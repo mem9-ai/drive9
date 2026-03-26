@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/meta"
@@ -221,11 +222,12 @@ func (b *Dat9Backend) ResumeUpload(ctx context.Context, uploadID string) (*Uploa
 		return nil, meta.ErrUploadNotActive
 	}
 
-	// Check expiry — abort S3 multipart before marking metadata.
-	// If S3 abort fails, leave status as UPLOADING so a future call can retry.
+	// Check expiry — best-effort abort of S3 multipart, then mark metadata.
+	// S3 lifecycle rules (AbortIncompleteMultipartUpload) handle orphaned parts
+	// if the abort call fails transiently.
 	if time.Now().After(upload.ExpiresAt) {
 		if err := b.s3.AbortMultipartUpload(ctx, upload.S3Key, upload.S3UploadID); err != nil {
-			return nil, fmt.Errorf("abort expired multipart upload: %w", err)
+			log.Printf("WARNING: failed to abort expired multipart upload %s: %v", uploadID, err)
 		}
 		b.store.AbortUpload(uploadID)
 		return nil, meta.ErrUploadExpired
