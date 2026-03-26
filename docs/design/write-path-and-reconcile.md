@@ -64,6 +64,47 @@ For small files:
 
 A typical small-file path should have one clear commit transaction, followed by async follow-up work.
 
+Representative create sequence:
+
+```text
+client              dat9 server                tenant-local state           async runtime
+  | PUT small file      |                               |                         |
+  |-------------------->|                               |                         |
+  |                     | BEGIN                         |                         |
+  |                     |------------------------------>|                         |
+  |                     | write content + metadata      |                         |
+  |                     | advance version state         |                         |
+  |                     | enqueue task or write         |                         |
+  |                     | durable reconcile marker      |                         |
+  |                     | COMMIT                        |                         |
+  |                     |------------------------------>|                         |
+  |<--------------------| 200/201 + committed revision  |                         |
+  |                     |                                                       process later
+```
+
+Representative overwrite sequence:
+
+```text
+client              dat9 server                tenant-local state           cleanup/reconcile
+  | PUT overwrite       |                               |                         |
+  | If-Match: r7        |                               |                         |
+  |-------------------->|                               |                         |
+  |                     | BEGIN                         |                         |
+  |                     |------------------------------>|                         |
+  |                     | resolve and lock path         |                         |
+  |                     | compare revision / policy     |                         |
+  |                     | write new content             |                         |
+  |                     | advance version to r8         |                         |
+  |                     | enqueue task or marker        |                         |
+  |                     | COMMIT                        |                         |
+  |                     |------------------------------>|                         |
+  |<--------------------| 200/201 + ETag: r8           |                         |
+  |                     |                                                   old derived state
+  |                     |                                                   is repaired async
+```
+
+If the overwrite precondition fails, the server must return conflict or precondition failure before any new committed version is exposed.
+
 ### 5.2 Large-file write path
 
 For large files:
@@ -85,6 +126,70 @@ Representative completion sequence:
 6. server marks upload state as completed
 7. commit succeeds -> file becomes confirmed
 8. path conflict or validation failure -> commit fails explicitly
+```
+
+Representative staged upload flow:
+
+```text
+client              dat9 server                object storage               tenant-local state
+  | request upload      |                               |                         |
+  |-------------------->|                               |                         |
+  |<--------------------| 202 + presigned parts         |                         |
+  | upload bytes -------------------------------------->|                         |
+  | complete upload     |                               |                         |
+  |-------------------->| verify object / finalize MPU  |                         |
+  |                     |------------------------------>|                         |
+  |                     | BEGIN                                                   |
+  |                     |-------------------------------------------------------->|
+  |                     | commit metadata + version                               |
+  |                     | create/confirm path binding                             |
+  |                     | mark upload completed                                   |
+  |                     | COMMIT                                                  |
+  |                     |-------------------------------------------------------->|
+  |<--------------------| 200/201 committed                                       |
+```
+
+Representative `/complete` conflict path:
+
+```text
+client              dat9 server                object storage               tenant-local state
+  | complete upload     |                               |                         |
+  |-------------------->| verify object / finalize MPU  |                         |
+  |                     | BEGIN                                                   |
+  |                     |-------------------------------------------------------->|
+  |                     | path conflict / revision mismatch / validation failure   |
+  |                     | ROLLBACK                                                |
+  |                     |-------------------------------------------------------->|
+  |<--------------------| 409 / 412                                               |
+
+Result:
+- upload must not transition to `COMPLETED`
+- confirmed file state must not advance
+- uploaded bytes may remain temporarily until retry, cancel, or reaper cleanup
+```
+
+Representative cross-tier overwrite:
+
+```text
+existing path /x currently points to:
+
+  old confirmed version
+  /x -> file/logical object -> old storage ref
+
+overwrite with a new representation:
+
+  1. stage new bytes in the target tier
+  2. begin commit transaction
+  3. validate overwrite precondition and path ownership
+  4. advance current version / storage reference to the new body
+  5. durably enqueue downstream work or write repair marker
+  6. commit
+  7. clean old storage asynchronously
+
+Invariant:
+- the user-visible path stays stable
+- the new committed version becomes current before old storage is deleted
+- old storage cleanup is never part of the critical commit path
 ```
 
 ### 5.3 Commit discipline
@@ -120,23 +225,31 @@ Examples of practical checks:
 Suggested file state machine:
 
 ```text
-PENDING ----> CONFIRMED ----> DELETED
-   |              |               |
-   |              |               +--> cleanup / reaper
-   |              +--> normal use
-   +--> aborted or failed write path may be removed by reconcile
+PENDING -------------------------> CONFIRMED -------------------------> DELETED
+   |                                   |                                   |
+   | failed staging /                  | overwrite produces                | cleanup worker
+   | abandoned draft                   | a newer version, but              | or reaper removes
+   |                                   | user-visible state stays          | physical storage later
+   +--> reconcile removes              | `CONFIRMED`                       |
+       invalid draft                   +--> normal read / list / search    +--> terminal logical state
 ```
 
 Suggested upload state machine:
 
 ```text
-UPLOADING ----> COMPLETED
-    |               |
-    |               +--> confirmed file state exists
-    +--> ABORTED
-    +--> EXPIRED
-            |
-            +--> cleanup / reaper
+UPLOADING -----------------------> COMPLETED
+    |                                  |
+    | /complete conflict or            | confirmed file state exists
+    | validation failure               | and points at a valid object
+    |                                  |
+    | stays non-terminal until         +--> normal retained upload record
+    | retry or explicit cancel
+    |
+    +-------------------------------> ABORTED
+    |
+    +-------------------------------> EXPIRED
+                                       |
+                                       +--> cleanup / reaper
 ```
 
 Important cross-state invariants:
@@ -144,6 +257,20 @@ Important cross-state invariants:
 - completed upload state must imply confirmed file state
 - confirmed file state must imply complete storage object exists
 - logical path bindings must point to valid file -> logical object bindings
+
+Recommended current-phase state constraints:
+
+- `upload.status = COMPLETED` must imply:
+  - metadata commit succeeded
+  - the file is `CONFIRMED`
+  - the target path binding exists
+- `/complete` returning `409` or `412` must imply:
+  - the file does not advance to a new committed version
+  - the upload does not become `COMPLETED`
+- physical storage cleanup must imply:
+  - the old version is no longer current
+  - no live logical binding still depends on that storage reference
+- reconcile may repair missing downstream work, but must not invent a committed version that never passed the write commit point
 
 ### 5.6 Delete path and cleanup separation
 
@@ -168,6 +295,31 @@ Representative delete flow:
 
 The implementation should serialize the "last reference removed" decision strongly enough to avoid leaving orphaned logical-object state behind.
 
+Representative concurrent delete / refcount flow:
+
+```text
+Initial state:
+  /a -> file F
+  /b -> file F
+
+tx1: rm /a                         tx2: rm /b
+--------------------------------   --------------------------------
+lock path /a and file F            waits for file F lock
+delete path /a
+remaining refs for F = 1
+commit
+                                   lock path /b and file F
+                                   delete path /b
+                                   remaining refs for F = 0
+                                   mark F logically deleted
+                                   commit
+
+after commit:
+  cleanup worker / reaper removes physical storage once
+```
+
+This serialization is important because "last reference removed" is a correctness boundary, not just a convenience optimization.
+
 ### 5.7 Reaper responsibilities
 
 The background reaper should at least be able to:
@@ -177,6 +329,30 @@ The background reaper should at least be able to:
 - clean orphaned storage objects
 - remove storage for deleted files after logical deletion is complete
 - trigger repair or cleanup for partially committed write flows
+
+Representative reconcile / reaper sweep:
+
+```text
+periodic sweep
+   |
+   +--> scan upload records
+   |      |
+   |      +--> `UPLOADING` past expiry -> abort or expire
+   |      +--> inconsistent `COMPLETED` -> investigate / repair
+   |
+   +--> scan committed files
+   |      |
+   |      +--> missing async task -> enqueue
+   |      +--> stale or missing derived artifact -> enqueue repair
+   |
+   +--> scan logically deleted state
+   |      |
+   |      +--> storage still present -> delete asynchronously
+   |
+   +--> scan storage namespace
+          |
+          +--> object has no valid metadata reference -> quarantine or delete
+```
 
 ## 6. Invariants / Correctness Rules
 

@@ -73,6 +73,25 @@ Representative user-facing operations include:
 
 These operations define the product shape even if the backend implementation is distributed and asynchronous.
 
+Representative endpoint surface:
+
+```text
+PUT    /v1/fs/{path}          write or initiate large-file upload
+GET    /v1/fs/{path}          read file or begin authorized download flow
+DELETE /v1/fs/{path}          remove file from user-visible namespace
+HEAD   /v1/fs/{path}          fetch metadata / revision / status
+GET    /v1/fs/{path}?list     list directory contents
+
+POST   /v1/search             search by semantic / keyword / metadata criteria
+
+GET    /v1/uploads?path=...&status=UPLOADING
+POST   /v1/uploads/{id}/resume
+POST   /v1/uploads/{id}/complete
+DELETE /v1/uploads/{id}
+```
+
+This should be treated as the representative current-phase endpoint shape, even if exact query parameters or response fields evolve.
+
 ### 5.2 Visible semantic artifacts
 
 Semantic artifacts should remain inspectable where practical.
@@ -132,6 +151,80 @@ Recommended behavior:
 - cancel marks the upload abandoned and eligible for cleanup
 - if an active upload already exists for the same logical target, resume/reuse policy must be explicit rather than implicit
 
+Representative large-file initiation example:
+
+```http
+PUT /v1/fs/data/archive.tar
+Content-Length: 5368709120
+Content-Type: application/octet-stream
+
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+
+{
+  "upload_id": "upl_01JXYZ...",
+  "path": "/data/archive.tar",
+  "status": "UPLOADING",
+  "parts": [
+    {"part_number": 1, "size": 67108864, "url": "https://object-store.example/..."},
+    {"part_number": 2, "size": 67108864, "url": "https://object-store.example/..."}
+  ],
+  "complete_url": "/v1/uploads/upl_01JXYZ.../complete"
+}
+```
+
+Representative upload management examples:
+
+```http
+GET /v1/uploads?path=/data/archive.tar&status=UPLOADING
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+[
+  {
+    "upload_id": "upl_01JXYZ...",
+    "path": "/data/archive.tar",
+    "status": "UPLOADING"
+  }
+]
+```
+
+```http
+POST /v1/uploads/upl_01JXYZ.../resume
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "upload_id": "upl_01JXYZ...",
+  "remaining_parts": [
+    {"part_number": 7, "size": 67108864, "url": "https://object-store.example/..."},
+    {"part_number": 8, "size": 67108864, "url": "https://object-store.example/..."}
+  ]
+}
+```
+
+```http
+POST /v1/uploads/upl_01JXYZ.../complete
+
+HTTP/1.1 200 OK
+ETag: "r18"
+Content-Type: application/json
+
+{
+  "path": "/data/archive.tar",
+  "status": "CONFIRMED",
+  "revision": "r18"
+}
+```
+
+```http
+DELETE /v1/uploads/upl_01JXYZ...
+
+HTTP/1.1 204 No Content
+```
+
 ### 5.4 Suggested HTTP status semantics
 
 The following status model should guide implementation.
@@ -172,6 +265,18 @@ Recommended conflict policy:
 - reuse an existing upload session only when the server can prove it refers to the same logical upload intent
 - otherwise return `409 Conflict` rather than silently rebinding state
 
+Representative conflict split:
+
+```text
+409 Conflict:
+- active upload session exists for the same path but a different logical upload intent
+- `/complete` fails because path ownership or upload/session identity is incompatible
+
+412 Precondition Failed:
+- client supplied `If-Match` does not match the current revision
+- overwrite precondition fails even though the path itself is valid
+```
+
 ### 5.5 Search contract
 
 Search should be a first-class user operation.
@@ -184,6 +289,36 @@ The API/UX contract should support at least:
 
 The contract does not need to expose every backend retrieval primitive. It should expose a coherent user-facing query model.
 
+Representative search request:
+
+```http
+POST /v1/search
+Content-Type: application/json
+
+{
+  "query": "training data for image classification",
+  "mode": "hybrid",
+  "scope": "/data/",
+  "filters": {
+    "tags": {"env": "prod"}
+  },
+  "top_k": 10
+}
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+[
+  {
+    "path": "/data/training-v3/.abstract.md",
+    "score": 0.92,
+    "kind": "semantic_artifact"
+  }
+]
+```
+
+The exact ranking formula may evolve, but the user-facing request shape should remain coherent across vector, keyword, and hybrid search modes.
+
 ### 5.6 Copy, move, and delete semantics
 
 User-facing semantics should remain simple:
@@ -193,6 +328,16 @@ User-facing semantics should remain simple:
 - delete should behave like removing the logical item from user view, even if physical cleanup happens later
 
 This preserves the product model while allowing backend-efficient implementations.
+
+Representative delete example:
+
+```http
+DELETE /v1/fs/data/archive.tar
+
+HTTP/1.1 204 No Content
+```
+
+This response means the path has been removed from the user-visible namespace. It does not require physical storage cleanup to have already finished.
 
 ### 5.7 Concurrency and overwrite contract
 
@@ -209,6 +354,49 @@ Writes should also preserve simple directory semantics:
 - writing to a file path may auto-create missing parent directories when the product chooses `mkdir -p` style behavior
 - file and directory path canonicalization rules must remain consistent across read, write, list, move, and delete
 
+Representative optimistic overwrite success:
+
+```http
+PUT /v1/fs/data/config.json
+If-Match: "r7"
+Content-Type: application/json
+
+{"feature": true}
+
+HTTP/1.1 200 OK
+ETag: "r8"
+Content-Type: application/json
+
+{
+  "path": "/data/config.json",
+  "revision": "r8",
+  "status": "CONFIRMED"
+}
+```
+
+Representative revision mismatch:
+
+```http
+PUT /v1/fs/data/config.json
+If-Match: "r7"
+Content-Type: application/json
+
+{"feature": true}
+
+HTTP/1.1 412 Precondition Failed
+ETag: "r9"
+Content-Type: application/json
+
+{
+  "error": {
+    "code": "revision_mismatch",
+    "message": "The current revision no longer matches If-Match."
+  }
+}
+```
+
+If the server exposes the current revision on mismatch, it should do so in a standard response field or header so the client can retry deliberately rather than guessing.
+
 ### 5.8 Path canonicalization and path safety
 
 The API contract should treat path canonicalization as a user-visible safety guarantee.
@@ -223,6 +411,16 @@ Recommended canonicalization rules:
 - normalize Unicode consistently
 
 This keeps path behavior stable across SDKs, CLIs, and HTTP clients.
+
+Representative path outcomes:
+
+```text
+"/data/report.txt"      -> valid file path
+"/data/reports/"        -> valid directory path
+"/data//report.txt"     -> normalized to "/data/report.txt"
+"/data/../secret.txt"   -> rejected
+"/data/report.txt/"     -> rejected as file path
+```
 
 ### 5.9 Presigned URL security
 

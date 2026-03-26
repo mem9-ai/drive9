@@ -94,6 +94,51 @@ If T1 finishes after v2 is current:
 - T2 or reconcile must remain able to establish the current summary
 ```
 
+Representative late-task timeline:
+
+```text
+time ---->
+
+t0   file write produces revision r1
+     -> enqueue T1(resource_version = r1)
+
+t1   file write produces revision r2
+     -> enqueue T2(resource_version = r2)
+
+t2   T1 finishes late
+     -> compare expected version r1 with current version r2
+     -> mismatch
+     -> do not advance current derived-state pointer
+     -> optionally retain as historical / diagnostic output only
+
+t3   T2 finishes
+     -> compare expected version r2 with current version r2
+     -> match
+     -> advance current derived-state pointer
+
+t4   if T2 is missing or fails repeatedly
+     -> reconcile detects stale or missing current derived state
+     -> enqueue or repair until current version is represented
+```
+
+Writeback decision shape:
+
+```text
+task(version = vN) finishes
+          |
+          v
+compare task.version with current.version
+          |
+     +----+----+
+     |         |
+   match    mismatch
+     |         |
+     v         v
+advance     no current-state advance
+current     retain only as historical
+pointer     output or drop as no-op
+```
+
 ### 5.3 Authoritative versus rebuildable state
 
 Authoritative state should include:
@@ -142,6 +187,12 @@ This does not mean the product stops feeling file-oriented. It means internal re
 For P0/P1, the practical invariant is:
 
 - every async writeback must be protected by a stale-write guard tied to the version observed when the task was created
+
+Additional current-phase constraints:
+
+- a stale task may finish successfully as background work, but it must not become the current derived-state winner
+- current derived-state pointers must move forward only through version-valid writeback
+- reconcile must reason from authoritative current version, not from "whichever task finished last"
 
 ## 7. Failure / Recovery
 
