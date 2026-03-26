@@ -27,12 +27,6 @@ type PartURL struct {
 	ExpiresAt string `json:"expires_at"`
 }
 
-// CompletePart is sent to the server when completing an upload.
-type CompletePart struct {
-	Number int    `json:"number"`
-	ETag   string `json:"etag"`
-}
-
 // ProgressFunc is called after each part upload completes.
 // partNumber is 1-based, totalParts is the total count.
 type ProgressFunc func(partNumber, totalParts int, bytesUploaded int64)
@@ -57,13 +51,14 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 		return c.Write(path, data)
 	}
 
-	// Large file: Content-Length only, no body — server returns 202 with upload plan
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), nil)
+	// Large file: send total size via Content-Length, empty body — server returns 202.
+	// Use http.NoBody + override ContentLength so Go sends the header without actual data.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), http.NoBody)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Content-Length", fmt.Sprintf("%d", size))
+	req.ContentLength = size
 
 	resp, err := c.do(req)
 	if err != nil {
@@ -88,12 +83,11 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, r io.Reader, progress ProgressFunc) error {
 	const maxConcurrency = 4
 
-	results := make([]CompletePart, len(plan.Parts))
 	errCh := make(chan error, 1)
 	sem := make(chan struct{}, maxConcurrency)
 	var wg sync.WaitGroup
 
-	for i, part := range plan.Parts {
+	for _, part := range plan.Parts {
 		// Acquire semaphore before reading so we hold at most maxConcurrency buffers
 		select {
 		case sem <- struct{}{}:
@@ -120,11 +114,11 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, r io.Reader, 
 		partData = partData[:n]
 
 		wg.Add(1)
-		go func(idx int, p PartURL, data []byte) {
+		go func(p PartURL, data []byte) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			etag, err := c.uploadOnePart(ctx, p.URL, data)
+			_, err := c.uploadOnePart(ctx, p.URL, data)
 			if err != nil {
 				select {
 				case errCh <- fmt.Errorf("part %d: %w", p.Number, err):
@@ -133,11 +127,10 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, r io.Reader, 
 				return
 			}
 
-			results[idx] = CompletePart{Number: p.Number, ETag: etag}
 			if progress != nil {
 				progress(p.Number, len(plan.Parts), int64(len(data)))
 			}
-		}(i, part, partData)
+		}(part, partData)
 	}
 
 	wg.Wait()
@@ -148,7 +141,7 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, r io.Reader, 
 	default:
 	}
 
-	return c.completeUpload(ctx, plan.UploadID, results)
+	return c.completeUpload(ctx, plan.UploadID)
 }
 
 // uploadOnePart PUTs data to a presigned URL and returns the ETag.
@@ -174,23 +167,13 @@ func (c *Client) uploadOnePart(ctx context.Context, url string, data []byte) (st
 }
 
 // completeUpload notifies the server that all parts are uploaded.
-func (c *Client) completeUpload(ctx context.Context, uploadID string, parts []CompletePart) error {
-	body, err := json.Marshal(struct {
-		Parts []CompletePart `json:"parts"`
-	}{Parts: parts})
-	if err != nil {
-		return err
-	}
-
+// No body needed — server rebuilds the part list via S3 ListParts.
+func (c *Client) completeUpload(ctx context.Context, uploadID string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+"/v1/uploads/"+uploadID+"/complete",
-		bytes.NewReader(body),
-	)
+		c.baseURL+"/v1/uploads/"+uploadID+"/complete", nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.ContentLength = int64(len(body))
 
 	resp, err := c.do(req)
 	if err != nil {
@@ -282,17 +265,16 @@ func (c *Client) ResumeUpload(ctx context.Context, path string, r io.ReaderAt, t
 
 	if len(plan.Parts) == 0 {
 		// All parts uploaded, just complete
-		return c.completeUpload(ctx, plan.UploadID, nil)
+		return c.completeUpload(ctx, plan.UploadID)
 	}
 
 	// Step 3: Upload missing parts concurrently
-	results, err := c.uploadMissingParts(ctx, *plan, r, progress)
-	if err != nil {
+	if err := c.uploadMissingParts(ctx, *plan, r, progress); err != nil {
 		return err
 	}
 
 	// Step 4: Complete
-	return c.completeUpload(ctx, plan.UploadID, results)
+	return c.completeUpload(ctx, plan.UploadID)
 }
 
 // queryUpload finds an active upload for the given path.
@@ -350,7 +332,7 @@ func (c *Client) requestResume(ctx context.Context, uploadID string) (*UploadPla
 }
 
 // uploadMissingParts uploads parts from a ReaderAt (random access for resume).
-func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.ReaderAt, progress ProgressFunc) ([]CompletePart, error) {
+func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.ReaderAt, progress ProgressFunc) error {
 	const maxConcurrency = 4
 	sem := make(chan struct{}, maxConcurrency)
 	errCh := make(chan error, 1)
@@ -363,19 +345,18 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 	}
 
 	parts := plan.Parts
-	results := make([]CompletePart, len(parts))
 
-	for i, part := range parts {
+	for _, part := range parts {
 		data := make([]byte, part.Size)
 		offset := int64(part.Number-1) * stdPartSize
 		n, err := r.ReadAt(data, offset)
 		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("read part %d at offset %d: %w", part.Number, offset, err)
+			return fmt.Errorf("read part %d at offset %d: %w", part.Number, offset, err)
 		}
 		data = data[:n]
 
 		wg.Add(1)
-		go func(idx int, p PartURL, d []byte) {
+		go func(p PartURL, d []byte) {
 			defer wg.Done()
 
 			select {
@@ -389,7 +370,7 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 				return
 			}
 
-			etag, err := c.uploadOnePart(ctx, p.URL, d)
+			_, err := c.uploadOnePart(ctx, p.URL, d)
 			if err != nil {
 				select {
 				case errCh <- fmt.Errorf("part %d: %w", p.Number, err):
@@ -397,20 +378,19 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 				}
 				return
 			}
-			results[idx] = CompletePart{Number: p.Number, ETag: etag}
 			if progress != nil {
 				progress(p.Number, len(parts), int64(len(d)))
 			}
-		}(i, part, data)
+		}(part, data)
 	}
 
 	wg.Wait()
 
 	select {
 	case err := <-errCh:
-		return nil, err
+		return err
 	default:
 	}
 
-	return results, nil
+	return nil
 }
