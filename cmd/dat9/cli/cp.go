@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -51,12 +52,12 @@ func Cp(c *client.Client, args []string) error {
 
 	switch {
 	case src == "-" && dstRemote:
-		// stdin → remote
+		// stdin → remote (small files only; stdin requires full read to know size)
 		data, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return fmt.Errorf("read stdin: %w", err)
 		}
-		return c.WriteStream(ctx, dst, strings.NewReader(string(data)), int64(len(data)), printProgress)
+		return c.WriteStream(ctx, dst, bytes.NewReader(data), int64(len(data)), printProgress)
 
 	case srcRemote && dst == "-":
 		// remote → stdout

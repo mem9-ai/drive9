@@ -12,18 +12,13 @@ import (
 	"testing"
 )
 
-// TestWriteStreamSmallFile verifies that WriteStream sends a small file directly.
+// TestWriteStreamSmallFile verifies that WriteStream sends a small file via single direct PUT.
 func TestWriteStreamSmallFile(t *testing.T) {
 	var writtenData []byte
+	requestCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/small.txt":
-			if r.Body == nil || r.ContentLength == 0 {
-				// First request: Content-Length only, return 200 (small file)
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-			// Second request: actual data
+		if r.Method == http.MethodPut && r.URL.Path == "/v1/fs/small.txt" {
+			requestCount++
 			writtenData, _ = io.ReadAll(r.Body)
 			w.WriteHeader(http.StatusOK)
 		}
@@ -35,6 +30,9 @@ func TestWriteStreamSmallFile(t *testing.T) {
 	err := c.WriteStream(context.Background(), "/small.txt", bytes.NewReader(data), int64(len(data)), nil)
 	if err != nil {
 		t.Fatalf("WriteStream: %v", err)
+	}
+	if requestCount != 1 {
+		t.Errorf("expected 1 request, got %d", requestCount)
 	}
 	if !bytes.Equal(writtenData, data) {
 		t.Errorf("got %q, want %q", writtenData, data)
@@ -89,6 +87,7 @@ func TestWriteStreamLargeFile(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "")
+	c.smallFileThreshold = 1 // force large file path for test
 	data := []byte("12345678") // 8 bytes, 2 parts (5+3)
 
 	var progressCalls []int
@@ -184,6 +183,7 @@ func TestResumeUpload(t *testing.T) {
 			// Step 2: Return missing parts (only part 2 is missing)
 			plan := UploadPlan{
 				UploadID: "resume-456",
+				PartSize: 4, // standard part size for this upload
 				Parts: []PartURL{
 					{Number: 2, URL: fmt.Sprintf("http://%s/parts/2", r.Host), Size: 4},
 				},
