@@ -418,7 +418,7 @@ func (b *Dat9Backend) readBlob(ref string) ([]byte, error) {
 }
 
 func (b *Dat9Backend) deleteBlob(ref string) {
-	os.Remove(b.blobPath(ref))
+	_ = os.Remove(b.blobPath(ref))
 }
 
 // --- writeCloser ---

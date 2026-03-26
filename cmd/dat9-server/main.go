@@ -43,7 +43,7 @@ func main() {
 	if err != nil {
 		die(fmt.Errorf("open meta store: %w", err))
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	b, err := backend.New(store, blobDir)
 	if err != nil {

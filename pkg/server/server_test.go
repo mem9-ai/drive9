@@ -21,14 +21,14 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(blobDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(blobDir) })
 
 	store, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
 	testmysql.ResetDB(t, store.DB())
-	t.Cleanup(func() { store.Close() })
+	t.Cleanup(func() { _ = store.Close() })
 
 	b, err := backend.New(store, blobDir)
 	if err != nil {
@@ -47,7 +47,7 @@ func TestWriteAndRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("write: %d", resp.StatusCode)
 	}
@@ -57,7 +57,7 @@ func TestWriteAndRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		t.Fatalf("read: %d", resp.StatusCode)
 	}
@@ -76,7 +76,7 @@ func TestListDir(t *testing.T) {
 	for _, name := range []string{"a.txt", "b.txt"} {
 		req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/"+name, strings.NewReader(name))
 		resp, _ := http.DefaultClient.Do(req)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 
 	// List
@@ -84,7 +84,7 @@ func TestListDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var result struct {
 		Entries []struct {
@@ -92,7 +92,9 @@ func TestListDir(t *testing.T) {
 			IsDir bool   `json:"isDir"`
 		} `json:"entries"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
 	if len(result.Entries) != 2 {
 		t.Fatalf("expected 2 entries, got %d", len(result.Entries))
 	}
@@ -106,7 +108,7 @@ func TestStat(t *testing.T) {
 	// Write a file
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/test.txt", strings.NewReader("data"))
 	resp, _ := http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Stat
 	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/test.txt", nil)
@@ -114,7 +116,7 @@ func TestStat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("stat: %d", resp.StatusCode)
 	}
@@ -134,12 +136,12 @@ func TestDelete(t *testing.T) {
 	// Write
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/del.txt", strings.NewReader("data"))
 	resp, _ := http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Delete
 	req, _ = http.NewRequest(http.MethodDelete, ts.URL+"/v1/fs/del.txt", nil)
 	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("delete: %d", resp.StatusCode)
 	}
@@ -147,7 +149,7 @@ func TestDelete(t *testing.T) {
 	// Verify gone
 	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/del.txt", nil)
 	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 404 {
 		t.Errorf("expected 404, got %d", resp.StatusCode)
 	}
@@ -161,13 +163,13 @@ func TestCopy(t *testing.T) {
 	// Write source
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/src.txt", strings.NewReader("shared"))
 	resp, _ := http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Copy (zero-copy)
 	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/dst.txt?copy", nil)
 	req.Header.Set("X-Dat9-Copy-Source", "/src.txt")
 	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("copy: %d", resp.StatusCode)
 	}
@@ -175,7 +177,7 @@ func TestCopy(t *testing.T) {
 	// Read copy
 	resp, _ = http.Get(ts.URL + "/v1/fs/dst.txt")
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if string(body) != "shared" {
 		t.Errorf("got %q", body)
 	}
@@ -189,13 +191,13 @@ func TestRename(t *testing.T) {
 	// Write
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/old.txt", strings.NewReader("data"))
 	resp, _ := http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Rename
 	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/new.txt?rename", nil)
 	req.Header.Set("X-Dat9-Rename-Source", "/old.txt")
 	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("rename: %d", resp.StatusCode)
 	}
@@ -203,7 +205,7 @@ func TestRename(t *testing.T) {
 	// Old gone
 	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/old.txt", nil)
 	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 404 {
 		t.Errorf("expected 404, got %d", resp.StatusCode)
 	}
@@ -211,7 +213,7 @@ func TestRename(t *testing.T) {
 	// New exists
 	resp, _ = http.Get(ts.URL + "/v1/fs/new.txt")
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if string(body) != "data" {
 		t.Errorf("got %q", body)
 	}
@@ -222,8 +224,11 @@ func TestNotFound(t *testing.T) {
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 
-	resp, _ := http.Get(ts.URL + "/v1/fs/nonexistent.txt")
-	defer resp.Body.Close()
+	resp, err := http.Get(ts.URL + "/v1/fs/nonexistent.txt")
+	if err != nil {
+		t.Fatalf("GET nonexistent: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 404 {
 		t.Errorf("expected 404, got %d", resp.StatusCode)
 	}
