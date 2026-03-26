@@ -608,6 +608,34 @@ func (s *Store) CompleteUpload(uploadID string) error {
 	return err
 }
 
+func (s *Store) AbortUpload(uploadID string) error {
+	_, err := s.db.Exec(`UPDATE uploads SET status = 'ABORTED',
+		updated_at = strftime('%Y-%m-%dT%H:%M:%f','now')
+		WHERE upload_id = ? AND status = 'UPLOADING'`, uploadID)
+	return err
+}
+
+func (s *Store) ListUploadsByPath(targetPath string, status UploadStatus) ([]*Upload, error) {
+	rows, err := s.db.Query(`SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
+		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
+		created_at, updated_at, expires_at
+		FROM uploads WHERE target_path = ? AND status = ?
+		ORDER BY created_at DESC`, targetPath, status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var uploads []*Upload
+	for rows.Next() {
+		u, err := scanUpload(rows)
+		if err != nil {
+			return nil, err
+		}
+		uploads = append(uploads, u)
+	}
+	return uploads, rows.Err()
+}
+
 // --- scan helpers ---
 
 type scanner interface {
