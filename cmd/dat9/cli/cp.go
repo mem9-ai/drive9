@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -13,27 +14,40 @@ import (
 //
 // Remote paths use a ":" prefix to distinguish from local paths:
 //
-//	dat9 cp local.txt :/remote/path    upload
-//	dat9 cp :/remote/path local.txt    download
-//	dat9 cp :/remote/a :/remote/b      server-side copy (zero-copy)
-//	dat9 cp - :/remote/path            upload from stdin
-//	dat9 cp :/remote/path -            download to stdout
+//	dat9 cp local.txt :/remote/path       upload
+//	dat9 cp :/remote/path local.txt       download
+//	dat9 cp :/remote/a :/remote/b         server-side copy (zero-copy)
+//	dat9 cp - :/remote/path               upload from stdin
+//	dat9 cp :/remote/path -               download to stdout
+//	dat9 cp --resume local.txt :/remote   resume interrupted upload
 func Cp(c *client.Client, args []string) error {
+	resume := false
+	filtered := args[:0]
+	for _, a := range args {
+		if a == "--resume" {
+			resume = true
+		} else {
+			filtered = append(filtered, a)
+		}
+	}
+	args = filtered
+
 	if len(args) != 2 {
-		return fmt.Errorf("usage: dat9 cp <src> <dst>")
+		return fmt.Errorf("usage: dat9 cp [--resume] <src> <dst>")
 	}
 	src, dst := args[0], args[1]
 
 	srcRemote := isRemote(src)
 	dstRemote := isRemote(dst)
 
-	// Strip ":" prefix from remote paths for API calls
 	if srcRemote {
 		src = src[1:]
 	}
 	if dstRemote {
 		dst = dst[1:]
 	}
+
+	ctx := context.Background()
 
 	switch {
 	case src == "-" && dstRemote:
@@ -42,39 +56,95 @@ func Cp(c *client.Client, args []string) error {
 		if err != nil {
 			return fmt.Errorf("read stdin: %w", err)
 		}
-		return c.Write(dst, data)
+		return c.WriteStream(ctx, dst, strings.NewReader(string(data)), int64(len(data)), printProgress)
 
 	case srcRemote && dst == "-":
 		// remote → stdout
-		data, err := c.Read(src)
-		if err != nil {
-			return err
-		}
-		_, err = os.Stdout.Write(data)
-		return err
+		return streamToStdout(ctx, c, src)
 
 	case !srcRemote && dstRemote:
 		// local → remote (upload)
-		data, err := os.ReadFile(src)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", src, err)
+		if resume {
+			return resumeUpload(ctx, c, src, dst)
 		}
-		return c.Write(dst, data)
+		return uploadFile(ctx, c, src, dst)
 
 	case srcRemote && !dstRemote:
 		// remote → local (download)
-		data, err := c.Read(src)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(dst, data, 0644)
+		return downloadFile(ctx, c, src, dst)
 
 	case srcRemote && dstRemote:
-		// remote → remote (server-side copy, zero-copy in inode model)
+		// remote → remote (server-side copy, zero-copy)
 		return c.Copy(src, dst)
 
 	default:
 		return fmt.Errorf("at least one path must be remote (use : prefix, e.g. :/path)")
+	}
+}
+
+func uploadFile(ctx context.Context, c *client.Client, localPath, remotePath string) error {
+	f, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", localPath, err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", localPath, err)
+	}
+
+	return c.WriteStream(ctx, remotePath, f, info.Size(), printProgress)
+}
+
+func resumeUpload(ctx context.Context, c *client.Client, localPath, remotePath string) error {
+	f, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", localPath, err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", localPath, err)
+	}
+
+	return c.ResumeUpload(ctx, remotePath, f, info.Size(), printProgress)
+}
+
+func downloadFile(ctx context.Context, c *client.Client, remotePath, localPath string) error {
+	rc, err := c.ReadStream(ctx, remotePath)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	out, err := os.Create(localPath)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", localPath, err)
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, rc)
+	return err
+}
+
+func streamToStdout(ctx context.Context, c *client.Client, remotePath string) error {
+	rc, err := c.ReadStream(ctx, remotePath)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	_, err = io.Copy(os.Stdout, rc)
+	return err
+}
+
+// printProgress displays part-level upload progress.
+func printProgress(partNumber, totalParts int, bytesUploaded int64) {
+	fmt.Fprintf(os.Stderr, "\r  part %d/%d uploaded (%d bytes)", partNumber, totalParts, bytesUploaded)
+	if partNumber == totalParts {
+		fmt.Fprintln(os.Stderr)
 	}
 }
 
