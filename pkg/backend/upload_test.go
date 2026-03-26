@@ -126,6 +126,67 @@ func TestLargeFileOverwritesSmallFile(t *testing.T) {
 	}
 }
 
+func TestOverwritePreservesZeroCopyLinks(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	// Create /a with small data
+	b.Write("/a", []byte("shared"), 0, 0x3) // Create|Truncate
+
+	// Zero-copy link: /b shares the same inode as /a
+	b.CopyFile("/a", "/b")
+
+	// Verify both read "shared"
+	dataA, _ := b.Read("/a", 0, -1)
+	dataB, _ := b.Read("/b", 0, -1)
+	if string(dataA) != "shared" || string(dataB) != "shared" {
+		t.Fatalf("expected both to be 'shared', got a=%q b=%q", dataA, dataB)
+	}
+
+	// Large file overwrite on /a
+	totalSize := int64(1 << 20)
+	plan, err := b.InitiateUpload(ctx, "/a", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	upload, _ := b.GetUpload(plan.UploadID)
+	data := make([]byte, totalSize)
+	for i := range data {
+		data[i] = 0xAB
+	}
+	for _, p := range plan.Parts {
+		start := int64(p.Number-1) * s3client.PartSize
+		end := start + p.Size
+		if end > totalSize {
+			end = totalSize
+		}
+		b.S3().(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, p.Number, bytes.NewReader(data[start:end]))
+	}
+
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+
+	// /a should now be the large S3 file
+	infoA, err := b.Stat("/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if infoA.Size != totalSize {
+		t.Errorf("/a: expected size %d, got %d", totalSize, infoA.Size)
+	}
+
+	// /b shares the same inode — it should also see the new S3 data
+	infoB, err := b.Stat("/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if infoB.Size != totalSize {
+		t.Errorf("/b: expected size %d (same inode), got %d", totalSize, infoB.Size)
+	}
+}
+
 func TestInitiateAndConfirmUpload(t *testing.T) {
 	b := newTestBackendWithS3(t)
 	ctx := context.Background()
