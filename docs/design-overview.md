@@ -230,7 +230,7 @@ file_nodes                                    files
 | Operation | Without inode (path = file) | With inode (file_nodes + files) |
 |-----------|---------------------------|-------------------------------|
 | `cp /a /b` | Copy S3 object ($$$, slow for 10GB) | `INSERT file_nodes` (instant, zero storage cost) |
-| `mv /a /b` | Copy S3 + delete old ($$$) | `UPDATE file_nodes SET path=...` (instant) |
+| `mv /a /b` | Copy S3 + delete old ($$$) | `UPDATE file_nodes SET path=...` (zero storage cost; O(1) for files, O(N) prefix rewrite for dirs) |
 | `rm /a` (has other links) | Complex reference tracking | `DELETE file_nodes WHERE path='/a'` (file survives) |
 | `rm /a` (last link) | Delete S3 object | Delete file_nodes → refcount=0 → Reaper deletes file+blob |
 | `stat --nlink` | Not possible | `SELECT COUNT(*) FROM file_nodes WHERE file_id=?` |
@@ -256,11 +256,16 @@ Small files are stored in db9 via `fs9_write('/blobs/<ulid>', content)`. Same UL
 |---|---|
 | `dat9 ls /data/` | `SELECT name, is_directory, f.size_bytes FROM file_nodes fn LEFT JOIN files f ON fn.file_id = f.file_id WHERE fn.parent_path = '/data/'` |
 | `dat9 cat /data/a.txt` | `file_nodes → file_id → files.storage_type` → if db9: `fs9_read(storage_ref)` / if s3: `S3.GetObject(storage_ref)` |
-| `dat9 cp /a /b` | `INSERT file_nodes(path='/b', file_id=same)` — zero-copy |
-| `dat9 mv /a /b` | `UPDATE file_nodes SET path='/b', parent_path=..., name=... WHERE path='/a'` |
+| `dat9 cp /a /b` (file) | `INSERT file_nodes(path='/b', file_id=same)` — zero-copy link, no storage copy |
+| `dat9 cp /a/ /b/` (dir) | Recursive: for each descendant of `/a/`, `INSERT file_nodes` with same `file_id` and rewritten path prefix. Zero storage cost, O(N) metadata INSERTs. |
+| `dat9 mv /a /b` (file) | `UPDATE file_nodes SET path='/b', parent_path=..., name=... WHERE path='/a'` — O(1) |
+| `dat9 mv /a/ /b/` (dir) | Batch prefix rewrite: UPDATE the directory node + all descendants' `path` and `parent_path`. O(N) metadata UPDATEs, zero storage cost. |
 | `dat9 rm /a` | `DELETE file_nodes WHERE path='/a'` → if refcount=0: mark file DELETED |
+| `dat9 rm -r /a/` | Recursive: `DELETE FROM file_nodes WHERE path = '/a/' OR path LIKE '/a/%'` → per-file refcount check → mark orphans DELETED |
 | `dat9 stat /a` | `SELECT fn.*, f.* FROM file_nodes fn JOIN files f ON ... WHERE fn.path='/a'` |
 | `dat9 search "query"` | `SELECT ... FROM files f JOIN file_nodes fn ON ... ORDER BY vec_embed_cosine_distance(f.vec, 'query') LIMIT k` |
+
+**Note on directory operations**: Directory `mv` and `cp` are O(N) in the number of descendants — but zero storage cost. This matches AGFS's philosophy: keep the filesystem interface simple, let the server handle batch metadata. Plan 9's `rename(2)` has the same property. For P0, batch operations run in a single transaction; sharded optimization is a future concern.
 
 ---
 
@@ -300,9 +305,13 @@ Client ──PUT part N──▶ S3
 
 Client ──POST /v1/uploads/{id}/complete──▶ dat9 server
                                               │
-                                       CompleteMultipartUpload
-                                       UPDATE files → CONFIRMED
-                                       INSERT file_nodes
+                                       CompleteMultipartUpload (S3)
+                                       BEGIN;
+                                         UPDATE files → CONFIRMED
+                                         INSERT file_nodes (path=target_path)
+                                         Auto-create parent dirs
+                                         UPDATE uploads → COMPLETED
+                                       COMMIT;
                                               │
 Client ◀── 200 { confirmed } ────────────────┘
 ```
@@ -567,6 +576,24 @@ POST /v1/query
 - `revision` is a server-managed, auto-incrementing BIGINT stored in `files.revision`.
 - Write to a path auto-creates parent directories (mkdir -p semantics).
 
+### Overwrite Semantics (Write to Existing Path)
+
+When a client writes to a path that already exists, dat9 uses **in-place update** on the existing `files` row:
+
+```
+PUT /v1/fs/data/config.json  (path already exists, file_id = 01JQ...)
+
+  1. Resolve file_nodes.path → file_id
+  2. UPDATE files SET storage_ref=?, size_bytes=?, content_text=?,
+     storage_type=?, revision=revision+1
+     WHERE file_id = ? [AND revision = ? if If-Match supplied]
+  3. Write new blob; async-delete old blob (see §8 Write Path)
+```
+
+**Cross-tier overwrite**: If a small file grows past the threshold, `storage_type` flips from `db9` to `s3`; `content_text` is set to NULL (db9 auto-clears `vec`/`tsv`). If a large file shrinks, it flips back to `db9` and gets auto-embedded. The old storage is cleaned up asynchronously.
+
+**Why in-place, not COW (copy-on-write)?** If `/a` and `/b` both point to the same file_id (zero-copy links), updating `/a`'s content should be visible at `/b` — they are the same file, just as with Unix hard links. This is consistent, unsurprising, and matches the inode model. If the caller wants independent copies, they should `cat /a > /tmp/a && cp /tmp/a /b` (read + write-new) instead of `cp /a /b` (link).
+
 **Atomic conditional update**:
 
 ```sql
@@ -613,7 +640,6 @@ All metadata lives in the tenant's db9 database. **Four tables**:
 ```sql
 CREATE TABLE file_nodes (
     node_id       VARCHAR(26) PRIMARY KEY,    -- ULID
-    namespace_id  VARCHAR(255) NOT NULL,
     path          VARCHAR(4096) NOT NULL,      -- canonical full path
     parent_path   VARCHAR(4096) NOT NULL,      -- parent directory path
     name          VARCHAR(255) NOT NULL,        -- basename
@@ -621,10 +647,11 @@ CREATE TABLE file_nodes (
     file_id       VARCHAR(26),                 -- → files.file_id, NULL for directories
     created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 
-    UNIQUE KEY idx_ns_path (namespace_id, path),
-    INDEX idx_parent (namespace_id, parent_path),
+    UNIQUE KEY idx_path (path),
+    INDEX idx_parent (parent_path),
     INDEX idx_file (file_id)
 );
+-- No namespace_id: each tenant has its own db9 cluster. Isolation is at the cluster level.
 ```
 
 **Design notes**:
@@ -633,7 +660,7 @@ CREATE TABLE file_nodes (
 - Multiple file_nodes can share the same `file_id` (N:1 = hard link / zero-copy cp).
 - `parent_path` enables `ls` via `SELECT ... WHERE parent_path = ?`.
 - `name` is denormalized from `path` for display (avoids string parsing in queries).
-- `mv` is a single UPDATE on one row.
+- `mv` on a file is a single UPDATE. `mv` on a directory is a batch prefix rewrite (O(N) descendants, zero storage cost).
 
 ### files — file entity (inode)
 
@@ -699,18 +726,21 @@ Separate table for proper SQL indexing. Supports precise filtering: `dat9 ls --t
 CREATE TABLE uploads (
     upload_id          VARCHAR(26) PRIMARY KEY,
     file_id            VARCHAR(26) NOT NULL,
+    target_path        VARCHAR(4096) NOT NULL,        -- destination path for resume lookup
     s3_upload_id       VARCHAR(255) NOT NULL,
-    s3_key             VARCHAR(1024) NOT NULL,      -- blobs/<ulid>
+    s3_key             VARCHAR(1024) NOT NULL,        -- blobs/<ulid>
     total_size         BIGINT NOT NULL,
     part_size          BIGINT NOT NULL,
     parts_total        INT NOT NULL,
     status             ENUM('UPLOADING','COMPLETED','ABORTED','EXPIRED') NOT NULL DEFAULT 'UPLOADING',
-    fingerprint_sha256 CHAR(64),                     -- dedup/conflict detection
-    idempotency_key    VARCHAR(255),                  -- client-provided
+    fingerprint_sha256 CHAR(64),                      -- dedup/conflict detection
+    idempotency_key    VARCHAR(255),                   -- client-provided
     created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     expires_at         DATETIME(3) NOT NULL,
-    INDEX idx_status_expires (status, expires_at)
+    INDEX idx_path_status (target_path, status),      -- resume lookup: WHERE target_path=? AND status='UPLOADING'
+    INDEX idx_status_expires (status, expires_at),
+    UNIQUE KEY idx_idempotency (idempotency_key)      -- at most one upload per idempotency_key
 );
 ```
 
@@ -729,20 +759,42 @@ CREATE TABLE uploads (
 ### Write Path
 
 ```
-Small file:
-  1. fs9_write('/blobs/<ulid>', content)              -- store to db9
-  2. INSERT files (storage_type='db9', content_text=content, CONFIRMED)
-     ← db9 auto-computes vec + tsv
-  3. INSERT file_nodes (path=..., file_id=...)
-  4. Auto-create parent directories (INSERT IGNORE for each ancestor)
+Small file (new path):
+  BEGIN;
+    1. INSERT files (storage_type='db9', content_text=content, status='CONFIRMED')
+       ← db9 auto-computes vec + tsv on INSERT
+    2. fs9_write('/blobs/<ulid>', content)             -- same TiKV txn context
+    3. INSERT file_nodes (path=..., file_id=...)
+    4. Auto-create parent directories (INSERT IGNORE for each ancestor)
+  COMMIT;
+
+Small file (overwrite existing path):
+  BEGIN;
+    1. SELECT file_id FROM file_nodes WHERE path = ? FOR UPDATE
+    2. UPDATE files SET storage_ref=?, size_bytes=?, content_text=?,
+       content_type=?, revision=revision+1 WHERE file_id = ?
+       ← db9 auto-recomputes vec + tsv on UPDATE
+    3. fs9_write('/blobs/<new-ulid>', content)
+    4. old_ref = previous storage_ref
+  COMMIT;
+  5. Async: fs9_remove(old_ref) or S3.DeleteObject(old_ref) if tier changed
 
 Large file:
-  1. INSERT files (storage_type='s3', PENDING) + INSERT uploads
+  1. INSERT files (storage_type='s3', PENDING) + INSERT uploads (target_path=...)
   2. Client uploads parts directly to S3 via presigned URLs
-  3. Client calls /complete → CompleteMultipartUpload
-  4. UPDATE files SET status='CONFIRMED'
-  5. INSERT file_nodes (path=..., file_id=...)
+  3. Client calls /complete → CompleteMultipartUpload (S3 side)
+  4. BEGIN;
+       UPDATE files SET status='CONFIRMED', confirmed_at=NOW(3)
+       INSERT file_nodes (path=target_path, file_id=...)
+       Auto-create parent directories (INSERT IGNORE)
+       UPDATE uploads SET status='COMPLETED', updated_at=NOW(3)
+     COMMIT;
+     -- If file_nodes INSERT conflicts (path exists): ROLLBACK, return 409
 ```
+
+**Atomicity**: db9's fs9 and SQL share the same TiKV transaction context — `fs9_write()` inside a `BEGIN/COMMIT` block is atomic with the metadata INSERTs. If the transaction rolls back, both metadata and blob are discarded.
+
+**Cross-tier overwrite**: When overwriting a small file (db9) with a large file (S3) or vice versa, the server updates `storage_type` + `storage_ref` in the files row and cleans up the old storage asynchronously. The `content_text` column is set to NULL for S3 files (db9 auto-clears `vec` and `tsv`).
 
 ### State Machines
 
@@ -778,7 +830,7 @@ UPLOADING ──▶ COMPLETED
 
 | Invariant | Meaning |
 |-----------|---------|
-| `uploads.status = COMPLETED` ⟹ `files.status = CONFIRMED` | Completed upload always has confirmed file |
+| `uploads.status = COMPLETED` ⟹ `files.status = CONFIRMED` ∧ `file_nodes` exists | Completed upload always has confirmed file **and** a path. Enforced by atomic `/complete` transaction. |
 | `files.status = CONFIRMED` ⟹ storage has the complete object | Fundamental data integrity guarantee |
 | `file_nodes.file_id` references existing `files.file_id` | Referential integrity |
 
@@ -786,15 +838,22 @@ UPLOADING ──▶ COMPLETED
 
 ```
 DELETE /v1/fs/{path}
-  1. DELETE FROM file_nodes WHERE path = ?
-  2. SELECT COUNT(*) FROM file_nodes WHERE file_id = ?
-     → if refcount > 0: done (other paths still reference this file)
-     → if refcount = 0:
-        3. DELETE FROM file_tags WHERE file_id = ?
-        4. if db9: fs9 delete; if s3: S3.DeleteObject(storage_ref)
-        5. UPDATE files SET status = 'DELETED'
+  BEGIN;
+    1. SELECT file_id FROM file_nodes WHERE path = ? FOR UPDATE
+    2. DELETE FROM file_nodes WHERE path = ?
+    3. SELECT f.file_id FROM files f WHERE f.file_id = ?
+       FOR UPDATE                              -- lock the files row
+    4. SELECT COUNT(*) FROM file_nodes WHERE file_id = ?
+       → if refcount > 0: COMMIT (other paths still reference this file)
+       → if refcount = 0:
+          5. DELETE FROM file_tags WHERE file_id = ?
+          6. UPDATE files SET status = 'DELETED'
+  COMMIT;
+  7. Async (outside txn): if db9: fs9 delete; if s3: S3.DeleteObject(storage_ref)
   → 200 OK
 ```
+
+**Why `FOR UPDATE`?** Without it, two concurrent `rm` calls on different paths pointing to the same file can both see refcount=1, both decide "not last link", and leave an orphan file with refcount=0. The `FOR UPDATE` on the `files` row serializes concurrent deletions and prevents this TOCTOU race. Storage deletion is deferred to outside the transaction (and also handled by the Reaper) so the critical section stays short.
 
 Reference-counted delete: the file entity is only removed when no paths reference it.
 
@@ -831,16 +890,91 @@ Read-only only. No recipient-side caching. Source tenant owns bytes.
 
 ---
 
-## 10. Multi-Tenancy
+## 10. Autoprovision & Control Plane
+
+### One Tenant = One Agent = One db9 Cluster
+
+Each agent gets its own db9 cluster. No registration — the first API call triggers autoprovision (same pattern as [mem9](https://mem9.ai)).
 
 ```
-Client (API Key)
-  → Auth Middleware
-    → Resolve: Credential → Tenant record (db9 connection + S3 config)
-    → All operations scoped to this tenant
+Agent (no key yet)
+  │
+  POST /v1/provision
+  │
+  dat9 control plane:
+    1. Generate api_key: "dat9_" + 32 random bytes (base62)
+    2. Call db9 API: create cluster → get connection string
+    3. Connect to new cluster, run schema init (4 tables + indexes + extensions)
+    4. Create S3 prefix: s3://<bucket>/tenants/<tenant_id>/blobs/
+    5. INSERT INTO tenants (api_key_hash, db9_dsn, s3_prefix, ...)
+    6. Return api_key to agent (only time it's shown in plaintext)
+  │
+  ◀── 200 { "api_key": "dat9_7kQ3x..." }
+
+Subsequent requests:
+  Authorization: Bearer dat9_7kQ3x...
+    → SHA-256(key) prefix lookup in tenants table
+    → Resolve db9 connection + S3 config
+    → All operations scoped to this tenant's db9 cluster
 ```
 
-Each tenant has its own db9 database and S3 prefix. Connection pooling with LRU eviction.
+### Control Plane Database
+
+The control plane has its own database (separate from tenant db9 clusters). Can be a single db9 instance or PostgreSQL.
+
+```sql
+CREATE TABLE tenants (
+    tenant_id       VARCHAR(26) PRIMARY KEY,    -- ULID
+    api_key_prefix  CHAR(12) NOT NULL,           -- first 12 chars of api_key, for fast lookup
+    api_key_hash    CHAR(64) NOT NULL,           -- SHA-256(api_key), for verification
+    db9_dsn         TEXT NOT NULL,                -- db9 cluster connection string (encrypted at rest)
+    s3_bucket       VARCHAR(63) NOT NULL,
+    s3_prefix       VARCHAR(1024) NOT NULL,       -- tenants/<tenant_id>/blobs/
+    status          ENUM('PROVISIONING','ACTIVE','SUSPENDED','DELETED') NOT NULL DEFAULT 'PROVISIONING',
+    created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    last_active_at  DATETIME(3),
+
+    INDEX idx_prefix (api_key_prefix),
+    INDEX idx_status (status)
+);
+```
+
+**api_key security**:
+
+- **Never stored in plaintext.** Only `SHA-256(api_key)` is stored. The prefix (first 12 chars) is stored separately for fast lookup.
+- **Prefix is non-unique.** 12 chars base62 ≈ 3.2 × 10^21 combinations — collision is astronomically unlikely, but the index is non-unique and auth verifies the full SHA-256 hash. If multiple rows match a prefix, each is checked.
+- **Format**: `dat9_` + 32 random bytes (base62). The `dat9_` prefix enables GitHub secret scanning and similar leak-detection tools.
+- **Transport**: HTTPS only. dat9 server rejects plain HTTP requests.
+
+### Schema Init
+
+When a new db9 cluster is provisioned, dat9 runs:
+
+```sql
+-- Extensions
+CREATE EXTENSION IF NOT EXISTS embedding;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS fs9;
+
+-- Tables (see §7 for full DDL)
+CREATE TABLE file_nodes (...);
+CREATE TABLE files (...);
+CREATE TABLE file_tags (...);
+CREATE TABLE uploads (...);
+```
+
+### Auth Flow (per request)
+
+```
+1. Extract api_key from Authorization header
+2. Compute prefix = api_key[:12], hash = SHA-256(api_key)
+3. SELECT * FROM tenants WHERE api_key_prefix = ? AND api_key_hash = ? AND status = 'ACTIVE'
+4. No row → 401 Unauthorized
+5. Open db9 connection (from pool, keyed by tenant_id)
+6. Route all operations to this tenant's db9 + S3
+```
+
+Single query, no second round-trip. Connection pooling with LRU eviction for idle tenant connections.
 
 ---
 
@@ -853,10 +987,13 @@ Raw input (URL-decoded once)
   → Reject if contains: NUL (\x00), control characters (\x01-\x1f), backslash (\)
   → Reject if any segment is "." or ".."
   → Collapse consecutive slashes: "///" → "/"
-  → Strip trailing slash (except root "/")
+  → Directory paths: MUST end with "/" (e.g., "/data/")
+  → File paths: MUST NOT end with "/" (e.g., "/data/a.txt")
   → Unicode NFC normalization
   → Result: canonical path
 ```
+
+**Trailing slash convention**: Directories always end with `/`, files never do. This is consistent throughout: `parent_path` stores `/data/`, `ls` queries `WHERE parent_path = '/data/'`, and `rm -r` uses `LIKE '/data/%'`. The server enforces this on all API inputs.
 
 ### 11.2 Presigned URL Security
 
@@ -911,7 +1048,7 @@ Raw input (URL-decoded once)
 
 | Question | Options | Leaning |
 |---|---|---|
-| Small/large file threshold | 512KB / 1MB / 10MB | 1MB |
+| Small/large file threshold | 1MB / 5MB / 10MB | 5MB — db9 fs9 supports up to 100MB; a 3MB Markdown document benefits from auto-embedding. Higher threshold = more files get semantic search for free. Trade-off: larger db9 storage cost per tenant. |
 | db9 embedding model | text-embedding-v4 / amazon.titan-embed-text-v2:0 | titan (matches user config) |
 | db9 FTS tokenizer | simple / jieba / chinese_ngram | jieba (Chinese support) |
 | Object store | AWS S3 / MinIO / R2 | S3 for cloud, MinIO for on-prem |
@@ -919,6 +1056,11 @@ Raw input (URL-decoded once)
 | File versioning | None / simple version chain | None for P0 |
 | Change notifications | None / polling / WebSocket | Polling for P0 |
 | content_text for binary files | NULL / auto-extract text | NULL (only text files get content_text) |
+| Provision anti-abuse | Rate limit only / CAPTCHA / invite-only | Rate limit for MVP. At scale: per-IP throttle on `/v1/provision`, max clusters per source. |
+| Tenant-internal ACL | Single key full access / scoped tokens / path-based ACL | Single key for P0. Path-based ACL is a post-MVP concern (enterprise). |
+| Cross-cluster schema migration | Manual / versioned migration tool / blue-green | Manual for P0. Need a rollout strategy before 100+ tenants. |
+| S3 orphan reconciliation | Reaper only / S3 Inventory cross-check | Reaper for P0. S3 Inventory periodic audit at scale. |
+| Observability | Structured logs only / metrics + traces / full o11y stack | Structured logs + Prometheus metrics for P0. Traces later. |
 
 ---
 
