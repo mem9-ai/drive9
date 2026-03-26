@@ -133,8 +133,15 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 }
 
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string) {
-	// Bifurcate by Content-Length: large files get 202 + presigned URLs
-	if cl := r.ContentLength; cl > 0 && s.backend.IsLargeFile(cl) {
+	// Bifurcate by size: large files get 202 + presigned URLs.
+	// Prefer X-Dat9-Content-Length header (needed because Go's net/http
+	// sends Content-Length: 0 when body is http.NoBody, even if
+	// req.ContentLength was set to the real size).
+	cl := r.ContentLength
+	if h := r.Header.Get("X-Dat9-Content-Length"); h != "" {
+		cl, _ = strconv.ParseInt(h, 10, 64)
+	}
+	if cl > 0 && s.backend.IsLargeFile(cl) {
 		plan, err := s.backend.InitiateUpload(r.Context(), path, cl)
 		if err != nil {
 			if errors.Is(err, meta.ErrUploadConflict) {

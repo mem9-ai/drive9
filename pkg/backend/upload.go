@@ -137,12 +137,12 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		return fmt.Errorf("complete multipart: %w", err)
 	}
 
-	// Atomically: confirm file, complete upload, ensure parents, create/overwrite node
-	var oldFileID string
+	// Atomically: complete upload, ensure parents, create or overwrite node
+	// Overwrite preserves inode model: update existing files row in-place
+	// so all zero-copy links see the new data.
+	var oldStorageRef string
+	var isOverwrite bool
 	if err := b.store.InTx(func(tx *sql.Tx) error {
-		if err := b.store.ConfirmFileTx(tx, upload.FileID); err != nil {
-			return err
-		}
 		if err := b.store.CompleteUploadTx(tx, uploadID); err != nil {
 			return err
 		}
@@ -150,16 +150,35 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			return err
 		}
 
-		// Check if path already exists — overwrite by updating file_id
+		// Check if path already exists
 		var existingFileID sql.NullString
 		err := tx.QueryRow(`SELECT file_id FROM file_nodes WHERE path = ?`, upload.TargetPath).Scan(&existingFileID)
 		if err == nil && existingFileID.Valid {
-			// Overwrite: update existing node to point to new file
-			oldFileID = existingFileID.String
-			_, err := tx.Exec(`UPDATE file_nodes SET file_id = ? WHERE path = ?`, upload.FileID, upload.TargetPath)
+			// Overwrite: update existing files row in-place (preserves inode/links)
+			isOverwrite = true
+			// Get old storage ref for cleanup
+			var oldRef string
+			tx.QueryRow(`SELECT storage_ref FROM files WHERE file_id = ?`, existingFileID.String).Scan(&oldRef)
+			oldStorageRef = oldRef
+
+			// Update the existing files row with new S3 data
+			_, err := tx.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
+				size_bytes = ?, revision = revision + 1, status = 'CONFIRMED',
+				confirmed_at = strftime('%Y-%m-%dT%H:%M:%f','now')
+				WHERE file_id = ?`,
+				meta.StorageS3, upload.S3Key, upload.TotalSize, existingFileID.String)
+			if err != nil {
+				return err
+			}
+			// Mark the new pending file record as deleted (not needed)
+			_, err = tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, upload.FileID)
 			return err
 		}
-		// New path: insert node
+
+		// New path: confirm the new file and insert node
+		if err := b.store.ConfirmFileTx(tx, upload.FileID); err != nil {
+			return err
+		}
 		return b.store.InsertNodeTx(tx, &meta.FileNode{
 			NodeID:     b.genID(),
 			Path:       upload.TargetPath,
@@ -172,13 +191,9 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		return err
 	}
 
-	// Clean up old file if overwritten
-	if oldFileID != "" {
-		oldFile, err := b.store.GetFile(oldFileID)
-		if err == nil {
-			b.store.MarkFileDeleted(oldFileID)
-			b.deleteBlob(oldFile.StorageRef)
-		}
+	// Clean up old blob if overwritten
+	if isOverwrite && oldStorageRef != "" {
+		b.deleteBlob(oldStorageRef)
 	}
 	return nil
 }
