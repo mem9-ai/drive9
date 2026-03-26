@@ -6,10 +6,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
+
+	"github.com/mem9-ai/dat9/pkg/backend"
+	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/s3client"
+	srvpkg "github.com/mem9-ai/dat9/pkg/server"
 )
 
 // TestWriteStreamSmallFile verifies that WriteStream sends a small file via single direct PUT.
@@ -91,7 +98,7 @@ func TestWriteStreamLargeFile(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "")
-	c.smallFileThreshold = 1 // force large file path for test
+	c.smallFileThreshold = 1   // force large file path for test
 	data := []byte("12345678") // 8 bytes, 2 parts (5+3)
 
 	var progressCalls []int
@@ -240,5 +247,123 @@ func TestResumeUpload(t *testing.T) {
 	}
 	if progressCalls[0] != [2]int{2, 3} {
 		t.Fatalf("progress = %v, want [[2 3]]", progressCalls)
+	}
+}
+
+func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
+	dbFile, err := os.CreateTemp("", "dat9-client-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbFile.Close()
+	defer os.Remove(dbFile.Name())
+
+	blobDir, err := os.MkdirTemp("", "dat9-client-blobs-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(blobDir)
+
+	s3Dir, err := os.MkdirTemp("", "dat9-client-s3-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(s3Dir)
+
+	store, err := meta.Open(dbFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseURL := "http://" + ln.Addr().String()
+	s3c, err := s3client.NewLocal(s3Dir, baseURL+"/s3")
+	if err != nil {
+		ln.Close()
+		t.Fatal(err)
+	}
+
+	b, err := backend.NewWithS3(store, blobDir, s3c)
+	if err != nil {
+		ln.Close()
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewUnstartedServer(srvpkg.New(b))
+	ts.Listener.Close()
+	ts.Listener = ln
+	ts.Start()
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	data := bytes.Repeat([]byte("x"), 20<<20) // 20MB => 3 parts with 8MB part size
+
+	req, err := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/resume-int.bin", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-Dat9-Content-Length", fmt.Sprintf("%d", len(data)))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("initiate upload: expected 202, got %d", resp.StatusCode)
+	}
+
+	var plan UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatalf("decode upload plan: %v", err)
+	}
+	if len(plan.Parts) != 3 {
+		t.Fatalf("expected 3 parts, got %d", len(plan.Parts))
+	}
+
+	req, err = http.NewRequest(http.MethodPut, plan.Parts[0].URL, bytes.NewReader(data[:int(plan.Parts[0].Size)]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = plan.Parts[0].Size
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("upload part 1: expected 200, got %d", resp.StatusCode)
+	}
+
+	var mu sync.Mutex
+	var progressCalls [][2]int
+	progress := func(partNum, total int, bytesUploaded int64) {
+		mu.Lock()
+		progressCalls = append(progressCalls, [2]int{partNum, total})
+		mu.Unlock()
+	}
+
+	if err := c.ResumeUpload(context.Background(), "/resume-int.bin", bytes.NewReader(data), int64(len(data)), progress); err != nil {
+		t.Fatalf("ResumeUpload integration: %v", err)
+	}
+
+	if len(progressCalls) != 2 {
+		t.Fatalf("progress called %d times, want 2", len(progressCalls))
+	}
+	seen := map[int]bool{}
+	for _, call := range progressCalls {
+		if call[1] != 3 {
+			t.Fatalf("progress total = %d, want 3; calls=%v", call[1], progressCalls)
+		}
+		seen[call[0]] = true
+	}
+	if !seen[2] || !seen[3] {
+		t.Fatalf("progress part numbers = %v, want parts 2 and 3", progressCalls)
 	}
 }
