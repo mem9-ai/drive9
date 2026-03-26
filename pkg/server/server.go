@@ -15,6 +15,7 @@ import (
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
 type Server struct {
@@ -28,6 +29,12 @@ func New(b *backend.Dat9Backend) *Server {
 	mux.HandleFunc("/v1/fs/", s.handleFS)
 	mux.HandleFunc("/v1/uploads", s.handleUploads)
 	mux.HandleFunc("/v1/uploads/", s.handleUploadAction)
+
+	// Register local S3 handler for presigned URL support in dev/test mode
+	if local, ok := b.S3().(*s3client.LocalS3Client); ok {
+		mux.Handle("/s3/", http.StripPrefix("/s3", local.Handler()))
+	}
+
 	s.mux = mux
 	return s
 }
@@ -336,6 +343,10 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 			return
 		}
 		if errors.Is(err, meta.ErrUploadNotActive) {
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, meta.ErrPathConflict) {
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}

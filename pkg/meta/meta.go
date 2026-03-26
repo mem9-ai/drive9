@@ -14,9 +14,10 @@ import (
 )
 
 var (
-	ErrNotFound       = errors.New("not found")
+	ErrNotFound        = errors.New("not found")
 	ErrUploadNotActive = errors.New("upload is not in UPLOADING state")
 	ErrUploadExpired   = errors.New("upload has expired")
+	ErrPathConflict    = errors.New("path already exists")
 )
 
 type StorageType string

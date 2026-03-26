@@ -215,14 +215,31 @@ func TestListUploads(t *testing.T) {
 	b := newTestBackendWithS3(t)
 	ctx := context.Background()
 
-	b.InitiateUpload(ctx, "/list-test.bin", 2<<20)
-	b.InitiateUpload(ctx, "/list-test.bin", 3<<20)
+	// One upload per path — use different paths
+	b.InitiateUpload(ctx, "/list-a.bin", 2<<20)
+	b.InitiateUpload(ctx, "/list-b.bin", 3<<20)
 
-	uploads, err := b.ListUploads("/list-test.bin", meta.UploadUploading)
+	uploadsA, err := b.ListUploads("/list-a.bin", meta.UploadUploading)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(uploads) != 2 {
-		t.Errorf("expected 2 uploads, got %d", len(uploads))
+	if len(uploadsA) != 1 {
+		t.Errorf("expected 1 upload for /list-a.bin, got %d", len(uploadsA))
+	}
+}
+
+func TestOneUploadPerPath(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	_, err := b.InitiateUpload(ctx, "/dup.bin", 2<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Second upload for same path should fail
+	_, err = b.InitiateUpload(ctx, "/dup.bin", 3<<20)
+	if err == nil {
+		t.Error("expected error for duplicate active upload")
 	}
 }
