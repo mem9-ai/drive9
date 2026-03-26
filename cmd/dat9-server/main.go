@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,6 +92,7 @@ func usage() {
 
 environment:
   DAT9_LISTEN_ADDR serve listen address (default: :9009)
+  DAT9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
   DAT9_DB_PATH     sqlite path (default: ./dat9.db)
   DAT9_BLOB_DIR    blob directory (default: ./blobs)
   DAT9_S3_DIR      s3 directory (default: ./s3)
@@ -111,16 +113,18 @@ func publicBaseURL(listenAddr string) string {
 		return v
 	}
 
+	// Without DAT9_PUBLIC_URL, only allow explicit loopback addresses.
+	// Wildcard or non-loopback addresses would produce unreachable presigned URLs.
 	switch {
-	case strings.HasPrefix(listenAddr, ":"):
-		return "http://127.0.0.1" + listenAddr
-	case strings.HasPrefix(listenAddr, "0.0.0.0:"):
-		return "http://127.0.0.1:" + strings.TrimPrefix(listenAddr, "0.0.0.0:")
-	case strings.HasPrefix(listenAddr, "[::]:"):
-		return "http://127.0.0.1:" + strings.TrimPrefix(listenAddr, "[::]:")
+	case strings.HasPrefix(listenAddr, "127.0.0.1:"),
+		strings.HasPrefix(listenAddr, "localhost:"),
+		strings.HasPrefix(listenAddr, "[::1]:"):
+		return "http://" + listenAddr
 	case strings.HasPrefix(listenAddr, "http://"), strings.HasPrefix(listenAddr, "https://"):
 		return strings.TrimRight(listenAddr, "/")
 	default:
-		return "http://" + listenAddr
+		log.Fatalf("DAT9_PUBLIC_URL is required when listen address is %q (wildcard or non-loopback). "+
+			"Set DAT9_PUBLIC_URL to the externally reachable base URL.", listenAddr)
+		return "" // unreachable
 	}
 }
