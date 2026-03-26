@@ -204,6 +204,9 @@ func (s *Store) InsertNode(n *FileNode) error {
 	_, err := s.db.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), timeStr(n.CreatedAt))
+	if isUniqueViolation(err) {
+		return ErrPathConflict
+	}
 	return err
 }
 
@@ -473,6 +476,9 @@ func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
 	_, err := db.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), timeStr(n.CreatedAt))
+	if isUniqueViolation(err) {
+		return ErrPathConflict
+	}
 	return err
 }
 
