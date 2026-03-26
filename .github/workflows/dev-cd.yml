@@ -14,10 +14,23 @@ on:
   workflow_dispatch:
     inputs:
       deploy_ref:
-        description: "Branch, tag, or SHA to deploy"
+        description: "Select ref to deploy"
         required: true
         default: "main"
-        type: string
+        type: choice
+        options:
+          - main
+          - feat/makefile-lint-ci-targets
+          - dat9-dev2/t19-integration
+          - dat9-dev3/p1-transfer-engine
+          - feat/p1-large-file-upload
+          - feat/p1-large-file-upload-final
+          - feat/split-cli-server-bin
+          - feat/tidb-mysql-migration
+          - docs/add-readme
+          - new_overview_design
+          - new_overview_design_main
+          - proposal/dat9-agent-native-data-infra
 
 env:
   AWS_REGION: ap-southeast-1
