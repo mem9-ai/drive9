@@ -1,5 +1,26 @@
 # RFC: Layered Design for `dat9` on Per-Tenant S3 + TiDB + Durable QueueFS (Layer V3)
 
+**Status**: Archived architecture exploration
+
+This document is kept as a historical layered architecture draft.
+It is useful for terminology and architectural exploration, but it is **not** the current rollout plan or canonical implementation target.
+
+Use current docs first:
+
+- `docs/overview.md`
+- `docs/design/*.md`
+- `docs/design/canonical-schema.md`
+
+Conflict rule:
+
+- if this document conflicts with the current RFC set, the current RFC set wins
+
+Known stale areas in this document include:
+
+- stronger early assumptions about queue/runtime rollout than the current phased P0 path
+- schema and state-model discussions that are now split across focused RFCs
+- architecture exploration detail that exceeds the current implementation target
+
 ## 1. Overview
 
 This document defines the target layered architecture for `dat9`.

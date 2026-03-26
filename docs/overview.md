@@ -158,6 +158,9 @@ Use these RFCs for the detailed definitions of:
 - retrieval and semantic derivation
 - upload, reconcile, and recovery behavior
 
+Archived historical references remain under `docs/old/`.
+They are useful for early implementation context, but they are not normative; if they conflict with the current RFC set, the current RFC set wins.
+
 ## 8. Summary
 
 dat9 should be understood as:

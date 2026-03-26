@@ -1,8 +1,27 @@
 # dat9: Agent-Native Data Infrastructure
 
-**Status**: Proposal (Draft v2)
+**Status**: Archived early-stage implementation reference
 **Date**: 2026-03-26
 **License**: Apache 2.0
+
+This document is kept as a historical implementation reference.
+It is **not** the current source of truth for dat9 design.
+
+Use current docs first:
+
+- `docs/overview.md`
+- `docs/design/*.md`
+- `docs/design/canonical-schema.md`
+
+Conflict rule:
+
+- if this document conflicts with the current RFC set, the current RFC set wins
+
+Known stale areas in this document include:
+
+- assumptions that db9 provides automatic generated-column embedding helpers such as `EMBED_TEXT()`
+- schema descriptions that predate `docs/design/canonical-schema.md`
+- async/search assumptions that changed after issue `#30`
 
 ---
 
