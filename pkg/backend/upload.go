@@ -129,7 +129,7 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		return fmt.Errorf("list parts: %w", err)
 	}
 
-	// Verify all parts are present and correctly sized
+	// Verify all parts are present, correctly sized, and have ETags
 	if len(parts) != upload.PartsTotal {
 		return fmt.Errorf("incomplete upload: got %d parts, expected %d", len(parts), upload.PartsTotal)
 	}
@@ -137,6 +137,9 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 	for i, p := range parts {
 		if p.Size != expectedParts[i].Size {
 			return fmt.Errorf("part %d size mismatch: got %d, expected %d", p.Number, p.Size, expectedParts[i].Size)
+		}
+		if p.ETag == "" {
+			return fmt.Errorf("part %d missing ETag", p.Number)
 		}
 	}
 
@@ -218,9 +221,12 @@ func (b *Dat9Backend) ResumeUpload(ctx context.Context, uploadID string) (*Uploa
 		return nil, meta.ErrUploadNotActive
 	}
 
-	// Check expiry
+	// Check expiry — abort S3 multipart before marking metadata.
+	// If S3 abort fails, leave status as UPLOADING so a future call can retry.
 	if time.Now().After(upload.ExpiresAt) {
-		b.s3.AbortMultipartUpload(ctx, upload.S3Key, upload.S3UploadID)
+		if err := b.s3.AbortMultipartUpload(ctx, upload.S3Key, upload.S3UploadID); err != nil {
+			return nil, fmt.Errorf("abort expired multipart upload: %w", err)
+		}
 		b.store.AbortUpload(uploadID)
 		return nil, meta.ErrUploadExpired
 	}
