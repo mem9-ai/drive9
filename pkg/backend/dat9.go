@@ -4,6 +4,7 @@ package backend
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
+	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -28,6 +30,7 @@ const smallFileThreshold = 1 << 20 // 1MB
 type Dat9Backend struct {
 	store   *meta.Store
 	blobDir string
+	s3      s3client.S3Client // nil when S3 is not configured
 	mu      sync.Mutex
 	entropy io.Reader
 }
@@ -41,6 +44,16 @@ func New(store *meta.Store, blobDir string) (*Dat9Backend, error) {
 		blobDir: blobDir,
 		entropy: ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0),
 	}, nil
+}
+
+// NewWithS3 creates a Dat9Backend with S3 support for large file uploads.
+func NewWithS3(store *meta.Store, blobDir string, s3 s3client.S3Client) (*Dat9Backend, error) {
+	b, err := New(store, blobDir)
+	if err != nil {
+		return nil, err
+	}
+	b.s3 = s3
+	return b, nil
 }
 
 func (b *Dat9Backend) Store() *meta.Store { return b.store }
@@ -373,6 +386,23 @@ func (b *Dat9Backend) OpenWrite(path string) (io.WriteCloser, error) {
 	return &writeCloser{backend: b, path: path}, nil
 }
 
+// --- CapabilityProvider ---
+
+func (b *Dat9Backend) GetCapabilities() filesystem.Capabilities {
+	caps := filesystem.DefaultCapabilities()
+	if b.s3 != nil {
+		caps.IsObjectStore = true
+	}
+	return caps
+}
+
+func (b *Dat9Backend) GetPathCapabilities(path string) filesystem.Capabilities {
+	return b.GetCapabilities()
+}
+
+// Verify interface compliance.
+var _ filesystem.CapabilityProvider = (*Dat9Backend)(nil)
+
 // CopyFile performs a zero-copy cp (new file_node pointing to same file_id).
 func (b *Dat9Backend) CopyFile(srcPath, dstPath string) error {
 	srcPath, err := pathutil.Canonicalize(srcPath)
@@ -418,6 +448,11 @@ func (b *Dat9Backend) readBlob(ref string) ([]byte, error) {
 }
 
 func (b *Dat9Backend) deleteBlob(ref string) {
+	if b.s3 != nil && !strings.HasPrefix(ref, "/blobs/") {
+		// S3 key (e.g. "blobs/ULID") — delete from S3
+		b.s3.DeleteObject(context.Background(), ref)
+		return
+	}
 	os.Remove(b.blobPath(ref))
 }
 
