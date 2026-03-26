@@ -2,8 +2,10 @@ package testmysql
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
+	"testing"
 	"time"
 
 	tcmysql "github.com/testcontainers/testcontainers-go/modules/mysql"
@@ -28,11 +30,11 @@ func Start(ctx context.Context) (*Instance, error) {
 		return &Instance{DSN: dsn}, nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 4*time.Minute)
 	defer cancel()
 
 	c, err := tcmysql.Run(ctx,
-		"mysql:8.4",
+		"mysql:8.0.36",
 		tcmysql.WithDatabase("dat9_test"),
 		tcmysql.WithUsername("dat9"),
 		tcmysql.WithPassword("dat9pass"),
@@ -41,7 +43,8 @@ func Start(ctx context.Context) (*Instance, error) {
 		return nil, fmt.Errorf("start mysql container: %w", err)
 	}
 
-	dsn, err := c.ConnectionString(ctx, "parseTime=true", "multiStatements=true")
+	// parseTime=true lets DATETIME scan directly into time.Time.
+	dsn, err := c.ConnectionString(ctx, "parseTime=true")
 	if err != nil {
 		_ = c.Terminate(context.Background())
 		return nil, fmt.Errorf("build mysql dsn: %w", err)
@@ -53,4 +56,19 @@ func Start(ctx context.Context) (*Instance, error) {
 			return c.Terminate(ctx)
 		},
 	}, nil
+}
+
+func ResetDB(t *testing.T, db *sql.DB) {
+	t.Helper()
+	queries := []string{
+		"DELETE FROM file_nodes",
+		"DELETE FROM file_tags",
+		"DELETE FROM uploads",
+		"DELETE FROM files",
+	}
+	for _, q := range queries {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("reset test db: %v", err)
+		}
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/meta"
 )
 
@@ -22,7 +23,7 @@ func newTestBackend(t *testing.T) *Dat9Backend {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resetTestDB(t, store)
+	testmysql.ResetDB(t, store.DB())
 	t.Cleanup(func() { store.Close() })
 
 	b, err := New(store, blobDir)
@@ -30,21 +31,6 @@ func newTestBackend(t *testing.T) *Dat9Backend {
 		t.Fatal(err)
 	}
 	return b
-}
-
-func resetTestDB(t *testing.T, store *meta.Store) {
-	t.Helper()
-	queries := []string{
-		"DELETE FROM file_nodes",
-		"DELETE FROM file_tags",
-		"DELETE FROM uploads",
-		"DELETE FROM files",
-	}
-	for _, q := range queries {
-		if _, err := store.DB().Exec(q); err != nil {
-			t.Fatalf("reset test db: %v", err)
-		}
-	}
 }
 
 var _ filesystem.FileSystem = (*Dat9Backend)(nil)
