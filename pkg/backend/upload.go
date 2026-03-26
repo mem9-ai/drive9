@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -13,8 +14,9 @@ import (
 
 // UploadPlan is returned by InitiateUpload for the 202 response.
 type UploadPlan struct {
-	UploadID string                 `json:"upload_id"`
-	Key      string                 `json:"key"`
+	UploadID string                    `json:"upload_id"`
+	Key      string                    `json:"key"`
+	PartSize int64                     `json:"part_size"`
 	Parts    []*s3client.UploadPartURL `json:"parts"`
 }
 
@@ -41,7 +43,8 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 	// Enforce one active upload per path
 	existing, err := b.store.GetUploadByPath(path)
 	if err == nil && existing != nil {
-		return nil, fmt.Errorf("active upload already exists for path %s (upload_id=%s)", path, existing.UploadID)
+		return nil, fmt.Errorf("%w: active upload already exists for path %s (upload_id=%s)",
+			meta.ErrPathConflict, path, existing.UploadID)
 	}
 
 	fileID := b.genID()
@@ -107,6 +110,7 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 	return &UploadPlan{
 		UploadID: uploadID,
 		Key:      s3Key,
+		PartSize: s3client.PartSize,
 		Parts:    urls,
 	}, nil
 }
@@ -137,17 +141,10 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		return fmt.Errorf("complete multipart: %w", err)
 	}
 
-	// Atomically: check path conflict, confirm file, complete upload, ensure parents, create node
-	return b.store.InTx(func(tx *sql.Tx) error {
-		// Check if target path already exists
-		var count int64
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE path = ?`, upload.TargetPath).Scan(&count); err != nil {
-			return err
-		}
-		if count > 0 {
-			return meta.ErrPathConflict
-		}
-
+	var replaced *meta.File
+	// Atomically: confirm file, complete upload, ensure parents, then either insert
+	// or overwrite the path node with the new file entity.
+	err = b.store.InTx(func(tx *sql.Tx) error {
 		if err := b.store.ConfirmFileTx(tx, upload.FileID); err != nil {
 			return err
 		}
@@ -157,6 +154,15 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		if err := b.store.EnsureParentDirsTx(tx, upload.TargetPath, b.genID); err != nil {
 			return err
 		}
+
+		replaced, err = b.store.ReplaceNodeFileTx(tx, upload.TargetPath, upload.FileID)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, meta.ErrNotFound) {
+			return err
+		}
+
 		return b.store.InsertNodeTx(tx, &meta.FileNode{
 			NodeID:     b.genID(),
 			Path:       upload.TargetPath,
@@ -166,6 +172,13 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			CreatedAt:  time.Now(),
 		})
 	})
+	if err != nil {
+		return err
+	}
+	if replaced != nil {
+		b.deleteBlob(replaced.StorageRef)
+	}
+	return nil
 }
 
 // ResumeUpload returns presigned URLs for the missing parts of an in-progress upload.
@@ -215,6 +228,7 @@ func (b *Dat9Backend) ResumeUpload(ctx context.Context, uploadID string) (*Uploa
 	return &UploadPlan{
 		UploadID: uploadID,
 		Key:      upload.S3Key,
+		PartSize: upload.PartSize,
 		Parts:    urls,
 	}, nil
 }

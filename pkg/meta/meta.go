@@ -482,6 +482,59 @@ func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
 	return err
 }
 
+// ReplaceNodeFileTx rewires an existing file node to point at a new file.
+// If the previous file becomes orphaned, it is marked DELETED and returned so
+// the caller can clean up its underlying blob/object after commit.
+func (s *Store) ReplaceNodeFileTx(db execer, path, newFileID string) (*File, error) {
+	var oldFileID sql.NullString
+	var isDir int
+	err := db.QueryRow(`SELECT file_id, is_directory FROM file_nodes WHERE path = ?`, path).
+		Scan(&oldFileID, &isDir)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if isDir != 0 {
+		return nil, ErrPathConflict
+	}
+
+	if _, err := db.Exec(`UPDATE file_nodes SET file_id = ?, is_directory = 0 WHERE path = ?`,
+		newFileID, path); err != nil {
+		if isUniqueViolation(err) {
+			return nil, ErrPathConflict
+		}
+		return nil, err
+	}
+
+	if !oldFileID.Valid || oldFileID.String == "" || oldFileID.String == newFileID {
+		return nil, nil
+	}
+
+	var count int64
+	if err := db.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE file_id = ?`, oldFileID.String).
+		Scan(&count); err != nil {
+		return nil, err
+	}
+	if count > 0 {
+		return nil, nil
+	}
+
+	if _, err := db.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, oldFileID.String); err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(`DELETE FROM file_tags WHERE file_id = ?`, oldFileID.String); err != nil {
+		return nil, err
+	}
+
+	row := db.QueryRow(`SELECT file_id, storage_type, storage_ref, content_type,
+		size_bytes, checksum_sha256, revision, status, source_id, content_text,
+		created_at, confirmed_at, expires_at
+		FROM files WHERE file_id = ?`, oldFileID.String)
+	return scanFile(row)
+}
+
 func (s *Store) MarkFileDeleted(fileID string) error {
 	_, err := s.db.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fileID)
 	return err
