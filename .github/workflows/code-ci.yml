@@ -31,3 +31,6 @@ jobs:
 
       - name: Test
         run: make test
+
+      - name: Build (server and cli)
+        run: make build
