@@ -8,12 +8,15 @@ import (
 	"io"
 	"net/http"
 	"sync"
+
+	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
 // UploadPlan is the server's 202 response for large file uploads.
 type UploadPlan struct {
-	UploadID string       `json:"upload_id"`
-	Parts    []PartURL    `json:"parts"`
+	UploadID string    `json:"upload_id"`
+	PartSize int64     `json:"part_size"` // standard part size (last part may be smaller)
+	Parts    []PartURL `json:"parts"`
 }
 
 // PartURL is a presigned URL for uploading one part.
@@ -34,17 +37,33 @@ type CompletePart struct {
 // partNumber is 1-based, totalParts is the total count.
 type ProgressFunc func(partNumber, totalParts int, bytesUploaded int64)
 
+// DefaultSmallFileThreshold matches the server's threshold for direct PUT vs multipart.
+const DefaultSmallFileThreshold = 1 << 20 // 1MB
+
 // WriteStream uploads data from a reader. For small files (size < threshold),
-// it does a direct PUT. For large files, the server returns 202 with presigned
-// URLs, and the engine uploads parts concurrently.
+// it does a direct PUT with body. For large files, it sends a Content-Length-only
+// PUT to get a 202 with presigned URLs, then uploads parts concurrently.
 func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc) error {
+	threshold := int64(DefaultSmallFileThreshold)
+	if c.smallFileThreshold > 0 {
+		threshold = c.smallFileThreshold
+	}
+	if size < threshold {
+		// Small file: direct PUT with body
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return fmt.Errorf("read data: %w", err)
+		}
+		return c.Write(path, data)
+	}
+
+	// Large file: Content-Length only, no body — server returns 202 with upload plan
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", size))
-	// No body — server decides based on Content-Length
 
 	resp, err := c.do(req)
 	if err != nil {
@@ -52,42 +71,22 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 	}
 	defer resp.Body.Close()
 
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusCreated:
-		// Small file: server expects body in a second request
-		return c.writeSmall(ctx, path, r)
-
-	case http.StatusAccepted:
-		// Large file: server returned presigned URLs
-		var plan UploadPlan
-		if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
-			return fmt.Errorf("decode upload plan: %w", err)
-		}
-		return c.uploadParts(ctx, plan, r, progress)
-
-	default:
+	if resp.StatusCode != http.StatusAccepted {
 		return readError(resp)
 	}
-}
 
-// writeSmall does a direct PUT with the body for small files.
-func (c *Client) writeSmall(ctx context.Context, path string, r io.Reader) error {
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return fmt.Errorf("read data: %w", err)
+	var plan UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		return fmt.Errorf("decode upload plan: %w", err)
 	}
-	return c.Write(path, data)
+	return c.uploadParts(ctx, plan, r, progress)
 }
 
 // uploadParts concurrently uploads parts to presigned URLs.
+// Part data is read sequentially from r, but uploads run concurrently
+// with at most maxConcurrency in-flight to bound memory usage.
 func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, r io.Reader, progress ProgressFunc) error {
 	const maxConcurrency = 4
-
-	type partResult struct {
-		number int
-		etag   string
-		err    error
-	}
 
 	results := make([]CompletePart, len(plan.Parts))
 	errCh := make(chan error, 1)
@@ -95,10 +94,27 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, r io.Reader, 
 	var wg sync.WaitGroup
 
 	for i, part := range plan.Parts {
-		// Read the part data from the sequential reader
+		// Acquire semaphore before reading so we hold at most maxConcurrency buffers
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		}
+
+		// Check for prior upload errors before reading more data
+		select {
+		case err := <-errCh:
+			wg.Wait()
+			return err
+		default:
+		}
+
 		partData := make([]byte, part.Size)
 		n, err := io.ReadFull(r, partData)
 		if err != nil && err != io.ErrUnexpectedEOF {
+			<-sem
+			wg.Wait()
 			return fmt.Errorf("read part %d: %w", part.Number, err)
 		}
 		partData = partData[:n]
@@ -106,17 +122,7 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, r io.Reader, 
 		wg.Add(1)
 		go func(idx int, p PartURL, data []byte) {
 			defer wg.Done()
-
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				select {
-				case errCh <- ctx.Err():
-				default:
-				}
-				return
-			}
+			defer func() { <-sem }()
 
 			etag, err := c.uploadOnePart(ctx, p.URL, data)
 			if err != nil {
@@ -280,7 +286,7 @@ func (c *Client) ResumeUpload(ctx context.Context, path string, r io.ReaderAt, t
 	}
 
 	// Step 3: Upload missing parts concurrently
-	results, err := c.uploadMissingParts(ctx, plan.Parts, r, progress)
+	results, err := c.uploadMissingParts(ctx, *plan, r, progress)
 	if err != nil {
 		return err
 	}
@@ -344,17 +350,24 @@ func (c *Client) requestResume(ctx context.Context, uploadID string) (*UploadPla
 }
 
 // uploadMissingParts uploads parts from a ReaderAt (random access for resume).
-func (c *Client) uploadMissingParts(ctx context.Context, parts []PartURL, r io.ReaderAt, progress ProgressFunc) ([]CompletePart, error) {
+func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.ReaderAt, progress ProgressFunc) ([]CompletePart, error) {
 	const maxConcurrency = 4
 	sem := make(chan struct{}, maxConcurrency)
 	errCh := make(chan error, 1)
 	var wg sync.WaitGroup
 
+	// Use plan's part size for offset calculation; fall back to default
+	stdPartSize := plan.PartSize
+	if stdPartSize <= 0 {
+		stdPartSize = s3client.PartSize
+	}
+
+	parts := plan.Parts
 	results := make([]CompletePart, len(parts))
 
 	for i, part := range parts {
 		data := make([]byte, part.Size)
-		offset := int64(part.Number-1) * part.Size
+		offset := int64(part.Number-1) * stdPartSize
 		n, err := r.ReadAt(data, offset)
 		if err != nil && err != io.EOF {
 			return nil, fmt.Errorf("read part %d at offset %d: %w", part.Number, offset, err)
