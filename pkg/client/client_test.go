@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/server"
@@ -22,7 +23,7 @@ func newTestClient(t *testing.T) (*Client, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resetTestDB(t, store)
+	testmysql.ResetDB(t, store.DB())
 
 	b, err := backend.New(store, blobDir)
 	if err != nil {
@@ -40,22 +41,6 @@ func newTestClient(t *testing.T) (*Client, func()) {
 
 	return New(ts.URL, ""), cleanup
 }
-
-func resetTestDB(t *testing.T, store *meta.Store) {
-	t.Helper()
-	queries := []string{
-		"DELETE FROM file_nodes",
-		"DELETE FROM file_tags",
-		"DELETE FROM uploads",
-		"DELETE FROM files",
-	}
-	for _, q := range queries {
-		if _, err := store.DB().Exec(q); err != nil {
-			t.Fatalf("reset test db: %v", err)
-		}
-	}
-}
-
 func TestWriteAndRead(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()

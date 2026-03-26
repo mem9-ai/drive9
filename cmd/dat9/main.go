@@ -77,12 +77,12 @@ commands:
   sh               interactive shell
   serve            start server
 
-	environment:
-	  DAT9_SERVER      server URL (default: http://localhost:9009)
-	  DAT9_API_KEY     API key
-	  DAT9_LISTEN_ADDR serve listen address (default: :9009)
-	  DAT9_MYSQL_DSN   serve TiDB/MySQL DSN (required)
-	  DAT9_BLOB_DIR    serve blob directory (default: ./blobs)
-`)
+environment:
+  DAT9_SERVER      server URL (default: http://localhost:9009)
+  DAT9_API_KEY     API key
+  DAT9_LISTEN_ADDR serve listen address (default: :9009)
+  DAT9_MYSQL_DSN   serve TiDB/MySQL DSN (required)
+  DAT9_BLOB_DIR    serve blob directory (default: ./blobs)
+  `)
 	os.Exit(2)
 }

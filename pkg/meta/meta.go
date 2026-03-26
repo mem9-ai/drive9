@@ -97,6 +97,9 @@ type Store struct {
 }
 
 func Open(dsn string) (*Store, error) {
+	if strings.Contains(dsn, "multiStatements=true") {
+		return nil, fmt.Errorf("multiStatements=true is not allowed in production DSN")
+	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -120,12 +123,12 @@ func (s *Store) migrate() error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
-			path         VARCHAR(768) NOT NULL,
-			parent_path  VARCHAR(768) NOT NULL,
+			path         VARCHAR(512) NOT NULL,
+			parent_path  VARCHAR(512) NOT NULL,
 			name         VARCHAR(255) NOT NULL,
 			is_directory BOOLEAN NOT NULL DEFAULT FALSE,
 			file_id      VARCHAR(64),
-			created_at   VARCHAR(64) NOT NULL
+			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 		)`,
 		`CREATE UNIQUE INDEX idx_path ON file_nodes(path)`,
 		`CREATE INDEX idx_parent ON file_nodes(parent_path)`,
@@ -142,9 +145,9 @@ func (s *Store) migrate() error {
 			status          VARCHAR(32) NOT NULL DEFAULT 'PENDING',
 			source_id       VARCHAR(255),
 			content_text    LONGTEXT,
-			created_at      VARCHAR(64) NOT NULL,
-			confirmed_at    VARCHAR(64),
-			expires_at      VARCHAR(64)
+			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			confirmed_at    DATETIME(3),
+			expires_at      DATETIME(3)
 		)`,
 		`CREATE INDEX idx_status ON files(status, created_at)`,
 
@@ -159,7 +162,7 @@ func (s *Store) migrate() error {
 		`CREATE TABLE IF NOT EXISTS uploads (
 			upload_id          VARCHAR(64) PRIMARY KEY,
 			file_id            VARCHAR(64) NOT NULL,
-			target_path        VARCHAR(700) NOT NULL,
+			target_path        VARCHAR(512) NOT NULL,
 			s3_upload_id       VARCHAR(255) NOT NULL,
 			s3_key             VARCHAR(2048) NOT NULL,
 			total_size         BIGINT NOT NULL,
@@ -168,16 +171,16 @@ func (s *Store) migrate() error {
 			status             VARCHAR(32) NOT NULL DEFAULT 'UPLOADING',
 			fingerprint_sha256 VARCHAR(128),
 			idempotency_key    VARCHAR(255),
-			created_at         VARCHAR(64) NOT NULL,
-			updated_at         VARCHAR(64) NOT NULL,
-			expires_at         VARCHAR(64) NOT NULL
+			created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			expires_at         DATETIME(3) NOT NULL
 		)`,
 		`CREATE INDEX idx_upload_path ON uploads(target_path, status)`,
 		`CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
-			if isIgnorableMigrationError(err) {
+			if isIndexStmt(stmt) && isDuplicateIndexError(err) {
 				continue
 			}
 			snippet := stmt
@@ -195,7 +198,7 @@ func (s *Store) migrate() error {
 func (s *Store) InsertNode(n *FileNode) error {
 	_, err := s.db.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), timeStr(n.CreatedAt))
+		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), n.CreatedAt.UTC())
 	return err
 }
 
@@ -353,7 +356,7 @@ func (s *Store) EnsureParentDirs(path string, genID func() string) error {
 		cur = parent
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 	for i := len(ancestors) - 1; i >= 0; i-- {
 		dirPath := ancestors[i]
 		pp := parentPath(dirPath)
@@ -362,7 +365,7 @@ func (s *Store) EnsureParentDirs(path string, genID func() string) error {
 			(node_id, path, parent_path, name, is_directory, created_at)
 			VALUES (?, ?, ?, ?, 1, ?)
 			ON DUPLICATE KEY UPDATE node_id = node_id`,
-			genID(), dirPath, pp, name, timeStr(now))
+			genID(), dirPath, pp, name, now)
 		if err != nil && !isUniqueViolation(err) {
 			return fmt.Errorf("ensure parent %s: %w", dirPath, err)
 		}
@@ -380,7 +383,7 @@ func (s *Store) InsertFile(f *File) error {
 		f.FileID, f.StorageType, f.StorageRef, nullStr(f.ContentType),
 		f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
 		nullStr(f.SourceID), nullStr(f.ContentText),
-		timeStr(f.CreatedAt), nilTimeStr(f.ConfirmedAt), nilTimeStr(f.ExpiresAt))
+		f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
 	return err
 }
 
@@ -399,7 +402,7 @@ func (s *Store) UpdateFileContent(fileID string, storageType StorageType, storag
 		confirmed_at = ?
 		WHERE file_id = ?`,
 		storageType, storageRef, nullStr(contentType), size,
-		nullStr(checksum), nullStr(contentText), timeStr(time.Now().UTC()), fileID)
+		nullStr(checksum), nullStr(contentText), time.Now().UTC(), fileID)
 	if err != nil {
 		return err
 	}
@@ -413,7 +416,7 @@ func (s *Store) UpdateFileContent(fileID string, storageType StorageType, storag
 func (s *Store) ConfirmFile(fileID string) error {
 	_, err := s.db.Exec(`UPDATE files SET status = 'CONFIRMED',
 		confirmed_at = ?
-		WHERE file_id = ? AND status = 'PENDING'`, timeStr(time.Now().UTC()), fileID)
+		WHERE file_id = ? AND status = 'PENDING'`, time.Now().UTC(), fileID)
 	return err
 }
 
@@ -592,7 +595,7 @@ func (s *Store) InsertUpload(u *Upload) error {
 		u.UploadID, u.FileID, u.TargetPath, u.S3UploadID, u.S3Key,
 		u.TotalSize, u.PartSize, u.PartsTotal, u.Status,
 		nullStr(u.FingerprintSHA), nullStr(u.IdempotencyKey),
-		timeStr(u.CreatedAt), timeStr(u.UpdatedAt), timeStr(u.ExpiresAt))
+		u.CreatedAt.UTC(), u.UpdatedAt.UTC(), u.ExpiresAt.UTC())
 	return err
 }
 
@@ -616,7 +619,7 @@ func (s *Store) GetUploadByPath(targetPath string) (*Upload, error) {
 func (s *Store) CompleteUpload(uploadID string) error {
 	_, err := s.db.Exec(`UPDATE uploads SET status = 'COMPLETED',
 		updated_at = ?
-		WHERE upload_id = ? AND status = 'UPLOADING'`, timeStr(time.Now().UTC()), uploadID)
+		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
 	return err
 }
 
@@ -630,7 +633,7 @@ func scanNode(s scanner) (*FileNode, error) {
 	var n FileNode
 	var isDir int
 	var fileID sql.NullString
-	var createdAt string
+	var createdAt time.Time
 	err := s.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &fileID, &createdAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -640,15 +643,15 @@ func scanNode(s scanner) (*FileNode, error) {
 	}
 	n.IsDirectory = isDir != 0
 	n.FileID = fileID.String
-	n.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	n.CreatedAt = createdAt.UTC()
 	return &n, nil
 }
 
 func scanFile(s scanner) (*File, error) {
 	var f File
 	var contentType, checksum, sourceID, contentText sql.NullString
-	var confirmedAt, expiresAt sql.NullString
-	var createdAt string
+	var confirmedAt, expiresAt sql.NullTime
+	var createdAt time.Time
 	err := s.Scan(&f.FileID, &f.StorageType, &f.StorageRef, &contentType,
 		&f.SizeBytes, &checksum, &f.Revision, &f.Status, &sourceID, &contentText,
 		&createdAt, &confirmedAt, &expiresAt)
@@ -662,13 +665,13 @@ func scanFile(s scanner) (*File, error) {
 	f.ChecksumSHA256 = checksum.String
 	f.SourceID = sourceID.String
 	f.ContentText = contentText.String
-	f.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	f.CreatedAt = createdAt.UTC()
 	if confirmedAt.Valid {
-		t, _ := time.Parse(time.RFC3339Nano, confirmedAt.String)
+		t := confirmedAt.Time.UTC()
 		f.ConfirmedAt = &t
 	}
 	if expiresAt.Valid {
-		t, _ := time.Parse(time.RFC3339Nano, expiresAt.String)
+		t := expiresAt.Time.UTC()
 		f.ExpiresAt = &t
 	}
 	return &f, nil
@@ -678,13 +681,13 @@ func scanNodeWithFile(rows *sql.Rows) (*NodeWithFile, error) {
 	var n FileNode
 	var isDir int
 	var nodeFileID sql.NullString
-	var nodeCreatedAt string
+	var nodeCreatedAt time.Time
 
 	var fFileID, fStorageType, fStorageRef sql.NullString
 	var fContentType, fChecksum, fSourceID, fContentText sql.NullString
 	var fSizeBytes, fRevision sql.NullInt64
 	var fStatus sql.NullString
-	var fCreatedAt, fConfirmedAt, fExpiresAt sql.NullString
+	var fCreatedAt, fConfirmedAt, fExpiresAt sql.NullTime
 
 	err := rows.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
 		&fFileID, &fStorageType, &fStorageRef, &fContentType, &fSizeBytes,
@@ -696,7 +699,7 @@ func scanNodeWithFile(rows *sql.Rows) (*NodeWithFile, error) {
 
 	n.IsDirectory = isDir != 0
 	n.FileID = nodeFileID.String
-	n.CreatedAt, _ = time.Parse(time.RFC3339Nano, nodeCreatedAt)
+	n.CreatedAt = nodeCreatedAt.UTC()
 
 	nf := &NodeWithFile{Node: n}
 	if fFileID.Valid {
@@ -713,14 +716,14 @@ func scanNodeWithFile(rows *sql.Rows) (*NodeWithFile, error) {
 			ContentText:    fContentText.String,
 		}
 		if fCreatedAt.Valid {
-			nf.File.CreatedAt, _ = time.Parse(time.RFC3339Nano, fCreatedAt.String)
+			nf.File.CreatedAt = fCreatedAt.Time.UTC()
 		}
 		if fConfirmedAt.Valid {
-			t, _ := time.Parse(time.RFC3339Nano, fConfirmedAt.String)
+			t := fConfirmedAt.Time.UTC()
 			nf.File.ConfirmedAt = &t
 		}
 		if fExpiresAt.Valid {
-			t, _ := time.Parse(time.RFC3339Nano, fExpiresAt.String)
+			t := fExpiresAt.Time.UTC()
 			nf.File.ExpiresAt = &t
 		}
 	}
@@ -730,7 +733,7 @@ func scanNodeWithFile(rows *sql.Rows) (*NodeWithFile, error) {
 func scanUpload(s scanner) (*Upload, error) {
 	var u Upload
 	var fingerprint, idempotencyKey sql.NullString
-	var createdAt, updatedAt, expiresAt string
+	var createdAt, updatedAt, expiresAt time.Time
 	err := s.Scan(&u.UploadID, &u.FileID, &u.TargetPath, &u.S3UploadID, &u.S3Key,
 		&u.TotalSize, &u.PartSize, &u.PartsTotal, &u.Status,
 		&fingerprint, &idempotencyKey,
@@ -743,9 +746,9 @@ func scanUpload(s scanner) (*Upload, error) {
 	}
 	u.FingerprintSHA = fingerprint.String
 	u.IdempotencyKey = idempotencyKey.String
-	u.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
-	u.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
-	u.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expiresAt)
+	u.CreatedAt = createdAt.UTC()
+	u.UpdatedAt = updatedAt.UTC()
+	u.ExpiresAt = expiresAt.UTC()
 	return &u, nil
 }
 
@@ -758,15 +761,11 @@ func nullStr(s string) interface{} {
 	return s
 }
 
-func timeStr(t time.Time) string {
-	return t.Format(time.RFC3339Nano)
-}
-
-func nilTimeStr(t *time.Time) interface{} {
+func nilTime(t *time.Time) interface{} {
 	if t == nil {
 		return nil
 	}
-	return t.Format(time.RFC3339Nano)
+	return t.UTC()
 }
 
 func parentPath(p string) string {
@@ -798,10 +797,15 @@ func isUniqueViolation(err error) bool {
 	return strings.Contains(msg, "Duplicate entry") || strings.Contains(msg, "UNIQUE constraint failed")
 }
 
-func isIgnorableMigrationError(err error) bool {
+func isIndexStmt(stmt string) bool {
+	s := strings.ToUpper(strings.TrimSpace(stmt))
+	return strings.HasPrefix(s, "CREATE INDEX") || strings.HasPrefix(s, "CREATE UNIQUE INDEX")
+}
+
+func isDuplicateIndexError(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "Duplicate key name") || strings.Contains(msg, "already exists")
+	return strings.Contains(msg, "Duplicate key name")
 }
