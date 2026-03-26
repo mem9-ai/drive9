@@ -12,25 +12,6 @@ on:
       - 'Makefile'
       - '.github/workflows/dev-cd.yml'
   workflow_dispatch:
-    inputs:
-      deploy_ref:
-        description: "Select ref to deploy"
-        required: true
-        default: "main"
-        type: choice
-        options:
-          - main
-          - feat/makefile-lint-ci-targets
-          - dat9-dev2/t19-integration
-          - dat9-dev3/p1-transfer-engine
-          - feat/p1-large-file-upload
-          - feat/p1-large-file-upload-final
-          - feat/split-cli-server-bin
-          - feat/tidb-mysql-migration
-          - docs/add-readme
-          - new_overview_design
-          - new_overview_design_main
-          - proposal/dat9-agent-native-data-infra
 
 env:
   AWS_REGION: ap-southeast-1
@@ -51,8 +32,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.deploy_ref || github.ref }}
 
       - name: Checkout agfs dependency
         run: |
@@ -75,7 +54,7 @@ jobs:
 
       - name: Build and push image
         run: |
-          REF_NAME=${{ github.event.inputs.deploy_ref || github.ref_name }}
+          REF_NAME=${{ github.ref_name }}
           REF_NAME=${REF_NAME/\//-}
           TAG="${REF_NAME}-${GITHUB_SHA::7}"
           make docker-build IMAGE_REPO=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} IMAGE_TAG=$TAG
