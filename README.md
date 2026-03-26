@@ -71,7 +71,7 @@ c.Delete("/data/file.txt")
 | `DAT9_SERVER` | Server URL | `http://localhost:9009` |
 | `DAT9_API_KEY` | API key | |
 | `DAT9_LISTEN_ADDR` | Server listen address | `:9009` |
-| `DAT9_DB_PATH` | SQLite database path | `./dat9.db` |
+| `DAT9_MYSQL_DSN` | MySQL DSN (example: `user:pass@tcp(127.0.0.1:3306)/dat9?parseTime=true`) | |
 | `DAT9_BLOB_DIR` | Blob storage directory | `./blobs` |
 
 ## Architecture
@@ -91,7 +91,7 @@ c.Delete("/data/file.txt")
   Dat9Backend   memfs        (plugins)
   (AGFS FileSystem)
      │
-     ├── < 1MB → SQLite + local blobs (P0)
+     ├── < 1MB → TiDB(MySQL protocol) + local blobs (P0)
      │            db9 + fs9 (production)
      │
      └── ≥ 1MB → S3 presigned URL
@@ -137,7 +137,7 @@ cmd/dat9-server/    Server entrypoint
 pkg/
   backend/          Dat9Backend — AGFS FileSystem implementation (inode model)
   client/           Go SDK HTTP client
-  meta/             Metadata store (SQLite P0 / db9 production)
+  meta/             Metadata store (TiDB/MySQL P0 / db9 production)
   server/           HTTP server (/v1/fs/{path} router)
   pathutil/         Path canonicalization and validation
   parser/           Content-aware parsing interface (future)

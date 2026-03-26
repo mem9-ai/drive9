@@ -6,17 +6,12 @@ import (
 	"testing"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/meta"
 )
 
 func newTestBackend(t *testing.T) *Dat9Backend {
 	t.Helper()
-	dbFile, err := os.CreateTemp("", "dat9-*.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dbFile.Close()
-	t.Cleanup(func() { os.Remove(dbFile.Name()) })
 
 	blobDir, err := os.MkdirTemp("", "dat9-blobs-*")
 	if err != nil {
@@ -24,10 +19,11 @@ func newTestBackend(t *testing.T) *Dat9Backend {
 	}
 	t.Cleanup(func() { os.RemoveAll(blobDir) })
 
-	store, err := meta.Open(dbFile.Name())
+	store, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
+	testmysql.ResetDB(t, store.DB())
 	t.Cleanup(func() { store.Close() })
 
 	b, err := New(store, blobDir)
