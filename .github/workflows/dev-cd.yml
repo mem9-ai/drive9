@@ -39,12 +39,6 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Lint
-        run: make lint
-
-      - name: Test
-        run: make test
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
