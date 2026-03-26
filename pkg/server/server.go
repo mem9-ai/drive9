@@ -137,6 +137,10 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	if cl := r.ContentLength; cl > 0 && s.backend.IsLargeFile(cl) {
 		plan, err := s.backend.InitiateUpload(r.Context(), path, cl)
 		if err != nil {
+			if errors.Is(err, meta.ErrUploadConflict) {
+				errJSON(w, http.StatusConflict, err.Error())
+				return
+			}
 			errJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}

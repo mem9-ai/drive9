@@ -18,6 +18,7 @@ var (
 	ErrUploadNotActive = errors.New("upload is not in UPLOADING state")
 	ErrUploadExpired   = errors.New("upload has expired")
 	ErrPathConflict    = errors.New("path already exists")
+	ErrUploadConflict  = errors.New("active upload already exists for this path")
 )
 
 type StorageType string

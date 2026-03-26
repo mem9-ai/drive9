@@ -41,7 +41,7 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 	// Enforce one active upload per path
 	existing, err := b.store.GetUploadByPath(path)
 	if err == nil && existing != nil {
-		return nil, fmt.Errorf("active upload already exists for path %s (upload_id=%s)", path, existing.UploadID)
+		return nil, meta.ErrUploadConflict
 	}
 
 	fileID := b.genID()
@@ -137,17 +137,9 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		return fmt.Errorf("complete multipart: %w", err)
 	}
 
-	// Atomically: check path conflict, confirm file, complete upload, ensure parents, create node
-	return b.store.InTx(func(tx *sql.Tx) error {
-		// Check if target path already exists
-		var count int64
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE path = ?`, upload.TargetPath).Scan(&count); err != nil {
-			return err
-		}
-		if count > 0 {
-			return meta.ErrPathConflict
-		}
-
+	// Atomically: confirm file, complete upload, ensure parents, create/overwrite node
+	var oldFileID string
+	if err := b.store.InTx(func(tx *sql.Tx) error {
 		if err := b.store.ConfirmFileTx(tx, upload.FileID); err != nil {
 			return err
 		}
@@ -157,6 +149,17 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		if err := b.store.EnsureParentDirsTx(tx, upload.TargetPath, b.genID); err != nil {
 			return err
 		}
+
+		// Check if path already exists — overwrite by updating file_id
+		var existingFileID sql.NullString
+		err := tx.QueryRow(`SELECT file_id FROM file_nodes WHERE path = ?`, upload.TargetPath).Scan(&existingFileID)
+		if err == nil && existingFileID.Valid {
+			// Overwrite: update existing node to point to new file
+			oldFileID = existingFileID.String
+			_, err := tx.Exec(`UPDATE file_nodes SET file_id = ? WHERE path = ?`, upload.FileID, upload.TargetPath)
+			return err
+		}
+		// New path: insert node
 		return b.store.InsertNodeTx(tx, &meta.FileNode{
 			NodeID:     b.genID(),
 			Path:       upload.TargetPath,
@@ -165,7 +168,19 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			FileID:     upload.FileID,
 			CreatedAt:  time.Now(),
 		})
-	})
+	}); err != nil {
+		return err
+	}
+
+	// Clean up old file if overwritten
+	if oldFileID != "" {
+		oldFile, err := b.store.GetFile(oldFileID)
+		if err == nil {
+			b.store.MarkFileDeleted(oldFileID)
+			b.deleteBlob(oldFile.StorageRef)
+		}
+	}
+	return nil
 }
 
 // ResumeUpload returns presigned URLs for the missing parts of an in-progress upload.

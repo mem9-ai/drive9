@@ -85,6 +85,47 @@ func TestIsLargeFile(t *testing.T) {
 	}
 }
 
+func TestLargeFileOverwritesSmallFile(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	// Create a small file first
+	b.Write("/overwrite.bin", []byte("small data"), 0, 0x3) // Create|Truncate
+
+	// Initiate large file upload to same path
+	totalSize := int64(1 << 20)
+	plan, err := b.InitiateUpload(ctx, "/overwrite.bin", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Upload all parts
+	upload, _ := b.GetUpload(plan.UploadID)
+	data := make([]byte, totalSize)
+	for _, p := range plan.Parts {
+		start := int64(p.Number-1) * s3client.PartSize
+		end := start + p.Size
+		if end > totalSize {
+			end = totalSize
+		}
+		b.S3().(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, p.Number, bytes.NewReader(data[start:end]))
+	}
+
+	// Confirm — should overwrite the small file
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the file now has the large file size
+	info, err := b.Stat("/overwrite.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size != totalSize {
+		t.Errorf("expected size %d after overwrite, got %d", totalSize, info.Size)
+	}
+}
+
 func TestInitiateAndConfirmUpload(t *testing.T) {
 	b := newTestBackendWithS3(t)
 	ctx := context.Background()
