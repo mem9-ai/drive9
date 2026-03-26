@@ -335,7 +335,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
-		if strings.Contains(err.Error(), "not UPLOADING") {
+		if errors.Is(err, meta.ErrUploadNotActive) {
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
@@ -353,11 +353,11 @@ func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uplo
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
-		if strings.Contains(err.Error(), "expired") {
+		if errors.Is(err, meta.ErrUploadExpired) {
 			errJSON(w, http.StatusGone, err.Error())
 			return
 		}
-		if strings.Contains(err.Error(), "not UPLOADING") {
+		if errors.Is(err, meta.ErrUploadNotActive) {
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
