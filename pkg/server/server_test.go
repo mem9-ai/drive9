@@ -9,18 +9,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/meta"
 )
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
-	dbFile, err := os.CreateTemp("", "dat9-srv-*.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dbFile.Close()
-	t.Cleanup(func() { os.Remove(dbFile.Name()) })
 
 	blobDir, err := os.MkdirTemp("", "dat9-srv-blobs-*")
 	if err != nil {
@@ -28,10 +23,11 @@ func newTestServer(t *testing.T) *Server {
 	}
 	t.Cleanup(func() { os.RemoveAll(blobDir) })
 
-	store, err := meta.Open(dbFile.Name())
+	store, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
+	testmysql.ResetDB(t, store.DB())
 	t.Cleanup(func() { store.Close() })
 
 	b, err := backend.New(store, blobDir)
@@ -40,7 +36,6 @@ func newTestServer(t *testing.T) *Server {
 	}
 	return New(b)
 }
-
 func TestWriteAndRead(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)

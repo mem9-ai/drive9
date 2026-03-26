@@ -2,24 +2,19 @@ package meta
 
 import (
 	"fmt"
-	"os"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/dat9/internal/testmysql"
 )
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	f, err := os.CreateTemp("", "dat9-meta-*.db")
+	s, err := Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
-	t.Cleanup(func() { os.Remove(f.Name()) })
-
-	s, err := Open(f.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
+	testmysql.ResetDB(t, s.DB())
 	t.Cleanup(func() { s.Close() })
 	return s
 }
