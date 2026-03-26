@@ -666,8 +666,27 @@ func (s *Store) DeleteDirRecursive(dirPath string) ([]*File, error) {
 
 // --- uploads operations ---
 
+// InsertUpload atomically checks for an active upload on the same path
+// and inserts the new upload record. This replaces the SQLite partial
+// unique index (not supported in MySQL/TiDB) with a serialized transaction.
 func (s *Store) InsertUpload(u *Upload) error {
-	_, err := s.db.Exec(`INSERT INTO uploads
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Lock-and-check: SELECT ... FOR UPDATE prevents concurrent inserts
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM uploads WHERE target_path = ? AND status = 'UPLOADING' FOR UPDATE`,
+		u.TargetPath).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return ErrUploadConflict
+	}
+
+	_, err = tx.Exec(`INSERT INTO uploads
 		(upload_id, file_id, target_path, s3_upload_id, s3_key, total_size, part_size,
 		 parts_total, status, fingerprint_sha256, idempotency_key, created_at, updated_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -675,10 +694,10 @@ func (s *Store) InsertUpload(u *Upload) error {
 		u.TotalSize, u.PartSize, u.PartsTotal, u.Status,
 		nullStr(u.FingerprintSHA), nullStr(u.IdempotencyKey),
 		u.CreatedAt.UTC(), u.UpdatedAt.UTC(), u.ExpiresAt.UTC())
-	if isUniqueViolation(err) {
-		return ErrUploadConflict
+	if err != nil {
+		return err
 	}
-	return err
+	return tx.Commit()
 }
 
 func (s *Store) GetUpload(uploadID string) (*Upload, error) {

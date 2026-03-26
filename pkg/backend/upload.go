@@ -174,9 +174,9 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			_, err := tx.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
 				size_bytes = ?, content_text = NULL, revision = revision + 1,
 				status = 'CONFIRMED',
-				confirmed_at = strftime('%Y-%m-%dT%H:%M:%f','now')
+				confirmed_at = ?
 				WHERE file_id = ?`,
-				meta.StorageS3, upload.S3Key, upload.TotalSize, existingFileID.String)
+				meta.StorageS3, upload.S3Key, upload.TotalSize, time.Now().UTC(), existingFileID.String)
 			if err != nil {
 				return err
 			}
