@@ -16,6 +16,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout agfs dependency
+        run: |
+          git clone --depth 1 https://github.com/c4pt0r/agfs ../agfs
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
