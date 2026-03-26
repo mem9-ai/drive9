@@ -827,7 +827,7 @@ Because L0/L1 are ordinary files, they're included automatically.
 
 ### V2 (Future): Live Read-Only Mount
 
-Read-only only. No recipient-side caching. Source tenant owns bytes. See [design-content-locality.md](./design-content-locality.md) for details.
+Read-only only. No recipient-side caching. Source tenant owns bytes.
 
 ---
 
@@ -931,13 +931,15 @@ POST   /v1/fs/{path}?grep     Server-side search (small files in db9)
 POST   /v1/fs/{path}?digest   Server-side hash (small files in db9)
 ```
 
-### Mount Management
+### Mount Management (Admin-only)
 
 ```
 GET    /v1/mounts              List mounted backends
-POST   /v1/mounts              Mount a new backend (runtime)
-DELETE /v1/mounts/{path}       Unmount
+POST   /v1/mounts              Mount a new backend (runtime, admin-only)
+DELETE /v1/mounts/{path}       Unmount (admin-only)
 ```
+
+Mount management is restricted to control-plane administrators. Tenant API keys cannot mount/unmount backends. Only built-in plugins are allowed; dynamic arbitrary plugin loading is prohibited.
 
 P0 ships with two mounts: `/ -> Dat9Backend` and `/mem -> memfs`.
 
