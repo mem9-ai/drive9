@@ -660,6 +660,9 @@ func (s *Store) InsertUpload(u *Upload) error {
 		u.TotalSize, u.PartSize, u.PartsTotal, u.Status,
 		nullStr(u.FingerprintSHA), nullStr(u.IdempotencyKey),
 		timeStr(u.CreatedAt), timeStr(u.UpdatedAt), timeStr(u.ExpiresAt))
+	if isUniqueViolation(err) {
+		return ErrUploadConflict
+	}
 	return err
 }
 
