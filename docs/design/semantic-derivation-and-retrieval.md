@@ -86,3 +86,4 @@ They should operate on bounded snapshot inputs or explicitly versioned aggregate
 - `docs/design/resource-versioning-and-async-correctness.md`
 - `docs/design/durable-queue-runtime.md`
 - `docs/design/write-path-and-reconcile.md`
+- `docs/design/api-and-ux-contract.md`

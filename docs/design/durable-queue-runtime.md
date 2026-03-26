@@ -16,6 +16,8 @@ It does not define:
 - complex workflow DAG semantics
 - cross-tenant fairness scheduling as a queue concern
 
+This RFC also does not require dat9 to ship the full durable queue feature set in its first implementation phase.
+
 ## 3. Definitions
 
 - **durable queuefs**: the queuefs interface backed by durable task state
@@ -23,9 +25,34 @@ It does not define:
 - **recover**: the act of re-queueing a stale processing task after lease expiry
 - **dead-lettered**: a terminal task state after retry exhaustion or explicit non-retry failure
 
-## 4. Design
+## 4. Current Implementation Target
 
-### 4.1 Runtime role
+The durable queue direction should be preserved, but rollout should be phased.
+
+### 4.1 P0 / P1 queue runtime
+
+Minimum expected capabilities for the current implementation phase:
+
+- `enqueue`
+- `dequeue`
+- `ack`
+- simple retry
+- stale-task recovery
+
+This is enough to support the first dat9 async flows without pretending that dequeue means permanent success.
+
+### 4.2 Later extensions
+
+The following features remain part of the target runtime model, but may be added incrementally:
+
+- `renew`
+- dead-letter behavior
+- richer queue statistics
+- queue classes, priorities, or broader worker routing
+
+## 5. Design
+
+### 5.1 Runtime role
 
 dat9 uses durable `queuefs` as:
 
@@ -33,11 +60,18 @@ dat9 uses durable `queuefs` as:
 - not a global shared scheduler
 - not a complete workflow engine by itself
 
-### 4.2 Backend assumption
+### 5.2 Backend assumption
 
 durable `queuefs` should keep the AGFS/queuefs interface shape but use a tenant-local `db9` backend for durable task state.
 
-### 4.3 Required operations
+AGFS/queuefs should be treated as:
+
+- the canonical queue-shaped access contract
+- an integration surface for tooling and system boundaries
+
+It should not be read as a requirement that all internal worker logic must literally use filesystem-like operations when a direct runtime interface is clearer and more efficient.
+
+### 5.3 Required operations
 
 dat9 depends on the following operations:
 
@@ -49,7 +83,9 @@ dat9 depends on the following operations:
 - `recover`
 - `stats`
 
-### 4.4 Runtime contract
+For P0/P1, `renew` and richer `stats` may be deferred if task duration and operational risk are still low, but the long-term contract should remain compatible with them.
+
+### 5.4 Runtime contract
 
 Each task must carry enough information for correct async execution, including at least:
 
@@ -69,7 +105,7 @@ queued -> processing -> succeeded
    +----------------> failed
 ```
 
-### 4.5 Worker expectations
+### 5.5 Worker expectations
 
 Workers must:
 
@@ -78,7 +114,9 @@ Workers must:
 - `ack` only after durable success conditions are met
 - `nack` or fail explicitly when processing cannot complete correctly
 
-## 5. Invariants / Correctness Rules
+If the current phase does not yet expose a full queuefs filesystem path to internal workers, the same runtime rules should still hold through a direct worker/runtime interface.
+
+## 6. Invariants / Correctness Rules
 
 - `dequeue` must not mean permanent success
 - lease expiry must not silently lose work
@@ -86,19 +124,20 @@ Workers must:
 - task runtime state must remain tenant-local
 - queuefs file interfaces must not be mistaken for the full semantic workflow definition
 
-## 6. Failure / Recovery
+## 7. Failure / Recovery
 
 - stale processing tasks must be recoverable
 - worker crashes must leave tasks recoverable through lease expiry and recover behavior
 - at-least-once delivery is acceptable; exactly-once is not required
 
-## 7. Open Questions
+## 8. Open Questions
 
 - how much task typing and payload normalization should be enforced centrally
 - whether some aggregate work should use separate queue classes or priorities
 
-## 8. References / Dependencies
+## 9. References / Dependencies
 
 - `docs/design/queuefs-durable-task-queue-rfc.md`
 - `docs/design/system-architecture.md`
 - `docs/design/resource-versioning-and-async-correctness.md`
+- `docs/design/write-path-and-reconcile.md`

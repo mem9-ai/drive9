@@ -21,6 +21,9 @@ This RFC does not define:
 - exact object upload API
 - complete retrieval ranking algorithms
 
+This RFC also does not require the project to ship the strongest version model on day one.
+It defines the target direction and the minimum correctness contract that current implementation work should satisfy.
+
 ## 3. Definitions
 
 - **resource_id**: the stable logical identity of a resource
@@ -29,9 +32,35 @@ This RFC does not define:
 - **rebuildable state**: derived state that may be recomputed from authoritative inputs
 - **stale task**: a task whose input version is no longer the active version for current-state progression
 
-## 4. Design
+## 4. Current Implementation Target
 
-### 4.1 Resource-version boundary
+This RFC intentionally separates the minimum viable correctness contract from the stronger long-term model.
+
+### 4.1 P0 / P1 minimum contract
+
+For the current implementation phase, dat9 should guarantee at least:
+
+- every async task binds a version input for the file or resource it processes
+- writeback is guarded by version equality or an equivalent stale-write check
+- stale work may be retained as a no-op or historical artifact, but must not advance current derived state
+- reconcile can detect missing or stale derived artifacts and schedule regeneration
+
+In practice, this means a simple file revision guard is acceptable for the first implementation stage if it enforces the same stale-write safety boundary.
+
+### 4.2 Longer-term target
+
+The stronger target model remains:
+
+- explicit `resource_id`
+- explicit `resource_version`
+- richer historical derived-state retention
+- aggregate snapshot versioning
+
+The system should be designed so the P0/P1 contract can evolve into this stronger model without changing the basic async correctness direction.
+
+## 5. Design
+
+### 5.1 Resource-version boundary
 
 Asynchronous work must run against explicit versioned inputs.
 
@@ -41,14 +70,27 @@ Every task that produces derived state must bind at least:
 - `resource_version`
 - task-specific input parameters
 
-### 4.2 Version-aware writeback
+For the current implementation phase, this may be approximated by a file-level revision token if a separate `resource_version` record is not yet materialized.
+
+### 5.2 Version-aware writeback
 
 When async work writes results back, the system must enforce one of two outcomes:
 
 - the result is still valid for the current version and may advance current-state pointers
 - the result is only retained as historical output and must not advance current-state pointers
 
-### 4.3 Authoritative versus rebuildable state
+Example:
+
+```text
+file v1 -> task T1(summary for v1)
+file v2 -> task T2(summary for v2)
+
+If T1 finishes after v2 is current:
+- T1 must not replace the current summary pointer
+- T2 or reconcile must remain able to establish the current summary
+```
+
+### 5.3 Authoritative versus rebuildable state
 
 Authoritative state should include:
 
@@ -64,7 +106,7 @@ Rebuildable state should include at least some derived artifacts such as:
 - vectors
 - other derived semantic products that can be recomputed
 
-### 4.4 Mental model
+### 5.4 Mental model
 
 ```text
 resource_id -> resource_version -> derived states
@@ -75,7 +117,7 @@ resource_id -> resource_version -> derived states
                    +--> indexed
 ```
 
-### 4.5 Lifecycle and async separation
+### 5.5 Lifecycle and async separation
 
 Path/file semantics are not enough to guarantee async correctness.
 
@@ -84,20 +126,26 @@ The system must separate:
 - naming and content location semantics
 - lifecycle and async writeback semantics
 
-## 5. Invariants / Correctness Rules
+This does not mean the product stops feeling file-oriented. It means internal correctness state is allowed to be stronger than the external file metaphor.
+
+## 6. Invariants / Correctness Rules
 
 - async tasks must bind explicit `resource_version`
 - stale tasks must not overwrite current derived state
 - current-state progression must be version-aware
 - rebuildable state must not be treated as the sole source of truth
 
-## 6. Failure / Recovery
+For P0/P1, the practical invariant is:
+
+- every async writeback must be protected by a stale-write guard tied to the version observed when the task was created
+
+## 7. Failure / Recovery
 
 - worker interruption must not corrupt current-state pointers
 - reconcile must be able to compare authoritative state with rebuildable state and trigger regeneration where needed
 - partial async completion must be recoverable without assuming exactly-once execution
 
-## 7. Open Questions
+## 8. Open Questions
 
 - the exact compare-and-set boundaries for every writeback path
 - the final lifecycle rules for delete, soft delete, restore, rename, and move against in-flight tasks
@@ -105,8 +153,9 @@ The system must separate:
 
 These questions may be resolved in follow-up RFCs without changing the core direction of this RFC.
 
-## 8. References / Dependencies
+## 9. References / Dependencies
 
 - `docs/design/system-architecture.md`
 - `docs/design/durable-queue-runtime.md`
 - `docs/design/semantic-derivation-and-retrieval.md`
+- `docs/design/write-path-and-reconcile.md`

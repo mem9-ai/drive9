@@ -121,6 +121,9 @@ It provides:
 - `/queue` for durable queue access
 - one consistent access surface for upper layers
 
+AGFS and queuefs should be treated as the canonical access contract and integration surface.
+They do not imply that every internal runtime component must literally use filesystem-shaped operations if a direct runtime interface is clearer for workers.
+
 AGFS does not define:
 
 - lifecycle correctness
@@ -154,6 +157,11 @@ The core backend roles are:
 - async work must be durable and recoverable
 - large-file storage must remain tenant-scoped at the object-namespace level
 
+In other words:
+
+- everything user-relevant should be inspectable through the file-like interface when practical
+- not every internal correctness state must be modeled as a user-visible file row
+
 ## 6. Failure / Recovery
 
 The architecture assumes failure and recovery are normal system behavior.
@@ -176,6 +184,6 @@ Detailed rules are defined in:
 
 ## 8. References / Dependencies
 
-- `dat9/docs/overview.md`
-- `dat9/docs/review/02-doc-architecture-plan.md`
+- `docs/overview.md`
 - `docs/design/queuefs-durable-task-queue-rfc.md`
+- `docs/design/api-and-ux-contract.md`
