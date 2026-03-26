@@ -283,13 +283,17 @@ func TestListUploadsEndpoint(t *testing.T) {
 
 	var result struct {
 		Uploads []struct {
-			UploadID string `json:"upload_id"`
-			Status   string `json:"status"`
+			UploadID   string `json:"upload_id"`
+			PartsTotal int    `json:"parts_total"`
+			Status     string `json:"status"`
 		} `json:"uploads"`
 	}
 	json.NewDecoder(resp.Body).Decode(&result)
 	if len(result.Uploads) != 1 {
 		t.Errorf("expected 1 upload, got %d", len(result.Uploads))
+	}
+	if result.Uploads[0].PartsTotal != 1 {
+		t.Errorf("expected parts_total=1, got %d", result.Uploads[0].PartsTotal)
 	}
 }
 
