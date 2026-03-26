@@ -196,6 +196,80 @@ func TestAutoCreateParentDirs(t *testing.T) {
 	}
 }
 
+func TestEnsureParentDirsNoRootSelfInsert(t *testing.T) {
+	b := newTestBackend(t)
+	// Creating a file at root level should not insert "/" as a child of itself
+	b.Write("/top.txt", []byte("x"), 0, filesystem.WriteFlagCreate)
+	entries, err := b.ReadDir("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name == "/" || e.Name == "" {
+			t.Errorf("root dir should not appear as its own child: %+v", e)
+		}
+	}
+}
+
+func TestOffsetWritePreservesTail(t *testing.T) {
+	b := newTestBackend(t)
+	b.Write("/f.txt", []byte("ABCDEFGH"), 0, filesystem.WriteFlagCreate)
+	// Overwrite bytes 2-4 with "XY", should preserve tail "EFGH"
+	b.Write("/f.txt", []byte("XY"), 2, 0)
+	data, err := b.Read("/f.txt", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "ABXYEFGH" {
+		t.Errorf("expected ABXYEFGH, got %q", string(data))
+	}
+}
+
+func TestRenameDirUpdatesName(t *testing.T) {
+	b := newTestBackend(t)
+	b.Mkdir("/alpha", 0o755)
+	b.Write("/alpha/file.txt", []byte("data"), 0, filesystem.WriteFlagCreate)
+	if err := b.Rename("/alpha/", "/beta/"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := b.Stat("/beta/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != "beta" {
+		t.Errorf("expected name 'beta', got %q", info.Name)
+	}
+}
+
+func TestRenameDirEnsuresParentDirs(t *testing.T) {
+	b := newTestBackend(t)
+	b.Mkdir("/src", 0o755)
+	b.Write("/src/file.txt", []byte("data"), 0, filesystem.WriteFlagCreate)
+	// Rename to a deeply nested path whose parents don't exist
+	if err := b.Rename("/src/", "/x/y/dst/"); err != nil {
+		t.Fatal(err)
+	}
+	// Parent dirs /x/ and /x/y/ should have been auto-created
+	for _, p := range []string{"/x/", "/x/y/"} {
+		info, err := b.Stat(p)
+		if err != nil {
+			t.Errorf("expected parent dir %s to exist: %v", p, err)
+			continue
+		}
+		if !info.IsDir {
+			t.Errorf("expected %s to be a directory", p)
+		}
+	}
+	// The renamed dir and its contents should be accessible
+	data, err := b.Read("/x/y/dst/file.txt", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "data" {
+		t.Errorf("expected 'data', got %q", string(data))
+	}
+}
+
 func TestOpenAndOpenWrite(t *testing.T) {
 	b := newTestBackend(t)
 	b.Write("/f.txt", []byte("content"), 0, filesystem.WriteFlagCreate)

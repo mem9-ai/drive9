@@ -296,11 +296,13 @@ func (s *Store) RenameDir(oldPrefix, newPrefix string) (int64, error) {
 		}
 		newPath := newPrefix + strings.TrimPrefix(p, oldPrefix)
 		newParent := newPrefix + strings.TrimPrefix(pp, oldPrefix)
+		newName := name
 		if p == oldPrefix {
 			newParent = parentPath(newPrefix)
 			newPath = newPrefix
+			newName = baseName(newPrefix)
 		}
-		updates = append(updates, update{nodeID, newPath, newParent, name})
+		updates = append(updates, update{nodeID, newPath, newParent, newName})
 	}
 	rows.Close()
 
@@ -333,7 +335,7 @@ func (s *Store) EnsureParentDirs(path string, genID func() string) error {
 	cur := path
 	for {
 		parent := parentPath(cur)
-		if parent == cur {
+		if parent == cur || parent == "/" {
 			break
 		}
 		ancestors = append(ancestors, parent)

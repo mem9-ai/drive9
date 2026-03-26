@@ -250,7 +250,11 @@ func (b *Dat9Backend) overwriteFile(nf *meta.NodeWithFile, data []byte, offset i
 		if offset > int64(len(existing)) {
 			existing = append(existing, make([]byte, offset-int64(len(existing)))...)
 		}
+		end := offset + int64(len(data))
 		finalData = append(existing[:offset], data...)
+		if end < int64(len(existing)) {
+			finalData = append(finalData, existing[end:]...)
+		}
 	}
 
 	oldRef := nf.File.StorageRef
@@ -343,6 +347,9 @@ func (b *Dat9Backend) Rename(oldPath, newPath string) error {
 		return err
 	}
 	if node.IsDirectory {
+		if err := b.store.EnsureParentDirs(newPath, b.genID); err != nil {
+			return err
+		}
 		_, err := b.store.RenameDir(oldPath, newPath)
 		return err
 	}
