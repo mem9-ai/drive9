@@ -1,4 +1,9 @@
-package cli
+// Command dat9-server starts the dat9 HTTP server.
+//
+// Usage:
+//
+//	dat9-server [listen-addr]
+package main
 
 import (
 	"fmt"
@@ -16,40 +21,38 @@ const (
 	defaultBlobDir    = "blobs"
 )
 
-// Serve starts the dat9 HTTP server backed by the local SQLite/blob stand-in
-// used in P0.
-func Serve(args []string) error {
-	if len(args) > 1 {
-		return fmt.Errorf("usage: dat9 serve [listen-addr]")
+func main() {
+	if len(os.Args) > 2 {
+		usage()
 	}
 
 	addr := envOr("DAT9_LISTEN_ADDR", defaultListenAddr)
-	if len(args) == 1 {
-		addr = args[0]
+	if len(os.Args) == 2 {
+		addr = os.Args[1]
 	}
 
 	dbPath := envOr("DAT9_DB_PATH", defaultDBPath)
 	blobDir := envOr("DAT9_BLOB_DIR", defaultBlobDir)
 
 	if err := ensureParentDir(dbPath); err != nil {
-		return err
+		die(err)
 	}
 	if err := os.MkdirAll(blobDir, 0o755); err != nil {
-		return fmt.Errorf("create blob dir: %w", err)
+		die(fmt.Errorf("create blob dir: %w", err))
 	}
 
 	store, err := meta.Open(dbPath)
 	if err != nil {
-		return fmt.Errorf("open meta store: %w", err)
+		die(fmt.Errorf("open meta store: %w", err))
 	}
 	defer store.Close()
 
 	b, err := backend.New(store, blobDir)
 	if err != nil {
-		return fmt.Errorf("create backend: %w", err)
+		die(fmt.Errorf("create backend: %w", err))
 	}
 
-	return server.New(b).ListenAndServe(addr)
+	die(server.New(b).ListenAndServe(addr))
 }
 
 func envOr(key, fallback string) string {
@@ -68,4 +71,23 @@ func ensureParentDir(path string) error {
 		return fmt.Errorf("create db dir: %w", err)
 	}
 	return nil
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `usage: dat9-server [listen-addr]
+
+environment:
+  DAT9_LISTEN_ADDR serve listen address (default: :9009)
+  DAT9_DB_PATH     sqlite path (default: ./dat9.db)
+  DAT9_BLOB_DIR    blob directory (default: ./blobs)
+`)
+	os.Exit(2)
+}
+
+func die(err error) {
+	if err == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "dat9-server: %v\n", err)
+	os.Exit(1)
 }

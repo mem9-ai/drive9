@@ -13,7 +13,6 @@
 //	mv    rename/move a file or directory
 //	rm    remove a file or directory
 //	sh    interactive shell
-//	serve start the dat9 HTTP server
 package main
 
 import (
@@ -49,8 +48,6 @@ func main() {
 		err = cli.Rm(c, args)
 	case "sh":
 		err = cli.Sh(c, args)
-	case "serve":
-		err = cli.Serve(args)
 	case "-h", "-help", "help":
 		usage()
 	default:
@@ -75,14 +72,10 @@ commands:
   mv <old> <new>   rename/move
   rm <path>        remove
   sh               interactive shell
-  serve            start server
 
 environment:
   DAT9_SERVER      server URL (default: http://localhost:9009)
   DAT9_API_KEY     API key
-  DAT9_LISTEN_ADDR serve listen address (default: :9009)
-  DAT9_DB_PATH     serve sqlite path (default: ./dat9.db)
-  DAT9_BLOB_DIR    serve blob directory (default: ./blobs)
 `)
 	os.Exit(2)
 }
