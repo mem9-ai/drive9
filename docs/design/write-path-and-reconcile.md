@@ -267,12 +267,138 @@ Recommended current-phase state constraints:
 - `/complete` returning `409` or `412` must imply:
   - the file does not advance to a new committed version
   - the upload does not become `COMPLETED`
+- metadata-only rename or move must make source disappearance and destination appearance visible in one commit
+- directory copy or move must not expose a half-rewritten subtree as committed user-visible state
 - physical storage cleanup must imply:
   - the old version is no longer current
   - no live logical binding still depends on that storage reference
 - reconcile may repair missing downstream work, but must not invent a committed version that never passed the write commit point
 
-### 5.6 Delete path and cleanup separation
+### 5.6 Copy, rename, and move commit protocols
+
+`cp`, `mv`, and `rename` need the same implementation-grade discipline as create, overwrite, and delete.
+
+The common rules are:
+
+- canonicalize source and destination before opening a transaction
+- reject impossible moves early, such as moving a directory into its own descendant
+- lock all conflicting namespace entries in a deterministic order
+- treat the namespace rewrite as the commit point
+- never put physical blob copy or delete on the critical path unless the operation explicitly requires byte duplication
+
+Recommended lock ordering:
+
+1. lock the lexically smaller of `source_path` and `dest_path` first when both concrete path rows exist
+2. lock the other path row or destination conflict point second
+3. lock any shared file row or subtree root after path locks
+
+This ordering matters because concurrent `cp`, `mv`, `rm`, and overwrite operations may otherwise deadlock or race on the same path binding.
+
+Representative file rename / move:
+
+```text
+BEGIN;
+  1. canonicalize source_path and dest_path
+  2. lock source file_nodes row FOR UPDATE
+  3. lock existing dest file_nodes row, or otherwise reserve the dest path conflict point
+  4. verify source exists and destination policy allows the move
+  5. UPDATE file_nodes
+       SET path = dest_path,
+           parent_path = dest_parent,
+           name = dest_name
+     WHERE path = source_path
+  6. COMMIT;
+```
+
+Commit semantics:
+
+- the source path disappears and the destination path appears atomically
+- `file_id`, `storage_ref`, and physical object bytes do not change
+- if destination validation fails, the transaction rolls back and the source path remains unchanged
+
+Representative zero-copy file copy:
+
+```text
+BEGIN;
+  1. lock source file_nodes row FOR UPDATE
+  2. lock existing dest file_nodes row, or otherwise reserve the dest path conflict point
+  3. read source.file_id
+  4. INSERT new file_nodes row for dest_path pointing to the same file_id
+  5. COMMIT;
+```
+
+Commit semantics:
+
+- copy creates a second path binding
+- no blob copy happens in the critical path
+- later delete still depends on refcount-aware "last reference removed" handling
+
+Representative directory move:
+
+```text
+precondition:
+  destination must not be inside source subtree
+
+recommended current-phase protocol:
+  1. acquire a subtree-scoped namespace lock for source prefix and destination prefix
+  2. BEGIN
+  3. lock source root row and destination conflict point
+  4. validate there is no conflicting destination subtree state
+  5. rewrite source root path
+  6. rewrite every descendant's path + parent_path inside the same transaction
+  7. COMMIT
+  8. release subtree lock
+```
+
+Representative directory move timeline:
+
+```text
+before:
+  /a/
+  /a/x
+  /a/y/z
+
+transaction:
+  lock subtree /a/
+  reserve destination /b/
+  rewrite /a/    -> /b/
+  rewrite /a/x   -> /b/x
+  rewrite /a/y/z -> /b/y/z
+  commit
+
+after:
+  /b/
+  /b/x
+  /b/y/z
+```
+
+The important guarantee is:
+
+- readers either see the old subtree or the new subtree after commit
+- they do not see a committed mixed tree with some descendants under `/a/` and others under `/b/`
+
+Representative directory copy:
+
+```text
+recommended current-phase protocol:
+  1. acquire a subtree-scoped namespace lock for source prefix and destination prefix
+  2. BEGIN
+  3. lock source root row and destination conflict point
+  4. read a stable snapshot of source descendants
+  5. INSERT new directory rows and copied descendant file_nodes rows under dest prefix
+  6. keep copied file rows pointing at the same underlying file_id where zero-copy semantics are allowed
+  7. COMMIT
+  8. release subtree lock
+```
+
+P0 implementation guidance:
+
+- for file `cp` and file `mv`, row-level locking is usually sufficient
+- for directory `cp` and directory `mv`, a coarse tenant-local namespace mutex or subtree-prefix lock is acceptable in P0
+- if the subtree is too large to rewrite atomically in one transaction, the server should reject or defer the operation rather than silently exposing partial committed state
+- chunked multi-transaction directory rewrites require an explicit operation journal and are a later design, not a hidden P0 behavior
+
+### 5.7 Delete path and cleanup separation
 
 Logical state transitions and physical cleanup should remain separable.
 
@@ -320,7 +446,7 @@ after commit:
 
 This serialization is important because "last reference removed" is a correctness boundary, not just a convenience optimization.
 
-### 5.7 Reaper responsibilities
+### 5.8 Reaper responsibilities
 
 The background reaper should at least be able to:
 
