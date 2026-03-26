@@ -1,14 +1,14 @@
 # dat9: Agent-Native Data Infrastructure
 
-**Status**: Proposal (Draft)  
-**Date**: 2026-03-25  
+**Status**: Proposal (Draft v2)
+**Date**: 2026-03-26
 **License**: Apache 2.0
 
 ---
 
 ## 1. Overview
 
-dat9 is a unified data infrastructure for AI agents. It presents a single filesystem-like interface for storing, retrieving, and querying data of any kind --- small config files, large datasets, structured metadata, key-value pairs --- while keeping the underlying complexity invisible to the user.
+dat9 is a unified data infrastructure for AI agents — a **network drive with built-in semantic search**. It presents a single filesystem-like interface for storing, retrieving, and querying data of any kind, while the underlying complexity (tiered storage, embedding, full-text indexing) is invisible to the user.
 
 An agent (or a human) interacts with dat9 the same way they interact with a local filesystem:
 
@@ -16,7 +16,9 @@ An agent (or a human) interacts with dat9 the same way they interact with a loca
 dat9 cp ./dataset.tar /data/dataset.tar        # upload (auto: presigned URL for large files)
 dat9 cat /config/settings.json                  # read
 dat9 ls /data/                                  # list
-dat9 cp /data/a.bin /data/b.bin                 # server-side copy (no download/re-upload)
+dat9 cp /data/a.bin /shared/a.bin               # zero-copy link (no re-upload)
+dat9 mv /data/old.bin /data/new.bin             # rename (zero storage cost)
+dat9 search "training data for image classification"  # semantic search
 dat9 sh                                         # interactive shell
 ```
 
@@ -24,103 +26,153 @@ dat9 sh                                         # interactive shell
 client = Dat9("https://dat9.example.com", api_key="...")
 client.write("/data/file.bin", open("local.bin", "rb"))
 client.read("/data/file.bin")
+client.search("training data")
 ```
 
-Underneath, dat9 separates **control plane** (metadata + auth + upload orchestration) from **data plane** (object storage). Large files never flow through the server --- clients upload directly to S3 via presigned URLs, with automatic multipart chunking and resumable uploads. The CLI also offers an interactive shell (`dat9 sh`) for quick navigation and file operations.
+### Core Insight: Build on db9, Not Around It
+
+Each dat9 tenant is backed by a [db9](https://db9.ai/) database. db9 already provides:
+
+- **fs9**: File storage in TiKV (16KB pages, up to 100MB per file)
+- **EMBED_TEXT()**: Auto-embedding as `GENERATED ALWAYS AS` columns
+- **VECTOR + HNSW**: Vector similarity search
+- **tsvector + GIN**: Full-text search with Chinese tokenizer (jieba)
+- **CHUNK_TEXT()**: Markdown-aware document chunking
+- **Hybrid search**: FTS filter + vector ranking in one SQL query
+
+dat9 adds what db9 doesn't have: **large-file S3 direct upload**, **path-tree namespace (inode model)**, **tiered context (L0/L1/L2)**, **cross-tenant sharing**, and an **AGFS-compatible filesystem interface**.
 
 ### Problem Statement
 
 - Agent tool fragmentation: each agent tool uses its own storage semantics and credentials.
 - Server bandwidth bottlenecks for large files: proxying large uploads is slow and expensive.
-- Missing metadata queryability: files exist, but cannot be filtered or discovered by rich tags.
-- No unified path-based abstraction across backends: object store, memory, and future backends are not addressable by a single path model.
+- Missing semantic discoverability: files exist, but cannot be found by meaning.
+- No unified path-based abstraction across storage tiers (db9 small files, S3 large files, memory scratch).
 
 ### Non-goals
 
 - POSIX-complete semantics in P0.
 - Transactional multi-file updates.
 - Data warehouse replacement.
-- A database for relational data (dat9 stores files + metadata, not relational records).
+- Reimplementing embedding/FTS/vector search (db9 already has these).
+- Retrieval algorithms (intent analysis, reranking) — that's the upper-layer agent framework's job.
 
 ### Design Principles
 
-1. **Users see only file operations** --- `cp`, `cat`, `ls`, `write`, `read`. All protocol complexity (presigned URLs, multipart, resume) is hidden in the SDK/CLI.
-2. **Server is pure control plane** --- metadata, presigned URL issuance, upload progress tracking. Never touches large file data.
-3. **Import, don't fork** --- Built on [AGFS](https://github.com/c4pt0r/agfs)'s `FileSystem` interface and `MountableFS` routing layer. Extend with our own backends and upload flow.
-4. **Pluggable backends via MountableFS** --- A radix-tree router dispatches paths to different backends. P0 ships with S3+metadata and `/mem` scratch space. Future: KV store, vector search --- all addressable by path.
-5. **Metadata and content are separated** --- Structured metadata lives in a relational DB; file content lives in object storage. This enables rich queries without scanning objects.
-6. **Cost-aware from day one** --- TTL, storage tiering, and automatic cleanup of incomplete multipart uploads.
-7. **Tiered context loading** --- Inspired by [OpenViking](https://github.com/volcengine/OpenViking)'s L0/L1/L2 model. Every directory can carry a ~100-token abstract (L0) and a ~1k-token overview (L1), enabling agents to scan cheaply before loading full content (L2).
+1. **Users see only file operations** --- `cp`, `cat`, `ls`, `search`. All protocol complexity is hidden.
+2. **Leverage db9 native capabilities** --- embedding, FTS, vector search, chunking are db9 built-in. dat9 orchestrates, not reimplements.
+3. **Tiered storage** --- Small files (< 1MB) in db9 (zero network overhead, instant search). Large files (>= 1MB) in S3 (presigned URL direct upload). One path namespace spanning both.
+4. **inode model** --- Paths and file entities are separate. One file can appear at multiple paths (zero-copy `cp`). `mv` is a metadata-only operation.
+5. **Import, don't fork** --- Built on [AGFS](https://github.com/c4pt0r/agfs)'s `FileSystem` interface and `MountableFS` routing layer.
+6. **Tiered context loading** --- Inspired by [OpenViking](https://github.com/volcengine/OpenViking)'s L0/L1/L2 model. Every directory can carry a ~100-token abstract (L0) and a ~1k-token overview (L1), enabling agents to scan cheaply before loading full content (L2).
 
 ---
 
 ## 2. Architecture
 
-### Three-Layer Storage Design
-
-dat9 separates storage into three independent layers, inspired by [OpenViking](https://github.com/volcengine/OpenViking)'s dual-layer architecture and extended with a metadata layer:
+### Storage Tiering
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                        dat9 Server (Go)                              │
-│                                                                      │
-│  ┌────────────────────────────────────────────────────────────────┐  │
-│  │                   MountableFS (AGFS)                           │  │
-│  │              radix-tree path → backend routing                 │  │
-│  │                                                                │  │
-│  │   /          → S3MetaBackend (files + metadata)                │  │
-│  │   /mem/      → memfs (in-memory scratch)                       │  │
-│  │   /kv/       → kvfs (future)                                   │  │
-│  └──────────┬─────────────────────────┬───────────────────────────┘  │
-│             │                         │                              │
-│  ┌──────────▼──────────┐   ┌──────────▼──────────┐                  │
-│  │  Content Layer      │   │  Metadata Layer      │                  │
-│  │                     │   │                      │                  │
-│  │  S3 / Object Store  │   │  Relational DB       │                  │
-│  │  blobs/<ulid>       │   │  - files table       │                  │
-│  │  (content-addressed │   │  - file_tags table   │                  │
-│  │   L2, L0, L1 all   │   │  - uploads table     │                  │
-│  │   stored by ULID)   │   │  - context_layers    │                  │
-│  │  memfs (volatile)   │   │                      │                  │
-│  └─────────────────────┘   └──────────────────────┘                  │
-│             │                                                        │
-│             │  async (write → queue → process)                       │
-│             ▼                                                        │
-│  ┌─────────────────────┐                                             │
-│  │  Index Layer        │                                             │
-│  │                     │                                             │
-│  │  Vector DB          │  ← L0 abstracts → embeddings               │
-│  │  - URI + vector     │  ← semantic search over directory tree      │
-│  │  - parent_uri       │  ← hierarchical retrieval                   │
-│  │  - context_type     │                                             │
-│  │  - sparse vector    │                                             │
-│  │                     │                                             │
-│  │  (not in read path  │                                             │
-│  │   for file I/O)     │                                             │
-│  └─────────────────────┘                                             │
-│                                                                      │
-│  ┌───────────────────────────────────────────────────────────────┐   │
-│  │  Background Workers                                           │   │
-│  │  - SemanticProcessor: file → LLM → L0/L1 generation          │   │
-│  │  - VectorIndexer: L0 → embedding → vector DB upsert          │   │
-│  │  - Reaper: cleanup expired / orphaned / aborted uploads       │   │
-│  └───────────────────────────────────────────────────────────────┘   │
+│                          dat9 Server (Go)                             │
+│                                                                       │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │                     MountableFS (AGFS)                           │  │
+│  │                radix-tree path → backend routing                 │  │
+│  │                                                                  │  │
+│  │   /          → Dat9Backend                                       │  │
+│  │   /mem/      → memfs (in-memory scratch)                         │  │
+│  └──────────┬──────────────────────────────────────────────────────┘  │
+│             │                                                         │
+│  ┌──────────▼──────────────────────────────────────────────────────┐  │
+│  │                       Dat9Backend                                │  │
+│  │              (implements AGFS FileSystem)                         │  │
+│  │                                                                  │  │
+│  │  Write path:                                                     │  │
+│  │    < 1MB  → db9 fs9_write()        (instant, auto-embedding)     │  │
+│  │    >= 1MB → S3 presigned URL       (direct upload, never proxied)│  │
+│  │                                                                  │  │
+│  │  Read path:                                                      │  │
+│  │    db9 file → fs9_read()           (~1ms)                        │  │
+│  │    S3 file  → presigned URL 302    (~50ms)                       │  │
+│  │                                                                  │  │
+│  │  Search:                                                         │  │
+│  │    semantic  → db9 HNSW vector     (auto-embedded content)       │  │
+│  │    keyword   → db9 GIN FTS         (auto-indexed content)        │  │
+│  │    hybrid    → FTS WHERE + vector ORDER BY                       │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                       │
+│  ┌──────────┐  ┌──────────┐                                          │
+│  │ 租户 db9 │  │    S3    │                                          │
+│  │          │  │          │                                          │
+│  │ 4 tables │  │ blobs/   │                                          │
+│  │ + fs9    │  │ <ulid>   │                                          │
+│  │ + embed  │  │          │                                          │
+│  │ + FTS    │  │ 大文件    │                                          │
+│  │ + vector │  │ >= 1MB   │                                          │
+│  └──────────┘  └──────────┘                                          │
+│                                                                       │
+│  ┌───────────────────────────────────────────────────────────────┐    │
+│  │  Background Workers                                           │    │
+│  │  - SemanticProcessor: L2 file → LLM → L0/L1 generation       │    │
+│  │  - Reaper: cleanup expired / orphaned / aborted uploads       │    │
+│  └───────────────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-**Key separation**:
+### Why Two Storage Tiers?
 
-| Layer | Stores | Read Latency | Write Path | Scales Independently |
-|-------|--------|-------------|------------|---------------------|
-| **Content** (S3 + memfs) | Actual file bytes (L0, L1, L2) | ~10-100ms (S3) / <1ms (memfs) | Synchronous (small) or presigned URL (large) | Yes (S3 is infinite) |
-| **Metadata** (Relational DB) | Paths, tags, upload state, revisions | ~1-5ms | Synchronous, always through server | Yes (DB scales separately) |
-| **Index** (Vector DB) | Embeddings of L0 abstracts, URIs | ~10-50ms | **Asynchronous** --- never blocks file writes | Yes (vector DB scales separately) |
+| Concern | db9 (< 1MB) | S3 (>= 1MB) |
+|---------|-------------|-------------|
+| **Latency** | ~1ms (TiKV local read) | ~50ms (HTTP round-trip) |
+| **Max size** | 100MB (db9 limit) | Unlimited |
+| **Auto-embedding** | `GENERATED ALWAYS AS (EMBED_TEXT(...))` — free | Not possible |
+| **FTS** | `GENERATED ALWAYS AS (to_tsvector(...))` — free | Not possible |
+| **Semantic search** | Native HNSW + GIN | Only via L0 abstract (small file in db9) |
+| **Cost** | db9 compute + TiKV storage | S3 storage (cheap) + transfer |
 
-**The index layer is async and decoupled from the write path.** Writing a file to dat9 returns immediately. The vector index is updated later by a background worker. This means:
+Small files benefit from db9's native embedding/FTS. Large files are too big for db9 and too expensive to embed entirely — they participate in search only through their L0 abstracts (which are small files stored in db9).
 
-- File writes are never slowed by embedding computation or vector DB latency.
-- The vector index can be rebuilt from scratch by re-reading L0s from S3.
-- If the vector DB is down, file I/O continues unaffected. Search is degraded but files are safe.
+### Relationship with AGFS
+
+dat9's server imports AGFS as a Go module dependency (Apache 2.0).
+
+| AGFS Package | What We Use |
+|---|---|
+| `pkg/filesystem` | `FileSystem` interface (Create, Read, Write, ReadDir, Stat, Rename, ...), `Capabilities` system, `WriteFlag`/`OpenFlag` types, `StreamReader`/`Toucher`/`Symlinker` extension interfaces |
+| `pkg/mountablefs` | `MountableFS` radix-tree path router --- dispatches `/path` to the correct backend plugin via longest-prefix match |
+| `pkg/plugin` | `ServicePlugin` interface (Name, Validate, Initialize, GetFileSystem, GetReadme, GetConfigParams, Shutdown) |
+| `pkg/plugins/memfs` | In-memory filesystem plugin used for `/mem` scratch mount |
+
+```go
+import (
+    "github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+    "github.com/c4pt0r/agfs/agfs-server/pkg/mountablefs"
+    "github.com/c4pt0r/agfs/agfs-server/pkg/plugin"
+)
+
+// Dat9Backend implements AGFS's FileSystem interface
+type Dat9Backend struct {
+    db9  *db9.Client    // tenant db9 (metadata + small file storage)
+    s3   S3Client       // large file storage
+}
+
+func (b *Dat9Backend) Read(path string, offset, size int64) ([]byte, error) { ... }
+func (b *Dat9Backend) Write(path string, data []byte, offset int64, flags filesystem.WriteFlag) (int64, error) { ... }
+func (b *Dat9Backend) ReadDir(path string) ([]filesystem.FileInfo, error) { ... }
+func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) { ... }
+
+// Capability detection via type assertion (AGFS pattern)
+if cp, ok := backend.(filesystem.CapabilityProvider); ok {
+    caps := cp.GetCapabilities()
+    if caps.IsObjectStore { /* use presigned URL path */ }
+}
+
+// Mount it
+mfs := mountablefs.NewMountableFS(api.DefaultPoolConfig())
+mfs.Mount("/", &Dat9Plugin{backend: dat9backend})
+mfs.Mount("/mem", memfsPlugin)
+```
 
 ### Client Layer
 
@@ -135,83 +187,107 @@ dat9 separates storage into three independent layers, inspired by [OpenViking](h
     ┌──────────────────▼──────────────────────────────▼──────┐
     │  Transfer Engine (inside SDK)                          │
     │                                                        │
-    │  Small file: PUT body → server proxy → S3              │
+    │  Small file: PUT body → server → db9 fs9_write         │
     │  Large file: PUT → 202 + presigned URLs → direct to S3 │
     │  Resume: GET /v1/uploads?path=... → re-issue URLs      │
     └───────────────────────────────────────────────────────┘
 ```
 
-Large file data goes directly from client to S3 via presigned URLs. The server never touches it.
+---
 
-### Relationship with AGFS
+## 3. inode Model: Paths and Files
 
-dat9's server imports AGFS as a Go module dependency (Apache 2.0). We pin the AGFS dependency to a specific commit or tag to avoid interface drift.
+### The Key Separation
 
-| AGFS Package | What We Use |
-|---|---|
-| `pkg/filesystem` | `FileSystem` interface (Create, Read, Write, ReadDir, Stat, Rename, ...), `Capabilities` system, `WriteFlag`/`OpenFlag` types, `StreamReader`/`Toucher`/`Symlinker` extension interfaces |
-| `pkg/mountablefs` | `MountableFS` radix-tree path router --- dispatches `/path` to the correct backend plugin via longest-prefix match, lock-free reads (`atomic.Value`) |
-| `pkg/plugin` | `ServicePlugin` interface (Name, Validate, Initialize, GetFileSystem, GetReadme, GetConfigParams, Shutdown) |
-| `pkg/plugins/memfs` | In-memory filesystem plugin used for `/mem` scratch mount |
+dat9 uses an **inode model** inspired by Unix: paths (directory entries) and file entities (inodes) are separate concerns.
 
-We write our own HTTP handlers (AGFS's handlers bind to a different URL schema), our own `S3MetaBackend` (implements `filesystem.FileSystem`), and all upload/query/reaper logic.
-
-```go
-import (
-    "github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
-    "github.com/c4pt0r/agfs/agfs-server/pkg/mountablefs"
-    "github.com/c4pt0r/agfs/agfs-server/pkg/plugin"
-)
-
-// Our backend implements AGFS's FileSystem interface
-type S3MetaBackend struct {
-    meta MetadataStore  // files + file_tags + context_layers tables
-    s3   S3Client       // object storage (blobs/<ulid> keys)
-}
-
-func (b *S3MetaBackend) Read(path string, offset, size int64) ([]byte, error) { ... }
-func (b *S3MetaBackend) Write(path string, data []byte, offset int64, flags filesystem.WriteFlag) (int64, error) { ... }
-func (b *S3MetaBackend) ReadDir(path string) ([]filesystem.FileInfo, error) { ... }
-func (b *S3MetaBackend) Stat(path string) (*filesystem.FileInfo, error) { ... }
-// ... all FileSystem methods
-
-// Capability detection via type assertion (AGFS pattern)
-if cp, ok := backend.(filesystem.CapabilityProvider); ok {
-    caps := cp.GetCapabilities()
-    if caps.IsObjectStore { /* use presigned URL path */ }
-}
-
-// Mount it
-mfs := mountablefs.NewMountableFS(api.DefaultPoolConfig())
-mfs.Mount("/", &S3MetaPlugin{backend: s3meta})
-mfs.Mount("/mem", memfsPlugin)  // in-memory scratch space, AGFS built-in
-// Future:
-// mfs.Mount("/kv", kvfsPlugin)
 ```
+                    file_nodes (dentry)              files (inode)
+                    ─────────────────               ──────────────
+path                  file_id (FK)                  file_id (PK)
+parent_path           ────────────▶                 storage_type: db9 | s3
+name                                                storage_ref
+is_directory                                        size_bytes
+                                                    content_type
+                                                    revision
+                                                    ...
+```
+
+**One file entity can appear at multiple paths** (N:1 mapping):
+
+```
+file_nodes                                    files
+─────────────────────────────                 ──────────────────────
+/data/training-v3/images.tar  ──┐             file_id: 01JQ...
+/shared/team-a/images.tar     ──┼──▶          storage_type: s3
+/backup/2026/images.tar       ──┘             storage_ref: blobs/01JQ...
+                                              size_bytes: 10737418240
+(3 paths, 1 file, 1 S3 object)
+```
+
+### Why inode Model?
+
+| Operation | Without inode (path = file) | With inode (file_nodes + files) |
+|-----------|---------------------------|-------------------------------|
+| `cp /a /b` | Copy S3 object ($$$, slow for 10GB) | `INSERT file_nodes` (instant, zero storage cost) |
+| `mv /a /b` | Copy S3 + delete old ($$$) | `UPDATE file_nodes SET path=...` (instant) |
+| `rm /a` (has other links) | Complex reference tracking | `DELETE file_nodes WHERE path='/a'` (file survives) |
+| `rm /a` (last link) | Delete S3 object | Delete file_nodes → refcount=0 → Reaper deletes file+blob |
+| `stat --nlink` | Not possible | `SELECT COUNT(*) FROM file_nodes WHERE file_id=?` |
+
+This is the same model as Unix (dentry + inode), Plan 9 (name space + file server), and OpenViking (URI tree + resource storage).
+
+### S3 Key Strategy
+
+Large files are stored at content-addressed S3 keys: `blobs/<ulid>`. The path-to-blob mapping lives only in the database.
+
+```
+S3 Bucket
+  blobs/
+    01JQ7R8K3M0000000000000001     ← /data/training-v3/images.tar.gz
+    01JQ7R8K3M0000000000000002     ← /config/model.bin
+```
+
+Small files are stored in db9 via `fs9_write('/blobs/<ulid>', content)`. Same ULID scheme, different storage backend.
+
+### Operation Mapping
+
+| dat9 operation | What happens |
+|---|---|
+| `dat9 ls /data/` | `SELECT name, is_directory, f.size_bytes FROM file_nodes fn LEFT JOIN files f ON fn.file_id = f.file_id WHERE fn.parent_path = '/data/'` |
+| `dat9 cat /data/a.txt` | `file_nodes → file_id → files.storage_type` → if db9: `fs9_read(storage_ref)` / if s3: `S3.GetObject(storage_ref)` |
+| `dat9 cp /a /b` | `INSERT file_nodes(path='/b', file_id=same)` — zero-copy |
+| `dat9 mv /a /b` | `UPDATE file_nodes SET path='/b', parent_path=..., name=... WHERE path='/a'` |
+| `dat9 rm /a` | `DELETE file_nodes WHERE path='/a'` → if refcount=0: mark file DELETED |
+| `dat9 stat /a` | `SELECT fn.*, f.* FROM file_nodes fn JOIN files f ON ... WHERE fn.path='/a'` |
+| `dat9 search "query"` | `SELECT ... FROM files f JOIN file_nodes fn ON ... ORDER BY vec_embed_cosine_distance(f.vec, 'query') LIMIT k` |
 
 ---
 
-## 3. Two Data Paths
+## 4. Two Data Paths
 
-dat9 serves two fundamentally different workloads through a single interface.
-
-### Small Files (< 10 MB): Server Proxy
+### Small Files (< 1MB): Server Proxy → db9
 
 ```
-Client ──PUT body──▶ dat9 server ──PUT──▶ S3
-                            │
-                     INSERT metadata
-                            │
-                     ◀── 200 OK ──
+Client ──PUT body──▶ dat9 server
+                        │
+                 fs9_write('/blobs/<ulid>', body)
+                 INSERT files (storage_type='db9', ...)
+                 INSERT file_nodes (path=..., file_id=...)
+                 ← db9 auto-computes: vec (EMBED_TEXT), tsv (to_tsvector)
+                        │
+Client ◀── 200 OK ──────┘
 ```
 
-The server reads the request body, uploads to S3, writes metadata, and returns. Simple, synchronous, one round-trip for the client.
+The server reads the request body, writes to db9, creates metadata, and returns. Simple, synchronous. **Embedding and FTS indexing happen automatically** via db9's `GENERATED ALWAYS AS` columns — no async pipeline needed for small files.
 
-### Large Files (>= 10 MB): Presigned URL Direct Upload
+### Large Files (>= 1MB): Presigned URL Direct Upload → S3
 
 ```
 Client ──PUT (Content-Length only, no body)──▶ dat9 server
                                                   │
+                                           INSERT files (PENDING)
+                                           INSERT uploads
                                            CreateMultipartUpload
                                            PresignUploadPart x N
                                                   │
@@ -226,149 +302,149 @@ Client ──POST /v1/uploads/{id}/complete──▶ dat9 server
                                               │
                                        CompleteMultipartUpload
                                        UPDATE files → CONFIRMED
+                                       INSERT file_nodes
                                               │
 Client ◀── 200 { confirmed } ────────────────┘
 ```
 
-The server never touches large file data. It issues presigned URLs and tracks progress.
+The server never touches large file data. Large files have `vec=NULL` and `tsv=NULL` — they don't participate in search directly. They participate through their L0 abstracts (see §5).
 
-**Capability-aware write handler**: the server checks `backend.(filesystem.CapabilityProvider).GetCapabilities().IsObjectStore` via type assertion. If true and size >= threshold, return 202 with presigned URLs. If false (e.g., `memfs`) or if the backend does not implement `CapabilityProvider`, always use direct writes and never return 202.
+**Capability-aware write handler**: the server checks `backend.(filesystem.CapabilityProvider).GetCapabilities().IsObjectStore` via type assertion. If true and size >= 1MB threshold, return 202 with presigned URLs.
 
 ### Resumable Uploads
 
-The SDK is **stateless** --- no local state files. On interruption, the SDK queries the server:
+The SDK is **stateless**. On interruption, the SDK queries the server:
 
 ```
 GET /v1/uploads?path=/data/big.bin&status=UPLOADING
 ```
 
-The server calls `S3.ListParts()` to determine which parts were already uploaded, then re-issues presigned URLs for the remaining parts. The client resumes from where it left off.
-
-```bash
-$ dat9 cp ./10gb.tar /data/10gb.tar
-Uploading /data/10gb.tar (10.0 GB)
-[████████████░░░░░░░░░░] 45%  ^C  # interrupted
-
-$ dat9 cp ./10gb.tar /data/10gb.tar     # just re-run the same command
-Resuming upload (72/160 parts done)
-[█████████████████████░] 95%
-Upload complete: /data/10gb.tar (10.0 GB)
-```
-
-### S3 Key Strategy: Content-Addressed Storage
-
-dat9 uses **content-addressed S3 keys**, not semantic paths. Every file is stored at `blobs/<ulid>`:
-
-```
-S3 Bucket
-  blobs/
-    01JQ7R8K3M0000000000000001     ← /data/training-v3/images.tar.gz
-    01JQ7R8K3M0000000000000002     ← /data/training-v3/.abstract.md
-    01JQ7R8K3M0000000000000003     ← /config/settings.json
-```
-
-The **path-to-blob mapping** lives in the `files` table:
-
-```
-files.path                          → files.s3_key
-"/data/training-v3/images.tar.gz"   → "blobs/01JQ7R8K3M0000000000000001"
-"/data/training-v3/.abstract.md"    → "blobs/01JQ7R8K3M0000000000000002"
-"/config/settings.json"             → "blobs/01JQ7R8K3M0000000000000003"
-```
-
-**Why content-addressed keys?**
-
-| Concern | Semantic keys (`/data/foo.bin`) | Content-addressed (`blobs/<ulid>`) |
-|---------|---|----|
-| **Rename / Move** | Must copy S3 object + delete old ($$, slow for large files) | `UPDATE files SET path=? WHERE file_id=?` — zero S3 cost |
-| **S3 key conflicts** | Path collisions require escaping | ULIDs are globally unique by construction |
-| **Key length** | Deep paths can exceed S3 limits | Fixed ~30 chars |
-| **Garbage collection** | S3 objects carry semantic meaning, risky to delete | Any blob not referenced by `files.s3_key` is garbage |
-
-**Operation mapping**:
-
-| dat9 operation | What happens |
-|---|---|
-| `dat9 ls /data/` | `SELECT path, size_bytes, ... FROM files WHERE parent_path = '/data/' AND status = 'CONFIRMED'` |
-| `dat9 cat /data/a.bin` | `SELECT s3_key FROM files WHERE path = '/data/a.bin'` → `S3.GetObject(s3_key)` |
-| `dat9 mv /data/a.bin /data/b.bin` | `UPDATE files SET path = '/data/b.bin', parent_path = '/data/' WHERE path = '/data/a.bin'` (zero S3 cost) |
-| `dat9 cp /data/a.bin /data/b.bin` | `S3.CopyObject(src_key, new_ulid_key)` + `INSERT files (path='/data/b.bin', s3_key='blobs/<new_ulid>')` |
-| `dat9 stat /data/a.bin` | `SELECT * FROM files WHERE path = '/data/a.bin'` |
-
-This design follows db9's philosophy: **the path namespace is a metadata concern, not a storage concern.** S3 is a dumb blob store; the database gives it structure.
+The server calls `S3.ListParts()` to determine which parts were already uploaded, then re-issues presigned URLs for the remaining parts.
 
 ---
 
-## 4. Tiered Context Storage and Semantic Index
+## 5. Tiered Context: L0 / L1 / L2
 
 dat9 adopts a three-layer content model inspired by [OpenViking](https://github.com/volcengine/OpenViking)'s L0/L1/L2 tiered context architecture. The core insight: agents rarely need the full content of a file. They need just enough context to decide whether to load more.
 
-### 4.1 The L0 / L1 / L2 Model
+### 5.1 The Model
 
 Every directory in dat9 can optionally carry three layers of progressively detailed content:
 
-| Layer | File | Token Budget | Purpose |
-|-------|------|-------------|---------|
-| **L0** | `.abstract.md` | ~100 tokens | Ultra-short summary. Used for vector search, quick filtering, directory-level scans. |
-| **L1** | `.overview.md` | ~1-2k tokens | Structured overview with navigation pointers. Tells the agent *what's here* and *how to access details*. |
-| **L2** | Original files | Unlimited | Full content. Loaded only when the agent confirms it needs the detail. |
+| Layer | File | Token Budget | Purpose | Storage |
+|-------|------|-------------|---------|---------|
+| **L0** | `.abstract.md` | ~100 tokens (~400B) | Ultra-short summary. Vector search, quick filtering. | db9 (small file, auto-embedded) |
+| **L1** | `.overview.md` | ~1-2k tokens (~4KB) | Structured overview with navigation pointers. | db9 (small file, auto-embedded) |
+| **L2** | Original files | Unlimited | Full content. Loaded only when the agent confirms it needs the detail. | db9 (< 1MB) or S3 (>= 1MB) |
 
 Example directory:
 
 ```
 /data/training-v3/
   .abstract.md          # L0: "ImageNet-subset training data, 50k images, labeled, v3."
-  .overview.md          # L1: structured summary + navigation to L2 files
-  metadata.json         # L2: full metadata
-  images.tar.gz         # L2: full data (10 GB)
+  .overview.md          # L1: structured summary + navigation pointers
+  .relations.json       # Cross-resource links (advisory)
+  metadata.json         # L2: full metadata (small, in db9)
+  images.tar.gz         # L2: full data (10 GB, in S3)
 ```
+
+**Key**: L0 and L1 are **ordinary small files** stored in db9 via the same Dat9Backend. They are file_nodes entries pointing to files entries. "Everything is a file" — no special tables, no caching layer. Because they're in db9, they are automatically embedded and FTS-indexed.
 
 Token savings: scanning 20 directories via L0 costs ~2k tokens. Loading 3 L1 overviews costs ~3k. Loading 1 full L2 costs ~5k. Total: **10k tokens instead of 100k** (10x reduction).
 
-### 4.2 Dual-Layer Storage: Content + Index
+### 5.2 Why No context_layers Table?
 
-Following OpenViking's architecture, dat9 separates content storage from semantic index:
+In the previous design, a `context_layers` table cached L0/L1 content to avoid S3 round-trips. With the new tiered storage:
+
+- L0/L1 files are already in db9 (~1ms read latency)
+- Their content is in `files.content_text` with auto-embedding
+- Batch scan: `SELECT fn.path, f.content_text FROM file_nodes fn JOIN files f ON ... WHERE fn.parent_path = '/data/' AND fn.name = '.abstract.md'`
+
+No caching table needed. db9 **is** the cache.
+
+### 5.3 Search: Everything Goes Through db9
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                    dat9 Storage Architecture                      │
-│                                                                  │
-│  ┌────────────────────────────────┐  ┌────────────────────────┐  │
-│  │     Content Layer (S3/memfs)   │  │   Index Layer (Vector) │  │
-│  │                                │  │                        │  │
-│  │  Stores:                       │  │  Stores:               │  │
-│  │  - L2 original files           │  │  - URI (path)          │  │
-│  │  - L1 .overview.md             │  │  - parent_uri          │  │
-│  │  - L0 .abstract.md             │  │  - dense vector        │  │
-│  │  - .relations.json             │  │  - sparse vector       │  │
-│  │                                │  │  - L0 text (denorm)    │  │
-│  │  Source of truth for content.  │  │  - context_type        │  │
-│  │  File I/O reads from here.     │  │  - is_leaf             │  │
-│  │                                │  │                        │  │
-│  │  Scales: S3 = infinite         │  │  NOT in file I/O path. │  │
-│  │                                │  │  Only for search().    │  │
-│  └────────────────────────────────┘  └────────────────────────┘  │
-│                                                                  │
-│  Single Data Source Principle:                                    │
-│  - All reads come from the Content Layer (S3).                   │
-│  - Vector Index stores only references (URIs) + embeddings.      │
-│  - If the vector index is lost, rebuild from L0s in S3.          │
-└──────────────────────────────────────────────────────────────────┘
+Semantic search (vector):
+  SELECT fn.path, f.content_text, fn.parent_path
+  FROM files f
+  JOIN file_nodes fn ON fn.file_id = f.file_id
+  WHERE f.vec IS NOT NULL AND f.status = 'CONFIRMED'
+  ORDER BY vec_embed_cosine_distance(f.vec, 'training data for image classification')
+  LIMIT 10;
+
+  → Returns: .abstract.md files (L0 of directories) + small L2 files
+  → Agent reads L1 of top results, then loads specific L2 files
+
+Full-text search (keyword):
+  SELECT fn.path, ts_headline('jieba', f.content_text, q) AS snippet
+  FROM files f
+  JOIN file_nodes fn ON fn.file_id = f.file_id,
+       plainto_tsquery('jieba', '训练数据') q
+  WHERE f.tsv @@ q AND f.status = 'CONFIRMED'
+  ORDER BY ts_rank(f.tsv, q) DESC
+  LIMIT 10;
+
+Hybrid search (FTS filter + vector ranking):
+  SELECT fn.path, f.content_text
+  FROM files f
+  JOIN file_nodes fn ON fn.file_id = f.file_id
+  WHERE f.tsv @@ plainto_tsquery('jieba', 'training')
+    AND f.status = 'CONFIRMED'
+  ORDER BY vec_embed_cosine_distance(f.vec, 'image classification training data')
+  LIMIT 10;
 ```
 
-**Why separate?**
+Large files (S3) don't have `vec` or `tsv`. They participate in search **indirectly** through their directory's `.abstract.md`:
 
-| Concern | Content Layer (S3) | Index Layer (Vector DB) |
-|---------|-------------------|------------------------|
-| **Availability** | Must be 100% available for file I/O | Can be temporarily down --- search degrades, but files are safe |
-| **Consistency** | Strong (S3 read-after-write) | Eventual (async indexing) |
-| **Rebuild** | Cannot rebuild (source of truth) | Can rebuild from L0s in S3 |
-| **Scaling** | S3 scales infinitely | Vector DB scales independently |
-| **Cost** | S3 storage cost | Compute (embeddings) + vector DB memory |
+```
+Agent: "find training data for image classification"
+  → Vector search hits /data/training-v3/.abstract.md (L0, in db9)
+  → Agent reads /data/training-v3/.overview.md (L1, in db9)
+  → Agent decides to download /data/training-v3/images.tar.gz (L2, in S3)
+```
 
-### 4.3 Async Processing Pipeline
+### 5.4 Hierarchical Retrieval
 
-File writes and vector indexing are **decoupled by a queue**. This is critical: file I/O must never block on LLM calls or vector DB writes.
+The filesystem directory structure itself becomes the navigation hierarchy:
+
+```
+Agent: "find training data for image classification"
+
+Step 1: Vector search over all files with embeddings
+  → Query embedding vs all file vectors (L0 abstracts + small L2 files)
+  → Returns candidate paths: [/data/training-v3/.abstract.md, /data/imagenet/.abstract.md]
+
+Step 2: Agent reads L1 of top candidates
+  → dat9 cat /data/training-v3/.overview.md
+  → ~1k tokens, structured: "50k images, labeled, classes: dog/cat/bird..."
+  → Agent decides: this is the one.
+
+Step 3: Agent loads specific L2 files
+  → dat9 cat /data/training-v3/metadata.json  (small, from db9)
+  → dat9 cat /data/training-v3/images.tar.gz  (large, 302 → S3 presigned URL)
+```
+
+### 5.5 Cross-Resource Relations (.relations.json)
+
+Each directory can optionally carry a `.relations.json` sidecar file:
+
+```json
+{
+  "relations": [
+    { "target": "/data/imagenet/", "type": "derived_from", "description": "Training subset extracted from ImageNet" },
+    { "target": "/experiments/resnet-v2/", "type": "used_by", "description": "Used as training input" }
+  ]
+}
+```
+
+- `.relations.json` is a regular small file stored in db9. "Everything is a file."
+- Relations are **advisory**, not enforced. Deleting a target does not cascade.
+- P0: users write `.relations.json` manually. Future: auto-generated by SemanticProcessor.
+
+### 5.6 Async Processing Pipeline
+
+For auto-generating L0/L1 from L2 files. This is a **P8+ feature** — not needed for P0.
 
 ```
 File Write (synchronous)              Background Workers (asynchronous)
@@ -376,199 +452,45 @@ File Write (synchronous)              Background Workers (asynchronous)
 
 dat9 cp file.md /docs/               SemanticProcessor (picks from queue):
   │                                     │
-  ├─▶ S3.PutObject(blobs/<ulid>)       ├─▶ S3.GetObject(blobs/<ulid>)
-  ├─▶ INSERT INTO files                ├─▶ LLM: generate L0 (.abstract.md)
-  │     (path, s3_key, CONFIRMED)      ├─▶ LLM: generate L1 (.overview.md)
-  ├─▶ ENQUEUE(semantic_queue,          ├─▶ S3.PutObject(.abstract.md)
-  │     {path, action: "created"})     ├─▶ S3.PutObject(.overview.md)
-  │                                     │
-  └─▶ 200 OK  (immediate)             VectorIndexer (after L0 ready):
-                                        │
-       ← file is usable NOW,           ├─▶ S3.GetObject(.abstract.md)
-         search catches up later        ├─▶ Embed(L0 text) → dense vector
-                                        ├─▶ VectorDB.Upsert({
-                                        │     uri: "/docs/file.md",
-                                        │     parent_uri: "/docs/",
-                                        │     vector: [...],
-                                        │     abstract: "...",
-                                        │     context_type: "resource",
-                                        │     is_leaf: true
-                                        │   })
-                                        └─▶ Propagate: re-generate parent
-                                              /docs/.abstract.md (bottom-up)
+  ├─▶ store content (db9 or S3)        ├─▶ read file content
+  ├─▶ INSERT files + file_nodes        ├─▶ LLM: generate L0 (.abstract.md)
+  ├─▶ ENQUEUE(semantic_queue,          ├─▶ LLM: generate L1 (.overview.md)
+  │     {path, action: "created"})     ├─▶ dat9 write .abstract.md (→ db9, auto-embedded)
+  │                                     ├─▶ dat9 write .overview.md (→ db9, auto-embedded)
+  └─▶ 200 OK  (immediate)             └─▶ Propagate: re-generate parent L0 (bottom-up)
 ```
 
-**Key properties**:
-
-- **File write returns immediately.** The 200 OK is returned after S3 + metadata. The agent can read the file right away.
-- **L0/L1 generation is async.** Uses an LLM (configurable: local model or API). Runs bottom-up: leaf files first, then parent directories aggregate child L0s into their own L1.
-- **Vector indexing is async.** Embedding computation and vector DB upsert happen after L0 is generated. Search results for newly written files may lag by seconds to minutes.
-- **Queue provides backpressure.** If the LLM or vector DB is slow, the queue buffers. File I/O is unaffected.
-- **Rebuilable.** The vector index can be fully rebuilt by scanning all `.abstract.md` files in S3 and re-embedding. No data loss.
-
-### 4.4 Hierarchical Retrieval
-
-The tiered model enables directory-recursive semantic search, following OpenViking's `HierarchicalRetriever` pattern:
-
-```
-Agent: "find training data for image classification"
-
-Step 1: Vector search over L0s
-  → Query embedding vs all L0 vectors
-  → Returns candidate URIs: [/data/training-v3/, /data/imagenet/, /experiments/resnet/]
-
-Step 2: Agent reads L1 of top candidates
-  → dat9 overview /data/training-v3/
-  → ~1k tokens, structured: "50k images, labeled, classes: dog/cat/bird..."
-  → Agent decides: this is the one.
-
-Step 3: Agent loads specific L2 files
-  → dat9 cat /data/training-v3/metadata.json
-  → Full detail, loaded on-demand.
-```
-
-The filesystem directory structure itself becomes the navigation hierarchy. No separate taxonomy or ontology needed.
-
-### 4.5 Vector Index Schema
-
-```
-Collection: dat9_context
-─────────────────────────
-id            string       Primary key (ULID)
-uri           string       File/directory path (e.g., "/data/training-v3/")
-parent_uri    string       Parent directory URI
-context_type  string       "resource" | "memory" | "skill" | ... (extensible)
-is_leaf       bool         true for files, false for directories
-vector        float[]      Dense embedding of L0 abstract
-sparse_vector map          Sparse vector (BM25-style, for keyword matching)
-abstract      string       L0 text (denormalized for reranking without S3 read)
-name          string       Display name
-created_at    string       ISO timestamp
-active_count  int64        Usage counter (for relevance boosting)
-```
-
-### 4.6 Cross-Resource Relations (.relations.json)
-
-Inspired by OpenViking's relation graph, each directory can optionally carry a `.relations.json` sidecar file describing links to related resources:
-
-```json
-{
-  "relations": [
-    {
-      "target": "/data/imagenet/",
-      "type": "derived_from",
-      "description": "Training subset extracted from ImageNet"
-    },
-    {
-      "target": "/experiments/resnet-v2/",
-      "type": "used_by",
-      "description": "Used as training input for ResNet v2 experiment"
-    }
-  ]
-}
-```
-
-**Design constraints**:
-
-- `.relations.json` is a regular file stored in S3 via the same `blobs/<ulid>` mechanism. "Everything is a file" applies.
-- Relations are **advisory**, not enforced. Deleting a target does not cascade-delete the relation entry.
-- P0: users write `.relations.json` manually. P8+: the semantic processor auto-generates relation suggestions based on content similarity.
-- The vector index can optionally index relation targets for graph-aware retrieval (e.g., "find all datasets used by experiment X").
-
-### 4.7 Scope and Boundaries
-
-dat9's responsibility is clearly scoped:
+### 5.7 Scope and Boundaries
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  Upper Layer (Agent Framework / Application)             │
-│                                                          │
-│  - Intent analysis ("what does the user want?")          │
-│  - Query planning ("which files to load?")               │
-│  - Reranking (cross-encoder, business logic)             │
-│  - Context assembly (compose prompt from L0/L1/L2)       │
-│  - Conversation memory management                        │
-│  - Access control policies beyond path-level auth         │
+│  - Intent analysis, query planning, reranking            │
+│  - Context assembly, conversation memory                 │
 └──────────────────────────┬──────────────────────────────┘
                            │  calls dat9 API
 ┌──────────────────────────▼──────────────────────────────┐
 │  dat9 (This System)                                      │
-│                                                          │
 │  - File CRUD: cp, cat, ls, mv, stat, rm                  │
-│  - Metadata: tags, queries, revisions                    │
-│  - Tiered context: L0/L1/L2 storage and caching          │
-│  - Vector search: /v1/search, /v1/find (P9+)             │
-│  - Upload orchestration: presigned URLs, multipart        │
-│  - Sharing: snapshot export/import, live read-only mounts │
-│  - Background: semantic generation, vector indexing        │
+│  - Semantic search: vector, FTS, hybrid (via db9)         │
+│  - Tags, queries, revisions                               │
+│  - Large-file upload: presigned URLs, multipart, resume   │
+│  - L0/L1/L2 tiered context                                │
+│  - Sharing: snapshot export/import                        │
+└──────────────────────────┬──────────────────────────────┘
+                           │  uses
+┌──────────────────────────▼──────────────────────────────┐
+│  db9 (Tenant Database)                                   │
+│  - fs9: small file storage                               │
+│  - EMBED_TEXT + HNSW: auto-embedding + vector search     │
+│  - to_tsvector + GIN: full-text search                   │
+│  - SQL: metadata queries                                 │
 └─────────────────────────────────────────────────────────┘
-```
-
-dat9 provides **storage, retrieval, and basic semantic search**. It does **not** interpret user intent, orchestrate multi-step reasoning, or decide which files to load. Those decisions belong to the calling agent framework.
-
-### 4.8 Relationship to dat9 Core
-
-Tiered storage and vector indexing are **built on top of** dat9's existing file operations, not a separate system:
-
-- `.abstract.md` and `.overview.md` are real files in S3 (stored at `blobs/<ulid>` like any other file), stored via the same S3MetaBackend. "Everything is a file" is preserved.
-- L0/L1 text is **cached** in a dedicated `context_layers` table (separate from `files` to avoid core table bloat). See [design-content-locality.md](./design-content-locality.md) for the full rationale.
-- The `context_layers` table includes a `content_hash` and `source_s3_etag` for staleness detection. A periodic reconciler catches drift.
-- The `semantic_queue` is a table in the metadata DB (or an external queue like SQS/Redis).
-- The vector DB is a pluggable backend (local, HTTP, or managed service).
-- **P0 ships without auto-generation or vector search.** Users manage L0/L1 manually. Semantic processing and vector search are P8+ features.
-- Even without the async pipeline, the L0/L1/L2 convention is useful --- agents can manually write `.abstract.md` and benefit from tiered loading.
-
-### 4.9 Sharing
-
-Sharing a directory tree means sharing its L0/L1/L2 files together. Because L0/L1 are real files in S3, they travel with the directory naturally.
-
-Assumption: each tenant (agent) has its own TiDB Serverless cluster. Therefore cross-tenant share metadata must live in a global control-plane registry, not inside one tenant DB.
-
-**V1 (default, recommended): Snapshot share create/accept**
-
-```bash
-dat9 share create /knowledge/ml-papers/ --to agent-007 --mode snapshot
-dat9 share accept sh_01J... --to /shared/ml-papers/
-```
-
-Snapshot mode performs point-in-time export/import across clusters. L0/L1 are included automatically because they are files. The recipient writes metadata in its own tenant DB and rebuilds `context_layers` cache and vector index locally. This keeps search consistency and ownership fully local to the recipient tenant.
-
-**V2 (future, optional): Cross-namespace read-only mounts**
-
-```bash
-dat9 share create /knowledge/ml-papers/ --to agent-007 --mode ro
-dat9 share mount sh_01J... /shared/ml-papers/
-```
-
-Read-only only in V2. No recipient-side caching for shared paths (always read-through to source S3). Non-transitive (no share-of-share). Source tenant owns bytes/revisions; target tenant owns only mount metadata and optional local derived indexes. Because per-tenant vector stores are isolated, live-share search freshness requires a separate sync/index policy and is intentionally deferred. See [design-content-locality.md](./design-content-locality.md) for security and consistency analysis.
-
-### 4.10 API for Search
-
-```
-# Semantic search (uses vector index)
-POST /v1/search
-{
-  "query": "training data for image classification",
-  "target_uri": "/data/",              # scope search to a subtree
-  "context_type": "resource",          # optional filter
-  "top_k": 10
-}
-→ [{ "uri": "/data/training-v3/", "score": 0.92, "abstract": "..." }, ...]
-
-# Hierarchical find (vector search + L1 loading in one call)
-POST /v1/find
-{
-  "query": "training data for image classification",
-  "target_uri": "/data/",
-  "depth": 2,                          # how many levels to recurse
-  "include_overview": true              # return L1 alongside results
-}
-→ [{ "uri": "/data/training-v3/", "score": 0.92, "abstract": "...", "overview": "..." }, ...]
 ```
 
 ---
 
-## 5. API Design
+## 6. API Design
 
 ### Unified FS Endpoint
 
@@ -581,28 +503,38 @@ DELETE /v1/fs/{path}          Delete
 HEAD   /v1/fs/{path}          Stat  (standard HTTP semantics)
 GET    /v1/fs/{path}?list     List directory
 
-GET    /v1/fs/{path}?abstract Returns L0 (.abstract.md) content directly
-GET    /v1/fs/{path}?overview Returns L1 (.overview.md) content directly
+POST   /v1/fs/{path}?copy     Server-side link (zero-copy, same file_id)
+  Header: X-Dat9-Copy-Source: /source/path
 
-POST   /v1/fs/{path}?copy     Server-side copy (S3 CopyObject, no download)
-  Header: X-AgentFS-Copy-Source: /source/path
+POST   /v1/search             Semantic search (vector + FTS + hybrid)
+POST   /v1/query              Metadata query (tags, status, source_id)
+```
 
-POST   /v1/search             Semantic search over L0 vectors (see Section 4.8)
-POST   /v1/find               Hierarchical search with L1 loading (see Section 4.8)
+### Search API
+
+```
+POST /v1/search
+{
+  "query": "training data for image classification",
+  "mode": "vector",                    // "vector" | "fts" | "hybrid"
+  "scope": "/data/",                   // optional: scope to subtree
+  "tags": {"env": "prod"},             // optional: tag filter
+  "top_k": 10
+}
+→ [{ "path": "/data/training-v3/.abstract.md", "score": 0.92, "content": "..." }, ...]
 ```
 
 ### API Error Model
 
 - 200: success
-- 202: large file upload required
+- 202: large file upload initiated
 - 302: redirect to presigned download URL
 - 400: bad request
 - 404: not found
 - 409: conflict (upload already exists for different file)
 - 412: precondition failed (If-Match revision mismatch)
-- 413: file too large (exceeds namespace quota)
 
-### Upload Management (SDK-internal, not user-facing)
+### Upload Management (SDK-internal)
 
 ```
 GET    /v1/uploads?path=...&status=UPLOADING   Query incomplete uploads
@@ -628,8 +560,6 @@ POST /v1/query
 }
 ```
 
-No raw SQL exposed. Structured filters are translated server-side.
-
 ### Concurrency Control
 
 - Default: **Last Writer Wins** (LWW)
@@ -637,12 +567,12 @@ No raw SQL exposed. Structured filters are translated server-side.
 - `revision` is a server-managed, auto-incrementing BIGINT stored in `files.revision`.
 - Write to a path auto-creates parent directories (mkdir -p semantics).
 
-**Atomic conditional update** (prevents lost updates):
+**Atomic conditional update**:
 
 ```sql
 UPDATE files
 SET    revision = revision + 1,
-       s3_key = ?,
+       storage_ref = ?,
        size_bytes = ?,
        checksum_sha256 = ?,
        confirmed_at = NOW(3)
@@ -653,184 +583,181 @@ WHERE  file_id = ?
 -- affected_rows = 1  →  success, return new revision in ETag
 ```
 
-The same conditional-update pattern applies to `Rename`, `Copy`, and `Delete` operations.
-
 ---
 
-## 6. Metadata Schema
+## 7. Metadata Schema
 
-All metadata lives in a per-namespace relational database. **Four tables** per tenant:
+All metadata lives in the tenant's db9 database. **Four tables**:
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌────────────────┐
-│   files     │────▶│  file_tags  │     │   uploads   │     │ context_layers │
-│             │     │             │     │             │     │                │
-│ path (UK)   │     │ file_id+key │     │ upload_id   │     │ path+layer     │
-│ s3_key      │     │ tag_value   │     │ file_id     │     │ content        │
-│ parent_path │     │             │     │ s3_upload_id│     │ content_hash   │
-│ is_directory│     └─────────────┘     └─────────────┘     └────────────────┘
-│ revision    │
-│ status      │     Core FS table       Upload state         Semantic cache
-└─────────────┘     (precise queries)   (multipart mgmt)     (L0/L1, derived)
+┌────────────────┐      ┌──────────────┐      ┌─────────────┐      ┌──────────────┐
+│  file_nodes    │ N:1  │    files     │      │  file_tags  │      │   uploads    │
+│  (dentry)      │─────▶│   (inode)    │◀─────│             │      │              │
+│                │      │              │      │ file_id+key │      │ upload_id    │
+│ path    (UK)   │      │ file_id (PK) │      │ tag_value   │      │ file_id      │
+│ parent_path    │      │ storage_type │      └─────────────┘      │ s3_upload_id │
+│ name           │      │ storage_ref  │                           │ status       │
+│ file_id  (FK)  │      │ size_bytes   │      Precise SQL          └──────────────┘
+│ is_directory   │      │ vec (auto)   │      queries on tags
+│                │      │ tsv (auto)   │                           Large-file S3
+│ Path tree      │      │ content_text │                           multipart state
+│ (ls, mv, cp)   │      │ revision     │
+└────────────────┘      │ status       │
+                        └──────────────┘
+                        File entity +
+                        auto search index
 ```
 
-### files — unified path + content metadata
+### file_nodes — path tree (dentry)
 
-The `files` and `file_paths` tables are **merged into a single `files` table**. There is no separate path table. Path is a column on `files`, not a separate entity. This simplifies all operations (`ls` = one query, `stat` = one query, `mv` = one UPDATE) and follows AGFS's pattern where the filesystem itself is the namespace authority.
+```sql
+CREATE TABLE file_nodes (
+    node_id       VARCHAR(26) PRIMARY KEY,    -- ULID
+    namespace_id  VARCHAR(255) NOT NULL,
+    path          VARCHAR(4096) NOT NULL,      -- canonical full path
+    parent_path   VARCHAR(4096) NOT NULL,      -- parent directory path
+    name          VARCHAR(255) NOT NULL,        -- basename
+    is_directory  BOOLEAN NOT NULL DEFAULT FALSE,
+    file_id       VARCHAR(26),                 -- → files.file_id, NULL for directories
+    created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+
+    UNIQUE KEY idx_ns_path (namespace_id, path),
+    INDEX idx_parent (namespace_id, parent_path),
+    INDEX idx_file (file_id)
+);
+```
+
+**Design notes**:
+
+- `file_id` is NULL for directories (directories have no content).
+- Multiple file_nodes can share the same `file_id` (N:1 = hard link / zero-copy cp).
+- `parent_path` enables `ls` via `SELECT ... WHERE parent_path = ?`.
+- `name` is denormalized from `path` for display (avoids string parsing in queries).
+- `mv` is a single UPDATE on one row.
+
+### files — file entity (inode)
 
 ```sql
 CREATE TABLE files (
-    file_id         VARCHAR(26) PRIMARY KEY,    -- ULID (time-ordered, distributed-friendly)
-    namespace_id    VARCHAR(255) NOT NULL,       -- tenant isolation
-    path            VARCHAR(4096) NOT NULL,      -- canonical path (e.g., "/data/training-v3/images.tar.gz")
-    parent_path     VARCHAR(4096) NOT NULL,      -- parent directory (e.g., "/data/training-v3/")
-    is_directory    BOOLEAN NOT NULL DEFAULT FALSE,
-    s3_key          VARCHAR(1024),               -- blobs/<ulid>, NULL for directories
+    file_id         VARCHAR(26) PRIMARY KEY,    -- ULID
+    storage_type    ENUM('db9', 's3') NOT NULL,
+    storage_ref     VARCHAR(1024) NOT NULL,      -- db9: '/blobs/<ulid>'; s3: 'blobs/<ulid>'
     content_type    VARCHAR(127),
     size_bytes      BIGINT NOT NULL DEFAULT 0,
     checksum_sha256 CHAR(64),
     revision        BIGINT NOT NULL DEFAULT 1,
-    status          ENUM('PENDING','CONFIRMED','ORPHANED','DELETED') NOT NULL DEFAULT 'PENDING',
-    source_id       VARCHAR(255),                -- e.g., "agent-007", for provenance tracking
+    status          ENUM('PENDING','CONFIRMED','DELETED') NOT NULL DEFAULT 'PENDING',
+    source_id       VARCHAR(255),                -- provenance: "agent-007"
+
+    -- semantic columns (auto-computed by db9, only for small text files)
+    content_text    TEXT,                         -- file text content (NULL for binary/large)
+    vec             VECTOR(1024) GENERATED ALWAYS AS (
+                      EMBED_TEXT('amazon.titan-embed-text-v2:0', content_text, '{"dimensions": 1024}')
+                    ) STORED,
+    tsv             TSVECTOR GENERATED ALWAYS AS (
+                      to_tsvector('jieba', COALESCE(content_text, ''))
+                    ) STORED,
+
     created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     confirmed_at    DATETIME(3),
-    updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-    expires_at      DATETIME(3),                 -- TTL
-    UNIQUE KEY idx_ns_path (namespace_id, path),
-    INDEX idx_parent (namespace_id, parent_path),
-    INDEX idx_status_created (status, created_at),
-    INDEX idx_expires (expires_at)
+    expires_at      DATETIME(3),
+
+    INDEX idx_status (status, created_at),
+    INDEX idx_expires (expires_at),
+    INDEX idx_vec USING hnsw (vec vector_cosine_ops),
+    INDEX idx_fts USING gin (tsv)
 );
 ```
 
-**Key design notes**:
+**Design notes**:
 
-- `s3_key = 'blobs/<ulid>'` for files, `NULL` for directories. Content-addressed: see §3 S3 Key Strategy.
-- `path` + `namespace_id` is the unique key. This is the canonical identity of a file.
-- `parent_path` enables `ls` via `SELECT ... WHERE parent_path = ?`, mirroring AGFS sqlfs's single-table pattern.
-- Directories are rows with `is_directory = TRUE` and `s3_key = NULL`. Created automatically via mkdir-p semantics on file write.
-- `revision` supports optimistic concurrency (see §5 Concurrency Control). Atomic update: `UPDATE ... WHERE revision = ?`.
+- `storage_type='db9'`: small file, `storage_ref='/blobs/01JQ...'` → `fs9_read(storage_ref)`.
+- `storage_type='s3'`: large file, `storage_ref='blobs/01JQ...'` → `S3.GetObject(storage_ref)`.
+- `content_text`: populated for small text files (including L0/L1). NULL for binary files and S3 files.
+- `vec`: **auto-computed by db9** via `GENERATED ALWAYS AS (EMBED_TEXT(...))`. Writing `content_text` automatically generates the embedding. NULL when `content_text` is NULL.
+- `tsv`: **auto-computed by db9** via `GENERATED ALWAYS AS (to_tsvector(...))`. Automatic FTS indexing with jieba Chinese tokenizer.
+- HNSW index on `vec` enables fast ANN search. GIN index on `tsv` enables fast keyword search.
+- `revision` supports optimistic concurrency (If-Match header).
 
-### file_tags — separate tag table for precise queries
-
-Tags are a **separate table**, not a JSON column on `files`. This enables proper SQL indexing for precise filtering (`dat9 ls --tag env=prod`), efficient tag modification (add/remove individual tags without rewriting the row), and multi-tag queries with standard SQL.
+### file_tags — tags
 
 ```sql
 CREATE TABLE file_tags (
-    namespace_id VARCHAR(255) NOT NULL,          -- denormalized for efficient tag scans
-    file_id      VARCHAR(26) NOT NULL,
-    tag_key      VARCHAR(255) NOT NULL,
-    tag_value    VARCHAR(1024) NOT NULL DEFAULT '',
-    updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    file_id   VARCHAR(26) NOT NULL,
+    tag_key   VARCHAR(255) NOT NULL,
+    tag_value VARCHAR(1024) NOT NULL DEFAULT '',
     PRIMARY KEY (file_id, tag_key),
-    INDEX idx_kv (namespace_id, tag_key, tag_value),  -- for "find all files where env=prod"
-    INDEX idx_file (file_id)                           -- for "get all tags of file X"
+    INDEX idx_kv (tag_key, tag_value)
 );
 ```
 
-**Tags dual-write (P9+)**: When tags are written to SQL, they are also propagated to the vector index as scalar metadata. This enables combined semantic + tag queries:
+Separate table for proper SQL indexing. Supports precise filtering: `dat9 ls --tag env=prod`.
 
-```
-POST /v1/search
-{
-  "query": "training data",
-  "filter": { "tags": {"env": "prod"} }    ← scalar filter in vector DB
-}
-```
-
-SQL handles precise queries (`tag_key = 'env' AND tag_value = 'prod'`). Vector DB handles semantic queries with tag filters. Both are authoritative for their respective query types.
-
-### uploads — multipart upload state tracking
+### uploads — large-file multipart upload state
 
 ```sql
 CREATE TABLE uploads (
     upload_id          VARCHAR(26) PRIMARY KEY,
     file_id            VARCHAR(26) NOT NULL,
-    namespace_id       VARCHAR(255) NOT NULL,         -- tenant isolation
-    path               VARCHAR(4096) NOT NULL,         -- for GET /v1/uploads?path=...
-    fingerprint_sha256 CHAR(64),                       -- content fingerprint for dedup/conflict detection
-    idempotency_key    VARCHAR(255),                   -- client-provided, prevents duplicate sessions
     s3_upload_id       VARCHAR(255) NOT NULL,
-    bucket             VARCHAR(63) NOT NULL,
-    s3_key             VARCHAR(1024) NOT NULL,          -- blobs/<ulid>, matches files.s3_key
+    s3_key             VARCHAR(1024) NOT NULL,      -- blobs/<ulid>
     total_size         BIGINT NOT NULL,
     part_size          BIGINT NOT NULL,
     parts_total        INT NOT NULL,
     status             ENUM('UPLOADING','COMPLETED','ABORTED','EXPIRED') NOT NULL DEFAULT 'UPLOADING',
+    fingerprint_sha256 CHAR(64),                     -- dedup/conflict detection
+    idempotency_key    VARCHAR(255),                  -- client-provided
     created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     expires_at         DATETIME(3) NOT NULL,
-    INDEX idx_path_status (path, status),
-    INDEX idx_status_expires (status, expires_at),
-    UNIQUE idx_active_upload (namespace_id, path, (IF(status='UPLOADING', 0, upload_id)))
-    -- Enforces: at most one UPLOADING session per (namespace, path).
-    -- Implementation note: for DBs without expression indexes, enforce in application layer
-    -- via SELECT ... FOR UPDATE before INSERT.
+    INDEX idx_status_expires (status, expires_at)
 );
 ```
-
-### context_layers — semantic cache (derived, rebuildable)
-
-Renamed from `content_cache`. This table caches L0/L1 text extracted from S3 sidecar files, enabling batch scans without per-file S3 GETs. It is part of the **semantic pipeline**, not the core filesystem — if the pipeline is disabled, this table stays empty. Zero invasiveness.
-
-```sql
-CREATE TABLE context_layers (
-    namespace_id    VARCHAR(255) NOT NULL,            -- tenant isolation
-    path            VARCHAR(4096) NOT NULL,
-    layer           ENUM('L0', 'L1') NOT NULL,
-    content         TEXT NOT NULL,
-    content_hash    CHAR(64) NOT NULL,                -- SHA-256, for staleness detection
-    source_s3_etag  VARCHAR(255),                     -- S3 ETag at cache fill time
-    status          ENUM('PENDING', 'READY') NOT NULL DEFAULT 'PENDING',
-    updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    PRIMARY KEY (namespace_id, path, layer),
-    INDEX idx_status (status),
-    CHECK (LENGTH(content) <= 8192)                   -- 8 KB max, prevent unbounded growth
-);
-```
-
-**Why `context_layers` and not `content_cache`?** The name reflects that this table stores semantic context at different abstraction layers (L0 abstract, L1 overview), not just cached content. It is extensible: future layers (multi-language L0, L0 version history, L1 variants) are just more rows.
 
 ### Design notes
 
-**Why ULID for primary keys?** Time-ordered (efficient range scans) + random suffix (avoids write hotspots in distributed DBs like TiDB).
+**Why ULID for primary keys?** Time-ordered (efficient range scans) + random suffix (avoids write hotspots in distributed DBs).
 
-**Why merge `files` + `file_paths` into one table?** The original design had a separate `file_paths` table with `(path PK, file_id FK)`. This added JOIN cost to every `ls` and `stat` operation, complicated `mv` (update both tables), and separated concerns that belong together. AGFS's `sqlfs` uses a single table with `path` + `parent_path` columns — dat9 follows this pattern. The merged table is simpler, faster (single-table scans), and easier to reason about.
+**Why separate file_nodes and files?** inode model: one file entity, multiple path references. Enables zero-copy `cp`, zero-cost `mv`, and proper reference-counted `rm`.
+
+**Why content_text on files instead of a separate table?** L0/L1 text is tiny (100-4000 tokens). With db9's `GENERATED ALWAYS AS`, embedding and FTS indexing are automatic. No async pipeline, no cache table, no eventual consistency — it's just a column.
 
 ---
 
-## 7. Consistency Model
+## 8. Consistency Model
 
-### Write Path: S3-first, then Metadata
+### Write Path
 
 ```
 Small file:
-  1. S3.PutObject(blobs/<ulid>)                  -- fail → return error, no dirty data
-  2. INSERT INTO files (path, s3_key, CONFIRMED)  -- fail → best-effort S3 delete; Reaper catches the rest
-  3. Auto-create parent directories (mkdir -p)    -- INSERT IGNORE for each ancestor
+  1. fs9_write('/blobs/<ulid>', content)              -- store to db9
+  2. INSERT files (storage_type='db9', content_text=content, CONFIRMED)
+     ← db9 auto-computes vec + tsv
+  3. INSERT file_nodes (path=..., file_id=...)
+  4. Auto-create parent directories (INSERT IGNORE for each ancestor)
 
 Large file:
-  1. INSERT INTO files (path, s3_key, PENDING) + INSERT INTO uploads
+  1. INSERT files (storage_type='s3', PENDING) + INSERT uploads
   2. Client uploads parts directly to S3 via presigned URLs
-  3. Client calls /complete → CompleteMultipartUpload → UPDATE files SET status = 'CONFIRMED'
+  3. Client calls /complete → CompleteMultipartUpload
+  4. UPDATE files SET status='CONFIRMED'
+  5. INSERT file_nodes (path=..., file_id=...)
 ```
 
 ### State Machines
-
-`files` and `uploads` have **separate** state machines with cross-table invariants.
 
 **files state machine**:
 
 ```
 PENDING ──────────────────▶ CONFIRMED ──▶ (normal use)
-    │  (S3 upload complete     │
-    │   + /complete called)    │ expires_at / explicit delete
-    │                          ▼
-    │                       DELETED ──▶ Reaper (S3 + metadata + context_layers + vector cleanup)
+    │  (upload complete         │
+    │   + /complete called)     │ expires_at / explicit delete / refcount=0
+    │                           ▼
+    │                        DELETED ──▶ Reaper (db9 fs9 delete or S3 delete)
     │
-    │ Reaper: S3.HeadObject fails
+    │ Reaper: storage check fails
     ▼
- ORPHANED ──▶ Reaper (metadata cleanup)
+ (Reaper deletes metadata)
 ```
 
 **uploads state machine**:
@@ -851,76 +778,75 @@ UPLOADING ──▶ COMPLETED
 
 | Invariant | Meaning |
 |-----------|---------|
-| `uploads.status = COMPLETED` ⟹ `files.status = CONFIRMED` | A completed upload always has a confirmed file |
-| `uploads.status = UPLOADING` ⟹ `files.status = PENDING` | An in-progress upload has a pending file |
-| `files.status = CONFIRMED` ⟹ S3 has the complete object | The fundamental data integrity guarantee |
-| At most one `uploads` row with `status = UPLOADING` per `(namespace, path)` | Prevents concurrent upload races (enforced by DB constraint) |
+| `uploads.status = COMPLETED` ⟹ `files.status = CONFIRMED` | Completed upload always has confirmed file |
+| `files.status = CONFIRMED` ⟹ storage has the complete object | Fundamental data integrity guarantee |
+| `file_nodes.file_id` references existing `files.file_id` | Referential integrity |
 
-### Delete Path: Synchronous Cleanup
-
-File deletion (`DELETE /v1/fs/{path}`) performs **synchronous** cleanup of all derived data before returning:
+### Delete Path
 
 ```
 DELETE /v1/fs/{path}
-  1. DELETE FROM context_layers WHERE path = ? OR path LIKE ?/%   -- L0/L1 cache
-  2. DELETE FROM file_tags WHERE file_id = ?                      -- tags
-  3. VectorDB.Delete(uri = path)                                  -- vector index entry
-  4. S3.DeleteObject(s3_key)                                      -- content blob
-  5. UPDATE files SET status = 'DELETED'                          -- metadata (soft delete)
+  1. DELETE FROM file_nodes WHERE path = ?
+  2. SELECT COUNT(*) FROM file_nodes WHERE file_id = ?
+     → if refcount > 0: done (other paths still reference this file)
+     → if refcount = 0:
+        3. DELETE FROM file_tags WHERE file_id = ?
+        4. if db9: fs9 delete; if s3: S3.DeleteObject(storage_ref)
+        5. UPDATE files SET status = 'DELETED'
   → 200 OK
 ```
 
-This matches OpenViking's `VikingFS.rm()` pattern: derived indexes are cleaned synchronously on delete. The Reaper is a **safety net**, not the primary cleanup path.
+Reference-counted delete: the file entity is only removed when no paths reference it.
 
 ### Reaper (Background Cleanup)
 
 Runs periodically to:
-1. **Abort timed-out uploads**: `S3.AbortMultipartUpload` + update status. Critical --- incomplete multipart uploads accumulate storage costs silently.
-2. **Reconcile orphaned PENDING files**: `S3.HeadObject` to check if data exists. Promote to CONFIRMED or mark ORPHANED.
-3. **Delete TTL-expired files**: Remove S3 objects + mark DELETED.
-4. **Sweep stale derived data**: Remove `context_layers` rows and vector index entries for paths whose `files.status` is `DELETED` or `ORPHANED` (idempotent --- re-running is safe).
-
-**Invariant**: `status=CONFIRMED` implies S3 has the complete file.
+1. **Abort timed-out uploads**: `S3.AbortMultipartUpload` + update status.
+2. **Delete TTL-expired files**: Remove storage objects + mark DELETED.
+3. **Clean orphan files**: files with refcount=0 and status != DELETED.
 
 ---
 
-## 8. Failure Modes
+## 9. Sharing
 
-- Init timeout → client retries create.
-- Part presigned URL expired → SDK calls resume to get fresh URLs.
-- `CompleteMultipartUpload` returns 200 with error body → server parses XML body, retries or marks ABORTED.
-- DB write fails after S3 success → Reaper reconciles (PENDING → CONFIRMED or ORPHANED).
-- Multiple clients same path → server returns existing upload session if fingerprint matches, 409 Conflict if different file.
+### V1: Snapshot Share (Recommended)
+
+```bash
+dat9 share create /knowledge/ml-papers/ --to agent-007 --mode snapshot
+dat9 share accept sh_01J... --to /shared/ml-papers/
+```
+
+Snapshot mode performs point-in-time export/import across tenants:
+
+1. Source tenant freezes a manifest (paths, checksums, sizes).
+2. Small files (db9): content copied to target tenant's db9 → auto-embedded.
+3. Large files (S3): S3 object-to-object copy to target tenant's S3 prefix.
+4. Target tenant creates file_nodes + files in its own db9.
+
+Because L0/L1 are ordinary files, they're included automatically.
+
+### V2 (Future): Live Read-Only Mount
+
+Read-only only. No recipient-side caching. Source tenant owns bytes. See [design-content-locality.md](./design-content-locality.md) for details.
 
 ---
 
-## 9. Multi-Tenancy
+## 10. Multi-Tenancy
 
 ```
 Client (API Key)
   → Auth Middleware
-    → Resolve: Credential → Namespace record (DB conn + S3 config)
-    → All operations scoped to this Namespace
+    → Resolve: Credential → Tenant record (db9 connection + S3 config)
+    → All operations scoped to this tenant
 ```
 
-Each namespace has its own database (or schema) and S3 prefix. Connection pooling with LRU eviction for idle connections.
-
-For cross-tenant sharing, dat9 adds a **global share registry** in control-plane infrastructure:
-
-- Tenant DBs remain fully isolated for file metadata.
-- Global registry stores only share contracts (`share_id`, source/target tenant+cluster, mode, status, expiry).
-- Authorization checks for shared paths call the global registry first, then resolve source tenant data-plane access.
-- Revocation is centralized and immediate at policy level.
+Each tenant has its own db9 database and S3 prefix. Connection pooling with LRU eviction.
 
 ---
 
-## 10. Security Model
+## 11. Security Model
 
-### 10.1 Path Canonicalization
-
-All incoming paths are normalized **before** authorization and routing. This prevents path traversal, mount boundary bypass, and encoding-based attacks.
-
-**Canonical Path Spec**:
+### 11.1 Path Canonicalization
 
 ```
 Raw input (URL-decoded once)
@@ -929,106 +855,37 @@ Raw input (URL-decoded once)
   → Collapse consecutive slashes: "///" → "/"
   → Strip trailing slash (except root "/")
   → Unicode NFC normalization
-  → Result: canonical path (used for all subsequent authorization + routing)
+  → Result: canonical path
 ```
 
-**Invariant**: Authorization checks, MountableFS routing, and metadata writes all use the canonical path. Raw paths are never stored or matched against.
-
-**Implementation note**: AGFS's `pathutil.NormalizePath()` provides `path.Clean` + leading-slash enforcement. dat9 wraps this with additional reject rules (NUL, control chars, `..` segments) as a pre-filter before the path reaches MountableFS.
-
-### 10.2 Presigned URL Security
-
-Presigned URLs are bearer tokens. Leakage (via logs, Referer headers, browser history) grants unauthorized S3 access. dat9 enforces:
+### 11.2 Presigned URL Security
 
 | Control | Spec |
 |---------|------|
 | **TTL** | Upload: max 120 seconds. Download: max 60 seconds. |
-| **Binding** | Upload URLs bind: part number, `Content-Length`, `x-amz-checksum-sha256`. Download URLs bind: S3 key only. |
-| **Single-use (uploads)** | Each presigned URL is tracked in the upload session. Re-issuing URLs for the same part invalidates the previous URL's ETag expectation at `CompleteMultipartUpload` time. |
-| **Log hygiene** | API gateway and application logs redact `X-Amz-Signature` and `X-Amz-Credential` query parameters. Response headers include `Cache-Control: private, no-store`. |
-| **Download indirection** | `GET /v1/fs/{path}` for large files returns a **one-time ticket** (`302` to `/v1/download/{ticket}`), which exchanges for a short-lived presigned URL. The ticket expires in 30 seconds and is single-use. This keeps presigned URLs out of redirect chains and Referer headers. |
+| **Binding** | Upload URLs bind: part number, `Content-Length`, `x-amz-checksum-sha256`. |
+| **Log hygiene** | Redact `X-Amz-Signature` and `X-Amz-Credential` in logs. |
+| **Download indirection** | `GET /v1/fs/{path}` for large files → one-time ticket → presigned URL. |
 
-### 10.3 Cross-Tenant Share Authorization
-
-Every read through a shared mount performs a **three-layer authorization check**:
-
-```
-Shared path read request
-  │
-  ├─▶ 1. Global registry check
-  │     share.status = ACTIVE AND NOT expired
-  │     → fail: 403 "share revoked or expired"
-  │
-  ├─▶ 2. Tenant binding check
-  │     requester.tenant_id == share.target_tenant
-  │     → fail: 403 "not authorized for this share"
-  │
-  └─▶ 3. Path prefix check
-        requested_path starts with share.target_mount_path
-        → fail: 403 "path outside share scope"
-```
-
-**Capability token** (V2 live mounts): Each shared-path read uses a short-lived token:
-
-```
-{
-  "share_id": "sh_01J...",
-  "target_tenant": "tenant-007",
-  "target_path_prefix": "/shared/ml-papers/",
-  "exp": 1711411200,          // 5-minute expiry
-  "nonce": "a1b2c3d4"
-}
-// HMAC-SHA256 signed by control-plane key
-```
-
-**Revocation semantics**: Policy revocation in the global registry is immediate. The next read fails. Already-issued presigned URLs are bounded by their short TTL (max 60 seconds) and cannot be renewed after revocation.
-
-### 10.4 Mount Management Permissions
-
-The mount management API (`/v1/mounts`) is **control-plane admin only**. Tenant APIs do not expose mount operations.
-
-| Rule | Rationale |
-|------|-----------|
-| Tenant API cannot call `POST /v1/mounts` or `DELETE /v1/mounts/{path}` | Prevents path-overlap attacks and arbitrary backend injection |
-| Backend type allowlist: only built-in plugins (`s3meta`, `memfs`, `kvfs`) | No dynamic plugin loading from untrusted sources |
-| All mount changes are audit-logged: operator, before/after mount tree, timestamp | Forensic traceability |
-
-### 10.5 Rate Limiting and Abuse Prevention
+### 11.3 Rate Limiting
 
 | Control | Scope | Default |
 |---------|-------|---------|
-| Request rate | Per namespace | 100 req/s (configurable) |
-| Upload bandwidth | Per namespace | 1 GB/hour (configurable) |
-| Concurrent uploads | Per namespace per path | 1 active session (enforced by DB unique constraint) |
-| Max file size | Per namespace | 100 GB (configurable, enforced at `PUT` via `Content-Length` pre-check) |
-| Upload session TTL | Per upload | 24 hours (Reaper aborts expired sessions) |
+| Request rate | Per tenant | 100 req/s |
+| Upload bandwidth | Per tenant | 1 GB/hour |
+| Concurrent uploads | Per tenant per path | 1 active session |
+| Max file size | Per tenant | 100 GB |
 
 ---
 
-## 11. Cost Controls
+## 12. Cost Controls
 
 | Strategy | Implementation |
 |---|---|
 | TTL expiration | `expires_at` column + Reaper |
-| Storage tiering | S3 Intelligent-Tiering (automatic hot/cold) |
-| Cold data archive | Lifecycle rule: 7d → Glacier Instant Retrieval |
-| Incomplete upload cleanup | Reaper `AbortMultipartUpload` + S3 Lifecycle `AbortIncompleteMultipartUpload` |
-
----
-
-## 12. Client Access Methods
-
-| Method | Large File Data Path | User Experience |
-|---|---|---|
-| **CLI** | Client → S3 direct | `dat9 cp ./big.bin /data/` (one command, progress bar, auto-resume) |
-| **CLI Shell** | Client → S3 direct | `dat9 sh` (interactive prompt for `cp/cat/ls`) |
-| **Go SDK** | SDK process → S3 direct | `client.Write("/data/big.bin", reader)` (one method) |
-| **Python SDK** | SDK process → S3 direct | `client.write("/data/big.bin", data)` (one method) |
-| **MCP Tools** | MCP server → S3 direct | `dat9_write("/data/big.bin", content)` (one tool call) |
-| **FUSE** | FUSE daemon → S3 direct | `cp big.bin /mnt/dat9/data/` (standard POSIX) |
-| **curl** | Manual (small files only) | `curl -X PUT .../v1/fs/path -d @file` |
-
-All methods keep large file data off the server.
+| Storage tiering | Small files in db9 (compute cost), large files in S3 (storage cost) |
+| Cold data archive | S3 Lifecycle: 7d → Glacier Instant Retrieval |
+| Incomplete upload cleanup | Reaper + S3 Lifecycle `AbortIncompleteMultipartUpload` |
 
 ---
 
@@ -1036,18 +893,17 @@ All methods keep large file data off the server.
 
 | Phase | Scope | Effort |
 |---|---|---|
-| **P0** | Server: AGFS MountableFS + S3MetaBackend (content-addressed `blobs/<ulid>`) + `files` table (merged path+metadata) + small-file CRUD + auth + namespace | M |
-| **P1** | Large-file upload: 202 flow + presigned URLs + `uploads` table + resume + Go SDK Transfer Engine | L |
-| **P2** | CLI: `dat9 cp/cat/ls/stat/mv/rm` + progress bar + auto-resume | M |
-| **P3** | Reaper + S3 Lifecycle + TTL cleanup | S |
-| **P4** | `file_tags` table + tag CRUD API + Query API (`POST /v1/query`) + server-side copy | M |
+| **P0** | Server: AGFS MountableFS + Dat9Backend + db9 integration (files + file_nodes tables) + small-file CRUD + auth + tenant | M |
+| **P1** | Large-file upload: 202 flow + presigned URLs + uploads table + resume + Go SDK Transfer Engine | L |
+| **P2** | CLI: `dat9 cp/cat/ls/stat/mv/rm/search` + progress bar + auto-resume | M |
+| **P3** | Reaper + S3 Lifecycle + TTL cleanup + reference-counted delete | S |
+| **P4** | file_tags table + tag CRUD + Query API + zero-copy cp | M |
 | **P5** | MCP Server | S |
 | **P6** | Python SDK | M |
 | **P7** | Server-side grep/digest (small files) + mount management API | M |
-| **P8** | Semantic processing pipeline: `context_layers` table + async L0/L1 generation (LLM-powered, bottom-up aggregation, `.relations.json` auto-generation, semantic queue) | L |
-| **P9** | Vector index integration: embedding, upsert, `/v1/search` + `/v1/find` endpoints, hierarchical retrieval, tags dual-write to vector DB | L |
-| **P10** | Smart Parser & TreeBuilder: content-aware file parsing (PDF→Markdown splitting, heading-based chunking), automatic categorization and path assignment (inspired by OpenViking's ingestion pipeline) | L |
-| **P11** | FUSE mount (HTTP-backed + cache layers, reuse agfs-fuse patterns) | L |
+| **P8** | Semantic processing pipeline: async L0/L1 generation from L2 (LLM-powered, bottom-up aggregation, .relations.json) | L |
+| **P9** | Smart Parser & TreeBuilder: content-aware parsing (PDF→Markdown splitting), automatic categorization (OpenViking-inspired) | L |
+| **P10** | FUSE mount (HTTP-backed + cache layers, reuse agfs-fuse patterns) | L |
 
 ---
 
@@ -1055,17 +911,14 @@ All methods keep large file data off the server.
 
 | Question | Options | Leaning |
 |---|---|---|
-| Small/large file threshold | 8 MB / 10 MB / 64 MB | 10 MB |
-| Part size | Fixed 64 MB / dynamic | Dynamic (8-256 MB based on file size) |
-| DB backend | TiDB / PostgreSQL / SQLite | Start with SQLite, graduate to TiDB |
+| Small/large file threshold | 512KB / 1MB / 10MB | 1MB |
+| db9 embedding model | text-embedding-v4 / amazon.titan-embed-text-v2:0 | titan (matches user config) |
+| db9 FTS tokenizer | simple / jieba / chinese_ngram | jieba (Chinese support) |
 | Object store | AWS S3 / MinIO / R2 | S3 for cloud, MinIO for on-prem |
-| Multiple clients uploading same path | Reuse existing session / 409 Conflict / LWW | Reuse existing session |
-| Upload conflict policy | Reuse session if same file fingerprint / 409 if different | Reuse session if same file fingerprint, 409 if different |
-| File versioning | None / simple version chain | None for P0, reserve `previous_file_id` in schema |
-| Change notifications | None / polling / WebSocket / webhook | Polling (`GET /v1/fs/?changes_since=<cursor>`) for P0 |
-| Vector DB backend | Local (SQLite+HNSW) / Qdrant / VikingDB / pgvector | Start local, graduate to managed |
-| Embedding model | OpenAI / local (e5-small) / configurable | Configurable, default to local for cost |
-| Semantic queue implementation | DB table polling / Redis / SQS | DB table for P0 simplicity |
+| Upload conflict policy | Reuse session if same fingerprint / 409 if different | Reuse if same fingerprint, 409 if different |
+| File versioning | None / simple version chain | None for P0 |
+| Change notifications | None / polling / WebSocket | Polling for P0 |
+| content_text for binary files | NULL / auto-extract text | NULL (only text files get content_text) |
 
 ---
 
@@ -1074,8 +927,8 @@ All methods keep large file data off the server.
 ### Server-side grep/digest (small files only)
 
 ```
-POST   /v1/fs/{path}?grep     Server-side search (small files only)
-POST   /v1/fs/{path}?digest   Server-side hash (small files only)
+POST   /v1/fs/{path}?grep     Server-side search (small files in db9)
+POST   /v1/fs/{path}?digest   Server-side hash (small files in db9)
 ```
 
 ### Mount Management
@@ -1086,47 +939,29 @@ POST   /v1/mounts              Mount a new backend (runtime)
 DELETE /v1/mounts/{path}       Unmount
 ```
 
-P0 ships with two mounts: `/ -> S3MetaBackend` and `/mem -> memfs`. Future phases add `kvfs`, etc.
+P0 ships with two mounts: `/ -> Dat9Backend` and `/mem -> memfs`.
 
-### Smart Parser & TreeBuilder (P10, OpenViking-inspired)
-
-In P0-P9, users specify file paths directly (`dat9 cp ./file.pdf /data/papers/file.pdf`). Starting P10, dat9 adds an optional **ingestion pipeline** inspired by OpenViking's Parser/TreeBuilder architecture:
+### Smart Parser & TreeBuilder (P9, OpenViking-inspired)
 
 ```
-User uploads file (path unspecified or /inbox/)
+User uploads file.pdf to /inbox/
   │
-  ├─▶ Parser
-  │     - Content-type dispatch: PDF, Markdown, HTML, ...
-  │     - Split strategies: heading-based, token-budget, semantic
-  │     - Example: 50-page PDF → 12 Markdown sections (threshold: 1024 tokens each)
-  │     - Original file preserved as-is (dat9 != OpenViking: we keep originals)
-  │
-  ├─▶ TreeBuilder
-  │     - Determine target path from content analysis + user-defined rules
-  │     - Collision detection: append suffix if path exists
-  │     - Example: /inbox/paper.pdf → /papers/2026/transformer-survey/paper.pdf
-  │     - Parsed sections → /papers/2026/transformer-survey/sections/*.md
-  │
-  ├─▶ Atomic move
-  │     - UPDATE files SET path = <final_path>  (zero S3 cost, content-addressed keys)
-  │     - Generate L0/L1 for new directory
-  │     - Update .relations.json with source → parsed links
-  │
-  └─▶ 200 OK { original: "/papers/.../paper.pdf", sections: [...] }
+  ├─▶ Parser: PDF → 12 Markdown sections (heading-based, 1024 tokens each)
+  ├─▶ TreeBuilder: determine target path → /papers/2026/transformer-survey/
+  ├─▶ mv /inbox/paper.pdf → /papers/2026/transformer-survey/paper.pdf
+  │     (zero-cost: only UPDATE file_nodes, no storage copy)
+  ├─▶ Write parsed sections as small files (→ db9, auto-embedded)
+  └─▶ Generate .relations.json linking original → sections
 ```
 
-**Key difference from OpenViking**: dat9 **always preserves the original file**. OpenViking discards originals after parsing (PDF → Markdown, original gone). dat9 keeps both the original and parsed sections, linked via `.relations.json`. This is critical for agent workflows where the original format matters (e.g., sending a PDF attachment).
-
-The content-addressed S3 key strategy (`blobs/<ulid>`) makes the atomic move step zero-cost — only the `files.path` column changes, no S3 copies needed.
+**Key difference from OpenViking**: dat9 **always preserves the original file**. Both original and parsed sections coexist, linked via `.relations.json`.
 
 ---
 
 ## References
 
+- **db9**: https://db9.ai/ --- Serverless database with built-in embedding, FTS, vector search, and fs9 file storage. Tenant database backend.
 - **OpenViking**: https://github.com/volcengine/OpenViking --- Context database for AI agents. Tiered storage (L0/L1/L2) design reference.
 - **AGFS**: https://github.com/c4pt0r/agfs --- Plan 9-inspired agent filesystem. We import its core interfaces.
 - **Git LFS Batch API**: https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md --- Control-plane upload pattern reference.
-- **GCS Resumable Uploads**: https://docs.google.com/storage/docs/resumable-uploads --- Resume semantics reference.
 - **S3 Multipart Upload**: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
-- **rclone**: https://rclone.org/ --- CLI UX benchmark (progress bar, auto-retry, multipart).
-- **db9 fs**: https://db9.ai/ --- Agent file-sharing tool. CLI UX reference (`<db>:/path` syntax).
