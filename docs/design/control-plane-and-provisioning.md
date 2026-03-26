@@ -106,35 +106,9 @@ Recommended provisioning phases:
 
 ### 5.3 Control-plane metadata model
 
-The new RFC set intentionally avoids freezing one exact DDL, but the old document was right that reviewers need a concrete metadata shape.
+The canonical `tenants` table, core columns, and baseline indexes are defined in `docs/design/canonical-schema.md`.
 
-Representative tenant metadata fields:
-
-- `tenant_id`
-- `api_key_prefix`
-- `api_key_hash`
-- `cell_id` or equivalent routing target
-- tenant-local `db9` service reference
-- tenant `S3` bucket/prefix or equivalent namespace reference
-- `status`
-- `created_at`
-- `last_active_at`
-- optional policy or quota references
-
-Representative logical table:
-
-```text
-tenants
-  tenant_id         primary identity
-  api_key_prefix    lookup accelerator only
-  api_key_hash      full credential verifier
-  cell_id           routing target
-  db9_ref           tenant-local state endpoint
-  s3_bucket/prefix  tenant object namespace
-  status            PROVISIONING | ACTIVE | SUSPENDED | DELETED
-  created_at        audit timestamp
-  last_active_at    routing / abuse / ops signal
-```
+This RFC focuses on the behavioral meaning of that metadata rather than repeating the full schema.
 
 Practical rules:
 
@@ -285,5 +259,6 @@ Recommended current-phase default leaning:
 ## 9. References / Dependencies
 
 - `docs/design/system-architecture.md`
+- `docs/design/canonical-schema.md`
 - `docs/overview.md`
 - `docs/design/api-and-ux-contract.md`

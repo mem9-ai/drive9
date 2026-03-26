@@ -113,23 +113,10 @@ This mapping is the reason zero-copy file `cp`, metadata-only file `mv`, and ref
 
 ### 5.3 Representative namespace data model
 
-The new design docs should stay schema-flexible, but the old document was right that the namespace model needs a concrete implementation picture.
+The canonical namespace tables, key columns, and indexes are defined in `docs/design/canonical-schema.md`.
 
-Representative logical records:
-
-- `file_nodes`
-  - path tree / dentry layer
-  - key fields: `path`, `parent_path`, `name`, `is_directory`, `file_id`
-- `files`
-  - inode-like file entity
-  - key fields: `file_id`, `storage_type`, `storage_ref`, `size_bytes`, `content_type`, `revision`, `status`
-
-Important structural rules:
-
-- `file_nodes.path` is unique per tenant namespace
-- directories may have `file_id = NULL`
-- multiple `file_nodes` may reference the same `files.file_id`
-- `files.storage_ref` points to stable storage identity, not to the user-visible path
+This RFC intentionally does not restate the exact DDL.
+Its job here is to explain what namespace operations mean semantically.
 
 Representative query and mutation consequences:
 
@@ -232,6 +219,7 @@ Current candidate defaults worth deciding explicitly:
 ## 9. References / Dependencies
 
 - `docs/overview.md`
+- `docs/design/canonical-schema.md`
 - `docs/design/system-architecture.md`
 - `docs/design/write-path-and-reconcile.md`
 - `docs/design/api-and-ux-contract.md`

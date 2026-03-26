@@ -300,6 +300,7 @@ Detailed rules are defined in:
 ## 8. References / Dependencies
 
 - `docs/overview.md`
+- `docs/design/canonical-schema.md`
 - `docs/design/control-plane-and-provisioning.md`
 - `docs/design/storage-and-namespace.md`
 - `docs/design/semantic-derivation-and-retrieval.md`

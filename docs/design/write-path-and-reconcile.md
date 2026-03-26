@@ -507,6 +507,7 @@ For the current phase, dat9 should at least support:
 
 ## 9. References / Dependencies
 
+- `docs/design/canonical-schema.md`
 - `docs/design/storage-and-namespace.md`
 - `docs/design/resource-versioning-and-async-correctness.md`
 - `docs/design/durable-queue-runtime.md`

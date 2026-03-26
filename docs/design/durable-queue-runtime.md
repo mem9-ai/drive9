@@ -117,16 +117,7 @@ Each task must carry enough information for correct async execution, including a
 - `resource_version`
 - attempt/lease metadata
 
-Representative runtime fields:
-
-- `attempt_count`
-- `max_attempts`
-- `leased_by`
-- `lease_until`
-- `last_heartbeat_at`
-- `last_error`
-- `created_at`
-- `updated_at`
+The canonical `tasks` table, state fields, and baseline indexes are defined in `docs/design/canonical-schema.md`.
 
 Tasks may also carry business input such as:
 
@@ -259,6 +250,7 @@ Useful correlation keys include:
 ## 9. References / Dependencies
 
 - `docs/design/queuefs-durable-task-queue-rfc.md`
+- `docs/design/canonical-schema.md`
 - `docs/design/system-architecture.md`
 - `docs/design/resource-versioning-and-async-correctness.md`
 - `docs/design/write-path-and-reconcile.md`

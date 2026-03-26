@@ -146,6 +146,9 @@ This is the reason large files do not need to be directly embedded in their full
 
 The old design contained a useful implementation-grade split between semantic material, vector material, and processing state. The new docs should preserve that distinction.
 
+Exact physical tables for this split are intentionally deferred.
+`docs/design/canonical-schema.md` defines that deferred boundary explicitly; this RFC focuses on the logical model that future physical schemas must preserve.
+
 Representative logical records:
 
 - semantic material
@@ -249,6 +252,7 @@ Current design assumptions:
 
 ## 8. References / Dependencies
 
+- `docs/design/canonical-schema.md`
 - `docs/design/resource-versioning-and-async-correctness.md`
 - `docs/design/durable-queue-runtime.md`
 - `docs/design/write-path-and-reconcile.md`

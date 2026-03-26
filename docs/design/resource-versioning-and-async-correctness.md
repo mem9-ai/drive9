@@ -76,6 +76,9 @@ Every task that produces derived state must bind at least:
 
 For the current implementation phase, this may be approximated by a file-level revision token if a separate `resource_version` record is not yet materialized.
 
+Where the current implementation uses concrete tables and fields such as `files.revision`, the canonical schema reference is `docs/design/canonical-schema.md`.
+This RFC focuses on correctness semantics rather than re-listing the exact physical schema.
+
 ### 5.2 Version-aware writeback
 
 When async work writes results back, the system must enforce one of two outcomes:
@@ -210,6 +213,7 @@ These questions may be resolved in follow-up RFCs without changing the core dire
 
 ## 9. References / Dependencies
 
+- `docs/design/canonical-schema.md`
 - `docs/design/system-architecture.md`
 - `docs/design/durable-queue-runtime.md`
 - `docs/design/semantic-derivation-and-retrieval.md`

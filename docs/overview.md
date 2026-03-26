@@ -141,6 +141,7 @@ This overview is intentionally short. Detailed design belongs in focused RFCs.
 Recommended core RFCs:
 
 - `docs/design/system-architecture.md`
+- `docs/design/canonical-schema.md`
 - `docs/design/storage-and-namespace.md`
 - `docs/design/resource-versioning-and-async-correctness.md`
 - `docs/design/durable-queue-runtime.md`
