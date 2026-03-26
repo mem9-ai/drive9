@@ -187,6 +187,52 @@ func TestOverwritePreservesZeroCopyLinks(t *testing.T) {
 	}
 }
 
+func TestCrossTierOverwriteClearsContentText(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	// Create a small db9 file with text content
+	b.Write("/cross.txt", []byte("hello world"), 0, 0x3) // Create|Truncate
+
+	// Verify content_text is set
+	nf, _ := b.Store().Stat("/cross.txt")
+	if nf.File.ContentText == "" {
+		t.Skip("store does not populate ContentText for small files")
+	}
+
+	// Large file overwrite (db9 → S3)
+	totalSize := int64(1 << 20)
+	plan, err := b.InitiateUpload(ctx, "/cross.txt", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upload, _ := b.GetUpload(plan.UploadID)
+	data := make([]byte, totalSize)
+	for _, p := range plan.Parts {
+		start := int64(p.Number-1) * s3client.PartSize
+		end := start + p.Size
+		if end > totalSize {
+			end = totalSize
+		}
+		b.S3().(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, p.Number, bytes.NewReader(data[start:end]))
+	}
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify content_text is cleared
+	nf, err = b.Store().Stat("/cross.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nf.File.ContentText != "" {
+		t.Errorf("expected content_text to be cleared after cross-tier overwrite, got %q", nf.File.ContentText)
+	}
+	if nf.File.StorageType != "s3" {
+		t.Errorf("expected storage_type s3, got %s", nf.File.StorageType)
+	}
+}
+
 func TestInitiateAndConfirmUpload(t *testing.T) {
 	b := newTestBackendWithS3(t)
 	ctx := context.Background()
