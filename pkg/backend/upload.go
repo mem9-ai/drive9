@@ -161,9 +161,11 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			tx.QueryRow(`SELECT storage_ref FROM files WHERE file_id = ?`, existingFileID.String).Scan(&oldRef)
 			oldStorageRef = oldRef
 
-			// Update the existing files row with new S3 data
+			// Update the existing files row with new S3 data.
+			// Clear content_text — S3 files must not carry stale db9 text.
 			_, err := tx.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
-				size_bytes = ?, revision = revision + 1, status = 'CONFIRMED',
+				size_bytes = ?, content_text = NULL, revision = revision + 1,
+				status = 'CONFIRMED',
 				confirmed_at = strftime('%Y-%m-%dT%H:%M:%f','now')
 				WHERE file_id = ?`,
 				meta.StorageS3, upload.S3Key, upload.TotalSize, existingFileID.String)
