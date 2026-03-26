@@ -38,6 +38,12 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 		return nil, fmt.Errorf("S3 not configured")
 	}
 
+	// Enforce one active upload per path
+	existing, err := b.store.GetUploadByPath(path)
+	if err == nil && existing != nil {
+		return nil, fmt.Errorf("active upload already exists for path %s (upload_id=%s)", path, existing.UploadID)
+	}
+
 	fileID := b.genID()
 	s3Key := "blobs/" + fileID
 
@@ -121,13 +127,27 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		return fmt.Errorf("list parts: %w", err)
 	}
 
+	// Verify all parts are present
+	if len(parts) != upload.PartsTotal {
+		return fmt.Errorf("incomplete upload: got %d parts, expected %d", len(parts), upload.PartsTotal)
+	}
+
 	// Complete S3 multipart upload (idempotent, outside transaction)
 	if err := b.s3.CompleteMultipartUpload(ctx, upload.S3Key, upload.S3UploadID, parts); err != nil {
 		return fmt.Errorf("complete multipart: %w", err)
 	}
 
-	// Atomically: confirm file, complete upload, ensure parents, create node
+	// Atomically: check path conflict, confirm file, complete upload, ensure parents, create node
 	return b.store.InTx(func(tx *sql.Tx) error {
+		// Check if target path already exists
+		var count int64
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE path = ?`, upload.TargetPath).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return meta.ErrPathConflict
+		}
+
 		if err := b.store.ConfirmFileTx(tx, upload.FileID); err != nil {
 			return err
 		}

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -192,14 +191,12 @@ func TestListUploadsEndpoint(t *testing.T) {
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 
-	// Create two uploads for the same path
-	for i := 0; i < 2; i++ {
-		body := make([]byte, 1<<20)
-		req, _ := http.NewRequest(http.MethodPut, ts.URL+fmt.Sprintf("/v1/fs/list-test.bin"), bytes.NewReader(body))
-		req.ContentLength = int64(len(body))
-		resp, _ := http.DefaultClient.Do(req)
-		resp.Body.Close()
-	}
+	// Create one upload
+	body := make([]byte, 1<<20)
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/list-test.bin", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	resp, _ := http.DefaultClient.Do(req)
+	resp.Body.Close()
 
 	// GET /v1/uploads?path=/list-test.bin&status=UPLOADING
 	resp, err := http.Get(ts.URL + "/v1/uploads?path=/list-test.bin&status=UPLOADING")
@@ -219,8 +216,33 @@ func TestListUploadsEndpoint(t *testing.T) {
 		} `json:"uploads"`
 	}
 	json.NewDecoder(resp.Body).Decode(&result)
-	if len(result.Uploads) != 2 {
-		t.Errorf("expected 2 uploads, got %d", len(result.Uploads))
+	if len(result.Uploads) != 1 {
+		t.Errorf("expected 1 upload, got %d", len(result.Uploads))
+	}
+}
+
+func TestOneUploadPerPath(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// First upload should succeed with 202
+	body := make([]byte, 1<<20)
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/dup-test.bin", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	resp, _ := http.DefaultClient.Do(req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("first upload: expected 202, got %d", resp.StatusCode)
+	}
+
+	// Second upload for same path should fail
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/dup-test.bin", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	resp, _ = http.DefaultClient.Do(req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("second upload: expected 500 (conflict), got %d", resp.StatusCode)
 	}
 }
 
