@@ -347,10 +347,28 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 	parts := plan.Parts
 
 	for _, part := range parts {
+		// Acquire semaphore before reading so we hold at most maxConcurrency buffers
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		}
+
+		// Check for prior upload errors before reading more data
+		select {
+		case err := <-errCh:
+			wg.Wait()
+			return err
+		default:
+		}
+
 		data := make([]byte, part.Size)
 		offset := int64(part.Number-1) * stdPartSize
 		n, err := r.ReadAt(data, offset)
 		if err != nil && err != io.EOF {
+			<-sem
+			wg.Wait()
 			return fmt.Errorf("read part %d at offset %d: %w", part.Number, offset, err)
 		}
 		data = data[:n]
@@ -358,17 +376,7 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 		wg.Add(1)
 		go func(p PartURL, d []byte) {
 			defer wg.Done()
-
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				select {
-				case errCh <- ctx.Err():
-				default:
-				}
-				return
-			}
+			defer func() { <-sem }()
 
 			_, err := c.uploadOnePart(ctx, p.URL, d)
 			if err != nil {
