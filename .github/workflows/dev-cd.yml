@@ -12,6 +12,12 @@ on:
       - 'Makefile'
       - '.github/workflows/dev-cd.yml'
   workflow_dispatch:
+    inputs:
+      deploy_ref:
+        description: "Branch, tag, or SHA to deploy"
+        required: true
+        default: "main"
+        type: string
 
 env:
   AWS_REGION: ap-southeast-1
@@ -32,6 +38,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.deploy_ref || github.ref }}
 
       - name: Checkout agfs dependency
         run: |
@@ -54,7 +62,7 @@ jobs:
 
       - name: Build and push image
         run: |
-          REF_NAME=${{ github.ref_name }}
+          REF_NAME=${{ github.event.inputs.deploy_ref || github.ref_name }}
           REF_NAME=${REF_NAME/\//-}
           TAG="${REF_NAME}-${GITHUB_SHA::7}"
           make docker-build IMAGE_REPO=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} IMAGE_TAG=$TAG
