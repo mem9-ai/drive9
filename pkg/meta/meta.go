@@ -212,7 +212,32 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("exec %q: %w", snippet, err)
 		}
 	}
+
+	// Upgrade existing uploads table: add generated column if missing.
+	if !s.columnExists("uploads", "active_target_path") {
+		upgrades := []string{
+			`ALTER TABLE uploads ADD COLUMN active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED`,
+			`CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path)`,
+		}
+		for _, stmt := range upgrades {
+			if _, err := s.db.Exec(stmt); err != nil {
+				if isDuplicateIndexError(err) {
+					continue
+				}
+				return fmt.Errorf("upgrade uploads: %w", err)
+			}
+		}
+	}
+
 	return nil
+}
+
+func (s *Store) columnExists(table, column string) bool {
+	var count int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = ? AND column_name = ?`,
+		table, column).Scan(&count)
+	return err == nil && count > 0
 }
 
 // --- file_nodes operations ---
