@@ -42,7 +42,26 @@ Minimum expected capabilities for the current implementation phase:
 
 This is enough to support the first dat9 async flows without pretending that dequeue means permanent success.
 
-### 4.2 Later extensions
+### 4.2 Recommended P0 implementation path
+
+For the first implementation stage, dat9 should prefer a simple tenant-local `db9` tasks table or equivalent direct runtime table model.
+
+This P0 path should provide at least:
+
+- durable task state
+- lease-aware dequeue behavior
+- `ack` / retry / recover behavior
+- version-aware task payloads and writeback guards
+
+This is the recommended P0 direction because it solves the current async requirements directly, while keeping the rollout smaller than a full queuefs-shaped runtime surface for internal workers on day one.
+
+The longer-term target remains:
+
+- a queuefs-compatible durable runtime contract
+- compatibility with the AGFS/queuefs interface shape
+- the ability to evolve toward richer queue-runtime behavior without changing the core task semantics
+
+### 4.3 Later extensions
 
 The following features remain part of the target runtime model, but may be added incrementally:
 
@@ -64,6 +83,8 @@ dat9 uses durable `queuefs` as:
 ### 5.2 Backend assumption
 
 durable `queuefs` should keep the AGFS/queuefs interface shape but use a tenant-local `db9` backend for durable task state.
+
+In practice, the current implementation may realize this through a direct `db9` tasks table or equivalent runtime interface, as long as the resulting semantics remain compatible with the durable queue contract defined in this RFC.
 
 AGFS/queuefs should be treated as:
 
