@@ -14,9 +14,10 @@ import (
 
 // Client is the dat9 HTTP client.
 type Client struct {
-	baseURL    string
-	apiKey     string
-	httpClient *http.Client
+	baseURL            string
+	apiKey             string
+	httpClient         *http.Client
+	smallFileThreshold int64 // 0 means use DefaultSmallFileThreshold
 }
 
 // New creates a new dat9 client.

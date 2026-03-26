@@ -137,6 +137,10 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	if cl := r.ContentLength; cl > 0 && s.backend.IsLargeFile(cl) {
 		plan, err := s.backend.InitiateUpload(r.Context(), path, cl)
 		if err != nil {
+			if errors.Is(err, meta.ErrPathConflict) {
+				errJSON(w, http.StatusConflict, err.Error())
+				return
+			}
 			errJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -284,28 +288,20 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type uploadEntry struct {
-		UploadID  string `json:"upload_id"`
-		Path      string `json:"path"`
-		TotalSize int64  `json:"total_size"`
-		Status    string `json:"status"`
-		CreatedAt string `json:"created_at"`
-		ExpiresAt string `json:"expires_at"`
+	if len(uploads) == 0 {
+		errJSON(w, http.StatusNotFound, meta.ErrNotFound.Error())
+		return
 	}
-	result := make([]uploadEntry, 0, len(uploads))
-	for _, u := range uploads {
-		result = append(result, uploadEntry{
-			UploadID:  u.UploadID,
-			Path:      u.TargetPath,
-			TotalSize: u.TotalSize,
-			Status:    string(u.Status),
-			CreatedAt: u.CreatedAt.Format("2006-01-02T15:04:05.000Z07:00"),
-			ExpiresAt: u.ExpiresAt.Format("2006-01-02T15:04:05.000Z07:00"),
-		})
-	}
-
+	u := uploads[0]
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"uploads": result})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"upload_id":   u.UploadID,
+		"key":         u.S3Key,
+		"parts_total": u.PartsTotal,
+		"status":      string(u.Status),
+		"created_at":  u.CreatedAt.Format("2006-01-02T15:04:05.000Z07:00"),
+		"expires_at":  u.ExpiresAt.Format("2006-01-02T15:04:05.000Z07:00"),
+	})
 }
 
 // handleUploadAction handles /v1/uploads/{id}/complete, /v1/uploads/{id}/resume, DELETE /v1/uploads/{id}

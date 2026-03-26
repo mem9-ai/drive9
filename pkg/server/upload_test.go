@@ -186,6 +186,78 @@ func TestUploadResumeEndpoint(t *testing.T) {
 	}
 }
 
+func TestLargeUploadOverwritesExistingSmallFile(t *testing.T) {
+	s, s3c := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Seed an existing small file at the target path.
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/overwrite.bin", bytes.NewReader([]byte("small")))
+	req.ContentLength = 5
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("small seed: expected 200, got %d", resp.StatusCode)
+	}
+
+	// Initiate a large upload to the same path.
+	totalSize := int64(2 << 20)
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/overwrite.bin", bytes.NewReader(make([]byte, totalSize)))
+	req.ContentLength = totalSize
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan backend.UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatalf("decode plan: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("initiate overwrite: expected 202, got %d", resp.StatusCode)
+	}
+
+	upload, err := s.backend.GetUpload(plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Upload all parts through the local S3 stand-in.
+	for _, p := range plan.Parts {
+		start := int64(p.Number-1) * s3client.PartSize
+		end := start + p.Size
+		if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, p.Number,
+			bytes.NewReader(make([]byte, end-start))); err != nil {
+			t.Fatalf("upload part %d: %v", p.Number, err)
+		}
+	}
+
+	// Complete should now overwrite the existing small-file node.
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/"+plan.UploadID+"/complete", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("complete overwrite: expected 200, got %d", resp.StatusCode)
+	}
+
+	nf, err := s.backend.Store().Stat("/overwrite.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nf.File == nil || nf.File.StorageType != meta.StorageS3 {
+		t.Fatalf("expected overwrite.bin to point at S3-backed file, got %+v", nf.File)
+	}
+	if nf.File.SizeBytes != totalSize {
+		t.Fatalf("expected size %d, got %d", totalSize, nf.File.SizeBytes)
+	}
+}
+
 func TestListUploadsEndpoint(t *testing.T) {
 	s, _ := newTestServerWithS3(t)
 	ts := httptest.NewServer(s)
@@ -210,14 +282,12 @@ func TestListUploadsEndpoint(t *testing.T) {
 	}
 
 	var result struct {
-		Uploads []struct {
-			UploadID string `json:"upload_id"`
-			Status   string `json:"status"`
-		} `json:"uploads"`
+		UploadID string `json:"upload_id"`
+		Status   string `json:"status"`
 	}
 	json.NewDecoder(resp.Body).Decode(&result)
-	if len(result.Uploads) != 1 {
-		t.Errorf("expected 1 upload, got %d", len(result.Uploads))
+	if result.UploadID == "" {
+		t.Error("expected upload_id in response")
 	}
 }
 
@@ -241,8 +311,8 @@ func TestOneUploadPerPath(t *testing.T) {
 	req.ContentLength = int64(len(body))
 	resp, _ = http.DefaultClient.Do(req)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("second upload: expected 500 (conflict), got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("second upload: expected 409 (conflict), got %d", resp.StatusCode)
 	}
 }
 
