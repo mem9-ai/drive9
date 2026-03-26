@@ -154,6 +154,116 @@ The core backend roles are:
   - exposed via AGFS-style queuefs interface
   - backed by tenant-local `db9`
 
+### 4.6 Layered responsibility map
+
+The old layered design is still useful as an implementation map.
+
+| Layer | Owns | Does not own |
+| --- | --- | --- |
+| Global Access and Control Plane | auth, tenant routing, provisioning, quota, fleet policy | tenant business truth, tenant-local version state |
+| Tenant-local Resource and Retrieval Control Layer | naming, lifecycle, versioning, retrieval planning, aggregate-trigger decisions | raw object bytes, global rate limits |
+| AGFS Access Plane | `/local` and `/queue` access surface, path/queue entry normalization, integration boundary | async correctness rules, version policy |
+| Tenant-local Task and Processing Layer | dequeue, lease, renew, ack/nack, retries, worker execution | path naming, auth, global fairness |
+| Tenant-local Shared State and Index Layer | metadata, version state, semantic state, vector/index state, task state | global routing and provisioning |
+| Global Observability and Operations | fleet view, tenant health aggregation, cost attribution | tenant commit path semantics |
+
+This map matters because the new RFC set splits concerns by document, but implementation still needs one place that says which layer owns which decisions.
+
+### 4.7 Representative write and async processing relationship
+
+The critical synchronous-to-asynchronous handoff should look like this:
+
+```text
+Client
+  |
+  v
+Global Access Layer
+  |
+  +--> authenticate tenant -> route to Tenant Cell
+                                      |
+                                      v
+                         Resource Control Layer
+                                      |
+                     +----------------+----------------+
+                     |                                 |
+                     v                                 v
+            write/read through /local          commit metadata/version
+                     |                                 |
+           +---------+---------+                       |
+           |                   |                       |
+           v                   v                       v
+      small body in db9   large object in S3   enqueue durable task
+                                                      or durable
+                                                      reconcile marker
+                                                           |
+                                                           v
+                                                     Async Runtime
+                                                           |
+                                      +--------------------+--------------------+
+                                      |                                         |
+                                      v                                         v
+                           read versioned input                         renew / ack / nack
+                           from db9 or S3                               update task state
+                                      |                                         |
+                                      +--------------------+--------------------+
+                                                           |
+                                                           v
+                                          parse / summarize / overview / embed
+                                                           |
+                                                           v
+                                         version-aware writeback into db9 state
+```
+
+The architectural invariant is:
+
+- user-visible commit happens before async derivation finishes
+- the handoff from committed state to async work must be durable or recoverable
+- workers always read and write against tenant-local authoritative state
+
+### 4.8 Operational boundary and observability
+
+The old design also carried an important operational distinction: global and tenant-local observability are different layers.
+
+Global observability should aggregate at least:
+
+- tenant request volume
+- tenant backlog and dead-letter counts
+- tenant cost and throughput
+- tenant health and provisioning state
+
+Tenant-local observability should expose at least:
+
+- `/local` read/write counts and latency
+- `/queue` enqueue/dequeue/renew/ack/nack/recover counts
+- per-task-type processing latency
+- retrieval, embedding, and indexing latency
+
+Correlation keys should be preserved across logs, metrics, and audit events whenever possible:
+
+- `tenant_id`
+- `resource_id`
+- `resource_version`
+- `task_id`
+- `semantic_version`
+- `index_version`
+
+### 4.9 Deployment shape and worker placement
+
+The tenant-cell abstraction allows multiple deployment shapes without changing the semantic model.
+
+Representative shape:
+
+- multiple stateless API / gateway nodes in front of the control plane
+- durable control-plane metadata for routing and provisioning
+- tenant-scoped `db9` state, tenant-scoped object namespace, and tenant-scoped queue runtime
+- one or more worker pools, either tenant-dedicated or a shared fleet that executes with explicit tenant context
+
+No matter which worker placement model is used, the following must hold:
+
+- workers execute against the target tenant context
+- task lease renewal and recovery remain available
+- version-aware writeback rules do not depend on one specific process staying alive
+
 ## 5. Invariants / Correctness Rules
 
 - external filesystem-like simplicity must not erase internal versioned state
@@ -190,5 +300,10 @@ Detailed rules are defined in:
 ## 8. References / Dependencies
 
 - `docs/overview.md`
+- `docs/design/control-plane-and-provisioning.md`
+- `docs/design/storage-and-namespace.md`
+- `docs/design/semantic-derivation-and-retrieval.md`
 - `docs/design/queuefs-durable-task-queue-rfc.md`
+- `docs/design/durable-queue-runtime.md`
+- `docs/design/write-path-and-reconcile.md`
 - `docs/design/api-and-ux-contract.md`

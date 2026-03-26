@@ -107,7 +107,7 @@ dat9 depends on the following operations:
 
 For P0/P1, `renew` and richer `stats` may be deferred if task duration and operational risk are still low, but the long-term contract should remain compatible with them.
 
-### 5.4 Runtime contract
+### 5.4 Task input and state model
 
 Each task must carry enough information for correct async execution, including at least:
 
@@ -117,17 +117,85 @@ Each task must carry enough information for correct async execution, including a
 - `resource_version`
 - attempt/lease metadata
 
+Representative runtime fields:
+
+- `attempt_count`
+- `max_attempts`
+- `leased_by`
+- `lease_until`
+- `last_heartbeat_at`
+- `last_error`
+- `created_at`
+- `updated_at`
+
+Tasks may also carry business input such as:
+
+- explicit parser or summarizer parameters
+- aggregate snapshot identifiers
+- dedupe keys or priority hints
+
+The critical rule is that every task that can advance derived state must carry an explicit input boundary, not just "the current file when processed later".
+
+### 5.5 Runtime contract and state machine
+
 Suggested state machine:
 
 ```text
-queued -> processing -> succeeded
-   |         |   |
-   |         |   +-> dead_lettered
-   |         +----> queued (retry/recover)
-   +----------------> failed
+queued --dequeue--> processing --ack------------------> succeeded
+   ^                    |  \
+   |                    |   \
+   |                    |    +--nack(retry=false)----> failed
+   |                    |
+   |                    +--renew---------------------> processing
+   |                    |
+   |                    +--nack(retry=true)---------> queued
+   |                    |
+   +--recover(expired lease)<------------------------+
+                        |
+                        +--attempts exhausted-------> dead_lettered
 ```
 
-### 5.5 Worker expectations
+Important runtime meanings:
+
+- `dequeue` claims work temporarily; it does not imply success
+- `processing` is lease-bound, not permanent ownership
+- `recover` only re-queues tasks whose lease has truly expired
+- `dead_lettered` is terminal for automated retry
+
+### 5.6 Lease, renew, and recovery timeline
+
+Representative timing model:
+
+```text
+t0  enqueue task T
+    status = queued
+
+t1  worker W1 dequeues T
+    status = processing
+    lease_until = t1 + lease_duration
+
+t2  W1 is still healthy
+    -> renew
+    -> lease_until = t2 + lease_duration
+
+t3  W1 crashes or stops renewing
+
+t4  lease expires
+
+t5  recover sweep observes:
+    status = processing AND lease_until < now
+    -> move T back to queued
+
+t6  worker W2 dequeues T and continues
+```
+
+Recovery rules:
+
+- long-running tasks must renew or heartbeat before expiry
+- recover logic must not steal tasks that still have a valid lease
+- at-least-once redelivery is acceptable and expected after expiry
+
+### 5.7 Worker expectations
 
 Workers must:
 
@@ -138,6 +206,35 @@ Workers must:
 
 If the current phase does not yet expose a full queuefs filesystem path to internal workers, the same runtime rules should still hold through a direct worker/runtime interface.
 
+Representative success/failure discipline:
+
+```text
+worker dequeues task(version = v7)
+  -> reads authoritative current state
+  -> performs work
+  -> attempts version-aware writeback
+  -> if writeback durably succeeds: ack
+  -> if retryable failure: nack(retry=true)
+  -> if permanent failure: nack(retry=false) or mark failed
+```
+
+### 5.8 Runtime observability
+
+At minimum, the runtime should expose:
+
+- queued / processing / failed / dead-letter counts
+- dequeue / renew / ack / nack / recover rates
+- task latency by task type
+- lease-expiry recovery count
+
+Useful correlation keys include:
+
+- `tenant_id`
+- `task_id`
+- `task_type`
+- `resource_id`
+- `resource_version`
+
 ## 6. Invariants / Correctness Rules
 
 - `dequeue` must not mean permanent success
@@ -145,12 +242,14 @@ If the current phase does not yet expose a full queuefs filesystem path to inter
 - retry and dead-letter behavior must be explicit
 - task runtime state must remain tenant-local
 - queuefs file interfaces must not be mistaken for the full semantic workflow definition
+- task payloads that can advance derived state must bind explicit versioned input
 
 ## 7. Failure / Recovery
 
 - stale processing tasks must be recoverable
 - worker crashes must leave tasks recoverable through lease expiry and recover behavior
 - at-least-once delivery is acceptable; exactly-once is not required
+- long-running tasks without renew support must be kept short enough that false recovery is not likely in practice
 
 ## 8. Open Questions
 

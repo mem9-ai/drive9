@@ -78,7 +78,71 @@ Recommended additional provisioning details:
 - tenant metadata should record lifecycle state such as `PROVISIONING`, `ACTIVE`, `SUSPENDED`, and `DELETED`
 - provisioning should create the tenant-scoped object prefix before the tenant becomes routable
 
-### 5.3 Routing model
+Representative tenant lifecycle:
+
+```text
+create request
+     |
+     v
+PROVISIONING -----> ACTIVE <-----> SUSPENDED
+                      |
+                      +-----------> DELETED
+```
+
+The important routing rule is:
+
+- `PROVISIONING` is not routable for normal tenant traffic
+- `ACTIVE` is routable
+- `SUSPENDED` fails auth or policy checks explicitly
+- `DELETED` is terminal for normal access
+
+Recommended provisioning phases:
+
+1. Create the control-plane tenant record with status `PROVISIONING`.
+2. Allocate or assign the tenant-local `db9` unit and object namespace.
+3. Initialize tenant-local schema and queue/runtime prerequisites.
+4. Persist tenant-to-cell routing metadata and mark the tenant `ACTIVE`.
+5. Reveal the generated credential once, if the product uses generated API keys.
+
+### 5.3 Control-plane metadata model
+
+The new RFC set intentionally avoids freezing one exact DDL, but the old document was right that reviewers need a concrete metadata shape.
+
+Representative tenant metadata fields:
+
+- `tenant_id`
+- `api_key_prefix`
+- `api_key_hash`
+- `cell_id` or equivalent routing target
+- tenant-local `db9` service reference
+- tenant `S3` bucket/prefix or equivalent namespace reference
+- `status`
+- `created_at`
+- `last_active_at`
+- optional policy or quota references
+
+Representative logical table:
+
+```text
+tenants
+  tenant_id         primary identity
+  api_key_prefix    lookup accelerator only
+  api_key_hash      full credential verifier
+  cell_id           routing target
+  db9_ref           tenant-local state endpoint
+  s3_bucket/prefix  tenant object namespace
+  status            PROVISIONING | ACTIVE | SUSPENDED | DELETED
+  created_at        audit timestamp
+  last_active_at    routing / abuse / ops signal
+```
+
+Practical rules:
+
+- prefix lookup is only an optimization; full-hash verification remains mandatory
+- control-plane metadata stores routing and operational facts, not tenant business state
+- partially provisioned tenants remain in `PROVISIONING` until all required tenant-local dependencies exist
+
+### 5.4 Routing model
 
 Requests should be resolved through:
 
@@ -91,12 +155,33 @@ Practical auth flow:
 ```text
 Authorization header
   -> derive lookup key
-  -> verify credential against control-plane metadata
-  -> resolve tenant status and Tenant Cell
+  -> control-plane metadata lookup by prefix/hash
+  -> verify credential and tenant status
+  -> resolve Tenant Cell and backend references
   -> route request to tenant-local db9 + S3 + runtime
 ```
 
-### 5.4 Policy model
+Representative request path:
+
+```text
+client request
+  -> control plane auth
+  -> tenant metadata lookup
+  -> status check
+  -> tenant-to-cell resolution
+  -> tenant-local connection / service selection
+  -> forward to the target Tenant Cell
+```
+
+Recommended auth behavior:
+
+- extract the credential from `Authorization`
+- derive `api_key_prefix`
+- select candidate tenant rows by prefix
+- verify the full credential hash
+- reject non-`ACTIVE` tenants before routing tenant traffic
+
+### 5.5 Policy model
 
 The control plane should own:
 
@@ -105,7 +190,7 @@ The control plane should own:
 - provisioning policy
 - deletion/suspension policy
 
-### 5.5 Credential and metadata security
+### 5.6 Credential and metadata security
 
 The control plane should follow these minimum rules:
 
@@ -128,7 +213,25 @@ Representative metadata fields include:
 - tenant `S3` bucket/prefix or equivalent namespace reference
 - tenant status such as `PROVISIONING`, `ACTIVE`, `SUSPENDED`, `DELETED`
 
-### 5.6 Anti-abuse and operational controls
+### 5.7 Provisioning safety and initialization
+
+Provisioning should be observable as a multi-step control-plane workflow rather than one opaque side effect.
+
+Representative initialization actions:
+
+- create the tenant metadata row
+- allocate the tenant-local `db9` unit or equivalent service binding
+- create the tenant object-storage prefix such as `tenants/<tenant_id>/...`
+- initialize required tenant-local schemas, indexes, or runtime tables
+- persist routing metadata only after the target cell is ready
+
+If one of these steps fails:
+
+- leave the tenant in `PROVISIONING`
+- record enough metadata for retry or operator cleanup
+- do not route ordinary tenant traffic to the half-initialized cell
+
+### 5.8 Anti-abuse and operational controls
 
 The control plane should define minimum abuse protections for provisioning and tenant access.
 
@@ -149,6 +252,7 @@ Additional practical rules:
 
 - tenant credentials should be shown in plaintext only at creation time if the product uses one-time secret reveal
 - suspended or deleted tenant state must fail auth explicitly
+- tenants in `PROVISIONING` must not receive normal routed workload
 
 ## 7. Failure / Recovery
 

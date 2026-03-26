@@ -97,7 +97,54 @@ More concrete operational guidance:
 - `mv /a/ /b/` for a directory may be O(N) in descendants because path metadata must be rewritten
 - `rm /a` should delete the namespace entry first and only remove storage when the last logical reference is gone
 
-### 5.3 Stable object storage keys
+Representative multi-path mapping:
+
+```text
+file_nodes (dentry)                         files (inode-like file entity)
+--------------------                        --------------------------------
+/data/a.tar  ---------\                     file_id: 01J...
+/shared/a.tar ---------+------------------> storage_type: s3
+/backup/a.tar --------/                     storage_ref: blobs/01J...
+                                            size_bytes: 10737418240
+                                            revision: r7
+```
+
+This mapping is the reason zero-copy file `cp`, metadata-only file `mv`, and refcount-aware delete remain possible without encoding user paths into object keys.
+
+### 5.3 Representative namespace data model
+
+The new design docs should stay schema-flexible, but the old document was right that the namespace model needs a concrete implementation picture.
+
+Representative logical records:
+
+- `file_nodes`
+  - path tree / dentry layer
+  - key fields: `path`, `parent_path`, `name`, `is_directory`, `file_id`
+- `files`
+  - inode-like file entity
+  - key fields: `file_id`, `storage_type`, `storage_ref`, `size_bytes`, `content_type`, `revision`, `status`
+
+Important structural rules:
+
+- `file_nodes.path` is unique per tenant namespace
+- directories may have `file_id = NULL`
+- multiple `file_nodes` may reference the same `files.file_id`
+- `files.storage_ref` points to stable storage identity, not to the user-visible path
+
+Representative query and mutation consequences:
+
+| Operation | Expected metadata effect |
+| --- | --- |
+| `ls /dir/` | lookup by `parent_path = '/dir/'` |
+| `cat /a` | resolve `path -> file_id -> storage_ref` |
+| `cp /a /b` for files | insert a second `file_nodes` row pointing at the same `file_id` |
+| `mv /a /b` for files | update one `file_nodes` row |
+| `mv /a/ /b/` for directories | rewrite descendant path metadata, but do not rewrite storage bytes |
+| `rm /a` | remove one namespace entry; physical cleanup only happens after the last reference is gone |
+
+The delete path therefore depends on refcount-aware semantics even if the final implementation does not literally expose Unix `nlink`.
+
+### 5.4 Stable object storage keys
 
 `object_key` should remain as stable as possible.
 
@@ -108,7 +155,17 @@ Recommended strategy:
 - store large objects under stable keys such as `blobs/<id>`
 - keep path-to-object mapping in metadata rather than encoding user paths into object keys
 
-### 5.4 Tenant-scoped object namespace
+Representative object-key planning:
+
+```text
+tenant-visible path:   /data/training-v3/images.tar.gz
+metadata binding:      file_nodes.path -> files.file_id -> files.storage_ref
+stable object key:     tenants/<tenant_id>/blobs/01JQ7R8K3M...
+```
+
+Rename and move should change the left side of this mapping, not the right side, unless a separate migration intentionally rewrites storage.
+
+### 5.5 Tenant-scoped object namespace
 
 Each tenant must have a tenant-scoped object storage namespace for direct large-file storage.
 
@@ -122,7 +179,7 @@ Stronger isolation may use:
 - a dedicated bucket
 - another equivalent isolated object-storage unit
 
-### 5.5 Copy, move, delete semantics
+### 5.6 Copy, move, delete semantics
 
 At the product level, dat9 should support:
 
@@ -140,6 +197,12 @@ More concrete guidance:
 - delete should remove namespace entries first and defer physical cleanup to later stages when needed
 
 This means the storage design should support reference-aware delete semantics even if the final schema does not literally use Unix inode terminology.
+
+Directory operation cost should also be explicit:
+
+- file `mv` is normally O(1) metadata work
+- directory `mv` and directory `cp` are O(N) in descendants
+- both cases should still avoid physical large-object copying unless a product feature explicitly asks for it
 
 ## 6. Invariants / Correctness Rules
 
