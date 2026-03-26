@@ -48,6 +48,11 @@ func TestWriteStreamLargeFile(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/large.bin":
+			// Verify X-Dat9-Content-Length header is set for large file bifurcation
+			if h := r.Header.Get("X-Dat9-Content-Length"); h != "8" {
+				http.Error(w, fmt.Sprintf("expected X-Dat9-Content-Length=8, got %q", h), 400)
+				return
+			}
 			// Return 202 with upload plan
 			plan := UploadPlan{
 				UploadID: "upload-123",

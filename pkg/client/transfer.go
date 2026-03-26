@@ -58,7 +58,7 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 		return err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = size
+	req.Header.Set("X-Dat9-Content-Length", fmt.Sprintf("%d", size))
 
 	resp, err := c.do(req)
 	if err != nil {
