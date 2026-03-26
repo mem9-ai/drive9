@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/server"
@@ -12,21 +13,17 @@ import (
 
 func newTestClient(t *testing.T) (*Client, func()) {
 	t.Helper()
-	dbFile, err := os.CreateTemp("", "dat9-client-*.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dbFile.Close()
 
 	blobDir, err := os.MkdirTemp("", "dat9-client-blobs-*")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	store, err := meta.Open(dbFile.Name())
+	store, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
+	testmysql.ResetDB(t, store.DB())
 
 	b, err := backend.New(store, blobDir)
 	if err != nil {
@@ -39,13 +36,11 @@ func newTestClient(t *testing.T) (*Client, func()) {
 	cleanup := func() {
 		ts.Close()
 		store.Close()
-		os.Remove(dbFile.Name())
 		os.RemoveAll(blobDir)
 	}
 
 	return New(ts.URL, ""), cleanup
 }
-
 func TestWriteAndRead(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()

@@ -1,5 +1,5 @@
 // Package backend implements the Dat9Backend, which satisfies AGFS's FileSystem interface.
-// P0 uses SQLite + local blob storage as a stand-in for db9/fs9.
+// P0 uses TiDB (MySQL protocol) + local blob storage as a stand-in for db9/fs9.
 package backend
 
 import (
