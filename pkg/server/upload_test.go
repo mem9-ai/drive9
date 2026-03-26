@@ -236,13 +236,13 @@ func TestOneUploadPerPath(t *testing.T) {
 		t.Fatalf("first upload: expected 202, got %d", resp.StatusCode)
 	}
 
-	// Second upload for same path should fail
+	// Second upload for same path should fail with 409
 	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/dup-test.bin", bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
 	resp, _ = http.DefaultClient.Do(req)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("second upload: expected 500 (conflict), got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("second upload: expected 409, got %d", resp.StatusCode)
 	}
 }
 
