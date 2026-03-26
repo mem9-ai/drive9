@@ -189,6 +189,7 @@ func (s *Store) migrate() error {
 			expires_at         TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_upload_path ON uploads(target_path, status)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_uploads_active ON uploads(target_path) WHERE status = 'UPLOADING'`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency ON uploads(idempotency_key)`,
 	}
 	for _, stmt := range stmts {

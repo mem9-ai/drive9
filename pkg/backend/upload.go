@@ -129,9 +129,15 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		return fmt.Errorf("list parts: %w", err)
 	}
 
-	// Verify all parts are present
+	// Verify all parts are present and correctly sized
 	if len(parts) != upload.PartsTotal {
 		return fmt.Errorf("incomplete upload: got %d parts, expected %d", len(parts), upload.PartsTotal)
+	}
+	expectedParts := s3client.CalcParts(upload.TotalSize, upload.PartSize)
+	for i, p := range parts {
+		if p.Size != expectedParts[i].Size {
+			return fmt.Errorf("part %d size mismatch: got %d, expected %d", p.Number, p.Size, expectedParts[i].Size)
+		}
 	}
 
 	// Complete S3 multipart upload (idempotent, outside transaction)
@@ -172,6 +178,13 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			}
 
 			_, err = tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, upload.FileID)
+			if err != nil {
+				return err
+			}
+			// Rebind upload record to the surviving inode so the uploads row
+			// never points at a tombstoned file.
+			_, err = tx.Exec(`UPDATE uploads SET file_id = ? WHERE upload_id = ?`,
+				existingFileID.String, uploadID)
 			return err
 		}
 
@@ -207,6 +220,7 @@ func (b *Dat9Backend) ResumeUpload(ctx context.Context, uploadID string) (*Uploa
 
 	// Check expiry
 	if time.Now().After(upload.ExpiresAt) {
+		b.s3.AbortMultipartUpload(ctx, upload.S3Key, upload.S3UploadID)
 		b.store.AbortUpload(uploadID)
 		return nil, meta.ErrUploadExpired
 	}
