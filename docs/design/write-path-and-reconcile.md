@@ -25,6 +25,9 @@ This RFC also does not require dat9 to expose all final upload and repair behavi
 - **reconcile**: background logic that compares actual state with expected authoritative state and repairs drift
 - **orphan object**: an object present in storage without valid committed metadata state
 - **outbox / compensation marker**: durable metadata used to ensure downstream work can be retried or repaired
+- **file**: the user-visible path-addressable item
+- **logical object**: the internal content identity behind one or more file paths
+- **derived artifact**: any output generated from resource processing, whether user-visible or internal
 
 ## 4. Current Implementation Target
 
@@ -71,6 +74,19 @@ For large files:
 
 A typical large-file path should not treat upload success alone as final system commit. Final commit happens when metadata/version state is confirmed.
 
+Representative completion sequence:
+
+```text
+1. client uploads parts directly to object storage
+2. client calls /complete
+3. server finalizes multipart upload or verifies uploaded object state
+4. server commits metadata/version state
+5. server creates or confirms the logical path binding
+6. server marks upload state as completed
+7. commit succeeds -> file becomes confirmed
+8. path conflict or validation failure -> commit fails explicitly
+```
+
 ### 5.3 Commit discipline
 
 For both write paths:
@@ -99,7 +115,37 @@ Examples of practical checks:
 - a completed upload record with no confirmed resource commit
 - an `S3` object under a tenant prefix with no valid metadata reference
 
-### 5.5 Cleanup separation
+### 5.5 State machines and cross-state invariants
+
+Suggested file state machine:
+
+```text
+PENDING ----> CONFIRMED ----> DELETED
+   |              |               |
+   |              |               +--> cleanup / reaper
+   |              +--> normal use
+   +--> aborted or failed write path may be removed by reconcile
+```
+
+Suggested upload state machine:
+
+```text
+UPLOADING ----> COMPLETED
+    |               |
+    |               +--> confirmed file state exists
+    +--> ABORTED
+    +--> EXPIRED
+            |
+            +--> cleanup / reaper
+```
+
+Important cross-state invariants:
+
+- completed upload state must imply confirmed file state
+- confirmed file state must imply complete storage object exists
+- logical path bindings must point to valid file -> logical object bindings
+
+### 5.6 Delete path and cleanup separation
 
 Logical state transitions and physical cleanup should remain separable.
 
@@ -108,6 +154,29 @@ Examples:
 - metadata may mark deletion first
 - old blobs may be cleaned later
 - timed-out uploads may be aborted asynchronously
+
+Representative delete flow:
+
+```text
+1. resolve path -> file -> logical object
+2. remove namespace entry
+3. check whether other logical paths still reference the same content
+4. if references remain, stop at namespace delete
+5. if no references remain, mark the logical object as deleted
+6. cleanup worker or reaper removes physical storage later
+```
+
+The implementation should serialize the "last reference removed" decision strongly enough to avoid leaving orphaned logical-object state behind.
+
+### 5.7 Reaper responsibilities
+
+The background reaper should at least be able to:
+
+- abort timed-out uploads
+- clean orphaned upload metadata
+- clean orphaned storage objects
+- remove storage for deleted files after logical deletion is complete
+- trigger repair or cleanup for partially committed write flows
 
 ## 6. Invariants / Correctness Rules
 
@@ -127,6 +196,7 @@ For the current phase, dat9 should at least support:
 - resumable or restartable direct uploads
 - periodic detection of committed files missing downstream semantic work
 - periodic cleanup of orphaned or abandoned upload state
+- periodic cleanup of logically deleted data whose physical storage still exists
 
 ## 8. Open Questions
 

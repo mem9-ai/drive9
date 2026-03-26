@@ -31,8 +31,8 @@ The namespace is path-based, but dat9 is not just a thin wrapper around object s
 
 - semantic summaries
 - hierarchical overviews
-- lightweight relation artifacts
-- async processing for derived content
+- lightweight semantic artifacts for relations
+- async processing for derived artifacts
 
 dat9 follows an L0 / L1 / L2 content model:
 
@@ -40,7 +40,7 @@ dat9 follows an L0 / L1 / L2 content model:
 - **L1**: structured overviews for navigation and quick understanding
 - **L2**: full underlying content
 
-Artifacts such as `.abstract.md`, `.overview.md`, and `.relations.json` should remain visible and inspectable through the filesystem-like interface.
+Semantic artifacts such as `.abstract.md`, `.overview.md`, and `.relations.json` should remain visible and inspectable through the filesystem-like interface.
 
 ## 3. Core product principles
 
@@ -104,6 +104,14 @@ dat9 intentionally separates two layers that should not be collapsed into one:
 
 - **path/file semantics** for user-visible naming, browsing, copying, and moving
 - **resource/version semantics** for asynchronous derivation, writeback safety, indexing, and recovery
+
+In this terminology:
+
+- a **file** is the user-visible path-addressable item
+- a **logical object** is the internal content identity behind one or more file paths
+- a **resource** is the internal versioned processing unit used for async correctness
+- a **derived artifact** is any generated output produced from resource processing
+- a **semantic artifact** is a user-visible derived artifact such as `.abstract.md` or `.overview.md`
 
 This distinction is important.
 

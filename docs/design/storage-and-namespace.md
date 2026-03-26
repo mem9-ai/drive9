@@ -2,14 +2,14 @@
 
 ## 1. Goal
 
-This RFC defines how dat9 organizes paths, logical file identity, storage tiers, and tenant-scoped object namespaces.
+This RFC defines how dat9 organizes paths, logical object identity, storage tiers, and tenant-scoped object namespaces.
 
 It focuses on:
 
 - small files in `db9`
 - large files in `S3`
 - inode-like path semantics
-- logical path versus object identity
+- logical path versus logical object identity
 - rename, move, copy, and delete behavior
 
 ## 2. Non-goals
@@ -26,7 +26,8 @@ This RFC also does not freeze one exact physical schema. It defines product-visi
 ## 3. Definitions
 
 - **path**: the user-visible logical name in the filesystem-like namespace
-- **logical file/object identity**: the internal identity of stored content, distinct from any one path
+- **file**: the user-visible path-addressable item resolved from a path
+- **logical object**: the internal identity of stored content, distinct from any one path
 - **small file**: content stored directly in `db9`
 - **large file**: content stored in `S3`
 - **tenant-scoped object namespace**: the `S3` namespace reserved for one tenant, typically a tenant-specific prefix in a shared bucket
@@ -74,19 +75,27 @@ dat9 should preserve inode-like semantics at the product level:
 Suggested mental model:
 
 ```text
-path -> logical file/object -> storage backend
-                         |- db9 blob
-                         \- S3 object
+path -> file -> logical object -> storage backend
+                              |- db9 blob
+                              \- S3 object
 ```
 
 Representative operation mapping:
 
 ```text
-cp /a /b      -> create another logical path reference where semantics allow
-mv /a /b      -> rewrite logical path metadata, not object-store bytes
-rm /a         -> remove logical path first, clean storage later if no references remain
-cat /a        -> resolve path -> logical identity -> storage backend
+cp /a /b      -> create another file path bound to the same logical object where semantics allow
+mv /a /b      -> rewrite file path metadata, not object-store bytes
+rm /a         -> remove file path first, clean storage later if no references remain
+cat /a        -> resolve path -> file -> logical object -> storage backend
 ```
+
+More concrete operational guidance:
+
+- `cp /a /b` for a file should prefer creating a second logical reference rather than copying bytes when product semantics allow
+- `cp /a/ /b/` for a directory may require recursive metadata work across descendants
+- `mv /a /b` for a file should be an O(1) metadata rewrite when possible
+- `mv /a/ /b/` for a directory may be O(N) in descendants because path metadata must be rewritten
+- `rm /a` should delete the namespace entry first and only remove storage when the last logical reference is gone
 
 ### 5.3 Stable object storage keys
 
@@ -125,10 +134,12 @@ The exact internal schema can vary, but these semantics should remain visible in
 
 More concrete guidance:
 
-- file copy should prefer zero-copy logical duplication where possible
+- file copy should prefer zero-copy additional file paths where possible
 - file move should be metadata-only when possible
 - directory move may require O(N) metadata rewrite for descendants, but should still avoid storage-byte rewriting
 - delete should remove namespace entries first and defer physical cleanup to later stages when needed
+
+This means the storage design should support reference-aware delete semantics even if the final schema does not literally use Unix inode terminology.
 
 ## 6. Invariants / Correctness Rules
 

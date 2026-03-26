@@ -31,6 +31,10 @@ It defines the target direction and the minimum correctness contract that curren
 - **authoritative state**: the state the system trusts for correctness and recovery
 - **rebuildable state**: derived state that may be recomputed from authoritative inputs
 - **stale task**: a task whose input version is no longer the active version for current-state progression
+- **file**: the user-visible path-addressable item
+- **logical object**: the internal content identity behind one or more file paths
+- **derived artifact**: any output generated from resource processing, whether user-visible or internal
+- **semantic artifact**: a user-visible derived artifact such as `.abstract.md` or `.overview.md`
 
 ## 4. Current Implementation Target
 
@@ -126,7 +130,7 @@ The system must separate:
 - naming and content location semantics
 - lifecycle and async writeback semantics
 
-This does not mean the product stops feeling file-oriented. It means internal correctness state is allowed to be stronger than the external file metaphor.
+This does not mean the product stops feeling file-oriented. It means internal resource state is allowed to be stronger than the external file metaphor.
 
 ## 6. Invariants / Correctness Rules
 

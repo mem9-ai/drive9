@@ -34,12 +34,17 @@ Those are defined in subsystem RFCs.
 - **db9 State Plane**: the tenant-local backend for small-file content, metadata, retrieval indexes, vector data, and async task state
 - **S3 Namespace**: the tenant-scoped object storage namespace used for large-file content
 - **durable queuefs**: the queuefs interface backed by tenant-local durable task state, used for async task execution
+- **file**: the user-visible path-addressable item in the filesystem-like namespace
+- **logical object**: the internal content identity behind one or more file paths
+- **resource**: the internal versioned processing unit used for async correctness and derived-state progression
+- **derived artifact**: any output generated from resource processing
+- **semantic artifact**: a user-visible derived artifact such as `.abstract.md`, `.overview.md`, or `.relations.json`
 
 ## 4. Design
 
 ### 4.1 System shape
 
-dat9 is organized as a global control plane plus tenant-local cells.
+dat9 is organized as a global control plane plus Tenant Cells.
 
 ```text
 +------------------------------------------------------+
@@ -152,7 +157,7 @@ The core backend roles are:
 ## 5. Invariants / Correctness Rules
 
 - external filesystem-like simplicity must not erase internal versioned state
-- tenant-local state and tenant-local execution must remain isolated by tenant cell
+- tenant-local state and tenant-local execution must remain isolated by Tenant Cell
 - AGFS must remain an access plane, not the only semantic model of the system
 - async work must be durable and recoverable
 - large-file storage must remain tenant-scoped at the object-namespace level

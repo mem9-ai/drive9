@@ -24,6 +24,7 @@ This RFC also does not require dat9 to ship the full durable queue feature set i
 - **lease**: a temporary claim on a task by a worker
 - **recover**: the act of re-queueing a stale processing task after lease expiry
 - **dead-lettered**: a terminal task state after retry exhaustion or explicit non-retry failure
+- **resource**: the internal versioned processing unit carried by async tasks for correctness
 
 ## 4. Current Implementation Target
 

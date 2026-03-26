@@ -26,7 +26,10 @@ Those belong in other design RFCs.
 ## 3. Definitions
 
 - **filesystem-like UX**: a product experience shaped around path-based operations such as copy, move, read, list, remove, and search
-- **semantic artifact**: a user-visible derived file such as `.abstract.md`, `.overview.md`, or `.relations.json`
+- **file**: the user-visible path-addressable item in the filesystem-like namespace
+- **logical object**: the internal content identity behind one or more file paths
+- **derived artifact**: any generated output produced from resource processing
+- **semantic artifact**: a user-visible derived artifact such as `.abstract.md`, `.overview.md`, or `.relations.json`
 - **small file**: content that is accepted through the direct small-file write path
 - **large file**: content that is accepted through the direct object-upload path
 - **completion step**: the API call that confirms a large-file upload and establishes final system commit
@@ -127,6 +130,7 @@ Recommended behavior:
 - resume returns only the remaining work needed to finish upload
 - complete is the only operation that establishes final committed large-file state
 - cancel marks the upload abandoned and eligible for cleanup
+- if an active upload already exists for the same logical target, resume/reuse policy must be explicit rather than implicit
 
 ### 5.4 Suggested HTTP status semantics
 
@@ -163,6 +167,11 @@ Additional guidance:
 - `409 Conflict` should be used for meaningful semantic conflicts, such as a conflicting upload session for the same path
 - `412 Precondition Failed` should be used when optimistic write preconditions fail, such as revision mismatch on overwrite
 
+Recommended conflict policy:
+
+- reuse an existing upload session only when the server can prove it refers to the same logical upload intent
+- otherwise return `409 Conflict` rather than silently rebinding state
+
 ### 5.5 Search contract
 
 Search should be a first-class user operation.
@@ -179,8 +188,8 @@ The contract does not need to expose every backend retrieval primitive. It shoul
 
 User-facing semantics should remain simple:
 
-- copy should behave like copying a logical file, even if physical storage is reused internally
-- move should behave like renaming or relocating a logical file, even if no physical object move occurs internally
+- copy should behave like copying a file path binding, even if physical storage is reused through the same logical object internally
+- move should behave like renaming or relocating a file path, even if no physical object move occurs internally
 - delete should behave like removing the logical item from user view, even if physical cleanup happens later
 
 This preserves the product model while allowing backend-efficient implementations.
@@ -265,7 +274,7 @@ over hidden, non-inspectable semantic behavior.
 
 - interrupted large-file uploads should be resumable or restartable
 - failed completion should not leave users unable to determine whether the file was committed
-- stale semantic artifacts may exist transiently, but the system must converge through async regeneration and reconcile
+- stale derived artifacts may exist transiently, but the system must converge through async regeneration and reconcile
 - user-visible contract should distinguish accepted, committed, and failed operations clearly enough to avoid ambiguity
 
 Recommended practical behavior:

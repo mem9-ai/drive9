@@ -2,7 +2,7 @@
 
 ## 1. Goal
 
-This RFC defines how dat9 derives semantic artifacts and how those artifacts participate in retrieval.
+This RFC defines how dat9 derives semantic artifacts and how derived artifacts participate in retrieval.
 
 It focuses on:
 
@@ -24,7 +24,8 @@ This RFC does not define:
 - **L0**: short summary for quick scanning
 - **L1**: structured overview for navigation and quick understanding
 - **L2**: full underlying content
-- **semantic artifact**: any derived content such as `.abstract.md`, `.overview.md`, parsed text, chunks, or relation sidecars
+- **derived artifact**: any output generated from resource processing, including summaries, overviews, parsed text, chunks, vectors, and relation sidecars
+- **semantic artifact**: a user-visible derived artifact such as `.abstract.md`, `.overview.md`, or `.relations.json`
 - **aggregate task**: a task that derives content from a collection, directory, or bounded set of inputs rather than from one file alone
 
 ## 4. Design
@@ -39,7 +40,7 @@ Examples include:
 - `.overview.md`
 - `.relations.json`
 
-These may be visible as ordinary files in the product interface even if the backend keeps additional internal state.
+These semantic artifacts may be visible as ordinary files in the product interface even if the backend keeps additional internal state.
 
 ### 4.2 Retrieval participation
 
@@ -68,11 +69,11 @@ They should operate on bounded snapshot inputs or explicitly versioned aggregate
 - semantic artifacts should be inspectable in the product model
 - small-file direct retrieval and large-file summary-based retrieval should coexist
 - aggregate derivation must operate on bounded inputs
-- derived semantic artifacts should remain rebuildable from authoritative state
+- derived artifacts should remain rebuildable from authoritative state
 
 ## 6. Failure / Recovery
 
-- missing or stale semantic artifacts must be regenerable through reconcile and async reruns
+- missing or stale derived artifacts must be regenerable through reconcile and async reruns
 - failed derivation must not invalidate authoritative resource state
 
 ## 7. Open Questions

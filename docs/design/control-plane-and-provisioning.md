@@ -17,8 +17,8 @@ This RFC also does not require every future provisioning and anti-abuse feature 
 ## 3. Definitions
 
 - **tenant onboarding**: the process of creating a new tenant and making it routable
-- **tenant-to-cell mapping**: the routing relation from tenant identity to its tenant cell
-- **control-plane metadata**: the global metadata needed to locate and manage tenant cells
+- **tenant-to-cell mapping**: the routing relation from tenant identity to its Tenant Cell
+- **control-plane metadata**: the global metadata needed to locate and manage Tenant Cells
 
 ## 4. Current Implementation Target
 
@@ -36,7 +36,7 @@ For the current phase, the control plane should provide at least:
 
 The minimum viable onboarding flow should support:
 
-- creating a tenant cell
+- creating a Tenant Cell
 - provisioning or assigning the tenant-local `db9` unit
 - assigning the tenant-scoped `S3` namespace
 - making the tenant routable through control-plane metadata
@@ -55,7 +55,7 @@ The Global Control Plane is responsible for:
 
 ### 5.2 Provisioning model
 
-Each tenant should be provisioned with an isolated tenant cell that includes:
+Each tenant should be provisioned with an isolated Tenant Cell that includes:
 
 - an isolated metadata and task-execution unit
 - an isolated `db9` cluster or equivalent isolated `db9` service unit
@@ -72,6 +72,12 @@ control plane -> store tenant-to-cell mapping
 control plane -> return tenant credential once
 ```
 
+Recommended additional provisioning details:
+
+- credentials should be revealed in plaintext only once at creation time if the product uses generated API keys
+- tenant metadata should record lifecycle state such as `PROVISIONING`, `ACTIVE`, `SUSPENDED`, and `DELETED`
+- provisioning should create the tenant-scoped object prefix before the tenant becomes routable
+
 ### 5.3 Routing model
 
 Requests should be resolved through:
@@ -86,7 +92,7 @@ Practical auth flow:
 Authorization header
   -> derive lookup key
   -> verify credential against control-plane metadata
-  -> resolve tenant status and tenant cell
+  -> resolve tenant status and Tenant Cell
   -> route request to tenant-local db9 + S3 + runtime
 ```
 
@@ -108,6 +114,12 @@ The control plane should follow these minimum rules:
 - tenant status must be enforced during auth
 - transport must require HTTPS
 
+More concrete recommendations:
+
+- use a credential format that is easy to identify in logs and secret-scanning systems, for example a stable prefix such as `dat9_`
+- use prefix lookup only as an optimization, never as the sole proof of identity
+- require full-hash verification after any prefix lookup hit
+
 Representative metadata fields include:
 
 - `tenant_id`
@@ -116,11 +128,22 @@ Representative metadata fields include:
 - tenant `S3` bucket/prefix or equivalent namespace reference
 - tenant status such as `PROVISIONING`, `ACTIVE`, `SUSPENDED`, `DELETED`
 
+### 5.6 Anti-abuse and operational controls
+
+The control plane should define minimum abuse protections for provisioning and tenant access.
+
+Examples:
+
+- rate limits on `/v1/provision`
+- maximum simultaneous provisioning attempts from one source
+- limits on active tenants or cells per source identity, if needed
+- explicit rejection of unauthenticated or suspended tenant requests
+
 ## 6. Invariants / Correctness Rules
 
-- tenant-local state must remain isolated at the tenant-cell level
+- tenant-local state must remain isolated at the Tenant Cell level
 - global control-plane metadata must not become the holder of tenant business truth
-- routing must always resolve to one valid tenant cell or fail explicitly
+- routing must always resolve to one valid Tenant Cell or fail explicitly
 
 Additional practical rules:
 
@@ -149,6 +172,11 @@ Current product decisions still worth documenting explicitly:
 - API key only vs scoped tokens
 - rate limit only vs stronger anti-abuse gating for `/v1/provision`
 - one tenant per isolated db9 unit vs other equivalent service-unit strategies
+
+Recommended current-phase default leaning:
+
+- API key based auth for P0/P1
+- rate limiting as the baseline anti-abuse control, with stronger gating added later if needed
 
 ## 9. References / Dependencies
 
