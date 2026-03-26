@@ -296,22 +296,24 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type uploadEntry struct {
-		UploadID  string `json:"upload_id"`
-		Path      string `json:"path"`
-		TotalSize int64  `json:"total_size"`
-		Status    string `json:"status"`
-		CreatedAt string `json:"created_at"`
-		ExpiresAt string `json:"expires_at"`
+		UploadID   string `json:"upload_id"`
+		Path       string `json:"path"`
+		TotalSize  int64  `json:"total_size"`
+		PartsTotal int    `json:"parts_total"`
+		Status     string `json:"status"`
+		CreatedAt  string `json:"created_at"`
+		ExpiresAt  string `json:"expires_at"`
 	}
 	result := make([]uploadEntry, 0, len(uploads))
 	for _, u := range uploads {
 		result = append(result, uploadEntry{
-			UploadID:  u.UploadID,
-			Path:      u.TargetPath,
-			TotalSize: u.TotalSize,
-			Status:    string(u.Status),
-			CreatedAt: u.CreatedAt.Format("2006-01-02T15:04:05.000Z07:00"),
-			ExpiresAt: u.ExpiresAt.Format("2006-01-02T15:04:05.000Z07:00"),
+			UploadID:   u.UploadID,
+			Path:       u.TargetPath,
+			TotalSize:  u.TotalSize,
+			PartsTotal: u.PartsTotal,
+			Status:     string(u.Status),
+			CreatedAt:  u.CreatedAt.Format("2006-01-02T15:04:05.000Z07:00"),
+			ExpiresAt:  u.ExpiresAt.Format("2006-01-02T15:04:05.000Z07:00"),
 		})
 	}
 
