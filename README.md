@@ -32,7 +32,7 @@ dat9 cp :/data/a.bin :/shared/a.bin
 dat9 mv :/data/old.bin :/data/new.bin
 
 # Start the server
-dat9 serve
+dat9-server
 ```
 
 ### Go SDK
@@ -132,7 +132,8 @@ POST   /v1/fs/{path}?mkdir        Create directory
 ## Project Structure
 
 ```
-cmd/dat9/           CLI entrypoint and subcommands
+cmd/dat9/           CLI entrypoint and commands
+cmd/dat9-server/    Server entrypoint
 pkg/
   backend/          Dat9Backend — AGFS FileSystem implementation (inode model)
   client/           Go SDK HTTP client
@@ -176,6 +177,7 @@ Four tables, all in the tenant's database:
 
 ```bash
 go build -o dat9 ./cmd/dat9
+go build -o dat9-server ./cmd/dat9-server
 ```
 
 ## Running Tests
