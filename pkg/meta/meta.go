@@ -13,7 +13,11 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-var ErrNotFound = errors.New("not found")
+var (
+	ErrNotFound       = errors.New("not found")
+	ErrUploadNotActive = errors.New("upload is not in UPLOADING state")
+	ErrUploadExpired   = errors.New("upload has expired")
+)
 
 type StorageType string
 
@@ -111,6 +115,20 @@ func Open(dbPath string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) DB() *sql.DB { return s.db }
+
+// InTx runs fn inside a database transaction. If fn returns an error, the
+// transaction is rolled back; otherwise it is committed.
+func (s *Store) InTx(fn func(tx *sql.Tx) error) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -399,9 +417,61 @@ func (s *Store) UpdateFileContent(fileID string, storageType StorageType, storag
 }
 
 func (s *Store) ConfirmFile(fileID string) error {
-	_, err := s.db.Exec(`UPDATE files SET status = 'CONFIRMED',
+	return s.ConfirmFileTx(s.db, fileID)
+}
+
+// execer abstracts *sql.DB and *sql.Tx for shared query execution.
+type execer interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+}
+
+func (s *Store) ConfirmFileTx(db execer, fileID string) error {
+	_, err := db.Exec(`UPDATE files SET status = 'CONFIRMED',
 		confirmed_at = strftime('%Y-%m-%dT%H:%M:%f','now')
 		WHERE file_id = ? AND status = 'PENDING'`, fileID)
+	return err
+}
+
+func (s *Store) CompleteUploadTx(db execer, uploadID string) error {
+	_, err := db.Exec(`UPDATE uploads SET status = 'COMPLETED',
+		updated_at = strftime('%Y-%m-%dT%H:%M:%f','now')
+		WHERE upload_id = ? AND status = 'UPLOADING'`, uploadID)
+	return err
+}
+
+func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) error {
+	var ancestors []string
+	cur := path
+	for {
+		parent := parentPath(cur)
+		if parent == cur || parent == "/" {
+			break
+		}
+		ancestors = append(ancestors, parent)
+		cur = parent
+	}
+	now := time.Now()
+	for i := len(ancestors) - 1; i >= 0; i-- {
+		dirPath := ancestors[i]
+		pp := parentPath(dirPath)
+		name := baseName(dirPath)
+		_, err := db.Exec(`INSERT OR IGNORE INTO file_nodes
+			(node_id, path, parent_path, name, is_directory, created_at)
+			VALUES (?, ?, ?, ?, 1, ?)`,
+			genID(), dirPath, pp, name, timeStr(now))
+		if err != nil && !isUniqueViolation(err) {
+			return fmt.Errorf("ensure parent %s: %w", dirPath, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
+	_, err := db.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), timeStr(n.CreatedAt))
 	return err
 }
 

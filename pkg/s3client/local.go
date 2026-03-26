@@ -170,14 +170,12 @@ func (c *LocalS3Client) AbortMultipartUpload(ctx context.Context, key, uploadID 
 
 func (c *LocalS3Client) ListParts(ctx context.Context, key, uploadID string) ([]Part, error) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	upload, ok := c.uploads[uploadID]
-	c.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("upload not found: %s", uploadID)
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	var parts []Part
 	for num, p := range upload.parts {

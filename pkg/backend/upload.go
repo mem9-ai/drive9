@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -111,7 +112,7 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		return err
 	}
 	if upload.Status != meta.UploadUploading {
-		return fmt.Errorf("upload %s is %s, not UPLOADING", uploadID, upload.Status)
+		return meta.ErrUploadNotActive
 	}
 
 	// List uploaded parts from S3
@@ -120,32 +121,30 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		return fmt.Errorf("list parts: %w", err)
 	}
 
-	// Complete S3 multipart upload
+	// Complete S3 multipart upload (idempotent, outside transaction)
 	if err := b.s3.CompleteMultipartUpload(ctx, upload.S3Key, upload.S3UploadID, parts); err != nil {
 		return fmt.Errorf("complete multipart: %w", err)
 	}
 
-	// Confirm file record
-	if err := b.store.ConfirmFile(upload.FileID); err != nil {
-		return err
-	}
-
-	// Mark upload complete
-	if err := b.store.CompleteUpload(uploadID); err != nil {
-		return err
-	}
-
-	// Ensure parent dirs and create file node
-	if err := b.store.EnsureParentDirs(upload.TargetPath, b.genID); err != nil {
-		return err
-	}
-	return b.store.InsertNode(&meta.FileNode{
-		NodeID:     b.genID(),
-		Path:       upload.TargetPath,
-		ParentPath: pathutil.ParentPath(upload.TargetPath),
-		Name:       pathutil.BaseName(upload.TargetPath),
-		FileID:     upload.FileID,
-		CreatedAt:  time.Now(),
+	// Atomically: confirm file, complete upload, ensure parents, create node
+	return b.store.InTx(func(tx *sql.Tx) error {
+		if err := b.store.ConfirmFileTx(tx, upload.FileID); err != nil {
+			return err
+		}
+		if err := b.store.CompleteUploadTx(tx, uploadID); err != nil {
+			return err
+		}
+		if err := b.store.EnsureParentDirsTx(tx, upload.TargetPath, b.genID); err != nil {
+			return err
+		}
+		return b.store.InsertNodeTx(tx, &meta.FileNode{
+			NodeID:     b.genID(),
+			Path:       upload.TargetPath,
+			ParentPath: pathutil.ParentPath(upload.TargetPath),
+			Name:       pathutil.BaseName(upload.TargetPath),
+			FileID:     upload.FileID,
+			CreatedAt:  time.Now(),
+		})
 	})
 }
 
@@ -156,13 +155,13 @@ func (b *Dat9Backend) ResumeUpload(ctx context.Context, uploadID string) (*Uploa
 		return nil, err
 	}
 	if upload.Status != meta.UploadUploading {
-		return nil, fmt.Errorf("upload %s is %s, not UPLOADING", uploadID, upload.Status)
+		return nil, meta.ErrUploadNotActive
 	}
 
 	// Check expiry
 	if time.Now().After(upload.ExpiresAt) {
 		b.store.AbortUpload(uploadID)
-		return nil, fmt.Errorf("upload %s has expired", uploadID)
+		return nil, meta.ErrUploadExpired
 	}
 
 	// List already-uploaded parts
@@ -207,7 +206,7 @@ func (b *Dat9Backend) AbortUpload(ctx context.Context, uploadID string) error {
 		return err
 	}
 	if upload.Status != meta.UploadUploading {
-		return fmt.Errorf("upload %s is %s, not UPLOADING", uploadID, upload.Status)
+		return meta.ErrUploadNotActive
 	}
 
 	b.s3.AbortMultipartUpload(ctx, upload.S3Key, upload.S3UploadID)
