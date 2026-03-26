@@ -172,11 +172,15 @@ func TestResumeUpload(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/uploads":
-			// Step 1: Return upload metadata
-			json.NewEncoder(w).Encode(UploadMeta{
-				UploadID:   "resume-456",
-				PartsTotal: 3,
-				Status:     "UPLOADING",
+			// Step 1: Return upload metadata in server's envelope format
+			json.NewEncoder(w).Encode(struct {
+				Uploads []UploadMeta `json:"uploads"`
+			}{
+				Uploads: []UploadMeta{{
+					UploadID:   "resume-456",
+					PartsTotal: 3,
+					Status:     "UPLOADING",
+				}},
 			})
 
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-456/resume":

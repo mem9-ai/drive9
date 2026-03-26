@@ -297,11 +297,16 @@ func (c *Client) queryUpload(ctx context.Context, path string) (*UploadMeta, err
 		return nil, readError(resp)
 	}
 
-	var meta UploadMeta
-	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+	var envelope struct {
+		Uploads []UploadMeta `json:"uploads"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
 		return nil, fmt.Errorf("decode upload meta: %w", err)
 	}
-	return &meta, nil
+	if len(envelope.Uploads) == 0 {
+		return nil, fmt.Errorf("no active upload for %s", path)
+	}
+	return &envelope.Uploads[0], nil
 }
 
 // requestResume asks the server to generate presigned URLs for missing parts.
