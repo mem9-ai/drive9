@@ -11,12 +11,6 @@ import (
 
 func newTestBackend(t *testing.T) *Dat9Backend {
 	t.Helper()
-	dbFile, err := os.CreateTemp("", "dat9-*.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dbFile.Close()
-	t.Cleanup(func() { os.Remove(dbFile.Name()) })
 
 	blobDir, err := os.MkdirTemp("", "dat9-blobs-*")
 	if err != nil {
@@ -24,10 +18,11 @@ func newTestBackend(t *testing.T) *Dat9Backend {
 	}
 	t.Cleanup(func() { os.RemoveAll(blobDir) })
 
-	store, err := meta.Open(dbFile.Name())
+	store, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
+	resetTestDB(t, store)
 	t.Cleanup(func() { store.Close() })
 
 	b, err := New(store, blobDir)
@@ -35,6 +30,21 @@ func newTestBackend(t *testing.T) *Dat9Backend {
 		t.Fatal(err)
 	}
 	return b
+}
+
+func resetTestDB(t *testing.T, store *meta.Store) {
+	t.Helper()
+	queries := []string{
+		"DELETE FROM file_nodes",
+		"DELETE FROM file_tags",
+		"DELETE FROM uploads",
+		"DELETE FROM files",
+	}
+	for _, q := range queries {
+		if _, err := store.DB().Exec(q); err != nil {
+			t.Fatalf("reset test db: %v", err)
+		}
+	}
 }
 
 var _ filesystem.FileSystem = (*Dat9Backend)(nil)

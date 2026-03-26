@@ -2,26 +2,34 @@ package meta
 
 import (
 	"fmt"
-	"os"
 	"testing"
 	"time"
 )
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	f, err := os.CreateTemp("", "dat9-meta-*.db")
+	s, err := Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
-	t.Cleanup(func() { os.Remove(f.Name()) })
-
-	s, err := Open(f.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
+	resetTestDB(t, s)
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+func resetTestDB(t *testing.T, s *Store) {
+	t.Helper()
+	queries := []string{
+		"DELETE FROM file_nodes",
+		"DELETE FROM file_tags",
+		"DELETE FROM uploads",
+		"DELETE FROM files",
+	}
+	for _, q := range queries {
+		if _, err := s.DB().Exec(q); err != nil {
+			t.Fatalf("reset test db: %v", err)
+		}
+	}
 }
 
 var seq int

@@ -12,21 +12,17 @@ import (
 
 func newTestClient(t *testing.T) (*Client, func()) {
 	t.Helper()
-	dbFile, err := os.CreateTemp("", "dat9-client-*.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dbFile.Close()
 
 	blobDir, err := os.MkdirTemp("", "dat9-client-blobs-*")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	store, err := meta.Open(dbFile.Name())
+	store, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
+	resetTestDB(t, store)
 
 	b, err := backend.New(store, blobDir)
 	if err != nil {
@@ -39,11 +35,25 @@ func newTestClient(t *testing.T) (*Client, func()) {
 	cleanup := func() {
 		ts.Close()
 		store.Close()
-		os.Remove(dbFile.Name())
 		os.RemoveAll(blobDir)
 	}
 
 	return New(ts.URL, ""), cleanup
+}
+
+func resetTestDB(t *testing.T, store *meta.Store) {
+	t.Helper()
+	queries := []string{
+		"DELETE FROM file_nodes",
+		"DELETE FROM file_tags",
+		"DELETE FROM uploads",
+		"DELETE FROM files",
+	}
+	for _, q := range queries {
+		if _, err := store.DB().Exec(q); err != nil {
+			t.Fatalf("reset test db: %v", err)
+		}
+	}
 }
 
 func TestWriteAndRead(t *testing.T) {

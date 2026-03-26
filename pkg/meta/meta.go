@@ -1,5 +1,5 @@
 // Package meta provides the inode-model metadata store for dat9.
-// P0 uses SQLite as a local stand-in for db9. Two core tables:
+// P0 uses TiDB (via MySQL protocol) as a local stand-in for db9. Two core tables:
 // file_nodes (dentry/path tree) and files (inode/file entity).
 package meta
 
@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/go-sql-driver/mysql"
 )
 
 var ErrNotFound = errors.New("not found")
@@ -91,15 +91,19 @@ type Upload struct {
 	ExpiresAt      time.Time
 }
 
-// Store is the metadata store backed by SQLite (stand-in for db9).
+// Store is the metadata store backed by TiDB/MySQL (stand-in for db9).
 type Store struct {
 	db *sql.DB
 }
 
-func Open(dbPath string) (*Store, error) {
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on")
+func Open(dsn string) (*Store, error) {
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping db: %w", err)
 	}
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
@@ -110,70 +114,77 @@ func Open(dbPath string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
-func (s *Store) DB() *sql.DB { return s.db }
+func (s *Store) DB() *sql.DB  { return s.db }
 
 func (s *Store) migrate() error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
-			node_id      TEXT PRIMARY KEY,
-			path         TEXT NOT NULL,
-			parent_path  TEXT NOT NULL,
-			name         TEXT NOT NULL,
-			is_directory INTEGER NOT NULL DEFAULT 0,
-			file_id      TEXT,
-			created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f','now'))
+			node_id      VARCHAR(64) PRIMARY KEY,
+			path         VARCHAR(768) NOT NULL,
+			parent_path  VARCHAR(768) NOT NULL,
+			name         VARCHAR(255) NOT NULL,
+			is_directory BOOLEAN NOT NULL DEFAULT FALSE,
+			file_id      VARCHAR(64),
+			created_at   VARCHAR(64) NOT NULL
 		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_path ON file_nodes(path)`,
-		`CREATE INDEX IF NOT EXISTS idx_parent ON file_nodes(parent_path)`,
-		`CREATE INDEX IF NOT EXISTS idx_file_id ON file_nodes(file_id)`,
+		`CREATE UNIQUE INDEX idx_path ON file_nodes(path)`,
+		`CREATE INDEX idx_parent ON file_nodes(parent_path)`,
+		`CREATE INDEX idx_file_id ON file_nodes(file_id)`,
 
 		`CREATE TABLE IF NOT EXISTS files (
-			file_id         TEXT PRIMARY KEY,
-			storage_type    TEXT NOT NULL,
+			file_id         VARCHAR(64) PRIMARY KEY,
+			storage_type    VARCHAR(32) NOT NULL,
 			storage_ref     TEXT NOT NULL,
-			content_type    TEXT,
-			size_bytes      INTEGER NOT NULL DEFAULT 0,
-			checksum_sha256 TEXT,
-			revision        INTEGER NOT NULL DEFAULT 1,
-			status          TEXT NOT NULL DEFAULT 'PENDING',
-			source_id       TEXT,
-			content_text    TEXT,
-			created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f','now')),
-			confirmed_at    TEXT,
-			expires_at      TEXT
+			content_type    VARCHAR(255),
+			size_bytes      BIGINT NOT NULL DEFAULT 0,
+			checksum_sha256 VARCHAR(128),
+			revision        BIGINT NOT NULL DEFAULT 1,
+			status          VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+			source_id       VARCHAR(255),
+			content_text    LONGTEXT,
+			created_at      VARCHAR(64) NOT NULL,
+			confirmed_at    VARCHAR(64),
+			expires_at      VARCHAR(64)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_status ON files(status, created_at)`,
+		`CREATE INDEX idx_status ON files(status, created_at)`,
 
 		`CREATE TABLE IF NOT EXISTS file_tags (
-			file_id   TEXT NOT NULL,
-			tag_key   TEXT NOT NULL,
-			tag_value TEXT NOT NULL DEFAULT '',
+			file_id   VARCHAR(64) NOT NULL,
+			tag_key   VARCHAR(255) NOT NULL,
+			tag_value VARCHAR(255) NOT NULL DEFAULT '',
 			PRIMARY KEY (file_id, tag_key)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_kv ON file_tags(tag_key, tag_value)`,
+		`CREATE INDEX idx_kv ON file_tags(tag_key, tag_value)`,
 
 		`CREATE TABLE IF NOT EXISTS uploads (
-			upload_id          TEXT PRIMARY KEY,
-			file_id            TEXT NOT NULL,
-			target_path        TEXT NOT NULL,
-			s3_upload_id       TEXT NOT NULL,
-			s3_key             TEXT NOT NULL,
-			total_size         INTEGER NOT NULL,
-			part_size          INTEGER NOT NULL,
-			parts_total        INTEGER NOT NULL,
-			status             TEXT NOT NULL DEFAULT 'UPLOADING',
-			fingerprint_sha256 TEXT,
-			idempotency_key    TEXT,
-			created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f','now')),
-			updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f','now')),
-			expires_at         TEXT NOT NULL
+			upload_id          VARCHAR(64) PRIMARY KEY,
+			file_id            VARCHAR(64) NOT NULL,
+			target_path        VARCHAR(700) NOT NULL,
+			s3_upload_id       VARCHAR(255) NOT NULL,
+			s3_key             VARCHAR(2048) NOT NULL,
+			total_size         BIGINT NOT NULL,
+			part_size          BIGINT NOT NULL,
+			parts_total        INT NOT NULL,
+			status             VARCHAR(32) NOT NULL DEFAULT 'UPLOADING',
+			fingerprint_sha256 VARCHAR(128),
+			idempotency_key    VARCHAR(255),
+			created_at         VARCHAR(64) NOT NULL,
+			updated_at         VARCHAR(64) NOT NULL,
+			expires_at         VARCHAR(64) NOT NULL
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_upload_path ON uploads(target_path, status)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency ON uploads(idempotency_key)`,
+		`CREATE INDEX idx_upload_path ON uploads(target_path, status)`,
+		`CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
-			return fmt.Errorf("exec %q: %w", stmt[:60], err)
+			if isIgnorableMigrationError(err) {
+				continue
+			}
+			snippet := stmt
+			if len(snippet) > 60 {
+				snippet = snippet[:60]
+			}
+			return fmt.Errorf("exec %q: %w", snippet, err)
 		}
 	}
 	return nil
@@ -347,9 +358,10 @@ func (s *Store) EnsureParentDirs(path string, genID func() string) error {
 		dirPath := ancestors[i]
 		pp := parentPath(dirPath)
 		name := baseName(dirPath)
-		_, err := s.db.Exec(`INSERT OR IGNORE INTO file_nodes
+		_, err := s.db.Exec(`INSERT INTO file_nodes
 			(node_id, path, parent_path, name, is_directory, created_at)
-			VALUES (?, ?, ?, ?, 1, ?)`,
+			VALUES (?, ?, ?, ?, 1, ?)
+			ON DUPLICATE KEY UPDATE node_id = node_id`,
 			genID(), dirPath, pp, name, timeStr(now))
 		if err != nil && !isUniqueViolation(err) {
 			return fmt.Errorf("ensure parent %s: %w", dirPath, err)
@@ -384,10 +396,10 @@ func (s *Store) UpdateFileContent(fileID string, storageType StorageType, storag
 	res, err := s.db.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
 		content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,
 		revision = revision + 1, status = 'CONFIRMED',
-		confirmed_at = strftime('%Y-%m-%dT%H:%M:%f','now')
+		confirmed_at = ?
 		WHERE file_id = ?`,
 		storageType, storageRef, nullStr(contentType), size,
-		nullStr(checksum), nullStr(contentText), fileID)
+		nullStr(checksum), nullStr(contentText), timeStr(time.Now().UTC()), fileID)
 	if err != nil {
 		return err
 	}
@@ -400,8 +412,8 @@ func (s *Store) UpdateFileContent(fileID string, storageType StorageType, storag
 
 func (s *Store) ConfirmFile(fileID string) error {
 	_, err := s.db.Exec(`UPDATE files SET status = 'CONFIRMED',
-		confirmed_at = strftime('%Y-%m-%dT%H:%M:%f','now')
-		WHERE file_id = ? AND status = 'PENDING'`, fileID)
+		confirmed_at = ?
+		WHERE file_id = ? AND status = 'PENDING'`, timeStr(time.Now().UTC()), fileID)
 	return err
 }
 
@@ -603,8 +615,8 @@ func (s *Store) GetUploadByPath(targetPath string) (*Upload, error) {
 
 func (s *Store) CompleteUpload(uploadID string) error {
 	_, err := s.db.Exec(`UPDATE uploads SET status = 'COMPLETED',
-		updated_at = strftime('%Y-%m-%dT%H:%M:%f','now')
-		WHERE upload_id = ? AND status = 'UPLOADING'`, uploadID)
+		updated_at = ?
+		WHERE upload_id = ? AND status = 'UPLOADING'`, timeStr(time.Now().UTC()), uploadID)
 	return err
 }
 
@@ -779,5 +791,17 @@ func baseName(p string) string {
 }
 
 func isUniqueViolation(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Duplicate entry") || strings.Contains(msg, "UNIQUE constraint failed")
+}
+
+func isIgnorableMigrationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Duplicate key name") || strings.Contains(msg, "already exists")
 }

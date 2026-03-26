@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/meta"
@@ -12,11 +11,10 @@ import (
 
 const (
 	defaultListenAddr = ":9009"
-	defaultDBPath     = "dat9.db"
 	defaultBlobDir    = "blobs"
 )
 
-// Serve starts the dat9 HTTP server backed by the local SQLite/blob stand-in
+// Serve starts the dat9 HTTP server backed by TiDB/MySQL + local blob stand-in
 // used in P0.
 func Serve(args []string) error {
 	if len(args) > 1 {
@@ -28,17 +26,17 @@ func Serve(args []string) error {
 		addr = args[0]
 	}
 
-	dbPath := envOr("DAT9_DB_PATH", defaultDBPath)
+	mysqlDSN := os.Getenv("DAT9_MYSQL_DSN")
+	if mysqlDSN == "" {
+		return fmt.Errorf("DAT9_MYSQL_DSN is required")
+	}
 	blobDir := envOr("DAT9_BLOB_DIR", defaultBlobDir)
 
-	if err := ensureParentDir(dbPath); err != nil {
-		return err
-	}
 	if err := os.MkdirAll(blobDir, 0o755); err != nil {
 		return fmt.Errorf("create blob dir: %w", err)
 	}
 
-	store, err := meta.Open(dbPath)
+	store, err := meta.Open(mysqlDSN)
 	if err != nil {
 		return fmt.Errorf("open meta store: %w", err)
 	}
@@ -57,15 +55,4 @@ func envOr(key, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-func ensureParentDir(path string) error {
-	dir := filepath.Dir(path)
-	if dir == "." || dir == "" {
-		return nil
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create db dir: %w", err)
-	}
-	return nil
 }
