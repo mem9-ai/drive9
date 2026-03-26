@@ -3,7 +3,6 @@ package backend
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"time"
 
@@ -43,8 +42,7 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 	// Enforce one active upload per path
 	existing, err := b.store.GetUploadByPath(path)
 	if err == nil && existing != nil {
-		return nil, fmt.Errorf("%w: active upload already exists for path %s (upload_id=%s)",
-			meta.ErrPathConflict, path, existing.UploadID)
+		return nil, meta.ErrUploadConflict
 	}
 
 	fileID := b.genID()
@@ -141,13 +139,12 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		return fmt.Errorf("complete multipart: %w", err)
 	}
 
-	var replaced *meta.File
-	// Atomically: confirm file, complete upload, ensure parents, then either insert
-	// or overwrite the path node with the new file entity.
-	err = b.store.InTx(func(tx *sql.Tx) error {
-		if err := b.store.ConfirmFileTx(tx, upload.FileID); err != nil {
-			return err
-		}
+	// Atomically: complete upload, ensure parents, create or overwrite node.
+	// Overwrite preserves inode identity by updating the existing files row
+	// in place so every hard link keeps pointing at the same file_id.
+	var oldStorageRef string
+	var isOverwrite bool
+	if err := b.store.InTx(func(tx *sql.Tx) error {
 		if err := b.store.CompleteUploadTx(tx, uploadID); err != nil {
 			return err
 		}
@@ -155,14 +152,32 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			return err
 		}
 
-		replaced, err = b.store.ReplaceNodeFileTx(tx, upload.TargetPath, upload.FileID)
-		if err == nil {
-			return nil
-		}
-		if !errors.Is(err, meta.ErrNotFound) {
+		var existingFileID sql.NullString
+		err := tx.QueryRow(`SELECT file_id FROM file_nodes WHERE path = ?`, upload.TargetPath).Scan(&existingFileID)
+		if err == nil && existingFileID.Valid {
+			isOverwrite = true
+
+			var oldRef string
+			tx.QueryRow(`SELECT storage_ref FROM files WHERE file_id = ?`, existingFileID.String).Scan(&oldRef)
+			oldStorageRef = oldRef
+
+			_, err := tx.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
+				size_bytes = ?, content_text = NULL, revision = revision + 1,
+				status = 'CONFIRMED',
+				confirmed_at = strftime('%Y-%m-%dT%H:%M:%f','now')
+				WHERE file_id = ?`,
+				meta.StorageS3, upload.S3Key, upload.TotalSize, existingFileID.String)
+			if err != nil {
+				return err
+			}
+
+			_, err = tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, upload.FileID)
 			return err
 		}
 
+		if err := b.store.ConfirmFileTx(tx, upload.FileID); err != nil {
+			return err
+		}
 		return b.store.InsertNodeTx(tx, &meta.FileNode{
 			NodeID:     b.genID(),
 			Path:       upload.TargetPath,
@@ -171,12 +186,11 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			FileID:     upload.FileID,
 			CreatedAt:  time.Now(),
 		})
-	})
-	if err != nil {
+	}); err != nil {
 		return err
 	}
-	if replaced != nil {
-		b.deleteBlob(replaced.StorageRef)
+	if isOverwrite && oldStorageRef != "" {
+		b.deleteBlob(oldStorageRef)
 	}
 	return nil
 }
