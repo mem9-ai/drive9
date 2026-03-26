@@ -7,8 +7,10 @@ func TestIsRemote(t *testing.T) {
 		path string
 		want bool
 	}{
-		{"/data/file.txt", true},
-		{"/", true},
+		{":/data/file.txt", true},
+		{":/", true},
+		{"/data/file.txt", false},
+		{"/tmp/local.txt", false},
 		{"local.txt", false},
 		{"./local.txt", false},
 		{"-", false},

@@ -11,11 +11,13 @@ import (
 
 // Cp copies files between local and remote.
 //
-//	dat9 cp local.txt /remote/path    upload
-//	dat9 cp /remote/path local.txt    download
-//	dat9 cp /remote/a /remote/b       server-side copy (zero-copy)
-//	dat9 cp - /remote/path            upload from stdin
-//	dat9 cp /remote/path -            download to stdout
+// Remote paths use a ":" prefix to distinguish from local paths:
+//
+//	dat9 cp local.txt :/remote/path    upload
+//	dat9 cp :/remote/path local.txt    download
+//	dat9 cp :/remote/a :/remote/b      server-side copy (zero-copy)
+//	dat9 cp - :/remote/path            upload from stdin
+//	dat9 cp :/remote/path -            download to stdout
 func Cp(c *client.Client, args []string) error {
 	if len(args) != 2 {
 		return fmt.Errorf("usage: dat9 cp <src> <dst>")
@@ -24,6 +26,14 @@ func Cp(c *client.Client, args []string) error {
 
 	srcRemote := isRemote(src)
 	dstRemote := isRemote(dst)
+
+	// Strip ":" prefix from remote paths for API calls
+	if srcRemote {
+		src = src[1:]
+	}
+	if dstRemote {
+		dst = dst[1:]
+	}
 
 	switch {
 	case src == "-" && dstRemote:
@@ -64,15 +74,15 @@ func Cp(c *client.Client, args []string) error {
 		return c.Copy(src, dst)
 
 	default:
-		return fmt.Errorf("at least one path must be remote (start with /)")
+		return fmt.Errorf("at least one path must be remote (use : prefix, e.g. :/path)")
 	}
 }
 
 // isRemote returns true if a path refers to a remote dat9 path.
-// Remote paths start with "/". Local paths are everything else.
+// Remote paths use a ":" prefix (e.g., ":/data/file.txt").
 func isRemote(path string) bool {
 	if path == "-" {
 		return false
 	}
-	return strings.HasPrefix(path, "/")
+	return strings.HasPrefix(path, ":")
 }

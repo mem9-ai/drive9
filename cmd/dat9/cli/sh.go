@@ -94,7 +94,8 @@ func Sh(c *client.Client, _ []string) error {
 				fmt.Fprintln(os.Stderr, "usage: cp <src> <dst>")
 				continue
 			}
-			if err := Cp(c, []string{resolve(cwd, args[0]), resolve(cwd, args[1])}); err != nil {
+			// In shell mode, all paths are remote — add ":" prefix for Cp
+			if err := Cp(c, []string{":" + resolve(cwd, args[0]), ":" + resolve(cwd, args[1])}); err != nil {
 				fmt.Fprintf(os.Stderr, "cp: %v\n", err)
 			}
 
