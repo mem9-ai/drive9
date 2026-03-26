@@ -193,9 +193,11 @@ func (s *Store) migrate() error {
 			idempotency_key    VARCHAR(255),
 			created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-			expires_at         DATETIME(3) NOT NULL
+			expires_at         DATETIME(3) NOT NULL,
+			active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED
 		)`,
 		`CREATE INDEX idx_upload_path ON uploads(target_path, status)`,
+		`CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path)`,
 		`CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)`,
 	}
 	for _, stmt := range stmts {
@@ -666,27 +668,8 @@ func (s *Store) DeleteDirRecursive(dirPath string) ([]*File, error) {
 
 // --- uploads operations ---
 
-// InsertUpload atomically checks for an active upload on the same path
-// and inserts the new upload record. This replaces the SQLite partial
-// unique index (not supported in MySQL/TiDB) with a serialized transaction.
 func (s *Store) InsertUpload(u *Upload) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	// Lock-and-check: SELECT ... FOR UPDATE prevents concurrent inserts
-	var count int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM uploads WHERE target_path = ? AND status = 'UPLOADING' FOR UPDATE`,
-		u.TargetPath).Scan(&count); err != nil {
-		return err
-	}
-	if count > 0 {
-		return ErrUploadConflict
-	}
-
-	_, err = tx.Exec(`INSERT INTO uploads
+	_, err := s.db.Exec(`INSERT INTO uploads
 		(upload_id, file_id, target_path, s3_upload_id, s3_key, total_size, part_size,
 		 parts_total, status, fingerprint_sha256, idempotency_key, created_at, updated_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -694,10 +677,10 @@ func (s *Store) InsertUpload(u *Upload) error {
 		u.TotalSize, u.PartSize, u.PartsTotal, u.Status,
 		nullStr(u.FingerprintSHA), nullStr(u.IdempotencyKey),
 		u.CreatedAt.UTC(), u.UpdatedAt.UTC(), u.ExpiresAt.UTC())
-	if err != nil {
-		return err
+	if isUniqueViolation(err) {
+		return ErrUploadConflict
 	}
-	return tx.Commit()
+	return err
 }
 
 func (s *Store) GetUpload(uploadID string) (*Upload, error) {
