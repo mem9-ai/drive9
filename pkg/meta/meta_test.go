@@ -1,0 +1,267 @@
+package meta
+
+import (
+	"fmt"
+	"os"
+	"testing"
+	"time"
+)
+
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	f, err := os.CreateTemp("", "dat9-meta-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	t.Cleanup(func() { os.Remove(f.Name()) })
+
+	s, err := Open(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+var seq int
+
+func genID() string {
+	seq++
+	return fmt.Sprintf("id-%04d", seq)
+}
+
+func TestInsertAndGetNode(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	node := &FileNode{
+		NodeID: "n1", Path: "/data/file.txt", ParentPath: "/data/",
+		Name: "file.txt", FileID: "f1", CreatedAt: now,
+	}
+	if err := s.InsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetNode("/data/file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NodeID != "n1" || got.FileID != "f1" || got.Name != "file.txt" {
+		t.Errorf("unexpected node: %+v", got)
+	}
+}
+
+func TestGetNodeNotFound(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.GetNode("/nonexistent")
+	if err != ErrNotFound {
+		t.Errorf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestInsertAndGetFile(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	f := &File{
+		FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		ContentType: "text/plain", SizeBytes: 100, Revision: 1,
+		Status: StatusConfirmed, ContentText: "hello world",
+		CreatedAt: now, ConfirmedAt: &now,
+	}
+	if err := s.InsertFile(f); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetFile("f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StorageType != StorageDB9 || got.SizeBytes != 100 || got.ContentText != "hello world" {
+		t.Errorf("unexpected file: %+v", got)
+	}
+}
+
+func TestStat(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 42, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now})
+	s.InsertNode(&FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now})
+
+	nf, err := s.Stat("/a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nf.Node.Path != "/a.txt" || nf.File == nil || nf.File.SizeBytes != 42 {
+		t.Errorf("unexpected stat: node=%+v file=%+v", nf.Node, nf.File)
+	}
+}
+
+func TestListDir(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	s.InsertNode(&FileNode{NodeID: "d1", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, CreatedAt: now})
+	s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now})
+	s.InsertNode(&FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", CreatedAt: now})
+	s.InsertNode(&FileNode{NodeID: "d2", Path: "/data/sub/", ParentPath: "/data/", Name: "sub", IsDirectory: true, CreatedAt: now})
+
+	entries, err := s.ListDir("/data/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	if entries[0].Node.Name != "a.txt" || entries[1].Node.Name != "sub" {
+		t.Errorf("unexpected entries: %+v, %+v", entries[0].Node, entries[1].Node)
+	}
+}
+
+func TestZeroCopyCp(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	s.InsertFile(&File{FileID: "f1", StorageType: StorageS3, StorageRef: "blobs/f1",
+		SizeBytes: 1000000, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now})
+	s.InsertNode(&FileNode{NodeID: "n1", Path: "/a.bin", ParentPath: "/", Name: "a.bin", FileID: "f1", CreatedAt: now})
+	s.InsertNode(&FileNode{NodeID: "n2", Path: "/b.bin", ParentPath: "/", Name: "b.bin", FileID: "f1", CreatedAt: now})
+
+	count, err := s.RefCount("f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Errorf("expected refcount 2, got %d", count)
+	}
+}
+
+func TestDeleteWithRefCount(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 50, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now})
+	s.InsertNode(&FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now})
+	s.InsertNode(&FileNode{NodeID: "n2", Path: "/b.txt", ParentPath: "/", Name: "b.txt", FileID: "f1", CreatedAt: now})
+
+	deleted, err := s.DeleteFileWithRefCheck("/a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != nil {
+		t.Error("expected nil (file should survive, refcount > 0)")
+	}
+
+	deleted, err = s.DeleteFileWithRefCheck("/b.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted == nil || deleted.Status != StatusDeleted {
+		t.Errorf("expected DELETED file record, got %+v", deleted)
+	}
+}
+
+func TestDeleteDirRecursive(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	s.InsertNode(&FileNode{NodeID: "d1", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, CreatedAt: now})
+	s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now})
+	s.InsertFile(&File{FileID: "f2", StorageType: StorageDB9, StorageRef: "/blobs/f2",
+		SizeBytes: 20, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now})
+	s.InsertNode(&FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", CreatedAt: now})
+	s.InsertNode(&FileNode{NodeID: "n2", Path: "/data/b.txt", ParentPath: "/data/", Name: "b.txt", FileID: "f2", CreatedAt: now})
+	s.InsertNode(&FileNode{NodeID: "n3", Path: "/shared.txt", ParentPath: "/", Name: "shared.txt", FileID: "f1", CreatedAt: now})
+
+	orphaned, err := s.DeleteDirRecursive("/data/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orphaned) != 1 || orphaned[0].FileID != "f2" {
+		t.Fatalf("expected 1 orphaned (f2), got %d", len(orphaned))
+	}
+
+	_, err = s.GetNode("/data/")
+	if err != ErrNotFound {
+		t.Error("expected /data/ deleted")
+	}
+	_, err = s.GetNode("/shared.txt")
+	if err != nil {
+		t.Error("expected /shared.txt to survive")
+	}
+}
+
+func TestEnsureParentDirs(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnsureParentDirs("/a/b/c/file.txt", genID); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"/a/", "/a/b/", "/a/b/c/"} {
+		n, err := s.GetNode(p)
+		if err != nil {
+			t.Errorf("expected dir at %s: %v", p, err)
+			continue
+		}
+		if !n.IsDirectory {
+			t.Errorf("expected %s to be directory", p)
+		}
+	}
+	// Idempotent
+	if err := s.EnsureParentDirs("/a/b/c/file.txt", genID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRenameFile(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	s.InsertNode(&FileNode{NodeID: "n1", Path: "/old.txt", ParentPath: "/", Name: "old.txt", FileID: "f1", CreatedAt: now})
+
+	if err := s.UpdateNodePath("/old.txt", "/new.txt", "/", "new.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetNode("/old.txt"); err != ErrNotFound {
+		t.Error("old path should be gone")
+	}
+	got, _ := s.GetNode("/new.txt")
+	if got.Name != "new.txt" || got.FileID != "f1" {
+		t.Errorf("unexpected: %+v", got)
+	}
+}
+
+func TestRenameDir(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	s.InsertNode(&FileNode{NodeID: "d1", Path: "/old/", ParentPath: "/", Name: "old", IsDirectory: true, CreatedAt: now})
+	s.InsertNode(&FileNode{NodeID: "n1", Path: "/old/a.txt", ParentPath: "/old/", Name: "a.txt", FileID: "f1", CreatedAt: now})
+	s.InsertNode(&FileNode{NodeID: "d2", Path: "/old/sub/", ParentPath: "/old/", Name: "sub", IsDirectory: true, CreatedAt: now})
+	s.InsertNode(&FileNode{NodeID: "n2", Path: "/old/sub/b.txt", ParentPath: "/old/sub/", Name: "b.txt", FileID: "f2", CreatedAt: now})
+
+	count, err := s.RenameDir("/old/", "/new/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 4 {
+		t.Errorf("expected 4 updated, got %d", count)
+	}
+	if _, err := s.GetNode("/old/"); err != ErrNotFound {
+		t.Error("/old/ should be gone")
+	}
+	for _, p := range []string{"/new/", "/new/a.txt", "/new/sub/", "/new/sub/b.txt"} {
+		if _, err := s.GetNode(p); err != nil {
+			t.Errorf("expected %s: %v", p, err)
+		}
+	}
+}
+
+func TestUpdateFileContent(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now})
+
+	if err := s.UpdateFileContent("f1", StorageDB9, "/blobs/f1-v2", "text/plain", "abc123", "new content", 42); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetFile("f1")
+	if got.Revision != 2 || got.SizeBytes != 42 || got.ContentText != "new content" {
+		t.Errorf("unexpected: %+v", got)
+	}
+}
