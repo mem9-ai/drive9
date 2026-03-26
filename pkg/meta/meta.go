@@ -197,7 +197,6 @@ func (s *Store) migrate() error {
 			active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED
 		)`,
 		`CREATE INDEX idx_upload_path ON uploads(target_path, status)`,
-		`CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path)`,
 		`CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)`,
 	}
 	for _, stmt := range stmts {
@@ -213,19 +212,16 @@ func (s *Store) migrate() error {
 		}
 	}
 
-	// Upgrade existing uploads table: add generated column if missing.
+	// Ensure active_target_path column and unique index exist.
+	// For fresh DBs the column is in CREATE TABLE; for existing DBs we ALTER.
 	if !s.columnExists("uploads", "active_target_path") {
-		upgrades := []string{
-			`ALTER TABLE uploads ADD COLUMN active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED`,
-			`CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path)`,
+		if _, err := s.db.Exec(`ALTER TABLE uploads ADD COLUMN active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED`); err != nil {
+			return fmt.Errorf("add active_target_path column: %w", err)
 		}
-		for _, stmt := range upgrades {
-			if _, err := s.db.Exec(stmt); err != nil {
-				if isDuplicateIndexError(err) {
-					continue
-				}
-				return fmt.Errorf("upgrade uploads: %w", err)
-			}
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path)`); err != nil {
+		if !isDuplicateIndexError(err) {
+			return fmt.Errorf("create idx_uploads_active: %w", err)
 		}
 	}
 
