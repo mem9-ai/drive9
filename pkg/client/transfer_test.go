@@ -44,14 +44,14 @@ func TestWriteStreamLargeFile(t *testing.T) {
 	var mu sync.Mutex
 	uploadedParts := map[int][]byte{}
 	completeCalled := false
-	var controlContentLength int64
-	var controlBodyRead bool
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/large.bin":
-			controlContentLength = r.ContentLength
-			controlBodyRead = r.Body != nil
+			if h := r.Header.Get("X-Dat9-Content-Length"); h != "8" {
+				http.Error(w, fmt.Sprintf("expected X-Dat9-Content-Length=8, got %q", h), 400)
+				return
+			}
 			// Return 202 with upload plan
 			plan := UploadPlan{
 				UploadID: "upload-123",
@@ -104,12 +104,6 @@ func TestWriteStreamLargeFile(t *testing.T) {
 	err := c.WriteStream(context.Background(), "/large.bin", bytes.NewReader(data), int64(len(data)), progress)
 	if err != nil {
 		t.Fatalf("WriteStream: %v", err)
-	}
-	if controlContentLength != int64(len(data)) {
-		t.Fatalf("control request ContentLength = %d, want %d", controlContentLength, len(data))
-	}
-	if !controlBodyRead {
-		t.Fatal("expected control request body reader to be present")
 	}
 
 	if !bytes.Equal(uploadedParts[1], []byte("12345")) {
@@ -183,11 +177,14 @@ func TestResumeUpload(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/uploads":
-			// Step 1: Return upload metadata
-			json.NewEncoder(w).Encode(UploadMeta{
-				UploadID:   "resume-456",
-				PartsTotal: 3,
-				Status:     "UPLOADING",
+			json.NewEncoder(w).Encode(struct {
+				Uploads []UploadMeta `json:"uploads"`
+			}{
+				Uploads: []UploadMeta{{
+					UploadID:   "resume-456",
+					PartsTotal: 3,
+					Status:     "UPLOADING",
+				}},
 			})
 
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-456/resume":

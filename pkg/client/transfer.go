@@ -1,16 +1,12 @@
 package client
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
-	"net/url"
 	"sync"
 
 	"github.com/mem9-ai/dat9/pkg/s3client"
@@ -55,90 +51,28 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 		return c.Write(path, data)
 	}
 
-	plan, err := c.initiateUpload(ctx, path, size)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), http.NoBody)
 	if err != nil {
 		return err
 	}
-	return c.uploadParts(ctx, *plan, r, progress)
-}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-Dat9-Content-Length", fmt.Sprintf("%d", size))
 
-// initiateUpload sends the large-file control request as a true header-only PUT.
-// net/http normalizes Content-Length to 0 when Body is http.NoBody, so the control
-// plane request is written directly to the connection.
-func (c *Client) initiateUpload(ctx context.Context, path string, size int64) (*UploadPlan, error) {
-	u, err := url.Parse(c.url(path))
+	resp, err := c.do(req)
 	if err != nil {
-		return nil, err
-	}
-
-	conn, err := dialControlConn(ctx, u)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetDeadline(deadline); err != nil {
-			return nil, err
-		}
-	}
-
-	bw := bufio.NewWriter(conn)
-	if _, err := fmt.Fprintf(bw,
-		"PUT %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\nConnection: close\r\n",
-		u.RequestURI(), u.Host, size); err != nil {
-		return nil, err
-	}
-	if c.apiKey != "" {
-		if _, err := fmt.Fprintf(bw, "Authorization: Bearer %s\r\n", c.apiKey); err != nil {
-			return nil, err
-		}
-	}
-	if _, err := bw.WriteString("\r\n"); err != nil {
-		return nil, err
-	}
-	if err := bw.Flush(); err != nil {
-		return nil, err
-	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPut})
-	if err != nil {
-		return nil, err
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusAccepted {
-		return nil, readError(resp)
+		return readError(resp)
 	}
 
 	var plan UploadPlan
 	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
-		return nil, fmt.Errorf("decode upload plan: %w", err)
+		return fmt.Errorf("decode upload plan: %w", err)
 	}
-	return &plan, nil
-}
-
-func dialControlConn(ctx context.Context, u *url.URL) (net.Conn, error) {
-	var d net.Dialer
-
-	switch u.Scheme {
-	case "http":
-		return d.DialContext(ctx, "tcp", u.Host)
-	case "https":
-		raw, err := d.DialContext(ctx, "tcp", u.Host)
-		if err != nil {
-			return nil, err
-		}
-		cfg := &tls.Config{ServerName: u.Hostname()}
-		conn := tls.Client(raw, cfg)
-		if err := conn.HandshakeContext(ctx); err != nil {
-			raw.Close()
-			return nil, err
-		}
-		return conn, nil
-	default:
-		return nil, fmt.Errorf("unsupported scheme: %s", u.Scheme)
-	}
+	return c.uploadParts(ctx, plan, r, progress)
 }
 
 // uploadParts concurrently uploads parts to presigned URLs.
@@ -354,18 +288,20 @@ func (c *Client) queryUpload(ctx context.Context, path string) (*UploadMeta, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("no active upload for %s", path)
-	}
 	if resp.StatusCode >= 300 {
 		return nil, readError(resp)
 	}
 
-	var meta UploadMeta
-	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+	var envelope struct {
+		Uploads []UploadMeta `json:"uploads"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
 		return nil, fmt.Errorf("decode upload meta: %w", err)
 	}
-	return &meta, nil
+	if len(envelope.Uploads) == 0 {
+		return nil, fmt.Errorf("no active upload for %s", path)
+	}
+	return &envelope.Uploads[0], nil
 }
 
 // requestResume asks the server to generate presigned URLs for missing parts.

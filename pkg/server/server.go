@@ -133,11 +133,16 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 }
 
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string) {
-	// Bifurcate by Content-Length: large files get 202 + presigned URLs
-	if cl := r.ContentLength; cl > 0 && s.backend.IsLargeFile(cl) {
+	// Bifurcate by size. Prefer X-Dat9-Content-Length because Go's net/http
+	// normalizes Content-Length to 0 when the request body is http.NoBody.
+	cl := r.ContentLength
+	if h := r.Header.Get("X-Dat9-Content-Length"); h != "" {
+		cl, _ = strconv.ParseInt(h, 10, 64)
+	}
+	if cl > 0 && s.backend.IsLargeFile(cl) {
 		plan, err := s.backend.InitiateUpload(r.Context(), path, cl)
 		if err != nil {
-			if errors.Is(err, meta.ErrPathConflict) {
+			if errors.Is(err, meta.ErrUploadConflict) {
 				errJSON(w, http.StatusConflict, err.Error())
 				return
 			}
@@ -288,20 +293,28 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(uploads) == 0 {
-		errJSON(w, http.StatusNotFound, meta.ErrNotFound.Error())
-		return
+	type uploadEntry struct {
+		UploadID  string `json:"upload_id"`
+		Path      string `json:"path"`
+		TotalSize int64  `json:"total_size"`
+		Status    string `json:"status"`
+		CreatedAt string `json:"created_at"`
+		ExpiresAt string `json:"expires_at"`
 	}
-	u := uploads[0]
+	result := make([]uploadEntry, 0, len(uploads))
+	for _, u := range uploads {
+		result = append(result, uploadEntry{
+			UploadID:  u.UploadID,
+			Path:      u.TargetPath,
+			TotalSize: u.TotalSize,
+			Status:    string(u.Status),
+			CreatedAt: u.CreatedAt.Format("2006-01-02T15:04:05.000Z07:00"),
+			ExpiresAt: u.ExpiresAt.Format("2006-01-02T15:04:05.000Z07:00"),
+		})
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"upload_id":   u.UploadID,
-		"key":         u.S3Key,
-		"parts_total": u.PartsTotal,
-		"status":      string(u.Status),
-		"created_at":  u.CreatedAt.Format("2006-01-02T15:04:05.000Z07:00"),
-		"expires_at":  u.ExpiresAt.Format("2006-01-02T15:04:05.000Z07:00"),
-	})
+	json.NewEncoder(w).Encode(map[string]interface{}{"uploads": result})
 }
 
 // handleUploadAction handles /v1/uploads/{id}/complete, /v1/uploads/{id}/resume, DELETE /v1/uploads/{id}
