@@ -623,14 +623,17 @@ func parsePartChecksumsHeader(raw string) ([]string, error) {
 	}
 	parts := strings.Split(raw, ",")
 	out := make([]string, 0, len(parts))
-	for _, p := range parts {
+	for i, p := range parts {
 		v := strings.TrimSpace(p)
 		if v == "" {
-			return nil, fmt.Errorf("invalid X-Dat9-Part-Checksums header")
+			return nil, fmt.Errorf("invalid X-Dat9-Part-Checksums header: empty value at index %d", i)
 		}
 		decoded, err := base64.StdEncoding.DecodeString(v)
-		if err != nil || len(decoded) != 32 {
-			return nil, fmt.Errorf("invalid X-Dat9-Part-Checksums header")
+		if err != nil {
+			return nil, fmt.Errorf("invalid X-Dat9-Part-Checksums header: invalid base64 at index %d", i)
+		}
+		if len(decoded) != 32 {
+			return nil, fmt.Errorf("invalid X-Dat9-Part-Checksums header: decoded length %d at index %d, expected 32", len(decoded), i)
 		}
 		out = append(out, v)
 	}

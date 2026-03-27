@@ -63,7 +63,7 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 	req.Header.Set("X-Dat9-Content-Length", fmt.Sprintf("%d", size))
 	ra, ok := r.(io.ReaderAt)
 	if !ok {
-		return fmt.Errorf("large uploads require a seekable reader")
+		return fmt.Errorf("large uploads require an io.ReaderAt (seekable source) to compute per-part checksums")
 	}
 	checksums, err := computePartChecksumsFromReaderAt(ra, size, s3client.PartSize)
 	if err != nil {

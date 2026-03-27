@@ -396,3 +396,20 @@ func TestAbortUploadEndpoint(t *testing.T) {
 		t.Errorf("expected ABORTED, got %s", upload.Status)
 	}
 }
+
+func TestParsePartChecksumsHeaderValidation(t *testing.T) {
+	if _, err := parsePartChecksumsHeader(""); err != nil {
+		t.Fatalf("empty header should be allowed: %v", err)
+	}
+
+	_, err := parsePartChecksumsHeader("not-base64")
+	if err == nil || !strings.Contains(err.Error(), "invalid base64") {
+		t.Fatalf("expected base64 error, got %v", err)
+	}
+
+	short := base64.StdEncoding.EncodeToString([]byte("short"))
+	_, err = parsePartChecksumsHeader(short)
+	if err == nil || !strings.Contains(err.Error(), "expected 32") {
+		t.Fatalf("expected decoded length error, got %v", err)
+	}
+}
