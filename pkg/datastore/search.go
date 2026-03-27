@@ -88,6 +88,9 @@ func rrfMerge(fts, vec []SearchResult, limit int) []SearchResult {
 }
 
 func subtreeCond(prefix string) (string, []any) {
+	if prefix != "/" {
+		prefix = strings.TrimRight(prefix, "/")
+	}
 	return "(fn.path = ? OR fn.path LIKE ?)", []any{prefix, prefix + "/%"}
 }
 
