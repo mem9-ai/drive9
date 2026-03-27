@@ -15,7 +15,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/mem9-ai/dat9/cmd/dat9/cli"
 )
@@ -59,43 +58,36 @@ func runFS(args []string) {
 	}
 	sub := args[0]
 	rest := args[1:]
+	c := cli.NewFromEnv()
 
+	var err error
 	switch sub {
 	case "cp":
-		c := cli.NewFromEnv()
-		if err := cli.Cp(c, rest); err != nil {
-			fatal("fs cp", err)
-		}
-	case "cat", "ls", "stat", "mv", "rm", "sh", "grep", "find":
-		ctxName, rest := extractContext(rest)
-		c := cli.NewClientForContext(ctxName)
-		var err error
-		switch sub {
-		case "cat":
-			err = cli.Cat(c, rest)
-		case "ls":
-			err = cli.Ls(c, rest)
-		case "stat":
-			err = cli.Stat(c, rest)
-		case "mv":
-			err = cli.Mv(c, rest)
-		case "rm":
-			err = cli.Rm(c, rest)
-		case "sh":
-			err = cli.Sh(c, rest)
-		case "grep":
-			err = cli.Grep(c, rest)
-		case "find":
-			err = cli.Find(c, rest)
-		}
-		if err != nil {
-			fatal("fs "+sub, err)
-		}
+		err = cli.Cp(c, rest)
+	case "cat":
+		err = cli.Cat(c, rest)
+	case "ls":
+		err = cli.Ls(c, rest)
+	case "stat":
+		err = cli.Stat(c, rest)
+	case "mv":
+		err = cli.Mv(c, rest)
+	case "rm":
+		err = cli.Rm(c, rest)
+	case "sh":
+		err = cli.Sh(c, rest)
+	case "grep":
+		err = cli.Grep(c, rest)
+	case "find":
+		err = cli.Find(c, rest)
 	case "-h", "-help", "help":
 		fsUsage()
 	default:
 		fmt.Fprintf(os.Stderr, "dat9 fs: unknown command %q\n", sub)
 		fsUsage()
+	}
+	if err != nil {
+		fatal("fs "+sub, err)
 	}
 }
 
@@ -118,32 +110,6 @@ func runDB(args []string) {
 		fmt.Fprintf(os.Stderr, "dat9 db: unknown command %q\n", sub)
 		dbUsage()
 	}
-}
-
-func extractContext(args []string) (string, []string) {
-	ctxName := ""
-	for i, arg := range args {
-		if strings.HasPrefix(arg, "-") {
-			continue
-		}
-		idx := strings.Index(arg, ":/")
-		if idx < 0 || idx == 1 {
-			continue
-		}
-		name := ""
-		if idx > 0 {
-			name = arg[:idx]
-		}
-		if name != "" && ctxName != "" && ctxName != name {
-			fmt.Fprintf(os.Stderr, "error: conflicting contexts: %s vs %s\n", ctxName, name)
-			os.Exit(1)
-		}
-		if name != "" {
-			ctxName = name
-		}
-		args[i] = arg[idx+1:]
-	}
-	return ctxName, args
 }
 
 func fatal(cmd string, err error) {
