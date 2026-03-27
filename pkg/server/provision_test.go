@@ -109,10 +109,15 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	tenantID := out["id"]
-	if tenantID == "" {
-		t.Fatal("empty id")
+	apiKey := out["api_key"]
+	if apiKey == "" {
+		t.Fatal("empty api_key")
 	}
+	resolved, err := metaStore.ResolveByAPIKeyHash(tenant.HashToken(apiKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID := resolved.Tenant.ID
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -205,9 +210,14 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if out["id"] == "" || out["api_key"] == "" {
+	if out["api_key"] == "" {
 		t.Fatalf("unexpected provision response: %+v", out)
 	}
+	resolved, err := metaStore.ResolveByAPIKeyHash(tenant.HashToken(out["api_key"]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID := resolved.Tenant.ID
 	if out["status"] != string(meta.TenantProvisioning) {
 		t.Fatalf("expected provisioning response status, got %q", out["status"])
 	}
@@ -215,7 +225,7 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	var status, provider, clusterID string
 	for {
-		row := metaStore.DB().QueryRow("SELECT status, provider, cluster_id FROM tenants WHERE id = ?", out["id"])
+		row := metaStore.DB().QueryRow("SELECT status, provider, cluster_id FROM tenants WHERE id = ?", tenantID)
 		if err := row.Scan(&status, &provider, &clusterID); err != nil {
 			t.Fatal(err)
 		}

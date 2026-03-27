@@ -68,9 +68,9 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	mux.Handle("/v1/fs/", business)
 	mux.Handle("/v1/uploads", business)
-	mux.Handle("/v1/uploads/", business)
+	mux.Handle("/v1/uploads/", business)l
 	mux.Handle("/v1/sql", business)
-	mux.HandleFunc("/v1/tenant/status", s.handleTenantStatus)
+	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
 
 	local := cfg.LocalS3
@@ -223,12 +223,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"id":         resolved.Tenant.ID,
-		"status":     string(resolved.Tenant.Status),
-		"provider":   resolved.Tenant.Provider,
-		"updated_at": resolved.Tenant.UpdatedAt.UTC().Format(time.RFC3339Nano),
-	})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": string(resolved.Tenant.Status)})
 }
 
 func backendFromRequest(r *http.Request) *backend.Dat9Backend {
@@ -702,10 +697,8 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"id":         tenantID,
-		"api_key":    token,
-		"api_key_id": apiKeyID,
-		"status":     string(meta.TenantProvisioning),
+		"api_key": token,
+		"status":  string(meta.TenantProvisioning),
 	})
 }
 

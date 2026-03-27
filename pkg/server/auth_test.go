@@ -186,7 +186,7 @@ func TestTenantStatusWithValidKey(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/tenant/status", nil)
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -200,7 +200,7 @@ func TestTenantStatusWithValidKey(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if out["id"] == "" || out["status"] != string(meta.TenantActive) {
+	if len(out) != 1 || out["status"] != string(meta.TenantActive) {
 		t.Fatalf("unexpected tenant status response: %+v", out)
 	}
 }
@@ -214,7 +214,7 @@ func TestTenantStatusReturnsProvisioningState(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/tenant/status", nil)
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -228,7 +228,7 @@ func TestTenantStatusReturnsProvisioningState(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if out["status"] != string(meta.TenantProvisioning) {
+	if len(out) != 1 || out["status"] != string(meta.TenantProvisioning) {
 		t.Fatalf("expected provisioning status, got %+v", out)
 	}
 }
