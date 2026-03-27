@@ -47,6 +47,7 @@ Use this value unless the environment owner announces a new endpoint.
 9. `copy`, `rename`, `delete`
 10. Final `list` verifies expected structure after mutations
 11. Large multipart upload (`PUT` plan + presigned part uploads + complete + download checksum)
+12. Upload-limit boundary (`1GiB` initiate accepted, `1GiB+1` rejected)
 
 ### `api-smoke-test-existing-key.sh`
 
@@ -62,6 +63,7 @@ Use this value unless the environment owner announces a new endpoint.
 4. CLI batch small-file flow (`cp` many files + dir list count + stat + sample reads)
 5. CLI search/DB flow (`fs grep`, `fs find`, `db sql`)
 6. CLI large-file flow (`cp` upload multipart + `cp` download + checksum verification)
+7. CLI upload-limit boundary (`1GiB` initiate accepted, `1GiB+1` rejected)
 
 ## Environment variables
 
@@ -76,10 +78,14 @@ Use this value unless the environment owner announces a new endpoint.
 | `BATCH_SMALL_FILE_COUNT` | `10` | `api-smoke-test.sh` |
 | `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh` |
 | `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh` |
+| `RUN_UPLOAD_LIMIT_BOUNDARY` | `1` | `api-smoke-test.sh` |
+| `UPLOAD_LIMIT_BYTES` | `1073741824` | `api-smoke-test.sh` |
 | `CLI_LARGE_FILE_MB` | `100` | `cli-smoke-test.sh` |
 | `CLI_BATCH_SMALL_FILE_COUNT` | `10` | `cli-smoke-test.sh` |
 | `CLI_MAX_RETRIES` | `8` | `cli-smoke-test.sh` |
 | `CLI_RETRY_SLEEP_S` | `2` | `cli-smoke-test.sh` |
+| `RUN_CLI_UPLOAD_LIMIT_BOUNDARY` | `1` | `cli-smoke-test.sh` |
+| `CLI_UPLOAD_LIMIT_BYTES` | `1073741824` | `cli-smoke-test.sh` |
 
 ## Conventions
 
