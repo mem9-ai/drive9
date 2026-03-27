@@ -99,7 +99,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	w.Write(data)
+	_, _ = w.Write(data)
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string) {
@@ -129,7 +129,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	_ = json.NewEncoder(w).Encode(result)
 }
 
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string) {
@@ -151,7 +151,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(plan)
+		_ = json.NewEncoder(w).Encode(plan)
 		return
 	}
 
@@ -170,7 +170,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	}
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string) {
@@ -218,7 +218,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 	}
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath string) {
@@ -238,7 +238,7 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 	}
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath string) {
@@ -258,7 +258,7 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 	}
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string) {
@@ -267,7 +267,7 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // handleUploads handles GET /v1/uploads?path=...&status=...
@@ -316,7 +316,7 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"uploads": result})
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"uploads": result})
 }
 
 // handleUploadAction handles /v1/uploads/{id}/complete, /v1/uploads/{id}/resume, DELETE /v1/uploads/{id}
@@ -365,7 +365,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uploadID string) {
@@ -387,7 +387,7 @@ func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uplo
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(plan)
+	_ = json.NewEncoder(w).Encode(plan)
 }
 
 func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploadID string) {
@@ -400,13 +400,13 @@ func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploa
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func errJSON(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 // ListenAndServe starts the server on the given address.

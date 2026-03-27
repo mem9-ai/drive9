@@ -16,10 +16,10 @@ import (
 // LocalS3Client implements S3Client using the local filesystem.
 // Used for testing and development without real S3.
 type LocalS3Client struct {
-	rootDir  string
-	baseURL  string // base URL for presigned URLs (e.g. "http://localhost:9091/s3")
-	mu       sync.Mutex
-	uploads  map[string]*localUpload // uploadID → upload state
+	rootDir string
+	baseURL string // base URL for presigned URLs (e.g. "http://localhost:9091/s3")
+	mu      sync.Mutex
+	uploads map[string]*localUpload // uploadID → upload state
 }
 
 type localUpload struct {
@@ -133,7 +133,7 @@ func (c *LocalS3Client) CompleteMultipartUpload(ctx context.Context, key, upload
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	for _, p := range sorted {
 		partFile := c.partPath(upload.key, uploadID, p.Number)
@@ -148,7 +148,7 @@ func (c *LocalS3Client) CompleteMultipartUpload(ctx context.Context, key, upload
 
 	// Cleanup parts
 	partsDir := filepath.Join(c.rootDir, "parts", uploadID)
-	os.RemoveAll(partsDir)
+	_ = os.RemoveAll(partsDir)
 
 	c.mu.Lock()
 	delete(c.uploads, uploadID)
@@ -159,7 +159,7 @@ func (c *LocalS3Client) CompleteMultipartUpload(ctx context.Context, key, upload
 
 func (c *LocalS3Client) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
 	partsDir := filepath.Join(c.rootDir, "parts", uploadID)
-	os.RemoveAll(partsDir)
+	_ = os.RemoveAll(partsDir)
 
 	c.mu.Lock()
 	delete(c.uploads, uploadID)

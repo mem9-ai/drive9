@@ -450,10 +450,10 @@ func (b *Dat9Backend) readBlob(ref string) ([]byte, error) {
 func (b *Dat9Backend) deleteBlob(ref string) {
 	if b.s3 != nil && !strings.HasPrefix(ref, "/blobs/") {
 		// S3 key (e.g. "blobs/ULID") — delete from S3
-		b.s3.DeleteObject(context.Background(), ref)
+		_ = b.s3.DeleteObject(context.Background(), ref)
 		return
 	}
-	os.Remove(b.blobPath(ref))
+	_ = os.Remove(b.blobPath(ref))
 }
 
 // --- writeCloser ---

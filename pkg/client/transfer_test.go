@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
@@ -72,7 +73,7 @@ func TestWriteStreamLargeFile(t *testing.T) {
 			plan.Parts[0].URL = fmt.Sprintf("http://%s/parts/1", r.Host)
 			plan.Parts[1].URL = fmt.Sprintf("http://%s/parts/2", r.Host)
 			w.WriteHeader(http.StatusAccepted)
-			json.NewEncoder(w).Encode(plan)
+			_ = json.NewEncoder(w).Encode(plan)
 
 		case r.Method == http.MethodPut && r.URL.Path == "/parts/1":
 			data, _ := io.ReadAll(r.Body)
@@ -130,7 +131,7 @@ func TestWriteStreamLargeFile(t *testing.T) {
 // TestReadStreamSmallFile verifies direct read for small files.
 func TestReadStreamSmallFile(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("small content"))
+		_, _ = w.Write([]byte("small content"))
 	}))
 	defer srv.Close()
 
@@ -139,7 +140,7 @@ func TestReadStreamSmallFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadStream: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	data, _ := io.ReadAll(rc)
 	if string(data) != "small content" {
@@ -156,7 +157,7 @@ func TestReadStreamLargeFile(t *testing.T) {
 			w.Header().Set("Location", fmt.Sprintf("http://%s/s3/presigned", r.Host))
 			w.WriteHeader(http.StatusFound)
 		case "/s3/presigned":
-			w.Write([]byte("large content from S3"))
+			_, _ = w.Write([]byte("large content from S3"))
 		}
 	}))
 	defer srv.Close()
@@ -166,7 +167,7 @@ func TestReadStreamLargeFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadStream: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	data, _ := io.ReadAll(rc)
 	if string(data) != "large content from S3" {
@@ -184,7 +185,7 @@ func TestResumeUpload(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/uploads":
-			json.NewEncoder(w).Encode(struct {
+			_ = json.NewEncoder(w).Encode(struct {
 				Uploads []UploadMeta `json:"uploads"`
 			}{
 				Uploads: []UploadMeta{{
@@ -203,7 +204,7 @@ func TestResumeUpload(t *testing.T) {
 					{Number: 2, URL: fmt.Sprintf("http://%s/parts/2", r.Host), Size: 4},
 				},
 			}
-			json.NewEncoder(w).Encode(plan)
+			_ = json.NewEncoder(w).Encode(plan)
 
 		case r.Method == http.MethodPut && r.URL.Path == "/parts/2":
 			data, _ := io.ReadAll(r.Body)
@@ -251,30 +252,24 @@ func TestResumeUpload(t *testing.T) {
 }
 
 func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
-	dbFile, err := os.CreateTemp("", "dat9-client-*.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dbFile.Close()
-	defer os.Remove(dbFile.Name())
-
 	blobDir, err := os.MkdirTemp("", "dat9-client-blobs-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(blobDir)
+	defer func() { _ = os.RemoveAll(blobDir) }()
 
 	s3Dir, err := os.MkdirTemp("", "dat9-client-s3-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(s3Dir)
+	defer func() { _ = os.RemoveAll(s3Dir) }()
 
-	store, err := meta.Open(dbFile.Name())
+	store, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	testmysql.ResetDB(t, store.DB())
+	defer func() { _ = store.Close() }()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -284,18 +279,18 @@ func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
 	baseURL := "http://" + ln.Addr().String()
 	s3c, err := s3client.NewLocal(s3Dir, baseURL+"/s3")
 	if err != nil {
-		ln.Close()
+		_ = ln.Close()
 		t.Fatal(err)
 	}
 
 	b, err := backend.NewWithS3(store, blobDir, s3c)
 	if err != nil {
-		ln.Close()
+		_ = ln.Close()
 		t.Fatal(err)
 	}
 
 	ts := httptest.NewUnstartedServer(srvpkg.New(b))
-	ts.Listener.Close()
+	_ = ts.Listener.Close()
 	ts.Listener = ln
 	ts.Start()
 	defer ts.Close()
@@ -314,7 +309,7 @@ func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("initiate upload: expected 202, got %d", resp.StatusCode)
 	}
@@ -336,7 +331,7 @@ func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("upload part 1: expected 200, got %d", resp.StatusCode)
 	}

@@ -17,14 +17,14 @@ func newTestBackend(t *testing.T) *Dat9Backend {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(blobDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(blobDir) })
 
 	store, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
 	testmysql.ResetDB(t, store.DB())
-	t.Cleanup(func() { store.Close() })
+	t.Cleanup(func() { _ = store.Close() })
 
 	b, err := New(store, blobDir)
 	if err != nil {
@@ -69,8 +69,12 @@ func TestWriteAndRead(t *testing.T) {
 
 func TestWriteOverwrite(t *testing.T) {
 	b := newTestBackend(t)
-	b.Write("/f.txt", []byte("old"), 0, filesystem.WriteFlagCreate)
-	b.Write("/f.txt", []byte("new"), 0, filesystem.WriteFlagTruncate)
+	if _, err := b.Write("/f.txt", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/f.txt", []byte("new"), 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
 	data, _ := b.Read("/f.txt", 0, -1)
 	if string(data) != "new" {
 		t.Errorf("got %q", data)
@@ -79,8 +83,12 @@ func TestWriteOverwrite(t *testing.T) {
 
 func TestWriteAppend(t *testing.T) {
 	b := newTestBackend(t)
-	b.Write("/f.txt", []byte("hello"), 0, filesystem.WriteFlagCreate)
-	b.Write("/f.txt", []byte(" world"), 0, filesystem.WriteFlagAppend)
+	if _, err := b.Write("/f.txt", []byte("hello"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/f.txt", []byte(" world"), 0, filesystem.WriteFlagAppend); err != nil {
+		t.Fatal(err)
+	}
 	data, _ := b.Read("/f.txt", 0, -1)
 	if string(data) != "hello world" {
 		t.Errorf("got %q", data)
@@ -89,7 +97,9 @@ func TestWriteAppend(t *testing.T) {
 
 func TestReadWithOffset(t *testing.T) {
 	b := newTestBackend(t)
-	b.Write("/f.txt", []byte("hello world"), 0, filesystem.WriteFlagCreate)
+	if _, err := b.Write("/f.txt", []byte("hello world"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
 	data, _ := b.Read("/f.txt", 6, 5)
 	if string(data) != "world" {
 		t.Errorf("got %q", data)
@@ -98,9 +108,15 @@ func TestReadWithOffset(t *testing.T) {
 
 func TestMkdirAndReadDir(t *testing.T) {
 	b := newTestBackend(t)
-	b.Mkdir("/data", 0o755)
-	b.Write("/data/a.txt", []byte("a"), 0, filesystem.WriteFlagCreate)
-	b.Write("/data/b.txt", []byte("bb"), 0, filesystem.WriteFlagCreate)
+	if err := b.Mkdir("/data", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/data/a.txt", []byte("a"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/data/b.txt", []byte("bb"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
 
 	entries, err := b.ReadDir("/data/")
 	if err != nil {
@@ -116,7 +132,9 @@ func TestMkdirAndReadDir(t *testing.T) {
 
 func TestRemove(t *testing.T) {
 	b := newTestBackend(t)
-	b.Write("/f.txt", []byte("data"), 0, filesystem.WriteFlagCreate)
+	if _, err := b.Write("/f.txt", []byte("data"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
 	if err := b.Remove("/f.txt"); err != nil {
 		t.Fatal(err)
 	}
@@ -128,9 +146,15 @@ func TestRemove(t *testing.T) {
 
 func TestRemoveAll(t *testing.T) {
 	b := newTestBackend(t)
-	b.Mkdir("/data", 0o755)
-	b.Write("/data/a.txt", []byte("a"), 0, filesystem.WriteFlagCreate)
-	b.Write("/data/b.txt", []byte("b"), 0, filesystem.WriteFlagCreate)
+	if err := b.Mkdir("/data", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/data/a.txt", []byte("a"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/data/b.txt", []byte("b"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
 	if err := b.RemoveAll("/data/"); err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +166,9 @@ func TestRemoveAll(t *testing.T) {
 
 func TestRename(t *testing.T) {
 	b := newTestBackend(t)
-	b.Write("/old.txt", []byte("data"), 0, filesystem.WriteFlagCreate)
+	if _, err := b.Write("/old.txt", []byte("data"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
 	if err := b.Rename("/old.txt", "/new.txt"); err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +183,9 @@ func TestRename(t *testing.T) {
 
 func TestZeroCopyCp(t *testing.T) {
 	b := newTestBackend(t)
-	b.Write("/a.txt", []byte("shared"), 0, filesystem.WriteFlagCreate)
+	if _, err := b.Write("/a.txt", []byte("shared"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
 	if err := b.CopyFile("/a.txt", "/b.txt"); err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +195,9 @@ func TestZeroCopyCp(t *testing.T) {
 		t.Error("content mismatch")
 	}
 	// Delete one, other survives
-	b.Remove("/a.txt")
+	if err := b.Remove("/a.txt"); err != nil {
+		t.Fatal(err)
+	}
 	dataB, err := b.Read("/b.txt", 0, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -179,7 +209,9 @@ func TestZeroCopyCp(t *testing.T) {
 
 func TestAutoCreateParentDirs(t *testing.T) {
 	b := newTestBackend(t)
-	b.Write("/a/b/c/file.txt", []byte("deep"), 0, filesystem.WriteFlagCreate)
+	if _, err := b.Write("/a/b/c/file.txt", []byte("deep"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
 	for _, p := range []string{"/a/", "/a/b/", "/a/b/c/"} {
 		info, err := b.Stat(p)
 		if err != nil {
@@ -195,7 +227,9 @@ func TestAutoCreateParentDirs(t *testing.T) {
 func TestEnsureParentDirsNoRootSelfInsert(t *testing.T) {
 	b := newTestBackend(t)
 	// Creating a file at root level should not insert "/" as a child of itself
-	b.Write("/top.txt", []byte("x"), 0, filesystem.WriteFlagCreate)
+	if _, err := b.Write("/top.txt", []byte("x"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
 	entries, err := b.ReadDir("/")
 	if err != nil {
 		t.Fatal(err)
@@ -209,9 +243,13 @@ func TestEnsureParentDirsNoRootSelfInsert(t *testing.T) {
 
 func TestOffsetWritePreservesTail(t *testing.T) {
 	b := newTestBackend(t)
-	b.Write("/f.txt", []byte("ABCDEFGH"), 0, filesystem.WriteFlagCreate)
+	if _, err := b.Write("/f.txt", []byte("ABCDEFGH"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
 	// Overwrite bytes 2-4 with "XY", should preserve tail "EFGH"
-	b.Write("/f.txt", []byte("XY"), 2, 0)
+	if _, err := b.Write("/f.txt", []byte("XY"), 2, 0); err != nil {
+		t.Fatal(err)
+	}
 	data, err := b.Read("/f.txt", 0, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -223,8 +261,12 @@ func TestOffsetWritePreservesTail(t *testing.T) {
 
 func TestRenameDirUpdatesName(t *testing.T) {
 	b := newTestBackend(t)
-	b.Mkdir("/alpha", 0o755)
-	b.Write("/alpha/file.txt", []byte("data"), 0, filesystem.WriteFlagCreate)
+	if err := b.Mkdir("/alpha", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/alpha/file.txt", []byte("data"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
 	if err := b.Rename("/alpha/", "/beta/"); err != nil {
 		t.Fatal(err)
 	}
@@ -239,8 +281,12 @@ func TestRenameDirUpdatesName(t *testing.T) {
 
 func TestRenameDirEnsuresParentDirs(t *testing.T) {
 	b := newTestBackend(t)
-	b.Mkdir("/src", 0o755)
-	b.Write("/src/file.txt", []byte("data"), 0, filesystem.WriteFlagCreate)
+	if err := b.Mkdir("/src", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/src/file.txt", []byte("data"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
 	// Rename to a deeply nested path whose parents don't exist
 	if err := b.Rename("/src/", "/x/y/dst/"); err != nil {
 		t.Fatal(err)
@@ -268,18 +314,35 @@ func TestRenameDirEnsuresParentDirs(t *testing.T) {
 
 func TestOpenAndOpenWrite(t *testing.T) {
 	b := newTestBackend(t)
-	b.Write("/f.txt", []byte("content"), 0, filesystem.WriteFlagCreate)
+	if _, err := b.Write("/f.txt", []byte("content"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
 
-	rc, _ := b.Open("/f.txt")
-	data, _ := io.ReadAll(rc)
-	rc.Close()
+	rc, err := b.Open("/f.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if string(data) != "content" {
 		t.Errorf("got %q", data)
 	}
 
-	wc, _ := b.OpenWrite("/f.txt")
-	wc.Write([]byte("new content"))
-	wc.Close()
+	wc, err := b.OpenWrite("/f.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wc.Write([]byte("new content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wc.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	readData, _ := b.Read("/f.txt", 0, -1)
 	if string(readData) != "new content" {

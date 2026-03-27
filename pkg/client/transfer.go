@@ -62,7 +62,7 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusAccepted {
 		return readError(resp)
@@ -154,7 +154,7 @@ func (c *Client) uploadOnePart(ctx context.Context, url string, data []byte) (st
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
@@ -177,7 +177,7 @@ func (c *Client) completeUpload(ctx context.Context, uploadID string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
 		return readError(resp)
@@ -209,7 +209,7 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 	switch {
 	case resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusTemporaryRedirect:
 		// Large file: follow presigned URL
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		location := resp.Header.Get("Location")
 		if location == "" {
 			return nil, fmt.Errorf("302 without Location header")
@@ -223,13 +223,13 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 			return nil, err
 		}
 		if resp2.StatusCode >= 300 {
-			defer resp2.Body.Close()
+			defer func() { _ = resp2.Body.Close() }()
 			return nil, readError(resp2)
 		}
 		return resp2.Body, nil
 
 	case resp.StatusCode >= 300:
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		return nil, readError(resp)
 
 	default:
@@ -286,7 +286,7 @@ func (c *Client) queryUpload(ctx context.Context, path string) (*UploadMeta, err
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
 		return nil, readError(resp)
@@ -315,7 +315,7 @@ func (c *Client) requestResume(ctx context.Context, uploadID string) (*UploadPla
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusGone {
 		return nil, fmt.Errorf("upload %s has expired", uploadID)

@@ -15,7 +15,7 @@ func newTestStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	testmysql.ResetDB(t, s.DB())
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
@@ -77,9 +77,13 @@ func TestInsertAndGetFile(t *testing.T) {
 func TestStat(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
-		SizeBytes: 42, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now})
-	s.InsertNode(&FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now})
+	if err := s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 42, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(&FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
 
 	nf, err := s.Stat("/a.txt")
 	if err != nil {
@@ -93,11 +97,19 @@ func TestStat(t *testing.T) {
 func TestListDir(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	s.InsertNode(&FileNode{NodeID: "d1", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, CreatedAt: now})
-	s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
-		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now})
-	s.InsertNode(&FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", CreatedAt: now})
-	s.InsertNode(&FileNode{NodeID: "d2", Path: "/data/sub/", ParentPath: "/data/", Name: "sub", IsDirectory: true, CreatedAt: now})
+	if err := s.InsertNode(&FileNode{NodeID: "d1", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(&FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(&FileNode{NodeID: "d2", Path: "/data/sub/", ParentPath: "/data/", Name: "sub", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
 
 	entries, err := s.ListDir("/data/")
 	if err != nil {
@@ -114,10 +126,16 @@ func TestListDir(t *testing.T) {
 func TestZeroCopyCp(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	s.InsertFile(&File{FileID: "f1", StorageType: StorageS3, StorageRef: "blobs/f1",
-		SizeBytes: 1000000, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now})
-	s.InsertNode(&FileNode{NodeID: "n1", Path: "/a.bin", ParentPath: "/", Name: "a.bin", FileID: "f1", CreatedAt: now})
-	s.InsertNode(&FileNode{NodeID: "n2", Path: "/b.bin", ParentPath: "/", Name: "b.bin", FileID: "f1", CreatedAt: now})
+	if err := s.InsertFile(&File{FileID: "f1", StorageType: StorageS3, StorageRef: "blobs/f1",
+		SizeBytes: 1000000, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(&FileNode{NodeID: "n1", Path: "/a.bin", ParentPath: "/", Name: "a.bin", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(&FileNode{NodeID: "n2", Path: "/b.bin", ParentPath: "/", Name: "b.bin", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
 
 	count, err := s.RefCount("f1")
 	if err != nil {
@@ -131,10 +149,16 @@ func TestZeroCopyCp(t *testing.T) {
 func TestDeleteWithRefCount(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
-		SizeBytes: 50, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now})
-	s.InsertNode(&FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now})
-	s.InsertNode(&FileNode{NodeID: "n2", Path: "/b.txt", ParentPath: "/", Name: "b.txt", FileID: "f1", CreatedAt: now})
+	if err := s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 50, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(&FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(&FileNode{NodeID: "n2", Path: "/b.txt", ParentPath: "/", Name: "b.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
 
 	deleted, err := s.DeleteFileWithRefCheck("/a.txt")
 	if err != nil {
@@ -156,14 +180,26 @@ func TestDeleteWithRefCount(t *testing.T) {
 func TestDeleteDirRecursive(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	s.InsertNode(&FileNode{NodeID: "d1", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, CreatedAt: now})
-	s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
-		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now})
-	s.InsertFile(&File{FileID: "f2", StorageType: StorageDB9, StorageRef: "/blobs/f2",
-		SizeBytes: 20, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now})
-	s.InsertNode(&FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", CreatedAt: now})
-	s.InsertNode(&FileNode{NodeID: "n2", Path: "/data/b.txt", ParentPath: "/data/", Name: "b.txt", FileID: "f2", CreatedAt: now})
-	s.InsertNode(&FileNode{NodeID: "n3", Path: "/shared.txt", ParentPath: "/", Name: "shared.txt", FileID: "f1", CreatedAt: now})
+	if err := s.InsertNode(&FileNode{NodeID: "d1", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertFile(&File{FileID: "f2", StorageType: StorageDB9, StorageRef: "/blobs/f2",
+		SizeBytes: 20, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(&FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(&FileNode{NodeID: "n2", Path: "/data/b.txt", ParentPath: "/data/", Name: "b.txt", FileID: "f2", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(&FileNode{NodeID: "n3", Path: "/shared.txt", ParentPath: "/", Name: "shared.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
 
 	orphaned, err := s.DeleteDirRecursive("/data/")
 	if err != nil {
@@ -207,7 +243,9 @@ func TestEnsureParentDirs(t *testing.T) {
 func TestRenameFile(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	s.InsertNode(&FileNode{NodeID: "n1", Path: "/old.txt", ParentPath: "/", Name: "old.txt", FileID: "f1", CreatedAt: now})
+	if err := s.InsertNode(&FileNode{NodeID: "n1", Path: "/old.txt", ParentPath: "/", Name: "old.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := s.UpdateNodePath("/old.txt", "/new.txt", "/", "new.txt"); err != nil {
 		t.Fatal(err)
@@ -224,10 +262,18 @@ func TestRenameFile(t *testing.T) {
 func TestRenameDir(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	s.InsertNode(&FileNode{NodeID: "d1", Path: "/old/", ParentPath: "/", Name: "old", IsDirectory: true, CreatedAt: now})
-	s.InsertNode(&FileNode{NodeID: "n1", Path: "/old/a.txt", ParentPath: "/old/", Name: "a.txt", FileID: "f1", CreatedAt: now})
-	s.InsertNode(&FileNode{NodeID: "d2", Path: "/old/sub/", ParentPath: "/old/", Name: "sub", IsDirectory: true, CreatedAt: now})
-	s.InsertNode(&FileNode{NodeID: "n2", Path: "/old/sub/b.txt", ParentPath: "/old/sub/", Name: "b.txt", FileID: "f2", CreatedAt: now})
+	if err := s.InsertNode(&FileNode{NodeID: "d1", Path: "/old/", ParentPath: "/", Name: "old", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(&FileNode{NodeID: "n1", Path: "/old/a.txt", ParentPath: "/old/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(&FileNode{NodeID: "d2", Path: "/old/sub/", ParentPath: "/old/", Name: "sub", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(&FileNode{NodeID: "n2", Path: "/old/sub/b.txt", ParentPath: "/old/sub/", Name: "b.txt", FileID: "f2", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
 
 	count, err := s.RenameDir("/old/", "/new/")
 	if err != nil {
@@ -249,8 +295,10 @@ func TestRenameDir(t *testing.T) {
 func TestUpdateFileContent(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
-		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now})
+	if err := s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := s.UpdateFileContent("f1", StorageDB9, "/blobs/f1-v2", "text/plain", "abc123", "new content", 42); err != nil {
 		t.Fatal(err)

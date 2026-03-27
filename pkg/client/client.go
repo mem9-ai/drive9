@@ -68,7 +68,7 @@ func (c *Client) Write(path string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return readError(resp)
 	}
@@ -85,7 +85,7 @@ func (c *Client) Read(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return nil, readError(resp)
 	}
@@ -102,7 +102,7 @@ func (c *Client) List(path string) ([]FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return nil, readError(resp)
 	}
@@ -125,7 +125,7 @@ func (c *Client) Stat(path string) (*StatResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode == 404 {
 		return nil, fmt.Errorf("not found: %s", path)
 	}
@@ -154,7 +154,7 @@ func (c *Client) Delete(path string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return readError(resp)
 	}
@@ -172,7 +172,7 @@ func (c *Client) Copy(srcPath, dstPath string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return readError(resp)
 	}
@@ -190,7 +190,7 @@ func (c *Client) Rename(oldPath, newPath string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return readError(resp)
 	}
@@ -207,7 +207,7 @@ func (c *Client) Mkdir(path string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return readError(resp)
 	}
