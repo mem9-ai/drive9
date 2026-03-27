@@ -3,11 +3,14 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/mem9-ai/dat9/internal/testmysql"
@@ -50,6 +53,18 @@ func newTestServerWithS3(t *testing.T) (*Server, *s3client.LocalS3Client) {
 	return New(b), s3c
 }
 
+func partChecksumHeader(data []byte) string {
+	parts := s3client.CalcParts(int64(len(data)), s3client.PartSize)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		start := int64(p.Number-1) * s3client.PartSize
+		end := start + p.Size
+		h := sha256.Sum256(data[start:end])
+		out = append(out, base64.StdEncoding.EncodeToString(h[:]))
+	}
+	return strings.Join(out, ",")
+}
+
 func TestLargeFilePut202(t *testing.T) {
 	s, _ := newTestServerWithS3(t)
 	ts := httptest.NewServer(s)
@@ -59,6 +74,7 @@ func TestLargeFilePut202(t *testing.T) {
 	body := make([]byte, 1<<20) // exactly 1MB
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/big.bin", bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -109,6 +125,7 @@ func TestUploadCompleteEndpoint(t *testing.T) {
 	body := make([]byte, 1<<20)
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/complete-test.bin", bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -158,6 +175,7 @@ func TestUploadResumeEndpoint(t *testing.T) {
 	body := make([]byte, totalSize)
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/resume-test.bin", bytes.NewReader(body))
 	req.ContentLength = totalSize
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -178,6 +196,7 @@ func TestUploadResumeEndpoint(t *testing.T) {
 
 	// POST /v1/uploads/{id}/resume
 	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/"+plan.UploadID+"/resume", nil)
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -217,8 +236,10 @@ func TestLargeUploadOverwritesExistingSmallFile(t *testing.T) {
 
 	// Initiate a large upload to the same path.
 	totalSize := int64(2 << 20)
-	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/overwrite.bin", bytes.NewReader(make([]byte, totalSize)))
+	largeBody := make([]byte, totalSize)
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/overwrite.bin", bytes.NewReader(largeBody))
 	req.ContentLength = totalSize
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(largeBody))
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -279,6 +300,7 @@ func TestListUploadsEndpoint(t *testing.T) {
 	body := make([]byte, 1<<20)
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/list-test.bin", bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
 	resp, _ := http.DefaultClient.Do(req)
 	_ = resp.Body.Close()
 
@@ -320,6 +342,7 @@ func TestOneUploadPerPath(t *testing.T) {
 	body := make([]byte, 1<<20)
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/dup-test.bin", bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
 	resp, _ := http.DefaultClient.Do(req)
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
@@ -329,6 +352,7 @@ func TestOneUploadPerPath(t *testing.T) {
 	// Second upload for same path should fail
 	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/dup-test.bin", bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
 	resp, _ = http.DefaultClient.Do(req)
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
@@ -345,6 +369,7 @@ func TestAbortUploadEndpoint(t *testing.T) {
 	body := make([]byte, 1<<20)
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/abort-test.bin", bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
 	resp, _ := http.DefaultClient.Do(req)
 
 	var plan backend.UploadPlan
@@ -369,5 +394,22 @@ func TestAbortUploadEndpoint(t *testing.T) {
 	upload, _ := s.fallback.GetUpload(plan.UploadID)
 	if upload.Status != datastore.UploadAborted {
 		t.Errorf("expected ABORTED, got %s", upload.Status)
+	}
+}
+
+func TestParsePartChecksumsHeaderValidation(t *testing.T) {
+	if _, err := parsePartChecksumsHeader(""); err != nil {
+		t.Fatalf("empty header should be allowed: %v", err)
+	}
+
+	_, err := parsePartChecksumsHeader("not-base64")
+	if err == nil || !strings.Contains(err.Error(), "invalid base64") {
+		t.Fatalf("expected base64 error, got %v", err)
+	}
+
+	short := base64.StdEncoding.EncodeToString([]byte("short"))
+	_, err = parsePartChecksumsHeader(short)
+	if err == nil || !strings.Contains(err.Error(), "expected 32") {
+		t.Fatalf("expected decoded length error, got %v", err)
 	}
 }

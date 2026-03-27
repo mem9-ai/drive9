@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -20,6 +21,8 @@ type UploadPlan struct {
 	Parts    []*s3client.UploadPartURL `json:"parts"`
 }
 
+var ErrPartChecksumCountMismatch = errors.New("part checksum count mismatch")
+
 // S3 returns the S3Client (nil when not configured).
 func (b *Dat9Backend) S3() s3client.S3Client { return b.s3 }
 
@@ -32,6 +35,10 @@ func (b *Dat9Backend) IsLargeFile(size int64) bool {
 // InitiateUpload creates a multipart upload for a large file.
 // Returns an UploadPlan with presigned URLs for all parts.
 func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize int64) (*UploadPlan, error) {
+	return b.InitiateUploadWithChecksums(ctx, path, totalSize, nil)
+}
+
+func (b *Dat9Backend) InitiateUploadWithChecksums(ctx context.Context, path string, totalSize int64, partChecksums []string) (*UploadPlan, error) {
 	path, err := pathutil.Canonicalize(path)
 	if err != nil {
 		return nil, err
@@ -57,11 +64,18 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 
 	// Calculate parts
 	parts := s3client.CalcParts(totalSize, s3client.PartSize)
+	if len(partChecksums) > 0 && len(partChecksums) != len(parts) {
+		return nil, fmt.Errorf("%w: got %d, expected %d", ErrPartChecksumCountMismatch, len(partChecksums), len(parts))
+	}
 
 	// Presign all part URLs
 	urls := make([]*s3client.UploadPartURL, len(parts))
 	for i, p := range parts {
-		u, err := b.s3.PresignUploadPart(ctx, s3Key, mpu.UploadID, p.Number, p.Size, s3client.UploadTTL)
+		checksum := ""
+		if len(partChecksums) > 0 {
+			checksum = partChecksums[i]
+		}
+		u, err := b.s3.PresignUploadPart(ctx, s3Key, mpu.UploadID, p.Number, p.Size, checksum, s3client.UploadTTL)
 		if err != nil {
 			_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 			return nil, fmt.Errorf("presign part %d: %w", p.Number, err)
@@ -214,6 +228,10 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 
 // ResumeUpload returns presigned URLs for the missing parts of an in-progress upload.
 func (b *Dat9Backend) ResumeUpload(ctx context.Context, uploadID string) (*UploadPlan, error) {
+	return b.ResumeUploadWithChecksums(ctx, uploadID, nil)
+}
+
+func (b *Dat9Backend) ResumeUploadWithChecksums(ctx context.Context, uploadID string, partChecksums []string) (*UploadPlan, error) {
 	upload, err := b.store.GetUpload(uploadID)
 	if err != nil {
 		return nil, err
@@ -246,6 +264,9 @@ func (b *Dat9Backend) ResumeUpload(ctx context.Context, uploadID string) (*Uploa
 
 	// Calculate all expected parts
 	allParts := s3client.CalcParts(upload.TotalSize, upload.PartSize)
+	if len(partChecksums) > 0 && len(partChecksums) != len(allParts) {
+		return nil, fmt.Errorf("%w: got %d, expected %d", ErrPartChecksumCountMismatch, len(partChecksums), len(allParts))
+	}
 
 	// Presign only the missing parts
 	var urls []*s3client.UploadPartURL
@@ -253,7 +274,11 @@ func (b *Dat9Backend) ResumeUpload(ctx context.Context, uploadID string) (*Uploa
 		if uploadedSet[p.Number] {
 			continue
 		}
-		u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, p.Number, p.Size, s3client.UploadTTL)
+		checksum := ""
+		if len(partChecksums) > 0 {
+			checksum = partChecksums[p.Number-1]
+		}
+		u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, p.Number, p.Size, checksum, s3client.UploadTTL)
 		if err != nil {
 			return nil, fmt.Errorf("presign part %d: %w", p.Number, err)
 		}

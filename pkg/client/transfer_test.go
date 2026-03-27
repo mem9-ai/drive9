@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -125,6 +126,20 @@ func TestWriteStreamLargeFile(t *testing.T) {
 	}
 	if len(progressCalls) != 2 {
 		t.Errorf("progress called %d times, want 2", len(progressCalls))
+	}
+}
+
+func TestWriteStreamLargeFileRequiresSeekableReader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("server should not be called for non-seekable large upload")
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+
+	if err := c.WriteStream(context.Background(), "/large.bin", io.NopCloser(bytes.NewReader([]byte("12345678"))), 8, nil); err == nil {
+		t.Fatal("expected error for non-seekable large upload")
 	}
 }
 
@@ -305,6 +320,11 @@ func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Dat9-Content-Length", fmt.Sprintf("%d", len(data)))
+	checksums, err := computePartChecksumsFromReaderAt(bytes.NewReader(data), int64(len(data)), s3client.PartSize)
+	if err != nil {
+		t.Fatalf("compute checksums: %v", err)
+	}
+	req.Header.Set("X-Dat9-Part-Checksums", strings.Join(checksums, ","))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -328,6 +348,9 @@ func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.ContentLength = plan.Parts[0].Size
+	if plan.Parts[0].ChecksumSHA256 != "" {
+		req.Header.Set("x-amz-checksum-sha256", plan.Parts[0].ChecksumSHA256)
+	}
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

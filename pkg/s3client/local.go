@@ -68,13 +68,14 @@ func (c *LocalS3Client) CreateMultipartUpload(ctx context.Context, key string) (
 	return &MultipartUpload{UploadID: uploadID, Key: key}, nil
 }
 
-func (c *LocalS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, ttl time.Duration) (*UploadPartURL, error) {
+func (c *LocalS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, checksumSHA256 string, ttl time.Duration) (*UploadPartURL, error) {
 	url := fmt.Sprintf("%s/upload/%s/%d", c.baseURL, uploadID, partNumber)
 	return &UploadPartURL{
-		Number:    partNumber,
-		URL:       url,
-		Size:      partSize,
-		ExpiresAt: time.Now().Add(ttl),
+		Number:         partNumber,
+		URL:            url,
+		Size:           partSize,
+		ChecksumSHA256: checksumSHA256,
+		ExpiresAt:      time.Now().Add(ttl),
 	}, nil
 }
 

@@ -94,25 +94,30 @@ func (c *AWSS3Client) CreateMultipartUpload(ctx context.Context, key string) (*M
 	}, nil
 }
 
-func (c *AWSS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, ttl time.Duration) (*UploadPartURL, error) {
+func (c *AWSS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, checksumSHA256 string, ttl time.Duration) (*UploadPartURL, error) {
 	if ttl > UploadTTL {
 		ttl = UploadTTL
 	}
-	out, err := c.presign.PresignUploadPart(ctx, &s3.UploadPartInput{
+	in := &s3.UploadPartInput{
 		Bucket:        &c.bucket,
 		Key:           aws.String(c.fullKey(key)),
 		UploadId:      &uploadID,
 		PartNumber:    aws.Int32(int32(partNumber)),
 		ContentLength: aws.Int64(partSize),
-	}, s3.WithPresignExpires(ttl))
+	}
+	if checksumSHA256 != "" {
+		in.ChecksumSHA256 = aws.String(checksumSHA256)
+	}
+	out, err := c.presign.PresignUploadPart(ctx, in, s3.WithPresignExpires(ttl))
 	if err != nil {
 		return nil, fmt.Errorf("presign upload part: %w", err)
 	}
 	return &UploadPartURL{
-		Number:    partNumber,
-		URL:       out.URL,
-		Size:      partSize,
-		ExpiresAt: time.Now().Add(ttl),
+		Number:         partNumber,
+		URL:            out.URL,
+		Size:           partSize,
+		ChecksumSHA256: checksumSHA256,
+		ExpiresAt:      time.Now().Add(ttl),
 	}, nil
 }
 

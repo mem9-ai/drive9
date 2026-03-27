@@ -3,6 +3,13 @@ SHELL := /bin/bash
 GO ?= go
 DOCKER ?= docker
 
+HOST_GOOS ?= $(shell $(GO) env GOOS)
+HOST_GOARCH ?= $(shell $(GO) env GOARCH)
+
+# Build target defaults to the local environment; callers can override.
+GOOS ?= $(HOST_GOOS)
+GOARCH ?= $(HOST_GOARCH)
+
 APP_NAME ?= dat9-server
 CLI_NAME ?= dat9
 
@@ -50,11 +57,11 @@ build: build-server build-cli
 
 build-server:
 	mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -o $(SERVER_BIN) ./cmd/dat9-server
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(SERVER_BIN) ./cmd/dat9-server
 
 build-cli:
 	mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -o $(CLI_BIN) ./cmd/dat9
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(CLI_BIN) ./cmd/dat9
 
 docker-build: build-server
 	DOCKER_BUILDKIT=0 $(DOCKER) build -t $(IMAGE) .
