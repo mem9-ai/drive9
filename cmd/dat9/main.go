@@ -14,6 +14,7 @@
 //	rm    remove a file or directory
 //	sh    interactive shell
 //	sql   execute SQL against file metadata
+//	auth  save or show API key
 package main
 
 import (
@@ -39,6 +40,12 @@ func main() {
 		return
 	case "-h", "-help", "help":
 		usage()
+	case "auth":
+		if err := cli.Auth(nil, args); err != nil {
+			fmt.Fprintf(os.Stderr, "auth: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	c := cli.NewFromEnv()
@@ -84,6 +91,7 @@ commands:
   rm <path>        remove
   sh               interactive shell
   sql "query"      execute SQL against file metadata
+  auth [api-key]   save or show API key (~/.dat9/credentials)
 
 environment:
   DAT9_SERVER      server URL (default: http://localhost:9009)
