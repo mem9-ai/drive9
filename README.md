@@ -71,8 +71,14 @@ c.Delete("/data/file.txt")
 | `DAT9_SERVER` | Server URL | `http://localhost:9009` |
 | `DAT9_API_KEY` | API key | |
 | `DAT9_LISTEN_ADDR` | Server listen address | `:9009` |
+| `DAT9_PUBLIC_URL` | Externally reachable base URL (required for remote clients) | |
 | `DAT9_MYSQL_DSN` | MySQL DSN (example: `user:pass@tcp(127.0.0.1:3306)/dat9?parseTime=true`) | |
 | `DAT9_BLOB_DIR` | Blob storage directory | `./blobs` |
+| `DAT9_S3_BUCKET` | S3 bucket name (enables AWS S3 mode; omit for local mock) | |
+| `DAT9_S3_REGION` | AWS region | `us-east-1` |
+| `DAT9_S3_PREFIX` | S3 key prefix (e.g. `tenants/abc/`) | |
+| `DAT9_S3_ROLE_ARN` | IAM role ARN to assume via STS | |
+| `DAT9_S3_DIR` | Local S3 mock directory (only used without `DAT9_S3_BUCKET`) | `./s3` |
 
 ## Architecture
 

@@ -169,7 +169,7 @@ func TestPresignURLsGenerated(t *testing.T) {
 
 	upload, _ := c.CreateMultipartUpload(ctx, "blobs/presign-test")
 
-	url, err := c.PresignUploadPart(ctx, "blobs/presign-test", upload.UploadID, 1, UploadTTL)
+	url, err := c.PresignUploadPart(ctx, "blobs/presign-test", upload.UploadID, 1, 8<<20, UploadTTL)
 	if err != nil {
 		t.Fatal(err)
 	}
