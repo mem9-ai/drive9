@@ -51,7 +51,7 @@ func newTestServerWithS3(t *testing.T) (*Server, *s3client.LocalS3Client) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(b), s3c
+	return New(Config{Backend: b}), s3c
 }
 
 func TestLargeFilePut202(t *testing.T) {

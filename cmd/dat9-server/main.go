@@ -65,7 +65,12 @@ func main() {
 		die(fmt.Errorf("create backend: %w", err))
 	}
 
-	die(server.New(b).ListenAndServe(addr))
+	apiKey := os.Getenv("DAT9_API_KEY")
+
+	die(server.New(server.Config{
+		Backend: b,
+		APIKey:  apiKey,
+	}).ListenAndServe(addr))
 }
 
 func envOr(key, fallback string) string {
@@ -84,6 +89,7 @@ environment:
   DAT9_MYSQL_DSN   TiDB/MySQL DSN (required)
   DAT9_BLOB_DIR    blob directory (default: ./blobs)
   DAT9_S3_DIR      s3 directory (default: ./s3)
+  DAT9_API_KEY     API key for authentication (unset = no auth, local dev mode)
 `)
 	os.Exit(2)
 }

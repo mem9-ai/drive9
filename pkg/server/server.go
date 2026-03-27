@@ -18,20 +18,29 @@ import (
 	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
+// Config holds the server configuration.
+type Config struct {
+	Backend *backend.Dat9Backend
+	APIKey  string // empty = no auth (local dev mode)
+}
+
 type Server struct {
 	backend *backend.Dat9Backend
 	mux     *http.ServeMux
 }
 
-func New(b *backend.Dat9Backend) *Server {
-	s := &Server{backend: b}
+func New(cfg Config) *Server {
+	s := &Server{backend: cfg.Backend}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/fs/", s.handleFS)
-	mux.HandleFunc("/v1/uploads", s.handleUploads)
-	mux.HandleFunc("/v1/uploads/", s.handleUploadAction)
 
-	// Register local S3 handler for presigned URL support in dev/test mode
-	if local, ok := b.S3().(*s3client.LocalS3Client); ok {
+	// All /v1/ routes go through auth middleware.
+	auth := authMiddleware(cfg.APIKey, http.HandlerFunc(s.handleFS))
+	mux.Handle("/v1/fs/", auth)
+	mux.Handle("/v1/uploads", authMiddleware(cfg.APIKey, http.HandlerFunc(s.handleUploads)))
+	mux.Handle("/v1/uploads/", authMiddleware(cfg.APIKey, http.HandlerFunc(s.handleUploadAction)))
+
+	// Local S3 handler is exempt from auth (presigned URLs are self-authenticating).
+	if local, ok := cfg.Backend.S3().(*s3client.LocalS3Client); ok {
 		mux.Handle("/s3/", http.StripPrefix("/s3", local.Handler()))
 	}
 
