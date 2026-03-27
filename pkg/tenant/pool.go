@@ -207,12 +207,13 @@ func (p *Pool) createBackend(t *Tenant) (*backend.Dat9Backend, *meta.Store, erro
 func (p *Pool) createS3Client(t *Tenant) (s3client.S3Client, error) {
 	if p.cfg.AWSConfig != nil {
 		// AWS S3: use shared bucket with per-tenant prefix.
-		prefix := t.S3KeyPrefix
-		if prefix == "" {
-			prefix = "tenants/" + t.ID + "/"
+		// Compose: global prefix + tenant-specific suffix.
+		tenantSuffix := t.S3KeyPrefix
+		if tenantSuffix == "" {
+			tenantSuffix = "tenants/" + t.ID + "/"
 		}
 		cfg := *p.cfg.AWSConfig // copy
-		cfg.Prefix = prefix
+		cfg.Prefix = cfg.Prefix + tenantSuffix
 		// Use tenant's S3Bucket if set, otherwise use the shared bucket.
 		if t.S3Bucket != "" {
 			cfg.Bucket = t.S3Bucket

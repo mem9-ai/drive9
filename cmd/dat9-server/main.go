@@ -44,8 +44,10 @@ func main() {
 	}
 
 	s3Dir := envOr("DAT9_S3_DIR", defaultS3Dir)
-	pubURL := publicBaseURL(addr)
-	s3BaseURL := pubURL + "/s3"
+
+	// localPublicURL returns the public base URL, only needed for local S3 presigned URLs.
+	// Deferred to avoid requiring DAT9_PUBLIC_URL when using AWS S3.
+	localPublicURL := func() string { return publicBaseURL(addr) }
 
 	// Helper: create an S3 client (AWS or local mock).
 	makeS3 := func() (s3client.S3Client, error) {
@@ -60,7 +62,7 @@ func main() {
 		if err := os.MkdirAll(s3Dir, 0o755); err != nil {
 			return nil, fmt.Errorf("create s3 dir: %w", err)
 		}
-		return s3client.NewLocal(s3Dir, s3BaseURL)
+		return s3client.NewLocal(s3Dir, localPublicURL()+"/s3")
 	}
 
 	cfg := server.Config{}
@@ -89,8 +91,6 @@ func main() {
 		poolCfg := tenant.PoolConfig{
 			MaxTenants: 128,
 			BlobDir:    blobDir,
-			S3Dir:      s3Dir,
-			PublicURL:  pubURL,
 		}
 		if s3Bucket != "" {
 			poolCfg.AWSConfig = &s3client.AWSConfig{
@@ -99,7 +99,10 @@ func main() {
 				Prefix:  os.Getenv("DAT9_S3_PREFIX"),
 				RoleARN: os.Getenv("DAT9_S3_ROLE_ARN"),
 			}
-			poolCfg.S3Dir = "" // AWS S3 takes precedence over local mock
+		} else {
+			// Local S3 mock needs public URL for presigned URLs.
+			poolCfg.S3Dir = s3Dir
+			poolCfg.PublicURL = localPublicURL()
 		}
 		pool := tenant.NewPool(poolCfg, enc)
 		defer pool.Close()
@@ -107,7 +110,9 @@ func main() {
 		cfg.Tenants = tenants
 		cfg.Pool = pool
 		cfg.AdminKey = adminKey
-		cfg.S3Dir = s3Dir
+		if s3Bucket == "" {
+			cfg.S3Dir = s3Dir // only needed for local S3 handler dispatch
+		}
 
 		// Set up provisioner if TiDB Cloud credentials are available
 		provisioner, err := tenant.NewTiDBStarterFromEnv()
