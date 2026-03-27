@@ -2,13 +2,17 @@ package s3client
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -16,10 +20,11 @@ import (
 // LocalS3Client implements S3Client using the local filesystem.
 // Used for testing and development without real S3.
 type LocalS3Client struct {
-	rootDir  string
-	baseURL  string // base URL for presigned URLs (e.g. "http://localhost:9091/s3")
-	mu       sync.Mutex
-	uploads  map[string]*localUpload // uploadID → upload state
+	rootDir    string
+	baseURL    string // base URL for presigned URLs (e.g. "http://localhost:9091/s3")
+	signingKey []byte // HMAC-SHA256 key for presigned URL signatures
+	mu         sync.Mutex
+	uploads    map[string]*localUpload // uploadID → upload state
 }
 
 type localUpload struct {
@@ -34,14 +39,20 @@ type localPart struct {
 
 // NewLocal creates a LocalS3Client rooted at the given directory.
 // baseURL is used to construct presigned URLs that can be resolved locally.
+// A random HMAC signing key is generated for presigned URL authentication.
 func NewLocal(rootDir, baseURL string) (*LocalS3Client, error) {
 	if err := os.MkdirAll(rootDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create s3 root: %w", err)
 	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("generate signing key: %w", err)
+	}
 	return &LocalS3Client{
-		rootDir: rootDir,
-		baseURL: baseURL,
-		uploads: make(map[string]*localUpload),
+		rootDir:    rootDir,
+		baseURL:    baseURL,
+		signingKey: key,
+		uploads:    make(map[string]*localUpload),
 	}, nil
 }
 
@@ -69,13 +80,13 @@ func (c *LocalS3Client) CreateMultipartUpload(ctx context.Context, key string) (
 }
 
 func (c *LocalS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, ttl time.Duration) (*UploadPartURL, error) {
-	// For local: presigned URL is just a direct path to the part file location.
-	// The local HTTP handler will resolve this.
-	url := fmt.Sprintf("%s/upload/%s/%d", c.baseURL, uploadID, partNumber)
+	path := fmt.Sprintf("/upload/%s/%d", uploadID, partNumber)
+	exp := time.Now().Add(ttl)
+	u := c.signURL(path, exp)
 	return &UploadPartURL{
 		Number:    partNumber,
-		URL:       url,
-		ExpiresAt: time.Now().Add(ttl),
+		URL:       u,
+		ExpiresAt: exp,
 	}, nil
 }
 
@@ -186,8 +197,9 @@ func (c *LocalS3Client) ListParts(ctx context.Context, key, uploadID string) ([]
 }
 
 func (c *LocalS3Client) PresignGetObject(ctx context.Context, key string, ttl time.Duration) (string, error) {
-	url := fmt.Sprintf("%s/objects/%s", c.baseURL, key)
-	return url, nil
+	path := "/objects/" + key
+	exp := time.Now().Add(ttl)
+	return c.signURL(path, exp), nil
 }
 
 func (c *LocalS3Client) PutObject(ctx context.Context, key string, body io.Reader, size int64) error {
@@ -208,6 +220,42 @@ func (c *LocalS3Client) GetObject(ctx context.Context, key string) (io.ReadClose
 
 func (c *LocalS3Client) DeleteObject(ctx context.Context, key string) error {
 	return os.Remove(c.objectPath(key))
+}
+
+// signURL appends sig and exp query parameters to a local presigned URL.
+func (c *LocalS3Client) signURL(path string, exp time.Time) string {
+	expStr := strconv.FormatInt(exp.Unix(), 10)
+	sig := c.computeSig(path, expStr)
+	return fmt.Sprintf("%s%s?exp=%s&sig=%s", c.baseURL, path, expStr, sig)
+}
+
+// computeSig returns HMAC-SHA256(signingKey, path+"\n"+exp) as hex.
+func (c *LocalS3Client) computeSig(path, exp string) string {
+	mac := hmac.New(sha256.New, c.signingKey)
+	mac.Write([]byte(path + "\n" + exp))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// VerifySignature checks the sig and exp query parameters on an incoming request.
+// Returns nil if valid, or an error describing the failure.
+func (c *LocalS3Client) VerifySignature(path string, query url.Values) error {
+	expStr := query.Get("exp")
+	sig := query.Get("sig")
+	if expStr == "" || sig == "" {
+		return fmt.Errorf("missing signature parameters")
+	}
+	expUnix, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid exp parameter")
+	}
+	if time.Now().Unix() > expUnix {
+		return fmt.Errorf("presigned URL expired")
+	}
+	expected := c.computeSig(path, expStr)
+	if !hmac.Equal([]byte(sig), []byte(expected)) {
+		return fmt.Errorf("invalid signature")
+	}
+	return nil
 }
 
 // Verify interface compliance.

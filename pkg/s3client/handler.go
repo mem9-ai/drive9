@@ -25,6 +25,11 @@ func (c *LocalS3Client) handleUploadPart(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if err := c.VerifySignature(r.URL.Path, r.URL.Query()); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+
 	// Parse: /upload/{uploadID}/{partNumber}
 	rest := strings.TrimPrefix(r.URL.Path, "/upload/")
 	parts := strings.SplitN(rest, "/", 2)
@@ -53,6 +58,11 @@ func (c *LocalS3Client) handleUploadPart(w http.ResponseWriter, r *http.Request)
 func (c *LocalS3Client) handleGetObject(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := c.VerifySignature(r.URL.Path, r.URL.Query()); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
 
