@@ -4,16 +4,39 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
 func SQL(c *client.Client, args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("usage: dat9 sql \"SELECT ...\"")
+	var query string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-q", "--query":
+			if i+1 >= len(args) {
+				return fmt.Errorf("-q requires a SQL query argument")
+			}
+			i++
+			query = args[i]
+		case "-f", "--file":
+			if i+1 >= len(args) {
+				return fmt.Errorf("-f requires a file path argument")
+			}
+			i++
+			data, err := os.ReadFile(args[i])
+			if err != nil {
+				return fmt.Errorf("read sql file: %w", err)
+			}
+			query = string(data)
+		default:
+			return fmt.Errorf("unknown flag %q\nusage: dat9 db sql -q \"SELECT ...\"", args[i])
+		}
 	}
-	query := strings.Join(args, " ")
+
+	if query == "" {
+		return fmt.Errorf("usage: dat9 db sql -q \"SELECT ...\" or dat9 db sql -f query.sql")
+	}
 
 	rows, err := c.SQL(query)
 	if err != nil {
