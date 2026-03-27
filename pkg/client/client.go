@@ -50,6 +50,15 @@ func (c *Client) url(path string) string {
 	return c.baseURL + "/v1/fs" + path
 }
 
+func (c *Client) RawPost(endpoint string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return c.do(req)
+}
+
 func (c *Client) do(req *http.Request) (*http.Response, error) {
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
