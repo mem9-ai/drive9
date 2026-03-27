@@ -5,36 +5,52 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
-func DBCreate(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("usage: dat9 db create <name> [--server URL]")
-	}
-	name := args[0]
+func Create(args []string) error {
+	name := ""
 	server := os.Getenv("DAT9_SERVER")
-	if server == "" {
-		server = "http://localhost:9009"
-	}
 
-	for i := 1; i < len(args); i++ {
-		if args[i] == "--server" && i+1 < len(args) {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--name":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--name requires an argument")
+			}
+			i++
+			name = args[i]
+		case "--server":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--server requires an argument")
+			}
 			i++
 			server = args[i]
+		default:
+			return fmt.Errorf("unknown flag %q\nusage: dat9 create [--name NAME] [--server URL]", args[i])
 		}
 	}
 
 	cfg := loadConfig()
-	if _, exists := cfg.Databases[name]; exists {
-		return fmt.Errorf("database %q already exists; use a different name or delete it first", name)
+
+	if server == "" {
+		server = cfg.ResolveServer()
+	}
+
+	if name == "" {
+		name = randomName()
+	}
+
+	if _, exists := cfg.Contexts[name]; exists {
+		return fmt.Errorf("context %q already exists; use a different name", name)
 	}
 
 	c := client.New(server, "")
 	resp, err := c.RawPost("/v1/provision", nil)
 	if err != nil {
-		return fmt.Errorf("provision request failed: %w", err)
+		return fmt.Errorf("provision failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -49,72 +65,89 @@ func DBCreate(args []string) error {
 	var result struct {
 		TenantID string `json:"tenant_id"`
 		APIKey   string `json:"api_key"`
-		APIKeyID string `json:"api_key_id"`
 		Status   string `json:"status"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("decode provision response: %w", err)
+		return fmt.Errorf("decode response: %w", err)
 	}
 
-	cfg.SetDB(name, &DBEntry{
-		Server: server,
-		APIKey: result.APIKey,
-	})
-	if cfg.DefaultDB == "" {
-		cfg.SetDefault(name)
+	if cfg.Server == "" {
+		cfg.Server = server
+	}
+	cfg.Contexts[name] = &Context{APIKey: result.APIKey}
+	if cfg.CurrentContext == "" {
+		cfg.CurrentContext = name
 	}
 	if err := saveConfig(cfg); err != nil {
-		return fmt.Errorf("save credentials: %w", err)
+		return fmt.Errorf("save config: %w", err)
 	}
 
-	fmt.Printf("database %q created (tenant: %s, status: %s)\n", name, result.TenantID, result.Status)
-	fmt.Printf("API key saved to %s\n", configPath())
-	if cfg.DefaultDB == name {
-		fmt.Printf("set as default database\n")
+	fmt.Printf("created %q (tenant: %s, status: %s)\n", name, result.TenantID, result.Status)
+	if cfg.CurrentContext == name {
+		fmt.Printf("switched to context %q\n", name)
 	}
+	fmt.Printf("config: %s\n", configPath())
 	return nil
 }
 
-func DBList() error {
+func Ctx(args []string) error {
+	if len(args) == 0 {
+		return ctxShow()
+	}
+	switch args[0] {
+	case "list", "ls":
+		return ctxList()
+	default:
+		return ctxSwitch(args[0])
+	}
+}
+
+func ctxShow() error {
 	cfg := loadConfig()
-	if len(cfg.Databases) == 0 {
-		fmt.Println("no databases configured")
-		fmt.Println("usage: dat9 db create <name>")
+	if cfg.CurrentContext == "" {
+		fmt.Println("no current context")
 		return nil
 	}
-	for name, entry := range cfg.Databases {
+	fmt.Println(cfg.CurrentContext)
+	return nil
+}
+
+func ctxList() error {
+	cfg := loadConfig()
+	if len(cfg.Contexts) == 0 {
+		fmt.Println("no contexts configured")
+		fmt.Println("run: dat9 create --name <name>")
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Contexts))
+	for name := range cfg.Contexts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
 		marker := "  "
-		if name == cfg.DefaultDB {
+		if name == cfg.CurrentContext {
 			marker = "* "
 		}
-		masked := entry.APIKey
+		ctx := cfg.Contexts[name]
+		masked := ctx.APIKey
 		if len(masked) > 12 {
 			masked = masked[:8] + "..." + masked[len(masked)-4:]
 		}
-		fmt.Printf("%s%-12s  server=%s  key=%s\n", marker, name, entry.Server, masked)
+		fmt.Printf("%s%s  (key=%s)\n", marker, name, masked)
 	}
 	return nil
 }
 
-func DBStatus(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("usage: dat9 db status <name>")
-	}
-	name := args[0]
+func ctxSwitch(name string) error {
 	cfg := loadConfig()
-	entry := cfg.GetDB(name)
-	if entry == nil {
-		return fmt.Errorf("database %q not found in credentials", name)
+	if _, ok := cfg.Contexts[name]; !ok {
+		return fmt.Errorf("context %q not found; run: dat9 ctx list", name)
 	}
-	fmt.Printf("name:    %s\n", name)
-	fmt.Printf("server:  %s\n", entry.Server)
-	masked := entry.APIKey
-	if len(masked) > 12 {
-		masked = masked[:8] + "..." + masked[len(masked)-4:]
+	cfg.CurrentContext = name
+	if err := saveConfig(cfg); err != nil {
+		return err
 	}
-	fmt.Printf("api_key: %s\n", masked)
-	if name == cfg.DefaultDB {
-		fmt.Printf("default: yes\n")
-	}
+	fmt.Printf("switched to context %q\n", name)
 	return nil
 }
