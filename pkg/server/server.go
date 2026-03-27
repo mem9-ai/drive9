@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -340,9 +341,13 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if len(partChecksums) == 0 {
+			errJSON(w, http.StatusBadRequest, "missing X-Dat9-Part-Checksums header")
+			return
+		}
 		plan, err := b.InitiateUploadWithChecksums(r.Context(), path, cl, partChecksums)
 		if err != nil {
-			if strings.Contains(err.Error(), "checksum") {
+			if errors.Is(err, backend.ErrPartChecksumCountMismatch) {
 				errJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
@@ -583,9 +588,13 @@ func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uplo
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if len(partChecksums) == 0 {
+		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Part-Checksums header")
+		return
+	}
 	plan, err := b.ResumeUploadWithChecksums(r.Context(), uploadID, partChecksums)
 	if err != nil {
-		if strings.Contains(err.Error(), "checksum") {
+		if errors.Is(err, backend.ErrPartChecksumCountMismatch) {
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -617,6 +626,10 @@ func parsePartChecksumsHeader(raw string) ([]string, error) {
 	for _, p := range parts {
 		v := strings.TrimSpace(p)
 		if v == "" {
+			return nil, fmt.Errorf("invalid X-Dat9-Part-Checksums header")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(v)
+		if err != nil || len(decoded) != 32 {
 			return nil, fmt.Errorf("invalid X-Dat9-Part-Checksums header")
 		}
 		out = append(out, v)

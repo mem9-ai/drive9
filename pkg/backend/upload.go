@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -19,6 +20,8 @@ type UploadPlan struct {
 	PartSize int64                     `json:"part_size"`
 	Parts    []*s3client.UploadPartURL `json:"parts"`
 }
+
+var ErrPartChecksumCountMismatch = errors.New("part checksum count mismatch")
 
 // S3 returns the S3Client (nil when not configured).
 func (b *Dat9Backend) S3() s3client.S3Client { return b.s3 }
@@ -62,7 +65,7 @@ func (b *Dat9Backend) InitiateUploadWithChecksums(ctx context.Context, path stri
 	// Calculate parts
 	parts := s3client.CalcParts(totalSize, s3client.PartSize)
 	if len(partChecksums) > 0 && len(partChecksums) != len(parts) {
-		return nil, fmt.Errorf("part checksum count mismatch: got %d, expected %d", len(partChecksums), len(parts))
+		return nil, fmt.Errorf("%w: got %d, expected %d", ErrPartChecksumCountMismatch, len(partChecksums), len(parts))
 	}
 
 	// Presign all part URLs
@@ -262,7 +265,7 @@ func (b *Dat9Backend) ResumeUploadWithChecksums(ctx context.Context, uploadID st
 	// Calculate all expected parts
 	allParts := s3client.CalcParts(upload.TotalSize, upload.PartSize)
 	if len(partChecksums) > 0 && len(partChecksums) != len(allParts) {
-		return nil, fmt.Errorf("part checksum count mismatch: got %d, expected %d", len(partChecksums), len(allParts))
+		return nil, fmt.Errorf("%w: got %d, expected %d", ErrPartChecksumCountMismatch, len(partChecksums), len(allParts))
 	}
 
 	// Presign only the missing parts

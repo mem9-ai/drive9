@@ -61,14 +61,16 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Dat9-Content-Length", fmt.Sprintf("%d", size))
-	if ra, ok := r.(io.ReaderAt); ok {
-		checksums, err := computePartChecksumsFromReaderAt(ra, size, s3client.PartSize)
-		if err != nil {
-			return fmt.Errorf("compute part checksums: %w", err)
-		}
-		if len(checksums) > 0 {
-			req.Header.Set("X-Dat9-Part-Checksums", strings.Join(checksums, ","))
-		}
+	ra, ok := r.(io.ReaderAt)
+	if !ok {
+		return fmt.Errorf("large uploads require a seekable reader")
+	}
+	checksums, err := computePartChecksumsFromReaderAt(ra, size, s3client.PartSize)
+	if err != nil {
+		return fmt.Errorf("compute part checksums: %w", err)
+	}
+	if len(checksums) > 0 {
+		req.Header.Set("X-Dat9-Part-Checksums", strings.Join(checksums, ","))
 	}
 
 	resp, err := c.do(req)
