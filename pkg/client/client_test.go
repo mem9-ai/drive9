@@ -35,8 +35,8 @@ func newTestClient(t *testing.T) (*Client, func()) {
 
 	cleanup := func() {
 		ts.Close()
-		store.Close()
-		os.RemoveAll(blobDir)
+		_ = store.Close()
+		_ = os.RemoveAll(blobDir)
 	}
 
 	return New(ts.URL, ""), cleanup
@@ -61,8 +61,12 @@ func TestListDir(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()
 
-	c.Write("/data/a.txt", []byte("a"))
-	c.Write("/data/b.txt", []byte("bb"))
+	if err := c.Write("/data/a.txt", []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Write("/data/b.txt", []byte("bb")); err != nil {
+		t.Fatal(err)
+	}
 
 	entries, err := c.List("/data/")
 	if err != nil {
@@ -77,7 +81,9 @@ func TestStat(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()
 
-	c.Write("/test.txt", []byte("data"))
+	if err := c.Write("/test.txt", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
 	info, err := c.Stat("/test.txt")
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +97,9 @@ func TestDelete(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()
 
-	c.Write("/del.txt", []byte("x"))
+	if err := c.Write("/del.txt", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.Delete("/del.txt"); err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +113,9 @@ func TestCopy(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()
 
-	c.Write("/src.txt", []byte("shared"))
+	if err := c.Write("/src.txt", []byte("shared")); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.Copy("/src.txt", "/dst.txt"); err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +129,9 @@ func TestRename(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()
 
-	c.Write("/old.txt", []byte("data"))
+	if err := c.Write("/old.txt", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.Rename("/old.txt", "/new.txt"); err != nil {
 		t.Fatal(err)
 	}

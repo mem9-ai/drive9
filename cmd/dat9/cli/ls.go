@@ -38,7 +38,7 @@ func Ls(c *client.Client, args []string) error {
 			if e.IsDir {
 				kind = "d"
 			}
-			fmt.Fprintf(w, "%s\t%d\t%s\n", kind, e.Size, e.Name)
+			_, _ = fmt.Fprintf(w, "%s\t%d\t%s\n", kind, e.Size, e.Name)
 		}
 		return w.Flush()
 	}

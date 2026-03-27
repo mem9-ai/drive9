@@ -62,8 +62,8 @@ func (c *LocalS3Client) handleGetObject(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
-	io.Copy(w, rc)
+	_, _ = io.Copy(w, rc)
 }

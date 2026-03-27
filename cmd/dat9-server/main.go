@@ -52,7 +52,7 @@ func main() {
 	if err != nil {
 		die(fmt.Errorf("open meta store: %w", err))
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	s3BaseURL := publicBaseURL(addr) + "/s3"
 	s3c, err := s3client.NewLocal(s3Dir, s3BaseURL)

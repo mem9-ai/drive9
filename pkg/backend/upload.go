@@ -63,7 +63,7 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 	for i, p := range parts {
 		u, err := b.s3.PresignUploadPart(ctx, s3Key, mpu.UploadID, p.Number, s3client.UploadTTL)
 		if err != nil {
-			b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
+			_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 			return nil, fmt.Errorf("presign part %d: %w", p.Number, err)
 		}
 		u.Size = p.Size
@@ -83,7 +83,7 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 		Status:      meta.StatusPending,
 		CreatedAt:   now,
 	}); err != nil {
-		b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
+		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		return nil, err
 	}
 
@@ -102,7 +102,7 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 		UpdatedAt:  now,
 		ExpiresAt:  now.Add(24 * time.Hour),
 	}); err != nil {
-		b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
+		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		return nil, err
 	}
 
@@ -168,8 +168,9 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			isOverwrite = true
 
 			var oldRef string
-			tx.QueryRow(`SELECT storage_ref FROM files WHERE file_id = ?`, existingFileID.String).Scan(&oldRef)
-			oldStorageRef = oldRef
+			if err := tx.QueryRow(`SELECT storage_ref FROM files WHERE file_id = ?`, existingFileID.String).Scan(&oldRef); err == nil {
+				oldStorageRef = oldRef
+			}
 
 			_, err := tx.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
 				size_bytes = ?, content_text = NULL, revision = revision + 1,
@@ -229,7 +230,7 @@ func (b *Dat9Backend) ResumeUpload(ctx context.Context, uploadID string) (*Uploa
 		if err := b.s3.AbortMultipartUpload(ctx, upload.S3Key, upload.S3UploadID); err != nil {
 			log.Printf("WARNING: failed to abort expired multipart upload %s: %v", uploadID, err)
 		}
-		b.store.AbortUpload(uploadID)
+		_ = b.store.AbortUpload(uploadID)
 		return nil, meta.ErrUploadExpired
 	}
 
@@ -279,7 +280,7 @@ func (b *Dat9Backend) AbortUpload(ctx context.Context, uploadID string) error {
 		return meta.ErrUploadNotActive
 	}
 
-	b.s3.AbortMultipartUpload(ctx, upload.S3Key, upload.S3UploadID)
+	_ = b.s3.AbortMultipartUpload(ctx, upload.S3Key, upload.S3UploadID)
 	return b.store.AbortUpload(uploadID)
 }
 

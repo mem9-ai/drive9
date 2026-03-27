@@ -111,12 +111,12 @@ func Open(dsn string) (*Store, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	if err := db.Ping(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	return s, nil
@@ -132,7 +132,7 @@ func (s *Store) InTx(fn func(tx *sql.Tx) error) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if err := fn(tx); err != nil {
 		return err
 	}
@@ -260,7 +260,7 @@ func (s *Store) ListNodes(parentPath string) ([]*FileNode, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var nodes []*FileNode
 	for rows.Next() {
 		n, err := scanNode(rows)
@@ -290,7 +290,7 @@ func (s *Store) DeleteEmptyDir(path string) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	var count int64
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE parent_path = ?`, path).Scan(&count); err != nil {
@@ -337,7 +337,7 @@ func (s *Store) RenameDir(oldPrefix, newPrefix string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	rows, err := tx.Query(`SELECT node_id, path, parent_path, name FROM file_nodes
 		WHERE path = ? OR path LIKE ? ORDER BY path`, oldPrefix, oldPrefix+"%")
@@ -351,7 +351,7 @@ func (s *Store) RenameDir(oldPrefix, newPrefix string) (int64, error) {
 	for rows.Next() {
 		var nodeID, p, pp, name string
 		if err := rows.Scan(&nodeID, &p, &pp, &name); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return 0, err
 		}
 		newPath := newPrefix + strings.TrimPrefix(p, oldPrefix)
@@ -364,13 +364,13 @@ func (s *Store) RenameDir(oldPrefix, newPrefix string) (int64, error) {
 		}
 		updates = append(updates, update{nodeID, newPath, newParent, newName})
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	stmt, err := tx.Prepare(`UPDATE file_nodes SET path = ?, parent_path = ?, name = ? WHERE node_id = ?`)
 	if err != nil {
 		return 0, err
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	for _, u := range updates {
 		if _, err := stmt.Exec(u.newPath, u.newParent, u.newName, u.nodeID); err != nil {
@@ -557,7 +557,7 @@ func (s *Store) ListDir(parentPath string) ([]*NodeWithFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var result []*NodeWithFile
 	for rows.Next() {
@@ -575,7 +575,7 @@ func (s *Store) DeleteFileWithRefCheck(path string) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	var fileID sql.NullString
 	var isDir bool
@@ -632,7 +632,7 @@ func (s *Store) DeleteDirRecursive(dirPath string) ([]*File, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	rows, err := tx.Query(`SELECT DISTINCT file_id FROM file_nodes
 		WHERE (path = ? OR path LIKE ?) AND file_id IS NOT NULL`, dirPath, dirPath+"%")
@@ -643,12 +643,12 @@ func (s *Store) DeleteDirRecursive(dirPath string) ([]*File, error) {
 	for rows.Next() {
 		var fid string
 		if err := rows.Scan(&fid); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return nil, err
 		}
 		fileIDs = append(fileIDs, fid)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	if _, err := tx.Exec(`DELETE FROM file_nodes WHERE path = ? OR path LIKE ?`,
 		dirPath, dirPath+"%"); err != nil {
@@ -744,7 +744,7 @@ func (s *Store) ListUploadsByPath(targetPath string, status UploadStatus) ([]*Up
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var uploads []*Upload
 	for rows.Next() {
 		u, err := scanUpload(rows)

@@ -14,7 +14,7 @@ func newTestClient(t *testing.T) *LocalS3Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 
 	c, err := NewLocal(dir, "http://localhost:9091/s3")
 	if err != nil {
@@ -67,7 +67,7 @@ func TestPutAndGetObject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	got, _ := io.ReadAll(rc)
 	if string(got) != "hello world" {
 		t.Errorf("got %q", got)
@@ -78,7 +78,9 @@ func TestDeleteObject(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	c.PutObject(ctx, "blobs/del", bytes.NewReader([]byte("x")), 1)
+	if err := c.PutObject(ctx, "blobs/del", bytes.NewReader([]byte("x")), 1); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.DeleteObject(ctx, "blobs/del"); err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +133,7 @@ func TestMultipartUploadComplete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	got, _ := io.ReadAll(rc)
 	if string(got) != "AAAABBBBCC" {
 		t.Errorf("expected AAAABBBBCC, got %q", got)
@@ -146,7 +148,9 @@ func TestMultipartUploadAbort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.UploadPart(ctx, upload.UploadID, 1, bytes.NewReader([]byte("data")))
+	if _, err := c.UploadPart(ctx, upload.UploadID, 1, bytes.NewReader([]byte("data"))); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := c.AbortMultipartUpload(ctx, "blobs/aborted", upload.UploadID); err != nil {
 		t.Fatal(err)
@@ -189,8 +193,12 @@ func TestPartialUploadAndListParts(t *testing.T) {
 	upload, _ := c.CreateMultipartUpload(ctx, "blobs/partial")
 
 	// Upload only parts 1 and 3 (skip 2 — simulates interrupted upload)
-	c.UploadPart(ctx, upload.UploadID, 1, bytes.NewReader([]byte("PART1")))
-	c.UploadPart(ctx, upload.UploadID, 3, bytes.NewReader([]byte("PART3")))
+	if _, err := c.UploadPart(ctx, upload.UploadID, 1, bytes.NewReader([]byte("PART1"))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.UploadPart(ctx, upload.UploadID, 3, bytes.NewReader([]byte("PART3"))); err != nil {
+		t.Fatal(err)
+	}
 
 	listed, err := c.ListParts(ctx, "blobs/partial", upload.UploadID)
 	if err != nil {
