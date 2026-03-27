@@ -9,8 +9,6 @@
 - provider 由配置显式指定：`db9` / `tidb_zero` / `tidb_cloud_starter`
 - 租户数据库密码必须走 KMS 加密后再持久化
 
-不在本文范围：应用部署、EKS 网络、o11y agent 安装。
-
 ---
 
 ## 2. 关键结论
@@ -62,7 +60,7 @@ type Encryptor interface {
 ### 4.2 工厂类型
 
 - `plain`: 明文透传（仅本地开发）
-- `md5`: 对称加密（兼容模式）
+- `md5`: 对称加密（非生产环境可选）
 - `kms`: AWS KMS（生产默认）
 
 建议默认：
@@ -105,9 +103,9 @@ type ClusterInfo struct {
 
 ### 5.2 DB9Provisioner
 
-- 当前状态：create API 尚未开放
+- DB9 create API：待开放
 - 接口预留：`CreateInstance(tag, root_password, ... )`
-- 一旦 API 可用，直接切主路径
+- API 开放后启用 DB9 创建路径
 
 ### 5.3 TiDBZeroProvisioner（当前可用）
 
@@ -324,7 +322,7 @@ CREATE TABLE IF NOT EXISTS tenants (
 
 字段约定：
 - `db_password`：仅存 KMS 密文，不存明文
-- `id`：租户唯一标识（不再维护独立 `name` 字段）
+- `id`：租户唯一标识
 - `status`：`provisioning|active|suspended|deleted`
 - `claim_url/claim_expires_at`：仅 zero provider 使用
 - `schema_version`：用于租户库 schema 演进控制
@@ -407,7 +405,7 @@ aws kms describe-key --key-id alias/dat9-<env>-db-password
 
 ## Phase 2（DB9 API 可用后立即做）
 - DB9Provisioner 实现并切为默认路径
-- 逐步下线 zero 在非开发环境的路径
+- zero 保留为开发环境方案
 
 ## Phase 3
 - 审计日志、失败补偿、配额与成本控制
