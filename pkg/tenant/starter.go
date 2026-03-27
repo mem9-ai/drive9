@@ -106,7 +106,8 @@ func (p *TiDBStarterProvisioner) Provision(ctx context.Context) (*ClusterInfo, e
 		Port:      port,
 		Username:  result.UserPrefix + ".root",
 		Password:  password,
-		DBName:    "test", // TiDB Starter default database
+		DBName:    "test",            // TiDB Starter default database
+		TLSMode:   TLSConfigName(),   // TiDB Cloud requires TLS
 	}, nil
 }
 

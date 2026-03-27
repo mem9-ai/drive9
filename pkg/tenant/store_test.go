@@ -2,6 +2,7 @@ package tenant
 
 import (
 	"crypto/rand"
+	"strings"
 	"testing"
 	"time"
 )
@@ -203,10 +204,16 @@ func TestHashAPIKey(t *testing.T) {
 }
 
 func TestDSN(t *testing.T) {
-	got := DSN("db.example.com", 4000, "admin", "pass", "mydb")
+	got := DSN("db.example.com", 4000, "admin", "pass", "mydb", "")
 	want := "admin:pass@tcp(db.example.com:4000)/mydb?parseTime=true"
 	if got != want {
 		t.Errorf("DSN = %q, want %q", got, want)
+	}
+
+	// With TLS
+	gotTLS := DSN("cloud.tidbapi.com", 4000, "user", "pw", "test", TLSConfigName())
+	if !strings.Contains(gotTLS, "tls=tidb-cloud") {
+		t.Errorf("DSN with TLS = %q, want tls=tidb-cloud", gotTLS)
 	}
 }
 

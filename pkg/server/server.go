@@ -3,6 +3,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -494,7 +495,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := bearerToken(r)
-	if token != s.adminKey {
+	if subtle.ConstantTimeCompare([]byte(token), []byte(s.adminKey)) != 1 {
 		errJSON(w, http.StatusUnauthorized, "invalid admin key")
 		return
 	}
@@ -543,7 +544,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "provisioning failed")
 		return
 	}
-	if err := s.tenants.UpdateClusterInfo(t.ID, info.Host, info.Port, info.Username, passwordEnc, info.DBName); err != nil {
+	if err := s.tenants.UpdateClusterInfo(t.ID, info.Host, info.Port, info.Username, passwordEnc, info.DBName, info.TLSMode); err != nil {
 		log.Printf("provision: update cluster info: %v", err)
 		s.tenants.UpdateStatus(t.ID, tenant.StatusDeleted)
 		errJSON(w, http.StatusInternalServerError, "provisioning failed")
@@ -551,7 +552,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 5: Init schema on the new cluster
-	dsn := tenant.DSN(info.Host, info.Port, info.Username, info.Password, info.DBName)
+	dsn := tenant.DSN(info.Host, info.Port, info.Username, info.Password, info.DBName, info.TLSMode)
 	if err := s.provisioner.InitSchema(ctx, dsn); err != nil {
 		log.Printf("provision: init schema: %v", err)
 		s.tenants.UpdateStatus(t.ID, tenant.StatusDeleted)

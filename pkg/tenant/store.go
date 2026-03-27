@@ -55,6 +55,8 @@ func (s *Store) migrate() error {
 			db_user          VARCHAR(255) NOT NULL DEFAULT '',
 			db_password_enc  VARBINARY(512),
 			db_name          VARCHAR(255) NOT NULL DEFAULT '',
+			db_tls           VARCHAR(64) NOT NULL DEFAULT '',
+			db_params        VARCHAR(512) NOT NULL DEFAULT '',
 			s3_bucket        VARCHAR(255) NOT NULL DEFAULT '',
 			s3_key_prefix    VARCHAR(255) NOT NULL DEFAULT '',
 			cluster_id       VARCHAR(255) NOT NULL DEFAULT '',
@@ -86,11 +88,12 @@ func (s *Store) migrate() error {
 func (s *Store) Insert(t *Tenant) error {
 	_, err := s.db.Exec(`INSERT INTO tenants
 		(id, api_key_prefix, api_key_hash, status, db_host, db_port, db_user,
-		 db_password_enc, db_name, s3_bucket, s3_key_prefix, cluster_id,
-		 provisioner_type, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 db_password_enc, db_name, db_tls, db_params, s3_bucket, s3_key_prefix,
+		 cluster_id, provisioner_type, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.APIKeyPrefix, t.APIKeyHash, t.Status,
 		t.DBHost, t.DBPort, t.DBUser, t.DBPasswordEnc, t.DBName,
+		t.DBTLS, t.DBParams,
 		t.S3Bucket, t.S3KeyPrefix, t.ClusterID, t.ProvisionerType,
 		t.CreatedAt.UTC(), t.UpdatedAt.UTC())
 	if err != nil && isDuplicateEntry(err) {
@@ -103,6 +106,7 @@ func (s *Store) Insert(t *Tenant) error {
 func (s *Store) GetByAPIKeyHash(hash string) (*Tenant, error) {
 	row := s.db.QueryRow(`SELECT id, api_key_prefix, api_key_hash, status,
 		db_host, db_port, db_user, db_password_enc, db_name,
+		db_tls, db_params,
 		s3_bucket, s3_key_prefix, cluster_id, provisioner_type,
 		created_at, updated_at
 		FROM tenants WHERE api_key_hash = ?`, hash)
@@ -113,6 +117,7 @@ func (s *Store) GetByAPIKeyHash(hash string) (*Tenant, error) {
 func (s *Store) Get(id string) (*Tenant, error) {
 	row := s.db.QueryRow(`SELECT id, api_key_prefix, api_key_hash, status,
 		db_host, db_port, db_user, db_password_enc, db_name,
+		db_tls, db_params,
 		s3_bucket, s3_key_prefix, cluster_id, provisioner_type,
 		created_at, updated_at
 		FROM tenants WHERE id = ?`, id)
@@ -134,10 +139,10 @@ func (s *Store) UpdateStatus(id string, status Status) error {
 }
 
 // UpdateClusterInfo sets the DB connection details after provisioning.
-func (s *Store) UpdateClusterInfo(id, host string, port int, user string, passwordEnc []byte, dbName string) error {
+func (s *Store) UpdateClusterInfo(id, host string, port int, user string, passwordEnc []byte, dbName, dbTLS string) error {
 	res, err := s.db.Exec(`UPDATE tenants SET db_host = ?, db_port = ?, db_user = ?,
-		db_password_enc = ?, db_name = ?, updated_at = ?
-		WHERE id = ?`, host, port, user, passwordEnc, dbName, time.Now().UTC(), id)
+		db_password_enc = ?, db_name = ?, db_tls = ?, updated_at = ?
+		WHERE id = ?`, host, port, user, passwordEnc, dbName, dbTLS, time.Now().UTC(), id)
 	if err != nil {
 		return err
 	}
@@ -204,6 +209,7 @@ func (s *Store) scanTenant(sc scanner) (*Tenant, error) {
 	var createdAt, updatedAt time.Time
 	err := sc.Scan(&t.ID, &t.APIKeyPrefix, &t.APIKeyHash, &t.Status,
 		&t.DBHost, &t.DBPort, &t.DBUser, &passwordEnc, &t.DBName,
+		&t.DBTLS, &t.DBParams,
 		&t.S3Bucket, &t.S3KeyPrefix, &t.ClusterID, &t.ProvisionerType,
 		&createdAt, &updatedAt)
 	if err != nil {
