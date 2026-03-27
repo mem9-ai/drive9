@@ -18,8 +18,12 @@ func TestParseRemote(t *testing.T) {
 		{"local.txt", "", "", false},
 		{"./local.txt", "", "", false},
 		{"-", "", "", false},
+		// Windows drive-letter paths must not be treated as remote.
 		{"C:/tmp/a.txt", "", "", false},
 		{"D:/Users/test", "", "", false},
+		{"c:/data", "", "", false},
+		// Two-char context names still work.
+		{"ab:/file.txt", "ab", "/file.txt", true},
 	}
 	for _, tt := range tests {
 		rp, ok := ParseRemote(tt.input)
