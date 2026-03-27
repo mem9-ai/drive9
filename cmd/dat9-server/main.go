@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/mem9-ai/dat9/pkg/encrypt"
@@ -65,6 +66,13 @@ func main() {
 	kmsKey := os.Getenv("DAT9_ENCRYPT_KEY")
 	tokenHex := os.Getenv("DAT9_TOKEN_SIGNING_KEY")
 	providerType := envOr("DAT9_TENANT_PROVIDER", tenant.ProviderTiDBZero)
+	maxUploadBytes := int64(1 << 30)
+	if raw := os.Getenv("DAT9_MAX_UPLOAD_BYTES"); raw != "" {
+		maxUploadBytes, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || maxUploadBytes <= 0 {
+			die(fmt.Errorf("invalid DAT9_MAX_UPLOAD_BYTES: must be a positive integer"))
+		}
+	}
 	providerType, err = tenant.NormalizeProvider(providerType)
 	if err != nil {
 		die(err)
@@ -121,11 +129,12 @@ func main() {
 	}
 
 	die(server.NewWithConfig(server.Config{
-		Meta:        store,
-		Pool:        pool,
-		Provisioner: provisioner,
-		TokenSecret: tokenSecret,
-		S3Dir:       s3Dir,
+		Meta:           store,
+		Pool:           pool,
+		Provisioner:    provisioner,
+		TokenSecret:    tokenSecret,
+		S3Dir:          s3Dir,
+		MaxUploadBytes: maxUploadBytes,
 	}).ListenAndServe(addr))
 }
 
@@ -146,8 +155,9 @@ environment:
   DAT9_ENCRYPT_TYPE local_aes|kms
   DAT9_MASTER_KEY  32-byte hex key for local_aes encryptor
   DAT9_ENCRYPT_KEY KMS key id or alias (required for kms)
-  DAT9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
-  DAT9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
+	DAT9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
+	DAT9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: 1073741824)
+	DAT9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
   S3 storage (set DAT9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DAT9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
   DAT9_S3_REGION   AWS region (default: us-east-1)
