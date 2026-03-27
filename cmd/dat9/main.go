@@ -8,8 +8,7 @@
 //
 //	create  provision a new database
 //	ctx     switch or list contexts
-//	fs      filesystem operations (cp, cat, ls, stat, mv, rm, sh)
-//	db      database operations (sql)
+//	fs      filesystem operations (cp, cat, ls, stat, mv, rm, sh, grep, find)
 package main
 
 import (
@@ -44,8 +43,6 @@ func main() {
 		}
 	case "fs":
 		runFS(args)
-	case "db":
-		runDB(args)
 	default:
 		fmt.Fprintf(os.Stderr, "dat9: unknown command %q\n", cmd)
 		usage()
@@ -91,27 +88,6 @@ func runFS(args []string) {
 	}
 }
 
-func runDB(args []string) {
-	if len(args) < 1 {
-		dbUsage()
-	}
-	sub := args[0]
-	rest := args[1:]
-
-	switch sub {
-	case "sql":
-		c := cli.NewFromEnv()
-		if err := cli.SQL(c, rest); err != nil {
-			fatal("db sql", err)
-		}
-	case "-h", "-help", "help":
-		dbUsage()
-	default:
-		fmt.Fprintf(os.Stderr, "dat9 db: unknown command %q\n", sub)
-		dbUsage()
-	}
-}
-
 func fatal(cmd string, err error) {
 	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, err)
 	os.Exit(1)
@@ -125,7 +101,6 @@ commands:
   ctx [name]       switch context (or show current)
   ctx list         list all contexts
   fs               filesystem operations
-  db               database operations
 
 environment:
   DAT9_SERVER      server URL (default: http://localhost:9009)
@@ -152,16 +127,6 @@ commands:
     -newer <YYYY-MM-DD>  modified after date
     -older <YYYY-MM-DD>  modified before date
     -size <+N|-N>        size filter in bytes
-`)
-	os.Exit(2)
-}
-
-func dbUsage() {
-	fmt.Fprintf(os.Stderr, `usage: dat9 db <command> [arguments]
-
-commands:
-  sql -q "query"   execute SQL query
-  sql -f file.sql  execute SQL from file
 `)
 	os.Exit(2)
 }
