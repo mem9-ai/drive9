@@ -29,6 +29,10 @@ func NewZeroProvisionerFromEnv() (*ZeroProvisioner, error) {
 
 func (p *ZeroProvisioner) ProviderType() string { return ProviderTiDBZero }
 
+func (p *ZeroProvisioner) InitSchema(_ context.Context, dsn string) error {
+	return initZeroSchema(dsn)
+}
+
 func (p *ZeroProvisioner) Provision(ctx context.Context, tenantID string) (*ClusterInfo, error) {
 	type reqBody struct {
 		Tag string `json:"tag"`
