@@ -1,0 +1,369 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"sync"
+	"testing"
+
+	"github.com/mem9-ai/dat9/pkg/backend"
+	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/s3client"
+	srvpkg "github.com/mem9-ai/dat9/pkg/server"
+)
+
+// TestWriteStreamSmallFile verifies that WriteStream sends a small file via single direct PUT.
+func TestWriteStreamSmallFile(t *testing.T) {
+	var writtenData []byte
+	requestCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.URL.Path == "/v1/fs/small.txt" {
+			requestCount++
+			writtenData, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	data := []byte("hello small")
+	err := c.WriteStream(context.Background(), "/small.txt", bytes.NewReader(data), int64(len(data)), nil)
+	if err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if requestCount != 1 {
+		t.Errorf("expected 1 request, got %d", requestCount)
+	}
+	if !bytes.Equal(writtenData, data) {
+		t.Errorf("got %q, want %q", writtenData, data)
+	}
+}
+
+// TestWriteStreamLargeFile verifies the 202 + multipart upload flow.
+func TestWriteStreamLargeFile(t *testing.T) {
+	var mu sync.Mutex
+	uploadedParts := map[int][]byte{}
+	completeCalled := false
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/large.bin":
+			if h := r.Header.Get("X-Dat9-Content-Length"); h != "8" {
+				http.Error(w, fmt.Sprintf("expected X-Dat9-Content-Length=8, got %q", h), 400)
+				return
+			}
+			// Return 202 with upload plan
+			plan := UploadPlan{
+				UploadID: "upload-123",
+				Parts: []PartURL{
+					{Number: 1, URL: "", Size: 5}, // URL filled below
+					{Number: 2, URL: "", Size: 3},
+				},
+			}
+			// We need the server URL for part URLs
+			// Parts will be uploaded to /parts/1, /parts/2
+			plan.Parts[0].URL = fmt.Sprintf("http://%s/parts/1", r.Host)
+			plan.Parts[1].URL = fmt.Sprintf("http://%s/parts/2", r.Host)
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(plan)
+
+		case r.Method == http.MethodPut && r.URL.Path == "/parts/1":
+			data, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			uploadedParts[1] = data
+			mu.Unlock()
+			w.Header().Set("ETag", `"etag1"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPut && r.URL.Path == "/parts/2":
+			data, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			uploadedParts[2] = data
+			mu.Unlock()
+			w.Header().Set("ETag", `"etag2"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/upload-123/complete":
+			completeCalled = true
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1   // force large file path for test
+	data := []byte("12345678") // 8 bytes, 2 parts (5+3)
+
+	var progressCalls []int
+	progress := func(partNum, total int, bytesUploaded int64) {
+		mu.Lock()
+		progressCalls = append(progressCalls, partNum)
+		mu.Unlock()
+	}
+
+	err := c.WriteStream(context.Background(), "/large.bin", bytes.NewReader(data), int64(len(data)), progress)
+	if err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+
+	if !bytes.Equal(uploadedParts[1], []byte("12345")) {
+		t.Errorf("part 1: got %q, want %q", uploadedParts[1], "12345")
+	}
+	if !bytes.Equal(uploadedParts[2], []byte("678")) {
+		t.Errorf("part 2: got %q, want %q", uploadedParts[2], "678")
+	}
+	if !completeCalled {
+		t.Error("complete was not called")
+	}
+	if len(progressCalls) != 2 {
+		t.Errorf("progress called %d times, want 2", len(progressCalls))
+	}
+}
+
+// TestReadStreamSmallFile verifies direct read for small files.
+func TestReadStreamSmallFile(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("small content"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	rc, err := c.ReadStream(context.Background(), "/small.txt")
+	if err != nil {
+		t.Fatalf("ReadStream: %v", err)
+	}
+	defer rc.Close()
+
+	data, _ := io.ReadAll(rc)
+	if string(data) != "small content" {
+		t.Errorf("got %q, want %q", data, "small content")
+	}
+}
+
+// TestReadStreamLargeFile verifies 302 redirect follow for large files.
+func TestReadStreamLargeFile(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/large.bin":
+			// Return 302 with presigned URL
+			w.Header().Set("Location", fmt.Sprintf("http://%s/s3/presigned", r.Host))
+			w.WriteHeader(http.StatusFound)
+		case "/s3/presigned":
+			w.Write([]byte("large content from S3"))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	rc, err := c.ReadStream(context.Background(), "/large.bin")
+	if err != nil {
+		t.Fatalf("ReadStream: %v", err)
+	}
+	defer rc.Close()
+
+	data, _ := io.ReadAll(rc)
+	if string(data) != "large content from S3" {
+		t.Errorf("got %q, want %q", data, "large content from S3")
+	}
+}
+
+// TestResumeUpload verifies the two-step resume flow.
+func TestResumeUpload(t *testing.T) {
+	var mu sync.Mutex
+	uploadedParts := map[int][]byte{}
+	completeCalled := false
+	var progressCalls [][2]int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/uploads":
+			json.NewEncoder(w).Encode(struct {
+				Uploads []UploadMeta `json:"uploads"`
+			}{
+				Uploads: []UploadMeta{{
+					UploadID:   "resume-456",
+					PartsTotal: 3,
+					Status:     "UPLOADING",
+				}},
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-456/resume":
+			// Step 2: Return missing parts (only part 2 is missing)
+			plan := UploadPlan{
+				UploadID: "resume-456",
+				PartSize: 4, // standard part size for this upload
+				Parts: []PartURL{
+					{Number: 2, URL: fmt.Sprintf("http://%s/parts/2", r.Host), Size: 4},
+				},
+			}
+			json.NewEncoder(w).Encode(plan)
+
+		case r.Method == http.MethodPut && r.URL.Path == "/parts/2":
+			data, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			uploadedParts[2] = data
+			mu.Unlock()
+			w.Header().Set("ETag", `"etag2"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-456/complete":
+			completeCalled = true
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	// Full file data: 12 bytes, 3 parts of 4 bytes each
+	// Part 1 (offset 0): "aaaa", Part 2 (offset 4): "bbbb", Part 3 (offset 8): "cccc"
+	fullData := []byte("aaaabbbbcccc")
+	progress := func(partNum, total int, bytesUploaded int64) {
+		mu.Lock()
+		progressCalls = append(progressCalls, [2]int{partNum, total})
+		mu.Unlock()
+	}
+
+	err := c.ResumeUpload(context.Background(), "/data/big.bin",
+		bytes.NewReader(fullData), int64(len(fullData)), progress)
+	if err != nil {
+		t.Fatalf("ResumeUpload: %v", err)
+	}
+
+	if !bytes.Equal(uploadedParts[2], []byte("bbbb")) {
+		t.Errorf("part 2: got %q, want %q", uploadedParts[2], "bbbb")
+	}
+	if !completeCalled {
+		t.Error("complete was not called")
+	}
+	if len(progressCalls) != 1 {
+		t.Fatalf("progress called %d times, want 1", len(progressCalls))
+	}
+	if progressCalls[0] != [2]int{2, 3} {
+		t.Fatalf("progress = %v, want [[2 3]]", progressCalls)
+	}
+}
+
+func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
+	dbFile, err := os.CreateTemp("", "dat9-client-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbFile.Close()
+	defer os.Remove(dbFile.Name())
+
+	blobDir, err := os.MkdirTemp("", "dat9-client-blobs-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(blobDir)
+
+	s3Dir, err := os.MkdirTemp("", "dat9-client-s3-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(s3Dir)
+
+	store, err := meta.Open(dbFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseURL := "http://" + ln.Addr().String()
+	s3c, err := s3client.NewLocal(s3Dir, baseURL+"/s3")
+	if err != nil {
+		ln.Close()
+		t.Fatal(err)
+	}
+
+	b, err := backend.NewWithS3(store, blobDir, s3c)
+	if err != nil {
+		ln.Close()
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewUnstartedServer(srvpkg.New(b))
+	ts.Listener.Close()
+	ts.Listener = ln
+	ts.Start()
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	data := bytes.Repeat([]byte("x"), 20<<20) // 20MB => 3 parts with 8MB part size
+
+	req, err := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/resume-int.bin", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-Dat9-Content-Length", fmt.Sprintf("%d", len(data)))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("initiate upload: expected 202, got %d", resp.StatusCode)
+	}
+
+	var plan UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatalf("decode upload plan: %v", err)
+	}
+	if len(plan.Parts) != 3 {
+		t.Fatalf("expected 3 parts, got %d", len(plan.Parts))
+	}
+
+	req, err = http.NewRequest(http.MethodPut, plan.Parts[0].URL, bytes.NewReader(data[:int(plan.Parts[0].Size)]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = plan.Parts[0].Size
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("upload part 1: expected 200, got %d", resp.StatusCode)
+	}
+
+	var mu sync.Mutex
+	var progressCalls [][2]int
+	progress := func(partNum, total int, bytesUploaded int64) {
+		mu.Lock()
+		progressCalls = append(progressCalls, [2]int{partNum, total})
+		mu.Unlock()
+	}
+
+	if err := c.ResumeUpload(context.Background(), "/resume-int.bin", bytes.NewReader(data), int64(len(data)), progress); err != nil {
+		t.Fatalf("ResumeUpload integration: %v", err)
+	}
+
+	if len(progressCalls) != 2 {
+		t.Fatalf("progress called %d times, want 2", len(progressCalls))
+	}
+	seen := map[int]bool{}
+	for _, call := range progressCalls {
+		if call[1] != 3 {
+			t.Fatalf("progress total = %d, want 3; calls=%v", call[1], progressCalls)
+		}
+		seen[call[0]] = true
+	}
+	if !seen[2] || !seen[3] {
+		t.Fatalf("progress part numbers = %v, want parts 2 and 3", progressCalls)
+	}
+}
