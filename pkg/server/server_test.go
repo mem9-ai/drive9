@@ -11,26 +11,35 @@ import (
 
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
-	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/dat9/pkg/tenant"
 )
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 
-	blobDir, err := os.MkdirTemp("", "dat9-srv-blobs-*")
+	s3Dir, err := os.MkdirTemp("", "dat9-srv-s3-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(blobDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(s3Dir) })
 
-	store, err := meta.Open(testDSN)
+	if err := tenant.InitSchemaForProvider(testDSN, tenant.ProviderTiDBZero); err != nil {
+		t.Fatal(err)
+	}
+	store, err := datastore.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
 	testmysql.ResetDB(t, store.DB())
 	t.Cleanup(func() { _ = store.Close() })
 
-	b, err := backend.New(store, blobDir)
+	s3c, err := s3client.NewLocal(s3Dir, "/s3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := backend.NewWithS3(store, s3c)
 	if err != nil {
 		t.Fatal(err)
 	}

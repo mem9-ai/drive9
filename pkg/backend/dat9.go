@@ -11,14 +11,12 @@ import (
 	"io"
 	"math/rand"
 	"mime"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
-	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/oklog/ulid/v2"
@@ -28,35 +26,38 @@ const smallFileThreshold = 1 << 20 // 1MB
 
 // Dat9Backend implements filesystem.FileSystem with the inode model.
 type Dat9Backend struct {
-	store   *meta.Store
-	blobDir string
-	s3      s3client.S3Client // nil when S3 is not configured
-	mu      sync.Mutex
-	entropy io.Reader
+	store     *datastore.Store
+	s3        s3client.S3Client // nil when S3 is not configured
+	smallInDB bool
+	mu        sync.Mutex
+	entropy   io.Reader
 }
 
-func New(store *meta.Store, blobDir string) (*Dat9Backend, error) {
-	if err := os.MkdirAll(blobDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create blob dir: %w", err)
-	}
+func New(store *datastore.Store) (*Dat9Backend, error) {
 	return &Dat9Backend{
-		store:   store,
-		blobDir: blobDir,
-		entropy: ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0),
+		store:     store,
+		smallInDB: true,
+		entropy:   ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0),
 	}, nil
 }
 
 // NewWithS3 creates a Dat9Backend with S3 support for large file uploads.
-func NewWithS3(store *meta.Store, blobDir string, s3 s3client.S3Client) (*Dat9Backend, error) {
-	b, err := New(store, blobDir)
+func NewWithS3(store *datastore.Store, s3 s3client.S3Client) (*Dat9Backend, error) {
+	return NewWithS3Mode(store, s3, true)
+}
+
+// NewWithS3Mode controls whether files smaller than threshold stay in DB.
+func NewWithS3Mode(store *datastore.Store, s3 s3client.S3Client, smallInDB bool) (*Dat9Backend, error) {
+	b, err := New(store)
 	if err != nil {
 		return nil, err
 	}
 	b.s3 = s3
+	b.smallInDB = smallInDB
 	return b, nil
 }
 
-func (b *Dat9Backend) Store() *meta.Store { return b.store }
+func (b *Dat9Backend) Store() *datastore.Store { return b.store }
 
 func (b *Dat9Backend) genID() string {
 	b.mu.Lock()
@@ -77,15 +78,27 @@ func (b *Dat9Backend) Create(path string) error {
 	}
 
 	fileID := b.genID()
-	storageRef := "/blobs/" + fileID
 	now := time.Now()
-
-	if err := b.writeBlob(storageRef, nil); err != nil {
-		return err
+	storageType := datastore.StorageDB9
+	storageRef := "inline"
+	var contentBlob []byte
+	if b.shouldStoreInDB(0) {
+		contentBlob = []byte{}
+	} else {
+		if b.s3 == nil {
+			return fmt.Errorf("s3 client not configured")
+		}
+		storageType = datastore.StorageS3
+		storageRef = "blobs/" + fileID
+		if err := b.s3.PutObject(context.Background(), storageRef, bytes.NewReader(nil), 0); err != nil {
+			return fmt.Errorf("put object: %w", err)
+		}
 	}
-	if err := b.store.InsertFile(&meta.File{
-		FileID: fileID, StorageType: meta.StorageDB9, StorageRef: storageRef,
-		SizeBytes: 0, Revision: 1, Status: meta.StatusConfirmed,
+
+	if err := b.store.InsertFile(&datastore.File{
+		FileID: fileID, StorageType: storageType, StorageRef: storageRef,
+		ContentBlob: contentBlob,
+		SizeBytes:   0, Revision: 1, Status: datastore.StatusConfirmed,
 		CreatedAt: now, ConfirmedAt: &now,
 	}); err != nil {
 		return err
@@ -93,7 +106,7 @@ func (b *Dat9Backend) Create(path string) error {
 	if err := b.store.EnsureParentDirs(path, b.genID); err != nil {
 		return err
 	}
-	return b.store.InsertNode(&meta.FileNode{
+	return b.store.InsertNode(&datastore.FileNode{
 		NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
 		Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
 	})
@@ -107,7 +120,7 @@ func (b *Dat9Backend) Mkdir(path string, perm uint32) error {
 	if err := b.store.EnsureParentDirs(dirPath, b.genID); err != nil {
 		return err
 	}
-	return b.store.InsertNode(&meta.FileNode{
+	return b.store.InsertNode(&datastore.FileNode{
 		NodeID: b.genID(), Path: dirPath, ParentPath: pathutil.ParentPath(dirPath),
 		Name: pathutil.BaseName(dirPath), IsDirectory: true, CreatedAt: time.Now(),
 	})
@@ -167,7 +180,7 @@ func (b *Dat9Backend) Read(path string, offset int64, size int64) ([]byte, error
 		return nil, fmt.Errorf("no file entity for path: %s", path)
 	}
 
-	data, err := b.readBlob(nf.File.StorageRef)
+	data, err := b.readFileData(nf.File)
 	if err != nil {
 		return nil, err
 	}
@@ -190,9 +203,9 @@ func (b *Dat9Backend) Write(path string, data []byte, offset int64, flags filesy
 	}
 
 	existing, err := b.store.Stat(path)
-	if err == meta.ErrNotFound {
+	if err == datastore.ErrNotFound {
 		if flags&filesystem.WriteFlagCreate == 0 {
-			return 0, meta.ErrNotFound
+			return 0, datastore.ErrNotFound
 		}
 		return b.createAndWrite(path, data)
 	}
@@ -210,21 +223,33 @@ func (b *Dat9Backend) Write(path string, data []byte, offset int64, flags filesy
 
 func (b *Dat9Backend) createAndWrite(path string, data []byte) (int64, error) {
 	fileID := b.genID()
-	storageRef := "/blobs/" + fileID
 	now := time.Now()
-
-	if err := b.writeBlob(storageRef, data); err != nil {
-		return 0, err
-	}
 
 	contentType := detectContentType(path, data)
 	checksum := sha256sum(data)
 	contentText := extractText(data, contentType)
 
-	if err := b.store.InsertFile(&meta.File{
-		FileID: fileID, StorageType: meta.StorageDB9, StorageRef: storageRef,
+	storageType := datastore.StorageDB9
+	storageRef := "inline"
+	var contentBlob []byte
+	if b.shouldStoreInDB(int64(len(data))) {
+		contentBlob = append([]byte(nil), data...)
+	} else {
+		if b.s3 == nil {
+			return 0, fmt.Errorf("s3 client not configured")
+		}
+		storageType = datastore.StorageS3
+		storageRef = "blobs/" + fileID
+		if err := b.s3.PutObject(context.Background(), storageRef, bytes.NewReader(data), int64(len(data))); err != nil {
+			return 0, fmt.Errorf("put object: %w", err)
+		}
+	}
+
+	if err := b.store.InsertFile(&datastore.File{
+		FileID: fileID, StorageType: storageType, StorageRef: storageRef,
+		ContentBlob: contentBlob,
 		ContentType: contentType, SizeBytes: int64(len(data)),
-		ChecksumSHA256: checksum, Revision: 1, Status: meta.StatusConfirmed,
+		ChecksumSHA256: checksum, Revision: 1, Status: datastore.StatusConfirmed,
 		ContentText: contentText, CreatedAt: now, ConfirmedAt: &now,
 	}); err != nil {
 		return 0, err
@@ -232,7 +257,7 @@ func (b *Dat9Backend) createAndWrite(path string, data []byte) (int64, error) {
 	if err := b.store.EnsureParentDirs(path, b.genID); err != nil {
 		return 0, err
 	}
-	if err := b.store.InsertNode(&meta.FileNode{
+	if err := b.store.InsertNode(&datastore.FileNode{
 		NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
 		Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
 	}); err != nil {
@@ -241,24 +266,24 @@ func (b *Dat9Backend) createAndWrite(path string, data []byte) (int64, error) {
 	return int64(len(data)), nil
 }
 
-func (b *Dat9Backend) overwriteFile(nf *meta.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag) (int64, error) {
+func (b *Dat9Backend) overwriteFile(nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag) (int64, error) {
 	if nf.File == nil {
 		return 0, fmt.Errorf("no file entity")
 	}
 
 	var finalData []byte
 	if flags&filesystem.WriteFlagAppend != 0 {
-		existing, err := b.readBlob(nf.File.StorageRef)
+		existing, err := b.readFileData(nf.File)
 		if err != nil {
-			return 0, fmt.Errorf("read existing blob for append: %w", err)
+			return 0, fmt.Errorf("read existing data for append: %w", err)
 		}
 		finalData = append(existing, data...)
 	} else if flags&filesystem.WriteFlagTruncate != 0 || offset <= 0 {
 		finalData = data
 	} else {
-		existing, err := b.readBlob(nf.File.StorageRef)
+		existing, err := b.readFileData(nf.File)
 		if err != nil {
-			return 0, fmt.Errorf("read existing blob for offset write: %w", err)
+			return 0, fmt.Errorf("read existing data for offset write: %w", err)
 		}
 		if offset > int64(len(existing)) {
 			existing = append(existing, make([]byte, offset-int64(len(existing)))...)
@@ -270,25 +295,36 @@ func (b *Dat9Backend) overwriteFile(nf *meta.NodeWithFile, data []byte, offset i
 		}
 	}
 
-	oldRef := nf.File.StorageRef
-	newRef := "/blobs/" + b.genID()
-
-	if err := b.writeBlob(newRef, finalData); err != nil {
-		return 0, err
-	}
-
 	contentType := detectContentType(nf.Node.Path, finalData)
 	checksum := sha256sum(finalData)
 	contentText := extractText(finalData, contentType)
+	storageType := datastore.StorageDB9
+	storageRef := "inline"
+	var contentBlob []byte
+	if b.shouldStoreInDB(int64(len(finalData))) {
+		contentBlob = append([]byte(nil), finalData...)
+	} else {
+		if b.s3 == nil {
+			return 0, fmt.Errorf("s3 client not configured")
+		}
+		storageType = datastore.StorageS3
+		storageRef = "blobs/" + b.genID()
+		if err := b.s3.PutObject(context.Background(), storageRef, bytes.NewReader(finalData), int64(len(finalData))); err != nil {
+			return 0, fmt.Errorf("put object: %w", err)
+		}
+	}
 
 	if err := b.store.UpdateFileContent(
-		nf.File.FileID, meta.StorageDB9, newRef,
-		contentType, checksum, contentText, int64(len(finalData)),
+		nf.File.FileID, storageType, storageRef,
+		contentType, checksum, contentText, contentBlob, int64(len(finalData)),
 	); err != nil {
+		if storageType == datastore.StorageS3 {
+			b.deleteBlob(storageRef)
+		}
 		return 0, err
 	}
-	if oldRef != newRef {
-		b.deleteBlob(oldRef)
+	if nf.File.StorageRef != "" && nf.File.StorageRef != storageRef {
+		b.deleteBlob(nf.File.StorageRef)
 	}
 	return int64(len(data)), nil
 }
@@ -423,37 +459,41 @@ func (b *Dat9Backend) CopyFile(srcPath, dstPath string) error {
 	if err := b.store.EnsureParentDirs(dstPath, b.genID); err != nil {
 		return err
 	}
-	return b.store.InsertNode(&meta.FileNode{
+	return b.store.InsertNode(&datastore.FileNode{
 		NodeID: b.genID(), Path: dstPath, ParentPath: pathutil.ParentPath(dstPath),
 		Name: pathutil.BaseName(dstPath), FileID: srcNode.FileID, CreatedAt: time.Now(),
 	})
 }
 
-// --- blob storage ---
-
-func (b *Dat9Backend) blobPath(ref string) string {
-	name := strings.TrimPrefix(ref, "/blobs/")
-	return filepath.Join(b.blobDir, name)
-}
-
-func (b *Dat9Backend) writeBlob(ref string, data []byte) error {
-	if data == nil {
-		data = []byte{}
-	}
-	return os.WriteFile(b.blobPath(ref), data, 0o644)
-}
-
-func (b *Dat9Backend) readBlob(ref string) ([]byte, error) {
-	return os.ReadFile(b.blobPath(ref))
-}
-
 func (b *Dat9Backend) deleteBlob(ref string) {
-	if b.s3 != nil && !strings.HasPrefix(ref, "/blobs/") {
-		// S3 key (e.g. "blobs/ULID") — delete from S3
+	if b.s3 != nil && ref != "" {
 		_ = b.s3.DeleteObject(context.Background(), ref)
-		return
 	}
-	_ = os.Remove(b.blobPath(ref))
+}
+
+func (b *Dat9Backend) readFileData(f *datastore.File) ([]byte, error) {
+	if f == nil {
+		return nil, fmt.Errorf("nil file")
+	}
+	if f.StorageType == datastore.StorageS3 {
+		if b.s3 == nil {
+			return nil, fmt.Errorf("s3 client not configured")
+		}
+		rc, err := b.s3.GetObject(context.Background(), f.StorageRef)
+		if err != nil {
+			return nil, err
+		}
+		defer rc.Close()
+		return io.ReadAll(rc)
+	}
+	if f.StorageType == datastore.StorageDB9 {
+		return append([]byte(nil), f.ContentBlob...), nil
+	}
+	return nil, fmt.Errorf("unsupported storage type for direct read: %s", f.StorageType)
+}
+
+func (b *Dat9Backend) shouldStoreInDB(size int64) bool {
+	return b.smallInDB && size < smallFileThreshold
 }
 
 // --- writeCloser ---
