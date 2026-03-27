@@ -64,4 +64,4 @@ build-cli:
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(CLI_BIN) ./cmd/dat9
 
 docker-build: build-server
-	DOCKER_BUILDKIT=0 $(DOCKER) build -t $(IMAGE) .
+	$(DOCKER) build -t $(IMAGE) .
