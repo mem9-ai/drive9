@@ -45,6 +45,9 @@ func Cp(c *client.Client, args []string) error {
 		ctxName = srcRP.Context
 	}
 	if dstIsRemote && dstRP.Context != "" {
+		if ctxName != "" && ctxName != dstRP.Context {
+			return fmt.Errorf("cross-context copy not supported: %s vs %s", ctxName, dstRP.Context)
+		}
 		ctxName = dstRP.Context
 	}
 	if ctxName != "" {
