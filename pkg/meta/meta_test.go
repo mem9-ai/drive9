@@ -100,3 +100,44 @@ func TestUpdateTenantStatus(t *testing.T) {
 		t.Fatalf("status=%s", status)
 	}
 }
+
+func TestListTenantsByStatus(t *testing.T) {
+	s := newControlStore(t)
+	now := time.Now().UTC()
+	for _, tc := range []struct {
+		id     string
+		status TenantStatus
+	}{
+		{id: "tp1", status: TenantProvisioning},
+		{id: "tp2", status: TenantProvisioning},
+		{id: "ta1", status: TenantActive},
+	} {
+		if err := s.InsertTenant(&Tenant{
+			ID:               tc.id,
+			Status:           tc.status,
+			DBHost:           "127.0.0.1",
+			DBPort:           4000,
+			DBUser:           "root",
+			DBPasswordCipher: []byte("cipher"),
+			DBName:           "tenant_db",
+			DBTLS:            true,
+			Provider:         "tidb_zero",
+			SchemaVersion:    1,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.ListTenantsByStatus(TenantProvisioning, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 provisioning tenants, got %d", len(got))
+	}
+	if got[0].Status != TenantProvisioning || got[1].Status != TenantProvisioning {
+		t.Fatalf("unexpected statuses: %s, %s", got[0].Status, got[1].Status)
+	}
+}
