@@ -68,13 +68,12 @@ func (c *LocalS3Client) CreateMultipartUpload(ctx context.Context, key string) (
 	return &MultipartUpload{UploadID: uploadID, Key: key}, nil
 }
 
-func (c *LocalS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, ttl time.Duration) (*UploadPartURL, error) {
-	// For local: presigned URL is just a direct path to the part file location.
-	// The local HTTP handler will resolve this.
+func (c *LocalS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, ttl time.Duration) (*UploadPartURL, error) {
 	url := fmt.Sprintf("%s/upload/%s/%d", c.baseURL, uploadID, partNumber)
 	return &UploadPartURL{
 		Number:    partNumber,
 		URL:       url,
+		Size:      partSize,
 		ExpiresAt: time.Now().Add(ttl),
 	}, nil
 }

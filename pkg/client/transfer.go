@@ -3,6 +3,8 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -144,11 +146,15 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, r io.Reader, 
 
 // uploadOnePart PUTs data to a presigned URL and returns the ETag.
 func (c *Client) uploadOnePart(ctx context.Context, url string, data []byte) (string, error) {
+	h := sha256.Sum256(data)
+	checksum := base64.StdEncoding.EncodeToString(h[:])
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(data))
 	if err != nil {
 		return "", err
 	}
 	req.ContentLength = int64(len(data))
+	req.Header.Set("x-amz-checksum-sha256", checksum)
 
 	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
 	if err != nil {
