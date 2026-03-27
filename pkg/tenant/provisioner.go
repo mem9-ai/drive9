@@ -10,6 +10,7 @@ type ClusterInfo struct {
 	Username  string
 	Password  string // plaintext — encrypt before storing
 	DBName    string
+	TLSMode   string // "" = no TLS, "true" = system CA, "skip-verify", or registered config name
 }
 
 // Provisioner abstracts cluster acquisition and schema initialization.

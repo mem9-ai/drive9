@@ -154,7 +154,7 @@ func (p *Pool) createBackend(t *Tenant) (*backend.Dat9Backend, *meta.Store, erro
 		return nil, nil, fmt.Errorf("decrypt password: %w", err)
 	}
 
-	dsn := DSN(t.DBHost, t.DBPort, t.DBUser, string(password), t.DBName)
+	dsn := DSN(t.DBHost, t.DBPort, t.DBUser, string(password), t.DBName, t.DBTLS)
 	store, err := meta.Open(dsn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open tenant db: %w", err)
