@@ -252,7 +252,11 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		if r.URL.Query().Has("list") {
+		if r.URL.Query().Has("grep") {
+			s.handleGrep(w, r, path)
+		} else if r.URL.Query().Has("find") {
+			s.handleFind(w, r, path)
+		} else if r.URL.Query().Has("list") {
 			s.handleList(w, r, path)
 		} else {
 			s.handleRead(w, r, path)
@@ -856,4 +860,96 @@ func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(rows)
+}
+
+func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	query := r.URL.Query().Get("grep")
+	if query == "" {
+		errJSON(w, http.StatusBadRequest, "empty grep query")
+		return
+	}
+	limit := 20
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid limit: "+v)
+			return
+		}
+		limit = n
+	}
+	results, err := b.Grep(r.Context(), query, path, limit)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(results)
+}
+
+func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	q := r.URL.Query()
+	f := &datastore.FindFilter{PathPrefix: path}
+	f.NameGlob = q.Get("name")
+	if tag := q.Get("tag"); tag != "" {
+		k, v, _ := strings.Cut(tag, "=")
+		f.TagKey = k
+		f.TagValue = v
+	}
+	if v := q.Get("newer"); v != "" {
+		t, err := time.Parse("2006-01-02", v)
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid newer date: "+v)
+			return
+		}
+		f.After = &t
+	}
+	if v := q.Get("older"); v != "" {
+		t, err := time.Parse("2006-01-02", v)
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid older date: "+v)
+			return
+		}
+		f.Before = &t
+	}
+	if v := q.Get("minsize"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid minsize: "+v)
+			return
+		}
+		f.MinSize = n
+	}
+	if v := q.Get("maxsize"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid maxsize: "+v)
+			return
+		}
+		f.MaxSize = n
+	}
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid limit: "+v)
+			return
+		}
+		f.Limit = n
+	}
+	results, err := b.Find(r.Context(), f)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(results)
 }

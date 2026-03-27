@@ -66,7 +66,7 @@ func runFS(args []string) {
 		if err := cli.Cp(c, rest); err != nil {
 			fatal("fs cp", err)
 		}
-	case "cat", "ls", "stat", "mv", "rm", "sh":
+	case "cat", "ls", "stat", "mv", "rm", "sh", "grep", "find":
 		ctxName, rest := extractContext(rest)
 		c := cli.NewClientForContext(ctxName)
 		var err error
@@ -83,6 +83,10 @@ func runFS(args []string) {
 			err = cli.Rm(c, rest)
 		case "sh":
 			err = cli.Sh(c, rest)
+		case "grep":
+			err = cli.Grep(c, rest)
+		case "find":
+			err = cli.Find(c, rest)
 		}
 		if err != nil {
 			fatal("fs "+sub, err)
@@ -168,13 +172,20 @@ func fsUsage() {
 	fmt.Fprintf(os.Stderr, `usage: dat9 fs <command> [arguments]
 
 commands:
-  cp <src> <dst>   copy files (local↔remote)
-  cat <path>       read file to stdout
-  ls [path]        list directory
-  stat <path>      file metadata
-  mv <old> <new>   rename/move
-  rm <path>        remove
-  sh               interactive shell
+  cp <src> <dst>       copy files (local↔remote)
+  cat <path>           read file to stdout
+  ls [path]            list directory
+  stat <path>          file metadata
+  mv <old> <new>       rename/move
+  rm <path>            remove
+  sh                   interactive shell
+  grep <pattern> [dir] search file contents
+  find [dir] [flags]   find files by attributes
+    -name <glob>         match filename
+    -tag <key=value>     match tag
+    -newer <YYYY-MM-DD>  modified after date
+    -older <YYYY-MM-DD>  modified before date
+    -size <+N|-N>        size filter in bytes
 `)
 	os.Exit(2)
 }
