@@ -19,11 +19,12 @@ type Part struct {
 
 // UploadPartURL is a presigned URL for uploading one part.
 type UploadPartURL struct {
-	Number         int       `json:"number"`                    // 1-based part number
-	URL            string    `json:"url"`                       // presigned PUT URL
-	Size           int64     `json:"size"`                      // expected part size
-	ChecksumSHA256 string    `json:"checksum_sha256,omitempty"` // expected checksum for signed uploads
-	ExpiresAt      time.Time `json:"expires_at"`                // URL expiry
+	Number         int               `json:"number"`                    // 1-based part number
+	URL            string            `json:"url"`                       // presigned PUT URL
+	Size           int64             `json:"size"`                      // expected part size
+	ChecksumSHA256 string            `json:"checksum_sha256,omitempty"` // expected checksum for signed uploads
+	Headers        map[string]string `json:"headers,omitempty"`         // required headers for presigned PUT
+	ExpiresAt      time.Time         `json:"expires_at"`                // URL expiry
 }
 
 // MultipartUpload holds the state of an initiated multipart upload.

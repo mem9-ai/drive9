@@ -70,11 +70,16 @@ func (c *LocalS3Client) CreateMultipartUpload(ctx context.Context, key string) (
 
 func (c *LocalS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, checksumSHA256 string, ttl time.Duration) (*UploadPartURL, error) {
 	url := fmt.Sprintf("%s/upload/%s/%d", c.baseURL, uploadID, partNumber)
+	var headers map[string]string
+	if checksumSHA256 != "" {
+		headers = map[string]string{"x-amz-checksum-sha256": checksumSHA256}
+	}
 	return &UploadPartURL{
 		Number:         partNumber,
 		URL:            url,
 		Size:           partSize,
 		ChecksumSHA256: checksumSHA256,
+		Headers:        headers,
 		ExpiresAt:      time.Now().Add(ttl),
 	}, nil
 }

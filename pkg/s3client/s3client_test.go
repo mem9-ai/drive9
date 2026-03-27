@@ -169,12 +169,15 @@ func TestPresignURLsGenerated(t *testing.T) {
 
 	upload, _ := c.CreateMultipartUpload(ctx, "blobs/presign-test")
 
-	url, err := c.PresignUploadPart(ctx, "blobs/presign-test", upload.UploadID, 1, 8<<20, "", UploadTTL)
+	url, err := c.PresignUploadPart(ctx, "blobs/presign-test", upload.UploadID, 1, 8<<20, "abc", UploadTTL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if url.URL == "" || url.Number != 1 {
 		t.Errorf("unexpected presigned URL: %+v", url)
+	}
+	if url.Headers["x-amz-checksum-sha256"] != "abc" {
+		t.Fatalf("expected checksum header in presigned part, got %+v", url.Headers)
 	}
 
 	getURL, err := c.PresignGetObject(ctx, "blobs/presign-test", DownloadTTL)

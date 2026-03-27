@@ -24,11 +24,12 @@ type UploadPlan struct {
 
 // PartURL is a presigned URL for uploading one part.
 type PartURL struct {
-	Number         int    `json:"number"`
-	URL            string `json:"url"`
-	Size           int64  `json:"size"`
-	ChecksumSHA256 string `json:"checksum_sha256,omitempty"`
-	ExpiresAt      string `json:"expires_at"`
+	Number         int               `json:"number"`
+	URL            string            `json:"url"`
+	Size           int64             `json:"size"`
+	ChecksumSHA256 string            `json:"checksum_sha256,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	ExpiresAt      string            `json:"expires_at"`
 }
 
 // ProgressFunc is called after each part upload completes.
@@ -168,6 +169,12 @@ func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, part.URL, bytes.NewReader(data))
 	if err != nil {
 		return "", err
+	}
+	for k, v := range part.Headers {
+		if strings.EqualFold(k, "host") {
+			continue
+		}
+		req.Header.Set(k, v)
 	}
 	req.ContentLength = int64(len(data))
 	req.Header.Set("x-amz-checksum-sha256", checksum)

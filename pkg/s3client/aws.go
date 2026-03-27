@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -53,9 +55,13 @@ func NewAWS(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 	}
 
 	client := s3.NewFromConfig(awsCfg)
+	presigner := v4.NewSigner(func(o *v4.SignerOptions) {
+		o.DisableURIPathEscaping = true
+		o.DisableHeaderHoisting = true
+	})
 	return &AWSS3Client{
 		client:  client,
-		presign: s3.NewPresignClient(client),
+		presign: s3.NewPresignClient(client, func(o *s3.PresignOptions) { o.Presigner = presigner }),
 		bucket:  cfg.Bucket,
 		prefix:  normalizePrefix(cfg.Prefix),
 	}, nil
@@ -112,13 +118,38 @@ func (c *AWSS3Client) PresignUploadPart(ctx context.Context, key, uploadID strin
 	if err != nil {
 		return nil, fmt.Errorf("presign upload part: %w", err)
 	}
+	headers := flattenSignedHeaders(out.SignedHeader)
+	if checksumSHA256 != "" {
+		headers[strings.ToLower("x-amz-checksum-sha256")] = checksumSHA256
+	}
 	return &UploadPartURL{
 		Number:         partNumber,
 		URL:            out.URL,
 		Size:           partSize,
 		ChecksumSHA256: checksumSHA256,
+		Headers:        headers,
 		ExpiresAt:      time.Now().Add(ttl),
 	}, nil
+}
+
+func flattenSignedHeaders(h http.Header) map[string]string {
+	if len(h) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(h))
+	for k, vs := range h {
+		if len(vs) == 0 {
+			continue
+		}
+		if strings.EqualFold(k, "host") {
+			continue
+		}
+		out[strings.ToLower(k)] = vs[0]
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func (c *AWSS3Client) CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []Part) error {
