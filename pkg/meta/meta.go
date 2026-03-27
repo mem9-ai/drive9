@@ -4,6 +4,7 @@
 package meta
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -103,8 +104,9 @@ type Store struct {
 }
 
 func Open(dsn string) (*Store, error) {
-	if strings.Contains(dsn, "multiStatements=true") {
-		return nil, fmt.Errorf("multiStatements=true is not allowed in production DSN")
+	lower := strings.ToLower(dsn)
+	if strings.Contains(lower, "multistatements=true") || strings.Contains(lower, "multistatements=1") {
+		return nil, fmt.Errorf("multiStatements is not allowed in production DSN")
 	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -756,7 +758,237 @@ func (s *Store) ListUploadsByPath(targetPath string, status UploadStatus) ([]*Up
 	return uploads, rows.Err()
 }
 
-// --- scan helpers ---
+// --- file_tags operations ---
+
+func (s *Store) SetTags(fileID string, tags map[string]string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.Prepare(`INSERT INTO file_tags (file_id, tag_key, tag_value)
+		VALUES (?, ?, ?)
+		ON DUPLICATE KEY UPDATE tag_value = VALUES(tag_value)`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stmt.Close() }()
+
+	for k, v := range tags {
+		if _, err := stmt.Exec(fileID, k, v); err != nil {
+			return fmt.Errorf("set tag %s: %w", k, err)
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) GetTags(fileID string) (map[string]string, error) {
+	rows, err := s.db.Query(`SELECT tag_key, tag_value FROM file_tags WHERE file_id = ?`, fileID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	tags := make(map[string]string)
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		tags[k] = v
+	}
+	return tags, rows.Err()
+}
+
+func (s *Store) DeleteTag(fileID, key string) error {
+	_, err := s.db.Exec(`DELETE FROM file_tags WHERE file_id = ? AND tag_key = ?`, fileID, key)
+	return err
+}
+
+// QueryFilter defines structured query parameters for /v1/query.
+type QueryFilter struct {
+	Tags          map[string]string
+	PathPrefix    string
+	SourceID      string
+	CreatedAfter  *time.Time
+	CreatedBefore *time.Time
+	Limit         int
+	Cursor        string
+}
+
+// QueryResult is one row from a metadata query.
+type QueryResult struct {
+	Path        string    `json:"path"`
+	Name        string    `json:"name"`
+	IsDirectory bool      `json:"is_directory"`
+	FileID      string    `json:"file_id,omitempty"`
+	StorageType string    `json:"storage_type,omitempty"`
+	SizeBytes   int64     `json:"size_bytes"`
+	ContentType string    `json:"content_type,omitempty"`
+	Revision    int64     `json:"revision"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+func (s *Store) Query(f *QueryFilter) ([]*QueryResult, error) {
+	if f.Limit <= 0 || f.Limit > 1000 {
+		f.Limit = 100
+	}
+
+	var where []string
+	var args []interface{}
+
+	where = append(where, "f.status = 'CONFIRMED'")
+
+	if f.PathPrefix != "" {
+		where = append(where, "fn.path LIKE ?")
+		args = append(args, f.PathPrefix+"%")
+	}
+	if f.SourceID != "" {
+		where = append(where, "f.source_id = ?")
+		args = append(args, f.SourceID)
+	}
+	if f.CreatedAfter != nil {
+		where = append(where, "f.created_at > ?")
+		args = append(args, f.CreatedAfter.UTC())
+	}
+	if f.CreatedBefore != nil {
+		where = append(where, "f.created_at < ?")
+		args = append(args, f.CreatedBefore.UTC())
+	}
+	if f.Cursor != "" {
+		where = append(where, "fn.path > ?")
+		args = append(args, f.Cursor)
+	}
+
+	for k, v := range f.Tags {
+		where = append(where, `EXISTS (SELECT 1 FROM file_tags t WHERE t.file_id = f.file_id AND t.tag_key = ? AND t.tag_value = ?)`)
+		args = append(args, k, v)
+	}
+
+	q := `SELECT fn.path, fn.name, fn.is_directory, fn.file_id,
+		f.storage_type, f.size_bytes, f.content_type, f.revision, f.created_at
+		FROM file_nodes fn
+		JOIN files f ON fn.file_id = f.file_id
+		WHERE ` + strings.Join(where, " AND ") + `
+		ORDER BY fn.path
+		LIMIT ?`
+	args = append(args, f.Limit)
+
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []*QueryResult
+	for rows.Next() {
+		var r QueryResult
+		var storageType, contentType sql.NullString
+		var fileID sql.NullString
+		var isDir int
+		var createdAt time.Time
+		if err := rows.Scan(&r.Path, &r.Name, &isDir, &fileID,
+			&storageType, &r.SizeBytes, &contentType, &r.Revision, &createdAt); err != nil {
+			return nil, err
+		}
+		r.IsDirectory = isDir != 0
+		r.FileID = fileID.String
+		r.StorageType = storageType.String
+		r.ContentType = contentType.String
+		r.CreatedAt = createdAt.UTC()
+		results = append(results, &r)
+	}
+	return results, rows.Err()
+}
+
+func (s *Store) ExecSQL(ctx context.Context, query string) ([]map[string]interface{}, error) {
+	q := strings.TrimSpace(query)
+	upper := strings.ToUpper(q)
+
+	isSelect := strings.HasPrefix(upper, "SELECT")
+	if strings.HasPrefix(upper, "WITH") {
+		hasDML := strings.Contains(upper, "INSERT") ||
+			strings.Contains(upper, "UPDATE") ||
+			strings.Contains(upper, "DELETE") ||
+			strings.Contains(upper, "DROP") ||
+			strings.Contains(upper, "ALTER") ||
+			strings.Contains(upper, "TRUNCATE")
+		if !hasDML {
+			isSelect = true
+		}
+	}
+	isTagWrite := strings.HasPrefix(upper, "INSERT INTO FILE_TAGS") ||
+		strings.HasPrefix(upper, "UPDATE FILE_TAGS") ||
+		strings.HasPrefix(upper, "DELETE FROM FILE_TAGS")
+
+	if isTagWrite {
+		if strings.HasPrefix(upper, "UPDATE") || strings.HasPrefix(upper, "DELETE") {
+			for _, t := range []string{"FILE_NODES", "FILES", "UPLOADS"} {
+				if strings.Contains(upper, t) {
+					return nil, fmt.Errorf("DML on file_tags must not reference other tables")
+				}
+			}
+		}
+	}
+
+	if !isSelect && !isTagWrite {
+		return nil, fmt.Errorf("only SELECT queries and INSERT/UPDATE/DELETE on file_tags are allowed")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	if isTagWrite {
+		res, err := s.db.ExecContext(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+		affected, _ := res.RowsAffected()
+		return []map[string]interface{}{{"rows_affected": affected}}, nil
+	}
+
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	const maxRows = 1000
+	var result []map[string]interface{}
+	for rows.Next() {
+		if len(result) >= maxRows {
+			break
+		}
+		vals := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		row := make(map[string]interface{}, len(cols))
+		for i, col := range cols {
+			v := vals[i]
+			if b, ok := v.([]byte); ok {
+				row[col] = string(b)
+			} else {
+				row[col] = v
+			}
+		}
+		result = append(result, row)
+	}
+	if result == nil {
+		result = []map[string]interface{}{}
+	}
+	return result, rows.Err()
+}
 
 type scanner interface {
 	Scan(dest ...interface{}) error

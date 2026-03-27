@@ -13,6 +13,7 @@
 //	mv    rename/move a file or directory
 //	rm    remove a file or directory
 //	sh    interactive shell
+//	sql   execute SQL against file metadata
 package main
 
 import (
@@ -48,6 +49,8 @@ func main() {
 		err = cli.Rm(c, args)
 	case "sh":
 		err = cli.Sh(c, args)
+	case "sql":
+		err = cli.SQL(c, args)
 	case "-h", "-help", "help":
 		usage()
 	default:
@@ -72,6 +75,7 @@ commands:
   mv <old> <new>   rename/move
   rm <path>        remove
   sh               interactive shell
+  sql "query"      execute SQL against file metadata
 
 environment:
   DAT9_SERVER      server URL (default: http://localhost:9009)
