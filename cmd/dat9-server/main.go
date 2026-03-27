@@ -72,6 +72,9 @@ func main() {
 		if err != nil || maxUploadBytes <= 0 {
 			die(fmt.Errorf("invalid DAT9_MAX_UPLOAD_BYTES: must be a positive integer"))
 		}
+		if maxUploadBytes < 1<<20 {
+			die(fmt.Errorf("DAT9_MAX_UPLOAD_BYTES too small: minimum 1048576 (1MiB)"))
+		}
 	}
 	providerType, err = tenant.NormalizeProvider(providerType)
 	if err != nil {
@@ -155,9 +158,9 @@ environment:
   DAT9_ENCRYPT_TYPE local_aes|kms
   DAT9_MASTER_KEY  32-byte hex key for local_aes encryptor
   DAT9_ENCRYPT_KEY KMS key id or alias (required for kms)
-	DAT9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
-	DAT9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: 1073741824)
-	DAT9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
+  DAT9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
+  DAT9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: 1073741824, minimum: 1048576)
+  DAT9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
   S3 storage (set DAT9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DAT9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
   DAT9_S3_REGION   AWS region (default: us-east-1)

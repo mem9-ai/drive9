@@ -452,3 +452,23 @@ func TestDeclaredContentLengthOverMaxRejected(t *testing.T) {
 		t.Fatalf("expected 413, got %d: %s", resp.StatusCode, body)
 	}
 }
+
+func TestContentLengthHeaderMismatchRejected(t *testing.T) {
+	base, _ := newTestServerWithS3(t)
+	s := NewWithConfig(Config{Backend: base.fallback, MaxUploadBytes: 1 << 20})
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/mismatch.bin", bytes.NewReader([]byte("1234")))
+	req.ContentLength = 4
+	req.Header.Set("X-Dat9-Content-Length", "5")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, body)
+	}
+}
