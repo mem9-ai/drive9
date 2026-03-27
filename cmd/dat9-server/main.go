@@ -89,7 +89,6 @@ func main() {
 		pool := tenant.NewPool(tenant.PoolConfig{
 			MaxTenants: 128,
 			BlobDir:    blobDir,
-			S3Bucket:   s3Bucket,
 			S3Dir:      s3Dir,
 			PublicURL:  pubURL,
 		}, enc)
