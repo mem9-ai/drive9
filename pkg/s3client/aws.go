@@ -38,6 +38,7 @@ func NewAWS(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(cfg.Region),
+		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
@@ -55,13 +56,9 @@ func NewAWS(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 	}
 
 	client := s3.NewFromConfig(awsCfg)
-	presigner := v4.NewSigner(func(o *v4.SignerOptions) {
-		o.DisableURIPathEscaping = true
-		o.DisableHeaderHoisting = true
-	})
 	return &AWSS3Client{
 		client:  client,
-		presign: s3.NewPresignClient(client, func(o *s3.PresignOptions) { o.Presigner = presigner }),
+		presign: s3.NewPresignClient(client),
 		bucket:  cfg.Bucket,
 		prefix:  normalizePrefix(cfg.Prefix),
 	}, nil
@@ -114,7 +111,14 @@ func (c *AWSS3Client) PresignUploadPart(ctx context.Context, key, uploadID strin
 	if checksumSHA256 != "" {
 		in.ChecksumSHA256 = aws.String(checksumSHA256)
 	}
-	out, err := c.presign.PresignUploadPart(ctx, in, s3.WithPresignExpires(ttl))
+	partPresigner := v4.NewSigner(func(o *v4.SignerOptions) {
+		o.DisableURIPathEscaping = true
+		o.DisableHeaderHoisting = true
+	})
+	out, err := c.presign.PresignUploadPart(ctx, in,
+		s3.WithPresignExpires(ttl),
+		func(o *s3.PresignOptions) { o.Presigner = partPresigner },
+	)
 	if err != nil {
 		return nil, fmt.Errorf("presign upload part: %w", err)
 	}
