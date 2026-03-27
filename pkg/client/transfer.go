@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/mem9-ai/dat9/pkg/s3client"
@@ -23,10 +24,11 @@ type UploadPlan struct {
 
 // PartURL is a presigned URL for uploading one part.
 type PartURL struct {
-	Number    int    `json:"number"`
-	URL       string `json:"url"`
-	Size      int64  `json:"size"`
-	ExpiresAt string `json:"expires_at"`
+	Number         int    `json:"number"`
+	URL            string `json:"url"`
+	Size           int64  `json:"size"`
+	ChecksumSHA256 string `json:"checksum_sha256,omitempty"`
+	ExpiresAt      string `json:"expires_at"`
 }
 
 // ProgressFunc is called after each part upload completes.
@@ -59,6 +61,15 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Dat9-Content-Length", fmt.Sprintf("%d", size))
+	if ra, ok := r.(io.ReaderAt); ok {
+		checksums, err := computePartChecksumsFromReaderAt(ra, size, s3client.PartSize)
+		if err != nil {
+			return fmt.Errorf("compute part checksums: %w", err)
+		}
+		if len(checksums) > 0 {
+			req.Header.Set("X-Dat9-Part-Checksums", strings.Join(checksums, ","))
+		}
+	}
 
 	resp, err := c.do(req)
 	if err != nil {
@@ -118,7 +129,7 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, r io.Reader, 
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			_, err := c.uploadOnePart(ctx, p.URL, data)
+			_, err := c.uploadOnePart(ctx, p, data)
 			if err != nil {
 				select {
 				case errCh <- fmt.Errorf("part %d: %w", p.Number, err):
@@ -145,11 +156,14 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, r io.Reader, 
 }
 
 // uploadOnePart PUTs data to a presigned URL and returns the ETag.
-func (c *Client) uploadOnePart(ctx context.Context, url string, data []byte) (string, error) {
+func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (string, error) {
 	h := sha256.Sum256(data)
 	checksum := base64.StdEncoding.EncodeToString(h[:])
+	if part.ChecksumSHA256 != "" && part.ChecksumSHA256 != checksum {
+		return "", fmt.Errorf("checksum mismatch for part %d", part.Number)
+	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, part.URL, bytes.NewReader(data))
 	if err != nil {
 		return "", err
 	}
@@ -262,7 +276,11 @@ func (c *Client) ResumeUpload(ctx context.Context, path string, r io.ReaderAt, t
 	}
 
 	// Step 2: Request resume — server returns presigned URLs for missing parts
-	plan, err := c.requestResume(ctx, meta.UploadID)
+	checksums, err := computePartChecksumsFromReaderAt(r, totalSize, s3client.PartSize)
+	if err != nil {
+		return fmt.Errorf("compute part checksums: %w", err)
+	}
+	plan, err := c.requestResume(ctx, meta.UploadID, checksums)
 	if err != nil {
 		return err
 	}
@@ -311,11 +329,14 @@ func (c *Client) queryUpload(ctx context.Context, path string) (*UploadMeta, err
 }
 
 // requestResume asks the server to generate presigned URLs for missing parts.
-func (c *Client) requestResume(ctx context.Context, uploadID string) (*UploadPlan, error) {
+func (c *Client) requestResume(ctx context.Context, uploadID string, checksums []string) (*UploadPlan, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL+"/v1/uploads/"+uploadID+"/resume", nil)
 	if err != nil {
 		return nil, err
+	}
+	if len(checksums) > 0 {
+		req.Header.Set("X-Dat9-Part-Checksums", strings.Join(checksums, ","))
 	}
 	resp, err := c.do(req)
 	if err != nil {
@@ -384,7 +405,7 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			_, err := c.uploadOnePart(ctx, p.URL, d)
+			_, err := c.uploadOnePart(ctx, p, d)
 			if err != nil {
 				select {
 				case errCh <- fmt.Errorf("part %d: %w", p.Number, err):
@@ -407,4 +428,26 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 	}
 
 	return nil
+}
+
+func computePartChecksumsFromReaderAt(r io.ReaderAt, totalSize int64, partSize int64) ([]string, error) {
+	if totalSize <= 0 {
+		return nil, nil
+	}
+	parts := s3client.CalcParts(totalSize, partSize)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		buf := make([]byte, p.Size)
+		offset := int64(p.Number-1) * partSize
+		n, err := r.ReadAt(buf, offset)
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("read part %d: %w", p.Number, err)
+		}
+		if int64(n) != p.Size {
+			return nil, fmt.Errorf("short read for part %d: got %d want %d", p.Number, n, p.Size)
+		}
+		h := sha256.Sum256(buf)
+		out = append(out, base64.StdEncoding.EncodeToString(h[:]))
+	}
+	return out, nil
 }

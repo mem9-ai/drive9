@@ -335,8 +335,17 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		cl, _ = strconv.ParseInt(h, 10, 64)
 	}
 	if cl > 0 && b.IsLargeFile(cl) {
-		plan, err := b.InitiateUpload(r.Context(), path, cl)
+		partChecksums, err := parsePartChecksumsHeader(r.Header.Get("X-Dat9-Part-Checksums"))
 		if err != nil {
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		plan, err := b.InitiateUploadWithChecksums(r.Context(), path, cl, partChecksums)
+		if err != nil {
+			if strings.Contains(err.Error(), "checksum") {
+				errJSON(w, http.StatusBadRequest, err.Error())
+				return
+			}
 			if errors.Is(err, datastore.ErrUploadConflict) {
 				errJSON(w, http.StatusConflict, err.Error())
 				return
@@ -569,8 +578,17 @@ func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uplo
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	plan, err := b.ResumeUpload(r.Context(), uploadID)
+	partChecksums, err := parsePartChecksumsHeader(r.Header.Get("X-Dat9-Part-Checksums"))
 	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	plan, err := b.ResumeUploadWithChecksums(r.Context(), uploadID, partChecksums)
+	if err != nil {
+		if strings.Contains(err.Error(), "checksum") {
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if errors.Is(err, datastore.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
@@ -587,6 +605,23 @@ func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uplo
 		return
 	}
 	_ = json.NewEncoder(w).Encode(plan)
+}
+
+func parsePartChecksumsHeader(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		v := strings.TrimSpace(p)
+		if v == "" {
+			return nil, fmt.Errorf("invalid X-Dat9-Part-Checksums header")
+		}
+		out = append(out, v)
+	}
+	return out, nil
 }
 
 func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploadID string) {

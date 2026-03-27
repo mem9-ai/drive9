@@ -19,10 +19,11 @@ type Part struct {
 
 // UploadPartURL is a presigned URL for uploading one part.
 type UploadPartURL struct {
-	Number    int       // 1-based part number
-	URL       string    // presigned PUT URL
-	Size      int64     // expected part size
-	ExpiresAt time.Time // URL expiry
+	Number         int       `json:"number"`                    // 1-based part number
+	URL            string    `json:"url"`                       // presigned PUT URL
+	Size           int64     `json:"size"`                      // expected part size
+	ChecksumSHA256 string    `json:"checksum_sha256,omitempty"` // expected checksum for signed uploads
+	ExpiresAt      time.Time `json:"expires_at"`                // URL expiry
 }
 
 // MultipartUpload holds the state of an initiated multipart upload.
@@ -39,7 +40,7 @@ type S3Client interface {
 
 	// PresignUploadPart returns a presigned URL for uploading a specific part.
 	// partSize is bound into the presigned URL as Content-Length per §11.2.
-	PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, ttl time.Duration) (*UploadPartURL, error)
+	PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, checksumSHA256 string, ttl time.Duration) (*UploadPartURL, error)
 
 	// CompleteMultipartUpload finalizes the upload with the given parts.
 	CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []Part) error
