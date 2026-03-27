@@ -87,4 +87,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/c4pt0r/agfs/agfs-server => ../../c4pt0r/agfs/agfs-server
+replace github.com/c4pt0r/agfs/agfs-server => ../agfs/agfs-server
