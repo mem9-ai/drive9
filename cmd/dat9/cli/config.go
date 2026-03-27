@@ -83,7 +83,7 @@ func (c *Config) ResolveServer() string {
 	if c.Server != "" {
 		return c.Server
 	}
-	return "https://xkopoerih4.execute-api.ap-southeast-1.amazonaws.com"
+	return "http://localhost:9009"
 }
 
 const nameChars = "abcdefghijklmnopqrstuvwxyz0123456789"
