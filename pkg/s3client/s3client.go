@@ -11,9 +11,10 @@ import (
 
 // Part represents a single part in a multipart upload.
 type Part struct {
-	Number int    // 1-based part number
-	Size   int64  // part size in bytes
-	ETag   string // returned by S3 after upload
+	Number         int    // 1-based part number
+	Size           int64  // part size in bytes
+	ETag           string // returned by S3 after upload
+	ChecksumSHA256 string // base64-encoded SHA-256, set when client uploads with checksum
 }
 
 // UploadPartURL is a presigned URL for uploading one part.
@@ -37,7 +38,8 @@ type S3Client interface {
 	CreateMultipartUpload(ctx context.Context, key string) (*MultipartUpload, error)
 
 	// PresignUploadPart returns a presigned URL for uploading a specific part.
-	PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, ttl time.Duration) (*UploadPartURL, error)
+	// partSize is bound into the presigned URL as Content-Length per §11.2.
+	PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, ttl time.Duration) (*UploadPartURL, error)
 
 	// CompleteMultipartUpload finalizes the upload with the given parts.
 	CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []Part) error

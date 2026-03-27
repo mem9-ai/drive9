@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -39,13 +40,10 @@ func main() {
 	}
 
 	blobDir := envOr("DAT9_BLOB_DIR", defaultBlobDir)
-	s3Dir := envOr("DAT9_S3_DIR", defaultS3Dir)
+	s3Bucket := os.Getenv("DAT9_S3_BUCKET")
 
 	if err := os.MkdirAll(blobDir, 0o755); err != nil {
 		die(fmt.Errorf("create blob dir: %w", err))
-	}
-	if err := os.MkdirAll(s3Dir, 0o755); err != nil {
-		die(fmt.Errorf("create s3 dir: %w", err))
 	}
 
 	store, err := meta.Open(mysqlDSN)
@@ -54,10 +52,31 @@ func main() {
 	}
 	defer func() { _ = store.Close() }()
 
-	s3BaseURL := publicBaseURL(addr) + "/s3"
-	s3c, err := s3client.NewLocal(s3Dir, s3BaseURL)
-	if err != nil {
-		die(fmt.Errorf("create local s3 client: %w", err))
+	var s3c s3client.S3Client
+	if s3Bucket != "" {
+		// Production: real AWS S3.
+		s3c, err = s3client.NewAWS(context.Background(), s3client.AWSConfig{
+			Region:  envOr("DAT9_S3_REGION", "us-east-1"),
+			Bucket:  s3Bucket,
+			Prefix:  os.Getenv("DAT9_S3_PREFIX"),
+			RoleARN: os.Getenv("DAT9_S3_ROLE_ARN"),
+		})
+		if err != nil {
+			die(fmt.Errorf("create aws s3 client: %w", err))
+		}
+		log.Printf("using AWS S3 (bucket=%s, region=%s, role=%s)", s3Bucket, envOr("DAT9_S3_REGION", "us-east-1"), envOr("DAT9_S3_ROLE_ARN", "default-credentials"))
+	} else {
+		// Development: local filesystem S3 mock.
+		s3Dir := envOr("DAT9_S3_DIR", defaultS3Dir)
+		if err := os.MkdirAll(s3Dir, 0o755); err != nil {
+			die(fmt.Errorf("create s3 dir: %w", err))
+		}
+		s3BaseURL := publicBaseURL(addr) + "/s3"
+		s3c, err = s3client.NewLocal(s3Dir, s3BaseURL)
+		if err != nil {
+			die(fmt.Errorf("create local s3 client: %w", err))
+		}
+		log.Printf("using local S3 mock (dir=%s)", s3Dir)
 	}
 
 	b, err := backend.NewWithS3(store, blobDir, s3c)
@@ -83,7 +102,13 @@ environment:
   DAT9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
   DAT9_MYSQL_DSN   TiDB/MySQL DSN (required)
   DAT9_BLOB_DIR    blob directory (default: ./blobs)
-  DAT9_S3_DIR      s3 directory (default: ./s3)
+
+  S3 storage (set DAT9_S3_BUCKET to enable AWS S3, otherwise local mock):
+  DAT9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
+  DAT9_S3_REGION   AWS region (default: us-east-1)
+  DAT9_S3_PREFIX   S3 key prefix (e.g. "tenants/abc/")
+  DAT9_S3_ROLE_ARN IAM role ARN to assume via STS (optional)
+  DAT9_S3_DIR      local s3 mock directory (default: ./s3, only used without DAT9_S3_BUCKET)
 `)
 	os.Exit(2)
 }
