@@ -7,26 +7,32 @@ import (
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/internal/testmysql"
-	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
 func newTestBackend(t *testing.T) *Dat9Backend {
 	t.Helper()
 
-	blobDir, err := os.MkdirTemp("", "dat9-blobs-*")
+	s3Dir, err := os.MkdirTemp("", "dat9-s3-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(blobDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(s3Dir) })
 
-	store, err := meta.Open(testDSN)
+	initBackendSchema(t, testDSN)
+	store, err := datastore.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
 	testmysql.ResetDB(t, store.DB())
 	t.Cleanup(func() { _ = store.Close() })
 
-	b, err := New(store, blobDir)
+	s3c, err := s3client.NewLocal(s3Dir, "/s3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewWithS3(store, s3c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +145,7 @@ func TestRemove(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := b.Stat("/f.txt")
-	if err != meta.ErrNotFound {
+	if err != datastore.ErrNotFound {
 		t.Errorf("expected ErrNotFound, got %v", err)
 	}
 }
@@ -159,7 +165,7 @@ func TestRemoveAll(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := b.Stat("/data/")
-	if err != meta.ErrNotFound {
+	if err != datastore.ErrNotFound {
 		t.Errorf("expected ErrNotFound, got %v", err)
 	}
 }
@@ -172,7 +178,7 @@ func TestRename(t *testing.T) {
 	if err := b.Rename("/old.txt", "/new.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.Stat("/old.txt"); err != meta.ErrNotFound {
+	if _, err := b.Stat("/old.txt"); err != datastore.ErrNotFound {
 		t.Error("old path should be gone")
 	}
 	data, _ := b.Read("/new.txt", 0, -1)
