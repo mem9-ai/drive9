@@ -7,7 +7,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 )
@@ -43,7 +43,7 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 	// Enforce one active upload per path
 	existing, err := b.store.GetUploadByPath(path)
 	if err == nil && existing != nil {
-		return nil, meta.ErrUploadConflict
+		return nil, datastore.ErrUploadConflict
 	}
 
 	fileID := b.genID()
@@ -73,13 +73,13 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 	uploadID := b.genID()
 
 	// Insert PENDING file record
-	if err := b.store.InsertFile(&meta.File{
+	if err := b.store.InsertFile(&datastore.File{
 		FileID:      fileID,
-		StorageType: meta.StorageS3,
+		StorageType: datastore.StorageS3,
 		StorageRef:  s3Key,
 		SizeBytes:   totalSize,
 		Revision:    1,
-		Status:      meta.StatusPending,
+		Status:      datastore.StatusPending,
 		CreatedAt:   now,
 	}); err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
@@ -87,7 +87,7 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 	}
 
 	// Insert upload record
-	if err := b.store.InsertUpload(&meta.Upload{
+	if err := b.store.InsertUpload(&datastore.Upload{
 		UploadID:   uploadID,
 		FileID:     fileID,
 		TargetPath: path,
@@ -96,7 +96,7 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 		TotalSize:  totalSize,
 		PartSize:   s3client.PartSize,
 		PartsTotal: len(parts),
-		Status:     meta.UploadUploading,
+		Status:     datastore.UploadUploading,
 		CreatedAt:  now,
 		UpdatedAt:  now,
 		ExpiresAt:  now.Add(24 * time.Hour),
@@ -119,8 +119,8 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 	if err != nil {
 		return err
 	}
-	if upload.Status != meta.UploadUploading {
-		return meta.ErrUploadNotActive
+	if upload.Status != datastore.UploadUploading {
+		return datastore.ErrUploadNotActive
 	}
 
 	// List uploaded parts from S3
@@ -176,7 +176,7 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 				status = 'CONFIRMED',
 				confirmed_at = ?
 				WHERE file_id = ?`,
-				meta.StorageS3, upload.S3Key, upload.TotalSize, time.Now().UTC(), existingFileID.String)
+				datastore.StorageS3, upload.S3Key, upload.TotalSize, time.Now().UTC(), existingFileID.String)
 			if err != nil {
 				return err
 			}
@@ -195,7 +195,7 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		if err := b.store.ConfirmFileTx(tx, upload.FileID); err != nil {
 			return err
 		}
-		return b.store.InsertNodeTx(tx, &meta.FileNode{
+		return b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID:     b.genID(),
 			Path:       upload.TargetPath,
 			ParentPath: pathutil.ParentPath(upload.TargetPath),
@@ -218,8 +218,8 @@ func (b *Dat9Backend) ResumeUpload(ctx context.Context, uploadID string) (*Uploa
 	if err != nil {
 		return nil, err
 	}
-	if upload.Status != meta.UploadUploading {
-		return nil, meta.ErrUploadNotActive
+	if upload.Status != datastore.UploadUploading {
+		return nil, datastore.ErrUploadNotActive
 	}
 
 	// Check expiry — best-effort abort of S3 multipart, then mark metadata.
@@ -230,7 +230,7 @@ func (b *Dat9Backend) ResumeUpload(ctx context.Context, uploadID string) (*Uploa
 			log.Printf("WARNING: failed to abort expired multipart upload %s: %v", uploadID, err)
 		}
 		_ = b.store.AbortUpload(uploadID)
-		return nil, meta.ErrUploadExpired
+		return nil, datastore.ErrUploadExpired
 	}
 
 	// List already-uploaded parts
@@ -274,8 +274,8 @@ func (b *Dat9Backend) AbortUpload(ctx context.Context, uploadID string) error {
 	if err != nil {
 		return err
 	}
-	if upload.Status != meta.UploadUploading {
-		return meta.ErrUploadNotActive
+	if upload.Status != datastore.UploadUploading {
+		return datastore.ErrUploadNotActive
 	}
 
 	_ = b.s3.AbortMultipartUpload(ctx, upload.S3Key, upload.S3UploadID)
@@ -283,12 +283,12 @@ func (b *Dat9Backend) AbortUpload(ctx context.Context, uploadID string) error {
 }
 
 // GetUpload returns the upload record.
-func (b *Dat9Backend) GetUpload(uploadID string) (*meta.Upload, error) {
+func (b *Dat9Backend) GetUpload(uploadID string) (*datastore.Upload, error) {
 	return b.store.GetUpload(uploadID)
 }
 
 // ListUploads returns uploads for a given path and status.
-func (b *Dat9Backend) ListUploads(path string, status meta.UploadStatus) ([]*meta.Upload, error) {
+func (b *Dat9Backend) ListUploads(path string, status datastore.UploadStatus) ([]*datastore.Upload, error) {
 	path, err := pathutil.Canonicalize(path)
 	if err != nil {
 		return nil, err
@@ -309,7 +309,7 @@ func (b *Dat9Backend) PresignGetObject(ctx context.Context, path string) (string
 	if nf.File == nil {
 		return "", fmt.Errorf("no file entity for path: %s", path)
 	}
-	if nf.File.StorageType != meta.StorageS3 {
+	if nf.File.StorageType != datastore.StorageS3 {
 		return "", fmt.Errorf("file is not S3-stored: %s", path)
 	}
 	return b.s3.PresignGetObject(ctx, nf.File.StorageRef, s3client.DownloadTTL)

@@ -7,25 +7,34 @@ import (
 
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
-	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/server"
+	"github.com/mem9-ai/dat9/pkg/tenant"
 )
 
 func newTestClient(t *testing.T) (*Client, func()) {
 	t.Helper()
 
-	blobDir, err := os.MkdirTemp("", "dat9-client-blobs-*")
+	s3Dir, err := os.MkdirTemp("", "dat9-client-s3-*")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	store, err := meta.Open(testDSN)
+	if err := tenant.InitSchemaForProvider(testDSN, tenant.ProviderTiDBZero); err != nil {
+		t.Fatal(err)
+	}
+	store, err := datastore.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
 	testmysql.ResetDB(t, store.DB())
 
-	b, err := backend.New(store, blobDir)
+	s3c, err := s3client.NewLocal(s3Dir, "/s3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := backend.NewWithS3(store, s3c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +45,7 @@ func newTestClient(t *testing.T) (*Client, func()) {
 	cleanup := func() {
 		ts.Close()
 		_ = store.Close()
-		_ = os.RemoveAll(blobDir)
+		_ = os.RemoveAll(s3Dir)
 	}
 
 	return New(ts.URL, ""), cleanup
