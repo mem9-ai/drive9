@@ -224,3 +224,28 @@ func readError(resp *http.Response) error {
 	}
 	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 }
+
+func (c *Client) SQL(query string) ([]map[string]interface{}, error) {
+	body, err := json.Marshal(map[string]string{"query": query})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/v1/sql", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var rows []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return rows, nil
+}

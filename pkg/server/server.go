@@ -29,6 +29,7 @@ func New(b *backend.Dat9Backend) *Server {
 	mux.HandleFunc("/v1/fs/", s.handleFS)
 	mux.HandleFunc("/v1/uploads", s.handleUploads)
 	mux.HandleFunc("/v1/uploads/", s.handleUploadAction)
+	mux.HandleFunc("/v1/sql", s.handleSQL)
 
 	// Register local S3 handler for presigned URL support in dev/test mode
 	if local, ok := b.S3().(*s3client.LocalS3Client); ok {
@@ -407,6 +408,34 @@ func errJSON(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req struct {
+		Query string `json:"query"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		errJSON(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if req.Query == "" {
+		errJSON(w, http.StatusBadRequest, "empty query")
+		return
+	}
+
+	rows, err := s.backend.ExecSQL(r.Context(), req.Query)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(rows)
 }
 
 // ListenAndServe starts the server on the given address.
