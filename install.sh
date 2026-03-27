@@ -2,12 +2,11 @@
 set -e
 
 # dat9 installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/qiffang/dat9/main/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/mem9-ai/dat9/main/install.sh | sh
 
-REPO="qiffang/dat9"
+REPO="mem9-ai/dat9"
 DEFAULT_INSTALL_DIR="/usr/local/bin"
 INSTALL_DIR=""
-SERVER_URL="https://xkopoerih4.execute-api.ap-southeast-1.amazonaws.com"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -115,40 +114,11 @@ report_path_status() {
   fi
 }
 
-bootstrap_server_config() {
+bootstrap_config() {
   if [ -z "${HOME:-}" ]; then
-    warn "HOME is not set; skipping server config bootstrap"
     return
   fi
-
-  CONFIG_DIR="${HOME}/.dat9"
-  CONFIG_PATH="${CONFIG_DIR}/config"
-
-  # If config already has a server set, don't overwrite
-  if [ -f "$CONFIG_PATH" ] && grep -q '"server"' "$CONFIG_PATH" 2>/dev/null; then
-    info "Keeping existing server from ${CONFIG_PATH}"
-    return
-  fi
-
-  mkdir -p "$CONFIG_DIR" 2>/dev/null || {
-    warn "Could not create ${CONFIG_DIR}; skipping server config bootstrap"
-    return
-  }
-
-  # Write default config with server URL
-  if [ ! -f "$CONFIG_PATH" ]; then
-    cat > "$CONFIG_PATH" <<CONF
-{
-  "server": "${SERVER_URL}",
-  "contexts": {}
-}
-CONF
-    info "Set default server to ${SERVER_URL}"
-  else
-    # Config exists but has no server — rewrite with server added
-    info "Existing config found without server; please set server manually:"
-    info "  dat9 expects DAT9_SERVER=${SERVER_URL}"
-  fi
+  mkdir -p "${HOME}/.dat9" 2>/dev/null || true
 }
 
 main() {
@@ -210,7 +180,7 @@ main() {
   else
     success "dat9 installed successfully!"
   fi
-  bootstrap_server_config
+  bootstrap_config
   report_path_status
   printf "\n"
   printf "  Next step:\n"
@@ -223,7 +193,7 @@ main() {
   printf "    ${DIM}\$${RESET} dat9 fs sh                               ${DIM}# interactive shell${RESET}\n"
   printf "\n"
   printf "  Environment:\n"
-  printf "    ${DIM}DAT9_SERVER${RESET}   server URL (default: ${SERVER_URL})\n"
+  printf "    ${DIM}DAT9_SERVER${RESET}   server URL (default: http://localhost:9009)\n"
   printf "    ${DIM}DAT9_API_KEY${RESET}  API key\n"
   printf "\n"
 }

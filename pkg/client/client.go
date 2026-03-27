@@ -280,7 +280,7 @@ func (c *Client) Grep(query, pathPrefix string, limit int) ([]SearchResult, erro
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return nil, readError(resp)
 	}
@@ -302,7 +302,7 @@ func (c *Client) Find(pathPrefix string, params url.Values) ([]SearchResult, err
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return nil, readError(resp)
 	}

@@ -87,13 +87,18 @@ func rrfMerge(fts, vec []SearchResult, limit int) []SearchResult {
 	return merged
 }
 
+func subtreeCond(prefix string) (string, []any) {
+	return "(fn.path = ? OR fn.path LIKE ?)", []any{prefix, prefix + "/%"}
+}
+
 func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limit int) []SearchResult {
 	conds := []string{"f.status = 'CONFIRMED'", "f.embedding IS NOT NULL"}
 	args := []any{query}
 
 	if pathPrefix != "" && pathPrefix != "/" {
-		conds = append(conds, "fn.path LIKE ?")
-		args = append(args, pathPrefix+"%")
+		cond, pargs := subtreeCond(pathPrefix)
+		conds = append(conds, cond)
+		args = append(args, pargs...)
 	}
 	args = append(args, query, limit)
 
@@ -108,7 +113,7 @@ func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limi
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []SearchResult
 	for rows.Next() {
@@ -146,8 +151,9 @@ func (s *Store) ftsSearch(ctx context.Context, query, pathPrefix string, limit i
 	var args []any
 
 	if pathPrefix != "" && pathPrefix != "/" {
-		conds = append(conds, "fn.path LIKE ?")
-		args = append(args, pathPrefix+"%")
+		cond, pargs := subtreeCond(pathPrefix)
+		conds = append(conds, cond)
+		args = append(args, pargs...)
 	}
 	args = append(args, limit)
 
@@ -161,7 +167,7 @@ func (s *Store) ftsSearch(ctx context.Context, query, pathPrefix string, limit i
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []SearchResult
 	for rows.Next() {
@@ -181,8 +187,9 @@ func (s *Store) keywordSearch(ctx context.Context, query, pathPrefix string, lim
 	args := []any{query}
 
 	if pathPrefix != "" && pathPrefix != "/" {
-		conds = append(conds, "fn.path LIKE ?")
-		args = append(args, pathPrefix+"%")
+		cond, pargs := subtreeCond(pathPrefix)
+		conds = append(conds, cond)
+		args = append(args, pargs...)
 	}
 	args = append(args, limit)
 
@@ -195,7 +202,7 @@ func (s *Store) keywordSearch(ctx context.Context, query, pathPrefix string, lim
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []SearchResult
 	for rows.Next() {
@@ -217,8 +224,9 @@ func (s *Store) Find(ctx context.Context, f *FindFilter) ([]SearchResult, error)
 	var args []any
 
 	if f.PathPrefix != "" && f.PathPrefix != "/" {
-		conds = append(conds, "fn.path LIKE ?")
-		args = append(args, f.PathPrefix+"%")
+		cond, pargs := subtreeCond(f.PathPrefix)
+		conds = append(conds, cond)
+		args = append(args, pargs...)
 	}
 	if f.NameGlob != "" {
 		pattern := strings.ReplaceAll(strings.ReplaceAll(f.NameGlob, "*", "%"), "?", "_")
@@ -261,7 +269,7 @@ func (s *Store) Find(ctx context.Context, f *FindFilter) ([]SearchResult, error)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []SearchResult
 	for rows.Next() {

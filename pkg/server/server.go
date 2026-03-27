@@ -846,7 +846,10 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 	}
 	limit := 20
 	if v := r.URL.Query().Get("limit"); v != "" {
-		fmt.Sscanf(v, "%d", &limit)
+		if _, err := fmt.Sscanf(v, "%d", &limit); err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid limit: "+v)
+			return
+		}
 	}
 	results, err := b.Grep(r.Context(), query, path, limit)
 	if err != nil {
@@ -872,23 +875,38 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 		f.TagValue = v
 	}
 	if v := q.Get("newer"); v != "" {
-		if t, err := time.Parse("2006-01-02", v); err == nil {
-			f.After = &t
+		t, err := time.Parse("2006-01-02", v)
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid newer date: "+v)
+			return
 		}
+		f.After = &t
 	}
 	if v := q.Get("older"); v != "" {
-		if t, err := time.Parse("2006-01-02", v); err == nil {
-			f.Before = &t
+		t, err := time.Parse("2006-01-02", v)
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid older date: "+v)
+			return
 		}
+		f.Before = &t
 	}
 	if v := q.Get("minsize"); v != "" {
-		fmt.Sscanf(v, "%d", &f.MinSize)
+		if _, err := fmt.Sscanf(v, "%d", &f.MinSize); err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid minsize: "+v)
+			return
+		}
 	}
 	if v := q.Get("maxsize"); v != "" {
-		fmt.Sscanf(v, "%d", &f.MaxSize)
+		if _, err := fmt.Sscanf(v, "%d", &f.MaxSize); err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid maxsize: "+v)
+			return
+		}
 	}
 	if v := q.Get("limit"); v != "" {
-		fmt.Sscanf(v, "%d", &f.Limit)
+		if _, err := fmt.Sscanf(v, "%d", &f.Limit); err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid limit: "+v)
+			return
+		}
 	}
 	results, err := b.Find(r.Context(), f)
 	if err != nil {

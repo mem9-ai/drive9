@@ -67,7 +67,7 @@ func Find(c *client.Client, args []string) error {
 		return err
 	}
 	for _, r := range results {
-		fmt.Fprintln(os.Stdout, r.Path)
+		_, _ = fmt.Fprintln(os.Stdout, r.Path)
 	}
 	return nil
 }

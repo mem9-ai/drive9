@@ -27,9 +27,9 @@ func Grep(c *client.Client, args []string) error {
 	}
 	for _, r := range results {
 		if r.Score != nil {
-			fmt.Fprintf(os.Stdout, "%s\t%.2f\n", r.Path, *r.Score)
+			_, _ = fmt.Fprintf(os.Stdout, "%s\t%.2f\n", r.Path, *r.Score)
 		} else {
-			fmt.Fprintln(os.Stdout, r.Path)
+			_, _ = fmt.Fprintln(os.Stdout, r.Path)
 		}
 	}
 	return nil
