@@ -905,7 +905,7 @@ Agent (no key yet)
     1. Generate api_key: "dat9_" + 32 random bytes (base62)
     2. Call db9 API: create cluster → get connection string
     3. Connect to new cluster, run schema init (4 tables + indexes + extensions)
-    4. Create S3 prefix: s3://<bucket>/tenants/<tenant_id>/blobs/
+    4. Create S3 prefix: s3://<bucket>/tenants/<tenant_id>/
     5. INSERT INTO tenants (api_key_hash, db9_dsn, s3_prefix, ...)
     6. Return api_key to agent (only time it's shown in plaintext)
   │
@@ -929,7 +929,7 @@ CREATE TABLE tenants (
     api_key_hash    CHAR(64) NOT NULL,           -- SHA-256(api_key), for verification
     db9_dsn         TEXT NOT NULL,                -- db9 cluster connection string (encrypted at rest)
     s3_bucket       VARCHAR(63) NOT NULL,
-    s3_prefix       VARCHAR(1024) NOT NULL,       -- tenants/<tenant_id>/blobs/
+    s3_prefix       VARCHAR(1024) NOT NULL,       -- tenants/<tenant_id>/
     status          ENUM('PROVISIONING','ACTIVE','SUSPENDED','DELETED') NOT NULL DEFAULT 'PROVISIONING',
     created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     last_active_at  DATETIME(3),

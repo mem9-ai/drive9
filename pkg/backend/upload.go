@@ -61,12 +61,11 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 	// Presign all part URLs
 	urls := make([]*s3client.UploadPartURL, len(parts))
 	for i, p := range parts {
-		u, err := b.s3.PresignUploadPart(ctx, s3Key, mpu.UploadID, p.Number, s3client.UploadTTL)
+		u, err := b.s3.PresignUploadPart(ctx, s3Key, mpu.UploadID, p.Number, p.Size, s3client.UploadTTL)
 		if err != nil {
 			_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 			return nil, fmt.Errorf("presign part %d: %w", p.Number, err)
 		}
-		u.Size = p.Size
 		urls[i] = u
 	}
 
@@ -254,11 +253,10 @@ func (b *Dat9Backend) ResumeUpload(ctx context.Context, uploadID string) (*Uploa
 		if uploadedSet[p.Number] {
 			continue
 		}
-		u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, p.Number, s3client.UploadTTL)
+		u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, p.Number, p.Size, s3client.UploadTTL)
 		if err != nil {
 			return nil, fmt.Errorf("presign part %d: %w", p.Number, err)
 		}
-		u.Size = p.Size
 		urls = append(urls, u)
 	}
 
