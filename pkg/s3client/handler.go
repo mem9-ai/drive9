@@ -10,6 +10,7 @@ import (
 )
 
 // Handler returns an http.Handler that serves the local S3 presigned URLs.
+// All requests must include valid sig and exp query parameters (HMAC-signed).
 // Mount this at the baseURL path prefix (e.g. "/s3").
 func (c *LocalS3Client) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -18,10 +19,24 @@ func (c *LocalS3Client) Handler() http.Handler {
 	return mux
 }
 
+// verifySig checks the HMAC signature and expiry on the request.
+func (c *LocalS3Client) verifySig(r *http.Request) bool {
+	sig := r.URL.Query().Get("sig")
+	exp := r.URL.Query().Get("exp")
+	if sig == "" || exp == "" {
+		return false
+	}
+	return c.VerifySignature(r.URL.Path, sig, exp)
+}
+
 // handleUploadPart handles PUT /upload/{uploadID}/{partNumber}
 func (c *LocalS3Client) handleUploadPart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !c.verifySig(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -53,6 +68,10 @@ func (c *LocalS3Client) handleUploadPart(w http.ResponseWriter, r *http.Request)
 func (c *LocalS3Client) handleGetObject(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !c.verifySig(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
