@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -32,9 +33,11 @@ func DBCreate(args []string) error {
 	}
 
 	c := client.New(server, "")
-	resp, err := c.RawPost("/v1/provision", nil)
+	reqBody := map[string]string{"name": name}
+	body, _ := json.Marshal(reqBody)
+	resp, err := c.RawPost("/v1/create", bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("provision request failed: %w", err)
+		return fmt.Errorf("create request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -43,17 +46,17 @@ func DBCreate(args []string) error {
 			Error string `json:"error"`
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&errResp)
-		return fmt.Errorf("provision failed (HTTP %d): %s", resp.StatusCode, errResp.Error)
+		return fmt.Errorf("create failed (HTTP %d): %s", resp.StatusCode, errResp.Error)
 	}
 
 	var result struct {
-		TenantID string `json:"tenant_id"`
-		APIKey   string `json:"api_key"`
-		APIKeyID string `json:"api_key_id"`
-		Status   string `json:"status"`
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		APIKey string `json:"api_key"`
+		Status string `json:"status"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("decode provision response: %w", err)
+		return fmt.Errorf("decode create response: %w", err)
 	}
 
 	cfg.SetDB(name, &DBEntry{
@@ -67,7 +70,7 @@ func DBCreate(args []string) error {
 		return fmt.Errorf("save credentials: %w", err)
 	}
 
-	fmt.Printf("database %q created (tenant: %s, status: %s)\n", name, result.TenantID, result.Status)
+	fmt.Printf("database %q created (id: %s, name: %s, status: %s)\n", name, result.ID, result.Name, result.Status)
 	fmt.Printf("API key saved to %s\n", configPath())
 	if cfg.DefaultDB == name {
 		fmt.Printf("set as default database\n")

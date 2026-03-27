@@ -94,8 +94,8 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	body, _ := json.Marshal(map[string]any{"provider": tenant.ProviderTiDBZero})
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
+	body, _ := json.Marshal(map[string]any{"name": "failure-case"})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/create", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -194,8 +194,8 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	body, _ := json.Marshal(map[string]any{"provider": tenant.ProviderTiDBZero, "db_tls": false})
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
+	body, _ := json.Marshal(map[string]any{"name": "configured-provisioner"})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/create", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -212,6 +212,9 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	}
 	if out["api_key"] == "" {
 		t.Fatalf("unexpected provision response: %+v", out)
+	}
+	if out["id"] == "" || out["name"] == "" {
+		t.Fatalf("expected id and name in create response, got %+v", out)
 	}
 	resolved, err := metaStore.ResolveByAPIKeyHash(tenant.HashToken(out["api_key"]))
 	if err != nil {

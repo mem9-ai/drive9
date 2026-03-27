@@ -2,7 +2,7 @@
 # dat9 API smoke test against a live dat9-server deployment.
 #
 # Coverage:
-#  1) Provision tenant (expect 202, api_key + status only)
+#  1) Create tenant (expect 202, id + name + api_key + status)
 #  2) Poll tenant status via GET /v1/status until active
 #  3) Root list
 #  4) Nested mkdir (multi-level directories)
@@ -107,18 +107,22 @@ ROOT_DIR="team-${TS}"
 BACKEND_DIR="${ROOT_DIR}/backend/go"
 FRONTEND_DIR="${ROOT_DIR}/frontend/web"
 
-step "1" "Provision tenant"
-resp=$(curl_body_code POST "$BASE/v1/provision")
+step "1" "Create tenant"
+resp=$(curl_body_code POST "$BASE/v1/create")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
-check_eq "POST /v1/provision returns 202" "$code" "202"
+check_eq "POST /v1/create returns 202" "$code" "202"
 
+TENANT_ID=$(printf '%s' "$body" | jq -r '.id // empty')
+TENANT_NAME=$(printf '%s' "$body" | jq -r '.name // empty')
 API_KEY=$(printf '%s' "$body" | jq -r '.api_key // empty')
 INIT_STATUS=$(printf '%s' "$body" | jq -r '.status // empty')
+check_cmd "response contains id" test -n "$TENANT_ID"
+check_cmd "response contains name" test -n "$TENANT_NAME"
 check_cmd "response contains api_key" test -n "$API_KEY"
 check_eq "provision response status is provisioning" "$INIT_STATUS" "provisioning"
 keys=$(printf '%s' "$body" | jq -r 'keys_unsorted | sort | join(",")')
-check_eq "provision response only has api_key+status" "$keys" "api_key,status"
+check_eq "create response has id,name,api_key,status" "$keys" "api_key,id,name,status"
 
 step "2" "Poll tenant status via /v1/status"
 deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))
@@ -128,6 +132,8 @@ while :; do
   scode=$(http_code "$sresp")
   sbody=$(json_body "$sresp")
   LAST_STATUS=$(printf '%s' "$sbody" | jq -r '.status // empty')
+  STATUS_ID=$(printf '%s' "$sbody" | jq -r '.id // empty')
+  STATUS_NAME=$(printf '%s' "$sbody" | jq -r '.name // empty')
   info "status=$LAST_STATUS"
   if [ "$scode" = "200" ] && [ "$LAST_STATUS" = "active" ]; then
     break
@@ -138,6 +144,8 @@ while :; do
   sleep "$POLL_INTERVAL_S"
 done
 check_eq "tenant eventually becomes active" "$LAST_STATUS" "active"
+check_eq "status response keeps same id" "$STATUS_ID" "$TENANT_ID"
+check_eq "status response keeps same name" "$STATUS_NAME" "$TENANT_NAME"
 
 step "3" "Root list"
 resp=$(curl_body_code GET "$BASE/v1/fs/?list" "$API_KEY")

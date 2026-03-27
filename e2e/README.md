@@ -35,6 +35,6 @@ export DAT9_BASE="https://xkopoerih4.execute-api.ap-southeast-1.amazonaws.com"
 
 ## Notes
 
-- `api-smoke-test.sh` expects `POST /v1/provision` to return only `api_key` and `status`.
-- Tenant readiness is checked through `GET /v1/status`.
+- `api-smoke-test.sh` expects `POST /v1/create` to return `id`, `name`, `api_key`, and `status`.
+- Tenant readiness is checked through `GET /v1/status`, which returns `id`, `name`, and `status`.
 - File operations use `/v1/fs/*` and include nested directory coverage.

@@ -35,6 +35,7 @@ const (
 
 type Tenant struct {
 	ID               string
+	Name             string
 	Status           TenantStatus
 	DBHost           string
 	DBPort           int
@@ -101,6 +102,7 @@ func (s *Store) migrate() error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS tenants (
 			id               VARCHAR(64) PRIMARY KEY,
+			name             VARCHAR(255) NOT NULL,
 			status           VARCHAR(20) NOT NULL DEFAULT 'provisioning',
 			db_host          VARCHAR(255) NOT NULL,
 			db_port          INT NOT NULL,
@@ -145,11 +147,15 @@ func (s *Store) migrate() error {
 }
 
 func (s *Store) InsertTenant(t *Tenant) error {
+	name := strings.TrimSpace(t.Name)
+	if name == "" {
+		name = t.ID
+	}
 	_, err := s.db.Exec(`INSERT INTO tenants
-		(id, status, db_host, db_port, db_user, db_password, db_name, db_tls,
+		(id, name, status, db_host, db_port, db_user, db_password, db_name, db_tls,
 		 provider, cluster_id, claim_url, claim_expires_at, schema_version, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Status, t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, name, t.Status, t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
 		t.Provider, nullStr(t.ClusterID), nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion, t.CreatedAt.UTC(), t.UpdatedAt.UTC())
 	if isDuplicateEntry(err) {
 		return ErrDuplicate
@@ -171,7 +177,7 @@ func (s *Store) InsertAPIKey(k *APIKey) error {
 
 func (s *Store) ResolveByAPIKeyHash(hash string) (*TenantWithAPIKey, error) {
 	row := s.db.QueryRow(`SELECT
-			t.id, t.status, t.db_host, t.db_port, t.db_user, t.db_password, t.db_name, t.db_tls,
+			t.id, t.name, t.status, t.db_host, t.db_port, t.db_user, t.db_password, t.db_name, t.db_tls,
 			t.provider, t.cluster_id, t.claim_url, t.claim_expires_at, t.schema_version, t.created_at, t.updated_at,
 			k.id, k.tenant_id, k.key_name, k.jwt_ciphertext, k.jwt_hash, k.token_version, k.status, k.issued_at,
 			k.revoked_at, k.created_at, k.updated_at
@@ -186,7 +192,7 @@ func (s *Store) ResolveByAPIKeyHash(hash string) (*TenantWithAPIKey, error) {
 	var clusterID sql.NullString
 	var revokedAt sql.NullTime
 	if err := row.Scan(
-		&out.Tenant.ID, &out.Tenant.Status, &out.Tenant.DBHost, &out.Tenant.DBPort, &out.Tenant.DBUser,
+		&out.Tenant.ID, &out.Tenant.Name, &out.Tenant.Status, &out.Tenant.DBHost, &out.Tenant.DBPort, &out.Tenant.DBUser,
 		&out.Tenant.DBPasswordCipher, &out.Tenant.DBName, &dbTLS, &out.Tenant.Provider, &clusterID,
 		&claimURL, &claimExp, &out.Tenant.SchemaVersion, &out.Tenant.CreatedAt, &out.Tenant.UpdatedAt,
 		&out.APIKey.ID, &out.APIKey.TenantID, &out.APIKey.KeyName, &out.APIKey.JWTCiphertext,
@@ -217,7 +223,7 @@ func (s *Store) ResolveByAPIKeyHash(hash string) (*TenantWithAPIKey, error) {
 }
 
 func (s *Store) GetTenant(id string) (*Tenant, error) {
-	row := s.db.QueryRow(`SELECT id, status, db_host, db_port, db_user, db_password, db_name,
+	row := s.db.QueryRow(`SELECT id, name, status, db_host, db_port, db_user, db_password, db_name,
 		db_tls, provider, cluster_id, claim_url, claim_expires_at, schema_version, created_at, updated_at
 		FROM tenants WHERE id = ?`, id)
 	var out Tenant
@@ -225,7 +231,7 @@ func (s *Store) GetTenant(id string) (*Tenant, error) {
 	var clusterID sql.NullString
 	var claimURL sql.NullString
 	var claimExp sql.NullTime
-	if err := row.Scan(&out.ID, &out.Status, &out.DBHost, &out.DBPort, &out.DBUser, &out.DBPasswordCipher,
+	if err := row.Scan(&out.ID, &out.Name, &out.Status, &out.DBHost, &out.DBPort, &out.DBUser, &out.DBPasswordCipher,
 		&out.DBName, &dbTLS, &out.Provider, &clusterID, &claimURL, &claimExp, &out.SchemaVersion,
 		&out.CreatedAt, &out.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -251,7 +257,7 @@ func (s *Store) ListTenantsByStatus(status TenantStatus, limit int) ([]Tenant, e
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.Query(`SELECT id, status, db_host, db_port, db_user, db_password, db_name,
+	rows, err := s.db.Query(`SELECT id, name, status, db_host, db_port, db_user, db_password, db_name,
 		db_tls, provider, cluster_id, claim_url, claim_expires_at, schema_version, created_at, updated_at
 		FROM tenants WHERE status = ? ORDER BY created_at ASC LIMIT ?`, status, limit)
 	if err != nil {
@@ -266,7 +272,7 @@ func (s *Store) ListTenantsByStatus(status TenantStatus, limit int) ([]Tenant, e
 		var clusterID sql.NullString
 		var claimURL sql.NullString
 		var claimExp sql.NullTime
-		if err := rows.Scan(&t.ID, &t.Status, &t.DBHost, &t.DBPort, &t.DBUser, &t.DBPasswordCipher,
+		if err := rows.Scan(&t.ID, &t.Name, &t.Status, &t.DBHost, &t.DBPort, &t.DBUser, &t.DBPasswordCipher,
 			&t.DBName, &dbTLS, &t.Provider, &clusterID, &claimURL, &claimExp, &t.SchemaVersion,
 			&t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err

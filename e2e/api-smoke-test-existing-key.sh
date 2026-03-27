@@ -51,7 +51,11 @@ resp=$(curl_code GET "$BASE/v1/status")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 status=$(printf '%s' "$body" | jq -r '.status // empty')
+tenant_id=$(printf '%s' "$body" | jq -r '.id // empty')
+tenant_name=$(printf '%s' "$body" | jq -r '.name // empty')
 check_eq "GET /v1/status returns 200" "$code" "200"
+check_eq "status response has id" "$([ -n "$tenant_id" ] && echo yes || echo no)" "yes"
+check_eq "status response has name" "$([ -n "$tenant_name" ] && echo yes || echo no)" "yes"
 
 if [ "$status" = "provisioning" ]; then
   deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))

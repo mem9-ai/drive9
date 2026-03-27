@@ -167,8 +167,8 @@ func TestProvisionWithoutProvisionerReturnsNotFound(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	body, _ := json.Marshal(map[string]any{"provider": tenant.ProviderDB9})
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
+	body, _ := json.Marshal(map[string]any{"name": "test-db"})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/create", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -200,7 +200,7 @@ func TestTenantStatusWithValidKey(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if len(out) != 1 || out["status"] != string(meta.TenantActive) {
+	if out["id"] == "" || out["name"] == "" || out["status"] != string(meta.TenantActive) {
 		t.Fatalf("unexpected tenant status response: %+v", out)
 	}
 }
@@ -228,7 +228,7 @@ func TestTenantStatusReturnsProvisioningState(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if len(out) != 1 || out["status"] != string(meta.TenantProvisioning) {
+	if out["id"] == "" || out["name"] == "" || out["status"] != string(meta.TenantProvisioning) {
 		t.Fatalf("expected provisioning status, got %+v", out)
 	}
 }

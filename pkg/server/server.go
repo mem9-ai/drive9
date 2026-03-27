@@ -71,7 +71,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/uploads/", business)
 	mux.Handle("/v1/sql", business)
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
-	mux.HandleFunc("/v1/provision", s.handleProvision)
+	mux.HandleFunc("/v1/create", s.handleCreate)
 
 	local := cfg.LocalS3
 	if local == nil && cfg.Backend != nil {
@@ -223,7 +223,11 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": string(resolved.Tenant.Status)})
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"id":     resolved.Tenant.ID,
+		"name":   resolved.Tenant.Name,
+		"status": string(resolved.Tenant.Status),
+	})
 }
 
 func backendFromRequest(r *http.Request) *backend.Dat9Backend {
@@ -606,7 +610,7 @@ func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploa
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -626,6 +630,19 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenantID := tenant.NewID()
+	tenantName := tenant.HashToken(tenantID)
+	var req struct {
+		Name string `json:"name"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			errJSON(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+			return
+		}
+		if strings.TrimSpace(req.Name) != "" {
+			tenantName = strings.TrimSpace(req.Name)
+		}
+	}
 	keyName := "default"
 
 	token, err := tenant.IssueToken(s.tokenSecret, tenantID, 1)
@@ -655,6 +672,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	if err := s.meta.InsertTenant(&meta.Tenant{
 		ID:               tenantID,
+		Name:             tenantName,
 		Status:           meta.TenantProvisioning,
 		DBHost:           cluster.Host,
 		DBPort:           cluster.Port,
@@ -697,6 +715,8 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{
+		"id":      tenantID,
+		"name":    tenantName,
 		"api_key": token,
 		"status":  string(meta.TenantProvisioning),
 	})
