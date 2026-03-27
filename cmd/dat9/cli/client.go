@@ -1,7 +1,3 @@
-// Package cli implements dat9 CLI commands.
-//
-// Design follows Plan 9 philosophy: small tools, composable, no flags bloat.
-// Each command reads from the client SDK and writes to stdout/stderr.
 package cli
 
 import (
@@ -10,12 +6,31 @@ import (
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
-// NewFromEnv creates a dat9 client from environment variables.
-func NewFromEnv() *client.Client {
+func NewClient(dbName string) *client.Client {
 	server := os.Getenv("DAT9_SERVER")
+	apiKey := os.Getenv("DAT9_API_KEY")
+
+	cfg := loadConfig()
+	if dbName == "" {
+		dbName = cfg.DefaultDB
+	}
+
+	entry := cfg.GetDB(dbName)
+	if entry != nil {
+		if server == "" {
+			server = entry.Server
+		}
+		if apiKey == "" {
+			apiKey = entry.APIKey
+		}
+	}
+
 	if server == "" {
 		server = "http://localhost:9009"
 	}
-	apiKey := os.Getenv("DAT9_API_KEY")
 	return client.New(server, apiKey)
+}
+
+func NewFromEnv() *client.Client {
+	return NewClient("")
 }

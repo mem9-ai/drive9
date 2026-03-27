@@ -4,9 +4,11 @@
 package datastore
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -105,8 +107,9 @@ type Store struct {
 }
 
 func Open(dsn string) (*Store, error) {
-	if strings.Contains(dsn, "multiStatements=true") {
-		return nil, fmt.Errorf("multiStatements=true is not allowed in production DSN")
+	lower := strings.ToLower(dsn)
+	if strings.Contains(lower, "multistatements=true") || strings.Contains(lower, "multistatements=1") {
+		return nil, fmt.Errorf("multiStatements is not allowed in production DSN")
 	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -992,4 +995,116 @@ func isUniqueViolation(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "Duplicate entry") || strings.Contains(msg, "UNIQUE constraint failed")
+}
+
+var wsNorm = regexp.MustCompile(`\s+`)
+
+func normalizeSQL(s string) string {
+	return wsNorm.ReplaceAllString(strings.TrimSpace(s), " ")
+}
+
+func (s *Store) ExecSQL(ctx context.Context, query string) ([]map[string]interface{}, error) {
+	q := strings.TrimSpace(query)
+	norm := strings.ToUpper(normalizeSQL(q))
+
+	isSelect := strings.HasPrefix(norm, "SELECT")
+	if strings.HasPrefix(norm, "WITH") {
+		hasDML := strings.Contains(norm, "INSERT") ||
+			strings.Contains(norm, "UPDATE") ||
+			strings.Contains(norm, "DELETE") ||
+			strings.Contains(norm, "DROP") ||
+			strings.Contains(norm, "ALTER") ||
+			strings.Contains(norm, "TRUNCATE")
+		if !hasDML {
+			isSelect = true
+		}
+	}
+	isTagWrite := strings.HasPrefix(norm, "INSERT INTO FILE_TAGS") ||
+		strings.HasPrefix(norm, "UPDATE FILE_TAGS") ||
+		strings.HasPrefix(norm, "DELETE FROM FILE_TAGS")
+
+	if isTagWrite {
+		if strings.HasPrefix(norm, "UPDATE") || strings.HasPrefix(norm, "DELETE") {
+			if strings.Contains(norm, " JOIN ") || strings.Contains(norm, " USING ") {
+				return nil, fmt.Errorf("multi-table DML not allowed; single-table statements on file_tags only")
+			}
+			if strings.HasPrefix(norm, "UPDATE") {
+				setIdx := strings.Index(norm, " SET ")
+				if setIdx > 0 && strings.Contains(norm[:setIdx], ",") {
+					return nil, fmt.Errorf("multi-table DML not allowed; single-table statements on file_tags only")
+				}
+			}
+			if strings.HasPrefix(norm, "DELETE") {
+				fromIdx := strings.Index(norm, " FROM ")
+				if fromIdx > 0 {
+					rest := norm[fromIdx+6:]
+					endIdx := strings.IndexAny(rest, " ;")
+					if endIdx < 0 {
+						endIdx = len(rest)
+					}
+					tablePart := rest[:endIdx]
+					if strings.Contains(tablePart, ",") {
+						return nil, fmt.Errorf("multi-table DML not allowed; single-table statements on file_tags only")
+					}
+				}
+			}
+		}
+	}
+
+	if !isSelect && !isTagWrite {
+		return nil, fmt.Errorf("only SELECT queries and INSERT/UPDATE/DELETE on file_tags are allowed")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	if isTagWrite {
+		res, err := s.db.ExecContext(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+		affected, _ := res.RowsAffected()
+		return []map[string]interface{}{{"rows_affected": affected}}, nil
+	}
+
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	const maxRows = 1000
+	var result []map[string]interface{}
+	for rows.Next() {
+		if len(result) >= maxRows {
+			break
+		}
+		vals := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		row := make(map[string]interface{}, len(cols))
+		for i, col := range cols {
+			v := vals[i]
+			if b, ok := v.([]byte); ok {
+				row[col] = string(b)
+			} else {
+				row[col] = v
+			}
+		}
+		result = append(result, row)
+	}
+	if result == nil {
+		result = []map[string]interface{}{}
+	}
+	return result, rows.Err()
 }
