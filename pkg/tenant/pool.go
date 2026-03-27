@@ -139,7 +139,11 @@ func (p *Pool) createBackend(t *meta.Tenant) (*backend.Dat9Backend, *datastore.S
 	if err != nil {
 		return nil, nil, err
 	}
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName)
+	query := "parseTime=true"
+	if t.DBTLS {
+		query += "&tls=true"
+	}
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, query)
 	store, err := datastore.Open(dsn)
 	if err != nil {
 		return nil, nil, err

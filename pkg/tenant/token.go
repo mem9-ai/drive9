@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/oklog/ulid/v2"
+	"github.com/google/uuid"
 )
 
 type Claims struct {
@@ -20,7 +20,9 @@ type Claims struct {
 	ExpiresAt    int64  `json:"exp,omitempty"`
 }
 
-func NewID() string { return ulid.Make().String() }
+const tokenPrefix = "dat9_"
+
+func NewID() string { return uuid.NewString() }
 
 func HashToken(raw string) string {
 	h := sha256.Sum256([]byte(raw))
@@ -53,7 +55,8 @@ func IssueTokenWithExpiry(secret []byte, tenantID string, tokenVersion int, expi
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(msg))
 	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	return msg + "." + sig, nil
+	jwt := msg + "." + sig
+	return tokenPrefix + base64.RawURLEncoding.EncodeToString([]byte(jwt)), nil
 }
 
 func ParseAndVerifyToken(secret []byte, raw string) (*Claims, error) {
@@ -61,6 +64,15 @@ func ParseAndVerifyToken(secret []byte, raw string) (*Claims, error) {
 }
 
 func parseAndVerifyTokenAt(secret []byte, raw string, nowUnix int64) (*Claims, error) {
+	if !strings.HasPrefix(raw, tokenPrefix) {
+		return nil, fmt.Errorf("invalid token format")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(raw, tokenPrefix))
+	if err != nil {
+		return nil, fmt.Errorf("invalid token format")
+	}
+	raw = string(decoded)
+
 	parts := strings.Split(raw, ".")
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("invalid token format")

@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -996,45 +997,56 @@ func isUniqueViolation(err error) bool {
 	return strings.Contains(msg, "Duplicate entry") || strings.Contains(msg, "UNIQUE constraint failed")
 }
 
+var wsNorm = regexp.MustCompile(`\s+`)
+
+func normalizeSQL(s string) string {
+	return wsNorm.ReplaceAllString(strings.TrimSpace(s), " ")
+}
+
 func (s *Store) ExecSQL(ctx context.Context, query string) ([]map[string]interface{}, error) {
 	q := strings.TrimSpace(query)
-	upper := strings.ToUpper(q)
+	norm := strings.ToUpper(normalizeSQL(q))
 
-	isSelect := strings.HasPrefix(upper, "SELECT")
-	if strings.HasPrefix(upper, "WITH") {
-		hasDML := strings.Contains(upper, "INSERT") ||
-			strings.Contains(upper, "UPDATE") ||
-			strings.Contains(upper, "DELETE") ||
-			strings.Contains(upper, "DROP") ||
-			strings.Contains(upper, "ALTER") ||
-			strings.Contains(upper, "TRUNCATE")
+	isSelect := strings.HasPrefix(norm, "SELECT")
+	if strings.HasPrefix(norm, "WITH") {
+		hasDML := strings.Contains(norm, "INSERT") ||
+			strings.Contains(norm, "UPDATE") ||
+			strings.Contains(norm, "DELETE") ||
+			strings.Contains(norm, "DROP") ||
+			strings.Contains(norm, "ALTER") ||
+			strings.Contains(norm, "TRUNCATE")
 		if !hasDML {
 			isSelect = true
 		}
 	}
-	isTagWrite := strings.HasPrefix(upper, "INSERT INTO FILE_TAGS") ||
-		strings.HasPrefix(upper, "UPDATE FILE_TAGS") ||
-		strings.HasPrefix(upper, "DELETE FROM FILE_TAGS")
+	isTagWrite := strings.HasPrefix(norm, "INSERT INTO FILE_TAGS") ||
+		strings.HasPrefix(norm, "UPDATE FILE_TAGS") ||
+		strings.HasPrefix(norm, "DELETE FROM FILE_TAGS")
 
 	if isTagWrite {
-		if strings.HasPrefix(upper, "UPDATE") || strings.HasPrefix(upper, "DELETE") {
-			hasJoin := strings.Contains(upper, " JOIN ")
-			hasUsing := strings.Contains(upper, " USING ")
-			hasCommaTable := false
-			if strings.HasPrefix(upper, "UPDATE") {
-				setIdx := strings.Index(upper, " SET ")
-				if setIdx > 0 {
-					hasCommaTable = strings.Contains(upper[:setIdx], ",")
-				}
-			} else {
-				fromIdx := strings.Index(upper, " FROM ")
-				whereIdx := strings.Index(upper, " WHERE ")
-				if fromIdx > 0 && whereIdx > fromIdx {
-					hasCommaTable = strings.Contains(upper[fromIdx:whereIdx], ",")
+		if strings.HasPrefix(norm, "UPDATE") || strings.HasPrefix(norm, "DELETE") {
+			if strings.Contains(norm, " JOIN ") || strings.Contains(norm, " USING ") {
+				return nil, fmt.Errorf("multi-table DML not allowed; single-table statements on file_tags only")
+			}
+			if strings.HasPrefix(norm, "UPDATE") {
+				setIdx := strings.Index(norm, " SET ")
+				if setIdx > 0 && strings.Contains(norm[:setIdx], ",") {
+					return nil, fmt.Errorf("multi-table DML not allowed; single-table statements on file_tags only")
 				}
 			}
-			if hasJoin || hasUsing || hasCommaTable {
-				return nil, fmt.Errorf("multi-table DML not allowed; single-table statements on file_tags only")
+			if strings.HasPrefix(norm, "DELETE") {
+				fromIdx := strings.Index(norm, " FROM ")
+				if fromIdx > 0 {
+					rest := norm[fromIdx+6:]
+					endIdx := strings.IndexAny(rest, " ;")
+					if endIdx < 0 {
+						endIdx = len(rest)
+					}
+					tablePart := rest[:endIdx]
+					if strings.Contains(tablePart, ",") {
+						return nil, fmt.Errorf("multi-table DML not allowed; single-table statements on file_tags only")
+					}
+				}
 			}
 		}
 	}

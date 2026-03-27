@@ -247,6 +247,49 @@ func (s *Store) GetTenant(id string) (*Tenant, error) {
 	return &out, nil
 }
 
+func (s *Store) ListTenantsByStatus(status TenantStatus, limit int) ([]Tenant, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`SELECT id, status, db_host, db_port, db_user, db_password, db_name,
+		db_tls, provider, cluster_id, claim_url, claim_expires_at, schema_version, created_at, updated_at
+		FROM tenants WHERE status = ? ORDER BY created_at ASC LIMIT ?`, status, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]Tenant, 0)
+	for rows.Next() {
+		var t Tenant
+		var dbTLS int
+		var clusterID sql.NullString
+		var claimURL sql.NullString
+		var claimExp sql.NullTime
+		if err := rows.Scan(&t.ID, &t.Status, &t.DBHost, &t.DBPort, &t.DBUser, &t.DBPasswordCipher,
+			&t.DBName, &dbTLS, &t.Provider, &clusterID, &claimURL, &claimExp, &t.SchemaVersion,
+			&t.CreatedAt, &t.UpdatedAt); err != nil {
+			return nil, err
+		}
+		t.DBTLS = dbTLS == 1
+		if clusterID.Valid {
+			t.ClusterID = clusterID.String
+		}
+		if claimURL.Valid {
+			t.ClaimURL = claimURL.String
+		}
+		if claimExp.Valid {
+			ts := claimExp.Time.UTC()
+			t.ClaimExpiresAt = &ts
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (s *Store) UpdateTenantStatus(id string, status TenantStatus) error {
 	res, err := s.db.Exec(`UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`, status, time.Now().UTC(), id)
 	if err != nil {

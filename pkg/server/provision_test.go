@@ -109,9 +109,9 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	tenantID := out["tenant_id"]
+	tenantID := out["id"]
 	if tenantID == "" {
-		t.Fatal("empty tenant_id")
+		t.Fatal("empty id")
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -205,7 +205,7 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if out["tenant_id"] == "" || out["api_key"] == "" {
+	if out["id"] == "" || out["api_key"] == "" {
 		t.Fatalf("unexpected provision response: %+v", out)
 	}
 	if out["status"] != string(meta.TenantProvisioning) {
@@ -215,7 +215,7 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	var status, provider, clusterID string
 	for {
-		row := metaStore.DB().QueryRow("SELECT status, provider, cluster_id FROM tenants WHERE id = ?", out["tenant_id"])
+		row := metaStore.DB().QueryRow("SELECT status, provider, cluster_id FROM tenants WHERE id = ?", out["id"])
 		if err := row.Scan(&status, &provider, &clusterID); err != nil {
 			t.Fatal(err)
 		}
@@ -229,5 +229,82 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	}
 	if provider != tenant.ProviderTiDBZero || clusterID != "cluster-1" {
 		t.Fatalf("unexpected tenant row: status=%s provider=%s cluster_id=%s", status, provider, clusterID)
+	}
+}
+
+func TestStartupResumesProvisioningTenantInit(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	parsed, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := "127.0.0.1"
+	port := 3306
+	if parsed.Addr != "" {
+		h, p, ok := strings.Cut(parsed.Addr, ":")
+		if ok {
+			host = h
+			_, _ = fmt.Sscanf(p, "%d", &port)
+		}
+	}
+
+	passCipher, err := pool.Encrypt([]byte(parsed.Passwd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID := tenant.NewID()
+	now := time.Now().UTC()
+	if err := metaStore.InsertTenant(&meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantProvisioning,
+		DBHost:           host,
+		DBPort:           port,
+		DBUser:           parsed.User,
+		DBPasswordCipher: passCipher,
+		DBName:           parsed.DBName,
+		DBTLS:            false,
+		Provider:         tenant.ProviderTiDBZero,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBZero, cluster: &tenant.ClusterInfo{}}
+	_ = NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov, TokenSecret: []byte("abc")})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		row := metaStore.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", tenantID)
+		var status string
+		if err := row.Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status == string(meta.TenantActive) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tenant did not become active after restart resume, status=%s", status)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

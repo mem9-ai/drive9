@@ -2,6 +2,7 @@ package tenant
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +30,9 @@ func TestIssueTokenDefaultNeverExpires(t *testing.T) {
 	}
 	if claims.ExpiresAt != 0 {
 		t.Fatalf("expected default token without exp, got exp=%d", claims.ExpiresAt)
+	}
+	if strings.Count(tok, ".") != 0 {
+		t.Fatalf("expected one-segment API key format, got token=%s", tok)
 	}
 }
 
@@ -63,5 +67,23 @@ func TestParseAndVerifyTokenRejectsExpiredExpClaim(t *testing.T) {
 	_, err = parseAndVerifyTokenAt(secret, tok, claims.ExpiresAt)
 	if err == nil || !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("expected expired error, got %v", err)
+	}
+}
+
+func TestParseAndVerifyTokenRejectsLegacyThreeSegmentJWT(t *testing.T) {
+	secret := testTokenSecret(t)
+	tok, err := IssueToken(secret, "tenant-1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawJWTBytes, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(tok, tokenPrefix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawJWT := string(rawJWTBytes)
+
+	_, err = ParseAndVerifyToken(secret, rawJWT)
+	if err == nil || !strings.Contains(err.Error(), "invalid token format") {
+		t.Fatalf("expected invalid token format error, got %v", err)
 	}
 }
