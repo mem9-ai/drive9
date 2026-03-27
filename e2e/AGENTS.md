@@ -17,6 +17,9 @@ DAT9_BASE=$DEPLOY bash e2e/api-smoke-test.sh
 
 # Existing key regression
 DAT9_BASE=$DEPLOY DAT9_API_KEY=dat9_xxx bash e2e/api-smoke-test-existing-key.sh
+
+# CLI smoke (provision + dat9 fs workflows + large file cp)
+DAT9_BASE=$DEPLOY bash e2e/cli-smoke-test.sh
 ```
 
 ## Dev endpoint
@@ -38,14 +41,24 @@ Use this value unless the environment owner announces a new endpoint.
 3. `GET /v1/fs/?list` returns `entries[]`
 4. Nested `mkdir` (`/team/...`) across multi-level paths
 5. Multi-file `PUT` + `GET` content verification
-6. `copy`, `rename`, `delete`, `recursive delete`
-7. Final `list` verifies expected structure after mutations
+6. Batch small-file writes (`N` files) + list count + sample reads
+7. `copy`, `rename`, `delete`
+8. Final `list` verifies expected structure after mutations
+9. Large multipart upload (`PUT` plan + presigned part uploads + complete + download checksum)
 
 ### `api-smoke-test-existing-key.sh`
 
 1. Existing API key auth on `GET /v1/status`
 2. Optional poll from `provisioning` to `active`
 3. `GET /v1/fs/?list` baseline read check
+
+### `cli-smoke-test.sh`
+
+1. Provision + readiness polling
+2. Build local `dat9` CLI binary
+3. CLI small-file flow (`cp`, `ls`, `cat`, `mv`, `rm`)
+4. CLI batch small-file flow (`cp` many files + dir list count + stat + sample reads)
+5. CLI large-file flow (`cp` upload multipart + `cp` download + checksum verification)
 
 ## Environment variables
 
@@ -55,6 +68,11 @@ Use this value unless the environment owner announces a new endpoint.
 | `DAT9_API_KEY` | - | `api-smoke-test-existing-key.sh` |
 | `POLL_TIMEOUT_S` | `120` (smoke), `60` (existing-key) | polling scripts |
 | `POLL_INTERVAL_S` | `5` | polling scripts |
+| `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
+| `LARGE_FILE_MB` | `100` | `api-smoke-test.sh` |
+| `BATCH_SMALL_FILE_COUNT` | `10` | `api-smoke-test.sh` |
+| `CLI_LARGE_FILE_MB` | `100` | `cli-smoke-test.sh` |
+| `CLI_BATCH_SMALL_FILE_COUNT` | `10` | `cli-smoke-test.sh` |
 
 ## Conventions
 

@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# dat9 CLI smoke test against a live deployment.
+
+set -euo pipefail
+
+BASE="${DAT9_BASE:-http://127.0.0.1:9009}"
+POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
+POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
+CLI_LARGE_FILE_MB="${CLI_LARGE_FILE_MB:-100}"
+CLI_BATCH_SMALL_FILE_COUNT="${CLI_BATCH_SMALL_FILE_COUNT:-10}"
+
+PASS=0
+FAIL=0
+TOTAL=0
+
+check_eq() {
+  local desc="$1" got="$2" want="$3"
+  TOTAL=$((TOTAL+1))
+  if [ "$got" = "$want" ]; then
+    echo "PASS $desc (got=$got)"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL $desc (want=$want got=$got)"
+    FAIL=$((FAIL+1))
+  fi
+}
+
+check_cmd() {
+  local desc="$1"
+  shift
+  TOTAL=$((TOTAL+1))
+  if "$@"; then
+    echo "PASS $desc"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL $desc"
+    FAIL=$((FAIL+1))
+  fi
+}
+
+echo "=== dat9 CLI smoke test ==="
+echo "BASE=$BASE"
+
+check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
+check_cmd "go is available" bash -c 'command -v go >/dev/null'
+
+echo "[1] provision tenant"
+pfile="$(mktemp)"
+pcode=$(curl -sS -o "$pfile" -w "%{http_code}" -X POST "$BASE/v1/provision")
+check_eq "POST /v1/provision returns 202" "$pcode" "202"
+API_KEY=$(jq -r '.api_key // empty' "$pfile")
+check_cmd "provision returns api_key" test -n "$API_KEY"
+
+echo "[2] wait tenant active"
+deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))
+state=""
+while :; do
+  sfile="$(mktemp)"
+  scode=$(curl -sS -o "$sfile" -w "%{http_code}" -H "Authorization: Bearer $API_KEY" "$BASE/v1/status")
+  state=$(jq -r '.status // empty' "$sfile")
+  rm -f "$sfile"
+  echo "status=${scode}:${state}"
+  if [ "$scode" = "200" ] && [ "$state" = "active" ]; then
+    break
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    break
+  fi
+  sleep "$POLL_INTERVAL_S"
+done
+check_eq "tenant becomes active" "$state" "active"
+
+echo "[3] build dat9 cli"
+CLI_BIN="$(mktemp)"
+go build -o "$CLI_BIN" ./cmd/dat9
+check_cmd "dat9 binary built" test -x "$CLI_BIN"
+
+dat9() {
+  DAT9_SERVER="$BASE" DAT9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
+}
+
+TS="$(date +%s)"
+SMALL_LOCAL="/tmp/dat9-cli-small-${TS}.txt"
+SMALL_REMOTE="/cli-${TS}-small.txt"
+SMALL_RENAMED="/cli-${TS}-small-renamed.txt"
+BATCH_LOCAL_DIR="/tmp/dat9-cli-batch-${TS}"
+BATCH_REMOTE_DIR="/cli-${TS}-batch"
+LARGE_LOCAL="/tmp/dat9-cli-large-${TS}.bin"
+LARGE_REMOTE="/cli-${TS}-large-${CLI_LARGE_FILE_MB}m.bin"
+LARGE_DOWNLOADED="/tmp/dat9-cli-large-${TS}.download.bin"
+LARGE_BYTES=$((CLI_LARGE_FILE_MB * 1024 * 1024))
+
+echo "[4] small file ops via cli"
+printf "cli-smoke-%s" "$TS" > "$SMALL_LOCAL"
+dat9 fs cp "$SMALL_LOCAL" ":$SMALL_REMOTE"
+
+ls_out="$(dat9 fs ls /)"
+small_present=$(python3 - "$ls_out" "$(basename "$SMALL_REMOTE")" <<'PY'
+import sys
+out=sys.argv[1].splitlines()
+name=sys.argv[2]
+print("true" if any(line.strip()==name for line in out) else "false")
+PY
+)
+check_eq "uploaded small file appears in ls /" "$small_present" "true"
+
+cat_out="$(dat9 fs cat ":$SMALL_REMOTE")"
+check_eq "cat returns expected small file content" "$cat_out" "cli-smoke-${TS}"
+
+dat9 fs mv ":$SMALL_REMOTE" ":$SMALL_RENAMED"
+renamed_out="$(dat9 fs ls /)"
+renamed_present=$(python3 - "$renamed_out" "$(basename "$SMALL_RENAMED")" <<'PY'
+import sys
+out=sys.argv[1].splitlines()
+name=sys.argv[2]
+print("true" if any(line.strip()==name for line in out) else "false")
+PY
+)
+check_eq "mv renames remote file" "$renamed_present" "true"
+
+echo "[5] batch small-file upload/list/read via cli"
+mkdir -p "$BATCH_LOCAL_DIR"
+for i in $(seq 1 "$CLI_BATCH_SMALL_FILE_COUNT"); do
+  lp="$BATCH_LOCAL_DIR/file-${i}.txt"
+  rp="$BATCH_REMOTE_DIR/file-${i}.txt"
+  printf "cli-batch-%s-%s" "$TS" "$i" > "$lp"
+  dat9 fs cp "$lp" ":$rp"
+done
+
+batch_ls="$(dat9 fs ls ":$BATCH_REMOTE_DIR")"
+batch_count=$(python3 - "$batch_ls" <<'PY'
+import sys
+lines=[ln.strip() for ln in sys.argv[1].splitlines() if ln.strip()]
+print(len(lines))
+PY
+)
+check_eq "batch dir file count matches" "$batch_count" "$CLI_BATCH_SMALL_FILE_COUNT"
+
+for i in 1 "$CLI_BATCH_SMALL_FILE_COUNT"; do
+  rp="$BATCH_REMOTE_DIR/file-${i}.txt"
+  got="$(dat9 fs cat ":$rp")"
+  want="cli-batch-$TS-$i"
+  check_eq "batch file content matches for $rp" "$got" "$want"
+done
+
+batch_stat="$(dat9 fs stat ":$BATCH_REMOTE_DIR/file-1.txt")"
+batch_isdir=$(python3 - "$batch_stat" <<'PY'
+import sys
+val=""
+for line in sys.argv[1].splitlines():
+    if line.strip().startswith("isdir:"):
+        val=line.split(":",1)[1].strip().lower()
+        break
+print(val)
+PY
+)
+check_eq "stat reports batch file isdir=false" "$batch_isdir" "false"
+
+echo "[6] large multipart upload via cli cp"
+dd if=/dev/zero of="$LARGE_LOCAL" bs=1M count="$CLI_LARGE_FILE_MB" status=none
+dat9 fs cp "$LARGE_LOCAL" ":$LARGE_REMOTE"
+
+stat_out="$(dat9 fs stat ":$LARGE_REMOTE")"
+remote_size=$(python3 - "$stat_out" <<'PY'
+import sys
+for line in sys.argv[1].splitlines():
+    if line.strip().startswith("size:"):
+        print(line.split(":",1)[1].strip())
+        break
+PY
+)
+check_eq "large remote size matches" "$remote_size" "$LARGE_BYTES"
+
+dat9 fs cp ":$LARGE_REMOTE" "$LARGE_DOWNLOADED"
+check_cmd "downloaded large file exists" test -f "$LARGE_DOWNLOADED"
+
+sum_src=$(sha256sum "$LARGE_LOCAL" | cut -d' ' -f1)
+sum_dst=$(sha256sum "$LARGE_DOWNLOADED" | cut -d' ' -f1)
+check_eq "downloaded large file sha256 matches" "$sum_dst" "$sum_src"
+
+echo "[7] cleanup via cli"
+dat9 fs rm ":$SMALL_RENAMED"
+dat9 fs rm ":$LARGE_REMOTE"
+for i in $(seq 1 "$CLI_BATCH_SMALL_FILE_COUNT"); do
+  dat9 fs rm ":$BATCH_REMOTE_DIR/file-${i}.txt"
+done
+
+final_ls="$(dat9 fs ls /)"
+small_left=$(python3 - "$final_ls" "$(basename "$SMALL_RENAMED")" <<'PY'
+import sys
+out=sys.argv[1].splitlines()
+name=sys.argv[2]
+print("true" if any(line.strip()==name for line in out) else "false")
+PY
+)
+large_left=$(python3 - "$final_ls" "$(basename "$LARGE_REMOTE")" <<'PY'
+import sys
+out=sys.argv[1].splitlines()
+name=sys.argv[2]
+print("true" if any(line.strip()==name for line in out) else "false")
+PY
+)
+check_eq "small file removed" "$small_left" "false"
+check_eq "large file removed" "$large_left" "false"
+
+batch_ls_after="$(dat9 fs ls /)"
+batch_left=$(python3 - "$batch_ls_after" "$(basename "$BATCH_REMOTE_DIR")" <<'PY'
+import sys
+out=sys.argv[1].splitlines()
+name=sys.argv[2]
+print("true" if any(line.strip()==name or line.strip()==name+"/" for line in out) else "false")
+PY
+)
+# Directory may remain empty after file deletions depending on backend semantics.
+check_eq "batch directory remains visible after file cleanup" "$batch_left" "true"
+
+rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
+rm -rf "$BATCH_LOCAL_DIR"
+
+echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"
+exit "$FAIL"
