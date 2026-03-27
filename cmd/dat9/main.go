@@ -123,20 +123,21 @@ func extractContext(args []string) (string, []string) {
 			continue
 		}
 		idx := strings.Index(arg, ":/")
-		if idx >= 0 {
-			name := ""
-			if idx > 0 {
-				name = arg[:idx]
-			}
-			if name != "" && ctxName != "" && ctxName != name {
-				fmt.Fprintf(os.Stderr, "error: conflicting contexts: %s vs %s\n", ctxName, name)
-				os.Exit(1)
-			}
-			if name != "" {
-				ctxName = name
-			}
-			args[i] = arg[idx+1:]
+		if idx < 0 || idx == 1 {
+			continue
 		}
+		name := ""
+		if idx > 0 {
+			name = arg[:idx]
+		}
+		if name != "" && ctxName != "" && ctxName != name {
+			fmt.Fprintf(os.Stderr, "error: conflicting contexts: %s vs %s\n", ctxName, name)
+			os.Exit(1)
+		}
+		if name != "" {
+			ctxName = name
+		}
+		args[i] = arg[idx+1:]
 	}
 	return ctxName, args
 }

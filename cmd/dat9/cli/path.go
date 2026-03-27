@@ -18,6 +18,9 @@ func ParseRemote(s string) (RemotePath, bool) {
 		}
 		return RemotePath{}, false
 	}
+	if idx == 1 {
+		return RemotePath{}, false
+	}
 	return RemotePath{
 		Context: s[:idx],
 		Path:    s[idx+1:],
