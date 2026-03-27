@@ -23,22 +23,24 @@ import (
 )
 
 type Config struct {
-	Meta        *meta.Store
-	Pool        *tenant.Pool
-	Provisioner tenant.Provisioner
-	TokenSecret []byte
-	Backend     *backend.Dat9Backend
-	LocalS3     *s3client.LocalS3Client
-	S3Dir       string
+	Meta           *meta.Store
+	Pool           *tenant.Pool
+	Provisioner    tenant.Provisioner
+	TokenSecret    []byte
+	Backend        *backend.Dat9Backend
+	LocalS3        *s3client.LocalS3Client
+	S3Dir          string
+	MaxUploadBytes int64
 }
 
 type Server struct {
-	fallback    *backend.Dat9Backend
-	meta        *meta.Store
-	pool        *tenant.Pool
-	provisioner tenant.Provisioner
-	tokenSecret []byte
-	mux         *http.ServeMux
+	fallback       *backend.Dat9Backend
+	meta           *meta.Store
+	pool           *tenant.Pool
+	provisioner    tenant.Provisioner
+	tokenSecret    []byte
+	maxUploadBytes int64
+	mux            *http.ServeMux
 }
 
 var (
@@ -47,17 +49,24 @@ var (
 	schemaInitMaxBackoff     = 30 * time.Second
 )
 
+const defaultMaxUploadBytes int64 = 1 << 30 // 1 GiB
+
 func New(b *backend.Dat9Backend) *Server {
 	return NewWithConfig(Config{Backend: b})
 }
 
 func NewWithConfig(cfg Config) *Server {
+	maxUpload := cfg.MaxUploadBytes
+	if maxUpload <= 0 {
+		maxUpload = defaultMaxUploadBytes
+	}
 	s := &Server{
-		fallback:    cfg.Backend,
-		meta:        cfg.Meta,
-		pool:        cfg.Pool,
-		tokenSecret: cfg.TokenSecret,
-		provisioner: cfg.Provisioner,
+		fallback:       cfg.Backend,
+		meta:           cfg.Meta,
+		pool:           cfg.Pool,
+		tokenSecret:    cfg.TokenSecret,
+		provisioner:    cfg.Provisioner,
+		maxUploadBytes: maxUpload,
 	}
 	mux := http.NewServeMux()
 
@@ -335,6 +344,10 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	if h := r.Header.Get("X-Dat9-Content-Length"); h != "" {
 		cl, _ = strconv.ParseInt(h, 10, 64)
 	}
+	if cl > s.maxUploadBytes {
+		errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
+		return
+	}
 	if cl > 0 && b.IsLargeFile(cl) {
 		partChecksums, err := parsePartChecksumsHeader(r.Header.Get("X-Dat9-Part-Checksums"))
 		if err != nil {
@@ -363,8 +376,14 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		_ = json.NewEncoder(w).Encode(plan)
 		return
 	}
-	data, err := io.ReadAll(r.Body)
+	body := http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
+	data, err := io.ReadAll(body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
+			return
+		}
 		errJSON(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}
