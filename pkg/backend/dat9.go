@@ -483,7 +483,7 @@ func (b *Dat9Backend) readFileData(f *datastore.File) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer rc.Close()
+		defer func() { _ = rc.Close() }()
 		return io.ReadAll(rc)
 	}
 	if f.StorageType == datastore.StorageDB9 {

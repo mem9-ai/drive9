@@ -60,7 +60,7 @@ func (p *StarterProvisioner) Provision(ctx context.Context, tenantID string) (*C
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("starter provision status %d: %s", resp.StatusCode, string(raw))
@@ -109,7 +109,7 @@ func (p *StarterProvisioner) doDigestAuthRequest(ctx context.Context, method, ur
 	if resp.StatusCode != http.StatusUnauthorized {
 		return resp, nil
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	wwwAuth := resp.Header.Get("WWW-Authenticate")
 	nonce, realm, qop := parseDigestChallenge(wwwAuth)

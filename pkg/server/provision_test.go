@@ -45,7 +45,7 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer metaStore.Close()
+	defer func() { _ = metaStore.Close() }()
 	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
 	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
 
@@ -102,7 +102,7 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
@@ -137,7 +137,7 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer metaStore.Close()
+	defer func() { _ = metaStore.Close() }()
 	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
 	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
 
@@ -198,7 +198,7 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}

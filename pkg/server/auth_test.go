@@ -57,7 +57,7 @@ func newAuthServer(t *testing.T) (*Server, string, func()) {
 			host = h
 		}
 		if p != "" {
-			fmt.Sscanf(p, "%d", &port)
+			_, _ = fmt.Sscanf(p, "%d", &port)
 		}
 	}
 	now := time.Now().UTC()
@@ -176,7 +176,7 @@ func TestProvisionWithoutProvisionerReturnsBadRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}

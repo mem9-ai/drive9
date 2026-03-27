@@ -60,7 +60,7 @@ func (p *ZeroProvisioner) Provision(ctx context.Context, tenantID string) (*Clus
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("zero provision status %d: %s", resp.StatusCode, string(body))

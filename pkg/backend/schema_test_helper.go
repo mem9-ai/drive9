@@ -14,7 +14,7 @@ func initBackendSchema(t *testing.T, dsn string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (node_id VARCHAR(64) PRIMARY KEY, path VARCHAR(512) NOT NULL, parent_path VARCHAR(512) NOT NULL, name VARCHAR(255) NOT NULL, is_directory BOOLEAN NOT NULL DEFAULT FALSE, file_id VARCHAR(64), created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3))`,
 		`CREATE UNIQUE INDEX idx_path ON file_nodes(path)`,

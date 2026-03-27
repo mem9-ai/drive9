@@ -14,7 +14,7 @@ func initDatastoreSchema(t *testing.T, dsn, provider string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	withBlob := provider == "tidb_zero" || provider == "tidb_cloud_starter"
 	contentBlobCol := ""

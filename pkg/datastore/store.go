@@ -993,16 +993,3 @@ func isUniqueViolation(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "Duplicate entry") || strings.Contains(msg, "UNIQUE constraint failed")
 }
-
-func isIndexStmt(stmt string) bool {
-	s := strings.ToUpper(strings.TrimSpace(stmt))
-	return strings.HasPrefix(s, "CREATE INDEX") || strings.HasPrefix(s, "CREATE UNIQUE INDEX")
-}
-
-func isDuplicateIndexError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "Duplicate key name")
-}

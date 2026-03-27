@@ -66,8 +66,8 @@ type APIKey struct {
 }
 
 type TenantWithAPIKey struct {
-	Tenant
-	APIKey
+	Tenant Tenant
+	APIKey APIKey
 }
 
 type Store struct {

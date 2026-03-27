@@ -17,7 +17,7 @@ func initSchemaByProvider(dsn, provider string) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := db.Ping(); err != nil {
 		return err
 	}
