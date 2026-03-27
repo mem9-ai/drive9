@@ -18,6 +18,8 @@ func TestParseRemote(t *testing.T) {
 		{"local.txt", "", "", false},
 		{"./local.txt", "", "", false},
 		{"-", "", "", false},
+		{"C:/tmp/a.txt", "", "", false},
+		{"D:/Users/test", "", "", false},
 	}
 	for _, tt := range tests {
 		rp, ok := ParseRemote(tt.input)

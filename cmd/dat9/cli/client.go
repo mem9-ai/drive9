@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/mem9-ai/dat9/pkg/client"
@@ -19,8 +20,15 @@ func NewClientForContext(ctxName string) *client.Client {
 		if name == "" {
 			name = cfg.CurrentContext
 		}
-		if ctx, ok := cfg.Contexts[name]; ok {
-			apiKey = ctx.APIKey
+		if name != "" {
+			ctx, ok := cfg.Contexts[name]
+			if !ok && ctxName != "" {
+				fmt.Fprintf(os.Stderr, "error: context %q not found in %s\n", ctxName, configPath())
+				os.Exit(1)
+			}
+			if ok {
+				apiKey = ctx.APIKey
+			}
 		}
 	}
 	return client.New(server, apiKey)
