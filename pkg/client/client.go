@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -257,4 +258,57 @@ func (c *Client) SQL(query string) ([]map[string]interface{}, error) {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
 	return rows, nil
+}
+
+type SearchResult struct {
+	Path      string   `json:"path"`
+	Name      string   `json:"name"`
+	SizeBytes int64    `json:"size_bytes"`
+	Score     *float64 `json:"score,omitempty"`
+}
+
+func (c *Client) Grep(query, pathPrefix string, limit int) ([]SearchResult, error) {
+	u := c.url(pathPrefix) + "?grep=" + url.QueryEscape(query)
+	if limit > 0 {
+		u += "&limit=" + strconv.Itoa(limit)
+	}
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var results []SearchResult
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func (c *Client) Find(pathPrefix string, params url.Values) ([]SearchResult, error) {
+	params.Set("find", "")
+	u := c.url(pathPrefix) + "?" + params.Encode()
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var results []SearchResult
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
