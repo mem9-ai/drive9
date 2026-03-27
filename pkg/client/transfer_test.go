@@ -15,7 +15,7 @@ import (
 
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
-	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	srvpkg "github.com/mem9-ai/dat9/pkg/server"
 )
@@ -264,7 +264,8 @@ func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
 	}
 	defer func() { _ = os.RemoveAll(s3Dir) }()
 
-	store, err := meta.Open(testDSN)
+	initClientTenantSchema(t, testDSN)
+	store, err := datastore.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +284,7 @@ func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err := backend.NewWithS3(store, blobDir, s3c)
+	b, err := backend.NewWithS3(store, s3c)
 	if err != nil {
 		_ = ln.Close()
 		t.Fatal(err)

@@ -7,20 +7,20 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
 	"strings"
 
-	"github.com/mem9-ai/dat9/pkg/backend"
+	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
-	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/server"
+	"github.com/mem9-ai/dat9/pkg/tenant"
 )
 
 const (
 	defaultListenAddr = ":9009"
-	defaultBlobDir    = "blobs"
 	defaultS3Dir      = "s3"
 )
 
@@ -34,57 +34,99 @@ func main() {
 		addr = os.Args[1]
 	}
 
-	mysqlDSN := os.Getenv("DAT9_MYSQL_DSN")
-	if mysqlDSN == "" {
-		die(fmt.Errorf("DAT9_MYSQL_DSN is required"))
+	metaDSN := os.Getenv("DAT9_META_DSN")
+	if metaDSN == "" {
+		die(fmt.Errorf("DAT9_META_DSN is required"))
 	}
 
-	blobDir := envOr("DAT9_BLOB_DIR", defaultBlobDir)
+	s3Dir := envOr("DAT9_S3_DIR", defaultS3Dir)
 	s3Bucket := os.Getenv("DAT9_S3_BUCKET")
+	s3Region := envOr("DAT9_S3_REGION", "us-east-1")
+	s3Prefix := os.Getenv("DAT9_S3_PREFIX")
+	s3RoleARN := os.Getenv("DAT9_S3_ROLE_ARN")
 
-	if err := os.MkdirAll(blobDir, 0o755); err != nil {
-		die(fmt.Errorf("create blob dir: %w", err))
-	}
-
-	store, err := meta.Open(mysqlDSN)
+	store, err := meta.Open(metaDSN)
 	if err != nil {
-		die(fmt.Errorf("open meta store: %w", err))
+		die(fmt.Errorf("open control-plane store: %w", err))
 	}
 	defer func() { _ = store.Close() }()
 
-	var s3c s3client.S3Client
-	if s3Bucket != "" {
-		// Production: real AWS S3.
-		s3c, err = s3client.NewAWS(context.Background(), s3client.AWSConfig{
-			Region:  envOr("DAT9_S3_REGION", "us-east-1"),
-			Bucket:  s3Bucket,
-			Prefix:  os.Getenv("DAT9_S3_PREFIX"),
-			RoleARN: os.Getenv("DAT9_S3_ROLE_ARN"),
-		})
-		if err != nil {
-			die(fmt.Errorf("create aws s3 client: %w", err))
-		}
-		log.Printf("using AWS S3 (bucket=%s, region=%s, role=%s)", s3Bucket, envOr("DAT9_S3_REGION", "us-east-1"), envOr("DAT9_S3_ROLE_ARN", "default-credentials"))
-	} else {
-		// Development: local filesystem S3 mock.
-		s3Dir := envOr("DAT9_S3_DIR", defaultS3Dir)
+	if s3Bucket == "" {
 		if err := os.MkdirAll(s3Dir, 0o755); err != nil {
 			die(fmt.Errorf("create s3 dir: %w", err))
 		}
-		s3BaseURL := publicBaseURL(addr) + "/s3"
-		s3c, err = s3client.NewLocal(s3Dir, s3BaseURL)
-		if err != nil {
-			die(fmt.Errorf("create local s3 client: %w", err))
-		}
-		log.Printf("using local S3 mock (dir=%s)", s3Dir)
+		log.Printf("using local S3 root directory (dir=%s)", s3Dir)
+	} else {
+		log.Printf("using AWS S3 (bucket=%s region=%s role=%s)", s3Bucket, s3Region, envOr("DAT9_S3_ROLE_ARN", "default-credentials"))
 	}
 
-	b, err := backend.NewWithS3(store, blobDir, s3c)
+	encryptType := envOr("DAT9_ENCRYPT_TYPE", "local_aes")
+	masterHex := os.Getenv("DAT9_MASTER_KEY")
+	kmsKey := os.Getenv("DAT9_ENCRYPT_KEY")
+	tokenHex := os.Getenv("DAT9_TOKEN_SIGNING_KEY")
+	providerType := envOr("DAT9_TENANT_PROVIDER", tenant.ProviderTiDBZero)
+	providerType, err = tenant.NormalizeProvider(providerType)
 	if err != nil {
-		die(fmt.Errorf("create backend: %w", err))
+		die(err)
 	}
 
-	die(server.New(b).ListenAndServe(addr))
+	var provisioner tenant.Provisioner
+	var provisionerErr error
+	switch providerType {
+	case tenant.ProviderTiDBZero:
+		provisioner, provisionerErr = tenant.NewZeroProvisionerFromEnv()
+	case tenant.ProviderTiDBCloudStarter:
+		provisioner, provisionerErr = tenant.NewStarterProvisionerFromEnv()
+	case tenant.ProviderDB9:
+		provisioner, provisionerErr = tenant.NewDB9ProvisionerFromEnv()
+	}
+	if provisionerErr != nil {
+		log.Printf("provider %s is not configured for auto provisioning: %v", providerType, provisionerErr)
+	}
+
+	var pool *tenant.Pool
+	var tokenSecret []byte
+	if tokenHex != "" {
+		tokenSecret, err = hex.DecodeString(tokenHex)
+		if err != nil {
+			die(fmt.Errorf("invalid DAT9_TOKEN_SIGNING_KEY: %w", err))
+		}
+		eKey := masterHex
+		eType := encrypt.Type(encryptType)
+		if eType == encrypt.TypeKMS {
+			eKey = kmsKey
+		}
+		enc, err := encrypt.New(context.Background(), encrypt.Config{
+			Type:   eType,
+			Key:    eKey,
+			Region: envOr("DAT9_S3_REGION", "us-east-1"),
+		})
+		if err != nil {
+			die(fmt.Errorf("create encryptor: %w", err))
+		}
+
+		if err := store.DB().Ping(); err != nil {
+			die(fmt.Errorf("control-plane db unavailable: %w", err))
+		}
+
+		pool = tenant.NewPool(tenant.PoolConfig{
+			S3Dir:     s3Dir,
+			PublicURL: publicBaseURL(addr),
+			S3Bucket:  s3Bucket,
+			S3Region:  s3Region,
+			S3Prefix:  s3Prefix,
+			S3RoleARN: s3RoleARN,
+		}, enc)
+		defer pool.Close()
+	}
+
+	die(server.NewWithConfig(server.Config{
+		Meta:        store,
+		Pool:        pool,
+		Provisioner: provisioner,
+		TokenSecret: tokenSecret,
+		S3Dir:       s3Dir,
+	}).ListenAndServe(addr))
 }
 
 func envOr(key, fallback string) string {
@@ -100,15 +142,18 @@ func usage() {
 environment:
   DAT9_LISTEN_ADDR serve listen address (default: :9009)
   DAT9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
-  DAT9_MYSQL_DSN   TiDB/MySQL DSN (required)
-  DAT9_BLOB_DIR    blob directory (default: ./blobs)
-
+  DAT9_META_DSN    control-plane MySQL DSN (required)
+  DAT9_ENCRYPT_TYPE local_aes|kms
+  DAT9_MASTER_KEY  32-byte hex key for local_aes encryptor
+  DAT9_ENCRYPT_KEY KMS key id or alias (required for kms)
+  DAT9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
+  DAT9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
   S3 storage (set DAT9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DAT9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
   DAT9_S3_REGION   AWS region (default: us-east-1)
-  DAT9_S3_PREFIX   S3 key prefix (e.g. "tenants/abc/")
+  DAT9_S3_PREFIX   S3 key prefix (e.g. "tenants")
   DAT9_S3_ROLE_ARN IAM role ARN to assume via STS (optional)
-  DAT9_S3_DIR      local s3 mock directory (default: ./s3, only used without DAT9_S3_BUCKET)
+  DAT9_S3_DIR      local s3 mock root directory (default: ./s3, only used without DAT9_S3_BUCKET)
 `)
 	os.Exit(2)
 }

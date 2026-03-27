@@ -23,6 +23,8 @@ import (
 	"github.com/mem9-ai/dat9/cmd/dat9/cli"
 )
 
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -30,6 +32,14 @@ func main() {
 
 	cmd := os.Args[1]
 	args := os.Args[2:]
+
+	switch cmd {
+	case "--version", "-v", "version":
+		fmt.Printf("dat9 %s\n", version)
+		return
+	case "-h", "-help", "help":
+		usage()
+	}
 
 	c := cli.NewFromEnv()
 
@@ -51,8 +61,6 @@ func main() {
 		err = cli.Sh(c, args)
 	case "sql":
 		err = cli.SQL(c, args)
-	case "-h", "-help", "help":
-		usage()
 	default:
 		fmt.Fprintf(os.Stderr, "dat9: unknown command %q\n", cmd)
 		usage()

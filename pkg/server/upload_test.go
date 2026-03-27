@@ -12,7 +12,7 @@ import (
 
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
-	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
@@ -30,7 +30,8 @@ func newTestServerWithS3(t *testing.T) (*Server, *s3client.LocalS3Client) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(s3Dir) })
 
-	store, err := meta.Open(testDSN)
+	initServerTenantSchema(t, testDSN)
+	store, err := datastore.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +43,7 @@ func newTestServerWithS3(t *testing.T) (*Server, *s3client.LocalS3Client) {
 		t.Fatal(err)
 	}
 
-	b, err := backend.NewWithS3(store, blobDir, s3c)
+	b, err := backend.NewWithS3(store, s3c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +121,7 @@ func TestUploadCompleteEndpoint(t *testing.T) {
 	_ = resp.Body.Close()
 
 	// Get the upload to find s3_upload_id
-	upload, _ := s.backend.GetUpload(plan.UploadID)
+	upload, _ := s.fallback.GetUpload(plan.UploadID)
 
 	// Upload all parts via S3 client directly
 	for _, p := range plan.Parts {
@@ -168,7 +169,7 @@ func TestUploadResumeEndpoint(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 
-	upload, _ := s.backend.GetUpload(plan.UploadID)
+	upload, _ := s.fallback.GetUpload(plan.UploadID)
 
 	// Upload only part 1
 	if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, 1, bytes.NewReader(make([]byte, s3client.PartSize))); err != nil {
@@ -231,7 +232,7 @@ func TestLargeUploadOverwritesExistingSmallFile(t *testing.T) {
 		t.Fatalf("initiate overwrite: expected 202, got %d", resp.StatusCode)
 	}
 
-	upload, err := s.backend.GetUpload(plan.UploadID)
+	upload, err := s.fallback.GetUpload(plan.UploadID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,11 +258,11 @@ func TestLargeUploadOverwritesExistingSmallFile(t *testing.T) {
 		t.Fatalf("complete overwrite: expected 200, got %d", resp.StatusCode)
 	}
 
-	nf, err := s.backend.Store().Stat("/overwrite.bin")
+	nf, err := s.fallback.Store().Stat("/overwrite.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if nf.File == nil || nf.File.StorageType != meta.StorageS3 {
+	if nf.File == nil || nf.File.StorageType != datastore.StorageS3 {
 		t.Fatalf("expected overwrite.bin to point at S3-backed file, got %+v", nf.File)
 	}
 	if nf.File.SizeBytes != totalSize {
@@ -365,8 +366,8 @@ func TestAbortUploadEndpoint(t *testing.T) {
 	}
 
 	// Verify upload is aborted
-	upload, _ := s.backend.GetUpload(plan.UploadID)
-	if upload.Status != meta.UploadAborted {
+	upload, _ := s.fallback.GetUpload(plan.UploadID)
+	if upload.Status != datastore.UploadAborted {
 		t.Errorf("expected ABORTED, got %s", upload.Status)
 	}
 }
