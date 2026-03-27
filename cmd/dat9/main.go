@@ -55,9 +55,9 @@ func parseDBAndArgs(args []string) (dbName string, rest []string) {
 	}
 	for i, arg := range args {
 		if idx := strings.Index(arg, ":/"); idx > 0 {
+			args[i] = arg[idx:]
 			return arg[:idx], args
 		}
-		_ = i
 	}
 	return "", args
 }
