@@ -1054,6 +1054,9 @@ func (s *Store) ExecSQL(ctx context.Context, query string) ([]map[string]interfa
 	if !isSelect && !isTagWrite {
 		return nil, fmt.Errorf("only SELECT queries and INSERT/UPDATE/DELETE on file_tags are allowed")
 	}
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("database is closed")
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
