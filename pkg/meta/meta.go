@@ -13,7 +13,13 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-var ErrNotFound = errors.New("not found")
+var (
+	ErrNotFound        = errors.New("not found")
+	ErrUploadNotActive = errors.New("upload is not in UPLOADING state")
+	ErrUploadExpired   = errors.New("upload has expired")
+	ErrPathConflict    = errors.New("path already exists")
+	ErrUploadConflict  = errors.New("active upload already exists for this path")
+)
 
 type StorageType string
 
@@ -119,6 +125,20 @@ func Open(dsn string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) DB() *sql.DB  { return s.db }
 
+// InTx runs fn inside a database transaction. If fn returns an error, the
+// transaction is rolled back; otherwise it is committed.
+func (s *Store) InTx(fn func(tx *sql.Tx) error) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) migrate() error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
@@ -173,7 +193,8 @@ func (s *Store) migrate() error {
 			idempotency_key    VARCHAR(255),
 			created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-			expires_at         DATETIME(3) NOT NULL
+			expires_at         DATETIME(3) NOT NULL,
+			active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED
 		)`,
 		`CREATE INDEX idx_upload_path ON uploads(target_path, status)`,
 		`CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)`,
@@ -190,7 +211,29 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("exec %q: %w", snippet, err)
 		}
 	}
+
+	// Ensure active_target_path column and unique index exist.
+	// For fresh DBs the column is in CREATE TABLE; for existing DBs we ALTER.
+	if !s.columnExists("uploads", "active_target_path") {
+		if _, err := s.db.Exec(`ALTER TABLE uploads ADD COLUMN active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED`); err != nil {
+			return fmt.Errorf("add active_target_path column: %w", err)
+		}
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path)`); err != nil {
+		if !isDuplicateIndexError(err) {
+			return fmt.Errorf("create idx_uploads_active: %w", err)
+		}
+	}
+
 	return nil
+}
+
+func (s *Store) columnExists(table, column string) bool {
+	var count int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = ? AND column_name = ?`,
+		table, column).Scan(&count)
+	return err == nil && count > 0
 }
 
 // --- file_nodes operations ---
@@ -199,6 +242,9 @@ func (s *Store) InsertNode(n *FileNode) error {
 	_, err := s.db.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), n.CreatedAt.UTC())
+	if isUniqueViolation(err) {
+		return ErrPathConflict
+	}
 	return err
 }
 
@@ -414,9 +460,65 @@ func (s *Store) UpdateFileContent(fileID string, storageType StorageType, storag
 }
 
 func (s *Store) ConfirmFile(fileID string) error {
-	_, err := s.db.Exec(`UPDATE files SET status = 'CONFIRMED',
+	return s.ConfirmFileTx(s.db, fileID)
+}
+
+// execer abstracts *sql.DB and *sql.Tx for shared query execution.
+type execer interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+}
+
+func (s *Store) ConfirmFileTx(db execer, fileID string) error {
+	_, err := db.Exec(`UPDATE files SET status = 'CONFIRMED',
 		confirmed_at = ?
 		WHERE file_id = ? AND status = 'PENDING'`, time.Now().UTC(), fileID)
+	return err
+}
+
+func (s *Store) CompleteUploadTx(db execer, uploadID string) error {
+	_, err := db.Exec(`UPDATE uploads SET status = 'COMPLETED',
+		updated_at = ?
+		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
+	return err
+}
+
+func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) error {
+	var ancestors []string
+	cur := path
+	for {
+		parent := parentPath(cur)
+		if parent == cur || parent == "/" {
+			break
+		}
+		ancestors = append(ancestors, parent)
+		cur = parent
+	}
+	now := time.Now()
+	for i := len(ancestors) - 1; i >= 0; i-- {
+		dirPath := ancestors[i]
+		pp := parentPath(dirPath)
+		name := baseName(dirPath)
+		_, err := db.Exec(`INSERT INTO file_nodes
+			(node_id, path, parent_path, name, is_directory, created_at)
+			VALUES (?, ?, ?, ?, 1, ?)
+			ON DUPLICATE KEY UPDATE node_id = node_id`,
+			genID(), dirPath, pp, name, now.UTC())
+		if err != nil && !isUniqueViolation(err) {
+			return fmt.Errorf("ensure parent %s: %w", dirPath, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
+	_, err := db.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), n.CreatedAt.UTC())
+	if isUniqueViolation(err) {
+		return ErrPathConflict
+	}
 	return err
 }
 
@@ -596,6 +698,9 @@ func (s *Store) InsertUpload(u *Upload) error {
 		u.TotalSize, u.PartSize, u.PartsTotal, u.Status,
 		nullStr(u.FingerprintSHA), nullStr(u.IdempotencyKey),
 		u.CreatedAt.UTC(), u.UpdatedAt.UTC(), u.ExpiresAt.UTC())
+	if isUniqueViolation(err) {
+		return ErrUploadConflict
+	}
 	return err
 }
 
@@ -621,6 +726,34 @@ func (s *Store) CompleteUpload(uploadID string) error {
 		updated_at = ?
 		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
 	return err
+}
+
+func (s *Store) AbortUpload(uploadID string) error {
+	_, err := s.db.Exec(`UPDATE uploads SET status = 'ABORTED',
+		updated_at = ?
+		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
+	return err
+}
+
+func (s *Store) ListUploadsByPath(targetPath string, status UploadStatus) ([]*Upload, error) {
+	rows, err := s.db.Query(`SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
+		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
+		created_at, updated_at, expires_at
+		FROM uploads WHERE target_path = ? AND status = ?
+		ORDER BY created_at DESC`, targetPath, status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var uploads []*Upload
+	for rows.Next() {
+		u, err := scanUpload(rows)
+		if err != nil {
+			return nil, err
+		}
+		uploads = append(uploads, u)
+	}
+	return uploads, rows.Err()
 }
 
 // --- scan helpers ---
