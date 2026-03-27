@@ -34,7 +34,7 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(b)
+	return New(Config{Backend: b})
 }
 func TestWriteAndRead(t *testing.T) {
 	s := newTestServer(t)
@@ -222,7 +222,10 @@ func TestNotFound(t *testing.T) {
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 
-	resp, _ := http.Get(ts.URL + "/v1/fs/nonexistent.txt")
+	resp, err := http.Get(ts.URL + "/v1/fs/nonexistent.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 404 {
 		t.Errorf("expected 404, got %d", resp.StatusCode)
