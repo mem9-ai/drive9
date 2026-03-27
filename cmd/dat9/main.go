@@ -6,14 +6,16 @@
 //
 // Commands:
 //
-//	fs    filesystem operations (cp, cat, ls, stat, mv, rm, sh)
-//	db    database operations (sql)
-//	auth  save or show API key
+//	fs      filesystem operations (cp, cat, ls, stat, mv, rm, sh)
+//	db      database operations (create, list, status, sql)
+//	use     set default database
+//	version show version
 package main
 
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/mem9-ai/dat9/cmd/dat9/cli"
 )
@@ -33,9 +35,9 @@ func main() {
 		fmt.Printf("dat9 %s\n", version)
 	case "-h", "-help", "help":
 		usage()
-	case "auth":
-		if err := cli.Auth(nil, args); err != nil {
-			fatal("auth", err)
+	case "use":
+		if err := cli.Use(args); err != nil {
+			fatal("use", err)
 		}
 	case "fs":
 		runFS(args)
@@ -47,13 +49,27 @@ func main() {
 	}
 }
 
+func parseDBAndArgs(args []string) (dbName string, rest []string) {
+	if len(args) == 0 {
+		return "", args
+	}
+	for i, arg := range args {
+		if idx := strings.Index(arg, ":/"); idx > 0 {
+			return arg[:idx], args
+		}
+		_ = i
+	}
+	return "", args
+}
+
 func runFS(args []string) {
 	if len(args) < 1 {
 		fsUsage()
 	}
 	sub := args[0]
 	rest := args[1:]
-	c := cli.NewFromEnv()
+	dbName, rest := parseDBAndArgs(rest)
+	c := cli.NewClient(dbName)
 
 	var err error
 	switch sub {
@@ -88,21 +104,39 @@ func runDB(args []string) {
 	}
 	sub := args[0]
 	rest := args[1:]
-	c := cli.NewFromEnv()
 
-	var err error
 	switch sub {
+	case "create":
+		if err := cli.DBCreate(rest); err != nil {
+			fatal("db create", err)
+		}
+	case "list", "ls":
+		if err := cli.DBList(); err != nil {
+			fatal("db list", err)
+		}
+	case "status":
+		if err := cli.DBStatus(rest); err != nil {
+			fatal("db status", err)
+		}
 	case "sql":
-		err = cli.SQL(c, rest)
+		dbName, sqlArgs := parseDBFromSQLArgs(rest)
+		c := cli.NewClient(dbName)
+		if err := cli.SQL(c, sqlArgs); err != nil {
+			fatal("db sql", err)
+		}
 	case "-h", "-help", "help":
 		dbUsage()
 	default:
 		fmt.Fprintf(os.Stderr, "dat9 db: unknown command %q\n", sub)
 		dbUsage()
 	}
-	if err != nil {
-		fatal("db "+sub, err)
+}
+
+func parseDBFromSQLArgs(args []string) (dbName string, rest []string) {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		return args[0], args[1:]
 	}
+	return "", args
 }
 
 func fatal(cmd string, err error) {
@@ -116,18 +150,20 @@ func usage() {
 commands:
   fs               filesystem operations
   db               database operations
-  auth [api-key]   save or show API key (~/.dat9/credentials)
-  version          show version
+  use [name]       set or show default database
 
 environment:
   DAT9_SERVER      server URL (default: http://localhost:9009)
-  DAT9_API_KEY     API key (or use: dat9 auth <key>)
+  DAT9_API_KEY     API key
 `)
 	os.Exit(2)
 }
 
 func fsUsage() {
 	fmt.Fprintf(os.Stderr, `usage: dat9 fs <command> [arguments]
+
+Remote paths use <db>:/path format (e.g. mydb:/data/file.txt).
+Omit <db> to use the default database.
 
 commands:
   cp <src> <dst>   copy files (local↔remote)
@@ -145,8 +181,11 @@ func dbUsage() {
 	fmt.Fprintf(os.Stderr, `usage: dat9 db <command> [arguments]
 
 commands:
-  sql -q "query"   execute SQL query
-  sql -f file.sql  execute SQL from file
+  create <name>           create a new database
+  list                    list databases
+  status <name>           show database status
+  sql [db] -q "query"     execute SQL query
+  sql [db] -f file.sql    execute SQL from file
 `)
 	os.Exit(2)
 }
