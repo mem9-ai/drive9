@@ -289,7 +289,7 @@ func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ts := httptest.NewUnstartedServer(srvpkg.New(b))
+	ts := httptest.NewUnstartedServer(srvpkg.New(srvpkg.Config{Backend: b}))
 	_ = ts.Listener.Close()
 	ts.Listener = ln
 	ts.Start()
