@@ -243,7 +243,11 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		if r.URL.Query().Has("list") {
+		if r.URL.Query().Has("grep") {
+			s.handleGrep(w, r, path)
+		} else if r.URL.Query().Has("find") {
+			s.handleFind(w, r, path)
+		} else if r.URL.Query().Has("list") {
 			s.handleList(w, r, path)
 		} else {
 			s.handleRead(w, r, path)

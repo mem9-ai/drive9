@@ -130,6 +130,11 @@ func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limi
 func ftsSafe(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `'`, `''`)
+	s = strings.ReplaceAll(s, `;`, "")
+	s = strings.ReplaceAll(s, `--`, "")
+	s = strings.ReplaceAll(s, `/*`, "")
+	s = strings.ReplaceAll(s, `*/`, "")
+	s = strings.ReplaceAll(s, "\x00", "")
 	return s
 }
 
