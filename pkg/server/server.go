@@ -828,3 +828,69 @@ func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(rows)
 }
+
+func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	query := r.URL.Query().Get("grep")
+	if query == "" {
+		errJSON(w, http.StatusBadRequest, "empty grep query")
+		return
+	}
+	limit := 20
+	if v := r.URL.Query().Get("limit"); v != "" {
+		fmt.Sscanf(v, "%d", &limit)
+	}
+	results, err := b.Grep(r.Context(), query, path, limit)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(results)
+}
+
+func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	q := r.URL.Query()
+	f := &datastore.FindFilter{PathPrefix: path}
+	f.NameGlob = q.Get("name")
+	if tag := q.Get("tag"); tag != "" {
+		k, v, _ := strings.Cut(tag, "=")
+		f.TagKey = k
+		f.TagValue = v
+	}
+	if v := q.Get("newer"); v != "" {
+		if t, err := time.Parse("2006-01-02", v); err == nil {
+			f.After = &t
+		}
+	}
+	if v := q.Get("older"); v != "" {
+		if t, err := time.Parse("2006-01-02", v); err == nil {
+			f.Before = &t
+		}
+	}
+	if v := q.Get("minsize"); v != "" {
+		fmt.Sscanf(v, "%d", &f.MinSize)
+	}
+	if v := q.Get("maxsize"); v != "" {
+		fmt.Sscanf(v, "%d", &f.MaxSize)
+	}
+	if v := q.Get("limit"); v != "" {
+		fmt.Sscanf(v, "%d", &f.Limit)
+	}
+	results, err := b.Find(r.Context(), f)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(results)
+}

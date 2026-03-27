@@ -572,3 +572,11 @@ func extractText(data []byte, contentType string) string {
 func (b *Dat9Backend) ExecSQL(ctx context.Context, query string) ([]map[string]interface{}, error) {
 	return b.store.ExecSQL(ctx, query)
 }
+
+func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit int) ([]datastore.SearchResult, error) {
+	return b.store.Grep(ctx, query, pathPrefix, limit)
+}
+
+func (b *Dat9Backend) Find(ctx context.Context, f *datastore.FindFilter) ([]datastore.SearchResult, error) {
+	return b.store.Find(ctx, f)
+}
