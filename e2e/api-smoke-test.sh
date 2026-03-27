@@ -8,9 +8,12 @@
 #  4) Nested mkdir (multi-level directories)
 #  5) Multi-file write/read under nested directories
 #  6) Batch small-file write/list/read validation
-#  6) Copy, rename, delete
-#  7) Final list verification
-#  8) 100MB multipart upload with checksum-bound presigned parts
+#  7) Content search (`grep`) and attribute search (`find`)
+#  8) SQL endpoint sanity query
+#  9) Copy, rename, delete
+# 10) Final list verification
+# 11) 100MB multipart upload with checksum-bound presigned parts + download checksum
+# 12) Max-upload boundary check (1GiB allowed, 1GiB+1 rejected)
 
 set -euo pipefail
 
@@ -20,6 +23,10 @@ POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 RUN_LARGE_FILE="${RUN_LARGE_FILE:-1}"
 LARGE_FILE_MB="${LARGE_FILE_MB:-100}"
 BATCH_SMALL_FILE_COUNT="${BATCH_SMALL_FILE_COUNT:-10}"
+REQUEST_MAX_RETRIES="${REQUEST_MAX_RETRIES:-8}"
+REQUEST_RETRY_SLEEP_S="${REQUEST_RETRY_SLEEP_S:-2}"
+RUN_UPLOAD_LIMIT_BOUNDARY="${RUN_UPLOAD_LIMIT_BOUNDARY:-1}"
+UPLOAD_LIMIT_BYTES="${UPLOAD_LIMIT_BYTES:-1073741824}"
 
 PASS=0
 FAIL=0
@@ -67,35 +74,32 @@ curl_body_code() {
   local auth="${3:-}"
   local data="${4:-}"
 
-  local body_file
-  body_file="$(mktemp)"
-
-  if [ -n "$auth" ] && [ -n "$data" ]; then
+  local attempt=1
+  while :; do
+    local body_file
+    body_file="$(mktemp)"
     local code
-    code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" -H "Authorization: Bearer $auth" --data-binary "$data" "$url")
-    cat "$body_file"
-    echo
-    echo "__HTTP__${code}"
-    rm -f "$body_file"
-    return
-  fi
+    if [ -n "$auth" ] && [ -n "$data" ]; then
+      code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" -H "Authorization: Bearer $auth" --data-binary "$data" "$url")
+    elif [ -n "$auth" ]; then
+      code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" -H "Authorization: Bearer $auth" "$url")
+    else
+      code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" "$url")
+    fi
 
-  if [ -n "$auth" ]; then
-    local code
-    code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" -H "Authorization: Bearer $auth" "$url")
-    cat "$body_file"
-    echo
-    echo "__HTTP__${code}"
-    rm -f "$body_file"
-    return
-  fi
+    if [ "$code" != "429" ] || [ "$attempt" -ge "$REQUEST_MAX_RETRIES" ]; then
+      cat "$body_file"
+      echo
+      echo "__HTTP__${code}"
+      rm -f "$body_file"
+      return
+    fi
 
-  local code
-  code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" "$url")
-  cat "$body_file"
-  echo
-  echo "__HTTP__${code}"
-  rm -f "$body_file"
+    info "throttled (429), retrying ${attempt}/${REQUEST_MAX_RETRIES}: $method $url"
+    rm -f "$body_file"
+    attempt=$((attempt + 1))
+    sleep "$REQUEST_RETRY_SLEEP_S"
+  done
 }
 
 http_code() { printf '%s' "$1" | awk -F'__HTTP__' 'NF>1{print $2}' | tr -d '\n'; }
@@ -214,17 +218,110 @@ for i in 1 "$BATCH_SMALL_FILE_COUNT"; do
   check_eq "batch file content matches for $path" "$rbody" "$expected"
 done
 
-step "7" "Copy, rename, delete"
-resp=$(curl -sS -o /tmp/dat9-copy.out -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "X-Dat9-Copy-Source: /$ROOT_DIR/README.md" "$BASE/v1/fs/$ROOT_DIR/README-copy.md?copy")
-check_eq "POST ?copy returns 200" "$resp" "200"
+step "7" "Search checks (grep/find)"
+resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?grep=smoke-$TS&limit=20" "$API_KEY")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+check_eq "GET ?grep returns 200" "$code" "200"
+grep_count=$(printf '%s' "$body" | jq -r 'length')
+check_cmd "grep returns at least 2 results" test "$grep_count" -ge 2
+grep_has_root=$(printf '%s' "$body" | jq -r --arg root "$ROOT_DIR" 'any(.[]; (.path // "") | contains($root))')
+check_eq "grep includes files under test root" "$grep_has_root" "true"
 
-resp=$(curl -sS -o /tmp/dat9-rename.out -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "X-Dat9-Rename-Source: /$BACKEND_DIR/config.yaml" "$BASE/v1/fs/$BACKEND_DIR/config-renamed.yaml?rename")
-check_eq "POST ?rename returns 200" "$resp" "200"
+resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?find=&name=*.yaml" "$API_KEY")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+check_eq "GET ?find returns 200" "$code" "200"
+find_has_yaml=$(printf '%s' "$body" | jq -r --arg p "$BACKEND_DIR/config.yaml" 'any(.[]; .path==$p)')
+if [ "$find_has_yaml" != "true" ]; then
+  find_has_yaml=$(printf '%s' "$body" | jq -r 'any(.[]; (.path // "") | endswith("config.yaml"))')
+fi
 
-resp=$(curl -sS -o /tmp/dat9-delete.out -w "%{http_code}" -X DELETE -H "Authorization: Bearer $API_KEY" "$BASE/v1/fs/$ROOT_DIR/README-copy.md")
-check_eq "DELETE copied file returns 200" "$resp" "200"
+if [ "$RUN_UPLOAD_LIMIT_BOUNDARY" = "1" ]; then
+  step "12" "Upload limit boundary (1GiB/1GiB+1)"
+  # Generate checksums for a 1GiB zero-filled upload plan: 128 parts * 8MiB.
+  BOUNDARY_CHECKSUMS=$(python3 - <<'PY'
+import base64
+import hashlib
+part = b"\x00" * (8 * 1024 * 1024)
+one = base64.b64encode(hashlib.sha256(part).digest()).decode()
+print(",".join([one] * 128))
+PY
+)
 
-step "8" "Final list verification"
+  boundary_ok_body="$(mktemp)"
+  boundary_ok_code=$(curl -sS -o "$boundary_ok_body" -w "%{http_code}" -X PUT \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "X-Dat9-Content-Length: $UPLOAD_LIMIT_BYTES" \
+    -H "X-Dat9-Part-Checksums: $BOUNDARY_CHECKSUMS" \
+    --data-binary "" \
+    "$BASE/v1/fs/$ROOT_DIR/limit-1g.bin")
+  check_eq "init at upload limit returns 202" "$boundary_ok_code" "202"
+  rm -f "$boundary_ok_body"
+
+  over_limit=$((UPLOAD_LIMIT_BYTES + 1))
+  boundary_over_body="$(mktemp)"
+  boundary_over_code=$(curl -sS -o "$boundary_over_body" -w "%{http_code}" -X PUT \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "X-Dat9-Content-Length: $over_limit" \
+    -H "X-Dat9-Part-Checksums: $BOUNDARY_CHECKSUMS" \
+    --data-binary "" \
+    "$BASE/v1/fs/$ROOT_DIR/limit-over.bin")
+  check_eq "init over upload limit returns 413" "$boundary_over_code" "413"
+  over_err=$(jq -r '.error // empty' "$boundary_over_body")
+  check_cmd "over-limit response has error message" test -n "$over_err"
+  rm -f "$boundary_over_body"
+fi
+check_eq "find by name returns yaml file" "$find_has_yaml" "true"
+
+step "8" "SQL endpoint sanity"
+sql_req='{"query":"SELECT 1 AS n"}'
+sql_body="$(mktemp)"
+code=$(curl -sS -o "$sql_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" --data-binary "$sql_req" "$BASE/v1/sql")
+body=$(cat "$sql_body")
+rm -f "$sql_body"
+check_eq "POST /v1/sql returns 200" "$code" "200"
+sql_n=$(printf '%s' "$body" | jq -r '.[0].n')
+check_eq "SQL query result n=1" "$sql_n" "1"
+
+step "9" "Copy, rename, delete"
+copy_body="$(mktemp)"
+copy_code=$(curl -sS -o "$copy_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "X-Dat9-Copy-Source: /$ROOT_DIR/README.md" "$BASE/v1/fs/$ROOT_DIR/README-copy.md?copy")
+copy_attempt=1
+while [ "$copy_code" = "429" ] && [ "$copy_attempt" -lt "$REQUEST_MAX_RETRIES" ]; do
+  info "throttled (429), retrying ${copy_attempt}/${REQUEST_MAX_RETRIES}: copy"
+  copy_attempt=$((copy_attempt + 1))
+  sleep "$REQUEST_RETRY_SLEEP_S"
+  copy_code=$(curl -sS -o "$copy_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "X-Dat9-Copy-Source: /$ROOT_DIR/README.md" "$BASE/v1/fs/$ROOT_DIR/README-copy.md?copy")
+done
+check_eq "POST ?copy returns 200" "$copy_code" "200"
+rm -f "$copy_body"
+
+rename_body="$(mktemp)"
+rename_code=$(curl -sS -o "$rename_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "X-Dat9-Rename-Source: /$BACKEND_DIR/config.yaml" "$BASE/v1/fs/$BACKEND_DIR/config-renamed.yaml?rename")
+rename_attempt=1
+while [ "$rename_code" = "429" ] && [ "$rename_attempt" -lt "$REQUEST_MAX_RETRIES" ]; do
+  info "throttled (429), retrying ${rename_attempt}/${REQUEST_MAX_RETRIES}: rename"
+  rename_attempt=$((rename_attempt + 1))
+  sleep "$REQUEST_RETRY_SLEEP_S"
+  rename_code=$(curl -sS -o "$rename_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "X-Dat9-Rename-Source: /$BACKEND_DIR/config.yaml" "$BASE/v1/fs/$BACKEND_DIR/config-renamed.yaml?rename")
+done
+check_eq "POST ?rename returns 200" "$rename_code" "200"
+rm -f "$rename_body"
+
+delete_body="$(mktemp)"
+delete_code=$(curl -sS -o "$delete_body" -w "%{http_code}" -X DELETE -H "Authorization: Bearer $API_KEY" "$BASE/v1/fs/$ROOT_DIR/README-copy.md")
+delete_attempt=1
+while [ "$delete_code" = "429" ] && [ "$delete_attempt" -lt "$REQUEST_MAX_RETRIES" ]; do
+  info "throttled (429), retrying ${delete_attempt}/${REQUEST_MAX_RETRIES}: delete"
+  delete_attempt=$((delete_attempt + 1))
+  sleep "$REQUEST_RETRY_SLEEP_S"
+  delete_code=$(curl -sS -o "$delete_body" -w "%{http_code}" -X DELETE -H "Authorization: Bearer $API_KEY" "$BASE/v1/fs/$ROOT_DIR/README-copy.md")
+done
+check_eq "DELETE copied file returns 200" "$delete_code" "200"
+rm -f "$delete_body"
+
+step "10" "Final list verification"
 resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?list" "$API_KEY")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
@@ -237,7 +334,7 @@ check_eq "frontend directory still exists" "$frontend_exists" "true"
 check_eq "copied file removed" "$copy_exists" "false"
 
 if [ "$RUN_LARGE_FILE" = "1" ]; then
-  step "9" "Large file multipart upload (${LARGE_FILE_MB}MB)"
+  step "11" "Large file multipart upload (${LARGE_FILE_MB}MB)"
   check_cmd "python3 is available" bash -c 'command -v python3 >/dev/null'
 
   resp=$(curl_body_code POST "$BASE/v1/fs/$LARGE_REMOTE_DIR?mkdir" "$API_KEY")
@@ -335,8 +432,6 @@ PY
 
   rm -f "$plan_file" "$LARGE_FILE_LOCAL" "$LARGE_FILE_DOWNLOADED"
 fi
-
-rm -f /tmp/dat9-copy.out /tmp/dat9-rename.out /tmp/dat9-delete.out
 
 echo
 echo "========================================================"
