@@ -1018,10 +1018,23 @@ func (s *Store) ExecSQL(ctx context.Context, query string) ([]map[string]interfa
 
 	if isTagWrite {
 		if strings.HasPrefix(upper, "UPDATE") || strings.HasPrefix(upper, "DELETE") {
-			for _, t := range []string{"FILE_NODES", "FILES", "UPLOADS"} {
-				if strings.Contains(upper, t) {
-					return nil, fmt.Errorf("DML on file_tags must not reference other tables")
+			hasJoin := strings.Contains(upper, " JOIN ")
+			hasUsing := strings.Contains(upper, " USING ")
+			hasCommaTable := false
+			if strings.HasPrefix(upper, "UPDATE") {
+				setIdx := strings.Index(upper, " SET ")
+				if setIdx > 0 {
+					hasCommaTable = strings.Contains(upper[:setIdx], ",")
 				}
+			} else {
+				fromIdx := strings.Index(upper, " FROM ")
+				whereIdx := strings.Index(upper, " WHERE ")
+				if fromIdx > 0 && whereIdx > fromIdx {
+					hasCommaTable = strings.Contains(upper[fromIdx:whereIdx], ",")
+				}
+			}
+			if hasJoin || hasUsing || hasCommaTable {
+				return nil, fmt.Errorf("multi-table DML not allowed; single-table statements on file_tags only")
 			}
 		}
 	}

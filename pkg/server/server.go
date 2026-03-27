@@ -665,7 +665,7 @@ func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request) {
 
 	b := backendFromRequest(r)
 	if b == nil {
-		errJSON(w, http.StatusInternalServerError, "no backend available")
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
 
