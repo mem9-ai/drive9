@@ -68,7 +68,7 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	mux.Handle("/v1/fs/", business)
 	mux.Handle("/v1/uploads", business)
-	mux.Handle("/v1/uploads/", business)l
+	mux.Handle("/v1/uploads/", business)
 	mux.Handle("/v1/sql", business)
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
