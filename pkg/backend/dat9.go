@@ -568,3 +568,7 @@ func extractText(data []byte, contentType string) string {
 	}
 	return string(data)
 }
+
+func (b *Dat9Backend) ExecSQL(ctx context.Context, query string) ([]map[string]interface{}, error) {
+	return b.store.ExecSQL(ctx, query)
+}

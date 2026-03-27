@@ -68,7 +68,8 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	mux.Handle("/v1/fs/", business)
 	mux.Handle("/v1/uploads", business)
-	mux.Handle("/v1/uploads/", business)
+	mux.Handle("/v1/uploads/", business)l
+	mux.Handle("/v1/sql", business)
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
 
@@ -164,6 +165,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleUploads(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/uploads/"):
 		s.handleUploadAction(w, r)
+	case r.URL.Path == "/v1/sql":
+		s.handleSQL(w, r)
 	default:
 		errJSON(w, http.StatusNotFound, "not found")
 	}
@@ -739,4 +742,38 @@ func errJSON(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	b := backendFromRequest(r)
+	if b == nil {
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+
+	var req struct {
+		Query string `json:"query"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		errJSON(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if req.Query == "" {
+		errJSON(w, http.StatusBadRequest, "empty query")
+		return
+	}
+
+	rows, err := b.ExecSQL(r.Context(), req.Query)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(rows)
 }
