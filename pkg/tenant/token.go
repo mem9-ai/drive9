@@ -17,6 +17,7 @@ type Claims struct {
 	TenantID     string `json:"tenant_id"`
 	TokenVersion int    `json:"token_version"`
 	IssuedAt     int64  `json:"iat"`
+	ExpiresAt    int64  `json:"exp,omitempty"`
 }
 
 func NewID() string { return ulid.Make().String() }
@@ -27,8 +28,15 @@ func HashToken(raw string) string {
 }
 
 func IssueToken(secret []byte, tenantID string, tokenVersion int) (string, error) {
+	return IssueTokenWithExpiry(secret, tenantID, tokenVersion, time.Time{})
+}
+
+func IssueTokenWithExpiry(secret []byte, tenantID string, tokenVersion int, expiresAt time.Time) (string, error) {
 	header := map[string]string{"alg": "HS256", "typ": "JWT"}
 	payload := Claims{TenantID: tenantID, TokenVersion: tokenVersion, IssuedAt: time.Now().Unix()}
+	if !expiresAt.IsZero() {
+		payload.ExpiresAt = expiresAt.Unix()
+	}
 
 	h, err := json.Marshal(header)
 	if err != nil {
@@ -49,6 +57,10 @@ func IssueToken(secret []byte, tenantID string, tokenVersion int) (string, error
 }
 
 func ParseAndVerifyToken(secret []byte, raw string) (*Claims, error) {
+	return parseAndVerifyTokenAt(secret, raw, time.Now().Unix())
+}
+
+func parseAndVerifyTokenAt(secret []byte, raw string, nowUnix int64) (*Claims, error) {
 	parts := strings.Split(raw, ".")
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("invalid token format")
@@ -74,8 +86,16 @@ func ParseAndVerifyToken(secret []byte, raw string) (*Claims, error) {
 	if err := json.Unmarshal(payloadJSON, &claims); err != nil {
 		return nil, fmt.Errorf("invalid token claims")
 	}
-	if claims.TenantID == "" || claims.TokenVersion <= 0 {
+	if claims.TenantID == "" || claims.TokenVersion <= 0 || claims.IssuedAt <= 0 {
 		return nil, fmt.Errorf("invalid token claims")
+	}
+	if claims.ExpiresAt > 0 {
+		if claims.ExpiresAt <= claims.IssuedAt {
+			return nil, fmt.Errorf("invalid token claims")
+		}
+		if nowUnix >= claims.ExpiresAt {
+			return nil, fmt.Errorf("token expired")
+		}
 	}
 	return &claims, nil
 }
