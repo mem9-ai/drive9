@@ -7,36 +7,31 @@ import (
 	"testing"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
 func newTestBackendWithS3(t *testing.T) *Dat9Backend {
 	t.Helper()
-	dbFile, err := os.CreateTemp("", "dat9-*.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dbFile.Close()
-	t.Cleanup(func() { os.Remove(dbFile.Name()) })
-
 	blobDir, err := os.MkdirTemp("", "dat9-blobs-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(blobDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(blobDir) })
 
 	s3Dir, err := os.MkdirTemp("", "dat9-s3-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(s3Dir) })
+	t.Cleanup(func() { _ = os.RemoveAll(s3Dir) })
 
-	store, err := meta.Open(dbFile.Name())
+	store, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { store.Close() })
+	testmysql.ResetDB(t, store.DB())
+	t.Cleanup(func() { _ = store.Close() })
 
 	s3c, err := s3client.NewLocal(s3Dir, "http://localhost:9091/s3")
 	if err != nil {
@@ -177,7 +172,9 @@ func TestResumeUpload(t *testing.T) {
 
 	// Upload only part 1 (simulate partial upload)
 	data := make([]byte, s3client.PartSize)
-	b.S3().(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, 1, bytes.NewReader(data))
+	if _, err := b.S3().(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, 1, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Resume should return parts 2 and 3
 	resumed, err := b.ResumeUpload(ctx, plan.UploadID)
@@ -216,8 +213,12 @@ func TestListUploads(t *testing.T) {
 	ctx := context.Background()
 
 	// One upload per path — use different paths
-	b.InitiateUpload(ctx, "/list-a.bin", 2<<20)
-	b.InitiateUpload(ctx, "/list-b.bin", 3<<20)
+	if _, err := b.InitiateUpload(ctx, "/list-a.bin", 2<<20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.InitiateUpload(ctx, "/list-b.bin", 3<<20); err != nil {
+		t.Fatal(err)
+	}
 
 	uploadsA, err := b.ListUploads("/list-a.bin", meta.UploadUploading)
 	if err != nil {

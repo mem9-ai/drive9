@@ -132,7 +132,7 @@ func (s *Store) InTx(fn func(tx *sql.Tx) error) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if err := fn(tx); err != nil {
 		return err
 	}
@@ -744,7 +744,7 @@ func (s *Store) ListUploadsByPath(targetPath string, status UploadStatus) ([]*Up
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var uploads []*Upload
 	for rows.Next() {
 		u, err := scanUpload(rows)

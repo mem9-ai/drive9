@@ -88,7 +88,7 @@ func uploadFile(ctx context.Context, c *client.Client, localPath, remotePath str
 	if err != nil {
 		return fmt.Errorf("open %s: %w", localPath, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	info, err := f.Stat()
 	if err != nil {
@@ -103,7 +103,7 @@ func resumeUpload(ctx context.Context, c *client.Client, localPath, remotePath s
 	if err != nil {
 		return fmt.Errorf("open %s: %w", localPath, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	info, err := f.Stat()
 	if err != nil {
@@ -118,13 +118,13 @@ func downloadFile(ctx context.Context, c *client.Client, remotePath, localPath s
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	out, err := os.Create(localPath)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", localPath, err)
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }()
 
 	_, err = io.Copy(out, rc)
 	return err
@@ -135,7 +135,7 @@ func streamToStdout(ctx context.Context, c *client.Client, remotePath string) er
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	_, err = io.Copy(os.Stdout, rc)
 	return err

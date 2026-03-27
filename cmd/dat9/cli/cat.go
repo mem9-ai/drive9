@@ -21,7 +21,7 @@ func Cat(c *client.Client, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	_, err = io.Copy(os.Stdout, rc)
 	return err
 }

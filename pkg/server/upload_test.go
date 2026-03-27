@@ -10,6 +10,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
@@ -17,30 +18,24 @@ import (
 
 func newTestServerWithS3(t *testing.T) (*Server, *s3client.LocalS3Client) {
 	t.Helper()
-	dbFile, err := os.CreateTemp("", "dat9-srv-*.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dbFile.Close()
-	t.Cleanup(func() { os.Remove(dbFile.Name()) })
-
 	blobDir, err := os.MkdirTemp("", "dat9-srv-blobs-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(blobDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(blobDir) })
 
 	s3Dir, err := os.MkdirTemp("", "dat9-srv-s3-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(s3Dir) })
+	t.Cleanup(func() { _ = os.RemoveAll(s3Dir) })
 
-	store, err := meta.Open(dbFile.Name())
+	store, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { store.Close() })
+	testmysql.ResetDB(t, store.DB())
+	t.Cleanup(func() { _ = store.Close() })
 
 	s3c, err := s3client.NewLocal(s3Dir, "http://localhost:9091/s3")
 	if err != nil {
@@ -67,7 +62,7 @@ func TestLargeFilePut202(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("expected 202, got %d", resp.StatusCode)
@@ -97,7 +92,7 @@ func TestSmallFilePut200(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
@@ -113,11 +108,16 @@ func TestUploadCompleteEndpoint(t *testing.T) {
 	body := make([]byte, 1<<20)
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/complete-test.bin", bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
-	resp, _ := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var plan backend.UploadPlan
-	json.NewDecoder(resp.Body).Decode(&plan)
-	resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
 
 	// Get the upload to find s3_upload_id
 	upload, _ := s.backend.GetUpload(plan.UploadID)
@@ -129,16 +129,18 @@ func TestUploadCompleteEndpoint(t *testing.T) {
 		if end > int64(len(body)) {
 			end = int64(len(body))
 		}
-		s3c.UploadPart(context.Background(), upload.S3UploadID, p.Number, bytes.NewReader(body[start:end]))
+		if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, p.Number, bytes.NewReader(body[start:end])); err != nil {
+			t.Fatalf("upload part %d: %v", p.Number, err)
+		}
 	}
 
 	// POST /v1/uploads/{id}/complete
 	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/"+plan.UploadID+"/complete", nil)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("complete: expected 200, got %d", resp.StatusCode)
@@ -155,24 +157,31 @@ func TestUploadResumeEndpoint(t *testing.T) {
 	body := make([]byte, totalSize)
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/resume-test.bin", bytes.NewReader(body))
 	req.ContentLength = totalSize
-	resp, _ := http.DefaultClient.Do(req)
-
-	var plan backend.UploadPlan
-	json.NewDecoder(resp.Body).Decode(&plan)
-	resp.Body.Close()
-
-	upload, _ := s.backend.GetUpload(plan.UploadID)
-
-	// Upload only part 1
-	s3c.UploadPart(context.Background(), upload.S3UploadID, 1, bytes.NewReader(make([]byte, s3client.PartSize)))
-
-	// POST /v1/uploads/{id}/resume
-	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/"+plan.UploadID+"/resume", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+
+	var plan backend.UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	upload, _ := s.backend.GetUpload(plan.UploadID)
+
+	// Upload only part 1
+	if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, 1, bytes.NewReader(make([]byte, s3client.PartSize))); err != nil {
+		t.Fatal(err)
+	}
+
+	// POST /v1/uploads/{id}/resume
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/"+plan.UploadID+"/resume", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -180,7 +189,9 @@ func TestUploadResumeEndpoint(t *testing.T) {
 	}
 
 	var resumed backend.UploadPlan
-	json.NewDecoder(resp.Body).Decode(&resumed)
+	if err := json.NewDecoder(resp.Body).Decode(&resumed); err != nil {
+		t.Fatal(err)
+	}
 	if len(resumed.Parts) != 2 {
 		t.Errorf("expected 2 missing parts, got %d", len(resumed.Parts))
 	}
@@ -198,7 +209,7 @@ func TestLargeUploadOverwritesExistingSmallFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("small seed: expected 200, got %d", resp.StatusCode)
 	}
@@ -215,7 +226,7 @@ func TestLargeUploadOverwritesExistingSmallFile(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
 		t.Fatalf("decode plan: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("initiate overwrite: expected 202, got %d", resp.StatusCode)
 	}
@@ -241,7 +252,7 @@ func TestLargeUploadOverwritesExistingSmallFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("complete overwrite: expected 200, got %d", resp.StatusCode)
 	}
@@ -268,14 +279,14 @@ func TestListUploadsEndpoint(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/list-test.bin", bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
 	resp, _ := http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// GET /v1/uploads?path=/list-test.bin&status=UPLOADING
 	resp, err := http.Get(ts.URL + "/v1/uploads?path=/list-test.bin&status=UPLOADING")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
@@ -288,7 +299,9 @@ func TestListUploadsEndpoint(t *testing.T) {
 			Status     string `json:"status"`
 		} `json:"uploads"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
 	if len(result.Uploads) != 1 {
 		t.Errorf("expected 1 upload, got %d", len(result.Uploads))
 	}
@@ -307,7 +320,7 @@ func TestOneUploadPerPath(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/dup-test.bin", bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
 	resp, _ := http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("first upload: expected 202, got %d", resp.StatusCode)
 	}
@@ -316,7 +329,7 @@ func TestOneUploadPerPath(t *testing.T) {
 	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/dup-test.bin", bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
 	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("second upload: expected 409 (conflict), got %d", resp.StatusCode)
 	}
@@ -334,8 +347,10 @@ func TestAbortUploadEndpoint(t *testing.T) {
 	resp, _ := http.DefaultClient.Do(req)
 
 	var plan backend.UploadPlan
-	json.NewDecoder(resp.Body).Decode(&plan)
-	resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
 
 	// DELETE /v1/uploads/{id}
 	req, _ = http.NewRequest(http.MethodDelete, ts.URL+"/v1/uploads/"+plan.UploadID, nil)
@@ -343,7 +358,7 @@ func TestAbortUploadEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("abort: expected 200, got %d", resp.StatusCode)

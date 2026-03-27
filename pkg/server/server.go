@@ -151,7 +151,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(plan)
+		_ = json.NewEncoder(w).Encode(plan)
 		return
 	}
 
@@ -316,7 +316,7 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"uploads": result})
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"uploads": result})
 }
 
 // handleUploadAction handles /v1/uploads/{id}/complete, /v1/uploads/{id}/resume, DELETE /v1/uploads/{id}
@@ -365,7 +365,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uploadID string) {
@@ -387,7 +387,7 @@ func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uplo
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(plan)
+	_ = json.NewEncoder(w).Encode(plan)
 }
 
 func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploadID string) {
@@ -400,7 +400,7 @@ func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploa
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func errJSON(w http.ResponseWriter, code int, msg string) {
