@@ -220,12 +220,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"id":         resolved.Tenant.ID,
-		"status":     string(resolved.Tenant.Status),
-		"provider":   resolved.Tenant.Provider,
-		"updated_at": resolved.Tenant.UpdatedAt.UTC().Format(time.RFC3339Nano),
-	})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": string(resolved.Tenant.Status)})
 }
 
 func backendFromRequest(r *http.Request) *backend.Dat9Backend {
@@ -699,10 +694,8 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"id":         tenantID,
-		"api_key":    token,
-		"api_key_id": apiKeyID,
-		"status":     string(meta.TenantProvisioning),
+		"api_key": token,
+		"status":  string(meta.TenantProvisioning),
 	})
 }
 
