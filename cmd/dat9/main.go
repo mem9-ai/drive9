@@ -101,10 +101,6 @@ commands:
   ctx [name]       switch context (or show current)
   ctx list         list all contexts
   fs               filesystem operations
-
-environment:
-  DAT9_SERVER      server URL (default: http://localhost:9009)
-  DAT9_API_KEY     API key (overrides config)
 `)
 	os.Exit(2)
 }
