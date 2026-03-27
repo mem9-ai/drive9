@@ -186,7 +186,7 @@ func TestTenantStatusWithValidKey(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/tenant/status", nil)
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -214,7 +214,7 @@ func TestTenantStatusReturnsProvisioningState(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/tenant/status", nil)
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
