@@ -2,23 +2,42 @@ package cli
 
 import "testing"
 
-func TestIsRemote(t *testing.T) {
+func TestParseRemote(t *testing.T) {
 	tests := []struct {
-		path string
-		want bool
+		input    string
+		wantCtx  string
+		wantPath string
+		wantOK   bool
 	}{
-		{":/data/file.txt", true},
-		{":/", true},
-		{"/data/file.txt", false},
-		{"/tmp/local.txt", false},
-		{"local.txt", false},
-		{"./local.txt", false},
-		{"-", false},
+		{":/data/file.txt", "", "/data/file.txt", true},
+		{":/", "", "/", true},
+		{"test1:/TODO.md", "test1", "/TODO.md", true},
+		{"mydb:/data/file.txt", "mydb", "/data/file.txt", true},
+		{"/data/file.txt", "", "", false},
+		{"/tmp/local.txt", "", "", false},
+		{"local.txt", "", "", false},
+		{"./local.txt", "", "", false},
+		{"-", "", "", false},
+		// Windows drive-letter paths must not be treated as remote.
+		{"C:/tmp/a.txt", "", "", false},
+		{"D:/Users/test", "", "", false},
+		{"c:/data", "", "", false},
+		// Two-char context names still work.
+		{"ab:/file.txt", "ab", "/file.txt", true},
 	}
 	for _, tt := range tests {
-		got := isRemote(tt.path)
-		if got != tt.want {
-			t.Errorf("isRemote(%q) = %v, want %v", tt.path, got, tt.want)
+		rp, ok := ParseRemote(tt.input)
+		if ok != tt.wantOK {
+			t.Errorf("ParseRemote(%q) ok=%v, want %v", tt.input, ok, tt.wantOK)
+			continue
+		}
+		if ok {
+			if rp.Context != tt.wantCtx {
+				t.Errorf("ParseRemote(%q) context=%q, want %q", tt.input, rp.Context, tt.wantCtx)
+			}
+			if rp.Path != tt.wantPath {
+				t.Errorf("ParseRemote(%q) path=%q, want %q", tt.input, rp.Path, tt.wantPath)
+			}
 		}
 	}
 }

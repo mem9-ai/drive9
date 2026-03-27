@@ -6,21 +6,20 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
 // Cp copies files between local and remote.
 //
-// Remote paths use a ":" prefix to distinguish from local paths:
+// Remote paths use ":" or "<name>:" prefix:
 //
-//	dat9 cp local.txt :/remote/path       upload
-//	dat9 cp :/remote/path local.txt       download
-//	dat9 cp :/remote/a :/remote/b         server-side copy (zero-copy)
-//	dat9 cp - :/remote/path               upload from stdin
-//	dat9 cp :/remote/path -               download to stdout
-//	dat9 cp --resume local.txt :/remote   resume interrupted upload
+//	dat9 fs cp local.txt :/remote/path          upload (current context)
+//	dat9 fs cp local.txt mydb:/remote/path      upload (mydb context)
+//	dat9 fs cp mydb:/remote/path local.txt      download
+//	dat9 fs cp :/remote/a :/remote/b            server-side copy
+//	dat9 fs cp - :/remote/path                  upload from stdin
+//	dat9 fs cp :/remote/path -                  download to stdout
 func Cp(c *client.Client, args []string) error {
 	resume := false
 	filtered := args[:0]
@@ -34,52 +33,54 @@ func Cp(c *client.Client, args []string) error {
 	args = filtered
 
 	if len(args) != 2 {
-		return fmt.Errorf("usage: dat9 cp [--resume] <src> <dst>")
+		return fmt.Errorf("usage: dat9 fs cp [--resume] <src> <dst>")
 	}
 	src, dst := args[0], args[1]
 
-	srcRemote := isRemote(src)
-	dstRemote := isRemote(dst)
+	srcRP, srcIsRemote := ParseRemote(src)
+	dstRP, dstIsRemote := ParseRemote(dst)
 
-	if srcRemote {
-		src = src[1:]
+	ctxName := ""
+	if srcIsRemote && srcRP.Context != "" {
+		ctxName = srcRP.Context
 	}
-	if dstRemote {
-		dst = dst[1:]
+	if dstIsRemote && dstRP.Context != "" {
+		if ctxName != "" && ctxName != dstRP.Context {
+			return fmt.Errorf("cross-context copy not supported: %s vs %s", ctxName, dstRP.Context)
+		}
+		ctxName = dstRP.Context
+	}
+	if ctxName != "" {
+		c = NewClientForContext(ctxName)
 	}
 
 	ctx := context.Background()
 
 	switch {
-	case src == "-" && dstRemote:
-		// stdin → remote (small files only; stdin requires full read to know size)
+	case src == "-" && dstIsRemote:
 		data, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return fmt.Errorf("read stdin: %w", err)
 		}
-		return c.WriteStream(ctx, dst, bytes.NewReader(data), int64(len(data)), printProgress)
+		return c.WriteStream(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress)
 
-	case srcRemote && dst == "-":
-		// remote → stdout
-		return streamToStdout(ctx, c, src)
+	case srcIsRemote && dst == "-":
+		return streamToStdout(ctx, c, srcRP.Path)
 
-	case !srcRemote && dstRemote:
-		// local → remote (upload)
+	case !srcIsRemote && dstIsRemote:
 		if resume {
-			return resumeUpload(ctx, c, src, dst)
+			return resumeUpload(ctx, c, src, dstRP.Path)
 		}
-		return uploadFile(ctx, c, src, dst)
+		return uploadFile(ctx, c, src, dstRP.Path)
 
-	case srcRemote && !dstRemote:
-		// remote → local (download)
-		return downloadFile(ctx, c, src, dst)
+	case srcIsRemote && !dstIsRemote:
+		return downloadFile(ctx, c, srcRP.Path, dst)
 
-	case srcRemote && dstRemote:
-		// remote → remote (server-side copy, zero-copy)
-		return c.Copy(src, dst)
+	case srcIsRemote && dstIsRemote:
+		return c.Copy(srcRP.Path, dstRP.Path)
 
 	default:
-		return fmt.Errorf("at least one path must be remote (use : prefix, e.g. :/path)")
+		return fmt.Errorf("at least one path must be remote (e.g. :/path or mydb:/path)")
 	}
 }
 
@@ -141,19 +142,9 @@ func streamToStdout(ctx context.Context, c *client.Client, remotePath string) er
 	return err
 }
 
-// printProgress displays part-level upload progress.
 func printProgress(partNumber, totalParts int, bytesUploaded int64) {
 	fmt.Fprintf(os.Stderr, "\r  part %d/%d uploaded (%d bytes)", partNumber, totalParts, bytesUploaded)
 	if partNumber == totalParts {
 		fmt.Fprintln(os.Stderr)
 	}
-}
-
-// isRemote returns true if a path refers to a remote dat9 path.
-// Remote paths use a ":" prefix (e.g., ":/data/file.txt").
-func isRemote(path string) bool {
-	if path == "-" {
-		return false
-	}
-	return strings.HasPrefix(path, ":")
 }
