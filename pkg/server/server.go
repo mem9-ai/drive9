@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -68,6 +69,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/fs/", business)
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
+	mux.HandleFunc("/v1/tenant/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
 
 	local := cfg.LocalS3
@@ -165,6 +167,65 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 	default:
 		errJSON(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.meta == nil || s.pool == nil || len(s.tokenSecret) == 0 {
+		errJSON(w, http.StatusNotFound, "tenant status not enabled")
+		return
+	}
+	tok := bearerToken(r)
+	if tok == "" {
+		errJSON(w, http.StatusUnauthorized, "missing or malformed Authorization header")
+		return
+	}
+
+	resolved, err := s.meta.ResolveByAPIKeyHash(tenant.HashToken(tok))
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			errJSON(w, http.StatusUnauthorized, "invalid API key")
+			return
+		}
+		errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(tenant.HashToken(tok)), []byte(resolved.APIKey.JWTHash)) != 1 {
+		errJSON(w, http.StatusUnauthorized, "invalid API key")
+		return
+	}
+	if resolved.APIKey.Status != meta.APIKeyActive {
+		errJSON(w, http.StatusUnauthorized, "invalid API key")
+		return
+	}
+	plain, err := poolDecryptToken(s.pool, resolved.APIKey.JWTCiphertext)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(tok), plain) != 1 {
+		errJSON(w, http.StatusUnauthorized, "invalid API key")
+		return
+	}
+	claims, err := tenant.ParseAndVerifyToken(s.tokenSecret, tok)
+	if err != nil {
+		errJSON(w, http.StatusUnauthorized, "invalid API key")
+		return
+	}
+	if claims.TenantID != resolved.Tenant.ID || claims.TokenVersion != resolved.APIKey.TokenVersion {
+		errJSON(w, http.StatusUnauthorized, "invalid API key")
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"id":         resolved.Tenant.ID,
+		"status":     string(resolved.Tenant.Status),
+		"provider":   resolved.Tenant.Provider,
+		"updated_at": resolved.Tenant.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	})
 }
 
 func backendFromRequest(r *http.Request) *backend.Dat9Backend {
