@@ -128,7 +128,6 @@ func extractContext(args []string) (string, []string) {
 				ctxName = arg[:idx]
 			}
 			args[i] = arg[idx+1:]
-			break
 		}
 	}
 	return ctxName, args
