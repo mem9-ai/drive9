@@ -42,9 +42,11 @@ Use this value unless the environment owner announces a new endpoint.
 4. Nested `mkdir` (`/team/...`) across multi-level paths
 5. Multi-file `PUT` + `GET` content verification
 6. Batch small-file writes (`N` files) + list count + sample reads
-7. `copy`, `rename`, `delete`
-8. Final `list` verifies expected structure after mutations
-9. Large multipart upload (`PUT` plan + presigned part uploads + complete + download checksum)
+7. Search checks (`GET ?grep=...`, `GET ?find=...`)
+8. SQL sanity check (`POST /v1/sql`)
+9. `copy`, `rename`, `delete`
+10. Final `list` verifies expected structure after mutations
+11. Large multipart upload (`PUT` plan + presigned part uploads + complete + download checksum)
 
 ### `api-smoke-test-existing-key.sh`
 
@@ -58,7 +60,8 @@ Use this value unless the environment owner announces a new endpoint.
 2. Build local `dat9` CLI binary
 3. CLI small-file flow (`cp`, `ls`, `cat`, `mv`, `rm`)
 4. CLI batch small-file flow (`cp` many files + dir list count + stat + sample reads)
-5. CLI large-file flow (`cp` upload multipart + `cp` download + checksum verification)
+5. CLI search/DB flow (`fs grep`, `fs find`, `db sql`)
+6. CLI large-file flow (`cp` upload multipart + `cp` download + checksum verification)
 
 ## Environment variables
 
@@ -71,8 +74,12 @@ Use this value unless the environment owner announces a new endpoint.
 | `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
 | `LARGE_FILE_MB` | `100` | `api-smoke-test.sh` |
 | `BATCH_SMALL_FILE_COUNT` | `10` | `api-smoke-test.sh` |
+| `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh` |
+| `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh` |
 | `CLI_LARGE_FILE_MB` | `100` | `cli-smoke-test.sh` |
 | `CLI_BATCH_SMALL_FILE_COUNT` | `10` | `cli-smoke-test.sh` |
+| `CLI_MAX_RETRIES` | `8` | `cli-smoke-test.sh` |
+| `CLI_RETRY_SLEEP_S` | `2` | `cli-smoke-test.sh` |
 
 ## Conventions
 
