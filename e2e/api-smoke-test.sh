@@ -13,6 +13,7 @@
 #  9) Copy, rename, delete
 # 10) Final list verification
 # 11) 100MB multipart upload with checksum-bound presigned parts + download checksum
+# 12) Max-upload boundary check (1GiB allowed, 1GiB+1 rejected)
 
 set -euo pipefail
 
@@ -24,6 +25,8 @@ LARGE_FILE_MB="${LARGE_FILE_MB:-100}"
 BATCH_SMALL_FILE_COUNT="${BATCH_SMALL_FILE_COUNT:-10}"
 REQUEST_MAX_RETRIES="${REQUEST_MAX_RETRIES:-8}"
 REQUEST_RETRY_SLEEP_S="${REQUEST_RETRY_SLEEP_S:-2}"
+RUN_UPLOAD_LIMIT_BOUNDARY="${RUN_UPLOAD_LIMIT_BOUNDARY:-1}"
+UPLOAD_LIMIT_BYTES="${UPLOAD_LIMIT_BYTES:-1073741824}"
 
 PASS=0
 FAIL=0
@@ -232,6 +235,42 @@ check_eq "GET ?find returns 200" "$code" "200"
 find_has_yaml=$(printf '%s' "$body" | jq -r --arg p "$BACKEND_DIR/config.yaml" 'any(.[]; .path==$p)')
 if [ "$find_has_yaml" != "true" ]; then
   find_has_yaml=$(printf '%s' "$body" | jq -r 'any(.[]; (.path // "") | endswith("config.yaml"))')
+fi
+
+if [ "$RUN_UPLOAD_LIMIT_BOUNDARY" = "1" ]; then
+  step "12" "Upload limit boundary (1GiB/1GiB+1)"
+  # Generate checksums for a 1GiB zero-filled upload plan: 128 parts * 8MiB.
+  BOUNDARY_CHECKSUMS=$(python3 - <<'PY'
+import base64
+import hashlib
+part = b"\x00" * (8 * 1024 * 1024)
+one = base64.b64encode(hashlib.sha256(part).digest()).decode()
+print(",".join([one] * 128))
+PY
+)
+
+  boundary_ok_body="$(mktemp)"
+  boundary_ok_code=$(curl -sS -o "$boundary_ok_body" -w "%{http_code}" -X PUT \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "X-Dat9-Content-Length: $UPLOAD_LIMIT_BYTES" \
+    -H "X-Dat9-Part-Checksums: $BOUNDARY_CHECKSUMS" \
+    --data-binary "" \
+    "$BASE/v1/fs/$ROOT_DIR/limit-1g.bin")
+  check_eq "init at upload limit returns 202" "$boundary_ok_code" "202"
+  rm -f "$boundary_ok_body"
+
+  over_limit=$((UPLOAD_LIMIT_BYTES + 1))
+  boundary_over_body="$(mktemp)"
+  boundary_over_code=$(curl -sS -o "$boundary_over_body" -w "%{http_code}" -X PUT \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "X-Dat9-Content-Length: $over_limit" \
+    -H "X-Dat9-Part-Checksums: $BOUNDARY_CHECKSUMS" \
+    --data-binary "" \
+    "$BASE/v1/fs/$ROOT_DIR/limit-over.bin")
+  check_eq "init over upload limit returns 413" "$boundary_over_code" "413"
+  over_err=$(jq -r '.error // empty' "$boundary_over_body")
+  check_cmd "over-limit response has error message" test -n "$over_err"
+  rm -f "$boundary_over_body"
 fi
 check_eq "find by name returns yaml file" "$find_has_yaml" "true"
 

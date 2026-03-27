@@ -10,6 +10,8 @@ CLI_LARGE_FILE_MB="${CLI_LARGE_FILE_MB:-100}"
 CLI_BATCH_SMALL_FILE_COUNT="${CLI_BATCH_SMALL_FILE_COUNT:-10}"
 CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
+RUN_CLI_UPLOAD_LIMIT_BOUNDARY="${RUN_CLI_UPLOAD_LIMIT_BOUNDARY:-1}"
+CLI_UPLOAD_LIMIT_BYTES="${CLI_UPLOAD_LIMIT_BYTES:-1073741824}"
 
 PASS=0
 FAIL=0
@@ -267,6 +269,41 @@ PY
 )
 # Directory cleanup semantics may vary; allow either retained empty dir or auto-removed dir.
 check_cmd "batch directory cleanup accepted" test "$batch_left" = "true" -o "$batch_left" = "false"
+
+if [ "$RUN_CLI_UPLOAD_LIMIT_BOUNDARY" = "1" ]; then
+  echo "[9] upload limit boundary via API with CLI auth"
+  boundary_checksums=$(python3 - <<'PY'
+import base64
+import hashlib
+part = b"\x00" * (8 * 1024 * 1024)
+one = base64.b64encode(hashlib.sha256(part).digest()).decode()
+print(",".join([one] * 128))
+PY
+)
+
+  ok_file="$(mktemp)"
+  ok_code=$(curl -sS -o "$ok_file" -w "%{http_code}" -X PUT \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "X-Dat9-Content-Length: $CLI_UPLOAD_LIMIT_BYTES" \
+    -H "X-Dat9-Part-Checksums: $boundary_checksums" \
+    --data-binary "" \
+    "$BASE/v1/fs/cli-limit-${TS}.bin")
+  check_eq "cli-boundary init at limit returns 202" "$ok_code" "202"
+  rm -f "$ok_file"
+
+  over=$((CLI_UPLOAD_LIMIT_BYTES + 1))
+  over_file="$(mktemp)"
+  over_code=$(curl -sS -o "$over_file" -w "%{http_code}" -X PUT \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "X-Dat9-Content-Length: $over" \
+    -H "X-Dat9-Part-Checksums: $boundary_checksums" \
+    --data-binary "" \
+    "$BASE/v1/fs/cli-limit-over-${TS}.bin")
+  check_eq "cli-boundary init over limit returns 413" "$over_code" "413"
+  over_err=$(jq -r '.error // empty' "$over_file")
+  check_cmd "cli-boundary over-limit has error message" test -n "$over_err"
+  rm -f "$over_file"
+fi
 
 rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
 rm -rf "$BATCH_LOCAL_DIR"
