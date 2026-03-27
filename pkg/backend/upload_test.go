@@ -8,25 +8,20 @@ import (
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/internal/testmysql"
-	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
 func newTestBackendWithS3(t *testing.T) *Dat9Backend {
 	t.Helper()
-	blobDir, err := os.MkdirTemp("", "dat9-blobs-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(blobDir) })
-
 	s3Dir, err := os.MkdirTemp("", "dat9-s3-*")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(s3Dir) })
 
-	store, err := meta.Open(testDSN)
+	initBackendSchema(t, testDSN)
+	store, err := datastore.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +33,23 @@ func newTestBackendWithS3(t *testing.T) *Dat9Backend {
 		t.Fatal(err)
 	}
 
-	b, err := NewWithS3(store, blobDir, s3c)
+	b, err := NewWithS3(store, s3c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func newTestBackendNoS3(t *testing.T) *Dat9Backend {
+	t.Helper()
+	initBackendSchema(t, testDSN)
+	store, err := datastore.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testmysql.ResetDB(t, store.DB())
+	t.Cleanup(func() { _ = store.Close() })
+	b, err := New(store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +57,7 @@ func newTestBackendWithS3(t *testing.T) *Dat9Backend {
 }
 
 func TestCapabilityProviderNoS3(t *testing.T) {
-	b := newTestBackend(t)
+	b := newTestBackendNoS3(t)
 	caps := b.GetCapabilities()
 	if caps.IsObjectStore {
 		t.Error("expected IsObjectStore=false without S3")
@@ -74,7 +85,7 @@ func TestIsLargeFile(t *testing.T) {
 	}
 
 	// Without S3, nothing is large
-	bNoS3 := newTestBackend(t)
+	bNoS3 := newTestBackendNoS3(t)
 	if bNoS3.IsLargeFile(10 << 20) {
 		t.Error("without S3, nothing should be large")
 	}
@@ -102,7 +113,7 @@ func TestInitiateAndConfirmUpload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if upload.Status != meta.UploadUploading {
+	if upload.Status != datastore.UploadUploading {
 		t.Errorf("expected UPLOADING, got %s", upload.Status)
 	}
 	if upload.TargetPath != "/bigfile.bin" {
@@ -134,7 +145,7 @@ func TestInitiateAndConfirmUpload(t *testing.T) {
 
 	// Verify upload is completed
 	upload, _ = b.GetUpload(plan.UploadID)
-	if upload.Status != meta.UploadCompleted {
+	if upload.Status != datastore.UploadCompleted {
 		t.Errorf("expected COMPLETED, got %s", upload.Status)
 	}
 
@@ -203,7 +214,7 @@ func TestAbortUpload(t *testing.T) {
 	}
 
 	upload, _ := b.GetUpload(plan.UploadID)
-	if upload.Status != meta.UploadAborted {
+	if upload.Status != datastore.UploadAborted {
 		t.Errorf("expected ABORTED, got %s", upload.Status)
 	}
 }
@@ -220,7 +231,7 @@ func TestListUploads(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	uploadsA, err := b.ListUploads("/list-a.bin", meta.UploadUploading)
+	uploadsA, err := b.ListUploads("/list-a.bin", datastore.UploadUploading)
 	if err != nil {
 		t.Fatal(err)
 	}
