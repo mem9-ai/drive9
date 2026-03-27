@@ -102,7 +102,40 @@ func NewWithConfig(cfg Config) *Server {
 	}
 
 	s.mux = mux
+	if s.meta != nil && s.pool != nil && s.provisioner != nil {
+		s.resumeProvisioningTenants()
+	}
 	return s
+}
+
+func (s *Server) resumeProvisioningTenants() {
+	tenants, err := s.meta.ListTenantsByStatus(meta.TenantProvisioning, 1000)
+	if err != nil {
+		log.Printf("list provisioning tenants failed: %v", err)
+		return
+	}
+	for i := range tenants {
+		t := tenants[i]
+		go s.resumeTenantSchemaInit(t)
+	}
+}
+
+func (s *Server) resumeTenantSchemaInit(t meta.Tenant) {
+	plain, err := s.pool.Decrypt(t.DBPasswordCipher)
+	if err != nil {
+		log.Printf("resume tenant schema init skipped: decrypt db password failed (tenant=%s): %v", t.ID, err)
+		return
+	}
+	dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
+	s.initTenantSchemaAsync(t.ID, dsn, t.Provider, s.provisioner.InitSchema)
+}
+
+func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled bool) string {
+	query := "parseTime=true"
+	if tlsEnabled {
+		query += "&tls=true"
+	}
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", user, password, host, port, dbName, query)
 }
 
 func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handler {
@@ -600,12 +633,12 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Initialize tenant schema asynchronously; tenant remains in provisioning state until success.
-	tenantDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true", cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName)
-	go s.initTenantSchemaAsync(tenantID, tenantDSN, provider, s.provisioner.InitSchema)
+	dsn := tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true)
+	go s.initTenantSchemaAsync(tenantID, dsn, provider, s.provisioner.InitSchema)
 
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"tenant_id":  tenantID,
+		"id":         tenantID,
 		"api_key":    token,
 		"api_key_id": apiKeyID,
 		"status":     string(meta.TenantProvisioning),
