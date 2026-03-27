@@ -174,12 +174,14 @@ func (s *Store) List(status Status) ([]*Tenant, error) {
 	if status == "" {
 		rows, err = s.db.Query(`SELECT id, api_key_prefix, api_key_hash, status,
 			db_host, db_port, db_user, db_password_enc, db_name,
+			db_tls, db_params,
 			s3_bucket, s3_key_prefix, cluster_id, provisioner_type,
 			created_at, updated_at
 			FROM tenants ORDER BY created_at`)
 	} else {
 		rows, err = s.db.Query(`SELECT id, api_key_prefix, api_key_hash, status,
 			db_host, db_port, db_user, db_password_enc, db_name,
+			db_tls, db_params,
 			s3_bucket, s3_key_prefix, cluster_id, provisioner_type,
 			created_at, updated_at
 			FROM tenants WHERE status = ? ORDER BY created_at`, status)
