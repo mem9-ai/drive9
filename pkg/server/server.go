@@ -340,9 +340,19 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	cl := r.ContentLength
+	actualCL := r.ContentLength
+	cl := actualCL
 	if h := r.Header.Get("X-Dat9-Content-Length"); h != "" {
-		cl, _ = strconv.ParseInt(h, 10, 64)
+		parsed, err := strconv.ParseInt(h, 10, 64)
+		if err != nil || parsed < 0 {
+			errJSON(w, http.StatusBadRequest, "invalid X-Dat9-Content-Length")
+			return
+		}
+		if actualCL > 0 && parsed > 0 && actualCL != parsed {
+			errJSON(w, http.StatusBadRequest, "Content-Length and X-Dat9-Content-Length mismatch")
+			return
+		}
+		cl = parsed
 	}
 	if cl > s.maxUploadBytes {
 		errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
