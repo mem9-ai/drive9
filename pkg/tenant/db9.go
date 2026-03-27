@@ -34,6 +34,10 @@ func NewDB9ProvisionerFromEnv() (*DB9Provisioner, error) {
 
 func (p *DB9Provisioner) ProviderType() string { return ProviderDB9 }
 
+func (p *DB9Provisioner) InitSchema(_ context.Context, dsn string) error {
+	return initDB9Schema(dsn)
+}
+
 func (p *DB9Provisioner) Provision(ctx context.Context, tenantID string) (*ClusterInfo, error) {
 	type reqBody struct {
 		TenantID string `json:"tenant_id"`
