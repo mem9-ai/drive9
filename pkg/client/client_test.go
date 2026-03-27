@@ -30,7 +30,7 @@ func newTestClient(t *testing.T) (*Client, func()) {
 		t.Fatal(err)
 	}
 
-	srv := server.New(b)
+	srv := server.New(server.Config{Backend: b})
 	ts := httptest.NewServer(srv)
 
 	cleanup := func() {

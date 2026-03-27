@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/server"
+	"github.com/mem9-ai/dat9/pkg/tenant"
 )
 
 const (
@@ -34,11 +36,6 @@ func main() {
 		addr = os.Args[1]
 	}
 
-	mysqlDSN := os.Getenv("DAT9_MYSQL_DSN")
-	if mysqlDSN == "" {
-		die(fmt.Errorf("DAT9_MYSQL_DSN is required"))
-	}
-
 	blobDir := envOr("DAT9_BLOB_DIR", defaultBlobDir)
 	s3Bucket := os.Getenv("DAT9_S3_BUCKET")
 
@@ -46,45 +43,103 @@ func main() {
 		die(fmt.Errorf("create blob dir: %w", err))
 	}
 
-	store, err := meta.Open(mysqlDSN)
-	if err != nil {
-		die(fmt.Errorf("open meta store: %w", err))
-	}
-	defer func() { _ = store.Close() }()
+	s3Dir := envOr("DAT9_S3_DIR", defaultS3Dir)
+	pubURL := publicBaseURL(addr)
+	s3BaseURL := pubURL + "/s3"
 
-	var s3c s3client.S3Client
-	if s3Bucket != "" {
-		// Production: real AWS S3.
-		s3c, err = s3client.NewAWS(context.Background(), s3client.AWSConfig{
-			Region:  envOr("DAT9_S3_REGION", "us-east-1"),
-			Bucket:  s3Bucket,
-			Prefix:  os.Getenv("DAT9_S3_PREFIX"),
-			RoleARN: os.Getenv("DAT9_S3_ROLE_ARN"),
-		})
-		if err != nil {
-			die(fmt.Errorf("create aws s3 client: %w", err))
+	// Helper: create an S3 client (AWS or local mock).
+	makeS3 := func() (s3client.S3Client, error) {
+		if s3Bucket != "" {
+			return s3client.NewAWS(context.Background(), s3client.AWSConfig{
+				Region:  envOr("DAT9_S3_REGION", "us-east-1"),
+				Bucket:  s3Bucket,
+				Prefix:  os.Getenv("DAT9_S3_PREFIX"),
+				RoleARN: os.Getenv("DAT9_S3_ROLE_ARN"),
+			})
 		}
-		log.Printf("using AWS S3 (bucket=%s, region=%s, role=%s)", s3Bucket, envOr("DAT9_S3_REGION", "us-east-1"), envOr("DAT9_S3_ROLE_ARN", "default-credentials"))
-	} else {
-		// Development: local filesystem S3 mock.
-		s3Dir := envOr("DAT9_S3_DIR", defaultS3Dir)
 		if err := os.MkdirAll(s3Dir, 0o755); err != nil {
-			die(fmt.Errorf("create s3 dir: %w", err))
+			return nil, fmt.Errorf("create s3 dir: %w", err)
 		}
-		s3BaseURL := publicBaseURL(addr) + "/s3"
-		s3c, err = s3client.NewLocal(s3Dir, s3BaseURL)
+		return s3client.NewLocal(s3Dir, s3BaseURL)
+	}
+
+	cfg := server.Config{}
+
+	// Multi-tenant mode: control plane DSN + master key + admin key
+	cpDSN := os.Getenv("DAT9_CONTROL_PLANE_DSN")
+	masterKeyHex := os.Getenv("DAT9_MASTER_KEY")
+	adminKey := os.Getenv("DAT9_ADMIN_KEY")
+
+	if cpDSN != "" && masterKeyHex != "" {
+		// Multi-tenant mode
+		masterKey, err := hex.DecodeString(masterKeyHex)
 		if err != nil {
-			die(fmt.Errorf("create local s3 client: %w", err))
+			die(fmt.Errorf("DAT9_MASTER_KEY must be 64 hex chars (32 bytes): %w", err))
 		}
-		log.Printf("using local S3 mock (dir=%s)", s3Dir)
+		enc, err := tenant.NewEncryptor(masterKey)
+		if err != nil {
+			die(fmt.Errorf("create encryptor: %w", err))
+		}
+		tenants, err := tenant.OpenStore(cpDSN, enc)
+		if err != nil {
+			die(fmt.Errorf("open control plane: %w", err))
+		}
+		defer tenants.Close()
+
+		pool := tenant.NewPool(tenant.PoolConfig{
+			MaxTenants: 128,
+			BlobDir:    blobDir,
+			S3Bucket:   s3Bucket,
+			S3Dir:      s3Dir,
+			PublicURL:  pubURL,
+		}, enc)
+		defer pool.Close()
+
+		cfg.Tenants = tenants
+		cfg.Pool = pool
+		cfg.AdminKey = adminKey
+		cfg.S3Dir = s3Dir
+
+		// Set up provisioner if TiDB Cloud credentials are available
+		provisioner, err := tenant.NewTiDBStarterFromEnv()
+		if err != nil {
+			log.Printf("tidb starter not configured: %v (provisioning disabled)", err)
+		} else {
+			cfg.Provisioner = provisioner
+		}
+
+		log.Printf("multi-tenant mode enabled (admin key: %v, provisioner: %v, s3: %v)",
+			adminKey != "", cfg.Provisioner != nil, s3Bucket != "")
+	} else {
+		// Single-tenant dev mode
+		mysqlDSN := os.Getenv("DAT9_MYSQL_DSN")
+		if mysqlDSN == "" {
+			die(fmt.Errorf("DAT9_MYSQL_DSN is required in local dev mode (or set DAT9_CONTROL_PLANE_DSN + DAT9_MASTER_KEY for multi-tenant)"))
+		}
+		store, err := meta.Open(mysqlDSN)
+		if err != nil {
+			die(fmt.Errorf("open meta store: %w", err))
+		}
+		defer func() { _ = store.Close() }()
+
+		s3c, err := makeS3()
+		if err != nil {
+			die(fmt.Errorf("create s3 client: %w", err))
+		}
+		if s3Bucket != "" {
+			log.Printf("using AWS S3 (bucket=%s)", s3Bucket)
+		} else {
+			log.Printf("using local S3 mock (dir=%s)", s3Dir)
+		}
+
+		b, err := backend.NewWithS3(store, blobDir, s3c)
+		if err != nil {
+			die(fmt.Errorf("create backend: %w", err))
+		}
+		cfg.Backend = b
 	}
 
-	b, err := backend.NewWithS3(store, blobDir, s3c)
-	if err != nil {
-		die(fmt.Errorf("create backend: %w", err))
-	}
-
-	die(server.New(b).ListenAndServe(addr))
+	die(server.New(cfg).ListenAndServe(addr))
 }
 
 func envOr(key, fallback string) string {
@@ -97,10 +152,20 @@ func envOr(key, fallback string) string {
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage: dat9-server [listen-addr]
 
-environment:
-  DAT9_LISTEN_ADDR serve listen address (default: :9009)
-  DAT9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
+environment (local dev mode):
   DAT9_MYSQL_DSN   TiDB/MySQL DSN (required)
+
+environment (multi-tenant mode):
+  DAT9_CONTROL_PLANE_DSN  control plane MySQL DSN (required)
+  DAT9_MASTER_KEY         32-byte hex master key for password encryption (required)
+  DAT9_ADMIN_KEY          admin key for /v1/provision (required for provisioning)
+  DAT9_TIDBCLOUD_API_KEY     TiDB Cloud API public key
+  DAT9_TIDBCLOUD_API_SECRET  TiDB Cloud API private key
+  DAT9_TIDBCLOUD_POOL_ID     TiDB Cloud cluster pool ID
+
+environment (common):
+  DAT9_LISTEN_ADDR serve listen address (default: :9009)
+  DAT9_PUBLIC_URL  externally reachable base URL for presigned URLs
   DAT9_BLOB_DIR    blob directory (default: ./blobs)
 
   S3 storage (set DAT9_S3_BUCKET to enable AWS S3, otherwise local mock):
@@ -126,8 +191,6 @@ func publicBaseURL(listenAddr string) string {
 		return v
 	}
 
-	// Without DAT9_PUBLIC_URL, only allow explicit loopback addresses.
-	// Wildcard or non-loopback addresses would produce unreachable presigned URLs.
 	switch {
 	case strings.HasPrefix(listenAddr, "127.0.0.1:"),
 		strings.HasPrefix(listenAddr, "localhost:"),

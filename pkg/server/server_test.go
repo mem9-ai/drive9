@@ -34,7 +34,7 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(b)
+	return New(Config{Backend: b})
 }
 func TestWriteAndRead(t *testing.T) {
 	s := newTestServer(t)

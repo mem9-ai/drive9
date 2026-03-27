@@ -11,32 +11,106 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/dat9/pkg/tenant"
 )
 
-type Server struct {
-	backend *backend.Dat9Backend
-	mux     *http.ServeMux
+// Config configures the server.
+type Config struct {
+	// Backend is the fallback backend for local dev mode (no multi-tenant).
+	// When Tenants is set, business routes use the tenant backend from context.
+	Backend *backend.Dat9Backend
+
+	// Multi-tenant fields. When Tenants is non-nil, auth is enforced.
+	Tenants     *tenant.Store
+	Pool        *tenant.Pool
+	Provisioner tenant.Provisioner
+
+	// AdminKey protects /v1/provision. Required when Tenants is set.
+	AdminKey string
+
+	// LocalS3 is set when using local S3 for presigned URL handling.
+	LocalS3 *s3client.LocalS3Client
 }
 
-func New(b *backend.Dat9Backend) *Server {
-	s := &Server{backend: b}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/fs/", s.handleFS)
-	mux.HandleFunc("/v1/uploads", s.handleUploads)
-	mux.HandleFunc("/v1/uploads/", s.handleUploadAction)
+type Server struct {
+	fallback    *backend.Dat9Backend // nil in multi-tenant mode with no fallback
+	tenants     *tenant.Store
+	pool        *tenant.Pool
+	provisioner tenant.Provisioner
+	adminKey    string
+	mux         *http.ServeMux
+}
 
-	// Register local S3 handler for presigned URL support in dev/test mode
-	if local, ok := b.S3().(*s3client.LocalS3Client); ok {
+func New(cfg Config) *Server {
+	s := &Server{
+		fallback:    cfg.Backend,
+		tenants:     cfg.Tenants,
+		pool:        cfg.Pool,
+		provisioner: cfg.Provisioner,
+		adminKey:    cfg.AdminKey,
+	}
+	mux := http.NewServeMux()
+
+	// Business routes — require tenant backend
+	var businessHandler http.Handler = http.HandlerFunc(s.handleBusiness)
+	if cfg.Tenants != nil && cfg.Pool != nil {
+		businessHandler = tenantAuthMiddleware(cfg.Tenants, cfg.Pool, businessHandler)
+	} else if cfg.Backend != nil {
+		// Local dev mode: inject fallback backend for all requests
+		businessHandler = injectBackendMiddleware(cfg.Backend, businessHandler)
+	}
+	mux.Handle("/v1/fs/", businessHandler)
+	mux.Handle("/v1/uploads", businessHandler)
+	mux.Handle("/v1/uploads/", businessHandler)
+
+	// Control plane routes (no tenant auth, admin key protected)
+	mux.HandleFunc("/v1/provision", s.handleProvision)
+
+	// Local S3 presigned URL handler (no auth — URLs are HMAC-signed)
+	local := cfg.LocalS3
+	if local == nil && cfg.Backend != nil {
+		if l, ok := cfg.Backend.S3().(*s3client.LocalS3Client); ok {
+			local = l
+		}
+	}
+	if local != nil {
 		mux.Handle("/s3/", http.StripPrefix("/s3", local.Handler()))
 	}
 
 	s.mux = mux
 	return s
+}
+
+// injectBackendMiddleware injects a fixed backend into context (local dev mode).
+func injectBackendMiddleware(b *backend.Dat9Backend, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(withBackend(r.Context(), b)))
+	})
+}
+
+// handleBusiness dispatches to the appropriate handler based on path.
+func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case strings.HasPrefix(r.URL.Path, "/v1/fs/"):
+		s.handleFS(w, r)
+	case r.URL.Path == "/v1/uploads":
+		s.handleUploads(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v1/uploads/"):
+		s.handleUploadAction(w, r)
+	default:
+		errJSON(w, http.StatusNotFound, "not found")
+	}
+}
+
+// backendFromRequest extracts the tenant backend from context.
+func backendFromRequest(r *http.Request) *backend.Dat9Backend {
+	return BackendFromCtx(r.Context())
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -78,9 +152,10 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
 	// Check if this is an S3-stored file — redirect to presigned URL
-	if s.backend.S3() != nil {
-		url, err := s.backend.PresignGetObject(r.Context(), path)
+	if b.S3() != nil {
+		url, err := b.PresignGetObject(r.Context(), path)
 		if err == nil {
 			http.Redirect(w, r, url, http.StatusFound)
 			return
@@ -88,7 +163,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		// Not an S3 file or error — fall through to local read
 	}
 
-	data, err := s.backend.Read(path, 0, -1)
+	data, err := b.Read(path, 0, -1)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, err.Error())
@@ -103,7 +178,8 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string) {
-	entries, err := s.backend.ReadDir(path)
+	b := backendFromRequest(r)
+	entries, err := b.ReadDir(path)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, err.Error())
@@ -133,14 +209,15 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 }
 
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
 	// Bifurcate by size. Prefer X-Dat9-Content-Length because Go's net/http
 	// normalizes Content-Length to 0 when the request body is http.NoBody.
 	cl := r.ContentLength
 	if h := r.Header.Get("X-Dat9-Content-Length"); h != "" {
 		cl, _ = strconv.ParseInt(h, 10, 64)
 	}
-	if cl > 0 && s.backend.IsLargeFile(cl) {
-		plan, err := s.backend.InitiateUpload(r.Context(), path, cl)
+	if cl > 0 && b.IsLargeFile(cl) {
+		plan, err := b.InitiateUpload(r.Context(), path, cl)
 		if err != nil {
 			if errors.Is(err, meta.ErrUploadConflict) {
 				errJSON(w, http.StatusConflict, err.Error())
@@ -162,7 +239,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 
-	_, err = s.backend.Write(path, data, 0,
+	_, err = b.Write(path, data, 0,
 		filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())
@@ -174,8 +251,9 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 }
 
 func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
 	// Single call to store.Stat to get both FileInfo and revision
-	nf, err := s.backend.Store().Stat(path)
+	nf, err := b.Store().Stat(path)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			w.WriteHeader(http.StatusNotFound)
@@ -200,13 +278,14 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
 	recursive := r.URL.Query().Has("recursive")
 
 	var err error
 	if recursive {
-		err = s.backend.RemoveAll(path)
+		err = b.RemoveAll(path)
 	} else {
-		err = s.backend.Remove(path)
+		err = b.Remove(path)
 	}
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
@@ -228,7 +307,7 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 		return
 	}
 
-	if err := s.backend.CopyFile(srcPath, dstPath); err != nil {
+	if err := backendFromRequest(r).CopyFile(srcPath, dstPath); err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
@@ -248,7 +327,7 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 		return
 	}
 
-	if err := s.backend.Rename(oldPath, newPath); err != nil {
+	if err := backendFromRequest(r).Rename(oldPath, newPath); err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
@@ -262,7 +341,7 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 }
 
 func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string) {
-	if err := s.backend.Mkdir(path, 0o755); err != nil {
+	if err := backendFromRequest(r).Mkdir(path, 0o755); err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -287,7 +366,7 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 		status = "UPLOADING"
 	}
 
-	uploads, err := s.backend.ListUploads(path, meta.UploadStatus(status))
+	uploads, err := backendFromRequest(r).ListUploads(path, meta.UploadStatus(status))
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -348,7 +427,7 @@ func (s *Server) handleUploadAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, uploadID string) {
-	if err := s.backend.ConfirmUpload(r.Context(), uploadID); err != nil {
+	if err := backendFromRequest(r).ConfirmUpload(r.Context(), uploadID); err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
@@ -369,7 +448,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 }
 
 func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uploadID string) {
-	plan, err := s.backend.ResumeUpload(r.Context(), uploadID)
+	plan, err := backendFromRequest(r).ResumeUpload(r.Context(), uploadID)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, err.Error())
@@ -391,7 +470,7 @@ func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uplo
 }
 
 func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploadID string) {
-	if err := s.backend.AbortUpload(r.Context(), uploadID); err != nil {
+	if err := backendFromRequest(r).AbortUpload(r.Context(), uploadID); err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
@@ -401,6 +480,100 @@ func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploa
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleProvision handles POST /v1/provision (admin-key protected).
+// Flow: validate admin key → generate API key → provision cluster → init schema → persist tenant → return key.
+func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.adminKey == "" || s.provisioner == nil || s.tenants == nil {
+		errJSON(w, http.StatusNotFound, "provisioning not enabled")
+		return
+	}
+	token := bearerToken(r)
+	if token != s.adminKey {
+		errJSON(w, http.StatusUnauthorized, "invalid admin key")
+		return
+	}
+
+	ctx := r.Context()
+
+	// Step 1: Generate API key
+	rawKey, prefix, hash, err := tenant.GenerateAPIKey()
+	if err != nil {
+		log.Printf("provision: generate key: %v", err)
+		errJSON(w, http.StatusInternalServerError, "key generation failed")
+		return
+	}
+
+	// Step 2: Create tenant record in provisioning state
+	now := time.Now().UTC()
+	t := &tenant.Tenant{
+		ID:              hash[:16], // use first 16 chars of hash as tenant ID
+		APIKeyPrefix:    prefix,
+		APIKeyHash:      hash,
+		Status:          tenant.StatusProvisioning,
+		ProvisionerType: s.provisioner.ProviderType(),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	if err := s.tenants.Insert(t); err != nil {
+		log.Printf("provision: insert tenant: %v", err)
+		errJSON(w, http.StatusInternalServerError, "provisioning failed")
+		return
+	}
+
+	// Step 3: Provision cluster
+	info, err := s.provisioner.Provision(ctx)
+	if err != nil {
+		log.Printf("provision: cluster: %v", err)
+		s.tenants.UpdateStatus(t.ID, tenant.StatusDeleted)
+		errJSON(w, http.StatusInternalServerError, "cluster provisioning failed")
+		return
+	}
+
+	// Step 4: Encrypt password and update tenant with cluster info
+	passwordEnc, err := s.tenants.EncryptPassword(info.Password)
+	if err != nil {
+		log.Printf("provision: encrypt password: %v", err)
+		s.tenants.UpdateStatus(t.ID, tenant.StatusDeleted)
+		errJSON(w, http.StatusInternalServerError, "provisioning failed")
+		return
+	}
+	if err := s.tenants.UpdateClusterInfo(t.ID, info.Host, info.Port, info.Username, passwordEnc, info.DBName); err != nil {
+		log.Printf("provision: update cluster info: %v", err)
+		s.tenants.UpdateStatus(t.ID, tenant.StatusDeleted)
+		errJSON(w, http.StatusInternalServerError, "provisioning failed")
+		return
+	}
+
+	// Step 5: Init schema on the new cluster
+	dsn := tenant.DSN(info.Host, info.Port, info.Username, info.Password, info.DBName)
+	if err := s.provisioner.InitSchema(ctx, dsn); err != nil {
+		log.Printf("provision: init schema: %v", err)
+		s.tenants.UpdateStatus(t.ID, tenant.StatusDeleted)
+		errJSON(w, http.StatusInternalServerError, "schema initialization failed")
+		return
+	}
+
+	// Step 6: Mark tenant active
+	if err := s.tenants.UpdateStatus(t.ID, tenant.StatusActive); err != nil {
+		log.Printf("provision: activate tenant: %v", err)
+		errJSON(w, http.StatusInternalServerError, "provisioning failed")
+		return
+	}
+
+	// Return the API key (only time it's exposed in plaintext)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{
+		"api_key":   rawKey,
+		"tenant_id": t.ID,
+		"status":    "active",
+	})
 }
 
 func errJSON(w http.ResponseWriter, code int, msg string) {
