@@ -13,7 +13,6 @@ import (
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/s3client"
-	"github.com/mem9-ai/dat9/pkg/tenant"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -25,9 +24,7 @@ func newTestServer(t *testing.T) *Server {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(s3Dir) })
 
-	if err := tenant.InitSchemaForProvider(testDSN, tenant.ProviderTiDBZero); err != nil {
-		t.Fatal(err)
-	}
+	initServerTenantSchema(t, testDSN)
 	store, err := datastore.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)

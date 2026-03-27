@@ -37,8 +37,11 @@ func initSchemaByProvider(dsn, provider string) error {
 	}
 
 	for _, stmt := range capabilityStatements(provider) {
+		if !isTiDBCluster(db) {
+			return fmt.Errorf("provider %s requires TiDB capabilities (FTS/VECTOR)", provider)
+		}
 		if _, err := db.Exec(stmt); err != nil {
-			if isDuplicateIndexError(err) || isDuplicateColumnError(err) || isUnsupportedCapabilityError(err) {
+			if isDuplicateIndexError(err) || isDuplicateColumnError(err) {
 				continue
 			}
 			snippet := stmt
@@ -168,14 +171,10 @@ func isDuplicateColumnError(err error) bool {
 	return strings.Contains(msg, "1060") || strings.Contains(msg, "Duplicate column name")
 }
 
-func isUnsupportedCapabilityError(err error) bool {
-	if err == nil {
+func isTiDBCluster(db *sql.DB) bool {
+	var ver string
+	if err := db.QueryRow(`SELECT VERSION()`).Scan(&ver); err != nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "you have an error in your sql syntax") ||
-		strings.Contains(msg, "unknown data type") ||
-		strings.Contains(msg, "function 'multilingual' is not defined") ||
-		strings.Contains(msg, "unsupported") ||
-		strings.Contains(msg, "vector")
+	return strings.Contains(strings.ToLower(ver), "tidb")
 }

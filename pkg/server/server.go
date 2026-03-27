@@ -21,24 +21,22 @@ import (
 )
 
 type Config struct {
-	Meta            *meta.Store
-	Pool            *tenant.Pool
-	Provisioners    map[string]tenant.Provisioner
-	TokenSecret     []byte
-	DefaultProvider string
-	Backend         *backend.Dat9Backend
-	LocalS3         *s3client.LocalS3Client
-	S3Dir           string
+	Meta        *meta.Store
+	Pool        *tenant.Pool
+	Provisioner tenant.Provisioner
+	TokenSecret []byte
+	Backend     *backend.Dat9Backend
+	LocalS3     *s3client.LocalS3Client
+	S3Dir       string
 }
 
 type Server struct {
-	fallback        *backend.Dat9Backend
-	meta            *meta.Store
-	pool            *tenant.Pool
-	provisioners    map[string]tenant.Provisioner
-	tokenSecret     []byte
-	defaultProvider string
-	mux             *http.ServeMux
+	fallback    *backend.Dat9Backend
+	meta        *meta.Store
+	pool        *tenant.Pool
+	provisioner tenant.Provisioner
+	tokenSecret []byte
+	mux         *http.ServeMux
 }
 
 var (
@@ -53,12 +51,11 @@ func New(b *backend.Dat9Backend) *Server {
 
 func NewWithConfig(cfg Config) *Server {
 	s := &Server{
-		fallback:        cfg.Backend,
-		meta:            cfg.Meta,
-		pool:            cfg.Pool,
-		tokenSecret:     cfg.TokenSecret,
-		provisioners:    cfg.Provisioners,
-		defaultProvider: cfg.DefaultProvider,
+		fallback:    cfg.Backend,
+		meta:        cfg.Meta,
+		pool:        cfg.Pool,
+		tokenSecret: cfg.TokenSecret,
+		provisioner: cfg.Provisioner,
 	}
 	mux := http.NewServeMux()
 
@@ -517,18 +514,6 @@ func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploa
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-type provisionRequest struct {
-	TenantID string `json:"tenant_id"`
-	KeyName  string `json:"key_name"`
-	Provider string `json:"provider"`
-	DBHost   string `json:"db_host"`
-	DBPort   int    `json:"db_port"`
-	DBUser   string `json:"db_user"`
-	DBPass   string `json:"db_password"`
-	DBName   string `json:"db_name"`
-	DBTLS    bool   `json:"db_tls"`
-}
-
 func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -538,37 +523,18 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "provisioning not enabled")
 		return
 	}
-	var req provisionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid body")
+	if s.provisioner == nil {
+		errJSON(w, http.StatusNotFound, "provisioner not configured")
 		return
 	}
-	provider := req.Provider
-	if provider == "" {
-		provider = s.defaultProvider
-	}
-	if provider == "" {
-		provider = tenant.ProviderTiDBZero
-	}
+	provider := s.provisioner.ProviderType()
 	provider, err := tenant.NormalizeProvider(provider)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	p, err := tenant.RequireProvisioner(provider, s.provisioners)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	hasManualDB := req.DBHost != "" || req.DBPort != 0 || req.DBUser != "" || req.DBPass != "" || req.DBName != ""
-	tenantID := req.TenantID
-	if tenantID == "" {
-		tenantID = tenant.NewID()
-	}
-	keyName := req.KeyName
-	if keyName == "" {
-		keyName = "default"
-	}
+	tenantID := tenant.NewID()
+	keyName := "default"
 
 	token, err := tenant.IssueToken(s.tokenSecret, tenantID, 1)
 	if err != nil {
@@ -577,28 +543,12 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	}
 	hash := tenant.HashToken(token)
 	now := time.Now().UTC()
-	cluster := &tenant.ClusterInfo{
-		TenantID: tenantID,
-		Provider: provider,
-		Host:     req.DBHost,
-		Port:     req.DBPort,
-		Username: req.DBUser,
-		Password: req.DBPass,
-		DBName:   req.DBName,
+	cluster, err := s.provisioner.Provision(r.Context(), tenantID)
+	if err != nil {
+		errJSON(w, http.StatusBadGateway, fmt.Sprintf("provision tenant cluster failed: %v", err))
+		return
 	}
-	if hasManualDB {
-		if cluster.Host == "" || cluster.Port == 0 || cluster.Username == "" || cluster.Password == "" || cluster.DBName == "" {
-			errJSON(w, http.StatusBadRequest, "incomplete manual db connection fields")
-			return
-		}
-	} else {
-		cluster, err = p.Provision(r.Context(), tenantID)
-		if err != nil {
-			errJSON(w, http.StatusBadGateway, fmt.Sprintf("provision tenant cluster failed: %v", err))
-			return
-		}
-		cluster.Provider = provider
-	}
+	cluster.Provider = provider
 
 	cipherPass, err := s.pool.Encrypt([]byte(cluster.Password))
 	if err != nil {
@@ -619,7 +569,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		DBUser:           cluster.Username,
 		DBPasswordCipher: cipherPass,
 		DBName:           cluster.DBName,
-		DBTLS:            req.DBTLS,
+		DBTLS:            true,
 		Provider:         provider,
 		ClusterID:        cluster.ClusterID,
 		ClaimURL:         cluster.ClaimURL,
@@ -651,7 +601,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	// Initialize tenant schema asynchronously; tenant remains in provisioning state until success.
 	tenantDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true", cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName)
-	go s.initTenantSchemaAsync(tenantID, tenantDSN, p)
+	go s.initTenantSchemaAsync(tenantID, tenantDSN, provider, s.provisioner.InitSchema)
 
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{
@@ -662,12 +612,12 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) initTenantSchemaAsync(tenantID, tenantDSN string, p tenant.Provisioner) {
+func (s *Server) initTenantSchemaAsync(tenantID, tenantDSN, provider string, schemaInit func(context.Context, string) error) {
 	deadline := time.Now().Add(schemaInitRetryWindow)
 	backoff := schemaInitInitialBackoff
 	attempt := 1
 	for {
-		if err := p.InitSchema(context.Background(), tenantDSN); err == nil {
+		if err := schemaInit(context.Background(), tenantDSN); err == nil {
 			if err := s.meta.UpdateTenantStatus(tenantID, meta.TenantActive); err != nil {
 				log.Printf("activate tenant %s failed after schema init: %v", tenantID, err)
 			}
@@ -681,7 +631,7 @@ func (s *Server) initTenantSchemaAsync(tenantID, tenantDSN string, p tenant.Prov
 				log.Printf("tenant %s marked failed after schema init retries exhausted: %v", tenantID, err)
 				return
 			}
-			log.Printf("init tenant schema failed (tenant=%s provider=%s attempt=%d remaining=%s): %v", tenantID, p.ProviderType(), attempt, remaining.Round(time.Second), err)
+			log.Printf("init tenant schema failed (tenant=%s provider=%s attempt=%d remaining=%s): %v", tenantID, provider, attempt, remaining.Round(time.Second), err)
 		}
 		sleepFor := backoff
 		if sleepFor > schemaInitMaxBackoff {

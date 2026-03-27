@@ -63,9 +63,7 @@ func newAuthServer(t *testing.T) (*Server, string, func()) {
 	now := time.Now().UTC()
 	tenantID := tenant.NewID()
 	tenantDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true", parsed.User, parsed.Passwd, host, port, parsed.DBName)
-	if err := tenant.InitSchemaForProvider(tenantDSN, tenant.ProviderTiDBZero); err != nil {
-		t.Fatal(err)
-	}
+	initServerTenantSchema(t, tenantDSN)
 	passCipher, err := pool.Encrypt([]byte(parsed.Passwd))
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +161,7 @@ func TestAuthValidKeyCanWrite(t *testing.T) {
 	}
 }
 
-func TestProvisionWithoutProvisionerReturnsBadRequest(t *testing.T) {
+func TestProvisionWithoutProvisionerReturnsNotFound(t *testing.T) {
 	srv, _, cleanup := newAuthServer(t)
 	defer cleanup()
 	ts := httptest.NewServer(srv)
@@ -177,7 +175,7 @@ func TestProvisionWithoutProvisionerReturnsBadRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusBadRequest {
+	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
 }

@@ -10,7 +10,6 @@ import (
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/server"
-	"github.com/mem9-ai/dat9/pkg/tenant"
 )
 
 func newTestClient(t *testing.T) (*Client, func()) {
@@ -21,9 +20,7 @@ func newTestClient(t *testing.T) (*Client, func()) {
 		t.Fatal(err)
 	}
 
-	if err := tenant.InitSchemaForProvider(testDSN, tenant.ProviderTiDBZero); err != nil {
-		t.Fatal(err)
-	}
+	initClientTenantSchema(t, testDSN)
 	store, err := datastore.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)

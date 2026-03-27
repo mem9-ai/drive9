@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
@@ -17,6 +18,10 @@ type PoolConfig struct {
 	MaxTenants int
 	S3Dir      string
 	PublicURL  string
+	S3Bucket   string
+	S3Region   string
+	S3Prefix   string
+	S3RoleARN  string
 }
 
 type Pool struct {
@@ -138,6 +143,30 @@ func (p *Pool) createBackend(t *meta.Tenant) (*backend.Dat9Backend, *datastore.S
 	store, err := datastore.Open(dsn)
 	if err != nil {
 		return nil, nil, err
+	}
+	if p.cfg.S3Bucket != "" {
+		prefix := strings.Trim(p.cfg.S3Prefix, "/")
+		if prefix != "" {
+			prefix += "/"
+		}
+		prefix += t.ID + "/"
+		s3c, err := s3client.NewAWS(context.Background(), s3client.AWSConfig{
+			Region:  p.cfg.S3Region,
+			Bucket:  p.cfg.S3Bucket,
+			Prefix:  prefix,
+			RoleARN: p.cfg.S3RoleARN,
+		})
+		if err != nil {
+			_ = store.Close()
+			return nil, nil, err
+		}
+		smallInDB := SmallInDB(t.Provider)
+		b, err := backend.NewWithS3Mode(store, s3c, smallInDB)
+		if err != nil {
+			_ = store.Close()
+			return nil, nil, err
+		}
+		return b, store, nil
 	}
 	if p.cfg.S3Dir != "" {
 		s3Dir := p.cfg.S3Dir + "/" + t.ID

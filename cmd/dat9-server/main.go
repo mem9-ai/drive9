@@ -40,6 +40,10 @@ func main() {
 	}
 
 	s3Dir := envOr("DAT9_S3_DIR", defaultS3Dir)
+	s3Bucket := os.Getenv("DAT9_S3_BUCKET")
+	s3Region := envOr("DAT9_S3_REGION", "us-east-1")
+	s3Prefix := os.Getenv("DAT9_S3_PREFIX")
+	s3RoleARN := os.Getenv("DAT9_S3_ROLE_ARN")
 
 	store, err := meta.Open(metaDSN)
 	if err != nil {
@@ -47,25 +51,37 @@ func main() {
 	}
 	defer func() { _ = store.Close() }()
 
-	if err := os.MkdirAll(s3Dir, 0o755); err != nil {
-		die(fmt.Errorf("create s3 dir: %w", err))
+	if s3Bucket == "" {
+		if err := os.MkdirAll(s3Dir, 0o755); err != nil {
+			die(fmt.Errorf("create s3 dir: %w", err))
+		}
+		log.Printf("using local S3 root directory (dir=%s)", s3Dir)
+	} else {
+		log.Printf("using AWS S3 (bucket=%s region=%s role=%s)", s3Bucket, s3Region, envOr("DAT9_S3_ROLE_ARN", "default-credentials"))
 	}
-	log.Printf("using local S3 root directory (dir=%s)", s3Dir)
 
 	encryptType := envOr("DAT9_ENCRYPT_TYPE", "local_aes")
 	masterHex := os.Getenv("DAT9_MASTER_KEY")
 	kmsKey := os.Getenv("DAT9_ENCRYPT_KEY")
 	tokenHex := os.Getenv("DAT9_TOKEN_SIGNING_KEY")
-	defaultProvider := envOr("DAT9_TENANT_PROVIDER", tenant.ProviderTiDBZero)
-	provisioners := map[string]tenant.Provisioner{}
-	if p, err := tenant.NewZeroProvisionerFromEnv(); err == nil {
-		provisioners[p.ProviderType()] = p
+	providerType := envOr("DAT9_TENANT_PROVIDER", tenant.ProviderTiDBZero)
+	providerType, err = tenant.NormalizeProvider(providerType)
+	if err != nil {
+		die(err)
 	}
-	if p, err := tenant.NewStarterProvisionerFromEnv(); err == nil {
-		provisioners[p.ProviderType()] = p
+
+	var provisioner tenant.Provisioner
+	var provisionerErr error
+	switch providerType {
+	case tenant.ProviderTiDBZero:
+		provisioner, provisionerErr = tenant.NewZeroProvisionerFromEnv()
+	case tenant.ProviderTiDBCloudStarter:
+		provisioner, provisionerErr = tenant.NewStarterProvisionerFromEnv()
+	case tenant.ProviderDB9:
+		provisioner, provisionerErr = tenant.NewDB9ProvisionerFromEnv()
 	}
-	if p, err := tenant.NewDB9ProvisionerFromEnv(); err == nil {
-		provisioners[p.ProviderType()] = p
+	if provisionerErr != nil {
+		log.Printf("provider %s is not configured for auto provisioning: %v", providerType, provisionerErr)
 	}
 
 	var pool *tenant.Pool
@@ -89,25 +105,27 @@ func main() {
 			die(fmt.Errorf("create encryptor: %w", err))
 		}
 
-		if _, err := tenant.NormalizeProvider(defaultProvider); err != nil {
-			die(err)
-		}
-
 		if err := store.DB().Ping(); err != nil {
 			die(fmt.Errorf("control-plane db unavailable: %w", err))
 		}
 
-		pool = tenant.NewPool(tenant.PoolConfig{S3Dir: s3Dir, PublicURL: publicBaseURL(addr)}, enc)
+		pool = tenant.NewPool(tenant.PoolConfig{
+			S3Dir:     s3Dir,
+			PublicURL: publicBaseURL(addr),
+			S3Bucket:  s3Bucket,
+			S3Region:  s3Region,
+			S3Prefix:  s3Prefix,
+			S3RoleARN: s3RoleARN,
+		}, enc)
 		defer pool.Close()
 	}
 
 	die(server.NewWithConfig(server.Config{
-		Meta:            store,
-		Pool:            pool,
-		Provisioners:    provisioners,
-		TokenSecret:     tokenSecret,
-		DefaultProvider: defaultProvider,
-		S3Dir:           s3Dir,
+		Meta:        store,
+		Pool:        pool,
+		Provisioner: provisioner,
+		TokenSecret: tokenSecret,
+		S3Dir:       s3Dir,
 	}).ListenAndServe(addr))
 }
 
@@ -130,13 +148,12 @@ environment:
   DAT9_ENCRYPT_KEY KMS key id or alias (required for kms)
   DAT9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
   DAT9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
-
   S3 storage (set DAT9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DAT9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
   DAT9_S3_REGION   AWS region (default: us-east-1)
-  DAT9_S3_PREFIX   S3 key prefix (e.g. "tenants/abc/")
+  DAT9_S3_PREFIX   S3 key prefix (e.g. "tenants")
   DAT9_S3_ROLE_ARN IAM role ARN to assume via STS (optional)
-  DAT9_S3_DIR      local s3 mock directory (default: ./s3, only used without DAT9_S3_BUCKET)
+  DAT9_S3_DIR      local s3 mock root directory (default: ./s3, only used without DAT9_S3_BUCKET)
 `)
 	os.Exit(2)
 }

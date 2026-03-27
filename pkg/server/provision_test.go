@@ -30,7 +30,7 @@ func (f *fakeProvisioner) InitSchema(_ context.Context, dsn string) error {
 	if f.initErr != nil {
 		return f.initErr
 	}
-	return tenant.InitSchemaForProvider(dsn, f.provider)
+	return nil
 }
 
 func (f *fakeProvisioner) Provision(_ context.Context, tenantID string) (*tenant.ClusterInfo, error) {
@@ -85,11 +85,10 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 	}()
 
 	srv := NewWithConfig(Config{
-		Meta:            metaStore,
-		Pool:            pool,
-		Provisioners:    map[string]tenant.Provisioner{tenant.ProviderTiDBZero: prov},
-		TokenSecret:     tokenSecret,
-		DefaultProvider: tenant.ProviderTiDBZero,
+		Meta:        metaStore,
+		Pool:        pool,
+		Provisioner: prov,
+		TokenSecret: tokenSecret,
 	})
 
 	ts := httptest.NewServer(srv)
@@ -181,11 +180,10 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	}}
 
 	srv := NewWithConfig(Config{
-		Meta:            metaStore,
-		Pool:            pool,
-		Provisioners:    map[string]tenant.Provisioner{tenant.ProviderTiDBZero: prov},
-		TokenSecret:     tokenSecret,
-		DefaultProvider: tenant.ProviderTiDBZero,
+		Meta:        metaStore,
+		Pool:        pool,
+		Provisioner: prov,
+		TokenSecret: tokenSecret,
 	})
 
 	ts := httptest.NewServer(srv)
