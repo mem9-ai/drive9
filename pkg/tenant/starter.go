@@ -49,6 +49,10 @@ func NewStarterProvisionerFromEnv() (*StarterProvisioner, error) {
 
 func (p *StarterProvisioner) ProviderType() string { return ProviderTiDBCloudStarter }
 
+func (p *StarterProvisioner) InitSchema(_ context.Context, dsn string) error {
+	return initStarterSchema(dsn)
+}
+
 func (p *StarterProvisioner) Provision(ctx context.Context, tenantID string) (*ClusterInfo, error) {
 	password, err := generateRandomPassword(24)
 	if err != nil {
