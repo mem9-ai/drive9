@@ -2,6 +2,7 @@ package tenant
 
 import (
 	"container/list"
+	"context"
 	"fmt"
 	"sync"
 
@@ -14,8 +15,13 @@ import (
 type PoolConfig struct {
 	MaxTenants int    // max cached backends (LRU eviction beyond this)
 	BlobDir    string // base blob directory; per-tenant subdirs are created
-	S3Dir      string // base S3 directory for local S3 (empty = no S3)
+	S3Dir      string // base S3 directory for local S3 (used when AWSConfig is nil)
 	PublicURL  string // public base URL for presigned URLs
+
+	// AWSConfig, when set, creates per-tenant AWSS3Client instances.
+	// Per-tenant prefix is derived from the tenant's S3KeyPrefix field,
+	// falling back to "tenants/<id>/".
+	AWSConfig *s3client.AWSConfig
 }
 
 // Pool caches per-tenant Dat9Backend instances with LRU eviction.
@@ -172,14 +178,14 @@ func (p *Pool) createBackend(t *Tenant) (*backend.Dat9Backend, *meta.Store, erro
 	}
 
 	blobDir := p.cfg.BlobDir + "/" + t.ID
-	if p.cfg.S3Dir != "" {
-		s3Dir := p.cfg.S3Dir + "/" + t.ID
-		s3BaseURL := p.cfg.PublicURL + "/s3/" + t.ID
-		s3c, err := s3client.NewLocal(s3Dir, s3BaseURL)
-		if err != nil {
-			store.Close()
-			return nil, nil, fmt.Errorf("create s3 client: %w", err)
-		}
+
+	// Create S3 client: prefer AWS if configured, then local, then none.
+	s3c, err := p.createS3Client(t)
+	if err != nil {
+		store.Close()
+		return nil, nil, fmt.Errorf("create s3 client: %w", err)
+	}
+	if s3c != nil {
 		b, err := backend.NewWithS3(store, blobDir, s3c)
 		if err != nil {
 			store.Close()
@@ -194,4 +200,30 @@ func (p *Pool) createBackend(t *Tenant) (*backend.Dat9Backend, *meta.Store, erro
 		return nil, nil, err
 	}
 	return b, store, nil
+}
+
+// createS3Client creates an S3 client for a tenant.
+// Returns (nil, nil) if no S3 is configured.
+func (p *Pool) createS3Client(t *Tenant) (s3client.S3Client, error) {
+	if p.cfg.AWSConfig != nil {
+		// AWS S3: use shared bucket with per-tenant prefix.
+		prefix := t.S3KeyPrefix
+		if prefix == "" {
+			prefix = "tenants/" + t.ID + "/"
+		}
+		cfg := *p.cfg.AWSConfig // copy
+		cfg.Prefix = prefix
+		// Use tenant's S3Bucket if set, otherwise use the shared bucket.
+		if t.S3Bucket != "" {
+			cfg.Bucket = t.S3Bucket
+		}
+		return s3client.NewAWS(context.Background(), cfg)
+	}
+	if p.cfg.S3Dir != "" {
+		// Local S3 mock: per-tenant directory.
+		s3Dir := p.cfg.S3Dir + "/" + t.ID
+		s3BaseURL := p.cfg.PublicURL + "/s3/" + t.ID
+		return s3client.NewLocal(s3Dir, s3BaseURL)
+	}
+	return nil, nil
 }

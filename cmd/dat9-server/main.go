@@ -86,12 +86,22 @@ func main() {
 		}
 		defer tenants.Close()
 
-		pool := tenant.NewPool(tenant.PoolConfig{
+		poolCfg := tenant.PoolConfig{
 			MaxTenants: 128,
 			BlobDir:    blobDir,
 			S3Dir:      s3Dir,
 			PublicURL:  pubURL,
-		}, enc)
+		}
+		if s3Bucket != "" {
+			poolCfg.AWSConfig = &s3client.AWSConfig{
+				Region:  envOr("DAT9_S3_REGION", "us-east-1"),
+				Bucket:  s3Bucket,
+				Prefix:  os.Getenv("DAT9_S3_PREFIX"),
+				RoleARN: os.Getenv("DAT9_S3_ROLE_ARN"),
+			}
+			poolCfg.S3Dir = "" // AWS S3 takes precedence over local mock
+		}
+		pool := tenant.NewPool(poolCfg, enc)
 		defer pool.Close()
 
 		cfg.Tenants = tenants
@@ -107,8 +117,12 @@ func main() {
 			cfg.Provisioner = provisioner
 		}
 
-		log.Printf("multi-tenant mode enabled (admin key: %v, provisioner: %v, s3: %v)",
-			adminKey != "", cfg.Provisioner != nil, s3Bucket != "")
+		s3Mode := "local"
+		if s3Bucket != "" {
+			s3Mode = fmt.Sprintf("aws (bucket=%s)", s3Bucket)
+		}
+		log.Printf("multi-tenant mode enabled (admin key: %v, provisioner: %v, s3: %s)",
+			adminKey != "", cfg.Provisioner != nil, s3Mode)
 	} else {
 		// Single-tenant dev mode
 		mysqlDSN := os.Getenv("DAT9_MYSQL_DSN")
