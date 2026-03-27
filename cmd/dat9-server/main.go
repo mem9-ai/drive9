@@ -82,6 +82,7 @@ func main() {
 		cfg.Tenants = tenants
 		cfg.Pool = pool
 		cfg.AdminKey = adminKey
+		cfg.S3Dir = s3Dir
 
 		// Set up provisioner if TiDB Cloud credentials are available
 		provisioner, err := tenant.NewTiDBStarterFromEnv()

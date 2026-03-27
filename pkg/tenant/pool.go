@@ -113,6 +113,17 @@ func (p *Pool) Get(t *Tenant) (*backend.Dat9Backend, error) {
 	return b, nil
 }
 
+// S3Backend returns the cached backend's S3 client for a tenant, if available.
+// Returns nil if the tenant is not cached or has no S3 client.
+func (p *Pool) S3Backend(tenantID string) *backend.Dat9Backend {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if elem, ok := p.items[tenantID]; ok {
+		return elem.Value.(*poolEntry).backend
+	}
+	return nil
+}
+
 // Evict removes a tenant's cached backend and closes its connections.
 func (p *Pool) Evict(tenantID string) {
 	p.mu.Lock()
@@ -163,7 +174,7 @@ func (p *Pool) createBackend(t *Tenant) (*backend.Dat9Backend, *meta.Store, erro
 	blobDir := p.cfg.BlobDir + "/" + t.ID
 	if p.cfg.S3Dir != "" {
 		s3Dir := p.cfg.S3Dir + "/" + t.ID
-		s3BaseURL := p.cfg.PublicURL + "/s3"
+		s3BaseURL := p.cfg.PublicURL + "/s3/" + t.ID
 		s3c, err := s3client.NewLocal(s3Dir, s3BaseURL)
 		if err != nil {
 			store.Close()
