@@ -35,8 +35,12 @@ type Config struct {
 	// AdminKey protects /v1/provision. Required when Tenants is set.
 	AdminKey string
 
-	// LocalS3 is set when using local S3 for presigned URL handling.
+	// LocalS3 is set when using local S3 for presigned URL handling (single-tenant).
 	LocalS3 *s3client.LocalS3Client
+
+	// S3Dir is the base S3 directory for multi-tenant local S3.
+	// Per-tenant S3 dirs are created as subdirs. Only used in multi-tenant mode.
+	S3Dir string
 }
 
 type Server struct {
@@ -82,6 +86,30 @@ func New(cfg Config) *Server {
 	}
 	if local != nil {
 		mux.Handle("/s3/", http.StripPrefix("/s3", local.Handler()))
+	} else if cfg.S3Dir != "" && cfg.Pool != nil {
+		// Multi-tenant local S3: presigned URLs use /s3/{tenantID}/...
+		mux.Handle("/s3/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Extract tenant ID from path: /s3/{tenantID}/upload/... or /s3/{tenantID}/objects/...
+			rest := strings.TrimPrefix(r.URL.Path, "/s3/")
+			tenantID, sub, ok := strings.Cut(rest, "/")
+			if !ok || tenantID == "" {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			b := cfg.Pool.S3Backend(tenantID)
+			if b == nil || b.S3() == nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			localS3, ok := b.S3().(*s3client.LocalS3Client)
+			if !ok {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			// Rewrite path to strip /s3/{tenantID} prefix
+			r.URL.Path = "/" + sub
+			localS3.Handler().ServeHTTP(w, r)
+		}))
 	}
 
 	s.mux = mux
