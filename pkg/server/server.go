@@ -846,10 +846,12 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 	}
 	limit := 20
 	if v := r.URL.Query().Get("limit"); v != "" {
-		if _, err := fmt.Sscanf(v, "%d", &limit); err != nil {
+		n, err := strconv.Atoi(v)
+		if err != nil {
 			errJSON(w, http.StatusBadRequest, "invalid limit: "+v)
 			return
 		}
+		limit = n
 	}
 	results, err := b.Grep(r.Context(), query, path, limit)
 	if err != nil {
@@ -891,22 +893,28 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 		f.Before = &t
 	}
 	if v := q.Get("minsize"); v != "" {
-		if _, err := fmt.Sscanf(v, "%d", &f.MinSize); err != nil {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
 			errJSON(w, http.StatusBadRequest, "invalid minsize: "+v)
 			return
 		}
+		f.MinSize = n
 	}
 	if v := q.Get("maxsize"); v != "" {
-		if _, err := fmt.Sscanf(v, "%d", &f.MaxSize); err != nil {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
 			errJSON(w, http.StatusBadRequest, "invalid maxsize: "+v)
 			return
 		}
+		f.MaxSize = n
 	}
 	if v := q.Get("limit"); v != "" {
-		if _, err := fmt.Sscanf(v, "%d", &f.Limit); err != nil {
+		n, err := strconv.Atoi(v)
+		if err != nil {
 			errJSON(w, http.StatusBadRequest, "invalid limit: "+v)
 			return
 		}
+		f.Limit = n
 	}
 	results, err := b.Find(r.Context(), f)
 	if err != nil {
