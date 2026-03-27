@@ -26,6 +26,11 @@ func DBCreate(args []string) error {
 		}
 	}
 
+	cfg := loadConfig()
+	if _, exists := cfg.Databases[name]; exists {
+		return fmt.Errorf("database %q already exists; use a different name or delete it first", name)
+	}
+
 	c := client.New(server, "")
 	resp, err := c.RawPost("/v1/provision", nil)
 	if err != nil {
@@ -51,7 +56,6 @@ func DBCreate(args []string) error {
 		return fmt.Errorf("decode provision response: %w", err)
 	}
 
-	cfg := loadConfig()
 	cfg.SetDB(name, &DBEntry{
 		Server: server,
 		APIKey: result.APIKey,
