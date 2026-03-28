@@ -93,6 +93,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/sql", business)
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
+	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	local := cfg.LocalS3
@@ -203,6 +204,15 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "business_route_not_found", "path", r.URL.Path, "method", r.Method)...)
 		errJSON(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
