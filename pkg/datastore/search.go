@@ -115,9 +115,9 @@ func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limi
 	q := `SELECT path, name, size_bytes, MIN(distance) AS distance
 		FROM (
 			SELECT fn.path AS path, fn.name AS name, f.size_bytes AS size_bytes,
-				VEC_EMBED_COSINE_DISTANCE(f.embedding_text, ?) AS distance
+				VEC_EMBED_COSINE_DISTANCE(f.embedding, ?) AS distance
 			FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
-			WHERE ` + whereBase + ` AND f.embedding_text IS NOT NULL
+			WHERE ` + whereBase + ` AND f.embedding IS NOT NULL
 
 			UNION ALL
 
