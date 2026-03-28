@@ -276,7 +276,7 @@ func TestStartupResumesProvisioningTenantInit(t *testing.T) {
 		}
 	}
 
-	passCipher, err := pool.Encrypt([]byte(parsed.Passwd))
+	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
 	if err != nil {
 		t.Fatal(err)
 	}
