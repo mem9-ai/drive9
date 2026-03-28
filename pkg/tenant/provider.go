@@ -7,9 +7,9 @@ const (
 	ProviderTiDBZero         = "tidb_zero"
 	ProviderTiDBCloudStarter = "tidb_cloud_starter"
 
-	currentDB9SchemaVersion              = 2
+	currentDB9SchemaVersion              = 1
 	currentTiDBZeroSchemaVersion         = 2
-	currentTiDBCloudStarterSchemaVersion = 2
+	currentTiDBCloudStarterSchemaVersion = 1
 )
 
 func NormalizeProvider(provider string) (string, error) {

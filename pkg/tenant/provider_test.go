@@ -7,9 +7,9 @@ func TestCurrentSchemaVersionByProvider(t *testing.T) {
 		provider string
 		want     int
 	}{
-		{ProviderDB9, 2},
+		{ProviderDB9, 1},
 		{ProviderTiDBZero, 2},
-		{ProviderTiDBCloudStarter, 2},
+		{ProviderTiDBCloudStarter, 1},
 		{"unknown", 1},
 	}
 
