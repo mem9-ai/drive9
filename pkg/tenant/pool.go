@@ -16,7 +16,6 @@ import (
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/s3client"
-	"github.com/mem9-ai/dat9/pkg/traceid"
 	"go.uber.org/zap"
 )
 
@@ -119,12 +118,12 @@ func (p *Pool) S3Backend(tenantID string) *backend.Dat9Backend {
 	return nil
 }
 
-func (p *Pool) Decrypt(cipher []byte) ([]byte, error) {
-	return p.enc.Decrypt(poolBackgroundContext(), cipher)
+func (p *Pool) Decrypt(ctx context.Context, cipher []byte) ([]byte, error) {
+	return p.enc.Decrypt(ctx, cipher)
 }
 
-func (p *Pool) Encrypt(plain []byte) ([]byte, error) {
-	return p.enc.Encrypt(poolBackgroundContext(), plain)
+func (p *Pool) Encrypt(ctx context.Context, plain []byte) ([]byte, error) {
+	return p.enc.Encrypt(ctx, plain)
 }
 
 func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantID string) (out *backend.Dat9Backend) {
@@ -234,8 +233,4 @@ func observePool(ctx context.Context, op, tenantID string, errp *error, start ti
 		logger.Error(ctx, "tenant_pool_op_failed", zap.String("operation", op), zap.String("tenant_id", tenantID), zap.String("result", result), zap.Error(*errp))
 	}
 	metrics.RecordOperation("tenant_pool", op, result, time.Since(start))
-}
-
-func poolBackgroundContext() context.Context {
-	return traceid.Background()
 }

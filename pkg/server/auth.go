@@ -71,7 +71,7 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			return
 		}
 
-		plain, err := poolDecryptToken(pool, resolved.APIKey.JWTCiphertext)
+		plain, err := poolDecryptToken(r.Context(), pool, resolved.APIKey.JWTCiphertext)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "auth_decrypt_failed", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 			metricEvent(r.Context(), "auth", "result", "decrypt_failed")
@@ -138,10 +138,10 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 	})
 }
 
-func poolDecryptToken(pool *tenant.Pool, cipher []byte) ([]byte, error) {
+func poolDecryptToken(ctx context.Context, pool *tenant.Pool, cipher []byte) ([]byte, error) {
 	// Decrypt is tenant-independent and uses pool encryptor shared for API key storage.
 	// Keep this helper to avoid exposing raw encryptor in handlers.
-	return pool.Decrypt(cipher)
+	return pool.Decrypt(ctx, cipher)
 }
 
 func bearerToken(r *http.Request) string {

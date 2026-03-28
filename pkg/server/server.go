@@ -148,7 +148,7 @@ func (s *Server) resumeProvisioningTenants() {
 
 func (s *Server) resumeTenantSchemaInit(t meta.Tenant) {
 	ctx := backgroundWithTrace(context.Background())
-	plain, err := s.pool.Decrypt(t.DBPasswordCipher)
+	plain, err := s.pool.Decrypt(ctx, t.DBPasswordCipher)
 	if err != nil {
 		logger.Warn(ctx, "resume_schema_init_skipped", zap.String("tenant_id", t.ID), zap.Error(err))
 		return
@@ -244,7 +244,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
-	plain, err := poolDecryptToken(s.pool, resolved.APIKey.JWTCiphertext)
+	plain, err := poolDecryptToken(r.Context(), s.pool, resolved.APIKey.JWTCiphertext)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_decrypt_failed", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
@@ -886,14 +886,14 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	}
 	cluster.Provider = provider
 
-	cipherPass, err := s.pool.Encrypt([]byte(cluster.Password))
+	cipherPass, err := s.pool.Encrypt(r.Context(), []byte(cluster.Password))
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_encrypt_db_password_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 		errJSON(w, http.StatusInternalServerError, "failed to encrypt db password")
 		return
 	}
-	cipherToken, err := s.pool.Encrypt([]byte(token))
+	cipherToken, err := s.pool.Encrypt(r.Context(), []byte(token))
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_encrypt_api_key_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
