@@ -239,3 +239,226 @@ func TestNotFound(t *testing.T) {
 		t.Errorf("expected 404, got %d", resp.StatusCode)
 	}
 }
+
+func TestTraceIDHeaderPropagation(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/fs/nonexistent.txt", nil)
+	req.Header.Set("X-Trace-ID", "trace-e2e-123")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if got := resp.Header.Get("X-Trace-ID"); got != "trace-e2e-123" {
+		t.Fatalf("expected trace header echo, got %q", got)
+	}
+
+	resp2, err := http.Get(ts.URL + "/v1/fs/nonexistent.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp2.Body.Close() }()
+	if got := resp2.Header.Get("X-Trace-ID"); got == "" {
+		t.Fatal("expected generated X-Trace-ID header")
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/m.txt", strings.NewReader("abc"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	sqlReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/sql", strings.NewReader(`{"query":"SELECT 1"}`))
+	sqlReq.Header.Set("Content-Type", "application/json")
+	sqlResp, err := http.DefaultClient.Do(sqlReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = sqlResp.Body.Close()
+
+	readResp, err := http.Get(ts.URL + "/v1/fs/m.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = readResp.Body.Close()
+
+	statReq, _ := http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/m.txt", nil)
+	statResp, err := http.DefaultClient.Do(statReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = statResp.Body.Close()
+
+	badFSReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/m.txt?unknown=1", nil)
+	badFSResp, err := http.DefaultClient.Do(badFSReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = badFSResp.Body.Close()
+
+	methodFSReq, _ := http.NewRequest(http.MethodPatch, ts.URL+"/v1/fs/m.txt", nil)
+	methodFSResp, err := http.DefaultClient.Do(methodFSReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = methodFSResp.Body.Close()
+
+	statusMethodReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/status", nil)
+	statusMethodResp, err := http.DefaultClient.Do(statusMethodReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = statusMethodResp.Body.Close()
+
+	statusReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)
+	statusResp, err := http.DefaultClient.Do(statusReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = statusResp.Body.Close()
+
+	provisionReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", nil)
+	provisionResp, err := http.DefaultClient.Do(provisionReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = provisionResp.Body.Close()
+
+	badSQLReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/sql", strings.NewReader(`{"query":""}`))
+	badSQLReq.Header.Set("Content-Type", "application/json")
+	badSQLResp, err := http.DefaultClient.Do(badSQLReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = badSQLResp.Body.Close()
+
+	grepBadReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/fs/m.txt?grep=abc&limit=NaN", nil)
+	grepBadResp, err := http.DefaultClient.Do(grepBadReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = grepBadResp.Body.Close()
+
+	findBadReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/fs/m.txt?find=1&newer=bad-date", nil)
+	findBadResp, err := http.DefaultClient.Do(findBadReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = findBadResp.Body.Close()
+
+	resp, err = http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status: %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+	if !strings.Contains(text, "dat9_http_requests_total") {
+		t.Fatalf("expected requests metric in response: %s", text)
+	}
+	if !strings.Contains(text, `route="/v1/fs/*"`) {
+		t.Fatalf("expected fs route metric label in response: %s", text)
+	}
+	if !strings.Contains(text, "dat9_http_inflight_requests") {
+		t.Fatalf("expected inflight metric in response: %s", text)
+	}
+	if !strings.Contains(text, `dat9_service_operations_total{component="backend",operation="exec_sql",result="ok"}`) {
+		t.Fatalf("expected backend service metric in response: %s", text)
+	}
+	if !strings.Contains(text, `dat9_tenant_events_total{event="fs_write",result="ok"}`) {
+		t.Fatalf("expected fs_write tenant event metric in response: %s", text)
+	}
+	if !strings.Contains(text, `dat9_tenant_events_total{event="fs_read",result="ok"}`) {
+		t.Fatalf("expected fs_read tenant event metric in response: %s", text)
+	}
+	if !strings.Contains(text, `dat9_tenant_events_total{event="tenant_provision",result="error"}`) {
+		t.Fatalf("expected tenant_provision error metric in response: %s", text)
+	}
+}
+
+func TestUploadActionMetrics(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	completeReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/nonexistent/complete", nil)
+	completeResp, err := http.DefaultClient.Do(completeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = completeResp.Body.Close()
+	if completeResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for upload complete, got %d", completeResp.StatusCode)
+	}
+
+	resumeReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/nonexistent/resume", nil)
+	resumeResp, err := http.DefaultClient.Do(resumeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resumeResp.Body.Close()
+	if resumeResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for upload resume, got %d", resumeResp.StatusCode)
+	}
+
+	abortReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/v1/uploads/nonexistent", nil)
+	abortResp, err := http.DefaultClient.Do(abortReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = abortResp.Body.Close()
+	if abortResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for upload abort, got %d", abortResp.StatusCode)
+	}
+
+	uploadsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/uploads", nil)
+	uploadsResp, err := http.DefaultClient.Do(uploadsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = uploadsResp.Body.Close()
+	if uploadsResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for uploads list without path, got %d", uploadsResp.StatusCode)
+	}
+
+	uploadActionReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/nonexistent/unknown", nil)
+	uploadActionResp, err := http.DefaultClient.Do(uploadActionReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = uploadActionResp.Body.Close()
+	if uploadActionResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown upload action, got %d", uploadActionResp.StatusCode)
+	}
+
+	metricsResp, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metricsResp.Body.Close() }()
+	body, _ := io.ReadAll(metricsResp.Body)
+	text := string(body)
+
+	if !strings.Contains(text, `dat9_tenant_events_total{event="upload_complete",result="error"}`) {
+		t.Fatalf("expected upload_complete metric, got: %s", text)
+	}
+	if !strings.Contains(text, `dat9_tenant_events_total{event="upload_resume",result="error"}`) {
+		t.Fatalf("expected upload_resume metric, got: %s", text)
+	}
+	if !strings.Contains(text, `dat9_tenant_events_total{event="upload_abort",result="error"}`) {
+		t.Fatalf("expected upload_abort metric, got: %s", text)
+	}
+}

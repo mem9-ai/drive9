@@ -1,6 +1,7 @@
 package meta
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -34,7 +35,7 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
-	if err := s.InsertTenant(tenant); err != nil {
+	if err := s.InsertTenant(context.Background(), tenant); err != nil {
 		t.Fatal(err)
 	}
 	key := &APIKey{
@@ -49,11 +50,11 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
-	if err := s.InsertAPIKey(key); err != nil {
+	if err := s.InsertAPIKey(context.Background(), key); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := s.ResolveByAPIKeyHash("hash1")
+	got, err := s.ResolveByAPIKeyHash(context.Background(), "hash1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +72,7 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 func TestUpdateTenantStatus(t *testing.T) {
 	s := newControlStore(t)
 	now := time.Now().UTC()
-	if err := s.InsertTenant(&Tenant{
+	if err := s.InsertTenant(context.Background(), &Tenant{
 		ID:               "t2",
 		Status:           TenantProvisioning,
 		DBHost:           "127.0.0.1",
@@ -87,7 +88,7 @@ func TestUpdateTenantStatus(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateTenantStatus("t2", TenantSuspended); err != nil {
+	if err := s.UpdateTenantStatus(context.Background(), "t2", TenantSuspended); err != nil {
 		t.Fatal(err)
 	}
 
@@ -112,7 +113,7 @@ func TestListTenantsByStatus(t *testing.T) {
 		{id: "tp2", status: TenantProvisioning},
 		{id: "ta1", status: TenantActive},
 	} {
-		if err := s.InsertTenant(&Tenant{
+		if err := s.InsertTenant(context.Background(), &Tenant{
 			ID:               tc.id,
 			Status:           tc.status,
 			DBHost:           "127.0.0.1",
@@ -130,7 +131,7 @@ func TestListTenantsByStatus(t *testing.T) {
 		}
 	}
 
-	got, err := s.ListTenantsByStatus(TenantProvisioning, 10)
+	got, err := s.ListTenantsByStatus(context.Background(), TenantProvisioning, 10)
 	if err != nil {
 		t.Fatal(err)
 	}

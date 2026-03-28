@@ -3,15 +3,20 @@ package tenant
 import (
 	"container/list"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/encrypt"
+	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/s3client"
+	"go.uber.org/zap"
 )
 
 type PoolConfig struct {
@@ -47,7 +52,10 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 	return &Pool{cfg: cfg, enc: enc, items: map[string]*list.Element{}, order: list.New(), maxSize: max}
 }
 
-func (p *Pool) Get(t *meta.Tenant) (*backend.Dat9Backend, error) {
+func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backend, err error) {
+	start := time.Now()
+	defer observePool(ctx, "get", t.ID, &err, start)
+
 	if t.Status != meta.TenantActive {
 		p.Invalidate(t.ID)
 		return nil, fmt.Errorf("tenant status: %s", t.Status)
@@ -62,7 +70,7 @@ func (p *Pool) Get(t *meta.Tenant) (*backend.Dat9Backend, error) {
 	}
 	p.mu.Unlock()
 
-	b, st, err := p.createBackend(t)
+	b, st, err := p.createBackend(ctx, t)
 	if err != nil {
 		return nil, err
 	}
@@ -110,32 +118,40 @@ func (p *Pool) S3Backend(tenantID string) *backend.Dat9Backend {
 	return nil
 }
 
-func (p *Pool) Decrypt(cipher []byte) ([]byte, error) {
-	return p.enc.Decrypt(context.Background(), cipher)
+func (p *Pool) Decrypt(ctx context.Context, cipher []byte) ([]byte, error) {
+	return p.enc.Decrypt(ctx, cipher)
 }
 
-func (p *Pool) Encrypt(plain []byte) ([]byte, error) {
-	return p.enc.Encrypt(context.Background(), plain)
+func (p *Pool) Encrypt(ctx context.Context, plain []byte) ([]byte, error) {
+	return p.enc.Encrypt(ctx, plain)
 }
 
-func (p *Pool) LoadS3Backend(metaStore *meta.Store, tenantID string) *backend.Dat9Backend {
+func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantID string) (out *backend.Dat9Backend) {
+	start := time.Now()
+	var err error
+	defer observePool(ctx, "load_s3_backend", tenantID, &err, start)
+
 	b := p.S3Backend(tenantID)
 	if b != nil {
 		return b
 	}
-	tenant, err := metaStore.GetTenant(tenantID)
+	tenant, err := metaStore.GetTenant(ctx, tenantID)
 	if err != nil {
+		if !errors.Is(err, meta.ErrNotFound) {
+			logger.Error(ctx, "tenant_pool_load_s3_backend_failed", zap.String("tenant_id", tenantID), zap.Error(err))
+		}
 		return nil
 	}
-	b, err = p.Get(tenant)
+	b, err = p.Get(ctx, tenant)
 	if err != nil {
+		logger.Error(ctx, "tenant_pool_get_failed", zap.String("tenant_id", tenantID), zap.Error(err))
 		return nil
 	}
 	return b
 }
 
-func (p *Pool) createBackend(t *meta.Tenant) (*backend.Dat9Backend, *datastore.Store, error) {
-	pass, err := p.enc.Decrypt(context.Background(), t.DBPasswordCipher)
+func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9Backend, *datastore.Store, error) {
+	pass, err := p.enc.Decrypt(ctx, t.DBPasswordCipher)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -154,7 +170,7 @@ func (p *Pool) createBackend(t *meta.Tenant) (*backend.Dat9Backend, *datastore.S
 			prefix += "/"
 		}
 		prefix += t.ID + "/"
-		s3c, err := s3client.NewAWS(context.Background(), s3client.AWSConfig{
+		s3c, err := s3client.NewAWS(ctx, s3client.AWSConfig{
 			Region:  p.cfg.S3Region,
 			Bucket:  p.cfg.S3Bucket,
 			Prefix:  prefix,
@@ -203,4 +219,18 @@ func (p *Pool) removeLocked(elem *list.Element) {
 	if e.store != nil {
 		_ = e.store.Close()
 	}
+}
+
+func observePool(ctx context.Context, op, tenantID string, errp *error, start time.Time) {
+	result := "ok"
+	if errp != nil && *errp != nil {
+		switch {
+		case errors.Is(*errp, meta.ErrNotFound):
+			result = "not_found"
+		default:
+			result = "error"
+		}
+		logger.Error(ctx, "tenant_pool_op_failed", zap.String("operation", op), zap.String("tenant_id", tenantID), zap.String("result", result), zap.Error(*errp))
+	}
+	metrics.RecordOperation("tenant_pool", op, result, time.Since(start))
 }

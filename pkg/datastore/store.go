@@ -13,6 +13,9 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/metrics"
+	"go.uber.org/zap"
 )
 
 var (
@@ -129,8 +132,11 @@ func (s *Store) DB() *sql.DB  { return s.db }
 
 // InTx runs fn inside a database transaction. If fn returns an error, the
 // transaction is rolled back; otherwise it is committed.
-func (s *Store) InTx(fn func(tx *sql.Tx) error) error {
-	tx, err := s.db.Begin()
+func (s *Store) InTx(ctx context.Context, fn func(tx *sql.Tx) error) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "in_tx", start, &err)
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -138,7 +144,8 @@ func (s *Store) InTx(fn func(tx *sql.Tx) error) error {
 	if err := fn(tx); err != nil {
 		return err
 	}
-	return tx.Commit()
+	err = tx.Commit()
+	return err
 }
 
 func (s *Store) columnExists(table, column string) bool {
@@ -151,30 +158,45 @@ func (s *Store) columnExists(table, column string) bool {
 
 // --- file_nodes operations ---
 
-func (s *Store) InsertNode(n *FileNode) error {
-	_, err := s.db.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, created_at)
+func (s *Store) InsertNode(ctx context.Context, n *FileNode) error {
+	start := time.Now()
+	var opErr error
+	defer observeStoreOp(ctx, "insert_node", start, &opErr)
+
+	_, err := s.db.ExecContext(ctx, `INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), n.CreatedAt.UTC())
 	if isUniqueViolation(err) {
+		opErr = ErrPathConflict
 		return ErrPathConflict
 	}
+	opErr = err
 	return err
 }
 
-func (s *Store) GetNode(path string) (*FileNode, error) {
-	row := s.db.QueryRow(`SELECT node_id, path, parent_path, name, is_directory, file_id, created_at
+func (s *Store) GetNode(ctx context.Context, path string) (*FileNode, error) {
+	start := time.Now()
+	var opErr error
+	defer observeStoreOp(ctx, "get_node", start, &opErr)
+
+	row := s.db.QueryRowContext(ctx, `SELECT node_id, path, parent_path, name, is_directory, file_id, created_at
 		FROM file_nodes WHERE path = ?`, path)
-	return scanNode(row)
+	n, err := scanNode(row)
+	opErr = err
+	return n, err
 }
 
-func (s *Store) ListNodes(parentPath string) ([]*FileNode, error) {
-	rows, err := s.db.Query(`SELECT node_id, path, parent_path, name, is_directory, file_id, created_at
+func (s *Store) ListNodes(ctx context.Context, parentPath string) (out []*FileNode, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "list_nodes", start, &err)
+
+	rows, err := s.db.QueryContext(ctx, `SELECT node_id, path, parent_path, name, is_directory, file_id, created_at
 		FROM file_nodes WHERE parent_path = ? ORDER BY name`, parentPath)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var nodes []*FileNode
+	nodes := make([]*FileNode, 0)
 	for rows.Next() {
 		n, err := scanNode(rows)
 		if err != nil {
@@ -182,11 +204,18 @@ func (s *Store) ListNodes(parentPath string) ([]*FileNode, error) {
 		}
 		nodes = append(nodes, n)
 	}
-	return nodes, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out = nodes
+	return out, nil
 }
 
-func (s *Store) DeleteNode(path string) error {
-	res, err := s.db.Exec(`DELETE FROM file_nodes WHERE path = ?`, path)
+func (s *Store) DeleteNode(ctx context.Context, path string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "delete_node", start, &err)
+
+	res, err := s.db.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ?`, path)
 	if err != nil {
 		return err
 	}
@@ -198,8 +227,11 @@ func (s *Store) DeleteNode(path string) error {
 }
 
 // DeleteEmptyDir atomically checks a directory is empty and deletes it.
-func (s *Store) DeleteEmptyDir(path string) error {
-	tx, err := s.db.Begin()
+func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "delete_empty_dir", start, &err)
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -220,20 +252,28 @@ func (s *Store) DeleteEmptyDir(path string) error {
 	if n == 0 {
 		return ErrNotFound
 	}
-	return tx.Commit()
+	err = tx.Commit()
+	return err
 }
 
-func (s *Store) DeleteNodesByPrefix(prefix string) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM file_nodes WHERE path = ? OR path LIKE ?`,
+func (s *Store) DeleteNodesByPrefix(ctx context.Context, prefix string) (n int64, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "delete_nodes_by_prefix", start, &err)
+
+	res, err := s.db.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ? OR path LIKE ?`,
 		prefix, prefix+"%")
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, err = res.RowsAffected()
+	return n, err
 }
 
-func (s *Store) UpdateNodePath(oldPath, newPath, newParentPath, newName string) error {
-	res, err := s.db.Exec(`UPDATE file_nodes SET path = ?, parent_path = ?, name = ?
+func (s *Store) UpdateNodePath(ctx context.Context, oldPath, newPath, newParentPath, newName string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "update_node_path", start, &err)
+
+	res, err := s.db.ExecContext(ctx, `UPDATE file_nodes SET path = ?, parent_path = ?, name = ?
 		WHERE path = ?`, newPath, newParentPath, newName, oldPath)
 	if err != nil {
 		return err
@@ -245,8 +285,11 @@ func (s *Store) UpdateNodePath(oldPath, newPath, newParentPath, newName string) 
 	return nil
 }
 
-func (s *Store) RenameDir(oldPrefix, newPrefix string) (int64, error) {
-	tx, err := s.db.Begin()
+func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (count int64, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "rename_dir", start, &err)
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -294,16 +337,22 @@ func (s *Store) RenameDir(oldPrefix, newPrefix string) (int64, error) {
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	return int64(len(updates)), nil
+	count = int64(len(updates))
+	return count, nil
 }
 
-func (s *Store) RefCount(fileID string) (int64, error) {
-	var count int64
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE file_id = ?`, fileID).Scan(&count)
+func (s *Store) RefCount(ctx context.Context, fileID string) (count int64, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "ref_count", start, &err)
+
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_nodes WHERE file_id = ?`, fileID).Scan(&count)
 	return count, err
 }
 
-func (s *Store) EnsureParentDirs(path string, genID func() string) error {
+func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "ensure_parent_dirs", start, &err)
+
 	var ancestors []string
 	cur := path
 	for {
@@ -320,7 +369,7 @@ func (s *Store) EnsureParentDirs(path string, genID func() string) error {
 		dirPath := ancestors[i]
 		pp := parentPath(dirPath)
 		name := baseName(dirPath)
-		_, err := s.db.Exec(`INSERT INTO file_nodes
+		_, err := s.db.ExecContext(ctx, `INSERT INTO file_nodes
 			(node_id, path, parent_path, name, is_directory, created_at)
 			VALUES (?, ?, ?, ?, 1, ?)
 			ON DUPLICATE KEY UPDATE node_id = node_id`,
@@ -334,9 +383,12 @@ func (s *Store) EnsureParentDirs(path string, genID func() string) error {
 
 // --- files operations ---
 
-func (s *Store) InsertFile(f *File) error {
+func (s *Store) InsertFile(ctx context.Context, f *File) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "insert_file", start, &err)
+
 	if s.hasContentBlob {
-		_, err := s.db.Exec(`INSERT INTO files
+		_, err = s.db.ExecContext(ctx, `INSERT INTO files
 			(file_id, storage_type, storage_ref, content_blob, content_type, size_bytes, checksum_sha256,
 			 revision, status, source_id, content_text, created_at, confirmed_at, expires_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -346,7 +398,7 @@ func (s *Store) InsertFile(f *File) error {
 			f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
 		return err
 	}
-	_, err := s.db.Exec(`INSERT INTO files
+	_, err = s.db.ExecContext(ctx, `INSERT INTO files
 		(file_id, storage_type, storage_ref, content_type, size_bytes, checksum_sha256,
 		 revision, status, source_id, content_text, created_at, confirmed_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -357,28 +409,35 @@ func (s *Store) InsertFile(f *File) error {
 	return err
 }
 
-func (s *Store) GetFile(fileID string) (*File, error) {
+func (s *Store) GetFile(ctx context.Context, fileID string) (out *File, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "get_file", start, &err)
+
 	if s.hasContentBlob {
-		row := s.db.QueryRow(`SELECT file_id, storage_type, storage_ref, content_blob, content_type,
+		row := s.db.QueryRowContext(ctx, `SELECT file_id, storage_type, storage_ref, content_blob, content_type,
 			size_bytes, checksum_sha256, revision, status, source_id, content_text,
 			created_at, confirmed_at, expires_at
 			FROM files WHERE file_id = ?`, fileID)
-		return scanFileWithBlob(row)
+		out, err = scanFileWithBlob(row)
+		return out, err
 	}
-	row := s.db.QueryRow(`SELECT file_id, storage_type, storage_ref, content_type,
+	row := s.db.QueryRowContext(ctx, `SELECT file_id, storage_type, storage_ref, content_type,
 		size_bytes, checksum_sha256, revision, status, source_id, content_text,
 		created_at, confirmed_at, expires_at
 		FROM files WHERE file_id = ?`, fileID)
-	return scanFileNoBlob(row)
+	out, err = scanFileNoBlob(row)
+	return out, err
 }
 
-func (s *Store) UpdateFileContent(fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64) error {
+func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "update_file_content", start, &err)
+
 	var (
 		res sql.Result
-		err error
 	)
 	if s.hasContentBlob {
-		res, err = s.db.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
+		res, err = s.db.ExecContext(ctx, `UPDATE files SET storage_type = ?, storage_ref = ?,
 			content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,
 			revision = revision + 1, status = 'CONFIRMED',
 			confirmed_at = ?
@@ -386,7 +445,7 @@ func (s *Store) UpdateFileContent(fileID string, storageType StorageType, storag
 			storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
 			nullStr(checksum), nullStr(contentText), time.Now().UTC(), fileID)
 	} else {
-		res, err = s.db.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
+		res, err = s.db.ExecContext(ctx, `UPDATE files SET storage_type = ?, storage_ref = ?,
 			content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,
 			revision = revision + 1, status = 'CONFIRMED',
 			confirmed_at = ?
@@ -404,8 +463,14 @@ func (s *Store) UpdateFileContent(fileID string, storageType StorageType, storag
 	return nil
 }
 
-func (s *Store) ConfirmFile(fileID string) error {
-	return s.ConfirmFileTx(s.db, fileID)
+func (s *Store) ConfirmFile(ctx context.Context, fileID string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "confirm_file", start, &err)
+
+	_, err = s.db.ExecContext(ctx, `UPDATE files SET status = 'CONFIRMED',
+		confirmed_at = ?
+		WHERE file_id = ? AND status = 'PENDING'`, time.Now().UTC(), fileID)
+	return err
 }
 
 // execer abstracts *sql.DB and *sql.Tx for shared query execution.
@@ -467,30 +532,40 @@ func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
 	return err
 }
 
-func (s *Store) MarkFileDeleted(fileID string) error {
-	_, err := s.db.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fileID)
+func (s *Store) MarkFileDeleted(ctx context.Context, fileID string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "mark_file_deleted", start, &err)
+
+	_, err = s.db.ExecContext(ctx, `UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fileID)
 	return err
 }
 
 // --- composite operations ---
 
-func (s *Store) Stat(path string) (*NodeWithFile, error) {
-	node, err := s.GetNode(path)
+func (s *Store) Stat(ctx context.Context, path string) (out *NodeWithFile, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "stat", start, &err)
+
+	node, err := s.GetNode(ctx, path)
 	if err != nil {
 		return nil, err
 	}
 	nf := &NodeWithFile{Node: *node}
 	if !node.IsDirectory && node.FileID != "" {
-		f, err := s.GetFile(node.FileID)
+		f, err := s.GetFile(ctx, node.FileID)
 		if err != nil {
 			return nil, err
 		}
 		nf.File = f
 	}
-	return nf, nil
+	out = nf
+	return out, nil
 }
 
-func (s *Store) ListDir(parentPath string) ([]*NodeWithFile, error) {
+func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWithFile, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "list_dir", start, &err)
+
 	q := `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
 		f.file_id, f.storage_type, f.storage_ref, `
 	if s.hasContentBlob {
@@ -503,13 +578,13 @@ func (s *Store) ListDir(parentPath string) ([]*NodeWithFile, error) {
 		LEFT JOIN files f ON fn.file_id = f.file_id AND f.status = 'CONFIRMED'
 		WHERE fn.parent_path = ?
 		ORDER BY fn.name`
-	rows, err := s.db.Query(q, parentPath)
+	rows, err := s.db.QueryContext(ctx, q, parentPath)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 
-	var result []*NodeWithFile
+	result := make([]*NodeWithFile, 0)
 	for rows.Next() {
 		var nf *NodeWithFile
 		if s.hasContentBlob {
@@ -522,11 +597,18 @@ func (s *Store) ListDir(parentPath string) ([]*NodeWithFile, error) {
 		}
 		result = append(result, nf)
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out = result
+	return out, nil
 }
 
-func (s *Store) DeleteFileWithRefCheck(path string) (*File, error) {
-	tx, err := s.db.Begin()
+func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *File, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "delete_file_with_ref_check", start, &err)
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -588,11 +670,15 @@ func (s *Store) DeleteFileWithRefCheck(path string) (*File, error) {
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return f, nil
+	out = f
+	return out, nil
 }
 
-func (s *Store) DeleteDirRecursive(dirPath string) ([]*File, error) {
-	tx, err := s.db.Begin()
+func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*File, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "delete_dir_recursive", start, &err)
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -657,13 +743,17 @@ func (s *Store) DeleteDirRecursive(dirPath string) ([]*File, error) {
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return orphaned, nil
+	out = orphaned
+	return out, nil
 }
 
 // --- uploads operations ---
 
-func (s *Store) InsertUpload(u *Upload) error {
-	_, err := s.db.Exec(`INSERT INTO uploads
+func (s *Store) InsertUpload(ctx context.Context, u *Upload) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "insert_upload", start, &err)
+
+	_, err = s.db.ExecContext(ctx, `INSERT INTO uploads
 		(upload_id, file_id, target_path, s3_upload_id, s3_key, total_size, part_size,
 		 parts_total, status, fingerprint_sha256, idempotency_key, created_at, updated_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -677,39 +767,56 @@ func (s *Store) InsertUpload(u *Upload) error {
 	return err
 }
 
-func (s *Store) GetUpload(uploadID string) (*Upload, error) {
-	row := s.db.QueryRow(`SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
+func (s *Store) GetUpload(ctx context.Context, uploadID string) (out *Upload, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "get_upload", start, &err)
+
+	row := s.db.QueryRowContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
 		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
 		FROM uploads WHERE upload_id = ?`, uploadID)
-	return scanUpload(row)
+	out, err = scanUpload(row)
+	return out, err
 }
 
-func (s *Store) GetUploadByPath(targetPath string) (*Upload, error) {
-	row := s.db.QueryRow(`SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
+func (s *Store) GetUploadByPath(ctx context.Context, targetPath string) (out *Upload, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "get_upload_by_path", start, &err)
+
+	row := s.db.QueryRowContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
 		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
 		FROM uploads WHERE target_path = ? AND status = 'UPLOADING'
 		ORDER BY created_at DESC LIMIT 1`, targetPath)
-	return scanUpload(row)
+	out, err = scanUpload(row)
+	return out, err
 }
 
-func (s *Store) CompleteUpload(uploadID string) error {
-	_, err := s.db.Exec(`UPDATE uploads SET status = 'COMPLETED',
+func (s *Store) CompleteUpload(ctx context.Context, uploadID string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "complete_upload", start, &err)
+
+	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = 'COMPLETED',
 		updated_at = ?
 		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
 	return err
 }
 
-func (s *Store) AbortUpload(uploadID string) error {
-	_, err := s.db.Exec(`UPDATE uploads SET status = 'ABORTED',
+func (s *Store) AbortUpload(ctx context.Context, uploadID string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "abort_upload", start, &err)
+
+	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = 'ABORTED',
 		updated_at = ?
 		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
 	return err
 }
 
-func (s *Store) ListUploadsByPath(targetPath string, status UploadStatus) ([]*Upload, error) {
-	rows, err := s.db.Query(`SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
+func (s *Store) ListUploadsByPath(ctx context.Context, targetPath string, status UploadStatus) (out []*Upload, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "list_uploads_by_path", start, &err)
+
+	rows, err := s.db.QueryContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
 		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
 		FROM uploads WHERE target_path = ? AND status = ?
@@ -718,7 +825,7 @@ func (s *Store) ListUploadsByPath(targetPath string, status UploadStatus) ([]*Up
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var uploads []*Upload
+	uploads := make([]*Upload, 0)
 	for rows.Next() {
 		u, err := scanUpload(rows)
 		if err != nil {
@@ -726,7 +833,11 @@ func (s *Store) ListUploadsByPath(targetPath string, status UploadStatus) ([]*Up
 		}
 		uploads = append(uploads, u)
 	}
-	return uploads, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out = uploads
+	return out, nil
 }
 
 // --- scan helpers ---
@@ -1003,7 +1114,32 @@ func normalizeSQL(s string) string {
 	return wsNorm.ReplaceAllString(strings.TrimSpace(s), " ")
 }
 
-func (s *Store) ExecSQL(ctx context.Context, query string) ([]map[string]interface{}, error) {
+func observeStoreOp(ctx context.Context, op string, start time.Time, errp *error) {
+	result := "ok"
+	if errp != nil && *errp != nil {
+		switch {
+		case errors.Is(*errp, ErrNotFound):
+			result = "not_found"
+		case errors.Is(*errp, ErrPathConflict), errors.Is(*errp, ErrUploadConflict):
+			result = "conflict"
+		default:
+			result = "error"
+		}
+		logger.Error(ctx, "datastore_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
+	}
+	metrics.RecordOperation("datastore", op, result, time.Since(start))
+}
+
+func (s *Store) ExecSQL(ctx context.Context, query string) (out []map[string]interface{}, err error) {
+	start := time.Now()
+	defer func() {
+		result := "ok"
+		if err != nil {
+			result = "error"
+		}
+		metrics.RecordOperation("datastore", "exec_sql", result, time.Since(start))
+	}()
+
 	q := strings.TrimSpace(query)
 	norm := strings.ToUpper(normalizeSQL(q))
 
@@ -1052,10 +1188,14 @@ func (s *Store) ExecSQL(ctx context.Context, query string) ([]map[string]interfa
 	}
 
 	if !isSelect && !isTagWrite {
-		return nil, fmt.Errorf("only SELECT queries and INSERT/UPDATE/DELETE on file_tags are allowed")
+		err = fmt.Errorf("only SELECT queries and INSERT/UPDATE/DELETE on file_tags are allowed")
+		logger.Warn(ctx, "datastore_exec_sql_rejected", zap.Int("query_len", len(q)), zap.Error(err))
+		return nil, err
 	}
 	if s == nil || s.db == nil {
-		return nil, fmt.Errorf("database is closed")
+		err = fmt.Errorf("database is closed")
+		logger.Error(ctx, "datastore_exec_sql_closed", zap.Error(err))
+		return nil, err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -1064,6 +1204,7 @@ func (s *Store) ExecSQL(ctx context.Context, query string) ([]map[string]interfa
 	if isTagWrite {
 		res, err := s.db.ExecContext(ctx, q)
 		if err != nil {
+			logger.Error(ctx, "datastore_exec_sql_tag_write_failed", zap.Int("query_len", len(q)), zap.Error(err))
 			return nil, err
 		}
 		affected, _ := res.RowsAffected()
@@ -1072,6 +1213,7 @@ func (s *Store) ExecSQL(ctx context.Context, query string) ([]map[string]interfa
 
 	rows, err := s.db.QueryContext(ctx, q)
 	if err != nil {
+		logger.Error(ctx, "datastore_exec_sql_query_failed", zap.Int("query_len", len(q)), zap.Error(err))
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
@@ -1082,7 +1224,7 @@ func (s *Store) ExecSQL(ctx context.Context, query string) ([]map[string]interfa
 	}
 
 	const maxRows = 1000
-	var result []map[string]interface{}
+	result := make([]map[string]interface{}, 0)
 	for rows.Next() {
 		if len(result) >= maxRows {
 			break
@@ -1106,8 +1248,9 @@ func (s *Store) ExecSQL(ctx context.Context, query string) ([]map[string]interfa
 		}
 		result = append(result, row)
 	}
-	if result == nil {
-		result = []map[string]interface{}{}
+	if err := rows.Err(); err != nil {
+		logger.Error(ctx, "datastore_exec_sql_scan_failed", zap.Int("query_len", len(q)), zap.Error(err))
+		return nil, err
 	}
-	return result, rows.Err()
+	return result, nil
 }
