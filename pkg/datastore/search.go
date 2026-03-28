@@ -6,6 +6,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"go.uber.org/zap"
 )
 
 type SearchResult struct {
@@ -95,6 +98,37 @@ func subtreeCond(prefix string) (string, []any) {
 }
 
 func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limit int) []SearchResult {
+	q, args := buildVectorSearchQuery(query, pathPrefix, limit)
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		logger.Warn(ctx, "datastore_vector_search_query_failed", zap.String("path_prefix", pathPrefix), zap.Int("query_len", len(query)), zap.Int("limit", limit), zap.Error(err))
+		return nil
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []SearchResult
+	for rows.Next() {
+		var r SearchResult
+		var dist float64
+		if err := rows.Scan(&r.Path, &r.Name, &r.SizeBytes, &dist); err != nil {
+			logger.Warn(ctx, "datastore_vector_search_scan_failed", zap.Error(err))
+			break
+		}
+		sc := 1.0 - dist
+		if sc < 0.3 {
+			continue
+		}
+		r.Score = &sc
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		logger.Warn(ctx, "datastore_vector_search_rows_failed", zap.Error(err))
+	}
+	return out
+}
+
+func buildVectorSearchQuery(query, pathPrefix string, limit int) (string, []any) {
 	baseConds := []string{"f.status = 'CONFIRMED'"}
 	var pathArgs []any
 
@@ -129,28 +163,7 @@ func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limi
 		GROUP BY path, name, size_bytes
 		ORDER BY distance
 		LIMIT ?`
-
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil
-	}
-	defer func() { _ = rows.Close() }()
-
-	var out []SearchResult
-	for rows.Next() {
-		var r SearchResult
-		var dist float64
-		if rows.Scan(&r.Path, &r.Name, &r.SizeBytes, &dist) != nil {
-			break
-		}
-		sc := 1.0 - dist
-		if sc < 0.3 {
-			continue
-		}
-		r.Score = &sc
-		out = append(out, r)
-	}
-	return out
+	return q, args
 }
 
 func ftsSafe(s string) string {
