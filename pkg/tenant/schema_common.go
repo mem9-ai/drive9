@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-const autoEmbedModel = "tidbcloud_free/amazon/titan-embed-text-v2"
+const autoEmbedModel = "titan-embed-image-v1"
 
 func execSchemaStatements(db *sql.DB, stmts []string) error {
 	for _, stmt := range stmts {
