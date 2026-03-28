@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -76,7 +77,7 @@ func newAuthServer(t *testing.T) (*Server, string, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := metaStore.InsertTenant(&meta.Tenant{
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantActive,
 		DBHost:           host,
@@ -92,7 +93,7 @@ func newAuthServer(t *testing.T) (*Server, string, func()) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := metaStore.InsertAPIKey(&meta.APIKey{
+	if err := metaStore.InsertAPIKey(context.Background(), &meta.APIKey{
 		ID:            tenant.NewID(),
 		TenantID:      tenantID,
 		KeyName:       "default",

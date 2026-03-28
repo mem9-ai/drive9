@@ -15,7 +15,9 @@ require (
 	github.com/jackc/pgx/v5 v5.9.1
 	github.com/oklog/ulid/v2 v2.1.0
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.41.0
+	go.uber.org/zap v1.27.0
 	golang.org/x/text v0.35.0
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
 require (
@@ -85,6 +87,7 @@ require (
 	go.opentelemetry.io/otel v1.41.0 // indirect
 	go.opentelemetry.io/otel/metric v1.41.0 // indirect
 	go.opentelemetry.io/otel/trace v1.41.0 // indirect
+	go.uber.org/multierr v1.10.0 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,9 +16,12 @@ import (
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/traceid"
+	"go.uber.org/zap"
 )
 
 type Config struct {
@@ -31,6 +33,7 @@ type Config struct {
 	LocalS3        *s3client.LocalS3Client
 	S3Dir          string
 	MaxUploadBytes int64
+	Logger         *zap.Logger
 }
 
 type Server struct {
@@ -40,6 +43,8 @@ type Server struct {
 	provisioner    tenant.Provisioner
 	tokenSecret    []byte
 	maxUploadBytes int64
+	metrics        *serverMetrics
+	logger         *zap.Logger
 	mux            *http.ServeMux
 }
 
@@ -60,6 +65,10 @@ func NewWithConfig(cfg Config) *Server {
 	if maxUpload <= 0 {
 		maxUpload = defaultMaxUploadBytes
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger, _ = zap.NewProduction()
+	}
 	s := &Server{
 		fallback:       cfg.Backend,
 		meta:           cfg.Meta,
@@ -67,6 +76,8 @@ func NewWithConfig(cfg Config) *Server {
 		tokenSecret:    cfg.TokenSecret,
 		provisioner:    cfg.Provisioner,
 		maxUploadBytes: maxUpload,
+		metrics:        newServerMetrics(),
+		logger:         logger,
 	}
 	mux := http.NewServeMux()
 
@@ -82,6 +93,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/sql", business)
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	local := cfg.LocalS3
 	if local == nil && cfg.Backend != nil {
@@ -99,7 +111,7 @@ func NewWithConfig(cfg Config) *Server {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			b := cfg.Pool.LoadS3Backend(cfg.Meta, tenantID)
+			b := cfg.Pool.LoadS3Backend(r.Context(), cfg.Meta, tenantID)
 			if b == nil || b.S3() == nil {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
@@ -122,9 +134,10 @@ func NewWithConfig(cfg Config) *Server {
 }
 
 func (s *Server) resumeProvisioningTenants() {
-	tenants, err := s.meta.ListTenantsByStatus(meta.TenantProvisioning, 1000)
+	ctx := backgroundWithTrace(context.Background())
+	tenants, err := s.meta.ListTenantsByStatus(ctx, meta.TenantProvisioning, 1000)
 	if err != nil {
-		log.Printf("list provisioning tenants failed: %v", err)
+		logger.Error(ctx, "resume_provisioning_list_failed", zap.Error(err))
 		return
 	}
 	for i := range tenants {
@@ -134,13 +147,22 @@ func (s *Server) resumeProvisioningTenants() {
 }
 
 func (s *Server) resumeTenantSchemaInit(t meta.Tenant) {
+	ctx := backgroundWithTrace(context.Background())
 	plain, err := s.pool.Decrypt(t.DBPasswordCipher)
 	if err != nil {
-		log.Printf("resume tenant schema init skipped: decrypt db password failed (tenant=%s): %v", t.ID, err)
+		logger.Warn(ctx, "resume_schema_init_skipped", zap.String("tenant_id", t.ID), zap.Error(err))
 		return
 	}
 	dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
-	s.initTenantSchemaAsync(t.ID, dsn, t.Provider, s.provisioner.InitSchema)
+	s.initTenantSchemaAsync(ctx, t.ID, dsn, t.Provider, s.provisioner.InitSchema)
+}
+
+func backgroundWithTrace(ctx context.Context) context.Context {
+	traceID := traceid.FromContext(ctx)
+	if traceID == "" {
+		traceID = traceid.Generate()
+	}
+	return traceid.With(context.Background(), traceID)
 }
 
 func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled bool) string {
@@ -159,11 +181,11 @@ func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handl
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.mux.ServeHTTP(w, r)
+	s.observe(s.mux, w, r)
 }
 
 func (s *Server) ListenAndServe(addr string) error {
-	log.Printf("dat9 server listening on %s", addr)
+	logger.Info(backgroundWithTrace(context.Background()), "server_start", zap.String("addr", addr), zap.Int64("max_upload_bytes", s.maxUploadBytes))
 	return http.ListenAndServe(addr, s)
 }
 
@@ -178,61 +200,74 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/v1/sql":
 		s.handleSQL(w, r)
 	default:
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "business_route_not_found", "path", r.URL.Path, "method", r.Method)...)
 		errJSON(w, http.StatusNotFound, "not found")
 	}
 }
 
 func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_method_not_allowed", "method", r.Method)...)
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	if s.meta == nil || s.pool == nil || len(s.tokenSecret) == 0 {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_not_enabled")...)
 		errJSON(w, http.StatusNotFound, "tenant status not enabled")
 		return
 	}
 	tok := bearerToken(r)
 	if tok == "" {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_missing_token")...)
 		errJSON(w, http.StatusUnauthorized, "missing or malformed Authorization header")
 		return
 	}
 
-	resolved, err := s.meta.ResolveByAPIKeyHash(tenant.HashToken(tok))
+	resolved, err := s.meta.ResolveByAPIKeyHash(r.Context(), tenant.HashToken(tok))
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_key_not_found")...)
 			errJSON(w, http.StatusUnauthorized, "invalid API key")
 			return
 		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_meta_unavailable", "error", err)...)
 		errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(tenant.HashToken(tok)), []byte(resolved.APIKey.JWTHash)) != 1 {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_hash_mismatch", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
 	if resolved.APIKey.Status != meta.APIKeyActive {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_key_inactive", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "status", resolved.APIKey.Status)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
 	plain, err := poolDecryptToken(s.pool, resolved.APIKey.JWTCiphertext)
 	if err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_decrypt_failed", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(tok), plain) != 1 {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_token_mismatch", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
 	claims, err := tenant.ParseAndVerifyToken(s.tokenSecret, tok)
 	if err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_token_invalid", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
 	if claims.TenantID != resolved.Tenant.ID || claims.TokenVersion != resolved.APIKey.TokenVersion {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_claims_mismatch", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "claim_tenant", claims.TenantID, "claim_version", claims.TokenVersion)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
 
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": string(resolved.Tenant.Status)})
 }
 
@@ -275,9 +310,11 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 		} else if r.URL.Query().Has("mkdir") {
 			s.handleMkdir(w, r, path)
 		} else {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_unknown_post_action", "path", path)...)
 			errJSON(w, http.StatusBadRequest, "unknown POST action")
 		}
 	default:
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_method_not_allowed", "path", path, "method", r.Method)...)
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
@@ -285,26 +322,36 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string) {
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "read_missing_scope", "path", path)...)
+		metricEvent(r.Context(), "fs_read", "result", "error")
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
 	if b.S3() != nil {
 		url, err := b.PresignGetObject(r.Context(), path)
 		if err == nil {
+			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_presigned_redirect", "path", path)...)
+			metricEvent(r.Context(), "fs_read", "result", "ok")
 			http.Redirect(w, r, url, http.StatusFound)
 			return
 		}
 	}
 
-	data, err := b.Read(path, 0, -1)
+	data, err := b.ReadCtx(r.Context(), path, 0, -1)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "read_not_found", "path", path)...)
+			metricEvent(r.Context(), "fs_read", "result", "error")
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "read_failed", "path", path, "error", err)...)
+		metricEvent(r.Context(), "fs_read", "result", "error")
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_ok", "path", path, "bytes", len(data))...)
+	metricEvent(r.Context(), "fs_read", "result", "ok")
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	_, _ = w.Write(data)
@@ -313,18 +360,24 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string) {
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "list_missing_scope", "path", path)...)
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	entries, err := b.ReadDir(path)
+	entries, err := b.ReadDirCtx(r.Context(), path)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "list_not_found", "path", path)...)
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "list_failed", "path", path, "error", err)...)
+		metricEvent(r.Context(), "userdb_query", "api", "list", "result", "error")
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	metricEvent(r.Context(), "userdb_query", "api", "list", "result", "ok")
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "list_ok", "path", path, "entries", len(entries))...)
 	type entry struct {
 		Name  string `json:"name"`
 		Size  int64  `json:"size"`
@@ -341,6 +394,8 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string) {
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_missing_scope", "path", path)...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
@@ -349,42 +404,60 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	if h := r.Header.Get("X-Dat9-Content-Length"); h != "" {
 		parsed, err := strconv.ParseInt(h, 10, 64)
 		if err != nil || parsed < 0 {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_invalid_declared_length", "path", path, "header", h)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSON(w, http.StatusBadRequest, "invalid X-Dat9-Content-Length")
 			return
 		}
 		if actualCL > 0 && parsed > 0 && actualCL != parsed {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_length_mismatch", "path", path, "content_length", actualCL, "declared_length", parsed)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSON(w, http.StatusBadRequest, "Content-Length and X-Dat9-Content-Length mismatch")
 			return
 		}
 		cl = parsed
 	}
 	if cl > s.maxUploadBytes {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_too_large", "path", path, "bytes", cl, "max", s.maxUploadBytes)...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
 		errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
 		return
 	}
 	if cl > 0 && b.IsLargeFile(cl) {
 		partChecksums, err := parsePartChecksumsHeader(r.Header.Get("X-Dat9-Part-Checksums"))
 		if err != nil {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_bad_checksums_header", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if len(partChecksums) == 0 {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_missing_checksums_header", "path", path)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSON(w, http.StatusBadRequest, "missing X-Dat9-Part-Checksums header")
 			return
 		}
 		plan, err := b.InitiateUploadWithChecksums(r.Context(), path, cl, partChecksums)
 		if err != nil {
 			if errors.Is(err, backend.ErrPartChecksumCountMismatch) {
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_checksum_count_mismatch", "path", path, "error", err)...)
+				metricEvent(r.Context(), "fs_write", "result", "error")
 				errJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			if errors.Is(err, datastore.ErrUploadConflict) {
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_upload_conflict", "path", path, "error", err)...)
+				metricEvent(r.Context(), "fs_write", "result", "conflict")
 				errJSON(w, http.StatusConflict, err.Error())
 				return
 			}
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_upload_initiate_failed", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "write_upload_initiated", "path", path, "parts", len(plan.Parts))...)
+		metricEvent(r.Context(), "fs_write", "result", "accepted")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(plan)
@@ -395,32 +468,43 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_body_too_large", "path", path, "max", s.maxUploadBytes)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
 			return
 		}
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_body_read_failed", "path", path, "error", err)...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
 		errJSON(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}
-	_, err = b.Write(path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate)
+	_, err = b.WriteCtx(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate)
 	if err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_failed", "path", path, "error", err)...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "write_ok", "path", path, "bytes", len(data))...)
+	metricEvent(r.Context(), "fs_write", "result", "ok")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string) {
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "stat_missing_scope", "path", path)...)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
-	nf, err := b.Store().Stat(path)
+	nf, err := b.Store().Stat(r.Context(), path)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "stat_not_found", "path", path)...)
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_failed", "path", path, "error", err)...)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -433,102 +517,123 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	if nf.File != nil {
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(nf.File.Revision, 10))
 	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_ok", "path", path, "is_dir", nf.Node.IsDirectory)...)
 	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path string) {
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "delete_missing_scope", "path", path)...)
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
 	recursive := r.URL.Query().Has("recursive")
 	var err error
 	if recursive {
-		err = b.RemoveAll(path)
+		err = b.RemoveAllCtx(r.Context(), path)
 	} else {
-		err = b.Remove(path)
+		err = b.RemoveCtx(r.Context(), path)
 	}
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "delete_not_found", "path", path, "recursive", recursive)...)
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "delete_failed", "path", path, "recursive", recursive, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "delete_ok", "path", path, "recursive", recursive)...)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath string) {
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "copy_missing_scope", "dst_path", dstPath)...)
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
 	srcPath := r.Header.Get("X-Dat9-Copy-Source")
 	if srcPath == "" {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "copy_missing_source_header", "dst_path", dstPath)...)
 		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Copy-Source header")
 		return
 	}
-	if err := b.CopyFile(srcPath, dstPath); err != nil {
+	if err := b.CopyFileCtx(r.Context(), srcPath, dstPath); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "copy_not_found", "src_path", srcPath, "dst_path", dstPath)...)
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "copy_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "copy_ok", "src_path", srcPath, "dst_path", dstPath)...)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath string) {
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "rename_missing_scope", "new_path", newPath)...)
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
 	oldPath := r.Header.Get("X-Dat9-Rename-Source")
 	if oldPath == "" {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "rename_missing_source_header", "new_path", newPath)...)
 		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Rename-Source header")
 		return
 	}
-	if err := b.Rename(oldPath, newPath); err != nil {
+	if err := b.RenameCtx(r.Context(), oldPath, newPath); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "rename_not_found", "old_path", oldPath, "new_path", newPath)...)
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "rename_failed", "old_path", oldPath, "new_path", newPath, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "rename_ok", "old_path", oldPath, "new_path", newPath)...)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string) {
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "mkdir_missing_scope", "path", path)...)
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	if err := b.Mkdir(path, 0o755); err != nil {
+	if err := b.MkdirCtx(r.Context(), path, 0o755); err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "mkdir_failed", "path", path, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "mkdir_ok", "path", path)...)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "uploads_missing_scope")...)
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
 	if r.Method != http.MethodGet {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "uploads_method_not_allowed", "method", r.Method)...)
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	path := r.URL.Query().Get("path")
 	if path == "" {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "uploads_missing_path")...)
 		errJSON(w, http.StatusBadRequest, "missing path parameter")
 		return
 	}
@@ -536,11 +641,15 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 	if status == "" {
 		status = string(datastore.UploadUploading)
 	}
-	uploads, err := b.ListUploads(path, datastore.UploadStatus(status))
+	uploads, err := b.ListUploads(r.Context(), path, datastore.UploadStatus(status))
 	if err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "uploads_list_failed", "path", path, "status", status, "error", err)...)
+		metricEvent(r.Context(), "metadb_query", "api", "uploads_list", "result", "error")
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	metricEvent(r.Context(), "metadb_query", "api", "uploads_list", "result", "ok")
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "uploads_list_ok", "path", path, "status", status, "count", len(uploads))...)
 	type uploadEntry struct {
 		UploadID   string `json:"upload_id"`
 		Path       string `json:"path"`
@@ -574,6 +683,7 @@ func (s *Server) handleUploadAction(w http.ResponseWriter, r *http.Request) {
 		action = strings.Trim(parts[1], "/")
 	}
 	if uploadID == "" {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_action_missing_upload_id", "path", r.URL.Path)...)
 		errJSON(w, http.StatusBadRequest, "missing upload ID")
 		return
 	}
@@ -585,6 +695,7 @@ func (s *Server) handleUploadAction(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodDelete && action == "":
 		s.handleUploadAbort(w, r, uploadID)
 	default:
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_action_unknown", "upload_id", uploadID, "action", action, "method", r.Method)...)
 		errJSON(w, http.StatusBadRequest, "unknown upload action")
 	}
 }
@@ -592,60 +703,88 @@ func (s *Server) handleUploadAction(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, uploadID string) {
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_missing_scope", "upload_id", uploadID)...)
+		metricEvent(r.Context(), "upload_complete", "result", "error")
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
 	if err := b.ConfirmUpload(r.Context(), uploadID); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_not_found", "upload_id", uploadID)...)
+			metricEvent(r.Context(), "upload_complete", "result", "error")
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
 		if errors.Is(err, datastore.ErrUploadNotActive) || errors.Is(err, datastore.ErrPathConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_conflict", "upload_id", uploadID, "error", err)...)
+			metricEvent(r.Context(), "upload_complete", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_failed", "upload_id", uploadID, "error", err)...)
+		metricEvent(r.Context(), "upload_complete", "result", "error")
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_ok", "upload_id", uploadID)...)
+	metricEvent(r.Context(), "upload_complete", "result", "ok")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uploadID string) {
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_missing_scope", "upload_id", uploadID)...)
+		metricEvent(r.Context(), "upload_resume", "result", "error")
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
 	partChecksums, err := parsePartChecksumsHeader(r.Header.Get("X-Dat9-Part-Checksums"))
 	if err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_bad_checksums", "upload_id", uploadID, "error", err)...)
+		metricEvent(r.Context(), "upload_resume", "result", "error")
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if len(partChecksums) == 0 {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_missing_checksums", "upload_id", uploadID)...)
+		metricEvent(r.Context(), "upload_resume", "result", "error")
 		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Part-Checksums header")
 		return
 	}
 	plan, err := b.ResumeUploadWithChecksums(r.Context(), uploadID, partChecksums)
 	if err != nil {
 		if errors.Is(err, backend.ErrPartChecksumCountMismatch) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_checksum_count_mismatch", "upload_id", uploadID, "error", err)...)
+			metricEvent(r.Context(), "upload_resume", "result", "error")
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_not_found", "upload_id", uploadID)...)
+			metricEvent(r.Context(), "upload_resume", "result", "error")
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
 		if errors.Is(err, datastore.ErrUploadExpired) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_expired", "upload_id", uploadID)...)
+			metricEvent(r.Context(), "upload_resume", "result", "error")
 			errJSON(w, http.StatusGone, err.Error())
 			return
 		}
 		if errors.Is(err, datastore.ErrUploadNotActive) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_not_active", "upload_id", uploadID)...)
+			metricEvent(r.Context(), "upload_resume", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_failed", "upload_id", uploadID, "error", err)...)
+		metricEvent(r.Context(), "upload_resume", "result", "error")
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_ok", "upload_id", uploadID, "parts", len(plan.Parts))...)
+	metricEvent(r.Context(), "upload_resume", "result", "ok")
 	_ = json.NewEncoder(w).Encode(plan)
 }
 
@@ -676,44 +815,63 @@ func parsePartChecksumsHeader(raw string) ([]string, error) {
 func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploadID string) {
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_abort_missing_scope", "upload_id", uploadID)...)
+		metricEvent(r.Context(), "upload_abort", "result", "error")
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
 	if err := b.AbortUpload(r.Context(), uploadID); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_abort_not_found", "upload_id", uploadID)...)
+			metricEvent(r.Context(), "upload_abort", "result", "error")
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_abort_failed", "upload_id", uploadID, "error", err)...)
+		metricEvent(r.Context(), "upload_abort", "result", "error")
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_abort_ok", "upload_id", uploadID)...)
+	metricEvent(r.Context(), "upload_abort", "result", "ok")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_method_not_allowed", "method", r.Method)...)
+		metricEvent(r.Context(), "tenant_provision", "result", "error")
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	if s.meta == nil || s.pool == nil || len(s.tokenSecret) == 0 {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_not_enabled")...)
+		metricEvent(r.Context(), "tenant_provision", "result", "error")
 		errJSON(w, http.StatusNotFound, "provisioning not enabled")
 		return
 	}
 	if s.provisioner == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provisioner_not_configured")...)
+		metricEvent(r.Context(), "tenant_provision", "result", "error")
 		errJSON(w, http.StatusNotFound, "provisioner not configured")
 		return
 	}
 	provider := s.provisioner.ProviderType()
 	provider, err := tenant.NormalizeProvider(provider)
 	if err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_provider_invalid", "provider", provider, "error", err)...)
+		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	tenantID := tenant.NewID()
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_requested", "tenant_id", tenantID, "provider", provider)...)
 	keyName := "default"
 
 	token, err := tenant.IssueToken(s.tokenSecret, tenantID, 1)
 	if err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_issue_token_failed", "tenant_id", tenantID, "error", err)...)
+		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 		errJSON(w, http.StatusInternalServerError, "failed to issue token")
 		return
 	}
@@ -721,6 +879,8 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	cluster, err := s.provisioner.Provision(r.Context(), tenantID)
 	if err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "cluster_error")
 		errJSON(w, http.StatusBadGateway, fmt.Sprintf("provision tenant cluster failed: %v", err))
 		return
 	}
@@ -728,16 +888,20 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	cipherPass, err := s.pool.Encrypt([]byte(cluster.Password))
 	if err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_encrypt_db_password_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 		errJSON(w, http.StatusInternalServerError, "failed to encrypt db password")
 		return
 	}
 	cipherToken, err := s.pool.Encrypt([]byte(token))
 	if err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_encrypt_api_key_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 		errJSON(w, http.StatusInternalServerError, "failed to encrypt api key")
 		return
 	}
 
-	if err := s.meta.InsertTenant(&meta.Tenant{
+	if err := s.meta.InsertTenant(r.Context(), &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantProvisioning,
 		DBHost:           cluster.Host,
@@ -754,11 +918,15 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}); err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_insert_tenant_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+		metricEvent(r.Context(), "metadb_query", "api", "insert_tenant", "result", "error")
 		errJSON(w, http.StatusInternalServerError, "failed to persist tenant")
 		return
 	}
+	metricEvent(r.Context(), "metadb_query", "api", "insert_tenant", "result", "ok")
 	apiKeyID := tenant.NewID()
-	if err := s.meta.InsertAPIKey(&meta.APIKey{
+	if err := s.meta.InsertAPIKey(r.Context(), &meta.APIKey{
 		ID:            apiKeyID,
 		TenantID:      tenantID,
 		KeyName:       keyName,
@@ -770,14 +938,20 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}); err != nil {
-		_ = s.meta.UpdateTenantStatus(tenantID, meta.TenantDeleted)
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_insert_api_key_failed", "tenant_id", tenantID, "api_key_id", apiKeyID, "error", err)...)
+		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+		metricEvent(r.Context(), "metadb_query", "api", "insert_api_key", "result", "error")
+		_ = s.meta.UpdateTenantStatus(r.Context(), tenantID, meta.TenantDeleted)
 		errJSON(w, http.StatusInternalServerError, "failed to persist api key")
 		return
 	}
+	metricEvent(r.Context(), "metadb_query", "api", "insert_api_key", "result", "ok")
 
 	// Initialize tenant schema asynchronously; tenant remains in provisioning state until success.
 	dsn := tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true)
-	go s.initTenantSchemaAsync(tenantID, dsn, provider, s.provisioner.InitSchema)
+	go s.initTenantSchemaAsync(backgroundWithTrace(r.Context()), tenantID, dsn, provider, s.provisioner.InitSchema)
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_accepted", "tenant_id", tenantID, "provider", provider)...)
+	metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "accepted")
 
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{
@@ -786,26 +960,42 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) initTenantSchemaAsync(tenantID, tenantDSN, provider string, schemaInit func(context.Context, string) error) {
+func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN, provider string, schemaInit func(context.Context, string) error) {
+	ctx = backgroundWithTrace(ctx)
+	logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_started", "tenant_id", tenantID, "provider", provider)...)
 	deadline := time.Now().Add(schemaInitRetryWindow)
 	backoff := schemaInitInitialBackoff
 	attempt := 1
 	for {
-		if err := schemaInit(context.Background(), tenantDSN); err == nil {
-			if err := s.meta.UpdateTenantStatus(tenantID, meta.TenantActive); err != nil {
-				log.Printf("activate tenant %s failed after schema init: %v", tenantID, err)
+		if err := schemaInit(ctx, tenantDSN); err == nil {
+			logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_ok", "tenant_id", tenantID, "provider", provider, "attempt", attempt)...)
+			if s.metrics != nil {
+				s.metrics.recordEvent("tenant_schema_init", "provider", provider, "result", "ok")
+			}
+			if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantActive); err != nil {
+				logger.Error(ctx, "schema_init_activate_failed", zap.String("tenant_id", tenantID), zap.Error(err))
 			}
 			return
 		} else {
+			logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", err)...)
+			if s.metrics != nil {
+				s.metrics.recordEvent("tenant_schema_init", "provider", provider, "result", "error")
+			}
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
-				if uerr := s.meta.UpdateTenantStatus(tenantID, meta.TenantFailed); uerr != nil {
-					log.Printf("mark tenant %s failed after init retries exhausted: update status failed: %v", tenantID, uerr)
+				if uerr := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed); uerr != nil {
+					logger.Error(ctx, "schema_init_mark_failed_update_error", zap.String("tenant_id", tenantID), zap.Error(uerr))
 				}
-				log.Printf("tenant %s marked failed after schema init retries exhausted: %v", tenantID, err)
+				logger.Error(ctx, "schema_init_retry_exhausted", zap.String("tenant_id", tenantID), zap.Error(err))
 				return
 			}
-			log.Printf("init tenant schema failed (tenant=%s provider=%s attempt=%d remaining=%s): %v", tenantID, provider, attempt, remaining.Round(time.Second), err)
+			logger.Warn(ctx, "schema_init_attempt_failed",
+				zap.String("tenant_id", tenantID),
+				zap.String("provider", provider),
+				zap.Int("attempt", attempt),
+				zap.String("remaining", remaining.Round(time.Second).String()),
+				zap.Error(err),
+			)
 		}
 		sleepFor := backoff
 		if sleepFor > schemaInitMaxBackoff {
@@ -830,12 +1020,14 @@ func errJSON(w http.ResponseWriter, code int, msg string) {
 
 func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "sql_method_not_allowed", "method", r.Method)...)
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "sql_missing_scope")...)
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
@@ -844,19 +1036,25 @@ func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request) {
 		Query string `json:"query"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "sql_bad_json", "error", err)...)
 		errJSON(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
 	if req.Query == "" {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "sql_empty_query")...)
 		errJSON(w, http.StatusBadRequest, "empty query")
 		return
 	}
 
 	rows, err := b.ExecSQL(r.Context(), req.Query)
 	if err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "sql_exec_failed", "query_len", len(req.Query), "error", err)...)
+		metricEvent(r.Context(), "userdb_query", "api", "sql", "result", "error")
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	metricEvent(r.Context(), "userdb_query", "api", "sql", "result", "ok")
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "sql_exec_ok", "query_len", len(req.Query), "rows", len(rows))...)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(rows)
@@ -865,11 +1063,13 @@ func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string) {
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "grep_missing_scope", "path", path)...)
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
 	query := r.URL.Query().Get("grep")
 	if query == "" {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "grep_empty_query", "path", path)...)
 		errJSON(w, http.StatusBadRequest, "empty grep query")
 		return
 	}
@@ -877,6 +1077,7 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 	if v := r.URL.Query().Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "grep_invalid_limit", "path", path, "limit", v)...)
 			errJSON(w, http.StatusBadRequest, "invalid limit: "+v)
 			return
 		}
@@ -884,9 +1085,13 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 	}
 	results, err := b.Grep(r.Context(), query, path, limit)
 	if err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_failed", "path", path, "query_len", len(query), "limit", limit, "error", err)...)
+		metricEvent(r.Context(), "userdb_query", "api", "grep", "result", "error")
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	metricEvent(r.Context(), "userdb_query", "api", "grep", "result", "ok")
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "grep_ok", "path", path, "query_len", len(query), "limit", limit, "results", len(results))...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(results)
 }
@@ -894,6 +1099,7 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string) {
 	b := backendFromRequest(r)
 	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "find_missing_scope", "path", path)...)
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
@@ -908,6 +1114,7 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 	if v := q.Get("newer"); v != "" {
 		t, err := time.Parse("2006-01-02", v)
 		if err != nil {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "find_invalid_newer", "path", path, "value", v)...)
 			errJSON(w, http.StatusBadRequest, "invalid newer date: "+v)
 			return
 		}
@@ -916,6 +1123,7 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 	if v := q.Get("older"); v != "" {
 		t, err := time.Parse("2006-01-02", v)
 		if err != nil {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "find_invalid_older", "path", path, "value", v)...)
 			errJSON(w, http.StatusBadRequest, "invalid older date: "+v)
 			return
 		}
@@ -924,6 +1132,7 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 	if v := q.Get("minsize"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "find_invalid_minsize", "path", path, "value", v)...)
 			errJSON(w, http.StatusBadRequest, "invalid minsize: "+v)
 			return
 		}
@@ -932,6 +1141,7 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 	if v := q.Get("maxsize"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "find_invalid_maxsize", "path", path, "value", v)...)
 			errJSON(w, http.StatusBadRequest, "invalid maxsize: "+v)
 			return
 		}
@@ -940,6 +1150,7 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 	if v := q.Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "find_invalid_limit", "path", path, "value", v)...)
 			errJSON(w, http.StatusBadRequest, "invalid limit: "+v)
 			return
 		}
@@ -947,9 +1158,13 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 	}
 	results, err := b.Find(r.Context(), f)
 	if err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "find_failed", "path", path, "error", err)...)
+		metricEvent(r.Context(), "userdb_query", "api", "find", "result", "error")
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	metricEvent(r.Context(), "userdb_query", "api", "find", "result", "ok")
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "find_ok", "path", path, "results", len(results), "name", f.NameGlob, "tag_key", f.TagKey)...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(results)
 }

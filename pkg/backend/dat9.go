@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -17,9 +18,13 @@ import (
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
 	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/dat9/pkg/traceid"
 	"github.com/oklog/ulid/v2"
+	"go.uber.org/zap"
 )
 
 const smallFileThreshold = 1 << 20 // 1MB
@@ -72,7 +77,14 @@ func (b *Dat9Backend) genID() string {
 }
 
 func (b *Dat9Backend) Create(path string) error {
-	path, err := pathutil.Canonicalize(path)
+	return b.CreateCtx(backgroundWithTrace(), path)
+}
+
+func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "create", err, start) }()
+
+	path, err = pathutil.Canonicalize(path)
 	if err != nil {
 		return err
 	}
@@ -90,86 +102,120 @@ func (b *Dat9Backend) Create(path string) error {
 		}
 		storageType = datastore.StorageS3
 		storageRef = "blobs/" + fileID
-		if err := b.s3.PutObject(context.Background(), storageRef, bytes.NewReader(nil), 0); err != nil {
+		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(nil), 0); err != nil {
+			logger.Error(ctx, "backend_create_put_object_failed", zap.String("path", path), zap.String("storage_ref", storageRef), zap.Error(err))
 			return fmt.Errorf("put object: %w", err)
 		}
 	}
 
-	if err := b.store.InsertFile(&datastore.File{
+	err = b.store.InsertFile(ctx, &datastore.File{
 		FileID: fileID, StorageType: storageType, StorageRef: storageRef,
 		ContentBlob: contentBlob,
 		SizeBytes:   0, Revision: 1, Status: datastore.StatusConfirmed,
 		CreatedAt: now, ConfirmedAt: &now,
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
-	if err := b.store.EnsureParentDirs(path, b.genID); err != nil {
+	err = b.store.EnsureParentDirs(ctx, path, b.genID)
+	if err != nil {
 		return err
 	}
-	return b.store.InsertNode(&datastore.FileNode{
+	err = b.store.InsertNode(ctx, &datastore.FileNode{
 		NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
 		Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
 	})
+	return err
 }
 
 func (b *Dat9Backend) Mkdir(path string, perm uint32) error {
+	return b.MkdirCtx(backgroundWithTrace(), path, perm)
+}
+
+func (b *Dat9Backend) MkdirCtx(ctx context.Context, path string, perm uint32) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "mkdir", err, start) }()
+
 	dirPath, err := pathutil.CanonicalizeDir(path)
 	if err != nil {
 		return err
 	}
-	if err := b.store.EnsureParentDirs(dirPath, b.genID); err != nil {
+	err = b.store.EnsureParentDirs(ctx, dirPath, b.genID)
+	if err != nil {
 		return err
 	}
-	return b.store.InsertNode(&datastore.FileNode{
+	err = b.store.InsertNode(ctx, &datastore.FileNode{
 		NodeID: b.genID(), Path: dirPath, ParentPath: pathutil.ParentPath(dirPath),
 		Name: pathutil.BaseName(dirPath), IsDirectory: true, CreatedAt: time.Now(),
 	})
+	return err
 }
 
 func (b *Dat9Backend) Remove(path string) error {
+	return b.RemoveCtx(backgroundWithTrace(), path)
+}
+
+func (b *Dat9Backend) RemoveCtx(ctx context.Context, path string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "remove", err, start) }()
+
 	path = normalizePath(path)
-	node, err := b.store.GetNode(path)
+	node, err := b.store.GetNode(ctx, path)
 	if err != nil {
 		return err
 	}
 	if node.IsDirectory {
-		return b.store.DeleteEmptyDir(path)
+		return b.store.DeleteEmptyDir(ctx, path)
 	}
-	deleted, err := b.store.DeleteFileWithRefCheck(path)
+	deleted, err := b.store.DeleteFileWithRefCheck(ctx, path)
 	if err != nil {
 		return err
 	}
 	if deleted != nil {
-		b.deleteBlob(deleted.StorageRef)
+		b.deleteBlobCtx(ctx, deleted.StorageRef)
 	}
 	return nil
 }
 
 func (b *Dat9Backend) RemoveAll(path string) error {
+	return b.RemoveAllCtx(backgroundWithTrace(), path)
+}
+
+func (b *Dat9Backend) RemoveAllCtx(ctx context.Context, path string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "remove_all", err, start) }()
+
 	path = normalizePath(path)
-	node, err := b.store.GetNode(path)
+	node, err := b.store.GetNode(ctx, path)
 	if err != nil {
 		return err
 	}
 	if !node.IsDirectory {
-		return b.Remove(path)
+		return b.RemoveCtx(ctx, path)
 	}
-	orphaned, err := b.store.DeleteDirRecursive(path)
+	orphaned, err := b.store.DeleteDirRecursive(ctx, path)
 	if err != nil {
 		return err
 	}
 	for _, f := range orphaned {
-		b.deleteBlob(f.StorageRef)
+		b.deleteBlobCtx(ctx, f.StorageRef)
 	}
 	return nil
 }
 
 func (b *Dat9Backend) Read(path string, offset int64, size int64) ([]byte, error) {
-	path, err := pathutil.Canonicalize(path)
+	return b.ReadCtx(backgroundWithTrace(), path, offset, size)
+}
+
+func (b *Dat9Backend) ReadCtx(ctx context.Context, path string, offset int64, size int64) (data []byte, err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "read", err, start) }()
+
+	path, err = pathutil.Canonicalize(path)
 	if err != nil {
 		return nil, err
 	}
-	nf, err := b.store.Stat(path)
+	nf, err := b.store.Stat(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -180,7 +226,7 @@ func (b *Dat9Backend) Read(path string, offset int64, size int64) ([]byte, error
 		return nil, fmt.Errorf("no file entity for path: %s", path)
 	}
 
-	data, err := b.readFileData(nf.File)
+	data, err = b.readFileDataCtx(ctx, nf.File)
 	if err != nil {
 		return nil, err
 	}
@@ -197,17 +243,24 @@ func (b *Dat9Backend) Read(path string, offset int64, size int64) ([]byte, error
 }
 
 func (b *Dat9Backend) Write(path string, data []byte, offset int64, flags filesystem.WriteFlag) (int64, error) {
-	path, err := pathutil.Canonicalize(path)
+	return b.WriteCtx(backgroundWithTrace(), path, data, offset, flags)
+}
+
+func (b *Dat9Backend) WriteCtx(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag) (n int64, err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "write", err, start) }()
+
+	path, err = pathutil.Canonicalize(path)
 	if err != nil {
 		return 0, err
 	}
 
-	existing, err := b.store.Stat(path)
+	existing, err := b.store.Stat(ctx, path)
 	if err == datastore.ErrNotFound {
 		if flags&filesystem.WriteFlagCreate == 0 {
 			return 0, datastore.ErrNotFound
 		}
-		return b.createAndWrite(path, data)
+		return b.createAndWriteCtx(ctx, path, data)
 	}
 	if err != nil {
 		return 0, err
@@ -218,10 +271,10 @@ func (b *Dat9Backend) Write(path string, data []byte, offset int64, flags filesy
 	if flags&filesystem.WriteFlagExclusive != 0 {
 		return 0, fmt.Errorf("file already exists: %s", path)
 	}
-	return b.overwriteFile(existing, data, offset, flags)
+	return b.overwriteFileCtx(ctx, existing, data, offset, flags)
 }
 
-func (b *Dat9Backend) createAndWrite(path string, data []byte) (int64, error) {
+func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte) (int64, error) {
 	fileID := b.genID()
 	now := time.Now()
 
@@ -240,12 +293,13 @@ func (b *Dat9Backend) createAndWrite(path string, data []byte) (int64, error) {
 		}
 		storageType = datastore.StorageS3
 		storageRef = "blobs/" + fileID
-		if err := b.s3.PutObject(context.Background(), storageRef, bytes.NewReader(data), int64(len(data))); err != nil {
+		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(data), int64(len(data))); err != nil {
+			logger.Error(ctx, "backend_create_and_write_put_object_failed", zap.String("path", path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(data)), zap.Error(err))
 			return 0, fmt.Errorf("put object: %w", err)
 		}
 	}
 
-	if err := b.store.InsertFile(&datastore.File{
+	if err := b.store.InsertFile(ctx, &datastore.File{
 		FileID: fileID, StorageType: storageType, StorageRef: storageRef,
 		ContentBlob: contentBlob,
 		ContentType: contentType, SizeBytes: int64(len(data)),
@@ -254,10 +308,10 @@ func (b *Dat9Backend) createAndWrite(path string, data []byte) (int64, error) {
 	}); err != nil {
 		return 0, err
 	}
-	if err := b.store.EnsureParentDirs(path, b.genID); err != nil {
+	if err := b.store.EnsureParentDirs(ctx, path, b.genID); err != nil {
 		return 0, err
 	}
-	if err := b.store.InsertNode(&datastore.FileNode{
+	if err := b.store.InsertNode(ctx, &datastore.FileNode{
 		NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
 		Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
 	}); err != nil {
@@ -266,14 +320,14 @@ func (b *Dat9Backend) createAndWrite(path string, data []byte) (int64, error) {
 	return int64(len(data)), nil
 }
 
-func (b *Dat9Backend) overwriteFile(nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag) (int64, error) {
+func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag) (int64, error) {
 	if nf.File == nil {
 		return 0, fmt.Errorf("no file entity")
 	}
 
 	var finalData []byte
 	if flags&filesystem.WriteFlagAppend != 0 {
-		existing, err := b.readFileData(nf.File)
+		existing, err := b.readFileDataCtx(ctx, nf.File)
 		if err != nil {
 			return 0, fmt.Errorf("read existing data for append: %w", err)
 		}
@@ -281,7 +335,7 @@ func (b *Dat9Backend) overwriteFile(nf *datastore.NodeWithFile, data []byte, off
 	} else if flags&filesystem.WriteFlagTruncate != 0 || offset <= 0 {
 		finalData = data
 	} else {
-		existing, err := b.readFileData(nf.File)
+		existing, err := b.readFileDataCtx(ctx, nf.File)
 		if err != nil {
 			return 0, fmt.Errorf("read existing data for offset write: %w", err)
 		}
@@ -309,37 +363,45 @@ func (b *Dat9Backend) overwriteFile(nf *datastore.NodeWithFile, data []byte, off
 		}
 		storageType = datastore.StorageS3
 		storageRef = "blobs/" + b.genID()
-		if err := b.s3.PutObject(context.Background(), storageRef, bytes.NewReader(finalData), int64(len(finalData))); err != nil {
+		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(finalData), int64(len(finalData))); err != nil {
+			logger.Error(ctx, "backend_overwrite_put_object_failed", zap.String("path", nf.Node.Path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(finalData)), zap.Error(err))
 			return 0, fmt.Errorf("put object: %w", err)
 		}
 	}
 
-	if err := b.store.UpdateFileContent(
+	if err := b.store.UpdateFileContent(ctx,
 		nf.File.FileID, storageType, storageRef,
 		contentType, checksum, contentText, contentBlob, int64(len(finalData)),
 	); err != nil {
 		if storageType == datastore.StorageS3 {
-			b.deleteBlob(storageRef)
+			b.deleteBlobCtx(ctx, storageRef)
 		}
 		return 0, err
 	}
 	if nf.File.StorageRef != "" && nf.File.StorageRef != storageRef {
-		b.deleteBlob(nf.File.StorageRef)
+		b.deleteBlobCtx(ctx, nf.File.StorageRef)
 	}
 	return int64(len(data)), nil
 }
 
 func (b *Dat9Backend) ReadDir(path string) ([]filesystem.FileInfo, error) {
+	return b.ReadDirCtx(backgroundWithTrace(), path)
+}
+
+func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []filesystem.FileInfo, err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "read_dir", err, start) }()
+
 	dirPath, err := pathutil.CanonicalizeDir(path)
 	if err != nil {
 		return nil, err
 	}
-	entries, err := b.store.ListDir(dirPath)
+	entries, err := b.store.ListDir(ctx, dirPath)
 	if err != nil {
 		return nil, err
 	}
 
-	var infos []filesystem.FileInfo
+	infos = make([]filesystem.FileInfo, 0, len(entries))
 	for _, e := range entries {
 		info := filesystem.FileInfo{
 			Name: e.Node.Name, IsDir: e.Node.IsDirectory, Mode: 0o644,
@@ -364,7 +426,7 @@ func (b *Dat9Backend) ReadDir(path string) ([]filesystem.FileInfo, error) {
 
 func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
 	path = normalizePath(path)
-	nf, err := b.store.Stat(path)
+	nf, err := b.store.Stat(backgroundWithTrace(), path)
 	if err != nil {
 		return nil, err
 	}
@@ -388,24 +450,34 @@ func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
 }
 
 func (b *Dat9Backend) Rename(oldPath, newPath string) error {
+	return b.RenameCtx(backgroundWithTrace(), oldPath, newPath)
+}
+
+func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "rename", err, start) }()
+
 	oldPath = normalizePath(oldPath)
 	newPath = normalizePath(newPath)
 
-	node, err := b.store.GetNode(oldPath)
+	node, err := b.store.GetNode(ctx, oldPath)
 	if err != nil {
 		return err
 	}
 	if node.IsDirectory {
-		if err := b.store.EnsureParentDirs(newPath, b.genID); err != nil {
+		err = b.store.EnsureParentDirs(ctx, newPath, b.genID)
+		if err != nil {
 			return err
 		}
-		_, err := b.store.RenameDir(oldPath, newPath)
+		_, err = b.store.RenameDir(ctx, oldPath, newPath)
 		return err
 	}
-	if err := b.store.EnsureParentDirs(newPath, b.genID); err != nil {
+	err = b.store.EnsureParentDirs(ctx, newPath, b.genID)
+	if err != nil {
 		return err
 	}
-	return b.store.UpdateNodePath(oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
+	err = b.store.UpdateNodePath(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
+	return err
 }
 
 func (b *Dat9Backend) Chmod(path string, mode uint32) error { return nil }
@@ -441,7 +513,14 @@ var _ filesystem.CapabilityProvider = (*Dat9Backend)(nil)
 
 // CopyFile performs a zero-copy cp (new file_node pointing to same file_id).
 func (b *Dat9Backend) CopyFile(srcPath, dstPath string) error {
-	srcPath, err := pathutil.Canonicalize(srcPath)
+	return b.CopyFileCtx(backgroundWithTrace(), srcPath, dstPath)
+}
+
+func (b *Dat9Backend) CopyFileCtx(ctx context.Context, srcPath, dstPath string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "copy_file", err, start) }()
+
+	srcPath, err = pathutil.Canonicalize(srcPath)
 	if err != nil {
 		return err
 	}
@@ -449,29 +528,35 @@ func (b *Dat9Backend) CopyFile(srcPath, dstPath string) error {
 	if err != nil {
 		return err
 	}
-	srcNode, err := b.store.GetNode(srcPath)
+	srcNode, err := b.store.GetNode(ctx, srcPath)
 	if err != nil {
 		return err
 	}
 	if srcNode.IsDirectory {
 		return fmt.Errorf("cannot copy directory with CopyFile: %s", srcPath)
 	}
-	if err := b.store.EnsureParentDirs(dstPath, b.genID); err != nil {
+	if err := b.store.EnsureParentDirs(ctx, dstPath, b.genID); err != nil {
 		return err
 	}
-	return b.store.InsertNode(&datastore.FileNode{
+	return b.store.InsertNode(ctx, &datastore.FileNode{
 		NodeID: b.genID(), Path: dstPath, ParentPath: pathutil.ParentPath(dstPath),
 		Name: pathutil.BaseName(dstPath), FileID: srcNode.FileID, CreatedAt: time.Now(),
 	})
 }
 
 func (b *Dat9Backend) deleteBlob(ref string) {
+	b.deleteBlobCtx(backgroundWithTrace(), ref)
+}
+
+func (b *Dat9Backend) deleteBlobCtx(ctx context.Context, ref string) {
 	if b.s3 != nil && ref != "" {
-		_ = b.s3.DeleteObject(context.Background(), ref)
+		if err := b.s3.DeleteObject(ctx, ref); err != nil {
+			logger.Warn(ctx, "backend_delete_blob_failed", zap.String("storage_ref", ref), zap.Error(err))
+		}
 	}
 }
 
-func (b *Dat9Backend) readFileData(f *datastore.File) ([]byte, error) {
+func (b *Dat9Backend) readFileDataCtx(ctx context.Context, f *datastore.File) ([]byte, error) {
 	if f == nil {
 		return nil, fmt.Errorf("nil file")
 	}
@@ -479,8 +564,9 @@ func (b *Dat9Backend) readFileData(f *datastore.File) ([]byte, error) {
 		if b.s3 == nil {
 			return nil, fmt.Errorf("s3 client not configured")
 		}
-		rc, err := b.s3.GetObject(context.Background(), f.StorageRef)
+		rc, err := b.s3.GetObject(ctx, f.StorageRef)
 		if err != nil {
+			logger.Error(ctx, "backend_read_get_object_failed", zap.String("storage_ref", f.StorageRef), zap.Error(err))
 			return nil, err
 		}
 		defer func() { _ = rc.Close() }()
@@ -529,6 +615,10 @@ func normalizePath(path string) string {
 	return p
 }
 
+func backgroundWithTrace() context.Context {
+	return traceid.Background()
+}
+
 func sha256sum(data []byte) string {
 	h := sha256.Sum256(data)
 	return hex.EncodeToString(h[:])
@@ -570,13 +660,46 @@ func extractText(data []byte, contentType string) string {
 }
 
 func (b *Dat9Backend) ExecSQL(ctx context.Context, query string) ([]map[string]interface{}, error) {
-	return b.store.ExecSQL(ctx, query)
+	start := time.Now()
+	rows, err := b.store.ExecSQL(ctx, query)
+	observeBackend(ctx, "exec_sql", err, start)
+	if err != nil {
+		logger.Error(ctx, "backend_exec_sql_failed", zap.Int("query_len", len(query)), zap.Error(err))
+		return nil, err
+	}
+	return rows, nil
 }
 
 func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit int) ([]datastore.SearchResult, error) {
-	return b.store.Grep(ctx, query, pathPrefix, limit)
+	start := time.Now()
+	rows, err := b.store.Grep(ctx, query, pathPrefix, limit)
+	observeBackend(ctx, "grep", err, start)
+	if err != nil {
+		logger.Error(ctx, "backend_grep_failed", zap.Int("query_len", len(query)), zap.String("path_prefix", pathPrefix), zap.Int("limit", limit), zap.Error(err))
+		return nil, err
+	}
+	return rows, nil
 }
 
 func (b *Dat9Backend) Find(ctx context.Context, f *datastore.FindFilter) ([]datastore.SearchResult, error) {
-	return b.store.Find(ctx, f)
+	start := time.Now()
+	rows, err := b.store.Find(ctx, f)
+	observeBackend(ctx, "find", err, start)
+	if err != nil {
+		logger.Error(ctx, "backend_find_failed", zap.String("path", f.PathPrefix), zap.String("name", f.NameGlob), zap.Error(err))
+		return nil, err
+	}
+	return rows, nil
+}
+
+func observeBackend(ctx context.Context, op string, err error, start time.Time) {
+	result := "ok"
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			result = "not_found"
+		} else {
+			result = "error"
+		}
+	}
+	metrics.RecordOperation("backend", op, result, time.Since(start))
 }

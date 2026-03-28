@@ -12,15 +12,28 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/mem9-ai/dat9/cmd/dat9/cli"
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"go.uber.org/zap"
 )
 
 var version = "dev"
+var cliLogger *zap.Logger
 
 func main() {
+	if cliLogEnabled() {
+		if l, err := logger.NewCLILogger(); err == nil {
+			cliLogger = l
+			logger.Set(l)
+			defer func() { _ = cliLogger.Sync() }()
+		}
+	}
+
 	if len(os.Args) < 2 {
 		usage()
 	}
@@ -30,23 +43,57 @@ func main() {
 
 	switch cmd {
 	case "--version", "-v", "version":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "version"))
+		}
 		fmt.Printf("dat9 %s\n", version)
 	case "-h", "-help", "help":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "help"))
+		}
 		usage()
 	case "create":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "create"))
+		}
 		if err := cli.Create(args); err != nil {
 			fatal("create", err)
 		}
 	case "ctx":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "ctx"))
+		}
 		if err := cli.Ctx(args); err != nil {
 			fatal("ctx", err)
 		}
 	case "fs":
+		if cliLogger != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = args[0]
+			}
+			logger.Info(context.Background(), "cli_command", zap.String("command", "fs"), zap.String("subcommand", sub))
+		}
 		runFS(args)
 	default:
+		if cliLogger != nil {
+			logger.Warn(context.Background(), "cli_unknown_command", zap.String("command", cmd))
+		}
 		fmt.Fprintf(os.Stderr, "dat9: unknown command %q\n", cmd)
 		usage()
 	}
+}
+
+func cliLogEnabled() bool {
+	raw := os.Getenv("DAT9_CLI_LOG_ENABLED")
+	if raw == "" {
+		return false
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false
+	}
+	return v
 }
 
 func runFS(args []string) {
@@ -89,6 +136,9 @@ func runFS(args []string) {
 }
 
 func fatal(cmd string, err error) {
+	if cliLogger != nil {
+		logger.Error(context.Background(), "cli_command_failed", zap.String("command", cmd), zap.Error(err))
+	}
 	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, err)
 	os.Exit(1)
 }

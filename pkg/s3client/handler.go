@@ -1,7 +1,6 @@
 package s3client
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,7 +38,7 @@ func (c *LocalS3Client) handleUploadPart(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	etag, err := c.UploadPart(context.Background(), uploadID, partNumber, r.Body)
+	etag, err := c.UploadPart(r.Context(), uploadID, partNumber, r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -57,7 +56,7 @@ func (c *LocalS3Client) handleGetObject(w http.ResponseWriter, r *http.Request) 
 	}
 
 	key := strings.TrimPrefix(r.URL.Path, "/objects/")
-	rc, err := c.GetObject(context.Background(), key)
+	rc, err := c.GetObject(r.Context(), key)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return

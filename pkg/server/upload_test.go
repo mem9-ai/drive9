@@ -138,7 +138,7 @@ func TestUploadCompleteEndpoint(t *testing.T) {
 	_ = resp.Body.Close()
 
 	// Get the upload to find s3_upload_id
-	upload, _ := s.fallback.GetUpload(plan.UploadID)
+	upload, _ := s.fallback.GetUpload(context.Background(), plan.UploadID)
 
 	// Upload all parts via S3 client directly
 	for _, p := range plan.Parts {
@@ -187,7 +187,7 @@ func TestUploadResumeEndpoint(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 
-	upload, _ := s.fallback.GetUpload(plan.UploadID)
+	upload, _ := s.fallback.GetUpload(context.Background(), plan.UploadID)
 
 	// Upload only part 1
 	if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, 1, bytes.NewReader(make([]byte, s3client.PartSize))); err != nil {
@@ -253,7 +253,7 @@ func TestLargeUploadOverwritesExistingSmallFile(t *testing.T) {
 		t.Fatalf("initiate overwrite: expected 202, got %d", resp.StatusCode)
 	}
 
-	upload, err := s.fallback.GetUpload(plan.UploadID)
+	upload, err := s.fallback.GetUpload(context.Background(), plan.UploadID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +279,7 @@ func TestLargeUploadOverwritesExistingSmallFile(t *testing.T) {
 		t.Fatalf("complete overwrite: expected 200, got %d", resp.StatusCode)
 	}
 
-	nf, err := s.fallback.Store().Stat("/overwrite.bin")
+	nf, err := s.fallback.Store().Stat(context.Background(), "/overwrite.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestAbortUploadEndpoint(t *testing.T) {
 	}
 
 	// Verify upload is aborted
-	upload, _ := s.fallback.GetUpload(plan.UploadID)
+	upload, _ := s.fallback.GetUpload(context.Background(), plan.UploadID)
 	if upload.Status != datastore.UploadAborted {
 		t.Errorf("expected ABORTED, got %s", upload.Status)
 	}
