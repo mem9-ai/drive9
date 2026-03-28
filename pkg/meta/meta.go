@@ -2,6 +2,7 @@
 package meta
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -9,6 +10,9 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/metrics"
+	"go.uber.org/zap"
 )
 
 var (
@@ -144,8 +148,10 @@ func (s *Store) migrate() error {
 	return nil
 }
 
-func (s *Store) InsertTenant(t *Tenant) error {
-	_, err := s.db.Exec(`INSERT INTO tenants
+func (s *Store) InsertTenant(ctx context.Context, t *Tenant) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "insert_tenant", start, &err)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO tenants
 		(id, status, db_host, db_port, db_user, db_password, db_name, db_tls,
 		 provider, cluster_id, claim_url, claim_expires_at, schema_version, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -157,8 +163,10 @@ func (s *Store) InsertTenant(t *Tenant) error {
 	return err
 }
 
-func (s *Store) InsertAPIKey(k *APIKey) error {
-	_, err := s.db.Exec(`INSERT INTO tenant_api_keys
+func (s *Store) InsertAPIKey(ctx context.Context, k *APIKey) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "insert_api_key", start, &err)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_api_keys
 		(id, tenant_id, key_name, jwt_ciphertext, jwt_hash, token_version, status, issued_at, revoked_at, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		k.ID, k.TenantID, k.KeyName, k.JWTCiphertext, k.JWTHash, k.TokenVersion, k.Status,
@@ -169,8 +177,10 @@ func (s *Store) InsertAPIKey(k *APIKey) error {
 	return err
 }
 
-func (s *Store) ResolveByAPIKeyHash(hash string) (*TenantWithAPIKey, error) {
-	row := s.db.QueryRow(`SELECT
+func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *TenantWithAPIKey, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "resolve_api_key_hash", start, &err)
+	row := s.db.QueryRowContext(ctx, `SELECT
 			t.id, t.status, t.db_host, t.db_port, t.db_user, t.db_password, t.db_name, t.db_tls,
 			t.provider, t.cluster_id, t.claim_url, t.claim_expires_at, t.schema_version, t.created_at, t.updated_at,
 			k.id, k.tenant_id, k.key_name, k.jwt_ciphertext, k.jwt_hash, k.token_version, k.status, k.issued_at,
@@ -179,79 +189,87 @@ func (s *Store) ResolveByAPIKeyHash(hash string) (*TenantWithAPIKey, error) {
 		JOIN tenants t ON t.id = k.tenant_id
 		WHERE k.jwt_hash = ?`, hash)
 
-	var out TenantWithAPIKey
+	var rec TenantWithAPIKey
 	var dbTLS int
 	var claimURL sql.NullString
 	var claimExp sql.NullTime
 	var clusterID sql.NullString
 	var revokedAt sql.NullTime
-	if err := row.Scan(
-		&out.Tenant.ID, &out.Tenant.Status, &out.Tenant.DBHost, &out.Tenant.DBPort, &out.Tenant.DBUser,
-		&out.Tenant.DBPasswordCipher, &out.Tenant.DBName, &dbTLS, &out.Tenant.Provider, &clusterID,
-		&claimURL, &claimExp, &out.Tenant.SchemaVersion, &out.Tenant.CreatedAt, &out.Tenant.UpdatedAt,
-		&out.APIKey.ID, &out.APIKey.TenantID, &out.APIKey.KeyName, &out.APIKey.JWTCiphertext,
-		&out.APIKey.JWTHash, &out.APIKey.TokenVersion, &out.APIKey.Status, &out.APIKey.IssuedAt,
-		&revokedAt, &out.APIKey.CreatedAt, &out.APIKey.UpdatedAt,
+	if err = row.Scan(
+		&rec.Tenant.ID, &rec.Tenant.Status, &rec.Tenant.DBHost, &rec.Tenant.DBPort, &rec.Tenant.DBUser,
+		&rec.Tenant.DBPasswordCipher, &rec.Tenant.DBName, &dbTLS, &rec.Tenant.Provider, &clusterID,
+		&claimURL, &claimExp, &rec.Tenant.SchemaVersion, &rec.Tenant.CreatedAt, &rec.Tenant.UpdatedAt,
+		&rec.APIKey.ID, &rec.APIKey.TenantID, &rec.APIKey.KeyName, &rec.APIKey.JWTCiphertext,
+		&rec.APIKey.JWTHash, &rec.APIKey.TokenVersion, &rec.APIKey.Status, &rec.APIKey.IssuedAt,
+		&revokedAt, &rec.APIKey.CreatedAt, &rec.APIKey.UpdatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
+			err = ErrNotFound
+			return nil, err
 		}
 		return nil, err
 	}
-	out.Tenant.DBTLS = dbTLS == 1
+	rec.Tenant.DBTLS = dbTLS == 1
 	if clusterID.Valid {
-		out.Tenant.ClusterID = clusterID.String
+		rec.Tenant.ClusterID = clusterID.String
 	}
 	if claimURL.Valid {
-		out.Tenant.ClaimURL = claimURL.String
+		rec.Tenant.ClaimURL = claimURL.String
 	}
 	if claimExp.Valid {
 		t := claimExp.Time.UTC()
-		out.Tenant.ClaimExpiresAt = &t
+		rec.Tenant.ClaimExpiresAt = &t
 	}
 	if revokedAt.Valid {
 		t := revokedAt.Time.UTC()
-		out.APIKey.RevokedAt = &t
+		rec.APIKey.RevokedAt = &t
 	}
-	return &out, nil
+	out = &rec
+	return out, nil
 }
 
-func (s *Store) GetTenant(id string) (*Tenant, error) {
-	row := s.db.QueryRow(`SELECT id, status, db_host, db_port, db_user, db_password, db_name,
+func (s *Store) GetTenant(ctx context.Context, id string) (out *Tenant, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "get_tenant", start, &err)
+	row := s.db.QueryRowContext(ctx, `SELECT id, status, db_host, db_port, db_user, db_password, db_name,
 		db_tls, provider, cluster_id, claim_url, claim_expires_at, schema_version, created_at, updated_at
 		FROM tenants WHERE id = ?`, id)
-	var out Tenant
 	var dbTLS int
 	var clusterID sql.NullString
 	var claimURL sql.NullString
 	var claimExp sql.NullTime
-	if err := row.Scan(&out.ID, &out.Status, &out.DBHost, &out.DBPort, &out.DBUser, &out.DBPasswordCipher,
-		&out.DBName, &dbTLS, &out.Provider, &clusterID, &claimURL, &claimExp, &out.SchemaVersion,
-		&out.CreatedAt, &out.UpdatedAt); err != nil {
+	var rec Tenant
+	if err = row.Scan(&rec.ID, &rec.Status, &rec.DBHost, &rec.DBPort, &rec.DBUser, &rec.DBPasswordCipher,
+		&rec.DBName, &dbTLS, &rec.Provider, &clusterID, &claimURL, &claimExp, &rec.SchemaVersion,
+		&rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
+			err = ErrNotFound
+			return nil, err
 		}
 		return nil, err
 	}
-	out.DBTLS = dbTLS == 1
+	rec.DBTLS = dbTLS == 1
 	if clusterID.Valid {
-		out.ClusterID = clusterID.String
+		rec.ClusterID = clusterID.String
 	}
 	if claimURL.Valid {
-		out.ClaimURL = claimURL.String
+		rec.ClaimURL = claimURL.String
 	}
 	if claimExp.Valid {
 		t := claimExp.Time.UTC()
-		out.ClaimExpiresAt = &t
+		rec.ClaimExpiresAt = &t
 	}
-	return &out, nil
+	out = &rec
+	return out, nil
 }
 
-func (s *Store) ListTenantsByStatus(status TenantStatus, limit int) ([]Tenant, error) {
+func (s *Store) ListTenantsByStatus(ctx context.Context, status TenantStatus, limit int) (out []Tenant, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_tenants_by_status", start, &err)
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.Query(`SELECT id, status, db_host, db_port, db_user, db_password, db_name,
+	rows, err := s.db.QueryContext(ctx, `SELECT id, status, db_host, db_port, db_user, db_password, db_name,
 		db_tls, provider, cluster_id, claim_url, claim_expires_at, schema_version, created_at, updated_at
 		FROM tenants WHERE status = ? ORDER BY created_at ASC LIMIT ?`, status, limit)
 	if err != nil {
@@ -259,7 +277,7 @@ func (s *Store) ListTenantsByStatus(status TenantStatus, limit int) ([]Tenant, e
 	}
 	defer func() { _ = rows.Close() }()
 
-	out := make([]Tenant, 0)
+	out = make([]Tenant, 0)
 	for rows.Next() {
 		var t Tenant
 		var dbTLS int
@@ -290,8 +308,10 @@ func (s *Store) ListTenantsByStatus(status TenantStatus, limit int) ([]Tenant, e
 	return out, nil
 }
 
-func (s *Store) UpdateTenantStatus(id string, status TenantStatus) error {
-	res, err := s.db.Exec(`UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`, status, time.Now().UTC(), id)
+func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status TenantStatus) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tenant_status", start, &err)
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`, status, time.Now().UTC(), id)
 	if err != nil {
 		return err
 	}
@@ -300,6 +320,22 @@ func (s *Store) UpdateTenantStatus(id string, status TenantStatus) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+func observeMeta(ctx context.Context, op string, start time.Time, errp *error) {
+	result := "ok"
+	if errp != nil && *errp != nil {
+		switch {
+		case errors.Is(*errp, ErrNotFound):
+			result = "not_found"
+		case errors.Is(*errp, ErrDuplicate):
+			result = "duplicate"
+		default:
+			result = "error"
+		}
+		logger.Error(ctx, "meta_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
+	}
+	metrics.RecordOperation("meta", op, result, time.Since(start))
 }
 
 func boolToInt(v bool) int {

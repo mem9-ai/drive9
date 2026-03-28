@@ -113,7 +113,7 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 	if apiKey == "" {
 		t.Fatal("empty api_key")
 	}
-	resolved, err := metaStore.ResolveByAPIKeyHash(tenant.HashToken(apiKey))
+	resolved, err := metaStore.ResolveByAPIKeyHash(context.Background(), tenant.HashToken(apiKey))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	if out["api_key"] == "" {
 		t.Fatalf("unexpected provision response: %+v", out)
 	}
-	resolved, err := metaStore.ResolveByAPIKeyHash(tenant.HashToken(out["api_key"]))
+	resolved, err := metaStore.ResolveByAPIKeyHash(context.Background(), tenant.HashToken(out["api_key"]))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,13 +276,13 @@ func TestStartupResumesProvisioningTenantInit(t *testing.T) {
 		}
 	}
 
-	passCipher, err := pool.Encrypt([]byte(parsed.Passwd))
+	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
 	if err != nil {
 		t.Fatal(err)
 	}
 	tenantID := tenant.NewID()
 	now := time.Now().UTC()
-	if err := metaStore.InsertTenant(&meta.Tenant{
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantProvisioning,
 		DBHost:           host,

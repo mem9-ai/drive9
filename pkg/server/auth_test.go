@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -64,7 +65,7 @@ func newAuthServer(t *testing.T) (*Server, string, func()) {
 	tenantID := tenant.NewID()
 	tenantDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true", parsed.User, parsed.Passwd, host, port, parsed.DBName)
 	initServerTenantSchema(t, tenantDSN)
-	passCipher, err := pool.Encrypt([]byte(parsed.Passwd))
+	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,11 +73,11 @@ func newAuthServer(t *testing.T) (*Server, string, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokCipher, err := pool.Encrypt([]byte(tok))
+	tokCipher, err := pool.Encrypt(context.Background(), []byte(tok))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := metaStore.InsertTenant(&meta.Tenant{
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantActive,
 		DBHost:           host,
@@ -92,7 +93,7 @@ func newAuthServer(t *testing.T) (*Server, string, func()) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := metaStore.InsertAPIKey(&meta.APIKey{
+	if err := metaStore.InsertAPIKey(context.Background(), &meta.APIKey{
 		ID:            tenant.NewID(),
 		TenantID:      tenantID,
 		KeyName:       "default",

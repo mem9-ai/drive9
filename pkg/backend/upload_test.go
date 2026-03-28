@@ -109,7 +109,7 @@ func TestInitiateAndConfirmUpload(t *testing.T) {
 	}
 
 	// Verify upload record exists
-	upload, err := b.GetUpload(plan.UploadID)
+	upload, err := b.GetUpload(ctx, plan.UploadID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestInitiateAndConfirmUpload(t *testing.T) {
 	}
 
 	// Verify upload is completed
-	upload, _ = b.GetUpload(plan.UploadID)
+	upload, _ = b.GetUpload(ctx, plan.UploadID)
 	if upload.Status != datastore.UploadCompleted {
 		t.Errorf("expected COMPLETED, got %s", upload.Status)
 	}
@@ -179,7 +179,7 @@ func TestResumeUpload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	upload, _ := b.GetUpload(plan.UploadID)
+	upload, _ := b.GetUpload(ctx, plan.UploadID)
 
 	// Upload only part 1 (simulate partial upload)
 	data := make([]byte, s3client.PartSize)
@@ -213,7 +213,7 @@ func TestAbortUpload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	upload, _ := b.GetUpload(plan.UploadID)
+	upload, _ := b.GetUpload(ctx, plan.UploadID)
 	if upload.Status != datastore.UploadAborted {
 		t.Errorf("expected ABORTED, got %s", upload.Status)
 	}
@@ -231,7 +231,7 @@ func TestListUploads(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	uploadsA, err := b.ListUploads("/list-a.bin", datastore.UploadUploading)
+	uploadsA, err := b.ListUploads(ctx, "/list-a.bin", datastore.UploadUploading)
 	if err != nil {
 		t.Fatal(err)
 	}
