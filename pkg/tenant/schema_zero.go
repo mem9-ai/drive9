@@ -48,7 +48,8 @@ func initZeroSchema(dsn string) error {
 			status          VARCHAR(32) NOT NULL DEFAULT 'PENDING',
 			source_id       VARCHAR(255),
 			content_text    LONGTEXT,
-			embedding       VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT('` + autoEmbedModel + `', content_text, '{"dimensions": 1024}')) STORED,
+			embedding_text  VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT('` + autoEmbedTextModel + `', content_text, '{"dimensions": 1024}')) STORED,
+			embedding_image VECTOR(1024) GENERATED ALWAYS AS (EMBED_IMAGE('` + autoEmbedImageModel + `', content_blob, '{"dimensions": 1024}')) STORED,
 			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			confirmed_at    DATETIME(3),
 			expires_at      DATETIME(3)
@@ -59,7 +60,10 @@ func initZeroSchema(dsn string) error {
 			WITH PARSER MULTILINGUAL
 			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
 		`ALTER TABLE files
-			ADD VECTOR INDEX idx_files_cosine((VEC_COSINE_DISTANCE(embedding)))
+			ADD VECTOR INDEX idx_files_cosine_text((VEC_COSINE_DISTANCE(embedding_text)))
+			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
+		`ALTER TABLE files
+			ADD VECTOR INDEX idx_files_cosine_image((VEC_COSINE_DISTANCE(embedding_image)))
 			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
 		`CREATE TABLE IF NOT EXISTS file_tags (
 			file_id   VARCHAR(64) NOT NULL,

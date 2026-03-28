@@ -41,13 +41,15 @@ func initDB9Schema(dsn string) error {
 			status          VARCHAR(32) NOT NULL DEFAULT 'PENDING',
 			source_id       VARCHAR(255),
 			content_text    TEXT,
-			embedding       vector(1024) GENERATED ALWAYS AS (EMBED_TEXT('` + autoEmbedModel + `', content_text, '{"dimensions": 1024}'::jsonb)) STORED,
+			embedding_text  vector(1024) GENERATED ALWAYS AS (EMBED_TEXT('` + autoEmbedTextModel + `', content_text, '{"dimensions": 1024}'::jsonb)) STORED,
+			embedding_image vector(1024) GENERATED ALWAYS AS (EMBED_IMAGE('` + autoEmbedImageModel + `', content_blob, '{"dimensions": 1024}'::jsonb)) STORED,
 			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			confirmed_at    TIMESTAMPTZ,
 			expires_at      TIMESTAMPTZ
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_status ON files(status, created_at)`,
-		`CREATE INDEX IF NOT EXISTS idx_files_cosine ON files USING hnsw (embedding vector_cosine_ops)`,
+		`CREATE INDEX IF NOT EXISTS idx_files_cosine_text ON files USING hnsw (embedding_text vector_cosine_ops)`,
+		`CREATE INDEX IF NOT EXISTS idx_files_cosine_image ON files USING hnsw (embedding_image vector_cosine_ops)`,
 		`CREATE INDEX IF NOT EXISTS idx_fts_content ON files USING gin (to_tsvector('simple', coalesce(content_text,'')))`,
 		`CREATE TABLE IF NOT EXISTS file_tags (
 			file_id   VARCHAR(64) NOT NULL,

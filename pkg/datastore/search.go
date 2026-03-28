@@ -95,7 +95,7 @@ func subtreeCond(prefix string) (string, []any) {
 }
 
 func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limit int) []SearchResult {
-	conds := []string{"f.status = 'CONFIRMED'", "f.embedding IS NOT NULL"}
+	conds := []string{"f.status = 'CONFIRMED'", "f.embedding_text IS NOT NULL"}
 	args := []any{query}
 
 	if pathPrefix != "" && pathPrefix != "/" {
@@ -106,10 +106,10 @@ func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limi
 	args = append(args, query, limit)
 
 	q := `SELECT fn.path, fn.name, f.size_bytes,
-		VEC_EMBED_COSINE_DISTANCE(f.embedding, ?) AS distance
+		VEC_EMBED_COSINE_DISTANCE(f.embedding_text, ?) AS distance
 		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
 		WHERE ` + strings.Join(conds, " AND ") + `
-		ORDER BY VEC_EMBED_COSINE_DISTANCE(f.embedding, ?)
+		ORDER BY VEC_EMBED_COSINE_DISTANCE(f.embedding_text, ?)
 		LIMIT ?`
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
