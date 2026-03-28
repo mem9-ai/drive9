@@ -139,28 +139,23 @@ func buildVectorSearchQuery(query, pathPrefix string, limit int) (string, []any)
 	}
 	whereBase := strings.Join(baseConds, " AND ")
 
-	args := make([]any, 0, 2+len(pathArgs)*2+1)
+	args := make([]any, 0, 2+len(pathArgs)+1)
 	args = append(args, query)
-	args = append(args, pathArgs...)
 	args = append(args, query)
 	args = append(args, pathArgs...)
 	args = append(args, limit)
 
-	q := `SELECT path, name, size_bytes, MIN(distance) AS distance
-		FROM (
-			SELECT fn.path AS path, fn.name AS name, f.size_bytes AS size_bytes,
-				VEC_EMBED_COSINE_DISTANCE(f.embedding, ?) AS distance
-			FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
-			WHERE ` + whereBase + ` AND f.embedding IS NOT NULL
-
-			UNION ALL
-
-			SELECT fn.path AS path, fn.name AS name, f.size_bytes AS size_bytes,
-				VEC_EMBED_COSINE_DISTANCE(f.embedding_image, ?) AS distance
-			FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
-			WHERE ` + whereBase + ` AND f.embedding_image IS NOT NULL
-		) ranked
-		GROUP BY path, name, size_bytes
+	q := `SELECT fn.path, fn.name, f.size_bytes,
+		CASE
+			WHEN f.content_type LIKE 'image/%' THEN VEC_EMBED_COSINE_DISTANCE(f.embedding_image, ?)
+			ELSE VEC_EMBED_COSINE_DISTANCE(f.embedding, ?)
+		END AS distance
+		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
+		WHERE ` + whereBase + `
+			AND (
+				(f.content_type LIKE 'image/%' AND f.embedding_image IS NOT NULL)
+				OR ((f.content_type IS NULL OR f.content_type NOT LIKE 'image/%') AND f.embedding IS NOT NULL)
+			)
 		ORDER BY distance
 		LIMIT ?`
 	return q, args
