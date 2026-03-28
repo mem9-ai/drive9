@@ -110,6 +110,8 @@ TS="$(date +%s)"
 SMALL_LOCAL="/tmp/dat9-cli-small-${TS}.txt"
 SMALL_REMOTE="/cli-${TS}-small.txt"
 SMALL_RENAMED="/cli-${TS}-small-renamed.txt"
+IMAGE_LOCAL="/tmp/dat9-cli-image-${TS}.png"
+IMAGE_REMOTE="/cli-${TS}-image.png"
 BATCH_LOCAL_DIR="/tmp/dat9-cli-batch-${TS}"
 BATCH_REMOTE_DIR="/cli-${TS}-batch"
 LARGE_LOCAL="/tmp/dat9-cli-large-${TS}.bin"
@@ -203,6 +205,21 @@ PY
 )
 check_eq "cli find by name returns txt files" "$find_has_txt" "true"
 
+echo "[6.1] cli image upload/find checks"
+printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+Xf7YAAAAASUVORK5CYII=' | base64 -d > "$IMAGE_LOCAL"
+check_cmd "local cli png fixture exists" test -s "$IMAGE_LOCAL"
+dat9_retry fs cp "$IMAGE_LOCAL" ":$IMAGE_REMOTE" >/dev/null
+
+find_png_out="$(dat9_retry fs find / -name "*.png")"
+find_has_png=$(python3 - "$find_png_out" "${IMAGE_REMOTE}" <<'PY'
+import sys
+lines=[ln.strip() for ln in sys.argv[1].splitlines() if ln.strip()]
+target=sys.argv[2]
+print("true" if any(line==target or line.endswith('.png') for line in lines) else "false")
+PY
+)
+check_eq "cli find by name returns png files" "$find_has_png" "true"
+
 sql_out="$(dat9_retry db sql -q "SELECT 1 AS n")"
 sql_ok=$(python3 - "$sql_out" <<'PY'
 import sys,re
@@ -236,6 +253,7 @@ check_eq "downloaded large file sha256 matches" "$sum_dst" "$sum_src"
 
 echo "[8] cleanup via cli"
 dat9_retry fs rm ":$SMALL_RENAMED" >/dev/null
+dat9_retry fs rm ":$IMAGE_REMOTE" >/dev/null
 dat9_retry fs rm ":$LARGE_REMOTE" >/dev/null
 for i in $(seq 1 "$CLI_BATCH_SMALL_FILE_COUNT"); do
   dat9_retry fs rm ":$BATCH_REMOTE_DIR/file-${i}.txt" >/dev/null
@@ -306,6 +324,7 @@ PY
 fi
 
 rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
+rm -f "$IMAGE_LOCAL"
 rm -rf "$BATCH_LOCAL_DIR"
 
 echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"

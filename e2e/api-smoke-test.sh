@@ -9,11 +9,12 @@
 #  5) Multi-file write/read under nested directories
 #  6) Batch small-file write/list/read validation
 #  7) Content search (`grep`) and attribute search (`find`)
-#  8) SQL endpoint sanity query
-#  9) Copy, rename, delete
-# 10) Final list verification
-# 11) 100MB multipart upload with checksum-bound presigned parts + download checksum
-# 12) Max-upload boundary check (1GiB allowed, 1GiB+1 rejected)
+#  8) Image upload + image query (`find` by image extension)
+#  9) SQL endpoint sanity query
+# 10) Copy, rename, delete
+# 11) Final list verification
+# 12) 100MB multipart upload with checksum-bound presigned parts + download checksum
+# 13) Max-upload boundary check (1GiB allowed, 1GiB+1 rejected)
 
 set -euo pipefail
 
@@ -121,6 +122,8 @@ LARGE_FILE_LOCAL="/tmp/dat9-e2e-large-${TS}.bin"
 LARGE_FILE_DOWNLOADED="/tmp/dat9-e2e-large-${TS}.download.bin"
 LARGE_REMOTE_DIR="${ROOT_DIR}/large"
 LARGE_REMOTE_FILE="${LARGE_REMOTE_DIR}/blob-${LARGE_FILE_MB}m.bin"
+IMAGE_LOCAL="/tmp/dat9-e2e-image-${TS}.png"
+IMAGE_REMOTE="${ROOT_DIR}/assets/icon-${TS}.png"
 
 step "1" "Provision tenant"
 resp=$(curl_body_code POST "$BASE/v1/provision")
@@ -237,44 +240,31 @@ if [ "$find_has_yaml" != "true" ]; then
   find_has_yaml=$(printf '%s' "$body" | jq -r 'any(.[]; (.path // "") | endswith("config.yaml"))')
 fi
 
-if [ "$RUN_UPLOAD_LIMIT_BOUNDARY" = "1" ]; then
-  step "12" "Upload limit boundary (1GiB/1GiB+1)"
-  # Generate checksums for a 1GiB zero-filled upload plan: 128 parts * 8MiB.
-  BOUNDARY_CHECKSUMS=$(python3 - <<'PY'
-import base64
-import hashlib
-part = b"\x00" * (8 * 1024 * 1024)
-one = base64.b64encode(hashlib.sha256(part).digest()).decode()
-print(",".join([one] * 128))
-PY
-)
+step "8" "Image upload and query"
+mkdir -p "$(dirname "$IMAGE_LOCAL")"
+printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+Xf7YAAAAASUVORK5CYII=' | base64 -d > "$IMAGE_LOCAL"
+check_cmd "local png fixture exists" test -s "$IMAGE_LOCAL"
 
-  boundary_ok_body="$(mktemp)"
-  boundary_ok_code=$(curl -sS -o "$boundary_ok_body" -w "%{http_code}" -X PUT \
-    -H "Authorization: Bearer $API_KEY" \
-    -H "X-Dat9-Content-Length: $UPLOAD_LIMIT_BYTES" \
-    -H "X-Dat9-Part-Checksums: $BOUNDARY_CHECKSUMS" \
-    --data-binary "" \
-    "$BASE/v1/fs/$ROOT_DIR/limit-1g.bin")
-  check_eq "init at upload limit returns 202" "$boundary_ok_code" "202"
-  rm -f "$boundary_ok_body"
+img_body="$(mktemp)"
+img_code=$(curl -sS -o "$img_body" -w "%{http_code}" -X PUT \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: image/png" \
+  --data-binary "@$IMAGE_LOCAL" \
+  "$BASE/v1/fs/$IMAGE_REMOTE")
+check_eq "PUT /v1/fs/$IMAGE_REMOTE returns 200" "$img_code" "200"
+rm -f "$img_body"
 
-  over_limit=$((UPLOAD_LIMIT_BYTES + 1))
-  boundary_over_body="$(mktemp)"
-  boundary_over_code=$(curl -sS -o "$boundary_over_body" -w "%{http_code}" -X PUT \
-    -H "Authorization: Bearer $API_KEY" \
-    -H "X-Dat9-Content-Length: $over_limit" \
-    -H "X-Dat9-Part-Checksums: $BOUNDARY_CHECKSUMS" \
-    --data-binary "" \
-    "$BASE/v1/fs/$ROOT_DIR/limit-over.bin")
-  check_eq "init over upload limit returns 413" "$boundary_over_code" "413"
-  over_err=$(jq -r '.error // empty' "$boundary_over_body")
-  check_cmd "over-limit response has error message" test -n "$over_err"
-  rm -f "$boundary_over_body"
+resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?find=&name=*.png" "$API_KEY")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+check_eq "GET ?find name=*.png returns 200" "$code" "200"
+find_has_png=$(printf '%s' "$body" | jq -r --arg p "$IMAGE_REMOTE" 'any(.[]; .path==$p)')
+if [ "$find_has_png" != "true" ]; then
+  find_has_png=$(printf '%s' "$body" | jq -r 'any(.[]; (.path // "") | endswith(".png"))')
 fi
-check_eq "find by name returns yaml file" "$find_has_yaml" "true"
+check_eq "find by name returns png file" "$find_has_png" "true"
 
-step "8" "SQL endpoint sanity"
+step "9" "SQL endpoint sanity"
 sql_req='{"query":"SELECT 1 AS n"}'
 sql_body="$(mktemp)"
 code=$(curl -sS -o "$sql_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" --data-binary "$sql_req" "$BASE/v1/sql")
@@ -284,7 +274,8 @@ check_eq "POST /v1/sql returns 200" "$code" "200"
 sql_n=$(printf '%s' "$body" | jq -r '.[0].n')
 check_eq "SQL query result n=1" "$sql_n" "1"
 
-step "9" "Copy, rename, delete"
+check_eq "find by name returns yaml file" "$find_has_yaml" "true"
+step "10" "Copy, rename, delete"
 copy_body="$(mktemp)"
 copy_code=$(curl -sS -o "$copy_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "X-Dat9-Copy-Source: /$ROOT_DIR/README.md" "$BASE/v1/fs/$ROOT_DIR/README-copy.md?copy")
 copy_attempt=1
@@ -321,7 +312,7 @@ done
 check_eq "DELETE copied file returns 200" "$delete_code" "200"
 rm -f "$delete_body"
 
-step "10" "Final list verification"
+step "11" "Final list verification"
 resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?list" "$API_KEY")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
@@ -334,7 +325,7 @@ check_eq "frontend directory still exists" "$frontend_exists" "true"
 check_eq "copied file removed" "$copy_exists" "false"
 
 if [ "$RUN_LARGE_FILE" = "1" ]; then
-  step "11" "Large file multipart upload (${LARGE_FILE_MB}MB)"
+  step "12" "Large file multipart upload (${LARGE_FILE_MB}MB)"
   check_cmd "python3 is available" bash -c 'command -v python3 >/dev/null'
 
   resp=$(curl_body_code POST "$BASE/v1/fs/$LARGE_REMOTE_DIR?mkdir" "$API_KEY")
@@ -432,6 +423,44 @@ PY
 
   rm -f "$plan_file" "$LARGE_FILE_LOCAL" "$LARGE_FILE_DOWNLOADED"
 fi
+
+if [ "$RUN_UPLOAD_LIMIT_BOUNDARY" = "1" ]; then
+  step "13" "Upload limit boundary (1GiB/1GiB+1)"
+  # Generate checksums for a 1GiB zero-filled upload plan: 128 parts * 8MiB.
+  BOUNDARY_CHECKSUMS=$(python3 - <<'PY'
+import base64
+import hashlib
+part = b"\x00" * (8 * 1024 * 1024)
+one = base64.b64encode(hashlib.sha256(part).digest()).decode()
+print(",".join([one] * 128))
+PY
+)
+
+  boundary_ok_body="$(mktemp)"
+  boundary_ok_code=$(curl -sS -o "$boundary_ok_body" -w "%{http_code}" -X PUT \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "X-Dat9-Content-Length: $UPLOAD_LIMIT_BYTES" \
+    -H "X-Dat9-Part-Checksums: $BOUNDARY_CHECKSUMS" \
+    --data-binary "" \
+    "$BASE/v1/fs/$ROOT_DIR/limit-1g.bin")
+  check_eq "init at upload limit returns 202" "$boundary_ok_code" "202"
+  rm -f "$boundary_ok_body"
+
+  over_limit=$((UPLOAD_LIMIT_BYTES + 1))
+  boundary_over_body="$(mktemp)"
+  boundary_over_code=$(curl -sS -o "$boundary_over_body" -w "%{http_code}" -X PUT \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "X-Dat9-Content-Length: $over_limit" \
+    -H "X-Dat9-Part-Checksums: $BOUNDARY_CHECKSUMS" \
+    --data-binary "" \
+    "$BASE/v1/fs/$ROOT_DIR/limit-over.bin")
+  check_eq "init over upload limit returns 413" "$boundary_over_code" "413"
+  over_err=$(jq -r '.error // empty' "$boundary_over_body")
+  check_cmd "over-limit response has error message" test -n "$over_err"
+  rm -f "$boundary_over_body"
+fi
+
+rm -f "$IMAGE_LOCAL"
 
 echo
 echo "========================================================"
