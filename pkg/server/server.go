@@ -924,7 +924,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		ClusterID:        cluster.ClusterID,
 		ClaimURL:         cluster.ClaimURL,
 		ClaimExpiresAt:   cluster.ClaimExpiresAt,
-		SchemaVersion:    1,
+		SchemaVersion:    tenant.CurrentSchemaVersion(provider),
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}); err != nil {

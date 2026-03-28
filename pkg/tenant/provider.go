@@ -6,6 +6,10 @@ const (
 	ProviderDB9              = "db9"
 	ProviderTiDBZero         = "tidb_zero"
 	ProviderTiDBCloudStarter = "tidb_cloud_starter"
+
+	currentDB9SchemaVersion              = 2
+	currentTiDBZeroSchemaVersion         = 2
+	currentTiDBCloudStarterSchemaVersion = 2
 )
 
 func NormalizeProvider(provider string) (string, error) {
@@ -19,4 +23,17 @@ func NormalizeProvider(provider string) (string, error) {
 
 func SmallInDB(provider string) bool {
 	return provider == ProviderTiDBZero || provider == ProviderTiDBCloudStarter
+}
+
+func CurrentSchemaVersion(provider string) int {
+	switch provider {
+	case ProviderDB9:
+		return currentDB9SchemaVersion
+	case ProviderTiDBZero:
+		return currentTiDBZeroSchemaVersion
+	case ProviderTiDBCloudStarter:
+		return currentTiDBCloudStarterSchemaVersion
+	default:
+		return 1
+	}
 }
