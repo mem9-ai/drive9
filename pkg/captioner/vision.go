@@ -17,7 +17,7 @@ import (
 // VisionConfig holds configuration for the Vision LLM captioner.
 type VisionConfig struct {
 	APIKey   string // required
-	Model    string // e.g. "gpt-4o", "claude-sonnet-4-20250514"
+	Model    string // e.g. "gpt-4o", "gpt-4o-mini" (OpenAI-compatible models only)
 	Endpoint string // base URL, e.g. "https://api.openai.com/v1"
 	MaxBytes int64  // max image size in bytes (0 = no limit)
 }
@@ -53,6 +53,7 @@ func NewVisionFromEnv() *VisionCaptioner {
 
 // VisionCaptioner calls an OpenAI-compatible chat/completions Vision API to
 // caption images. It does NOT support Claude's native Messages API format.
+// A native Anthropic provider can be added as a separate Captioner implementation.
 type VisionCaptioner struct {
 	cfg    VisionConfig
 	client *http.Client
