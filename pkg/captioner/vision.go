@@ -51,7 +51,8 @@ func NewVisionFromEnv() *VisionCaptioner {
 	})
 }
 
-// VisionCaptioner calls an OpenAI-compatible Vision API to caption images.
+// VisionCaptioner calls an OpenAI-compatible chat/completions Vision API to
+// caption images. It does NOT support Claude's native Messages API format.
 type VisionCaptioner struct {
 	cfg    VisionConfig
 	client *http.Client
@@ -75,6 +76,9 @@ const captionPrompt = "Describe this image concisely for search indexing. " +
 func (v *VisionCaptioner) Caption(ctx context.Context, imageBytes []byte, contentType string) (string, error) {
 	if v.cfg.MaxBytes > 0 && int64(len(imageBytes)) > v.cfg.MaxBytes {
 		return "", fmt.Errorf("%w: size %d exceeds limit %d", ErrImageTooLarge, len(imageBytes), v.cfg.MaxBytes)
+	}
+	if !strings.HasPrefix(contentType, "image/") {
+		return "", fmt.Errorf("%w: unsupported content type %q", ErrInvalidOutput, contentType)
 	}
 
 	dataURI := fmt.Sprintf("data:%s;base64,%s", contentType, base64.StdEncoding.EncodeToString(imageBytes))
@@ -110,17 +114,16 @@ func (v *VisionCaptioner) Caption(ctx context.Context, imageBytes []byte, conten
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MB max
 	if err != nil {
 		return "", fmt.Errorf("read response: %w", err)
 	}
 
-	if resp.StatusCode >= 400 {
-		// 4xx errors are non-retryable (bad request, auth, etc.)
-		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			return "", fmt.Errorf("%w: HTTP %d: %s", ErrInvalidOutput, resp.StatusCode, truncate(string(respBody), 200))
-		}
+	if resp.StatusCode >= 500 {
 		return "", fmt.Errorf("vision API error: HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 200))
+	}
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("%w: HTTP %d: %s", ErrInvalidOutput, resp.StatusCode, truncate(string(respBody), 200))
 	}
 
 	var chatResp chatResponse

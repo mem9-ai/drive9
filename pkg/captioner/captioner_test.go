@@ -167,6 +167,14 @@ func TestVisionCaptioner_Caption(t *testing.T) {
 		}
 	})
 
+	t.Run("invalid content type", func(t *testing.T) {
+		c := NewVision(VisionConfig{APIKey: "k", Model: "m", Endpoint: "http://unused"})
+		_, err := c.Caption(context.Background(), []byte{0xFF}, "application/pdf")
+		if !errors.Is(err, ErrInvalidOutput) {
+			t.Errorf("expected ErrInvalidOutput for non-image content type, got %v", err)
+		}
+	})
+
 	t.Run("too long caption", func(t *testing.T) {
 		longCaption := strings.Repeat("word ", MaxCaptionLen/5+1)
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -217,17 +225,17 @@ func TestNewVisionFromEnv(t *testing.T) {
 
 	t.Run("configured with custom values", func(t *testing.T) {
 		t.Setenv("DAT9_CAPTIONER_API_KEY", "sk-abc")
-		t.Setenv("DAT9_CAPTIONER_MODEL", "claude-sonnet-4-20250514")
-		t.Setenv("DAT9_CAPTIONER_ENDPOINT", "https://api.anthropic.com/v1")
+		t.Setenv("DAT9_CAPTIONER_MODEL", "gpt-4o-mini")
+		t.Setenv("DAT9_CAPTIONER_ENDPOINT", "https://custom.openai-compatible.example/v1")
 		t.Setenv("DAT9_IMAGE_CAPTION_MAX_BYTES", "5242880")
 		c := NewVisionFromEnv()
 		if c == nil {
 			t.Fatal("expected non-nil")
 		}
-		if c.cfg.Model != "claude-sonnet-4-20250514" {
+		if c.cfg.Model != "gpt-4o-mini" {
 			t.Errorf("Model = %q", c.cfg.Model)
 		}
-		if c.cfg.Endpoint != "https://api.anthropic.com/v1" {
+		if c.cfg.Endpoint != "https://custom.openai-compatible.example/v1" {
 			t.Errorf("Endpoint = %q", c.cfg.Endpoint)
 		}
 		if c.cfg.MaxBytes != 5242880 {
