@@ -1,6 +1,7 @@
 package datastore
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -34,10 +35,10 @@ func TestInsertAndGetNode(t *testing.T) {
 		NodeID: "n1", Path: "/data/file.txt", ParentPath: "/data/",
 		Name: "file.txt", FileID: "f1", CreatedAt: now,
 	}
-	if err := s.InsertNode(node); err != nil {
+	if err := s.InsertNode(context.Background(), node); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.GetNode("/data/file.txt")
+	got, err := s.GetNode(context.Background(), "/data/file.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +49,7 @@ func TestInsertAndGetNode(t *testing.T) {
 
 func TestGetNodeNotFound(t *testing.T) {
 	s := newTestStore(t)
-	_, err := s.GetNode("/nonexistent")
+	_, err := s.GetNode(context.Background(), "/nonexistent")
 	if err != ErrNotFound {
 		t.Errorf("expected ErrNotFound, got %v", err)
 	}
@@ -63,10 +64,10 @@ func TestInsertAndGetFile(t *testing.T) {
 		Status: StatusConfirmed, ContentText: "hello world",
 		CreatedAt: now, ConfirmedAt: &now,
 	}
-	if err := s.InsertFile(f); err != nil {
+	if err := s.InsertFile(context.Background(), f); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.GetFile("f1")
+	got, err := s.GetFile(context.Background(), "f1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,15 +79,15 @@ func TestInsertAndGetFile(t *testing.T) {
 func TestStat(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	if err := s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+	if err := s.InsertFile(context.Background(), &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
 		SizeBytes: 42, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertNode(&FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 
-	nf, err := s.Stat("/a.txt")
+	nf, err := s.Stat(context.Background(), "/a.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,21 +99,21 @@ func TestStat(t *testing.T) {
 func TestListDir(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	if err := s.InsertNode(&FileNode{NodeID: "d1", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "d1", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+	if err := s.InsertFile(context.Background(), &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
 		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertNode(&FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertNode(&FileNode{NodeID: "d2", Path: "/data/sub/", ParentPath: "/data/", Name: "sub", IsDirectory: true, CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "d2", Path: "/data/sub/", ParentPath: "/data/", Name: "sub", IsDirectory: true, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 
-	entries, err := s.ListDir("/data/")
+	entries, err := s.ListDir(context.Background(), "/data/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,18 +128,18 @@ func TestListDir(t *testing.T) {
 func TestZeroCopyCp(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	if err := s.InsertFile(&File{FileID: "f1", StorageType: StorageS3, StorageRef: "blobs/f1",
+	if err := s.InsertFile(context.Background(), &File{FileID: "f1", StorageType: StorageS3, StorageRef: "blobs/f1",
 		SizeBytes: 1000000, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertNode(&FileNode{NodeID: "n1", Path: "/a.bin", ParentPath: "/", Name: "a.bin", FileID: "f1", CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/a.bin", ParentPath: "/", Name: "a.bin", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertNode(&FileNode{NodeID: "n2", Path: "/b.bin", ParentPath: "/", Name: "b.bin", FileID: "f1", CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n2", Path: "/b.bin", ParentPath: "/", Name: "b.bin", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 
-	count, err := s.RefCount("f1")
+	count, err := s.RefCount(context.Background(), "f1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,18 +151,18 @@ func TestZeroCopyCp(t *testing.T) {
 func TestDeleteWithRefCount(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	if err := s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+	if err := s.InsertFile(context.Background(), &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
 		SizeBytes: 50, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertNode(&FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertNode(&FileNode{NodeID: "n2", Path: "/b.txt", ParentPath: "/", Name: "b.txt", FileID: "f1", CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n2", Path: "/b.txt", ParentPath: "/", Name: "b.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 
-	deleted, err := s.DeleteFileWithRefCheck("/a.txt")
+	deleted, err := s.DeleteFileWithRefCheck(context.Background(), "/a.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +170,7 @@ func TestDeleteWithRefCount(t *testing.T) {
 		t.Error("expected nil (file should survive, refcount > 0)")
 	}
 
-	deleted, err = s.DeleteFileWithRefCheck("/b.txt")
+	deleted, err = s.DeleteFileWithRefCheck(context.Background(), "/b.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,28 +182,28 @@ func TestDeleteWithRefCount(t *testing.T) {
 func TestDeleteDirRecursive(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	if err := s.InsertNode(&FileNode{NodeID: "d1", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "d1", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+	if err := s.InsertFile(context.Background(), &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
 		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertFile(&File{FileID: "f2", StorageType: StorageDB9, StorageRef: "/blobs/f2",
+	if err := s.InsertFile(context.Background(), &File{FileID: "f2", StorageType: StorageDB9, StorageRef: "/blobs/f2",
 		SizeBytes: 20, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertNode(&FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertNode(&FileNode{NodeID: "n2", Path: "/data/b.txt", ParentPath: "/data/", Name: "b.txt", FileID: "f2", CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n2", Path: "/data/b.txt", ParentPath: "/data/", Name: "b.txt", FileID: "f2", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertNode(&FileNode{NodeID: "n3", Path: "/shared.txt", ParentPath: "/", Name: "shared.txt", FileID: "f1", CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n3", Path: "/shared.txt", ParentPath: "/", Name: "shared.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 
-	orphaned, err := s.DeleteDirRecursive("/data/")
+	orphaned, err := s.DeleteDirRecursive(context.Background(), "/data/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,11 +211,11 @@ func TestDeleteDirRecursive(t *testing.T) {
 		t.Fatalf("expected 1 orphaned (f2), got %d", len(orphaned))
 	}
 
-	_, err = s.GetNode("/data/")
+	_, err = s.GetNode(context.Background(), "/data/")
 	if err != ErrNotFound {
 		t.Error("expected /data/ deleted")
 	}
-	_, err = s.GetNode("/shared.txt")
+	_, err = s.GetNode(context.Background(), "/shared.txt")
 	if err != nil {
 		t.Error("expected /shared.txt to survive")
 	}
@@ -222,11 +223,11 @@ func TestDeleteDirRecursive(t *testing.T) {
 
 func TestEnsureParentDirs(t *testing.T) {
 	s := newTestStore(t)
-	if err := s.EnsureParentDirs("/a/b/c/file.txt", genID); err != nil {
+	if err := s.EnsureParentDirs(context.Background(), "/a/b/c/file.txt", genID); err != nil {
 		t.Fatal(err)
 	}
 	for _, p := range []string{"/a/", "/a/b/", "/a/b/c/"} {
-		n, err := s.GetNode(p)
+		n, err := s.GetNode(context.Background(), p)
 		if err != nil {
 			t.Errorf("expected dir at %s: %v", p, err)
 			continue
@@ -236,7 +237,7 @@ func TestEnsureParentDirs(t *testing.T) {
 		}
 	}
 	// Idempotent
-	if err := s.EnsureParentDirs("/a/b/c/file.txt", genID); err != nil {
+	if err := s.EnsureParentDirs(context.Background(), "/a/b/c/file.txt", genID); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -244,17 +245,17 @@ func TestEnsureParentDirs(t *testing.T) {
 func TestRenameFile(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	if err := s.InsertNode(&FileNode{NodeID: "n1", Path: "/old.txt", ParentPath: "/", Name: "old.txt", FileID: "f1", CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/old.txt", ParentPath: "/", Name: "old.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.UpdateNodePath("/old.txt", "/new.txt", "/", "new.txt"); err != nil {
+	if err := s.UpdateNodePath(context.Background(), "/old.txt", "/new.txt", "/", "new.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetNode("/old.txt"); err != ErrNotFound {
+	if _, err := s.GetNode(context.Background(), "/old.txt"); err != ErrNotFound {
 		t.Error("old path should be gone")
 	}
-	got, _ := s.GetNode("/new.txt")
+	got, _ := s.GetNode(context.Background(), "/new.txt")
 	if got.Name != "new.txt" || got.FileID != "f1" {
 		t.Errorf("unexpected: %+v", got)
 	}
@@ -263,31 +264,31 @@ func TestRenameFile(t *testing.T) {
 func TestRenameDir(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	if err := s.InsertNode(&FileNode{NodeID: "d1", Path: "/old/", ParentPath: "/", Name: "old", IsDirectory: true, CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "d1", Path: "/old/", ParentPath: "/", Name: "old", IsDirectory: true, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertNode(&FileNode{NodeID: "n1", Path: "/old/a.txt", ParentPath: "/old/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/old/a.txt", ParentPath: "/old/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertNode(&FileNode{NodeID: "d2", Path: "/old/sub/", ParentPath: "/old/", Name: "sub", IsDirectory: true, CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "d2", Path: "/old/sub/", ParentPath: "/old/", Name: "sub", IsDirectory: true, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertNode(&FileNode{NodeID: "n2", Path: "/old/sub/b.txt", ParentPath: "/old/sub/", Name: "b.txt", FileID: "f2", CreatedAt: now}); err != nil {
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n2", Path: "/old/sub/b.txt", ParentPath: "/old/sub/", Name: "b.txt", FileID: "f2", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 
-	count, err := s.RenameDir("/old/", "/new/")
+	count, err := s.RenameDir(context.Background(), "/old/", "/new/")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if count != 4 {
 		t.Errorf("expected 4 updated, got %d", count)
 	}
-	if _, err := s.GetNode("/old/"); err != ErrNotFound {
+	if _, err := s.GetNode(context.Background(), "/old/"); err != ErrNotFound {
 		t.Error("/old/ should be gone")
 	}
 	for _, p := range []string{"/new/", "/new/a.txt", "/new/sub/", "/new/sub/b.txt"} {
-		if _, err := s.GetNode(p); err != nil {
+		if _, err := s.GetNode(context.Background(), p); err != nil {
 			t.Errorf("expected %s: %v", p, err)
 		}
 	}
@@ -296,15 +297,15 @@ func TestRenameDir(t *testing.T) {
 func TestUpdateFileContent(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
-	if err := s.InsertFile(&File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+	if err := s.InsertFile(context.Background(), &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
 		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.UpdateFileContent("f1", StorageDB9, "/blobs/f1-v2", "text/plain", "abc123", "new content", []byte("blob"), 42); err != nil {
+	if err := s.UpdateFileContent(context.Background(), "f1", StorageDB9, "/blobs/f1-v2", "text/plain", "abc123", "new content", []byte("blob"), 42); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := s.GetFile("f1")
+	got, _ := s.GetFile(context.Background(), "f1")
 	if got.Revision != 2 || got.SizeBytes != 42 || got.ContentText != "new content" {
 		t.Errorf("unexpected: %+v", got)
 	}

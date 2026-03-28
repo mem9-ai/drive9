@@ -9,15 +9,16 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/mem9-ai/dat9/pkg/encrypt"
+	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/server"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	"go.uber.org/zap"
 )
 
 const (
@@ -34,6 +35,13 @@ func main() {
 	if len(os.Args) == 2 {
 		addr = os.Args[1]
 	}
+
+	srvLogger, err := logger.NewServerLogger()
+	if err != nil {
+		die(fmt.Errorf("create logger: %w", err))
+	}
+	defer func() { _ = srvLogger.Sync() }()
+	logger.Set(srvLogger)
 
 	metaDSN := os.Getenv("DAT9_META_DSN")
 	if metaDSN == "" {
@@ -56,9 +64,9 @@ func main() {
 		if err := os.MkdirAll(s3Dir, 0o755); err != nil {
 			die(fmt.Errorf("create s3 dir: %w", err))
 		}
-		log.Printf("using local S3 root directory (dir=%s)", s3Dir)
+		logger.Info(context.Background(), "s3_mode_local", zap.String("dir", s3Dir))
 	} else {
-		log.Printf("using AWS S3 (bucket=%s region=%s role=%s)", s3Bucket, s3Region, envOr("DAT9_S3_ROLE_ARN", "default-credentials"))
+		logger.Info(context.Background(), "s3_mode_aws", zap.String("bucket", s3Bucket), zap.String("region", s3Region), zap.String("role", envOr("DAT9_S3_ROLE_ARN", "default-credentials")))
 	}
 
 	encryptType := envOr("DAT9_ENCRYPT_TYPE", "local_aes")
@@ -92,7 +100,7 @@ func main() {
 		provisioner, provisionerErr = tenant.NewDB9ProvisionerFromEnv()
 	}
 	if provisionerErr != nil {
-		log.Printf("provider %s is not configured for auto provisioning: %v", providerType, provisionerErr)
+		logger.Warn(context.Background(), "provisioner_not_configured", zap.String("provider", providerType), zap.Error(provisionerErr))
 	}
 
 	var pool *tenant.Pool
@@ -138,6 +146,7 @@ func main() {
 		TokenSecret:    tokenSecret,
 		S3Dir:          s3Dir,
 		MaxUploadBytes: maxUploadBytes,
+		Logger:         srvLogger,
 	}).ListenAndServe(addr))
 }
 
@@ -194,8 +203,8 @@ func publicBaseURL(listenAddr string) string {
 	case strings.HasPrefix(listenAddr, "http://"), strings.HasPrefix(listenAddr, "https://"):
 		return strings.TrimRight(listenAddr, "/")
 	default:
-		log.Fatalf("DAT9_PUBLIC_URL is required when listen address is %q (wildcard or non-loopback). "+
-			"Set DAT9_PUBLIC_URL to the externally reachable base URL.", listenAddr)
+		fmt.Fprintf(os.Stderr, "dat9-server: DAT9_PUBLIC_URL is required when listen address is %q (wildcard or non-loopback). Set DAT9_PUBLIC_URL to the externally reachable base URL.\n", listenAddr)
+		os.Exit(1)
 		return "" // unreachable
 	}
 }
