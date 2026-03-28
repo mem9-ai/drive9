@@ -41,7 +41,7 @@ func initDB9Schema(dsn string) error {
 			status          VARCHAR(32) NOT NULL DEFAULT 'PENDING',
 			source_id       VARCHAR(255),
 			content_text    TEXT,
-			embedding       vector(1024) GENERATED ALWAYS AS (EMBED_TEXT('` + autoEmbedTextModel + `', content_text, '{"dimensions": 1024}'::jsonb)) STORED,
+			embedding       vector(1024) GENERATED ALWAYS AS (EMBED_TEXT('` + autoEmbedTextModel + `', content_text, '{"dimensions": 1024}')) STORED,
 			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			confirmed_at    TIMESTAMPTZ,
 			expires_at      TIMESTAMPTZ
