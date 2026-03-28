@@ -95,21 +95,39 @@ func subtreeCond(prefix string) (string, []any) {
 }
 
 func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limit int) []SearchResult {
-	conds := []string{"f.status = 'CONFIRMED'", "f.embedding_text IS NOT NULL"}
-	args := []any{query}
+	baseConds := []string{"f.status = 'CONFIRMED'"}
+	var pathArgs []any
 
 	if pathPrefix != "" && pathPrefix != "/" {
 		cond, pargs := subtreeCond(pathPrefix)
-		conds = append(conds, cond)
-		args = append(args, pargs...)
+		baseConds = append(baseConds, cond)
+		pathArgs = append(pathArgs, pargs...)
 	}
-	args = append(args, query, limit)
+	whereBase := strings.Join(baseConds, " AND ")
 
-	q := `SELECT fn.path, fn.name, f.size_bytes,
-		VEC_EMBED_COSINE_DISTANCE(f.embedding_text, ?) AS distance
-		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
-		WHERE ` + strings.Join(conds, " AND ") + `
-		ORDER BY VEC_EMBED_COSINE_DISTANCE(f.embedding_text, ?)
+	args := make([]any, 0, 2+len(pathArgs)*2+1)
+	args = append(args, query)
+	args = append(args, pathArgs...)
+	args = append(args, query)
+	args = append(args, pathArgs...)
+	args = append(args, limit)
+
+	q := `SELECT path, name, size_bytes, MIN(distance) AS distance
+		FROM (
+			SELECT fn.path AS path, fn.name AS name, f.size_bytes AS size_bytes,
+				VEC_EMBED_COSINE_DISTANCE(f.embedding_text, ?) AS distance
+			FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
+			WHERE ` + whereBase + ` AND f.embedding_text IS NOT NULL
+
+			UNION ALL
+
+			SELECT fn.path AS path, fn.name AS name, f.size_bytes AS size_bytes,
+				VEC_EMBED_COSINE_DISTANCE(f.embedding_image, ?) AS distance
+			FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
+			WHERE ` + whereBase + ` AND f.embedding_image IS NOT NULL
+		) ranked
+		GROUP BY path, name, size_bytes
+		ORDER BY distance
 		LIMIT ?`
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
