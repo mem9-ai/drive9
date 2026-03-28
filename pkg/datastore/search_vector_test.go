@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-func TestBuildVectorSearchQueryIncludesTextAndImageEmbeddings(t *testing.T) {
-	q, args := buildVectorSearchQuery("invoice screenshot", "/docs/", 25)
+func TestBuildVectorSearchQueryV2RoutesTextAndImage(t *testing.T) {
+	q, args := buildVectorSearchQuery("invoice screenshot", "/docs/", 25, true)
 
 	if !strings.Contains(q, "VEC_EMBED_COSINE_DISTANCE(f.embedding,") {
 		t.Fatalf("expected query to include text embedding distance: %s", q)
@@ -42,8 +42,35 @@ func TestBuildVectorSearchQueryIncludesTextAndImageEmbeddings(t *testing.T) {
 }
 
 func TestBuildVectorSearchQueryRootPathHasNoPathArgs(t *testing.T) {
-	_, args := buildVectorSearchQuery("q", "/", 10)
+	_, args := buildVectorSearchQuery("q", "/", 10, true)
 	if len(args) != 3 {
 		t.Fatalf("expected 3 args for root path, got %d", len(args))
+	}
+}
+
+func TestBuildVectorSearchQueryV1UsesTextEmbeddingOnly(t *testing.T) {
+	q, args := buildVectorSearchQuery("invoice", "/docs/", 25, false)
+
+	if strings.Contains(q, "embedding_image") {
+		t.Fatalf("did not expect image embedding query in v1 mode: %s", q)
+	}
+	if strings.Contains(q, "content_type LIKE 'image/%'") {
+		t.Fatalf("did not expect content-type routing in v1 mode: %s", q)
+	}
+
+	if len(args) != 4 {
+		t.Fatalf("expected 4 args, got %d", len(args))
+	}
+	if got, ok := args[0].(string); !ok || got != "invoice" {
+		t.Fatalf("unexpected query arg: %#v", args[0])
+	}
+	if got, ok := args[1].(string); !ok || got != "/docs" {
+		t.Fatalf("unexpected path arg #1: %#v", args[1])
+	}
+	if got, ok := args[2].(string); !ok || got != "/docs/%" {
+		t.Fatalf("unexpected path arg #2: %#v", args[2])
+	}
+	if got, ok := args[3].(int); !ok || got != 25 {
+		t.Fatalf("unexpected limit arg: %#v", args[3])
 	}
 }

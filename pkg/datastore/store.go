@@ -107,6 +107,7 @@ type Upload struct {
 type Store struct {
 	db             *sql.DB
 	hasContentBlob bool
+	hasImageEmbed  bool
 }
 
 func Open(dsn string) (*Store, error) {
@@ -124,6 +125,7 @@ func Open(dsn string) (*Store, error) {
 	}
 	s := &Store{db: db}
 	s.hasContentBlob = s.columnExists("files", "content_blob")
+	s.hasImageEmbed = s.columnExists("files", "embedding_image")
 	return s, nil
 }
 

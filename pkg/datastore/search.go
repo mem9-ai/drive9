@@ -98,7 +98,7 @@ func subtreeCond(prefix string) (string, []any) {
 }
 
 func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limit int) []SearchResult {
-	q, args := buildVectorSearchQuery(query, pathPrefix, limit)
+	q, args := buildVectorSearchQuery(query, pathPrefix, limit, s.hasImageEmbed)
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -128,7 +128,7 @@ func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limi
 	return out
 }
 
-func buildVectorSearchQuery(query, pathPrefix string, limit int) (string, []any) {
+func buildVectorSearchQuery(query, pathPrefix string, limit int, hasImageEmbed bool) (string, []any) {
 	baseConds := []string{"f.status = 'CONFIRMED'"}
 	var pathArgs []any
 
@@ -138,6 +138,21 @@ func buildVectorSearchQuery(query, pathPrefix string, limit int) (string, []any)
 		pathArgs = append(pathArgs, pargs...)
 	}
 	whereBase := strings.Join(baseConds, " AND ")
+
+	if !hasImageEmbed {
+		args := make([]any, 0, 1+len(pathArgs)+1)
+		args = append(args, query)
+		args = append(args, pathArgs...)
+		args = append(args, limit)
+
+		q := `SELECT fn.path, fn.name, f.size_bytes,
+			VEC_EMBED_COSINE_DISTANCE(f.embedding, ?) AS distance
+			FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
+			WHERE ` + whereBase + ` AND f.embedding IS NOT NULL
+			ORDER BY distance
+			LIMIT ?`
+		return q, args
+	}
 
 	args := make([]any, 0, 2+len(pathArgs)+1)
 	args = append(args, query)
