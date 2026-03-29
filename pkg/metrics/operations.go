@@ -4,9 +4,6 @@ package metrics
 import (
 	"fmt"
 	"net/http"
-	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -50,11 +47,11 @@ func RecordOperation(component, operation, result string, d time.Duration) {
 
 func WritePrometheus(w http.ResponseWriter) {
 	globalOps.mu.RLock()
-	countKeys := sorted(globalOps.counts)
-	counts := cloneInt(globalOps.counts)
-	durationCount := cloneInt(globalOps.durationCount)
-	durationSum := cloneFloat(globalOps.durationSum)
-	durationBucket := cloneBucket(globalOps.durationBucket)
+	countKeys := SortedKeys(globalOps.counts)
+	counts := CloneIntMap(globalOps.counts)
+	durationCount := CloneIntMap(globalOps.durationCount)
+	durationSum := CloneFloatMap(globalOps.durationSum)
+	durationBucket := CloneBucketMap(globalOps.durationBucket)
 	globalOps.mu.RUnlock()
 
 	_, _ = fmt.Fprintln(w, "# HELP dat9_service_operations_total Service operations by component/operation/result")
@@ -68,7 +65,7 @@ func WritePrometheus(w http.ResponseWriter) {
 	for _, k := range countKeys {
 		buckets := durationBucket[k]
 		for i, bound := range operationDurationBounds {
-			_, _ = fmt.Fprintf(w, "dat9_service_operation_duration_seconds_bucket{%s,le=\"%s\"} %d\n", k, formatPromBound(bound), buckets[i])
+			_, _ = fmt.Fprintf(w, "dat9_service_operation_duration_seconds_bucket{%s,le=\"%s\"} %d\n", k, FormatPromBound(bound), buckets[i])
 		}
 		_, _ = fmt.Fprintf(w, "dat9_service_operation_duration_seconds_bucket{%s,le=\"+Inf\"} %d\n", k, durationCount[k])
 	}
@@ -87,51 +84,5 @@ func WritePrometheus(w http.ResponseWriter) {
 }
 
 func labels(component, operation, result string) string {
-	return "component=\"" + esc(component) + "\",operation=\"" + esc(operation) + "\",result=\"" + esc(result) + "\""
-}
-
-func esc(s string) string {
-	s = strings.ReplaceAll(s, "\\", "\\\\")
-	s = strings.ReplaceAll(s, `"`, `\\"`)
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	return s
-}
-
-func sorted[T any](m map[string]T) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	sort.Strings(ks)
-	return ks
-}
-
-func cloneInt(m map[string]int64) map[string]int64 {
-	out := make(map[string]int64, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
-}
-
-func cloneFloat(m map[string]float64) map[string]float64 {
-	out := make(map[string]float64, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
-}
-
-func cloneBucket(m map[string][]int64) map[string][]int64 {
-	out := make(map[string][]int64, len(m))
-	for k, v := range m {
-		vv := make([]int64, len(v))
-		copy(vv, v)
-		out[k] = vv
-	}
-	return out
-}
-
-func formatPromBound(v float64) string {
-	return strconv.FormatFloat(v, 'g', -1, 64)
+	return "component=\"" + EscapePromLabel(component) + "\",operation=\"" + EscapePromLabel(operation) + "\",result=\"" + EscapePromLabel(result) + "\""
 }

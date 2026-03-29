@@ -43,11 +43,12 @@ Use this value unless the environment owner announces a new endpoint.
 5. Multi-file `PUT` + `GET` content verification
 6. Batch small-file writes (`N` files) + list count + sample reads
 7. Search checks (`GET ?grep=...`, `GET ?find=...`)
-8. SQL sanity check (`POST /v1/sql`)
-9. `copy`, `rename`, `delete`
-10. Final `list` verifies expected structure after mutations
-11. Large multipart upload (`PUT` plan + presigned part uploads + complete + download checksum)
-12. Upload-limit boundary (`1GiB` initiate accepted, `1GiB+1` rejected)
+8. Image upload (`.png`) + image query check (`GET ?find=&name=*.png`)
+9. SQL sanity check (`POST /v1/sql`)
+10. `copy`, `rename`, `delete`
+11. Final `list` verifies expected structure after mutations
+12. Large multipart upload (`PUT` plan + presigned part uploads + complete + download checksum)
+13. Upload-limit boundary (`1GiB` initiate accepted, `1GiB+1` rejected)
 
 ### `api-smoke-test-existing-key.sh`
 
@@ -61,9 +62,10 @@ Use this value unless the environment owner announces a new endpoint.
 2. Build local `dat9` CLI binary
 3. CLI small-file flow (`cp`, `ls`, `cat`, `mv`, `rm`)
 4. CLI batch small-file flow (`cp` many files + dir list count + stat + sample reads)
-5. CLI search/DB flow (`fs grep`, `fs find`, `db sql`)
-6. CLI large-file flow (`cp` upload multipart + `cp` download + checksum verification)
-7. CLI upload-limit boundary (`1GiB` initiate accepted, `1GiB+1` rejected)
+5. CLI search flow (`fs grep`, `fs find`)
+6. CLI image flow (`fs cp` png + `fs find -name "*.png"`)
+7. CLI large-file flow (`cp` upload multipart + `cp` download + checksum verification)
+8. CLI upload-limit boundary (`1GiB` initiate accepted, `1GiB+1` rejected)
 
 ## Environment variables
 
