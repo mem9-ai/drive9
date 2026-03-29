@@ -12,7 +12,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
@@ -53,6 +55,10 @@ func main() {
 	s3Region := envOr("DAT9_S3_REGION", "us-east-1")
 	s3Prefix := os.Getenv("DAT9_S3_PREFIX")
 	s3RoleARN := os.Getenv("DAT9_S3_ROLE_ARN")
+	backendOptions, err := buildBackendOptionsFromEnv()
+	if err != nil {
+		die(err)
+	}
 
 	store, err := meta.Open(metaDSN)
 	if err != nil {
@@ -129,12 +135,13 @@ func main() {
 		}
 
 		pool = tenant.NewPool(tenant.PoolConfig{
-			S3Dir:     s3Dir,
-			PublicURL: publicBaseURL(addr),
-			S3Bucket:  s3Bucket,
-			S3Region:  s3Region,
-			S3Prefix:  s3Prefix,
-			S3RoleARN: s3RoleARN,
+			S3Dir:          s3Dir,
+			PublicURL:      publicBaseURL(addr),
+			S3Bucket:       s3Bucket,
+			S3Region:       s3Region,
+			S3Prefix:       s3Prefix,
+			S3RoleARN:      s3RoleARN,
+			BackendOptions: backendOptions,
 		}, enc)
 		defer pool.Close()
 	}
@@ -176,6 +183,18 @@ environment:
   DAT9_S3_PREFIX   S3 key prefix (e.g. "tenants")
   DAT9_S3_ROLE_ARN IAM role ARN to assume via STS (optional)
   DAT9_S3_DIR      local s3 mock root directory (default: ./s3, only used without DAT9_S3_BUCKET)
+  Image extraction (async image -> text for search):
+  DAT9_IMAGE_EXTRACT_ENABLED true|false (default: true)
+  DAT9_IMAGE_EXTRACT_QUEUE_SIZE buffered task queue size (default: 128)
+  DAT9_IMAGE_EXTRACT_WORKERS number of workers (default: 1)
+  DAT9_IMAGE_EXTRACT_MAX_BYTES max image bytes processed per task (default: 8388608)
+  DAT9_IMAGE_EXTRACT_TIMEOUT_SECONDS extractor timeout seconds (default: 20)
+  DAT9_IMAGE_EXTRACT_MAX_TEXT_BYTES max extracted text stored in files.content_text (default: 8192)
+  DAT9_IMAGE_EXTRACT_API_BASE OpenAI-compatible base URL (optional)
+  DAT9_IMAGE_EXTRACT_API_KEY  API key for DAT9_IMAGE_EXTRACT_API_BASE (optional)
+  DAT9_IMAGE_EXTRACT_MODEL    model name for vision extraction (optional)
+  DAT9_IMAGE_EXTRACT_PROMPT   custom extraction prompt (optional)
+  DAT9_IMAGE_EXTRACT_MAX_TOKENS max model output tokens (default: 256)
 `)
 	os.Exit(2)
 }
@@ -207,4 +226,92 @@ func publicBaseURL(listenAddr string) string {
 		os.Exit(1)
 		return "" // unreachable
 	}
+}
+
+func buildBackendOptionsFromEnv() (backend.Options, error) {
+	var opts backend.Options
+	if !envBool("DAT9_IMAGE_EXTRACT_ENABLED", true) {
+		return opts, nil
+	}
+
+	async := backend.AsyncImageExtractOptions{
+		Enabled:             true,
+		QueueSize:           envInt("DAT9_IMAGE_EXTRACT_QUEUE_SIZE", 128),
+		Workers:             envInt("DAT9_IMAGE_EXTRACT_WORKERS", 1),
+		MaxImageBytes:       envInt64("DAT9_IMAGE_EXTRACT_MAX_BYTES", 8<<20),
+		TaskTimeout:         time.Duration(envInt("DAT9_IMAGE_EXTRACT_TIMEOUT_SECONDS", 20)) * time.Second,
+		MaxExtractTextBytes: envInt("DAT9_IMAGE_EXTRACT_MAX_TEXT_BYTES", 8<<10),
+	}
+
+	baseURL := strings.TrimSpace(os.Getenv("DAT9_IMAGE_EXTRACT_API_BASE"))
+	apiKey := strings.TrimSpace(os.Getenv("DAT9_IMAGE_EXTRACT_API_KEY"))
+	model := strings.TrimSpace(os.Getenv("DAT9_IMAGE_EXTRACT_MODEL"))
+	prompt := strings.TrimSpace(os.Getenv("DAT9_IMAGE_EXTRACT_PROMPT"))
+	maxTokens := envInt("DAT9_IMAGE_EXTRACT_MAX_TOKENS", 256)
+
+	configured := baseURL != "" || apiKey != "" || model != ""
+	if configured {
+		if baseURL == "" || apiKey == "" || model == "" {
+			return backend.Options{}, fmt.Errorf("DAT9_IMAGE_EXTRACT_API_BASE, DAT9_IMAGE_EXTRACT_API_KEY and DAT9_IMAGE_EXTRACT_MODEL must be set together")
+		}
+		extractor, err := backend.NewOpenAIImageTextExtractor(backend.OpenAIImageTextExtractorConfig{
+			BaseURL:   baseURL,
+			APIKey:    apiKey,
+			Model:     model,
+			Prompt:    prompt,
+			MaxTokens: maxTokens,
+			Timeout:   async.TaskTimeout,
+		})
+		if err != nil {
+			return backend.Options{}, fmt.Errorf("init image extractor: %w", err)
+		}
+		async.Extractor = backend.NewFallbackImageTextExtractor(extractor, backend.NewBasicImageTextExtractor())
+		logger.Info(context.Background(), "image_extract_mode_openai_compatible",
+			zap.String("model", model), zap.String("base_url", baseURL))
+	} else {
+		async.Extractor = backend.NewBasicImageTextExtractor()
+		logger.Info(context.Background(), "image_extract_mode_basic_fallback")
+	}
+
+	opts.AsyncImageExtract = async
+	return opts, nil
+}
+
+func envBool(key string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func envInt(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func envInt64(key string, fallback int64) int64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return v
 }

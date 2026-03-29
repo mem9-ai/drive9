@@ -12,6 +12,10 @@ import (
 )
 
 func newTestBackend(t *testing.T) *Dat9Backend {
+	return newTestBackendWithOptions(t, Options{})
+}
+
+func newTestBackendWithOptions(t *testing.T, opts Options) *Dat9Backend {
 	t.Helper()
 
 	s3Dir, err := os.MkdirTemp("", "dat9-s3-*")
@@ -32,10 +36,11 @@ func newTestBackend(t *testing.T) *Dat9Backend {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := NewWithS3(store, s3c)
+	b, err := NewWithS3ModeAndOptions(store, s3c, true, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { b.Close() })
 	return b
 }
 
