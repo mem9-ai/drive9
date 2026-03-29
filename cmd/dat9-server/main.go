@@ -184,7 +184,7 @@ environment:
   DAT9_S3_ROLE_ARN IAM role ARN to assume via STS (optional)
   DAT9_S3_DIR      local s3 mock root directory (default: ./s3, only used without DAT9_S3_BUCKET)
   Image extraction (async image -> text for search):
-  DAT9_IMAGE_EXTRACT_ENABLED true|false (default: true)
+  DAT9_IMAGE_EXTRACT_ENABLED true|false (default: false)
   DAT9_IMAGE_EXTRACT_QUEUE_SIZE buffered task queue size (default: 128)
   DAT9_IMAGE_EXTRACT_WORKERS number of workers (default: 1)
   DAT9_IMAGE_EXTRACT_MAX_BYTES max image bytes processed per task (default: 8388608)
@@ -230,7 +230,7 @@ func publicBaseURL(listenAddr string) string {
 
 func buildBackendOptionsFromEnv() (backend.Options, error) {
 	var opts backend.Options
-	if !envBool("DAT9_IMAGE_EXTRACT_ENABLED", true) {
+	if !envBool("DAT9_IMAGE_EXTRACT_ENABLED", false) {
 		return opts, nil
 	}
 

@@ -79,7 +79,7 @@ c.Delete("/data/file.txt")
 | `DAT9_S3_PREFIX` | S3 key prefix (e.g. `tenants/abc/`) | |
 | `DAT9_S3_ROLE_ARN` | IAM role ARN to assume via STS | |
 | `DAT9_S3_DIR` | Local S3 mock directory (only used without `DAT9_S3_BUCKET`) | `./s3` |
-| `DAT9_IMAGE_EXTRACT_ENABLED` | Enable async image->text extraction for search | `true` |
+| `DAT9_IMAGE_EXTRACT_ENABLED` | Enable async image->text extraction for search | `false` |
 | `DAT9_IMAGE_EXTRACT_QUEUE_SIZE` | In-memory queue size for extraction tasks | `128` |
 | `DAT9_IMAGE_EXTRACT_WORKERS` | Number of extraction workers | `1` |
 | `DAT9_IMAGE_EXTRACT_MAX_BYTES` | Max image bytes processed per task | `8388608` |
