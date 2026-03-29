@@ -27,6 +27,8 @@ type PoolConfig struct {
 	S3Region   string
 	S3Prefix   string
 	S3RoleARN  string
+
+	BackendOptions backend.Options
 }
 
 type Pool struct {
@@ -78,6 +80,7 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if elem, ok := p.items[t.ID]; ok {
+		b.Close()
 		_ = st.Close()
 		p.order.MoveToFront(elem)
 		return elem.Value.(*entry).backend, nil
@@ -181,7 +184,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			return nil, nil, err
 		}
 		smallInDB := SmallInDB(t.Provider)
-		b, err := backend.NewWithS3Mode(store, s3c, smallInDB)
+		b, err := backend.NewWithS3ModeAndOptions(store, s3c, smallInDB, p.cfg.BackendOptions)
 		if err != nil {
 			_ = store.Close()
 			return nil, nil, err
@@ -197,14 +200,14 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			return nil, nil, err
 		}
 		smallInDB := SmallInDB(t.Provider)
-		b, err := backend.NewWithS3Mode(store, s3c, smallInDB)
+		b, err := backend.NewWithS3ModeAndOptions(store, s3c, smallInDB, p.cfg.BackendOptions)
 		if err != nil {
 			_ = store.Close()
 			return nil, nil, err
 		}
 		return b, store, nil
 	}
-	b, err := backend.New(store)
+	b, err := backend.NewWithOptions(store, p.cfg.BackendOptions)
 	if err != nil {
 		_ = store.Close()
 		return nil, nil, err
@@ -216,6 +219,9 @@ func (p *Pool) removeLocked(elem *list.Element) {
 	e := elem.Value.(*entry)
 	p.order.Remove(elem)
 	delete(p.items, e.tenantID)
+	if e.backend != nil {
+		e.backend.Close()
+	}
 	if e.store != nil {
 		_ = e.store.Close()
 	}
