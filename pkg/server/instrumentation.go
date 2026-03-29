@@ -217,6 +217,8 @@ func requestRoute(path string) string {
 	switch {
 	case path == "/metrics":
 		return "/metrics"
+	case path == "/healthz":
+		return "/healthz"
 	case path == "/v1/provision":
 		return "/v1/provision"
 	case path == "/v1/status":
@@ -285,6 +287,9 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 	}
 	if apiKeyID != "" {
 		fields = append(fields, zap.String("api_key_id", apiKeyID))
+	}
+	if route == "/metrics" || route == "/healthz" {
+		return
 	}
 	logger.Info(r.Context(), "http_request", fields...)
 }
