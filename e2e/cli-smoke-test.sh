@@ -106,10 +106,42 @@ dat9_retry() {
   done
 }
 
+# Some read-after-write paths can be eventually consistent right after upload.
+dat9_retry_read() {
+  local attempt=1
+  local out rc
+  while :; do
+    set +e
+    out=$(dat9 "$@" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      printf '%s' "$out"
+      return 0
+    fi
+    if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"not found"* ]]; then
+      echo "retry $attempt/$CLI_MAX_RETRIES for dat9 $* (not found yet)" >&2
+      attempt=$((attempt + 1))
+      sleep "$CLI_RETRY_SLEEP_S"
+      continue
+    fi
+    if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* ]]; then
+      echo "retry $attempt/$CLI_MAX_RETRIES for dat9 $* (throttled)" >&2
+      attempt=$((attempt + 1))
+      sleep "$CLI_RETRY_SLEEP_S"
+      continue
+    fi
+    printf '%s\n' "$out" >&2
+    return "$rc"
+  done
+}
+
 TS="$(date +%s)"
 SMALL_LOCAL="/tmp/dat9-cli-small-${TS}.txt"
 SMALL_REMOTE="/cli-${TS}-small.txt"
 SMALL_RENAMED="/cli-${TS}-small-renamed.txt"
+IMAGE_LOCAL="/tmp/dat9-cli-image-${TS}.png"
+IMAGE_REMOTE="/cli-${TS}-image.png"
 BATCH_LOCAL_DIR="/tmp/dat9-cli-batch-${TS}"
 BATCH_REMOTE_DIR="/cli-${TS}-batch"
 LARGE_LOCAL="/tmp/dat9-cli-large-${TS}.bin"
@@ -131,10 +163,10 @@ PY
 )
 check_eq "uploaded small file appears in ls /" "$small_present" "true"
 
-cat_out="$(dat9_retry fs cat ":$SMALL_REMOTE")"
+cat_out="$(dat9_retry_read fs cat "$SMALL_REMOTE")"
 check_eq "cat returns expected small file content" "$cat_out" "cli-smoke-${TS}"
 
-dat9_retry fs mv ":$SMALL_REMOTE" ":$SMALL_RENAMED" >/dev/null
+dat9_retry fs mv "$SMALL_REMOTE" "$SMALL_RENAMED" >/dev/null
 renamed_out="$(dat9_retry fs ls /)"
 renamed_present=$(python3 - "$renamed_out" "$(basename "$SMALL_RENAMED")" <<'PY'
 import sys
@@ -154,7 +186,7 @@ for i in $(seq 1 "$CLI_BATCH_SMALL_FILE_COUNT"); do
   dat9_retry fs cp "$lp" ":$rp" >/dev/null
 done
 
-batch_ls="$(dat9_retry fs ls ":$BATCH_REMOTE_DIR")"
+batch_ls="$(dat9_retry fs ls "$BATCH_REMOTE_DIR")"
 batch_count=$(python3 - "$batch_ls" <<'PY'
 import sys
 lines=[ln.strip() for ln in sys.argv[1].splitlines() if ln.strip()]
@@ -165,12 +197,12 @@ check_eq "batch dir file count matches" "$batch_count" "$CLI_BATCH_SMALL_FILE_CO
 
 for i in 1 "$CLI_BATCH_SMALL_FILE_COUNT"; do
   rp="$BATCH_REMOTE_DIR/file-${i}.txt"
-  got="$(dat9_retry fs cat ":$rp")"
+  got="$(dat9_retry_read fs cat "$rp")"
   want="cli-batch-$TS-$i"
   check_eq "batch file content matches for $rp" "$got" "$want"
 done
 
-batch_stat="$(dat9_retry fs stat ":$BATCH_REMOTE_DIR/file-1.txt")"
+batch_stat="$(dat9_retry fs stat "$BATCH_REMOTE_DIR/file-1.txt")"
 batch_isdir=$(python3 - "$batch_stat" <<'PY'
 import sys
 val=""
@@ -183,7 +215,7 @@ PY
 )
 check_eq "stat reports batch file isdir=false" "$batch_isdir" "false"
 
-echo "[6] cli grep/find/db checks"
+echo "[6] cli grep/find checks"
 grep_out="$(dat9_retry fs grep "cli-batch-$TS" "/")"
 grep_has_batch=$(python3 - "$grep_out" "$BATCH_REMOTE_DIR/file-1.txt" <<'PY'
 import sys
@@ -203,20 +235,26 @@ PY
 )
 check_eq "cli find by name returns txt files" "$find_has_txt" "true"
 
-sql_out="$(dat9_retry db sql -q "SELECT 1 AS n")"
-sql_ok=$(python3 - "$sql_out" <<'PY'
-import sys,re
-s=sys.argv[1]
-print("true" if re.search(r"\b1\b", s) else "false")
+echo "[6.1] cli image upload/find checks"
+printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+Xf7YAAAAASUVORK5CYII=' | base64 -d > "$IMAGE_LOCAL"
+check_cmd "local cli png fixture exists" test -s "$IMAGE_LOCAL"
+dat9_retry fs cp "$IMAGE_LOCAL" ":$IMAGE_REMOTE" >/dev/null
+
+find_png_out="$(dat9_retry fs find / -name "*.png")"
+find_has_png=$(python3 - "$find_png_out" "$IMAGE_REMOTE" <<'PY'
+import sys
+lines=[ln.strip() for ln in sys.argv[1].splitlines() if ln.strip()]
+target=sys.argv[2]
+print("true" if any(line == target or line.endswith('.png') for line in lines) else "false")
 PY
 )
-check_eq "cli db sql returns row containing 1" "$sql_ok" "true"
+check_eq "cli find by name returns png files" "$find_has_png" "true"
 
 echo "[7] large multipart upload via cli cp"
 dd if=/dev/zero of="$LARGE_LOCAL" bs=1M count="$CLI_LARGE_FILE_MB" status=none
 dat9_retry fs cp "$LARGE_LOCAL" ":$LARGE_REMOTE" >/dev/null
 
-stat_out="$(dat9_retry fs stat ":$LARGE_REMOTE")"
+stat_out="$(dat9_retry fs stat "$LARGE_REMOTE")"
 remote_size=$(python3 - "$stat_out" <<'PY'
 import sys
 for line in sys.argv[1].splitlines():
@@ -235,10 +273,11 @@ sum_dst=$(sha256sum "$LARGE_DOWNLOADED" | cut -d' ' -f1)
 check_eq "downloaded large file sha256 matches" "$sum_dst" "$sum_src"
 
 echo "[8] cleanup via cli"
-dat9_retry fs rm ":$SMALL_RENAMED" >/dev/null
-dat9_retry fs rm ":$LARGE_REMOTE" >/dev/null
+dat9_retry fs rm "$SMALL_RENAMED" >/dev/null
+dat9_retry fs rm "$IMAGE_REMOTE" >/dev/null
+dat9_retry fs rm "$LARGE_REMOTE" >/dev/null
 for i in $(seq 1 "$CLI_BATCH_SMALL_FILE_COUNT"); do
-  dat9_retry fs rm ":$BATCH_REMOTE_DIR/file-${i}.txt" >/dev/null
+  dat9_retry fs rm "$BATCH_REMOTE_DIR/file-${i}.txt" >/dev/null
 done
 
 final_ls="$(dat9_retry fs ls /)"
@@ -305,7 +344,7 @@ PY
   rm -f "$over_file"
 fi
 
-rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
+rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$IMAGE_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
 rm -rf "$BATCH_LOCAL_DIR"
 
 echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"

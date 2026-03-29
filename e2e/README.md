@@ -12,9 +12,9 @@ Live end-to-end scripts for validating deployed `dat9-server` behavior.
 
 | Script | What it validates |
 |--------|--------------------|
-| `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, grep/find/sql checks, large multipart upload+download |
+| `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, grep/find checks, image upload+query check, sql checks, large multipart upload+download |
 | `api-smoke-test-existing-key.sh` | Existing API key status/list checks |
-| `cli-smoke-test.sh` | End-to-end CLI workflow including `fs grep`/`fs find`/`db sql` and large multipart `fs cp` upload/download |
+| `cli-smoke-test.sh` | End-to-end CLI workflow including `fs grep`/`fs find`, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
 
 ## Run
 

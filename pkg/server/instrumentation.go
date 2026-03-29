@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -119,14 +118,14 @@ func (m *serverMetrics) writePrometheus(w http.ResponseWriter) {
 	_, _ = fmt.Fprintf(w, "dat9_http_inflight_requests %d\n", m.inFlight.Load())
 
 	m.mu.RLock()
-	requestKeys := sortedKeys(m.requests)
-	durationKeys := sortedKeys(m.durationCount)
-	eventKeys := sortedKeys(m.events)
-	requests := cloneIntMap(m.requests)
-	durationCount := cloneIntMap(m.durationCount)
-	durationSecond := cloneFloatMap(m.durationSecond)
-	durationBucket := cloneBucketMap(m.durationBucket)
-	events := cloneIntMap(m.events)
+	requestKeys := metrics.SortedKeys(m.requests)
+	durationKeys := metrics.SortedKeys(m.durationCount)
+	eventKeys := metrics.SortedKeys(m.events)
+	requests := metrics.CloneIntMap(m.requests)
+	durationCount := metrics.CloneIntMap(m.durationCount)
+	durationSecond := metrics.CloneFloatMap(m.durationSecond)
+	durationBucket := metrics.CloneBucketMap(m.durationBucket)
+	events := metrics.CloneIntMap(m.events)
 	m.mu.RUnlock()
 
 	_, _ = fmt.Fprintln(w, "# HELP dat9_http_requests_total Total HTTP requests by method/route/status")
@@ -140,7 +139,7 @@ func (m *serverMetrics) writePrometheus(w http.ResponseWriter) {
 	for _, k := range durationKeys {
 		buckets := durationBucket[k]
 		for i, bound := range httpDurationBounds {
-			_, _ = fmt.Fprintf(w, "dat9_http_request_duration_seconds_bucket{%s,le=\"%s\"} %d\n", k, formatPromBound(bound), buckets[i])
+			_, _ = fmt.Fprintf(w, "dat9_http_request_duration_seconds_bucket{%s,le=\"%s\"} %d\n", k, metrics.FormatPromBound(bound), buckets[i])
 		}
 		_, _ = fmt.Fprintf(w, "dat9_http_request_duration_seconds_bucket{%s,le=\"+Inf\"} %d\n", k, durationCount[k])
 	}
@@ -164,55 +163,16 @@ func (m *serverMetrics) writePrometheus(w http.ResponseWriter) {
 	}
 }
 
-func cloneIntMap(src map[string]int64) map[string]int64 {
-	out := make(map[string]int64, len(src))
-	for k, v := range src {
-		out[k] = v
-	}
-	return out
-}
-
-func cloneFloatMap(src map[string]float64) map[string]float64 {
-	out := make(map[string]float64, len(src))
-	for k, v := range src {
-		out[k] = v
-	}
-	return out
-}
-
-func cloneBucketMap(src map[string][]int64) map[string][]int64 {
-	out := make(map[string][]int64, len(src))
-	for k, v := range src {
-		vv := make([]int64, len(v))
-		copy(vv, v)
-		out[k] = vv
-	}
-	return out
-}
-
-func formatPromBound(v float64) string {
-	return strconv.FormatFloat(v, 'g', -1, 64)
-}
-
-func sortedKeys[T any](m map[string]T) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
 func metricLabels(method, route string, status ...string) string {
 	b := strings.Builder{}
 	b.WriteString(`method="`)
-	b.WriteString(escapePromLabel(method))
+	b.WriteString(metrics.EscapePromLabel(method))
 	b.WriteString(`",route="`)
-	b.WriteString(escapePromLabel(route))
+	b.WriteString(metrics.EscapePromLabel(route))
 	b.WriteString(`"`)
 	if len(status) > 0 {
 		b.WriteString(`,status="`)
-		b.WriteString(escapePromLabel(status[0]))
+		b.WriteString(metrics.EscapePromLabel(status[0]))
 		b.WriteString(`"`)
 	}
 	return b.String()
@@ -221,23 +181,16 @@ func metricLabels(method, route string, status ...string) string {
 func metricEventLabels(event string, labels ...string) string {
 	b := strings.Builder{}
 	b.WriteString(`event="`)
-	b.WriteString(escapePromLabel(event))
+	b.WriteString(metrics.EscapePromLabel(event))
 	b.WriteString(`"`)
 	for i := 0; i+1 < len(labels); i += 2 {
 		b.WriteString(",")
-		b.WriteString(escapePromLabel(labels[i]))
+		b.WriteString(metrics.EscapePromLabel(labels[i]))
 		b.WriteString(`="`)
-		b.WriteString(escapePromLabel(labels[i+1]))
+		b.WriteString(metrics.EscapePromLabel(labels[i+1]))
 		b.WriteString(`"`)
 	}
 	return b.String()
-}
-
-func escapePromLabel(s string) string {
-	s = strings.ReplaceAll(s, "\\", "\\\\")
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	return s
 }
 
 type observedResponseWriter struct {
@@ -318,7 +271,6 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 	}
 
 	fields := []zap.Field{
-		zap.String("trace_id", traceID),
 		zap.String("method", r.Method),
 		zap.String("path", r.URL.Path),
 		zap.String("route", route),
