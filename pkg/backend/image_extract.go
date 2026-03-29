@@ -143,6 +143,10 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 		metrics.RecordOperation("image_extract", "process", "not_image", time.Since(start))
 		return
 	}
+	if task.Revision > 0 && f.Revision != task.Revision {
+		metrics.RecordOperation("image_extract", "process", "stale_precheck", time.Since(start))
+		return
+	}
 
 	data, err := b.loadImageBytesForExtract(ctx, f)
 	if err != nil {
