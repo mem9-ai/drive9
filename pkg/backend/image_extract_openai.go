@@ -46,7 +46,7 @@ func NewOpenAIImageTextExtractor(cfg OpenAIImageTextExtractorConfig) (*OpenAIIma
 	if cfg.Model == "" {
 		return nil, fmt.Errorf("openai extractor model is required")
 	}
-	endpoint := base
+	var endpoint string
 	if strings.HasSuffix(base, "/v1") {
 		endpoint = base + "/chat/completions"
 	} else {
