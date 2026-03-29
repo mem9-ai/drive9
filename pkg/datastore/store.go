@@ -429,7 +429,7 @@ func (s *Store) GetFile(ctx context.Context, fileID string) (out *File, err erro
 	return out, err
 }
 
-func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64) (err error) {
+func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64) (newRevision int64, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "update_file_content", start, &err)
 
@@ -454,13 +454,43 @@ func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageTyp
 			nullStr(checksum), nullStr(contentText), time.Now().UTC(), fileID)
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return ErrNotFound
+		return 0, ErrNotFound
 	}
-	return nil
+	var rev int64
+	if err := s.db.QueryRowContext(ctx, `SELECT revision FROM files WHERE file_id = ?`, fileID).Scan(&rev); err != nil {
+		return 0, fmt.Errorf("read revision after update: %w", err)
+	}
+	return rev, nil
+}
+
+// UpdateFileSearchText updates files.content_text for search enrichment.
+// If expectedChecksum is non-empty, update is applied only when checksum matches.
+// This prevents stale async tasks from overwriting a newer file revision.
+func (s *Store) UpdateFileSearchText(ctx context.Context, fileID string, expectedRevision int64, contentText string) (updated bool, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "update_file_search_text", start, &err)
+
+	var (
+		res sql.Result
+	)
+	if expectedRevision > 0 {
+		res, err = s.db.ExecContext(ctx, `UPDATE files SET content_text = ?
+			WHERE file_id = ? AND status = 'CONFIRMED' AND revision = ?`,
+			nullStr(contentText), fileID, expectedRevision)
+	} else {
+		res, err = s.db.ExecContext(ctx, `UPDATE files SET content_text = ?
+			WHERE file_id = ? AND status = 'CONFIRMED'`,
+			nullStr(contentText), fileID)
+	}
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 func (s *Store) ConfirmFile(ctx context.Context, fileID string) (err error) {

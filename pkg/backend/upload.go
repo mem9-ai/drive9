@@ -256,6 +256,9 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 	if isOverwrite && oldStorageRef != "" {
 		b.deleteBlob(oldStorageRef)
 	}
+
+	b.enqueueImageExtractForUpload(ctx, upload, isOverwrite)
+
 	metrics.RecordOperation("backend", "confirm_upload", "ok", time.Since(start))
 	return nil
 }

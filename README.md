@@ -79,6 +79,17 @@ c.Delete("/data/file.txt")
 | `DAT9_S3_PREFIX` | S3 key prefix (e.g. `tenants/abc/`) | |
 | `DAT9_S3_ROLE_ARN` | IAM role ARN to assume via STS | |
 | `DAT9_S3_DIR` | Local S3 mock directory (only used without `DAT9_S3_BUCKET`) | `./s3` |
+| `DAT9_IMAGE_EXTRACT_ENABLED` | Enable async image->text extraction for search | `false` |
+| `DAT9_IMAGE_EXTRACT_QUEUE_SIZE` | In-memory queue size for extraction tasks | `128` |
+| `DAT9_IMAGE_EXTRACT_WORKERS` | Number of extraction workers | `1` |
+| `DAT9_IMAGE_EXTRACT_MAX_BYTES` | Max image bytes processed per task | `8388608` |
+| `DAT9_IMAGE_EXTRACT_TIMEOUT_SECONDS` | Timeout per extraction task | `20` |
+| `DAT9_IMAGE_EXTRACT_MAX_TEXT_BYTES` | Max extracted text stored into `files.content_text` | `8192` |
+| `DAT9_IMAGE_EXTRACT_API_BASE` | OpenAI-compatible base URL (optional; set with key/model) | |
+| `DAT9_IMAGE_EXTRACT_API_KEY` | API key for image extraction provider | |
+| `DAT9_IMAGE_EXTRACT_MODEL` | Vision model name (for example Qwen VL model id) | |
+| `DAT9_IMAGE_EXTRACT_PROMPT` | Custom extraction prompt | `Describe this image for file search. Include key objects, scene, any visible text (OCR), and concise tags.` |
+| `DAT9_IMAGE_EXTRACT_MAX_TOKENS` | Max output tokens for model extraction | `256` |
 
 ## Architecture
 

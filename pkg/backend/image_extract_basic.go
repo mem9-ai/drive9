@@ -1,0 +1,62 @@
+package backend
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+	"strings"
+
+	"github.com/mem9-ai/dat9/pkg/pathutil"
+)
+
+// BasicImageTextExtractor is a deterministic fallback extractor used when no
+// external vision model is configured. It emits lightweight metadata text.
+type BasicImageTextExtractor struct{}
+
+func NewBasicImageTextExtractor() *BasicImageTextExtractor { return &BasicImageTextExtractor{} }
+
+func (e *BasicImageTextExtractor) ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, error) {
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	default:
+	}
+
+	name := pathutil.BaseName(req.Path)
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(req.Data))
+	if err == nil {
+		return strings.TrimSpace(fmt.Sprintf("image file %s format %s width %d height %d", name, strings.ToLower(format), cfg.Width, cfg.Height)), nil
+	}
+	if req.ContentType != "" {
+		return strings.TrimSpace(fmt.Sprintf("image file %s content type %s", name, req.ContentType)), nil
+	}
+	return strings.TrimSpace(fmt.Sprintf("image file %s", name)), nil
+}
+
+type fallbackImageTextExtractor struct {
+	primary  ImageTextExtractor
+	fallback ImageTextExtractor
+}
+
+// NewFallbackImageTextExtractor wraps an extractor with a fallback extractor.
+func NewFallbackImageTextExtractor(primary, fallback ImageTextExtractor) ImageTextExtractor {
+	if primary == nil {
+		return fallback
+	}
+	if fallback == nil {
+		return primary
+	}
+	return &fallbackImageTextExtractor{primary: primary, fallback: fallback}
+}
+
+func (e *fallbackImageTextExtractor) ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, error) {
+	text, err := e.primary.ExtractImageText(ctx, req)
+	if err == nil && strings.TrimSpace(text) != "" {
+		return text, nil
+	}
+	return e.fallback.ExtractImageText(ctx, req)
+}

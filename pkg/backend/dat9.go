@@ -36,29 +36,52 @@ type Dat9Backend struct {
 	smallInDB bool
 	mu        sync.Mutex
 	entropy   io.Reader
+
+	// Async image -> text extraction worker (in-memory queue for P0).
+	imageExtractEnabled bool
+	imageExtractor      ImageTextExtractor
+	imageExtractQueue   chan imageExtractTask
+	imageExtractWG      sync.WaitGroup
+	imageExtractCancel  context.CancelFunc
+	imageExtractTimeout time.Duration
+	imageExtractMaxSize int64
+	maxExtractTextBytes int
 }
 
-func New(store *datastore.Store) (*Dat9Backend, error) {
+func newBaseBackend(store *datastore.Store) *Dat9Backend {
 	return &Dat9Backend{
 		store:     store,
 		smallInDB: true,
 		entropy:   ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0),
-	}, nil
+	}
+}
+
+func New(store *datastore.Store) (*Dat9Backend, error) {
+	return NewWithOptions(store, Options{})
+}
+
+func NewWithOptions(store *datastore.Store, opts Options) (*Dat9Backend, error) {
+	b := newBaseBackend(store)
+	b.configureOptions(opts)
+	return b, nil
 }
 
 // NewWithS3 creates a Dat9Backend with S3 support for large file uploads.
 func NewWithS3(store *datastore.Store, s3 s3client.S3Client) (*Dat9Backend, error) {
-	return NewWithS3Mode(store, s3, true)
+	return NewWithS3ModeAndOptions(store, s3, true, Options{})
 }
 
 // NewWithS3Mode controls whether files smaller than threshold stay in DB.
 func NewWithS3Mode(store *datastore.Store, s3 s3client.S3Client, smallInDB bool) (*Dat9Backend, error) {
-	b, err := New(store)
-	if err != nil {
-		return nil, err
-	}
+	return NewWithS3ModeAndOptions(store, s3, smallInDB, Options{})
+}
+
+// NewWithS3ModeAndOptions controls storage mode and backend options.
+func NewWithS3ModeAndOptions(store *datastore.Store, s3 s3client.S3Client, smallInDB bool, opts Options) (*Dat9Backend, error) {
+	b := newBaseBackend(store)
 	b.s3 = s3
 	b.smallInDB = smallInDB
+	b.configureOptions(opts)
 	return b, nil
 }
 
@@ -317,6 +340,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	}); err != nil {
 		return 0, err
 	}
+	b.enqueueImageExtract(fileID, path, contentType, 1)
 	return int64(len(data)), nil
 }
 
@@ -369,10 +393,11 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		}
 	}
 
-	if err := b.store.UpdateFileContent(ctx,
+	newRev, err := b.store.UpdateFileContent(ctx,
 		nf.File.FileID, storageType, storageRef,
 		contentType, checksum, contentText, contentBlob, int64(len(finalData)),
-	); err != nil {
+	)
+	if err != nil {
 		if storageType == datastore.StorageS3 {
 			b.deleteBlobCtx(ctx, storageRef)
 		}
@@ -381,6 +406,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 	if nf.File.StorageRef != "" && nf.File.StorageRef != storageRef {
 		b.deleteBlobCtx(ctx, nf.File.StorageRef)
 	}
+	b.enqueueImageExtract(nf.File.FileID, nf.Node.Path, contentType, newRev)
 	return int64(len(data)), nil
 }
 
