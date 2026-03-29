@@ -60,7 +60,10 @@ func (b *Dat9Backend) enqueueImageExtract(fileID, path, contentType string, revi
 		return
 	}
 	if !isImageContentType(contentType) {
-		return
+		contentType = contentTypeFromPath(path)
+		if !isImageContentType(contentType) {
+			return
+		}
 	}
 	task := imageExtractTask{
 		FileID:      fileID,

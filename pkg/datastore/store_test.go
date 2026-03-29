@@ -302,8 +302,12 @@ func TestUpdateFileContent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.UpdateFileContent(context.Background(), "f1", StorageDB9, "/blobs/f1-v2", "text/plain", "abc123", "new content", []byte("blob"), 42); err != nil {
+	newRev, err := s.UpdateFileContent(context.Background(), "f1", StorageDB9, "/blobs/f1-v2", "text/plain", "abc123", "new content", []byte("blob"), 42)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if newRev != 2 {
+		t.Errorf("expected newRev=2, got %d", newRev)
 	}
 	got, _ := s.GetFile(context.Background(), "f1")
 	if got.Revision != 2 || got.SizeBytes != 42 || got.ContentText != "new content" {
