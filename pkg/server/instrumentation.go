@@ -66,14 +66,18 @@ type serverMetrics struct {
 	requests       map[string]int64
 	durationCount  map[string]int64
 	durationSecond map[string]float64
+	durationBucket map[string][]int64
 	events         map[string]int64
 }
+
+var httpDurationBounds = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 
 func newServerMetrics() *serverMetrics {
 	return &serverMetrics{
 		requests:       make(map[string]int64),
 		durationCount:  make(map[string]int64),
 		durationSecond: make(map[string]float64),
+		durationBucket: make(map[string][]int64),
 		events:         make(map[string]int64),
 	}
 }
@@ -86,6 +90,17 @@ func (m *serverMetrics) record(method, route string, status int, d time.Duration
 	m.requests[statusKey]++
 	m.durationCount[durationKey]++
 	m.durationSecond[durationKey] += d.Seconds()
+	buckets := m.durationBucket[durationKey]
+	if buckets == nil {
+		buckets = make([]int64, len(httpDurationBounds))
+		m.durationBucket[durationKey] = buckets
+	}
+	seconds := d.Seconds()
+	for i, bound := range httpDurationBounds {
+		if seconds <= bound {
+			buckets[i]++
+		}
+	}
 	m.mu.Unlock()
 }
 
@@ -110,6 +125,7 @@ func (m *serverMetrics) writePrometheus(w http.ResponseWriter) {
 	requests := cloneIntMap(m.requests)
 	durationCount := cloneIntMap(m.durationCount)
 	durationSecond := cloneFloatMap(m.durationSecond)
+	durationBucket := cloneBucketMap(m.durationBucket)
 	events := cloneIntMap(m.events)
 	m.mu.RUnlock()
 
@@ -117,6 +133,16 @@ func (m *serverMetrics) writePrometheus(w http.ResponseWriter) {
 	_, _ = fmt.Fprintln(w, "# TYPE dat9_http_requests_total counter")
 	for _, k := range requestKeys {
 		_, _ = fmt.Fprintf(w, "dat9_http_requests_total{%s} %d\n", k, requests[k])
+	}
+
+	_, _ = fmt.Fprintln(w, "# HELP dat9_http_request_duration_seconds HTTP request duration histogram by method/route")
+	_, _ = fmt.Fprintln(w, "# TYPE dat9_http_request_duration_seconds histogram")
+	for _, k := range durationKeys {
+		buckets := durationBucket[k]
+		for i, bound := range httpDurationBounds {
+			_, _ = fmt.Fprintf(w, "dat9_http_request_duration_seconds_bucket{%s,le=\"%s\"} %d\n", k, formatPromBound(bound), buckets[i])
+		}
+		_, _ = fmt.Fprintf(w, "dat9_http_request_duration_seconds_bucket{%s,le=\"+Inf\"} %d\n", k, durationCount[k])
 	}
 
 	_, _ = fmt.Fprintln(w, "# HELP dat9_http_request_duration_seconds_count HTTP request duration count by method/route")
@@ -152,6 +178,20 @@ func cloneFloatMap(src map[string]float64) map[string]float64 {
 		out[k] = v
 	}
 	return out
+}
+
+func cloneBucketMap(src map[string][]int64) map[string][]int64 {
+	out := make(map[string][]int64, len(src))
+	for k, v := range src {
+		vv := make([]int64, len(v))
+		copy(vv, v)
+		out[k] = vv
+	}
+	return out
+}
+
+func formatPromBound(v float64) string {
+	return strconv.FormatFloat(v, 'g', -1, 64)
 }
 
 func sortedKeys[T any](m map[string]T) []string {
