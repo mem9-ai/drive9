@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 	"go.uber.org/zap"
 )
 
@@ -73,7 +75,9 @@ func (b *Dat9Backend) enqueueImageExtract(fileID, path, contentType string, revi
 	}
 	select {
 	case b.imageExtractQueue <- task:
+		metrics.RecordOperation("image_extract", "enqueue", "ok", 0)
 	default:
+		metrics.RecordOperation("image_extract", "enqueue", "queue_full", 0)
 		logger.Warn(backgroundWithTrace(), "backend_image_extract_queue_full_drop",
 			zap.String("file_id", fileID),
 			zap.String("path", path),
@@ -117,15 +121,18 @@ func (b *Dat9Backend) runImageExtractWorker(ctx context.Context) {
 }
 
 func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExtractTask) {
+	start := time.Now()
 	f, err := b.store.GetFile(ctx, task.FileID)
 	if err != nil {
 		if !errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(ctx, "backend_image_extract_get_file_failed",
 				zap.String("file_id", task.FileID), zap.Error(err))
 		}
+		metrics.RecordOperation("image_extract", "process", "get_file_error", time.Since(start))
 		return
 	}
 	if f.Status != datastore.StatusConfirmed {
+		metrics.RecordOperation("image_extract", "process", "not_confirmed", time.Since(start))
 		return
 	}
 	ct := f.ContentType
@@ -133,6 +140,7 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 		ct = task.ContentType
 	}
 	if !isImageContentType(ct) {
+		metrics.RecordOperation("image_extract", "process", "not_image", time.Since(start))
 		return
 	}
 
@@ -140,9 +148,11 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 	if err != nil {
 		logger.Warn(ctx, "backend_image_extract_load_bytes_failed",
 			zap.String("file_id", task.FileID), zap.Error(err))
+		metrics.RecordOperation("image_extract", "process", "load_error", time.Since(start))
 		return
 	}
 	if len(data) == 0 {
+		metrics.RecordOperation("image_extract", "process", "skip_too_large", time.Since(start))
 		return
 	}
 
@@ -157,10 +167,12 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 	if err != nil {
 		logger.Warn(ctx, "backend_image_extract_failed",
 			zap.String("file_id", task.FileID), zap.String("path", task.Path), zap.Error(err))
+		metrics.RecordOperation("image_extract", "process", "extract_error", time.Since(start))
 		return
 	}
 	text = sanitizeExtractedText(text, b.maxExtractTextBytes)
 	if text == "" {
+		metrics.RecordOperation("image_extract", "process", "empty_text", time.Since(start))
 		return
 	}
 
@@ -168,15 +180,18 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 	if err != nil {
 		logger.Warn(ctx, "backend_image_extract_update_file_failed",
 			zap.String("file_id", task.FileID), zap.Error(err))
+		metrics.RecordOperation("image_extract", "process", "update_error", time.Since(start))
 		return
 	}
 	if !updated {
 		logger.Info(ctx, "backend_image_extract_skipped_stale",
 			zap.String("file_id", task.FileID), zap.String("path", task.Path))
+		metrics.RecordOperation("image_extract", "process", "stale", time.Since(start))
 		return
 	}
 	logger.Info(ctx, "backend_image_extract_ok",
 		zap.String("file_id", task.FileID), zap.String("path", task.Path), zap.Int("text_len", len(text)))
+	metrics.RecordOperation("image_extract", "process", "ok", time.Since(start))
 }
 
 func (b *Dat9Backend) loadImageBytesForExtract(ctx context.Context, f *datastore.File) ([]byte, error) {

@@ -3,6 +3,9 @@ package backend
 import (
 	"context"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"go.uber.org/zap"
 )
 
 const (
@@ -66,6 +69,8 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 		b.imageExtractWG.Add(1)
 		go b.runImageExtractWorker(ctx)
 	}
+	logger.Info(ctx, "backend_image_extract_workers_started",
+		zap.Int("workers", cfg.Workers), zap.Int("queue_size", cfg.QueueSize))
 }
 
 // Close stops background workers owned by this backend instance.
@@ -76,4 +81,5 @@ func (b *Dat9Backend) Close() {
 	b.imageExtractCancel()
 	b.imageExtractWG.Wait()
 	b.imageExtractCancel = nil
+	logger.Info(backgroundWithTrace(), "backend_image_extract_workers_stopped")
 }
