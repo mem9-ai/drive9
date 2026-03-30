@@ -28,6 +28,23 @@ func genID() string {
 	return fmt.Sprintf("id-%04d", seq)
 }
 
+func setEmbeddingRevision(t *testing.T, s *Store, fileID string, revision int64) {
+	t.Helper()
+	if _, err := s.DB().Exec(`UPDATE files SET embedding_revision = ? WHERE file_id = ?`, revision, fileID); err != nil {
+		t.Fatalf("set embedding_revision for %s: %v", fileID, err)
+	}
+}
+
+func requireEmbeddingRevision(t *testing.T, got *int64, want int64) {
+	t.Helper()
+	if got == nil {
+		t.Fatalf("embedding_revision=nil, want %d", want)
+	}
+	if *got != want {
+		t.Fatalf("embedding_revision=%d, want %d", *got, want)
+	}
+}
+
 func TestInsertAndGetNode(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
@@ -67,6 +84,7 @@ func TestInsertAndGetFile(t *testing.T) {
 	if err := s.InsertFile(context.Background(), f); err != nil {
 		t.Fatal(err)
 	}
+	setEmbeddingRevision(t, s, "f1", 7)
 	got, err := s.GetFile(context.Background(), "f1")
 	if err != nil {
 		t.Fatal(err)
@@ -74,6 +92,7 @@ func TestInsertAndGetFile(t *testing.T) {
 	if got.StorageType != StorageDB9 || got.SizeBytes != 100 || got.ContentText != "hello world" {
 		t.Errorf("unexpected file: %+v", got)
 	}
+	requireEmbeddingRevision(t, got.EmbeddingRevision, 7)
 }
 
 func TestStat(t *testing.T) {
@@ -83,6 +102,7 @@ func TestStat(t *testing.T) {
 		SizeBytes: 42, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
 		t.Fatal(err)
 	}
+	setEmbeddingRevision(t, s, "f1", 11)
 	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
@@ -94,6 +114,7 @@ func TestStat(t *testing.T) {
 	if nf.Node.Path != "/a.txt" || nf.File == nil || nf.File.SizeBytes != 42 {
 		t.Errorf("unexpected stat: node=%+v file=%+v", nf.Node, nf.File)
 	}
+	requireEmbeddingRevision(t, nf.File.EmbeddingRevision, 11)
 }
 
 func TestListDir(t *testing.T) {
@@ -106,6 +127,7 @@ func TestListDir(t *testing.T) {
 		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
 		t.Fatal(err)
 	}
+	setEmbeddingRevision(t, s, "f1", 13)
 	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
@@ -123,6 +145,10 @@ func TestListDir(t *testing.T) {
 	if entries[0].Node.Name != "a.txt" || entries[1].Node.Name != "sub" {
 		t.Errorf("unexpected entries: %+v, %+v", entries[0].Node, entries[1].Node)
 	}
+	if entries[0].File == nil {
+		t.Fatal("expected file entry for a.txt")
+	}
+	requireEmbeddingRevision(t, entries[0].File.EmbeddingRevision, 13)
 }
 
 func TestZeroCopyCp(t *testing.T) {
@@ -155,6 +181,7 @@ func TestDeleteWithRefCount(t *testing.T) {
 		SizeBytes: 50, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
 		t.Fatal(err)
 	}
+	setEmbeddingRevision(t, s, "f1", 17)
 	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
@@ -177,6 +204,7 @@ func TestDeleteWithRefCount(t *testing.T) {
 	if deleted == nil || deleted.Status != StatusDeleted {
 		t.Errorf("expected DELETED file record, got %+v", deleted)
 	}
+	requireEmbeddingRevision(t, deleted.EmbeddingRevision, 17)
 }
 
 func TestDeleteDirRecursive(t *testing.T) {
@@ -189,10 +217,12 @@ func TestDeleteDirRecursive(t *testing.T) {
 		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
 		t.Fatal(err)
 	}
+	setEmbeddingRevision(t, s, "f1", 19)
 	if err := s.InsertFile(context.Background(), &File{FileID: "f2", StorageType: StorageDB9, StorageRef: "/blobs/f2",
 		SizeBytes: 20, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
 		t.Fatal(err)
 	}
+	setEmbeddingRevision(t, s, "f2", 23)
 	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
@@ -210,6 +240,7 @@ func TestDeleteDirRecursive(t *testing.T) {
 	if len(orphaned) != 1 || orphaned[0].FileID != "f2" {
 		t.Fatalf("expected 1 orphaned (f2), got %d", len(orphaned))
 	}
+	requireEmbeddingRevision(t, orphaned[0].EmbeddingRevision, 23)
 
 	_, err = s.GetNode(context.Background(), "/data/")
 	if err != ErrNotFound {
