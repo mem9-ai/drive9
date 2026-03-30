@@ -88,7 +88,7 @@ c.Delete("/data/file.txt")
 | `DAT9_IMAGE_EXTRACT_API_BASE` | OpenAI-compatible base URL (optional; set with key/model) | |
 | `DAT9_IMAGE_EXTRACT_API_KEY` | API key for image extraction provider | |
 | `DAT9_IMAGE_EXTRACT_MODEL` | Vision model name (for example Qwen VL model id) | |
-| `DAT9_IMAGE_EXTRACT_PROMPT` | Custom extraction prompt | `Describe this image for file search. Include key objects, scene, any visible text (OCR), and concise tags.` |
+| `DAT9_IMAGE_EXTRACT_PROMPT` | Custom extraction prompt | `Describe this image for file search in both Chinese and English. Include: key objects, scene description, any visible text (OCR), and concise tags. First write in Chinese, then in English. 用中文和英文双语描述这张图片，包括：主要物体、场景描述、图中可见文字（OCR）、简洁标签。先写中文，再写英文。` |
 | `DAT9_IMAGE_EXTRACT_MAX_TOKENS` | Max output tokens for model extraction | `256` |
 
 ## Architecture
