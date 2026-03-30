@@ -18,7 +18,15 @@ const defaultSemanticMaxAttempts = 5
 func (s *Store) EnqueueSemanticTask(ctx context.Context, task *semantic.Task) (created bool, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "enqueue_semantic_task", start, &err)
+	return s.enqueueSemanticTask(s.db, task)
+}
 
+// EnqueueSemanticTaskTx inserts a queued semantic task inside an existing transaction.
+func (s *Store) EnqueueSemanticTaskTx(db execer, task *semantic.Task) (bool, error) {
+	return s.enqueueSemanticTask(db, task)
+}
+
+func (s *Store) enqueueSemanticTask(db execer, task *semantic.Task) (bool, error) {
 	if task == nil {
 		return false, fmt.Errorf("semantic task is required")
 	}
@@ -44,7 +52,7 @@ func (s *Store) EnqueueSemanticTask(ctx context.Context, task *semantic.Task) (c
 		updatedAt = createdAt
 	}
 
-	_, err = s.db.ExecContext(ctx, `INSERT INTO semantic_tasks
+	_, err := db.Exec(`INSERT INTO semantic_tasks
 		(task_id, task_type, resource_id, resource_version, status, attempt_count, max_attempts,
 		 receipt, leased_at, lease_until, available_at, payload_json, last_error,
 		 created_at, updated_at, completed_at)
@@ -59,7 +67,7 @@ func (s *Store) EnqueueSemanticTask(ctx context.Context, task *semantic.Task) (c
 	if !isUniqueViolation(err) {
 		return false, err
 	}
-	duplicate, dupErr := s.semanticTaskExistsByResource(ctx, task.TaskType, task.ResourceID, task.ResourceVersion)
+	duplicate, dupErr := semanticTaskExistsByResource(db, task.TaskType, task.ResourceID, task.ResourceVersion)
 	if dupErr != nil {
 		return false, dupErr
 	}
@@ -273,9 +281,9 @@ func (s *Store) RecoverExpiredSemanticTasks(ctx context.Context, now time.Time, 
 	return recovered, nil
 }
 
-func (s *Store) semanticTaskExistsByResource(ctx context.Context, taskType semantic.TaskType, resourceID string, resourceVersion int64) (bool, error) {
+func semanticTaskExistsByResource(db execer, taskType semantic.TaskType, resourceID string, resourceVersion int64) (bool, error) {
 	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM semantic_tasks
+	err := db.QueryRow(`SELECT COUNT(*) FROM semantic_tasks
 		WHERE task_type = ? AND resource_id = ? AND resource_version = ?`,
 		taskType, resourceID, resourceVersion).Scan(&count)
 	if err != nil {
