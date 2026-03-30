@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -322,22 +323,30 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}
 	}
 
-	if err := b.store.InsertFile(ctx, &datastore.File{
-		FileID: fileID, StorageType: storageType, StorageRef: storageRef,
-		ContentBlob: contentBlob,
-		ContentType: contentType, SizeBytes: int64(len(data)),
-		ChecksumSHA256: checksum, Revision: 1, Status: datastore.StatusConfirmed,
-		ContentText: contentText, CreatedAt: now, ConfirmedAt: &now,
+	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.store.InsertFileTx(tx, &datastore.File{
+			FileID: fileID, StorageType: storageType, StorageRef: storageRef,
+			ContentBlob: contentBlob,
+			ContentType: contentType, SizeBytes: int64(len(data)),
+			ChecksumSHA256: checksum, Revision: 1, Status: datastore.StatusConfirmed,
+			ContentText: contentText, CreatedAt: now, ConfirmedAt: &now,
+		}); err != nil {
+			return err
+		}
+		if err := b.store.EnsureParentDirsTx(tx, path, b.genID); err != nil {
+			return err
+		}
+		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
+			NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
+			Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
+		}); err != nil {
+			return err
+		}
+		return b.enqueueEmbedTaskTx(tx, fileID, 1)
 	}); err != nil {
-		return 0, err
-	}
-	if err := b.store.EnsureParentDirs(ctx, path, b.genID); err != nil {
-		return 0, err
-	}
-	if err := b.store.InsertNode(ctx, &datastore.FileNode{
-		NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
-		Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
-	}); err != nil {
+		if storageType == datastore.StorageS3 {
+			b.deleteBlobCtx(ctx, storageRef)
+		}
 		return 0, err
 	}
 	b.enqueueImageExtract(fileID, path, contentType, 1)
@@ -393,10 +402,18 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		}
 	}
 
-	newRev, err := b.store.UpdateFileContent(ctx,
-		nf.File.FileID, storageType, storageRef,
-		contentType, checksum, contentText, contentBlob, int64(len(finalData)),
-	)
+	var newRev int64
+	err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		var txErr error
+		newRev, txErr = b.store.UpdateFileContentTx(tx,
+			nf.File.FileID, storageType, storageRef,
+			contentType, checksum, contentText, contentBlob, int64(len(finalData)),
+		)
+		if txErr != nil {
+			return txErr
+		}
+		return b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
+	})
 	if err != nil {
 		if storageType == datastore.StorageS3 {
 			b.deleteBlobCtx(ctx, storageRef)

@@ -198,6 +198,9 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 	// in place so every hard link keeps pointing at the same file_id.
 	var oldStorageRef string
 	var isOverwrite bool
+	var confirmedFileID string
+	var confirmedRevision int64
+	contentType := detectContentType(upload.TargetPath, nil)
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
 		if err := b.store.CompleteUploadTx(tx, uploadID); err != nil {
 			return err
@@ -210,21 +213,21 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		err := tx.QueryRow(`SELECT file_id FROM file_nodes WHERE path = ?`, upload.TargetPath).Scan(&existingFileID)
 		if err == nil && existingFileID.Valid {
 			isOverwrite = true
+			confirmedFileID = existingFileID.String
 
 			var oldRef string
 			if err := tx.QueryRow(`SELECT storage_ref FROM files WHERE file_id = ?`, existingFileID.String).Scan(&oldRef); err == nil {
 				oldStorageRef = oldRef
 			}
 
-			_, err := tx.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
-				size_bytes = ?, content_text = NULL, revision = revision + 1,
-				status = 'CONFIRMED',
-				confirmed_at = ?
-				WHERE file_id = ?`,
-				datastore.StorageS3, upload.S3Key, upload.TotalSize, time.Now().UTC(), existingFileID.String)
+			newRev, err := b.store.UpdateFileContentTx(tx,
+				existingFileID.String, datastore.StorageS3, upload.S3Key,
+				contentType, "", "", nil, upload.TotalSize,
+			)
 			if err != nil {
 				return err
 			}
+			confirmedRevision = newRev
 
 			_, err = tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, upload.FileID)
 			if err != nil {
@@ -234,20 +237,45 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			// never points at a tombstoned file.
 			_, err = tx.Exec(`UPDATE uploads SET file_id = ? WHERE upload_id = ?`,
 				existingFileID.String, uploadID)
+			if err != nil {
+				return err
+			}
+			return b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
 
-		if err := b.store.ConfirmFileTx(tx, upload.FileID); err != nil {
+		now := time.Now().UTC()
+		res, err := tx.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
+			size_bytes = ?, checksum_sha256 = NULL, content_text = NULL,
+			embedding = NULL, embedding_revision = NULL,
+			status = 'CONFIRMED', confirmed_at = ?
+			WHERE file_id = ? AND status = 'PENDING'`,
+			datastore.StorageS3, upload.S3Key, contentType, upload.TotalSize, now, upload.FileID)
+		if err != nil {
 			return err
 		}
-		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+		rowsAffected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rowsAffected == 0 {
+			return datastore.ErrNotFound
+		}
+		confirmedFileID = upload.FileID
+		confirmedRevision = 1
+		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID:     b.genID(),
 			Path:       upload.TargetPath,
 			ParentPath: pathutil.ParentPath(upload.TargetPath),
 			Name:       pathutil.BaseName(upload.TargetPath),
 			FileID:     upload.FileID,
 			CreatedAt:  time.Now(),
-		})
+		}); err != nil {
+			return err
+		}
+		return b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
 	}); err != nil {
 		logger.Error(ctx, "backend_confirm_upload_tx_failed", zap.String("upload_id", uploadID), zap.Error(err))
 		metrics.RecordOperation("backend", "confirm_upload", "error", time.Since(start))
