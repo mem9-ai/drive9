@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/mem9-ai/dat9/internal/testmysql"
 )
 
 func initDatastoreSchema(t *testing.T, dsn, provider string) {
@@ -49,5 +50,8 @@ func initDatastoreSchema(t *testing.T, dsn, provider string) {
 			}
 			t.Fatal(err)
 		}
+	}
+	if withBlob {
+		testmysql.EnsureContentBlobColumn(t, db)
 	}
 }
