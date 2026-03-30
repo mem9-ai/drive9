@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,9 +26,17 @@ type Dat9FS struct {
 	dirHandles  *HandleTable[*DirHandle]
 	readCache   *ReadCache
 	dirCache    *DirCache
+	dirtyMu     sync.Mutex
+	dirtyInodes map[uint64]dirtyInodeState
+	dirtySeq    uint64
 	uid         uint32
 	gid         uint32
 	opts        *MountOptions
+}
+
+type dirtyInodeState struct {
+	size int64
+	seq  uint64
 }
 
 // NewDat9FS creates a new FUSE filesystem backed by the given dat9 client.
@@ -40,6 +49,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		dirHandles:    NewHandleTable[*DirHandle](),
 		readCache:     NewReadCache(opts.CacheSize, 0),
 		dirCache:      NewDirCache(opts.DirTTL),
+		dirtyInodes:   make(map[uint64]dirtyInodeState),
 		uid:           uint32(os.Getuid()),
 		gid:           uint32(os.Getgid()),
 		opts:          opts,
@@ -68,26 +78,38 @@ func parentDir(p string) string {
 }
 
 func (fs *Dat9FS) dirtyHandleSize(ino uint64) (int64, bool) {
-	type candidate struct {
-		fh *FileHandle
+	fs.dirtyMu.Lock()
+	defer fs.dirtyMu.Unlock()
+
+	state, ok := fs.dirtyInodes[ino]
+	if !ok {
+		return 0, false
 	}
-	var handles []candidate
-	fs.fileHandles.ForEach(func(_ uint64, fh *FileHandle) {
-		if fh != nil && fh.Ino == ino && fh.Dirty != nil {
-			handles = append(handles, candidate{fh: fh})
-		}
-	})
-	for _, h := range handles {
-		h.fh.Lock()
-		dirty := h.fh.Dirty
-		if dirty != nil && dirty.HasDirtyParts() {
-			size := dirty.Size()
-			h.fh.Unlock()
-			return size, true
-		}
-		h.fh.Unlock()
+	return state.size, true
+}
+
+func (fs *Dat9FS) markDirtySize(ino uint64, size int64) uint64 {
+	fs.dirtyMu.Lock()
+	defer fs.dirtyMu.Unlock()
+
+	fs.dirtySeq++
+	seq := fs.dirtySeq
+	fs.dirtyInodes[ino] = dirtyInodeState{size: size, seq: seq}
+	return seq
+}
+
+func (fs *Dat9FS) clearDirtySize(ino uint64, seq uint64) {
+	if seq == 0 {
+		return
 	}
-	return 0, false
+
+	fs.dirtyMu.Lock()
+	defer fs.dirtyMu.Unlock()
+
+	state, ok := fs.dirtyInodes[ino]
+	if ok && state.seq == seq {
+		delete(fs.dirtyInodes, ino)
+	}
 }
 
 func (fs *Dat9FS) preloadWritableHandle(fh *FileHandle) gofuse.Status {
@@ -263,6 +285,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					fh.Unlock()
 					return gofuse.Status(syscall.EFBIG)
 				}
+				fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
 				fh.Unlock()
 			}
 		} else {
@@ -448,6 +471,9 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 		if entryOut == nil {
 			break
 		}
+		if !fs.inodes.IncrementLookup(e.Ino) {
+			return gofuse.EIO
+		}
 
 		// Fill in the entry attributes
 		inoEntry, found := fs.inodes.GetEntry(e.Ino)
@@ -540,6 +566,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		Flags: input.Flags,
 		Dirty: wb,
 	}
+	fh.DirtySeq = fs.markDirtySize(ino, 0)
 	out.Fh = fs.fileHandles.Allocate(fh)
 	out.OpenFlags = gofuse.FOPEN_DIRECT_IO // bypass kernel page cache for writes
 	fs.fillEntryOut(entry, &out.EntryOut)
@@ -691,6 +718,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	if err != nil {
 		return 0, gofuse.Status(syscall.EFBIG)
 	}
+	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
 
 	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
 	return n, gofuse.OK
@@ -725,6 +753,8 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	if ok {
 		fh.Lock()
 		fs.flushHandle(fh)
+		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+		fh.DirtySeq = 0
 		fh.Unlock()
 	}
 	fs.fileHandles.Delete(input.Fh)
@@ -788,6 +818,8 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 	}
 
 	fh.Dirty.ClearDirty()
+	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+	fh.DirtySeq = 0
 	fs.readCache.Invalidate(fh.Path)
 	fs.dirCache.Invalidate(parentDir(fh.Path))
 	fs.inodes.UpdateSize(fh.Ino, size)

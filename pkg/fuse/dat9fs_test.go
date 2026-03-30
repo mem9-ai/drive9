@@ -83,6 +83,7 @@ func TestGetAttrPrefersDirtyHandleSize(t *testing.T) {
 	if _, err := fh.Dirty.Write(0, []byte("dirty-size")); err != nil {
 		t.Fatal(err)
 	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
 	fs.fileHandles.Allocate(fh)
 
 	var out gofuse.AttrOut
@@ -93,6 +94,44 @@ func TestGetAttrPrefersDirtyHandleSize(t *testing.T) {
 		t.Fatalf("GetAttr status = %v, want OK", st)
 	}
 	if got, want := out.Attr.Size, uint64(len("dirty-size")); got != want {
+		t.Fatalf("GetAttr size = %d, want %d", got, want)
+	}
+}
+
+func TestGetAttrUsesLatestDirtyHandleSize(t *testing.T) {
+	fs, ino, cleanup := newTestDat9FS(t, 4, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "data")
+	})
+	defer cleanup()
+
+	fh1 := &FileHandle{
+		Ino:   ino,
+		Path:  "/file.bin",
+		Dirty: NewWriteBuffer("/file.bin", 0),
+	}
+	fh2 := &FileHandle{
+		Ino:   ino,
+		Path:  "/file.bin",
+		Dirty: NewWriteBuffer("/file.bin", 0),
+	}
+	fhID1 := fs.fileHandles.Allocate(fh1)
+	fhID2 := fs.fileHandles.Allocate(fh2)
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fhID1}, []byte("abc")); st != gofuse.OK {
+		t.Fatalf("first write status = %v, want OK", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fhID2}, []byte("abcdefghi")); st != gofuse.OK {
+		t.Fatalf("second write status = %v, want OK", st)
+	}
+
+	var out gofuse.AttrOut
+	st := fs.GetAttr(nil, &gofuse.GetAttrIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr status = %v, want OK", st)
+	}
+	if got, want := out.Attr.Size, uint64(len("abcdefghi")); got != want {
 		t.Fatalf("GetAttr size = %d, want %d", got, want)
 	}
 }

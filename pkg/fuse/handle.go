@@ -9,6 +9,7 @@ type FileHandle struct {
 	Path     string
 	Flags    uint32       // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
 	Dirty    *WriteBuffer // write buffer, nil for read-only opens
+	DirtySeq uint64       // monotonic sequence for authoritative dirty-size tracking
 	OrigSize int64        // original file size at open time (for patch detection)
 	mu       sync.Mutex
 }

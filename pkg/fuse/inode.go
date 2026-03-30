@@ -102,6 +102,20 @@ func (m *InodeToPath) EnsureInode(path string, isDir bool, size int64, mtime tim
 	return ino
 }
 
+// IncrementLookup adds one kernel lookup reference to an existing inode.
+// Returns false if the inode does not exist.
+func (m *InodeToPath) IncrementLookup(ino uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return false
+	}
+	entry.Nlookup++
+	return true
+}
+
 // GetPath returns the path associated with the given inode number. The second
 // return value is false if the inode is not found.
 func (m *InodeToPath) GetPath(ino uint64) (string, bool) {

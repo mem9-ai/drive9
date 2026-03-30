@@ -273,6 +273,10 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 // are transferred. For small files (no redirect) the full body is returned
 // and the caller should read only what it needs.
 func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	if length <= 0 {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+
 	noRedirectClient := *c.httpClient
 	noRedirectClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
@@ -308,11 +312,20 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		if err != nil {
 			return nil, err
 		}
-		if resp2.StatusCode >= 300 && resp2.StatusCode != http.StatusPartialContent {
+
+		switch resp2.StatusCode {
+		case http.StatusPartialContent:
+			return resp2.Body, nil
+		case http.StatusRequestedRangeNotSatisfiable:
 			defer func() { _ = resp2.Body.Close() }()
-			return nil, readError(resp2)
+			return io.NopCloser(bytes.NewReader(nil)), nil
+		default:
+			defer func() { _ = resp2.Body.Close() }()
+			if resp2.StatusCode >= 300 {
+				return nil, readError(resp2)
+			}
+			return nil, fmt.Errorf("expected HTTP 206 for ranged read, got %d", resp2.StatusCode)
 		}
-		return resp2.Body, nil
 
 	case resp.StatusCode >= 300:
 		defer func() { _ = resp.Body.Close() }()

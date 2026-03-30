@@ -190,6 +190,59 @@ func TestReadStreamLargeFile(t *testing.T) {
 	}
 }
 
+func TestReadStreamRangeLargeFileRequiresPartialContent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/large.bin":
+			w.Header().Set("Location", fmt.Sprintf("http://%s/s3/presigned", r.Host))
+			w.WriteHeader(http.StatusFound)
+		case "/s3/presigned":
+			if got := r.Header.Get("Range"); got != "bytes=5-8" {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK) // proxy ignored Range
+			_, _ = w.Write([]byte("full-body"))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	rc, err := c.ReadStreamRange(context.Background(), "/large.bin", 5, 4)
+	if err == nil {
+		_ = rc.Close()
+		t.Fatal("expected error when ranged read does not return 206")
+	}
+}
+
+func TestReadStreamRangeLargeFileTreats416AsEOF(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/large.bin":
+			w.Header().Set("Location", fmt.Sprintf("http://%s/s3/presigned", r.Host))
+			w.WriteHeader(http.StatusFound)
+		case "/s3/presigned":
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	rc, err := c.ReadStreamRange(context.Background(), "/large.bin", 100, 4)
+	if err != nil {
+		t.Fatalf("ReadStreamRange: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("expected EOF empty body, got %q", data)
+	}
+}
+
 // TestResumeUpload verifies the two-step resume flow.
 func TestResumeUpload(t *testing.T) {
 	var mu sync.Mutex

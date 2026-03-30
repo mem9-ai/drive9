@@ -125,6 +125,20 @@ func TestInodeToPath_UpdateSize(t *testing.T) {
 	}
 }
 
+func TestInodeToPath_IncrementLookupPreservesExistingRef(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.Lookup("/child.txt", false, 1, time.Now()) // existing live ref
+	_ = m.EnsureInode("/child.txt", false, 1, time.Now())
+	if !m.IncrementLookup(ino) {
+		t.Fatal("IncrementLookup should succeed")
+	}
+
+	m.Forget(ino, 1) // drop the readdirplus ref only
+	if _, ok := m.GetPath(ino); !ok {
+		t.Fatal("inode should still exist after dropping only the extra lookup ref")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // HandleTable tests
 // ---------------------------------------------------------------------------
