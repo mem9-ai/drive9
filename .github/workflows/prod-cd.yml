@@ -1,0 +1,79 @@
+name: Deploy server to prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Optional image tag override (default: use current dev deployment image)"
+        required: false
+        type: string
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  AWS_ASSUME_ARN: ${{ secrets.AWS_ASSUME_ARN }}
+  ECR_REPOSITORY: dat9-server
+  EKS_DEV_CLUSTER: dev-dat9
+  EKS_PROD_CLUSTER: prod-dat9
+  DEPLOY_NAMESPACE: dat9
+  K8S_DEPLOYMENT: dat9-server
+
+jobs:
+  deploy:
+    name: Promote dev image to prod
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ASSUME_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for dev and prod
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_DEV_CLUSTER }} \
+            --region ${{ env.AWS_REGION }} \
+            --alias dev
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_PROD_CLUSTER }} \
+            --region ${{ env.AWS_REGION }} \
+            --alias prod
+
+      - name: Resolve image from dev
+        run: |
+          INPUT_TAG='${{ inputs.image_tag }}'
+          if [ -n "$INPUT_TAG" ]; then
+            IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$INPUT_TAG"
+          else
+            IMAGE=$(kubectl --context dev -n ${{ env.DEPLOY_NAMESPACE }} \
+              get deployment/${{ env.K8S_DEPLOYMENT }} \
+              -o jsonpath='{.spec.template.spec.containers[?(@.name=="dat9-server")].image}')
+          fi
+
+          if [ -z "$IMAGE" ]; then
+            echo "Failed to resolve image" >&2
+            exit 1
+          fi
+
+          echo "Promoting image: $IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy to prod
+        run: |
+          kubectl --context prod -n ${{ env.DEPLOY_NAMESPACE }} \
+            set image deployment/${{ env.K8S_DEPLOYMENT }} \
+            ${{ env.K8S_DEPLOYMENT }}=${{ env.IMAGE }}
+          kubectl --context prod -n ${{ env.DEPLOY_NAMESPACE }} \
+            rollout status deployment/${{ env.K8S_DEPLOYMENT }} \
+            --timeout=180s
+
+      - name: Rollback on failed deploy
+        if: failure()
+        run: |
+          kubectl --context prod -n ${{ env.DEPLOY_NAMESPACE }} \
+            rollout undo deployment/${{ env.K8S_DEPLOYMENT }}
