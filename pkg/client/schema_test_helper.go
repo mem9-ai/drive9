@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/mem9-ai/dat9/internal/testmysql"
 )
 
 func initClientTenantSchema(t *testing.T, dsn string) {
@@ -45,4 +46,5 @@ func initClientTenantSchema(t *testing.T, dsn string) {
 			t.Fatal(err)
 		}
 	}
+	testmysql.EnsureContentBlobColumn(t, db)
 }
