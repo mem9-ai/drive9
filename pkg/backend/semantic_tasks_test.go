@@ -3,6 +3,7 @@ package backend
 import (
 	"bytes"
 	"context"
+	"io"
 	"testing"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
@@ -176,6 +177,32 @@ func TestWriteOverwriteSkipsEmbedTaskWithoutTextSource(t *testing.T) {
 	}
 	if tasks[0].ResourceVersion != 1 {
 		t.Fatalf("unexpected semantic task history: %+v", tasks)
+	}
+}
+
+func TestWriteOverwriteDoesNotDeleteInlineMarkerObject(t *testing.T) {
+	b := newTestBackend(t)
+	if _, err := b.Write("/f", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.S3().PutObject(context.Background(), "inline", bytes.NewReader([]byte("marker")), int64(len("marker"))); err != nil {
+		t.Fatal(err)
+	}
+	large := bytes.Repeat([]byte("a"), 2<<20)
+	if _, err := b.Write("/f", large, 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	rc, err := b.S3().GetObject(context.Background(), "inline")
+	if err != nil {
+		t.Fatalf("inline marker object should survive overwrite cleanup: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "marker" {
+		t.Fatalf("marker object=%q, want %q", data, "marker")
 	}
 }
 
