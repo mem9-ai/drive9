@@ -618,22 +618,12 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		return gofuse.ReadResultData(data[offset:end]), gofuse.OK
 	}
 
-	// Large file or unknown size: stream read
-	rc, err := fs.client.ReadStream(context.Background(), p)
+	// Large file or unknown size: range read (avoids O(offset) discard)
+	rc, err := fs.client.ReadStreamRange(context.Background(), p, int64(input.Offset), int64(input.Size))
 	if err != nil {
 		return nil, httpToFuseStatus(err)
 	}
 	defer func() { _ = rc.Close() }()
-
-	// Skip to offset
-	if input.Offset > 0 {
-		if _, err := io.CopyN(io.Discard, rc, int64(input.Offset)); err != nil {
-			if err == io.EOF {
-				return gofuse.ReadResultData(nil), gofuse.OK
-			}
-			return nil, gofuse.EIO
-		}
-	}
 
 	data := make([]byte, input.Size)
 	n, err := io.ReadFull(rc, data)

@@ -267,6 +267,63 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 	}
 }
 
+// ReadStreamRange reads a byte range from a remote file. For large files the
+// server returns a 302 redirect to a presigned S3 URL; this method resolves
+// that redirect and issues an HTTP Range request so only the requested bytes
+// are transferred. For small files (no redirect) the full body is returned
+// and the caller should read only what it needs.
+func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	noRedirectClient := *c.httpClient
+	noRedirectClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path), nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := noRedirectClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	switch {
+	case resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusTemporaryRedirect:
+		_ = resp.Body.Close()
+		location := resp.Header.Get("Location")
+		if location == "" {
+			return nil, fmt.Errorf("302 without Location header")
+		}
+		req2, err := http.NewRequestWithContext(ctx, http.MethodGet, location, nil)
+		if err != nil {
+			return nil, err
+		}
+		// Use HTTP Range header for efficient partial read.
+		req2.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+		resp2, err := c.httpClient.Do(req2)
+		if err != nil {
+			return nil, err
+		}
+		if resp2.StatusCode >= 300 && resp2.StatusCode != http.StatusPartialContent {
+			defer func() { _ = resp2.Body.Close() }()
+			return nil, readError(resp2)
+		}
+		return resp2.Body, nil
+
+	case resp.StatusCode >= 300:
+		defer func() { _ = resp.Body.Close() }()
+		return nil, readError(resp)
+
+	default:
+		// Small file: return body directly (caller reads what it needs).
+		return resp.Body, nil
+	}
+}
+
 // UploadMeta is the server's response for querying active uploads.
 type UploadMeta struct {
 	UploadID   string `json:"upload_id"`
