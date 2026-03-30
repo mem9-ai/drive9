@@ -197,6 +197,7 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 	// Overwrite preserves inode identity by updating the existing files row
 	// in place so every hard link keeps pointing at the same file_id.
 	var oldStorageRef string
+	var oldStorageType datastore.StorageType
 	var isOverwrite bool
 	var confirmedFileID string
 	var confirmedRevision int64
@@ -216,7 +217,7 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			confirmedFileID = existingFileID.String
 
 			var oldRef string
-			if err := tx.QueryRow(`SELECT storage_ref FROM files WHERE file_id = ?`, existingFileID.String).Scan(&oldRef); err == nil {
+			if err := tx.QueryRow(`SELECT storage_type, storage_ref FROM files WHERE file_id = ?`, existingFileID.String).Scan(&oldStorageType, &oldRef); err == nil {
 				oldStorageRef = oldRef
 			}
 
@@ -287,8 +288,8 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		metrics.RecordOperation("backend", "confirm_upload", "error", time.Since(start))
 		return err
 	}
-	if isOverwrite && oldStorageRef != "" {
-		b.deleteBlob(oldStorageRef)
+	if isOverwrite {
+		b.deleteBlobIfS3Ctx(ctx, oldStorageType, oldStorageRef, upload.S3Key)
 	}
 
 	b.enqueueImageExtractForUpload(ctx, upload, isOverwrite)
