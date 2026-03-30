@@ -602,6 +602,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			if st := fs.preloadWritableHandle(fh); st != gofuse.OK {
 				return st
 			}
+		} else {
+			// O_TRUNC: mark buffer as dirty so that close() without any
+			// writes still persists the truncation (POSIX semantics).
+			fh.Dirty.Truncate(0)
 		}
 	}
 
