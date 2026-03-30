@@ -59,6 +59,9 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 	defer observePool(ctx, "get", t.ID, &err, start)
 
 	if t.Status != meta.TenantActive {
+		logger.Warn(ctx, "tenant_pool_get_skipped_inactive",
+			zap.String("tenant_id", t.ID),
+			zap.String("status", string(t.Status)))
 		p.Invalidate(t.ID)
 		return nil, fmt.Errorf("tenant status: %s", t.Status)
 	}
@@ -156,7 +159,7 @@ func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantI
 func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9Backend, *datastore.Store, error) {
 	pass, err := p.enc.Decrypt(ctx, t.DBPasswordCipher)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("decrypt db password: %w", err)
 	}
 	query := "parseTime=true"
 	if t.DBTLS {
@@ -165,7 +168,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, query)
 	store, err := datastore.Open(dsn)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("open datastore: %w", err)
 	}
 	if p.cfg.S3Bucket != "" {
 		prefix := strings.Trim(p.cfg.S3Prefix, "/")
@@ -181,13 +184,13 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		})
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("create aws s3 client: %w", err)
 		}
 		smallInDB := SmallInDB(t.Provider)
 		b, err := backend.NewWithS3ModeAndOptions(store, s3c, smallInDB, p.cfg.BackendOptions)
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("create backend with s3 mode: %w", err)
 		}
 		return b, store, nil
 	}
@@ -197,20 +200,20 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		s3c, err := s3client.NewLocal(s3Dir, s3BaseURL)
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("create local s3 client: %w", err)
 		}
 		smallInDB := SmallInDB(t.Provider)
 		b, err := backend.NewWithS3ModeAndOptions(store, s3c, smallInDB, p.cfg.BackendOptions)
 		if err != nil {
 			_ = store.Close()
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("create backend with local s3 mode: %w", err)
 		}
 		return b, store, nil
 	}
 	b, err := backend.NewWithOptions(store, p.cfg.BackendOptions)
 	if err != nil {
 		_ = store.Close()
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("create backend: %w", err)
 	}
 	return b, store, nil
 }

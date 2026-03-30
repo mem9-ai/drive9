@@ -76,8 +76,10 @@ func (b *Dat9Backend) enqueueImageExtract(fileID, path, contentType string, revi
 	select {
 	case b.imageExtractQueue <- task:
 		metrics.RecordOperation("image_extract", "enqueue", "ok", 0)
+		metrics.RecordGauge("image_extract", "queue_depth", float64(len(b.imageExtractQueue)))
 	default:
 		metrics.RecordOperation("image_extract", "enqueue", "queue_full", 0)
+		metrics.RecordGauge("image_extract", "queue_depth", float64(len(b.imageExtractQueue)))
 		logger.Warn(backgroundWithTrace(), "backend_image_extract_queue_full_drop",
 			zap.String("file_id", fileID),
 			zap.String("path", path),
@@ -93,28 +95,48 @@ func (b *Dat9Backend) enqueueImageExtractForUpload(ctx context.Context, upload *
 	if isOverwrite {
 		nf, err := b.store.Stat(ctx, upload.TargetPath)
 		if err != nil || nf.File == nil {
+			logger.Warn(ctx, "backend_image_extract_upload_enqueue_stat_failed",
+				zap.String("upload_id", upload.UploadID),
+				zap.String("path", upload.TargetPath),
+				zap.Error(err))
 			return
 		}
 		fileID = nf.File.FileID
 	}
 	f, err := b.store.GetFile(ctx, fileID)
 	if err != nil {
+		logger.Warn(ctx, "backend_image_extract_upload_enqueue_get_file_failed",
+			zap.String("upload_id", upload.UploadID),
+			zap.String("file_id", fileID),
+			zap.String("path", upload.TargetPath),
+			zap.Error(err))
 		return
 	}
 	ct := f.ContentType
 	if ct == "" {
 		ct = contentTypeFromPath(upload.TargetPath)
+		if ct == "" {
+			logger.Warn(ctx, "backend_image_extract_upload_enqueue_skipped_unknown_content_type",
+				zap.String("upload_id", upload.UploadID),
+				zap.String("file_id", fileID),
+				zap.String("path", upload.TargetPath),
+				zap.String("reason", "content_type_missing_and_extension_unknown"))
+			return
+		}
 	}
 	b.enqueueImageExtract(fileID, upload.TargetPath, ct, f.Revision)
 }
 
-func (b *Dat9Backend) runImageExtractWorker(ctx context.Context) {
+func (b *Dat9Backend) runImageExtractWorker(ctx context.Context, workerID int) {
 	defer b.imageExtractWG.Done()
+	logger.Info(ctx, "backend_image_extract_worker_started", zap.Int("worker_id", workerID))
 	for {
 		select {
 		case <-ctx.Done():
+			logger.Info(ctx, "backend_image_extract_worker_stopped", zap.Int("worker_id", workerID), zap.String("reason", "context_canceled"))
 			return
 		case task := <-b.imageExtractQueue:
+			metrics.RecordGauge("image_extract", "queue_depth", float64(len(b.imageExtractQueue)))
 			b.processImageExtractTask(ctx, task)
 		}
 	}
@@ -156,6 +178,11 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 		return
 	}
 	if len(data) == 0 {
+		logger.Warn(ctx, "backend_image_extract_skipped_too_large_or_empty",
+			zap.String("file_id", task.FileID),
+			zap.String("path", task.Path),
+			zap.Int64("file_size", f.SizeBytes),
+			zap.Int64("max_bytes", b.imageExtractMaxSize))
 		metrics.RecordOperation("image_extract", "process", "skip_too_large", time.Since(start))
 		return
 	}
@@ -176,6 +203,9 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 	}
 	text = sanitizeExtractedText(text, b.maxExtractTextBytes)
 	if text == "" {
+		logger.Warn(ctx, "backend_image_extract_empty_text",
+			zap.String("file_id", task.FileID),
+			zap.String("path", task.Path))
 		metrics.RecordOperation("image_extract", "process", "empty_text", time.Since(start))
 		return
 	}

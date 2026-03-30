@@ -6,6 +6,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"go.uber.org/zap"
 )
 
 type SearchResult struct {
@@ -114,6 +117,11 @@ func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limi
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
+		logger.Warn(ctx, "datastore_vector_search_query_failed",
+			zap.Int("query_len", len(query)),
+			zap.String("path_prefix", pathPrefix),
+			zap.Int("limit", limit),
+			zap.Error(err))
 		return nil
 	}
 	defer func() { _ = rows.Close() }()
@@ -122,7 +130,8 @@ func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limi
 	for rows.Next() {
 		var r SearchResult
 		var dist float64
-		if rows.Scan(&r.Path, &r.Name, &r.SizeBytes, &dist) != nil {
+		if err := rows.Scan(&r.Path, &r.Name, &r.SizeBytes, &dist); err != nil {
+			logger.Warn(ctx, "datastore_vector_search_scan_failed", zap.Error(err))
 			break
 		}
 		sc := 1.0 - dist
@@ -131,6 +140,9 @@ func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limi
 		}
 		r.Score = &sc
 		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		logger.Warn(ctx, "datastore_vector_search_rows_failed", zap.Error(err))
 	}
 	return out
 }
@@ -168,6 +180,11 @@ func (s *Store) ftsSearch(ctx context.Context, query, pathPrefix string, limit i
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
+		logger.Warn(ctx, "datastore_fts_search_query_failed",
+			zap.Int("query_len", len(query)),
+			zap.String("path_prefix", pathPrefix),
+			zap.Int("limit", limit),
+			zap.Error(err))
 		return nil
 	}
 	defer func() { _ = rows.Close() }()
@@ -176,11 +193,15 @@ func (s *Store) ftsSearch(ctx context.Context, query, pathPrefix string, limit i
 	for rows.Next() {
 		var r SearchResult
 		var sc float64
-		if rows.Scan(&r.Path, &r.Name, &r.SizeBytes, &sc) != nil {
+		if err := rows.Scan(&r.Path, &r.Name, &r.SizeBytes, &sc); err != nil {
+			logger.Warn(ctx, "datastore_fts_search_scan_failed", zap.Error(err))
 			break
 		}
 		r.Score = &sc
 		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		logger.Warn(ctx, "datastore_fts_search_rows_failed", zap.Error(err))
 	}
 	return out
 }

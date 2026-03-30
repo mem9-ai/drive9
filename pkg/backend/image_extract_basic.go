@@ -10,7 +10,10 @@ import (
 	_ "image/png"
 	"strings"
 
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
+	"go.uber.org/zap"
 )
 
 // BasicImageTextExtractor is a deterministic fallback extractor used when no
@@ -57,6 +60,18 @@ func (e *fallbackImageTextExtractor) ExtractImageText(ctx context.Context, req I
 	text, err := e.primary.ExtractImageText(ctx, req)
 	if err == nil && strings.TrimSpace(text) != "" {
 		return text, nil
+	}
+	if err != nil {
+		logger.Warn(ctx, "backend_image_extract_primary_failed_use_fallback",
+			zap.String("file_id", req.FileID),
+			zap.String("path", req.Path),
+			zap.Error(err))
+		metrics.RecordOperation("image_extract", "fallback", "primary_error", 0)
+	} else {
+		logger.Warn(ctx, "backend_image_extract_primary_empty_use_fallback",
+			zap.String("file_id", req.FileID),
+			zap.String("path", req.Path))
+		metrics.RecordOperation("image_extract", "fallback", "primary_empty", 0)
 	}
 	return e.fallback.ExtractImageText(ctx, req)
 }
