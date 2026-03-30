@@ -421,7 +421,7 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 			childP = dirPath + "/" + item.Name
 		}
 
-		ino := fs.inodes.Lookup(childP, item.IsDir, item.Size, time.Now())
+		ino := fs.inodes.EnsureInode(childP, item.IsDir, item.Size, time.Now())
 
 		var mode uint32
 		if item.IsDir {
@@ -456,7 +456,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		return gofuse.EIO
 	}
 
-	wb := NewWriteBuffer(childP, 0)
+	wb := NewWriteBuffer(childP, maxPreloadSize)
 	wb.touched = true
 	fh := &FileHandle{
 		Ino:   ino,
@@ -491,7 +491,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		if fs.opts.ReadOnly {
 			return gofuse.EROFS
 		}
-		fh.Dirty = NewWriteBuffer(p, 0)
+		fh.Dirty = NewWriteBuffer(p, maxPreloadSize)
 
 		// Preload existing content for non-truncating opens so that
 		// random writes don't discard the original file data.
@@ -507,7 +507,11 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 				fh.Dirty = NewWriteBuffer(p, bufMax)
 
 				if stat.Size <= smallFileThreshold {
-					if existing, err := fs.client.Read(p); err == nil && len(existing) > 0 {
+					existing, err := fs.client.Read(p)
+					if err != nil {
+						return gofuse.EIO
+					}
+					if len(existing) > 0 {
 						_, _ = fh.Dirty.Write(0, existing)
 						fh.Dirty.ClearDirty()
 					}
@@ -517,16 +521,20 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 					return gofuse.Status(syscall.EFBIG)
 				} else {
 					rc, err := fs.client.ReadStream(context.Background(), p)
-					if err == nil {
-						data, err := io.ReadAll(rc)
-						_ = rc.Close()
-						if err == nil && len(data) > 0 {
-							if _, werr := fh.Dirty.Write(0, data); werr != nil {
-								fh.Dirty = NewWriteBuffer(p, int64(len(data))+16<<20)
-								_, _ = fh.Dirty.Write(0, data)
-							}
-							fh.Dirty.ClearDirty()
+					if err != nil {
+						return gofuse.EIO
+					}
+					data, err := io.ReadAll(rc)
+					_ = rc.Close()
+					if err != nil {
+						return gofuse.EIO
+					}
+					if len(data) > 0 {
+						if _, werr := fh.Dirty.Write(0, data); werr != nil {
+							fh.Dirty = NewWriteBuffer(p, int64(len(data))+16<<20)
+							_, _ = fh.Dirty.Write(0, data)
 						}
+						fh.Dirty.ClearDirty()
 					}
 				}
 			}

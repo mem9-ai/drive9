@@ -72,6 +72,36 @@ func (m *InodeToPath) Lookup(path string, isDir bool, size int64, mtime time.Tim
 	return ino
 }
 
+// EnsureInode returns the inode for the given path, allocating one if it does
+// not exist. Unlike Lookup, it does NOT increment the Nlookup counter. Use
+// this for readdir entries where the kernel does not track a lookup reference.
+func (m *InodeToPath) EnsureInode(path string, isDir bool, size int64, mtime time.Time) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if ino, ok := m.byPath[path]; ok {
+		entry := m.byInode[ino]
+		entry.Size = size
+		entry.Mtime = mtime
+		return ino
+	}
+
+	ino := m.nextIno
+	m.nextIno++
+
+	entry := &InodeEntry{
+		Ino:     ino,
+		Path:    path,
+		IsDir:   isDir,
+		Nlookup: 0, // no kernel lookup reference yet
+		Size:    size,
+		Mtime:   mtime,
+	}
+	m.byInode[ino] = entry
+	m.byPath[path] = ino
+	return ino
+}
+
 // GetPath returns the path associated with the given inode number. The second
 // return value is false if the inode is not found.
 func (m *InodeToPath) GetPath(ino uint64) (string, bool) {
