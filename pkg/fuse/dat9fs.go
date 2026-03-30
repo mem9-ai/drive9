@@ -67,6 +67,79 @@ func parentDir(p string) string {
 	return d
 }
 
+func (fs *Dat9FS) dirtyHandleSize(ino uint64) (int64, bool) {
+	type candidate struct {
+		fh *FileHandle
+	}
+	var handles []candidate
+	fs.fileHandles.ForEach(func(_ uint64, fh *FileHandle) {
+		if fh != nil && fh.Ino == ino && fh.Dirty != nil {
+			handles = append(handles, candidate{fh: fh})
+		}
+	})
+	for _, h := range handles {
+		h.fh.Lock()
+		dirty := h.fh.Dirty
+		if dirty != nil && dirty.HasDirtyParts() {
+			size := dirty.Size()
+			h.fh.Unlock()
+			return size, true
+		}
+		h.fh.Unlock()
+	}
+	return 0, false
+}
+
+func (fs *Dat9FS) preloadWritableHandle(fh *FileHandle) gofuse.Status {
+	stat, err := fs.client.Stat(fh.Path)
+	if err != nil {
+		return httpToFuseStatus(err)
+	}
+	fh.OrigSize = stat.Size
+	if stat.Size == 0 {
+		return gofuse.OK
+	}
+	if stat.Size > maxPreloadSize {
+		return gofuse.Status(syscall.EFBIG)
+	}
+
+	bufMax := stat.Size + 16<<20
+	if bufMax < defaultWriteBufferMaxSize {
+		bufMax = defaultWriteBufferMaxSize
+	}
+	fh.Dirty = NewWriteBuffer(fh.Path, bufMax)
+
+	var data []byte
+	if stat.Size <= smallFileThreshold {
+		data, err = fs.client.Read(fh.Path)
+		if err != nil {
+			return httpToFuseStatus(err)
+		}
+	} else {
+		rc, err := fs.client.ReadStream(context.Background(), fh.Path)
+		if err != nil {
+			return httpToFuseStatus(err)
+		}
+		defer func() { _ = rc.Close() }()
+
+		data, err = io.ReadAll(rc)
+		if err != nil {
+			return gofuse.EIO
+		}
+	}
+	if int64(len(data)) != stat.Size {
+		return gofuse.EIO
+	}
+	if len(data) == 0 {
+		return gofuse.OK
+	}
+	if _, err := fh.Dirty.Write(0, data); err != nil {
+		return gofuse.Status(syscall.EFBIG)
+	}
+	fh.Dirty.ClearDirty()
+	return gofuse.OK
+}
+
 func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 	out.Ino = entry.Ino
 	out.Size = uint64(entry.Size)
@@ -152,8 +225,11 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		return gofuse.ENOENT
 	}
 
-	// For non-root, refresh from server
-	if input.NodeId != 1 {
+	// Prefer unflushed writable state over the remote object size.
+	if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
+		entry.Size = size
+	} else if input.NodeId != 1 {
+		// For non-root without local dirty state, refresh from server.
 		stat, err := fs.client.Stat(entry.Path)
 		if err != nil {
 			return httpToFuseStatus(err)
@@ -496,47 +572,8 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		// Preload existing content for non-truncating opens so that
 		// random writes don't discard the original file data.
 		if input.Flags&syscall.O_TRUNC == 0 {
-			stat, err := fs.client.Stat(p)
-			if err == nil && stat.Size > 0 {
-				fh.OrigSize = stat.Size
-
-				bufMax := stat.Size + 16<<20
-				if bufMax < defaultWriteBufferMaxSize {
-					bufMax = defaultWriteBufferMaxSize
-				}
-				fh.Dirty = NewWriteBuffer(p, bufMax)
-
-				if stat.Size <= smallFileThreshold {
-					existing, err := fs.client.Read(p)
-					if err != nil {
-						return gofuse.EIO
-					}
-					if len(existing) > 0 {
-						_, _ = fh.Dirty.Write(0, existing)
-						fh.Dirty.ClearDirty()
-					}
-				} else if stat.Size > maxPreloadSize {
-					// File too large to preload into memory — reject
-					// writable open to avoid OOM.
-					return gofuse.Status(syscall.EFBIG)
-				} else {
-					rc, err := fs.client.ReadStream(context.Background(), p)
-					if err != nil {
-						return gofuse.EIO
-					}
-					data, err := io.ReadAll(rc)
-					_ = rc.Close()
-					if err != nil {
-						return gofuse.EIO
-					}
-					if len(data) > 0 {
-						if _, werr := fh.Dirty.Write(0, data); werr != nil {
-							fh.Dirty = NewWriteBuffer(p, int64(len(data))+16<<20)
-							_, _ = fh.Dirty.Write(0, data)
-						}
-						fh.Dirty.ClearDirty()
-					}
-				}
+			if st := fs.preloadWritableHandle(fh); st != gofuse.OK {
+				return st
 			}
 		}
 	}

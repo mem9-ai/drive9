@@ -111,6 +111,11 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 		if newParts < len(wb.dirtyParts) {
 			wb.dirtyParts = wb.dirtyParts[:newParts]
 		}
+		if size > 0 && size%partSize == 0 && newParts > 0 {
+			// Exact-boundary shrinks still need a PATCH/flush to update the
+			// remote object size, even if no part payload changed.
+			wb.dirtyParts[newParts-1] = true
+		}
 	case size > cur:
 		if size > int64(cap(wb.buf)) {
 			grown := make([]byte, size)
