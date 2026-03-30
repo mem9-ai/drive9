@@ -151,7 +151,7 @@ func (s *Store) InTx(ctx context.Context, fn func(tx *sql.Tx) error) (err error)
 func (s *Store) columnExists(table, column string) bool {
 	var count int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = ? AND column_name = ?`,
+		`SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
 		table, column).Scan(&count)
 	return err == nil && count > 0
 }
