@@ -63,6 +63,16 @@ type S3Client interface {
 
 	// DeleteObject removes an object.
 	DeleteObject(ctx context.Context, key string) error
+
+	// UploadPartCopy copies a byte range from an existing S3 object into a part
+	// of an in-progress multipart upload. The copy happens server-side within S3
+	// — no data flows through the caller. startByte and endByte are inclusive.
+	// Returns the ETag of the copied part.
+	UploadPartCopy(ctx context.Context, destKey, uploadID string, partNumber int, sourceKey string, startByte, endByte int64) (string, error)
+
+	// PresignGetObjectRange returns a presigned URL for reading a byte range of
+	// an object. startByte and endByte are inclusive.
+	PresignGetObjectRange(ctx context.Context, key string, startByte, endByte int64, ttl time.Duration) (string, error)
 }
 
 // Default presigned URL TTLs per design doc §11.2.

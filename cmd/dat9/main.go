@@ -9,6 +9,8 @@
 //	create  provision a new database
 //	ctx     switch or list contexts
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, sh, grep, find)
+//	mount   mount dat9 as a local FUSE filesystem
+//	umount  unmount a dat9 FUSE mount
 package main
 
 import (
@@ -75,6 +77,20 @@ func main() {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "fs"), zap.String("subcommand", sub))
 		}
 		runFS(args)
+	case "mount":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "mount"))
+		}
+		if err := cli.MountCmd(args); err != nil {
+			fatal("mount", err)
+		}
+	case "umount":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "umount"))
+		}
+		if err := cli.UmountCmd(args); err != nil {
+			fatal("umount", err)
+		}
 	default:
 		if cliLogger != nil {
 			logger.Warn(context.Background(), "cli_unknown_command", zap.String("command", cmd))
@@ -151,6 +167,8 @@ commands:
   ctx [name]       switch context (or show current)
   ctx list         list all contexts
   fs               filesystem operations
+  mount <dir>      mount dat9 as a local FUSE filesystem
+  umount <dir>     unmount a dat9 FUSE mount
 `)
 	os.Exit(2)
 }
