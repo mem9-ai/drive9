@@ -36,6 +36,8 @@ func initZeroSchema(dsn string) error {
 		`CREATE UNIQUE INDEX idx_path ON file_nodes(path)`,
 		`CREATE INDEX idx_parent ON file_nodes(parent_path)`,
 		`CREATE INDEX idx_file_id ON file_nodes(file_id)`,
+		// See docs/async-embedding/async-embedding-generation-proposal.md,
+		// section "2) File schema: embedding must become mutable and revision-aware".
 		`CREATE TABLE IF NOT EXISTS files (
 			file_id            VARCHAR(64) PRIMARY KEY,
 			storage_type       VARCHAR(32) NOT NULL,
@@ -88,6 +90,13 @@ func initZeroSchema(dsn string) error {
 		)`,
 		`CREATE INDEX idx_upload_path ON uploads(target_path, status)`,
 		`CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)`,
+		// semantic_tasks groups fields by responsibility:
+		// - identity/resource binding: task_id, task_type, resource_id, resource_version
+		// - delivery state: status, attempt_count, max_attempts
+		// - lease/claim ownership: receipt, leased_at, lease_until, available_at
+		// - diagnostics/audit: payload_json, last_error, created_at, updated_at, completed_at
+		// payload_json is only for lightweight hints/debugging; worker correctness
+		// must always re-read current file state via resource_id + resource_version.
 		`CREATE TABLE IF NOT EXISTS semantic_tasks (
 			task_id           VARCHAR(64) PRIMARY KEY,
 			task_type         VARCHAR(32) NOT NULL,

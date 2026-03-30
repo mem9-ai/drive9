@@ -32,7 +32,10 @@ var (
 	ErrTaskLeaseMismatch = errors.New("semantic task lease mismatch")
 )
 
-// Task is a durable semantic task persisted in the tenant data plane.
+// Task mirrors one row in the tenant-local semantic_tasks table defined in
+// pkg/tenant/schema_zero.go and pkg/tenant/schema_db9.go. Keep this struct in
+// sync with the table shape and lifecycle semantics documented in
+// docs/async-embedding/async-embedding-generation-proposal.md.
 type Task struct {
 	TaskID          string
 	TaskType        TaskType
