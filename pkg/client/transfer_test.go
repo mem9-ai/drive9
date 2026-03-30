@@ -190,7 +190,7 @@ func TestReadStreamLargeFile(t *testing.T) {
 	}
 }
 
-func TestReadStreamRangeLargeFileRequiresPartialContent(t *testing.T) {
+func TestReadStreamRangeLargeFileFallbackOnOK(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/fs/large.bin":
@@ -209,9 +209,14 @@ func TestReadStreamRangeLargeFileRequiresPartialContent(t *testing.T) {
 
 	c := New(srv.URL, "")
 	rc, err := c.ReadStreamRange(context.Background(), "/large.bin", 5, 4)
-	if err == nil {
-		_ = rc.Close()
-		t.Fatal("expected error when ranged read does not return 206")
+	if err != nil {
+		t.Fatalf("ReadStreamRange: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+	data, _ := io.ReadAll(rc)
+	// "full-body" → skip 5 → "body" (4 bytes)
+	if got := string(data); got != "body" {
+		t.Errorf("got %q, want %q", got, "body")
 	}
 }
 
