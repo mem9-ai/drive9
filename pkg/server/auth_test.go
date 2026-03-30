@@ -36,8 +36,7 @@ func newAuthRuntime(t *testing.T) (*authTestRuntime, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	resetServerTestState(t, testDSN, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -70,8 +69,6 @@ func newAuthRuntime(t *testing.T) (*authTestRuntime, func()) {
 	}
 	now := time.Now().UTC()
 	tenantID := tenant.NewID()
-	tenantDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true", parsed.User, parsed.Passwd, host, port, parsed.DBName)
-	initServerTenantSchema(t, tenantDSN)
 	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
 	if err != nil {
 		t.Fatal(err)
@@ -116,8 +113,7 @@ func newAuthRuntime(t *testing.T) (*authTestRuntime, func()) {
 	}
 	cleanup := func() {
 		pool.Close()
-		_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-		_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+		resetServerTestState(t, testDSN, metaStore.DB())
 		_ = metaStore.Close()
 	}
 	return &authTestRuntime{meta: metaStore, pool: pool, tokenSecret: tokenSecret, token: tok}, cleanup
@@ -127,7 +123,10 @@ func newAuthServer(t *testing.T) (*Server, string, func()) {
 	t.Helper()
 	rt, cleanup := newAuthRuntime(t)
 	srv := NewWithConfig(Config{Meta: rt.meta, Pool: rt.pool, TokenSecret: rt.tokenSecret})
-	return srv, rt.token, cleanup
+	return srv, rt.token, func() {
+		srv.waitBackgroundTasks()
+		cleanup()
+	}
 }
 
 func mustTempDir(t *testing.T) string {
