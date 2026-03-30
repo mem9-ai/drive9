@@ -67,7 +67,7 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	b.imageExtractCancel = cancel
 	for i := 0; i < cfg.Workers; i++ {
 		b.imageExtractWG.Add(1)
-		go b.runImageExtractWorker(ctx)
+		go b.runImageExtractWorker(ctx, i+1)
 	}
 	logger.Info(ctx, "backend_image_extract_workers_started",
 		zap.Int("workers", cfg.Workers), zap.Int("queue_size", cfg.QueueSize))
@@ -81,5 +81,7 @@ func (b *Dat9Backend) Close() {
 	b.imageExtractCancel()
 	b.imageExtractWG.Wait()
 	b.imageExtractCancel = nil
-	logger.Info(backgroundWithTrace(), "backend_image_extract_workers_stopped")
+	logger.Info(backgroundWithTrace(), "backend_image_extract_workers_stopped",
+		zap.Int("queue_depth", len(b.imageExtractQueue)),
+		zap.Int("queue_size", cap(b.imageExtractQueue)))
 }
