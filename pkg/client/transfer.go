@@ -320,11 +320,13 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 			defer func() { _ = resp2.Body.Close() }()
 			return io.NopCloser(bytes.NewReader(nil)), nil
 		default:
-			defer func() { _ = resp2.Body.Close() }()
 			if resp2.StatusCode >= 300 {
+				defer func() { _ = resp2.Body.Close() }()
 				return nil, readError(resp2)
 			}
-			return nil, fmt.Errorf("expected HTTP 206 for ranged read, got %d", resp2.StatusCode)
+			// 200: server returned full body (Range not honored).
+			// Skip to offset and limit the read.
+			return c.sliceBody(resp2.Body, offset, length)
 		}
 
 	case resp.StatusCode >= 300:
@@ -332,10 +334,34 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		return nil, readError(resp)
 
 	default:
-		// Small file: return body directly (caller reads what it needs).
-		return resp.Body, nil
+		// Small file: full body returned. Skip to offset and limit.
+		return c.sliceBody(resp.Body, offset, length)
 	}
 }
+
+// sliceBody skips offset bytes from rc, then returns a reader limited to
+// length bytes. The original rc is closed when the returned ReadCloser is closed.
+func (c *Client) sliceBody(rc io.ReadCloser, offset, length int64) (io.ReadCloser, error) {
+	if offset > 0 {
+		if _, err := io.CopyN(io.Discard, rc, offset); err != nil {
+			_ = rc.Close()
+			if err == io.EOF {
+				// Offset past end — return empty reader.
+				return io.NopCloser(strings.NewReader("")), nil
+			}
+			return nil, fmt.Errorf("skip to offset: %w", err)
+		}
+	}
+	return &limitedReadCloser{r: io.LimitReader(rc, length), c: rc}, nil
+}
+
+type limitedReadCloser struct {
+	r io.Reader
+	c io.Closer
+}
+
+func (l *limitedReadCloser) Read(p []byte) (int, error) { return l.r.Read(p) }
+func (l *limitedReadCloser) Close() error               { return l.c.Close() }
 
 // UploadMeta is the server's response for querying active uploads.
 type UploadMeta struct {

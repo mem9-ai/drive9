@@ -32,7 +32,8 @@ type PatchUploadPart struct {
 	Size      int64             `json:"size"`               // expected part size
 	Headers   map[string]string `json:"headers,omitempty"`  // required headers for the PUT
 	ExpiresAt time.Time         `json:"expires_at"`
-	ReadURL   string            `json:"read_url,omitempty"` // presigned GET URL to download original part data (empty for parts beyond original file)
+	ReadURL     string            `json:"read_url,omitempty"`     // presigned GET URL to download original part data (empty for parts beyond original file)
+	ReadHeaders map[string]string `json:"read_headers,omitempty"` // required headers for the GET (e.g. Range, signed into the presigned URL)
 }
 
 // InitiatePatchUpload creates a multipart upload for modifying an existing
@@ -159,6 +160,11 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 					// Non-fatal: client can still upload the full part without merging
 				} else {
 					pup.ReadURL = readURL
+					// AWS presigned URLs with Range bake the header into the
+					// signature — the client MUST send the matching Range header.
+					pup.ReadHeaders = map[string]string{
+						"Range": fmt.Sprintf("bytes=%d-%d", partStart, partEnd),
+					}
 				}
 			}
 

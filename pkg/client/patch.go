@@ -28,7 +28,8 @@ type PatchPartURL struct {
 	Size      int64             `json:"size"`
 	Headers   map[string]string `json:"headers,omitempty"`
 	ExpiresAt string            `json:"expires_at"`
-	ReadURL   string            `json:"read_url,omitempty"`
+	ReadURL     string            `json:"read_url,omitempty"`
+	ReadHeaders map[string]string `json:"read_headers,omitempty"`
 }
 
 // PatchFile performs a partial update of a large file using S3 UploadPartCopy
@@ -135,6 +136,12 @@ func (c *Client) uploadPatchPart(ctx context.Context, part *PatchPartURL, readPa
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, part.ReadURL, nil)
 		if err != nil {
 			return fmt.Errorf("create read request: %w", err)
+		}
+		// AWS presigned URLs with Range require the matching Range header.
+		for k, v := range part.ReadHeaders {
+			if !strings.EqualFold(k, "host") {
+				req.Header.Set(k, v)
+			}
 		}
 		resp, err := c.httpClient.Do(req) // Direct to S3, no auth
 		if err != nil {
