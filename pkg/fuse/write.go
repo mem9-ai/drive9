@@ -3,8 +3,9 @@ package fuse
 import "syscall"
 
 const (
-	defaultWriteBufferMaxSize = 64 << 20 // 64MB per file
-	partSize                  = 8 << 20  // 8MB - must match s3client.PartSize
+	defaultWriteBufferMaxSize = 64 << 20  // 64MB per file
+	partSize                  = 8 << 20   // 8MB - must match s3client.PartSize
+	maxPreloadSize            = 256 << 20 // 256MB - hard limit for preloading existing files into memory
 )
 
 // WriteBuffer accumulates write data for a single file.
