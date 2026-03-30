@@ -6,8 +6,6 @@ import (
 	"strings"
 )
 
-const autoEmbedModel = "tidbcloud_free/amazon/titan-embed-text-v2"
-
 func execSchemaStatements(db *sql.DB, stmts []string) error {
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

@@ -10,22 +10,36 @@ func TestInitSchemaProviderSplit(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s1.Close() })
-	dropDataPlaneTables(t, s1)
-	initDatastoreSchema(t, testDSN, "tidb_zero")
-	if !s1.columnExists("files", "content_blob") {
-		t.Fatal("expected content_blob column for tidb_zero")
+	tests := []struct {
+		provider        string
+		wantContentBlob bool
+	}{
+		{provider: "tidb_zero", wantContentBlob: true},
+		{provider: "tidb_cloud_starter", wantContentBlob: true},
+		{provider: "db9", wantContentBlob: false},
 	}
 
-	dropDataPlaneTables(t, s1)
-	initDatastoreSchema(t, testDSN, "db9")
-	if s1.columnExists("files", "content_blob") {
-		t.Fatal("did not expect content_blob column for db9")
+	for _, tc := range tests {
+		dropDataPlaneTables(t, s1)
+		initDatastoreSchema(t, testDSN, tc.provider)
+		if got := s1.columnExists("files", "content_blob"); got != tc.wantContentBlob {
+			t.Fatalf("provider %s content_blob=%v, want %v", tc.provider, got, tc.wantContentBlob)
+		}
+		for _, col := range []string{"embedding", "embedding_revision"} {
+			if !s1.columnExists("files", col) {
+				t.Fatalf("provider %s missing files.%s", tc.provider, col)
+			}
+		}
+		if !s1.columnExists("semantic_tasks", "task_id") {
+			t.Fatalf("provider %s missing semantic_tasks table", tc.provider)
+		}
 	}
 }
 
 func dropDataPlaneTables(t *testing.T, s *Store) {
 	t.Helper()
 	stmts := []string{
+		"DROP TABLE IF EXISTS semantic_tasks",
 		"DROP TABLE IF EXISTS uploads",
 		"DROP TABLE IF EXISTS file_tags",
 		"DROP TABLE IF EXISTS file_nodes",

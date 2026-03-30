@@ -41,7 +41,8 @@ func initDB9Schema(dsn string) error {
 			status          VARCHAR(32) NOT NULL DEFAULT 'PENDING',
 			source_id       VARCHAR(255),
 			content_text    TEXT,
-			embedding       vector(1024) GENERATED ALWAYS AS (EMBED_TEXT('` + autoEmbedModel + `', content_text, '{"dimensions": 1024}'::jsonb)) STORED,
+			embedding       vector(1024),
+			embedding_revision BIGINT,
 			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			confirmed_at    TIMESTAMPTZ,
 			expires_at      TIMESTAMPTZ
@@ -75,6 +76,26 @@ func initDB9Schema(dsn string) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_upload_path ON uploads(target_path, status)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency ON uploads(idempotency_key)`,
+		`CREATE TABLE IF NOT EXISTS semantic_tasks (
+			task_id           VARCHAR(64) PRIMARY KEY,
+			task_type         VARCHAR(32) NOT NULL,
+			resource_id       VARCHAR(64) NOT NULL,
+			resource_version  BIGINT NOT NULL,
+			status            VARCHAR(20) NOT NULL,
+			attempt_count     INT NOT NULL DEFAULT 0,
+			max_attempts      INT NOT NULL DEFAULT 5,
+			receipt           VARCHAR(128),
+			leased_at         TIMESTAMPTZ,
+			lease_until       TIMESTAMPTZ,
+			available_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			payload_json      JSONB,
+			last_error        TEXT,
+			created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			completed_at      TIMESTAMPTZ,
+			UNIQUE (task_type, resource_id, resource_version)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_task_claim ON semantic_tasks(status, available_at, lease_until, created_at)`,
 	}
 
 	return execSchemaStatements(db, stmts)

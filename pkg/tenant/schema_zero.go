@@ -48,7 +48,8 @@ func initZeroSchema(dsn string) error {
 			status          VARCHAR(32) NOT NULL DEFAULT 'PENDING',
 			source_id       VARCHAR(255),
 			content_text    LONGTEXT,
-			embedding       VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT('` + autoEmbedModel + `', content_text, '{"dimensions": 1024}')) STORED,
+			embedding       VECTOR(1024),
+			embedding_revision BIGINT,
 			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			confirmed_at    DATETIME(3),
 			expires_at      DATETIME(3)
@@ -87,6 +88,26 @@ func initZeroSchema(dsn string) error {
 		)`,
 		`CREATE INDEX idx_upload_path ON uploads(target_path, status)`,
 		`CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)`,
+		`CREATE TABLE IF NOT EXISTS semantic_tasks (
+			task_id           VARCHAR(64) PRIMARY KEY,
+			task_type         VARCHAR(32) NOT NULL,
+			resource_id       VARCHAR(64) NOT NULL,
+			resource_version  BIGINT NOT NULL,
+			status            VARCHAR(20) NOT NULL,
+			attempt_count     INT NOT NULL DEFAULT 0,
+			max_attempts      INT NOT NULL DEFAULT 5,
+			receipt           VARCHAR(128) NULL,
+			leased_at         DATETIME(3) NULL,
+			lease_until       DATETIME(3) NULL,
+			available_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			payload_json      JSON NULL,
+			last_error        TEXT NULL,
+			created_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			completed_at      DATETIME(3) NULL
+		)`,
+		`CREATE UNIQUE INDEX uk_task_resource_version ON semantic_tasks(task_type, resource_id, resource_version)`,
+		`CREATE INDEX idx_task_claim ON semantic_tasks(status, available_at, lease_until, created_at)`,
 	}
 
 	return execSchemaStatements(db, stmts)
