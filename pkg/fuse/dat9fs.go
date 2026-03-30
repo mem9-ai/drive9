@@ -605,7 +605,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		} else {
 			// O_TRUNC: mark buffer as dirty so that close() without any
 			// writes still persists the truncation (POSIX semantics).
-			fh.Dirty.Truncate(0)
+			_ = fh.Dirty.Truncate(0)
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 			fs.inodes.UpdateSize(fh.Ino, 0)
 		}
