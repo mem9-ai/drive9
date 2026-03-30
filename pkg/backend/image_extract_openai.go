@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const defaultImageExtractPrompt = "Describe this image for file search. Include key objects, scene, any visible text (OCR), and concise tags."
+const defaultImageExtractPrompt = "Describe this image for file search in both Chinese and English. Include: key objects, scene description, any visible text (OCR), and concise tags. First write in Chinese, then in English. 用中文和英文双语描述这张图片，包括：主要物体、场景描述、图中可见文字（OCR）、简洁标签。先写中文，再写英文。"
 
 // OpenAIImageTextExtractorConfig configures an OpenAI-compatible vision endpoint.
 // This works with providers that expose the /v1/chat/completions API surface.
