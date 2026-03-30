@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/s3client"
@@ -29,8 +28,8 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	testmysql.ResetDB(t, store.DB())
 	t.Cleanup(func() { _ = store.Close() })
+	resetServerTestState(t, testDSN, store.DB())
 
 	s3c, err := s3client.NewLocal(s3Dir, "/s3")
 	if err != nil {
@@ -40,7 +39,9 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(b)
+	s := New(b)
+	t.Cleanup(s.waitBackgroundTasks)
+	return s
 }
 func TestWriteAndRead(t *testing.T) {
 	s := newTestServer(t)

@@ -29,8 +29,7 @@ func newAuthServer(t *testing.T) (*Server, string, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	resetServerTestState(t, testDSN, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -63,8 +62,6 @@ func newAuthServer(t *testing.T) (*Server, string, func()) {
 	}
 	now := time.Now().UTC()
 	tenantID := tenant.NewID()
-	tenantDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true", parsed.User, parsed.Passwd, host, port, parsed.DBName)
-	initServerTenantSchema(t, tenantDSN)
 	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
 	if err != nil {
 		t.Fatal(err)
@@ -110,9 +107,9 @@ func newAuthServer(t *testing.T) (*Server, string, func()) {
 
 	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, TokenSecret: tokenSecret})
 	cleanup := func() {
+		srv.waitBackgroundTasks()
 		pool.Close()
-		_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-		_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+		resetServerTestState(t, testDSN, metaStore.DB())
 		_ = metaStore.Close()
 	}
 	return srv, tok, cleanup
