@@ -273,4 +273,38 @@ func (c *AWSS3Client) DeleteObject(ctx context.Context, key string) error {
 	return nil
 }
 
+func (c *AWSS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID string, partNumber int, sourceKey string, startByte, endByte int64) (string, error) {
+	copySource := fmt.Sprintf("%s/%s", c.bucket, c.fullKey(sourceKey))
+	copyRange := fmt.Sprintf("bytes=%d-%d", startByte, endByte)
+
+	out, err := c.client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+		Bucket:          &c.bucket,
+		Key:             aws.String(c.fullKey(destKey)),
+		UploadId:        &uploadID,
+		PartNumber:      aws.Int32(int32(partNumber)),
+		CopySource:      aws.String(copySource),
+		CopySourceRange: aws.String(copyRange),
+	})
+	if err != nil {
+		return "", fmt.Errorf("upload part copy: %w", err)
+	}
+	return aws.ToString(out.CopyPartResult.ETag), nil
+}
+
+func (c *AWSS3Client) PresignGetObjectRange(ctx context.Context, key string, startByte, endByte int64, ttl time.Duration) (string, error) {
+	if ttl > DownloadTTL {
+		ttl = DownloadTTL
+	}
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", startByte, endByte)
+	out, err := c.presign.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: &c.bucket,
+		Key:    aws.String(c.fullKey(key)),
+		Range:  aws.String(rangeHeader),
+	}, s3.WithPresignExpires(ttl))
+	if err != nil {
+		return "", fmt.Errorf("presign get object range: %w", err)
+	}
+	return out.URL, nil
+}
+
 var _ S3Client = (*AWSS3Client)(nil)
