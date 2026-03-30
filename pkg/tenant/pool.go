@@ -71,11 +71,9 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 		p.order.MoveToFront(elem)
 		b := elem.Value.(*entry).backend
 		p.mu.Unlock()
-		logger.Info(ctx, "tenant_pool_cache_hit", zap.String("tenant_id", t.ID))
 		return b, nil
 	}
 	p.mu.Unlock()
-	logger.Info(ctx, "tenant_pool_cache_miss", zap.String("tenant_id", t.ID), zap.String("provider", t.Provider))
 
 	b, st, err := p.createBackend(ctx, t)
 	if err != nil {
@@ -88,12 +86,10 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 		b.Close()
 		_ = st.Close()
 		p.order.MoveToFront(elem)
-		logger.Info(ctx, "tenant_pool_cache_race_reuse", zap.String("tenant_id", t.ID))
 		return elem.Value.(*entry).backend, nil
 	}
 	elem := p.order.PushFront(&entry{tenantID: t.ID, backend: b, store: st})
 	p.items[t.ID] = elem
-	logger.Info(ctx, "tenant_pool_cache_inserted", zap.String("tenant_id", t.ID), zap.Int("pool_size", p.order.Len()))
 	for p.order.Len() > p.maxSize {
 		oldest := p.order.Back()
 		if oldest != nil {
@@ -143,10 +139,8 @@ func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantI
 
 	b := p.S3Backend(tenantID)
 	if b != nil {
-		logger.Info(ctx, "tenant_pool_load_s3_backend_hit", zap.String("tenant_id", tenantID))
 		return b
 	}
-	logger.Info(ctx, "tenant_pool_load_s3_backend_miss", zap.String("tenant_id", tenantID))
 	tenant, err := metaStore.GetTenant(ctx, tenantID)
 	if err != nil {
 		if !errors.Is(err, meta.ErrNotFound) {
@@ -163,7 +157,6 @@ func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantI
 }
 
 func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9Backend, *datastore.Store, error) {
-	logger.Info(ctx, "tenant_pool_create_backend_started", zap.String("tenant_id", t.ID), zap.String("provider", t.Provider))
 	pass, err := p.enc.Decrypt(ctx, t.DBPasswordCipher)
 	if err != nil {
 		return nil, nil, fmt.Errorf("decrypt db password: %w", err)
@@ -199,10 +192,6 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("create backend with s3 mode: %w", err)
 		}
-		logger.Info(ctx, "tenant_pool_create_backend_ok",
-			zap.String("tenant_id", t.ID),
-			zap.String("provider", t.Provider),
-			zap.String("storage_mode", "s3_aws"))
 		return b, store, nil
 	}
 	if p.cfg.S3Dir != "" {
@@ -219,10 +208,6 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("create backend with local s3 mode: %w", err)
 		}
-		logger.Info(ctx, "tenant_pool_create_backend_ok",
-			zap.String("tenant_id", t.ID),
-			zap.String("provider", t.Provider),
-			zap.String("storage_mode", "s3_local"))
 		return b, store, nil
 	}
 	b, err := backend.NewWithOptions(store, p.cfg.BackendOptions)
@@ -230,10 +215,6 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		_ = store.Close()
 		return nil, nil, fmt.Errorf("create backend: %w", err)
 	}
-	logger.Info(ctx, "tenant_pool_create_backend_ok",
-		zap.String("tenant_id", t.ID),
-		zap.String("provider", t.Provider),
-		zap.String("storage_mode", "db_only"))
 	return b, store, nil
 }
 
@@ -247,10 +228,8 @@ func (p *Pool) removeLocked(ctx context.Context, elem *list.Element, reason stri
 	if e.store != nil {
 		_ = e.store.Close()
 	}
-	logger.Info(ctx, "tenant_pool_entry_removed",
-		zap.String("tenant_id", e.tenantID),
-		zap.String("reason", reason),
-		zap.Int("pool_size", p.order.Len()))
+	_ = ctx
+	_ = reason
 }
 
 func observePool(ctx context.Context, op, tenantID string, errp *error, start time.Time) {

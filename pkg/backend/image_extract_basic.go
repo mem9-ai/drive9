@@ -68,7 +68,7 @@ func (e *fallbackImageTextExtractor) ExtractImageText(ctx context.Context, req I
 			zap.Error(err))
 		metrics.RecordOperation("image_extract", "fallback", "primary_error", 0)
 	} else {
-		logger.Info(ctx, "backend_image_extract_primary_empty_use_fallback",
+		logger.Warn(ctx, "backend_image_extract_primary_empty_use_fallback",
 			zap.String("file_id", req.FileID),
 			zap.String("path", req.Path))
 		metrics.RecordOperation("image_extract", "fallback", "primary_empty", 0)

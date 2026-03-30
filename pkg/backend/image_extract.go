@@ -59,19 +59,11 @@ func contentTypeFromPath(path string) string {
 
 func (b *Dat9Backend) enqueueImageExtract(fileID, path, contentType string, revision int64) {
 	if !b.imageExtractEnabled || b.imageExtractor == nil {
-		logger.Info(backgroundWithTrace(), "backend_image_extract_enqueue_skipped",
-			zap.String("file_id", fileID),
-			zap.String("path", path),
-			zap.String("reason", "disabled_or_extractor_missing"))
 		return
 	}
 	if !isImageContentType(contentType) {
 		contentType = contentTypeFromPath(path)
 		if !isImageContentType(contentType) {
-			logger.Info(backgroundWithTrace(), "backend_image_extract_enqueue_skipped",
-				zap.String("file_id", fileID),
-				zap.String("path", path),
-				zap.String("reason", "not_image"))
 			return
 		}
 	}
@@ -84,13 +76,6 @@ func (b *Dat9Backend) enqueueImageExtract(fileID, path, contentType string, revi
 	select {
 	case b.imageExtractQueue <- task:
 		metrics.RecordOperation("image_extract", "enqueue", "ok", 0)
-		logger.Info(backgroundWithTrace(), "backend_image_extract_enqueued",
-			zap.String("file_id", fileID),
-			zap.String("path", path),
-			zap.String("content_type", contentType),
-			zap.Int64("revision", revision),
-			zap.Int("queue_depth", len(b.imageExtractQueue)),
-			zap.Int("queue_size", cap(b.imageExtractQueue)))
 	default:
 		metrics.RecordOperation("image_extract", "enqueue", "queue_full", 0)
 		logger.Warn(backgroundWithTrace(), "backend_image_extract_queue_full_drop",
@@ -102,11 +87,6 @@ func (b *Dat9Backend) enqueueImageExtract(fileID, path, contentType string, revi
 
 func (b *Dat9Backend) enqueueImageExtractForUpload(ctx context.Context, upload *datastore.Upload, isOverwrite bool) {
 	if !b.imageExtractEnabled || b.imageExtractor == nil {
-		logger.Info(ctx, "backend_image_extract_upload_enqueue_skipped",
-			zap.String("upload_id", upload.UploadID),
-			zap.String("path", upload.TargetPath),
-			zap.Bool("is_overwrite", isOverwrite),
-			zap.String("reason", "disabled_or_extractor_missing"))
 		return
 	}
 	fileID := upload.FileID
@@ -134,13 +114,6 @@ func (b *Dat9Backend) enqueueImageExtractForUpload(ctx context.Context, upload *
 	if ct == "" {
 		ct = contentTypeFromPath(upload.TargetPath)
 	}
-	logger.Info(ctx, "backend_image_extract_upload_enqueue_resolved",
-		zap.String("upload_id", upload.UploadID),
-		zap.String("file_id", fileID),
-		zap.String("path", upload.TargetPath),
-		zap.String("content_type", ct),
-		zap.Int64("revision", f.Revision),
-		zap.Bool("is_overwrite", isOverwrite))
 	b.enqueueImageExtract(fileID, upload.TargetPath, ct, f.Revision)
 }
 
@@ -160,13 +133,6 @@ func (b *Dat9Backend) runImageExtractWorker(ctx context.Context, workerID int) {
 
 func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExtractTask) {
 	start := time.Now()
-	logger.Info(ctx, "backend_image_extract_task_started",
-		zap.String("file_id", task.FileID),
-		zap.String("path", task.Path),
-		zap.String("content_type", task.ContentType),
-		zap.Int64("revision", task.Revision),
-		zap.Int("queue_depth", len(b.imageExtractQueue)),
-		zap.Int("queue_size", cap(b.imageExtractQueue)))
 	f, err := b.store.GetFile(ctx, task.FileID)
 	if err != nil {
 		if !errors.Is(err, datastore.ErrNotFound) {
@@ -177,11 +143,6 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 		return
 	}
 	if f.Status != datastore.StatusConfirmed {
-		logger.Info(ctx, "backend_image_extract_task_skipped",
-			zap.String("file_id", task.FileID),
-			zap.String("path", task.Path),
-			zap.String("reason", "not_confirmed"),
-			zap.String("status", string(f.Status)))
 		metrics.RecordOperation("image_extract", "process", "not_confirmed", time.Since(start))
 		return
 	}
@@ -190,21 +151,10 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 		ct = task.ContentType
 	}
 	if !isImageContentType(ct) {
-		logger.Info(ctx, "backend_image_extract_task_skipped",
-			zap.String("file_id", task.FileID),
-			zap.String("path", task.Path),
-			zap.String("reason", "not_image"),
-			zap.String("content_type", ct))
 		metrics.RecordOperation("image_extract", "process", "not_image", time.Since(start))
 		return
 	}
 	if task.Revision > 0 && f.Revision != task.Revision {
-		logger.Info(ctx, "backend_image_extract_task_skipped",
-			zap.String("file_id", task.FileID),
-			zap.String("path", task.Path),
-			zap.String("reason", "stale_precheck"),
-			zap.Int64("task_revision", task.Revision),
-			zap.Int64("current_revision", f.Revision))
 		metrics.RecordOperation("image_extract", "process", "stale_precheck", time.Since(start))
 		return
 	}
@@ -217,10 +167,9 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 		return
 	}
 	if len(data) == 0 {
-		logger.Info(ctx, "backend_image_extract_task_skipped",
+		logger.Warn(ctx, "backend_image_extract_skipped_too_large_or_empty",
 			zap.String("file_id", task.FileID),
 			zap.String("path", task.Path),
-			zap.String("reason", "too_large_or_empty"),
 			zap.Int64("file_size", f.SizeBytes),
 			zap.Int64("max_bytes", b.imageExtractMaxSize))
 		metrics.RecordOperation("image_extract", "process", "skip_too_large", time.Since(start))
@@ -243,10 +192,9 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 	}
 	text = sanitizeExtractedText(text, b.maxExtractTextBytes)
 	if text == "" {
-		logger.Info(ctx, "backend_image_extract_task_skipped",
+		logger.Warn(ctx, "backend_image_extract_empty_text",
 			zap.String("file_id", task.FileID),
-			zap.String("path", task.Path),
-			zap.String("reason", "empty_text"))
+			zap.String("path", task.Path))
 		metrics.RecordOperation("image_extract", "process", "empty_text", time.Since(start))
 		return
 	}
