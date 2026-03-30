@@ -4,6 +4,7 @@
 set -euo pipefail
 
 BASE="${DAT9_BASE:-http://127.0.0.1:9009}"
+DAT9_IMAGE_FIXTURE_URL="${DAT9_IMAGE_FIXTURE_URL:-https://upload.wikimedia.org/wikipedia/commons/3/3a/Cat03.jpg}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 CLI_LARGE_FILE_MB="${CLI_LARGE_FILE_MB:-100}"
@@ -12,6 +13,8 @@ CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
 RUN_CLI_UPLOAD_LIMIT_BOUNDARY="${RUN_CLI_UPLOAD_LIMIT_BOUNDARY:-1}"
 CLI_UPLOAD_LIMIT_BYTES="${CLI_UPLOAD_LIMIT_BYTES:-1073741824}"
+CLI_SEMANTIC_TIMEOUT_S="${CLI_SEMANTIC_TIMEOUT_S:-90}"
+CLI_SEMANTIC_INTERVAL_S="${CLI_SEMANTIC_INTERVAL_S:-3}"
 
 PASS=0
 FAIL=0
@@ -136,12 +139,43 @@ dat9_retry_read() {
   done
 }
 
+wait_cli_grep_target() {
+  local desc="$1"
+  local query="$2"
+  local target="$3"
+  local deadline=$(( $(date +%s) + CLI_SEMANTIC_TIMEOUT_S ))
+  local found="false"
+  while :; do
+    local out
+    out="$(dat9_retry fs grep "$query" /)"
+    found=$(python3 - "$out" "$target" <<'PY'
+import sys
+out=sys.argv[1].splitlines()
+target=sys.argv[2]
+print("true" if any(line.split("\t")[0].strip()==target for line in out if line.strip()) else "false")
+PY
+)
+    if [ "$found" = "true" ]; then
+      break
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      break
+    fi
+    echo "semantic recall not ready for $target, retrying" >&2
+    sleep "$CLI_SEMANTIC_INTERVAL_S"
+  done
+  check_eq "$desc" "$found" "true"
+}
+
 TS="$(date +%s)"
 SMALL_LOCAL="/tmp/dat9-cli-small-${TS}.txt"
 SMALL_REMOTE="/cli-${TS}-small.txt"
 SMALL_RENAMED="/cli-${TS}-small-renamed.txt"
-IMAGE_LOCAL="/tmp/dat9-cli-image-${TS}.png"
-IMAGE_REMOTE="/cli-${TS}-image.png"
+IMAGE_LOCAL="/tmp/dat9-cli-image-${TS}.jpg"
+IMAGE_REMOTE="/cli-${TS}-image.jpg"
+SEM_TEXT_TARGET="/cli-${TS}-cat-story.txt"
+SEM_TEXT_OTHER="/cli-${TS}-dog-story.txt"
+IMAGE_CAPTION_REMOTE="/cli-${TS}-image.caption.txt"
 BATCH_LOCAL_DIR="/tmp/dat9-cli-batch-${TS}"
 BATCH_REMOTE_DIR="/cli-${TS}-batch"
 LARGE_LOCAL="/tmp/dat9-cli-large-${TS}.bin"
@@ -235,20 +269,33 @@ PY
 )
 check_eq "cli find by name returns txt files" "$find_has_txt" "true"
 
-echo "[6.1] cli image upload/find checks"
-printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+Xf7YAAAAASUVORK5CYII=' | base64 -d > "$IMAGE_LOCAL"
-check_cmd "local cli png fixture exists" test -s "$IMAGE_LOCAL"
-dat9_retry fs cp "$IMAGE_LOCAL" ":$IMAGE_REMOTE" >/dev/null
+echo "[6.1] cli semantic text recall checks"
+printf "A cat is resting on a sofa near a window." > "/tmp/dat9-cli-sem-target-${TS}.txt"
+printf "A dog is running in a field under bright sun." > "/tmp/dat9-cli-sem-other-${TS}.txt"
+dat9_retry fs cp "/tmp/dat9-cli-sem-target-${TS}.txt" ":$SEM_TEXT_TARGET" >/dev/null
+dat9_retry fs cp "/tmp/dat9-cli-sem-other-${TS}.txt" ":$SEM_TEXT_OTHER" >/dev/null
 
-find_png_out="$(dat9_retry fs find / -name "*.png")"
+wait_cli_grep_target "cli semantic grep includes cat-story target" "feline sofa" "$SEM_TEXT_TARGET"
+wait_cli_grep_target "cli semantic grep includes dog-story target" "canine field" "$SEM_TEXT_OTHER"
+
+echo "[6.2] cli image-associated recall checks"
+curl -fsSL "$DAT9_IMAGE_FIXTURE_URL" -o "$IMAGE_LOCAL"
+check_cmd "local cli jpg fixture exists" test -s "$IMAGE_LOCAL"
+dat9_retry fs cp "$IMAGE_LOCAL" ":$IMAGE_REMOTE" >/dev/null
+printf "This image shows a cat face icon." > "/tmp/dat9-cli-image-caption-${TS}.txt"
+dat9_retry fs cp "/tmp/dat9-cli-image-caption-${TS}.txt" ":$IMAGE_CAPTION_REMOTE" >/dev/null
+
+wait_cli_grep_target "cli image-associated grep includes caption" "feline face icon" "$IMAGE_CAPTION_REMOTE"
+
+find_png_out="$(dat9_retry fs find / -name "*.jpg")"
 find_has_png=$(python3 - "$find_png_out" "$IMAGE_REMOTE" <<'PY'
 import sys
 lines=[ln.strip() for ln in sys.argv[1].splitlines() if ln.strip()]
 target=sys.argv[2]
-print("true" if any(line == target or line.endswith('.png') for line in lines) else "false")
+print("true" if any(line == target or line.endswith('.jpg') for line in lines) else "false")
 PY
 )
-check_eq "cli find by name returns png files" "$find_has_png" "true"
+check_eq "cli find by name returns jpg files" "$find_has_png" "true"
 
 echo "[7] large multipart upload via cli cp"
 dd if=/dev/zero of="$LARGE_LOCAL" bs=1M count="$CLI_LARGE_FILE_MB" status=none
@@ -345,6 +392,7 @@ PY
 fi
 
 rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$IMAGE_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
+rm -f "/tmp/dat9-cli-sem-target-${TS}.txt" "/tmp/dat9-cli-sem-other-${TS}.txt" "/tmp/dat9-cli-image-caption-${TS}.txt"
 rm -rf "$BATCH_LOCAL_DIR"
 
 echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"

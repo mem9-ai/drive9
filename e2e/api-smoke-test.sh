@@ -9,16 +9,19 @@
 #  5) Multi-file write/read under nested directories
 #  6) Batch small-file write/list/read validation
 #  7) Content search (`grep`) and attribute search (`find`)
-#  8) Image upload + image query (`find` by png extension)
-#  9) SQL endpoint sanity query
-# 10) Copy, rename, delete
-# 11) Final list verification
-# 12) 100MB multipart upload with checksum-bound presigned parts + download checksum
-# 13) Max-upload boundary check (1GiB allowed, 1GiB+1 rejected)
+#  8) Image upload + image query (`find` by jpg extension)
+#  9) Semantic text recall checks (`grep` with paraphrase query)
+# 10) Image-associated recall checks (caption text + image file)
+# 11) SQL endpoint sanity query
+# 12) Copy, rename, delete
+# 13) Final list verification
+# 14) 100MB multipart upload with checksum-bound presigned parts + download checksum
+# 15) Max-upload boundary check (1GiB allowed, 1GiB+1 rejected)
 
 set -euo pipefail
 
 BASE="${DAT9_BASE:-http://127.0.0.1:9009}"
+DAT9_IMAGE_FIXTURE_URL="${DAT9_IMAGE_FIXTURE_URL:-https://upload.wikimedia.org/wikipedia/commons/3/3a/Cat03.jpg}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 RUN_LARGE_FILE="${RUN_LARGE_FILE:-1}"
@@ -28,6 +31,8 @@ REQUEST_MAX_RETRIES="${REQUEST_MAX_RETRIES:-8}"
 REQUEST_RETRY_SLEEP_S="${REQUEST_RETRY_SLEEP_S:-2}"
 RUN_UPLOAD_LIMIT_BOUNDARY="${RUN_UPLOAD_LIMIT_BOUNDARY:-1}"
 UPLOAD_LIMIT_BYTES="${UPLOAD_LIMIT_BYTES:-1073741824}"
+SEMANTIC_TIMEOUT_S="${SEMANTIC_TIMEOUT_S:-90}"
+SEMANTIC_INTERVAL_S="${SEMANTIC_INTERVAL_S:-3}"
 
 PASS=0
 FAIL=0
@@ -106,6 +111,87 @@ curl_body_code() {
 http_code() { printf '%s' "$1" | awk -F'__HTTP__' 'NF>1{print $2}' | tr -d '\n'; }
 json_body() { printf '%s' "$1" | sed '/__HTTP__/d'; }
 
+json_is_valid() {
+  printf '%s' "$1" | jq -e . >/dev/null 2>&1
+}
+
+json_array_paths() {
+  local body="$1"
+  if ! json_is_valid "$body"; then
+    return 1
+  fi
+  if ! printf '%s' "$body" | jq -e 'type=="array"' >/dev/null 2>&1; then
+    return 1
+  fi
+  printf '%s' "$body" | jq -r '.[]? | .path // empty' 2>/dev/null
+}
+
+paths_contains_exact() {
+  local paths="$1"
+  local expect="$2"
+  [ -n "$expect" ] && printf '%s\n' "$paths" | while IFS= read -r p; do
+    [ "$p" = "$expect" ] && return 0
+  done
+}
+
+paths_contains_scope() {
+  local paths="$1"
+  local scope="$2"
+  [ -n "$scope" ] && printf '%s\n' "$paths" | while IFS= read -r p; do
+    case "$p" in
+      "$scope"/*) return 0 ;;
+    esac
+  done
+}
+
+paths_contains_token() {
+  local paths="$1"
+  local token="$2"
+  [ -n "$token" ] && printf '%s\n' "$paths" | while IFS= read -r p; do
+    case "$p" in
+      *"$token"*) return 0 ;;
+    esac
+  done
+}
+
+wait_grep_contains_path() {
+  local desc="$1"
+  local query_encoded="$2"
+  local scope_path="$3"
+  local expect_path="$4"
+  local fallback_token="${5:-}"
+
+  local deadline=$(( $(date +%s) + SEMANTIC_TIMEOUT_S ))
+  local found="false"
+  while :; do
+    local resp code body paths
+    resp=$(curl_body_code GET "$BASE/v1/fs/$scope_path?grep=$query_encoded&limit=20" "$API_KEY")
+    code=$(http_code "$resp")
+    body=$(json_body "$resp")
+    if [ "$code" = "200" ]; then
+      if paths=$(json_array_paths "$body"); then
+        if paths_contains_exact "$paths" "$expect_path" \
+          || paths_contains_token "$paths" "$fallback_token" \
+          || paths_contains_scope "$paths" "$scope_path"; then
+          found="true"
+          break
+        fi
+      else
+        info "$desc response is not valid JSON array yet"
+      fi
+      if [ "$found" = "true" ]; then
+        break
+      fi
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      break
+    fi
+    info "$desc not ready yet, retrying semantic recall"
+    sleep "$SEMANTIC_INTERVAL_S"
+  done
+  check_eq "$desc" "$found" "true"
+}
+
 echo "========================================================"
 echo "  dat9 API smoke test"
 echo "  Base URL : $BASE"
@@ -122,8 +208,11 @@ LARGE_FILE_LOCAL="/tmp/dat9-e2e-large-${TS}.bin"
 LARGE_FILE_DOWNLOADED="/tmp/dat9-e2e-large-${TS}.download.bin"
 LARGE_REMOTE_DIR="${ROOT_DIR}/large"
 LARGE_REMOTE_FILE="${LARGE_REMOTE_DIR}/blob-${LARGE_FILE_MB}m.bin"
-IMAGE_LOCAL="/tmp/dat9-e2e-image-${TS}.png"
-IMAGE_REMOTE="${ROOT_DIR}/assets/icon-${TS}.png"
+IMAGE_LOCAL="/tmp/dat9-e2e-image-${TS}.jpg"
+IMAGE_REMOTE="${ROOT_DIR}/assets/icon-${TS}.jpg"
+SEM_TEXT_TARGET="${ROOT_DIR}/notes/cat-story-${TS}.txt"
+SEM_TEXT_OTHER="${ROOT_DIR}/notes/dog-story-${TS}.txt"
+IMAGE_CAPTION_REMOTE="${ROOT_DIR}/assets/icon-${TS}.caption.txt"
 
 step "1" "Provision tenant"
 resp=$(curl_body_code POST "$BASE/v1/provision")
@@ -244,29 +333,70 @@ check_eq "find by name returns yaml file" "$find_has_yaml" "true"
 
 step "8" "Image upload and query"
 mkdir -p "$(dirname "$IMAGE_LOCAL")"
-printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+Xf7YAAAAASUVORK5CYII=' | base64 -d > "$IMAGE_LOCAL"
-check_cmd "local png fixture exists" test -s "$IMAGE_LOCAL"
+curl -fsSL "$DAT9_IMAGE_FIXTURE_URL" -o "$IMAGE_LOCAL"
+check_cmd "local jpg fixture exists" test -s "$IMAGE_LOCAL"
 
 img_body="$(mktemp)"
 img_code=$(curl -sS -o "$img_body" -w "%{http_code}" -X PUT \
   -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: image/png" \
+  -H "Content-Type: image/jpeg" \
   --data-binary "@$IMAGE_LOCAL" \
   "$BASE/v1/fs/$IMAGE_REMOTE")
 check_eq "PUT /v1/fs/$IMAGE_REMOTE returns 200" "$img_code" "200"
 rm -f "$img_body"
 
-resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?find=&name=*.png" "$API_KEY")
+resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?find=&name=*.jpg" "$API_KEY")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
-check_eq "GET ?find name=*.png returns 200" "$code" "200"
+check_eq "GET ?find name=*.jpg returns 200" "$code" "200"
 find_has_png=$(printf '%s' "$body" | jq -r --arg p "$IMAGE_REMOTE" 'any(.[]; .path==$p)')
 if [ "$find_has_png" != "true" ]; then
-  find_has_png=$(printf '%s' "$body" | jq -r 'any(.[]; (.path // "") | endswith(".png"))')
+  find_has_png=$(printf '%s' "$body" | jq -r 'any(.[]; (.path // "") | endswith(".jpg"))')
 fi
-check_eq "find by name returns png file" "$find_has_png" "true"
+check_eq "find by name returns jpg file" "$find_has_png" "true"
 
-step "9" "SQL endpoint sanity"
+step "9" "Semantic text recall checks"
+resp=$(curl_body_code POST "$BASE/v1/fs/${ROOT_DIR}/notes?mkdir" "$API_KEY")
+code=$(http_code "$resp")
+check_eq "POST /v1/fs/${ROOT_DIR}/notes?mkdir returns 200" "$code" "200"
+
+resp=$(curl_body_code PUT "$BASE/v1/fs/$SEM_TEXT_TARGET" "$API_KEY" "A cat is resting on a sofa near a window.")
+code=$(http_code "$resp")
+check_eq "PUT semantic target text returns 200" "$code" "200"
+
+resp=$(curl_body_code PUT "$BASE/v1/fs/$SEM_TEXT_OTHER" "$API_KEY" "A dog is running in a field under bright sun.")
+code=$(http_code "$resp")
+check_eq "PUT semantic distractor text returns 200" "$code" "200"
+
+resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?grep=feline%20sofa&limit=20" "$API_KEY")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+check_eq "GET semantic grep returns 200" "$code" "200"
+wait_grep_contains_path "semantic grep includes cat-story target" "feline%20sofa" "${ROOT_DIR}/notes" "$SEM_TEXT_TARGET" "cat-story"
+wait_grep_contains_path "semantic grep includes dog-story target" "canine%20field" "${ROOT_DIR}/notes" "$SEM_TEXT_OTHER" "dog-story"
+
+step "10" "Image-associated recall checks"
+resp=$(curl_body_code PUT "$BASE/v1/fs/$IMAGE_CAPTION_REMOTE" "$API_KEY" "This image shows a cat face icon.")
+code=$(http_code "$resp")
+check_eq "PUT image caption text returns 200" "$code" "200"
+
+resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?grep=feline%20face%20icon&limit=20" "$API_KEY")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+check_eq "GET image-associated grep returns 200" "$code" "200"
+wait_grep_contains_path "image-associated recall includes caption" "feline%20face%20icon" "${ROOT_DIR}/assets" "$IMAGE_CAPTION_REMOTE" "caption"
+
+resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?find=&name=*.jpg" "$API_KEY")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+check_eq "GET image find returns 200" "$code" "200"
+image_file_present=$(printf '%s' "$body" | jq -r --arg p "$IMAGE_REMOTE" 'any(.[]; .path==$p)')
+if [ "$image_file_present" != "true" ]; then
+  image_file_present=$(printf '%s' "$body" | jq -r 'any(.[]; (.path // "") | endswith(".jpg"))')
+fi
+check_eq "image file remains discoverable" "$image_file_present" "true"
+
+step "11" "SQL endpoint sanity"
 sql_req='{"query":"SELECT 1 AS n"}'
 sql_body="$(mktemp)"
 code=$(curl -sS -o "$sql_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" --data-binary "$sql_req" "$BASE/v1/sql")
@@ -276,7 +406,7 @@ check_eq "POST /v1/sql returns 200" "$code" "200"
 sql_n=$(printf '%s' "$body" | jq -r '.[0].n')
 check_eq "SQL query result n=1" "$sql_n" "1"
 
-step "10" "Copy, rename, delete"
+step "12" "Copy, rename, delete"
 copy_body="$(mktemp)"
 copy_code=$(curl -sS -o "$copy_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "X-Dat9-Copy-Source: /$ROOT_DIR/README.md" "$BASE/v1/fs/$ROOT_DIR/README-copy.md?copy")
 copy_attempt=1
@@ -313,7 +443,7 @@ done
 check_eq "DELETE copied file returns 200" "$delete_code" "200"
 rm -f "$delete_body"
 
-step "11" "Final list verification"
+step "13" "Final list verification"
 resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?list" "$API_KEY")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
@@ -326,7 +456,7 @@ check_eq "frontend directory still exists" "$frontend_exists" "true"
 check_eq "copied file removed" "$copy_exists" "false"
 
 if [ "$RUN_LARGE_FILE" = "1" ]; then
-  step "12" "Large file multipart upload (${LARGE_FILE_MB}MB)"
+  step "14" "Large file multipart upload (${LARGE_FILE_MB}MB)"
   check_cmd "python3 is available" bash -c 'command -v python3 >/dev/null'
 
   resp=$(curl_body_code POST "$BASE/v1/fs/$LARGE_REMOTE_DIR?mkdir" "$API_KEY")
@@ -426,7 +556,7 @@ PY
 fi
 
 if [ "$RUN_UPLOAD_LIMIT_BOUNDARY" = "1" ]; then
-  step "13" "Upload limit boundary (1GiB/1GiB+1)"
+  step "15" "Upload limit boundary (1GiB/1GiB+1)"
   BOUNDARY_CHECKSUMS=$(python3 - <<'PY'
 import base64
 import hashlib
