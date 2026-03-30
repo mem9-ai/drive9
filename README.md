@@ -200,7 +200,24 @@ go build -o dat9-server ./cmd/dat9-server
 ## Running Tests
 
 ```bash
-go test ./...
+make test
+```
+
+`make test` runs `go test ./...` and the MySQL-backed test suites use either:
+
+- a Docker-compatible container runtime to start a `mysql:8.0.36` test container automatically, or
+- an existing MySQL instance provided via the `DAT9_MYSQL_DSN` environment variable
+
+For example, to reuse an existing local MySQL instance:
+
+```bash
+DAT9_MYSQL_DSN='dat9:dat9pass@tcp(127.0.0.1:3306)/dat9_test?parseTime=true' make test
+```
+
+With Podman on macOS or Linux, use the following command to run tests:
+
+```bash
+make test-podman
 ```
 
 ## References
