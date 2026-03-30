@@ -312,6 +312,8 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 		s.handleStat(w, r, path)
 	case http.MethodDelete:
 		s.handleDelete(w, r, path)
+	case http.MethodPatch:
+		s.handlePatch(w, r, path)
 	case http.MethodPost:
 		if r.URL.Query().Has("copy") {
 			s.handleCopy(w, r, path)
@@ -498,6 +500,68 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "write_ok", "path", path, "bytes", len(data))...)
 	metricEvent(r.Context(), "fs_write", "result", "ok")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_missing_scope", "path", path)...)
+		metricEvent(r.Context(), "fs_patch", "result", "error")
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+
+	var req struct {
+		NewSize    int64 `json:"new_size"`
+		DirtyParts []int `json:"dirty_parts"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_bad_body", "path", path, "error", err)...)
+		metricEvent(r.Context(), "fs_patch", "result", "error")
+		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if req.NewSize <= 0 {
+		errJSON(w, http.StatusBadRequest, "new_size must be positive")
+		return
+	}
+	if len(req.DirtyParts) == 0 {
+		errJSON(w, http.StatusBadRequest, "dirty_parts must not be empty")
+		return
+	}
+
+	plan, err := b.InitiatePatchUpload(r.Context(), path, req.NewSize, req.DirtyParts)
+	if err != nil {
+		if errors.Is(err, datastore.ErrUploadConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_conflict", "path", path)...)
+			metricEvent(r.Context(), "fs_patch", "result", "conflict")
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_not_found", "path", path)...)
+			metricEvent(r.Context(), "fs_patch", "result", "error")
+			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if strings.Contains(err.Error(), "file is not S3-stored") || strings.Contains(err.Error(), "S3 not configured") {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_unsupported_target", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_patch", "result", "error")
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_failed", "path", path, "error", err)...)
+		metricEvent(r.Context(), "fs_patch", "result", "error")
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_initiated", "path", path,
+		"dirty_parts", len(plan.UploadParts), "copied_parts", len(plan.CopiedParts))...)
+	metricEvent(r.Context(), "fs_patch", "result", "accepted")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(plan)
 }
 
 func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string) {

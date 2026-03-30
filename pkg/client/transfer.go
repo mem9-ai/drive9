@@ -267,6 +267,102 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 	}
 }
 
+// ReadStreamRange reads a byte range from a remote file. For large files the
+// server returns a 302 redirect to a presigned S3 URL; this method resolves
+// that redirect and issues an HTTP Range request so only the requested bytes
+// are transferred. For small files (no redirect) the full body is returned
+// and the caller should read only what it needs.
+func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	if length <= 0 {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+
+	noRedirectClient := *c.httpClient
+	noRedirectClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path), nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := noRedirectClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	switch {
+	case resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusTemporaryRedirect:
+		_ = resp.Body.Close()
+		location := resp.Header.Get("Location")
+		if location == "" {
+			return nil, fmt.Errorf("302 without Location header")
+		}
+		req2, err := http.NewRequestWithContext(ctx, http.MethodGet, location, nil)
+		if err != nil {
+			return nil, err
+		}
+		// Use HTTP Range header for efficient partial read.
+		req2.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+		resp2, err := c.httpClient.Do(req2)
+		if err != nil {
+			return nil, err
+		}
+
+		switch resp2.StatusCode {
+		case http.StatusPartialContent:
+			return resp2.Body, nil
+		case http.StatusRequestedRangeNotSatisfiable:
+			defer func() { _ = resp2.Body.Close() }()
+			return io.NopCloser(bytes.NewReader(nil)), nil
+		default:
+			if resp2.StatusCode >= 300 {
+				defer func() { _ = resp2.Body.Close() }()
+				return nil, readError(resp2)
+			}
+			// 200: server returned full body (Range not honored).
+			// Skip to offset and limit the read.
+			return c.sliceBody(resp2.Body, offset, length)
+		}
+
+	case resp.StatusCode >= 300:
+		defer func() { _ = resp.Body.Close() }()
+		return nil, readError(resp)
+
+	default:
+		// Small file: full body returned. Skip to offset and limit.
+		return c.sliceBody(resp.Body, offset, length)
+	}
+}
+
+// sliceBody skips offset bytes from rc, then returns a reader limited to
+// length bytes. The original rc is closed when the returned ReadCloser is closed.
+func (c *Client) sliceBody(rc io.ReadCloser, offset, length int64) (io.ReadCloser, error) {
+	if offset > 0 {
+		if _, err := io.CopyN(io.Discard, rc, offset); err != nil {
+			_ = rc.Close()
+			if err == io.EOF {
+				// Offset past end — return empty reader.
+				return io.NopCloser(strings.NewReader("")), nil
+			}
+			return nil, fmt.Errorf("skip to offset: %w", err)
+		}
+	}
+	return &limitedReadCloser{r: io.LimitReader(rc, length), c: rc}, nil
+}
+
+type limitedReadCloser struct {
+	r io.Reader
+	c io.Closer
+}
+
+func (l *limitedReadCloser) Read(p []byte) (int, error) { return l.r.Read(p) }
+func (l *limitedReadCloser) Close() error               { return l.c.Close() }
+
 // UploadMeta is the server's response for querying active uploads.
 type UploadMeta struct {
 	UploadID   string `json:"upload_id"`

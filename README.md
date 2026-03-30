@@ -33,6 +33,71 @@ dat9 mv :/data/old.bin :/data/new.bin
 
 # Start the server
 dat9-server
+
+# Mount as local filesystem
+dat9 mount /mnt/dat9
+
+# Unmount
+dat9 umount /mnt/dat9
+```
+
+### FUSE Mount
+
+Mount dat9 as a local filesystem — use `ls`, `cat`, `vim`, `cp` directly on your dat9 data.
+
+```bash
+dat9 mount /mnt/dat9
+```
+
+#### Prerequisites
+
+FUSE mount requires a platform-specific FUSE provider:
+
+**macOS**
+
+Install [macFUSE](https://osxfuse.github.io/):
+
+```bash
+brew install --cask macfuse
+```
+
+On Apple Silicon, you may need to approve the macFUSE system extension in **System Settings > Privacy & Security** and reboot before mounts will work.
+
+**Linux**
+
+Install FUSE 3 (or FUSE 2) via your package manager:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install fuse3
+
+# RHEL / CentOS / Fedora
+sudo dnf install fuse3
+
+# Arch
+sudo pacman -S fuse3
+```
+
+Ensure your user is in the `fuse` group (or use `allow_other` mount option with `/etc/fuse.conf`).
+
+**Windows**
+
+Not currently supported. Contributions welcome via [WinFsp](https://winfsp.dev/).
+
+#### Mount Options
+
+```
+dat9 mount [flags] <mountpoint>
+
+  --server       dat9 server URL (default: $DAT9_SERVER)
+  --api-key      API key (default: $DAT9_API_KEY)
+  --cache-size   read cache size in MB (default: 128)
+  --dir-ttl      directory cache TTL (default: 5s)
+  --attr-ttl     kernel attr cache TTL (default: 1s)
+  --entry-ttl    kernel entry cache TTL (default: 1s)
+  --allow-other  allow other users to access mount
+  --read-only    mount as read-only
+  --debug        enable FUSE debug logging
 ```
 
 ### Go SDK
@@ -94,20 +159,20 @@ c.Delete("/data/file.txt")
 ## Architecture
 
 ```
-┌──────────┐  ┌──────────┐  ┌──────────┐
-│   CLI    │  │ Go SDK   │  │ MCP/FUSE │
-│ dat9 cp  │  │ client   │  │ (future) │
-└────┬─────┘  └────┬─────┘  └────┬─────┘
-     └─────────────┼──────────────┘
-                   ▼
-         dat9 HTTP Server
-         /v1/fs/{path}
-                   │
-     ┌─────────────┼─────────────┐
-     ▼             ▼             ▼
-  Dat9Backend   memfs        (plugins)
-  (AGFS FileSystem)
-     │
+┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+│   CLI    │  │ Go SDK   │  │   FUSE   │  │   MCP    │
+│ dat9 cp  │  │ client   │  │dat9 mount│  │ (future) │
+└────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘
+     └─────────────┼──────────────┼──────────────┘
+                   ▼              │
+         dat9 HTTP Server        │
+         /v1/fs/{path}           │
+                   │         ┌───┘
+     ┌─────────────┼─────────┤
+     ▼             ▼         ▼
+  Dat9Backend   memfs     S3 direct
+  (AGFS FileSystem)       (presigned URL,
+     │                     FUSE ↔ S3)
      ├── < 1MB → TiDB(MySQL protocol) + local blobs (P0)
      │            db9 + fs9 (production)
      │
@@ -149,12 +214,14 @@ POST   /v1/fs/{path}?mkdir        Create directory
 ## Project Structure
 
 ```
-cmd/dat9/           CLI entrypoint and commands
+cmd/dat9/           CLI entrypoint and commands (cp, cat, ls, mount, umount, ...)
 cmd/dat9-server/    Server entrypoint
 pkg/
   backend/          Dat9Backend — AGFS FileSystem implementation (inode model)
   client/           Go SDK HTTP client
+  fuse/             FUSE mount (go-fuse/v2 RawFileSystem, inode mapping, caching)
   meta/             Metadata store (TiDB/MySQL P0 / db9 production)
+  s3client/         S3-compatible object store interface (AWS + local mock)
   server/           HTTP server (/v1/fs/{path} router)
   pathutil/         Path canonicalization and validation
   parser/           Content-aware parsing interface (future)
@@ -188,7 +255,7 @@ Four tables, all in the tenant's database:
 | **P7** | Server-side grep/digest | Planned |
 | **P8** | Async L0/L1 generation (LLM-powered) | Planned |
 | **P9** | Smart Parser & TreeBuilder | Planned |
-| **P10** | FUSE mount | Planned |
+| **P10** | FUSE mount | ✅ Done |
 
 ## Building
 

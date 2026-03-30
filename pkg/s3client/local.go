@@ -215,5 +215,53 @@ func (c *LocalS3Client) DeleteObject(ctx context.Context, key string) error {
 	return os.Remove(c.objectPath(key))
 }
 
+func (c *LocalS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID string, partNumber int, sourceKey string, startByte, endByte int64) (string, error) {
+	c.mu.Lock()
+	upload, ok := c.uploads[uploadID]
+	c.mu.Unlock()
+	if !ok {
+		return "", fmt.Errorf("upload not found: %s", uploadID)
+	}
+
+	// Read source range from the existing object file
+	srcPath := c.objectPath(sourceKey)
+	f, err := os.Open(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("open source object: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	size := endByte - startByte + 1
+	data := make([]byte, size)
+	n, err := f.ReadAt(data, startByte)
+	if err != nil && err != io.EOF {
+		return "", fmt.Errorf("read source range: %w", err)
+	}
+	data = data[:n]
+
+	// Write as a part file
+	path := c.partPath(upload.key, uploadID, partNumber)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", err
+	}
+
+	h := sha256.Sum256(data)
+	etag := hex.EncodeToString(h[:16])
+
+	c.mu.Lock()
+	upload.parts[partNumber] = &localPart{size: int64(len(data)), etag: etag}
+	c.mu.Unlock()
+
+	return etag, nil
+}
+
+func (c *LocalS3Client) PresignGetObjectRange(ctx context.Context, key string, startByte, endByte int64, ttl time.Duration) (string, error) {
+	url := fmt.Sprintf("%s/objects/%s?range=%d-%d", c.baseURL, key, startByte, endByte)
+	return url, nil
+}
+
 // Verify interface compliance.
 var _ S3Client = (*LocalS3Client)(nil)
