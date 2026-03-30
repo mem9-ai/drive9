@@ -60,6 +60,13 @@ func main() {
 	if err != nil {
 		die(err)
 	}
+	semanticEmbedder, semanticWorkerOpts, err := buildSemanticWorkerConfigFromEnv()
+	if err != nil {
+		die(err)
+	}
+	if semanticEmbedder != nil && backendOptions.QueryEmbedding.Client == nil {
+		backendOptions.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
+	}
 
 	store, err := meta.Open(metaDSN)
 	if err != nil {
@@ -151,13 +158,15 @@ func main() {
 	}
 
 	die(server.NewWithConfig(server.Config{
-		Meta:           store,
-		Pool:           pool,
-		Provisioner:    provisioner,
-		TokenSecret:    tokenSecret,
-		S3Dir:          s3Dir,
-		MaxUploadBytes: maxUploadBytes,
-		Logger:         srvLogger,
+		Meta:             store,
+		Pool:             pool,
+		Provisioner:      provisioner,
+		TokenSecret:      tokenSecret,
+		S3Dir:            s3Dir,
+		MaxUploadBytes:   maxUploadBytes,
+		Logger:           srvLogger,
+		SemanticEmbedder: semanticEmbedder,
+		SemanticWorkers:  semanticWorkerOpts,
 	}).ListenAndServe(addr))
 }
 
@@ -193,6 +202,19 @@ environment:
   DAT9_QUERY_EMBED_MODEL    model name for query embedding (optional)
   DAT9_QUERY_EMBED_DIMENSIONS optional embedding dimensions override
   DAT9_QUERY_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
+  Async semantic embedding worker:
+  DAT9_EMBED_API_BASE OpenAI-compatible base URL for background embedding (optional)
+  DAT9_EMBED_API_KEY  API key for DAT9_EMBED_API_BASE (optional)
+  DAT9_EMBED_MODEL    model name for background embedding (optional)
+  DAT9_EMBED_DIMENSIONS optional embedding dimensions override
+  DAT9_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
+  DAT9_SEMANTIC_WORKERS number of background workers (default: 1)
+  DAT9_SEMANTIC_POLL_INTERVAL_MS worker poll interval in milliseconds (default: 200)
+  DAT9_SEMANTIC_LEASE_SECONDS task lease duration in seconds (default: 30)
+  DAT9_SEMANTIC_RECOVER_INTERVAL_MS recover sweep interval in milliseconds (default: 5000)
+  DAT9_SEMANTIC_RETRY_BASE_MS base retry backoff in milliseconds (default: 200)
+  DAT9_SEMANTIC_TENANT_LIMIT active tenants scanned per round (default: 128)
+  DAT9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
   Image extraction (async image -> text for search):
   DAT9_IMAGE_EXTRACT_ENABLED true|false (default: false)
   DAT9_IMAGE_EXTRACT_QUEUE_SIZE buffered task queue size (default: 128)
@@ -313,6 +335,42 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 
 	opts.AsyncImageExtract = async
 	return opts, nil
+}
+
+func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorkerOptions, error) {
+	var opts server.SemanticWorkerOptions
+	baseURL := strings.TrimSpace(os.Getenv("DAT9_EMBED_API_BASE"))
+	apiKey := strings.TrimSpace(os.Getenv("DAT9_EMBED_API_KEY"))
+	model := strings.TrimSpace(os.Getenv("DAT9_EMBED_MODEL"))
+	configured := baseURL != "" || apiKey != "" || model != ""
+	if !configured {
+		return nil, opts, nil
+	}
+	if baseURL == "" || apiKey == "" || model == "" {
+		return nil, opts, fmt.Errorf("DAT9_EMBED_API_BASE, DAT9_EMBED_API_KEY and DAT9_EMBED_MODEL must be set together")
+	}
+	client, err := embedding.NewOpenAIClient(embedding.OpenAIClientConfig{
+		BaseURL:    baseURL,
+		APIKey:     apiKey,
+		Model:      model,
+		Dimensions: envInt("DAT9_EMBED_DIMENSIONS", 0),
+		Timeout:    time.Duration(envInt("DAT9_EMBED_TIMEOUT_SECONDS", 20)) * time.Second,
+	})
+	if err != nil {
+		return nil, opts, fmt.Errorf("init semantic embedder: %w", err)
+	}
+	opts = server.SemanticWorkerOptions{
+		Workers:              envInt("DAT9_SEMANTIC_WORKERS", 1),
+		PollInterval:         time.Duration(envInt("DAT9_SEMANTIC_POLL_INTERVAL_MS", 200)) * time.Millisecond,
+		LeaseDuration:        time.Duration(envInt("DAT9_SEMANTIC_LEASE_SECONDS", 30)) * time.Second,
+		RecoverInterval:      time.Duration(envInt("DAT9_SEMANTIC_RECOVER_INTERVAL_MS", 5000)) * time.Millisecond,
+		RetryBaseDelay:       time.Duration(envInt("DAT9_SEMANTIC_RETRY_BASE_MS", 200)) * time.Millisecond,
+		TenantScanLimit:      envInt("DAT9_SEMANTIC_TENANT_LIMIT", 128),
+		PerTenantConcurrency: envInt("DAT9_SEMANTIC_PER_TENANT_CONCURRENCY", 1),
+	}
+	logger.Info(context.Background(), "semantic_embedding_mode_openai_compatible",
+		zap.String("model", model), zap.String("base_url", baseURL))
+	return client, opts, nil
 }
 
 func envBool(key string, fallback bool) bool {

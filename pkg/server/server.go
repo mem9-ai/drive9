@@ -16,6 +16,7 @@ import (
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
@@ -25,15 +26,17 @@ import (
 )
 
 type Config struct {
-	Meta           *meta.Store
-	Pool           *tenant.Pool
-	Provisioner    tenant.Provisioner
-	TokenSecret    []byte
-	Backend        *backend.Dat9Backend
-	LocalS3        *s3client.LocalS3Client
-	S3Dir          string
-	MaxUploadBytes int64
-	Logger         *zap.Logger
+	Meta             *meta.Store
+	Pool             *tenant.Pool
+	Provisioner      tenant.Provisioner
+	TokenSecret      []byte
+	Backend          *backend.Dat9Backend
+	LocalS3          *s3client.LocalS3Client
+	S3Dir            string
+	MaxUploadBytes   int64
+	Logger           *zap.Logger
+	SemanticEmbedder embedding.Client
+	SemanticWorkers  SemanticWorkerOptions
 }
 
 type Server struct {
@@ -46,6 +49,7 @@ type Server struct {
 	metrics        *serverMetrics
 	logger         *zap.Logger
 	mux            *http.ServeMux
+	semanticWorker *semanticWorkerManager
 }
 
 var (
@@ -131,7 +135,17 @@ func NewWithConfig(cfg Config) *Server {
 	if s.meta != nil && s.pool != nil && s.provisioner != nil {
 		s.resumeProvisioningTenants()
 	}
+	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
+	if s.semanticWorker != nil {
+		s.semanticWorker.Start(backgroundWithTrace(context.Background()))
+	}
 	return s
+}
+
+func (s *Server) Close() {
+	if s.semanticWorker != nil {
+		s.semanticWorker.Stop()
+	}
 }
 
 func (s *Server) resumeProvisioningTenants() {
