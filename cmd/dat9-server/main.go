@@ -94,6 +94,7 @@ func main() {
 	if err != nil {
 		die(err)
 	}
+	logger.Info(context.Background(), "tenant_provider_selected", zap.String("provider", providerType))
 
 	var provisioner tenant.Provisioner
 	var provisionerErr error
@@ -107,6 +108,8 @@ func main() {
 	}
 	if provisionerErr != nil {
 		logger.Warn(context.Background(), "provisioner_not_configured", zap.String("provider", providerType), zap.Error(provisionerErr))
+	} else {
+		logger.Info(context.Background(), "provisioner_configured", zap.String("provider", providerType))
 	}
 
 	var pool *tenant.Pool
