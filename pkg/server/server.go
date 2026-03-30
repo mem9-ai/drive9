@@ -538,6 +538,18 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_not_found", "path", path)...)
+			metricEvent(r.Context(), "fs_patch", "result", "error")
+			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if strings.Contains(err.Error(), "file is not S3-stored") || strings.Contains(err.Error(), "S3 not configured") {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_unsupported_target", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_patch", "result", "error")
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_patch", "result", "error")
 		errJSON(w, http.StatusInternalServerError, err.Error())

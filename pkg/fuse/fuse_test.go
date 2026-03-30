@@ -446,7 +446,7 @@ func TestWriteBuffer_DirtyParts_TruncateShrink(t *testing.T) {
 	// Write 3 parts
 	data := make([]byte, partSize*3)
 	_, _ = wb.Write(0, data)
-	wb.dirtyParts = nil // clear as if preloaded
+	wb.ClearDirty()
 
 	// Truncate to 1 part
 	_ = wb.Truncate(partSize / 2)
@@ -457,10 +457,22 @@ func TestWriteBuffer_DirtyParts_TruncateShrink(t *testing.T) {
 	}
 }
 
+func TestWriteBuffer_DirtyParts_TruncateShrinkAtBoundary(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0)
+	_, _ = wb.Write(0, make([]byte, partSize*3))
+	wb.ClearDirty()
+
+	_ = wb.Truncate(partSize)
+	dirty := wb.DirtyPartNumbers()
+	if len(dirty) != 1 || dirty[0] != 1 {
+		t.Fatalf("expected dirty=[1] after boundary truncate, got %v", dirty)
+	}
+}
+
 func TestWriteBuffer_DirtyParts_TruncateExtend(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0)
 	_, _ = wb.Write(0, make([]byte, partSize)) // 1 full part
-	wb.dirtyParts = nil                 // clear as if preloaded
+	wb.dirtyParts = nil                        // clear as if preloaded
 
 	// Extend to 3 parts
 	_ = wb.Truncate(partSize*3 - 100)
@@ -574,11 +586,11 @@ func TestHttpToFuseStatus(t *testing.T) {
 		err    error
 		expect int32
 	}{
-		{nil, 0}, // OK
+		{nil, 0},                           // OK
 		{fmt.Errorf("not found: /x"), -2},  // ENOENT
-		{fmt.Errorf("HTTP 404: ..."), -2},   // ENOENT
-		{fmt.Errorf("HTTP 403: ..."), -13},  // EACCES
-		{fmt.Errorf("HTTP 500: ..."), -5},   // EIO
+		{fmt.Errorf("HTTP 404: ..."), -2},  // ENOENT
+		{fmt.Errorf("HTTP 403: ..."), -13}, // EACCES
+		{fmt.Errorf("HTTP 500: ..."), -5},  // EIO
 	}
 	_ = tests // compile check — errno values vary by platform
 }

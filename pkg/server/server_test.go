@@ -225,6 +225,50 @@ func TestRename(t *testing.T) {
 	}
 }
 
+func TestPatchMissingPathReturnsNotFound(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPatch, ts.URL+"/v1/fs/missing.bin", strings.NewReader(`{"new_size":16,"dirty_parts":[1]}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("patch missing path: got %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestPatchDBBackedFileReturnsBadRequest(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	writeReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/small.txt", strings.NewReader("hello"))
+	writeResp, err := http.DefaultClient.Do(writeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = writeResp.Body.Close()
+	if writeResp.StatusCode != http.StatusOK {
+		t.Fatalf("write small file: got %d, want 200", writeResp.StatusCode)
+	}
+
+	patchReq, _ := http.NewRequest(http.MethodPatch, ts.URL+"/v1/fs/small.txt", strings.NewReader(`{"new_size":16,"dirty_parts":[1]}`))
+	patchReq.Header.Set("Content-Type", "application/json")
+	patchResp, err := http.DefaultClient.Do(patchReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = patchResp.Body.Close()
+	if patchResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("patch small file: got %d, want 400", patchResp.StatusCode)
+	}
+}
+
 func TestNotFound(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
