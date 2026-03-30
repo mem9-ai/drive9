@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
@@ -46,6 +47,7 @@ type Server struct {
 	metrics        *serverMetrics
 	logger         *zap.Logger
 	mux            *http.ServeMux
+	asyncWG        sync.WaitGroup
 }
 
 var (
@@ -143,7 +145,9 @@ func (s *Server) resumeProvisioningTenants() {
 	}
 	for i := range tenants {
 		t := tenants[i]
-		go s.resumeTenantSchemaInit(t)
+		s.startAsync(func() {
+			s.resumeTenantSchemaInit(t)
+		})
 	}
 }
 
@@ -179,6 +183,18 @@ func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handl
 		scope := &TenantScope{TenantID: "local", APIKeyID: "local", TokenVersion: 1, Backend: b}
 		next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 	})
+}
+
+func (s *Server) startAsync(fn func()) {
+	s.asyncWG.Add(1)
+	go func() {
+		defer s.asyncWG.Done()
+		fn()
+	}()
+}
+
+func (s *Server) waitBackgroundTasks() {
+	s.asyncWG.Wait()
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -959,7 +975,9 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	// Initialize tenant schema asynchronously; tenant remains in provisioning state until success.
 	dsn := tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true)
-	go s.initTenantSchemaAsync(backgroundWithTrace(r.Context()), tenantID, dsn, provider, s.provisioner.InitSchema)
+	s.startAsync(func() {
+		s.initTenantSchemaAsync(backgroundWithTrace(r.Context()), tenantID, dsn, provider, s.provisioner.InitSchema)
+	})
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_accepted", "tenant_id", tenantID, "provider", provider)...)
 	metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "accepted")
 

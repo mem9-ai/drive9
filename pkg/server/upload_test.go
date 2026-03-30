@@ -13,7 +13,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/s3client"
@@ -38,8 +37,8 @@ func newTestServerWithS3(t *testing.T) (*Server, *s3client.LocalS3Client) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	testmysql.ResetDB(t, store.DB())
 	t.Cleanup(func() { _ = store.Close() })
+	resetServerTestState(t, testDSN, store.DB())
 
 	s3c, err := s3client.NewLocal(s3Dir, "http://localhost:9091/s3")
 	if err != nil {
@@ -50,7 +49,9 @@ func newTestServerWithS3(t *testing.T) (*Server, *s3client.LocalS3Client) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(b), s3c
+	s := New(b)
+	t.Cleanup(s.waitBackgroundTasks)
+	return s, s3c
 }
 
 func partChecksumHeader(data []byte) string {
