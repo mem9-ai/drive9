@@ -49,8 +49,8 @@ func NewStarterProvisionerFromEnv() (*StarterProvisioner, error) {
 
 func (p *StarterProvisioner) ProviderType() string { return ProviderTiDBCloudStarter }
 
-func (p *StarterProvisioner) InitSchema(_ context.Context, dsn string) error {
-	return initStarterSchema(dsn)
+func (p *StarterProvisioner) InitSchema(_ context.Context, _ string) error {
+	return nil
 }
 
 func (p *StarterProvisioner) Provision(ctx context.Context, tenantID string) (*ClusterInfo, error) {
