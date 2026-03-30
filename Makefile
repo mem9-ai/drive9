@@ -26,14 +26,19 @@ IMAGE_TAG ?= latest
 IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
 LINT_TIMEOUT ?= 10m
 
-.PHONY: mod test fmt lint install-lint build build-server build-cli docker-build
+.PHONY: mod test test-podman fmt lint install-lint build build-server build-cli docker-build
 
 mod:
 	$(GO) mod tidy
 	$(GO) mod download
 
+# Run all tests. MySQL-backed suites either start a mysql:8.0.36 container via
+# a Docker-compatible runtime or reuse DAT9_MYSQL_DSN when it is provided.
 test:
 	$(GO) test ./...
+
+test-podman:
+	@source ./scripts/test-podman.sh && $(GO) test ./...
 
 fmt:
 	$(MAKE) install-lint
