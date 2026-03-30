@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 	"go.uber.org/zap"
 )
 
@@ -62,6 +63,9 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	b.imageExtractMaxSize = cfg.MaxImageBytes
 	b.maxExtractTextBytes = cfg.MaxExtractTextBytes
 	b.imageExtractQueue = make(chan imageExtractTask, cfg.QueueSize)
+	metrics.RecordGauge("image_extract", "queue_capacity", float64(cfg.QueueSize))
+	metrics.RecordGauge("image_extract", "workers", float64(cfg.Workers))
+	metrics.RecordGauge("image_extract", "queue_depth", 0)
 
 	ctx, cancel := context.WithCancel(backgroundWithTrace())
 	b.imageExtractCancel = cancel
@@ -81,6 +85,8 @@ func (b *Dat9Backend) Close() {
 	b.imageExtractCancel()
 	b.imageExtractWG.Wait()
 	b.imageExtractCancel = nil
+	metrics.RecordGauge("image_extract", "workers", 0)
+	metrics.RecordGauge("image_extract", "queue_depth", 0)
 	logger.Info(backgroundWithTrace(), "backend_image_extract_workers_stopped",
 		zap.Int("queue_depth", len(b.imageExtractQueue)),
 		zap.Int("queue_size", cap(b.imageExtractQueue)))

@@ -76,8 +76,10 @@ func (b *Dat9Backend) enqueueImageExtract(fileID, path, contentType string, revi
 	select {
 	case b.imageExtractQueue <- task:
 		metrics.RecordOperation("image_extract", "enqueue", "ok", 0)
+		metrics.RecordGauge("image_extract", "queue_depth", float64(len(b.imageExtractQueue)))
 	default:
 		metrics.RecordOperation("image_extract", "enqueue", "queue_full", 0)
+		metrics.RecordGauge("image_extract", "queue_depth", float64(len(b.imageExtractQueue)))
 		logger.Warn(backgroundWithTrace(), "backend_image_extract_queue_full_drop",
 			zap.String("file_id", fileID),
 			zap.String("path", path),
@@ -113,6 +115,14 @@ func (b *Dat9Backend) enqueueImageExtractForUpload(ctx context.Context, upload *
 	ct := f.ContentType
 	if ct == "" {
 		ct = contentTypeFromPath(upload.TargetPath)
+		if ct == "" {
+			logger.Warn(ctx, "backend_image_extract_upload_enqueue_skipped_unknown_content_type",
+				zap.String("upload_id", upload.UploadID),
+				zap.String("file_id", fileID),
+				zap.String("path", upload.TargetPath),
+				zap.String("reason", "content_type_missing_and_extension_unknown"))
+			return
+		}
 	}
 	b.enqueueImageExtract(fileID, upload.TargetPath, ct, f.Revision)
 }
@@ -126,6 +136,7 @@ func (b *Dat9Backend) runImageExtractWorker(ctx context.Context, workerID int) {
 			logger.Info(ctx, "backend_image_extract_worker_stopped", zap.Int("worker_id", workerID), zap.String("reason", "context_canceled"))
 			return
 		case task := <-b.imageExtractQueue:
+			metrics.RecordGauge("image_extract", "queue_depth", float64(len(b.imageExtractQueue)))
 			b.processImageExtractTask(ctx, task)
 		}
 	}
