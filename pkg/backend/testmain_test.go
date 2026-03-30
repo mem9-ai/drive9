@@ -17,6 +17,13 @@ func TestMain(m *testing.M) {
 		log.Fatalf("setup mysql test instance: %v", err)
 	}
 	testDSN = inst.DSN
+	if os.Getenv("DAT9_MYSQL_DSN") != "" {
+		isolatedDSN, err := testmysql.PrepareIsolatedDatabase(inst.DSN, "backend")
+		if err != nil {
+			log.Fatalf("prepare isolated backend test database: %v", err)
+		}
+		testDSN = isolatedDSN
+	}
 
 	code := m.Run()
 	if err := inst.Close(context.Background()); err != nil {
