@@ -62,7 +62,7 @@ func (c *Client) PatchFile(ctx context.Context, path string, newSize int64, dirt
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusAccepted {
 		return readError(resp)
 	}
@@ -140,7 +140,7 @@ func (c *Client) uploadPatchPart(ctx context.Context, part *PatchPartURL, readPa
 		if err != nil {
 			return fmt.Errorf("download original part: %w", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode >= 300 {
 			return fmt.Errorf("download original part: HTTP %d", resp.StatusCode)
 		}
@@ -177,7 +177,7 @@ func (c *Client) uploadPatchPart(ctx context.Context, part *PatchPartURL, readPa
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("upload part: HTTP %d: %s", resp.StatusCode, string(body))
