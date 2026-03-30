@@ -178,8 +178,8 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	if input.Valid&gofuse.FATTR_SIZE != 0 {
 		newSize := int64(input.Size)
 
-		// If there's an open file handle with a write buffer, truncate it
 		if input.Valid&gofuse.FATTR_FH != 0 {
+			// ftruncate(fd, size): truncate the open write buffer.
 			fh, ok := fs.fileHandles.Get(input.Fh)
 			if ok && fh.Dirty != nil {
 				fh.Lock()
@@ -188,6 +188,21 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					return gofuse.Status(syscall.EFBIG)
 				}
 				fh.Unlock()
+			}
+		} else {
+			// truncate(path, size): no open file handle — must persist
+			// to the server. We only support truncate-to-zero, which is
+			// the common case (e.g. shell "> file").
+			if newSize == 0 {
+				if err := fs.client.Write(entry.Path, nil); err != nil {
+					return httpToFuseStatus(err)
+				}
+				fs.readCache.Invalidate(entry.Path)
+				fs.dirCache.Invalidate(parentDir(entry.Path))
+			} else if newSize != entry.Size {
+				// Arbitrary truncate without an open handle is not
+				// supported — dat9 has no server-side truncate API.
+				return gofuse.Status(syscall.ENOTSUP)
 			}
 		}
 		entry.Size = newSize
@@ -496,6 +511,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 						_, _ = fh.Dirty.Write(0, existing)
 						fh.Dirty.ClearDirty()
 					}
+				} else if stat.Size > maxPreloadSize {
+					// File too large to preload into memory — reject
+					// writable open to avoid OOM.
+					return gofuse.Status(syscall.EFBIG)
 				} else {
 					rc, err := fs.client.ReadStream(context.Background(), p)
 					if err == nil {
@@ -506,7 +525,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 								fh.Dirty = NewWriteBuffer(p, int64(len(data))+16<<20)
 								_, _ = fh.Dirty.Write(0, data)
 							}
-							fh.Dirty.dirtyParts = nil
+							fh.Dirty.ClearDirty()
 						}
 					}
 				}
