@@ -93,7 +93,7 @@ func TestGetAttrPrefersDirtyHandleSize(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("GetAttr status = %v, want OK", st)
 	}
-	if got, want := out.Attr.Size, uint64(len("dirty-size")); got != want {
+	if got, want := out.Size, uint64(len("dirty-size")); got != want {
 		t.Fatalf("GetAttr size = %d, want %d", got, want)
 	}
 }
@@ -131,7 +131,7 @@ func TestGetAttrUsesLatestDirtyHandleSize(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("GetAttr status = %v, want OK", st)
 	}
-	if got, want := out.Attr.Size, uint64(len("abcdefghi")); got != want {
+	if got, want := out.Size, uint64(len("abcdefghi")); got != want {
 		t.Fatalf("GetAttr size = %d, want %d", got, want)
 	}
 }
