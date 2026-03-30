@@ -229,7 +229,7 @@ func (c *LocalS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID st
 	if err != nil {
 		return "", fmt.Errorf("open source object: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	size := endByte - startByte + 1
 	data := make([]byte, size)

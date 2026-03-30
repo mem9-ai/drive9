@@ -71,8 +71,8 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 	out.Ino = entry.Ino
 	out.Size = uint64(entry.Size)
 	out.Blocks = (uint64(entry.Size) + 511) / 512
-	out.Owner.Uid = fs.uid
-	out.Owner.Gid = fs.gid
+	out.Uid = fs.uid
+	out.Gid = fs.gid
 
 	mtime := entry.Mtime
 	if mtime.IsZero() {
@@ -493,18 +493,18 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 
 				if stat.Size <= smallFileThreshold {
 					if existing, err := fs.client.Read(p); err == nil && len(existing) > 0 {
-						fh.Dirty.Write(0, existing)
+						_, _ = fh.Dirty.Write(0, existing)
 						fh.Dirty.ClearDirty()
 					}
 				} else {
 					rc, err := fs.client.ReadStream(context.Background(), p)
 					if err == nil {
 						data, err := io.ReadAll(rc)
-						rc.Close()
+						_ = rc.Close()
 						if err == nil && len(data) > 0 {
 							if _, werr := fh.Dirty.Write(0, data); werr != nil {
 								fh.Dirty = NewWriteBuffer(p, int64(len(data))+16<<20)
-								fh.Dirty.Write(0, data)
+								_, _ = fh.Dirty.Write(0, data)
 							}
 							fh.Dirty.dirtyParts = nil
 						}
@@ -596,7 +596,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	if err != nil {
 		return nil, httpToFuseStatus(err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	// Skip to offset
 	if input.Offset > 0 {

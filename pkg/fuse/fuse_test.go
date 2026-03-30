@@ -285,8 +285,8 @@ func TestWriteBuffer_Sequential(t *testing.T) {
 
 func TestWriteBuffer_RandomWrite(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0)
-	wb.Write(0, []byte("aaaa"))
-	wb.Write(2, []byte("bb"))
+	_, _ = wb.Write(0, []byte("aaaa"))
+	_, _ = wb.Write(2, []byte("bb"))
 	if string(wb.Bytes()) != "aabb" {
 		t.Fatalf("random write: got %q, want %q", wb.Bytes(), "aabb")
 	}
@@ -294,7 +294,7 @@ func TestWriteBuffer_RandomWrite(t *testing.T) {
 
 func TestWriteBuffer_GapFill(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0)
-	wb.Write(5, []byte("x"))
+	_, _ = wb.Write(5, []byte("x"))
 	if wb.Size() != 6 {
 		t.Fatalf("Size = %d, want 6", wb.Size())
 	}
@@ -308,7 +308,7 @@ func TestWriteBuffer_GapFill(t *testing.T) {
 
 func TestWriteBuffer_Truncate(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0)
-	wb.Write(0, []byte("hello world"))
+	_, _ = wb.Write(0, []byte("hello world"))
 
 	if err := wb.Truncate(5); err != nil {
 		t.Fatal(err)
@@ -340,13 +340,13 @@ func TestWriteBuffer_PreloadThenRandomWrite(t *testing.T) {
 
 	// Preload original file content (what Open does via client.Read)
 	original := []byte("hello world, this is the original content!")
-	wb.Write(0, original)
+	_, _ = wb.Write(0, original)
 	if string(wb.Bytes()) != string(original) {
 		t.Fatalf("after preload: got %q", wb.Bytes())
 	}
 
 	// Random write at offset 6 — should overwrite "world" with "EARTH"
-	wb.Write(6, []byte("EARTH"))
+	_, _ = wb.Write(6, []byte("EARTH"))
 	want := "hello EARTH, this is the original content!"
 	if string(wb.Bytes()) != want {
 		t.Fatalf("after pwrite: got %q, want %q", wb.Bytes(), want)
@@ -363,7 +363,7 @@ func TestWriteBuffer_PreloadThenRandomWrite(t *testing.T) {
 
 func TestWriteBuffer_Reset(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0)
-	wb.Write(0, []byte("data"))
+	_, _ = wb.Write(0, []byte("data"))
 	wb.Reset()
 	if wb.Size() != 0 {
 		t.Fatalf("after Reset: Size=%d", wb.Size())
@@ -376,7 +376,7 @@ func TestWriteBuffer_Reset(t *testing.T) {
 func TestWriteBuffer_DirtyParts_SinglePart(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0)
 	// Write within the first 8MB part
-	wb.Write(0, []byte("hello"))
+	_, _ = wb.Write(0, []byte("hello"))
 	dirty := wb.DirtyPartNumbers()
 	if len(dirty) != 1 || dirty[0] != 1 {
 		t.Fatalf("expected dirty=[1], got %v", dirty)
@@ -386,11 +386,11 @@ func TestWriteBuffer_DirtyParts_SinglePart(t *testing.T) {
 func TestWriteBuffer_DirtyParts_MultipleParts(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0)
 	// Write at beginning of part 1
-	wb.Write(0, []byte("a"))
+	_, _ = wb.Write(0, []byte("a"))
 	// Write at beginning of part 2 (offset 8MB)
-	wb.Write(partSize, []byte("b"))
+	_, _ = wb.Write(partSize, []byte("b"))
 	// Write at beginning of part 3 (offset 16MB)
-	wb.Write(2*partSize, []byte("c"))
+	_, _ = wb.Write(2*partSize, []byte("c"))
 
 	dirty := wb.DirtyPartNumbers()
 	if len(dirty) != 3 {
@@ -409,7 +409,7 @@ func TestWriteBuffer_DirtyParts_CrossPartBoundary(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0)
 	// Write across the boundary of part 1 and part 2
 	data := make([]byte, 100)
-	wb.Write(partSize-50, data) // straddles parts 1 and 2
+	_, _ = wb.Write(partSize-50, data) // straddles parts 1 and 2
 	dirty := wb.DirtyPartNumbers()
 	if len(dirty) != 2 {
 		t.Fatalf("expected 2 dirty parts, got %v", dirty)
@@ -423,7 +423,7 @@ func TestWriteBuffer_DirtyParts_PreloadClearsFlags(t *testing.T) {
 	for i := range data {
 		data[i] = byte(i % 256)
 	}
-	wb.Write(0, data)
+	_, _ = wb.Write(0, data)
 
 	// After preload, clear dirty flags (simulating Open behavior)
 	wb.dirtyParts = nil
@@ -434,7 +434,7 @@ func TestWriteBuffer_DirtyParts_PreloadClearsFlags(t *testing.T) {
 	}
 
 	// Now write to part 2 only
-	wb.Write(partSize+100, []byte("modified"))
+	_, _ = wb.Write(partSize+100, []byte("modified"))
 	dirty := wb.DirtyPartNumbers()
 	if len(dirty) != 1 || dirty[0] != 2 {
 		t.Fatalf("expected dirty=[2], got %v", dirty)
@@ -445,11 +445,11 @@ func TestWriteBuffer_DirtyParts_TruncateShrink(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0)
 	// Write 3 parts
 	data := make([]byte, partSize*3)
-	wb.Write(0, data)
+	_, _ = wb.Write(0, data)
 	wb.dirtyParts = nil // clear as if preloaded
 
 	// Truncate to 1 part
-	wb.Truncate(partSize / 2)
+	_ = wb.Truncate(partSize / 2)
 	dirty := wb.DirtyPartNumbers()
 	// Part 1 should be dirty (it was truncated within)
 	if len(dirty) != 1 || dirty[0] != 1 {
@@ -459,11 +459,11 @@ func TestWriteBuffer_DirtyParts_TruncateShrink(t *testing.T) {
 
 func TestWriteBuffer_DirtyParts_TruncateExtend(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0)
-	wb.Write(0, make([]byte, partSize)) // 1 full part
+	_, _ = wb.Write(0, make([]byte, partSize)) // 1 full part
 	wb.dirtyParts = nil                 // clear as if preloaded
 
 	// Extend to 3 parts
-	wb.Truncate(partSize*3 - 100)
+	_ = wb.Truncate(partSize*3 - 100)
 	dirty := wb.DirtyPartNumbers()
 	// Parts 2 and 3 should be dirty (extended region)
 	if len(dirty) != 2 {
@@ -478,7 +478,7 @@ func TestWriteBuffer_PartData(t *testing.T) {
 	for i := range data {
 		data[i] = byte(i % 256)
 	}
-	wb.Write(0, data)
+	_, _ = wb.Write(0, data)
 
 	// Part 1 should be exactly partSize bytes
 	p1 := wb.PartData(1)
@@ -501,7 +501,7 @@ func TestWriteBuffer_PartData(t *testing.T) {
 
 func TestWriteBuffer_MarkAllDirty(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0)
-	wb.Write(0, make([]byte, partSize*3))
+	_, _ = wb.Write(0, make([]byte, partSize*3))
 	wb.dirtyParts = nil // clear
 
 	wb.MarkAllDirty()
