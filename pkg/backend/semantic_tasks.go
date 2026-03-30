@@ -9,8 +9,14 @@ import (
 
 func (b *Dat9Backend) enqueueEmbedTaskTx(tx *sql.Tx, fileID string, revision int64) error {
 	now := time.Now().UTC()
-	_, err := b.store.EnqueueSemanticTaskTx(tx, &semantic.Task{
-		TaskID:          b.genID(),
+	_, err := b.store.EnqueueSemanticTaskTx(tx, newEmbedTask(b.genID(), fileID, revision, now))
+	return err
+}
+
+func newEmbedTask(taskID, fileID string, revision int64, now time.Time) *semantic.Task {
+	now = now.UTC()
+	return &semantic.Task{
+		TaskID:          taskID,
 		TaskType:        semantic.TaskTypeEmbed,
 		ResourceID:      fileID,
 		ResourceVersion: revision,
@@ -19,6 +25,5 @@ func (b *Dat9Backend) enqueueEmbedTaskTx(tx *sql.Tx, fileID string, revision int
 		AvailableAt:     now,
 		CreatedAt:       now,
 		UpdatedAt:       now,
-	})
-	return err
+	}
 }

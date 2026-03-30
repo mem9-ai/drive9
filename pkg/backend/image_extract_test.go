@@ -101,6 +101,113 @@ func TestAsyncImageExtractSkipsStaleChecksum(t *testing.T) {
 	}
 }
 
+func TestAsyncImageExtractRequeuesSucceededEmbedTask(t *testing.T) {
+	extractor := &gatedImageExtractor{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	b := newTestBackendWithOptions(t, Options{
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: extractor,
+		},
+	})
+
+	if _, err := b.Write("/img/requeue.png", []byte("first-image-bytes"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-extractor.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("image extraction did not start")
+	}
+
+	fileID, _, _, _ := mustFileForPath(t, b, "/img/requeue.png")
+	claimed, found, err := b.Store().ClaimSemanticTask(context.Background(), time.Now().UTC(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected initial embed task to exist")
+	}
+	if err := b.Store().AckSemanticTask(context.Background(), claimed.TaskID, claimed.Receipt); err != nil {
+		t.Fatal(err)
+	}
+	close(extractor.release)
+
+	got := waitForContentText(t, b, "/img/requeue.png", 3*time.Second)
+	if got != "old caption" {
+		t.Fatalf("expected extracted text %q, got %q", "old caption", got)
+	}
+
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+	if tasks[0].ResourceVersion != 1 || tasks[0].Status != "queued" {
+		t.Fatalf("expected image bridge to requeue embed task, got %+v", tasks[0])
+	}
+}
+
+func TestAsyncImageExtractStaleResultDoesNotRequeueOldRevision(t *testing.T) {
+	extractor := &gatedImageExtractor{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	b := newTestBackendWithOptions(t, Options{
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: extractor,
+		},
+	})
+
+	if _, err := b.Write("/img/stale.png", []byte("first-image-bytes"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-extractor.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first extraction did not start")
+	}
+
+	fileID, _, _, _ := mustFileForPath(t, b, "/img/stale.png")
+	claimed, found, err := b.Store().ClaimSemanticTask(context.Background(), time.Now().UTC(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected initial embed task to exist")
+	}
+	if err := b.Store().AckSemanticTask(context.Background(), claimed.TaskID, claimed.Receipt); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := b.Write("/img/stale.png", []byte("second-image-bytes"), 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	close(extractor.release)
+
+	got := waitForContentText(t, b, "/img/stale.png", 3*time.Second)
+	if got != "new caption" {
+		t.Fatalf("expected final extracted text %q, got %q", "new caption", got)
+	}
+
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 2 {
+		t.Fatalf("semantic task count=%d, want 2", len(tasks))
+	}
+	if tasks[0].ResourceVersion != 1 || tasks[0].Status != "succeeded" {
+		t.Fatalf("stale revision task should stay terminal, got %+v", tasks[0])
+	}
+	if tasks[1].ResourceVersion != 2 || tasks[1].Status != "queued" {
+		t.Fatalf("current revision task should remain queued, got %+v", tasks[1])
+	}
+}
+
 func waitForContentText(t *testing.T, b *Dat9Backend, path string, timeout time.Duration) string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

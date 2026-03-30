@@ -256,6 +256,55 @@ func TestSemanticTaskRecoverAfterReopen(t *testing.T) {
 	}
 }
 
+func TestEnsureSemanticTaskQueuedRequeuesSucceededTask(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if _, err := s.EnqueueSemanticTask(ctx, newSemanticTask("task-1", "file-1", 1, now, now)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := s.ClaimSemanticTask(ctx, now.Add(time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected claim to find task")
+	}
+	if err := s.AckSemanticTask(ctx, claimed.TaskID, claimed.Receipt); err != nil {
+		t.Fatal(err)
+	}
+
+	queued, err := s.EnsureSemanticTaskQueued(ctx, &semantic.Task{
+		TaskID:          "task-requeue",
+		TaskType:        semantic.TaskTypeEmbed,
+		ResourceID:      "file-1",
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     now.Add(2 * time.Second),
+		CreatedAt:       now.Add(2 * time.Second),
+		UpdatedAt:       now.Add(2 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !queued {
+		t.Fatal("expected ensure to requeue succeeded task")
+	}
+
+	task := mustGetSemanticTask(t, s, claimed.TaskID)
+	if task.Status != semantic.TaskQueued {
+		t.Fatalf("status=%q, want %q", task.Status, semantic.TaskQueued)
+	}
+	if task.CompletedAt != nil {
+		t.Fatal("completed_at should be cleared when re-queued")
+	}
+	if task.Receipt != "" || task.LeasedAt != nil || task.LeaseUntil != nil {
+		t.Fatalf("lease fields should be cleared when re-queued: %+v", task)
+	}
+}
+
 func mustGetSemanticTask(t *testing.T, s *Store, taskID string) *semantic.Task {
 	t.Helper()
 	row := s.DB().QueryRow(`SELECT task_id, task_type, resource_id, resource_version, status,

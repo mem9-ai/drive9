@@ -21,9 +21,37 @@ func (s *Store) EnqueueSemanticTask(ctx context.Context, task *semantic.Task) (c
 	return s.enqueueSemanticTask(s.db, task)
 }
 
+// EnsureSemanticTaskQueued makes sure the semantic task exists and is queued.
+// Existing terminal tasks for the same resource/version are re-queued in place.
+func (s *Store) EnsureSemanticTaskQueued(ctx context.Context, task *semantic.Task) (queued bool, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "ensure_semantic_task_queued", start, &err)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	queued, err = s.ensureSemanticTaskQueuedTx(tx, task)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return queued, nil
+}
+
 // EnqueueSemanticTaskTx inserts a queued semantic task inside an existing transaction.
 func (s *Store) EnqueueSemanticTaskTx(db execer, task *semantic.Task) (bool, error) {
 	return s.enqueueSemanticTask(db, task)
+}
+
+// EnsureSemanticTaskQueuedTx makes sure the semantic task exists and is queued
+// inside an existing transaction.
+func (s *Store) EnsureSemanticTaskQueuedTx(tx *sql.Tx, task *semantic.Task) (bool, error) {
+	return s.ensureSemanticTaskQueuedTx(tx, task)
 }
 
 func (s *Store) enqueueSemanticTask(db execer, task *semantic.Task) (bool, error) {
@@ -75,6 +103,56 @@ func (s *Store) enqueueSemanticTask(db execer, task *semantic.Task) (bool, error
 		return false, nil
 	}
 	return false, err
+}
+
+func (s *Store) ensureSemanticTaskQueuedTx(tx *sql.Tx, task *semantic.Task) (bool, error) {
+	if task == nil {
+		return false, fmt.Errorf("semantic task is required")
+	}
+	created, err := s.enqueueSemanticTask(tx, task)
+	if err != nil {
+		return false, err
+	}
+	if created {
+		return true, nil
+	}
+
+	now := time.Now().UTC()
+	row := tx.QueryRow(`SELECT task_id, task_type, resource_id, resource_version, status,
+		attempt_count, max_attempts, receipt, leased_at, lease_until, available_at,
+		payload_json, last_error, created_at, updated_at, completed_at
+		FROM semantic_tasks
+		WHERE task_type = ? AND resource_id = ? AND resource_version = ?
+		FOR UPDATE`, task.TaskType, task.ResourceID, task.ResourceVersion)
+	existing, err := scanSemanticTask(row)
+	if err != nil {
+		return false, err
+	}
+	if existing.Status == semantic.TaskProcessing && existing.LeaseUntil != nil && existing.LeaseUntil.After(now) {
+		return false, nil
+	}
+
+	availableAt := task.AvailableAt
+	if availableAt.IsZero() {
+		availableAt = now
+	}
+	maxAttempts := existing.MaxAttempts
+	if task.MaxAttempts > 0 {
+		maxAttempts = task.MaxAttempts
+	}
+	payload := existing.PayloadJSON
+	if len(task.PayloadJSON) > 0 {
+		payload = task.PayloadJSON
+	}
+	_, err = tx.Exec(`UPDATE semantic_tasks SET status = ?, receipt = NULL, leased_at = NULL,
+		lease_until = NULL, available_at = ?, payload_json = ?, last_error = NULL,
+		max_attempts = ?, completed_at = NULL, updated_at = ?
+		WHERE task_id = ?`,
+		semantic.TaskQueued, availableAt.UTC(), nilBytes(payload), maxAttempts, now, existing.TaskID)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ClaimSemanticTask claims one queued semantic task and leases it to the caller.

@@ -223,6 +223,12 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 		metrics.RecordOperation("image_extract", "process", "stale", time.Since(start))
 		return
 	}
+	if _, err := b.store.EnsureSemanticTaskQueued(ctx, newEmbedTask(b.genID(), task.FileID, task.Revision, time.Now().UTC())); err != nil {
+		logger.Warn(ctx, "backend_image_extract_enqueue_embed_failed",
+			zap.String("file_id", task.FileID), zap.String("path", task.Path), zap.Int64("revision", task.Revision), zap.Error(err))
+		metrics.RecordOperation("image_extract", "process", "enqueue_embed_error", time.Since(start))
+		return
+	}
 	logger.Info(ctx, "backend_image_extract_ok",
 		zap.String("file_id", task.FileID), zap.String("path", task.Path), zap.Int("text_len", len(text)))
 	metrics.RecordOperation("image_extract", "process", "ok", time.Since(start))
