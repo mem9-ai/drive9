@@ -160,25 +160,34 @@ func ftsSafe(s string) string {
 
 func (s *Store) ftsSearch(ctx context.Context, query, pathPrefix string, limit int) []SearchResult {
 	safe := ftsSafe(query)
-	ftsExpr := "fts_match_word('" + safe + "', f.content_text)"
+	ftsExpr := "fts_match_word('" + safe + "', content_text)"
 
-	conds := []string{"f.status = 'CONFIRMED'", ftsExpr}
 	var args []any
-
-	if pathPrefix != "" && pathPrefix != "/" {
-		cond, pargs := subtreeCond(pathPrefix)
-		conds = append(conds, cond)
-		args = append(args, pargs...)
-	}
 	args = append(args, limit)
 
-	q := `SELECT fn.path, fn.name, f.size_bytes, ` + ftsExpr + ` AS score
-		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
-		WHERE ` + strings.Join(conds, " AND ") + `
+	innerQ := `SELECT file_id, size_bytes, ` + ftsExpr + ` AS score
+		FROM files
+		WHERE status = 'CONFIRMED' AND ` + ftsExpr + `
 		ORDER BY ` + ftsExpr + ` DESC
 		LIMIT ?`
 
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	var outerConds []string
+	var outerArgs []any
+	if pathPrefix != "" && pathPrefix != "/" {
+		cond, pargs := subtreeCond(pathPrefix)
+		outerConds = append(outerConds, cond)
+		outerArgs = append(outerArgs, pargs...)
+	}
+
+	q := `SELECT fn.path, fn.name, fts.size_bytes, fts.score
+		FROM (` + innerQ + `) fts
+		JOIN file_nodes fn ON fn.file_id = fts.file_id`
+	if len(outerConds) > 0 {
+		q += ` WHERE ` + strings.Join(outerConds, " AND ")
+	}
+
+	allArgs := append(args, outerArgs...)
+	rows, err := s.db.QueryContext(ctx, q, allArgs...)
 	if err != nil {
 		logger.Warn(ctx, "datastore_fts_search_query_failed",
 			zap.Int("query_len", len(query)),
