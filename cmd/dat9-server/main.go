@@ -252,6 +252,10 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	configured := baseURL != "" || apiKey != "" || model != ""
 	if configured {
 		if baseURL == "" || apiKey == "" || model == "" {
+			logger.Error(context.Background(), "image_extract_mode_invalid_config",
+				zap.Bool("base_url_present", baseURL != ""),
+				zap.Bool("api_key_present", apiKey != ""),
+				zap.Bool("model_present", model != ""))
 			return backend.Options{}, fmt.Errorf("DAT9_IMAGE_EXTRACT_API_BASE, DAT9_IMAGE_EXTRACT_API_KEY and DAT9_IMAGE_EXTRACT_MODEL must be set together")
 		}
 		extractor, err := backend.NewOpenAIImageTextExtractor(backend.OpenAIImageTextExtractorConfig{
