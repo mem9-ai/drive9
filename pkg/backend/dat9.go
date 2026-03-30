@@ -429,9 +429,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		}
 		return 0, err
 	}
-	if nf.File.StorageRef != "" && nf.File.StorageRef != storageRef {
-		b.deleteBlobCtx(ctx, nf.File.StorageRef)
-	}
+	b.deleteBlobIfS3Ctx(ctx, nf.File.StorageType, nf.File.StorageRef, storageRef)
 	b.enqueueImageExtract(nf.File.FileID, nf.Node.Path, contentType, newRev)
 	return int64(len(data)), nil
 }
@@ -606,6 +604,13 @@ func (b *Dat9Backend) deleteBlobCtx(ctx context.Context, ref string) {
 			logger.Warn(ctx, "backend_delete_blob_failed", zap.String("storage_ref", ref), zap.Error(err))
 		}
 	}
+}
+
+func (b *Dat9Backend) deleteBlobIfS3Ctx(ctx context.Context, storageType datastore.StorageType, storageRef, keepRef string) {
+	if storageType != datastore.StorageS3 || storageRef == "" || storageRef == keepRef {
+		return
+	}
+	b.deleteBlobCtx(ctx, storageRef)
 }
 
 func (b *Dat9Backend) readFileDataCtx(ctx context.Context, f *datastore.File) ([]byte, error) {
