@@ -93,7 +93,7 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 	for p.order.Len() > p.maxSize {
 		oldest := p.order.Back()
 		if oldest != nil {
-			p.removeLocked(ctx, oldest, "evict_lru")
+			p.removeLocked(oldest)
 		}
 	}
 	return b, nil
@@ -103,7 +103,7 @@ func (p *Pool) Invalidate(tenantID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if elem, ok := p.items[tenantID]; ok {
-		p.removeLocked(context.Background(), elem, "invalidate")
+		p.removeLocked(elem)
 	}
 }
 
@@ -111,7 +111,7 @@ func (p *Pool) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for p.order.Len() > 0 {
-		p.removeLocked(context.Background(), p.order.Back(), "close")
+		p.removeLocked(p.order.Back())
 	}
 }
 
@@ -218,7 +218,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	return b, store, nil
 }
 
-func (p *Pool) removeLocked(ctx context.Context, elem *list.Element, reason string) {
+func (p *Pool) removeLocked(elem *list.Element) {
 	e := elem.Value.(*entry)
 	p.order.Remove(elem)
 	delete(p.items, e.tenantID)
@@ -228,8 +228,6 @@ func (p *Pool) removeLocked(ctx context.Context, elem *list.Element, reason stri
 	if e.store != nil {
 		_ = e.store.Close()
 	}
-	_ = ctx
-	_ = reason
 }
 
 func observePool(ctx context.Context, op, tenantID string, errp *error, start time.Time) {
