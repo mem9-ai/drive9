@@ -203,6 +203,12 @@ go build -o dat9-server ./cmd/dat9-server
 go test ./...
 ```
 
+On macOS with Podman, use the following command to run tests:
+
+```bash
+make test-macos-podman
+```
+
 ## References
 
 - [db9](https://db9.ai/) — Serverless database with built-in embedding, FTS, vector search, and fs9 file storage

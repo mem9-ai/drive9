@@ -26,7 +26,7 @@ IMAGE_TAG ?= latest
 IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
 LINT_TIMEOUT ?= 10m
 
-.PHONY: mod test fmt lint install-lint build build-server build-cli docker-build
+.PHONY: mod test test-macos-podman fmt lint install-lint build build-server build-cli docker-build
 
 mod:
 	$(GO) mod tidy
@@ -34,6 +34,9 @@ mod:
 
 test:
 	$(GO) test ./...
+
+test-macos-podman:
+	@source ./scripts/macos-podman.sh && $(GO) test ./...
 
 fmt:
 	$(MAKE) install-lint
