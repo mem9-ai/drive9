@@ -621,8 +621,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	fh.Lock()
-	// If there's a dirty buffer, read from it
-	if fh.Dirty != nil && fh.Dirty.Size() > 0 {
+	// If there's a dirty buffer (even empty — e.g. after Create or truncate-to-zero),
+	// read from it so we don't go back to the server and see stale/non-existent data.
+	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
 		data := fh.Dirty.Bytes()
 		offset := int64(input.Offset)
 		if offset >= int64(len(data)) {
