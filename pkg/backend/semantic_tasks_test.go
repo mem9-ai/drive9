@@ -297,6 +297,46 @@ func TestConfirmUploadOverwriteSkipsEmbedTaskWithoutTextSourceAndRebindsUpload(t
 	}
 }
 
+func TestRenameDoesNotCreateAdditionalSemanticTasks(t *testing.T) {
+	b := newTestBackend(t)
+	if _, err := b.Write("/old.txt", []byte("data"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/old.txt")
+	if err := b.Rename("/old.txt", "/new.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	newFileID, _, _, _ := mustFileForPath(t, b, "/new.txt")
+	if newFileID != fileID {
+		t.Fatalf("rename should preserve file_id=%q, got %q", fileID, newFileID)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+}
+
+func TestCopyFileDoesNotCreateAdditionalSemanticTasks(t *testing.T) {
+	b := newTestBackend(t)
+	if _, err := b.Write("/src.txt", []byte("shared"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/src.txt")
+	if err := b.CopyFile("/src.txt", "/dst.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	dstFileID, _, _, _ := mustFileForPath(t, b, "/dst.txt")
+	if dstFileID != fileID {
+		t.Fatalf("copy should preserve file_id=%q, got %q", fileID, dstFileID)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+}
+
 func TestShouldEnqueueEmbedForRevisionWithSynchronousText(t *testing.T) {
 	b := newTestBackend(t)
 	if !b.shouldEnqueueEmbedForRevision("/docs/a.txt", "text/plain", "hello world") {
