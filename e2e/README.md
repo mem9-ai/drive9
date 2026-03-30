@@ -28,12 +28,18 @@ DAT9_BASE=$DEPLOY DAT9_API_KEY=dat9_xxx bash e2e/api-smoke-test-existing-key.sh
 DAT9_BASE=$DEPLOY bash e2e/cli-smoke-test.sh
 ```
 
-## Dev endpoint
+## Deployment Endpoints
 
-Current dev deployment endpoint:
+### Dev
 
 ```bash
 export DAT9_BASE="https://xkopoerih4.execute-api.ap-southeast-1.amazonaws.com"
+```
+
+### Prod
+
+```bash
+export DAT9_BASE="https://4w9z8cd9b7.execute-api.ap-southeast-1.amazonaws.com"
 ```
 
 ## Notes
