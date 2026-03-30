@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
+	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
@@ -186,6 +187,12 @@ environment:
   DAT9_S3_PREFIX   S3 key prefix (e.g. "tenants")
   DAT9_S3_ROLE_ARN IAM role ARN to assume via STS (optional)
   DAT9_S3_DIR      local s3 mock root directory (default: ./s3, only used without DAT9_S3_BUCKET)
+  Query embedding (app-side semantic query embedding for grep):
+  DAT9_QUERY_EMBED_API_BASE OpenAI-compatible base URL (optional)
+  DAT9_QUERY_EMBED_API_KEY  API key for DAT9_QUERY_EMBED_API_BASE (optional)
+  DAT9_QUERY_EMBED_MODEL    model name for query embedding (optional)
+  DAT9_QUERY_EMBED_DIMENSIONS optional embedding dimensions override
+  DAT9_QUERY_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
   Image extraction (async image -> text for search):
   DAT9_IMAGE_EXTRACT_ENABLED true|false (default: false)
   DAT9_IMAGE_EXTRACT_QUEUE_SIZE buffered task queue size (default: 128)
@@ -233,6 +240,30 @@ func publicBaseURL(listenAddr string) string {
 
 func buildBackendOptionsFromEnv() (backend.Options, error) {
 	var opts backend.Options
+
+	queryBaseURL := strings.TrimSpace(os.Getenv("DAT9_QUERY_EMBED_API_BASE"))
+	queryAPIKey := strings.TrimSpace(os.Getenv("DAT9_QUERY_EMBED_API_KEY"))
+	queryModel := strings.TrimSpace(os.Getenv("DAT9_QUERY_EMBED_MODEL"))
+	queryConfigured := queryBaseURL != "" || queryAPIKey != "" || queryModel != ""
+	if queryConfigured {
+		if queryBaseURL == "" || queryAPIKey == "" || queryModel == "" {
+			return backend.Options{}, fmt.Errorf("DAT9_QUERY_EMBED_API_BASE, DAT9_QUERY_EMBED_API_KEY and DAT9_QUERY_EMBED_MODEL must be set together")
+		}
+		queryClient, err := embedding.NewOpenAIClient(embedding.OpenAIClientConfig{
+			BaseURL:    queryBaseURL,
+			APIKey:     queryAPIKey,
+			Model:      queryModel,
+			Dimensions: envInt("DAT9_QUERY_EMBED_DIMENSIONS", 0),
+			Timeout:    time.Duration(envInt("DAT9_QUERY_EMBED_TIMEOUT_SECONDS", 20)) * time.Second,
+		})
+		if err != nil {
+			return backend.Options{}, fmt.Errorf("init query embedder: %w", err)
+		}
+		opts.QueryEmbedding = backend.QueryEmbeddingOptions{Client: queryClient}
+		logger.Info(context.Background(), "query_embedding_mode_openai_compatible",
+			zap.String("model", queryModel), zap.String("base_url", queryBaseURL))
+	}
+
 	if !envBool("DAT9_IMAGE_EXTRACT_ENABLED", false) {
 		return opts, nil
 	}

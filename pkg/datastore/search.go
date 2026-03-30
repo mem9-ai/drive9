@@ -2,13 +2,11 @@ package datastore
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/logger"
-	"go.uber.org/zap"
+	"github.com/mem9-ai/dat9/pkg/embedding"
 )
 
 type SearchResult struct {
@@ -32,31 +30,8 @@ type FindFilter struct {
 
 const rrfK = 60.0
 
-func (s *Store) Grep(ctx context.Context, query, pathPrefix string, limit int) ([]SearchResult, error) {
-	if query == "" {
-		return nil, fmt.Errorf("empty query")
-	}
-	if limit <= 0 || limit > 100 {
-		limit = 20
-	}
-	fetch := limit * 3
-
-	vecCh := make(chan []SearchResult, 1)
-	ftsCh := make(chan []SearchResult, 1)
-
-	go func() { vecCh <- s.vectorSearch(ctx, query, pathPrefix, fetch) }()
-	go func() { ftsCh <- s.ftsSearch(ctx, query, pathPrefix, fetch) }()
-
-	vec := <-vecCh
-	fts := <-ftsCh
-
-	if len(vec) == 0 && len(fts) == 0 {
-		return s.keywordSearch(ctx, query, pathPrefix, limit)
-	}
-	return rrfMerge(fts, vec, limit), nil
-}
-
-func rrfMerge(fts, vec []SearchResult, limit int) []SearchResult {
+// RRFMerge merges ranked FTS and vector results with reciprocal rank fusion.
+func RRFMerge(fts, vec []SearchResult, limit int) []SearchResult {
 	scores := make(map[string]float64)
 	for rank, r := range fts {
 		scores[r.Path] += 1.0 / (rrfK + float64(rank+1))
@@ -97,16 +72,21 @@ func subtreeCond(prefix string) (string, []any) {
 	return "(fn.path = ? OR fn.path LIKE ?)", []any{prefix, prefix + "/%"}
 }
 
-func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limit int) []SearchResult {
-	conds := []string{"f.status = 'CONFIRMED'", "f.embedding IS NOT NULL"}
-	args := []any{query}
+// VectorSearch runs a vector similarity search for the supplied embedding.
+func (s *Store) VectorSearch(ctx context.Context, queryEmbedding []float32, pathPrefix string, limit int) ([]SearchResult, error) {
+	if len(queryEmbedding) == 0 {
+		return nil, nil
+	}
+	conds := []string{"f.status = 'CONFIRMED'", "f.embedding IS NOT NULL", "f.embedding_revision = f.revision"}
+	vecParam := embedding.FormatVector(queryEmbedding)
+	args := []any{vecParam}
 
 	if pathPrefix != "" && pathPrefix != "/" {
 		cond, pargs := subtreeCond(pathPrefix)
 		conds = append(conds, cond)
 		args = append(args, pargs...)
 	}
-	args = append(args, query, limit)
+	args = append(args, vecParam, limit)
 
 	q := `SELECT fn.path, fn.name, f.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(f.embedding, ?) AS distance
@@ -117,12 +97,7 @@ func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limi
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
-		logger.Warn(ctx, "datastore_vector_search_query_failed",
-			zap.Int("query_len", len(query)),
-			zap.String("path_prefix", pathPrefix),
-			zap.Int("limit", limit),
-			zap.Error(err))
-		return nil
+		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -131,8 +106,7 @@ func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limi
 		var r SearchResult
 		var dist float64
 		if err := rows.Scan(&r.Path, &r.Name, &r.SizeBytes, &dist); err != nil {
-			logger.Warn(ctx, "datastore_vector_search_scan_failed", zap.Error(err))
-			break
+			return nil, err
 		}
 		sc := 1.0 - dist
 		if sc < 0.3 {
@@ -142,9 +116,9 @@ func (s *Store) vectorSearch(ctx context.Context, query, pathPrefix string, limi
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		logger.Warn(ctx, "datastore_vector_search_rows_failed", zap.Error(err))
+		return nil, err
 	}
-	return out
+	return out, nil
 }
 
 func ftsSafe(s string) string {
@@ -158,7 +132,8 @@ func ftsSafe(s string) string {
 	return s
 }
 
-func (s *Store) ftsSearch(ctx context.Context, query, pathPrefix string, limit int) []SearchResult {
+// FTSSearch runs a full-text search over files.content_text.
+func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit int) ([]SearchResult, error) {
 	safe := ftsSafe(query)
 	ftsExpr := "fts_match_word('" + safe + "', content_text)"
 
@@ -189,12 +164,7 @@ func (s *Store) ftsSearch(ctx context.Context, query, pathPrefix string, limit i
 	allArgs := append(args, outerArgs...)
 	rows, err := s.db.QueryContext(ctx, q, allArgs...)
 	if err != nil {
-		logger.Warn(ctx, "datastore_fts_search_query_failed",
-			zap.Int("query_len", len(query)),
-			zap.String("path_prefix", pathPrefix),
-			zap.Int("limit", limit),
-			zap.Error(err))
-		return nil
+		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -203,19 +173,19 @@ func (s *Store) ftsSearch(ctx context.Context, query, pathPrefix string, limit i
 		var r SearchResult
 		var sc float64
 		if err := rows.Scan(&r.Path, &r.Name, &r.SizeBytes, &sc); err != nil {
-			logger.Warn(ctx, "datastore_fts_search_scan_failed", zap.Error(err))
-			break
+			return nil, err
 		}
 		r.Score = &sc
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		logger.Warn(ctx, "datastore_fts_search_rows_failed", zap.Error(err))
+		return nil, err
 	}
-	return out
+	return out, nil
 }
 
-func (s *Store) keywordSearch(ctx context.Context, query, pathPrefix string, limit int) ([]SearchResult, error) {
+// KeywordSearch runs a LIKE-based fallback search when semantic ranking is unavailable.
+func (s *Store) KeywordSearch(ctx context.Context, query, pathPrefix string, limit int) ([]SearchResult, error) {
 	conds := []string{"f.status = 'CONFIRMED'", "f.content_text LIKE CONCAT('%', ?, '%')"}
 	args := []any{query}
 

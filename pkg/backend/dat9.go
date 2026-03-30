@@ -19,6 +19,7 @@ import (
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
@@ -32,11 +33,12 @@ const smallFileThreshold = 1 << 20 // 1MB
 
 // Dat9Backend implements filesystem.FileSystem with the inode model.
 type Dat9Backend struct {
-	store     *datastore.Store
-	s3        s3client.S3Client // nil when S3 is not configured
-	smallInDB bool
-	mu        sync.Mutex
-	entropy   io.Reader
+	store         *datastore.Store
+	s3            s3client.S3Client // nil when S3 is not configured
+	smallInDB     bool
+	queryEmbedder embedding.Client
+	mu            sync.Mutex
+	entropy       io.Reader
 
 	// Async image -> text extraction worker (in-memory queue for P0).
 	imageExtractEnabled bool
@@ -51,9 +53,10 @@ type Dat9Backend struct {
 
 func newBaseBackend(store *datastore.Store) *Dat9Backend {
 	return &Dat9Backend{
-		store:     store,
-		smallInDB: true,
-		entropy:   ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0),
+		store:         store,
+		smallInDB:     true,
+		queryEmbedder: embedding.NopClient{},
+		entropy:       ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0),
 	}
 }
 
@@ -715,13 +718,73 @@ func (b *Dat9Backend) ExecSQL(ctx context.Context, query string) ([]map[string]i
 
 func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit int) ([]datastore.SearchResult, error) {
 	start := time.Now()
-	rows, err := b.store.Grep(ctx, query, pathPrefix, limit)
-	observeBackend(ctx, "grep", err, start)
-	if err != nil {
-		logger.Error(ctx, "backend_grep_failed", zap.Int("query_len", len(query)), zap.String("path_prefix", pathPrefix), zap.Int("limit", limit), zap.Error(err))
+	var err error
+	defer func() { observeBackend(ctx, "grep", err, start) }()
+
+	if strings.TrimSpace(query) == "" {
+		err = fmt.Errorf("empty query")
 		return nil, err
 	}
-	return rows, nil
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	fetch := limit * 3
+
+	type grepResp struct {
+		rows []datastore.SearchResult
+		err  error
+	}
+	ftsCh := make(chan grepResp, 1)
+	go func() {
+		rows, searchErr := b.store.FTSSearch(ctx, query, pathPrefix, fetch)
+		ftsCh <- grepResp{rows: rows, err: searchErr}
+	}()
+
+	var vecCh chan grepResp
+	if b.queryEmbedder != nil {
+		vecCh = make(chan grepResp, 1)
+		go func() {
+			queryVec, embedErr := b.queryEmbedder.EmbedText(ctx, query)
+			if embedErr != nil || len(queryVec) == 0 {
+				vecCh <- grepResp{err: embedErr}
+				return
+			}
+			rows, searchErr := b.store.VectorSearch(ctx, queryVec, pathPrefix, fetch)
+			vecCh <- grepResp{rows: rows, err: searchErr}
+		}()
+	}
+
+	ftsResp := <-ftsCh
+	if ftsResp.err != nil {
+		logger.Warn(ctx, "backend_grep_fts_failed",
+			zap.Int("query_len", len(query)),
+			zap.String("path_prefix", pathPrefix),
+			zap.Int("limit", fetch),
+			zap.Error(ftsResp.err))
+	}
+
+	var vecResp grepResp
+	if vecCh != nil {
+		vecResp = <-vecCh
+		if vecResp.err != nil {
+			logger.Warn(ctx, "backend_grep_vector_failed",
+				zap.Int("query_len", len(query)),
+				zap.String("path_prefix", pathPrefix),
+				zap.Int("limit", fetch),
+				zap.Error(vecResp.err))
+		}
+	}
+
+	if len(ftsResp.rows) == 0 && len(vecResp.rows) == 0 {
+		rows, searchErr := b.store.KeywordSearch(ctx, query, pathPrefix, limit)
+		if searchErr != nil {
+			logger.Error(ctx, "backend_grep_failed", zap.Int("query_len", len(query)), zap.String("path_prefix", pathPrefix), zap.Int("limit", limit), zap.Error(searchErr))
+			err = searchErr
+			return nil, err
+		}
+		return rows, nil
+	}
+	return datastore.RRFMerge(ftsResp.rows, vecResp.rows, limit), nil
 }
 
 func (b *Dat9Backend) Find(ctx context.Context, f *datastore.FindFilter) ([]datastore.SearchResult, error) {
