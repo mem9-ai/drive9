@@ -46,8 +46,7 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	resetServerTestState(t, testDSN, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -90,6 +89,7 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 		Provisioner: prov,
 		TokenSecret: tokenSecret,
 	})
+	t.Cleanup(srv.waitBackgroundTasks)
 
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
@@ -142,8 +142,7 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	resetServerTestState(t, testDSN, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -190,6 +189,7 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 		Provisioner: prov,
 		TokenSecret: tokenSecret,
 	})
+	t.Cleanup(srv.waitBackgroundTasks)
 
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
@@ -248,8 +248,7 @@ func TestStartupResumesProvisioningTenantInit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	resetServerTestState(t, testDSN, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -300,7 +299,8 @@ func TestStartupResumesProvisioningTenantInit(t *testing.T) {
 	}
 
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBZero, cluster: &tenant.ClusterInfo{}}
-	_ = NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov, TokenSecret: []byte("abc")})
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov, TokenSecret: []byte("abc")})
+	t.Cleanup(srv.waitBackgroundTasks)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
