@@ -218,7 +218,7 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 		if txErr != nil {
 			return txErr
 		}
-		if !updated {
+		if !updated || b.UsesDatabaseAutoEmbedding() {
 			return nil
 		}
 		_, txErr = b.store.EnsureSemanticTaskQueuedTx(tx, newEmbedTask(b.genID(), task.FileID, task.Revision, time.Now().UTC()))
