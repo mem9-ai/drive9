@@ -49,8 +49,14 @@ func NewStarterProvisionerFromEnv() (*StarterProvisioner, error) {
 
 func (p *StarterProvisioner) ProviderType() string { return ProviderTiDBCloudStarter }
 
-func (p *StarterProvisioner) InitSchema(_ context.Context, dsn string) error {
-	return initStarterSchema(dsn)
+// InitSchema is intentionally a no-op for TiDB Cloud Starter.
+//
+// Starter tenants come from an externally initialized cluster/pool whose
+// database bootstrap and schema setup happen outside this repository. Returning
+// nil here means "schema is managed externally", not "schema initialization was
+// forgotten".
+func (p *StarterProvisioner) InitSchema(_ context.Context, _ string) error {
+	return nil
 }
 
 func (p *StarterProvisioner) Provision(ctx context.Context, tenantID string) (*ClusterInfo, error) {
