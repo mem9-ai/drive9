@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -11,6 +12,8 @@ const (
 	tidbAutoEmbeddingModel      = "openai/text-embedding-3-small"
 	tidbAutoEmbeddingDimensions = 1024
 )
+
+var tidbAutoEmbeddingOptionsJSON = fmt.Sprintf(`{"dimensions":%d}`, tidbAutoEmbeddingDimensions)
 
 func tidbAutoEmbeddingSchemaStatements(withContentBlob bool) []string {
 	contentBlobCol := ""
@@ -42,10 +45,10 @@ func tidbAutoEmbeddingSchemaStatements(withContentBlob bool) []string {
 			status             VARCHAR(32) NOT NULL DEFAULT 'PENDING',
 			source_id          VARCHAR(255),
 			content_text       LONGTEXT,
-			embedding          VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT(
-				'openai/text-embedding-3-small',
+			embedding          VECTOR(` + strconv.Itoa(tidbAutoEmbeddingDimensions) + `) GENERATED ALWAYS AS (EMBED_TEXT(
+				'` + tidbAutoEmbeddingModel + `',
 				content_text,
-				'{"dimensions":1024}'
+				'` + tidbAutoEmbeddingOptionsJSON + `'
 			)) STORED,
 			embedding_revision BIGINT,
 			created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -118,13 +121,14 @@ func ValidateTiDBAutoEmbeddingSchema(db *sql.DB) error {
 	if !isTiDBCluster(db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
-	var tableName string
-	var createStmt string
-	if err := db.QueryRow(`SHOW CREATE TABLE files`).Scan(&tableName, &createStmt); err != nil {
-		return fmt.Errorf("show create table files: %w", err)
-	}
-	if err := validateTiDBAutoEmbeddingFilesDDL(createStmt); err != nil {
-		return fmt.Errorf("files schema contract: %w", err)
+	for _, table := range []string{"file_nodes", "files", "file_tags", "uploads", "semantic_tasks"} {
+		createStmt, err := loadShowCreateTable(db, table)
+		if err != nil {
+			return fmt.Errorf("show create table %s: %w", table, err)
+		}
+		if err := validateTiDBAutoEmbeddingTableDDL(table, createStmt); err != nil {
+			return fmt.Errorf("%s schema contract: %w", table, err)
+		}
 	}
 	return nil
 }
@@ -135,6 +139,9 @@ func initTiDBAutoEmbeddingSchema(dsn string, withContentBlob bool) error {
 		return err
 	}
 	defer func() { _ = db.Close() }()
+	if !isTiDBCluster(db) {
+		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
+	}
 	if err := execSchemaStatements(db, tidbAutoEmbeddingSchemaStatements(withContentBlob)); err != nil {
 		return err
 	}
@@ -171,13 +178,14 @@ func validateTiDBAutoEmbeddingFilesDDL(createStmt string) error {
 		pattern string
 		errMsg  string
 	}{
-		{"embedding vector(1024) generated always as", "missing generated embedding column"},
+		{"embedding vector(" + strconv.Itoa(tidbAutoEmbeddingDimensions) + ") generated always as", "missing generated embedding column"},
 		{"embed_text(", "missing EMBED_TEXT generated expression"},
 		{tidbAutoEmbeddingModel, "embedding model contract mismatch"},
 		{"content_text", "generated expression must derive from content_text"},
-		{"dimensions", "embedding dimensions option missing"},
-		{"1024", "embedding dimensions must stay at 1024"},
+		{tidbAutoEmbeddingOptionsJSON, "embedding dimensions option mismatch"},
 		{"embedding_revision bigint", "embedding_revision compatibility column missing"},
+		{"idx_fts_content", "missing fulltext index idx_fts_content"},
+		{"with parser multilingual", "fulltext index must use multilingual parser"},
 		{"idx_files_cosine", "missing vector index idx_files_cosine"},
 		{"vec_cosine_distance(embedding)", "vector index must target embedding cosine distance"},
 	}
@@ -187,6 +195,92 @@ func validateTiDBAutoEmbeddingFilesDDL(createStmt string) error {
 		}
 	}
 	return nil
+}
+
+func validateTiDBAutoEmbeddingTableDDL(tableName, createStmt string) error {
+	switch tableName {
+	case "file_nodes":
+		return validateTiDBAutoEmbeddingFileNodesDDL(createStmt)
+	case "files":
+		return validateTiDBAutoEmbeddingFilesDDL(createStmt)
+	case "file_tags":
+		return validateTiDBAutoEmbeddingFileTagsDDL(createStmt)
+	case "uploads":
+		return validateTiDBAutoEmbeddingUploadsDDL(createStmt)
+	case "semantic_tasks":
+		return validateTiDBAutoEmbeddingSemanticTasksDDL(createStmt)
+	default:
+		return fmt.Errorf("unsupported table %q", tableName)
+	}
+}
+
+func validateTiDBAutoEmbeddingFileNodesDDL(createStmt string) error {
+	return validateDDLContains(createStmt,
+		ddlCheck{pattern: "node_id varchar(64)", errMsg: "missing node_id column"},
+		ddlCheck{pattern: "path varchar(512)", errMsg: "missing path column"},
+		ddlCheck{pattern: "parent_path varchar(512)", errMsg: "missing parent_path column"},
+		ddlCheck{pattern: "file_id varchar(64)", errMsg: "missing file_id column"},
+		ddlCheck{pattern: "idx_path", errMsg: "missing unique index idx_path"},
+		ddlCheck{pattern: "idx_parent", errMsg: "missing index idx_parent"},
+		ddlCheck{pattern: "idx_file_id", errMsg: "missing index idx_file_id"},
+	)
+}
+
+func validateTiDBAutoEmbeddingFileTagsDDL(createStmt string) error {
+	return validateDDLContains(createStmt,
+		ddlCheck{pattern: "primary key (file_id,tag_key)", errMsg: "missing file_tags primary key"},
+		ddlCheck{pattern: "tag_key varchar(255)", errMsg: "missing tag_key column"},
+		ddlCheck{pattern: "tag_value varchar(255)", errMsg: "missing tag_value column"},
+		ddlCheck{pattern: "idx_kv", errMsg: "missing index idx_kv"},
+	)
+}
+
+func validateTiDBAutoEmbeddingUploadsDDL(createStmt string) error {
+	return validateDDLContains(createStmt,
+		ddlCheck{pattern: "upload_id varchar(64)", errMsg: "missing upload_id column"},
+		ddlCheck{pattern: "target_path varchar(512)", errMsg: "missing target_path column"},
+		ddlCheck{pattern: "status varchar(32)", errMsg: "missing status column"},
+		ddlCheck{pattern: "active_target_path varchar(512) as (case when status = 'uploading' then target_path else null end) stored", errMsg: "missing active_target_path generated column"},
+		ddlCheck{pattern: "idx_upload_path", errMsg: "missing index idx_upload_path"},
+		ddlCheck{pattern: "idx_idempotency", errMsg: "missing unique index idx_idempotency"},
+	)
+}
+
+func validateTiDBAutoEmbeddingSemanticTasksDDL(createStmt string) error {
+	return validateDDLContains(createStmt,
+		ddlCheck{pattern: "task_id varchar(64)", errMsg: "missing task_id column"},
+		ddlCheck{pattern: "task_type varchar(32)", errMsg: "missing task_type column"},
+		ddlCheck{pattern: "resource_id varchar(64)", errMsg: "missing resource_id column"},
+		ddlCheck{pattern: "resource_version bigint", errMsg: "missing resource_version column"},
+		ddlCheck{pattern: "status varchar(20)", errMsg: "missing status column"},
+		ddlCheck{pattern: "uk_task_resource_version", errMsg: "missing unique index uk_task_resource_version"},
+		ddlCheck{pattern: "idx_task_claim", errMsg: "missing index idx_task_claim"},
+	)
+}
+
+type ddlCheck struct {
+	pattern string
+	errMsg  string
+}
+
+func validateDDLContains(createStmt string, checks ...ddlCheck) error {
+	norm := normalizeDDL(createStmt)
+	for _, check := range checks {
+		if !strings.Contains(norm, check.pattern) {
+			return errors.New(check.errMsg)
+		}
+	}
+	return nil
+}
+
+func loadShowCreateTable(db *sql.DB, tableName string) (string, error) {
+	var gotTable string
+	var createStmt string
+	query := fmt.Sprintf("SHOW CREATE TABLE %s", tableName)
+	if err := db.QueryRow(query).Scan(&gotTable, &createStmt); err != nil {
+		return "", err
+	}
+	return createStmt, nil
 }
 
 func normalizeDDL(s string) string {

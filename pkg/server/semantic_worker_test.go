@@ -160,6 +160,56 @@ func TestServerDoesNotStartSemanticWorkerForAutoEmbeddingFallbackBackend(t *test
 	}
 }
 
+func TestSemanticWorkerMultiTenantModeIgnoresAutoEmbeddingFallbackDisable(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	pool := newTestTenantPool(t)
+	passCipher, err := pool.Encrypt(context.Background(), []byte("pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	tenantID := tenant.NewID()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: passCipher,
+		DBName:           "app",
+		DBTLS:            false,
+		Provider:         tenant.ProviderDB9,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{DatabaseAutoEmbedding: true})
+	m := newSemanticWorkerManager(b, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
+	if m == nil {
+		t.Fatal("expected semantic worker manager in multi-tenant mode")
+	}
+	refs, err := m.listTenantRefs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("tenant ref count=%d, want 1", len(refs))
+	}
+	if refs[0].id != tenantID {
+		t.Fatalf("tenant ref id=%q, want %q", refs[0].id, tenantID)
+	}
+}
+
 func TestSemanticWorkerAcksObsoleteRevisionAndWritesLatest(t *testing.T) {
 	b := newTestBackendForSemanticWorker(t)
 	if _, err := b.Write("/docs/b.txt", []byte("version one"), 0, filesystem.WriteFlagCreate); err != nil {

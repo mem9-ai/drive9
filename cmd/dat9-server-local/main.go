@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net"
 	"net/http"
@@ -48,10 +49,11 @@ func main() {
 	if localDSN == "" {
 		die(fmt.Errorf("DAT9_LOCAL_DSN is required"))
 	}
+	localInitSchema := envBool("DAT9_LOCAL_INIT_SCHEMA", true)
 
 	// Local validation should be able to bootstrap a fresh tenant database without
 	// going through the multi-tenant provision flow.
-	if envBool("DAT9_LOCAL_INIT_SCHEMA", true) {
+	if localInitSchema {
 		if err := tenant.InitTiDBTenantSchema(localDSN); err != nil {
 			die(fmt.Errorf("init local tenant schema: %w", err))
 		}
@@ -67,6 +69,7 @@ func main() {
 	if err != nil {
 		die(err)
 	}
+	backendOpts.DatabaseAutoEmbedding = shouldUseLocalDatabaseAutoEmbedding(store.DB(), localInitSchema)
 	semanticEmbedder, workerOpts, err := buildSemanticWorkerConfigFromEnv()
 	if err != nil {
 		die(err)
@@ -105,7 +108,8 @@ func main() {
 		zap.String("listen_addr", addr),
 		zap.String("local_dsn", redactDSN(localDSN)),
 		zap.String("s3_dir", s3Dir),
-		zap.Bool("local_init_schema", envBool("DAT9_LOCAL_INIT_SCHEMA", true)))
+		zap.Bool("local_init_schema", localInitSchema),
+		zap.Bool("database_auto_embedding", backendOpts.DatabaseAutoEmbedding))
 
 	// Bind first so we can emit a definitive "started" log only after the socket
 	// is actually listening.
@@ -193,6 +197,18 @@ func publicBaseURL(listenAddr string) string {
 		os.Exit(1)
 		return ""
 	}
+}
+
+var localAutoEmbeddingSchemaValidator = tenant.ValidateTiDBAutoEmbeddingSchema
+
+func shouldUseLocalDatabaseAutoEmbedding(db *sql.DB, schemaInitialized bool) bool {
+	if schemaInitialized {
+		return true
+	}
+	if db == nil {
+		return false
+	}
+	return localAutoEmbeddingSchemaValidator(db) == nil
 }
 
 func buildBackendOptionsFromEnv() (backend.Options, error) {
