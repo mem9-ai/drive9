@@ -22,9 +22,9 @@ const (
 type Options struct {
 	AsyncImageExtract AsyncImageExtractOptions
 	QueryEmbedding    QueryEmbeddingOptions
-	// DatabaseAutoEmbedding marks backends whose semantic text is embedded by the
-	// database rather than the app-managed embed worker. The initial foundation
-	// commit only stores this mode bit; follow-up commits split runtime behavior.
+	// DatabaseAutoEmbedding controls whether semantic text is embedded by the
+	// database itself rather than by the app-managed embed worker. When enabled,
+	// runtime write/query paths rely on database-side embedding behavior.
 	DatabaseAutoEmbedding bool
 }
 

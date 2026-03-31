@@ -115,10 +115,11 @@ func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Sto
 	if embedder == nil {
 		return nil
 	}
-	if fallback != nil && fallback.UsesDatabaseAutoEmbedding() {
+	hasMultiTenant := metaStore != nil && pool != nil
+	if fallback != nil && !hasMultiTenant && fallback.UsesDatabaseAutoEmbedding() {
 		return nil
 	}
-	if fallback == nil && (metaStore == nil || pool == nil) {
+	if fallback == nil && !hasMultiTenant {
 		return nil
 	}
 	opts.normalize()
@@ -423,22 +424,25 @@ func (m *semanticWorkerManager) releaseTenantSlot(tenantID string) {
 }
 
 func (m *semanticWorkerManager) listTenantRefs(ctx context.Context) ([]semanticTenantRef, error) {
+	if m.meta != nil && m.pool != nil {
+		tenants, err := m.meta.ListTenantsByStatus(ctx, meta.TenantActive, m.opts.TenantScanLimit)
+		if err != nil {
+			return nil, err
+		}
+		refs := make([]semanticTenantRef, 0, len(tenants))
+		for i := range tenants {
+			t := tenants[i]
+			if semanticWorkerUsesTiDBAutoEmbedding(t.Provider) {
+				continue
+			}
+			refs = append(refs, semanticTenantRef{id: t.ID, tenant: &t})
+		}
+		return refs, nil
+	}
 	if m.fallback != nil {
 		return []semanticTenantRef{{id: semanticLocalTenantID}}, nil
 	}
-	tenants, err := m.meta.ListTenantsByStatus(ctx, meta.TenantActive, m.opts.TenantScanLimit)
-	if err != nil {
-		return nil, err
-	}
-	refs := make([]semanticTenantRef, 0, len(tenants))
-	for i := range tenants {
-		t := tenants[i]
-		if semanticWorkerUsesTiDBAutoEmbedding(t.Provider) {
-			continue
-		}
-		refs = append(refs, semanticTenantRef{id: t.ID, tenant: &t})
-	}
-	return refs, nil
+	return nil, nil
 }
 
 func (m *semanticWorkerManager) storeForRef(ctx context.Context, ref semanticTenantRef) (*datastore.Store, error) {

@@ -37,8 +37,9 @@ type Dat9Backend struct {
 	s3            s3client.S3Client // nil when S3 is not configured
 	smallInDB     bool
 	queryEmbedder embedding.Client
-	// databaseAutoEmbedding records whether this backend should eventually run
-	// the TiDB database-managed embedding path instead of the app-managed one.
+	// databaseAutoEmbedding selects whether this backend uses the TiDB
+	// database-managed embedding path instead of the app-managed one for write,
+	// upload, image extraction, and grep behavior.
 	databaseAutoEmbedding bool
 	mu                    sync.Mutex
 	entropy               io.Reader
