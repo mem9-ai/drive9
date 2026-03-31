@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>dat9 — Network drive with semantic search for AI agents</title>
+    <meta name="description" content="dat9 is a network drive with built-in semantic search for AI agents. Filesystem-like interface over tiered storage with automatic embedding and full-text indexing.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- Background Grid -->
+    <div class="bg-grid"></div>
+    
+    <!-- Navigation -->
+    <nav class="nav">
+        <div class="nav-container">
+            <a href="#" class="logo">
+                <span class="logo-icon">◆</span>
+                <span class="logo-text">dat9</span>
+            </a>
+            <div class="nav-links">
+                <a href="#features">Features</a>
+                <a href="#cli">CLI</a>
+                <a href="#sdk">SDK</a>
+                <a href="https://github.com/mem9-ai/dat9" target="_blank" class="nav-github">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                        <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                    </svg>
+                </a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero Section -->
+    <section class="hero">
+        <div class="container">
+            <h1 class="hero-title">
+                Network drive<br>
+                <span class="gradient-text">with semantic search_</span>
+            </h1>
+            <p class="hero-subtitle">
+                A unified filesystem-like interface for AI agents. Store, retrieve, and search
+                with automatic embedding and full-text indexing.
+                Use familiar commands like a local drive.
+            </p>
+            
+            <!-- CLI Install -->
+            <div class="cli-box">
+                <div class="cli-header">
+                    <span class="cli-label">CLI</span>
+                    <button class="cli-copy" onclick="copyToClipboard(this)">
+                        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                        </svg>
+                    </button>
+                </div>
+                <code class="cli-code">$ curl -fsSL https://dat9.ai/install | sh</code>
+                <div class="cli-meta">macOS / Linux (x86_64, arm64)</div>
+            </div>
+
+            <!-- AI Agents Badge -->
+            <div class="agents-section">
+                <div class="agents-label">AI Agents</div>
+                <div class="agents-instruction">
+                    <code>Read https://dat9.ai/skill.md and follow instructions</code>
+                </div>
+                <p class="agents-desc">Your agent learns to install, auth, and use dat9 autonomously</p>
+            </div>
+
+            <!-- Tool Ecosystem -->
+            <div="ecosystem">
+                <p class="ecosystem-label">dat9 works with any agent and stack</p>
+                <div class="ecosystem-grid">
+                    <div class="ecosystem-item">
+                        <div class="ecosystem-icon">◆</div>
+                        <span>Claude Code</span>
+                    </div>
+                    <div class="ecosystem-item">
+                        <div class="ecosystem-icon">◇</div>
+                        <span>OpenAI Codex</span>
+                    </div>
+                    <div class="ecosystem-item">
+                        <div class="ecosystem-icon">◆</div>
+                        <span>Cursor</span>
+                    </div>
+                    <div class="ecosystem-item">
+                        <div class="ecosystem-icon">◇</div>
+                        <span>Cline</span>
+                    </div>
+                    <div class="ecosystem-item">
+                        <div class="ecosystem-icon">◆</div>
+                        <span>VS Code</span>
+                    </div>
+                    <div class="ecosystem-item">
+                        <div class="ecosystem-icon">◇</div>
+                        <span>mem9</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Use Cases Section -->
+    <section class="use-cases" id="features">
+        <div class="container">
+            <h2 class="section-title">Why dat9?</h2>
+            <p class="section-subtitle">Built for AI agents, designed for developers.</p>
+            <div class="use-cases-grid">
+                <!-- Use Case 1 -->
+                <div class="use-case-card">
+                    <div class="use-case-header">
+                        <h3>Search by meaning</h3>
+                        <p>Find files by content, not just filename</p>
+                    </div>
+                    <div class="use-case-body">
+                        <p>All files are automatically embedded and indexed. Query by meaning using natural language. Smart summaries let agents scan quickly before loading full content.</p>
+                    </div>
+                    <div class="use-case-footer">
+                        <span class="tag">Auto-embedding</span>
+                        <span class="tag">Vector search</span>
+                        <span class="tag">Smart summaries</span>
+                    </div>
+                </div>
+
+                <!-- Use Case 2 -->
+                <div class="use-case-card">
+                    <div class="use-case-header">
+                        <h3>Any file size</h3>
+                        <p>From configs to datasets — seamless handling</p>
+                    </div>
+                    <div class="use-case-body">
+                        <p>Efficient upload and download with automatic resume support. Optimized data flow for any file size with streaming and retry built in.</p>
+                    </div>
+                    <div class="use-case-footer">
+                        <span class="tag">Auto-resume</span>
+                        <span class="tag">Streaming</span>
+                        <span class="tag">Reliable</span>
+                    </div>
+                </div>
+
+                <!-- Use Case 3 -->
+                <div class="use-case-card">
+                    <div class="use-case-header">
+                        <h3>Zero-copy operations</h3>
+                        <p>Copy and rename without re-upload</p>
+                    </div>
+                    <div class="use-case-body">
+                        <p>Copy without re-upload. Rename instantly. One file can appear at multiple paths. Efficient storage management handles cleanup automatically.</p>
+                    </div>
+                    <div class="use-case-footer">
+                        <span class="tag">Instant copy</span>
+                        <span class="tag">Fast rename</span>
+                        <span class="tag">Efficient storage</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Features Section -->
+    <section class="features">
+        <div class="container">
+            <h2 class="section-title">Everything your agent needs</h2>
+            <p class="section-subtitle">Search, store, and manage files — all through a familiar filesystem interface.</p>
+
+            <div class="features-grid">
+                <!-- Feature 1: Semantic Search -->
+                <div class="feature-card">
+                    <div class="feature-icon">🔍</div>
+                    <h3>Semantic search, built in</h3>
+                    <p>Find files by meaning. Auto-embeddings and vector search powered by TiDB Cloud — no external pipeline, no API keys in your code.</p>
+                    <div class="code-block">
+                        <code># Search for configs related to deployment<br>
+$ dat9 search "deploy to production" --limit 5<br>
+<br>
+/config/prod.env<br>
+/scripts/deploy.sh<br>
+/docs/deployment.md</code>
+                    </div>
+                    <div class="replaces">
+                        <span class="replaces-label">replaces</span>
+                        <span class="replaces-item">vector DB</span>
+                        <span class="replaces-item">embedding pipeline</span>
+                    </div>
+                </div>
+
+                <!-- Feature 2: FUSE Mount -->
+                <div class="feature-card">
+                    <div class="feature-icon">📂</div>
+                    <h3>Mount like local storage</h3>
+                    <p>FUSE mount puts dat9 at a local path. Use <code>ls</code>, <code>cat</code>, <code>vim</code>, <code>cp</code> directly on your remote data.</p>
+                    <div class="code-block">
+                        <code>$ dat9 mount /mnt/dat9<br>
+Mounted dat9 at /mnt/dat9<br>
+<br>
+$ ls /mnt/dat9/data/<br>
+dataset.tar  config.json  logs/<br>
+<br>
+$ cat /mnt/dat9/config.json | jq .</code>
+                    </div>
+                    <div class="replaces">
+                        <span class="replaces-label">replaces</span>
+                        <span class="replaces-item">S3 clients</span>
+                        <span class="replaces-item">sync tools</span>
+                    </div>
+                </div>
+
+                <!-- Feature 3: Tiered Context -->
+                <div class="feature-card">
+                    <div class="feature-icon">📚</div>
+                    <h3>Smart summaries</h3>
+                    <p>Every directory can carry summary files. Agents scan cheaply before loading full content — saving tokens and time.</p>
+                    <div class="code-block">
+                        <code>$ dat9 cat :/data/.summary.md<br>
+Dataset: Image classification training data<br>
+Size: 50K images, 10 classes<br>
+Format: PNG, 224x224<br>
+Updated: 2024-01-15</code>
+                    </div>
+                    <div class="replaces">
+                        <span class="replaces-label">replaces</span>
+                        <span class="replaces-item">manual summarization</span>
+                        <span class="replaces-item">context overflow</span>
+                    </div>
+                </div>
+
+                <!-- Feature 4: Zero-Copy Operations -->
+                <div class="feature-card">
+                    <div class="feature-icon">⚡</div>
+                    <h3>Zero-copy cp & mv</h3>
+                    <p>Copy files without re-upload. Rename instantly. All metadata operations — no data movement, no storage cost for duplicates.</p>
+                    <div class="code-block">
+                        <code># Zero-copy link — no re-upload<br>
+$ dat9 cp :/data/file.bin :/backup/file.bin<br>
+Linked in 0.003s<br>
+<br>
+# Metadata-only rename<br>
+$ dat9 mv :/old/name.txt :/new/name.txt<br>
+Renamed in 0.001s</code>
+                    </div>
+                    <div class="replaces">
+                        <span class="replaces-label">replaces</span>
+                        <span class="replaces-item">duplicate storage</span>
+                        <span class="replaces-item">slow renames</span>
+                    </div>
+                </div>
+
+                <!-- Feature 5: Go SDK -->
+                <div class="feature-card">
+                    <div class="feature-icon">🚀</div>
+                    <h3>Native Go SDK</h3>
+                    <p>Build agent tools with the Go SDK. Streaming, resume support, and context cancellation built in.</p>
+                    <div class="code-block">
+                        <code>import "github.com/mem9-ai/dat9/pkg/client"<br>
+<br>
+c := client.New("http://localhost:9009", "")<br>
+data, _ := c.Read("/config.json")<br>
+c.Write("/output.json", result)</code>
+                    </div>
+                    <div class="replaces">
+                        <span class="replaces-label">replaces</span>
+                        <span class="replaces-item">S3 SDKs</span>
+                        <span class="replaces-item">HTTP boilerplate</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Highlights Section -->
+    <section class="highlights">
+        <div class="container">
+            <div class="highlights-grid">
+                <div class="highlight-card">
+                    <div class="highlight-icon">🔍</div>
+                    <h4>Semantic Search</h4>
+                    <p>Find files by meaning with vector similarity and full-text search</p>
+                </div>
+                <div class="highlight-card">
+                    <div class="highlight-icon">⚡</div>
+                    <h4>Zero-Copy</h4>
+                    <p>Instant copy and rename without data movement</p>
+                </div>
+                <div class="highlight-card">
+                    <div class="highlight-icon">🏷️</div>
+                    <h4>Tagging</h4>
+                    <p>Organize and filter files with key-value tags</p>
+                </div>
+                <div class="highlight-card">
+                    <div class="highlight-icon">⬆️</div>
+                    <h4>Resumable Uploads</h4>
+                    <p>Reliable upload with automatic resume support</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- CLI Section -->
+    <section class="cli-section" id="cli">
+        <div class="container">
+            <h2 class="section-title">Unix-like CLI</h2>
+            <p class="section-subtitle">Familiar commands for a networked filesystem.</p>
+
+            <div class="cli-examples">
+                <div class="cli-example">
+                    <div class="cli-example-header">
+                        <span class="cli-example-prompt">$</span>
+                        <span class="cli-example-cmd">dat9 cp ./local.txt :/remote/path.txt</span>
+                    </div>
+                    <p class="cli-example-desc">Upload a file to dat9. Files are stored and indexed automatically.</p>
+                </div>
+
+                <div class="cli-example">
+                    <div class="cli-example-header">
+                        <span class="cli-example-prompt">$</span>
+                        <span class="cli-example-cmd">dat9 cat :/config/settings.json</span>
+                    </div>
+                    <p class="cli-example-desc">Read file contents to stdout. Works with pipes and redirects.</p>
+                </div>
+
+                <div class="cli-example">
+                    <div class="cli-example-header">
+                        <span class="cli-example-prompt">$</span>
+                        <span class="cli-example-cmd">dat9 ls :/data/</span>
+                    </div>
+                    <p class="cli-example-desc">List directory contents. Shows size, modified time, and type.</p>
+                </div>
+
+                <div class="cli-example">
+                    <div class="cli-example-header">
+                        <span class="cli-example-prompt">$</span>
+                        <span class="cli-example-cmd">dat9 cp :/data/a.bin :/shared/a.bin</span>
+                    </div>
+                    <p class="cli-example-desc">Zero-copy link — same file, new path. No re-upload, no extra storage.</p>
+                </div>
+
+                <div class="cli-example">
+                    <div class="cli-example-header">
+                        <span class="cli-example-prompt">$</span>
+                        <span class="cli-example-cmd">dat9 mv :/old/name.txt :/new/name.txt</span>
+                    </div>
+                    <p class="cli-example-desc">Rename or move. Metadata-only operation, instant completion.</p>
+                </div>
+
+                <div class="cli-example">
+                    <div class="cli-example-header">
+                        <span class="cli-example-prompt">$</span>
+                        <span class="cli-example-cmd">dat9 mount /mnt/dat9</span>
+                    </div>
+                    <p class="cli-example-desc">Mount as local filesystem. Use standard tools directly on dat9 data.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- SDK Section -->
+    <section class="sdk-section" id="sdk">
+        <div class="container">
+            <h2 class="section-title">Go SDK</h2>
+            <p class="section-subtitle">Build agent tools with streaming, resume, and context support.</p>
+
+            <div class="sdk-code">
+                <div class="code-window">
+                    <div class="code-window-header">
+                        <div class="code-window-dots">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                        </div>
+                        <span class="code-window-title">main.go</span>
+                    </div>
+                    <pre class="code-window-content"><code><span class="code-keyword">package</span> main
+
+<span class="code-keyword">import</span> (
+    <span class="code-string">"context"</span>
+    <span class="code-string">"fmt"</span>
+    <span class="code-string">"log"</span>
+    
+    <span class="code-string">"github.com/mem9-ai/dat9/pkg/client"</span>
+)
+
+<span class="code-keyword">func</span> <span class="code-function">main</span>() {
+    ctx := context.Background()
+    
+    <span class="code-comment">// Create client</span>
+    c := client.New(<span class="code-string">"http://localhost:9009"</span>, <span class="code-string">""</span>)
+    
+    <span class="code-comment">// Write file</span>
+    err := c.Write(ctx, <span class="code-string">"/data/hello.txt"</span>, []byte(<span class="code-string">"Hello, dat9!"</span>))
+    <span class="code-keyword">if</span> err != <span class="code-keyword">nil</span> {
+        log.Fatal(err)
+    }
+    
+    <span class="code-comment">// Read file</span>
+    data, err := c.Read(ctx, <span class="code-string">"/data/hello.txt"</span>)
+    <span class="code-keyword">if</span> err != <span class="code-keyword">nil</span> {
+        log.Fatal(err)
+    }
+    fmt.Println(<span class="code-keyword">string</span>(data))
+    
+    <span class="code-comment">// List directory</span>
+    entries, err := c.List(ctx, <span class="code-string">"/data/"</span>)
+    <span class="code-keyword">if</span> err != <span class="code-keyword">nil</span> {
+        log.Fatal(err)
+    }
+    <span class="code-keyword">for</span> _, e := <span class="code-keyword">range</span> entries {
+        fmt.Println(e.Name, e.Size, e.ModTime)
+    }
+    
+    <span class="code-comment">// Zero-copy link</span>
+    err = c.Copy(ctx, <span class="code-string">"/data/hello.txt"</span>, <span class="code-string">"/backup/hello.txt"</span>)
+    <span class="code-keyword">if</span> err != <span class="code-keyword">nil</span> {
+        log.Fatal(err)
+    }
+}</code></pre>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- CTA Section -->
+    <section class="cta-section">
+        <div class="container">
+            <h2 class="cta-title">Start building in seconds</h2>
+            <p class="cta-subtitle">One command to install. One command to start. Zero config.</p>
+            
+            <div class="cli-box cta-cli">
+                <div class="cli-header">
+                    <span class="cli-label">Install</span>
+                    <button class="cli-copy" onclick="copyToClipboard(this)">
+                        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                        </svg>
+                    </button>
+                </div>
+                <code class="cli-code">$ curl -fsSL https://dat9.ai/install | sh</code>
+            </div>
+
+            <div class="cta-links">
+                <a href="https://github.com/mem9-ai/dat9" target="_blank" class="cta-button primary">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                        <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                    </svg>
+                    View on GitHub
+                </a>
+                <a href="https://github.com/mem9-ai/dat9/blob/main/README.md" target="_blank" class="cta-button secondary">
+                    Read Docs
+                </a>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container">
+            <div class="footer-grid">
+                <div class="footer-brand">
+                    <a href="#" class="logo">
+                        <span class="logo-icon">◆</span>
+                        <span class="logo-text">dat9</span>
+                    </a>
+                    <p class="footer-tagline">Network drive with semantic search for AI agents.</p>
+
+                </div>
+                <div class="footer-links">
+                    <h4>Resources</h4>
+                    <a href="https://github.com/mem9-ai/dat9" target="_blank">GitHub</a>
+                    <a href="https://github.com/mem9-ai/dat9/blob/main/README.md" target="_blank">Documentation</a>
+                    <a href="skill.md">Skill File</a>
+                </div>
+                <div class="footer-links">
+                    <h4>Community</h4>
+                    <a href="https://github.com/mem9-ai/dat9/issues" target="_blank">Issues</a>
+                    <a href="https://github.com/mem9-ai/dat9/discussions" target="_blank">Discussions</a>
+                </div>
+            </div>
+            <div class="footer-bottom">
+                <p>Apache 2.0 License. Built for AI agents.</p>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        function copyToClipboard(button) {
+            const code = button.closest('.cli-box').querySelector('.cli-code').textContent;
+            const cleanCode = code.replace(/^\$\s*/, '');
+            navigator.clipboard.writeText(cleanCode).then(() => {
+                const original = button.innerHTML;
+                button.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+                setTimeout(() => {
+                    button.innerHTML = original;
+                }, 2000);
+            });
+        }
+
+        // Smooth scroll for navigation
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function (e) {
+                e.preventDefault();
+                const target = document.querySelector(this.getAttribute('href'));
+                if (target) {
+                    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+            });
+        });
+
+        // Add glow effect to feature cards on mouse move
+        document.querySelectorAll('.feature-card').forEach(card => {
+            card.addEventListener('mousemove', (e) => {
+                const rect = card.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const y = e.clientY - rect.top;
+                card.style.setProperty('--mouse-x', `${x}px`);
+                card.style.setProperty('--mouse-y', `${y}px`);
+            });
+        });
+    </script>
+</body>
+</html>
