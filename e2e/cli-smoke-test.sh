@@ -3,10 +3,14 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE="${DAT9_BASE:-http://127.0.0.1:9009}"
-DAT9_IMAGE_FIXTURE_URL="${DAT9_IMAGE_FIXTURE_URL:-https://upload.wikimedia.org/wikipedia/commons/3/3a/Cat03.jpg}"
+DAT9_IMAGE_FIXTURE_PATH="${DAT9_IMAGE_FIXTURE_PATH:-$SCRIPT_DIR/fixtures/cat03.jpg}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
+CLI_SOURCE="${CLI_SOURCE:-build}"
+CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://dat9.ai/releases}"
+CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
 CLI_LARGE_FILE_MB="${CLI_LARGE_FILE_MB:-100}"
 CLI_BATCH_SMALL_FILE_COUNT="${CLI_BATCH_SMALL_FILE_COUNT:-10}"
 CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
@@ -45,11 +49,75 @@ check_cmd() {
   fi
 }
 
+detect_release_target() {
+  case "$(uname -s)" in
+    Linux) CLI_RELEASE_OS="linux" ;;
+    Darwin) CLI_RELEASE_OS="darwin" ;;
+    *)
+      echo "unsupported OS for official CLI download: $(uname -s)" >&2
+      return 1
+      ;;
+  esac
+
+  case "$(uname -m)" in
+    x86_64|amd64) CLI_RELEASE_ARCH="amd64" ;;
+    aarch64|arm64) CLI_RELEASE_ARCH="arm64" ;;
+    *)
+      echo "unsupported architecture for official CLI download: $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+}
+
+download_official_cli() {
+  local target_version="$CLI_RELEASE_VERSION"
+  detect_release_target || return 1
+  if [ -z "$target_version" ]; then
+    target_version=$(curl -fsSL "$CLI_RELEASE_BASE_URL/version" | tr -d '[:space:]')
+  fi
+  if [ -z "$target_version" ]; then
+    echo "failed to resolve release version from $CLI_RELEASE_BASE_URL/version" >&2
+    return 1
+  fi
+  curl -fsSL "$CLI_RELEASE_BASE_URL/dat9-$CLI_RELEASE_OS-$CLI_RELEASE_ARCH" -o "$CLI_BIN"
+  chmod +x "$CLI_BIN"
+  local actual_version
+  actual_version="$($CLI_BIN --version 2>/dev/null | awk '{print $2}')"
+  if [ -n "$CLI_RELEASE_VERSION" ] && [ "$actual_version" != "$CLI_RELEASE_VERSION" ]; then
+    echo "downloaded version mismatch: expected=$CLI_RELEASE_VERSION actual=$actual_version" >&2
+    return 1
+  fi
+  echo "downloaded official dat9 $actual_version for $CLI_RELEASE_OS/$CLI_RELEASE_ARCH" >&2
+}
+
+prepare_cli_binary() {
+  CLI_BIN="$(mktemp)"
+  case "$CLI_SOURCE" in
+    build)
+      go build -o "$CLI_BIN" ./cmd/dat9
+      ;;
+    official)
+      download_official_cli
+      ;;
+    *)
+      echo "invalid CLI_SOURCE: $CLI_SOURCE (expected build|official)" >&2
+      return 1
+      ;;
+  esac
+}
+
 echo "=== dat9 CLI smoke test ==="
 echo "BASE=$BASE"
+echo "CLI_SOURCE=$CLI_SOURCE"
+echo "IMAGE_FIXTURE=$DAT9_IMAGE_FIXTURE_PATH"
 
 check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
-check_cmd "go is available" bash -c 'command -v go >/dev/null'
+if [ "$CLI_SOURCE" = "build" ]; then
+  check_cmd "go is available" bash -c 'command -v go >/dev/null'
+else
+  check_cmd "curl is available" bash -c 'command -v curl >/dev/null'
+fi
+check_cmd "local image fixture exists" test -s "$DAT9_IMAGE_FIXTURE_PATH"
 
 echo "[1] provision tenant"
 pfile="$(mktemp)"
@@ -77,10 +145,9 @@ while :; do
 done
 check_eq "tenant becomes active" "$state" "active"
 
-echo "[3] build dat9 cli"
-CLI_BIN="$(mktemp)"
-go build -o "$CLI_BIN" ./cmd/dat9
-check_cmd "dat9 binary built" test -x "$CLI_BIN"
+echo "[3] prepare dat9 cli"
+prepare_cli_binary
+check_cmd "dat9 binary ready" test -x "$CLI_BIN"
 
 dat9() {
   DAT9_SERVER="$BASE" DAT9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
@@ -279,7 +346,7 @@ wait_cli_grep_target "cli semantic grep includes cat-story target" "feline sofa"
 wait_cli_grep_target "cli semantic grep includes dog-story target" "canine field" "$SEM_TEXT_OTHER"
 
 echo "[6.2] cli image-associated recall checks"
-curl -fsSL "$DAT9_IMAGE_FIXTURE_URL" -o "$IMAGE_LOCAL"
+cp "$DAT9_IMAGE_FIXTURE_PATH" "$IMAGE_LOCAL"
 check_cmd "local cli jpg fixture exists" test -s "$IMAGE_LOCAL"
 dat9_retry fs cp "$IMAGE_LOCAL" ":$IMAGE_REMOTE" >/dev/null
 printf "This image shows a cat face icon." > "/tmp/dat9-cli-image-caption-${TS}.txt"

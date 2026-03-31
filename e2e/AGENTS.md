@@ -38,6 +38,12 @@ export DAT9_BASE="https://xkopoerih4.execute-api.ap-southeast-1.amazonaws.com"
 
 Use this value unless the environment owner announces a new endpoint.
 
+## Prod endpoint
+
+```bash
+export DAT9_BASE="https://api.dat9.ai"
+```
+
 ## Coverage
 
 ### `api-smoke-test.sh`
@@ -67,7 +73,7 @@ Use this value unless the environment owner announces a new endpoint.
 ### `cli-smoke-test.sh`
 
 1. Provision + readiness polling
-2. Build local `dat9` CLI binary
+2. Prepare `dat9` CLI binary (build local or download official release)
 3. CLI small-file flow (`cp`, `ls`, `cat`, `mv`, `rm`)
 4. CLI batch small-file flow (`cp` many files + dir list count + stat + sample reads)
 5. CLI search flow (`fs grep`, `fs find`)
@@ -79,7 +85,7 @@ Use this value unless the environment owner announces a new endpoint.
 ### `fuse-smoke-test.sh`
 
 1. Provision + readiness polling
-2. Build local `dat9` CLI binary
+2. Prepare `dat9` CLI binary (build local or download official release)
 3. Mount compatibility precheck for root `stat /`
 4. RW mount lifecycle (`dat9 mount`, `dat9 umount`)
 5. File semantics (`create`, `read`, `overwrite`, `append`, `truncate`, `unlink`)
@@ -107,6 +113,7 @@ Notes:
 | Variable | Default | Used by |
 |----------|---------|---------|
 | `DAT9_BASE` | `http://127.0.0.1:9009` | all scripts |
+| `DAT9_IMAGE_FIXTURE_PATH` | `e2e/fixtures/cat03.jpg` | `api-smoke-test.sh`, `cli-smoke-test.sh` |
 | `DAT9_API_KEY` | - | `api-smoke-test-existing-key.sh` |
 | `POLL_TIMEOUT_S` | `120` (smoke), `60` (existing-key) | polling scripts |
 | `POLL_INTERVAL_S` | `5` | polling scripts |
@@ -127,6 +134,9 @@ Notes:
 | `CLI_UPLOAD_LIMIT_BYTES` | `1073741824` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_TIMEOUT_S` | `90` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_INTERVAL_S` | `3` | `cli-smoke-test.sh` |
+| `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh` |
+| `CLI_RELEASE_BASE_URL` | `https://dat9.ai/releases` | `cli-smoke-test.sh`, `fuse-smoke-test.sh` |
+| `CLI_RELEASE_VERSION` | *(latest)* | `cli-smoke-test.sh`, `fuse-smoke-test.sh` |
 | `MOUNT_READY_TIMEOUT_S` | `20` | `fuse-smoke-test.sh` |
 | `MOUNT_READY_INTERVAL_S` | `1` | `fuse-smoke-test.sh` |
 | `FUSE_MOUNT_ROOT` | `/tmp` | `fuse-smoke-test.sh` |
