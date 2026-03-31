@@ -29,10 +29,13 @@ func TestSmallInDB(t *testing.T) {
 	}
 }
 
-func TestUsesTiDBAutoEmbeddingDefaultsRemainDisabled(t *testing.T) {
-	for _, provider := range []string{ProviderTiDBZero, ProviderTiDBCloudStarter, ProviderDB9} {
-		if UsesTiDBAutoEmbedding(provider) {
-			t.Fatalf("provider %s should remain on app-managed embedding until rollout switch", provider)
+func TestUsesTiDBAutoEmbedding(t *testing.T) {
+	for _, provider := range []string{ProviderTiDBZero, ProviderTiDBCloudStarter} {
+		if !UsesTiDBAutoEmbedding(provider) {
+			t.Fatalf("provider %s should use TiDB auto-embedding mode", provider)
 		}
+	}
+	if UsesTiDBAutoEmbedding(ProviderDB9) {
+		t.Fatal("db9 should remain on app-managed embedding")
 	}
 }

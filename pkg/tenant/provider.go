@@ -22,13 +22,11 @@ func SmallInDB(provider string) bool {
 }
 
 // UsesTiDBAutoEmbedding reports whether the provider should run the TiDB
-// database-managed auto-embedding mode. The foundation phase keeps this
-// disabled so provider defaults remain unchanged until the rollout switch
-// lands in a dedicated follow-up commit.
+// database-managed auto-embedding mode.
 func UsesTiDBAutoEmbedding(provider string) bool {
 	switch provider {
 	case ProviderTiDBZero, ProviderTiDBCloudStarter:
-		return false
+		return true
 	default:
 		return false
 	}
