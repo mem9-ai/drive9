@@ -594,10 +594,6 @@ func (b *Dat9Backend) CopyFileCtx(ctx context.Context, srcPath, dstPath string) 
 	})
 }
 
-func (b *Dat9Backend) deleteBlob(ref string) {
-	b.deleteBlobCtx(backgroundWithTrace(), ref)
-}
-
 func (b *Dat9Backend) deleteBlobCtx(ctx context.Context, ref string) {
 	if b.s3 != nil && ref != "" {
 		if err := b.s3.DeleteObject(ctx, ref); err != nil {
