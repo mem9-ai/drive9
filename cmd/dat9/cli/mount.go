@@ -80,14 +80,28 @@ func UmountCmd(args []string) error {
 	}
 	mountPoint := args[0]
 
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("umount", mountPoint)
-	default:
-		cmd = exec.Command("fusermount", "-u", mountPoint)
+	argv, err := umountArgv(runtime.GOOS, exec.LookPath, mountPoint)
+	if err != nil {
+		return err
 	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func umountArgv(goos string, lookPath func(string) (string, error), mountPoint string) ([]string, error) {
+	if goos == "darwin" {
+		return []string{"umount", mountPoint}, nil
+	}
+	if _, err := lookPath("fusermount3"); err == nil {
+		return []string{"fusermount3", "-u", mountPoint}, nil
+	}
+	if _, err := lookPath("fusermount"); err == nil {
+		return []string{"fusermount", "-u", mountPoint}, nil
+	}
+	if _, err := lookPath("umount"); err == nil {
+		return []string{"umount", mountPoint}, nil
+	}
+	return nil, fmt.Errorf("umount: no supported unmount binary found (tried fusermount3, fusermount, umount)")
 }
