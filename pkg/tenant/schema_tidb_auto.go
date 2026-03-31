@@ -8,8 +8,9 @@ import (
 	"strings"
 )
 
+// Reference of Auto Embedding in TiDB Cloud: https://docs.pingcap.com/ai/vector-search-auto-embedding-amazon-titan/
 const (
-	tidbAutoEmbeddingModel      = "openai/text-embedding-3-small"
+	tidbAutoEmbeddingModel      = "tidbcloud_free/amazon/titan-embed-text-v2"
 	tidbAutoEmbeddingDimensions = 1024
 )
 
