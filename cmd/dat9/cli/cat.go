@@ -13,11 +13,17 @@ import (
 // Uses ReadStream to handle both small files (direct) and large files (presigned URL).
 //
 //	dat9 cat /path/to/file
+//	dat9 cat :/path/to/file
 func Cat(c *client.Client, args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: dat9 cat <path>")
 	}
-	rc, err := c.ReadStream(context.Background(), args[0])
+	path := args[0]
+	// Handle ":" prefixed remote paths like cp command
+	if rp, isRemote := ParseRemote(path); isRemote {
+		path = rp.Path
+	}
+	rc, err := c.ReadStream(context.Background(), path)
 	if err != nil {
 		return err
 	}
