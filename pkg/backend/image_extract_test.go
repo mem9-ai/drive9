@@ -66,6 +66,32 @@ func TestAsyncImageExtractUpdatesContentText(t *testing.T) {
 	}
 }
 
+func TestAsyncImageExtractAutoEmbeddingUpdatesContentTextWithoutSemanticTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: &staticImageExtractor{text: "cat on sofa screenshot invoice"},
+		},
+	})
+
+	if _, err := b.Write("/img/auto.png", []byte("fake-png"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	got := waitForContentText(t, b, "/img/auto.png", 2*time.Second)
+	if !strings.Contains(got, "cat on sofa") {
+		t.Fatalf("unexpected extracted text: %q", got)
+	}
+
+	fileID, _, _, _ := mustFileForPath(t, b, "/img/auto.png")
+	if tasks := loadSemanticTasksForFile(t, b, fileID); len(tasks) != 0 {
+		t.Fatalf("semantic task count=%d, want 0", len(tasks))
+	}
+}
+
 func TestAsyncImageExtractSkipsStaleChecksum(t *testing.T) {
 	extractor := &gatedImageExtractor{
 		started: make(chan struct{}, 1),
@@ -98,6 +124,45 @@ func TestAsyncImageExtractSkipsStaleChecksum(t *testing.T) {
 	got := waitForContentText(t, b, "/img/b.png", 3*time.Second)
 	if got != "new caption" {
 		t.Fatalf("expected final extracted text %q, got %q", "new caption", got)
+	}
+}
+
+func TestAsyncImageExtractAutoEmbeddingStaleResultDoesNotQueueOrOverwriteCurrentText(t *testing.T) {
+	extractor := &gatedImageExtractor{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: extractor,
+		},
+	})
+
+	if _, err := b.Write("/img/auto-stale.png", []byte("first-image-bytes"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-extractor.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first extraction did not start")
+	}
+
+	fileID, _, _, _ := mustFileForPath(t, b, "/img/auto-stale.png")
+	if _, err := b.Write("/img/auto-stale.png", []byte("second-image-bytes"), 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	close(extractor.release)
+
+	got := waitForContentText(t, b, "/img/auto-stale.png", 3*time.Second)
+	if got != "new caption" {
+		t.Fatalf("expected final extracted text %q, got %q", "new caption", got)
+	}
+	if tasks := loadSemanticTasksForFile(t, b, fileID); len(tasks) != 0 {
+		t.Fatalf("semantic task count=%d, want 0", len(tasks))
 	}
 }
 
