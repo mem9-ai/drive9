@@ -25,9 +25,9 @@ const (
 	defaultSemanticLeaseDuration        = 30 * time.Second
 	defaultSemanticRecoverInterval      = 5 * time.Second
 	defaultSemanticRetryBaseDelay       = 200 * time.Millisecond
+	defaultSemanticRetryMaxDelay        = 30 * time.Second
 	defaultSemanticTenantScanLimit      = 128
 	defaultSemanticPerTenantConcurrency = 1
-	maxSemanticRetryDelay               = 30 * time.Second
 	semanticLocalTenantID               = "local"
 )
 
@@ -38,6 +38,7 @@ type SemanticWorkerOptions struct {
 	LeaseDuration        time.Duration
 	RecoverInterval      time.Duration
 	RetryBaseDelay       time.Duration
+	RetryMaxDelay        time.Duration
 	TenantScanLimit      int
 	PerTenantConcurrency int
 }
@@ -57,6 +58,12 @@ func (o *SemanticWorkerOptions) normalize() {
 	}
 	if o.RetryBaseDelay <= 0 {
 		o.RetryBaseDelay = defaultSemanticRetryBaseDelay
+	}
+	if o.RetryMaxDelay <= 0 {
+		o.RetryMaxDelay = defaultSemanticRetryMaxDelay
+	}
+	if o.RetryMaxDelay < o.RetryBaseDelay {
+		o.RetryMaxDelay = o.RetryBaseDelay
 	}
 	if o.TenantScanLimit <= 0 {
 		o.TenantScanLimit = defaultSemanticTenantScanLimit
@@ -303,12 +310,12 @@ func (m *semanticWorkerManager) retryDelay(attemptCount int) time.Duration {
 	delay := m.opts.RetryBaseDelay
 	for i := 1; i < attemptCount; i++ {
 		delay *= 2
-		if delay >= maxSemanticRetryDelay {
-			return maxSemanticRetryDelay
+		if delay >= m.opts.RetryMaxDelay {
+			return m.opts.RetryMaxDelay
 		}
 	}
-	if delay > maxSemanticRetryDelay {
-		return maxSemanticRetryDelay
+	if delay > m.opts.RetryMaxDelay {
+		return m.opts.RetryMaxDelay
 	}
 	return delay
 }

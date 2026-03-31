@@ -410,6 +410,35 @@ func TestSemanticWorkerUnsupportedTaskTypeDeadLetters(t *testing.T) {
 	waitForNamedTaskStatus(t, b, "task-generate-l0", string(semantic.TaskDeadLettered), 3*time.Second)
 }
 
+func TestSemanticWorkerRetryDelayHonorsConfiguredMax(t *testing.T) {
+	m := newSemanticWorkerManager(newTestBackendForSemanticWorker(t), nil, nil, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{
+		RetryBaseDelay: 200 * time.Millisecond,
+		RetryMaxDelay:  2 * time.Second,
+	})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	if got := m.retryDelay(1); got != 200*time.Millisecond {
+		t.Fatalf("retryDelay(1)=%v, want %v", got, 200*time.Millisecond)
+	}
+	if got := m.retryDelay(4); got != 1600*time.Millisecond {
+		t.Fatalf("retryDelay(4)=%v, want %v", got, 1600*time.Millisecond)
+	}
+	if got := m.retryDelay(5); got != 2*time.Second {
+		t.Fatalf("retryDelay(5)=%v, want %v", got, 2*time.Second)
+	}
+}
+
+func TestSemanticWorkerNormalizeRetryMaxDelayAtLeastBase(t *testing.T) {
+	var opts SemanticWorkerOptions
+	opts.RetryBaseDelay = 5 * time.Second
+	opts.RetryMaxDelay = time.Second
+	opts.normalize()
+	if opts.RetryMaxDelay != opts.RetryBaseDelay {
+		t.Fatalf("RetryMaxDelay=%v, want %v", opts.RetryMaxDelay, opts.RetryBaseDelay)
+	}
+}
+
 func mustServerFile(t *testing.T, b *backend.Dat9Backend, path string) *datastore.File {
 	t.Helper()
 	nf, err := b.Store().Stat(context.Background(), path)
