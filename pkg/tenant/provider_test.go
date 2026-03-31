@@ -28,3 +28,11 @@ func TestSmallInDB(t *testing.T) {
 		t.Fatal("db9 should not store small files in db")
 	}
 }
+
+func TestUsesTiDBAutoEmbeddingDefaultsRemainDisabled(t *testing.T) {
+	for _, provider := range []string{ProviderTiDBZero, ProviderTiDBCloudStarter, ProviderDB9} {
+		if UsesTiDBAutoEmbedding(provider) {
+			t.Fatalf("provider %s should remain on app-managed embedding until rollout switch", provider)
+		}
+	}
+}

@@ -22,6 +22,10 @@ const (
 type Options struct {
 	AsyncImageExtract AsyncImageExtractOptions
 	QueryEmbedding    QueryEmbeddingOptions
+	// DatabaseAutoEmbedding marks backends whose semantic text is embedded by the
+	// database rather than the app-managed embed worker. The initial foundation
+	// commit only stores this mode bit; follow-up commits split runtime behavior.
+	DatabaseAutoEmbedding bool
 }
 
 // AsyncImageExtractOptions controls async image->text extraction.
@@ -41,6 +45,8 @@ type QueryEmbeddingOptions struct {
 }
 
 func (b *Dat9Backend) configureOptions(opts Options) {
+	b.databaseAutoEmbedding = opts.DatabaseAutoEmbedding
+
 	if opts.QueryEmbedding.Client != nil {
 		b.queryEmbedder = opts.QueryEmbedding.Client
 	} else {
