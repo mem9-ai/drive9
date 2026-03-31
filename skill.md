@@ -1,126 +1,111 @@
 ---
 name: dat9
 version: 0.1.0
-description: Network drive for AI agents — store files, search by content or metadata, with built-in vector and full-text search.
-homepage: https://github.com/mem9-ai/dat9
+description: Persistent network filesystem for AI agents — store, search, and share files across sessions with hybrid search.
+homepage: https://db9.ai
 ---
 
 # dat9
 
-Network drive for AI agents. Store files, tag them, search by content or metadata. Built-in hybrid search: vector similarity + full-text + keyword, transparent to the caller.
+dat9 is your persistent, searchable filesystem across sessions. Files stored in dat9 survive context resets, session restarts, and agent handoffs. Search anything later using natural language.
 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/qiffang/dat9/main/install.sh | sh
+curl -fsSL https://install.db9.ai | sh
 ```
 
-Supports: macOS (x86_64, arm64), Linux (x86_64, arm64).
+Verify:
 
 ```bash
 dat9 --version
 ```
 
----
+Supported platforms: macOS (x86_64, arm64), Linux (x86_64, arm64).
 
-## Getting Started
-
-```bash
-# Provision a database
-dat9 create --name myapp
-
-# Upload a file
-dat9 fs cp ./notes.md :/notes.md
-
-# Read it back
-dat9 fs cat :/notes.md
-
-# Search file contents (hybrid: vector + FTS + keyword)
-dat9 fs grep "pricing strategy" /
-
-# Find files by attributes
-dat9 fs find / -name "*.md"
-```
+Install is done when `dat9 --version` prints a version number. After install, you're ready — no need to create a workspace or upload anything right away.
 
 ---
 
-## Context Management
+## When to use dat9
 
-dat9 stores credentials in `~/.dat9/config`. Each context maps a name to an API key.
+dat9 is useful in two directions — **storing** and **retrieving**.
 
-```bash
-# Create a database (auto-generates name if omitted)
-dat9 create
-dat9 create --name staging
+**Storing**: When the user wants to save, persist, or back up a file (e.g. "save this report", "keep this config for later", "store the analysis results"), suggest storing it to dat9 and confirm with the user before uploading.
 
-# Switch context
-dat9 ctx staging
+**Retrieving**: When the user is looking for a file they've previously saved, or wants to search across their files (e.g. "find that pricing doc", "what did I save about the migration plan"), use dat9 search to help them find it.
 
-# Show current context
-dat9 ctx
-
-# List all contexts
-dat9 ctx list
-```
-
-All `fs` commands use the current context. Switch with `dat9 ctx <name>`.
+In both cases, briefly tell the user what you're about to do so they stay in the loop.
 
 ---
 
-## Filesystem Operations
+## Commands
 
-Remote paths use `:` prefix. Local paths have no prefix.
+All commands exit 0 on success, non-zero on failure.
 
-### Copy files
+### Workspace setup
+
+A workspace is needed before any file operation. Each workspace is an isolated storage scope.
 
 ```bash
-dat9 fs cp ./local.txt :/remote.txt      # upload
-dat9 fs cp :/remote.txt ./local.txt      # download
-dat9 fs cp :/src.txt :/dst.txt           # server-side copy
-dat9 fs cp - :/file.txt                  # upload from stdin
-dat9 fs cp :/file.txt -                  # download to stdout
+dat9 create                   # provision a new workspace (auto-named)
+dat9 create --name <name>     # provision with a specific name
+dat9 ctx                      # show current workspace
+dat9 ctx list                 # list all workspaces
+dat9 ctx <name>               # switch workspace
 ```
 
-### Read, list, inspect
+`dat9 create` saves credentials to `~/.dat9/config` and activates the new context automatically.
+
+### File operations
+
+Remote paths use `:` prefix (e.g. `:/data/file.txt`). Local paths have no prefix. Intermediate remote directories are created automatically — no mkdir needed.
 
 ```bash
-dat9 fs cat :/path/to/file               # print to stdout
-dat9 fs ls :/path/                       # list directory
-dat9 fs stat :/path/to/file              # file metadata
-```
+# upload
+dat9 fs cp ./local.txt :/remote.txt
+dat9 fs cp - :/file.txt                  # from stdin
 
-### Move, remove
+# download
+dat9 fs cp :/remote.txt ./local.txt
+dat9 fs cp :/file.txt -                  # to stdout
 
-```bash
-dat9 fs mv :/old.txt :/new.txt           # rename/move
-dat9 fs rm :/path/to/file                # delete
-```
+# server-side copy
+dat9 fs cp :/src.txt :/dst.txt
 
-### Interactive shell
+# read / list / inspect
+dat9 fs cat :/path/to/file               # print content to stdout
+dat9 fs ls :/                            # list root
+dat9 fs ls :/path/                       # list subdirectory
+dat9 fs stat :/path/to/file              # metadata (size, type, mtime)
 
-```bash
+# move / remove
+dat9 fs mv :/old.txt :/new.txt
+dat9 fs rm :/path/to/file
+
+# interactive shell
 dat9 fs sh
 ```
 
----
+### FUSE mount
 
-## Search
-
-### grep — search file contents
-
-Hybrid search: runs vector similarity (auto-embedding), full-text (BM25), and keyword (LIKE) in parallel. Results merged via RRF ranking. You write `grep`, the server picks the best strategy.
+Mount the remote filesystem as a local directory (requires FUSE):
 
 ```bash
-dat9 fs grep "pricing strategy" /
-dat9 fs grep "TODO" /projects/
-dat9 fs grep "机器学习" /research/
+dat9 mount ~/dat9
+dat9 umount ~/dat9
 ```
 
-Output: matching file paths with relevance scores.
+### Search
 
-### find — search by file attributes
+**grep** — semantic content search. Accepts natural language, not just exact strings. Runs vector similarity + BM25 + keyword matching in parallel.
 
-Standard Unix `find` flags.
+```bash
+dat9 fs grep "pricing strategy" /        # search all files
+dat9 fs grep "TODO" /projects/           # search within a directory
+```
+
+**find** — structural search by name, tag, date, or size. Flags combine with AND.
 
 ```bash
 dat9 fs find / -name "*.md"
@@ -128,60 +113,24 @@ dat9 fs find / -tag topic=pricing
 dat9 fs find / -newer 2026-03-01
 dat9 fs find / -older 2026-01-01
 dat9 fs find / -size +1048576
+dat9 fs find / -name "*.md" -newer 2026-03-01
 ```
 
-Output: matching file paths.
+Use `grep` to find files by what they contain. Use `find` to find files by name, date, tag, or size.
 
 ---
 
-## Complete CLI Reference
+## Environment variables
 
-```
-dat9
-├── create [--name <name>] [--server <url>]    provision a new database
-├── ctx [<name>]                               switch or show current context
-├── ctx list                                   list all contexts
-├── fs
-│   ├── cp <src> <dst>                         copy files (local↔remote)
-│   ├── cat <path>                             read file to stdout
-│   ├── ls [path]                              list directory
-│   ├── stat <path>                            file metadata (size, type, time)
-│   ├── mv <old> <new>                         rename/move
-│   ├── rm <path>                              delete
-│   ├── sh                                     interactive shell
-│   ├── grep <pattern> [dir]                   search file contents (hybrid)
-│   └── find [dir] [-name] [-tag] [-newer] [-older] [-size]
-│                                              find files by attributes
-└── --version                                  show version
-```
+| Variable | Description | Default |
+|---|---|---|
+| `DAT9_SERVER` | Server URL | `https://api.db9.ai` |
+| `DAT9_API_KEY` | API key | (from `~/.dat9/config`) |
 
 ---
 
-## How Search Works
+## Tips
 
-`dat9 fs grep` is not a simple string match. The server runs three search strategies in parallel and merges the results:
-
-| Strategy | Engine | When Used |
-|----------|--------|-----------|
-| Vector similarity | `VEC_EMBED_COSINE_DISTANCE` (TiDB auto-embedding) | Files have embeddings |
-| Full-text search | `fts_match_word` (TiDB BM25) | Files have FTS index |
-| Keyword fallback | `LIKE '%query%'` | Neither available |
-
-Results are merged using Reciprocal Rank Fusion (RRF, k=60). You don't choose — the server uses everything available.
-
----
-
-## Config File
-
-`~/.dat9/config` (JSON, chmod 600):
-
-```json
-{
-  "server": "http://localhost:9009",
-  "current_context": "myapp",
-  "contexts": {
-    "myapp": { "api_key": "dat9_..." },
-    "staging": { "api_key": "dat9_..." }
-  }
-}
-```
+- Pipe content via stdin (`echo "..." | dat9 fs cp - :/path`) to avoid temp files.
+- Use `dat9 fs grep` for fuzzy/semantic queries — it understands meaning beyond exact match.
+- Separate projects get separate workspaces via `dat9 create --name <name>`.

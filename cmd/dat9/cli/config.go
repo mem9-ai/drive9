@@ -83,7 +83,7 @@ func (c *Config) ResolveServer() string {
 	if c.Server != "" {
 		return c.Server
 	}
-	return "http://localhost:9009"
+	return "https://api.db9.ai"
 }
 
 const nameChars = "abcdefghijklmnopqrstuvwxyz0123456789"
