@@ -221,10 +221,18 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 				oldStorageRef = oldRef
 			}
 
-			newRev, err := b.store.UpdateFileContentTx(tx,
-				existingFileID.String, datastore.StorageS3, upload.S3Key,
-				contentType, "", "", nil, upload.TotalSize,
-			)
+			var newRev int64
+			if b.UsesDatabaseAutoEmbedding() {
+				newRev, err = b.store.UpdateFileContentAutoEmbeddingTx(tx,
+					existingFileID.String, datastore.StorageS3, upload.S3Key,
+					contentType, "", "", nil, upload.TotalSize,
+				)
+			} else {
+				newRev, err = b.store.UpdateFileContentTx(tx,
+					existingFileID.String, datastore.StorageS3, upload.S3Key,
+					contentType, "", "", nil, upload.TotalSize,
+				)
+			}
 			if err != nil {
 				return err
 			}
@@ -241,7 +249,7 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			if err != nil {
 				return err
 			}
-			if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "") {
+			if !b.UsesDatabaseAutoEmbedding() && b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "") {
 				return b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
 			}
 			return nil
@@ -250,22 +258,30 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			return err
 		}
 
-		now := time.Now().UTC()
-		res, err := tx.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
-			size_bytes = ?, checksum_sha256 = NULL, content_text = NULL,
-			embedding = NULL, embedding_revision = NULL,
-			status = 'CONFIRMED', confirmed_at = ?
-			WHERE file_id = ? AND status = 'PENDING'`,
-			datastore.StorageS3, upload.S3Key, contentType, upload.TotalSize, now, upload.FileID)
-		if err != nil {
-			return err
-		}
-		rowsAffected, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if rowsAffected == 0 {
-			return datastore.ErrNotFound
+		if b.UsesDatabaseAutoEmbedding() {
+			if err := b.store.ConfirmPendingFileAutoEmbeddingTx(tx,
+				upload.FileID, datastore.StorageS3, upload.S3Key, contentType, upload.TotalSize,
+			); err != nil {
+				return err
+			}
+		} else {
+			now := time.Now().UTC()
+			res, err := tx.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
+				size_bytes = ?, checksum_sha256 = NULL, content_text = NULL,
+				embedding = NULL, embedding_revision = NULL,
+				status = 'CONFIRMED', confirmed_at = ?
+				WHERE file_id = ? AND status = 'PENDING'`,
+				datastore.StorageS3, upload.S3Key, contentType, upload.TotalSize, now, upload.FileID)
+			if err != nil {
+				return err
+			}
+			rowsAffected, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if rowsAffected == 0 {
+				return datastore.ErrNotFound
+			}
 		}
 		confirmedFileID = upload.FileID
 		confirmedRevision = 1
@@ -279,7 +295,7 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		}); err != nil {
 			return err
 		}
-		if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "") {
+		if !b.UsesDatabaseAutoEmbedding() && b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "") {
 			return b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
 		}
 		return nil

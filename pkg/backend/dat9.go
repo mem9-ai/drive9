@@ -354,7 +354,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}); err != nil {
 			return err
 		}
-		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText) {
+		if !b.UsesDatabaseAutoEmbedding() && b.shouldEnqueueEmbedForRevision(path, contentType, contentText) {
 			return b.enqueueEmbedTaskTx(tx, fileID, 1)
 		}
 		return nil
@@ -420,14 +420,21 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 	var newRev int64
 	err := b.store.InTx(ctx, func(tx *sql.Tx) error {
 		var txErr error
-		newRev, txErr = b.store.UpdateFileContentTx(tx,
-			nf.File.FileID, storageType, storageRef,
-			contentType, checksum, contentText, contentBlob, int64(len(finalData)),
-		)
+		if b.UsesDatabaseAutoEmbedding() {
+			newRev, txErr = b.store.UpdateFileContentAutoEmbeddingTx(tx,
+				nf.File.FileID, storageType, storageRef,
+				contentType, checksum, contentText, contentBlob, int64(len(finalData)),
+			)
+		} else {
+			newRev, txErr = b.store.UpdateFileContentTx(tx,
+				nf.File.FileID, storageType, storageRef,
+				contentType, checksum, contentText, contentBlob, int64(len(finalData)),
+			)
+		}
 		if txErr != nil {
 			return txErr
 		}
-		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText) {
+		if !b.UsesDatabaseAutoEmbedding() && b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText) {
 			return b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
 		}
 		return nil

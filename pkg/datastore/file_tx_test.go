@@ -111,6 +111,48 @@ func TestClearFileEmbeddingStateTx(t *testing.T) {
 	}
 }
 
+func TestUpdateFileContentAutoEmbeddingTxPreservesEmbeddingState(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID:      "f1",
+		StorageType: StorageDB9,
+		StorageRef:  "/blobs/f1",
+		ContentType: "text/plain",
+		SizeBytes:   10,
+		Revision:    1,
+		Status:      StatusConfirmed,
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	setEmbeddingRevision(t, s, "f1", 9)
+
+	var newRev int64
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		var err error
+		newRev, err = s.UpdateFileContentAutoEmbeddingTx(tx, "f1", StorageDB9, "/blobs/f1-v2", "text/markdown", "sum-2", "new text", []byte("blob-2"), 22)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if newRev != 2 {
+		t.Fatalf("new revision=%d, want 2", newRev)
+	}
+
+	got, err := s.GetFile(context.Background(), "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Revision != 2 || got.StorageRef != "/blobs/f1-v2" || got.ContentText != "new text" {
+		t.Fatalf("unexpected updated file: %+v", got)
+	}
+	if got.EmbeddingRevision == nil || *got.EmbeddingRevision != 9 {
+		t.Fatalf("embedding revision should be preserved, got %v", got.EmbeddingRevision)
+	}
+}
+
 func TestEnqueueSemanticTaskTxRollsBackWithOuterTransaction(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now().UTC()
