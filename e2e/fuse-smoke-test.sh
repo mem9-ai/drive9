@@ -9,6 +9,9 @@ POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-20}"
 MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
 FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
+CLI_SOURCE="${CLI_SOURCE:-build}"
+CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://dat9.ai/releases}"
+CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
 CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
 
@@ -52,6 +55,63 @@ check_cmd_fail() {
     echo "PASS $desc"
     PASS=$((PASS + 1))
   fi
+}
+
+detect_release_target() {
+  case "$(uname -s)" in
+    Linux) CLI_RELEASE_OS="linux" ;;
+    Darwin) CLI_RELEASE_OS="darwin" ;;
+    *)
+      echo "unsupported OS for official CLI download: $(uname -s)" >&2
+      return 1
+      ;;
+  esac
+
+  case "$(uname -m)" in
+    x86_64|amd64) CLI_RELEASE_ARCH="amd64" ;;
+    aarch64|arm64) CLI_RELEASE_ARCH="arm64" ;;
+    *)
+      echo "unsupported architecture for official CLI download: $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+}
+
+download_official_cli() {
+  local target_version="$CLI_RELEASE_VERSION"
+  detect_release_target || return 1
+  if [ -z "$target_version" ]; then
+    target_version=$(curl -fsSL "$CLI_RELEASE_BASE_URL/version" | tr -d '[:space:]')
+  fi
+  if [ -z "$target_version" ]; then
+    echo "failed to resolve release version from $CLI_RELEASE_BASE_URL/version" >&2
+    return 1
+  fi
+  curl -fsSL "$CLI_RELEASE_BASE_URL/dat9-$CLI_RELEASE_OS-$CLI_RELEASE_ARCH" -o "$CLI_BIN"
+  chmod +x "$CLI_BIN"
+  local actual_version
+  actual_version="$($CLI_BIN --version 2>/dev/null | awk '{print $2}')"
+  if [ -n "$CLI_RELEASE_VERSION" ] && [ "$actual_version" != "$CLI_RELEASE_VERSION" ]; then
+    echo "downloaded version mismatch: expected=$CLI_RELEASE_VERSION actual=$actual_version" >&2
+    return 1
+  fi
+  echo "downloaded official dat9 $actual_version for $CLI_RELEASE_OS/$CLI_RELEASE_ARCH" >&2
+}
+
+prepare_cli_binary() {
+  CLI_BIN="$(mktemp)"
+  case "$CLI_SOURCE" in
+    build)
+      go build -o "$CLI_BIN" ./cmd/dat9
+      ;;
+    official)
+      download_official_cli
+      ;;
+    *)
+      echo "invalid CLI_SOURCE: $CLI_SOURCE (expected build|official)" >&2
+      return 1
+      ;;
+  esac
 }
 
 skip() {
@@ -218,9 +278,14 @@ stop_mount() {
 
 echo "=== dat9 FUSE smoke test ==="
 echo "BASE=$BASE"
+echo "CLI_SOURCE=$CLI_SOURCE"
 
 check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
-check_cmd "go is available" bash -c 'command -v go >/dev/null'
+if [ "$CLI_SOURCE" = "build" ]; then
+  check_cmd "go is available" bash -c 'command -v go >/dev/null'
+else
+  check_cmd "curl is available" bash -c 'command -v curl >/dev/null'
+fi
 check_cmd "python3 is available" bash -c 'command -v python3 >/dev/null'
 
 if [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
@@ -228,8 +293,8 @@ if [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 if [ "$(uname -s)" = "Linux" ]; then
-  if ! command -v fusermount >/dev/null 2>&1; then
-    skip "fusermount is required for Linux FUSE unmount"
+  if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
+    skip "fusermount/fusermount3 is required for Linux FUSE unmount"
   fi
   if [ ! -e /dev/fuse ]; then
     skip "/dev/fuse not available"
@@ -263,10 +328,9 @@ while :; do
 done
 check_eq "tenant becomes active" "$state" "active"
 
-echo "[3] build dat9 cli"
-CLI_BIN="$(mktemp)"
-go build -o "$CLI_BIN" ./cmd/dat9
-check_cmd "dat9 binary built" test -x "$CLI_BIN"
+echo "[3] prepare dat9 cli"
+prepare_cli_binary
+check_cmd "dat9 binary ready" test -x "$CLI_BIN"
 
 dat9() {
   DAT9_SERVER="$BASE" DAT9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
