@@ -174,13 +174,13 @@ func buildVectorSearchByTextQuery(queryText, pathPrefix string, limit int) (stri
 		conds = append(conds, cond)
 		args = append(args, pargs...)
 	}
-	args = append(args, queryText, limit)
+	args = append(args, limit)
 
 	q := `SELECT fn.path, fn.name, f.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(f.embedding, ?) AS distance
 		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
 		WHERE ` + strings.Join(conds, " AND ") + `
-		ORDER BY VEC_EMBED_COSINE_DISTANCE(f.embedding, ?)
+		ORDER BY distance
 		LIMIT ?`
 	return q, args, true
 }
