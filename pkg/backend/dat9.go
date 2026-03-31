@@ -345,7 +345,10 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}); err != nil {
 			return err
 		}
-		return b.enqueueEmbedTaskTx(tx, fileID, 1)
+		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText) {
+			return b.enqueueEmbedTaskTx(tx, fileID, 1)
+		}
+		return nil
 	}); err != nil {
 		if storageType == datastore.StorageS3 {
 			b.deleteBlobCtx(ctx, storageRef)
@@ -415,7 +418,10 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		if txErr != nil {
 			return txErr
 		}
-		return b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
+		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText) {
+			return b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
+		}
+		return nil
 	})
 	if err != nil {
 		if storageType == datastore.StorageS3 {

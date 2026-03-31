@@ -104,6 +104,25 @@ func TestWriteCreateEnqueuesEmbedTask(t *testing.T) {
 	}
 }
 
+func TestWriteCreateSkipsEmbedTaskWithoutTextSource(t *testing.T) {
+	b := newTestBackend(t)
+	if _, err := b.Write("/data/blob.bin", []byte{0, 1, 2, 3}, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	fileID, revision, embeddingRevision, _ := mustFileForPath(t, b, "/data/blob.bin")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	if embeddingRevision != nil {
+		t.Fatalf("embedding revision should be nil before worker, got %v", *embeddingRevision)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 0 {
+		t.Fatalf("semantic task count=%d, want 0", len(tasks))
+	}
+}
+
 func TestWriteOverwriteEnqueuesNextRevisionAndClearsEmbeddingState(t *testing.T) {
 	b := newTestBackend(t)
 	if _, err := b.Write("/f.txt", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -132,7 +151,35 @@ func TestWriteOverwriteEnqueuesNextRevisionAndClearsEmbeddingState(t *testing.T)
 	}
 }
 
-func TestConfirmUploadEnqueuesEmbedTask(t *testing.T) {
+func TestWriteOverwriteSkipsEmbedTaskWithoutTextSource(t *testing.T) {
+	b := newTestBackend(t)
+	if _, err := b.Write("/f", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/f")
+	setStoredEmbeddingState(t, b, fileID, 1)
+
+	if _, err := b.Write("/f", []byte{0, 1, 2, 3}, 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	_, revision, embeddingRevision, _ := mustFileForPath(t, b, "/f")
+	if revision != 2 {
+		t.Fatalf("revision=%d, want 2", revision)
+	}
+	if embeddingRevision != nil {
+		t.Fatalf("embedding revision should be cleared, got %v", *embeddingRevision)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+	if tasks[0].ResourceVersion != 1 {
+		t.Fatalf("unexpected semantic task history: %+v", tasks)
+	}
+}
+
+func TestConfirmUploadSkipsEmbedTaskWithoutTextSource(t *testing.T) {
 	b := newTestBackendWithS3(t)
 	ctx := context.Background()
 	totalSize := int64(2 << 20)
@@ -157,12 +204,12 @@ func TestConfirmUploadEnqueuesEmbedTask(t *testing.T) {
 		t.Fatalf("content_type=%q, want %q", contentType, detectContentType("/bigfile.txt", nil))
 	}
 	tasks := loadSemanticTasksForFile(t, b, fileID)
-	if len(tasks) != 1 || tasks[0].ResourceVersion != 1 || tasks[0].TaskType != string(semantic.TaskTypeEmbed) {
-		t.Fatalf("unexpected upload semantic tasks: %+v", tasks)
+	if len(tasks) != 0 {
+		t.Fatalf("semantic task count=%d, want 0", len(tasks))
 	}
 }
 
-func TestConfirmUploadOverwriteEnqueuesNextRevisionAndRebindsUpload(t *testing.T) {
+func TestConfirmUploadOverwriteSkipsEmbedTaskWithoutTextSourceAndRebindsUpload(t *testing.T) {
 	b := newTestBackendWithS3(t)
 	ctx := context.Background()
 	if _, err := b.Write("/report.txt", []byte("old body"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -201,7 +248,10 @@ func TestConfirmUploadOverwriteEnqueuesNextRevisionAndRebindsUpload(t *testing.T
 		t.Fatalf("content_type=%q, want %q", contentType, detectContentType("/report.txt", nil))
 	}
 	tasks := loadSemanticTasksForFile(t, b, fileID)
-	if len(tasks) != 2 || tasks[1].ResourceVersion != 2 || tasks[1].TaskType != string(semantic.TaskTypeEmbed) {
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+	if tasks[0].ResourceVersion != 1 || tasks[0].TaskType != string(semantic.TaskTypeEmbed) {
 		t.Fatalf("unexpected overwrite upload semantic tasks: %+v", tasks)
 	}
 	upload, err := b.GetUpload(ctx, plan.UploadID)
@@ -217,5 +267,33 @@ func TestConfirmUploadOverwriteEnqueuesNextRevisionAndRebindsUpload(t *testing.T
 	}
 	if deletedStatus != "DELETED" {
 		t.Fatalf("pending upload file status=%q, want DELETED", deletedStatus)
+	}
+}
+
+func TestShouldEnqueueEmbedForRevisionWithSynchronousText(t *testing.T) {
+	b := newTestBackend(t)
+	if !b.shouldEnqueueEmbedForRevision("/docs/a.txt", "text/plain", "hello world") {
+		t.Fatal("expected synchronous text content to enqueue embed work")
+	}
+}
+
+func TestShouldEnqueueEmbedForRevisionWithAsyncImageSource(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: &staticImageExtractor{text: "caption"},
+		},
+	})
+	if !b.shouldEnqueueEmbedForRevision("/img/a.png", "application/octet-stream", "") {
+		t.Fatal("expected image path with async extractor to enqueue embed work")
+	}
+}
+
+func TestShouldEnqueueEmbedForRevisionWithoutTextSource(t *testing.T) {
+	b := newTestBackend(t)
+	if b.shouldEnqueueEmbedForRevision("/bin/a.bin", "application/octet-stream", "") {
+		t.Fatal("generic binary object should not enqueue embed work without text source")
 	}
 }

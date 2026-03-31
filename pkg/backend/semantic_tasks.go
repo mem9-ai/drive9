@@ -2,6 +2,7 @@ package backend
 
 import (
 	"database/sql"
+	"strings"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/semantic"
@@ -26,4 +27,21 @@ func newEmbedTask(taskID, fileID string, revision int64, now time.Time) *semanti
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
+}
+
+func (b *Dat9Backend) shouldEnqueueEmbedForRevision(path, contentType, contentText string) bool {
+	if strings.TrimSpace(contentText) != "" {
+		return true
+	}
+	return b.hasAsyncImageTextSource(path, contentType)
+}
+
+func (b *Dat9Backend) hasAsyncImageTextSource(path, contentType string) bool {
+	if !b.imageExtractEnabled || b.imageExtractor == nil {
+		return false
+	}
+	if isImageContentType(contentType) {
+		return true
+	}
+	return isImageContentType(contentTypeFromPath(path))
 }

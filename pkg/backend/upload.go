@@ -240,7 +240,10 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			if err != nil {
 				return err
 			}
-			return b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
+			if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "") {
+				return b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
+			}
+			return nil
 		}
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -275,7 +278,10 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		}); err != nil {
 			return err
 		}
-		return b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
+		if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "") {
+			return b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
+		}
+		return nil
 	}); err != nil {
 		logger.Error(ctx, "backend_confirm_upload_tx_failed", zap.String("upload_id", uploadID), zap.Error(err))
 		metrics.RecordOperation("backend", "confirm_upload", "error", time.Since(start))
