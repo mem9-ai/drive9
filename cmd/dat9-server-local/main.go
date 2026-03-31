@@ -128,7 +128,7 @@ environment:
   DAT9_LISTEN_ADDR serve listen address (default: 127.0.0.1:9009)
   DAT9_PUBLIC_URL  externally reachable base URL (optional for loopback listen address)
   DAT9_LOCAL_DSN   local tenant TiDB/MySQL DSN (required)
-  DAT9_LOCAL_INIT_SCHEMA initialize tenant schema on startup (default: true)
+  DAT9_LOCAL_INIT_SCHEMA initialize tenant schema on startup (default: false)
   DAT9_S3_DIR      local S3 mock root directory (default: /tmp/dat9-local-s3)
 
   Query embedding (app-side semantic query embedding for grep):

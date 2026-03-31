@@ -6,7 +6,8 @@
 #
 # Example:
 #   source ./scripts/dat9-server-local-env.sh
-#   go run ./cmd/dat9-server-local
+#   export DAT9_LOCAL_INIT_SCHEMA=true   # only for disposable local databases
+#   make run-server-local
 
 # Server basics
 : "${DAT9_LISTEN_ADDR:=127.0.0.1:9009}"
@@ -16,7 +17,7 @@
 # Create the database ahead of time, for example:
 #   mycli --host 127.0.0.1 --port 4000 -u root -e "CREATE DATABASE IF NOT EXISTS dat9_local;"
 : "${DAT9_LOCAL_DSN:=root@tcp(127.0.0.1:4000)/dat9_local?parseTime=true}"
-: "${DAT9_LOCAL_INIT_SCHEMA:=true}"
+: "${DAT9_LOCAL_INIT_SCHEMA:=false}"
 
 # Local mock S3 mode.
 : "${DAT9_S3_DIR:=${TMPDIR:-/tmp}/dat9-local-s3}"
@@ -39,11 +40,8 @@
 : "${DAT9_SEMANTIC_PER_TENANT_CONCURRENCY:=1}"
 
 # Query embedding.
-# Leave these unset to reuse the background embedder configured above.
-: "${DAT9_QUERY_EMBED_API_BASE:=${DAT9_EMBED_API_BASE}}"
-: "${DAT9_QUERY_EMBED_API_KEY:=${DAT9_EMBED_API_KEY}}"
-: "${DAT9_QUERY_EMBED_MODEL:=${DAT9_EMBED_MODEL}}"
-: "${DAT9_QUERY_EMBED_TIMEOUT_SECONDS:=20}"
+# Leave DAT9_QUERY_EMBED_* unset by default so dat9-server-local exercises the
+# same embedder-reuse path as dat9-server when only DAT9_EMBED_* is configured.
 
 # Optional: image extract bridge validation.
 : "${DAT9_IMAGE_EXTRACT_ENABLED:=false}"
@@ -66,10 +64,6 @@ export DAT9_SEMANTIC_RECOVER_INTERVAL_MS
 export DAT9_SEMANTIC_RETRY_BASE_MS
 export DAT9_SEMANTIC_RETRY_MAX_MS
 export DAT9_SEMANTIC_PER_TENANT_CONCURRENCY
-export DAT9_QUERY_EMBED_API_BASE
-export DAT9_QUERY_EMBED_API_KEY
-export DAT9_QUERY_EMBED_MODEL
-export DAT9_QUERY_EMBED_TIMEOUT_SECONDS
 export DAT9_IMAGE_EXTRACT_ENABLED
 export DAT9_IMAGE_EXTRACT_QUEUE_SIZE
 export DAT9_IMAGE_EXTRACT_WORKERS
