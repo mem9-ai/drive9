@@ -51,7 +51,7 @@ func Mount(opts *MountOptions) error {
 
 	// Create client and verify connectivity
 	c := client.New(opts.Server, opts.APIKey)
-	if _, err := c.Stat("/"); err != nil {
+	if _, err := c.List("/"); err != nil {
 		return fmt.Errorf("cannot reach dat9 server: %w", err)
 	}
 
