@@ -55,7 +55,10 @@ func TestBuildVectorSearchByTextQueryOmitsRevisionFilter(t *testing.T) {
 	if !strings.Contains(q, "VEC_EMBED_COSINE_DISTANCE(f.embedding, ?)") {
 		t.Fatalf("text-query vector SQL missing distance expression: %s", q)
 	}
-	wantArgs := []any{"semantic probe", "/docs", "/docs/%", "semantic probe", 7}
+	if !strings.Contains(q, "ORDER BY distance") {
+		t.Fatalf("text-query vector SQL should order by projected alias: %s", q)
+	}
+	wantArgs := []any{"semantic probe", "/docs", "/docs/%", 7}
 	if !reflect.DeepEqual(args, wantArgs) {
 		t.Fatalf("text-query vector args=%#v, want %#v", args, wantArgs)
 	}
