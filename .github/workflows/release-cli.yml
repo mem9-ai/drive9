@@ -11,6 +11,10 @@ on:
       - 'Makefile'
   workflow_dispatch:
 
+concurrency:
+  group: release-cli
+  cancel-in-progress: true
+
 jobs:
   release:
     name: Build and publish CLI
@@ -68,4 +72,5 @@ jobs:
           git add site/releases/
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "release: dat9 CLI ${{ env.VERSION }}"
+          git pull --rebase
           git push
