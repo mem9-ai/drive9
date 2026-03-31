@@ -24,9 +24,19 @@ type Client struct {
 // New creates a new dat9 client.
 func New(baseURL, apiKey string) *Client {
 	return &Client{
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		apiKey:     apiKey,
-		httpClient: http.DefaultClient,
+		baseURL: strings.TrimRight(baseURL, "/"),
+		apiKey:  apiKey,
+		httpClient: &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) > 0 && req.URL.Host != via[0].URL.Host {
+					req.Header.Del("Authorization")
+				}
+				if len(via) >= 10 {
+					return fmt.Errorf("too many redirects")
+				}
+				return nil
+			},
+		},
 	}
 }
 
