@@ -24,11 +24,16 @@ import (
 )
 
 const (
-	defaultListenAddr = "127.0.0.1:9009"
-	defaultS3Dir      = "/tmp/dat9-local-s3"
+	defaultListenAddr     = "127.0.0.1:9009"
+	defaultS3Dir          = "/tmp/dat9-local-s3"
+	envLocalEmbeddingMode = "DAT9_LOCAL_EMBEDDING_MODE"
 )
 
 func main() {
+	startupCtx := context.Background()
+	startupStart := time.Now()
+	logLocalStartupStep(startupCtx, startupStart, startupStart, "process_start")
+
 	if len(os.Args) > 2 {
 		usage()
 	}
@@ -44,36 +49,63 @@ func main() {
 	}
 	defer func() { _ = srvLogger.Sync() }()
 	logger.Set(srvLogger)
+	logLocalStartupStep(startupCtx, startupStart, time.Now(), "logger_ready")
 
 	localDSN := strings.TrimSpace(os.Getenv("DAT9_LOCAL_DSN"))
 	if localDSN == "" {
 		die(fmt.Errorf("DAT9_LOCAL_DSN is required"))
 	}
-	localInitSchema := envBool("DAT9_LOCAL_INIT_SCHEMA", true)
+	localInitSchema := envBool("DAT9_LOCAL_INIT_SCHEMA", false)
+	requestedEmbeddingMode, explicitEmbeddingMode, err := localEmbeddingModeFromEnv()
+	if err != nil {
+		die(err)
+	}
 
 	// Local validation should be able to bootstrap a fresh tenant database without
 	// going through the multi-tenant provision flow.
 	if localInitSchema {
-		if err := tenant.InitTiDBTenantSchema(localDSN); err != nil {
+		stepStart := time.Now()
+		initMode := requestedEmbeddingMode
+		if !explicitEmbeddingMode {
+			initMode = tenant.TiDBEmbeddingModeAuto
+		}
+		if err := localTiDBSchemaInitializer(localDSN, initMode); err != nil {
 			die(fmt.Errorf("init local tenant schema: %w", err))
 		}
+		logLocalStartupStep(startupCtx, startupStart, stepStart, "init_local_tenant_schema",
+			zap.String("embedding_mode", string(initMode)))
 	}
 
+	stepStart := time.Now()
 	store, err := datastore.Open(localDSN)
 	if err != nil {
 		die(fmt.Errorf("open local datastore: %w", err))
 	}
 	defer func() { _ = store.Close() }()
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "open_local_datastore")
 
+	stepStart = time.Now()
 	backendOpts, err := buildBackendOptionsFromEnv()
 	if err != nil {
 		die(err)
 	}
-	backendOpts.DatabaseAutoEmbedding = shouldUseLocalDatabaseAutoEmbedding(store.DB(), localInitSchema)
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "build_backend_options")
+
+	stepStart = time.Now()
+	localEmbeddingMode, err := detectLocalTiDBEmbeddingMode(store.DB(), localInitSchema, requestedEmbeddingMode, explicitEmbeddingMode)
+	if err != nil {
+		die(fmt.Errorf("detect local embedding mode: %w", err))
+	}
+	backendOpts.DatabaseAutoEmbedding = localEmbeddingMode == tenant.TiDBEmbeddingModeAuto
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "detect_local_embedding_mode",
+		zap.String("embedding_mode", string(localEmbeddingMode)))
+
+	stepStart = time.Now()
 	semanticEmbedder, workerOpts, err := buildSemanticWorkerConfigFromEnv()
 	if err != nil {
 		die(err)
 	}
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "build_semantic_worker_config")
 	// Keep the local entrypoint aligned with dat9-server: if only the background
 	// embedder is configured, grep reuses it for app-side query embedding.
 	if semanticEmbedder != nil && backendOpts.QueryEmbedding.Client == nil {
@@ -83,17 +115,22 @@ func main() {
 	s3Dir := envOr("DAT9_S3_DIR", defaultS3Dir)
 	// Even in local single-tenant mode we keep the same S3-facing upload code path
 	// by backing it with the local mock implementation.
+	stepStart = time.Now()
 	localS3, err := s3client.NewLocal(s3Dir, publicBaseURL(addr)+"/s3")
 	if err != nil {
 		die(fmt.Errorf("create local s3: %w", err))
 	}
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_local_s3")
 
+	stepStart = time.Now()
 	b, err := backend.NewWithS3ModeAndOptions(store, localS3, true, backendOpts)
 	if err != nil {
 		die(fmt.Errorf("create local backend: %w", err))
 	}
 	defer b.Close()
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_local_backend")
 
+	stepStart = time.Now()
 	srv := server.NewWithConfig(server.Config{
 		Backend:          b,
 		LocalS3:          localS3,
@@ -103,23 +140,30 @@ func main() {
 		SemanticWorkers:  workerOpts,
 	})
 	defer srv.Close()
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_server")
 
-	logger.Info(context.Background(), "local_server_mode",
+	logger.Info(startupCtx, "local_server_mode",
 		zap.String("listen_addr", addr),
 		zap.String("local_dsn", redactDSN(localDSN)),
 		zap.String("s3_dir", s3Dir),
 		zap.Bool("local_init_schema", localInitSchema),
-		zap.Bool("database_auto_embedding", backendOpts.DatabaseAutoEmbedding))
+		zap.String("requested_embedding_mode", localEmbeddingModeLabel(requestedEmbeddingMode, explicitEmbeddingMode)),
+		zap.String("embedding_mode", string(localEmbeddingMode)),
+		zap.Bool("database_auto_embedding", backendOpts.DatabaseAutoEmbedding),
+		zap.Duration("startup_elapsed", time.Since(startupStart)))
 
 	// Bind first so we can emit a definitive "started" log only after the socket
 	// is actually listening.
+	stepStart = time.Now()
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		die(fmt.Errorf("listen: %w", err))
 	}
-	logger.Info(context.Background(), "local_server_started",
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "listen")
+	logger.Info(startupCtx, "local_server_started",
 		zap.String("listen_addr", addr),
-		zap.String("public_url", publicBaseURL(addr)))
+		zap.String("public_url", publicBaseURL(addr)),
+		zap.Duration("startup_elapsed", time.Since(startupStart)))
 	defer func() { _ = ln.Close() }()
 
 	die(http.Serve(ln, srv))
@@ -133,6 +177,7 @@ environment:
   DAT9_PUBLIC_URL  externally reachable base URL (optional for loopback listen address)
   DAT9_LOCAL_DSN   local tenant TiDB/MySQL DSN (required)
   DAT9_LOCAL_INIT_SCHEMA initialize tenant schema on startup (default: false)
+  DAT9_LOCAL_EMBEDDING_MODE auto|app|detect (default: auto when initing schema, detect otherwise)
   DAT9_S3_DIR      local S3 mock root directory (default: /tmp/dat9-local-s3)
 
   Query embedding (app-side semantic query embedding for grep):
@@ -199,18 +244,75 @@ func publicBaseURL(listenAddr string) string {
 	}
 }
 
-var localAutoEmbeddingSchemaValidator = func(db *sql.DB) error {
-	return tenant.ValidateTiDBSchemaForMode(db, tenant.TiDBEmbeddingModeAuto)
+func logLocalStartupStep(ctx context.Context, startupStart, stepStart time.Time, step string, extra ...zap.Field) {
+	fields := []zap.Field{
+		zap.String("step", step),
+		zap.Duration("elapsed", time.Since(stepStart)),
+		zap.Duration("startup_elapsed", time.Since(startupStart)),
+	}
+	fields = append(fields, extra...)
+	logger.Info(ctx, "local_server_startup_step", fields...)
 }
 
-func shouldUseLocalDatabaseAutoEmbedding(db *sql.DB, schemaInitialized bool) bool {
+var (
+	localTiDBEmbeddingModeDetector = tenant.DetectTiDBEmbeddingMode
+	localTiDBSchemaValidator       = tenant.ValidateTiDBSchemaForMode
+	localTiDBSchemaInitializer     = tenant.InitTiDBTenantSchemaForMode
+)
+
+func detectLocalTiDBEmbeddingMode(db *sql.DB, schemaInitialized bool, requestedMode tenant.TiDBEmbeddingMode, explicitMode bool) (tenant.TiDBEmbeddingMode, error) {
+	if explicitMode {
+		if schemaInitialized {
+			return requestedMode, nil
+		}
+		if db == nil {
+			return tenant.TiDBEmbeddingModeUnknown, fmt.Errorf("nil db")
+		}
+		if err := localTiDBSchemaValidator(db, requestedMode); err != nil {
+			return tenant.TiDBEmbeddingModeUnknown, err
+		}
+		return requestedMode, nil
+	}
 	if schemaInitialized {
-		return true
+		return tenant.TiDBEmbeddingModeAuto, nil
 	}
 	if db == nil {
-		return false
+		return tenant.TiDBEmbeddingModeUnknown, fmt.Errorf("nil db")
 	}
-	return localAutoEmbeddingSchemaValidator(db) == nil
+	mode, err := localTiDBEmbeddingModeDetector(db)
+	if err != nil {
+		return tenant.TiDBEmbeddingModeUnknown, err
+	}
+	if mode != tenant.TiDBEmbeddingModeAuto && mode != tenant.TiDBEmbeddingModeApp {
+		return tenant.TiDBEmbeddingModeUnknown, fmt.Errorf("unsupported TiDB embedding mode %q", mode)
+	}
+	if err := localTiDBSchemaValidator(db, mode); err != nil {
+		return tenant.TiDBEmbeddingModeUnknown, err
+	}
+	return mode, nil
+}
+
+func localEmbeddingModeFromEnv() (tenant.TiDBEmbeddingMode, bool, error) {
+	raw := strings.TrimSpace(os.Getenv(envLocalEmbeddingMode))
+	switch strings.ToLower(raw) {
+	case "":
+		return tenant.TiDBEmbeddingModeUnknown, false, nil
+	case "detect":
+		return tenant.TiDBEmbeddingModeUnknown, false, nil
+	case "auto", string(tenant.TiDBEmbeddingModeAuto):
+		return tenant.TiDBEmbeddingModeAuto, true, nil
+	case "app", string(tenant.TiDBEmbeddingModeApp):
+		return tenant.TiDBEmbeddingModeApp, true, nil
+	default:
+		return tenant.TiDBEmbeddingModeUnknown, false, fmt.Errorf("%s must be one of auto, app, or detect", envLocalEmbeddingMode)
+	}
+}
+
+func localEmbeddingModeLabel(mode tenant.TiDBEmbeddingMode, explicit bool) string {
+	if !explicit {
+		return "detect"
+	}
+	return string(mode)
 }
 
 func buildBackendOptionsFromEnv() (backend.Options, error) {
