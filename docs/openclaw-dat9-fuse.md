@@ -2,7 +2,7 @@
 name: dat9-fuse-openclaw
 version: 0.1.0
 description: Use dat9 FUSE as OpenClaw workspace storage for persistent files.
-homepage: https://github.com/mem9-ai/dat9
+homepage: https://dat9.ai
 ---
 
 # dat9 FUSE for OpenClaw
@@ -38,22 +38,28 @@ dat9 mount "$HOME/dat9-openclaw"
 
 Keep this process running in a tmux/screen session or as a service.
 
-## 3) Point OpenClaw HOME/workspace into the mount
+## 3) Run OpenClaw in an isolated shell rooted on the mount
+
+Do not overwrite your global shell `HOME`. Use a subshell so only OpenClaw
+state/config writes into dat9.
 
 ```bash
 mkdir -p "$HOME/dat9-openclaw/openclaw-home"
-export HOME="$HOME/dat9-openclaw/openclaw-home"
-openclaw --version
+(
+  export HOME="$HOME/dat9-openclaw/openclaw-home"
+  openclaw --version
+)
 ```
-
-OpenClaw state now persists under the mounted dat9 filesystem.
 
 ## 4) Skill/plugin operations (example)
 
 ```bash
-openclaw plugins --help
-openclaw plugins install @tencent-weixin/openclaw-weixin
-openclaw plugins list
+(
+  export HOME="$HOME/dat9-openclaw/openclaw-home"
+  openclaw plugins --help
+  openclaw plugins install @tencent-weixin/openclaw-weixin
+  openclaw plugins list
+)
 ```
 
 If remote registry throttles (`429`) or plugin install is memory-heavy, retry later or use a larger instance.
@@ -62,7 +68,7 @@ If remote registry throttles (`429`) or plugin install is memory-heavy, retry la
 
 ```bash
 # Write via mounted path
-echo "openclaw-fuse-ok" > "$HOME/fuse-check.txt"
+echo "openclaw-fuse-ok" > "$HOME/dat9-openclaw/openclaw-home/fuse-check.txt"
 
 # Read via dat9 API/CLI path
 dat9 fs cat /openclaw-home/fuse-check.txt
