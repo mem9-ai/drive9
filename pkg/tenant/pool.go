@@ -175,7 +175,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		return nil, nil, fmt.Errorf("open datastore: %w", err)
 	}
 	if opts.DatabaseAutoEmbedding && (t.Provider == ProviderTiDBZero || t.Provider == ProviderTiDBCloudStarter) {
-		if err := ValidateTiDBAutoEmbeddingSchema(store.DB()); err != nil {
+		if err := ValidateTiDBSchemaForMode(store.DB(), TiDBEmbeddingModeAuto); err != nil {
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("validate tidb auto-embedding schema: %w", err)
 		}

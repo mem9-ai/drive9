@@ -52,7 +52,7 @@ func (p *StarterProvisioner) ProviderType() string { return ProviderTiDBCloudSta
 // InitSchema validates the externally provisioned Starter schema against the
 // shared TiDB auto-embedding launch contract without creating or altering data.
 func (p *StarterProvisioner) InitSchema(_ context.Context, dsn string) error {
-	return validateTiDBAutoEmbeddingSchemaDSN(dsn)
+	return validateTiDBSchemaForModeDSN(dsn, TiDBEmbeddingModeAuto)
 }
 
 func (p *StarterProvisioner) Provision(ctx context.Context, tenantID string) (*ClusterInfo, error) {
