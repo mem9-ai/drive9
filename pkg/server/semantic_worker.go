@@ -31,6 +31,8 @@ const (
 	semanticLocalTenantID               = "local"
 )
 
+var semanticWorkerUsesTiDBAutoEmbedding = tenant.UsesTiDBAutoEmbedding
+
 // SemanticWorkerOptions controls background embed task processing.
 type SemanticWorkerOptions struct {
 	Workers              int
@@ -111,6 +113,9 @@ type semanticObservationSnapshot struct {
 
 func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store, pool *tenant.Pool, embedder embedding.Client, opts SemanticWorkerOptions) *semanticWorkerManager {
 	if embedder == nil {
+		return nil
+	}
+	if fallback != nil && fallback.UsesDatabaseAutoEmbedding() {
 		return nil
 	}
 	if fallback == nil && (metaStore == nil || pool == nil) {
@@ -428,6 +433,9 @@ func (m *semanticWorkerManager) listTenantRefs(ctx context.Context) ([]semanticT
 	refs := make([]semanticTenantRef, 0, len(tenants))
 	for i := range tenants {
 		t := tenants[i]
+		if semanticWorkerUsesTiDBAutoEmbedding(t.Provider) {
+			continue
+		}
 		refs = append(refs, semanticTenantRef{id: t.ID, tenant: &t})
 	}
 	return refs, nil

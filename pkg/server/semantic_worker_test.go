@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"os"
 	"testing"
@@ -11,9 +12,12 @@ import (
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/semantic"
+	"github.com/mem9-ai/dat9/pkg/tenant"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
@@ -30,7 +34,22 @@ func (e staticSemanticEmbedder) EmbedText(context.Context, string) ([]float32, e
 	return append([]float32(nil), e.vec...), nil
 }
 
-func newTestBackendForSemanticWorker(t *testing.T) *backend.Dat9Backend {
+func newTestTenantPool(t *testing.T) *tenant.Pool {
+	t.Helper()
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	t.Cleanup(func() { pool.Close() })
+	return pool
+}
+
+func newTestBackendForSemanticWorkerWithOptions(t *testing.T, opts backend.Options) *backend.Dat9Backend {
 	t.Helper()
 	s3Dir, err := os.MkdirTemp("", "dat9-semantic-worker-s3-*")
 	if err != nil {
@@ -50,12 +69,16 @@ func newTestBackendForSemanticWorker(t *testing.T) *backend.Dat9Backend {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := backend.NewWithS3(store, s3c)
+	b, err := backend.NewWithS3ModeAndOptions(store, s3c, true, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { b.Close() })
 	return b
+}
+
+func newTestBackendForSemanticWorker(t *testing.T) *backend.Dat9Backend {
+	return newTestBackendForSemanticWorkerWithOptions(t, backend.Options{})
 }
 
 func newTestServerWithSemanticWorker(t *testing.T, embedder staticSemanticEmbedder, workerOpts SemanticWorkerOptions) (*Server, *backend.Dat9Backend) {
@@ -117,6 +140,24 @@ func TestSemanticWorkerProcessesEmbedTask(t *testing.T) {
 	nf := mustServerFile(t, b, "/docs/a.txt")
 	waitForEmbeddingRevision(t, b, "/docs/a.txt", 1, 3*time.Second)
 	waitForTaskStatus(t, b, nf.FileID, 1, string(semantic.TaskSucceeded), 3*time.Second)
+}
+
+func TestServerDoesNotStartSemanticWorkerForAutoEmbeddingFallbackBackend(t *testing.T) {
+	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{DatabaseAutoEmbedding: true})
+	s := NewWithConfig(Config{
+		Backend:          b,
+		SemanticEmbedder: staticSemanticEmbedder{vec: []float32{0.1, 0.2, 0.3}},
+		SemanticWorkers: SemanticWorkerOptions{
+			Workers:         1,
+			PollInterval:    10 * time.Millisecond,
+			RecoverInterval: 50 * time.Millisecond,
+			LeaseDuration:   200 * time.Millisecond,
+		},
+	})
+	t.Cleanup(func() { s.Close() })
+	if s.semanticWorker != nil {
+		t.Fatal("semantic worker should stay disabled for auto-embedding fallback backend")
+	}
 }
 
 func TestSemanticWorkerAcksObsoleteRevisionAndWritesLatest(t *testing.T) {
@@ -304,6 +345,80 @@ func TestSemanticWorkerCollectObservationLocalFallback(t *testing.T) {
 	}
 
 	waitForNamedTaskStatus(t, b, claimed.TaskID, string(semantic.TaskProcessing), time.Second)
+}
+
+func TestSemanticWorkerListTenantRefsSkipsAutoEmbeddingProviders(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	pool := newTestTenantPool(t)
+	passCipher, err := pool.Encrypt(context.Background(), []byte("pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	autoTenantID := tenant.NewID()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               autoTenantID,
+		Status:           meta.TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: passCipher,
+		DBName:           "app",
+		DBTLS:            false,
+		Provider:         tenant.ProviderTiDBZero,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	keepTenantID := tenant.NewID()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               keepTenantID,
+		Status:           meta.TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: passCipher,
+		DBName:           "app",
+		DBTLS:            false,
+		Provider:         tenant.ProviderDB9,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := semanticWorkerUsesTiDBAutoEmbedding
+	semanticWorkerUsesTiDBAutoEmbedding = func(provider string) bool {
+		return provider == tenant.ProviderTiDBZero
+	}
+	defer func() {
+		semanticWorkerUsesTiDBAutoEmbedding = orig
+	}()
+
+	m := newSemanticWorkerManager(nil, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	refs, err := m.listTenantRefs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("tenant ref count=%d, want 1", len(refs))
+	}
+	if refs[0].id != keepTenantID {
+		t.Fatalf("tenant ref id=%q, want %q", refs[0].id, keepTenantID)
+	}
 }
 
 func TestSemanticWorkerClaimAndAckLogsIncludeTaskFields(t *testing.T) {
