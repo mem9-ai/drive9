@@ -45,13 +45,8 @@ func (o *MountOptions) setDefaults() {
 func Mount(opts *MountOptions) error {
 	opts.setDefaults()
 
-	// Validate mount point exists
-	info, err := os.Stat(opts.MountPoint)
-	if err != nil {
-		return fmt.Errorf("mount point: %w", err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("mount point %s is not a directory", opts.MountPoint)
+	if err := os.MkdirAll(opts.MountPoint, 0o755); err != nil {
+		return fmt.Errorf("create mount point: %w", err)
 	}
 
 	// Create client and verify connectivity
