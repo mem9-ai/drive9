@@ -114,7 +114,8 @@ func (c *Client) Read(path string) ([]byte, error) {
 
 // List returns the entries in a directory.
 func (c *Client) List(path string) ([]FileInfo, error) {
-	req, err := http.NewRequest(http.MethodGet, c.url(path)+"?list", nil)
+	// Use an explicit value to avoid intermediaries dropping bare "?list".
+	req, err := http.NewRequest(http.MethodGet, c.url(path)+"?list=1", nil)
 	if err != nil {
 		return nil, err
 	}

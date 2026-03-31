@@ -86,7 +86,7 @@ func TestListDir(t *testing.T) {
 	}
 
 	// List
-	resp, err := http.Get(ts.URL + "/v1/fs/data/?list")
+	resp, err := http.Get(ts.URL + "/v1/fs/data/?list=1")
 	if err != nil {
 		t.Fatal(err)
 	}
