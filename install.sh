@@ -2,9 +2,9 @@
 set -e
 
 # dat9 installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/mem9-ai/dat9/main/install.sh | sh
+# Usage: curl -fsSL https://install.db9.ai | sh
 
-REPO="mem9-ai/dat9"
+REPO="mem9-ai/dat9"  # GitHub release source
 DEFAULT_INSTALL_DIR="/usr/local/bin"
 INSTALL_DIR=""
 
@@ -189,11 +189,10 @@ main() {
   printf "  Then try:\n"
   printf "    ${DIM}\$${RESET} dat9 fs ls :/                            ${DIM}# list files${RESET}\n"
   printf "    ${DIM}\$${RESET} dat9 fs cp ./file.txt :/data/file.txt    ${DIM}# upload a file${RESET}\n"
-  printf "    ${DIM}\$${RESET} dat9 db sql -q 'SELECT 42'               ${DIM}# run SQL${RESET}\n"
   printf "    ${DIM}\$${RESET} dat9 fs sh                               ${DIM}# interactive shell${RESET}\n"
   printf "\n"
   printf "  Environment:\n"
-  printf "    ${DIM}DAT9_SERVER${RESET}   server URL (default: http://localhost:9009)\n"
+  printf "    ${DIM}DAT9_SERVER${RESET}   server URL (default: https://api.db9.ai)\n"
   printf "    ${DIM}DAT9_API_KEY${RESET}  API key\n"
   printf "\n"
 }
