@@ -11,7 +11,7 @@ CREATE TABLE files (
 	file_id VARCHAR(64) PRIMARY KEY,
 	content_text LONGTEXT,
 	embedding VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT(
-		'openai/text-embedding-3-small',
+		'tidbcloud_free/amazon/titan-embed-text-v2',
 		content_text,
 		'{"dimensions":1024}'
 	)) STORED,
@@ -48,7 +48,7 @@ CREATE TABLE files (
 	file_id VARCHAR(64) PRIMARY KEY,
 	content_text LONGTEXT,
 	embedding VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT(
-		'openai/text-embedding-3-small',
+		'tidbcloud_free/amazon/titan-embed-text-v2',
 		content_text,
 		'{"dimensions":1024}'
 	)) STORED,
