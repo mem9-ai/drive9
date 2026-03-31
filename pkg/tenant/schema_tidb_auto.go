@@ -1,11 +1,24 @@
 package tenant
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"go.uber.org/zap"
+)
+
+type TiDBEmbeddingMode string
+
+const (
+	TiDBEmbeddingModeUnknown TiDBEmbeddingMode = "unknown"
+	TiDBEmbeddingModeAuto    TiDBEmbeddingMode = "auto-embedding"
+	TiDBEmbeddingModeApp     TiDBEmbeddingMode = "app-managed"
 )
 
 // Reference of Auto Embedding in TiDB Cloud: https://docs.pingcap.com/ai/vector-search-auto-embedding-amazon-titan/
@@ -15,6 +28,17 @@ const (
 )
 
 var tidbAutoEmbeddingOptionsJSON = fmt.Sprintf(`{"dimensions":%d}`, tidbAutoEmbeddingDimensions)
+
+type tidbColumnMeta struct {
+	columnType           string
+	extra                string
+	generationExpression string
+}
+
+type tidbTableMeta struct {
+	tableName string
+	columns   map[string]tidbColumnMeta
+}
 
 func tidbAutoEmbeddingSchemaStatements(withContentBlob bool) []string {
 	contentBlobCol := ""
@@ -113,23 +137,94 @@ func tidbAutoEmbeddingSchemaStatements(withContentBlob bool) []string {
 	}
 }
 
-// ValidateTiDBAutoEmbeddingSchema checks that an already-open TiDB connection
-// exposes the launch-time auto-embedding contract required by TiDB tenants.
-func ValidateTiDBAutoEmbeddingSchema(db *sql.DB) error {
+// DetectTiDBEmbeddingMode inspects the TiDB files-table embedding contract and
+// reports whether the schema is in database-managed auto mode or app-managed mode.
+func DetectTiDBEmbeddingMode(db *sql.DB) (TiDBEmbeddingMode, error) {
+	ctx := context.Background()
+	start := time.Now()
+	logger.Info(ctx, "tenant_detect_tidb_embedding_mode_started")
+	if db == nil {
+		return TiDBEmbeddingModeUnknown, fmt.Errorf("nil db")
+	}
+	if !isTiDBCluster(db) {
+		return TiDBEmbeddingModeUnknown, fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
+	}
+	loadStart := time.Now()
+	filesMeta, err := loadTiDBTableMeta(db, "files")
+	if err != nil {
+		logger.Warn(ctx, "tenant_detect_tidb_embedding_mode_load_files_failed",
+			zap.Duration("elapsed", time.Since(loadStart)),
+			zap.Duration("total_elapsed", time.Since(start)),
+			zap.Error(err))
+		return TiDBEmbeddingModeUnknown, fmt.Errorf("load files table metadata: %w", err)
+	}
+	logger.Info(ctx, "tenant_detect_tidb_embedding_mode_loaded_files",
+		zap.Duration("elapsed", time.Since(loadStart)),
+		zap.Duration("total_elapsed", time.Since(start)))
+	detectStart := time.Now()
+	mode, err := detectTiDBEmbeddingModeFromFilesMeta(filesMeta)
+	if err != nil {
+		logger.Warn(ctx, "tenant_detect_tidb_embedding_mode_failed",
+			zap.Duration("elapsed", time.Since(detectStart)),
+			zap.Duration("total_elapsed", time.Since(start)),
+			zap.Error(err))
+		return TiDBEmbeddingModeUnknown, fmt.Errorf("files schema contract: %w", err)
+	}
+	logger.Info(ctx, "tenant_detect_tidb_embedding_mode_finished",
+		zap.String("mode", string(mode)),
+		zap.Duration("elapsed", time.Since(detectStart)),
+		zap.Duration("total_elapsed", time.Since(start)))
+	return mode, nil
+}
+
+// ValidateTiDBSchemaForMode validates that an already-open TiDB connection
+// matches exactly one supported dat9 embedding contract for the requested mode.
+//
+// The `mode` argument is a runtime behavior contract, not a cosmetic schema tag:
+//
+//   - `TiDBEmbeddingModeAuto` requires database-managed embedding, where
+//     `files.embedding` is a stored generated column derived from `content_text`
+//     via `EMBED_TEXT(...)`.
+//   - `TiDBEmbeddingModeApp` requires application-managed embedding, where
+//     `files.embedding` remains writable for the app-side embed worker and
+//     query-embedding path.
+//
+// The validator is intentionally strict: if the schema does not clearly satisfy
+// the requested mode, it returns an error rather than guessing or falling back
+// to the other mode.
+//
+// At the moment this contract is intentionally scoped to the tables that drive
+// embedding-mode behavior directly: `files` and `semantic_tasks`. Other TiDB
+// tables are currently outside this mode validator.
+//
+// Within that scope, `files` is validated structurally for the requested mode,
+// while `semantic_tasks` is currently checked only for table existence.
+func ValidateTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) error {
 	if db == nil {
 		return fmt.Errorf("nil db")
 	}
 	if !isTiDBCluster(db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
-	for _, table := range []string{"file_nodes", "files", "file_tags", "uploads", "semantic_tasks"} {
-		createStmt, err := loadShowCreateTable(db, table)
-		if err != nil {
-			return fmt.Errorf("show create table %s: %w", table, err)
-		}
-		if err := validateTiDBAutoEmbeddingTableDDL(table, createStmt); err != nil {
-			return fmt.Errorf("%s schema contract: %w", table, err)
-		}
+	if err := validateTiDBSchemaMode(mode); err != nil {
+		return err
+	}
+	filesMeta, err := loadTiDBTableMeta(db, "files")
+	if err != nil {
+		return fmt.Errorf("load files table metadata: %w", err)
+	}
+	if err := validateTiDBTableForMode(mode, filesMeta); err != nil {
+		return fmt.Errorf("files schema contract: %w", err)
+	}
+	if err := ensureTiDBTableExists(db, "semantic_tasks"); err != nil {
+		return fmt.Errorf("semantic_tasks schema contract: %w", err)
+	}
+	return nil
+}
+
+func validateTiDBSchemaMode(mode TiDBEmbeddingMode) error {
+	if mode != TiDBEmbeddingModeAuto && mode != TiDBEmbeddingModeApp {
+		return fmt.Errorf("unsupported TiDB embedding mode %q", mode)
 	}
 	return nil
 }
@@ -146,16 +241,16 @@ func initTiDBAutoEmbeddingSchema(dsn string, withContentBlob bool) error {
 	if err := execSchemaStatements(db, tidbAutoEmbeddingSchemaStatements(withContentBlob)); err != nil {
 		return err
 	}
-	return ValidateTiDBAutoEmbeddingSchema(db)
+	return ValidateTiDBSchemaForMode(db, TiDBEmbeddingModeAuto)
 }
 
-func validateTiDBAutoEmbeddingSchemaDSN(dsn string) error {
+func validateTiDBSchemaForModeDSN(dsn string, mode TiDBEmbeddingMode) error {
 	db, err := openTiDBSchemaDB(dsn)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	return ValidateTiDBAutoEmbeddingSchema(db)
+	return ValidateTiDBSchemaForMode(db, mode)
 }
 
 func openTiDBSchemaDB(dsn string) (*sql.DB, error) {
@@ -173,103 +268,172 @@ func openTiDBSchemaDB(dsn string) (*sql.DB, error) {
 	return db, nil
 }
 
-func validateTiDBAutoEmbeddingFilesDDL(createStmt string) error {
-	norm := normalizeDDL(createStmt)
+func validateTiDBTableForMode(mode TiDBEmbeddingMode, meta tidbTableMeta) error {
+	switch meta.tableName {
+	case "files":
+		switch mode {
+		case TiDBEmbeddingModeAuto:
+			return validateTiDBAutoEmbeddingFilesTable(meta)
+		case TiDBEmbeddingModeApp:
+			return validateTiDBAppEmbeddingFilesTable(meta)
+		default:
+			return fmt.Errorf("unsupported TiDB embedding mode %q", mode)
+		}
+	default:
+		return fmt.Errorf("unsupported table %q", meta.tableName)
+	}
+}
+
+func detectTiDBEmbeddingModeFromFilesMeta(meta tidbTableMeta) (TiDBEmbeddingMode, error) {
+	col, err := meta.requireColumn("embedding")
+	if err != nil {
+		return TiDBEmbeddingModeUnknown, err
+	}
+	if normalizeSQLFragment(col.columnType) != fmt.Sprintf("vector(%d)", tidbAutoEmbeddingDimensions) {
+		return TiDBEmbeddingModeUnknown, fmt.Errorf("unsupported embedding column type %q", col.columnType)
+	}
+	extra := normalizeSQLFragment(col.extra)
+	expr := normalizeSQLFragment(col.generationExpression)
+	if strings.Contains(extra, "generated") {
+		if !strings.Contains(extra, "stored") {
+			return TiDBEmbeddingModeUnknown, errors.New("embedding generated column must be stored")
+		}
+		if !strings.Contains(expr, "embed_text(") {
+			return TiDBEmbeddingModeUnknown, errors.New("embedding generated expression must use EMBED_TEXT")
+		}
+		return TiDBEmbeddingModeAuto, nil
+	}
+	if expr != "" {
+		return TiDBEmbeddingModeUnknown, errors.New("embedding generation expression present without generated column metadata")
+	}
+	return TiDBEmbeddingModeApp, nil
+}
+
+func validateTiDBAutoEmbeddingFilesTable(meta tidbTableMeta) error {
+	if err := validateTiDBFilesTableBase(meta); err != nil {
+		return err
+	}
+	col, err := meta.requireColumn("embedding")
+	if err != nil {
+		return err
+	}
+	extra := normalizeSQLFragment(col.extra)
+	if !strings.Contains(extra, "generated") || !strings.Contains(extra, "stored") {
+		return errors.New("embedding column must be a stored generated column")
+	}
+	expr := normalizeSQLFragment(col.generationExpression)
 	checks := []struct {
 		pattern string
 		errMsg  string
 	}{
-		{"embedding vector(" + strconv.Itoa(tidbAutoEmbeddingDimensions) + ") generated always as", "missing generated embedding column"},
-		{"embed_text(", "missing EMBED_TEXT generated expression"},
+		{"embed_text(", "embedding generated expression must use EMBED_TEXT"},
 		{tidbAutoEmbeddingModel, "embedding model contract mismatch"},
 		{"content_text", "generated expression must derive from content_text"},
 		{tidbAutoEmbeddingOptionsJSON, "embedding dimensions option mismatch"},
-		{"embedding_revision bigint", "embedding_revision compatibility column missing"},
-		{"idx_fts_content", "missing fulltext index idx_fts_content"},
-		{"with parser multilingual", "fulltext index must use multilingual parser"},
-		{"idx_files_cosine", "missing vector index idx_files_cosine"},
-		{"vec_cosine_distance(embedding)", "vector index must target embedding cosine distance"},
 	}
 	for _, check := range checks {
-		if !strings.Contains(norm, check.pattern) {
+		if !strings.Contains(expr, check.pattern) {
 			return errors.New(check.errMsg)
 		}
 	}
 	return nil
 }
 
-func validateTiDBAutoEmbeddingTableDDL(tableName, createStmt string) error {
-	switch tableName {
-	case "file_nodes":
-		return validateTiDBAutoEmbeddingFileNodesDDL(createStmt)
-	case "files":
-		return validateTiDBAutoEmbeddingFilesDDL(createStmt)
-	case "file_tags":
-		return validateTiDBAutoEmbeddingFileTagsDDL(createStmt)
-	case "uploads":
-		return validateTiDBAutoEmbeddingUploadsDDL(createStmt)
-	case "semantic_tasks":
-		return validateTiDBAutoEmbeddingSemanticTasksDDL(createStmt)
-	default:
-		return fmt.Errorf("unsupported table %q", tableName)
+func validateTiDBAppEmbeddingFilesTable(meta tidbTableMeta) error {
+	if err := validateTiDBFilesTableBase(meta); err != nil {
+		return err
 	}
+	col, err := meta.requireColumn("embedding")
+	if err != nil {
+		return err
+	}
+	extra := normalizeSQLFragment(col.extra)
+	if strings.Contains(extra, "generated") {
+		return errors.New("embedding column must be writable in app mode")
+	}
+	if expr := normalizeSQLFragment(col.generationExpression); expr != "" {
+		return errors.New("embedding column must not define a generation expression in app mode")
+	}
+	return nil
 }
 
-func validateTiDBAutoEmbeddingFileNodesDDL(createStmt string) error {
-	return validateDDLContains(createStmt,
-		ddlCheck{pattern: "node_id varchar(64)", errMsg: "missing node_id column"},
-		ddlCheck{pattern: "path varchar(512)", errMsg: "missing path column"},
-		ddlCheck{pattern: "parent_path varchar(512)", errMsg: "missing parent_path column"},
-		ddlCheck{pattern: "file_id varchar(64)", errMsg: "missing file_id column"},
-		ddlCheck{pattern: "idx_path", errMsg: "missing unique index idx_path"},
-		ddlCheck{pattern: "idx_parent", errMsg: "missing index idx_parent"},
-		ddlCheck{pattern: "idx_file_id", errMsg: "missing index idx_file_id"},
-	)
+func validateTiDBFilesTableBase(meta tidbTableMeta) error {
+	if err := meta.requireColumnType("file_id", "varchar(64)"); err != nil {
+		return err
+	}
+	if err := meta.requireColumnType("status", "varchar(32)"); err != nil {
+		return err
+	}
+	if err := meta.requireColumnType("content_text", "longtext"); err != nil {
+		return err
+	}
+	if err := meta.requireColumnType("embedding", fmt.Sprintf("vector(%d)", tidbAutoEmbeddingDimensions)); err != nil {
+		return err
+	}
+	return meta.requireColumnType("embedding_revision", "bigint")
 }
 
-func validateTiDBAutoEmbeddingFileTagsDDL(createStmt string) error {
-	return validateDDLContains(createStmt,
-		ddlCheck{pattern: "primary key (file_id,tag_key)", errMsg: "missing file_tags primary key"},
-		ddlCheck{pattern: "tag_key varchar(255)", errMsg: "missing tag_key column"},
-		ddlCheck{pattern: "tag_value varchar(255)", errMsg: "missing tag_value column"},
-		ddlCheck{pattern: "idx_kv", errMsg: "missing index idx_kv"},
-	)
+func loadTiDBTableMeta(db *sql.DB, tableName string) (tidbTableMeta, error) {
+	columns, err := loadTiDBColumnMeta(db, tableName)
+	if err != nil {
+		return tidbTableMeta{}, fmt.Errorf("load columns: %w", err)
+	}
+	return tidbTableMeta{tableName: tableName, columns: columns}, nil
 }
 
-func validateTiDBAutoEmbeddingUploadsDDL(createStmt string) error {
-	return validateDDLContains(createStmt,
-		ddlCheck{pattern: "upload_id varchar(64)", errMsg: "missing upload_id column"},
-		ddlCheck{pattern: "target_path varchar(512)", errMsg: "missing target_path column"},
-		ddlCheck{pattern: "status varchar(32)", errMsg: "missing status column"},
-		ddlCheck{pattern: "active_target_path varchar(512) as (case when status = 'uploading' then target_path else null end) stored", errMsg: "missing active_target_path generated column"},
-		ddlCheck{pattern: "idx_upload_path", errMsg: "missing index idx_upload_path"},
-		ddlCheck{pattern: "idx_idempotency", errMsg: "missing unique index idx_idempotency"},
-	)
+func ensureTiDBTableExists(db *sql.DB, tableName string) error {
+	if _, err := loadShowCreateTable(db, tableName); err != nil {
+		return fmt.Errorf("show create table: %w", err)
+	}
+	return nil
 }
 
-func validateTiDBAutoEmbeddingSemanticTasksDDL(createStmt string) error {
-	return validateDDLContains(createStmt,
-		ddlCheck{pattern: "task_id varchar(64)", errMsg: "missing task_id column"},
-		ddlCheck{pattern: "task_type varchar(32)", errMsg: "missing task_type column"},
-		ddlCheck{pattern: "resource_id varchar(64)", errMsg: "missing resource_id column"},
-		ddlCheck{pattern: "resource_version bigint", errMsg: "missing resource_version column"},
-		ddlCheck{pattern: "status varchar(20)", errMsg: "missing status column"},
-		ddlCheck{pattern: "uk_task_resource_version", errMsg: "missing unique index uk_task_resource_version"},
-		ddlCheck{pattern: "idx_task_claim", errMsg: "missing index idx_task_claim"},
-	)
-}
+func loadTiDBColumnMeta(db *sql.DB, tableName string) (map[string]tidbColumnMeta, error) {
+	rows, err := db.Query(`SELECT column_name, column_type, extra, generation_expression
+		FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = ?`, tableName)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
 
-type ddlCheck struct {
-	pattern string
-	errMsg  string
-}
-
-func validateDDLContains(createStmt string, checks ...ddlCheck) error {
-	norm := normalizeDDL(createStmt)
-	for _, check := range checks {
-		if !strings.Contains(norm, check.pattern) {
-			return errors.New(check.errMsg)
+	columns := make(map[string]tidbColumnMeta)
+	for rows.Next() {
+		var name, columnType string
+		var extra, generationExpression sql.NullString
+		if err := rows.Scan(&name, &columnType, &extra, &generationExpression); err != nil {
+			return nil, err
 		}
+		columns[strings.ToLower(name)] = tidbColumnMeta{
+			columnType:           columnType,
+			extra:                extra.String,
+			generationExpression: generationExpression.String,
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(columns) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return columns, nil
+}
+
+func (m tidbTableMeta) requireColumn(name string) (tidbColumnMeta, error) {
+	col, ok := m.columns[strings.ToLower(name)]
+	if !ok {
+		return tidbColumnMeta{}, fmt.Errorf("missing %s column", name)
+	}
+	return col, nil
+}
+
+func (m tidbTableMeta) requireColumnType(name, want string) error {
+	col, err := m.requireColumn(name)
+	if err != nil {
+		return err
+	}
+	if normalizeSQLFragment(col.columnType) != normalizeSQLFragment(want) {
+		return fmt.Errorf("%s column type = %q, want %s", name, col.columnType, want)
 	}
 	return nil
 }
@@ -284,8 +448,10 @@ func loadShowCreateTable(db *sql.DB, tableName string) (string, error) {
 	return createStmt, nil
 }
 
-func normalizeDDL(s string) string {
-	s = strings.ToLower(strings.ReplaceAll(s, "`", ""))
+func normalizeSQLFragment(s string) string {
+	s = strings.ToLower(s)
+	s = strings.ReplaceAll(s, "`", "")
+	s = strings.ReplaceAll(s, "_utf8mb4", "")
 	fields := strings.Fields(s)
 	return strings.Join(fields, " ")
 }

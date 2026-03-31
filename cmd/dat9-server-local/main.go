@@ -199,7 +199,9 @@ func publicBaseURL(listenAddr string) string {
 	}
 }
 
-var localAutoEmbeddingSchemaValidator = tenant.ValidateTiDBAutoEmbeddingSchema
+var localAutoEmbeddingSchemaValidator = func(db *sql.DB) error {
+	return tenant.ValidateTiDBSchemaForMode(db, tenant.TiDBEmbeddingModeAuto)
+}
 
 func shouldUseLocalDatabaseAutoEmbedding(db *sql.DB, schemaInitialized bool) bool {
 	if schemaInitialized {

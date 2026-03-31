@@ -5,78 +5,70 @@ import (
 	"testing"
 )
 
-func TestValidateTiDBAutoEmbeddingFilesDDLAcceptsGeneratedEmbedding(t *testing.T) {
-	ddl := `
-CREATE TABLE files (
-	file_id VARCHAR(64) PRIMARY KEY,
-	content_text LONGTEXT,
-	embedding VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT(
-		'tidbcloud_free/amazon/titan-embed-text-v2',
-		content_text,
-		'{"dimensions":1024}'
-	)) STORED,
-	embedding_revision BIGINT,
-	FULLTEXT INDEX idx_fts_content(content_text) WITH PARSER MULTILINGUAL,
-	VECTOR INDEX idx_files_cosine((VEC_COSINE_DISTANCE(embedding)))
-)`
-	if err := validateTiDBAutoEmbeddingFilesDDL(ddl); err != nil {
-		t.Fatalf("expected generated auto-embedding ddl to validate: %v", err)
+func TestDetectTiDBEmbeddingModeFromFilesMeta(t *testing.T) {
+	autoMeta := testFilesTableMeta(TiDBEmbeddingModeAuto)
+	mode, err := detectTiDBEmbeddingModeFromFilesMeta(autoMeta)
+	if err != nil {
+		t.Fatalf("detect auto mode: %v", err)
+	}
+	if mode != TiDBEmbeddingModeAuto {
+		t.Fatalf("mode=%q, want %q", mode, TiDBEmbeddingModeAuto)
+	}
+
+	appMeta := testFilesTableMeta(TiDBEmbeddingModeApp)
+	mode, err = detectTiDBEmbeddingModeFromFilesMeta(appMeta)
+	if err != nil {
+		t.Fatalf("detect app mode: %v", err)
+	}
+	if mode != TiDBEmbeddingModeApp {
+		t.Fatalf("mode=%q, want %q", mode, TiDBEmbeddingModeApp)
 	}
 }
 
-func TestValidateTiDBAutoEmbeddingFilesDDLRejectsWritableEmbedding(t *testing.T) {
-	ddl := `
-CREATE TABLE files (
-	file_id VARCHAR(64) PRIMARY KEY,
-	content_text LONGTEXT,
-	embedding VECTOR(1024),
-	embedding_revision BIGINT,
-	VECTOR INDEX idx_files_cosine((VEC_COSINE_DISTANCE(embedding)))
-)`
-	err := validateTiDBAutoEmbeddingFilesDDL(ddl)
-	if err == nil {
-		t.Fatal("expected writable embedding ddl to be rejected")
+func TestValidateTiDBAutoEmbeddingFilesTableAcceptsRealTiDBMetadata(t *testing.T) {
+	if err := validateTiDBAutoEmbeddingFilesTable(testFilesTableMeta(TiDBEmbeddingModeAuto)); err != nil {
+		t.Fatalf("expected auto files table to validate: %v", err)
 	}
-	if !strings.Contains(err.Error(), "generated embedding column") {
+}
+
+func TestValidateTiDBAutoEmbeddingFilesTableRejectsWritableEmbedding(t *testing.T) {
+	err := validateTiDBAutoEmbeddingFilesTable(testFilesTableMeta(TiDBEmbeddingModeApp))
+	if err == nil {
+		t.Fatal("expected writable embedding column to be rejected")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "generated") {
 		t.Fatalf("unexpected validation error: %v", err)
 	}
 }
 
-func TestValidateTiDBAutoEmbeddingFilesDDLRejectsMissingFTSIndex(t *testing.T) {
-	ddl := `
-CREATE TABLE files (
-	file_id VARCHAR(64) PRIMARY KEY,
-	content_text LONGTEXT,
-	embedding VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT(
-		'tidbcloud_free/amazon/titan-embed-text-v2',
-		content_text,
-		'{"dimensions":1024}'
-	)) STORED,
-	embedding_revision BIGINT,
-	VECTOR INDEX idx_files_cosine((VEC_COSINE_DISTANCE(embedding)))
-)`
-	err := validateTiDBAutoEmbeddingFilesDDL(ddl)
+func TestValidateTiDBAppEmbeddingFilesTableRejectsGeneratedEmbedding(t *testing.T) {
+	err := validateTiDBAppEmbeddingFilesTable(testFilesTableMeta(TiDBEmbeddingModeAuto))
 	if err == nil {
-		t.Fatal("expected missing fulltext index to be rejected")
+		t.Fatal("expected generated embedding column to be rejected in app mode")
 	}
-	if !strings.Contains(err.Error(), "idx_fts_content") {
+	if !strings.Contains(strings.ToLower(err.Error()), "writable") {
 		t.Fatalf("unexpected validation error: %v", err)
 	}
 }
 
-func TestValidateTiDBAutoEmbeddingTableDDLRejectsMissingUploadsIndex(t *testing.T) {
-	ddl := `
-CREATE TABLE uploads (
-	upload_id VARCHAR(64) PRIMARY KEY,
-	target_path VARCHAR(512) NOT NULL,
-	status VARCHAR(32) NOT NULL,
-	active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED
-)`
-	err := validateTiDBAutoEmbeddingTableDDL("uploads", ddl)
-	if err == nil {
-		t.Fatal("expected uploads contract validation to fail")
+func testFilesTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
+	meta := tidbTableMeta{
+		tableName: "files",
+		columns: map[string]tidbColumnMeta{
+			"file_id":            {columnType: "varchar(64)"},
+			"status":             {columnType: "varchar(32)"},
+			"content_text":       {columnType: "longtext"},
+			"embedding":          {columnType: "vector(1024)"},
+			"embedding_revision": {columnType: "bigint"},
+		},
 	}
-	if !strings.Contains(err.Error(), "idx_upload_path") {
-		t.Fatalf("unexpected validation error: %v", err)
+	if mode == TiDBEmbeddingModeAuto {
+		meta.columns["embedding"] = tidbColumnMeta{
+			columnType:           "vector(1024)",
+			extra:                "STORED GENERATED",
+			generationExpression: "embed_text(_utf8mb4'tidbcloud_free/amazon/titan-embed-text-v2', `content_text`, _utf8mb4'{\"dimensions\":1024}')",
+		}
+		return meta
 	}
+	return meta
 }
