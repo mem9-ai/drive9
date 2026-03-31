@@ -26,7 +26,7 @@ IMAGE_TAG ?= latest
 IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
 LINT_TIMEOUT ?= 10m
 
-.PHONY: mod test test-podman fmt lint install-lint build build-server build-cli docker-build
+.PHONY: mod test test-podman fmt lint install-lint build build-server build-cli run-server-local docker-build
 
 mod:
 	$(GO) mod tidy
@@ -63,6 +63,9 @@ build: build-server build-cli
 build-server:
 	mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(SERVER_BIN) ./cmd/dat9-server
+
+run-server-local:
+	@source ./scripts/dat9-server-local-env.sh && $(GO) run ./cmd/dat9-server-local
 
 build-cli:
 	mkdir -p $(BIN_DIR)
