@@ -204,24 +204,29 @@ the dedicated local entrypoint plus the repository-owned env script:
 
 ```bash
 source ./scripts/dat9-server-local-env.sh
+export DAT9_LOCAL_INIT_SCHEMA=true   # only for disposable local databases
 make run-server-local
 ```
+
+The helper script keeps `DAT9_LOCAL_INIT_SCHEMA=false` by default so the local
+entrypoint does not mutate an existing database unless you opt in explicitly.
 
 Override any variables you need before `make run-server-local`, for example a
 custom local/remote TiDB DSN:
 
 ```bash
 export DAT9_LOCAL_DSN='root@tcp(127.0.0.1:4000)/dat9_local?parseTime=true'
+export DAT9_LOCAL_INIT_SCHEMA=true   # only if this is a disposable database
 make run-server-local
 ```
 
 The helper script sets sensible defaults for local validation, including:
 
 - `DAT9_LOCAL_DSN`
-- `DAT9_LOCAL_INIT_SCHEMA=true`
+- `DAT9_LOCAL_INIT_SCHEMA=false`
 - local mock S3 via `DAT9_S3_DIR`
 - local Ollama-compatible `DAT9_EMBED_*` defaults
-- query embedding reusing the same provider defaults
+- query embedding reusing `DAT9_EMBED_*` unless `DAT9_QUERY_EMBED_*` is set explicitly
 
 ## Running Tests
 
