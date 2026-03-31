@@ -351,6 +351,8 @@ Not acceptable. Embedding is already a prerequisite for search availability, not
 17. Add log fields: `tenant_id`, `task_id`, `resource_id`, `resource_version`, `receipt`, `attempt_count`
 18. After `embed` is stable, reuse the same task substrate to add `extract_text`, `generate_l0`, and `generate_l1`
 
+Phase D is also the place to decide the minimum production observability set needed for dead-letter triage and queue-lag diagnosis. Phase C should not block worker/search correctness on that decision; instead, once correctness is stable, this phase should finalize the smallest useful metrics/logging surface and align naming with existing `image_extract` instrumentation where practical.
+
 ## Validation Strategy
 
 - **Queue contract tests**:
