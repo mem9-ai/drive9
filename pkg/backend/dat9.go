@@ -786,7 +786,13 @@ func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit 
 		}
 	}
 
-	if len(ftsResp.rows) == 0 && len(vecResp.rows) == 0 {
+	// Decision rule for grep:
+	// 1. FTS and vector search are ranking signals; either one may fail independently.
+	// 2. If either path returns ranked rows, serve those rows directly after RRF merge.
+	// 3. Only fall back to LIKE-based keyword search when both ranking paths produce no rows.
+	// This keeps semantic ranking as an enhancement while preserving a text-search safety net.
+	hasRankedResults := len(ftsResp.rows) > 0 || len(vecResp.rows) > 0
+	if !hasRankedResults {
 		rows, searchErr := b.store.KeywordSearch(ctx, query, pathPrefix, limit)
 		if searchErr != nil {
 			logger.Error(ctx, "backend_grep_failed", zap.Int("query_len", len(query)), zap.String("path_prefix", pathPrefix), zap.Int("limit", limit), zap.Error(searchErr))

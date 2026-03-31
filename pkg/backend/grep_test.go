@@ -97,7 +97,7 @@ func TestGrepEmbedsQueryInApplicationLayerBeforeFallback(t *testing.T) {
 	}
 }
 
-func TestGrepFallsBackToKeywordWhenVectorQueryFails(t *testing.T) {
+func TestGrepUsesFTSResultsWhenVectorQueryFails(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
 		QueryEmbedding: QueryEmbeddingOptions{
 			Client: staticQueryEmbedder{vec: []float32{0.1, 0.2, 0.3}},
@@ -112,6 +112,25 @@ func TestGrepFallsBackToKeywordWhenVectorQueryFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(results) != 1 || results[0].Path != "/notes/c.txt" {
+		t.Fatalf("unexpected grep results: %+v", results)
+	}
+}
+
+func TestGrepFallsBackToKeywordWhenFTSIsEmptyAndVectorFails(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		QueryEmbedding: QueryEmbeddingOptions{
+			Client: staticQueryEmbedder{err: errors.New("vector unavailable")},
+		},
+	})
+	if _, err := b.Write("/notes/d.txt", []byte("connection pooling keeps latency stable"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := b.Grep(context.Background(), "pool", "/notes/", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Path != "/notes/d.txt" {
 		t.Fatalf("unexpected grep results: %+v", results)
 	}
 }
