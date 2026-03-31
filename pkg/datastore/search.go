@@ -105,6 +105,39 @@ func (s *Store) VectorSearch(ctx context.Context, queryEmbedding []float32, path
 	return out, nil
 }
 
+// VectorSearchByText runs a TiDB-side text-query vector similarity search.
+func (s *Store) VectorSearchByText(ctx context.Context, queryText, pathPrefix string, limit int) ([]SearchResult, error) {
+	q, args, ok := buildVectorSearchByTextQuery(queryText, pathPrefix, limit)
+	if !ok {
+		return nil, nil
+	}
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []SearchResult
+	for rows.Next() {
+		var r SearchResult
+		var dist float64
+		if err := rows.Scan(&r.Path, &r.Name, &r.SizeBytes, &dist); err != nil {
+			return nil, err
+		}
+		sc := 1.0 - dist
+		if sc < 0.3 {
+			continue
+		}
+		r.Score = &sc
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func buildVectorSearchQuery(queryEmbedding []float32, pathPrefix string, limit int) (string, []any, bool) {
 	if len(queryEmbedding) == 0 {
 		return "", nil, false
@@ -119,6 +152,29 @@ func buildVectorSearchQuery(queryEmbedding []float32, pathPrefix string, limit i
 		args = append(args, pargs...)
 	}
 	args = append(args, vecParam, limit)
+
+	q := `SELECT fn.path, fn.name, f.size_bytes,
+		VEC_EMBED_COSINE_DISTANCE(f.embedding, ?) AS distance
+		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
+		WHERE ` + strings.Join(conds, " AND ") + `
+		ORDER BY VEC_EMBED_COSINE_DISTANCE(f.embedding, ?)
+	LIMIT ?`
+	return q, args, true
+}
+
+func buildVectorSearchByTextQuery(queryText, pathPrefix string, limit int) (string, []any, bool) {
+	if strings.TrimSpace(queryText) == "" {
+		return "", nil, false
+	}
+	conds := []string{"f.status = 'CONFIRMED'", "f.embedding IS NOT NULL"}
+	args := []any{queryText}
+
+	if pathPrefix != "" && pathPrefix != "/" {
+		cond, pargs := subtreeCond(pathPrefix)
+		conds = append(conds, cond)
+		args = append(args, pargs...)
+	}
+	args = append(args, queryText, limit)
 
 	q := `SELECT fn.path, fn.name, f.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(f.embedding, ?) AS distance
