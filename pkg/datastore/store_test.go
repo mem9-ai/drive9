@@ -2,6 +2,7 @@ package datastore
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"testing"
 	"time"
@@ -149,6 +150,96 @@ func TestListDir(t *testing.T) {
 		t.Fatal("expected file entry for a.txt")
 	}
 	requireEmbeddingRevision(t, entries[0].File.EmbeddingRevision, 13)
+}
+
+func TestUpdateFileSearchText(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID:      "f1",
+		StorageType: StorageDB9,
+		StorageRef:  "/blobs/f1",
+		Revision:    2,
+		Status:      StatusConfirmed,
+		ContentText: "old text",
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := s.UpdateFileSearchText(context.Background(), "f1", 2, "new text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated {
+		t.Fatal("expected revision-gated update to succeed")
+	}
+	if got := mustFile(t, s, "f1").ContentText; got != "new text" {
+		t.Fatalf("content_text=%q, want %q", got, "new text")
+	}
+}
+
+func TestUpdateFileSearchTextRejectsStaleRevision(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID:      "f1",
+		StorageType: StorageDB9,
+		StorageRef:  "/blobs/f1",
+		Revision:    3,
+		Status:      StatusConfirmed,
+		ContentText: "old text",
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := s.UpdateFileSearchText(context.Background(), "f1", 2, "new text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated {
+		t.Fatal("stale revision should not update content_text")
+	}
+	if got := mustFile(t, s, "f1").ContentText; got != "old text" {
+		t.Fatalf("content_text=%q, want %q", got, "old text")
+	}
+}
+
+func TestUpdateFileSearchTextTxRollsBackWithOuterTransaction(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID:      "f1",
+		StorageType: StorageDB9,
+		StorageRef:  "/blobs/f1",
+		Revision:    2,
+		Status:      StatusConfirmed,
+		ContentText: "old text",
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		updated, err := s.UpdateFileSearchTextTx(tx, "f1", 2, "new text")
+		if err != nil {
+			return err
+		}
+		if !updated {
+			t.Fatal("expected transactional search-text update to succeed")
+		}
+		return context.Canceled
+	})
+	if err != context.Canceled {
+		t.Fatalf("rollback error=%v, want %v", err, context.Canceled)
+	}
+	if got := mustFile(t, s, "f1").ContentText; got != "old text" {
+		t.Fatalf("content_text=%q, want %q after rollback", got, "old text")
+	}
 }
 
 func TestZeroCopyCp(t *testing.T) {

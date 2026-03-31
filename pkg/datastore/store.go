@@ -470,29 +470,40 @@ func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageTyp
 }
 
 // UpdateFileSearchText updates files.content_text for search enrichment.
-// If expectedChecksum is non-empty, update is applied only when checksum matches.
+// When expectedRevision is positive, the update applies only to that revision.
 // This prevents stale async tasks from overwriting a newer file revision.
 func (s *Store) UpdateFileSearchText(ctx context.Context, fileID string, expectedRevision int64, contentText string) (updated bool, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "update_file_search_text", start, &err)
 
-	var (
-		res sql.Result
-	)
-	if expectedRevision > 0 {
-		res, err = s.db.ExecContext(ctx, `UPDATE files SET content_text = ?
-			WHERE file_id = ? AND status = 'CONFIRMED' AND revision = ?`,
-			nullStr(contentText), fileID, expectedRevision)
-	} else {
-		res, err = s.db.ExecContext(ctx, `UPDATE files SET content_text = ?
-			WHERE file_id = ? AND status = 'CONFIRMED'`,
-			nullStr(contentText), fileID)
-	}
+	res, err := s.updateFileSearchTextExec(s.db, fileID, expectedRevision, contentText)
 	if err != nil {
 		return false, err
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// UpdateFileSearchTextTx updates files.content_text inside an existing
+// transaction while preserving the revision gate used by async image tasks.
+func (s *Store) UpdateFileSearchTextTx(db execer, fileID string, expectedRevision int64, contentText string) (bool, error) {
+	res, err := s.updateFileSearchTextExec(db, fileID, expectedRevision, contentText)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevision int64, contentText string) (sql.Result, error) {
+	if expectedRevision > 0 {
+		return db.Exec(`UPDATE files SET content_text = ?
+			WHERE file_id = ? AND status = 'CONFIRMED' AND revision = ?`,
+			nullStr(contentText), fileID, expectedRevision)
+	}
+	return db.Exec(`UPDATE files SET content_text = ?
+		WHERE file_id = ? AND status = 'CONFIRMED'`,
+		nullStr(contentText), fileID)
 }
 
 func (s *Store) ConfirmFile(ctx context.Context, fileID string) (err error) {

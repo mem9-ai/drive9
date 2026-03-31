@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -210,7 +211,19 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 		return
 	}
 
-	updated, err := b.store.UpdateFileSearchText(ctx, task.FileID, task.Revision, text)
+	var updated bool
+	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
+		var txErr error
+		updated, txErr = b.store.UpdateFileSearchTextTx(tx, task.FileID, task.Revision, text)
+		if txErr != nil {
+			return txErr
+		}
+		if !updated {
+			return nil
+		}
+		_, txErr = b.store.EnsureSemanticTaskQueuedTx(tx, newEmbedTask(b.genID(), task.FileID, task.Revision, time.Now().UTC()))
+		return txErr
+	})
 	if err != nil {
 		logger.Warn(ctx, "backend_image_extract_update_file_failed",
 			zap.String("file_id", task.FileID), zap.Error(err))
@@ -221,12 +234,6 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 		logger.Info(ctx, "backend_image_extract_skipped_stale",
 			zap.String("file_id", task.FileID), zap.String("path", task.Path))
 		metrics.RecordOperation("image_extract", "process", "stale", time.Since(start))
-		return
-	}
-	if _, err := b.store.EnsureSemanticTaskQueued(ctx, newEmbedTask(b.genID(), task.FileID, task.Revision, time.Now().UTC())); err != nil {
-		logger.Warn(ctx, "backend_image_extract_enqueue_embed_failed",
-			zap.String("file_id", task.FileID), zap.String("path", task.Path), zap.Int64("revision", task.Revision), zap.Error(err))
-		metrics.RecordOperation("image_extract", "process", "enqueue_embed_error", time.Since(start))
 		return
 	}
 	logger.Info(ctx, "backend_image_extract_ok",
