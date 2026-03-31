@@ -174,6 +174,12 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	if err != nil {
 		return nil, nil, fmt.Errorf("open datastore: %w", err)
 	}
+	if opts.DatabaseAutoEmbedding && (t.Provider == ProviderTiDBZero || t.Provider == ProviderTiDBCloudStarter) {
+		if err := ValidateTiDBAutoEmbeddingSchema(store.DB()); err != nil {
+			_ = store.Close()
+			return nil, nil, fmt.Errorf("validate tidb auto-embedding schema: %w", err)
+		}
+	}
 	if p.cfg.S3Bucket != "" {
 		prefix := strings.Trim(p.cfg.S3Prefix, "/")
 		if prefix != "" {

@@ -49,14 +49,10 @@ func NewStarterProvisionerFromEnv() (*StarterProvisioner, error) {
 
 func (p *StarterProvisioner) ProviderType() string { return ProviderTiDBCloudStarter }
 
-// InitSchema is intentionally a no-op for TiDB Cloud Starter.
-//
-// Starter tenants come from an externally initialized cluster/pool whose
-// database bootstrap and schema setup happen outside this repository. Returning
-// nil here means "schema is managed externally", not "schema initialization was
-// forgotten".
-func (p *StarterProvisioner) InitSchema(_ context.Context, _ string) error {
-	return nil
+// InitSchema validates the externally provisioned Starter schema against the
+// shared TiDB auto-embedding launch contract without creating or altering data.
+func (p *StarterProvisioner) InitSchema(_ context.Context, dsn string) error {
+	return validateTiDBAutoEmbeddingSchemaDSN(dsn)
 }
 
 func (p *StarterProvisioner) Provision(ctx context.Context, tenantID string) (*ClusterInfo, error) {
