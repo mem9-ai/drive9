@@ -7,6 +7,12 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
+// InitTiDBTenantSchema initializes the tenant data-plane schema on a TiDB/MySQL
+// DSN using the current TiDB-oriented schema shape required by dat9.
+func InitTiDBTenantSchema(dsn string) error {
+	return initZeroSchema(dsn)
+}
+
 func initZeroSchema(dsn string) error {
 	if hasMultiStatements(dsn) {
 		return fmt.Errorf("multiStatements is not allowed")
