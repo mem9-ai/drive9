@@ -757,7 +757,13 @@ func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit 
 	}()
 
 	var vecCh chan grepResp
-	if b.queryEmbedder != nil {
+	if b.UsesDatabaseAutoEmbedding() {
+		vecCh = make(chan grepResp, 1)
+		go func() {
+			rows, searchErr := b.store.VectorSearchByText(ctx, query, pathPrefix, fetch)
+			vecCh <- grepResp{rows: rows, err: searchErr}
+		}()
+	} else if b.queryEmbedder != nil {
 		vecCh = make(chan grepResp, 1)
 		go func() {
 			queryVec, embedErr := b.queryEmbedder.EmbedText(ctx, query)

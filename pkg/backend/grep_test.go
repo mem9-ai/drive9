@@ -134,3 +134,30 @@ func TestGrepFallsBackToKeywordWhenFTSIsEmptyAndVectorFails(t *testing.T) {
 		t.Fatalf("unexpected grep results: %+v", results)
 	}
 }
+
+func TestGrepAutoEmbeddingSkipsApplicationQueryEmbedder(t *testing.T) {
+	seen := make(chan string, 1)
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		QueryEmbedding: QueryEmbeddingOptions{
+			Client: recordingQueryEmbedder{seen: seen, err: errors.New("should not be called")},
+		},
+	})
+	if _, err := b.Write("/notes/auto.txt", []byte("semantic probe from database side"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := b.Grep(context.Background(), "semantic probe", "/notes/", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Path != "/notes/auto.txt" {
+		t.Fatalf("unexpected grep results: %+v", results)
+	}
+
+	select {
+	case got := <-seen:
+		t.Fatalf("query embedder was called in auto mode with %q", got)
+	default:
+	}
+}
