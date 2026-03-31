@@ -2,9 +2,9 @@
 set -e
 
 # dat9 installer
-# Usage: curl -fsSL https://install.db9.ai | sh
+# Usage: curl -fsSL https://dat9.ai/install | sh
 
-REPO="mem9-ai/dat9"  # GitHub release source
+BASE_URL="https://dat9.ai/releases"
 DEFAULT_INSTALL_DIR="/usr/local/bin"
 INSTALL_DIR=""
 
@@ -55,12 +55,23 @@ download() {
   fi
 }
 
-fetch_latest_tag() {
-  LATEST_TAG=""
+download_quiet() {
   if command -v curl > /dev/null 2>&1; then
-    LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/') || true
+    curl -fsSL -o "$2" "$1"
   elif command -v wget > /dev/null 2>&1; then
-    LATEST_TAG=$(wget -q -O - "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/') || true
+    wget -q -O "$2" "$1"
+  else
+    error "Neither curl nor wget found."
+  fi
+}
+
+fetch_version() {
+  LATEST_VERSION=""
+  VERSION_URL="${BASE_URL}/version"
+  if command -v curl > /dev/null 2>&1; then
+    LATEST_VERSION=$(curl -fsSL "$VERSION_URL" 2>/dev/null | tr -d '[:space:]') || true
+  elif command -v wget > /dev/null 2>&1; then
+    LATEST_VERSION=$(wget -q -O - "$VERSION_URL" 2>/dev/null | tr -d '[:space:]') || true
   fi
 }
 
@@ -131,9 +142,10 @@ main() {
   ARCH=$(detect_arch)
   info "Platform: ${OS}/${ARCH}"
 
-  fetch_latest_tag
-  if [ -n "$LATEST_TAG" ]; then
-    info "Latest version: ${LATEST_TAG}"
+  LATEST_VERSION=""
+  fetch_version
+  if [ -n "$LATEST_VERSION" ]; then
+    info "Latest version: v${LATEST_VERSION}"
   fi
 
   resolve_install_dir
@@ -150,17 +162,14 @@ main() {
   TMP_DIR=$(mktemp -d)
   trap 'rm -rf "$TMP_DIR"' EXIT
 
-  ASSET="dat9-${OS}-${ARCH}"
-  if [ -n "$LATEST_TAG" ]; then
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${ASSET}"
-    info "Downloading dat9 ${LATEST_TAG}..."
+  # Download dat9 (FUSE support is built-in, no separate binary needed)
+  if [ -n "$LATEST_VERSION" ]; then
+    info "Downloading dat9 v${LATEST_VERSION}..."
   else
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
     info "Downloading dat9..."
   fi
-
-  if ! download "$DOWNLOAD_URL" "$TMP_DIR/dat9"; then
-    error "No pre-built binary available for ${OS}/${ARCH}.\n  Available: linux/amd64, linux/arm64, darwin/arm64, darwin/amd64\n  Visit https://github.com/${REPO} for more info."
+  if ! download "${BASE_URL}/dat9-${OS}-${ARCH}" "$TMP_DIR/dat9"; then
+    error "No pre-built binary available for ${OS}/${ARCH}.\n  Available: linux/amd64, linux/arm64, darwin/arm64, darwin/amd64\n  Visit https://dat9.ai for more info."
   fi
   chmod +x "$TMP_DIR/dat9"
 
@@ -190,10 +199,9 @@ main() {
   printf "    ${DIM}\$${RESET} dat9 fs ls :/                            ${DIM}# list files${RESET}\n"
   printf "    ${DIM}\$${RESET} dat9 fs cp ./file.txt :/data/file.txt    ${DIM}# upload a file${RESET}\n"
   printf "    ${DIM}\$${RESET} dat9 fs sh                               ${DIM}# interactive shell${RESET}\n"
+  printf "    ${DIM}\$${RESET} dat9 mount ~/dat9                        ${DIM}# mount as local directory${RESET}\n"
   printf "\n"
-  printf "  Environment:\n"
-  printf "    ${DIM}DAT9_SERVER${RESET}   server URL (default: https://api.db9.ai)\n"
-  printf "    ${DIM}DAT9_API_KEY${RESET}  API key\n"
+  printf "  More usage: ${DIM}https://dat9.ai/skill.md${RESET}\n"
   printf "\n"
 }
 
