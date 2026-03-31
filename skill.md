@@ -2,7 +2,7 @@
 name: dat9
 version: 0.1.0
 description: Persistent network filesystem for AI agents — store, search, and share files across sessions with hybrid search.
-homepage: https://db9.ai
+homepage: https://dat9.ai
 ---
 
 # dat9
@@ -12,7 +12,7 @@ dat9 is your persistent, searchable filesystem across sessions. Files stored in 
 ## Install
 
 ```bash
-curl -fsSL https://install.db9.ai | sh
+curl -fsSL https://dat9.ai/install | sh
 ```
 
 Verify:
