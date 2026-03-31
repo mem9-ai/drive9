@@ -20,8 +20,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE="${DAT9_BASE:-http://127.0.0.1:9009}"
-DAT9_IMAGE_FIXTURE_URL="${DAT9_IMAGE_FIXTURE_URL:-https://upload.wikimedia.org/wikipedia/commons/3/3a/Cat03.jpg}"
+DAT9_IMAGE_FIXTURE_PATH="${DAT9_IMAGE_FIXTURE_PATH:-$SCRIPT_DIR/fixtures/cat03.jpg}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 RUN_LARGE_FILE="${RUN_LARGE_FILE:-1}"
@@ -195,8 +196,11 @@ wait_grep_contains_path() {
 echo "========================================================"
 echo "  dat9 API smoke test"
 echo "  Base URL : $BASE"
+echo "  Image fixture : $DAT9_IMAGE_FIXTURE_PATH"
 echo "  Started  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "========================================================"
+
+check_cmd "local image fixture exists" test -s "$DAT9_IMAGE_FIXTURE_PATH"
 
 TS="$(date +%s)"
 ROOT_DIR="team-${TS}"
@@ -333,7 +337,7 @@ check_eq "find by name returns yaml file" "$find_has_yaml" "true"
 
 step "8" "Image upload and query"
 mkdir -p "$(dirname "$IMAGE_LOCAL")"
-curl -fsSL "$DAT9_IMAGE_FIXTURE_URL" -o "$IMAGE_LOCAL"
+cp "$DAT9_IMAGE_FIXTURE_PATH" "$IMAGE_LOCAL"
 check_cmd "local jpg fixture exists" test -s "$IMAGE_LOCAL"
 
 img_body="$(mktemp)"

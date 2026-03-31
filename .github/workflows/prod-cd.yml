@@ -11,7 +11,7 @@ on:
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-  AWS_ASSUME_ARN: ${{ secrets.AWS_ASSUME_ARN }}
+  AWS_ASSUME_ARN_PROD: ${{ secrets.AWS_ASSUME_ARN_PROD }}
   ECR_REPOSITORY: dat9-server
   EKS_DEV_CLUSTER: dev-dat9
   EKS_PROD_CLUSTER: prod-dat9
@@ -30,7 +30,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.AWS_ASSUME_ARN }}
+          role-to-assume: ${{ env.AWS_ASSUME_ARN_PROD }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Update kubeconfig for dev and prod
