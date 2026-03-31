@@ -1,0 +1,76 @@
+name: Release CLI binaries
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cmd/**'
+      - 'pkg/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+  workflow_dispatch:
+
+concurrency:
+  group: release-cli
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Build and publish CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout agfs dependency
+        run: |
+          git clone --depth 1 https://github.com/c4pt0r/agfs ../agfs
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Determine version
+        run: |
+          VERSION="${GITHUB_SHA::7}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build CLI for all platforms
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            echo "Building dat9-${os}-${arch}..."
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -ldflags "-X main.version=${{ env.VERSION }}" \
+              -o "dist/dat9-${os}-${arch}" ./cmd/dat9
+          done
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum dat9-* > checksums.txt
+
+      - name: Write version file
+        run: |
+          echo "${{ env.VERSION }}" > dist/version
+
+      - name: Push to dat9-fe
+        run: |
+          git clone --depth 1 "https://x-access-token:${{ secrets.DAT9_FE_DEPLOY_TOKEN }}@github.com/mem9-ai/dat9-fe.git" /tmp/dat9-fe
+          mkdir -p /tmp/dat9-fe/site/releases
+          cp dist/* /tmp/dat9-fe/site/releases/
+          cd /tmp/dat9-fe
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add site/releases/
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "release: dat9 CLI ${{ env.VERSION }}"
+          git pull --rebase
+          git push
