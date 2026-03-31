@@ -149,6 +149,7 @@ environment:
   DAT9_SEMANTIC_LEASE_SECONDS task lease duration in seconds (default: 30)
   DAT9_SEMANTIC_RECOVER_INTERVAL_MS recover sweep interval in milliseconds (default: 5000)
   DAT9_SEMANTIC_RETRY_BASE_MS base retry backoff in milliseconds (default: 200)
+  DAT9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
   DAT9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
 
   Image extraction (async image -> text for search):
@@ -295,6 +296,7 @@ func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorker
 		LeaseDuration:        time.Duration(envInt("DAT9_SEMANTIC_LEASE_SECONDS", 30)) * time.Second,
 		RecoverInterval:      time.Duration(envInt("DAT9_SEMANTIC_RECOVER_INTERVAL_MS", 5000)) * time.Millisecond,
 		RetryBaseDelay:       time.Duration(envInt("DAT9_SEMANTIC_RETRY_BASE_MS", 200)) * time.Millisecond,
+		RetryMaxDelay:        time.Duration(envInt("DAT9_SEMANTIC_RETRY_MAX_MS", 30000)) * time.Millisecond,
 		PerTenantConcurrency: envInt("DAT9_SEMANTIC_PER_TENANT_CONCURRENCY", 1),
 	}
 	logger.Info(context.Background(), "semantic_embedding_mode_openai_compatible",
