@@ -124,6 +124,25 @@ func TestWriteCreateSkipsEmbedTaskWithoutTextSource(t *testing.T) {
 	}
 }
 
+func TestWriteCreateAutoEmbeddingSkipsEmbedTaskEvenWithTextSource(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
+	if _, err := b.Write("/data/file.txt", []byte("hello world"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	fileID, revision, embeddingRevision, _ := mustFileForPath(t, b, "/data/file.txt")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	if embeddingRevision != nil {
+		t.Fatalf("embedding revision should remain nil on create, got %v", *embeddingRevision)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 0 {
+		t.Fatalf("semantic task count=%d, want 0", len(tasks))
+	}
+}
+
 func TestWriteOverwriteEnqueuesNextRevisionAndClearsEmbeddingState(t *testing.T) {
 	b := newTestBackend(t)
 	if _, err := b.Write("/f.txt", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -177,6 +196,31 @@ func TestWriteOverwriteSkipsEmbedTaskWithoutTextSource(t *testing.T) {
 	}
 	if tasks[0].ResourceVersion != 1 {
 		t.Fatalf("unexpected semantic task history: %+v", tasks)
+	}
+}
+
+func TestWriteOverwriteAutoEmbeddingSkipsEmbedTaskAndPreservesEmbeddingState(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
+	if _, err := b.Write("/f.txt", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/f.txt")
+	setStoredEmbeddingState(t, b, fileID, 1)
+
+	if _, err := b.Write("/f.txt", []byte("new"), 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	_, revision, embeddingRevision, _ := mustFileForPath(t, b, "/f.txt")
+	if revision != 2 {
+		t.Fatalf("revision=%d, want 2", revision)
+	}
+	if embeddingRevision == nil || *embeddingRevision != 1 {
+		t.Fatalf("embedding revision should be preserved, got %v", embeddingRevision)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 0 {
+		t.Fatalf("semantic task count=%d, want 0", len(tasks))
 	}
 }
 
@@ -280,6 +324,64 @@ func TestConfirmUploadOverwriteSkipsEmbedTaskWithoutTextSourceAndRebindsUpload(t
 	}
 	if tasks[0].ResourceVersion != 1 || tasks[0].TaskType != string(semantic.TaskTypeEmbed) {
 		t.Fatalf("unexpected overwrite upload semantic tasks: %+v", tasks)
+	}
+	upload, err := b.GetUpload(ctx, plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upload.FileID != fileID {
+		t.Fatalf("upload file_id=%q, want surviving inode %q", upload.FileID, fileID)
+	}
+	var deletedStatus string
+	if err := b.Store().DB().QueryRow(`SELECT status FROM files WHERE file_id = ?`, pendingFileID).Scan(&deletedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if deletedStatus != "DELETED" {
+		t.Fatalf("pending upload file status=%q, want DELETED", deletedStatus)
+	}
+}
+
+func TestConfirmUploadOverwriteAutoEmbeddingSkipsEmbedTaskAndPreservesEmbeddingState(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
+	ctx := context.Background()
+	if _, err := b.Write("/report.txt", []byte("old body"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/report.txt")
+	setStoredEmbeddingState(t, b, fileID, 1)
+
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUpload(ctx, "/report.txt", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingUpload, err := b.GetUpload(ctx, plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingFileID := pendingUpload.FileID
+	uploadAllPartsForPlan(t, b, plan, plan.UploadID, totalSize)
+
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+
+	confirmedFileID, revision, embeddingRevision, contentType := mustFileForPath(t, b, "/report.txt")
+	if confirmedFileID != fileID {
+		t.Fatalf("overwrite should preserve inode file_id=%q, got %q", fileID, confirmedFileID)
+	}
+	if revision != 2 {
+		t.Fatalf("revision=%d, want 2", revision)
+	}
+	if embeddingRevision == nil || *embeddingRevision != 1 {
+		t.Fatalf("embedding revision should be preserved, got %v", embeddingRevision)
+	}
+	if contentType != detectContentType("/report.txt", nil) {
+		t.Fatalf("content_type=%q, want %q", contentType, detectContentType("/report.txt", nil))
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 0 {
+		t.Fatalf("semantic task count=%d, want 0", len(tasks))
 	}
 	upload, err := b.GetUpload(ctx, plan.UploadID)
 	if err != nil {
