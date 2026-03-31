@@ -74,26 +74,10 @@ func subtreeCond(prefix string) (string, []any) {
 
 // VectorSearch runs a vector similarity search for the supplied embedding.
 func (s *Store) VectorSearch(ctx context.Context, queryEmbedding []float32, pathPrefix string, limit int) ([]SearchResult, error) {
-	if len(queryEmbedding) == 0 {
+	q, args, ok := buildVectorSearchQuery(queryEmbedding, pathPrefix, limit)
+	if !ok {
 		return nil, nil
 	}
-	conds := []string{"f.status = 'CONFIRMED'", "f.embedding IS NOT NULL", "f.embedding_revision = f.revision"}
-	vecParam := embedding.FormatVector(queryEmbedding)
-	args := []any{vecParam}
-
-	if pathPrefix != "" && pathPrefix != "/" {
-		cond, pargs := subtreeCond(pathPrefix)
-		conds = append(conds, cond)
-		args = append(args, pargs...)
-	}
-	args = append(args, vecParam, limit)
-
-	q := `SELECT fn.path, fn.name, f.size_bytes,
-		VEC_EMBED_COSINE_DISTANCE(f.embedding, ?) AS distance
-		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
-		WHERE ` + strings.Join(conds, " AND ") + `
-		ORDER BY VEC_EMBED_COSINE_DISTANCE(f.embedding, ?)
-		LIMIT ?`
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -119,6 +103,30 @@ func (s *Store) VectorSearch(ctx context.Context, queryEmbedding []float32, path
 		return nil, err
 	}
 	return out, nil
+}
+
+func buildVectorSearchQuery(queryEmbedding []float32, pathPrefix string, limit int) (string, []any, bool) {
+	if len(queryEmbedding) == 0 {
+		return "", nil, false
+	}
+	conds := []string{"f.status = 'CONFIRMED'", "f.embedding IS NOT NULL", "f.embedding_revision = f.revision"}
+	vecParam := embedding.FormatVector(queryEmbedding)
+	args := []any{vecParam}
+
+	if pathPrefix != "" && pathPrefix != "/" {
+		cond, pargs := subtreeCond(pathPrefix)
+		conds = append(conds, cond)
+		args = append(args, pargs...)
+	}
+	args = append(args, vecParam, limit)
+
+	q := `SELECT fn.path, fn.name, f.size_bytes,
+		VEC_EMBED_COSINE_DISTANCE(f.embedding, ?) AS distance
+		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
+		WHERE ` + strings.Join(conds, " AND ") + `
+		ORDER BY VEC_EMBED_COSINE_DISTANCE(f.embedding, ?)
+		LIMIT ?`
+	return q, args, true
 }
 
 func ftsSafe(s string) string {
