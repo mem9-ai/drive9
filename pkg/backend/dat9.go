@@ -37,8 +37,11 @@ type Dat9Backend struct {
 	s3            s3client.S3Client // nil when S3 is not configured
 	smallInDB     bool
 	queryEmbedder embedding.Client
-	mu            sync.Mutex
-	entropy       io.Reader
+	// databaseAutoEmbedding records whether this backend should eventually run
+	// the TiDB database-managed embedding path instead of the app-managed one.
+	databaseAutoEmbedding bool
+	mu                    sync.Mutex
+	entropy               io.Reader
 
 	// Async image -> text extraction worker (in-memory queue for P0).
 	imageExtractEnabled bool
@@ -90,6 +93,12 @@ func NewWithS3ModeAndOptions(store *datastore.Store, s3 s3client.S3Client, small
 }
 
 func (b *Dat9Backend) Store() *datastore.Store { return b.store }
+
+// UsesDatabaseAutoEmbedding reports whether this backend instance is
+// configured for database-managed semantic embedding.
+func (b *Dat9Backend) UsesDatabaseAutoEmbedding() bool {
+	return b.databaseAutoEmbedding
+}
 
 func (b *Dat9Backend) genID() string {
 	b.mu.Lock()
