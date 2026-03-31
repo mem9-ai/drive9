@@ -23,7 +23,15 @@ dat9 --version
 
 Supported platforms: macOS (x86_64, arm64), Linux (x86_64, arm64).
 
-Install is done when `dat9 --version` prints a version number. After install, you're ready — no need to create a workspace or upload anything right away.
+Install is done when `dat9 --version` prints a version number. Do not upload any files at install time.
+
+### Preconditions
+
+Before any file operation, ensure the chain is satisfied: **install → create → fs commands**.
+
+1. `dat9 --version` succeeds (binary installed)
+2. `dat9 ctx` returns a context name (workspace exists). If empty, run `dat9 create` first.
+3. Now `dat9 fs ...` commands will work.
 
 ---
 
@@ -45,7 +53,7 @@ All commands exit 0 on success, non-zero on failure.
 
 ### Workspace setup
 
-A workspace is needed before any file operation. Each workspace is an isolated storage scope.
+Each workspace is an isolated storage scope. A workspace must exist before any `fs` command.
 
 ```bash
 dat9 create                   # provision a new workspace (auto-named)
@@ -105,6 +113,8 @@ dat9 fs grep "pricing strategy" /        # search all files
 dat9 fs grep "TODO" /projects/           # search within a directory
 ```
 
+Output: one line per match — `<path>\t<score>` (tab-separated). Empty output means no matches.
+
 **find** — structural search by name, tag, date, or size. Flags combine with AND.
 
 ```bash
@@ -116,7 +126,20 @@ dat9 fs find / -size +1048576
 dat9 fs find / -name "*.md" -newer 2026-03-01
 ```
 
+Output: one path per line. Empty output means no matches.
+
 Use `grep` to find files by what they contain. Use `find` to find files by name, date, tag, or size.
+
+### Output formats
+
+| Command | Output |
+|---|---|
+| `fs ls` | one entry per line, directories end with `/` |
+| `fs ls -l` | tab-separated: `type  size  name` (type: `d` or `-`) |
+| `fs cat` | raw file content to stdout |
+| `fs stat` | key-value lines: `size`, `isdir`, `revision` |
+| `fs grep` | tab-separated: `path  score` per match |
+| `fs find` | one path per line |
 
 ---
 
@@ -128,6 +151,17 @@ Use `grep` to find files by what they contain. Use `find` to find files by name,
 | `DAT9_API_KEY` | API key | (from `~/.dat9/config`) |
 
 ---
+
+## Error handling
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `no current context` | No workspace created yet | Run `dat9 create` |
+| `context "X" not found` | Typo or deleted context | Run `dat9 ctx list` to see available |
+| `provision failed` | Server unreachable or down | Check `DAT9_SERVER` env, network connectivity |
+| `401` / `403` | Invalid or expired API key | Run `dat9 ctx list` to verify, or `dat9 create` for a new workspace |
+| `404` on file ops | File or path doesn't exist | Run `dat9 fs ls :/` to check what's there |
+| Non-zero exit, no output | Generic failure | Re-run with `DAT9_CLI_LOG_ENABLED=true` for debug logs |
 
 ## Tips
 
