@@ -305,6 +305,99 @@ func TestEnsureSemanticTaskQueuedRequeuesSucceededTask(t *testing.T) {
 	}
 }
 
+func TestObserveSemanticTasksSummarizesQueueState(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Now().UTC()
+
+	if _, err := s.EnqueueSemanticTask(ctx, newSemanticTask("task-queued", "file-queued", 1, base.Add(-3*time.Second), base)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnqueueSemanticTask(ctx, newSemanticTask("task-future", "file-future", 1, base.Add(30*time.Second), base.Add(time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnqueueSemanticTask(ctx, newSemanticTask("task-processing", "file-processing", 1, base.Add(-5*time.Second), base.Add(2*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	processingTask, found, err := s.ClaimSemanticTask(ctx, base.Add(time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected processing task to be claimed")
+	}
+
+	if _, err := s.EnqueueSemanticTask(ctx, newSemanticTask("task-dead", "file-dead", 1, base.Add(-4*time.Second), base.Add(3*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`UPDATE semantic_tasks SET max_attempts = 1 WHERE task_id = ?`, "task-dead"); err != nil {
+		t.Fatal(err)
+	}
+	deadTask, found, err := s.ClaimSemanticTask(ctx, base.Add(2*time.Second), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected dead-letter task to be claimed")
+	}
+	if err := s.RetrySemanticTask(ctx, deadTask.TaskID, deadTask.Receipt, base.Add(3*time.Second), "permanent failure"); err != nil {
+		t.Fatal(err)
+	}
+
+	obs, err := s.ObserveSemanticTasks(ctx, base.Add(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs.Queued != 2 {
+		t.Fatalf("queued=%d, want 2", obs.Queued)
+	}
+	if obs.Processing != 1 {
+		t.Fatalf("processing=%d, want 1", obs.Processing)
+	}
+	if obs.DeadLettered != 1 {
+		t.Fatalf("dead_lettered=%d, want 1", obs.DeadLettered)
+	}
+	if obs.OldestClaimableAvailableAt == nil {
+		t.Fatal("expected oldest claimable available_at")
+	}
+	wantOldest := base.Add(-3 * time.Second).Round(time.Millisecond)
+	if !obs.OldestClaimableAvailableAt.Equal(wantOldest) {
+		t.Fatalf("oldest claimable=%s, want %s", obs.OldestClaimableAvailableAt.UTC(), wantOldest.UTC())
+	}
+
+	task := mustGetSemanticTask(t, s, processingTask.TaskID)
+	if task.Status != semantic.TaskProcessing {
+		t.Fatalf("processing task status=%q, want %q", task.Status, semantic.TaskProcessing)
+	}
+}
+
+func TestObserveSemanticTasksSkipsFutureOnlyQueueLag(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Unix(1711600700, 0).UTC()
+
+	if _, err := s.EnqueueSemanticTask(ctx, newSemanticTask("task-future", "file-future", 1, base.Add(10*time.Second), base)); err != nil {
+		t.Fatal(err)
+	}
+
+	obs, err := s.ObserveSemanticTasks(ctx, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs.Queued != 1 {
+		t.Fatalf("queued=%d, want 1", obs.Queued)
+	}
+	if obs.Processing != 0 {
+		t.Fatalf("processing=%d, want 0", obs.Processing)
+	}
+	if obs.DeadLettered != 0 {
+		t.Fatalf("dead_lettered=%d, want 0", obs.DeadLettered)
+	}
+	if obs.OldestClaimableAvailableAt != nil {
+		t.Fatalf("oldest claimable=%s, want nil", obs.OldestClaimableAvailableAt.UTC())
+	}
+}
+
 func mustGetSemanticTask(t *testing.T, s *Store, taskID string) *semantic.Task {
 	t.Helper()
 	row := s.DB().QueryRow(`SELECT task_id, task_type, resource_id, resource_version, status,

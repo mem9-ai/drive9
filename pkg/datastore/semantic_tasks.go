@@ -13,6 +13,16 @@ import (
 
 const defaultSemanticMaxAttempts = 5
 
+// SemanticTaskObservation summarizes queue state for one tenant-local
+// semantic_tasks table at a point in time. It is read-only state used for
+// observability and must not be treated as a source of delivery truth.
+type SemanticTaskObservation struct {
+	Queued                     int
+	Processing                 int
+	DeadLettered               int
+	OldestClaimableAvailableAt *time.Time
+}
+
 // EnqueueSemanticTask inserts a queued semantic task unless the same
 // task_type/resource_id/resource_version tuple already exists.
 func (s *Store) EnqueueSemanticTask(ctx context.Context, task *semantic.Task) (created bool, err error) {
@@ -52,6 +62,65 @@ func (s *Store) EnqueueSemanticTaskTx(db execer, task *semantic.Task) (bool, err
 // inside an existing transaction.
 func (s *Store) EnsureSemanticTaskQueuedTx(tx *sql.Tx, task *semantic.Task) (bool, error) {
 	return s.ensureSemanticTaskQueuedTx(tx, task)
+}
+
+// ObserveSemanticTasks returns a best-effort read-only queue snapshot for the
+// current tenant store without mutating any semantic task state.
+func (s *Store) ObserveSemanticTasks(ctx context.Context, now time.Time) (out *SemanticTaskObservation, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "observe_semantic_tasks", start, &err)
+
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	obs := &SemanticTaskObservation{}
+
+	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM semantic_tasks
+		WHERE status IN (?, ?, ?)
+		GROUP BY status`,
+		semantic.TaskQueued, semantic.TaskProcessing, semantic.TaskDeadLettered)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var (
+			status string
+			count  int
+		)
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, err
+		}
+		switch semantic.TaskStatus(status) {
+		case semantic.TaskQueued:
+			obs.Queued = count
+		case semantic.TaskProcessing:
+			obs.Processing = count
+		case semantic.TaskDeadLettered:
+			obs.DeadLettered = count
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	var availableAt sql.NullTime
+	err = s.db.QueryRowContext(ctx, `SELECT available_at FROM semantic_tasks
+		WHERE status = ? AND available_at <= ?
+		ORDER BY available_at, created_at, task_id
+		LIMIT 1`,
+		semantic.TaskQueued, now).Scan(&availableAt)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if availableAt.Valid {
+		t := availableAt.Time.UTC()
+		obs.OldestClaimableAvailableAt = &t
+	}
+	return obs, nil
 }
 
 func (s *Store) enqueueSemanticTask(db execer, task *semantic.Task) (bool, error) {
