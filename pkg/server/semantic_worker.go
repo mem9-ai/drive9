@@ -73,10 +73,11 @@ type semanticWorkerManager struct {
 	embedder embedding.Client
 	opts     SemanticWorkerOptions
 
-	mu       sync.Mutex
-	inflight map[string]int
-	rr       int
-	stores   map[string]*datastore.Store
+	mu         sync.Mutex
+	inflight   map[string]int
+	processing int
+	rr         int
+	stores     map[string]*datastore.Store
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -91,6 +92,14 @@ type semanticTarget struct {
 	tenantID string
 	store    *datastore.Store
 	release  func()
+}
+
+type semanticObservationSnapshot struct {
+	queued          int
+	processing      int
+	deadLettered    int
+	queueLagSeconds float64
+	inflight        int
 }
 
 func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store, pool *tenant.Pool, embedder embedding.Client, opts SemanticWorkerOptions) *semanticWorkerManager {
@@ -118,6 +127,12 @@ func (m *semanticWorkerManager) Start(ctx context.Context) {
 	}
 	workerCtx, cancel := context.WithCancel(backgroundWithTrace(ctx))
 	m.cancel = cancel
+	metrics.RecordGauge("semantic_worker", "workers", float64(m.opts.Workers))
+	metrics.RecordGauge("semantic_worker", "inflight", 0)
+	metrics.RecordGauge("semantic_worker", "queued", 0)
+	metrics.RecordGauge("semantic_worker", "processing", 0)
+	metrics.RecordGauge("semantic_worker", "dead_lettered", 0)
+	metrics.RecordGauge("semantic_worker", "queue_lag_seconds", 0)
 	for i := 0; i < m.opts.Workers; i++ {
 		m.wg.Add(1)
 		go m.workerLoop(workerCtx, i+1)
@@ -144,6 +159,9 @@ func (m *semanticWorkerManager) Stop() {
 		_ = store.Close()
 		delete(m.stores, tenantID)
 	}
+	m.processing = 0
+	metrics.RecordGauge("semantic_worker", "workers", 0)
+	metrics.RecordGauge("semantic_worker", "inflight", 0)
 }
 
 func (m *semanticWorkerManager) workerLoop(ctx context.Context, workerID int) {
@@ -174,6 +192,7 @@ func (m *semanticWorkerManager) recoverLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			m.recoverExpired(ctx)
+			m.observeOnce(ctx, time.Now().UTC())
 		}
 	}
 }
@@ -189,17 +208,29 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 	}
 	defer target.release()
 
+	claimStart := time.Now()
 	task, found, err := target.store.ClaimSemanticTask(ctx, time.Now().UTC(), m.opts.LeaseDuration)
 	if err != nil {
+		metrics.RecordOperation("semantic_worker", "claim", "error", time.Since(claimStart))
 		logger.Warn(ctx, "semantic_worker_claim_failed",
-			zap.String("tenant_id", target.tenantID),
-			zap.Error(err))
+			append([]zap.Field{
+				zap.String("tenant_id", target.tenantID),
+				zap.String("result", "error"),
+			}, zap.Error(err))...)
 		m.invalidateTenantStore(target.tenantID)
 		return false
 	}
 	if !found {
 		return false
 	}
+	metrics.RecordOperation("semantic_worker", "claim", "ok", time.Since(claimStart))
+	logger.Info(ctx, "semantic_worker_claim_ok",
+		append([]zap.Field{
+			zap.String("tenant_id", target.tenantID),
+			zap.String("result", "ok"),
+		}, semanticTaskLogFields(task)...)...)
+	m.markProcessingStart()
+	defer m.markProcessingDone()
 	m.processTask(ctx, target.tenantID, target.store, task)
 	return true
 }
@@ -213,92 +244,56 @@ func (m *semanticWorkerManager) processTask(ctx context.Context, tenantID string
 	defer func() {
 		metrics.RecordOperation("semantic_worker", string(task.TaskType), result, time.Since(start))
 	}()
-
-	if task.TaskType != semantic.TaskTypeEmbed {
-		result = "unsupported"
-		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("unsupported task type %q", task.TaskType))
-		return
-	}
-
-	file, err := store.GetFile(ctx, task.ResourceID)
-	if err != nil {
-		if errors.Is(err, datastore.ErrNotFound) {
-			result = "obsolete"
-			m.ackTask(ctx, tenantID, store, task, "file_not_found")
-			return
-		}
-		result = "get_file_error"
-		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("get file: %v", err))
-		return
-	}
-	if file.Status != datastore.StatusConfirmed || file.Revision != task.ResourceVersion || strings.TrimSpace(file.ContentText) == "" {
-		result = "obsolete"
-		m.ackTask(ctx, tenantID, store, task, "stale_or_empty")
-		return
-	}
-
-	vec, err := m.embedder.EmbedText(ctx, file.ContentText)
-	if err != nil {
-		result = "embed_error"
-		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("embed text: %v", err))
-		return
-	}
-	if len(vec) == 0 {
-		result = "embed_empty"
-		m.retryTask(ctx, tenantID, store, task, "embed text returned empty vector")
-		return
-	}
-
-	updated, err := store.UpdateFileEmbedding(ctx, task.ResourceID, task.ResourceVersion, vec)
-	if err != nil {
-		result = "writeback_error"
-		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("write embedding: %v", err))
-		return
-	}
-	if !updated {
-		result = "obsolete"
-		m.ackTask(ctx, tenantID, store, task, "conditional_write_miss")
-		return
-	}
-	m.ackTask(ctx, tenantID, store, task, "written")
+	result = m.dispatchTask(ctx, tenantID, store, task)
 }
 
 func (m *semanticWorkerManager) ackTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task, reason string) {
 	if err := store.AckSemanticTask(ctx, task.TaskID, task.Receipt); err != nil {
 		logger.Warn(ctx, "semantic_worker_ack_failed",
-			zap.String("tenant_id", tenantID),
-			zap.String("task_id", task.TaskID),
-			zap.String("reason", reason),
-			zap.Error(err))
+			append([]zap.Field{
+				zap.String("tenant_id", tenantID),
+				zap.String("reason", reason),
+				zap.String("result", "error"),
+			}, append(semanticTaskLogFields(task), zap.Error(err))...)...)
 		return
 	}
 	logger.Info(ctx, "semantic_worker_ack_ok",
-		zap.String("tenant_id", tenantID),
-		zap.String("task_id", task.TaskID),
-		zap.String("resource_id", task.ResourceID),
-		zap.Int64("resource_version", task.ResourceVersion),
-		zap.String("reason", reason))
+		append([]zap.Field{
+			zap.String("tenant_id", tenantID),
+			zap.String("reason", reason),
+			zap.String("result", reason),
+		}, semanticTaskLogFields(task)...)...)
 }
 
 func (m *semanticWorkerManager) retryTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task, message string) {
+	start := time.Now()
 	retryAt := time.Now().UTC().Add(m.retryDelay(task.AttemptCount))
+	willDeadLetter := task.AttemptCount >= task.MaxAttempts
 	if err := store.RetrySemanticTask(ctx, task.TaskID, task.Receipt, retryAt, message); err != nil {
+		metrics.RecordOperation("semantic_worker", "retry", "error", time.Since(start))
 		logger.Warn(ctx, "semantic_worker_retry_failed",
-			zap.String("tenant_id", tenantID),
-			zap.String("task_id", task.TaskID),
-			zap.String("resource_id", task.ResourceID),
-			zap.Int64("resource_version", task.ResourceVersion),
-			zap.Error(err))
+			append([]zap.Field{
+				zap.String("tenant_id", tenantID),
+				zap.String("result", "error"),
+			}, append(semanticTaskLogFields(task), zap.Error(err))...)...)
 		return
 	}
-	logger.Warn(ctx, "semantic_worker_retry_scheduled",
+	result := "scheduled"
+	logMessage := "semantic_worker_retry_scheduled"
+	if willDeadLetter {
+		result = "dead_lettered"
+		logMessage = "semantic_worker_dead_lettered"
+	}
+	metrics.RecordOperation("semantic_worker", "retry", result, time.Since(start))
+	fields := append([]zap.Field{
 		zap.String("tenant_id", tenantID),
-		zap.String("task_id", task.TaskID),
-		zap.String("resource_id", task.ResourceID),
-		zap.Int64("resource_version", task.ResourceVersion),
-		zap.Int("attempt_count", task.AttemptCount),
-		zap.Time("retry_at", retryAt),
-		zap.String("message", message))
+		zap.String("result", result),
+		zap.String("message", message),
+	}, semanticTaskLogFields(task)...)
+	if !willDeadLetter {
+		fields = append(fields, zap.Time("retry_at", retryAt))
+	}
+	logger.Warn(ctx, logMessage, fields...)
 }
 
 func (m *semanticWorkerManager) retryDelay(attemptCount int) time.Duration {
@@ -332,8 +327,10 @@ func (m *semanticWorkerManager) recoverExpired(ctx context.Context) {
 				zap.Error(err))
 			continue
 		}
+		start := time.Now()
 		recovered, err := store.RecoverExpiredSemanticTasks(ctx, time.Now().UTC(), 64)
 		if err != nil {
+			metrics.RecordOperation("semantic_worker", "recover", "error", time.Since(start))
 			logger.Warn(ctx, "semantic_worker_recover_failed",
 				zap.String("tenant_id", ref.id),
 				zap.Error(err))
@@ -341,8 +338,10 @@ func (m *semanticWorkerManager) recoverExpired(ctx context.Context) {
 			continue
 		}
 		if recovered > 0 {
+			metrics.RecordOperation("semantic_worker", "recover", "ok", time.Since(start))
 			logger.Info(ctx, "semantic_worker_recover_ok",
 				zap.String("tenant_id", ref.id),
+				zap.String("result", "ok"),
 				zap.Int("recovered", recovered))
 		}
 	}
@@ -364,6 +363,9 @@ func (m *semanticWorkerManager) nextTarget(ctx context.Context) (*semanticTarget
 		}
 		store, err := m.storeForRef(ctx, ref)
 		if err != nil {
+			logger.Warn(ctx, "semantic_worker_open_store_failed",
+				zap.String("tenant_id", ref.id),
+				zap.Error(err))
 			m.releaseTenantSlot(ref.id)
 			continue
 		}
@@ -472,4 +474,150 @@ func (m *semanticWorkerManager) invalidateTenantStore(tenantID string) {
 	}
 	_ = store.Close()
 	delete(m.stores, tenantID)
+}
+
+func (m *semanticWorkerManager) dispatchTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task) string {
+	switch task.TaskType {
+	case semantic.TaskTypeEmbed:
+		return m.processEmbedTask(ctx, tenantID, store, task)
+	default:
+		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("unsupported task type %q", task.TaskType))
+		return "unsupported"
+	}
+}
+
+func (m *semanticWorkerManager) processEmbedTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task) string {
+	file, err := store.GetFile(ctx, task.ResourceID)
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			m.ackTask(ctx, tenantID, store, task, "file_not_found")
+			return "obsolete"
+		}
+		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("get file: %v", err))
+		return "get_file_error"
+	}
+	if file.Status != datastore.StatusConfirmed || file.Revision != task.ResourceVersion || strings.TrimSpace(file.ContentText) == "" {
+		m.ackTask(ctx, tenantID, store, task, "stale_or_empty")
+		return "obsolete"
+	}
+
+	vec, err := m.embedder.EmbedText(ctx, file.ContentText)
+	if err != nil {
+		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("embed text: %v", err))
+		return "embed_error"
+	}
+	if len(vec) == 0 {
+		m.retryTask(ctx, tenantID, store, task, "embed text returned empty vector")
+		return "embed_empty"
+	}
+
+	updated, err := store.UpdateFileEmbedding(ctx, task.ResourceID, task.ResourceVersion, vec)
+	if err != nil {
+		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("write embedding: %v", err))
+		return "writeback_error"
+	}
+	if !updated {
+		m.ackTask(ctx, tenantID, store, task, "conditional_write_miss")
+		return "obsolete"
+	}
+	m.ackTask(ctx, tenantID, store, task, "written")
+	return "ok"
+}
+
+func semanticTaskLogFields(task *semantic.Task) []zap.Field {
+	if task == nil {
+		return nil
+	}
+	fields := []zap.Field{
+		zap.String("task_id", task.TaskID),
+		zap.String("task_type", string(task.TaskType)),
+		zap.String("resource_id", task.ResourceID),
+		zap.Int64("resource_version", task.ResourceVersion),
+		zap.String("receipt", task.Receipt),
+		zap.Int("attempt_count", task.AttemptCount),
+	}
+	if task.LeaseUntil != nil {
+		fields = append(fields, zap.Time("lease_until", task.LeaseUntil.UTC()))
+	}
+	return fields
+}
+
+func (m *semanticWorkerManager) markProcessingStart() {
+	m.mu.Lock()
+	m.processing++
+	inflight := m.processing
+	m.mu.Unlock()
+	metrics.RecordGauge("semantic_worker", "inflight", float64(inflight))
+}
+
+func (m *semanticWorkerManager) markProcessingDone() {
+	m.mu.Lock()
+	if m.processing > 0 {
+		m.processing--
+	}
+	inflight := m.processing
+	m.mu.Unlock()
+	metrics.RecordGauge("semantic_worker", "inflight", float64(inflight))
+}
+
+func (m *semanticWorkerManager) snapshotProcessing() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.processing
+}
+
+func (m *semanticWorkerManager) observeOnce(ctx context.Context, now time.Time) {
+	snapshot := m.collectObservation(ctx, now)
+	metrics.RecordGauge("semantic_worker", "inflight", float64(snapshot.inflight))
+	metrics.RecordGauge("semantic_worker", "queued", float64(snapshot.queued))
+	metrics.RecordGauge("semantic_worker", "processing", float64(snapshot.processing))
+	metrics.RecordGauge("semantic_worker", "dead_lettered", float64(snapshot.deadLettered))
+	metrics.RecordGauge("semantic_worker", "queue_lag_seconds", snapshot.queueLagSeconds)
+}
+
+func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time.Time) semanticObservationSnapshot {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	snapshot := semanticObservationSnapshot{inflight: m.snapshotProcessing()}
+	refs, err := m.listTenantRefs(ctx)
+	if err != nil {
+		logger.Warn(ctx, "semantic_worker_list_tenants_for_observation_failed", zap.Error(err))
+		return snapshot
+	}
+
+	var oldest *time.Time
+	for _, ref := range refs {
+		store, err := m.storeForRef(ctx, ref)
+		if err != nil {
+			logger.Warn(ctx, "semantic_worker_open_store_for_observation_failed",
+				zap.String("tenant_id", ref.id),
+				zap.Error(err))
+			continue
+		}
+		obs, err := store.ObserveSemanticTasks(ctx, now)
+		if err != nil {
+			logger.Warn(ctx, "semantic_worker_observe_failed",
+				zap.String("tenant_id", ref.id),
+				zap.Error(err))
+			m.invalidateTenantStore(ref.id)
+			continue
+		}
+		snapshot.queued += obs.Queued
+		snapshot.processing += obs.Processing
+		snapshot.deadLettered += obs.DeadLettered
+		if obs.OldestClaimableAvailableAt != nil && (oldest == nil || obs.OldestClaimableAvailableAt.Before(*oldest)) {
+			t := obs.OldestClaimableAvailableAt.UTC()
+			oldest = &t
+		}
+	}
+	if oldest != nil {
+		lag := now.Sub(*oldest).Seconds()
+		if lag > 0 {
+			snapshot.queueLagSeconds = lag
+		}
+	}
+	return snapshot
 }

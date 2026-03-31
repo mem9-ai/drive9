@@ -11,8 +11,11 @@ import (
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/semantic"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 type staticSemanticEmbedder struct {
@@ -201,6 +204,212 @@ func TestSemanticWorkerRecoversExpiredClaim(t *testing.T) {
 	}
 }
 
+func TestSemanticWorkerCollectObservationLocalFallback(t *testing.T) {
+	b := newTestBackendForSemanticWorker(t)
+	ctx := context.Background()
+	base := time.Now().UTC()
+
+	if _, err := b.Store().EnqueueSemanticTask(ctx, &semantic.Task{
+		TaskID:          "task-processing",
+		TaskType:        semantic.TaskTypeEmbed,
+		ResourceID:      "file-processing",
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     base.Add(-5 * time.Second),
+		CreatedAt:       base,
+		UpdatedAt:       base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Store().EnqueueSemanticTask(ctx, &semantic.Task{
+		TaskID:          "task-dead",
+		TaskType:        semantic.TaskTypeEmbed,
+		ResourceID:      "file-dead",
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     1,
+		AvailableAt:     base.Add(-4 * time.Second),
+		CreatedAt:       base.Add(time.Second),
+		UpdatedAt:       base.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := b.Store().ClaimSemanticTask(ctx, base.Add(2*time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected claimed processing task")
+	}
+	if _, err := b.Store().EnqueueSemanticTask(ctx, &semantic.Task{
+		TaskID:          "task-queued",
+		TaskType:        semantic.TaskTypeEmbed,
+		ResourceID:      "file-queued",
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     base.Add(-3 * time.Second),
+		CreatedAt:       base.Add(2 * time.Second),
+		UpdatedAt:       base.Add(2 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Store().EnqueueSemanticTask(ctx, &semantic.Task{
+		TaskID:          "task-future",
+		TaskType:        semantic.TaskTypeEmbed,
+		ResourceID:      "file-future",
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     base.Add(30 * time.Second),
+		CreatedAt:       base.Add(3 * time.Second),
+		UpdatedAt:       base.Add(3 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadTask, found, err := b.Store().ClaimSemanticTask(ctx, base.Add(3*time.Second), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected dead-letter task to be claimed")
+	}
+	if err := b.Store().RetrySemanticTask(ctx, deadTask.TaskID, deadTask.Receipt, base.Add(4*time.Second), "permanent failure"); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newSemanticWorkerManager(b, nil, nil, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	m.markProcessingStart()
+	defer m.markProcessingDone()
+
+	snapshot := m.collectObservation(ctx, base.Add(5*time.Second))
+	if snapshot.inflight != 1 {
+		t.Fatalf("inflight=%d, want 1", snapshot.inflight)
+	}
+	if snapshot.queued != 2 {
+		t.Fatalf("queued=%d, want 2", snapshot.queued)
+	}
+	if snapshot.processing != 1 {
+		t.Fatalf("processing=%d, want 1", snapshot.processing)
+	}
+	if snapshot.deadLettered != 1 {
+		t.Fatalf("dead_lettered=%d, want 1", snapshot.deadLettered)
+	}
+	if snapshot.queueLagSeconds < 7.5 || snapshot.queueLagSeconds > 8.5 {
+		t.Fatalf("queue_lag_seconds=%v, want about 8", snapshot.queueLagSeconds)
+	}
+
+	waitForNamedTaskStatus(t, b, claimed.TaskID, string(semantic.TaskProcessing), time.Second)
+}
+
+func TestSemanticWorkerClaimAndAckLogsIncludeTaskFields(t *testing.T) {
+	core, recorded := observer.New(zap.InfoLevel)
+	restoreLogger := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(restoreLogger) })
+
+	_, b := newTestServerWithSemanticWorker(t, staticSemanticEmbedder{vec: []float32{0.1, 0.2, 0.3}}, SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
+	})
+	if _, err := b.Write("/docs/logs.txt", []byte("hello semantic logs"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	nf := mustServerFile(t, b, "/docs/logs.txt")
+	waitForTaskStatus(t, b, nf.FileID, 1, string(semantic.TaskSucceeded), 3*time.Second)
+
+	claim := waitForObservedLog(t, recorded, "semantic_worker_claim_ok", 3*time.Second)
+	if claim.ContextMap()["task_type"] != string(semantic.TaskTypeEmbed) {
+		t.Fatalf("claim task_type=%v, want %q", claim.ContextMap()["task_type"], semantic.TaskTypeEmbed)
+	}
+	if claim.ContextMap()["resource_id"] != nf.FileID {
+		t.Fatalf("claim resource_id=%v, want %q", claim.ContextMap()["resource_id"], nf.FileID)
+	}
+	if claim.ContextMap()["result"] != "ok" {
+		t.Fatalf("claim result=%v, want %q", claim.ContextMap()["result"], "ok")
+	}
+
+	ack := waitForObservedLog(t, recorded, "semantic_worker_ack_ok", 3*time.Second)
+	if ack.ContextMap()["task_type"] != string(semantic.TaskTypeEmbed) {
+		t.Fatalf("ack task_type=%v, want %q", ack.ContextMap()["task_type"], semantic.TaskTypeEmbed)
+	}
+	if ack.ContextMap()["resource_id"] != nf.FileID {
+		t.Fatalf("ack resource_id=%v, want %q", ack.ContextMap()["resource_id"], nf.FileID)
+	}
+	if ack.ContextMap()["reason"] != "written" {
+		t.Fatalf("ack reason=%v, want %q", ack.ContextMap()["reason"], "written")
+	}
+}
+
+func TestSemanticWorkerDeadLetterLogIncludesTaskFields(t *testing.T) {
+	core, recorded := observer.New(zap.WarnLevel)
+	restoreLogger := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(restoreLogger) })
+
+	_, b := newTestServerWithSemanticWorker(t, staticSemanticEmbedder{err: errors.New("embed failed")}, SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 30 * time.Millisecond,
+		LeaseDuration:   100 * time.Millisecond,
+		RetryBaseDelay:  20 * time.Millisecond,
+	})
+	if _, err := b.Write("/docs/dead.txt", []byte("dead letter logs"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	nf := mustServerFile(t, b, "/docs/dead.txt")
+	if _, err := b.Store().DB().Exec(`UPDATE semantic_tasks SET max_attempts = 1 WHERE resource_id = ? AND resource_version = 1`, nf.FileID); err != nil {
+		t.Fatal(err)
+	}
+	waitForTaskStatus(t, b, nf.FileID, 1, string(semantic.TaskDeadLettered), 3*time.Second)
+
+	entry := waitForObservedLog(t, recorded, "semantic_worker_dead_lettered", 3*time.Second)
+	if entry.ContextMap()["task_type"] != string(semantic.TaskTypeEmbed) {
+		t.Fatalf("dead-letter task_type=%v, want %q", entry.ContextMap()["task_type"], semantic.TaskTypeEmbed)
+	}
+	if entry.ContextMap()["resource_id"] != nf.FileID {
+		t.Fatalf("dead-letter resource_id=%v, want %q", entry.ContextMap()["resource_id"], nf.FileID)
+	}
+	if entry.ContextMap()["result"] != "dead_lettered" {
+		t.Fatalf("dead-letter result=%v, want %q", entry.ContextMap()["result"], "dead_lettered")
+	}
+}
+
+func TestSemanticWorkerUnsupportedTaskTypeDeadLetters(t *testing.T) {
+	b := newTestBackendForSemanticWorker(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if _, err := b.Store().EnqueueSemanticTask(ctx, &semantic.Task{
+		TaskID:          "task-generate-l0",
+		TaskType:        semantic.TaskTypeGenerateL0,
+		ResourceID:      "summary-target",
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     1,
+		AvailableAt:     now,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s := NewWithConfig(Config{Backend: b, SemanticEmbedder: staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkers: SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 30 * time.Millisecond,
+		LeaseDuration:   100 * time.Millisecond,
+		RetryBaseDelay:  20 * time.Millisecond,
+	}})
+	t.Cleanup(func() { s.Close() })
+
+	waitForNamedTaskStatus(t, b, "task-generate-l0", string(semantic.TaskDeadLettered), 3*time.Second)
+}
+
 func mustServerFile(t *testing.T, b *backend.Dat9Backend, path string) *datastore.File {
 	t.Helper()
 	nf, err := b.Store().Stat(context.Background(), path)
@@ -208,4 +417,39 @@ func mustServerFile(t *testing.T, b *backend.Dat9Backend, path string) *datastor
 		t.Fatalf("stat %s: %v", path, err)
 	}
 	return nf.File
+}
+
+func waitForNamedTaskStatus(t *testing.T, b *backend.Dat9Backend, taskID, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var status string
+		err := b.Store().DB().QueryRow(`SELECT status FROM semantic_tasks WHERE task_id = ?`, taskID).Scan(&status)
+		if err == nil && status == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var status string
+	if err := b.Store().DB().QueryRow(`SELECT status FROM semantic_tasks WHERE task_id = ?`, taskID).Scan(&status); err != nil {
+		t.Fatalf("wait named task status query: %v", err)
+	}
+	t.Fatalf("task %s status=%q, want %q", taskID, status, want)
+}
+
+func waitForObservedLog(t *testing.T, recorded *observer.ObservedLogs, message string, timeout time.Duration) observer.LoggedEntry {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		entries := recorded.FilterMessage(message).AllUntimed()
+		if len(entries) > 0 {
+			return entries[len(entries)-1]
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	entries := recorded.FilterMessage(message).AllUntimed()
+	if len(entries) == 0 {
+		t.Fatalf("timed out waiting for log message %q", message)
+	}
+	return entries[len(entries)-1]
 }

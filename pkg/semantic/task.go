@@ -12,6 +12,12 @@ type TaskType string
 const (
 	// TaskTypeEmbed generates or refreshes file embeddings.
 	TaskTypeEmbed TaskType = "embed"
+	// TaskTypeExtractText extracts or refreshes file content_text.
+	TaskTypeExtractText TaskType = "extract_text"
+	// TaskTypeGenerateL0 generates or refreshes .abstract.md style summaries.
+	TaskTypeGenerateL0 TaskType = "generate_l0"
+	// TaskTypeGenerateL1 generates or refreshes .overview.md style summaries.
+	TaskTypeGenerateL1 TaskType = "generate_l1"
 )
 
 // TaskStatus describes the delivery state of a semantic task.
