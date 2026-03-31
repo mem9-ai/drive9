@@ -442,6 +442,10 @@ func (m *semanticWorkerManager) storeForRef(ctx context.Context, ref semanticTen
 	if err != nil {
 		return nil, fmt.Errorf("decrypt tenant password: %w", err)
 	}
+	// TODO(async-embedding): This worker runtime path still assumes every tenant
+	// datastore can be opened through the MySQL-oriented datastore.Open + tenantDSN
+	// flow. DB9/Postgres schema support exists at the DDL layer, but end-to-end
+	// runtime support here is not provider-neutral yet.
 	store, err := datastore.Open(tenantDSN(ref.tenant.DBUser, string(pass), ref.tenant.DBHost, ref.tenant.DBPort, ref.tenant.DBName, ref.tenant.DBTLS))
 	if err != nil {
 		return nil, fmt.Errorf("open tenant store: %w", err)
