@@ -16,7 +16,7 @@ CLI_BATCH_SMALL_FILE_COUNT="${CLI_BATCH_SMALL_FILE_COUNT:-10}"
 CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
 RUN_CLI_UPLOAD_LIMIT_BOUNDARY="${RUN_CLI_UPLOAD_LIMIT_BOUNDARY:-1}"
-CLI_UPLOAD_LIMIT_BYTES="${CLI_UPLOAD_LIMIT_BYTES:-1073741824}"
+CLI_UPLOAD_LIMIT_BYTES="${CLI_UPLOAD_LIMIT_BYTES:-53687091200}"
 CLI_SEMANTIC_TIMEOUT_S="${CLI_SEMANTIC_TIMEOUT_S:-90}"
 CLI_SEMANTIC_INTERVAL_S="${CLI_SEMANTIC_INTERVAL_S:-3}"
 
@@ -428,9 +428,13 @@ if [ "$RUN_CLI_UPLOAD_LIMIT_BOUNDARY" = "1" ]; then
   boundary_checksums=$(python3 - <<'PY'
 import base64
 import hashlib
+import os
 part = b"\x00" * (8 * 1024 * 1024)
 one = base64.b64encode(hashlib.sha256(part).digest()).decode()
-print(",".join([one] * 128))
+upload_limit = int(os.environ["CLI_UPLOAD_LIMIT_BYTES"])
+part_size = 8 * 1024 * 1024
+parts = (upload_limit + part_size - 1) // part_size
+print(",".join([one] * parts))
 PY
 )
 

@@ -58,7 +58,7 @@ var (
 	schemaInitMaxBackoff     = 30 * time.Second
 )
 
-const defaultMaxUploadBytes int64 = 1 << 30 // 1 GiB
+const defaultMaxUploadBytes int64 = 50 * (1 << 30) // 50 GiB
 
 func New(b *backend.Dat9Backend) *Server {
 	return NewWithConfig(Config{Backend: b})
