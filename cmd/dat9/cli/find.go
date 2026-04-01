@@ -62,6 +62,11 @@ func Find(c *client.Client, args []string) error {
 		}
 	}
 
+	// Handle ":" prefixed remote paths like cp command
+	if rp, isRemote := ParseRemote(path); isRemote {
+		path = rp.Path
+	}
+
 	results, err := c.Find(path, params)
 	if err != nil {
 		return err

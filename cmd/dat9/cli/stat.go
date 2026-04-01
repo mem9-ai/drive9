@@ -9,11 +9,17 @@ import (
 // Stat shows metadata for a remote path.
 //
 //	dat9 stat /path/to/file
+//	dat9 stat :/path/to/file
 func Stat(c *client.Client, args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: dat9 stat <path>")
 	}
-	s, err := c.Stat(args[0])
+	path := args[0]
+	// Handle ":" prefixed remote paths like cp command
+	if rp, isRemote := ParseRemote(path); isRemote {
+		path = rp.Path
+	}
+	s, err := c.Stat(path)
 	if err != nil {
 		return err
 	}

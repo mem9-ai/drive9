@@ -18,6 +18,11 @@ func Grep(c *client.Client, args []string) error {
 		path = args[1]
 	}
 
+	// Handle ":" prefixed remote paths like cp command
+	if rp, isRemote := ParseRemote(path); isRemote {
+		path = rp.Path
+	}
+
 	results, err := c.Grep(query, path, 20)
 	if err != nil {
 		return err
@@ -44,6 +49,12 @@ func GrepJSON(c *client.Client, args []string) error {
 	if len(args) > 1 {
 		path = args[1]
 	}
+
+	// Handle ":" prefixed remote paths like cp command
+	if rp, isRemote := ParseRemote(path); isRemote {
+		path = rp.Path
+	}
+
 	results, err := c.Grep(query, path, 20)
 	if err != nil {
 		return err
