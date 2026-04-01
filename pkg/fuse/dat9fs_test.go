@@ -194,7 +194,7 @@ func TestLookupFallsBackToParentListWhenDirStatUnsupported(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("Lookup status = %v, want OK", st)
 	}
-	if out.Attr.Mode&syscall.S_IFDIR == 0 {
-		t.Fatalf("Lookup mode = %o, want directory mode", out.Attr.Mode)
+	if out.Mode&syscall.S_IFDIR == 0 {
+		t.Fatalf("Lookup mode = %o, want directory mode", out.Mode)
 	}
 }
