@@ -147,7 +147,7 @@ Use `grep` to find files by what they contain. Use `find` to find files by name,
 
 | Variable | Description | Default |
 |---|---|---|
-| `DAT9_SERVER` | Server URL | `https://api.db9.ai` |
+| `DAT9_SERVER` | Server URL | `https://api.dat9.ai` |
 | `DAT9_API_KEY` | API key | (from `~/.dat9/config`) |
 
 ---

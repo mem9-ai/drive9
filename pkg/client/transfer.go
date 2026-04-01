@@ -37,7 +37,7 @@ type PartURL struct {
 type ProgressFunc func(partNumber, totalParts int, bytesUploaded int64)
 
 // DefaultSmallFileThreshold matches the server's threshold for direct PUT vs multipart.
-const DefaultSmallFileThreshold = 50 << 10 // 50KB
+const DefaultSmallFileThreshold = 50_000 // 50,000 bytes — matches embedding model max input characters
 
 // WriteStream uploads data from a reader. For small files (size < threshold),
 // it does a direct PUT with body. For large files, it sends a Content-Length-only
