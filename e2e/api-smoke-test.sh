@@ -637,41 +637,64 @@ fi
 
 if [ "$RUN_UPLOAD_LIMIT_BOUNDARY" = "1" ]; then
   step "15" "Upload limit boundary (limit/limit+1)"
-  BOUNDARY_CHECKSUMS=$(python3 - <<'PY'
+  boundary_ok_payload="$(mktemp)"
+  python3 - "$ROOT_DIR/limit-1g.bin" "$UPLOAD_LIMIT_BYTES" > "$boundary_ok_payload" <<'PY'
 import base64
 import hashlib
-import os
-part = b"\x00" * (8 * 1024 * 1024)
-one = base64.b64encode(hashlib.sha256(part).digest()).decode()
-upload_limit = int(os.environ["UPLOAD_LIMIT_BYTES"])
+import json
+import sys
+
+path = "/" + sys.argv[1].lstrip("/")
+upload_limit = int(sys.argv[2])
 part_size = 8 * 1024 * 1024
+part = b"\x00" * part_size
+checksum = base64.b64encode(hashlib.sha256(part).digest()).decode()
 parts = (upload_limit + part_size - 1) // part_size
-print(",".join([one] * parts))
+print(json.dumps({
+    "path": path,
+    "total_size": upload_limit,
+    "part_checksums": [checksum] * parts,
+}))
 PY
-)
 
   boundary_ok_body="$(mktemp)"
-  boundary_ok_code=$(curl -sS -o "$boundary_ok_body" -w "%{http_code}" -X PUT \
+  boundary_ok_code=$(curl -sS -o "$boundary_ok_body" -w "%{http_code}" -X POST \
     -H "Authorization: Bearer $API_KEY" \
-    -H "X-Dat9-Content-Length: $UPLOAD_LIMIT_BYTES" \
-    -H "X-Dat9-Part-Checksums: $BOUNDARY_CHECKSUMS" \
-    --data-binary "" \
-    "$BASE/v1/fs/$ROOT_DIR/limit-1g.bin")
+    -H "Content-Type: application/json" \
+    --data-binary "@$boundary_ok_payload" \
+    "$BASE/v1/uploads/initiate")
   check_eq "init at upload limit returns 202" "$boundary_ok_code" "202"
-  rm -f "$boundary_ok_body"
+  rm -f "$boundary_ok_payload" "$boundary_ok_body"
 
   over_limit=$((UPLOAD_LIMIT_BYTES + 1))
+  boundary_over_payload="$(mktemp)"
+  python3 - "$ROOT_DIR/limit-over.bin" "$over_limit" > "$boundary_over_payload" <<'PY'
+import base64
+import hashlib
+import json
+import sys
+
+path = "/" + sys.argv[1].lstrip("/")
+over_limit = int(sys.argv[2])
+part = b"\x00" * (8 * 1024 * 1024)
+checksum = base64.b64encode(hashlib.sha256(part).digest()).decode()
+print(json.dumps({
+    "path": path,
+    "total_size": over_limit,
+    "part_checksums": [checksum],
+}))
+PY
+
   boundary_over_body="$(mktemp)"
-  boundary_over_code=$(curl -sS -o "$boundary_over_body" -w "%{http_code}" -X PUT \
+  boundary_over_code=$(curl -sS -o "$boundary_over_body" -w "%{http_code}" -X POST \
     -H "Authorization: Bearer $API_KEY" \
-    -H "X-Dat9-Content-Length: $over_limit" \
-    -H "X-Dat9-Part-Checksums: $BOUNDARY_CHECKSUMS" \
-    --data-binary "" \
-    "$BASE/v1/fs/$ROOT_DIR/limit-over.bin")
+    -H "Content-Type: application/json" \
+    --data-binary "@$boundary_over_payload" \
+    "$BASE/v1/uploads/initiate")
   check_eq "init over upload limit returns 413" "$boundary_over_code" "413"
   over_err=$(jq -r '.error // empty' "$boundary_over_body")
   check_cmd "over-limit response has error message" test -n "$over_err"
-  rm -f "$boundary_over_body"
+  rm -f "$boundary_over_payload" "$boundary_over_body"
 fi
 
 rm -f "$IMAGE_LOCAL"
