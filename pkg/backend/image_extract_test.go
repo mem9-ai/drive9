@@ -79,17 +79,25 @@ func TestAsyncImageExtractAutoEmbeddingUpdatesContentTextWithoutSemanticTask(t *
 			Extractor: &staticImageExtractor{text: "cat on sofa screenshot invoice"},
 		},
 	})
-
-	if _, err := b.Write("/img/auto.png", []byte("fake-png"), 0, filesystem.WriteFlagCreate); err != nil {
+	fileID := insertImageFileForExtractTest(t, b, "/img/auto.png", "image/png", []byte("fake-png"))
+	result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/img/auto.png",
+		ContentType: "image/png",
+		Revision:    1,
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	if result != ImageExtractResultWritten {
+		t.Fatalf("result=%q, want %q", result, ImageExtractResultWritten)
+	}
 
-	got := waitForContentText(t, b, "/img/auto.png", 2*time.Second)
+	got := waitForContentText(t, b, "/img/auto.png", time.Second)
 	if !strings.Contains(got, "cat on sofa") {
 		t.Fatalf("unexpected extracted text: %q", got)
 	}
 
-	fileID, _, _, _ := mustFileForPath(t, b, "/img/auto.png")
 	if tasks := loadSemanticTasksForFile(t, b, fileID); len(tasks) != 0 {
 		t.Fatalf("semantic task count=%d, want 0", len(tasks))
 	}
@@ -144,17 +152,14 @@ func TestAsyncImageExtractAutoEmbeddingStaleResultDoesNotQueueOrOverwriteCurrent
 			Extractor: extractor,
 		},
 	})
-
-	if _, err := b.Write("/img/auto-stale.png", []byte("first-image-bytes"), 0, filesystem.WriteFlagCreate); err != nil {
-		t.Fatal(err)
-	}
+	fileID := insertImageFileForExtractTest(t, b, "/img/auto-stale.png", "image/png", []byte("first-image-bytes"))
+	b.enqueueImageExtract(fileID, "/img/auto-stale.png", "image/png", 1)
 	select {
 	case <-extractor.started:
 	case <-time.After(2 * time.Second):
 		t.Fatal("first extraction did not start")
 	}
 
-	fileID, _, _, _ := mustFileForPath(t, b, "/img/auto-stale.png")
 	if _, err := b.Write("/img/auto-stale.png", []byte("second-image-bytes"), 0, filesystem.WriteFlagTruncate); err != nil {
 		t.Fatal(err)
 	}

@@ -145,6 +145,51 @@ func TestWriteCreateAutoEmbeddingSkipsEmbedTaskEvenWithTextSource(t *testing.T) 
 	}
 }
 
+func TestWriteCreateAutoEmbeddingImageEnqueuesImgExtractTaskWithoutLegacyQueue(t *testing.T) {
+	extractor := &gatedImageExtractor{started: make(chan struct{}, 1), release: make(chan struct{})}
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: extractor,
+		},
+	})
+	if _, err := b.Write("/img/create-auto.png", []byte("fake-png"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-extractor.started:
+		close(extractor.release)
+		t.Fatal("legacy image queue should stay idle for auto create path")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	fileID, revision, embeddingRevision, _ := mustFileForPath(t, b, "/img/create-auto.png")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	if embeddingRevision != nil {
+		t.Fatalf("embedding revision should remain nil before durable worker, got %v", *embeddingRevision)
+	}
+	nf, err := b.Store().Stat(context.Background(), "/img/create-auto.png")
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat /img/create-auto.png: %v", err)
+	}
+	if nf.File.ContentText != "" {
+		t.Fatalf("content_text=%q, want empty before durable worker", nf.File.ContentText)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+	if tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) || tasks[0].Status != string(semantic.TaskQueued) || tasks[0].ResourceVersion != 1 {
+		t.Fatalf("unexpected semantic task: %+v", tasks[0])
+	}
+}
+
 func TestWriteOverwriteEnqueuesNextRevisionAndClearsEmbeddingState(t *testing.T) {
 	b := newTestBackend(t)
 	if _, err := b.Write("/f.txt", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {

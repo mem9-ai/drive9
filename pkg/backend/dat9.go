@@ -355,7 +355,13 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}); err != nil {
 			return err
 		}
-		if !b.UsesDatabaseAutoEmbedding() && b.shouldEnqueueEmbedForRevision(path, contentType, contentText) {
+		if b.UsesDatabaseAutoEmbedding() {
+			if b.hasAsyncImageTextSource(path, contentType) {
+				return b.enqueueImgExtractTaskTx(tx, fileID, 1, path, contentType)
+			}
+			return nil
+		}
+		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText) {
 			return b.enqueueEmbedTaskTx(tx, fileID, 1)
 		}
 		return nil
@@ -364,6 +370,12 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			b.deleteBlobCtx(ctx, storageRef)
 		}
 		return 0, err
+	}
+	// Temporary compatibility: app embedding still relies on the legacy
+	// backend-owned image queue until its image task flow also moves to
+	// semantic_tasks.
+	if b.UsesDatabaseAutoEmbedding() {
+		return int64(len(data)), nil
 	}
 	b.enqueueImageExtract(fileID, path, contentType, 1)
 	return int64(len(data)), nil
