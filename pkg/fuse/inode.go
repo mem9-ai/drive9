@@ -168,6 +168,12 @@ func (m *InodeToPath) Forget(ino uint64, nlookup uint64) {
 
 	entry.Nlookup -= int64(nlookup)
 	if entry.Nlookup <= 0 && ino != 1 {
+		if entry.IsDir {
+			// Preserve directory inode->path mappings after lookup refs drop.
+			// Later mkdir/rename/rmdir calls can still reference the inode.
+			entry.Nlookup = 0
+			return
+		}
 		delete(m.byPath, entry.Path)
 		delete(m.byInode, ino)
 	}

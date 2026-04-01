@@ -55,11 +55,21 @@ func TestInodeToPath_LookupExisting(t *testing.T) {
 
 func TestInodeToPath_Forget(t *testing.T) {
 	m := NewInodeToPath()
-	ino := m.Lookup("/tmp", true, 0, time.Now())
+	ino := m.Lookup("/tmp", false, 0, time.Now())
 	m.Forget(ino, 1)
 	_, ok := m.GetPath(ino)
 	if ok {
 		t.Fatal("expected inode to be removed after Forget")
+	}
+}
+
+func TestInodeToPath_ForgetDirectoryKeepsMapping(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.Lookup("/tmp", true, 0, time.Now())
+	m.Forget(ino, 1)
+	p, ok := m.GetPath(ino)
+	if !ok || p != "/tmp" {
+		t.Fatalf("directory inode mapping should be preserved, got %q, %v", p, ok)
 	}
 }
 

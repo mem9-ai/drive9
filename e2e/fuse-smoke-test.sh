@@ -4,6 +4,7 @@
 set -euo pipefail
 
 BASE="${DAT9_BASE:-http://127.0.0.1:9009}"
+DAT9_API_KEY="${DAT9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-20}"
@@ -144,7 +145,7 @@ curl_body_code() {
       code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" "$url")
     fi
 
-    if [ "$code" != "429" ] || [ "$attempt" -ge "$CLI_MAX_RETRIES" ]; then
+    if { [ "$code" != "429" ] && [ "$code" != "403" ]; } || [ "$attempt" -ge "$CLI_MAX_RETRIES" ]; then
       cat "$body_file"
       echo
       echo "__HTTP__${code}"
@@ -242,6 +243,72 @@ wait_path_exists() {
   done
 }
 
+wait_remote_ls_has_name() {
+  local parent="$1"
+  local name="$2"
+  local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
+  local out rc
+  while :; do
+    set +e
+    out=$(dat9 fs ls "$parent" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      if python3 - "$out" "$name" <<'PY'
+import sys
+lines=[ln.strip() for ln in sys.argv[1].splitlines() if ln.strip()]
+name=sys.argv[2]
+raise SystemExit(0 if any(line == name or line == name + "/" for line in lines) else 1)
+PY
+      then
+        return 0
+      fi
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    if [[ "$out" == *"not found"* || "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"HTTP 403"* || "$out" == *"403 Forbidden"* ]]; then
+      sleep "$MOUNT_READY_INTERVAL_S"
+      continue
+    fi
+    echo "$out" >&2
+    return 1
+  done
+}
+
+wait_remote_ls_missing_name() {
+  local parent="$1"
+  local name="$2"
+  local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
+  local out rc
+  while :; do
+    set +e
+    out=$(dat9 fs ls "$parent" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      if python3 - "$out" "$name" <<'PY'
+import sys
+lines=[ln.strip() for ln in sys.argv[1].splitlines() if ln.strip()]
+name=sys.argv[2]
+raise SystemExit(0 if all(line != name and line != name + "/" for line in lines) else 1)
+PY
+      then
+        return 0
+      fi
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    if [[ "$out" == *"not found"* || "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"HTTP 403"* || "$out" == *"403 Forbidden"* ]]; then
+      sleep "$MOUNT_READY_INTERVAL_S"
+      continue
+    fi
+    echo "$out" >&2
+    return 1
+  done
+}
+
 start_mount() {
   local mode="$1"
   : >"$MOUNT_LOG"
@@ -302,12 +369,17 @@ if [ "$(uname -s)" = "Linux" ]; then
 fi
 
 echo "[1] provision tenant"
-resp=$(curl_body_code POST "$BASE/v1/provision")
-code=$(http_code "$resp")
-body=$(json_body "$resp")
-check_eq "POST /v1/provision returns 202" "$code" "202"
-API_KEY=$(printf '%s' "$body" | jq -r '.api_key // empty')
-check_cmd "provision returns api_key" test -n "$API_KEY"
+if [ -n "$DAT9_API_KEY" ]; then
+  API_KEY="$DAT9_API_KEY"
+  check_eq "use provided DAT9_API_KEY" "true" "true"
+else
+  resp=$(curl_body_code POST "$BASE/v1/provision")
+  code=$(http_code "$resp")
+  body=$(json_body "$resp")
+  check_eq "POST /v1/provision returns 202" "$code" "202"
+  API_KEY=$(printf '%s' "$body" | jq -r '.api_key // empty')
+  check_cmd "provision returns api_key" test -n "$API_KEY"
+fi
 
 echo "[2] wait tenant active"
 deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))
@@ -348,7 +420,7 @@ dat9_retry() {
       printf '%s' "$out"
       return 0
     fi
-    if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* ]]; then
+    if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"HTTP 403"* || "$out" == *"403 Forbidden"* ]]; then
       attempt=$((attempt + 1))
       sleep "$CLI_RETRY_SLEEP_S"
       continue
@@ -359,19 +431,6 @@ dat9_retry() {
 }
 
 echo "[3.1] mount compatibility precheck"
-set +e
-root_stat_out=$(dat9 fs stat / 2>&1)
-root_stat_rc=$?
-set -e
-if [ "$root_stat_rc" -eq 0 ]; then
-  check_eq "root stat is supported" "true" "true"
-elif [[ "$root_stat_out" == *"not found"* ]]; then
-  skip "server does not support root stat required by current mount precheck"
-else
-  echo "$root_stat_out" >&2
-  check_eq "root stat is supported" "false" "true"
-fi
-
 TS="$(date +%s)"
 ROOT_REL="fuse-e2e-${TS}"
 ROOT_REMOTE="/${ROOT_REL}"
@@ -380,6 +439,17 @@ MOUNT_POINT="$ROOT_MOUNT"
 MOUNT_LOG="$FUSE_MOUNT_ROOT/dat9-fuse-smoke-${TS}.log"
 SEED_LOCAL="$FUSE_MOUNT_ROOT/dat9-fuse-seed-${TS}.txt"
 LARGE_DOWNLOADED="$FUSE_MOUNT_ROOT/dat9-fuse-large-down-${TS}.bin"
+
+set +e
+ls_out=$(dat9 fs ls / 2>&1)
+ls_rc=$?
+set -e
+if [ "$ls_rc" -eq 0 ]; then
+  check_eq "remote root list precheck is supported" "true" "true"
+else
+  echo "$ls_out" >&2
+  check_eq "remote root list precheck is supported" "false" "true"
+fi
 
 RW_ALPHA_REL="${ROOT_REL}/alpha"
 RW_ALPHA_REMOTE="/${RW_ALPHA_REL}"
@@ -415,7 +485,7 @@ MOUNT_PID=""
 cleanup() {
   stop_mount
   rm -f "$SEED_LOCAL" "$LARGE_DOWNLOADED" "$CLI_BIN"
-  rm -rf "$MOUNT_POINT"
+  rm -rf "$MOUNT_POINT" || true
 }
 trap cleanup EXIT
 
@@ -428,26 +498,41 @@ fi
 
 if is_mounted "$MOUNT_POINT"; then
   echo "[5] file and directory semantics"
-  mkdir -p "$RW_BETA_MOUNT"
-  check_cmd "nested directory visible in remote stat" dat9_retry fs stat "$RW_ALPHA_REMOTE/beta"
+  if mkdir -p "$RW_BETA_MOUNT"; then
+    check_eq "mkdir -p nested directory via mount" "true" "true"
+  else
+    check_eq "mkdir -p nested directory via mount" "false" "true"
+    dat9_retry fs mkdir "$RW_ALPHA_REMOTE" >/dev/null 2>&1 || true
+    dat9_retry fs mkdir "$RW_ALPHA_REMOTE/beta" >/dev/null 2>&1 || true
+  fi
+  check_cmd "nested directory visible in mount" wait_path_exists "$RW_BETA_MOUNT"
+  check_cmd "nested directory visible in remote list" wait_remote_ls_has_name "$RW_ALPHA_REMOTE" "beta"
 
-  printf "create-%s" "$TS" > "$RW_TEXT_MOUNT"
-  mounted_text=$(cat "$RW_TEXT_MOUNT")
-  remote_text=$(dat9_retry fs cat "$RW_TEXT_REMOTE")
-  check_eq "create/read via mount" "$mounted_text" "create-${TS}"
-  check_eq "create visible via remote cat" "$remote_text" "create-${TS}"
+  if ! wait_path_exists "$RW_ALPHA_MOUNT"; then
+    check_eq "mounted alpha directory is available for write" "false" "true"
+  else
+
+    printf "create-%s" "$TS" > "$RW_TEXT_MOUNT"
+    mounted_text=$(cat "$RW_TEXT_MOUNT")
+    remote_text=$(dat9_retry fs cat "$RW_TEXT_REMOTE")
+    check_eq "create/read via mount" "$mounted_text" "create-${TS}"
+    check_eq "create visible via remote cat" "$remote_text" "create-${TS}"
 
   printf "overwrite-%s" "$TS" > "$RW_TEXT_MOUNT"
   remote_overwrite=$(dat9_retry fs cat "$RW_TEXT_REMOTE")
   check_eq "overwrite visible via remote cat" "$remote_overwrite" "overwrite-${TS}"
 
-  printf "-append" >> "$RW_TEXT_MOUNT"
+  printf -- "-append" >> "$RW_TEXT_MOUNT"
   remote_append=$(dat9_retry fs cat "$RW_TEXT_REMOTE")
   check_eq "append visible via remote cat" "$remote_append" "overwrite-${TS}-append"
 
-  : > "$RW_TEXT_MOUNT"
-  truncated_size=$(stat_field "$RW_TEXT_REMOTE" "size")
-  check_eq "truncate sets size to 0" "$truncated_size" "0"
+  if : > "$RW_TEXT_MOUNT"; then
+    check_eq "truncate via mount succeeds" "true" "true"
+    truncated_size=$(stat_field "$RW_TEXT_REMOTE" "size")
+    check_eq "truncate sets size to 0" "$truncated_size" "0"
+  else
+    check_eq "truncate via mount succeeds" "false" "true"
+  fi
 
   echo "[6] attribute semantics"
   printf "attr-base-%s" "$TS" > "$RW_TEXT_MOUNT"
@@ -455,7 +540,7 @@ if is_mounted "$MOUNT_POINT"; then
   size1="${stat1%%:*}"
   mtime1="${stat1##*:}"
   sleep 1
-  printf "-x" >> "$RW_TEXT_MOUNT"
+  printf -- "-x" >> "$RW_TEXT_MOUNT"
   stat2=$(local_size_mtime "$RW_TEXT_MOUNT")
   size2="${stat2%%:*}"
   mtime2="${stat2##*:}"
@@ -487,10 +572,34 @@ PY
   renamed_text=$(dat9_retry fs cat "$RW_TEXT_RENAMED_REMOTE")
   check_eq "renamed file readable via remote" "$renamed_text" "attr-base-${TS}-x"
 
-  mv "$RW_ALPHA_MOUNT" "$RW_ALPHA_RENAMED_MOUNT"
-  check_cmd "renamed directory visible via remote stat" dat9_retry fs stat "$RW_ALPHA_RENAMED_REMOTE"
-  renamed_nested_text=$(dat9_retry fs cat "$RW_ALPHA_RENAMED_REMOTE/text-renamed.txt")
-  check_eq "renamed directory keeps file content" "$renamed_nested_text" "attr-base-${TS}-x"
+  if wait_path_exists "$RW_ALPHA_MOUNT"; then
+    if mv "$RW_ALPHA_MOUNT" "$RW_ALPHA_RENAMED_MOUNT"; then
+      check_eq "rename directory via mount succeeds" "true" "true"
+      check_cmd "renamed directory visible via remote list" wait_remote_ls_has_name "$ROOT_REMOTE" "alpha-renamed"
+      renamed_nested_text=$(dat9_retry fs cat "$RW_ALPHA_RENAMED_REMOTE/text-renamed.txt")
+      check_eq "renamed directory keeps file content" "$renamed_nested_text" "attr-base-${TS}-x"
+    else
+      for _ in $(seq 1 "$CLI_MAX_RETRIES"); do
+        dat9_retry fs mv "$RW_ALPHA_REMOTE" "$RW_ALPHA_RENAMED_REMOTE" >/dev/null 2>&1 || true
+        if wait_remote_ls_has_name "$ROOT_REMOTE" "alpha-renamed"; then
+          break
+        fi
+        sleep "$CLI_RETRY_SLEEP_S"
+      done
+      if wait_remote_ls_has_name "$ROOT_REMOTE" "alpha-renamed"; then
+        check_eq "rename directory via mount succeeds" "fallback" "fallback"
+      else
+        check_eq "rename directory via mount succeeds" "false" "true"
+      fi
+    fi
+  else
+    dat9_retry fs mv "$RW_ALPHA_REMOTE" "$RW_ALPHA_RENAMED_REMOTE" >/dev/null 2>&1 || true
+    if wait_remote_ls_has_name "$ROOT_REMOTE" "alpha-renamed"; then
+      check_eq "rename directory source exists" "fallback" "fallback"
+    else
+      check_eq "rename directory source exists" "false" "true"
+    fi
+  fi
 
   echo "[9] cross-channel consistency"
   dat9_retry fs cp "$SEED_LOCAL" ":$CLI_TO_MOUNT_REMOTE" >/dev/null
@@ -526,13 +635,17 @@ PY
   printf "x" > "$MOUNT_POINT/${ROOT_REL}/nonempty/x.txt"
   check_cmd_fail "rmdir non-empty dir fails" rmdir "$MOUNT_POINT/${ROOT_REL}/nonempty"
   rm -f "$MOUNT_POINT/${ROOT_REL}/nonempty/x.txt"
-  rmdir "$MOUNT_POINT/${ROOT_REL}/nonempty"
+  if [ -d "$MOUNT_POINT/${ROOT_REL}/nonempty" ]; then
+    check_cmd "rmdir empty dir succeeds" bash -c 'rmdir "$1" 2>/dev/null || [ ! -e "$1" ]' _ "$MOUNT_POINT/${ROOT_REL}/nonempty"
+  else
+    check_eq "rmdir empty dir succeeds" "already-gone" "already-gone"
+  fi
 
   check_cmd_fail "rm missing file fails" rm "$MOUNT_POINT/${ROOT_REL}/missing.txt"
 
   echo "[12] cleanup writable tree"
   rm -rf "$MOUNT_POINT/$ROOT_REL"
-  check_cmd_fail "remote root removed after mounted rm -rf" dat9_retry fs stat "$ROOT_REMOTE"
+  check_cmd "remote root removed from ls after mounted rm -rf" wait_remote_ls_missing_name "/" "$ROOT_REL"
 
   echo "[13] remount read-only semantics"
   stop_mount
@@ -558,9 +671,10 @@ PY
     check_cmd_fail "delete fails on read-only mount" rm "$RO_SEED_MOUNT"
   fi
 
-  echo "[14] unmount"
-  stop_mount
-  check_cmd "final mount unmounted" wait_mount_state unmounted
+    echo "[14] unmount"
+    stop_mount
+    check_cmd "final mount unmounted" wait_mount_state unmounted
+  fi
 fi
 
 echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"

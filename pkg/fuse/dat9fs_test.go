@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -133,5 +134,67 @@ func TestGetAttrUsesLatestDirtyHandleSize(t *testing.T) {
 	}
 	if got, want := out.Size, uint64(len("abcdefghi")); got != want {
 		t.Fatalf("GetAttr size = %d, want %d", got, want)
+	}
+}
+
+func TestGetAttrDirectoryDoesNotRequireRemoteStat(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+
+	var out gofuse.AttrOut
+	st := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: dirIno}}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr status = %v, want OK", st)
+	}
+	if out.Mode&syscall.S_IFDIR == 0 {
+		t.Fatalf("GetAttr mode = %o, want directory mode", out.Mode)
+	}
+}
+
+func TestLookupFallsBackToParentListWhenDirStatUnsupported(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			http.Error(w, "not found", http.StatusNotFound)
+		case http.MethodGet:
+			if r.URL.Path == "/v1/fs/" && r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"entries": []map[string]any{{
+						"name":  "dir",
+						"isDir": true,
+						"size":  0,
+					}},
+				})
+				return
+			}
+			http.NotFound(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "dir", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if out.Mode&syscall.S_IFDIR == 0 {
+		t.Fatalf("Lookup mode = %o, want directory mode", out.Mode)
 	}
 }
