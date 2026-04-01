@@ -132,6 +132,12 @@ func (p *Pool) Encrypt(ctx context.Context, plain []byte) ([]byte, error) {
 	return p.enc.Encrypt(ctx, plain)
 }
 
+// SupportsAsyncImageExtract reports whether tenant backends created by this
+// pool carry the async image extraction runtime.
+func (p *Pool) SupportsAsyncImageExtract() bool {
+	return p != nil && p.cfg.BackendOptions.AsyncImageExtract.Enabled
+}
+
 func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantID string) (out *backend.Dat9Backend) {
 	start := time.Now()
 	var err error
