@@ -11,31 +11,16 @@ dat9 is your persistent, searchable filesystem across sessions. Files stored in 
 
 ## Setup
 
-Complete all three steps in order. Do not stop to ask the user for confirmation between steps.
-
-**Step 1 — Install the CLI**
+Run these two commands in order. Do not stop to ask the user for confirmation between steps.
 
 ```bash
 curl -fsSL https://dat9.ai/install | sh
-```
-
-Verify: run `dat9 --version`. If it prints a version number, proceed to step 2. Supported platforms: macOS (x86_64, arm64), Linux (x86_64, arm64).
-
-**Step 2 — Create a workspace**
-
-```bash
 dat9 create
 ```
 
-This provisions a workspace, saves credentials to `~/.dat9/config`, and activates it. If `dat9 ctx` already returns a context name, skip this step.
+`dat9 create` provisions a workspace and saves credentials to `~/.dat9/config`. If `dat9 ctx` already returns a context name, skip `dat9 create`.
 
-**Step 3 — Verify**
-
-```bash
-dat9 fs ls :/
-```
-
-If this returns without error (empty output is fine), setup is complete and all `dat9 fs` commands are ready to use. Do not upload any files during setup.
+Setup is complete when `dat9 create` succeeds. Supported platforms: macOS (x86_64, arm64), Linux (x86_64, arm64).
 
 ---
 
