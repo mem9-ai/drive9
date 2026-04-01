@@ -76,6 +76,10 @@ type uploadInitiateRequest struct {
 	PartChecksums []string `json:"part_checksums"`
 }
 
+type uploadResumeRequest struct {
+	PartChecksums []string `json:"part_checksums"`
+}
+
 func (c *Client) initiateUpload(ctx context.Context, path string, size int64, checksums []string) (UploadPlan, error) {
 	plan, resp, err := c.initiateUploadByBody(ctx, path, size, checksums)
 	if err == nil {
@@ -492,6 +496,54 @@ func (c *Client) queryUpload(ctx context.Context, path string) (*UploadMeta, err
 
 // requestResume asks the server to generate presigned URLs for missing parts.
 func (c *Client) requestResume(ctx context.Context, uploadID string, checksums []string) (*UploadPlan, error) {
+	plan, resp, err := c.requestResumeByBody(ctx, uploadID, checksums)
+	if err == nil {
+		return plan, nil
+	}
+	if resp != nil {
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode == http.StatusBadRequest && strings.Contains(strings.ToLower(err.Error()), "missing x-dat9-part-checksums header") {
+			return c.requestResumeLegacy(ctx, uploadID, checksums)
+		}
+		return nil, err
+	}
+	return nil, err
+}
+
+func (c *Client) requestResumeByBody(ctx context.Context, uploadID string, checksums []string) (*UploadPlan, *http.Response, error) {
+	body, err := json.Marshal(uploadResumeRequest{PartChecksums: checksums})
+	if err != nil {
+		return nil, nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/v1/uploads/"+uploadID+"/resume", bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if resp.StatusCode == http.StatusGone {
+		_ = resp.Body.Close()
+		return nil, nil, fmt.Errorf("upload %s has expired", uploadID)
+	}
+	if resp.StatusCode >= 300 {
+		return nil, resp, readError(resp)
+	}
+
+	var plan UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		_ = resp.Body.Close()
+		return nil, nil, fmt.Errorf("decode resume plan: %w", err)
+	}
+	_ = resp.Body.Close()
+	return &plan, nil, nil
+}
+
+func (c *Client) requestResumeLegacy(ctx context.Context, uploadID string, checksums []string) (*UploadPlan, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL+"/v1/uploads/"+uploadID+"/resume", nil)
 	if err != nil {
