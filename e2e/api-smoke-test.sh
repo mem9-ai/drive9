@@ -15,7 +15,7 @@
 # 11) SQL endpoint sanity query
 # 12) Copy, rename, delete
 # 13) Final list verification
-# 14) 100MB multipart upload with checksum-bound presigned parts + download checksum
+# 14) 100MB multipart upload via POST /v1/uploads/initiate + download checksum
 # 15) Max-upload boundary check (1GiB allowed, 1GiB+1 rejected)
 
 set -euo pipefail
@@ -340,14 +340,84 @@ mkdir -p "$(dirname "$IMAGE_LOCAL")"
 cp "$DAT9_IMAGE_FIXTURE_PATH" "$IMAGE_LOCAL"
 check_cmd "local jpg fixture exists" test -s "$IMAGE_LOCAL"
 
-img_body="$(mktemp)"
-img_code=$(curl -sS -o "$img_body" -w "%{http_code}" -X PUT \
+IMAGE_BYTES=$(wc -c < "$IMAGE_LOCAL" | tr -d ' ')
+IMAGE_CHECKSUMS=$(python3 - "$IMAGE_LOCAL" <<'PY'
+import base64
+import hashlib
+import sys
+
+part_size = 8 * 1024 * 1024
+out = []
+with open(sys.argv[1], "rb") as f:
+    while True:
+        chunk = f.read(part_size)
+        if not chunk:
+            break
+        out.append(base64.b64encode(hashlib.sha256(chunk).digest()).decode())
+print(",".join(out))
+PY
+)
+
+image_init_payload="$(mktemp)"
+jq -n \
+  --arg path "/$IMAGE_REMOTE" \
+  --argjson total_size "$IMAGE_BYTES" \
+  --arg checksums "$IMAGE_CHECKSUMS" \
+  '{path:$path,total_size:$total_size,part_checksums:($checksums|split(","))}' > "$image_init_payload"
+
+image_plan_file="$(mktemp)"
+image_plan_code=$(curl -sS -o "$image_plan_file" -w "%{http_code}" -X POST \
   -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: image/jpeg" \
-  --data-binary "@$IMAGE_LOCAL" \
-  "$BASE/v1/fs/$IMAGE_REMOTE")
-check_eq "PUT /v1/fs/$IMAGE_REMOTE returns 200" "$img_code" "200"
-rm -f "$img_body"
+  -H "Content-Type: application/json" \
+  --data-binary "@$image_init_payload" \
+  "$BASE/v1/uploads/initiate")
+check_eq "POST /v1/uploads/initiate for image returns 202" "$image_plan_code" "202"
+
+image_upload_id=$(jq -r '.upload_id // empty' "$image_plan_file")
+image_part_count=$(jq -r '.parts | length' "$image_plan_file")
+check_cmd "image multipart upload_id exists" test -n "$image_upload_id"
+check_cmd "image multipart has presigned parts" test "$image_part_count" -gt 0
+
+python3 - "$image_plan_file" "$IMAGE_LOCAL" <<'PY'
+import json
+import sys
+import urllib.request
+
+plan_path, file_path = sys.argv[1], sys.argv[2]
+with open(plan_path, "r", encoding="utf-8") as f:
+    plan = json.load(f)
+
+parts = plan.get("parts", [])
+with open(file_path, "rb") as data_file:
+    for idx, p in enumerate(parts, 1):
+        url = p["url"]
+        size = int(p["size"])
+        data = data_file.read(size)
+        if len(data) != size:
+            raise SystemExit(f"short read for part {idx}: got {len(data)} expected {size}")
+
+        req = urllib.request.Request(url, data=data, method="PUT")
+        req.add_header("Content-Length", str(size))
+        for hk, hv in (p.get("headers") or {}).items():
+            req.add_header(hk, hv)
+        if p.get("checksum_sha256"):
+            req.add_header("x-amz-checksum-sha256", p["checksum_sha256"])
+
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            status = getattr(resp, "status", 200)
+            if status >= 300:
+                raise SystemExit(f"part {idx} failed: HTTP {status}")
+PY
+check_eq "image multipart part upload script exits successfully" "$?" "0"
+
+resp=$(curl_body_code POST "$BASE/v1/uploads/$image_upload_id/complete" "$API_KEY")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+image_complete_status=$(printf '%s' "$body" | jq -r '.status // empty')
+check_eq "POST /v1/uploads/$image_upload_id/complete returns 200" "$code" "200"
+check_eq "image complete response status is ok" "$image_complete_status" "ok"
+
+rm -f "$image_init_payload" "$image_plan_file"
 
 resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?find=&name=*.jpg" "$API_KEY")
 code=$(http_code "$resp")
@@ -460,7 +530,7 @@ check_eq "frontend directory still exists" "$frontend_exists" "true"
 check_eq "copied file removed" "$copy_exists" "false"
 
 if [ "$RUN_LARGE_FILE" = "1" ]; then
-  step "14" "Large file multipart upload (${LARGE_FILE_MB}MB)"
+  step "14" "Large file multipart upload via body initiate (${LARGE_FILE_MB}MB)"
   check_cmd "python3 is available" bash -c 'command -v python3 >/dev/null'
 
   resp=$(curl_body_code POST "$BASE/v1/fs/$LARGE_REMOTE_DIR?mkdir" "$API_KEY")
@@ -487,14 +557,20 @@ print(",".join(out))
 PY
 )
 
+  init_payload="$(mktemp)"
+  jq -n \
+    --arg path "/$LARGE_REMOTE_FILE" \
+    --argjson total_size "$LARGE_FILE_BYTES" \
+    --arg checksums "$PART_CHECKSUMS" \
+    '{path:$path,total_size:$total_size,part_checksums:($checksums|split(","))}' > "$init_payload"
+
   plan_file="$(mktemp)"
-  plan_code=$(curl -sS -o "$plan_file" -w "%{http_code}" -X PUT \
+  plan_code=$(curl -sS -o "$plan_file" -w "%{http_code}" -X POST \
     -H "Authorization: Bearer $API_KEY" \
-    -H "X-Dat9-Content-Length: $LARGE_FILE_BYTES" \
-    -H "X-Dat9-Part-Checksums: $PART_CHECKSUMS" \
-    --data-binary "" \
-    "$BASE/v1/fs/$LARGE_REMOTE_FILE")
-  check_eq "initiate multipart upload returns 202" "$plan_code" "202"
+    -H "Content-Type: application/json" \
+    --data-binary "@$init_payload" \
+    "$BASE/v1/uploads/initiate")
+  check_eq "POST /v1/uploads/initiate returns 202" "$plan_code" "202"
 
   upload_id=$(jq -r '.upload_id // empty' "$plan_file")
   part_count=$(jq -r '.parts | length' "$plan_file")
@@ -556,7 +632,7 @@ PY
   dst_sum=$(sha256sum "$LARGE_FILE_DOWNLOADED" | cut -d' ' -f1)
   check_eq "downloaded large file sha256 matches" "$dst_sum" "$src_sum"
 
-  rm -f "$plan_file" "$LARGE_FILE_LOCAL" "$LARGE_FILE_DOWNLOADED"
+  rm -f "$init_payload" "$plan_file" "$LARGE_FILE_LOCAL" "$LARGE_FILE_DOWNLOADED"
 fi
 
 if [ "$RUN_UPLOAD_LIMIT_BOUNDARY" = "1" ]; then
