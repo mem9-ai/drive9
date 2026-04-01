@@ -267,7 +267,7 @@ PY
     if [ "$(date +%s)" -ge "$deadline" ]; then
       return 1
     fi
-    if [[ "$out" == *"not found"* || "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* ]]; then
+    if [[ "$out" == *"not found"* || "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"HTTP 403"* || "$out" == *"403 Forbidden"* ]]; then
       sleep "$MOUNT_READY_INTERVAL_S"
       continue
     fi
@@ -300,7 +300,7 @@ PY
     if [ "$(date +%s)" -ge "$deadline" ]; then
       return 1
     fi
-    if [[ "$out" == *"not found"* || "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* ]]; then
+    if [[ "$out" == *"not found"* || "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"HTTP 403"* || "$out" == *"403 Forbidden"* ]]; then
       sleep "$MOUNT_READY_INTERVAL_S"
       continue
     fi
