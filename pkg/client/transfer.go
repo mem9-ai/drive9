@@ -55,13 +55,6 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 		}
 		return c.Write(path, data)
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), http.NoBody)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Dat9-Content-Length", fmt.Sprintf("%d", size))
 	ra, ok := r.(io.ReaderAt)
 	if !ok {
 		return fmt.Errorf("large uploads require an io.ReaderAt (seekable source) to compute per-part checksums")
@@ -70,25 +63,86 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 	if err != nil {
 		return fmt.Errorf("compute part checksums: %w", err)
 	}
+	plan, err := c.initiateUpload(ctx, path, size, checksums)
+	if err != nil {
+		return err
+	}
+	return c.uploadParts(ctx, plan, r, progress)
+}
+
+type uploadInitiateRequest struct {
+	Path          string   `json:"path"`
+	TotalSize     int64    `json:"total_size"`
+	PartChecksums []string `json:"part_checksums"`
+}
+
+func (c *Client) initiateUpload(ctx context.Context, path string, size int64, checksums []string) (UploadPlan, error) {
+	plan, resp, err := c.initiateUploadByBody(ctx, path, size, checksums)
+	if err == nil {
+		return plan, nil
+	}
+	if resp != nil {
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+			return c.initiateUploadLegacy(ctx, path, size, checksums)
+		}
+		return UploadPlan{}, err
+	}
+	return UploadPlan{}, err
+}
+
+func (c *Client) initiateUploadByBody(ctx context.Context, path string, size int64, checksums []string) (UploadPlan, *http.Response, error) {
+	body, err := json.Marshal(uploadInitiateRequest{Path: path, TotalSize: size, PartChecksums: checksums})
+	if err != nil {
+		return UploadPlan{}, nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/uploads/initiate", bytes.NewReader(body))
+	if err != nil {
+		return UploadPlan{}, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return UploadPlan{}, nil, err
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		return UploadPlan{}, resp, readError(resp)
+	}
+	var plan UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		_ = resp.Body.Close()
+		return UploadPlan{}, nil, fmt.Errorf("decode upload plan: %w", err)
+	}
+	_ = resp.Body.Close()
+	return plan, nil, nil
+}
+
+func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int64, checksums []string) (UploadPlan, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), http.NoBody)
+	if err != nil {
+		return UploadPlan{}, err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-Dat9-Content-Length", fmt.Sprintf("%d", size))
 	if len(checksums) > 0 {
 		req.Header.Set("X-Dat9-Part-Checksums", strings.Join(checksums, ","))
 	}
 
 	resp, err := c.do(req)
 	if err != nil {
-		return err
+		return UploadPlan{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusAccepted {
-		return readError(resp)
+		return UploadPlan{}, readError(resp)
 	}
 
 	var plan UploadPlan
 	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
-		return fmt.Errorf("decode upload plan: %w", err)
+		return UploadPlan{}, fmt.Errorf("decode upload plan: %w", err)
 	}
-	return c.uploadParts(ctx, plan, r, progress)
+	return plan, nil
 }
 
 // uploadParts concurrently uploads parts to presigned URLs.
