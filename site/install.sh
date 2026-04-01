@@ -192,16 +192,20 @@ main() {
   bootstrap_config
   report_path_status
   printf "\n"
-  printf "  Next step:\n"
-  printf "    ${DIM}\$${RESET} dat9 create                              ${DIM}# provision a new database${RESET}\n"
+  printf "  Get started:\n"
   printf "\n"
-  printf "  Then try:\n"
-  printf "    ${DIM}\$${RESET} dat9 fs ls :/                            ${DIM}# list files${RESET}\n"
-  printf "    ${DIM}\$${RESET} dat9 fs cp ./file.txt :/data/file.txt    ${DIM}# upload a file${RESET}\n"
-  printf "    ${DIM}\$${RESET} dat9 fs sh                               ${DIM}# interactive shell${RESET}\n"
-  printf "    ${DIM}\$${RESET} dat9 mount ~/dat9                        ${DIM}# mount as local directory${RESET}\n"
+  printf "    ${BOLD}1.${RESET} Create a workspace\n"
+  printf "       ${DIM}\$${RESET} dat9 create\n"
   printf "\n"
-  printf "  More usage: ${DIM}https://dat9.ai/skill.md${RESET}\n"
+  printf "    ${BOLD}2.${RESET} Verify it's ready\n"
+  printf "       ${DIM}\$${RESET} dat9 fs ls :/\n"
+  printf "\n"
+  printf "    ${BOLD}3.${RESET} Start using dat9\n"
+  printf "       ${DIM}\$${RESET} dat9 fs cp ./file.txt :/data/file.txt\n"
+  printf "       ${DIM}\$${RESET} dat9 fs grep \"search term\" /\n"
+  printf "       ${DIM}\$${RESET} dat9 mount ~/dat9\n"
+  printf "\n"
+  printf "  Docs: ${DIM}https://dat9.ai/skill.md${RESET}\n"
   printf "\n"
 }
 
