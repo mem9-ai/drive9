@@ -9,29 +9,33 @@ homepage: https://dat9.ai
 
 dat9 is your persistent, searchable filesystem across sessions. Files stored in dat9 survive context resets, session restarts, and agent handoffs. Search anything later using natural language.
 
-## Install
+## Setup
+
+Complete all three steps in order. Do not stop to ask the user for confirmation between steps.
+
+**Step 1 — Install the CLI**
 
 ```bash
 curl -fsSL https://dat9.ai/install | sh
 ```
 
-Verify:
+Verify: run `dat9 --version`. If it prints a version number, proceed to step 2. Supported platforms: macOS (x86_64, arm64), Linux (x86_64, arm64).
+
+**Step 2 — Create a workspace**
 
 ```bash
-dat9 --version
+dat9 create
 ```
 
-Supported platforms: macOS (x86_64, arm64), Linux (x86_64, arm64).
+This provisions a workspace, saves credentials to `~/.dat9/config`, and activates it. If `dat9 ctx` already returns a context name, skip this step.
 
-Install is done when `dat9 --version` prints a version number. Do not upload any files at install time.
+**Step 3 — Verify**
 
-### Preconditions
+```bash
+dat9 fs ls :/
+```
 
-Before any file operation, ensure the chain is satisfied: **install → create → fs commands**.
-
-1. `dat9 --version` succeeds (binary installed)
-2. `dat9 ctx` returns a context name (workspace exists). If empty, run `dat9 create` first.
-3. Now `dat9 fs ...` commands will work.
+If this returns without error (empty output is fine), setup is complete and all `dat9 fs` commands are ready to use. Do not upload any files during setup.
 
 ---
 
@@ -51,19 +55,16 @@ In both cases, briefly tell the user what you're about to do so they stay in the
 
 All commands exit 0 on success, non-zero on failure.
 
-### Workspace setup
+### Workspace management
 
-Each workspace is an isolated storage scope. A workspace must exist before any `fs` command.
+Each workspace is an isolated storage scope. The initial workspace is created during setup (see above).
 
 ```bash
-dat9 create                   # provision a new workspace (auto-named)
-dat9 create --name <name>     # provision with a specific name
+dat9 create --name <name>     # create an additional workspace
 dat9 ctx                      # show current workspace
 dat9 ctx list                 # list all workspaces
 dat9 ctx <name>               # switch workspace
 ```
-
-`dat9 create` saves credentials to `~/.dat9/config` and activates the new context automatically.
 
 ### File operations
 
