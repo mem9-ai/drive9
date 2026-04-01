@@ -71,24 +71,6 @@ func (e staticServerImageExtractor) ExtractImageText(context.Context, backend.Im
 	return e.text, nil
 }
 
-type gatedServerImageExtractor struct {
-	text    string
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (e *gatedServerImageExtractor) ExtractImageText(context.Context, backend.ImageExtractRequest) (string, error) {
-	e.once.Do(func() {
-		select {
-		case e.started <- struct{}{}:
-		default:
-		}
-		<-e.release
-	})
-	return e.text, nil
-}
-
 func newTestTenantPool(t *testing.T) *tenant.Pool {
 	return newTestTenantPoolWithBackendOptions(t, backend.Options{})
 }
@@ -1207,41 +1189,6 @@ func waitForObservedLog(t *testing.T, recorded *observer.ObservedLogs, message s
 		t.Fatalf("timed out waiting for log message %q", message)
 	}
 	return entries[len(entries)-1]
-}
-
-func waitForStoreContentText(t *testing.T, store *datastore.Store, path, wantSubstring string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		nf, err := store.Stat(context.Background(), path)
-		if err == nil && nf.File != nil && strings.Contains(nf.File.ContentText, wantSubstring) {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	nf, err := store.Stat(context.Background(), path)
-	if err != nil || nf.File == nil {
-		t.Fatalf("stat %s while waiting for content text: %v", path, err)
-	}
-	t.Fatalf("content_text=%q, want substring %q", nf.File.ContentText, wantSubstring)
-}
-
-func waitForStoreNamedTaskStatus(t *testing.T, store *datastore.Store, taskID, want string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		var status string
-		err := store.DB().QueryRow(`SELECT status FROM semantic_tasks WHERE task_id = ?`, taskID).Scan(&status)
-		if err == nil && status == want {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	var status string
-	if err := store.DB().QueryRow(`SELECT status FROM semantic_tasks WHERE task_id = ?`, taskID).Scan(&status); err != nil {
-		t.Fatalf("wait named task status query: %v", err)
-	}
-	t.Fatalf("task %s status=%q, want %q", taskID, status, want)
 }
 
 func waitForStoreEmbeddingRevision(t *testing.T, store *datastore.Store, path string, want int64, timeout time.Duration) {
