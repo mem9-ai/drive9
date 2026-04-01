@@ -133,7 +133,12 @@ func Sh(c *client.Client, _ []string) error {
 }
 
 // resolve resolves a path relative to the current working directory.
+// Handles ":" prefixed remote paths like cp command (fixes issue #19).
 func resolve(cwd, path string) string {
+	// Handle ":" prefixed remote paths
+	if rp, isRemote := ParseRemote(path); isRemote {
+		return rp.Path
+	}
 	if strings.HasPrefix(path, "/") {
 		return path
 	}

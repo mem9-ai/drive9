@@ -9,9 +9,15 @@ import (
 // Rm removes a remote file or directory.
 //
 //	dat9 rm /path/to/file
+//	dat9 rm :/path/to/file
 func Rm(c *client.Client, args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: dat9 rm <path>")
 	}
-	return c.Delete(args[0])
+	path := args[0]
+	// Handle ":" prefixed remote paths like cp command
+	if rp, isRemote := ParseRemote(path); isRemote {
+		path = rp.Path
+	}
+	return c.Delete(path)
 }
