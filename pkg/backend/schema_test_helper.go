@@ -32,6 +32,7 @@ func initBackendSchema(t *testing.T, dsn string) {
 		`CREATE TABLE IF NOT EXISTS semantic_tasks (task_id VARCHAR(64) PRIMARY KEY, task_type VARCHAR(32) NOT NULL, resource_id VARCHAR(64) NOT NULL, resource_version BIGINT NOT NULL, status VARCHAR(20) NOT NULL, attempt_count INT NOT NULL DEFAULT 0, max_attempts INT NOT NULL DEFAULT 5, receipt VARCHAR(128), leased_at DATETIME(3), lease_until DATETIME(3), available_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), payload_json JSON, last_error TEXT, created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), completed_at DATETIME(3))`,
 		`CREATE UNIQUE INDEX uk_task_resource_version ON semantic_tasks(task_type, resource_id, resource_version)`,
 		`CREATE INDEX idx_task_claim ON semantic_tasks(status, available_at, lease_until, created_at)`,
+		`CREATE INDEX idx_task_claim_type ON semantic_tasks(status, task_type, available_at, created_at, task_id)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

@@ -95,6 +95,7 @@ func tidbAppEmbeddingSchemaStatements(withContentBlob bool) []string {
 		)`,
 		`CREATE UNIQUE INDEX uk_task_resource_version ON semantic_tasks(task_type, resource_id, resource_version)`,
 		`CREATE INDEX idx_task_claim ON semantic_tasks(status, available_at, lease_until, created_at)`,
+		`CREATE INDEX idx_task_claim_type ON semantic_tasks(status, task_type, available_at, created_at, task_id)`,
 	}
 }
 
