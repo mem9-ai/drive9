@@ -904,17 +904,8 @@ func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uplo
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	partChecksums, err := parsePartChecksumsHeader(r.Header.Get("X-Dat9-Part-Checksums"))
+	partChecksums, err := s.parseResumePartChecksums(w, r, uploadID)
 	if err != nil {
-		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_bad_checksums", "upload_id", uploadID, "error", err)...)
-		metricEvent(r.Context(), "upload_resume", "result", "error")
-		errJSON(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if len(partChecksums) == 0 {
-		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_missing_checksums", "upload_id", uploadID)...)
-		metricEvent(r.Context(), "upload_resume", "result", "error")
-		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Part-Checksums header")
 		return
 	}
 	plan, err := b.ResumeUploadWithChecksums(r.Context(), uploadID, partChecksums)
@@ -951,6 +942,57 @@ func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uplo
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_ok", "upload_id", uploadID, "parts", len(plan.Parts))...)
 	metricEvent(r.Context(), "upload_resume", "result", "ok")
 	_ = json.NewEncoder(w).Encode(plan)
+}
+
+func (s *Server) parseResumePartChecksums(w http.ResponseWriter, r *http.Request, uploadID string) ([]string, error) {
+	contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+	if strings.HasPrefix(contentType, "application/json") {
+		var req struct {
+			PartChecksums []string `json:"part_checksums"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_body_too_large", "upload_id", uploadID, "max", 1<<20)...)
+				metricEvent(r.Context(), "upload_resume", "result", "error")
+				errJSON(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return nil, err
+			}
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_bad_body", "upload_id", uploadID, "error", err)...)
+			metricEvent(r.Context(), "upload_resume", "result", "error")
+			errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			return nil, err
+		}
+		partChecksums, err := validatePartChecksums(req.PartChecksums)
+		if err != nil {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_bad_checksums", "upload_id", uploadID, "error", err)...)
+			metricEvent(r.Context(), "upload_resume", "result", "error")
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return nil, err
+		}
+		if len(partChecksums) == 0 {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_missing_checksums", "upload_id", uploadID)...)
+			metricEvent(r.Context(), "upload_resume", "result", "error")
+			errJSON(w, http.StatusBadRequest, "missing part_checksums")
+			return nil, errors.New("missing part_checksums")
+		}
+		return partChecksums, nil
+	}
+
+	partChecksums, err := parsePartChecksumsHeader(r.Header.Get("X-Dat9-Part-Checksums"))
+	if err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_bad_checksums", "upload_id", uploadID, "error", err)...)
+		metricEvent(r.Context(), "upload_resume", "result", "error")
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return nil, err
+	}
+	if len(partChecksums) == 0 {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_missing_checksums", "upload_id", uploadID)...)
+		metricEvent(r.Context(), "upload_resume", "result", "error")
+		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Part-Checksums header")
+		return nil, errors.New("missing x-dat9-part-checksums header")
+	}
+	return partChecksums, nil
 }
 
 func parsePartChecksumsHeader(raw string) ([]string, error) {
