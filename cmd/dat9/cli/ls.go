@@ -13,6 +13,7 @@ import (
 //	dat9 ls           list /
 //	dat9 ls /path/    list /path/
 //	dat9 ls -l /path  long format with size
+//	dat9 ls :/path    list using remote path prefix
 func Ls(c *client.Client, args []string) error {
 	long := false
 	path := "/"
@@ -24,6 +25,11 @@ func Ls(c *client.Client, args []string) error {
 		default:
 			path = arg
 		}
+	}
+
+	// Handle ":" prefixed remote paths like cp command
+	if rp, isRemote := ParseRemote(path); isRemote {
+		path = rp.Path
 	}
 
 	entries, err := c.List(path)
