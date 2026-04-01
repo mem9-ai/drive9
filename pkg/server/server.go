@@ -714,6 +714,10 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
+	if r.Method == http.MethodPost {
+		s.handleUploadInitiate(w, r, b)
+		return
+	}
 	if r.Method != http.MethodGet {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "uploads_method_not_allowed", "method", r.Method)...)
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -760,6 +764,71 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"uploads": out})
+}
+
+func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b *backend.Dat9Backend) {
+	var req struct {
+		Path          string   `json:"path"`
+		TotalSize     int64    `json:"total_size"`
+		PartChecksums []string `json:"part_checksums"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_bad_body", "error", err)...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
+		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Path) == "" {
+		errJSON(w, http.StatusBadRequest, "missing path")
+		return
+	}
+	if req.TotalSize <= 0 {
+		errJSON(w, http.StatusBadRequest, "total_size must be positive")
+		return
+	}
+	if req.TotalSize > s.maxUploadBytes {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_too_large", "path", req.Path, "bytes", req.TotalSize, "max", s.maxUploadBytes)...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
+		errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
+		return
+	}
+	partChecksums, err := validatePartChecksums(req.PartChecksums)
+	if err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_bad_checksums", "path", req.Path, "error", err)...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(partChecksums) == 0 {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_missing_checksums", "path", req.Path)...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
+		errJSON(w, http.StatusBadRequest, "missing part_checksums")
+		return
+	}
+	plan, err := b.InitiateUploadWithChecksums(r.Context(), req.Path, req.TotalSize, partChecksums)
+	if err != nil {
+		if errors.Is(err, backend.ErrPartChecksumCountMismatch) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_checksum_count_mismatch", "path", req.Path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrUploadConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_conflict", "path", req.Path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", "conflict")
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_failed", "path", req.Path, "error", err)...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_ok", "path", req.Path, "parts", len(plan.Parts))...)
+	metricEvent(r.Context(), "fs_write", "result", "accepted")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(plan)
 }
 
 func (s *Server) handleUploadAction(w http.ResponseWriter, r *http.Request) {
@@ -882,18 +951,22 @@ func parsePartChecksumsHeader(raw string) ([]string, error) {
 		return nil, nil
 	}
 	parts := strings.Split(raw, ",")
+	return validatePartChecksums(parts)
+}
+
+func validatePartChecksums(parts []string) ([]string, error) {
 	out := make([]string, 0, len(parts))
 	for i, p := range parts {
 		v := strings.TrimSpace(p)
 		if v == "" {
-			return nil, fmt.Errorf("invalid X-Dat9-Part-Checksums header: empty value at index %d", i)
+			return nil, fmt.Errorf("invalid part checksums: empty value at index %d", i)
 		}
 		decoded, err := base64.StdEncoding.DecodeString(v)
 		if err != nil {
-			return nil, fmt.Errorf("invalid X-Dat9-Part-Checksums header: invalid base64 at index %d", i)
+			return nil, fmt.Errorf("invalid part checksums: invalid base64 at index %d", i)
 		}
 		if len(decoded) != 32 {
-			return nil, fmt.Errorf("invalid X-Dat9-Part-Checksums header: decoded length %d at index %d, expected 32", len(decoded), i)
+			return nil, fmt.Errorf("invalid part checksums: decoded length %d at index %d, expected 32", len(decoded), i)
 		}
 		out = append(out, v)
 	}

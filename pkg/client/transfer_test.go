@@ -56,9 +56,14 @@ func TestWriteStreamLargeFile(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/large.bin":
-			if h := r.Header.Get("X-Dat9-Content-Length"); h != "8" {
-				http.Error(w, fmt.Sprintf("expected X-Dat9-Content-Length=8, got %q", h), 400)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
+			var req uploadInitiateRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			if req.Path != "/large.bin" || req.TotalSize != 8 {
+				http.Error(w, fmt.Sprintf("bad initiate payload: %+v", req), http.StatusBadRequest)
 				return
 			}
 			// Return 202 with upload plan
@@ -126,6 +131,41 @@ func TestWriteStreamLargeFile(t *testing.T) {
 	}
 	if len(progressCalls) != 2 {
 		t.Errorf("progress called %d times, want 2", len(progressCalls))
+	}
+}
+
+func TestWriteStreamLargeFileFallsBackToLegacyInitiate(t *testing.T) {
+	var usedLegacy bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
+			http.NotFound(w, r)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/legacy.bin":
+			usedLegacy = true
+			if h := r.Header.Get("X-Dat9-Content-Length"); h != "8" {
+				http.Error(w, "bad length", http.StatusBadRequest)
+				return
+			}
+			plan := UploadPlan{UploadID: "legacy-upload", Parts: []PartURL{{Number: 1, URL: fmt.Sprintf("http://%s/legacy/part/1", r.Host), Size: 8}}}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(plan)
+		case r.Method == http.MethodPut && r.URL.Path == "/legacy/part/1":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/legacy-upload/complete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	if err := c.WriteStream(context.Background(), "/legacy.bin", bytes.NewReader([]byte("12345678")), 8, nil); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if !usedLegacy {
+		t.Fatal("expected legacy initiate fallback to be used")
 	}
 }
 
