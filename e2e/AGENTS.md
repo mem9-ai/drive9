@@ -61,7 +61,7 @@ export DAT9_BASE="https://api.dat9.ai"
 11. SQL sanity check (`POST /v1/sql`)
 12. `copy`, `rename`, `delete`
 13. Final `list` verifies expected structure after mutations
-14. Large multipart upload (`PUT` plan + presigned part uploads + complete + download checksum)
+14. Large multipart upload (`POST /v1/uploads/initiate` + presigned part uploads + complete + download checksum)
 15. Upload-limit boundary (`1GiB` initiate accepted, `1GiB+1` rejected)
 
 ### `api-smoke-test-existing-key.sh`
@@ -86,7 +86,7 @@ export DAT9_BASE="https://api.dat9.ai"
 
 1. Provision + readiness polling
 2. Prepare `dat9` CLI binary (build local or download official release)
-3. Mount compatibility precheck for root `stat /`
+3. Mount compatibility precheck for root `ls /`
 4. RW mount lifecycle (`dat9 mount`, `dat9 umount`)
 5. File semantics (`create`, `read`, `overwrite`, `append`, `truncate`, `unlink`)
 6. Directory semantics (`mkdir`, nested paths, `readdir`, empty/non-empty `rmdir`)
@@ -99,7 +99,7 @@ export DAT9_BASE="https://api.dat9.ai"
 13. Linux prerequisite guardrails (`fusermount`, `/dev/fuse`) with skip behavior when unavailable
 
 Notes:
-- The current mount implementation prechecks `stat /`. If the deployment does not support root `stat`, this script exits as `SKIP` with a clear reason.
+- The script prechecks root `ls /` reachability before mount behavior checks.
 
 ### `smoke-all.sh`
 
@@ -115,6 +115,7 @@ Notes:
 | `DAT9_BASE` | `http://127.0.0.1:9009` | all scripts |
 | `DAT9_IMAGE_FIXTURE_PATH` | `e2e/fixtures/cat03.jpg` | `api-smoke-test.sh`, `cli-smoke-test.sh` |
 | `DAT9_API_KEY` | - | `api-smoke-test-existing-key.sh` |
+| `DAT9_API_KEY` | - | `fuse-smoke-test.sh` (optional; skip provision when set) |
 | `POLL_TIMEOUT_S` | `120` (smoke), `60` (existing-key) | polling scripts |
 | `POLL_INTERVAL_S` | `5` | polling scripts |
 | `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
