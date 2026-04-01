@@ -271,6 +271,54 @@ func TestWriteOverwriteAutoEmbeddingSkipsEmbedTaskAndPreservesEmbeddingState(t *
 	}
 }
 
+func TestWriteOverwriteAutoEmbeddingImageEnqueuesImgExtractTaskWithoutLegacyQueue(t *testing.T) {
+	extractor := &gatedImageExtractor{started: make(chan struct{}, 1), release: make(chan struct{})}
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: extractor,
+		},
+	})
+	fileID := insertImageFileForExtractTest(t, b, "/img/overwrite-auto.png", "image/png", []byte("old-image"))
+	setStoredEmbeddingState(t, b, fileID, 1)
+
+	if _, err := b.Write("/img/overwrite-auto.png", []byte("new-image"), 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-extractor.started:
+		close(extractor.release)
+		t.Fatal("legacy image queue should stay idle for auto overwrite path")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	_, revision, embeddingRevision, _ := mustFileForPath(t, b, "/img/overwrite-auto.png")
+	if revision != 2 {
+		t.Fatalf("revision=%d, want 2", revision)
+	}
+	if embeddingRevision == nil || *embeddingRevision != 1 {
+		t.Fatalf("embedding revision should be preserved, got %v", embeddingRevision)
+	}
+	nf, err := b.Store().Stat(context.Background(), "/img/overwrite-auto.png")
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat /img/overwrite-auto.png: %v", err)
+	}
+	if nf.File.ContentText != "" {
+		t.Fatalf("content_text=%q, want empty before durable worker", nf.File.ContentText)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+	if tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) || tasks[0].Status != string(semantic.TaskQueued) || tasks[0].ResourceVersion != 2 {
+		t.Fatalf("unexpected semantic task: %+v", tasks[0])
+	}
+}
+
 func TestWriteOverwriteDoesNotDeleteInlineMarkerObject(t *testing.T) {
 	b := newTestBackend(t)
 	if _, err := b.Write("/f", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {

@@ -11,6 +11,7 @@ import (
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
+	"github.com/mem9-ai/dat9/pkg/semantic"
 )
 
 type staticImageExtractor struct {
@@ -153,7 +154,18 @@ func TestAsyncImageExtractAutoEmbeddingStaleResultDoesNotQueueOrOverwriteCurrent
 		},
 	})
 	fileID := insertImageFileForExtractTest(t, b, "/img/auto-stale.png", "image/png", []byte("first-image-bytes"))
-	b.enqueueImageExtract(fileID, "/img/auto-stale.png", "image/png", 1)
+	resultCh := make(chan ImageExtractResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+			FileID:      fileID,
+			Path:        "/img/auto-stale.png",
+			ContentType: "image/png",
+			Revision:    1,
+		})
+		resultCh <- result
+		errCh <- err
+	}()
 	select {
 	case <-extractor.started:
 	case <-time.After(2 * time.Second):
@@ -163,14 +175,36 @@ func TestAsyncImageExtractAutoEmbeddingStaleResultDoesNotQueueOrOverwriteCurrent
 	if _, err := b.Write("/img/auto-stale.png", []byte("second-image-bytes"), 0, filesystem.WriteFlagTruncate); err != nil {
 		t.Fatal(err)
 	}
+	result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/img/auto-stale.png",
+		ContentType: "image/png",
+		Revision:    2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != ImageExtractResultWritten {
+		t.Fatalf("result=%q, want %q", result, ImageExtractResultWritten)
+	}
 	close(extractor.release)
+	if gotErr := <-errCh; gotErr != nil {
+		t.Fatal(gotErr)
+	}
+	if got := <-resultCh; got != ImageExtractResultStale {
+		t.Fatalf("stale result=%q, want %q", got, ImageExtractResultStale)
+	}
 
-	got := waitForContentText(t, b, "/img/auto-stale.png", 3*time.Second)
+	got := waitForContentText(t, b, "/img/auto-stale.png", time.Second)
 	if got != "new caption" {
 		t.Fatalf("expected final extracted text %q, got %q", "new caption", got)
 	}
-	if tasks := loadSemanticTasksForFile(t, b, fileID); len(tasks) != 0 {
-		t.Fatalf("semantic task count=%d, want 0", len(tasks))
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+	if tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) || tasks[0].Status != "queued" || tasks[0].ResourceVersion != 2 {
+		t.Fatalf("unexpected semantic task history: %+v", tasks)
 	}
 }
 
