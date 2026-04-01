@@ -350,23 +350,26 @@ func (m *semanticWorkerManager) recoverExpired(ctx context.Context) {
 				zap.Error(err))
 			continue
 		}
-		start := time.Now()
-		recovered, err := target.store.RecoverExpiredSemanticTasks(ctx, time.Now().UTC(), 64)
-		if err != nil {
-			metrics.RecordOperation("semantic_worker", "recover", "error", time.Since(start))
-			logger.Warn(ctx, "semantic_worker_recover_failed",
-				zap.String("tenant_id", ref.id),
-				zap.Error(err))
-			m.invalidateTenantBackend(ref.id)
-			continue
-		}
-		if recovered > 0 {
-			metrics.RecordOperation("semantic_worker", "recover", "ok", time.Since(start))
-			logger.Info(ctx, "semantic_worker_recover_ok",
-				zap.String("tenant_id", ref.id),
-				zap.String("result", "ok"),
-				zap.Int("recovered", recovered))
-		}
+		func() {
+			defer target.release()
+			start := time.Now()
+			recovered, err := target.store.RecoverExpiredSemanticTasks(ctx, time.Now().UTC(), 64)
+			if err != nil {
+				metrics.RecordOperation("semantic_worker", "recover", "error", time.Since(start))
+				logger.Warn(ctx, "semantic_worker_recover_failed",
+					zap.String("tenant_id", ref.id),
+					zap.Error(err))
+				m.invalidateTenantBackend(ref.id)
+				return
+			}
+			if recovered > 0 {
+				metrics.RecordOperation("semantic_worker", "recover", "ok", time.Since(start))
+				logger.Info(ctx, "semantic_worker_recover_ok",
+					zap.String("tenant_id", ref.id),
+					zap.String("result", "ok"),
+					zap.Int("recovered", recovered))
+			}
+		}()
 	}
 }
 
@@ -392,11 +395,11 @@ func (m *semanticWorkerManager) nextTarget(ctx context.Context) (*semanticTarget
 			m.releaseTenantSlot(ref.id)
 			continue
 		}
+		target.release = chainReleases(target.release, func() { m.releaseTenantSlot(ref.id) })
 		if len(target.allowedTaskTypes) == 0 {
-			m.releaseTenantSlot(ref.id)
+			target.release()
 			continue
 		}
-		target.release = func() { m.releaseTenantSlot(ref.id) }
 		return target, nil
 	}
 	return nil, nil
@@ -455,11 +458,27 @@ func (m *semanticWorkerManager) listTenantRefs(ctx context.Context) ([]semanticT
 }
 
 func (m *semanticWorkerManager) targetForRef(ctx context.Context, ref semanticTenantRef) (*semanticTarget, error) {
-	b, err := m.backendForRef(ctx, ref)
+	if ref.id == semanticLocalTenantID {
+		if m.fallback == nil {
+			return nil, fmt.Errorf("backend missing for %s", ref.id)
+		}
+		return &semanticTarget{
+			tenantID:         ref.id,
+			backend:          m.fallback,
+			store:            m.fallback.Store(),
+			allowedTaskTypes: m.allowedTaskTypesForTarget(m.fallback),
+			release:          func() {},
+		}, nil
+	}
+	if ref.tenant == nil {
+		return nil, fmt.Errorf("tenant metadata missing for %s", ref.id)
+	}
+	b, release, err := m.pool.Acquire(ctx, ref.tenant)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("acquire tenant backend: %w", err)
 	}
 	if b == nil {
+		release()
 		return nil, fmt.Errorf("backend missing for %s", ref.id)
 	}
 	return &semanticTarget{
@@ -467,21 +486,8 @@ func (m *semanticWorkerManager) targetForRef(ctx context.Context, ref semanticTe
 		backend:          b,
 		store:            b.Store(),
 		allowedTaskTypes: m.allowedTaskTypesForTarget(b),
+		release:          release,
 	}, nil
-}
-
-func (m *semanticWorkerManager) backendForRef(ctx context.Context, ref semanticTenantRef) (*backend.Dat9Backend, error) {
-	if ref.id == semanticLocalTenantID {
-		return m.fallback, nil
-	}
-	if ref.tenant == nil {
-		return nil, fmt.Errorf("tenant metadata missing for %s", ref.id)
-	}
-	b, err := m.pool.Get(ctx, ref.tenant)
-	if err != nil {
-		return nil, fmt.Errorf("get tenant backend: %w", err)
-	}
-	return b, nil
 }
 
 func (m *semanticWorkerManager) invalidateTenantBackend(tenantID string) {
@@ -631,21 +637,24 @@ func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time
 				zap.Error(err))
 			continue
 		}
-		obs, err := target.store.ObserveSemanticTasks(ctx, now)
-		if err != nil {
-			logger.Warn(ctx, "semantic_worker_observe_failed",
-				zap.String("tenant_id", ref.id),
-				zap.Error(err))
-			m.invalidateTenantBackend(ref.id)
-			continue
-		}
-		snapshot.queued += obs.Queued
-		snapshot.processing += obs.Processing
-		snapshot.deadLettered += obs.DeadLettered
-		if obs.OldestClaimableAvailableAt != nil && (oldest == nil || obs.OldestClaimableAvailableAt.Before(*oldest)) {
-			t := obs.OldestClaimableAvailableAt.UTC()
-			oldest = &t
-		}
+		func() {
+			defer target.release()
+			obs, err := target.store.ObserveSemanticTasks(ctx, now)
+			if err != nil {
+				logger.Warn(ctx, "semantic_worker_observe_failed",
+					zap.String("tenant_id", ref.id),
+					zap.Error(err))
+				m.invalidateTenantBackend(ref.id)
+				return
+			}
+			snapshot.queued += obs.Queued
+			snapshot.processing += obs.Processing
+			snapshot.deadLettered += obs.DeadLettered
+			if obs.OldestClaimableAvailableAt != nil && (oldest == nil || obs.OldestClaimableAvailableAt.Before(*oldest)) {
+				t := obs.OldestClaimableAvailableAt.UTC()
+				oldest = &t
+			}
+		}()
 	}
 	if oldest != nil {
 		lag := now.Sub(*oldest).Seconds()
@@ -717,4 +726,15 @@ func imageExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.ImageExtr
 		spec.ContentType = payload.ContentType
 	}
 	return spec
+}
+
+func chainReleases(first, second func()) func() {
+	return func() {
+		if first != nil {
+			first()
+		}
+		if second != nil {
+			second()
+		}
+	}
 }

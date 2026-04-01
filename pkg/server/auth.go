@@ -124,13 +124,14 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			return
 		}
 
-		b, err := pool.Get(r.Context(), &resolved.Tenant)
+		b, release, err := pool.Acquire(r.Context(), &resolved.Tenant)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "backend_load_failed", "tenant_id", resolved.Tenant.ID, "error", err)...)
 			metricEvent(r.Context(), "tenant_backend", "result", "load_failed")
 			errJSON(w, http.StatusInternalServerError, "backend unavailable")
 			return
 		}
+		defer release()
 		metricEvent(r.Context(), "auth", "result", "ok")
 
 		scope := &TenantScope{TenantID: resolved.Tenant.ID, APIKeyID: resolved.APIKey.ID, TokenVersion: resolved.APIKey.TokenVersion, Backend: b}

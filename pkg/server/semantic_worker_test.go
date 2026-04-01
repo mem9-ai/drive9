@@ -6,12 +6,15 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	"github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
@@ -38,6 +41,24 @@ func (e staticSemanticEmbedder) EmbedText(context.Context, string) ([]float32, e
 	return append([]float32(nil), e.vec...), nil
 }
 
+type gatedSemanticEmbedder struct {
+	vec     []float32
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (e *gatedSemanticEmbedder) EmbedText(context.Context, string) ([]float32, error) {
+	e.once.Do(func() {
+		select {
+		case e.started <- struct{}{}:
+		default:
+		}
+		<-e.release
+	})
+	return append([]float32(nil), e.vec...), nil
+}
+
 type staticServerImageExtractor struct {
 	text string
 	err  error
@@ -47,6 +68,24 @@ func (e staticServerImageExtractor) ExtractImageText(context.Context, backend.Im
 	if e.err != nil {
 		return "", e.err
 	}
+	return e.text, nil
+}
+
+type gatedServerImageExtractor struct {
+	text    string
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (e *gatedServerImageExtractor) ExtractImageText(context.Context, backend.ImageExtractRequest) (string, error) {
+	e.once.Do(func() {
+		select {
+		case e.started <- struct{}{}:
+		default:
+		}
+		<-e.release
+	})
 	return e.text, nil
 }
 
@@ -209,6 +248,93 @@ func TestSemanticWorkerProcessesImgExtractTaskWithoutEmbedder(t *testing.T) {
 	if tasks := loadSemanticTaskRowsForResource(t, b, fileID); len(tasks) != 1 || tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) {
 		t.Fatalf("unexpected semantic task rows: %+v", tasks)
 	}
+}
+
+func TestSemanticWorkerKeepsBorrowedTenantBackendAliveDuringInvalidate(t *testing.T) {
+	initServerTenantSchema(t, testDSN)
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	pool := newTestTenantPool(t)
+	parsed, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port := "127.0.0.1", 3306
+	if parsed.Addr != "" {
+		h, p, _ := strings.Cut(parsed.Addr, ":")
+		if h != "" {
+			host = h
+		}
+		if p != "" {
+			_, _ = fmt.Sscanf(p, "%d", &port)
+		}
+	}
+	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	tenantID := tenant.NewID()
+	tenantMeta := &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantActive,
+		DBHost:           host,
+		DBPort:           port,
+		DBUser:           parsed.User,
+		DBPasswordCipher: passCipher,
+		DBName:           parsed.DBName,
+		DBTLS:            false,
+		Provider:         tenant.ProviderDB9,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := metaStore.InsertTenant(context.Background(), tenantMeta); err != nil {
+		t.Fatal(err)
+	}
+	b, err := pool.Get(context.Background(), tenantMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/docs/pinned-worker.txt", []byte("hello borrowed backend"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	nf := mustServerFile(t, b, "/docs/pinned-worker.txt")
+	embedder := &gatedSemanticEmbedder{
+		vec:     []float32{0.1, 0.2, 0.3},
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+
+	s := NewWithConfig(Config{Meta: metaStore, Pool: pool, SemanticEmbedder: embedder, SemanticWorkers: SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
+	}})
+	t.Cleanup(func() { s.Close() })
+
+	select {
+	case <-embedder.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("embed task did not start")
+	}
+	pool.Invalidate(tenantID)
+	close(embedder.release)
+
+	probeStore, err := datastore.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = probeStore.Close() }()
+	waitForStoreEmbeddingRevision(t, probeStore, "/docs/pinned-worker.txt", 1, 3*time.Second)
+	waitForStoreTaskStatusByResource(t, probeStore, nf.FileID, 1, string(semantic.TaskSucceeded), 3*time.Second)
 }
 
 func TestSemanticWorkerImageOnlySkipsLegacyEmbedBacklog(t *testing.T) {
@@ -1081,4 +1207,77 @@ func waitForObservedLog(t *testing.T, recorded *observer.ObservedLogs, message s
 		t.Fatalf("timed out waiting for log message %q", message)
 	}
 	return entries[len(entries)-1]
+}
+
+func waitForStoreContentText(t *testing.T, store *datastore.Store, path, wantSubstring string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		nf, err := store.Stat(context.Background(), path)
+		if err == nil && nf.File != nil && strings.Contains(nf.File.ContentText, wantSubstring) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	nf, err := store.Stat(context.Background(), path)
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat %s while waiting for content text: %v", path, err)
+	}
+	t.Fatalf("content_text=%q, want substring %q", nf.File.ContentText, wantSubstring)
+}
+
+func waitForStoreNamedTaskStatus(t *testing.T, store *datastore.Store, taskID, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var status string
+		err := store.DB().QueryRow(`SELECT status FROM semantic_tasks WHERE task_id = ?`, taskID).Scan(&status)
+		if err == nil && status == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var status string
+	if err := store.DB().QueryRow(`SELECT status FROM semantic_tasks WHERE task_id = ?`, taskID).Scan(&status); err != nil {
+		t.Fatalf("wait named task status query: %v", err)
+	}
+	t.Fatalf("task %s status=%q, want %q", taskID, status, want)
+}
+
+func waitForStoreEmbeddingRevision(t *testing.T, store *datastore.Store, path string, want int64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		nf, err := store.Stat(context.Background(), path)
+		if err == nil && nf.File != nil && nf.File.EmbeddingRevision != nil && *nf.File.EmbeddingRevision == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	nf, err := store.Stat(context.Background(), path)
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat %s while waiting for embedding revision: %v", path, err)
+	}
+	if nf.File.EmbeddingRevision == nil {
+		t.Fatalf("timed out waiting for embedding revision %d on %s", want, path)
+	}
+	t.Fatalf("embedding revision=%d, want %d", *nf.File.EmbeddingRevision, want)
+}
+
+func waitForStoreTaskStatusByResource(t *testing.T, store *datastore.Store, resourceID string, version int64, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var status string
+		err := store.DB().QueryRow(`SELECT status FROM semantic_tasks WHERE resource_id = ? AND resource_version = ?`, resourceID, version).Scan(&status)
+		if err == nil && status == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var status string
+	if err := store.DB().QueryRow(`SELECT status FROM semantic_tasks WHERE resource_id = ? AND resource_version = ?`, resourceID, version).Scan(&status); err != nil {
+		t.Fatalf("wait task status by resource query: %v", err)
+	}
+	t.Fatalf("resource %s version %d status=%q, want %q", resourceID, version, status, want)
 }
