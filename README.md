@@ -173,10 +173,10 @@ c.Delete("/data/file.txt")
   Dat9Backend   memfs     S3 direct
   (AGFS FileSystem)       (presigned URL,
      │                     FUSE ↔ S3)
-     ├── < 1MB → TiDB(MySQL protocol) + local blobs (P0)
+     ├── < 50KB → TiDB(MySQL protocol) + local blobs (P0)
      │            db9 + fs9 (production)
      │
-     └── ≥ 1MB → S3 presigned URL
+     └── ≥ 50KB → S3 presigned URL
                   (direct upload, server not involved)
 ```
 
@@ -184,7 +184,7 @@ c.Delete("/data/file.txt")
 
 **inode model** — Paths (file_nodes) and file entities (files) are separate, just like Unix. One file can appear at multiple paths. `cp` is a zero-cost link. `mv` is metadata-only. `rm` is reference-counted.
 
-**Tiered storage** — Small files (< 1MB) go to db9 with automatic embedding and FTS indexing. Large files (≥ 1MB) go directly to S3 via presigned URLs. One path namespace spans both.
+**Tiered storage** — Small files (< 50KB) go to db9 with automatic embedding and FTS indexing. Large files (≥ 50KB) go directly to S3 via presigned URLs. One path namespace spans both.
 
 **Tiered context (L0/L1/L2)** — Every directory can carry `.abstract.md` (~100 tokens) and `.overview.md` (~1k tokens). Agents scan cheaply via L0/L1 before loading full content (L2). 10x token savings.
 

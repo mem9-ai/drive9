@@ -61,7 +61,7 @@ dat9 adds what db9 doesn't have: **large-file S3 direct upload**, **path-tree na
 
 1. **Users see only file operations** --- `cp`, `cat`, `ls`, `search`. All protocol complexity is hidden.
 2. **Leverage db9 native capabilities** --- embedding, FTS, vector search, chunking are db9 built-in. dat9 orchestrates, not reimplements.
-3. **Tiered storage** --- Small files (< 1MB) in db9 (zero network overhead, instant search). Large files (>= 1MB) in S3 (presigned URL direct upload). One path namespace spanning both.
+3. **Tiered storage** --- Small files (< 50KB) in db9 (zero network overhead, instant search). Large files (>= 50KB) in S3 (presigned URL direct upload). One path namespace spanning both.
 4. **inode model** --- Paths and file entities are separate. One file can appear at multiple paths (zero-copy `cp`). `mv` is a metadata-only operation.
 5. **Import, don't fork** --- Built on [AGFS](https://github.com/c4pt0r/agfs)'s `FileSystem` interface and `MountableFS` routing layer.
 6. **Tiered context loading** --- Inspired by [OpenViking](https://github.com/volcengine/OpenViking)'s L0/L1/L2 model. Every directory can carry a ~100-token abstract (L0) and a ~1k-token overview (L1), enabling agents to scan cheaply before loading full content (L2).
@@ -89,8 +89,8 @@ dat9 adds what db9 doesn't have: **large-file S3 direct upload**, **path-tree na
 │  │              (implements AGFS FileSystem)                         │  │
 │  │                                                                  │  │
 │  │  Write path:                                                     │  │
-│  │    < 1MB  → db9 fs9_write()        (instant, auto-embedding)     │  │
-│  │    >= 1MB → S3 presigned URL       (direct upload, never proxied)│  │
+│  │    < 50KB → db9 fs9_write()        (instant, auto-embedding)     │  │
+│  │    >= 50KB → S3 presigned URL      (direct upload, never proxied)│  │
 │  │                                                                  │  │
 │  │  Read path:                                                      │  │
 │  │    db9 file → fs9_read()           (~1ms)                        │  │
@@ -109,7 +109,7 @@ dat9 adds what db9 doesn't have: **large-file S3 direct upload**, **path-tree na
 │  │ + fs9    │  │ <ulid>   │                                          │
 │  │ + embed  │  │          │                                          │
 │  │ + FTS    │  │ 大文件    │                                          │
-│  │ + vector │  │ >= 1MB   │                                          │
+│  │ + vector │  │ >= 50KB  │                                          │
 │  └──────────┘  └──────────┘                                          │
 │                                                                       │
 │  ┌───────────────────────────────────────────────────────────────┐    │
@@ -122,7 +122,7 @@ dat9 adds what db9 doesn't have: **large-file S3 direct upload**, **path-tree na
 
 ### Why Two Storage Tiers?
 
-| Concern | db9 (< 1MB) | S3 (>= 1MB) |
+| Concern | db9 (< 50KB) | S3 (>= 50KB) |
 |---------|-------------|-------------|
 | **Latency** | ~1ms (TiKV local read) | ~50ms (HTTP round-trip) |
 | **Max size** | 100MB (db9 limit) | Unlimited |
@@ -131,7 +131,7 @@ dat9 adds what db9 doesn't have: **large-file S3 direct upload**, **path-tree na
 | **Semantic search** | Native HNSW + GIN | Only via L0 abstract (small file in db9) |
 | **Cost** | db9 compute + TiKV storage | S3 storage (cheap) + transfer |
 
-Small files benefit from db9's native embedding/FTS. Large files are too big for db9 and too expensive to embed entirely — they participate in search only through their L0 abstracts (which are small files stored in db9).
+Small files benefit from db9's native embedding/FTS. Large files are too big to embed entirely — they participate in search only through their L0 abstracts (which are small files stored in db9).
 
 ### Relationship with AGFS
 
@@ -271,7 +271,7 @@ Small files are stored in db9 via `fs9_write('/blobs/<ulid>', content)`. Same UL
 
 ## 4. Two Data Paths
 
-### Small Files (< 1MB): Server Proxy → db9
+### Small Files (< 50KB): Server Proxy → db9
 
 ```
 Client ──PUT body──▶ dat9 server
@@ -286,7 +286,7 @@ Client ◀── 200 OK ──────┘
 
 The server reads the request body, writes to db9, creates metadata, and returns. Simple, synchronous. **Embedding and FTS indexing happen automatically** via db9's `GENERATED ALWAYS AS` columns — no async pipeline needed for small files.
 
-### Large Files (>= 1MB): Presigned URL Direct Upload → S3
+### Large Files (>= 50KB): Presigned URL Direct Upload → S3
 
 ```
 Client ──PUT (Content-Length only, no body)──▶ dat9 server
@@ -318,7 +318,7 @@ Client ◀── 200 { confirmed } ───────────────
 
 The server never touches large file data. Large files have `vec=NULL` and `tsv=NULL` — they don't participate in search directly. They participate through their L0 abstracts (see §5).
 
-**Capability-aware write handler**: the server checks `backend.(filesystem.CapabilityProvider).GetCapabilities().IsObjectStore` via type assertion. If true and size >= 1MB threshold, return 202 with presigned URLs.
+**Capability-aware write handler**: the server checks `backend.(filesystem.CapabilityProvider).GetCapabilities().IsObjectStore` via type assertion. If true and size >= 50KB threshold, return 202 with presigned URLs.
 
 ### Resumable Uploads
 
@@ -344,7 +344,7 @@ Every directory in dat9 can optionally carry three layers of progressively detai
 |-------|------|-------------|---------|---------|
 | **L0** | `.abstract.md` | ~100 tokens (~400B) | Ultra-short summary. Vector search, quick filtering. | db9 (small file, auto-embedded) |
 | **L1** | `.overview.md` | ~1-2k tokens (~4KB) | Structured overview with navigation pointers. | db9 (small file, auto-embedded) |
-| **L2** | Original files | Unlimited | Full content. Loaded only when the agent confirms it needs the detail. | db9 (< 1MB) or S3 (>= 1MB) |
+| **L2** | Original files | Unlimited | Full content. Loaded only when the agent confirms it needs the detail. | db9 (< 50KB) or S3 (>= 50KB) |
 
 Example directory:
 
@@ -999,7 +999,7 @@ Raw input (URL-decoded once)
 
 | Control | Spec |
 |---------|------|
-| **TTL** | Upload: max 120 seconds. Download: max 60 seconds. |
+| **TTL** | Upload: max 10 minutes. Download: max 10 minutes. |
 | **Binding** | Upload URLs bind: part number, `Content-Length`, `x-amz-checksum-sha256`. |
 | **Log hygiene** | Redact `X-Amz-Signature` and `X-Amz-Credential` in logs. |
 | **Download indirection** | `GET /v1/fs/{path}` for large files → one-time ticket → presigned URL. |
@@ -1048,7 +1048,7 @@ Raw input (URL-decoded once)
 
 | Question | Options | Leaning |
 |---|---|---|
-| Small/large file threshold | 1MB / 5MB / 10MB | 5MB — db9 fs9 supports up to 100MB; a 3MB Markdown document benefits from auto-embedding. Higher threshold = more files get semantic search for free. Trade-off: larger db9 storage cost per tenant. |
+| Small/large file threshold | 50,000 bytes | Aligned with embedding model's max input (50,000 characters). Files below threshold get auto-embedding and FTS in db9. Files above go to S3 and participate in search via L0 abstracts. |
 | db9 embedding model | text-embedding-v4 / amazon.titan-embed-text-v2:0 | titan (matches user config) |
 | db9 FTS tokenizer | simple / jieba / chinese_ngram | jieba (Chinese support) |
 | Object store | AWS S3 / MinIO / R2 | S3 for cloud, MinIO for on-prem |
