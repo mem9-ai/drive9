@@ -774,7 +774,13 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 		TotalSize     int64    `json:"total_size"`
 		PartChecksums []string `json:"part_checksums"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_body_too_large", "max", 1<<20)...)
+			errJSON(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_bad_body", "error", err)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
