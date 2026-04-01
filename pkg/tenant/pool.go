@@ -35,7 +35,7 @@ type Pool struct {
 	mu      sync.Mutex
 	cfg     PoolConfig
 	enc     encrypt.Encryptor
-	items   map[string]*list.Element
+	items   map[string]*entry
 	order   *list.List
 	maxSize int
 }
@@ -44,6 +44,9 @@ type entry struct {
 	tenantID string
 	backend  *backend.Dat9Backend
 	store    *datastore.Store
+	elem     *list.Element
+	refs     int
+	retired  bool
 }
 
 func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
@@ -51,7 +54,7 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 	if max <= 0 {
 		max = 128
 	}
-	return &Pool{cfg: cfg, enc: enc, items: map[string]*list.Element{}, order: list.New(), maxSize: max}
+	return &Pool{cfg: cfg, enc: enc, items: map[string]*entry{}, order: list.New(), maxSize: max}
 }
 
 func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backend, err error) {
@@ -67,9 +70,9 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 	}
 
 	p.mu.Lock()
-	if elem, ok := p.items[t.ID]; ok {
-		p.order.MoveToFront(elem)
-		b := elem.Value.(*entry).backend
+	if e, ok := p.items[t.ID]; ok {
+		p.order.MoveToFront(e.elem)
+		b := e.backend
 		p.mu.Unlock()
 		return b, nil
 	}
@@ -81,45 +84,118 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if elem, ok := p.items[t.ID]; ok {
+	if e, ok := p.items[t.ID]; ok {
 		b.Close()
 		_ = st.Close()
-		p.order.MoveToFront(elem)
-		return elem.Value.(*entry).backend, nil
+		p.order.MoveToFront(e.elem)
+		p.mu.Unlock()
+		return e.backend, nil
 	}
-	elem := p.order.PushFront(&entry{tenantID: t.ID, backend: b, store: st})
-	p.items[t.ID] = elem
+	e := &entry{tenantID: t.ID, backend: b, store: st}
+	e.elem = p.order.PushFront(e)
+	p.items[t.ID] = e
+	toClose := make([]*entry, 0, 1)
 	for p.order.Len() > p.maxSize {
 		oldest := p.order.Back()
 		if oldest != nil {
-			p.removeLocked(oldest)
+			if removed := p.removeLocked(oldest); removed != nil {
+				toClose = append(toClose, removed)
+			}
 		}
+	}
+	p.mu.Unlock()
+	for _, retired := range toClose {
+		closeEntry(retired)
 	}
 	return b, nil
 }
 
-func (p *Pool) Invalidate(tenantID string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if elem, ok := p.items[tenantID]; ok {
-		p.removeLocked(elem)
+// Acquire returns a backend that is pinned for the caller's active use. The
+// returned release callback must be called when the caller is done with the
+// backend so a retired entry can be closed.
+func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backend, release func(), err error) {
+	start := time.Now()
+	defer observePool(ctx, "acquire", t.ID, &err, start)
+
+	if t.Status != meta.TenantActive {
+		logger.Warn(ctx, "tenant_pool_get_skipped_inactive",
+			zap.String("tenant_id", t.ID),
+			zap.String("status", string(t.Status)))
+		p.Invalidate(t.ID)
+		return nil, nil, fmt.Errorf("tenant status: %s", t.Status)
 	}
+
+	p.mu.Lock()
+	if e, ok := p.items[t.ID]; ok {
+		e.refs++
+		p.order.MoveToFront(e.elem)
+		p.mu.Unlock()
+		return e.backend, p.makeRelease(e), nil
+	}
+	p.mu.Unlock()
+
+	b, st, err := p.createBackend(ctx, t)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	p.mu.Lock()
+	if e, ok := p.items[t.ID]; ok {
+		e.refs++
+		p.order.MoveToFront(e.elem)
+		p.mu.Unlock()
+		b.Close()
+		_ = st.Close()
+		return e.backend, p.makeRelease(e), nil
+	}
+	e := &entry{tenantID: t.ID, backend: b, store: st, refs: 1}
+	e.elem = p.order.PushFront(e)
+	p.items[t.ID] = e
+	toClose := make([]*entry, 0, 1)
+	for p.order.Len() > p.maxSize {
+		oldest := p.order.Back()
+		if oldest != nil {
+			if removed := p.removeLocked(oldest); removed != nil {
+				toClose = append(toClose, removed)
+			}
+		}
+	}
+	p.mu.Unlock()
+	for _, retired := range toClose {
+		closeEntry(retired)
+	}
+	return b, p.makeRelease(e), nil
+}
+
+func (p *Pool) Invalidate(tenantID string) {
+	var toClose *entry
+	p.mu.Lock()
+	if e, ok := p.items[tenantID]; ok {
+		toClose = p.removeLocked(e.elem)
+	}
+	p.mu.Unlock()
+	closeEntry(toClose)
 }
 
 func (p *Pool) Close() {
+	toClose := make([]*entry, 0, p.order.Len())
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	for p.order.Len() > 0 {
-		p.removeLocked(p.order.Back())
+		if removed := p.removeLocked(p.order.Back()); removed != nil {
+			toClose = append(toClose, removed)
+		}
+	}
+	p.mu.Unlock()
+	for _, retired := range toClose {
+		closeEntry(retired)
 	}
 }
 
 func (p *Pool) S3Backend(tenantID string) *backend.Dat9Backend {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if elem, ok := p.items[tenantID]; ok {
-		return elem.Value.(*entry).backend
+	if e, ok := p.items[tenantID]; ok {
+		return e.backend
 	}
 	return nil
 }
@@ -234,10 +310,47 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	return b, store, nil
 }
 
-func (p *Pool) removeLocked(elem *list.Element) {
+func (p *Pool) removeLocked(elem *list.Element) *entry {
 	e := elem.Value.(*entry)
 	p.order.Remove(elem)
+	e.elem = nil
 	delete(p.items, e.tenantID)
+	e.retired = true
+	if e.refs == 0 {
+		return e
+	}
+	return nil
+}
+
+func (p *Pool) makeRelease(e *entry) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.releaseEntry(e)
+		})
+	}
+}
+
+func (p *Pool) releaseEntry(e *entry) {
+	if e == nil {
+		return
+	}
+	var toClose *entry
+	p.mu.Lock()
+	if e.refs > 0 {
+		e.refs--
+	}
+	if e.refs == 0 && e.retired {
+		toClose = e
+	}
+	p.mu.Unlock()
+	closeEntry(toClose)
+}
+
+func closeEntry(e *entry) {
+	if e == nil {
+		return
+	}
 	if e.backend != nil {
 		e.backend.Close()
 	}
