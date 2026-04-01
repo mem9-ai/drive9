@@ -97,6 +97,43 @@ func TestLargeFilePut202(t *testing.T) {
 	}
 }
 
+func TestUploadInitiateByBody202(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	body := make([]byte, 1<<20) // exactly 1MB
+	reqBody := map[string]any{
+		"path":           "/big-body.bin",
+		"total_size":     len(body),
+		"part_checksums": strings.Split(partChecksumHeader(body), ","),
+	}
+	p, _ := json.Marshal(reqBody)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/initiate", bytes.NewReader(p))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusAccepted {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 202, got %d: %s", resp.StatusCode, b)
+	}
+
+	var plan backend.UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if plan.UploadID == "" {
+		t.Error("expected upload_id")
+	}
+	if len(plan.Parts) == 0 {
+		t.Error("expected parts")
+	}
+}
+
 func TestSmallFilePut200(t *testing.T) {
 	s, _ := newTestServerWithS3(t)
 	ts := httptest.NewServer(s)
@@ -206,6 +243,56 @@ func TestUploadResumeEndpoint(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("resume: expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var resumed backend.UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&resumed); err != nil {
+		t.Fatal(err)
+	}
+	if len(resumed.Parts) != 2 {
+		t.Errorf("expected 2 missing parts, got %d", len(resumed.Parts))
+	}
+}
+
+func TestUploadResumeEndpointByBody(t *testing.T) {
+	s, s3c := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	totalSize := int64(20 << 20)
+	body := make([]byte, totalSize)
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/resume-body-test.bin", bytes.NewReader(body))
+	req.ContentLength = totalSize
+	checksumsHeader := partChecksumHeader(body)
+	req.Header.Set("X-Dat9-Part-Checksums", checksumsHeader)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var plan backend.UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	upload, _ := s.fallback.GetUpload(context.Background(), plan.UploadID)
+	if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, 1, bytes.NewReader(make([]byte, s3client.PartSize))); err != nil {
+		t.Fatal(err)
+	}
+
+	resumePayload, _ := json.Marshal(map[string]any{"part_checksums": strings.Split(checksumsHeader, ",")})
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/"+plan.UploadID+"/resume", bytes.NewReader(resumePayload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("resume by body: expected 200, got %d: %s", resp.StatusCode, b)
 	}
 
 	var resumed backend.UploadPlan

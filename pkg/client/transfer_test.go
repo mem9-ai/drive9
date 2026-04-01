@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mem9-ai/dat9/internal/testmysql"
@@ -56,9 +57,14 @@ func TestWriteStreamLargeFile(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/large.bin":
-			if h := r.Header.Get("X-Dat9-Content-Length"); h != "8" {
-				http.Error(w, fmt.Sprintf("expected X-Dat9-Content-Length=8, got %q", h), 400)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
+			var req uploadInitiateRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			if req.Path != "/large.bin" || req.TotalSize != 8 {
+				http.Error(w, fmt.Sprintf("bad initiate payload: %+v", req), http.StatusBadRequest)
 				return
 			}
 			// Return 202 with upload plan
@@ -126,6 +132,72 @@ func TestWriteStreamLargeFile(t *testing.T) {
 	}
 	if len(progressCalls) != 2 {
 		t.Errorf("progress called %d times, want 2", len(progressCalls))
+	}
+}
+
+func TestWriteStreamLargeFileFallsBackToLegacyInitiate(t *testing.T) {
+	var usedLegacy atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
+			http.NotFound(w, r)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/legacy.bin":
+			usedLegacy.Store(true)
+			if h := r.Header.Get("X-Dat9-Content-Length"); h != "8" {
+				http.Error(w, "bad length", http.StatusBadRequest)
+				return
+			}
+			plan := UploadPlan{UploadID: "legacy-upload", Parts: []PartURL{{Number: 1, URL: fmt.Sprintf("http://%s/legacy/part/1", r.Host), Size: 8}}}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(plan)
+		case r.Method == http.MethodPut && r.URL.Path == "/legacy/part/1":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/legacy-upload/complete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	if err := c.WriteStream(context.Background(), "/legacy.bin", bytes.NewReader([]byte("12345678")), 8, nil); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if !usedLegacy.Load() {
+		t.Fatal("expected legacy initiate fallback to be used")
+	}
+}
+
+func TestWriteStreamLargeFileFallsBackOnUnknownUploadAction(t *testing.T) {
+	var usedLegacy atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
+			http.Error(w, `{"error":"unknown upload action"}`, http.StatusBadRequest)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/legacy.bin":
+			usedLegacy.Store(true)
+			plan := UploadPlan{UploadID: "legacy-upload-400", Parts: []PartURL{{Number: 1, URL: fmt.Sprintf("http://%s/legacy400/part/1", r.Host), Size: 8}}}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(plan)
+		case r.Method == http.MethodPut && r.URL.Path == "/legacy400/part/1":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/legacy-upload-400/complete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	if err := c.WriteStream(context.Background(), "/legacy.bin", bytes.NewReader([]byte("12345678")), 8, nil); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if !usedLegacy.Load() {
+		t.Fatal("expected legacy initiate fallback to be used")
 	}
 }
 
@@ -269,6 +341,17 @@ func TestResumeUpload(t *testing.T) {
 			})
 
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-456/resume":
+			var req struct {
+				PartChecksums []string `json:"part_checksums"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			if len(req.PartChecksums) == 0 {
+				http.Error(w, "bad checksums", http.StatusBadRequest)
+				return
+			}
 			// Step 2: Return missing parts (only part 2 is missing)
 			plan := UploadPlan{
 				UploadID: "resume-456",
@@ -321,6 +404,49 @@ func TestResumeUpload(t *testing.T) {
 	}
 	if progressCalls[0] != [2]int{2, 3} {
 		t.Fatalf("progress = %v, want [[2 3]]", progressCalls)
+	}
+}
+
+func TestResumeUploadFallsBackToLegacyHeader(t *testing.T) {
+	var resumeCalls int
+	var usedLegacy atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/uploads":
+			_ = json.NewEncoder(w).Encode(struct {
+				Uploads []UploadMeta `json:"uploads"`
+			}{
+				Uploads: []UploadMeta{{UploadID: "resume-legacy", PartsTotal: 1, Status: "UPLOADING"}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-legacy/resume":
+			resumeCalls++
+			if resumeCalls == 1 {
+				http.Error(w, `{"error":"missing X-Dat9-Part-Checksums header"}`, http.StatusBadRequest)
+				return
+			}
+			if r.Header.Get("X-Dat9-Part-Checksums") == "" {
+				http.Error(w, "missing legacy header", http.StatusBadRequest)
+				return
+			}
+			usedLegacy.Store(true)
+			_ = json.NewEncoder(w).Encode(UploadPlan{UploadID: "resume-legacy", PartSize: 8, Parts: []PartURL{{Number: 1, URL: fmt.Sprintf("http://%s/resume-legacy/part/1", r.Host), Size: 8}}})
+		case r.Method == http.MethodPut && r.URL.Path == "/resume-legacy/part/1":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-legacy/complete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	if err := c.ResumeUpload(context.Background(), "/legacy-resume.bin", bytes.NewReader([]byte("12345678")), 8, nil); err != nil {
+		t.Fatalf("ResumeUpload: %v", err)
+	}
+	if !usedLegacy.Load() {
+		t.Fatal("expected legacy header fallback to be used")
 	}
 }
 
