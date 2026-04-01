@@ -208,6 +208,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.HasPrefix(r.URL.Path, "/v1/fs/"):
 		s.handleFS(w, r)
+	case r.URL.Path == "/v1/uploads/initiate":
+		s.handleUploads(w, r)
 	case r.URL.Path == "/v1/uploads":
 		s.handleUploads(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/uploads/"):
