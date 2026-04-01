@@ -86,7 +86,7 @@ func newAuthServer(t *testing.T) (*Server, string, func()) {
 		DBPasswordCipher: passCipher,
 		DBName:           parsed.DBName,
 		DBTLS:            false,
-		Provider:         "tidb_zero",
+		Provider:         tenant.ProviderDB9,
 		SchemaVersion:    1,
 		CreatedAt:        now,
 		UpdatedAt:        now,

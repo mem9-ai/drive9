@@ -29,22 +29,25 @@ func initDB9Schema(dsn string) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_path ON file_nodes(path)`,
 		`CREATE INDEX IF NOT EXISTS idx_parent ON file_nodes(parent_path)`,
 		`CREATE INDEX IF NOT EXISTS idx_file_id ON file_nodes(file_id)`,
+		// See docs/async-embedding/async-embedding-generation-proposal.md,
+		// section "2) File schema: embedding must become mutable and revision-aware".
 		`CREATE TABLE IF NOT EXISTS files (
-			file_id         VARCHAR(64) PRIMARY KEY,
-			storage_type    VARCHAR(32) NOT NULL,
-			storage_ref     TEXT NOT NULL,
-			content_blob    BYTEA,
-			content_type    VARCHAR(255),
-			size_bytes      BIGINT NOT NULL DEFAULT 0,
-			checksum_sha256 VARCHAR(128),
-			revision        BIGINT NOT NULL DEFAULT 1,
-			status          VARCHAR(32) NOT NULL DEFAULT 'PENDING',
-			source_id       VARCHAR(255),
-			content_text    TEXT,
-			embedding       vector(1024) GENERATED ALWAYS AS (EMBED_TEXT('` + autoEmbedModel + `', content_text, '{"dimensions": 1024}'::jsonb)) STORED,
-			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			confirmed_at    TIMESTAMPTZ,
-			expires_at      TIMESTAMPTZ
+			file_id            VARCHAR(64) PRIMARY KEY,
+			storage_type       VARCHAR(32) NOT NULL,
+			storage_ref        TEXT NOT NULL,
+			content_blob       BYTEA,
+			content_type       VARCHAR(255),
+			size_bytes         BIGINT NOT NULL DEFAULT 0,
+			checksum_sha256    VARCHAR(128),
+			revision           BIGINT NOT NULL DEFAULT 1,
+			status             VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+			source_id          VARCHAR(255),
+			content_text       TEXT,
+			embedding          vector(1024),
+			embedding_revision BIGINT,
+			created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			confirmed_at       TIMESTAMPTZ,
+			expires_at         TIMESTAMPTZ
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_status ON files(status, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_files_cosine ON files USING hnsw (embedding vector_cosine_ops)`,
@@ -75,6 +78,33 @@ func initDB9Schema(dsn string) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_upload_path ON uploads(target_path, status)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency ON uploads(idempotency_key)`,
+		// semantic_tasks groups fields by responsibility:
+		// - identity/resource binding: task_id, task_type, resource_id, resource_version
+		// - delivery state: status, attempt_count, max_attempts
+		// - lease/claim ownership: receipt, leased_at, lease_until, available_at
+		// - diagnostics/audit: payload_json, last_error, created_at, updated_at, completed_at
+		// payload_json is only for lightweight hints/debugging; worker correctness
+		// must always re-read current file state via resource_id + resource_version.
+		`CREATE TABLE IF NOT EXISTS semantic_tasks (
+			task_id           VARCHAR(64) PRIMARY KEY,
+			task_type         VARCHAR(32) NOT NULL,
+			resource_id       VARCHAR(64) NOT NULL,
+			resource_version  BIGINT NOT NULL,
+			status            VARCHAR(20) NOT NULL,
+			attempt_count     INT NOT NULL DEFAULT 0,
+			max_attempts      INT NOT NULL DEFAULT 5,
+			receipt           VARCHAR(128),
+			leased_at         TIMESTAMPTZ,
+			lease_until       TIMESTAMPTZ,
+			available_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			payload_json      JSONB,
+			last_error        TEXT,
+			created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			completed_at      TIMESTAMPTZ,
+			UNIQUE (task_type, resource_id, resource_version)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_task_claim ON semantic_tasks(status, available_at, lease_until, created_at)`,
 	}
 
 	return execSchemaStatements(db, stmts)

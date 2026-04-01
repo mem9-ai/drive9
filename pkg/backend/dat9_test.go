@@ -60,6 +60,20 @@ func TestCreateAndStat(t *testing.T) {
 	}
 }
 
+func TestUsesDatabaseAutoEmbeddingDefaultsToFalse(t *testing.T) {
+	b := newTestBackend(t)
+	if b.UsesDatabaseAutoEmbedding() {
+		t.Fatal("default backend should remain app-managed")
+	}
+}
+
+func TestUsesDatabaseAutoEmbeddingReflectsOption(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
+	if !b.UsesDatabaseAutoEmbedding() {
+		t.Fatal("backend should expose database auto-embedding option")
+	}
+}
+
 func TestWriteAndRead(t *testing.T) {
 	b := newTestBackend(t)
 	n, err := b.Write("/data/file.txt", []byte("hello world"), 0, filesystem.WriteFlagCreate)

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
@@ -31,11 +33,16 @@ const smallFileThreshold = 1 << 20 // 1MB
 
 // Dat9Backend implements filesystem.FileSystem with the inode model.
 type Dat9Backend struct {
-	store     *datastore.Store
-	s3        s3client.S3Client // nil when S3 is not configured
-	smallInDB bool
-	mu        sync.Mutex
-	entropy   io.Reader
+	store         *datastore.Store
+	s3            s3client.S3Client // nil when S3 is not configured
+	smallInDB     bool
+	queryEmbedder embedding.Client
+	// databaseAutoEmbedding selects whether this backend uses the TiDB
+	// database-managed embedding path instead of the app-managed one for write,
+	// upload, image extraction, and grep behavior.
+	databaseAutoEmbedding bool
+	mu                    sync.Mutex
+	entropy               io.Reader
 
 	// Async image -> text extraction worker (in-memory queue for P0).
 	imageExtractEnabled bool
@@ -50,9 +57,10 @@ type Dat9Backend struct {
 
 func newBaseBackend(store *datastore.Store) *Dat9Backend {
 	return &Dat9Backend{
-		store:     store,
-		smallInDB: true,
-		entropy:   ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0),
+		store:         store,
+		smallInDB:     true,
+		queryEmbedder: embedding.NopClient{},
+		entropy:       ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0),
 	}
 }
 
@@ -86,6 +94,12 @@ func NewWithS3ModeAndOptions(store *datastore.Store, s3 s3client.S3Client, small
 }
 
 func (b *Dat9Backend) Store() *datastore.Store { return b.store }
+
+// UsesDatabaseAutoEmbedding reports whether this backend instance is
+// configured for database-managed semantic embedding.
+func (b *Dat9Backend) UsesDatabaseAutoEmbedding() bool {
+	return b.databaseAutoEmbedding
+}
 
 func (b *Dat9Backend) genID() string {
 	b.mu.Lock()
@@ -322,22 +336,33 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}
 	}
 
-	if err := b.store.InsertFile(ctx, &datastore.File{
-		FileID: fileID, StorageType: storageType, StorageRef: storageRef,
-		ContentBlob: contentBlob,
-		ContentType: contentType, SizeBytes: int64(len(data)),
-		ChecksumSHA256: checksum, Revision: 1, Status: datastore.StatusConfirmed,
-		ContentText: contentText, CreatedAt: now, ConfirmedAt: &now,
+	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.store.InsertFileTx(tx, &datastore.File{
+			FileID: fileID, StorageType: storageType, StorageRef: storageRef,
+			ContentBlob: contentBlob,
+			ContentType: contentType, SizeBytes: int64(len(data)),
+			ChecksumSHA256: checksum, Revision: 1, Status: datastore.StatusConfirmed,
+			ContentText: contentText, CreatedAt: now, ConfirmedAt: &now,
+		}); err != nil {
+			return err
+		}
+		if err := b.store.EnsureParentDirsTx(tx, path, b.genID); err != nil {
+			return err
+		}
+		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
+			NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
+			Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
+		}); err != nil {
+			return err
+		}
+		if !b.UsesDatabaseAutoEmbedding() && b.shouldEnqueueEmbedForRevision(path, contentType, contentText) {
+			return b.enqueueEmbedTaskTx(tx, fileID, 1)
+		}
+		return nil
 	}); err != nil {
-		return 0, err
-	}
-	if err := b.store.EnsureParentDirs(ctx, path, b.genID); err != nil {
-		return 0, err
-	}
-	if err := b.store.InsertNode(ctx, &datastore.FileNode{
-		NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
-		Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
-	}); err != nil {
+		if storageType == datastore.StorageS3 {
+			b.deleteBlobCtx(ctx, storageRef)
+		}
 		return 0, err
 	}
 	b.enqueueImageExtract(fileID, path, contentType, 1)
@@ -393,19 +418,35 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		}
 	}
 
-	newRev, err := b.store.UpdateFileContent(ctx,
-		nf.File.FileID, storageType, storageRef,
-		contentType, checksum, contentText, contentBlob, int64(len(finalData)),
-	)
+	var newRev int64
+	err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		var txErr error
+		if b.UsesDatabaseAutoEmbedding() {
+			newRev, txErr = b.store.UpdateFileContentAutoEmbeddingTx(tx,
+				nf.File.FileID, storageType, storageRef,
+				contentType, checksum, contentText, contentBlob, int64(len(finalData)),
+			)
+		} else {
+			newRev, txErr = b.store.UpdateFileContentTx(tx,
+				nf.File.FileID, storageType, storageRef,
+				contentType, checksum, contentText, contentBlob, int64(len(finalData)),
+			)
+		}
+		if txErr != nil {
+			return txErr
+		}
+		if !b.UsesDatabaseAutoEmbedding() && b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText) {
+			return b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
+		}
+		return nil
+	})
 	if err != nil {
 		if storageType == datastore.StorageS3 {
 			b.deleteBlobCtx(ctx, storageRef)
 		}
 		return 0, err
 	}
-	if nf.File.StorageRef != "" && nf.File.StorageRef != storageRef {
-		b.deleteBlobCtx(ctx, nf.File.StorageRef)
-	}
+	b.deleteBlobIfS3Ctx(ctx, nf.File.StorageType, nf.File.StorageRef, storageRef)
 	b.enqueueImageExtract(nf.File.FileID, nf.Node.Path, contentType, newRev)
 	return int64(len(data)), nil
 }
@@ -570,16 +611,19 @@ func (b *Dat9Backend) CopyFileCtx(ctx context.Context, srcPath, dstPath string) 
 	})
 }
 
-func (b *Dat9Backend) deleteBlob(ref string) {
-	b.deleteBlobCtx(backgroundWithTrace(), ref)
-}
-
 func (b *Dat9Backend) deleteBlobCtx(ctx context.Context, ref string) {
 	if b.s3 != nil && ref != "" {
 		if err := b.s3.DeleteObject(ctx, ref); err != nil {
 			logger.Warn(ctx, "backend_delete_blob_failed", zap.String("storage_ref", ref), zap.Error(err))
 		}
 	}
+}
+
+func (b *Dat9Backend) deleteBlobIfS3Ctx(ctx context.Context, storageType datastore.StorageType, storageRef, keepRef string) {
+	if storageType != datastore.StorageS3 || storageRef == "" || storageRef == keepRef {
+		return
+	}
+	b.deleteBlobCtx(ctx, storageRef)
 }
 
 func (b *Dat9Backend) readFileDataCtx(ctx context.Context, f *datastore.File) ([]byte, error) {
@@ -698,13 +742,85 @@ func (b *Dat9Backend) ExecSQL(ctx context.Context, query string) ([]map[string]i
 
 func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit int) ([]datastore.SearchResult, error) {
 	start := time.Now()
-	rows, err := b.store.Grep(ctx, query, pathPrefix, limit)
-	observeBackend(ctx, "grep", err, start)
-	if err != nil {
-		logger.Error(ctx, "backend_grep_failed", zap.Int("query_len", len(query)), zap.String("path_prefix", pathPrefix), zap.Int("limit", limit), zap.Error(err))
+	var err error
+	defer func() { observeBackend(ctx, "grep", err, start) }()
+
+	if strings.TrimSpace(query) == "" {
+		err = fmt.Errorf("empty query")
 		return nil, err
 	}
-	return rows, nil
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	fetch := limit * 3
+
+	type grepResp struct {
+		rows []datastore.SearchResult
+		err  error
+	}
+	ftsCh := make(chan grepResp, 1)
+	go func() {
+		rows, searchErr := b.store.FTSSearch(ctx, query, pathPrefix, fetch)
+		ftsCh <- grepResp{rows: rows, err: searchErr}
+	}()
+
+	var vecCh chan grepResp
+	if b.UsesDatabaseAutoEmbedding() {
+		vecCh = make(chan grepResp, 1)
+		go func() {
+			rows, searchErr := b.store.VectorSearchByText(ctx, query, pathPrefix, fetch)
+			vecCh <- grepResp{rows: rows, err: searchErr}
+		}()
+	} else if b.queryEmbedder != nil {
+		vecCh = make(chan grepResp, 1)
+		go func() {
+			queryVec, embedErr := b.queryEmbedder.EmbedText(ctx, query)
+			if embedErr != nil || len(queryVec) == 0 {
+				vecCh <- grepResp{err: embedErr}
+				return
+			}
+			rows, searchErr := b.store.VectorSearch(ctx, queryVec, pathPrefix, fetch)
+			vecCh <- grepResp{rows: rows, err: searchErr}
+		}()
+	}
+
+	ftsResp := <-ftsCh
+	if ftsResp.err != nil {
+		logger.Warn(ctx, "backend_grep_fts_failed",
+			zap.Int("query_len", len(query)),
+			zap.String("path_prefix", pathPrefix),
+			zap.Int("limit", fetch),
+			zap.Error(ftsResp.err))
+	}
+
+	var vecResp grepResp
+	if vecCh != nil {
+		vecResp = <-vecCh
+		if vecResp.err != nil {
+			logger.Warn(ctx, "backend_grep_vector_failed",
+				zap.Int("query_len", len(query)),
+				zap.String("path_prefix", pathPrefix),
+				zap.Int("limit", fetch),
+				zap.Error(vecResp.err))
+		}
+	}
+
+	// Decision rule for grep:
+	// 1. FTS and vector search are ranking signals; either one may fail independently.
+	// 2. If either path returns ranked rows, serve those rows directly after RRF merge.
+	// 3. Only fall back to LIKE-based keyword search when both ranking paths produce no rows.
+	// This keeps semantic ranking as an enhancement while preserving a text-search safety net.
+	hasRankedResults := len(ftsResp.rows) > 0 || len(vecResp.rows) > 0
+	if !hasRankedResults {
+		rows, searchErr := b.store.KeywordSearch(ctx, query, pathPrefix, limit)
+		if searchErr != nil {
+			logger.Error(ctx, "backend_grep_failed", zap.Int("query_len", len(query)), zap.String("path_prefix", pathPrefix), zap.Int("limit", limit), zap.Error(searchErr))
+			err = searchErr
+			return nil, err
+		}
+		return rows, nil
+	}
+	return datastore.RRFMerge(ftsResp.rows, vecResp.rows, limit), nil
 }
 
 func (b *Dat9Backend) Find(ctx context.Context, f *datastore.FindFilter) ([]datastore.SearchResult, error) {
