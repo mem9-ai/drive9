@@ -219,8 +219,9 @@ func (b *Dat9Backend) processQueuedImageExtractTask(ctx context.Context, task Im
 }
 
 // ProcessImageExtractTask runs the backend-owned image extraction logic for one
-// revision-scoped task. Terminal non-retry outcomes return a nil error and a
-// non-empty result label. Transient failures return a retryable error.
+// revision-scoped task. Normal terminal business outcomes return a nil error
+// and a non-empty result label. Runtime misconfiguration, misrouting, and
+// transient failures return a retryable error.
 func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExtractTaskSpec) (ImageExtractResult, error) {
 	if !b.SupportsAsyncImageExtract() {
 		return ImageExtractResultRuntimeNotConfigured, fmt.Errorf("async image extract runtime not configured")
