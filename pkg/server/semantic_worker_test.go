@@ -975,7 +975,7 @@ func TestSemanticWorkerDeadLetterLogIncludesTaskFields(t *testing.T) {
 	}
 }
 
-func TestSemanticWorkerUnsupportedTaskTypeDeadLetters(t *testing.T) {
+func TestSemanticWorkerDoesNotClaimUnsupportedTaskType(t *testing.T) {
 	b := newTestBackendForSemanticWorker(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -1001,7 +1001,11 @@ func TestSemanticWorkerUnsupportedTaskTypeDeadLetters(t *testing.T) {
 	}})
 	t.Cleanup(func() { s.Close() })
 
-	waitForNamedTaskStatus(t, b, "task-generate-l0", string(semantic.TaskDeadLettered), 3*time.Second)
+	time.Sleep(300 * time.Millisecond)
+	task := mustGetServerSemanticTask(t, b, "task-generate-l0")
+	if task.Status != string(semantic.TaskQueued) || task.AttemptCount != 0 {
+		t.Fatalf("generate_l0 task=%+v, want queued with attempt_count 0", task)
+	}
 }
 
 func TestSemanticWorkerRetryDelayHonorsConfiguredMax(t *testing.T) {

@@ -35,8 +35,8 @@ const (
 var semanticWorkerUsesTiDBAutoEmbedding = tenant.UsesTiDBAutoEmbedding
 
 var (
-	semanticWorkerAllowedEmbedTaskTypes      = []semantic.TaskType{semantic.TaskTypeEmbed, semantic.TaskTypeGenerateL0}
-	semanticWorkerAllowedImgExtractTaskTypes = []semantic.TaskType{semantic.TaskTypeImgExtractText, semantic.TaskTypeGenerateL0}
+	semanticWorkerAllowedEmbedTaskTypes      = []semantic.TaskType{semantic.TaskTypeEmbed}
+	semanticWorkerAllowedImgExtractTaskTypes = []semantic.TaskType{semantic.TaskTypeImgExtractText}
 )
 
 // SemanticWorkerOptions controls background semantic task processing.
