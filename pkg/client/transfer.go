@@ -86,6 +86,9 @@ func (c *Client) initiateUpload(ctx context.Context, path string, size int64, ch
 		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
 			return c.initiateUploadLegacy(ctx, path, size, checksums)
 		}
+		if resp.StatusCode == http.StatusBadRequest && strings.Contains(strings.ToLower(err.Error()), "unknown upload action") {
+			return c.initiateUploadLegacy(ctx, path, size, checksums)
+		}
 		return UploadPlan{}, err
 	}
 	return UploadPlan{}, err

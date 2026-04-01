@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mem9-ai/dat9/internal/testmysql"
@@ -135,13 +136,13 @@ func TestWriteStreamLargeFile(t *testing.T) {
 }
 
 func TestWriteStreamLargeFileFallsBackToLegacyInitiate(t *testing.T) {
-	var usedLegacy bool
+	var usedLegacy atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
 			http.NotFound(w, r)
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/legacy.bin":
-			usedLegacy = true
+			usedLegacy.Store(true)
 			if h := r.Header.Get("X-Dat9-Content-Length"); h != "8" {
 				http.Error(w, "bad length", http.StatusBadRequest)
 				return
@@ -164,7 +165,38 @@ func TestWriteStreamLargeFileFallsBackToLegacyInitiate(t *testing.T) {
 	if err := c.WriteStream(context.Background(), "/legacy.bin", bytes.NewReader([]byte("12345678")), 8, nil); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
-	if !usedLegacy {
+	if !usedLegacy.Load() {
+		t.Fatal("expected legacy initiate fallback to be used")
+	}
+}
+
+func TestWriteStreamLargeFileFallsBackOnUnknownUploadAction(t *testing.T) {
+	var usedLegacy atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
+			http.Error(w, `{"error":"unknown upload action"}`, http.StatusBadRequest)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/legacy.bin":
+			usedLegacy.Store(true)
+			plan := UploadPlan{UploadID: "legacy-upload-400", Parts: []PartURL{{Number: 1, URL: fmt.Sprintf("http://%s/legacy400/part/1", r.Host), Size: 8}}}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(plan)
+		case r.Method == http.MethodPut && r.URL.Path == "/legacy400/part/1":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/legacy-upload-400/complete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	if err := c.WriteStream(context.Background(), "/legacy.bin", bytes.NewReader([]byte("12345678")), 8, nil); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if !usedLegacy.Load() {
 		t.Fatal("expected legacy initiate fallback to be used")
 	}
 }
