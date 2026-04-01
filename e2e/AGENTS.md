@@ -86,7 +86,7 @@ export DAT9_BASE="https://api.dat9.ai"
 
 1. Provision + readiness polling
 2. Prepare `dat9` CLI binary (build local or download official release)
-3. Mount compatibility precheck for root `stat /`
+3. Mount compatibility precheck for root `ls /`
 4. RW mount lifecycle (`dat9 mount`, `dat9 umount`)
 5. File semantics (`create`, `read`, `overwrite`, `append`, `truncate`, `unlink`)
 6. Directory semantics (`mkdir`, nested paths, `readdir`, empty/non-empty `rmdir`)
@@ -99,7 +99,7 @@ export DAT9_BASE="https://api.dat9.ai"
 13. Linux prerequisite guardrails (`fusermount`, `/dev/fuse`) with skip behavior when unavailable
 
 Notes:
-- The current mount implementation prechecks `stat /`. If the deployment does not support root `stat`, this script exits as `SKIP` with a clear reason.
+- The script prechecks root `ls /` reachability before mount behavior checks.
 
 ### `smoke-all.sh`
 
