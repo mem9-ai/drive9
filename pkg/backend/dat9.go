@@ -29,7 +29,7 @@ import (
 	"go.uber.org/zap"
 )
 
-const smallFileThreshold = 1 << 20 // 1MB
+const smallFileThreshold = 50_000 // 50,000 bytes — matches embedding model max input characters
 
 // Dat9Backend implements filesystem.FileSystem with the inode model.
 type Dat9Backend struct {
