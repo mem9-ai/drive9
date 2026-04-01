@@ -20,3 +20,14 @@ func NormalizeProvider(provider string) (string, error) {
 func SmallInDB(provider string) bool {
 	return provider == ProviderTiDBZero || provider == ProviderTiDBCloudStarter
 }
+
+// UsesTiDBAutoEmbedding reports whether the provider should run the TiDB
+// database-managed auto-embedding mode.
+func UsesTiDBAutoEmbedding(provider string) bool {
+	switch provider {
+	case ProviderTiDBZero, ProviderTiDBCloudStarter:
+		return true
+	default:
+		return false
+	}
+}

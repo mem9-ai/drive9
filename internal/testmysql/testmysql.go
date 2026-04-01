@@ -61,6 +61,7 @@ func Start(ctx context.Context) (*Instance, error) {
 func ResetDB(t *testing.T, db *sql.DB) {
 	t.Helper()
 	queries := []string{
+		"DELETE FROM semantic_tasks",
 		"DELETE FROM file_nodes",
 		"DELETE FROM file_tags",
 		"DELETE FROM uploads",

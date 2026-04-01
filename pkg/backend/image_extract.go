@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -210,7 +211,19 @@ func (b *Dat9Backend) processImageExtractTask(ctx context.Context, task imageExt
 		return
 	}
 
-	updated, err := b.store.UpdateFileSearchText(ctx, task.FileID, task.Revision, text)
+	var updated bool
+	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
+		var txErr error
+		updated, txErr = b.store.UpdateFileSearchTextTx(tx, task.FileID, task.Revision, text)
+		if txErr != nil {
+			return txErr
+		}
+		if !updated || b.UsesDatabaseAutoEmbedding() {
+			return nil
+		}
+		_, txErr = b.store.EnsureSemanticTaskQueuedTx(tx, newEmbedTask(b.genID(), task.FileID, task.Revision, time.Now().UTC()))
+		return txErr
+	})
 	if err != nil {
 		logger.Warn(ctx, "backend_image_extract_update_file_failed",
 			zap.String("file_id", task.FileID), zap.Error(err))

@@ -49,8 +49,10 @@ func NewStarterProvisionerFromEnv() (*StarterProvisioner, error) {
 
 func (p *StarterProvisioner) ProviderType() string { return ProviderTiDBCloudStarter }
 
-func (p *StarterProvisioner) InitSchema(_ context.Context, _ string) error {
-	return nil
+// InitSchema validates the externally provisioned Starter schema against the
+// shared TiDB auto-embedding launch contract without creating or altering data.
+func (p *StarterProvisioner) InitSchema(_ context.Context, dsn string) error {
+	return validateTiDBSchemaForModeDSN(dsn, TiDBEmbeddingModeAuto)
 }
 
 func (p *StarterProvisioner) Provision(ctx context.Context, tenantID string) (*ClusterInfo, error) {

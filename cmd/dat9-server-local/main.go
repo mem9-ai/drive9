@@ -1,35 +1,39 @@
-// Command dat9-server starts the dat9 HTTP server.
-//
-// Usage:
-//
-//	dat9-server [listen-addr]
+// Command dat9-server-local starts a single-tenant dat9 HTTP server
+// backed directly by DAT9_LOCAL_DSN for local validation.
 package main
 
 import (
 	"context"
-	"encoding/hex"
+	"database/sql"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
+	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/embedding"
-	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/logger"
-	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/server"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"go.uber.org/zap"
 )
 
 const (
-	defaultListenAddr = ":9009"
-	defaultS3Dir      = "s3"
+	defaultListenAddr     = "127.0.0.1:9009"
+	defaultS3Dir          = "/tmp/dat9-local-s3"
+	envLocalEmbeddingMode = "DAT9_LOCAL_EMBEDDING_MODE"
 )
 
 func main() {
+	startupCtx := context.Background()
+	startupStart := time.Now()
+	logLocalStartupStep(startupCtx, startupStart, startupStart, "process_start")
+
 	if len(os.Args) > 2 {
 		usage()
 	}
@@ -45,163 +49,144 @@ func main() {
 	}
 	defer func() { _ = srvLogger.Sync() }()
 	logger.Set(srvLogger)
+	logLocalStartupStep(startupCtx, startupStart, time.Now(), "logger_ready")
 
-	metaDSN := os.Getenv("DAT9_META_DSN")
-	if metaDSN == "" {
-		die(fmt.Errorf("DAT9_META_DSN is required"))
+	localDSN := strings.TrimSpace(os.Getenv("DAT9_LOCAL_DSN"))
+	if localDSN == "" {
+		die(fmt.Errorf("DAT9_LOCAL_DSN is required"))
+	}
+	localInitSchema := envBool("DAT9_LOCAL_INIT_SCHEMA", false)
+	requestedEmbeddingMode, explicitEmbeddingMode, err := localEmbeddingModeFromEnv()
+	if err != nil {
+		die(err)
+	}
+
+	// Local validation should be able to bootstrap a fresh tenant database without
+	// going through the multi-tenant provision flow.
+	if localInitSchema {
+		stepStart := time.Now()
+		initMode := requestedEmbeddingMode
+		if !explicitEmbeddingMode {
+			initMode = tenant.TiDBEmbeddingModeAuto
+		}
+		if err := localTiDBSchemaInitializer(localDSN, initMode); err != nil {
+			die(fmt.Errorf("init local tenant schema: %w", err))
+		}
+		logLocalStartupStep(startupCtx, startupStart, stepStart, "init_local_tenant_schema",
+			zap.String("embedding_mode", string(initMode)))
+	}
+
+	stepStart := time.Now()
+	store, err := datastore.Open(localDSN)
+	if err != nil {
+		die(fmt.Errorf("open local datastore: %w", err))
+	}
+	defer func() { _ = store.Close() }()
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "open_local_datastore")
+
+	stepStart = time.Now()
+	backendOpts, err := buildBackendOptionsFromEnv()
+	if err != nil {
+		die(err)
+	}
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "build_backend_options")
+
+	stepStart = time.Now()
+	localEmbeddingMode, err := detectLocalTiDBEmbeddingMode(store.DB(), localInitSchema, requestedEmbeddingMode, explicitEmbeddingMode)
+	if err != nil {
+		die(fmt.Errorf("detect local embedding mode: %w", err))
+	}
+	backendOpts.DatabaseAutoEmbedding = localEmbeddingMode == tenant.TiDBEmbeddingModeAuto
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "detect_local_embedding_mode",
+		zap.String("embedding_mode", string(localEmbeddingMode)))
+
+	stepStart = time.Now()
+	semanticEmbedder, workerOpts, err := buildSemanticWorkerConfigFromEnv()
+	if err != nil {
+		die(err)
+	}
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "build_semantic_worker_config")
+	// Keep the local entrypoint aligned with dat9-server: if only the background
+	// embedder is configured, grep reuses it for app-side query embedding.
+	if semanticEmbedder != nil && backendOpts.QueryEmbedding.Client == nil {
+		backendOpts.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
 	}
 
 	s3Dir := envOr("DAT9_S3_DIR", defaultS3Dir)
-	s3Bucket := os.Getenv("DAT9_S3_BUCKET")
-	s3Region := envOr("DAT9_S3_REGION", "us-east-1")
-	s3Prefix := os.Getenv("DAT9_S3_PREFIX")
-	s3RoleARN := os.Getenv("DAT9_S3_ROLE_ARN")
-	backendOptions, err := buildBackendOptionsFromEnv()
+	// Even in local single-tenant mode we keep the same S3-facing upload code path
+	// by backing it with the local mock implementation.
+	stepStart = time.Now()
+	localS3, err := s3client.NewLocal(s3Dir, publicBaseURL(addr)+"/s3")
 	if err != nil {
-		die(err)
+		die(fmt.Errorf("create local s3: %w", err))
 	}
-	semanticEmbedder, semanticWorkerOpts, err := buildSemanticWorkerConfigFromEnv()
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_local_s3")
+
+	stepStart = time.Now()
+	b, err := backend.NewWithS3ModeAndOptions(store, localS3, true, backendOpts)
 	if err != nil {
-		die(err)
+		die(fmt.Errorf("create local backend: %w", err))
 	}
-	if semanticEmbedder != nil && backendOptions.QueryEmbedding.Client == nil {
-		backendOptions.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
-	}
+	defer b.Close()
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_local_backend")
 
-	store, err := meta.Open(metaDSN)
-	if err != nil {
-		die(fmt.Errorf("open control-plane store: %w", err))
-	}
-	defer func() { _ = store.Close() }()
-
-	if s3Bucket == "" {
-		if err := os.MkdirAll(s3Dir, 0o755); err != nil {
-			die(fmt.Errorf("create s3 dir: %w", err))
-		}
-		logger.Info(context.Background(), "s3_mode_local", zap.String("dir", s3Dir))
-	} else {
-		logger.Info(context.Background(), "s3_mode_aws", zap.String("bucket", s3Bucket), zap.String("region", s3Region), zap.String("role", envOr("DAT9_S3_ROLE_ARN", "default-credentials")))
-	}
-
-	encryptType := envOr("DAT9_ENCRYPT_TYPE", "local_aes")
-	masterHex := os.Getenv("DAT9_MASTER_KEY")
-	kmsKey := os.Getenv("DAT9_ENCRYPT_KEY")
-	tokenHex := os.Getenv("DAT9_TOKEN_SIGNING_KEY")
-	providerType := envOr("DAT9_TENANT_PROVIDER", tenant.ProviderTiDBZero)
-	maxUploadBytes := int64(1 << 30)
-	if raw := os.Getenv("DAT9_MAX_UPLOAD_BYTES"); raw != "" {
-		maxUploadBytes, err = strconv.ParseInt(raw, 10, 64)
-		if err != nil || maxUploadBytes <= 0 {
-			die(fmt.Errorf("invalid DAT9_MAX_UPLOAD_BYTES: must be a positive integer"))
-		}
-		if maxUploadBytes < 1<<20 {
-			die(fmt.Errorf("DAT9_MAX_UPLOAD_BYTES too small: minimum 1048576 (1MiB)"))
-		}
-	}
-	providerType, err = tenant.NormalizeProvider(providerType)
-	if err != nil {
-		die(err)
-	}
-	logger.Info(context.Background(), "tenant_provider_selected", zap.String("provider", providerType))
-
-	var provisioner tenant.Provisioner
-	var provisionerErr error
-	switch providerType {
-	case tenant.ProviderTiDBZero:
-		provisioner, provisionerErr = tenant.NewZeroProvisionerFromEnv()
-	case tenant.ProviderTiDBCloudStarter:
-		provisioner, provisionerErr = tenant.NewStarterProvisionerFromEnv()
-	case tenant.ProviderDB9:
-		provisioner, provisionerErr = tenant.NewDB9ProvisionerFromEnv()
-	}
-	if provisionerErr != nil {
-		logger.Warn(context.Background(), "provisioner_not_configured", zap.String("provider", providerType), zap.Error(provisionerErr))
-	} else {
-		logger.Info(context.Background(), "provisioner_configured", zap.String("provider", providerType))
-	}
-
-	var pool *tenant.Pool
-	var tokenSecret []byte
-	if tokenHex != "" {
-		tokenSecret, err = hex.DecodeString(tokenHex)
-		if err != nil {
-			die(fmt.Errorf("invalid DAT9_TOKEN_SIGNING_KEY: %w", err))
-		}
-		eKey := masterHex
-		eType := encrypt.Type(encryptType)
-		if eType == encrypt.TypeKMS {
-			eKey = kmsKey
-		}
-		enc, err := encrypt.New(context.Background(), encrypt.Config{
-			Type:   eType,
-			Key:    eKey,
-			Region: envOr("DAT9_S3_REGION", "us-east-1"),
-		})
-		if err != nil {
-			die(fmt.Errorf("create encryptor: %w", err))
-		}
-
-		if err := store.DB().Ping(); err != nil {
-			die(fmt.Errorf("control-plane db unavailable: %w", err))
-		}
-
-		pool = tenant.NewPool(tenant.PoolConfig{
-			S3Dir:          s3Dir,
-			PublicURL:      publicBaseURL(addr),
-			S3Bucket:       s3Bucket,
-			S3Region:       s3Region,
-			S3Prefix:       s3Prefix,
-			S3RoleARN:      s3RoleARN,
-			BackendOptions: backendOptions,
-		}, enc)
-		defer pool.Close()
-	}
-
-	die(server.NewWithConfig(server.Config{
-		Meta:             store,
-		Pool:             pool,
-		Provisioner:      provisioner,
-		TokenSecret:      tokenSecret,
+	stepStart = time.Now()
+	srv := server.NewWithConfig(server.Config{
+		Backend:          b,
+		LocalS3:          localS3,
 		S3Dir:            s3Dir,
-		MaxUploadBytes:   maxUploadBytes,
 		Logger:           srvLogger,
 		SemanticEmbedder: semanticEmbedder,
-		SemanticWorkers:  semanticWorkerOpts,
-	}).ListenAndServe(addr))
-}
+		SemanticWorkers:  workerOpts,
+	})
+	defer srv.Close()
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_server")
 
-func envOr(key, fallback string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
+	logger.Info(startupCtx, "local_server_mode",
+		zap.String("listen_addr", addr),
+		zap.String("local_dsn", redactDSN(localDSN)),
+		zap.String("s3_dir", s3Dir),
+		zap.Bool("local_init_schema", localInitSchema),
+		zap.String("requested_embedding_mode", localEmbeddingModeLabel(requestedEmbeddingMode, explicitEmbeddingMode)),
+		zap.String("embedding_mode", string(localEmbeddingMode)),
+		zap.Bool("database_auto_embedding", backendOpts.DatabaseAutoEmbedding),
+		zap.Duration("startup_elapsed", time.Since(startupStart)))
+
+	// Bind first so we can emit a definitive "started" log only after the socket
+	// is actually listening.
+	stepStart = time.Now()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		die(fmt.Errorf("listen: %w", err))
 	}
-	return fallback
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "listen")
+	logger.Info(startupCtx, "local_server_started",
+		zap.String("listen_addr", addr),
+		zap.String("public_url", publicBaseURL(addr)),
+		zap.Duration("startup_elapsed", time.Since(startupStart)))
+	defer func() { _ = ln.Close() }()
+
+	die(http.Serve(ln, srv))
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `usage: dat9-server [listen-addr]
+	fmt.Fprintf(os.Stderr, `usage: dat9-server-local [listen-addr]
 
 environment:
-  DAT9_LISTEN_ADDR serve listen address (default: :9009)
-  DAT9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
-  DAT9_META_DSN    control-plane MySQL DSN (required)
-  DAT9_ENCRYPT_TYPE local_aes|kms
-  DAT9_MASTER_KEY  32-byte hex key for local_aes encryptor
-  DAT9_ENCRYPT_KEY KMS key id or alias (required for kms)
-  DAT9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
-  DAT9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: 1073741824, minimum: 1048576)
-  DAT9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
-  S3 storage (set DAT9_S3_BUCKET to enable AWS S3, otherwise local mock):
-  DAT9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
-  DAT9_S3_REGION   AWS region (default: us-east-1)
-  DAT9_S3_PREFIX   S3 key prefix (e.g. "tenants")
-  DAT9_S3_ROLE_ARN IAM role ARN to assume via STS (optional)
-  DAT9_S3_DIR      local s3 mock root directory (default: ./s3, only used without DAT9_S3_BUCKET)
+  DAT9_LISTEN_ADDR serve listen address (default: 127.0.0.1:9009)
+  DAT9_PUBLIC_URL  externally reachable base URL (optional for loopback listen address)
+  DAT9_LOCAL_DSN   local tenant TiDB/MySQL DSN (required)
+  DAT9_LOCAL_INIT_SCHEMA initialize tenant schema on startup (default: false)
+  DAT9_LOCAL_EMBEDDING_MODE auto|app|detect (default: auto when initing schema, detect otherwise)
+  DAT9_S3_DIR      local S3 mock root directory (default: /tmp/dat9-local-s3)
+
   Query embedding (app-side semantic query embedding for grep):
   DAT9_QUERY_EMBED_API_BASE OpenAI-compatible base URL (optional)
   DAT9_QUERY_EMBED_API_KEY  API key for DAT9_QUERY_EMBED_API_BASE (optional)
   DAT9_QUERY_EMBED_MODEL    model name for query embedding (optional)
   DAT9_QUERY_EMBED_DIMENSIONS optional embedding dimensions override
   DAT9_QUERY_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
+
   Async semantic embedding worker:
   DAT9_EMBED_API_BASE OpenAI-compatible base URL for background embedding (optional)
   DAT9_EMBED_API_KEY  API key for DAT9_EMBED_API_BASE (optional)
@@ -214,8 +199,8 @@ environment:
   DAT9_SEMANTIC_RECOVER_INTERVAL_MS recover sweep interval in milliseconds (default: 5000)
   DAT9_SEMANTIC_RETRY_BASE_MS base retry backoff in milliseconds (default: 200)
   DAT9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
-  DAT9_SEMANTIC_TENANT_LIMIT active tenants scanned per round (default: 128)
   DAT9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
+
   Image extraction (async image -> text for search):
   DAT9_IMAGE_EXTRACT_ENABLED true|false (default: false)
   DAT9_IMAGE_EXTRACT_QUEUE_SIZE buffered task queue size (default: 128)
@@ -236,7 +221,7 @@ func die(err error) {
 	if err == nil {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "dat9-server: %v\n", err)
+	fmt.Fprintf(os.Stderr, "dat9-server-local: %v\n", err)
 	os.Exit(1)
 }
 
@@ -245,8 +230,6 @@ func publicBaseURL(listenAddr string) string {
 		return v
 	}
 
-	// Without DAT9_PUBLIC_URL, only allow explicit loopback addresses.
-	// Wildcard or non-loopback addresses would produce unreachable presigned URLs.
 	switch {
 	case strings.HasPrefix(listenAddr, "127.0.0.1:"),
 		strings.HasPrefix(listenAddr, "localhost:"),
@@ -255,10 +238,81 @@ func publicBaseURL(listenAddr string) string {
 	case strings.HasPrefix(listenAddr, "http://"), strings.HasPrefix(listenAddr, "https://"):
 		return strings.TrimRight(listenAddr, "/")
 	default:
-		fmt.Fprintf(os.Stderr, "dat9-server: DAT9_PUBLIC_URL is required when listen address is %q (wildcard or non-loopback). Set DAT9_PUBLIC_URL to the externally reachable base URL.\n", listenAddr)
+		fmt.Fprintf(os.Stderr, "dat9-server-local: DAT9_PUBLIC_URL is required when listen address is %q (wildcard or non-loopback).\n", listenAddr)
 		os.Exit(1)
-		return "" // unreachable
+		return ""
 	}
+}
+
+func logLocalStartupStep(ctx context.Context, startupStart, stepStart time.Time, step string, extra ...zap.Field) {
+	fields := []zap.Field{
+		zap.String("step", step),
+		zap.Duration("elapsed", time.Since(stepStart)),
+		zap.Duration("startup_elapsed", time.Since(startupStart)),
+	}
+	fields = append(fields, extra...)
+	logger.Info(ctx, "local_server_startup_step", fields...)
+}
+
+var (
+	localTiDBEmbeddingModeDetector = tenant.DetectTiDBEmbeddingMode
+	localTiDBSchemaValidator       = tenant.ValidateTiDBSchemaForMode
+	localTiDBSchemaInitializer     = tenant.InitTiDBTenantSchemaForMode
+)
+
+func detectLocalTiDBEmbeddingMode(db *sql.DB, schemaInitialized bool, requestedMode tenant.TiDBEmbeddingMode, explicitMode bool) (tenant.TiDBEmbeddingMode, error) {
+	if explicitMode {
+		if schemaInitialized {
+			return requestedMode, nil
+		}
+		if db == nil {
+			return tenant.TiDBEmbeddingModeUnknown, fmt.Errorf("nil db")
+		}
+		if err := localTiDBSchemaValidator(db, requestedMode); err != nil {
+			return tenant.TiDBEmbeddingModeUnknown, err
+		}
+		return requestedMode, nil
+	}
+	if schemaInitialized {
+		return tenant.TiDBEmbeddingModeAuto, nil
+	}
+	if db == nil {
+		return tenant.TiDBEmbeddingModeUnknown, fmt.Errorf("nil db")
+	}
+	mode, err := localTiDBEmbeddingModeDetector(db)
+	if err != nil {
+		return tenant.TiDBEmbeddingModeUnknown, err
+	}
+	if mode != tenant.TiDBEmbeddingModeAuto && mode != tenant.TiDBEmbeddingModeApp {
+		return tenant.TiDBEmbeddingModeUnknown, fmt.Errorf("unsupported TiDB embedding mode %q", mode)
+	}
+	if err := localTiDBSchemaValidator(db, mode); err != nil {
+		return tenant.TiDBEmbeddingModeUnknown, err
+	}
+	return mode, nil
+}
+
+func localEmbeddingModeFromEnv() (tenant.TiDBEmbeddingMode, bool, error) {
+	raw := strings.TrimSpace(os.Getenv(envLocalEmbeddingMode))
+	switch strings.ToLower(raw) {
+	case "":
+		return tenant.TiDBEmbeddingModeUnknown, false, nil
+	case "detect":
+		return tenant.TiDBEmbeddingModeUnknown, false, nil
+	case "auto", string(tenant.TiDBEmbeddingModeAuto):
+		return tenant.TiDBEmbeddingModeAuto, true, nil
+	case "app", string(tenant.TiDBEmbeddingModeApp):
+		return tenant.TiDBEmbeddingModeApp, true, nil
+	default:
+		return tenant.TiDBEmbeddingModeUnknown, false, fmt.Errorf("%s must be one of auto, app, or detect", envLocalEmbeddingMode)
+	}
+}
+
+func localEmbeddingModeLabel(mode tenant.TiDBEmbeddingMode, explicit bool) string {
+	if !explicit {
+		return "detect"
+	}
+	return string(mode)
 }
 
 func buildBackendOptionsFromEnv() (backend.Options, error) {
@@ -309,10 +363,6 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	configured := baseURL != "" || apiKey != "" || model != ""
 	if configured {
 		if baseURL == "" || apiKey == "" || model == "" {
-			logger.Error(context.Background(), "image_extract_mode_invalid_config",
-				zap.Bool("base_url_present", baseURL != ""),
-				zap.Bool("api_key_present", apiKey != ""),
-				zap.Bool("model_present", model != ""))
 			return backend.Options{}, fmt.Errorf("DAT9_IMAGE_EXTRACT_API_BASE, DAT9_IMAGE_EXTRACT_API_KEY and DAT9_IMAGE_EXTRACT_MODEL must be set together")
 		}
 		extractor, err := backend.NewOpenAIImageTextExtractor(backend.OpenAIImageTextExtractorConfig{
@@ -367,12 +417,28 @@ func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorker
 		RecoverInterval:      time.Duration(envInt("DAT9_SEMANTIC_RECOVER_INTERVAL_MS", 5000)) * time.Millisecond,
 		RetryBaseDelay:       time.Duration(envInt("DAT9_SEMANTIC_RETRY_BASE_MS", 200)) * time.Millisecond,
 		RetryMaxDelay:        time.Duration(envInt("DAT9_SEMANTIC_RETRY_MAX_MS", 30000)) * time.Millisecond,
-		TenantScanLimit:      envInt("DAT9_SEMANTIC_TENANT_LIMIT", 128),
 		PerTenantConcurrency: envInt("DAT9_SEMANTIC_PER_TENANT_CONCURRENCY", 1),
 	}
 	logger.Info(context.Background(), "semantic_embedding_mode_openai_compatible",
 		zap.String("model", model), zap.String("base_url", baseURL))
 	return client, opts, nil
+}
+
+func redactDSN(dsn string) string {
+	if at := strings.Index(dsn, "@"); at >= 0 {
+		prefix := dsn[:at]
+		if colon := strings.Index(prefix, ":"); colon >= 0 {
+			return prefix[:colon+1] + "***" + dsn[at:]
+		}
+	}
+	return dsn
+}
+
+func envOr(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func envBool(key string, fallback bool) bool {

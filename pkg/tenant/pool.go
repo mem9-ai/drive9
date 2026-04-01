@@ -161,6 +161,10 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	if err != nil {
 		return nil, nil, fmt.Errorf("decrypt db password: %w", err)
 	}
+	opts := p.cfg.BackendOptions
+	if UsesTiDBAutoEmbedding(t.Provider) {
+		opts.DatabaseAutoEmbedding = true
+	}
 	query := "parseTime=true"
 	if t.DBTLS {
 		query += "&tls=true"
@@ -169,6 +173,12 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	store, err := datastore.Open(dsn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open datastore: %w", err)
+	}
+	if opts.DatabaseAutoEmbedding && (t.Provider == ProviderTiDBZero || t.Provider == ProviderTiDBCloudStarter) {
+		if err := ValidateTiDBSchemaForMode(store.DB(), TiDBEmbeddingModeAuto); err != nil {
+			_ = store.Close()
+			return nil, nil, fmt.Errorf("validate tidb auto-embedding schema: %w", err)
+		}
 	}
 	if p.cfg.S3Bucket != "" {
 		prefix := strings.Trim(p.cfg.S3Prefix, "/")
@@ -187,7 +197,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			return nil, nil, fmt.Errorf("create aws s3 client: %w", err)
 		}
 		smallInDB := SmallInDB(t.Provider)
-		b, err := backend.NewWithS3ModeAndOptions(store, s3c, smallInDB, p.cfg.BackendOptions)
+		b, err := backend.NewWithS3ModeAndOptions(store, s3c, smallInDB, opts)
 		if err != nil {
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("create backend with s3 mode: %w", err)
@@ -203,14 +213,14 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			return nil, nil, fmt.Errorf("create local s3 client: %w", err)
 		}
 		smallInDB := SmallInDB(t.Provider)
-		b, err := backend.NewWithS3ModeAndOptions(store, s3c, smallInDB, p.cfg.BackendOptions)
+		b, err := backend.NewWithS3ModeAndOptions(store, s3c, smallInDB, opts)
 		if err != nil {
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("create backend with local s3 mode: %w", err)
 		}
 		return b, store, nil
 	}
-	b, err := backend.NewWithOptions(store, p.cfg.BackendOptions)
+	b, err := backend.NewWithOptions(store, opts)
 	if err != nil {
 		_ = store.Close()
 		return nil, nil, fmt.Errorf("create backend: %w", err)

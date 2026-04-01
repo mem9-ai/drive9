@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"go.uber.org/zap"
@@ -20,6 +21,11 @@ const (
 // Options configures Dat9Backend behavior.
 type Options struct {
 	AsyncImageExtract AsyncImageExtractOptions
+	QueryEmbedding    QueryEmbeddingOptions
+	// DatabaseAutoEmbedding controls whether semantic text is embedded by the
+	// database itself rather than by the app-managed embed worker. When enabled,
+	// runtime write/query paths rely on database-side embedding behavior.
+	DatabaseAutoEmbedding bool
 }
 
 // AsyncImageExtractOptions controls async image->text extraction.
@@ -33,7 +39,20 @@ type AsyncImageExtractOptions struct {
 	Extractor           ImageTextExtractor
 }
 
+// QueryEmbeddingOptions controls app-side query embedding for semantic search.
+type QueryEmbeddingOptions struct {
+	Client embedding.Client
+}
+
 func (b *Dat9Backend) configureOptions(opts Options) {
+	b.databaseAutoEmbedding = opts.DatabaseAutoEmbedding
+
+	if opts.QueryEmbedding.Client != nil {
+		b.queryEmbedder = opts.QueryEmbedding.Client
+	} else {
+		b.queryEmbedder = embedding.NopClient{}
+	}
+
 	cfg := opts.AsyncImageExtract
 	if !cfg.Enabled {
 		return

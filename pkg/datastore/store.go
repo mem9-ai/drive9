@@ -71,12 +71,14 @@ type File struct {
 	SizeBytes      int64
 	ChecksumSHA256 string
 	Revision       int64
-	Status         FileStatus
-	SourceID       string
-	ContentText    string
-	CreatedAt      time.Time
-	ConfirmedAt    *time.Time
-	ExpiresAt      *time.Time
+	// EmbeddingRevision tracks which file revision produced the stored embedding.
+	EmbeddingRevision *int64
+	Status            FileStatus
+	SourceID          string
+	ContentText       string
+	CreatedAt         time.Time
+	ConfirmedAt       *time.Time
+	ExpiresAt         *time.Time
 }
 
 // NodeWithFile joins file_nodes and files for stat/read operations.
@@ -415,14 +417,14 @@ func (s *Store) GetFile(ctx context.Context, fileID string) (out *File, err erro
 
 	if s.hasContentBlob {
 		row := s.db.QueryRowContext(ctx, `SELECT file_id, storage_type, storage_ref, content_blob, content_type,
-			size_bytes, checksum_sha256, revision, status, source_id, content_text,
+			size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
 			created_at, confirmed_at, expires_at
 			FROM files WHERE file_id = ?`, fileID)
 		out, err = scanFileWithBlob(row)
 		return out, err
 	}
 	row := s.db.QueryRowContext(ctx, `SELECT file_id, storage_type, storage_ref, content_type,
-		size_bytes, checksum_sha256, revision, status, source_id, content_text,
+		size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
 		created_at, confirmed_at, expires_at
 		FROM files WHERE file_id = ?`, fileID)
 	out, err = scanFileNoBlob(row)
@@ -468,29 +470,40 @@ func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageTyp
 }
 
 // UpdateFileSearchText updates files.content_text for search enrichment.
-// If expectedChecksum is non-empty, update is applied only when checksum matches.
+// When expectedRevision is positive, the update applies only to that revision.
 // This prevents stale async tasks from overwriting a newer file revision.
 func (s *Store) UpdateFileSearchText(ctx context.Context, fileID string, expectedRevision int64, contentText string) (updated bool, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "update_file_search_text", start, &err)
 
-	var (
-		res sql.Result
-	)
-	if expectedRevision > 0 {
-		res, err = s.db.ExecContext(ctx, `UPDATE files SET content_text = ?
-			WHERE file_id = ? AND status = 'CONFIRMED' AND revision = ?`,
-			nullStr(contentText), fileID, expectedRevision)
-	} else {
-		res, err = s.db.ExecContext(ctx, `UPDATE files SET content_text = ?
-			WHERE file_id = ? AND status = 'CONFIRMED'`,
-			nullStr(contentText), fileID)
-	}
+	res, err := s.updateFileSearchTextExec(s.db, fileID, expectedRevision, contentText)
 	if err != nil {
 		return false, err
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// UpdateFileSearchTextTx updates files.content_text inside an existing
+// transaction while preserving the revision gate used by async image tasks.
+func (s *Store) UpdateFileSearchTextTx(db execer, fileID string, expectedRevision int64, contentText string) (bool, error) {
+	res, err := s.updateFileSearchTextExec(db, fileID, expectedRevision, contentText)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevision int64, contentText string) (sql.Result, error) {
+	if expectedRevision > 0 {
+		return db.Exec(`UPDATE files SET content_text = ?
+			WHERE file_id = ? AND status = 'CONFIRMED' AND revision = ?`,
+			nullStr(contentText), fileID, expectedRevision)
+	}
+	return db.Exec(`UPDATE files SET content_text = ?
+		WHERE file_id = ? AND status = 'CONFIRMED'`,
+		nullStr(contentText), fileID)
 }
 
 func (s *Store) ConfirmFile(ctx context.Context, fileID string) (err error) {
@@ -602,7 +615,7 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 		q += `f.content_blob, `
 	}
 	q += `f.content_type, f.size_bytes,
-		f.checksum_sha256, f.revision, f.status, f.source_id, f.content_text,
+		f.checksum_sha256, f.revision, f.embedding_revision, f.status, f.source_id, f.content_text,
 		f.created_at, f.confirmed_at, f.expires_at
 		FROM file_nodes fn
 		LEFT JOIN files f ON fn.file_id = f.file_id AND f.status = 'CONFIRMED'
@@ -683,7 +696,7 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	if s.hasContentBlob {
 		q += `content_blob, `
 	}
-	q += `content_type, size_bytes, checksum_sha256, revision, status, source_id, content_text,
+	q += `content_type, size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
 		created_at, confirmed_at, expires_at
 		FROM files WHERE file_id = ?`
 	row := tx.QueryRow(q, fileID.String)
@@ -754,7 +767,7 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		if s.hasContentBlob {
 			q += `content_blob, `
 		}
-		q += `content_type, size_bytes, checksum_sha256, revision, status, source_id, content_text,
+		q += `content_type, size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
 			created_at, confirmed_at, expires_at
 			FROM files WHERE file_id = ?`
 		row := tx.QueryRow(q, fid)
@@ -898,10 +911,11 @@ func scanFileWithBlob(s scanner) (*File, error) {
 	var f File
 	var contentBlob []byte
 	var contentType, checksum, sourceID, contentText sql.NullString
+	var embeddingRevision sql.NullInt64
 	var confirmedAt, expiresAt sql.NullTime
 	var createdAt time.Time
 	err := s.Scan(&f.FileID, &f.StorageType, &f.StorageRef, &contentBlob, &contentType,
-		&f.SizeBytes, &checksum, &f.Revision, &f.Status, &sourceID, &contentText,
+		&f.SizeBytes, &checksum, &f.Revision, &embeddingRevision, &f.Status, &sourceID, &contentText,
 		&createdAt, &confirmedAt, &expiresAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -914,6 +928,10 @@ func scanFileWithBlob(s scanner) (*File, error) {
 	f.ChecksumSHA256 = checksum.String
 	f.SourceID = sourceID.String
 	f.ContentText = contentText.String
+	if embeddingRevision.Valid {
+		rev := embeddingRevision.Int64
+		f.EmbeddingRevision = &rev
+	}
 	f.CreatedAt = createdAt.UTC()
 	if confirmedAt.Valid {
 		t := confirmedAt.Time.UTC()
@@ -929,10 +947,11 @@ func scanFileWithBlob(s scanner) (*File, error) {
 func scanFileNoBlob(s scanner) (*File, error) {
 	var f File
 	var contentType, checksum, sourceID, contentText sql.NullString
+	var embeddingRevision sql.NullInt64
 	var confirmedAt, expiresAt sql.NullTime
 	var createdAt time.Time
 	err := s.Scan(&f.FileID, &f.StorageType, &f.StorageRef, &contentType,
-		&f.SizeBytes, &checksum, &f.Revision, &f.Status, &sourceID, &contentText,
+		&f.SizeBytes, &checksum, &f.Revision, &embeddingRevision, &f.Status, &sourceID, &contentText,
 		&createdAt, &confirmedAt, &expiresAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -944,6 +963,10 @@ func scanFileNoBlob(s scanner) (*File, error) {
 	f.ChecksumSHA256 = checksum.String
 	f.SourceID = sourceID.String
 	f.ContentText = contentText.String
+	if embeddingRevision.Valid {
+		rev := embeddingRevision.Int64
+		f.EmbeddingRevision = &rev
+	}
 	f.CreatedAt = createdAt.UTC()
 	if confirmedAt.Valid {
 		t := confirmedAt.Time.UTC()
@@ -965,13 +988,13 @@ func scanNodeWithFileWithBlob(rows *sql.Rows) (*NodeWithFile, error) {
 	var fFileID, fStorageType, fStorageRef sql.NullString
 	var fContentBlob []byte
 	var fContentType, fChecksum, fSourceID, fContentText sql.NullString
-	var fSizeBytes, fRevision sql.NullInt64
+	var fSizeBytes, fRevision, fEmbeddingRevision sql.NullInt64
 	var fStatus sql.NullString
 	var fCreatedAt, fConfirmedAt, fExpiresAt sql.NullTime
 
 	err := rows.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
 		&fFileID, &fStorageType, &fStorageRef, &fContentBlob, &fContentType, &fSizeBytes,
-		&fChecksum, &fRevision, &fStatus, &fSourceID, &fContentText,
+		&fChecksum, &fRevision, &fEmbeddingRevision, &fStatus, &fSourceID, &fContentText,
 		&fCreatedAt, &fConfirmedAt, &fExpiresAt)
 	if err != nil {
 		return nil, err
@@ -996,6 +1019,10 @@ func scanNodeWithFileWithBlob(rows *sql.Rows) (*NodeWithFile, error) {
 			SourceID:       fSourceID.String,
 			ContentText:    fContentText.String,
 		}
+		if fEmbeddingRevision.Valid {
+			rev := fEmbeddingRevision.Int64
+			nf.File.EmbeddingRevision = &rev
+		}
 		if fCreatedAt.Valid {
 			nf.File.CreatedAt = fCreatedAt.Time.UTC()
 		}
@@ -1019,13 +1046,13 @@ func scanNodeWithFileNoBlob(rows *sql.Rows) (*NodeWithFile, error) {
 
 	var fFileID, fStorageType, fStorageRef sql.NullString
 	var fContentType, fChecksum, fSourceID, fContentText sql.NullString
-	var fSizeBytes, fRevision sql.NullInt64
+	var fSizeBytes, fRevision, fEmbeddingRevision sql.NullInt64
 	var fStatus sql.NullString
 	var fCreatedAt, fConfirmedAt, fExpiresAt sql.NullTime
 
 	err := rows.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
 		&fFileID, &fStorageType, &fStorageRef, &fContentType, &fSizeBytes,
-		&fChecksum, &fRevision, &fStatus, &fSourceID, &fContentText,
+		&fChecksum, &fRevision, &fEmbeddingRevision, &fStatus, &fSourceID, &fContentText,
 		&fCreatedAt, &fConfirmedAt, &fExpiresAt)
 	if err != nil {
 		return nil, err
@@ -1048,6 +1075,10 @@ func scanNodeWithFileNoBlob(rows *sql.Rows) (*NodeWithFile, error) {
 			Status:         FileStatus(fStatus.String),
 			SourceID:       fSourceID.String,
 			ContentText:    fContentText.String,
+		}
+		if fEmbeddingRevision.Valid {
+			rev := fEmbeddingRevision.Int64
+			nf.File.EmbeddingRevision = &rev
 		}
 		if fCreatedAt.Valid {
 			nf.File.CreatedAt = fCreatedAt.Time.UTC()
