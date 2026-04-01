@@ -81,7 +81,7 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	b.imageExtractTimeout = cfg.TaskTimeout
 	b.imageExtractMaxSize = cfg.MaxImageBytes
 	b.maxExtractTextBytes = cfg.MaxExtractTextBytes
-	b.imageExtractQueue = make(chan imageExtractTask, cfg.QueueSize)
+	b.imageExtractQueue = make(chan ImageExtractTaskSpec, cfg.QueueSize)
 	metrics.RecordGauge("image_extract", "queue_capacity", float64(cfg.QueueSize))
 	metrics.RecordGauge("image_extract", "workers", float64(cfg.Workers))
 	metrics.RecordGauge("image_extract", "queue_depth", 0)

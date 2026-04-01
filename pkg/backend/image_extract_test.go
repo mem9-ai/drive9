@@ -2,12 +2,15 @@ package backend
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/pathutil"
 )
 
 type staticImageExtractor struct {
@@ -271,6 +274,147 @@ func TestAsyncImageExtractStaleResultDoesNotRequeueOldRevision(t *testing.T) {
 	if tasks[1].ResourceVersion != 2 || tasks[1].Status != "queued" {
 		t.Fatalf("current revision task should remain queued, got %+v", tasks[1])
 	}
+}
+
+func TestProcessImageExtractTaskWritesContentTextAndQueuesEmbedTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: &staticImageExtractor{text: "cat on sofa screenshot invoice"},
+		},
+	})
+
+	fileID := insertImageFileForExtractTest(t, b, "/img/direct.png", "image/png", []byte("fake-png"))
+	result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/img/direct.png",
+		ContentType: "image/png",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != ImageExtractResultWritten {
+		t.Fatalf("result=%q, want %q", result, ImageExtractResultWritten)
+	}
+
+	nf, err := b.Store().Stat(context.Background(), "/img/direct.png")
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat /img/direct.png: %v", err)
+	}
+	if !strings.Contains(nf.File.ContentText, "cat on sofa") {
+		t.Fatalf("unexpected extracted text: %q", nf.File.ContentText)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+	if tasks[0].TaskType != "embed" || tasks[0].ResourceVersion != 1 || tasks[0].Status != "queued" {
+		t.Fatalf("unexpected semantic task: %+v", tasks[0])
+	}
+}
+
+func TestProcessImageExtractTaskAutoEmbeddingSkipsEmbedBridge(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: &staticImageExtractor{text: "cat on sofa screenshot invoice"},
+		},
+	})
+
+	fileID := insertImageFileForExtractTest(t, b, "/img/direct-auto.png", "image/png", []byte("fake-png"))
+	result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/img/direct-auto.png",
+		ContentType: "image/png",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != ImageExtractResultWritten {
+		t.Fatalf("result=%q, want %q", result, ImageExtractResultWritten)
+	}
+
+	nf, err := b.Store().Stat(context.Background(), "/img/direct-auto.png")
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat /img/direct-auto.png: %v", err)
+	}
+	if !strings.Contains(nf.File.ContentText, "cat on sofa") {
+		t.Fatalf("unexpected extracted text: %q", nf.File.ContentText)
+	}
+	if tasks := loadSemanticTasksForFile(t, b, fileID); len(tasks) != 0 {
+		t.Fatalf("semantic task count=%d, want 0", len(tasks))
+	}
+}
+
+func TestProcessImageExtractTaskTooLargeReturnsTerminalResult(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:       true,
+			Workers:       1,
+			QueueSize:     8,
+			MaxImageBytes: 4,
+			Extractor:     &staticImageExtractor{text: "should not run"},
+		},
+	})
+
+	fileID := insertImageFileForExtractTest(t, b, "/img/large.png", "image/png", []byte("12345"))
+	result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/img/large.png",
+		ContentType: "image/png",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != ImageExtractResultTooLarge {
+		t.Fatalf("result=%q, want %q", result, ImageExtractResultTooLarge)
+	}
+}
+
+func insertImageFileForExtractTest(t *testing.T, b *Dat9Backend, path, contentType string, data []byte) string {
+	t.Helper()
+	fileID := b.genID()
+	now := time.Now().UTC()
+	err := b.Store().InTx(context.Background(), func(tx *sql.Tx) error {
+		if err := b.Store().InsertFileTx(tx, &datastore.File{
+			FileID:         fileID,
+			StorageType:    datastore.StorageDB9,
+			StorageRef:     "inline",
+			ContentBlob:    append([]byte(nil), data...),
+			ContentType:    contentType,
+			SizeBytes:      int64(len(data)),
+			Revision:       1,
+			Status:         datastore.StatusConfirmed,
+			CreatedAt:      now,
+			ConfirmedAt:    &now,
+			ChecksumSHA256: "",
+		}); err != nil {
+			return err
+		}
+		if err := b.Store().EnsureParentDirsTx(tx, path, b.genID); err != nil {
+			return err
+		}
+		return b.Store().InsertNodeTx(tx, &datastore.FileNode{
+			NodeID:     b.genID(),
+			Path:       path,
+			ParentPath: pathutil.ParentPath(path),
+			Name:       pathutil.BaseName(path),
+			FileID:     fileID,
+			CreatedAt:  now,
+		})
+	})
+	if err != nil {
+		t.Fatalf("insert image file %s: %v", path, err)
+	}
+	return fileID
 }
 
 func waitForContentText(t *testing.T, b *Dat9Backend, path string, timeout time.Duration) string {

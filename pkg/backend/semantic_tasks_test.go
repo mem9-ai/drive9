@@ -3,8 +3,10 @@ package backend
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/s3client"
@@ -464,5 +466,26 @@ func TestShouldEnqueueEmbedForRevisionWithoutTextSource(t *testing.T) {
 	b := newTestBackend(t)
 	if b.shouldEnqueueEmbedForRevision("/bin/a.bin", "application/octet-stream", "") {
 		t.Fatal("generic binary object should not enqueue embed work without text source")
+	}
+}
+
+func TestNewImgExtractTaskCarriesPayloadHints(t *testing.T) {
+	now := time.Now().UTC()
+	task, err := newImgExtractTask("task-1", "file-1", 7, "/img/a.png", "image/png", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.TaskType != semantic.TaskTypeImgExtractText {
+		t.Fatalf("task type=%q, want %q", task.TaskType, semantic.TaskTypeImgExtractText)
+	}
+	if task.ResourceID != "file-1" || task.ResourceVersion != 7 {
+		t.Fatalf("unexpected task identity: %+v", task)
+	}
+	var payload semantic.ImgExtractTaskPayload
+	if err := json.Unmarshal(task.PayloadJSON, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Path != "/img/a.png" || payload.ContentType != "image/png" {
+		t.Fatalf("unexpected payload: %+v", payload)
 	}
 }

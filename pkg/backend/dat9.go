@@ -47,7 +47,7 @@ type Dat9Backend struct {
 	// Async image -> text extraction worker (in-memory queue for P0).
 	imageExtractEnabled bool
 	imageExtractor      ImageTextExtractor
-	imageExtractQueue   chan imageExtractTask
+	imageExtractQueue   chan ImageExtractTaskSpec
 	imageExtractWG      sync.WaitGroup
 	imageExtractCancel  context.CancelFunc
 	imageExtractTimeout time.Duration
