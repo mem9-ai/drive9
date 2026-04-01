@@ -16,7 +16,7 @@
 # 12) Copy, rename, delete
 # 13) Final list verification
 # 14) 100MB multipart upload via POST /v1/uploads/initiate + download checksum
-# 15) Max-upload boundary check (1GiB allowed, 1GiB+1 rejected)
+# 15) Max-upload boundary check (limit allowed, limit+1 rejected)
 
 set -euo pipefail
 
@@ -31,7 +31,7 @@ BATCH_SMALL_FILE_COUNT="${BATCH_SMALL_FILE_COUNT:-10}"
 REQUEST_MAX_RETRIES="${REQUEST_MAX_RETRIES:-8}"
 REQUEST_RETRY_SLEEP_S="${REQUEST_RETRY_SLEEP_S:-2}"
 RUN_UPLOAD_LIMIT_BOUNDARY="${RUN_UPLOAD_LIMIT_BOUNDARY:-1}"
-UPLOAD_LIMIT_BYTES="${UPLOAD_LIMIT_BYTES:-1073741824}"
+UPLOAD_LIMIT_BYTES="${UPLOAD_LIMIT_BYTES:-53687091200}"
 SEMANTIC_TIMEOUT_S="${SEMANTIC_TIMEOUT_S:-90}"
 SEMANTIC_INTERVAL_S="${SEMANTIC_INTERVAL_S:-3}"
 
@@ -636,13 +636,17 @@ PY
 fi
 
 if [ "$RUN_UPLOAD_LIMIT_BOUNDARY" = "1" ]; then
-  step "15" "Upload limit boundary (1GiB/1GiB+1)"
+  step "15" "Upload limit boundary (limit/limit+1)"
   BOUNDARY_CHECKSUMS=$(python3 - <<'PY'
 import base64
 import hashlib
+import os
 part = b"\x00" * (8 * 1024 * 1024)
 one = base64.b64encode(hashlib.sha256(part).digest()).decode()
-print(",".join([one] * 128))
+upload_limit = int(os.environ["UPLOAD_LIMIT_BYTES"])
+part_size = 8 * 1024 * 1024
+parts = (upload_limit + part_size - 1) // part_size
+print(",".join([one] * parts))
 PY
 )
 

@@ -62,7 +62,8 @@ export DAT9_BASE="https://api.dat9.ai"
 12. `copy`, `rename`, `delete`
 13. Final `list` verifies expected structure after mutations
 14. Large multipart upload (`POST /v1/uploads/initiate` + presigned part uploads + complete + download checksum)
-15. Upload-limit boundary (`1GiB` initiate accepted, `1GiB+1` rejected)
+
+15. Upload-limit boundary (`50GiB` initiate accepted, `50GiB+1` rejected)
 
 ### `api-smoke-test-existing-key.sh`
 
@@ -80,7 +81,7 @@ export DAT9_BASE="https://api.dat9.ai"
 6. CLI semantic and image-associated recall flow (`fs grep` paraphrase + image caption recall) with async polling
 7. CLI image flow (`fs cp` jpg + `fs find -name "*.jpg"`)
 8. CLI large-file flow (`cp` upload multipart + `cp` download + checksum verification)
-9. CLI upload-limit boundary (`1GiB` initiate accepted, `1GiB+1` rejected)
+9. CLI upload-limit boundary (`50GiB` initiate accepted, `50GiB+1` rejected)
 
 ### `fuse-smoke-test.sh`
 
@@ -124,7 +125,7 @@ Notes:
 | `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh` |
 | `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh` |
 | `RUN_UPLOAD_LIMIT_BOUNDARY` | `1` | `api-smoke-test.sh` |
-| `UPLOAD_LIMIT_BYTES` | `1073741824` | `api-smoke-test.sh` |
+| `UPLOAD_LIMIT_BYTES` | `53687091200` | `api-smoke-test.sh` |
 | `SEMANTIC_TIMEOUT_S` | `90` | `api-smoke-test.sh` |
 | `SEMANTIC_INTERVAL_S` | `3` | `api-smoke-test.sh` |
 | `CLI_LARGE_FILE_MB` | `100` | `cli-smoke-test.sh` |
@@ -132,7 +133,7 @@ Notes:
 | `CLI_MAX_RETRIES` | `8` | `cli-smoke-test.sh` |
 | `CLI_RETRY_SLEEP_S` | `2` | `cli-smoke-test.sh` |
 | `RUN_CLI_UPLOAD_LIMIT_BOUNDARY` | `1` | `cli-smoke-test.sh` |
-| `CLI_UPLOAD_LIMIT_BYTES` | `1073741824` | `cli-smoke-test.sh` |
+| `CLI_UPLOAD_LIMIT_BYTES` | `53687091200` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_TIMEOUT_S` | `90` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_INTERVAL_S` | `3` | `cli-smoke-test.sh` |
 | `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh` |
