@@ -34,6 +34,11 @@ const (
 
 var semanticWorkerUsesTiDBAutoEmbedding = tenant.UsesTiDBAutoEmbedding
 
+var (
+	semanticWorkerAllowedEmbedTaskTypes      = []semantic.TaskType{semantic.TaskTypeEmbed, semantic.TaskTypeGenerateL0}
+	semanticWorkerAllowedImgExtractTaskTypes = []semantic.TaskType{semantic.TaskTypeImgExtractText, semantic.TaskTypeGenerateL0}
+)
+
 // SemanticWorkerOptions controls background semantic task processing.
 type SemanticWorkerOptions struct {
 	Workers              int
@@ -98,10 +103,11 @@ type semanticTenantRef struct {
 }
 
 type semanticTarget struct {
-	tenantID string
-	backend  *backend.Dat9Backend
-	store    *datastore.Store
-	release  func()
+	tenantID         string
+	backend          *backend.Dat9Backend
+	store            *datastore.Store
+	allowedTaskTypes []semantic.TaskType
+	release          func()
 }
 
 type semanticObservationSnapshot struct {
@@ -226,7 +232,7 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 	defer target.release()
 
 	claimStart := time.Now()
-	task, found, err := target.store.ClaimSemanticTask(ctx, time.Now().UTC(), m.opts.LeaseDuration)
+	task, found, err := target.store.ClaimSemanticTaskOfTypes(ctx, time.Now().UTC(), m.opts.LeaseDuration, target.allowedTaskTypes...)
 	if err != nil {
 		metrics.RecordOperation("semantic_worker", "claim", "error", time.Since(claimStart))
 		logger.Warn(ctx, "semantic_worker_claim_failed",
@@ -386,6 +392,10 @@ func (m *semanticWorkerManager) nextTarget(ctx context.Context) (*semanticTarget
 			m.releaseTenantSlot(ref.id)
 			continue
 		}
+		if len(target.allowedTaskTypes) == 0 {
+			m.releaseTenantSlot(ref.id)
+			continue
+		}
 		target.release = func() { m.releaseTenantSlot(ref.id) }
 		return target, nil
 	}
@@ -452,7 +462,12 @@ func (m *semanticWorkerManager) targetForRef(ctx context.Context, ref semanticTe
 	if b == nil {
 		return nil, fmt.Errorf("backend missing for %s", ref.id)
 	}
-	return &semanticTarget{tenantID: ref.id, backend: b, store: b.Store()}, nil
+	return &semanticTarget{
+		tenantID:         ref.id,
+		backend:          b,
+		store:            b.Store(),
+		allowedTaskTypes: m.allowedTaskTypesForTarget(b),
+	}, nil
 }
 
 func (m *semanticWorkerManager) backendForRef(ctx context.Context, ref semanticTenantRef) (*backend.Dat9Backend, error) {
@@ -492,6 +507,10 @@ func (m *semanticWorkerManager) dispatchTask(ctx context.Context, target *semant
 }
 
 func (m *semanticWorkerManager) processEmbedTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task) string {
+	if m.embedder == nil {
+		m.retryTask(ctx, tenantID, store, task, "embed handler not configured")
+		return "handler_missing"
+	}
 	file, err := store.GetFile(ctx, task.ResourceID)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
@@ -653,7 +672,7 @@ func (m *semanticWorkerManager) hasImageHandler() bool {
 
 func (m *semanticWorkerManager) supportsTenantProvider(provider string) bool {
 	if semanticWorkerUsesTiDBAutoEmbedding(provider) {
-		return m.hasImageHandler()
+		return m.pool != nil && m.pool.SupportsAsyncImageExtract()
 	}
 	return m.hasEmbedHandler()
 }
@@ -666,6 +685,22 @@ func (m *semanticWorkerManager) shouldIncludeFallback() bool {
 		return m.hasImageHandler()
 	}
 	return m.hasEmbedHandler()
+}
+
+func (m *semanticWorkerManager) allowedTaskTypesForTarget(b *backend.Dat9Backend) []semantic.TaskType {
+	if m == nil || b == nil {
+		return nil
+	}
+	if b.UsesDatabaseAutoEmbedding() {
+		if b.SupportsAsyncImageExtract() {
+			return semanticWorkerAllowedImgExtractTaskTypes
+		}
+		return nil
+	}
+	if m.embedder != nil {
+		return semanticWorkerAllowedEmbedTaskTypes
+	}
+	return nil
 }
 
 func imageExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.ImageExtractTaskSpec {

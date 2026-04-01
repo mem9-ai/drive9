@@ -211,6 +211,105 @@ func TestSemanticWorkerProcessesImgExtractTaskWithoutEmbedder(t *testing.T) {
 	}
 }
 
+func TestSemanticWorkerImageOnlySkipsLegacyEmbedBacklog(t *testing.T) {
+	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: staticServerImageExtractor{text: "cat on sofa screenshot invoice"},
+		},
+	})
+	ctx := context.Background()
+	fileID := insertServerImageFileForExtractTest(t, b, "/img/backlog.png", "image/png", []byte("fake-png"))
+	payload, err := json.Marshal(semantic.ImgExtractTaskPayload{Path: "/img/backlog.png", ContentType: "image/png"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC()
+	if _, err := b.Store().EnqueueSemanticTask(ctx, &semantic.Task{
+		TaskID:          "legacy-embed-task",
+		TaskType:        semantic.TaskTypeEmbed,
+		ResourceID:      "legacy-embed-file",
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     base,
+		CreatedAt:       base,
+		UpdatedAt:       base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Store().EnqueueSemanticTask(ctx, &semantic.Task{
+		TaskID:          "img-task-typed-claim",
+		TaskType:        semantic.TaskTypeImgExtractText,
+		ResourceID:      fileID,
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     base.Add(time.Second),
+		PayloadJSON:     payload,
+		CreatedAt:       base.Add(time.Second),
+		UpdatedAt:       base.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewWithConfig(Config{Backend: b, SemanticWorkers: SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
+	}})
+	t.Cleanup(func() { s.Close() })
+
+	waitForContentTextOnServer(t, b, "/img/backlog.png", "cat on sofa", 3*time.Second)
+	waitForNamedTaskStatus(t, b, "img-task-typed-claim", string(semantic.TaskSucceeded), 3*time.Second)
+	legacy := mustGetServerSemanticTask(t, b, "legacy-embed-task")
+	if legacy.Status != string(semantic.TaskQueued) || legacy.AttemptCount != 0 {
+		t.Fatalf("legacy embed task=%+v, want queued with attempt_count 0", legacy)
+	}
+}
+
+func TestSemanticWorkerEmbedOnlySkipsImageTasks(t *testing.T) {
+	b := newTestBackendForSemanticWorker(t)
+	ctx := context.Background()
+	base := time.Now().UTC()
+	if _, err := b.Store().EnqueueSemanticTask(ctx, &semantic.Task{
+		TaskID:          "legacy-img-task",
+		TaskType:        semantic.TaskTypeImgExtractText,
+		ResourceID:      "legacy-image-file",
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     base,
+		CreatedAt:       base,
+		UpdatedAt:       base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/docs/embed-only.txt", []byte("hello typed claim"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	nf := mustServerFile(t, b, "/docs/embed-only.txt")
+
+	s := NewWithConfig(Config{Backend: b, SemanticEmbedder: staticSemanticEmbedder{vec: []float32{0.1, 0.2, 0.3}}, SemanticWorkers: SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
+	}})
+	t.Cleanup(func() { s.Close() })
+
+	waitForEmbeddingRevision(t, b, "/docs/embed-only.txt", 1, 3*time.Second)
+	waitForTaskStatus(t, b, nf.FileID, 1, string(semantic.TaskSucceeded), 3*time.Second)
+	legacy := mustGetServerSemanticTask(t, b, "legacy-img-task")
+	if legacy.Status != string(semantic.TaskQueued) || legacy.AttemptCount != 0 {
+		t.Fatalf("legacy image task=%+v, want queued with attempt_count 0", legacy)
+	}
+}
+
 func TestServerDoesNotStartSemanticWorkerWithoutHandlers(t *testing.T) {
 	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{DatabaseAutoEmbedding: true})
 	s := NewWithConfig(Config{Backend: b, SemanticWorkers: SemanticWorkerOptions{Workers: 1}})
@@ -599,6 +698,100 @@ func TestSemanticWorkerListTenantRefsEmbedOnlySkipsAutoProviders(t *testing.T) {
 	}
 }
 
+func TestSemanticWorkerListTenantRefsDoesNotUseFallbackImageCapabilityForPoolTenants(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	pool := newTestTenantPool(t)
+	passCipher, err := pool.Encrypt(context.Background(), []byte("pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	autoTenantID := tenant.NewID()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               autoTenantID,
+		Status:           meta.TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: passCipher,
+		DBName:           "app",
+		DBTLS:            false,
+		Provider:         tenant.ProviderTiDBZero,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fallback := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 1,
+			Extractor: staticServerImageExtractor{text: "fallback only"},
+		},
+	})
+
+	orig := semanticWorkerUsesTiDBAutoEmbedding
+	semanticWorkerUsesTiDBAutoEmbedding = func(provider string) bool {
+		return provider == tenant.ProviderTiDBZero
+	}
+	defer func() {
+		semanticWorkerUsesTiDBAutoEmbedding = orig
+	}()
+
+	m := newSemanticWorkerManager(fallback, metaStore, pool, nil, SemanticWorkerOptions{})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	refs, err := m.listTenantRefs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 0 {
+		t.Fatalf("tenant ref count=%d, want 0", len(refs))
+	}
+}
+
+func TestSemanticWorkerProcessEmbedTaskWithoutEmbedderDoesNotPanic(t *testing.T) {
+	b := newTestBackendForSemanticWorker(t)
+	if _, err := b.Write("/docs/no-embedder.txt", []byte("hello guard"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	nf := mustServerFile(t, b, "/docs/no-embedder.txt")
+	claimed, found, err := b.Store().ClaimSemanticTask(context.Background(), time.Now().UTC(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected embed task to be claimable")
+	}
+	var opts SemanticWorkerOptions
+	opts.normalize()
+	m := &semanticWorkerManager{fallback: b, opts: opts}
+	if got := m.processEmbedTask(context.Background(), semanticLocalTenantID, b.Store(), claimed); got != "handler_missing" {
+		t.Fatalf("process result=%q, want %q", got, "handler_missing")
+	}
+	task := mustGetServerSemanticTask(t, b, claimed.TaskID)
+	if task.Status != string(semantic.TaskQueued) {
+		t.Fatalf("task status=%q, want %q", task.Status, semantic.TaskQueued)
+	}
+	if !strings.Contains(task.LastError, "embed handler not configured") {
+		t.Fatalf("last_error=%v, want embed handler message", task.LastError)
+	}
+	if task.ResourceID != nf.FileID {
+		t.Fatalf("task resource_id=%q, want %q", task.ResourceID, nf.FileID)
+	}
+}
+
 func TestSemanticWorkerClaimAndAckLogsIncludeTaskFields(t *testing.T) {
 	core, recorded := observer.New(zap.InfoLevel)
 	restoreLogger := logger.L()
@@ -737,6 +930,15 @@ type serverSemanticTaskRow struct {
 	Status   string
 }
 
+type serverSemanticTaskState struct {
+	TaskID       string
+	TaskType     string
+	ResourceID   string
+	Status       string
+	AttemptCount int
+	LastError    string
+}
+
 func insertServerImageFileForExtractTest(t *testing.T, b *backend.Dat9Backend, path, contentType string, data []byte) string {
 	t.Helper()
 	fileID := mustServerImageFileID(t, b, path, contentType, data)
@@ -817,6 +1019,24 @@ func loadSemanticTaskRowsForResource(t *testing.T, b *backend.Dat9Backend, resou
 		t.Fatalf("iterate semantic tasks for %s: %v", resourceID, err)
 	}
 	return out
+}
+
+func mustGetServerSemanticTask(t *testing.T, b *backend.Dat9Backend, taskID string) serverSemanticTaskState {
+	t.Helper()
+	var task serverSemanticTaskState
+	err := b.Store().DB().QueryRow(`SELECT task_id, task_type, resource_id, status, attempt_count, COALESCE(last_error, '')
+		FROM semantic_tasks WHERE task_id = ?`, taskID).Scan(
+		&task.TaskID,
+		&task.TaskType,
+		&task.ResourceID,
+		&task.Status,
+		&task.AttemptCount,
+		&task.LastError,
+	)
+	if err != nil {
+		t.Fatalf("get semantic task %s: %v", taskID, err)
+	}
+	return task
 }
 
 func mustServerFile(t *testing.T, b *backend.Dat9Backend, path string) *datastore.File {
