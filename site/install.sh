@@ -4,7 +4,8 @@ set -e
 # dat9 installer
 # Usage: curl -fsSL https://dat9.ai/install | sh
 
-BASE_URL="https://dat9.ai/releases"
+BASE_URL="https://dat9.ai"
+API_URL="https://api.dat9.ai"
 DEFAULT_INSTALL_DIR="/usr/local/bin"
 INSTALL_DIR=""
 
@@ -67,7 +68,7 @@ download_quiet() {
 
 fetch_version() {
   LATEST_VERSION=""
-  VERSION_URL="${BASE_URL}/version"
+  VERSION_URL="${BASE_URL}/releases/version"
   if command -v curl > /dev/null 2>&1; then
     LATEST_VERSION=$(curl -fsSL "$VERSION_URL" 2>/dev/null | tr -d '[:space:]') || true
   elif command -v wget > /dev/null 2>&1; then
@@ -129,7 +130,18 @@ bootstrap_config() {
   if [ -z "${HOME:-}" ]; then
     return
   fi
-  mkdir -p "${HOME}/.dat9" 2>/dev/null || true
+  CONFIG_DIR="${HOME}/.dat9"
+  CONFIG_FILE="${CONFIG_DIR}/config"
+  mkdir -p "${CONFIG_DIR}" 2>/dev/null || true
+  if [ ! -f "${CONFIG_FILE}" ]; then
+    cat > "${CONFIG_FILE}" <<CONF
+{
+  "server": "${API_URL}",
+  "contexts": {}
+}
+CONF
+    chmod 600 "${CONFIG_FILE}"
+  fi
 }
 
 main() {
@@ -168,7 +180,7 @@ main() {
   else
     info "Downloading dat9..."
   fi
-  if ! download "${BASE_URL}/dat9-${OS}-${ARCH}" "$TMP_DIR/dat9"; then
+  if ! download "${BASE_URL}/releases/dat9-${OS}-${ARCH}" "$TMP_DIR/dat9"; then
     error "No pre-built binary available for ${OS}/${ARCH}.\n  Available: linux/amd64, linux/arm64, darwin/arm64, darwin/amd64\n  Visit https://dat9.ai for more info."
   fi
   chmod +x "$TMP_DIR/dat9"
@@ -192,16 +204,20 @@ main() {
   bootstrap_config
   report_path_status
   printf "\n"
-  printf "  Next step:\n"
-  printf "    ${DIM}\$${RESET} dat9 create                              ${DIM}# provision a new database${RESET}\n"
+  printf "  Get started:\n"
   printf "\n"
-  printf "  Then try:\n"
-  printf "    ${DIM}\$${RESET} dat9 fs ls :/                            ${DIM}# list files${RESET}\n"
-  printf "    ${DIM}\$${RESET} dat9 fs cp ./file.txt :/data/file.txt    ${DIM}# upload a file${RESET}\n"
-  printf "    ${DIM}\$${RESET} dat9 fs sh                               ${DIM}# interactive shell${RESET}\n"
-  printf "    ${DIM}\$${RESET} dat9 mount ~/dat9                        ${DIM}# mount as local directory${RESET}\n"
+  printf "    ${BOLD}1.${RESET} Create a workspace\n"
+  printf "       ${DIM}\$${RESET} dat9 create\n"
   printf "\n"
-  printf "  More usage: ${DIM}https://dat9.ai/skill.md${RESET}\n"
+  printf "    ${BOLD}2.${RESET} Verify it's ready\n"
+  printf "       ${DIM}\$${RESET} dat9 fs ls :/\n"
+  printf "\n"
+  printf "    ${BOLD}3.${RESET} Start using dat9\n"
+  printf "       ${DIM}\$${RESET} dat9 fs cp ./file.txt :/data/file.txt\n"
+  printf "       ${DIM}\$${RESET} dat9 fs grep \"search term\" /\n"
+  printf "       ${DIM}\$${RESET} dat9 mount ~/dat9\n"
+  printf "\n"
+  printf "  Docs: ${DIM}https://dat9.ai/skill.md${RESET}\n"
   printf "\n"
 }
 
