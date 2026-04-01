@@ -27,7 +27,7 @@ import (
 	"go.uber.org/zap"
 )
 
-const smallFileThreshold = 1 << 20 // 1MB
+const smallFileThreshold = 50 << 10 // 50KB
 
 // Dat9Backend implements filesystem.FileSystem with the inode model.
 type Dat9Backend struct {

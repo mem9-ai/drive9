@@ -77,8 +77,8 @@ type S3Client interface {
 
 // Default presigned URL TTLs per design doc §11.2.
 const (
-	UploadTTL   = 120 * time.Second
-	DownloadTTL = 60 * time.Second
+	UploadTTL   = 10 * time.Minute
+	DownloadTTL = 10 * time.Minute
 )
 
 // PartSize is the default multipart part size (8MB).

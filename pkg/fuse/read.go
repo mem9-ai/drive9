@@ -10,7 +10,7 @@ import (
 const (
 	defaultReadCacheMaxSize = 128 << 20          // 128MB
 	defaultReadCacheTTL     = 30 * time.Second   // 30s
-	smallFileThreshold      = 1 << 20            // 1MB - matches client.DefaultSmallFileThreshold
+	smallFileThreshold      = 50 << 10           // 50KB - matches client.DefaultSmallFileThreshold
 )
 
 // cacheEntry holds a single cached file's data and metadata.
