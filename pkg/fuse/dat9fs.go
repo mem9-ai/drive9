@@ -211,6 +211,14 @@ func httpToFuseStatus(err error) gofuse.Status {
 	}
 }
 
+func isNotFoundErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "not found") || strings.Contains(msg, "HTTP 404")
+}
+
 // --- RawFileSystem methods ---------------------------------------------------
 
 func (fs *Dat9FS) Init(server *gofuse.Server) {
@@ -225,7 +233,33 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 
 	stat, err := fs.client.Stat(childP)
 	if err != nil {
-		return httpToFuseStatus(err)
+		if !isNotFoundErr(err) {
+			return httpToFuseStatus(err)
+		}
+
+		// Some deployments do not support stat/HEAD on directories.
+		// Fall back to listing the parent and matching by name.
+		parentPath, ok := fs.inodes.GetPath(header.NodeId)
+		if !ok {
+			return gofuse.ENOENT
+		}
+		items, listErr := fs.client.List(parentPath)
+		if listErr != nil {
+			return httpToFuseStatus(listErr)
+		}
+		for _, item := range items {
+			if item.Name != name {
+				continue
+			}
+			ino := fs.inodes.Lookup(childP, item.IsDir, item.Size, time.Now())
+			entry, ok := fs.inodes.GetEntry(ino)
+			if !ok {
+				return gofuse.EIO
+			}
+			fs.fillEntryOut(entry, out)
+			return gofuse.OK
+		}
+		return gofuse.ENOENT
 	}
 
 	ino := fs.inodes.Lookup(childP, stat.IsDir, stat.Size, time.Now())
@@ -251,14 +285,17 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
 		entry.Size = size
 	} else if input.NodeId != 1 {
-		// For non-root without local dirty state, refresh from server.
-		stat, err := fs.client.Stat(entry.Path)
-		if err != nil {
-			return httpToFuseStatus(err)
+		// Some deployments do not support HEAD/stat on directories.
+		// Keep directory attrs from inode map and only refresh regular files.
+		if !entry.IsDir {
+			stat, err := fs.client.Stat(entry.Path)
+			if err != nil {
+				return httpToFuseStatus(err)
+			}
+			entry.Size = stat.Size
+			entry.IsDir = stat.IsDir
+			fs.inodes.UpdateSize(input.NodeId, stat.Size)
 		}
-		entry.Size = stat.Size
-		entry.IsDir = stat.IsDir
-		fs.inodes.UpdateSize(input.NodeId, stat.Size)
 	}
 
 	fs.fillAttr(entry, &out.Attr)
