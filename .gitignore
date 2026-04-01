@@ -39,3 +39,6 @@ tmp/
 /dat9
 dat9-server
 .gstack/
+
+# Local review artifacts
+second_opinion*
