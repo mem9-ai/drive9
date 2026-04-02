@@ -70,6 +70,7 @@ func TestWriteStreamLargeFile(t *testing.T) {
 			// Return 202 with upload plan
 			plan := UploadPlan{
 				UploadID: "upload-123",
+				PartSize: 5,
 				Parts: []PartURL{
 					{Number: 1, URL: "", Size: 5}, // URL filled below
 					{Number: 2, URL: "", Size: 3},
