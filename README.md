@@ -260,8 +260,9 @@ Four tables, all in the tenant's database:
 ## Building
 
 ```bash
-go build -o dat9 ./cmd/dat9
-go build -o dat9-server ./cmd/dat9-server
+mkdir -p bin
+go build -o bin/dat9 ./cmd/dat9
+go build -o bin/dat9-server ./cmd/dat9-server
 ```
 
 ## Local Validation Server

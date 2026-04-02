@@ -2,6 +2,7 @@ package backend
 
 import (
 	"database/sql"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -11,6 +12,16 @@ import (
 func (b *Dat9Backend) enqueueEmbedTaskTx(tx *sql.Tx, fileID string, revision int64) error {
 	now := time.Now().UTC()
 	_, err := b.store.EnqueueSemanticTaskTx(tx, newEmbedTask(b.genID(), fileID, revision, now))
+	return err
+}
+
+func (b *Dat9Backend) enqueueImgExtractTaskTx(tx *sql.Tx, fileID string, revision int64, path, contentType string) error {
+	now := time.Now().UTC()
+	task, err := newImgExtractTask(b.genID(), fileID, revision, path, contentType, now)
+	if err != nil {
+		return err
+	}
+	_, err = b.store.EnqueueSemanticTaskTx(tx, task)
 	return err
 }
 
@@ -27,6 +38,31 @@ func newEmbedTask(taskID, fileID string, revision int64, now time.Time) *semanti
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
+}
+
+func newImgExtractTask(taskID, fileID string, revision int64, path, contentType string, now time.Time) (*semantic.Task, error) {
+	now = now.UTC()
+	payload := semantic.ImgExtractTaskPayload{Path: path, ContentType: contentType}
+	var payloadJSON []byte
+	if payload.Path != "" || payload.ContentType != "" {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		payloadJSON = encoded
+	}
+	return &semantic.Task{
+		TaskID:          taskID,
+		TaskType:        semantic.TaskTypeImgExtractText,
+		ResourceID:      fileID,
+		ResourceVersion: revision,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     5,
+		AvailableAt:     now,
+		PayloadJSON:     payloadJSON,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}, nil
 }
 
 func (b *Dat9Backend) shouldEnqueueEmbedForRevision(path, contentType, contentText string) bool {

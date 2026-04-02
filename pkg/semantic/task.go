@@ -6,14 +6,21 @@ import (
 	"time"
 )
 
+// ImgExtractTaskPayload carries non-authoritative hints for durable image text
+// extraction. The task identity remains resource_id + resource_version.
+type ImgExtractTaskPayload struct {
+	Path        string `json:"path,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+}
+
 // TaskType identifies the durable semantic work to execute.
 type TaskType string
 
 const (
 	// TaskTypeEmbed generates or refreshes file embeddings.
 	TaskTypeEmbed TaskType = "embed"
-	// TaskTypeExtractText extracts or refreshes file content_text.
-	TaskTypeExtractText TaskType = "extract_text"
+	// TaskTypeImgExtractText extracts or refreshes image-derived file content_text.
+	TaskTypeImgExtractText TaskType = "img_extract_text"
 	// TaskTypeGenerateL0 generates or refreshes .abstract.md style summaries.
 	TaskTypeGenerateL0 TaskType = "generate_l0"
 	// TaskTypeGenerateL1 generates or refreshes .overview.md style summaries.

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -228,7 +229,21 @@ func (s *Store) ensureSemanticTaskQueuedTx(tx *sql.Tx, task *semantic.Task) (boo
 func (s *Store) ClaimSemanticTask(ctx context.Context, now time.Time, leaseDuration time.Duration) (out *semantic.Task, found bool, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "claim_semantic_task", start, &err)
+	return s.claimSemanticTask(ctx, now, leaseDuration, nil)
+}
 
+// ClaimSemanticTaskOfTypes claims one queued semantic task whose task_type is
+// included in taskTypes and leases it to the caller.
+func (s *Store) ClaimSemanticTaskOfTypes(ctx context.Context, now time.Time, leaseDuration time.Duration, taskTypes ...semantic.TaskType) (out *semantic.Task, found bool, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "claim_semantic_task_of_types", start, &err)
+	if len(taskTypes) == 0 {
+		return nil, false, fmt.Errorf("claim task types are required")
+	}
+	return s.claimSemanticTask(ctx, now, leaseDuration, taskTypes)
+}
+
+func (s *Store) claimSemanticTask(ctx context.Context, now time.Time, leaseDuration time.Duration, taskTypes []semantic.TaskType) (out *semantic.Task, found bool, err error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -237,6 +252,10 @@ func (s *Store) ClaimSemanticTask(ctx context.Context, now time.Time, leaseDurat
 	if leaseDuration <= 0 {
 		leaseDuration = 30 * time.Second
 	}
+	normalizedTypes, err := normalizeClaimTaskTypes(taskTypes)
+	if err != nil {
+		return nil, false, err
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -244,14 +263,8 @@ func (s *Store) ClaimSemanticTask(ctx context.Context, now time.Time, leaseDurat
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	row := tx.QueryRowContext(ctx, `SELECT task_id, task_type, resource_id, resource_version, status,
-		attempt_count, max_attempts, receipt, leased_at, lease_until, available_at,
-		payload_json, last_error, created_at, updated_at, completed_at
-		FROM semantic_tasks
-		WHERE status = ? AND available_at <= ?
-		ORDER BY available_at, created_at, task_id
-		LIMIT 1
-		FOR UPDATE SKIP LOCKED`, semantic.TaskQueued, now)
+	query, args := claimSemanticTaskQuery(now, normalizedTypes)
+	row := tx.QueryRowContext(ctx, query, args...)
 	task, scanErr := scanSemanticTask(row)
 	if scanErr != nil {
 		if errors.Is(scanErr, semantic.ErrTaskNotFound) {
@@ -290,6 +303,60 @@ func (s *Store) ClaimSemanticTask(ctx context.Context, now time.Time, leaseDurat
 		return nil, false, err
 	}
 	return task, true, nil
+}
+
+func normalizeClaimTaskTypes(taskTypes []semantic.TaskType) ([]semantic.TaskType, error) {
+	if len(taskTypes) == 0 {
+		return nil, nil
+	}
+	seen := make(map[semantic.TaskType]struct{}, len(taskTypes))
+	normalized := make([]semantic.TaskType, 0, len(taskTypes))
+	for _, taskType := range taskTypes {
+		if strings.TrimSpace(string(taskType)) == "" {
+			return nil, fmt.Errorf("claim task type is required")
+		}
+		if _, ok := seen[taskType]; ok {
+			continue
+		}
+		seen[taskType] = struct{}{}
+		normalized = append(normalized, taskType)
+	}
+	return normalized, nil
+}
+
+func claimSemanticTaskQuery(now time.Time, taskTypes []semantic.TaskType) (string, []any) {
+	query := `SELECT task_id, task_type, resource_id, resource_version, status,
+		attempt_count, max_attempts, receipt, leased_at, lease_until, available_at,
+		payload_json, last_error, created_at, updated_at, completed_at
+		FROM semantic_tasks
+		WHERE status = ?`
+	args := []any{semantic.TaskQueued}
+	if len(taskTypes) == 1 {
+		query += ` AND task_type = ?`
+		args = append(args, taskTypes[0])
+	} else if len(taskTypes) > 1 {
+		query += ` AND task_type IN (` + questionPlaceholders(len(taskTypes)) + `)`
+		for _, taskType := range taskTypes {
+			args = append(args, taskType)
+		}
+	}
+	query += ` AND available_at <= ?
+		ORDER BY available_at, created_at, task_id
+		LIMIT 1
+		FOR UPDATE SKIP LOCKED`
+	args = append(args, now)
+	return query, args
+}
+
+func questionPlaceholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	parts := make([]string, n)
+	for i := range parts {
+		parts[i] = "?"
+	}
+	return strings.Join(parts, ", ")
 }
 
 // AckSemanticTask marks a leased semantic task as succeeded.

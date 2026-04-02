@@ -249,7 +249,13 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 			if err != nil {
 				return err
 			}
-			if !b.UsesDatabaseAutoEmbedding() && b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "") {
+			if b.UsesDatabaseAutoEmbedding() {
+				if b.hasAsyncImageTextSource(upload.TargetPath, contentType) {
+					return b.enqueueImgExtractTaskTx(tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+				}
+				return nil
+			}
+			if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "") {
 				return b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
 			}
 			return nil
@@ -295,7 +301,13 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		}); err != nil {
 			return err
 		}
-		if !b.UsesDatabaseAutoEmbedding() && b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "") {
+		if b.UsesDatabaseAutoEmbedding() {
+			if b.hasAsyncImageTextSource(upload.TargetPath, contentType) {
+				return b.enqueueImgExtractTaskTx(tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+			}
+			return nil
+		}
+		if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "") {
 			return b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
 		}
 		return nil
@@ -307,7 +319,13 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 	if isOverwrite {
 		b.deleteBlobIfS3Ctx(ctx, oldStorageType, oldStorageRef, upload.S3Key)
 	}
-
+	// Temporary compatibility: app embedding still relies on the legacy
+	// backend-owned image queue until its image task flow also moves to
+	// semantic_tasks.
+	if b.UsesDatabaseAutoEmbedding() {
+		metrics.RecordOperation("backend", "confirm_upload", "ok", time.Since(start))
+		return nil
+	}
 	b.enqueueImageExtractForUpload(ctx, upload, isOverwrite)
 
 	metrics.RecordOperation("backend", "confirm_upload", "ok", time.Since(start))

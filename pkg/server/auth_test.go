@@ -19,7 +19,14 @@ import (
 	"github.com/mem9-ai/dat9/pkg/tenant"
 )
 
-func newAuthServer(t *testing.T) (*Server, string, func()) {
+type authTestRuntime struct {
+	meta        *meta.Store
+	pool        *tenant.Pool
+	tokenSecret []byte
+	token       string
+}
+
+func newAuthRuntime(t *testing.T) (*authTestRuntime, func()) {
 	t.Helper()
 	if testDSN == "" {
 		t.Skip("no test database available")
@@ -107,15 +114,20 @@ func newAuthServer(t *testing.T) (*Server, string, func()) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-
-	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, TokenSecret: tokenSecret})
 	cleanup := func() {
 		pool.Close()
 		_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
 		_, _ = metaStore.DB().Exec("DELETE FROM tenants")
 		_ = metaStore.Close()
 	}
-	return srv, tok, cleanup
+	return &authTestRuntime{meta: metaStore, pool: pool, tokenSecret: tokenSecret, token: tok}, cleanup
+}
+
+func newAuthServer(t *testing.T) (*Server, string, func()) {
+	t.Helper()
+	rt, cleanup := newAuthRuntime(t)
+	srv := NewWithConfig(Config{Meta: rt.meta, Pool: rt.pool, TokenSecret: rt.tokenSecret})
+	return srv, rt.token, cleanup
 }
 
 func mustTempDir(t *testing.T) string {
@@ -158,6 +170,35 @@ func TestAuthValidKeyCanWrite(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+}
+
+func TestAuthKeepsBorrowedBackendValidDuringRequestAfterInvalidate(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+	h := tenantAuthMiddleware(rt.meta, rt.pool, rt.tokenSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scope := ScopeFromContext(r.Context())
+		if scope == nil || scope.Backend == nil {
+			t.Fatal("expected tenant scope backend")
+		}
+		rt.pool.Invalidate(scope.TenantID)
+		if err := scope.Backend.Store().DB().PingContext(r.Context()); err != nil {
+			t.Fatalf("borrowed backend store should remain usable during request: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/borrow", nil)
+	req.Header.Set("Authorization", "Bearer "+rt.token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
 }

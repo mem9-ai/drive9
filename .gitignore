@@ -37,5 +37,9 @@ dist/
 build/
 tmp/
 /dat9
-dat9-server
+/dat9-server
 .gstack/
+__pycache__/
+
+# Local review artifacts
+second_opinion*

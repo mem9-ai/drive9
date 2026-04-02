@@ -3,8 +3,10 @@ package backend
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/s3client"
@@ -143,6 +145,51 @@ func TestWriteCreateAutoEmbeddingSkipsEmbedTaskEvenWithTextSource(t *testing.T) 
 	}
 }
 
+func TestWriteCreateAutoEmbeddingImageEnqueuesImgExtractTaskWithoutLegacyQueue(t *testing.T) {
+	extractor := &gatedImageExtractor{started: make(chan struct{}, 1), release: make(chan struct{})}
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: extractor,
+		},
+	})
+	if _, err := b.Write("/img/create-auto.png", []byte("fake-png"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-extractor.started:
+		close(extractor.release)
+		t.Fatal("legacy image queue should stay idle for auto create path")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	fileID, revision, embeddingRevision, _ := mustFileForPath(t, b, "/img/create-auto.png")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	if embeddingRevision != nil {
+		t.Fatalf("embedding revision should remain nil before durable worker, got %v", *embeddingRevision)
+	}
+	nf, err := b.Store().Stat(context.Background(), "/img/create-auto.png")
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat /img/create-auto.png: %v", err)
+	}
+	if nf.File.ContentText != "" {
+		t.Fatalf("content_text=%q, want empty before durable worker", nf.File.ContentText)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+	if tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) || tasks[0].Status != string(semantic.TaskQueued) || tasks[0].ResourceVersion != 1 {
+		t.Fatalf("unexpected semantic task: %+v", tasks[0])
+	}
+}
+
 func TestWriteOverwriteEnqueuesNextRevisionAndClearsEmbeddingState(t *testing.T) {
 	b := newTestBackend(t)
 	if _, err := b.Write("/f.txt", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -221,6 +268,54 @@ func TestWriteOverwriteAutoEmbeddingSkipsEmbedTaskAndPreservesEmbeddingState(t *
 	tasks := loadSemanticTasksForFile(t, b, fileID)
 	if len(tasks) != 0 {
 		t.Fatalf("semantic task count=%d, want 0", len(tasks))
+	}
+}
+
+func TestWriteOverwriteAutoEmbeddingImageEnqueuesImgExtractTaskWithoutLegacyQueue(t *testing.T) {
+	extractor := &gatedImageExtractor{started: make(chan struct{}, 1), release: make(chan struct{})}
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: extractor,
+		},
+	})
+	fileID := insertImageFileForExtractTest(t, b, "/img/overwrite-auto.png", "image/png", []byte("old-image"))
+	setStoredEmbeddingState(t, b, fileID, 1)
+
+	if _, err := b.Write("/img/overwrite-auto.png", []byte("new-image"), 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-extractor.started:
+		close(extractor.release)
+		t.Fatal("legacy image queue should stay idle for auto overwrite path")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	_, revision, embeddingRevision, _ := mustFileForPath(t, b, "/img/overwrite-auto.png")
+	if revision != 2 {
+		t.Fatalf("revision=%d, want 2", revision)
+	}
+	if embeddingRevision == nil || *embeddingRevision != 1 {
+		t.Fatalf("embedding revision should be preserved, got %v", embeddingRevision)
+	}
+	nf, err := b.Store().Stat(context.Background(), "/img/overwrite-auto.png")
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat /img/overwrite-auto.png: %v", err)
+	}
+	if nf.File.ContentText != "" {
+		t.Fatalf("content_text=%q, want empty before durable worker", nf.File.ContentText)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+	if tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) || tasks[0].Status != string(semantic.TaskQueued) || tasks[0].ResourceVersion != 2 {
+		t.Fatalf("unexpected semantic task: %+v", tasks[0])
 	}
 }
 
@@ -399,6 +494,143 @@ func TestConfirmUploadOverwriteAutoEmbeddingSkipsEmbedTaskAndPreservesEmbeddingS
 	}
 }
 
+func TestConfirmUploadAutoEmbeddingImageEnqueuesImgExtractTaskWithoutLegacyQueue(t *testing.T) {
+	extractor := &gatedImageExtractor{started: make(chan struct{}, 1), release: make(chan struct{})}
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: extractor,
+		},
+	})
+	ctx := context.Background()
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUpload(ctx, "/img/upload-auto.png", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadAllPartsForPlan(t, b, plan, plan.UploadID, totalSize)
+
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-extractor.started:
+		close(extractor.release)
+		t.Fatal("legacy image queue should stay idle for auto upload create path")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	fileID, revision, embeddingRevision, contentType := mustFileForPath(t, b, "/img/upload-auto.png")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	if embeddingRevision != nil {
+		t.Fatalf("embedding revision should be nil before durable worker, got %v", *embeddingRevision)
+	}
+	if contentType != detectContentType("/img/upload-auto.png", nil) {
+		t.Fatalf("content_type=%q, want %q", contentType, detectContentType("/img/upload-auto.png", nil))
+	}
+	nf, err := b.Store().Stat(ctx, "/img/upload-auto.png")
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat /img/upload-auto.png: %v", err)
+	}
+	if nf.File.ContentText != "" {
+		t.Fatalf("content_text=%q, want empty before durable worker", nf.File.ContentText)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+	if tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) || tasks[0].Status != string(semantic.TaskQueued) || tasks[0].ResourceVersion != 1 {
+		t.Fatalf("unexpected semantic task: %+v", tasks[0])
+	}
+}
+
+func TestConfirmUploadOverwriteAutoEmbeddingImageEnqueuesImgExtractTaskWithoutLegacyQueue(t *testing.T) {
+	extractor := &gatedImageExtractor{started: make(chan struct{}, 1), release: make(chan struct{})}
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: extractor,
+		},
+	})
+	ctx := context.Background()
+	fileID := insertImageFileForExtractTest(t, b, "/img/upload-overwrite-auto.png", "image/png", []byte("old-image"))
+	setStoredEmbeddingState(t, b, fileID, 1)
+
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUpload(ctx, "/img/upload-overwrite-auto.png", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingUpload, err := b.GetUpload(ctx, plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingFileID := pendingUpload.FileID
+	uploadAllPartsForPlan(t, b, plan, plan.UploadID, totalSize)
+
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-extractor.started:
+		close(extractor.release)
+		t.Fatal("legacy image queue should stay idle for auto upload overwrite path")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	confirmedFileID, revision, embeddingRevision, contentType := mustFileForPath(t, b, "/img/upload-overwrite-auto.png")
+	if confirmedFileID != fileID {
+		t.Fatalf("overwrite should preserve inode file_id=%q, got %q", fileID, confirmedFileID)
+	}
+	if revision != 2 {
+		t.Fatalf("revision=%d, want 2", revision)
+	}
+	if embeddingRevision == nil || *embeddingRevision != 1 {
+		t.Fatalf("embedding revision should be preserved, got %v", embeddingRevision)
+	}
+	if contentType != detectContentType("/img/upload-overwrite-auto.png", nil) {
+		t.Fatalf("content_type=%q, want %q", contentType, detectContentType("/img/upload-overwrite-auto.png", nil))
+	}
+	nf, err := b.Store().Stat(ctx, "/img/upload-overwrite-auto.png")
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat /img/upload-overwrite-auto.png: %v", err)
+	}
+	if nf.File.ContentText != "" {
+		t.Fatalf("content_text=%q, want empty before durable worker", nf.File.ContentText)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+	if tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) || tasks[0].Status != string(semantic.TaskQueued) || tasks[0].ResourceVersion != 2 {
+		t.Fatalf("unexpected semantic task: %+v", tasks[0])
+	}
+	upload, err := b.GetUpload(ctx, plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upload.FileID != fileID {
+		t.Fatalf("upload file_id=%q, want surviving inode %q", upload.FileID, fileID)
+	}
+	var deletedStatus string
+	if err := b.Store().DB().QueryRow(`SELECT status FROM files WHERE file_id = ?`, pendingFileID).Scan(&deletedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if deletedStatus != "DELETED" {
+		t.Fatalf("pending upload file status=%q, want DELETED", deletedStatus)
+	}
+}
+
 func TestRenameDoesNotCreateAdditionalSemanticTasks(t *testing.T) {
 	b := newTestBackend(t)
 	if _, err := b.Write("/old.txt", []byte("data"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -464,5 +696,26 @@ func TestShouldEnqueueEmbedForRevisionWithoutTextSource(t *testing.T) {
 	b := newTestBackend(t)
 	if b.shouldEnqueueEmbedForRevision("/bin/a.bin", "application/octet-stream", "") {
 		t.Fatal("generic binary object should not enqueue embed work without text source")
+	}
+}
+
+func TestNewImgExtractTaskCarriesPayloadHints(t *testing.T) {
+	now := time.Now().UTC()
+	task, err := newImgExtractTask("task-1", "file-1", 7, "/img/a.png", "image/png", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.TaskType != semantic.TaskTypeImgExtractText {
+		t.Fatalf("task type=%q, want %q", task.TaskType, semantic.TaskTypeImgExtractText)
+	}
+	if task.ResourceID != "file-1" || task.ResourceVersion != 7 {
+		t.Fatalf("unexpected task identity: %+v", task)
+	}
+	var payload semantic.ImgExtractTaskPayload
+	if err := json.Unmarshal(task.PayloadJSON, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Path != "/img/a.png" || payload.ContentType != "image/png" {
+		t.Fatalf("unexpected payload: %+v", payload)
 	}
 }

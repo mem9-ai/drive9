@@ -10,9 +10,13 @@ import (
 )
 
 func newSemanticTask(taskID, resourceID string, version int64, availableAt, createdAt time.Time) *semantic.Task {
+	return newSemanticTaskOfType(semantic.TaskTypeEmbed, taskID, resourceID, version, availableAt, createdAt)
+}
+
+func newSemanticTaskOfType(taskType semantic.TaskType, taskID, resourceID string, version int64, availableAt, createdAt time.Time) *semantic.Task {
 	return &semantic.Task{
 		TaskID:          taskID,
-		TaskType:        semantic.TaskTypeEmbed,
+		TaskType:        taskType,
 		ResourceID:      resourceID,
 		ResourceVersion: version,
 		Status:          semantic.TaskQueued,
@@ -140,6 +144,98 @@ func TestSemanticTaskClaimOrderByAvailableAtThenCreatedAt(t *testing.T) {
 		if claimed.TaskID != want {
 			t.Fatalf("claimed task=%q, want %q", claimed.TaskID, want)
 		}
+	}
+}
+
+func TestClaimSemanticTaskOfTypesSkipsOlderDisallowedTask(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Unix(1711600350, 0).UTC()
+
+	tasks := []*semantic.Task{
+		newSemanticTaskOfType(semantic.TaskTypeEmbed, "task-embed", "file-embed", 1, base, base),
+		newSemanticTaskOfType(semantic.TaskTypeImgExtractText, "task-img", "file-img", 1, base.Add(time.Second), base.Add(time.Second)),
+	}
+	for _, task := range tasks {
+		if _, err := s.EnqueueSemanticTask(ctx, task); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	claimed, found, err := s.ClaimSemanticTaskOfTypes(ctx, base.Add(5*time.Second), time.Minute, semantic.TaskTypeImgExtractText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected filtered claim to find image task")
+	}
+	if claimed.TaskID != "task-img" {
+		t.Fatalf("claimed task=%q, want %q", claimed.TaskID, "task-img")
+	}
+
+	embed := mustGetSemanticTask(t, s, "task-embed")
+	if embed.Status != semantic.TaskQueued {
+		t.Fatalf("embed task status=%q, want %q", embed.Status, semantic.TaskQueued)
+	}
+}
+
+func TestClaimSemanticTaskOfTypesReturnsNotFoundWhenOnlyDisallowedTasksExist(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Unix(1711600360, 0).UTC()
+
+	if _, err := s.EnqueueSemanticTask(ctx, newSemanticTaskOfType(semantic.TaskTypeEmbed, "task-embed", "file-embed", 1, base, base)); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, found, err := s.ClaimSemanticTaskOfTypes(ctx, base.Add(time.Second), time.Minute, semantic.TaskTypeImgExtractText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatalf("unexpected claimed task: %+v", claimed)
+	}
+
+	task := mustGetSemanticTask(t, s, "task-embed")
+	if task.Status != semantic.TaskQueued {
+		t.Fatalf("task status=%q, want %q", task.Status, semantic.TaskQueued)
+	}
+}
+
+func TestClaimSemanticTaskOfTypesSupportsMultipleTaskTypes(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Unix(1711600370, 0).UTC()
+
+	tasks := []*semantic.Task{
+		newSemanticTaskOfType(semantic.TaskTypeEmbed, "task-embed", "file-embed", 1, base, base),
+		newSemanticTaskOfType(semantic.TaskTypeImgExtractText, "task-img", "file-img", 1, base.Add(time.Second), base.Add(time.Second)),
+	}
+	for _, task := range tasks {
+		if _, err := s.EnqueueSemanticTask(ctx, task); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	claimed, found, err := s.ClaimSemanticTaskOfTypes(ctx, base.Add(5*time.Second), time.Minute, semantic.TaskTypeImgExtractText, semantic.TaskTypeEmbed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected filtered claim to find a task")
+	}
+	if claimed.TaskID != "task-embed" {
+		t.Fatalf("claimed task=%q, want %q", claimed.TaskID, "task-embed")
+	}
+}
+
+func TestClaimSemanticTaskOfTypesRejectsEmptyTaskTypes(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Unix(1711600380, 0).UTC()
+
+	if _, _, err := s.ClaimSemanticTaskOfTypes(ctx, base, time.Minute); err == nil {
+		t.Fatal("expected empty task types to fail")
 	}
 }
 
