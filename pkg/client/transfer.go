@@ -41,7 +41,9 @@ type ProgressFunc func(partNumber, totalParts int, bytesUploaded int64)
 const DefaultSmallFileThreshold = 50_000 // 50,000 bytes — matches embedding model max input characters
 
 // Upload concurrency limits, modeled after db9's memory-bounded approach:
-//   parallelism = min(maxBufferBytes / partSize, maxConcurrency)
+//
+//	parallelism = min(maxBufferBytes / partSize, maxConcurrency)
+//
 // This keeps total in-flight memory bounded regardless of part size.
 const (
 	uploadMaxConcurrency = 16
@@ -57,6 +59,17 @@ func uploadParallelism(partSize int64) int {
 		byMemory = 1
 	}
 	return min(byMemory, uploadMaxConcurrency)
+}
+
+func checksumParallelism(partSize int64, partCount int) int {
+	if partSize <= 0 {
+		partSize = s3client.PartSize
+	}
+	byMemory := int(uploadMaxBufferBytes / partSize)
+	if byMemory < 1 {
+		byMemory = 1
+	}
+	return min(runtime.GOMAXPROCS(0), partCount, byMemory)
 }
 
 // WriteStream uploads data from a reader. For small files (size < threshold),
@@ -220,7 +233,13 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 				}
 				return
 			}
-			data = data[:n]
+			if int64(n) != p.Size {
+				select {
+				case errCh <- fmt.Errorf("short read for part %d: got %d want %d", p.Number, n, p.Size):
+				default:
+				}
+				return
+			}
 
 			_, err = c.uploadOnePart(ctx, p, data)
 			if err != nil {
@@ -644,7 +663,13 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 				}
 				return
 			}
-			data = data[:n]
+			if int64(n) != p.Size {
+				select {
+				case errCh <- fmt.Errorf("short read for part %d at offset %d: got %d want %d", p.Number, offset, n, p.Size):
+				default:
+				}
+				return
+			}
 
 			_, err = c.uploadOnePart(ctx, p, data)
 			if err != nil {
@@ -678,7 +703,7 @@ func computePartChecksumsFromReaderAt(r io.ReaderAt, totalSize int64, partSize i
 	parts := s3client.CalcParts(totalSize, partSize)
 	checksums := make([]string, len(parts))
 	// Cap workers by CPU count, part count, and memory (workers × partSize ≤ 256MB).
-	workers := min(runtime.GOMAXPROCS(0), len(parts), uploadParallelism(partSize))
+	workers := checksumParallelism(partSize, len(parts))
 
 	var wg sync.WaitGroup
 	var firstErr error
