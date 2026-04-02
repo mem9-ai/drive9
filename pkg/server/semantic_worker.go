@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -33,7 +34,12 @@ const (
 
 var semanticWorkerUsesTiDBAutoEmbedding = tenant.UsesTiDBAutoEmbedding
 
-// SemanticWorkerOptions controls background embed task processing.
+var (
+	semanticWorkerAllowedEmbedTaskTypes      = []semantic.TaskType{semantic.TaskTypeEmbed}
+	semanticWorkerAllowedImgExtractTaskTypes = []semantic.TaskType{semantic.TaskTypeImgExtractText}
+)
+
+// SemanticWorkerOptions controls background semantic task processing.
 type SemanticWorkerOptions struct {
 	Workers              int
 	PollInterval         time.Duration
@@ -86,7 +92,6 @@ type semanticWorkerManager struct {
 	inflight   map[string]int
 	processing int
 	rr         int
-	stores     map[string]*datastore.Store
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -98,9 +103,11 @@ type semanticTenantRef struct {
 }
 
 type semanticTarget struct {
-	tenantID string
-	store    *datastore.Store
-	release  func()
+	tenantID         string
+	backend          *backend.Dat9Backend
+	store            *datastore.Store
+	allowedTaskTypes []semantic.TaskType
+	release          func()
 }
 
 type semanticObservationSnapshot struct {
@@ -112,15 +119,23 @@ type semanticObservationSnapshot struct {
 }
 
 func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store, pool *tenant.Pool, embedder embedding.Client, opts SemanticWorkerOptions) *semanticWorkerManager {
-	if embedder == nil {
-		return nil
-	}
 	hasMultiTenant := metaStore != nil && pool != nil
-	if fallback != nil && !hasMultiTenant && fallback.UsesDatabaseAutoEmbedding() {
-		return nil
-	}
 	if fallback == nil && !hasMultiTenant {
 		return nil
+	}
+	hasEmbedHandler := embedder != nil
+	hasImageHandler := (fallback != nil && fallback.SupportsAsyncImageExtract()) || (pool != nil && pool.SupportsAsyncImageExtract())
+	if !hasEmbedHandler && !hasImageHandler {
+		return nil
+	}
+	if fallback != nil && !hasMultiTenant {
+		if fallback.UsesDatabaseAutoEmbedding() {
+			if !fallback.SupportsAsyncImageExtract() {
+				return nil
+			}
+		} else if !hasEmbedHandler {
+			return nil
+		}
 	}
 	opts.normalize()
 	return &semanticWorkerManager{
@@ -130,7 +145,6 @@ func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Sto
 		embedder: embedder,
 		opts:     opts,
 		inflight: make(map[string]int),
-		stores:   make(map[string]*datastore.Store),
 	}
 }
 
@@ -168,10 +182,6 @@ func (m *semanticWorkerManager) Stop() {
 	m.cancel = nil
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for tenantID, store := range m.stores {
-		_ = store.Close()
-		delete(m.stores, tenantID)
-	}
 	m.processing = 0
 	metrics.RecordGauge("semantic_worker", "workers", 0)
 	metrics.RecordGauge("semantic_worker", "inflight", 0)
@@ -222,7 +232,7 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 	defer target.release()
 
 	claimStart := time.Now()
-	task, found, err := target.store.ClaimSemanticTask(ctx, time.Now().UTC(), m.opts.LeaseDuration)
+	task, found, err := target.store.ClaimSemanticTaskOfTypes(ctx, time.Now().UTC(), m.opts.LeaseDuration, target.allowedTaskTypes...)
 	if err != nil {
 		metrics.RecordOperation("semantic_worker", "claim", "error", time.Since(claimStart))
 		logger.Warn(ctx, "semantic_worker_claim_failed",
@@ -230,7 +240,7 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 				zap.String("tenant_id", target.tenantID),
 				zap.String("result", "error"),
 			}, zap.Error(err))...)
-		m.invalidateTenantStore(target.tenantID)
+		m.invalidateTenantBackend(target.tenantID)
 		return false
 	}
 	if !found {
@@ -244,11 +254,11 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 		}, semanticTaskLogFields(task)...)...)
 	m.markProcessingStart()
 	defer m.markProcessingDone()
-	m.processTask(ctx, target.tenantID, target.store, task)
+	m.processTask(ctx, target, task)
 	return true
 }
 
-func (m *semanticWorkerManager) processTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task) {
+func (m *semanticWorkerManager) processTask(ctx context.Context, target *semanticTarget, task *semantic.Task) {
 	if task == nil {
 		return
 	}
@@ -257,7 +267,7 @@ func (m *semanticWorkerManager) processTask(ctx context.Context, tenantID string
 	defer func() {
 		metrics.RecordOperation("semantic_worker", string(task.TaskType), result, time.Since(start))
 	}()
-	result = m.dispatchTask(ctx, tenantID, store, task)
+	result = m.dispatchTask(ctx, target, task)
 }
 
 func (m *semanticWorkerManager) ackTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task, reason string) {
@@ -333,30 +343,33 @@ func (m *semanticWorkerManager) recoverExpired(ctx context.Context) {
 		return
 	}
 	for _, ref := range refs {
-		store, err := m.storeForRef(ctx, ref)
+		target, err := m.targetForRef(ctx, ref)
 		if err != nil {
 			logger.Warn(ctx, "semantic_worker_open_store_for_recovery_failed",
 				zap.String("tenant_id", ref.id),
 				zap.Error(err))
 			continue
 		}
-		start := time.Now()
-		recovered, err := store.RecoverExpiredSemanticTasks(ctx, time.Now().UTC(), 64)
-		if err != nil {
-			metrics.RecordOperation("semantic_worker", "recover", "error", time.Since(start))
-			logger.Warn(ctx, "semantic_worker_recover_failed",
-				zap.String("tenant_id", ref.id),
-				zap.Error(err))
-			m.invalidateTenantStore(ref.id)
-			continue
-		}
-		if recovered > 0 {
-			metrics.RecordOperation("semantic_worker", "recover", "ok", time.Since(start))
-			logger.Info(ctx, "semantic_worker_recover_ok",
-				zap.String("tenant_id", ref.id),
-				zap.String("result", "ok"),
-				zap.Int("recovered", recovered))
-		}
+		func() {
+			defer target.release()
+			start := time.Now()
+			recovered, err := target.store.RecoverExpiredSemanticTasks(ctx, time.Now().UTC(), 64)
+			if err != nil {
+				metrics.RecordOperation("semantic_worker", "recover", "error", time.Since(start))
+				logger.Warn(ctx, "semantic_worker_recover_failed",
+					zap.String("tenant_id", ref.id),
+					zap.Error(err))
+				m.invalidateTenantBackend(ref.id)
+				return
+			}
+			if recovered > 0 {
+				metrics.RecordOperation("semantic_worker", "recover", "ok", time.Since(start))
+				logger.Info(ctx, "semantic_worker_recover_ok",
+					zap.String("tenant_id", ref.id),
+					zap.String("result", "ok"),
+					zap.Int("recovered", recovered))
+			}
+		}()
 	}
 }
 
@@ -374,7 +387,7 @@ func (m *semanticWorkerManager) nextTarget(ctx context.Context) (*semanticTarget
 		if !ok {
 			return nil, nil
 		}
-		store, err := m.storeForRef(ctx, ref)
+		target, err := m.targetForRef(ctx, ref)
 		if err != nil {
 			logger.Warn(ctx, "semantic_worker_open_store_failed",
 				zap.String("tenant_id", ref.id),
@@ -382,13 +395,12 @@ func (m *semanticWorkerManager) nextTarget(ctx context.Context) (*semanticTarget
 			m.releaseTenantSlot(ref.id)
 			continue
 		}
-		return &semanticTarget{
-			tenantID: ref.id,
-			store:    store,
-			release: func() {
-				m.releaseTenantSlot(ref.id)
-			},
-		}, nil
+		target.release = chainReleases(target.release, func() { m.releaseTenantSlot(ref.id) })
+		if len(target.allowedTaskTypes) == 0 {
+			target.release()
+			continue
+		}
+		return target, nil
 	}
 	return nil, nil
 }
@@ -432,80 +444,79 @@ func (m *semanticWorkerManager) listTenantRefs(ctx context.Context) ([]semanticT
 		refs := make([]semanticTenantRef, 0, len(tenants))
 		for i := range tenants {
 			t := tenants[i]
-			if semanticWorkerUsesTiDBAutoEmbedding(t.Provider) {
+			if !m.supportsTenantProvider(t.Provider) {
 				continue
 			}
 			refs = append(refs, semanticTenantRef{id: t.ID, tenant: &t})
 		}
 		return refs, nil
 	}
-	if m.fallback != nil {
+	if m.shouldIncludeFallback() {
 		return []semanticTenantRef{{id: semanticLocalTenantID}}, nil
 	}
 	return nil, nil
 }
 
-func (m *semanticWorkerManager) storeForRef(ctx context.Context, ref semanticTenantRef) (*datastore.Store, error) {
+func (m *semanticWorkerManager) targetForRef(ctx context.Context, ref semanticTenantRef) (*semanticTarget, error) {
 	if ref.id == semanticLocalTenantID {
-		return m.fallback.Store(), nil
+		if m.fallback == nil {
+			return nil, fmt.Errorf("backend missing for %s", ref.id)
+		}
+		return &semanticTarget{
+			tenantID:         ref.id,
+			backend:          m.fallback,
+			store:            m.fallback.Store(),
+			allowedTaskTypes: m.allowedTaskTypesForTarget(m.fallback),
+			release:          func() {},
+		}, nil
 	}
-	m.mu.Lock()
-	if store := m.stores[ref.id]; store != nil {
-		m.mu.Unlock()
-		return store, nil
-	}
-	m.mu.Unlock()
-
 	if ref.tenant == nil {
 		return nil, fmt.Errorf("tenant metadata missing for %s", ref.id)
 	}
-	pass, err := m.pool.Decrypt(ctx, ref.tenant.DBPasswordCipher)
+	b, release, err := m.pool.Acquire(ctx, ref.tenant)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt tenant password: %w", err)
+		return nil, fmt.Errorf("acquire tenant backend: %w", err)
 	}
-	// TODO(async-embedding): This worker runtime path still assumes every tenant
-	// datastore can be opened through the MySQL-oriented datastore.Open + tenantDSN
-	// flow. DB9/Postgres schema support exists at the DDL layer, but end-to-end
-	// runtime support here is not provider-neutral yet.
-	store, err := datastore.Open(tenantDSN(ref.tenant.DBUser, string(pass), ref.tenant.DBHost, ref.tenant.DBPort, ref.tenant.DBName, ref.tenant.DBTLS))
-	if err != nil {
-		return nil, fmt.Errorf("open tenant store: %w", err)
+	if b == nil {
+		release()
+		return nil, fmt.Errorf("backend missing for %s", ref.id)
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if existing := m.stores[ref.id]; existing != nil {
-		_ = store.Close()
-		return existing, nil
-	}
-	m.stores[ref.id] = store
-	return store, nil
+	return &semanticTarget{
+		tenantID:         ref.id,
+		backend:          b,
+		store:            b.Store(),
+		allowedTaskTypes: m.allowedTaskTypesForTarget(b),
+		release:          release,
+	}, nil
 }
 
-func (m *semanticWorkerManager) invalidateTenantStore(tenantID string) {
+func (m *semanticWorkerManager) invalidateTenantBackend(tenantID string) {
 	if tenantID == semanticLocalTenantID {
 		return
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	store := m.stores[tenantID]
-	if store == nil {
+	if m.pool == nil {
 		return
 	}
-	_ = store.Close()
-	delete(m.stores, tenantID)
+	m.pool.Invalidate(tenantID)
 }
 
-func (m *semanticWorkerManager) dispatchTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task) string {
+func (m *semanticWorkerManager) dispatchTask(ctx context.Context, target *semanticTarget, task *semantic.Task) string {
 	switch task.TaskType {
 	case semantic.TaskTypeEmbed:
-		return m.processEmbedTask(ctx, tenantID, store, task)
+		return m.processEmbedTask(ctx, target.tenantID, target.store, task)
+	case semantic.TaskTypeImgExtractText:
+		return m.processImgExtractTask(ctx, target.tenantID, target.store, target.backend, task)
 	default:
-		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("unsupported task type %q", task.TaskType))
+		m.retryTask(ctx, target.tenantID, target.store, task, fmt.Sprintf("unsupported task type %q", task.TaskType))
 		return "unsupported"
 	}
 }
 
 func (m *semanticWorkerManager) processEmbedTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task) string {
+	if m.embedder == nil {
+		m.retryTask(ctx, tenantID, store, task, "embed handler not configured")
+		return "handler_missing"
+	}
 	file, err := store.GetFile(ctx, task.ResourceID)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
@@ -541,6 +552,16 @@ func (m *semanticWorkerManager) processEmbedTask(ctx context.Context, tenantID s
 	}
 	m.ackTask(ctx, tenantID, store, task, "written")
 	return "ok"
+}
+
+func (m *semanticWorkerManager) processImgExtractTask(ctx context.Context, tenantID string, store *datastore.Store, b *backend.Dat9Backend, task *semantic.Task) string {
+	result, err := b.ProcessImageExtractTask(ctx, imageExtractTaskSpecFromSemanticTask(task))
+	if err != nil {
+		m.retryTask(ctx, tenantID, store, task, err.Error())
+		return string(result)
+	}
+	m.ackTask(ctx, tenantID, store, task, string(result))
+	return string(result)
 }
 
 func semanticTaskLogFields(task *semantic.Task) []zap.Field {
@@ -609,28 +630,31 @@ func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time
 
 	var oldest *time.Time
 	for _, ref := range refs {
-		store, err := m.storeForRef(ctx, ref)
+		target, err := m.targetForRef(ctx, ref)
 		if err != nil {
 			logger.Warn(ctx, "semantic_worker_open_store_for_observation_failed",
 				zap.String("tenant_id", ref.id),
 				zap.Error(err))
 			continue
 		}
-		obs, err := store.ObserveSemanticTasks(ctx, now)
-		if err != nil {
-			logger.Warn(ctx, "semantic_worker_observe_failed",
-				zap.String("tenant_id", ref.id),
-				zap.Error(err))
-			m.invalidateTenantStore(ref.id)
-			continue
-		}
-		snapshot.queued += obs.Queued
-		snapshot.processing += obs.Processing
-		snapshot.deadLettered += obs.DeadLettered
-		if obs.OldestClaimableAvailableAt != nil && (oldest == nil || obs.OldestClaimableAvailableAt.Before(*oldest)) {
-			t := obs.OldestClaimableAvailableAt.UTC()
-			oldest = &t
-		}
+		func() {
+			defer target.release()
+			obs, err := target.store.ObserveSemanticTasks(ctx, now)
+			if err != nil {
+				logger.Warn(ctx, "semantic_worker_observe_failed",
+					zap.String("tenant_id", ref.id),
+					zap.Error(err))
+				m.invalidateTenantBackend(ref.id)
+				return
+			}
+			snapshot.queued += obs.Queued
+			snapshot.processing += obs.Processing
+			snapshot.deadLettered += obs.DeadLettered
+			if obs.OldestClaimableAvailableAt != nil && (oldest == nil || obs.OldestClaimableAvailableAt.Before(*oldest)) {
+				t := obs.OldestClaimableAvailableAt.UTC()
+				oldest = &t
+			}
+		}()
 	}
 	if oldest != nil {
 		lag := now.Sub(*oldest).Seconds()
@@ -639,4 +663,78 @@ func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time
 		}
 	}
 	return snapshot
+}
+
+func (m *semanticWorkerManager) hasEmbedHandler() bool {
+	return m != nil && m.embedder != nil
+}
+
+func (m *semanticWorkerManager) hasImageHandler() bool {
+	if m == nil {
+		return false
+	}
+	if m.fallback != nil && m.fallback.SupportsAsyncImageExtract() {
+		return true
+	}
+	return m.pool != nil && m.pool.SupportsAsyncImageExtract()
+}
+
+func (m *semanticWorkerManager) supportsTenantProvider(provider string) bool {
+	if semanticWorkerUsesTiDBAutoEmbedding(provider) {
+		return m.pool != nil && m.pool.SupportsAsyncImageExtract()
+	}
+	return m.hasEmbedHandler()
+}
+
+func (m *semanticWorkerManager) shouldIncludeFallback() bool {
+	if m == nil || m.fallback == nil {
+		return false
+	}
+	if m.fallback.UsesDatabaseAutoEmbedding() {
+		return m.hasImageHandler()
+	}
+	return m.hasEmbedHandler()
+}
+
+func (m *semanticWorkerManager) allowedTaskTypesForTarget(b *backend.Dat9Backend) []semantic.TaskType {
+	if m == nil || b == nil {
+		return nil
+	}
+	if b.UsesDatabaseAutoEmbedding() {
+		if b.SupportsAsyncImageExtract() {
+			return semanticWorkerAllowedImgExtractTaskTypes
+		}
+		return nil
+	}
+	if m.embedder != nil {
+		return semanticWorkerAllowedEmbedTaskTypes
+	}
+	return nil
+}
+
+func imageExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.ImageExtractTaskSpec {
+	if task == nil {
+		return backend.ImageExtractTaskSpec{}
+	}
+	spec := backend.ImageExtractTaskSpec{FileID: task.ResourceID, Revision: task.ResourceVersion}
+	if len(task.PayloadJSON) == 0 {
+		return spec
+	}
+	var payload semantic.ImgExtractTaskPayload
+	if err := json.Unmarshal(task.PayloadJSON, &payload); err == nil {
+		spec.Path = payload.Path
+		spec.ContentType = payload.ContentType
+	}
+	return spec
+}
+
+func chainReleases(first, second func()) func() {
+	return func() {
+		if first != nil {
+			first()
+		}
+		if second != nil {
+			second()
+		}
+	}
 }

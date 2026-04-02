@@ -105,6 +105,9 @@ func main() {
 	if err != nil {
 		die(err)
 	}
+	if strings.TrimSpace(os.Getenv("DAT9_SEMANTIC_LEASE_SECONDS")) == "" {
+		workerOpts.LeaseDuration = defaultSemanticLeaseDurationForLocal(backendOpts.AsyncImageExtract)
+	}
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "build_semantic_worker_config")
 	// Keep the local entrypoint aligned with dat9-server: if only the background
 	// embedder is configured, grep reuses it for app-side query embedding.
@@ -195,7 +198,7 @@ environment:
   DAT9_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
   DAT9_SEMANTIC_WORKERS number of background workers (default: 1)
   DAT9_SEMANTIC_POLL_INTERVAL_MS worker poll interval in milliseconds (default: 200)
-  DAT9_SEMANTIC_LEASE_SECONDS task lease duration in seconds (default: 30)
+  DAT9_SEMANTIC_LEASE_SECONDS task lease duration in seconds (default: 30; when unset and image extraction is enabled, local server uses max(30, 2x image extract timeout))
   DAT9_SEMANTIC_RECOVER_INTERVAL_MS recover sweep interval in milliseconds (default: 5000)
   DAT9_SEMANTIC_RETRY_BASE_MS base retry backoff in milliseconds (default: 200)
   DAT9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
@@ -422,6 +425,20 @@ func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorker
 	logger.Info(context.Background(), "semantic_embedding_mode_openai_compatible",
 		zap.String("model", model), zap.String("base_url", baseURL))
 	return client, opts, nil
+}
+
+func defaultSemanticLeaseDurationForLocal(async backend.AsyncImageExtractOptions) time.Duration {
+	lease := 30 * time.Second
+	if !async.Enabled || async.TaskTimeout <= 0 {
+		return lease
+	}
+	derived := async.TaskTimeout * 2
+	if derived > lease {
+		lease = derived
+	}
+	// TODO: Add semantic task lease renewal for long-running work, then revisit
+	// whether this conservative default lease multiplier is still necessary.
+	return lease
 }
 
 func redactDSN(dsn string) string {

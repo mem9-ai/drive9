@@ -47,7 +47,7 @@ type Dat9Backend struct {
 	// Async image -> text extraction worker (in-memory queue for P0).
 	imageExtractEnabled bool
 	imageExtractor      ImageTextExtractor
-	imageExtractQueue   chan imageExtractTask
+	imageExtractQueue   chan ImageExtractTaskSpec
 	imageExtractWG      sync.WaitGroup
 	imageExtractCancel  context.CancelFunc
 	imageExtractTimeout time.Duration
@@ -355,7 +355,13 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}); err != nil {
 			return err
 		}
-		if !b.UsesDatabaseAutoEmbedding() && b.shouldEnqueueEmbedForRevision(path, contentType, contentText) {
+		if b.UsesDatabaseAutoEmbedding() {
+			if b.hasAsyncImageTextSource(path, contentType) {
+				return b.enqueueImgExtractTaskTx(tx, fileID, 1, path, contentType)
+			}
+			return nil
+		}
+		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText) {
 			return b.enqueueEmbedTaskTx(tx, fileID, 1)
 		}
 		return nil
@@ -364,6 +370,12 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			b.deleteBlobCtx(ctx, storageRef)
 		}
 		return 0, err
+	}
+	// Temporary compatibility: app embedding still relies on the legacy
+	// backend-owned image queue until its image task flow also moves to
+	// semantic_tasks.
+	if b.UsesDatabaseAutoEmbedding() {
+		return int64(len(data)), nil
 	}
 	b.enqueueImageExtract(fileID, path, contentType, 1)
 	return int64(len(data)), nil
@@ -435,7 +447,13 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		if txErr != nil {
 			return txErr
 		}
-		if !b.UsesDatabaseAutoEmbedding() && b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText) {
+		if b.UsesDatabaseAutoEmbedding() {
+			if b.hasAsyncImageTextSource(nf.Node.Path, contentType) {
+				return b.enqueueImgExtractTaskTx(tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
+			}
+			return nil
+		}
+		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText) {
 			return b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
 		}
 		return nil
@@ -447,6 +465,12 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		return 0, err
 	}
 	b.deleteBlobIfS3Ctx(ctx, nf.File.StorageType, nf.File.StorageRef, storageRef)
+	// Temporary compatibility: app embedding still relies on the legacy
+	// backend-owned image queue until its image task flow also moves to
+	// semantic_tasks.
+	if b.UsesDatabaseAutoEmbedding() {
+		return int64(len(data)), nil
+	}
 	b.enqueueImageExtract(nf.File.FileID, nf.Node.Path, contentType, newRev)
 	return int64(len(data)), nil
 }
