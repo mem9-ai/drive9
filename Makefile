@@ -25,6 +25,7 @@ IMAGE_REPO ?= dat9-server
 IMAGE_TAG ?= latest
 IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
 LINT_TIMEOUT ?= 10m
+TEST_P ?=
 
 .PHONY: mod test test-podman fmt lint install-lint build build-server build-cli run-server-local docker-build
 
@@ -34,13 +35,19 @@ mod:
 
 # Run all tests. MySQL-backed suites reuse DAT9_MYSQL_DSN when provided. When
 # it is unset and podman is available locally, automatically configure the
-# podman-backed testcontainers environment before running go test.
+# podman-backed testcontainers environment before running go test. Set TEST_P
+# to pass `-p <value>` to `go test`; by default package parallelism is not
+# limited.
 test:
 	@set -euo pipefail; \
+	test_p_flag=""; \
+	if [ -n "$(TEST_P)" ]; then \
+		test_p_flag="-p $(TEST_P)"; \
+	fi; \
 	if [ -z "$${DAT9_MYSQL_DSN:-}" ] && command -v podman >/dev/null 2>&1; then \
 		source ./scripts/test-podman.sh; \
 	fi; \
-	$(GO) test -p 1 -v ./...
+	$(GO) test $$test_p_flag -v ./...
 
 fmt:
 	$(MAKE) install-lint
