@@ -1254,18 +1254,6 @@ func mustServerImageFileID(t *testing.T, b *backend.Dat9Backend, path, contentTy
 	return fileID
 }
 
-func mustParseMySQLDBName(t *testing.T, dsn string) string {
-	t.Helper()
-	parsed, err := mysql.ParseDSN(dsn)
-	if err != nil {
-		t.Fatalf("parse dsn %q: %v", dsn, err)
-	}
-	if strings.TrimSpace(parsed.DBName) == "" {
-		t.Fatalf("dsn %q missing db name", dsn)
-	}
-	return parsed.DBName
-}
-
 func waitForContentTextOnServer(t *testing.T, b *backend.Dat9Backend, path, wantSubstring string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
