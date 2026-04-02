@@ -90,7 +90,7 @@ Background Embed Path
 ---------------------
 SemanticWorkerManager
     -> choose tenant store (local fallback or active tenant round-robin)
-    -> ClaimSemanticTask(...)
+    -> ClaimSemanticTask(..., taskTypes...)
     -> GetFile(resource_id)
     -> if missing / stale / empty: ack obsolete task
     -> embed file.ContentText
