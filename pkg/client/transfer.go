@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -39,6 +40,25 @@ type ProgressFunc func(partNumber, totalParts int, bytesUploaded int64)
 // DefaultSmallFileThreshold matches the server's threshold for direct PUT vs multipart.
 const DefaultSmallFileThreshold = 50_000 // 50,000 bytes — matches embedding model max input characters
 
+// Upload concurrency limits, modeled after db9's memory-bounded approach:
+//   parallelism = min(maxBufferBytes / partSize, maxConcurrency)
+// This keeps total in-flight memory bounded regardless of part size.
+const (
+	uploadMaxConcurrency = 16
+	uploadMaxBufferBytes = 256 * 1024 * 1024 // 256 MB
+)
+
+func uploadParallelism(partSize int64) int {
+	if partSize <= 0 {
+		partSize = s3client.PartSize
+	}
+	byMemory := int(uploadMaxBufferBytes / partSize)
+	if byMemory < 1 {
+		byMemory = 1
+	}
+	return min(byMemory, uploadMaxConcurrency)
+}
+
 // WriteStream uploads data from a reader. For small files (size < threshold),
 // it does a direct PUT with body. For large files, it sends a Content-Length-only
 // PUT to get a 202 with presigned URLs, then uploads parts concurrently.
@@ -67,7 +87,7 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 	if err != nil {
 		return err
 	}
-	return c.uploadParts(ctx, plan, r, progress)
+	return c.uploadParts(ctx, plan, ra, progress)
 }
 
 type uploadInitiateRequest struct {
@@ -153,25 +173,24 @@ func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int
 }
 
 // uploadParts concurrently uploads parts to presigned URLs.
-// Part data is read sequentially from r, but uploads run concurrently
+// Each goroutine reads its part directly via ReaderAt (parallel disk reads),
 // with at most maxConcurrency in-flight to bound memory usage.
-func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, r io.Reader, progress ProgressFunc) error {
-	const maxConcurrency = 4
+func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderAt, progress ProgressFunc) error {
+	stdPartSize := plan.PartSize
+	if stdPartSize <= 0 && len(plan.Parts) > 0 {
+		stdPartSize = plan.Parts[0].Size
+	}
+	if stdPartSize <= 0 {
+		stdPartSize = s3client.PartSize
+	}
+	maxConcurrency := uploadParallelism(stdPartSize)
 
 	errCh := make(chan error, 1)
 	sem := make(chan struct{}, maxConcurrency)
 	var wg sync.WaitGroup
 
 	for _, part := range plan.Parts {
-		// Acquire semaphore before reading so we hold at most maxConcurrency buffers
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			wg.Wait()
-			return ctx.Err()
-		}
-
-		// Check for prior upload errors before reading more data
+		// Check for prior upload errors before spawning more work
 		select {
 		case err := <-errCh:
 			wg.Wait()
@@ -179,21 +198,31 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, r io.Reader, 
 		default:
 		}
 
-		partData := make([]byte, part.Size)
-		n, err := io.ReadFull(r, partData)
-		if err != nil && err != io.ErrUnexpectedEOF {
-			<-sem
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
 			wg.Wait()
-			return fmt.Errorf("read part %d: %w", part.Number, err)
+			return ctx.Err()
 		}
-		partData = partData[:n]
 
 		wg.Add(1)
-		go func(p PartURL, data []byte) {
+		go func(p PartURL) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			_, err := c.uploadOnePart(ctx, p, data)
+			data := make([]byte, p.Size)
+			offset := int64(p.Number-1) * stdPartSize
+			n, err := ra.ReadAt(data, offset)
+			if err != nil && err != io.EOF {
+				select {
+				case errCh <- fmt.Errorf("read part %d: %w", p.Number, err):
+				default:
+				}
+				return
+			}
+			data = data[:n]
+
+			_, err = c.uploadOnePart(ctx, p, data)
 			if err != nil {
 				select {
 				case errCh <- fmt.Errorf("part %d: %w", p.Number, err):
@@ -205,7 +234,7 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, r io.Reader, 
 			if progress != nil {
 				progress(p.Number, len(plan.Parts), int64(len(data)))
 			}
-		}(part, partData)
+		}(part)
 	}
 
 	wg.Wait()
@@ -221,10 +250,11 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, r io.Reader, 
 
 // uploadOnePart PUTs data to a presigned URL and returns the ETag.
 func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (string, error) {
-	h := sha256.Sum256(data)
-	checksum := base64.StdEncoding.EncodeToString(h[:])
-	if part.ChecksumSHA256 != "" && part.ChecksumSHA256 != checksum {
-		return "", fmt.Errorf("checksum mismatch for part %d", part.Number)
+	checksum := part.ChecksumSHA256
+	if checksum == "" {
+		// No pre-computed checksum (legacy path) — compute it now.
+		h := sha256.Sum256(data)
+		checksum = base64.StdEncoding.EncodeToString(h[:])
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, part.URL, bytes.NewReader(data))
@@ -574,29 +604,17 @@ func (c *Client) requestResumeLegacy(ctx context.Context, uploadID string, check
 
 // uploadMissingParts uploads parts from a ReaderAt (random access for resume).
 func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.ReaderAt, totalParts int, progress ProgressFunc) error {
-	const maxConcurrency = 4
-	sem := make(chan struct{}, maxConcurrency)
-	errCh := make(chan error, 1)
-	var wg sync.WaitGroup
-
 	// Use plan's part size for offset calculation; fall back to default
 	stdPartSize := plan.PartSize
 	if stdPartSize <= 0 {
 		stdPartSize = s3client.PartSize
 	}
+	maxConcurrency := uploadParallelism(stdPartSize)
+	sem := make(chan struct{}, maxConcurrency)
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
 
-	parts := plan.Parts
-
-	for _, part := range parts {
-		// Acquire semaphore before reading so we hold at most maxConcurrency buffers
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			wg.Wait()
-			return ctx.Err()
-		}
-
-		// Check for prior upload errors before reading more data
+	for _, part := range plan.Parts {
 		select {
 		case err := <-errCh:
 			wg.Wait()
@@ -604,22 +622,31 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 		default:
 		}
 
-		data := make([]byte, part.Size)
-		offset := int64(part.Number-1) * stdPartSize
-		n, err := r.ReadAt(data, offset)
-		if err != nil && err != io.EOF {
-			<-sem
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
 			wg.Wait()
-			return fmt.Errorf("read part %d at offset %d: %w", part.Number, offset, err)
+			return ctx.Err()
 		}
-		data = data[:n]
 
 		wg.Add(1)
-		go func(p PartURL, d []byte) {
+		go func(p PartURL) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			_, err := c.uploadOnePart(ctx, p, d)
+			data := make([]byte, p.Size)
+			offset := int64(p.Number-1) * stdPartSize
+			n, err := r.ReadAt(data, offset)
+			if err != nil && err != io.EOF {
+				select {
+				case errCh <- fmt.Errorf("read part %d at offset %d: %w", p.Number, offset, err):
+				default:
+				}
+				return
+			}
+			data = data[:n]
+
+			_, err = c.uploadOnePart(ctx, p, data)
 			if err != nil {
 				select {
 				case errCh <- fmt.Errorf("part %d: %w", p.Number, err):
@@ -628,9 +655,9 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 				return
 			}
 			if progress != nil {
-				progress(p.Number, totalParts, int64(len(d)))
+				progress(p.Number, totalParts, int64(len(data)))
 			}
-		}(part, data)
+		}(part)
 	}
 
 	wg.Wait()
@@ -649,19 +676,49 @@ func computePartChecksumsFromReaderAt(r io.ReaderAt, totalSize int64, partSize i
 		return nil, nil
 	}
 	parts := s3client.CalcParts(totalSize, partSize)
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		buf := make([]byte, p.Size)
-		offset := int64(p.Number-1) * partSize
-		n, err := r.ReadAt(buf, offset)
-		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("read part %d: %w", p.Number, err)
-		}
-		if int64(n) != p.Size {
-			return nil, fmt.Errorf("short read for part %d: got %d want %d", p.Number, n, p.Size)
-		}
-		h := sha256.Sum256(buf)
-		out = append(out, base64.StdEncoding.EncodeToString(h[:]))
+	checksums := make([]string, len(parts))
+	// Cap workers by CPU count, part count, and memory (workers × partSize ≤ 256MB).
+	workers := min(runtime.GOMAXPROCS(0), len(parts), uploadParallelism(partSize))
+
+	var wg sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
+	partCh := make(chan int, len(parts))
+
+	for i := range parts {
+		partCh <- i
 	}
-	return out, nil
+	close(partCh)
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, partSize)
+			for i := range partCh {
+				p := parts[i]
+				data := buf[:p.Size]
+				offset := int64(p.Number-1) * partSize
+				n, err := r.ReadAt(data, offset)
+				if err != nil && err != io.EOF {
+					errOnce.Do(func() { firstErr = fmt.Errorf("read part %d: %w", p.Number, err) })
+					return
+				}
+				if int64(n) != p.Size {
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("short read for part %d: got %d want %d", p.Number, n, p.Size)
+					})
+					return
+				}
+				h := sha256.Sum256(data)
+				checksums[i] = base64.StdEncoding.EncodeToString(h[:])
+			}
+		}()
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return checksums, nil
 }

@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Client is the dat9 HTTP client.
@@ -23,10 +25,25 @@ type Client struct {
 
 // New creates a new dat9 client.
 func New(baseURL, apiKey string) *Client {
+	// Transport tuned for concurrent multipart uploads to S3.
+	// Default MaxIdleConnsPerHost=2 forces new TLS handshakes for every
+	// part beyond 2 in-flight, adding ~50-100ms per part. Setting it to
+	// 16 lets the connection pool cover typical upload parallelism.
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 16,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
 		httpClient: &http.Client{
+			Transport: transport,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if len(via) > 0 && req.URL.Host != via[0].URL.Host {
 					req.Header.Del("Authorization")
