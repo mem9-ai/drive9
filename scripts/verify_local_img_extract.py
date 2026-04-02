@@ -4,7 +4,7 @@
 
 This script exercises two end-to-end paths:
 
-1. Small direct PUT to `/v1/fs/<path>.png`
+1. Direct PUT to `/v1/fs/<path>`
 2. Multipart upload via `/v1/uploads/initiate` -> S3 part PUTs -> `/complete`
 
 For each path it waits until:
@@ -21,6 +21,8 @@ import argparse
 import base64
 import hashlib
 import json
+import os
+from pathlib import Path
 import sys
 import time
 import urllib.request
@@ -146,14 +148,64 @@ class Verifier:
             f"timed out waiting for durable img_extract_text success for {path}; last rows: {json.dumps(last_rows, ensure_ascii=False)}"
         )
 
-    def verify_direct_put(self, path: str) -> VerificationResult:
+    def calc_part_checksums(self, payload: bytes) -> list[str]:
+        checksums = []
+        for start in range(0, len(payload), PART_SIZE):
+            chunk = payload[start : start + PART_SIZE]
+            checksums.append(base64.b64encode(hashlib.sha256(chunk).digest()).decode())
+        return checksums
+
+    def upload_parts_from_plan(self, plan: dict[str, Any], payload: bytes) -> None:
+        for part in plan["parts"]:
+            number = int(part["number"])
+            start = (number - 1) * int(plan["part_size"])
+            chunk = payload[start : start + int(part["size"])]
+            headers = {k: str(v) for k, v in (part.get("headers") or {}).items()}
+            headers["Content-Length"] = str(len(chunk))
+            req = urllib.request.Request(
+                part["url"], data=chunk, method="PUT", headers=headers
+            )
+            with urllib.request.urlopen(
+                req, timeout=max(self.timeout_seconds, 60)
+            ) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(
+                        f"multipart part {number} upload failed with status {resp.status}"
+                    )
+
+    def complete_upload(self, upload_id: str, path: str) -> None:
+        complete_status, complete_body = self.request_status(
+            "POST",
+            f"/v1/uploads/{upload_id}/complete",
+            payload=b"",
+        )
+        if complete_status != 200:
+            raise RuntimeError(
+                f"multipart complete failed for {path}: status={complete_status}, body={complete_body.decode(errors='replace')}"
+            )
+
+    def verify_direct_put_bytes(self, path: str, payload: bytes) -> VerificationResult:
+        checksums = self.calc_part_checksums(payload)
         status, body = self.request_status(
             "PUT",
             "/v1/fs" + path,
-            payload=b"fake-png",
-            headers={"Content-Length": str(len(b"fake-png"))},
+            payload=payload,
+            headers={
+                "Content-Length": str(len(payload)),
+                "X-Dat9-Part-Checksums": ",".join(checksums),
+            },
         )
-        if status != 200:
+        if status == 202:
+            plan = json.loads(body.decode())
+            if (
+                not isinstance(plan, dict)
+                or not plan.get("upload_id")
+                or not plan.get("parts")
+            ):
+                raise RuntimeError(f"unexpected PUT upload plan payload: {plan!r}")
+            self.upload_parts_from_plan(plan, payload)
+            self.complete_upload(str(plan["upload_id"]), path)
+        elif status != 200:
             raise RuntimeError(
                 f"direct PUT failed for {path}: status={status}, body={body.decode(errors='replace')}"
             )
@@ -161,14 +213,9 @@ class Verifier:
         result.flow = "direct_put"
         return result
 
-    def verify_multipart(self, path: str, total_size: int) -> VerificationResult:
-        body = b"fake-png-multipart-" + (
-            b"z" * (total_size - len(b"fake-png-multipart-"))
-        )
-        checksums = []
-        for start in range(0, len(body), PART_SIZE):
-            chunk = body[start : start + PART_SIZE]
-            checksums.append(base64.b64encode(hashlib.sha256(chunk).digest()).decode())
+    def verify_multipart(self, path: str, payload: bytes) -> VerificationResult:
+        body = payload
+        checksums = self.calc_part_checksums(body)
 
         initiate_payload = json.dumps(
             {
@@ -190,41 +237,37 @@ class Verifier:
         ):
             raise RuntimeError(f"unexpected multipart initiate payload: {plan!r}")
 
-        for part in plan["parts"]:
-            number = int(part["number"])
-            start = (number - 1) * int(plan["part_size"])
-            chunk = body[start : start + int(part["size"])]
-            headers = {k: str(v) for k, v in (part.get("headers") or {}).items()}
-            headers["Content-Length"] = str(len(chunk))
-            req = urllib.request.Request(
-                part["url"], data=chunk, method="PUT", headers=headers
-            )
-            with urllib.request.urlopen(
-                req, timeout=max(self.timeout_seconds, 60)
-            ) as resp:
-                if resp.status != 200:
-                    raise RuntimeError(
-                        f"multipart part {number} upload failed with status {resp.status}"
-                    )
-
-        complete_status, complete_body = self.request_status(
-            "POST",
-            f"/v1/uploads/{plan['upload_id']}/complete",
-            payload=b"",
-        )
-        if complete_status != 200:
-            raise RuntimeError(
-                f"multipart complete failed for {path}: status={complete_status}, body={complete_body.decode(errors='replace')}"
-            )
+        self.upload_parts_from_plan(plan, body)
+        self.complete_upload(str(plan["upload_id"]), path)
 
         result = self.wait_for_img_extract_success(path)
         result.flow = "multipart"
         return result
 
 
-def make_unique_path(prefix: str) -> str:
+def normalize_remote_path(remote_path: str) -> str:
+    remote_path = remote_path.strip()
+    if not remote_path:
+        raise ValueError("remote path must not be empty")
+    if not remote_path.startswith("/"):
+        remote_path = "/" + remote_path
+    return remote_path
+
+
+def make_unique_path_like(prefix: str, source_name: str) -> str:
     suffix = uuid.uuid4().hex[:10]
-    return f"/{prefix}-{suffix}.png"
+    ext = Path(source_name).suffix or ".png"
+    return f"/{prefix}-{suffix}{ext}"
+
+
+def load_image_bytes(path: str) -> bytes:
+    file_path = Path(path).expanduser().resolve()
+    if not file_path.is_file():
+        raise FileNotFoundError(f"image file not found: {file_path}")
+    data = file_path.read_bytes()
+    if not data:
+        raise ValueError(f"image file is empty: {file_path}")
+    return data
 
 
 def print_result(result: VerificationResult) -> None:
@@ -264,13 +307,19 @@ def parse_args() -> argparse.Namespace:
         help="poll interval while waiting for task completion",
     )
     parser.add_argument(
-        "--multipart-size-bytes",
-        type=int,
-        default=(1 << 20) + 1024,
-        help=(
-            "multipart payload size; default stays above the 1 MiB multipart threshold "
-            "but below the default 8 MiB image extract max"
-        ),
+        "--image",
+        default="",
+        help="real image file to upload for both flows; if unset, the script uses built-in fake bytes",
+    )
+    parser.add_argument(
+        "--direct-image",
+        default="",
+        help="optional image file used only for the direct PUT flow",
+    )
+    parser.add_argument(
+        "--multipart-image",
+        default="",
+        help="optional image file used only for the multipart flow",
     )
     parser.add_argument(
         "--direct-path", default="", help="optional fixed path for the direct PUT flow"
@@ -280,20 +329,56 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="optional fixed path for the multipart flow",
     )
+    parser.add_argument(
+        "--skip-direct",
+        action="store_true",
+        help="skip the direct PUT flow",
+    )
+    parser.add_argument(
+        "--skip-multipart",
+        action="store_true",
+        help="skip the multipart flow",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.skip_direct and args.skip_multipart:
+        raise ValueError("cannot skip both direct and multipart flows")
+
     verifier = Verifier(args.base_url, args.timeout_seconds, args.poll_interval_seconds)
 
-    direct_path = args.direct_path or make_unique_path("verify-direct")
-    multipart_path = args.multipart_path or make_unique_path("verify-multipart")
+    direct_image = args.direct_image or args.image
+    multipart_image = args.multipart_image or args.image
+
+    direct_payload = load_image_bytes(direct_image) if direct_image else b"fake-png"
+    multipart_payload = (
+        load_image_bytes(multipart_image) if multipart_image else b"fake-png-multipart"
+    )
+
+    direct_source_name = direct_image or "fake-direct.png"
+    multipart_source_name = multipart_image or "fake-multipart.png"
+
+    direct_path = (
+        normalize_remote_path(args.direct_path)
+        if args.direct_path
+        else make_unique_path_like("verify-direct", direct_source_name)
+    )
+    multipart_path = (
+        normalize_remote_path(args.multipart_path)
+        if args.multipart_path
+        else make_unique_path_like("verify-multipart", multipart_source_name)
+    )
 
     print(
         json.dumps(
             {
                 "base_url": args.base_url,
+                "direct_image": os.path.abspath(direct_image) if direct_image else None,
+                "multipart_image": os.path.abspath(multipart_image)
+                if multipart_image
+                else None,
                 "direct_path": direct_path,
                 "multipart_path": multipart_path,
             },
@@ -301,13 +386,13 @@ def main() -> int:
         )
     )
 
-    direct_result = verifier.verify_direct_put(direct_path)
-    print_result(direct_result)
+    if not args.skip_direct:
+        direct_result = verifier.verify_direct_put_bytes(direct_path, direct_payload)
+        print_result(direct_result)
 
-    multipart_result = verifier.verify_multipart(
-        multipart_path, args.multipart_size_bytes
-    )
-    print_result(multipart_result)
+    if not args.skip_multipart:
+        multipart_result = verifier.verify_multipart(multipart_path, multipart_payload)
+        print_result(multipart_result)
 
     return 0
 
