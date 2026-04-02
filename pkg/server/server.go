@@ -137,7 +137,22 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
 	if s.semanticWorker != nil {
+		logger.Info("server_semantic_workers_enabled",
+			zap.Int("workers", s.semanticWorker.opts.Workers),
+			zap.Duration("poll_interval", s.semanticWorker.opts.PollInterval),
+			zap.Duration("lease_duration", s.semanticWorker.opts.LeaseDuration),
+			zap.Duration("recover_interval", s.semanticWorker.opts.RecoverInterval),
+			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
+			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
+			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()))
 		s.semanticWorker.Start(backgroundWithTrace(context.Background()))
+	} else {
+		logger.Info("server_semantic_workers_disabled",
+			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
+			zap.Bool("fallback_present", cfg.Backend != nil),
+			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
+			zap.Bool("pool_present", cfg.Pool != nil),
+			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()))
 	}
 	return s
 }

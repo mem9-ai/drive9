@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/embedding"
@@ -93,7 +94,12 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 		go b.runImageExtractWorker(ctx, i+1)
 	}
 	logger.Info(ctx, "backend_image_extract_workers_started",
-		zap.Int("workers", cfg.Workers), zap.Int("queue_size", cfg.QueueSize))
+		zap.Int("workers", cfg.Workers),
+		zap.Int("queue_size", cfg.QueueSize),
+		zap.Duration("task_timeout", cfg.TaskTimeout),
+		zap.Int64("max_image_bytes", cfg.MaxImageBytes),
+		zap.Int("max_extract_text_bytes", cfg.MaxExtractTextBytes),
+		zap.String("extractor_type", fmt.Sprintf("%T", cfg.Extractor)))
 }
 
 // Close stops background workers owned by this backend instance.
