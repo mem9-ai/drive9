@@ -255,7 +255,7 @@ Tenant scan should also be grouped by handler capability:
 - When only `img_extract_text` exists: scan only auto embedding tenants and the local auto fallback backend
 - When both exist: scan both sets
 
-`ClaimSemanticTask(...)` does not filter by `task_type`, see `pkg/datastore/semantic_tasks.go:227`. If an img-only worker scans an app tenant, it may claim an `embed` task first, and unsupported task types are retried as unsupported, see `pkg/server/semantic_worker.go:498`. Therefore, “img-only worker scans only auto stores” is not an optimization; it is a correctness precondition for Phase 1.
+`ClaimSemanticTask(..., taskTypes...)` can restrict claims by `task_type`, and leaving `taskTypes` empty means “claim any task”. If an img-only worker scans an app tenant without passing `img_extract_text` as an allowed type, it may claim an `embed` task first, and unsupported task types are retried as unsupported, see `pkg/server/semantic_worker.go:503`. Therefore, “img-only worker scans only auto stores” is not just an optimization; it remains a correctness precondition for Phase 1.
 
 As a rollout precondition, any store cut over to an `img_extract_text`-only handler must not have pending app-side `embed` backlog. Otherwise, even with correct scan scope, the worker may still claim historical `embed` tasks within the same store. Such stores must either be drained first or excluded from the Phase 1 cutover set.
 

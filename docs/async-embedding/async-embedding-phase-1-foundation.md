@@ -298,7 +298,7 @@ type ClaimResult struct {
 Corresponding methods in `pkg/datastore` are recommended as:
 
 - `EnqueueSemanticTask(ctx, task) (created bool, err error)`
-- `ClaimSemanticTask(ctx, now, leaseDuration) (*semantic.Task, bool, error)`
+- `ClaimSemanticTask(ctx, now, leaseDuration, taskTypes...) (*semantic.Task, bool, error)`
 - `AckSemanticTask(ctx, taskID, receipt) error`
 - `RetrySemanticTask(ctx, taskID, receipt, retryAt, lastErr) error`
 - `RecoverExpiredSemanticTasks(ctx, now, limit) (int, error)`
@@ -306,7 +306,7 @@ Corresponding methods in `pkg/datastore` are recommended as:
 Among them:
 
 - `Enqueue` uses the unique key `(task_type, resource_id, resource_version)` for dedupe; duplicate enqueue returns `created=false`, not an error
-- `Claim` uses `FOR UPDATE SKIP LOCKED`, sets `status=processing`, a new `receipt`, `leased_at`, `lease_until`, and increments `attempt_count` at claim time
+- `Claim` uses `FOR UPDATE SKIP LOCKED`, sets `status=processing`, a new `receipt`, `leased_at`, `lease_until`, and increments `attempt_count` at claim time; an empty `taskTypes` filter means “claim any task type”
 - `Ack` accepts only the current receipt; on success it changes status to `succeeded` and writes `completed_at`
 - `Retry` accepts only the current receipt; when not dead-lettered, it resets status to `queued` and updates `available_at` and `last_error`
 - `RecoverExpired` only handles tasks where `status=processing` and `lease_until < now`, resetting them to `queued` and clearing receipt/lease fields

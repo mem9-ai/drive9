@@ -232,7 +232,7 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 	defer target.release()
 
 	claimStart := time.Now()
-	task, found, err := target.store.ClaimSemanticTaskOfTypes(ctx, time.Now().UTC(), m.opts.LeaseDuration, target.allowedTaskTypes...)
+	task, found, err := target.store.ClaimSemanticTask(ctx, time.Now().UTC(), m.opts.LeaseDuration, target.allowedTaskTypes...)
 	if err != nil {
 		metrics.RecordOperation("semantic_worker", "claim", "error", time.Since(claimStart))
 		logger.Warn(ctx, "semantic_worker_claim_failed",

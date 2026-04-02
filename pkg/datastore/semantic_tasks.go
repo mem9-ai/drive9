@@ -225,21 +225,12 @@ func (s *Store) ensureSemanticTaskQueuedTx(tx *sql.Tx, task *semantic.Task) (boo
 	return true, nil
 }
 
-// ClaimSemanticTask claims one queued semantic task and leases it to the caller.
-func (s *Store) ClaimSemanticTask(ctx context.Context, now time.Time, leaseDuration time.Duration) (out *semantic.Task, found bool, err error) {
+// ClaimSemanticTask claims one queued semantic task and leases it to the
+// caller. When taskTypes is empty, any queued task type is eligible.
+// Otherwise, only tasks whose task_type is included in taskTypes are eligible.
+func (s *Store) ClaimSemanticTask(ctx context.Context, now time.Time, leaseDuration time.Duration, taskTypes ...semantic.TaskType) (out *semantic.Task, found bool, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "claim_semantic_task", start, &err)
-	return s.claimSemanticTask(ctx, now, leaseDuration, nil)
-}
-
-// ClaimSemanticTaskOfTypes claims one queued semantic task whose task_type is
-// included in taskTypes and leases it to the caller.
-func (s *Store) ClaimSemanticTaskOfTypes(ctx context.Context, now time.Time, leaseDuration time.Duration, taskTypes ...semantic.TaskType) (out *semantic.Task, found bool, err error) {
-	start := time.Now()
-	defer observeStoreOp(ctx, "claim_semantic_task_of_types", start, &err)
-	if len(taskTypes) == 0 {
-		return nil, false, fmt.Errorf("claim task types are required")
-	}
 	return s.claimSemanticTask(ctx, now, leaseDuration, taskTypes)
 }
 

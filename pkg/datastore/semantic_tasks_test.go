@@ -147,7 +147,7 @@ func TestSemanticTaskClaimOrderByAvailableAtThenCreatedAt(t *testing.T) {
 	}
 }
 
-func TestClaimSemanticTaskOfTypesSkipsOlderDisallowedTask(t *testing.T) {
+func TestClaimSemanticTaskSkipsOlderDisallowedTask(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	base := time.Unix(1711600350, 0).UTC()
@@ -162,7 +162,7 @@ func TestClaimSemanticTaskOfTypesSkipsOlderDisallowedTask(t *testing.T) {
 		}
 	}
 
-	claimed, found, err := s.ClaimSemanticTaskOfTypes(ctx, base.Add(5*time.Second), time.Minute, semantic.TaskTypeImgExtractText)
+	claimed, found, err := s.ClaimSemanticTask(ctx, base.Add(5*time.Second), time.Minute, semantic.TaskTypeImgExtractText)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestClaimSemanticTaskOfTypesSkipsOlderDisallowedTask(t *testing.T) {
 	}
 }
 
-func TestClaimSemanticTaskOfTypesReturnsNotFoundWhenOnlyDisallowedTasksExist(t *testing.T) {
+func TestClaimSemanticTaskReturnsNotFoundWhenOnlyDisallowedTasksExist(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	base := time.Unix(1711600360, 0).UTC()
@@ -188,7 +188,7 @@ func TestClaimSemanticTaskOfTypesReturnsNotFoundWhenOnlyDisallowedTasksExist(t *
 		t.Fatal(err)
 	}
 
-	claimed, found, err := s.ClaimSemanticTaskOfTypes(ctx, base.Add(time.Second), time.Minute, semantic.TaskTypeImgExtractText)
+	claimed, found, err := s.ClaimSemanticTask(ctx, base.Add(time.Second), time.Minute, semantic.TaskTypeImgExtractText)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestClaimSemanticTaskOfTypesReturnsNotFoundWhenOnlyDisallowedTasksExist(t *
 	}
 }
 
-func TestClaimSemanticTaskOfTypesSupportsMultipleTaskTypes(t *testing.T) {
+func TestClaimSemanticTaskSupportsMultipleTaskTypes(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	base := time.Unix(1711600370, 0).UTC()
@@ -217,7 +217,7 @@ func TestClaimSemanticTaskOfTypesSupportsMultipleTaskTypes(t *testing.T) {
 		}
 	}
 
-	claimed, found, err := s.ClaimSemanticTaskOfTypes(ctx, base.Add(5*time.Second), time.Minute, semantic.TaskTypeImgExtractText, semantic.TaskTypeEmbed)
+	claimed, found, err := s.ClaimSemanticTask(ctx, base.Add(5*time.Second), time.Minute, semantic.TaskTypeImgExtractText, semantic.TaskTypeEmbed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,13 +229,24 @@ func TestClaimSemanticTaskOfTypesSupportsMultipleTaskTypes(t *testing.T) {
 	}
 }
 
-func TestClaimSemanticTaskOfTypesRejectsEmptyTaskTypes(t *testing.T) {
+func TestClaimSemanticTaskWithoutFiltersClaimsAnyTask(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	base := time.Unix(1711600380, 0).UTC()
 
-	if _, _, err := s.ClaimSemanticTaskOfTypes(ctx, base, time.Minute); err == nil {
-		t.Fatal("expected empty task types to fail")
+	if _, err := s.EnqueueSemanticTask(ctx, newSemanticTask("task-1", "file-1", 1, base, base)); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, found, err := s.ClaimSemanticTask(ctx, base.Add(time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected unfiltered claim to find task")
+	}
+	if claimed.TaskID != "task-1" {
+		t.Fatalf("claimed task=%q, want %q", claimed.TaskID, "task-1")
 	}
 }
 

@@ -137,7 +137,7 @@ c.Delete("/data/file.txt")
 | `DAT9_API_KEY` | API key | |
 | `DAT9_LISTEN_ADDR` | Server listen address | `:9009` |
 | `DAT9_PUBLIC_URL` | Externally reachable base URL (required for remote clients) | |
-| `DAT9_MYSQL_DSN` | MySQL DSN (example: `user:pass@tcp(127.0.0.1:3306)/dat9?parseTime=true`) | |
+| `DAT9_MYSQL_DSN` | MySQL DSN for tests/local validation (example: `user:pass@tcp(127.0.0.1:3306)/dat9?parseTime=true`) | |
 | `DAT9_BLOB_DIR` | Blob storage directory | `./blobs` |
 | `DAT9_S3_BUCKET` | S3 bucket name (enables AWS S3 mode; omit for local mock) | |
 | `DAT9_S3_REGION` | AWS region | `us-east-1` |
@@ -217,14 +217,22 @@ POST   /v1/fs/{path}?mkdir        Create directory
 cmd/dat9/           CLI entrypoint and commands (cp, cat, ls, mount, umount, ...)
 cmd/dat9-server/    Server entrypoint
 pkg/
-  backend/          Dat9Backend — AGFS FileSystem implementation (inode model)
+  backend/          Dat9Backend — AGFS FileSystem implementation
   client/           Go SDK HTTP client
+  datastore/        Core metadata store and semantic task persistence
+  embedding/        Embedding provider integration and vector helpers
+  encrypt/          Encryption helpers
   fuse/             FUSE mount (go-fuse/v2 RawFileSystem, inode mapping, caching)
-  meta/             Metadata store (TiDB/MySQL P0 / db9 production)
+  logger/           Structured logging helpers
+  meta/             Metadata/search-facing models and helpers
+  metrics/          Metrics recording
+  semantic/         Durable semantic task types and contracts
   s3client/         S3-compatible object store interface (AWS + local mock)
   server/           HTTP server (/v1/fs/{path} router)
+  tenant/           Tenant schema management and embedding mode detection
   pathutil/         Path canonicalization and validation
   parser/           Content-aware parsing interface (future)
+  traceid/          Trace ID helpers
   treebuilder/      Parsed content → path namespace mapping (future)
 docs/
   design-overview.md  Full design document
@@ -232,14 +240,15 @@ docs/
 
 ## Metadata Schema
 
-Four tables, all in the tenant's database:
+Five core tables, all in the tenant's database:
 
 | Table | Purpose |
 |---|---|
-| `file_nodes` | Path tree (dentry) — path, parent, name, file_id reference |
-| `files` | File entity (inode) — storage type/ref, size, checksum, revision, status, content_text |
-| `file_tags` | Key-value tags for precise SQL filtering |
-| `uploads` | Large-file S3 multipart upload state tracking |
+| `file_nodes` | Path tree (dentry) — path, parent, name, directory flag, file_id reference |
+| `files` | File entity (inode) — storage location, size, checksum, revision, lifecycle status, extracted text, embedding state |
+| `file_tags` | Key-value tags for precise filtering |
+| `uploads` | Large-file multipart upload state and idempotency tracking |
+| `semantic_tasks` | Durable background work queue for async embedding and image text extraction |
 
 ## Roadmap
 
@@ -302,10 +311,13 @@ The helper script sets sensible defaults for local validation, including:
 make test
 ```
 
-`make test` runs `go test ./...` and the MySQL-backed test suites use either:
+`make test` is the standard test entrypoint and runs `go test ./...`.
 
-- a Docker-compatible container runtime to start a `mysql:8.0.36` test container automatically, or
-- an existing MySQL instance provided via the `DAT9_MYSQL_DSN` environment variable
+For MySQL-backed test suites:
+
+- if `DAT9_MYSQL_DSN` is set, the tests reuse that MySQL instance
+- otherwise, if `podman` is available locally, `make test` automatically configures the Podman-backed testcontainers environment
+- otherwise, testcontainers uses the default Docker-compatible runtime environment
 
 For example, to reuse an existing local MySQL instance:
 
@@ -313,11 +325,7 @@ For example, to reuse an existing local MySQL instance:
 DAT9_MYSQL_DSN='dat9:dat9pass@tcp(127.0.0.1:3306)/dat9_test?parseTime=true' make test
 ```
 
-With Podman on macOS or Linux, use the following command to run tests:
-
-```bash
-make test-podman
-```
+If you do not provide `DAT9_MYSQL_DSN`, make sure a Docker-compatible container runtime is available locally.
 
 ## References
 
