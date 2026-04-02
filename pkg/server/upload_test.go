@@ -12,14 +12,21 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/dat9/pkg/semantic"
 )
 
 func newTestServerWithS3(t *testing.T) (*Server, *s3client.LocalS3Client) {
+	t.Helper()
+	return newTestServerWithS3Config(t, backend.Options{}, SemanticWorkerOptions{})
+}
+
+func newTestServerWithS3Config(t *testing.T, backendOpts backend.Options, workerOpts SemanticWorkerOptions) (*Server, *s3client.LocalS3Client) {
 	t.Helper()
 	blobDir, err := os.MkdirTemp("", "dat9-srv-blobs-*")
 	if err != nil {
@@ -46,11 +53,11 @@ func newTestServerWithS3(t *testing.T) (*Server, *s3client.LocalS3Client) {
 		t.Fatal(err)
 	}
 
-	b, err := backend.NewWithS3(store, s3c)
+	b, err := backend.NewWithS3ModeAndOptions(store, s3c, true, backendOpts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(b), s3c
+	return NewWithConfig(Config{Backend: b, SemanticWorkers: workerOpts}), s3c
 }
 
 func partChecksumHeader(data []byte) string {
@@ -150,6 +157,49 @@ func TestSmallFilePut200(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestAutoImagePutWritesContentTextEndToEnd(t *testing.T) {
+	s, _ := newTestServerWithS3Config(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: staticServerImageExtractor{text: "caption from http put"},
+		},
+	}, SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
+	})
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/e2e-put.png", bytes.NewReader([]byte("fake-png")))
+	req.ContentLength = int64(len("fake-png"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	file := mustServerFile(t, s.fallback, "/e2e-put.png")
+	waitForContentTextOnServer(t, s.fallback, "/e2e-put.png", "caption from http put", 3*time.Second)
+	waitForTaskStatus(t, s.fallback, file.FileID, 1, string(semantic.TaskSucceeded), 3*time.Second)
+
+	tasks := loadSemanticTaskRowsForResource(t, s.fallback, file.FileID)
+	if len(tasks) != 1 {
+		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	}
+	if tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) || tasks[0].Status != string(semantic.TaskSucceeded) {
+		t.Fatalf("unexpected semantic task rows: %+v", tasks)
 	}
 }
 
@@ -375,6 +425,102 @@ func TestLargeUploadOverwritesExistingSmallFile(t *testing.T) {
 	}
 	if nf.File.SizeBytes != totalSize {
 		t.Fatalf("expected size %d, got %d", totalSize, nf.File.SizeBytes)
+	}
+}
+
+func TestAutoImageMultipartOverwriteWritesContentTextEndToEnd(t *testing.T) {
+	s, s3c := newTestServerWithS3Config(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: staticServerImageExtractor{text: "caption from multipart overwrite"},
+		},
+	}, SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
+	})
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	seedReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/overwrite-auto.png", bytes.NewReader([]byte("seed-image")))
+	seedReq.ContentLength = int64(len("seed-image"))
+	seedResp, err := http.DefaultClient.Do(seedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = seedResp.Body.Close() }()
+	if seedResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(seedResp.Body)
+		t.Fatalf("seed put: expected 200, got %d: %s", seedResp.StatusCode, body)
+	}
+
+	original := mustServerFile(t, s.fallback, "/overwrite-auto.png")
+	waitForContentTextOnServer(t, s.fallback, "/overwrite-auto.png", "caption from multipart overwrite", 3*time.Second)
+	waitForTaskStatus(t, s.fallback, original.FileID, 1, string(semantic.TaskSucceeded), 3*time.Second)
+
+	totalSize := int64(2 << 20)
+	body := make([]byte, totalSize)
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/overwrite-auto.png", bytes.NewReader(body))
+	req.ContentLength = totalSize
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan backend.UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatalf("decode plan: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("initiate overwrite: expected 202, got %d", resp.StatusCode)
+	}
+
+	upload, err := s.fallback.GetUpload(context.Background(), plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, part := range plan.Parts {
+		start := int64(part.Number-1) * s3client.PartSize
+		end := start + part.Size
+		if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, part.Number, bytes.NewReader(make([]byte, end-start))); err != nil {
+			t.Fatalf("upload part %d: %v", part.Number, err)
+		}
+	}
+
+	completeReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/"+plan.UploadID+"/complete", nil)
+	completeResp, err := http.DefaultClient.Do(completeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = completeResp.Body.Close() }()
+	if completeResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(completeResp.Body)
+		t.Fatalf("complete overwrite: expected 200, got %d: %s", completeResp.StatusCode, body)
+	}
+
+	updated := mustServerFile(t, s.fallback, "/overwrite-auto.png")
+	if updated.FileID != original.FileID {
+		t.Fatalf("overwrite file_id=%q, want %q", updated.FileID, original.FileID)
+	}
+	if updated.Revision != 2 {
+		t.Fatalf("revision=%d, want 2", updated.Revision)
+	}
+	waitForContentTextOnServer(t, s.fallback, "/overwrite-auto.png", "caption from multipart overwrite", 3*time.Second)
+	waitForTaskStatus(t, s.fallback, updated.FileID, 2, string(semantic.TaskSucceeded), 3*time.Second)
+
+	tasks := loadSemanticTaskRowsForResource(t, s.fallback, updated.FileID)
+	if len(tasks) != 2 {
+		t.Fatalf("semantic task count=%d, want 2", len(tasks))
+	}
+	for _, task := range tasks {
+		if task.TaskType != string(semantic.TaskTypeImgExtractText) || task.Status != string(semantic.TaskSucceeded) {
+			t.Fatalf("unexpected semantic task rows: %+v", tasks)
+		}
 	}
 }
 

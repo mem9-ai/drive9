@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -806,6 +809,163 @@ func TestSemanticWorkerListTenantRefsEmbedOnlySkipsAutoProviders(t *testing.T) {
 	}
 }
 
+func TestSemanticWorkerHTTPMultiTenantImageOnlySkipsAppTenantEmbedTasks(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	pool := newTestTenantPoolWithBackendOptions(t, backend.Options{
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: staticServerImageExtractor{text: "auto tenant caption"},
+		},
+	})
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+
+	initServerTenantSchema(t, testDSN)
+	appStore, err := datastore.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testmysql.ResetDB(t, appStore.DB())
+	if err := appStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	insertTenantWithToken := func(provider string, tenantDSN string) (*meta.Tenant, string) {
+		t.Helper()
+		parsedTenant, err := mysql.ParseDSN(tenantDSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		host, port := "127.0.0.1", 3306
+		if parsedTenant.Addr != "" {
+			h, p, _ := strings.Cut(parsedTenant.Addr, ":")
+			if h != "" {
+				host = h
+			}
+			if p != "" {
+				_, _ = fmt.Sscanf(p, "%d", &port)
+			}
+		}
+		passCipher, err := pool.Encrypt(context.Background(), []byte(parsedTenant.Passwd))
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		tenantMeta := &meta.Tenant{
+			ID:               tenant.NewID(),
+			Status:           meta.TenantActive,
+			DBHost:           host,
+			DBPort:           port,
+			DBUser:           parsedTenant.User,
+			DBPasswordCipher: passCipher,
+			DBName:           parsedTenant.DBName,
+			DBTLS:            false,
+			Provider:         provider,
+			SchemaVersion:    1,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+		if err := metaStore.InsertTenant(context.Background(), tenantMeta); err != nil {
+			t.Fatal(err)
+		}
+		tok, err := tenant.IssueToken(tokenSecret, tenantMeta.ID, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokCipher, err := pool.Encrypt(context.Background(), []byte(tok))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := metaStore.InsertAPIKey(context.Background(), &meta.APIKey{
+			ID:            tenant.NewID(),
+			TenantID:      tenantMeta.ID,
+			KeyName:       provider,
+			JWTCiphertext: tokCipher,
+			JWTHash:       tenant.HashToken(tok),
+			TokenVersion:  1,
+			Status:        meta.APIKeyActive,
+			IssuedAt:      now,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return tenantMeta, tok
+	}
+
+	appTenant, appToken := insertTenantWithToken(tenant.ProviderDB9, testDSN)
+
+	s := NewWithConfig(Config{Meta: metaStore, Pool: pool, TokenSecret: tokenSecret, SemanticWorkers: SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
+	}})
+	t.Cleanup(func() { s.Close() })
+	if s.semanticWorker == nil {
+		t.Fatal("expected semantic worker manager in multi-tenant image-only mode")
+	}
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	putWithToken := func(tok, path string, body []byte) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPut, ts.URL+path, strings.NewReader(string(body)))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.ContentLength = int64(len(body))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			payload, _ := io.ReadAll(resp.Body)
+			t.Fatalf("PUT %s status=%d body=%s", path, resp.StatusCode, payload)
+		}
+	}
+
+	putWithToken(appToken, "/v1/fs/docs/app.txt", []byte("hello app tenant"))
+	appBackend, releaseApp, err := pool.Acquire(context.Background(), appTenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseApp()
+
+	appFile := mustServerFile(t, appBackend, "/docs/app.txt")
+	time.Sleep(300 * time.Millisecond)
+	var appTask serverSemanticTaskState
+	err = appBackend.Store().DB().QueryRow(`SELECT task_id, task_type, resource_id, status, attempt_count, COALESCE(last_error, '')
+		FROM semantic_tasks WHERE resource_id = ? AND resource_version = 1`, appFile.FileID).Scan(
+		&appTask.TaskID,
+		&appTask.TaskType,
+		&appTask.ResourceID,
+		&appTask.Status,
+		&appTask.AttemptCount,
+		&appTask.LastError,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if appTask.TaskType != string(semantic.TaskTypeEmbed) {
+		t.Fatalf("app task_type=%q, want %q", appTask.TaskType, semantic.TaskTypeEmbed)
+	}
+	if appTask.Status != string(semantic.TaskQueued) || appTask.AttemptCount != 0 {
+		t.Fatalf("app task=%+v, want queued with attempt_count 0", appTask)
+	}
+}
+
 func TestSemanticWorkerListTenantRefsDoesNotUseFallbackImageCapabilityForPoolTenants(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -1092,6 +1252,18 @@ func mustServerImageFileID(t *testing.T, b *backend.Dat9Backend, path, contentTy
 		t.Fatalf("insert image file %s: %v", path, err)
 	}
 	return fileID
+}
+
+func mustParseMySQLDBName(t *testing.T, dsn string) string {
+	t.Helper()
+	parsed, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn %q: %v", dsn, err)
+	}
+	if strings.TrimSpace(parsed.DBName) == "" {
+		t.Fatalf("dsn %q missing db name", dsn)
+	}
+	return parsed.DBName
 }
 
 func waitForContentTextOnServer(t *testing.T, b *backend.Dat9Backend, path, wantSubstring string, timeout time.Duration) {
