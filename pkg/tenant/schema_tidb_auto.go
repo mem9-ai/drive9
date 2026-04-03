@@ -40,11 +40,7 @@ type tidbTableMeta struct {
 	columns   map[string]tidbColumnMeta
 }
 
-func tidbAutoEmbeddingSchemaStatements(withContentBlob bool) []string {
-	contentBlobCol := ""
-	if withContentBlob {
-		contentBlobCol = "content_blob       LONGBLOB,"
-	}
+func tidbAutoEmbeddingSchemaStatements() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
@@ -62,7 +58,7 @@ func tidbAutoEmbeddingSchemaStatements(withContentBlob bool) []string {
 			file_id            VARCHAR(64) PRIMARY KEY,
 			storage_type       VARCHAR(32) NOT NULL,
 			storage_ref        TEXT NOT NULL,
-			` + contentBlobCol + `
+			content_blob       LONGBLOB,
 			content_type       VARCHAR(255),
 			size_bytes         BIGINT NOT NULL DEFAULT 0,
 			checksum_sha256    VARCHAR(128),
@@ -230,7 +226,7 @@ func validateTiDBSchemaMode(mode TiDBEmbeddingMode) error {
 	return nil
 }
 
-func initTiDBAutoEmbeddingSchema(dsn string, withContentBlob bool) error {
+func initTiDBAutoEmbeddingSchema(dsn string) error {
 	db, err := openTiDBSchemaDB(dsn)
 	if err != nil {
 		return err
@@ -239,7 +235,7 @@ func initTiDBAutoEmbeddingSchema(dsn string, withContentBlob bool) error {
 	if !isTiDBCluster(db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
-	if err := execSchemaStatements(db, tidbAutoEmbeddingSchemaStatements(withContentBlob)); err != nil {
+	if err := execSchemaStatements(db, tidbAutoEmbeddingSchemaStatements()); err != nil {
 		return err
 	}
 	return ValidateTiDBSchemaForMode(db, TiDBEmbeddingModeAuto)

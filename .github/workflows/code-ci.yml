@@ -23,6 +23,20 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Cache golangci-lint binary
+        uses: actions/cache@v4
+        with:
+          path: bin/golangci-lint
+          key: ${{ runner.os }}-golangci-lint-bin-${{ hashFiles('Makefile', 'go.mod') }}
+
+      - name: Cache golangci-lint analysis cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/golangci-lint
+          key: ${{ runner.os }}-golangci-lint-cache-${{ hashFiles('go.sum', 'Makefile') }}
+          restore-keys: |
+            ${{ runner.os }}-golangci-lint-cache-
+
       - name: Lint
         run: make lint
 

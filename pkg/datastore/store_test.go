@@ -16,7 +16,7 @@ func newTestStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	initDatastoreSchema(t, testDSN, "tidb_zero")
+	initDatastoreSchema(t, testDSN)
 	testmysql.ResetDB(t, s.DB())
 	t.Cleanup(func() { _ = s.Close() })
 	return s

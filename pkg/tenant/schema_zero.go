@@ -13,12 +13,12 @@ func InitTiDBTenantSchemaForMode(dsn string, mode TiDBEmbeddingMode) error {
 	case TiDBEmbeddingModeAuto:
 		return initZeroSchema(dsn)
 	case TiDBEmbeddingModeApp:
-		return initTiDBAppEmbeddingSchema(dsn, true)
+		return initTiDBAppEmbeddingSchema(dsn)
 	default:
 		return validateTiDBSchemaMode(mode)
 	}
 }
 
 func initZeroSchema(dsn string) error {
-	return initTiDBAutoEmbeddingSchema(dsn, true)
+	return initTiDBAutoEmbeddingSchema(dsn)
 }

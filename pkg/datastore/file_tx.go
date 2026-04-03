@@ -7,22 +7,11 @@ import (
 
 // InsertFileTx inserts a file row inside an existing transaction.
 func (s *Store) InsertFileTx(db execer, f *File) error {
-	if s.hasContentBlob {
-		_, err := db.Exec(`INSERT INTO files
-			(file_id, storage_type, storage_ref, content_blob, content_type, size_bytes, checksum_sha256,
-			 revision, status, source_id, content_text, created_at, confirmed_at, expires_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			f.FileID, f.StorageType, f.StorageRef, nilBytes(f.ContentBlob), nullStr(f.ContentType),
-			f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
-			nullStr(f.SourceID), nullStr(f.ContentText),
-			f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
-		return err
-	}
 	_, err := db.Exec(`INSERT INTO files
-		(file_id, storage_type, storage_ref, content_type, size_bytes, checksum_sha256,
+		(file_id, storage_type, storage_ref, content_blob, content_type, size_bytes, checksum_sha256,
 		 revision, status, source_id, content_text, created_at, confirmed_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.FileID, f.StorageType, f.StorageRef, nullStr(f.ContentType),
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.FileID, f.StorageType, f.StorageRef, nilBytes(f.ContentBlob), nullStr(f.ContentType),
 		f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
 		nullStr(f.SourceID), nullStr(f.ContentText),
 		f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
@@ -34,31 +23,15 @@ func (s *Store) InsertFileTx(db execer, f *File) error {
 // vectors for the new revision.
 func (s *Store) UpdateFileContentTx(db execer, fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64) (int64, error) {
 	now := time.Now().UTC()
-	var res interface{ RowsAffected() (int64, error) }
-	if s.hasContentBlob {
-		r, err := db.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
-			content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,
-			embedding = NULL, embedding_revision = NULL,
-			revision = revision + 1, status = 'CONFIRMED', confirmed_at = ?
-			WHERE file_id = ?`,
-			storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
-			nullStr(checksum), nullStr(contentText), now, fileID)
-		if err != nil {
-			return 0, err
-		}
-		res = r
-	} else {
-		r, err := db.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
-			content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,
-			embedding = NULL, embedding_revision = NULL,
-			revision = revision + 1, status = 'CONFIRMED', confirmed_at = ?
-			WHERE file_id = ?`,
-			storageType, storageRef, nullStr(contentType), size,
-			nullStr(checksum), nullStr(contentText), now, fileID)
-		if err != nil {
-			return 0, err
-		}
-		res = r
+	res, err := db.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
+		content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,
+		embedding = NULL, embedding_revision = NULL,
+		revision = revision + 1, status = 'CONFIRMED', confirmed_at = ?
+		WHERE file_id = ?`,
+		storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
+		nullStr(checksum), nullStr(contentText), now, fileID)
+	if err != nil {
+		return 0, err
 	}
 	rowsAffected, err := res.RowsAffected()
 	if err != nil {
@@ -79,29 +52,14 @@ func (s *Store) UpdateFileContentTx(db execer, fileID string, storageType Storag
 // vectors from content_text, so the write path must stop clearing vector state.
 func (s *Store) UpdateFileContentAutoEmbeddingTx(db execer, fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64) (int64, error) {
 	now := time.Now().UTC()
-	var res interface{ RowsAffected() (int64, error) }
-	if s.hasContentBlob {
-		r, err := db.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
-			content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,
-			revision = revision + 1, status = 'CONFIRMED', confirmed_at = ?
-			WHERE file_id = ?`,
-			storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
-			nullStr(checksum), nullStr(contentText), now, fileID)
-		if err != nil {
-			return 0, err
-		}
-		res = r
-	} else {
-		r, err := db.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
-			content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,
-			revision = revision + 1, status = 'CONFIRMED', confirmed_at = ?
-			WHERE file_id = ?`,
-			storageType, storageRef, nullStr(contentType), size,
-			nullStr(checksum), nullStr(contentText), now, fileID)
-		if err != nil {
-			return 0, err
-		}
-		res = r
+	res, err := db.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?,
+		content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,
+		revision = revision + 1, status = 'CONFIRMED', confirmed_at = ?
+		WHERE file_id = ?`,
+		storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
+		nullStr(checksum), nullStr(contentText), now, fileID)
+	if err != nil {
+		return 0, err
 	}
 	rowsAffected, err := res.RowsAffected()
 	if err != nil {
