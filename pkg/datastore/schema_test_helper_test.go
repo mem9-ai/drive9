@@ -16,7 +16,7 @@ func initDatastoreSchema(t *testing.T, dsn, provider string) {
 	}
 	defer func() { _ = db.Close() }()
 
-	withBlob := provider == "tidb_zero" || provider == "tidb_cloud_starter"
+	withBlob := provider == "tidb_zero" || provider == "tidb_cloud_starter" || provider == "db9"
 	// The test MySQL fixture does not guarantee VECTOR support, so helper schemas
 	// store embeddings as LONGTEXT even though production tenant schemas use VECTOR.
 	contentBlobCol := ""

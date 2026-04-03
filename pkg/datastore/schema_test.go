@@ -20,7 +20,7 @@ func TestInitSchemaProviderSplit(t *testing.T) {
 	}{
 		{provider: "tidb_zero", wantContentBlob: true},
 		{provider: "tidb_cloud_starter", wantContentBlob: true},
-		{provider: "db9", wantContentBlob: false},
+		{provider: "db9", wantContentBlob: true},
 	}
 
 	for _, tc := range tests {

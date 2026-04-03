@@ -58,6 +58,9 @@ DAT9_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/dat9_test?parseTime=true' make tes
 If `DAT9_MYSQL_DSN` is unset and `podman` is available, `make test` auto-configures
 testcontainers via `scripts/test-podman.sh`. Otherwise a Docker-compatible runtime is used.
 
+If a direct `go test` run fails with `rootless Docker not found`, retry with `make test`
+so the project can use `scripts/test-podman.sh` to route testcontainers through Podman.
+
 **E2E smoke tests** (not `go test`) live in `e2e/` and target live deployments:
 
 ```bash
