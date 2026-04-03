@@ -7,8 +7,8 @@ import (
 )
 
 func NewFromEnv() *client.Client {
-	server := os.Getenv("DAT9_SERVER")
-	apiKey := os.Getenv("DAT9_API_KEY")
+	server := os.Getenv("DRIVE9_SERVER")
+	apiKey := os.Getenv("DRIVE9_API_KEY")
 
 	cfg := loadConfig()
 	if server == "" {

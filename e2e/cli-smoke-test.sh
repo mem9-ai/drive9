@@ -94,7 +94,7 @@ prepare_cli_binary() {
   CLI_BIN="$(mktemp)"
   case "$CLI_SOURCE" in
     build)
-      go build -o "$CLI_BIN" ./cmd/dat9
+      make build-cli CLI_BIN="$CLI_BIN"
       ;;
     official)
       download_official_cli

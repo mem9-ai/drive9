@@ -23,7 +23,7 @@ func configDir() string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".dat9")
+	return filepath.Join(home, ".drive9")
 }
 
 func configPath() string {

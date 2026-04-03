@@ -16,11 +16,11 @@ func fakeLookPath(binMap map[string]bool) func(string) (string, error) {
 }
 
 func TestUmountArgvDarwin(t *testing.T) {
-	got, err := umountArgv("darwin", fakeLookPath(nil), "/mnt/dat9")
+	got, err := umountArgv("darwin", fakeLookPath(nil), "/mnt/drive9")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"umount", "/mnt/dat9"}
+	want := []string{"umount", "/mnt/drive9"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("argv = %v, want %v", got, want)
 	}
@@ -31,11 +31,11 @@ func TestUmountArgvPrefersFusermount3(t *testing.T) {
 		"fusermount3": true,
 		"fusermount":  true,
 		"umount":      true,
-	}), "/mnt/dat9")
+	}), "/mnt/drive9")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"fusermount3", "-u", "/mnt/dat9"}
+	want := []string{"fusermount3", "-u", "/mnt/drive9"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("argv = %v, want %v", got, want)
 	}
@@ -44,11 +44,11 @@ func TestUmountArgvPrefersFusermount3(t *testing.T) {
 func TestUmountArgvFallsBackToFusermount(t *testing.T) {
 	got, err := umountArgv("linux", fakeLookPath(map[string]bool{
 		"fusermount": true,
-	}), "/mnt/dat9")
+	}), "/mnt/drive9")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"fusermount", "-u", "/mnt/dat9"}
+	want := []string{"fusermount", "-u", "/mnt/drive9"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("argv = %v, want %v", got, want)
 	}
@@ -57,18 +57,18 @@ func TestUmountArgvFallsBackToFusermount(t *testing.T) {
 func TestUmountArgvFallsBackToUmount(t *testing.T) {
 	got, err := umountArgv("linux", fakeLookPath(map[string]bool{
 		"umount": true,
-	}), "/mnt/dat9")
+	}), "/mnt/drive9")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"umount", "/mnt/dat9"}
+	want := []string{"umount", "/mnt/drive9"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("argv = %v, want %v", got, want)
 	}
 }
 
 func TestUmountArgvNoBinary(t *testing.T) {
-	_, err := umountArgv("linux", fakeLookPath(nil), "/mnt/dat9")
+	_, err := umountArgv("linux", fakeLookPath(nil), "/mnt/drive9")
 	if err == nil {
 		t.Fatal("expected error when no unmount binaries are available")
 	}
