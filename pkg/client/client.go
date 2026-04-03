@@ -28,7 +28,12 @@ func New(baseURL, apiKey string) *Client {
 	// Default MaxIdleConnsPerHost=2 forces new TLS handshakes for every
 	// part beyond 2 in-flight, adding ~50-100ms per part. Setting it to
 	// 16 lets the connection pool cover typical upload parallelism.
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	var transport *http.Transport
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = t.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 16
 	return &Client{
