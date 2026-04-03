@@ -8,7 +8,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-func initDatastoreSchema(t *testing.T, dsn, provider string) {
+func initDatastoreSchema(t *testing.T, dsn string) {
 	t.Helper()
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -16,19 +16,14 @@ func initDatastoreSchema(t *testing.T, dsn, provider string) {
 	}
 	defer func() { _ = db.Close() }()
 
-	withBlob := provider == "tidb_zero" || provider == "tidb_cloud_starter"
 	// The test MySQL fixture does not guarantee VECTOR support, so helper schemas
 	// store embeddings as LONGTEXT even though production tenant schemas use VECTOR.
-	contentBlobCol := ""
-	if withBlob {
-		contentBlobCol = "content_blob LONGBLOB,"
-	}
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (node_id VARCHAR(64) PRIMARY KEY, path VARCHAR(512) NOT NULL, parent_path VARCHAR(512) NOT NULL, name VARCHAR(255) NOT NULL, is_directory BOOLEAN NOT NULL DEFAULT FALSE, file_id VARCHAR(64), created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3))`,
 		`CREATE UNIQUE INDEX idx_path ON file_nodes(path)`,
 		`CREATE INDEX idx_parent ON file_nodes(parent_path)`,
 		`CREATE INDEX idx_file_id ON file_nodes(file_id)`,
-		`CREATE TABLE IF NOT EXISTS files (file_id VARCHAR(64) PRIMARY KEY, storage_type VARCHAR(32) NOT NULL, storage_ref TEXT NOT NULL, ` + contentBlobCol + ` content_type VARCHAR(255), size_bytes BIGINT NOT NULL DEFAULT 0, checksum_sha256 VARCHAR(128), revision BIGINT NOT NULL DEFAULT 1, status VARCHAR(32) NOT NULL DEFAULT 'PENDING', source_id VARCHAR(255), content_text LONGTEXT, embedding LONGTEXT, embedding_revision BIGINT, created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), confirmed_at DATETIME(3), expires_at DATETIME(3))`,
+		`CREATE TABLE IF NOT EXISTS files (file_id VARCHAR(64) PRIMARY KEY, storage_type VARCHAR(32) NOT NULL, storage_ref TEXT NOT NULL, content_blob LONGBLOB, content_type VARCHAR(255), size_bytes BIGINT NOT NULL DEFAULT 0, checksum_sha256 VARCHAR(128), revision BIGINT NOT NULL DEFAULT 1, status VARCHAR(32) NOT NULL DEFAULT 'PENDING', source_id VARCHAR(255), content_text LONGTEXT, embedding LONGTEXT, embedding_revision BIGINT, created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), confirmed_at DATETIME(3), expires_at DATETIME(3))`,
 		`CREATE INDEX idx_status ON files(status, created_at)`,
 		`CREATE TABLE IF NOT EXISTS file_tags (file_id VARCHAR(64) NOT NULL, tag_key VARCHAR(255) NOT NULL, tag_value VARCHAR(255) NOT NULL DEFAULT '', PRIMARY KEY (file_id, tag_key))`,
 		`CREATE INDEX idx_kv ON file_tags(tag_key, tag_value)`,
