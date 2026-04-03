@@ -91,7 +91,7 @@ func main() {
 	kmsKey := os.Getenv("DAT9_ENCRYPT_KEY")
 	tokenHex := os.Getenv("DAT9_TOKEN_SIGNING_KEY")
 	providerType := envOr("DAT9_TENANT_PROVIDER", tenant.ProviderTiDBZero)
-	maxUploadBytes := int64(1 << 30)
+	maxUploadBytes := server.DefaultMaxUploadBytes
 	if raw := os.Getenv("DAT9_MAX_UPLOAD_BYTES"); raw != "" {
 		maxUploadBytes, err = strconv.ParseInt(raw, 10, 64)
 		if err != nil || maxUploadBytes <= 0 {
@@ -191,7 +191,7 @@ environment:
   DAT9_MASTER_KEY  32-byte hex key for local_aes encryptor
   DAT9_ENCRYPT_KEY KMS key id or alias (required for kms)
   DAT9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
-  DAT9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: 1073741824, minimum: 1048576)
+  DAT9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)
   DAT9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
   S3 storage (set DAT9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DAT9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
@@ -231,7 +231,7 @@ environment:
   DAT9_IMAGE_EXTRACT_MODEL    model name for vision extraction (optional)
   DAT9_IMAGE_EXTRACT_PROMPT   custom extraction prompt (optional)
   DAT9_IMAGE_EXTRACT_MAX_TOKENS max model output tokens (default: 256)
-`)
+`, server.DefaultMaxUploadBytes)
 	os.Exit(2)
 }
 
