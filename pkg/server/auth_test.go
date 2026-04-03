@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
@@ -53,23 +51,10 @@ func newAuthRuntime(t *testing.T) (*authTestRuntime, func()) {
 		t.Fatal(err)
 	}
 
-	parsed, err := mysql.ParseDSN(testDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	host, port := "127.0.0.1", 3306
-	if parsed.Addr != "" {
-		h, p, _ := strings.Cut(parsed.Addr, ":")
-		if h != "" {
-			host = h
-		}
-		if p != "" {
-			_, _ = fmt.Sscanf(p, "%d", &port)
-		}
-	}
+	conn := parseTestTenantConnInfo(t, testDSN)
 	now := time.Now().UTC()
 	tenantID := tenant.NewID()
-	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
+	passCipher, err := pool.Encrypt(context.Background(), []byte(conn.Password))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,12 +69,12 @@ func newAuthRuntime(t *testing.T) (*authTestRuntime, func()) {
 	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantActive,
-		DBHost:           host,
-		DBPort:           port,
-		DBUser:           parsed.User,
+		DBHost:           conn.Host,
+		DBPort:           conn.Port,
+		DBUser:           conn.User,
 		DBPasswordCipher: passCipher,
-		DBName:           parsed.DBName,
-		DBTLS:            false,
+		DBName:           conn.DBName,
+		DBTLS:            conn.TLS,
 		Provider:         tenant.ProviderDB9,
 		SchemaVersion:    1,
 		CreatedAt:        now,

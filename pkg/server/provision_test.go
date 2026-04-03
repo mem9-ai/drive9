@@ -8,11 +8,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
@@ -160,27 +158,15 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	parsed, err := mysql.ParseDSN(testDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	host := "127.0.0.1"
-	port := 3306
-	if parsed.Addr != "" {
-		h, p, ok := strings.Cut(parsed.Addr, ":")
-		if ok {
-			host = h
-			_, _ = fmt.Sscanf(p, "%d", &port)
-		}
-	}
+	conn := parseTestTenantConnInfo(t, testDSN)
 
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBZero, cluster: &tenant.ClusterInfo{
 		ClusterID: "cluster-1",
-		Host:      host,
-		Port:      port,
-		Username:  parsed.User,
-		Password:  parsed.Passwd,
-		DBName:    parsed.DBName,
+		Host:      conn.Host,
+		Port:      conn.Port,
+		Username:  conn.User,
+		Password:  conn.Password,
+		DBName:    conn.DBName,
 	}}
 
 	srv := NewWithConfig(Config{
@@ -194,7 +180,7 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	body, _ := json.Marshal(map[string]any{"provider": tenant.ProviderTiDBZero, "db_tls": false})
+	body, _ := json.Marshal(map[string]any{"provider": tenant.ProviderTiDBZero, "db_tls": conn.TLS})
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -261,21 +247,9 @@ func TestStartupResumesProvisioningTenantInit(t *testing.T) {
 	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
 	defer pool.Close()
 
-	parsed, err := mysql.ParseDSN(testDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	host := "127.0.0.1"
-	port := 3306
-	if parsed.Addr != "" {
-		h, p, ok := strings.Cut(parsed.Addr, ":")
-		if ok {
-			host = h
-			_, _ = fmt.Sscanf(p, "%d", &port)
-		}
-	}
+	conn := parseTestTenantConnInfo(t, testDSN)
 
-	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
+	passCipher, err := pool.Encrypt(context.Background(), []byte(conn.Password))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,12 +258,12 @@ func TestStartupResumesProvisioningTenantInit(t *testing.T) {
 	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantProvisioning,
-		DBHost:           host,
-		DBPort:           port,
-		DBUser:           parsed.User,
+		DBHost:           conn.Host,
+		DBPort:           conn.Port,
+		DBUser:           conn.User,
 		DBPasswordCipher: passCipher,
-		DBName:           parsed.DBName,
-		DBTLS:            false,
+		DBName:           conn.DBName,
+		DBTLS:            conn.TLS,
 		Provider:         tenant.ProviderTiDBZero,
 		SchemaVersion:    1,
 		CreatedAt:        now,

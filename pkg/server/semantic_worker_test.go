@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,7 +16,6 @@ import (
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
-	"github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
@@ -246,21 +244,8 @@ func TestSemanticWorkerKeepsBorrowedTenantBackendAliveDuringInvalidate(t *testin
 	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
 
 	pool := newTestTenantPool(t)
-	parsed, err := mysql.ParseDSN(testDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	host, port := "127.0.0.1", 3306
-	if parsed.Addr != "" {
-		h, p, _ := strings.Cut(parsed.Addr, ":")
-		if h != "" {
-			host = h
-		}
-		if p != "" {
-			_, _ = fmt.Sscanf(p, "%d", &port)
-		}
-	}
-	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
+	conn := parseTestTenantConnInfo(t, testDSN)
+	passCipher, err := pool.Encrypt(context.Background(), []byte(conn.Password))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,12 +254,12 @@ func TestSemanticWorkerKeepsBorrowedTenantBackendAliveDuringInvalidate(t *testin
 	tenantMeta := &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantActive,
-		DBHost:           host,
-		DBPort:           port,
-		DBUser:           parsed.User,
+		DBHost:           conn.Host,
+		DBPort:           conn.Port,
+		DBUser:           conn.User,
 		DBPasswordCipher: passCipher,
-		DBName:           parsed.DBName,
-		DBTLS:            false,
+		DBName:           conn.DBName,
+		DBTLS:            conn.TLS,
 		Provider:         tenant.ProviderDB9,
 		SchemaVersion:    1,
 		CreatedAt:        now,
@@ -844,21 +829,8 @@ func TestSemanticWorkerHTTPMultiTenantImageOnlySkipsAppTenantEmbedTasks(t *testi
 
 	insertTenantWithToken := func(provider string, tenantDSN string) (*meta.Tenant, string) {
 		t.Helper()
-		parsedTenant, err := mysql.ParseDSN(tenantDSN)
-		if err != nil {
-			t.Fatal(err)
-		}
-		host, port := "127.0.0.1", 3306
-		if parsedTenant.Addr != "" {
-			h, p, _ := strings.Cut(parsedTenant.Addr, ":")
-			if h != "" {
-				host = h
-			}
-			if p != "" {
-				_, _ = fmt.Sscanf(p, "%d", &port)
-			}
-		}
-		passCipher, err := pool.Encrypt(context.Background(), []byte(parsedTenant.Passwd))
+		conn := parseTestTenantConnInfo(t, tenantDSN)
+		passCipher, err := pool.Encrypt(context.Background(), []byte(conn.Password))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -866,12 +838,12 @@ func TestSemanticWorkerHTTPMultiTenantImageOnlySkipsAppTenantEmbedTasks(t *testi
 		tenantMeta := &meta.Tenant{
 			ID:               tenant.NewID(),
 			Status:           meta.TenantActive,
-			DBHost:           host,
-			DBPort:           port,
-			DBUser:           parsedTenant.User,
+			DBHost:           conn.Host,
+			DBPort:           conn.Port,
+			DBUser:           conn.User,
 			DBPasswordCipher: passCipher,
-			DBName:           parsedTenant.DBName,
-			DBTLS:            false,
+			DBName:           conn.DBName,
+			DBTLS:            conn.TLS,
 			Provider:         provider,
 			SchemaVersion:    1,
 			CreatedAt:        now,
