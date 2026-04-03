@@ -1,16 +1,16 @@
-// Command dat9 provides a CLI for dat9 file and data operations.
+// Command drive9 provides a CLI for drive9 file and data operations.
 //
 // Usage:
 //
-//	dat9 <command> [arguments]
+//	drive9 <command> [arguments]
 //
 // Commands:
 //
 //	create  provision a new database
 //	ctx     switch or list contexts
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, sh, grep, find)
-//	mount   mount dat9 as a local FUSE filesystem
-//	umount  unmount a dat9 FUSE mount
+//	mount   mount drive9 as a local FUSE filesystem
+//	umount  unmount a drive9 FUSE mount
 package main
 
 import (
@@ -48,7 +48,7 @@ func main() {
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "version"))
 		}
-		fmt.Printf("dat9 %s\n", version)
+		fmt.Printf("drive9 %s\n", version)
 	case "-h", "-help", "help":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "help"))
@@ -95,13 +95,13 @@ func main() {
 		if cliLogger != nil {
 			logger.Warn(context.Background(), "cli_unknown_command", zap.String("command", cmd))
 		}
-		fmt.Fprintf(os.Stderr, "dat9: unknown command %q\n", cmd)
+		fmt.Fprintf(os.Stderr, "drive9: unknown command %q\n", cmd)
 		usage()
 	}
 }
 
 func cliLogEnabled() bool {
-	raw := os.Getenv("DAT9_CLI_LOG_ENABLED")
+	raw := os.Getenv("DRIVE9_CLI_LOG_ENABLED")
 	if raw == "" {
 		return false
 	}
@@ -143,7 +143,7 @@ func runFS(args []string) {
 	case "-h", "-help", "help":
 		fsUsage()
 	default:
-		fmt.Fprintf(os.Stderr, "dat9 fs: unknown command %q\n", sub)
+		fmt.Fprintf(os.Stderr, "drive9 fs: unknown command %q\n", sub)
 		fsUsage()
 	}
 	if err != nil {
@@ -160,21 +160,21 @@ func fatal(cmd string, err error) {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `usage: dat9 <command> [arguments]
+	fmt.Fprintf(os.Stderr, `usage: drive9 <command> [arguments]
 
 commands:
   create           provision a new database
   ctx [name]       switch context (or show current)
   ctx list         list all contexts
   fs               filesystem operations
-  mount <dir>      mount dat9 as a local FUSE filesystem
-  umount <dir>     unmount a dat9 FUSE mount
+  mount <dir>      mount drive9 as a local FUSE filesystem
+  umount <dir>     unmount a drive9 FUSE mount
 `)
 	os.Exit(2)
 }
 
 func fsUsage() {
-	fmt.Fprintf(os.Stderr, `usage: dat9 fs <command> [arguments]
+	fmt.Fprintf(os.Stderr, `usage: drive9 fs <command> [arguments]
 
 commands:
   cp <src> <dst>       copy files (local↔remote)

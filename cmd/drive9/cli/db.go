@@ -12,7 +12,7 @@ import (
 
 func Create(args []string) error {
 	name := ""
-	server := os.Getenv("DAT9_SERVER")
+	server := os.Getenv("DRIVE9_SERVER")
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -29,7 +29,7 @@ func Create(args []string) error {
 			i++
 			server = args[i]
 		default:
-			return fmt.Errorf("unknown flag %q\nusage: dat9 create [--name NAME] [--server URL]", args[i])
+			return fmt.Errorf("unknown flag %q\nusage: drive9 create [--name NAME] [--server URL]", args[i])
 		}
 	}
 
@@ -116,7 +116,7 @@ func ctxList() error {
 	cfg := loadConfig()
 	if len(cfg.Contexts) == 0 {
 		fmt.Println("no contexts configured")
-		fmt.Println("run: dat9 create --name <name>")
+		fmt.Println("run: drive9 create --name <name>")
 		return nil
 	}
 	names := make([]string, 0, len(cfg.Contexts))
@@ -142,7 +142,7 @@ func ctxList() error {
 func ctxSwitch(name string) error {
 	cfg := loadConfig()
 	if _, ok := cfg.Contexts[name]; !ok {
-		return fmt.Errorf("context %q not found; run: dat9 ctx list", name)
+		return fmt.Errorf("context %q not found; run: drive9 ctx list", name)
 	}
 	cfg.CurrentContext = name
 	if err := saveConfig(cfg); err != nil {

@@ -12,7 +12,7 @@ import (
 
 // Sh runs an interactive shell.
 //
-//	dat9 sh
+//	drive9 sh
 //
 // The shell supports: cd, pwd, ls, cat, cp, mv, rm, stat, help, exit.
 // Paths are resolved relative to the current working directory.
@@ -21,7 +21,7 @@ func Sh(c *client.Client, _ []string) error {
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for {
-		fmt.Printf("dat9:%s> ", cwd)
+		fmt.Printf("drive9:%s> ", cwd)
 		if !scanner.Scan() {
 			fmt.Println()
 			return nil

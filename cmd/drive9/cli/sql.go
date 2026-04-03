@@ -30,12 +30,12 @@ func SQL(c *client.Client, args []string) error {
 			}
 			query = string(data)
 		default:
-			return fmt.Errorf("unknown flag %q\nusage: dat9 db sql -q \"SELECT ...\"", args[i])
+			return fmt.Errorf("unknown flag %q\nusage: drive9 db sql -q \"SELECT ...\"", args[i])
 		}
 	}
 
 	if query == "" {
-		return fmt.Errorf("usage: dat9 db sql -q \"SELECT ...\" or dat9 db sql -f query.sql")
+		return fmt.Errorf("usage: drive9 db sql -q \"SELECT ...\" or drive9 db sql -f query.sql")
 	}
 
 	rows, err := c.SQL(query)
