@@ -666,6 +666,14 @@ func TestUploadRespectsMaxUploadBytes(t *testing.T) {
 	}
 }
 
+func TestNewWithConfigUsesDefaultMaxUploadBytes(t *testing.T) {
+	base, _ := newTestServerWithS3(t)
+	s := NewWithConfig(Config{Backend: base.fallback})
+	if s.maxUploadBytes != DefaultMaxUploadBytes {
+		t.Fatalf("default maxUploadBytes = %d, want %d", s.maxUploadBytes, DefaultMaxUploadBytes)
+	}
+}
+
 func TestDeclaredContentLengthOverMaxRejected(t *testing.T) {
 	base, _ := newTestServerWithS3(t)
 	s := NewWithConfig(Config{Backend: base.fallback, MaxUploadBytes: 10})

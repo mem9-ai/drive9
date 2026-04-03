@@ -58,7 +58,9 @@ var (
 	schemaInitMaxBackoff     = 30 * time.Second
 )
 
-const defaultMaxUploadBytes int64 = 50 * (1 << 30) // 50 GiB
+// DefaultMaxUploadBytes is the server-wide fallback upload size limit.
+// Keep callers on this exported constant so the default stays consistent.
+const DefaultMaxUploadBytes int64 = 50 * (1 << 30) // 50 GiB
 
 func New(b *backend.Dat9Backend) *Server {
 	return NewWithConfig(Config{Backend: b})
@@ -67,7 +69,7 @@ func New(b *backend.Dat9Backend) *Server {
 func NewWithConfig(cfg Config) *Server {
 	maxUpload := cfg.MaxUploadBytes
 	if maxUpload <= 0 {
-		maxUpload = defaultMaxUploadBytes
+		maxUpload = DefaultMaxUploadBytes
 	}
 	logger := cfg.Logger
 	if logger == nil {
