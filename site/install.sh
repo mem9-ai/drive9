@@ -1,11 +1,11 @@
 #!/bin/sh
 set -e
 
-# dat9 installer
-# Usage: curl -fsSL https://dat9.ai/install | sh
+# drive9 installer
+# Usage: curl -fsSL https://drive9.ai/install.sh | sh
 
-BASE_URL="https://dat9.ai"
-API_URL="https://api.dat9.ai"
+BASE_URL="https://drive9.ai"
+API_URL="https://api.drive9.ai"
 DEFAULT_INSTALL_DIR="/usr/local/bin"
 INSTALL_DIR=""
 
@@ -84,24 +84,24 @@ is_user_managed_dir() {
 }
 
 resolve_install_dir() {
-  if [ -n "${DAT9_INSTALL_DIR:-}" ]; then
-    INSTALL_DIR="$DAT9_INSTALL_DIR"
-    info "Install dir: ${INSTALL_DIR} (from DAT9_INSTALL_DIR)"
+  if [ -n "${DRIVE9_INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="$DRIVE9_INSTALL_DIR"
+    info "Install dir: ${INSTALL_DIR} (from DRIVE9_INSTALL_DIR)"
     return
   fi
 
-  EXISTING=$(command -v dat9 2>/dev/null || true)
+  EXISTING=$(command -v drive9 2>/dev/null || true)
   if [ -n "$EXISTING" ] && [ -x "$EXISTING" ]; then
     EXISTING_DIR=$(dirname "$EXISTING")
     if is_user_managed_dir "$EXISTING_DIR"; then
       INSTALL_DIR="$EXISTING_DIR"
-      info "Upgrading active dat9 in ${INSTALL_DIR}"
+      info "Upgrading active drive9 in ${INSTALL_DIR}"
       return
     fi
 
     INSTALL_DIR="$DEFAULT_INSTALL_DIR"
-    warn "dat9 currently resolves to ${EXISTING}"
-    warn "Installing to ${INSTALL_DIR}; set DAT9_INSTALL_DIR=${EXISTING_DIR} to replace the active binary"
+    warn "drive9 currently resolves to ${EXISTING}"
+    warn "Installing to ${INSTALL_DIR}; set DRIVE9_INSTALL_DIR=${EXISTING_DIR} to replace the active binary"
     return
   fi
 
@@ -110,19 +110,19 @@ resolve_install_dir() {
 }
 
 report_path_status() {
-  INSTALLED="${INSTALL_DIR}/dat9"
-  ACTIVE=$(command -v dat9 2>/dev/null || true)
+  INSTALLED="${INSTALL_DIR}/drive9"
+  ACTIVE=$(command -v drive9 2>/dev/null || true)
 
   if [ -z "$ACTIVE" ]; then
-    warn "dat9 is installed at ${INSTALLED}, but ${INSTALL_DIR} is not on your PATH"
+    warn "drive9 is installed at ${INSTALLED}, but ${INSTALL_DIR} is not on your PATH"
     warn "Run ${INSTALLED} directly or add ${INSTALL_DIR} to PATH"
     return
   fi
 
   if [ "$ACTIVE" != "$INSTALLED" ]; then
-    warn "PATH shadowing detected: dat9 resolves to ${ACTIVE}"
+    warn "PATH shadowing detected: drive9 resolves to ${ACTIVE}"
     warn "Installed binary: ${INSTALLED}"
-    warn "Re-run with DAT9_INSTALL_DIR=$(dirname "$ACTIVE") to replace the active binary"
+    warn "Re-run with DRIVE9_INSTALL_DIR=$(dirname "$ACTIVE") to replace the active binary"
   fi
 }
 
@@ -130,7 +130,7 @@ bootstrap_config() {
   if [ -z "${HOME:-}" ]; then
     return
   fi
-  CONFIG_DIR="${HOME}/.dat9"
+  CONFIG_DIR="${HOME}/.drive9"
   CONFIG_FILE="${CONFIG_DIR}/config"
   mkdir -p "${CONFIG_DIR}" 2>/dev/null || true
   if [ ! -f "${CONFIG_FILE}" ]; then
@@ -146,7 +146,7 @@ CONF
 
 main() {
   printf "\n"
-  printf "  ${BOLD}dat9${RESET} installer\n"
+  printf "  ${BOLD}drive9${RESET} installer\n"
   printf "  ${DIM}────────────────────────────${RESET}\n"
   printf "\n"
 
@@ -163,8 +163,8 @@ main() {
   resolve_install_dir
 
   OLD_VERSION=""
-  if [ -x "${INSTALL_DIR}/dat9" ]; then
-    OLD_VERSION=$("${INSTALL_DIR}/dat9" --version 2>/dev/null | sed 's/^dat9[[:space:]]*//' | tr -d '[:space:]') || true
+  if [ -x "${INSTALL_DIR}/drive9" ]; then
+    OLD_VERSION=$("${INSTALL_DIR}/drive9" --version 2>/dev/null | sed 's/^drive9[[:space:]]*//' | tr -d '[:space:]') || true
   fi
 
   if [ ! -d "$INSTALL_DIR" ]; then
@@ -174,32 +174,32 @@ main() {
   TMP_DIR=$(mktemp -d)
   trap 'rm -rf "$TMP_DIR"' EXIT
 
-  # Download dat9 (FUSE support is built-in, no separate binary needed)
+  # Download drive9 (FUSE support is built-in, no separate binary needed)
   if [ -n "$LATEST_VERSION" ]; then
-    info "Downloading dat9 v${LATEST_VERSION}..."
+    info "Downloading drive9 v${LATEST_VERSION}..."
   else
-    info "Downloading dat9..."
+    info "Downloading drive9..."
   fi
-  if ! download "${BASE_URL}/releases/dat9-${OS}-${ARCH}" "$TMP_DIR/dat9"; then
-    error "No pre-built binary available for ${OS}/${ARCH}.\n  Available: linux/amd64, linux/arm64, darwin/arm64, darwin/amd64\n  Visit https://dat9.ai for more info."
+  if ! download "${BASE_URL}/releases/drive9-${OS}-${ARCH}" "$TMP_DIR/drive9"; then
+    error "No pre-built binary available for ${OS}/${ARCH}.\n  Available: linux/amd64, linux/arm64, darwin/arm64, darwin/amd64\n  Visit https://drive9.ai for more info."
   fi
-  chmod +x "$TMP_DIR/dat9"
+  chmod +x "$TMP_DIR/drive9"
 
   if [ -w "$INSTALL_DIR" ]; then
-    mv "$TMP_DIR/dat9" "$INSTALL_DIR/dat9"
+    mv "$TMP_DIR/drive9" "$INSTALL_DIR/drive9"
   else
     info "Installing to ${INSTALL_DIR} (requires sudo)..."
-    sudo mv "$TMP_DIR/dat9" "$INSTALL_DIR/dat9"
+    sudo mv "$TMP_DIR/drive9" "$INSTALL_DIR/drive9"
   fi
 
   printf "\n"
-  NEW_VERSION=$(${INSTALL_DIR}/dat9 --version 2>/dev/null | sed 's/^dat9[[:space:]]*//' | tr -d '[:space:]') || true
+  NEW_VERSION=$(${INSTALL_DIR}/drive9 --version 2>/dev/null | sed 's/^drive9[[:space:]]*//' | tr -d '[:space:]') || true
   if [ -n "$OLD_VERSION" ] && [ -n "$NEW_VERSION" ] && [ "$OLD_VERSION" != "$NEW_VERSION" ]; then
-    success "dat9 upgraded successfully! (v${OLD_VERSION} -> v${NEW_VERSION})"
+    success "drive9 upgraded successfully! (v${OLD_VERSION} -> v${NEW_VERSION})"
   elif [ -n "$NEW_VERSION" ]; then
-    success "dat9 installed successfully! (v${NEW_VERSION})"
+    success "drive9 installed successfully! (v${NEW_VERSION})"
   else
-    success "dat9 installed successfully!"
+    success "drive9 installed successfully!"
   fi
   bootstrap_config
   report_path_status
@@ -207,17 +207,17 @@ main() {
   printf "  Get started:\n"
   printf "\n"
   printf "    ${BOLD}1.${RESET} Create a workspace\n"
-  printf "       ${DIM}\$${RESET} dat9 create\n"
+  printf "       ${DIM}\$${RESET} drive9 create\n"
   printf "\n"
   printf "    ${BOLD}2.${RESET} Verify it's ready\n"
-  printf "       ${DIM}\$${RESET} dat9 fs ls :/\n"
+  printf "       ${DIM}\$${RESET} drive9 fs ls :/\n"
   printf "\n"
-  printf "    ${BOLD}3.${RESET} Start using dat9\n"
-  printf "       ${DIM}\$${RESET} dat9 fs cp ./file.txt :/data/file.txt\n"
-  printf "       ${DIM}\$${RESET} dat9 fs grep \"search term\" /\n"
-  printf "       ${DIM}\$${RESET} dat9 mount ~/dat9\n"
+  printf "    ${BOLD}3.${RESET} Start using drive9\n"
+  printf "       ${DIM}\$${RESET} drive9 fs cp ./file.txt :/data/file.txt\n"
+  printf "       ${DIM}\$${RESET} drive9 fs grep \"search term\" /\n"
+  printf "       ${DIM}\$${RESET} drive9 mount ~/drive9\n"
   printf "\n"
-  printf "  Docs: ${DIM}https://dat9.ai/skill.md${RESET}\n"
+  printf "  Docs: ${DIM}https://drive9.ai/skill.md${RESET}\n"
   printf "\n"
 }
 

@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>dat9 — Network drive with semantic search for AI agents</title>
-    <meta name="description" content="dat9 is a network drive with built-in semantic search for AI agents. Filesystem-like interface over tiered storage with automatic embedding and full-text indexing.">
+    <title>drive9 — Network drive with semantic search for AI agents</title>
+    <meta name="description" content="drive9 is a network drive with built-in semantic search for AI agents. Filesystem-like interface over tiered storage with automatic embedding and full-text indexing.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -19,13 +19,13 @@
         <div class="nav-container">
             <a href="#" class="logo">
                 <span class="logo-icon">◆</span>
-                <span class="logo-text">dat9</span>
+                <span class="logo-text">drive9</span>
             </a>
             <div class="nav-links">
                 <a href="#features">Features</a>
                 <a href="#cli">CLI</a>
                 <a href="#sdk">SDK</a>
-                <a href="https://github.com/mem9-ai/dat9" target="_blank" class="nav-github">
+                <a href="https://github.com/mem9-ai/drive9" target="_blank" class="nav-github">
                     <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
                         <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
                     </svg>
@@ -58,7 +58,7 @@
                         </svg>
                     </button>
                 </div>
-                <code class="cli-code">$ curl -fsSL https://dat9.ai/install.sh | sh</code>
+                <code class="cli-code">$ curl -fsSL https://drive9.ai/install.sh | sh</code>
                 <div class="cli-meta">macOS / Linux (x86_64, arm64)</div>
             </div>
 
@@ -66,14 +66,14 @@
             <div class="agents-section">
                 <div class="agents-label">AI Agents</div>
                 <div class="agents-instruction">
-                    <code>Read https://dat9.ai/skill.md and follow instructions</code>
+                    <code>Read https://drive9.ai/skill.md and follow instructions</code>
                 </div>
-                <p class="agents-desc">Your agent learns to install, auth, and use dat9 autonomously</p>
+                <p class="agents-desc">Your agent learns to install, auth, and use drive9 autonomously</p>
             </div>
 
             <!-- Tool Ecosystem -->
             <div="ecosystem">
-                <p class="ecosystem-label">dat9 works with any agent and stack</p>
+                <p class="ecosystem-label">drive9 works with any agent and stack</p>
                 <div class="ecosystem-grid">
                     <div class="ecosystem-item">
                         <div class="ecosystem-icon">◆</div>
@@ -107,7 +107,7 @@
     <!-- Use Cases Section -->
     <section class="use-cases" id="features">
         <div class="container">
-            <h2 class="section-title">Why dat9?</h2>
+            <h2 class="section-title">Why drive9?</h2>
             <p class="section-subtitle">Built for AI agents, designed for developers.</p>
             <div class="use-cases-grid">
                 <!-- Use Case 1 -->
@@ -175,7 +175,7 @@
                     <p>Find files by meaning. Auto-embeddings and vector search powered by TiDB Cloud — no external pipeline, no API keys in your code.</p>
                     <div class="code-block">
                         <code># Search for configs related to deployment<br>
-$ dat9 search "deploy to production" --limit 5<br>
+$ drive9 search "deploy to production" --limit 5<br>
 <br>
 /config/prod.env<br>
 /scripts/deploy.sh<br>
@@ -192,15 +192,15 @@ $ dat9 search "deploy to production" --limit 5<br>
                 <div class="feature-card">
                     <div class="feature-icon">📂</div>
                     <h3>Mount like local storage</h3>
-                    <p>FUSE mount puts dat9 at a local path. Use <code>ls</code>, <code>cat</code>, <code>vim</code>, <code>cp</code> directly on your remote data.</p>
+                    <p>FUSE mount puts drive9 at a local path. Use <code>ls</code>, <code>cat</code>, <code>vim</code>, <code>cp</code> directly on your remote data.</p>
                     <div class="code-block">
-                        <code>$ dat9 mount /mnt/dat9<br>
-Mounted dat9 at /mnt/dat9<br>
+                        <code>$ drive9 mount /mnt/drive9<br>
+Mounted drive9 at /mnt/drive9<br>
 <br>
-$ ls /mnt/dat9/data/<br>
+$ ls /mnt/drive9/data/<br>
 dataset.tar  config.json  logs/<br>
 <br>
-$ cat /mnt/dat9/config.json | jq .</code>
+$ cat /mnt/drive9/config.json | jq .</code>
                     </div>
                     <div class="replaces">
                         <span class="replaces-label">replaces</span>
@@ -215,7 +215,7 @@ $ cat /mnt/dat9/config.json | jq .</code>
                     <h3>Smart summaries</h3>
                     <p>Every directory can carry summary files. Agents scan cheaply before loading full content — saving tokens and time.</p>
                     <div class="code-block">
-                        <code>$ dat9 cat :/data/.summary.md<br>
+                        <code>$ drive9 cat :/data/.summary.md<br>
 Dataset: Image classification training data<br>
 Size: 50K images, 10 classes<br>
 Format: PNG, 224x224<br>
@@ -235,11 +235,11 @@ Updated: 2024-01-15</code>
                     <p>Copy files without re-upload. Rename instantly. All metadata operations — no data movement, no storage cost for duplicates.</p>
                     <div class="code-block">
                         <code># Zero-copy link — no re-upload<br>
-$ dat9 cp :/data/file.bin :/backup/file.bin<br>
+$ drive9 cp :/data/file.bin :/backup/file.bin<br>
 Linked in 0.003s<br>
 <br>
 # Metadata-only rename<br>
-$ dat9 mv :/old/name.txt :/new/name.txt<br>
+$ drive9 mv :/old/name.txt :/new/name.txt<br>
 Renamed in 0.001s</code>
                     </div>
                     <div class="replaces">
@@ -255,7 +255,7 @@ Renamed in 0.001s</code>
                     <h3>Native Go SDK</h3>
                     <p>Build agent tools with the Go SDK. Streaming, resume support, and context cancellation built in.</p>
                     <div class="code-block">
-                        <code>import "github.com/mem9-ai/dat9/pkg/client"<br>
+                        <code>import "github.com/mem9-ai/drive9/pkg/client"<br>
 <br>
 c := client.New("http://localhost:9009", "")<br>
 data, _ := c.Read("/config.json")<br>
@@ -309,15 +309,15 @@ c.Write("/output.json", result)</code>
                 <div class="cli-example">
                     <div class="cli-example-header">
                         <span class="cli-example-prompt">$</span>
-                        <span class="cli-example-cmd">dat9 cp ./local.txt :/remote/path.txt</span>
+                        <span class="cli-example-cmd">drive9 cp ./local.txt :/remote/path.txt</span>
                     </div>
-                    <p class="cli-example-desc">Upload a file to dat9. Files are stored and indexed automatically.</p>
+                    <p class="cli-example-desc">Upload a file to drive9. Files are stored and indexed automatically.</p>
                 </div>
 
                 <div class="cli-example">
                     <div class="cli-example-header">
                         <span class="cli-example-prompt">$</span>
-                        <span class="cli-example-cmd">dat9 cat :/config/settings.json</span>
+                        <span class="cli-example-cmd">drive9 cat :/config/settings.json</span>
                     </div>
                     <p class="cli-example-desc">Read file contents to stdout. Works with pipes and redirects.</p>
                 </div>
@@ -325,7 +325,7 @@ c.Write("/output.json", result)</code>
                 <div class="cli-example">
                     <div class="cli-example-header">
                         <span class="cli-example-prompt">$</span>
-                        <span class="cli-example-cmd">dat9 ls :/data/</span>
+                        <span class="cli-example-cmd">drive9 ls :/data/</span>
                     </div>
                     <p class="cli-example-desc">List directory contents. Shows size, modified time, and type.</p>
                 </div>
@@ -333,7 +333,7 @@ c.Write("/output.json", result)</code>
                 <div class="cli-example">
                     <div class="cli-example-header">
                         <span class="cli-example-prompt">$</span>
-                        <span class="cli-example-cmd">dat9 cp :/data/a.bin :/shared/a.bin</span>
+                        <span class="cli-example-cmd">drive9 cp :/data/a.bin :/shared/a.bin</span>
                     </div>
                     <p class="cli-example-desc">Zero-copy link — same file, new path. No re-upload, no extra storage.</p>
                 </div>
@@ -341,7 +341,7 @@ c.Write("/output.json", result)</code>
                 <div class="cli-example">
                     <div class="cli-example-header">
                         <span class="cli-example-prompt">$</span>
-                        <span class="cli-example-cmd">dat9 mv :/old/name.txt :/new/name.txt</span>
+                        <span class="cli-example-cmd">drive9 mv :/old/name.txt :/new/name.txt</span>
                     </div>
                     <p class="cli-example-desc">Rename or move. Metadata-only operation, instant completion.</p>
                 </div>
@@ -349,9 +349,9 @@ c.Write("/output.json", result)</code>
                 <div class="cli-example">
                     <div class="cli-example-header">
                         <span class="cli-example-prompt">$</span>
-                        <span class="cli-example-cmd">dat9 mount /mnt/dat9</span>
+                        <span class="cli-example-cmd">drive9 mount /mnt/drive9</span>
                     </div>
-                    <p class="cli-example-desc">Mount as local filesystem. Use standard tools directly on dat9 data.</p>
+                    <p class="cli-example-desc">Mount as local filesystem. Use standard tools directly on drive9 data.</p>
                 </div>
             </div>
         </div>
@@ -380,7 +380,7 @@ c.Write("/output.json", result)</code>
     <span class="code-string">"fmt"</span>
     <span class="code-string">"log"</span>
     
-    <span class="code-string">"github.com/mem9-ai/dat9/pkg/client"</span>
+    <span class="code-string">"github.com/mem9-ai/drive9/pkg/client"</span>
 )
 
 <span class="code-keyword">func</span> <span class="code-function">main</span>() {
@@ -390,7 +390,7 @@ c.Write("/output.json", result)</code>
     c := client.New(<span class="code-string">"http://localhost:9009"</span>, <span class="code-string">""</span>)
     
     <span class="code-comment">// Write file</span>
-    err := c.Write(ctx, <span class="code-string">"/data/hello.txt"</span>, []byte(<span class="code-string">"Hello, dat9!"</span>))
+    err := c.Write(ctx, <span class="code-string">"/data/hello.txt"</span>, []byte(<span class="code-string">"Hello, drive9!"</span>))
     <span class="code-keyword">if</span> err != <span class="code-keyword">nil</span> {
         log.Fatal(err)
     }
@@ -438,17 +438,17 @@ c.Write("/output.json", result)</code>
                         </svg>
                     </button>
                 </div>
-                <code class="cli-code">$ curl -fsSL https://dat9.ai/install | sh</code>
+                <code class="cli-code">$ curl -fsSL https://drive9.ai/install.sh | sh</code>
             </div>
 
             <div class="cta-links">
-                <a href="https://github.com/mem9-ai/dat9" target="_blank" class="cta-button primary">
+                <a href="https://github.com/mem9-ai/drive9" target="_blank" class="cta-button primary">
                     <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
                         <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
                     </svg>
                     View on GitHub
                 </a>
-                <a href="https://github.com/mem9-ai/dat9/blob/main/README.md" target="_blank" class="cta-button secondary">
+                <a href="https://github.com/mem9-ai/drive9/blob/main/README.md" target="_blank" class="cta-button secondary">
                     Read Docs
                 </a>
             </div>
@@ -462,21 +462,21 @@ c.Write("/output.json", result)</code>
                 <div class="footer-brand">
                     <a href="#" class="logo">
                         <span class="logo-icon">◆</span>
-                        <span class="logo-text">dat9</span>
+                        <span class="logo-text">drive9</span>
                     </a>
                     <p class="footer-tagline">Network drive with semantic search for AI agents.</p>
 
                 </div>
                 <div class="footer-links">
                     <h4>Resources</h4>
-                    <a href="https://github.com/mem9-ai/dat9" target="_blank">GitHub</a>
-                    <a href="https://github.com/mem9-ai/dat9/blob/main/README.md" target="_blank">Documentation</a>
+                    <a href="https://github.com/mem9-ai/drive9" target="_blank">GitHub</a>
+                    <a href="https://github.com/mem9-ai/drive9/blob/main/README.md" target="_blank">Documentation</a>
                     <a href="skill.md">Skill File</a>
                 </div>
                 <div class="footer-links">
                     <h4>Community</h4>
-                    <a href="https://github.com/mem9-ai/dat9/issues" target="_blank">Issues</a>
-                    <a href="https://github.com/mem9-ai/dat9/discussions" target="_blank">Discussions</a>
+                    <a href="https://github.com/mem9-ai/drive9/issues" target="_blank">Issues</a>
+                    <a href="https://github.com/mem9-ai/drive9/discussions" target="_blank">Discussions</a>
                 </div>
             </div>
             <div class="footer-bottom">

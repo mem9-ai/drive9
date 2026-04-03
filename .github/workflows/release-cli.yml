@@ -46,31 +46,31 @@ jobs:
           for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             os="${target%/*}"
             arch="${target#*/}"
-            echo "Building dat9-${os}-${arch}..."
+            echo "Building drive9-${os}-${arch}..."
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
               go build -ldflags "-X main.version=${{ env.VERSION }}" \
-              -o "dist/dat9-${os}-${arch}" ./cmd/dat9
+              -o "dist/drive9-${os}-${arch}" ./cmd/drive9
           done
 
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum dat9-* > checksums.txt
+          sha256sum drive9-* > checksums.txt
 
       - name: Write version file
         run: |
           echo "${{ env.VERSION }}" > dist/version
 
-      - name: Push to dat9-fe
+      - name: Push to drive9-fe
         run: |
-          git clone --depth 1 "https://x-access-token:${{ secrets.DAT9_FE_DEPLOY_TOKEN }}@github.com/mem9-ai/dat9-fe.git" /tmp/dat9-fe
-          mkdir -p /tmp/dat9-fe/site/releases
-          cp dist/* /tmp/dat9-fe/site/releases/
-          cd /tmp/dat9-fe
+          git clone --depth 1 "https://x-access-token:${{ secrets.DRIVE9_FE_DEPLOY_TOKEN }}@github.com/mem9-ai/drive9-fe.git" /tmp/drive9-fe
+          mkdir -p /tmp/drive9-fe/site/releases
+          cp dist/* /tmp/drive9-fe/site/releases/
+          cd /tmp/drive9-fe
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add site/releases/
           git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "release: dat9 CLI ${{ env.VERSION }}"
+          git commit -m "release: drive9 CLI ${{ env.VERSION }}"
           git pull --rebase
           git push

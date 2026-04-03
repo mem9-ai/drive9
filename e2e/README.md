@@ -51,7 +51,7 @@ export DAT9_BASE="https://xkopoerih4.execute-api.ap-southeast-1.amazonaws.com"
 ### Prod
 
 ```bash
-export DAT9_BASE="https://api.dat9.ai"
+export DAT9_BASE="https://api.drive9.ai"
 ```
 
 ## Notes
