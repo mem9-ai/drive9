@@ -22,6 +22,51 @@ import (
 	srvpkg "github.com/mem9-ai/dat9/pkg/server"
 )
 
+type shortUploadReader struct {
+	data          []byte
+	seq           *bytes.Reader
+	shortOffset   int64
+	mu            sync.Mutex
+	readsByOffset map[int64]int
+}
+
+func newShortUploadReader(data []byte, shortOffset int64) *shortUploadReader {
+	cloned := append([]byte(nil), data...)
+	return &shortUploadReader{
+		data:          cloned,
+		seq:           bytes.NewReader(cloned),
+		shortOffset:   shortOffset,
+		readsByOffset: make(map[int64]int),
+	}
+}
+
+func (r *shortUploadReader) Read(p []byte) (int, error) {
+	return r.seq.Read(p)
+}
+
+func (r *shortUploadReader) ReadAt(p []byte, off int64) (int, error) {
+	r.mu.Lock()
+	r.readsByOffset[off]++
+	readCount := r.readsByOffset[off]
+	r.mu.Unlock()
+
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if off >= int64(len(r.data)) {
+		return 0, io.EOF
+	}
+	if off == r.shortOffset && readCount == 2 {
+		n := copy(p[:len(p)-1], r.data[off:])
+		return n, io.EOF
+	}
+	n := copy(p, r.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
 // TestWriteStreamSmallFile verifies that WriteStream sends a small file via single direct PUT.
 func TestWriteStreamSmallFile(t *testing.T) {
 	var writtenData []byte
@@ -53,7 +98,7 @@ func TestWriteStreamSmallFile(t *testing.T) {
 func TestWriteStreamLargeFile(t *testing.T) {
 	var mu sync.Mutex
 	uploadedParts := map[int][]byte{}
-	completeCalled := false
+	var completeCalled atomic.Bool
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -70,6 +115,7 @@ func TestWriteStreamLargeFile(t *testing.T) {
 			// Return 202 with upload plan
 			plan := UploadPlan{
 				UploadID: "upload-123",
+				PartSize: 5,
 				Parts: []PartURL{
 					{Number: 1, URL: "", Size: 5}, // URL filled below
 					{Number: 2, URL: "", Size: 3},
@@ -99,7 +145,7 @@ func TestWriteStreamLargeFile(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/upload-123/complete":
-			completeCalled = true
+			completeCalled.Store(true)
 			w.WriteHeader(http.StatusOK)
 		}
 	}))
@@ -127,11 +173,64 @@ func TestWriteStreamLargeFile(t *testing.T) {
 	if !bytes.Equal(uploadedParts[2], []byte("678")) {
 		t.Errorf("part 2: got %q, want %q", uploadedParts[2], "678")
 	}
-	if !completeCalled {
+	if !completeCalled.Load() {
 		t.Error("complete was not called")
 	}
 	if len(progressCalls) != 2 {
 		t.Errorf("progress called %d times, want 2", len(progressCalls))
+	}
+}
+
+func TestWriteStreamLargeFileErrorsOnShortPartRead(t *testing.T) {
+	var mu sync.Mutex
+	uploadedParts := map[string][]byte{}
+	var completeCalled atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
+			plan := UploadPlan{
+				UploadID: "upload-short-read",
+				PartSize: 5,
+				Parts: []PartURL{
+					{Number: 1, URL: fmt.Sprintf("http://%s/parts/1", r.Host), Size: 5},
+					{Number: 2, URL: fmt.Sprintf("http://%s/parts/2", r.Host), Size: 3},
+				},
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(plan)
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/parts/"):
+			data, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			uploadedParts[r.URL.Path] = data
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/upload-short-read/complete":
+			completeCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+
+	err := c.WriteStream(context.Background(), "/large.bin", newShortUploadReader([]byte("12345678"), 0), 8, nil)
+	if err == nil {
+		t.Fatal("expected short read error")
+	}
+	if !strings.Contains(err.Error(), "short read for part 1") {
+		t.Fatalf("expected short read error, got %v", err)
+	}
+	if completeCalled.Load() {
+		t.Fatal("complete should not be called after short read")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if _, ok := uploadedParts["/parts/1"]; ok {
+		t.Fatalf("short-read part should not be uploaded: got %q", uploadedParts["/parts/1"])
 	}
 }
 

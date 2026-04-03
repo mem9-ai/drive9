@@ -23,10 +23,24 @@ type Client struct {
 
 // New creates a new dat9 client.
 func New(baseURL, apiKey string) *Client {
+	// Clone DefaultTransport to preserve Proxy, HTTP/2, dialer, and TLS defaults,
+	// then tune connection pooling for concurrent multipart uploads to S3.
+	// Default MaxIdleConnsPerHost=2 forces new TLS handshakes for every
+	// part beyond 2 in-flight, adding ~50-100ms per part. Setting it to
+	// 16 lets the connection pool cover typical upload parallelism.
+	var transport *http.Transport
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = t.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 16
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
 		httpClient: &http.Client{
+			Transport: transport,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if len(via) > 0 && req.URL.Host != via[0].URL.Host {
 					req.Header.Del("Authorization")
