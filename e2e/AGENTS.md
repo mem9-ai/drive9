@@ -41,7 +41,7 @@ Use this value unless the environment owner announces a new endpoint.
 ## Prod endpoint
 
 ```bash
-export DAT9_BASE="https://api.dat9.ai"
+export DAT9_BASE="https://api.drive9.ai"
 ```
 
 ## Coverage
@@ -137,7 +137,7 @@ Notes:
 | `CLI_SEMANTIC_TIMEOUT_S` | `90` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_INTERVAL_S` | `3` | `cli-smoke-test.sh` |
 | `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh` |
-| `CLI_RELEASE_BASE_URL` | `https://dat9.ai/releases` | `cli-smoke-test.sh`, `fuse-smoke-test.sh` |
+| `CLI_RELEASE_BASE_URL` | `https://drive9.ai/releases` | `cli-smoke-test.sh`, `fuse-smoke-test.sh` |
 | `CLI_RELEASE_VERSION` | *(latest)* | `cli-smoke-test.sh`, `fuse-smoke-test.sh` |
 | `MOUNT_READY_TIMEOUT_S` | `20` | `fuse-smoke-test.sh` |
 | `MOUNT_READY_INTERVAL_S` | `1` | `fuse-smoke-test.sh` |
