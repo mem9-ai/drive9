@@ -19,7 +19,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/mem9-ai/dat9/cmd/dat9/cli"
+	"github.com/mem9-ai/dat9/cmd/drive9/cli"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"go.uber.org/zap"
 )
