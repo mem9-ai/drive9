@@ -173,7 +173,7 @@ func cloneTenantForID(t *testing.T, pool *Pool, src *meta.Tenant, tenantID strin
 		DBUser:           parsed.User,
 		DBPasswordCipher: passCipher,
 		DBName:           parsed.DBName,
-		DBTLS:            false,
+		DBTLS:            parsed.TLSConfig != "" && !strings.EqualFold(parsed.TLSConfig, "false"),
 		Provider:         provider,
 		SchemaVersion:    1,
 		CreatedAt:        now,

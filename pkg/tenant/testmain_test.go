@@ -16,6 +16,7 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		log.Fatalf("setup mysql test instance: %v", err)
 	}
+	log.Printf("using mysql test instance source=%s dsn=%s", inst.Source, inst.Redacted)
 	testDSN = inst.DSN
 
 	code := m.Run()

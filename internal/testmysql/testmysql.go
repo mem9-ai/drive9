@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,8 @@ const envDSN = "DAT9_MYSQL_DSN"
 
 type Instance struct {
 	DSN       string
+	Source    string
+	Redacted  string
 	terminate func(context.Context) error
 }
 
@@ -27,7 +30,7 @@ func (i *Instance) Close(ctx context.Context) error {
 
 func Start(ctx context.Context) (*Instance, error) {
 	if dsn := os.Getenv(envDSN); dsn != "" {
-		return &Instance{DSN: dsn}, nil
+		return &Instance{DSN: dsn, Source: "env", Redacted: redactDSN(dsn)}, nil
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 4*time.Minute)
@@ -51,11 +54,23 @@ func Start(ctx context.Context) (*Instance, error) {
 	}
 
 	return &Instance{
-		DSN: dsn,
+		DSN:      dsn,
+		Source:   "testcontainer",
+		Redacted: redactDSN(dsn),
 		terminate: func(ctx context.Context) error {
 			return c.Terminate(ctx)
 		},
 	}, nil
+}
+
+func redactDSN(dsn string) string {
+	if at := strings.Index(dsn, "@"); at >= 0 {
+		prefix := dsn[:at]
+		if colon := strings.Index(prefix, ":"); colon >= 0 {
+			return prefix[:colon+1] + "***" + dsn[at:]
+		}
+	}
+	return dsn
 }
 
 func ResetDB(t *testing.T, db *sql.DB) {
