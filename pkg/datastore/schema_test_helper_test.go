@@ -8,7 +8,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-func initDatastoreSchema(t *testing.T, dsn, provider string) {
+func initDatastoreSchema(t *testing.T, dsn string) {
 	t.Helper()
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {

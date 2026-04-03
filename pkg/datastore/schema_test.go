@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-func TestInitSchemaProviderSplit(t *testing.T) {
+func TestInitSchemaRequiredColumns(t *testing.T) {
 	// TODO(async-embedding): This test only validates schema shape through the
 	// MySQL fixture used by the current store/runtime path. It does not execute
 	// initDB9Schema on a real Postgres-backed store or validate Postgres-specific
@@ -14,22 +14,19 @@ func TestInitSchemaProviderSplit(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s1.Close() })
-	providers := []string{"tidb_zero", "tidb_cloud_starter", "db9"}
 
-	for _, provider := range providers {
-		dropDataPlaneTables(t, s1)
-		initDatastoreSchema(t, testDSN, provider)
-		if !s1.columnExists("files", "content_blob") {
-			t.Fatalf("provider %s missing files.content_blob", provider)
+	dropDataPlaneTables(t, s1)
+	initDatastoreSchema(t, testDSN)
+	if !s1.columnExists("files", "content_blob") {
+		t.Fatal("missing files.content_blob")
+	}
+	for _, col := range []string{"embedding", "embedding_revision"} {
+		if !s1.columnExists("files", col) {
+			t.Fatalf("missing files.%s", col)
 		}
-		for _, col := range []string{"embedding", "embedding_revision"} {
-			if !s1.columnExists("files", col) {
-				t.Fatalf("provider %s missing files.%s", provider, col)
-			}
-		}
-		if !s1.columnExists("semantic_tasks", "task_id") {
-			t.Fatalf("provider %s missing semantic_tasks table", provider)
-		}
+	}
+	if !s1.columnExists("semantic_tasks", "task_id") {
+		t.Fatal("missing semantic_tasks table")
 	}
 }
 

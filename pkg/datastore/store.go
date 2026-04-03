@@ -574,6 +574,8 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 	start := time.Now()
 	defer observeStoreOp(ctx, "list_dir", start, &err)
 
+	// TODO(#110): ReadDir only needs lightweight file metadata. Split this into a
+	// metadata-only listing path so directory scans do not fetch or copy content_blob.
 	q := `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
 		f.file_id, f.storage_type, f.storage_ref, f.content_blob, f.content_type, f.size_bytes,
 		f.checksum_sha256, f.revision, f.embedding_revision, f.status, f.source_id, f.content_text,
