@@ -98,7 +98,7 @@ func TestWriteStreamSmallFile(t *testing.T) {
 func TestWriteStreamLargeFile(t *testing.T) {
 	var mu sync.Mutex
 	uploadedParts := map[int][]byte{}
-	completeCalled := false
+	var completeCalled atomic.Bool
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -145,7 +145,7 @@ func TestWriteStreamLargeFile(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/upload-123/complete":
-			completeCalled = true
+			completeCalled.Store(true)
 			w.WriteHeader(http.StatusOK)
 		}
 	}))
@@ -173,7 +173,7 @@ func TestWriteStreamLargeFile(t *testing.T) {
 	if !bytes.Equal(uploadedParts[2], []byte("678")) {
 		t.Errorf("part 2: got %q, want %q", uploadedParts[2], "678")
 	}
-	if !completeCalled {
+	if !completeCalled.Load() {
 		t.Error("complete was not called")
 	}
 	if len(progressCalls) != 2 {
@@ -184,7 +184,7 @@ func TestWriteStreamLargeFile(t *testing.T) {
 func TestWriteStreamLargeFileErrorsOnShortPartRead(t *testing.T) {
 	var mu sync.Mutex
 	uploadedParts := map[string][]byte{}
-	completeCalled := false
+	var completeCalled atomic.Bool
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -206,7 +206,7 @@ func TestWriteStreamLargeFileErrorsOnShortPartRead(t *testing.T) {
 			mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/upload-short-read/complete":
-			completeCalled = true
+			completeCalled.Store(true)
 			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
@@ -224,7 +224,7 @@ func TestWriteStreamLargeFileErrorsOnShortPartRead(t *testing.T) {
 	if !strings.Contains(err.Error(), "short read for part 1") {
 		t.Fatalf("expected short read error, got %v", err)
 	}
-	if completeCalled {
+	if completeCalled.Load() {
 		t.Fatal("complete should not be called after short read")
 	}
 	mu.Lock()

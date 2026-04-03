@@ -198,6 +198,9 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 	}
 	maxConcurrency := uploadParallelism(stdPartSize)
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	errCh := make(chan error, 1)
 	sem := make(chan struct{}, maxConcurrency)
 	var wg sync.WaitGroup
@@ -206,6 +209,7 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 		// Check for prior upload errors before spawning more work
 		select {
 		case err := <-errCh:
+			cancel()
 			wg.Wait()
 			return err
 		default:
@@ -231,6 +235,7 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 				case errCh <- fmt.Errorf("read part %d: %w", p.Number, err):
 				default:
 				}
+				cancel()
 				return
 			}
 			if int64(n) != p.Size {
@@ -238,6 +243,7 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 				case errCh <- fmt.Errorf("short read for part %d: got %d want %d", p.Number, n, p.Size):
 				default:
 				}
+				cancel()
 				return
 			}
 
@@ -247,6 +253,7 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 				case errCh <- fmt.Errorf("part %d: %w", p.Number, err):
 				default:
 				}
+				cancel()
 				return
 			}
 
@@ -629,6 +636,10 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 		stdPartSize = s3client.PartSize
 	}
 	maxConcurrency := uploadParallelism(stdPartSize)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	sem := make(chan struct{}, maxConcurrency)
 	errCh := make(chan error, 1)
 	var wg sync.WaitGroup
@@ -636,6 +647,7 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 	for _, part := range plan.Parts {
 		select {
 		case err := <-errCh:
+			cancel()
 			wg.Wait()
 			return err
 		default:
@@ -661,6 +673,7 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 				case errCh <- fmt.Errorf("read part %d at offset %d: %w", p.Number, offset, err):
 				default:
 				}
+				cancel()
 				return
 			}
 			if int64(n) != p.Size {
@@ -668,6 +681,7 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 				case errCh <- fmt.Errorf("short read for part %d at offset %d: got %d want %d", p.Number, offset, n, p.Size):
 				default:
 				}
+				cancel()
 				return
 			}
 
@@ -677,6 +691,7 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 				case errCh <- fmt.Errorf("part %d: %w", p.Number, err):
 				default:
 				}
+				cancel()
 				return
 			}
 			if progress != nil {
