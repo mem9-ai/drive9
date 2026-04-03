@@ -83,7 +83,7 @@ func (c *Config) ResolveServer() string {
 	if c.Server != "" {
 		return c.Server
 	}
-	return "https://api.dat9.ai"
+	return "https://api.drive9.ai"
 }
 
 const nameChars = "abcdefghijklmnopqrstuvwxyz0123456789"

@@ -2,7 +2,7 @@
 name: dat9-fuse-openclaw
 version: 0.1.0
 description: Use dat9 FUSE as OpenClaw workspace storage for persistent files.
-homepage: https://dat9.ai
+homepage: https://drive9.ai
 ---
 
 # dat9 FUSE for OpenClaw
@@ -18,7 +18,7 @@ Mount a dat9 tenant locally, then point OpenClaw workspace paths into the mount 
 Install `dat9` using the standard entrypoint:
 
 ```bash
-curl -fsSL https://dat9.ai/install | sh
+curl -fsSL https://drive9.ai/install.sh | sh
 dat9 --version
 ```
 
