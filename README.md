@@ -214,7 +214,7 @@ POST   /v1/fs/{path}?mkdir        Create directory
 ## Project Structure
 
 ```
-cmd/dat9/           CLI entrypoint and commands (cp, cat, ls, mount, umount, ...)
+cmd/drive9/         CLI entrypoint and commands (cp, cat, ls, mount, umount, ...)
 cmd/dat9-server/    Server entrypoint
 pkg/
   backend/          Dat9Backend — AGFS FileSystem implementation
@@ -270,7 +270,7 @@ Five core tables, all in the tenant's database:
 
 ```bash
 mkdir -p bin
-go build -o bin/dat9 ./cmd/dat9
+go build -o bin/dat9 ./cmd/drive9
 go build -o bin/dat9-server ./cmd/dat9-server
 ```
 

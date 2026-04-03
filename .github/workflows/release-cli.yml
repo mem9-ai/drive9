@@ -42,22 +42,9 @@ jobs:
 
       - name: Build CLI for all platforms
         run: |
-          mkdir -p dist
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
-            os="${target%/*}"
-            arch="${target#*/}"
-            echo "Building drive9-${os}-${arch}..."
-            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
-              go build -ldflags "-X main.version=${{ env.VERSION }}" \
-              -o "dist/drive9-${os}-${arch}" ./cmd/drive9
-          done
+          make build-cli-release DIST_DIR=dist VERSION="${{ env.VERSION }}"
 
-      - name: Generate checksums
-        run: |
-          cd dist
-          sha256sum drive9-* > checksums.txt
-
-      - name: Write version file
+      - name: Ensure version file
         run: |
           echo "${{ env.VERSION }}" > dist/version
 

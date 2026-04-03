@@ -14,12 +14,12 @@ import (
 //
 // Remote paths use ":" or "<name>:" prefix:
 //
-//	dat9 fs cp local.txt :/remote/path          upload (current context)
-//	dat9 fs cp local.txt mydb:/remote/path      upload (mydb context)
-//	dat9 fs cp mydb:/remote/path local.txt      download
-//	dat9 fs cp :/remote/a :/remote/b            server-side copy
-//	dat9 fs cp - :/remote/path                  upload from stdin
-//	dat9 fs cp :/remote/path -                  download to stdout
+//	drive9 fs cp local.txt :/remote/path          upload (current context)
+//	drive9 fs cp local.txt mydb:/remote/path      upload (mydb context)
+//	drive9 fs cp mydb:/remote/path local.txt      download
+//	drive9 fs cp :/remote/a :/remote/b            server-side copy
+//	drive9 fs cp - :/remote/path                  upload from stdin
+//	drive9 fs cp :/remote/path -                  download to stdout
 func Cp(c *client.Client, args []string) error {
 	resume := false
 	filtered := args[:0]
@@ -33,7 +33,7 @@ func Cp(c *client.Client, args []string) error {
 	args = filtered
 
 	if len(args) != 2 {
-		return fmt.Errorf("usage: dat9 fs cp [--resume] <src> <dst>")
+		return fmt.Errorf("usage: drive9 fs cp [--resume] <src> <dst>")
 	}
 	src, dst := args[0], args[1]
 

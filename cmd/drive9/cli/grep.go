@@ -10,7 +10,7 @@ import (
 
 func Grep(c *client.Client, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: dat9 fs grep <pattern> [path]")
+		return fmt.Errorf("usage: drive9 fs grep <pattern> [path]")
 	}
 	query := args[0]
 	path := "/"
@@ -42,7 +42,7 @@ func Grep(c *client.Client, args []string) error {
 
 func GrepJSON(c *client.Client, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: dat9 fs grep <pattern> [path]")
+		return fmt.Errorf("usage: drive9 fs grep <pattern> [path]")
 	}
 	query := args[0]
 	path := "/"

@@ -12,11 +12,15 @@ GOARCH ?= $(HOST_GOARCH)
 
 APP_NAME ?= dat9-server
 CLI_NAME ?= dat9
+CLI_DIST_NAME ?= drive9
 
 BIN_DIR ?= bin
+DIST_DIR ?= dist
 SERVER_BIN ?= $(BIN_DIR)/$(APP_NAME)
 CLI_BIN ?= $(BIN_DIR)/$(CLI_NAME)
 LOCAL_BIN ?= $(CURDIR)/bin
+VERSION ?=
+CLI_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 GOLANGCI_LINT_VERSION ?= v2.5.0
 GOLANGCI_LINT_BIN ?= $(LOCAL_BIN)/golangci-lint
@@ -27,7 +31,7 @@ IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
 LINT_TIMEOUT ?= 10m
 TEST_P ?=
 
-.PHONY: mod test test-podman fmt lint install-lint build build-server build-cli run-server-local docker-build
+.PHONY: mod test test-podman fmt lint install-lint build build-server build-cli build-cli-release run-server-local docker-build
 
 mod:
 	$(GO) mod tidy
@@ -78,7 +82,25 @@ run-server-local:
 
 build-cli:
 	mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(CLI_BIN) ./cmd/dat9
+	@set -euo pipefail; \
+	if [ -n "$(VERSION)" ]; then \
+		CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "-X main.version=$(VERSION)" -o $(CLI_BIN) ./cmd/drive9; \
+	else \
+		CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(CLI_BIN) ./cmd/drive9; \
+	fi; \
+	true
+
+build-cli-release:
+	@set -euo pipefail; \
+	mkdir -p $(DIST_DIR); \
+	for target in $(CLI_TARGETS); do \
+		os="$${target%/*}"; \
+		arch="$${target#*/}"; \
+		out="$(DIST_DIR)/$(CLI_DIST_NAME)-$${os}-$${arch}"; \
+		echo "Building $$(basename "$$out")..."; \
+		$(MAKE) --no-print-directory build-cli GOOS="$$os" GOARCH="$$arch" CLI_BIN="$$out" VERSION="$(VERSION)"; \
+	done; \
+	cd $(DIST_DIR) && sha256sum $(CLI_DIST_NAME)-* > checksums.txt && printf '%s\n' "$(VERSION)" > version
 
 docker-build: build-server
 	$(DOCKER) build -t $(IMAGE) .

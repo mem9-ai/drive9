@@ -8,14 +8,14 @@ import (
 	"runtime"
 	"time"
 
-	dat9fuse "github.com/mem9-ai/dat9/pkg/fuse"
+	drive9fuse "github.com/mem9-ai/dat9/pkg/fuse"
 )
 
-// MountCmd handles the "dat9 mount" command.
+// MountCmd handles the "drive9 mount" command.
 func MountCmd(args []string) error {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
-	server := fs.String("server", os.Getenv("DAT9_SERVER"), "dat9 server URL")
-	apiKey := fs.String("api-key", os.Getenv("DAT9_API_KEY"), "API key")
+	server := fs.String("server", os.Getenv("DRIVE9_SERVER"), "drive9 server URL")
+	apiKey := fs.String("api-key", os.Getenv("DRIVE9_API_KEY"), "API key")
 	cacheSize := fs.Int("cache-size", 128, "read cache size in MB")
 	dirTTL := fs.Duration("dir-ttl", 5*time.Second, "directory cache TTL")
 	attrTTL := fs.Duration("attr-ttl", 1*time.Second, "kernel attr cache TTL")
@@ -25,7 +25,7 @@ func MountCmd(args []string) error {
 	debug := fs.Bool("debug", false, "enable FUSE debug logging")
 
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: dat9 mount [flags] <mountpoint>\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "usage: drive9 mount [flags] <mountpoint>\n\nflags:\n")
 		fs.PrintDefaults()
 	}
 
@@ -51,13 +51,13 @@ func MountCmd(args []string) error {
 	}
 
 	if *server == "" {
-		return fmt.Errorf("dat9 server URL required (--server or $DAT9_SERVER)")
+		return fmt.Errorf("drive9 server URL required (--server or $DRIVE9_SERVER)")
 	}
 	if *apiKey == "" {
-		return fmt.Errorf("API key required (--api-key or $DAT9_API_KEY)")
+		return fmt.Errorf("API key required (--api-key or $DRIVE9_API_KEY)")
 	}
 
-	opts := &dat9fuse.MountOptions{
+	opts := &drive9fuse.MountOptions{
 		Server:     *server,
 		APIKey:     *apiKey,
 		MountPoint: mountPoint,
@@ -70,13 +70,13 @@ func MountCmd(args []string) error {
 		Debug:      *debug,
 	}
 
-	return dat9fuse.Mount(opts)
+	return drive9fuse.Mount(opts)
 }
 
-// UmountCmd handles the "dat9 umount" command.
+// UmountCmd handles the "drive9 umount" command.
 func UmountCmd(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: dat9 umount <mountpoint>")
+		return fmt.Errorf("usage: drive9 umount <mountpoint>")
 	}
 	mountPoint := args[0]
 
