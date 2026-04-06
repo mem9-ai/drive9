@@ -770,7 +770,7 @@ func (s *Store) GetUploadByPath(ctx context.Context, targetPath string) (out *Up
 	row := s.db.QueryRowContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
 		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
-		FROM uploads WHERE target_path = ? AND status = 'UPLOADING'
+		FROM uploads WHERE target_path = ? AND status IN ('INITIATED', 'UPLOADING')
 		ORDER BY created_at DESC LIMIT 1`, targetPath)
 	out, err = scanUpload(row)
 	return out, err
