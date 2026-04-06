@@ -89,9 +89,10 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 		return nil, fmt.Errorf("create multipart upload: %w", err)
 	}
 
-	// Calculate adaptive part size for the new upload
-	partSize := s3client.CalcAdaptivePartSize(newSize)
-	newParts := s3client.CalcParts(newSize, partSize)
+	// Calculate new parts — patch path uses fixed PartSize because callers
+	// (FUSE, client) determine dirty_parts based on this boundary before
+	// the server responds. Adaptive part size for patches deferred to T5.
+	newParts := s3client.CalcParts(newSize, s3client.PartSize)
 
 	// Build dirty set for O(1) lookup
 	dirtySet := make(map[int]bool, len(dirtyParts))
@@ -102,19 +103,19 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 	// How many parts did the original file have?
 	origPartCount := 0
 	if origSize > 0 {
-		origPartCount = len(s3client.CalcParts(origSize, partSize))
+		origPartCount = len(s3client.CalcParts(origSize, s3client.PartSize))
 	}
 
 	plan := &PatchPlan{
 		UploadID: "", // set below after DB insert
-		PartSize: partSize,
+		PartSize: s3client.PartSize,
 	}
 
 	// Process each part
 	for _, p := range newParts {
 		if !dirtySet[p.Number] && p.Number <= origPartCount {
 			// Unchanged part within original file range → server-side copy
-			partStart := int64(p.Number-1) * partSize
+			partStart := int64(p.Number-1) * s3client.PartSize
 			partEnd := partStart + p.Size - 1
 			// Clamp to original file size (last part may be smaller)
 			if partEnd >= origSize {
@@ -150,7 +151,7 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 			// If this part overlaps with the original file, provide a read URL
 			// so the client can download the original data for merging.
 			if p.Number <= origPartCount {
-				partStart := int64(p.Number-1) * partSize
+				partStart := int64(p.Number-1) * s3client.PartSize
 				partEnd := partStart + p.Size - 1
 				if partEnd >= origSize {
 					partEnd = origSize - 1
@@ -199,7 +200,7 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 		S3UploadID: mpu.UploadID,
 		S3Key:      newS3Key,
 		TotalSize:  newSize,
-		PartSize:   partSize,
+		PartSize:   s3client.PartSize,
 		PartsTotal: len(newParts),
 		Status:     datastore.UploadUploading,
 		CreatedAt:  now,
