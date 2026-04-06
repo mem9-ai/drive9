@@ -14,6 +14,15 @@ import (
 	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
+// entriesFromInts converts a slice of part numbers to PresignPartEntry slice (no checksums).
+func entriesFromInts(nums []int) []PresignPartEntry {
+	entries := make([]PresignPartEntry, len(nums))
+	for i, n := range nums {
+		entries[i] = PresignPartEntry{PartNumber: n}
+	}
+	return entries
+}
+
 func newTestBackendWithS3(t *testing.T) *Dat9Backend {
 	t.Helper()
 	s3Dir, err := os.MkdirTemp("", "dat9-s3-*")
@@ -281,8 +290,11 @@ func TestInitiateUploadV2(t *testing.T) {
 	if plan.Resumable {
 		t.Error("expected resumable=false for phase 1")
 	}
-	if plan.ChecksumContract != "none" {
-		t.Errorf("expected checksum_contract=none, got %s", plan.ChecksumContract)
+	if plan.ChecksumContract.Required {
+		t.Error("expected checksum_contract.required=false for phase 1")
+	}
+	if len(plan.ChecksumContract.Supported) == 0 {
+		t.Error("expected checksum_contract.supported to be non-empty")
 	}
 
 	// Verify upload starts in INITIATED status
@@ -308,7 +320,7 @@ func TestPresignPartSingle(t *testing.T) {
 	}
 
 	// Valid part number
-	u, err := b.PresignPart(ctx, plan.UploadID, 1)
+	u, err := b.PresignPart(ctx, plan.UploadID, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,17 +338,17 @@ func TestPresignPartSingle(t *testing.T) {
 	}
 
 	// Invalid part number: 0
-	if _, err := b.PresignPart(ctx, plan.UploadID, 0); err == nil {
+	if _, err := b.PresignPart(ctx, plan.UploadID, 0, nil); err == nil {
 		t.Error("expected error for part_number=0")
 	}
 
 	// Invalid part number: too large
-	if _, err := b.PresignPart(ctx, plan.UploadID, plan.TotalParts+1); err == nil {
+	if _, err := b.PresignPart(ctx, plan.UploadID, plan.TotalParts+1, nil); err == nil {
 		t.Error("expected error for part_number > total_parts")
 	}
 
 	// Last valid part
-	u, err = b.PresignPart(ctx, plan.UploadID, plan.TotalParts)
+	u, err = b.PresignPart(ctx, plan.UploadID, plan.TotalParts, nil)
 	if err != nil {
 		t.Fatalf("presign last part: %v", err)
 	}
@@ -355,7 +367,7 @@ func TestPresignPartsBatch(t *testing.T) {
 	}
 
 	// Presign parts 1, 2, 3
-	urls, err := b.PresignParts(ctx, plan.UploadID, []int{1, 2, 3})
+	urls, err := b.PresignParts(ctx, plan.UploadID, entriesFromInts([]int{1, 2, 3}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,7 +396,7 @@ func TestPresignBatchDuplicateRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = b.PresignParts(ctx, plan.UploadID, []int{1, 2, 1})
+	_, err = b.PresignParts(ctx, plan.UploadID, entriesFromInts([]int{1, 2, 1}))
 	if err == nil {
 		t.Fatal("expected error for duplicate part numbers")
 	}
@@ -415,7 +427,7 @@ func TestPresignBatchLimitExceeded(t *testing.T) {
 		t.Skipf("not enough parts (%d) to test batch limit", plan.TotalParts)
 	}
 
-	_, err = b.PresignParts(ctx, plan.UploadID, parts)
+	_, err = b.PresignParts(ctx, plan.UploadID, entriesFromInts(parts))
 	if err == nil {
 		t.Fatal("expected error for batch > MaxPresignBatch")
 	}
@@ -438,13 +450,13 @@ func TestPresignAfterAbortFails(t *testing.T) {
 	}
 
 	// Single presign should fail
-	_, err = b.PresignPart(ctx, plan.UploadID, 1)
+	_, err = b.PresignPart(ctx, plan.UploadID, 1, nil)
 	if err == nil {
 		t.Error("expected error presigning after abort")
 	}
 
 	// Batch presign should fail
-	_, err = b.PresignParts(ctx, plan.UploadID, []int{1, 2})
+	_, err = b.PresignParts(ctx, plan.UploadID, entriesFromInts([]int{1, 2}))
 	if err == nil {
 		t.Error("expected error batch presigning after abort")
 	}
@@ -467,7 +479,7 @@ func TestPresignExpiredUpload(t *testing.T) {
 	}
 
 	// Single presign should fail with expired error
-	_, err = b.PresignPart(ctx, plan.UploadID, 1)
+	_, err = b.PresignPart(ctx, plan.UploadID, 1, nil)
 	if err == nil {
 		t.Fatal("expected error for expired upload")
 	}
@@ -485,7 +497,7 @@ func TestPresignExpiredUpload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = b.PresignParts(ctx, plan2.UploadID, []int{1})
+	_, err = b.PresignParts(ctx, plan2.UploadID, entriesFromInts([]int{1}))
 	if err == nil {
 		t.Fatal("expected error for expired upload batch")
 	}
@@ -515,7 +527,7 @@ func TestV2FullUploadFlow(t *testing.T) {
 	for i := range partNums {
 		partNums[i] = i + 1
 	}
-	urls, err := b.PresignParts(ctx, plan.UploadID, partNums)
+	urls, err := b.PresignParts(ctx, plan.UploadID, entriesFromInts(partNums))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -581,7 +593,7 @@ func TestV2CompleteETagMismatch(t *testing.T) {
 	for i := range partNums {
 		partNums[i] = i + 1
 	}
-	urls, err := b.PresignParts(ctx, plan.UploadID, partNums)
+	urls, err := b.PresignParts(ctx, plan.UploadID, entriesFromInts(partNums))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,7 +636,7 @@ func TestV2CompletePartCountMismatch(t *testing.T) {
 	}
 
 	// Transition to UPLOADING
-	if _, err := b.PresignPart(ctx, plan.UploadID, 1); err != nil {
+	if _, err := b.PresignPart(ctx, plan.UploadID, 1, nil); err != nil {
 		t.Fatal(err)
 	}
 

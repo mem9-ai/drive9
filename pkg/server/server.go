@@ -1158,7 +1158,8 @@ func (s *Server) handleV2PresignPart(w http.ResponseWriter, r *http.Request, upl
 		return
 	}
 	var req struct {
-		PartNumber int `json:"part_number"`
+		PartNumber int                      `json:"part_number"`
+		Checksum   *backend.PresignChecksum `json:"checksum,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_part_bad_body", "upload_id", uploadID, "error", err)...)
@@ -1169,7 +1170,7 @@ func (s *Server) handleV2PresignPart(w http.ResponseWriter, r *http.Request, upl
 		errJSON(w, http.StatusBadRequest, "part_number must be >= 1")
 		return
 	}
-	u, err := b.PresignPart(r.Context(), uploadID, req.PartNumber)
+	u, err := b.PresignPart(r.Context(), uploadID, req.PartNumber, req.Checksum)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "upload not found")
@@ -1203,18 +1204,18 @@ func (s *Server) handleV2PresignBatch(w http.ResponseWriter, r *http.Request, up
 		return
 	}
 	var req struct {
-		PartNumbers []int `json:"part_numbers"`
+		Parts []backend.PresignPartEntry `json:"parts"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_batch_bad_body", "upload_id", uploadID, "error", err)...)
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
-	if len(req.PartNumbers) == 0 {
-		errJSON(w, http.StatusBadRequest, "part_numbers must not be empty")
+	if len(req.Parts) == 0 {
+		errJSON(w, http.StatusBadRequest, "parts must not be empty")
 		return
 	}
-	urls, err := b.PresignParts(r.Context(), uploadID, req.PartNumbers)
+	urls, err := b.PresignParts(r.Context(), uploadID, req.Parts)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "upload not found")
