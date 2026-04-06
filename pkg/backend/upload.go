@@ -273,7 +273,7 @@ func (b *Dat9Backend) InitiateUploadV2(ctx context.Context, path string, totalSi
 		ExpiresAt:        expiresAt.Format(time.RFC3339),
 		Resumable:        false,
 		ChecksumContract: ChecksumContract{
-			Supported: []string{"crc32c"},
+			Supported: []string{"SHA-256"},
 			Required:  false,
 		},
 	}, nil
@@ -420,7 +420,7 @@ func (b *Dat9Backend) ConfirmUploadV2(ctx context.Context, uploadID string, clie
 		return datastore.ErrUploadNotActive
 	}
 	if time.Now().After(upload.ExpiresAt) {
-		_ = b.store.AbortUpload(ctx, uploadID)
+		_ = b.AbortUploadV2(ctx, uploadID)
 		metrics.RecordOperation("backend", "confirm_upload_v2", "expired", time.Since(start))
 		return datastore.ErrUploadExpired
 	}
