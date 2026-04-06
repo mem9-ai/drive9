@@ -307,12 +307,12 @@ func (b *Dat9Backend) PresignPart(ctx context.Context, uploadID string, partNumb
 		return nil, datastore.ErrUploadNotActive
 	}
 	if time.Now().After(upload.ExpiresAt) {
-		_ = b.store.AbortUpload(ctx, uploadID)
+		_ = b.AbortUploadV2(ctx, uploadID)
 		metrics.RecordOperation("backend", "presign_part", "expired", time.Since(start))
 		return nil, datastore.ErrUploadExpired
 	}
 	if upload.Status == datastore.UploadInitiated {
-		if err := b.store.UpdateUploadStatus(ctx, uploadID, datastore.UploadUploading); err != nil {
+		if err := b.store.TransitionUploadStatus(ctx, uploadID, datastore.UploadInitiated, datastore.UploadUploading); err != nil {
 			logger.Error(ctx, "backend_presign_part_status_transition_failed", zap.String("upload_id", uploadID), zap.Error(err))
 			metrics.RecordOperation("backend", "presign_part", "error", time.Since(start))
 			return nil, err
@@ -352,7 +352,7 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, entries
 		return nil, datastore.ErrUploadNotActive
 	}
 	if time.Now().After(upload.ExpiresAt) {
-		_ = b.store.AbortUpload(ctx, uploadID)
+		_ = b.AbortUploadV2(ctx, uploadID)
 		metrics.RecordOperation("backend", "presign_parts", "expired", time.Since(start))
 		return nil, datastore.ErrUploadExpired
 	}
@@ -370,7 +370,7 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, entries
 		seen[e.PartNumber] = true
 	}
 	if upload.Status == datastore.UploadInitiated {
-		if err := b.store.UpdateUploadStatus(ctx, uploadID, datastore.UploadUploading); err != nil {
+		if err := b.store.TransitionUploadStatus(ctx, uploadID, datastore.UploadInitiated, datastore.UploadUploading); err != nil {
 			logger.Error(ctx, "backend_presign_parts_status_transition_failed", zap.String("upload_id", uploadID), zap.Error(err))
 			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
 			return nil, err
