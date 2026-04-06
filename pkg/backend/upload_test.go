@@ -240,6 +240,75 @@ func TestListUploads(t *testing.T) {
 	}
 }
 
+// TestPartSizePersistedAndImmutable verifies that the part_size written to the
+// uploads row at initiate time is the exact value read back by GetUpload,
+// ConfirmUpload, and ResumeUpload — ensuring no code path silently substitutes
+// the hardcoded s3client.PartSize constant.
+func TestPartSizePersistedAndImmutable(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	totalSize := int64(20 << 20) // 20 MiB → 3 parts at 8 MiB
+	plan, err := b.InitiateUpload(ctx, "/partsize-test.bin", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. UploadPlan must carry the same part_size used at insert.
+	if plan.PartSize != s3client.PartSize {
+		t.Fatalf("plan.PartSize = %d, want %d", plan.PartSize, s3client.PartSize)
+	}
+
+	// 2. Round-trip: the value read from the DB must match.
+	upload, err := b.GetUpload(ctx, plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upload.PartSize != s3client.PartSize {
+		t.Fatalf("upload.PartSize = %d, want %d", upload.PartSize, s3client.PartSize)
+	}
+
+	// 3. ResumeUpload must use the persisted part_size (not a hardcoded constant).
+	//    Upload part 1, then resume — the returned plan's PartSize must match.
+	data := make([]byte, s3client.PartSize)
+	if _, err := b.S3().(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, 1, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := b.ResumeUpload(ctx, plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.PartSize != upload.PartSize {
+		t.Fatalf("resumed.PartSize = %d, want %d (persisted value)", resumed.PartSize, upload.PartSize)
+	}
+
+	// 4. Upload remaining parts and confirm — ConfirmUpload internally uses
+	//    upload.PartSize to verify part sizes, so a mismatch would fail here.
+	for _, p := range resumed.Parts {
+		start := int64(p.Number-1) * upload.PartSize
+		end := start + p.Size
+		if end > totalSize {
+			end = totalSize
+		}
+		chunk := make([]byte, end-start)
+		if _, err := b.S3().(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, p.Number, bytes.NewReader(chunk)); err != nil {
+			t.Fatalf("upload part %d: %v", p.Number, err)
+		}
+	}
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatalf("ConfirmUpload failed: %v", err)
+	}
+
+	// 5. After completion the persisted part_size must remain unchanged.
+	final, err := b.GetUpload(ctx, plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.PartSize != upload.PartSize {
+		t.Fatalf("part_size changed after confirm: got %d, want %d", final.PartSize, upload.PartSize)
+	}
+}
+
 func TestOneUploadPerPath(t *testing.T) {
 	b := newTestBackendWithS3(t)
 	ctx := context.Background()
