@@ -90,10 +90,11 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 	}
 
 	// Use client-provided part size if valid (>= MinPartSize); otherwise
-	// compute adaptive part size from the new file size.
+	// fall back to fixed 8 MiB for backward compatibility with old clients
+	// that compute dirty_parts at fixed 8 MiB boundaries.
 	partSize := clientPartSize
 	if partSize < s3client.MinPartSize {
-		partSize = s3client.CalcAdaptivePartSize(newSize)
+		partSize = s3client.PartSize
 	}
 	newParts := s3client.CalcParts(newSize, partSize)
 
