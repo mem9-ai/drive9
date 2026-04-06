@@ -96,6 +96,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/fs/", business)
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
+	mux.Handle("/v2/uploads/", business)
 	mux.Handle("/v1/sql", business)
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
@@ -231,6 +232,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleUploads(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/uploads/"):
 		s.handleUploadAction(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v2/uploads/"):
+		s.handleV2Uploads(w, r)
 	case r.URL.Path == "/v1/sql":
 		s.handleSQL(w, r)
 	default:
@@ -1063,6 +1066,164 @@ func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploa
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_abort_ok", "upload_id", uploadID)...)
 	metricEvent(r.Context(), "upload_abort", "result", "ok")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// --- v2 upload handlers (on-demand presign, adaptive part size) ---
+
+func (s *Server) handleV2Uploads(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/v2/uploads/")
+	parts := strings.SplitN(rest, "/", 2)
+	seg0 := parts[0]
+	action := ""
+	if len(parts) > 1 {
+		action = strings.Trim(parts[1], "/")
+	}
+
+	switch {
+	case seg0 == "initiate" && r.Method == http.MethodPost:
+		s.handleV2UploadInitiate(w, r)
+	case seg0 != "" && action == "presign" && r.Method == http.MethodPost:
+		s.handleV2PresignPart(w, r, seg0)
+	case seg0 != "" && action == "presign-batch" && r.Method == http.MethodPost:
+		s.handleV2PresignBatch(w, r, seg0)
+	case seg0 != "" && action == "complete" && r.Method == http.MethodPost:
+		s.handleUploadComplete(w, r, seg0)
+	case seg0 != "" && action == "" && r.Method == http.MethodDelete:
+		s.handleUploadAbort(w, r, seg0)
+	default:
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_uploads_unknown_route", "path", r.URL.Path, "method", r.Method)...)
+		errJSON(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_missing_scope")...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	var req struct {
+		Path      string `json:"path"`
+		TotalSize int64  `json:"total_size"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			errJSON(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_bad_body", "error", err)...)
+		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Path) == "" {
+		errJSON(w, http.StatusBadRequest, "missing path")
+		return
+	}
+	if req.TotalSize <= 0 {
+		errJSON(w, http.StatusBadRequest, "total_size must be positive")
+		return
+	}
+	if req.TotalSize > s.maxUploadBytes {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_too_large", "path", req.Path, "bytes", req.TotalSize, "max", s.maxUploadBytes)...)
+		errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
+		return
+	}
+	plan, err := b.InitiateUploadV2(r.Context(), req.Path, req.TotalSize)
+	if err != nil {
+		if errors.Is(err, datastore.ErrUploadConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_conflict", "path", req.Path, "error", err)...)
+			metricEvent(r.Context(), "v2_upload_initiate", "result", "conflict")
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_failed", "path", req.Path, "error", err)...)
+		metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_ok", "path", req.Path, "part_size", plan.PartSize, "total_parts", plan.TotalParts)...)
+	metricEvent(r.Context(), "v2_upload_initiate", "result", "ok")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(plan)
+}
+
+func (s *Server) handleV2PresignPart(w http.ResponseWriter, r *http.Request, uploadID string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_part_missing_scope", "upload_id", uploadID)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	var req struct {
+		PartNumber int `json:"part_number"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_part_bad_body", "upload_id", uploadID, "error", err)...)
+		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if req.PartNumber < 1 {
+		errJSON(w, http.StatusBadRequest, "part_number must be >= 1")
+		return
+	}
+	url, err := b.PresignPart(r.Context(), uploadID, req.PartNumber)
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrUploadNotActive) || errors.Is(err, datastore.ErrUploadExpired) {
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_part_failed", "upload_id", uploadID, "part", req.PartNumber, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_part_ok", "upload_id", uploadID, "part", req.PartNumber)...)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(url)
+}
+
+func (s *Server) handleV2PresignBatch(w http.ResponseWriter, r *http.Request, uploadID string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_batch_missing_scope", "upload_id", uploadID)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	var req struct {
+		PartNumbers []int `json:"part_numbers"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_batch_bad_body", "upload_id", uploadID, "error", err)...)
+		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if len(req.PartNumbers) == 0 {
+		errJSON(w, http.StatusBadRequest, "part_numbers must not be empty")
+		return
+	}
+	urls, err := b.PresignParts(r.Context(), uploadID, req.PartNumbers)
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrUploadNotActive) || errors.Is(err, datastore.ErrUploadExpired) {
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_batch_failed", "upload_id", uploadID, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_batch_ok", "upload_id", uploadID, "parts", len(urls))...)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"parts": urls})
 }
 
 func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {

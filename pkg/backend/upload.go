@@ -23,6 +23,15 @@ type UploadPlan struct {
 	Parts    []*s3client.UploadPartURL `json:"parts"`
 }
 
+// UploadPlanV2 is returned by InitiateUploadV2 — no presigned URLs.
+type UploadPlanV2 struct {
+	UploadID   string `json:"upload_id"`
+	Key        string `json:"key"`
+	PartSize   int64  `json:"part_size"`
+	TotalParts int    `json:"total_parts"`
+	ExpiresAt  string `json:"expires_at"`
+}
+
 var ErrPartChecksumCountMismatch = errors.New("part checksum count mismatch")
 
 // S3 returns the S3Client (nil when not configured).
@@ -145,6 +154,158 @@ func (b *Dat9Backend) InitiateUploadWithChecksums(ctx context.Context, path stri
 		PartSize: s3client.PartSize,
 		Parts:    urls,
 	}, nil
+}
+
+// InitiateUploadV2 creates a multipart upload with adaptive part size.
+// Unlike v1, it does NOT presign any URLs — clients fetch them on demand.
+func (b *Dat9Backend) InitiateUploadV2(ctx context.Context, path string, totalSize int64) (*UploadPlanV2, error) {
+	start := time.Now()
+
+	path, err := pathutil.Canonicalize(path)
+	if err != nil {
+		logger.Warn(ctx, "backend_initiate_upload_v2_invalid_path", zap.String("path", path), zap.Error(err))
+		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+		return nil, err
+	}
+	if b.s3 == nil {
+		err := fmt.Errorf("S3 not configured")
+		logger.Error(ctx, "backend_initiate_upload_v2_s3_missing", zap.String("path", path), zap.Error(err))
+		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+		return nil, err
+	}
+
+	existing, err := b.store.GetUploadByPath(ctx, path)
+	if err == nil && existing != nil {
+		metrics.RecordOperation("backend", "initiate_upload_v2", "conflict", time.Since(start))
+		return nil, datastore.ErrUploadConflict
+	}
+
+	partSize := s3client.CalcAdaptivePartSize(totalSize)
+	parts := s3client.CalcParts(totalSize, partSize)
+
+	fileID := b.genID()
+	s3Key := "blobs/" + fileID
+
+	mpu, err := b.s3.CreateMultipartUpload(ctx, s3Key)
+	if err != nil {
+		logger.Error(ctx, "backend_initiate_upload_v2_create_multipart_failed", zap.String("path", path), zap.Error(err))
+		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+		return nil, fmt.Errorf("create multipart upload: %w", err)
+	}
+
+	now := time.Now()
+	uploadID := b.genID()
+	expiresAt := now.Add(24 * time.Hour)
+
+	if err := b.store.InsertFile(ctx, &datastore.File{
+		FileID:      fileID,
+		StorageType: datastore.StorageS3,
+		StorageRef:  s3Key,
+		SizeBytes:   totalSize,
+		Revision:    1,
+		Status:      datastore.StatusPending,
+		CreatedAt:   now,
+	}); err != nil {
+		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
+		logger.Error(ctx, "backend_initiate_upload_v2_insert_file_failed", zap.String("path", path), zap.Error(err))
+		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+		return nil, err
+	}
+
+	if err := b.store.InsertUpload(ctx, &datastore.Upload{
+		UploadID:   uploadID,
+		FileID:     fileID,
+		TargetPath: path,
+		S3UploadID: mpu.UploadID,
+		S3Key:      s3Key,
+		TotalSize:  totalSize,
+		PartSize:   partSize,
+		PartsTotal: len(parts),
+		Status:     datastore.UploadUploading,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		ExpiresAt:  expiresAt,
+	}); err != nil {
+		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
+		logger.Error(ctx, "backend_initiate_upload_v2_insert_upload_failed", zap.String("path", path), zap.Error(err))
+		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+		return nil, err
+	}
+	metrics.RecordOperation("backend", "initiate_upload_v2", "ok", time.Since(start))
+
+	return &UploadPlanV2{
+		UploadID:   uploadID,
+		Key:        s3Key,
+		PartSize:   partSize,
+		TotalParts: len(parts),
+		ExpiresAt:  expiresAt.Format(time.RFC3339),
+	}, nil
+}
+
+// PresignPart presigns a single part URL for an active upload.
+func (b *Dat9Backend) PresignPart(ctx context.Context, uploadID string, partNumber int) (*s3client.UploadPartURL, error) {
+	start := time.Now()
+
+	upload, err := b.store.GetUpload(ctx, uploadID)
+	if err != nil {
+		metrics.RecordOperation("backend", "presign_part", "error", time.Since(start))
+		return nil, err
+	}
+	if upload.Status != datastore.UploadUploading {
+		metrics.RecordOperation("backend", "presign_part", "not_active", time.Since(start))
+		return nil, datastore.ErrUploadNotActive
+	}
+	if partNumber < 1 || partNumber > upload.PartsTotal {
+		metrics.RecordOperation("backend", "presign_part", "error", time.Since(start))
+		return nil, fmt.Errorf("invalid part number %d: must be between 1 and %d", partNumber, upload.PartsTotal)
+	}
+
+	parts := s3client.CalcParts(upload.TotalSize, upload.PartSize)
+	partSize := parts[partNumber-1].Size
+
+	u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, partNumber, partSize, "", s3client.UploadTTL)
+	if err != nil {
+		logger.Error(ctx, "backend_presign_part_failed", zap.String("upload_id", uploadID), zap.Int("part_number", partNumber), zap.Error(err))
+		metrics.RecordOperation("backend", "presign_part", "error", time.Since(start))
+		return nil, fmt.Errorf("presign part %d: %w", partNumber, err)
+	}
+	metrics.RecordOperation("backend", "presign_part", "ok", time.Since(start))
+	return u, nil
+}
+
+// PresignParts presigns multiple part URLs for an active upload.
+func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, partNumbers []int) ([]*s3client.UploadPartURL, error) {
+	start := time.Now()
+
+	upload, err := b.store.GetUpload(ctx, uploadID)
+	if err != nil {
+		metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
+		return nil, err
+	}
+	if upload.Status != datastore.UploadUploading {
+		metrics.RecordOperation("backend", "presign_parts", "not_active", time.Since(start))
+		return nil, datastore.ErrUploadNotActive
+	}
+
+	parts := s3client.CalcParts(upload.TotalSize, upload.PartSize)
+
+	urls := make([]*s3client.UploadPartURL, len(partNumbers))
+	for i, pn := range partNumbers {
+		if pn < 1 || pn > upload.PartsTotal {
+			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
+			return nil, fmt.Errorf("invalid part number %d: must be between 1 and %d", pn, upload.PartsTotal)
+		}
+		partSize := parts[pn-1].Size
+		u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, pn, partSize, "", s3client.UploadTTL)
+		if err != nil {
+			logger.Error(ctx, "backend_presign_parts_failed", zap.String("upload_id", uploadID), zap.Int("part_number", pn), zap.Error(err))
+			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
+			return nil, fmt.Errorf("presign part %d: %w", pn, err)
+		}
+		urls[i] = u
+	}
+	metrics.RecordOperation("backend", "presign_parts", "ok", time.Since(start))
+	return urls, nil
 }
 
 // ConfirmUpload completes the multipart upload and creates the file node.

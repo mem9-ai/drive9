@@ -231,6 +231,8 @@ func requestRoute(path string) string {
 		return "/v1/uploads"
 	case strings.HasPrefix(path, "/v1/uploads/"):
 		return "/v1/uploads/*"
+	case strings.HasPrefix(path, "/v2/uploads/"):
+		return "/v2/uploads/*"
 	case strings.HasPrefix(path, "/s3/"):
 		return "/s3/*"
 	default:
