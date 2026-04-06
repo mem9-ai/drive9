@@ -79,7 +79,7 @@ func TestGetAttrPrefersDirtyHandleSize(t *testing.T) {
 	fh := &FileHandle{
 		Ino:   ino,
 		Path:  "/file.bin",
-		Dirty: NewWriteBuffer("/file.bin", 0),
+		Dirty: NewWriteBuffer("/file.bin", 0, 0),
 	}
 	if _, err := fh.Dirty.Write(0, []byte("dirty-size")); err != nil {
 		t.Fatal(err)
@@ -108,12 +108,12 @@ func TestGetAttrUsesLatestDirtyHandleSize(t *testing.T) {
 	fh1 := &FileHandle{
 		Ino:   ino,
 		Path:  "/file.bin",
-		Dirty: NewWriteBuffer("/file.bin", 0),
+		Dirty: NewWriteBuffer("/file.bin", 0, 0),
 	}
 	fh2 := &FileHandle{
 		Ino:   ino,
 		Path:  "/file.bin",
-		Dirty: NewWriteBuffer("/file.bin", 0),
+		Dirty: NewWriteBuffer("/file.bin", 0, 0),
 	}
 	fhID1 := fs.fileHandles.Allocate(fh1)
 	fhID2 := fs.fileHandles.Allocate(fh2)

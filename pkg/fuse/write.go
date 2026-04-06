@@ -4,12 +4,12 @@ import "syscall"
 
 const (
 	defaultWriteBufferMaxSize = 64 << 20  // 64MB per file
-	partSize                  = 8 << 20   // 8MB - must match s3client.PartSize
+	DefaultPartSize           = 8 << 20   // 8MB - default for v1 uploads; v2 may use adaptive sizes
 	maxPreloadSize            = 256 << 20 // 256MB - hard limit for preloading existing files into memory
 )
 
 // WriteBuffer accumulates write data for a single file.
-// It tracks which 8MB parts have been modified so that on flush,
+// It tracks which parts have been modified so that on flush,
 // only dirty parts need to be uploaded (unchanged parts are copied
 // server-side via S3 UploadPartCopy).
 // It is NOT thread-safe; callers must hold the FileHandle mutex.
@@ -17,19 +17,25 @@ type WriteBuffer struct {
 	path       string
 	buf        []byte
 	maxSize    int64
+	partSize   int64
 	dirtyParts []bool
 	touched    bool
 }
 
 // NewWriteBuffer creates a new WriteBuffer for the given path.
 // If maxSize <= 0, defaultWriteBufferMaxSize (64MB) is used.
-func NewWriteBuffer(path string, maxSize int64) *WriteBuffer {
+// If partSize <= 0, DefaultPartSize (8MB) is used.
+func NewWriteBuffer(path string, maxSize int64, partSize int64) *WriteBuffer {
 	if maxSize <= 0 {
 		maxSize = defaultWriteBufferMaxSize
 	}
+	if partSize <= 0 {
+		partSize = DefaultPartSize
+	}
 	return &WriteBuffer{
-		path:    path,
-		maxSize: maxSize,
+		path:     path,
+		maxSize:  maxSize,
+		partSize: partSize,
 	}
 }
 
@@ -64,8 +70,8 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 
 // markDirty marks all parts that overlap with [start, end) as dirty.
 func (wb *WriteBuffer) markDirty(start, end int64) {
-	firstPart := int(start / partSize)
-	lastPart := int((end - 1) / partSize)
+	firstPart := int(start / wb.partSize)
+	lastPart := int((end - 1) / wb.partSize)
 	if end <= start {
 		return
 	}
@@ -107,11 +113,11 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 		}
 		wb.buf = wb.buf[:size]
 		// Shrink dirtyParts if we now have fewer parts.
-		newParts := int((size + partSize - 1) / partSize)
+		newParts := int((size + wb.partSize - 1) / wb.partSize)
 		if newParts < len(wb.dirtyParts) {
 			wb.dirtyParts = wb.dirtyParts[:newParts]
 		}
-		if size > 0 && size%partSize == 0 && newParts > 0 {
+		if size > 0 && size%wb.partSize == 0 && newParts > 0 {
 			// Exact-boundary shrinks still need a PATCH/flush to update the
 			// remote object size, even if no part payload changed.
 			wb.dirtyParts[newParts-1] = true
@@ -138,6 +144,11 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 // Size returns the current buffer length.
 func (wb *WriteBuffer) Size() int64 {
 	return int64(len(wb.buf))
+}
+
+// PartSize returns the part size used for dirty-part boundary calculations.
+func (wb *WriteBuffer) PartSize() int64 {
+	return wb.partSize
 }
 
 func (wb *WriteBuffer) HasDirtyParts() bool {
@@ -173,7 +184,7 @@ func (wb *WriteBuffer) DirtyPartNumbers() []int {
 // MarkAllDirty marks every part in the current buffer as dirty.
 // Used when the entire file content is loaded (e.g., new file or full rewrite).
 func (wb *WriteBuffer) MarkAllDirty() {
-	n := int((wb.Size() + partSize - 1) / partSize)
+	n := int((wb.Size() + wb.partSize - 1) / wb.partSize)
 	wb.dirtyParts = make([]bool, n)
 	for i := range wb.dirtyParts {
 		wb.dirtyParts[i] = true
@@ -183,11 +194,11 @@ func (wb *WriteBuffer) MarkAllDirty() {
 // PartData returns the data for a specific 1-based part number.
 // Returns nil if the part is out of range.
 func (wb *WriteBuffer) PartData(partNum int) []byte {
-	start := int64(partNum-1) * partSize
+	start := int64(partNum-1) * wb.partSize
 	if start >= int64(len(wb.buf)) {
 		return nil
 	}
-	end := start + partSize
+	end := start + wb.partSize
 	if end > int64(len(wb.buf)) {
 		end = int64(len(wb.buf))
 	}
