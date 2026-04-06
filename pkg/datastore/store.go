@@ -819,6 +819,28 @@ func (s *Store) UpdateUploadStatus(ctx context.Context, uploadID string, status 
 	return err
 }
 
+// TransitionUploadStatus atomically transitions an upload from expectedStatus to newStatus.
+// Returns ErrUploadNotActive if the current status doesn't match expectedStatus.
+func (s *Store) TransitionUploadStatus(ctx context.Context, uploadID string, expectedStatus, newStatus UploadStatus) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "transition_upload_status", start, &err)
+
+	res, err := s.db.ExecContext(ctx, `UPDATE uploads SET status = ?,
+		updated_at = ?
+		WHERE upload_id = ? AND status = ?`, string(newStatus), time.Now().UTC(), uploadID, string(expectedStatus))
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrUploadNotActive
+	}
+	return nil
+}
+
 func (s *Store) ListUploadsByPath(ctx context.Context, targetPath string, status UploadStatus) (out []*Upload, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "list_uploads_by_path", start, &err)
