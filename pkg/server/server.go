@@ -1082,8 +1082,6 @@ func (s *Server) handleV2Uploads(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case seg0 == "initiate" && r.Method == http.MethodPost:
 		s.handleV2UploadInitiate(w, r)
-	case seg0 != "" && action == "complete" && r.Method == http.MethodPost:
-		s.handleUploadComplete(w, r, seg0)
 	case seg0 != "" && action == "abort" && r.Method == http.MethodPost:
 		s.handleV2UploadAbort(w, r, seg0)
 	default:

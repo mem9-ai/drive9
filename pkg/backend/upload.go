@@ -624,6 +624,7 @@ func (b *Dat9Backend) AbortUpload(ctx context.Context, uploadID string) error {
 }
 
 // AbortUploadV2 cancels an upload (idempotent — returns nil for not-found or already-aborted).
+// Cleans up: aborts S3 multipart, marks upload ABORTED, marks pending file DELETED.
 func (b *Dat9Backend) AbortUploadV2(ctx context.Context, uploadID string) error {
 	start := time.Now()
 	upload, err := b.store.GetUpload(ctx, uploadID)
@@ -647,6 +648,12 @@ func (b *Dat9Backend) AbortUploadV2(ctx context.Context, uploadID string) error 
 		logger.Error(ctx, "backend_abort_upload_v2_store_failed", zap.String("upload_id", uploadID), zap.Error(err))
 		metrics.RecordOperation("backend", "abort_upload_v2", "error", time.Since(start))
 		return err
+	}
+	// Clean up the pending file row created at initiate time.
+	if upload.FileID != "" {
+		if err := b.store.MarkFileDeleted(ctx, upload.FileID); err != nil {
+			logger.Warn(ctx, "backend_abort_upload_v2_mark_file_deleted_failed", zap.String("upload_id", uploadID), zap.String("file_id", upload.FileID), zap.Error(err))
+		}
 	}
 	metrics.RecordOperation("backend", "abort_upload_v2", "ok", time.Since(start))
 	return nil
