@@ -102,6 +102,10 @@ func TestWriteStreamLargeFile(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			// v2 not supported by this mock — trigger v1 fallback
+			http.NotFound(w, r)
+
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
 			var req uploadInitiateRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -147,6 +151,9 @@ func TestWriteStreamLargeFile(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/upload-123/complete":
 			completeCalled.Store(true)
 			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
 		}
 	}))
 	defer srv.Close()

@@ -89,7 +89,9 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 		return nil, fmt.Errorf("create multipart upload: %w", err)
 	}
 
-	// Calculate new parts
+	// Calculate new parts — patch path uses fixed PartSize because callers
+	// (FUSE, client) determine dirty_parts based on this boundary before
+	// the server responds. Adaptive part size for patches deferred to T5.
 	newParts := s3client.CalcParts(newSize, s3client.PartSize)
 
 	// Build dirty set for O(1) lookup

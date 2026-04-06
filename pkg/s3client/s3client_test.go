@@ -214,3 +214,73 @@ func TestPartialUploadAndListParts(t *testing.T) {
 		t.Errorf("unexpected part numbers: %v", listed)
 	}
 }
+
+func TestCalcAdaptivePartSize(t *testing.T) {
+	tests := []struct {
+		name     string
+		total    int64
+		wantPS   int64
+		wantN    int // expected number of parts (0 = skip check)
+	}{
+		{"small file 1 MiB", 1 << 20, PartSize, 1},
+		{"80 GiB", 80 * (1 << 30), 9 << 20, 0},           // ceil(80GiB/10000) → align up to 9 MiB
+		{"100 GiB", 100 * (1 << 30), 11 << 20, 0},        // ceil(100GiB/10000) → align up to 11 MiB
+		{"500 GiB", 500 * (1 << 30), 52 << 20, 0},        // ceil(500GiB/10000) → align up to 52 MiB
+		{"5 TiB max S3 object", 5 * (1 << 40), MaxAdaptivePartSize, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ps := CalcAdaptivePartSize(tt.total)
+			if ps < PartSize {
+				t.Errorf("part size %d < minimum %d", ps, PartSize)
+			}
+			if ps > MaxAdaptivePartSize {
+				t.Errorf("part size %d > maximum %d", ps, MaxAdaptivePartSize)
+			}
+			// Check 1 MiB alignment
+			if ps%(1<<20) != 0 {
+				t.Errorf("part size %d not aligned to 1 MiB", ps)
+			}
+			if tt.wantPS != 0 && ps != tt.wantPS {
+				t.Errorf("CalcAdaptivePartSize(%d) = %d, want %d", tt.total, ps, tt.wantPS)
+			}
+			if tt.wantN != 0 {
+				parts := CalcParts(tt.total, ps)
+				if len(parts) != tt.wantN {
+					t.Errorf("CalcParts(%d, %d) = %d parts, want %d", tt.total, ps, len(parts), tt.wantN)
+				}
+			}
+		})
+	}
+}
+
+func TestCalcAdaptivePartSizeInvariants(t *testing.T) {
+	// Monotonicity: larger files should produce >= part sizes
+	prev := CalcAdaptivePartSize(1)
+	for _, size := range []int64{
+		1 << 20, 10 << 20, 100 << 20, 1 << 30, 10 * (1 << 30),
+		50 * (1 << 30), 100 * (1 << 30), 500 * (1 << 30), 1 << 40, 5 * (1 << 40),
+	} {
+		ps := CalcAdaptivePartSize(size)
+		if ps < prev {
+			t.Errorf("monotonicity violated: CalcAdaptivePartSize(%d)=%d < CalcAdaptivePartSize(prev)=%d", size, ps, prev)
+		}
+		prev = ps
+	}
+
+	// Zero and negative sizes should still return PartSize (minimum clamp)
+	if ps := CalcAdaptivePartSize(0); ps != PartSize {
+		t.Errorf("CalcAdaptivePartSize(0) = %d, want %d", ps, PartSize)
+	}
+	if ps := CalcAdaptivePartSize(-1); ps != PartSize {
+		t.Errorf("CalcAdaptivePartSize(-1) = %d, want %d", ps, PartSize)
+	}
+
+	// Files within MaxAdaptivePartSize * 10000 should produce <= 10000 parts
+	maxSafe := int64(MaxAdaptivePartSize) * 10000
+	ps := CalcAdaptivePartSize(maxSafe)
+	parts := CalcParts(maxSafe, ps)
+	if len(parts) > 10000 {
+		t.Errorf("CalcAdaptivePartSize(%d) = %d → %d parts, exceeds S3 limit of 10000", maxSafe, ps, len(parts))
+	}
+}

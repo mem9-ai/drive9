@@ -62,7 +62,7 @@ func uploadAllPartsForPlan(t *testing.T, b *Dat9Backend, plan *UploadPlan, uploa
 		partData[i] = byte(i % 251)
 	}
 	for _, part := range plan.Parts {
-		start := int64(part.Number-1) * s3client.PartSize
+		start := int64(part.Number-1) * upload.PartSize
 		end := start + part.Size
 		if end > totalSize {
 			end = totalSize
