@@ -141,6 +141,58 @@ func TestUploadInitiateByBody202(t *testing.T) {
 	}
 }
 
+func TestV1LargeFilePutRequiresChecksumHeader(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	body := make([]byte, 1<<20)
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/missing-checksums.bin", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, b)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), "missing X-Dat9-Part-Checksums header") {
+		t.Fatalf("expected missing checksum header error, got %s", b)
+	}
+}
+
+func TestV1UploadInitiateByBodyRequiresPartChecksums(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	reqBody := map[string]any{
+		"path":       "/missing-body-checksums.bin",
+		"total_size": 1 << 20,
+	}
+	p, _ := json.Marshal(reqBody)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/initiate", bytes.NewReader(p))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, b)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), "missing part_checksums") {
+		t.Fatalf("expected missing part_checksums error, got %s", b)
+	}
+}
+
 func TestSmallFilePut200(t *testing.T) {
 	s, _ := newTestServerWithS3(t)
 	ts := httptest.NewServer(s)
@@ -351,6 +403,44 @@ func TestUploadResumeEndpointByBody(t *testing.T) {
 	}
 	if len(resumed.Parts) != 2 {
 		t.Errorf("expected 2 missing parts, got %d", len(resumed.Parts))
+	}
+}
+
+func TestV1UploadResumeRequiresChecksums(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	totalSize := int64(20 << 20)
+	body := make([]byte, totalSize)
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/resume-missing-checksums.bin", bytes.NewReader(body))
+	req.ContentLength = totalSize
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var plan backend.UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/"+plan.UploadID+"/resume", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, b)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), "missing X-Dat9-Part-Checksums header") {
+		t.Fatalf("expected missing checksum header error, got %s", b)
 	}
 }
 
