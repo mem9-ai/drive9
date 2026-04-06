@@ -1,7 +1,7 @@
-# Proposal: Phase 1 rollout for durable `img_extract_text` in dat9
+# Proposal: Phase 1 rollout for durable `img_extract_text` in drive9
 
 **Date**: 2026-04-01
-**Purpose**: Based on the current `dat9` codebase, propose a production-oriented, clearly scoped, incrementally rollable Phase 1 plan to migrate the current backend-owned asynchronous image text extraction path from a best-effort in-memory queue to the durable `semantic_tasks` substrate, with priority on `auto embedding + create + overwrite + upload completion`.
+**Purpose**: Based on the current `drive9` codebase, propose a production-oriented, clearly scoped, incrementally rollable Phase 1 plan to migrate the current backend-owned asynchronous image text extraction path from a best-effort in-memory queue to the durable `semantic_tasks` substrate, with priority on `auto embedding + create + overwrite + upload completion`.
 
 ## Summary
 
@@ -29,8 +29,8 @@ The current repository already has most of the image text extraction machinery. 
 
 **Synchronous text fast path**
 
-- `extractText(data, contentType)` lives in `pkg/backend/dat9.go:719`
-- It only handles a subset of text content types; once a file exceeds `smallFileThreshold`, it returns an empty string, see `pkg/backend/dat9.go:32` and `pkg/backend/dat9.go:726`
+- `extractText(data, contentType)` lives in `pkg/backend/drive9.go:719`
+- It only handles a subset of text content types; once a file exceeds `smallFileThreshold`, it returns an empty string, see `pkg/backend/drive9.go:32` and `pkg/backend/drive9.go:726`
 - This path is responsible for synchronous `content_text` production for small text files, not images
 
 **Current asynchronous image extraction prototype**
@@ -51,8 +51,8 @@ The current repository already has most of the image text extraction machinery. 
 
 Even though the durable substrate already exists, image text production in auto embedding mode still depends on a backend-owned in-memory queue. The relevant write paths are:
 
-- `create` still directly calls `enqueueImageExtract(...)`, see `pkg/backend/dat9.go:368`
-- `overwrite` still directly calls `enqueueImageExtract(...)`, see `pkg/backend/dat9.go:450`
+- `create` still directly calls `enqueueImageExtract(...)`, see `pkg/backend/drive9.go:368`
+- `overwrite` still directly calls `enqueueImageExtract(...)`, see `pkg/backend/drive9.go:450`
 - `upload completion` still directly calls `enqueueImageExtractForUpload(...)`, see `pkg/backend/upload.go:311`
 
 This means auto embedding still has the following production risks:
@@ -67,9 +67,9 @@ This means auto embedding still has the following production risks:
 The current code already distinguishes the two embedding modes clearly:
 
 - In auto embedding mode, `files.embedding` is a stored generated column derived by the database from `content_text`, see `pkg/tenant/schema_tidb_auto.go:72`
-- Auto embedding write paths do not enqueue app-managed `embed` tasks, see `pkg/backend/dat9.go:358` and `pkg/backend/upload.go:252`
+- Auto embedding write paths do not enqueue app-managed `embed` tasks, see `pkg/backend/drive9.go:358` and `pkg/backend/upload.go:252`
 - Auto embedding overwrite/confirm helpers do not clear embedding columns, see `pkg/datastore/file_tx.go:77` and `pkg/datastore/file_tx.go:120`
-- In auto embedding mode, grep uses `VectorSearchByText` directly instead of an app-side query embedder, see `pkg/backend/dat9.go:768`
+- In auto embedding mode, grep uses `VectorSearchByText` directly instead of an app-side query embedder, see `pkg/backend/drive9.go:768`
 
 So prioritizing auto embedding in Phase 1 creates a smaller and real closed loop: once `content_text` is written back durably, the database's existing auto embedding behavior continues to work.
 
@@ -139,7 +139,7 @@ Request Path                                  Background Path
    stops here           may requeue / bridge embed
 
 Separate server-owned semantic worker today:
-    semantic worker in dat9-server -> only handles durable embed tasks
+    semantic worker in drive9-server -> only handles durable embed tasks
 
 
 Target Architecture (Phase 1)
@@ -147,7 +147,7 @@ Target Architecture (Phase 1)
 
 Request Path                                  Background Path
 +----------------------------------+          +----------------------------------+
-| create / overwrite /            |          | semantic worker in dat9-server   |
+| create / overwrite /            |          | semantic worker in drive9-server   |
 | upload completion                |          | (server-owned delivery owner)    |
 +----------------+-----------------+          +----------------+-----------------+
                  |                                           |
@@ -280,11 +280,11 @@ Therefore, task registration must occur in the same transaction that commits the
 
 #### `create`
 
-In `createAndWriteCtx()`, an image-like small-file create should enqueue `img_extract_text` after `InsertFileTx + EnsureParentDirsTx + InsertNodeTx` succeed and before the transaction commits. Reference point: `pkg/backend/dat9.go:339`.
+In `createAndWriteCtx()`, an image-like small-file create should enqueue `img_extract_text` after `InsertFileTx + EnsureParentDirsTx + InsertNodeTx` succeed and before the transaction commits. Reference point: `pkg/backend/drive9.go:339`.
 
 #### `overwrite`
 
-In `overwriteFileCtx()`, an image-like overwrite should enqueue `img_extract_text` after `UpdateFileContentAutoEmbeddingTx(...)` returns the new revision and before the transaction commits. Reference point: `pkg/backend/dat9.go:422`.
+In `overwriteFileCtx()`, an image-like overwrite should enqueue `img_extract_text` after `UpdateFileContentAutoEmbeddingTx(...)` returns the new revision and before the transaction commits. Reference point: `pkg/backend/drive9.go:422`.
 
 #### `upload completion`
 

@@ -1,8 +1,8 @@
-# Dat9 Tenant Provisioning Design (DB9 / TiDB Zero / TiDB Starter)
+# Drive9 Tenant Provisioning Design (DB9 / TiDB Zero / TiDB Starter)
 
 ## 1. Goal and Scope
 
-This design defines how dat9 provisions a database for a new tenant, initializes the required schema, and stores connection credentials securely.
+This design defines how drive9 provisions a database for a new tenant, initializes the required schema, and stores connection credentials securely.
 
 - Support three provider options: `db9`, `tidb_zero`, `tidb_cloud_starter`
 - `db9` and `zero/starter` are peer options, selected by config
@@ -13,7 +13,7 @@ This design defines how dat9 provisions a database for a new tenant, initializes
 
 ## 2. Key Decisions
 
-- The dat9 data schema includes only: `file_nodes`, `files`, `file_tags`, `uploads`
+- The drive9 data schema includes only: `file_nodes`, `files`, `file_tags`, `uploads`
 - FTS and Vector are required capabilities (on `files`)
 - Encryption uses a unified abstraction: `Encryptor` (`Encrypt/Decrypt`) with a `plain/md5/kms` factory
 - `tenant_id` is the canonical tenant identity across all layers
@@ -28,7 +28,7 @@ This design defines how dat9 provisions a database for a new tenant, initializes
 1. API receives `CreateTenant`
 2. `TenantService` selects a provisioner (`db9` / `zero` / `starter`)
 3. Provisioner returns connection info (`host/port/user/password/dbname/cluster_id`)
-4. `SchemaInitializer` initializes dat9 schema (including FTS + Vector)
+4. `SchemaInitializer` initializes drive9 schema (including FTS + Vector)
 5. `Encryptor(kms)` encrypts DB password
 6. Persist tenant metadata in control-plane meta DB
 7. Issue a default JWT API key (non-expiring machine key)
@@ -39,7 +39,7 @@ This design defines how dat9 provisions a database for a new tenant, initializes
 No automatic fallback. Provider is selected strictly by config:
 
 ```text
-DAT9_TENANT_PROVIDER=db9 | tidb_zero | tidb_cloud_starter
+DRIVE9_TENANT_PROVIDER=db9 | tidb_zero | tidb_cloud_starter
 ```
 
 Behavior:
@@ -69,8 +69,8 @@ type Encryptor interface {
 Recommended defaults:
 
 ```text
-DAT9_ENCRYPT_TYPE=kms
-DAT9_ENCRYPT_KEY=alias/dat9-<env>-db-password
+DRIVE9_ENCRYPT_TYPE=kms
+DRIVE9_ENCRYPT_KEY=alias/drive9-<env>-db-password
 ```
 
 ### 4.3 KMS Storage Convention
@@ -123,7 +123,7 @@ type ClusterInfo struct {
 
 ---
 
-## 6. Dat9 Schema
+## 6. Drive9 Schema
 
 ### 6.1 Common Logical Requirement
 
@@ -359,27 +359,27 @@ Read/write rules:
 
 ```bash
 # provider selection
-DAT9_TENANT_PROVIDER=db9|tidb_zero|tidb_cloud_starter
+DRIVE9_TENANT_PROVIDER=db9|tidb_zero|tidb_cloud_starter
 
 # encryption
-DAT9_ENCRYPT_TYPE=kms
-DAT9_ENCRYPT_KEY=alias/dat9-<env>-db-password
+DRIVE9_ENCRYPT_TYPE=kms
+DRIVE9_ENCRYPT_KEY=alias/drive9-<env>-db-password
 
 # db9 (preferred)
-DAT9_DB9_API_URL=https://<db9-api>
-DAT9_DB9_API_KEY=<token>
+DRIVE9_DB9_API_URL=https://<db9-api>
+DRIVE9_DB9_API_KEY=<token>
 
 # tidb zero
-DAT9_ZERO_API_URL=https://<zero-api>
+DRIVE9_ZERO_API_URL=https://<zero-api>
 
 # tidb starter
-DAT9_TIDBCLOUD_API_URL=https://<tidb-cloud-api>
-DAT9_TIDBCLOUD_API_KEY=<key>
-DAT9_TIDBCLOUD_API_SECRET=<secret>
-DAT9_TIDBCLOUD_POOL_ID=<pool-id>
+DRIVE9_TIDBCLOUD_API_URL=https://<tidb-cloud-api>
+DRIVE9_TIDBCLOUD_API_KEY=<key>
+DRIVE9_TIDBCLOUD_API_SECRET=<secret>
+DRIVE9_TIDBCLOUD_POOL_ID=<pool-id>
 
 # meta db
-DAT9_META_DSN=<meta-db-dsn>
+DRIVE9_META_DSN=<meta-db-dsn>
 ```
 
 ### 7.3 API Key (JWT) Auth and Tenant Scope
@@ -418,7 +418,7 @@ type TenantScope struct {
     TenantID     string
     APIKeyID     string
     TokenVersion int
-    Backend      *backend.Dat9Backend
+    Backend      *backend.Drive9Backend
 }
 
 func ScopeFromContext(ctx context.Context) *TenantScope
@@ -457,16 +457,16 @@ Notes:
 ```bash
 # 1) Create KMS key
 aws kms create-key \
-  --description "dat9 tenant db password encryption" \
-  --tags TagKey=project,TagValue=dat9 TagKey=env,TagValue=shared
+  --description "drive9 tenant db password encryption" \
+  --tags TagKey=project,TagValue=drive9 TagKey=env,TagValue=shared
 
 # 2) Create alias
 aws kms create-alias \
-  --alias-name alias/dat9-<env>-db-password \
+  --alias-name alias/drive9-<env>-db-password \
   --target-key-id <KeyId>
 
 # 3) Verify
-aws kms describe-key --key-id alias/dat9-<env>-db-password
+aws kms describe-key --key-id alias/drive9-<env>-db-password
 ```
 
 Server config stores only alias, not plaintext key material.
@@ -494,7 +494,7 @@ Server config stores only alias, not plaintext key material.
 - Provisioner abstraction
 - Zero + Starter implementation
 - KMS Encryptor implementation
-- dat9 schema init (FTS + Vector)
+- drive9 schema init (FTS + Vector)
 - JWT API key table + tenant scope middleware
 
 ### Phase 2 (as soon as DB9 API is ready)
