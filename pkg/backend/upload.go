@@ -279,17 +279,21 @@ func (b *Dat9Backend) InitiateUploadV2(ctx context.Context, path string, totalSi
 	}, nil
 }
 
+// ErrUnsupportedAlgorithm is returned when a client supplies a checksum algorithm
+// not in ChecksumContract.Supported.
+var ErrUnsupportedAlgorithm = fmt.Errorf("unsupported checksum algorithm")
+
 // resolveChecksumSHA256 extracts the SHA-256 value from an optional checksum.
-// Phase 1 only supports SHA-256 pass-through; other algorithms are accepted
-// but ignored (the presigned URL won't include a checksum header for them).
-func resolveChecksumSHA256(cs *PresignChecksum) string {
+// Phase 1 only supports SHA-256; unsupported algorithms are rejected with
+// ErrUnsupportedAlgorithm so the contract stays honest.
+func resolveChecksumSHA256(cs *PresignChecksum) (string, error) {
 	if cs == nil || cs.Value == "" {
-		return ""
+		return "", nil
 	}
 	if cs.Algorithm == "sha256" || cs.Algorithm == "SHA256" || cs.Algorithm == "SHA-256" {
-		return cs.Value
+		return cs.Value, nil
 	}
-	return ""
+	return "", fmt.Errorf("%w: %s", ErrUnsupportedAlgorithm, cs.Algorithm)
 }
 
 // PresignPart presigns a single part URL for an active upload.
@@ -326,7 +330,11 @@ func (b *Dat9Backend) PresignPart(ctx context.Context, uploadID string, partNumb
 	parts := s3client.CalcParts(upload.TotalSize, upload.PartSize)
 	partSize := parts[partNumber-1].Size
 
-	checksumSHA256 := resolveChecksumSHA256(checksum)
+	checksumSHA256, err := resolveChecksumSHA256(checksum)
+	if err != nil {
+		metrics.RecordOperation("backend", "presign_part", "error", time.Since(start))
+		return nil, err
+	}
 	u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, partNumber, partSize, checksumSHA256, s3client.UploadTTL)
 	if err != nil {
 		logger.Error(ctx, "backend_presign_part_failed", zap.String("upload_id", uploadID), zap.Int("part_number", partNumber), zap.Error(err))
@@ -387,7 +395,11 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, entries
 			return nil, fmt.Errorf("invalid part number %d: must be between 1 and %d", pn, upload.PartsTotal)
 		}
 		partSize := parts[pn-1].Size
-		checksumSHA256 := resolveChecksumSHA256(e.Checksum)
+		checksumSHA256, err := resolveChecksumSHA256(e.Checksum)
+		if err != nil {
+			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
+			return nil, err
+		}
 		u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, pn, partSize, checksumSHA256, s3client.UploadTTL)
 		if err != nil {
 			logger.Error(ctx, "backend_presign_parts_failed", zap.String("upload_id", uploadID), zap.Int("part_number", pn), zap.Error(err))
@@ -431,6 +443,20 @@ func (b *Dat9Backend) ConfirmUploadV2(ctx context.Context, uploadID string, clie
 		return fmt.Errorf("part count mismatch: client sent %d, expected %d", len(clientParts), upload.PartsTotal)
 	}
 
+	// Reject duplicate part numbers and validate completeness (all 1..N present)
+	clientPartMap := make(map[int]string, len(clientParts))
+	for _, cp := range clientParts {
+		if _, dup := clientPartMap[cp.Number]; dup {
+			metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
+			return fmt.Errorf("duplicate part number %d in complete request", cp.Number)
+		}
+		if cp.Number < 1 || cp.Number > upload.PartsTotal {
+			metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
+			return fmt.Errorf("invalid part number %d: must be between 1 and %d", cp.Number, upload.PartsTotal)
+		}
+		clientPartMap[cp.Number] = cp.ETag
+	}
+
 	// List uploaded parts from S3
 	s3Parts, err := b.s3.ListParts(ctx, upload.S3Key, upload.S3UploadID)
 	if err != nil {
@@ -439,20 +465,20 @@ func (b *Dat9Backend) ConfirmUploadV2(ctx context.Context, uploadID string, clie
 		return fmt.Errorf("list parts: %w", err)
 	}
 
-	// Cross-validate client parts against S3 parts
+	// Cross-validate: every client part must match an S3 part ETag
 	s3PartMap := make(map[int]string, len(s3Parts))
 	for _, p := range s3Parts {
 		s3PartMap[p.Number] = p.ETag
 	}
-	for _, cp := range clientParts {
-		s3ETag, ok := s3PartMap[cp.Number]
+	for partNum, clientETag := range clientPartMap {
+		s3ETag, ok := s3PartMap[partNum]
 		if !ok {
 			metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
-			return fmt.Errorf("part %d not found in S3", cp.Number)
+			return fmt.Errorf("part %d not found in S3", partNum)
 		}
-		if cp.ETag != s3ETag {
+		if clientETag != s3ETag {
 			metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
-			return fmt.Errorf("part %d ETag mismatch: client=%q, S3=%q", cp.Number, cp.ETag, s3ETag)
+			return fmt.Errorf("part %d ETag mismatch: client=%q, S3=%q", partNum, clientETag, s3ETag)
 		}
 	}
 
