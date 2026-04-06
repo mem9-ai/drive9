@@ -588,6 +588,19 @@ func (c *Client) uploadPartsV2(ctx context.Context, plan *uploadPlanV2, ra io.Re
 			}
 
 			etag, err := c.uploadOnePartV2(ctx, p, data)
+			if err == errPresignExpired {
+				// Presigned URL expired — fetch a fresh one and retry once.
+				fresh, presignErr := c.presignOnePart(ctx, plan.UploadID, p.Number)
+				if presignErr != nil {
+					select {
+					case errCh <- fmt.Errorf("re-presign part %d: %w", p.Number, presignErr):
+					default:
+					}
+					cancel()
+					return
+				}
+				etag, err = c.uploadOnePartV2(ctx, *fresh, data)
+			}
 			if err != nil {
 				select {
 				case errCh <- fmt.Errorf("part %d: %w", p.Number, err):
@@ -622,8 +635,12 @@ func (c *Client) uploadPartsV2(ctx context.Context, plan *uploadPlanV2, ra io.Re
 	return results, nil
 }
 
+// errPresignExpired indicates S3 returned 403, likely due to an expired presigned URL.
+var errPresignExpired = fmt.Errorf("presigned URL expired")
+
 // uploadOnePartV2 PUTs data to a presigned URL and returns the ETag.
-// Unlike v1, no checksum header is sent (phase 1: required=false).
+// Phase 1: no per-part checksum header — checksum negotiation deferred to #113/#114.
+// Returns errPresignExpired on 403 so callers can re-presign and retry.
 func (c *Client) uploadOnePartV2(ctx context.Context, part presignedPart, data []byte) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, part.URL, bytes.NewReader(data))
 	if err != nil {
@@ -637,23 +654,53 @@ func (c *Client) uploadOnePartV2(ctx context.Context, part presignedPart, data [
 	}
 	req.ContentLength = int64(len(data))
 
-	// Compute and send SHA-256 inline — S3 requires it for data integrity
-	// even though the v2 protocol doesn't mandate pre-computed checksums.
-	h := sha256.Sum256(data)
-	req.Header.Set("x-amz-checksum-sha256", base64.StdEncoding.EncodeToString(h[:]))
-
 	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusForbidden {
+		return "", errPresignExpired
+	}
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	return resp.Header.Get("ETag"), nil
+}
+
+// presignOnePart fetches a fresh presigned URL for a single part via
+// POST /v2/uploads/{id}/presign. Used to retry after presigned URL expiry.
+func (c *Client) presignOnePart(ctx context.Context, uploadID string, partNumber int) (*presignedPart, error) {
+	body, err := json.Marshal(struct {
+		PartNumber int `json:"part_number"`
+	}{PartNumber: partNumber})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/v2/uploads/"+uploadID+"/presign", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var p presignedPart
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		return nil, fmt.Errorf("decode presign response: %w", err)
+	}
+	return &p, nil
 }
 
 // completeUploadV2 sends the part list to POST /v2/uploads/{id}/complete.
