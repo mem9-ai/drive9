@@ -549,6 +549,82 @@ func TestResumeUploadFallsBackToLegacyHeader(t *testing.T) {
 	}
 }
 
+func TestResumeUploadKeepsUsingV1Endpoints(t *testing.T) {
+	var uploadedPart []byte
+	var completeCalled atomic.Bool
+	var v2Called atomic.Bool
+	queryCalls := 0
+	resumeCalls := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v2/"):
+			v2Called.Store(true)
+			http.Error(w, "unexpected v2 request", http.StatusInternalServerError)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/uploads":
+			queryCalls++
+			_ = json.NewEncoder(w).Encode(struct {
+				Uploads []UploadMeta `json:"uploads"`
+			}{
+				Uploads: []UploadMeta{{
+					UploadID:   "resume-v1-only",
+					PartsTotal: 2,
+					Status:     "UPLOADING",
+				}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-v1-only/resume":
+			resumeCalls++
+			var req uploadResumeRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			if len(req.PartChecksums) == 0 {
+				http.Error(w, "missing checksums", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(UploadPlan{
+				UploadID: "resume-v1-only",
+				PartSize: 4,
+				Parts: []PartURL{
+					{Number: 2, URL: fmt.Sprintf("http://%s/resume-v1-only/part/2", r.Host), Size: 4},
+				},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/resume-v1-only/part/2":
+			uploadedPart, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-v1-only/complete":
+			completeCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	fullData := []byte("aaaabbbb")
+	if err := c.ResumeUpload(context.Background(), "/resume-v1-only.bin", bytes.NewReader(fullData), int64(len(fullData)), nil); err != nil {
+		t.Fatalf("ResumeUpload: %v", err)
+	}
+
+	if v2Called.Load() {
+		t.Fatal("resume flow should not probe /v2 endpoints")
+	}
+	if queryCalls != 1 {
+		t.Fatalf("query calls = %d, want 1", queryCalls)
+	}
+	if resumeCalls != 1 {
+		t.Fatalf("resume calls = %d, want 1", resumeCalls)
+	}
+	if !bytes.Equal(uploadedPart, []byte("bbbb")) {
+		t.Fatalf("uploaded part = %q, want %q", uploadedPart, "bbbb")
+	}
+	if !completeCalled.Load() {
+		t.Fatal("complete was not called")
+	}
+}
+
 func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
 	blobDir, err := os.MkdirTemp("", "dat9-client-blobs-*")
 	if err != nil {
