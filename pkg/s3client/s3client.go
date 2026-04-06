@@ -90,6 +90,9 @@ const MinPartSize = 5 << 20
 // MaxAdaptivePartSize is the upper bound for adaptive part size (512 MiB).
 const MaxAdaptivePartSize = 512 << 20
 
+// MaxPartSize is the S3 hard limit for a single multipart part (5 GiB).
+const MaxPartSize = 5 << 30
+
 // CalcAdaptivePartSize returns a part size tuned for totalSize.
 // Formula: ceil(fileSize / 10000) aligned up to 1 MiB, clamped to [8 MiB, 512 MiB].
 // This is the single authoritative implementation — do not duplicate elsewhere.

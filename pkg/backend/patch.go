@@ -85,6 +85,10 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 	if partSize < s3client.MinPartSize {
 		partSize = s3client.PartSize
 	}
+	if partSize > s3client.MaxPartSize {
+		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		return nil, fmt.Errorf("part_size %d exceeds S3 per-part limit of %d", partSize, s3client.MaxPartSize)
+	}
 	newParts := s3client.CalcParts(newSize, partSize)
 	if len(newParts) > MaxMultipartParts {
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
