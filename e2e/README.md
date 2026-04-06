@@ -1,10 +1,10 @@
-# dat9 E2E tests
+# drive9 E2E tests
 
-Live end-to-end scripts for validating deployed `dat9-server` behavior.
+Live end-to-end scripts for validating deployed `drive9-server` behavior.
 
 ## Prerequisites
 
-- A running server endpoint (`DAT9_BASE`)
+- A running server endpoint (`DRIVE9_BASE`)
 - `jq` installed
 - Bash 4+
 
@@ -23,21 +23,21 @@ Live end-to-end scripts for validating deployed `dat9-server` behavior.
 ```bash
 DEPLOY=https://<api-endpoint>
 
-DAT9_BASE=$DEPLOY bash e2e/api-smoke-test.sh
+DRIVE9_BASE=$DEPLOY bash e2e/api-smoke-test.sh
 
-DAT9_BASE=$DEPLOY DAT9_API_KEY=dat9_xxx bash e2e/api-smoke-test-existing-key.sh
+DRIVE9_BASE=$DEPLOY DRIVE9_API_KEY=drive9_xxx bash e2e/api-smoke-test-existing-key.sh
 
-DAT9_BASE=$DEPLOY bash e2e/cli-smoke-test.sh
+DRIVE9_BASE=$DEPLOY bash e2e/cli-smoke-test.sh
 
-# Use official released dat9 CLI instead of local build
-DAT9_BASE=$DEPLOY CLI_SOURCE=official bash e2e/cli-smoke-test.sh
+# Use official released drive9 CLI instead of local build
+DRIVE9_BASE=$DEPLOY CLI_SOURCE=official bash e2e/cli-smoke-test.sh
 
-DAT9_BASE=$DEPLOY bash e2e/fuse-smoke-test.sh
+DRIVE9_BASE=$DEPLOY bash e2e/fuse-smoke-test.sh
 
-# Use official released dat9 CLI for FUSE smoke
-DAT9_BASE=$DEPLOY CLI_SOURCE=official bash e2e/fuse-smoke-test.sh
+# Use official released drive9 CLI for FUSE smoke
+DRIVE9_BASE=$DEPLOY CLI_SOURCE=official bash e2e/fuse-smoke-test.sh
 
-DAT9_BASE=$DEPLOY bash e2e/smoke-all.sh
+DRIVE9_BASE=$DEPLOY bash e2e/smoke-all.sh
 ```
 
 ## Deployment Endpoints
@@ -45,13 +45,13 @@ DAT9_BASE=$DEPLOY bash e2e/smoke-all.sh
 ### Dev
 
 ```bash
-export DAT9_BASE="https://xkopoerih4.execute-api.ap-southeast-1.amazonaws.com"
+export DRIVE9_BASE="https://xkopoerih4.execute-api.ap-southeast-1.amazonaws.com"
 ```
 
 ### Prod
 
 ```bash
-export DAT9_BASE="https://api.drive9.ai"
+export DRIVE9_BASE="https://api.drive9.ai"
 ```
 
 ## Notes
@@ -61,7 +61,7 @@ export DAT9_BASE="https://api.drive9.ai"
 - File operations use `/v1/fs/*` and include nested directory coverage.
 - Semantic recall polling knobs for API smoke are `SEMANTIC_TIMEOUT_S` and `SEMANTIC_INTERVAL_S`.
 - Semantic recall polling knobs for CLI smoke are `CLI_SEMANTIC_TIMEOUT_S` and `CLI_SEMANTIC_INTERVAL_S`.
-- Image fixture path is `DAT9_IMAGE_FIXTURE_PATH` (default `e2e/fixtures/cat03.jpg`) and uses the repo-local fixture.
+- Image fixture path is `DRIVE9_IMAGE_FIXTURE_PATH` (default `e2e/fixtures/cat03.jpg`) and uses the repo-local fixture.
 - Large-file scenario is enabled by default (`RUN_LARGE_FILE=1`) and runs a multipart upload using checksum-bound presigned parts.
 - You can tune size with `LARGE_FILE_MB` (default `100`).
 - CLI smoke large-file size can be tuned with `CLI_LARGE_FILE_MB` (default `100`).
