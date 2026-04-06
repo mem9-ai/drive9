@@ -138,7 +138,7 @@ func TestInitiateAndConfirmUpload(t *testing.T) {
 	}
 
 	for _, p := range plan.Parts {
-		start := int64(p.Number-1) * s3client.PartSize
+		start := int64(p.Number-1) * plan.PartSize
 		end := start + p.Size
 		if end > totalSize {
 			end = totalSize
@@ -193,7 +193,7 @@ func TestResumeUpload(t *testing.T) {
 	upload, _ := b.GetUpload(ctx, plan.UploadID)
 
 	// Upload only part 1 (simulate partial upload)
-	data := make([]byte, s3client.PartSize)
+	data := make([]byte, upload.PartSize)
 	if _, err := b.S3().(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, 1, bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
