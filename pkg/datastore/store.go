@@ -44,6 +44,7 @@ const (
 type UploadStatus string
 
 const (
+	UploadInitiated UploadStatus = "INITIATED"
 	UploadUploading UploadStatus = "UPLOADING"
 	UploadCompleted UploadStatus = "COMPLETED"
 	UploadAborted   UploadStatus = "ABORTED"
@@ -792,6 +793,29 @@ func (s *Store) AbortUpload(ctx context.Context, uploadID string) (err error) {
 	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = 'ABORTED',
 		updated_at = ?
 		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
+	return err
+}
+
+// AbortUploadV2 sets an upload to ABORTED from either INITIATED or UPLOADING.
+// Returns nil (idempotent) if the upload is already aborted or not found.
+func (s *Store) AbortUploadV2(ctx context.Context, uploadID string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "abort_upload_v2", start, &err)
+
+	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = 'ABORTED',
+		updated_at = ?
+		WHERE upload_id = ? AND status IN ('INITIATED', 'UPLOADING')`, time.Now().UTC(), uploadID)
+	return err
+}
+
+// UpdateUploadStatus transitions an upload to a new status.
+func (s *Store) UpdateUploadStatus(ctx context.Context, uploadID string, status UploadStatus) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "update_upload_status", start, &err)
+
+	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = ?,
+		updated_at = ?
+		WHERE upload_id = ?`, string(status), time.Now().UTC(), uploadID)
 	return err
 }
 
