@@ -482,9 +482,22 @@ func (b *Dat9Backend) ConfirmUploadV2(ctx context.Context, uploadID string, clie
 		}
 	}
 
+	// Verify part sizes match expected layout.
+	expectedParts := s3client.CalcParts(upload.TotalSize, upload.PartSize)
+	if len(s3Parts) != len(expectedParts) {
+		metrics.RecordOperation("backend", "confirm_upload_v2", "incomplete", time.Since(start))
+		return fmt.Errorf("incomplete upload: S3 has %d parts, expected %d", len(s3Parts), len(expectedParts))
+	}
+	for i, p := range s3Parts {
+		if p.Size != expectedParts[i].Size {
+			metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
+			return fmt.Errorf("part %d size mismatch: got %d, expected %d", p.Number, p.Size, expectedParts[i].Size)
+		}
+	}
+
+	// Complete using the already-validated parts — no second ListParts.
 	metrics.RecordOperation("backend", "confirm_upload_v2", "ok", time.Since(start))
-	// Delegate to common confirm logic (which re-lists parts, verifies sizes, and completes)
-	return b.ConfirmUpload(ctx, uploadID)
+	return b.finalizeUpload(ctx, upload, s3Parts)
 }
 
 // ConfirmUpload completes the multipart upload and creates the file node.
@@ -526,16 +539,23 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		}
 	}
 
+	metrics.RecordOperation("backend", "confirm_upload", "ok", time.Since(start))
+	return b.finalizeUpload(ctx, upload, parts)
+}
+
+// finalizeUpload completes the S3 multipart upload and creates the file node.
+// Both ConfirmUpload (v1) and ConfirmUploadV2 call this with already-validated parts.
+func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Upload, parts []s3client.Part) error {
+	start := time.Now()
+	uploadID := upload.UploadID
+
 	// Complete S3 multipart upload (idempotent, outside transaction)
 	if err := b.s3.CompleteMultipartUpload(ctx, upload.S3Key, upload.S3UploadID, parts); err != nil {
-		logger.Error(ctx, "backend_confirm_upload_complete_multipart_failed", zap.String("upload_id", uploadID), zap.Error(err))
-		metrics.RecordOperation("backend", "confirm_upload", "error", time.Since(start))
+		logger.Error(ctx, "backend_finalize_upload_complete_multipart_failed", zap.String("upload_id", uploadID), zap.Error(err))
+		metrics.RecordOperation("backend", "finalize_upload", "error", time.Since(start))
 		return fmt.Errorf("complete multipart: %w", err)
 	}
 
-	// Atomically: complete upload, ensure parents, create or overwrite node.
-	// Overwrite preserves inode identity by updating the existing files row
-	// in place so every hard link keeps pointing at the same file_id.
 	var oldStorageRef string
 	var oldStorageType datastore.StorageType
 	var isOverwrite bool
@@ -652,23 +672,20 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 		}
 		return nil
 	}); err != nil {
-		logger.Error(ctx, "backend_confirm_upload_tx_failed", zap.String("upload_id", uploadID), zap.Error(err))
-		metrics.RecordOperation("backend", "confirm_upload", "error", time.Since(start))
+		logger.Error(ctx, "backend_finalize_upload_tx_failed", zap.String("upload_id", uploadID), zap.Error(err))
+		metrics.RecordOperation("backend", "finalize_upload", "error", time.Since(start))
 		return err
 	}
 	if isOverwrite {
 		b.deleteBlobIfS3Ctx(ctx, oldStorageType, oldStorageRef, upload.S3Key)
 	}
-	// Temporary compatibility: app embedding still relies on the legacy
-	// backend-owned image queue until its image task flow also moves to
-	// semantic_tasks.
 	if b.UsesDatabaseAutoEmbedding() {
-		metrics.RecordOperation("backend", "confirm_upload", "ok", time.Since(start))
+		metrics.RecordOperation("backend", "finalize_upload", "ok", time.Since(start))
 		return nil
 	}
 	b.enqueueImageExtractForUpload(ctx, upload, isOverwrite)
 
-	metrics.RecordOperation("backend", "confirm_upload", "ok", time.Since(start))
+	metrics.RecordOperation("backend", "finalize_upload", "ok", time.Since(start))
 	return nil
 }
 
