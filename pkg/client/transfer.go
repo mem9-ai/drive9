@@ -178,12 +178,17 @@ func (c *Client) writeStreamV2(ctx context.Context, path string, ra io.ReaderAt,
 	// Upload parts, collecting ETags for the complete call.
 	parts, err := c.uploadPartsV2(ctx, plan, ra, presignCh, presignErrCh, progress)
 	if err != nil {
-		// Best-effort abort
 		_ = c.abortUploadV2(context.Background(), plan.UploadID)
 		return err
 	}
 
-	return c.completeUploadV2(ctx, plan.UploadID, parts)
+	if err := c.completeUploadV2(ctx, plan.UploadID, parts); err != nil {
+		// Complete failed (network error, 5xx, 409, 410) — best-effort abort
+		// to avoid leaving orphaned multipart uploads / upload rows.
+		_ = c.abortUploadV2(context.Background(), plan.UploadID)
+		return err
+	}
+	return nil
 }
 
 type uploadInitiateRequest struct {
