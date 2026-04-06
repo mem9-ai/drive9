@@ -713,3 +713,302 @@ func TestContentLengthHeaderMismatchRejected(t *testing.T) {
 		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, body)
 	}
 }
+
+// --- v2 upload endpoint tests ---
+
+// initiateV2Upload is a test helper that posts to /v2/uploads/initiate and returns the plan.
+func initiateV2Upload(t *testing.T, tsURL, path string, totalSize int64) backend.UploadPlanV2 {
+	t.Helper()
+	payload, _ := json.Marshal(map[string]any{"path": path, "total_size": totalSize})
+	req, _ := http.NewRequest(http.MethodPost, tsURL+"/v2/uploads/initiate", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("v2 initiate: expected 202, got %d: %s", resp.StatusCode, b)
+	}
+	var plan backend.UploadPlanV2
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
+
+func TestV2InitiateReturnsCorrectContract(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	totalSize := int64(20 << 20) // 20 MiB → 3 parts at 8 MiB each
+	plan := initiateV2Upload(t, ts.URL, "/v2-contract.bin", totalSize)
+
+	if plan.UploadID == "" {
+		t.Error("expected upload_id")
+	}
+	if plan.PartSize != s3client.PartSize {
+		t.Errorf("expected part_size=%d, got %d", s3client.PartSize, plan.PartSize)
+	}
+	if plan.TotalParts != 3 {
+		t.Errorf("expected total_parts=3, got %d", plan.TotalParts)
+	}
+	if plan.Resumable != false {
+		t.Error("expected resumable=false in phase 1")
+	}
+	if plan.ChecksumContract.Required != false {
+		t.Error("expected checksum_contract.required=false in phase 1")
+	}
+	if len(plan.ChecksumContract.Supported) == 0 {
+		t.Error("expected at least one supported checksum algorithm")
+	}
+
+	// Upload should be in INITIATED status
+	upload, err := s.fallback.GetUpload(context.Background(), plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upload.Status != datastore.UploadInitiated {
+		t.Errorf("expected INITIATED status, got %s", upload.Status)
+	}
+}
+
+func TestV2PresignPartTransitionsToUploading(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	plan := initiateV2Upload(t, ts.URL, "/v2-presign.bin", 20<<20)
+
+	// Presign part 1
+	payload, _ := json.Marshal(map[string]any{"part_number": 1})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v2/uploads/"+plan.UploadID+"/presign", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("v2 presign: expected 200, got %d: %s", resp.StatusCode, b)
+	}
+
+	var u s3client.UploadPartURL
+	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
+		t.Fatal(err)
+	}
+	if u.URL == "" {
+		t.Error("expected presigned URL")
+	}
+	if u.Number != 1 {
+		t.Errorf("expected part number 1, got %d", u.Number)
+	}
+
+	// Upload should now be UPLOADING
+	upload, err := s.fallback.GetUpload(context.Background(), plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upload.Status != datastore.UploadUploading {
+		t.Errorf("expected UPLOADING status after presign, got %s", upload.Status)
+	}
+}
+
+func TestV2PresignPartWithChecksum(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	plan := initiateV2Upload(t, ts.URL, "/v2-presign-checksum.bin", 20<<20)
+
+	payload, _ := json.Marshal(map[string]any{
+		"part_number": 1,
+		"checksum": map[string]string{
+			"algorithm": "SHA-256",
+			"value":     "dGVzdGNoZWNrc3VtdmFsdWVwYWRkZWQxMjM0NTY3ODk=", // 32 bytes base64
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v2/uploads/"+plan.UploadID+"/presign", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("v2 presign with checksum: expected 200, got %d: %s", resp.StatusCode, b)
+	}
+}
+
+func TestV2PresignBatch(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	plan := initiateV2Upload(t, ts.URL, "/v2-batch.bin", 20<<20)
+
+	payload, _ := json.Marshal(map[string]any{
+		"parts": []map[string]any{
+			{"part_number": 1},
+			{"part_number": 2},
+			{"part_number": 3},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v2/uploads/"+plan.UploadID+"/presign-batch", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("v2 presign-batch: expected 200, got %d: %s", resp.StatusCode, b)
+	}
+
+	var result struct {
+		Parts []*s3client.UploadPartURL `json:"parts"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Parts) != 3 {
+		t.Errorf("expected 3 parts, got %d", len(result.Parts))
+	}
+
+	// Upload should be UPLOADING
+	upload, _ := s.fallback.GetUpload(context.Background(), plan.UploadID)
+	if upload.Status != datastore.UploadUploading {
+		t.Errorf("expected UPLOADING after batch presign, got %s", upload.Status)
+	}
+}
+
+func TestV2PresignBatchExceedsLimit(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	plan := initiateV2Upload(t, ts.URL, "/v2-batch-limit.bin", 20<<20)
+
+	// Build 501 entries
+	entries := make([]map[string]any, 501)
+	for i := range entries {
+		entries[i] = map[string]any{"part_number": 1} // part_number doesn't matter for limit check
+	}
+	payload, _ := json.Marshal(map[string]any{"parts": entries})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v2/uploads/"+plan.UploadID+"/presign-batch", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("batch limit: expected 400, got %d: %s", resp.StatusCode, b)
+	}
+}
+
+func TestV2AbortIdempotent(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	plan := initiateV2Upload(t, ts.URL, "/v2-abort.bin", 20<<20)
+
+	// Abort an INITIATED upload
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v2/uploads/"+plan.UploadID+"/abort", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("abort INITIATED: expected 200, got %d", resp.StatusCode)
+	}
+
+	// Verify status is ABORTED
+	upload, _ := s.fallback.GetUpload(context.Background(), plan.UploadID)
+	if upload.Status != datastore.UploadAborted {
+		t.Errorf("expected ABORTED, got %s", upload.Status)
+	}
+
+	// Second abort should still return 200 (idempotent)
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v2/uploads/"+plan.UploadID+"/abort", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second abort: expected 200 (idempotent), got %d", resp.StatusCode)
+	}
+}
+
+func TestV2AbortNonExistent(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Abort a non-existent upload should return 200 (idempotent)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v2/uploads/nonexistent-id/abort", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("abort non-existent: expected 200 (idempotent), got %d", resp.StatusCode)
+	}
+}
+
+func TestV2PresignThenComplete(t *testing.T) {
+	s, s3c := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	totalSize := int64(1 << 20) // 1 MiB → 1 part
+	plan := initiateV2Upload(t, ts.URL, "/v2-complete.bin", totalSize)
+
+	// Presign part 1
+	payload, _ := json.Marshal(map[string]any{"part_number": 1})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v2/uploads/"+plan.UploadID+"/presign", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	// Upload part directly via S3
+	upload, _ := s.fallback.GetUpload(context.Background(), plan.UploadID)
+	if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, 1, bytes.NewReader(make([]byte, totalSize))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Complete via v2 endpoint
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v2/uploads/"+plan.UploadID+"/complete", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("v2 complete: expected 200, got %d", resp.StatusCode)
+	}
+
+	// Verify upload is completed
+	upload, _ = s.fallback.GetUpload(context.Background(), plan.UploadID)
+	if upload.Status != datastore.UploadCompleted {
+		t.Errorf("expected COMPLETED, got %s", upload.Status)
+	}
+}

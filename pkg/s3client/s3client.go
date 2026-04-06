@@ -87,11 +87,13 @@ const PartSize = 8 << 20
 // MinPartSize is the S3 minimum part size (5MB).
 const MinPartSize = 5 << 20
 
-// MaxAdaptivePartSize is the upper bound for adaptive part size (512 MiB).
-const MaxAdaptivePartSize = 512 << 20
+// MaxS3PartSize is the S3 maximum part size (5 GiB).
+const MaxS3PartSize = 5 << 30
 
 // CalcAdaptivePartSize returns a part size tuned for totalSize.
-// Formula: ceil(fileSize / 10000) aligned up to 1 MiB, clamped to [8 MiB, 512 MiB].
+// Formula: ceil(fileSize / 10000) aligned up to 1 MiB, clamped to [8 MiB, 5 GiB].
+// The ceil(n/10000) guarantees ≤10000 parts for any file size, satisfying the S3
+// multipart upload limit. The 5 GiB upper bound matches the S3 per-part maximum.
 // This is the single authoritative implementation — do not duplicate elsewhere.
 func CalcAdaptivePartSize(totalSize int64) int64 {
 	const align = 1 << 20 // 1 MiB alignment
@@ -106,8 +108,8 @@ func CalcAdaptivePartSize(totalSize int64) int64 {
 	if ps < PartSize {
 		ps = PartSize // 8 MiB minimum
 	}
-	if ps > MaxAdaptivePartSize {
-		ps = MaxAdaptivePartSize
+	if ps > MaxS3PartSize {
+		ps = MaxS3PartSize
 	}
 	return ps
 }

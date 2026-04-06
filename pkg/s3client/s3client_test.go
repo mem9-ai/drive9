@@ -226,7 +226,7 @@ func TestCalcAdaptivePartSize(t *testing.T) {
 		{"80 GiB", 80 * (1 << 30), 9 << 20, 0},           // ceil(80GiB/10000) → align up to 9 MiB
 		{"100 GiB", 100 * (1 << 30), 11 << 20, 0},        // ceil(100GiB/10000) → align up to 11 MiB
 		{"500 GiB", 500 * (1 << 30), 52 << 20, 0},        // ceil(500GiB/10000) → align up to 52 MiB
-		{"5 TiB max S3 object", 5 * (1 << 40), MaxAdaptivePartSize, 0},
+		{"5 TiB max S3 object", 5 * (1 << 40), 525 << 20, 0}, // ceil(5TiB/10000) → 525 MiB
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -234,8 +234,8 @@ func TestCalcAdaptivePartSize(t *testing.T) {
 			if ps < PartSize {
 				t.Errorf("part size %d < minimum %d", ps, PartSize)
 			}
-			if ps > MaxAdaptivePartSize {
-				t.Errorf("part size %d > maximum %d", ps, MaxAdaptivePartSize)
+			if ps > MaxS3PartSize {
+				t.Errorf("part size %d > maximum %d", ps, MaxS3PartSize)
 			}
 			// Check 1 MiB alignment
 			if ps%(1<<20) != 0 {
@@ -276,11 +276,19 @@ func TestCalcAdaptivePartSizeInvariants(t *testing.T) {
 		t.Errorf("CalcAdaptivePartSize(-1) = %d, want %d", ps, PartSize)
 	}
 
-	// Files within MaxAdaptivePartSize * 10000 should produce <= 10000 parts
-	maxSafe := int64(MaxAdaptivePartSize) * 10000
+	// Files within MaxS3PartSize * 10000 should produce <= 10000 parts
+	maxSafe := int64(MaxS3PartSize) * 10000
 	ps := CalcAdaptivePartSize(maxSafe)
 	parts := CalcParts(maxSafe, ps)
 	if len(parts) > 10000 {
 		t.Errorf("CalcAdaptivePartSize(%d) = %d → %d parts, exceeds S3 limit of 10000", maxSafe, ps, len(parts))
+	}
+
+	// 5 TiB (S3 max object size) must produce <= 10000 parts
+	fiveTiB := int64(5) * (1 << 40)
+	ps5 := CalcAdaptivePartSize(fiveTiB)
+	parts5 := CalcParts(fiveTiB, ps5)
+	if len(parts5) > 10000 {
+		t.Errorf("CalcAdaptivePartSize(5TiB) = %d → %d parts, exceeds S3 limit of 10000", ps5, len(parts5))
 	}
 }
