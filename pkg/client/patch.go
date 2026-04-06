@@ -32,6 +32,19 @@ type PatchPartURL struct {
 	ReadHeaders map[string]string `json:"read_headers,omitempty"`
 }
 
+type patchOptions struct {
+	partSize int64
+}
+
+// PatchOption configures a PatchFile call.
+type PatchOption func(*patchOptions)
+
+// WithPartSize tells the server which part boundary the client used for
+// dirty-part tracking. If omitted the server picks adaptively.
+func WithPartSize(ps int64) PatchOption {
+	return func(o *patchOptions) { o.partSize = ps }
+}
+
 // PatchFile performs a partial update of a large file using S3 UploadPartCopy
 // for unchanged parts. Only the dirty parts are transferred over the network.
 //
@@ -44,12 +57,21 @@ type PatchPartURL struct {
 //     and the original data for that part (downloaded from ReadURL; nil if the
 //     part is entirely new beyond the original file). It must return the final
 //     part data to upload.
-func (c *Client) PatchFile(ctx context.Context, path string, newSize int64, dirtyParts []int, readPart func(partNumber int, partSize int64, origData []byte) ([]byte, error), progress ProgressFunc) error {
+func (c *Client) PatchFile(ctx context.Context, path string, newSize int64, dirtyParts []int, readPart func(partNumber int, partSize int64, origData []byte) ([]byte, error), progress ProgressFunc, opts ...PatchOption) error {
+	var po patchOptions
+	for _, o := range opts {
+		o(&po)
+	}
+
 	// Step 1: Request patch plan from server
-	reqBody, err := json.Marshal(map[string]any{
+	patchReq := map[string]any{
 		"new_size":    newSize,
 		"dirty_parts": dirtyParts,
-	})
+	}
+	if po.partSize > 0 {
+		patchReq["part_size"] = po.partSize
+	}
+	reqBody, err := json.Marshal(patchReq)
 	if err != nil {
 		return fmt.Errorf("marshal patch request: %w", err)
 	}
