@@ -44,6 +44,7 @@ const (
 type UploadStatus string
 
 const (
+	UploadInitiated UploadStatus = "INITIATED"
 	UploadUploading UploadStatus = "UPLOADING"
 	UploadCompleted UploadStatus = "COMPLETED"
 	UploadAborted   UploadStatus = "ABORTED"
@@ -769,7 +770,7 @@ func (s *Store) GetUploadByPath(ctx context.Context, targetPath string) (out *Up
 	row := s.db.QueryRowContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
 		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
-		FROM uploads WHERE target_path = ? AND status = 'UPLOADING'
+		FROM uploads WHERE target_path = ? AND status IN ('INITIATED', 'UPLOADING')
 		ORDER BY created_at DESC LIMIT 1`, targetPath)
 	out, err = scanUpload(row)
 	return out, err
@@ -793,6 +794,51 @@ func (s *Store) AbortUpload(ctx context.Context, uploadID string) (err error) {
 		updated_at = ?
 		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
 	return err
+}
+
+// AbortUploadV2 sets an upload to ABORTED from either INITIATED or UPLOADING.
+// Returns nil (idempotent) if the upload is already aborted or not found.
+func (s *Store) AbortUploadV2(ctx context.Context, uploadID string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "abort_upload_v2", start, &err)
+
+	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = 'ABORTED',
+		updated_at = ?
+		WHERE upload_id = ? AND status IN ('INITIATED', 'UPLOADING')`, time.Now().UTC(), uploadID)
+	return err
+}
+
+// UpdateUploadStatus transitions an upload to a new status.
+func (s *Store) UpdateUploadStatus(ctx context.Context, uploadID string, status UploadStatus) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "update_upload_status", start, &err)
+
+	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = ?,
+		updated_at = ?
+		WHERE upload_id = ?`, string(status), time.Now().UTC(), uploadID)
+	return err
+}
+
+// TransitionUploadStatus atomically transitions an upload from expectedStatus to newStatus.
+// Returns ErrUploadNotActive if the current status doesn't match expectedStatus.
+func (s *Store) TransitionUploadStatus(ctx context.Context, uploadID string, expectedStatus, newStatus UploadStatus) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "transition_upload_status", start, &err)
+
+	res, err := s.db.ExecContext(ctx, `UPDATE uploads SET status = ?,
+		updated_at = ?
+		WHERE upload_id = ? AND status = ?`, string(newStatus), time.Now().UTC(), uploadID, string(expectedStatus))
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrUploadNotActive
+	}
+	return nil
 }
 
 func (s *Store) ListUploadsByPath(ctx context.Context, targetPath string, status UploadStatus) (out []*Upload, err error) {

@@ -332,7 +332,7 @@ func TestUploadCompleteEndpoint(t *testing.T) {
 
 	// Upload all parts via S3 client directly
 	for _, p := range plan.Parts {
-		start := int64(p.Number-1) * s3client.PartSize
+		start := int64(p.Number-1) * plan.PartSize
 		end := start + p.Size
 		if end > int64(len(body)) {
 			end = int64(len(body))
@@ -380,7 +380,7 @@ func TestUploadResumeEndpoint(t *testing.T) {
 	upload, _ := s.fallback.GetUpload(context.Background(), plan.UploadID)
 
 	// Upload only part 1
-	if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, 1, bytes.NewReader(make([]byte, s3client.PartSize))); err != nil {
+	if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, 1, bytes.NewReader(make([]byte, upload.PartSize))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -430,7 +430,7 @@ func TestUploadResumeEndpointByBody(t *testing.T) {
 	_ = resp.Body.Close()
 
 	upload, _ := s.fallback.GetUpload(context.Background(), plan.UploadID)
-	if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, 1, bytes.NewReader(make([]byte, s3client.PartSize))); err != nil {
+	if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, 1, bytes.NewReader(make([]byte, upload.PartSize))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -666,7 +666,7 @@ func TestLargeUploadOverwritesExistingSmallFile(t *testing.T) {
 
 	// Upload all parts through the local S3 stand-in.
 	for _, p := range plan.Parts {
-		start := int64(p.Number-1) * s3client.PartSize
+		start := int64(p.Number-1) * plan.PartSize
 		end := start + p.Size
 		if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, p.Number,
 			bytes.NewReader(make([]byte, end-start))); err != nil {
@@ -754,7 +754,7 @@ func TestAutoImageMultipartOverwriteWritesContentTextEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, part := range plan.Parts {
-		start := int64(part.Number-1) * s3client.PartSize
+		start := int64(part.Number-1) * plan.PartSize
 		end := start + part.Size
 		if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, part.Number, bytes.NewReader(make([]byte, end-start))); err != nil {
 			t.Fatalf("upload part %d: %v", part.Number, err)
