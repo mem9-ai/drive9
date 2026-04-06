@@ -37,6 +37,9 @@ type UploadPlanV2 struct {
 // MaxMultipartParts is the S3 hard limit on parts per multipart upload.
 const MaxMultipartParts = 10000
 
+// MaxPresignBatch is the maximum number of parts that can be presigned in a single batch request.
+const MaxPresignBatch = 500
+
 var ErrPartChecksumCountMismatch = errors.New("part checksum count mismatch")
 
 // S3 returns the S3Client (nil when not configured).
@@ -269,6 +272,11 @@ func (b *Dat9Backend) PresignPart(ctx context.Context, uploadID string, partNumb
 		metrics.RecordOperation("backend", "presign_part", "not_active", time.Since(start))
 		return nil, datastore.ErrUploadNotActive
 	}
+	if time.Now().After(upload.ExpiresAt) {
+		_ = b.store.AbortUpload(ctx, uploadID)
+		metrics.RecordOperation("backend", "presign_part", "expired", time.Since(start))
+		return nil, datastore.ErrUploadExpired
+	}
 	if upload.Status == datastore.UploadInitiated {
 		if err := b.store.UpdateUploadStatus(ctx, uploadID, datastore.UploadUploading); err != nil {
 			logger.Error(ctx, "backend_presign_part_status_transition_failed", zap.String("upload_id", uploadID), zap.Error(err))
@@ -307,6 +315,24 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, partNum
 	if upload.Status != datastore.UploadUploading && upload.Status != datastore.UploadInitiated {
 		metrics.RecordOperation("backend", "presign_parts", "not_active", time.Since(start))
 		return nil, datastore.ErrUploadNotActive
+	}
+	if time.Now().After(upload.ExpiresAt) {
+		_ = b.store.AbortUpload(ctx, uploadID)
+		metrics.RecordOperation("backend", "presign_parts", "expired", time.Since(start))
+		return nil, datastore.ErrUploadExpired
+	}
+	if len(partNumbers) > MaxPresignBatch {
+		metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
+		return nil, fmt.Errorf("batch too large: %d parts exceeds limit of %d", len(partNumbers), MaxPresignBatch)
+	}
+	// Reject duplicate part numbers in the batch.
+	seen := make(map[int]bool, len(partNumbers))
+	for _, pn := range partNumbers {
+		if seen[pn] {
+			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
+			return nil, fmt.Errorf("duplicate part number %d in batch", pn)
+		}
+		seen[pn] = true
 	}
 	if upload.Status == datastore.UploadInitiated {
 		if err := b.store.UpdateUploadStatus(ctx, uploadID, datastore.UploadUploading); err != nil {
