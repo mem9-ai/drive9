@@ -23,15 +23,21 @@ type UploadPlan struct {
 	Parts    []*s3client.UploadPartURL `json:"parts"`
 }
 
+// ChecksumContract describes the checksum capabilities of a v2 upload.
+type ChecksumContract struct {
+	Supported []string `json:"supported"`
+	Required  bool     `json:"required"`
+}
+
 // UploadPlanV2 is returned by InitiateUploadV2 — no presigned URLs.
 type UploadPlanV2 struct {
-	UploadID         string `json:"upload_id"`
-	Key              string `json:"key"`
-	PartSize         int64  `json:"part_size"`
-	TotalParts       int    `json:"total_parts"`
-	ExpiresAt        string `json:"expires_at"`
-	Resumable        bool   `json:"resumable"`
-	ChecksumContract string `json:"checksum_contract"`
+	UploadID         string           `json:"upload_id"`
+	Key              string           `json:"key"`
+	PartSize         int64            `json:"part_size"`
+	TotalParts       int              `json:"total_parts"`
+	ExpiresAt        string           `json:"expires_at"`
+	Resumable        bool             `json:"resumable"`
+	ChecksumContract ChecksumContract `json:"checksum_contract"`
 }
 
 // MaxMultipartParts is the S3 hard limit on parts per multipart upload.
@@ -245,19 +251,28 @@ func (b *Dat9Backend) InitiateUploadV2(ctx context.Context, path string, totalSi
 	metrics.RecordOperation("backend", "initiate_upload_v2", "ok", time.Since(start))
 
 	return &UploadPlanV2{
-		UploadID:         uploadID,
-		Key:              s3Key,
-		PartSize:         partSize,
-		TotalParts:       len(parts),
-		ExpiresAt:        expiresAt.Format(time.RFC3339),
-		Resumable:        false,
-		ChecksumContract: "none",
+		UploadID:   uploadID,
+		Key:        s3Key,
+		PartSize:   partSize,
+		TotalParts: len(parts),
+		ExpiresAt:  expiresAt.Format(time.RFC3339),
+		Resumable:  false,
+		ChecksumContract: ChecksumContract{
+			Supported: []string{"SHA-256"},
+			Required:  false,
+		},
 	}, nil
 }
 
-// PresignPart presigns a single part URL for an active upload.
-// Transitions INITIATED → UPLOADING on first presign.
-func (b *Dat9Backend) PresignPart(ctx context.Context, uploadID string, partNumber int) (*s3client.UploadPartURL, error) {
+// PresignPartChecksum holds an optional checksum for a presign request.
+type PresignPartChecksum struct {
+	Algorithm string `json:"algorithm"`
+	Value     string `json:"value"`
+}
+
+// PresignPart presigns a single part URL for an active v2 upload.
+// On the first call, transitions the upload from INITIATED to UPLOADING.
+func (b *Dat9Backend) PresignPart(ctx context.Context, uploadID string, partNumber int, checksum *PresignPartChecksum) (*s3client.UploadPartURL, error) {
 	start := time.Now()
 
 	upload, err := b.store.GetUpload(ctx, uploadID)
@@ -269,6 +284,7 @@ func (b *Dat9Backend) PresignPart(ctx context.Context, uploadID string, partNumb
 		metrics.RecordOperation("backend", "presign_part", "not_active", time.Since(start))
 		return nil, datastore.ErrUploadNotActive
 	}
+	// Transition initiated → uploading on first presign call.
 	if upload.Status == datastore.UploadInitiated {
 		if err := b.store.UpdateUploadStatus(ctx, uploadID, datastore.UploadUploading); err != nil {
 			logger.Error(ctx, "backend_presign_part_status_transition_failed", zap.String("upload_id", uploadID), zap.Error(err))
@@ -284,7 +300,12 @@ func (b *Dat9Backend) PresignPart(ctx context.Context, uploadID string, partNumb
 	parts := s3client.CalcParts(upload.TotalSize, upload.PartSize)
 	partSize := parts[partNumber-1].Size
 
-	u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, partNumber, partSize, "", s3client.UploadTTL)
+	checksumValue := ""
+	if checksum != nil && checksum.Value != "" {
+		checksumValue = checksum.Value
+	}
+
+	u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, partNumber, partSize, checksumValue, s3client.UploadTTL)
 	if err != nil {
 		logger.Error(ctx, "backend_presign_part_failed", zap.String("upload_id", uploadID), zap.Int("part_number", partNumber), zap.Error(err))
 		metrics.RecordOperation("backend", "presign_part", "error", time.Since(start))
@@ -294,10 +315,22 @@ func (b *Dat9Backend) PresignPart(ctx context.Context, uploadID string, partNumb
 	return u, nil
 }
 
-// PresignParts presigns multiple part URLs for an active upload.
-// Transitions INITIATED → UPLOADING on first presign.
-func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, partNumbers []int) ([]*s3client.UploadPartURL, error) {
+// PresignBatchEntry holds a part number and optional checksum for batch presign.
+type PresignBatchEntry struct {
+	PartNumber int                  `json:"part_number"`
+	Checksum   *PresignPartChecksum `json:"checksum,omitempty"`
+}
+
+// PresignParts presigns multiple part URLs for an active v2 upload.
+// On the first call, transitions the upload from INITIATED to UPLOADING.
+// Maximum 500 parts per batch.
+func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, entries []PresignBatchEntry) ([]*s3client.UploadPartURL, error) {
 	start := time.Now()
+
+	if len(entries) > 500 {
+		metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
+		return nil, fmt.Errorf("presign batch too large: %d parts, max 500", len(entries))
+	}
 
 	upload, err := b.store.GetUpload(ctx, uploadID)
 	if err != nil {
@@ -318,18 +351,22 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, partNum
 
 	parts := s3client.CalcParts(upload.TotalSize, upload.PartSize)
 
-	urls := make([]*s3client.UploadPartURL, len(partNumbers))
-	for i, pn := range partNumbers {
-		if pn < 1 || pn > upload.PartsTotal {
+	urls := make([]*s3client.UploadPartURL, len(entries))
+	for i, e := range entries {
+		if e.PartNumber < 1 || e.PartNumber > upload.PartsTotal {
 			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
-			return nil, fmt.Errorf("invalid part number %d: must be between 1 and %d", pn, upload.PartsTotal)
+			return nil, fmt.Errorf("invalid part number %d: must be between 1 and %d", e.PartNumber, upload.PartsTotal)
 		}
-		partSize := parts[pn-1].Size
-		u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, pn, partSize, "", s3client.UploadTTL)
+		partSize := parts[e.PartNumber-1].Size
+		checksumValue := ""
+		if e.Checksum != nil && e.Checksum.Value != "" {
+			checksumValue = e.Checksum.Value
+		}
+		u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, e.PartNumber, partSize, checksumValue, s3client.UploadTTL)
 		if err != nil {
-			logger.Error(ctx, "backend_presign_parts_failed", zap.String("upload_id", uploadID), zap.Int("part_number", pn), zap.Error(err))
+			logger.Error(ctx, "backend_presign_parts_failed", zap.String("upload_id", uploadID), zap.Int("part_number", e.PartNumber), zap.Error(err))
 			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
-			return nil, fmt.Errorf("presign part %d: %w", pn, err)
+			return nil, fmt.Errorf("presign part %d: %w", e.PartNumber, err)
 		}
 		urls[i] = u
 	}
@@ -608,7 +645,7 @@ func (b *Dat9Backend) AbortUpload(ctx context.Context, uploadID string) error {
 		metrics.RecordOperation("backend", "abort_upload", "error", time.Since(start))
 		return err
 	}
-	if upload.Status != datastore.UploadUploading {
+	if upload.Status != datastore.UploadUploading && upload.Status != datastore.UploadInitiated {
 		metrics.RecordOperation("backend", "abort_upload", "not_active", time.Since(start))
 		return datastore.ErrUploadNotActive
 	}

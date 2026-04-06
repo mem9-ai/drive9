@@ -792,7 +792,7 @@ func (s *Store) AbortUpload(ctx context.Context, uploadID string) (err error) {
 
 	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = 'ABORTED',
 		updated_at = ?
-		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
+		WHERE upload_id = ? AND status IN ('UPLOADING', 'INITIATED')`, time.Now().UTC(), uploadID)
 	return err
 }
 
