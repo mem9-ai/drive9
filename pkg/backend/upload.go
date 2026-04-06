@@ -363,6 +363,67 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, partNum
 	return urls, nil
 }
 
+// CompletePart is a client-supplied part reference for v2 complete.
+type CompletePart struct {
+	Number int    `json:"number"`
+	ETag   string `json:"etag"`
+}
+
+// ConfirmUploadV2 validates client-supplied parts against S3, then completes the upload.
+func (b *Dat9Backend) ConfirmUploadV2(ctx context.Context, uploadID string, clientParts []CompletePart) error {
+	start := time.Now()
+
+	upload, err := b.store.GetUpload(ctx, uploadID)
+	if err != nil {
+		metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
+		return err
+	}
+	if upload.Status != datastore.UploadUploading {
+		metrics.RecordOperation("backend", "confirm_upload_v2", "not_active", time.Since(start))
+		return datastore.ErrUploadNotActive
+	}
+	if time.Now().After(upload.ExpiresAt) {
+		_ = b.store.AbortUpload(ctx, uploadID)
+		metrics.RecordOperation("backend", "confirm_upload_v2", "expired", time.Since(start))
+		return datastore.ErrUploadExpired
+	}
+
+	// Validate client-supplied part count
+	if len(clientParts) != upload.PartsTotal {
+		metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
+		return fmt.Errorf("part count mismatch: client sent %d, expected %d", len(clientParts), upload.PartsTotal)
+	}
+
+	// List uploaded parts from S3
+	s3Parts, err := b.s3.ListParts(ctx, upload.S3Key, upload.S3UploadID)
+	if err != nil {
+		logger.Error(ctx, "backend_confirm_upload_v2_list_parts_failed", zap.String("upload_id", uploadID), zap.Error(err))
+		metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
+		return fmt.Errorf("list parts: %w", err)
+	}
+
+	// Cross-validate client parts against S3 parts
+	s3PartMap := make(map[int]string, len(s3Parts))
+	for _, p := range s3Parts {
+		s3PartMap[p.Number] = p.ETag
+	}
+	for _, cp := range clientParts {
+		s3ETag, ok := s3PartMap[cp.Number]
+		if !ok {
+			metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
+			return fmt.Errorf("part %d not found in S3", cp.Number)
+		}
+		if cp.ETag != s3ETag {
+			metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
+			return fmt.Errorf("part %d ETag mismatch: client=%q, S3=%q", cp.Number, cp.ETag, s3ETag)
+		}
+	}
+
+	metrics.RecordOperation("backend", "confirm_upload_v2", "ok", time.Since(start))
+	// Delegate to common confirm logic (which re-lists parts, verifies sizes, and completes)
+	return b.ConfirmUpload(ctx, uploadID)
+}
+
 // ConfirmUpload completes the multipart upload and creates the file node.
 func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error {
 	start := time.Now()

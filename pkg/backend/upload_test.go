@@ -526,25 +526,27 @@ func TestV2FullUploadFlow(t *testing.T) {
 		t.Fatalf("expected UPLOADING, got %s", upload.Status)
 	}
 
-	// Upload all parts via S3 client
+	// Upload all parts via S3 client, collecting ETags for v2 complete
 	partData := make([]byte, totalSize)
 	for i := range partData {
 		partData[i] = byte(i % 256)
 	}
-	for _, u := range urls {
+	completeParts := make([]CompletePart, len(urls))
+	for i, u := range urls {
 		start := int64(u.Number-1) * upload.PartSize
 		end := start + u.Size
 		if end > totalSize {
 			end = totalSize
 		}
-		_, err := b.S3().(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, u.Number, bytes.NewReader(partData[start:end]))
+		etag, err := b.S3().(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, u.Number, bytes.NewReader(partData[start:end]))
 		if err != nil {
 			t.Fatalf("upload part %d: %v", u.Number, err)
 		}
+		completeParts[i] = CompletePart{Number: u.Number, ETag: etag}
 	}
 
-	// Confirm upload
-	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+	// Confirm upload via v2 (with client-supplied parts)
+	if err := b.ConfirmUploadV2(ctx, plan.UploadID, completeParts); err != nil {
 		t.Fatal(err)
 	}
 
@@ -561,5 +563,77 @@ func TestV2FullUploadFlow(t *testing.T) {
 	}
 	if info.Size != totalSize {
 		t.Errorf("expected size %d, got %d", totalSize, info.Size)
+	}
+}
+
+func TestV2CompleteETagMismatch(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	totalSize := int64(20 << 20)
+	plan, err := b.InitiateUploadV2(ctx, "/v2-etag-mismatch.bin", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Presign and upload all parts
+	partNums := make([]int, plan.TotalParts)
+	for i := range partNums {
+		partNums[i] = i + 1
+	}
+	urls, err := b.PresignParts(ctx, plan.UploadID, partNums)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	upload, _ := b.GetUpload(ctx, plan.UploadID)
+	partData := make([]byte, totalSize)
+	completeParts := make([]CompletePart, len(urls))
+	for i, u := range urls {
+		start := int64(u.Number-1) * upload.PartSize
+		end := start + u.Size
+		if end > totalSize {
+			end = totalSize
+		}
+		etag, err := b.S3().(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, u.Number, bytes.NewReader(partData[start:end]))
+		if err != nil {
+			t.Fatalf("upload part %d: %v", u.Number, err)
+		}
+		completeParts[i] = CompletePart{Number: u.Number, ETag: etag}
+	}
+
+	// Tamper with the first part's ETag
+	completeParts[0].ETag = "bad-etag"
+
+	err = b.ConfirmUploadV2(ctx, plan.UploadID, completeParts)
+	if err == nil {
+		t.Fatal("expected error for ETag mismatch")
+	}
+	if !strings.Contains(err.Error(), "ETag mismatch") {
+		t.Errorf("expected ETag mismatch error, got: %v", err)
+	}
+}
+
+func TestV2CompletePartCountMismatch(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	plan, err := b.InitiateUploadV2(ctx, "/v2-partcount.bin", 20<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Transition to UPLOADING
+	if _, err := b.PresignPart(ctx, plan.UploadID, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Try to complete with wrong number of parts
+	err = b.ConfirmUploadV2(ctx, plan.UploadID, []CompletePart{{Number: 1, ETag: "x"}})
+	if err == nil {
+		t.Fatal("expected error for part count mismatch")
+	}
+	if !strings.Contains(err.Error(), "part count mismatch") {
+		t.Errorf("expected part count mismatch error, got: %v", err)
 	}
 }
