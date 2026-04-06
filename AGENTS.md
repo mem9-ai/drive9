@@ -1,13 +1,13 @@
 ---
-title: AGENTS.md - dat9 development guide for AI coding agents
+title: AGENTS.md - drive9 development guide for AI coding agents
 ---
 
 ## Repository overview
 
-dat9 is a Go agent-native filesystem — a network drive with semantic search built on top of
+drive9 is a Go agent-native filesystem — a network drive with semantic search built on top of
 TiDB/MySQL (metadata), S3 (large files), and db9 (small files + embeddings).
 
-Module: `github.com/mem9-ai/dat9`  
+Module: `github.com/mem9-ai/drive9`  
 Go version: 1.25.1 (see `go.mod`)
 
 **Critical prerequisite**: the project has a local `replace` directive pointing to a sibling
@@ -22,7 +22,7 @@ git clone --depth 1 https://github.com/c4pt0r/agfs ../agfs
 ## Build commands
 
 ```bash
-make build           # build server + CLI → bin/dat9-server, bin/dat9
+make build           # build server + CLI → bin/drive9-server, bin/drive9
 make build-server    # server only
 make build-cli       # CLI only (supports VERSION= for ldflags)
 make build-cli-release  # cross-compile for linux/amd64|arm64, darwin/amd64|arm64
@@ -31,8 +31,8 @@ make build-cli-release  # cross-compile for linux/amd64|arm64, darwin/amd64|arm6
 Direct Go equivalents:
 
 ```bash
-go build -o bin/dat9-server ./cmd/dat9-server
-go build -o bin/dat9 ./cmd/drive9
+go build -o bin/drive9-server ./cmd/drive9-server
+go build -o bin/drive9 ./cmd/drive9
 ```
 
 All binaries are built with `CGO_ENABLED=0`.
@@ -52,10 +52,10 @@ MySQL-backed tests require a container runtime or an explicit DSN:
 
 ```bash
 # Use an existing MySQL/TiDB instance
-DAT9_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/dat9_test?parseTime=true' make test
+DRIVE9_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/drive9_test?parseTime=true' make test
 ```
 
-If `DAT9_MYSQL_DSN` is unset and `podman` is available, `make test` auto-configures
+If `DRIVE9_MYSQL_DSN` is unset and `podman` is available, `make test` auto-configures
 testcontainers via `scripts/test-podman.sh`. Otherwise a Docker-compatible runtime is used.
 
 If a direct `go test` run fails with `rootless Docker not found`, retry with `make test`
@@ -64,9 +64,9 @@ so the project can use `scripts/test-podman.sh` to route testcontainers through 
 **E2E smoke tests** (not `go test`) live in `e2e/` and target live deployments:
 
 ```bash
-DAT9_BASE=https://... bash e2e/api-smoke-test.sh
-DAT9_BASE=https://... bash e2e/cli-smoke-test.sh
-DAT9_BASE=https://... bash e2e/smoke-all.sh
+DRIVE9_BASE=https://... bash e2e/api-smoke-test.sh
+DRIVE9_BASE=https://... bash e2e/cli-smoke-test.sh
+DRIVE9_BASE=https://... bash e2e/smoke-all.sh
 ```
 
 ---
@@ -87,12 +87,12 @@ tests on every PR to `main`.
 ## Local dev server
 
 ```bash
-source ./scripts/dat9-server-local-env.sh
-export DAT9_LOCAL_INIT_SCHEMA=true   # only for a fresh/disposable database
+source ./scripts/drive9-server-local-env.sh
+export DRIVE9_LOCAL_INIT_SCHEMA=true   # only for a fresh/disposable database
 make run-server-local
 ```
 
-The env script sets defaults for `DAT9_LOCAL_DSN`, local mock S3, and Ollama-compatible
+The env script sets defaults for `DRIVE9_LOCAL_DSN`, local mock S3, and Ollama-compatible
 embedding. Override any var before running.
 
 ---
@@ -101,9 +101,9 @@ embedding. Override any var before running.
 
 ```
 cmd/drive9/          CLI entrypoint (cp, cat, ls, mv, rm, mount, umount, ...)
-cmd/dat9-server/     Server entrypoint
+cmd/drive9-server/     Server entrypoint
 pkg/
-  backend/           AGFS FileSystem implementation (Dat9Backend)
+  backend/           AGFS FileSystem implementation (Drive9Backend)
   client/            Go SDK HTTP client
   datastore/         Core metadata store (TiDB/MySQL)
   embedding/         Embedding provider integration
@@ -147,7 +147,7 @@ import (
 
     "go.uber.org/zap" // third-party
 
-    "github.com/mem9-ai/dat9/pkg/logger" // internal
+    "github.com/mem9-ai/drive9/pkg/logger" // internal
 )
 ```
 
@@ -228,6 +228,6 @@ Obtain a logger from `pkg/logger` or accept `*zap.Logger` via `Config`.
 
 ### Path conventions
 
-- All dat9 paths are absolute, UTF-8, NFC-normalized, no backslashes, no `..` segments.
+- All drive9 paths are absolute, UTF-8, NFC-normalized, no backslashes, no `..` segments.
 - Directories always end with `/`; files never do.
 - Use `pkg/pathutil` for all path normalization — never manipulate raw strings directly.

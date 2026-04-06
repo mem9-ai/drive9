@@ -1,11 +1,11 @@
-# Proposal: TiDB Auto Embedding Mode for dat9
+# Proposal: TiDB Auto Embedding Mode for drive9
 
 **Date**: 2026-03-31  
 **Purpose**: Define a production-grade auto embedding mode for TiDB tenants. In this mode, the application continues to produce and maintain `files.content_text`, while the database derives document vectors from `content_text` and embeds query text on the database side during search.
 
 ## Summary
 
-`dat9` should introduce a **database-managed auto embedding** mode for TiDB tenants as the launch schema baseline for **TiDB Cloud Starter** and **TiDB Cloud Zero**. In this mode:
+`drive9` should introduce a **database-managed auto embedding** mode for TiDB tenants as the launch schema baseline for **TiDB Cloud Starter** and **TiDB Cloud Zero**. In this mode:
 
 - `files.content_text` is the canonical semantic text for retrieval
 - the database derives `files.embedding` from `content_text`
@@ -18,7 +18,7 @@ The project has not launched yet, so the first rollout does not define online mi
 
 ### Current State
 
-Today, the semantic indexing pipeline in `dat9` is app-managed:
+Today, the semantic indexing pipeline in `drive9` is app-managed:
 
 #### Current responsibilities of the `files` table
 
@@ -290,11 +290,11 @@ The reduced proposal leaves no open question that blocks the launch boundary. It
 ## References
 
 - `database-auto-embedding/database-managed-auto-embedding-mode.zh.md`
-- `dat9-2/pkg/backend/dat9.go`
-- `dat9-2/pkg/backend/upload.go`
-- `dat9-2/pkg/backend/image_extract.go`
-- `dat9-2/pkg/datastore/search.go`
-- `dat9-2/pkg/datastore/file_tx.go`
-- `dat9-2/pkg/server/semantic_worker.go`
-- `dat9-2/pkg/tenant/schema_zero.go`
-- `dat9-2/pkg/tenant/starter.go`
+- `drive9-2/pkg/backend/drive9.go`
+- `drive9-2/pkg/backend/upload.go`
+- `drive9-2/pkg/backend/image_extract.go`
+- `drive9-2/pkg/datastore/search.go`
+- `drive9-2/pkg/datastore/file_tx.go`
+- `drive9-2/pkg/server/semantic_worker.go`
+- `drive9-2/pkg/tenant/schema_zero.go`
+- `drive9-2/pkg/tenant/starter.go`

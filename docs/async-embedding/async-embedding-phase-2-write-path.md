@@ -1,4 +1,4 @@
-# Proposal: dat9-2 Async Embedding Phase 2 Write-Path Integration
+# Proposal: drive9-2 Async Embedding Phase 2 Write-Path Integration
 
 **Date**: 2026-03-31
 **Purpose**: Turn Phase B of `async-embedding-generation-proposal.md` into a scoped, review-ready proposal for transactional write-path integration and image-to-embed bridging.
@@ -22,7 +22,7 @@ The repository already contains the Phase 1 foundation required by write-path in
 
 The write paths that Phase 2 needs to integrate are still owned by `pkg/backend`:
 
-- small-file create / overwrite in `pkg/backend/dat9.go`
+- small-file create / overwrite in `pkg/backend/drive9.go`
 - multipart upload completion and in-place overwrite in `pkg/backend/upload.go`
 - async image caption / OCR writeback in `pkg/backend/image_extract.go`
 
@@ -138,7 +138,7 @@ The table intentionally separates "clear stale state" from "enqueue embed". Clea
 
 ### 3) Small-file create and overwrite
 
-For `pkg/backend/dat9.go`, Phase 2 should replace the previous split operations with one transaction per committed revision.
+For `pkg/backend/drive9.go`, Phase 2 should replace the previous split operations with one transaction per committed revision.
 
 For create:
 
