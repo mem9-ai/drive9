@@ -1068,6 +1068,27 @@ func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploa
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+// handleV2UploadAbort is the v2 idempotent abort handler.
+// Per phase-1 contract: returns 200 even if upload is already aborted/completed/not found.
+func (s *Server) handleV2UploadAbort(w http.ResponseWriter, r *http.Request, uploadID string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_abort_missing_scope", "upload_id", uploadID)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	err := b.AbortUpload(r.Context(), uploadID)
+	if err != nil && !errors.Is(err, datastore.ErrNotFound) && !errors.Is(err, datastore.ErrUploadNotActive) {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_abort_failed", "upload_id", uploadID, "error", err)...)
+		metricEvent(r.Context(), "v2_upload_abort", "result", "error")
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_abort_ok", "upload_id", uploadID)...)
+	metricEvent(r.Context(), "v2_upload_abort", "result", "ok")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
 // --- v2 upload handlers (on-demand presign, adaptive part size) ---
 
 func (s *Server) handleV2Uploads(w http.ResponseWriter, r *http.Request) {
@@ -1088,8 +1109,8 @@ func (s *Server) handleV2Uploads(w http.ResponseWriter, r *http.Request) {
 		s.handleV2PresignBatch(w, r, seg0)
 	case seg0 != "" && action == "complete" && r.Method == http.MethodPost:
 		s.handleUploadComplete(w, r, seg0)
-	case seg0 != "" && action == "" && r.Method == http.MethodDelete:
-		s.handleUploadAbort(w, r, seg0)
+	case seg0 != "" && action == "abort" && r.Method == http.MethodPost:
+		s.handleV2UploadAbort(w, r, seg0)
 	default:
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_uploads_unknown_route", "path", r.URL.Path, "method", r.Method)...)
 		errJSON(w, http.StatusNotFound, "not found")
@@ -1158,7 +1179,8 @@ func (s *Server) handleV2PresignPart(w http.ResponseWriter, r *http.Request, upl
 		return
 	}
 	var req struct {
-		PartNumber int `json:"part_number"`
+		PartNumber int                          `json:"part_number"`
+		Checksum   *backend.PresignPartChecksum `json:"checksum,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_part_bad_body", "upload_id", uploadID, "error", err)...)
@@ -1169,7 +1191,7 @@ func (s *Server) handleV2PresignPart(w http.ResponseWriter, r *http.Request, upl
 		errJSON(w, http.StatusBadRequest, "part_number must be >= 1")
 		return
 	}
-	url, err := b.PresignPart(r.Context(), uploadID, req.PartNumber)
+	url, err := b.PresignPart(r.Context(), uploadID, req.PartNumber, req.Checksum)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, err.Error())
@@ -1196,18 +1218,22 @@ func (s *Server) handleV2PresignBatch(w http.ResponseWriter, r *http.Request, up
 		return
 	}
 	var req struct {
-		PartNumbers []int `json:"part_numbers"`
+		Parts []backend.PresignBatchEntry `json:"parts"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_batch_bad_body", "upload_id", uploadID, "error", err)...)
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
-	if len(req.PartNumbers) == 0 {
-		errJSON(w, http.StatusBadRequest, "part_numbers must not be empty")
+	if len(req.Parts) == 0 {
+		errJSON(w, http.StatusBadRequest, "parts must not be empty")
 		return
 	}
-	urls, err := b.PresignParts(r.Context(), uploadID, req.PartNumbers)
+	if len(req.Parts) > 500 {
+		errJSON(w, http.StatusBadRequest, "parts exceeds maximum batch size of 500")
+		return
+	}
+	urls, err := b.PresignParts(r.Context(), uploadID, req.Parts)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, err.Error())

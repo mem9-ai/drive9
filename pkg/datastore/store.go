@@ -44,6 +44,7 @@ const (
 type UploadStatus string
 
 const (
+	UploadInitiated UploadStatus = "INITIATED"
 	UploadUploading UploadStatus = "UPLOADING"
 	UploadCompleted UploadStatus = "COMPLETED"
 	UploadAborted   UploadStatus = "ABORTED"
@@ -791,8 +792,27 @@ func (s *Store) AbortUpload(ctx context.Context, uploadID string) (err error) {
 
 	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = 'ABORTED',
 		updated_at = ?
-		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
+		WHERE upload_id = ? AND status IN ('UPLOADING', 'INITIATED')`, time.Now().UTC(), uploadID)
 	return err
+}
+
+// ActivateUpload transitions an upload from INITIATED to UPLOADING.
+// Returns true if the transition happened, false if already UPLOADING.
+func (s *Store) ActivateUpload(ctx context.Context, uploadID string) (activated bool, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "activate_upload", start, &err)
+
+	res, err := s.db.ExecContext(ctx, `UPDATE uploads SET status = 'UPLOADING',
+		updated_at = ?
+		WHERE upload_id = ? AND status = 'INITIATED'`, time.Now().UTC(), uploadID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func (s *Store) ListUploadsByPath(ctx context.Context, targetPath string, status UploadStatus) (out []*Upload, err error) {
