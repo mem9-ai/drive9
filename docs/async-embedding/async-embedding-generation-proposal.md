@@ -1,11 +1,11 @@
-# Proposal: dat9-2 Async Embedding Generation
+# Proposal: drive9-2 Async Embedding Generation
 
 **Date**: 2026-03-30
-**Purpose**: Replace the current incorrect dependency on `EMBED_TEXT()` with a minimal, recoverable, testable async task pipeline, and make vector search in `dat9-2` stand on real executable code paths.
+**Purpose**: Replace the current incorrect dependency on `EMBED_TEXT()` with a minimal, recoverable, testable async task pipeline, and make vector search in `drive9-2` stand on real executable code paths.
 
 ## Summary
 
-`dat9-2` should move file embedding generation from database-generated columns into the application layer, and introduce a tenant-local durable task pipeline. This pipeline should not directly carry over the QueueFS filesystem interface from AGFS. Instead, it should reuse QueueFS's well-tested claim / ack / recover semantics and implement them on top of dat9's own `semantic_tasks` table and worker manager.
+`drive9-2` should move file embedding generation from database-generated columns into the application layer, and introduce a tenant-local durable task pipeline. This pipeline should not directly carry over the QueueFS filesystem interface from AGFS. Instead, it should reuse QueueFS's well-tested claim / ack / recover semantics and implement them on top of drive9's own `semantic_tasks` table and worker manager.
 
 Phase 1 focuses on durable `embed` tasks. After a file write succeeds, the request should still return immediately. In the same database transaction, the server should clear the old embedding, record the target revision, and enqueue an async task. Workers claim tasks through leases, call the embedding API, and write back the result only if `files.revision` still equals the task's bound `resource_version`. The search path should also switch to generating query embeddings in the application layer, then performing vector-to-vector retrieval.
 
@@ -17,21 +17,21 @@ This design keeps the current synchronous storage semantics of `PUT /v1/fs` and 
 
 ### Current State
 
-The current small-file write path in `pkg/backend/dat9.go` synchronously writes content, extracts `content_text`, and persists metadata. `createAndWriteCtx` writes `content_text` directly when inserting into `files`, and `overwriteFileCtx` recomputes `content_text` synchronously on overwrite and calls `UpdateFileContent`. If the file is an image, both paths also call `enqueueImageExtract` after the write completes, so a background worker can asynchronously patch in caption / OCR text. Today, neither create nor overwrite places "file write + follow-up semantic work registration" in the same transaction.
+The current small-file write path in `pkg/backend/drive9.go` synchronously writes content, extracts `content_text`, and persists metadata. `createAndWriteCtx` writes `content_text` directly when inserting into `files`, and `overwriteFileCtx` recomputes `content_text` synchronously on overwrite and calls `UpdateFileContent`. If the file is an image, both paths also call `enqueueImageExtract` after the write completes, so a background worker can asynchronously patch in caption / OCR text. Today, neither create nor overwrite places "file write + follow-up semantic work registration" in the same transaction.
 
 The large-file path returns `202` through `PUT /v1/fs/{path}`, then `pkg/backend/upload.go` completes the multipart upload in `ConfirmUpload` and overwrites the existing inode in place. In that path, the overwrite transaction sets `content_text` to `NULL`, and after the transaction commits, if the target file looks like an image, it also calls `enqueueImageExtractForUpload` to patch `content_text` asynchronously. In other words, upload completion already combines "in-place overwrite inside the transaction + best-effort semantic enrichment after the transaction."
 
 The current search path concurrently executes FTS and vector search in `pkg/datastore/search.go`. `vectorSearch` requires `f.embedding IS NOT NULL` and directly calls `VEC_EMBED_COSINE_DISTANCE(f.embedding, ?)`, passing the raw query string as the second parameter.
 
-The tenant schema still assumes the database can generate text embeddings automatically. `pkg/tenant/schema_zero.go`, `pkg/tenant/schema_starter.go`, and `pkg/tenant/schema_db9.go` all define `files.embedding` as `GENERATED ALWAYS AS (EMBED_TEXT(...))`. But `dat9` origin issue #30 has already confirmed that online db9 instances do not provide `EMBED_TEXT(text) -> vector`, `CHUNK_TEXT(text)`, or `vec_embed_cosine_distance(vector, text)`.
+The tenant schema still assumes the database can generate text embeddings automatically. `pkg/tenant/schema_zero.go`, `pkg/tenant/schema_starter.go`, and `pkg/tenant/schema_db9.go` all define `files.embedding` as `GENERATED ALWAYS AS (EMBED_TEXT(...))`. But `drive9` origin issue #30 has already confirmed that online db9 instances do not provide `EMBED_TEXT(text) -> vector`, `CHUNK_TEXT(text)`, or `vec_embed_cosine_distance(vector, text)`.
 
-`dat9-2` already has a content-semantic worker, but it only covers image -> text enrichment. `pkg/backend/options.go` starts `imageExtractQueue` / a goroutine when constructing the backend, `pkg/backend/image_extract.go` performs revision-gated async writeback through `UpdateFileSearchText(ctx, fileID, revision, text)`, and `pkg/backend/image_extract_test.go` covers the case where a stale revision must not write back new content.
+`drive9-2` already has a content-semantic worker, but it only covers image -> text enrichment. `pkg/backend/options.go` starts `imageExtractQueue` / a goroutine when constructing the backend, `pkg/backend/image_extract.go` performs revision-gated async writeback through `UpdateFileSearchText(ctx, fileID, revision, text)`, and `pkg/backend/image_extract_test.go` covers the case where a stale revision must not write back new content.
 
-However, this existing path is still only a P0 best-effort mechanism, not a durable pipeline. The queue is an in-memory `chan`; when full, tasks are dropped directly. There is no `claim/ack/recover`, no retry/backoff/dead-letter, and the worker lifetime is tied to the `Dat9Backend` instance. In multi-tenant mode, LRU eviction in `pkg/tenant/pool.go` calls `backend.Close()`, which stops the image extract goroutine for that tenant. Compared with the proposal target, the current implementation is better understood as "a prototype that has already validated revision-gated writeback constraints," not as a reusable task system.
+However, this existing path is still only a P0 best-effort mechanism, not a durable pipeline. The queue is an in-memory `chan`; when full, tasks are dropped directly. There is no `claim/ack/recover`, no retry/backoff/dead-letter, and the worker lifetime is tied to the `Drive9Backend` instance. In multi-tenant mode, LRU eviction in `pkg/tenant/pool.go` calls `backend.Close()`, which stops the image extract goroutine for that tenant. Compared with the proposal target, the current implementation is better understood as "a prototype that has already validated revision-gated writeback constraints," not as a reusable task system.
 
 Today, the only server-owned background logic in `pkg/server/server.go` is still provisioning resume. Semantic workers are not yet hosted independently of backend / pool lifecycle.
 
-On the other hand, `agfs-worktree/agfs-server/pkg/plugins/queuefs` already implements the core semantics of a durable queue and has fairly complete contract tests across memory / SQLite / PostgreSQL / TiDB. `Claim` uses leases, `Ack` requires receipts, `RecoverExpired` handles recovery after crash/restart, invalid receipts are rejected, and recovered ordering remains stable. Those semantics are already mature. But QueueFS itself is a queue-only substrate: it does not include task dedupe, task history, result/error storage, and it exposes filesystem control surface that dat9 does not need.
+On the other hand, `agfs-worktree/agfs-server/pkg/plugins/queuefs` already implements the core semantics of a durable queue and has fairly complete contract tests across memory / SQLite / PostgreSQL / TiDB. `Claim` uses leases, `Ack` requires receipts, `RecoverExpired` handles recovery after crash/restart, invalid receipts are rejected, and recovered ordering remains stable. Those semantics are already mature. But QueueFS itself is a queue-only substrate: it does not include task dedupe, task history, result/error storage, and it exposes filesystem control surface that drive9 does not need.
 
 ### Problem Statement
 
@@ -42,7 +42,7 @@ The current design bases search correctness on two capabilities that do not exis
 
 Both assumptions have already been ruled out by issue #30, so the current schema and `vectorSearch` code path cannot serve as the foundation for the future implementation.
 
-At the same time, the `dat9-2` write model has several facts that cannot be broken:
+At the same time, the `drive9-2` write model has several facts that cannot be broken:
 
 - overwrite is an in-place inode update, not copy-on-write
 - zero-copy copy shares the same `file_id`
@@ -61,7 +61,7 @@ In addition, the latest code already has one async `content_text` writeback sour
 - Delivery semantics may be at-least-once; exactly-once is not required. The embedding handler must therefore be idempotent.
 - Multi-tenant workers cannot depend on whether a `tenant.Pool` cache entry happens to stay resident, or background processing may be accidentally paused by LRU eviction.
 - Existing `AsyncImageExtract` must not silently degrade after the migration. It is not durable today, but it does already update `content_text` asynchronously. Once embedding moves to the app layer, vector searchability for those files must be preserved.
-- QueueFS provides high test value, but dat9 does not need to expose queues as filesystem APIs like `/queue/<name>/ack`.
+- QueueFS provides high test value, but drive9 does not need to expose queues as filesystem APIs like `/queue/<name>/ack`.
 
 ## Goals
 
@@ -73,7 +73,7 @@ In addition, the latest code already has one async `content_text` writeback sour
 
 ## Non-Goals
 
-- Do not vendor the full QueueFS plugin directly into `dat9-2` in Phase 1
+- Do not vendor the full QueueFS plugin directly into `drive9-2` in Phase 1
 - Do not implement L0/L1 generation for `.abstract.md` / `.overview.md` in Phase 1
 - Do not add external task query / task watch HTTP APIs
 - Do not require Phase 1 to immediately migrate the existing image -> text extraction into durable `extract_text` tasks; however, after it successfully writes back `content_text`, it must be able to trigger the corresponding revision's `embed`
@@ -85,7 +85,7 @@ In addition, the latest code already has one async `content_text` writeback sour
 Write Path
 ---------
 HTTP PUT / upload complete
-    -> Dat9Backend transaction
+    -> Drive9Backend transaction
     -> update files row
     -> clear stale embedding state
     -> enqueue semantic_tasks(embed, file_id, revision)
@@ -114,7 +114,7 @@ grep/search request
 
 ### 1) Durable task substrate: reuse QueueFS semantics, not QueueFS surface
 
-Inside `dat9-2`, add a `semantic_tasks` table and corresponding `pkg/queue` / `pkg/semantic` code, rather than moving in the whole QueueFS filesystem plugin.
+Inside `drive9-2`, add a `semantic_tasks` table and corresponding `pkg/queue` / `pkg/semantic` code, rather than moving in the whole QueueFS filesystem plugin.
 
 Semantics to preserve and borrow directly:
 
@@ -130,7 +130,7 @@ Parts not to inherit:
 - filesystem control surfaces such as `/enqueue`, `/dequeue`, `/ack`, `/recover`
 - payload structures meant only for generic message queues
 
-What dat9 needs is a task-aware queue, not a queue-only substrate, so task metadata must live in the same table.
+What drive9 needs is a task-aware queue, not a queue-only substrate, so task metadata must live in the same table.
 
 The suggested minimal schema is:
 
@@ -183,7 +183,7 @@ Put differently, `embedding_revision` is the version stamp of `files.embedding`.
 
 ### 3) Write path changes: clear first, enqueue in the same transaction
 
-Small-file create / overwrite in `pkg/backend/dat9.go` do not currently use `Store.InTx`. To bind file persistence and task enqueue together, the following paths must be refactored into transactional versions:
+Small-file create / overwrite in `pkg/backend/drive9.go` do not currently use `Store.InTx`. To bind file persistence and task enqueue together, the following paths must be refactored into transactional versions:
 
 - `createAndWriteCtx`
 - `overwriteFileCtx`
@@ -303,13 +303,13 @@ This part should follow QueueFS durable tests as closely as possible, because th
 
 ## Alternatives Considered
 
-### A. Move the full QueueFS durable mode directly into dat9-2
+### A. Move the full QueueFS durable mode directly into drive9-2
 
-Not recommended for Phase 1. QueueFS has a good durable queue contract, but its filesystem control surface, queue registry, and per-queue table design are too heavy for dat9's internal semantic pipeline, and they cannot directly express task metadata such as `resource_id + resource_version + last_error + max_attempts`.
+Not recommended for Phase 1. QueueFS has a good durable queue contract, but its filesystem control surface, queue registry, and per-queue table design are too heavy for drive9's internal semantic pipeline, and they cannot directly express task metadata such as `resource_id + resource_version + last_error + max_attempts`.
 
 ### B. Build only the simplest possible task table and do not absorb QueueFS contract
 
-Also not recommended. Issue #30 requires lease, ack, crash recovery, and at-least-once delivery. QueueFS has already explored those boundaries once and has cross-backend regression tests. Dat9 does not need to reinvent claim / receipt / recover semantics.
+Also not recommended. Issue #30 requires lease, ack, crash recovery, and at-least-once delivery. QueueFS has already explored those boundaries once and has cross-backend regression tests. Drive9 does not need to reinvent claim / receipt / recover semantics.
 
 ### C. Start with in-process channel / goroutine and add durable queue later
 
@@ -328,11 +328,11 @@ Not acceptable. Embedding is already a prerequisite for search availability, not
    - `pkg/client/schema_test_helper.go`
    - `pkg/backend/schema_test_helper.go`
 5. Add queue contract and datastore helpers under `pkg/queue` or `pkg/semantic`: `Enqueue`, `Claim`, `Ack`, `Retry`, `RecoverExpired`
-6. Translate the key QueueFS durable lifecycle tests into local dat9 tests: wrong receipt, recovery after restart, claim order, ack after stale claim
+6. Translate the key QueueFS durable lifecycle tests into local drive9 tests: wrong receipt, recovery after restart, claim order, ack after stale claim
 
 ### Phase B: Write-path integration
 
-7. Convert create / overwrite in `pkg/backend/dat9.go` into transactional implementations
+7. Convert create / overwrite in `pkg/backend/drive9.go` into transactional implementations
 8. On successful write, synchronously clear old embedding state and enqueue an `embed` task
 9. Modify `pkg/backend/upload.go` so upload completion explicitly clears embedding state during overwrite; for large/binary files without a `content_text` producer, Phase 1 still does not create `embed` tasks
 10. Add a bridge to the existing `pkg/backend/image_extract.go`: after `UpdateFileSearchText` succeeds, enqueue/ensure an `embed` task for the same revision, so image-file vector search does not regress
@@ -401,18 +401,18 @@ Phase D is also the place to decide the minimum production observability set nee
 
 ## References
 
-- `dat9` origin issue #30: durable async processing is a prerequisite because db9 does not provide `EMBED_TEXT(text) -> vector`
+- `drive9` origin issue #30: durable async processing is a prerequisite because db9 does not provide `EMBED_TEXT(text) -> vector`
 - `agfs-worktree/agfs-server/docs/concepts/durable-queuefs-concept.md`
 - `agfs-worktree/agfs-server/pkg/plugins/queuefs/internal/sqlqueue/backend.go`
 - `agfs-worktree/agfs-server/pkg/plugins/queuefs/queuefs_durable_contract_test.go`
-- `dat9-2/pkg/backend/dat9.go`
-- `dat9-2/pkg/backend/upload.go`
-- `dat9-2/pkg/backend/image_extract.go`
-- `dat9-2/pkg/backend/image_extract_test.go`
-- `dat9-2/pkg/backend/options.go`
-- `dat9-2/pkg/datastore/search.go`
-- `dat9-2/pkg/datastore/store.go`
-- `dat9-2/pkg/tenant/pool.go`
-- `dat9-2/pkg/tenant/schema_zero.go`
-- `dat9-2/pkg/tenant/schema_starter.go`
-- `dat9-2/pkg/tenant/schema_db9.go`
+- `drive9-2/pkg/backend/drive9.go`
+- `drive9-2/pkg/backend/upload.go`
+- `drive9-2/pkg/backend/image_extract.go`
+- `drive9-2/pkg/backend/image_extract_test.go`
+- `drive9-2/pkg/backend/options.go`
+- `drive9-2/pkg/datastore/search.go`
+- `drive9-2/pkg/datastore/store.go`
+- `drive9-2/pkg/tenant/pool.go`
+- `drive9-2/pkg/tenant/schema_zero.go`
+- `drive9-2/pkg/tenant/schema_starter.go`
+- `drive9-2/pkg/tenant/schema_db9.go`

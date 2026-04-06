@@ -4,7 +4,7 @@ title: e2e - Live end-to-end scripts
 
 ## Overview
 
-This directory contains live end-to-end tests for deployed dat9-server instances.
+This directory contains live end-to-end tests for deployed drive9-server instances.
 These scripts are integration probes (not unit tests) and call real HTTP endpoints.
 
 ## Quick start
@@ -13,19 +13,19 @@ These scripts are integration probes (not unit tests) and call real HTTP endpoin
 DEPLOY=https://<your-api-gateway-or-server>
 
 # Full smoke (provision -> status poll -> nested dirs -> file ops)
-DAT9_BASE=$DEPLOY bash e2e/api-smoke-test.sh
+DRIVE9_BASE=$DEPLOY bash e2e/api-smoke-test.sh
 
 # Existing key regression
-DAT9_BASE=$DEPLOY DAT9_API_KEY=dat9_xxx bash e2e/api-smoke-test-existing-key.sh
+DRIVE9_BASE=$DEPLOY DRIVE9_API_KEY=drive9_xxx bash e2e/api-smoke-test-existing-key.sh
 
-# CLI smoke (provision + dat9 fs workflows + large file cp)
-DAT9_BASE=$DEPLOY bash e2e/cli-smoke-test.sh
+# CLI smoke (provision + drive9 fs workflows + large file cp)
+DRIVE9_BASE=$DEPLOY bash e2e/cli-smoke-test.sh
 
 # FUSE smoke (mount + bidirectional filesystem checks)
-DAT9_BASE=$DEPLOY bash e2e/fuse-smoke-test.sh
+DRIVE9_BASE=$DEPLOY bash e2e/fuse-smoke-test.sh
 
 # Run all smoke scripts in sequence
-DAT9_BASE=$DEPLOY bash e2e/smoke-all.sh
+DRIVE9_BASE=$DEPLOY bash e2e/smoke-all.sh
 ```
 
 ## Dev endpoint
@@ -33,7 +33,7 @@ DAT9_BASE=$DEPLOY bash e2e/smoke-all.sh
 Current shared dev deployment:
 
 ```bash
-export DAT9_BASE="https://xkopoerih4.execute-api.ap-southeast-1.amazonaws.com"
+export DRIVE9_BASE="https://xkopoerih4.execute-api.ap-southeast-1.amazonaws.com"
 ```
 
 Use this value unless the environment owner announces a new endpoint.
@@ -41,7 +41,7 @@ Use this value unless the environment owner announces a new endpoint.
 ## Prod endpoint
 
 ```bash
-export DAT9_BASE="https://api.drive9.ai"
+export DRIVE9_BASE="https://api.drive9.ai"
 ```
 
 ## Coverage
@@ -74,7 +74,7 @@ export DAT9_BASE="https://api.drive9.ai"
 ### `cli-smoke-test.sh`
 
 1. Provision + readiness polling
-2. Prepare `dat9` CLI binary (build local or download official release)
+2. Prepare `drive9` CLI binary (build local or download official release)
 3. CLI small-file flow (`cp`, `ls`, `cat`, `mv`, `rm`)
 4. CLI batch small-file flow (`cp` many files + dir list count + stat + sample reads)
 5. CLI search flow (`fs grep`, `fs find`)
@@ -86,9 +86,9 @@ export DAT9_BASE="https://api.drive9.ai"
 ### `fuse-smoke-test.sh`
 
 1. Provision + readiness polling
-2. Prepare `dat9` CLI binary (build local or download official release)
+2. Prepare `drive9` CLI binary (build local or download official release)
 3. Mount compatibility precheck for root `ls /`
-4. RW mount lifecycle (`dat9 mount`, `dat9 umount`)
+4. RW mount lifecycle (`drive9 mount`, `drive9 umount`)
 5. File semantics (`create`, `read`, `overwrite`, `append`, `truncate`, `unlink`)
 6. Directory semantics (`mkdir`, nested paths, `readdir`, empty/non-empty `rmdir`)
 7. Rename semantics (file + directory rename consistency)
@@ -113,10 +113,10 @@ Notes:
 
 | Variable | Default | Used by |
 |----------|---------|---------|
-| `DAT9_BASE` | `http://127.0.0.1:9009` | all scripts |
-| `DAT9_IMAGE_FIXTURE_PATH` | `e2e/fixtures/cat03.jpg` | `api-smoke-test.sh`, `cli-smoke-test.sh` |
-| `DAT9_API_KEY` | - | `api-smoke-test-existing-key.sh` |
-| `DAT9_API_KEY` | - | `fuse-smoke-test.sh` (optional; skip provision when set) |
+| `DRIVE9_BASE` | `http://127.0.0.1:9009` | all scripts |
+| `DRIVE9_IMAGE_FIXTURE_PATH` | `e2e/fixtures/cat03.jpg` | `api-smoke-test.sh`, `cli-smoke-test.sh` |
+| `DRIVE9_API_KEY` | - | `api-smoke-test-existing-key.sh` |
+| `DRIVE9_API_KEY` | - | `fuse-smoke-test.sh` (optional; skip provision when set) |
 | `POLL_TIMEOUT_S` | `120` (smoke), `60` (existing-key) | polling scripts |
 | `POLL_INTERVAL_S` | `5` | polling scripts |
 | `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
