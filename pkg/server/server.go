@@ -550,6 +550,7 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 	var req struct {
 		NewSize    int64 `json:"new_size"`
 		DirtyParts []int `json:"dirty_parts"`
+		PartSize   int64 `json:"part_size,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_bad_body", "path", path, "error", err)...)
@@ -566,7 +567,7 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 
-	plan, err := b.InitiatePatchUpload(r.Context(), path, req.NewSize, req.DirtyParts)
+	plan, err := b.InitiatePatchUpload(r.Context(), path, req.NewSize, req.DirtyParts, req.PartSize)
 	if err != nil {
 		if errors.Is(err, datastore.ErrUploadConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_conflict", "path", path)...)
