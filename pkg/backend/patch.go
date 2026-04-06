@@ -78,6 +78,19 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 		return nil, datastore.ErrUploadConflict
 	}
 
+	// Use client-provided part size if valid (>= MinPartSize); otherwise
+	// fall back to fixed 8 MiB for backward compatibility with old clients
+	// that compute dirty_parts at fixed 8 MiB boundaries.
+	partSize := clientPartSize
+	if partSize < s3client.MinPartSize {
+		partSize = s3client.PartSize
+	}
+	newParts := s3client.CalcParts(newSize, partSize)
+	if len(newParts) > MaxMultipartParts {
+		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		return nil, fmt.Errorf("part_size %d produces %d parts for size %d, exceeds S3 limit of %d", partSize, len(newParts), newSize, MaxMultipartParts)
+	}
+
 	// Create new S3 multipart upload (new key — old object stays until confirm)
 	fileID := b.genID()
 	newS3Key := "blobs/" + fileID
@@ -88,15 +101,6 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
 		return nil, fmt.Errorf("create multipart upload: %w", err)
 	}
-
-	// Use client-provided part size if valid (>= MinPartSize); otherwise
-	// fall back to fixed 8 MiB for backward compatibility with old clients
-	// that compute dirty_parts at fixed 8 MiB boundaries.
-	partSize := clientPartSize
-	if partSize < s3client.MinPartSize {
-		partSize = s3client.PartSize
-	}
-	newParts := s3client.CalcParts(newSize, partSize)
 
 	// Build dirty set for O(1) lookup
 	dirtySet := make(map[int]bool, len(dirtyParts))
