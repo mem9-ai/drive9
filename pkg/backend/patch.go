@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -19,19 +20,19 @@ import (
 // upload the result. Unchanged parts are copied server-side via S3
 // UploadPartCopy — no data flows through the client for those.
 type PatchPlan struct {
-	UploadID    string              `json:"upload_id"`
-	PartSize    int64               `json:"part_size"`
-	UploadParts []*PatchUploadPart  `json:"upload_parts"`  // parts the client must upload
-	CopiedParts []int               `json:"copied_parts"`  // part numbers copied server-side
+	UploadID    string             `json:"upload_id"`
+	PartSize    int64              `json:"part_size"`
+	UploadParts []*PatchUploadPart `json:"upload_parts"` // parts the client must upload
+	CopiedParts []int              `json:"copied_parts"` // part numbers copied server-side
 }
 
 // PatchUploadPart describes one dirty part that the client needs to upload.
 type PatchUploadPart struct {
-	Number    int               `json:"number"`
-	URL       string            `json:"url"`               // presigned PUT URL for uploading
-	Size      int64             `json:"size"`               // expected part size
-	Headers   map[string]string `json:"headers,omitempty"`  // required headers for the PUT
-	ExpiresAt time.Time         `json:"expires_at"`
+	Number      int               `json:"number"`
+	URL         string            `json:"url"`               // presigned PUT URL for uploading
+	Size        int64             `json:"size"`              // expected part size
+	Headers     map[string]string `json:"headers,omitempty"` // required headers for the PUT
+	ExpiresAt   time.Time         `json:"expires_at"`
 	ReadURL     string            `json:"read_url,omitempty"`     // presigned GET URL to download original part data (empty for parts beyond original file)
 	ReadHeaders map[string]string `json:"read_headers,omitempty"` // required headers for the GET (e.g. Range, signed into the presigned URL)
 }
@@ -46,6 +47,10 @@ type PatchUploadPart struct {
 //   - dirtyParts: 1-based part numbers that the client has modified
 func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newSize int64, dirtyParts []int, clientPartSize int64) (*PatchPlan, error) {
 	start := time.Now()
+	if err := b.ensureUploadSizeAllowed(newSize); err != nil {
+		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		return nil, err
+	}
 
 	path, err := pathutil.Canonicalize(path)
 	if err != nil {
@@ -190,34 +195,35 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 	now := time.Now()
 	uploadID := b.genID()
 
-	if err := b.store.InsertFile(ctx, &datastore.File{
-		FileID:      fileID,
-		StorageType: datastore.StorageS3,
-		StorageRef:  newS3Key,
-		SizeBytes:   newSize,
-		Revision:    1,
-		Status:      datastore.StatusPending,
-		CreatedAt:   now,
-	}); err != nil {
-		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
-		logger.Error(ctx, "backend_patch_upload_insert_file_failed", zap.String("path", path), zap.Error(err))
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
-		return nil, err
-	}
-
-	if err := b.store.InsertUpload(ctx, &datastore.Upload{
-		UploadID:   uploadID,
-		FileID:     fileID,
-		TargetPath: path,
-		S3UploadID: mpu.UploadID,
-		S3Key:      newS3Key,
-		TotalSize:  newSize,
-		PartSize:   partSize,
-		PartsTotal: len(newParts),
-		Status:     datastore.UploadUploading,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-		ExpiresAt:  now.Add(24 * time.Hour),
+	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.ensureTenantStorageQuotaTx(tx, path, newSize); err != nil {
+			return err
+		}
+		if err := b.store.InsertFileTx(tx, &datastore.File{
+			FileID:      fileID,
+			StorageType: datastore.StorageS3,
+			StorageRef:  newS3Key,
+			SizeBytes:   newSize,
+			Revision:    1,
+			Status:      datastore.StatusPending,
+			CreatedAt:   now,
+		}); err != nil {
+			return err
+		}
+		return b.store.InsertUploadTx(tx, &datastore.Upload{
+			UploadID:   uploadID,
+			FileID:     fileID,
+			TargetPath: path,
+			S3UploadID: mpu.UploadID,
+			S3Key:      newS3Key,
+			TotalSize:  newSize,
+			PartSize:   partSize,
+			PartsTotal: len(newParts),
+			Status:     datastore.UploadUploading,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+			ExpiresAt:  now.Add(24 * time.Hour),
+		})
 	}); err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
 		logger.Error(ctx, "backend_patch_upload_insert_upload_failed", zap.String("path", path), zap.Error(err))

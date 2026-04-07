@@ -72,7 +72,7 @@ export DRIVE9_BASE="https://api.drive9.ai"
 - FUSE mount readiness knobs are `MOUNT_READY_TIMEOUT_S`, `MOUNT_READY_INTERVAL_S`, and `FUSE_MOUNT_ROOT`.
 - CLI source knobs are `CLI_SOURCE` (`build` or `official`), `CLI_RELEASE_BASE_URL`, and optional `CLI_RELEASE_VERSION`.
 - API upload-limit boundary check is enabled by default via `RUN_UPLOAD_LIMIT_BOUNDARY=1`.
-- `UPLOAD_LIMIT_BYTES` controls the boundary value checked by API e2e (default `53687091200`).
+- `UPLOAD_LIMIT_BYTES` controls the boundary value checked by API e2e (default `10737418240`).
 - CLI upload-limit boundary check is enabled by default via `RUN_CLI_UPLOAD_LIMIT_BOUNDARY=1`.
-- `CLI_UPLOAD_LIMIT_BYTES` controls the boundary value checked by CLI e2e (default `53687091200`).
+- `CLI_UPLOAD_LIMIT_BYTES` controls the boundary value checked by CLI e2e (default `10737418240`).
 - `fuse-smoke-test.sh` will `SKIP` when host prerequisites are missing (for example no `/dev/fuse`) or when the server does not support mount precheck `ls /`.
