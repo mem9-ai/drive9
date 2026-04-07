@@ -267,9 +267,9 @@ func publicBaseURL(listenAddr string) string {
 
 func buildBackendOptionsFromEnv() (backend.Options, error) {
 	var opts backend.Options
-	opts.MaxTenantStorageBytes = envInt64("DAT9_MAX_TENANT_STORAGE_BYTES", 50*(1<<30))
+	opts.MaxTenantStorageBytes = envInt64("DRIVE9_MAX_TENANT_STORAGE_BYTES", 50*(1<<30))
 	if opts.MaxTenantStorageBytes <= 0 {
-		return backend.Options{}, fmt.Errorf("DAT9_MAX_TENANT_STORAGE_BYTES must be a positive integer")
+		return backend.Options{}, fmt.Errorf("DRIVE9_MAX_TENANT_STORAGE_BYTES must be a positive integer")
 	}
 
 	queryBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_BASE"))

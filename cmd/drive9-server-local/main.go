@@ -90,13 +90,13 @@ func main() {
 		die(err)
 	}
 	maxUploadBytes := server.DefaultMaxUploadBytes
-	if raw := os.Getenv("DAT9_MAX_UPLOAD_BYTES"); raw != "" {
+	if raw := os.Getenv("DRIVE9_MAX_UPLOAD_BYTES"); raw != "" {
 		maxUploadBytes, err = strconv.ParseInt(raw, 10, 64)
 		if err != nil || maxUploadBytes <= 0 {
-			die(fmt.Errorf("invalid DAT9_MAX_UPLOAD_BYTES: must be a positive integer"))
+			die(fmt.Errorf("invalid DRIVE9_MAX_UPLOAD_BYTES: must be a positive integer"))
 		}
 		if maxUploadBytes < 1<<20 {
-			die(fmt.Errorf("DAT9_MAX_UPLOAD_BYTES too small: minimum 1048576 (1MiB)"))
+			die(fmt.Errorf("DRIVE9_MAX_UPLOAD_BYTES too small: minimum 1048576 (1MiB)"))
 		}
 	}
 	backendOpts.MaxUploadBytes = maxUploadBytes
@@ -332,9 +332,9 @@ func localEmbeddingModeLabel(mode tenant.TiDBEmbeddingMode, explicit bool) strin
 
 func buildBackendOptionsFromEnv() (backend.Options, error) {
 	var opts backend.Options
-	opts.MaxTenantStorageBytes = envInt64("DAT9_MAX_TENANT_STORAGE_BYTES", 50*(1<<30))
+	opts.MaxTenantStorageBytes = envInt64("DRIVE9_MAX_TENANT_STORAGE_BYTES", 50*(1<<30))
 	if opts.MaxTenantStorageBytes <= 0 {
-		return backend.Options{}, fmt.Errorf("DAT9_MAX_TENANT_STORAGE_BYTES must be a positive integer")
+		return backend.Options{}, fmt.Errorf("DRIVE9_MAX_TENANT_STORAGE_BYTES must be a positive integer")
 	}
 
 	queryBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_BASE"))
