@@ -3,10 +3,11 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -68,8 +69,10 @@ func partChecksumHeader(data []byte) string {
 	for _, p := range parts {
 		start := int64(p.Number-1) * s3client.PartSize
 		end := start + p.Size
-		h := sha256.Sum256(data[start:end])
-		out = append(out, base64.StdEncoding.EncodeToString(h[:]))
+		h := crc32.Checksum(data[start:end], crc32.MakeTable(crc32.Castagnoli))
+		var b [4]byte
+		binary.BigEndian.PutUint32(b[:], h)
+		out = append(out, base64.StdEncoding.EncodeToString(b[:]))
 	}
 	return strings.Join(out, ",")
 }
