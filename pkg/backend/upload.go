@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/datastore"
@@ -59,6 +60,10 @@ type PresignPartEntry struct {
 }
 
 var ErrPartChecksumCountMismatch = errors.New("part checksum count mismatch")
+
+func normalizeETag(etag string) string {
+	return strings.Trim(etag, "\"")
+}
 
 // S3 returns the S3Client (nil when not configured).
 func (b *Dat9Backend) S3() s3client.S3Client { return b.s3 }
@@ -487,7 +492,7 @@ func (b *Dat9Backend) ConfirmUploadV2(ctx context.Context, uploadID string, clie
 			metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
 			return fmt.Errorf("part %d not found in S3", partNum)
 		}
-		if clientETag != s3ETag {
+		if normalizeETag(clientETag) != normalizeETag(s3ETag) {
 			metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
 			return fmt.Errorf("part %d ETag mismatch: client=%q, S3=%q", partNum, clientETag, s3ETag)
 		}
