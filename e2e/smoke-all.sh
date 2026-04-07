@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-BASE="${DAT9_BASE:-http://127.0.0.1:9009}"
+BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 
 PASS=0
 FAIL=0
@@ -15,7 +15,7 @@ run_case() {
   echo
   echo "=== [$name] $script ==="
   set +e
-  DAT9_BASE="$BASE" bash "$script"
+  DRIVE9_BASE="$BASE" bash "$script"
   local rc=$?
   set -e
 

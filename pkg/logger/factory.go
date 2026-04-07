@@ -33,9 +33,9 @@ func NewCLILogger() (*zap.Logger, error) {
 
 	rotate := &lumberjack.Logger{
 		Filename:   logPath,
-		MaxSize:    envInt("DAT9_CLI_LOG_MAX_SIZE_MB", 10),
-		MaxBackups: envInt("DAT9_CLI_LOG_MAX_BACKUPS", 5),
-		MaxAge:     envInt("DAT9_CLI_LOG_MAX_AGE_DAYS", 14),
+		MaxSize:    envInt("DRIVE9_CLI_LOG_MAX_SIZE_MB", 10),
+		MaxBackups: envInt("DRIVE9_CLI_LOG_MAX_BACKUPS", 5),
+		MaxAge:     envInt("DRIVE9_CLI_LOG_MAX_AGE_DAYS", 14),
 		Compress:   true,
 	}
 

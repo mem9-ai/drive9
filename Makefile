@@ -37,7 +37,7 @@ mod:
 	$(GO) mod tidy
 	$(GO) mod download
 
-# Run all tests. MySQL-backed suites reuse DAT9_MYSQL_DSN when provided. When
+# Run all tests. MySQL-backed suites reuse DRIVE9_TEST_MYSQL_DSN when provided. When
 # it is unset and podman is available locally, automatically configure the
 # podman-backed testcontainers environment before running go test. Set TEST_P
 # to pass `-p <value>` to `go test`; by default package parallelism is not
@@ -48,7 +48,7 @@ test:
 	if [ -n "$(TEST_P)" ]; then \
 		test_p_flag="-p $(TEST_P)"; \
 	fi; \
-	if [ -z "$${DAT9_MYSQL_DSN:-}" ] && command -v podman >/dev/null 2>&1; then \
+	if [ -z "$${DRIVE9_TEST_MYSQL_DSN:-}" ] && command -v podman >/dev/null 2>&1; then \
 		source ./scripts/test-podman.sh; \
 	fi; \
 	$(GO) test $$test_p_flag -v ./...
@@ -78,7 +78,7 @@ build-server:
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(SERVER_BIN) ./cmd/dat9-server
 
 run-server-local:
-	@source ./scripts/dat9-server-local-env.sh && $(GO) run ./cmd/dat9-server-local
+	@source ./scripts/drive9-server-local-env.sh && $(GO) run ./cmd/dat9-server-local
 
 build-cli:
 	mkdir -p $(BIN_DIR)

@@ -1,5 +1,5 @@
 // Command dat9-server-local starts a single-tenant dat9 HTTP server
-// backed directly by DAT9_LOCAL_DSN for local validation.
+// backed directly by DRIVE9_LOCAL_DSN for local validation.
 package main
 
 import (
@@ -25,8 +25,8 @@ import (
 
 const (
 	defaultListenAddr     = "127.0.0.1:9009"
-	defaultS3Dir          = "/tmp/dat9-local-s3"
-	envLocalEmbeddingMode = "DAT9_LOCAL_EMBEDDING_MODE"
+	defaultS3Dir          = "/tmp/drive9-local-s3"
+	envLocalEmbeddingMode = "DRIVE9_LOCAL_EMBEDDING_MODE"
 )
 
 func main() {
@@ -38,7 +38,7 @@ func main() {
 		usage()
 	}
 
-	addr := envOr("DAT9_LISTEN_ADDR", defaultListenAddr)
+	addr := envOr("DRIVE9_LISTEN_ADDR", defaultListenAddr)
 	if len(os.Args) == 2 {
 		addr = os.Args[1]
 	}
@@ -51,11 +51,11 @@ func main() {
 	logger.Set(srvLogger)
 	logLocalStartupStep(startupCtx, startupStart, time.Now(), "logger_ready")
 
-	localDSN := strings.TrimSpace(os.Getenv("DAT9_LOCAL_DSN"))
+	localDSN := strings.TrimSpace(os.Getenv("DRIVE9_LOCAL_DSN"))
 	if localDSN == "" {
-		die(fmt.Errorf("DAT9_LOCAL_DSN is required"))
+		die(fmt.Errorf("DRIVE9_LOCAL_DSN is required"))
 	}
-	localInitSchema := envBool("DAT9_LOCAL_INIT_SCHEMA", false)
+	localInitSchema := envBool("DRIVE9_LOCAL_INIT_SCHEMA", false)
 	requestedEmbeddingMode, explicitEmbeddingMode, err := localEmbeddingModeFromEnv()
 	if err != nil {
 		die(err)
@@ -116,7 +116,7 @@ func main() {
 	if err != nil {
 		die(err)
 	}
-	if strings.TrimSpace(os.Getenv("DAT9_SEMANTIC_LEASE_SECONDS")) == "" {
+	if strings.TrimSpace(os.Getenv("DRIVE9_SEMANTIC_LEASE_SECONDS")) == "" {
 		workerOpts.LeaseDuration = defaultSemanticLeaseDurationForLocal(backendOpts.AsyncImageExtract)
 	}
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "build_semantic_worker_config")
@@ -126,7 +126,7 @@ func main() {
 		backendOpts.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
 	}
 
-	s3Dir := envOr("DAT9_S3_DIR", defaultS3Dir)
+	s3Dir := envOr("DRIVE9_S3_DIR", defaultS3Dir)
 	// Even in local single-tenant mode we keep the same S3-facing upload code path
 	// by backing it with the local mock implementation.
 	stepStart = time.Now()
@@ -188,46 +188,46 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `usage: dat9-server-local [listen-addr]
 
 environment:
-  DAT9_LISTEN_ADDR serve listen address (default: 127.0.0.1:9009)
-  DAT9_PUBLIC_URL  externally reachable base URL (optional for loopback listen address)
-  DAT9_LOCAL_DSN   local tenant TiDB/MySQL DSN (required)
-  DAT9_LOCAL_INIT_SCHEMA initialize tenant schema on startup (default: false)
-  DAT9_LOCAL_EMBEDDING_MODE auto|app|detect (default: auto when initing schema, detect otherwise)
-  DAT9_S3_DIR      local S3 mock root directory (default: /tmp/dat9-local-s3)
+  DRIVE9_LISTEN_ADDR serve listen address (default: 127.0.0.1:9009)
+  DRIVE9_PUBLIC_URL  externally reachable base URL (optional for loopback listen address)
+  DRIVE9_LOCAL_DSN   local tenant TiDB/MySQL DSN (required)
+  DRIVE9_LOCAL_INIT_SCHEMA initialize tenant schema on startup (default: false)
+  DRIVE9_LOCAL_EMBEDDING_MODE auto|app|detect (default: auto when initing schema, detect otherwise)
+  DRIVE9_S3_DIR      local S3 mock root directory (default: /tmp/drive9-local-s3)
 
   Query embedding (app-side semantic query embedding for grep):
-  DAT9_QUERY_EMBED_API_BASE OpenAI-compatible base URL (optional)
-  DAT9_QUERY_EMBED_API_KEY  API key for DAT9_QUERY_EMBED_API_BASE (optional)
-  DAT9_QUERY_EMBED_MODEL    model name for query embedding (optional)
-  DAT9_QUERY_EMBED_DIMENSIONS optional embedding dimensions override
-  DAT9_QUERY_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
+  DRIVE9_QUERY_EMBED_API_BASE OpenAI-compatible base URL (optional)
+  DRIVE9_QUERY_EMBED_API_KEY  API key for DRIVE9_QUERY_EMBED_API_BASE (optional)
+  DRIVE9_QUERY_EMBED_MODEL    model name for query embedding (optional)
+  DRIVE9_QUERY_EMBED_DIMENSIONS optional embedding dimensions override
+  DRIVE9_QUERY_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
 
   Async semantic embedding worker:
-  DAT9_EMBED_API_BASE OpenAI-compatible base URL for background embedding (optional)
-  DAT9_EMBED_API_KEY  API key for DAT9_EMBED_API_BASE (optional)
-  DAT9_EMBED_MODEL    model name for background embedding (optional)
-  DAT9_EMBED_DIMENSIONS optional embedding dimensions override
-  DAT9_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
-  DAT9_SEMANTIC_WORKERS number of background workers (default: 1)
-  DAT9_SEMANTIC_POLL_INTERVAL_MS worker poll interval in milliseconds (default: 200)
-  DAT9_SEMANTIC_LEASE_SECONDS task lease duration in seconds (default: 30; when unset and image extraction is enabled, local server uses max(30, 2x image extract timeout))
-  DAT9_SEMANTIC_RECOVER_INTERVAL_MS recover sweep interval in milliseconds (default: 5000)
-  DAT9_SEMANTIC_RETRY_BASE_MS base retry backoff in milliseconds (default: 200)
-  DAT9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
-  DAT9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
+  DRIVE9_EMBED_API_BASE OpenAI-compatible base URL for background embedding (optional)
+  DRIVE9_EMBED_API_KEY  API key for DRIVE9_EMBED_API_BASE (optional)
+  DRIVE9_EMBED_MODEL    model name for background embedding (optional)
+  DRIVE9_EMBED_DIMENSIONS optional embedding dimensions override
+  DRIVE9_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
+  DRIVE9_SEMANTIC_WORKERS number of background workers (default: 1)
+  DRIVE9_SEMANTIC_POLL_INTERVAL_MS worker poll interval in milliseconds (default: 200)
+  DRIVE9_SEMANTIC_LEASE_SECONDS task lease duration in seconds (default: 30; when unset and image extraction is enabled, local server uses max(30, 2x image extract timeout))
+  DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS recover sweep interval in milliseconds (default: 5000)
+  DRIVE9_SEMANTIC_RETRY_BASE_MS base retry backoff in milliseconds (default: 200)
+  DRIVE9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
+  DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
 
   Image extraction (async image -> text for search):
-  DAT9_IMAGE_EXTRACT_ENABLED true|false (default: false)
-  DAT9_IMAGE_EXTRACT_QUEUE_SIZE buffered task queue size (default: 128)
-  DAT9_IMAGE_EXTRACT_WORKERS number of workers (default: 1)
-  DAT9_IMAGE_EXTRACT_MAX_BYTES max image bytes processed per task (default: 8388608)
-  DAT9_IMAGE_EXTRACT_TIMEOUT_SECONDS extractor timeout seconds (default: 20)
-  DAT9_IMAGE_EXTRACT_MAX_TEXT_BYTES max extracted text stored in files.content_text (default: 8192)
-  DAT9_IMAGE_EXTRACT_API_BASE OpenAI-compatible base URL (optional)
-  DAT9_IMAGE_EXTRACT_API_KEY  API key for DAT9_IMAGE_EXTRACT_API_BASE (optional)
-  DAT9_IMAGE_EXTRACT_MODEL    model name for vision extraction (optional)
-  DAT9_IMAGE_EXTRACT_PROMPT   custom extraction prompt (optional)
-  DAT9_IMAGE_EXTRACT_MAX_TOKENS max model output tokens (default: 256)
+  DRIVE9_IMAGE_EXTRACT_ENABLED true|false (default: false)
+  DRIVE9_IMAGE_EXTRACT_QUEUE_SIZE buffered task queue size (default: 128)
+  DRIVE9_IMAGE_EXTRACT_WORKERS number of workers (default: 1)
+  DRIVE9_IMAGE_EXTRACT_MAX_BYTES max image bytes processed per task (default: 8388608)
+  DRIVE9_IMAGE_EXTRACT_TIMEOUT_SECONDS extractor timeout seconds (default: 20)
+  DRIVE9_IMAGE_EXTRACT_MAX_TEXT_BYTES max extracted text stored in files.content_text (default: 8192)
+  DRIVE9_IMAGE_EXTRACT_API_BASE OpenAI-compatible base URL (optional)
+  DRIVE9_IMAGE_EXTRACT_API_KEY  API key for DRIVE9_IMAGE_EXTRACT_API_BASE (optional)
+  DRIVE9_IMAGE_EXTRACT_MODEL    model name for vision extraction (optional)
+  DRIVE9_IMAGE_EXTRACT_PROMPT   custom extraction prompt (optional)
+  DRIVE9_IMAGE_EXTRACT_MAX_TOKENS max model output tokens (default: 256)
 `)
 	os.Exit(2)
 }
@@ -241,7 +241,7 @@ func die(err error) {
 }
 
 func publicBaseURL(listenAddr string) string {
-	if v := strings.TrimRight(os.Getenv("DAT9_PUBLIC_URL"), "/"); v != "" {
+	if v := strings.TrimRight(os.Getenv("DRIVE9_PUBLIC_URL"), "/"); v != "" {
 		return v
 	}
 
@@ -253,7 +253,7 @@ func publicBaseURL(listenAddr string) string {
 	case strings.HasPrefix(listenAddr, "http://"), strings.HasPrefix(listenAddr, "https://"):
 		return strings.TrimRight(listenAddr, "/")
 	default:
-		fmt.Fprintf(os.Stderr, "dat9-server-local: DAT9_PUBLIC_URL is required when listen address is %q (wildcard or non-loopback).\n", listenAddr)
+		fmt.Fprintf(os.Stderr, "dat9-server-local: DRIVE9_PUBLIC_URL is required when listen address is %q (wildcard or non-loopback).\n", listenAddr)
 		os.Exit(1)
 		return ""
 	}
@@ -337,20 +337,20 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 		return backend.Options{}, fmt.Errorf("DAT9_MAX_TENANT_STORAGE_BYTES must be a positive integer")
 	}
 
-	queryBaseURL := strings.TrimSpace(os.Getenv("DAT9_QUERY_EMBED_API_BASE"))
-	queryAPIKey := strings.TrimSpace(os.Getenv("DAT9_QUERY_EMBED_API_KEY"))
-	queryModel := strings.TrimSpace(os.Getenv("DAT9_QUERY_EMBED_MODEL"))
+	queryBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_BASE"))
+	queryAPIKey := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_KEY"))
+	queryModel := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_MODEL"))
 	queryConfigured := queryBaseURL != "" || queryAPIKey != "" || queryModel != ""
 	if queryConfigured {
 		if queryBaseURL == "" || queryAPIKey == "" || queryModel == "" {
-			return backend.Options{}, fmt.Errorf("DAT9_QUERY_EMBED_API_BASE, DAT9_QUERY_EMBED_API_KEY and DAT9_QUERY_EMBED_MODEL must be set together")
+			return backend.Options{}, fmt.Errorf("DRIVE9_QUERY_EMBED_API_BASE, DRIVE9_QUERY_EMBED_API_KEY and DRIVE9_QUERY_EMBED_MODEL must be set together")
 		}
 		queryClient, err := embedding.NewOpenAIClient(embedding.OpenAIClientConfig{
 			BaseURL:    queryBaseURL,
 			APIKey:     queryAPIKey,
 			Model:      queryModel,
-			Dimensions: envInt("DAT9_QUERY_EMBED_DIMENSIONS", 0),
-			Timeout:    time.Duration(envInt("DAT9_QUERY_EMBED_TIMEOUT_SECONDS", 20)) * time.Second,
+			Dimensions: envInt("DRIVE9_QUERY_EMBED_DIMENSIONS", 0),
+			Timeout:    time.Duration(envInt("DRIVE9_QUERY_EMBED_TIMEOUT_SECONDS", 20)) * time.Second,
 		})
 		if err != nil {
 			return backend.Options{}, fmt.Errorf("init query embedder: %w", err)
@@ -360,29 +360,29 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 			zap.String("model", queryModel), zap.String("base_url", queryBaseURL))
 	}
 
-	if !envBool("DAT9_IMAGE_EXTRACT_ENABLED", false) {
+	if !envBool("DRIVE9_IMAGE_EXTRACT_ENABLED", false) {
 		return opts, nil
 	}
 
 	async := backend.AsyncImageExtractOptions{
 		Enabled:             true,
-		QueueSize:           envInt("DAT9_IMAGE_EXTRACT_QUEUE_SIZE", 128),
-		Workers:             envInt("DAT9_IMAGE_EXTRACT_WORKERS", 1),
-		MaxImageBytes:       envInt64("DAT9_IMAGE_EXTRACT_MAX_BYTES", 8<<20),
-		TaskTimeout:         time.Duration(envInt("DAT9_IMAGE_EXTRACT_TIMEOUT_SECONDS", 20)) * time.Second,
-		MaxExtractTextBytes: envInt("DAT9_IMAGE_EXTRACT_MAX_TEXT_BYTES", 8<<10),
+		QueueSize:           envInt("DRIVE9_IMAGE_EXTRACT_QUEUE_SIZE", 128),
+		Workers:             envInt("DRIVE9_IMAGE_EXTRACT_WORKERS", 1),
+		MaxImageBytes:       envInt64("DRIVE9_IMAGE_EXTRACT_MAX_BYTES", 8<<20),
+		TaskTimeout:         time.Duration(envInt("DRIVE9_IMAGE_EXTRACT_TIMEOUT_SECONDS", 20)) * time.Second,
+		MaxExtractTextBytes: envInt("DRIVE9_IMAGE_EXTRACT_MAX_TEXT_BYTES", 8<<10),
 	}
 
-	baseURL := strings.TrimSpace(os.Getenv("DAT9_IMAGE_EXTRACT_API_BASE"))
-	apiKey := strings.TrimSpace(os.Getenv("DAT9_IMAGE_EXTRACT_API_KEY"))
-	model := strings.TrimSpace(os.Getenv("DAT9_IMAGE_EXTRACT_MODEL"))
-	prompt := strings.TrimSpace(os.Getenv("DAT9_IMAGE_EXTRACT_PROMPT"))
-	maxTokens := envInt("DAT9_IMAGE_EXTRACT_MAX_TOKENS", 256)
+	baseURL := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_API_BASE"))
+	apiKey := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_API_KEY"))
+	model := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_MODEL"))
+	prompt := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_PROMPT"))
+	maxTokens := envInt("DRIVE9_IMAGE_EXTRACT_MAX_TOKENS", 256)
 
 	configured := baseURL != "" || apiKey != "" || model != ""
 	if configured {
 		if baseURL == "" || apiKey == "" || model == "" {
-			return backend.Options{}, fmt.Errorf("DAT9_IMAGE_EXTRACT_API_BASE, DAT9_IMAGE_EXTRACT_API_KEY and DAT9_IMAGE_EXTRACT_MODEL must be set together")
+			return backend.Options{}, fmt.Errorf("DRIVE9_IMAGE_EXTRACT_API_BASE, DRIVE9_IMAGE_EXTRACT_API_KEY and DRIVE9_IMAGE_EXTRACT_MODEL must be set together")
 		}
 		extractor, err := backend.NewOpenAIImageTextExtractor(backend.OpenAIImageTextExtractorConfig{
 			BaseURL:   baseURL,
@@ -409,34 +409,34 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 
 func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorkerOptions, error) {
 	var opts server.SemanticWorkerOptions
-	baseURL := strings.TrimSpace(os.Getenv("DAT9_EMBED_API_BASE"))
-	apiKey := strings.TrimSpace(os.Getenv("DAT9_EMBED_API_KEY"))
-	model := strings.TrimSpace(os.Getenv("DAT9_EMBED_MODEL"))
+	baseURL := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_API_BASE"))
+	apiKey := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_API_KEY"))
+	model := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_MODEL"))
 	configured := baseURL != "" || apiKey != "" || model != ""
 	if !configured {
 		return nil, opts, nil
 	}
 	if baseURL == "" || apiKey == "" || model == "" {
-		return nil, opts, fmt.Errorf("DAT9_EMBED_API_BASE, DAT9_EMBED_API_KEY and DAT9_EMBED_MODEL must be set together")
+		return nil, opts, fmt.Errorf("DRIVE9_EMBED_API_BASE, DRIVE9_EMBED_API_KEY and DRIVE9_EMBED_MODEL must be set together")
 	}
 	client, err := embedding.NewOpenAIClient(embedding.OpenAIClientConfig{
 		BaseURL:    baseURL,
 		APIKey:     apiKey,
 		Model:      model,
-		Dimensions: envInt("DAT9_EMBED_DIMENSIONS", 0),
-		Timeout:    time.Duration(envInt("DAT9_EMBED_TIMEOUT_SECONDS", 20)) * time.Second,
+		Dimensions: envInt("DRIVE9_EMBED_DIMENSIONS", 0),
+		Timeout:    time.Duration(envInt("DRIVE9_EMBED_TIMEOUT_SECONDS", 20)) * time.Second,
 	})
 	if err != nil {
 		return nil, opts, fmt.Errorf("init semantic embedder: %w", err)
 	}
 	opts = server.SemanticWorkerOptions{
-		Workers:              envInt("DAT9_SEMANTIC_WORKERS", 1),
-		PollInterval:         time.Duration(envInt("DAT9_SEMANTIC_POLL_INTERVAL_MS", 200)) * time.Millisecond,
-		LeaseDuration:        time.Duration(envInt("DAT9_SEMANTIC_LEASE_SECONDS", 30)) * time.Second,
-		RecoverInterval:      time.Duration(envInt("DAT9_SEMANTIC_RECOVER_INTERVAL_MS", 5000)) * time.Millisecond,
-		RetryBaseDelay:       time.Duration(envInt("DAT9_SEMANTIC_RETRY_BASE_MS", 200)) * time.Millisecond,
-		RetryMaxDelay:        time.Duration(envInt("DAT9_SEMANTIC_RETRY_MAX_MS", 30000)) * time.Millisecond,
-		PerTenantConcurrency: envInt("DAT9_SEMANTIC_PER_TENANT_CONCURRENCY", 1),
+		Workers:              envInt("DRIVE9_SEMANTIC_WORKERS", 1),
+		PollInterval:         time.Duration(envInt("DRIVE9_SEMANTIC_POLL_INTERVAL_MS", 200)) * time.Millisecond,
+		LeaseDuration:        time.Duration(envInt("DRIVE9_SEMANTIC_LEASE_SECONDS", 30)) * time.Second,
+		RecoverInterval:      time.Duration(envInt("DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS", 5000)) * time.Millisecond,
+		RetryBaseDelay:       time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_BASE_MS", 200)) * time.Millisecond,
+		RetryMaxDelay:        time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_MAX_MS", 30000)) * time.Millisecond,
+		PerTenantConcurrency: envInt("DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY", 1),
 	}
 	logger.Info(context.Background(), "semantic_embedding_mode_openai_compatible",
 		zap.String("model", model), zap.String("base_url", baseURL))

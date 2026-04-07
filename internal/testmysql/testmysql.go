@@ -11,7 +11,7 @@ import (
 	tcmysql "github.com/testcontainers/testcontainers-go/modules/mysql"
 )
 
-const envDSN = "DAT9_MYSQL_DSN"
+const envDSN = "DRIVE9_TEST_MYSQL_DSN"
 
 type Instance struct {
 	DSN       string

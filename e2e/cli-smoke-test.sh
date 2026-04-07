@@ -4,8 +4,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE="${DAT9_BASE:-http://127.0.0.1:9009}"
-DAT9_IMAGE_FIXTURE_PATH="${DAT9_IMAGE_FIXTURE_PATH:-$SCRIPT_DIR/fixtures/cat03.jpg}"
+BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
+DRIVE9_IMAGE_FIXTURE_PATH="${DRIVE9_IMAGE_FIXTURE_PATH:-$SCRIPT_DIR/fixtures/cat03.jpg}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 CLI_SOURCE="${CLI_SOURCE:-build}"
@@ -109,7 +109,7 @@ prepare_cli_binary() {
 echo "=== dat9 CLI smoke test ==="
 echo "BASE=$BASE"
 echo "CLI_SOURCE=$CLI_SOURCE"
-echo "IMAGE_FIXTURE=$DAT9_IMAGE_FIXTURE_PATH"
+echo "IMAGE_FIXTURE=$DRIVE9_IMAGE_FIXTURE_PATH"
 
 check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
 if [ "$CLI_SOURCE" = "build" ]; then
@@ -117,7 +117,7 @@ if [ "$CLI_SOURCE" = "build" ]; then
 else
   check_cmd "curl is available" bash -c 'command -v curl >/dev/null'
 fi
-check_cmd "local image fixture exists" test -s "$DAT9_IMAGE_FIXTURE_PATH"
+check_cmd "local image fixture exists" test -s "$DRIVE9_IMAGE_FIXTURE_PATH"
 
 echo "[1] provision tenant"
 pfile="$(mktemp)"
@@ -150,7 +150,7 @@ prepare_cli_binary
 check_cmd "dat9 binary ready" test -x "$CLI_BIN"
 
 dat9() {
-  DAT9_SERVER="$BASE" DAT9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
+  DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
 }
 
 dat9_retry() {
@@ -346,7 +346,7 @@ wait_cli_grep_target "cli semantic grep includes cat-story target" "feline sofa"
 wait_cli_grep_target "cli semantic grep includes dog-story target" "canine field" "$SEM_TEXT_OTHER"
 
 echo "[6.2] cli image-associated recall checks"
-cp "$DAT9_IMAGE_FIXTURE_PATH" "$IMAGE_LOCAL"
+cp "$DRIVE9_IMAGE_FIXTURE_PATH" "$IMAGE_LOCAL"
 check_cmd "local cli jpg fixture exists" test -s "$IMAGE_LOCAL"
 dat9_retry fs cp "$IMAGE_LOCAL" ":$IMAGE_REMOTE" >/dev/null
 printf "This image shows a cat face icon." > "/tmp/dat9-cli-image-caption-${TS}.txt"

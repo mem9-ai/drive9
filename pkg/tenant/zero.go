@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const envZeroAPIURL = "DAT9_ZERO_API_URL"
+const envZeroAPIURL = "DRIVE9_ZERO_API_URL"
 
 type ZeroProvisioner struct {
 	baseURL string

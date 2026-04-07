@@ -139,13 +139,43 @@ c.Delete("/data/file.txt")
 | `DRIVE9_API_KEY` | API key | |
 | `DRIVE9_LISTEN_ADDR` | Server listen address | `:9009` |
 | `DRIVE9_PUBLIC_URL` | Externally reachable base URL (required for remote clients) | |
-| `DRIVE9_MYSQL_DSN` | MySQL DSN for tests/local validation (example: `user:pass@tcp(127.0.0.1:3306)/drive9?parseTime=true`) | |
-| `DRIVE9_BLOB_DIR` | Blob storage directory | `./blobs` |
+| `DRIVE9_META_DSN` | Control-plane MySQL DSN for the multi-tenant server | |
 | `DRIVE9_S3_BUCKET` | S3 bucket name (enables AWS S3 mode; omit for local mock) | |
 | `DRIVE9_S3_REGION` | AWS region | `us-east-1` |
 | `DRIVE9_S3_PREFIX` | S3 key prefix (e.g. `tenants/abc/`) | |
 | `DRIVE9_S3_ROLE_ARN` | IAM role ARN to assume via STS | |
 | `DRIVE9_S3_DIR` | Local S3 mock directory (only used without `DRIVE9_S3_BUCKET`) | `./s3` |
+| `DRIVE9_TENANT_PROVIDER` | Tenant provisioner: `db9`, `tidb_zero`, or `tidb_cloud_starter` | `tidb_zero` |
+| `DRIVE9_MAX_UPLOAD_BYTES` | Maximum allowed upload size in bytes | `53687091200` |
+| `DRIVE9_ZERO_API_URL` | TiDB Zero provision API base URL | |
+| `DRIVE9_TIDBCLOUD_API_URL` | TiDB Cloud Starter API base URL | |
+| `DRIVE9_TIDBCLOUD_API_KEY` | TiDB Cloud Starter API key | |
+| `DRIVE9_TIDBCLOUD_API_SECRET` | TiDB Cloud Starter API secret | |
+| `DRIVE9_TIDBCLOUD_POOL_ID` | TiDB Cloud Starter pool id | |
+| `DRIVE9_DB9_API_URL` | db9 provision API base URL | |
+| `DRIVE9_DB9_API_KEY` | db9 provision API key | |
+| `DRIVE9_ENCRYPT_TYPE` | Encryption backend: `local_aes` or `kms` | `local_aes` |
+| `DRIVE9_MASTER_KEY` | 32-byte hex key for `local_aes` encryption | |
+| `DRIVE9_ENCRYPT_KEY` | KMS key id or alias when `DRIVE9_ENCRYPT_TYPE=kms` | |
+| `DRIVE9_TOKEN_SIGNING_KEY` | 32-byte hex key for JWT API key signing | |
+| `DRIVE9_QUERY_EMBED_API_BASE` | OpenAI-compatible base URL for query embedding | |
+| `DRIVE9_QUERY_EMBED_API_KEY` | API key for query embedding | |
+| `DRIVE9_QUERY_EMBED_MODEL` | Model name for query embedding | |
+| `DRIVE9_QUERY_EMBED_DIMENSIONS` | Optional query embedding dimensions override | |
+| `DRIVE9_QUERY_EMBED_TIMEOUT_SECONDS` | Query embedding timeout seconds | `20` |
+| `DRIVE9_EMBED_API_BASE` | OpenAI-compatible base URL for background embedding | |
+| `DRIVE9_EMBED_API_KEY` | API key for background embedding | |
+| `DRIVE9_EMBED_MODEL` | Model name for background embedding | |
+| `DRIVE9_EMBED_DIMENSIONS` | Optional background embedding dimensions override | |
+| `DRIVE9_EMBED_TIMEOUT_SECONDS` | Background embedding timeout seconds | `20` |
+| `DRIVE9_SEMANTIC_WORKERS` | Number of semantic workers | `1` |
+| `DRIVE9_SEMANTIC_POLL_INTERVAL_MS` | Semantic worker poll interval in milliseconds | `200` |
+| `DRIVE9_SEMANTIC_LEASE_SECONDS` | Semantic task lease duration in seconds | `30` |
+| `DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS` | Expired semantic task recover interval in milliseconds | `5000` |
+| `DRIVE9_SEMANTIC_RETRY_BASE_MS` | Base semantic retry backoff in milliseconds | `200` |
+| `DRIVE9_SEMANTIC_RETRY_MAX_MS` | Max semantic retry backoff in milliseconds | `30000` |
+| `DRIVE9_SEMANTIC_TENANT_LIMIT` | Active tenants scanned per round | `128` |
+| `DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY` | Max concurrent semantic tasks per tenant | `1` |
 | `DRIVE9_IMAGE_EXTRACT_ENABLED` | Enable async image->text extraction for search | `false` |
 | `DRIVE9_IMAGE_EXTRACT_QUEUE_SIZE` | In-memory queue size for extraction tasks | `128` |
 | `DRIVE9_IMAGE_EXTRACT_WORKERS` | Number of extraction workers | `1` |
@@ -157,6 +187,14 @@ c.Delete("/data/file.txt")
 | `DRIVE9_IMAGE_EXTRACT_MODEL` | Vision model name (for example Qwen VL model id) | |
 | `DRIVE9_IMAGE_EXTRACT_PROMPT` | Custom extraction prompt | `用中文描述这张图片，用于文件搜索。包括：主要物体、场景描述、图中可见文字（OCR）、简洁标签。最后一行用英文写5-10个关键词标签（English tags），用逗号分隔。` |
 | `DRIVE9_IMAGE_EXTRACT_MAX_TOKENS` | Max output tokens for model extraction | `256` |
+| `DRIVE9_CLI_LOG_ENABLED` | Enable CLI structured log file output | `false` |
+| `DRIVE9_CLI_LOG_MAX_SIZE_MB` | CLI log rotation max size in MB | `10` |
+| `DRIVE9_CLI_LOG_MAX_BACKUPS` | CLI log rotation max backups | `5` |
+| `DRIVE9_CLI_LOG_MAX_AGE_DAYS` | CLI log rotation max age in days | `14` |
+| `DRIVE9_TEST_MYSQL_DSN` | MySQL/TiDB DSN reused by test suites (example: `user:pass@tcp(127.0.0.1:3306)/drive9_test?parseTime=true`) | |
+| `DRIVE9_LOCAL_DSN` | Local single-tenant datastore DSN for `dat9-server-local` | |
+| `DRIVE9_LOCAL_INIT_SCHEMA` | Initialize local tenant schema on startup | `false` |
+| `DRIVE9_LOCAL_EMBEDDING_MODE` | Local embedding mode: `auto`, `app`, or `detect` | `detect` |
 
 ## Architecture
 
@@ -317,17 +355,17 @@ make test
 
 For MySQL-backed test suites:
 
-- if `DRIVE9_MYSQL_DSN` is set, the tests reuse that MySQL instance
+- if `DRIVE9_TEST_MYSQL_DSN` is set, the tests reuse that MySQL instance
 - otherwise, if `podman` is available locally, `make test` automatically configures the Podman-backed testcontainers environment
 - otherwise, testcontainers uses the default Docker-compatible runtime environment
 
 For example, to reuse an existing local MySQL instance:
 
 ```bash
-DRIVE9_MYSQL_DSN='drive9:drive9pass@tcp(127.0.0.1:3306)/drive9_test?parseTime=true' make test
+DRIVE9_TEST_MYSQL_DSN='drive9:drive9pass@tcp(127.0.0.1:3306)/drive9_test?parseTime=true' make test
 ```
 
-If you do not provide `DRIVE9_MYSQL_DSN`, make sure a Docker-compatible container runtime is available locally.
+If you do not provide `DRIVE9_TEST_MYSQL_DSN`, make sure a Docker-compatible container runtime is available locally.
 
 ## References
 
