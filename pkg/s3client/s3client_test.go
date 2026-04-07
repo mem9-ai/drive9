@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -215,17 +216,93 @@ func TestPartialUploadAndListParts(t *testing.T) {
 	}
 }
 
+func TestMultipartUploadNoChecksumAlgo(t *testing.T) {
+	c := newTestClient(t)
+	ctx := context.Background()
+
+	// Initiate with ChecksumAlgoNone — simulates v2 uploads where
+	// the client doesn't send per-part checksums.
+	upload, err := c.CreateMultipartUpload(ctx, "blobs/no-checksum", ChecksumAlgoNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upload.UploadID == "" {
+		t.Fatal("expected non-empty upload ID")
+	}
+
+	// Upload parts without any checksum header
+	partData := []string{"AAAA", "BB"}
+	var parts []Part
+	for i, d := range partData {
+		etag, err := c.UploadPart(ctx, upload.UploadID, i+1, bytes.NewReader([]byte(d)))
+		if err != nil {
+			t.Fatalf("upload part %d: %v", i+1, err)
+		}
+		parts = append(parts, Part{Number: i + 1, Size: int64(len(d)), ETag: etag})
+	}
+
+	// Complete should succeed without checksum validation
+	if err := c.CompleteMultipartUpload(ctx, "blobs/no-checksum", upload.UploadID, parts); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify assembled object
+	rc, err := c.GetObject(ctx, "blobs/no-checksum")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rc.Close() }()
+	got, _ := io.ReadAll(rc)
+	if string(got) != "AAAABB" {
+		t.Errorf("expected AAAABB, got %q", got)
+	}
+}
+
+func TestChecksumAlgorithmForAWS(t *testing.T) {
+	tests := []struct {
+		name    string
+		algo    ChecksumAlgo
+		want    string
+		wantOK  bool
+		wantErr string
+	}{
+		{name: "none", algo: ChecksumAlgoNone, wantOK: false},
+		{name: "crc32c", algo: ChecksumAlgoCRC32C, want: "CRC32C", wantOK: true},
+		{name: "sha256", algo: ChecksumAlgoSHA256, want: "SHA256", wantOK: true},
+		{name: "unknown", algo: ChecksumAlgo("bogus"), wantErr: "unsupported checksum algorithm"},
+	}
+
+	for _, tt := range tests {
+		got, ok, err := checksumAlgorithmForAWS(tt.algo)
+		if tt.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("%s: expected error containing %q, got %v", tt.name, tt.wantErr, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", tt.name, err)
+		}
+		if ok != tt.wantOK {
+			t.Fatalf("%s: ok=%v, want %v", tt.name, ok, tt.wantOK)
+		}
+		if string(got) != tt.want {
+			t.Fatalf("%s: got %q, want %q", tt.name, string(got), tt.want)
+		}
+	}
+}
+
 func TestCalcAdaptivePartSize(t *testing.T) {
 	tests := []struct {
-		name     string
-		total    int64
-		wantPS   int64
-		wantN    int // expected number of parts (0 = skip check)
+		name   string
+		total  int64
+		wantPS int64
+		wantN  int // expected number of parts (0 = skip check)
 	}{
 		{"small file 1 MiB", 1 << 20, PartSize, 1},
-		{"80 GiB", 80 * (1 << 30), 9 << 20, 0},           // ceil(80GiB/10000) → align up to 9 MiB
-		{"100 GiB", 100 * (1 << 30), 11 << 20, 0},        // ceil(100GiB/10000) → align up to 11 MiB
-		{"500 GiB", 500 * (1 << 30), 52 << 20, 0},        // ceil(500GiB/10000) → align up to 52 MiB
+		{"80 GiB", 80 * (1 << 30), 9 << 20, 0},    // ceil(80GiB/10000) → align up to 9 MiB
+		{"100 GiB", 100 * (1 << 30), 11 << 20, 0}, // ceil(100GiB/10000) → align up to 11 MiB
+		{"500 GiB", 500 * (1 << 30), 52 << 20, 0}, // ceil(500GiB/10000) → align up to 52 MiB
 		{"5 TiB max S3 object", 5 * (1 << 40), MaxAdaptivePartSize, 0},
 	}
 	for _, tt := range tests {
