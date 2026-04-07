@@ -1038,7 +1038,9 @@ func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.ContentLength = plan.Parts[0].Size
-	if plan.Parts[0].ChecksumSHA256 != "" {
+	if plan.Parts[0].ChecksumCRC32C != "" {
+		req.Header.Set("x-amz-checksum-crc32c", plan.Parts[0].ChecksumCRC32C)
+	} else if plan.Parts[0].ChecksumSHA256 != "" {
 		req.Header.Set("x-amz-checksum-sha256", plan.Parts[0].ChecksumSHA256)
 	}
 	resp, err = http.DefaultClient.Do(req)

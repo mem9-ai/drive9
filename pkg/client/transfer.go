@@ -3,10 +3,11 @@ package client
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"runtime"
@@ -30,6 +31,7 @@ type PartURL struct {
 	URL            string            `json:"url"`
 	Size           int64             `json:"size"`
 	ChecksumSHA256 string            `json:"checksum_sha256,omitempty"`
+	ChecksumCRC32C string            `json:"checksum_crc32c,omitempty"`
 	Headers        map[string]string `json:"headers,omitempty"`
 	ExpiresAt      string            `json:"expires_at"`
 }
@@ -364,11 +366,10 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 
 // uploadOnePart PUTs data to a presigned URL and returns the ETag.
 func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (string, error) {
-	checksum := part.ChecksumSHA256
+	checksum := part.ChecksumCRC32C
 	if checksum == "" {
-		// No pre-computed checksum (legacy path) — compute it now.
-		h := sha256.Sum256(data)
-		checksum = base64.StdEncoding.EncodeToString(h[:])
+		// No pre-computed checksum — compute CRC32C now.
+		checksum = computeCRC32C(data)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, part.URL, bytes.NewReader(data))
@@ -382,7 +383,7 @@ func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (
 		req.Header.Set(k, v)
 	}
 	req.ContentLength = int64(len(data))
-	req.Header.Set("x-amz-checksum-sha256", checksum)
+	req.Header.Set("x-amz-checksum-crc32c", checksum)
 
 	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
 	if err != nil {
@@ -1172,8 +1173,7 @@ func computePartChecksumsFromReaderAt(r io.ReaderAt, totalSize int64, partSize i
 					})
 					return
 				}
-				h := sha256.Sum256(data)
-				checksums[i] = base64.StdEncoding.EncodeToString(h[:])
+				checksums[i] = computeCRC32C(data)
 			}
 		}()
 	}
@@ -1183,4 +1183,13 @@ func computePartChecksumsFromReaderAt(r io.ReaderAt, totalSize int64, partSize i
 		return nil, firstErr
 	}
 	return checksums, nil
+}
+
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+
+func computeCRC32C(data []byte) string {
+	v := crc32.Checksum(data, crc32cTable)
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, v)
+	return base64.StdEncoding.EncodeToString(b)
 }

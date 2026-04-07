@@ -82,11 +82,15 @@ func (c *AWSS3Client) fullKey(key string) string {
 	return c.prefix + key
 }
 
-func (c *AWSS3Client) CreateMultipartUpload(ctx context.Context, key string) (*MultipartUpload, error) {
+func (c *AWSS3Client) CreateMultipartUpload(ctx context.Context, key string, algo ChecksumAlgo) (*MultipartUpload, error) {
+	awsAlgo := types.ChecksumAlgorithmSha256
+	if algo == ChecksumAlgoCRC32C {
+		awsAlgo = types.ChecksumAlgorithmCrc32c
+	}
 	out, err := c.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket:            &c.bucket,
 		Key:               aws.String(c.fullKey(key)),
-		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+		ChecksumAlgorithm: awsAlgo,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create multipart upload: %w", err)
@@ -97,7 +101,7 @@ func (c *AWSS3Client) CreateMultipartUpload(ctx context.Context, key string) (*M
 	}, nil
 }
 
-func (c *AWSS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, checksumSHA256 string, ttl time.Duration) (*UploadPartURL, error) {
+func (c *AWSS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, algo ChecksumAlgo, checksumValue string, ttl time.Duration) (*UploadPartURL, error) {
 	if ttl > UploadTTL {
 		ttl = UploadTTL
 	}
@@ -108,8 +112,16 @@ func (c *AWSS3Client) PresignUploadPart(ctx context.Context, key, uploadID strin
 		PartNumber:    aws.Int32(int32(partNumber)),
 		ContentLength: aws.Int64(partSize),
 	}
-	if checksumSHA256 != "" {
-		in.ChecksumSHA256 = aws.String(checksumSHA256)
+	var headerKey string
+	if checksumValue != "" {
+		switch algo {
+		case ChecksumAlgoCRC32C:
+			in.ChecksumCRC32C = aws.String(checksumValue)
+			headerKey = "x-amz-checksum-crc32c"
+		default:
+			in.ChecksumSHA256 = aws.String(checksumValue)
+			headerKey = "x-amz-checksum-sha256"
+		}
 	}
 	partPresigner := v4.NewSigner(func(o *v4.SignerOptions) {
 		o.DisableURIPathEscaping = true
@@ -123,17 +135,23 @@ func (c *AWSS3Client) PresignUploadPart(ctx context.Context, key, uploadID strin
 		return nil, fmt.Errorf("presign upload part: %w", err)
 	}
 	headers := flattenSignedHeaders(out.SignedHeader)
-	if checksumSHA256 != "" {
-		headers[strings.ToLower("x-amz-checksum-sha256")] = checksumSHA256
+	if checksumValue != "" {
+		headers[headerKey] = checksumValue
 	}
-	return &UploadPartURL{
-		Number:         partNumber,
-		URL:            out.URL,
-		Size:           partSize,
-		ChecksumSHA256: checksumSHA256,
-		Headers:        headers,
-		ExpiresAt:      time.Now().Add(ttl),
-	}, nil
+	result := &UploadPartURL{
+		Number:    partNumber,
+		URL:       out.URL,
+		Size:      partSize,
+		Headers:   headers,
+		ExpiresAt: time.Now().Add(ttl),
+	}
+	switch algo {
+	case ChecksumAlgoCRC32C:
+		result.ChecksumCRC32C = checksumValue
+	default:
+		result.ChecksumSHA256 = checksumValue
+	}
+	return result, nil
 }
 
 func flattenSignedHeaders(h http.Header) map[string]string {
@@ -163,7 +181,9 @@ func (c *AWSS3Client) CompleteMultipartUpload(ctx context.Context, key, uploadID
 			PartNumber: aws.Int32(int32(p.Number)),
 			ETag:       aws.String(p.ETag),
 		}
-		if p.ChecksumSHA256 != "" {
+		if p.ChecksumCRC32C != "" {
+			cp.ChecksumCRC32C = aws.String(p.ChecksumCRC32C)
+		} else if p.ChecksumSHA256 != "" {
 			cp.ChecksumSHA256 = aws.String(p.ChecksumSHA256)
 		}
 		completed[i] = cp
@@ -214,6 +234,7 @@ func (c *AWSS3Client) ListParts(ctx context.Context, key, uploadID string) ([]Pa
 				Size:           aws.ToInt64(p.Size),
 				ETag:           aws.ToString(p.ETag),
 				ChecksumSHA256: aws.ToString(p.ChecksumSHA256),
+				ChecksumCRC32C: aws.ToString(p.ChecksumCRC32C),
 			})
 		}
 		if !aws.ToBool(out.IsTruncated) {
