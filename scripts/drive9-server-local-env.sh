@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Source this file before starting dat9-server-local.
+# Source this file before starting drive9-server-local.
 # It only fills in sensible local-validation defaults; any variable already set
 # in the caller environment is preserved.
 #
@@ -24,7 +24,7 @@
 # Local mock S3 mode.
 : "${DRIVE9_S3_DIR:=${TMPDIR:-/tmp}/drive9-local-s3}"
 
-# Run the following command to pull the embedding model before starting dat9-server-local.
+# Run the following command to pull the embedding model before starting drive9-server-local.
 # ollama pull all-minilm
 # curl http://localhost:11434/v1/embeddings -H "Content-Type: application/json" -d '{"model":"all-minilm", "input": "This is an embedding test"}'
 
@@ -37,15 +37,15 @@
 # DRIVE9_SEMANTIC_WORKERS=1
 # DRIVE9_SEMANTIC_POLL_INTERVAL_MS=200
 # DRIVE9_SEMANTIC_LEASE_SECONDS defaults to 30, or max(30, 2x image extract timeout)
-#   in dat9-server-local when unset and async image extraction is enabled.
+#   in drive9-server-local when unset and async image extraction is enabled.
 # DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS=5000
 # DRIVE9_SEMANTIC_RETRY_BASE_MS=200
 # DRIVE9_SEMANTIC_RETRY_MAX_MS=30000
 # DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY=1
 
 # Query embedding.
-# Leave DRIVE9_QUERY_EMBED_* unset by default so dat9-server-local exercises the
-# same embedder-reuse path as dat9-server when only DRIVE9_EMBED_* is configured.
+# Leave DRIVE9_QUERY_EMBED_* unset by default so drive9-server-local exercises the
+# same embedder-reuse path as drive9-server when only DRIVE9_EMBED_* is configured.
 
 # Optional: image extract bridge validation.
 # Leave these unset to keep image extract disabled / using built-in defaults.
@@ -60,5 +60,5 @@ export DRIVE9_EMBED_API_BASE
 export DRIVE9_EMBED_API_KEY
 export DRIVE9_EMBED_MODEL
 
-echo "Environment loaded for dat9-server-local."
+echo "Environment loaded for drive9-server-local."
 echo "Run: make run-server-local"

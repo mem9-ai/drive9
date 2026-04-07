@@ -1,8 +1,8 @@
-// Command dat9-server starts the dat9 HTTP server.
+// Command drive9-server starts the drive9 HTTP server.
 //
 // Usage:
 //
-//	dat9-server [listen-addr]
+//	drive9-server [listen-addr]
 package main
 
 import (
@@ -182,7 +182,7 @@ func envOr(key, fallback string) string {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `usage: dat9-server [listen-addr]
+	fmt.Fprintf(os.Stderr, `usage: drive9-server [listen-addr]
 
 environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: :9009)
@@ -214,7 +214,7 @@ environment:
   DRIVE9_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
   DRIVE9_SEMANTIC_WORKERS number of background workers (default: 1)
   DRIVE9_SEMANTIC_POLL_INTERVAL_MS worker poll interval in milliseconds (default: 200)
-  DRIVE9_SEMANTIC_LEASE_SECONDS task lease duration in seconds (default: 30; when unset and image extraction is enabled, dat9-server uses max(30, 2x image extract timeout))
+  DRIVE9_SEMANTIC_LEASE_SECONDS task lease duration in seconds (default: 30; when unset and image extraction is enabled, drive9-server uses max(30, 2x image extract timeout))
   DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS recover sweep interval in milliseconds (default: 5000)
   DRIVE9_SEMANTIC_RETRY_BASE_MS base retry backoff in milliseconds (default: 200)
   DRIVE9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
@@ -240,7 +240,7 @@ func die(err error) {
 	if err == nil {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "dat9-server: %v\n", err)
+	fmt.Fprintf(os.Stderr, "drive9-server: %v\n", err)
 	os.Exit(1)
 }
 
@@ -259,7 +259,7 @@ func publicBaseURL(listenAddr string) string {
 	case strings.HasPrefix(listenAddr, "http://"), strings.HasPrefix(listenAddr, "https://"):
 		return strings.TrimRight(listenAddr, "/")
 	default:
-		fmt.Fprintf(os.Stderr, "dat9-server: DRIVE9_PUBLIC_URL is required when listen address is %q (wildcard or non-loopback). Set DRIVE9_PUBLIC_URL to the externally reachable base URL.\n", listenAddr)
+		fmt.Fprintf(os.Stderr, "drive9-server: DRIVE9_PUBLIC_URL is required when listen address is %q (wildcard or non-loopback). Set DRIVE9_PUBLIC_URL to the externally reachable base URL.\n", listenAddr)
 		os.Exit(1)
 		return "" // unreachable
 	}
