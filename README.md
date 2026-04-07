@@ -192,7 +192,7 @@ c.Delete("/data/file.txt")
 | `DRIVE9_CLI_LOG_MAX_BACKUPS` | CLI log rotation max backups | `5` |
 | `DRIVE9_CLI_LOG_MAX_AGE_DAYS` | CLI log rotation max age in days | `14` |
 | `DRIVE9_TEST_MYSQL_DSN` | MySQL/TiDB DSN reused by test suites (example: `user:pass@tcp(127.0.0.1:3306)/drive9_test?parseTime=true`) | |
-| `DRIVE9_LOCAL_DSN` | Local single-tenant datastore DSN for `dat9-server-local` | |
+| `DRIVE9_LOCAL_DSN` | Local single-tenant datastore DSN for `drive9-server-local` | |
 | `DRIVE9_LOCAL_INIT_SCHEMA` | Initialize local tenant schema on startup | `false` |
 | `DRIVE9_LOCAL_EMBEDDING_MODE` | Local embedding mode: `auto`, `app`, or `detect` | `detect` |
 
