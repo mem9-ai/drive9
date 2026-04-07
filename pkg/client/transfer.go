@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"runtime"
@@ -30,6 +31,7 @@ type PartURL struct {
 	URL            string            `json:"url"`
 	Size           int64             `json:"size"`
 	ChecksumSHA256 string            `json:"checksum_sha256,omitempty"`
+	ChecksumCRC32C string            `json:"checksum_crc32c,omitempty"`
 	Headers        map[string]string `json:"headers,omitempty"`
 	ExpiresAt      string            `json:"expires_at"`
 }
@@ -141,9 +143,9 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 // the v2 initiate endpoint, so the caller should fall back to v1.
 var errV2NotAvailable = fmt.Errorf("v2 upload API not available")
 
-// writeStreamV1 is the original v1 upload path: pre-compute checksums → initiate → upload all.
+// writeStreamV1 is the original v1 upload path: pre-compute CRC32C checksums → initiate → upload all.
 func (c *Client) writeStreamV1(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc) error {
-	checksums, err := computePartChecksumsFromReaderAt(ra, size, s3client.PartSize)
+	checksums, err := computePartChecksumsCRC32C(ra, size, s3client.PartSize)
 	if err != nil {
 		return fmt.Errorf("compute part checksums: %w", err)
 	}
@@ -364,13 +366,6 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 
 // uploadOnePart PUTs data to a presigned URL and returns the ETag.
 func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (string, error) {
-	checksum := part.ChecksumSHA256
-	if checksum == "" {
-		// No pre-computed checksum (legacy path) — compute it now.
-		h := sha256.Sum256(data)
-		checksum = base64.StdEncoding.EncodeToString(h[:])
-	}
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, part.URL, bytes.NewReader(data))
 	if err != nil {
 		return "", err
@@ -382,7 +377,18 @@ func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (
 		req.Header.Set(k, v)
 	}
 	req.ContentLength = int64(len(data))
-	req.Header.Set("x-amz-checksum-sha256", checksum)
+
+	// Set the appropriate checksum header based on what the server provided
+	if part.ChecksumCRC32C != "" {
+		req.Header.Set("x-amz-checksum-crc32c", part.ChecksumCRC32C)
+	} else if part.ChecksumSHA256 != "" {
+		req.Header.Set("x-amz-checksum-sha256", part.ChecksumSHA256)
+	} else {
+		// No pre-computed checksum — compute CRC32C (v1 default)
+		h := crc32.Checksum(data, crc32cTable)
+		b := [4]byte{byte(h >> 24), byte(h >> 16), byte(h >> 8), byte(h)}
+		req.Header.Set("x-amz-checksum-crc32c", base64.StdEncoding.EncodeToString(b[:]))
+	}
 
 	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
 	if err != nil {
@@ -904,10 +910,11 @@ func (l *limitedReadCloser) Close() error               { return l.c.Close() }
 
 // UploadMeta is the server's response for querying active uploads.
 type UploadMeta struct {
-	UploadID   string `json:"upload_id"`
-	PartsTotal int    `json:"parts_total"`
-	Status     string `json:"status"`
-	ExpiresAt  string `json:"expires_at"`
+	UploadID     string `json:"upload_id"`
+	PartsTotal   int    `json:"parts_total"`
+	Status       string `json:"status"`
+	ChecksumAlgo string `json:"checksum_algo"`
+	ExpiresAt    string `json:"expires_at"`
 }
 
 // ResumeUpload queries for an incomplete upload and resumes it.
@@ -919,8 +926,14 @@ func (c *Client) ResumeUpload(ctx context.Context, path string, r io.ReaderAt, t
 		return err
 	}
 
-	// Step 2: Request resume — server returns presigned URLs for missing parts
-	checksums, err := computePartChecksumsFromReaderAt(r, totalSize, s3client.PartSize)
+	// Step 2: Request resume — server returns presigned URLs for missing parts.
+	// Use the upload's checksum algorithm for computing part checksums.
+	var checksums []string
+	if meta.ChecksumAlgo == "CRC32C" {
+		checksums, err = computePartChecksumsCRC32C(r, totalSize, s3client.PartSize)
+	} else {
+		checksums, err = computePartChecksumsSHA256(r, totalSize, s3client.PartSize)
+	}
 	if err != nil {
 		return fmt.Errorf("compute part checksums: %w", err)
 	}
@@ -1133,13 +1146,67 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 	return nil
 }
 
-func computePartChecksumsFromReaderAt(r io.ReaderAt, totalSize int64, partSize int64) ([]string, error) {
+// crc32cTable is the Castagnoli CRC32C table, used for v1 per-part checksums.
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+
+func computePartChecksumsCRC32C(r io.ReaderAt, totalSize int64, partSize int64) ([]string, error) {
 	if totalSize <= 0 {
 		return nil, nil
 	}
 	parts := s3client.CalcParts(totalSize, partSize)
 	checksums := make([]string, len(parts))
-	// Cap workers by CPU count, part count, and memory (workers × partSize ≤ 256MB).
+	workers := checksumParallelism(partSize, len(parts))
+
+	var wg sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
+	partCh := make(chan int, len(parts))
+
+	for i := range parts {
+		partCh <- i
+	}
+	close(partCh)
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, partSize)
+			for i := range partCh {
+				p := parts[i]
+				data := buf[:p.Size]
+				offset := int64(p.Number-1) * partSize
+				n, err := r.ReadAt(data, offset)
+				if err != nil && err != io.EOF {
+					errOnce.Do(func() { firstErr = fmt.Errorf("read part %d: %w", p.Number, err) })
+					return
+				}
+				if int64(n) != p.Size {
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("short read for part %d: got %d want %d", p.Number, n, p.Size)
+					})
+					return
+				}
+				h := crc32.Checksum(data, crc32cTable)
+				b := [4]byte{byte(h >> 24), byte(h >> 16), byte(h >> 8), byte(h)}
+				checksums[i] = base64.StdEncoding.EncodeToString(b[:])
+			}
+		}()
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return checksums, nil
+}
+
+func computePartChecksumsSHA256(r io.ReaderAt, totalSize int64, partSize int64) ([]string, error) {
+	if totalSize <= 0 {
+		return nil, nil
+	}
+	parts := s3client.CalcParts(totalSize, partSize)
+	checksums := make([]string, len(parts))
 	workers := checksumParallelism(partSize, len(parts))
 
 	var wg sync.WaitGroup

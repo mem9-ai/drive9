@@ -1010,7 +1010,7 @@ func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Dat9-Content-Length", fmt.Sprintf("%d", len(data)))
-	checksums, err := computePartChecksumsFromReaderAt(bytes.NewReader(data), int64(len(data)), s3client.PartSize)
+	checksums, err := computePartChecksumsCRC32C(bytes.NewReader(data), int64(len(data)), s3client.PartSize)
 	if err != nil {
 		t.Fatalf("compute checksums: %v", err)
 	}

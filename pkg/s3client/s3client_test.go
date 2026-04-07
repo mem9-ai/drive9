@@ -95,7 +95,7 @@ func TestMultipartUploadComplete(t *testing.T) {
 	ctx := context.Background()
 
 	// Initiate
-	upload, err := c.CreateMultipartUpload(ctx, "blobs/big1")
+	upload, err := c.CreateMultipartUpload(ctx, "blobs/big1", ChecksumAlgoSHA256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestMultipartUploadAbort(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	upload, err := c.CreateMultipartUpload(ctx, "blobs/aborted")
+	upload, err := c.CreateMultipartUpload(ctx, "blobs/aborted", ChecksumAlgoSHA256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,17 +167,17 @@ func TestPresignURLsGenerated(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	upload, _ := c.CreateMultipartUpload(ctx, "blobs/presign-test")
+	upload, _ := c.CreateMultipartUpload(ctx, "blobs/presign-test", ChecksumAlgoCRC32C)
 
-	url, err := c.PresignUploadPart(ctx, "blobs/presign-test", upload.UploadID, 1, 8<<20, "abc", UploadTTL)
+	url, err := c.PresignUploadPart(ctx, "blobs/presign-test", upload.UploadID, 1, 8<<20, "", "abc", UploadTTL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if url.URL == "" || url.Number != 1 {
 		t.Errorf("unexpected presigned URL: %+v", url)
 	}
-	if url.Headers["x-amz-checksum-sha256"] != "abc" {
-		t.Fatalf("expected checksum header in presigned part, got %+v", url.Headers)
+	if url.Headers["x-amz-checksum-crc32c"] != "abc" {
+		t.Fatalf("expected crc32c checksum header in presigned part, got %+v", url.Headers)
 	}
 
 	getURL, err := c.PresignGetObject(ctx, "blobs/presign-test", DownloadTTL)
@@ -193,7 +193,7 @@ func TestPartialUploadAndListParts(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	upload, _ := c.CreateMultipartUpload(ctx, "blobs/partial")
+	upload, _ := c.CreateMultipartUpload(ctx, "blobs/partial", ChecksumAlgoSHA256)
 
 	// Upload only parts 1 and 3 (skip 2 — simulates interrupted upload)
 	if _, err := c.UploadPart(ctx, upload.UploadID, 1, bytes.NewReader([]byte("PART1"))); err != nil {

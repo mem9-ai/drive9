@@ -901,18 +901,18 @@ func TestAbortUploadEndpoint(t *testing.T) {
 }
 
 func TestParsePartChecksumsHeaderValidation(t *testing.T) {
-	if _, err := parsePartChecksumsHeader(""); err != nil {
+	if _, err := parsePartChecksumsHeader("", 4); err != nil {
 		t.Fatalf("empty header should be allowed: %v", err)
 	}
 
-	_, err := parsePartChecksumsHeader("not-base64")
+	_, err := parsePartChecksumsHeader("not-base64", 4)
 	if err == nil || !strings.Contains(err.Error(), "invalid base64") {
 		t.Fatalf("expected base64 error, got %v", err)
 	}
 
 	short := base64.StdEncoding.EncodeToString([]byte("short"))
-	_, err = parsePartChecksumsHeader(short)
-	if err == nil || !strings.Contains(err.Error(), "expected 32") {
+	_, err = parsePartChecksumsHeader(short, 4)
+	if err == nil || !strings.Contains(err.Error(), "expected 4") {
 		t.Fatalf("expected decoded length error, got %v", err)
 	}
 }

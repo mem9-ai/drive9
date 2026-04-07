@@ -101,6 +101,7 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 			part_size          BIGINT NOT NULL,
 			parts_total        INT NOT NULL,
 			status             VARCHAR(32) NOT NULL DEFAULT 'UPLOADING',
+			checksum_algo      VARCHAR(16) NOT NULL DEFAULT 'SHA256',
 			fingerprint_sha256 VARCHAR(128),
 			idempotency_key    VARCHAR(255),
 			created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),

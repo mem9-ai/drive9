@@ -99,6 +99,7 @@ type Upload struct {
 	PartSize       int64
 	PartsTotal     int
 	Status         UploadStatus
+	ChecksumAlgo   string // "SHA256" or "CRC32C"; empty defaults to "SHA256"
 	FingerprintSHA string
 	IdempotencyKey string
 	CreatedAt      time.Time
@@ -793,12 +794,16 @@ func (s *Store) InsertUpload(ctx context.Context, u *Upload) (err error) {
 }
 
 func (s *Store) InsertUploadTx(db execer, u *Upload) error {
+	algo := u.ChecksumAlgo
+	if algo == "" {
+		algo = "SHA256"
+	}
 	_, err := db.Exec(`INSERT INTO uploads
 		(upload_id, file_id, target_path, s3_upload_id, s3_key, total_size, part_size,
-		 parts_total, status, fingerprint_sha256, idempotency_key, created_at, updated_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 parts_total, status, checksum_algo, fingerprint_sha256, idempotency_key, created_at, updated_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		u.UploadID, u.FileID, u.TargetPath, u.S3UploadID, u.S3Key,
-		u.TotalSize, u.PartSize, u.PartsTotal, u.Status,
+		u.TotalSize, u.PartSize, u.PartsTotal, u.Status, algo,
 		nullStr(u.FingerprintSHA), nullStr(u.IdempotencyKey),
 		u.CreatedAt.UTC(), u.UpdatedAt.UTC(), u.ExpiresAt.UTC())
 	if isUniqueViolation(err) {
@@ -812,7 +817,7 @@ func (s *Store) GetUpload(ctx context.Context, uploadID string) (out *Upload, er
 	defer observeStoreOp(ctx, "get_upload", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
-		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
+		total_size, part_size, parts_total, status, checksum_algo, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
 		FROM uploads WHERE upload_id = ?`, uploadID)
 	out, err = scanUpload(row)
@@ -824,7 +829,7 @@ func (s *Store) GetUploadByPath(ctx context.Context, targetPath string) (out *Up
 	defer observeStoreOp(ctx, "get_upload_by_path", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
-		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
+		total_size, part_size, parts_total, status, checksum_algo, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
 		FROM uploads WHERE target_path = ? AND status IN ('INITIATED', 'UPLOADING') AND expires_at > ?
 		ORDER BY created_at DESC LIMIT 1`, targetPath, time.Now().UTC())
@@ -902,7 +907,7 @@ func (s *Store) ListUploadsByPath(ctx context.Context, targetPath string, status
 	defer observeStoreOp(ctx, "list_uploads_by_path", start, &err)
 
 	rows, err := s.db.QueryContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
-		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
+		total_size, part_size, parts_total, status, checksum_algo, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
 		FROM uploads WHERE target_path = ? AND status = ?
 		ORDER BY created_at DESC`, targetPath, status)
@@ -1054,17 +1059,22 @@ func nilBytes(b []byte) any {
 
 func scanUpload(s scanner) (*Upload, error) {
 	var u Upload
+	var checksumAlgo sql.NullString
 	var fingerprint, idempotencyKey sql.NullString
 	var createdAt, updatedAt, expiresAt time.Time
 	err := s.Scan(&u.UploadID, &u.FileID, &u.TargetPath, &u.S3UploadID, &u.S3Key,
 		&u.TotalSize, &u.PartSize, &u.PartsTotal, &u.Status,
-		&fingerprint, &idempotencyKey,
+		&checksumAlgo, &fingerprint, &idempotencyKey,
 		&createdAt, &updatedAt, &expiresAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
+	}
+	u.ChecksumAlgo = checksumAlgo.String
+	if u.ChecksumAlgo == "" {
+		u.ChecksumAlgo = "SHA256"
 	}
 	u.FingerprintSHA = fingerprint.String
 	u.IdempotencyKey = idempotencyKey.String
