@@ -711,6 +711,63 @@ func TestV2CompleteETagMismatch(t *testing.T) {
 	}
 }
 
+func TestV2CompleteAcceptsQuotedClientETag(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	totalSize := int64(20 << 20)
+	plan, err := b.InitiateUploadV2(ctx, "/v2-quoted-client-etag.bin", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	partNums := make([]int, plan.TotalParts)
+	for i := range partNums {
+		partNums[i] = i + 1
+	}
+	urls, err := b.PresignParts(ctx, plan.UploadID, entriesFromInts(partNums))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	upload, _ := b.GetUpload(ctx, plan.UploadID)
+	partData := make([]byte, totalSize)
+	completeParts := make([]CompletePart, len(urls))
+	for i, u := range urls {
+		start := int64(u.Number-1) * upload.PartSize
+		end := start + u.Size
+		if end > totalSize {
+			end = totalSize
+		}
+		etag, err := b.S3().(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, u.Number, bytes.NewReader(partData[start:end]))
+		if err != nil {
+			t.Fatalf("upload part %d: %v", u.Number, err)
+		}
+		completeParts[i] = CompletePart{Number: u.Number, ETag: "\"" + etag + "\""}
+	}
+
+	if err := b.ConfirmUploadV2(ctx, plan.UploadID, completeParts); err != nil {
+		t.Fatalf("ConfirmUploadV2 with quoted client ETags: %v", err)
+	}
+}
+
+func TestNormalizeETag(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "bare", in: "abc", want: "abc"},
+		{name: "quoted", in: "\"abc\"", want: "abc"},
+		{name: "double quoted empty", in: "\"\"", want: ""},
+	}
+	for _, tt := range tests {
+		if got := normalizeETag(tt.in); got != tt.want {
+			t.Fatalf("%s: normalizeETag(%q) = %q, want %q", tt.name, tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestV2CompletePartCountMismatch(t *testing.T) {
 	b := newTestBackendWithS3(t)
 	ctx := context.Background()
