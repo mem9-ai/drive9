@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
@@ -980,5 +981,62 @@ func TestContentLengthHeaderMismatchRejected(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestWriteReturns507WhenTenantStorageQuotaExceeded(t *testing.T) {
+	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 10}, SemanticWorkerOptions{})
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/fill.txt", bytes.NewReader([]byte("1234567890")))
+	req.ContentLength = 10
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected first write 200, got %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/overflow.txt", bytes.NewReader([]byte("1")))
+	req.ContentLength = 1
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusInsufficientStorage {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 507, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestUploadInitiateReturns507WhenTenantStorageQuotaExceeded(t *testing.T) {
+	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 70_000}, SemanticWorkerOptions{})
+	if _, err := s.fallback.Write("/filled.bin", bytes.Repeat([]byte("a"), 60_000), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	body := bytes.Repeat([]byte("b"), 20_000)
+	reqBody := map[string]any{
+		"path":           "/quota-over.bin",
+		"total_size":     len(body),
+		"part_checksums": strings.Split(partChecksumHeader(body), ","),
+	}
+	p, _ := json.Marshal(reqBody)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/initiate", bytes.NewReader(p))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusInsufficientStorage {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 507, got %d: %s", resp.StatusCode, body)
 	}
 }

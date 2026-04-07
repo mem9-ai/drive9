@@ -77,6 +77,10 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 
 func (b *Dat9Backend) InitiateUploadWithChecksums(ctx context.Context, path string, totalSize int64, partChecksums []string) (*UploadPlan, error) {
 	start := time.Now()
+	if err := b.ensureUploadSizeAllowed(totalSize); err != nil {
+		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
+		return nil, err
+	}
 
 	path, err := pathutil.Canonicalize(path)
 	if err != nil {
@@ -136,36 +140,35 @@ func (b *Dat9Backend) InitiateUploadWithChecksums(ctx context.Context, path stri
 	now := time.Now()
 	uploadID := b.genID()
 
-	// Insert PENDING file record
-	if err := b.store.InsertFile(ctx, &datastore.File{
-		FileID:      fileID,
-		StorageType: datastore.StorageS3,
-		StorageRef:  s3Key,
-		SizeBytes:   totalSize,
-		Revision:    1,
-		Status:      datastore.StatusPending,
-		CreatedAt:   now,
-	}); err != nil {
-		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
-		logger.Error(ctx, "backend_initiate_upload_insert_file_failed", zap.String("path", path), zap.Error(err))
-		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
-		return nil, err
-	}
-
-	// Insert upload record
-	if err := b.store.InsertUpload(ctx, &datastore.Upload{
-		UploadID:   uploadID,
-		FileID:     fileID,
-		TargetPath: path,
-		S3UploadID: mpu.UploadID,
-		S3Key:      s3Key,
-		TotalSize:  totalSize,
-		PartSize:   s3client.PartSize,
-		PartsTotal: len(parts),
-		Status:     datastore.UploadUploading,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-		ExpiresAt:  now.Add(24 * time.Hour),
+	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.ensureTenantStorageQuotaTx(tx, path, totalSize); err != nil {
+			return err
+		}
+		if err := b.store.InsertFileTx(tx, &datastore.File{
+			FileID:      fileID,
+			StorageType: datastore.StorageS3,
+			StorageRef:  s3Key,
+			SizeBytes:   totalSize,
+			Revision:    1,
+			Status:      datastore.StatusPending,
+			CreatedAt:   now,
+		}); err != nil {
+			return err
+		}
+		return b.store.InsertUploadTx(tx, &datastore.Upload{
+			UploadID:   uploadID,
+			FileID:     fileID,
+			TargetPath: path,
+			S3UploadID: mpu.UploadID,
+			S3Key:      s3Key,
+			TotalSize:  totalSize,
+			PartSize:   s3client.PartSize,
+			PartsTotal: len(parts),
+			Status:     datastore.UploadUploading,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+			ExpiresAt:  now.Add(24 * time.Hour),
+		})
 	}); err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		logger.Error(ctx, "backend_initiate_upload_insert_upload_failed", zap.String("path", path), zap.Error(err))
@@ -186,6 +189,10 @@ func (b *Dat9Backend) InitiateUploadWithChecksums(ctx context.Context, path stri
 // Unlike v1, it does NOT presign any URLs — clients fetch them on demand.
 func (b *Dat9Backend) InitiateUploadV2(ctx context.Context, path string, totalSize int64) (*UploadPlanV2, error) {
 	start := time.Now()
+	if err := b.ensureUploadSizeAllowed(totalSize); err != nil {
+		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+		return nil, err
+	}
 
 	path, err := pathutil.Canonicalize(path)
 	if err != nil {
@@ -229,34 +236,35 @@ func (b *Dat9Backend) InitiateUploadV2(ctx context.Context, path string, totalSi
 	uploadID := b.genID()
 	expiresAt := now.Add(24 * time.Hour)
 
-	if err := b.store.InsertFile(ctx, &datastore.File{
-		FileID:      fileID,
-		StorageType: datastore.StorageS3,
-		StorageRef:  s3Key,
-		SizeBytes:   totalSize,
-		Revision:    1,
-		Status:      datastore.StatusPending,
-		CreatedAt:   now,
-	}); err != nil {
-		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
-		logger.Error(ctx, "backend_initiate_upload_v2_insert_file_failed", zap.String("path", path), zap.Error(err))
-		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
-		return nil, err
-	}
-
-	if err := b.store.InsertUpload(ctx, &datastore.Upload{
-		UploadID:   uploadID,
-		FileID:     fileID,
-		TargetPath: path,
-		S3UploadID: mpu.UploadID,
-		S3Key:      s3Key,
-		TotalSize:  totalSize,
-		PartSize:   partSize,
-		PartsTotal: len(parts),
-		Status:     datastore.UploadInitiated,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-		ExpiresAt:  expiresAt,
+	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.ensureTenantStorageQuotaTx(tx, path, totalSize); err != nil {
+			return err
+		}
+		if err := b.store.InsertFileTx(tx, &datastore.File{
+			FileID:      fileID,
+			StorageType: datastore.StorageS3,
+			StorageRef:  s3Key,
+			SizeBytes:   totalSize,
+			Revision:    1,
+			Status:      datastore.StatusPending,
+			CreatedAt:   now,
+		}); err != nil {
+			return err
+		}
+		return b.store.InsertUploadTx(tx, &datastore.Upload{
+			UploadID:   uploadID,
+			FileID:     fileID,
+			TargetPath: path,
+			S3UploadID: mpu.UploadID,
+			S3Key:      s3Key,
+			TotalSize:  totalSize,
+			PartSize:   partSize,
+			PartsTotal: len(parts),
+			Status:     datastore.UploadInitiated,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+			ExpiresAt:  expiresAt,
+		})
 	}); err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		logger.Error(ctx, "backend_initiate_upload_v2_insert_upload_failed", zap.String("path", path), zap.Error(err))
@@ -266,12 +274,12 @@ func (b *Dat9Backend) InitiateUploadV2(ctx context.Context, path string, totalSi
 	metrics.RecordOperation("backend", "initiate_upload_v2", "ok", time.Since(start))
 
 	return &UploadPlanV2{
-		UploadID:         uploadID,
-		Key:              s3Key,
-		PartSize:         partSize,
-		TotalParts:       len(parts),
-		ExpiresAt:        expiresAt.Format(time.RFC3339),
-		Resumable:        false,
+		UploadID:   uploadID,
+		Key:        s3Key,
+		PartSize:   partSize,
+		TotalParts: len(parts),
+		ExpiresAt:  expiresAt.Format(time.RFC3339),
+		Resumable:  false,
 		ChecksumContract: ChecksumContract{
 			Supported: []string{"SHA-256"},
 			Required:  false,
