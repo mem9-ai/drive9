@@ -10,7 +10,7 @@ HOST_GOARCH ?= $(shell $(GO) env GOARCH)
 GOOS ?= $(HOST_GOOS)
 GOARCH ?= $(HOST_GOARCH)
 
-APP_NAME ?= dat9-server
+APP_NAME ?= drive9-server
 CLI_NAME ?= dat9
 CLI_DIST_NAME ?= drive9
 
@@ -25,7 +25,7 @@ CLI_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 GOLANGCI_LINT_VERSION ?= v2.5.0
 GOLANGCI_LINT_BIN ?= $(LOCAL_BIN)/golangci-lint
 
-IMAGE_REPO ?= dat9-server
+IMAGE_REPO ?= drive9-server
 IMAGE_TAG ?= latest
 IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
 LINT_TIMEOUT ?= 10m
@@ -75,7 +75,7 @@ build: build-server build-cli
 
 build-server:
 	mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(SERVER_BIN) ./cmd/dat9-server
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(SERVER_BIN) ./cmd/drive9-server
 
 run-server-local:
 	@source ./scripts/drive9-server-local-env.sh && $(GO) run ./cmd/dat9-server-local
