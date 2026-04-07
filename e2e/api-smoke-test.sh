@@ -194,7 +194,7 @@ wait_grep_contains_path() {
 }
 
 echo "========================================================"
-echo "  dat9 API smoke test"
+echo "  drive9 API smoke test"
 echo "  Base URL : $BASE"
 echo "  Image fixture : $DRIVE9_IMAGE_FIXTURE_PATH"
 echo "  Started  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"

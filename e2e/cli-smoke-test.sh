@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dat9 CLI smoke test against a live deployment.
+# drive9 CLI smoke test against a live deployment.
 
 set -euo pipefail
 
@@ -106,7 +106,7 @@ prepare_cli_binary() {
   esac
 }
 
-echo "=== dat9 CLI smoke test ==="
+echo "=== drive9 CLI smoke test ==="
 echo "BASE=$BASE"
 echo "CLI_SOURCE=$CLI_SOURCE"
 echo "IMAGE_FIXTURE=$DRIVE9_IMAGE_FIXTURE_PATH"
