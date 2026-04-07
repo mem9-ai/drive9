@@ -104,7 +104,7 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 	fileID := b.genID()
 	newS3Key := "blobs/" + fileID
 
-	mpu, err := b.s3.CreateMultipartUpload(ctx, newS3Key)
+	mpu, err := b.s3.CreateMultipartUpload(ctx, newS3Key, s3client.ChecksumAlgoSHA256)
 	if err != nil {
 		logger.Error(ctx, "backend_patch_upload_create_mpu_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
@@ -149,7 +149,7 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 			plan.CopiedParts = append(plan.CopiedParts, p.Number)
 		} else {
 			// Dirty part or new part beyond original → client must upload
-			u, err := b.s3.PresignUploadPart(ctx, newS3Key, mpu.UploadID, p.Number, p.Size, "", s3client.UploadTTL)
+			u, err := b.s3.PresignUploadPart(ctx, newS3Key, mpu.UploadID, p.Number, p.Size, s3client.ChecksumAlgoSHA256, "", s3client.UploadTTL)
 			if err != nil {
 				_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
 				logger.Error(ctx, "backend_patch_upload_presign_failed", zap.String("path", path), zap.Int("part", p.Number), zap.Error(err))

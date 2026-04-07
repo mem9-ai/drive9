@@ -3,10 +3,11 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -63,13 +64,16 @@ func newTestServerWithS3Config(t *testing.T, backendOpts backend.Options, worker
 }
 
 func partChecksumHeader(data []byte) string {
+	table := crc32.MakeTable(crc32.Castagnoli)
 	parts := s3client.CalcParts(int64(len(data)), s3client.PartSize)
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
 		start := int64(p.Number-1) * s3client.PartSize
 		end := start + p.Size
-		h := sha256.Sum256(data[start:end])
-		out = append(out, base64.StdEncoding.EncodeToString(h[:]))
+		v := crc32.Checksum(data[start:end], table)
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, v)
+		out = append(out, base64.StdEncoding.EncodeToString(b))
 	}
 	return strings.Join(out, ",")
 }
@@ -912,7 +916,7 @@ func TestParsePartChecksumsHeaderValidation(t *testing.T) {
 
 	short := base64.StdEncoding.EncodeToString([]byte("short"))
 	_, err = parsePartChecksumsHeader(short)
-	if err == nil || !strings.Contains(err.Error(), "expected 32") {
+	if err == nil || !strings.Contains(err.Error(), "expected 4") {
 		t.Fatalf("expected decoded length error, got %v", err)
 	}
 }

@@ -105,8 +105,8 @@ func (b *Dat9Backend) InitiateUploadWithChecksums(ctx context.Context, path stri
 	fileID := b.genID()
 	s3Key := "blobs/" + fileID
 
-	// Create S3 multipart upload
-	mpu, err := b.s3.CreateMultipartUpload(ctx, s3Key)
+	// Create S3 multipart upload — v1 uses CRC32C
+	mpu, err := b.s3.CreateMultipartUpload(ctx, s3Key, s3client.ChecksumAlgoCRC32C)
 	if err != nil {
 		logger.Error(ctx, "backend_initiate_upload_create_multipart_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
@@ -127,7 +127,7 @@ func (b *Dat9Backend) InitiateUploadWithChecksums(ctx context.Context, path stri
 		if len(partChecksums) > 0 {
 			checksum = partChecksums[i]
 		}
-		u, err := b.s3.PresignUploadPart(ctx, s3Key, mpu.UploadID, p.Number, p.Size, checksum, s3client.UploadTTL)
+		u, err := b.s3.PresignUploadPart(ctx, s3Key, mpu.UploadID, p.Number, p.Size, s3client.ChecksumAlgoCRC32C, checksum, s3client.UploadTTL)
 		if err != nil {
 			_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 			logger.Error(ctx, "backend_initiate_upload_presign_failed", zap.String("path", path), zap.Int("part_number", p.Number), zap.Error(err))
@@ -225,7 +225,7 @@ func (b *Dat9Backend) InitiateUploadV2(ctx context.Context, path string, totalSi
 	fileID := b.genID()
 	s3Key := "blobs/" + fileID
 
-	mpu, err := b.s3.CreateMultipartUpload(ctx, s3Key)
+	mpu, err := b.s3.CreateMultipartUpload(ctx, s3Key, s3client.ChecksumAlgoSHA256)
 	if err != nil {
 		logger.Error(ctx, "backend_initiate_upload_v2_create_multipart_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
@@ -343,7 +343,7 @@ func (b *Dat9Backend) PresignPart(ctx context.Context, uploadID string, partNumb
 		metrics.RecordOperation("backend", "presign_part", "error", time.Since(start))
 		return nil, err
 	}
-	u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, partNumber, partSize, checksumSHA256, s3client.UploadTTL)
+	u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, partNumber, partSize, s3client.ChecksumAlgoSHA256, checksumSHA256, s3client.UploadTTL)
 	if err != nil {
 		logger.Error(ctx, "backend_presign_part_failed", zap.String("upload_id", uploadID), zap.Int("part_number", partNumber), zap.Error(err))
 		metrics.RecordOperation("backend", "presign_part", "error", time.Since(start))
@@ -408,7 +408,7 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, entries
 			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
 			return nil, err
 		}
-		u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, pn, partSize, checksumSHA256, s3client.UploadTTL)
+		u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, pn, partSize, s3client.ChecksumAlgoSHA256, checksumSHA256, s3client.UploadTTL)
 		if err != nil {
 			logger.Error(ctx, "backend_presign_parts_failed", zap.String("upload_id", uploadID), zap.Int("part_number", pn), zap.Error(err))
 			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
@@ -757,7 +757,7 @@ func (b *Dat9Backend) ResumeUploadWithChecksums(ctx context.Context, uploadID st
 		if len(partChecksums) > 0 {
 			checksum = partChecksums[p.Number-1]
 		}
-		u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, p.Number, p.Size, checksum, s3client.UploadTTL)
+		u, err := b.s3.PresignUploadPart(ctx, upload.S3Key, upload.S3UploadID, p.Number, p.Size, s3client.ChecksumAlgoCRC32C, checksum, s3client.UploadTTL)
 		if err != nil {
 			logger.Error(ctx, "backend_resume_upload_presign_failed", zap.String("upload_id", uploadID), zap.Int("part_number", p.Number), zap.Error(err))
 			metrics.RecordOperation("backend", "resume_upload", "error", time.Since(start))

@@ -9,12 +9,21 @@ import (
 	"time"
 )
 
+// ChecksumAlgo identifies the checksum algorithm for a multipart upload.
+type ChecksumAlgo string
+
+const (
+	ChecksumAlgoSHA256 ChecksumAlgo = "SHA256"
+	ChecksumAlgoCRC32C ChecksumAlgo = "CRC32C"
+)
+
 // Part represents a single part in a multipart upload.
 type Part struct {
 	Number         int    // 1-based part number
 	Size           int64  // part size in bytes
 	ETag           string // returned by S3 after upload
 	ChecksumSHA256 string // base64-encoded SHA-256, set when client uploads with checksum
+	ChecksumCRC32C string // base64-encoded CRC32C, set when client uploads with CRC32C checksum
 }
 
 // UploadPartURL is a presigned URL for uploading one part.
@@ -22,7 +31,8 @@ type UploadPartURL struct {
 	Number         int               `json:"number"`                    // 1-based part number
 	URL            string            `json:"url"`                       // presigned PUT URL
 	Size           int64             `json:"size"`                      // expected part size
-	ChecksumSHA256 string            `json:"checksum_sha256,omitempty"` // expected checksum for signed uploads
+	ChecksumSHA256 string            `json:"checksum_sha256,omitempty"` // expected SHA-256 checksum for signed uploads
+	ChecksumCRC32C string            `json:"checksum_crc32c,omitempty"` // expected CRC32C checksum for signed uploads
 	Headers        map[string]string `json:"headers,omitempty"`         // required headers for presigned PUT
 	ExpiresAt      time.Time         `json:"expires_at"`                // URL expiry
 }
@@ -36,12 +46,14 @@ type MultipartUpload struct {
 // S3Client abstracts S3-compatible object store operations.
 // Implementations: LocalS3Client (testing), AWSS3Client (production).
 type S3Client interface {
-	// CreateMultipartUpload initiates a new multipart upload.
-	CreateMultipartUpload(ctx context.Context, key string) (*MultipartUpload, error)
+	// CreateMultipartUpload initiates a new multipart upload with the given checksum algorithm.
+	CreateMultipartUpload(ctx context.Context, key string, algo ChecksumAlgo) (*MultipartUpload, error)
 
 	// PresignUploadPart returns a presigned URL for uploading a specific part.
 	// partSize is bound into the presigned URL as Content-Length per §11.2.
-	PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, checksumSHA256 string, ttl time.Duration) (*UploadPartURL, error)
+	// algo + checksumValue work together: the value is signed into the URL under the
+	// header corresponding to algo. Pass empty checksumValue to skip checksum signing.
+	PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, algo ChecksumAlgo, checksumValue string, ttl time.Duration) (*UploadPartURL, error)
 
 	// CompleteMultipartUpload finalizes the upload with the given parts.
 	CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []Part) error

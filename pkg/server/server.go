@@ -1090,8 +1090,8 @@ func validatePartChecksums(parts []string) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid part checksums: invalid base64 at index %d", i)
 		}
-		if len(decoded) != 32 {
-			return nil, fmt.Errorf("invalid part checksums: decoded length %d at index %d, expected 32", len(decoded), i)
+		if len(decoded) != 4 {
+			return nil, fmt.Errorf("invalid part checksums: decoded length %d at index %d, expected 4", len(decoded), i)
 		}
 		out = append(out, v)
 	}
