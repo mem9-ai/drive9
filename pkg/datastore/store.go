@@ -563,6 +563,9 @@ func (s *Store) ConfirmedStorageBytesTx(db execer) (int64, error) {
 // multipart uploads beyond what is already counted by the confirmed file set.
 func (s *Store) ActiveUploadReservedBytesTx(db execer) (int64, error) {
 	var total sql.NullInt64
+	// TODO: This aggregation joins uploads -> file_nodes -> files on every quota
+	// check. If upload concurrency grows, re-evaluate the access path and add a
+	// more targeted uploads status/index strategy or a pre-aggregated quota state.
 	err := db.QueryRow(`SELECT COALESCE(SUM(
 		CASE
 			WHEN u.total_size > COALESCE(f.size_bytes, 0) THEN u.total_size - COALESCE(f.size_bytes, 0)
@@ -572,7 +575,7 @@ func (s *Store) ActiveUploadReservedBytesTx(db execer) (int64, error) {
 		FROM uploads u
 		LEFT JOIN file_nodes fn ON fn.path = u.target_path
 		LEFT JOIN files f ON f.file_id = fn.file_id AND f.status = 'CONFIRMED'
-		WHERE u.status IN ('INITIATED', 'UPLOADING')`).Scan(&total)
+		WHERE u.status IN ('INITIATED', 'UPLOADING') AND u.expires_at > ?`, time.Now().UTC()).Scan(&total)
 	if err != nil {
 		return 0, err
 	}
@@ -823,8 +826,8 @@ func (s *Store) GetUploadByPath(ctx context.Context, targetPath string) (out *Up
 	row := s.db.QueryRowContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
 		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
-		FROM uploads WHERE target_path = ? AND status IN ('INITIATED', 'UPLOADING')
-		ORDER BY created_at DESC LIMIT 1`, targetPath)
+		FROM uploads WHERE target_path = ? AND status IN ('INITIATED', 'UPLOADING') AND expires_at > ?
+		ORDER BY created_at DESC LIMIT 1`, targetPath, time.Now().UTC())
 	out, err = scanUpload(row)
 	return out, err
 }

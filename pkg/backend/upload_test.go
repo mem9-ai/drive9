@@ -25,6 +25,10 @@ func entriesFromInts(nums []int) []PresignPartEntry {
 }
 
 func newTestBackendWithS3(t *testing.T) *Dat9Backend {
+	return newTestBackendWithS3AndOptions(t, Options{})
+}
+
+func newTestBackendWithS3AndOptions(t *testing.T, opts Options) *Dat9Backend {
 	t.Helper()
 	s3Dir, err := os.MkdirTemp("", "dat9-s3-*")
 	if err != nil {
@@ -45,10 +49,11 @@ func newTestBackendWithS3(t *testing.T) *Dat9Backend {
 		t.Fatal(err)
 	}
 
-	b, err := NewWithS3(store, s3c)
+	b, err := NewWithS3ModeAndOptions(store, s3c, true, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { b.Close() })
 	return b
 }
 
@@ -531,6 +536,58 @@ func TestPresignExpiredUpload(t *testing.T) {
 	}
 	if err != datastore.ErrUploadExpired {
 		t.Errorf("expected ErrUploadExpired, got: %v", err)
+	}
+}
+
+func TestExpiredUploadNoLongerBlocksSamePathInitiate(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	plan, err := b.InitiateUploadV2(ctx, "/expired-retry.bin", 20<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = b.store.DB().ExecContext(ctx, `UPDATE uploads SET expires_at = ? WHERE upload_id = ?`,
+		time.Now().Add(-1*time.Hour), plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plan2, err := b.InitiateUploadV2(ctx, "/expired-retry.bin", 20<<20)
+	if err != nil {
+		t.Fatalf("expected expired upload to stop blocking the path, got %v", err)
+	}
+	if plan2.UploadID == plan.UploadID {
+		t.Fatal("expected a new upload record after the previous one expired")
+	}
+}
+
+func TestExpiredUploadReservationNoLongerCountsTowardQuota(t *testing.T) {
+	b := newTestBackendWithS3AndOptions(t, Options{MaxTenantStorageBytes: 30 << 20})
+	ctx := context.Background()
+
+	plan, err := b.InitiateUploadV2(ctx, "/expired-quota.bin", 20<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := b.InitiateUploadV2(ctx, "/fresh-quota.bin", 20<<20); !errors.Is(err, ErrStorageQuotaExceeded) {
+		t.Fatalf("expected quota rejection while first reservation is active, got %v", err)
+	}
+
+	_, err = b.store.DB().ExecContext(ctx, `UPDATE uploads SET expires_at = ? WHERE upload_id = ?`,
+		time.Now().Add(-1*time.Hour), plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plan2, err := b.InitiateUploadV2(ctx, "/fresh-quota.bin", 20<<20)
+	if err != nil {
+		t.Fatalf("expected expired reservation to stop consuming quota, got %v", err)
+	}
+	if plan2.UploadID == "" {
+		t.Fatal("expected a new upload plan")
 	}
 }
 
