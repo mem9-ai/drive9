@@ -53,7 +53,7 @@ func (c *LocalS3Client) partPath(key, uploadID string, partNumber int) string {
 	return filepath.Join(c.rootDir, "parts", uploadID, fmt.Sprintf("%05d", partNumber))
 }
 
-func (c *LocalS3Client) CreateMultipartUpload(ctx context.Context, key string) (*MultipartUpload, error) {
+func (c *LocalS3Client) CreateMultipartUpload(ctx context.Context, key string, algo ChecksumAlgo) (*MultipartUpload, error) {
 	uploadID := fmt.Sprintf("upload-%x", sha256.Sum256([]byte(key+time.Now().String())))[:24]
 
 	partsDir := filepath.Join(c.rootDir, "parts", uploadID)
@@ -68,17 +68,24 @@ func (c *LocalS3Client) CreateMultipartUpload(ctx context.Context, key string) (
 	return &MultipartUpload{UploadID: uploadID, Key: key}, nil
 }
 
-func (c *LocalS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, checksumSHA256 string, ttl time.Duration) (*UploadPartURL, error) {
+func (c *LocalS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, checksumSHA256 string, checksumCRC32C string, ttl time.Duration) (*UploadPartURL, error) {
 	url := fmt.Sprintf("%s/upload/%s/%d", c.baseURL, uploadID, partNumber)
 	var headers map[string]string
 	if checksumSHA256 != "" {
 		headers = map[string]string{"x-amz-checksum-sha256": checksumSHA256}
+	}
+	if checksumCRC32C != "" {
+		if headers == nil {
+			headers = make(map[string]string)
+		}
+		headers["x-amz-checksum-crc32c"] = checksumCRC32C
 	}
 	return &UploadPartURL{
 		Number:         partNumber,
 		URL:            url,
 		Size:           partSize,
 		ChecksumSHA256: checksumSHA256,
+		ChecksumCRC32C: checksumCRC32C,
 		Headers:        headers,
 		ExpiresAt:      time.Now().Add(ttl),
 	}, nil
