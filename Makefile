@@ -78,7 +78,7 @@ build-server:
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(SERVER_BIN) ./cmd/drive9-server
 
 run-server-local:
-	@source ./scripts/drive9-server-local-env.sh && $(GO) run ./cmd/dat9-server-local
+	@source ./scripts/drive9-server-local-env.sh && $(GO) run ./cmd/drive9-server-local
 
 build-cli:
 	mkdir -p $(BIN_DIR)
