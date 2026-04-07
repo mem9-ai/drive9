@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
@@ -188,6 +189,322 @@ func TestWriteStreamLargeFile(t *testing.T) {
 	}
 }
 
+func TestWriteStreamV2SinglePart(t *testing.T) {
+	var uploaded []byte
+	var progressCalls [][2]int
+	var completeReq struct {
+		Parts []completePart `json:"parts"`
+	}
+	var sawV1 atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path      string `json:"path"`
+				TotalSize int64  `json:"total_size"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			if req.Path != "/v2-single.bin" || req.TotalSize != 7 {
+				http.Error(w, fmt.Sprintf("bad initiate payload: %+v", req), http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(uploadPlanV2{
+				UploadID:   "v2-single",
+				PartSize:   11,
+				TotalParts: 1,
+				ChecksumContract: checksumContract{
+					Supported: []string{"SHA-256"},
+				},
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-single/presign-batch":
+			var req struct {
+				Parts []struct {
+					PartNumber int `json:"part_number"`
+				} `json:"parts"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			if len(req.Parts) != 1 || req.Parts[0].PartNumber != 1 {
+				http.Error(w, fmt.Sprintf("bad parts request: %+v", req.Parts), http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(struct {
+				Parts []presignedPart `json:"parts"`
+			}{
+				Parts: []presignedPart{{
+					Number:    1,
+					URL:       fmt.Sprintf("http://%s/v2parts/1", r.Host),
+					Size:      7,
+					ExpiresAt: time.Now().Add(time.Minute),
+				}},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/v2parts/1":
+			if got := r.Header.Get("x-amz-checksum-sha256"); got != "" {
+				http.Error(w, "v2 upload should not send checksum header", http.StatusBadRequest)
+				return
+			}
+			uploaded, _ = io.ReadAll(r.Body)
+			w.Header().Set("ETag", `"etag-v2-1"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-single/complete":
+			if err := json.NewDecoder(r.Body).Decode(&completeReq); err != nil {
+				http.Error(w, "bad complete json", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+
+		case strings.HasPrefix(r.URL.Path, "/v1/"):
+			sawV1.Store(true)
+			http.Error(w, "unexpected v1 request", http.StatusInternalServerError)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	err := c.WriteStream(context.Background(), "/v2-single.bin", bytes.NewReader([]byte("1234567")), 7,
+		func(partNum, total int, bytesUploaded int64) {
+			progressCalls = append(progressCalls, [2]int{partNum, total})
+		})
+	if err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if sawV1.Load() {
+		t.Fatal("unexpected v1 fallback during v2 single-part upload")
+	}
+	if got := string(uploaded); got != "1234567" {
+		t.Fatalf("uploaded body = %q, want %q", got, "1234567")
+	}
+	if len(progressCalls) != 1 || progressCalls[0] != [2]int{1, 1} {
+		t.Fatalf("progress calls = %v, want [[1 1]]", progressCalls)
+	}
+	if len(completeReq.Parts) != 1 || completeReq.Parts[0] != (completePart{Number: 1, ETag: `"etag-v2-1"`}) {
+		t.Fatalf("complete payload = %+v, want one part with etag", completeReq.Parts)
+	}
+}
+
+func TestWriteStreamV2MultiPartUsesPlanPartSize(t *testing.T) {
+	var mu sync.Mutex
+	uploadedParts := map[int][]byte{}
+	var presignReq struct {
+		Parts []struct {
+			PartNumber int `json:"part_number"`
+		} `json:"parts"`
+	}
+	var completeReq struct {
+		Parts []completePart `json:"parts"`
+	}
+	var progressCalls [][2]int
+	var sawV1 atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(uploadPlanV2{
+				UploadID:   "v2-multi",
+				PartSize:   5,
+				TotalParts: 3,
+				ChecksumContract: checksumContract{
+					Supported: []string{"SHA-256"},
+				},
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-multi/presign-batch":
+			if err := json.NewDecoder(r.Body).Decode(&presignReq); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(struct {
+				Parts []presignedPart `json:"parts"`
+			}{
+				Parts: []presignedPart{
+					{Number: 1, URL: fmt.Sprintf("http://%s/v2parts/1", r.Host), Size: 5, ExpiresAt: time.Now().Add(time.Minute)},
+					{Number: 2, URL: fmt.Sprintf("http://%s/v2parts/2", r.Host), Size: 5, ExpiresAt: time.Now().Add(time.Minute)},
+					{Number: 3, URL: fmt.Sprintf("http://%s/v2parts/3", r.Host), Size: 2, ExpiresAt: time.Now().Add(time.Minute)},
+				},
+			})
+
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v2parts/"):
+			var partNum int
+			if _, err := fmt.Sscanf(r.URL.Path, "/v2parts/%d", &partNum); err != nil {
+				http.Error(w, "bad part path", http.StatusBadRequest)
+				return
+			}
+			data, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			uploadedParts[partNum] = data
+			mu.Unlock()
+			w.Header().Set("ETag", fmt.Sprintf(`"etag-%d"`, partNum))
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-multi/complete":
+			if err := json.NewDecoder(r.Body).Decode(&completeReq); err != nil {
+				http.Error(w, "bad complete json", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+
+		case strings.HasPrefix(r.URL.Path, "/v1/"):
+			sawV1.Store(true)
+			http.Error(w, "unexpected v1 request", http.StatusInternalServerError)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	err := c.WriteStream(context.Background(), "/v2-multi.bin", bytes.NewReader([]byte("abcdefghijkl")), 12,
+		func(partNum, total int, bytesUploaded int64) {
+			mu.Lock()
+			progressCalls = append(progressCalls, [2]int{partNum, total})
+			mu.Unlock()
+		})
+	if err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if sawV1.Load() {
+		t.Fatal("unexpected v1 fallback during v2 multipart upload")
+	}
+	if len(presignReq.Parts) != 3 ||
+		presignReq.Parts[0].PartNumber != 1 ||
+		presignReq.Parts[1].PartNumber != 2 ||
+		presignReq.Parts[2].PartNumber != 3 {
+		t.Fatalf("presign batch parts = %+v, want [1 2 3]", presignReq.Parts)
+	}
+	if got := string(uploadedParts[1]); got != "abcde" {
+		t.Fatalf("part 1 = %q, want %q", got, "abcde")
+	}
+	if got := string(uploadedParts[2]); got != "fghij" {
+		t.Fatalf("part 2 = %q, want %q", got, "fghij")
+	}
+	if got := string(uploadedParts[3]); got != "kl" {
+		t.Fatalf("part 3 = %q, want %q", got, "kl")
+	}
+	if len(completeReq.Parts) != 3 {
+		t.Fatalf("complete payload has %d parts, want 3", len(completeReq.Parts))
+	}
+	for i, part := range completeReq.Parts {
+		want := completePart{Number: i + 1, ETag: fmt.Sprintf(`"etag-%d"`, i+1)}
+		if part != want {
+			t.Fatalf("complete part[%d] = %+v, want %+v", i, part, want)
+		}
+	}
+	if len(progressCalls) != 3 {
+		t.Fatalf("progress calls = %v, want 3 calls", progressCalls)
+	}
+}
+
+func TestWriteStreamV2RePresignsExpiredPart(t *testing.T) {
+	var expiredUploads atomic.Int32
+	var freshUploads atomic.Int32
+	var rePresignCalls atomic.Int32
+	var completeCalled atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(uploadPlanV2{
+				UploadID:   "v2-retry",
+				PartSize:   4,
+				TotalParts: 1,
+				ChecksumContract: checksumContract{
+					Supported: []string{"SHA-256"},
+				},
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-retry/presign-batch":
+			_ = json.NewEncoder(w).Encode(struct {
+				Parts []presignedPart `json:"parts"`
+			}{
+				Parts: []presignedPart{{
+					Number:    1,
+					URL:       fmt.Sprintf("http://%s/v2parts/expired/1", r.Host),
+					Size:      4,
+					ExpiresAt: time.Now().Add(-time.Minute),
+				}},
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-retry/presign":
+			rePresignCalls.Add(1)
+			var req struct {
+				PartNumber int `json:"part_number"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			if req.PartNumber != 1 {
+				http.Error(w, fmt.Sprintf("bad part number %d", req.PartNumber), http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(presignedPart{
+				Number:    1,
+				URL:       fmt.Sprintf("http://%s/v2parts/fresh/1", r.Host),
+				Size:      4,
+				ExpiresAt: time.Now().Add(time.Minute),
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/v2parts/expired/1":
+			expiredUploads.Add(1)
+			w.WriteHeader(http.StatusForbidden)
+
+		case r.Method == http.MethodPut && r.URL.Path == "/v2parts/fresh/1":
+			freshUploads.Add(1)
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "data" {
+				http.Error(w, "bad fresh upload body", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("ETag", `"etag-fresh"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-retry/complete":
+			completeCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	if err := c.WriteStream(context.Background(), "/retry.bin", bytes.NewReader([]byte("data")), 4, nil); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if expiredUploads.Load() != 1 {
+		t.Fatalf("expired upload attempts = %d, want 1", expiredUploads.Load())
+	}
+	if rePresignCalls.Load() != 1 {
+		t.Fatalf("re-presign calls = %d, want 1", rePresignCalls.Load())
+	}
+	if freshUploads.Load() != 1 {
+		t.Fatalf("fresh upload attempts = %d, want 1", freshUploads.Load())
+	}
+	if !completeCalled.Load() {
+		t.Fatal("complete was not called after re-presign retry")
+	}
+}
+
 func TestWriteStreamLargeFileErrorsOnShortPartRead(t *testing.T) {
 	var mu sync.Mutex
 	uploadedParts := map[string][]byte{}
@@ -243,8 +560,12 @@ func TestWriteStreamLargeFileErrorsOnShortPartRead(t *testing.T) {
 
 func TestWriteStreamLargeFileFallsBackToLegacyInitiate(t *testing.T) {
 	var usedLegacy atomic.Bool
+	var sawV2 atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			sawV2.Store(true)
+			http.NotFound(w, r)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
 			http.NotFound(w, r)
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/legacy.bin":
@@ -273,6 +594,9 @@ func TestWriteStreamLargeFileFallsBackToLegacyInitiate(t *testing.T) {
 	}
 	if !usedLegacy.Load() {
 		t.Fatal("expected legacy initiate fallback to be used")
+	}
+	if !sawV2.Load() {
+		t.Fatal("expected client to probe /v2 before falling back to legacy upload")
 	}
 }
 
