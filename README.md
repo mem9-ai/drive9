@@ -147,6 +147,7 @@ c.Delete("/data/file.txt")
 | `DRIVE9_S3_DIR` | Local S3 mock directory (only used without `DRIVE9_S3_BUCKET`) | `./s3` |
 | `DRIVE9_TENANT_PROVIDER` | Tenant provisioner: `db9`, `tidb_zero`, or `tidb_cloud_starter` | `tidb_zero` |
 | `DRIVE9_MAX_UPLOAD_BYTES` | Maximum allowed upload size in bytes | `53687091200` |
+| `DRIVE9_MAX_TENANT_STORAGE_BYTES` | Maximum logical storage per tenant in bytes | `53687091200` |
 | `DRIVE9_ZERO_API_URL` | TiDB Zero provision API base URL | |
 | `DRIVE9_TIDBCLOUD_API_URL` | TiDB Cloud Starter API base URL | |
 | `DRIVE9_TIDBCLOUD_API_KEY` | TiDB Cloud Starter API key | |
