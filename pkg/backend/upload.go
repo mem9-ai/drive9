@@ -225,7 +225,10 @@ func (b *Dat9Backend) InitiateUploadV2(ctx context.Context, path string, totalSi
 	fileID := b.genID()
 	s3Key := "blobs/" + fileID
 
-	mpu, err := b.s3.CreateMultipartUpload(ctx, s3Key, s3client.ChecksumAlgoSHA256)
+	// v2 does not declare a checksum algorithm at the S3 level because the
+	// client doesn't send per-part checksums yet (ChecksumContract.Required=false).
+	// When #114 adds inline checksums, switch back to a concrete algorithm.
+	mpu, err := b.s3.CreateMultipartUpload(ctx, s3Key, s3client.ChecksumAlgoNone)
 	if err != nil {
 		logger.Error(ctx, "backend_initiate_upload_v2_create_multipart_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))

@@ -13,6 +13,7 @@ import (
 type ChecksumAlgo string
 
 const (
+	ChecksumAlgoNone   ChecksumAlgo = ""       // no checksum algorithm declared
 	ChecksumAlgoSHA256 ChecksumAlgo = "SHA256"
 	ChecksumAlgoCRC32C ChecksumAlgo = "CRC32C"
 )
