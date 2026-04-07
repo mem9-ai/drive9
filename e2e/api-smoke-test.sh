@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dat9 API smoke test against a live dat9-server deployment.
+# drive9 API smoke test against a live drive9-server deployment.
 #
 # Coverage:
 #  1) Provision tenant (expect 202, api_key + status only)

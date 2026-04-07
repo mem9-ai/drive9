@@ -1,4 +1,4 @@
-// Command dat9-server-local starts a single-tenant dat9 HTTP server
+// Command drive9-server-local starts a single-tenant drive9 HTTP server
 // backed directly by DRIVE9_LOCAL_DSN for local validation.
 package main
 
@@ -120,7 +120,7 @@ func main() {
 		workerOpts.LeaseDuration = defaultSemanticLeaseDurationForLocal(backendOpts.AsyncImageExtract)
 	}
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "build_semantic_worker_config")
-	// Keep the local entrypoint aligned with dat9-server: if only the background
+	// Keep the local entrypoint aligned with drive9-server: if only the background
 	// embedder is configured, grep reuses it for app-side query embedding.
 	if semanticEmbedder != nil && backendOpts.QueryEmbedding.Client == nil {
 		backendOpts.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
@@ -185,7 +185,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `usage: dat9-server-local [listen-addr]
+	fmt.Fprintf(os.Stderr, `usage: drive9-server-local [listen-addr]
 
 environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: 127.0.0.1:9009)
@@ -236,7 +236,7 @@ func die(err error) {
 	if err == nil {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "dat9-server-local: %v\n", err)
+	fmt.Fprintf(os.Stderr, "drive9-server-local: %v\n", err)
 	os.Exit(1)
 }
 
@@ -253,7 +253,7 @@ func publicBaseURL(listenAddr string) string {
 	case strings.HasPrefix(listenAddr, "http://"), strings.HasPrefix(listenAddr, "https://"):
 		return strings.TrimRight(listenAddr, "/")
 	default:
-		fmt.Fprintf(os.Stderr, "dat9-server-local: DRIVE9_PUBLIC_URL is required when listen address is %q (wildcard or non-loopback).\n", listenAddr)
+		fmt.Fprintf(os.Stderr, "drive9-server-local: DRIVE9_PUBLIC_URL is required when listen address is %q (wildcard or non-loopback).\n", listenAddr)
 		os.Exit(1)
 		return ""
 	}
