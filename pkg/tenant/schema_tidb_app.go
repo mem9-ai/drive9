@@ -72,6 +72,8 @@ func tidbAppEmbeddingSchemaStatements() []string {
 		)`,
 		`CREATE INDEX idx_upload_path ON uploads(target_path, status)`,
 		`CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)`,
+		// Migration: add checksum_algo to existing uploads tables (idempotent — duplicate column is ignored).
+		`ALTER TABLE uploads ADD COLUMN checksum_algo VARCHAR(16) NOT NULL DEFAULT 'SHA256' AFTER status`,
 		`CREATE TABLE IF NOT EXISTS semantic_tasks (
 			task_id           VARCHAR(64) PRIMARY KEY,
 			task_type         VARCHAR(32) NOT NULL,
