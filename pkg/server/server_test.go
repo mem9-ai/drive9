@@ -460,8 +460,8 @@ func TestUploadActionMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resumeResp.Body.Close()
-	if resumeResp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400 for upload resume, got %d", resumeResp.StatusCode)
+	if resumeResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for upload resume, got %d", resumeResp.StatusCode)
 	}
 
 	abortReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/v1/uploads/nonexistent", nil)
