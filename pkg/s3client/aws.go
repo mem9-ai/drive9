@@ -49,7 +49,7 @@ func NewAWS(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 		awsCfg.Credentials = aws.NewCredentialsCache(
 			stscreds.NewAssumeRoleProvider(stsClient, cfg.RoleARN,
 				func(o *stscreds.AssumeRoleOptions) {
-					o.RoleSessionName = "dat9-server"
+					o.RoleSessionName = "drive9-server"
 				},
 			),
 		)
