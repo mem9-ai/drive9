@@ -11,8 +11,7 @@ GOOS ?= $(HOST_GOOS)
 GOARCH ?= $(HOST_GOARCH)
 
 APP_NAME ?= drive9-server
-CLI_NAME ?= dat9
-CLI_DIST_NAME ?= drive9
+CLI_NAME ?= drive9
 
 BIN_DIR ?= bin
 DIST_DIR ?= dist
@@ -96,11 +95,11 @@ build-cli-release:
 	for target in $(CLI_TARGETS); do \
 		os="$${target%/*}"; \
 		arch="$${target#*/}"; \
-		out="$(DIST_DIR)/$(CLI_DIST_NAME)-$${os}-$${arch}"; \
+		out="$(DIST_DIR)/$(CLI_NAME)-$${os}-$${arch}"; \
 		echo "Building $$(basename "$$out")..."; \
 		$(MAKE) --no-print-directory build-cli GOOS="$$os" GOARCH="$$arch" CLI_BIN="$$out" VERSION="$(VERSION)"; \
 	done; \
-	cd $(DIST_DIR) && sha256sum $(CLI_DIST_NAME)-* > checksums.txt && printf '%s\n' "$(VERSION)" > version
+	cd $(DIST_DIR) && sha256sum $(CLI_NAME)-* > checksums.txt && printf '%s\n' "$(VERSION)" > version
 
 docker-build: build-server
 	$(DOCKER) build -t $(IMAGE) .

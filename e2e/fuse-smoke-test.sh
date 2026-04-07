@@ -88,7 +88,7 @@ download_official_cli() {
     echo "failed to resolve release version from $CLI_RELEASE_BASE_URL/version" >&2
     return 1
   fi
-  curl -fsSL "$CLI_RELEASE_BASE_URL/dat9-$CLI_RELEASE_OS-$CLI_RELEASE_ARCH" -o "$CLI_BIN"
+  curl -fsSL "$CLI_RELEASE_BASE_URL/drive9-$CLI_RELEASE_OS-$CLI_RELEASE_ARCH" -o "$CLI_BIN"
   chmod +x "$CLI_BIN"
   local actual_version
   actual_version="$($CLI_BIN --version 2>/dev/null | awk '{print $2}')"
@@ -96,7 +96,7 @@ download_official_cli() {
     echo "downloaded version mismatch: expected=$CLI_RELEASE_VERSION actual=$actual_version" >&2
     return 1
   fi
-  echo "downloaded official dat9 $actual_version for $CLI_RELEASE_OS/$CLI_RELEASE_ARCH" >&2
+  echo "downloaded official drive9 $actual_version for $CLI_RELEASE_OS/$CLI_RELEASE_ARCH" >&2
 }
 
 prepare_cli_binary() {
@@ -400,9 +400,9 @@ while :; do
 done
 check_eq "tenant becomes active" "$state" "active"
 
-echo "[3] prepare dat9 cli"
+echo "[3] prepare drive9 cli"
 prepare_cli_binary
-check_cmd "dat9 binary ready" test -x "$CLI_BIN"
+check_cmd "drive9 binary ready" test -x "$CLI_BIN"
 
 dat9() {
   DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
