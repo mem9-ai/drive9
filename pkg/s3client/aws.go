@@ -83,15 +83,20 @@ func (c *AWSS3Client) fullKey(key string) string {
 }
 
 func (c *AWSS3Client) CreateMultipartUpload(ctx context.Context, key string, algo ChecksumAlgo) (*MultipartUpload, error) {
-	awsAlgo := types.ChecksumAlgorithmSha256
-	if algo == ChecksumAlgoCRC32C {
-		awsAlgo = types.ChecksumAlgorithmCrc32c
+	in := &s3.CreateMultipartUploadInput{
+		Bucket: &c.bucket,
+		Key:    aws.String(c.fullKey(key)),
 	}
-	out, err := c.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
-		Bucket:            &c.bucket,
-		Key:               aws.String(c.fullKey(key)),
-		ChecksumAlgorithm: awsAlgo,
-	})
+	switch algo {
+	case ChecksumAlgoCRC32C:
+		in.ChecksumAlgorithm = types.ChecksumAlgorithmCrc32c
+	case ChecksumAlgoSHA256:
+		in.ChecksumAlgorithm = types.ChecksumAlgorithmSha256
+	default:
+		// ChecksumAlgoNone: do not set ChecksumAlgorithm — S3 won't
+		// require per-part checksum headers.
+	}
+	out, err := c.client.CreateMultipartUpload(ctx, in)
 	if err != nil {
 		return nil, fmt.Errorf("create multipart upload: %w", err)
 	}

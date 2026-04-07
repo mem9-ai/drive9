@@ -215,6 +215,48 @@ func TestPartialUploadAndListParts(t *testing.T) {
 	}
 }
 
+func TestMultipartUploadNoChecksumAlgo(t *testing.T) {
+	c := newTestClient(t)
+	ctx := context.Background()
+
+	// Initiate with ChecksumAlgoNone — simulates v2 uploads where
+	// the client doesn't send per-part checksums.
+	upload, err := c.CreateMultipartUpload(ctx, "blobs/no-checksum", ChecksumAlgoNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upload.UploadID == "" {
+		t.Fatal("expected non-empty upload ID")
+	}
+
+	// Upload parts without any checksum header
+	partData := []string{"AAAA", "BB"}
+	var parts []Part
+	for i, d := range partData {
+		etag, err := c.UploadPart(ctx, upload.UploadID, i+1, bytes.NewReader([]byte(d)))
+		if err != nil {
+			t.Fatalf("upload part %d: %v", i+1, err)
+		}
+		parts = append(parts, Part{Number: i + 1, Size: int64(len(d)), ETag: etag})
+	}
+
+	// Complete should succeed without checksum validation
+	if err := c.CompleteMultipartUpload(ctx, "blobs/no-checksum", upload.UploadID, parts); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify assembled object
+	rc, err := c.GetObject(ctx, "blobs/no-checksum")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rc.Close() }()
+	got, _ := io.ReadAll(rc)
+	if string(got) != "AAAABB" {
+		t.Errorf("expected AAAABB, got %q", got)
+	}
+}
+
 func TestCalcAdaptivePartSize(t *testing.T) {
 	tests := []struct {
 		name     string
