@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	envDB9APIURL = "DAT9_DB9_API_URL"
-	envDB9APIKey = "DAT9_DB9_API_KEY"
+	envDB9APIURL = "DRIVE9_DB9_API_URL"
+	envDB9APIKey = "DRIVE9_DB9_API_KEY"
 )
 
 type DB9Provisioner struct {

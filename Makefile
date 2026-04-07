@@ -10,9 +10,8 @@ HOST_GOARCH ?= $(shell $(GO) env GOARCH)
 GOOS ?= $(HOST_GOOS)
 GOARCH ?= $(HOST_GOARCH)
 
-APP_NAME ?= dat9-server
-CLI_NAME ?= dat9
-CLI_DIST_NAME ?= drive9
+APP_NAME ?= drive9-server
+CLI_NAME ?= drive9
 
 BIN_DIR ?= bin
 DIST_DIR ?= dist
@@ -25,7 +24,7 @@ CLI_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 GOLANGCI_LINT_VERSION ?= v2.5.0
 GOLANGCI_LINT_BIN ?= $(LOCAL_BIN)/golangci-lint
 
-IMAGE_REPO ?= dat9-server
+IMAGE_REPO ?= drive9-server
 IMAGE_TAG ?= latest
 IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
 LINT_TIMEOUT ?= 10m
@@ -37,7 +36,7 @@ mod:
 	$(GO) mod tidy
 	$(GO) mod download
 
-# Run all tests. MySQL-backed suites reuse DAT9_MYSQL_DSN when provided. When
+# Run all tests. MySQL-backed suites reuse DRIVE9_TEST_MYSQL_DSN when provided. When
 # it is unset and podman is available locally, automatically configure the
 # podman-backed testcontainers environment before running go test. Set TEST_P
 # to pass `-p <value>` to `go test`; by default package parallelism is not
@@ -48,7 +47,7 @@ test:
 	if [ -n "$(TEST_P)" ]; then \
 		test_p_flag="-p $(TEST_P)"; \
 	fi; \
-	if [ -z "$${DAT9_MYSQL_DSN:-}" ] && command -v podman >/dev/null 2>&1; then \
+	if [ -z "$${DRIVE9_TEST_MYSQL_DSN:-}" ] && command -v podman >/dev/null 2>&1; then \
 		source ./scripts/test-podman.sh; \
 	fi; \
 	$(GO) test $$test_p_flag -v ./...
@@ -75,10 +74,10 @@ build: build-server build-cli
 
 build-server:
 	mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(SERVER_BIN) ./cmd/dat9-server
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(SERVER_BIN) ./cmd/drive9-server
 
 run-server-local:
-	@source ./scripts/dat9-server-local-env.sh && $(GO) run ./cmd/dat9-server-local
+	@source ./scripts/drive9-server-local-env.sh && $(GO) run ./cmd/drive9-server-local
 
 build-cli:
 	mkdir -p $(BIN_DIR)
@@ -96,11 +95,11 @@ build-cli-release:
 	for target in $(CLI_TARGETS); do \
 		os="$${target%/*}"; \
 		arch="$${target#*/}"; \
-		out="$(DIST_DIR)/$(CLI_DIST_NAME)-$${os}-$${arch}"; \
+		out="$(DIST_DIR)/$(CLI_NAME)-$${os}-$${arch}"; \
 		echo "Building $$(basename "$$out")..."; \
 		$(MAKE) --no-print-directory build-cli GOOS="$$os" GOARCH="$$arch" CLI_BIN="$$out" VERSION="$(VERSION)"; \
 	done; \
-	cd $(DIST_DIR) && sha256sum $(CLI_DIST_NAME)-* > checksums.txt && printf '%s\n' "$(VERSION)" > version
+	cd $(DIST_DIR) && sha256sum $(CLI_NAME)-* > checksums.txt && printf '%s\n' "$(VERSION)" > version
 
 docker-build: build-server
 	$(DOCKER) build -t $(IMAGE) .

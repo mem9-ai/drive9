@@ -52,10 +52,10 @@ MySQL-backed tests require a container runtime or an explicit DSN:
 
 ```bash
 # Use an existing MySQL/TiDB instance
-DRIVE9_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/drive9_test?parseTime=true' make test
+DRIVE9_TEST_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/drive9_test?parseTime=true' make test
 ```
 
-If `DRIVE9_MYSQL_DSN` is unset and `podman` is available, `make test` auto-configures
+If `DRIVE9_TEST_MYSQL_DSN` is unset and `podman` is available, `make test` auto-configures
 testcontainers via `scripts/test-podman.sh`. Otherwise a Docker-compatible runtime is used.
 
 If a direct `go test` run fails with `rootless Docker not found`, retry with `make test`

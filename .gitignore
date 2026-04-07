@@ -37,7 +37,7 @@ dist/
 build/
 tmp/
 /dat9
-/dat9-server
+/drive9-server
 .gstack/
 __pycache__/
 
