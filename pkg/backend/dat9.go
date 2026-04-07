@@ -41,6 +41,8 @@ type Dat9Backend struct {
 	// database-managed embedding path instead of the app-managed one for write,
 	// upload, image extraction, and grep behavior.
 	databaseAutoEmbedding bool
+	maxUploadBytes        int64
+	maxTenantStorageBytes int64
 	mu                    sync.Mutex
 	entropy               io.Reader
 
@@ -312,6 +314,9 @@ func (b *Dat9Backend) WriteCtx(ctx context.Context, path string, data []byte, of
 }
 
 func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte) (int64, error) {
+	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
+		return 0, err
+	}
 	fileID := b.genID()
 	now := time.Now()
 
@@ -337,6 +342,9 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	}
 
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.ensureTenantStorageQuotaTx(tx, path, int64(len(data))); err != nil {
+			return err
+		}
 		if err := b.store.InsertFileTx(tx, &datastore.File{
 			FileID: fileID, StorageType: storageType, StorageRef: storageRef,
 			ContentBlob: contentBlob,
@@ -410,6 +418,9 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		}
 	}
 
+	if err := b.ensureUploadSizeAllowed(int64(len(finalData))); err != nil {
+		return 0, err
+	}
 	contentType := detectContentType(nf.Node.Path, finalData)
 	checksum := sha256sum(finalData)
 	contentText := extractText(finalData, contentType)
@@ -432,6 +443,9 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 
 	var newRev int64
 	err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.ensureTenantStorageQuotaTx(tx, nf.Node.Path, int64(len(finalData))); err != nil {
+			return err
+		}
 		var txErr error
 		if b.UsesDatabaseAutoEmbedding() {
 			newRev, txErr = b.store.UpdateFileContentAutoEmbeddingTx(tx,

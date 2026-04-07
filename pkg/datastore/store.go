@@ -549,6 +549,57 @@ func (s *Store) MarkFileDeleted(ctx context.Context, fileID string) (err error) 
 	return err
 }
 
+// ConfirmedStorageBytesTx returns the total bytes occupied by confirmed file
+// entities in the current tenant database.
+func (s *Store) ConfirmedStorageBytesTx(db execer) (int64, error) {
+	var total sql.NullInt64
+	if err := db.QueryRow(`SELECT COALESCE(SUM(size_bytes), 0) FROM files WHERE status = 'CONFIRMED'`).Scan(&total); err != nil {
+		return 0, err
+	}
+	return total.Int64, nil
+}
+
+// ActiveUploadReservedBytesTx returns the additional bytes reserved by active
+// multipart uploads beyond what is already counted by the confirmed file set.
+func (s *Store) ActiveUploadReservedBytesTx(db execer) (int64, error) {
+	var total sql.NullInt64
+	// TODO: This aggregation joins uploads -> file_nodes -> files on every quota
+	// check. If upload concurrency grows, re-evaluate the access path and add a
+	// more targeted uploads status/index strategy or a pre-aggregated quota state.
+	err := db.QueryRow(`SELECT COALESCE(SUM(
+		CASE
+			WHEN u.total_size > COALESCE(f.size_bytes, 0) THEN u.total_size - COALESCE(f.size_bytes, 0)
+			ELSE 0
+		END
+	), 0)
+		FROM uploads u
+		LEFT JOIN file_nodes fn ON fn.path = u.target_path
+		LEFT JOIN files f ON f.file_id = fn.file_id AND f.status = 'CONFIRMED'
+		WHERE u.status IN ('INITIATED', 'UPLOADING') AND u.expires_at > ?`, time.Now().UTC()).Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+	return total.Int64, nil
+}
+
+// ConfirmedFileSizeByPathTx returns the current confirmed file size at path.
+// Missing paths and directories report zero bytes.
+func (s *Store) ConfirmedFileSizeByPathTx(db execer, path string) (int64, error) {
+	var size sql.NullInt64
+	err := db.QueryRow(`SELECT f.size_bytes
+		FROM file_nodes fn
+		JOIN files f ON f.file_id = fn.file_id
+		WHERE fn.path = ? AND fn.is_directory = 0 AND f.status = 'CONFIRMED'
+		LIMIT 1`, path).Scan(&size)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return size.Int64, nil
+}
+
 // --- composite operations ---
 
 func (s *Store) Stat(ctx context.Context, path string) (out *NodeWithFile, err error) {
@@ -737,7 +788,12 @@ func (s *Store) InsertUpload(ctx context.Context, u *Upload) (err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "insert_upload", start, &err)
 
-	_, err = s.db.ExecContext(ctx, `INSERT INTO uploads
+	err = s.InsertUploadTx(s.db, u)
+	return err
+}
+
+func (s *Store) InsertUploadTx(db execer, u *Upload) error {
+	_, err := db.Exec(`INSERT INTO uploads
 		(upload_id, file_id, target_path, s3_upload_id, s3_key, total_size, part_size,
 		 parts_total, status, fingerprint_sha256, idempotency_key, created_at, updated_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -770,8 +826,8 @@ func (s *Store) GetUploadByPath(ctx context.Context, targetPath string) (out *Up
 	row := s.db.QueryRowContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
 		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
-		FROM uploads WHERE target_path = ? AND status IN ('INITIATED', 'UPLOADING')
-		ORDER BY created_at DESC LIMIT 1`, targetPath)
+		FROM uploads WHERE target_path = ? AND status IN ('INITIATED', 'UPLOADING') AND expires_at > ?
+		ORDER BY created_at DESC LIMIT 1`, targetPath, time.Now().UTC())
 	out, err = scanUpload(row)
 	return out, err
 }

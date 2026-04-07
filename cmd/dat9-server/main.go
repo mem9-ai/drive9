@@ -101,6 +101,7 @@ func main() {
 			die(fmt.Errorf("DAT9_MAX_UPLOAD_BYTES too small: minimum 1048576 (1MiB)"))
 		}
 	}
+	backendOptions.MaxUploadBytes = maxUploadBytes
 	providerType, err = tenant.NormalizeProvider(providerType)
 	if err != nil {
 		die(err)
@@ -266,6 +267,10 @@ func publicBaseURL(listenAddr string) string {
 
 func buildBackendOptionsFromEnv() (backend.Options, error) {
 	var opts backend.Options
+	opts.MaxTenantStorageBytes = envInt64("DAT9_MAX_TENANT_STORAGE_BYTES", 50*(1<<30))
+	if opts.MaxTenantStorageBytes <= 0 {
+		return backend.Options{}, fmt.Errorf("DAT9_MAX_TENANT_STORAGE_BYTES must be a positive integer")
+	}
 
 	queryBaseURL := strings.TrimSpace(os.Getenv("DAT9_QUERY_EMBED_API_BASE"))
 	queryAPIKey := strings.TrimSpace(os.Getenv("DAT9_QUERY_EMBED_API_KEY"))

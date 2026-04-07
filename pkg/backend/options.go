@@ -16,13 +16,19 @@ const (
 	defaultImageExtractWorkers   = 1
 	defaultImageExtractMaxSize   = int64(8 << 20) // 8 MiB
 	defaultImageExtractTimeout   = 20 * time.Second
-	defaultMaxExtractedTextBytes = 8 << 10 // 8 KiB
+	defaultMaxExtractedTextBytes = 8 << 10               // 8 KiB
+	defaultMaxUploadBytes        = int64(10 * (1 << 30)) // 10 GiB
+	defaultMaxTenantStorageBytes = int64(50 * (1 << 30)) // 50 GiB
 )
 
 // Options configures Dat9Backend behavior.
 type Options struct {
 	AsyncImageExtract AsyncImageExtractOptions
 	QueryEmbedding    QueryEmbeddingOptions
+	MaxUploadBytes    int64
+	// MaxTenantStorageBytes caps the total logical storage a single tenant may
+	// occupy across confirmed files plus in-flight upload reservations.
+	MaxTenantStorageBytes int64
 	// DatabaseAutoEmbedding controls whether semantic text is embedded by the
 	// database itself rather than by the app-managed embed worker. When enabled,
 	// runtime write/query paths rely on database-side embedding behavior.
@@ -47,6 +53,16 @@ type QueryEmbeddingOptions struct {
 
 func (b *Dat9Backend) configureOptions(opts Options) {
 	b.databaseAutoEmbedding = opts.DatabaseAutoEmbedding
+	if opts.MaxUploadBytes > 0 {
+		b.maxUploadBytes = opts.MaxUploadBytes
+	} else {
+		b.maxUploadBytes = defaultMaxUploadBytes
+	}
+	if opts.MaxTenantStorageBytes > 0 {
+		b.maxTenantStorageBytes = opts.MaxTenantStorageBytes
+	} else {
+		b.maxTenantStorageBytes = defaultMaxTenantStorageBytes
+	}
 
 	if opts.QueryEmbedding.Client != nil {
 		b.queryEmbedder = opts.QueryEmbedding.Client
