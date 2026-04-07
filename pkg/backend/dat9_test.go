@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"errors"
 	"io"
 	"os"
 	"testing"
@@ -117,6 +118,27 @@ func TestWriteAppend(t *testing.T) {
 	data, _ := b.Read("/f.txt", 0, -1)
 	if string(data) != "hello world" {
 		t.Errorf("got %q", data)
+	}
+}
+
+func TestWriteRejectedWhenTenantStorageQuotaExceeded(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{MaxTenantStorageBytes: 10})
+	_, err := b.Write("/quota.txt", []byte("12345678901"), 0, filesystem.WriteFlagCreate)
+	if !errors.Is(err, ErrStorageQuotaExceeded) {
+		t.Fatalf("expected ErrStorageQuotaExceeded, got %v", err)
+	}
+}
+
+func TestWriteOverwriteReusesExistingQuota(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{MaxTenantStorageBytes: 10})
+	if _, err := b.Write("/quota.txt", []byte("1234567890"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/quota.txt", []byte("abcdefghij"), 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("same-size overwrite should succeed: %v", err)
+	}
+	if _, err := b.Write("/quota.txt", []byte("abcdefghijk"), 0, filesystem.WriteFlagTruncate); !errors.Is(err, ErrStorageQuotaExceeded) {
+		t.Fatalf("expected ErrStorageQuotaExceeded on growth, got %v", err)
 	}
 }
 

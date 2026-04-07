@@ -3,6 +3,7 @@ package backend
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -264,6 +265,33 @@ func TestOneUploadPerPath(t *testing.T) {
 	_, err = b.InitiateUpload(ctx, "/dup.bin", 3<<20)
 	if err == nil {
 		t.Error("expected error for duplicate active upload")
+	}
+}
+
+func TestInitiateUploadRejectsReservedQuotaOverflow(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{MaxTenantStorageBytes: 100_000})
+	ctx := context.Background()
+
+	if _, err := b.InitiateUpload(ctx, "/reserved-a.bin", 60_000); err != nil {
+		t.Fatal(err)
+	}
+	_, err := b.InitiateUpload(ctx, "/reserved-b.bin", 50_000)
+	if !errors.Is(err, ErrStorageQuotaExceeded) {
+		t.Fatalf("expected ErrStorageQuotaExceeded, got %v", err)
+	}
+}
+
+func TestInitiatePatchUploadRejectsQuotaGrowth(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{MaxTenantStorageBytes: 100_000})
+	ctx := context.Background()
+
+	data := bytes.Repeat([]byte("a"), 80_000)
+	if _, err := b.Write("/patch-quota.bin", data, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	_, err := b.InitiatePatchUpload(ctx, "/patch-quota.bin", 130_000, []int{1}, s3client.PartSize)
+	if !errors.Is(err, ErrStorageQuotaExceeded) {
+		t.Fatalf("expected ErrStorageQuotaExceeded, got %v", err)
 	}
 }
 

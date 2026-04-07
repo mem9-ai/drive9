@@ -60,7 +60,7 @@ var (
 
 // DefaultMaxUploadBytes is the server-wide fallback upload size limit.
 // Keep callers on this exported constant so the default stays consistent.
-const DefaultMaxUploadBytes int64 = 50 * (1 << 30) // 50 GiB
+const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
 
 func New(b *backend.Dat9Backend) *Server {
 	return NewWithConfig(Config{Backend: b})
@@ -487,6 +487,18 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		}
 		plan, err := b.InitiateUploadWithChecksums(r.Context(), path, cl, partChecksums)
 		if err != nil {
+			if errors.Is(err, backend.ErrUploadTooLarge) {
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_upload_too_large", "path", path, "error", err)...)
+				metricEvent(r.Context(), "fs_write", "result", "error")
+				errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
+				return
+			}
+			if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_storage_quota_exceeded", "path", path, "error", err)...)
+				metricEvent(r.Context(), "fs_write", "result", "error")
+				errJSON(w, http.StatusInsufficientStorage, err.Error())
+				return
+			}
 			if errors.Is(err, backend.ErrPartChecksumCountMismatch) {
 				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_checksum_count_mismatch", "path", path, "error", err)...)
 				metricEvent(r.Context(), "fs_write", "result", "error")
@@ -528,6 +540,18 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	}
 	_, err = b.WriteCtx(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate)
 	if err != nil {
+		if errors.Is(err, backend.ErrUploadTooLarge) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_too_large_backend", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_storage_quota_exceeded", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			errJSON(w, http.StatusInsufficientStorage, err.Error())
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
 		errJSON(w, http.StatusInternalServerError, err.Error())
@@ -566,9 +590,27 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 		errJSON(w, http.StatusBadRequest, "dirty_parts must not be empty")
 		return
 	}
+	if req.NewSize > s.maxUploadBytes {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_too_large", "path", path, "bytes", req.NewSize, "max", s.maxUploadBytes)...)
+		metricEvent(r.Context(), "fs_patch", "result", "error")
+		errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
+		return
+	}
 
 	plan, err := b.InitiatePatchUpload(r.Context(), path, req.NewSize, req.DirtyParts, req.PartSize)
 	if err != nil {
+		if errors.Is(err, backend.ErrUploadTooLarge) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_too_large", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_patch", "result", "error")
+			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_storage_quota_exceeded", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_patch", "result", "error")
+			errJSON(w, http.StatusInsufficientStorage, err.Error())
+			return
+		}
 		if errors.Is(err, datastore.ErrUploadConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_conflict", "path", path)...)
 			metricEvent(r.Context(), "fs_patch", "result", "conflict")
@@ -836,6 +878,18 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 	}
 	plan, err := b.InitiateUploadWithChecksums(r.Context(), req.Path, req.TotalSize, partChecksums)
 	if err != nil {
+		if errors.Is(err, backend.ErrUploadTooLarge) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_too_large_backend", "path", req.Path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_storage_quota_exceeded", "path", req.Path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			errJSON(w, http.StatusInsufficientStorage, err.Error())
+			return
+		}
 		if errors.Is(err, backend.ErrPartChecksumCountMismatch) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_checksum_count_mismatch", "path", req.Path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
@@ -1133,6 +1187,18 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 	}
 	plan, err := b.InitiateUploadV2(r.Context(), req.Path, req.TotalSize)
 	if err != nil {
+		if errors.Is(err, backend.ErrUploadTooLarge) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_too_large_backend", "path", req.Path, "error", err)...)
+			metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
+			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_storage_quota_exceeded", "path", req.Path, "error", err)...)
+			metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
+			errJSON(w, http.StatusInsufficientStorage, err.Error())
+			return
+		}
 		if errors.Is(err, datastore.ErrUploadConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_conflict", "path", req.Path, "error", err)...)
 			metricEvent(r.Context(), "v2_upload_initiate", "result", "conflict")
