@@ -3,8 +3,8 @@
 
 set -euo pipefail
 
-BASE="${DAT9_BASE:-http://127.0.0.1:9009}"
-DAT9_API_KEY="${DAT9_API_KEY:-}"
+BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
+DRIVE9_API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-20}"
@@ -369,9 +369,9 @@ if [ "$(uname -s)" = "Linux" ]; then
 fi
 
 echo "[1] provision tenant"
-if [ -n "$DAT9_API_KEY" ]; then
-  API_KEY="$DAT9_API_KEY"
-  check_eq "use provided DAT9_API_KEY" "true" "true"
+if [ -n "$DRIVE9_API_KEY" ]; then
+  API_KEY="$DRIVE9_API_KEY"
+  check_eq "use provided DRIVE9_API_KEY" "true" "true"
 else
   resp=$(curl_body_code POST "$BASE/v1/provision")
   code=$(http_code "$resp")
@@ -405,7 +405,7 @@ prepare_cli_binary
 check_cmd "dat9 binary ready" test -x "$CLI_BIN"
 
 dat9() {
-  DAT9_SERVER="$BASE" DAT9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
+  DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
 }
 
 dat9_retry() {

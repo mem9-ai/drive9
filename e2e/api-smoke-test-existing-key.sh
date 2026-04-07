@@ -3,13 +3,13 @@
 
 set -euo pipefail
 
-BASE="${DAT9_BASE:-http://127.0.0.1:9009}"
-API_KEY="${DAT9_API_KEY:-}"
+BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
+API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-60}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 
 if [ -z "$API_KEY" ]; then
-  echo "DAT9_API_KEY is required"
+  echo "DRIVE9_API_KEY is required"
   exit 1
 fi
 
