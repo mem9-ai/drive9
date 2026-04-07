@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -257,17 +258,51 @@ func TestMultipartUploadNoChecksumAlgo(t *testing.T) {
 	}
 }
 
+func TestChecksumAlgorithmForAWS(t *testing.T) {
+	tests := []struct {
+		name    string
+		algo    ChecksumAlgo
+		want    string
+		wantOK  bool
+		wantErr string
+	}{
+		{name: "none", algo: ChecksumAlgoNone, wantOK: false},
+		{name: "crc32c", algo: ChecksumAlgoCRC32C, want: "CRC32C", wantOK: true},
+		{name: "sha256", algo: ChecksumAlgoSHA256, want: "SHA256", wantOK: true},
+		{name: "unknown", algo: ChecksumAlgo("bogus"), wantErr: "unsupported checksum algorithm"},
+	}
+
+	for _, tt := range tests {
+		got, ok, err := checksumAlgorithmForAWS(tt.algo)
+		if tt.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("%s: expected error containing %q, got %v", tt.name, tt.wantErr, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", tt.name, err)
+		}
+		if ok != tt.wantOK {
+			t.Fatalf("%s: ok=%v, want %v", tt.name, ok, tt.wantOK)
+		}
+		if string(got) != tt.want {
+			t.Fatalf("%s: got %q, want %q", tt.name, string(got), tt.want)
+		}
+	}
+}
+
 func TestCalcAdaptivePartSize(t *testing.T) {
 	tests := []struct {
-		name     string
-		total    int64
-		wantPS   int64
-		wantN    int // expected number of parts (0 = skip check)
+		name   string
+		total  int64
+		wantPS int64
+		wantN  int // expected number of parts (0 = skip check)
 	}{
 		{"small file 1 MiB", 1 << 20, PartSize, 1},
-		{"80 GiB", 80 * (1 << 30), 9 << 20, 0},           // ceil(80GiB/10000) → align up to 9 MiB
-		{"100 GiB", 100 * (1 << 30), 11 << 20, 0},        // ceil(100GiB/10000) → align up to 11 MiB
-		{"500 GiB", 500 * (1 << 30), 52 << 20, 0},        // ceil(500GiB/10000) → align up to 52 MiB
+		{"80 GiB", 80 * (1 << 30), 9 << 20, 0},    // ceil(80GiB/10000) → align up to 9 MiB
+		{"100 GiB", 100 * (1 << 30), 11 << 20, 0}, // ceil(100GiB/10000) → align up to 11 MiB
+		{"500 GiB", 500 * (1 << 30), 52 << 20, 0}, // ceil(500GiB/10000) → align up to 52 MiB
 		{"5 TiB max S3 object", 5 * (1 << 40), MaxAdaptivePartSize, 0},
 	}
 	for _, tt := range tests {
