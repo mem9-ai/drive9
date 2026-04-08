@@ -101,20 +101,14 @@ func resumeUpload(ctx context.Context, c *client.Client, localPath, remotePath s
 }
 
 func downloadFile(ctx context.Context, c *client.Client, remotePath, localPath string) error {
-	rc, err := c.ReadStream(ctx, remotePath)
+	st, err := c.Stat(remotePath)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = rc.Close() }()
-
-	out, err := os.Create(localPath)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", localPath, err)
+	if st.IsDir {
+		return fmt.Errorf("cannot download directory %s with fs cp", remotePath)
 	}
-	defer func() { _ = out.Close() }()
-
-	_, err = io.Copy(out, rc)
-	return err
+	return c.DownloadToFile(ctx, remotePath, localPath, st.Size)
 }
 
 func streamToStdout(ctx context.Context, c *client.Client, remotePath string) error {
