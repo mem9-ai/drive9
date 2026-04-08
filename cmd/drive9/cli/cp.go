@@ -3,9 +3,11 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -108,7 +110,12 @@ func downloadFile(ctx context.Context, c *client.Client, remotePath, localPath s
 	if st.IsDir {
 		return fmt.Errorf("cannot download directory %s with fs cp", remotePath)
 	}
-	return c.DownloadToFile(ctx, remotePath, localPath, st.Size)
+	summary, err := c.DownloadToFileWithSummary(ctx, remotePath, localPath, st.Size)
+	if err != nil {
+		return err
+	}
+	emitDownloadSummary(summary, remotePath, localPath)
+	return nil
 }
 
 func streamToStdout(ctx context.Context, c *client.Client, remotePath string) error {
@@ -126,5 +133,40 @@ func printProgress(partNumber, totalParts int, bytesUploaded int64) {
 	fmt.Fprintf(os.Stderr, "\r  part %d/%d uploaded (%d bytes)", partNumber, totalParts, bytesUploaded)
 	if partNumber == totalParts {
 		fmt.Fprintln(os.Stderr)
+	}
+}
+
+func emitDownloadSummary(summary *client.DownloadSummary, remotePath, localPath string) {
+	if summary == nil || os.Getenv("DRIVE9_DOWNLOAD_SUMMARY_STDERR") == "" {
+		return
+	}
+
+	payload := struct {
+		Type          string  `json:"type"`
+		RemotePath    string  `json:"remote_path"`
+		LocalPath     string  `json:"local_path"`
+		Mode          string  `json:"mode"`
+		Concurrency   int     `json:"concurrency"`
+		ChunkSize     int64   `json:"chunk_size_bytes"`
+		RangeCount    int     `json:"range_count"`
+		StartedAt     string  `json:"started_at"`
+		FinishedAt    string  `json:"finished_at"`
+		ElapsedSecond float64 `json:"elapsed_seconds"`
+	}{
+		Type:          "download_summary",
+		RemotePath:    remotePath,
+		LocalPath:     localPath,
+		Mode:          summary.Mode,
+		Concurrency:   summary.Concurrency,
+		ChunkSize:     summary.ChunkSize,
+		RangeCount:    summary.RangeCount,
+		StartedAt:     summary.StartedAt.Format(time.RFC3339Nano),
+		FinishedAt:    summary.FinishedAt.Format(time.RFC3339Nano),
+		ElapsedSecond: summary.Elapsed.Seconds(),
+	}
+
+	encoder := json.NewEncoder(os.Stderr)
+	if err := encoder.Encode(payload); err != nil {
+		fmt.Fprintf(os.Stderr, "download summary encode failed: %v\n", err)
 	}
 }
