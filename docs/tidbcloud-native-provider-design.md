@@ -41,9 +41,9 @@ If both are present, `X-TIDBCLOUD-CLUSTER-ID` wins.
 If either `X-TIDBCLOUD-*` header is present and tenant provider is not `tidbcloud-native`, return:
 
 - HTTP `400`
-- message: `not support header X-TIDBCLOUD-xxxxxxx`
+- message: `unsupported X-TIDBCLOUD-ZERO-INSTANCE-ID header` or `unsupported X-TIDBCLOUD-CLUSTER-ID header` (based on the provided header)
 
-If `DRIVER9_TENANT_PROVIDER=tidbcloud-native` but neither `X-TIDBCLOUD-ZERO-INSTANCE-ID` nor `X-TIDBCLOUD-CLUSTER-ID` is provided, return:
+If `DRIVE9_TENANT_PROVIDER=tidbcloud-native` but neither `X-TIDBCLOUD-ZERO-INSTANCE-ID` nor `X-TIDBCLOUD-CLUSTER-ID` is provided, return:
 
 - HTTP `400`
 - message: `missing required header X-TIDBCLOUD-ZERO-INSTANCE-ID or X-TIDBCLOUD-CLUSTER-ID`
@@ -62,8 +62,9 @@ If `DRIVER9_TENANT_PROVIDER=tidbcloud-native` but neither `X-TIDBCLOUD-ZERO-INST
 
 1. Validate provider is `tidbcloud-native`.
 2. Extract auth from request:
-   - Prefer TiDB Cloud API key in request.
-   - Fallback to OAuth bearer token.
+   - Prefer TiDB Cloud API key in `X-TIDBCLOUD-API-KEY`.
+   - Fallback to TiDB Cloud OAuth bearer token in `X-TIDBCLOUD-OAUTH-BEARER`.
+   - `Authorization` remains reserved for drive9 tenant auth and must not be repurposed for TiDB Cloud auth in this flow.
 3. Call TiDB Cloud Account + Global services to verify this auth can operate the target cluster.
 4. On success, call Global Server by cluster ID to get connection info + `cloud_admin` password.
 5. Continue Provision/SQL.
@@ -100,6 +101,7 @@ No plaintext secrets in logs.
   - In Provision/SQL paths, branch to `tidbcloud-native` resolver when headers exist.
 - `pkg/tenant/*`
   - Ensure provider enum/value supports `tidbcloud-native`.
+  - Note: existing provider names are mostly snake_case; this hyphenated value is intentional and must be normalized explicitly in provider parsing (`tenant.NormalizeProvider`) and related config docs.
 - New package `pkg/tidbcloud/`:
   - `account_client.go`: permission verification for cluster operations.
   - `global_client.go`: resolve instance/cluster -> real connection data.
@@ -120,7 +122,7 @@ No dedicated feature flag is required.
 
 Enablement is decided only by tenant provider value:
 
-- `DRIVER9_TENANT_PROVIDER=tidbcloud-native` -> native flow enabled.
+- `DRIVE9_TENANT_PROVIDER=tidbcloud-native` -> native flow enabled.
 - any other provider -> native headers are rejected as unsupported.
 
 So rollout/rollback is done by provider configuration, not by a separate `*_ENABLED` flag.
