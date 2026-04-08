@@ -189,6 +189,7 @@ c.Delete("/data/file.txt")
 | `DRIVE9_IMAGE_EXTRACT_PROMPT` | Custom extraction prompt | `用中文描述这张图片，用于文件搜索。包括：主要物体、场景描述、图中可见文字（OCR）、简洁标签。最后一行用英文写5-10个关键词标签（English tags），用逗号分隔。` |
 | `DRIVE9_IMAGE_EXTRACT_MAX_TOKENS` | Max output tokens for model extraction | `256` |
 | `DRIVE9_CLI_LOG_ENABLED` | Enable CLI structured log file output | `false` |
+| `DRIVE9_BENCH_JSON_ENABLED` | Emit benchmark-consumable JSON lines on CLI stderr for selected paths | `false` |
 | `DRIVE9_CLI_LOG_MAX_SIZE_MB` | CLI log rotation max size in MB | `10` |
 | `DRIVE9_CLI_LOG_MAX_BACKUPS` | CLI log rotation max backups | `5` |
 | `DRIVE9_CLI_LOG_MAX_AGE_DAYS` | CLI log rotation max age in days | `14` |

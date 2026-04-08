@@ -3,9 +3,11 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -101,20 +103,17 @@ func resumeUpload(ctx context.Context, c *client.Client, localPath, remotePath s
 }
 
 func downloadFile(ctx context.Context, c *client.Client, remotePath, localPath string) error {
-	rc, err := c.ReadStream(ctx, remotePath)
+	info, err := c.Stat(remotePath)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = rc.Close() }()
 
-	out, err := os.Create(localPath)
+	summary, err := c.DownloadToFileWithSummary(ctx, remotePath, localPath, info.Size)
 	if err != nil {
-		return fmt.Errorf("create %s: %w", localPath, err)
+		return err
 	}
-	defer func() { _ = out.Close() }()
-
-	_, err = io.Copy(out, rc)
-	return err
+	emitBenchJSON(summary)
+	return nil
 }
 
 func streamToStdout(ctx context.Context, c *client.Client, remotePath string) error {
@@ -133,4 +132,23 @@ func printProgress(partNumber, totalParts int, bytesUploaded int64) {
 	if partNumber == totalParts {
 		fmt.Fprintln(os.Stderr)
 	}
+}
+
+func benchJSONEnabled() bool {
+	raw := os.Getenv("DRIVE9_BENCH_JSON_ENABLED")
+	if raw == "" {
+		return false
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false
+	}
+	return enabled
+}
+
+func emitBenchJSON(payload any) {
+	if payload == nil || !benchJSONEnabled() {
+		return
+	}
+	_ = json.NewEncoder(os.Stderr).Encode(payload)
 }
