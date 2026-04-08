@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1077,4 +1078,230 @@ func TestResumeUploadIntegrationProgressTotal(t *testing.T) {
 	if !seen[2] || !seen[3] {
 		t.Fatalf("progress part numbers = %v, want parts 2 and 3", progressCalls)
 	}
+}
+
+func TestDownloadToFileWithSummaryParallelSuccess(t *testing.T) {
+	data := makeDownloadFixture(downloadParallelThreshold + 12345)
+	srv := newDownloadTestServer(t, data, downloadTestServerConfig{honorRange: true})
+	defer srv.Close()
+
+	dst := t.TempDir() + "/parallel.bin"
+	summary, err := srv.client.DownloadToFileWithSummary(context.Background(), "/parallel.bin", dst, int64(len(data)))
+	if err != nil {
+		t.Fatalf("DownloadToFileWithSummary: %v", err)
+	}
+	if summary.Mode != "parallel_range" {
+		t.Fatalf("summary mode = %q, want %q", summary.Mode, "parallel_range")
+	}
+	if summary.RangeCount < 2 {
+		t.Fatalf("summary range count = %d, want >= 2", summary.RangeCount)
+	}
+	if summary.Concurrency != min(downloadMaxConcurrency, summary.RangeCount) {
+		t.Fatalf("summary concurrency = %d, want %d", summary.Concurrency, min(downloadMaxConcurrency, summary.RangeCount))
+	}
+	if summary.Elapsed <= 0 {
+		t.Fatalf("summary elapsed = %s, want > 0", summary.Elapsed)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", dst, err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded file content mismatch")
+	}
+	if srv.rangeRequestCount() != summary.RangeCount {
+		t.Fatalf("range request count = %d, want %d", srv.rangeRequestCount(), summary.RangeCount)
+	}
+}
+
+func TestDownloadToFileWithSummaryRejectsFullBodyFallback(t *testing.T) {
+	data := makeDownloadFixture(downloadParallelThreshold + 2048)
+	srv := newDownloadTestServer(t, data, downloadTestServerConfig{honorRange: false})
+	defer srv.Close()
+
+	dst := t.TempDir() + "/fallback.bin"
+	_, err := srv.client.DownloadToFileWithSummary(context.Background(), "/fallback.bin", dst, int64(len(data)))
+	if err == nil {
+		t.Fatal("expected DownloadToFileWithSummary to fail when Range is not honored")
+	}
+	if !errors.Is(err, errRangeNotHonored) {
+		t.Fatalf("error = %v, want errRangeNotHonored", err)
+	}
+}
+
+func TestDownloadToFileWithSummaryWorkerError(t *testing.T) {
+	data := makeDownloadFixture(downloadParallelThreshold + 4096)
+	srv := newDownloadTestServer(t, data, downloadTestServerConfig{
+		honorRange: true,
+		failOffset: downloadChunkSize,
+	})
+	defer srv.Close()
+
+	dst := t.TempDir() + "/worker-error.bin"
+	_, err := srv.client.DownloadToFileWithSummary(context.Background(), "/worker-error.bin", dst, int64(len(data)))
+	if err == nil {
+		t.Fatal("expected DownloadToFileWithSummary to fail on range worker error")
+	}
+	if !strings.Contains(err.Error(), "HTTP 500") {
+		t.Fatalf("error = %v, want HTTP 500", err)
+	}
+}
+
+func TestDownloadToFileWithSummaryShortRead(t *testing.T) {
+	data := makeDownloadFixture(downloadParallelThreshold + 4096)
+	srv := newDownloadTestServer(t, data, downloadTestServerConfig{
+		honorRange:  true,
+		shortOffset: downloadChunkSize,
+	})
+	defer srv.Close()
+
+	dst := t.TempDir() + "/short-read.bin"
+	_, err := srv.client.DownloadToFileWithSummary(context.Background(), "/short-read.bin", dst, int64(len(data)))
+	if err == nil {
+		t.Fatal("expected DownloadToFileWithSummary to fail on short read")
+	}
+	if !strings.Contains(err.Error(), "short read") {
+		t.Fatalf("error = %v, want short read", err)
+	}
+}
+
+func TestDownloadToFileWithSummarySmallFileUsesSingleStream(t *testing.T) {
+	data := []byte("small-file")
+	srv := newDownloadTestServer(t, data, downloadTestServerConfig{honorRange: true})
+	defer srv.Close()
+
+	dst := t.TempDir() + "/small.bin"
+	summary, err := srv.client.DownloadToFileWithSummary(context.Background(), "/small.bin", dst, int64(len(data)))
+	if err != nil {
+		t.Fatalf("DownloadToFileWithSummary: %v", err)
+	}
+	if summary.Mode != "single_stream" {
+		t.Fatalf("summary mode = %q, want %q", summary.Mode, "single_stream")
+	}
+	if srv.rangeRequestCount() != 0 {
+		t.Fatalf("range request count = %d, want 0", srv.rangeRequestCount())
+	}
+	if srv.fullBodyRequestCount() == 0 {
+		t.Fatal("expected at least one full-body request for single-stream download")
+	}
+}
+
+type downloadTestServerConfig struct {
+	honorRange  bool
+	failOffset  int64
+	shortOffset int64
+}
+
+type downloadTestServer struct {
+	server *httptest.Server
+	client *Client
+
+	mu               sync.Mutex
+	rangeRequests    []string
+	fullBodyRequests int
+}
+
+func newDownloadTestServer(t *testing.T, data []byte, cfg downloadTestServerConfig) *downloadTestServer {
+	t.Helper()
+
+	state := &downloadTestServer{}
+	var serverURL string
+
+	state.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
+			w.Header().Set("Location", serverURL+"/blob")
+			w.WriteHeader(http.StatusFound)
+
+		case r.Method == http.MethodGet && r.URL.Path == "/blob":
+			rangeHeader := r.Header.Get("Range")
+			if rangeHeader == "" {
+				state.recordFullBodyRequest()
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(data)
+				return
+			}
+
+			state.recordRangeRequest(rangeHeader)
+			var start, end int64
+			if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil {
+				http.Error(w, "bad range", http.StatusBadRequest)
+				return
+			}
+			if start == cfg.failOffset {
+				http.Error(w, "injected range failure", http.StatusInternalServerError)
+				return
+			}
+			if !cfg.honorRange {
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(data)
+				return
+			}
+			if start >= int64(len(data)) {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			if end >= int64(len(data)) {
+				end = int64(len(data)) - 1
+			}
+
+			body := append([]byte(nil), data[start:end+1]...)
+			if start == cfg.shortOffset && len(body) > 0 {
+				body = body[:len(body)-1]
+			}
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+int64(len(body))-1, len(data)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	serverURL = state.server.URL
+	state.client = New(state.server.URL, "")
+	return state
+}
+
+func (s *downloadTestServer) Close() {
+	s.server.Close()
+}
+
+func (s *downloadTestServer) recordRangeRequest(rangeHeader string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rangeRequests = append(s.rangeRequests, rangeHeader)
+}
+
+func (s *downloadTestServer) recordFullBodyRequest() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fullBodyRequests++
+}
+
+func (s *downloadTestServer) rangeRequestCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.rangeRequests)
+}
+
+func (s *downloadTestServer) fullBodyRequestCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fullBodyRequests
+}
+
+func makeDownloadFixture(size int64) []byte {
+	data := make([]byte, size)
+	for i := range data {
+		data[i] = byte((i*17 + 11) % 251)
+	}
+	return data
 }

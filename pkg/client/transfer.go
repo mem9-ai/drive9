@@ -6,10 +6,12 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -85,7 +87,30 @@ const DefaultSmallFileThreshold = 50_000 // 50,000 bytes — matches embedding m
 const (
 	uploadMaxConcurrency = 16
 	uploadMaxBufferBytes = 256 * 1024 * 1024 // 256 MB
+
+	downloadParallelThreshold = 8 << 20
+	downloadChunkSize         = 8 << 20
+	downloadMaxConcurrency    = 8
 )
+
+var errRangeNotHonored = errors.New("range request not honored")
+
+type downloadRange struct {
+	Index  int
+	Offset int64
+	Length int64
+}
+
+// DownloadSummary captures coarse-grained metadata for a completed download.
+type DownloadSummary struct {
+	Mode        string
+	Concurrency int
+	ChunkSize   int64
+	RangeCount  int
+	StartedAt   time.Time
+	FinishedAt  time.Time
+	Elapsed     time.Duration
+}
 
 func uploadParallelism(partSize int64) int {
 	if partSize <= 0 {
@@ -754,6 +779,185 @@ func (c *Client) abortUploadV2(ctx context.Context, uploadID string) error {
 	return nil
 }
 
+// DownloadParallelThreshold returns the minimum file size that should use
+// parallel range downloads.
+func DownloadParallelThreshold() int64 {
+	return downloadParallelThreshold
+}
+
+// DownloadToFile downloads a remote file into localPath.
+func (c *Client) DownloadToFile(ctx context.Context, remotePath, localPath string, size int64) error {
+	_, err := c.DownloadToFileWithSummary(ctx, remotePath, localPath, size)
+	return err
+}
+
+// DownloadToFileWithSummary downloads a remote file and returns a coarse
+// summary that benchmarks can consume later.
+func (c *Client) DownloadToFileWithSummary(ctx context.Context, remotePath, localPath string, size int64) (_ *DownloadSummary, retErr error) {
+	out, err := os.Create(localPath)
+	if err != nil {
+		return nil, fmt.Errorf("create %s: %w", localPath, err)
+	}
+	defer func() {
+		if closeErr := out.Close(); retErr == nil && closeErr != nil {
+			retErr = fmt.Errorf("close %s: %w", localPath, closeErr)
+		}
+	}()
+
+	if size < downloadParallelThreshold {
+		return c.downloadSingleStreamToFile(ctx, remotePath, out)
+	}
+	if err := out.Truncate(size); err != nil {
+		return nil, fmt.Errorf("truncate %s to %d bytes: %w", localPath, size, err)
+	}
+	return c.downloadLargeFileParallel(ctx, remotePath, out, size)
+}
+
+func (c *Client) downloadSingleStreamToFile(ctx context.Context, remotePath string, out *os.File) (*DownloadSummary, error) {
+	startedAt := time.Now()
+
+	rc, err := c.ReadStream(ctx, remotePath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }()
+
+	written, err := io.Copy(out, rc)
+	if err != nil {
+		return nil, err
+	}
+	if err := out.Sync(); err != nil {
+		return nil, fmt.Errorf("sync download target: %w", err)
+	}
+
+	finishedAt := time.Now()
+	return &DownloadSummary{
+		Mode:        "single_stream",
+		Concurrency: 1,
+		ChunkSize:   written,
+		RangeCount:  1,
+		StartedAt:   startedAt,
+		FinishedAt:  finishedAt,
+		Elapsed:     finishedAt.Sub(startedAt),
+	}, nil
+}
+
+func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath string, out *os.File, size int64) (*DownloadSummary, error) {
+	ranges := buildDownloadRanges(size, downloadChunkSize)
+	concurrency := min(downloadMaxConcurrency, len(ranges))
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
+	startedAt := time.Now()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	tasks := make(chan downloadRange, concurrency)
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case r, ok := <-tasks:
+					if !ok {
+						return
+					}
+					if err := c.downloadOneRange(ctx, remotePath, out, r); err != nil {
+						select {
+						case errCh <- err:
+						default:
+						}
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+	}
+
+producer:
+	for _, r := range ranges {
+		select {
+		case <-ctx.Done():
+			break producer
+		case tasks <- r:
+		}
+	}
+	close(tasks)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return nil, err
+	default:
+	}
+
+	if err := out.Sync(); err != nil {
+		return nil, fmt.Errorf("sync download target: %w", err)
+	}
+
+	finishedAt := time.Now()
+	return &DownloadSummary{
+		Mode:        "parallel_range",
+		Concurrency: concurrency,
+		ChunkSize:   downloadChunkSize,
+		RangeCount:  len(ranges),
+		StartedAt:   startedAt,
+		FinishedAt:  finishedAt,
+		Elapsed:     finishedAt.Sub(startedAt),
+	}, nil
+}
+
+func buildDownloadRanges(size, chunkSize int64) []downloadRange {
+	if size <= 0 {
+		return []downloadRange{{Index: 0, Offset: 0, Length: 0}}
+	}
+
+	rangeCount := int((size + chunkSize - 1) / chunkSize)
+	ranges := make([]downloadRange, 0, rangeCount)
+	for i := 0; i < rangeCount; i++ {
+		offset := int64(i) * chunkSize
+		length := min(chunkSize, size-offset)
+		ranges = append(ranges, downloadRange{
+			Index:  i,
+			Offset: offset,
+			Length: length,
+		})
+	}
+	return ranges
+}
+
+func (c *Client) downloadOneRange(ctx context.Context, remotePath string, out *os.File, r downloadRange) error {
+	rc, err := c.readStreamRangeStrict(ctx, remotePath, r.Offset, r.Length)
+	if err != nil {
+		return fmt.Errorf("range %d (%d-%d): %w", r.Index, r.Offset, r.Offset+r.Length-1, err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return fmt.Errorf("read range %d body: %w", r.Index, err)
+	}
+	if int64(len(data)) != r.Length {
+		return fmt.Errorf("short read for range %d: got %d want %d", r.Index, len(data), r.Length)
+	}
+	n, err := out.WriteAt(data, r.Offset)
+	if err != nil {
+		return fmt.Errorf("write range %d at offset %d: %w", r.Index, r.Offset, err)
+	}
+	if n != len(data) {
+		return fmt.Errorf("short write for range %d: got %d want %d", r.Index, n, len(data))
+	}
+	return nil
+}
+
 // ReadStream reads a file, following 302 redirects for large files.
 func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, error) {
 	// Disable redirect following so we can detect 302
@@ -813,6 +1017,14 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 // are transferred. For small files (no redirect) the full body is returned
 // and the caller should read only what it needs.
 func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	return c.readStreamRange(ctx, path, offset, length, true)
+}
+
+func (c *Client) readStreamRangeStrict(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	return c.readStreamRange(ctx, path, offset, length, false)
+}
+
+func (c *Client) readStreamRange(ctx context.Context, path string, offset, length int64, allowFullBodyFallback bool) (io.ReadCloser, error) {
 	if length <= 0 {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
@@ -864,6 +1076,10 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 				defer func() { _ = resp2.Body.Close() }()
 				return nil, readError(resp2)
 			}
+			if !allowFullBodyFallback {
+				_ = resp2.Body.Close()
+				return nil, fmt.Errorf("%w: redirected GET returned HTTP %d", errRangeNotHonored, resp2.StatusCode)
+			}
 			// 200: server returned full body (Range not honored).
 			// Skip to offset and limit the read.
 			return c.sliceBody(resp2.Body, offset, length)
@@ -874,6 +1090,10 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		return nil, readError(resp)
 
 	default:
+		if !allowFullBodyFallback {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("%w: origin GET returned HTTP %d", errRangeNotHonored, resp.StatusCode)
+		}
 		// Small file: full body returned. Skip to offset and limit.
 		return c.sliceBody(resp.Body, offset, length)
 	}
