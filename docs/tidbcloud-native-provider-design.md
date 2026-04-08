@@ -65,7 +65,6 @@ If `DRIVE9_TENANT_PROVIDER=tidbcloud-native` but neither `X-TIDBCLOUD-ZERO-INSTA
    - Prefer TiDB Cloud API key pair (`public key` + `private key`) from request metadata.
    - For upstream TiDB Cloud Account API calls, drive9 uses HTTP Digest auth with `public:private` (same as official usage, e.g. `curl --digest --user 'PUBLIC:PRIVATE' ...`).
    - Fallback to OAuth token path only if configured by product/API contract.
-   - `Authorization` on the drive9 request remains reserved for drive9 tenant auth and must not be repurposed directly for TiDB Cloud API key auth.
 3. Call TiDB Cloud Account + Global services to verify this auth can operate the target cluster.
 4. On success, call Global Server by cluster ID to get connection info + `cloud_admin` password.
 5. Continue Provision/SQL.
@@ -145,6 +144,7 @@ So rollout/rollback is done by provider configuration, not by a separate `*_ENAB
 - TiDB Cloud API key authentication follows official digest mode:
   - `curl --digest --user 'YOUR_PUBLIC_KEY:YOUR_PRIVATE_KEY' --request GET --url https://api.tidbcloud.com/api/v1beta/projects`
 - drive9 should mirror this when calling TiDB Cloud Account/Global services with API key credentials.
+- In `tidbcloud-native` mode, auth is delegated to TiDB Cloud verification flow (API key digest or OAuth by contract), rather than drive9-local auth semantics.
 
 ## Testing Plan
 
