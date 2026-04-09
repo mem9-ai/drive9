@@ -23,5 +23,12 @@ jobs:
           git remote add upstream https://github.com/mem9-ai/drive9.git || true
           git fetch upstream
           git checkout main
-          git merge upstream/main --no-edit -X theirs
+          if ! git merge upstream/main --no-edit -X theirs; then
+            # Accept all upstream versions for modify/delete conflicts
+            git diff --name-only --diff-filter=U | while read f; do
+              git checkout upstream/main -- "$f" 2>/dev/null || git rm "$f" 2>/dev/null || true
+            done
+            git add -A
+            git commit --no-edit
+          fi
           git push origin main
