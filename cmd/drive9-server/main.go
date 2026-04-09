@@ -21,6 +21,9 @@ import (
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/server"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/db9"
+	"github.com/mem9-ai/dat9/pkg/tenant/starter"
+	"github.com/mem9-ai/dat9/pkg/tenant/tidbzero"
 	"go.uber.org/zap"
 )
 
@@ -112,11 +115,11 @@ func main() {
 	var provisionerErr error
 	switch providerType {
 	case tenant.ProviderTiDBZero:
-		provisioner, provisionerErr = tenant.NewZeroProvisionerFromEnv()
+		provisioner, provisionerErr = tidbzero.NewProvisionerFromEnv()
 	case tenant.ProviderTiDBCloudStarter:
-		provisioner, provisionerErr = tenant.NewStarterProvisionerFromEnv()
+		provisioner, provisionerErr = starter.NewProvisionerFromEnv()
 	case tenant.ProviderDB9:
-		provisioner, provisionerErr = tenant.NewDB9ProvisionerFromEnv()
+		provisioner, provisionerErr = db9.NewProvisionerFromEnv()
 	}
 	if provisionerErr != nil {
 		logger.Warn(context.Background(), "provisioner_not_configured", zap.String("provider", providerType), zap.Error(provisionerErr))

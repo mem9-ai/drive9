@@ -1,4 +1,4 @@
-package tenant
+package schema
 
 import (
 	"context"
@@ -24,10 +24,10 @@ const (
 // Reference of Auto Embedding in TiDB Cloud: https://docs.pingcap.com/ai/vector-search-auto-embedding-amazon-titan/
 const (
 	tidbAutoEmbeddingModel      = "tidbcloud_free/amazon/titan-embed-text-v2"
-	tidbAutoEmbeddingDimensions = 1024
+	TiDBAutoEmbeddingDimensions = 1024
 )
 
-var tidbAutoEmbeddingOptionsJSON = fmt.Sprintf(`{"dimensions":%d}`, tidbAutoEmbeddingDimensions)
+var tidbAutoEmbeddingOptionsJSON = fmt.Sprintf(`{"dimensions":%d}`, TiDBAutoEmbeddingDimensions)
 
 type tidbColumnMeta struct {
 	columnType           string
@@ -66,7 +66,7 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 			status             VARCHAR(32) NOT NULL DEFAULT 'PENDING',
 			source_id          VARCHAR(255),
 			content_text       LONGTEXT,
-			embedding          VECTOR(` + strconv.Itoa(tidbAutoEmbeddingDimensions) + `) GENERATED ALWAYS AS (EMBED_TEXT(
+			embedding          VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `) GENERATED ALWAYS AS (EMBED_TEXT(
 				'` + tidbAutoEmbeddingModel + `',
 				content_text,
 				'` + tidbAutoEmbeddingOptionsJSON + `'
@@ -143,7 +143,7 @@ func DetectTiDBEmbeddingMode(db *sql.DB) (TiDBEmbeddingMode, error) {
 	if db == nil {
 		return TiDBEmbeddingModeUnknown, fmt.Errorf("nil db")
 	}
-	if !isTiDBCluster(db) {
+	if !IsTiDBCluster(db) {
 		return TiDBEmbeddingModeUnknown, fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
 	loadStart := time.Now()
@@ -176,31 +176,11 @@ func DetectTiDBEmbeddingMode(db *sql.DB) (TiDBEmbeddingMode, error) {
 
 // ValidateTiDBSchemaForMode validates that an already-open TiDB connection
 // matches exactly one supported dat9 embedding contract for the requested mode.
-//
-// The `mode` argument is a runtime behavior contract, not a cosmetic schema tag:
-//
-//   - `TiDBEmbeddingModeAuto` requires database-managed embedding, where
-//     `files.embedding` is a stored generated column derived from `content_text`
-//     via `EMBED_TEXT(...)`.
-//   - `TiDBEmbeddingModeApp` requires application-managed embedding, where
-//     `files.embedding` remains writable for the app-side embed worker and
-//     query-embedding path.
-//
-// The validator is intentionally strict: if the schema does not clearly satisfy
-// the requested mode, it returns an error rather than guessing or falling back
-// to the other mode.
-//
-// At the moment this contract is intentionally scoped to the tables that drive
-// embedding-mode behavior directly: `files` and `semantic_tasks`. Other TiDB
-// tables are currently outside this mode validator.
-//
-// Within that scope, `files` is validated structurally for the requested mode,
-// while `semantic_tasks` is currently checked only for table existence.
 func ValidateTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) error {
 	if db == nil {
 		return fmt.Errorf("nil db")
 	}
-	if !isTiDBCluster(db) {
+	if !IsTiDBCluster(db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
 	if err := validateTiDBSchemaMode(mode); err != nil {
@@ -227,22 +207,23 @@ func validateTiDBSchemaMode(mode TiDBEmbeddingMode) error {
 }
 
 func initTiDBAutoEmbeddingSchema(dsn string) error {
-	db, err := openTiDBSchemaDB(dsn)
+	db, err := OpenTiDBSchemaDB(dsn)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	if !isTiDBCluster(db) {
+	if !IsTiDBCluster(db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
-	if err := execSchemaStatements(db, tidbAutoEmbeddingSchemaStatements()); err != nil {
+	if err := ExecSchemaStatements(db, tidbAutoEmbeddingSchemaStatements()); err != nil {
 		return err
 	}
 	return ValidateTiDBSchemaForMode(db, TiDBEmbeddingModeAuto)
 }
 
-func validateTiDBSchemaForModeDSN(dsn string, mode TiDBEmbeddingMode) error {
-	db, err := openTiDBSchemaDB(dsn)
+// ValidateTiDBSchemaForModeDSN opens a DSN, validates the schema, and closes.
+func ValidateTiDBSchemaForModeDSN(dsn string, mode TiDBEmbeddingMode) error {
+	db, err := OpenTiDBSchemaDB(dsn)
 	if err != nil {
 		return err
 	}
@@ -250,8 +231,8 @@ func validateTiDBSchemaForModeDSN(dsn string, mode TiDBEmbeddingMode) error {
 	return ValidateTiDBSchemaForMode(db, mode)
 }
 
-func openTiDBSchemaDB(dsn string) (*sql.DB, error) {
-	if hasMultiStatements(dsn) {
+func OpenTiDBSchemaDB(dsn string) (*sql.DB, error) {
+	if HasMultiStatements(dsn) {
 		return nil, fmt.Errorf("multiStatements is not allowed")
 	}
 	db, err := sql.Open("mysql", dsn)
@@ -286,7 +267,7 @@ func detectTiDBEmbeddingModeFromFilesMeta(meta tidbTableMeta) (TiDBEmbeddingMode
 	if err != nil {
 		return TiDBEmbeddingModeUnknown, err
 	}
-	if normalizeSQLFragment(col.columnType) != fmt.Sprintf("vector(%d)", tidbAutoEmbeddingDimensions) {
+	if normalizeSQLFragment(col.columnType) != fmt.Sprintf("vector(%d)", TiDBAutoEmbeddingDimensions) {
 		return TiDBEmbeddingModeUnknown, fmt.Errorf("unsupported embedding column type %q", col.columnType)
 	}
 	extra := normalizeSQLFragment(col.extra)
@@ -364,7 +345,7 @@ func validateTiDBFilesTableBase(meta tidbTableMeta) error {
 	if err := meta.requireColumnType("content_text", "longtext"); err != nil {
 		return err
 	}
-	if err := meta.requireColumnType("embedding", fmt.Sprintf("vector(%d)", tidbAutoEmbeddingDimensions)); err != nil {
+	if err := meta.requireColumnType("embedding", fmt.Sprintf("vector(%d)", TiDBAutoEmbeddingDimensions)); err != nil {
 		return err
 	}
 	return meta.requireColumnType("embedding_revision", "bigint")

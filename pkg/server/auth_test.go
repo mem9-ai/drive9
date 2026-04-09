@@ -17,6 +17,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/token"
 )
 
 type authTestRuntime struct {
@@ -69,14 +70,14 @@ func newAuthRuntime(t *testing.T) (*authTestRuntime, func()) {
 		}
 	}
 	now := time.Now().UTC()
-	tenantID := tenant.NewID()
+	tenantID := token.NewID()
 	tenantDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true", parsed.User, parsed.Passwd, host, port, parsed.DBName)
 	initServerTenantSchema(t, tenantDSN)
 	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok, err := tenant.IssueToken(tokenSecret, tenantID, 1)
+	tok, err := token.IssueToken(tokenSecret, tenantID, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,11 +102,11 @@ func newAuthRuntime(t *testing.T) (*authTestRuntime, func()) {
 		t.Fatal(err)
 	}
 	if err := metaStore.InsertAPIKey(context.Background(), &meta.APIKey{
-		ID:            tenant.NewID(),
+		ID:            token.NewID(),
 		TenantID:      tenantID,
 		KeyName:       "default",
 		JWTCiphertext: tokCipher,
-		JWTHash:       tenant.HashToken(tok),
+		JWTHash:       token.HashToken(tok),
 		TokenVersion:  1,
 		Status:        meta.APIKeyActive,
 		IssuedAt:      now,
