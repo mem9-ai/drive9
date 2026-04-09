@@ -67,9 +67,6 @@ func main() {
 	if err != nil {
 		die(err)
 	}
-	if strings.TrimSpace(os.Getenv("DRIVE9_SEMANTIC_LEASE_SECONDS")) == "" {
-		semanticWorkerOpts.LeaseDuration = defaultSemanticLeaseDuration(backendOptions.AsyncImageExtract)
-	}
 	if semanticEmbedder != nil && backendOptions.QueryEmbedding.Client == nil {
 		backendOptions.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
 	}
@@ -217,7 +214,7 @@ environment:
   DRIVE9_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
   DRIVE9_SEMANTIC_WORKERS number of background workers (default: 1)
   DRIVE9_SEMANTIC_POLL_INTERVAL_MS worker poll interval in milliseconds (default: 200)
-  DRIVE9_SEMANTIC_LEASE_SECONDS task lease duration in seconds (default: 30; when unset and image extraction is enabled, drive9-server uses max(30, 2x image extract timeout))
+  DRIVE9_SEMANTIC_LEASE_SECONDS task lease duration in seconds (default: 30)
   DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS recover sweep interval in milliseconds (default: 5000)
   DRIVE9_SEMANTIC_RETRY_BASE_MS base retry backoff in milliseconds (default: 200)
   DRIVE9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
@@ -384,20 +381,6 @@ func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorker
 	logger.Info(context.Background(), "semantic_embedding_mode_openai_compatible",
 		zap.String("model", model), zap.String("base_url", baseURL))
 	return client, opts, nil
-}
-
-func defaultSemanticLeaseDuration(async backend.AsyncImageExtractOptions) time.Duration {
-	lease := 30 * time.Second
-	if !async.Enabled || async.TaskTimeout <= 0 {
-		return lease
-	}
-	derived := async.TaskTimeout * 2
-	if derived > lease {
-		lease = derived
-	}
-	// TODO: Add semantic task lease renewal for long-running work, then revisit
-	// whether this conservative default lease multiplier is still necessary.
-	return lease
 }
 
 func envBool(key string, fallback bool) bool {
