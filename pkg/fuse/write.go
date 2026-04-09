@@ -8,18 +8,38 @@ const (
 	maxPreloadSize            = 256 << 20 // 256MB - hard limit for preloading existing files into memory
 )
 
+// OnPartReadyFunc is called when a part is fully written and ready for upload.
+// partNum is 1-based. data is a snapshot that the callee may own.
+type OnPartReadyFunc func(partNum int, data []byte)
+
+// LoadPartFunc is called to lazily load part data from the remote server.
+// partNum is 1-based. Returns the part data.
+type LoadPartFunc func(partNum int) ([]byte, error)
+
 // WriteBuffer accumulates write data for a single file.
+// It uses a sparse part map: only parts that have been written to or
+// explicitly loaded are held in memory. This enables lazy preloading
+// (load parts on demand) and streaming uploads (notify when parts are full).
+//
 // It tracks which parts have been modified so that on flush,
 // only dirty parts need to be uploaded (unchanged parts are copied
 // server-side via S3 UploadPartCopy).
 // It is NOT thread-safe; callers must hold the FileHandle mutex.
 type WriteBuffer struct {
 	path       string
-	buf        []byte
+	totalSize  int64          // current logical file size
 	maxSize    int64
 	partSize   int64
-	dirtyParts []bool
+	parts      map[int][]byte // 0-based part index → part data
+	dirtyParts map[int]bool   // 0-based part index → dirty flag
 	touched    bool
+
+	// Callbacks (optional)
+	OnPartReady OnPartReadyFunc // called when a part is fully written
+	LoadPart    LoadPartFunc    // called to lazily load part data
+
+	// Memory tracking
+	curMemory int64 // current bytes held in parts map
 }
 
 // NewWriteBuffer creates a new WriteBuffer for the given path.
@@ -33,9 +53,11 @@ func NewWriteBuffer(path string, maxSize int64, partSize int64) *WriteBuffer {
 		partSize = DefaultPartSize
 	}
 	return &WriteBuffer{
-		path:     path,
-		maxSize:  maxSize,
-		partSize: partSize,
+		path:       path,
+		maxSize:    maxSize,
+		partSize:   partSize,
+		parts:      make(map[int][]byte),
+		dirtyParts: make(map[int]bool),
 	}
 }
 
@@ -49,23 +71,123 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 		return 0, syscall.EFBIG
 	}
 
-	// Grow the buffer if needed.
-	if end > int64(len(wb.buf)) {
-		if end > int64(cap(wb.buf)) {
-			// Allocate a new slice with enough capacity.
-			grown := make([]byte, end)
-			copy(grown, wb.buf)
-			wb.buf = grown
-		} else {
-			// Extend length within existing capacity; new bytes are already zero.
-			wb.buf = wb.buf[:end]
+	// Update totalSize
+	if end > wb.totalSize {
+		wb.totalSize = end
+	}
+
+	// Write data across parts
+	pos := offset
+	dataOff := 0
+	var newlyFullParts []int // 1-based part numbers that just became full
+
+	for dataOff < len(data) {
+		partIdx := int(pos / wb.partSize)
+		partOff := pos % wb.partSize
+
+		// Ensure part exists (lazily load or create)
+		if err := wb.ensurePart(partIdx); err != nil {
+			return uint32(dataOff), err
+		}
+
+		part := wb.parts[partIdx]
+		// How much can we write into this part?
+		canWrite := wb.partSize - partOff
+		remaining := int64(len(data) - dataOff)
+		if canWrite > remaining {
+			canWrite = remaining
+		}
+
+		// Extend part slice if needed
+		neededLen := partOff + canWrite
+		if neededLen > int64(len(part)) {
+			if neededLen > wb.partSize {
+				neededLen = wb.partSize
+			}
+			grown := make([]byte, neededLen)
+			copy(grown, part)
+			wb.curMemory += neededLen - int64(len(part))
+			part = grown
+			wb.parts[partIdx] = part
+		}
+
+		copy(part[partOff:partOff+canWrite], data[dataOff:dataOff+int(canWrite)])
+		wb.dirtyParts[partIdx] = true
+
+		// Check if this part is now full
+		partEnd := int64(partIdx+1) * wb.partSize
+		if wb.totalSize >= partEnd && int64(len(part)) == wb.partSize {
+			newlyFullParts = append(newlyFullParts, partIdx+1) // 1-based
+		}
+
+		pos += canWrite
+		dataOff += int(canWrite)
+	}
+
+	// Handle gap zero-fill: if offset was beyond previous totalSize,
+	// the parts in between need to exist and be zero-filled.
+	// This is handled by ensurePart which creates zero-filled parts.
+
+	wb.touched = true
+
+	// Notify about full parts
+	if wb.OnPartReady != nil {
+		for _, pn := range newlyFullParts {
+			partData := wb.PartData(pn)
+			if partData != nil && int64(len(partData)) == wb.partSize {
+				// Make a snapshot for the callback
+				snapshot := make([]byte, len(partData))
+				copy(snapshot, partData)
+				wb.OnPartReady(pn, snapshot)
+			}
 		}
 	}
 
-	copy(wb.buf[offset:], data)
-	wb.markDirty(offset, end)
-	wb.touched = true
 	return uint32(len(data)), nil
+}
+
+// ensurePart makes sure a part exists in the map. If it doesn't exist
+// and LoadPart is set, tries to load from remote. Otherwise creates a
+// zero-filled part sized to cover the needed region.
+func (wb *WriteBuffer) ensurePart(partIdx int) error {
+	if _, ok := wb.parts[partIdx]; ok {
+		return nil
+	}
+
+	// Try lazy load
+	if wb.LoadPart != nil {
+		partStart := int64(partIdx) * wb.partSize
+		// Only load if the remote file actually has data in this range
+		if partStart < wb.origSize() {
+			data, err := wb.LoadPart(partIdx + 1) // 1-based
+			if err != nil {
+				return err
+			}
+			wb.parts[partIdx] = data
+			wb.curMemory += int64(len(data))
+			return nil
+		}
+	}
+
+	// Create empty part
+	wb.parts[partIdx] = nil // will be grown as needed in Write
+	return nil
+}
+
+// origSize returns the original file size for lazy load decisions.
+// For files opened without lazy loading, this returns 0 (no remote parts to load).
+func (wb *WriteBuffer) origSize() int64 {
+	// If LoadPart is set, the totalSize at buffer creation represents
+	// the original remote file size. Parts beyond that are new.
+	// We track this via the OrigSize field on FileHandle, but WriteBuffer
+	// doesn't have direct access. Instead, LoadPart itself knows whether
+	// the part exists remotely — if it doesn't, it returns empty data.
+	// So we can always try loading and let the callback handle it.
+	// Return a large value to always try the callback when set.
+	if wb.LoadPart != nil {
+		return 1<<63 - 1
+	}
+	return 0
 }
 
 // markDirty marks all parts that overlap with [start, end) as dirty.
@@ -74,14 +196,6 @@ func (wb *WriteBuffer) markDirty(start, end int64) {
 	lastPart := int((end - 1) / wb.partSize)
 	if end <= start {
 		return
-	}
-
-	// Grow dirtyParts slice if needed.
-	needed := lastPart + 1
-	if needed > len(wb.dirtyParts) {
-		grown := make([]bool, needed)
-		copy(grown, wb.dirtyParts)
-		wb.dirtyParts = grown
 	}
 
 	for i := firstPart; i <= lastPart; i++ {
@@ -101,49 +215,55 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 	}
 	wb.touched = true
 
-	cur := int64(len(wb.buf))
+	cur := wb.totalSize
 	switch {
 	case size < cur:
-		// Mark parts that are affected by the shrink as dirty.
+		// Mark affected parts as dirty
 		if size > 0 {
 			wb.markDirty(size, cur)
 		} else {
-			// Truncate to zero: mark all existing parts dirty.
 			wb.markDirty(0, cur)
 		}
-		wb.buf = wb.buf[:size]
-		// Shrink dirtyParts if we now have fewer parts.
-		newParts := int((size + wb.partSize - 1) / wb.partSize)
-		if newParts < len(wb.dirtyParts) {
-			wb.dirtyParts = wb.dirtyParts[:newParts]
-		}
-		if size > 0 && size%wb.partSize == 0 && newParts > 0 {
-			// Exact-boundary shrinks still need a PATCH/flush to update the
-			// remote object size, even if no part payload changed.
-			wb.dirtyParts[newParts-1] = true
-		}
-	case size > cur:
-		if size > int64(cap(wb.buf)) {
-			grown := make([]byte, size)
-			copy(grown, wb.buf)
-			wb.buf = grown
-		} else {
-			// Zero the extended region within existing capacity.
-			prev := len(wb.buf)
-			wb.buf = wb.buf[:size]
-			for i := prev; i < len(wb.buf); i++ {
-				wb.buf[i] = 0
+
+		// Remove parts beyond the new size
+		newPartCount := int((size + wb.partSize - 1) / wb.partSize)
+		for idx := range wb.parts {
+			if idx >= newPartCount {
+				wb.curMemory -= int64(len(wb.parts[idx]))
+				delete(wb.parts, idx)
+				delete(wb.dirtyParts, idx)
 			}
 		}
-		// Mark the extended region as dirty.
+
+		// Truncate the last surviving part if needed
+		if size > 0 && newPartCount > 0 {
+			lastIdx := newPartCount - 1
+			partOff := size - int64(lastIdx)*wb.partSize
+			if part, ok := wb.parts[lastIdx]; ok && int64(len(part)) > partOff {
+				wb.curMemory -= int64(len(part)) - partOff
+				wb.parts[lastIdx] = part[:partOff]
+			}
+		}
+
+		// Mark exact-boundary shrinks
+		if size > 0 && size%wb.partSize == 0 && newPartCount > 0 {
+			wb.dirtyParts[newPartCount-1] = true
+		}
+
+		wb.totalSize = size
+
+	case size > cur:
+		// Mark the extended region as dirty
 		wb.markDirty(cur, size)
+		// Ensure parts exist for the extended region (zero-filled on access)
+		wb.totalSize = size
 	}
 	return nil
 }
 
-// Size returns the current buffer length.
+// Size returns the current logical file size.
 func (wb *WriteBuffer) Size() int64 {
-	return int64(len(wb.buf))
+	return wb.totalSize
 }
 
 // PartSize returns the part size used for dirty-part boundary calculations.
@@ -163,19 +283,32 @@ func (wb *WriteBuffer) HasDirtyParts() bool {
 	return false
 }
 
-// Bytes returns the buffer contents as a direct reference.
-// The caller should not hold the returned slice for longer than necessary,
-// since subsequent writes or truncations may invalidate it.
+// Bytes returns the buffer contents as a contiguous byte slice.
+// This materializes all parts into a single allocation.
+// For backward compatibility with code that reads from the buffer.
 func (wb *WriteBuffer) Bytes() []byte {
-	return wb.buf
+	if wb.totalSize == 0 {
+		return nil
+	}
+	buf := make([]byte, wb.totalSize)
+	numParts := int((wb.totalSize + wb.partSize - 1) / wb.partSize)
+	for i := 0; i < numParts; i++ {
+		part, ok := wb.parts[i]
+		if !ok || part == nil {
+			continue
+		}
+		start := int64(i) * wb.partSize
+		copy(buf[start:], part)
+	}
+	return buf
 }
 
 // DirtyPartNumbers returns the 1-based part numbers that have been modified.
 func (wb *WriteBuffer) DirtyPartNumbers() []int {
 	var parts []int
-	for i, dirty := range wb.dirtyParts {
+	for idx, dirty := range wb.dirtyParts {
 		if dirty {
-			parts = append(parts, i+1) // 1-based
+			parts = append(parts, idx+1) // 1-based
 		}
 	}
 	return parts
@@ -184,36 +317,63 @@ func (wb *WriteBuffer) DirtyPartNumbers() []int {
 // MarkAllDirty marks every part in the current buffer as dirty.
 // Used when the entire file content is loaded (e.g., new file or full rewrite).
 func (wb *WriteBuffer) MarkAllDirty() {
-	n := int((wb.Size() + wb.partSize - 1) / wb.partSize)
-	wb.dirtyParts = make([]bool, n)
-	for i := range wb.dirtyParts {
+	n := int((wb.totalSize + wb.partSize - 1) / wb.partSize)
+	wb.dirtyParts = make(map[int]bool, n)
+	for i := 0; i < n; i++ {
 		wb.dirtyParts[i] = true
 	}
 }
 
 // PartData returns the data for a specific 1-based part number.
-// Returns nil if the part is out of range.
+// Returns nil if the part is out of range or not loaded.
 func (wb *WriteBuffer) PartData(partNum int) []byte {
-	start := int64(partNum-1) * wb.partSize
-	if start >= int64(len(wb.buf)) {
+	partIdx := partNum - 1
+	start := int64(partIdx) * wb.partSize
+	if start >= wb.totalSize {
 		return nil
 	}
-	end := start + wb.partSize
-	if end > int64(len(wb.buf)) {
-		end = int64(len(wb.buf))
+
+	part, ok := wb.parts[partIdx]
+	if !ok || part == nil {
+		// Part not loaded — return zero-filled slice of the correct size
+		end := start + wb.partSize
+		if end > wb.totalSize {
+			end = wb.totalSize
+		}
+		return make([]byte, end-start)
 	}
-	return wb.buf[start:end]
+
+	// The part may be shorter than expected if it's the last part
+	expectedEnd := start + wb.partSize
+	if expectedEnd > wb.totalSize {
+		expectedEnd = wb.totalSize
+	}
+	expectedLen := expectedEnd - start
+
+	if int64(len(part)) < expectedLen {
+		// Extend with zeros
+		extended := make([]byte, expectedLen)
+		copy(extended, part)
+		return extended
+	}
+	return part[:expectedLen]
+}
+
+// IsPartLoaded reports whether the 0-based part index is in memory.
+func (wb *WriteBuffer) IsPartLoaded(partIdx int) bool {
+	_, ok := wb.parts[partIdx]
+	return ok
 }
 
 // Reset clears the buffer, releasing the underlying memory.
 func (wb *WriteBuffer) Reset() {
-	wb.buf = nil
-	wb.dirtyParts = nil
+	wb.parts = make(map[int][]byte)
+	wb.dirtyParts = make(map[int]bool)
+	wb.totalSize = 0
+	wb.curMemory = 0
 }
 
 func (wb *WriteBuffer) ClearDirty() {
-	for i := range wb.dirtyParts {
-		wb.dirtyParts[i] = false
-	}
+	wb.dirtyParts = make(map[int]bool)
 	wb.touched = false
 }

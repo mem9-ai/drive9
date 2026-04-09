@@ -450,7 +450,7 @@ func TestWriteBuffer_DirtyParts_PreloadClearsFlags(t *testing.T) {
 	_, _ = wb.Write(0, data)
 
 	// After preload, clear dirty flags (simulating Open behavior)
-	wb.dirtyParts = nil
+	wb.ClearDirty()
 
 	// No parts should be dirty
 	if len(wb.DirtyPartNumbers()) != 0 {
@@ -496,7 +496,7 @@ func TestWriteBuffer_DirtyParts_TruncateShrinkAtBoundary(t *testing.T) {
 func TestWriteBuffer_DirtyParts_TruncateExtend(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0, 0)
 	_, _ = wb.Write(0, make([]byte, DefaultPartSize)) // 1 full part
-	wb.dirtyParts = nil                        // clear as if preloaded
+	wb.ClearDirty()                        // clear as if preloaded
 
 	// Extend to 3 parts
 	_ = wb.Truncate(DefaultPartSize*3 - 100)
@@ -538,7 +538,7 @@ func TestWriteBuffer_PartData(t *testing.T) {
 func TestWriteBuffer_MarkAllDirty(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0, 0)
 	_, _ = wb.Write(0, make([]byte, DefaultPartSize*3))
-	wb.dirtyParts = nil // clear
+	wb.ClearDirty() // clear
 
 	wb.MarkAllDirty()
 	dirty := wb.DirtyPartNumbers()
@@ -598,6 +598,178 @@ func TestDirCache_InvalidateAll(t *testing.T) {
 	}
 	if _, ok := dc.Get("/b"); ok {
 		t.Fatal("/b should be gone")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sparse WriteBuffer with LoadPart (lazy loading) tests
+// ---------------------------------------------------------------------------
+
+func TestWriteBuffer_LazyLoad_WriteTriggersLoad(t *testing.T) {
+	// Simulate a 2-part file where LoadPart provides the existing data.
+	wb := NewWriteBuffer("/test", 0, DefaultPartSize)
+	wb.totalSize = DefaultPartSize * 2 // pretend file is 16MB
+
+	loadCalls := 0
+	wb.LoadPart = func(partNum int) ([]byte, error) {
+		loadCalls++
+		data := make([]byte, DefaultPartSize)
+		// Fill with a pattern based on part number
+		for i := range data {
+			data[i] = byte(partNum)
+		}
+		return data, nil
+	}
+
+	// Write to the middle of part 2 — should trigger lazy load of part 2
+	_, err := wb.Write(DefaultPartSize+100, []byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadCalls != 1 {
+		t.Fatalf("expected 1 LoadPart call, got %d", loadCalls)
+	}
+
+	// The written data should be at the correct offset within part 2
+	p2 := wb.PartData(2)
+	if string(p2[100:105]) != "hello" {
+		t.Fatalf("part 2 data at offset 100: got %q", p2[100:105])
+	}
+
+	// Data before the write should be the original loaded data (byte value 2)
+	if p2[0] != 2 {
+		t.Fatalf("part 2 first byte: got %d, want 2", p2[0])
+	}
+}
+
+func TestWriteBuffer_LazyLoad_UnloadedPartReturnsZeros(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, DefaultPartSize)
+	wb.totalSize = DefaultPartSize * 2
+
+	// No LoadPart set — unloaded parts should return zero-filled data
+	p1 := wb.PartData(1)
+	if p1 == nil {
+		t.Fatal("PartData should return zero-filled slice, not nil")
+	}
+	if len(p1) != int(DefaultPartSize) {
+		t.Fatalf("PartData len = %d, want %d", len(p1), DefaultPartSize)
+	}
+	for i, b := range p1 {
+		if b != 0 {
+			t.Fatalf("byte %d = %d, want 0", i, b)
+		}
+	}
+}
+
+func TestWriteBuffer_OnPartReady_Notification(t *testing.T) {
+	wb := NewWriteBuffer("/test", defaultWriteBufferMaxSize, DefaultPartSize)
+
+	var readyParts []int
+	wb.OnPartReady = func(partNum int, data []byte) {
+		readyParts = append(readyParts, partNum)
+	}
+
+	// Write exactly 1 full part
+	data := make([]byte, DefaultPartSize)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	_, err := wb.Write(0, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(readyParts) != 1 || readyParts[0] != 1 {
+		t.Fatalf("expected OnPartReady called with part 1, got %v", readyParts)
+	}
+}
+
+func TestWriteBuffer_OnPartReady_NotCalledForPartialPart(t *testing.T) {
+	wb := NewWriteBuffer("/test", defaultWriteBufferMaxSize, DefaultPartSize)
+
+	called := false
+	wb.OnPartReady = func(partNum int, data []byte) {
+		called = true
+	}
+
+	// Write less than a full part
+	_, _ = wb.Write(0, []byte("small data"))
+	if called {
+		t.Fatal("OnPartReady should not be called for partial parts")
+	}
+}
+
+func TestWriteBuffer_Bytes_MaterializesSparseBuffer(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 10) // small part size for testing
+	wb.totalSize = 30
+
+	// Write to part 1 (bytes 0-9)
+	_, _ = wb.Write(0, []byte("AAAAAAAAAA"))
+	// Write to part 3 (bytes 20-29)
+	_, _ = wb.Write(20, []byte("CCCCCCCCCC"))
+
+	data := wb.Bytes()
+	if len(data) != 30 {
+		t.Fatalf("Bytes() len = %d, want 30", len(data))
+	}
+	if string(data[0:10]) != "AAAAAAAAAA" {
+		t.Fatalf("part 1: got %q", data[0:10])
+	}
+	// Part 2 (bytes 10-19) should be zeros
+	for i := 10; i < 20; i++ {
+		if data[i] != 0 {
+			t.Fatalf("byte %d = %d, want 0", i, data[i])
+		}
+	}
+	if string(data[20:30]) != "CCCCCCCCCC" {
+		t.Fatalf("part 3: got %q", data[20:30])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Prefetcher tests
+// ---------------------------------------------------------------------------
+
+func TestPrefetcher_SequentialReadGrowsWindow(t *testing.T) {
+	p := NewPrefetcher(nil, "/test", 100*1024*1024) // 100MB file
+
+	// Simulate sequential reads
+	p.OnRead(0, 4096)
+	if p.window != prefetchMinWindow*2 {
+		t.Fatalf("window after first sequential read = %d, want %d", p.window, prefetchMinWindow*2)
+	}
+
+	p.OnRead(4096, 4096)
+	if p.window != prefetchMinWindow*4 {
+		t.Fatalf("window after second sequential read = %d, want %d", p.window, prefetchMinWindow*4)
+	}
+}
+
+func TestPrefetcher_RandomReadResetsWindow(t *testing.T) {
+	p := NewPrefetcher(nil, "/test", 100*1024*1024)
+
+	// Sequential reads to grow window
+	p.OnRead(0, 4096)
+	p.OnRead(4096, 4096)
+
+	// Random read
+	p.OnRead(50*1024*1024, 4096)
+	if p.window != prefetchMinWindow {
+		t.Fatalf("window after random read = %d, want %d (reset)", p.window, prefetchMinWindow)
+	}
+}
+
+func TestPrefetcher_WindowCapAtMax(t *testing.T) {
+	p := NewPrefetcher(nil, "/test", 1024*1024*1024) // 1GB file
+
+	offset := int64(0)
+	for i := 0; i < 20; i++ {
+		p.OnRead(offset, 4096)
+		offset += 4096
+	}
+
+	if p.window > prefetchMaxWindow {
+		t.Fatalf("window %d exceeds max %d", p.window, prefetchMaxWindow)
 	}
 }
 
