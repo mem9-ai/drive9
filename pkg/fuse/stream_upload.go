@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"log"
 	"sync"
 
 	"github.com/mem9-ai/dat9/pkg/client"
@@ -11,23 +12,29 @@ import (
 // OnPartReady callback. When a part is fully written (8MB), it is
 // immediately uploaded in the background. On close/flush, only the
 // last partial part + CompleteMultipartUpload are needed.
+//
+// SubmitPart returns an error so the caller knows if a submission failed.
+// It tracks which part numbers have been submitted to avoid duplicate
+// uploads (e.g. when OnPartReady fires for the same part on rewrite).
 type StreamUploader struct {
 	client    *client.Client
 	path      string
 	totalSize int64 // updated as file grows
 
-	mu      sync.Mutex
-	writer  *client.StreamWriter
-	started bool
-	err     error // first background error
+	mu             sync.Mutex
+	writer         *client.StreamWriter
+	started        bool
+	err            error        // first background error
+	submittedParts map[int]bool // parts already submitted — prevents duplicates
 }
 
 // NewStreamUploader creates a StreamUploader for the given path.
 // No network calls are made until the first part is submitted.
 func NewStreamUploader(c *client.Client, path string) *StreamUploader {
 	return &StreamUploader{
-		client: c,
-		path:   path,
+		client:         c,
+		path:           path,
+		submittedParts: make(map[int]bool),
 	}
 }
 
@@ -48,11 +55,21 @@ func (su *StreamUploader) SetTotalSize(size int64) {
 
 // SubmitPart uploads a part in the background. partNum is 1-based.
 // data is owned by the caller — StreamUploader will copy it.
-func (su *StreamUploader) SubmitPart(partNum int, data []byte) {
+// Returns an error if the upload has already failed or the part couldn't
+// be submitted. Duplicate submissions of the same partNum are silently
+// ignored (idempotent).
+func (su *StreamUploader) SubmitPart(partNum int, data []byte) error {
 	su.mu.Lock()
 	if su.err != nil {
+		err := su.err
 		su.mu.Unlock()
-		return
+		return err
+	}
+
+	// Skip duplicate submissions (e.g. OnPartReady firing on rewrite)
+	if su.submittedParts[partNum] {
+		su.mu.Unlock()
+		return nil
 	}
 
 	// Lazy init the StreamWriter
@@ -60,6 +77,7 @@ func (su *StreamUploader) SubmitPart(partNum int, data []byte) {
 		su.writer = su.client.NewStreamWriter(context.Background(), su.path, su.totalSize)
 		su.started = true
 	}
+	su.submittedParts[partNum] = true
 	sw := su.writer
 	su.mu.Unlock()
 
@@ -69,12 +87,23 @@ func (su *StreamUploader) SubmitPart(partNum int, data []byte) {
 			su.err = err
 		}
 		su.mu.Unlock()
+		return err
 	}
+	return nil
+}
+
+// IsPartSubmitted reports whether a part has already been submitted.
+func (su *StreamUploader) IsPartSubmitted(partNum int) bool {
+	su.mu.Lock()
+	defer su.mu.Unlock()
+	return su.submittedParts[partNum]
 }
 
 // Finish uploads the last (possibly partial) part and completes the upload.
-// totalSize must reflect the final file size. Returns any error from
-// background uploads or the complete call.
+// lastPartNum and lastPartData describe the final part. If the last part
+// was already submitted via SubmitPart (exact-multiple-of-partSize case),
+// pass nil for lastPartData.
+// Returns any error from background uploads or the complete call.
 func (su *StreamUploader) Finish(totalSize int64, lastPartNum int, lastPartData []byte) error {
 	su.mu.Lock()
 	if su.err != nil {
@@ -93,10 +122,12 @@ func (su *StreamUploader) Finish(totalSize int64, lastPartNum int, lastPartData 
 		return nil
 	}
 
-	// Update total size on the StreamWriter by recreating if needed
-	// The StreamWriter was created with potentially outdated totalSize.
-	// Since the v2 initiate already happened with the initial size,
-	// the server knows the total. We just need to complete with all parts.
+	// If the last part was already submitted (file size is exact multiple
+	// of partSize), don't upload it again — pass nil data to Complete.
+	if su.submittedParts[lastPartNum] {
+		lastPartData = nil
+	}
+
 	sw := su.writer
 	su.mu.Unlock()
 
@@ -115,7 +146,9 @@ func (su *StreamUploader) Abort() {
 	su.mu.Unlock()
 
 	if sw != nil {
-		_ = sw.Abort(context.Background())
+		if err := sw.Abort(context.Background()); err != nil {
+			log.Printf("stream upload abort failed for %s: %v", su.path, err)
+		}
 	}
 }
 

@@ -35,8 +35,9 @@ type WriteBuffer struct {
 	touched    bool
 
 	// Callbacks (optional)
-	OnPartReady OnPartReadyFunc // called when a part is fully written
-	LoadPart    LoadPartFunc    // called to lazily load part data
+	OnPartReady   OnPartReadyFunc // called when a part is fully written
+	LoadPart      LoadPartFunc    // called to lazily load part data
+	notifiedParts map[int]bool    // parts already notified via OnPartReady (prevents duplicates)
 
 	// remoteSize is the original remote file size, set when lazy loading
 	// is configured. ensurePart() only calls LoadPart for parts whose
@@ -136,14 +137,21 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 
 	wb.touched = true
 
-	// Notify about full parts
+	// Notify about full parts (only once per part — skip already-notified parts)
 	if wb.OnPartReady != nil {
 		for _, pn := range newlyFullParts {
+			if wb.notifiedParts != nil && wb.notifiedParts[pn] {
+				continue // already notified (e.g. rewrite of a full part)
+			}
 			partData := wb.PartData(pn)
 			if partData != nil && int64(len(partData)) == wb.partSize {
 				// Make a snapshot for the callback
 				snapshot := make([]byte, len(partData))
 				copy(snapshot, partData)
+				if wb.notifiedParts == nil {
+					wb.notifiedParts = make(map[int]bool)
+				}
+				wb.notifiedParts[pn] = true
 				wb.OnPartReady(pn, snapshot)
 			}
 		}
@@ -154,7 +162,7 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 
 // ensurePart makes sure a part exists in the map. If it doesn't exist
 // and LoadPart is set, tries to load from remote. Otherwise creates a
-// zero-filled part sized to cover the needed region.
+// nil entry that will be grown as needed by Write.
 func (wb *WriteBuffer) ensurePart(partIdx int) error {
 	if _, ok := wb.parts[partIdx]; ok {
 		return nil
@@ -315,7 +323,8 @@ func (wb *WriteBuffer) MarkAllDirty() {
 }
 
 // PartData returns the data for a specific 1-based part number.
-// Returns nil if the part is out of range or not loaded.
+// Returns nil if the part is out of range (partNum beyond totalSize).
+// Returns a zero-filled slice if the part is within range but not loaded.
 func (wb *WriteBuffer) PartData(partNum int) []byte {
 	partIdx := partNum - 1
 	start := int64(partIdx) * wb.partSize
@@ -349,6 +358,69 @@ func (wb *WriteBuffer) PartData(partNum int) []byte {
 	return part[:expectedLen]
 }
 
+// ReadAt reads up to len(buf) bytes from the buffer starting at offset.
+// Returns the number of bytes read. This avoids materializing the entire
+// sparse buffer — it reads directly from individual parts.
+func (wb *WriteBuffer) ReadAt(offset int64, buf []byte) int {
+	if offset >= wb.totalSize {
+		return 0
+	}
+	end := offset + int64(len(buf))
+	if end > wb.totalSize {
+		end = wb.totalSize
+	}
+	total := int(end - offset)
+	if total <= 0 {
+		return 0
+	}
+
+	pos := offset
+	copied := 0
+	for copied < total {
+		partIdx := int(pos / wb.partSize)
+		partOff := pos % wb.partSize
+
+		// How much from this part?
+		canRead := wb.partSize - partOff
+		remaining := int64(total - copied)
+		if canRead > remaining {
+			canRead = remaining
+		}
+
+		part, ok := wb.parts[partIdx]
+		if ok && part != nil {
+			// Read from loaded part
+			partEnd := partOff + canRead
+			if partEnd > int64(len(part)) {
+				// Part is shorter than expected — copy what exists, rest is zero
+				if partOff < int64(len(part)) {
+					n := copy(buf[copied:], part[partOff:])
+					// Zero-fill the rest
+					for i := copied + n; i < copied+int(canRead); i++ {
+						buf[i] = 0
+					}
+				} else {
+					// Entirely beyond the part — zero-fill
+					for i := copied; i < copied+int(canRead); i++ {
+						buf[i] = 0
+					}
+				}
+			} else {
+				copy(buf[copied:], part[partOff:partEnd])
+			}
+		} else {
+			// Part not loaded — zero-fill
+			for i := copied; i < copied+int(canRead); i++ {
+				buf[i] = 0
+			}
+		}
+
+		pos += canRead
+		copied += int(canRead)
+	}
+	return total
+}
+
 // IsPartLoaded reports whether the 0-based part index is in memory.
 func (wb *WriteBuffer) IsPartLoaded(partIdx int) bool {
 	_, ok := wb.parts[partIdx]
@@ -359,6 +431,7 @@ func (wb *WriteBuffer) IsPartLoaded(partIdx int) bool {
 func (wb *WriteBuffer) Reset() {
 	wb.parts = make(map[int][]byte)
 	wb.dirtyParts = make(map[int]bool)
+	wb.notifiedParts = nil
 	wb.totalSize = 0
 	wb.curMemory = 0
 }

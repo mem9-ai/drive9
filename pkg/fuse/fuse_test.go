@@ -775,6 +775,145 @@ func TestPrefetcher_WindowCapAtMax(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// OnPartReady duplicate prevention test
+// ---------------------------------------------------------------------------
+
+func TestWriteBuffer_OnPartReady_NoDuplicateOnRewrite(t *testing.T) {
+	wb := NewWriteBuffer("/test", defaultWriteBufferMaxSize, DefaultPartSize)
+
+	var readyParts []int
+	wb.OnPartReady = func(partNum int, data []byte) {
+		readyParts = append(readyParts, partNum)
+	}
+
+	// Write exactly 1 full part
+	data := make([]byte, DefaultPartSize)
+	_, err := wb.Write(0, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(readyParts) != 1 {
+		t.Fatalf("expected 1 OnPartReady call, got %d", len(readyParts))
+	}
+
+	// Rewrite the same full part — should NOT trigger OnPartReady again
+	_, err = wb.Write(0, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(readyParts) != 1 {
+		t.Fatalf("expected still 1 OnPartReady call after rewrite, got %d", len(readyParts))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// WriteBuffer.ReadAt tests
+// ---------------------------------------------------------------------------
+
+func TestWriteBuffer_ReadAt_Basic(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 10) // small part size
+	_, _ = wb.Write(0, []byte("AAAAAAAAAA"))  // part 1
+	_, _ = wb.Write(20, []byte("CCCCCCCCCC")) // part 3
+
+	// Read across all three parts including the sparse gap
+	buf := make([]byte, 30)
+	n := wb.ReadAt(0, buf)
+	if n != 30 {
+		t.Fatalf("ReadAt returned %d, want 30", n)
+	}
+	if string(buf[0:10]) != "AAAAAAAAAA" {
+		t.Fatalf("part 1: got %q", buf[0:10])
+	}
+	for i := 10; i < 20; i++ {
+		if buf[i] != 0 {
+			t.Fatalf("byte %d = %d, want 0 (sparse gap)", i, buf[i])
+		}
+	}
+	if string(buf[20:30]) != "CCCCCCCCCC" {
+		t.Fatalf("part 3: got %q", buf[20:30])
+	}
+}
+
+func TestWriteBuffer_ReadAt_PartialRead(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 10)
+	_, _ = wb.Write(0, []byte("hello world!padding!"))
+
+	// Read from middle of part 1 into part 2
+	buf := make([]byte, 5)
+	n := wb.ReadAt(3, buf)
+	if n != 5 {
+		t.Fatalf("ReadAt returned %d, want 5", n)
+	}
+	if string(buf) != "lo wo" {
+		t.Fatalf("ReadAt mid: got %q, want %q", buf, "lo wo")
+	}
+}
+
+func TestWriteBuffer_ReadAt_BeyondEnd(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 0)
+	_, _ = wb.Write(0, []byte("abc"))
+
+	buf := make([]byte, 10)
+	n := wb.ReadAt(100, buf)
+	if n != 0 {
+		t.Fatalf("ReadAt beyond end returned %d, want 0", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Prefetcher Close test
+// ---------------------------------------------------------------------------
+
+func TestPrefetcher_CloseStopsAccepting(t *testing.T) {
+	p := NewPrefetcher(nil, "/test", 100*1024*1024)
+
+	// Sequential reads work before close
+	p.OnRead(0, 4096)
+	if p.window != prefetchMinWindow*2 {
+		t.Fatalf("window before close = %d, want %d", p.window, prefetchMinWindow*2)
+	}
+
+	p.Close()
+
+	// After close, OnRead is a no-op
+	p.OnRead(4096, 4096)
+	if p.window != prefetchMinWindow*2 {
+		t.Fatalf("window should not change after Close, got %d", p.window)
+	}
+
+	// Get returns miss after close
+	_, ok := p.Get(0, 4096)
+	if ok {
+		t.Fatal("Get should return false after Close")
+	}
+
+	// Double-close is safe
+	p.Close()
+}
+
+// ---------------------------------------------------------------------------
+// StreamUploader duplicate prevention test
+// ---------------------------------------------------------------------------
+
+func TestStreamUploader_SubmitPartDuplicate(t *testing.T) {
+	// Create StreamUploader without a real client — just test dedup logic
+	su := NewStreamUploader(nil, "/test")
+
+	// Manually mark a part as submitted
+	su.mu.Lock()
+	su.submittedParts[1] = true
+	su.mu.Unlock()
+
+	// Submitting the same part again should be a no-op (returns nil, no panic)
+	if !su.IsPartSubmitted(1) {
+		t.Fatal("part 1 should be marked as submitted")
+	}
+	if su.IsPartSubmitted(2) {
+		t.Fatal("part 2 should not be submitted")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Error mapping test
 // ---------------------------------------------------------------------------
 

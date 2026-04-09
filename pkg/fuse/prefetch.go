@@ -32,6 +32,9 @@ type prefetchBlock struct {
 // Eviction: uses smallest-offset eviction, optimised for forward sequential
 // reads (e.g. cat, cp). Reverse reads will thrash the cache — this is
 // acceptable since the common case is forward streaming.
+//
+// Lifecycle: call Close() when the file handle is released to cancel
+// inflight prefetches and prevent goroutine leaks.
 type Prefetcher struct {
 	mu         sync.Mutex
 	nextExpect int64 // next expected offset (for sequential detection)
@@ -41,10 +44,14 @@ type Prefetcher struct {
 	client     *client.Client
 	path       string
 	fileSize   int64
+	cancel     context.CancelFunc // cancels all inflight prefetch goroutines
+	ctx        context.Context    // parent context for prefetch goroutines
+	closed     bool
 }
 
 // NewPrefetcher creates a Prefetcher for the given file.
 func NewPrefetcher(c *client.Client, path string, fileSize int64) *Prefetcher {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Prefetcher{
 		nextExpect: 0,
 		window:     prefetchMinWindow,
@@ -53,6 +60,8 @@ func NewPrefetcher(c *client.Client, path string, fileSize int64) *Prefetcher {
 		client:     c,
 		path:       path,
 		fileSize:   fileSize,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 }
 
@@ -60,6 +69,10 @@ func NewPrefetcher(c *client.Client, path string, fileSize int64) *Prefetcher {
 // Returns the data and true on hit, or nil and false on miss.
 func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, false
+	}
 	block, ok := p.cache[offset]
 	p.mu.Unlock()
 
@@ -67,8 +80,13 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 		return nil, false
 	}
 
-	// Wait for the block to be ready
-	<-block.ready
+	// Wait for the block to be ready (or context cancellation)
+	select {
+	case <-block.ready:
+	case <-p.ctx.Done():
+		return nil, false
+	}
+
 	if block.err != nil {
 		// Remove failed block
 		p.mu.Lock()
@@ -97,6 +115,10 @@ func (p *Prefetcher) OnRead(offset int64, size int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if p.closed {
+		return
+	}
+
 	if offset == p.nextExpect {
 		// Sequential read detected — grow window
 		p.window *= 2
@@ -122,6 +144,26 @@ func (p *Prefetcher) OnRead(offset int64, size int) {
 	}
 
 	p.nextExpect = offset + int64(size)
+}
+
+// Close cancels all inflight prefetch goroutines and clears the cache.
+// Safe to call multiple times. After Close, Get and OnRead are no-ops.
+func (p *Prefetcher) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed {
+		return
+	}
+	p.closed = true
+	p.cancel()
+	// Clear cache to release memory
+	for k := range p.cache {
+		delete(p.cache, k)
+	}
+	for k := range p.inflight {
+		delete(p.inflight, k)
+	}
 }
 
 // startPrefetch launches a background fetch. Caller must hold p.mu.
@@ -157,10 +199,11 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 	p.cache[offset] = block
 	p.inflight[offset] = true
 
+	ctx := p.ctx
 	go func() {
 		defer close(block.ready)
 
-		rc, err := p.client.ReadStreamRange(context.Background(), p.path, offset, length)
+		rc, err := p.client.ReadStreamRange(ctx, p.path, offset, length)
 		if err != nil {
 			block.err = err
 			return

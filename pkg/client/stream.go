@@ -8,26 +8,30 @@ import (
 
 // StreamWriter provides a streaming multipart upload API where individual
 // parts can be submitted concurrently as they become available.
-// It wraps the v2 upload protocol (initiate → presign → upload → complete),
-// with fallback to v1 if the server doesn't support v2.
+// It wraps the v2 upload protocol (initiate → presign → upload → complete).
+// If the server doesn't support v2, WritePart returns an error.
 //
 // Usage:
 //  1. Call Client.NewStreamWriter() to create a StreamWriter (lazy — no network call yet).
 //  2. Call WritePart() for each part as data becomes ready (concurrency-safe).
-//  3. Call Complete() to upload the final part and finalize the upload.
+//  3. Call Complete() to wait for inflight parts, upload the final part, and finalize.
 //  4. Call Abort() on any error to clean up server-side state.
+//
+// State transitions: idle → started → completed/aborted.
+// Once completed or aborted, no further WritePart/Complete/Abort calls are accepted.
 type StreamWriter struct {
-	client   *Client
-	path     string
+	client    *Client
+	path      string
 	totalSize int64
 
 	mu        sync.Mutex
-	plan      *uploadPlanV2    // lazily initialized on first WritePart
+	plan      *uploadPlanV2       // lazily initialized on first WritePart
 	uploaded  map[int]completePart // partNumber → completed part
 	inflight  sync.WaitGroup
-	err       error            // first error from any goroutine
+	err       error // first error from any goroutine
 	started   bool
 	completed bool
+	aborted   bool
 
 	sem chan struct{} // concurrency limiter
 }
@@ -71,6 +75,7 @@ func (sw *StreamWriter) initLocked(ctx context.Context) error {
 // WritePart uploads a single part in the background. partNum is 1-based.
 // data is copied internally so the caller may reuse the buffer after return.
 // This method is concurrency-safe.
+// Returns an error if the writer is already completed, aborted, or has a prior error.
 func (sw *StreamWriter) WritePart(ctx context.Context, partNum int, data []byte) error {
 	sw.mu.Lock()
 	if sw.err != nil {
@@ -82,6 +87,10 @@ func (sw *StreamWriter) WritePart(ctx context.Context, partNum int, data []byte)
 		sw.mu.Unlock()
 		return fmt.Errorf("stream writer already completed")
 	}
+	if sw.aborted {
+		sw.mu.Unlock()
+		return fmt.Errorf("stream writer already aborted")
+	}
 
 	// Lazy init
 	if err := sw.initLocked(ctx); err != nil {
@@ -90,6 +99,11 @@ func (sw *StreamWriter) WritePart(ctx context.Context, partNum int, data []byte)
 		return err
 	}
 	plan := sw.plan
+
+	// Add to inflight INSIDE the mutex so Complete()'s Wait() cannot
+	// race — it can only call Wait() after acquiring the lock, and by
+	// then Add(1) has already been called.
+	sw.inflight.Add(1)
 	sw.mu.Unlock()
 
 	// Copy data so caller can reuse buffer
@@ -100,10 +114,10 @@ func (sw *StreamWriter) WritePart(ctx context.Context, partNum int, data []byte)
 	select {
 	case sw.sem <- struct{}{}:
 	case <-ctx.Done():
+		sw.inflight.Done()
 		return ctx.Err()
 	}
 
-	sw.inflight.Add(1)
 	go func() {
 		defer sw.inflight.Done()
 		defer func() { <-sw.sem }()
@@ -139,27 +153,38 @@ func (sw *StreamWriter) WritePart(ctx context.Context, partNum int, data []byte)
 	return nil
 }
 
-// Complete waits for all inflight parts, uploads the final part if provided,
-// and calls CompleteMultipartUpload.
+// Complete waits for all inflight background parts, then uploads the final
+// part (if provided), and calls CompleteMultipartUpload to finalize.
 // finalPartNum/finalPartData can be used for the last (possibly partial) part.
-// If finalPartData is nil, no additional part is uploaded.
+// If finalPartData is empty, no additional part is uploaded.
 func (sw *StreamWriter) Complete(ctx context.Context, finalPartNum int, finalPartData []byte) error {
+	// Wait for all background parts first — they may still be calling Add(1)
+	// inside WritePart's mutex section, so we must not hold the lock here.
+	sw.inflight.Wait()
+
+	sw.mu.Lock()
+	if sw.completed {
+		sw.mu.Unlock()
+		return fmt.Errorf("stream writer already completed")
+	}
+	if sw.aborted {
+		sw.mu.Unlock()
+		return fmt.Errorf("stream writer already aborted")
+	}
+	if sw.err != nil {
+		err := sw.err
+		sw.mu.Unlock()
+		return err
+	}
+	if !sw.started || sw.plan == nil {
+		sw.mu.Unlock()
+		return fmt.Errorf("stream writer was never started")
+	}
+	plan := sw.plan
+	sw.mu.Unlock()
+
 	// Upload final part synchronously if provided
 	if len(finalPartData) > 0 {
-		sw.mu.Lock()
-		if sw.err != nil {
-			err := sw.err
-			sw.mu.Unlock()
-			return err
-		}
-		if err := sw.initLocked(ctx); err != nil {
-			sw.err = err
-			sw.mu.Unlock()
-			return err
-		}
-		plan := sw.plan
-		sw.mu.Unlock()
-
 		pp, err := sw.client.presignOnePart(ctx, plan.UploadID, finalPartNum)
 		if err != nil {
 			return fmt.Errorf("presign final part %d: %w", finalPartNum, err)
@@ -173,19 +198,8 @@ func (sw *StreamWriter) Complete(ctx context.Context, finalPartNum int, finalPar
 		sw.mu.Unlock()
 	}
 
-	// Wait for all background parts
-	sw.inflight.Wait()
-
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
-
-	if sw.err != nil {
-		return sw.err
-	}
-
-	if !sw.started || sw.plan == nil {
-		return fmt.Errorf("stream writer was never started")
-	}
 
 	// Build ordered parts list from actually-uploaded parts.
 	// We use sw.uploaded (not sw.plan.TotalParts) because the file may have
@@ -214,11 +228,18 @@ func (sw *StreamWriter) Complete(ctx context.Context, finalPartNum int, finalPar
 }
 
 // Abort cancels the multipart upload and cleans up server-side state.
+// Waits for inflight parts to finish before aborting.
+// After Abort, no further WritePart or Complete calls are accepted.
 func (sw *StreamWriter) Abort(ctx context.Context) error {
 	sw.inflight.Wait()
 
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
+
+	if sw.aborted {
+		return nil // already aborted
+	}
+	sw.aborted = true
 
 	if !sw.started || sw.plan == nil {
 		return nil

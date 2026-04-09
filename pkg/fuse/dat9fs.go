@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log"
 	"os"
 	"path"
 	"strings"
@@ -670,7 +671,9 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	streamer := NewStreamUploader(fs.client, childP)
 	fh.Streamer = streamer
 	wb.OnPartReady = func(partNum int, data []byte) {
-		streamer.SubmitPart(partNum, data)
+		if err := streamer.SubmitPart(partNum, data); err != nil {
+			log.Printf("stream submit part %d failed for %s: %v", partNum, childP, err)
+		}
 	}
 
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
@@ -722,7 +725,9 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			streamer := NewStreamUploader(fs.client, p)
 			fh.Streamer = streamer
 			fh.Dirty.OnPartReady = func(partNum int, data []byte) {
-				streamer.SubmitPart(partNum, data)
+				if err := streamer.SubmitPart(partNum, data); err != nil {
+					log.Printf("stream submit part %d failed for %s: %v", partNum, p, err)
+				}
 			}
 		}
 	}
@@ -753,19 +758,20 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	fh.Lock()
 	// If there's a dirty buffer (even empty — e.g. after Create or truncate-to-zero),
 	// read from it so we don't go back to the server and see stale/non-existent data.
+	// Uses ReadAt to avoid materializing the entire sparse buffer.
 	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
-		data := fh.Dirty.Bytes()
 		offset := int64(input.Offset)
-		if offset >= int64(len(data)) {
+		size := fh.Dirty.Size()
+		if offset >= size {
 			fh.Unlock()
 			return gofuse.ReadResultData(nil), gofuse.OK
 		}
 		end := offset + int64(input.Size)
-		if end > int64(len(data)) {
-			end = int64(len(data))
+		if end > size {
+			end = size
 		}
 		result := make([]byte, end-offset)
-		copy(result, data[offset:end])
+		fh.Dirty.ReadAt(offset, result)
 		fh.Unlock()
 		return gofuse.ReadResultData(result), gofuse.OK
 	}
@@ -926,10 +932,21 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
 		fh.Lock()
-		fs.flushHandle(fh)
+		st := fs.flushHandle(fh)
+		if st != gofuse.OK && fh.Streamer != nil {
+			// Flush failed — abort the streaming upload to avoid orphaned
+			// multipart uploads on S3.
+			fh.Streamer.Abort()
+			log.Printf("flush failed for %s (status %d), aborted stream upload", fh.Path, st)
+		}
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
 		fh.Unlock()
+
+		// Close prefetcher to cancel inflight goroutines.
+		if fh.Prefetch != nil {
+			fh.Prefetch.Close()
+		}
 	}
 	fs.fileHandles.Delete(input.Fh)
 }
