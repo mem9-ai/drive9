@@ -114,6 +114,11 @@ type downloadRange struct {
 	length int64
 }
 
+// readTarget captures the presigned object URL resolved from the control
+// plane for one large-file download. The current parallel downloader assumes
+// this URL remains valid for the lifetime of the download; if it expires mid-
+// transfer we fail the download instead of refreshing and retrying in place.
+// Follow-up: #138.
 type readTarget struct {
 	objectURL string
 }
@@ -1077,6 +1082,11 @@ func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, loca
 	// Resolve the presigned object URL once, then reuse it for all range GETs in
 	// this download. This avoids paying one redirect / presign round-trip per
 	// chunk while keeping the existing server contract unchanged.
+	//
+	// This path currently assumes the object content stays stable for the whole
+	// download. We do not capture ETag / VersionId at resolve time or attach
+	// If-Match on per-range GETs, so cross-range consistency is best-effort.
+	// Follow-up: #139.
 	target, err := c.resolveReadTarget(ctx, remotePath)
 	if err != nil {
 		return nil, err
