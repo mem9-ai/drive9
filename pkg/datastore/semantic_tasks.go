@@ -373,6 +373,35 @@ func (s *Store) AckSemanticTask(ctx context.Context, taskID, receipt string) (er
 	return s.semanticTaskLeaseError(ctx, taskID)
 }
 
+// RenewSemanticTask extends the lease for a currently owned semantic task.
+func (s *Store) RenewSemanticTask(ctx context.Context, taskID, receipt string, leaseDuration time.Duration) (leaseUntil time.Time, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "renew_semantic_task", start, &err)
+
+	now := time.Now().UTC()
+	if leaseDuration <= 0 {
+		leaseDuration = 30 * time.Second
+	}
+	leaseUntil = now.Add(leaseDuration)
+	res, err := s.db.ExecContext(ctx, `UPDATE semantic_tasks SET lease_until = ?, updated_at = ?
+		WHERE task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`,
+		leaseUntil, now, taskID, semantic.TaskProcessing, receipt, now)
+	if err != nil {
+		return time.Time{}, err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return time.Time{}, err
+	}
+	if rowsAffected > 0 {
+		return leaseUntil, nil
+	}
+	if err := s.semanticTaskLeaseError(ctx, taskID); err != nil {
+		return time.Time{}, err
+	}
+	return time.Time{}, nil
+}
+
 // RetrySemanticTask requeues or dead-letters a leased semantic task.
 func (s *Store) RetrySemanticTask(ctx context.Context, taskID, receipt string, retryAt time.Time, lastErr string) (err error) {
 	start := time.Now()
