@@ -31,7 +31,7 @@ IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
 LINT_TIMEOUT ?= 10m
 TEST_P ?=
 
-.PHONY: mod test test-podman fmt lint install-lint build build-server build-cli build-cli-release run-server-local docker-build
+.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-cli build-cli-release run-server-local docker-build
 
 mod:
 	$(GO) mod tidy
@@ -52,6 +52,9 @@ test:
 		source ./scripts/test-podman.sh; \
 	fi; \
 	$(GO) test $$test_p_flag -v ./...
+
+test-failpoint:
+	./scripts/run_failpoint_tests.py
 
 fmt:
 	$(MAKE) install-lint
