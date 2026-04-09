@@ -22,35 +22,36 @@ import (
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
+	"github.com/mem9-ai/dat9/pkg/tidbcloud"
 	"github.com/mem9-ai/dat9/pkg/traceid"
 	"go.uber.org/zap"
 )
 
 type Config struct {
-	Meta             *meta.Store
-	Pool             *tenant.Pool
-	Provisioner      tenant.Provisioner
-	TokenSecret      []byte
-	Backend          *backend.Dat9Backend
-	LocalS3          *s3client.LocalS3Client
-	S3Dir            string
-	MaxUploadBytes   int64
-	Logger           *zap.Logger
-	SemanticEmbedder embedding.Client
-	SemanticWorkers  SemanticWorkerOptions
+	Meta         *meta.Store
+	Pool         *tenant.Pool
+	Provisioner  tenant.Provisioner
+	TokenSecret       []byte
+	Backend           *backend.Dat9Backend
+	LocalS3           *s3client.LocalS3Client
+	S3Dir             string
+	MaxUploadBytes    int64
+	Logger            *zap.Logger
+	SemanticEmbedder  embedding.Client
+	SemanticWorkers   SemanticWorkerOptions
 }
 
 type Server struct {
-	fallback       *backend.Dat9Backend
-	meta           *meta.Store
-	pool           *tenant.Pool
-	provisioner    tenant.Provisioner
-	tokenSecret    []byte
-	maxUploadBytes int64
-	metrics        *serverMetrics
-	logger         *zap.Logger
-	mux            *http.ServeMux
-	semanticWorker *semanticWorkerManager
+	fallback          *backend.Dat9Backend
+	meta              *meta.Store
+	pool              *tenant.Pool
+	provisioner       tenant.Provisioner
+	tokenSecret       []byte
+	maxUploadBytes    int64
+	metrics           *serverMetrics
+	logger            *zap.Logger
+	mux               *http.ServeMux
+	semanticWorker    *semanticWorkerManager
 }
 
 var (
@@ -1389,14 +1390,31 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "provisioning not enabled")
 		return
 	}
+
+	// Detect tidbcloud-native provision via headers.
+	target, err := tidbcloud.ParseHeaders(r)
+	if err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_bad_tidbcloud_header", "error", err)...)
+		metricEvent(r.Context(), "tenant_provision", "result", "error")
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if target != nil {
+		s.handleNativeProvision(w, r, target)
+		return
+	}
+
 	if s.provisioner == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provisioner_not_configured")...)
 		metricEvent(r.Context(), "tenant_provision", "result", "error")
 		errJSON(w, http.StatusNotFound, "provisioner not configured")
 		return
 	}
+
+	// Reject tidbcloud headers on non-native providers (should not reach here
+	// since target == nil, but guard against future changes).
 	provider := s.provisioner.ProviderType()
-	provider, err := tenant.NormalizeProvider(provider)
+	provider, err = tenant.NormalizeProvider(provider)
 	if err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_provider_invalid", "provider", provider, "error", err)...)
 		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")

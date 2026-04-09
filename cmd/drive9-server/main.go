@@ -23,8 +23,16 @@ import (
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/db9"
 	"github.com/mem9-ai/dat9/pkg/tenant/starter"
+	"github.com/mem9-ai/dat9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/dat9/pkg/tenant/tidbzero"
+	"github.com/mem9-ai/dat9/pkg/tidbcloud"
+	accountpb "github.com/tidbcloud/account/idl/pbgen/proto/account"
+	serverlessv1 "github.com/tidbcloud/tidb-management-service/api/spec/global/serverless/v1"
+	zerov1beta1 "github.com/tidbcloud/tidb-management-service/api/spec/tidb_cloud_open_api/zero/v1beta1"
+	mgmtv1 "github.com/tidbcloud/tidb-management-service/api/spec/tidb_mgmt_service/v1"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 const (
@@ -120,6 +128,8 @@ func main() {
 		provisioner, provisionerErr = starter.NewProvisionerFromEnv()
 	case tenant.ProviderDB9:
 		provisioner, provisionerErr = db9.NewProvisionerFromEnv()
+	case tenant.ProviderTiDBCloudNative:
+		// tidbcloud-native is wired below after the encryptor is created.
 	}
 	if provisionerErr != nil {
 		logger.Warn(context.Background(), "provisioner_not_configured", zap.String("provider", providerType), zap.Error(provisionerErr))
@@ -162,6 +172,54 @@ func main() {
 			BackendOptions: backendOptions,
 		}, enc)
 		defer pool.Close()
+
+		if providerType == tenant.ProviderTiDBCloudNative {
+			// Three gRPC targets:
+			//   tidb-mgmt-service          → ClusterService (ListClusters) + ZeroInstanceService
+			//   serverless-global-service   → ServerlessService (GetEncryptedCloudAdminPwd)
+			//   account-provider-grpc       → AccountAPIService (VerifyUserOrgAndProjects)
+			mgmtAddr := os.Getenv("DRIVE9_TIDBCLOUD_MGMT_ADDR")
+			if mgmtAddr == "" {
+				die(fmt.Errorf("DRIVE9_TIDBCLOUD_MGMT_ADDR is required for tidbcloud-native provider"))
+			}
+			serverlessAddr := os.Getenv("DRIVE9_TIDBCLOUD_SERVERLESS_GLOBAL_ADDR")
+			if serverlessAddr == "" {
+				die(fmt.Errorf("DRIVE9_TIDBCLOUD_SERVERLESS_GLOBAL_ADDR is required for tidbcloud-native provider"))
+			}
+			accountAddr := os.Getenv("DRIVE9_TIDBCLOUD_ACCOUNT_ADDR")
+			if accountAddr == "" {
+				die(fmt.Errorf("DRIVE9_TIDBCLOUD_ACCOUNT_ADDR is required for tidbcloud-native provider"))
+			}
+
+			tlsCreds := credentials.NewTLS(nil)
+			mgmtConn, err := grpc.NewClient(mgmtAddr, grpc.WithTransportCredentials(tlsCreds))
+			if err != nil {
+				die(fmt.Errorf("dial tidb-mgmt-service %s: %w", mgmtAddr, err))
+			}
+			serverlessConn, err := grpc.NewClient(serverlessAddr, grpc.WithTransportCredentials(tlsCreds))
+			if err != nil {
+				die(fmt.Errorf("dial serverless-global-service %s: %w", serverlessAddr, err))
+			}
+			accountConn, err := grpc.NewClient(accountAddr, grpc.WithTransportCredentials(tlsCreds))
+			if err != nil {
+				die(fmt.Errorf("dial account-provider-grpc %s: %w", accountAddr, err))
+			}
+
+			globalClient := tidbcloud.NewGRPCGlobalClient(
+				mgmtv1.NewClusterServiceClient(mgmtConn),
+				serverlessv1.NewServerlessServiceClient(serverlessConn),
+				zerov1beta1.NewZeroInstanceServiceClient(mgmtConn),
+			)
+			accountClient := tidbcloud.NewGRPCAccountClient(
+				accountpb.NewAccountAPIServiceClient(accountConn),
+			)
+			provisioner = tidbcloudnative.NewProvisioner(globalClient, accountClient, enc)
+			logger.Info(context.Background(), "provisioner_configured",
+				zap.String("provider", providerType),
+				zap.String("mgmt_addr", mgmtAddr),
+				zap.String("serverless_addr", serverlessAddr),
+				zap.String("account_addr", accountAddr))
+		}
 	}
 
 	die(server.NewWithConfig(server.Config{
