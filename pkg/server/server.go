@@ -431,10 +431,15 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		Name  string `json:"name"`
 		Size  int64  `json:"size"`
 		IsDir bool   `json:"isDir"`
+		Mtime int64  `json:"mtime,omitempty"`
 	}
 	out := make([]entry, 0, len(entries))
 	for _, e := range entries {
-		out = append(out, entry{Name: e.Name, Size: e.Size, IsDir: e.IsDir})
+		var mtime int64
+		if !e.ModTime.IsZero() {
+			mtime = e.ModTime.Unix()
+		}
+		out = append(out, entry{Name: e.Name, Size: e.Size, IsDir: e.IsDir, Mtime: mtime})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"entries": out})
@@ -670,6 +675,13 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	w.Header().Set("X-Dat9-IsDir", fmt.Sprintf("%v", nf.Node.IsDirectory))
 	if nf.File != nil {
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(nf.File.Revision, 10))
+		if nf.File.ConfirmedAt != nil {
+			w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(nf.File.ConfirmedAt.Unix(), 10))
+		} else {
+			w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(nf.File.CreatedAt.Unix(), 10))
+		}
+	} else {
+		w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(nf.Node.CreatedAt.Unix(), 10))
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_ok", "path", path, "is_dir", nf.Node.IsDirectory)...)
 	w.WriteHeader(http.StatusOK)

@@ -4,13 +4,16 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Client is the dat9 HTTP client.
@@ -36,6 +39,40 @@ func New(baseURL, apiKey string) *Client {
 	}
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 16
+
+	// Custom DialContext: fall back to public DNS (8.8.8.8, 1.1.1.1) when the
+	// system resolver fails. Fixes DNS on Termux and minimal containers that
+	// lack /etc/resolv.conf.
+	baseDialer := &net.Dialer{Timeout: 10 * time.Second}
+	fallbackResolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			// Try Google DNS first, then Cloudflare.
+			conn, err := d.DialContext(ctx, "udp", "8.8.8.8:53")
+			if err != nil {
+				conn, err = d.DialContext(ctx, "udp", "1.1.1.1:53")
+			}
+			return conn, err
+		},
+	}
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Try system resolver first.
+		conn, err := baseDialer.DialContext(ctx, network, addr)
+		if err == nil {
+			return conn, nil
+		}
+		// System DNS failed — resolve with fallback DNS and retry.
+		host, port, splitErr := net.SplitHostPort(addr)
+		if splitErr != nil {
+			return nil, err // return original error
+		}
+		ips, resolveErr := fallbackResolver.LookupHost(ctx, host)
+		if resolveErr != nil || len(ips) == 0 {
+			return nil, err // return original dial error
+		}
+		return baseDialer.DialContext(ctx, network, net.JoinHostPort(ips[0], port))
+	}
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
@@ -59,6 +96,7 @@ type FileInfo struct {
 	Name  string `json:"name"`
 	Size  int64  `json:"size"`
 	IsDir bool   `json:"isDir"`
+	Mtime int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
 }
 
 // StatResult represents file metadata from HEAD.
@@ -66,6 +104,7 @@ type StatResult struct {
 	Size     int64
 	IsDir    bool
 	Revision int64
+	Mtime    time.Time
 }
 
 func (c *Client) url(path string) string {
@@ -175,6 +214,11 @@ func (c *Client) Stat(path string) (*StatResult, error) {
 	}
 	if rev := resp.Header.Get("X-Dat9-Revision"); rev != "" {
 		s.Revision, _ = strconv.ParseInt(rev, 10, 64)
+	}
+	if mt := resp.Header.Get("X-Dat9-Mtime"); mt != "" {
+		if sec, err := strconv.ParseInt(mt, 10, 64); err == nil {
+			s.Mtime = time.Unix(sec, 0)
+		}
 	}
 	return s, nil
 }

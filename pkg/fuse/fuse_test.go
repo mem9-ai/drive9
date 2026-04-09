@@ -1178,3 +1178,102 @@ func TestHttpToFuseStatus(t *testing.T) {
 	}
 	_ = tests // compile check — errno values vary by platform
 }
+
+// ---------------------------------------------------------------------------
+// FlushDebouncer tests
+// ---------------------------------------------------------------------------
+
+func TestFlushDebouncer_ScheduleAndFire(t *testing.T) {
+	d := newFlushDebouncer(50 * time.Millisecond)
+	done := make(chan string, 1)
+	d.Schedule("/a", func() { done <- "/a" })
+
+	select {
+	case p := <-done:
+		if p != "/a" {
+			t.Fatalf("got %q, want /a", p)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("debounce did not fire within 1s")
+	}
+}
+
+func TestFlushDebouncer_CoalescesRapidSchedules(t *testing.T) {
+	d := newFlushDebouncer(100 * time.Millisecond)
+	callCount := 0
+	var lastVal int
+	for i := 0; i < 5; i++ {
+		v := i
+		d.Schedule("/a", func() {
+			callCount++
+			lastVal = v
+		})
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Wait for the debounce to fire
+	time.Sleep(200 * time.Millisecond)
+
+	if callCount != 1 {
+		t.Fatalf("callCount = %d, want 1 (coalesced)", callCount)
+	}
+	if lastVal != 4 {
+		t.Fatalf("lastVal = %d, want 4 (latest schedule)", lastVal)
+	}
+}
+
+func TestFlushDebouncer_Cancel(t *testing.T) {
+	d := newFlushDebouncer(100 * time.Millisecond)
+	called := false
+	d.Schedule("/a", func() { called = true })
+	d.Cancel("/a")
+
+	time.Sleep(200 * time.Millisecond)
+	if called {
+		t.Fatal("upload should not have been called after Cancel")
+	}
+}
+
+func TestFlushDebouncer_FlushAll(t *testing.T) {
+	d := newFlushDebouncer(10 * time.Second) // long delay — won't fire naturally
+	results := make(map[string]bool)
+	d.Schedule("/a", func() { results["/a"] = true })
+	d.Schedule("/b", func() { results["/b"] = true })
+
+	d.FlushAll()
+
+	if !results["/a"] || !results["/b"] {
+		t.Fatalf("FlushAll should have called both uploads: %v", results)
+	}
+}
+
+func TestFlushDebouncer_IndependentPaths(t *testing.T) {
+	d := newFlushDebouncer(50 * time.Millisecond)
+	done := make(chan string, 2)
+	d.Schedule("/a", func() { done <- "/a" })
+	d.Schedule("/b", func() { done <- "/b" })
+
+	got := make(map[string]bool)
+	for i := 0; i < 2; i++ {
+		select {
+		case p := <-done:
+			got[p] = true
+		case <-time.After(time.Second):
+			t.Fatal("timeout waiting for debounce")
+		}
+	}
+	if !got["/a"] || !got["/b"] {
+		t.Fatalf("expected both paths, got %v", got)
+	}
+}
+
+func TestInodeToPath_UpdateMtime(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.Lookup("/f", false, 10, time.Now())
+	newTime := time.Date(2025, 3, 15, 0, 0, 0, 0, time.UTC)
+	m.UpdateMtime(ino, newTime)
+	entry, _ := m.GetEntry(ino)
+	if !entry.Mtime.Equal(newTime) {
+		t.Fatalf("UpdateMtime: got %v, want %v", entry.Mtime, newTime)
+	}
+}

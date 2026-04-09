@@ -34,6 +34,7 @@ type Dat9FS struct {
 	uid         uint32
 	gid         uint32
 	opts        *MountOptions
+	debouncer   *flushDebouncer
 
 	// server is the go-fuse server, set during Init(). Used to send
 	// kernel cache invalidation notifications (EntryNotify, InodeNotify)
@@ -60,6 +61,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		uid:           uint32(os.Getuid()),
 		gid:           uint32(os.Getgid()),
 		opts:          opts,
+		debouncer:     newFlushDebouncer(opts.FlushDebounce),
 	}
 }
 
@@ -299,7 +301,11 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 			if item.Name != name {
 				continue
 			}
-			ino := fs.inodes.Lookup(childP, item.IsDir, item.Size, time.Now())
+			mtime := time.Now()
+			if item.Mtime > 0 {
+				mtime = time.Unix(item.Mtime, 0)
+			}
+			ino := fs.inodes.Lookup(childP, item.IsDir, item.Size, mtime)
 			entry, ok := fs.inodes.GetEntry(ino)
 			if !ok {
 				return gofuse.EIO
@@ -310,7 +316,11 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		return gofuse.ENOENT
 	}
 
-	ino := fs.inodes.Lookup(childP, stat.IsDir, stat.Size, time.Now())
+	mtime := time.Now()
+	if !stat.Mtime.IsZero() {
+		mtime = stat.Mtime
+	}
+	ino := fs.inodes.Lookup(childP, stat.IsDir, stat.Size, mtime)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
@@ -343,6 +353,10 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 			entry.Size = stat.Size
 			entry.IsDir = stat.IsDir
 			fs.inodes.UpdateSize(input.NodeId, stat.Size)
+			if !stat.Mtime.IsZero() {
+				entry.Mtime = stat.Mtime
+				fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+			}
 		}
 	}
 
@@ -355,6 +369,12 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
+	}
+
+	// Handle mtime updates
+	if mtime, ok := input.GetMTime(); ok {
+		entry.Mtime = mtime
+		fs.inodes.UpdateMtime(input.NodeId, mtime)
 	}
 
 	// Handle truncate
@@ -608,10 +628,15 @@ func (fs *Dat9FS) listDir(dirPath string) ([]DirEntry, error) {
 	// Store in dir cache
 	cached := make([]CachedFileInfo, len(items))
 	for i, item := range items {
+		var mtime time.Time
+		if item.Mtime > 0 {
+			mtime = time.Unix(item.Mtime, 0)
+		}
 		cached[i] = CachedFileInfo{
 			Name:  item.Name,
 			Size:  item.Size,
 			IsDir: item.IsDir,
+			Mtime: mtime,
 		}
 	}
 	fs.dirCache.Put(dirPath, cached)
@@ -629,7 +654,11 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 			childP = dirPath + "/" + item.Name
 		}
 
-		ino := fs.inodes.EnsureInode(childP, item.IsDir, item.Size, time.Now())
+		mtime := item.Mtime
+		if mtime.IsZero() {
+			mtime = time.Now()
+		}
+		ino := fs.inodes.EnsureInode(childP, item.IsDir, item.Size, mtime)
 
 		var mode uint32
 		if item.IsDir {
@@ -973,7 +1002,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.St
 	fh.Lock()
 	defer fh.Unlock()
 
-	return fs.flushHandle(fh)
+	return fs.flushHandleDebounced(fh, false)
 }
 
 func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.Status {
@@ -985,12 +1014,15 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.St
 	fh.Lock()
 	defer fh.Unlock()
 
-	return fs.flushHandle(fh)
+	return fs.flushHandleDebounced(fh, true)
 }
 
 func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
+		// Cancel any pending debounce for this path — Release always flushes immediately.
+		fs.debouncer.Cancel(fh.Path)
+
 		fh.Lock()
 		st := fs.flushHandle(fh)
 		streamer := fh.Streamer
@@ -1012,6 +1044,54 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		}
 	}
 	fs.fileHandles.Delete(input.Fh)
+}
+
+// flushHandleDebounced wraps flushHandle with optional debouncing for small files.
+// When force is false and the file is small, the upload may be deferred.
+// Caller must hold fh.mu.
+func (fs *Dat9FS) flushHandleDebounced(fh *FileHandle, force bool) gofuse.Status {
+	if force || fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
+		return fs.flushHandle(fh)
+	}
+
+	size := fh.Dirty.Size()
+	if size >= smallFileThreshold || fs.debouncer.delay <= 0 {
+		return fs.flushHandle(fh)
+	}
+
+	// Small file: schedule a deferred upload.
+	// Snapshot the data so the deferred upload sees a consistent copy.
+	data := make([]byte, len(fh.Dirty.Bytes()))
+	copy(data, fh.Dirty.Bytes())
+	filePath := fh.Path
+	ino := fh.Ino
+	handle := fh // capture for goroutine
+
+	fs.debouncer.Schedule(filePath, func() {
+		if err := fs.client.Write(filePath, data); err != nil {
+			log.Printf("debounced flush failed for %s: %v", filePath, err)
+			return
+		}
+		// Clear dirty under fh.mu after successful upload so that a
+		// subsequent Release → flushHandle does not re-upload the same data.
+		handle.Lock()
+		if handle.Dirty != nil {
+			handle.Dirty.ClearDirty()
+		}
+		handle.Unlock()
+		fs.readCache.Invalidate(filePath)
+		fs.dirCache.Invalidate(parentDir(filePath))
+		fs.inodes.UpdateSize(ino, int64(len(data)))
+		fs.notifyInode(ino)
+		parentIno, _ := fs.inodes.GetInode(parentDir(filePath))
+		fs.notifyInode(parentIno)
+	})
+
+	// Do NOT ClearDirty here — the buffer stays dirty as a safety net.
+	// If Release fires before the debouncer, it cancels the timer and
+	// flushHandle will upload from the still-dirty buffer.
+	// If the debouncer fires first, its callback clears dirty state.
+	return gofuse.OK
 }
 
 // flushHandle uploads buffered data to the server. Caller must hold fh.mu.
@@ -1180,8 +1260,12 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 	return gofuse.OK
 }
 
-// FlushAll flushes all open file handles. Used during graceful shutdown.
+// FlushAll flushes all open file handles and drains pending debounced uploads.
+// Used during graceful shutdown.
 func (fs *Dat9FS) FlushAll() {
+	// Drain all pending debounced uploads first.
+	fs.debouncer.FlushAll()
+
 	// Snapshot handles outside the lock to avoid deadlocking with
 	// concurrent FUSE operations that need HandleTable access.
 	type entry struct {
@@ -1197,6 +1281,38 @@ func (fs *Dat9FS) FlushAll() {
 		fs.flushHandle(e.fh)
 		e.fh.Unlock()
 	}
+}
+
+// StatFs reports a generous virtual capacity so that apps (Obsidian, Finder)
+// see free space and allow writes. The actual limit is server-side.
+func (fs *Dat9FS) StatFs(cancel <-chan struct{}, header *gofuse.InHeader, out *gofuse.StatfsOut) gofuse.Status {
+	const blockSize = 4096
+	const totalBlocks = (1 << 40) / blockSize // 1 TiB
+	out.Blocks = totalBlocks
+	out.Bfree = totalBlocks - 1
+	out.Bavail = totalBlocks - 1
+	out.Bsize = blockSize
+	out.NameLen = 255
+	out.Frsize = blockSize
+	return gofuse.OK
+}
+
+// --- Xattr stubs (macOS Finder/Spotlight compatibility) ----------------------
+
+func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string, dest []byte) (uint32, gofuse.Status) {
+	return 0, gofuse.ENOATTR
+}
+
+func (fs *Dat9FS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, dest []byte) (uint32, gofuse.Status) {
+	return 0, gofuse.OK
+}
+
+func (fs *Dat9FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, attr string, data []byte) gofuse.Status {
+	return gofuse.OK
+}
+
+func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string) gofuse.Status {
+	return gofuse.ENOATTR
 }
 
 func (fs *Dat9FS) String() string {
