@@ -9,9 +9,24 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Sync upstream via GitHub API
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Sync upstream
         run: |
-          gh api -X POST /repos/${{ github.repository }}/merge-upstream \
-            -f branch=main
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/mem9-ai/drive9.git || true
+          git fetch upstream
+          git checkout main
+          if ! git merge upstream/main --no-edit -X theirs; then
+            git diff --name-only --diff-filter=U | while read f; do
+              git checkout upstream/main -- "$f" 2>/dev/null || git rm "$f" 2>/dev/null || true
+            done
+            git add -A
+            git commit --no-edit
+          fi
+          git push origin main
