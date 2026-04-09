@@ -9,9 +9,15 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      GOPRIVATE: github.com/tidbcloud/*
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Configure private Go modules
+        run: |
+          git config --global url."https://${{ secrets.GH_PAT }}@github.com/tidbcloud/".insteadOf "https://github.com/tidbcloud/"
 
       - name: Checkout agfs dependency
         run: |
