@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/tidbcloud"
@@ -169,5 +170,98 @@ func TestProviderType(t *testing.T) {
 	p := NewProvisioner(nil, nil, nil)
 	if got := p.ProviderType(); got != "tidbcloud-native" {
 		t.Fatalf("got %s, want tidbcloud-native", got)
+	}
+}
+
+// --- mock AccountClient ---
+
+type mockAccountClientForProvisioner struct {
+	authorizeFn func(ctx context.Context, r *http.Request, clusterID string) (uint64, error)
+}
+
+func (m *mockAccountClientForProvisioner) Authorize(ctx context.Context, r *http.Request, clusterID string) (uint64, error) {
+	return m.authorizeFn(ctx, r, clusterID)
+}
+
+func TestAuthorize_OrgMatch(t *testing.T) {
+	account := &mockAccountClientForProvisioner{
+		authorizeFn: func(_ context.Context, _ *http.Request, _ string) (uint64, error) {
+			return 100, nil
+		},
+	}
+	global := &mockGlobalClient{
+		getClusterInfoFn: func(_ context.Context, clusterID string) (*tidbcloud.ClusterInfo, error) {
+			return &tidbcloud.ClusterInfo{ClusterID: clusterID, OrgID: 100, Host: "h", Port: 4000, Username: "u"}, nil
+		},
+	}
+
+	p := NewProvisioner(global, account, nil)
+	r, _ := http.NewRequest("GET", "/", nil)
+	if err := p.Authorize(context.Background(), r, "12345"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestAuthorize_OrgMismatch(t *testing.T) {
+	account := &mockAccountClientForProvisioner{
+		authorizeFn: func(_ context.Context, _ *http.Request, _ string) (uint64, error) {
+			return 100, nil
+		},
+	}
+	global := &mockGlobalClient{
+		getClusterInfoFn: func(_ context.Context, clusterID string) (*tidbcloud.ClusterInfo, error) {
+			return &tidbcloud.ClusterInfo{ClusterID: clusterID, OrgID: 999, Host: "h", Port: 4000, Username: "u"}, nil
+		},
+	}
+
+	p := NewProvisioner(global, account, nil)
+	r, _ := http.NewRequest("GET", "/", nil)
+	err := p.Authorize(context.Background(), r, "12345")
+	if err == nil {
+		t.Fatal("expected error for org mismatch")
+	}
+	if !errors.Is(err, tidbcloud.ErrAuthForbidden) {
+		t.Fatalf("expected ErrAuthForbidden, got: %v", err)
+	}
+}
+
+func TestAuthorize_AccountError(t *testing.T) {
+	account := &mockAccountClientForProvisioner{
+		authorizeFn: func(_ context.Context, _ *http.Request, _ string) (uint64, error) {
+			return 0, fmt.Errorf("%w: bad token", tidbcloud.ErrAuthMissing)
+		},
+	}
+
+	p := NewProvisioner(nil, account, nil)
+	r, _ := http.NewRequest("GET", "/", nil)
+	err := p.Authorize(context.Background(), r, "12345")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, tidbcloud.ErrAuthMissing) {
+		t.Fatalf("expected ErrAuthMissing, got: %v", err)
+	}
+}
+
+func TestAuthorize_ClusterNotFound(t *testing.T) {
+	account := &mockAccountClientForProvisioner{
+		authorizeFn: func(_ context.Context, _ *http.Request, _ string) (uint64, error) {
+			return 100, nil
+		},
+	}
+	global := &mockGlobalClient{
+		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
+			return nil, fmt.Errorf("get cluster: %w", tidbcloud.ErrClusterNotFound)
+		},
+	}
+
+	p := NewProvisioner(global, account, nil)
+	r, _ := http.NewRequest("GET", "/", nil)
+	err := p.Authorize(context.Background(), r, "12345")
+	if err == nil {
+		t.Fatal("expected error for cluster not found")
+	}
+	if !errors.Is(err, tidbcloud.ErrClusterNotFound) {
+		t.Fatalf("expected ErrClusterNotFound, got: %v", err)
 	}
 }

@@ -94,6 +94,7 @@ func (g *grpcGlobalClient) GetClusterInfo(ctx context.Context, clusterID string)
 
 	return &ClusterInfo{
 		ClusterID: clusterID,
+		OrgID:     clusters[0].GetOrganizationId(),
 		Host:      pub.GetHost(),
 		Port:      int(pub.GetPort()),
 		Username:  "cloud_admin",

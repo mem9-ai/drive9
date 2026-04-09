@@ -96,7 +96,20 @@ func (p *Provisioner) VerifyZeroInstance(ctx context.Context, instanceID string)
 	return nil
 }
 
-// Authorize delegates authorization to the account service.
+// Authorize delegates authentication to the account service, then verifies that
+// the cluster belongs to the same organization as the authenticated user.
 func (p *Provisioner) Authorize(ctx context.Context, r *http.Request, clusterID string) error {
-	return p.account.Authorize(ctx, r, clusterID)
+	orgID, err := p.account.Authorize(ctx, r, clusterID)
+	if err != nil {
+		return err
+	}
+
+	info, err := p.global.GetClusterInfo(ctx, clusterID)
+	if err != nil {
+		return fmt.Errorf("verify cluster org: %w", err)
+	}
+	if info.OrgID != orgID {
+		return fmt.Errorf("%w: cluster %s does not belong to org %d", tidbcloud.ErrAuthForbidden, clusterID, orgID)
+	}
+	return nil
 }

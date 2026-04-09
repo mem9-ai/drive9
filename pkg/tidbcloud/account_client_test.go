@@ -66,8 +66,12 @@ func TestAuthorize_OAuthToken_Success(t *testing.T) {
 	r, _ := http.NewRequest("GET", "/", nil)
 	r.Header.Set("Authorization", "Bearer valid-token")
 
-	if err := client.Authorize(context.Background(), r, "cluster-1"); err != nil {
+	orgID, err := client.Authorize(context.Background(), r, "cluster-1")
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if orgID != 200 {
+		t.Fatalf("got orgID %d, want 200", orgID)
 	}
 }
 
@@ -97,8 +101,12 @@ func TestAuthorize_APIKey_Success(t *testing.T) {
 	r.Header.Set("X-Auth-Method", "digest")
 	r.Header.Set("X-Auth-Content", `{"public_key":"my-access-key"}`)
 
-	if err := client.Authorize(context.Background(), r, "cluster-1"); err != nil {
+	orgID, err := client.Authorize(context.Background(), r, "cluster-1")
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if orgID != 400 {
+		t.Fatalf("got orgID %d, want 400", orgID)
 	}
 }
 
@@ -106,7 +114,7 @@ func TestAuthorize_NoCredentials(t *testing.T) {
 	client := NewGRPCAccountClient(&mockAccountClient{})
 	r, _ := http.NewRequest("GET", "/", nil)
 
-	err := client.Authorize(context.Background(), r, "cluster-1")
+	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
 		t.Fatal("expected error for missing credentials")
 	}
@@ -128,7 +136,7 @@ func TestAuthorize_OAuthToken_InactiveUser(t *testing.T) {
 	r, _ := http.NewRequest("GET", "/", nil)
 	r.Header.Set("Authorization", "Bearer some-token")
 
-	err := client.Authorize(context.Background(), r, "cluster-1")
+	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
 		t.Fatal("expected error for inactive user")
 	}
@@ -153,7 +161,7 @@ func TestAuthorize_OAuthToken_NoOrgs(t *testing.T) {
 	r, _ := http.NewRequest("GET", "/", nil)
 	r.Header.Set("Authorization", "Bearer some-token")
 
-	err := client.Authorize(context.Background(), r, "cluster-1")
+	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
 		t.Fatal("expected error for user with no orgs")
 	}
@@ -183,7 +191,7 @@ func TestAuthorize_OAuthToken_VerifyFails(t *testing.T) {
 	r, _ := http.NewRequest("GET", "/", nil)
 	r.Header.Set("Authorization", "Bearer some-token")
 
-	err := client.Authorize(context.Background(), r, "cluster-1")
+	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
 		t.Fatal("expected error for failed verify")
 	}
@@ -207,7 +215,7 @@ func TestAuthorize_APIKey_NoOrgScope(t *testing.T) {
 	r.Header.Set("X-Auth-Method", "basic")
 	r.Header.Set("X-Auth-Content", `{"public_key":"my-key"}`)
 
-	err := client.Authorize(context.Background(), r, "cluster-1")
+	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
 		t.Fatal("expected error for API key with no org scope")
 	}
@@ -222,7 +230,7 @@ func TestAuthorize_APIKey_EmptyContent(t *testing.T) {
 	r.Header.Set("X-Auth-Method", "digest")
 	// No X-Auth-Content header
 
-	err := client.Authorize(context.Background(), r, "cluster-1")
+	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
 		t.Fatal("expected error for empty auth content")
 	}
@@ -237,7 +245,7 @@ func TestAuthorize_APIKey_InvalidJSON(t *testing.T) {
 	r.Header.Set("X-Auth-Method", "digest")
 	r.Header.Set("X-Auth-Content", "not-json")
 
-	err := client.Authorize(context.Background(), r, "cluster-1")
+	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}

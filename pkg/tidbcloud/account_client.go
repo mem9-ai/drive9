@@ -15,10 +15,10 @@ import (
 // AccountClient abstracts calls to TiDB Cloud Account service for authorization.
 type AccountClient interface {
 	// Authorize verifies the request's auth context has permission to operate
-	// the given cluster. Returns nil on success.
+	// the given cluster. Returns the authenticated org ID on success.
 	// Returns ErrAuthMissing if no credentials are found in the request.
 	// Returns ErrAuthForbidden if credentials are valid but lack permission.
-	Authorize(ctx context.Context, r *http.Request, clusterID string) error
+	Authorize(ctx context.Context, r *http.Request, clusterID string) (orgID uint64, err error)
 }
 
 // ErrAuthMissing indicates the request lacks valid authentication credentials.
@@ -48,10 +48,10 @@ func NewGRPCAccountClient(account accountpb.AccountAPIServiceClient) AccountClie
 	return &grpcAccountClient{account: account}
 }
 
-func (c *grpcAccountClient) Authorize(ctx context.Context, r *http.Request, _ string) error {
+func (c *grpcAccountClient) Authorize(ctx context.Context, r *http.Request, _ string) (uint64, error) {
 	identity, err := c.authenticate(ctx, r)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// Verify the user belongs to the org.
@@ -60,12 +60,12 @@ func (c *grpcAccountClient) Authorize(ctx context.Context, r *http.Request, _ st
 		OrgId:  identity.orgID,
 	})
 	if err != nil {
-		return fmt.Errorf("verify user org: %w", err)
+		return 0, fmt.Errorf("verify user org: %w", err)
 	}
 	if !resp.GetResult() {
-		return fmt.Errorf("%w: user %d not authorized for org %d", ErrAuthForbidden, identity.userID, identity.orgID)
+		return 0, fmt.Errorf("%w: user %d not authorized for org %d", ErrAuthForbidden, identity.userID, identity.orgID)
 	}
-	return nil
+	return identity.orgID, nil
 }
 
 // authenticate extracts credentials from the request and resolves identity via

@@ -8,6 +8,7 @@ import (
 // ClusterInfo holds cluster metadata returned from the global server.
 type ClusterInfo struct {
 	ClusterID string
+	OrgID     uint64
 	Host      string
 	Port      int
 	Username  string
