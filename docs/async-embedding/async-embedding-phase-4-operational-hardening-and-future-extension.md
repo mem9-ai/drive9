@@ -1,4 +1,4 @@
-# Proposal: dat9-2 Async Embedding Phase 4 Operational Hardening and Future Extension
+# Proposal: drive9-2 Async Embedding Phase 4 Operational Hardening and Future Extension
 
 **Date**: 2026-03-31
 **Purpose**: Turn Phase D of `async-embedding-generation-proposal.md` into a review-ready proposal for production observability, dead-letter/queue-lag diagnosis, and safe extension of the durable semantic task substrate beyond `embed`.
@@ -19,7 +19,7 @@ The current repository already has the core Phase 3 execution path in place:
 
 - `pkg/server/semantic_worker.go` starts background workers, claims `embed` tasks, retries failures, and runs `RecoverExpiredSemanticTasks`
 - `pkg/datastore/semantic_tasks.go` provides durable task primitives such as `Enqueue`, `Claim`, `Ack`, `Retry`, and `RecoverExpired`
-- `pkg/backend/dat9.go` and `pkg/datastore/search.go` already make current-revision vectors queryable end to end
+- `pkg/backend/drive9.go` and `pkg/datastore/search.go` already make current-revision vectors queryable end to end
 
 The repository also already contains a generic process-wide metrics surface through `pkg/metrics/operations.go`:
 
@@ -342,11 +342,11 @@ No open questions are currently required for Phase 4 scope. Handler routing and 
 
 ## References
 
-- `dat9-2/docs/async-embedding/async-embedding-generation-proposal.md`
-- `dat9-2/docs/async-embedding/async-embedding-phase-3-worker-and-search-correctness.md`
-- `dat9-2/pkg/server/semantic_worker.go`
-- `dat9-2/pkg/semantic/task.go`
-- `dat9-2/pkg/datastore/semantic_tasks.go`
-- `dat9-2/pkg/backend/image_extract.go`
-- `dat9-2/pkg/backend/options.go`
-- `dat9-2/pkg/metrics/operations.go`
+- `drive9-2/docs/async-embedding/async-embedding-generation-proposal.md`
+- `drive9-2/docs/async-embedding/async-embedding-phase-3-worker-and-search-correctness.md`
+- `drive9-2/pkg/server/semantic_worker.go`
+- `drive9-2/pkg/semantic/task.go`
+- `drive9-2/pkg/datastore/semantic_tasks.go`
+- `drive9-2/pkg/backend/image_extract.go`
+- `drive9-2/pkg/backend/options.go`
+- `drive9-2/pkg/metrics/operations.go`

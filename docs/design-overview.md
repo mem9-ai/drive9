@@ -1,4 +1,4 @@
-# dat9: Agent-Native Data Infrastructure
+# drive9: Agent-Native Data Infrastructure
 
 **Status**: Proposal (Draft v2)
 **Date**: 2026-03-26
@@ -8,22 +8,22 @@
 
 ## 1. Overview
 
-dat9 is a unified data infrastructure for AI agents — a **network drive with built-in semantic search**. It presents a single filesystem-like interface for storing, retrieving, and querying data of any kind, while the underlying complexity (tiered storage, embedding, full-text indexing) is invisible to the user.
+drive9 is a unified data infrastructure for AI agents — a **network drive with built-in semantic search**. It presents a single filesystem-like interface for storing, retrieving, and querying data of any kind, while the underlying complexity (tiered storage, embedding, full-text indexing) is invisible to the user.
 
-An agent (or a human) interacts with dat9 the same way they interact with a local filesystem:
+An agent (or a human) interacts with drive9 the same way they interact with a local filesystem:
 
 ```bash
-dat9 cp ./dataset.tar /data/dataset.tar        # upload (auto: presigned URL for large files)
-dat9 cat /config/settings.json                  # read
-dat9 ls /data/                                  # list
-dat9 cp /data/a.bin /shared/a.bin               # zero-copy link (no re-upload)
-dat9 mv /data/old.bin /data/new.bin             # rename (zero storage cost)
-dat9 search "training data for image classification"  # semantic search
-dat9 sh                                         # interactive shell
+drive9 cp ./dataset.tar /data/dataset.tar        # upload (auto: presigned URL for large files)
+drive9 cat /config/settings.json                  # read
+drive9 ls /data/                                  # list
+drive9 cp /data/a.bin /shared/a.bin               # zero-copy link (no re-upload)
+drive9 mv /data/old.bin /data/new.bin             # rename (zero storage cost)
+drive9 search "training data for image classification"  # semantic search
+drive9 sh                                         # interactive shell
 ```
 
 ```python
-client = Dat9("https://dat9.example.com", api_key="...")
+client = Drive9("https://drive9.example.com", api_key="...")
 client.write("/data/file.bin", open("local.bin", "rb"))
 client.read("/data/file.bin")
 client.search("training data")
@@ -31,7 +31,7 @@ client.search("training data")
 
 ### Core Insight: Build on db9, Not Around It
 
-Each dat9 tenant is backed by a [db9](https://db9.ai/) database. db9 already provides:
+Each drive9 tenant is backed by a [db9](https://db9.ai/) database. db9 already provides:
 
 - **fs9**: File storage in TiKV (16KB pages, up to 100MB per file)
 - **EMBED_TEXT()**: Auto-embedding as `GENERATED ALWAYS AS` columns
@@ -40,7 +40,7 @@ Each dat9 tenant is backed by a [db9](https://db9.ai/) database. db9 already pro
 - **CHUNK_TEXT()**: Markdown-aware document chunking
 - **Hybrid search**: FTS filter + vector ranking in one SQL query
 
-dat9 adds what db9 doesn't have: **large-file S3 direct upload**, **path-tree namespace (inode model)**, **tiered context (L0/L1/L2)**, **cross-tenant sharing**, and an **AGFS-compatible filesystem interface**.
+drive9 adds what db9 doesn't have: **large-file S3 direct upload**, **path-tree namespace (inode model)**, **tiered context (L0/L1/L2)**, **cross-tenant sharing**, and an **AGFS-compatible filesystem interface**.
 
 ### Problem Statement
 
@@ -60,7 +60,7 @@ dat9 adds what db9 doesn't have: **large-file S3 direct upload**, **path-tree na
 ### Design Principles
 
 1. **Users see only file operations** --- `cp`, `cat`, `ls`, `search`. All protocol complexity is hidden.
-2. **Leverage db9 native capabilities** --- embedding, FTS, vector search, chunking are db9 built-in. dat9 orchestrates, not reimplements.
+2. **Leverage db9 native capabilities** --- embedding, FTS, vector search, chunking are db9 built-in. drive9 orchestrates, not reimplements.
 3. **Tiered storage** --- Small files (< 50,000 bytes) in db9 (zero network overhead, instant search). Large files (>= 50,000 bytes) in S3 (presigned URL direct upload). One path namespace spanning both.
 4. **inode model** --- Paths and file entities are separate. One file can appear at multiple paths (zero-copy `cp`). `mv` is a metadata-only operation.
 5. **Import, don't fork** --- Built on [AGFS](https://github.com/c4pt0r/agfs)'s `FileSystem` interface and `MountableFS` routing layer.
@@ -74,18 +74,18 @@ dat9 adds what db9 doesn't have: **large-file S3 direct upload**, **path-tree na
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                          dat9 Server (Go)                             │
+│                          drive9 Server (Go)                             │
 │                                                                       │
 │  ┌─────────────────────────────────────────────────────────────────┐  │
 │  │                     MountableFS (AGFS)                           │  │
 │  │                radix-tree path → backend routing                 │  │
 │  │                                                                  │  │
-│  │   /          → Dat9Backend                                       │  │
+│  │   /          → Drive9Backend                                       │  │
 │  │   /mem/      → memfs (in-memory scratch)                         │  │
 │  └──────────┬──────────────────────────────────────────────────────┘  │
 │             │                                                         │
 │  ┌──────────▼──────────────────────────────────────────────────────┐  │
-│  │                       Dat9Backend                                │  │
+│  │                       Drive9Backend                                │  │
 │  │              (implements AGFS FileSystem)                         │  │
 │  │                                                                  │  │
 │  │  Write path:                                                     │  │
@@ -135,7 +135,7 @@ Small files benefit from db9's native embedding/FTS. Large files are too big to 
 
 ### Relationship with AGFS
 
-dat9's server imports AGFS as a Go module dependency (Apache 2.0).
+drive9's server imports AGFS as a Go module dependency (Apache 2.0).
 
 | AGFS Package | What We Use |
 |---|---|
@@ -151,16 +151,16 @@ import (
     "github.com/c4pt0r/agfs/agfs-server/pkg/plugin"
 )
 
-// Dat9Backend implements AGFS's FileSystem interface
-type Dat9Backend struct {
+// Drive9Backend implements AGFS's FileSystem interface
+type Drive9Backend struct {
     db9  *db9.Client    // tenant db9 (metadata + small file storage)
     s3   S3Client       // large file storage
 }
 
-func (b *Dat9Backend) Read(path string, offset, size int64) ([]byte, error) { ... }
-func (b *Dat9Backend) Write(path string, data []byte, offset int64, flags filesystem.WriteFlag) (int64, error) { ... }
-func (b *Dat9Backend) ReadDir(path string) ([]filesystem.FileInfo, error) { ... }
-func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) { ... }
+func (b *Drive9Backend) Read(path string, offset, size int64) ([]byte, error) { ... }
+func (b *Drive9Backend) Write(path string, data []byte, offset int64, flags filesystem.WriteFlag) (int64, error) { ... }
+func (b *Drive9Backend) ReadDir(path string) ([]filesystem.FileInfo, error) { ... }
+func (b *Drive9Backend) Stat(path string) (*filesystem.FileInfo, error) { ... }
 
 // Capability detection via type assertion (AGFS pattern)
 if cp, ok := backend.(filesystem.CapabilityProvider); ok {
@@ -170,7 +170,7 @@ if cp, ok := backend.(filesystem.CapabilityProvider); ok {
 
 // Mount it
 mfs := mountablefs.NewMountableFS(api.DefaultPoolConfig())
-mfs.Mount("/", &Dat9Plugin{backend: dat9backend})
+mfs.Mount("/", &Drive9Plugin{backend: drive9backend})
 mfs.Mount("/mem", memfsPlugin)
 ```
 
@@ -179,8 +179,8 @@ mfs.Mount("/mem", memfsPlugin)
 ```
     ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐
     │   CLI    │  │   SDK    │  │   MCP    │  │ FUSE (later) │
-    │ dat9 cp  │  │ Go/Py   │  │ Tools    │  │              │
-    │ dat9 sh  │  │          │  │          │  │              │
+    │ drive9 cp  │  │ Go/Py   │  │ Tools    │  │              │
+    │ drive9 sh  │  │          │  │          │  │              │
     └────┬─────┘  └────┬─────┘  └────┬─────┘  └──────┬───────┘
          └─────────────┼─────────────┘               │
                        │  (all go through SDK)        │
@@ -199,7 +199,7 @@ mfs.Mount("/mem", memfsPlugin)
 
 ### The Key Separation
 
-dat9 uses an **inode model** inspired by Unix: paths (directory entries) and file entities (inodes) are separate concerns.
+drive9 uses an **inode model** inspired by Unix: paths (directory entries) and file entities (inodes) are separate concerns.
 
 ```
                     file_nodes (dentry)              files (inode)
@@ -252,18 +252,18 @@ Small files are stored in db9 via `fs9_write('/blobs/<ulid>', content)`. Same UL
 
 ### Operation Mapping
 
-| dat9 operation | What happens |
+| drive9 operation | What happens |
 |---|---|
-| `dat9 ls /data/` | `SELECT name, is_directory, f.size_bytes FROM file_nodes fn LEFT JOIN files f ON fn.file_id = f.file_id WHERE fn.parent_path = '/data/'` |
-| `dat9 cat /data/a.txt` | `file_nodes → file_id → files.storage_type` → if db9: `fs9_read(storage_ref)` / if s3: `S3.GetObject(storage_ref)` |
-| `dat9 cp /a /b` (file) | `INSERT file_nodes(path='/b', file_id=same)` — zero-copy link, no storage copy |
-| `dat9 cp /a/ /b/` (dir) | Recursive: for each descendant of `/a/`, `INSERT file_nodes` with same `file_id` and rewritten path prefix. Zero storage cost, O(N) metadata INSERTs. |
-| `dat9 mv /a /b` (file) | `UPDATE file_nodes SET path='/b', parent_path=..., name=... WHERE path='/a'` — O(1) |
-| `dat9 mv /a/ /b/` (dir) | Batch prefix rewrite: UPDATE the directory node + all descendants' `path` and `parent_path`. O(N) metadata UPDATEs, zero storage cost. |
-| `dat9 rm /a` | `DELETE file_nodes WHERE path='/a'` → if refcount=0: mark file DELETED |
-| `dat9 rm -r /a/` | Recursive: `DELETE FROM file_nodes WHERE path = '/a/' OR path LIKE '/a/%'` → per-file refcount check → mark orphans DELETED |
-| `dat9 stat /a` | `SELECT fn.*, f.* FROM file_nodes fn JOIN files f ON ... WHERE fn.path='/a'` |
-| `dat9 search "query"` | `SELECT ... FROM files f JOIN file_nodes fn ON ... ORDER BY vec_embed_cosine_distance(f.vec, 'query') LIMIT k` |
+| `drive9 ls /data/` | `SELECT name, is_directory, f.size_bytes FROM file_nodes fn LEFT JOIN files f ON fn.file_id = f.file_id WHERE fn.parent_path = '/data/'` |
+| `drive9 cat /data/a.txt` | `file_nodes → file_id → files.storage_type` → if db9: `fs9_read(storage_ref)` / if s3: `S3.GetObject(storage_ref)` |
+| `drive9 cp /a /b` (file) | `INSERT file_nodes(path='/b', file_id=same)` — zero-copy link, no storage copy |
+| `drive9 cp /a/ /b/` (dir) | Recursive: for each descendant of `/a/`, `INSERT file_nodes` with same `file_id` and rewritten path prefix. Zero storage cost, O(N) metadata INSERTs. |
+| `drive9 mv /a /b` (file) | `UPDATE file_nodes SET path='/b', parent_path=..., name=... WHERE path='/a'` — O(1) |
+| `drive9 mv /a/ /b/` (dir) | Batch prefix rewrite: UPDATE the directory node + all descendants' `path` and `parent_path`. O(N) metadata UPDATEs, zero storage cost. |
+| `drive9 rm /a` | `DELETE file_nodes WHERE path='/a'` → if refcount=0: mark file DELETED |
+| `drive9 rm -r /a/` | Recursive: `DELETE FROM file_nodes WHERE path = '/a/' OR path LIKE '/a/%'` → per-file refcount check → mark orphans DELETED |
+| `drive9 stat /a` | `SELECT fn.*, f.* FROM file_nodes fn JOIN files f ON ... WHERE fn.path='/a'` |
+| `drive9 search "query"` | `SELECT ... FROM files f JOIN file_nodes fn ON ... ORDER BY vec_embed_cosine_distance(f.vec, 'query') LIMIT k` |
 
 **Note on directory operations**: Directory `mv` and `cp` are O(N) in the number of descendants — but zero storage cost. This matches AGFS's philosophy: keep the filesystem interface simple, let the server handle batch metadata. Plan 9's `rename(2)` has the same property. For P0, batch operations run in a single transaction; sharded optimization is a future concern.
 
@@ -274,7 +274,7 @@ Small files are stored in db9 via `fs9_write('/blobs/<ulid>', content)`. Same UL
 ### Small Files (< 50,000 bytes): Server Proxy → db9
 
 ```
-Client ──PUT body──▶ dat9 server
+Client ──PUT body──▶ drive9 server
                         │
                  fs9_write('/blobs/<ulid>', body)
                  INSERT files (storage_type='db9', ...)
@@ -289,7 +289,7 @@ The server reads the request body, writes to db9, creates metadata, and returns.
 ### Large Files (>= 50,000 bytes): Presigned URL Direct Upload → S3
 
 ```
-Client ──PUT (Content-Length only, no body)──▶ dat9 server
+Client ──PUT (Content-Length only, no body)──▶ drive9 server
                                                   │
                                            INSERT files (PENDING)
                                            INSERT uploads
@@ -303,7 +303,7 @@ Client ──PUT part 2──▶ S3
   ...
 Client ──PUT part N──▶ S3
 
-Client ──POST /v1/uploads/{id}/complete──▶ dat9 server
+Client ──POST /v1/uploads/{id}/complete──▶ drive9 server
                                               │
                                        CompleteMultipartUpload (S3)
                                        BEGIN;
@@ -334,11 +334,11 @@ The server calls `S3.ListParts()` to determine which parts were already uploaded
 
 ## 5. Tiered Context: L0 / L1 / L2
 
-dat9 adopts a three-layer content model inspired by [OpenViking](https://github.com/volcengine/OpenViking)'s L0/L1/L2 tiered context architecture. The core insight: agents rarely need the full content of a file. They need just enough context to decide whether to load more.
+drive9 adopts a three-layer content model inspired by [OpenViking](https://github.com/volcengine/OpenViking)'s L0/L1/L2 tiered context architecture. The core insight: agents rarely need the full content of a file. They need just enough context to decide whether to load more.
 
 ### 5.1 The Model
 
-Every directory in dat9 can optionally carry three layers of progressively detailed content:
+Every directory in drive9 can optionally carry three layers of progressively detailed content:
 
 | Layer | File | Token Budget | Purpose | Storage |
 |-------|------|-------------|---------|---------|
@@ -357,7 +357,7 @@ Example directory:
   images.tar.gz         # L2: full data (10 GB, in S3)
 ```
 
-**Key**: L0 and L1 are **ordinary small files** stored in db9 via the same Dat9Backend. They are file_nodes entries pointing to files entries. "Everything is a file" — no special tables, no caching layer. Because they're in db9, they are automatically embedded and FTS-indexed.
+**Key**: L0 and L1 are **ordinary small files** stored in db9 via the same Drive9Backend. They are file_nodes entries pointing to files entries. "Everything is a file" — no special tables, no caching layer. Because they're in db9, they are automatically embedded and FTS-indexed.
 
 Token savings: scanning 20 directories via L0 costs ~2k tokens. Loading 3 L1 overviews costs ~3k. Loading 1 full L2 costs ~5k. Total: **10k tokens instead of 100k** (10x reduction).
 
@@ -425,13 +425,13 @@ Step 1: Vector search over all files with embeddings
   → Returns candidate paths: [/data/training-v3/.abstract.md, /data/imagenet/.abstract.md]
 
 Step 2: Agent reads L1 of top candidates
-  → dat9 cat /data/training-v3/.overview.md
+  → drive9 cat /data/training-v3/.overview.md
   → ~1k tokens, structured: "50k images, labeled, classes: dog/cat/bird..."
   → Agent decides: this is the one.
 
 Step 3: Agent loads specific L2 files
-  → dat9 cat /data/training-v3/metadata.json  (small, from db9)
-  → dat9 cat /data/training-v3/images.tar.gz  (large, 302 → S3 presigned URL)
+  → drive9 cat /data/training-v3/metadata.json  (small, from db9)
+  → drive9 cat /data/training-v3/images.tar.gz  (large, 302 → S3 presigned URL)
 ```
 
 ### 5.5 Cross-Resource Relations (.relations.json)
@@ -459,13 +459,13 @@ For auto-generating L0/L1 from L2 files. This is a **P8+ feature** — not neede
 File Write (synchronous)              Background Workers (asynchronous)
 ─────────────────────                 ──────────────────────────────────
 
-dat9 cp file.md /docs/               SemanticProcessor (picks from queue):
+drive9 cp file.md /docs/               SemanticProcessor (picks from queue):
   │                                     │
   ├─▶ store content (db9 or S3)        ├─▶ read file content
   ├─▶ INSERT files + file_nodes        ├─▶ LLM: generate L0 (.abstract.md)
   ├─▶ ENQUEUE(semantic_queue,          ├─▶ LLM: generate L1 (.overview.md)
-  │     {path, action: "created"})     ├─▶ dat9 write .abstract.md (→ db9, auto-embedded)
-  │                                     ├─▶ dat9 write .overview.md (→ db9, auto-embedded)
+  │     {path, action: "created"})     ├─▶ drive9 write .abstract.md (→ db9, auto-embedded)
+  │                                     ├─▶ drive9 write .overview.md (→ db9, auto-embedded)
   └─▶ 200 OK  (immediate)             └─▶ Propagate: re-generate parent L0 (bottom-up)
 ```
 
@@ -477,9 +477,9 @@ dat9 cp file.md /docs/               SemanticProcessor (picks from queue):
 │  - Intent analysis, query planning, reranking            │
 │  - Context assembly, conversation memory                 │
 └──────────────────────────┬──────────────────────────────┘
-                           │  calls dat9 API
+                           │  calls drive9 API
 ┌──────────────────────────▼──────────────────────────────┐
-│  dat9 (This System)                                      │
+│  drive9 (This System)                                      │
 │  - File CRUD: cp, cat, ls, mv, stat, rm                  │
 │  - Semantic search: vector, FTS, hybrid (via db9)         │
 │  - Tags, queries, revisions                               │
@@ -513,7 +513,7 @@ HEAD   /v1/fs/{path}          Stat  (standard HTTP semantics)
 GET    /v1/fs/{path}?list     List directory
 
 POST   /v1/fs/{path}?copy     Server-side link (zero-copy, same file_id)
-  Header: X-Dat9-Copy-Source: /source/path
+  Header: X-Drive9-Copy-Source: /source/path
 
 POST   /v1/search             Semantic search (vector + FTS + hybrid)
 POST   /v1/query              Metadata query (tags, status, source_id)
@@ -578,7 +578,7 @@ POST /v1/query
 
 ### Overwrite Semantics (Write to Existing Path)
 
-When a client writes to a path that already exists, dat9 uses **in-place update** on the existing `files` row:
+When a client writes to a path that already exists, drive9 uses **in-place update** on the existing `files` row:
 
 ```
 PUT /v1/fs/data/config.json  (path already exists, file_id = 01JQ...)
@@ -718,7 +718,7 @@ CREATE TABLE file_tags (
 );
 ```
 
-Separate table for proper SQL indexing. Supports precise filtering: `dat9 ls --tag env=prod`.
+Separate table for proper SQL indexing. Supports precise filtering: `drive9 ls --tag env=prod`.
 
 ### uploads — large-file multipart upload state
 
@@ -871,8 +871,8 @@ Runs periodically to:
 ### V1: Snapshot Share (Recommended)
 
 ```bash
-dat9 share create /knowledge/ml-papers/ --to agent-007 --mode snapshot
-dat9 share accept sh_01J... --to /shared/ml-papers/
+drive9 share create /knowledge/ml-papers/ --to agent-007 --mode snapshot
+drive9 share accept sh_01J... --to /shared/ml-papers/
 ```
 
 Snapshot mode performs point-in-time export/import across tenants:
@@ -901,18 +901,18 @@ Agent (no key yet)
   │
   POST /v1/provision
   │
-  dat9 control plane:
-    1. Generate api_key: "dat9_" + 32 random bytes (base62)
+  drive9 control plane:
+    1. Generate api_key: "drive9_" + 32 random bytes (base62)
     2. Call db9 API: create cluster → get connection string
     3. Connect to new cluster, run schema init (4 tables + indexes + extensions)
     4. Create S3 prefix: s3://<bucket>/tenants/<tenant_id>/
     5. INSERT INTO tenants (api_key_hash, db9_dsn, s3_prefix, ...)
     6. Return api_key to agent (only time it's shown in plaintext)
   │
-  ◀── 200 { "api_key": "dat9_7kQ3x..." }
+  ◀── 200 { "api_key": "drive9_7kQ3x..." }
 
 Subsequent requests:
-  Authorization: Bearer dat9_7kQ3x...
+  Authorization: Bearer drive9_7kQ3x...
     → SHA-256(key) prefix lookup in tenants table
     → Resolve db9 connection + S3 config
     → All operations scoped to this tenant's db9 cluster
@@ -943,12 +943,12 @@ CREATE TABLE tenants (
 
 - **Never stored in plaintext.** Only `SHA-256(api_key)` is stored. The prefix (first 12 chars) is stored separately for fast lookup.
 - **Prefix is non-unique.** 12 chars base62 ≈ 3.2 × 10^21 combinations — collision is astronomically unlikely, but the index is non-unique and auth verifies the full SHA-256 hash. If multiple rows match a prefix, each is checked.
-- **Format**: `dat9_` + 32 random bytes (base62). The `dat9_` prefix enables GitHub secret scanning and similar leak-detection tools.
-- **Transport**: HTTPS only. dat9 server rejects plain HTTP requests.
+- **Format**: `drive9_` + 32 random bytes (base62). The `drive9_` prefix enables GitHub secret scanning and similar leak-detection tools.
+- **Transport**: HTTPS only. drive9 server rejects plain HTTP requests.
 
 ### Schema Init
 
-When a new db9 cluster is provisioned, dat9 runs:
+When a new db9 cluster is provisioned, drive9 runs:
 
 ```sql
 -- Extensions
@@ -1030,9 +1030,9 @@ Raw input (URL-decoded once)
 
 | Phase | Scope | Effort |
 |---|---|---|
-| **P0** | Server: AGFS MountableFS + Dat9Backend + db9 integration (files + file_nodes tables) + small-file CRUD + auth + tenant | M |
+| **P0** | Server: AGFS MountableFS + Drive9Backend + db9 integration (files + file_nodes tables) + small-file CRUD + auth + tenant | M |
 | **P1** | Large-file upload: 202 flow + presigned URLs + uploads table + resume + Go SDK Transfer Engine | L |
-| **P2** | CLI: `dat9 cp/cat/ls/stat/mv/rm/search` + progress bar + auto-resume | M |
+| **P2** | CLI: `drive9 cp/cat/ls/stat/mv/rm/search` + progress bar + auto-resume | M |
 | **P3** | Reaper + S3 Lifecycle + TTL cleanup + reference-counted delete | S |
 | **P4** | file_tags table + tag CRUD + Query API + zero-copy cp | M |
 | **P5** | MCP Server | S |
@@ -1083,7 +1083,7 @@ DELETE /v1/mounts/{path}       Unmount (admin-only)
 
 Mount management is restricted to control-plane administrators. Tenant API keys cannot mount/unmount backends. Only built-in plugins are allowed; dynamic arbitrary plugin loading is prohibited.
 
-P0 ships with two mounts: `/ -> Dat9Backend` and `/mem -> memfs`.
+P0 ships with two mounts: `/ -> Drive9Backend` and `/mem -> memfs`.
 
 ### Smart Parser & TreeBuilder (P9, OpenViking-inspired)
 
@@ -1098,7 +1098,7 @@ User uploads file.pdf to /inbox/
   └─▶ Generate .relations.json linking original → sections
 ```
 
-**Key difference from OpenViking**: dat9 **always preserves the original file**. Both original and parsed sections coexist, linked via `.relations.json`.
+**Key difference from OpenViking**: drive9 **always preserves the original file**. Both original and parsed sections coexist, linked via `.relations.json`.
 
 ---
 

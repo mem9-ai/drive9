@@ -3,9 +3,11 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
@@ -61,13 +64,16 @@ func newTestServerWithS3Config(t *testing.T, backendOpts backend.Options, worker
 }
 
 func partChecksumHeader(data []byte) string {
+	table := crc32.MakeTable(crc32.Castagnoli)
 	parts := s3client.CalcParts(int64(len(data)), s3client.PartSize)
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
 		start := int64(p.Number-1) * s3client.PartSize
 		end := start + p.Size
-		h := sha256.Sum256(data[start:end])
-		out = append(out, base64.StdEncoding.EncodeToString(h[:]))
+		v := crc32.Checksum(data[start:end], table)
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, v)
+		out = append(out, base64.StdEncoding.EncodeToString(b))
 	}
 	return strings.Join(out, ",")
 }
@@ -138,6 +144,108 @@ func TestUploadInitiateByBody202(t *testing.T) {
 	}
 	if len(plan.Parts) == 0 {
 		t.Error("expected parts")
+	}
+}
+
+func TestV1UploadInitiateReturnsAllPresignedParts(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	totalSize := 20 << 20
+	body := make([]byte, totalSize)
+	reqBody := map[string]any{
+		"path":           "/all-parts.bin",
+		"total_size":     totalSize,
+		"part_checksums": strings.Split(partChecksumHeader(body), ","),
+	}
+	p, _ := json.Marshal(reqBody)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/initiate", bytes.NewReader(p))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusAccepted {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 202, got %d: %s", resp.StatusCode, b)
+	}
+
+	var plan backend.UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if plan.PartSize != s3client.PartSize {
+		t.Fatalf("part size = %d, want %d", plan.PartSize, s3client.PartSize)
+	}
+	if len(plan.Parts) != 3 {
+		t.Fatalf("expected 3 presigned parts, got %d", len(plan.Parts))
+	}
+	wantSizes := []int64{s3client.PartSize, s3client.PartSize, 4 << 20}
+	for i, part := range plan.Parts {
+		if part.Number != i+1 {
+			t.Fatalf("part %d number = %d, want %d", i, part.Number, i+1)
+		}
+		if part.URL == "" {
+			t.Fatalf("part %d missing presigned URL", part.Number)
+		}
+		if part.Size != wantSizes[i] {
+			t.Fatalf("part %d size = %d, want %d", part.Number, part.Size, wantSizes[i])
+		}
+	}
+}
+
+func TestV1LargeFilePutRequiresChecksumHeader(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	body := make([]byte, 1<<20)
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/missing-checksums.bin", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, b)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), "missing X-Dat9-Part-Checksums header") {
+		t.Fatalf("expected missing checksum header error, got %s", b)
+	}
+}
+
+func TestV1UploadInitiateByBodyRequiresPartChecksums(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	reqBody := map[string]any{
+		"path":       "/missing-body-checksums.bin",
+		"total_size": 1 << 20,
+	}
+	p, _ := json.Marshal(reqBody)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/initiate", bytes.NewReader(p))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, b)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), "missing part_checksums") {
+		t.Fatalf("expected missing part_checksums error, got %s", b)
 	}
 }
 
@@ -229,7 +337,7 @@ func TestUploadCompleteEndpoint(t *testing.T) {
 
 	// Upload all parts via S3 client directly
 	for _, p := range plan.Parts {
-		start := int64(p.Number-1) * s3client.PartSize
+		start := int64(p.Number-1) * plan.PartSize
 		end := start + p.Size
 		if end > int64(len(body)) {
 			end = int64(len(body))
@@ -277,7 +385,7 @@ func TestUploadResumeEndpoint(t *testing.T) {
 	upload, _ := s.fallback.GetUpload(context.Background(), plan.UploadID)
 
 	// Upload only part 1
-	if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, 1, bytes.NewReader(make([]byte, s3client.PartSize))); err != nil {
+	if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, 1, bytes.NewReader(make([]byte, upload.PartSize))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -327,7 +435,7 @@ func TestUploadResumeEndpointByBody(t *testing.T) {
 	_ = resp.Body.Close()
 
 	upload, _ := s.fallback.GetUpload(context.Background(), plan.UploadID)
-	if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, 1, bytes.NewReader(make([]byte, s3client.PartSize))); err != nil {
+	if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, 1, bytes.NewReader(make([]byte, upload.PartSize))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -351,6 +459,172 @@ func TestUploadResumeEndpointByBody(t *testing.T) {
 	}
 	if len(resumed.Parts) != 2 {
 		t.Errorf("expected 2 missing parts, got %d", len(resumed.Parts))
+	}
+}
+
+func TestV1UploadResumeRequiresChecksums(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	totalSize := int64(20 << 20)
+	body := make([]byte, totalSize)
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/resume-missing-checksums.bin", bytes.NewReader(body))
+	req.ContentLength = totalSize
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var plan backend.UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/"+plan.UploadID+"/resume", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, b)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), "missing X-Dat9-Part-Checksums header") {
+		t.Fatalf("expected missing checksum header error, got %s", b)
+	}
+}
+
+func TestV1UploadResumeByBodyRequiresPartChecksums(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	totalSize := int64(20 << 20)
+	body := make([]byte, totalSize)
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/resume-missing-body-checksums.bin", bytes.NewReader(body))
+	req.ContentLength = totalSize
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var plan backend.UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/"+plan.UploadID+"/resume", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, b)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), "missing part_checksums") {
+		t.Fatalf("expected missing part_checksums error, got %s", b)
+	}
+}
+
+func TestV1PatchUsesFixedPartSizeBoundary(t *testing.T) {
+	s, s3c := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	totalSize := int64(20 << 20)
+	body := make([]byte, totalSize)
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/patch-fixed-boundary.bin", bytes.NewReader(body))
+	req.ContentLength = totalSize
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var uploadPlan backend.UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&uploadPlan); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	upload, err := s.fallback.GetUpload(context.Background(), uploadPlan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, part := range uploadPlan.Parts {
+		start := int64(part.Number-1) * s3client.PartSize
+		end := start + part.Size
+		if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, part.Number, bytes.NewReader(body[start:end])); err != nil {
+			t.Fatalf("upload part %d: %v", part.Number, err)
+		}
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/"+uploadPlan.UploadID+"/complete", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("complete: expected 200, got %d", resp.StatusCode)
+	}
+
+	patchReq := map[string]any{
+		"new_size":    totalSize,
+		"dirty_parts": []int{2},
+	}
+	p, _ := json.Marshal(patchReq)
+	req, _ = http.NewRequest(http.MethodPatch, ts.URL+"/v1/fs/patch-fixed-boundary.bin", bytes.NewReader(p))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusAccepted {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("patch: expected 202, got %d: %s", resp.StatusCode, b)
+	}
+
+	var plan backend.PatchPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if plan.PartSize != s3client.PartSize {
+		t.Fatalf("patch part size = %d, want %d", plan.PartSize, s3client.PartSize)
+	}
+	if len(plan.UploadParts) != 1 {
+		t.Fatalf("upload parts = %d, want 1", len(plan.UploadParts))
+	}
+	part := plan.UploadParts[0]
+	if part.Number != 2 {
+		t.Fatalf("upload part number = %d, want 2", part.Number)
+	}
+	if part.Size != s3client.PartSize {
+		t.Fatalf("upload part size = %d, want %d", part.Size, s3client.PartSize)
+	}
+	if part.ReadURL == "" {
+		t.Fatal("expected read_url for dirty part within original file")
+	}
+	if got := part.ReadHeaders["Range"]; got != fmt.Sprintf("bytes=%d-%d", s3client.PartSize, 2*s3client.PartSize-1) {
+		t.Fatalf("range header = %q, want %q", got, fmt.Sprintf("bytes=%d-%d", s3client.PartSize, 2*s3client.PartSize-1))
+	}
+	if len(plan.CopiedParts) != 2 || plan.CopiedParts[0] != 1 || plan.CopiedParts[1] != 3 {
+		t.Fatalf("copied parts = %v, want [1 3]", plan.CopiedParts)
 	}
 }
 
@@ -397,7 +671,7 @@ func TestLargeUploadOverwritesExistingSmallFile(t *testing.T) {
 
 	// Upload all parts through the local S3 stand-in.
 	for _, p := range plan.Parts {
-		start := int64(p.Number-1) * s3client.PartSize
+		start := int64(p.Number-1) * plan.PartSize
 		end := start + p.Size
 		if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, p.Number,
 			bytes.NewReader(make([]byte, end-start))); err != nil {
@@ -485,7 +759,7 @@ func TestAutoImageMultipartOverwriteWritesContentTextEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, part := range plan.Parts {
-		start := int64(part.Number-1) * s3client.PartSize
+		start := int64(part.Number-1) * plan.PartSize
 		end := start + part.Size
 		if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, part.Number, bytes.NewReader(make([]byte, end-start))); err != nil {
 			t.Fatalf("upload part %d: %v", part.Number, err)
@@ -642,7 +916,7 @@ func TestParsePartChecksumsHeaderValidation(t *testing.T) {
 
 	short := base64.StdEncoding.EncodeToString([]byte("short"))
 	_, err = parsePartChecksumsHeader(short)
-	if err == nil || !strings.Contains(err.Error(), "expected 32") {
+	if err == nil || !strings.Contains(err.Error(), "expected 4") {
 		t.Fatalf("expected decoded length error, got %v", err)
 	}
 }
@@ -663,6 +937,14 @@ func TestUploadRespectsMaxUploadBytes(t *testing.T) {
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 413, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestNewWithConfigUsesDefaultMaxUploadBytes(t *testing.T) {
+	base, _ := newTestServerWithS3(t)
+	s := NewWithConfig(Config{Backend: base.fallback})
+	if s.maxUploadBytes != DefaultMaxUploadBytes {
+		t.Fatalf("default maxUploadBytes = %d, want %d", s.maxUploadBytes, DefaultMaxUploadBytes)
 	}
 }
 
@@ -703,5 +985,62 @@ func TestContentLengthHeaderMismatchRejected(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestWriteReturns507WhenTenantStorageQuotaExceeded(t *testing.T) {
+	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 10}, SemanticWorkerOptions{})
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/fill.txt", bytes.NewReader([]byte("1234567890")))
+	req.ContentLength = 10
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected first write 200, got %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/overflow.txt", bytes.NewReader([]byte("1")))
+	req.ContentLength = 1
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusInsufficientStorage {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 507, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestUploadInitiateReturns507WhenTenantStorageQuotaExceeded(t *testing.T) {
+	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 70_000}, SemanticWorkerOptions{})
+	if _, err := s.fallback.Write("/filled.bin", bytes.Repeat([]byte("a"), 60_000), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	body := bytes.Repeat([]byte("b"), 20_000)
+	reqBody := map[string]any{
+		"path":           "/quota-over.bin",
+		"total_size":     len(body),
+		"part_checksums": strings.Split(partChecksumHeader(body), ","),
+	}
+	p, _ := json.Marshal(reqBody)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/initiate", bytes.NewReader(p))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusInsufficientStorage {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 507, got %d: %s", resp.StatusCode, body)
 	}
 }

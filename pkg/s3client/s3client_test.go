@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -95,7 +96,7 @@ func TestMultipartUploadComplete(t *testing.T) {
 	ctx := context.Background()
 
 	// Initiate
-	upload, err := c.CreateMultipartUpload(ctx, "blobs/big1")
+	upload, err := c.CreateMultipartUpload(ctx, "blobs/big1", ChecksumAlgoSHA256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +145,7 @@ func TestMultipartUploadAbort(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	upload, err := c.CreateMultipartUpload(ctx, "blobs/aborted")
+	upload, err := c.CreateMultipartUpload(ctx, "blobs/aborted", ChecksumAlgoSHA256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,9 +168,9 @@ func TestPresignURLsGenerated(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	upload, _ := c.CreateMultipartUpload(ctx, "blobs/presign-test")
+	upload, _ := c.CreateMultipartUpload(ctx, "blobs/presign-test", ChecksumAlgoSHA256)
 
-	url, err := c.PresignUploadPart(ctx, "blobs/presign-test", upload.UploadID, 1, 8<<20, "abc", UploadTTL)
+	url, err := c.PresignUploadPart(ctx, "blobs/presign-test", upload.UploadID, 1, 8<<20, ChecksumAlgoSHA256, "abc", UploadTTL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +194,7 @@ func TestPartialUploadAndListParts(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	upload, _ := c.CreateMultipartUpload(ctx, "blobs/partial")
+	upload, _ := c.CreateMultipartUpload(ctx, "blobs/partial", ChecksumAlgoSHA256)
 
 	// Upload only parts 1 and 3 (skip 2 — simulates interrupted upload)
 	if _, err := c.UploadPart(ctx, upload.UploadID, 1, bytes.NewReader([]byte("PART1"))); err != nil {
@@ -212,5 +213,151 @@ func TestPartialUploadAndListParts(t *testing.T) {
 	}
 	if listed[0].Number != 1 || listed[1].Number != 3 {
 		t.Errorf("unexpected part numbers: %v", listed)
+	}
+}
+
+func TestMultipartUploadNoChecksumAlgo(t *testing.T) {
+	c := newTestClient(t)
+	ctx := context.Background()
+
+	// Initiate with ChecksumAlgoNone — simulates v2 uploads where
+	// the client doesn't send per-part checksums.
+	upload, err := c.CreateMultipartUpload(ctx, "blobs/no-checksum", ChecksumAlgoNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upload.UploadID == "" {
+		t.Fatal("expected non-empty upload ID")
+	}
+
+	// Upload parts without any checksum header
+	partData := []string{"AAAA", "BB"}
+	var parts []Part
+	for i, d := range partData {
+		etag, err := c.UploadPart(ctx, upload.UploadID, i+1, bytes.NewReader([]byte(d)))
+		if err != nil {
+			t.Fatalf("upload part %d: %v", i+1, err)
+		}
+		parts = append(parts, Part{Number: i + 1, Size: int64(len(d)), ETag: etag})
+	}
+
+	// Complete should succeed without checksum validation
+	if err := c.CompleteMultipartUpload(ctx, "blobs/no-checksum", upload.UploadID, parts); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify assembled object
+	rc, err := c.GetObject(ctx, "blobs/no-checksum")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rc.Close() }()
+	got, _ := io.ReadAll(rc)
+	if string(got) != "AAAABB" {
+		t.Errorf("expected AAAABB, got %q", got)
+	}
+}
+
+func TestChecksumAlgorithmForAWS(t *testing.T) {
+	tests := []struct {
+		name    string
+		algo    ChecksumAlgo
+		want    string
+		wantOK  bool
+		wantErr string
+	}{
+		{name: "none", algo: ChecksumAlgoNone, wantOK: false},
+		{name: "crc32c", algo: ChecksumAlgoCRC32C, want: "CRC32C", wantOK: true},
+		{name: "sha256", algo: ChecksumAlgoSHA256, want: "SHA256", wantOK: true},
+		{name: "unknown", algo: ChecksumAlgo("bogus"), wantErr: "unsupported checksum algorithm"},
+	}
+
+	for _, tt := range tests {
+		got, ok, err := checksumAlgorithmForAWS(tt.algo)
+		if tt.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("%s: expected error containing %q, got %v", tt.name, tt.wantErr, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", tt.name, err)
+		}
+		if ok != tt.wantOK {
+			t.Fatalf("%s: ok=%v, want %v", tt.name, ok, tt.wantOK)
+		}
+		if string(got) != tt.want {
+			t.Fatalf("%s: got %q, want %q", tt.name, string(got), tt.want)
+		}
+	}
+}
+
+func TestCalcAdaptivePartSize(t *testing.T) {
+	tests := []struct {
+		name   string
+		total  int64
+		wantPS int64
+		wantN  int // expected number of parts (0 = skip check)
+	}{
+		{"small file 1 MiB", 1 << 20, PartSize, 1},
+		{"80 GiB", 80 * (1 << 30), 9 << 20, 0},    // ceil(80GiB/10000) → align up to 9 MiB
+		{"100 GiB", 100 * (1 << 30), 11 << 20, 0}, // ceil(100GiB/10000) → align up to 11 MiB
+		{"500 GiB", 500 * (1 << 30), 52 << 20, 0}, // ceil(500GiB/10000) → align up to 52 MiB
+		{"5 TiB max S3 object", 5 * (1 << 40), MaxAdaptivePartSize, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ps := CalcAdaptivePartSize(tt.total)
+			if ps < PartSize {
+				t.Errorf("part size %d < minimum %d", ps, PartSize)
+			}
+			if ps > MaxAdaptivePartSize {
+				t.Errorf("part size %d > maximum %d", ps, MaxAdaptivePartSize)
+			}
+			// Check 1 MiB alignment
+			if ps%(1<<20) != 0 {
+				t.Errorf("part size %d not aligned to 1 MiB", ps)
+			}
+			if tt.wantPS != 0 && ps != tt.wantPS {
+				t.Errorf("CalcAdaptivePartSize(%d) = %d, want %d", tt.total, ps, tt.wantPS)
+			}
+			if tt.wantN != 0 {
+				parts := CalcParts(tt.total, ps)
+				if len(parts) != tt.wantN {
+					t.Errorf("CalcParts(%d, %d) = %d parts, want %d", tt.total, ps, len(parts), tt.wantN)
+				}
+			}
+		})
+	}
+}
+
+func TestCalcAdaptivePartSizeInvariants(t *testing.T) {
+	// Monotonicity: larger files should produce >= part sizes
+	prev := CalcAdaptivePartSize(1)
+	for _, size := range []int64{
+		1 << 20, 10 << 20, 100 << 20, 1 << 30, 10 * (1 << 30),
+		50 * (1 << 30), 100 * (1 << 30), 500 * (1 << 30), 1 << 40, 5 * (1 << 40),
+	} {
+		ps := CalcAdaptivePartSize(size)
+		if ps < prev {
+			t.Errorf("monotonicity violated: CalcAdaptivePartSize(%d)=%d < CalcAdaptivePartSize(prev)=%d", size, ps, prev)
+		}
+		prev = ps
+	}
+
+	// Zero and negative sizes should still return PartSize (minimum clamp)
+	if ps := CalcAdaptivePartSize(0); ps != PartSize {
+		t.Errorf("CalcAdaptivePartSize(0) = %d, want %d", ps, PartSize)
+	}
+	if ps := CalcAdaptivePartSize(-1); ps != PartSize {
+		t.Errorf("CalcAdaptivePartSize(-1) = %d, want %d", ps, PartSize)
+	}
+
+	// Files within MaxAdaptivePartSize * 10000 should produce <= 10000 parts
+	maxSafe := int64(MaxAdaptivePartSize) * 10000
+	ps := CalcAdaptivePartSize(maxSafe)
+	parts := CalcParts(maxSafe, ps)
+	if len(parts) > 10000 {
+		t.Errorf("CalcAdaptivePartSize(%d) = %d → %d parts, exceeds S3 limit of 10000", maxSafe, ps, len(parts))
 	}
 }

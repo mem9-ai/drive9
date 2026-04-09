@@ -3,15 +3,15 @@
 
 set -euo pipefail
 
-BASE="${DAT9_BASE:-http://127.0.0.1:9009}"
-DAT9_API_KEY="${DAT9_API_KEY:-}"
+BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
+DRIVE9_API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-20}"
 MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
 FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
 CLI_SOURCE="${CLI_SOURCE:-build}"
-CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://dat9.ai/releases}"
+CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://drive9.ai/releases}"
 CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
 CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
@@ -88,7 +88,7 @@ download_official_cli() {
     echo "failed to resolve release version from $CLI_RELEASE_BASE_URL/version" >&2
     return 1
   fi
-  curl -fsSL "$CLI_RELEASE_BASE_URL/dat9-$CLI_RELEASE_OS-$CLI_RELEASE_ARCH" -o "$CLI_BIN"
+  curl -fsSL "$CLI_RELEASE_BASE_URL/drive9-$CLI_RELEASE_OS-$CLI_RELEASE_ARCH" -o "$CLI_BIN"
   chmod +x "$CLI_BIN"
   local actual_version
   actual_version="$($CLI_BIN --version 2>/dev/null | awk '{print $2}')"
@@ -96,14 +96,14 @@ download_official_cli() {
     echo "downloaded version mismatch: expected=$CLI_RELEASE_VERSION actual=$actual_version" >&2
     return 1
   fi
-  echo "downloaded official dat9 $actual_version for $CLI_RELEASE_OS/$CLI_RELEASE_ARCH" >&2
+  echo "downloaded official drive9 $actual_version for $CLI_RELEASE_OS/$CLI_RELEASE_ARCH" >&2
 }
 
 prepare_cli_binary() {
   CLI_BIN="$(mktemp)"
   case "$CLI_SOURCE" in
     build)
-      go build -o "$CLI_BIN" ./cmd/dat9
+      make build-cli CLI_BIN="$CLI_BIN"
       ;;
     official)
       download_official_cli
@@ -369,9 +369,9 @@ if [ "$(uname -s)" = "Linux" ]; then
 fi
 
 echo "[1] provision tenant"
-if [ -n "$DAT9_API_KEY" ]; then
-  API_KEY="$DAT9_API_KEY"
-  check_eq "use provided DAT9_API_KEY" "true" "true"
+if [ -n "$DRIVE9_API_KEY" ]; then
+  API_KEY="$DRIVE9_API_KEY"
+  check_eq "use provided DRIVE9_API_KEY" "true" "true"
 else
   resp=$(curl_body_code POST "$BASE/v1/provision")
   code=$(http_code "$resp")
@@ -400,12 +400,12 @@ while :; do
 done
 check_eq "tenant becomes active" "$state" "active"
 
-echo "[3] prepare dat9 cli"
+echo "[3] prepare drive9 cli"
 prepare_cli_binary
-check_cmd "dat9 binary ready" test -x "$CLI_BIN"
+check_cmd "drive9 binary ready" test -x "$CLI_BIN"
 
 dat9() {
-  DAT9_SERVER="$BASE" DAT9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
+  DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
 }
 
 dat9_retry() {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dat9 API smoke test against a live dat9-server deployment.
+# drive9 API smoke test against a live drive9-server deployment.
 #
 # Coverage:
 #  1) Provision tenant (expect 202, api_key + status only)
@@ -21,8 +21,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE="${DAT9_BASE:-http://127.0.0.1:9009}"
-DAT9_IMAGE_FIXTURE_PATH="${DAT9_IMAGE_FIXTURE_PATH:-$SCRIPT_DIR/fixtures/cat03.jpg}"
+BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
+DRIVE9_IMAGE_FIXTURE_PATH="${DRIVE9_IMAGE_FIXTURE_PATH:-$SCRIPT_DIR/fixtures/cat03.jpg}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 RUN_LARGE_FILE="${RUN_LARGE_FILE:-1}"
@@ -31,7 +31,7 @@ BATCH_SMALL_FILE_COUNT="${BATCH_SMALL_FILE_COUNT:-10}"
 REQUEST_MAX_RETRIES="${REQUEST_MAX_RETRIES:-8}"
 REQUEST_RETRY_SLEEP_S="${REQUEST_RETRY_SLEEP_S:-2}"
 RUN_UPLOAD_LIMIT_BOUNDARY="${RUN_UPLOAD_LIMIT_BOUNDARY:-1}"
-UPLOAD_LIMIT_BYTES="${UPLOAD_LIMIT_BYTES:-53687091200}"
+UPLOAD_LIMIT_BYTES="${UPLOAD_LIMIT_BYTES:-10737418240}"
 SEMANTIC_TIMEOUT_S="${SEMANTIC_TIMEOUT_S:-90}"
 SEMANTIC_INTERVAL_S="${SEMANTIC_INTERVAL_S:-3}"
 
@@ -194,13 +194,13 @@ wait_grep_contains_path() {
 }
 
 echo "========================================================"
-echo "  dat9 API smoke test"
+echo "  drive9 API smoke test"
 echo "  Base URL : $BASE"
-echo "  Image fixture : $DAT9_IMAGE_FIXTURE_PATH"
+echo "  Image fixture : $DRIVE9_IMAGE_FIXTURE_PATH"
 echo "  Started  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "========================================================"
 
-check_cmd "local image fixture exists" test -s "$DAT9_IMAGE_FIXTURE_PATH"
+check_cmd "local image fixture exists" test -s "$DRIVE9_IMAGE_FIXTURE_PATH"
 
 TS="$(date +%s)"
 ROOT_DIR="team-${TS}"
@@ -337,7 +337,7 @@ check_eq "find by name returns yaml file" "$find_has_yaml" "true"
 
 step "8" "Image upload and query"
 mkdir -p "$(dirname "$IMAGE_LOCAL")"
-cp "$DAT9_IMAGE_FIXTURE_PATH" "$IMAGE_LOCAL"
+cp "$DRIVE9_IMAGE_FIXTURE_PATH" "$IMAGE_LOCAL"
 check_cmd "local jpg fixture exists" test -s "$IMAGE_LOCAL"
 
 IMAGE_BYTES=$(wc -c < "$IMAGE_LOCAL" | tr -d ' ')

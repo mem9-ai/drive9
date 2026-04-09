@@ -53,7 +53,7 @@ func (c *LocalS3Client) partPath(key, uploadID string, partNumber int) string {
 	return filepath.Join(c.rootDir, "parts", uploadID, fmt.Sprintf("%05d", partNumber))
 }
 
-func (c *LocalS3Client) CreateMultipartUpload(ctx context.Context, key string) (*MultipartUpload, error) {
+func (c *LocalS3Client) CreateMultipartUpload(ctx context.Context, key string, algo ChecksumAlgo) (*MultipartUpload, error) {
 	uploadID := fmt.Sprintf("upload-%x", sha256.Sum256([]byte(key+time.Now().String())))[:24]
 
 	partsDir := filepath.Join(c.rootDir, "parts", uploadID)
@@ -68,20 +68,31 @@ func (c *LocalS3Client) CreateMultipartUpload(ctx context.Context, key string) (
 	return &MultipartUpload{UploadID: uploadID, Key: key}, nil
 }
 
-func (c *LocalS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, checksumSHA256 string, ttl time.Duration) (*UploadPartURL, error) {
+func (c *LocalS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, algo ChecksumAlgo, checksumValue string, ttl time.Duration) (*UploadPartURL, error) {
 	url := fmt.Sprintf("%s/upload/%s/%d", c.baseURL, uploadID, partNumber)
 	var headers map[string]string
-	if checksumSHA256 != "" {
-		headers = map[string]string{"x-amz-checksum-sha256": checksumSHA256}
+	if checksumValue != "" {
+		switch algo {
+		case ChecksumAlgoCRC32C:
+			headers = map[string]string{"x-amz-checksum-crc32c": checksumValue}
+		default:
+			headers = map[string]string{"x-amz-checksum-sha256": checksumValue}
+		}
 	}
-	return &UploadPartURL{
-		Number:         partNumber,
-		URL:            url,
-		Size:           partSize,
-		ChecksumSHA256: checksumSHA256,
-		Headers:        headers,
-		ExpiresAt:      time.Now().Add(ttl),
-	}, nil
+	result := &UploadPartURL{
+		Number:    partNumber,
+		URL:       url,
+		Size:      partSize,
+		Headers:   headers,
+		ExpiresAt: time.Now().Add(ttl),
+	}
+	switch algo {
+	case ChecksumAlgoCRC32C:
+		result.ChecksumCRC32C = checksumValue
+	default:
+		result.ChecksumSHA256 = checksumValue
+	}
+	return result, nil
 }
 
 // UploadPart directly writes a part (used by the local presigned URL handler).

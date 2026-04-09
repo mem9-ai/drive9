@@ -1,0 +1,440 @@
+// Command drive9-server starts the drive9 HTTP server.
+//
+// Usage:
+//
+//	drive9-server [listen-addr]
+package main
+
+import (
+	"context"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/mem9-ai/dat9/pkg/backend"
+	"github.com/mem9-ai/dat9/pkg/embedding"
+	"github.com/mem9-ai/dat9/pkg/encrypt"
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/server"
+	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/db9"
+	"github.com/mem9-ai/dat9/pkg/tenant/starter"
+	"github.com/mem9-ai/dat9/pkg/tenant/tidbzero"
+	"go.uber.org/zap"
+)
+
+const (
+	defaultListenAddr = ":9009"
+	defaultS3Dir      = "s3"
+)
+
+func main() {
+	if len(os.Args) > 2 {
+		usage()
+	}
+
+	addr := envOr("DRIVE9_LISTEN_ADDR", defaultListenAddr)
+	if len(os.Args) == 2 {
+		addr = os.Args[1]
+	}
+
+	srvLogger, err := logger.NewServerLogger()
+	if err != nil {
+		die(fmt.Errorf("create logger: %w", err))
+	}
+	defer func() { _ = srvLogger.Sync() }()
+	logger.Set(srvLogger)
+
+	metaDSN := os.Getenv("DRIVE9_META_DSN")
+	if metaDSN == "" {
+		die(fmt.Errorf("DRIVE9_META_DSN is required"))
+	}
+
+	s3Dir := envOr("DRIVE9_S3_DIR", defaultS3Dir)
+	s3Bucket := os.Getenv("DRIVE9_S3_BUCKET")
+	s3Region := envOr("DRIVE9_S3_REGION", "us-east-1")
+	s3Prefix := os.Getenv("DRIVE9_S3_PREFIX")
+	s3RoleARN := os.Getenv("DRIVE9_S3_ROLE_ARN")
+	backendOptions, err := buildBackendOptionsFromEnv()
+	if err != nil {
+		die(err)
+	}
+	semanticEmbedder, semanticWorkerOpts, err := buildSemanticWorkerConfigFromEnv()
+	if err != nil {
+		die(err)
+	}
+	if strings.TrimSpace(os.Getenv("DRIVE9_SEMANTIC_LEASE_SECONDS")) == "" {
+		semanticWorkerOpts.LeaseDuration = defaultSemanticLeaseDuration(backendOptions.AsyncImageExtract)
+	}
+	if semanticEmbedder != nil && backendOptions.QueryEmbedding.Client == nil {
+		backendOptions.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
+	}
+
+	store, err := meta.Open(metaDSN)
+	if err != nil {
+		die(fmt.Errorf("open control-plane store: %w", err))
+	}
+	defer func() { _ = store.Close() }()
+
+	if s3Bucket == "" {
+		if err := os.MkdirAll(s3Dir, 0o755); err != nil {
+			die(fmt.Errorf("create s3 dir: %w", err))
+		}
+		logger.Info(context.Background(), "s3_mode_local", zap.String("dir", s3Dir))
+	} else {
+		logger.Info(context.Background(), "s3_mode_aws", zap.String("bucket", s3Bucket), zap.String("region", s3Region), zap.String("role", envOr("DRIVE9_S3_ROLE_ARN", "default-credentials")))
+	}
+
+	encryptType := envOr("DRIVE9_ENCRYPT_TYPE", "local_aes")
+	masterHex := os.Getenv("DRIVE9_MASTER_KEY")
+	kmsKey := os.Getenv("DRIVE9_ENCRYPT_KEY")
+	tokenHex := os.Getenv("DRIVE9_TOKEN_SIGNING_KEY")
+	providerType := envOr("DRIVE9_TENANT_PROVIDER", tenant.ProviderTiDBZero)
+	maxUploadBytes := server.DefaultMaxUploadBytes
+	if raw := os.Getenv("DRIVE9_MAX_UPLOAD_BYTES"); raw != "" {
+		maxUploadBytes, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || maxUploadBytes <= 0 {
+			die(fmt.Errorf("invalid DRIVE9_MAX_UPLOAD_BYTES: must be a positive integer"))
+		}
+		if maxUploadBytes < 1<<20 {
+			die(fmt.Errorf("DRIVE9_MAX_UPLOAD_BYTES too small: minimum 1048576 (1MiB)"))
+		}
+	}
+	backendOptions.MaxUploadBytes = maxUploadBytes
+	providerType, err = tenant.NormalizeProvider(providerType)
+	if err != nil {
+		die(err)
+	}
+	logger.Info(context.Background(), "tenant_provider_selected", zap.String("provider", providerType))
+
+	var provisioner tenant.Provisioner
+	var provisionerErr error
+	switch providerType {
+	case tenant.ProviderTiDBZero:
+		provisioner, provisionerErr = tidbzero.NewProvisionerFromEnv()
+	case tenant.ProviderTiDBCloudStarter:
+		provisioner, provisionerErr = starter.NewProvisionerFromEnv()
+	case tenant.ProviderDB9:
+		provisioner, provisionerErr = db9.NewProvisionerFromEnv()
+	}
+	if provisionerErr != nil {
+		logger.Warn(context.Background(), "provisioner_not_configured", zap.String("provider", providerType), zap.Error(provisionerErr))
+	} else {
+		logger.Info(context.Background(), "provisioner_configured", zap.String("provider", providerType))
+	}
+
+	var pool *tenant.Pool
+	var tokenSecret []byte
+	if tokenHex != "" {
+		tokenSecret, err = hex.DecodeString(tokenHex)
+		if err != nil {
+			die(fmt.Errorf("invalid DRIVE9_TOKEN_SIGNING_KEY: %w", err))
+		}
+		eKey := masterHex
+		eType := encrypt.Type(encryptType)
+		if eType == encrypt.TypeKMS {
+			eKey = kmsKey
+		}
+		enc, err := encrypt.New(context.Background(), encrypt.Config{
+			Type:   eType,
+			Key:    eKey,
+			Region: envOr("DRIVE9_S3_REGION", "us-east-1"),
+		})
+		if err != nil {
+			die(fmt.Errorf("create encryptor: %w", err))
+		}
+
+		if err := store.DB().Ping(); err != nil {
+			die(fmt.Errorf("control-plane db unavailable: %w", err))
+		}
+
+		pool = tenant.NewPool(tenant.PoolConfig{
+			S3Dir:          s3Dir,
+			PublicURL:      publicBaseURL(addr),
+			S3Bucket:       s3Bucket,
+			S3Region:       s3Region,
+			S3Prefix:       s3Prefix,
+			S3RoleARN:      s3RoleARN,
+			BackendOptions: backendOptions,
+		}, enc)
+		defer pool.Close()
+	}
+
+	die(server.NewWithConfig(server.Config{
+		Meta:             store,
+		Pool:             pool,
+		Provisioner:      provisioner,
+		TokenSecret:      tokenSecret,
+		S3Dir:            s3Dir,
+		MaxUploadBytes:   maxUploadBytes,
+		Logger:           srvLogger,
+		SemanticEmbedder: semanticEmbedder,
+		SemanticWorkers:  semanticWorkerOpts,
+	}).ListenAndServe(addr))
+}
+
+func envOr(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `usage: drive9-server [listen-addr]
+
+environment:
+  DRIVE9_LISTEN_ADDR serve listen address (default: :9009)
+  DRIVE9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
+  DRIVE9_META_DSN    control-plane MySQL DSN (required)
+  DRIVE9_ENCRYPT_TYPE local_aes|kms
+  DRIVE9_MASTER_KEY  32-byte hex key for local_aes encryptor
+  DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms)
+  DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
+  DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)
+  DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
+  S3 storage (set DRIVE9_S3_BUCKET to enable AWS S3, otherwise local mock):
+  DRIVE9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
+  DRIVE9_S3_REGION   AWS region (default: us-east-1)
+  DRIVE9_S3_PREFIX   S3 key prefix (e.g. "tenants")
+  DRIVE9_S3_ROLE_ARN IAM role ARN to assume via STS (optional)
+  DRIVE9_S3_DIR      local s3 mock root directory (default: ./s3, only used without DRIVE9_S3_BUCKET)
+  Query embedding (app-side semantic query embedding for grep):
+  DRIVE9_QUERY_EMBED_API_BASE OpenAI-compatible base URL (optional)
+  DRIVE9_QUERY_EMBED_API_KEY  API key for DRIVE9_QUERY_EMBED_API_BASE (optional)
+  DRIVE9_QUERY_EMBED_MODEL    model name for query embedding (optional)
+  DRIVE9_QUERY_EMBED_DIMENSIONS optional embedding dimensions override
+  DRIVE9_QUERY_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
+  Async semantic embedding worker:
+  DRIVE9_EMBED_API_BASE OpenAI-compatible base URL for background embedding (optional)
+  DRIVE9_EMBED_API_KEY  API key for DRIVE9_EMBED_API_BASE (optional)
+  DRIVE9_EMBED_MODEL    model name for background embedding (optional)
+  DRIVE9_EMBED_DIMENSIONS optional embedding dimensions override
+  DRIVE9_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
+  DRIVE9_SEMANTIC_WORKERS number of background workers (default: 1)
+  DRIVE9_SEMANTIC_POLL_INTERVAL_MS worker poll interval in milliseconds (default: 200)
+  DRIVE9_SEMANTIC_LEASE_SECONDS task lease duration in seconds (default: 30; when unset and image extraction is enabled, drive9-server uses max(30, 2x image extract timeout))
+  DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS recover sweep interval in milliseconds (default: 5000)
+  DRIVE9_SEMANTIC_RETRY_BASE_MS base retry backoff in milliseconds (default: 200)
+  DRIVE9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
+  DRIVE9_SEMANTIC_TENANT_LIMIT active tenants scanned per round (default: 128)
+  DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
+  Image extraction (async image -> text for search):
+  DRIVE9_IMAGE_EXTRACT_ENABLED true|false (default: false)
+  DRIVE9_IMAGE_EXTRACT_QUEUE_SIZE buffered task queue size (default: 128)
+  DRIVE9_IMAGE_EXTRACT_WORKERS number of workers (default: 1)
+  DRIVE9_IMAGE_EXTRACT_MAX_BYTES max image bytes processed per task (default: 8388608)
+  DRIVE9_IMAGE_EXTRACT_TIMEOUT_SECONDS extractor timeout seconds (default: 20)
+  DRIVE9_IMAGE_EXTRACT_MAX_TEXT_BYTES max extracted text stored in files.content_text (default: 8192)
+  DRIVE9_IMAGE_EXTRACT_API_BASE OpenAI-compatible base URL (optional)
+  DRIVE9_IMAGE_EXTRACT_API_KEY  API key for DRIVE9_IMAGE_EXTRACT_API_BASE (optional)
+  DRIVE9_IMAGE_EXTRACT_MODEL    model name for vision extraction (optional)
+  DRIVE9_IMAGE_EXTRACT_PROMPT   custom extraction prompt (optional)
+  DRIVE9_IMAGE_EXTRACT_MAX_TOKENS max model output tokens (default: 256)
+`, server.DefaultMaxUploadBytes)
+	os.Exit(2)
+}
+
+func die(err error) {
+	if err == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "drive9-server: %v\n", err)
+	os.Exit(1)
+}
+
+func publicBaseURL(listenAddr string) string {
+	if v := strings.TrimRight(os.Getenv("DRIVE9_PUBLIC_URL"), "/"); v != "" {
+		return v
+	}
+
+	// Without DRIVE9_PUBLIC_URL, only allow explicit loopback addresses.
+	// Wildcard or non-loopback addresses would produce unreachable presigned URLs.
+	switch {
+	case strings.HasPrefix(listenAddr, "127.0.0.1:"),
+		strings.HasPrefix(listenAddr, "localhost:"),
+		strings.HasPrefix(listenAddr, "[::1]:"):
+		return "http://" + listenAddr
+	case strings.HasPrefix(listenAddr, "http://"), strings.HasPrefix(listenAddr, "https://"):
+		return strings.TrimRight(listenAddr, "/")
+	default:
+		fmt.Fprintf(os.Stderr, "drive9-server: DRIVE9_PUBLIC_URL is required when listen address is %q (wildcard or non-loopback). Set DRIVE9_PUBLIC_URL to the externally reachable base URL.\n", listenAddr)
+		os.Exit(1)
+		return "" // unreachable
+	}
+}
+
+func buildBackendOptionsFromEnv() (backend.Options, error) {
+	var opts backend.Options
+	opts.MaxTenantStorageBytes = envInt64("DRIVE9_MAX_TENANT_STORAGE_BYTES", 50*(1<<30))
+	if opts.MaxTenantStorageBytes <= 0 {
+		return backend.Options{}, fmt.Errorf("DRIVE9_MAX_TENANT_STORAGE_BYTES must be a positive integer")
+	}
+
+	queryBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_BASE"))
+	queryAPIKey := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_KEY"))
+	queryModel := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_MODEL"))
+	queryConfigured := queryBaseURL != "" || queryAPIKey != "" || queryModel != ""
+	if queryConfigured {
+		if queryBaseURL == "" || queryAPIKey == "" || queryModel == "" {
+			return backend.Options{}, fmt.Errorf("DRIVE9_QUERY_EMBED_API_BASE, DRIVE9_QUERY_EMBED_API_KEY and DRIVE9_QUERY_EMBED_MODEL must be set together")
+		}
+		queryClient, err := embedding.NewOpenAIClient(embedding.OpenAIClientConfig{
+			BaseURL:    queryBaseURL,
+			APIKey:     queryAPIKey,
+			Model:      queryModel,
+			Dimensions: envInt("DRIVE9_QUERY_EMBED_DIMENSIONS", 0),
+			Timeout:    time.Duration(envInt("DRIVE9_QUERY_EMBED_TIMEOUT_SECONDS", 20)) * time.Second,
+		})
+		if err != nil {
+			return backend.Options{}, fmt.Errorf("init query embedder: %w", err)
+		}
+		opts.QueryEmbedding = backend.QueryEmbeddingOptions{Client: queryClient}
+		logger.Info(context.Background(), "query_embedding_mode_openai_compatible",
+			zap.String("model", queryModel), zap.String("base_url", queryBaseURL))
+	}
+
+	if !envBool("DRIVE9_IMAGE_EXTRACT_ENABLED", false) {
+		return opts, nil
+	}
+
+	async := backend.AsyncImageExtractOptions{
+		Enabled:             true,
+		QueueSize:           envInt("DRIVE9_IMAGE_EXTRACT_QUEUE_SIZE", 128),
+		Workers:             envInt("DRIVE9_IMAGE_EXTRACT_WORKERS", 1),
+		MaxImageBytes:       envInt64("DRIVE9_IMAGE_EXTRACT_MAX_BYTES", 8<<20),
+		TaskTimeout:         time.Duration(envInt("DRIVE9_IMAGE_EXTRACT_TIMEOUT_SECONDS", 20)) * time.Second,
+		MaxExtractTextBytes: envInt("DRIVE9_IMAGE_EXTRACT_MAX_TEXT_BYTES", 8<<10),
+	}
+
+	baseURL := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_API_BASE"))
+	apiKey := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_API_KEY"))
+	model := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_MODEL"))
+	prompt := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_PROMPT"))
+	maxTokens := envInt("DRIVE9_IMAGE_EXTRACT_MAX_TOKENS", 256)
+
+	configured := baseURL != "" || apiKey != "" || model != ""
+	if configured {
+		if baseURL == "" || apiKey == "" || model == "" {
+			logger.Error(context.Background(), "image_extract_mode_invalid_config",
+				zap.Bool("base_url_present", baseURL != ""),
+				zap.Bool("api_key_present", apiKey != ""),
+				zap.Bool("model_present", model != ""))
+			return backend.Options{}, fmt.Errorf("DRIVE9_IMAGE_EXTRACT_API_BASE, DRIVE9_IMAGE_EXTRACT_API_KEY and DRIVE9_IMAGE_EXTRACT_MODEL must be set together")
+		}
+		extractor, err := backend.NewOpenAIImageTextExtractor(backend.OpenAIImageTextExtractorConfig{
+			BaseURL:   baseURL,
+			APIKey:    apiKey,
+			Model:     model,
+			Prompt:    prompt,
+			MaxTokens: maxTokens,
+			Timeout:   async.TaskTimeout,
+		})
+		if err != nil {
+			return backend.Options{}, fmt.Errorf("init image extractor: %w", err)
+		}
+		async.Extractor = backend.NewFallbackImageTextExtractor(extractor, backend.NewBasicImageTextExtractor())
+		logger.Info(context.Background(), "image_extract_mode_openai_compatible",
+			zap.String("model", model), zap.String("base_url", baseURL))
+	} else {
+		async.Extractor = backend.NewBasicImageTextExtractor()
+		logger.Info(context.Background(), "image_extract_mode_basic_fallback")
+	}
+
+	opts.AsyncImageExtract = async
+	return opts, nil
+}
+
+func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorkerOptions, error) {
+	var opts server.SemanticWorkerOptions
+	baseURL := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_API_BASE"))
+	apiKey := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_API_KEY"))
+	model := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_MODEL"))
+	configured := baseURL != "" || apiKey != "" || model != ""
+	if !configured {
+		return nil, opts, nil
+	}
+	if baseURL == "" || apiKey == "" || model == "" {
+		return nil, opts, fmt.Errorf("DRIVE9_EMBED_API_BASE, DRIVE9_EMBED_API_KEY and DRIVE9_EMBED_MODEL must be set together")
+	}
+	client, err := embedding.NewOpenAIClient(embedding.OpenAIClientConfig{
+		BaseURL:    baseURL,
+		APIKey:     apiKey,
+		Model:      model,
+		Dimensions: envInt("DRIVE9_EMBED_DIMENSIONS", 0),
+		Timeout:    time.Duration(envInt("DRIVE9_EMBED_TIMEOUT_SECONDS", 20)) * time.Second,
+	})
+	if err != nil {
+		return nil, opts, fmt.Errorf("init semantic embedder: %w", err)
+	}
+	opts = server.SemanticWorkerOptions{
+		Workers:              envInt("DRIVE9_SEMANTIC_WORKERS", 1),
+		PollInterval:         time.Duration(envInt("DRIVE9_SEMANTIC_POLL_INTERVAL_MS", 200)) * time.Millisecond,
+		LeaseDuration:        time.Duration(envInt("DRIVE9_SEMANTIC_LEASE_SECONDS", 30)) * time.Second,
+		RecoverInterval:      time.Duration(envInt("DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS", 5000)) * time.Millisecond,
+		RetryBaseDelay:       time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_BASE_MS", 200)) * time.Millisecond,
+		RetryMaxDelay:        time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_MAX_MS", 30000)) * time.Millisecond,
+		TenantScanLimit:      envInt("DRIVE9_SEMANTIC_TENANT_LIMIT", 128),
+		PerTenantConcurrency: envInt("DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY", 1),
+	}
+	logger.Info(context.Background(), "semantic_embedding_mode_openai_compatible",
+		zap.String("model", model), zap.String("base_url", baseURL))
+	return client, opts, nil
+}
+
+func defaultSemanticLeaseDuration(async backend.AsyncImageExtractOptions) time.Duration {
+	lease := 30 * time.Second
+	if !async.Enabled || async.TaskTimeout <= 0 {
+		return lease
+	}
+	derived := async.TaskTimeout * 2
+	if derived > lease {
+		lease = derived
+	}
+	// TODO: Add semantic task lease renewal for long-running work, then revisit
+	// whether this conservative default lease multiplier is still necessary.
+	return lease
+}
+
+func envBool(key string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func envInt(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func envInt64(key string, fallback int64) int64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return v
+}

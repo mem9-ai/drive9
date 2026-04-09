@@ -3,15 +3,17 @@ package client
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mem9-ai/dat9/pkg/s3client"
 )
@@ -29,8 +31,43 @@ type PartURL struct {
 	URL            string            `json:"url"`
 	Size           int64             `json:"size"`
 	ChecksumSHA256 string            `json:"checksum_sha256,omitempty"`
+	ChecksumCRC32C string            `json:"checksum_crc32c,omitempty"`
 	Headers        map[string]string `json:"headers,omitempty"`
 	ExpiresAt      string            `json:"expires_at"`
+}
+
+// --- v2 upload types (on-demand presign, no upfront checksum) ---
+
+// uploadPlanV2 mirrors the server's UploadPlanV2 response.
+type uploadPlanV2 struct {
+	UploadID         string           `json:"upload_id"`
+	Key              string           `json:"key"`
+	PartSize         int64            `json:"part_size"`
+	TotalParts       int              `json:"total_parts"`
+	ExpiresAt        string           `json:"expires_at"`
+	Resumable        bool             `json:"resumable"`
+	ChecksumContract checksumContract `json:"checksum_contract"`
+}
+
+type checksumContract struct {
+	Supported []string `json:"supported"`
+	Required  bool     `json:"required"`
+}
+
+// presignedPart is a presigned URL received from the v2 presign-batch endpoint.
+type presignedPart struct {
+	Number         int               `json:"number"`
+	URL            string            `json:"url"`
+	Size           int64             `json:"size"`
+	ChecksumSHA256 string            `json:"checksum_sha256,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	ExpiresAt      time.Time         `json:"expires_at"`
+}
+
+// completePart is sent to the v2 complete endpoint.
+type completePart struct {
+	Number int    `json:"number"`
+	ETag   string `json:"etag"`
 }
 
 // ProgressFunc is called after each part upload completes.
@@ -73,8 +110,8 @@ func checksumParallelism(partSize int64, partCount int) int {
 }
 
 // WriteStream uploads data from a reader. For small files (size < threshold),
-// it does a direct PUT with body. For large files, it sends a Content-Length-only
-// PUT to get a 202 with presigned URLs, then uploads parts concurrently.
+// it does a direct PUT with body. For large files, it tries the v2 protocol
+// (on-demand presign, no upfront checksum) first, falling back to v1 on 404.
 func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc) error {
 	threshold := int64(DefaultSmallFileThreshold)
 	if c.smallFileThreshold > 0 {
@@ -90,8 +127,24 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 	}
 	ra, ok := r.(io.ReaderAt)
 	if !ok {
-		return fmt.Errorf("large uploads require an io.ReaderAt (seekable source) to compute per-part checksums")
+		return fmt.Errorf("large uploads require an io.ReaderAt (seekable source)")
 	}
+
+	// Try v2 protocol first (on-demand presign, no checksum pre-computation).
+	err := c.writeStreamV2(ctx, path, ra, size, progress)
+	if err == errV2NotAvailable {
+		// Server doesn't support v2 — fall back to v1.
+		return c.writeStreamV1(ctx, path, ra, size, progress)
+	}
+	return err
+}
+
+// errV2NotAvailable is a sentinel indicating the server returned 404 for
+// the v2 initiate endpoint, so the caller should fall back to v1.
+var errV2NotAvailable = fmt.Errorf("v2 upload API not available")
+
+// writeStreamV1 is the original v1 upload path: pre-compute checksums → initiate → upload all.
+func (c *Client) writeStreamV1(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc) error {
 	checksums, err := computePartChecksumsFromReaderAt(ra, size, s3client.PartSize)
 	if err != nil {
 		return fmt.Errorf("compute part checksums: %w", err)
@@ -101,6 +154,43 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 		return err
 	}
 	return c.uploadParts(ctx, plan, ra, progress)
+}
+
+// writeStreamV2 implements the v2 upload protocol:
+// 1. Initiate (no checksums, server returns part_size + total_parts)
+// 2. Pipelined presign: background goroutine fetches presigned URLs in batches
+// 3. Upload goroutines consume presigned URLs from channel
+// 4. Complete with part ETags, or abort on failure
+func (c *Client) writeStreamV2(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc) error {
+	plan, err := c.initiateUploadV2(ctx, path, size)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Pipelined presign: feed presigned URLs into a buffered channel.
+	parallelism := uploadParallelism(plan.PartSize)
+	presignCh := make(chan presignedPart, parallelism)
+	presignErrCh := make(chan error, 1)
+
+	go c.presignPipeline(ctx, plan, parallelism, presignCh, presignErrCh)
+
+	// Upload parts, collecting ETags for the complete call.
+	parts, err := c.uploadPartsV2(ctx, plan, ra, presignCh, presignErrCh, progress)
+	if err != nil {
+		_ = c.abortUploadV2(context.Background(), plan.UploadID)
+		return err
+	}
+
+	if err := c.completeUploadV2(ctx, plan.UploadID, parts); err != nil {
+		// Complete failed (network error, 5xx, 409, 410) — best-effort abort
+		// to avoid leaving orphaned multipart uploads / upload rows.
+		_ = c.abortUploadV2(context.Background(), plan.UploadID)
+		return err
+	}
+	return nil
 }
 
 type uploadInitiateRequest struct {
@@ -276,11 +366,10 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 
 // uploadOnePart PUTs data to a presigned URL and returns the ETag.
 func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (string, error) {
-	checksum := part.ChecksumSHA256
+	checksum := part.ChecksumCRC32C
 	if checksum == "" {
-		// No pre-computed checksum (legacy path) — compute it now.
-		h := sha256.Sum256(data)
-		checksum = base64.StdEncoding.EncodeToString(h[:])
+		// No pre-computed checksum — compute CRC32C now.
+		checksum = computeCRC32C(data)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, part.URL, bytes.NewReader(data))
@@ -294,7 +383,7 @@ func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (
 		req.Header.Set(k, v)
 	}
 	req.ContentLength = int64(len(data))
-	req.Header.Set("x-amz-checksum-sha256", checksum)
+	req.Header.Set("x-amz-checksum-crc32c", checksum)
 
 	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
 	if err != nil {
@@ -325,6 +414,340 @@ func (c *Client) completeUpload(ctx context.Context, uploadID string) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode >= 300 {
+		return readError(resp)
+	}
+	return nil
+}
+
+// --- v2 upload methods ---
+
+// initiateUploadV2 calls POST /v2/uploads/initiate.
+// Returns errV2NotAvailable if the server responds with 404.
+func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64) (*uploadPlanV2, error) {
+	body, err := json.Marshal(struct {
+		Path      string `json:"path"`
+		TotalSize int64  `json:"total_size"`
+	}{Path: path, TotalSize: size})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v2/uploads/initiate", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, errV2NotAvailable
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		return nil, readError(resp)
+	}
+	var plan uploadPlanV2
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		return nil, fmt.Errorf("decode v2 upload plan: %w", err)
+	}
+	return &plan, nil
+}
+
+// presignPipeline runs in a background goroutine. It fetches presigned URLs
+// in batches via POST /v2/uploads/{id}/presign-batch and sends them to presignCh.
+// The channel is closed when all parts have been presigned or an error occurs.
+func (c *Client) presignPipeline(ctx context.Context, plan *uploadPlanV2, batchSize int, presignCh chan<- presignedPart, errCh chan<- error) {
+	defer close(presignCh)
+
+	for start := 1; start <= plan.TotalParts; start += batchSize {
+		end := start + batchSize - 1
+		if end > plan.TotalParts {
+			end = plan.TotalParts
+		}
+
+		// Build batch request (no checksums in phase 1)
+		entries := make([]struct {
+			PartNumber int `json:"part_number"`
+		}, 0, end-start+1)
+		for i := start; i <= end; i++ {
+			entries = append(entries, struct {
+				PartNumber int `json:"part_number"`
+			}{PartNumber: i})
+		}
+
+		body, err := json.Marshal(struct {
+			Parts any `json:"parts"`
+		}{Parts: entries})
+		if err != nil {
+			errCh <- fmt.Errorf("marshal presign batch: %w", err)
+			return
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			c.baseURL+"/v2/uploads/"+plan.UploadID+"/presign-batch", bytes.NewReader(body))
+		if err != nil {
+			errCh <- fmt.Errorf("create presign batch request: %w", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.do(req)
+		if err != nil {
+			errCh <- fmt.Errorf("presign batch: %w", err)
+			return
+		}
+
+		if resp.StatusCode >= 300 {
+			err = readError(resp)
+			_ = resp.Body.Close()
+			errCh <- fmt.Errorf("presign batch HTTP %d: %w", resp.StatusCode, err)
+			return
+		}
+
+		var result struct {
+			Parts []presignedPart `json:"parts"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			_ = resp.Body.Close()
+			errCh <- fmt.Errorf("decode presign batch: %w", err)
+			return
+		}
+		_ = resp.Body.Close()
+
+		for _, p := range result.Parts {
+			select {
+			case presignCh <- p:
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			}
+		}
+	}
+}
+
+// uploadPartsV2 reads presigned URLs from presignCh and uploads parts concurrently.
+// Returns the completed parts (number + etag) in order.
+func (c *Client) uploadPartsV2(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt,
+	presignCh <-chan presignedPart, presignErrCh <-chan error, progress ProgressFunc) ([]completePart, error) {
+
+	parallelism := uploadParallelism(plan.PartSize)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make([]completePart, plan.TotalParts)
+	errCh := make(chan error, 1)
+	sem := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+
+	for pp := range presignCh {
+		// Check for presign pipeline errors
+		select {
+		case err := <-presignErrCh:
+			cancel()
+			wg.Wait()
+			return nil, fmt.Errorf("presign pipeline: %w", err)
+		default:
+		}
+
+		// Check for prior upload errors
+		select {
+		case err := <-errCh:
+			cancel()
+			wg.Wait()
+			return nil, err
+		default:
+		}
+
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return nil, ctx.Err()
+		}
+
+		wg.Add(1)
+		go func(p presignedPart) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			data := make([]byte, p.Size)
+			offset := int64(p.Number-1) * plan.PartSize
+			n, err := ra.ReadAt(data, offset)
+			if err != nil && err != io.EOF {
+				select {
+				case errCh <- fmt.Errorf("read part %d: %w", p.Number, err):
+				default:
+				}
+				cancel()
+				return
+			}
+			if int64(n) != p.Size {
+				select {
+				case errCh <- fmt.Errorf("short read for part %d: got %d want %d", p.Number, n, p.Size):
+				default:
+				}
+				cancel()
+				return
+			}
+
+			etag, err := c.uploadOnePartV2(ctx, p, data)
+			if err == errPresignExpired {
+				// Presigned URL expired — fetch a fresh one and retry once.
+				fresh, presignErr := c.presignOnePart(ctx, plan.UploadID, p.Number)
+				if presignErr != nil {
+					select {
+					case errCh <- fmt.Errorf("re-presign part %d: %w", p.Number, presignErr):
+					default:
+					}
+					cancel()
+					return
+				}
+				etag, err = c.uploadOnePartV2(ctx, *fresh, data)
+			}
+			if err != nil {
+				select {
+				case errCh <- fmt.Errorf("part %d: %w", p.Number, err):
+				default:
+				}
+				cancel()
+				return
+			}
+
+			results[p.Number-1] = completePart{Number: p.Number, ETag: etag}
+
+			if progress != nil {
+				progress(p.Number, plan.TotalParts, int64(len(data)))
+			}
+		}(pp)
+	}
+
+	wg.Wait()
+
+	// Check for any remaining errors
+	select {
+	case err := <-presignErrCh:
+		return nil, fmt.Errorf("presign pipeline: %w", err)
+	default:
+	}
+	select {
+	case err := <-errCh:
+		return nil, err
+	default:
+	}
+
+	return results, nil
+}
+
+// errPresignExpired indicates S3 returned 403, likely due to an expired presigned URL.
+var errPresignExpired = fmt.Errorf("presigned URL expired")
+
+// uploadOnePartV2 PUTs data to a presigned URL and returns the ETag.
+// Phase 1: no per-part checksum header — checksum negotiation deferred to #113/#114.
+// Returns errPresignExpired on 403 so callers can re-presign and retry.
+func (c *Client) uploadOnePartV2(ctx context.Context, part presignedPart, data []byte) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, part.URL, bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	for k, v := range part.Headers {
+		if strings.EqualFold(k, "host") {
+			continue
+		}
+		req.Header.Set(k, v)
+	}
+	req.ContentLength = int64(len(data))
+
+	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusForbidden {
+		return "", errPresignExpired
+	}
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	return resp.Header.Get("ETag"), nil
+}
+
+// presignOnePart fetches a fresh presigned URL for a single part via
+// POST /v2/uploads/{id}/presign. Used to retry after presigned URL expiry.
+func (c *Client) presignOnePart(ctx context.Context, uploadID string, partNumber int) (*presignedPart, error) {
+	body, err := json.Marshal(struct {
+		PartNumber int `json:"part_number"`
+	}{PartNumber: partNumber})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/v2/uploads/"+uploadID+"/presign", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var p presignedPart
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		return nil, fmt.Errorf("decode presign response: %w", err)
+	}
+	return &p, nil
+}
+
+// completeUploadV2 sends the part list to POST /v2/uploads/{id}/complete.
+func (c *Client) completeUploadV2(ctx context.Context, uploadID string, parts []completePart) error {
+	body, err := json.Marshal(struct {
+		Parts []completePart `json:"parts"`
+	}{Parts: parts})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/v2/uploads/"+uploadID+"/complete", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 300 {
+		return readError(resp)
+	}
+	return nil
+}
+
+// abortUploadV2 sends POST /v2/uploads/{id}/abort.
+func (c *Client) abortUploadV2(ctx context.Context, uploadID string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/v2/uploads/"+uploadID+"/abort", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return readError(resp)
 	}
@@ -750,8 +1173,7 @@ func computePartChecksumsFromReaderAt(r io.ReaderAt, totalSize int64, partSize i
 					})
 					return
 				}
-				h := sha256.Sum256(data)
-				checksums[i] = base64.StdEncoding.EncodeToString(h[:])
+				checksums[i] = computeCRC32C(data)
 			}
 		}()
 	}
@@ -761,4 +1183,13 @@ func computePartChecksumsFromReaderAt(r io.ReaderAt, totalSize int64, partSize i
 		return nil, firstErr
 	}
 	return checksums, nil
+}
+
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+
+func computeCRC32C(data []byte) string {
+	v := crc32.Checksum(data, crc32cTable)
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, v)
+	return base64.StdEncoding.EncodeToString(b)
 }

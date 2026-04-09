@@ -44,6 +44,7 @@ const (
 type UploadStatus string
 
 const (
+	UploadInitiated UploadStatus = "INITIATED"
 	UploadUploading UploadStatus = "UPLOADING"
 	UploadCompleted UploadStatus = "COMPLETED"
 	UploadAborted   UploadStatus = "ABORTED"
@@ -107,8 +108,7 @@ type Upload struct {
 
 // Store is the metadata store backed by TiDB/MySQL (stand-in for db9).
 type Store struct {
-	db             *sql.DB
-	hasContentBlob bool
+	db *sql.DB
 }
 
 func Open(dsn string) (*Store, error) {
@@ -124,9 +124,7 @@ func Open(dsn string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
-	s := &Store{db: db}
-	s.hasContentBlob = s.columnExists("files", "content_blob")
-	return s, nil
+	return &Store{db: db}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -389,22 +387,11 @@ func (s *Store) InsertFile(ctx context.Context, f *File) (err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "insert_file", start, &err)
 
-	if s.hasContentBlob {
-		_, err = s.db.ExecContext(ctx, `INSERT INTO files
-			(file_id, storage_type, storage_ref, content_blob, content_type, size_bytes, checksum_sha256,
-			 revision, status, source_id, content_text, created_at, confirmed_at, expires_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			f.FileID, f.StorageType, f.StorageRef, nilBytes(f.ContentBlob), nullStr(f.ContentType),
-			f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
-			nullStr(f.SourceID), nullStr(f.ContentText),
-			f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
-		return err
-	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO files
-		(file_id, storage_type, storage_ref, content_type, size_bytes, checksum_sha256,
+		(file_id, storage_type, storage_ref, content_blob, content_type, size_bytes, checksum_sha256,
 		 revision, status, source_id, content_text, created_at, confirmed_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.FileID, f.StorageType, f.StorageRef, nullStr(f.ContentType),
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.FileID, f.StorageType, f.StorageRef, nilBytes(f.ContentBlob), nullStr(f.ContentType),
 		f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
 		nullStr(f.SourceID), nullStr(f.ContentText),
 		f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
@@ -415,19 +402,11 @@ func (s *Store) GetFile(ctx context.Context, fileID string) (out *File, err erro
 	start := time.Now()
 	defer observeStoreOp(ctx, "get_file", start, &err)
 
-	if s.hasContentBlob {
-		row := s.db.QueryRowContext(ctx, `SELECT file_id, storage_type, storage_ref, content_blob, content_type,
-			size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
-			created_at, confirmed_at, expires_at
-			FROM files WHERE file_id = ?`, fileID)
-		out, err = scanFileWithBlob(row)
-		return out, err
-	}
-	row := s.db.QueryRowContext(ctx, `SELECT file_id, storage_type, storage_ref, content_type,
+	row := s.db.QueryRowContext(ctx, `SELECT file_id, storage_type, storage_ref, content_blob, content_type,
 		size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
 		created_at, confirmed_at, expires_at
 		FROM files WHERE file_id = ?`, fileID)
-	out, err = scanFileNoBlob(row)
+	out, err = scanFileWithBlob(row)
 	return out, err
 }
 
@@ -435,26 +414,13 @@ func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageTyp
 	start := time.Now()
 	defer observeStoreOp(ctx, "update_file_content", start, &err)
 
-	var (
-		res sql.Result
-	)
-	if s.hasContentBlob {
-		res, err = s.db.ExecContext(ctx, `UPDATE files SET storage_type = ?, storage_ref = ?,
-			content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,
-			revision = revision + 1, status = 'CONFIRMED',
-			confirmed_at = ?
-			WHERE file_id = ?`,
-			storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
-			nullStr(checksum), nullStr(contentText), time.Now().UTC(), fileID)
-	} else {
-		res, err = s.db.ExecContext(ctx, `UPDATE files SET storage_type = ?, storage_ref = ?,
-			content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,
-			revision = revision + 1, status = 'CONFIRMED',
-			confirmed_at = ?
-			WHERE file_id = ?`,
-			storageType, storageRef, nullStr(contentType), size,
-			nullStr(checksum), nullStr(contentText), time.Now().UTC(), fileID)
-	}
+	res, err := s.db.ExecContext(ctx, `UPDATE files SET storage_type = ?, storage_ref = ?,
+		content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,
+		revision = revision + 1, status = 'CONFIRMED',
+		confirmed_at = ?
+		WHERE file_id = ?`,
+		storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
+		nullStr(checksum), nullStr(contentText), time.Now().UTC(), fileID)
 	if err != nil {
 		return 0, err
 	}
@@ -583,6 +549,57 @@ func (s *Store) MarkFileDeleted(ctx context.Context, fileID string) (err error) 
 	return err
 }
 
+// ConfirmedStorageBytesTx returns the total bytes occupied by confirmed file
+// entities in the current tenant database.
+func (s *Store) ConfirmedStorageBytesTx(db execer) (int64, error) {
+	var total sql.NullInt64
+	if err := db.QueryRow(`SELECT COALESCE(SUM(size_bytes), 0) FROM files WHERE status = 'CONFIRMED'`).Scan(&total); err != nil {
+		return 0, err
+	}
+	return total.Int64, nil
+}
+
+// ActiveUploadReservedBytesTx returns the additional bytes reserved by active
+// multipart uploads beyond what is already counted by the confirmed file set.
+func (s *Store) ActiveUploadReservedBytesTx(db execer) (int64, error) {
+	var total sql.NullInt64
+	// TODO: This aggregation joins uploads -> file_nodes -> files on every quota
+	// check. If upload concurrency grows, re-evaluate the access path and add a
+	// more targeted uploads status/index strategy or a pre-aggregated quota state.
+	err := db.QueryRow(`SELECT COALESCE(SUM(
+		CASE
+			WHEN u.total_size > COALESCE(f.size_bytes, 0) THEN u.total_size - COALESCE(f.size_bytes, 0)
+			ELSE 0
+		END
+	), 0)
+		FROM uploads u
+		LEFT JOIN file_nodes fn ON fn.path = u.target_path
+		LEFT JOIN files f ON f.file_id = fn.file_id AND f.status = 'CONFIRMED'
+		WHERE u.status IN ('INITIATED', 'UPLOADING') AND u.expires_at > ?`, time.Now().UTC()).Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+	return total.Int64, nil
+}
+
+// ConfirmedFileSizeByPathTx returns the current confirmed file size at path.
+// Missing paths and directories report zero bytes.
+func (s *Store) ConfirmedFileSizeByPathTx(db execer, path string) (int64, error) {
+	var size sql.NullInt64
+	err := db.QueryRow(`SELECT f.size_bytes
+		FROM file_nodes fn
+		JOIN files f ON f.file_id = fn.file_id
+		WHERE fn.path = ? AND fn.is_directory = 0 AND f.status = 'CONFIRMED'
+		LIMIT 1`, path).Scan(&size)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return size.Int64, nil
+}
+
 // --- composite operations ---
 
 func (s *Store) Stat(ctx context.Context, path string) (out *NodeWithFile, err error) {
@@ -609,12 +626,10 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 	start := time.Now()
 	defer observeStoreOp(ctx, "list_dir", start, &err)
 
+	// TODO(#110): ReadDir only needs lightweight file metadata. Split this into a
+	// metadata-only listing path so directory scans do not fetch or copy content_blob.
 	q := `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
-		f.file_id, f.storage_type, f.storage_ref, `
-	if s.hasContentBlob {
-		q += `f.content_blob, `
-	}
-	q += `f.content_type, f.size_bytes,
+		f.file_id, f.storage_type, f.storage_ref, f.content_blob, f.content_type, f.size_bytes,
 		f.checksum_sha256, f.revision, f.embedding_revision, f.status, f.source_id, f.content_text,
 		f.created_at, f.confirmed_at, f.expires_at
 		FROM file_nodes fn
@@ -629,12 +644,7 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 
 	result := make([]*NodeWithFile, 0)
 	for rows.Next() {
-		var nf *NodeWithFile
-		if s.hasContentBlob {
-			nf, err = scanNodeWithFileWithBlob(rows)
-		} else {
-			nf, err = scanNodeWithFileNoBlob(rows)
-		}
+		nf, err := scanNodeWithFileWithBlob(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -692,20 +702,11 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 		return nil, err
 	}
 
-	q := `SELECT file_id, storage_type, storage_ref, `
-	if s.hasContentBlob {
-		q += `content_blob, `
-	}
-	q += `content_type, size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
+	row := tx.QueryRow(`SELECT file_id, storage_type, storage_ref, content_blob, content_type,
+		size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
 		created_at, confirmed_at, expires_at
-		FROM files WHERE file_id = ?`
-	row := tx.QueryRow(q, fileID.String)
-	var f *File
-	if s.hasContentBlob {
-		f, err = scanFileWithBlob(row)
-	} else {
-		f, err = scanFileNoBlob(row)
-	}
+		FROM files WHERE file_id = ?`, fileID.String)
+	f, err := scanFileWithBlob(row)
 	if err != nil {
 		return nil, err
 	}
@@ -763,20 +764,11 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		if _, err := tx.Exec(`DELETE FROM file_tags WHERE file_id = ?`, fid); err != nil {
 			return nil, err
 		}
-		q := `SELECT file_id, storage_type, storage_ref, `
-		if s.hasContentBlob {
-			q += `content_blob, `
-		}
-		q += `content_type, size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
+		row := tx.QueryRow(`SELECT file_id, storage_type, storage_ref, content_blob, content_type,
+			size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
 			created_at, confirmed_at, expires_at
-			FROM files WHERE file_id = ?`
-		row := tx.QueryRow(q, fid)
-		var f *File
-		if s.hasContentBlob {
-			f, err = scanFileWithBlob(row)
-		} else {
-			f, err = scanFileNoBlob(row)
-		}
+			FROM files WHERE file_id = ?`, fid)
+		f, err := scanFileWithBlob(row)
 		if err != nil {
 			return nil, err
 		}
@@ -796,7 +788,12 @@ func (s *Store) InsertUpload(ctx context.Context, u *Upload) (err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "insert_upload", start, &err)
 
-	_, err = s.db.ExecContext(ctx, `INSERT INTO uploads
+	err = s.InsertUploadTx(s.db, u)
+	return err
+}
+
+func (s *Store) InsertUploadTx(db execer, u *Upload) error {
+	_, err := db.Exec(`INSERT INTO uploads
 		(upload_id, file_id, target_path, s3_upload_id, s3_key, total_size, part_size,
 		 parts_total, status, fingerprint_sha256, idempotency_key, created_at, updated_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -829,8 +826,8 @@ func (s *Store) GetUploadByPath(ctx context.Context, targetPath string) (out *Up
 	row := s.db.QueryRowContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
 		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
-		FROM uploads WHERE target_path = ? AND status = 'UPLOADING'
-		ORDER BY created_at DESC LIMIT 1`, targetPath)
+		FROM uploads WHERE target_path = ? AND status IN ('INITIATED', 'UPLOADING') AND expires_at > ?
+		ORDER BY created_at DESC LIMIT 1`, targetPath, time.Now().UTC())
 	out, err = scanUpload(row)
 	return out, err
 }
@@ -853,6 +850,51 @@ func (s *Store) AbortUpload(ctx context.Context, uploadID string) (err error) {
 		updated_at = ?
 		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
 	return err
+}
+
+// AbortUploadV2 sets an upload to ABORTED from either INITIATED or UPLOADING.
+// Returns nil (idempotent) if the upload is already aborted or not found.
+func (s *Store) AbortUploadV2(ctx context.Context, uploadID string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "abort_upload_v2", start, &err)
+
+	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = 'ABORTED',
+		updated_at = ?
+		WHERE upload_id = ? AND status IN ('INITIATED', 'UPLOADING')`, time.Now().UTC(), uploadID)
+	return err
+}
+
+// UpdateUploadStatus transitions an upload to a new status.
+func (s *Store) UpdateUploadStatus(ctx context.Context, uploadID string, status UploadStatus) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "update_upload_status", start, &err)
+
+	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = ?,
+		updated_at = ?
+		WHERE upload_id = ?`, string(status), time.Now().UTC(), uploadID)
+	return err
+}
+
+// TransitionUploadStatus atomically transitions an upload from expectedStatus to newStatus.
+// Returns ErrUploadNotActive if the current status doesn't match expectedStatus.
+func (s *Store) TransitionUploadStatus(ctx context.Context, uploadID string, expectedStatus, newStatus UploadStatus) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "transition_upload_status", start, &err)
+
+	res, err := s.db.ExecContext(ctx, `UPDATE uploads SET status = ?,
+		updated_at = ?
+		WHERE upload_id = ? AND status = ?`, string(newStatus), time.Now().UTC(), uploadID, string(expectedStatus))
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrUploadNotActive
+	}
+	return nil
 }
 
 func (s *Store) ListUploadsByPath(ctx context.Context, targetPath string, status UploadStatus) (out []*Upload, err error) {
@@ -944,41 +986,6 @@ func scanFileWithBlob(s scanner) (*File, error) {
 	return &f, nil
 }
 
-func scanFileNoBlob(s scanner) (*File, error) {
-	var f File
-	var contentType, checksum, sourceID, contentText sql.NullString
-	var embeddingRevision sql.NullInt64
-	var confirmedAt, expiresAt sql.NullTime
-	var createdAt time.Time
-	err := s.Scan(&f.FileID, &f.StorageType, &f.StorageRef, &contentType,
-		&f.SizeBytes, &checksum, &f.Revision, &embeddingRevision, &f.Status, &sourceID, &contentText,
-		&createdAt, &confirmedAt, &expiresAt)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, err
-	}
-	f.ContentType = contentType.String
-	f.ChecksumSHA256 = checksum.String
-	f.SourceID = sourceID.String
-	f.ContentText = contentText.String
-	if embeddingRevision.Valid {
-		rev := embeddingRevision.Int64
-		f.EmbeddingRevision = &rev
-	}
-	f.CreatedAt = createdAt.UTC()
-	if confirmedAt.Valid {
-		t := confirmedAt.Time.UTC()
-		f.ConfirmedAt = &t
-	}
-	if expiresAt.Valid {
-		t := expiresAt.Time.UTC()
-		f.ExpiresAt = &t
-	}
-	return &f, nil
-}
-
 func scanNodeWithFileWithBlob(rows *sql.Rows) (*NodeWithFile, error) {
 	var n FileNode
 	var isDir int
@@ -1011,63 +1018,6 @@ func scanNodeWithFileWithBlob(rows *sql.Rows) (*NodeWithFile, error) {
 			StorageType:    StorageType(fStorageType.String),
 			StorageRef:     fStorageRef.String,
 			ContentBlob:    append([]byte(nil), fContentBlob...),
-			ContentType:    fContentType.String,
-			SizeBytes:      fSizeBytes.Int64,
-			ChecksumSHA256: fChecksum.String,
-			Revision:       fRevision.Int64,
-			Status:         FileStatus(fStatus.String),
-			SourceID:       fSourceID.String,
-			ContentText:    fContentText.String,
-		}
-		if fEmbeddingRevision.Valid {
-			rev := fEmbeddingRevision.Int64
-			nf.File.EmbeddingRevision = &rev
-		}
-		if fCreatedAt.Valid {
-			nf.File.CreatedAt = fCreatedAt.Time.UTC()
-		}
-		if fConfirmedAt.Valid {
-			t := fConfirmedAt.Time.UTC()
-			nf.File.ConfirmedAt = &t
-		}
-		if fExpiresAt.Valid {
-			t := fExpiresAt.Time.UTC()
-			nf.File.ExpiresAt = &t
-		}
-	}
-	return nf, nil
-}
-
-func scanNodeWithFileNoBlob(rows *sql.Rows) (*NodeWithFile, error) {
-	var n FileNode
-	var isDir int
-	var nodeFileID sql.NullString
-	var nodeCreatedAt time.Time
-
-	var fFileID, fStorageType, fStorageRef sql.NullString
-	var fContentType, fChecksum, fSourceID, fContentText sql.NullString
-	var fSizeBytes, fRevision, fEmbeddingRevision sql.NullInt64
-	var fStatus sql.NullString
-	var fCreatedAt, fConfirmedAt, fExpiresAt sql.NullTime
-
-	err := rows.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
-		&fFileID, &fStorageType, &fStorageRef, &fContentType, &fSizeBytes,
-		&fChecksum, &fRevision, &fEmbeddingRevision, &fStatus, &fSourceID, &fContentText,
-		&fCreatedAt, &fConfirmedAt, &fExpiresAt)
-	if err != nil {
-		return nil, err
-	}
-
-	n.IsDirectory = isDir != 0
-	n.FileID = nodeFileID.String
-	n.CreatedAt = nodeCreatedAt.UTC()
-
-	nf := &NodeWithFile{Node: n}
-	if fFileID.Valid {
-		nf.File = &File{
-			FileID:         fFileID.String,
-			StorageType:    StorageType(fStorageType.String),
-			StorageRef:     fStorageRef.String,
 			ContentType:    fContentType.String,
 			SizeBytes:      fSizeBytes.Int64,
 			ChecksumSHA256: fChecksum.String,

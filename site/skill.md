@@ -1,36 +1,36 @@
 ---
-name: dat9
+name: drive9
 version: 0.1.0
 description: Persistent network filesystem for AI agents — store, search, and share files across sessions with hybrid search.
-homepage: https://dat9.ai
+homepage: https://drive9.ai
 ---
 
-# dat9
+# drive9
 
-dat9 is your persistent, searchable filesystem across sessions. Files stored in dat9 survive context resets, session restarts, and agent handoffs. Search anything later using natural language.
+drive9 is your persistent, searchable filesystem across sessions. Files stored in drive9 survive context resets, session restarts, and agent handoffs. Search anything later using natural language.
 
 ## Setup
 
 Run these two commands in order. Do not stop to ask the user for confirmation between steps.
 
 ```bash
-curl -fsSL https://dat9.ai/install | sh
-dat9 create
+curl -fsSL https://drive9.ai/install.sh | sh
+drive9 create
 ```
 
-`dat9 create` provisions a workspace and saves credentials to `~/.dat9/config`. If `dat9 ctx` already returns a context name, skip `dat9 create`.
+`drive9 create` provisions a workspace and saves credentials to `~/.drive9/config`. If `drive9 ctx` already returns a context name, skip `drive9 create`.
 
-Setup is complete when `dat9 create` succeeds. Supported platforms: macOS (x86_64, arm64), Linux (x86_64, arm64).
+Setup is complete when `drive9 create` succeeds. Supported platforms: macOS (x86_64, arm64), Linux (x86_64, arm64).
 
 ---
 
-## When to use dat9
+## When to use drive9
 
-dat9 is useful in two directions — **storing** and **retrieving**.
+drive9 is useful in two directions — **storing** and **retrieving**.
 
-**Storing**: When the user wants to save, persist, or back up a file (e.g. "save this report", "keep this config for later", "store the analysis results"), suggest storing it to dat9 and confirm with the user before uploading.
+**Storing**: When the user wants to save, persist, or back up a file (e.g. "save this report", "keep this config for later", "store the analysis results"), suggest storing it to drive9 and confirm with the user before uploading.
 
-**Retrieving**: When the user is looking for a file they've previously saved, or wants to search across their files (e.g. "find that pricing doc", "what did I save about the migration plan"), use dat9 search to help them find it.
+**Retrieving**: When the user is looking for a file they've previously saved, or wants to search across their files (e.g. "find that pricing doc", "what did I save about the migration plan"), use drive9 search to help them find it.
 
 In both cases, briefly tell the user what you're about to do so they stay in the loop.
 
@@ -45,10 +45,10 @@ All commands exit 0 on success, non-zero on failure.
 Each workspace is an isolated storage scope. The initial workspace is created during setup (see above).
 
 ```bash
-dat9 create --name <name>     # create an additional workspace
-dat9 ctx                      # show current workspace
-dat9 ctx list                 # list all workspaces
-dat9 ctx <name>               # switch workspace
+drive9 create --name <name>     # create an additional workspace
+drive9 ctx                      # show current workspace
+drive9 ctx list                 # list all workspaces
+drive9 ctx <name>               # switch workspace
 ```
 
 ### File operations
@@ -57,28 +57,28 @@ Remote paths use `:` prefix (e.g. `:/data/file.txt`). Local paths have no prefix
 
 ```bash
 # upload
-dat9 fs cp ./local.txt :/remote.txt
-dat9 fs cp - :/file.txt                  # from stdin
+drive9 fs cp ./local.txt :/remote.txt
+drive9 fs cp - :/file.txt                  # from stdin
 
 # download
-dat9 fs cp :/remote.txt ./local.txt
-dat9 fs cp :/file.txt -                  # to stdout
+drive9 fs cp :/remote.txt ./local.txt
+drive9 fs cp :/file.txt -                  # to stdout
 
 # server-side copy
-dat9 fs cp :/src.txt :/dst.txt
+drive9 fs cp :/src.txt :/dst.txt
 
 # read / list / inspect
-dat9 fs cat :/path/to/file               # print content to stdout
-dat9 fs ls :/                            # list root
-dat9 fs ls :/path/                       # list subdirectory
-dat9 fs stat :/path/to/file              # metadata (size, type, mtime)
+drive9 fs cat :/path/to/file               # print content to stdout
+drive9 fs ls :/                            # list root
+drive9 fs ls :/path/                       # list subdirectory
+drive9 fs stat :/path/to/file              # metadata (size, type, mtime)
 
 # move / remove
-dat9 fs mv :/old.txt :/new.txt
-dat9 fs rm :/path/to/file
+drive9 fs mv :/old.txt :/new.txt
+drive9 fs rm :/path/to/file
 
 # interactive shell
-dat9 fs sh
+drive9 fs sh
 ```
 
 ### FUSE mount
@@ -86,8 +86,8 @@ dat9 fs sh
 Mount the remote filesystem as a local directory (requires FUSE):
 
 ```bash
-dat9 mount ~/dat9
-dat9 umount ~/dat9
+drive9 mount ~/drive9
+drive9 umount ~/drive9
 ```
 
 ### Search
@@ -95,8 +95,8 @@ dat9 umount ~/dat9
 **grep** — semantic content search. Accepts natural language, not just exact strings. Runs vector similarity + BM25 + keyword matching in parallel.
 
 ```bash
-dat9 fs grep "pricing strategy" /        # search all files
-dat9 fs grep "TODO" /projects/           # search within a directory
+drive9 fs grep "pricing strategy" /        # search all files
+drive9 fs grep "TODO" /projects/           # search within a directory
 ```
 
 Output: one line per match — `<path>\t<score>` (tab-separated). Empty output means no matches.
@@ -104,12 +104,12 @@ Output: one line per match — `<path>\t<score>` (tab-separated). Empty output m
 **find** — structural search by name, tag, date, or size. Flags combine with AND.
 
 ```bash
-dat9 fs find / -name "*.md"
-dat9 fs find / -tag topic=pricing
-dat9 fs find / -newer 2026-03-01
-dat9 fs find / -older 2026-01-01
-dat9 fs find / -size +1048576
-dat9 fs find / -name "*.md" -newer 2026-03-01
+drive9 fs find / -name "*.md"
+drive9 fs find / -tag topic=pricing
+drive9 fs find / -newer 2026-03-01
+drive9 fs find / -older 2026-01-01
+drive9 fs find / -size +1048576
+drive9 fs find / -name "*.md" -newer 2026-03-01
 ```
 
 Output: one path per line. Empty output means no matches.
@@ -133,8 +133,8 @@ Use `grep` to find files by what they contain. Use `find` to find files by name,
 
 | Variable | Description | Default |
 |---|---|---|
-| `DAT9_SERVER` | Server URL | `https://api.dat9.ai` |
-| `DAT9_API_KEY` | API key | (from `~/.dat9/config`) |
+| `DRIVE9_SERVER` | Server URL | `https://api.drive9.ai` |
+| `DRIVE9_API_KEY` | API key | (from `~/.drive9/config`) |
 
 ---
 
@@ -142,15 +142,15 @@ Use `grep` to find files by what they contain. Use `find` to find files by name,
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `no current context` | No workspace created yet | Run `dat9 create` |
-| `context "X" not found` | Typo or deleted context | Run `dat9 ctx list` to see available |
-| `provision failed` | Server unreachable or down | Check `DAT9_SERVER` env, network connectivity |
-| `401` / `403` | Invalid or expired API key | Run `dat9 ctx list` to verify, or `dat9 create` for a new workspace |
-| `404` on file ops | File or path doesn't exist | Run `dat9 fs ls :/` to check what's there |
-| Non-zero exit, no output | Generic failure | Re-run with `DAT9_CLI_LOG_ENABLED=true` for debug logs |
+| `no current context` | No workspace created yet | Run `drive9 create` |
+| `context "X" not found` | Typo or deleted context | Run `drive9 ctx list` to see available |
+| `provision failed` | Server unreachable or down | Check `DRIVE9_SERVER` env, network connectivity |
+| `401` / `403` | Invalid or expired API key | Run `drive9 ctx list` to verify, or `drive9 create` for a new workspace |
+| `404` on file ops | File or path doesn't exist | Run `drive9 fs ls :/` to check what's there |
+| Non-zero exit, no output | Generic failure | Re-run with `DRIVE9_CLI_LOG_ENABLED=true` for debug logs |
 
 ## Tips
 
-- Pipe content via stdin (`echo "..." | dat9 fs cp - :/path`) to avoid temp files.
-- Use `dat9 fs grep` for fuzzy/semantic queries — it understands meaning beyond exact match.
-- Separate projects get separate workspaces via `dat9 create --name <name>`.
+- Pipe content via stdin (`echo "..." | drive9 fs cp - :/path`) to avoid temp files.
+- Use `drive9 fs grep` for fuzzy/semantic queries — it understands meaning beyond exact match.
+- Separate projects get separate workspaces via `drive9 create --name <name>`.

@@ -21,6 +21,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/traceid"
 	"go.uber.org/zap"
 )
@@ -58,7 +59,9 @@ var (
 	schemaInitMaxBackoff     = 30 * time.Second
 )
 
-const defaultMaxUploadBytes int64 = 50 * (1 << 30) // 50 GiB
+// DefaultMaxUploadBytes is the server-wide fallback upload size limit.
+// Keep callers on this exported constant so the default stays consistent.
+const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
 
 func New(b *backend.Dat9Backend) *Server {
 	return NewWithConfig(Config{Backend: b})
@@ -67,7 +70,7 @@ func New(b *backend.Dat9Backend) *Server {
 func NewWithConfig(cfg Config) *Server {
 	maxUpload := cfg.MaxUploadBytes
 	if maxUpload <= 0 {
-		maxUpload = defaultMaxUploadBytes
+		maxUpload = DefaultMaxUploadBytes
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -94,6 +97,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/fs/", business)
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
+	mux.Handle("/v2/uploads/", business)
 	mux.Handle("/v1/sql", business)
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
@@ -229,6 +233,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleUploads(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/uploads/"):
 		s.handleUploadAction(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v2/uploads/"):
+		s.handleV2Uploads(w, r)
 	case r.URL.Path == "/v1/sql":
 		s.handleSQL(w, r)
 	default:
@@ -264,7 +270,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resolved, err := s.meta.ResolveByAPIKeyHash(r.Context(), tenant.HashToken(tok))
+	resolved, err := s.meta.ResolveByAPIKeyHash(r.Context(), token.HashToken(tok))
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_key_not_found")...)
@@ -275,7 +281,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
 		return
 	}
-	if subtle.ConstantTimeCompare([]byte(tenant.HashToken(tok)), []byte(resolved.APIKey.JWTHash)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(token.HashToken(tok)), []byte(resolved.APIKey.JWTHash)) != 1 {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_hash_mismatch", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
@@ -296,7 +302,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
-	claims, err := tenant.ParseAndVerifyToken(s.tokenSecret, tok)
+	claims, err := token.ParseAndVerifyToken(s.tokenSecret, tok)
 	if err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_token_invalid", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
@@ -482,6 +488,18 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		}
 		plan, err := b.InitiateUploadWithChecksums(r.Context(), path, cl, partChecksums)
 		if err != nil {
+			if errors.Is(err, backend.ErrUploadTooLarge) {
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_upload_too_large", "path", path, "error", err)...)
+				metricEvent(r.Context(), "fs_write", "result", "error")
+				errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
+				return
+			}
+			if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_storage_quota_exceeded", "path", path, "error", err)...)
+				metricEvent(r.Context(), "fs_write", "result", "error")
+				errJSON(w, http.StatusInsufficientStorage, err.Error())
+				return
+			}
 			if errors.Is(err, backend.ErrPartChecksumCountMismatch) {
 				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_checksum_count_mismatch", "path", path, "error", err)...)
 				metricEvent(r.Context(), "fs_write", "result", "error")
@@ -523,6 +541,18 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	}
 	_, err = b.WriteCtx(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate)
 	if err != nil {
+		if errors.Is(err, backend.ErrUploadTooLarge) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_too_large_backend", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_storage_quota_exceeded", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			errJSON(w, http.StatusInsufficientStorage, err.Error())
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
 		errJSON(w, http.StatusInternalServerError, err.Error())
@@ -545,6 +575,7 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 	var req struct {
 		NewSize    int64 `json:"new_size"`
 		DirtyParts []int `json:"dirty_parts"`
+		PartSize   int64 `json:"part_size,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_bad_body", "path", path, "error", err)...)
@@ -560,9 +591,27 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 		errJSON(w, http.StatusBadRequest, "dirty_parts must not be empty")
 		return
 	}
+	if req.NewSize > s.maxUploadBytes {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_too_large", "path", path, "bytes", req.NewSize, "max", s.maxUploadBytes)...)
+		metricEvent(r.Context(), "fs_patch", "result", "error")
+		errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
+		return
+	}
 
-	plan, err := b.InitiatePatchUpload(r.Context(), path, req.NewSize, req.DirtyParts)
+	plan, err := b.InitiatePatchUpload(r.Context(), path, req.NewSize, req.DirtyParts, req.PartSize)
 	if err != nil {
+		if errors.Is(err, backend.ErrUploadTooLarge) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_too_large", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_patch", "result", "error")
+			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_storage_quota_exceeded", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_patch", "result", "error")
+			errJSON(w, http.StatusInsufficientStorage, err.Error())
+			return
+		}
 		if errors.Is(err, datastore.ErrUploadConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_conflict", "path", path)...)
 			metricEvent(r.Context(), "fs_patch", "result", "conflict")
@@ -830,6 +879,18 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 	}
 	plan, err := b.InitiateUploadWithChecksums(r.Context(), req.Path, req.TotalSize, partChecksums)
 	if err != nil {
+		if errors.Is(err, backend.ErrUploadTooLarge) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_too_large_backend", "path", req.Path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_storage_quota_exceeded", "path", req.Path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			errJSON(w, http.StatusInsufficientStorage, err.Error())
+			return
+		}
 		if errors.Is(err, backend.ErrPartChecksumCountMismatch) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_checksum_count_mismatch", "path", req.Path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
@@ -1030,8 +1091,8 @@ func validatePartChecksums(parts []string) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid part checksums: invalid base64 at index %d", i)
 		}
-		if len(decoded) != 32 {
-			return nil, fmt.Errorf("invalid part checksums: decoded length %d at index %d, expected 32", len(decoded), i)
+		if len(decoded) != 4 {
+			return nil, fmt.Errorf("invalid part checksums: decoded length %d at index %d, expected 4", len(decoded), i)
 		}
 		out = append(out, v)
 	}
@@ -1063,6 +1124,258 @@ func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploa
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+// --- v2 upload handlers (on-demand presign, adaptive part size) ---
+
+func (s *Server) handleV2Uploads(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/v2/uploads/")
+	parts := strings.SplitN(rest, "/", 2)
+	seg0 := parts[0]
+	action := ""
+	if len(parts) > 1 {
+		action = strings.Trim(parts[1], "/")
+	}
+
+	switch {
+	case seg0 == "initiate" && r.Method == http.MethodPost:
+		s.handleV2UploadInitiate(w, r)
+	case seg0 != "" && action == "presign" && r.Method == http.MethodPost:
+		s.handleV2PresignPart(w, r, seg0)
+	case seg0 != "" && action == "presign-batch" && r.Method == http.MethodPost:
+		s.handleV2PresignBatch(w, r, seg0)
+	case seg0 != "" && action == "complete" && r.Method == http.MethodPost:
+		s.handleV2UploadComplete(w, r, seg0)
+	case seg0 != "" && action == "abort" && r.Method == http.MethodPost:
+		s.handleV2UploadAbort(w, r, seg0)
+	default:
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_uploads_unknown_route", "path", r.URL.Path, "method", r.Method)...)
+		errJSON(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_missing_scope")...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	var req struct {
+		Path      string `json:"path"`
+		TotalSize int64  `json:"total_size"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			errJSON(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_bad_body", "error", err)...)
+		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Path) == "" {
+		errJSON(w, http.StatusBadRequest, "missing path")
+		return
+	}
+	if req.TotalSize <= 0 {
+		errJSON(w, http.StatusBadRequest, "total_size must be positive")
+		return
+	}
+	if req.TotalSize > s.maxUploadBytes {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_too_large", "path", req.Path, "bytes", req.TotalSize, "max", s.maxUploadBytes)...)
+		errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
+		return
+	}
+	plan, err := b.InitiateUploadV2(r.Context(), req.Path, req.TotalSize)
+	if err != nil {
+		if errors.Is(err, backend.ErrUploadTooLarge) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_too_large_backend", "path", req.Path, "error", err)...)
+			metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
+			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_storage_quota_exceeded", "path", req.Path, "error", err)...)
+			metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
+			errJSON(w, http.StatusInsufficientStorage, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrUploadConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_conflict", "path", req.Path, "error", err)...)
+			metricEvent(r.Context(), "v2_upload_initiate", "result", "conflict")
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_failed", "path", req.Path, "error", err)...)
+		metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_ok", "path", req.Path, "part_size", plan.PartSize, "total_parts", plan.TotalParts)...)
+	metricEvent(r.Context(), "v2_upload_initiate", "result", "ok")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(plan)
+}
+
+func (s *Server) handleV2PresignPart(w http.ResponseWriter, r *http.Request, uploadID string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_part_missing_scope", "upload_id", uploadID)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	var req struct {
+		PartNumber int                      `json:"part_number"`
+		Checksum   *backend.PresignChecksum `json:"checksum,omitempty"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_part_bad_body", "upload_id", uploadID, "error", err)...)
+		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if req.PartNumber < 1 {
+		errJSON(w, http.StatusBadRequest, "part_number must be >= 1")
+		return
+	}
+	u, err := b.PresignPart(r.Context(), uploadID, req.PartNumber, req.Checksum)
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "upload not found")
+			return
+		}
+		if errors.Is(err, datastore.ErrUploadExpired) {
+			metricEvent(r.Context(), "v2_presign_part", "result", "expired")
+			errJSON(w, http.StatusGone, "upload expired")
+			return
+		}
+		if errors.Is(err, datastore.ErrUploadNotActive) {
+			errJSON(w, http.StatusConflict, "upload is not active")
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_part_failed", "upload_id", uploadID, "part_number", req.PartNumber, "error", err)...)
+		metricEvent(r.Context(), "v2_presign_part", "result", "error")
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_part_ok", "upload_id", uploadID, "part_number", req.PartNumber)...)
+	metricEvent(r.Context(), "v2_presign_part", "result", "ok")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(u)
+}
+
+func (s *Server) handleV2PresignBatch(w http.ResponseWriter, r *http.Request, uploadID string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_batch_missing_scope", "upload_id", uploadID)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	var req struct {
+		Parts []backend.PresignPartEntry `json:"parts"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_batch_bad_body", "upload_id", uploadID, "error", err)...)
+		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if len(req.Parts) == 0 {
+		errJSON(w, http.StatusBadRequest, "parts must not be empty")
+		return
+	}
+	urls, err := b.PresignParts(r.Context(), uploadID, req.Parts)
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "upload not found")
+			return
+		}
+		if errors.Is(err, datastore.ErrUploadExpired) {
+			metricEvent(r.Context(), "v2_presign_batch", "result", "expired")
+			errJSON(w, http.StatusGone, "upload expired")
+			return
+		}
+		if errors.Is(err, datastore.ErrUploadNotActive) {
+			errJSON(w, http.StatusConflict, "upload is not active")
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_batch_failed", "upload_id", uploadID, "error", err)...)
+		metricEvent(r.Context(), "v2_presign_batch", "result", "error")
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_presign_batch_ok", "upload_id", uploadID, "count", len(urls))...)
+	metricEvent(r.Context(), "v2_presign_batch", "result", "ok")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"parts": urls})
+}
+
+func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, uploadID string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_missing_scope", "upload_id", uploadID)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	var req struct {
+		Parts []backend.CompletePart `json:"parts"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_bad_body", "upload_id", uploadID, "error", err)...)
+		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if len(req.Parts) == 0 {
+		errJSON(w, http.StatusBadRequest, "parts must not be empty")
+		return
+	}
+	if err := b.ConfirmUploadV2(r.Context(), uploadID, req.Parts); err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "upload not found")
+			return
+		}
+		if errors.Is(err, datastore.ErrUploadExpired) {
+			metricEvent(r.Context(), "v2_upload_complete", "result", "expired")
+			errJSON(w, http.StatusGone, "upload expired")
+			return
+		}
+		if errors.Is(err, datastore.ErrUploadNotActive) {
+			errJSON(w, http.StatusConflict, "upload is not active")
+			return
+		}
+		if errors.Is(err, datastore.ErrPathConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_conflict", "upload_id", uploadID, "error", err)...)
+			metricEvent(r.Context(), "v2_upload_complete", "result", "conflict")
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_failed", "upload_id", uploadID, "error", err)...)
+		metricEvent(r.Context(), "v2_upload_complete", "result", "error")
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_ok", "upload_id", uploadID)...)
+	metricEvent(r.Context(), "v2_upload_complete", "result", "ok")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "completed"})
+}
+
+func (s *Server) handleV2UploadAbort(w http.ResponseWriter, r *http.Request, uploadID string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_abort_missing_scope", "upload_id", uploadID)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	if err := b.AbortUploadV2(r.Context(), uploadID); err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_abort_failed", "upload_id", uploadID, "error", err)...)
+		metricEvent(r.Context(), "v2_upload_abort", "result", "error")
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_abort_ok", "upload_id", uploadID)...)
+	metricEvent(r.Context(), "v2_upload_abort", "result", "ok")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
 func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_method_not_allowed", "method", r.Method)...)
@@ -1090,18 +1403,18 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	tenantID := tenant.NewID()
+	tenantID := token.NewID()
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_requested", "tenant_id", tenantID, "provider", provider)...)
 	keyName := "default"
 
-	token, err := tenant.IssueToken(s.tokenSecret, tenantID, 1)
+	apiToken, err := token.IssueToken(s.tokenSecret, tenantID, 1)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_issue_token_failed", "tenant_id", tenantID, "error", err)...)
 		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 		errJSON(w, http.StatusInternalServerError, "failed to issue token")
 		return
 	}
-	hash := tenant.HashToken(token)
+	hash := token.HashToken(apiToken)
 	now := time.Now().UTC()
 	cluster, err := s.provisioner.Provision(r.Context(), tenantID)
 	if err != nil {
@@ -1119,7 +1432,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "failed to encrypt db password")
 		return
 	}
-	cipherToken, err := s.pool.Encrypt(r.Context(), []byte(token))
+	cipherToken, err := s.pool.Encrypt(r.Context(), []byte(apiToken))
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_encrypt_api_key_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
@@ -1151,7 +1464,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metricEvent(r.Context(), "metadb_query", "api", "insert_tenant", "result", "ok")
-	apiKeyID := tenant.NewID()
+	apiKeyID := token.NewID()
 	if err := s.meta.InsertAPIKey(r.Context(), &meta.APIKey{
 		ID:            apiKeyID,
 		TenantID:      tenantID,
@@ -1181,7 +1494,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"api_key": token,
+		"api_key": apiToken,
 		"status":  string(meta.TenantProvisioning),
 	})
 }

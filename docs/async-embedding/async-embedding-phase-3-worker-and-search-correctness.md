@@ -1,4 +1,4 @@
-# Proposal: dat9-2 Async Embedding Phase 3 Worker and Search Correctness
+# Proposal: drive9-2 Async Embedding Phase 3 Worker and Search Correctness
 
 **Date**: 2026-03-31
 **Purpose**: Turn Phase C of `async-embedding-generation-proposal.md` into a review-ready proposal for embedding-provider wiring, server-owned worker execution, and search-path correctness.
@@ -27,7 +27,7 @@ The verified Phase 3 code boundaries are already visible in the repository:
 - `pkg/embedding/openai.go` provides an OpenAI-compatible `/v1/embeddings` client
 - `pkg/server/server.go` can start a server-owned `SemanticWorkerManager` through `Config.SemanticEmbedder` and `Config.SemanticWorkers`
 - `pkg/server/semantic_worker.go` claims tasks, filters obsolete work, retries failures, runs recover sweeps, and conditionally writes vectors back through `UpdateFileEmbedding`
-- `pkg/backend/dat9.go` already embeds grep queries in the application layer and merges FTS and vector results with the existing RRF logic
+- `pkg/backend/drive9.go` already embeds grep queries in the application layer and merges FTS and vector results with the existing RRF logic
 - `pkg/datastore/search.go` already exposes `VectorSearch(ctx, queryEmbedding, pathPrefix, limit)` and filters on `f.embedding_revision = f.revision`
 
 The test baseline also shows that the intended behavior is concrete rather than aspirational:
@@ -81,7 +81,7 @@ In other words, Phase 2 guarantees that semantic work is recorded, but Phase 3 i
 ```text
 Server Startup
 --------------
-cmd/dat9-server
+cmd/drive9-server
     -> build query embedder / semantic embedder from env
     -> server.NewWithConfig(...)
     -> start SemanticWorkerManager when semantic embedder is configured
@@ -115,7 +115,7 @@ backend.Grep
 Phase 3 should keep the ownership split explicit:
 
 - `pkg/embedding` owns the provider-facing client contract and vector formatting helpers
-- `cmd/dat9-server/main.go` owns runtime wiring from environment variables into query embedding and background embedding clients
+- `cmd/drive9-server/main.go` owns runtime wiring from environment variables into query embedding and background embedding clients
 - `pkg/server` owns semantic task execution lifetime, tenant scheduling, and recover sweeps
 - `pkg/backend` owns request-path grep orchestration and fallback behavior
 - `pkg/datastore` owns vector search SQL and revision-gated embedding writeback
@@ -136,7 +136,7 @@ Verified design points from the current codebase:
 
 - `embedding.NopClient` returns `(nil, nil)` so callers can keep simple fallback logic
 - `embedding.OpenAIClient` targets an OpenAI-compatible embeddings endpoint and supports `BaseURL`, `APIKey`, `Model`, optional `Dimensions`, and timeout control
-- `cmd/dat9-server/main.go` already allows query embedding and background embedding to be configured separately through env vars
+- `cmd/drive9-server/main.go` already allows query embedding and background embedding to be configured separately through env vars
 - when a semantic worker embedder is configured but a dedicated query embedder is not, server startup already reuses the semantic embedder for query embedding
 
 Phase 3 should keep that split as an explicit configuration policy rather than prematurely collapsing the two roles into one path. Query embedding and background document embedding live on different execution paths and may later need different models, timeouts, or rate limits. Keeping two config surfaces while allowing default reuse is the simplest way to preserve that flexibility without complicating the current rollout.
@@ -187,7 +187,7 @@ The critical invariant is that writeback is never unconditional. `files.embeddin
 
 Phase 3 must fix both sides of semantic search correctness: who produces the query vector, and which stored vectors are eligible to match.
 
-`pkg/backend/dat9.go` should keep the current parallel search structure:
+`pkg/backend/drive9.go` should keep the current parallel search structure:
 
 - FTS starts immediately
 - the vector path first calls `queryEmbedder.EmbedText(ctx, query)`
@@ -232,7 +232,7 @@ Phase 3 should therefore define its support boundary honestly: worker and search
 ### Step 1: Provider and config wiring
 
 1. keep `pkg/embedding.Client` as the shared contract for background and query embedding
-2. wire `DAT9_QUERY_EMBED_*` and `DAT9_EMBED_*` configuration into `cmd/dat9-server/main.go`
+2. wire `DRIVE9_QUERY_EMBED_*` and `DRIVE9_EMBED_*` configuration into `cmd/drive9-server/main.go`
 3. reuse the semantic embedder for query embedding when dedicated query config is absent
 
 ### Step 2: Worker activation
@@ -243,7 +243,7 @@ Phase 3 should therefore define its support boundary honestly: worker and search
 
 ### Step 3: Search correctness
 
-7. keep grep's concurrent FTS + vector structure in `pkg/backend/dat9.go`
+7. keep grep's concurrent FTS + vector structure in `pkg/backend/drive9.go`
 8. require the vector branch to consume an app-generated query vector
 9. filter vector SQL on `embedding_revision = revision`
 10. preserve keyword fallback when semantic ranking is unavailable
@@ -293,17 +293,17 @@ Phase 3 should therefore define its support boundary honestly: worker and search
 
 ## References
 
-- `dat9-2/docs/async-embedding/async-embedding-generation-proposal.md`
-- `dat9-2/docs/async-embedding/async-embedding-phase-1-foundation.md`
-- `dat9-2/docs/async-embedding/async-embedding-phase-2-write-path.md`
-- `dat9-2/cmd/dat9-server/main.go`
-- `dat9-2/pkg/embedding/client.go`
-- `dat9-2/pkg/embedding/openai.go`
-- `dat9-2/pkg/server/server.go`
-- `dat9-2/pkg/server/semantic_worker.go`
-- `dat9-2/pkg/server/semantic_worker_test.go`
-- `dat9-2/pkg/backend/dat9.go`
-- `dat9-2/pkg/backend/grep_test.go`
-- `dat9-2/pkg/datastore/search.go`
-- `dat9-2/pkg/datastore/embedding_writeback.go`
-- `dat9-2/pkg/datastore/schema_test.go`
+- `drive9-2/docs/async-embedding/async-embedding-generation-proposal.md`
+- `drive9-2/docs/async-embedding/async-embedding-phase-1-foundation.md`
+- `drive9-2/docs/async-embedding/async-embedding-phase-2-write-path.md`
+- `drive9-2/cmd/drive9-server/main.go`
+- `drive9-2/pkg/embedding/client.go`
+- `drive9-2/pkg/embedding/openai.go`
+- `drive9-2/pkg/server/server.go`
+- `drive9-2/pkg/server/semantic_worker.go`
+- `drive9-2/pkg/server/semantic_worker_test.go`
+- `drive9-2/pkg/backend/drive9.go`
+- `drive9-2/pkg/backend/grep_test.go`
+- `drive9-2/pkg/datastore/search.go`
+- `drive9-2/pkg/datastore/embedding_writeback.go`
+- `drive9-2/pkg/datastore/schema_test.go`

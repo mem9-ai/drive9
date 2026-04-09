@@ -1,4 +1,4 @@
-# Proposal: dat9-2 Async Embedding Phase A
+# Proposal: drive9-2 Async Embedding Phase A
 
 **Date**: 2026-03-30
 **Purpose**: Turn Phase A of `async-embedding-generation-proposal.md` into a directly executable design document, with clear schema, datastore contracts, test coverage, and implementation order.
@@ -7,13 +7,13 @@
 
 Phase A only covers "contract hardening and schema preparation." It does not change the current write path, search path, worker lifecycle, or introduce a real embedding provider. The goal of this phase is to lay down all static foundations required by later async embedding work in one pass: new tenant schema no longer depends on generated `EMBED_TEXT(...)`, tenant DBs gain a durable `semantic_tasks` table, `pkg/datastore` can read `embedding_revision` and operate semantic tasks, and the test baseline covers durable-contract semantics such as receipt / lease / recover.
 
-To control blast radius, Phase A intentionally keeps the principle of "capability landed, behavior still disabled by default." In this phase, `pkg/backend/dat9.go`, `pkg/backend/upload.go`, and `pkg/datastore/search.go` do not switch over to the new path. They only gain a stable data model and SQL contract that Phase B/C can build on.
+To control blast radius, Phase A intentionally keeps the principle of "capability landed, behavior still disabled by default." In this phase, `pkg/backend/drive9.go`, `pkg/backend/upload.go`, and `pkg/datastore/search.go` do not switch over to the new path. They only gain a stable data model and SQL contract that Phase B/C can build on.
 
 ## Context
 
 ### Current State
 
-At the moment, embedding-related infrastructure in `dat9-2` is spread across three layers:
+At the moment, embedding-related infrastructure in `drive9-2` is spread across three layers:
 
 1. `pkg/tenant/schema_zero.go`, `pkg/tenant/schema_starter.go`, and `pkg/tenant/schema_db9.go` all define `files.embedding` as `GENERATED ALWAYS AS (EMBED_TEXT(...))`.
 2. The `File` struct and scan helpers in `pkg/datastore/store.go` only cover fields such as `content_text`, `revision`, and `status`; there is no representation of `embedding_revision` or task state yet.
@@ -34,7 +34,7 @@ If implementation jumps straight into Phase B/C before completing Phase A, later
 
 1. the schema still assumes the database can generate embeddings automatically, so the application layer cannot safely take over vector state
 2. datastore has neither a task model nor revision-aware state such as `embedding_revision`, so later worker/search code has no unified read/write surface
-3. the durable queue contract has not yet been landed in dat9's own store layer, so once Phase B starts refactoring the write path, file persistence and async task registration are likely to become a half-finished mix
+3. the durable queue contract has not yet been landed in drive9's own store layer, so once Phase B starts refactoring the write path, file persistence and async task registration are likely to become a half-finished mix
 
 The value of Phase A is not "implement part of embedding functionality ahead of time." Its value is fixing the contracts that later phases actually depend on, so Phase B/C do not have to keep reworking schema, SQL, and test semantics.
 
@@ -58,7 +58,7 @@ The value of Phase A is not "implement part of embedding functionality ahead of 
 ## Non-Goals
 
 - Do not connect any embedding provider in Phase A.
-- Do not refactor create / overwrite transactions in `pkg/backend/dat9.go` in Phase A.
+- Do not refactor create / overwrite transactions in `pkg/backend/drive9.go` in Phase A.
 - Do not start `SemanticWorkerManager` in Phase A.
 - Do not change query embedding in `pkg/datastore/search.go` in Phase A.
 - Do not convert the existing image extract worker into a durable pipeline in Phase A.
@@ -311,7 +311,7 @@ Among them:
 - `Retry` accepts only the current receipt; when not dead-lettered, it resets status to `queued` and updates `available_at` and `last_error`
 - `RecoverExpired` only handles tasks where `status=processing` and `lease_until < now`, resetting them to `queued` and clearing receipt/lease fields
 
-This API is smaller than QueueFS because dat9 Phase A needs only two result paths: "confirmed success" and "failed retry." `Release` semantics can be covered by `Retry(..., retryAt=now)`.
+This API is smaller than QueueFS because drive9 Phase A needs only two result paths: "confirmed success" and "failed retry." `Release` semantics can be covered by `Retry(..., retryAt=now)`.
 
 #### 4.3 Error model
 
@@ -356,7 +356,7 @@ The minimal assertion is that `embedding_revision` is not lost during scanning i
 
 #### 5.3 Durable task contract tests
 
-Goal: translate the most critical durable lifecycle tests from QueueFS into dat9's store contract.
+Goal: translate the most critical durable lifecycle tests from QueueFS into drive9's store contract.
 
 Must cover:
 

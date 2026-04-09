@@ -13,6 +13,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE
@@ -129,7 +130,7 @@ func (fs *Dat9FS) preloadWritableHandle(fh *FileHandle) gofuse.Status {
 	if bufMax < defaultWriteBufferMaxSize {
 		bufMax = defaultWriteBufferMaxSize
 	}
-	fh.Dirty = NewWriteBuffer(fh.Path, bufMax)
+	fh.Dirty = NewWriteBuffer(fh.Path, bufMax, s3client.CalcAdaptivePartSize(stat.Size))
 
 	var data []byte
 	if stat.Size <= smallFileThreshold {
@@ -595,7 +596,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		return gofuse.EIO
 	}
 
-	wb := NewWriteBuffer(childP, maxPreloadSize)
+	wb := NewWriteBuffer(childP, maxPreloadSize, 0)
 	wb.touched = true
 	fh := &FileHandle{
 		Ino:   ino,
@@ -631,7 +632,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		if fs.opts.ReadOnly {
 			return gofuse.EROFS
 		}
-		fh.Dirty = NewWriteBuffer(p, maxPreloadSize)
+		fh.Dirty = NewWriteBuffer(p, maxPreloadSize, 0)
 
 		// Preload existing content for non-truncating opens so that
 		// random writes don't discard the original file data.
@@ -755,7 +756,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	defer fh.Unlock()
 
 	if fh.Dirty == nil {
-		fh.Dirty = NewWriteBuffer(fh.Path, 0)
+		fh.Dirty = NewWriteBuffer(fh.Path, 0, 0)
 	}
 
 	n, err := fh.Dirty.Write(int64(input.Offset), data)
@@ -844,6 +845,7 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 					return origData, nil
 				},
 				nil,
+				client.WithPartSize(fh.Dirty.PartSize()),
 			)
 		}
 		// If no dirty parts, nothing changed — skip upload.
