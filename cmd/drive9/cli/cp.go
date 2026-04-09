@@ -8,6 +8,8 @@ import (
 	"os"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"go.uber.org/zap"
 )
 
 // Cp copies files between local and remote.
@@ -101,20 +103,17 @@ func resumeUpload(ctx context.Context, c *client.Client, localPath, remotePath s
 }
 
 func downloadFile(ctx context.Context, c *client.Client, remotePath, localPath string) error {
-	rc, err := c.ReadStream(ctx, remotePath)
+	info, err := c.Stat(remotePath)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = rc.Close() }()
 
-	out, err := os.Create(localPath)
+	summary, err := c.DownloadToFileWithSummary(ctx, remotePath, localPath, info.Size)
 	if err != nil {
-		return fmt.Errorf("create %s: %w", localPath, err)
+		return err
 	}
-	defer func() { _ = out.Close() }()
-
-	_, err = io.Copy(out, rc)
-	return err
+	emitDownloadSummary(summary)
+	return nil
 }
 
 func streamToStdout(ctx context.Context, c *client.Client, remotePath string) error {
@@ -133,4 +132,28 @@ func printProgress(partNumber, totalParts int, bytesUploaded int64) {
 	if partNumber == totalParts {
 		fmt.Fprintln(os.Stderr)
 	}
+}
+
+// emitDownloadSummary keeps benchmark-only metadata in the same structured CLI
+// log stream as the rest of the command lifecycle, instead of inventing a
+// second stderr-only output contract.
+func emitDownloadSummary(summary *client.DownloadSummary) {
+	if summary == nil || !logger.CLIEnabled() {
+		return
+	}
+	// The benchmark harness reads this stable event from the CLI log file.
+	logger.Info(
+		context.Background(),
+		"download_summary",
+		zap.String("type", summary.Type),
+		zap.String("mode", summary.Mode),
+		zap.Int("concurrency", summary.Concurrency),
+		zap.Int64("chunk_size_bytes", summary.ChunkSizeBytes),
+		zap.Int("range_count", summary.RangeCount),
+		zap.Time("started_at", summary.StartedAt),
+		zap.Time("finished_at", summary.FinishedAt),
+		zap.Float64("elapsed_seconds", summary.ElapsedSeconds),
+		zap.String("remote_path", summary.RemotePath),
+		zap.String("local_path", summary.LocalPath),
+	)
 }
