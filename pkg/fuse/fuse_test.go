@@ -662,41 +662,46 @@ func TestWriteBuffer_LazyLoad_UnloadedPartReturnsZeros(t *testing.T) {
 	}
 }
 
-func TestWriteBuffer_OnPartReady_Notification(t *testing.T) {
+func TestWriteBuffer_RewritePartPreservesLatestData(t *testing.T) {
+	// Verify that rewriting a full part keeps the latest data in the buffer.
+	// This is critical: FUSE writers can revisit earlier offsets before close
+	// (e.g. patching headers, checksums, footers).
 	wb := NewWriteBuffer("/test", defaultWriteBufferMaxSize, DefaultPartSize)
 
-	var readyParts []int
-	wb.OnPartReady = func(partNum int, data []byte) {
-		readyParts = append(readyParts, partNum)
-	}
-
-	// Write exactly 1 full part
+	// Write a full first part
 	data := make([]byte, DefaultPartSize)
 	for i := range data {
-		data[i] = byte(i % 256)
+		data[i] = 0xAA
 	}
 	_, err := wb.Write(0, data)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if len(readyParts) != 1 || readyParts[0] != 1 {
-		t.Fatalf("expected OnPartReady called with part 1, got %v", readyParts)
+	// Write beyond part 1 to establish a multi-part file
+	_, _ = wb.Write(DefaultPartSize, []byte("part2"))
+
+	// Now go back and rewrite the beginning of part 1 (e.g. header patch)
+	_, _ = wb.Write(0, []byte("HEADER"))
+
+	// Verify part 1 has the latest data
+	p1 := wb.PartData(1)
+	if string(p1[:6]) != "HEADER" {
+		t.Fatalf("part 1 header: got %q, want %q", p1[:6], "HEADER")
 	}
-}
-
-func TestWriteBuffer_OnPartReady_NotCalledForPartialPart(t *testing.T) {
-	wb := NewWriteBuffer("/test", defaultWriteBufferMaxSize, DefaultPartSize)
-
-	called := false
-	wb.OnPartReady = func(partNum int, data []byte) {
-		called = true
+	// Rest of part 1 should still be 0xAA
+	if p1[6] != 0xAA {
+		t.Fatalf("part 1 byte 6: got %02x, want 0xAA", p1[6])
 	}
 
-	// Write less than a full part
-	_, _ = wb.Write(0, []byte("small data"))
-	if called {
-		t.Fatal("OnPartReady should not be called for partial parts")
+	// Part 1 should be dirty
+	dirty := wb.DirtyPartNumbers()
+	dirtySet := make(map[int]bool)
+	for _, d := range dirty {
+		dirtySet[d] = true
+	}
+	if !dirtySet[1] {
+		t.Fatal("part 1 should be dirty after rewrite")
 	}
 }
 
@@ -775,34 +780,49 @@ func TestPrefetcher_WindowCapAtMax(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// OnPartReady duplicate prevention test
+// Rewrite-before-close correctness test
 // ---------------------------------------------------------------------------
 
-func TestWriteBuffer_OnPartReady_NoDuplicateOnRewrite(t *testing.T) {
+func TestWriteBuffer_RewriteBeforeClose_AllDirtyPartsHaveLatestData(t *testing.T) {
+	// Simulates: write 3 full parts, then go back and patch byte 0 of part 1.
+	// All 3 parts should be dirty, and part 1 should have the patched data.
 	wb := NewWriteBuffer("/test", defaultWriteBufferMaxSize, DefaultPartSize)
 
-	var readyParts []int
-	wb.OnPartReady = func(partNum int, data []byte) {
-		readyParts = append(readyParts, partNum)
+	// Write 3 full parts
+	for i := 0; i < 3; i++ {
+		data := make([]byte, DefaultPartSize)
+		for j := range data {
+			data[j] = byte(i + 1) // part 1 = 0x01, part 2 = 0x02, part 3 = 0x03
+		}
+		_, err := wb.Write(int64(i)*DefaultPartSize, data)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	// Write exactly 1 full part
-	data := make([]byte, DefaultPartSize)
-	_, err := wb.Write(0, data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(readyParts) != 1 {
-		t.Fatalf("expected 1 OnPartReady call, got %d", len(readyParts))
+	// Patch first 4 bytes of part 1 (e.g. file magic / header)
+	_, _ = wb.Write(0, []byte("MAGIC"))
+
+	// All 3 parts should be dirty
+	dirty := wb.DirtyPartNumbers()
+	if len(dirty) != 3 {
+		t.Fatalf("expected 3 dirty parts, got %v", dirty)
 	}
 
-	// Rewrite the same full part — should NOT trigger OnPartReady again
-	_, err = wb.Write(0, data)
-	if err != nil {
-		t.Fatal(err)
+	// Part 1 should have the patched header
+	p1 := wb.PartData(1)
+	if string(p1[:5]) != "MAGIC" {
+		t.Fatalf("part 1 header: got %q, want %q", p1[:5], "MAGIC")
 	}
-	if len(readyParts) != 1 {
-		t.Fatalf("expected still 1 OnPartReady call after rewrite, got %d", len(readyParts))
+	// Rest of part 1 should be original (0x01)
+	if p1[5] != 0x01 {
+		t.Fatalf("part 1 byte 5: got %02x, want 0x01", p1[5])
+	}
+
+	// Part 2 should be untouched original
+	p2 := wb.PartData(2)
+	if p2[0] != 0x02 {
+		t.Fatalf("part 2 byte 0: got %02x, want 0x02", p2[0])
 	}
 }
 
@@ -892,24 +912,13 @@ func TestPrefetcher_CloseStopsAccepting(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// StreamUploader duplicate prevention test
+// StreamUploader tests
 // ---------------------------------------------------------------------------
 
-func TestStreamUploader_SubmitPartDuplicate(t *testing.T) {
-	// Create StreamUploader without a real client — just test dedup logic
+func TestStreamUploader_NotStartedBeforeUploadAll(t *testing.T) {
 	su := NewStreamUploader(nil, "/test")
-
-	// Manually mark a part as submitted
-	su.mu.Lock()
-	su.submittedParts[1] = true
-	su.mu.Unlock()
-
-	// Submitting the same part again should be a no-op (returns nil, no panic)
-	if !su.IsPartSubmitted(1) {
-		t.Fatal("part 1 should be marked as submitted")
-	}
-	if su.IsPartSubmitted(2) {
-		t.Fatal("part 2 should not be submitted")
+	if su.Started() {
+		t.Fatal("should not be started before UploadAll")
 	}
 }
 

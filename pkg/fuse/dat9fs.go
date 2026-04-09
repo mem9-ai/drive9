@@ -666,15 +666,10 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		Dirty: wb,
 	}
 
-	// Set up streaming uploader for new files — parts will be uploaded
-	// in the background as they fill up (8MB each).
-	streamer := NewStreamUploader(fs.client, childP)
-	fh.Streamer = streamer
-	wb.OnPartReady = func(partNum int, data []byte) {
-		if err := streamer.SubmitPart(partNum, data); err != nil {
-			log.Printf("stream submit part %d failed for %s: %v", partNum, childP, err)
-		}
-	}
+	// Attach a streaming uploader — actual upload happens at flush time,
+	// not during Write(), because FUSE writers can revisit any offset
+	// before close (e.g. patching headers, updating checksums).
+	fh.Streamer = NewStreamUploader(fs.client, childP)
 
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
 	out.Fh = fs.fileHandles.Allocate(fh)
@@ -721,14 +716,8 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 			fs.inodes.UpdateSize(fh.Ino, 0)
 
-			// Set up streaming uploader — truncated file is like a new file.
-			streamer := NewStreamUploader(fs.client, p)
-			fh.Streamer = streamer
-			fh.Dirty.OnPartReady = func(partNum int, data []byte) {
-				if err := streamer.SubmitPart(partNum, data); err != nil {
-					log.Printf("stream submit part %d failed for %s: %v", partNum, p, err)
-				}
-			}
+			// Attach streaming uploader — actual upload at flush time.
+			fh.Streamer = NewStreamUploader(fs.client, p)
 		}
 	}
 
@@ -880,26 +869,11 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		fh.Dirty = NewWriteBuffer(fh.Path, 0, 0)
 	}
 
-	// Pre-update streamer size so that if OnPartReady fires from within
-	// Write() and triggers lazy initiation, the totalSize is accurate.
-	if fh.Streamer != nil {
-		endOffset := int64(input.Offset) + int64(len(data))
-		if endOffset > fh.Dirty.Size() {
-			fh.Streamer.SetTotalSize(endOffset)
-		}
-	}
-
 	n, err := fh.Dirty.Write(int64(input.Offset), data)
 	if err != nil {
 		return 0, gofuse.Status(syscall.EFBIG)
 	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
-
-	// Keep the streamer's totalSize in sync after write completes.
-	if fh.Streamer != nil {
-		fh.Streamer.SetTotalSize(fh.Dirty.Size())
-	}
-
 	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
 	return n, gofuse.OK
 }
@@ -964,19 +938,23 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 
 	var err error
 
-	// Path 1: Streaming upload is in progress — finish it.
-	if fh.Streamer != nil && fh.Streamer.Started() {
-		// Update the total size on the streamer
-		fh.Streamer.SetTotalSize(size)
-
-		// Find the last part (which may be partial / not yet submitted)
-		lastPartNum := int((size + fh.Dirty.PartSize() - 1) / fh.Dirty.PartSize())
-		var lastPartData []byte
-		if lastPartNum > 0 {
-			lastPartData = fh.Dirty.PartData(lastPartNum)
+	// Path 1: Large new file with streaming uploader — upload all parts
+	// in parallel at flush time. We deliberately do NOT upload during Write()
+	// because FUSE writers can revisit any offset before close (headers,
+	// checksums, footers), and the final file size is unknown until now.
+	if fh.Streamer != nil && size >= smallFileThreshold {
+		numParts := int((size + fh.Dirty.PartSize() - 1) / fh.Dirty.PartSize())
+		partSnapshots := make(map[int][]byte, numParts)
+		for pn := 1; pn <= numParts; pn++ {
+			src := fh.Dirty.PartData(pn)
+			if src != nil {
+				cp := make([]byte, len(src))
+				copy(cp, src)
+				partSnapshots[pn] = cp
+			}
 		}
 
-		err = fh.Streamer.Finish(size, lastPartNum, lastPartData)
+		err = fh.Streamer.UploadAll(context.Background(), size, partSnapshots)
 		if err != nil {
 			return httpToFuseStatus(err)
 		}
@@ -987,14 +965,13 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 		fs.readCache.Invalidate(fh.Path)
 		fs.dirCache.Invalidate(parentDir(fh.Path))
 		fs.inodes.UpdateSize(fh.Ino, size)
-		// Invalidate kernel attr/data cache for this inode and parent dir listing.
 		fs.notifyInode(fh.Ino)
 		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
 		fs.notifyInode(parentIno)
 		return gofuse.OK
 	}
 
-	// Path 2: No streaming — materialize all data for upload.
+	// Path 2: No streaming uploader or small file — materialize all data for upload.
 	data := fh.Dirty.Bytes()
 
 	if size < smallFileThreshold {

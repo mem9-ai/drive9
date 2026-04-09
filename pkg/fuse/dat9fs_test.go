@@ -352,7 +352,4 @@ func TestCreateFileGetsStreamUploader(t *testing.T) {
 	if fh.Streamer == nil {
 		t.Fatal("expected StreamUploader to be set for new file")
 	}
-	if fh.Dirty.OnPartReady == nil {
-		t.Fatal("expected OnPartReady callback to be wired to streamer")
-	}
 }

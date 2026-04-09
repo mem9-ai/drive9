@@ -8,132 +8,81 @@ import (
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
-// StreamUploader manages background part uploads driven by WriteBuffer's
-// OnPartReady callback. When a part is fully written (8MB), it is
-// immediately uploaded in the background. On close/flush, only the
-// last partial part + CompleteMultipartUpload are needed.
+// StreamUploader manages parallel part uploads at flush time.
 //
-// SubmitPart returns an error so the caller knows if a submission failed.
-// It tracks which part numbers have been submitted to avoid duplicate
-// uploads (e.g. when OnPartReady fires for the same part on rewrite).
+// Unlike the previous design which uploaded parts eagerly during Write(),
+// this uploader is only used at flush/close time. This is necessary because
+// FUSE writers can revisit any offset before close (e.g. patching headers,
+// updating checksums, writing footers), and the final file size is not known
+// until close. Eagerly uploading parts during Write() would persist stale
+// content for any rewritten parts.
+//
+// At flush time, flushHandle calls UploadAll with the final dirty parts,
+// which initiates a v2 multipart upload and uploads all parts in parallel.
 type StreamUploader struct {
-	client    *client.Client
-	path      string
-	totalSize int64 // updated as file grows
+	client *client.Client
+	path   string
 
-	mu             sync.Mutex
-	writer         *client.StreamWriter
-	started        bool
-	err            error        // first background error
-	submittedParts map[int]bool // parts already submitted — prevents duplicates
+	mu      sync.Mutex
+	writer  *client.StreamWriter
+	started bool
 }
 
 // NewStreamUploader creates a StreamUploader for the given path.
-// No network calls are made until the first part is submitted.
+// No network calls are made until UploadAll is called at flush time.
 func NewStreamUploader(c *client.Client, path string) *StreamUploader {
 	return &StreamUploader{
-		client:         c,
-		path:           path,
-		submittedParts: make(map[int]bool),
+		client: c,
+		path:   path,
 	}
 }
 
-// Started reports whether any parts have been submitted.
+// Started reports whether the upload has been initiated.
 func (su *StreamUploader) Started() bool {
 	su.mu.Lock()
 	defer su.mu.Unlock()
 	return su.started
 }
 
-// SetTotalSize updates the expected total file size. Must be called
-// before Finish so the StreamWriter knows the correct totalSize.
-func (su *StreamUploader) SetTotalSize(size int64) {
-	su.mu.Lock()
-	defer su.mu.Unlock()
-	su.totalSize = size
-}
-
-// SubmitPart uploads a part in the background. partNum is 1-based.
-// data is owned by the caller — StreamUploader will copy it.
-// Returns an error if the upload has already failed or the part couldn't
-// be submitted. Duplicate submissions of the same partNum are silently
-// ignored (idempotent).
-func (su *StreamUploader) SubmitPart(partNum int, data []byte) error {
-	su.mu.Lock()
-	if su.err != nil {
-		err := su.err
-		su.mu.Unlock()
-		return err
-	}
-
-	// Skip duplicate submissions (e.g. OnPartReady firing on rewrite)
-	if su.submittedParts[partNum] {
-		su.mu.Unlock()
+// UploadAll initiates a v2 multipart upload and uploads all provided parts
+// in parallel. This should be called at flush time with the final file size
+// and all part data. partData is a map of 1-based partNum → data.
+// The last part may be smaller than partSize.
+func (su *StreamUploader) UploadAll(ctx context.Context, totalSize int64, partData map[int][]byte) error {
+	if len(partData) == 0 {
 		return nil
 	}
 
-	// Lazy init the StreamWriter
-	if !su.started {
-		su.writer = su.client.NewStreamWriter(context.Background(), su.path, su.totalSize)
-		su.started = true
-	}
-	su.submittedParts[partNum] = true
+	su.mu.Lock()
+	su.writer = su.client.NewStreamWriter(ctx, su.path, totalSize)
+	su.started = true
 	sw := su.writer
 	su.mu.Unlock()
 
-	if err := sw.WritePart(context.Background(), partNum, data); err != nil {
-		su.mu.Lock()
-		if su.err == nil {
-			su.err = err
+	// Find the max part number to determine which is the last part
+	maxPart := 0
+	for pn := range partData {
+		if pn > maxPart {
+			maxPart = pn
 		}
-		su.mu.Unlock()
-		return err
 	}
-	return nil
-}
 
-// IsPartSubmitted reports whether a part has already been submitted.
-func (su *StreamUploader) IsPartSubmitted(partNum int) bool {
-	su.mu.Lock()
-	defer su.mu.Unlock()
-	return su.submittedParts[partNum]
-}
-
-// Finish uploads the last (possibly partial) part and completes the upload.
-// lastPartNum and lastPartData describe the final part. If the last part
-// was already submitted via SubmitPart (exact-multiple-of-partSize case),
-// pass nil for lastPartData.
-// Returns any error from background uploads or the complete call.
-func (su *StreamUploader) Finish(totalSize int64, lastPartNum int, lastPartData []byte) error {
-	su.mu.Lock()
-	if su.err != nil {
-		err := su.err
-		sw := su.writer
-		su.mu.Unlock()
-		if sw != nil {
-			_ = sw.Abort(context.Background())
+	// Upload all parts except the last one in parallel via WritePart
+	for pn, data := range partData {
+		if pn == maxPart {
+			continue // last part is handled by Complete
 		}
-		return err
+		if err := sw.WritePart(ctx, pn, data); err != nil {
+			_ = sw.Abort(ctx)
+			return err
+		}
 	}
 
-	if !su.started {
-		// Never started — shouldn't happen, but handle gracefully
-		su.mu.Unlock()
-		return nil
-	}
-
-	// If the last part was already submitted (file size is exact multiple
-	// of partSize), don't upload it again — pass nil data to Complete.
-	if su.submittedParts[lastPartNum] {
-		lastPartData = nil
-	}
-
-	sw := su.writer
-	su.mu.Unlock()
-
-	err := sw.Complete(context.Background(), lastPartNum, lastPartData)
+	// Complete with the last part
+	lastPartData := partData[maxPart]
+	err := sw.Complete(ctx, maxPart, lastPartData)
 	if err != nil {
-		_ = sw.Abort(context.Background())
+		_ = sw.Abort(ctx)
 		return err
 	}
 	return nil
@@ -150,11 +99,4 @@ func (su *StreamUploader) Abort() {
 			log.Printf("stream upload abort failed for %s: %v", su.path, err)
 		}
 	}
-}
-
-// Err returns the first background error, if any.
-func (su *StreamUploader) Err() error {
-	su.mu.Lock()
-	defer su.mu.Unlock()
-	return su.err
 }

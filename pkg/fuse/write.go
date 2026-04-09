@@ -8,10 +8,6 @@ const (
 	maxPreloadSize            = 256 << 20 // 256MB - hard limit for preloading existing files into memory
 )
 
-// OnPartReadyFunc is called when a part is fully written and ready for upload.
-// partNum is 1-based. data is a snapshot that the callee may own.
-type OnPartReadyFunc func(partNum int, data []byte)
-
 // LoadPartFunc is called to lazily load part data from the remote server.
 // partNum is 1-based. Returns the part data.
 type LoadPartFunc func(partNum int) ([]byte, error)
@@ -34,10 +30,8 @@ type WriteBuffer struct {
 	dirtyParts map[int]bool   // 0-based part index → dirty flag
 	touched    bool
 
-	// Callbacks (optional)
-	OnPartReady   OnPartReadyFunc // called when a part is fully written
-	LoadPart      LoadPartFunc    // called to lazily load part data
-	notifiedParts map[int]bool    // parts already notified via OnPartReady (prevents duplicates)
+	// Callback (optional)
+	LoadPart LoadPartFunc // called to lazily load part data
 
 	// remoteSize is the original remote file size, set when lazy loading
 	// is configured. ensurePart() only calls LoadPart for parts whose
@@ -86,7 +80,6 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 	// Write data across parts
 	pos := offset
 	dataOff := 0
-	var newlyFullParts []int // 1-based part numbers that just became full
 
 	for dataOff < len(data) {
 		partIdx := int(pos / wb.partSize)
@@ -121,12 +114,6 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 		copy(part[partOff:partOff+canWrite], data[dataOff:dataOff+int(canWrite)])
 		wb.dirtyParts[partIdx] = true
 
-		// Check if this part is now full
-		partEnd := int64(partIdx+1) * wb.partSize
-		if wb.totalSize >= partEnd && int64(len(part)) == wb.partSize {
-			newlyFullParts = append(newlyFullParts, partIdx+1) // 1-based
-		}
-
 		pos += canWrite
 		dataOff += int(canWrite)
 	}
@@ -136,26 +123,6 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 	// This is handled by ensurePart which creates zero-filled parts.
 
 	wb.touched = true
-
-	// Notify about full parts (only once per part — skip already-notified parts)
-	if wb.OnPartReady != nil {
-		for _, pn := range newlyFullParts {
-			if wb.notifiedParts != nil && wb.notifiedParts[pn] {
-				continue // already notified (e.g. rewrite of a full part)
-			}
-			partData := wb.PartData(pn)
-			if partData != nil && int64(len(partData)) == wb.partSize {
-				// Make a snapshot for the callback
-				snapshot := make([]byte, len(partData))
-				copy(snapshot, partData)
-				if wb.notifiedParts == nil {
-					wb.notifiedParts = make(map[int]bool)
-				}
-				wb.notifiedParts[pn] = true
-				wb.OnPartReady(pn, snapshot)
-			}
-		}
-	}
 
 	return uint32(len(data)), nil
 }
@@ -431,7 +398,6 @@ func (wb *WriteBuffer) IsPartLoaded(partIdx int) bool {
 func (wb *WriteBuffer) Reset() {
 	wb.parts = make(map[int][]byte)
 	wb.dirtyParts = make(map[int]bool)
-	wb.notifiedParts = nil
 	wb.totalSize = 0
 	wb.curMemory = 0
 }
