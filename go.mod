@@ -110,3 +110,5 @@ require (
 )
 
 replace github.com/c4pt0r/agfs/agfs-server => ../agfs/agfs-server
+
+replace go.buf.build/protocolbuffers/go/linuxgit/tidbcloud => buf.build/gen/go/linuxgit/tidbcloud/protocolbuffers/go v1.31.0-20220906123915-0bcf82e34c7b.1
