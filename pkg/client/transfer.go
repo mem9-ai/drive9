@@ -6,10 +6,12 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -87,6 +89,48 @@ const (
 	uploadMaxBufferBytes = 256 * 1024 * 1024 // 256 MB
 )
 
+const (
+	downloadParallelThreshold = 8 << 20
+	downloadChunkSize         = 8 << 20
+	downloadMaxConcurrency    = 8
+)
+
+var errReadTargetNoRedirect = errors.New("parallel download unavailable without redirect")
+
+// DownloadSummary exposes the coarse-grained large-file download metrics that
+// the CLI emits as a structured log event when CLI logging is enabled.
+type DownloadSummary struct {
+	Type           string    `json:"type"`
+	Mode           string    `json:"mode"`
+	Concurrency    int       `json:"concurrency"`
+	ChunkSizeBytes int64     `json:"chunk_size_bytes"`
+	RangeCount     int       `json:"range_count"`
+	StartedAt      time.Time `json:"started_at"`
+	FinishedAt     time.Time `json:"finished_at"`
+	ElapsedSeconds float64   `json:"elapsed_seconds"`
+	RemotePath     string    `json:"remote_path"`
+	LocalPath      string    `json:"local_path"`
+}
+
+type downloadRange struct {
+	offset int64
+	length int64
+}
+
+// readTarget captures the presigned object URL resolved from the control
+// plane for one large-file download. The current parallel downloader assumes
+// this URL remains valid for the lifetime of the download; if it expires mid-
+// transfer we fail the download instead of refreshing and retrying in place.
+// Follow-up: #138.
+type readTarget struct {
+	objectURL string
+}
+
+type uploadBufferPool struct {
+	size int64
+	ch   chan []byte
+}
+
 func uploadParallelism(partSize int64) int {
 	if partSize <= 0 {
 		partSize = s3client.PartSize
@@ -107,6 +151,46 @@ func checksumParallelism(partSize int64, partCount int) int {
 		byMemory = 1
 	}
 	return min(runtime.GOMAXPROCS(0), partCount, byMemory)
+}
+
+func newUploadBufferPool(bufferSize int64, count int) *uploadBufferPool {
+	if bufferSize <= 0 {
+		bufferSize = s3client.PartSize
+	}
+	if count < 1 {
+		count = 1
+	}
+	ch := make(chan []byte, count)
+	// Preallocate exactly one buffer per in-flight worker so uploads can reuse
+	// memory across parts instead of allocating a fresh part-sized slice on each
+	// iteration.
+	for i := 0; i < count; i++ {
+		ch <- make([]byte, bufferSize)
+	}
+	return &uploadBufferPool{size: bufferSize, ch: ch}
+}
+
+func (p *uploadBufferPool) get(ctx context.Context) ([]byte, error) {
+	select {
+	case buf := <-p.ch:
+		return buf[:p.size], nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// put expects a buffer previously obtained from this pool via get(). When a
+// caller returns a shortened view of that buffer, we restore its full length
+// before enqueuing it again. If a non-pool buffer with insufficient capacity is
+// passed in by mistake, drop it instead of panicking on the reslice.
+func (p *uploadBufferPool) put(buf []byte) {
+	if buf == nil {
+		return
+	}
+	if int64(cap(buf)) < p.size {
+		return
+	}
+	p.ch <- buf[:p.size]
 }
 
 // WriteStream uploads data from a reader. For small files (size < threshold),
@@ -287,6 +371,7 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 		stdPartSize = s3client.PartSize
 	}
 	maxConcurrency := uploadParallelism(stdPartSize)
+	bufferPool := newUploadBufferPool(stdPartSize, maxConcurrency)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -317,7 +402,13 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			data := make([]byte, p.Size)
+			fullBuf, err := bufferPool.get(ctx)
+			if err != nil {
+				return
+			}
+			defer bufferPool.put(fullBuf)
+
+			data := fullBuf[:p.Size]
 			offset := int64(p.Number-1) * stdPartSize
 			n, err := ra.ReadAt(data, offset)
 			if err != nil && err != io.EOF {
@@ -348,7 +439,7 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 			}
 
 			if progress != nil {
-				progress(p.Number, len(plan.Parts), int64(len(data)))
+				progress(p.Number, len(plan.Parts), p.Size)
 			}
 		}(part)
 	}
@@ -534,6 +625,7 @@ func (c *Client) uploadPartsV2(ctx context.Context, plan *uploadPlanV2, ra io.Re
 	presignCh <-chan presignedPart, presignErrCh <-chan error, progress ProgressFunc) ([]completePart, error) {
 
 	parallelism := uploadParallelism(plan.PartSize)
+	bufferPool := newUploadBufferPool(plan.PartSize, parallelism)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -573,7 +665,13 @@ func (c *Client) uploadPartsV2(ctx context.Context, plan *uploadPlanV2, ra io.Re
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			data := make([]byte, p.Size)
+			fullBuf, err := bufferPool.get(ctx)
+			if err != nil {
+				return
+			}
+			defer bufferPool.put(fullBuf)
+
+			data := fullBuf[:p.Size]
 			offset := int64(p.Number-1) * plan.PartSize
 			n, err := ra.ReadAt(data, offset)
 			if err != nil && err != io.EOF {
@@ -619,7 +717,7 @@ func (c *Client) uploadPartsV2(ctx context.Context, plan *uploadPlanV2, ra io.Re
 			results[p.Number-1] = completePart{Number: p.Number, ETag: etag}
 
 			if progress != nil {
-				progress(p.Number, plan.TotalParts, int64(len(data)))
+				progress(p.Number, plan.TotalParts, p.Size)
 			}
 		}(pp)
 	}
@@ -756,21 +854,7 @@ func (c *Client) abortUploadV2(ctx context.Context, uploadID string) error {
 
 // ReadStream reads a file, following 302 redirects for large files.
 func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, error) {
-	// Disable redirect following so we can detect 302
-	noRedirectClient := *c.httpClient
-	noRedirectClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path), nil)
-	if err != nil {
-		return nil, err
-	}
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-
-	resp, err := noRedirectClient.Do(req)
+	resp, err := c.readWithoutRedirect(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -807,16 +891,8 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 	}
 }
 
-// ReadStreamRange reads a byte range from a remote file. For large files the
-// server returns a 302 redirect to a presigned S3 URL; this method resolves
-// that redirect and issues an HTTP Range request so only the requested bytes
-// are transferred. For small files (no redirect) the full body is returned
-// and the caller should read only what it needs.
-func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
-	if length <= 0 {
-		return io.NopCloser(bytes.NewReader(nil)), nil
-	}
-
+func (c *Client) readWithoutRedirect(ctx context.Context, path string) (*http.Response, error) {
+	// Disable redirect following so we can detect 302
 	noRedirectClient := *c.httpClient
 	noRedirectClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
@@ -830,7 +906,53 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 
-	resp, err := noRedirectClient.Do(req)
+	return noRedirectClient.Do(req)
+}
+
+func (c *Client) resolveReadTarget(ctx context.Context, path string) (*readTarget, error) {
+	resp, err := c.readWithoutRedirect(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch {
+	case resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusTemporaryRedirect:
+		location := resp.Header.Get("Location")
+		if location == "" {
+			return nil, fmt.Errorf("302 without Location header")
+		}
+		return &readTarget{objectURL: location}, nil
+
+	case resp.StatusCode >= 300:
+		return nil, readError(resp)
+
+	default:
+		return nil, errReadTargetNoRedirect
+	}
+}
+
+func (c *Client) downloadToFileSequential(ctx context.Context, remotePath string, out *os.File) (*DownloadSummary, error) {
+	rc, err := c.ReadStream(ctx, remotePath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }()
+	_, err = io.Copy(out, rc)
+	return nil, err
+}
+
+// ReadStreamRange reads a byte range from a remote file. For large files the
+// server returns a 302 redirect to a presigned S3 URL; this method resolves
+// that redirect and issues an HTTP Range request so only the requested bytes
+// are transferred. For small files (no redirect) the full body is returned
+// and the caller should read only what it needs.
+func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	if length <= 0 {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+
+	resp, err := c.readWithoutRedirect(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -879,6 +1001,40 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 	}
 }
 
+func (c *Client) readObjectRangeStrict(ctx context.Context, objectURL string, offset, length int64) (io.ReadCloser, error) {
+	if length <= 0 {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, objectURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		return resp.Body, nil
+	case http.StatusRequestedRangeNotSatisfiable:
+		defer func() { _ = resp.Body.Close() }()
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	case http.StatusOK:
+		defer func() { _ = resp.Body.Close() }()
+		return nil, fmt.Errorf("range request was not honored for %q at offset=%d length=%d", objectURL, offset, length)
+	default:
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode >= 300 {
+			return nil, readError(resp)
+		}
+		return nil, fmt.Errorf("unexpected status %d for range request %q", resp.StatusCode, objectURL)
+	}
+}
+
 // sliceBody skips offset bytes from rc, then returns a reader limited to
 // length bytes. The original rc is closed when the returned ReadCloser is closed.
 func (c *Client) sliceBody(rc io.ReadCloser, offset, length int64) (io.ReadCloser, error) {
@@ -902,6 +1058,153 @@ type limitedReadCloser struct {
 
 func (l *limitedReadCloser) Read(p []byte) (int, error) { return l.r.Read(p) }
 func (l *limitedReadCloser) Close() error               { return l.c.Close() }
+
+// DownloadToFile downloads a remote file into a local path.
+func (c *Client) DownloadToFile(ctx context.Context, remotePath, localPath string, size int64) error {
+	_, err := c.DownloadToFileWithSummary(ctx, remotePath, localPath, size)
+	return err
+}
+
+// DownloadToFileWithSummary downloads a remote file into a local path and
+// returns a coarse-grained summary when the large-file parallel path is used.
+func (c *Client) DownloadToFileWithSummary(ctx context.Context, remotePath, localPath string, size int64) (*DownloadSummary, error) {
+	out, err := os.Create(localPath)
+	if err != nil {
+		return nil, fmt.Errorf("create %s: %w", localPath, err)
+	}
+	defer func() { _ = out.Close() }()
+
+	if size < downloadParallelThreshold {
+		return c.downloadToFileSequential(ctx, remotePath, out)
+	}
+
+	target, err := c.resolveReadTarget(ctx, remotePath)
+	if err != nil {
+		if errors.Is(err, errReadTargetNoRedirect) {
+			// Keep large-file downloads working when the control plane serves the
+			// object inline instead of redirecting to object storage. In that case
+			// the parallel range path is unavailable, so fall back to ReadStream.
+			return c.downloadToFileSequential(ctx, remotePath, out)
+		}
+		return nil, err
+	}
+	if err := out.Truncate(size); err != nil {
+		return nil, fmt.Errorf("preallocate %s: %w", localPath, err)
+	}
+	// The current failure semantics intentionally keep the partially written
+	// destination file on disk when a parallel range worker fails. Follow-up:
+	// #141.
+	summary, err := c.downloadLargeFileParallel(ctx, remotePath, localPath, out, size, target)
+	if err != nil {
+		return nil, err
+	}
+	if err := out.Sync(); err != nil {
+		return nil, fmt.Errorf("sync %s: %w", localPath, err)
+	}
+	return summary, nil
+}
+
+func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, localPath string, out *os.File, size int64, target *readTarget) (*DownloadSummary, error) {
+	// Resolve the presigned object URL once, then reuse it for all range GETs in
+	// this download. This avoids paying one redirect / presign round-trip per
+	// chunk while keeping the existing server contract unchanged.
+	//
+	// This path currently assumes the object content stays stable for the whole
+	// download. We do not capture ETag / VersionId at resolve time or attach
+	// If-Match on per-range GETs, so cross-range consistency is best-effort.
+	// Follow-up: #139.
+
+	rangeCount := int((size + downloadChunkSize - 1) / downloadChunkSize)
+	concurrency := min(downloadMaxConcurrency, rangeCount)
+	startedAt := time.Now()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	tasks := make(chan downloadRange, concurrency)
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+
+	reportErr := func(err error) {
+		select {
+		case errCh <- err:
+			cancel()
+		default:
+		}
+	}
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasks {
+				if ctx.Err() != nil {
+					return
+				}
+
+				rc, err := c.readObjectRangeStrict(ctx, target.objectURL, task.offset, task.length)
+				if err != nil {
+					reportErr(err)
+					return
+				}
+
+				// Each worker reads its range fully before WriteAt so file offsets stay
+				// independent and we never coordinate shared seek state between goroutines.
+				data, readErr := io.ReadAll(rc)
+				closeErr := rc.Close()
+				if readErr != nil {
+					reportErr(fmt.Errorf("read range offset=%d length=%d: %w", task.offset, task.length, readErr))
+					return
+				}
+				if closeErr != nil {
+					reportErr(fmt.Errorf("close range offset=%d length=%d: %w", task.offset, task.length, closeErr))
+					return
+				}
+				if int64(len(data)) != task.length {
+					reportErr(fmt.Errorf("short range read at offset=%d: got %d bytes, want %d", task.offset, len(data), task.length))
+					return
+				}
+				if _, err := out.WriteAt(data, task.offset); err != nil {
+					reportErr(fmt.Errorf("write range offset=%d length=%d: %w", task.offset, task.length, err))
+					return
+				}
+			}
+		}()
+	}
+
+enqueueLoop:
+	for offset := int64(0); offset < size; offset += downloadChunkSize {
+		length := min(size-offset, downloadChunkSize)
+		task := downloadRange{offset: offset, length: length}
+		select {
+		case tasks <- task:
+		case <-ctx.Done():
+			break enqueueLoop
+		}
+	}
+	close(tasks)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return nil, err
+	default:
+	}
+
+	finishedAt := time.Now()
+	return &DownloadSummary{
+		Type:           "download_summary",
+		Mode:           "parallel_range_reuse_presigned_url",
+		Concurrency:    concurrency,
+		ChunkSizeBytes: downloadChunkSize,
+		RangeCount:     rangeCount,
+		StartedAt:      startedAt,
+		FinishedAt:     finishedAt,
+		ElapsedSeconds: finishedAt.Sub(startedAt).Seconds(),
+		RemotePath:     remotePath,
+		LocalPath:      localPath,
+	}, nil
+}
 
 // UploadMeta is the server's response for querying active uploads.
 type UploadMeta struct {
@@ -1059,6 +1362,7 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 		stdPartSize = s3client.PartSize
 	}
 	maxConcurrency := uploadParallelism(stdPartSize)
+	bufferPool := newUploadBufferPool(stdPartSize, maxConcurrency)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1088,7 +1392,13 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			data := make([]byte, p.Size)
+			fullBuf, err := bufferPool.get(ctx)
+			if err != nil {
+				return
+			}
+			defer bufferPool.put(fullBuf)
+
+			data := fullBuf[:p.Size]
 			offset := int64(p.Number-1) * stdPartSize
 			n, err := r.ReadAt(data, offset)
 			if err != nil && err != io.EOF {
@@ -1118,7 +1428,7 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 				return
 			}
 			if progress != nil {
-				progress(p.Number, totalParts, int64(len(data)))
+				progress(p.Number, totalParts, p.Size)
 			}
 		}(part)
 	}

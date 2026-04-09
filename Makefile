@@ -19,6 +19,7 @@ SERVER_BIN ?= $(BIN_DIR)/$(APP_NAME)
 CLI_BIN ?= $(BIN_DIR)/$(CLI_NAME)
 LOCAL_BIN ?= $(CURDIR)/bin
 VERSION ?=
+GIT_HASH ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 CLI_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 GOLANGCI_LINT_VERSION ?= v2.5.0
@@ -82,11 +83,13 @@ run-server-local:
 build-cli:
 	mkdir -p $(BIN_DIR)
 	@set -euo pipefail; \
+	ldflags="-X main.gitHash=$(GIT_HASH)"; \
 	if [ -n "$(VERSION)" ]; then \
-		CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "-X main.version=$(VERSION)" -o $(CLI_BIN) ./cmd/drive9; \
+		ldflags="$$ldflags -X main.version=$(VERSION)"; \
 	else \
-		CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(CLI_BIN) ./cmd/drive9; \
+		ldflags="$$ldflags -X main.version=dev"; \
 	fi; \
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$$ldflags" -o $(CLI_BIN) ./cmd/drive9; \
 	true
 
 build-cli-release:
