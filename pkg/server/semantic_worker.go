@@ -118,6 +118,19 @@ type semanticObservationSnapshot struct {
 	inflight        int
 }
 
+type semanticTaskAction string
+
+const (
+	semanticTaskActionAck   semanticTaskAction = "ack"
+	semanticTaskActionRetry semanticTaskAction = "retry"
+)
+
+type semanticTaskOutcome struct {
+	action  semanticTaskAction
+	result  string
+	message string
+}
+
 func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store, pool *tenant.Pool, embedder embedding.Client, opts SemanticWorkerOptions) *semanticWorkerManager {
 	hasMultiTenant := metaStore != nil && pool != nil
 	if fallback == nil && !hasMultiTenant {
@@ -259,7 +272,7 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 }
 
 func (m *semanticWorkerManager) processTask(ctx context.Context, target *semanticTarget, task *semantic.Task) {
-	if task == nil {
+	if task == nil || target == nil {
 		return
 	}
 	start := time.Now()
@@ -267,7 +280,14 @@ func (m *semanticWorkerManager) processTask(ctx context.Context, target *semanti
 	defer func() {
 		metrics.RecordOperation("semantic_worker", string(task.TaskType), result, time.Since(start))
 	}()
-	result = m.dispatchTask(ctx, target, task)
+	outcome := m.dispatchTask(ctx, target, task)
+	result = outcome.result
+	switch outcome.action {
+	case semanticTaskActionAck:
+		m.ackTask(ctx, target.tenantID, target.store, task, outcome.message)
+	case semanticTaskActionRetry:
+		m.retryTask(ctx, target.tenantID, target.store, task, outcome.message)
+	}
 }
 
 func (m *semanticWorkerManager) ackTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task, reason string) {
@@ -500,68 +520,57 @@ func (m *semanticWorkerManager) invalidateTenantBackend(tenantID string) {
 	m.pool.Invalidate(tenantID)
 }
 
-func (m *semanticWorkerManager) dispatchTask(ctx context.Context, target *semanticTarget, task *semantic.Task) string {
+func (m *semanticWorkerManager) dispatchTask(ctx context.Context, target *semanticTarget, task *semantic.Task) semanticTaskOutcome {
 	switch task.TaskType {
 	case semantic.TaskTypeEmbed:
-		return m.processEmbedTask(ctx, target.tenantID, target.store, task)
+		return m.processEmbedTask(ctx, target.store, task)
 	case semantic.TaskTypeImgExtractText:
-		return m.processImgExtractTask(ctx, target.tenantID, target.store, target.backend, task)
+		return m.processImgExtractTask(ctx, target.backend, task)
 	default:
-		m.retryTask(ctx, target.tenantID, target.store, task, fmt.Sprintf("unsupported task type %q", task.TaskType))
-		return "unsupported"
+		message := fmt.Sprintf("unsupported task type %q", task.TaskType)
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "unsupported", message: message}
 	}
 }
 
-func (m *semanticWorkerManager) processEmbedTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task) string {
+func (m *semanticWorkerManager) processEmbedTask(ctx context.Context, store *datastore.Store, task *semantic.Task) semanticTaskOutcome {
 	if m.embedder == nil {
-		m.retryTask(ctx, tenantID, store, task, "embed handler not configured")
-		return "handler_missing"
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "handler_missing", message: "embed handler not configured"}
 	}
 	file, err := store.GetFile(ctx, task.ResourceID)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
-			m.ackTask(ctx, tenantID, store, task, "file_not_found")
-			return "obsolete"
+			return semanticTaskOutcome{action: semanticTaskActionAck, result: "obsolete", message: "file_not_found"}
 		}
-		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("get file: %v", err))
-		return "get_file_error"
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "get_file_error", message: fmt.Sprintf("get file: %v", err)}
 	}
 	if file.Status != datastore.StatusConfirmed || file.Revision != task.ResourceVersion || strings.TrimSpace(file.ContentText) == "" {
-		m.ackTask(ctx, tenantID, store, task, "stale_or_empty")
-		return "obsolete"
+		return semanticTaskOutcome{action: semanticTaskActionAck, result: "obsolete", message: "stale_or_empty"}
 	}
 
 	vec, err := m.embedder.EmbedText(ctx, file.ContentText)
 	if err != nil {
-		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("embed text: %v", err))
-		return "embed_error"
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "embed_error", message: fmt.Sprintf("embed text: %v", err)}
 	}
 	if len(vec) == 0 {
-		m.retryTask(ctx, tenantID, store, task, "embed text returned empty vector")
-		return "embed_empty"
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "embed_empty", message: "embed text returned empty vector"}
 	}
 
 	updated, err := store.UpdateFileEmbedding(ctx, task.ResourceID, task.ResourceVersion, vec)
 	if err != nil {
-		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("write embedding: %v", err))
-		return "writeback_error"
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "writeback_error", message: fmt.Sprintf("write embedding: %v", err)}
 	}
 	if !updated {
-		m.ackTask(ctx, tenantID, store, task, "conditional_write_miss")
-		return "obsolete"
+		return semanticTaskOutcome{action: semanticTaskActionAck, result: "obsolete", message: "conditional_write_miss"}
 	}
-	m.ackTask(ctx, tenantID, store, task, "written")
-	return "ok"
+	return semanticTaskOutcome{action: semanticTaskActionAck, result: "ok", message: "written"}
 }
 
-func (m *semanticWorkerManager) processImgExtractTask(ctx context.Context, tenantID string, store *datastore.Store, b *backend.Dat9Backend, task *semantic.Task) string {
+func (m *semanticWorkerManager) processImgExtractTask(ctx context.Context, b *backend.Dat9Backend, task *semantic.Task) semanticTaskOutcome {
 	result, err := b.ProcessImageExtractTask(ctx, imageExtractTaskSpecFromSemanticTask(task))
 	if err != nil {
-		m.retryTask(ctx, tenantID, store, task, err.Error())
-		return string(result)
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: string(result), message: err.Error()}
 	}
-	m.ackTask(ctx, tenantID, store, task, string(result))
-	return string(result)
+	return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: string(result)}
 }
 
 func semanticTaskLogFields(task *semantic.Task) []zap.Field {

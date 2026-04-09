@@ -1046,9 +1046,10 @@ func TestSemanticWorkerProcessEmbedTaskWithoutEmbedderDoesNotPanic(t *testing.T)
 	var opts SemanticWorkerOptions
 	opts.normalize()
 	m := &semanticWorkerManager{fallback: b, opts: opts}
-	if got := m.processEmbedTask(context.Background(), semanticLocalTenantID, b.Store(), claimed); got != "handler_missing" {
-		t.Fatalf("process result=%q, want %q", got, "handler_missing")
-	}
+	m.processTask(context.Background(), &semanticTarget{
+		tenantID: semanticLocalTenantID,
+		store:    b.Store(),
+	}, claimed)
 	task := mustGetServerSemanticTask(t, b, claimed.TaskID)
 	if task.Status != string(semantic.TaskQueued) {
 		t.Fatalf("task status=%q, want %q", task.Status, semantic.TaskQueued)
