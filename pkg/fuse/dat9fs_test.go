@@ -54,7 +54,9 @@ func TestOpenWritableFailsWhenSmallFilePreloadFails(t *testing.T) {
 	}
 }
 
-func TestOpenWritableFailsWhenLargeFilePreloadFails(t *testing.T) {
+func TestOpenWritableLargeFileLazyPreload(t *testing.T) {
+	// With lazy preload, Open() succeeds for large files even if the server
+	// would fail on GET — the actual data loading is deferred to Write time.
 	fs, ino, cleanup := newTestDat9FS(t, smallFileThreshold+1, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	})
@@ -65,8 +67,8 @@ func TestOpenWritableFailsWhenLargeFilePreloadFails(t *testing.T) {
 		InHeader: gofuse.InHeader{NodeId: ino},
 		Flags:    uint32(syscall.O_RDWR),
 	}, &out)
-	if st != gofuse.EIO {
-		t.Fatalf("Open status = %v, want EIO", st)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK (lazy preload defers loading)", st)
 	}
 }
 
@@ -196,5 +198,158 @@ func TestLookupFallsBackToParentListWhenDirStatUnsupported(t *testing.T) {
 	}
 	if out.Mode&syscall.S_IFDIR == 0 {
 		t.Fatalf("Lookup mode = %o, want directory mode", out.Mode)
+	}
+}
+
+func TestOpenReadOnlyLargeFileGetsPrefetcher(t *testing.T) {
+	size := int64(1024 * 1024) // 1MB — above smallFileThreshold
+	data := make([]byte, size)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	fs, ino, cleanup := newTestDat9FS(t, size, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(data)
+	})
+	defer cleanup()
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.Prefetch == nil {
+		t.Fatal("expected Prefetcher to be set for large read-only file")
+	}
+}
+
+func TestOpenWritableLargeFileGetsLazyPreload(t *testing.T) {
+	size := int64(1024 * 1024) // 1MB — above smallFileThreshold
+	getCalled := false
+
+	fs, ino, cleanup := newTestDat9FS(t, size, func(w http.ResponseWriter, r *http.Request) {
+		getCalled = true
+		_, _ = w.Write(make([]byte, size))
+	})
+	defer cleanup()
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDWR),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	// With lazy preload, Open should NOT have fetched the file content
+	if getCalled {
+		t.Fatal("expected lazy preload — GET should not be called during Open")
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.Dirty == nil {
+		t.Fatal("expected Dirty buffer to be set")
+	}
+	if fh.Dirty.LoadPart == nil {
+		t.Fatal("expected LoadPart callback to be set for lazy preload")
+	}
+}
+
+func TestDefaultTTLIs60Seconds(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	if opts.AttrTTL != 60*time.Second {
+		t.Fatalf("default AttrTTL = %v, want 60s", opts.AttrTTL)
+	}
+	if opts.EntryTTL != 60*time.Second {
+		t.Fatalf("default EntryTTL = %v, want 60s", opts.EntryTTL)
+	}
+}
+
+func TestLookupReturnsTTLInEntryOut(t *testing.T) {
+	fs, _, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, 42))
+	})
+	defer cleanup()
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "file.bin", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	// The entry timeout should match the configured TTL (60s default).
+	// go-fuse stores timeouts in seconds + nanoseconds.
+	if out.EntryValid < 59 {
+		t.Fatalf("EntryValid = %d, want >= 59 (60s TTL)", out.EntryValid)
+	}
+	if out.AttrValid < 59 {
+		t.Fatalf("AttrValid = %d, want >= 59 (60s TTL)", out.AttrValid)
+	}
+}
+
+func TestInitStoresServer(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	if fs.server != nil {
+		t.Fatal("server should be nil before Init")
+	}
+	// We can't easily create a real gofuse.Server in tests,
+	// but we can verify that notifyEntry/notifyInode are safe
+	// to call with a nil server (no panic).
+	fs.notifyEntry(1, "test")
+	fs.notifyInode(1)
+}
+
+func TestCreateFileGetsStreamUploader(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	// First we need to list root so inodes are populated
+	_, _ = fs.client.List("/")
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "newfile.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.Streamer == nil {
+		t.Fatal("expected StreamUploader to be set for new file")
 	}
 }

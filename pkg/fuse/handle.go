@@ -11,6 +11,8 @@ type FileHandle struct {
 	Dirty    *WriteBuffer // write buffer, nil for read-only opens
 	DirtySeq uint64       // monotonic sequence for authoritative dirty-size tracking
 	OrigSize int64        // original file size at open time (for patch detection)
+	Streamer *StreamUploader // nil for small files / read-only; manages background part uploads
+	Prefetch *Prefetcher     // nil for writable handles; sequential read prefetcher
 	mu       sync.Mutex
 }
 

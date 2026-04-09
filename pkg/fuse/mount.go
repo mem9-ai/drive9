@@ -33,10 +33,10 @@ func (o *MountOptions) setDefaults() {
 		o.DirTTL = defaultDirCacheTTL
 	}
 	if o.AttrTTL <= 0 {
-		o.AttrTTL = 1 * time.Second
+		o.AttrTTL = 60 * time.Second
 	}
 	if o.EntryTTL <= 0 {
-		o.EntryTTL = 1 * time.Second
+		o.EntryTTL = 60 * time.Second
 	}
 }
 
@@ -62,7 +62,7 @@ func Mount(opts *MountOptions) error {
 	fuseOpts := &gofuse.MountOptions{
 		FsName:       "dat9",
 		Name:         "dat9",
-		MaxReadAhead: 128 * 1024, // 128KB
+		MaxReadAhead: 8 * 1024 * 1024, // 8MB — larger readahead reduces FUSE kernel↔userspace switches
 		Debug:        opts.Debug,
 		AllowOther:   opts.AllowOther,
 	}

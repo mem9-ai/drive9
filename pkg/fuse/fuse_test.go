@@ -450,7 +450,7 @@ func TestWriteBuffer_DirtyParts_PreloadClearsFlags(t *testing.T) {
 	_, _ = wb.Write(0, data)
 
 	// After preload, clear dirty flags (simulating Open behavior)
-	wb.dirtyParts = nil
+	wb.ClearDirty()
 
 	// No parts should be dirty
 	if len(wb.DirtyPartNumbers()) != 0 {
@@ -496,7 +496,7 @@ func TestWriteBuffer_DirtyParts_TruncateShrinkAtBoundary(t *testing.T) {
 func TestWriteBuffer_DirtyParts_TruncateExtend(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0, 0)
 	_, _ = wb.Write(0, make([]byte, DefaultPartSize)) // 1 full part
-	wb.dirtyParts = nil                        // clear as if preloaded
+	wb.ClearDirty()                        // clear as if preloaded
 
 	// Extend to 3 parts
 	_ = wb.Truncate(DefaultPartSize*3 - 100)
@@ -538,7 +538,7 @@ func TestWriteBuffer_PartData(t *testing.T) {
 func TestWriteBuffer_MarkAllDirty(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0, 0)
 	_, _ = wb.Write(0, make([]byte, DefaultPartSize*3))
-	wb.dirtyParts = nil // clear
+	wb.ClearDirty() // clear
 
 	wb.MarkAllDirty()
 	dirty := wb.DirtyPartNumbers()
@@ -598,6 +598,566 @@ func TestDirCache_InvalidateAll(t *testing.T) {
 	}
 	if _, ok := dc.Get("/b"); ok {
 		t.Fatal("/b should be gone")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sparse WriteBuffer with LoadPart (lazy loading) tests
+// ---------------------------------------------------------------------------
+
+func TestWriteBuffer_LazyLoad_WriteTriggersLoad(t *testing.T) {
+	// Simulate a 2-part file where LoadPart provides the existing data.
+	wb := NewWriteBuffer("/test", 0, DefaultPartSize)
+	wb.totalSize = DefaultPartSize * 2  // pretend file is 16MB
+	wb.remoteSize = DefaultPartSize * 2 // remote file is the same size
+
+	loadCalls := 0
+	wb.LoadPart = func(partNum int) ([]byte, error) {
+		loadCalls++
+		data := make([]byte, DefaultPartSize)
+		// Fill with a pattern based on part number
+		for i := range data {
+			data[i] = byte(partNum)
+		}
+		return data, nil
+	}
+
+	// Write to the middle of part 2 — should trigger lazy load of part 2
+	_, err := wb.Write(DefaultPartSize+100, []byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadCalls != 1 {
+		t.Fatalf("expected 1 LoadPart call, got %d", loadCalls)
+	}
+
+	// The written data should be at the correct offset within part 2
+	p2 := wb.PartData(2)
+	if string(p2[100:105]) != "hello" {
+		t.Fatalf("part 2 data at offset 100: got %q", p2[100:105])
+	}
+
+	// Data before the write should be the original loaded data (byte value 2)
+	if p2[0] != 2 {
+		t.Fatalf("part 2 first byte: got %d, want 2", p2[0])
+	}
+}
+
+func TestWriteBuffer_LazyLoad_UnloadedPartReturnsZeros(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, DefaultPartSize)
+	wb.totalSize = DefaultPartSize * 2
+
+	// No LoadPart set — unloaded parts should return zero-filled data
+	p1 := wb.PartData(1)
+	if p1 == nil {
+		t.Fatal("PartData should return zero-filled slice, not nil")
+	}
+	if len(p1) != int(DefaultPartSize) {
+		t.Fatalf("PartData len = %d, want %d", len(p1), DefaultPartSize)
+	}
+	for i, b := range p1 {
+		if b != 0 {
+			t.Fatalf("byte %d = %d, want 0", i, b)
+		}
+	}
+}
+
+func TestWriteBuffer_RewritePartPreservesLatestData(t *testing.T) {
+	// Verify that rewriting a full part keeps the latest data in the buffer.
+	// This is critical: FUSE writers can revisit earlier offsets before close
+	// (e.g. patching headers, checksums, footers).
+	wb := NewWriteBuffer("/test", defaultWriteBufferMaxSize, DefaultPartSize)
+
+	// Write a full first part
+	data := make([]byte, DefaultPartSize)
+	for i := range data {
+		data[i] = 0xAA
+	}
+	_, err := wb.Write(0, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write beyond part 1 to establish a multi-part file
+	_, _ = wb.Write(DefaultPartSize, []byte("part2"))
+
+	// Now go back and rewrite the beginning of part 1 (e.g. header patch)
+	_, _ = wb.Write(0, []byte("HEADER"))
+
+	// Verify part 1 has the latest data
+	p1 := wb.PartData(1)
+	if string(p1[:6]) != "HEADER" {
+		t.Fatalf("part 1 header: got %q, want %q", p1[:6], "HEADER")
+	}
+	// Rest of part 1 should still be 0xAA
+	if p1[6] != 0xAA {
+		t.Fatalf("part 1 byte 6: got %02x, want 0xAA", p1[6])
+	}
+
+	// Part 1 should be dirty
+	dirty := wb.DirtyPartNumbers()
+	dirtySet := make(map[int]bool)
+	for _, d := range dirty {
+		dirtySet[d] = true
+	}
+	if !dirtySet[1] {
+		t.Fatal("part 1 should be dirty after rewrite")
+	}
+}
+
+func TestWriteBuffer_Bytes_MaterializesSparseBuffer(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 10) // small part size for testing
+	wb.totalSize = 30
+
+	// Write to part 1 (bytes 0-9)
+	_, _ = wb.Write(0, []byte("AAAAAAAAAA"))
+	// Write to part 3 (bytes 20-29)
+	_, _ = wb.Write(20, []byte("CCCCCCCCCC"))
+
+	data := wb.Bytes()
+	if len(data) != 30 {
+		t.Fatalf("Bytes() len = %d, want 30", len(data))
+	}
+	if string(data[0:10]) != "AAAAAAAAAA" {
+		t.Fatalf("part 1: got %q", data[0:10])
+	}
+	// Part 2 (bytes 10-19) should be zeros
+	for i := 10; i < 20; i++ {
+		if data[i] != 0 {
+			t.Fatalf("byte %d = %d, want 0", i, data[i])
+		}
+	}
+	if string(data[20:30]) != "CCCCCCCCCC" {
+		t.Fatalf("part 3: got %q", data[20:30])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Prefetcher tests
+// ---------------------------------------------------------------------------
+
+func TestPrefetcher_SequentialReadGrowsWindow(t *testing.T) {
+	p := NewPrefetcher(nil, "/test", 100*1024*1024) // 100MB file
+
+	// Simulate sequential reads
+	p.OnRead(0, 4096)
+	if p.window != prefetchMinWindow*2 {
+		t.Fatalf("window after first sequential read = %d, want %d", p.window, prefetchMinWindow*2)
+	}
+
+	p.OnRead(4096, 4096)
+	if p.window != prefetchMinWindow*4 {
+		t.Fatalf("window after second sequential read = %d, want %d", p.window, prefetchMinWindow*4)
+	}
+}
+
+func TestPrefetcher_RandomReadResetsWindow(t *testing.T) {
+	p := NewPrefetcher(nil, "/test", 100*1024*1024)
+
+	// Sequential reads to grow window
+	p.OnRead(0, 4096)
+	p.OnRead(4096, 4096)
+
+	// Random read
+	p.OnRead(50*1024*1024, 4096)
+	if p.window != prefetchMinWindow {
+		t.Fatalf("window after random read = %d, want %d (reset)", p.window, prefetchMinWindow)
+	}
+}
+
+func TestPrefetcher_WindowCapAtMax(t *testing.T) {
+	p := NewPrefetcher(nil, "/test", 1024*1024*1024) // 1GB file
+
+	offset := int64(0)
+	for i := 0; i < 20; i++ {
+		p.OnRead(offset, 4096)
+		offset += 4096
+	}
+
+	if p.window > prefetchMaxWindow {
+		t.Fatalf("window %d exceeds max %d", p.window, prefetchMaxWindow)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Rewrite-before-close correctness test
+// ---------------------------------------------------------------------------
+
+func TestWriteBuffer_RewriteBeforeClose_AllDirtyPartsHaveLatestData(t *testing.T) {
+	// Simulates: write 3 full parts, then go back and patch byte 0 of part 1.
+	// All 3 parts should be dirty, and part 1 should have the patched data.
+	wb := NewWriteBuffer("/test", defaultWriteBufferMaxSize, DefaultPartSize)
+
+	// Write 3 full parts
+	for i := 0; i < 3; i++ {
+		data := make([]byte, DefaultPartSize)
+		for j := range data {
+			data[j] = byte(i + 1) // part 1 = 0x01, part 2 = 0x02, part 3 = 0x03
+		}
+		_, err := wb.Write(int64(i)*DefaultPartSize, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Patch first 4 bytes of part 1 (e.g. file magic / header)
+	_, _ = wb.Write(0, []byte("MAGIC"))
+
+	// All 3 parts should be dirty
+	dirty := wb.DirtyPartNumbers()
+	if len(dirty) != 3 {
+		t.Fatalf("expected 3 dirty parts, got %v", dirty)
+	}
+
+	// Part 1 should have the patched header
+	p1 := wb.PartData(1)
+	if string(p1[:5]) != "MAGIC" {
+		t.Fatalf("part 1 header: got %q, want %q", p1[:5], "MAGIC")
+	}
+	// Rest of part 1 should be original (0x01)
+	if p1[5] != 0x01 {
+		t.Fatalf("part 1 byte 5: got %02x, want 0x01", p1[5])
+	}
+
+	// Part 2 should be untouched original
+	p2 := wb.PartData(2)
+	if p2[0] != 0x02 {
+		t.Fatalf("part 2 byte 0: got %02x, want 0x02", p2[0])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// WriteBuffer.ReadAt tests
+// ---------------------------------------------------------------------------
+
+func TestWriteBuffer_ReadAt_Basic(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 10) // small part size
+	_, _ = wb.Write(0, []byte("AAAAAAAAAA"))  // part 1
+	_, _ = wb.Write(20, []byte("CCCCCCCCCC")) // part 3
+
+	// Read across all three parts including the sparse gap
+	buf := make([]byte, 30)
+	n := wb.ReadAt(0, buf)
+	if n != 30 {
+		t.Fatalf("ReadAt returned %d, want 30", n)
+	}
+	if string(buf[0:10]) != "AAAAAAAAAA" {
+		t.Fatalf("part 1: got %q", buf[0:10])
+	}
+	for i := 10; i < 20; i++ {
+		if buf[i] != 0 {
+			t.Fatalf("byte %d = %d, want 0 (sparse gap)", i, buf[i])
+		}
+	}
+	if string(buf[20:30]) != "CCCCCCCCCC" {
+		t.Fatalf("part 3: got %q", buf[20:30])
+	}
+}
+
+func TestWriteBuffer_ReadAt_PartialRead(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 10)
+	_, _ = wb.Write(0, []byte("hello world!padding!"))
+
+	// Read from middle of part 1 into part 2
+	buf := make([]byte, 5)
+	n := wb.ReadAt(3, buf)
+	if n != 5 {
+		t.Fatalf("ReadAt returned %d, want 5", n)
+	}
+	if string(buf) != "lo wo" {
+		t.Fatalf("ReadAt mid: got %q, want %q", buf, "lo wo")
+	}
+}
+
+func TestWriteBuffer_ReadAt_BeyondEnd(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 0)
+	_, _ = wb.Write(0, []byte("abc"))
+
+	buf := make([]byte, 10)
+	n := wb.ReadAt(100, buf)
+	if n != 0 {
+		t.Fatalf("ReadAt beyond end returned %d, want 0", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Prefetcher Close test
+// ---------------------------------------------------------------------------
+
+func TestPrefetcher_CloseStopsAccepting(t *testing.T) {
+	p := NewPrefetcher(nil, "/test", 100*1024*1024)
+
+	// Sequential reads work before close
+	p.OnRead(0, 4096)
+	if p.window != prefetchMinWindow*2 {
+		t.Fatalf("window before close = %d, want %d", p.window, prefetchMinWindow*2)
+	}
+
+	p.Close()
+
+	// After close, OnRead is a no-op
+	p.OnRead(4096, 4096)
+	if p.window != prefetchMinWindow*2 {
+		t.Fatalf("window should not change after Close, got %d", p.window)
+	}
+
+	// Get returns miss after close
+	_, ok := p.Get(0, 4096)
+	if ok {
+		t.Fatal("Get should return false after Close")
+	}
+
+	// Double-close is safe
+	p.Close()
+}
+
+// ---------------------------------------------------------------------------
+// StreamUploader tests
+// ---------------------------------------------------------------------------
+
+func TestStreamUploader_NotStartedBeforeUploadAll(t *testing.T) {
+	su := NewStreamUploader(nil, "/test")
+	if su.Started() {
+		t.Fatal("should not be started before UploadAll")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sequential write detection tests
+// ---------------------------------------------------------------------------
+
+func TestWriteBuffer_SequentialDetection(t *testing.T) {
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	// Sequential writes should maintain sequential flag
+	_, _ = wb.Write(0, make([]byte, 1024))
+	if !wb.IsSequential() {
+		t.Fatal("should be sequential after forward write")
+	}
+	if wb.appendCursor != 1024 {
+		t.Fatalf("appendCursor = %d, want 1024", wb.appendCursor)
+	}
+
+	// Continue appending
+	_, _ = wb.Write(1024, make([]byte, 2048))
+	if !wb.IsSequential() {
+		t.Fatal("should still be sequential")
+	}
+	if wb.appendCursor != 3072 {
+		t.Fatalf("appendCursor = %d, want 3072", wb.appendCursor)
+	}
+
+	// Gap write (forward) — still sequential
+	_, _ = wb.Write(4096, make([]byte, 100))
+	if !wb.IsSequential() {
+		t.Fatal("gap write forward should still be sequential")
+	}
+	if wb.appendCursor != 4196 {
+		t.Fatalf("appendCursor = %d, want 4196", wb.appendCursor)
+	}
+}
+
+func TestWriteBuffer_BackwriteBreaksSequential(t *testing.T) {
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	// Write forward
+	_, _ = wb.Write(0, make([]byte, 4096))
+	if !wb.IsSequential() {
+		t.Fatal("should be sequential")
+	}
+
+	// Back-write
+	_, _ = wb.Write(100, []byte("patch"))
+	if wb.IsSequential() {
+		t.Fatal("back-write should break sequential mode")
+	}
+}
+
+func TestWriteBuffer_OnPartFull_SequentialAppend(t *testing.T) {
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	var calledParts []int
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		calledParts = append(calledParts, partIdx)
+		if int64(len(data)) != DefaultPartSize {
+			t.Fatalf("OnPartFull got %d bytes, want %d", len(data), DefaultPartSize)
+		}
+	}
+
+	// Write exactly 3 full parts
+	for i := 0; i < 3; i++ {
+		_, err := wb.Write(int64(i)*DefaultPartSize, make([]byte, DefaultPartSize))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Write a little into part 4 to trigger part 3 callback
+	_, _ = wb.Write(3*DefaultPartSize, []byte("x"))
+
+	// Parts 0, 1, 2 should have been reported as full
+	// (part 3 is not full yet — only has 1 byte)
+	if len(calledParts) != 3 {
+		t.Fatalf("OnPartFull called for %d parts, want 3; parts=%v", len(calledParts), calledParts)
+	}
+	for i, p := range calledParts {
+		if p != i {
+			t.Fatalf("calledParts[%d] = %d, want %d", i, p, i)
+		}
+	}
+}
+
+func TestWriteBuffer_OnPartFull_NotCalledOnBackwrite(t *testing.T) {
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	callCount := 0
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		callCount++
+	}
+
+	// Write 2 full parts + some of part 3
+	_, _ = wb.Write(0, make([]byte, 2*int(DefaultPartSize)+100))
+
+	countBefore := callCount
+
+	// Back-write breaks sequential
+	_, _ = wb.Write(0, []byte("header-patch"))
+
+	// Continue writing forward — should NOT trigger OnPartFull since sequential is false
+	_, _ = wb.Write(wb.appendCursor, make([]byte, DefaultPartSize))
+
+	if callCount != countBefore {
+		t.Fatalf("OnPartFull should not be called after sequential is broken; calls before=%d, after=%d",
+			countBefore, callCount)
+	}
+}
+
+func TestWriteBuffer_EvictPart(t *testing.T) {
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	// Write 2 full parts
+	_, _ = wb.Write(0, make([]byte, 2*int(DefaultPartSize)))
+
+	memBefore := wb.curMemory
+
+	// Evict part 0
+	wb.EvictPart(0)
+
+	if _, ok := wb.parts[0]; ok {
+		t.Fatal("part 0 should be deleted after eviction")
+	}
+	if !wb.uploadedParts[0] {
+		t.Fatal("part 0 should be marked as uploaded")
+	}
+	if wb.curMemory >= memBefore {
+		t.Fatalf("memory should decrease after eviction: before=%d, after=%d", memBefore, wb.curMemory)
+	}
+
+	// Back-write to evicted part should recreate it (zero-filled)
+	wb.sequential = false // simulate back-write breaking sequential
+	_, err := wb.Write(100, []byte("back"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	part, ok := wb.parts[0]
+	if !ok {
+		t.Fatal("part 0 should be recreated after back-write")
+	}
+	if int64(len(part)) != DefaultPartSize {
+		t.Fatalf("recreated part should be %d bytes, got %d", DefaultPartSize, len(part))
+	}
+	// Written data should be at the correct offset
+	if string(part[100:104]) != "back" {
+		t.Fatalf("back-write data: got %q, want %q", part[100:104], "back")
+	}
+	// Non-written area should be zero (original data is lost)
+	if part[0] != 0 {
+		t.Fatalf("non-written byte should be 0, got %d", part[0])
+	}
+	// Part should be dirty (needs re-upload)
+	if !wb.dirtyParts[0] {
+		t.Fatal("back-written evicted part should be dirty")
+	}
+}
+
+func TestWriteBuffer_ResetSequentialState(t *testing.T) {
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	// Write 2 full parts, break sequential with back-write
+	_, _ = wb.Write(0, make([]byte, 2*int(DefaultPartSize)))
+	_, _ = wb.Write(0, []byte("patch"))
+	if wb.IsSequential() {
+		t.Fatal("should not be sequential after back-write")
+	}
+	if wb.appendCursor != 2*DefaultPartSize {
+		t.Fatalf("appendCursor = %d, want %d", wb.appendCursor, 2*DefaultPartSize)
+	}
+
+	// Truncate to 0 and reset
+	_ = wb.Truncate(0)
+	wb.ResetSequentialState(0)
+
+	if !wb.IsSequential() {
+		t.Fatal("should be sequential after ResetSequentialState")
+	}
+	if wb.appendCursor != 0 {
+		t.Fatalf("appendCursor = %d, want 0", wb.appendCursor)
+	}
+
+	// New writes after reset should be correctly tracked as sequential
+	callCount := 0
+	wb.OnPartFull = func(partIdx int, data []byte) { callCount++ }
+	_, _ = wb.Write(0, make([]byte, DefaultPartSize+1))
+	if !wb.IsSequential() {
+		t.Fatal("should still be sequential after forward write post-reset")
+	}
+	if callCount != 1 {
+		t.Fatalf("OnPartFull called %d times, want 1", callCount)
+	}
+}
+
+func TestWriteBuffer_ExactPartSizeBoundary_NoDoubleUpload(t *testing.T) {
+	// When file size is exactly N*partSize, the last part was already
+	// fully streamed. Verify OnPartFull fires for all N parts.
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	var calledParts []int
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		calledParts = append(calledParts, partIdx)
+	}
+
+	// Write exactly 3 full parts (24MB)
+	totalSize := 3 * int(DefaultPartSize)
+	_, _ = wb.Write(0, make([]byte, totalSize))
+
+	// All 3 parts should have been reported as full
+	if len(calledParts) != 3 {
+		t.Fatalf("OnPartFull called for %d parts, want 3; parts=%v", len(calledParts), calledParts)
+	}
+
+	// Verify totalSize is exact multiple
+	if wb.Size()%wb.PartSize() != 0 {
+		t.Fatalf("size %d is not exact multiple of partSize %d", wb.Size(), wb.PartSize())
+	}
+}
+
+func TestStreamUploader_HasStreamedParts(t *testing.T) {
+	su := NewStreamUploader(nil, "/test")
+	if su.HasStreamedParts() {
+		t.Fatal("should have no streamed parts initially")
 	}
 }
 
