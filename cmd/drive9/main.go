@@ -17,7 +17,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
 
 	"github.com/mem9-ai/dat9/cmd/drive9/cli"
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -28,7 +27,7 @@ var version = "dev"
 var cliLogger *zap.Logger
 
 func main() {
-	if cliLogEnabled() {
+	if logger.CLIEnabled() {
 		if l, err := logger.NewCLILogger(); err == nil {
 			cliLogger = l
 			logger.Set(l)
@@ -98,18 +97,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "drive9: unknown command %q\n", cmd)
 		usage()
 	}
-}
-
-func cliLogEnabled() bool {
-	raw := os.Getenv("DRIVE9_CLI_LOG_ENABLED")
-	if raw == "" {
-		return false
-	}
-	v, err := strconv.ParseBool(raw)
-	if err != nil {
-		return false
-	}
-	return v
 }
 
 func runFS(args []string) {

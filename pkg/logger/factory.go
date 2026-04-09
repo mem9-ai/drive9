@@ -15,6 +15,10 @@ func NewServerLogger() (*zap.Logger, error) {
 	return zap.NewProduction()
 }
 
+func CLIEnabled() bool {
+	return envBool("DRIVE9_CLI_LOG_ENABLED", false)
+}
+
 func NewCLILogger() (*zap.Logger, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -55,6 +59,18 @@ func envInt(key string, fallback int) int {
 	}
 	v, err := strconv.Atoi(raw)
 	if err != nil || v <= 0 {
+		return fallback
+	}
+	return v
+}
+
+func envBool(key string, fallback bool) bool {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
 		return fallback
 	}
 	return v

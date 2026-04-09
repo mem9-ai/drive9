@@ -95,7 +95,7 @@ const (
 )
 
 // DownloadSummary exposes the coarse-grained large-file download metrics that
-// the benchmark harness consumes from CLI stderr.
+// the CLI emits as a structured log event when CLI logging is enabled.
 type DownloadSummary struct {
 	Type           string    `json:"type"`
 	Mode           string    `json:"mode"`
@@ -153,6 +153,9 @@ func newUploadBufferPool(bufferSize int64, count int) *uploadBufferPool {
 		count = 1
 	}
 	ch := make(chan []byte, count)
+	// Preallocate exactly one buffer per in-flight worker so uploads can reuse
+	// memory across parts instead of allocating a fresh part-sized slice on each
+	// iteration.
 	for i := 0; i < count; i++ {
 		ch <- make([]byte, bufferSize)
 	}
@@ -1071,6 +1074,9 @@ func (c *Client) DownloadToFileWithSummary(ctx context.Context, remotePath, loca
 }
 
 func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, localPath string, out *os.File, size int64) (*DownloadSummary, error) {
+	// Resolve the presigned object URL once, then reuse it for all range GETs in
+	// this download. This avoids paying one redirect / presign round-trip per
+	// chunk while keeping the existing server contract unchanged.
 	target, err := c.resolveReadTarget(ctx, remotePath)
 	if err != nil {
 		return nil, err
@@ -1110,6 +1116,8 @@ func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, loca
 					return
 				}
 
+				// Each worker reads its range fully before WriteAt so file offsets stay
+				// independent and we never coordinate shared seek state between goroutines.
 				data, readErr := io.ReadAll(rc)
 				closeErr := rc.Close()
 				if readErr != nil {

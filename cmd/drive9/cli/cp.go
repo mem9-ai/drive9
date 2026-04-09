@@ -3,13 +3,13 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"go.uber.org/zap"
 )
 
 // Cp copies files between local and remote.
@@ -112,7 +112,7 @@ func downloadFile(ctx context.Context, c *client.Client, remotePath, localPath s
 	if err != nil {
 		return err
 	}
-	emitBenchJSON(summary)
+	emitDownloadSummary(summary)
 	return nil
 }
 
@@ -134,21 +134,26 @@ func printProgress(partNumber, totalParts int, bytesUploaded int64) {
 	}
 }
 
-func benchJSONEnabled() bool {
-	raw := os.Getenv("DRIVE9_BENCH_JSON_ENABLED")
-	if raw == "" {
-		return false
-	}
-	enabled, err := strconv.ParseBool(raw)
-	if err != nil {
-		return false
-	}
-	return enabled
-}
-
-func emitBenchJSON(payload any) {
-	if payload == nil || !benchJSONEnabled() {
+// emitDownloadSummary keeps benchmark-only metadata in the same structured CLI
+// log stream as the rest of the command lifecycle, instead of inventing a
+// second stderr-only output contract.
+func emitDownloadSummary(summary *client.DownloadSummary) {
+	if summary == nil || !logger.CLIEnabled() {
 		return
 	}
-	_ = json.NewEncoder(os.Stderr).Encode(payload)
+	// The benchmark harness reads this stable event from the CLI log file.
+	logger.Info(
+		context.Background(),
+		"download_summary",
+		zap.String("type", summary.Type),
+		zap.String("mode", summary.Mode),
+		zap.Int("concurrency", summary.Concurrency),
+		zap.Int64("chunk_size_bytes", summary.ChunkSizeBytes),
+		zap.Int("range_count", summary.RangeCount),
+		zap.Time("started_at", summary.StartedAt),
+		zap.Time("finished_at", summary.FinishedAt),
+		zap.Float64("elapsed_seconds", summary.ElapsedSeconds),
+		zap.String("remote_path", summary.RemotePath),
+		zap.String("local_path", summary.LocalPath),
+	)
 }
