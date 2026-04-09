@@ -17,7 +17,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
 
 	"github.com/mem9-ai/dat9/cmd/drive9/cli"
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -25,14 +24,17 @@ import (
 )
 
 var version = "dev"
+var gitHash = "unknown"
 var cliLogger *zap.Logger
 
 func main() {
-	if cliLogEnabled() {
+	if logger.CLIEnabled() {
 		if l, err := logger.NewCLILogger(); err == nil {
 			cliLogger = l
 			logger.Set(l)
 			defer func() { _ = cliLogger.Sync() }()
+		} else {
+			fmt.Fprintf(os.Stderr, "drive9: failed to initialize CLI logger: %v\n", err)
 		}
 	}
 
@@ -48,7 +50,7 @@ func main() {
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "version"))
 		}
-		fmt.Printf("drive9 %s\n", version)
+		fmt.Print(versionString())
 	case "-h", "-help", "help":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "help"))
@@ -100,16 +102,8 @@ func main() {
 	}
 }
 
-func cliLogEnabled() bool {
-	raw := os.Getenv("DRIVE9_CLI_LOG_ENABLED")
-	if raw == "" {
-		return false
-	}
-	v, err := strconv.ParseBool(raw)
-	if err != nil {
-		return false
-	}
-	return v
+func versionString() string {
+	return fmt.Sprintf("drive9 %s\nGit Commit Hash: %s\n", version, gitHash)
 }
 
 func runFS(args []string) {

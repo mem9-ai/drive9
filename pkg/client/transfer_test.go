@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -66,6 +67,69 @@ func (r *shortUploadReader) ReadAt(p []byte, off int64) (int, error) {
 		return n, io.EOF
 	}
 	return n, nil
+}
+
+func TestUploadBufferPoolRestoresFullLengthOnPut(t *testing.T) {
+	pool := newUploadBufferPool(8, 1)
+
+	buf, err := pool.get(context.Background())
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(buf) != 8 {
+		t.Fatalf("initial len = %d, want 8", len(buf))
+	}
+
+	pool.put(buf[:3])
+
+	buf, err = pool.get(context.Background())
+	if err != nil {
+		t.Fatalf("second get: %v", err)
+	}
+	if len(buf) != 8 {
+		t.Fatalf("restored len = %d, want 8", len(buf))
+	}
+}
+
+func TestUploadBufferPoolPutDropsForeignShortBuffer(t *testing.T) {
+	pool := newUploadBufferPool(8, 1)
+
+	buf, err := pool.get(context.Background())
+	if err != nil {
+		t.Fatalf("initial get: %v", err)
+	}
+
+	// A foreign buffer with smaller capacity should be ignored rather than
+	// panicking when put() tries to restore the pool's full buffer length.
+	pool.put(make([]byte, 4))
+	pool.put(buf[:3])
+
+	buf, err = pool.get(context.Background())
+	if err != nil {
+		t.Fatalf("second get: %v", err)
+	}
+	if len(buf) != 8 {
+		t.Fatalf("restored len = %d, want 8", len(buf))
+	}
+}
+
+func TestUploadBufferPoolGetHonorsContextCancel(t *testing.T) {
+	pool := newUploadBufferPool(4, 1)
+	buf, err := pool.get(context.Background())
+	if err != nil {
+		t.Fatalf("initial get: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := pool.get(ctx); err == nil {
+		t.Fatal("expected canceled get to fail")
+	} else if err != context.Canceled {
+		t.Fatalf("canceled get error = %v, want %v", err, context.Canceled)
+	}
+
+	pool.put(buf)
 }
 
 // TestWriteStreamSmallFile verifies that WriteStream sends a small file via single direct PUT.
@@ -747,6 +811,201 @@ func TestReadStreamRangeLargeFileTreats416AsEOF(t *testing.T) {
 	}
 	if len(data) != 0 {
 		t.Fatalf("expected EOF empty body, got %q", data)
+	}
+}
+
+func TestDownloadToFileWithSummaryReusesPresignedURL(t *testing.T) {
+	data := bytes.Repeat([]byte("ab"), downloadChunkSize/2)
+	data = append(data, []byte("tail")...)
+
+	var readRequests atomic.Int32
+	var objectRequests atomic.Int32
+	var rangedRequests atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/large.bin":
+			readRequests.Add(1)
+			w.Header().Set("Location", fmt.Sprintf("http://%s/s3/presigned?token=fixed", r.Host))
+			w.WriteHeader(http.StatusFound)
+		case "/s3/presigned":
+			objectRequests.Add(1)
+			if got := r.URL.RawQuery; got != "token=fixed" {
+				http.Error(w, "wrong presigned url query: "+got, http.StatusBadRequest)
+				return
+			}
+			rangeHeader := r.Header.Get("Range")
+			if !strings.HasPrefix(rangeHeader, "bytes=") {
+				http.Error(w, "missing range", http.StatusBadRequest)
+				return
+			}
+			rangedRequests.Add(1)
+			var start, end int
+			if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil {
+				http.Error(w, "bad range: "+rangeHeader, http.StatusBadRequest)
+				return
+			}
+			if start < 0 || end < start || end >= len(data) {
+				http.Error(w, "range outside test data", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[start : end+1])
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	localPath := filepath.Join(t.TempDir(), "large.bin")
+	c := New(srv.URL, "")
+
+	summary, err := c.DownloadToFileWithSummary(context.Background(), "/large.bin", localPath, int64(len(data)))
+	if err != nil {
+		t.Fatalf("DownloadToFileWithSummary: %v", err)
+	}
+	if summary == nil {
+		t.Fatal("expected download summary for large-file path")
+	}
+	if got := readRequests.Load(); got != 1 {
+		t.Fatalf("expected one /v1/fs request, got %d", got)
+	}
+	if got := objectRequests.Load(); got != 2 {
+		t.Fatalf("expected two object requests, got %d", got)
+	}
+	if got := rangedRequests.Load(); got != 2 {
+		t.Fatalf("expected two range requests, got %d", got)
+	}
+	if summary.Mode != "parallel_range_reuse_presigned_url" {
+		t.Fatalf("summary mode = %q, want %q", summary.Mode, "parallel_range_reuse_presigned_url")
+	}
+	if summary.RangeCount != 2 {
+		t.Fatalf("summary range_count = %d, want 2", summary.RangeCount)
+	}
+	if summary.Concurrency != 2 {
+		t.Fatalf("summary concurrency = %d, want 2", summary.Concurrency)
+	}
+
+	downloaded, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(downloaded, data) {
+		t.Fatal("downloaded file content mismatch")
+	}
+}
+
+func TestDownloadToFileWithSummaryFailsWhenRangeNotHonored(t *testing.T) {
+	data := bytes.Repeat([]byte("z"), downloadChunkSize+1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/large.bin":
+			w.Header().Set("Location", fmt.Sprintf("http://%s/s3/presigned", r.Host))
+			w.WriteHeader(http.StatusFound)
+		case "/s3/presigned":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	localPath := filepath.Join(t.TempDir(), "large.bin")
+	c := New(srv.URL, "")
+
+	_, err := c.DownloadToFileWithSummary(context.Background(), "/large.bin", localPath, int64(len(data)))
+	if err == nil {
+		t.Fatal("expected strict range failure")
+	}
+	if !strings.Contains(err.Error(), "range request was not honored") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDownloadToFileWithSummaryFallsBackWhenReadPathDoesNotRedirect(t *testing.T) {
+	data := bytes.Repeat([]byte("q"), downloadParallelThreshold+17)
+
+	var readRequests atomic.Int32
+	var objectRequests atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/large.bin":
+			readRequests.Add(1)
+			_, _ = w.Write(data)
+		case "/s3/presigned":
+			objectRequests.Add(1)
+			http.Error(w, "unexpected object request", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	localPath := filepath.Join(t.TempDir(), "large.bin")
+	c := New(srv.URL, "")
+
+	summary, err := c.DownloadToFileWithSummary(context.Background(), "/large.bin", localPath, int64(len(data)))
+	if err != nil {
+		t.Fatalf("DownloadToFileWithSummary: %v", err)
+	}
+	if summary != nil {
+		t.Fatalf("expected nil summary when falling back to sequential download, got %+v", summary)
+	}
+	if got := readRequests.Load(); got != 2 {
+		t.Fatalf("expected one resolve attempt plus one sequential read, got %d requests", got)
+	}
+	if got := objectRequests.Load(); got != 0 {
+		t.Fatalf("expected no object storage requests, got %d", got)
+	}
+
+	downloaded, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(downloaded, data) {
+		t.Fatal("downloaded file content mismatch")
+	}
+}
+
+func TestDownloadToFileWithSummarySmallFileUsesSequentialPath(t *testing.T) {
+	var readRequests atomic.Int32
+	data := []byte("small content")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/small.txt":
+			readRequests.Add(1)
+			_, _ = w.Write(data)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	localPath := filepath.Join(t.TempDir(), "small.txt")
+	c := New(srv.URL, "")
+
+	summary, err := c.DownloadToFileWithSummary(context.Background(), "/small.txt", localPath, int64(len(data)))
+	if err != nil {
+		t.Fatalf("DownloadToFileWithSummary: %v", err)
+	}
+	if summary != nil {
+		t.Fatalf("expected nil summary for small-file path, got %+v", summary)
+	}
+	if got := readRequests.Load(); got != 1 {
+		t.Fatalf("expected one sequential read request, got %d", got)
+	}
+
+	downloaded, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(downloaded) != string(data) {
+		t.Fatalf("got %q, want %q", downloaded, data)
 	}
 }
 
