@@ -14,11 +14,13 @@ import pathlib
 import re
 import subprocess
 import sys
+import os
 from collections import defaultdict
 
 
 def main() -> int:
     repo_root = pathlib.Path(__file__).resolve().parent.parent
+    env = os.environ.copy()
     failpoint_ctl = (
         pathlib.Path(
             subprocess.check_output(["go", "env", "GOPATH"], text=True).strip()
@@ -41,17 +43,20 @@ def main() -> int:
 
     exit_code = 0
     try:
-        run([str(failpoint_ctl), "enable", "."], cwd=repo_root)
+        if not env.get("DRIVE9_TEST_MYSQL_DSN") and command_exists("podman"):
+            env = load_podman_test_env(repo_root, env)
+        run([str(failpoint_ctl), "enable", "."], cwd=repo_root, env=env)
         for pkg, tests in sorted(tests_by_pkg.items()):
             pattern = "^(%s)$" % "|".join(sorted(tests))
             run(
                 ["go", "test", "-v", "-tags", "failpoint", pkg, "-run", pattern],
                 cwd=repo_root,
+                env=env,
             )
     except subprocess.CalledProcessError as exc:
         exit_code = exc.returncode or 1
     finally:
-        subprocess.run([str(failpoint_ctl), "disable", "."], cwd=repo_root, check=False)
+        subprocess.run([str(failpoint_ctl), "disable", "."], cwd=repo_root, check=False, env=env)
 
     return exit_code
 
@@ -71,8 +76,34 @@ def collect_failpoint_tests(repo_root: pathlib.Path) -> dict[str, set[str]]:
     return tests_by_pkg
 
 
-def run(cmd: list[str], cwd: pathlib.Path) -> None:
-    subprocess.run(cmd, cwd=cwd, check=True)
+def load_podman_test_env(repo_root: pathlib.Path, env: dict[str, str]) -> dict[str, str]:
+    command = "source ./scripts/test-podman.sh && env"
+    proc = subprocess.run(
+        ["bash", "-lc", command],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    merged = env.copy()
+    for line in proc.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        merged[key] = value
+    return merged
+
+
+def command_exists(name: str) -> bool:
+    return subprocess.run(
+        ["bash", "-lc", f"command -v {name} >/dev/null 2>&1"],
+        check=False,
+    ).returncode == 0
+
+
+def run(cmd: list[str], cwd: pathlib.Path, env: dict[str, str]) -> None:
+    subprocess.run(cmd, cwd=cwd, check=True, env=env)
 
 
 if __name__ == "__main__":
