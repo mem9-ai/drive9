@@ -130,9 +130,11 @@ func (fs *Dat9FS) preloadWritableHandle(fh *FileHandle) gofuse.Status {
 	}
 
 	partSize := s3client.CalcAdaptivePartSize(stat.Size)
-	bufMax := stat.Size + 16<<20
-	if bufMax < defaultWriteBufferMaxSize {
-		bufMax = defaultWriteBufferMaxSize
+	// Allow growth up to 2x original size or at least 1GB, whichever is larger.
+	// Lazy loading means memory usage is O(touched_parts), not O(bufMax).
+	bufMax := stat.Size * 2
+	if bufMax < maxPreloadSize {
+		bufMax = maxPreloadSize
 	}
 	fh.Dirty = NewWriteBuffer(fh.Path, bufMax, partSize)
 
@@ -368,6 +370,10 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					fh.Unlock()
 					return gofuse.Status(syscall.EFBIG)
 				}
+				// Reset sequential write tracking after truncate so that
+				// subsequent writes starting at the new size are not
+				// misdetected as back-writes (appendCursor may be stale).
+				fh.Dirty.ResetSequentialState(newSize)
 				fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
 				fh.Unlock()
 			}
@@ -657,8 +663,10 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		return gofuse.EIO
 	}
 
-	wb := NewWriteBuffer(childP, maxPreloadSize, 0)
+	wb := NewWriteBuffer(childP, streamingWriteMaxSize, 0)
 	wb.touched = true
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
 	fh := &FileHandle{
 		Ino:   ino,
 		Path:  childP,
@@ -666,10 +674,25 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		Dirty: wb,
 	}
 
-	// Attach a streaming uploader — actual upload happens at flush time,
-	// not during Write(), because FUSE writers can revisit any offset
-	// before close (e.g. patching headers, updating checksums).
+	// Attach a streaming uploader for sequential write streaming.
+	// For pure sequential writes (cp, dd, ffmpeg), parts are uploaded
+	// as they fill during Write() and memory is released immediately.
+	// For non-sequential writes, falls back to flush-time UploadAll.
 	fh.Streamer = NewStreamUploader(fs.client, childP)
+
+	// Wire up the OnPartFull callback: when a sequential write fills
+	// a part, submit it for background upload and evict after completion.
+	streamer := fh.Streamer
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		partNum := partIdx + 1
+		if err := streamer.SubmitPart(context.Background(), partNum, data, func(pn int) {
+			fh.Lock()
+			fh.Dirty.EvictPart(pn - 1) // 0-based
+			fh.Unlock()
+		}); err != nil {
+			log.Printf("streaming submit part %d failed for %s: %v", partNum, childP, err)
+		}
+	}
 
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
 	out.Fh = fs.fileHandles.Allocate(fh)
@@ -712,12 +735,27 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		} else {
 			// O_TRUNC: mark buffer as dirty so that close() without any
 			// writes still persists the truncation (POSIX semantics).
+			fh.Dirty.maxSize = streamingWriteMaxSize
+			fh.Dirty.sequential = true
+			fh.Dirty.uploadedParts = make(map[int]bool)
 			_ = fh.Dirty.Truncate(0)
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 			fs.inodes.UpdateSize(fh.Ino, 0)
 
-			// Attach streaming uploader — actual upload at flush time.
+			// Attach streaming uploader with OnPartFull wiring.
 			fh.Streamer = NewStreamUploader(fs.client, p)
+			streamer := fh.Streamer
+			filePath := p
+			fh.Dirty.OnPartFull = func(partIdx int, data []byte) {
+				partNum := partIdx + 1
+				if err := streamer.SubmitPart(context.Background(), partNum, data, func(pn int) {
+					fh.Lock()
+					fh.Dirty.EvictPart(pn - 1)
+					fh.Unlock()
+				}); err != nil {
+					log.Printf("streaming submit part %d failed for %s: %v", partNum, filePath, err)
+				}
+			}
 		}
 	}
 
@@ -748,6 +786,10 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// If there's a dirty buffer (even empty — e.g. after Create or truncate-to-zero),
 	// read from it so we don't go back to the server and see stale/non-existent data.
 	// Uses ReadAt to avoid materializing the entire sparse buffer.
+	//
+	// However, if the handle has evicted (streaming-uploaded) parts, we cannot
+	// serve reads from those ranges — the data is on S3 but not in memory.
+	// For such ranges we fall through to the server read path.
 	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
 		offset := int64(input.Offset)
 		size := fh.Dirty.Size()
@@ -759,15 +801,35 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		if end > size {
 			end = size
 		}
-		result := make([]byte, end-offset)
-		fh.Dirty.ReadAt(offset, result)
-		fh.Unlock()
-		return gofuse.ReadResultData(result), gofuse.OK
-	}
 
-	// Writable handle with lazy-loaded buffer (no dirty parts yet) —
-	// read directly from the server for unloaded parts.
-	if fh.Dirty != nil && fh.Dirty.Size() > 0 && !fh.Dirty.HasDirtyParts() {
+		// Check if the read range touches any evicted part.
+		// If so, we cannot serve this read from memory — fall through to server.
+		touchesEvicted := false
+		if evicted := fh.Dirty.StreamedPartIndices(); len(evicted) > 0 {
+			ps := fh.Dirty.PartSize()
+			firstPart := int(offset / ps)
+			lastPart := int((end - 1) / ps)
+			for p := firstPart; p <= lastPart; p++ {
+				if evicted[p] && !fh.Dirty.IsPartLoaded(p) {
+					touchesEvicted = true
+					break
+				}
+			}
+		}
+
+		if !touchesEvicted {
+			result := make([]byte, end-offset)
+			fh.Dirty.ReadAt(offset, result)
+			fh.Unlock()
+			return gofuse.ReadResultData(result), gofuse.OK
+		}
+		// touchesEvicted: data is on S3 (already uploaded). Fall through to
+		// server read. NOTE: for new files mid-stream, Complete has not been
+		// called yet, so server reads may fail. This is best-effort.
+		fh.Unlock()
+	} else if fh.Dirty != nil && fh.Dirty.Size() > 0 && !fh.Dirty.HasDirtyParts() {
+		// Writable handle with lazy-loaded buffer (no dirty parts yet) —
+		// read directly from the server for unloaded parts.
 		offset := int64(input.Offset)
 		size := fh.Dirty.Size()
 		if offset >= size {
@@ -938,10 +1000,51 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 
 	var err error
 
-	// Path 1: Large new file with streaming uploader — upload all parts
-	// in parallel at flush time. We deliberately do NOT upload during Write()
-	// because FUSE writers can revisit any offset before close (headers,
-	// checksums, footers), and the final file size is unknown until now.
+	// Path 1a: Streaming mode — some parts already uploaded during Write().
+	// This path is used for large sequential writes (cp, dd, ffmpeg).
+	// Only the final partial part and any dirty (back-written) parts need uploading.
+	if fh.Streamer != nil && fh.Streamer.HasStreamedParts() {
+		partSize := fh.Dirty.PartSize()
+		numParts := int((size + partSize - 1) / partSize)
+		lastPartNum := numParts // 1-based
+
+		// Determine data for the last part.
+		// If the file size is an exact multiple of partSize, the last part was
+		// already fully streamed and evicted — pass nil so FinishStreaming
+		// does not re-upload it with empty/zero data.
+		var lastCp []byte
+		if size%partSize != 0 {
+			// Last part is partial — it's still in the WriteBuffer
+			lastPartData := fh.Dirty.PartData(lastPartNum)
+			if lastPartData != nil {
+				lastCp = make([]byte, len(lastPartData))
+				copy(lastCp, lastPartData)
+			}
+		}
+
+		// Collect dirty parts that need re-upload (back-written after eviction)
+		dirtyParts := fh.Dirty.DirtyStreamedParts()
+
+		err = fh.Streamer.FinishStreaming(context.Background(), size,
+			lastPartNum, lastCp, dirtyParts)
+		if err != nil {
+			return httpToFuseStatus(err)
+		}
+
+		fh.Dirty.ClearDirty()
+		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+		fh.DirtySeq = 0
+		fs.readCache.Invalidate(fh.Path)
+		fs.dirCache.Invalidate(parentDir(fh.Path))
+		fs.inodes.UpdateSize(fh.Ino, size)
+		fs.notifyInode(fh.Ino)
+		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
+		fs.notifyInode(parentIno)
+		return gofuse.OK
+	}
+
+	// Path 1b: Large new file with streaming uploader but no streaming parts
+	// (non-sequential writes) — upload all parts in parallel at flush time.
 	if fh.Streamer != nil && size >= smallFileThreshold {
 		numParts := int((size + fh.Dirty.PartSize() - 1) / fh.Dirty.PartSize())
 		partSnapshots := make(map[int][]byte, numParts)

@@ -3,37 +3,43 @@ package fuse
 import (
 	"context"
 	"log"
+	"math"
 	"sync"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
-// StreamUploader manages parallel part uploads at flush time.
+// StreamUploader manages parallel part uploads both during Write() for
+// sequential streaming and at flush/close time for non-sequential files.
 //
-// Unlike the previous design which uploaded parts eagerly during Write(),
-// this uploader is only used at flush/close time. This is necessary because
-// FUSE writers can revisit any offset before close (e.g. patching headers,
-// updating checksums, writing footers), and the final file size is not known
-// until close. Eagerly uploading parts during Write() would persist stale
-// content for any rewritten parts.
+// Two modes of operation:
 //
-// At flush time, flushHandle calls UploadAll with the final dirty parts,
-// which initiates a v2 multipart upload and uploads all parts in parallel.
+// 1. Flush-time upload (UploadAll): Used for non-sequential writes or when
+//    streaming was not triggered. All parts are uploaded in parallel at close.
+//
+// 2. Streaming upload (SubmitPart + FinishStreaming): Used for large sequential
+//    writes. Parts are uploaded as they fill during Write(), and memory is
+//    released after each upload completes. At close, FinishStreaming uploads
+//    the final partial part and any dirty (back-written) parts, then completes.
 type StreamUploader struct {
 	client *client.Client
 	path   string
 
-	mu      sync.Mutex
-	writer  *client.StreamWriter
-	started bool
+	mu            sync.Mutex
+	writer        *client.StreamWriter
+	started       bool
+	streamedParts map[int]bool // 1-based part numbers uploaded during streaming
+	inflightWg    sync.WaitGroup
+	streamErr     error // first error from streaming upload
 }
 
 // NewStreamUploader creates a StreamUploader for the given path.
-// No network calls are made until UploadAll is called at flush time.
+// No network calls are made until UploadAll or SubmitPart is called.
 func NewStreamUploader(c *client.Client, path string) *StreamUploader {
 	return &StreamUploader{
-		client: c,
-		path:   path,
+		client:        c,
+		path:          path,
+		streamedParts: make(map[int]bool),
 	}
 }
 
@@ -42,6 +48,116 @@ func (su *StreamUploader) Started() bool {
 	su.mu.Lock()
 	defer su.mu.Unlock()
 	return su.started
+}
+
+// HasStreamedParts reports whether any parts were uploaded during streaming
+// (i.e., during Write() calls, not at flush time).
+func (su *StreamUploader) HasStreamedParts() bool {
+	su.mu.Lock()
+	defer su.mu.Unlock()
+	return len(su.streamedParts) > 0
+}
+
+// SubmitPart uploads a single part in the background (streaming mode).
+// Lazily initiates the multipart upload on first call.
+// partNum is 1-based. data is copied by the underlying StreamWriter.
+// onDone is called after a successful upload with the 1-based part number.
+func (su *StreamUploader) SubmitPart(ctx context.Context, partNum int, data []byte, onDone func(int)) error {
+	su.mu.Lock()
+
+	// Check for prior error
+	if su.streamErr != nil {
+		err := su.streamErr
+		su.mu.Unlock()
+		return err
+	}
+
+	// Lazy init — use a very large totalSize since we don't know final size yet.
+	// This only affects server plan metadata, not actual upload correctness.
+	if !su.started {
+		su.writer = su.client.NewStreamWriter(ctx, su.path, math.MaxInt64)
+		su.started = true
+	}
+	sw := su.writer
+
+	su.inflightWg.Add(1)
+	su.mu.Unlock()
+
+	// Make a copy of data for the background upload
+	buf := make([]byte, len(data))
+	copy(buf, data)
+
+	go func() {
+		defer su.inflightWg.Done()
+
+		err := sw.WritePart(ctx, partNum, buf)
+		if err != nil {
+			su.mu.Lock()
+			if su.streamErr == nil {
+				su.streamErr = err
+			}
+			su.mu.Unlock()
+			log.Printf("streaming upload part %d failed for %s: %v", partNum, su.path, err)
+			return
+		}
+
+		su.mu.Lock()
+		su.streamedParts[partNum] = true
+		su.mu.Unlock()
+
+		if onDone != nil {
+			onDone(partNum)
+		}
+	}()
+
+	return nil
+}
+
+// FinishStreaming completes a streaming upload:
+//  1. Wait for all inflight streaming parts
+//  2. Re-upload any dirty parts (parts that were back-written after eviction)
+//  3. Upload the final (partial) part via Complete
+//
+// lastPartNum is 1-based, lastPartData is the data for the final part.
+// dirtyParts is a map of 1-based partNum → data for back-written parts.
+func (su *StreamUploader) FinishStreaming(ctx context.Context, totalSize int64,
+	lastPartNum int, lastPartData []byte, dirtyParts map[int][]byte) error {
+
+	// Wait for all inflight streaming uploads
+	su.inflightWg.Wait()
+
+	su.mu.Lock()
+	if su.streamErr != nil {
+		err := su.streamErr
+		sw := su.writer
+		su.mu.Unlock()
+		if sw != nil {
+			_ = sw.Abort(ctx)
+		}
+		return err
+	}
+	sw := su.writer
+	if sw == nil {
+		su.mu.Unlock()
+		return nil
+	}
+	su.mu.Unlock()
+
+	// Re-upload dirty (back-written) parts
+	for pn, data := range dirtyParts {
+		if err := sw.WritePart(ctx, pn, data); err != nil {
+			_ = sw.Abort(ctx)
+			return err
+		}
+	}
+
+	// Complete with the last part
+	err := sw.Complete(ctx, lastPartNum, lastPartData)
+	if err != nil {
+		_ = sw.Abort(ctx)
+		return err
+	}
+	return nil
 }
 
 // UploadAll initiates a v2 multipart upload and uploads all provided parts
@@ -90,6 +206,9 @@ func (su *StreamUploader) UploadAll(ctx context.Context, totalSize int64, partDa
 
 // Abort cancels the upload and cleans up server-side state.
 func (su *StreamUploader) Abort() {
+	// Wait for inflight streaming parts before aborting
+	su.inflightWg.Wait()
+
 	su.mu.Lock()
 	sw := su.writer
 	su.mu.Unlock()

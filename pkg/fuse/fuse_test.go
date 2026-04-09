@@ -923,6 +923,245 @@ func TestStreamUploader_NotStartedBeforeUploadAll(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Sequential write detection tests
+// ---------------------------------------------------------------------------
+
+func TestWriteBuffer_SequentialDetection(t *testing.T) {
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	// Sequential writes should maintain sequential flag
+	_, _ = wb.Write(0, make([]byte, 1024))
+	if !wb.IsSequential() {
+		t.Fatal("should be sequential after forward write")
+	}
+	if wb.appendCursor != 1024 {
+		t.Fatalf("appendCursor = %d, want 1024", wb.appendCursor)
+	}
+
+	// Continue appending
+	_, _ = wb.Write(1024, make([]byte, 2048))
+	if !wb.IsSequential() {
+		t.Fatal("should still be sequential")
+	}
+	if wb.appendCursor != 3072 {
+		t.Fatalf("appendCursor = %d, want 3072", wb.appendCursor)
+	}
+
+	// Gap write (forward) — still sequential
+	_, _ = wb.Write(4096, make([]byte, 100))
+	if !wb.IsSequential() {
+		t.Fatal("gap write forward should still be sequential")
+	}
+	if wb.appendCursor != 4196 {
+		t.Fatalf("appendCursor = %d, want 4196", wb.appendCursor)
+	}
+}
+
+func TestWriteBuffer_BackwriteBreaksSequential(t *testing.T) {
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	// Write forward
+	_, _ = wb.Write(0, make([]byte, 4096))
+	if !wb.IsSequential() {
+		t.Fatal("should be sequential")
+	}
+
+	// Back-write
+	_, _ = wb.Write(100, []byte("patch"))
+	if wb.IsSequential() {
+		t.Fatal("back-write should break sequential mode")
+	}
+}
+
+func TestWriteBuffer_OnPartFull_SequentialAppend(t *testing.T) {
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	var calledParts []int
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		calledParts = append(calledParts, partIdx)
+		if int64(len(data)) != DefaultPartSize {
+			t.Fatalf("OnPartFull got %d bytes, want %d", len(data), DefaultPartSize)
+		}
+	}
+
+	// Write exactly 3 full parts
+	for i := 0; i < 3; i++ {
+		_, err := wb.Write(int64(i)*DefaultPartSize, make([]byte, DefaultPartSize))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Write a little into part 4 to trigger part 3 callback
+	_, _ = wb.Write(3*DefaultPartSize, []byte("x"))
+
+	// Parts 0, 1, 2 should have been reported as full
+	// (part 3 is not full yet — only has 1 byte)
+	if len(calledParts) != 3 {
+		t.Fatalf("OnPartFull called for %d parts, want 3; parts=%v", len(calledParts), calledParts)
+	}
+	for i, p := range calledParts {
+		if p != i {
+			t.Fatalf("calledParts[%d] = %d, want %d", i, p, i)
+		}
+	}
+}
+
+func TestWriteBuffer_OnPartFull_NotCalledOnBackwrite(t *testing.T) {
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	callCount := 0
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		callCount++
+	}
+
+	// Write 2 full parts + some of part 3
+	_, _ = wb.Write(0, make([]byte, 2*int(DefaultPartSize)+100))
+
+	countBefore := callCount
+
+	// Back-write breaks sequential
+	_, _ = wb.Write(0, []byte("header-patch"))
+
+	// Continue writing forward — should NOT trigger OnPartFull since sequential is false
+	_, _ = wb.Write(wb.appendCursor, make([]byte, DefaultPartSize))
+
+	if callCount != countBefore {
+		t.Fatalf("OnPartFull should not be called after sequential is broken; calls before=%d, after=%d",
+			countBefore, callCount)
+	}
+}
+
+func TestWriteBuffer_EvictPart(t *testing.T) {
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	// Write 2 full parts
+	_, _ = wb.Write(0, make([]byte, 2*int(DefaultPartSize)))
+
+	memBefore := wb.curMemory
+
+	// Evict part 0
+	wb.EvictPart(0)
+
+	if _, ok := wb.parts[0]; ok {
+		t.Fatal("part 0 should be deleted after eviction")
+	}
+	if !wb.uploadedParts[0] {
+		t.Fatal("part 0 should be marked as uploaded")
+	}
+	if wb.curMemory >= memBefore {
+		t.Fatalf("memory should decrease after eviction: before=%d, after=%d", memBefore, wb.curMemory)
+	}
+
+	// Back-write to evicted part should recreate it (zero-filled)
+	wb.sequential = false // simulate back-write breaking sequential
+	_, err := wb.Write(100, []byte("back"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	part, ok := wb.parts[0]
+	if !ok {
+		t.Fatal("part 0 should be recreated after back-write")
+	}
+	if int64(len(part)) != DefaultPartSize {
+		t.Fatalf("recreated part should be %d bytes, got %d", DefaultPartSize, len(part))
+	}
+	// Written data should be at the correct offset
+	if string(part[100:104]) != "back" {
+		t.Fatalf("back-write data: got %q, want %q", part[100:104], "back")
+	}
+	// Non-written area should be zero (original data is lost)
+	if part[0] != 0 {
+		t.Fatalf("non-written byte should be 0, got %d", part[0])
+	}
+	// Part should be dirty (needs re-upload)
+	if !wb.dirtyParts[0] {
+		t.Fatal("back-written evicted part should be dirty")
+	}
+}
+
+func TestWriteBuffer_ResetSequentialState(t *testing.T) {
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	// Write 2 full parts, break sequential with back-write
+	_, _ = wb.Write(0, make([]byte, 2*int(DefaultPartSize)))
+	_, _ = wb.Write(0, []byte("patch"))
+	if wb.IsSequential() {
+		t.Fatal("should not be sequential after back-write")
+	}
+	if wb.appendCursor != 2*DefaultPartSize {
+		t.Fatalf("appendCursor = %d, want %d", wb.appendCursor, 2*DefaultPartSize)
+	}
+
+	// Truncate to 0 and reset
+	_ = wb.Truncate(0)
+	wb.ResetSequentialState(0)
+
+	if !wb.IsSequential() {
+		t.Fatal("should be sequential after ResetSequentialState")
+	}
+	if wb.appendCursor != 0 {
+		t.Fatalf("appendCursor = %d, want 0", wb.appendCursor)
+	}
+
+	// New writes after reset should be correctly tracked as sequential
+	callCount := 0
+	wb.OnPartFull = func(partIdx int, data []byte) { callCount++ }
+	_, _ = wb.Write(0, make([]byte, DefaultPartSize+1))
+	if !wb.IsSequential() {
+		t.Fatal("should still be sequential after forward write post-reset")
+	}
+	if callCount != 1 {
+		t.Fatalf("OnPartFull called %d times, want 1", callCount)
+	}
+}
+
+func TestWriteBuffer_ExactPartSizeBoundary_NoDoubleUpload(t *testing.T) {
+	// When file size is exactly N*partSize, the last part was already
+	// fully streamed. Verify OnPartFull fires for all N parts.
+	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	var calledParts []int
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		calledParts = append(calledParts, partIdx)
+	}
+
+	// Write exactly 3 full parts (24MB)
+	totalSize := 3 * int(DefaultPartSize)
+	_, _ = wb.Write(0, make([]byte, totalSize))
+
+	// All 3 parts should have been reported as full
+	if len(calledParts) != 3 {
+		t.Fatalf("OnPartFull called for %d parts, want 3; parts=%v", len(calledParts), calledParts)
+	}
+
+	// Verify totalSize is exact multiple
+	if wb.Size()%wb.PartSize() != 0 {
+		t.Fatalf("size %d is not exact multiple of partSize %d", wb.Size(), wb.PartSize())
+	}
+}
+
+func TestStreamUploader_HasStreamedParts(t *testing.T) {
+	su := NewStreamUploader(nil, "/test")
+	if su.HasStreamedParts() {
+		t.Fatal("should have no streamed parts initially")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Error mapping test
 // ---------------------------------------------------------------------------
 

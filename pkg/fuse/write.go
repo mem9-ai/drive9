@@ -1,11 +1,15 @@
 package fuse
 
-import "syscall"
+import (
+	"log"
+	"syscall"
+)
 
 const (
-	defaultWriteBufferMaxSize = 64 << 20  // 64MB per file
-	DefaultPartSize           = 8 << 20   // 8MB - default for v1 uploads; v2 may use adaptive sizes
-	maxPreloadSize            = 256 << 20 // 256MB - hard limit for preloading existing files into memory
+	defaultWriteBufferMaxSize  = 64 << 20  // 64MB per file
+	streamingWriteMaxSize      = 10 << 30  // 10GB — for sequential streaming writes
+	DefaultPartSize            = 8 << 20   // 8MB - default for v1 uploads; v2 may use adaptive sizes
+	maxPreloadSize             = 1 << 30   // 1GB - hard limit for preloading existing files into memory
 )
 
 // LoadPartFunc is called to lazily load part data from the remote server.
@@ -41,6 +45,17 @@ type WriteBuffer struct {
 
 	// Memory tracking
 	curMemory int64 // current bytes held in parts map
+
+	// Sequential write detection
+	appendCursor int64 // end of highest contiguous write; updated only on sequential writes
+	sequential   bool  // false after any back-write
+
+	// Streaming upload state
+	uploadedParts map[int]bool // 0-based part indices uploaded by StreamUploader
+	// OnPartFull is called when a sequential write fills a part completely.
+	// partIdx is 0-based, data is the full part data (partSize bytes).
+	// The callback should copy data if it needs to outlive the call.
+	OnPartFull func(partIdx int, data []byte)
 }
 
 // NewWriteBuffer creates a new WriteBuffer for the given path.
@@ -124,6 +139,38 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 
 	wb.touched = true
 
+	// Sequential write detection and streaming upload trigger
+	prevCursor := wb.appendCursor
+	if offset == wb.appendCursor {
+		wb.appendCursor = end
+	} else if offset > wb.appendCursor {
+		// Gap write — still forward, cursor jumps to end
+		wb.appendCursor = end
+	} else {
+		// Back-write: offset < appendCursor
+		wb.sequential = false
+	}
+
+	// Check if we filled any parts (only in sequential mode with callback).
+	// Part p is full when appendCursor >= (p+1)*partSize.
+	if wb.sequential && wb.OnPartFull != nil && wb.appendCursor > prevCursor {
+		if prevCursor < 0 {
+			prevCursor = 0
+		}
+		// The first part that could have become newly full
+		firstCandidate := int(prevCursor / wb.partSize)
+		// The number of full parts based on current cursor
+		numFullParts := int(wb.appendCursor / wb.partSize)
+		for p := firstCandidate; p < numFullParts; p++ {
+			if wb.uploadedParts != nil && wb.uploadedParts[p] {
+				continue // already uploaded
+			}
+			if part, ok := wb.parts[p]; ok && int64(len(part)) == wb.partSize {
+				wb.OnPartFull(p, part)
+			}
+		}
+	}
+
 	return uint32(len(data)), nil
 }
 
@@ -132,6 +179,18 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 // nil entry that will be grown as needed by Write.
 func (wb *WriteBuffer) ensurePart(partIdx int) error {
 	if _, ok := wb.parts[partIdx]; ok {
+		return nil
+	}
+
+	// Check if this part was evicted after streaming upload.
+	// Recreate as zero-filled — the original data is gone (already on S3).
+	// Only the newly written bytes will be meaningful; other bytes are zeros.
+	if wb.uploadedParts != nil && wb.uploadedParts[partIdx] {
+		log.Printf("WARNING: back-write to evicted part %d of %s — "+
+			"non-written bytes will be zero (original data already uploaded to S3)", partIdx, wb.path)
+		data := make([]byte, wb.partSize)
+		wb.parts[partIdx] = data
+		wb.curMemory += wb.partSize
 		return nil
 	}
 
@@ -405,4 +464,65 @@ func (wb *WriteBuffer) Reset() {
 func (wb *WriteBuffer) ClearDirty() {
 	wb.dirtyParts = make(map[int]bool)
 	wb.touched = false
+}
+
+// IsSequential reports whether the buffer is still in sequential append mode.
+func (wb *WriteBuffer) IsSequential() bool {
+	return wb.sequential
+}
+
+// ResetSequentialState resets the append cursor to newSize so that subsequent
+// writes starting at newSize are correctly detected as sequential.
+// This must be called after Truncate to avoid the stale appendCursor causing
+// false back-write detection.
+func (wb *WriteBuffer) ResetSequentialState(newSize int64) {
+	wb.appendCursor = newSize
+	// Re-enable sequential if it was broken — truncate is a new start.
+	// Don't clear uploadedParts: already-uploaded parts are still on S3.
+	wb.sequential = true
+}
+
+// EvictPart releases the memory for a 0-based part index after it has been
+// uploaded via streaming. The part is recorded in uploadedParts so that
+// subsequent reads/writes know it was already handled.
+// If a back-write later touches this part, ensurePart will recreate it
+// as a zero-filled slice and log a warning.
+func (wb *WriteBuffer) EvictPart(partIdx int) {
+	if wb.uploadedParts == nil {
+		wb.uploadedParts = make(map[int]bool)
+	}
+	wb.uploadedParts[partIdx] = true
+
+	if part, ok := wb.parts[partIdx]; ok {
+		wb.curMemory -= int64(len(part))
+		delete(wb.parts, partIdx)
+	}
+}
+
+// StreamedPartIndices returns the set of 0-based part indices that were
+// uploaded during streaming (and whose memory was evicted).
+func (wb *WriteBuffer) StreamedPartIndices() map[int]bool {
+	return wb.uploadedParts
+}
+
+// DirtyStreamedParts returns parts that were evicted (streamed) but later
+// back-written. These need to be re-uploaded at flush time.
+// Returns a map of 1-based partNum → part data.
+func (wb *WriteBuffer) DirtyStreamedParts() map[int][]byte {
+	result := make(map[int][]byte)
+	for idx := range wb.uploadedParts {
+		if !wb.dirtyParts[idx] {
+			continue // not back-written
+		}
+		// Part was back-written after eviction — get its data via PartData
+		// which handles zero-extension and size clamping correctly.
+		data := wb.PartData(idx + 1) // 1-based
+		if data == nil {
+			continue // part is beyond current totalSize (file was truncated)
+		}
+		cp := make([]byte, len(data))
+		copy(cp, data)
+		result[idx+1] = cp
+	}
+	return result
 }
