@@ -131,6 +131,25 @@ type semanticTaskOutcome struct {
 	message string
 }
 
+type semanticTaskLeaseExecution struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	stopCh chan struct{}
+	doneCh chan struct{}
+
+	mu             sync.Mutex
+	lost           bool
+	renewAttempted bool
+	lastLeaseUntil *time.Time
+}
+
+type semanticTaskLeaseOutcome struct {
+	lost           bool
+	renewAttempted bool
+	lastLeaseUntil *time.Time
+}
+
 func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store, pool *tenant.Pool, embedder embedding.Client, opts SemanticWorkerOptions) *semanticWorkerManager {
 	hasMultiTenant := metaStore != nil && pool != nil
 	if fallback == nil && !hasMultiTenant {
@@ -280,7 +299,13 @@ func (m *semanticWorkerManager) processTask(ctx context.Context, target *semanti
 	defer func() {
 		metrics.RecordOperation("semantic_worker", string(task.TaskType), result, time.Since(start))
 	}()
-	outcome := m.dispatchTask(ctx, target, task)
+	leaseExec := m.startTaskLeaseExecution(ctx, target, task)
+	outcome := m.dispatchTask(leaseExec.leaseCtx(), target, task)
+	leaseOutcome := leaseExec.stop()
+	if leaseOutcome.lost {
+		result = "lease_lost"
+		return
+	}
 	result = outcome.result
 	switch outcome.action {
 	case semanticTaskActionAck:
@@ -530,6 +555,189 @@ func (m *semanticWorkerManager) dispatchTask(ctx context.Context, target *semant
 		message := fmt.Sprintf("unsupported task type %q", task.TaskType)
 		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "unsupported", message: message}
 	}
+}
+
+func (m *semanticWorkerManager) startTaskLeaseExecution(ctx context.Context, target *semanticTarget, task *semantic.Task) *semanticTaskLeaseExecution {
+	leaseCtx, cancel := context.WithCancel(ctx)
+	exec := &semanticTaskLeaseExecution{
+		ctx:    leaseCtx,
+		cancel: cancel,
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
+	if task != nil && task.LeaseUntil != nil {
+		leaseUntil := task.LeaseUntil.UTC()
+		exec.lastLeaseUntil = &leaseUntil
+	}
+	go exec.run(m, target, task)
+	return exec
+}
+
+func (m *semanticWorkerManager) leaseRenewInterval() time.Duration {
+	interval := m.opts.LeaseDuration / 2
+	if interval > 0 {
+		return interval
+	}
+	if m.opts.LeaseDuration > 0 {
+		return m.opts.LeaseDuration
+	}
+	return time.Second
+}
+
+func (e *semanticTaskLeaseExecution) leaseCtx() context.Context {
+	if e == nil || e.ctx == nil {
+		return context.Background()
+	}
+	return e.ctx
+}
+
+func (e *semanticTaskLeaseExecution) stop() semanticTaskLeaseOutcome {
+	if e == nil {
+		return semanticTaskLeaseOutcome{}
+	}
+	close(e.stopCh)
+	e.cancel()
+	<-e.doneCh
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	outcome := semanticTaskLeaseOutcome{
+		lost:           e.lost,
+		renewAttempted: e.renewAttempted,
+	}
+	if e.lastLeaseUntil != nil {
+		leaseUntil := e.lastLeaseUntil.UTC()
+		outcome.lastLeaseUntil = &leaseUntil
+	}
+	return outcome
+}
+
+func (e *semanticTaskLeaseExecution) run(m *semanticWorkerManager, target *semanticTarget, task *semantic.Task) {
+	defer close(e.doneCh)
+	if m == nil || target == nil || target.store == nil || task == nil {
+		return
+	}
+
+	ticker := time.NewTicker(m.leaseRenewInterval())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-e.stopCh:
+			e.logStopped(m, target, task)
+			return
+		case <-e.ctx.Done():
+			select {
+			case <-e.stopCh:
+				e.logStopped(m, target, task)
+			default:
+			}
+			return
+		case <-ticker.C:
+			e.markRenewAttempted()
+			renewStart := time.Now()
+			leaseUntil, err := target.store.RenewSemanticTask(e.ctx, task.TaskID, task.Receipt, m.opts.LeaseDuration)
+			if err != nil {
+				if e.shouldStop() {
+					e.logStopped(m, target, task)
+					return
+				}
+				metrics.RecordOperation("semantic_worker", "renew", "error", time.Since(renewStart))
+				if errors.Is(err, semantic.ErrTaskLeaseMismatch) || errors.Is(err, semantic.ErrTaskNotFound) {
+					e.markLeaseLost()
+					metrics.RecordOperation("semantic_worker", "lease_lost", "ok", time.Since(renewStart))
+					logger.Warn(e.ctx, "semantic_worker_lease_lost",
+						append([]zap.Field{
+							zap.String("tenant_id", target.tenantID),
+							zap.String("result", "lease_lost"),
+						}, append(semanticTaskLogFields(task), zap.Error(err))...)...)
+					e.cancel()
+					e.logStopped(m, target, task)
+					return
+				}
+				logger.Warn(e.ctx, "semantic_worker_lease_renew_failed",
+					append([]zap.Field{
+						zap.String("tenant_id", target.tenantID),
+						zap.String("result", "error"),
+					}, append(semanticTaskLogFields(task), zap.Error(err))...)...)
+				continue
+			}
+			e.recordRenewedLease(leaseUntil)
+			metrics.RecordOperation("semantic_worker", "renew", "ok", time.Since(renewStart))
+		}
+	}
+}
+
+func (e *semanticTaskLeaseExecution) shouldStop() bool {
+	if e == nil {
+		return true
+	}
+	select {
+	case <-e.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *semanticTaskLeaseExecution) recordRenewedLease(leaseUntil time.Time) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.renewAttempted = true
+	t := leaseUntil.UTC()
+	e.lastLeaseUntil = &t
+}
+
+func (e *semanticTaskLeaseExecution) markRenewAttempted() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.renewAttempted = true
+}
+
+func (e *semanticTaskLeaseExecution) markLeaseLost() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.lost = true
+	e.renewAttempted = true
+}
+
+func (e *semanticTaskLeaseExecution) logStopped(m *semanticWorkerManager, target *semanticTarget, task *semantic.Task) {
+	if e == nil || m == nil || target == nil || task == nil {
+		return
+	}
+	e.mu.Lock()
+	renewAttempted := e.renewAttempted
+	lost := e.lost
+	var leaseUntil *time.Time
+	if e.lastLeaseUntil != nil {
+		t := e.lastLeaseUntil.UTC()
+		leaseUntil = &t
+	}
+	e.mu.Unlock()
+	if !renewAttempted {
+		return
+	}
+
+	fields := append([]zap.Field{
+		zap.String("tenant_id", target.tenantID),
+		zap.String("result", "owned"),
+	}, semanticTaskLogFields(task)...)
+	if lost {
+		fields[1] = zap.String("result", "lease_lost")
+	}
+	if leaseUntil != nil {
+		fields = append(fields, zap.Time("latest_lease_until", leaseUntil.UTC()))
+	}
+	logger.Info(e.ctx, "semantic_worker_lease_renew_stopped", fields...)
 }
 
 func (m *semanticWorkerManager) processEmbedTask(ctx context.Context, store *datastore.Store, task *semantic.Task) semanticTaskOutcome {

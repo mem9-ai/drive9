@@ -75,6 +75,33 @@ func (e staticServerImageExtractor) ExtractImageText(context.Context, backend.Im
 	return e.text, nil
 }
 
+type gatedServerImageExtractor struct {
+	text string
+
+	started  chan struct{}
+	release  chan struct{}
+	canceled chan struct{}
+}
+
+func (e *gatedServerImageExtractor) ExtractImageText(ctx context.Context, req backend.ImageExtractRequest) (string, error) {
+	select {
+	case e.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-e.release:
+		return e.text, nil
+	case <-ctx.Done():
+		if e.canceled != nil {
+			select {
+			case e.canceled <- struct{}{}:
+			default:
+			}
+		}
+		return "", ctx.Err()
+	}
+}
+
 func newTestTenantPool(t *testing.T) *tenant.Pool {
 	return newTestTenantPoolWithBackendOptions(t, backend.Options{})
 }
@@ -1062,6 +1089,199 @@ func TestSemanticWorkerProcessEmbedTaskWithoutEmbedderDoesNotPanic(t *testing.T)
 	}
 }
 
+func TestSemanticWorkerRenewsLeaseForLongImageTask(t *testing.T) {
+	extractor := &gatedServerImageExtractor{
+		text:    "renewed image text",
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: extractor,
+		},
+	})
+	fileID := insertServerImageFileForExtractTest(t, b, "/img/renew.png", "image/png", []byte("fake-png"))
+	payload, err := json.Marshal(semantic.ImgExtractTaskPayload{Path: "/img/renew.png", ContentType: "image/png"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	availableAt := now.Add(-time.Second)
+	if _, err := b.Store().EnqueueSemanticTask(context.Background(), &semantic.Task{
+		TaskID:          "img-task-renew",
+		TaskType:        semantic.TaskTypeImgExtractText,
+		ResourceID:      fileID,
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     availableAt,
+		PayloadJSON:     payload,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	leaseDuration := 80 * time.Millisecond
+	claimed, found, err := b.Store().ClaimSemanticTask(context.Background(), time.Now().UTC(), leaseDuration, semantic.TaskTypeImgExtractText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected image task to be claimable")
+	}
+
+	m := newSemanticWorkerManager(b, nil, nil, nil, SemanticWorkerOptions{LeaseDuration: leaseDuration})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.processTask(context.Background(), &semanticTarget{
+			tenantID: semanticLocalTenantID,
+			backend:  b,
+			store:    b.Store(),
+		}, claimed)
+	}()
+
+	select {
+	case <-extractor.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("image task did not start")
+	}
+
+	renewedLeaseUntil := waitForNamedTaskLeaseAfter(t, b, claimed.TaskID, claimed.LeaseUntil, time.Second)
+	recovered, err := b.Store().RecoverExpiredSemanticTasks(context.Background(), claimed.LeaseUntil.UTC().Add(time.Millisecond), 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered=%d, want 0", recovered)
+	}
+	if renewedLeaseUntil.Before(claimed.LeaseUntil.UTC()) {
+		t.Fatalf("renewed lease_until=%v, want after %v", renewedLeaseUntil, claimed.LeaseUntil.UTC())
+	}
+
+	close(extractor.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("processTask did not finish")
+	}
+
+	waitForNamedTaskStatus(t, b, claimed.TaskID, string(semantic.TaskSucceeded), 2*time.Second)
+	task := mustGetServerSemanticTask(t, b, claimed.TaskID)
+	if task.AttemptCount != 1 {
+		t.Fatalf("attempt_count=%d, want 1", task.AttemptCount)
+	}
+}
+
+func TestSemanticWorkerCancelsLeaseLostImageTaskWithoutAckOrRetry(t *testing.T) {
+	core, recorded := observer.New(zap.InfoLevel)
+	restoreLogger := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(restoreLogger) })
+
+	extractor := &gatedServerImageExtractor{
+		text:     "stale image text",
+		started:  make(chan struct{}, 1),
+		release:  make(chan struct{}),
+		canceled: make(chan struct{}, 1),
+	}
+	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: extractor,
+		},
+	})
+	fileID := insertServerImageFileForExtractTest(t, b, "/img/lease-lost.png", "image/png", []byte("fake-png"))
+	payload, err := json.Marshal(semantic.ImgExtractTaskPayload{Path: "/img/lease-lost.png", ContentType: "image/png"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := b.Store().EnqueueSemanticTask(context.Background(), &semantic.Task{
+		TaskID:          "img-task-lease-lost",
+		TaskType:        semantic.TaskTypeImgExtractText,
+		ResourceID:      fileID,
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     now,
+		PayloadJSON:     payload,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	leaseDuration := 80 * time.Millisecond
+	claimed, found, err := b.Store().ClaimSemanticTask(context.Background(), now, leaseDuration, semantic.TaskTypeImgExtractText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected image task to be claimable")
+	}
+
+	m := newSemanticWorkerManager(b, nil, nil, nil, SemanticWorkerOptions{LeaseDuration: leaseDuration})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.processTask(context.Background(), &semanticTarget{
+			tenantID: semanticLocalTenantID,
+			backend:  b,
+			store:    b.Store(),
+		}, claimed)
+	}()
+
+	select {
+	case <-extractor.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("image task did not start")
+	}
+
+	if _, err := b.Store().DB().Exec(`UPDATE semantic_tasks
+		SET status = ?, receipt = NULL, leased_at = NULL, lease_until = NULL, available_at = ?, updated_at = ?
+		WHERE task_id = ?`,
+		semantic.TaskQueued, now.Add(time.Second), now.Add(time.Second), claimed.TaskID); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-extractor.canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected lease-lost cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("processTask did not finish after lease loss")
+	}
+
+	task := mustGetServerSemanticTask(t, b, claimed.TaskID)
+	if task.Status != string(semantic.TaskQueued) {
+		t.Fatalf("task status=%q, want %q", task.Status, semantic.TaskQueued)
+	}
+	if task.AttemptCount != 1 {
+		t.Fatalf("attempt_count=%d, want 1", task.AttemptCount)
+	}
+
+	waitForObservedLog(t, recorded, "semantic_worker_lease_lost", 2*time.Second)
+	assertNoObservedLogForTask(t, recorded, claimed.TaskID, "semantic_worker_ack_ok", "semantic_worker_ack_failed", "semantic_worker_retry_scheduled", "semantic_worker_retry_failed", "semantic_worker_dead_lettered")
+}
+
 func TestSemanticWorkerClaimAndAckLogsIncludeTaskFields(t *testing.T) {
 	core, recorded := observer.New(zap.InfoLevel)
 	restoreLogger := logger.L()
@@ -1355,6 +1575,42 @@ func waitForObservedLog(t *testing.T, recorded *observer.ObservedLogs, message s
 		t.Fatalf("timed out waiting for log message %q", message)
 	}
 	return entries[len(entries)-1]
+}
+
+func waitForNamedTaskLeaseAfter(t *testing.T, b *backend.Dat9Backend, taskID string, after *time.Time, timeout time.Duration) time.Time {
+	t.Helper()
+	if after == nil {
+		t.Fatal("after must not be nil")
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var leaseUntil time.Time
+		err := b.Store().DB().QueryRow(`SELECT lease_until FROM semantic_tasks WHERE task_id = ?`, taskID).Scan(&leaseUntil)
+		if err == nil {
+			leaseUntil = leaseUntil.UTC()
+			if leaseUntil.After(after.UTC()) {
+				return leaseUntil
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var leaseUntil time.Time
+	if err := b.Store().DB().QueryRow(`SELECT lease_until FROM semantic_tasks WHERE task_id = ?`, taskID).Scan(&leaseUntil); err != nil {
+		t.Fatalf("wait task lease_until query: %v", err)
+	}
+	t.Fatalf("task %s lease_until=%v, want after %v", taskID, leaseUntil.UTC(), after.UTC())
+	return time.Time{}
+}
+
+func assertNoObservedLogForTask(t *testing.T, recorded *observer.ObservedLogs, taskID string, messages ...string) {
+	t.Helper()
+	for _, message := range messages {
+		for _, entry := range recorded.FilterMessage(message).AllUntimed() {
+			if entry.ContextMap()["task_id"] == taskID {
+				t.Fatalf("unexpected log %q for task %s", message, taskID)
+			}
+		}
+	}
 }
 
 func waitForStoreEmbeddingRevision(t *testing.T, store *datastore.Store, path string, want int64, timeout time.Duration) {
