@@ -91,6 +91,22 @@ func (su *StreamUploader) SubmitPart(ctx context.Context, partNum int, data []by
 	go func() {
 		defer su.inflightWg.Done()
 
+		// sw.WritePart queues the actual S3 upload in a background goroutine
+		// inside StreamWriter. It copies buf internally, so buf is safe to
+		// reference after WritePart returns. The actual upload completes when
+		// sw.Complete() calls sw.inflight.Wait() inside FinishStreaming.
+		//
+		// We mark streamedParts and call onDone here (after WritePart returns)
+		// rather than after the S3 upload finishes, because:
+		// 1. WritePart has already copied the data — eviction is safe.
+		// 2. If the S3 upload later fails, streamErr is set by StreamWriter,
+		//    and FinishStreaming checks it before calling Complete.
+		// 3. onDone (EvictPart) only releases memory — it does not affect
+		//    upload correctness.
+		//
+		// IMPORTANT: flushHandle must release fh.mu before calling
+		// FinishStreaming, because onDone acquires fh.mu. Otherwise deadlock:
+		//   fh.Lock() → FinishStreaming → inflightWg.Wait() → onDone → fh.Lock()
 		err := sw.WritePart(ctx, partNum, buf)
 		if err != nil {
 			su.mu.Lock()

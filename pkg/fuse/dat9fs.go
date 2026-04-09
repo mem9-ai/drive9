@@ -840,9 +840,16 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			fh.Unlock()
 			return gofuse.ReadResultData(result), gofuse.OK
 		}
-		// touchesEvicted: data is on S3 (already uploaded). Fall through to
-		// server read. NOTE: for new files mid-stream, Complete has not been
-		// called yet, so server reads may fail. This is best-effort.
+		// touchesEvicted: for new files (remoteSize == 0), the multipart
+		// upload has not been completed yet — the object doesn't exist on the
+		// server, so ReadStreamRange would fail. Return EIO; sequential writers
+		// (cp, dd, ffmpeg) never read back evicted data in practice.
+		if fh.Dirty.remoteSize == 0 {
+			fh.Unlock()
+			return nil, gofuse.EIO
+		}
+		// Existing file with evicted parts: the original object still exists
+		// on the server, so fall through to ReadStreamRange.
 		fh.Unlock()
 	} else if fh.Dirty != nil && fh.Dirty.Size() > 0 && !fh.Dirty.HasDirtyParts() {
 		// Writable handle with lazy-loaded buffer (no dirty parts yet) —
@@ -986,15 +993,18 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	if ok {
 		fh.Lock()
 		st := fs.flushHandle(fh)
-		if st != gofuse.OK && fh.Streamer != nil {
-			// Flush failed — abort the streaming upload to avoid orphaned
-			// multipart uploads on S3.
-			fh.Streamer.Abort()
-			log.Printf("flush failed for %s (status %d), aborted stream upload", fh.Path, st)
-		}
+		streamer := fh.Streamer
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
 		fh.Unlock()
+
+		if st != gofuse.OK && streamer != nil {
+			// Flush failed — abort the streaming upload to avoid orphaned
+			// multipart uploads on S3. Called without fh.mu to avoid deadlock
+			// with inflight SubmitPart goroutines that need fh.Lock() in onDone.
+			streamer.Abort()
+			log.Printf("flush failed for %s (status %d), aborted stream upload", fh.Path, st)
+		}
 
 		// Close prefetcher to cancel inflight goroutines.
 		if fh.Prefetch != nil {
@@ -1005,6 +1015,9 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 }
 
 // flushHandle uploads buffered data to the server. Caller must hold fh.mu.
+// NOTE: This method temporarily releases fh.mu during network calls
+// (FinishStreaming, UploadAll) to avoid deadlock with streaming upload
+// callbacks. The lock is re-acquired before modifying handle state.
 func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 	if fh.Dirty == nil {
 		return gofuse.OK
@@ -1042,8 +1055,17 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 		// Collect dirty parts that need re-upload (back-written after eviction)
 		dirtyParts := fh.Dirty.DirtyStreamedParts()
 
-		err = fh.Streamer.FinishStreaming(context.Background(), size,
+		streamer := fh.Streamer
+
+		// Release fh.mu before network calls. FinishStreaming calls
+		// inflightWg.Wait() which blocks until SubmitPart goroutines finish.
+		// Those goroutines call onDone → fh.Lock(), so holding fh.mu here
+		// would deadlock.
+		fh.Unlock()
+		err = streamer.FinishStreaming(context.Background(), size,
 			lastPartNum, lastCp, dirtyParts)
+		fh.Lock()
+
 		if err != nil {
 			return httpToFuseStatus(err)
 		}
@@ -1074,7 +1096,13 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 			}
 		}
 
-		err = fh.Streamer.UploadAll(context.Background(), size, partSnapshots)
+		streamer := fh.Streamer
+
+		// Release fh.mu during network call (same deadlock avoidance as Path 1a).
+		fh.Unlock()
+		err = streamer.UploadAll(context.Background(), size, partSnapshots)
+		fh.Lock()
+
 		if err != nil {
 			return httpToFuseStatus(err)
 		}

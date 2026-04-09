@@ -205,7 +205,12 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 
 	ctx := p.ctx
 	go func() {
-		defer close(block.ready)
+		defer func() {
+			p.mu.Lock()
+			delete(p.inflight, offset)
+			p.mu.Unlock()
+			close(block.ready)
+		}()
 
 		rc, err := p.client.ReadStreamRange(ctx, p.path, offset, length)
 		if err != nil {
@@ -220,9 +225,5 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 			return
 		}
 		block.data = data
-
-		p.mu.Lock()
-		delete(p.inflight, offset)
-		p.mu.Unlock()
 	}()
 }
