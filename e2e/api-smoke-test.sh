@@ -343,8 +343,29 @@ check_cmd "local jpg fixture exists" test -s "$IMAGE_LOCAL"
 IMAGE_BYTES=$(wc -c < "$IMAGE_LOCAL" | tr -d ' ')
 IMAGE_CHECKSUMS=$(python3 - "$IMAGE_LOCAL" <<'PY'
 import base64
-import hashlib
+import struct
 import sys
+
+def _crc32c_table():
+    poly = 0x82F63B78
+    tbl = []
+    for i in range(256):
+        crc = i
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ poly
+            else:
+                crc >>= 1
+        tbl.append(crc)
+    return tbl
+
+_TABLE = _crc32c_table()
+
+def crc32c(data):
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc = _TABLE[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFF
 
 part_size = 8 * 1024 * 1024
 out = []
@@ -353,7 +374,7 @@ with open(sys.argv[1], "rb") as f:
         chunk = f.read(part_size)
         if not chunk:
             break
-        out.append(base64.b64encode(hashlib.sha256(chunk).digest()).decode())
+        out.append(base64.b64encode(struct.pack(">I", crc32c(chunk))).decode())
 print(",".join(out))
 PY
 )
@@ -400,7 +421,9 @@ with open(file_path, "rb") as data_file:
         req.add_header("Content-Length", str(size))
         for hk, hv in (p.get("headers") or {}).items():
             req.add_header(hk, hv)
-        if p.get("checksum_sha256"):
+        if p.get("checksum_crc32c"):
+            req.add_header("x-amz-checksum-crc32c", p["checksum_crc32c"])
+        elif p.get("checksum_sha256"):
             req.add_header("x-amz-checksum-sha256", p["checksum_sha256"])
 
         with urllib.request.urlopen(req, timeout=300) as resp:
@@ -542,8 +565,29 @@ if [ "$RUN_LARGE_FILE" = "1" ]; then
 
   PART_CHECKSUMS=$(python3 - "$LARGE_FILE_LOCAL" <<'PY'
 import base64
-import hashlib
+import struct
 import sys
+
+def _crc32c_table():
+    poly = 0x82F63B78
+    tbl = []
+    for i in range(256):
+        crc = i
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ poly
+            else:
+                crc >>= 1
+        tbl.append(crc)
+    return tbl
+
+_TABLE = _crc32c_table()
+
+def crc32c(data):
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc = _TABLE[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFF
 
 part_size = 8 * 1024 * 1024
 out = []
@@ -552,7 +596,7 @@ with open(sys.argv[1], "rb") as f:
         chunk = f.read(part_size)
         if not chunk:
             break
-        out.append(base64.b64encode(hashlib.sha256(chunk).digest()).decode())
+        out.append(base64.b64encode(struct.pack(">I", crc32c(chunk))).decode())
 print(",".join(out))
 PY
 )
@@ -599,7 +643,9 @@ with open(file_path, "rb") as data_file:
         req.add_header("Content-Length", str(size))
         for hk, hv in (p.get("headers") or {}).items():
             req.add_header(hk, hv)
-        if p.get("checksum_sha256"):
+        if p.get("checksum_crc32c"):
+            req.add_header("x-amz-checksum-crc32c", p["checksum_crc32c"])
+        elif p.get("checksum_sha256"):
             req.add_header("x-amz-checksum-sha256", p["checksum_sha256"])
 
         with urllib.request.urlopen(req, timeout=300) as resp:
@@ -640,15 +686,36 @@ if [ "$RUN_UPLOAD_LIMIT_BOUNDARY" = "1" ]; then
   boundary_ok_payload="$(mktemp)"
   python3 - "$ROOT_DIR/limit-1g.bin" "$UPLOAD_LIMIT_BYTES" > "$boundary_ok_payload" <<'PY'
 import base64
-import hashlib
 import json
+import struct
 import sys
+
+def _crc32c_table():
+    poly = 0x82F63B78
+    tbl = []
+    for i in range(256):
+        crc = i
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ poly
+            else:
+                crc >>= 1
+        tbl.append(crc)
+    return tbl
+
+_TABLE = _crc32c_table()
+
+def crc32c(data):
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc = _TABLE[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFF
 
 path = "/" + sys.argv[1].lstrip("/")
 upload_limit = int(sys.argv[2])
 part_size = 8 * 1024 * 1024
 part = b"\x00" * part_size
-checksum = base64.b64encode(hashlib.sha256(part).digest()).decode()
+checksum = base64.b64encode(struct.pack(">I", crc32c(part))).decode()
 parts = (upload_limit + part_size - 1) // part_size
 print(json.dumps({
     "path": path,
@@ -670,14 +737,35 @@ PY
   boundary_over_payload="$(mktemp)"
   python3 - "$ROOT_DIR/limit-over.bin" "$over_limit" > "$boundary_over_payload" <<'PY'
 import base64
-import hashlib
 import json
+import struct
 import sys
+
+def _crc32c_table():
+    poly = 0x82F63B78
+    tbl = []
+    for i in range(256):
+        crc = i
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ poly
+            else:
+                crc >>= 1
+        tbl.append(crc)
+    return tbl
+
+_TABLE = _crc32c_table()
+
+def crc32c(data):
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc = _TABLE[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFF
 
 path = "/" + sys.argv[1].lstrip("/")
 over_limit = int(sys.argv[2])
 part = b"\x00" * (8 * 1024 * 1024)
-checksum = base64.b64encode(hashlib.sha256(part).digest()).decode()
+checksum = base64.b64encode(struct.pack(">I", crc32c(part))).decode()
 print(json.dumps({
     "path": path,
     "total_size": over_limit,

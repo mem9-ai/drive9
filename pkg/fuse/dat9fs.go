@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log"
 	"os"
 	"path"
 	"strings"
@@ -33,6 +34,11 @@ type Dat9FS struct {
 	uid         uint32
 	gid         uint32
 	opts        *MountOptions
+
+	// server is the go-fuse server, set during Init(). Used to send
+	// kernel cache invalidation notifications (EntryNotify, InodeNotify)
+	// so that long TTLs don't serve stale data after local mutations.
+	server *gofuse.Server
 }
 
 type dirtyInodeState struct {
@@ -122,44 +128,65 @@ func (fs *Dat9FS) preloadWritableHandle(fh *FileHandle) gofuse.Status {
 	if stat.Size == 0 {
 		return gofuse.OK
 	}
-	if stat.Size > maxPreloadSize {
-		return gofuse.Status(syscall.EFBIG)
-	}
 
-	bufMax := stat.Size + 16<<20
-	if bufMax < defaultWriteBufferMaxSize {
-		bufMax = defaultWriteBufferMaxSize
+	partSize := s3client.CalcAdaptivePartSize(stat.Size)
+	// Allow growth up to 2x original size or at least 1GB, whichever is larger.
+	// Lazy loading means memory usage is O(touched_parts), not O(bufMax).
+	bufMax := stat.Size * 2
+	if bufMax < maxPreloadSize {
+		bufMax = maxPreloadSize
 	}
-	fh.Dirty = NewWriteBuffer(fh.Path, bufMax, s3client.CalcAdaptivePartSize(stat.Size))
+	fh.Dirty = NewWriteBuffer(fh.Path, bufMax, partSize)
 
-	var data []byte
+	// Small files: eager preload (one HTTP request is cheaper than per-part loading)
 	if stat.Size <= smallFileThreshold {
-		data, err = fs.client.Read(fh.Path)
+		data, err := fs.client.Read(fh.Path)
 		if err != nil {
 			return httpToFuseStatus(err)
 		}
-	} else {
-		rc, err := fs.client.ReadStream(context.Background(), fh.Path)
+		if int64(len(data)) != stat.Size {
+			return gofuse.EIO
+		}
+		if _, err := fh.Dirty.Write(0, data); err != nil {
+			return gofuse.Status(syscall.EFBIG)
+		}
+		fh.Dirty.ClearDirty()
+		return gofuse.OK
+	}
+
+	// Large files: lazy preload — only Stat() now, load parts on demand.
+	// Set totalSize so the buffer knows the file extent, but don't load data.
+	// Set remoteSize so ensurePart() knows which parts exist on the server.
+	fh.Dirty.totalSize = stat.Size
+	fh.Dirty.remoteSize = stat.Size
+
+	// Install lazy loader: loads a single part from the server via range read.
+	c := fs.client
+	filePath := fh.Path
+	fh.Dirty.LoadPart = func(partNum int) ([]byte, error) {
+		partIdx := partNum - 1
+		offset := int64(partIdx) * partSize
+		length := partSize
+		if offset+length > stat.Size {
+			length = stat.Size - offset
+		}
+		if length <= 0 {
+			return nil, nil
+		}
+
+		rc, err := c.ReadStreamRange(context.Background(), filePath, offset, length)
 		if err != nil {
-			return httpToFuseStatus(err)
+			return nil, err
 		}
 		defer func() { _ = rc.Close() }()
 
-		data, err = io.ReadAll(rc)
+		data, err := io.ReadAll(rc)
 		if err != nil {
-			return gofuse.EIO
+			return nil, err
 		}
+		return data, nil
 	}
-	if int64(len(data)) != stat.Size {
-		return gofuse.EIO
-	}
-	if len(data) == 0 {
-		return gofuse.OK
-	}
-	if _, err := fh.Dirty.Write(0, data); err != nil {
-		return gofuse.Status(syscall.EFBIG)
-	}
-	fh.Dirty.ClearDirty()
+
 	return gofuse.OK
 }
 
@@ -223,7 +250,27 @@ func isNotFoundErr(err error) bool {
 // --- RawFileSystem methods ---------------------------------------------------
 
 func (fs *Dat9FS) Init(server *gofuse.Server) {
-	// nothing special needed
+	fs.server = server
+}
+
+// notifyEntry tells the kernel to invalidate a directory entry cache.
+// Safe to call even if the server is not yet initialized (e.g., during tests).
+func (fs *Dat9FS) notifyEntry(parentIno uint64, name string) {
+	if fs.server == nil {
+		return
+	}
+	// EntryNotify can return ENOENT if the kernel doesn't have the entry
+	// cached — that's fine, we just ignore it.
+	_ = fs.server.EntryNotify(parentIno, name)
+}
+
+// notifyInode tells the kernel to invalidate cached attributes and data
+// for an inode. off=0, sz=0 means invalidate all cached data.
+func (fs *Dat9FS) notifyInode(ino uint64) {
+	if fs.server == nil {
+		return
+	}
+	_ = fs.server.InodeNotify(ino, 0, 0)
 }
 
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) gofuse.Status {
@@ -323,6 +370,10 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					fh.Unlock()
 					return gofuse.Status(syscall.EFBIG)
 				}
+				// Reset sequential write tracking after truncate so that
+				// subsequent writes starting at the new size are not
+				// misdetected as back-writes (appendCursor may be stale).
+				fh.Dirty.ResetSequentialState(newSize)
 				fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
 				fh.Unlock()
 			}
@@ -344,6 +395,8 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		}
 		entry.Size = newSize
 		fs.inodes.UpdateSize(input.NodeId, newSize)
+		// Invalidate kernel attr cache for the truncated inode.
+		fs.notifyInode(input.NodeId)
 	}
 
 	fs.fillAttr(entry, &out.Attr)
@@ -371,6 +424,9 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Invalidate(parentPath)
+	fs.notifyEntry(input.NodeId, name)
+	// Invalidate kernel's cached directory listing for parent.
+	fs.notifyInode(input.NodeId)
 
 	fs.fillEntryOut(entry, out)
 	return gofuse.OK
@@ -391,6 +447,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.dirCache.Invalidate(parentPath)
+	// Tell kernel the entry no longer exists and parent dir changed.
+	fs.notifyEntry(header.NodeId, name)
+	fs.notifyInode(header.NodeId)
 	return gofuse.OK
 }
 
@@ -410,6 +469,9 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.dirCache.Invalidate(parentPath)
+	// Tell kernel the entry no longer exists and parent dir changed.
+	fs.notifyEntry(header.NodeId, name)
+	fs.notifyInode(header.NodeId)
 	return gofuse.OK
 }
 
@@ -433,9 +495,15 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 
 	oldParent, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Invalidate(oldParent)
+	// Tell kernel old entry is gone and old parent dir changed.
+	fs.notifyEntry(input.NodeId, oldName)
+	fs.notifyInode(input.NodeId)
 	if input.Newdir != input.NodeId {
 		newParent, _ := fs.inodes.GetPath(input.Newdir)
 		fs.dirCache.Invalidate(newParent)
+		// Tell kernel new parent dir changed too.
+		fs.notifyEntry(input.Newdir, newName)
+		fs.notifyInode(input.Newdir)
 	}
 	return gofuse.OK
 }
@@ -596,14 +664,37 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		return gofuse.EIO
 	}
 
-	wb := NewWriteBuffer(childP, maxPreloadSize, 0)
+	wb := NewWriteBuffer(childP, streamingWriteMaxSize, 0)
 	wb.touched = true
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
 	fh := &FileHandle{
 		Ino:   ino,
 		Path:  childP,
 		Flags: input.Flags,
 		Dirty: wb,
 	}
+
+	// Attach a streaming uploader for sequential write streaming.
+	// For pure sequential writes (cp, dd, ffmpeg), parts are uploaded
+	// as they fill during Write() and memory is released immediately.
+	// For non-sequential writes, falls back to flush-time UploadAll.
+	fh.Streamer = NewStreamUploader(fs.client, childP)
+
+	// Wire up the OnPartFull callback: when a sequential write fills
+	// a part, submit it for background upload and evict after completion.
+	streamer := fh.Streamer
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		partNum := partIdx + 1
+		if err := streamer.SubmitPart(context.Background(), partNum, data, func(pn int) {
+			fh.Lock()
+			fh.Dirty.EvictPart(pn - 1) // 0-based
+			fh.Unlock()
+		}); err != nil {
+			log.Printf("streaming submit part %d failed for %s: %v", partNum, childP, err)
+		}
+	}
+
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
 	out.Fh = fs.fileHandles.Allocate(fh)
 	out.OpenFlags = gofuse.FOPEN_DIRECT_IO // bypass kernel page cache for writes
@@ -611,6 +702,9 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Invalidate(parentPath)
+	fs.notifyEntry(input.NodeId, name)
+	// Invalidate kernel's cached directory listing for parent.
+	fs.notifyInode(input.NodeId)
 	return gofuse.OK
 }
 
@@ -643,9 +737,35 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		} else {
 			// O_TRUNC: mark buffer as dirty so that close() without any
 			// writes still persists the truncation (POSIX semantics).
+			fh.Dirty.maxSize = streamingWriteMaxSize
+			fh.Dirty.sequential = true
+			fh.Dirty.uploadedParts = make(map[int]bool)
 			_ = fh.Dirty.Truncate(0)
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 			fs.inodes.UpdateSize(fh.Ino, 0)
+
+			// Attach streaming uploader with OnPartFull wiring.
+			fh.Streamer = NewStreamUploader(fs.client, p)
+			streamer := fh.Streamer
+			filePath := p
+			fh.Dirty.OnPartFull = func(partIdx int, data []byte) {
+				partNum := partIdx + 1
+				if err := streamer.SubmitPart(context.Background(), partNum, data, func(pn int) {
+					fh.Lock()
+					fh.Dirty.EvictPart(pn - 1)
+					fh.Unlock()
+				}); err != nil {
+					log.Printf("streaming submit part %d failed for %s: %v", partNum, filePath, err)
+				}
+			}
+		}
+	}
+
+	// Set up read prefetcher for read-only opens on large files.
+	if fh.Dirty == nil {
+		entry, _ := fs.inodes.GetEntry(input.NodeId)
+		if entry != nil && entry.Size > smallFileThreshold {
+			fh.Prefetch = NewPrefetcher(fs.client, p, entry.Size)
 		}
 	}
 
@@ -667,25 +787,101 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	fh.Lock()
 	// If there's a dirty buffer (even empty — e.g. after Create or truncate-to-zero),
 	// read from it so we don't go back to the server and see stale/non-existent data.
+	// Uses ReadAt to avoid materializing the entire sparse buffer.
+	//
+	// However, if the handle has evicted (streaming-uploaded) parts, we cannot
+	// serve reads from those ranges — the data is on S3 but not in memory.
+	// For such ranges we fall through to the server read path.
 	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
-		data := fh.Dirty.Bytes()
 		offset := int64(input.Offset)
-		if offset >= int64(len(data)) {
+		size := fh.Dirty.Size()
+		if offset >= size {
 			fh.Unlock()
 			return gofuse.ReadResultData(nil), gofuse.OK
 		}
 		end := offset + int64(input.Size)
-		if end > int64(len(data)) {
-			end = int64(len(data))
+		if end > size {
+			end = size
 		}
-		result := make([]byte, end-offset)
-		copy(result, data[offset:end])
+
+		// Check if the read range touches any evicted part.
+		// If so, we cannot serve this read from memory — fall through to server.
+		touchesEvicted := false
+		if evicted := fh.Dirty.StreamedPartIndices(); len(evicted) > 0 {
+			ps := fh.Dirty.PartSize()
+			firstPart := int(offset / ps)
+			lastPart := int((end - 1) / ps)
+			for p := firstPart; p <= lastPart; p++ {
+				if evicted[p] && !fh.Dirty.IsPartLoaded(p) {
+					touchesEvicted = true
+					break
+				}
+			}
+		}
+
+		if !touchesEvicted {
+			// Ensure parts touched by this read are loaded from the server
+			// before calling ReadAt. Without this, ReadAt returns zeros for
+			// unloaded parts in lazily-loaded files.
+			ps := fh.Dirty.PartSize()
+			firstPart := int(offset / ps)
+			lastPart := int((end - 1) / ps)
+			for p := firstPart; p <= lastPart; p++ {
+				if !fh.Dirty.IsPartLoaded(p) {
+					if err := fh.Dirty.EnsureLoaded(p); err != nil {
+						fh.Unlock()
+						return nil, gofuse.EIO
+					}
+				}
+			}
+
+			result := make([]byte, end-offset)
+			fh.Dirty.ReadAt(offset, result)
+			fh.Unlock()
+			return gofuse.ReadResultData(result), gofuse.OK
+		}
+		// touchesEvicted: for new files (remoteSize == 0), the multipart
+		// upload has not been completed yet — the object doesn't exist on the
+		// server, so ReadStreamRange would fail. Return EIO; sequential writers
+		// (cp, dd, ffmpeg) never read back evicted data in practice.
+		if fh.Dirty.remoteSize == 0 {
+			fh.Unlock()
+			return nil, gofuse.EIO
+		}
+		// Existing file with evicted parts: the original object still exists
+		// on the server, so fall through to ReadStreamRange.
 		fh.Unlock()
-		return gofuse.ReadResultData(result), gofuse.OK
+	} else if fh.Dirty != nil && fh.Dirty.Size() > 0 && !fh.Dirty.HasDirtyParts() {
+		// Writable handle with lazy-loaded buffer (no dirty parts yet) —
+		// read directly from the server for unloaded parts.
+		offset := int64(input.Offset)
+		size := fh.Dirty.Size()
+		if offset >= size {
+			fh.Unlock()
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
+		fh.Unlock()
+		// Fall through to server read below
+	} else {
+		fh.Unlock()
 	}
-	fh.Unlock()
 
 	p := fh.Path
+
+	// Try prefetcher for large read-only files
+	if fh.Prefetch != nil {
+		offset := int64(input.Offset)
+		size := int(input.Size)
+		if data, ok := fh.Prefetch.Get(offset, size); ok {
+			// Trigger next prefetch
+			fh.Prefetch.OnRead(offset, len(data))
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
+		// Cache miss — fall through to direct read, then trigger prefetch
+		defer func() {
+			fh.Prefetch.OnRead(offset, size)
+		}()
+	}
 
 	// Try read cache for small files
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
@@ -764,7 +960,6 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		return 0, gofuse.Status(syscall.EFBIG)
 	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
-
 	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
 	return n, gofuse.OK
 }
@@ -797,15 +992,32 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
 		fh.Lock()
-		fs.flushHandle(fh)
+		st := fs.flushHandle(fh)
+		streamer := fh.Streamer
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
 		fh.Unlock()
+
+		if st != gofuse.OK && streamer != nil {
+			// Flush failed — abort the streaming upload to avoid orphaned
+			// multipart uploads on S3. Called without fh.mu to avoid deadlock
+			// with inflight SubmitPart goroutines that need fh.Lock() in onDone.
+			streamer.Abort()
+			log.Printf("flush failed for %s (status %d), aborted stream upload", fh.Path, st)
+		}
+
+		// Close prefetcher to cancel inflight goroutines.
+		if fh.Prefetch != nil {
+			fh.Prefetch.Close()
+		}
 	}
 	fs.fileHandles.Delete(input.Fh)
 }
 
 // flushHandle uploads buffered data to the server. Caller must hold fh.mu.
+// NOTE: This method temporarily releases fh.mu during network calls
+// (FinishStreaming, UploadAll) to avoid deadlock with streaming upload
+// callbacks. The lock is re-acquired before modifying handle state.
 func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 	if fh.Dirty == nil {
 		return gofuse.OK
@@ -814,10 +1026,102 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 		return gofuse.OK
 	}
 
-	data := fh.Dirty.Bytes()
-	size := int64(len(data))
+	size := fh.Dirty.Size()
 
 	var err error
+
+	// Path 1a: Streaming mode — some parts already uploaded during Write().
+	// This path is used for large sequential writes (cp, dd, ffmpeg).
+	// Only the final partial part and any dirty (back-written) parts need uploading.
+	if fh.Streamer != nil && fh.Streamer.HasStreamedParts() {
+		partSize := fh.Dirty.PartSize()
+		numParts := int((size + partSize - 1) / partSize)
+		lastPartNum := numParts // 1-based
+
+		// Determine data for the last part.
+		// If the file size is an exact multiple of partSize, the last part was
+		// already fully streamed and evicted — pass nil so FinishStreaming
+		// does not re-upload it with empty/zero data.
+		var lastCp []byte
+		if size%partSize != 0 {
+			// Last part is partial — it's still in the WriteBuffer
+			lastPartData := fh.Dirty.PartData(lastPartNum)
+			if lastPartData != nil {
+				lastCp = make([]byte, len(lastPartData))
+				copy(lastCp, lastPartData)
+			}
+		}
+
+		// Collect dirty parts that need re-upload (back-written after eviction)
+		dirtyParts := fh.Dirty.DirtyStreamedParts()
+
+		streamer := fh.Streamer
+
+		// Release fh.mu before network calls. FinishStreaming calls
+		// inflightWg.Wait() which blocks until SubmitPart goroutines finish.
+		// Those goroutines call onDone → fh.Lock(), so holding fh.mu here
+		// would deadlock.
+		fh.Unlock()
+		err = streamer.FinishStreaming(context.Background(), size,
+			lastPartNum, lastCp, dirtyParts)
+		fh.Lock()
+
+		if err != nil {
+			return httpToFuseStatus(err)
+		}
+
+		fh.Dirty.ClearDirty()
+		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+		fh.DirtySeq = 0
+		fs.readCache.Invalidate(fh.Path)
+		fs.dirCache.Invalidate(parentDir(fh.Path))
+		fs.inodes.UpdateSize(fh.Ino, size)
+		fs.notifyInode(fh.Ino)
+		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
+		fs.notifyInode(parentIno)
+		return gofuse.OK
+	}
+
+	// Path 1b: Large new file with streaming uploader but no streaming parts
+	// (non-sequential writes) — upload all parts in parallel at flush time.
+	if fh.Streamer != nil && size >= smallFileThreshold {
+		numParts := int((size + fh.Dirty.PartSize() - 1) / fh.Dirty.PartSize())
+		partSnapshots := make(map[int][]byte, numParts)
+		for pn := 1; pn <= numParts; pn++ {
+			src := fh.Dirty.PartData(pn)
+			if src != nil {
+				cp := make([]byte, len(src))
+				copy(cp, src)
+				partSnapshots[pn] = cp
+			}
+		}
+
+		streamer := fh.Streamer
+
+		// Release fh.mu during network call (same deadlock avoidance as Path 1a).
+		fh.Unlock()
+		err = streamer.UploadAll(context.Background(), size, partSnapshots)
+		fh.Lock()
+
+		if err != nil {
+			return httpToFuseStatus(err)
+		}
+
+		fh.Dirty.ClearDirty()
+		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+		fh.DirtySeq = 0
+		fs.readCache.Invalidate(fh.Path)
+		fs.dirCache.Invalidate(parentDir(fh.Path))
+		fs.inodes.UpdateSize(fh.Ino, size)
+		fs.notifyInode(fh.Ino)
+		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
+		fs.notifyInode(parentIno)
+		return gofuse.OK
+	}
+
+	// Path 2: No streaming uploader or small file — materialize all data for upload.
+	data := fh.Dirty.Bytes()
+
 	if size < smallFileThreshold {
 		// Small file: direct PUT.
 		err = fs.client.Write(fh.Path, data)
@@ -869,6 +1173,10 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 	fs.readCache.Invalidate(fh.Path)
 	fs.dirCache.Invalidate(parentDir(fh.Path))
 	fs.inodes.UpdateSize(fh.Ino, size)
+	// Invalidate kernel attr/data cache for this inode and parent dir listing.
+	fs.notifyInode(fh.Ino)
+	parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
+	fs.notifyInode(parentIno)
 	return gofuse.OK
 }
 
