@@ -19,7 +19,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/server"
-	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 	"go.uber.org/zap"
 )
 
@@ -67,7 +67,7 @@ func main() {
 		stepStart := time.Now()
 		initMode := requestedEmbeddingMode
 		if !explicitEmbeddingMode {
-			initMode = tenant.TiDBEmbeddingModeAuto
+			initMode = schema.TiDBEmbeddingModeAuto
 		}
 		if err := localTiDBSchemaInitializer(localDSN, initMode); err != nil {
 			die(fmt.Errorf("init local tenant schema: %w", err))
@@ -107,7 +107,7 @@ func main() {
 	if err != nil {
 		die(fmt.Errorf("detect local embedding mode: %w", err))
 	}
-	backendOpts.DatabaseAutoEmbedding = localEmbeddingMode == tenant.TiDBEmbeddingModeAuto
+	backendOpts.DatabaseAutoEmbedding = localEmbeddingMode == schema.TiDBEmbeddingModeAuto
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "detect_local_embedding_mode",
 		zap.String("embedding_mode", string(localEmbeddingMode)))
 
@@ -270,60 +270,60 @@ func logLocalStartupStep(ctx context.Context, startupStart, stepStart time.Time,
 }
 
 var (
-	localTiDBEmbeddingModeDetector = tenant.DetectTiDBEmbeddingMode
-	localTiDBSchemaValidator       = tenant.ValidateTiDBSchemaForMode
-	localTiDBSchemaInitializer     = tenant.InitTiDBTenantSchemaForMode
+	localTiDBEmbeddingModeDetector = schema.DetectTiDBEmbeddingMode
+	localTiDBSchemaValidator       = schema.ValidateTiDBSchemaForMode
+	localTiDBSchemaInitializer     = schema.InitTiDBTenantSchemaForMode
 )
 
-func detectLocalTiDBEmbeddingMode(db *sql.DB, schemaInitialized bool, requestedMode tenant.TiDBEmbeddingMode, explicitMode bool) (tenant.TiDBEmbeddingMode, error) {
+func detectLocalTiDBEmbeddingMode(db *sql.DB, schemaInitialized bool, requestedMode schema.TiDBEmbeddingMode, explicitMode bool) (schema.TiDBEmbeddingMode, error) {
 	if explicitMode {
 		if schemaInitialized {
 			return requestedMode, nil
 		}
 		if db == nil {
-			return tenant.TiDBEmbeddingModeUnknown, fmt.Errorf("nil db")
+			return schema.TiDBEmbeddingModeUnknown, fmt.Errorf("nil db")
 		}
 		if err := localTiDBSchemaValidator(db, requestedMode); err != nil {
-			return tenant.TiDBEmbeddingModeUnknown, err
+			return schema.TiDBEmbeddingModeUnknown, err
 		}
 		return requestedMode, nil
 	}
 	if schemaInitialized {
-		return tenant.TiDBEmbeddingModeAuto, nil
+		return schema.TiDBEmbeddingModeAuto, nil
 	}
 	if db == nil {
-		return tenant.TiDBEmbeddingModeUnknown, fmt.Errorf("nil db")
+		return schema.TiDBEmbeddingModeUnknown, fmt.Errorf("nil db")
 	}
 	mode, err := localTiDBEmbeddingModeDetector(db)
 	if err != nil {
-		return tenant.TiDBEmbeddingModeUnknown, err
+		return schema.TiDBEmbeddingModeUnknown, err
 	}
-	if mode != tenant.TiDBEmbeddingModeAuto && mode != tenant.TiDBEmbeddingModeApp {
-		return tenant.TiDBEmbeddingModeUnknown, fmt.Errorf("unsupported TiDB embedding mode %q", mode)
+	if mode != schema.TiDBEmbeddingModeAuto && mode != schema.TiDBEmbeddingModeApp {
+		return schema.TiDBEmbeddingModeUnknown, fmt.Errorf("unsupported TiDB embedding mode %q", mode)
 	}
 	if err := localTiDBSchemaValidator(db, mode); err != nil {
-		return tenant.TiDBEmbeddingModeUnknown, err
+		return schema.TiDBEmbeddingModeUnknown, err
 	}
 	return mode, nil
 }
 
-func localEmbeddingModeFromEnv() (tenant.TiDBEmbeddingMode, bool, error) {
+func localEmbeddingModeFromEnv() (schema.TiDBEmbeddingMode, bool, error) {
 	raw := strings.TrimSpace(os.Getenv(envLocalEmbeddingMode))
 	switch strings.ToLower(raw) {
 	case "":
-		return tenant.TiDBEmbeddingModeUnknown, false, nil
+		return schema.TiDBEmbeddingModeUnknown, false, nil
 	case "detect":
-		return tenant.TiDBEmbeddingModeUnknown, false, nil
-	case "auto", string(tenant.TiDBEmbeddingModeAuto):
-		return tenant.TiDBEmbeddingModeAuto, true, nil
-	case "app", string(tenant.TiDBEmbeddingModeApp):
-		return tenant.TiDBEmbeddingModeApp, true, nil
+		return schema.TiDBEmbeddingModeUnknown, false, nil
+	case "auto", string(schema.TiDBEmbeddingModeAuto):
+		return schema.TiDBEmbeddingModeAuto, true, nil
+	case "app", string(schema.TiDBEmbeddingModeApp):
+		return schema.TiDBEmbeddingModeApp, true, nil
 	default:
-		return tenant.TiDBEmbeddingModeUnknown, false, fmt.Errorf("%s must be one of auto, app, or detect", envLocalEmbeddingMode)
+		return schema.TiDBEmbeddingModeUnknown, false, fmt.Errorf("%s must be one of auto, app, or detect", envLocalEmbeddingMode)
 	}
 }
 
-func localEmbeddingModeLabel(mode tenant.TiDBEmbeddingMode, explicit bool) string {
+func localEmbeddingModeLabel(mode schema.TiDBEmbeddingMode, explicit bool) string {
 	if !explicit {
 		return "detect"
 	}

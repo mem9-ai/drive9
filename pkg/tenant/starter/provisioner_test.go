@@ -1,4 +1,4 @@
-package tenant
+package starter
 
 import (
 	"context"
@@ -6,8 +6,8 @@ import (
 	"testing"
 )
 
-func TestStarterProvisionerInitSchemaValidatesSchema(t *testing.T) {
-	p := &StarterProvisioner{}
+func TestProvisionerInitSchemaValidatesSchema(t *testing.T) {
+	p := &Provisioner{}
 	err := p.InitSchema(context.Background(), "ignored-dsn")
 	if err == nil {
 		t.Fatal("expected starter schema validation to reject invalid dsn")

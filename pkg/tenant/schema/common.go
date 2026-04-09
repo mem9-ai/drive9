@@ -1,4 +1,4 @@
-package tenant
+package schema
 
 import (
 	"database/sql"
@@ -6,7 +6,9 @@ import (
 	"strings"
 )
 
-func execSchemaStatements(db *sql.DB, stmts []string) error {
+// ExecSchemaStatements executes a sequence of DDL statements, ignoring
+// duplicate-key / already-exists errors that arise from racing migrations.
+func ExecSchemaStatements(db *sql.DB, stmts []string) error {
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
 			if isIgnorableSchemaError(err) {
@@ -22,7 +24,7 @@ func execSchemaStatements(db *sql.DB, stmts []string) error {
 	return nil
 }
 
-func hasMultiStatements(dsn string) bool {
+func HasMultiStatements(dsn string) bool {
 	lower := strings.ToLower(dsn)
 	return strings.Contains(lower, "multistatements=true") || strings.Contains(lower, "multistatements=1")
 }
@@ -37,7 +39,7 @@ func isIgnorableSchemaError(err error) bool {
 		strings.Contains(msg, "duplicate column")
 }
 
-func isTiDBCluster(db *sql.DB) bool {
+func IsTiDBCluster(db *sql.DB) bool {
 	var ver string
 	if err := db.QueryRow(`SELECT VERSION()`).Scan(&ver); err != nil {
 		return false

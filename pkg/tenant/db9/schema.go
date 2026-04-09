@@ -1,9 +1,11 @@
-package tenant
+package db9
 
 import (
 	"database/sql"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
 
 func initDB9Schema(dsn string) error {
@@ -108,5 +110,5 @@ func initDB9Schema(dsn string) error {
 		`CREATE INDEX IF NOT EXISTS idx_task_claim_type ON semantic_tasks(status, task_type, available_at, created_at, task_id)`,
 	}
 
-	return execSchemaStatements(db, stmts)
+	return schema.ExecSchemaStatements(db, stmts)
 }

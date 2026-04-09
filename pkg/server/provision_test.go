@@ -16,6 +16,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/token"
 )
 
 type fakeProvisioner struct {
@@ -113,7 +114,7 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 	if apiKey == "" {
 		t.Fatal("empty api_key")
 	}
-	resolved, err := metaStore.ResolveByAPIKeyHash(context.Background(), tenant.HashToken(apiKey))
+	resolved, err := metaStore.ResolveByAPIKeyHash(context.Background(), token.HashToken(apiKey))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +214,7 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	if out["api_key"] == "" {
 		t.Fatalf("unexpected provision response: %+v", out)
 	}
-	resolved, err := metaStore.ResolveByAPIKeyHash(context.Background(), tenant.HashToken(out["api_key"]))
+	resolved, err := metaStore.ResolveByAPIKeyHash(context.Background(), token.HashToken(out["api_key"]))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +281,7 @@ func TestStartupResumesProvisioningTenantInit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tenantID := tenant.NewID()
+	tenantID := token.NewID()
 	now := time.Now().UTC()
 	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
 		ID:               tenantID,

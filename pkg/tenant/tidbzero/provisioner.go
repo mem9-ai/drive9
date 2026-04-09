@@ -1,4 +1,4 @@
-package tenant
+package tidbzero
 
 import (
 	"bytes"
@@ -10,30 +10,33 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
 
 const envZeroAPIURL = "DRIVE9_ZERO_API_URL"
 
-type ZeroProvisioner struct {
+type Provisioner struct {
 	baseURL string
 	client  *http.Client
 }
 
-func NewZeroProvisionerFromEnv() (*ZeroProvisioner, error) {
+func NewProvisionerFromEnv() (*Provisioner, error) {
 	base := os.Getenv(envZeroAPIURL)
 	if base == "" {
 		return nil, fmt.Errorf("%s is required", envZeroAPIURL)
 	}
-	return &ZeroProvisioner{baseURL: strings.TrimRight(base, "/"), client: &http.Client{Timeout: 30 * time.Second}}, nil
+	return &Provisioner{baseURL: strings.TrimRight(base, "/"), client: &http.Client{Timeout: 30 * time.Second}}, nil
 }
 
-func (p *ZeroProvisioner) ProviderType() string { return ProviderTiDBZero }
+func (p *Provisioner) ProviderType() string { return tenant.ProviderTiDBZero }
 
-func (p *ZeroProvisioner) InitSchema(_ context.Context, dsn string) error {
-	return initZeroSchema(dsn)
+func (p *Provisioner) InitSchema(_ context.Context, dsn string) error {
+	return schema.InitTiDBTenantSchema(dsn)
 }
 
-func (p *ZeroProvisioner) Provision(ctx context.Context, tenantID string) (*ClusterInfo, error) {
+func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.ClusterInfo, error) {
 	type reqBody struct {
 		Tag string `json:"tag"`
 	}
@@ -86,7 +89,7 @@ func (p *ZeroProvisioner) Provision(ctx context.Context, tenantID string) (*Clus
 		}
 	}
 
-	return &ClusterInfo{
+	return &tenant.ClusterInfo{
 		TenantID:       tenantID,
 		ClusterID:      out.Instance.ID,
 		Host:           out.Instance.Connection.Host,
@@ -94,7 +97,7 @@ func (p *ZeroProvisioner) Provision(ctx context.Context, tenantID string) (*Clus
 		Username:       out.Instance.Connection.Username,
 		Password:       out.Instance.Connection.Password,
 		DBName:         "test",
-		Provider:       ProviderTiDBZero,
+		Provider:       tenant.ProviderTiDBZero,
 		ClaimURL:       out.Instance.ClaimInfo.ClaimURL,
 		ClaimExpiresAt: claimExp,
 	}, nil

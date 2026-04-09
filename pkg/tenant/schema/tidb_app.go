@@ -1,4 +1,4 @@
-package tenant
+package schema
 
 import (
 	"fmt"
@@ -31,7 +31,7 @@ func tidbAppEmbeddingSchemaStatements() []string {
 			status             VARCHAR(32) NOT NULL DEFAULT 'PENDING',
 			source_id          VARCHAR(255),
 			content_text       LONGTEXT,
-			embedding          VECTOR(` + strconv.Itoa(tidbAutoEmbeddingDimensions) + `),
+			embedding          VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `),
 			embedding_revision BIGINT,
 			created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			confirmed_at       DATETIME(3),
@@ -96,15 +96,15 @@ func tidbAppEmbeddingSchemaStatements() []string {
 }
 
 func initTiDBAppEmbeddingSchema(dsn string) error {
-	db, err := openTiDBSchemaDB(dsn)
+	db, err := OpenTiDBSchemaDB(dsn)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	if !isTiDBCluster(db) {
+	if !IsTiDBCluster(db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
-	if err := execSchemaStatements(db, tidbAppEmbeddingSchemaStatements()); err != nil {
+	if err := ExecSchemaStatements(db, tidbAppEmbeddingSchemaStatements()); err != nil {
 		return err
 	}
 	return ValidateTiDBSchemaForMode(db, TiDBEmbeddingModeApp)
