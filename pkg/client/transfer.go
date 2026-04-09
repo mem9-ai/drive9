@@ -176,8 +176,15 @@ func (p *uploadBufferPool) get(ctx context.Context) ([]byte, error) {
 	}
 }
 
+// put expects a buffer previously obtained from this pool via get(). When a
+// caller returns a shortened view of that buffer, we restore its full length
+// before enqueuing it again. If a non-pool buffer with insufficient capacity is
+// passed in by mistake, drop it instead of panicking on the reslice.
 func (p *uploadBufferPool) put(buf []byte) {
 	if buf == nil {
+		return
+	}
+	if int64(cap(buf)) < p.size {
 		return
 	}
 	p.ch <- buf[:p.size]

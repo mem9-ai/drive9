@@ -91,6 +91,28 @@ func TestUploadBufferPoolRestoresFullLengthOnPut(t *testing.T) {
 	}
 }
 
+func TestUploadBufferPoolPutDropsForeignShortBuffer(t *testing.T) {
+	pool := newUploadBufferPool(8, 1)
+
+	buf, err := pool.get(context.Background())
+	if err != nil {
+		t.Fatalf("initial get: %v", err)
+	}
+
+	// A foreign buffer with smaller capacity should be ignored rather than
+	// panicking when put() tries to restore the pool's full buffer length.
+	pool.put(make([]byte, 4))
+	pool.put(buf[:3])
+
+	buf, err = pool.get(context.Background())
+	if err != nil {
+		t.Fatalf("second get: %v", err)
+	}
+	if len(buf) != 8 {
+		t.Fatalf("restored len = %d, want 8", len(buf))
+	}
+}
+
 func TestUploadBufferPoolGetHonorsContextCancel(t *testing.T) {
 	pool := newUploadBufferPool(4, 1)
 	buf, err := pool.get(context.Background())
