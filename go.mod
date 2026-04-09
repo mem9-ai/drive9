@@ -16,9 +16,17 @@ require (
 	github.com/jackc/pgx/v5 v5.9.1
 	github.com/oklog/ulid/v2 v2.1.0
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.41.0
+	github.com/tidbcloud/tidb-management-service/api v0.0.0-20260409104828-3391ea2e1652
 	go.uber.org/zap v1.27.0
 	golang.org/x/text v0.35.0
+	google.golang.org/grpc v1.79.1
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
+)
+
+require (
+	github.com/golang/mock v1.6.0 // indirect
+	github.com/tidbcloud/account/idl/pbgen/proto/acl v0.1.1 // indirect
+	go.buf.build/protocolbuffers/go/linuxgit/tidbcloud v1.3.4 // indirect
 )
 
 require (
@@ -80,6 +88,7 @@ require (
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/testcontainers/testcontainers-go v0.41.0 // indirect
+	github.com/tidbcloud/account/idl/pbgen/proto/account v0.2.29-0.20260309082810-35388bd6d689
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
@@ -90,9 +99,12 @@ require (
 	go.opentelemetry.io/otel/trace v1.41.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
+	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect
-	google.golang.org/grpc v1.79.1 // indirect
+	golang.org/x/time v0.3.0 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260209200024-4cfbd4190f57 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260209200024-4cfbd4190f57 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
