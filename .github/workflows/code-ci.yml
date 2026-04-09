@@ -9,15 +9,12 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      GOPRIVATE: github.com/tidbcloud/*
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Configure private Go modules
-        run: |
-          git config --global url."https://${{ secrets.GH_PAT }}@github.com/tidbcloud/".insteadOf "https://github.com/tidbcloud/"
+        with:
+          submodules: true
+          token: ${{ secrets.GIT_ACTION_BOT }}
 
       - name: Checkout agfs dependency
         run: |
@@ -28,6 +25,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+        env:
+          GOPRIVATE: "github.com/tidbcloud,github.com/pingcap/dbaas"
+
+      - name: Configure git for private modules
+        env:
+          TOKEN: ${{ secrets.GIT_ACTION_BOT }}
+        run: git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/"
 
       - name: Cache golangci-lint binary
         uses: actions/cache@v4
