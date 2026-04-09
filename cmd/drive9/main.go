@@ -24,6 +24,7 @@ import (
 )
 
 var version = "dev"
+var gitHash = "unknown"
 var cliLogger *zap.Logger
 
 func main() {
@@ -32,6 +33,8 @@ func main() {
 			cliLogger = l
 			logger.Set(l)
 			defer func() { _ = cliLogger.Sync() }()
+		} else {
+			fmt.Fprintf(os.Stderr, "drive9: failed to initialize CLI logger: %v\n", err)
 		}
 	}
 
@@ -47,7 +50,7 @@ func main() {
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "version"))
 		}
-		fmt.Printf("drive9 %s\n", version)
+		fmt.Print(versionString())
 	case "-h", "-help", "help":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "help"))
@@ -97,6 +100,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "drive9: unknown command %q\n", cmd)
 		usage()
 	}
+}
+
+func versionString() string {
+	return fmt.Sprintf("drive9 %s\nGit Commit Hash: %s\n", version, gitHash)
 }
 
 func runFS(args []string) {
