@@ -42,19 +42,19 @@ var (
 // SemanticWorkerOptions controls background semantic task processing.
 type SemanticWorkerOptions struct {
 	// Workers is the number of polling worker goroutines.
-	Workers              int
+	Workers int
 	// PollInterval is the idle wait between claim attempts.
-	PollInterval         time.Duration
+	PollInterval time.Duration
 	// LeaseDuration is the base task lease window used by claim and renew.
-	LeaseDuration        time.Duration
+	LeaseDuration time.Duration
 	// RecoverInterval controls how often expired leases are swept back to queue.
-	RecoverInterval      time.Duration
+	RecoverInterval time.Duration
 	// RetryBaseDelay is the initial backoff for retry scheduling.
-	RetryBaseDelay       time.Duration
+	RetryBaseDelay time.Duration
 	// RetryMaxDelay is the cap for exponential retry backoff.
-	RetryMaxDelay        time.Duration
+	RetryMaxDelay time.Duration
 	// TenantScanLimit bounds active tenants checked per scheduling pass.
-	TenantScanLimit      int
+	TenantScanLimit int
 	// PerTenantConcurrency limits concurrent tasks per tenant.
 	PerTenantConcurrency int
 }
@@ -143,8 +143,9 @@ type semanticTaskLeaseExecution struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	stopCh chan struct{}
-	doneCh chan struct{}
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	stopOnce sync.Once
 
 	mu             sync.Mutex
 	lost           bool
@@ -308,9 +309,20 @@ func (m *semanticWorkerManager) processTask(ctx context.Context, target *semanti
 		metrics.RecordOperation("semantic_worker", string(task.TaskType), result, time.Since(start))
 	}()
 	leaseExec := m.startTaskLeaseExecution(ctx, target, task)
+	var (
+		leaseStopOnce sync.Once
+		leaseOutcome  semanticTaskLeaseOutcome
+	)
+	stopLease := func() semanticTaskLeaseOutcome {
+		leaseStopOnce.Do(func() {
+			leaseOutcome = leaseExec.stop()
+		})
+		return leaseOutcome
+	}
+	defer stopLease()
 	outcome := m.dispatchTask(leaseExec.leaseCtx(), target, task)
 	// Stop renewal before ack/retry so only one lease owner can finalize outcome.
-	leaseOutcome := leaseExec.stop()
+	leaseOutcome = stopLease()
 	if leaseOutcome.lost {
 		result = "lease_lost"
 		return
@@ -608,9 +620,11 @@ func (e *semanticTaskLeaseExecution) stop() semanticTaskLeaseOutcome {
 	}
 	// close(stopCh) + cancel() ensures the renew loop exits whether it is waiting
 	// on ticker or blocked inside a datastore call using e.ctx.
-	close(e.stopCh)
-	e.cancel()
-	<-e.doneCh
+	e.stopOnce.Do(func() {
+		close(e.stopCh)
+		e.cancel()
+		<-e.doneCh
+	})
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -651,12 +665,10 @@ func (e *semanticTaskLeaseExecution) run(m *semanticWorkerManager, target *seman
 			renewStart := time.Now()
 			leaseUntil, err := target.store.RenewSemanticTask(e.ctx, task.TaskID, task.Receipt, m.opts.LeaseDuration)
 			if err != nil {
-				if e.shouldStop() {
-					e.logStopped(m, target, task)
-					return
-				}
-				metrics.RecordOperation("semantic_worker", "renew", "error", time.Since(renewStart))
 				if errors.Is(err, semantic.ErrTaskLeaseMismatch) || errors.Is(err, semantic.ErrTaskNotFound) {
+					metrics.RecordOperation("semantic_worker", "renew", "error", time.Since(renewStart))
+					// A renew already in flight can still discover lease loss after
+					// processTask begins shutdown, so lease mismatch wins over stop.
 					e.markLeaseLost()
 					metrics.RecordOperation("semantic_worker", "lease_lost", "ok", time.Since(renewStart))
 					logger.Warn(e.ctx, "semantic_worker_lease_lost",
@@ -669,6 +681,11 @@ func (e *semanticTaskLeaseExecution) run(m *semanticWorkerManager, target *seman
 					e.logStopped(m, target, task)
 					return
 				}
+				if e.shouldStop() {
+					e.logStopped(m, target, task)
+					return
+				}
+				metrics.RecordOperation("semantic_worker", "renew", "error", time.Since(renewStart))
 				logger.Warn(e.ctx, "semantic_worker_lease_renew_failed",
 					append([]zap.Field{
 						zap.String("tenant_id", target.tenantID),

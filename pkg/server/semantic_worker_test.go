@@ -102,6 +102,20 @@ func (e *gatedServerImageExtractor) ExtractImageText(ctx context.Context, req ba
 	}
 }
 
+type panicServerImageExtractor struct {
+	started chan struct{}
+}
+
+func (e *panicServerImageExtractor) ExtractImageText(context.Context, backend.ImageExtractRequest) (string, error) {
+	if e != nil && e.started != nil {
+		select {
+		case e.started <- struct{}{}:
+		default:
+		}
+	}
+	panic("panic image extractor")
+}
+
 func newTestTenantPool(t *testing.T) *tenant.Pool {
 	return newTestTenantPoolWithBackendOptions(t, backend.Options{})
 }
@@ -1292,6 +1306,111 @@ func TestSemanticWorkerCancelsLeaseLostImageTaskWithoutAckOrRetry(t *testing.T) 
 
 	waitForObservedLog(t, recorded, "semantic_worker_lease_lost", 2*time.Second)
 	assertNoObservedLogForTask(t, recorded, claimed.TaskID, "semantic_worker_ack_ok", "semantic_worker_ack_failed", "semantic_worker_retry_scheduled", "semantic_worker_retry_failed", "semantic_worker_dead_lettered")
+}
+
+func TestSemanticWorkerPanicStopsLeaseRenewal(t *testing.T) {
+	extractor := &panicServerImageExtractor{started: make(chan struct{}, 1)}
+	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: extractor,
+		},
+	})
+	fileID := insertServerImageFileForExtractTest(t, b, "/img/panic.png", "image/png", []byte("fake-png"))
+	payload, err := json.Marshal(semantic.ImgExtractTaskPayload{Path: "/img/panic.png", ContentType: "image/png"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := b.Store().EnqueueSemanticTask(context.Background(), &semantic.Task{
+		TaskID:          "img-task-panic",
+		TaskType:        semantic.TaskTypeImgExtractText,
+		ResourceID:      fileID,
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     now.Add(-time.Second),
+		PayloadJSON:     payload,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	leaseDuration := 80 * time.Millisecond
+	claimed, found, err := b.Store().ClaimSemanticTask(context.Background(), time.Now().UTC(), leaseDuration, semantic.TaskTypeImgExtractText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected image task to be claimable")
+	}
+
+	m := newSemanticWorkerManager(b, nil, nil, nil, SemanticWorkerOptions{LeaseDuration: leaseDuration})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	panicCh := make(chan any, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				panicCh <- r
+			}
+		}()
+		m.processTask(context.Background(), &semanticTarget{
+			tenantID: semanticLocalTenantID,
+			backend:  b,
+			store:    b.Store(),
+		}, claimed)
+	}()
+
+	select {
+	case <-extractor.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("image task did not start")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("processTask did not panic and finish")
+	}
+	select {
+	case <-panicCh:
+	default:
+		t.Fatal("expected processTask panic to be recovered in test")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		recovered, err := b.Store().RecoverExpiredSemanticTasks(context.Background(), time.Now().UTC(), 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if recovered > 0 {
+			waitForNamedTaskStatus(t, b, claimed.TaskID, string(semantic.TaskQueued), time.Second)
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("expected expired task to be recoverable after handler panic")
+}
+
+func TestSemanticTaskLeaseExecutionStopIsIdempotent(t *testing.T) {
+	e := &semanticTaskLeaseExecution{
+		ctx:    context.Background(),
+		cancel: func() {},
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
+	close(e.doneCh)
+
+	_ = e.stop()
+	_ = e.stop()
 }
 
 func TestSemanticWorkerClaimAndAckLogsIncludeTaskFields(t *testing.T) {
