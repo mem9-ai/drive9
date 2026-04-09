@@ -50,6 +50,13 @@ func TestIsNotFound_ClusterNotFound(t *testing.T) {
 	}
 }
 
+func TestIsNotFound_InstanceNotFound(t *testing.T) {
+	err := fmt.Errorf("get instance abc: %w", ErrInstanceNotFound)
+	if !IsNotFound(err) {
+		t.Fatal("expected true for ErrInstanceNotFound")
+	}
+}
+
 func TestIsNotFound_OtherError(t *testing.T) {
 	if IsNotFound(errors.New("something else")) {
 		t.Fatal("expected false for unrelated error")

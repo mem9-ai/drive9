@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -129,6 +130,11 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}); err != nil {
+		if errors.Is(err, meta.ErrDuplicate) {
+			logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_already_exists", "tenant_id", tenantID, "provider", provider)...)
+			errJSON(w, http.StatusConflict, "tenant already provisioned")
+			return
+		}
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_tenant_failed", "tenant_id", tenantID, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
 		errJSON(w, http.StatusInternalServerError, "failed to persist tenant")

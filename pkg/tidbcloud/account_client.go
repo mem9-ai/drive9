@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	accountpb "github.com/tidbcloud/account/idl/pbgen/proto/account"
-	"go.uber.org/zap"
 
 	"github.com/mem9-ai/dat9/pkg/logger"
 )
@@ -154,7 +153,7 @@ func (c *grpcAccountClient) authByAPIKey(ctx context.Context, accessKey string) 
 		}
 	}
 	if orgID == 0 {
-		logger.L().Warn("API key has no ORG scope in resource_infos", zap.String("access_key", accessKey))
+		logger.L().Warn("API key has no ORG scope in resource_infos")
 		return nil, fmt.Errorf("%w: API key has no org scope", ErrAuthForbidden)
 	}
 	apiKey := resp.GetApiKey()

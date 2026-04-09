@@ -17,7 +17,7 @@ func IsAuthError(err error) (status int, ok bool) {
 	return 0, false
 }
 
-// IsNotFound reports whether err indicates a cluster/instance was not found.
+// IsNotFound reports whether err indicates a cluster or instance was not found.
 func IsNotFound(err error) bool {
-	return errors.Is(err, ErrClusterNotFound)
+	return errors.Is(err, ErrClusterNotFound) || errors.Is(err, ErrInstanceNotFound)
 }
