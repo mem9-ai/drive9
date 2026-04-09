@@ -1,4 +1,4 @@
-package tenant
+package token
 
 import (
 	"crypto/rand"

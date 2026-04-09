@@ -16,6 +16,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 	"go.uber.org/zap"
 )
 
@@ -257,7 +258,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		return nil, nil, fmt.Errorf("open datastore: %w", err)
 	}
 	if opts.DatabaseAutoEmbedding && (t.Provider == ProviderTiDBZero || t.Provider == ProviderTiDBCloudStarter) {
-		if err := ValidateTiDBSchemaForMode(store.DB(), TiDBEmbeddingModeAuto); err != nil {
+		if err := schema.ValidateTiDBSchemaForMode(store.DB(), schema.TiDBEmbeddingModeAuto); err != nil {
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("validate tidb auto-embedding schema: %w", err)
 		}

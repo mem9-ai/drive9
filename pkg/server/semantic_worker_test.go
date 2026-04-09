@@ -28,6 +28,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/semantic"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
@@ -265,7 +266,7 @@ func TestSemanticWorkerKeepsBorrowedTenantBackendAliveDuringInvalidate(t *testin
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	tenantID := tenant.NewID()
+	tenantID := token.NewID()
 	tenantMeta := &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantActive,
@@ -447,7 +448,7 @@ func TestSemanticWorkerManagerStartsForMultiTenantImageOnlyMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	tenantID := tenant.NewID()
+	tenantID := token.NewID()
 	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantActive,
@@ -676,7 +677,7 @@ func TestSemanticWorkerListTenantRefsImageOnlyIncludesAutoProviders(t *testing.T
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	autoTenantID := tenant.NewID()
+	autoTenantID := token.NewID()
 	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
 		ID:               autoTenantID,
 		Status:           meta.TenantActive,
@@ -693,7 +694,7 @@ func TestSemanticWorkerListTenantRefsImageOnlyIncludesAutoProviders(t *testing.T
 	}); err != nil {
 		t.Fatal(err)
 	}
-	keepTenantID := tenant.NewID()
+	keepTenantID := token.NewID()
 	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
 		ID:               keepTenantID,
 		Status:           meta.TenantActive,
@@ -750,7 +751,7 @@ func TestSemanticWorkerListTenantRefsEmbedOnlySkipsAutoProviders(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	autoTenantID := tenant.NewID()
+	autoTenantID := token.NewID()
 	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
 		ID:               autoTenantID,
 		Status:           meta.TenantActive,
@@ -767,7 +768,7 @@ func TestSemanticWorkerListTenantRefsEmbedOnlySkipsAutoProviders(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	keepTenantID := tenant.NewID()
+	keepTenantID := token.NewID()
 	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
 		ID:               keepTenantID,
 		Status:           meta.TenantActive,
@@ -864,7 +865,7 @@ func TestSemanticWorkerHTTPMultiTenantImageOnlySkipsAppTenantEmbedTasks(t *testi
 		}
 		now := time.Now().UTC()
 		tenantMeta := &meta.Tenant{
-			ID:               tenant.NewID(),
+			ID:               token.NewID(),
 			Status:           meta.TenantActive,
 			DBHost:           host,
 			DBPort:           port,
@@ -880,7 +881,7 @@ func TestSemanticWorkerHTTPMultiTenantImageOnlySkipsAppTenantEmbedTasks(t *testi
 		if err := metaStore.InsertTenant(context.Background(), tenantMeta); err != nil {
 			t.Fatal(err)
 		}
-		tok, err := tenant.IssueToken(tokenSecret, tenantMeta.ID, 1)
+		tok, err := token.IssueToken(tokenSecret, tenantMeta.ID, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -889,11 +890,11 @@ func TestSemanticWorkerHTTPMultiTenantImageOnlySkipsAppTenantEmbedTasks(t *testi
 			t.Fatal(err)
 		}
 		if err := metaStore.InsertAPIKey(context.Background(), &meta.APIKey{
-			ID:            tenant.NewID(),
+			ID:            token.NewID(),
 			TenantID:      tenantMeta.ID,
 			KeyName:       provider,
 			JWTCiphertext: tokCipher,
-			JWTHash:       tenant.HashToken(tok),
+			JWTHash:       token.HashToken(tok),
 			TokenVersion:  1,
 			Status:        meta.APIKeyActive,
 			IssuedAt:      now,
@@ -981,7 +982,7 @@ func TestSemanticWorkerListTenantRefsDoesNotUseFallbackImageCapabilityForPoolTen
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	autoTenantID := tenant.NewID()
+	autoTenantID := token.NewID()
 	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
 		ID:               autoTenantID,
 		Status:           meta.TenantActive,
@@ -1219,7 +1220,7 @@ func insertServerImageFileForExtractTest(t *testing.T, b *backend.Dat9Backend, p
 
 func mustServerImageFileID(t *testing.T, b *backend.Dat9Backend, path, contentType string, data []byte) string {
 	t.Helper()
-	fileID := "file-" + tenant.NewID()
+	fileID := "file-" + token.NewID()
 	now := time.Now().UTC()
 	err := b.Store().InTx(context.Background(), func(tx *sql.Tx) error {
 		if err := b.Store().InsertFileTx(tx, &datastore.File{
@@ -1236,11 +1237,11 @@ func mustServerImageFileID(t *testing.T, b *backend.Dat9Backend, path, contentTy
 		}); err != nil {
 			return err
 		}
-		if err := b.Store().EnsureParentDirsTx(tx, path, func() string { return tenant.NewID() }); err != nil {
+		if err := b.Store().EnsureParentDirsTx(tx, path, func() string { return token.NewID() }); err != nil {
 			return err
 		}
 		return b.Store().InsertNodeTx(tx, &datastore.FileNode{
-			NodeID:     tenant.NewID(),
+			NodeID:     token.NewID(),
 			Path:       path,
 			ParentPath: pathutil.ParentPath(path),
 			Name:       pathutil.BaseName(path),

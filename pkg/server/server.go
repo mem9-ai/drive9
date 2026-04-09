@@ -21,6 +21,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/traceid"
 	"go.uber.org/zap"
 )
@@ -269,7 +270,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resolved, err := s.meta.ResolveByAPIKeyHash(r.Context(), tenant.HashToken(tok))
+	resolved, err := s.meta.ResolveByAPIKeyHash(r.Context(), token.HashToken(tok))
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_key_not_found")...)
@@ -280,7 +281,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
 		return
 	}
-	if subtle.ConstantTimeCompare([]byte(tenant.HashToken(tok)), []byte(resolved.APIKey.JWTHash)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(token.HashToken(tok)), []byte(resolved.APIKey.JWTHash)) != 1 {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_hash_mismatch", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
@@ -301,7 +302,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
-	claims, err := tenant.ParseAndVerifyToken(s.tokenSecret, tok)
+	claims, err := token.ParseAndVerifyToken(s.tokenSecret, tok)
 	if err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_token_invalid", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
@@ -1402,18 +1403,18 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	tenantID := tenant.NewID()
+	tenantID := token.NewID()
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_requested", "tenant_id", tenantID, "provider", provider)...)
 	keyName := "default"
 
-	token, err := tenant.IssueToken(s.tokenSecret, tenantID, 1)
+	apiToken, err := token.IssueToken(s.tokenSecret, tenantID, 1)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_issue_token_failed", "tenant_id", tenantID, "error", err)...)
 		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 		errJSON(w, http.StatusInternalServerError, "failed to issue token")
 		return
 	}
-	hash := tenant.HashToken(token)
+	hash := token.HashToken(apiToken)
 	now := time.Now().UTC()
 	cluster, err := s.provisioner.Provision(r.Context(), tenantID)
 	if err != nil {
@@ -1431,7 +1432,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "failed to encrypt db password")
 		return
 	}
-	cipherToken, err := s.pool.Encrypt(r.Context(), []byte(token))
+	cipherToken, err := s.pool.Encrypt(r.Context(), []byte(apiToken))
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_encrypt_api_key_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
@@ -1463,7 +1464,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metricEvent(r.Context(), "metadb_query", "api", "insert_tenant", "result", "ok")
-	apiKeyID := tenant.NewID()
+	apiKeyID := token.NewID()
 	if err := s.meta.InsertAPIKey(r.Context(), &meta.APIKey{
 		ID:            apiKeyID,
 		TenantID:      tenantID,
@@ -1493,7 +1494,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"api_key": token,
+		"api_key": apiToken,
 		"status":  string(meta.TenantProvisioning),
 	})
 }
