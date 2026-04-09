@@ -69,6 +69,47 @@ func (r *shortUploadReader) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
+func TestUploadBufferPoolRestoresFullLengthOnPut(t *testing.T) {
+	pool := newUploadBufferPool(8, 1)
+
+	buf, err := pool.get(context.Background())
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(buf) != 8 {
+		t.Fatalf("initial len = %d, want 8", len(buf))
+	}
+
+	pool.put(buf[:3])
+
+	buf, err = pool.get(context.Background())
+	if err != nil {
+		t.Fatalf("second get: %v", err)
+	}
+	if len(buf) != 8 {
+		t.Fatalf("restored len = %d, want 8", len(buf))
+	}
+}
+
+func TestUploadBufferPoolGetHonorsContextCancel(t *testing.T) {
+	pool := newUploadBufferPool(4, 1)
+	buf, err := pool.get(context.Background())
+	if err != nil {
+		t.Fatalf("initial get: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := pool.get(ctx); err == nil {
+		t.Fatal("expected canceled get to fail")
+	} else if err != context.Canceled {
+		t.Fatalf("canceled get error = %v, want %v", err, context.Canceled)
+	}
+
+	pool.put(buf)
+}
+
 // TestWriteStreamSmallFile verifies that WriteStream sends a small file via single direct PUT.
 func TestWriteStreamSmallFile(t *testing.T) {
 	var writtenData []byte

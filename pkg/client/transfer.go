@@ -118,6 +118,11 @@ type readTarget struct {
 	objectURL string
 }
 
+type uploadBufferPool struct {
+	size int64
+	ch   chan []byte
+}
+
 func uploadParallelism(partSize int64) int {
 	if partSize <= 0 {
 		partSize = s3client.PartSize
@@ -138,6 +143,36 @@ func checksumParallelism(partSize int64, partCount int) int {
 		byMemory = 1
 	}
 	return min(runtime.GOMAXPROCS(0), partCount, byMemory)
+}
+
+func newUploadBufferPool(bufferSize int64, count int) *uploadBufferPool {
+	if bufferSize <= 0 {
+		bufferSize = s3client.PartSize
+	}
+	if count < 1 {
+		count = 1
+	}
+	ch := make(chan []byte, count)
+	for i := 0; i < count; i++ {
+		ch <- make([]byte, bufferSize)
+	}
+	return &uploadBufferPool{size: bufferSize, ch: ch}
+}
+
+func (p *uploadBufferPool) get(ctx context.Context) ([]byte, error) {
+	select {
+	case buf := <-p.ch:
+		return buf[:p.size], nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (p *uploadBufferPool) put(buf []byte) {
+	if buf == nil {
+		return
+	}
+	p.ch <- buf[:p.size]
 }
 
 // WriteStream uploads data from a reader. For small files (size < threshold),
@@ -318,6 +353,7 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 		stdPartSize = s3client.PartSize
 	}
 	maxConcurrency := uploadParallelism(stdPartSize)
+	bufferPool := newUploadBufferPool(stdPartSize, maxConcurrency)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -348,7 +384,13 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			data := make([]byte, p.Size)
+			fullBuf, err := bufferPool.get(ctx)
+			if err != nil {
+				return
+			}
+			defer bufferPool.put(fullBuf)
+
+			data := fullBuf[:p.Size]
 			offset := int64(p.Number-1) * stdPartSize
 			n, err := ra.ReadAt(data, offset)
 			if err != nil && err != io.EOF {
@@ -379,7 +421,7 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 			}
 
 			if progress != nil {
-				progress(p.Number, len(plan.Parts), int64(len(data)))
+				progress(p.Number, len(plan.Parts), p.Size)
 			}
 		}(part)
 	}
@@ -565,6 +607,7 @@ func (c *Client) uploadPartsV2(ctx context.Context, plan *uploadPlanV2, ra io.Re
 	presignCh <-chan presignedPart, presignErrCh <-chan error, progress ProgressFunc) ([]completePart, error) {
 
 	parallelism := uploadParallelism(plan.PartSize)
+	bufferPool := newUploadBufferPool(plan.PartSize, parallelism)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -604,7 +647,13 @@ func (c *Client) uploadPartsV2(ctx context.Context, plan *uploadPlanV2, ra io.Re
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			data := make([]byte, p.Size)
+			fullBuf, err := bufferPool.get(ctx)
+			if err != nil {
+				return
+			}
+			defer bufferPool.put(fullBuf)
+
+			data := fullBuf[:p.Size]
 			offset := int64(p.Number-1) * plan.PartSize
 			n, err := ra.ReadAt(data, offset)
 			if err != nil && err != io.EOF {
@@ -650,7 +699,7 @@ func (c *Client) uploadPartsV2(ctx context.Context, plan *uploadPlanV2, ra io.Re
 			results[p.Number-1] = completePart{Number: p.Number, ETag: etag}
 
 			if progress != nil {
-				progress(p.Number, plan.TotalParts, int64(len(data)))
+				progress(p.Number, plan.TotalParts, p.Size)
 			}
 		}(pp)
 	}
@@ -1273,6 +1322,7 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 		stdPartSize = s3client.PartSize
 	}
 	maxConcurrency := uploadParallelism(stdPartSize)
+	bufferPool := newUploadBufferPool(stdPartSize, maxConcurrency)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1302,7 +1352,13 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			data := make([]byte, p.Size)
+			fullBuf, err := bufferPool.get(ctx)
+			if err != nil {
+				return
+			}
+			defer bufferPool.put(fullBuf)
+
+			data := fullBuf[:p.Size]
 			offset := int64(p.Number-1) * stdPartSize
 			n, err := r.ReadAt(data, offset)
 			if err != nil && err != io.EOF {
@@ -1332,7 +1388,7 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 				return
 			}
 			if progress != nil {
-				progress(p.Number, totalParts, int64(len(data)))
+				progress(p.Number, totalParts, p.Size)
 			}
 		}(part)
 	}
