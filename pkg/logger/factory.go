@@ -19,16 +19,34 @@ func CLIEnabled() bool {
 	return envBool("DRIVE9_CLI_LOG_ENABLED", false)
 }
 
-func NewCLILogger() (*zap.Logger, error) {
+func CLILogDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, fmt.Errorf("resolve home: %w", err)
+		return "", fmt.Errorf("resolve home: %w", err)
 	}
-	logDir := filepath.Join(home, ".dat", "log")
+	return filepath.Join(home, ".drive9", "cli"), nil
+}
+
+func CLILogPath() (string, error) {
+	logDir, err := CLILogDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(logDir, "drive9-cli.log"), nil
+}
+
+func NewCLILogger() (*zap.Logger, error) {
+	logDir, err := CLILogDir()
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create log dir: %w", err)
 	}
-	logPath := filepath.Join(logDir, "dat9-cli.log")
+	logPath, err := CLILogPath()
+	if err != nil {
+		return nil, err
+	}
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open log file: %w", err)

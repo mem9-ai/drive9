@@ -112,7 +112,11 @@ func TestDownloadFileEmitsDownloadSummaryToCLILogForLargeFile(t *testing.T) {
 		t.Fatalf("Sync(cli log): %v", err)
 	}
 
-	logBytes, err := os.ReadFile(filepath.Join(homeDir, ".dat", "log", "dat9-cli.log"))
+	logPath, err := logger.CLILogPath()
+	if err != nil {
+		t.Fatalf("CLILogPath: %v", err)
+	}
+	logBytes, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatalf("ReadFile(cli log): %v", err)
 	}
@@ -159,7 +163,10 @@ func TestDownloadFileSkipsDownloadSummaryWhenCLILogDisabled(t *testing.T) {
 		t.Fatalf("Sync(cli log): %v", err)
 	}
 
-	logPath := filepath.Join(homeDir, ".dat", "log", "dat9-cli.log")
+	logPath, err := logger.CLILogPath()
+	if err != nil {
+		t.Fatalf("CLILogPath: %v", err)
+	}
 	logBytes, err := os.ReadFile(logPath)
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("ReadFile(cli log): %v", err)
