@@ -1,0 +1,25 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 * * * *' # every hour
+  workflow_dispatch: # allow manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync upstream
+        run: |
+          git remote add upstream https://github.com/mem9-ai/drive9.git || true
+          git fetch upstream
+          git checkout main
+          git merge upstream/main --no-edit
+          git push origin main
