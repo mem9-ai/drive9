@@ -401,10 +401,11 @@ func (s *Store) RenewSemanticTask(ctx context.Context, taskID, receipt string, l
 	if rowsAffected > 0 {
 		return leaseUntil, nil
 	}
-	if err := s.semanticTaskLeaseError(ctx, taskID); err != nil {
-		return time.Time{}, err
+	err = s.semanticTaskLeaseError(ctx, taskID)
+	if err == nil {
+		err = semantic.ErrTaskLeaseMismatch
 	}
-	return time.Time{}, nil
+	return time.Time{}, err
 }
 
 // RetrySemanticTask requeues or dead-letters a leased semantic task.
