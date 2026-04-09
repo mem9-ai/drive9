@@ -1,0 +1,121 @@
+name: Drive9 Dev CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'The region to deploy to'
+        required: true
+        default: '*'
+        type: string
+
+jobs:
+  build:
+    name: Build
+    runs-on: self-hosted
+    outputs:
+      image: ${{ steps.docker-build-push.outputs.image }}
+      tag: ${{ steps.image-tag.outputs.tag }}
+    env:
+      ECR_REPO: tidbcloud/drive9-server
+      IMAGE_NAME: drive9-server
+      AWS_ROLE_ARN: ${{ secrets.DBAAS_DEV_AWS_ROLE }}
+      AWS_REGION: us-west-2
+    permissions:
+      contents: "read"
+      id-token: "write"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          token: ${{ secrets.GIT_ACTION_BOT }}
+
+      - name: Checkout agfs dependency
+        run: |
+          git clone --depth 1 https://${{ secrets.GIT_ACTION_BOT }}@github.com/c4pt0r/agfs ../agfs
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+        env:
+          GOPRIVATE: "github.com/tidbcloud,github.com/pingcap/dbaas"
+
+      - name: Configure git for private modules
+        env:
+          TOKEN: ${{ secrets.GIT_ACTION_BOT }}
+        run: git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Compute image tag
+        id: image-tag
+        run: |
+          REF_NAME=${{ github.ref_name }}
+          REF_NAME=${REF_NAME/\//-}
+          echo "tag=${REF_NAME}-${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build server binary
+        run: make build-server GOOS=linux GOARCH=amd64
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: docker-build-push
+        run: |
+          FULL_IMAGE=${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.image-tag.outputs.tag }}
+          docker build -t ${FULL_IMAGE} .
+          docker push ${FULL_IMAGE}
+          echo "image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+
+  setup:
+    runs-on: self-hosted
+    outputs:
+      region: ${{ steps.prepare-region.outputs.region }}
+    steps:
+      - name: Define region to deploy
+        id: prepare-region
+        run: |
+          if [[ "${{ github.event.inputs.region }}" == "" ]]; then
+            echo 'region=["*"]' >> "$GITHUB_OUTPUT"
+          else
+            input="${{ github.event.inputs.region }}"
+            echo "region=[\"${input//,/\",\"}\"]" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    name: Deploy
+    needs: [build, setup]
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        region: ${{ fromJSON(needs.setup.outputs.region) }}
+    steps:
+      - name: Get PR number
+        id: pr-number
+        run: |
+          out=$(curl -s -u tidbcloud-bot:${{ secrets.GIT_ACTION_BOT }} \
+            -H "Accept: application/vnd.github.groot-preview+json" \
+            "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
+            | jq '.[].number')
+          echo "pr=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version in app-delivery repo
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: bump-drive9-version.yaml
+          repo: tidbcloud/app-delivery
+          ref: refs/heads/main
+          token: ${{ secrets.GIT_ACTION_BOT }}
+          inputs: '{"version": "${{ needs.build.outputs.tag }}", "env": "dev", "region": "${{ matrix.region }}", "url": "https://github.com/${{ github.repository }}/pull/${{ steps.pr-number.outputs.pr }}", "author": "${{ github.actor }}" }'
