@@ -1,4 +1,4 @@
-package tenant
+package schema
 
 // InitTiDBTenantSchema initializes the TiDB launch schema baseline with the
 // shared database-managed auto-embedding contract used by TiDB tenants.
@@ -11,14 +11,10 @@ func InitTiDBTenantSchema(dsn string) error {
 func InitTiDBTenantSchemaForMode(dsn string, mode TiDBEmbeddingMode) error {
 	switch mode {
 	case TiDBEmbeddingModeAuto:
-		return initZeroSchema(dsn)
+		return initTiDBAutoEmbeddingSchema(dsn)
 	case TiDBEmbeddingModeApp:
 		return initTiDBAppEmbeddingSchema(dsn)
 	default:
 		return validateTiDBSchemaMode(mode)
 	}
-}
-
-func initZeroSchema(dsn string) error {
-	return initTiDBAutoEmbeddingSchema(dsn)
 }

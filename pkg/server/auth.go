@@ -11,6 +11,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/token"
 )
 
 type scopeKey int
@@ -43,7 +44,7 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			return
 		}
 
-		resolved, err := metaStore.ResolveByAPIKeyHash(r.Context(), tenant.HashToken(tok))
+		resolved, err := metaStore.ResolveByAPIKeyHash(r.Context(), token.HashToken(tok))
 		if err != nil {
 			if errors.Is(err, meta.ErrNotFound) {
 				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_key_not_found")...)
@@ -57,7 +58,7 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			return
 		}
 
-		if subtle.ConstantTimeCompare([]byte(tenant.HashToken(tok)), []byte(resolved.APIKey.JWTHash)) != 1 {
+		if subtle.ConstantTimeCompare([]byte(token.HashToken(tok)), []byte(resolved.APIKey.JWTHash)) != 1 {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_hash_mismatch", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID)...)
 			metricEvent(r.Context(), "auth", "result", "hash_mismatch")
 			errJSON(w, http.StatusUnauthorized, "invalid API key")
@@ -85,7 +86,7 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			return
 		}
 
-		claims, err := tenant.ParseAndVerifyToken(tokenSecret, tok)
+		claims, err := token.ParseAndVerifyToken(tokenSecret, tok)
 		if err != nil {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_token_invalid", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 			metricEvent(r.Context(), "auth", "result", "token_invalid")

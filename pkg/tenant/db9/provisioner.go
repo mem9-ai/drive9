@@ -1,4 +1,4 @@
-package tenant
+package db9
 
 import (
 	"bytes"
@@ -10,6 +10,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/tenant"
 )
 
 const (
@@ -17,28 +19,28 @@ const (
 	envDB9APIKey = "DRIVE9_DB9_API_KEY"
 )
 
-type DB9Provisioner struct {
+type Provisioner struct {
 	baseURL string
 	apiKey  string
 	client  *http.Client
 }
 
-func NewDB9ProvisionerFromEnv() (*DB9Provisioner, error) {
+func NewProvisionerFromEnv() (*Provisioner, error) {
 	base := os.Getenv(envDB9APIURL)
 	key := os.Getenv(envDB9APIKey)
 	if base == "" || key == "" {
 		return nil, fmt.Errorf("%s and %s are required", envDB9APIURL, envDB9APIKey)
 	}
-	return &DB9Provisioner{baseURL: strings.TrimRight(base, "/"), apiKey: key, client: &http.Client{Timeout: 30 * time.Second}}, nil
+	return &Provisioner{baseURL: strings.TrimRight(base, "/"), apiKey: key, client: &http.Client{Timeout: 30 * time.Second}}, nil
 }
 
-func (p *DB9Provisioner) ProviderType() string { return ProviderDB9 }
+func (p *Provisioner) ProviderType() string { return tenant.ProviderDB9 }
 
-func (p *DB9Provisioner) InitSchema(_ context.Context, dsn string) error {
+func (p *Provisioner) InitSchema(_ context.Context, dsn string) error {
 	return initDB9Schema(dsn)
 }
 
-func (p *DB9Provisioner) Provision(ctx context.Context, tenantID string) (*ClusterInfo, error) {
+func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.ClusterInfo, error) {
 	type reqBody struct {
 		TenantID string `json:"tenant_id"`
 	}
@@ -74,7 +76,7 @@ func (p *DB9Provisioner) Provision(ctx context.Context, tenantID string) (*Clust
 	if out.Host == "" || out.Port == 0 || out.Username == "" || out.Password == "" || out.DBName == "" {
 		return nil, fmt.Errorf("db9 response missing required connection fields")
 	}
-	return &ClusterInfo{
+	return &tenant.ClusterInfo{
 		TenantID:  tenantID,
 		ClusterID: out.ClusterID,
 		Host:      out.Host,
@@ -82,6 +84,6 @@ func (p *DB9Provisioner) Provision(ctx context.Context, tenantID string) (*Clust
 		Username:  out.Username,
 		Password:  out.Password,
 		DBName:    out.DBName,
-		Provider:  ProviderDB9,
+		Provider:  tenant.ProviderDB9,
 	}, nil
 }

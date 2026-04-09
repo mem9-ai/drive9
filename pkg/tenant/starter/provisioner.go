@@ -1,4 +1,5 @@
-package tenant
+// Package starter implements the TiDB Cloud Starter tenant provisioner.
+package starter
 
 import (
 	"bytes"
@@ -13,6 +14,9 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
 
 const (
@@ -22,7 +26,7 @@ const (
 	envTiDBPoolID    = "DRIVE9_TIDBCLOUD_POOL_ID"
 )
 
-type StarterProvisioner struct {
+type Provisioner struct {
 	apiURL    string
 	apiKey    string
 	apiSecret string
@@ -30,7 +34,7 @@ type StarterProvisioner struct {
 	client    *http.Client
 }
 
-func NewStarterProvisionerFromEnv() (*StarterProvisioner, error) {
+func NewProvisionerFromEnv() (*Provisioner, error) {
 	apiURL := os.Getenv(envTiDBAPIURL)
 	apiKey := os.Getenv(envTiDBAPIKey)
 	apiSecret := os.Getenv(envTiDBAPISecret)
@@ -38,7 +42,7 @@ func NewStarterProvisionerFromEnv() (*StarterProvisioner, error) {
 	if apiURL == "" || apiKey == "" || apiSecret == "" || poolID == "" {
 		return nil, fmt.Errorf("%s, %s, %s and %s are required", envTiDBAPIURL, envTiDBAPIKey, envTiDBAPISecret, envTiDBPoolID)
 	}
-	return &StarterProvisioner{
+	return &Provisioner{
 		apiURL:    strings.TrimRight(apiURL, "/"),
 		apiKey:    apiKey,
 		apiSecret: apiSecret,
@@ -47,15 +51,15 @@ func NewStarterProvisionerFromEnv() (*StarterProvisioner, error) {
 	}, nil
 }
 
-func (p *StarterProvisioner) ProviderType() string { return ProviderTiDBCloudStarter }
+func (p *Provisioner) ProviderType() string { return tenant.ProviderTiDBCloudStarter }
 
 // InitSchema validates the externally provisioned Starter schema against the
 // shared TiDB auto-embedding launch contract without creating or altering data.
-func (p *StarterProvisioner) InitSchema(_ context.Context, dsn string) error {
-	return validateTiDBSchemaForModeDSN(dsn, TiDBEmbeddingModeAuto)
+func (p *Provisioner) InitSchema(_ context.Context, dsn string) error {
+	return schema.ValidateTiDBSchemaForModeDSN(dsn, schema.TiDBEmbeddingModeAuto)
 }
 
-func (p *StarterProvisioner) Provision(ctx context.Context, tenantID string) (*ClusterInfo, error) {
+func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.ClusterInfo, error) {
 	password, err := generateRandomPassword(24)
 	if err != nil {
 		return nil, err
@@ -89,7 +93,7 @@ func (p *StarterProvisioner) Provision(ctx context.Context, tenantID string) (*C
 		return nil, fmt.Errorf("starter response missing endpoint")
 	}
 
-	return &ClusterInfo{
+	return &tenant.ClusterInfo{
 		TenantID:  tenantID,
 		ClusterID: out.ClusterID,
 		Host:      out.Endpoints.Public.Host,
@@ -97,11 +101,11 @@ func (p *StarterProvisioner) Provision(ctx context.Context, tenantID string) (*C
 		Username:  out.UserPrefix + ".root",
 		Password:  password,
 		DBName:    "test",
-		Provider:  ProviderTiDBCloudStarter,
+		Provider:  tenant.ProviderTiDBCloudStarter,
 	}, nil
 }
 
-func (p *StarterProvisioner) doDigestAuthRequest(ctx context.Context, method, uri string, body []byte) (*http.Response, error) {
+func (p *Provisioner) doDigestAuthRequest(ctx context.Context, method, uri string, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, uri, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
