@@ -925,6 +925,52 @@ func TestDownloadToFileWithSummaryFailsWhenRangeNotHonored(t *testing.T) {
 	}
 }
 
+func TestDownloadToFileWithSummaryFallsBackWhenReadPathDoesNotRedirect(t *testing.T) {
+	data := bytes.Repeat([]byte("q"), downloadParallelThreshold+17)
+
+	var readRequests atomic.Int32
+	var objectRequests atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/large.bin":
+			readRequests.Add(1)
+			_, _ = w.Write(data)
+		case "/s3/presigned":
+			objectRequests.Add(1)
+			http.Error(w, "unexpected object request", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	localPath := filepath.Join(t.TempDir(), "large.bin")
+	c := New(srv.URL, "")
+
+	summary, err := c.DownloadToFileWithSummary(context.Background(), "/large.bin", localPath, int64(len(data)))
+	if err != nil {
+		t.Fatalf("DownloadToFileWithSummary: %v", err)
+	}
+	if summary != nil {
+		t.Fatalf("expected nil summary when falling back to sequential download, got %+v", summary)
+	}
+	if got := readRequests.Load(); got != 2 {
+		t.Fatalf("expected one resolve attempt plus one sequential read, got %d requests", got)
+	}
+	if got := objectRequests.Load(); got != 0 {
+		t.Fatalf("expected no object storage requests, got %d", got)
+	}
+
+	downloaded, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(downloaded, data) {
+		t.Fatal("downloaded file content mismatch")
+	}
+}
+
 func TestDownloadToFileWithSummarySmallFileUsesSequentialPath(t *testing.T) {
 	var readRequests atomic.Int32
 	data := []byte("small content")

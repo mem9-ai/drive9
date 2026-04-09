@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -93,6 +94,8 @@ const (
 	downloadChunkSize         = 8 << 20
 	downloadMaxConcurrency    = 8
 )
+
+var errReadTargetNoRedirect = errors.New("parallel download unavailable without redirect")
 
 // DownloadSummary exposes the coarse-grained large-file download metrics that
 // the CLI emits as a structured log event when CLI logging is enabled.
@@ -925,8 +928,18 @@ func (c *Client) resolveReadTarget(ctx context.Context, path string) (*readTarge
 		return nil, readError(resp)
 
 	default:
-		return nil, fmt.Errorf("expected redirect for large download path %q, got HTTP %d", path, resp.StatusCode)
+		return nil, errReadTargetNoRedirect
 	}
+}
+
+func (c *Client) downloadToFileSequential(ctx context.Context, remotePath string, out *os.File) (*DownloadSummary, error) {
+	rc, err := c.ReadStream(ctx, remotePath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }()
+	_, err = io.Copy(out, rc)
+	return nil, err
 }
 
 // ReadStreamRange reads a byte range from a remote file. For large files the
@@ -1062,20 +1075,26 @@ func (c *Client) DownloadToFileWithSummary(ctx context.Context, remotePath, loca
 	defer func() { _ = out.Close() }()
 
 	if size < downloadParallelThreshold {
-		rc, err := c.ReadStream(ctx, remotePath)
-		if err != nil {
-			return nil, err
-		}
-		defer func() { _ = rc.Close() }()
-		_, err = io.Copy(out, rc)
-		return nil, err
+		return c.downloadToFileSequential(ctx, remotePath, out)
 	}
 
+	target, err := c.resolveReadTarget(ctx, remotePath)
+	if err != nil {
+		if errors.Is(err, errReadTargetNoRedirect) {
+			// Keep large-file downloads working when the control plane serves the
+			// object inline instead of redirecting to object storage. In that case
+			// the parallel range path is unavailable, so fall back to ReadStream.
+			return c.downloadToFileSequential(ctx, remotePath, out)
+		}
+		return nil, err
+	}
 	if err := out.Truncate(size); err != nil {
 		return nil, fmt.Errorf("preallocate %s: %w", localPath, err)
 	}
-
-	summary, err := c.downloadLargeFileParallel(ctx, remotePath, localPath, out, size)
+	// The current failure semantics intentionally keep the partially written
+	// destination file on disk when a parallel range worker fails. Follow-up:
+	// #141.
+	summary, err := c.downloadLargeFileParallel(ctx, remotePath, localPath, out, size, target)
 	if err != nil {
 		return nil, err
 	}
@@ -1085,7 +1104,7 @@ func (c *Client) DownloadToFileWithSummary(ctx context.Context, remotePath, loca
 	return summary, nil
 }
 
-func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, localPath string, out *os.File, size int64) (*DownloadSummary, error) {
+func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, localPath string, out *os.File, size int64, target *readTarget) (*DownloadSummary, error) {
 	// Resolve the presigned object URL once, then reuse it for all range GETs in
 	// this download. This avoids paying one redirect / presign round-trip per
 	// chunk while keeping the existing server contract unchanged.
@@ -1094,10 +1113,6 @@ func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, loca
 	// download. We do not capture ETag / VersionId at resolve time or attach
 	// If-Match on per-range GETs, so cross-range consistency is best-effort.
 	// Follow-up: #139.
-	target, err := c.resolveReadTarget(ctx, remotePath)
-	if err != nil {
-		return nil, err
-	}
 
 	rangeCount := int((size + downloadChunkSize - 1) / downloadChunkSize)
 	concurrency := min(downloadMaxConcurrency, rangeCount)
