@@ -24,8 +24,14 @@ type prefetchBlock struct {
 
 // Prefetcher detects sequential read patterns and prefetches upcoming data
 // blocks in the background, reducing HTTP round-trips for large file reads.
-// It is NOT thread-safe; callers must hold the FileHandle mutex for Get/OnRead,
-// but background goroutines manage their own synchronization.
+//
+// Concurrency: Prefetcher is fully self-synchronized via p.mu.
+// Callers do NOT need to hold any external lock.
+// Lock ordering (if relevant): FileHandle.mu → Prefetcher.mu.
+//
+// Eviction: uses smallest-offset eviction, optimised for forward sequential
+// reads (e.g. cat, cp). Reverse reads will thrash the cache — this is
+// acceptable since the common case is forward streaming.
 type Prefetcher struct {
 	mu         sync.Mutex
 	nextExpect int64 // next expected offset (for sequential detection)

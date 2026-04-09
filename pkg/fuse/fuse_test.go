@@ -608,7 +608,8 @@ func TestDirCache_InvalidateAll(t *testing.T) {
 func TestWriteBuffer_LazyLoad_WriteTriggersLoad(t *testing.T) {
 	// Simulate a 2-part file where LoadPart provides the existing data.
 	wb := NewWriteBuffer("/test", 0, DefaultPartSize)
-	wb.totalSize = DefaultPartSize * 2 // pretend file is 16MB
+	wb.totalSize = DefaultPartSize * 2  // pretend file is 16MB
+	wb.remoteSize = DefaultPartSize * 2 // remote file is the same size
 
 	loadCalls := 0
 	wb.LoadPart = func(partNum int) ([]byte, error) {

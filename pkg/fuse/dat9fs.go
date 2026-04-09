@@ -153,7 +153,9 @@ func (fs *Dat9FS) preloadWritableHandle(fh *FileHandle) gofuse.Status {
 
 	// Large files: lazy preload — only Stat() now, load parts on demand.
 	// Set totalSize so the buffer knows the file extent, but don't load data.
+	// Set remoteSize so ensurePart() knows which parts exist on the server.
 	fh.Dirty.totalSize = stat.Size
+	fh.Dirty.remoteSize = stat.Size
 
 	// Install lazy loader: loads a single part from the server via range read.
 	c := fs.client

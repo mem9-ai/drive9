@@ -145,7 +145,7 @@ func (sw *StreamWriter) WritePart(ctx context.Context, partNum int, data []byte)
 // If finalPartData is nil, no additional part is uploaded.
 func (sw *StreamWriter) Complete(ctx context.Context, finalPartNum int, finalPartData []byte) error {
 	// Upload final part synchronously if provided
-	if finalPartData != nil && len(finalPartData) > 0 {
+	if len(finalPartData) > 0 {
 		sw.mu.Lock()
 		if sw.err != nil {
 			err := sw.err

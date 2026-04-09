@@ -38,6 +38,12 @@ type WriteBuffer struct {
 	OnPartReady OnPartReadyFunc // called when a part is fully written
 	LoadPart    LoadPartFunc    // called to lazily load part data
 
+	// remoteSize is the original remote file size, set when lazy loading
+	// is configured. ensurePart() only calls LoadPart for parts whose
+	// start offset < remoteSize. Parts beyond this are new (zero-filled).
+	// Zero means "no remote data" (e.g. new file or eager-loaded file).
+	remoteSize int64
+
 	// Memory tracking
 	curMemory int64 // current bytes held in parts map
 }
@@ -154,11 +160,10 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 		return nil
 	}
 
-	// Try lazy load
+	// Try lazy load — only for parts that exist in the remote file.
 	if wb.LoadPart != nil {
 		partStart := int64(partIdx) * wb.partSize
-		// Only load if the remote file actually has data in this range
-		if partStart < wb.origSize() {
+		if partStart < wb.remoteSize {
 			data, err := wb.LoadPart(partIdx + 1) // 1-based
 			if err != nil {
 				return err
@@ -174,21 +179,6 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 	return nil
 }
 
-// origSize returns the original file size for lazy load decisions.
-// For files opened without lazy loading, this returns 0 (no remote parts to load).
-func (wb *WriteBuffer) origSize() int64 {
-	// If LoadPart is set, the totalSize at buffer creation represents
-	// the original remote file size. Parts beyond that are new.
-	// We track this via the OrigSize field on FileHandle, but WriteBuffer
-	// doesn't have direct access. Instead, LoadPart itself knows whether
-	// the part exists remotely — if it doesn't, it returns empty data.
-	// So we can always try loading and let the callback handle it.
-	// Return a large value to always try the callback when set.
-	if wb.LoadPart != nil {
-		return 1<<63 - 1
-	}
-	return 0
-}
 
 // markDirty marks all parts that overlap with [start, end) as dirty.
 func (wb *WriteBuffer) markDirty(start, end int64) {

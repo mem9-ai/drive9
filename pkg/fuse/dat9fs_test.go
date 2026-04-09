@@ -209,7 +209,7 @@ func TestOpenReadOnlyLargeFileGetsPrefetcher(t *testing.T) {
 	}
 
 	fs, ino, cleanup := newTestDat9FS(t, size, func(w http.ResponseWriter, r *http.Request) {
-		w.Write(data)
+		_, _ = w.Write(data)
 	})
 	defer cleanup()
 
@@ -237,7 +237,7 @@ func TestOpenWritableLargeFileGetsLazyPreload(t *testing.T) {
 
 	fs, ino, cleanup := newTestDat9FS(t, size, func(w http.ResponseWriter, r *http.Request) {
 		getCalled = true
-		w.Write(make([]byte, size))
+		_, _ = w.Write(make([]byte, size))
 	})
 	defer cleanup()
 
@@ -280,7 +280,7 @@ func TestDefaultTTLIs60Seconds(t *testing.T) {
 
 func TestLookupReturnsTTLInEntryOut(t *testing.T) {
 	fs, _, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
-		w.Write(make([]byte, 42))
+		_, _ = w.Write(make([]byte, 42))
 	})
 	defer cleanup()
 
