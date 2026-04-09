@@ -16,6 +16,6 @@ Please answer these questions before submitting your issue. Thanks!
 
 ### 3. What did you see instead (Required)
 
-### 4. What is your TiDB version? (Required)
+### 4. What is your drive9 version? (Required)
 
-<!-- Paste the output of SELECT tidb_version() -->
+<!-- Paste the output of `drive9 version`. -->
