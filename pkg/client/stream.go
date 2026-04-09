@@ -32,6 +32,7 @@ type StreamWriter struct {
 	started   bool
 	completed bool
 	aborted   bool
+	closing   bool // set before Wait() in Complete/Abort to reject new WritePart
 
 	sem chan struct{} // concurrency limiter
 }
@@ -90,6 +91,10 @@ func (sw *StreamWriter) WritePart(ctx context.Context, partNum int, data []byte)
 	if sw.aborted {
 		sw.mu.Unlock()
 		return fmt.Errorf("stream writer already aborted")
+	}
+	if sw.closing {
+		sw.mu.Unlock()
+		return fmt.Errorf("stream writer is closing")
 	}
 
 	// Lazy init
@@ -158,10 +163,7 @@ func (sw *StreamWriter) WritePart(ctx context.Context, partNum int, data []byte)
 // finalPartNum/finalPartData can be used for the last (possibly partial) part.
 // If finalPartData is empty, no additional part is uploaded.
 func (sw *StreamWriter) Complete(ctx context.Context, finalPartNum int, finalPartData []byte) error {
-	// Wait for all background parts first — they may still be calling Add(1)
-	// inside WritePart's mutex section, so we must not hold the lock here.
-	sw.inflight.Wait()
-
+	// Seal the writer first so no new WritePart calls can sneak in.
 	sw.mu.Lock()
 	if sw.completed {
 		sw.mu.Unlock()
@@ -171,6 +173,17 @@ func (sw *StreamWriter) Complete(ctx context.Context, finalPartNum int, finalPar
 		sw.mu.Unlock()
 		return fmt.Errorf("stream writer already aborted")
 	}
+	if sw.closing {
+		sw.mu.Unlock()
+		return fmt.Errorf("stream writer is closing")
+	}
+	sw.closing = true
+	sw.mu.Unlock()
+
+	// Now wait — no new WritePart can pass the closing check above.
+	sw.inflight.Wait()
+
+	sw.mu.Lock()
 	if sw.err != nil {
 		err := sw.err
 		sw.mu.Unlock()
@@ -231,14 +244,20 @@ func (sw *StreamWriter) Complete(ctx context.Context, finalPartNum int, finalPar
 // Waits for inflight parts to finish before aborting.
 // After Abort, no further WritePart or Complete calls are accepted.
 func (sw *StreamWriter) Abort(ctx context.Context) error {
+	// Seal the writer so no new WritePart calls can start.
+	sw.mu.Lock()
+	if sw.aborted {
+		sw.mu.Unlock()
+		return nil // already aborted
+	}
+	sw.closing = true
+	sw.mu.Unlock()
+
 	sw.inflight.Wait()
 
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 
-	if sw.aborted {
-		return nil // already aborted
-	}
 	sw.aborted = true
 
 	if !sw.started || sw.plan == nil {

@@ -424,6 +424,7 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Invalidate(parentPath)
+	fs.notifyEntry(input.NodeId, name)
 	// Invalidate kernel's cached directory listing for parent.
 	fs.notifyInode(input.NodeId)
 
@@ -701,6 +702,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Invalidate(parentPath)
+	fs.notifyEntry(input.NodeId, name)
 	// Invalidate kernel's cached directory listing for parent.
 	fs.notifyInode(input.NodeId)
 	return gofuse.OK
@@ -818,6 +820,21 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		}
 
 		if !touchesEvicted {
+			// Ensure parts touched by this read are loaded from the server
+			// before calling ReadAt. Without this, ReadAt returns zeros for
+			// unloaded parts in lazily-loaded files.
+			ps := fh.Dirty.PartSize()
+			firstPart := int(offset / ps)
+			lastPart := int((end - 1) / ps)
+			for p := firstPart; p <= lastPart; p++ {
+				if !fh.Dirty.IsPartLoaded(p) {
+					if err := fh.Dirty.EnsureLoaded(p); err != nil {
+						fh.Unlock()
+						return nil, gofuse.EIO
+					}
+				}
+			}
+
 			result := make([]byte, end-offset)
 			fh.Dirty.ReadAt(offset, result)
 			fh.Unlock()

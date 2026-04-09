@@ -5,6 +5,7 @@ import (
 	"log"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -132,7 +133,9 @@ func (su *StreamUploader) FinishStreaming(ctx context.Context, totalSize int64,
 		sw := su.writer
 		su.mu.Unlock()
 		if sw != nil {
-			_ = sw.Abort(ctx)
+			abortCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_ = sw.Abort(abortCtx)
+			cancel()
 		}
 		return err
 	}
@@ -146,7 +149,9 @@ func (su *StreamUploader) FinishStreaming(ctx context.Context, totalSize int64,
 	// Re-upload dirty (back-written) parts
 	for pn, data := range dirtyParts {
 		if err := sw.WritePart(ctx, pn, data); err != nil {
-			_ = sw.Abort(ctx)
+			abortCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_ = sw.Abort(abortCtx)
+			cancel()
 			return err
 		}
 	}
@@ -154,7 +159,9 @@ func (su *StreamUploader) FinishStreaming(ctx context.Context, totalSize int64,
 	// Complete with the last part
 	err := sw.Complete(ctx, lastPartNum, lastPartData)
 	if err != nil {
-		_ = sw.Abort(ctx)
+		abortCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = sw.Abort(abortCtx)
+		cancel()
 		return err
 	}
 	return nil
@@ -189,7 +196,9 @@ func (su *StreamUploader) UploadAll(ctx context.Context, totalSize int64, partDa
 			continue // last part is handled by Complete
 		}
 		if err := sw.WritePart(ctx, pn, data); err != nil {
-			_ = sw.Abort(ctx)
+			abortCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_ = sw.Abort(abortCtx)
+			cancel()
 			return err
 		}
 	}
@@ -198,7 +207,9 @@ func (su *StreamUploader) UploadAll(ctx context.Context, totalSize int64, partDa
 	lastPartData := partData[maxPart]
 	err := sw.Complete(ctx, maxPart, lastPartData)
 	if err != nil {
-		_ = sw.Abort(ctx)
+		abortCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = sw.Abort(abortCtx)
+		cancel()
 		return err
 	}
 	return nil

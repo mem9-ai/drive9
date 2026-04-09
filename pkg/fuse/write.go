@@ -466,6 +466,13 @@ func (wb *WriteBuffer) ClearDirty() {
 	wb.touched = false
 }
 
+// EnsureLoaded loads a part from the server if it's not already in memory.
+// partIdx is 0-based. This is used by the Read path to load unmodified parts
+// before serving from the buffer, avoiding returning zeros for unloaded parts.
+func (wb *WriteBuffer) EnsureLoaded(partIdx int) error {
+	return wb.ensurePart(partIdx)
+}
+
 // IsSequential reports whether the buffer is still in sequential append mode.
 func (wb *WriteBuffer) IsSequential() bool {
 	return wb.sequential

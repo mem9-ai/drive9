@@ -88,9 +88,11 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 	}
 
 	if block.err != nil {
-		// Remove failed block
+		// Remove failed block — verify identity to avoid deleting a replacement
 		p.mu.Lock()
-		delete(p.cache, offset)
+		if p.cache[offset] == block {
+			delete(p.cache, offset)
+		}
 		p.mu.Unlock()
 		return nil, false
 	}
@@ -101,9 +103,11 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 		data = data[:size]
 	}
 
-	// Clean up used block
+	// Clean up used block — verify identity to avoid deleting a replacement
 	p.mu.Lock()
-	delete(p.cache, offset)
+	if p.cache[offset] == block {
+		delete(p.cache, offset)
+	}
 	p.mu.Unlock()
 
 	return data, true
