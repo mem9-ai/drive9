@@ -77,6 +77,8 @@ def collect_failpoint_tests(repo_root: pathlib.Path) -> dict[str, set[str]]:
 
 
 def load_podman_test_env(repo_root: pathlib.Path, env: dict[str, str]) -> dict[str, str]:
+    # Mirror the regular `make test` environment so failpoint runs use the same
+    # MySQL testcontainers setup when the suite relies on Podman locally.
     command = "source ./scripts/test-podman.sh && env"
     proc = subprocess.run(
         ["bash", "-lc", command],

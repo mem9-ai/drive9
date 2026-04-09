@@ -551,6 +551,8 @@ func (s *Store) semanticTaskLeaseError(ctx context.Context, taskID string) error
 
 func semanticTaskLeaseNow() time.Time {
 	now := time.Now().UTC()
+	// Keep lease-sensitive tests deterministic by letting failpoint mode override
+	// the current time seen by a single lease ownership check.
 	failpoint.Inject("semanticTaskLeaseNow", func(val failpoint.Value) {
 		switch injected := val.(type) {
 		case string:

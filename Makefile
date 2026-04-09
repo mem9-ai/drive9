@@ -53,6 +53,9 @@ test:
 	fi; \
 	$(GO) test $$test_p_flag -v ./...
 
+# Run only failpoint-tagged tests through repository-wide instrumentation.
+# Do not run this concurrently with the normal test target because failpoint-ctl
+# rewrites the source tree while the tests are running.
 test-failpoint:
 	./scripts/run_failpoint_tests.py
 
