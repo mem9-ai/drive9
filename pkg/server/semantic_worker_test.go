@@ -1095,6 +1095,11 @@ func TestSemanticWorkerRenewsLeaseForLongImageTask(t *testing.T) {
 		started: make(chan struct{}, 1),
 		release: make(chan struct{}),
 	}
+	var releaseOnce sync.Once
+	releaseExtractor := func() {
+		releaseOnce.Do(func() { close(extractor.release) })
+	}
+	t.Cleanup(releaseExtractor)
 	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
 		DatabaseAutoEmbedding: true,
 		AsyncImageExtract: backend.AsyncImageExtractOptions{
@@ -1156,7 +1161,9 @@ func TestSemanticWorkerRenewsLeaseForLongImageTask(t *testing.T) {
 	}
 
 	renewedLeaseUntil := waitForNamedTaskLeaseAfter(t, b, claimed.TaskID, claimed.LeaseUntil, time.Second)
-	recovered, err := b.Store().RecoverExpiredSemanticTasks(context.Background(), claimed.LeaseUntil.UTC().Add(time.Millisecond), 64)
+	// Use a point just before the renewed lease to avoid precision/race flakes
+	// around the old lease boundary.
+	recovered, err := b.Store().RecoverExpiredSemanticTasks(context.Background(), renewedLeaseUntil.Add(-time.Millisecond), 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1167,7 +1174,7 @@ func TestSemanticWorkerRenewsLeaseForLongImageTask(t *testing.T) {
 		t.Fatalf("renewed lease_until=%v, want after %v", renewedLeaseUntil, claimed.LeaseUntil.UTC())
 	}
 
-	close(extractor.release)
+	releaseExtractor()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
@@ -1193,6 +1200,11 @@ func TestSemanticWorkerCancelsLeaseLostImageTaskWithoutAckOrRetry(t *testing.T) 
 		release:  make(chan struct{}),
 		canceled: make(chan struct{}, 1),
 	}
+	var releaseOnce sync.Once
+	releaseExtractor := func() {
+		releaseOnce.Do(func() { close(extractor.release) })
+	}
+	t.Cleanup(releaseExtractor)
 	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
 		DatabaseAutoEmbedding: true,
 		AsyncImageExtract: backend.AsyncImageExtractOptions{
@@ -1215,7 +1227,7 @@ func TestSemanticWorkerCancelsLeaseLostImageTaskWithoutAckOrRetry(t *testing.T) 
 		ResourceVersion: 1,
 		Status:          semantic.TaskQueued,
 		MaxAttempts:     3,
-		AvailableAt:     now,
+		AvailableAt:     now.Add(-time.Second),
 		PayloadJSON:     payload,
 		CreatedAt:       now,
 		UpdatedAt:       now,
@@ -1224,7 +1236,7 @@ func TestSemanticWorkerCancelsLeaseLostImageTaskWithoutAckOrRetry(t *testing.T) 
 	}
 
 	leaseDuration := 80 * time.Millisecond
-	claimed, found, err := b.Store().ClaimSemanticTask(context.Background(), now, leaseDuration, semantic.TaskTypeImgExtractText)
+	claimed, found, err := b.Store().ClaimSemanticTask(context.Background(), time.Now().UTC(), leaseDuration, semantic.TaskTypeImgExtractText)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -41,13 +41,21 @@ var (
 
 // SemanticWorkerOptions controls background semantic task processing.
 type SemanticWorkerOptions struct {
+	// Workers is the number of polling worker goroutines.
 	Workers              int
+	// PollInterval is the idle wait between claim attempts.
 	PollInterval         time.Duration
+	// LeaseDuration is the base task lease window used by claim and renew.
 	LeaseDuration        time.Duration
+	// RecoverInterval controls how often expired leases are swept back to queue.
 	RecoverInterval      time.Duration
+	// RetryBaseDelay is the initial backoff for retry scheduling.
 	RetryBaseDelay       time.Duration
+	// RetryMaxDelay is the cap for exponential retry backoff.
 	RetryMaxDelay        time.Duration
+	// TenantScanLimit bounds active tenants checked per scheduling pass.
 	TenantScanLimit      int
+	// PerTenantConcurrency limits concurrent tasks per tenant.
 	PerTenantConcurrency int
 }
 
@@ -301,6 +309,7 @@ func (m *semanticWorkerManager) processTask(ctx context.Context, target *semanti
 	}()
 	leaseExec := m.startTaskLeaseExecution(ctx, target, task)
 	outcome := m.dispatchTask(leaseExec.leaseCtx(), target, task)
+	// Stop renewal before ack/retry so only one lease owner can finalize outcome.
 	leaseOutcome := leaseExec.stop()
 	if leaseOutcome.lost {
 		result = "lease_lost"
@@ -574,6 +583,8 @@ func (m *semanticWorkerManager) startTaskLeaseExecution(ctx context.Context, tar
 }
 
 func (m *semanticWorkerManager) leaseRenewInterval() time.Duration {
+	// Renew halfway through the lease window to keep enough slack for transient
+	// latency while avoiding unnecessary renew write amplification.
 	interval := m.opts.LeaseDuration / 2
 	if interval > 0 {
 		return interval
@@ -595,6 +606,8 @@ func (e *semanticTaskLeaseExecution) stop() semanticTaskLeaseOutcome {
 	if e == nil {
 		return semanticTaskLeaseOutcome{}
 	}
+	// close(stopCh) + cancel() ensures the renew loop exits whether it is waiting
+	// on ticker or blocked inside a datastore call using e.ctx.
 	close(e.stopCh)
 	e.cancel()
 	<-e.doneCh
@@ -651,6 +664,7 @@ func (e *semanticTaskLeaseExecution) run(m *semanticWorkerManager, target *seman
 							zap.String("tenant_id", target.tenantID),
 							zap.String("result", "lease_lost"),
 						}, append(semanticTaskLogFields(task), zap.Error(err))...)...)
+					// Cancel handler context immediately once lease ownership is lost.
 					e.cancel()
 					e.logStopped(m, target, task)
 					return
