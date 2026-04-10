@@ -90,7 +90,7 @@ func (c *Client) streamEvents(ctx context.Context, since uint64, actor string, h
 	if err != nil {
 		return fmt.Errorf("SSE connect: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("SSE status %d", resp.StatusCode)
