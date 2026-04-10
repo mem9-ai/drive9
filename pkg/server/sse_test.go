@@ -187,6 +187,116 @@ func TestSSEEndpointLiveEvent(t *testing.T) {
 	}
 }
 
+func TestSSEStructuralOpEmitsReset(t *testing.T) {
+	srv := &Server{events: newEventBuses()}
+	bus := srv.events.get("")
+
+	// Publish a mix: write (file_changed) then rename (structural → reset).
+	bus.Publish("/a.txt", "write", "actor1")
+	bus.Publish("/old.txt", "rename", "actor1")
+	bus.Publish("/dir", "mkdir", "actor1")
+	bus.Publish("/gone.txt", "delete", "actor1")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Replay from seq=0 → initial reset, then connect at head for live.
+	// Instead, replay from seq=1 to get events 2,3,4.
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+
+	// Event 2: rename → should be reset with reason structural_change.
+	ev1, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected first event")
+	}
+	if ev1.Event != "reset" {
+		t.Fatalf("rename op: event=%q, want reset", ev1.Event)
+	}
+	var reset1 map[string]interface{}
+	if err := json.Unmarshal([]byte(ev1.Data), &reset1); err != nil {
+		t.Fatalf("unmarshal reset1: %v", err)
+	}
+	if reset1["reason"] != "structural_change" {
+		t.Errorf("rename reset reason=%v, want structural_change", reset1["reason"])
+	}
+
+	// Event 3: mkdir → also reset.
+	ev2, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected second event")
+	}
+	if ev2.Event != "reset" {
+		t.Fatalf("mkdir op: event=%q, want reset", ev2.Event)
+	}
+
+	// Event 4: delete → also reset.
+	ev3, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected third event")
+	}
+	if ev3.Event != "reset" {
+		t.Fatalf("delete op: event=%q, want reset", ev3.Event)
+	}
+}
+
+func TestSSEStructuralOpLiveEmitsReset(t *testing.T) {
+	srv := &Server{events: newEventBuses()}
+	bus := srv.events.get("")
+
+	bus.Publish("/existing.txt", "write", "")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Publish a structural op live.
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		bus.Publish("/old", "rename", "remote-actor")
+	}()
+
+	scanner := bufio.NewScanner(resp.Body)
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected live event")
+	}
+	if ev.Event != "reset" {
+		t.Fatalf("live rename: event=%q, want reset", ev.Event)
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(ev.Data), &data); err != nil {
+		t.Fatalf("unmarshal live reset: %v", err)
+	}
+	if data["reason"] != "structural_change" {
+		t.Errorf("live rename reason=%v, want structural_change", data["reason"])
+	}
+}
+
 func TestSSEEndpointMethodNotAllowed(t *testing.T) {
 	srv := &Server{events: newEventBuses()}
 	w := httptest.NewRecorder()
