@@ -87,9 +87,15 @@ func (g *grpcGlobalClient) GetClusterInfo(ctx context.Context, clusterID string)
 	if sc == nil {
 		return nil, fmt.Errorf("cluster %s is not a serverless cluster", clusterID)
 	}
-	pub := sc.GetCluster().GetEndpoints().GetPublic()
+	regional := sc.GetCluster()
+	pub := regional.GetEndpoints().GetPublic()
 	if pub == nil || pub.GetHost() == "" {
 		return nil, fmt.Errorf("cluster %s has no public endpoint", clusterID)
+	}
+
+	username := "cloud_admin"
+	if prefix := regional.GetUserPrefix(); prefix != "" {
+		username = prefix + ".cloud_admin"
 	}
 
 	return &ClusterInfo{
@@ -97,7 +103,7 @@ func (g *grpcGlobalClient) GetClusterInfo(ctx context.Context, clusterID string)
 		OrgID:     clusters[0].GetOrganizationId(),
 		Host:      pub.GetHost(),
 		Port:      int(pub.GetPort()),
-		Username:  "cloud_admin",
+		Username:  username,
 	}, nil
 }
 
