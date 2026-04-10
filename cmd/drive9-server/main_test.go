@@ -2,28 +2,33 @@ package main
 
 import "testing"
 
-func TestHasKubernetesResolverTarget(t *testing.T) {
+func TestNormalizeGRPCTarget(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		targets []string
-		want    bool
+		name   string
+		target string
+		want   string
 	}{
 		{
-			name:    "kubernetes target with port",
-			targets: []string{"kubernetes:///tidb-mgmt-service.tidb-management-service:10001"},
-			want:    true,
+			name:   "kubernetes target with port",
+			target: "kubernetes:///tidb-mgmt-service.tidb-management-service:10001",
+			want:   "dns:///tidb-mgmt-service.tidb-management-service:10001",
 		},
 		{
-			name:    "kubernetes target without port",
-			targets: []string{"kubernetes:///tidb-mgmt-service.tidb-management-service"},
-			want:    true,
+			name:   "kubernetes target without port",
+			target: "kubernetes:///tidb-mgmt-service.tidb-management-service",
+			want:   "dns:///tidb-mgmt-service.tidb-management-service",
 		},
 		{
-			name:    "dns targets only",
-			targets: []string{"dns:///tidb-mgmt-service.tidb-management-service:10001"},
-			want:    false,
+			name:   "kubernetes double slash target",
+			target: "kubernetes://tidb-mgmt-service.tidb-management-service:10001",
+			want:   "dns:///tidb-mgmt-service.tidb-management-service:10001",
+		},
+		{
+			name:   "dns targets unchanged",
+			target: "dns:///tidb-mgmt-service.tidb-management-service:10001",
+			want:   "dns:///tidb-mgmt-service.tidb-management-service:10001",
 		},
 	}
 
@@ -31,9 +36,9 @@ func TestHasKubernetesResolverTarget(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := hasKubernetesResolverTarget(tc.targets...)
+			got := normalizeGRPCTarget(tc.target)
 			if got != tc.want {
-				t.Fatalf("hasKubernetesResolverTarget() = %v, want %v", got, tc.want)
+				t.Fatalf("normalizeGRPCTarget() = %q, want %q", got, tc.want)
 			}
 		})
 	}
