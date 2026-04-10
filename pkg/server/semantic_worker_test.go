@@ -75,47 +75,6 @@ func (e staticServerImageExtractor) ExtractImageText(context.Context, backend.Im
 	return e.text, nil
 }
 
-type gatedServerImageExtractor struct {
-	text string
-
-	started  chan struct{}
-	release  chan struct{}
-	canceled chan struct{}
-}
-
-func (e *gatedServerImageExtractor) ExtractImageText(ctx context.Context, req backend.ImageExtractRequest) (string, error) {
-	select {
-	case e.started <- struct{}{}:
-	default:
-	}
-	select {
-	case <-e.release:
-		return e.text, nil
-	case <-ctx.Done():
-		if e.canceled != nil {
-			select {
-			case e.canceled <- struct{}{}:
-			default:
-			}
-		}
-		return "", ctx.Err()
-	}
-}
-
-type panicServerImageExtractor struct {
-	started chan struct{}
-}
-
-func (e *panicServerImageExtractor) ExtractImageText(context.Context, backend.ImageExtractRequest) (string, error) {
-	if e != nil && e.started != nil {
-		select {
-		case e.started <- struct{}{}:
-		default:
-		}
-	}
-	panic("panic image extractor")
-}
-
 func newTestTenantPool(t *testing.T) *tenant.Pool {
 	return newTestTenantPoolWithBackendOptions(t, backend.Options{})
 }
@@ -1409,42 +1368,6 @@ func waitForObservedLog(t *testing.T, recorded *observer.ObservedLogs, message s
 		t.Fatalf("timed out waiting for log message %q", message)
 	}
 	return entries[len(entries)-1]
-}
-
-func waitForNamedTaskLeaseAfter(t *testing.T, b *backend.Dat9Backend, taskID string, after *time.Time, timeout time.Duration) time.Time {
-	t.Helper()
-	if after == nil {
-		t.Fatal("after must not be nil")
-	}
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		var leaseUntil time.Time
-		err := b.Store().DB().QueryRow(`SELECT lease_until FROM semantic_tasks WHERE task_id = ?`, taskID).Scan(&leaseUntil)
-		if err == nil {
-			leaseUntil = leaseUntil.UTC()
-			if leaseUntil.After(after.UTC()) {
-				return leaseUntil
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	var leaseUntil time.Time
-	if err := b.Store().DB().QueryRow(`SELECT lease_until FROM semantic_tasks WHERE task_id = ?`, taskID).Scan(&leaseUntil); err != nil {
-		t.Fatalf("wait task lease_until query: %v", err)
-	}
-	t.Fatalf("task %s lease_until=%v, want after %v", taskID, leaseUntil.UTC(), after.UTC())
-	return time.Time{}
-}
-
-func assertNoObservedLogForTask(t *testing.T, recorded *observer.ObservedLogs, taskID string, messages ...string) {
-	t.Helper()
-	for _, message := range messages {
-		for _, entry := range recorded.FilterMessage(message).AllUntimed() {
-			if entry.ContextMap()["task_id"] == taskID {
-				t.Fatalf("unexpected log %q for task %s", message, taskID)
-			}
-		}
-	}
 }
 
 func waitForStoreEmbeddingRevision(t *testing.T, store *datastore.Store, path string, want int64, timeout time.Duration) {
