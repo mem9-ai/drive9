@@ -111,9 +111,9 @@ func TestSemanticWorkerFinalizeAckSkipsWhenLeaseOwnershipLostAtBoundary(t *testi
 	})
 
 	waitForEmbeddingRevision(t, b, "/docs/finalize-ack.txt", 1, 3*time.Second)
-	waitForNamedTaskStatus(t, b, taskIDForResource(t, b, nf.FileID), string(semantic.TaskProcessing), 3*time.Second)
+	waitForNamedTaskStatus(t, b, taskIDForResourceAndType(t, b, nf.FileID, semantic.TaskTypeEmbed), string(semantic.TaskProcessing), 3*time.Second)
 
-	task := mustGetServerSemanticTask(t, b, taskIDForResource(t, b, nf.FileID))
+	task := mustGetServerSemanticTask(t, b, taskIDForResourceAndType(t, b, nf.FileID, semantic.TaskTypeEmbed))
 	if task.Status != string(semantic.TaskProcessing) {
 		t.Fatalf("task status=%q, want %q", task.Status, semantic.TaskProcessing)
 	}
@@ -151,9 +151,9 @@ func TestSemanticWorkerFinalizeRetrySkipsWhenLeaseOwnershipLostAtBoundary(t *tes
 		_ = failpoint.Disable(semanticWorkerBeforeFinalizeFailpoint)
 	})
 
-	waitForNamedTaskStatus(t, b, taskIDForResource(t, b, nf.FileID), string(semantic.TaskProcessing), 3*time.Second)
+	waitForNamedTaskStatus(t, b, taskIDForResourceAndType(t, b, nf.FileID, semantic.TaskTypeEmbed), string(semantic.TaskProcessing), 3*time.Second)
 
-	task := mustGetServerSemanticTask(t, b, taskIDForResource(t, b, nf.FileID))
+	task := mustGetServerSemanticTask(t, b, taskIDForResourceAndType(t, b, nf.FileID, semantic.TaskTypeEmbed))
 	if task.Status != string(semantic.TaskProcessing) {
 		t.Fatalf("task status=%q, want %q", task.Status, semantic.TaskProcessing)
 	}
@@ -505,13 +505,14 @@ func TestSemanticWorkerPanicStopsLeaseRenewalWithFailpoint(t *testing.T) {
 	waitForNamedTaskStatus(t, b, claimed.TaskID, string(semantic.TaskQueued), time.Second)
 }
 
-func taskIDForResource(t *testing.T, b *backend.Dat9Backend, resourceID string) string {
+func taskIDForResourceAndType(t *testing.T, b *backend.Dat9Backend, resourceID string, taskType semantic.TaskType) string {
 	t.Helper()
 	var taskID string
 	err := b.Store().DB().QueryRow(`SELECT task_id
-		FROM semantic_tasks WHERE resource_id = ? AND resource_version = 1`, resourceID).Scan(&taskID)
+		FROM semantic_tasks WHERE resource_id = ? AND resource_version = 1 AND task_type = ?`,
+		resourceID, taskType).Scan(&taskID)
 	if err != nil {
-		t.Fatalf("get semantic task id by resource %s: %v", resourceID, err)
+		t.Fatalf("get semantic task id by resource %s and task_type %s: %v", resourceID, taskType, err)
 	}
 	return taskID
 }

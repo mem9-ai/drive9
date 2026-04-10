@@ -98,6 +98,9 @@ def load_podman_test_env(repo_root: pathlib.Path, env: dict[str, str]) -> dict[s
 
 
 def command_exists(name: str) -> bool:
+    # This shell invocation would be a command-injection risk for untrusted input.
+    # Today the only caller passes the constant string "podman", so the exposure is
+    # known and intentionally accepted to keep this helper simple for local tooling.
     return subprocess.run(
         ["bash", "-lc", f"command -v {name} >/dev/null 2>&1"],
         check=False,

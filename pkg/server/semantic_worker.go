@@ -2,13 +2,15 @@ package server
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/pingcap/failpoint"
+	"go.uber.org/zap"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
@@ -18,8 +20,6 @@ import (
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/semantic"
 	"github.com/mem9-ai/dat9/pkg/tenant"
-	"github.com/pingcap/failpoint"
-	"go.uber.org/zap"
 )
 
 const (
@@ -335,6 +335,9 @@ func (m *semanticWorkerManager) processTask(ctx context.Context, target *semanti
 	// force a lease-loss window before any terminal state mutation happens.
 	stillOwned, err := m.semanticTaskStillOwned(ctx, target.tenantID, target.store, task, outcome.result)
 	if err != nil {
+		// Fall back to the datastore lease checks in ack/retry when the ownership
+		// pre-check cannot read current state, instead of stranding the task in
+		// processing on a transient read failure.
 		logger.Warn(ctx, "semantic_worker_finalize_ownership_check_failed",
 			append([]zap.Field{
 				zap.String("tenant_id", target.tenantID),
@@ -787,7 +790,6 @@ func (e *semanticTaskLeaseExecution) logStopped(m *semanticWorkerManager, target
 	if leaseUntil != nil {
 		fields = append(fields, zap.Time("latest_lease_until", leaseUntil.UTC()))
 	}
-	failpoint.InjectCall("semanticWorkerLeaseRenewStopped", target.tenantID, target.store, task, result, renewAttempted, lost)
 	logger.Info(e.ctx, "semantic_worker_lease_renew_stopped", fields...)
 }
 
@@ -838,17 +840,14 @@ func (m *semanticWorkerManager) injectBeforeSemanticTaskFinalize(tenantID string
 
 func (m *semanticWorkerManager) semanticTaskStillOwned(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task, result string) (bool, error) {
 	if store == nil || task == nil {
-		return false, nil
+		return false, fmt.Errorf("check semantic task ownership: nil store or task")
 	}
-	now := time.Now().UTC()
+	now := semanticWorkerLeaseNow()
 	var count int
 	err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM semantic_tasks
 		WHERE task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`,
 		task.TaskID, semantic.TaskProcessing, task.Receipt, now).Scan(&count)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
 		return false, fmt.Errorf("check semantic task ownership: %w", err)
 	}
 	if count > 0 {
@@ -863,6 +862,22 @@ func (m *semanticWorkerManager) semanticTaskStillOwned(ctx context.Context, tena
 			zap.String("result", result),
 		}, semanticTaskLogFields(task)...)...)
 	return false, nil
+}
+
+func semanticWorkerLeaseNow() time.Time {
+	now := time.Now().UTC()
+	// Keep finalize ownership checks deterministic by letting failpoint tests
+	// override the clock used by the worker-side lease re-check.
+	failpoint.Inject("semanticWorkerLeaseNow", func(val failpoint.Value) {
+		switch injected := val.(type) {
+		case string:
+			parsed, err := time.Parse(time.RFC3339Nano, injected)
+			if err == nil {
+				now = parsed.UTC()
+			}
+		}
+	})
+	return now
 }
 
 func semanticTaskLogFields(task *semantic.Task) []zap.Field {
