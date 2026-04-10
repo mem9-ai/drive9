@@ -139,7 +139,12 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 
 // Write uploads data to a remote path.
 func (c *Client) Write(path string, data []byte) error {
-	req, err := http.NewRequest(http.MethodPut, c.url(path), bytes.NewReader(data))
+	return c.WriteCtx(context.Background(), path, data)
+}
+
+// WriteCtx uploads data to a remote path with context support.
+func (c *Client) WriteCtx(ctx context.Context, path string, data []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -157,7 +162,12 @@ func (c *Client) Write(path string, data []byte) error {
 
 // Read downloads a file's content.
 func (c *Client) Read(path string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, c.url(path), nil)
+	return c.ReadCtx(context.Background(), path)
+}
+
+// ReadCtx downloads a file's content with context support.
+func (c *Client) ReadCtx(ctx context.Context, path string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -174,8 +184,13 @@ func (c *Client) Read(path string) ([]byte, error) {
 
 // List returns the entries in a directory.
 func (c *Client) List(path string) ([]FileInfo, error) {
+	return c.ListCtx(context.Background(), path)
+}
+
+// ListCtx returns the entries in a directory with context support.
+func (c *Client) ListCtx(ctx context.Context, path string) ([]FileInfo, error) {
 	// Use an explicit value to avoid intermediaries dropping bare "?list".
-	req, err := http.NewRequest(http.MethodGet, c.url(path)+"?list=1", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path)+"?list=1", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +213,12 @@ func (c *Client) List(path string) ([]FileInfo, error) {
 
 // Stat returns metadata for a path.
 func (c *Client) Stat(path string) (*StatResult, error) {
-	req, err := http.NewRequest(http.MethodHead, c.url(path), nil)
+	return c.StatCtx(context.Background(), path)
+}
+
+// StatCtx returns metadata for a path with context support.
+func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.url(path), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +252,12 @@ func (c *Client) Stat(path string) (*StatResult, error) {
 
 // Delete removes a file or directory.
 func (c *Client) Delete(path string) error {
-	req, err := http.NewRequest(http.MethodDelete, c.url(path), nil)
+	return c.DeleteCtx(context.Background(), path)
+}
+
+// DeleteCtx removes a file or directory with context support.
+func (c *Client) DeleteCtx(ctx context.Context, path string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.url(path), nil)
 	if err != nil {
 		return err
 	}
@@ -267,7 +292,12 @@ func (c *Client) Copy(srcPath, dstPath string) error {
 
 // Rename moves/renames a file or directory (metadata-only).
 func (c *Client) Rename(oldPath, newPath string) error {
-	req, err := http.NewRequest(http.MethodPost, c.url(newPath)+"?rename", nil)
+	return c.RenameCtx(context.Background(), oldPath, newPath)
+}
+
+// RenameCtx moves/renames a file or directory with context support.
+func (c *Client) RenameCtx(ctx context.Context, oldPath, newPath string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(newPath)+"?rename", nil)
 	if err != nil {
 		return err
 	}
@@ -285,7 +315,12 @@ func (c *Client) Rename(oldPath, newPath string) error {
 
 // Mkdir creates a directory.
 func (c *Client) Mkdir(path string) error {
-	req, err := http.NewRequest(http.MethodPost, c.url(path)+"?mkdir", nil)
+	return c.MkdirCtx(context.Background(), path)
+}
+
+// MkdirCtx creates a directory with context support.
+func (c *Client) MkdirCtx(ctx context.Context, path string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?mkdir", nil)
 	if err != nil {
 		return err
 	}

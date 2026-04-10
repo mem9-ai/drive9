@@ -65,6 +65,25 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 	}
 }
 
+// fuseTimeout is the default timeout for FUSE operations that make HTTP calls.
+// This prevents slow/dead servers from blocking the FUSE event loop forever.
+const fuseTimeout = 30 * time.Second
+
+// fuseCtx converts a FUSE cancel channel into a context.Context with a timeout.
+// The context is cancelled when either the FUSE operation is interrupted or the
+// timeout expires. This ensures HTTP calls never block indefinitely.
+func fuseCtx(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
+	ctx, cf := context.WithTimeout(context.Background(), fuseTimeout)
+	go func() {
+		select {
+		case <-cancel:
+			cf()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cf
+}
+
 // --- helpers -----------------------------------------------------------------
 
 func (fs *Dat9FS) childPath(parentIno uint64, name string) (string, gofuse.Status) {
@@ -121,8 +140,8 @@ func (fs *Dat9FS) clearDirtySize(ino uint64, seq uint64) {
 	}
 }
 
-func (fs *Dat9FS) preloadWritableHandle(fh *FileHandle) gofuse.Status {
-	stat, err := fs.client.Stat(fh.Path)
+func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
+	stat, err := fs.client.StatCtx(ctx, fh.Path)
 	if err != nil {
 		return httpToFuseStatus(err)
 	}
@@ -142,7 +161,7 @@ func (fs *Dat9FS) preloadWritableHandle(fh *FileHandle) gofuse.Status {
 
 	// Small files: eager preload (one HTTP request is cheaper than per-part loading)
 	if stat.Size <= smallFileThreshold {
-		data, err := fs.client.Read(fh.Path)
+		data, err := fs.client.ReadCtx(ctx, fh.Path)
 		if err != nil {
 			return httpToFuseStatus(err)
 		}
@@ -276,12 +295,15 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 }
 
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) gofuse.Status {
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
 	}
 
-	stat, err := fs.client.Stat(childP)
+	stat, err := fs.client.StatCtx(ctx, childP)
 	if err != nil {
 		if !isNotFoundErr(err) {
 			return httpToFuseStatus(err)
@@ -293,7 +315,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		if !ok {
 			return gofuse.ENOENT
 		}
-		items, listErr := fs.client.List(parentPath)
+		items, listErr := fs.client.ListCtx(ctx, parentPath)
 		if listErr != nil {
 			return httpToFuseStatus(listErr)
 		}
@@ -346,7 +368,9 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		// Some deployments do not support HEAD/stat on directories.
 		// Keep directory attrs from inode map and only refresh regular files.
 		if !entry.IsDir {
-			stat, err := fs.client.Stat(entry.Path)
+			ctx, cf := fuseCtx(cancel)
+			defer cf()
+			stat, err := fs.client.StatCtx(ctx, entry.Path)
 			if err != nil {
 				return httpToFuseStatus(err)
 			}
@@ -402,7 +426,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			// to the server. We only support truncate-to-zero, which is
 			// the common case (e.g. shell "> file").
 			if newSize == 0 {
-				if err := fs.client.Write(entry.Path, nil); err != nil {
+				ctx, cf := fuseCtx(cancel)
+				defer cf()
+				if err := fs.client.WriteCtx(ctx, entry.Path, nil); err != nil {
 					return httpToFuseStatus(err)
 				}
 				fs.readCache.Invalidate(entry.Path)
@@ -427,12 +453,15 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 // --- Directory operations ----------------------------------------------------
 
 func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, out *gofuse.EntryOut) gofuse.Status {
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
 	childP, st := fs.childPath(input.NodeId, name)
 	if st != gofuse.OK {
 		return st
 	}
 
-	if err := fs.client.Mkdir(childP); err != nil {
+	if err := fs.client.MkdirCtx(ctx, childP); err != nil {
 		return httpToFuseStatus(err)
 	}
 
@@ -453,12 +482,15 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 }
 
 func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string) gofuse.Status {
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
 	}
 
-	if err := fs.client.Delete(childP); err != nil {
+	if err := fs.client.DeleteCtx(ctx, childP); err != nil {
 		return httpToFuseStatus(err)
 	}
 
@@ -474,12 +506,15 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 }
 
 func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string) gofuse.Status {
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
 	}
 
-	if err := fs.client.Delete(childP); err != nil {
+	if err := fs.client.DeleteCtx(ctx, childP); err != nil {
 		return httpToFuseStatus(err)
 	}
 
@@ -496,6 +531,9 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 }
 
 func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName string, newName string) gofuse.Status {
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
 	oldP, st := fs.childPath(input.NodeId, oldName)
 	if st != gofuse.OK {
 		return st
@@ -505,7 +543,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		return st
 	}
 
-	if err := fs.client.Rename(oldP, newP); err != nil {
+	if err := fs.client.RenameCtx(ctx, oldP, newP); err != nil {
 		return httpToFuseStatus(err)
 	}
 
@@ -551,7 +589,9 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 
 	// Populate entries if not already done
 	if dh.Entries == nil {
-		entries, err := fs.listDir(dh.Path)
+		ctx, cf := fuseCtx(cancel)
+		defer cf()
+		entries, err := fs.listDir(ctx, dh.Path)
 		if err != nil {
 			return httpToFuseStatus(err)
 		}
@@ -579,7 +619,9 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 	}
 
 	if dh.Entries == nil {
-		entries, err := fs.listDir(dh.Path)
+		ctx, cf := fuseCtx(cancel)
+		defer cf()
+		entries, err := fs.listDir(ctx, dh.Path)
 		if err != nil {
 			return httpToFuseStatus(err)
 		}
@@ -614,13 +656,13 @@ func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
 	fs.dirHandles.Delete(input.Fh)
 }
 
-func (fs *Dat9FS) listDir(dirPath string) ([]DirEntry, error) {
+func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, error) {
 	// Check dir cache first
 	if cached, ok := fs.dirCache.Get(dirPath); ok {
 		return fs.cachedToDirEntries(dirPath, cached), nil
 	}
 
-	items, err := fs.client.List(dirPath)
+	items, err := fs.client.ListCtx(ctx, dirPath)
 	if err != nil {
 		return nil, err
 	}
@@ -738,6 +780,9 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 }
 
 func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) gofuse.Status {
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
 	p, ok := fs.inodes.GetPath(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -760,7 +805,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		// Preload existing content for non-truncating opens so that
 		// random writes don't discard the original file data.
 		if input.Flags&syscall.O_TRUNC == 0 {
-			if st := fs.preloadWritableHandle(fh); st != gofuse.OK {
+			if st := fs.preloadWritableHandle(ctx, fh); st != gofuse.OK {
 				return st
 			}
 		} else {
@@ -895,6 +940,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		fh.Unlock()
 	}
 
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
 	p := fh.Path
 
 	// Try prefetcher for large read-only files
@@ -916,7 +964,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
 	if entry != nil && entry.Size <= smallFileThreshold && entry.Size > 0 {
 		// Check read cache
-		stat, _ := fs.client.Stat(p)
+		stat, _ := fs.client.StatCtx(ctx, p)
 		var rev int64
 		if stat != nil {
 			rev = stat.Revision
@@ -934,7 +982,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		}
 
 		// Small file: read entirely into cache
-		data, err := fs.client.Read(p)
+		data, err := fs.client.ReadCtx(ctx, p)
 		if err != nil {
 			return nil, httpToFuseStatus(err)
 		}
@@ -953,7 +1001,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	// Large file or unknown size: range read (avoids O(offset) discard)
-	rc, err := fs.client.ReadStreamRange(context.Background(), p, int64(input.Offset), int64(input.Size))
+	rc, err := fs.client.ReadStreamRange(ctx, p, int64(input.Offset), int64(input.Size))
 	if err != nil {
 		return nil, httpToFuseStatus(err)
 	}
@@ -999,10 +1047,13 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.St
 		return gofuse.OK
 	}
 
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
 	fh.Lock()
 	defer fh.Unlock()
 
-	return fs.flushHandleDebounced(fh, false)
+	return fs.flushHandleDebounced(ctx, fh, false)
 }
 
 func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.Status {
@@ -1011,10 +1062,13 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.St
 		return gofuse.OK
 	}
 
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
 	fh.Lock()
 	defer fh.Unlock()
 
-	return fs.flushHandleDebounced(fh, true)
+	return fs.flushHandleDebounced(ctx, fh, true)
 }
 
 func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
@@ -1023,8 +1077,12 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		// Cancel any pending debounce for this path — Release always flushes immediately.
 		fs.debouncer.Cancel(fh.Path)
 
+		// Release uses a generous timeout since it must persist data.
+		ctx, cf := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cf()
+
 		fh.Lock()
-		st := fs.flushHandle(fh)
+		st := fs.flushHandle(ctx, fh)
 		streamer := fh.Streamer
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
@@ -1049,14 +1107,14 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 // flushHandleDebounced wraps flushHandle with optional debouncing for small files.
 // When force is false and the file is small, the upload may be deferred.
 // Caller must hold fh.mu.
-func (fs *Dat9FS) flushHandleDebounced(fh *FileHandle, force bool) gofuse.Status {
+func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, force bool) gofuse.Status {
 	if force || fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
-		return fs.flushHandle(fh)
+		return fs.flushHandle(ctx, fh)
 	}
 
 	size := fh.Dirty.Size()
 	if size >= smallFileThreshold || fs.debouncer.delay <= 0 {
-		return fs.flushHandle(fh)
+		return fs.flushHandle(ctx, fh)
 	}
 
 	// Small file: schedule a deferred upload.
@@ -1069,7 +1127,9 @@ func (fs *Dat9FS) flushHandleDebounced(fh *FileHandle, force bool) gofuse.Status
 	snapshotSeq := fh.DirtySeq // capture current dirty sequence
 
 	fs.debouncer.Schedule(filePath, func() {
-		if err := fs.client.Write(filePath, data); err != nil {
+		dCtx, dCf := context.WithTimeout(context.Background(), fuseTimeout)
+		defer dCf()
+		if err := fs.client.WriteCtx(dCtx, filePath, data); err != nil {
 			log.Printf("debounced flush failed for %s: %v", filePath, err)
 			return
 		}
@@ -1099,7 +1159,7 @@ func (fs *Dat9FS) flushHandleDebounced(fh *FileHandle, force bool) gofuse.Status
 // NOTE: This method temporarily releases fh.mu during network calls
 // (FinishStreaming, UploadAll) to avoid deadlock with streaming upload
 // callbacks. The lock is re-acquired before modifying handle state.
-func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
+func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
 	if fh.Dirty == nil {
 		return gofuse.OK
 	}
@@ -1143,7 +1203,7 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 		// Those goroutines call onDone → fh.Lock(), so holding fh.mu here
 		// would deadlock.
 		fh.Unlock()
-		err = streamer.FinishStreaming(context.Background(), size,
+		err = streamer.FinishStreaming(ctx, size,
 			lastPartNum, lastCp, dirtyParts)
 		fh.Lock()
 
@@ -1181,7 +1241,7 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 
 		// Release fh.mu during network call (same deadlock avoidance as Path 1a).
 		fh.Unlock()
-		err = streamer.UploadAll(context.Background(), size, partSnapshots)
+		err = streamer.UploadAll(ctx, size, partSnapshots)
 		fh.Lock()
 
 		if err != nil {
@@ -1205,7 +1265,7 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 
 	if size < smallFileThreshold {
 		// Small file: direct PUT.
-		err = fs.client.Write(fh.Path, data)
+		err = fs.client.WriteCtx(ctx, fh.Path, data)
 	} else if fh.OrigSize >= smallFileThreshold {
 		dirtyParts := fh.Dirty.DirtyPartNumbers()
 		if len(dirtyParts) > 0 {
@@ -1219,7 +1279,7 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 				}
 			}
 			err = fs.client.PatchFile(
-				context.Background(),
+				ctx,
 				fh.Path,
 				size,
 				dirtyParts,
@@ -1237,7 +1297,7 @@ func (fs *Dat9FS) flushHandle(fh *FileHandle) gofuse.Status {
 	} else {
 		// New large file or small-to-large growth: full upload via multipart.
 		err = fs.client.WriteStream(
-			context.Background(),
+			ctx,
 			fh.Path,
 			bytes.NewReader(data),
 			size,
@@ -1278,9 +1338,13 @@ func (fs *Dat9FS) FlushAll() {
 		handles = append(handles, entry{fhID, fh})
 	})
 	for _, e := range handles {
+		// Per-handle timeout so each flush gets a full 60s regardless of
+		// how many handles precede it.
+		ctx, cf := context.WithTimeout(context.Background(), 60*time.Second)
 		e.fh.Lock()
-		fs.flushHandle(e.fh)
+		fs.flushHandle(ctx, e.fh)
 		e.fh.Unlock()
+		cf()
 	}
 }
 
