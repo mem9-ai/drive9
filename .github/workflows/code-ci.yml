@@ -8,7 +8,7 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,6 +42,12 @@ jobs:
 
       - name: Test
         run: make test
+
+      - name: Install failpoint-ctl
+        run: go install github.com/pingcap/failpoint/failpoint-ctl@latest
+
+      - name: Failpoint test
+        run: make test-failpoint
 
       - name: Build (server and cli)
         run: make build
