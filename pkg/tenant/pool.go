@@ -216,27 +216,32 @@ func (p *Pool) SupportsAsyncImageExtract() bool {
 	return p != nil && p.cfg.BackendOptions.AsyncImageExtract.Enabled
 }
 
-// poolAutoSemanticTaskTypes is the immutable slice for pool-level auto routing
-// when async image extract is enabled in BackendOptions. Callers must not mutate it.
-var poolAutoSemanticTaskTypes = []semantic.TaskType{semantic.TaskTypeImgExtractText}
-
 // AutoSemanticTaskTypes returns the auto-backend durable semantic task types
-// implied by PoolConfig.BackendOptions (async image extract). This is a coarse
-// routing hint for tenant list filtering before a backend is acquired; it does
-// not include app-managed embed tasks. Nil means the pool contributes no auto
-// semantic tasks. The returned slice must be treated as read-only.
+// implied by PoolConfig.BackendOptions (async image and/or audio extract). This
+// is a coarse routing hint for tenant list filtering before a backend is
+// acquired; it does not include app-managed embed tasks. Nil means the pool
+// contributes no auto semantic tasks. The returned slice must be treated as
+// read-only.
 //
-// Viability matches backend.Options.configureOptions: when Enabled, a nil
-// Extractor is replaced with NewBasicImageTextExtractor before workers start, so
-// pool-level routing stays aligned with Dat9Backend.SupportsAsyncImageExtract.
+// Image: viability matches backend.Options.configureOptions — when Enabled, a nil
+// Image Extractor is replaced with NewBasicImageTextExtractor before workers start.
+// Audio: Phase 2 requires Enabled and a non-nil Extractor (no implicit default);
+// pool routing must stay aligned with Dat9Backend.SupportsAsyncAudioExtract.
 func (p *Pool) AutoSemanticTaskTypes() []semantic.TaskType {
 	if p == nil {
 		return nil
 	}
-	if !backend.AsyncImageExtractWillWireRuntime(p.cfg.BackendOptions.AsyncImageExtract) {
+	var out []semantic.TaskType
+	if backend.AsyncImageExtractWillWireRuntime(p.cfg.BackendOptions.AsyncImageExtract) {
+		out = append(out, semantic.TaskTypeImgExtractText)
+	}
+	if backend.AsyncAudioExtractWillWireRuntime(p.cfg.BackendOptions.AsyncAudioExtract) {
+		out = append(out, semantic.TaskTypeAudioExtractText)
+	}
+	if len(out) == 0 {
 		return nil
 	}
-	return poolAutoSemanticTaskTypes
+	return out
 }
 
 func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantID string) (out *backend.Dat9Backend) {

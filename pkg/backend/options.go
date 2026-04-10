@@ -17,6 +17,9 @@ const (
 	defaultImageExtractMaxSize   = int64(8 << 20) // 8 MiB
 	defaultImageExtractTimeout   = 20 * time.Second
 	defaultMaxExtractedTextBytes = 8 << 10               // 8 KiB
+	defaultAudioExtractMaxSize   = int64(32 << 20)       // 32 MiB
+	defaultAudioExtractTimeout   = 2 * time.Minute
+	defaultMaxAudioExtractedTextBytes = 8 << 10          // 8 KiB
 	defaultMaxUploadBytes        = int64(10 * (1 << 30)) // 10 GiB
 	defaultMaxTenantStorageBytes = int64(50 * (1 << 30)) // 50 GiB
 )
@@ -24,6 +27,10 @@ const (
 // Options configures Dat9Backend behavior.
 type Options struct {
 	AsyncImageExtract AsyncImageExtractOptions
+	// AsyncAudioExtract configures durable audio transcript extraction for the
+	// TiDB auto-embedding path. Unlike async image extract, there is no in-process
+	// queue; work is delivered only via semantic_tasks when runtime is wired.
+	AsyncAudioExtract AsyncAudioExtractOptions
 	QueryEmbedding    QueryEmbeddingOptions
 	MaxUploadBytes    int64
 	// MaxTenantStorageBytes caps the total logical storage a single tenant may
@@ -54,6 +61,23 @@ func AsyncImageExtractWillWireRuntime(opts AsyncImageExtractOptions) bool {
 	return opts.Enabled
 }
 
+// AsyncAudioExtractOptions configures audio transcript extraction for the database
+// auto-embedding path. Delivery uses semantic_tasks only; no local worker queue.
+type AsyncAudioExtractOptions struct {
+	Enabled             bool
+	MaxAudioBytes       int64
+	TaskTimeout         time.Duration
+	MaxExtractTextBytes int
+	Extractor           AudioTextExtractor
+}
+
+// AsyncAudioExtractWillWireRuntime reports whether async audio extraction should be
+// treated as fully configured. Unlike image extract, Phase 2 does not substitute a
+// default extractor: both Enabled and a non-nil Extractor are required.
+func AsyncAudioExtractWillWireRuntime(opts AsyncAudioExtractOptions) bool {
+	return opts.Enabled && opts.Extractor != nil
+}
+
 // QueryEmbeddingOptions controls app-side query embedding for semantic search.
 type QueryEmbeddingOptions struct {
 	Client embedding.Client
@@ -79,51 +103,73 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	}
 
 	cfg := opts.AsyncImageExtract
-	if !cfg.Enabled {
-		return
-	}
-	if cfg.QueueSize <= 0 {
-		cfg.QueueSize = defaultImageExtractQueueSize
-	}
-	if cfg.Workers <= 0 {
-		cfg.Workers = defaultImageExtractWorkers
-	}
-	if cfg.MaxImageBytes <= 0 {
-		cfg.MaxImageBytes = defaultImageExtractMaxSize
-	}
-	if cfg.TaskTimeout <= 0 {
-		cfg.TaskTimeout = defaultImageExtractTimeout
-	}
-	if cfg.MaxExtractTextBytes <= 0 {
-		cfg.MaxExtractTextBytes = defaultMaxExtractedTextBytes
-	}
-	if cfg.Extractor == nil {
-		cfg.Extractor = NewBasicImageTextExtractor()
+	if cfg.Enabled {
+		if cfg.QueueSize <= 0 {
+			cfg.QueueSize = defaultImageExtractQueueSize
+		}
+		if cfg.Workers <= 0 {
+			cfg.Workers = defaultImageExtractWorkers
+		}
+		if cfg.MaxImageBytes <= 0 {
+			cfg.MaxImageBytes = defaultImageExtractMaxSize
+		}
+		if cfg.TaskTimeout <= 0 {
+			cfg.TaskTimeout = defaultImageExtractTimeout
+		}
+		if cfg.MaxExtractTextBytes <= 0 {
+			cfg.MaxExtractTextBytes = defaultMaxExtractedTextBytes
+		}
+		if cfg.Extractor == nil {
+			cfg.Extractor = NewBasicImageTextExtractor()
+		}
+
+		b.imageExtractEnabled = true
+		b.imageExtractor = cfg.Extractor
+		b.imageExtractTimeout = cfg.TaskTimeout
+		b.imageExtractMaxSize = cfg.MaxImageBytes
+		b.maxExtractTextBytes = cfg.MaxExtractTextBytes
+		b.imageExtractQueue = make(chan ImageExtractTaskSpec, cfg.QueueSize)
+		metrics.RecordGauge("image_extract", "queue_capacity", float64(cfg.QueueSize))
+		metrics.RecordGauge("image_extract", "workers", float64(cfg.Workers))
+		metrics.RecordGauge("image_extract", "queue_depth", 0)
+
+		ctx, cancel := context.WithCancel(backgroundWithTrace())
+		b.imageExtractCancel = cancel
+		for i := 0; i < cfg.Workers; i++ {
+			b.imageExtractWG.Add(1)
+			go b.runImageExtractWorker(ctx, i+1)
+		}
+		logger.Info(ctx, "backend_image_extract_workers_started",
+			zap.Int("workers", cfg.Workers),
+			zap.Int("queue_size", cfg.QueueSize),
+			zap.Duration("task_timeout", cfg.TaskTimeout),
+			zap.Int64("max_image_bytes", cfg.MaxImageBytes),
+			zap.Int("max_extract_text_bytes", cfg.MaxExtractTextBytes),
+			zap.String("extractor_type", fmt.Sprintf("%T", cfg.Extractor)))
 	}
 
-	b.imageExtractEnabled = true
-	b.imageExtractor = cfg.Extractor
-	b.imageExtractTimeout = cfg.TaskTimeout
-	b.imageExtractMaxSize = cfg.MaxImageBytes
-	b.maxExtractTextBytes = cfg.MaxExtractTextBytes
-	b.imageExtractQueue = make(chan ImageExtractTaskSpec, cfg.QueueSize)
-	metrics.RecordGauge("image_extract", "queue_capacity", float64(cfg.QueueSize))
-	metrics.RecordGauge("image_extract", "workers", float64(cfg.Workers))
-	metrics.RecordGauge("image_extract", "queue_depth", 0)
-
-	ctx, cancel := context.WithCancel(backgroundWithTrace())
-	b.imageExtractCancel = cancel
-	for i := 0; i < cfg.Workers; i++ {
-		b.imageExtractWG.Add(1)
-		go b.runImageExtractWorker(ctx, i+1)
+	a := opts.AsyncAudioExtract
+	if AsyncAudioExtractWillWireRuntime(a) {
+		if a.MaxAudioBytes <= 0 {
+			a.MaxAudioBytes = defaultAudioExtractMaxSize
+		}
+		if a.TaskTimeout <= 0 {
+			a.TaskTimeout = defaultAudioExtractTimeout
+		}
+		if a.MaxExtractTextBytes <= 0 {
+			a.MaxExtractTextBytes = defaultMaxAudioExtractedTextBytes
+		}
+		b.audioExtractEnabled = true
+		b.audioExtractor = a.Extractor
+		b.audioExtractTimeout = a.TaskTimeout
+		b.audioExtractMaxSize = a.MaxAudioBytes
+		b.maxAudioExtractTextBytes = a.MaxExtractTextBytes
+		logger.Info(backgroundWithTrace(), "backend_audio_extract_runtime_configured",
+			zap.Duration("task_timeout", a.TaskTimeout),
+			zap.Int64("max_audio_bytes", a.MaxAudioBytes),
+			zap.Int("max_extract_text_bytes", a.MaxExtractTextBytes),
+			zap.String("extractor_type", fmt.Sprintf("%T", a.Extractor)))
 	}
-	logger.Info(ctx, "backend_image_extract_workers_started",
-		zap.Int("workers", cfg.Workers),
-		zap.Int("queue_size", cfg.QueueSize),
-		zap.Duration("task_timeout", cfg.TaskTimeout),
-		zap.Int64("max_image_bytes", cfg.MaxImageBytes),
-		zap.Int("max_extract_text_bytes", cfg.MaxExtractTextBytes),
-		zap.String("extractor_type", fmt.Sprintf("%T", cfg.Extractor)))
 }
 
 // Close stops background workers owned by this backend instance.

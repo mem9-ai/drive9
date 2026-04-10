@@ -55,6 +55,13 @@ type Dat9Backend struct {
 	imageExtractTimeout time.Duration
 	imageExtractMaxSize int64
 	maxExtractTextBytes int
+
+	// Durable audio transcript extraction (semantic_tasks only; no local queue).
+	audioExtractEnabled      bool
+	audioExtractor           AudioTextExtractor
+	audioExtractTimeout      time.Duration
+	audioExtractMaxSize      int64
+	maxAudioExtractTextBytes int
 }
 
 func newBaseBackend(store *datastore.Store) *Dat9Backend {

@@ -82,20 +82,26 @@ func (b *Dat9Backend) hasAsyncImageTextSource(path, contentType string) bool {
 	return isImageContentType(contentTypeFromPath(path))
 }
 
-// dat9AutoSemanticTaskTypes is the immutable slice returned when this backend
-// exposes auto-managed img_extract_text work. Callers must not mutate it.
-var dat9AutoSemanticTaskTypes = []semantic.TaskType{semantic.TaskTypeImgExtractText}
-
 // AutoSemanticTaskTypes returns durable semantic task types executed on the
-// database auto-embedding (TiDB auto) path — today only img_extract_text when
-// async image extraction runtime is configured.
+// database auto-embedding (TiDB auto) path: img_extract_text and/or
+// audio_extract_text when the corresponding async runtimes are configured.
 //
 // It does not include app-managed embed work; embed routing uses the worker
 // embedder, not the backend. A nil return means this backend contributes no
 // auto semantic tasks. The returned slice must be treated as read-only.
 func (b *Dat9Backend) AutoSemanticTaskTypes() []semantic.TaskType {
-	if b == nil || !b.UsesDatabaseAutoEmbedding() || !b.SupportsAsyncImageExtract() {
+	if b == nil || !b.UsesDatabaseAutoEmbedding() {
 		return nil
 	}
-	return dat9AutoSemanticTaskTypes
+	var out []semantic.TaskType
+	if b.SupportsAsyncImageExtract() {
+		out = append(out, semantic.TaskTypeImgExtractText)
+	}
+	if b.SupportsAsyncAudioExtract() {
+		out = append(out, semantic.TaskTypeAudioExtractText)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
