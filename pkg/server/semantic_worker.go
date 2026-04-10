@@ -166,29 +166,39 @@ func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Sto
 	if fallback == nil && !hasMultiTenant {
 		return nil
 	}
-	hasEmbedHandler := embedder != nil
-	hasImageHandler := (fallback != nil && fallback.SupportsAsyncImageExtract()) || (pool != nil && pool.SupportsAsyncImageExtract())
-	if !hasEmbedHandler && !hasImageHandler {
-		return nil
-	}
-	if fallback != nil && !hasMultiTenant {
-		if fallback.UsesDatabaseAutoEmbedding() {
-			if !fallback.SupportsAsyncImageExtract() {
-				return nil
-			}
-		} else if !hasEmbedHandler {
-			return nil
-		}
-	}
-	opts.normalize()
-	return &semanticWorkerManager{
+	m := &semanticWorkerManager{
 		fallback: fallback,
 		meta:     metaStore,
 		pool:     pool,
 		embedder: embedder,
-		opts:     opts,
-		inflight: make(map[string]int),
 	}
+	app := m.appManagedTaskTypes()
+	var poolAuto []semantic.TaskType
+	if pool != nil {
+		poolAuto = pool.AutoSemanticTaskTypes()
+	}
+	var fbAuto []semantic.TaskType
+	if fallback != nil {
+		fbAuto = fallback.AutoSemanticTaskTypes()
+	}
+	if !hasAnyTaskTypes(app) && !hasAnyTaskTypes(poolAuto) && !hasAnyTaskTypes(fbAuto) {
+		return nil
+	}
+	// Single-tenant mode: require a viable fallback — either auto image path is
+	// fully configured, or app-managed embed is available.
+	if fallback != nil && !hasMultiTenant {
+		if fallback.UsesDatabaseAutoEmbedding() {
+			if !hasAnyTaskTypes(fallback.AutoSemanticTaskTypes()) {
+				return nil
+			}
+		} else if !hasAnyTaskTypes(app) {
+			return nil
+		}
+	}
+	opts.normalize()
+	m.opts = opts
+	m.inflight = make(map[string]int)
+	return m
 }
 
 func (m *semanticWorkerManager) Start(ctx context.Context) {
@@ -528,7 +538,7 @@ func (m *semanticWorkerManager) listTenantRefs(ctx context.Context) ([]semanticT
 		refs := make([]semanticTenantRef, 0, len(tenants))
 		for i := range tenants {
 			t := tenants[i]
-			if !m.supportsTenantProvider(t.Provider) {
+			if !hasAnyTaskTypes(m.taskTypesForProvider(t.Provider)) {
 				continue
 			}
 			refs = append(refs, semanticTenantRef{id: t.ID, tenant: &t})
@@ -550,7 +560,7 @@ func (m *semanticWorkerManager) targetForRef(ctx context.Context, ref semanticTe
 			tenantID:         ref.id,
 			backend:          m.fallback,
 			store:            m.fallback.Store(),
-			allowedTaskTypes: m.allowedTaskTypesForTarget(m.fallback),
+			allowedTaskTypes: m.taskTypesForTarget(m.fallback),
 			release:          func() {},
 		}, nil
 	}
@@ -569,7 +579,7 @@ func (m *semanticWorkerManager) targetForRef(ctx context.Context, ref semanticTe
 		tenantID:         ref.id,
 		backend:          b,
 		store:            b.Store(),
-		allowedTaskTypes: m.allowedTaskTypesForTarget(b),
+		allowedTaskTypes: m.taskTypesForTarget(b),
 		release:          release,
 	}, nil
 }
@@ -981,25 +991,31 @@ func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time
 	return snapshot
 }
 
-func (m *semanticWorkerManager) hasEmbedHandler() bool {
-	return m != nil && m.embedder != nil
+func hasAnyTaskTypes(types []semantic.TaskType) bool {
+	return len(types) > 0
 }
 
-func (m *semanticWorkerManager) hasImageHandler() bool {
+// appManagedTaskTypes returns task types driven by the worker embedder (app-managed path).
+func (m *semanticWorkerManager) appManagedTaskTypes() []semantic.TaskType {
+	if m == nil || m.embedder == nil {
+		return nil
+	}
+	return semanticWorkerAllowedEmbedTaskTypes
+}
+
+// taskTypesForProvider is the routing filter for meta tenant list scanning: TiDB-auto
+// tenants use pool auto types; others require app-managed embed.
+func (m *semanticWorkerManager) taskTypesForProvider(provider string) []semantic.TaskType {
 	if m == nil {
-		return false
+		return nil
 	}
-	if m.fallback != nil && m.fallback.SupportsAsyncImageExtract() {
-		return true
-	}
-	return m.pool != nil && m.pool.SupportsAsyncImageExtract()
-}
-
-func (m *semanticWorkerManager) supportsTenantProvider(provider string) bool {
 	if semanticWorkerUsesTiDBAutoEmbedding(provider) {
-		return m.pool != nil && m.pool.SupportsAsyncImageExtract()
+		if m.pool == nil {
+			return nil
+		}
+		return m.pool.AutoSemanticTaskTypes()
 	}
-	return m.hasEmbedHandler()
+	return m.appManagedTaskTypes()
 }
 
 func (m *semanticWorkerManager) shouldIncludeFallback() bool {
@@ -1007,25 +1023,20 @@ func (m *semanticWorkerManager) shouldIncludeFallback() bool {
 		return false
 	}
 	if m.fallback.UsesDatabaseAutoEmbedding() {
-		return m.hasImageHandler()
+		return hasAnyTaskTypes(m.fallback.AutoSemanticTaskTypes())
 	}
-	return m.hasEmbedHandler()
+	return hasAnyTaskTypes(m.appManagedTaskTypes())
 }
 
-func (m *semanticWorkerManager) allowedTaskTypesForTarget(b *backend.Dat9Backend) []semantic.TaskType {
+// taskTypesForTarget is the effective ClaimSemanticTask filter for a concrete backend.
+func (m *semanticWorkerManager) taskTypesForTarget(b *backend.Dat9Backend) []semantic.TaskType {
 	if m == nil || b == nil {
 		return nil
 	}
 	if b.UsesDatabaseAutoEmbedding() {
-		if b.SupportsAsyncImageExtract() {
-			return semanticWorkerAllowedImgExtractTaskTypes
-		}
-		return nil
+		return b.AutoSemanticTaskTypes()
 	}
-	if m.embedder != nil {
-		return semanticWorkerAllowedEmbedTaskTypes
-	}
-	return nil
+	return m.appManagedTaskTypes()
 }
 
 func imageExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.ImageExtractTaskSpec {

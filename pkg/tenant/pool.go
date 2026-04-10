@@ -16,6 +16,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/dat9/pkg/semantic"
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 	"go.uber.org/zap"
 )
@@ -213,6 +214,22 @@ func (p *Pool) Encrypt(ctx context.Context, plain []byte) ([]byte, error) {
 // pool carry the async image extraction runtime.
 func (p *Pool) SupportsAsyncImageExtract() bool {
 	return p != nil && p.cfg.BackendOptions.AsyncImageExtract.Enabled
+}
+
+// poolAutoSemanticTaskTypes is the immutable slice for pool-level auto routing
+// when async image extract is enabled in BackendOptions. Callers must not mutate it.
+var poolAutoSemanticTaskTypes = []semantic.TaskType{semantic.TaskTypeImgExtractText}
+
+// AutoSemanticTaskTypes returns the auto-backend durable semantic task types
+// implied by PoolConfig.BackendOptions (async image extract). This is a coarse
+// routing hint for tenant list filtering before a backend is acquired; it does
+// not include app-managed embed tasks. Nil means the pool contributes no auto
+// semantic tasks. The returned slice must be treated as read-only.
+func (p *Pool) AutoSemanticTaskTypes() []semantic.TaskType {
+	if p == nil || !p.cfg.BackendOptions.AsyncImageExtract.Enabled {
+		return nil
+	}
+	return poolAutoSemanticTaskTypes
 }
 
 func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantID string) (out *backend.Dat9Backend) {
