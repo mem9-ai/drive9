@@ -211,7 +211,7 @@ func Mount(opts *MountOptions) error {
 	}
 
 	// Start SSE watcher for remote change notifications.
-	sseWatcher := StartSSEWatcher(dat9fs, opts.Server, opts.APIKey, actorID)
+	sseWatcher := StartSSEWatcher(dat9fs, c, actorID)
 
 	// Start serving in a background goroutine so WaitMount can proceed.
 	// On macOS, Serve() must be running before WaitMount() returns because

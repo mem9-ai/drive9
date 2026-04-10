@@ -4,6 +4,8 @@ import (
 	"path"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/client"
 )
 
 func TestSSEWatcherResetPreservesInodes(t *testing.T) {
@@ -78,7 +80,7 @@ func TestSSEWatcherHandleChangeInvalidatesCache(t *testing.T) {
 	w := &SSEWatcher{fs: fs, actor: "my-actor"}
 
 	// A change from a different actor should invalidate caches.
-	w.handleChange(changeEvent{
+	w.handleChange(&client.ChangeEvent{
 		Seq:   1,
 		Path:  "/docs/readme.md",
 		Op:    "write",
@@ -115,14 +117,66 @@ func TestSSEWatcherSelfFilterSkipsOwnEvents(t *testing.T) {
 	w := &SSEWatcher{fs: fs, actor: "my-actor"}
 
 	// An event from our own actor should be skipped.
-	w.handleEvent(sseEvent{
-		Type: "file_changed",
-		Data: []byte(`{"seq":1,"path":"/test.txt","op":"write","actor":"my-actor"}`),
-	})
+	w.handleEvent(
+		&client.ChangeEvent{Seq: 1, Path: "/test.txt", Op: "write", Actor: "my-actor"},
+		nil,
+	)
 
 	// Cache should NOT be invalidated because we skip our own events.
 	if _, ok := fs.readCache.Get("/test.txt", 1); !ok {
 		t.Error("readCache should NOT be invalidated for own actor's events")
+	}
+}
+
+func TestSSEWatcherHandleEventReset(t *testing.T) {
+	opts := &MountOptions{
+		CacheSize: 1 << 20,
+		DirTTL:    5 * time.Second,
+	}
+	opts.setDefaults()
+	fs := &Dat9FS{
+		inodes:    NewInodeToPath(),
+		readCache: NewReadCache(opts.CacheSize, 0),
+		dirCache:  NewDirCache(opts.DirTTL),
+	}
+
+	fs.readCache.Put("/test.txt", []byte("data"), 1)
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "test.txt", Size: 4}})
+
+	w := &SSEWatcher{fs: fs, actor: "my-actor"}
+
+	// A reset event should clear caches.
+	w.handleEvent(nil, &client.ResetEvent{Seq: 5, Reason: "structural_change"})
+
+	if _, ok := fs.readCache.Get("/test.txt", 1); ok {
+		t.Error("readCache should be cleared after reset")
+	}
+	if _, ok := fs.dirCache.Get("/"); ok {
+		t.Error("dirCache should be cleared after reset")
+	}
+}
+
+func TestSSEWatcherHeartbeatDoesNotReset(t *testing.T) {
+	opts := &MountOptions{
+		CacheSize: 1 << 20,
+		DirTTL:    5 * time.Second,
+	}
+	opts.setDefaults()
+	fs := &Dat9FS{
+		inodes:    NewInodeToPath(),
+		readCache: NewReadCache(opts.CacheSize, 0),
+		dirCache:  NewDirCache(opts.DirTTL),
+	}
+
+	fs.readCache.Put("/test.txt", []byte("data"), 1)
+
+	w := &SSEWatcher{fs: fs, actor: "my-actor"}
+
+	// A heartbeat (reset with empty reason) should NOT clear caches.
+	w.handleEvent(nil, &client.ResetEvent{Seq: 5, Reason: ""})
+
+	if _, ok := fs.readCache.Get("/test.txt", 1); !ok {
+		t.Error("readCache should NOT be cleared after heartbeat")
 	}
 }
 
