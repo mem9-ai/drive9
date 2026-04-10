@@ -90,7 +90,7 @@ func TestSSEEndpointReplay(t *testing.T) {
 	bus := srv.events.get("")
 
 	bus.Publish("/a.txt", "write", "actor1")
-	bus.Publish("/b.txt", "delete", "actor2")
+	bus.Publish("/b.txt", "write", "actor2")
 	bus.Publish("/c.txt", "write", "actor1")
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -123,7 +123,7 @@ func TestSSEEndpointReplay(t *testing.T) {
 	if err := json.Unmarshal([]byte(ev1.Data), &data1); err != nil {
 		t.Fatalf("unmarshal event1: %v", err)
 	}
-	if data1.Path != "/b.txt" || data1.Op != "delete" {
+	if data1.Path != "/b.txt" || data1.Op != "write" {
 		t.Errorf("event1 data: %+v", data1)
 	}
 
