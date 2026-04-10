@@ -40,6 +40,11 @@ type Dat9FS struct {
 	// kernel cache invalidation notifications (EntryNotify, InodeNotify)
 	// so that long TTLs don't serve stale data after local mutations.
 	server *gofuse.Server
+
+	// notifyWg tracks inflight asynchronous kernel notification goroutines
+	// (EntryNotify, InodeNotify). FlushAll waits on this to ensure all
+	// notifications complete before shutdown.
+	notifyWg sync.WaitGroup
 }
 
 type dirtyInodeState struct {
@@ -289,7 +294,11 @@ func (fs *Dat9FS) notifyEntry(parentIno uint64, name string) {
 	// trigger synchronous Lookup/GetAttr back into our handlers, which
 	// needs a free go-fuse worker thread. If called from within a handler,
 	// the calling worker is blocked, potentially exhausting the pool.
-	go func() { _ = fs.server.EntryNotify(parentIno, name) }()
+	fs.notifyWg.Add(1)
+	go func() {
+		defer fs.notifyWg.Done()
+		_ = fs.server.EntryNotify(parentIno, name)
+	}()
 }
 
 // notifyInode tells the kernel to invalidate cached attributes and data
@@ -298,7 +307,11 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 	if fs.server == nil {
 		return
 	}
-	go func() { _ = fs.server.InodeNotify(ino, 0, 0) }()
+	fs.notifyWg.Add(1)
+	go func() {
+		defer fs.notifyWg.Done()
+		_ = fs.server.InodeNotify(ino, 0, 0)
+	}()
 }
 
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) gofuse.Status {
@@ -1328,7 +1341,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	return gofuse.OK
 }
 
-// FlushAll flushes all open file handles and drains pending debounced uploads.
+// FlushAll flushes all open file handles, drains pending debounced uploads,
+// and waits for inflight async kernel notifications to complete.
 // Used during graceful shutdown.
 func (fs *Dat9FS) FlushAll() {
 	// Drain all pending debounced uploads first.
@@ -1353,6 +1367,9 @@ func (fs *Dat9FS) FlushAll() {
 		e.fh.Unlock()
 		cf()
 	}
+
+	// Wait for any inflight async kernel notifications to complete.
+	fs.notifyWg.Wait()
 }
 
 // StatFs reports a generous virtual capacity so that apps (Obsidian, Finder)

@@ -714,8 +714,12 @@ func TestNotifyEntry_NonBlocking(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(client.New("http://localhost", ""), opts)
-	// fs.server is nil — verify it doesn't panic.
-	// In production, fs.server != nil and the go func() ensures no block.
+
+	// Set a non-nil server so notifyEntry/notifyInode actually enter the
+	// async goroutine path (a zero-value Server returns ENOSYS immediately
+	// from EntryNotify/InodeNotify, which is fine — we just need the
+	// goroutine to be spawned and complete).
+	fs.Init(&gofuse.Server{})
 
 	done := make(chan struct{})
 	go func() {
@@ -728,6 +732,18 @@ func TestNotifyEntry_NonBlocking(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("notifyEntry/notifyInode blocked for > 1s (should be async)")
+	}
+
+	// Wait for the async goroutines to complete and verify WaitGroup drains.
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		fs.notifyWg.Wait()
+	}()
+	select {
+	case <-drainDone:
+	case <-time.After(time.Second):
+		t.Fatal("notifyWg.Wait() blocked — async notifications not completing")
 	}
 }
 
@@ -764,6 +780,7 @@ func TestMutationHandlers_CompleteWithinTimeout(t *testing.T) {
 	// Pre-populate some inodes for mutation tests
 	fs.inodes.Lookup("/existing.txt", false, 100, time.Now())
 	fs.inodes.Lookup("/oldname.txt", false, 100, time.Now())
+	fs.inodes.Lookup("/existingdir", true, 0, time.Now())
 
 	tests := []struct {
 		name string
@@ -791,6 +808,21 @@ func TestMutationHandlers_CompleteWithinTimeout(t *testing.T) {
 			name: "Unlink",
 			fn: func() gofuse.Status {
 				return fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "existing.txt")
+			},
+		},
+		{
+			name: "Rmdir",
+			fn: func() gofuse.Status {
+				return fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "existingdir")
+			},
+		},
+		{
+			name: "Rename",
+			fn: func() gofuse.Status {
+				return fs.Rename(nil, &gofuse.RenameIn{
+					InHeader: gofuse.InHeader{NodeId: 1},
+					Newdir:   1,
+				}, "oldname.txt", "renamed.txt")
 			},
 		},
 	}
