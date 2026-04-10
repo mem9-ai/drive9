@@ -20,7 +20,7 @@ func MountCmd(args []string) error {
 	dirTTL := fs.Duration("dir-ttl", 5*time.Second, "directory cache TTL")
 	attrTTL := fs.Duration("attr-ttl", 1*time.Second, "kernel attr cache TTL")
 	entryTTL := fs.Duration("entry-ttl", 1*time.Second, "kernel entry cache TTL")
-	flushDebounce := fs.Duration("flush-debounce", 2*time.Second, "debounce window for small-file flush coalescing (0 disables)")
+	flushDebounce := fs.Duration("flush-debounce", -1, "debounce window for small-file flush coalescing (default 2s, 0 disables)")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
 	debug := fs.Bool("debug", false, "enable FUSE debug logging")

@@ -531,7 +531,7 @@ func TestLookup_UsesMtimeFromStat(t *testing.T) {
 // the scenario: Flush debounces → ClearDirty → Release cancels timer →
 // flushHandle sees no dirty data → data never uploaded.
 func TestDebounce_ReleaseAfterFlush_NoDataLoss(t *testing.T) {
-	var uploaded []byte
+	uploadedCh := make(chan []byte, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodHead:
@@ -547,7 +547,7 @@ func TestDebounce_ReleaseAfterFlush_NoDataLoss(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		case http.MethodPut:
 			body, _ := io.ReadAll(r.Body)
-			uploaded = body
+			uploadedCh <- append([]byte(nil), body...)
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusOK)
@@ -592,11 +592,13 @@ func TestDebounce_ReleaseAfterFlush_NoDataLoss(t *testing.T) {
 		Fh:       createOut.Fh,
 	})
 
-	// Verify data was uploaded
-	if uploaded == nil {
+	// Verify data was uploaded (use channel to avoid race)
+	select {
+	case uploaded := <-uploadedCh:
+		if string(uploaded) != "important data" {
+			t.Fatalf("uploaded = %q, want %q", uploaded, "important data")
+		}
+	case <-time.After(time.Second):
 		t.Fatal("data was never uploaded — data loss!")
-	}
-	if string(uploaded) != "important data" {
-		t.Fatalf("uploaded = %q, want %q", uploaded, "important data")
 	}
 }

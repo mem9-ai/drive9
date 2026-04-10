@@ -150,18 +150,19 @@ Five tables per tenant:
 
 ## Mount options
 
-```
+```text
 drive9 mount [flags] <mountpoint>
 
-  --server       Server URL (default: $DRIVE9_SERVER)
-  --api-key      API key (default: $DRIVE9_API_KEY)
-  --cache-size   Read cache size in MB (default: 128)
-  --dir-ttl      Directory cache TTL (default: 5s)
-  --attr-ttl     Kernel attr cache TTL (default: 60s)
-  --entry-ttl    Kernel entry cache TTL (default: 60s)
-  --allow-other  Allow other users to access mount
-  --read-only    Mount as read-only
-  --debug        Enable FUSE debug logging
+  --server           Server URL (default: $DRIVE9_SERVER)
+  --api-key          API key (default: $DRIVE9_API_KEY)
+  --cache-size       Read cache size in MB (default: 128)
+  --dir-ttl          Directory cache TTL (default: 5s)
+  --attr-ttl         Kernel attr cache TTL (default: 60s)
+  --entry-ttl        Kernel entry cache TTL (default: 60s)
+  --flush-debounce   Small-file flush debounce window (default: 2s, 0 disables)
+  --allow-other      Allow other users to access mount
+  --read-only        Mount as read-only
+  --debug            Enable FUSE debug logging
 ```
 
 ## Building

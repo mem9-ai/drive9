@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -62,7 +63,13 @@ func New(baseURL, apiKey string) *Client {
 		if err == nil {
 			return conn, nil
 		}
-		// System DNS failed — resolve with fallback DNS and retry.
+		// Only fall back to public DNS on actual DNS resolution errors.
+		// Non-DNS errors (connection refused, timeout, etc.) should not
+		// leak internal hostnames to public resolvers.
+		var dnsErr *net.DNSError
+		if !errors.As(err, &dnsErr) {
+			return nil, err
+		}
 		host, port, splitErr := net.SplitHostPort(addr)
 		if splitErr != nil {
 			return nil, err // return original error

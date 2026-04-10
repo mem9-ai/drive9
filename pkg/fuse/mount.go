@@ -20,7 +20,7 @@ type MountOptions struct {
 	DirTTL        time.Duration // DirCache TTL (default 5s)
 	AttrTTL       time.Duration // kernel attr cache TTL (default 1s)
 	EntryTTL      time.Duration // kernel entry cache TTL (default 1s)
-	FlushDebounce time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables)
+	FlushDebounce time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
 	AllowOther    bool          // allow other users to access mount
 	ReadOnly      bool          // mount as read-only
 	Debug         bool          // enable FUSE debug logging
@@ -39,7 +39,8 @@ func (o *MountOptions) setDefaults() {
 	if o.EntryTTL <= 0 {
 		o.EntryTTL = 60 * time.Second
 	}
-	if o.FlushDebounce <= 0 {
+	// FlushDebounce: 0 means disabled, negative means unset (use default).
+	if o.FlushDebounce < 0 {
 		o.FlushDebounce = defaultFlushDebounce
 	}
 }

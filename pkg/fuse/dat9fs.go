@@ -1065,17 +1065,18 @@ func (fs *Dat9FS) flushHandleDebounced(fh *FileHandle, force bool) gofuse.Status
 	copy(data, fh.Dirty.Bytes())
 	filePath := fh.Path
 	ino := fh.Ino
-	handle := fh // capture for goroutine
+	handle := fh          // capture for goroutine
+	snapshotSeq := fh.DirtySeq // capture current dirty sequence
 
 	fs.debouncer.Schedule(filePath, func() {
 		if err := fs.client.Write(filePath, data); err != nil {
 			log.Printf("debounced flush failed for %s: %v", filePath, err)
 			return
 		}
-		// Clear dirty under fh.mu after successful upload so that a
-		// subsequent Release → flushHandle does not re-upload the same data.
+		// Only clear dirty if no writes occurred since the snapshot was taken.
+		// If DirtySeq changed, the buffer has new data that wasn't uploaded.
 		handle.Lock()
-		if handle.Dirty != nil {
+		if handle.Dirty != nil && handle.DirtySeq == snapshotSeq {
 			handle.Dirty.ClearDirty()
 		}
 		handle.Unlock()

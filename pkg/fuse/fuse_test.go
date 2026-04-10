@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1200,36 +1201,45 @@ func TestFlushDebouncer_ScheduleAndFire(t *testing.T) {
 
 func TestFlushDebouncer_CoalescesRapidSchedules(t *testing.T) {
 	d := newFlushDebouncer(100 * time.Millisecond)
-	callCount := 0
-	var lastVal int
+	var callCount atomic.Int32
+	var lastVal atomic.Int32
+	done := make(chan struct{}, 1)
 	for i := 0; i < 5; i++ {
-		v := i
+		v := int32(i)
 		d.Schedule("/a", func() {
-			callCount++
-			lastVal = v
+			callCount.Add(1)
+			lastVal.Store(v)
+			select {
+			case done <- struct{}{}:
+			default:
+			}
 		})
 		time.Sleep(20 * time.Millisecond)
 	}
 
 	// Wait for the debounce to fire
-	time.Sleep(200 * time.Millisecond)
-
-	if callCount != 1 {
-		t.Fatalf("callCount = %d, want 1 (coalesced)", callCount)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("debounce did not fire within 1s")
 	}
-	if lastVal != 4 {
-		t.Fatalf("lastVal = %d, want 4 (latest schedule)", lastVal)
+
+	if c := callCount.Load(); c != 1 {
+		t.Fatalf("callCount = %d, want 1 (coalesced)", c)
+	}
+	if v := lastVal.Load(); v != 4 {
+		t.Fatalf("lastVal = %d, want 4 (latest schedule)", v)
 	}
 }
 
 func TestFlushDebouncer_Cancel(t *testing.T) {
 	d := newFlushDebouncer(100 * time.Millisecond)
-	called := false
-	d.Schedule("/a", func() { called = true })
+	var called atomic.Bool
+	d.Schedule("/a", func() { called.Store(true) })
 	d.Cancel("/a")
 
 	time.Sleep(200 * time.Millisecond)
-	if called {
+	if called.Load() {
 		t.Fatal("upload should not have been called after Cancel")
 	}
 }
