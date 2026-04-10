@@ -117,6 +117,131 @@ func TestSemanticTaskAckWrongReceiptFails(t *testing.T) {
 	}
 }
 
+func TestSemanticTaskRenewExtendsLease(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if _, err := s.EnqueueSemanticTask(ctx, newSemanticTask("task-1", "file-1", 1, now, now)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := s.ClaimSemanticTask(ctx, now.Add(time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected claim to find task")
+	}
+
+	renewedUntil, err := s.RenewSemanticTask(ctx, claimed.TaskID, claimed.Receipt, 2*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !renewedUntil.After(*claimed.LeaseUntil) {
+		t.Fatalf("renewed lease_until=%s, want after %s", renewedUntil.UTC(), claimed.LeaseUntil.UTC())
+	}
+
+	task := mustGetSemanticTask(t, s, claimed.TaskID)
+	if task.Status != semantic.TaskProcessing {
+		t.Fatalf("status=%q, want %q", task.Status, semantic.TaskProcessing)
+	}
+	if task.AttemptCount != 1 {
+		t.Fatalf("attempt_count=%d, want 1", task.AttemptCount)
+	}
+	if !task.AvailableAt.Equal(claimed.AvailableAt) {
+		t.Fatalf("available_at=%s, want %s", task.AvailableAt.UTC(), claimed.AvailableAt.UTC())
+	}
+	if task.LeaseUntil == nil {
+		t.Fatal("stored lease_until should not be nil after renew")
+	}
+	if !task.LeaseUntil.After(*claimed.LeaseUntil) {
+		t.Fatalf("stored lease_until=%s, want after %s", task.LeaseUntil.UTC(), claimed.LeaseUntil.UTC())
+	}
+	if delta := task.LeaseUntil.Sub(renewedUntil); delta < -time.Second || delta > time.Second {
+		t.Fatalf("stored lease_until=%s, renewed_until=%s, delta=%s", task.LeaseUntil.UTC(), renewedUntil.UTC(), delta)
+	}
+}
+
+func TestSemanticTaskRenewWrongReceiptFails(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if _, err := s.EnqueueSemanticTask(ctx, newSemanticTask("task-1", "file-1", 1, now, now)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := s.ClaimSemanticTask(ctx, now.Add(time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected claim to find task")
+	}
+
+	_, err = s.RenewSemanticTask(ctx, claimed.TaskID, "wrong-receipt", time.Minute)
+	if !errors.Is(err, semantic.ErrTaskLeaseMismatch) {
+		t.Fatalf("renew error=%v, want %v", err, semantic.ErrTaskLeaseMismatch)
+	}
+}
+
+func TestSemanticTaskRenewExpiredLeaseFails(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	availableAt := now.Add(-time.Second)
+
+	if _, err := s.EnqueueSemanticTask(ctx, newSemanticTask("task-1", "file-1", 1, availableAt, now)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := s.ClaimSemanticTask(ctx, time.Now().UTC(), 20*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected claim to find task")
+	}
+
+	time.Sleep(40 * time.Millisecond)
+
+	_, err = s.RenewSemanticTask(ctx, claimed.TaskID, claimed.Receipt, time.Minute)
+	if !errors.Is(err, semantic.ErrTaskLeaseMismatch) {
+		t.Fatalf("renew error=%v, want %v", err, semantic.ErrTaskLeaseMismatch)
+	}
+}
+
+func TestSemanticTaskRenewAfterAckFails(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if _, err := s.EnqueueSemanticTask(ctx, newSemanticTask("task-1", "file-1", 1, now, now)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := s.ClaimSemanticTask(ctx, now.Add(time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected claim to find task")
+	}
+	if err := s.AckSemanticTask(ctx, claimed.TaskID, claimed.Receipt); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.RenewSemanticTask(ctx, claimed.TaskID, claimed.Receipt, time.Minute)
+	if !errors.Is(err, semantic.ErrTaskLeaseMismatch) {
+		t.Fatalf("renew error=%v, want %v", err, semantic.ErrTaskLeaseMismatch)
+	}
+}
+
+func TestSemanticTaskRenewNotFoundFails(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.RenewSemanticTask(context.Background(), "missing-task", "missing-receipt", time.Minute)
+	if !errors.Is(err, semantic.ErrTaskNotFound) {
+		t.Fatalf("renew error=%v, want %v", err, semantic.ErrTaskNotFound)
+	}
+}
+
 func TestSemanticTaskClaimOrderByAvailableAtThenCreatedAt(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

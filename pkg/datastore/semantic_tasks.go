@@ -373,6 +373,44 @@ func (s *Store) AckSemanticTask(ctx context.Context, taskID, receipt string) (er
 	return s.semanticTaskLeaseError(ctx, taskID)
 }
 
+// RenewSemanticTask extends the lease for a currently owned processing task.
+// The renewal succeeds only when task ownership is still valid, meaning:
+// status is processing, receipt matches, and lease_until has not expired.
+//
+// It returns semantic.ErrTaskNotFound when taskID does not exist, and
+// semantic.ErrTaskLeaseMismatch when the lease is no longer owned by receipt.
+func (s *Store) RenewSemanticTask(ctx context.Context, taskID, receipt string, leaseDuration time.Duration) (leaseUntil time.Time, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "renew_semantic_task", start, &err)
+
+	now := time.Now().UTC()
+	if leaseDuration <= 0 {
+		leaseDuration = 30 * time.Second
+	}
+	leaseUntil = now.Add(leaseDuration)
+	res, err := s.db.ExecContext(ctx, `UPDATE semantic_tasks SET lease_until = ?, updated_at = ?
+		WHERE task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`,
+		leaseUntil, now, taskID, semantic.TaskProcessing, receipt, now)
+	if err != nil {
+		return time.Time{}, err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return time.Time{}, err
+	}
+	if rowsAffected > 0 {
+		return leaseUntil, nil
+	}
+	err = s.semanticTaskLeaseError(ctx, taskID)
+	if err == nil {
+		// semanticTaskLeaseError should classify a zero-row renew as either
+		// not-found or lease-mismatch. Keep a defensive fallback so a future
+		// helper change cannot accidentally surface a false-success renew path.
+		err = semantic.ErrTaskLeaseMismatch
+	}
+	return time.Time{}, err
+}
+
 // RetrySemanticTask requeues or dead-letters a leased semantic task.
 func (s *Store) RetrySemanticTask(ctx context.Context, taskID, receipt string, retryAt time.Time, lastErr string) (err error) {
 	start := time.Now()

@@ -102,6 +102,7 @@ embedding. Override any var before running.
 ```
 cmd/drive9/          CLI entrypoint (cp, cat, ls, mv, rm, mount, umount, ...)
 cmd/drive9-server/     Server entrypoint
+.github/ISSUE_TEMPLATE/ GitHub issue templates (bug report / enhancement / feature request)
 pkg/
   backend/           AGFS FileSystem implementation (Drive9Backend)
   client/            Go SDK HTTP client
@@ -125,6 +126,9 @@ scripts/             Shell helpers for local dev and test
 docs/                Design documents
 site/                Frontend / release assets
 ```
+
+When creating a new GitHub issue, follow the templates under `.github/ISSUE_TEMPLATE/`
+to keep issue structure and required context consistent.
 
 ---
 
