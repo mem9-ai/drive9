@@ -140,6 +140,14 @@ func NewWithConfig(cfg Config) *Server {
 		s.resumeProvisioningTenants()
 	}
 	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
+	appManagedTaskTypes := semanticWorkerLogTaskTypes(cfg.SemanticEmbedder != nil)
+	var fallbackTaskTypes, poolAutoTaskTypes []string
+	if cfg.Backend != nil {
+		fallbackTaskTypes = semanticWorkerLogTaskTypesFromTypes(cfg.Backend.AutoSemanticTaskTypes())
+	}
+	if cfg.Pool != nil {
+		poolAutoTaskTypes = semanticWorkerLogTaskTypesFromTypes(cfg.Pool.AutoSemanticTaskTypes())
+	}
 	if s.semanticWorker != nil {
 		logger.Info("server_semantic_workers_enabled",
 			zap.Int("workers", s.semanticWorker.opts.Workers),
@@ -147,12 +155,18 @@ func NewWithConfig(cfg Config) *Server {
 			zap.Duration("lease_duration", s.semanticWorker.opts.LeaseDuration),
 			zap.Duration("recover_interval", s.semanticWorker.opts.RecoverInterval),
 			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
+			zap.Strings("app_managed_task_types", appManagedTaskTypes),
+			zap.Strings("fallback_task_types", fallbackTaskTypes),
+			zap.Strings("pool_auto_task_types", poolAutoTaskTypes),
 			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
 			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()))
 		s.semanticWorker.Start(backgroundWithTrace(context.Background()))
 	} else {
 		logger.Info("server_semantic_workers_disabled",
 			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
+			zap.Strings("app_managed_task_types", appManagedTaskTypes),
+			zap.Strings("fallback_task_types", fallbackTaskTypes),
+			zap.Strings("pool_auto_task_types", poolAutoTaskTypes),
 			zap.Bool("fallback_present", cfg.Backend != nil),
 			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
 			zap.Bool("pool_present", cfg.Pool != nil),

@@ -1065,3 +1065,23 @@ func chainReleases(first, second func()) func() {
 		}
 	}
 }
+
+// semanticWorkerLogTaskTypes returns app-managed task type names for server startup logs.
+func semanticWorkerLogTaskTypes(embedderConfigured bool) []string {
+	if !embedderConfigured {
+		return nil
+	}
+	return []string{string(semantic.TaskTypeEmbed)}
+}
+
+// semanticWorkerLogTaskTypesFromTypes stringifies AutoSemanticTaskTypes-style slices for zap.
+func semanticWorkerLogTaskTypesFromTypes(types []semantic.TaskType) []string {
+	if len(types) == 0 {
+		return nil
+	}
+	out := make([]string, len(types))
+	for i, t := range types {
+		out[i] = string(t)
+	}
+	return out
+}
