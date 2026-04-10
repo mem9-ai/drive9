@@ -41,13 +41,21 @@ var (
 
 // SemanticWorkerOptions controls background semantic task processing.
 type SemanticWorkerOptions struct {
-	Workers              int
-	PollInterval         time.Duration
-	LeaseDuration        time.Duration
-	RecoverInterval      time.Duration
-	RetryBaseDelay       time.Duration
-	RetryMaxDelay        time.Duration
-	TenantScanLimit      int
+	// Workers is the number of polling worker goroutines.
+	Workers int
+	// PollInterval is the idle wait between claim attempts.
+	PollInterval time.Duration
+	// LeaseDuration is the base task lease window used by claim and renew.
+	LeaseDuration time.Duration
+	// RecoverInterval controls how often expired leases are swept back to queue.
+	RecoverInterval time.Duration
+	// RetryBaseDelay is the initial backoff for retry scheduling.
+	RetryBaseDelay time.Duration
+	// RetryMaxDelay is the cap for exponential retry backoff.
+	RetryMaxDelay time.Duration
+	// TenantScanLimit bounds active tenants checked per scheduling pass.
+	TenantScanLimit int
+	// PerTenantConcurrency limits concurrent tasks per tenant.
 	PerTenantConcurrency int
 }
 
@@ -116,6 +124,39 @@ type semanticObservationSnapshot struct {
 	deadLettered    int
 	queueLagSeconds float64
 	inflight        int
+}
+
+type semanticTaskAction string
+
+const (
+	semanticTaskActionAck   semanticTaskAction = "ack"
+	semanticTaskActionRetry semanticTaskAction = "retry"
+)
+
+type semanticTaskOutcome struct {
+	action  semanticTaskAction
+	result  string
+	message string
+}
+
+type semanticTaskLeaseExecution struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	stopOnce sync.Once
+
+	mu             sync.Mutex
+	lost           bool
+	renewAttempted bool
+	lastLeaseUntil *time.Time
+}
+
+type semanticTaskLeaseOutcome struct {
+	lost           bool
+	renewAttempted bool
+	lastLeaseUntil *time.Time
 }
 
 func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store, pool *tenant.Pool, embedder embedding.Client, opts SemanticWorkerOptions) *semanticWorkerManager {
@@ -259,7 +300,7 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 }
 
 func (m *semanticWorkerManager) processTask(ctx context.Context, target *semanticTarget, task *semantic.Task) {
-	if task == nil {
+	if task == nil || target == nil {
 		return
 	}
 	start := time.Now()
@@ -267,7 +308,32 @@ func (m *semanticWorkerManager) processTask(ctx context.Context, target *semanti
 	defer func() {
 		metrics.RecordOperation("semantic_worker", string(task.TaskType), result, time.Since(start))
 	}()
-	result = m.dispatchTask(ctx, target, task)
+	leaseExec := m.startTaskLeaseExecution(ctx, target, task)
+	var (
+		leaseStopOnce sync.Once
+		leaseOutcome  semanticTaskLeaseOutcome
+	)
+	stopLease := func() semanticTaskLeaseOutcome {
+		leaseStopOnce.Do(func() {
+			leaseOutcome = leaseExec.stop()
+		})
+		return leaseOutcome
+	}
+	defer stopLease()
+	outcome := m.dispatchTask(leaseExec.leaseCtx(), target, task)
+	// Stop renewal before ack/retry so only one lease owner can finalize outcome.
+	leaseOutcome = stopLease()
+	if leaseOutcome.lost {
+		result = "lease_lost"
+		return
+	}
+	result = outcome.result
+	switch outcome.action {
+	case semanticTaskActionAck:
+		m.ackTask(ctx, target.tenantID, target.store, task, outcome.message)
+	case semanticTaskActionRetry:
+		m.retryTask(ctx, target.tenantID, target.store, task, outcome.message)
+	}
 }
 
 func (m *semanticWorkerManager) ackTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task, reason string) {
@@ -500,68 +566,251 @@ func (m *semanticWorkerManager) invalidateTenantBackend(tenantID string) {
 	m.pool.Invalidate(tenantID)
 }
 
-func (m *semanticWorkerManager) dispatchTask(ctx context.Context, target *semanticTarget, task *semantic.Task) string {
+func (m *semanticWorkerManager) dispatchTask(ctx context.Context, target *semanticTarget, task *semantic.Task) semanticTaskOutcome {
 	switch task.TaskType {
 	case semantic.TaskTypeEmbed:
-		return m.processEmbedTask(ctx, target.tenantID, target.store, task)
+		return m.processEmbedTask(ctx, target.store, task)
 	case semantic.TaskTypeImgExtractText:
-		return m.processImgExtractTask(ctx, target.tenantID, target.store, target.backend, task)
+		return m.processImgExtractTask(ctx, target.backend, task)
 	default:
-		m.retryTask(ctx, target.tenantID, target.store, task, fmt.Sprintf("unsupported task type %q", task.TaskType))
-		return "unsupported"
+		message := fmt.Sprintf("unsupported task type %q", task.TaskType)
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "unsupported", message: message}
 	}
 }
 
-func (m *semanticWorkerManager) processEmbedTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task) string {
+func (m *semanticWorkerManager) startTaskLeaseExecution(ctx context.Context, target *semanticTarget, task *semantic.Task) *semanticTaskLeaseExecution {
+	leaseCtx, cancel := context.WithCancel(ctx)
+	exec := &semanticTaskLeaseExecution{
+		ctx:    leaseCtx,
+		cancel: cancel,
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
+	if task != nil && task.LeaseUntil != nil {
+		leaseUntil := task.LeaseUntil.UTC()
+		exec.lastLeaseUntil = &leaseUntil
+	}
+	go exec.run(m, target, task)
+	return exec
+}
+
+func (m *semanticWorkerManager) leaseRenewInterval() time.Duration {
+	// Renew halfway through the lease window to keep enough slack for transient
+	// latency while avoiding unnecessary renew write amplification.
+	interval := m.opts.LeaseDuration / 2
+	if interval > 0 {
+		return interval
+	}
+	if m.opts.LeaseDuration > 0 {
+		return m.opts.LeaseDuration
+	}
+	return time.Second
+}
+
+func (e *semanticTaskLeaseExecution) leaseCtx() context.Context {
+	if e == nil || e.ctx == nil {
+		return context.Background()
+	}
+	return e.ctx
+}
+
+func (e *semanticTaskLeaseExecution) stop() semanticTaskLeaseOutcome {
+	if e == nil {
+		return semanticTaskLeaseOutcome{}
+	}
+	// close(stopCh) + cancel() ensures the renew loop exits whether it is waiting
+	// on ticker or blocked inside a datastore call using e.ctx.
+	e.stopOnce.Do(func() {
+		close(e.stopCh)
+		e.cancel()
+		<-e.doneCh
+	})
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	outcome := semanticTaskLeaseOutcome{
+		lost:           e.lost,
+		renewAttempted: e.renewAttempted,
+	}
+	if e.lastLeaseUntil != nil {
+		leaseUntil := e.lastLeaseUntil.UTC()
+		outcome.lastLeaseUntil = &leaseUntil
+	}
+	return outcome
+}
+
+func (e *semanticTaskLeaseExecution) run(m *semanticWorkerManager, target *semanticTarget, task *semantic.Task) {
+	defer close(e.doneCh)
+	if m == nil || target == nil || target.store == nil || task == nil {
+		return
+	}
+
+	ticker := time.NewTicker(m.leaseRenewInterval())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-e.stopCh:
+			e.logStopped(m, target, task)
+			return
+		case <-e.ctx.Done():
+			select {
+			case <-e.stopCh:
+				e.logStopped(m, target, task)
+			default:
+			}
+			return
+		case <-ticker.C:
+			e.markRenewAttempted()
+			renewStart := time.Now()
+			leaseUntil, err := target.store.RenewSemanticTask(e.ctx, task.TaskID, task.Receipt, m.opts.LeaseDuration)
+			if err != nil {
+				if errors.Is(err, semantic.ErrTaskLeaseMismatch) || errors.Is(err, semantic.ErrTaskNotFound) {
+					metrics.RecordOperation("semantic_worker", "renew", "error", time.Since(renewStart))
+					// A renew already in flight can still discover lease loss after
+					// processTask begins shutdown, so lease mismatch wins over stop.
+					e.markLeaseLost()
+					metrics.RecordOperation("semantic_worker", "lease_lost", "ok", time.Since(renewStart))
+					logger.Warn(e.ctx, "semantic_worker_lease_lost",
+						append([]zap.Field{
+							zap.String("tenant_id", target.tenantID),
+							zap.String("result", "lease_lost"),
+						}, append(semanticTaskLogFields(task), zap.Error(err))...)...)
+					// Cancel handler context immediately once lease ownership is lost.
+					e.cancel()
+					e.logStopped(m, target, task)
+					return
+				}
+				if e.shouldStop() {
+					e.logStopped(m, target, task)
+					return
+				}
+				metrics.RecordOperation("semantic_worker", "renew", "error", time.Since(renewStart))
+				logger.Warn(e.ctx, "semantic_worker_lease_renew_failed",
+					append([]zap.Field{
+						zap.String("tenant_id", target.tenantID),
+						zap.String("result", "error"),
+					}, append(semanticTaskLogFields(task), zap.Error(err))...)...)
+				continue
+			}
+			e.recordRenewedLease(leaseUntil)
+			metrics.RecordOperation("semantic_worker", "renew", "ok", time.Since(renewStart))
+		}
+	}
+}
+
+func (e *semanticTaskLeaseExecution) shouldStop() bool {
+	if e == nil {
+		return true
+	}
+	select {
+	case <-e.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *semanticTaskLeaseExecution) recordRenewedLease(leaseUntil time.Time) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.renewAttempted = true
+	t := leaseUntil.UTC()
+	e.lastLeaseUntil = &t
+}
+
+func (e *semanticTaskLeaseExecution) markRenewAttempted() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.renewAttempted = true
+}
+
+func (e *semanticTaskLeaseExecution) markLeaseLost() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.lost = true
+	e.renewAttempted = true
+}
+
+func (e *semanticTaskLeaseExecution) logStopped(m *semanticWorkerManager, target *semanticTarget, task *semantic.Task) {
+	if e == nil || m == nil || target == nil || task == nil {
+		return
+	}
+	e.mu.Lock()
+	renewAttempted := e.renewAttempted
+	lost := e.lost
+	var leaseUntil *time.Time
+	if e.lastLeaseUntil != nil {
+		t := e.lastLeaseUntil.UTC()
+		leaseUntil = &t
+	}
+	e.mu.Unlock()
+	if !renewAttempted {
+		return
+	}
+
+	result := "owned"
+	if lost {
+		result = "lease_lost"
+	}
+	fields := append([]zap.Field{
+		zap.String("tenant_id", target.tenantID),
+		zap.String("result", result),
+	}, semanticTaskLogFields(task)...)
+	if leaseUntil != nil {
+		fields = append(fields, zap.Time("latest_lease_until", leaseUntil.UTC()))
+	}
+	logger.Info(e.ctx, "semantic_worker_lease_renew_stopped", fields...)
+}
+
+func (m *semanticWorkerManager) processEmbedTask(ctx context.Context, store *datastore.Store, task *semantic.Task) semanticTaskOutcome {
 	if m.embedder == nil {
-		m.retryTask(ctx, tenantID, store, task, "embed handler not configured")
-		return "handler_missing"
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "handler_missing", message: "embed handler not configured"}
 	}
 	file, err := store.GetFile(ctx, task.ResourceID)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
-			m.ackTask(ctx, tenantID, store, task, "file_not_found")
-			return "obsolete"
+			return semanticTaskOutcome{action: semanticTaskActionAck, result: "obsolete", message: "file_not_found"}
 		}
-		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("get file: %v", err))
-		return "get_file_error"
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "get_file_error", message: fmt.Sprintf("get file: %v", err)}
 	}
 	if file.Status != datastore.StatusConfirmed || file.Revision != task.ResourceVersion || strings.TrimSpace(file.ContentText) == "" {
-		m.ackTask(ctx, tenantID, store, task, "stale_or_empty")
-		return "obsolete"
+		return semanticTaskOutcome{action: semanticTaskActionAck, result: "obsolete", message: "stale_or_empty"}
 	}
 
 	vec, err := m.embedder.EmbedText(ctx, file.ContentText)
 	if err != nil {
-		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("embed text: %v", err))
-		return "embed_error"
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "embed_error", message: fmt.Sprintf("embed text: %v", err)}
 	}
 	if len(vec) == 0 {
-		m.retryTask(ctx, tenantID, store, task, "embed text returned empty vector")
-		return "embed_empty"
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "embed_empty", message: "embed text returned empty vector"}
 	}
 
 	updated, err := store.UpdateFileEmbedding(ctx, task.ResourceID, task.ResourceVersion, vec)
 	if err != nil {
-		m.retryTask(ctx, tenantID, store, task, fmt.Sprintf("write embedding: %v", err))
-		return "writeback_error"
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "writeback_error", message: fmt.Sprintf("write embedding: %v", err)}
 	}
 	if !updated {
-		m.ackTask(ctx, tenantID, store, task, "conditional_write_miss")
-		return "obsolete"
+		return semanticTaskOutcome{action: semanticTaskActionAck, result: "obsolete", message: "conditional_write_miss"}
 	}
-	m.ackTask(ctx, tenantID, store, task, "written")
-	return "ok"
+	return semanticTaskOutcome{action: semanticTaskActionAck, result: "ok", message: "written"}
 }
 
-func (m *semanticWorkerManager) processImgExtractTask(ctx context.Context, tenantID string, store *datastore.Store, b *backend.Dat9Backend, task *semantic.Task) string {
+func (m *semanticWorkerManager) processImgExtractTask(ctx context.Context, b *backend.Dat9Backend, task *semantic.Task) semanticTaskOutcome {
 	result, err := b.ProcessImageExtractTask(ctx, imageExtractTaskSpecFromSemanticTask(task))
 	if err != nil {
-		m.retryTask(ctx, tenantID, store, task, err.Error())
-		return string(result)
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: string(result), message: err.Error()}
 	}
-	m.ackTask(ctx, tenantID, store, task, string(result))
-	return string(result)
+	return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: string(result)}
 }
 
 func semanticTaskLogFields(task *semantic.Task) []zap.Field {
