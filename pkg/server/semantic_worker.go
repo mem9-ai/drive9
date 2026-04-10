@@ -670,6 +670,7 @@ func (e *semanticTaskLeaseExecution) run(m *semanticWorkerManager, target *seman
 			return
 		case <-ticker.C:
 			e.markRenewAttempted()
+			failpoint.InjectCall("semanticWorkerBeforeRenew", target.tenantID, target.store, task)
 			renewStart := time.Now()
 			leaseUntil, err := target.store.RenewSemanticTask(e.ctx, task.TaskID, task.Receipt, m.opts.LeaseDuration)
 			if err != nil {
@@ -678,6 +679,7 @@ func (e *semanticTaskLeaseExecution) run(m *semanticWorkerManager, target *seman
 					// A renew already in flight can still discover lease loss after
 					// processTask begins shutdown, so lease mismatch wins over stop.
 					e.markLeaseLost()
+					failpoint.InjectCall("semanticWorkerOnLeaseLost", target.tenantID, target.store, task, err)
 					metrics.RecordOperation("semantic_worker", "lease_lost", "ok", time.Since(renewStart))
 					logger.Warn(e.ctx, "semantic_worker_lease_lost",
 						append([]zap.Field{
@@ -702,6 +704,7 @@ func (e *semanticTaskLeaseExecution) run(m *semanticWorkerManager, target *seman
 				continue
 			}
 			e.recordRenewedLease(leaseUntil)
+			failpoint.InjectCall("semanticWorkerAfterRenew", target.tenantID, target.store, task, leaseUntil)
 			metrics.RecordOperation("semantic_worker", "renew", "ok", time.Since(renewStart))
 		}
 	}
@@ -777,6 +780,7 @@ func (e *semanticTaskLeaseExecution) logStopped(m *semanticWorkerManager, target
 	if leaseUntil != nil {
 		fields = append(fields, zap.Time("latest_lease_until", leaseUntil.UTC()))
 	}
+	failpoint.InjectCall("semanticWorkerLeaseRenewStopped", target.tenantID, target.store, task, result, renewAttempted, lost)
 	logger.Info(e.ctx, "semantic_worker_lease_renew_stopped", fields...)
 }
 
