@@ -25,6 +25,39 @@ func (b *Dat9Backend) enqueueImgExtractTaskTx(tx *sql.Tx, fileID string, revisio
 	return err
 }
 
+func (b *Dat9Backend) enqueueAudioExtractTaskTx(tx *sql.Tx, fileID string, revision int64, path, contentType string) error {
+	now := time.Now().UTC()
+	task, err := newAudioExtractTask(b.genID(), fileID, revision, path, contentType, now)
+	if err != nil {
+		return err
+	}
+	_, err = b.store.EnqueueSemanticTaskTx(tx, task)
+	return err
+}
+
+// enqueueTiDBAutoSemanticTasksTx registers durable img_extract_text and/or
+// audio_extract_text tasks for one confirmed file revision in TiDB auto-embedding mode.
+func (b *Dat9Backend) enqueueTiDBAutoSemanticTasksTx(tx *sql.Tx, fileID string, revision int64, path, contentType string) error {
+	if b.hasAsyncImageTextSource(path, contentType) {
+		if err := b.enqueueImgExtractTaskTx(tx, fileID, revision, path, contentType); err != nil {
+			return err
+		}
+	}
+	if b.shouldEnqueueAudioExtractTask(path, contentType) {
+		if err := b.enqueueAudioExtractTaskTx(tx, fileID, revision, path, contentType); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *Dat9Backend) shouldEnqueueAudioExtractTask(path, contentType string) bool {
+	if !b.SupportsAsyncAudioExtract() {
+		return false
+	}
+	return isSupportedAudioForSemanticTask(path, contentType)
+}
+
 func newEmbedTask(taskID, fileID string, revision int64, now time.Time) *semantic.Task {
 	now = now.UTC()
 	return &semantic.Task{
@@ -54,6 +87,31 @@ func newImgExtractTask(taskID, fileID string, revision int64, path, contentType 
 	return &semantic.Task{
 		TaskID:          taskID,
 		TaskType:        semantic.TaskTypeImgExtractText,
+		ResourceID:      fileID,
+		ResourceVersion: revision,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     5,
+		AvailableAt:     now,
+		PayloadJSON:     payloadJSON,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}, nil
+}
+
+func newAudioExtractTask(taskID, fileID string, revision int64, path, contentType string, now time.Time) (*semantic.Task, error) {
+	now = now.UTC()
+	payload := semantic.AudioExtractTaskPayload{Path: path, ContentType: contentType}
+	var payloadJSON []byte
+	if payload.Path != "" || payload.ContentType != "" {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		payloadJSON = encoded
+	}
+	return &semantic.Task{
+		TaskID:          taskID,
+		TaskType:        semantic.TaskTypeAudioExtractText,
 		ResourceID:      fileID,
 		ResourceVersion: revision,
 		Status:          semantic.TaskQueued,
