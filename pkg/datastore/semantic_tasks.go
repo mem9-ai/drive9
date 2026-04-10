@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pingcap/failpoint"
+
 	"github.com/mem9-ai/dat9/pkg/semantic"
 )
 
@@ -355,7 +357,7 @@ func (s *Store) AckSemanticTask(ctx context.Context, taskID, receipt string) (er
 	start := time.Now()
 	defer observeStoreOp(ctx, "ack_semantic_task", start, &err)
 
-	now := time.Now().UTC()
+	now := semanticTaskLeaseNow()
 	res, err := s.db.ExecContext(ctx, `UPDATE semantic_tasks SET status = ?, receipt = NULL,
 		leased_at = NULL, lease_until = NULL, completed_at = ?, updated_at = ?
 		WHERE task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`,
@@ -416,7 +418,7 @@ func (s *Store) RetrySemanticTask(ctx context.Context, taskID, receipt string, r
 	start := time.Now()
 	defer observeStoreOp(ctx, "retry_semantic_task", start, &err)
 
-	now := time.Now().UTC()
+	now := semanticTaskLeaseNow()
 	if retryAt.IsZero() {
 		retryAt = now
 	} else {
@@ -465,7 +467,7 @@ func (s *Store) RecoverExpiredSemanticTasks(ctx context.Context, now time.Time, 
 	defer observeStoreOp(ctx, "recover_expired_semantic_tasks", start, &err)
 
 	if now.IsZero() {
-		now = time.Now().UTC()
+		now = semanticTaskLeaseNow()
 	} else {
 		now = now.UTC()
 	}
@@ -545,6 +547,22 @@ func (s *Store) semanticTaskLeaseError(ctx context.Context, taskID string) error
 		return semantic.ErrTaskNotFound
 	}
 	return semantic.ErrTaskLeaseMismatch
+}
+
+func semanticTaskLeaseNow() time.Time {
+	now := time.Now().UTC()
+	// Keep lease-sensitive tests deterministic by letting failpoint mode override
+	// the current time seen by a single lease ownership check.
+	failpoint.Inject("semanticTaskLeaseNow", func(val failpoint.Value) {
+		switch injected := val.(type) {
+		case string:
+			parsed, err := time.Parse(time.RFC3339Nano, injected)
+			if err == nil {
+				now = parsed.UTC()
+			}
+		}
+	})
+	return now
 }
 
 func scanSemanticTask(s scanner) (*semantic.Task, error) {

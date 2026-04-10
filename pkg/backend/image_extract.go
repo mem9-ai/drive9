@@ -10,6 +10,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/pingcap/failpoint"
+
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/metrics"
@@ -277,6 +279,9 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 
 	var updated bool
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := injectedImageExtractWritebackError("imageExtractWritebackUpdateFileSearchTextError"); err != nil {
+			return err
+		}
 		var txErr error
 		updated, txErr = b.store.UpdateFileSearchTextTx(tx, task.FileID, task.Revision, text)
 		if txErr != nil {
@@ -284,6 +289,9 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 		}
 		if !updated || b.UsesDatabaseAutoEmbedding() {
 			return nil
+		}
+		if err := injectedImageExtractWritebackError("imageExtractWritebackQueueEmbedTaskError"); err != nil {
+			return err
 		}
 		_, txErr = b.store.EnsureSemanticTaskQueuedTx(tx, newEmbedTask(b.genID(), task.FileID, task.Revision, time.Now().UTC()))
 		return txErr
@@ -295,6 +303,21 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 		return ImageExtractResultStale, nil
 	}
 	return ImageExtractResultWritten, nil
+}
+
+func injectedImageExtractWritebackError(name string) error {
+	var injected error
+	failpoint.Inject(name, func(val failpoint.Value) {
+		switch v := val.(type) {
+		case string:
+			injected = errors.New(v)
+		case bool:
+			if v {
+				injected = fmt.Errorf("injected failpoint %s", name)
+			}
+		}
+	})
+	return injected
 }
 
 func legacyImageExtractMetricResult(result ImageExtractResult) string {
