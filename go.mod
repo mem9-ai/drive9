@@ -15,6 +15,7 @@ require (
 	github.com/hanwen/go-fuse/v2 v2.9.0
 	github.com/jackc/pgx/v5 v5.9.1
 	github.com/oklog/ulid/v2 v2.1.0
+	github.com/sercand/kuberesolver/v5 v5.1.1
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.41.0
 	github.com/tidbcloud/tidb-management-service/api v0.0.0-20260409104828-3391ea2e1652
 	go.uber.org/zap v1.27.0
@@ -24,7 +25,15 @@ require (
 )
 
 require (
+	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/fsnotify/fsnotify v1.6.0 // indirect
 	github.com/golang/mock v1.6.0 // indirect
+	github.com/golang/protobuf v1.5.4 // indirect
+	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
+	github.com/prometheus/client_golang v1.15.1 // indirect
+	github.com/prometheus/client_model v0.3.0 // indirect
+	github.com/prometheus/common v0.42.0 // indirect
+	github.com/prometheus/procfs v0.9.0 // indirect
 	github.com/tidbcloud/account/idl/pbgen/proto/acl v0.1.1 // indirect
 	go.buf.build/protocolbuffers/go/linuxgit/tidbcloud v1.3.4 // indirect
 )
