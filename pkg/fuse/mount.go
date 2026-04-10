@@ -13,16 +13,17 @@ import (
 
 // MountOptions configures the FUSE mount.
 type MountOptions struct {
-	Server     string        // dat9 server URL
-	APIKey     string        // dat9 API key
-	MountPoint string        // local mount point
-	CacheSize  int64         // ReadCache max size in bytes (default 128MB)
-	DirTTL     time.Duration // DirCache TTL (default 5s)
-	AttrTTL    time.Duration // kernel attr cache TTL (default 1s)
-	EntryTTL   time.Duration // kernel entry cache TTL (default 1s)
-	AllowOther bool          // allow other users to access mount
-	ReadOnly   bool          // mount as read-only
-	Debug      bool          // enable FUSE debug logging
+	Server        string        // dat9 server URL
+	APIKey        string        // dat9 API key
+	MountPoint    string        // local mount point
+	CacheSize     int64         // ReadCache max size in bytes (default 128MB)
+	DirTTL        time.Duration // DirCache TTL (default 5s)
+	AttrTTL       time.Duration // kernel attr cache TTL (default 1s)
+	EntryTTL      time.Duration // kernel entry cache TTL (default 1s)
+	FlushDebounce time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
+	AllowOther    bool          // allow other users to access mount
+	ReadOnly      bool          // mount as read-only
+	Debug         bool          // enable FUSE debug logging
 }
 
 func (o *MountOptions) setDefaults() {
@@ -37,6 +38,10 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.EntryTTL <= 0 {
 		o.EntryTTL = 60 * time.Second
+	}
+	// FlushDebounce: 0 means disabled, negative means unset (use default).
+	if o.FlushDebounce < 0 {
+		o.FlushDebounce = defaultFlushDebounce
 	}
 }
 

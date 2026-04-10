@@ -3,6 +3,7 @@ package fuse
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -351,5 +352,253 @@ func TestCreateFileGetsStreamUploader(t *testing.T) {
 	}
 	if fh.Streamer == nil {
 		t.Fatal("expected StreamUploader to be set for new file")
+	}
+}
+
+func TestStatFs_ReportsVirtualCapacity(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	var out gofuse.StatfsOut
+	st := fs.StatFs(nil, &gofuse.InHeader{NodeId: 1}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("StatFs status = %v, want OK", st)
+	}
+	if out.Bsize != 4096 {
+		t.Fatalf("Bsize = %d, want 4096", out.Bsize)
+	}
+	if out.Frsize != 4096 {
+		t.Fatalf("Frsize = %d, want 4096", out.Frsize)
+	}
+	if out.NameLen != 255 {
+		t.Fatalf("NameLen = %d, want 255", out.NameLen)
+	}
+	// 1 TiB in 4K blocks
+	const expectedBlocks = (1 << 40) / 4096
+	if out.Blocks != expectedBlocks {
+		t.Fatalf("Blocks = %d, want %d", out.Blocks, expectedBlocks)
+	}
+	if out.Bavail != expectedBlocks-1 {
+		t.Fatalf("Bavail = %d, want %d", out.Bavail, expectedBlocks-1)
+	}
+}
+
+func TestXAttr_GetReturnsENOATTR(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	_, st := fs.GetXAttr(nil, &gofuse.InHeader{NodeId: 1}, "user.test", nil)
+	if st != gofuse.ENOATTR {
+		t.Fatalf("GetXAttr status = %v, want ENOATTR", st)
+	}
+}
+
+func TestXAttr_ListReturnsEmpty(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	n, st := fs.ListXAttr(nil, &gofuse.InHeader{NodeId: 1}, nil)
+	if st != gofuse.OK {
+		t.Fatalf("ListXAttr status = %v, want OK", st)
+	}
+	if n != 0 {
+		t.Fatalf("ListXAttr size = %d, want 0", n)
+	}
+}
+
+func TestXAttr_SetDiscardsSilently(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	st := fs.SetXAttr(nil, &gofuse.SetXAttrIn{}, "user.test", []byte("val"))
+	if st != gofuse.OK {
+		t.Fatalf("SetXAttr status = %v, want OK", st)
+	}
+}
+
+func TestXAttr_RemoveReturnsENOATTR(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	st := fs.RemoveXAttr(nil, &gofuse.InHeader{NodeId: 1}, "user.test")
+	if st != gofuse.ENOATTR {
+		t.Fatalf("RemoveXAttr status = %v, want ENOATTR", st)
+	}
+}
+
+func TestSetAttr_MtimeUpdate(t *testing.T) {
+	fs, ino, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, 42))
+	})
+	defer cleanup()
+
+	mtime := time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MTIME,
+			Mtime:    uint64(mtime.Unix()),
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	// Verify the inode was updated
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if !entry.Mtime.Equal(mtime) {
+		t.Fatalf("Mtime = %v, want %v", entry.Mtime, mtime)
+	}
+
+	// Verify the attr output has the correct mtime
+	if out.Mtime != uint64(mtime.Unix()) {
+		t.Fatalf("out.Mtime = %d, want %d", out.Mtime, mtime.Unix())
+	}
+}
+
+func TestSetAttr_MtimeNow(t *testing.T) {
+	fs, ino, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, 42))
+	})
+	defer cleanup()
+
+	before := time.Now()
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MTIME | gofuse.FATTR_MTIME_NOW,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	after := time.Now()
+
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if entry.Mtime.Before(before) || entry.Mtime.After(after) {
+		t.Fatalf("Mtime = %v, expected between %v and %v", entry.Mtime, before, after)
+	}
+}
+
+func TestLookup_UsesMtimeFromStat(t *testing.T) {
+	mtime := time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "100")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(mtime.Unix(), 10))
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "file.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if out.Mtime != uint64(mtime.Unix()) {
+		t.Fatalf("Lookup mtime = %d, want %d", out.Mtime, mtime.Unix())
+	}
+}
+
+// TestDebounce_ReleaseAfterFlush_NoDataLoss verifies that data is not lost
+// when Release fires after a debounced Flush. This is a regression test for
+// the scenario: Flush debounces → ClearDirty → Release cancels timer →
+// flushHandle sees no dirty data → data never uploaded.
+func TestDebounce_ReleaseAfterFlush_NoDataLoss(t *testing.T) {
+	uploadedCh := make(chan []byte, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			uploadedCh <- append([]byte(nil), body...)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 10 * time.Second} // long debounce — won't fire naturally
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	// Create a file
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "test.md", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	// Write data
+	_, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}, []byte("important data"))
+	if st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	// Flush (will debounce since file < smallFileThreshold and debounce > 0)
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	if st != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", st)
+	}
+
+	// Release (should cancel debounce and flush immediately)
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+
+	// Verify data was uploaded (use channel to avoid race)
+	select {
+	case uploaded := <-uploadedCh:
+		if string(uploaded) != "important data" {
+			t.Fatalf("uploaded = %q, want %q", uploaded, "important data")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("data was never uploaded — data loss!")
 	}
 }
