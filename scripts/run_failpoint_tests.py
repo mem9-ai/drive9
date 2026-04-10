@@ -21,13 +21,7 @@ from collections import defaultdict
 def main() -> int:
     repo_root = pathlib.Path(__file__).resolve().parent.parent
     env = os.environ.copy()
-    failpoint_ctl = (
-        pathlib.Path(
-            subprocess.check_output(["go", "env", "GOPATH"], text=True).strip()
-        )
-        / "bin"
-        / "failpoint-ctl"
-    )
+    failpoint_ctl = resolve_failpoint_ctl_path(env)
     if not failpoint_ctl.exists():
         print(f"failpoint-ctl not found at {failpoint_ctl}", file=sys.stderr)
         print(
@@ -56,7 +50,21 @@ def main() -> int:
     except subprocess.CalledProcessError as exc:
         exit_code = exc.returncode or 1
     finally:
-        subprocess.run([str(failpoint_ctl), "disable", "."], cwd=repo_root, check=False, env=env)
+        disable = subprocess.run(
+            [str(failpoint_ctl), "disable", "."],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if disable.returncode != 0:
+            if disable.stdout:
+                print(disable.stdout, file=sys.stderr, end="")
+            if disable.stderr:
+                print(disable.stderr, file=sys.stderr, end="")
+            if exit_code == 0:
+                exit_code = disable.returncode or 1
 
     return exit_code
 
@@ -74,6 +82,16 @@ def collect_failpoint_tests(repo_root: pathlib.Path) -> dict[str, set[str]]:
                 tests_by_pkg[pkg].add(match.group(1))
 
     return tests_by_pkg
+
+
+def resolve_failpoint_ctl_path(env: dict[str, str]) -> pathlib.Path:
+    gobin = subprocess.check_output(["go", "env", "GOBIN"], text=True, env=env).strip()
+    if gobin:
+        return pathlib.Path(gobin) / "failpoint-ctl"
+
+    gopath = subprocess.check_output(["go", "env", "GOPATH"], text=True, env=env).strip()
+    first_gopath = next((entry for entry in gopath.split(os.pathsep) if entry), "")
+    return pathlib.Path(first_gopath) / "bin" / "failpoint-ctl"
 
 
 def load_podman_test_env(repo_root: pathlib.Path, env: dict[str, str]) -> dict[str, str]:
