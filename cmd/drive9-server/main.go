@@ -33,6 +33,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
@@ -191,16 +192,15 @@ func main() {
 			serverlessAddr = normalizeGRPCTarget(serverlessAddr)
 			accountAddr = normalizeGRPCTarget(accountAddr)
 
-			tlsCreds := credentials.NewTLS(nil)
-			mgmtConn, err := grpc.NewClient(mgmtAddr, grpc.WithTransportCredentials(tlsCreds))
+			mgmtConn, err := newGRPCClientConn(mgmtAddr, true)
 			if err != nil {
 				die(fmt.Errorf("dial tidb-mgmt-service %s: %w", mgmtAddr, err))
 			}
-			serverlessConn, err := grpc.NewClient(serverlessAddr, grpc.WithTransportCredentials(tlsCreds))
+			serverlessConn, err := newGRPCClientConn(serverlessAddr, true)
 			if err != nil {
 				die(fmt.Errorf("dial serverless-global-service %s: %w", serverlessAddr, err))
 			}
-			accountConn, err := grpc.NewClient(accountAddr, grpc.WithTransportCredentials(tlsCreds))
+			accountConn, err := newGRPCClientConn(accountAddr, true)
 			if err != nil {
 				die(fmt.Errorf("dial account-provider-grpc %s: %w", accountAddr, err))
 			}
@@ -214,13 +214,13 @@ func main() {
 				accountpb.NewAccountAPIServiceClient(accountConn),
 			)
 			provisioner = tidbcloudnative.NewProvisioner(globalClient, accountClient, enc)
-			logger.Info(context.Background(), "provisioner_configured",
-				zap.String("provider", providerType),
-				zap.String("mgmt_addr", mgmtAddr),
-				zap.String("serverless_addr", serverlessAddr),
-				zap.String("account_addr", accountAddr))
+				logger.Info(context.Background(), "provisioner_configured",
+					zap.String("provider", providerType),
+					zap.String("mgmt_addr", mgmtAddr),
+					zap.String("serverless_addr", serverlessAddr),
+					zap.String("account_addr", accountAddr))
+			}
 		}
-	}
 
 	die(server.NewWithConfig(server.Config{
 		Meta:             store,
@@ -252,6 +252,13 @@ func normalizeGRPCTarget(target string) string {
 	return target
 }
 
+func newGRPCClientConn(target string, insecureMode bool) (*grpc.ClientConn, error) {
+	if insecureMode {
+		return grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	return grpc.NewClient(target, grpc.WithTransportCredentials(credentials.NewTLS(nil)))
+}
+
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage: drive9-server [listen-addr]
 
@@ -265,6 +272,10 @@ environment:
   DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
   DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
+  TiDB Cloud native gRPC:
+  DRIVE9_TIDBCLOUD_MGMT_ADDR tidb-mgmt-service gRPC target (required for tidb_cloud_native)
+  DRIVE9_TIDBCLOUD_SERVERLESS_GLOBAL_ADDR serverless-global-service gRPC target (required for tidb_cloud_native)
+  DRIVE9_TIDBCLOUD_ACCOUNT_ADDR account-provider-grpc target (required for tidb_cloud_native)
   S3 storage (set DRIVE9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DRIVE9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
   DRIVE9_S3_REGION   AWS region (default: us-east-1)
