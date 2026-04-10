@@ -333,7 +333,14 @@ func (m *semanticWorkerManager) processTask(ctx context.Context, target *semanti
 	m.injectBeforeSemanticTaskFinalize(target.tenantID, target.store, task, outcome)
 	// Re-check ownership after the handler returns so tests can deterministically
 	// force a lease-loss window before any terminal state mutation happens.
-	if !m.semanticTaskStillOwned(ctx, target.tenantID, target.store, task, outcome.result) {
+	stillOwned, err := m.semanticTaskStillOwned(ctx, target.tenantID, target.store, task, outcome.result)
+	if err != nil {
+		logger.Warn(ctx, "semantic_worker_finalize_ownership_check_failed",
+			append([]zap.Field{
+				zap.String("tenant_id", target.tenantID),
+				zap.String("result", outcome.result),
+			}, append(semanticTaskLogFields(task), zap.Error(err))...)...)
+	} else if !stillOwned {
 		return
 	}
 	switch outcome.action {
@@ -829,9 +836,9 @@ func (m *semanticWorkerManager) injectBeforeSemanticTaskFinalize(tenantID string
 	failpoint.InjectCall("semanticWorkerBeforeFinalize", tenantID, store, task, string(outcome.action), outcome.message, outcome.result)
 }
 
-func (m *semanticWorkerManager) semanticTaskStillOwned(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task, result string) bool {
+func (m *semanticWorkerManager) semanticTaskStillOwned(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task, result string) (bool, error) {
 	if store == nil || task == nil {
-		return false
+		return false, nil
 	}
 	now := time.Now().UTC()
 	var count int
@@ -839,17 +846,13 @@ func (m *semanticWorkerManager) semanticTaskStillOwned(ctx context.Context, tena
 		WHERE task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`,
 		task.TaskID, semantic.TaskProcessing, task.Receipt, now).Scan(&count)
 	if err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			logger.Warn(ctx, "semantic_worker_finalize_ownership_check_failed",
-				append([]zap.Field{
-					zap.String("tenant_id", tenantID),
-					zap.String("result", result),
-				}, append(semanticTaskLogFields(task), zap.Error(err))...)...)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
 		}
-		return false
+		return false, fmt.Errorf("check semantic task ownership: %w", err)
 	}
 	if count > 0 {
-		return true
+		return true, nil
 	}
 	// Treat ownership loss as a finalized runtime event: the worker must not ack
 	// or retry once another actor could have legitimately reclaimed the task.
@@ -859,7 +862,7 @@ func (m *semanticWorkerManager) semanticTaskStillOwned(ctx context.Context, tena
 			zap.String("tenant_id", tenantID),
 			zap.String("result", result),
 		}, semanticTaskLogFields(task)...)...)
-	return false
+	return false, nil
 }
 
 func semanticTaskLogFields(task *semantic.Task) []zap.Field {

@@ -227,8 +227,9 @@ Obtain a logger from `pkg/logger` or accept `*zap.Logger` via `Config`.
 - Always pair `failpoint.Enable(...)` / `failpoint.EnableCall(...)` with `t.Cleanup(...)`
   that disables the failpoint.
 - Run failpoint tests through `python3 scripts/run_failpoint_tests.py` or `make test-failpoint`.
-  Do not run them in parallel with ordinary `go test` commands: `failpoint-ctl enable/disable`
-  rewrites source files during the run and can break concurrent non-failpoint builds.
+  Do not run them in parallel with ordinary `go test` commands or `make lint`:
+  `failpoint-ctl enable/disable` rewrites source files during the run and can
+  break concurrent non-failpoint builds and type-checking.
 - Keep failpoint-off behavior identical to the non-instrumented code path.
 - When a timing-sensitive test still needs synchronization, prefer channels plus failpoint
   gating over sleeps that guess at scheduler timing.

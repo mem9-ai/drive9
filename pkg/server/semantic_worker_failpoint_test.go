@@ -111,9 +111,9 @@ func TestSemanticWorkerFinalizeAckSkipsWhenLeaseOwnershipLostAtBoundary(t *testi
 	})
 
 	waitForEmbeddingRevision(t, b, "/docs/finalize-ack.txt", 1, 3*time.Second)
-	waitForTaskStatusByResource(t, b, nf.FileID, string(semantic.TaskProcessing), 3*time.Second)
+	waitForNamedTaskStatus(t, b, taskIDForResource(t, b, nf.FileID), string(semantic.TaskProcessing), 3*time.Second)
 
-	task := mustGetServerSemanticTaskByResource(t, b, nf.FileID)
+	task := mustGetServerSemanticTask(t, b, taskIDForResource(t, b, nf.FileID))
 	if task.Status != string(semantic.TaskProcessing) {
 		t.Fatalf("task status=%q, want %q", task.Status, semantic.TaskProcessing)
 	}
@@ -151,9 +151,9 @@ func TestSemanticWorkerFinalizeRetrySkipsWhenLeaseOwnershipLostAtBoundary(t *tes
 		_ = failpoint.Disable(semanticWorkerBeforeFinalizeFailpoint)
 	})
 
-	waitForTaskStatusByResource(t, b, nf.FileID, string(semantic.TaskProcessing), 3*time.Second)
+	waitForNamedTaskStatus(t, b, taskIDForResource(t, b, nf.FileID), string(semantic.TaskProcessing), 3*time.Second)
 
-	task := mustGetServerSemanticTaskByResource(t, b, nf.FileID)
+	task := mustGetServerSemanticTask(t, b, taskIDForResource(t, b, nf.FileID))
 	if task.Status != string(semantic.TaskProcessing) {
 		t.Fatalf("task status=%q, want %q", task.Status, semantic.TaskProcessing)
 	}
@@ -505,38 +505,13 @@ func TestSemanticWorkerPanicStopsLeaseRenewalWithFailpoint(t *testing.T) {
 	waitForNamedTaskStatus(t, b, claimed.TaskID, string(semantic.TaskQueued), time.Second)
 }
 
-func mustGetServerSemanticTaskByResource(t *testing.T, b *backend.Dat9Backend, resourceID string) serverSemanticTaskState {
+func taskIDForResource(t *testing.T, b *backend.Dat9Backend, resourceID string) string {
 	t.Helper()
-	var task serverSemanticTaskState
-	err := b.Store().DB().QueryRow(`SELECT task_id, task_type, resource_id, status, attempt_count, COALESCE(last_error, '')
-		FROM semantic_tasks WHERE resource_id = ? AND resource_version = 1`, resourceID).Scan(
-		&task.TaskID,
-		&task.TaskType,
-		&task.ResourceID,
-		&task.Status,
-		&task.AttemptCount,
-		&task.LastError,
-	)
+	var taskID string
+	err := b.Store().DB().QueryRow(`SELECT task_id
+		FROM semantic_tasks WHERE resource_id = ? AND resource_version = 1`, resourceID).Scan(&taskID)
 	if err != nil {
-		t.Fatalf("get semantic task by resource %s: %v", resourceID, err)
+		t.Fatalf("get semantic task id by resource %s: %v", resourceID, err)
 	}
-	return task
-}
-
-func waitForTaskStatusByResource(t *testing.T, b *backend.Dat9Backend, resourceID, want string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		var status string
-		err := b.Store().DB().QueryRow(`SELECT status FROM semantic_tasks WHERE resource_id = ? AND resource_version = 1`, resourceID).Scan(&status)
-		if err == nil && status == want {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	var status string
-	if err := b.Store().DB().QueryRow(`SELECT status FROM semantic_tasks WHERE resource_id = ? AND resource_version = 1`, resourceID).Scan(&status); err != nil {
-		t.Fatalf("wait task status query by resource: %v", err)
-	}
-	t.Fatalf("resource %s status=%q, want %q", resourceID, status, want)
+	return taskID
 }
