@@ -431,6 +431,35 @@ func TestServerDoesNotStartSemanticWorkerWithoutHandlers(t *testing.T) {
 	}
 }
 
+func TestSemanticWorkerTaskTypesForTarget(t *testing.T) {
+	bApp := newTestBackendForSemanticWorker(t)
+	m := newSemanticWorkerManager(bApp, nil, nil, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
+	got := m.taskTypesForTarget(bApp)
+	if len(got) != 1 || got[0] != semantic.TaskTypeEmbed {
+		t.Fatalf("got %#v, want embed", got)
+	}
+
+	bAuto := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled: true, Workers: 1, QueueSize: 4, Extractor: staticServerImageExtractor{text: "ok"},
+		},
+	})
+	mAuto := newSemanticWorkerManager(bAuto, nil, nil, nil, SemanticWorkerOptions{})
+	gotAuto := mAuto.taskTypesForTarget(bAuto)
+	if len(gotAuto) != 1 || gotAuto[0] != semantic.TaskTypeImgExtractText {
+		t.Fatalf("got %#v, want img_extract_text", gotAuto)
+	}
+}
+
+func TestSemanticWorkerTaskTypesForTargetNilWithoutEmbedder(t *testing.T) {
+	b := newTestBackendForSemanticWorker(t)
+	m := newSemanticWorkerManager(b, nil, nil, nil, SemanticWorkerOptions{})
+	if m.taskTypesForTarget(b) != nil {
+		t.Fatal("app-managed backend without embedder should yield nil task types")
+	}
+}
+
 func TestSemanticWorkerManagerStartsForMultiTenantImageOnlyMode(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {

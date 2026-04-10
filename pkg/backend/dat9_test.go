@@ -10,6 +10,7 @@ import (
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/dat9/pkg/semantic"
 )
 
 func newTestBackend(t *testing.T) *Dat9Backend {
@@ -73,6 +74,36 @@ func TestUsesDatabaseAutoEmbeddingReflectsOption(t *testing.T) {
 	if !b.UsesDatabaseAutoEmbedding() {
 		t.Fatal("backend should expose database auto-embedding option")
 	}
+}
+
+func TestDat9BackendAutoSemanticTaskTypes(t *testing.T) {
+	t.Run("app_managed_default", func(t *testing.T) {
+		b := newTestBackend(t)
+		if b.AutoSemanticTaskTypes() != nil {
+			t.Fatal("expected nil when not in database auto-embedding mode")
+		}
+	})
+	t.Run("auto_mode_without_async_runtime", func(t *testing.T) {
+		b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
+		if b.AutoSemanticTaskTypes() != nil {
+			t.Fatal("expected nil without async image extraction runtime")
+		}
+	})
+	t.Run("auto_mode_with_async_image", func(t *testing.T) {
+		b := newTestBackendWithOptions(t, Options{
+			DatabaseAutoEmbedding: true,
+			AsyncImageExtract: AsyncImageExtractOptions{
+				Enabled:   true,
+				Workers:   1,
+				QueueSize: 4,
+				Extractor: &staticImageExtractor{text: "caption"},
+			},
+		})
+		got := b.AutoSemanticTaskTypes()
+		if len(got) != 1 || got[0] != semantic.TaskTypeImgExtractText {
+			t.Fatalf("got %#v, want [img_extract_text]", got)
+		}
+	})
 }
 
 func TestWriteAndRead(t *testing.T) {
