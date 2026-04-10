@@ -58,7 +58,7 @@ func TestSSEEndpointSince0SendsReset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d, want 200", resp.StatusCode)
@@ -107,7 +107,7 @@ func TestSSEEndpointReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	scanner := bufio.NewScanner(resp.Body)
 
@@ -120,7 +120,9 @@ func TestSSEEndpointReplay(t *testing.T) {
 		t.Fatalf("event1=%q, want file_changed", ev1.Event)
 	}
 	var data1 ChangeEvent
-	json.Unmarshal([]byte(ev1.Data), &data1)
+	if err := json.Unmarshal([]byte(ev1.Data), &data1); err != nil {
+		t.Fatalf("unmarshal event1: %v", err)
+	}
 	if data1.Path != "/b.txt" || data1.Op != "delete" {
 		t.Errorf("event1 data: %+v", data1)
 	}
@@ -130,7 +132,9 @@ func TestSSEEndpointReplay(t *testing.T) {
 		t.Fatal("expected second replayed event")
 	}
 	var data2 ChangeEvent
-	json.Unmarshal([]byte(ev2.Data), &data2)
+	if err := json.Unmarshal([]byte(ev2.Data), &data2); err != nil {
+		t.Fatalf("unmarshal event2: %v", err)
+	}
 	if data2.Path != "/c.txt" || data2.Op != "write" {
 		t.Errorf("event2 data: %+v", data2)
 	}
@@ -158,7 +162,7 @@ func TestSSEEndpointLiveEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Publish a new event after connection is established.
 	go func() {
@@ -175,7 +179,9 @@ func TestSSEEndpointLiveEvent(t *testing.T) {
 		t.Fatalf("live event=%q, want file_changed", ev.Event)
 	}
 	var data ChangeEvent
-	json.Unmarshal([]byte(ev.Data), &data)
+	if err := json.Unmarshal([]byte(ev.Data), &data); err != nil {
+		t.Fatalf("unmarshal live event: %v", err)
+	}
 	if data.Path != "/new.txt" || data.Actor != "remote-actor" {
 		t.Errorf("live event data: %+v", data)
 	}

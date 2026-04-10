@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -158,10 +159,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 func sendSSEEvent(w http.ResponseWriter, ev ChangeEvent) {
 	data, err := json.Marshal(ev)
 	if err != nil {
-		logger.Error(nil, "sse_marshal_event_failed")
+		logger.Error(context.TODO(), "sse_marshal_event_failed")
 		return
 	}
-	fmt.Fprintf(w, "event: file_changed\ndata: %s\n\n", data)
+	_, _ = fmt.Fprintf(w, "event: file_changed\ndata: %s\n\n", data)
 }
 
 func sendSSEReset(w http.ResponseWriter, seq uint64, reason string) {
@@ -169,12 +170,12 @@ func sendSSEReset(w http.ResponseWriter, seq uint64, reason string) {
 		"seq":    seq,
 		"reason": reason,
 	})
-	fmt.Fprintf(w, "event: reset\ndata: %s\n\n", data)
+	_, _ = fmt.Fprintf(w, "event: reset\ndata: %s\n\n", data)
 }
 
 func sendSSEHeartbeat(w http.ResponseWriter, seq uint64) {
 	data, _ := json.Marshal(map[string]interface{}{
 		"seq": seq,
 	})
-	fmt.Fprintf(w, "event: heartbeat\ndata: %s\n\n", data)
+	_, _ = fmt.Fprintf(w, "event: heartbeat\ndata: %s\n\n", data)
 }
