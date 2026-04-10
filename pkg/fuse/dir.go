@@ -14,6 +14,7 @@ type CachedFileInfo struct {
 	Name  string
 	Size  int64
 	IsDir bool
+	Mtime time.Time
 }
 
 type dirCacheEntry struct {

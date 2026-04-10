@@ -189,6 +189,16 @@ func (m *InodeToPath) UpdateSize(ino uint64, size int64) {
 	}
 }
 
+// UpdateMtime updates the mtime of the entry identified by the given inode.
+func (m *InodeToPath) UpdateMtime(ino uint64, mtime time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Mtime = mtime
+	}
+}
+
 // Rename updates the path mapping when a file or directory is moved from
 // oldPath to newPath. If the entry is a directory, all descendant entries
 // whose paths have the prefix oldPath+"/" are also updated.
