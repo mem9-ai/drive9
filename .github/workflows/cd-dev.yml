@@ -19,6 +19,7 @@ jobs:
     env:
       ECR_REPO: tidbcloud/drive9-server
       IMAGE_NAME: drive9-server
+      AWS_ROLE_ARN: ${{ secrets.DBAAS_DEV_AWS_ROLE }}
       AWS_REGION: us-west-2
     permissions:
       contents: "read"
