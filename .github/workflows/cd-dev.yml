@@ -19,11 +19,9 @@ jobs:
     env:
       ECR_REPO: tidbcloud/drive9-server
       IMAGE_NAME: drive9-server
-      AWS_ROLE_ARN: ${{ secrets.DBAAS_DEV_AWS_ROLE }}
       AWS_REGION: us-west-2
     permissions:
       contents: "read"
-      id-token: "write"
     steps:
       - name: check out code
         uses: actions/checkout@v4
@@ -56,12 +54,6 @@ jobs:
 
       - name: Build server binary
         run: make build-server GOOS=linux GOARCH=amd64
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ env.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: ecr-login
