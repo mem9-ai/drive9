@@ -1,0 +1,138 @@
+name: Drive9 Dev CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'The region to deploy to'
+        required: true
+        default: '*'
+        type: string
+
+jobs:
+  build:
+    name: Build
+    runs-on: self-hosted
+    outputs:
+      tag: ${{ steps.image-tag.outputs.tag }}
+    env:
+      ECR_REPO: tidbcloud/drive9-server
+      AWS_ROLE_ARN: ${{ secrets.DBAAS_DEV_AWS_ROLE }}
+      AWS_REGION: us-west-2
+    permissions:
+      contents: "read"
+      id-token: "write"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          token: ${{ secrets.GIT_ACTION_BOT }}
+
+      - name: Checkout agfs dependency
+        run: |
+          git clone --depth 1 https://github.com/c4pt0r/agfs ../agfs
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+        env:
+          GOPRIVATE: "github.com/tidbcloud,github.com/pingcap/dbaas"
+
+      - name: Configure git for private modules
+        env:
+          TOKEN: ${{ secrets.GIT_ACTION_BOT }}
+        run: git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Compute image tag
+        id: image-tag
+        run: |
+          REF_NAME=${{ github.ref_name }}
+          SAFE_REF_NAME=$(printf '%s' "$REF_NAME" | sed 's/[^[:alnum:]_.-]/-/g; s/^[.-][.-]*//')
+          if [ -z "$SAFE_REF_NAME" ]; then
+            SAFE_REF_NAME=ref
+          fi
+          echo "tag=${SAFE_REF_NAME}-${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build server binary
+        run: make build-server GOOS=linux GOARCH=amd64
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        run: |
+          FULL_IMAGE=${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.image-tag.outputs.tag }}
+          docker build -t ${FULL_IMAGE} .
+          docker push ${FULL_IMAGE}
+
+  setup:
+    runs-on: self-hosted
+    outputs:
+      region: ${{ steps.prepare-region.outputs.region }}
+    steps:
+      - name: Define region to deploy
+        id: prepare-region
+        env:
+          REGION_INPUT: ${{ github.event.inputs.region }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          region_input = os.environ.get("REGION_INPUT", "")
+          if region_input == "":
+              regions = ["*"]
+          else:
+              regions = [part.strip() for part in region_input.split(",") if part.strip()]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as github_output:
+              github_output.write(f"region={json.dumps(regions)}\n")
+          PY
+
+  deploy:
+    name: Deploy
+    needs: [build, setup]
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        region: ${{ fromJSON(needs.setup.outputs.region) }}
+    steps:
+      - name: Get source URL
+        id: pr-number
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GIT_ACTION_BOT }}
+          script: |
+            const [owner, repo] = '${{ github.repository }}'.split('/');
+            const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner,
+              repo,
+              commit_sha: '${{ github.sha }}'
+            });
+            const pr = data[0];
+            const url = pr
+              ? `https://github.com/${{ github.repository }}/pull/${pr.number}`
+              : `https://github.com/${{ github.repository }}/commit/${{ github.sha }}`;
+            core.setOutput('url', url);
+
+      - name: Bump version in app-delivery repo
+        uses: benc-uk/workflow-dispatch@7a027648b88c2413826b6ddd6c76114894dc5ec4 # v1
+        with:
+          workflow: bump-drive9-version.yaml
+          repo: tidbcloud/app-delivery
+          ref: refs/heads/main
+          token: ${{ secrets.GIT_ACTION_BOT }}
+          inputs: '{"version": "${{ needs.build.outputs.tag }}", "env": "dev", "region": "${{ matrix.region }}", "url": "${{ steps.pr-number.outputs.url }}", "author": "${{ github.actor }}" }'
