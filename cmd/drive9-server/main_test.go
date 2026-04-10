@@ -43,3 +43,29 @@ func TestNormalizeGRPCTarget(t *testing.T) {
 		})
 	}
 }
+
+func TestEnvBool(t *testing.T) {
+	t.Run("fallback", func(t *testing.T) {
+		t.Setenv("DRIVE9_TEST_BOOL", "")
+		got := envBool("DRIVE9_TEST_BOOL", true)
+		if !got {
+			t.Fatalf("envBool() = %v, want true", got)
+		}
+	})
+
+	t.Run("parse true", func(t *testing.T) {
+		t.Setenv("DRIVE9_TEST_BOOL", "true")
+		got := envBool("DRIVE9_TEST_BOOL", false)
+		if !got {
+			t.Fatalf("envBool() = %v, want true", got)
+		}
+	})
+
+	t.Run("invalid uses fallback", func(t *testing.T) {
+		t.Setenv("DRIVE9_TEST_BOOL", "not-a-bool")
+		got := envBool("DRIVE9_TEST_BOOL", false)
+		if got {
+			t.Fatalf("envBool() = %v, want false", got)
+		}
+	})
+}
