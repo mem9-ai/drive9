@@ -1,4 +1,4 @@
-name: Drive9 Dev CD
+name: Dev CD
 
 on:
   push:
