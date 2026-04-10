@@ -19,6 +19,7 @@ jobs:
     env:
       ECR_REPO: tidbcloud/drive9-server
       IMAGE_NAME: drive9-server
+      AWS_REGION: us-west-2
     steps:
       - name: check out code
         uses: actions/checkout@v4
