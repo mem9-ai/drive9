@@ -87,18 +87,18 @@ func (w *SSEWatcher) handleReset() {
 	w.fs.dirCache.InvalidateAll()
 
 	// 2. Best-effort kernel cache invalidation for all known inodes.
+	//    Snapshot entries first so we don't hold the inode map lock during
+	//    potentially slow kernel notify calls.
 	//    InodeToPath is kept intact (stale but resolvable).
-	//    Kernel will re-Lookup on next access, which re-validates against server.
-	w.fs.inodes.ForEach(func(ino uint64, entry InodeEntry) {
-		// InodeNotify invalidates cached attrs and page data.
-		w.fs.notifyInode(ino)
+	entries := w.fs.inodes.Snapshot()
+	for _, entry := range entries {
+		w.fs.notifyInode(entry.Ino)
 
-		// EntryNotify invalidates parent's dentry cache for this name.
 		if entry.Path != "/" {
 			parent := parentDir(entry.Path)
 			if parentIno, ok := w.fs.inodes.GetInode(parent); ok {
 				w.fs.notifyEntry(parentIno, path.Base(entry.Path))
 			}
 		}
-	})
+	}
 }

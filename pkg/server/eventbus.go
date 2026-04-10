@@ -2,7 +2,6 @@ package server
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -23,8 +22,8 @@ const (
 // EventBus is a per-tenant in-memory event hub backed by a fixed-size ring buffer.
 // Single-instance only — does not survive restarts or replicate across processes.
 type EventBus struct {
-	seq       atomic.Uint64
 	mu        sync.Mutex
+	seq       uint64 // monotonic counter, protected by mu
 	ring      [eventBusRingSize]ChangeEvent
 	head      int // next write position
 	count     int // entries currently stored (max eventBusRingSize)
@@ -41,16 +40,15 @@ func NewEventBus() *EventBus {
 
 // Publish appends a new event to the ring buffer and wakes all subscribers.
 func (eb *EventBus) Publish(path, op, actor string) {
-	seq := eb.seq.Add(1)
+	eb.mu.Lock()
+	eb.seq++
 	ev := ChangeEvent{
-		Seq:   seq,
+		Seq:   eb.seq,
 		Path:  path,
 		Op:    op,
 		Actor: actor,
 		Ts:    time.Now().UnixMilli(),
 	}
-
-	eb.mu.Lock()
 	eb.ring[eb.head] = ev
 	eb.head = (eb.head + 1) % eventBusRingSize
 	if eb.count < eventBusRingSize {
@@ -94,7 +92,9 @@ func (eb *EventBus) Unsubscribe(id uint64) {
 
 // Seq returns the current sequence number (0 if no events published).
 func (eb *EventBus) Seq() uint64 {
-	return eb.seq.Load()
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+	return eb.seq
 }
 
 // EventsSince returns all events with seq > since. If since is too old

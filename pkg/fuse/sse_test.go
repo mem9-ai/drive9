@@ -1,7 +1,6 @@
 package fuse
 
 import (
-	"path"
 	"testing"
 	"time"
 
@@ -190,10 +189,7 @@ func TestParentDir(t *testing.T) {
 		{"/", "/"},
 	}
 	for _, tt := range tests {
-		got := path.Dir(tt.input)
-		if got == "." {
-			got = "/"
-		}
+		got := parentDir(tt.input)
 		if got != tt.want {
 			t.Errorf("parentDir(%q) = %q, want %q", tt.input, got, tt.want)
 		}

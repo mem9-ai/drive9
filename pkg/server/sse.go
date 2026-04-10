@@ -103,8 +103,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	lastSeen := since
 	if since == 0 {
 		// Initial connection: send reset with current seq.
-		sendSSEReset(w, bus.Seq(), "initial_sync")
-		lastSeen = bus.Seq()
+		seq := bus.Seq()
+		sendSSEReset(w, seq, "initial_sync")
+		lastSeen = seq
 		flusher.Flush()
 	} else {
 		events, ok := bus.EventsSince(since)
@@ -135,7 +136,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-heartbeat.C:
-			sendSSEHeartbeat(w, bus.Seq())
+			sendSSEHeartbeat(w, lastSeen)
 			flusher.Flush()
 		case _, open := <-notify:
 			if !open {
@@ -143,8 +144,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			}
 			events, ok := bus.EventsSince(lastSeen)
 			if !ok {
-				sendSSEReset(w, bus.Seq(), "seq_too_old")
-				lastSeen = bus.Seq()
+				resetSeq := bus.Seq()
+				sendSSEReset(w, resetSeq, "seq_too_old")
+				lastSeen = resetSeq
 			} else {
 				for _, ev := range events {
 					sendSSEEvent(w, ev)
@@ -156,7 +158,24 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// isStructuralOp returns true for operations that change namespace structure
+// (rename, delete, mkdir, copy). These ops require a full reset on the client
+// because targeted invalidation cannot reliably cover old paths, subtrees,
+// and parent directory caches.
+func isStructuralOp(op string) bool {
+	switch op {
+	case "rename", "delete", "mkdir", "copy":
+		return true
+	}
+	return false
+}
+
 func sendSSEEvent(w http.ResponseWriter, ev ChangeEvent) {
+	if isStructuralOp(ev.Op) {
+		// Structural ops are sent as reset events per the accepted design.
+		sendSSEReset(w, ev.Seq, "structural_change")
+		return
+	}
 	data, err := json.Marshal(ev)
 	if err != nil {
 		logger.Error(context.TODO(), "sse_marshal_event_failed")

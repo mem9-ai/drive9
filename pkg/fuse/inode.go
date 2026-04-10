@@ -252,15 +252,18 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 	}
 }
 
-// ForEach calls fn for each entry in the map while holding a read lock.
-// fn receives copies of entries to avoid data races.
-func (m *InodeToPath) ForEach(fn func(ino uint64, entry InodeEntry)) {
+// Snapshot returns a copy of all entries. The caller can iterate outside
+// the lock, avoiding holding the read-lock during expensive callbacks
+// (e.g. kernel inode/entry notifications).
+func (m *InodeToPath) Snapshot() []InodeEntry {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	for ino, e := range m.byInode {
-		fn(ino, *e)
+	entries := make([]InodeEntry, 0, len(m.byInode))
+	for _, e := range m.byInode {
+		entries = append(entries, *e)
 	}
+	return entries
 }
 
 // Remove deletes the entry for the given path from both maps.

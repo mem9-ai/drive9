@@ -60,8 +60,13 @@ func (c *Client) WatchEvents(ctx context.Context, actor string, handler EventHan
 		default:
 		}
 
+		// Always backoff on disconnect (err or clean EOF).
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return
+		}
 		if err != nil {
-			time.Sleep(backoff)
 			backoff *= 2
 			if backoff > sseMaxBackoff {
 				backoff = sseMaxBackoff
@@ -137,12 +142,6 @@ func parseAndDispatch(eventType, data string, handler EventHandler) {
 		}
 		handler(nil, &ev)
 	case "heartbeat":
-		// Heartbeats carry seq for liveness but don't need dispatching.
-		var ev ResetEvent
-		if err := json.Unmarshal([]byte(data), &ev); err != nil {
-			return
-		}
-		// Update lastSeq via reset path (same struct shape).
-		handler(nil, &ev)
+		// Heartbeats are connection-liveness signals only; do not dispatch.
 	}
 }
