@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sercand/kuberesolver/v5"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/encrypt"
@@ -187,6 +188,9 @@ func main() {
 			if accountAddr == "" {
 				die(fmt.Errorf("DRIVE9_TIDBCLOUD_ACCOUNT_ADDR is required for tidbcloud-native provider"))
 			}
+			if hasKubernetesResolverTarget(mgmtAddr, serverlessAddr, accountAddr) {
+				kuberesolver.RegisterInCluster()
+			}
 
 			tlsCreds := credentials.NewTLS(nil)
 			mgmtConn, err := grpc.NewClient(mgmtAddr, grpc.WithTransportCredentials(tlsCreds))
@@ -237,6 +241,15 @@ func envOr(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func hasKubernetesResolverTarget(targets ...string) bool {
+	for _, target := range targets {
+		if strings.HasPrefix(target, "kubernetes://") {
+			return true
+		}
+	}
+	return false
 }
 
 func usage() {
