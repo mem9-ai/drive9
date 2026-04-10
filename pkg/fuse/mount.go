@@ -81,6 +81,23 @@ func Mount(opts *MountOptions) error {
 		return fmt.Errorf("fuse mount: %w", err)
 	}
 
+	// Start serving in a background goroutine so WaitMount can proceed.
+	// On macOS, Serve() must be running before WaitMount() returns because
+	// mount_macfuse waits for STATFS (handled in the serve loop) before
+	// signalling ready, and WaitMount then runs pollHack which triggers
+	// a LOOKUP+OPEN+POLL through the mount point.
+	go server.Serve()
+
+	// WaitMount blocks until mount_macfuse exits (INIT+STATFS done) and
+	// then runs pollHack, which opens .go-fuse-epoll-hack inside the mount
+	// to trigger _OP_POLL so go-fuse can reply ENOSYS. Without this, macOS
+	// may later send _OP_POLL and deadlock the Go runtime (the netpoller
+	// thread consumes the last GOMAXPROCS slot, leaving no thread to handle
+	// the POLL request from the kernel).
+	if err := server.WaitMount(); err != nil {
+		return fmt.Errorf("fuse wait mount: %w", err)
+	}
+
 	// Signal handling for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -95,6 +112,6 @@ func Mount(opts *MountOptions) error {
 	}()
 
 	fmt.Fprintf(os.Stderr, "dat9: mounted on %s (server: %s)\n", opts.MountPoint, opts.Server)
-	server.Serve()
+	server.Wait()
 	return nil
 }
