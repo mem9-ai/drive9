@@ -97,23 +97,25 @@ func (eb *EventBus) Seq() uint64 {
 	return eb.seq
 }
 
-// EventsSince returns all events with seq > since. If since is too old
-// (the ring has wrapped past it) or from a future/different server lifetime,
-// ok is false and the caller should send a reset.
+// EventsSince returns all events with seq > since and the current head seq.
+// If since is too old (ring wrapped), from the future, or zero, ok is false
+// and the caller should send a reset using the returned headSeq.
 //
-// When since == 0, this always returns ok=false (caller should send reset +
-// start live from current head).
-func (eb *EventBus) EventsSince(since uint64) (events []ChangeEvent, ok bool) {
-	if since == 0 {
-		return nil, false
-	}
-
+// headSeq is always returned from the same lock acquisition as the event
+// scan, guaranteeing a consistent snapshot for reset cursor positioning.
+func (eb *EventBus) EventsSince(since uint64) (events []ChangeEvent, headSeq uint64, ok bool) {
 	eb.mu.Lock()
 	defer eb.mu.Unlock()
 
+	headSeq = eb.seq
+
+	if since == 0 {
+		return nil, headSeq, false
+	}
+
 	if eb.count == 0 {
 		// No events ever published. since > 0 means stale client.
-		return nil, false
+		return nil, headSeq, false
 	}
 
 	// Find the oldest seq in the ring.
@@ -123,15 +125,15 @@ func (eb *EventBus) EventsSince(since uint64) (events []ChangeEvent, ok bool) {
 
 	if since < oldestSeq {
 		// Ring has wrapped past the client's position.
-		return nil, false
+		return nil, headSeq, false
 	}
 	if since > newestSeq {
 		// Client is ahead of us (e.g. server restarted). Send reset.
-		return nil, false
+		return nil, headSeq, false
 	}
 	if since == newestSeq {
 		// Client is caught up, no new events.
-		return nil, true
+		return nil, headSeq, true
 	}
 
 	// Walk the ring from oldest to newest, collecting events with seq > since.
@@ -143,5 +145,5 @@ func (eb *EventBus) EventsSince(since uint64) (events []ChangeEvent, ok bool) {
 			result = append(result, ev)
 		}
 	}
-	return result, true
+	return result, headSeq, true
 }

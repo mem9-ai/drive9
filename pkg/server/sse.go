@@ -100,32 +100,27 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// Phase 1: Replay or Reset.
+	// EventsSince returns headSeq from the same lock acquisition as the
+	// ring scan, so reset cursor and ring state are a consistent snapshot.
+	events, headSeq, ok := bus.EventsSince(since)
 	lastSeen := since
-	if since == 0 {
-		// Initial connection: send reset with current seq.
-		seq := bus.Seq()
-		sendSSEReset(w, seq, "initial_sync")
-		lastSeen = seq
-		flusher.Flush()
-	} else {
-		events, ok := bus.EventsSince(since)
-		if !ok {
-			// Gap detected: send reset.
-			currentSeq := bus.Seq()
-			reason := "seq_too_old"
-			if since > currentSeq {
+	if !ok {
+		reason := "initial_sync"
+		if since > 0 {
+			reason = "seq_too_old"
+			if since > headSeq {
 				reason = "server_restart"
 			}
-			sendSSEReset(w, currentSeq, reason)
-			lastSeen = currentSeq
-		} else {
-			for _, ev := range events {
-				sendSSEEvent(w, ev)
-				lastSeen = ev.Seq
-			}
 		}
-		flusher.Flush()
+		sendSSEReset(w, headSeq, reason)
+		lastSeen = headSeq
+	} else {
+		for _, ev := range events {
+			sendSSEEvent(w, ev)
+			lastSeen = ev.Seq
+		}
 	}
+	flusher.Flush()
 
 	// Phase 2: Live stream.
 	heartbeat := time.NewTicker(sseHeartbeatInterval)
@@ -142,13 +137,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if !open {
 				return
 			}
-			events, ok := bus.EventsSince(lastSeen)
-			if !ok {
-				resetSeq := bus.Seq()
-				sendSSEReset(w, resetSeq, "seq_too_old")
-				lastSeen = resetSeq
+			liveEvents, liveHead, liveOK := bus.EventsSince(lastSeen)
+			if !liveOK {
+				sendSSEReset(w, liveHead, "seq_too_old")
+				lastSeen = liveHead
 			} else {
-				for _, ev := range events {
+				for _, ev := range liveEvents {
 					sendSSEEvent(w, ev)
 					lastSeen = ev.Seq
 				}

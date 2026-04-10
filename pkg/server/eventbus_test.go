@@ -26,12 +26,15 @@ func TestEventBusSince0ReturnsNotOK(t *testing.T) {
 	bus := NewEventBus()
 	bus.Publish("/a.txt", "write", "")
 
-	events, ok := bus.EventsSince(0)
+	events, headSeq, ok := bus.EventsSince(0)
 	if ok {
 		t.Fatal("EventsSince(0) should return ok=false (initial sync → reset)")
 	}
 	if events != nil {
 		t.Fatalf("expected nil events, got %d", len(events))
+	}
+	if headSeq != 1 {
+		t.Fatalf("headSeq=%d, want 1", headSeq)
 	}
 }
 
@@ -41,7 +44,7 @@ func TestEventBusReplay(t *testing.T) {
 	bus.Publish("/b.txt", "write", "")
 	bus.Publish("/c.txt", "delete", "")
 
-	events, ok := bus.EventsSince(1) // since seq=1, want seq=2,3
+	events, _, ok := bus.EventsSince(1) // since seq=1, want seq=2,3
 	if !ok {
 		t.Fatal("EventsSince(1) returned not ok")
 	}
@@ -60,7 +63,7 @@ func TestEventBusCaughtUp(t *testing.T) {
 	bus := NewEventBus()
 	bus.Publish("/a.txt", "write", "")
 
-	events, ok := bus.EventsSince(1)
+	events, _, ok := bus.EventsSince(1)
 	if !ok {
 		t.Fatal("expected ok=true when caught up")
 	}
@@ -77,13 +80,13 @@ func TestEventBusRingOverflow(t *testing.T) {
 	}
 
 	// Seq 1 should be evicted from the ring.
-	_, ok := bus.EventsSince(1)
+	_, _, ok := bus.EventsSince(1)
 	if ok {
 		t.Fatal("expected ok=false for seq that's been overwritten")
 	}
 
 	// Most recent seq should still be reachable.
-	events, ok := bus.EventsSince(uint64(eventBusRingSize))
+	events, _, ok := bus.EventsSince(uint64(eventBusRingSize))
 	if !ok {
 		t.Fatal("expected ok=true for recent seq")
 	}
@@ -97,7 +100,7 @@ func TestEventBusFutureSeq(t *testing.T) {
 	bus.Publish("/a.txt", "write", "")
 
 	// Client has seq=999 but server only has seq=1 (e.g. server restarted).
-	_, ok := bus.EventsSince(999)
+	_, _, ok := bus.EventsSince(999)
 	if ok {
 		t.Fatal("expected ok=false for future seq (server restart)")
 	}
@@ -150,7 +153,7 @@ func TestEventBusConcurrentPublish(t *testing.T) {
 func TestEventBusEmptyRingSincePositive(t *testing.T) {
 	bus := NewEventBus()
 	// No events published; client has since=5 (stale from previous server life).
-	_, ok := bus.EventsSince(5)
+	_, _, ok := bus.EventsSince(5)
 	if ok {
 		t.Fatal("expected ok=false when ring is empty and since > 0")
 	}
