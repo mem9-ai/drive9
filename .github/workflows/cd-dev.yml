@@ -36,7 +36,7 @@ jobs:
 
       - name: Checkout agfs dependency
         run: |
-          git clone --depth 1 https://${{ secrets.GIT_ACTION_BOT }}@github.com/c4pt0r/agfs ../agfs
+          git clone --depth 1 https://github.com/c4pt0r/agfs ../agfs
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -55,8 +55,11 @@ jobs:
         id: image-tag
         run: |
           REF_NAME=${{ github.ref_name }}
-          REF_NAME=${REF_NAME/\//-}
-          echo "tag=${REF_NAME}-${{ github.sha }}" >> $GITHUB_OUTPUT
+          SAFE_REF_NAME=$(printf '%s' "$REF_NAME" | sed 's/[^[:alnum:]_.-]/-/g; s/^[.-][.-]*//')
+          if [ -z "$SAFE_REF_NAME" ]; then
+            SAFE_REF_NAME=ref
+          fi
+          echo "tag=${SAFE_REF_NAME}-${{ github.sha }}" >> $GITHUB_OUTPUT
 
       - name: Build server binary
         run: make build-server GOOS=linux GOARCH=amd64
@@ -105,11 +108,15 @@ jobs:
       - name: Get PR number
         id: pr-number
         run: |
-          out=$(curl -s -u tidbcloud-bot:${{ secrets.GIT_ACTION_BOT }} \
-            -H "Accept: application/vnd.github.groot-preview+json" \
+          out=$(curl -sf -u tidbcloud-bot:${{ secrets.GIT_ACTION_BOT }} \
+            -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
-            | jq '.[].number')
-          echo "pr=$out" >> "$GITHUB_OUTPUT"
+            | jq -r '.[0].number // empty')
+          if [ -n "$out" ]; then
+            echo "url=https://github.com/${{ github.repository }}/pull/${out}" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=https://github.com/${{ github.repository }}/commit/${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Bump version in app-delivery repo
         uses: benc-uk/workflow-dispatch@v1
@@ -118,4 +125,4 @@ jobs:
           repo: tidbcloud/app-delivery
           ref: refs/heads/main
           token: ${{ secrets.GIT_ACTION_BOT }}
-          inputs: '{"version": "${{ needs.build.outputs.tag }}", "env": "dev", "region": "${{ matrix.region }}", "url": "https://github.com/${{ github.repository }}/pull/${{ steps.pr-number.outputs.pr }}", "author": "${{ github.actor }}" }'
+          inputs: '{"version": "${{ needs.build.outputs.tag }}", "env": "dev", "region": "${{ matrix.region }}", "url": "${{ steps.pr-number.outputs.url }}", "author": "${{ github.actor }}" }'
