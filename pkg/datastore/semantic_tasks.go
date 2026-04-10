@@ -403,6 +403,9 @@ func (s *Store) RenewSemanticTask(ctx context.Context, taskID, receipt string, l
 	}
 	err = s.semanticTaskLeaseError(ctx, taskID)
 	if err == nil {
+		// semanticTaskLeaseError should classify a zero-row renew as either
+		// not-found or lease-mismatch. Keep a defensive fallback so a future
+		// helper change cannot accidentally surface a false-success renew path.
 		err = semantic.ErrTaskLeaseMismatch
 	}
 	return time.Time{}, err

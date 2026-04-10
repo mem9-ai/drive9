@@ -758,13 +758,14 @@ func (e *semanticTaskLeaseExecution) logStopped(m *semanticWorkerManager, target
 		return
 	}
 
+	result := "owned"
+	if lost {
+		result = "lease_lost"
+	}
 	fields := append([]zap.Field{
 		zap.String("tenant_id", target.tenantID),
-		zap.String("result", "owned"),
+		zap.String("result", result),
 	}, semanticTaskLogFields(task)...)
-	if lost {
-		fields[1] = zap.String("result", "lease_lost")
-	}
 	if leaseUntil != nil {
 		fields = append(fields, zap.Time("latest_lease_until", leaseUntil.UTC()))
 	}
