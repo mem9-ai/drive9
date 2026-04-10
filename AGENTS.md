@@ -100,31 +100,31 @@ embedding. Override any var before running.
 ## Project layout
 
 ```
-cmd/drive9/          CLI entrypoint (cp, cat, ls, mv, rm, mount, umount, ...)
-cmd/drive9-server/     Server entrypoint
+cmd/drive9/             CLI entrypoint (cp, cat, ls, mv, rm, mount, umount, ...)
+cmd/drive9-server/      Server entrypoint
 .github/ISSUE_TEMPLATE/ GitHub issue templates (bug report / enhancement / feature request)
 pkg/
-  backend/           AGFS FileSystem implementation (Drive9Backend)
-  client/            Go SDK HTTP client
-  datastore/         Core metadata store (TiDB/MySQL)
-  embedding/         Embedding provider integration
-  encrypt/           Encryption helpers
-  fuse/              FUSE mount (go-fuse/v2)
-  logger/            Structured logging (zap)
-  meta/              Metadata/search models
-  metrics/           Metrics recording
-  s3client/          S3 interface (AWS + local mock)
-  server/            HTTP server (/v1/fs/{path} router)
-  tenant/            Tenant schema management
-  pathutil/          Path canonicalization and validation
-  semantic/          Durable background task types
-  traceid/           Trace ID helpers
+  backend/              AGFS FileSystem implementation (Drive9Backend)
+  client/               Go SDK HTTP client
+  datastore/            Core metadata store (TiDB/MySQL)
+  embedding/            Embedding provider integration
+  encrypt/              Encryption helpers
+  fuse/                 FUSE mount (go-fuse/v2)
+  logger/               Structured logging (zap)
+  meta/                 Metadata/search models
+  metrics/              Metrics recording
+  s3client/             S3 interface (AWS + local mock)
+  server/               HTTP server (/v1/fs/{path} router)
+  tenant/               Tenant schema management
+  pathutil/             Path canonicalization and validation
+  semantic/             Durable background task types
+  traceid/              Trace ID helpers
 internal/
-  testmysql/         MySQL test helpers (shared across packages)
-e2e/                 Live bash smoke tests (not go test)
-scripts/             Shell helpers for local dev and test
-docs/                Design documents
-site/                Frontend / release assets
+  testmysql/            MySQL test helpers (shared across packages)
+e2e/                    Live bash smoke tests (not go test)
+scripts/                Shell helpers for local dev and test
+docs/                   Design documents
+site/                   Frontend / release assets
 ```
 
 When creating a new GitHub issue, follow the templates under `.github/ISSUE_TEMPLATE/`
@@ -213,6 +213,25 @@ Obtain a logger from `pkg/logger` or accept `*zap.Logger` via `Config`.
 - Use `t.Fatal` / `t.Fatalf` for setup failures; use `t.Errorf` for assertion failures.
 - No external assertion library — plain `if got != want { t.Fatalf(...) }`.
 - `TestMain` in `testmain_test.go` wires up the shared DSN for each package.
+
+### Failpoint testing
+
+- Use failpoint only for high-value concurrency and failure-path boundaries (lease expiry,
+  renew/stop races, panic cleanup, finalize ack/retry ownership checks), not as a blanket
+  replacement for ordinary polling or simple mocks.
+- Put failpoint-backed tests in `*_failpoint_test.go` files with `//go:build failpoint`.
+- Prefer injection points at state-transition boundaries so tests can deterministically
+  control ownership windows without production-only branching.
+- Scope failpoint callbacks narrowly by task/resource/action so one test cannot accidentally
+  perturb unrelated work in the same package.
+- Always pair `failpoint.Enable(...)` / `failpoint.EnableCall(...)` with `t.Cleanup(...)`
+  that disables the failpoint.
+- Run failpoint tests through `python3 scripts/run_failpoint_tests.py` or `make test-failpoint`.
+  Do not run them in parallel with ordinary `go test` commands: `failpoint-ctl enable/disable`
+  rewrites source files during the run and can break concurrent non-failpoint builds.
+- Keep failpoint-off behavior identical to the non-instrumented code path.
+- When a timing-sensitive test still needs synchronization, prefer channels plus failpoint
+  gating over sleeps that guess at scheduler timing.
 
 ### Context
 
