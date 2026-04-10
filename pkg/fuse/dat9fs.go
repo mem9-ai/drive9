@@ -182,6 +182,8 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 	fh.Dirty.remoteSize = stat.Size
 
 	// Install lazy loader: loads a single part from the server via range read.
+	// Uses a bounded timeout so a stalled server cannot block the FUSE handler
+	// (and its held fh.mu) indefinitely.
 	c := fs.client
 	filePath := fh.Path
 	fh.Dirty.LoadPart = func(partNum int) ([]byte, error) {
@@ -195,7 +197,10 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 			return nil, nil
 		}
 
-		rc, err := c.ReadStreamRange(context.Background(), filePath, offset, length)
+		lpCtx, lpCf := context.WithTimeout(context.Background(), fuseTimeout)
+		defer lpCf()
+
+		rc, err := c.ReadStreamRange(lpCtx, filePath, offset, length)
 		if err != nil {
 			return nil, err
 		}
@@ -280,9 +285,11 @@ func (fs *Dat9FS) notifyEntry(parentIno uint64, name string) {
 	if fs.server == nil {
 		return
 	}
-	// EntryNotify can return ENOENT if the kernel doesn't have the entry
-	// cached — that's fine, we just ignore it.
-	_ = fs.server.EntryNotify(parentIno, name)
+	// Run asynchronously to avoid deadlock on macOS: EntryNotify can
+	// trigger synchronous Lookup/GetAttr back into our handlers, which
+	// needs a free go-fuse worker thread. If called from within a handler,
+	// the calling worker is blocked, potentially exhausting the pool.
+	go func() { _ = fs.server.EntryNotify(parentIno, name) }()
 }
 
 // notifyInode tells the kernel to invalidate cached attributes and data
@@ -291,7 +298,7 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 	if fs.server == nil {
 		return
 	}
-	_ = fs.server.InodeNotify(ino, 0, 0)
+	go func() { _ = fs.server.InodeNotify(ino, 0, 0) }()
 }
 
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) gofuse.Status {
