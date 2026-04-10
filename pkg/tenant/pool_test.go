@@ -227,4 +227,29 @@ func TestPoolAutoSemanticTaskTypes(t *testing.T) {
 	if len(got) != 1 || got[0] != semantic.TaskTypeImgExtractText {
 		t.Fatalf("got %#v, want [img_extract_text]", got)
 	}
+
+	audioOnly := NewPool(PoolConfig{BackendOptions: backend.Options{
+		AsyncAudioExtract: backend.AsyncAudioExtractOptions{Enabled: true, Extractor: &poolDummyAudioExtractor{}},
+	}}, enc)
+	defer audioOnly.Close()
+	gotAudio := audioOnly.AutoSemanticTaskTypes()
+	if len(gotAudio) != 1 || gotAudio[0] != semantic.TaskTypeAudioExtractText {
+		t.Fatalf("got %#v, want [audio_extract_text]", gotAudio)
+	}
+
+	both := NewPool(PoolConfig{BackendOptions: backend.Options{
+		AsyncImageExtract: backend.AsyncImageExtractOptions{Enabled: true},
+		AsyncAudioExtract: backend.AsyncAudioExtractOptions{Enabled: true, Extractor: &poolDummyAudioExtractor{}},
+	}}, enc)
+	defer both.Close()
+	gotBoth := both.AutoSemanticTaskTypes()
+	if len(gotBoth) != 2 || gotBoth[0] != semantic.TaskTypeImgExtractText || gotBoth[1] != semantic.TaskTypeAudioExtractText {
+		t.Fatalf("got %#v, want [img_extract_text audio_extract_text]", gotBoth)
+	}
+}
+
+type poolDummyAudioExtractor struct{}
+
+func (poolDummyAudioExtractor) ExtractAudioText(context.Context, backend.AudioExtractRequest) (string, error) {
+	return "", nil
 }

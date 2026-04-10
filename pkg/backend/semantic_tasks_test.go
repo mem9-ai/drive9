@@ -190,6 +190,117 @@ func TestWriteCreateAutoEmbeddingImageEnqueuesImgExtractTaskWithoutLegacyQueue(t
 	}
 }
 
+func TestWriteCreateAutoEmbeddingAudioEnqueuesAudioExtractTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	if _, err := b.Write("/tracks/create.mp3", []byte{0xff, 0xf3}, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, revision, _, _ := mustFileForPath(t, b, "/tracks/create.mp3")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var audioSeen bool
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			audioSeen = true
+			if tsk.Status != string(semantic.TaskQueued) || tsk.ResourceVersion != 1 {
+				t.Fatalf("unexpected audio task: %+v", tsk)
+			}
+		}
+	}
+	if !audioSeen {
+		t.Fatalf("expected audio_extract_text among %+v", tasks)
+	}
+	nf, err := b.Store().Stat(context.Background(), "/tracks/create.mp3")
+	if err != nil || nf.File == nil {
+		t.Fatal(err)
+	}
+	if nf.File.ContentText != "" {
+		t.Fatalf("content_text should be empty before worker, got %q", nf.File.ContentText)
+	}
+}
+
+func TestWriteOverwriteAutoEmbeddingAudioEnqueuesAudioExtractTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	fileID := insertImageFileForExtractTest(t, b, "/tracks/ow.mp3", "audio/mpeg", []byte{1, 2, 3})
+	setStoredEmbeddingState(t, b, fileID, 1)
+
+	if _, err := b.Write("/tracks/ow.mp3", []byte{4, 5, 6}, 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	_, revision, _, _ := mustFileForPath(t, b, "/tracks/ow.mp3")
+	if revision != 2 {
+		t.Fatalf("revision=%d, want 2", revision)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var audioSeen bool
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) && tsk.ResourceVersion == 2 {
+			audioSeen = true
+			if tsk.Status != string(semantic.TaskQueued) {
+				t.Fatalf("unexpected audio task: %+v", tsk)
+			}
+		}
+	}
+	if !audioSeen {
+		t.Fatalf("expected audio_extract_text for revision 2 among %+v", tasks)
+	}
+}
+
+func TestWriteCreateAutoEmbeddingSkipsAudioWhenExtractorUnset(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled: true,
+			// Extractor nil: Phase 2 does not wire a default extractor.
+			Extractor: nil,
+		},
+	})
+	if _, err := b.Write("/tracks/no-extractor.mp3", []byte{0xff, 0xf3}, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/tracks/no-extractor.mp3")
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			t.Fatalf("unexpected audio task: %+v", tsk)
+		}
+	}
+}
+
+func TestWriteCreateAutoEmbeddingSkipsAudioForNonAudioFile(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	if _, err := b.Write("/notes/plain.txt", []byte("hello"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/notes/plain.txt")
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			t.Fatalf("unexpected audio task: %+v", tsk)
+		}
+	}
+}
+
 func TestWriteOverwriteEnqueuesNextRevisionAndClearsEmbeddingState(t *testing.T) {
 	b := newTestBackend(t)
 	if _, err := b.Write("/f.txt", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -547,6 +658,33 @@ func TestConfirmUploadAutoEmbeddingImageEnqueuesImgExtractTaskWithoutLegacyQueue
 	}
 	if tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) || tasks[0].Status != string(semantic.TaskQueued) || tasks[0].ResourceVersion != 1 {
 		t.Fatalf("unexpected semantic task: %+v", tasks[0])
+	}
+}
+
+func TestConfirmUploadAutoEmbeddingDoesNotEnqueueAudioExtractTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	ctx := context.Background()
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUpload(ctx, "/upload/clip.mp3", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadAllPartsForPlan(t, b, plan, plan.UploadID, totalSize)
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/upload/clip.mp3")
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			t.Fatalf("upload completion must not enqueue audio_extract_text, got %+v", tsk)
+		}
 	}
 }
 

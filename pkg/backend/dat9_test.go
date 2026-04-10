@@ -95,7 +95,7 @@ func TestDat9BackendAutoSemanticTaskTypes(t *testing.T) {
 	t.Run("auto_mode_without_async_runtime", func(t *testing.T) {
 		b := newTestBackendWithOptions(t, Options{DatabaseAutoEmbedding: true})
 		if b.AutoSemanticTaskTypes() != nil {
-			t.Fatal("expected nil without async image extraction runtime")
+			t.Fatal("expected nil without async image/audio extraction runtime")
 		}
 	})
 	t.Run("auto_mode_with_async_image", func(t *testing.T) {
@@ -111,6 +111,38 @@ func TestDat9BackendAutoSemanticTaskTypes(t *testing.T) {
 		got := b.AutoSemanticTaskTypes()
 		if len(got) != 1 || got[0] != semantic.TaskTypeImgExtractText {
 			t.Fatalf("got %#v, want [img_extract_text]", got)
+		}
+	})
+	t.Run("auto_mode_with_async_audio_only", func(t *testing.T) {
+		b := newTestBackendWithOptions(t, Options{
+			DatabaseAutoEmbedding: true,
+			AsyncAudioExtract: AsyncAudioExtractOptions{
+				Enabled:   true,
+				Extractor: &staticAudioExtractor{text: "x"},
+			},
+		})
+		got := b.AutoSemanticTaskTypes()
+		if len(got) != 1 || got[0] != semantic.TaskTypeAudioExtractText {
+			t.Fatalf("got %#v, want [audio_extract_text]", got)
+		}
+	})
+	t.Run("auto_mode_with_image_and_audio", func(t *testing.T) {
+		b := newTestBackendWithOptions(t, Options{
+			DatabaseAutoEmbedding: true,
+			AsyncImageExtract: AsyncImageExtractOptions{
+				Enabled:   true,
+				Workers:   1,
+				QueueSize: 4,
+				Extractor: &staticImageExtractor{text: "caption"},
+			},
+			AsyncAudioExtract: AsyncAudioExtractOptions{
+				Enabled:   true,
+				Extractor: &staticAudioExtractor{text: "x"},
+			},
+		})
+		got := b.AutoSemanticTaskTypes()
+		if len(got) != 2 || got[0] != semantic.TaskTypeImgExtractText || got[1] != semantic.TaskTypeAudioExtractText {
+			t.Fatalf("got %#v, want [img_extract_text audio_extract_text]", got)
 		}
 	})
 }
