@@ -611,6 +611,8 @@ func (m *semanticWorkerManager) dispatchTask(ctx context.Context, target *semant
 		return m.processEmbedTask(ctx, target.store, task)
 	case semantic.TaskTypeImgExtractText:
 		return m.processImgExtractTask(ctx, target.backend, task)
+	case semantic.TaskTypeAudioExtractText:
+		return m.processAudioExtractTask(ctx, target.backend, task)
 	default:
 		message := fmt.Sprintf("unsupported task type %q", task.TaskType)
 		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "unsupported", message: message}
@@ -855,6 +857,14 @@ func (m *semanticWorkerManager) processImgExtractTask(ctx context.Context, b *ba
 	return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: string(result)}
 }
 
+func (m *semanticWorkerManager) processAudioExtractTask(ctx context.Context, b *backend.Dat9Backend, task *semantic.Task) semanticTaskOutcome {
+	result, err := b.ProcessAudioExtractTask(ctx, audioExtractTaskSpecFromSemanticTask(task))
+	if err != nil {
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: string(result), message: err.Error()}
+	}
+	return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: string(result)}
+}
+
 func (m *semanticWorkerManager) injectBeforeSemanticTaskFinalize(tenantID string, store *datastore.Store, task *semantic.Task, outcome semanticTaskOutcome) {
 	failpoint.InjectCall("semanticWorkerBeforeFinalize", tenantID, store, task, string(outcome.action), outcome.message, outcome.result)
 }
@@ -1059,6 +1069,22 @@ func imageExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.ImageExtr
 		return spec
 	}
 	var payload semantic.ImgExtractTaskPayload
+	if err := json.Unmarshal(task.PayloadJSON, &payload); err == nil {
+		spec.Path = payload.Path
+		spec.ContentType = payload.ContentType
+	}
+	return spec
+}
+
+func audioExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.AudioExtractTaskSpec {
+	if task == nil {
+		return backend.AudioExtractTaskSpec{}
+	}
+	spec := backend.AudioExtractTaskSpec{FileID: task.ResourceID, Revision: task.ResourceVersion}
+	if len(task.PayloadJSON) == 0 {
+		return spec
+	}
+	var payload semantic.AudioExtractTaskPayload
 	if err := json.Unmarshal(task.PayloadJSON, &payload); err == nil {
 		spec.Path = payload.Path
 		spec.ContentType = payload.ContentType

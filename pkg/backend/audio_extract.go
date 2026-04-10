@@ -2,7 +2,15 @@ package backend
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"io"
 	"strings"
+
+	"github.com/pingcap/failpoint"
+
+	"github.com/mem9-ai/dat9/pkg/datastore"
 )
 
 // AudioExtractRequest is the input to a pluggable audio->text extractor.
@@ -118,10 +126,6 @@ func effectiveAudioMIME(path, contentType string) string {
 	return ""
 }
 
-func audioContentTypeFromPath(path string) string {
-	return effectiveAudioMIME(path, "")
-}
-
 // isAudioContentType reports whether contentType (and optional path fallback) is
 // in the Phase-2 audio allowlist.
 func isAudioContentType(contentType, path string) bool {
@@ -130,4 +134,127 @@ func isAudioContentType(contentType, path string) bool {
 
 func isSupportedAudioForSemanticTask(path, contentType string) bool {
 	return isAudioContentType(contentType, path)
+}
+
+// ProcessAudioExtractTask runs transcript extraction for one durable
+// audio_extract_text task. Terminal business outcomes return a nil error; runtime
+// misconfiguration and transient failures return a retryable error.
+func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExtractTaskSpec) (AudioExtractResult, error) {
+	if !b.SupportsAsyncAudioExtract() {
+		return AudioExtractResultRuntimeNotConfigured, fmt.Errorf("async audio extract runtime not configured")
+	}
+
+	f, err := b.store.GetFile(ctx, task.FileID)
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			return AudioExtractResultFileNotFound, nil
+		}
+		return AudioExtractResultGetFileError, fmt.Errorf("get file: %w", err)
+	}
+	if f.Status != datastore.StatusConfirmed {
+		return AudioExtractResultNotConfirmed, nil
+	}
+	ct := strings.TrimSpace(f.ContentType)
+	if ct == "" {
+		ct = strings.TrimSpace(task.ContentType)
+	}
+	if !isSupportedAudioForSemanticTask(task.Path, ct) {
+		return AudioExtractResultNotAudio, nil
+	}
+	if task.Revision > 0 && f.Revision != task.Revision {
+		return AudioExtractResultStale, nil
+	}
+
+	data, err := b.loadAudioBytesForExtract(ctx, f)
+	if err != nil {
+		return AudioExtractResultLoadError, fmt.Errorf("load audio bytes: %w", err)
+	}
+	if len(data) == 0 {
+		return AudioExtractResultTooLarge, nil
+	}
+
+	resolvedMIME := effectiveAudioMIME(task.Path, ct)
+	taskCtx, cancel := context.WithTimeout(ctx, b.audioExtractTimeout)
+	text, err := b.audioExtractor.ExtractAudioText(taskCtx, AudioExtractRequest{
+		FileID:      task.FileID,
+		Path:        task.Path,
+		ContentType: resolvedMIME,
+		Data:        data,
+	})
+	cancel()
+	if err != nil {
+		return AudioExtractResultExtractError, fmt.Errorf("extract audio text: %w", err)
+	}
+	text = sanitizeExtractedText(text, b.maxAudioExtractTextBytes)
+	if text == "" {
+		return AudioExtractResultEmptyText, nil
+	}
+
+	var updated bool
+	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := injectedAudioExtractWritebackError("audioExtractWritebackUpdateFileSearchTextError"); err != nil {
+			return err
+		}
+		var txErr error
+		updated, txErr = b.store.UpdateFileSearchTextTx(tx, task.FileID, task.Revision, text)
+		return txErr
+	})
+	if err != nil {
+		return AudioExtractResultUpdateError, fmt.Errorf("update file search text: %w", err)
+	}
+	if !updated {
+		return AudioExtractResultStale, nil
+	}
+	return AudioExtractResultWritten, nil
+}
+
+func injectedAudioExtractWritebackError(name string) error {
+	var injected error
+	failpoint.Inject(name, func(val failpoint.Value) {
+		switch v := val.(type) {
+		case string:
+			injected = errors.New(v)
+		case bool:
+			if v {
+				injected = fmt.Errorf("injected failpoint %s", name)
+			}
+		}
+	})
+	return injected
+}
+
+func (b *Dat9Backend) loadAudioBytesForExtract(ctx context.Context, f *datastore.File) ([]byte, error) {
+	if b.audioExtractMaxSize > 0 && f.SizeBytes > b.audioExtractMaxSize {
+		return nil, nil
+	}
+	if f.StorageType == datastore.StorageDB9 {
+		if b.audioExtractMaxSize > 0 && int64(len(f.ContentBlob)) > b.audioExtractMaxSize {
+			return nil, nil
+		}
+		return append([]byte(nil), f.ContentBlob...), nil
+	}
+	if f.StorageType != datastore.StorageS3 {
+		return nil, fmt.Errorf("unsupported storage type: %s", f.StorageType)
+	}
+	if b.s3 == nil {
+		return nil, fmt.Errorf("s3 client not configured")
+	}
+	rc, err := b.s3.GetObject(ctx, f.StorageRef)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }()
+
+	reader := io.Reader(rc)
+	if b.audioExtractMaxSize > 0 {
+		reader = io.LimitReader(rc, b.audioExtractMaxSize+1)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	if b.audioExtractMaxSize > 0 && int64(len(data)) > b.audioExtractMaxSize {
+		return nil, nil
+	}
+	return data, nil
 }
