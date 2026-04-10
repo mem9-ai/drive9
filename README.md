@@ -180,6 +180,32 @@ make test
 
 Uses `DRIVE9_TEST_MYSQL_DSN` if set, otherwise spins up a container via testcontainers.
 
+### Failpoint tests
+
+drive9 also has targeted failpoint-based tests for high-value semantic task timing and
+failure-path behavior such as lease expiry, renew boundaries, lease loss, and panic cleanup.
+
+Run them with:
+
+```bash
+make test-failpoint
+# or
+python3 scripts/run_failpoint_tests.py
+```
+
+Notes:
+
+- Failpoint tests rewrite instrumented source files during execution, then restore them when
+  the run finishes. Do not run failpoint tests in parallel with ordinary `go test` commands.
+- The failpoint runner uses the same MySQL test environment as normal tests:
+  `DRIVE9_TEST_MYSQL_DSN` if set, otherwise Podman via `scripts/test-podman.sh` when
+  available, or another Docker-compatible runtime through testcontainers.
+- Failpoint-specific test files use the `failpoint` build tag. Some editors may show build-tag
+  warnings for `*_failpoint_test.go` unless configured to include `-tags=failpoint`; this does
+  not mean the tests are broken.
+- Prefer failpoint for correctness-sensitive concurrency boundaries, not for simple happy-path
+  unit tests that ordinary mocks or polling already cover well.
+
 ## Project layout
 
 ```

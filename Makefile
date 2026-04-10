@@ -31,7 +31,7 @@ IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
 LINT_TIMEOUT ?= 10m
 TEST_P ?=
 
-.PHONY: mod test test-podman fmt lint install-lint build build-server build-cli build-cli-release run-server-local docker-build
+.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-cli build-cli-release run-server-local docker-build
 
 mod:
 	$(GO) mod tidy
@@ -52,6 +52,12 @@ test:
 		source ./scripts/test-podman.sh; \
 	fi; \
 	$(GO) test $$test_p_flag -v ./...
+
+# Run only failpoint-tagged tests through repository-wide instrumentation.
+# Do not run this concurrently with the normal test target because failpoint-ctl
+# rewrites the source tree while the tests are running.
+test-failpoint:
+	./scripts/run_failpoint_tests.py
 
 fmt:
 	$(MAKE) install-lint
