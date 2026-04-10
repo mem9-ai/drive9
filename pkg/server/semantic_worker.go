@@ -185,7 +185,14 @@ func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Sto
 	if fallback != nil {
 		fbAuto = fallback.AutoSemanticTaskTypes()
 	}
-	if !hasAnyTaskTypes(app) && !hasAnyTaskTypes(poolAuto) && !hasAnyTaskTypes(fbAuto) {
+	// Multi-tenant scheduling never includes the local fallback ref (listTenantRefs
+	// only enumerates meta tenants), so fallback auto task types must not make the
+	// manager viable by themselves.
+	viable := hasAnyTaskTypes(app) || hasAnyTaskTypes(poolAuto)
+	if !hasMultiTenant {
+		viable = viable || hasAnyTaskTypes(fbAuto)
+	}
+	if !viable {
 		return nil
 	}
 	// Single-tenant mode: require a viable fallback — either auto image path is

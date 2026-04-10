@@ -502,6 +502,30 @@ func TestSemanticWorkerManagerStartsForMultiTenantImageOnlyMode(t *testing.T) {
 	_ = tenantID
 }
 
+func TestSemanticWorkerManagerNilWhenMultiTenantOnlyFallbackHasAutoTasks(t *testing.T) {
+	initServerTenantSchema(t, testDSN)
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	pool := newTestTenantPool(t)
+	fallback := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled: true, Workers: 1, QueueSize: 4, Extractor: staticServerImageExtractor{text: "x"},
+		},
+	})
+
+	m := newSemanticWorkerManager(fallback, metaStore, pool, nil, SemanticWorkerOptions{})
+	if m != nil {
+		t.Fatal("expected nil manager: multi-tenant listTenantRefs never schedules fallback, so fallback-only auto types are unreachable")
+	}
+}
+
 func TestSemanticWorkerAcksObsoleteRevisionAndWritesLatest(t *testing.T) {
 	b := newTestBackendForSemanticWorker(t)
 	if _, err := b.Write("/docs/b.txt", []byte("version one"), 0, filesystem.WriteFlagCreate); err != nil {
