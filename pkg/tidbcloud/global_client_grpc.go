@@ -88,6 +88,9 @@ func (g *grpcGlobalClient) GetClusterInfo(ctx context.Context, clusterID string)
 		return nil, fmt.Errorf("cluster %s is not a serverless cluster", clusterID)
 	}
 	regional := sc.GetCluster()
+	if regional == nil {
+		return nil, fmt.Errorf("cluster %s has no regional cluster info", clusterID)
+	}
 	pub := regional.GetEndpoints().GetPublic()
 	if pub == nil || pub.GetHost() == "" {
 		return nil, fmt.Errorf("cluster %s has no public endpoint", clusterID)
