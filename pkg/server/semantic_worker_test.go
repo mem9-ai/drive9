@@ -1070,7 +1070,10 @@ func TestSemanticWorkerListTenantRefsDoesNotUseFallbackImageCapabilityForPoolTen
 		semanticWorkerUsesTiDBAutoEmbedding = orig
 	}()
 
-	m := newSemanticWorkerManager(fallback, metaStore, pool, nil, SemanticWorkerOptions{})
+	// Pool has no async image extract, so TiDB-auto tenants get no task types from
+	// the pool; embedder is only to satisfy worker viability (multi-tenant path does
+	// not count fallback-only fbAuto — see newSemanticWorkerManager).
+	m := newSemanticWorkerManager(fallback, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
 	if m == nil {
 		t.Fatal("expected semantic worker manager")
 	}
