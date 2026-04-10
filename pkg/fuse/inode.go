@@ -252,6 +252,17 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 	}
 }
 
+// ForEach calls fn for each entry in the map while holding a read lock.
+// fn receives copies of entries to avoid data races.
+func (m *InodeToPath) ForEach(fn func(ino uint64, entry InodeEntry)) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for ino, e := range m.byInode {
+		fn(ino, *e)
+	}
+}
+
 // Remove deletes the entry for the given path from both maps.
 func (m *InodeToPath) Remove(path string) {
 	m.mu.Lock()

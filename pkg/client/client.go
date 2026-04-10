@@ -21,6 +21,7 @@ import (
 type Client struct {
 	baseURL            string
 	apiKey             string
+	actor              string // X-Dat9-Actor header value (per-mount ID)
 	httpClient         *http.Client
 	smallFileThreshold int64 // 0 means use DefaultSmallFileThreshold
 }
@@ -150,9 +151,28 @@ func (c *Client) RawPost(endpoint string, body io.Reader) (*http.Response, error
 	return c.do(req)
 }
 
+// SetActor sets the X-Dat9-Actor header value for all subsequent requests.
+// Used by FUSE mounts to identify the per-mount actor for SSE self-filtering.
+func (c *Client) SetActor(actor string) {
+	c.actor = actor
+}
+
+// BaseURL returns the server base URL.
+func (c *Client) BaseURL() string {
+	return c.baseURL
+}
+
+// APIKey returns the API key.
+func (c *Client) APIKey() string {
+	return c.apiKey
+}
+
 func (c *Client) do(req *http.Request) (*http.Response, error) {
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	if c.actor != "" {
+		req.Header.Set("X-Dat9-Actor", c.actor)
 	}
 	return c.httpClient.Do(req)
 }
