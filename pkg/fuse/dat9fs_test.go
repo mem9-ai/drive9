@@ -41,7 +41,10 @@ func newTestDat9FS(t *testing.T, size int64, get func(http.ResponseWriter, *http
 	return fs, ino, ts.Close
 }
 
-func TestOpenWritableFailsWhenSmallFilePreloadFails(t *testing.T) {
+func TestOpenWritableSmallFileLazyPreload(t *testing.T) {
+	// With unified lazy preload, Open() succeeds for small files even if the
+	// server would fail on GET — the actual data loading is deferred to first
+	// Read/Write via LoadPart (same behavior as large files).
 	fs, ino, cleanup := newTestDat9FS(t, 16, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	})
@@ -52,8 +55,8 @@ func TestOpenWritableFailsWhenSmallFilePreloadFails(t *testing.T) {
 		InHeader: gofuse.InHeader{NodeId: ino},
 		Flags:    uint32(syscall.O_RDWR),
 	}, &out)
-	if st != gofuse.EIO {
-		t.Fatalf("Open status = %v, want EIO", st)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK (lazy preload defers loading)", st)
 	}
 }
 

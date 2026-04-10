@@ -5,15 +5,17 @@ import "sync"
 // FileHandle represents an open file in the FUSE filesystem.
 // WriteBuffer is defined in write.go and supports offset-based writes.
 type FileHandle struct {
-	Ino      uint64
-	Path     string
-	Flags    uint32       // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
-	Dirty    *WriteBuffer // write buffer, nil for read-only opens
-	DirtySeq uint64       // monotonic sequence for authoritative dirty-size tracking
-	OrigSize int64        // original file size at open time (for patch detection)
-	Streamer *StreamUploader // nil for small files / read-only; manages background part uploads
-	Prefetch *Prefetcher     // nil for writable handles; sequential read prefetcher
-	mu       sync.Mutex
+	Ino          uint64
+	Path         string
+	Flags        uint32       // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
+	Dirty        *WriteBuffer // write buffer, nil for read-only opens
+	DirtySeq     uint64       // monotonic sequence for authoritative dirty-size tracking
+	WriteBackSeq uint64       // DirtySeq at time of write-back cache snapshot (0 = no snapshot)
+	OrigSize     int64        // original file size at open time (for patch detection)
+	IsNew        bool         // true if created via Create() (no prior remote existence)
+	Streamer     *StreamUploader // nil for small files / read-only; manages background part uploads
+	Prefetch     *Prefetcher     // nil for writable handles; sequential read prefetcher
+	mu           sync.Mutex
 }
 
 // Lock acquires the file handle mutex.

@@ -3,7 +3,10 @@ package fuse
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -16,6 +19,7 @@ type MountOptions struct {
 	Server        string        // dat9 server URL
 	APIKey        string        // dat9 API key
 	MountPoint    string        // local mount point
+	CacheDir      string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
 	CacheSize     int64         // ReadCache max size in bytes (default 128MB)
 	DirTTL        time.Duration // DirCache TTL (default 5s)
 	AttrTTL       time.Duration // kernel attr cache TTL (default 1s)
@@ -63,13 +67,42 @@ func Mount(opts *MountOptions) error {
 	// Build FUSE filesystem
 	dat9fs := NewDat9FS(c, opts)
 
+	// Initialize write-back cache for async flush if not read-only.
+	if !opts.ReadOnly {
+		cacheBase := opts.CacheDir
+		if cacheBase == "" {
+			home, err := os.UserHomeDir()
+			if err == nil {
+				cacheBase = filepath.Join(home, ".cache", "drive9")
+			}
+		}
+		if cacheBase != "" {
+			mh := MountHash(opts.Server, opts.MountPoint)
+			pendingDir := filepath.Join(cacheBase, mh, "pending")
+			wbCache, err := NewWriteBackCache(pendingDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "dat9: write-back cache init failed: %v (continuing without)\n", err)
+			} else {
+				uploader := NewWriteBackUploader(c, wbCache, 4)
+				dat9fs.SetWriteBack(wbCache, uploader)
+				// Recover any pending uploads from a previous session.
+				uploader.RecoverPending()
+			}
+		}
+	}
+
 	// Configure FUSE mount options
 	fuseOpts := &gofuse.MountOptions{
-		FsName:       "dat9",
-		Name:         "dat9",
-		MaxReadAhead: 8 * 1024 * 1024, // 8MB — larger readahead reduces FUSE kernel↔userspace switches
-		Debug:        opts.Debug,
-		AllowOther:   opts.AllowOther,
+		FsName:        "dat9",
+		Name:          "dat9",
+		MaxReadAhead:  8 * 1024 * 1024,   // 8MB — larger readahead reduces FUSE kernel↔userspace switches
+		MaxWrite:      128 * 1024,         // 128KB per write request (default 64KB)
+		MaxBackground: 32,                 // concurrent background FUSE requests (default 12)
+		Debug:         opts.Debug,
+		AllowOther:    opts.AllowOther,
+	}
+	if runtime.GOOS == "linux" {
+		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively
 	}
 	if opts.ReadOnly {
 		fuseOpts.Options = append(fuseOpts.Options, "ro")
@@ -105,13 +138,55 @@ func Mount(opts *MountOptions) error {
 	go func() {
 		<-sigCh
 		fmt.Fprintf(os.Stderr, "\ndat9: unmounting %s...\n", opts.MountPoint)
+
+		// Second Ctrl+C during unmount exits immediately.
+		go func() {
+			<-sigCh
+			fmt.Fprintf(os.Stderr, "dat9: forced exit\n")
+			os.Exit(1)
+		}()
+
 		dat9fs.FlushAll()
-		if err := server.Unmount(); err != nil {
-			fmt.Fprintf(os.Stderr, "dat9: unmount error: %v\n", err)
+
+		// Retry unmount up to 5 times — EBUSY is transient (Spotlight, Finder).
+		const maxRetries = 5
+		var unmountErr error
+		for i := 0; i < maxRetries; i++ {
+			if unmountErr = server.Unmount(); unmountErr == nil {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "dat9: unmount attempt %d/%d failed: %v\n", i+1, maxRetries, unmountErr)
+			if i < maxRetries-1 {
+				time.Sleep(500 * time.Millisecond)
+			}
 		}
+
+		// All retries exhausted — force unmount via OS tool.
+		fmt.Fprintf(os.Stderr, "dat9: retries exhausted, force-unmounting %s\n", opts.MountPoint)
+		forceUnmount(opts.MountPoint)
 	}()
 
 	fmt.Fprintf(os.Stderr, "dat9: mounted on %s (server: %s)\n", opts.MountPoint, opts.Server)
 	server.Wait()
 	return nil
+}
+
+// forceUnmount shells out to OS-specific tools to force-unmount a FUSE mount.
+func forceUnmount(mountpoint string) {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "darwin" {
+		cmd = exec.Command("diskutil", "unmount", "force", mountpoint)
+	} else {
+		// Linux: try fusermount first, fall back to umount -l.
+		if _, err := exec.LookPath("fusermount"); err == nil {
+			cmd = exec.Command("fusermount", "-u", mountpoint)
+		} else {
+			cmd = exec.Command("umount", "-l", mountpoint)
+		}
+	}
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "dat9: force unmount failed: %v\n", err)
+	}
 }
