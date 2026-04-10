@@ -225,8 +225,15 @@ var poolAutoSemanticTaskTypes = []semantic.TaskType{semantic.TaskTypeImgExtractT
 // routing hint for tenant list filtering before a backend is acquired; it does
 // not include app-managed embed tasks. Nil means the pool contributes no auto
 // semantic tasks. The returned slice must be treated as read-only.
+//
+// Viability matches backend.Options.configureOptions: when Enabled, a nil
+// Extractor is replaced with NewBasicImageTextExtractor before workers start, so
+// pool-level routing stays aligned with Dat9Backend.SupportsAsyncImageExtract.
 func (p *Pool) AutoSemanticTaskTypes() []semantic.TaskType {
-	if p == nil || !p.cfg.BackendOptions.AsyncImageExtract.Enabled {
+	if p == nil {
+		return nil
+	}
+	if !backend.AsyncImageExtractWillWireRuntime(p.cfg.BackendOptions.AsyncImageExtract) {
 		return nil
 	}
 	return poolAutoSemanticTaskTypes

@@ -38,6 +38,13 @@ var semanticWorkerUsesTiDBAutoEmbedding = tenant.UsesTiDBAutoEmbedding
 
 var semanticWorkerAllowedEmbedTaskTypes = []semantic.TaskType{semantic.TaskTypeEmbed}
 
+func appManagedSemanticTaskTypes(embedder embedding.Client) []semantic.TaskType {
+	if embedder == nil {
+		return nil
+	}
+	return semanticWorkerAllowedEmbedTaskTypes
+}
+
 // SemanticWorkerOptions controls background semantic task processing.
 type SemanticWorkerOptions struct {
 	// Workers is the number of polling worker goroutines.
@@ -994,10 +1001,10 @@ func hasAnyTaskTypes(types []semantic.TaskType) bool {
 
 // appManagedTaskTypes returns task types driven by the worker embedder (app-managed path).
 func (m *semanticWorkerManager) appManagedTaskTypes() []semantic.TaskType {
-	if m == nil || m.embedder == nil {
+	if m == nil {
 		return nil
 	}
-	return semanticWorkerAllowedEmbedTaskTypes
+	return appManagedSemanticTaskTypes(m.embedder)
 }
 
 // taskTypesForProvider is the routing filter for meta tenant list scanning: TiDB-auto
@@ -1061,14 +1068,6 @@ func chainReleases(first, second func()) func() {
 			second()
 		}
 	}
-}
-
-// semanticWorkerLogTaskTypes returns app-managed task type names for server startup logs.
-func semanticWorkerLogTaskTypes(embedderConfigured bool) []string {
-	if !embedderConfigured {
-		return nil
-	}
-	return []string{string(semantic.TaskTypeEmbed)}
 }
 
 // semanticWorkerLogTaskTypesFromTypes stringifies AutoSemanticTaskTypes-style slices for zap.

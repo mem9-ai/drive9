@@ -46,6 +46,14 @@ type AsyncImageExtractOptions struct {
 	Extractor           ImageTextExtractor
 }
 
+// AsyncImageExtractWillWireRuntime reports whether async image extraction will be
+// wired on a Dat9Backend built from opts. When Enabled is true, configureOptions
+// always assigns a concrete ImageTextExtractor (NewBasicImageTextExtractor when nil),
+// so this matches effective SupportsAsyncImageExtract after backend construction.
+func AsyncImageExtractWillWireRuntime(opts AsyncImageExtractOptions) bool {
+	return opts.Enabled
+}
+
 // QueryEmbeddingOptions controls app-side query embedding for semantic search.
 type QueryEmbeddingOptions struct {
 	Client embedding.Client

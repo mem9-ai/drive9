@@ -76,6 +76,15 @@ func TestUsesDatabaseAutoEmbeddingReflectsOption(t *testing.T) {
 	}
 }
 
+func TestAsyncImageExtractWillWireRuntime(t *testing.T) {
+	if AsyncImageExtractWillWireRuntime(AsyncImageExtractOptions{}) {
+		t.Fatal("disabled async image extract should not wire runtime")
+	}
+	if !AsyncImageExtractWillWireRuntime(AsyncImageExtractOptions{Enabled: true}) {
+		t.Fatal("enabled async image extract should wire runtime (extractor may be defaulted in configureOptions)")
+	}
+}
+
 func TestDat9BackendAutoSemanticTaskTypes(t *testing.T) {
 	t.Run("app_managed_default", func(t *testing.T) {
 		b := newTestBackend(t)

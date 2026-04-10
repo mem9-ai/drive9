@@ -140,7 +140,7 @@ func NewWithConfig(cfg Config) *Server {
 		s.resumeProvisioningTenants()
 	}
 	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
-	appManagedTaskTypes := semanticWorkerLogTaskTypes(cfg.SemanticEmbedder != nil)
+	appManagedTaskTypes := semanticWorkerLogTaskTypesFromTypes(appManagedSemanticTaskTypes(cfg.SemanticEmbedder))
 	var fallbackTaskTypes, poolAutoTaskTypes []string
 	if cfg.Backend != nil {
 		fallbackTaskTypes = semanticWorkerLogTaskTypesFromTypes(cfg.Backend.AutoSemanticTaskTypes())
