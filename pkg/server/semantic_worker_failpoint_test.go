@@ -26,6 +26,33 @@ const semanticWorkerBeforeRenewFailpoint = "github.com/mem9-ai/dat9/pkg/server/s
 const semanticWorkerAfterRenewFailpoint = "github.com/mem9-ai/dat9/pkg/server/semanticWorkerAfterRenew"
 const semanticWorkerOnLeaseLostFailpoint = "github.com/mem9-ai/dat9/pkg/server/semanticWorkerOnLeaseLost"
 
+type gatedServerImageExtractor struct {
+	text string
+
+	started  chan struct{}
+	release  chan struct{}
+	canceled chan struct{}
+}
+
+func (e *gatedServerImageExtractor) ExtractImageText(ctx context.Context, req backend.ImageExtractRequest) (string, error) {
+	select {
+	case e.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-e.release:
+		return e.text, nil
+	case <-ctx.Done():
+		if e.canceled != nil {
+			select {
+			case e.canceled <- struct{}{}:
+			default:
+			}
+		}
+		return "", ctx.Err()
+	}
+}
+
 type gatedPanicServerImageExtractor struct {
 	started chan struct{}
 	release chan struct{}
@@ -42,6 +69,17 @@ func (e *gatedPanicServerImageExtractor) ExtractImageText(context.Context, backe
 		<-e.release
 	}
 	panic("panic image extractor")
+}
+
+func assertNoObservedLogForTask(t *testing.T, recorded *observer.ObservedLogs, taskID string, messages ...string) {
+	t.Helper()
+	for _, message := range messages {
+		for _, entry := range recorded.FilterMessage(message).AllUntimed() {
+			if entry.ContextMap()["task_id"] == taskID {
+				t.Fatalf("unexpected log %q for task %s", message, taskID)
+			}
+		}
+	}
 }
 
 func TestSemanticWorkerFinalizeAckSkipsWhenLeaseOwnershipLostAtBoundary(t *testing.T) {
