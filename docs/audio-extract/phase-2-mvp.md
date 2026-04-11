@@ -5,7 +5,7 @@
 
 ## Summary
 
-The scope of [audio-extract-text-proposal.md](/Users/jayson/Projects/claw-memories/drive9/docs/audio-extract-text-proposal.md) is still too broad. It spans:
+The scope of [audio-extract-text-proposal.md](../audio-extract-text-proposal.md) is still too broad. It spans:
 
 - audio durable tasks
 - integration with three write paths
@@ -33,19 +33,19 @@ The success criterion for this MVP is not "audio retrieval is now complete," nor
 The repository already has most of the infrastructure needed for this MVP:
 
 1. `files.content_text` is already the stable semantic text entry point for retrieval.
-  - The TiDB auto-embedding proposal explicitly defines `content_text` as the canonical semantic source, from which the database derives vectors. See [auto-embedding-mode.md](/Users/jayson/Projects/claw-memories/drive9/docs/auto-embedding-mode.md).
+  - The TiDB auto-embedding proposal explicitly defines `content_text` as the canonical semantic source, from which the database derives vectors. See [auto-embedding-mode.md](../auto-embedding-mode.md).
 2. The main grep/search path for TiDB auto-embedding already exists.
-  - `Grep(...)` in [dat9.go](/Users/jayson/Projects/claw-memories/drive9/pkg/backend/dat9.go) runs the following in parallel:
+  - `Grep(...)` in [dat9.go](../../pkg/backend/dat9.go) runs the following in parallel:
     - `FTSSearch(...)`
     - `VectorSearchByText(...)`
     - if both ranked paths return no results, it falls back to `KeywordSearch(...)`
   - For a TiDB auto-embedding backend, the vector path directly uses the database-side `VectorSearchByText(...)` and does not require an app-managed `embed` worker.
 3. The direct-write create / overwrite paths already write `files` metadata inside the transaction.
-  - `createAndWriteCtx(...)` and `overwriteFileCtx(...)` in [dat9.go](/Users/jayson/Projects/claw-memories/drive9/pkg/backend/dat9.go) already compute:
+  - `createAndWriteCtx(...)` and `overwriteFileCtx(...)` in [dat9.go](../../pkg/backend/dat9.go) already compute:
     - `content_type`
     - `checksum`
     - `content_text`
-  - On the TiDB auto-embedding path, [file_tx.go](/Users/jayson/Projects/claw-memories/drive9/pkg/datastore/file_tx.go)'s `UpdateFileContentAutoEmbeddingTx(...)` keeps `content_text` as the input to database-side embedding, rather than using the app-managed embedding clear/recompute flow.
+  - On the TiDB auto-embedding path, [file_tx.go](../../pkg/datastore/file_tx.go)'s `UpdateFileContentAutoEmbeddingTx(...)` keeps `content_text` as the input to database-side embedding, rather than using the app-managed embedding clear/recompute flow.
 4. The `semantic worker` is already the delivery owner for durable semantic tasks.
   - The repo already has:
     - `claim / ack / retry / recover`

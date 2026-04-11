@@ -243,13 +243,20 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 		return AudioExtractResultEmptyText, nil
 	}
 
+	// Always revision-gate writeback: UpdateFileSearchTextTx treats expectedRevision<=0
+	// as an unscoped UPDATE: use the loaded row revision when the task omits ResourceVersion.
+	expectedRevision := task.Revision
+	if expectedRevision == 0 {
+		expectedRevision = f.Revision
+	}
+
 	var updated bool
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		if err := injectedAudioExtractWritebackError("audioExtractWritebackUpdateFileSearchTextError"); err != nil {
 			return err
 		}
 		var txErr error
-		updated, txErr = b.store.UpdateFileSearchTextTx(tx, task.FileID, task.Revision, text)
+		updated, txErr = b.store.UpdateFileSearchTextTx(tx, task.FileID, expectedRevision, text)
 		return txErr
 	})
 	if err != nil {

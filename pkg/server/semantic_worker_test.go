@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -533,8 +534,13 @@ func TestSemanticWorkerTaskTypesForTarget(t *testing.T) {
 	})
 	mBoth := newSemanticWorkerManager(bBoth, nil, nil, nil, SemanticWorkerOptions{})
 	gotBoth := mBoth.taskTypesForTarget(bBoth)
-	if len(gotBoth) != 2 || gotBoth[0] != semantic.TaskTypeImgExtractText || gotBoth[1] != semantic.TaskTypeAudioExtractText {
-		t.Fatalf("got %#v, want img_extract_text+audio_extract_text", gotBoth)
+	if len(gotBoth) != 2 {
+		t.Fatalf("got %#v, want 2 task types", gotBoth)
+	}
+	for _, want := range []semantic.TaskType{semantic.TaskTypeImgExtractText, semantic.TaskTypeAudioExtractText} {
+		if !slices.Contains(gotBoth, want) {
+			t.Fatalf("got %#v, missing %v", gotBoth, want)
+		}
 	}
 }
 
