@@ -515,13 +515,14 @@ def main() -> int:
         print_result(r)
 
     if not args.skip_overwrite:
-        op = normalize_remote_path("/audio/e2e-overwrite-fixed.mp3")
+        # Unique path so repeat runs are not affected by leftover /audio/e2e-overwrite-fixed.mp3.
+        op = make_unique_path("overwrite", ".mp3")
         r1 = v.verify_direct_put_bytes(op, fake_mp3)
-        if r1.revision != 1:
-            raise RuntimeError(f"overwrite first revision={r1.revision}, want 1")
         r2 = v.verify_direct_put_bytes(op, fake_mp3 + b"-v2")
-        if r2.revision != 2:
-            raise RuntimeError(f"overwrite second revision={r2.revision}, want 2")
+        if r2.revision != r1.revision + 1:
+            raise RuntimeError(
+                f"overwrite revision {r1.revision} -> {r2.revision}, want +1"
+            )
         want = expected_stub_transcript(op)
         if r2.content_text != want:
             raise RuntimeError(f"overwrite content_text={r2.content_text!r}, want {want!r}")
