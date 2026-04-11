@@ -54,6 +54,7 @@ func TestEffectiveAudioMIMEAllowlistedMP3AndWAV(t *testing.T) {
 	}{
 		{"/x.mp3", "audio/mpeg", "audio/mpeg"},
 		{"/x.wav", "audio/wav", "audio/wav"},
+		{"/x.wav", "audio/wave", "audio/wav"},
 		{"/x.wav", "audio/x-wav", "audio/x-wav"},
 		{"/sub/clip.mp3", "application/octet-stream", "audio/mpeg"},
 		{"/sub/clip.wav", "application/octet-stream", "audio/wav"},

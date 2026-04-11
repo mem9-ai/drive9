@@ -111,6 +111,10 @@ func stripMIMEParams(ct string) string {
 // normalizeStdlibAudioMIMEAliases maps Go mime.TypeByExtension and common
 // platform MIME-info aliases onto the MVP allowlist keys (see allowedAudioMIME).
 //
+// Linux /etc/mime.types often maps .wav to audio/wave; Go loads that at runtime.
+// We treat it as WAV and canonicalize to audio/wav so isAllowedAudioMIME and
+// task payloads stay consistent across macOS vs CI.
+//
 // TODO(post-MVP audio): When MP4/M4A, AAC, and FLAC are allowlisted again,
 // restore alias normalization, for example:
 //
@@ -125,7 +129,13 @@ func stripMIMEParams(ct string) string {
 //		return ct
 //	}
 func normalizeStdlibAudioMIMEAliases(ct string) string {
-	return stripMIMEParams(ct)
+	ct = stripMIMEParams(ct)
+	switch ct {
+	case "audio/wave":
+		return "audio/wav"
+	default:
+		return ct
+	}
 }
 
 func isAllowedAudioMIME(ct string) bool {
