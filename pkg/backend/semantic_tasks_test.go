@@ -879,7 +879,16 @@ func TestConfirmUploadAutoEmbeddingSkipsAudioWhenAsyncAudioDisabled(t *testing.T
 	}
 }
 
-func TestConfirmUploadV2AutoEmbeddingEnqueuesAudioExtractTask(t *testing.T) {
+// TestConfirmUploadV2AutoEmbeddingEnqueuesAudioViaSharedFinalize checks that
+// ConfirmUploadV2 enqueues audio_extract_text for TiDB auto-embedding by going
+// through the shared finalizeUpload path.
+//
+// The fixture intentionally uses InitiateUpload (v1) to create the multipart
+// upload and upload parts; only the completion step uses ConfirmUploadV2. That
+// does not exercise the full InitiateUploadV2 / v2 presign lifecycle (covered
+// in upload_test.go); it specifically locks shared finalize behavior so v1 and
+// v2 completion stay aligned for semantic enqueue.
+func TestConfirmUploadV2AutoEmbeddingEnqueuesAudioViaSharedFinalize(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
 		DatabaseAutoEmbedding: true,
 		AsyncAudioExtract: AsyncAudioExtractOptions{
@@ -889,7 +898,7 @@ func TestConfirmUploadV2AutoEmbeddingEnqueuesAudioExtractTask(t *testing.T) {
 	})
 	ctx := context.Background()
 	totalSize := int64(2 << 20)
-	plan, err := b.InitiateUpload(ctx, "/upload/v2-clip.mp3", totalSize)
+	plan, err := b.InitiateUpload(ctx, "/upload/shared-finalize-v2-clip.mp3", totalSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -898,7 +907,7 @@ func TestConfirmUploadV2AutoEmbeddingEnqueuesAudioExtractTask(t *testing.T) {
 	if err := b.ConfirmUploadV2(ctx, plan.UploadID, parts); err != nil {
 		t.Fatal(err)
 	}
-	fileID, revision, _, _ := mustFileForPath(t, b, "/upload/v2-clip.mp3")
+	fileID, revision, _, _ := mustFileForPath(t, b, "/upload/shared-finalize-v2-clip.mp3")
 	if revision != 1 {
 		t.Fatalf("revision=%d, want 1", revision)
 	}
