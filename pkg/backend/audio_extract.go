@@ -63,31 +63,41 @@ func (b *Dat9Backend) SupportsAsyncAudioExtract() bool {
 // audioExtensionMIME maps path suffixes to canonical MIME types for the MVP
 // allowlist. Used only when content_type is missing or too generic.
 //
+// Phase 2 MVP supports MP3 and WAV only. Broader formats are deferred; see
+// TODO(post-MVP audio) and TODO(WebM) below.
+//
+// TODO(post-MVP audio): Restore MP4/M4A, AAC, FLAC, OGG extensions (and MIME /
+// alias allowlist entries) once the extractor and tests cover them.
+//	".m4a":  "audio/mp4",
+//	".aac":  "audio/aac",
+//	".ogg":  "audio/ogg",
+//	".flac": "audio/flac",
+//
 // TODO(WebM): Phase 2 MVP excludes both audio/webm and video/webm. Go's
 // mime.TypeByExtension(".webm") reports video/webm; supporting WebM means
 // deciding extractor behavior for muxed vs audio-only payloads and possibly
 // normalizing aliases—revisit after MVP.
 var audioExtensionMIME = map[string]string{
-	".mp3":  "audio/mpeg",
-	".wav":  "audio/wav",
-	".m4a":  "audio/mp4",
-	".aac":  "audio/aac",
-	".ogg":  "audio/ogg",
-	".flac": "audio/flac",
+	".mp3": "audio/mpeg",
+	".wav": "audio/wav",
 }
 
-// allowedAudioMIME is the MVP closed set for durable audio_extract_text. Keep in
-// sync with audioExtensionMIME canonical types; do not add audio/webm or
-// video/webm until post-MVP WebM work (see TODO on audioExtensionMIME).
+// allowedAudioMIME is the MVP closed set for durable audio_extract_text.
+// Phase 2: MP3 and WAV only (see TODO(post-MVP audio) on audioExtensionMIME).
+//
+// TODO(post-MVP audio): Re-add closed-set entries for MP4/M4A, AAC, OGG, FLAC
+// (and aliases such as audio/mp4a-latm) when those formats return to scope.
+//	"audio/mp4":   {},
+//	"audio/x-m4a": {},
+//	"audio/aac":   {},
+//	"audio/ogg":   {},
+//	"audio/flac":  {},
+//
+// Do not add audio/webm or video/webm until post-MVP WebM work (TODO(WebM)).
 var allowedAudioMIME = map[string]struct{}{
 	"audio/mpeg":  {},
 	"audio/wav":   {},
 	"audio/x-wav": {},
-	"audio/mp4":   {},
-	"audio/x-m4a": {},
-	"audio/aac":   {},
-	"audio/ogg":   {},
-	"audio/flac":  {},
 }
 
 func stripMIMEParams(ct string) string {
@@ -100,18 +110,22 @@ func stripMIMEParams(ct string) string {
 
 // normalizeStdlibAudioMIMEAliases maps Go mime.TypeByExtension and common
 // platform MIME-info aliases onto the MVP allowlist keys (see allowedAudioMIME).
+//
+// TODO(post-MVP audio): When MP4/M4A, AAC, and FLAC are allowlisted again,
+// restore alias normalization, for example:
+//
+//	switch ct {
+//	case "audio/mp4a-latm":
+//		return "audio/mp4"
+//	case "audio/x-aac":
+//		return "audio/aac"
+//	case "audio/x-flac":
+//		return "audio/flac"
+//	default:
+//		return ct
+//	}
 func normalizeStdlibAudioMIMEAliases(ct string) string {
-	ct = stripMIMEParams(ct)
-	switch ct {
-	case "audio/mp4a-latm":
-		return "audio/mp4"
-	case "audio/x-aac":
-		return "audio/aac"
-	case "audio/x-flac":
-		return "audio/flac"
-	default:
-		return ct
-	}
+	return stripMIMEParams(ct)
 }
 
 func isAllowedAudioMIME(ct string) bool {

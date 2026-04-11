@@ -48,14 +48,17 @@ func TestProcessAudioExtractTaskWritesContentText(t *testing.T) {
 	}
 }
 
-func TestEffectiveAudioMIMENormalizesStdlibAliases(t *testing.T) {
+func TestEffectiveAudioMIMEAllowlistedMP3AndWAV(t *testing.T) {
 	tests := []struct {
 		path, ct, want string
 	}{
-		{"/x.m4a", "audio/mp4a-latm", "audio/mp4"},
-		{"/x.aac", "audio/x-aac", "audio/aac"},
-		{"/x.flac", "audio/x-flac", "audio/flac"},
 		{"/x.mp3", "audio/mpeg", "audio/mpeg"},
+		{"/x.wav", "audio/wav", "audio/wav"},
+		{"/x.wav", "audio/x-wav", "audio/x-wav"},
+		{"/sub/clip.mp3", "application/octet-stream", "audio/mpeg"},
+		{"/sub/clip.wav", "application/octet-stream", "audio/wav"},
+		{"/x.m4a", "application/octet-stream", ""},
+		{"/x.m4a", "audio/mp4a-latm", ""},
 	}
 	for _, tc := range tests {
 		got := effectiveAudioMIME(tc.path, tc.ct)

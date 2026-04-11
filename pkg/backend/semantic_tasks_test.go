@@ -227,7 +227,7 @@ func TestWriteCreateAutoEmbeddingAudioEnqueuesAudioExtractTask(t *testing.T) {
 	}
 }
 
-func TestWriteCreateAutoEmbeddingM4AEnqueuesAudioExtractTask(t *testing.T) {
+func TestWriteCreateAutoEmbeddingSkipsM4AForAudioExtract(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
 		DatabaseAutoEmbedding: true,
 		AsyncAudioExtract: AsyncAudioExtractOptions{
@@ -243,17 +243,10 @@ func TestWriteCreateAutoEmbeddingM4AEnqueuesAudioExtractTask(t *testing.T) {
 		t.Fatalf("revision=%d, want 1", revision)
 	}
 	tasks := loadSemanticTasksForFile(t, b, fileID)
-	var audioSeen bool
 	for _, tsk := range tasks {
 		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
-			audioSeen = true
-			if tsk.Status != string(semantic.TaskQueued) || tsk.ResourceVersion != 1 {
-				t.Fatalf("unexpected audio task: %+v", tsk)
-			}
+			t.Fatalf("MVP audio_extract_text is MP3/WAV only; unexpected task: %+v", tsk)
 		}
-	}
-	if !audioSeen {
-		t.Fatalf("expected audio_extract_text for .m4a among %+v", tasks)
 	}
 }
 
