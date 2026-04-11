@@ -98,6 +98,18 @@ func TestDat9BackendAutoSemanticTaskTypes(t *testing.T) {
 			t.Fatal("expected nil without async image/audio extraction runtime")
 		}
 	})
+	t.Run("auto_mode_audio_enabled_nil_extractor", func(t *testing.T) {
+		b := newTestBackendWithOptions(t, Options{
+			DatabaseAutoEmbedding: true,
+			AsyncAudioExtract: AsyncAudioExtractOptions{
+				Enabled:   true,
+				Extractor: nil,
+			},
+		})
+		if b.AutoSemanticTaskTypes() != nil {
+			t.Fatalf("got %#v, want nil when audio async enabled but extractor unset", b.AutoSemanticTaskTypes())
+		}
+	})
 	t.Run("auto_mode_with_async_image", func(t *testing.T) {
 		b := newTestBackendWithOptions(t, Options{
 			DatabaseAutoEmbedding: true,

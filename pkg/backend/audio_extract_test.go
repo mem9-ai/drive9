@@ -48,6 +48,23 @@ func TestProcessAudioExtractTaskWritesContentText(t *testing.T) {
 	}
 }
 
+func TestEffectiveAudioMIMENormalizesStdlibAliases(t *testing.T) {
+	tests := []struct {
+		path, ct, want string
+	}{
+		{"/x.m4a", "audio/mp4a-latm", "audio/mp4"},
+		{"/x.aac", "audio/x-aac", "audio/aac"},
+		{"/x.flac", "audio/x-flac", "audio/flac"},
+		{"/x.mp3", "audio/mpeg", "audio/mpeg"},
+	}
+	for _, tc := range tests {
+		got := effectiveAudioMIME(tc.path, tc.ct)
+		if got != tc.want {
+			t.Fatalf("effectiveAudioMIME(%q,%q)=%q, want %q", tc.path, tc.ct, got, tc.want)
+		}
+	}
+}
+
 func TestProcessAudioExtractTaskStaleRevision(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
 		DatabaseAutoEmbedding: true,
@@ -71,6 +88,32 @@ func TestProcessAudioExtractTaskStaleRevision(t *testing.T) {
 	}
 	if result != AudioExtractResultStale {
 		t.Fatalf("result=%q, want %q", result, AudioExtractResultStale)
+	}
+}
+
+func TestProcessAudioExtractTaskStaleBeforeNotAudioWhenTypeChanged(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "must not apply"},
+		},
+	})
+	fileID := insertImageFileForExtractTest(t, b, "/rec/type-changed.mp3", "audio/mpeg", []byte{1, 2, 3})
+	if _, err := b.Store().DB().Exec(`UPDATE files SET revision = 2, content_type = ? WHERE file_id = ?`, "text/plain", fileID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := b.ProcessAudioExtractTask(context.Background(), AudioExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/rec/type-changed.mp3",
+		ContentType: "audio/mpeg",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != AudioExtractResultStale {
+		t.Fatalf("result=%q, want %q (revision mismatch must win over not_audio)", result, AudioExtractResultStale)
 	}
 }
 

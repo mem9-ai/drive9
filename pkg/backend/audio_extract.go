@@ -98,8 +98,24 @@ func stripMIMEParams(ct string) string {
 	return ct
 }
 
+// normalizeStdlibAudioMIMEAliases maps Go mime.TypeByExtension and common
+// platform MIME-info aliases onto the MVP allowlist keys (see allowedAudioMIME).
+func normalizeStdlibAudioMIMEAliases(ct string) string {
+	ct = stripMIMEParams(ct)
+	switch ct {
+	case "audio/mp4a-latm":
+		return "audio/mp4"
+	case "audio/x-aac":
+		return "audio/aac"
+	case "audio/x-flac":
+		return "audio/flac"
+	default:
+		return ct
+	}
+}
+
 func isAllowedAudioMIME(ct string) bool {
-	_, ok := allowedAudioMIME[stripMIMEParams(ct)]
+	_, ok := allowedAudioMIME[normalizeStdlibAudioMIMEAliases(ct)]
 	return ok
 }
 
@@ -117,11 +133,11 @@ func audioMIMEAllowsPathFallback(ct string) bool {
 // effectiveAudioMIME resolves an allowlisted audio MIME from stored content_type
 // and/or path. It does not sniff file bytes; detectContentType elsewhere is unchanged.
 func effectiveAudioMIME(path, contentType string) string {
-	ct := stripMIMEParams(contentType)
-	if isAllowedAudioMIME(ct) {
-		return ct
+	rawStripped := stripMIMEParams(contentType)
+	if isAllowedAudioMIME(contentType) {
+		return normalizeStdlibAudioMIMEAliases(contentType)
 	}
-	if !audioMIMEAllowsPathFallback(ct) {
+	if !audioMIMEAllowsPathFallback(rawStripped) {
 		return ""
 	}
 	path = strings.ToLower(path)
@@ -181,12 +197,12 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 	if f.Status != datastore.StatusConfirmed {
 		return AudioExtractResultNotConfirmed, nil
 	}
+	if task.Revision > 0 && f.Revision != task.Revision {
+		return AudioExtractResultStale, nil
+	}
 	resolvedMIME := resolvedAudioMIMEForHandler(task.Path, f.ContentType, task.ContentType)
 	if resolvedMIME == "" {
 		return AudioExtractResultNotAudio, nil
-	}
-	if task.Revision > 0 && f.Revision != task.Revision {
-		return AudioExtractResultStale, nil
 	}
 
 	data, err := b.loadAudioBytesForExtract(ctx, f)
