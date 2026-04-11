@@ -56,7 +56,7 @@ func NewOpenAIAudioTextExtractor(cfg OpenAIAudioTextExtractorConfig) (*OpenAIAud
 	if client == nil {
 		timeout := cfg.Timeout
 		if timeout <= 0 {
-			timeout = 30 * time.Second
+			timeout = defaultAudioExtractTimeout
 		}
 		client = &http.Client{Timeout: timeout}
 	}

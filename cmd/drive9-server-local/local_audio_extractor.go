@@ -25,10 +25,6 @@ const (
 	envAudioExtractPrompt         = "DRIVE9_AUDIO_EXTRACT_PROMPT"
 	localAudioExtractStubMode     = "stub"
 	localAudioExtractOpenAIMode   = "openai"
-
-	// When DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS is unset, OpenAI HTTP client uses this
-	// default so local mode matches documented audio task timeouts (not NewOpenAIAudioTextExtractor's 30s fallback).
-	localOpenAIAudioHTTPTimeoutDefault = 120 * time.Second
 )
 
 // localStubAudioTextExtractor implements backend.AudioTextExtractor for local e2e.
@@ -74,16 +70,12 @@ func buildLocalAudioExtractOptionsFromEnv() (backend.AsyncAudioExtractOptions, e
 			Extractor:           localStubAudioTextExtractor{},
 		}, nil
 	case localAudioExtractOpenAIMode:
-		httpTimeout := time.Duration(envInt(envAudioExtractTimeoutSeconds, 0)) * time.Second
-		if httpTimeout <= 0 {
-			httpTimeout = localOpenAIAudioHTTPTimeoutDefault
-		}
 		extractor, err := backend.NewOpenAIAudioTextExtractor(backend.OpenAIAudioTextExtractorConfig{
 			BaseURL: strings.TrimSpace(os.Getenv(envAudioExtractAPIBase)),
 			APIKey:  strings.TrimSpace(os.Getenv(envAudioExtractAPIKey)),
 			Model:   strings.TrimSpace(os.Getenv(envAudioExtractModel)),
 			Prompt:  strings.TrimSpace(os.Getenv(envAudioExtractPrompt)),
-			Timeout: httpTimeout,
+			Timeout: time.Duration(envInt(envAudioExtractTimeoutSeconds, 0)) * time.Second,
 		})
 		if err != nil {
 			return backend.AsyncAudioExtractOptions{}, fmt.Errorf("init local openai audio extractor: %w", err)
