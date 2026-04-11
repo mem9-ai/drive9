@@ -60,8 +60,13 @@ func (b *Dat9Backend) SupportsAsyncAudioExtract() bool {
 	return b != nil && b.audioExtractEnabled && b.audioExtractor != nil
 }
 
-// audioExtensionMIME maps known file suffixes to Phase-2 allowlisted audio MIME
-// types. Used only when content_type is missing or too generic to identify audio.
+// audioExtensionMIME maps path suffixes to canonical MIME types for the MVP
+// allowlist. Used only when content_type is missing or too generic.
+//
+// TODO(WebM): Phase 2 MVP excludes both audio/webm and video/webm. Go's
+// mime.TypeByExtension(".webm") reports video/webm; supporting WebM means
+// deciding extractor behavior for muxed vs audio-only payloads and possibly
+// normalizing aliases—revisit after MVP.
 var audioExtensionMIME = map[string]string{
 	".mp3":  "audio/mpeg",
 	".wav":  "audio/wav",
@@ -71,6 +76,9 @@ var audioExtensionMIME = map[string]string{
 	".flac": "audio/flac",
 }
 
+// allowedAudioMIME is the MVP closed set for durable audio_extract_text. Keep in
+// sync with audioExtensionMIME canonical types; do not add audio/webm or
+// video/webm until post-MVP WebM work (see TODO on audioExtensionMIME).
 var allowedAudioMIME = map[string]struct{}{
 	"audio/mpeg":  {},
 	"audio/wav":   {},
@@ -79,7 +87,6 @@ var allowedAudioMIME = map[string]struct{}{
 	"audio/x-m4a": {},
 	"audio/aac":   {},
 	"audio/ogg":   {},
-	"audio/webm":  {},
 	"audio/flac":  {},
 }
 
