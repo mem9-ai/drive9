@@ -80,36 +80,36 @@ func (e *OpenAIAudioTextExtractor) ExtractAudioText(ctx context.Context, req Aud
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	if err := writer.WriteField("model", e.model); err != nil {
-		return "", err
+		return "", fmt.Errorf("write audio transcription model field for %q: %w", req.Path, err)
 	}
 	if strings.TrimSpace(e.prompt) != "" {
 		if err := writer.WriteField("prompt", e.prompt); err != nil {
-			return "", err
+			return "", fmt.Errorf("write audio transcription prompt field for %q: %w", req.Path, err)
 		}
 	}
 	if err := writeAudioMultipartFile(writer, req); err != nil {
-		return "", err
+		return "", fmt.Errorf("write audio transcription file part for %q: %w", req.Path, err)
 	}
 	if err := writer.Close(); err != nil {
-		return "", err
+		return "", fmt.Errorf("finalize audio transcription multipart body for %q: %w", req.Path, err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint, bytes.NewReader(body.Bytes()))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("create audio transcription request for %q: %w", req.Path, err)
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+e.apiKey)
 	httpReq.Header.Set("Content-Type", writer.FormDataContentType())
 
 	resp, err := e.client.Do(httpReq)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("send audio transcription request for %q: %w", req.Path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("read audio transcription response for %q: %w", req.Path, err)
 	}
 	var parsed struct {
 		Text  string `json:"text"`
@@ -141,6 +141,11 @@ func writeAudioMultipartFile(writer *multipart.Writer, req AudioExtractRequest) 
 	if filename == "" || filename == "." || filename == "/" {
 		filename = "audio"
 	}
+	// Reject characters that break a quoted filename= parameter or inject header lines.
+	// TODO: Encode arbitrary basenames using RFC 5987 filename* (and/or safer multipart headers).
+	if strings.ContainsAny(filename, "\"\r\n") {
+		return fmt.Errorf("basename %q contains forbidden characters (\", CR, or LF)", filename)
+	}
 	contentType := stripMIMEParams(req.ContentType)
 	if contentType == "" {
 		contentType = "application/octet-stream"
@@ -153,8 +158,10 @@ func writeAudioMultipartFile(writer *multipart.Writer, req AudioExtractRequest) 
 	header.Set("Content-Type", contentType)
 	part, err := writer.CreatePart(header)
 	if err != nil {
-		return err
+		return fmt.Errorf("create multipart file part: %w", err)
 	}
-	_, err = part.Write(req.Data)
-	return err
+	if _, err := part.Write(req.Data); err != nil {
+		return fmt.Errorf("write multipart file bytes: %w", err)
+	}
+	return nil
 }

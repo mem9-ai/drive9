@@ -22,9 +22,9 @@ func TestBuildBackendOptionsFromEnvAudioDisabled(t *testing.T) {
 		"DRIVE9_AUDIO_EXTRACT_MAX_BYTES",
 		"DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES",
 	}
-	restore := snapshotEnv(keys)
-	t.Cleanup(func() { restoreEnv(restore) })
-	unsetEnv(keys)
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
 
 	opts, err := buildBackendOptionsFromEnv()
 	if err != nil {
@@ -46,9 +46,9 @@ func TestBuildBackendOptionsFromEnvAudioMissingRequiredConfig(t *testing.T) {
 		"DRIVE9_AUDIO_EXTRACT_API_KEY",
 		"DRIVE9_AUDIO_EXTRACT_MODEL",
 	}
-	restore := snapshotEnv(keys)
-	t.Cleanup(func() { restoreEnv(restore) })
-	unsetEnv(keys)
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
 
 	if err := os.Setenv("DRIVE9_AUDIO_EXTRACT_ENABLED", "true"); err != nil {
 		t.Fatal(err)
@@ -79,9 +79,9 @@ func TestBuildBackendOptionsFromEnvAudioOpenAI(t *testing.T) {
 		"DRIVE9_AUDIO_EXTRACT_MAX_BYTES",
 		"DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES",
 	}
-	restore := snapshotEnv(keys)
-	t.Cleanup(func() { restoreEnv(restore) })
-	unsetEnv(keys)
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
 
 	setEnv(t, "DRIVE9_AUDIO_EXTRACT_ENABLED", "true")
 	setEnv(t, "DRIVE9_AUDIO_EXTRACT_API_BASE", "https://example.com/v1")
@@ -110,7 +110,8 @@ func TestBuildBackendOptionsFromEnvAudioOpenAI(t *testing.T) {
 	}
 }
 
-func snapshotEnv(keys []string) map[string]string {
+func snapshotEnv(t *testing.T, keys []string) map[string]string {
+	t.Helper()
 	out := make(map[string]string, len(keys))
 	for _, key := range keys {
 		out[key] = os.Getenv(key)
@@ -118,19 +119,27 @@ func snapshotEnv(keys []string) map[string]string {
 	return out
 }
 
-func restoreEnv(snapshot map[string]string) {
+func restoreEnv(t *testing.T, snapshot map[string]string) {
+	t.Helper()
 	for key, value := range snapshot {
 		if value == "" {
-			_ = os.Unsetenv(key)
+			if err := os.Unsetenv(key); err != nil {
+				t.Fatalf("unset %s: %v", key, err)
+			}
 			continue
 		}
-		_ = os.Setenv(key, value)
+		if err := os.Setenv(key, value); err != nil {
+			t.Fatalf("restore %s: %v", key, err)
+		}
 	}
 }
 
-func unsetEnv(keys []string) {
+func unsetEnv(t *testing.T, keys []string) {
+	t.Helper()
 	for _, key := range keys {
-		_ = os.Unsetenv(key)
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatalf("unset %s: %v", key, err)
+		}
 	}
 }
 

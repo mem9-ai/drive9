@@ -322,6 +322,29 @@ func TestOpenAIAudioTextExtractorOmitsBlankPrompt(t *testing.T) {
 	}
 }
 
+func TestOpenAIAudioTextExtractorRejectsUnsafeMultipartFilename(t *testing.T) {
+	extractor, err := NewOpenAIAudioTextExtractor(OpenAIAudioTextExtractorConfig{
+		BaseURL: "https://example.com",
+		APIKey:  "secret",
+		Model:   "whisper-1",
+		Client:  &http.Client{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+		Path:        `/music/a"b.mp3`,
+		ContentType: "audio/mpeg",
+		Data:        []byte("x"),
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "forbidden") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestWriteAudioMultipartFileRejectsCancelledContextIndirectly(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("request should not be sent for canceled context")

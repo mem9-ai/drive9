@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -37,8 +38,14 @@ DEFAULT_BASE_URL = "http://127.0.0.1:9009"
 PART_SIZE = 8 * 1024 * 1024
 
 
+def sql_string_literal(value: str) -> str:
+    """Escape a value for use inside single-quoted SQL string literals (double single-quotes)."""
+    return value.replace("'", "''")
+
+
 def crc32c_castagnoli(data: bytes) -> int:
     """CRC32C (Castagnoli) for v1 multipart part_checksums; matches server validatePartChecksums (4-byte digest)."""
+    # TODO: For large parts / many parts, optional accelerate with google-crc32c when installed.
     crc = 0xFFFFFFFF
     for b in data:
         crc ^= b
@@ -114,10 +121,14 @@ class Verifier:
             method=method,
             headers=headers or {},
         )
-        with urllib.request.urlopen(
-            req, timeout=timeout or self.timeout_seconds
-        ) as resp:
-            return resp.status, resp.read()
+        try:
+            with urllib.request.urlopen(
+                req, timeout=timeout or self.timeout_seconds
+            ) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            body = e.read()
+            return e.code, body
 
     def exec_sql(self, query: str) -> list[dict[str, Any]]:
         payload = json.dumps({"query": query}).encode()
@@ -133,6 +144,7 @@ class Verifier:
 
     def wait_for_audio_extract_success(self, path: str) -> VerificationResult:
         # Join current inode revision so overwrite picks up the latest task row.
+        path_lit = sql_string_literal(path)
         query = (
             "SELECT n.path, f.file_id, f.revision, f.content_type, "
             "COALESCE(f.content_text, '') AS content_text, "
@@ -142,7 +154,7 @@ class Verifier:
             "JOIN files f ON f.file_id = n.file_id "
             "LEFT JOIN semantic_tasks t "
             "  ON t.resource_id = f.file_id AND t.resource_version = f.revision "
-            f"WHERE n.path = '{path}'"
+            f"WHERE n.path = '{path_lit}'"
         )
         deadline = time.time() + self.timeout_seconds
         last_rows: list[dict[str, Any]] = []
@@ -174,13 +186,14 @@ class Verifier:
 
     def assert_no_audio_extract_task(self, path: str, settle_seconds: float) -> None:
         """After `settle_seconds`, fail if a succeeded audio_extract_text exists for this path."""
+        path_lit = sql_string_literal(path)
         query = (
             "SELECT n.path, f.revision, t.task_id, t.task_type, t.status "
             "FROM file_nodes n "
             "JOIN files f ON f.file_id = n.file_id "
             "LEFT JOIN semantic_tasks t "
             "  ON t.resource_id = f.file_id AND t.resource_version = f.revision "
-            f"WHERE n.path = '{path}'"
+            f"WHERE n.path = '{path_lit}'"
         )
         time.sleep(settle_seconds)
         rows = self.exec_sql(query)
@@ -567,4 +580,5 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as exc:  # pragma: no cover - CLI failure path
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        # TODO: `raise SystemExit(1) from None` here to suppress noisy exception chaining on stderr.
         raise SystemExit(1)
