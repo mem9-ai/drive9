@@ -228,12 +228,16 @@ environment:
   DRIVE9_IMAGE_EXTRACT_PROMPT   custom extraction prompt (optional)
   DRIVE9_IMAGE_EXTRACT_MAX_TOKENS max model output tokens (default: 256)
 
-  Async audio transcript extract (TiDB auto-embedding durable tasks; local stub only):
+  Async audio transcript extract (TiDB auto-embedding durable tasks):
   DRIVE9_AUDIO_EXTRACT_ENABLED true|false (default: false)
-  DRIVE9_AUDIO_EXTRACT_MODE stub (required when enabled; no other modes in this binary)
+  DRIVE9_AUDIO_EXTRACT_MODE stub|openai (required when enabled)
   DRIVE9_AUDIO_EXTRACT_MAX_BYTES max audio bytes per task (optional; backend default when unset)
   DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS extractor timeout seconds (optional; backend default when unset)
   DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES max transcript bytes stored in files.content_text (optional; backend default when unset)
+  DRIVE9_AUDIO_EXTRACT_API_BASE OpenAI-compatible base URL (required for openai mode)
+  DRIVE9_AUDIO_EXTRACT_API_KEY  API key for DRIVE9_AUDIO_EXTRACT_API_BASE (required for openai mode)
+  DRIVE9_AUDIO_EXTRACT_MODEL    model name for audio transcription (required for openai mode)
+  DRIVE9_AUDIO_EXTRACT_PROMPT   optional provider prompt for transcription (openai mode)
 `)
 	os.Exit(2)
 }
@@ -415,10 +419,11 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	}
 	if backend.AsyncAudioExtractWillWireRuntime(audioOpts) {
 		opts.AsyncAudioExtract = audioOpts
-		logger.Info(context.Background(), "local_server_audio_extract_stub_configured",
+		logger.Info(context.Background(), "local_server_audio_extract_runtime_configured",
 			zap.Int64("max_audio_bytes", audioOpts.MaxAudioBytes),
 			zap.Duration("task_timeout", audioOpts.TaskTimeout),
-			zap.Int("max_extract_text_bytes", audioOpts.MaxExtractTextBytes))
+			zap.Int("max_extract_text_bytes", audioOpts.MaxExtractTextBytes),
+			zap.String("extractor_type", fmt.Sprintf("%T", audioOpts.Extractor)))
 	}
 	return opts, nil
 }

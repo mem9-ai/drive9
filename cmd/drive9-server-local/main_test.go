@@ -154,6 +154,10 @@ func TestBuildLocalAudioExtractOptionsFromEnv(t *testing.T) {
 		envAudioExtractMaxBytes,
 		envAudioExtractTimeoutSeconds,
 		envAudioExtractMaxTextBytes,
+		envAudioExtractAPIBase,
+		envAudioExtractAPIKey,
+		envAudioExtractModel,
+		envAudioExtractPrompt,
 	}
 	prev := make(map[string]string, len(keys))
 	for _, k := range keys {
@@ -220,6 +224,41 @@ func TestBuildLocalAudioExtractOptionsFromEnv(t *testing.T) {
 	if opts.Extractor == nil {
 		t.Fatal("expected non-nil extractor")
 	}
+
+	unsetAll()
+	if err := os.Setenv(envAudioExtractEnabled, "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envAudioExtractMode, "openai"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := buildLocalAudioExtractOptionsFromEnv(); err == nil {
+		t.Fatal("expected openai mode without provider config to fail")
+	}
+
+	unsetAll()
+	if err := os.Setenv(envAudioExtractEnabled, "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envAudioExtractMode, "openai"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envAudioExtractAPIBase, "https://example.com/v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envAudioExtractAPIKey, "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envAudioExtractModel, "whisper-1"); err != nil {
+		t.Fatal(err)
+	}
+	opts, err = buildLocalAudioExtractOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("openai mode: %v", err)
+	}
+	if !backend.AsyncAudioExtractWillWireRuntime(opts) {
+		t.Fatalf("expected openai runtime wired, got %+v", opts)
+	}
 }
 
 func TestBuildBackendOptionsFromEnvAudioStub(t *testing.T) {
@@ -230,6 +269,9 @@ func TestBuildBackendOptionsFromEnvAudioStub(t *testing.T) {
 		"DRIVE9_IMAGE_EXTRACT_ENABLED",
 		envAudioExtractEnabled,
 		envAudioExtractMode,
+		envAudioExtractAPIBase,
+		envAudioExtractAPIKey,
+		envAudioExtractModel,
 	}
 	prev := make(map[string]string, len(keys))
 	for _, k := range keys {
@@ -252,6 +294,60 @@ func TestBuildBackendOptionsFromEnvAudioStub(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Setenv(envAudioExtractMode, "stub"); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := buildBackendOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildBackendOptionsFromEnv: %v", err)
+	}
+	if !backend.AsyncAudioExtractWillWireRuntime(opts.AsyncAudioExtract) {
+		t.Fatalf("expected async audio in backend options, got %+v", opts.AsyncAudioExtract)
+	}
+}
+
+func TestBuildBackendOptionsFromEnvAudioOpenAI(t *testing.T) {
+	keys := []string{
+		"DRIVE9_QUERY_EMBED_API_BASE",
+		"DRIVE9_QUERY_EMBED_API_KEY",
+		"DRIVE9_QUERY_EMBED_MODEL",
+		"DRIVE9_IMAGE_EXTRACT_ENABLED",
+		envAudioExtractEnabled,
+		envAudioExtractMode,
+		envAudioExtractAPIBase,
+		envAudioExtractAPIKey,
+		envAudioExtractModel,
+		envAudioExtractPrompt,
+	}
+	prev := make(map[string]string, len(keys))
+	for _, k := range keys {
+		prev[k] = os.Getenv(k)
+	}
+	t.Cleanup(func() {
+		for _, k := range keys {
+			if prev[k] == "" {
+				_ = os.Unsetenv(k)
+			} else {
+				_ = os.Setenv(k, prev[k])
+			}
+		}
+	})
+	for _, k := range keys {
+		_ = os.Unsetenv(k)
+	}
+
+	if err := os.Setenv(envAudioExtractEnabled, "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envAudioExtractMode, "openai"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envAudioExtractAPIBase, "https://example.com/v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envAudioExtractAPIKey, "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envAudioExtractModel, "whisper-1"); err != nil {
 		t.Fatal(err)
 	}
 	opts, err := buildBackendOptionsFromEnv()
