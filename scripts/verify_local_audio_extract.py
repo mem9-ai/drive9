@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import json
 import os
 import sys
@@ -36,6 +35,16 @@ from typing import Any
 
 DEFAULT_BASE_URL = "http://127.0.0.1:9009"
 PART_SIZE = 8 * 1024 * 1024
+
+
+def crc32c_castagnoli(data: bytes) -> int:
+    """CRC32C (Castagnoli) for v1 multipart part_checksums; matches server validatePartChecksums (4-byte digest)."""
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+    return (~crc) & 0xFFFFFFFF
 
 
 @dataclass
@@ -202,12 +211,12 @@ class Verifier:
             )
 
     def calc_part_checksums(self, payload: bytes) -> list[str]:
+        # v1 initiate uses CRC32C per part (base64 of 4 big-endian bytes), not SHA256.
         checksums = []
         for start in range(0, len(payload), PART_SIZE):
             chunk = payload[start : start + PART_SIZE]
-            checksums.append(
-                base64.b64encode(hashlib.sha256(chunk).digest()).decode()
-            )
+            digest = crc32c_castagnoli(chunk).to_bytes(4, byteorder="big")
+            checksums.append(base64.b64encode(digest).decode())
         return checksums
 
     def upload_parts_from_plan(self, plan: dict[str, Any], payload: bytes) -> None:
