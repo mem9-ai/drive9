@@ -40,17 +40,17 @@ type AudioExtractResult string
 
 const (
 	AudioExtractResultRuntimeNotConfigured AudioExtractResult = "runtime_not_configured"
-	AudioExtractResultGetFileError           AudioExtractResult = "get_file_error"
-	AudioExtractResultFileNotFound           AudioExtractResult = "file_not_found"
-	AudioExtractResultNotConfirmed           AudioExtractResult = "not_confirmed"
-	AudioExtractResultNotAudio               AudioExtractResult = "not_audio"
-	AudioExtractResultStale                  AudioExtractResult = "stale"
-	AudioExtractResultLoadError              AudioExtractResult = "load_error"
-	AudioExtractResultTooLarge               AudioExtractResult = "too_large"
-	AudioExtractResultExtractError           AudioExtractResult = "extract_error"
-	AudioExtractResultEmptyText              AudioExtractResult = "empty_text"
-	AudioExtractResultUpdateError            AudioExtractResult = "update_error"
-	AudioExtractResultWritten                AudioExtractResult = "written"
+	AudioExtractResultGetFileError         AudioExtractResult = "get_file_error"
+	AudioExtractResultFileNotFound         AudioExtractResult = "file_not_found"
+	AudioExtractResultNotConfirmed         AudioExtractResult = "not_confirmed"
+	AudioExtractResultNotAudio             AudioExtractResult = "not_audio"
+	AudioExtractResultStale                AudioExtractResult = "stale"
+	AudioExtractResultLoadError            AudioExtractResult = "load_error"
+	AudioExtractResultTooLarge             AudioExtractResult = "too_large"
+	AudioExtractResultExtractError         AudioExtractResult = "extract_error"
+	AudioExtractResultEmptyText            AudioExtractResult = "empty_text"
+	AudioExtractResultUpdateError          AudioExtractResult = "update_error"
+	AudioExtractResultWritten              AudioExtractResult = "written"
 )
 
 // SupportsAsyncAudioExtract reports whether this backend instance has a fully
@@ -136,6 +136,26 @@ func isSupportedAudioForSemanticTask(path, contentType string) bool {
 	return isAudioContentType(contentType, path)
 }
 
+// errAudioExtractSourceTooLarge signals the object exceeds MaxAudioBytes; it is
+// distinct from an empty payload so the handler does not report oversize for 0-byte inputs.
+var errAudioExtractSourceTooLarge = errors.New("audio extract source exceeds configured max bytes")
+
+// resolvedAudioMIMEForHandler combines the stored file Content-Type with the durable
+// task payload hint. When the DB value is generic (empty, octet-stream, text/plain),
+// we may still resolve audio via path extension or the payload MIME—so a task enqueued
+// with an audio hint is not dropped just because the inode row kept a generic type.
+func resolvedAudioMIMEForHandler(path, storedContentType, payloadContentType string) string {
+	stored := strings.TrimSpace(storedContentType)
+	payload := strings.TrimSpace(payloadContentType)
+	if m := effectiveAudioMIME(path, stored); m != "" {
+		return m
+	}
+	if audioMIMEAllowsPathFallback(stored) {
+		return effectiveAudioMIME(path, payload)
+	}
+	return ""
+}
+
 // ProcessAudioExtractTask runs transcript extraction for one durable
 // audio_extract_text task. Terminal business outcomes return a nil error; runtime
 // misconfiguration and transient failures return a retryable error.
@@ -154,11 +174,8 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 	if f.Status != datastore.StatusConfirmed {
 		return AudioExtractResultNotConfirmed, nil
 	}
-	ct := strings.TrimSpace(f.ContentType)
-	if ct == "" {
-		ct = strings.TrimSpace(task.ContentType)
-	}
-	if !isSupportedAudioForSemanticTask(task.Path, ct) {
+	resolvedMIME := resolvedAudioMIMEForHandler(task.Path, f.ContentType, task.ContentType)
+	if resolvedMIME == "" {
 		return AudioExtractResultNotAudio, nil
 	}
 	if task.Revision > 0 && f.Revision != task.Revision {
@@ -167,13 +184,12 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 
 	data, err := b.loadAudioBytesForExtract(ctx, f)
 	if err != nil {
+		if errors.Is(err, errAudioExtractSourceTooLarge) {
+			return AudioExtractResultTooLarge, nil
+		}
 		return AudioExtractResultLoadError, fmt.Errorf("load audio bytes: %w", err)
 	}
-	if len(data) == 0 {
-		return AudioExtractResultTooLarge, nil
-	}
 
-	resolvedMIME := effectiveAudioMIME(task.Path, ct)
 	taskCtx, cancel := context.WithTimeout(ctx, b.audioExtractTimeout)
 	text, err := b.audioExtractor.ExtractAudioText(taskCtx, AudioExtractRequest{
 		FileID:      task.FileID,
@@ -225,11 +241,11 @@ func injectedAudioExtractWritebackError(name string) error {
 
 func (b *Dat9Backend) loadAudioBytesForExtract(ctx context.Context, f *datastore.File) ([]byte, error) {
 	if b.audioExtractMaxSize > 0 && f.SizeBytes > b.audioExtractMaxSize {
-		return nil, nil
+		return nil, errAudioExtractSourceTooLarge
 	}
 	if f.StorageType == datastore.StorageDB9 {
 		if b.audioExtractMaxSize > 0 && int64(len(f.ContentBlob)) > b.audioExtractMaxSize {
-			return nil, nil
+			return nil, errAudioExtractSourceTooLarge
 		}
 		return append([]byte(nil), f.ContentBlob...), nil
 	}
@@ -254,7 +270,7 @@ func (b *Dat9Backend) loadAudioBytesForExtract(ctx context.Context, f *datastore
 		return nil, err
 	}
 	if b.audioExtractMaxSize > 0 && int64(len(data)) > b.audioExtractMaxSize {
-		return nil, nil
+		return nil, errAudioExtractSourceTooLarge
 	}
 	return data, nil
 }

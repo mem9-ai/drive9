@@ -74,6 +74,79 @@ func TestProcessAudioExtractTaskStaleRevision(t *testing.T) {
 	}
 }
 
+func TestProcessAudioExtractTaskUsesPayloadMIMEWhenStoredGenericAndExtensionless(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "payload hint transcript"},
+		},
+	})
+	fileID := insertImageFileForExtractTest(t, b, "/rec/extensionless-audio", "application/octet-stream", []byte{0xff, 0xf3, 0x80})
+	result, err := b.ProcessAudioExtractTask(context.Background(), AudioExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/rec/extensionless-audio",
+		ContentType: "audio/mpeg",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != AudioExtractResultWritten {
+		t.Fatalf("result=%q, want %q (stored generic MIME must combine with payload hint)", result, AudioExtractResultWritten)
+	}
+	got := waitForContentText(t, b, "/rec/extensionless-audio", time.Second)
+	if !strings.Contains(got, "payload hint") {
+		t.Fatalf("unexpected content_text: %q", got)
+	}
+}
+
+func TestProcessAudioExtractTaskNonGenericStoredIgnoresConflictingPayloadMIME(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "must not run"},
+		},
+	})
+	fileID := insertImageFileForExtractTest(t, b, "/rec/wrong-type.bin", "image/png", []byte{1, 2, 3, 4})
+	result, err := b.ProcessAudioExtractTask(context.Background(), AudioExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/rec/wrong-type.bin",
+		ContentType: "audio/mpeg",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != AudioExtractResultNotAudio {
+		t.Fatalf("result=%q, want %q (specific non-generic stored type must not be overridden by payload)", result, AudioExtractResultNotAudio)
+	}
+}
+
+func TestProcessAudioExtractTaskZeroByteSourceNotReportedAsTooLarge(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "empty blob ok"},
+		},
+	})
+	fileID := insertImageFileForExtractTest(t, b, "/rec/zero.mp3", "audio/mpeg", []byte{})
+	result, err := b.ProcessAudioExtractTask(context.Background(), AudioExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/rec/zero.mp3",
+		ContentType: "audio/mpeg",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != AudioExtractResultWritten {
+		t.Fatalf("result=%q, want %q (0-byte payload is not oversize)", result, AudioExtractResultWritten)
+	}
+}
+
 func TestProcessAudioExtractTaskNotAudio(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
 		DatabaseAutoEmbedding: true,
