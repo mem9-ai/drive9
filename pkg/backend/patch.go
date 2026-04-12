@@ -46,6 +46,11 @@ type PatchUploadPart struct {
 //   - newSize: the total size of the file after patching
 //   - dirtyParts: 1-based part numbers that the client has modified
 func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newSize int64, dirtyParts []int, clientPartSize int64) (*PatchPlan, error) {
+	return b.InitiatePatchUploadIfRevision(ctx, path, newSize, dirtyParts, clientPartSize, -1)
+}
+
+// InitiatePatchUploadIfRevision starts a patch upload with optional CAS semantics.
+func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path string, newSize int64, dirtyParts []int, clientPartSize int64, expectedRevision int64) (*PatchPlan, error) {
 	start := time.Now()
 	if err := b.ensureUploadSizeAllowed(newSize); err != nil {
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
@@ -71,6 +76,14 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 	if nf.File == nil || nf.File.StorageType != datastore.StorageS3 {
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
 		return nil, fmt.Errorf("file is not S3-stored: %s", path)
+	}
+	if expectedRevision == 0 {
+		metrics.RecordOperation("backend", "patch_upload", "conflict", time.Since(start))
+		return nil, datastore.ErrRevisionConflict
+	}
+	if expectedRevision > 0 && nf.File.Revision != expectedRevision {
+		metrics.RecordOperation("backend", "patch_upload", "conflict", time.Since(start))
+		return nil, datastore.ErrRevisionConflict
 	}
 
 	sourceKey := nf.File.StorageRef
@@ -211,18 +224,19 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 			return err
 		}
 		return b.store.InsertUploadTx(tx, &datastore.Upload{
-			UploadID:   uploadID,
-			FileID:     fileID,
-			TargetPath: path,
-			S3UploadID: mpu.UploadID,
-			S3Key:      newS3Key,
-			TotalSize:  newSize,
-			PartSize:   partSize,
-			PartsTotal: len(newParts),
-			Status:     datastore.UploadUploading,
-			CreatedAt:  now,
-			UpdatedAt:  now,
-			ExpiresAt:  now.Add(24 * time.Hour),
+			UploadID:         uploadID,
+			FileID:           fileID,
+			TargetPath:       path,
+			S3UploadID:       mpu.UploadID,
+			S3Key:            newS3Key,
+			TotalSize:        newSize,
+			PartSize:         partSize,
+			PartsTotal:       len(newParts),
+			ExpectedRevision: expectedRevisionPtr(expectedRevision),
+			Status:           datastore.UploadUploading,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+			ExpiresAt:        now.Add(24 * time.Hour),
 		})
 	}); err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)

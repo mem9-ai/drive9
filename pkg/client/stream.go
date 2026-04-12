@@ -20,12 +20,13 @@ import (
 // State transitions: idle → started → completed/aborted.
 // Once completed or aborted, no further WritePart/Complete/Abort calls are accepted.
 type StreamWriter struct {
-	client    *Client
-	path      string
-	totalSize int64
+	client           *Client
+	path             string
+	totalSize        int64
+	expectedRevision int64
 
 	mu        sync.Mutex
-	plan      *uploadPlanV2       // lazily initialized on first WritePart
+	plan      *uploadPlanV2        // lazily initialized on first WritePart
 	uploaded  map[int]completePart // partNumber → completed part
 	inflight  sync.WaitGroup
 	err       error // first error from any goroutine
@@ -40,12 +41,18 @@ type StreamWriter struct {
 // NewStreamWriter creates a StreamWriter for streaming multipart upload.
 // No network call is made until the first WritePart.
 func (c *Client) NewStreamWriter(ctx context.Context, path string, totalSize int64) *StreamWriter {
+	return c.NewStreamWriterConditional(ctx, path, totalSize, -1)
+}
+
+// NewStreamWriterConditional creates a StreamWriter with optional CAS semantics.
+func (c *Client) NewStreamWriterConditional(ctx context.Context, path string, totalSize int64, expectedRevision int64) *StreamWriter {
 	return &StreamWriter{
-		client:    c,
-		path:      path,
-		totalSize: totalSize,
-		uploaded:  make(map[int]completePart),
-		sem:       make(chan struct{}, uploadMaxConcurrency),
+		client:           c,
+		path:             path,
+		totalSize:        totalSize,
+		expectedRevision: expectedRevision,
+		uploaded:         make(map[int]completePart),
+		sem:              make(chan struct{}, uploadMaxConcurrency),
 	}
 }
 
@@ -61,7 +68,7 @@ func (sw *StreamWriter) initLocked(ctx context.Context) error {
 	if sw.started {
 		return nil
 	}
-	plan, err := sw.client.initiateUploadV2(ctx, sw.path, sw.totalSize)
+	plan, err := sw.client.initiateUploadV2(ctx, sw.path, sw.totalSize, sw.expectedRevision)
 	if err == errV2NotAvailable {
 		return fmt.Errorf("streaming upload requires v2 protocol: %w", err)
 	}

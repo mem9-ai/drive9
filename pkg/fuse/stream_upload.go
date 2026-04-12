@@ -15,16 +15,17 @@ import (
 //
 // Two modes of operation:
 //
-// 1. Flush-time upload (UploadAll): Used for non-sequential writes or when
-//    streaming was not triggered. All parts are uploaded in parallel at close.
+//  1. Flush-time upload (UploadAll): Used for non-sequential writes or when
+//     streaming was not triggered. All parts are uploaded in parallel at close.
 //
-// 2. Streaming upload (SubmitPart + FinishStreaming): Used for large sequential
-//    writes. Parts are uploaded as they fill during Write(), and memory is
-//    released after each upload completes. At close, FinishStreaming uploads
-//    the final partial part and any dirty (back-written) parts, then completes.
+//  2. Streaming upload (SubmitPart + FinishStreaming): Used for large sequential
+//     writes. Parts are uploaded as they fill during Write(), and memory is
+//     released after each upload completes. At close, FinishStreaming uploads
+//     the final partial part and any dirty (back-written) parts, then completes.
 type StreamUploader struct {
-	client *client.Client
-	path   string
+	client           *client.Client
+	path             string
+	expectedRevision int64
 
 	mu            sync.Mutex
 	writer        *client.StreamWriter
@@ -36,11 +37,12 @@ type StreamUploader struct {
 
 // NewStreamUploader creates a StreamUploader for the given path.
 // No network calls are made until UploadAll or SubmitPart is called.
-func NewStreamUploader(c *client.Client, path string) *StreamUploader {
+func NewStreamUploader(c *client.Client, path string, expectedRevision int64) *StreamUploader {
 	return &StreamUploader{
-		client:        c,
-		path:          path,
-		streamedParts: make(map[int]bool),
+		client:           c,
+		path:             path,
+		expectedRevision: expectedRevision,
+		streamedParts:    make(map[int]bool),
 	}
 }
 
@@ -76,7 +78,7 @@ func (su *StreamUploader) SubmitPart(ctx context.Context, partNum int, data []by
 	// Lazy init — use a very large totalSize since we don't know final size yet.
 	// This only affects server plan metadata, not actual upload correctness.
 	if !su.started {
-		su.writer = su.client.NewStreamWriter(ctx, su.path, math.MaxInt64)
+		su.writer = su.client.NewStreamWriterConditional(ctx, su.path, math.MaxInt64, su.expectedRevision)
 		su.started = true
 	}
 	sw := su.writer
@@ -193,7 +195,7 @@ func (su *StreamUploader) UploadAll(ctx context.Context, totalSize int64, partDa
 	}
 
 	su.mu.Lock()
-	su.writer = su.client.NewStreamWriter(ctx, su.path, totalSize)
+	su.writer = su.client.NewStreamWriterConditional(ctx, su.path, totalSize, su.expectedRevision)
 	su.started = true
 	sw := su.writer
 	su.mu.Unlock()

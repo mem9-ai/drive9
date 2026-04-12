@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -131,6 +132,76 @@ func TestStat(t *testing.T) {
 	}
 	if resp.Header.Get("X-Dat9-IsDir") != "false" {
 		t.Errorf("expected X-Dat9-IsDir false, got %s", resp.Header.Get("X-Dat9-IsDir"))
+	}
+}
+
+func TestWriteWithExpectedRevisionConflict(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/cas.txt", strings.NewReader("v1"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("initial write: %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/cas.txt", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev, _ := strconv.ParseInt(resp.Header.Get("X-Dat9-Revision"), 10, 64)
+	_ = resp.Body.Close()
+	if rev != 1 {
+		t.Fatalf("initial revision = %d, want 1", rev)
+	}
+
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/cas.txt", strings.NewReader("stale"))
+	req.Header.Set("X-Dat9-Expected-Revision", "0")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("create-if-absent conflict status = %d, want 409", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/cas.txt", strings.NewReader("v2"))
+	req.Header.Set("X-Dat9-Expected-Revision", "1")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("conditional overwrite status = %d, want 200", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/cas.txt", strings.NewReader("late"))
+	req.Header.Set("X-Dat9-Expected-Revision", "1")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("stale revision conflict status = %d, want 409", resp.StatusCode)
+	}
+
+	resp, err = http.Get(ts.URL + "/v1/fs/cas.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if string(body) != "v2" {
+		t.Fatalf("final body = %q, want v2", body)
 	}
 }
 
