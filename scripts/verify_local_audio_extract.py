@@ -12,8 +12,14 @@ Exercises HTTP paths aligned with docs/impl/audio-extract-local-e2e-validation-i
   stub audio enabled for other scenarios)
 - Optional: `--expect-no-audio-tasks` for a server *without* audio runtime (upload  `.mp3` and assert no succeeded audio task)
 
-Requires TiDB auto-embedding + `DRIVE9_AUDIO_EXTRACT_ENABLED=true` + `MODE=stub`
-on the server for positive cases.
+Requires TiDB auto-embedding + `DRIVE9_AUDIO_EXTRACT_ENABLED=true`.
+
+- **`--mode stub` (default)** — server must use `DRIVE9_AUDIO_EXTRACT_MODE=stub`. Uses a tiny
+  synthetic `.mp3`-like payload and asserts stub-shaped transcripts + grep on `transcript`.
+- **`--mode openai`** — server must use real ASR (`DRIVE9_AUDIO_EXTRACT_MODE=openai` + API config).
+  You must pass **`--audio-file`** with a real decodable audio file; transcripts are only
+  asserted to be non-empty (no stub string match). Grep checks are skipped because wording
+  is model-dependent.
 
 The script exits non-zero on any failed assertion.
 """
@@ -26,6 +32,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -420,6 +427,8 @@ def normalize_remote_path(remote_path: str) -> str:
 
 def make_unique_path(prefix: str, ext: str) -> str:
     suffix = uuid.uuid4().hex[:10]
+    if not ext.startswith("."):
+        ext = "." + ext
     return normalize_remote_path(f"/audio/{prefix}-{suffix}{ext}")
 
 
@@ -444,6 +453,18 @@ def print_result(result: VerificationResult) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--mode",
+        choices=("stub", "openai"),
+        default="stub",
+        help="stub: synthetic bytes + stub transcript assertions (default). "
+        "openai: require --audio-file with real audio; only non-empty transcript.",
+    )
+    p.add_argument(
+        "--audio-file",
+        metavar="PATH",
+        help="local audio file to upload when --mode=openai (must be decodable by your ASR)",
+    )
     p.add_argument(
         "--base-url", default=DEFAULT_BASE_URL, help="drive9-server-local base URL"
     )
@@ -496,7 +517,34 @@ def parse_args() -> argparse.Namespace:
         default=12.0,
         help="seconds to wait before asserting no audio task (negative cases)",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.mode == "openai":
+        if not args.audio_file:
+            p.error("--audio-file is required when --mode=openai")
+    elif args.audio_file:
+        p.error("--audio-file is only valid with --mode=openai")
+    return args
+
+
+def load_openai_audio(path: str) -> tuple[bytes, str]:
+    """Read file bytes and a filename extension (with leading dot) for remote paths."""
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise RuntimeError(f"audio file not found or not a file: {path}")
+    ext = p.suffix.lower()
+    if not ext:
+        ext = ".mp3"
+    data = p.read_bytes()
+    if len(data) == 0:
+        raise RuntimeError(f"audio file is empty: {path}")
+    return data, ext
+
+
+def openai_second_revision_payload(payload: bytes) -> bytes:
+    """Second upload bytes: differ from `payload` so revision advances; prefer truncation."""
+    if len(payload) > 1:
+        return payload[:-1]
+    return payload + b"\x00"
 
 
 def main() -> int:
@@ -516,49 +564,68 @@ def main() -> int:
         )
         return 0
 
+    if args.mode == "openai":
+        audio_bytes, audio_ext = load_openai_audio(args.audio_file)
+    else:
+        audio_bytes = b""
+        audio_ext = ".mp3"
+
     fake_mp3 = b"\xff\xfb\x90" + b"\x00" * 256
+    payload = audio_bytes if args.mode == "openai" else fake_mp3
+
+    def assert_transcript(flow_label: str, remote_path: str, got: str) -> None:
+        if args.mode == "stub":
+            want = expected_stub_transcript(remote_path)
+            if got != want:
+                raise RuntimeError(
+                    f"{flow_label} content_text={got!r}, want {want!r}"
+                )
+        else:
+            if not (got or "").strip():
+                raise RuntimeError(
+                    f"{flow_label}: expected non-empty transcript in openai mode, got {got!r}"
+                )
 
     if not args.skip_direct:
-        dp = make_unique_path("direct", ".mp3")
-        r = v.verify_direct_put_bytes(dp, fake_mp3)
-        want = expected_stub_transcript(dp)
-        if r.content_text != want:
-            raise RuntimeError(f"direct content_text={r.content_text!r}, want {want!r}")
-        v.verify_grep_under_prefix("/audio/", "transcript", dp)
+        dp = make_unique_path("direct", audio_ext)
+        r = v.verify_direct_put_bytes(dp, payload)
+        assert_transcript("direct", dp, r.content_text)
+        if args.mode == "stub":
+            v.verify_grep_under_prefix("/audio/", "transcript", dp)
         print_result(r)
 
     if not args.skip_overwrite:
         # Unique path so repeat runs are not affected by leftover /audio/e2e-overwrite-fixed.mp3.
-        op = make_unique_path("overwrite", ".mp3")
-        r1 = v.verify_direct_put_bytes(op, fake_mp3)
-        r2 = v.verify_direct_put_bytes(op, fake_mp3 + b"-v2")
+        op = make_unique_path("overwrite", audio_ext)
+        r1 = v.verify_direct_put_bytes(op, payload)
+        r2 = v.verify_direct_put_bytes(
+            op,
+            payload + b"-v2" if args.mode == "stub" else openai_second_revision_payload(payload),
+        )
         if r2.revision != r1.revision + 1:
             raise RuntimeError(
                 f"overwrite revision {r1.revision} -> {r2.revision}, want +1"
             )
-        want = expected_stub_transcript(op)
-        if r2.content_text != want:
-            raise RuntimeError(f"overwrite content_text={r2.content_text!r}, want {want!r}")
+        assert_transcript("overwrite", op, r2.content_text)
         r2.flow = "overwrite"
-        v.verify_grep_under_prefix("/audio/", "transcript", op)
+        if args.mode == "stub":
+            v.verify_grep_under_prefix("/audio/", "transcript", op)
         print_result(r2)
 
     if not args.skip_multipart_v1:
-        mp = make_unique_path("multipart-v1", ".mp3")
-        r = v.verify_multipart_v1(mp, fake_mp3)
-        want = expected_stub_transcript(mp)
-        if r.content_text != want:
-            raise RuntimeError(f"v1 content_text={r.content_text!r}, want {want!r}")
-        v.verify_grep_under_prefix("/audio/", "transcript", mp)
+        mp = make_unique_path("multipart-v1", audio_ext)
+        r = v.verify_multipart_v1(mp, payload)
+        assert_transcript("multipart_v1", mp, r.content_text)
+        if args.mode == "stub":
+            v.verify_grep_under_prefix("/audio/", "transcript", mp)
         print_result(r)
 
     if not args.skip_multipart_v2:
-        mp2 = make_unique_path("multipart-v2", ".mp3")
-        r = v.verify_multipart_v2(mp2, fake_mp3)
-        want = expected_stub_transcript(mp2)
-        if r.content_text != want:
-            raise RuntimeError(f"v2 content_text={r.content_text!r}, want {want!r}")
-        v.verify_grep_under_prefix("/audio/", "transcript", mp2)
+        mp2 = make_unique_path("multipart-v2", audio_ext)
+        r = v.verify_multipart_v2(mp2, payload)
+        assert_transcript("multipart_v2", mp2, r.content_text)
+        if args.mode == "stub":
+            v.verify_grep_under_prefix("/audio/", "transcript", mp2)
         print_result(r)
 
     if not args.skip_negative_m4a:
