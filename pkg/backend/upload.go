@@ -435,6 +435,7 @@ type CompletePart struct {
 }
 
 // ConfirmUploadV2 validates client-supplied parts against S3, then completes the upload.
+// It shares finalizeUpload with ConfirmUpload, so TiDB auto-semantic task enqueue matches the v1 path.
 func (b *Dat9Backend) ConfirmUploadV2(ctx context.Context, uploadID string, clientParts []CompletePart) error {
 	start := time.Now()
 
@@ -517,6 +518,8 @@ func (b *Dat9Backend) ConfirmUploadV2(ctx context.Context, uploadID string, clie
 }
 
 // ConfirmUpload completes the multipart upload and creates the file node.
+// TiDB auto-embedding tenants: when applicable, finalizeUpload enqueues durable
+// img_extract_text / audio_extract_text in the completion transaction (same contract as create/overwrite).
 func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error {
 	start := time.Now()
 
@@ -561,6 +564,10 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 
 // finalizeUpload completes the S3 multipart upload and creates the file node.
 // Both ConfirmUpload (v1) and ConfirmUploadV2 call this with already-validated parts.
+//
+// For TiDB auto-embedding tenants, durable img_extract_text / audio_extract_text
+// tasks are registered in the same transaction via enqueueTiDBAutoSemanticTasksTx,
+// matching create/overwrite semantics (MP3/WAV closed set, runtime gates, payloads).
 func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Upload, parts []s3client.Part) error {
 	start := time.Now()
 	uploadID := upload.UploadID
@@ -626,10 +633,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 				return err
 			}
 			if b.UsesDatabaseAutoEmbedding() {
-				if b.hasAsyncImageTextSource(upload.TargetPath, contentType) {
-					return b.enqueueImgExtractTaskTx(tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
-				}
-				return nil
+				return b.enqueueTiDBAutoSemanticTasksTx(tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
 			}
 			if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "") {
 				return b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
@@ -678,10 +682,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			return err
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			if b.hasAsyncImageTextSource(upload.TargetPath, contentType) {
-				return b.enqueueImgExtractTaskTx(tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
-			}
-			return nil
+			return b.enqueueTiDBAutoSemanticTasksTx(tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
 		}
 		if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "") {
 			return b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)

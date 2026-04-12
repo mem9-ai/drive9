@@ -73,6 +73,26 @@ func uploadAllPartsForPlan(t *testing.T, b *Dat9Backend, plan *UploadPlan, uploa
 	}
 }
 
+// completePartsForConfirmV2 builds the client part list for ConfirmUploadV2 after
+// parts have been uploaded to S3 (same bytes as uploadAllPartsForPlan).
+func completePartsForConfirmV2(t *testing.T, b *Dat9Backend, uploadID string) []CompletePart {
+	t.Helper()
+	ctx := context.Background()
+	u, err := b.GetUpload(ctx, uploadID)
+	if err != nil {
+		t.Fatalf("get upload: %v", err)
+	}
+	parts, err := b.S3().ListParts(ctx, u.S3Key, u.S3UploadID)
+	if err != nil {
+		t.Fatalf("list parts: %v", err)
+	}
+	out := make([]CompletePart, len(parts))
+	for i, p := range parts {
+		out[i] = CompletePart{Number: p.Number, ETag: p.ETag}
+	}
+	return out
+}
+
 func mustFileForPath(t *testing.T, b *Dat9Backend, path string) (string, int64, *int64, string) {
 	t.Helper()
 	nf, err := b.Store().Stat(context.Background(), path)
@@ -187,6 +207,185 @@ func TestWriteCreateAutoEmbeddingImageEnqueuesImgExtractTaskWithoutLegacyQueue(t
 	}
 	if tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) || tasks[0].Status != string(semantic.TaskQueued) || tasks[0].ResourceVersion != 1 {
 		t.Fatalf("unexpected semantic task: %+v", tasks[0])
+	}
+}
+
+func TestWriteCreateAutoEmbeddingAudioEnqueuesAudioExtractTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	if _, err := b.Write("/tracks/create.mp3", []byte{0xff, 0xf3}, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, revision, _, _ := mustFileForPath(t, b, "/tracks/create.mp3")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var audioSeen bool
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			audioSeen = true
+			if tsk.Status != string(semantic.TaskQueued) || tsk.ResourceVersion != 1 {
+				t.Fatalf("unexpected audio task: %+v", tsk)
+			}
+		}
+	}
+	if !audioSeen {
+		t.Fatalf("expected audio_extract_text among %+v", tasks)
+	}
+	nf, err := b.Store().Stat(context.Background(), "/tracks/create.mp3")
+	if err != nil || nf.File == nil {
+		t.Fatal(err)
+	}
+	if nf.File.ContentText != "" {
+		t.Fatalf("content_text should be empty before worker, got %q", nf.File.ContentText)
+	}
+}
+
+func TestWriteCreateAutoEmbeddingMP4EnqueuesAudioExtractTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	if _, err := b.Write("/tracks/create.mp4", []byte{0x00, 0x00, 0x00, 0x18}, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, revision, _, contentType := mustFileForPath(t, b, "/tracks/create.mp4")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	wantCT := detectContentType("/tracks/create.mp4", nil)
+	if contentType != wantCT {
+		t.Fatalf("content_type=%q, want %q", contentType, wantCT)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var audioSeen bool
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			audioSeen = true
+			if tsk.Status != string(semantic.TaskQueued) || tsk.ResourceVersion != 1 {
+				t.Fatalf("unexpected audio task: %+v", tsk)
+			}
+		}
+	}
+	if !audioSeen {
+		t.Fatalf("expected audio_extract_text among %+v", tasks)
+	}
+}
+
+func TestWriteCreateAutoEmbeddingM4AEnqueuesAudioExtractTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	if _, err := b.Write("/tracks/create.m4a", []byte{0x00, 0x00, 0x00}, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, revision, _, contentType := mustFileForPath(t, b, "/tracks/create.m4a")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	wantCT := detectContentType("/tracks/create.m4a", nil)
+	if contentType != wantCT {
+		t.Fatalf("content_type=%q, want %q", contentType, wantCT)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var audioSeen bool
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			audioSeen = true
+			if tsk.Status != string(semantic.TaskQueued) || tsk.ResourceVersion != 1 {
+				t.Fatalf("unexpected audio task: %+v", tsk)
+			}
+		}
+	}
+	if !audioSeen {
+		t.Fatalf("expected audio_extract_text among %+v", tasks)
+	}
+}
+
+func TestWriteOverwriteAutoEmbeddingAudioEnqueuesAudioExtractTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	fileID := insertImageFileForExtractTest(t, b, "/tracks/ow.mp3", "audio/mpeg", []byte{1, 2, 3})
+	setStoredEmbeddingState(t, b, fileID, 1)
+
+	if _, err := b.Write("/tracks/ow.mp3", []byte{4, 5, 6}, 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	_, revision, _, _ := mustFileForPath(t, b, "/tracks/ow.mp3")
+	if revision != 2 {
+		t.Fatalf("revision=%d, want 2", revision)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var audioSeen bool
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) && tsk.ResourceVersion == 2 {
+			audioSeen = true
+			if tsk.Status != string(semantic.TaskQueued) {
+				t.Fatalf("unexpected audio task: %+v", tsk)
+			}
+		}
+	}
+	if !audioSeen {
+		t.Fatalf("expected audio_extract_text for revision 2 among %+v", tasks)
+	}
+}
+
+func TestWriteCreateAutoEmbeddingSkipsAudioWhenExtractorUnset(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled: true,
+			// Extractor nil: Phase 2 does not wire a default extractor.
+			Extractor: nil,
+		},
+	})
+	if _, err := b.Write("/tracks/no-extractor.mp3", []byte{0xff, 0xf3}, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/tracks/no-extractor.mp3")
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			t.Fatalf("unexpected audio task: %+v", tsk)
+		}
+	}
+}
+
+func TestWriteCreateAutoEmbeddingSkipsAudioForNonAudioFile(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	if _, err := b.Write("/notes/plain.txt", []byte("hello"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/notes/plain.txt")
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			t.Fatalf("unexpected audio task: %+v", tsk)
+		}
 	}
 }
 
@@ -547,6 +746,283 @@ func TestConfirmUploadAutoEmbeddingImageEnqueuesImgExtractTaskWithoutLegacyQueue
 	}
 	if tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) || tasks[0].Status != string(semantic.TaskQueued) || tasks[0].ResourceVersion != 1 {
 		t.Fatalf("unexpected semantic task: %+v", tasks[0])
+	}
+}
+
+func TestConfirmUploadAutoEmbeddingEnqueuesAudioExtractTaskForMP3(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	ctx := context.Background()
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUpload(ctx, "/upload/clip.mp3", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadAllPartsForPlan(t, b, plan, plan.UploadID, totalSize)
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+	fileID, revision, _, _ := mustFileForPath(t, b, "/upload/clip.mp3")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var audioSeen bool
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			audioSeen = true
+			if tsk.Status != string(semantic.TaskQueued) || tsk.ResourceVersion != 1 {
+				t.Fatalf("unexpected audio task: %+v", tsk)
+			}
+		}
+	}
+	if !audioSeen {
+		t.Fatalf("expected audio_extract_text for upload completion .mp3 among %+v", tasks)
+	}
+}
+
+func TestConfirmUploadAutoEmbeddingEnqueuesAudioExtractTaskForWAV(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	ctx := context.Background()
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUpload(ctx, "/upload/clip.wav", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadAllPartsForPlan(t, b, plan, plan.UploadID, totalSize)
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+	fileID, revision, _, contentType := mustFileForPath(t, b, "/upload/clip.wav")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	wantCT := detectContentType("/upload/clip.wav", nil)
+	if contentType != wantCT {
+		t.Fatalf("content_type=%q, want %q", contentType, wantCT)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var audioSeen bool
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			audioSeen = true
+			if tsk.Status != string(semantic.TaskQueued) || tsk.ResourceVersion != 1 {
+				t.Fatalf("unexpected audio task: %+v", tsk)
+			}
+		}
+	}
+	if !audioSeen {
+		t.Fatalf("expected audio_extract_text for upload completion .wav among %+v", tasks)
+	}
+}
+
+func TestConfirmUploadAutoEmbeddingEnqueuesAudioExtractTaskForMP4(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	ctx := context.Background()
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUpload(ctx, "/upload/clip.mp4", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadAllPartsForPlan(t, b, plan, plan.UploadID, totalSize)
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+	fileID, revision, _, contentType := mustFileForPath(t, b, "/upload/clip.mp4")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	wantCT := detectContentType("/upload/clip.mp4", nil)
+	if contentType != wantCT {
+		t.Fatalf("content_type=%q, want %q", contentType, wantCT)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var audioSeen bool
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			audioSeen = true
+			if tsk.Status != string(semantic.TaskQueued) || tsk.ResourceVersion != 1 {
+				t.Fatalf("unexpected audio task: %+v", tsk)
+			}
+		}
+	}
+	if !audioSeen {
+		t.Fatalf("expected audio_extract_text for upload completion .mp4 among %+v", tasks)
+	}
+}
+
+func TestConfirmUploadOverwriteAutoEmbeddingEnqueuesAudioExtractTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	ctx := context.Background()
+	fileID := insertImageFileForExtractTest(t, b, "/upload/ow.mp3", "audio/mpeg", []byte{1, 2, 3})
+	setStoredEmbeddingState(t, b, fileID, 1)
+
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUpload(ctx, "/upload/ow.mp3", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadAllPartsForPlan(t, b, plan, plan.UploadID, totalSize)
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+	confirmedID, revision, _, _ := mustFileForPath(t, b, "/upload/ow.mp3")
+	if confirmedID != fileID {
+		t.Fatalf("overwrite should preserve file_id=%q, got %q", fileID, confirmedID)
+	}
+	if revision != 2 {
+		t.Fatalf("revision=%d, want 2", revision)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var audioRev2 bool
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) && tsk.ResourceVersion == 2 {
+			audioRev2 = true
+			if tsk.Status != string(semantic.TaskQueued) {
+				t.Fatalf("unexpected audio task: %+v", tsk)
+			}
+		}
+	}
+	if !audioRev2 {
+		t.Fatalf("expected audio_extract_text for revision 2 among %+v", tasks)
+	}
+}
+
+func TestConfirmUploadAutoEmbeddingEnqueuesAudioExtractTaskForM4A(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	ctx := context.Background()
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUpload(ctx, "/upload/clip.m4a", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadAllPartsForPlan(t, b, plan, plan.UploadID, totalSize)
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+	fileID, revision, _, contentType := mustFileForPath(t, b, "/upload/clip.m4a")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	wantCT := detectContentType("/upload/clip.m4a", nil)
+	if contentType != wantCT {
+		t.Fatalf("content_type=%q, want %q", contentType, wantCT)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var audioSeen bool
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			audioSeen = true
+			if tsk.Status != string(semantic.TaskQueued) || tsk.ResourceVersion != 1 {
+				t.Fatalf("unexpected audio task: %+v", tsk)
+			}
+		}
+	}
+	if !audioSeen {
+		t.Fatalf("expected audio_extract_text for upload completion .m4a among %+v", tasks)
+	}
+}
+
+func TestConfirmUploadAutoEmbeddingSkipsAudioWhenAsyncAudioDisabled(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   false,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	ctx := context.Background()
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUpload(ctx, "/upload/no-audio-async.mp3", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadAllPartsForPlan(t, b, plan, plan.UploadID, totalSize)
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/upload/no-audio-async.mp3")
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			t.Fatalf("unexpected audio task when async audio disabled: %+v", tsk)
+		}
+	}
+}
+
+// TestConfirmUploadV2AutoEmbeddingEnqueuesAudioViaSharedFinalize checks that
+// ConfirmUploadV2 enqueues audio_extract_text for TiDB auto-embedding by going
+// through the shared finalizeUpload path.
+//
+// The fixture intentionally uses InitiateUpload (v1) to create the multipart
+// upload and upload parts; only the completion step uses ConfirmUploadV2. That
+// does not exercise the full InitiateUploadV2 / v2 presign lifecycle (covered
+// in upload_test.go); it specifically locks shared finalize behavior so v1 and
+// v2 completion stay aligned for semantic enqueue.
+func TestConfirmUploadV2AutoEmbeddingEnqueuesAudioViaSharedFinalize(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "x"},
+		},
+	})
+	ctx := context.Background()
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUpload(ctx, "/upload/shared-finalize-v2-clip.mp3", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadAllPartsForPlan(t, b, plan, plan.UploadID, totalSize)
+	parts := completePartsForConfirmV2(t, b, plan.UploadID)
+	if err := b.ConfirmUploadV2(ctx, plan.UploadID, parts); err != nil {
+		t.Fatal(err)
+	}
+	fileID, revision, _, _ := mustFileForPath(t, b, "/upload/shared-finalize-v2-clip.mp3")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var audioSeen bool
+	for _, tsk := range tasks {
+		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
+			audioSeen = true
+			if tsk.Status != string(semantic.TaskQueued) || tsk.ResourceVersion != 1 {
+				t.Fatalf("unexpected audio task: %+v", tsk)
+			}
+		}
+	}
+	if !audioSeen {
+		t.Fatalf("ConfirmUploadV2 should enqueue audio via shared finalize; got %+v", tasks)
 	}
 }
 

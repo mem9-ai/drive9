@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -69,6 +70,18 @@ type staticServerImageExtractor struct {
 }
 
 func (e staticServerImageExtractor) ExtractImageText(context.Context, backend.ImageExtractRequest) (string, error) {
+	if e.err != nil {
+		return "", e.err
+	}
+	return e.text, nil
+}
+
+type staticServerAudioExtractor struct {
+	text string
+	err  error
+}
+
+func (e staticServerAudioExtractor) ExtractAudioText(context.Context, backend.AudioExtractRequest) (string, error) {
 	if e.err != nil {
 		return "", e.err
 	}
@@ -232,6 +245,100 @@ func TestSemanticWorkerProcessesImgExtractTaskWithoutEmbedder(t *testing.T) {
 	waitForContentTextOnServer(t, b, "/img/worker.png", "cat on sofa", 3*time.Second)
 	waitForNamedTaskStatus(t, b, "img-task-1", string(semantic.TaskSucceeded), 3*time.Second)
 	if tasks := loadSemanticTaskRowsForResource(t, b, fileID); len(tasks) != 1 || tasks[0].TaskType != string(semantic.TaskTypeImgExtractText) {
+		t.Fatalf("unexpected semantic task rows: %+v", tasks)
+	}
+}
+
+func TestSemanticWorkerProcessesAudioExtractTaskWithoutEmbedder(t *testing.T) {
+	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: backend.AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: staticServerAudioExtractor{text: "hello from audio worker"},
+		},
+	})
+	fileID := insertServerImageFileForExtractTest(t, b, "/rec/worker.mp3", "audio/mpeg", []byte{0xff, 0xf3})
+	payload, err := json.Marshal(semantic.AudioExtractTaskPayload{Path: "/rec/worker.mp3", ContentType: "audio/mpeg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := b.Store().EnqueueSemanticTask(context.Background(), &semantic.Task{
+		TaskID:          "audio-task-1",
+		TaskType:        semantic.TaskTypeAudioExtractText,
+		ResourceID:      fileID,
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     now,
+		PayloadJSON:     payload,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewWithConfig(Config{Backend: b, SemanticWorkers: SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
+	}})
+	t.Cleanup(func() { s.Close() })
+	if s.semanticWorker == nil {
+		t.Fatal("expected semantic worker to start for auto audio tasks")
+	}
+
+	waitForContentTextOnServer(t, b, "/rec/worker.mp3", "hello from audio", 3*time.Second)
+	waitForNamedTaskStatus(t, b, "audio-task-1", string(semantic.TaskSucceeded), 3*time.Second)
+	if tasks := loadSemanticTaskRowsForResource(t, b, fileID); len(tasks) != 1 || tasks[0].TaskType != string(semantic.TaskTypeAudioExtractText) {
+		t.Fatalf("unexpected semantic task rows: %+v", tasks)
+	}
+}
+
+func TestSemanticWorkerProcessesMP4AudioExtractTaskWithoutEmbedder(t *testing.T) {
+	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: backend.AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: staticServerAudioExtractor{text: "hello from mp4 audio worker"},
+		},
+	})
+	fileID := insertServerImageFileForExtractTest(t, b, "/rec/worker.mp4", "video/mp4", []byte{0x00, 0x00, 0x00, 0x18})
+	payload, err := json.Marshal(semantic.AudioExtractTaskPayload{Path: "/rec/worker.mp4", ContentType: "video/mp4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := b.Store().EnqueueSemanticTask(context.Background(), &semantic.Task{
+		TaskID:          "audio-mp4-task-1",
+		TaskType:        semantic.TaskTypeAudioExtractText,
+		ResourceID:      fileID,
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     now,
+		PayloadJSON:     payload,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewWithConfig(Config{Backend: b, SemanticWorkers: SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
+	}})
+	t.Cleanup(func() { s.Close() })
+	if s.semanticWorker == nil {
+		t.Fatal("expected semantic worker to start for auto audio tasks")
+	}
+
+	waitForContentTextOnServer(t, b, "/rec/worker.mp4", "hello from mp4 audio", 3*time.Second)
+	waitForNamedTaskStatus(t, b, "audio-mp4-task-1", string(semantic.TaskSucceeded), 3*time.Second)
+	if tasks := loadSemanticTaskRowsForResource(t, b, fileID); len(tasks) != 1 || tasks[0].TaskType != string(semantic.TaskTypeAudioExtractText) {
 		t.Fatalf("unexpected semantic task rows: %+v", tasks)
 	}
 }
@@ -431,6 +538,67 @@ func TestServerDoesNotStartSemanticWorkerWithoutHandlers(t *testing.T) {
 	}
 }
 
+func TestSemanticWorkerTaskTypesForTarget(t *testing.T) {
+	bApp := newTestBackendForSemanticWorker(t)
+	m := newSemanticWorkerManager(bApp, nil, nil, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
+	got := m.taskTypesForTarget(bApp)
+	if len(got) != 1 || got[0] != semantic.TaskTypeEmbed {
+		t.Fatalf("got %#v, want embed", got)
+	}
+
+	bAuto := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled: true, Workers: 1, QueueSize: 4, Extractor: staticServerImageExtractor{text: "ok"},
+		},
+	})
+	mAuto := newSemanticWorkerManager(bAuto, nil, nil, nil, SemanticWorkerOptions{})
+	gotAuto := mAuto.taskTypesForTarget(bAuto)
+	if len(gotAuto) != 1 || gotAuto[0] != semantic.TaskTypeImgExtractText {
+		t.Fatalf("got %#v, want img_extract_text", gotAuto)
+	}
+
+	bAudio := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: backend.AsyncAudioExtractOptions{
+			Enabled: true, Extractor: staticServerAudioExtractor{text: "x"},
+		},
+	})
+	mAudio := newSemanticWorkerManager(bAudio, nil, nil, nil, SemanticWorkerOptions{})
+	gotAudio := mAudio.taskTypesForTarget(bAudio)
+	if len(gotAudio) != 1 || gotAudio[0] != semantic.TaskTypeAudioExtractText {
+		t.Fatalf("got %#v, want audio_extract_text", gotAudio)
+	}
+
+	bBoth := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled: true, Workers: 1, QueueSize: 4, Extractor: staticServerImageExtractor{text: "i"},
+		},
+		AsyncAudioExtract: backend.AsyncAudioExtractOptions{
+			Enabled: true, Extractor: staticServerAudioExtractor{text: "a"},
+		},
+	})
+	mBoth := newSemanticWorkerManager(bBoth, nil, nil, nil, SemanticWorkerOptions{})
+	gotBoth := mBoth.taskTypesForTarget(bBoth)
+	if len(gotBoth) != 2 {
+		t.Fatalf("got %#v, want 2 task types", gotBoth)
+	}
+	for _, want := range []semantic.TaskType{semantic.TaskTypeImgExtractText, semantic.TaskTypeAudioExtractText} {
+		if !slices.Contains(gotBoth, want) {
+			t.Fatalf("got %#v, missing %v", gotBoth, want)
+		}
+	}
+}
+
+func TestSemanticWorkerTaskTypesForTargetNilWithoutEmbedder(t *testing.T) {
+	b := newTestBackendForSemanticWorker(t)
+	m := newSemanticWorkerManager(b, nil, nil, nil, SemanticWorkerOptions{})
+	if m.taskTypesForTarget(b) != nil {
+		t.Fatal("app-managed backend without embedder should yield nil task types")
+	}
+}
+
 func TestSemanticWorkerManagerStartsForMultiTenantImageOnlyMode(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -471,6 +639,72 @@ func TestSemanticWorkerManagerStartsForMultiTenantImageOnlyMode(t *testing.T) {
 		t.Fatal("expected semantic worker manager in multi-tenant image-only mode")
 	}
 	_ = tenantID
+}
+
+func TestSemanticWorkerManagerStartsForMultiTenantAudioOnlyMode(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	pool := newTestTenantPoolWithBackendOptions(t, backend.Options{
+		AsyncAudioExtract: backend.AsyncAudioExtractOptions{Enabled: true, Extractor: staticServerAudioExtractor{text: "x"}},
+	})
+	passCipher, err := pool.Encrypt(context.Background(), []byte("pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	tenantID := token.NewID()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: passCipher,
+		DBName:           "app",
+		DBTLS:            false,
+		Provider:         tenant.ProviderDB9,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newSemanticWorkerManager(nil, metaStore, pool, nil, SemanticWorkerOptions{})
+	if m == nil {
+		t.Fatal("expected semantic worker manager in multi-tenant audio-only mode")
+	}
+	_ = tenantID
+}
+
+func TestSemanticWorkerManagerNilWhenMultiTenantOnlyFallbackHasAutoTasks(t *testing.T) {
+	initServerTenantSchema(t, testDSN)
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	pool := newTestTenantPool(t)
+	fallback := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled: true, Workers: 1, QueueSize: 4, Extractor: staticServerImageExtractor{text: "x"},
+		},
+	})
+
+	m := newSemanticWorkerManager(fallback, metaStore, pool, nil, SemanticWorkerOptions{})
+	if m != nil {
+		t.Fatal("expected nil manager: multi-tenant listTenantRefs never schedules fallback, so fallback-only auto types are unreachable")
+	}
 }
 
 func TestSemanticWorkerAcksObsoleteRevisionAndWritesLatest(t *testing.T) {
@@ -1017,7 +1251,10 @@ func TestSemanticWorkerListTenantRefsDoesNotUseFallbackImageCapabilityForPoolTen
 		semanticWorkerUsesTiDBAutoEmbedding = orig
 	}()
 
-	m := newSemanticWorkerManager(fallback, metaStore, pool, nil, SemanticWorkerOptions{})
+	// Pool has no async image extract, so TiDB-auto tenants get no task types from
+	// the pool; embedder is only to satisfy worker viability (multi-tenant path does
+	// not count fallback-only fbAuto — see newSemanticWorkerManager).
+	m := newSemanticWorkerManager(fallback, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
 	if m == nil {
 		t.Fatal("expected semantic worker manager")
 	}
