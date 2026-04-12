@@ -48,13 +48,33 @@ drive9 umount /mnt/drive9
 ### Go SDK
 
 ```go
-c := client.New("http://localhost:9009", "")
-c.Write("/data/file.txt", []byte("hello"))
-data, _ := c.Read("/data/file.txt")
-entries, _ := c.List("/data/")
-c.Copy("/a.txt", "/b.txt")   // zero-copy
-c.Rename("/old", "/new")     // metadata-only
-c.Delete("/data/file.txt")
+import "github.com/mem9-ai/drive9/pkg/client"
+
+// Create client (get API key from 'drive9 create' or drive9.ai console)
+c := client.New("https://api.drive9.ai", "your-api-key")
+
+// Write file (auto-handles small/large files)
+if err := c.Write("/data/file.txt", []byte("hello")); err != nil {
+    log.Fatal(err)
+}
+
+// Read file
+data, err := c.Read("/data/file.txt")
+if err != nil {
+    log.Fatal(err)
+}
+
+// List directory
+entries, err := c.List("/data/")
+
+// Copy (zero-copy, metadata only)
+err = c.Copy("/a.txt", "/b.txt")
+
+// Rename (metadata only)
+err = c.Rename("/old.txt", "/new.txt")
+
+// Delete
+err = c.Delete("/data/file.txt")
 ```
 
 ## Architecture
