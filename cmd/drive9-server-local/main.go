@@ -141,6 +141,18 @@ func main() {
 	defer b.Close()
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_local_backend")
 
+	if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
+		Backend:          b,
+		LocalS3:          localS3,
+		S3Dir:            s3Dir,
+		MaxUploadBytes:   maxUploadBytes,
+		Logger:           srvLogger,
+		SemanticEmbedder: semanticEmbedder,
+		SemanticWorkers:  workerOpts,
+	}, backendOpts, true); err != nil {
+		die(err)
+	}
+
 	stepStart = time.Now()
 	srv := server.NewWithConfig(server.Config{
 		Backend:          b,
@@ -154,6 +166,7 @@ func main() {
 	defer srv.Close()
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_server")
 
+	audioRuntime := backend.AsyncAudioExtractWillWireRuntime(backendOpts.AsyncAudioExtract)
 	logger.Info(startupCtx, "local_server_mode",
 		zap.String("listen_addr", addr),
 		zap.String("local_dsn", redactDSN(localDSN)),
@@ -162,6 +175,7 @@ func main() {
 		zap.String("requested_embedding_mode", localEmbeddingModeLabel(requestedEmbeddingMode, explicitEmbeddingMode)),
 		zap.String("embedding_mode", string(localEmbeddingMode)),
 		zap.Bool("database_auto_embedding", backendOpts.DatabaseAutoEmbedding),
+		zap.Bool("local_audio_extract_runtime", audioRuntime),
 		zap.Duration("startup_elapsed", time.Since(startupStart)))
 
 	// Bind first so we can emit a definitive "started" log only after the socket
@@ -225,6 +239,17 @@ environment:
   DRIVE9_IMAGE_EXTRACT_MODEL    model name for vision extraction (optional)
   DRIVE9_IMAGE_EXTRACT_PROMPT   custom extraction prompt (optional)
   DRIVE9_IMAGE_EXTRACT_MAX_TOKENS max model output tokens (default: 256)
+
+  Async audio transcript extract (TiDB auto-embedding durable tasks):
+  DRIVE9_AUDIO_EXTRACT_ENABLED true|false (default: false)
+  DRIVE9_AUDIO_EXTRACT_MODE stub|openai (required when enabled)
+  DRIVE9_AUDIO_EXTRACT_MAX_BYTES max audio bytes per task (optional; backend default when unset)
+  DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS extractor timeout seconds (optional; backend default when unset)
+  DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES max transcript bytes stored in files.content_text (optional; backend default when unset)
+  DRIVE9_AUDIO_EXTRACT_API_BASE OpenAI-compatible base URL (required for openai mode)
+  DRIVE9_AUDIO_EXTRACT_API_KEY  API key for DRIVE9_AUDIO_EXTRACT_API_BASE (required for openai mode)
+  DRIVE9_AUDIO_EXTRACT_MODEL    model name for audio transcription (required for openai mode)
+  DRIVE9_AUDIO_EXTRACT_PROMPT   optional provider prompt for transcription (openai mode)
 `)
 	os.Exit(2)
 }
@@ -357,50 +382,61 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 			zap.String("model", queryModel), zap.String("base_url", queryBaseURL))
 	}
 
-	if !envBool("DRIVE9_IMAGE_EXTRACT_ENABLED", false) {
-		return opts, nil
-	}
-
-	async := backend.AsyncImageExtractOptions{
-		Enabled:             true,
-		QueueSize:           envInt("DRIVE9_IMAGE_EXTRACT_QUEUE_SIZE", 128),
-		Workers:             envInt("DRIVE9_IMAGE_EXTRACT_WORKERS", 1),
-		MaxImageBytes:       envInt64("DRIVE9_IMAGE_EXTRACT_MAX_BYTES", 8<<20),
-		TaskTimeout:         time.Duration(envInt("DRIVE9_IMAGE_EXTRACT_TIMEOUT_SECONDS", 20)) * time.Second,
-		MaxExtractTextBytes: envInt("DRIVE9_IMAGE_EXTRACT_MAX_TEXT_BYTES", 8<<10),
-	}
-
-	baseURL := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_API_BASE"))
-	apiKey := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_API_KEY"))
-	model := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_MODEL"))
-	prompt := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_PROMPT"))
-	maxTokens := envInt("DRIVE9_IMAGE_EXTRACT_MAX_TOKENS", 256)
-
-	configured := baseURL != "" || apiKey != "" || model != ""
-	if configured {
-		if baseURL == "" || apiKey == "" || model == "" {
-			return backend.Options{}, fmt.Errorf("DRIVE9_IMAGE_EXTRACT_API_BASE, DRIVE9_IMAGE_EXTRACT_API_KEY and DRIVE9_IMAGE_EXTRACT_MODEL must be set together")
+	if envBool("DRIVE9_IMAGE_EXTRACT_ENABLED", false) {
+		async := backend.AsyncImageExtractOptions{
+			Enabled:             true,
+			QueueSize:           envInt("DRIVE9_IMAGE_EXTRACT_QUEUE_SIZE", 128),
+			Workers:             envInt("DRIVE9_IMAGE_EXTRACT_WORKERS", 1),
+			MaxImageBytes:       envInt64("DRIVE9_IMAGE_EXTRACT_MAX_BYTES", 8<<20),
+			TaskTimeout:         time.Duration(envInt("DRIVE9_IMAGE_EXTRACT_TIMEOUT_SECONDS", 20)) * time.Second,
+			MaxExtractTextBytes: envInt("DRIVE9_IMAGE_EXTRACT_MAX_TEXT_BYTES", 8<<10),
 		}
-		extractor, err := backend.NewOpenAIImageTextExtractor(backend.OpenAIImageTextExtractorConfig{
-			BaseURL:   baseURL,
-			APIKey:    apiKey,
-			Model:     model,
-			Prompt:    prompt,
-			MaxTokens: maxTokens,
-			Timeout:   async.TaskTimeout,
-		})
-		if err != nil {
-			return backend.Options{}, fmt.Errorf("init image extractor: %w", err)
+
+		baseURL := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_API_BASE"))
+		apiKey := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_API_KEY"))
+		model := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_MODEL"))
+		prompt := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_PROMPT"))
+		maxTokens := envInt("DRIVE9_IMAGE_EXTRACT_MAX_TOKENS", 256)
+
+		configured := baseURL != "" || apiKey != "" || model != ""
+		if configured {
+			if baseURL == "" || apiKey == "" || model == "" {
+				return backend.Options{}, fmt.Errorf("DRIVE9_IMAGE_EXTRACT_API_BASE, DRIVE9_IMAGE_EXTRACT_API_KEY and DRIVE9_IMAGE_EXTRACT_MODEL must be set together")
+			}
+			extractor, err := backend.NewOpenAIImageTextExtractor(backend.OpenAIImageTextExtractorConfig{
+				BaseURL:   baseURL,
+				APIKey:    apiKey,
+				Model:     model,
+				Prompt:    prompt,
+				MaxTokens: maxTokens,
+				Timeout:   async.TaskTimeout,
+			})
+			if err != nil {
+				return backend.Options{}, fmt.Errorf("init image extractor: %w", err)
+			}
+			async.Extractor = backend.NewFallbackImageTextExtractor(extractor, backend.NewBasicImageTextExtractor())
+			logger.Info(context.Background(), "image_extract_mode_openai_compatible",
+				zap.String("model", model), zap.String("base_url", baseURL))
+		} else {
+			async.Extractor = backend.NewBasicImageTextExtractor()
+			logger.Info(context.Background(), "image_extract_mode_basic_fallback")
 		}
-		async.Extractor = backend.NewFallbackImageTextExtractor(extractor, backend.NewBasicImageTextExtractor())
-		logger.Info(context.Background(), "image_extract_mode_openai_compatible",
-			zap.String("model", model), zap.String("base_url", baseURL))
-	} else {
-		async.Extractor = backend.NewBasicImageTextExtractor()
-		logger.Info(context.Background(), "image_extract_mode_basic_fallback")
+
+		opts.AsyncImageExtract = async
 	}
 
-	opts.AsyncImageExtract = async
+	audioOpts, err := buildLocalAudioExtractOptionsFromEnv()
+	if err != nil {
+		return backend.Options{}, err
+	}
+	if backend.AsyncAudioExtractWillWireRuntime(audioOpts) {
+		opts.AsyncAudioExtract = audioOpts
+		logger.Info(context.Background(), "local_server_audio_extract_runtime_configured",
+			zap.Int64("max_audio_bytes", audioOpts.MaxAudioBytes),
+			zap.Duration("task_timeout", audioOpts.TaskTimeout),
+			zap.Int("max_extract_text_bytes", audioOpts.MaxExtractTextBytes),
+			zap.String("extractor_type", fmt.Sprintf("%T", audioOpts.Extractor)))
+	}
 	return opts, nil
 }
 

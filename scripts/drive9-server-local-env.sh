@@ -52,6 +52,22 @@
 # : "${DRIVE9_IMAGE_EXTRACT_QUEUE_SIZE:=128}"
 # : "${DRIVE9_IMAGE_EXTRACT_WORKERS:=1}"
 
+# Optional: async audio transcript extract.
+# Wires durable audio_extract_text tasks; requires TiDB auto-embedding on the DB.
+# Use stub mode for deterministic local e2e, or openai mode for provider smoke.
+# : "${DRIVE9_AUDIO_EXTRACT_ENABLED:=true}"
+# : "${DRIVE9_AUDIO_EXTRACT_MODE:=stub}"
+# Leave unset to keep audio extract disabled (default).
+# Optional tuning (omit to use backend defaults):
+# DRIVE9_AUDIO_EXTRACT_MAX_BYTES
+# DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS
+# DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES
+# OpenAI-compatible mode only:
+# DRIVE9_AUDIO_EXTRACT_API_BASE
+# DRIVE9_AUDIO_EXTRACT_API_KEY
+# DRIVE9_AUDIO_EXTRACT_MODEL
+# DRIVE9_AUDIO_EXTRACT_PROMPT
+
 export DRIVE9_PUBLIC_URL
 export DRIVE9_LOCAL_DSN
 export DRIVE9_S3_DIR
@@ -61,3 +77,14 @@ export DRIVE9_EMBED_MODEL
 
 echo "Environment loaded for drive9-server-local."
 echo "Run: make run-server-local"
+echo ""
+echo "Audio extract e2e (optional): enable stub runtime, then run the verifier, e.g."
+echo "  export DRIVE9_LOCAL_EMBEDDING_MODE=auto DRIVE9_AUDIO_EXTRACT_ENABLED=true DRIVE9_AUDIO_EXTRACT_MODE=stub"
+echo "  make run-server-local"
+echo "  python3 scripts/verify_local_audio_extract.py"
+echo ""
+echo "Audio extract provider smoke (optional):"
+echo "  export DRIVE9_LOCAL_EMBEDDING_MODE=auto DRIVE9_AUDIO_EXTRACT_ENABLED=true DRIVE9_AUDIO_EXTRACT_MODE=openai"
+echo "  export DRIVE9_AUDIO_EXTRACT_API_BASE=... DRIVE9_AUDIO_EXTRACT_API_KEY=... DRIVE9_AUDIO_EXTRACT_MODEL=..."
+echo "  make run-server-local"
+echo "  python3 scripts/verify_local_audio_extract.py --mode openai --audio-file /path/to/sample.wav"
