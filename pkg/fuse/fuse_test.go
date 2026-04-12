@@ -497,7 +497,7 @@ func TestWriteBuffer_DirtyParts_TruncateShrinkAtBoundary(t *testing.T) {
 func TestWriteBuffer_DirtyParts_TruncateExtend(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0, 0)
 	_, _ = wb.Write(0, make([]byte, DefaultPartSize)) // 1 full part
-	wb.ClearDirty()                        // clear as if preloaded
+	wb.ClearDirty()                                   // clear as if preloaded
 
 	// Extend to 3 parts
 	_ = wb.Truncate(DefaultPartSize*3 - 100)
@@ -832,7 +832,7 @@ func TestWriteBuffer_RewriteBeforeClose_AllDirtyPartsHaveLatestData(t *testing.T
 // ---------------------------------------------------------------------------
 
 func TestWriteBuffer_ReadAt_Basic(t *testing.T) {
-	wb := NewWriteBuffer("/test", 0, 10) // small part size
+	wb := NewWriteBuffer("/test", 0, 10)      // small part size
 	_, _ = wb.Write(0, []byte("AAAAAAAAAA"))  // part 1
 	_, _ = wb.Write(20, []byte("CCCCCCCCCC")) // part 3
 
@@ -917,7 +917,7 @@ func TestPrefetcher_CloseStopsAccepting(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestStreamUploader_NotStartedBeforeUploadAll(t *testing.T) {
-	su := NewStreamUploader(nil, "/test")
+	su := NewStreamUploader(nil, "/test", -1)
 	if su.Started() {
 		t.Fatal("should not be started before UploadAll")
 	}
@@ -1156,7 +1156,7 @@ func TestWriteBuffer_ExactPartSizeBoundary_NoDoubleUpload(t *testing.T) {
 }
 
 func TestStreamUploader_HasStreamedParts(t *testing.T) {
-	su := NewStreamUploader(nil, "/test")
+	su := NewStreamUploader(nil, "/test", -1)
 	if su.HasStreamedParts() {
 		t.Fatal("should have no streamed parts initially")
 	}

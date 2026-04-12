@@ -25,6 +25,26 @@ type Client struct {
 	smallFileThreshold int64 // 0 means use DefaultSmallFileThreshold
 }
 
+// ErrConflict reports an HTTP 409 write conflict from the server.
+var ErrConflict = errors.New("conflict")
+
+// StatusError preserves the HTTP status code for API errors.
+type StatusError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *StatusError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return fmt.Sprintf("HTTP %d", e.StatusCode)
+}
+
+func (e *StatusError) Is(target error) bool {
+	return target == ErrConflict && e.StatusCode == http.StatusConflict
+}
+
 // New creates a new dat9 client.
 func New(baseURL, apiKey string) *Client {
 	// Clone DefaultTransport to preserve Proxy, HTTP/2, dialer, and TLS defaults,
@@ -144,11 +164,24 @@ func (c *Client) Write(path string, data []byte) error {
 
 // WriteCtx uploads data to a remote path with context support.
 func (c *Client) WriteCtx(ctx context.Context, path string, data []byte) error {
+	return c.WriteCtxConditional(ctx, path, data, -1)
+}
+
+// WriteCtxConditional uploads data to a remote path and applies the write only
+// when expectedRevision matches the current server revision.
+// expectedRevision semantics:
+// - negative: unconditional write
+// - zero: path must not already exist
+// - positive: file must exist at exactly that revision
+func (c *Client) WriteCtxConditional(ctx context.Context, path string, data []byte, expectedRevision int64) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
+	if expectedRevision >= 0 {
+		req.Header.Set("X-Dat9-Expected-Revision", strconv.FormatInt(expectedRevision, 10))
+	}
 	resp, err := c.do(req)
 	if err != nil {
 		return err
@@ -341,9 +374,9 @@ func readError(resp *http.Response) error {
 		Error string `json:"error"`
 	}
 	if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-		return fmt.Errorf("%s", errResp.Error)
+		return &StatusError{StatusCode: resp.StatusCode, Message: errResp.Error}
 	}
-	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	return &StatusError{StatusCode: resp.StatusCode, Message: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body))}
 }
 
 func (c *Client) SQL(query string) ([]map[string]interface{}, error) {

@@ -19,11 +19,12 @@ import (
 )
 
 var (
-	ErrNotFound        = errors.New("not found")
-	ErrUploadNotActive = errors.New("upload is not in UPLOADING state")
-	ErrUploadExpired   = errors.New("upload has expired")
-	ErrPathConflict    = errors.New("path already exists")
-	ErrUploadConflict  = errors.New("active upload already exists for this path")
+	ErrNotFound         = errors.New("not found")
+	ErrUploadNotActive  = errors.New("upload is not in UPLOADING state")
+	ErrUploadExpired    = errors.New("upload has expired")
+	ErrPathConflict     = errors.New("path already exists")
+	ErrUploadConflict   = errors.New("active upload already exists for this path")
+	ErrRevisionConflict = errors.New("revision conflict")
 )
 
 type StorageType string
@@ -90,20 +91,21 @@ type NodeWithFile struct {
 
 // Upload represents a row in the uploads table.
 type Upload struct {
-	UploadID       string
-	FileID         string
-	TargetPath     string
-	S3UploadID     string
-	S3Key          string
-	TotalSize      int64
-	PartSize       int64
-	PartsTotal     int
-	Status         UploadStatus
-	FingerprintSHA string
-	IdempotencyKey string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	ExpiresAt      time.Time
+	UploadID         string
+	FileID           string
+	TargetPath       string
+	S3UploadID       string
+	S3Key            string
+	TotalSize        int64
+	PartSize         int64
+	PartsTotal       int
+	ExpectedRevision *int64
+	Status           UploadStatus
+	FingerprintSHA   string
+	IdempotencyKey   string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	ExpiresAt        time.Time
 }
 
 // Store is the metadata store backed by TiDB/MySQL (stand-in for db9).
@@ -795,10 +797,10 @@ func (s *Store) InsertUpload(ctx context.Context, u *Upload) (err error) {
 func (s *Store) InsertUploadTx(db execer, u *Upload) error {
 	_, err := db.Exec(`INSERT INTO uploads
 		(upload_id, file_id, target_path, s3_upload_id, s3_key, total_size, part_size,
-		 parts_total, status, fingerprint_sha256, idempotency_key, created_at, updated_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 parts_total, expected_revision, status, fingerprint_sha256, idempotency_key, created_at, updated_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		u.UploadID, u.FileID, u.TargetPath, u.S3UploadID, u.S3Key,
-		u.TotalSize, u.PartSize, u.PartsTotal, u.Status,
+		u.TotalSize, u.PartSize, u.PartsTotal, nullInt64Ptr(u.ExpectedRevision), u.Status,
 		nullStr(u.FingerprintSHA), nullStr(u.IdempotencyKey),
 		u.CreatedAt.UTC(), u.UpdatedAt.UTC(), u.ExpiresAt.UTC())
 	if isUniqueViolation(err) {
@@ -812,7 +814,7 @@ func (s *Store) GetUpload(ctx context.Context, uploadID string) (out *Upload, er
 	defer observeStoreOp(ctx, "get_upload", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
-		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
+		total_size, part_size, parts_total, expected_revision, status, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
 		FROM uploads WHERE upload_id = ?`, uploadID)
 	out, err = scanUpload(row)
@@ -824,7 +826,7 @@ func (s *Store) GetUploadByPath(ctx context.Context, targetPath string) (out *Up
 	defer observeStoreOp(ctx, "get_upload_by_path", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
-		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
+		total_size, part_size, parts_total, expected_revision, status, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
 		FROM uploads WHERE target_path = ? AND status IN ('INITIATED', 'UPLOADING') AND expires_at > ?
 		ORDER BY created_at DESC LIMIT 1`, targetPath, time.Now().UTC())
@@ -902,7 +904,7 @@ func (s *Store) ListUploadsByPath(ctx context.Context, targetPath string, status
 	defer observeStoreOp(ctx, "list_uploads_by_path", start, &err)
 
 	rows, err := s.db.QueryContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
-		total_size, part_size, parts_total, status, fingerprint_sha256, idempotency_key,
+		total_size, part_size, parts_total, expected_revision, status, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
 		FROM uploads WHERE target_path = ? AND status = ?
 		ORDER BY created_at DESC`, targetPath, status)
@@ -1055,9 +1057,10 @@ func nilBytes(b []byte) any {
 func scanUpload(s scanner) (*Upload, error) {
 	var u Upload
 	var fingerprint, idempotencyKey sql.NullString
+	var expectedRevision sql.NullInt64
 	var createdAt, updatedAt, expiresAt time.Time
 	err := s.Scan(&u.UploadID, &u.FileID, &u.TargetPath, &u.S3UploadID, &u.S3Key,
-		&u.TotalSize, &u.PartSize, &u.PartsTotal, &u.Status,
+		&u.TotalSize, &u.PartSize, &u.PartsTotal, &expectedRevision, &u.Status,
 		&fingerprint, &idempotencyKey,
 		&createdAt, &updatedAt, &expiresAt)
 	if err != nil {
@@ -1068,6 +1071,10 @@ func scanUpload(s scanner) (*Upload, error) {
 	}
 	u.FingerprintSHA = fingerprint.String
 	u.IdempotencyKey = idempotencyKey.String
+	if expectedRevision.Valid {
+		rev := expectedRevision.Int64
+		u.ExpectedRevision = &rev
+	}
 	u.CreatedAt = createdAt.UTC()
 	u.UpdatedAt = updatedAt.UTC()
 	u.ExpiresAt = expiresAt.UTC()
@@ -1081,6 +1088,13 @@ func nullStr(s string) interface{} {
 		return nil
 	}
 	return s
+}
+
+func nullInt64Ptr(v *int64) interface{} {
+	if v == nil {
+		return nil
+	}
+	return *v
 }
 
 func nilTime(t *time.Time) interface{} {

@@ -15,25 +15,26 @@ import (
 
 // PatchPlan mirrors the server's response for a PATCH request.
 type PatchPlan struct {
-	UploadID    string            `json:"upload_id"`
-	PartSize    int64             `json:"part_size"`
-	UploadParts []*PatchPartURL   `json:"upload_parts"`
-	CopiedParts []int             `json:"copied_parts"`
+	UploadID    string          `json:"upload_id"`
+	PartSize    int64           `json:"part_size"`
+	UploadParts []*PatchPartURL `json:"upload_parts"`
+	CopiedParts []int           `json:"copied_parts"`
 }
 
 // PatchPartURL describes one dirty part the client must upload.
 type PatchPartURL struct {
-	Number    int               `json:"number"`
-	URL       string            `json:"url"`
-	Size      int64             `json:"size"`
-	Headers   map[string]string `json:"headers,omitempty"`
-	ExpiresAt string            `json:"expires_at"`
+	Number      int               `json:"number"`
+	URL         string            `json:"url"`
+	Size        int64             `json:"size"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	ExpiresAt   string            `json:"expires_at"`
 	ReadURL     string            `json:"read_url,omitempty"`
 	ReadHeaders map[string]string `json:"read_headers,omitempty"`
 }
 
 type patchOptions struct {
-	partSize int64
+	partSize         int64
+	expectedRevision *int64
 }
 
 // PatchOption configures a PatchFile call.
@@ -43,6 +44,12 @@ type PatchOption func(*patchOptions)
 // dirty-part tracking. If omitted the server picks adaptively.
 func WithPartSize(ps int64) PatchOption {
 	return func(o *patchOptions) { o.partSize = ps }
+}
+
+// WithExpectedRevision requires the patch to apply only if the remote file is
+// still at the given revision when the upload is finalized.
+func WithExpectedRevision(rev int64) PatchOption {
+	return func(o *patchOptions) { o.expectedRevision = expectedRevisionField(rev) }
 }
 
 // PatchFile performs a partial update of a large file using S3 UploadPartCopy
@@ -70,6 +77,9 @@ func (c *Client) PatchFile(ctx context.Context, path string, newSize int64, dirt
 	}
 	if po.partSize > 0 {
 		patchReq["part_size"] = po.partSize
+	}
+	if po.expectedRevision != nil {
+		patchReq["expected_revision"] = *po.expectedRevision
 	}
 	reqBody, err := json.Marshal(patchReq)
 	if err != nil {

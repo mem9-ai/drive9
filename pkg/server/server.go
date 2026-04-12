@@ -467,6 +467,11 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
+	expectedRevision, err := parseExpectedRevisionHeader(r.Header.Get("X-Dat9-Expected-Revision"))
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, "invalid X-Dat9-Expected-Revision header")
+		return
+	}
 	actualCL := r.ContentLength
 	cl := actualCL
 	if h := r.Header.Get("X-Dat9-Content-Length"); h != "" {
@@ -505,7 +510,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusBadRequest, "missing X-Dat9-Part-Checksums header")
 			return
 		}
-		plan, err := b.InitiateUploadWithChecksums(r.Context(), path, cl, partChecksums)
+		plan, err := b.InitiateUploadWithChecksumsIfRevision(r.Context(), path, cl, partChecksums, expectedRevision)
 		if err != nil {
 			if errors.Is(err, backend.ErrUploadTooLarge) {
 				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_upload_too_large", "path", path, "error", err)...)
@@ -527,6 +532,12 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			}
 			if errors.Is(err, datastore.ErrUploadConflict) {
 				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_upload_conflict", "path", path, "error", err)...)
+				metricEvent(r.Context(), "fs_write", "result", "conflict")
+				errJSON(w, http.StatusConflict, err.Error())
+				return
+			}
+			if errors.Is(err, datastore.ErrRevisionConflict) {
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_upload_revision_conflict", "path", path, "error", err)...)
 				metricEvent(r.Context(), "fs_write", "result", "conflict")
 				errJSON(w, http.StatusConflict, err.Error())
 				return
@@ -558,7 +569,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		errJSON(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}
-	_, err = b.WriteCtx(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate)
+	_, err = b.WriteCtxIfRevision(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, expectedRevision)
 	if err != nil {
 		if errors.Is(err, backend.ErrUploadTooLarge) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_too_large_backend", "path", path, "error", err)...)
@@ -570,6 +581,12 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_storage_quota_exceeded", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSON(w, http.StatusInsufficientStorage, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrRevisionConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_conflict", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", "conflict")
+			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_failed", "path", path, "error", err)...)
@@ -592,9 +609,10 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 	}
 
 	var req struct {
-		NewSize    int64 `json:"new_size"`
-		DirtyParts []int `json:"dirty_parts"`
-		PartSize   int64 `json:"part_size,omitempty"`
+		NewSize          int64  `json:"new_size"`
+		DirtyParts       []int  `json:"dirty_parts"`
+		PartSize         int64  `json:"part_size,omitempty"`
+		ExpectedRevision *int64 `json:"expected_revision,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_bad_body", "path", path, "error", err)...)
@@ -616,8 +634,16 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 		errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
 		return
 	}
+	if req.ExpectedRevision != nil && *req.ExpectedRevision < 0 {
+		errJSON(w, http.StatusBadRequest, "expected_revision must be >= 0")
+		return
+	}
+	expectedRevision := int64(-1)
+	if req.ExpectedRevision != nil {
+		expectedRevision = *req.ExpectedRevision
+	}
 
-	plan, err := b.InitiatePatchUpload(r.Context(), path, req.NewSize, req.DirtyParts, req.PartSize)
+	plan, err := b.InitiatePatchUploadIfRevision(r.Context(), path, req.NewSize, req.DirtyParts, req.PartSize, expectedRevision)
 	if err != nil {
 		if errors.Is(err, backend.ErrUploadTooLarge) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_too_large", "path", path, "error", err)...)
@@ -633,6 +659,12 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 		}
 		if errors.Is(err, datastore.ErrUploadConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_conflict", "path", path)...)
+			metricEvent(r.Context(), "fs_patch", "result", "conflict")
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrRevisionConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_revision_conflict", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_patch", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
@@ -860,9 +892,10 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b *backend.Dat9Backend) {
 	var req struct {
-		Path          string   `json:"path"`
-		TotalSize     int64    `json:"total_size"`
-		PartChecksums []string `json:"part_checksums"`
+		Path             string   `json:"path"`
+		TotalSize        int64    `json:"total_size"`
+		PartChecksums    []string `json:"part_checksums"`
+		ExpectedRevision *int64   `json:"expected_revision,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		var maxErr *http.MaxBytesError
@@ -890,6 +923,10 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 		errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
 		return
 	}
+	if req.ExpectedRevision != nil && *req.ExpectedRevision < 0 {
+		errJSON(w, http.StatusBadRequest, "expected_revision must be >= 0")
+		return
+	}
 	partChecksums, err := validatePartChecksums(req.PartChecksums)
 	if err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_bad_checksums", "path", req.Path, "error", err)...)
@@ -903,7 +940,11 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 		errJSON(w, http.StatusBadRequest, "missing part_checksums")
 		return
 	}
-	plan, err := b.InitiateUploadWithChecksums(r.Context(), req.Path, req.TotalSize, partChecksums)
+	expectedRevision := int64(-1)
+	if req.ExpectedRevision != nil {
+		expectedRevision = *req.ExpectedRevision
+	}
+	plan, err := b.InitiateUploadWithChecksumsIfRevision(r.Context(), req.Path, req.TotalSize, partChecksums, expectedRevision)
 	if err != nil {
 		if errors.Is(err, backend.ErrUploadTooLarge) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_too_large_backend", "path", req.Path, "error", err)...)
@@ -925,6 +966,12 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 		}
 		if errors.Is(err, datastore.ErrUploadConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_conflict", "path", req.Path, "error", err)...)
+			metricEvent(r.Context(), "fs_write", "result", "conflict")
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrRevisionConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_revision_conflict", "path", req.Path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
@@ -984,6 +1031,12 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 		}
 		if errors.Is(err, datastore.ErrUploadNotActive) || errors.Is(err, datastore.ErrPathConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_conflict", "upload_id", uploadID, "error", err)...)
+			metricEvent(r.Context(), "upload_complete", "result", "conflict")
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrRevisionConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_revision_conflict", "upload_id", uploadID, "error", err)...)
 			metricEvent(r.Context(), "upload_complete", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
@@ -1125,6 +1178,18 @@ func validatePartChecksums(parts []string) ([]string, error) {
 	return out, nil
 }
 
+func parseExpectedRevisionHeader(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return -1, nil
+	}
+	rev, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || rev < 0 {
+		return 0, fmt.Errorf("invalid expected revision")
+	}
+	return rev, nil
+}
+
 func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploadID string) {
 	b := backendFromRequest(r)
 	if b == nil {
@@ -1186,8 +1251,9 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req struct {
-		Path      string `json:"path"`
-		TotalSize int64  `json:"total_size"`
+		Path             string `json:"path"`
+		TotalSize        int64  `json:"total_size"`
+		ExpectedRevision *int64 `json:"expected_revision,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		var maxErr *http.MaxBytesError
@@ -1212,7 +1278,15 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 		errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
 		return
 	}
-	plan, err := b.InitiateUploadV2(r.Context(), req.Path, req.TotalSize)
+	if req.ExpectedRevision != nil && *req.ExpectedRevision < 0 {
+		errJSON(w, http.StatusBadRequest, "expected_revision must be >= 0")
+		return
+	}
+	expectedRevision := int64(-1)
+	if req.ExpectedRevision != nil {
+		expectedRevision = *req.ExpectedRevision
+	}
+	plan, err := b.InitiateUploadV2IfRevision(r.Context(), req.Path, req.TotalSize, expectedRevision)
 	if err != nil {
 		if errors.Is(err, backend.ErrUploadTooLarge) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_too_large_backend", "path", req.Path, "error", err)...)
@@ -1228,6 +1302,12 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 		}
 		if errors.Is(err, datastore.ErrUploadConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_conflict", "path", req.Path, "error", err)...)
+			metricEvent(r.Context(), "v2_upload_initiate", "result", "conflict")
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrRevisionConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_revision_conflict", "path", req.Path, "error", err)...)
 			metricEvent(r.Context(), "v2_upload_initiate", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
@@ -1370,6 +1450,12 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 		}
 		if errors.Is(err, datastore.ErrPathConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_conflict", "upload_id", uploadID, "error", err)...)
+			metricEvent(r.Context(), "v2_upload_complete", "result", "conflict")
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrRevisionConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_revision_conflict", "upload_id", uploadID, "error", err)...)
 			metricEvent(r.Context(), "v2_upload_complete", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return

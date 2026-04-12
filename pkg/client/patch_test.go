@@ -241,3 +241,56 @@ func TestPatchFileFailsFastOnOversizePartSize(t *testing.T) {
 		t.Fatal("complete should not be attempted after patch rejection")
 	}
 }
+
+func TestPatchFileSendsExpectedRevision(t *testing.T) {
+	var gotExpected *int64
+	var completeCalled bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs/cas.bin":
+			var req struct {
+				NewSize          int64  `json:"new_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			gotExpected = req.ExpectedRevision
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(PatchPlan{
+				UploadID:    "patch-cas",
+				PartSize:    8,
+				UploadParts: []*PatchPartURL{},
+				CopiedParts: []int{1},
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/patch-cas/complete":
+			completeCalled = true
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	err := c.PatchFile(context.Background(), "/cas.bin", 8, nil,
+		func(partNumber int, partSize int64, origData []byte) ([]byte, error) {
+			t.Fatal("readPart should not be called when there are no upload parts")
+			return nil, nil
+		},
+		nil,
+		WithExpectedRevision(19))
+	if err != nil {
+		t.Fatalf("PatchFile: %v", err)
+	}
+	if gotExpected == nil || *gotExpected != 19 {
+		t.Fatalf("expected_revision = %v, want 19", gotExpected)
+	}
+	if !completeCalled {
+		t.Fatal("complete was not called")
+	}
+}

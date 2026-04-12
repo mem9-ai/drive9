@@ -68,6 +68,59 @@ func normalizeETag(etag string) string {
 // S3 returns the S3Client (nil when not configured).
 func (b *Dat9Backend) S3() s3client.S3Client { return b.s3 }
 
+func expectedRevisionPtr(expectedRevision int64) *int64 {
+	if expectedRevision < 0 {
+		return nil
+	}
+	rev := expectedRevision
+	return &rev
+}
+
+func uploadExpectedRevision(upload *datastore.Upload) int64 {
+	if upload == nil || upload.ExpectedRevision == nil {
+		return -1
+	}
+	return *upload.ExpectedRevision
+}
+
+func (b *Dat9Backend) validateUploadTargetRevision(ctx context.Context, path string, expectedRevision int64) error {
+	nf, err := b.store.Stat(ctx, path)
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			if expectedRevision > 0 {
+				return datastore.ErrRevisionConflict
+			}
+			return nil
+		}
+		return err
+	}
+	if nf.Node.IsDirectory {
+		return fmt.Errorf("is a directory: %s", path)
+	}
+	if expectedRevision == 0 {
+		return datastore.ErrRevisionConflict
+	}
+	if expectedRevision > 0 && (nf.File == nil || nf.File.Status != datastore.StatusConfirmed || nf.File.Revision != expectedRevision) {
+		return datastore.ErrRevisionConflict
+	}
+	return nil
+}
+
+func (b *Dat9Backend) cleanupFailedFinalizeUpload(ctx context.Context, upload *datastore.Upload) {
+	if upload == nil {
+		return
+	}
+	b.deleteBlobCtx(ctx, upload.S3Key)
+	if err := b.store.AbortUploadV2(ctx, upload.UploadID); err != nil {
+		logger.Warn(ctx, "backend_finalize_upload_abort_metadata_failed", zap.String("upload_id", upload.UploadID), zap.Error(err))
+	}
+	if upload.FileID != "" {
+		if err := b.store.MarkFileDeleted(ctx, upload.FileID); err != nil {
+			logger.Warn(ctx, "backend_finalize_upload_mark_file_deleted_failed", zap.String("upload_id", upload.UploadID), zap.String("file_id", upload.FileID), zap.Error(err))
+		}
+	}
+}
+
 // IsLargeFile returns true if the given size exceeds the small file threshold
 // and S3 is configured.
 func (b *Dat9Backend) IsLargeFile(size int64) bool {
@@ -77,10 +130,19 @@ func (b *Dat9Backend) IsLargeFile(size int64) bool {
 // InitiateUpload creates a multipart upload for a large file.
 // Returns an UploadPlan with presigned URLs for all parts.
 func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize int64) (*UploadPlan, error) {
-	return b.InitiateUploadWithChecksums(ctx, path, totalSize, nil)
+	return b.InitiateUploadIfRevision(ctx, path, totalSize, -1)
+}
+
+// InitiateUploadIfRevision starts a v1 multipart upload with optional CAS semantics.
+func (b *Dat9Backend) InitiateUploadIfRevision(ctx context.Context, path string, totalSize int64, expectedRevision int64) (*UploadPlan, error) {
+	return b.InitiateUploadWithChecksumsIfRevision(ctx, path, totalSize, nil, expectedRevision)
 }
 
 func (b *Dat9Backend) InitiateUploadWithChecksums(ctx context.Context, path string, totalSize int64, partChecksums []string) (*UploadPlan, error) {
+	return b.InitiateUploadWithChecksumsIfRevision(ctx, path, totalSize, partChecksums, -1)
+}
+
+func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context, path string, totalSize int64, partChecksums []string, expectedRevision int64) (*UploadPlan, error) {
 	start := time.Now()
 	if err := b.ensureUploadSizeAllowed(totalSize); err != nil {
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
@@ -97,6 +159,14 @@ func (b *Dat9Backend) InitiateUploadWithChecksums(ctx context.Context, path stri
 		err := fmt.Errorf("S3 not configured")
 		logger.Error(ctx, "backend_initiate_upload_s3_missing", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
+		return nil, err
+	}
+	if err := b.validateUploadTargetRevision(ctx, path, expectedRevision); err != nil {
+		if errors.Is(err, datastore.ErrRevisionConflict) {
+			metrics.RecordOperation("backend", "initiate_upload", "conflict", time.Since(start))
+		} else {
+			metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
+		}
 		return nil, err
 	}
 
@@ -161,18 +231,19 @@ func (b *Dat9Backend) InitiateUploadWithChecksums(ctx context.Context, path stri
 			return err
 		}
 		return b.store.InsertUploadTx(tx, &datastore.Upload{
-			UploadID:   uploadID,
-			FileID:     fileID,
-			TargetPath: path,
-			S3UploadID: mpu.UploadID,
-			S3Key:      s3Key,
-			TotalSize:  totalSize,
-			PartSize:   s3client.PartSize,
-			PartsTotal: len(parts),
-			Status:     datastore.UploadUploading,
-			CreatedAt:  now,
-			UpdatedAt:  now,
-			ExpiresAt:  now.Add(24 * time.Hour),
+			UploadID:         uploadID,
+			FileID:           fileID,
+			TargetPath:       path,
+			S3UploadID:       mpu.UploadID,
+			S3Key:            s3Key,
+			TotalSize:        totalSize,
+			PartSize:         s3client.PartSize,
+			PartsTotal:       len(parts),
+			ExpectedRevision: expectedRevisionPtr(expectedRevision),
+			Status:           datastore.UploadUploading,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+			ExpiresAt:        now.Add(24 * time.Hour),
 		})
 	}); err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
@@ -193,6 +264,11 @@ func (b *Dat9Backend) InitiateUploadWithChecksums(ctx context.Context, path stri
 // InitiateUploadV2 creates a multipart upload with adaptive part size.
 // Unlike v1, it does NOT presign any URLs — clients fetch them on demand.
 func (b *Dat9Backend) InitiateUploadV2(ctx context.Context, path string, totalSize int64) (*UploadPlanV2, error) {
+	return b.InitiateUploadV2IfRevision(ctx, path, totalSize, -1)
+}
+
+// InitiateUploadV2IfRevision starts a v2 multipart upload with optional CAS semantics.
+func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path string, totalSize int64, expectedRevision int64) (*UploadPlanV2, error) {
 	start := time.Now()
 	if err := b.ensureUploadSizeAllowed(totalSize); err != nil {
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
@@ -209,6 +285,14 @@ func (b *Dat9Backend) InitiateUploadV2(ctx context.Context, path string, totalSi
 		err := fmt.Errorf("S3 not configured")
 		logger.Error(ctx, "backend_initiate_upload_v2_s3_missing", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+		return nil, err
+	}
+	if err := b.validateUploadTargetRevision(ctx, path, expectedRevision); err != nil {
+		if errors.Is(err, datastore.ErrRevisionConflict) {
+			metrics.RecordOperation("backend", "initiate_upload_v2", "conflict", time.Since(start))
+		} else {
+			metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+		}
 		return nil, err
 	}
 
@@ -260,18 +344,19 @@ func (b *Dat9Backend) InitiateUploadV2(ctx context.Context, path string, totalSi
 			return err
 		}
 		return b.store.InsertUploadTx(tx, &datastore.Upload{
-			UploadID:   uploadID,
-			FileID:     fileID,
-			TargetPath: path,
-			S3UploadID: mpu.UploadID,
-			S3Key:      s3Key,
-			TotalSize:  totalSize,
-			PartSize:   partSize,
-			PartsTotal: len(parts),
-			Status:     datastore.UploadInitiated,
-			CreatedAt:  now,
-			UpdatedAt:  now,
-			ExpiresAt:  expiresAt,
+			UploadID:         uploadID,
+			FileID:           fileID,
+			TargetPath:       path,
+			S3UploadID:       mpu.UploadID,
+			S3Key:            s3Key,
+			TotalSize:        totalSize,
+			PartSize:         partSize,
+			PartsTotal:       len(parts),
+			ExpectedRevision: expectedRevisionPtr(expectedRevision),
+			Status:           datastore.UploadInitiated,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+			ExpiresAt:        expiresAt,
 		})
 	}); err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
@@ -571,6 +656,7 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Upload, parts []s3client.Part) error {
 	start := time.Now()
 	uploadID := upload.UploadID
+	expectedRevision := uploadExpectedRevision(upload)
 
 	// Complete S3 multipart upload (idempotent, outside transaction)
 	if err := b.s3.CompleteMultipartUpload(ctx, upload.S3Key, upload.S3UploadID, parts); err != nil {
@@ -594,20 +680,41 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		}
 
 		var existingFileID sql.NullString
-		err := tx.QueryRow(`SELECT file_id FROM file_nodes WHERE path = ?`, upload.TargetPath).Scan(&existingFileID)
+		err := tx.QueryRow(`SELECT file_id FROM file_nodes WHERE path = ? FOR UPDATE`, upload.TargetPath).Scan(&existingFileID)
 		if err == nil && existingFileID.Valid {
+			if expectedRevision == 0 {
+				return datastore.ErrRevisionConflict
+			}
 			isOverwrite = true
 			confirmedFileID = existingFileID.String
 
 			var oldRef string
-			if err := tx.QueryRow(`SELECT storage_type, storage_ref FROM files WHERE file_id = ?`, existingFileID.String).Scan(&oldStorageType, &oldRef); err == nil {
+			var currentRevision int64
+			if err := tx.QueryRow(`SELECT storage_type, storage_ref, revision FROM files WHERE file_id = ? AND status = 'CONFIRMED' FOR UPDATE`, existingFileID.String).Scan(&oldStorageType, &oldRef, &currentRevision); err == nil {
 				oldStorageRef = oldRef
+				if expectedRevision > 0 && currentRevision != expectedRevision {
+					return datastore.ErrRevisionConflict
+				}
+			} else if errors.Is(err, sql.ErrNoRows) {
+				return datastore.ErrRevisionConflict
+			} else {
+				return err
 			}
 
 			var newRev int64
-			if b.UsesDatabaseAutoEmbedding() {
+			if b.UsesDatabaseAutoEmbedding() && expectedRevision > 0 {
+				newRev, err = b.store.UpdateFileContentAutoEmbeddingIfRevisionTx(tx,
+					existingFileID.String, expectedRevision, datastore.StorageS3, upload.S3Key,
+					contentType, "", "", nil, upload.TotalSize,
+				)
+			} else if b.UsesDatabaseAutoEmbedding() {
 				newRev, err = b.store.UpdateFileContentAutoEmbeddingTx(tx,
 					existingFileID.String, datastore.StorageS3, upload.S3Key,
+					contentType, "", "", nil, upload.TotalSize,
+				)
+			} else if expectedRevision > 0 {
+				newRev, err = b.store.UpdateFileContentIfRevisionTx(tx,
+					existingFileID.String, expectedRevision, datastore.StorageS3, upload.S3Key,
 					contentType, "", "", nil, upload.TotalSize,
 				)
 			} else {
@@ -642,6 +749,9 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		}
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
+		}
+		if expectedRevision > 0 {
+			return datastore.ErrRevisionConflict
 		}
 
 		if b.UsesDatabaseAutoEmbedding() {
@@ -679,6 +789,9 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			FileID:     upload.FileID,
 			CreatedAt:  time.Now(),
 		}); err != nil {
+			if expectedRevision >= 0 && errors.Is(err, datastore.ErrPathConflict) {
+				return datastore.ErrRevisionConflict
+			}
 			return err
 		}
 		if b.UsesDatabaseAutoEmbedding() {
@@ -690,6 +803,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		return nil
 	}); err != nil {
 		logger.Error(ctx, "backend_finalize_upload_tx_failed", zap.String("upload_id", uploadID), zap.Error(err))
+		b.cleanupFailedFinalizeUpload(ctx, upload)
 		metrics.RecordOperation("backend", "finalize_upload", "error", time.Since(start))
 		return err
 	}

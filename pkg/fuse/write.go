@@ -6,10 +6,10 @@ import (
 )
 
 const (
-	defaultWriteBufferMaxSize  = 64 << 20  // 64MB per file
-	streamingWriteMaxSize      = 10 << 30  // 10GB — for sequential streaming writes
-	DefaultPartSize            = 8 << 20   // 8MB - default for v1 uploads; v2 may use adaptive sizes
-	maxPreloadSize             = 1 << 30   // 1GB - hard limit for preloading existing files into memory
+	defaultWriteBufferMaxSize = 64 << 20 // 64MB per file
+	streamingWriteMaxSize     = 10 << 30 // 10GB — for sequential streaming writes
+	DefaultPartSize           = 8 << 20  // 8MB - default for v1 uploads; v2 may use adaptive sizes
+	maxPreloadSize            = 1 << 30  // 1GB - hard limit for preloading existing files into memory
 )
 
 // LoadPartFunc is called to lazily load part data from the remote server.
@@ -27,7 +27,7 @@ type LoadPartFunc func(partNum int) ([]byte, error)
 // It is NOT thread-safe; callers must hold the FileHandle mutex.
 type WriteBuffer struct {
 	path       string
-	totalSize  int64          // current logical file size
+	totalSize  int64 // current logical file size
 	maxSize    int64
 	partSize   int64
 	parts      map[int][]byte // 0-based part index → part data
@@ -212,7 +212,6 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 	wb.parts[partIdx] = nil // will be grown as needed in Write
 	return nil
 }
-
 
 // markDirty marks all parts that overlap with [start, end) as dirty.
 func (wb *WriteBuffer) markDirty(start, end int64) {
@@ -451,6 +450,28 @@ func (wb *WriteBuffer) ReadAt(offset int64, buf []byte) int {
 func (wb *WriteBuffer) IsPartLoaded(partIdx int) bool {
 	_, ok := wb.parts[partIdx]
 	return ok
+}
+
+// CanMaterializeFull reports whether Bytes() can reconstruct the full current
+// file contents without silently zero-filling untouched remote-backed ranges.
+// This is true for new files (remoteSize == 0) and for existing files whose
+// entire retained remote prefix has been loaded into memory.
+func (wb *WriteBuffer) CanMaterializeFull() bool {
+	covered := wb.remoteSize
+	if wb.totalSize < covered {
+		covered = wb.totalSize
+	}
+	if covered <= 0 {
+		return true
+	}
+
+	numParts := int((covered + wb.partSize - 1) / wb.partSize)
+	for idx := 0; idx < numParts; idx++ {
+		if !wb.IsPartLoaded(idx) {
+			return false
+		}
+	}
+	return true
 }
 
 // Reset clears the buffer, releasing the underlying memory.
