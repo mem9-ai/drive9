@@ -11,9 +11,11 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/internal/testmysql"
+	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/semantic"
 )
 
 func TestPoolAcquireInvalidateDefersCloseUntilRelease(t *testing.T) {
@@ -197,4 +199,57 @@ func assertStoreClosed(t *testing.T, store *datastore.Store) {
 	if err := store.DB().PingContext(ctx); err == nil {
 		t.Fatal("expected store to be closed")
 	}
+}
+
+func TestPoolAutoSemanticTaskTypes(t *testing.T) {
+	var p *Pool
+	if p.AutoSemanticTaskTypes() != nil {
+		t.Fatal("nil pool should return nil task types")
+	}
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled := NewPool(PoolConfig{BackendOptions: backend.Options{}}, enc)
+	defer disabled.Close()
+	if disabled.AutoSemanticTaskTypes() != nil {
+		t.Fatal("async image extract disabled should yield nil")
+	}
+	enabled := NewPool(PoolConfig{BackendOptions: backend.Options{
+		AsyncImageExtract: backend.AsyncImageExtractOptions{Enabled: true},
+	}}, enc)
+	defer enabled.Close()
+	got := enabled.AutoSemanticTaskTypes()
+	if len(got) != 1 || got[0] != semantic.TaskTypeImgExtractText {
+		t.Fatalf("got %#v, want [img_extract_text]", got)
+	}
+
+	audioOnly := NewPool(PoolConfig{BackendOptions: backend.Options{
+		AsyncAudioExtract: backend.AsyncAudioExtractOptions{Enabled: true, Extractor: &poolDummyAudioExtractor{}},
+	}}, enc)
+	defer audioOnly.Close()
+	gotAudio := audioOnly.AutoSemanticTaskTypes()
+	if len(gotAudio) != 1 || gotAudio[0] != semantic.TaskTypeAudioExtractText {
+		t.Fatalf("got %#v, want [audio_extract_text]", gotAudio)
+	}
+
+	both := NewPool(PoolConfig{BackendOptions: backend.Options{
+		AsyncImageExtract: backend.AsyncImageExtractOptions{Enabled: true},
+		AsyncAudioExtract: backend.AsyncAudioExtractOptions{Enabled: true, Extractor: &poolDummyAudioExtractor{}},
+	}}, enc)
+	defer both.Close()
+	gotBoth := both.AutoSemanticTaskTypes()
+	if len(gotBoth) != 2 || gotBoth[0] != semantic.TaskTypeImgExtractText || gotBoth[1] != semantic.TaskTypeAudioExtractText {
+		t.Fatalf("got %#v, want [img_extract_text audio_extract_text]", gotBoth)
+	}
+}
+
+type poolDummyAudioExtractor struct{}
+
+func (poolDummyAudioExtractor) ExtractAudioText(context.Context, backend.AudioExtractRequest) (string, error) {
+	return "", nil
 }

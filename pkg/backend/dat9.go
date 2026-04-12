@@ -55,6 +55,13 @@ type Dat9Backend struct {
 	imageExtractTimeout time.Duration
 	imageExtractMaxSize int64
 	maxExtractTextBytes int
+
+	// Durable audio transcript extraction (semantic_tasks only; no local queue).
+	audioExtractEnabled      bool
+	audioExtractor           AudioTextExtractor
+	audioExtractTimeout      time.Duration
+	audioExtractMaxSize      int64
+	maxAudioExtractTextBytes int
 }
 
 func newBaseBackend(store *datastore.Store) *Dat9Backend {
@@ -364,10 +371,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			return err
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			if b.hasAsyncImageTextSource(path, contentType) {
-				return b.enqueueImgExtractTaskTx(tx, fileID, 1, path, contentType)
-			}
-			return nil
+			return b.enqueueTiDBAutoSemanticTasksTx(tx, fileID, 1, path, contentType)
 		}
 		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText) {
 			return b.enqueueEmbedTaskTx(tx, fileID, 1)
@@ -462,10 +466,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 			return txErr
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			if b.hasAsyncImageTextSource(nf.Node.Path, contentType) {
-				return b.enqueueImgExtractTaskTx(tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
-			}
-			return nil
+			return b.enqueueTiDBAutoSemanticTasksTx(tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
 		}
 		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText) {
 			return b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
