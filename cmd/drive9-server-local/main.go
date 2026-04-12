@@ -141,6 +141,18 @@ func main() {
 	defer b.Close()
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_local_backend")
 
+	if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
+		Backend:          b,
+		LocalS3:          localS3,
+		S3Dir:            s3Dir,
+		MaxUploadBytes:   maxUploadBytes,
+		Logger:           srvLogger,
+		SemanticEmbedder: semanticEmbedder,
+		SemanticWorkers:  workerOpts,
+	}, backendOpts, true); err != nil {
+		die(err)
+	}
+
 	stepStart = time.Now()
 	srv := server.NewWithConfig(server.Config{
 		Backend:          b,

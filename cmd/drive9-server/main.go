@@ -161,6 +161,22 @@ func main() {
 		defer pool.Close()
 	}
 
+	if pool != nil {
+		if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
+			Meta:             store,
+			Pool:             pool,
+			Provisioner:      provisioner,
+			TokenSecret:      tokenSecret,
+			S3Dir:            s3Dir,
+			MaxUploadBytes:   maxUploadBytes,
+			Logger:           srvLogger,
+			SemanticEmbedder: semanticEmbedder,
+			SemanticWorkers:  semanticWorkerOpts,
+		}, backendOptions, false); err != nil {
+			die(err)
+		}
+	}
+
 	die(server.NewWithConfig(server.Config{
 		Meta:             store,
 		Pool:             pool,

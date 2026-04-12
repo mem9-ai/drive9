@@ -234,27 +234,18 @@ This boundary is intentional. In Phase 1, the upload completion path does not in
 
 Those approaches would all expand the transaction boundary and implementation complexity significantly, weakening the "minimal shippable closure" that the proposal is trying to preserve.
 
-The recommended Phase 1 supported set should remain conservative, for example:
+The **shipped Phase 1 MVP** keeps the supported audio set intentionally small (MP3 + WAV only), matching the current allowlist and tests (for example `.m4a` must not enqueue `audio_extract_text` in this phase):
 
-- MIME:
+- MIME (after platform alias normalization where applicable):
   - `audio/mpeg`
-  - `audio/wav`
-  - `audio/x-wav`
-  - `audio/mp4`
-  - `audio/x-m4a`
-  - `audio/aac`
-  - `audio/ogg`
-  - `audio/webm`
-  - `audio/flac`
+  - `audio/wav` (including common synonyms normalized to this value, such as `audio/wave`, `audio/x-wav`, `audio/vnd.wave`, `audio/x-pn-wav`)
 - extensions:
   - `.mp3`
   - `.wav`
-  - `.m4a`
-  - `.aac`
-  - `.ogg`
-  - `.flac`
 
-This also implies a clear limitation: some files that are truly audio, but lack reliable MIME and also lack standard extensions, may not enter the audio semantic retrieval closure in Phase 1. This limitation is stronger on multipart upload completion, because that path guarantees only extension-level recognition in the current phase. This is acceptable for now; if higher recognition rates are needed later, they should be handled as a separate enhancement.
+**Deferred (post‑MVP in this codebase):** formats such as M4A/AAC, OGG, FLAC, WebM, and their MIME aliases remain out of the Phase 1 closure until allowlist, sniffing, and negative tests are extended together. The implementation carries TODOs / comments for re‑enabling those paths without expanding the transaction or completion contract in Phase 1.
+
+This also implies a clear limitation: some files that are truly audio, but lack reliable MIME and also lack standard extensions, may not enter the audio semantic retrieval closure in Phase 1. This limitation is stronger on multipart upload completion, because that path guarantees only extension-based recognition in the current phase. This is acceptable for now; if higher recognition rates are needed later, they should be handled as a separate enhancement.
 
 ### 6. The Audio Handler Should Reuse the Overall Structure of the Image Handler
 

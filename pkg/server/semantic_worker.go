@@ -95,6 +95,38 @@ func (o *SemanticWorkerOptions) normalize() {
 	}
 }
 
+// SemanticWorkerWillRun reports whether NewWithConfig would construct a non-nil
+// semantic worker manager for cfg. It mirrors newSemanticWorkerManager viability
+// without starting background goroutines.
+func SemanticWorkerWillRun(cfg Config) bool {
+	return newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers) != nil
+}
+
+// ValidateDurableAsyncExtractRequiresSemanticWorker returns an error when async
+// image or audio extraction runtimes are enabled on the backend template (so
+// durable TiDB-auto semantic tasks may be enqueued for matching tenants) but the
+// semantic worker would not start for cfg.
+//
+// When localTiDBAutoOnly is true, validation applies only if
+// template.DatabaseAutoEmbedding is true (drive9-server-local after resolving
+// embedding mode). When false (drive9-server with a tenant pool), the template
+// may leave DatabaseAutoEmbedding unset because per-tenant backends set it during
+// pool createBackend; in that case validation always runs when a runtime wires.
+func ValidateDurableAsyncExtractRequiresSemanticWorker(cfg Config, template backend.Options, localTiDBAutoOnly bool) error {
+	willWire := backend.AsyncImageExtractWillWireRuntime(template.AsyncImageExtract) ||
+		backend.AsyncAudioExtractWillWireRuntime(template.AsyncAudioExtract)
+	if !willWire {
+		return nil
+	}
+	if localTiDBAutoOnly && !template.DatabaseAutoEmbedding {
+		return nil
+	}
+	if SemanticWorkerWillRun(cfg) {
+		return nil
+	}
+	return fmt.Errorf("semantic worker would not start but durable async image/audio extract is enabled; configure DRIVE9_EMBED_* for app-managed embedding or fix worker/task-type routing so img_extract_text and audio_extract_text can be claimed")
+}
+
 type semanticWorkerManager struct {
 	fallback *backend.Dat9Backend
 	meta     *meta.Store
