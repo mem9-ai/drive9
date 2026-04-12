@@ -1271,8 +1271,8 @@ func TestLookupFindsPendingWriteBack(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("Lookup: %v — file should be visible from write-back cache", st)
 	}
-	if out.Attr.Size != 10 {
-		t.Fatalf("Lookup size = %d, want 10", out.Attr.Size)
+	if out.Size != 10 {
+		t.Fatalf("Lookup size = %d, want 10", out.Size)
 	}
 }
 
@@ -1293,7 +1293,7 @@ func TestOpenWritable_PreloadsFromWriteBackCache(t *testing.T) {
 				return
 			}
 			// Return stale server data
-			w.Write([]byte("stale"))
+			_, _ = w.Write([]byte("stale"))
 		case http.MethodPut:
 			_, _ = io.ReadAll(r.Body)
 			w.WriteHeader(http.StatusOK)
@@ -1736,7 +1736,7 @@ func TestPreload_LazyLoad_SmallFile(t *testing.T) {
 			}
 			readCalls.Add(1)
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(fileData)))
-			w.Write(fileData)
+			_, _ = w.Write(fileData)
 		default:
 			w.WriteHeader(http.StatusOK)
 		}

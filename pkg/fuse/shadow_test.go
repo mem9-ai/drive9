@@ -15,7 +15,7 @@ func TestShadowStoreWriteExtentsReadAt(t *testing.T) {
 
 	// Create a write buffer with some dirty data.
 	wb := NewWriteBuffer("/test/file.txt", 0, 0)
-	wb.Write(0, []byte("hello world"))
+	_, _ = wb.Write(0, []byte("hello world"))
 
 	// Write extents to shadow.
 	if err := ss.WriteExtents("/test/file.txt", wb, 42); err != nil {
@@ -56,8 +56,8 @@ func TestShadowStorePartialWrite(t *testing.T) {
 
 	// Write buffer with data in two separate parts.
 	wb := NewWriteBuffer("/partial.txt", 0, 1024) // 1KB part size
-	wb.Write(0, bytes.Repeat([]byte("A"), 1024))   // Part 0 — full
-	wb.Write(1024, bytes.Repeat([]byte("B"), 500))  // Part 1 — partial
+	_, _ = wb.Write(0, bytes.Repeat([]byte("A"), 1024))   // Part 0 — full
+	_, _ = wb.Write(1024, bytes.Repeat([]byte("B"), 500))  // Part 1 — partial
 
 	if err := ss.WriteExtents("/partial.txt", wb, 1); err != nil {
 		t.Fatal(err)
@@ -93,8 +93,8 @@ func TestShadowStoreRemove(t *testing.T) {
 	defer ss.Close()
 
 	wb := NewWriteBuffer("/remove.txt", 0, 0)
-	wb.Write(0, []byte("data"))
-	ss.WriteExtents("/remove.txt", wb, 1)
+	_, _ = wb.Write(0, []byte("data"))
+	_ = ss.WriteExtents("/remove.txt", wb, 1)
 
 	if !ss.Has("/remove.txt") {
 		t.Error("expected shadow file to exist")
@@ -116,8 +116,8 @@ func TestShadowStoreRename(t *testing.T) {
 	defer ss.Close()
 
 	wb := NewWriteBuffer("/old.txt", 0, 0)
-	wb.Write(0, []byte("renamed"))
-	ss.WriteExtents("/old.txt", wb, 1)
+	_, _ = wb.Write(0, []byte("renamed"))
+	_ = ss.WriteExtents("/old.txt", wb, 1)
 
 	ok := ss.Rename("/old.txt", "/new.txt")
 	if !ok {
@@ -147,8 +147,8 @@ func TestShadowStoreReadAll(t *testing.T) {
 	defer ss.Close()
 
 	wb := NewWriteBuffer("/readall.txt", 0, 0)
-	wb.Write(0, []byte("full content"))
-	ss.WriteExtents("/readall.txt", wb, 1)
+	_, _ = wb.Write(0, []byte("full content"))
+	_ = ss.WriteExtents("/readall.txt", wb, 1)
 
 	data, err := ss.ReadAll("/readall.txt")
 	if err != nil {

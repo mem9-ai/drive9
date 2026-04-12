@@ -251,4 +251,14 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry) {
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
 	cq.removeFromQueue(entry)
+
+	// Clean up local state to prevent infinite retry loop on restart.
+	// The data is either stale (conflict) or unrecoverable (max retries).
+	if cq.shadows != nil {
+		cq.shadows.Remove(entry.Path)
+	}
+	if cq.index != nil {
+		cq.index.Remove(entry.Path)
+	}
+	log.Printf("commit queue: terminal failure for %s, local state cleaned up", entry.Path)
 }

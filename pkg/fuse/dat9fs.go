@@ -313,7 +313,7 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 	if fh.Dirty == nil {
 		return nil
 	}
-	if !(fh.ShadowReady || fh.IsNew || fh.Dirty.CanMaterializeFull()) {
+	if !fh.ShadowReady && !fh.IsNew && !fh.Dirty.CanMaterializeFull() {
 		return syscall.ENOTSUP
 	}
 	return fs.writeBack.PutWithBaseRev(

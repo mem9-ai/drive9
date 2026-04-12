@@ -216,7 +216,11 @@ func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
 	// Write new .meta with updated path and fresh generation.
 	meta.Path = newPath
 	meta.Generation = c.nextGen.Add(1)
-	metaBytes, _ := json.Marshal(meta)
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		_ = os.Rename(newDat, oldDat)
+		return false
+	}
 	newMeta := c.metaFile(newPath)
 	if err := atomicWrite(newMeta, metaBytes); err != nil {
 		// Restore .dat to old location on meta-write failure.
@@ -343,7 +347,7 @@ func fsyncDir(dir string) error {
 		return err
 	}
 	err = d.Sync()
-	d.Close()
+	_ = d.Close()
 	return err
 }
 

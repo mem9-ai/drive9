@@ -29,14 +29,16 @@ func TestJournalAppendReplay(t *testing.T) {
 	if err := j.Fsync(); err != nil {
 		t.Fatal(err)
 	}
-	j.Close()
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Replay from a new journal instance.
 	j2, err := NewJournal(jPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer j2.Close()
+	defer func() { _ = j2.Close() }()
 
 	var replayed []JournalEntry
 	err = j2.Replay(func(e JournalEntry) {
@@ -98,7 +100,9 @@ func TestJournalCompact(t *testing.T) {
 	if replayed[0].Path != "/b.txt" {
 		t.Errorf("after compact: path = %q, want /b.txt", replayed[0].Path)
 	}
-	j.Close()
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestJournalEmptyReplay(t *testing.T) {
@@ -109,7 +113,7 @@ func TestJournalEmptyReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer j.Close()
+	defer func() { _ = j.Close() }()
 
 	var count int
 	err = j.Replay(func(e JournalEntry) {

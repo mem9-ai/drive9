@@ -95,9 +95,7 @@ func ResolveMode(mode SyncMode, serverURL string) SyncMode {
 // ApplyInteractiveProfile configures MountOptions for interactive editing
 // workloads (vim, VSCode, JetBrains).
 func ApplyInteractiveProfile(opts *MountOptions) {
-	if opts.SyncMode == SyncAuto {
-		// Will be resolved at mount time.
-	}
+	// SyncMode == SyncAuto is resolved at mount time; no override needed here.
 	if opts.AttrTTL <= 0 {
 		opts.AttrTTL = 1 * time.Second
 	}

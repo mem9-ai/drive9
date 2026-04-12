@@ -34,12 +34,14 @@ func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
-	cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/ok.txt",
 		BaseRev: 7,
 		Size:    4,
 		Kind:    PendingOverwrite,
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	cq.DrainAll()
 
 	if gotExpected != "7" {
@@ -79,22 +81,26 @@ func TestCommitQueueConflictKeepsPendingState(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
-	cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/conflict.txt",
 		BaseRev: 3,
 		Size:    4,
 		Kind:    PendingOverwrite,
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	cq.DrainAll()
 
 	if calls != 1 {
 		t.Fatalf("conflict should stop retries after first attempt, got %d calls", calls)
 	}
-	if !pending.HasPending("/conflict.txt") {
-		t.Fatal("pending entry should remain after conflict")
+	// Terminal failure cleans up shadow and pending index to prevent
+	// infinite retry loop on restart.
+	if pending.HasPending("/conflict.txt") {
+		t.Fatal("pending entry should be cleaned up after terminal conflict")
 	}
-	if !shadow.Has("/conflict.txt") {
-		t.Fatal("shadow should remain after conflict")
+	if shadow.Has("/conflict.txt") {
+		t.Fatal("shadow should be cleaned up after terminal conflict")
 	}
 	if got := cq.Pending(); got != 0 {
 		t.Fatalf("queue pending count = %d, want 0 after terminal conflict", got)

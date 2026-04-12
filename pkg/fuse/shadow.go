@@ -270,12 +270,12 @@ func (s *ShadowStore) ReadAt(remotePath string, offset int64, buf []byte) (int, 
 		s.mu.Lock()
 		// Re-check after acquiring write lock.
 		if existingSf, exists := s.files[remotePath]; exists {
-			fd.Close()
+			_ = fd.Close()
 			sf = existingSf
 		} else {
 			fi, err := fd.Stat()
 			if err != nil {
-				fd.Close()
+				_ = fd.Close()
 				s.mu.Unlock()
 				return 0, fmt.Errorf("shadow stat: %w", err)
 			}
