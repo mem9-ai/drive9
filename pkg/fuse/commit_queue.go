@@ -71,19 +71,19 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 // is full (backpressure).
 func (cq *CommitQueue) Enqueue(entry *CommitEntry) error {
 	cq.mu.Lock()
+	defer cq.mu.Unlock()
 	if cq.stopped {
-		cq.mu.Unlock()
 		return fmt.Errorf("commit queue stopped")
 	}
 	if len(cq.queue) >= cq.maxPending {
-		cq.mu.Unlock()
 		return fmt.Errorf("commit queue full (%d pending)", cq.maxPending)
 	}
 	cq.queue = append(cq.queue, entry)
-	cq.mu.Unlock()
 
-	// Send to workers. The channel buffer is always > maxPending, so this
-	// will not block as long as the backpressure check above holds.
+	// Send to workers while holding the lock. The channel buffer is always
+	// > maxPending, so this will not block as long as the backpressure
+	// check above holds. Holding the lock prevents DrainAll from closing
+	// workCh between our check and the send.
 	cq.workCh <- entry
 	return nil
 }
@@ -105,13 +105,15 @@ func (cq *CommitQueue) IsFull() bool {
 // DrainAll stops accepting new entries and waits for all workers to finish.
 func (cq *CommitQueue) DrainAll() {
 	cq.mu.Lock()
-	if !cq.stopped {
-		cq.stopped = true
+	if cq.stopped {
+		cq.mu.Unlock()
+		cq.wg.Wait()
+		return
 	}
-	cq.mu.Unlock()
-
-	// Close workCh so workers exit after processing remaining entries.
+	cq.stopped = true
+	// Close workCh under the lock so no concurrent Enqueue can send after close.
 	close(cq.workCh)
+	cq.mu.Unlock()
 	cq.wg.Wait()
 }
 
@@ -126,6 +128,10 @@ func (cq *CommitQueue) RecoverPending() {
 			continue
 		}
 		if cq.shadows != nil && !cq.shadows.Has(path) {
+			// Shadow file missing — prune orphaned pending index entry so
+			// Lookup/GetAttr don't serve stale metadata.
+			log.Printf("commit queue: pruning orphaned pending entry for %s (shadow missing)", path)
+			cq.index.Remove(path)
 			continue
 		}
 		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {

@@ -864,11 +864,23 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		// Pending-overwrite files (edits to existing remote files) must NOT
 		// use this path — the original remote file still exists at oldP and
 		// requires a server-side rename after the upload completes.
+		isPendingNew := false
 		if meta, ok := fs.writeBack.GetMeta(oldP); ok && meta.Kind == PendingNew {
 			fs.writeBack.RenamePending(oldP, newP)
-			// Schedule background upload for the new path.
 			fs.uploader.Submit(newP)
-
+			isPendingNew = true
+		}
+		// Also check pendingIndex for files handed to commitQueue after Release.
+		if !isPendingNew && fs.pendingIndex != nil {
+			if meta, ok := fs.pendingIndex.GetMeta(oldP); ok && meta.Kind == PendingNew {
+				if fs.shadowStore != nil {
+					fs.shadowStore.Rename(oldP, newP)
+				}
+				fs.pendingIndex.RenamePending(oldP, newP)
+				isPendingNew = true
+			}
+		}
+		if isPendingNew {
 			fs.inodes.Rename(oldP, newP)
 			fs.readCache.Invalidate(oldP)
 			fs.readCache.InvalidatePrefix(oldP + "/")
@@ -1074,47 +1086,75 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 }
 
 // mergePendingDirEntries overlays pending write-back entries onto a directory
-// listing. Files that exist in the write-back cache but are not yet on the
-// server are added to the listing so that ls, tab-completion, and editors
-// can see them.
+// listing. Files that exist in the write-back cache or pendingIndex (commit
+// queue backed) but are not yet on the server are added to the listing so
+// that ls, tab-completion, and editors can see them.
 func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []DirEntry {
-	if fs.writeBack == nil {
-		return entries
-	}
-	pending := fs.writeBack.ListPendingPaths()
-	if len(pending) == 0 {
-		return entries
-	}
-
 	// Build set of already-listed names for dedup.
 	existing := make(map[string]struct{}, len(entries))
 	for _, e := range entries {
 		existing[e.Name] = struct{}{}
 	}
 
-	for p := range pending {
-		if parentDir(p) != dirPath {
-			continue
+	// Overlay write-back cache entries.
+	if fs.writeBack != nil {
+		for p := range fs.writeBack.ListPendingPaths() {
+			if parentDir(p) != dirPath {
+				continue
+			}
+			name := path.Base(p)
+			if _, ok := existing[name]; ok {
+				continue
+			}
+			meta, ok := fs.writeBack.GetMeta(p)
+			if !ok {
+				continue
+			}
+			mtime := meta.Mtime
+			if mtime.IsZero() {
+				mtime = time.Now()
+			}
+			ino := fs.inodes.EnsureInode(p, false, meta.Size, mtime)
+			entries = append(entries, DirEntry{
+				Name: name,
+				Ino:  ino,
+				Mode: syscall.S_IFREG,
+			})
+			existing[name] = struct{}{}
 		}
-		name := path.Base(p)
-		if _, ok := existing[name]; ok {
-			continue // already in remote listing (pending overwrite)
-		}
-		meta, ok := fs.writeBack.GetMeta(p)
-		if !ok {
-			continue
-		}
-		mtime := meta.Mtime
-		if mtime.IsZero() {
-			mtime = time.Now()
-		}
-		ino := fs.inodes.EnsureInode(p, false, meta.Size, mtime)
-		entries = append(entries, DirEntry{
-			Name: name,
-			Ino:  ino,
-			Mode: syscall.S_IFREG,
-		})
 	}
+
+	// Overlay commit-queue-backed entries from pendingIndex. These are files
+	// handed to commitQueue after Release but not yet uploaded to the server.
+	if fs.pendingIndex != nil {
+		prefix := dirPath
+		if prefix != "/" {
+			prefix += "/"
+		} else {
+			prefix = "/"
+		}
+		for _, meta := range fs.pendingIndex.ListByPrefix(prefix) {
+			if parentDir(meta.Path) != dirPath {
+				continue
+			}
+			name := path.Base(meta.Path)
+			if _, ok := existing[name]; ok {
+				continue // already listed from writeBack or remote
+			}
+			mtime := meta.Mtime
+			if mtime.IsZero() {
+				mtime = time.Now()
+			}
+			ino := fs.inodes.EnsureInode(meta.Path, false, meta.Size, mtime)
+			entries = append(entries, DirEntry{
+				Name: name,
+				Ino:  ino,
+				Mode: syscall.S_IFREG,
+			})
+			existing[name] = struct{}{}
+		}
+	}
+
 	return entries
 }
 
@@ -1704,7 +1744,8 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.St
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
-	if fs.writeBack != nil && fs.uploader != nil {
+	if fs.writeBack != nil && fs.uploader != nil && fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq {
+		// Snapshot matches current dirty state — safe to upload.
 		if err := fs.uploader.UploadSync(ctx, fh.Path); err != nil {
 			log.Printf("fsync writeback upload failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
@@ -1717,6 +1758,10 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.St
 			fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 			fh.WriteBackSeq = 0
 		}
+	} else if fs.writeBack != nil && fh.WriteBackSeq != 0 && fh.WriteBackSeq != fh.DirtySeq {
+		// Snapshot is stale — discard it so we don't upload old data.
+		fs.writeBack.Remove(fh.Path)
+		fh.WriteBackSeq = 0
 	}
 
 	return fs.flushHandleDebounced(ctx, fh, true)

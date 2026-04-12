@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -82,7 +83,7 @@ func Mount(opts *MountOptions) error {
 	dat9fs := NewDat9FS(c, opts)
 
 	// Resolve sync mode (auto-detect RTT if needed).
-	resolved := ResolveMode(opts.SyncMode, opts.Server)
+	resolved := ResolveMode(context.Background(), opts.SyncMode, opts.Server)
 	dat9fs.syncMode = resolved
 	fmt.Fprintf(os.Stderr, "dat9: sync mode: %s\n", resolved)
 

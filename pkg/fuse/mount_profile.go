@@ -56,20 +56,20 @@ const maxCommitQueuePending = 100
 
 // MeasureRTT measures the round-trip time to the server by issuing a HEAD
 // request to the root path. Returns the measured duration.
-func MeasureRTT(serverURL string) (time.Duration, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func MeasureRTT(ctx context.Context, serverURL string) (time.Duration, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, serverURL+"/", nil)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("build RTT probe request: %w", err)
 	}
 
 	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
 	rtt := time.Since(start)
 	if err != nil {
-		return rtt, err
+		return rtt, fmt.Errorf("execute RTT probe: %w", err)
 	}
 	_ = resp.Body.Close()
 	return rtt, nil
@@ -77,11 +77,11 @@ func MeasureRTT(serverURL string) (time.Duration, error) {
 
 // ResolveMode resolves SyncAuto to either SyncInteractive or SyncStrict
 // based on measured RTT to the server.
-func ResolveMode(mode SyncMode, serverURL string) SyncMode {
+func ResolveMode(ctx context.Context, mode SyncMode, serverURL string) SyncMode {
 	if mode != SyncAuto {
 		return mode
 	}
-	rtt, err := MeasureRTT(serverURL)
+	rtt, err := MeasureRTT(ctx, serverURL)
 	if err != nil {
 		// Cannot measure — assume WAN, use interactive.
 		return SyncInteractive
