@@ -234,14 +234,16 @@ This boundary is intentional. In Phase 1, the upload completion path does not in
 
 Those approaches would all expand the transaction boundary and implementation complexity significantly, weakening the "minimal shippable closure" that the proposal is trying to preserve.
 
-The **shipped Phase 1 MVP** keeps the supported audio set intentionally small (MP3 + WAV only), matching the current allowlist and tests (for example `.m4a` must not enqueue `audio_extract_text` in this phase):
+The **shipped Phase 1 MVP** keeps the supported audio set intentionally small (MP3 + WAV + `.mp4` container uploads), matching the current allowlist and tests (for example `.m4a` must not enqueue `audio_extract_text` in this phase):
 
 - MIME (after platform alias normalization where applicable):
   - `audio/mpeg`
   - `audio/wav` (including common synonyms normalized to this value, such as `audio/wave`, `audio/x-wav`, `audio/vnd.wave`, `audio/x-pn-wav`)
+  - `audio/mp4` for semantic routing, with `.mp4` container uploads commonly detected and persisted as `video/mp4`
 - extensions:
   - `.mp3`
   - `.wav`
+  - `.mp4`
 
 **Deferred (post‑MVP in this codebase):** formats such as M4A/AAC, OGG, FLAC, WebM, and their MIME aliases remain out of the Phase 1 closure until allowlist, sniffing, and negative tests are extended together. The implementation carries TODOs / comments for re‑enabling those paths without expanding the transaction or completion contract in Phase 1.
 

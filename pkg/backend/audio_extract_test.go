@@ -21,6 +21,20 @@ func (e *staticAudioExtractor) ExtractAudioText(ctx context.Context, req AudioEx
 	return e.text, nil
 }
 
+type recordingAudioExtractor struct {
+	text           string
+	err            error
+	gotContentType string
+}
+
+func (e *recordingAudioExtractor) ExtractAudioText(ctx context.Context, req AudioExtractRequest) (string, error) {
+	e.gotContentType = req.ContentType
+	if e.err != nil {
+		return "", e.err
+	}
+	return e.text, nil
+}
+
 func TestProcessAudioExtractTaskWritesContentText(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
 		DatabaseAutoEmbedding: true,
@@ -48,7 +62,7 @@ func TestProcessAudioExtractTaskWritesContentText(t *testing.T) {
 	}
 }
 
-func TestEffectiveAudioMIMEAllowlistedMP3AndWAV(t *testing.T) {
+func TestEffectiveAudioMIMEAllowlistedMP3WAVAndMP4(t *testing.T) {
 	tests := []struct {
 		path, ct, want string
 	}{
@@ -58,6 +72,10 @@ func TestEffectiveAudioMIMEAllowlistedMP3AndWAV(t *testing.T) {
 		{"/x.wav", "audio/vnd.wave", "audio/wav"},
 		{"/x.wav", "audio/x-pn-wav", "audio/wav"},
 		{"/x.wav", "audio/x-wav", "audio/x-wav"},
+		{"/x.mp4", "audio/mp4", "audio/mp4"},
+		{"/x.mp4", "video/mp4", "audio/mp4"},
+		{"/x.mp4", "application/mp4", "audio/mp4"},
+		{"/sub/clip.mp4", "application/octet-stream", "audio/mp4"},
 		{"/sub/clip.mp3", "application/octet-stream", "audio/mpeg"},
 		{"/sub/clip.wav", "application/octet-stream", "audio/wav"},
 		{"/x.m4a", "application/octet-stream", ""},
@@ -68,6 +86,37 @@ func TestEffectiveAudioMIMEAllowlistedMP3AndWAV(t *testing.T) {
 		if got != tc.want {
 			t.Fatalf("effectiveAudioMIME(%q,%q)=%q, want %q", tc.path, tc.ct, got, tc.want)
 		}
+	}
+}
+
+func TestProcessAudioExtractTaskPreservesMP4ContainerMIMEForExtractor(t *testing.T) {
+	extractor := &recordingAudioExtractor{text: "spoken mp4 transcript"}
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: extractor,
+		},
+	})
+	fileID := insertImageFileForExtractTest(t, b, "/rec/clip.mp4", "video/mp4", []byte{0x00, 0x00, 0x00, 0x18})
+	result, err := b.ProcessAudioExtractTask(context.Background(), AudioExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/rec/clip.mp4",
+		ContentType: "video/mp4",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != AudioExtractResultWritten {
+		t.Fatalf("result=%q, want %q", result, AudioExtractResultWritten)
+	}
+	if extractor.gotContentType != "video/mp4" {
+		t.Fatalf("extractor content type=%q, want video/mp4", extractor.gotContentType)
+	}
+	got := waitForContentText(t, b, "/rec/clip.mp4", time.Second)
+	if !strings.Contains(got, "mp4 transcript") {
+		t.Fatalf("unexpected content_text: %q", got)
 	}
 }
 

@@ -60,14 +60,17 @@ func (b *Dat9Backend) SupportsAsyncAudioExtract() bool {
 	return b != nil && b.audioExtractEnabled && b.audioExtractor != nil
 }
 
-// audioExtensionMIME maps path suffixes to canonical MIME types for the MVP
-// allowlist. Used only when content_type is missing or too generic.
+// audioExtensionMIME maps path suffixes to canonical MIME types for the current
+// audio_extract_text closed set. It is consulted only when content_type is
+// missing or too generic.
 //
-// Phase 2 MVP supports MP3 and WAV only. Broader formats are deferred; see
-// TODO(post-MVP audio) and TODO(WebM) below.
+// The shipped set intentionally stays small: MP3, WAV, and MP4 container
+// uploads. Broader formats remain deferred; see TODO(post-MVP audio) and
+// TODO(WebM) below.
 //
-// TODO(post-MVP audio): Restore MP4/M4A, AAC, FLAC, OGG extensions (and MIME /
+// TODO(post-MVP audio): Restore M4A, AAC, FLAC, OGG extensions (and MIME /
 // alias allowlist entries) once the extractor and tests cover them.
+//
 //	".m4a":  "audio/mp4",
 //	".aac":  "audio/aac",
 //	".ogg":  "audio/ogg",
@@ -80,14 +83,16 @@ func (b *Dat9Backend) SupportsAsyncAudioExtract() bool {
 var audioExtensionMIME = map[string]string{
 	".mp3": "audio/mpeg",
 	".wav": "audio/wav",
+	".mp4": "audio/mp4",
 }
 
-// allowedAudioMIME is the MVP closed set for durable audio_extract_text.
-// Phase 2: MP3 and WAV only (see TODO(post-MVP audio) on audioExtensionMIME).
+// allowedAudioMIME is the current closed set for durable audio_extract_text.
+// MP4 container uploads are admitted here even though detectContentType()
+// commonly reports video/mp4 for .mp4 paths.
 //
-// TODO(post-MVP audio): Re-add closed-set entries for MP4/M4A, AAC, OGG, FLAC
+// TODO(post-MVP audio): Re-add closed-set entries for M4A, AAC, OGG, FLAC
 // (and aliases such as audio/mp4a-latm) when those formats return to scope.
-//	"audio/mp4":   {},
+//
 //	"audio/x-m4a": {},
 //	"audio/aac":   {},
 //	"audio/ogg":   {},
@@ -98,6 +103,7 @@ var allowedAudioMIME = map[string]struct{}{
 	"audio/mpeg":  {},
 	"audio/wav":   {},
 	"audio/x-wav": {},
+	"audio/mp4":   {},
 }
 
 func stripMIMEParams(ct string) string {
@@ -109,15 +115,18 @@ func stripMIMEParams(ct string) string {
 }
 
 // normalizeStdlibAudioMIMEAliases maps Go mime.TypeByExtension and common
-// platform MIME-info aliases onto the MVP allowlist keys (see allowedAudioMIME).
+// platform MIME-info aliases onto the current allowlist keys (see
+// allowedAudioMIME).
 //
 // Linux loads extension MIME from freedesktop globs2 before /etc/mime.types.
 // Typical mappings include audio/vnd.wave (preferred in shared-mime-info2.3+),
 // audio/wave, and audio/x-wav; only some of those are in allowedAudioMIME.
 // Canonicalize WAV synonyms to audio/wav so enqueue and task payloads match
-// across macOS vs Ubuntu CI.
+// across macOS vs Ubuntu CI. Also canonicalize MP4 container MIME variants so
+// semantic routing can treat .mp4 uploads as audio_extract_text candidates
+// without changing detectContentType().
 //
-// TODO(post-MVP audio): When MP4/M4A, AAC, and FLAC are allowlisted again,
+// TODO(post-MVP audio): When M4A, AAC, and FLAC are allowlisted again,
 // restore alias normalization, for example:
 //
 //	switch ct {
@@ -135,6 +144,8 @@ func normalizeStdlibAudioMIMEAliases(ct string) string {
 	switch ct {
 	case "audio/wave", "audio/vnd.wave", "audio/x-pn-wav":
 		return "audio/wav"
+	case "video/mp4", "application/mp4":
+		return "audio/mp4"
 	default:
 		return ct
 	}
@@ -205,6 +216,27 @@ func resolvedAudioMIMEForHandler(path, storedContentType, payloadContentType str
 	return ""
 }
 
+// resolvedAudioExtractContentType chooses the MIME sent to the pluggable
+// extractor after the handler has already decided the revision is a supported
+// audio source.
+//
+// Semantic routing canonicalizes MP4 containers to audio/mp4 for stable
+// eligibility checks, but OpenAI-compatible ASR providers often expect the
+// original part-level container MIME (commonly video/mp4) for .mp4 uploads.
+func resolvedAudioExtractContentType(storedContentType, payloadContentType, resolvedAudioMIME string) string {
+	resolved := strings.TrimSpace(resolvedAudioMIME)
+	if resolved == "" {
+		return ""
+	}
+	for _, candidate := range []string{storedContentType, payloadContentType} {
+		switch stripMIMEParams(candidate) {
+		case "video/mp4", "application/mp4":
+			return stripMIMEParams(candidate)
+		}
+	}
+	return resolved
+}
+
 // ProcessAudioExtractTask runs transcript extraction for one durable
 // audio_extract_text task. Terminal business outcomes return a nil error; runtime
 // misconfiguration and transient failures return a retryable error.
@@ -230,6 +262,10 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 	if resolvedMIME == "" {
 		return AudioExtractResultNotAudio, nil
 	}
+	extractorContentType := resolvedAudioExtractContentType(f.ContentType, task.ContentType, resolvedMIME)
+	if extractorContentType == "" {
+		extractorContentType = resolvedMIME
+	}
 
 	data, err := b.loadAudioBytesForExtract(ctx, f)
 	if err != nil {
@@ -243,7 +279,7 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 	text, err := b.audioExtractor.ExtractAudioText(taskCtx, AudioExtractRequest{
 		FileID:      task.FileID,
 		Path:        task.Path,
-		ContentType: resolvedMIME,
+		ContentType: extractorContentType,
 		Data:        data,
 	})
 	cancel()

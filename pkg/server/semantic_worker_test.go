@@ -296,6 +296,53 @@ func TestSemanticWorkerProcessesAudioExtractTaskWithoutEmbedder(t *testing.T) {
 	}
 }
 
+func TestSemanticWorkerProcessesMP4AudioExtractTaskWithoutEmbedder(t *testing.T) {
+	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: backend.AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: staticServerAudioExtractor{text: "hello from mp4 audio worker"},
+		},
+	})
+	fileID := insertServerImageFileForExtractTest(t, b, "/rec/worker.mp4", "video/mp4", []byte{0x00, 0x00, 0x00, 0x18})
+	payload, err := json.Marshal(semantic.AudioExtractTaskPayload{Path: "/rec/worker.mp4", ContentType: "video/mp4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := b.Store().EnqueueSemanticTask(context.Background(), &semantic.Task{
+		TaskID:          "audio-mp4-task-1",
+		TaskType:        semantic.TaskTypeAudioExtractText,
+		ResourceID:      fileID,
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     now,
+		PayloadJSON:     payload,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewWithConfig(Config{Backend: b, SemanticWorkers: SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
+	}})
+	t.Cleanup(func() { s.Close() })
+	if s.semanticWorker == nil {
+		t.Fatal("expected semantic worker to start for auto audio tasks")
+	}
+
+	waitForContentTextOnServer(t, b, "/rec/worker.mp4", "hello from mp4 audio", 3*time.Second)
+	waitForNamedTaskStatus(t, b, "audio-mp4-task-1", string(semantic.TaskSucceeded), 3*time.Second)
+	if tasks := loadSemanticTaskRowsForResource(t, b, fileID); len(tasks) != 1 || tasks[0].TaskType != string(semantic.TaskTypeAudioExtractText) {
+		t.Fatalf("unexpected semantic task rows: %+v", tasks)
+	}
+}
+
 func TestSemanticWorkerKeepsBorrowedTenantBackendAliveDuringInvalidate(t *testing.T) {
 	initServerTenantSchema(t, testDSN)
 	metaStore, err := meta.Open(testDSN)
