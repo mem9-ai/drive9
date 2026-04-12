@@ -2,12 +2,22 @@ package fuse
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+)
+
+// Exponential backoff constants for upload retries.
+const (
+	uploadBackoffBase = 200 * time.Millisecond
+	uploadBackoffMax  = 30 * time.Second
+	uploadMaxRetries  = 3
 )
 
 // uploadTimeout is the per-file timeout for background write-back uploads.
@@ -16,6 +26,8 @@ const uploadTimeout = 60 * time.Second
 // submitTimeout is the maximum time Submit will block waiting for channel space
 // before falling back to a synchronous upload in the calling goroutine.
 const submitTimeout = 5 * time.Second
+
+var errWriteBackBaseRevisionRequired = errors.New("writeback base revision required")
 
 // pathState tracks per-path in-flight upload state so that callers can wait
 // for completion and concurrent uploads of the same path are serialized.
@@ -115,10 +127,32 @@ func (u *WriteBackUploader) DrainAll() {
 // previous session and submits them for upload.
 func (u *WriteBackUploader) RecoverPending() {
 	entries := u.cache.ListPending()
+	skippedLegacyOverwrites := 0
 	for _, e := range entries {
+		if e.Meta.Kind == PendingOverwrite && e.Meta.BaseRev <= 0 {
+			skippedLegacyOverwrites++
+			log.Printf("writeback: skipping legacy overwrite without base revision for %s", e.Meta.Path)
+			continue
+		}
 		log.Printf("writeback: recovering pending upload for %s (%d bytes)", e.Meta.Path, e.Meta.Size)
 		u.Submit(e.Meta.Path)
 	}
+	if skippedLegacyOverwrites > 0 {
+		log.Printf("writeback: skipped %d legacy overwrite entries without base revision during recovery", skippedLegacyOverwrites)
+	}
+}
+
+func expectedRevisionForWriteBack(meta *WriteBackMeta) (int64, error) {
+	if meta == nil {
+		return -1, fmt.Errorf("missing writeback metadata")
+	}
+	if meta.Kind == PendingNew {
+		return 0, nil
+	}
+	if meta.BaseRev <= 0 {
+		return -1, errWriteBackBaseRevisionRequired
+	}
+	return meta.BaseRev, nil
 }
 
 func (u *WriteBackUploader) worker() {
@@ -173,11 +207,47 @@ func (u *WriteBackUploader) uploadOne(remotePath string) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
-	defer cancel()
+	expectedRevision, err := expectedRevisionForWriteBack(meta)
+	if err != nil {
+		// TODO: add a migration or cleanup path for legacy overwrite entries
+		// without base revisions so they do not remain pending forever when
+		// they only flow through Flush -> Release -> background uploadOne.
+		log.Printf("writeback upload skipped for %s: %v", remotePath, err)
+		return
+	}
 
-	if err := u.client.WriteCtx(ctx, remotePath, data); err != nil {
-		log.Printf("writeback upload failed for %s: %v (will retry on next mount)", remotePath, err)
+	// Retry with exponential backoff.
+	var lastErr error
+	for attempt := 0; attempt <= uploadMaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(float64(uploadBackoffBase) * math.Pow(2, float64(attempt-1)))
+			if delay > uploadBackoffMax {
+				delay = uploadBackoffMax
+			}
+			time.Sleep(delay)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+		lastErr = u.client.WriteCtxConditional(ctx, remotePath, data, expectedRevision)
+		cancel()
+
+		if lastErr == nil {
+			break
+		}
+		if errors.Is(lastErr, client.ErrConflict) {
+			break
+		}
+		log.Printf("writeback upload attempt %d/%d failed for %s: %v", attempt+1, uploadMaxRetries+1, remotePath, lastErr)
+	}
+
+	if lastErr != nil {
+		if errors.Is(lastErr, client.ErrConflict) {
+			// TODO: persist a conflict marker or resolution flow so these
+			// entries do not remain pending forever across mounts.
+			log.Printf("writeback upload conflict for %s at base revision %d (will keep local pending data)", remotePath, meta.BaseRev)
+			return
+		}
+		log.Printf("writeback upload failed for %s after %d attempts: %v (will retry on next mount)", remotePath, uploadMaxRetries+1, lastErr)
 		return
 	}
 
@@ -209,7 +279,20 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, remotePath string) e
 		return nil
 	}
 
-	if err := u.client.WriteCtx(ctx, remotePath, data); err != nil {
+	expectedRevision, err := expectedRevisionForWriteBack(meta)
+	if err != nil {
+		if errors.Is(err, errWriteBackBaseRevisionRequired) && meta.Kind == PendingOverwrite {
+			// Backward compatibility for pre-CAS writeback entries: preserve
+			// the historical UploadSync behaviour so fsync/rename do not fail
+			// with EIO on mounts that still have legacy pending overwrites.
+			log.Printf("writeback uploadsync: legacy overwrite without base revision for %s, falling back to unconditional write", remotePath)
+			expectedRevision = -1
+		} else {
+			return fmt.Errorf("resolve expected revision for %s: %w", remotePath, err)
+		}
+	}
+
+	if err := u.client.WriteCtxConditional(ctx, remotePath, data, expectedRevision); err != nil {
 		return err
 	}
 

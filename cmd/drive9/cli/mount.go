@@ -21,6 +21,8 @@ func MountCmd(args []string) error {
 	attrTTL := fs.Duration("attr-ttl", 1*time.Second, "kernel attr cache TTL")
 	entryTTL := fs.Duration("entry-ttl", 1*time.Second, "kernel entry cache TTL")
 	flushDebounce := fs.Duration("flush-debounce", -1, "debounce window for small-file flush coalescing (default 2s, 0 disables)")
+	syncMode := fs.String("sync-mode", "auto", "sync mode: auto, interactive, or strict")
+	profile := fs.String("profile", "", "mount profile: interactive (empty for default)")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
 	debug := fs.Bool("debug", false, "enable FUSE debug logging")
@@ -67,6 +69,8 @@ func MountCmd(args []string) error {
 		AttrTTL:       *attrTTL,
 		EntryTTL:      *entryTTL,
 		FlushDebounce: *flushDebounce,
+		SyncMode:      drive9fuse.ParseSyncMode(*syncMode),
+		Profile:       *profile,
 		AllowOther:    *allowOther,
 		ReadOnly:      *readOnly,
 		Debug:         *debug,

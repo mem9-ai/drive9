@@ -41,6 +41,24 @@ type Dat9FS struct {
 	writeBack *WriteBackCache
 	uploader  *WriteBackUploader
 
+	// pendingIndex is the in-memory authoritative metadata index.
+	// All metadata reads (GetMeta) are served from memory (O(1)).
+	// Nil when CacheDir is not configured.
+	pendingIndex *PendingIndex
+
+	// shadowStore manages per-path local shadow files for extent-based
+	// writes. Flush writes only dirty parts via pwrite. Nil when not configured.
+	shadowStore *ShadowStore
+
+	// syncMode is the resolved sync mode (interactive or strict).
+	syncMode SyncMode
+
+	// journal is the append-only WAL for crash recovery (P1).
+	journal *Journal
+
+	// commitQueue is the ordered background remote commit queue (P1).
+	commitQueue *CommitQueue
+
 	// server is the go-fuse server, set during Init(). Used to send
 	// kernel cache invalidation notifications (EntryNotify, InodeNotify)
 	// so that long TTLs don't serve stale data after local mutations.
@@ -173,6 +191,7 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 		return httpToFuseStatus(err)
 	}
 	fh.OrigSize = stat.Size
+	fh.BaseRev = stat.Revision
 	if stat.Size == 0 {
 		return gofuse.OK
 	}
@@ -227,6 +246,115 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 	}
 
 	return gofuse.OK
+}
+
+func (fs *Dat9FS) pendingKindForHandle(fh *FileHandle) PendingKind {
+	if fh.IsNew {
+		return PendingNew
+	}
+	return PendingOverwrite
+}
+
+func expectedRevisionForHandle(fh *FileHandle) int64 {
+	if fh == nil {
+		return -1
+	}
+	if fh.IsNew {
+		return 0
+	}
+	if fh.BaseRev > 0 {
+		return fh.BaseRev
+	}
+	return -1
+}
+
+func (fs *Dat9FS) canStageShadowFastLocked(fh *FileHandle) bool {
+	if fs.shadowStore == nil || fs.pendingIndex == nil || fh == nil || fh.Dirty == nil {
+		return false
+	}
+	if fh.ShadowReady || fh.IsNew {
+		return true
+	}
+	return fh.Dirty.CanMaterializeFull()
+}
+
+func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
+	if !fs.canStageShadowFastLocked(fh) {
+		return syscall.ENOTSUP
+	}
+
+	size := fh.Dirty.Size()
+	if fh.ShadowReady {
+		if err := fs.shadowStore.Truncate(fh.Path, size, fh.BaseRev); err != nil {
+			return err
+		}
+	} else {
+		if err := fs.shadowStore.WriteFull(fh.Path, fh.Dirty.Bytes(), fh.BaseRev); err != nil {
+			return err
+		}
+		fh.ShadowReady = true
+	}
+
+	if durable {
+		if err := fs.shadowStore.Sync(fh.Path); err != nil {
+			return err
+		}
+	}
+	if _, err := fs.pendingIndex.PutWithBaseRev(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev); err != nil {
+		log.Printf("pending index put failed for %s: %v", fh.Path, err)
+	}
+	return nil
+}
+
+func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
+	if fs.writeBack == nil {
+		return nil
+	}
+	if fh.Dirty == nil {
+		return nil
+	}
+	if !(fh.ShadowReady || fh.IsNew || fh.Dirty.CanMaterializeFull()) {
+		return syscall.ENOTSUP
+	}
+	return fs.writeBack.PutWithBaseRev(
+		fh.Path,
+		fh.Dirty.Bytes(),
+		fh.Dirty.Size(),
+		fs.pendingKindForHandle(fh),
+		fh.BaseRev,
+	)
+}
+
+func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *WriteBackMeta) error {
+	if fs.shadowStore == nil || fh == nil || meta == nil {
+		return syscall.ENOENT
+	}
+
+	data, err := fs.shadowStore.ReadAll(fh.Path)
+	if err != nil {
+		return err
+	}
+
+	wb := NewWriteBuffer(fh.Path, maxPreloadSize, 0)
+	if len(data) > 0 {
+		if _, err := wb.Write(0, data); err != nil {
+			return err
+		}
+		wb.ClearDirty()
+	} else {
+		wb.totalSize = meta.Size
+	}
+
+	fh.Dirty = wb
+	fh.ShadowReady = true
+	fh.IsNew = meta.Kind == PendingNew
+	fh.OrigSize = meta.Size
+	if meta.BaseRev > 0 {
+		fh.BaseRev = meta.BaseRev
+	} else if rev := fs.shadowStore.BaseRev(fh.Path); rev > 0 {
+		fh.BaseRev = rev
+	}
+	return nil
 }
 
 func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
@@ -328,10 +456,23 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		return st
 	}
 
-	// Pending namespace overlay: if the file exists in the write-back cache
-	// (created/written locally but not yet uploaded), use that metadata so
-	// the file is visible to ls, stat, open, etc.
-	if fs.writeBack != nil {
+	// Pending namespace overlay: check in-memory PendingIndex first (O(1)),
+	// then fall back to the write-back cache GetMeta for backward compat.
+	if fs.pendingIndex != nil {
+		if meta, ok := fs.pendingIndex.GetMeta(childP); ok {
+			mtime := meta.Mtime
+			if mtime.IsZero() {
+				mtime = time.Now()
+			}
+			ino := fs.inodes.Lookup(childP, false, meta.Size, mtime)
+			entry, ok := fs.inodes.GetEntry(ino)
+			if !ok {
+				return gofuse.EIO
+			}
+			fs.fillEntryOut(entry, out)
+			return gofuse.OK
+		}
+	} else if fs.writeBack != nil {
 		if meta, ok := fs.writeBack.GetMeta(childP); ok {
 			mtime := meta.Mtime
 			if mtime.IsZero() {
@@ -382,6 +523,10 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 			fs.fillEntryOut(entry, out)
 			return gofuse.OK
 		}
+		// Cache negative lookup: tell kernel this entry doesn't exist
+		// for NegativeEntryTTL so it doesn't re-ask immediately.
+		out.NodeId = 0
+		out.SetEntryTimeout(fs.opts.NegativeEntryTTL)
 		return gofuse.ENOENT
 	}
 
@@ -390,6 +535,10 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		mtime = stat.Mtime
 	}
 	ino := fs.inodes.Lookup(childP, stat.IsDir, stat.Size, mtime)
+	// Store server revision for cache validation.
+	if stat.Revision > 0 {
+		fs.inodes.UpdateRevision(ino, stat.Revision)
+	}
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
@@ -412,15 +561,28 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
 		entry.Size = size
 	} else if fs.writeBack != nil && !entry.IsDir {
-		// Check write-back cache for pending (not yet uploaded) data. This
-		// ensures close-to-open consistency: `echo x > f; cat f` sees the
-		// correct size even while the async upload is still in progress.
-		if meta, ok := fs.writeBack.GetMeta(entry.Path); ok {
-			entry.Size = meta.Size
-			if !meta.Mtime.IsZero() {
-				entry.Mtime = meta.Mtime
+		// Check pending index first (in-memory, O(1)), then fall back
+		// to old GetMeta for backward compatibility.
+		pendingFound := false
+		if fs.pendingIndex != nil {
+			if meta, ok := fs.pendingIndex.GetMeta(entry.Path); ok {
+				entry.Size = meta.Size
+				if !meta.Mtime.IsZero() {
+					entry.Mtime = meta.Mtime
+				}
+				pendingFound = true
 			}
-		} else if input.NodeId != 1 {
+		}
+		if !pendingFound {
+			if meta, ok := fs.writeBack.GetMeta(entry.Path); ok {
+				entry.Size = meta.Size
+				if !meta.Mtime.IsZero() {
+					entry.Mtime = meta.Mtime
+				}
+				pendingFound = true
+			}
+		}
+		if !pendingFound && input.NodeId != 1 {
 			ctx, cf := fuseCtx(cancel)
 			defer cf()
 			stat, err := fs.client.StatCtx(ctx, entry.Path)
@@ -430,6 +592,9 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 			entry.Size = stat.Size
 			entry.IsDir = stat.IsDir
 			fs.inodes.UpdateSize(input.NodeId, stat.Size)
+			if stat.Revision > 0 {
+				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
+			}
 			if !stat.Mtime.IsZero() {
 				entry.Mtime = stat.Mtime
 				fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
@@ -448,6 +613,9 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 			entry.Size = stat.Size
 			entry.IsDir = stat.IsDir
 			fs.inodes.UpdateSize(input.NodeId, stat.Size)
+			if stat.Revision > 0 {
+				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
+			}
 			if !stat.Mtime.IsZero() {
 				entry.Mtime = stat.Mtime
 				fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
@@ -484,6 +652,17 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				if err := fh.Dirty.Truncate(newSize); err != nil {
 					fh.Unlock()
 					return gofuse.Status(syscall.EFBIG)
+				}
+				if fs.shadowStore != nil && fs.pendingIndex != nil {
+					if fh.ShadowReady || fh.IsNew || newSize == 0 {
+						if err := fs.shadowStore.Truncate(fh.Path, newSize, fh.BaseRev); err != nil {
+							log.Printf("shadow truncate failed for %s: %v", fh.Path, err)
+							fs.shadowStore.Remove(fh.Path)
+							fh.ShadowReady = false
+						} else {
+							fh.ShadowReady = true
+						}
+					}
 				}
 				// Reset sequential write tracking after truncate so that
 				// subsequent writes starting at the new size are not
@@ -962,18 +1141,27 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	wb.sequential = true
 	wb.uploadedParts = make(map[int]bool)
 	fh := &FileHandle{
-		Ino:   ino,
-		Path:  childP,
-		Flags: input.Flags,
-		Dirty: wb,
-		IsNew: true,
+		Ino:         ino,
+		Path:        childP,
+		Flags:       input.Flags,
+		Dirty:       wb,
+		IsNew:       true,
+		ShadowReady: false,
+	}
+
+	if fs.shadowStore != nil && fs.pendingIndex != nil {
+		if err := fs.shadowStore.Ensure(childP, 0, 0); err != nil {
+			log.Printf("shadow ensure failed for create %s: %v", childP, err)
+		} else {
+			fh.ShadowReady = true
+		}
 	}
 
 	// Attach a streaming uploader for sequential write streaming.
 	// For pure sequential writes (cp, dd, ffmpeg), parts are uploaded
 	// as they fill during Write() and memory is released immediately.
 	// For non-sequential writes, falls back to flush-time UploadAll.
-	fh.Streamer = NewStreamUploader(fs.client, childP)
+	fh.Streamer = NewStreamUploader(fs.client, childP, expectedRevisionForHandle(fh))
 
 	// Wire up the OnPartFull callback: when a sequential write fills
 	// a part, submit it for background upload and evict after completion.
@@ -991,7 +1179,10 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
 	out.Fh = fs.fileHandles.Allocate(fh)
-	out.OpenFlags = gofuse.FOPEN_DIRECT_IO // bypass kernel page cache for writes
+	// Use cached I/O for small/interactive files. Kernel coalesces writes
+	// and serves reads from page cache after first access.
+	// Keep DIRECT_IO for O_TRUNC streaming files.
+	out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 	fs.fillEntryOut(entry, &out.EntryOut)
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
@@ -1016,6 +1207,11 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		Path:  p,
 		Flags: input.Flags,
 	}
+	entry, _ := fs.inodes.GetEntry(input.NodeId)
+	if entry != nil {
+		fh.OrigSize = entry.Size
+		fh.BaseRev = entry.Revision
+	}
 
 	// Allocate write buffer for writable opens
 	accMode := input.Flags & syscall.O_ACCMODE
@@ -1029,9 +1225,18 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		// random writes don't discard the original file data.
 		if input.Flags&syscall.O_TRUNC == 0 {
 			preloaded := false
+			if fs.pendingIndex != nil && fs.shadowStore != nil {
+				if meta, ok := fs.pendingIndex.GetMeta(p); ok && fs.shadowStore.Has(p) {
+					if err := fs.loadWritableHandleFromShadowLocked(fh, meta); err == nil {
+						preloaded = true
+					} else {
+						log.Printf("shadow preload failed for %s: %v", p, err)
+					}
+				}
+			}
 			// Prefer write-back cache over remote — handles the case where
 			// a previous close is still uploading asynchronously.
-			if fs.writeBack != nil {
+			if !preloaded && fs.writeBack != nil {
 				if wbData, ok := fs.writeBack.Get(p); ok {
 					if _, err := fh.Dirty.Write(0, wbData); err != nil {
 						return gofuse.Status(syscall.EFBIG)
@@ -1058,9 +1263,16 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			_ = fh.Dirty.Truncate(0)
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 			fs.inodes.UpdateSize(fh.Ino, 0)
+			if fs.shadowStore != nil && fs.pendingIndex != nil {
+				if err := fs.shadowStore.Ensure(p, 0, fh.BaseRev); err != nil {
+					log.Printf("shadow ensure failed for truncate-open %s: %v", p, err)
+				} else {
+					fh.ShadowReady = true
+				}
+			}
 
 			// Attach streaming uploader with OnPartFull wiring.
-			fh.Streamer = NewStreamUploader(fs.client, p)
+			fh.Streamer = NewStreamUploader(fs.client, p, expectedRevisionForHandle(fh))
 			streamer := fh.Streamer
 			filePath := p
 			fh.Dirty.OnPartFull = func(partIdx int, data []byte) {
@@ -1086,7 +1298,14 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 
 	out.Fh = fs.fileHandles.Allocate(fh)
 	if fh.Dirty != nil {
-		out.OpenFlags = gofuse.FOPEN_DIRECT_IO
+		// Use cached I/O for small/interactive files (< 64MB, no O_TRUNC).
+		// Kernel coalesces writes and serves reads from page cache.
+		// Keep DIRECT_IO for O_TRUNC or large streaming files.
+		if input.Flags&syscall.O_TRUNC != 0 || fh.OrigSize >= smallFileShadowThreshold {
+			out.OpenFlags = gofuse.FOPEN_DIRECT_IO
+		} else {
+			out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
+		}
 	} else {
 		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 	}
@@ -1166,6 +1385,21 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		// Existing file with evicted parts: the original object still exists
 		// on the server, so fall through to ReadStreamRange.
 		fh.Unlock()
+	} else if fh.Dirty != nil && fh.ShadowReady {
+		offset := int64(input.Offset)
+		size := fh.Dirty.Size()
+		if offset >= size {
+			fh.Unlock()
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
+		end := offset + int64(input.Size)
+		if end > size {
+			end = size
+		}
+		result := make([]byte, end-offset)
+		fh.Dirty.ReadAt(offset, result)
+		fh.Unlock()
+		return gofuse.ReadResultData(result), gofuse.OK
 	} else if fh.Dirty != nil && fh.Dirty.Size() > 0 && !fh.Dirty.HasDirtyParts() {
 		// Writable handle with lazy-loaded buffer (no dirty parts yet) —
 		// read directly from the server for unloaded parts.
@@ -1181,6 +1415,27 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		fh.Unlock()
 	}
 
+	// Read path priority for pending files:
+	// 1. ShadowStore.ReadAt (local SSD) — for files staged by Flush
+	// 2. WriteBackCache.Get (local disk, full file) — legacy path
+	if fh.Dirty == nil && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path) {
+		offset := int64(input.Offset)
+		sz := fs.shadowStore.Size(fh.Path)
+		if sz >= 0 {
+			if offset >= sz {
+				return gofuse.ReadResultData(nil), gofuse.OK
+			}
+			end := offset + int64(input.Size)
+			if end > sz {
+				end = sz
+			}
+			buf := make([]byte, end-offset)
+			n, err := fs.shadowStore.ReadAt(fh.Path, offset, buf)
+			if err == nil && n > 0 {
+				return gofuse.ReadResultData(buf[:n]), gofuse.OK
+			}
+		}
+	}
 	// Close-to-open consistency: if a previous handle wrote data to the
 	// write-back cache (async upload still in progress), serve reads from
 	// that cached data instead of going to the server (which has stale data).
@@ -1218,13 +1473,14 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		}()
 	}
 
-	// Try read cache for small files. Use TTL-based expiry (rev=0) to avoid
-	// a per-read StatCtx round-trip. Staleness is bounded by the cache TTL
-	// (same order as the kernel attr/entry TTL).
+	// Try read cache for small files. Use revision-aware cache: if the
+	// InodeEntry has a stored revision from the last Lookup/GetAttr, pass
+	// it to the cache for validation. Cache hit only if revision matches.
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
 	if entry != nil && entry.Size <= smallFileThreshold && entry.Size > 0 {
+		cacheRev := entry.Revision // use revision from last Stat/Lookup
 		// Fast path: serve from cache without any HTTP call.
-		if data, ok := fs.readCache.Get(p, 0); ok {
+		if data, ok := fs.readCache.Get(p, cacheRev); ok {
 			offset := int64(input.Offset)
 			if offset >= int64(len(data)) {
 				return gofuse.ReadResultData(nil), gofuse.OK
@@ -1242,7 +1498,8 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		if err != nil {
 			return nil, httpToFuseStatus(err)
 		}
-		fs.readCache.Put(p, data, 0)
+		// Store with the revision from the prior Stat/Lookup.
+		fs.readCache.Put(p, data, cacheRev)
 		offset := int64(input.Offset)
 		if offset >= int64(len(data)) {
 			return gofuse.ReadResultData(nil), gofuse.OK
@@ -1290,6 +1547,13 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	if err != nil {
 		return 0, gofuse.Status(syscall.EFBIG)
 	}
+	if fh.ShadowReady && fs.shadowStore != nil {
+		if _, err := fs.shadowStore.WriteAt(fh.Path, int64(input.Offset), data, fh.BaseRev); err != nil {
+			log.Printf("shadow write-through failed for %s: %v", fh.Path, err)
+			fs.shadowStore.Remove(fh.Path)
+			fh.ShadowReady = false
+		}
+	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
 	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
 	return n, gofuse.OK
@@ -1324,19 +1588,33 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.St
 		// no parts have been streamed, the data is still fully in the WriteBuffer.
 		hasActiveStream := fh.Streamer != nil && fh.Streamer.HasStreamedParts()
 		if size < writeBackThreshold && !hasActiveStream {
-			data := fh.Dirty.Bytes()
-			kind := PendingOverwrite
-			if fh.IsNew {
-				kind = PendingNew
-			}
-			if err := fs.writeBack.Put(fh.Path, data, size, kind); err != nil {
-				log.Printf("writeback cache put failed for %s: %v, falling back to sync upload", fh.Path, err)
-				// Fall through to synchronous upload below.
-			} else {
-				// Snapshot the dirty sequence at cache-write time so
-				// Release can detect whether new writes happened since.
-				fh.WriteBackSeq = fh.DirtySeq
-				return gofuse.OK
+			// Only stage locally when the shadow/buffer represents the full
+			// current file contents. Otherwise a background full-file PUT would
+			// silently zero untouched remote-backed ranges.
+			if fs.canStageShadowFastLocked(fh) || fh.Dirty.CanMaterializeFull() {
+				if fs.shadowStore != nil && fs.pendingIndex != nil {
+					if err := fs.stageShadowLocked(fh, true); err != nil {
+						log.Printf("shadow stage failed for %s: %v, falling through", fh.Path, err)
+					} else {
+						if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
+							log.Printf("writeback snapshot failed for %s: %v", fh.Path, err)
+						}
+						fh.WriteBackSeq = fh.DirtySeq
+						return gofuse.OK
+					}
+				}
+
+				if err := fs.snapshotWriteBackLocked(fh); err != nil {
+					log.Printf("writeback cache put failed for %s: %v, falling back to sync upload", fh.Path, err)
+				} else {
+					if fs.pendingIndex != nil {
+						_, _ = fs.pendingIndex.PutWithBaseRev(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev)
+					}
+					// Snapshot the dirty sequence at cache-write time so
+					// Release can detect whether new writes happened since.
+					fh.WriteBackSeq = fh.DirtySeq
+					return gofuse.OK
+				}
 			}
 		}
 	}
@@ -1353,15 +1631,38 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.St
 		return gofuse.OK
 	}
 
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
-
 	fh.Lock()
 	defer fh.Unlock()
 
-	// Fsync requires data to be persisted to the remote server.
-	// If there's a pending write-back cache entry for this path,
-	// upload it synchronously first, then proceed with the normal flush.
+	// Interactive mode: Fsync = local durable only. Shadow file + journal
+	// ensure crash safety. Remote commit happens asynchronously.
+	if fs.syncMode == SyncInteractive {
+		if fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
+			return gofuse.OK
+		}
+		if err := fs.stageShadowLocked(fh, true); err == nil {
+			if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
+				log.Printf("fsync writeback snapshot failed for %s: %v", fh.Path, err)
+			}
+			fh.WriteBackSeq = fh.DirtySeq
+			// Journal fsync for local durability (when journal is available).
+			if fs.journal != nil {
+				entry := JournalEntry{
+					Op:      JournalFsync,
+					Path:    fh.Path,
+					BaseRev: fh.BaseRev,
+				}
+				_ = fs.journal.Append(entry)
+				_ = fs.journal.Fsync()
+			}
+			return gofuse.OK
+		}
+	}
+
+	// Strict mode: Fsync = remote durable. Upload to server before returning.
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
 	if fs.writeBack != nil && fs.uploader != nil {
 		if err := fs.uploader.UploadSync(ctx, fh.Path); err != nil {
 			log.Printf("fsync writeback upload failed for %s: %v", fh.Path, err)
@@ -1400,8 +1701,27 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				fh.WriteBackSeq = 0
 				fh.Unlock()
 
-				// Async upload — the uploader will read from cache and upload.
-				fs.uploader.Submit(fh.Path)
+				// Enqueue to CommitQueue if available (P1), otherwise
+				// use the legacy uploader.
+				if fs.commitQueue != nil && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path) {
+					entry := &CommitEntry{
+						Path:    fh.Path,
+						Inode:   fh.Ino,
+						BaseRev: fh.BaseRev,
+						Size:    fh.Dirty.Size(),
+						Kind:    PendingOverwrite,
+					}
+					if fh.IsNew {
+						entry.Kind = PendingNew
+					}
+					if err := fs.commitQueue.Enqueue(entry); err != nil {
+						// Backpressure — fall back to legacy uploader.
+						fs.uploader.Submit(fh.Path)
+					}
+				} else {
+					// Async upload — the uploader will read from cache and upload.
+					fs.uploader.Submit(fh.Path)
+				}
 
 				// Invalidate caches so subsequent reads see fresh data.
 				fs.readCache.Invalidate(fh.Path)
@@ -1472,7 +1792,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	copy(data, fh.Dirty.Bytes())
 	filePath := fh.Path
 	ino := fh.Ino
-	handle := fh          // capture for goroutine
+	handle := fh               // capture for goroutine
 	snapshotSeq := fh.DirtySeq // capture current dirty sequence
 
 	fs.debouncer.Schedule(filePath, func() {
@@ -1614,7 +1934,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 
 	if size < smallFileThreshold {
 		// Small file: direct PUT.
-		err = fs.client.WriteCtx(ctx, fh.Path, data)
+		err = fs.client.WriteCtxConditional(ctx, fh.Path, data, expectedRevisionForHandle(fh))
 	} else if fh.OrigSize >= smallFileThreshold {
 		dirtyParts := fh.Dirty.DirtyPartNumbers()
 		if len(dirtyParts) > 0 {
@@ -1640,17 +1960,19 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 				},
 				nil,
 				client.WithPartSize(fh.Dirty.PartSize()),
+				client.WithExpectedRevision(expectedRevisionForHandle(fh)),
 			)
 		}
 		// If no dirty parts, nothing changed — skip upload.
 	} else {
 		// New large file or small-to-large growth: full upload via multipart.
-		err = fs.client.WriteStream(
+		err = fs.client.WriteStreamConditional(
 			ctx,
 			fh.Path,
 			bytes.NewReader(data),
 			size,
 			nil,
+			expectedRevisionForHandle(fh),
 		)
 	}
 	if err != nil {
@@ -1700,6 +2022,21 @@ func (fs *Dat9FS) FlushAll() {
 	// Drain all pending write-back uploads before shutting down.
 	if fs.uploader != nil {
 		fs.uploader.DrainAll()
+	}
+
+	// Drain CommitQueue (P1).
+	if fs.commitQueue != nil {
+		fs.commitQueue.DrainAll()
+	}
+
+	// Close journal.
+	if fs.journal != nil {
+		_ = fs.journal.Close()
+	}
+
+	// Close shadow store.
+	if fs.shadowStore != nil {
+		fs.shadowStore.Close()
 	}
 
 	// Wait for any inflight async kernel notifications to complete.

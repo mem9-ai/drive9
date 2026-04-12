@@ -695,6 +695,123 @@ func TestWriteStreamLargeFileFallsBackOnUnknownUploadAction(t *testing.T) {
 	}
 }
 
+func TestWriteStreamConditionalV2CarriesExpectedRevision(t *testing.T) {
+	var gotExpected *int64
+	var completeCalled atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path             string `json:"path"`
+				TotalSize        int64  `json:"total_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			gotExpected = req.ExpectedRevision
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(uploadPlanV2{
+				UploadID:   "v2-cas",
+				PartSize:   8,
+				TotalParts: 1,
+				ChecksumContract: checksumContract{
+					Supported: []string{"SHA-256"},
+				},
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-cas/presign-batch":
+			_ = json.NewEncoder(w).Encode(struct {
+				Parts []presignedPart `json:"parts"`
+			}{
+				Parts: []presignedPart{{
+					Number:    1,
+					URL:       fmt.Sprintf("http://%s/v2parts/1", r.Host),
+					Size:      5,
+					ExpiresAt: time.Now().Add(time.Minute),
+				}},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/v2parts/1":
+			w.Header().Set("ETag", `"etag-v2-cas"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-cas/complete":
+			completeCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	if err := c.WriteStreamConditional(context.Background(), "/cas-v2.bin", bytes.NewReader([]byte("12345")), 5, nil, 27); err != nil {
+		t.Fatalf("WriteStreamConditional: %v", err)
+	}
+	if gotExpected == nil || *gotExpected != 27 {
+		t.Fatalf("expected_revision = %v, want 27", gotExpected)
+	}
+	if !completeCalled.Load() {
+		t.Fatal("complete was not called")
+	}
+}
+
+func TestWriteStreamConditionalLegacyFallbackCarriesExpectedRevisionHeader(t *testing.T) {
+	var gotExpected string
+	var sawV2 atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			sawV2.Store(true)
+			http.NotFound(w, r)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
+			http.NotFound(w, r)
+
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/legacy-cas.bin":
+			gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
+			plan := UploadPlan{
+				UploadID: "legacy-cas",
+				Parts: []PartURL{{
+					Number: 1,
+					URL:    fmt.Sprintf("http://%s/legacy/part/1", r.Host),
+					Size:   8,
+				}},
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(plan)
+
+		case r.Method == http.MethodPut && r.URL.Path == "/legacy/part/1":
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/legacy-cas/complete":
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	if err := c.WriteStreamConditional(context.Background(), "/legacy-cas.bin", bytes.NewReader([]byte("12345678")), 8, nil, 31); err != nil {
+		t.Fatalf("WriteStreamConditional: %v", err)
+	}
+	if !sawV2.Load() {
+		t.Fatal("expected v2 probe before legacy fallback")
+	}
+	if gotExpected != "31" {
+		t.Fatalf("X-Dat9-Expected-Revision = %q, want %q", gotExpected, "31")
+	}
+}
+
 func TestWriteStreamLargeFileRequiresSeekableReader(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatalf("server should not be called for non-seekable large upload")

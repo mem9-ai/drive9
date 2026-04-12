@@ -197,6 +197,11 @@ func (p *uploadBufferPool) put(buf []byte) {
 // it does a direct PUT with body. For large files, it tries the v2 protocol
 // (on-demand presign, no upfront checksum) first, falling back to v1 on 404.
 func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc) error {
+	return c.WriteStreamConditional(ctx, path, r, size, progress, -1)
+}
+
+// WriteStreamConditional uploads data from a reader with optional CAS semantics.
+func (c *Client) WriteStreamConditional(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64) error {
 	threshold := int64(DefaultSmallFileThreshold)
 	if c.smallFileThreshold > 0 {
 		threshold = c.smallFileThreshold
@@ -207,7 +212,7 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 		if err != nil {
 			return fmt.Errorf("read data: %w", err)
 		}
-		return c.Write(path, data)
+		return c.WriteCtxConditional(ctx, path, data, expectedRevision)
 	}
 	ra, ok := r.(io.ReaderAt)
 	if !ok {
@@ -215,10 +220,10 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 	}
 
 	// Try v2 protocol first (on-demand presign, no checksum pre-computation).
-	err := c.writeStreamV2(ctx, path, ra, size, progress)
+	err := c.writeStreamV2(ctx, path, ra, size, progress, expectedRevision)
 	if err == errV2NotAvailable {
 		// Server doesn't support v2 — fall back to v1.
-		return c.writeStreamV1(ctx, path, ra, size, progress)
+		return c.writeStreamV1(ctx, path, ra, size, progress, expectedRevision)
 	}
 	return err
 }
@@ -228,12 +233,12 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 var errV2NotAvailable = fmt.Errorf("v2 upload API not available")
 
 // writeStreamV1 is the original v1 upload path: pre-compute checksums → initiate → upload all.
-func (c *Client) writeStreamV1(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc) error {
+func (c *Client) writeStreamV1(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
 	checksums, err := computePartChecksumsFromReaderAt(ra, size, s3client.PartSize)
 	if err != nil {
 		return fmt.Errorf("compute part checksums: %w", err)
 	}
-	plan, err := c.initiateUpload(ctx, path, size, checksums)
+	plan, err := c.initiateUpload(ctx, path, size, checksums, expectedRevision)
 	if err != nil {
 		return err
 	}
@@ -245,8 +250,8 @@ func (c *Client) writeStreamV1(ctx context.Context, path string, ra io.ReaderAt,
 // 2. Pipelined presign: background goroutine fetches presigned URLs in batches
 // 3. Upload goroutines consume presigned URLs from channel
 // 4. Complete with part ETags, or abort on failure
-func (c *Client) writeStreamV2(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc) error {
-	plan, err := c.initiateUploadV2(ctx, path, size)
+func (c *Client) writeStreamV2(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
+	plan, err := c.initiateUploadV2(ctx, path, size, expectedRevision)
 	if err != nil {
 		return err
 	}
@@ -278,35 +283,49 @@ func (c *Client) writeStreamV2(ctx context.Context, path string, ra io.ReaderAt,
 }
 
 type uploadInitiateRequest struct {
-	Path          string   `json:"path"`
-	TotalSize     int64    `json:"total_size"`
-	PartChecksums []string `json:"part_checksums"`
+	Path             string   `json:"path"`
+	TotalSize        int64    `json:"total_size"`
+	PartChecksums    []string `json:"part_checksums"`
+	ExpectedRevision *int64   `json:"expected_revision,omitempty"`
 }
 
 type uploadResumeRequest struct {
 	PartChecksums []string `json:"part_checksums"`
 }
 
-func (c *Client) initiateUpload(ctx context.Context, path string, size int64, checksums []string) (UploadPlan, error) {
-	plan, resp, err := c.initiateUploadByBody(ctx, path, size, checksums)
+func expectedRevisionField(expectedRevision int64) *int64 {
+	if expectedRevision < 0 {
+		return nil
+	}
+	rev := expectedRevision
+	return &rev
+}
+
+func (c *Client) initiateUpload(ctx context.Context, path string, size int64, checksums []string, expectedRevision int64) (UploadPlan, error) {
+	plan, resp, err := c.initiateUploadByBody(ctx, path, size, checksums, expectedRevision)
 	if err == nil {
 		return plan, nil
 	}
 	if resp != nil {
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
-			return c.initiateUploadLegacy(ctx, path, size, checksums)
+			return c.initiateUploadLegacy(ctx, path, size, checksums, expectedRevision)
 		}
 		if resp.StatusCode == http.StatusBadRequest && strings.Contains(strings.ToLower(err.Error()), "unknown upload action") {
-			return c.initiateUploadLegacy(ctx, path, size, checksums)
+			return c.initiateUploadLegacy(ctx, path, size, checksums, expectedRevision)
 		}
 		return UploadPlan{}, err
 	}
 	return UploadPlan{}, err
 }
 
-func (c *Client) initiateUploadByBody(ctx context.Context, path string, size int64, checksums []string) (UploadPlan, *http.Response, error) {
-	body, err := json.Marshal(uploadInitiateRequest{Path: path, TotalSize: size, PartChecksums: checksums})
+func (c *Client) initiateUploadByBody(ctx context.Context, path string, size int64, checksums []string, expectedRevision int64) (UploadPlan, *http.Response, error) {
+	body, err := json.Marshal(uploadInitiateRequest{
+		Path:             path,
+		TotalSize:        size,
+		PartChecksums:    checksums,
+		ExpectedRevision: expectedRevisionField(expectedRevision),
+	})
 	if err != nil {
 		return UploadPlan{}, nil, err
 	}
@@ -331,7 +350,7 @@ func (c *Client) initiateUploadByBody(ctx context.Context, path string, size int
 	return plan, nil, nil
 }
 
-func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int64, checksums []string) (UploadPlan, error) {
+func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int64, checksums []string, expectedRevision int64) (UploadPlan, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), http.NoBody)
 	if err != nil {
 		return UploadPlan{}, err
@@ -340,6 +359,9 @@ func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int
 	req.Header.Set("X-Dat9-Content-Length", fmt.Sprintf("%d", size))
 	if len(checksums) > 0 {
 		req.Header.Set("X-Dat9-Part-Checksums", strings.Join(checksums, ","))
+	}
+	if expectedRevision >= 0 {
+		req.Header.Set("X-Dat9-Expected-Revision", fmt.Sprintf("%d", expectedRevision))
 	}
 
 	resp, err := c.do(req)
@@ -515,11 +537,12 @@ func (c *Client) completeUpload(ctx context.Context, uploadID string) error {
 
 // initiateUploadV2 calls POST /v2/uploads/initiate.
 // Returns errV2NotAvailable if the server responds with 404.
-func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64) (*uploadPlanV2, error) {
+func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64, expectedRevision int64) (*uploadPlanV2, error) {
 	body, err := json.Marshal(struct {
-		Path      string `json:"path"`
-		TotalSize int64  `json:"total_size"`
-	}{Path: path, TotalSize: size})
+		Path             string `json:"path"`
+		TotalSize        int64  `json:"total_size"`
+		ExpectedRevision *int64 `json:"expected_revision,omitempty"`
+	}{Path: path, TotalSize: size, ExpectedRevision: expectedRevisionField(expectedRevision)})
 	if err != nil {
 		return nil, err
 	}

@@ -16,18 +16,22 @@ import (
 
 // MountOptions configures the FUSE mount.
 type MountOptions struct {
-	Server        string        // dat9 server URL
-	APIKey        string        // dat9 API key
-	MountPoint    string        // local mount point
-	CacheDir      string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
-	CacheSize     int64         // ReadCache max size in bytes (default 128MB)
-	DirTTL        time.Duration // DirCache TTL (default 5s)
-	AttrTTL       time.Duration // kernel attr cache TTL (default 1s)
-	EntryTTL      time.Duration // kernel entry cache TTL (default 1s)
-	FlushDebounce time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
-	AllowOther    bool          // allow other users to access mount
-	ReadOnly      bool          // mount as read-only
-	Debug         bool          // enable FUSE debug logging
+	Server            string        // dat9 server URL
+	APIKey            string        // dat9 API key
+	MountPoint        string        // local mount point
+	CacheDir          string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
+	CacheSize         int64         // ReadCache max size in bytes (default 128MB)
+	DirTTL            time.Duration // DirCache TTL (default 5s)
+	AttrTTL           time.Duration // kernel attr cache TTL (default 1s)
+	EntryTTL          time.Duration // kernel entry cache TTL (default 1s)
+	NegativeEntryTTL  time.Duration // kernel negative entry cache TTL (default 1s)
+	FlushDebounce     time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
+	SyncMode          SyncMode      // interactive, strict, or auto (default auto)
+	Profile           string        // mount profile: "interactive", "" (default)
+	UploadConcurrency int           // number of background upload workers (default 4)
+	AllowOther        bool          // allow other users to access mount
+	ReadOnly          bool          // mount as read-only
+	Debug             bool          // enable FUSE debug logging
 }
 
 func (o *MountOptions) setDefaults() {
@@ -38,14 +42,24 @@ func (o *MountOptions) setDefaults() {
 		o.DirTTL = defaultDirCacheTTL
 	}
 	if o.AttrTTL <= 0 {
-		o.AttrTTL = 60 * time.Second
+		o.AttrTTL = 1 * time.Second
 	}
 	if o.EntryTTL <= 0 {
-		o.EntryTTL = 60 * time.Second
+		o.EntryTTL = 1 * time.Second
+	}
+	if o.NegativeEntryTTL <= 0 {
+		o.NegativeEntryTTL = 1 * time.Second
 	}
 	// FlushDebounce: 0 means disabled, negative means unset (use default).
 	if o.FlushDebounce < 0 {
 		o.FlushDebounce = defaultFlushDebounce
+	}
+	if o.UploadConcurrency <= 0 {
+		o.UploadConcurrency = 4
+	}
+	// Apply interactive profile if requested.
+	if o.Profile == "interactive" {
+		ApplyInteractiveProfile(o)
 	}
 }
 
@@ -67,7 +81,12 @@ func Mount(opts *MountOptions) error {
 	// Build FUSE filesystem
 	dat9fs := NewDat9FS(c, opts)
 
-	// Initialize write-back cache for async flush if not read-only.
+	// Resolve sync mode (auto-detect RTT if needed).
+	resolved := ResolveMode(opts.SyncMode, opts.Server)
+	dat9fs.syncMode = resolved
+	fmt.Fprintf(os.Stderr, "dat9: sync mode: %s\n", resolved)
+
+	// Initialize write-back cache, shadow store, and pending index.
 	if !opts.ReadOnly {
 		cacheBase := opts.CacheDir
 		if cacheBase == "" {
@@ -79,14 +98,63 @@ func Mount(opts *MountOptions) error {
 		if cacheBase != "" {
 			mh := MountHash(opts.Server, opts.MountPoint)
 			pendingDir := filepath.Join(cacheBase, mh, "pending")
+			shadowDir := filepath.Join(cacheBase, mh, "shadow")
+
+			// Initialize PendingIndex (in-memory authoritative metadata).
+			pendingIdx, err := NewPendingIndex(pendingDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "dat9: pending index init failed: %v (continuing without)\n", err)
+			} else {
+				if err := pendingIdx.RecoverFromDisk(); err != nil {
+					fmt.Fprintf(os.Stderr, "dat9: pending index recovery: %v\n", err)
+				}
+				dat9fs.pendingIndex = pendingIdx
+			}
+
+			// Initialize ShadowStore.
+			shadowStore, err := NewShadowStore(shadowDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "dat9: shadow store init failed: %v (continuing without)\n", err)
+			} else {
+				dat9fs.shadowStore = shadowStore
+			}
+
+			// Initialize Journal WAL.
+			journalPath := filepath.Join(cacheBase, mh, "journal.wal")
+			journal, err := NewJournal(journalPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "dat9: journal init failed: %v (continuing without)\n", err)
+			} else {
+				dat9fs.journal = journal
+				// Replay journal for crash recovery.
+				_ = journal.Replay(func(e JournalEntry) {
+					// Re-register pending paths from journal.
+					if pendingIdx != nil && e.Op != JournalCommit && e.Op != JournalUnlink {
+						if !pendingIdx.HasPending(e.Path) {
+							_, _ = pendingIdx.Put(e.Path, 0, PendingOverwrite)
+						}
+					}
+				})
+			}
+
+			// Initialize CommitQueue for background remote commits.
+			if shadowStore != nil && pendingIdx != nil {
+				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, maxCommitQueuePending)
+				cq.RecoverPending()
+				dat9fs.commitQueue = cq
+			}
+
 			wbCache, err := NewWriteBackCache(pendingDir)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "dat9: write-back cache init failed: %v (continuing without)\n", err)
 			} else {
-				uploader := NewWriteBackUploader(c, wbCache, 4)
+				uploader := NewWriteBackUploader(c, wbCache, opts.UploadConcurrency)
 				dat9fs.SetWriteBack(wbCache, uploader)
-				// Recover any pending uploads from a previous session.
-				uploader.RecoverPending()
+				// Recover pending uploads only when the newer commit queue is
+				// unavailable. Otherwise commitQueue owns shadow-backed recovery.
+				if dat9fs.commitQueue == nil {
+					uploader.RecoverPending()
+				}
 			}
 		}
 	}
@@ -95,9 +163,9 @@ func Mount(opts *MountOptions) error {
 	fuseOpts := &gofuse.MountOptions{
 		FsName:        "dat9",
 		Name:          "dat9",
-		MaxReadAhead:  8 * 1024 * 1024,   // 8MB — larger readahead reduces FUSE kernel↔userspace switches
-		MaxWrite:      128 * 1024,         // 128KB per write request (default 64KB)
-		MaxBackground: 32,                 // concurrent background FUSE requests (default 12)
+		MaxReadAhead:  8 * 1024 * 1024, // 8MB — larger readahead reduces FUSE kernel↔userspace switches
+		MaxWrite:      128 * 1024,      // 128KB per write request (default 64KB)
+		MaxBackground: 32,              // concurrent background FUSE requests (default 12)
 		Debug:         opts.Debug,
 		AllowOther:    opts.AllowOther,
 	}

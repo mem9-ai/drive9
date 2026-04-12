@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -60,6 +61,29 @@ func TestWriteBackCache_PutGetRemove(t *testing.T) {
 	cache.Remove(path)
 	if _, ok := cache.Get(path); ok {
 		t.Fatal("expected Get to return false after Remove")
+	}
+}
+
+func TestWriteBackCache_PutWithBaseRevPersistsRevision(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cache.PutWithBaseRev("/existing.txt", []byte("hello"), 5, PendingOverwrite, 17); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, ok := cache.GetMeta("/existing.txt")
+	if !ok {
+		t.Fatal("expected GetMeta to return true")
+	}
+	if meta.Kind != PendingOverwrite {
+		t.Fatalf("meta.Kind = %v, want %v", meta.Kind, PendingOverwrite)
+	}
+	if meta.BaseRev != 17 {
+		t.Fatalf("meta.BaseRev = %d, want 17", meta.BaseRev)
 	}
 }
 
@@ -245,6 +269,129 @@ func TestWriteBackUploader_UploadFailRetainsCache(t *testing.T) {
 	// Cache entry should be retained for retry on next mount.
 	if _, ok := cache.Get("/fail.txt"); !ok {
 		t.Fatal("cache entry should be retained after upload failure")
+	}
+}
+
+func TestWriteBackUploader_PendingNewUsesCreateIfAbsent(t *testing.T) {
+	var gotExpected string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := client.New(ts.URL, "")
+	uploader := NewWriteBackUploader(c, cache, 1)
+
+	_ = cache.Put("/new.txt", []byte("new"), 3, PendingNew)
+	uploader.Submit("/new.txt")
+	uploader.DrainAll()
+
+	if gotExpected != "0" {
+		t.Fatalf("X-Dat9-Expected-Revision = %q, want %q", gotExpected, "0")
+	}
+}
+
+func TestWriteBackUploader_PendingOverwriteUsesBaseRevision(t *testing.T) {
+	var gotExpected string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := client.New(ts.URL, "")
+	uploader := NewWriteBackUploader(c, cache, 1)
+
+	_ = cache.PutWithBaseRev("/existing.txt", []byte("edit"), 4, PendingOverwrite, 23)
+	uploader.Submit("/existing.txt")
+	uploader.DrainAll()
+
+	if gotExpected != "23" {
+		t.Fatalf("X-Dat9-Expected-Revision = %q, want %q", gotExpected, "23")
+	}
+}
+
+func TestWriteBackUploader_PendingOverwriteWithoutBaseRevRetainsCache(t *testing.T) {
+	var putCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			putCalls.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := client.New(ts.URL, "")
+	uploader := NewWriteBackUploader(c, cache, 1)
+
+	_ = cache.Put("/legacy-overwrite.txt", []byte("edit"), 4, PendingOverwrite)
+	uploader.Submit("/legacy-overwrite.txt")
+	uploader.DrainAll()
+
+	if putCalls.Load() != 0 {
+		t.Fatalf("putCalls = %d, want 0", putCalls.Load())
+	}
+	if _, ok := cache.Get("/legacy-overwrite.txt"); !ok {
+		t.Fatal("legacy overwrite entry should remain pending")
+	}
+
+	// Simulate next mount: recovery should continue skipping the legacy entry.
+	uploader = NewWriteBackUploader(c, cache, 1)
+	uploader.RecoverPending()
+	uploader.DrainAll()
+
+	if putCalls.Load() != 0 {
+		t.Fatalf("putCalls after recovery = %d, want 0", putCalls.Load())
+	}
+}
+
+func TestWriteBackUploader_UploadSyncLegacyOverwriteFallsBackToUnconditional(t *testing.T) {
+	var gotExpected string
+	var putCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			putCalls.Add(1)
+			gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := client.New(ts.URL, "")
+	uploader := NewWriteBackUploader(c, cache, 1)
+
+	_ = cache.Put("/legacy-sync.txt", []byte("edit"), 4, PendingOverwrite)
+	if err := uploader.UploadSync(context.Background(), "/legacy-sync.txt"); err != nil {
+		t.Fatalf("UploadSync: %v", err)
+	}
+
+	if putCalls.Load() != 1 {
+		t.Fatalf("putCalls = %d, want 1", putCalls.Load())
+	}
+	if gotExpected != "" {
+		t.Fatalf("X-Dat9-Expected-Revision = %q, want empty for unconditional legacy fallback", gotExpected)
+	}
+	if _, ok := cache.Get("/legacy-sync.txt"); ok {
+		t.Fatal("legacy overwrite cache entry should be removed after UploadSync fallback")
 	}
 }
 
@@ -1378,7 +1525,7 @@ func TestRename_PendingOverwrite_UsesSlowPath(t *testing.T) {
 	fs.SetWriteBack(cache, uploader)
 
 	// Pending-overwrite: file existed on server, was edited locally.
-	_ = cache.Put("/existing.txt", []byte("edited data"), 11, PendingOverwrite)
+	_ = cache.PutWithBaseRev("/existing.txt", []byte("edited data"), 11, PendingOverwrite, 7)
 
 	fs.inodes.Lookup("/existing.txt", false, 11, time.Time{})
 	fs.inodes.Lookup("/renamed.txt", false, 0, time.Time{})
@@ -1547,7 +1694,7 @@ func TestUnlink_PendingOverwrite_DeletesRemote(t *testing.T) {
 	fs.SetWriteBack(cache, uploader)
 
 	// PendingOverwrite: file existed on server, edited locally.
-	_ = cache.Put("/existing.txt", []byte("edited"), 6, PendingOverwrite)
+	_ = cache.PutWithBaseRev("/existing.txt", []byte("edited"), 6, PendingOverwrite, 7)
 	fs.inodes.Lookup("/existing.txt", false, 6, time.Time{})
 
 	st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "existing.txt")
@@ -1749,7 +1896,7 @@ func TestRename_Directory_MigratesPendingDescendants(t *testing.T) {
 
 	// Create pending files under /olddir/.
 	_ = cache.Put("/olddir/file1.txt", []byte("d1"), 2, PendingNew)
-	_ = cache.Put("/olddir/sub/file2.txt", []byte("d2"), 2, PendingOverwrite)
+	_ = cache.PutWithBaseRev("/olddir/sub/file2.txt", []byte("d2"), 2, PendingOverwrite, 11)
 
 	fs.inodes.Lookup("/olddir", true, 0, time.Time{})
 	fs.inodes.Lookup("/newdir", true, 0, time.Time{})

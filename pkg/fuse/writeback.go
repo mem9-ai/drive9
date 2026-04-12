@@ -42,6 +42,7 @@ type WriteBackMeta struct {
 	CreatedAt  time.Time   `json:"created_at"`
 	Generation uint64      `json:"generation,omitempty"`
 	Kind       PendingKind `json:"kind"`
+	BaseRev    int64       `json:"base_rev,omitempty"`
 }
 
 // WriteBackCache manages a local disk cache of pending (not-yet-uploaded)
@@ -108,6 +109,12 @@ func (c *WriteBackCache) metaFile(remotePath string) string {
 // kind indicates whether this is a newly created file or an overwrite of an
 // existing remote file (affects Rename fast-path eligibility).
 func (c *WriteBackCache) Put(remotePath string, data []byte, size int64, kind PendingKind) error {
+	return c.PutWithBaseRev(remotePath, data, size, kind, 0)
+}
+
+// PutWithBaseRev is like Put, but also persists the remote base revision used
+// for CAS-protected overwrite uploads. baseRev is ignored for PendingNew.
+func (c *WriteBackCache) PutWithBaseRev(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -125,6 +132,7 @@ func (c *WriteBackCache) Put(remotePath string, data []byte, size int64, kind Pe
 		CreatedAt:  time.Now(),
 		Generation: c.nextGen.Add(1),
 		Kind:       kind,
+		BaseRev:    baseRev,
 	}
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {

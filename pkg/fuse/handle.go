@@ -7,12 +7,14 @@ import "sync"
 type FileHandle struct {
 	Ino          uint64
 	Path         string
-	Flags        uint32       // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
-	Dirty        *WriteBuffer // write buffer, nil for read-only opens
-	DirtySeq     uint64       // monotonic sequence for authoritative dirty-size tracking
-	WriteBackSeq uint64       // DirtySeq at time of write-back cache snapshot (0 = no snapshot)
-	OrigSize     int64        // original file size at open time (for patch detection)
-	IsNew        bool         // true if created via Create() (no prior remote existence)
+	Flags        uint32          // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
+	Dirty        *WriteBuffer    // write buffer, nil for read-only opens
+	DirtySeq     uint64          // monotonic sequence for authoritative dirty-size tracking
+	WriteBackSeq uint64          // DirtySeq at time of write-back cache snapshot (0 = no snapshot)
+	OrigSize     int64           // original file size at open time (for patch detection)
+	BaseRev      int64           // server revision at open time (for conflict detection)
+	IsNew        bool            // true if created via Create() (no prior remote existence)
+	ShadowReady  bool            // true when the local shadow file is a safe full snapshot
 	Streamer     *StreamUploader // nil for small files / read-only; manages background part uploads
 	Prefetch     *Prefetcher     // nil for writable handles; sequential read prefetcher
 	mu           sync.Mutex

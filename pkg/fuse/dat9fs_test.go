@@ -78,6 +78,478 @@ func TestOpenWritableLargeFileLazyPreload(t *testing.T) {
 	}
 }
 
+func TestCreateWriteThroughShadow(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_RDWR),
+	}, "shadow.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Fh:       out.Fh,
+		Offset:   0,
+	}, []byte("hello")); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	buf := make([]byte, 5)
+	n, err := shadow.ReadAt("/shadow.txt", 0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 || string(buf) != "hello" {
+		t.Fatalf("shadow read = %q (%d), want hello (5)", buf[:n], n)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("expected file handle to exist")
+	}
+	if !fh.ShadowReady {
+		t.Fatal("expected created handle to remain shadow-backed")
+	}
+}
+
+func TestOpenTruncateWriteThroughShadow(t *testing.T) {
+	fs, ino, cleanup := newTestDat9FS(t, 32, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "existing remote content that should be truncated")
+	})
+	defer cleanup()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_TRUNC),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Offset:   0,
+	}, []byte("bye")); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	if sz := shadow.Size("/file.bin"); sz != 3 {
+		t.Fatalf("shadow size = %d, want 3", sz)
+	}
+	buf := make([]byte, 3)
+	n, err := shadow.ReadAt("/file.bin", 0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 || string(buf) != "bye" {
+		t.Fatalf("shadow data = %q (%d), want bye (3)", buf[:n], n)
+	}
+}
+
+func TestFlushSkipsAsyncShadowForPartialExistingSnapshot(t *testing.T) {
+	const size = int64(9 << 20) // > 8MB part size and < 10MB write-back threshold
+
+	var mutateCalls atomic.Int32
+	data := make([]byte, size)
+	for i := range data {
+		data[i] = 'a'
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			_, _ = w.Write(data)
+		default:
+			mutateCalls.Add(1)
+			http.Error(w, "mutation not supported in test", http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, size, time.Now())
+
+	writeBack, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.writeBack = writeBack
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDWR),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Offset:   0,
+	}, []byte("Z")); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+	})
+	if st == gofuse.OK {
+		t.Fatal("Flush unexpectedly succeeded; partial existing snapshot should not use async local fast path")
+	}
+	if mutateCalls.Load() == 0 {
+		t.Fatal("expected Flush to attempt a remote mutation after skipping async local staging")
+	}
+	if pending.Count() != 0 {
+		t.Fatalf("pending index count = %d, want 0", pending.Count())
+	}
+	if shadow.Has("/file.bin") {
+		t.Fatal("partial existing overwrite should not create a shadow fast-path snapshot")
+	}
+	if _, ok := writeBack.Get("/file.bin"); ok {
+		t.Fatal("partial existing overwrite should not create a write-back snapshot")
+	}
+}
+
+func TestOpenWritablePrefersPendingShadowSnapshot(t *testing.T) {
+	fs, ino, cleanup := newTestDat9FS(t, 5, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "stale")
+	})
+	defer cleanup()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	if err := shadow.WriteFull("/file.bin", []byte("fresh"), 9); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/file.bin", 5, PendingOverwrite, 9); err != nil {
+		t.Fatal(err)
+	}
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDWR),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("expected file handle to exist")
+	}
+	if !fh.ShadowReady {
+		t.Fatal("expected open to reuse pending shadow snapshot")
+	}
+	if fh.BaseRev != 9 {
+		t.Fatalf("BaseRev = %d, want 9", fh.BaseRev)
+	}
+
+	buf := make([]byte, 16)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	data, _ := result.Bytes(buf)
+	if string(data) != "fresh" {
+		t.Fatalf("Read = %q, want fresh", data)
+	}
+}
+
+func TestFlushLargeOverwritePatchCarriesExpectedRevision(t *testing.T) {
+	const (
+		fileSize = smallFileThreshold + 1024
+		partSize = 5 << 20
+	)
+
+	var gotExpected int64 = -1
+	var uploadedBytes int
+	var completeCalled bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs/file.bin":
+			var req struct {
+				NewSize          int64  `json:"new_size"`
+				DirtyParts       []int  `json:"dirty_parts"`
+				PartSize         int64  `json:"part_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad patch body", http.StatusBadRequest)
+				return
+			}
+			if req.ExpectedRevision == nil {
+				http.Error(w, "missing expected_revision", http.StatusBadRequest)
+				return
+			}
+			gotExpected = *req.ExpectedRevision
+			if req.NewSize != fileSize {
+				http.Error(w, "bad new_size", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(client.PatchPlan{
+				UploadID: "patch-1",
+				PartSize: partSize,
+				UploadParts: []*client.PatchPartURL{{
+					Number:    1,
+					URL:       "http://" + r.Host + "/upload/1",
+					Size:      fileSize,
+					ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+				}},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/upload/1":
+			body, _ := io.ReadAll(r.Body)
+			uploadedBytes = len(body)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/patch-1/complete":
+			completeCalled = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	ino := fs.inodes.Lookup("/file.bin", false, fileSize, time.Now())
+	wb := NewWriteBuffer("/file.bin", 0, partSize)
+	_, err := wb.Write(0, make([]byte, fileSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     "/file.bin",
+		Dirty:    wb,
+		OrigSize: fileSize,
+		BaseRev:  17,
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, wb.Size())
+	fhID := fs.fileHandles.Allocate(fh)
+
+	st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       fhID,
+	})
+	if st != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", st)
+	}
+	if gotExpected != 17 {
+		t.Fatalf("expected_revision = %d, want 17", gotExpected)
+	}
+	if uploadedBytes != int(fileSize) {
+		t.Fatalf("uploaded bytes = %d, want %d", uploadedBytes, fileSize)
+	}
+	if !completeCalled {
+		t.Fatal("patch complete was not called")
+	}
+}
+
+func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
+	const fileSize = smallFileThreshold + 2048
+
+	var gotExpected int64 = -1
+	var completeParts int
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path             string `json:"path"`
+				TotalSize        int64  `json:"total_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad initiate body", http.StatusBadRequest)
+				return
+			}
+			if req.ExpectedRevision == nil {
+				http.Error(w, "missing expected_revision", http.StatusBadRequest)
+				return
+			}
+			gotExpected = *req.ExpectedRevision
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "up-1",
+				"key":         "blobs/up-1",
+				"part_size":   8 << 20,
+				"total_parts": 1,
+				"expires_at":  time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+				"resumable":   false,
+				"checksum_contract": map[string]any{
+					"supported": []string{"SHA-256"},
+					"required":  false,
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/up-1/presign-batch":
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number":     1,
+					"url":        "http://" + r.Host + "/upload/1",
+					"size":       fileSize,
+					"headers":    map[string]string{},
+					"expires_at": time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+				}},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/upload/1":
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.Header().Set("ETag", `"etag-1"`)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/up-1/complete":
+			var req struct {
+				Parts []struct {
+					Number int    `json:"number"`
+					ETag   string `json:"etag"`
+				} `json:"parts"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad complete body", http.StatusBadRequest)
+				return
+			}
+			completeParts = len(req.Parts)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	ino := fs.inodes.Lookup("/new.bin", false, 0, time.Now())
+	wb := NewWriteBuffer("/new.bin", 0, 0)
+	_, err := wb.Write(0, make([]byte, fileSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     "/new.bin",
+		Dirty:    wb,
+		OrigSize: 0,
+		IsNew:    true,
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, wb.Size())
+	fhID := fs.fileHandles.Allocate(fh)
+
+	st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       fhID,
+	})
+	if st != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", st)
+	}
+	if gotExpected != 0 {
+		t.Fatalf("expected_revision = %d, want 0", gotExpected)
+	}
+	if completeParts != 1 {
+		t.Fatalf("complete parts = %d, want 1", completeParts)
+	}
+}
+
+func TestWriteBufferCanMaterializeFull(t *testing.T) {
+	wb := NewWriteBuffer("/file.bin", 0, 8)
+	wb.totalSize = 16
+	wb.remoteSize = 16
+	wb.parts[0] = []byte("12345678")
+	if wb.CanMaterializeFull() {
+		t.Fatal("expected partial remote coverage to be unsafe for full materialization")
+	}
+
+	wb.parts[1] = []byte("abcdefgh")
+	if !wb.CanMaterializeFull() {
+		t.Fatal("expected complete remote coverage to be safe for full materialization")
+	}
+
+	if err := wb.Truncate(4); err != nil {
+		t.Fatal(err)
+	}
+	delete(wb.parts, 1)
+	if !wb.CanMaterializeFull() {
+		t.Fatal("truncate should drop the need to materialize removed remote ranges")
+	}
+}
+
 func TestGetAttrPrefersDirtyHandleSize(t *testing.T) {
 	fs, ino, cleanup := newTestDat9FS(t, 4, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, "data")
@@ -273,14 +745,17 @@ func TestOpenWritableLargeFileGetsLazyPreload(t *testing.T) {
 	}
 }
 
-func TestDefaultTTLIs60Seconds(t *testing.T) {
+func TestDefaultTTLIs1Second(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	if opts.AttrTTL != 60*time.Second {
-		t.Fatalf("default AttrTTL = %v, want 60s", opts.AttrTTL)
+	if opts.AttrTTL != 1*time.Second {
+		t.Fatalf("default AttrTTL = %v, want 1s", opts.AttrTTL)
 	}
-	if opts.EntryTTL != 60*time.Second {
-		t.Fatalf("default EntryTTL = %v, want 60s", opts.EntryTTL)
+	if opts.EntryTTL != 1*time.Second {
+		t.Fatalf("default EntryTTL = %v, want 1s", opts.EntryTTL)
+	}
+	if opts.NegativeEntryTTL != 1*time.Second {
+		t.Fatalf("default NegativeEntryTTL = %v, want 1s", opts.NegativeEntryTTL)
 	}
 }
 
@@ -295,13 +770,14 @@ func TestLookupReturnsTTLInEntryOut(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("Lookup status = %v, want OK", st)
 	}
-	// The entry timeout should match the configured TTL (60s default).
+	// The entry timeout should match the configured TTL (1s default).
 	// go-fuse stores timeouts in seconds + nanoseconds.
-	if out.EntryValid < 59 {
-		t.Fatalf("EntryValid = %d, want >= 59 (60s TTL)", out.EntryValid)
+	// With 1s TTL, EntryValid should be ~1.
+	if out.EntryValid < 1 || out.EntryValid > 2 {
+		t.Fatalf("EntryValid = %d, want ~1 (1s TTL)", out.EntryValid)
 	}
-	if out.AttrValid < 59 {
-		t.Fatalf("AttrValid = %d, want >= 59 (60s TTL)", out.AttrValid)
+	if out.AttrValid < 1 || out.AttrValid > 2 {
+		t.Fatalf("AttrValid = %d, want ~1 (1s TTL)", out.AttrValid)
 	}
 }
 
@@ -973,7 +1449,7 @@ func TestFlushHandle_SmallFile_ServerUnreachable(t *testing.T) {
 		Ino:      ino,
 		Path:     "/slow.txt",
 		Dirty:    wb,
-		Streamer: NewStreamUploader(fs.client, "/slow.txt"),
+		Streamer: NewStreamUploader(fs.client, "/slow.txt", -1),
 	}
 	fh.DirtySeq = fs.markDirtySize(ino, wb.Size())
 	fhID := fs.fileHandles.Allocate(fh)
