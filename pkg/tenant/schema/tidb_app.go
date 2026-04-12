@@ -61,6 +61,7 @@ func tidbAppEmbeddingSchemaStatements() []string {
 			total_size         BIGINT NOT NULL,
 			part_size          BIGINT NOT NULL,
 			parts_total        INT NOT NULL,
+			expected_revision  BIGINT NULL,
 			status             VARCHAR(32) NOT NULL DEFAULT 'UPLOADING',
 			fingerprint_sha256 VARCHAR(128),
 			idempotency_key    VARCHAR(255),
@@ -69,6 +70,7 @@ func tidbAppEmbeddingSchemaStatements() []string {
 			expires_at         DATETIME(3) NOT NULL,
 			active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED
 		)`,
+		`ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL`,
 		`CREATE INDEX idx_upload_path ON uploads(target_path, status)`,
 		`CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)`,
 		`CREATE TABLE IF NOT EXISTS semantic_tasks (

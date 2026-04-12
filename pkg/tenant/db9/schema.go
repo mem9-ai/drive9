@@ -70,6 +70,7 @@ func initDB9Schema(dsn string) error {
 			total_size         BIGINT NOT NULL,
 			part_size          BIGINT NOT NULL,
 			parts_total        INT NOT NULL,
+			expected_revision  BIGINT,
 			status             VARCHAR(32) NOT NULL DEFAULT 'UPLOADING',
 			fingerprint_sha256 VARCHAR(128),
 			idempotency_key    VARCHAR(255),

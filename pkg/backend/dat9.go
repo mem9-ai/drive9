@@ -293,6 +293,16 @@ func (b *Dat9Backend) Write(path string, data []byte, offset int64, flags filesy
 }
 
 func (b *Dat9Backend) WriteCtx(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag) (n int64, err error) {
+	return b.WriteCtxIfRevision(ctx, path, data, offset, flags, -1)
+}
+
+// WriteCtxIfRevision applies the write only when expectedRevision matches the
+// current file revision.
+// expectedRevision semantics:
+// - negative: unconditional write
+// - zero: path must not already exist
+// - positive: file must exist at exactly that revision
+func (b *Dat9Backend) WriteCtxIfRevision(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64) (n int64, err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, "write", err, start) }()
 
@@ -303,13 +313,26 @@ func (b *Dat9Backend) WriteCtx(ctx context.Context, path string, data []byte, of
 
 	existing, err := b.store.Stat(ctx, path)
 	if err == datastore.ErrNotFound {
+		if expectedRevision > 0 {
+			return 0, datastore.ErrRevisionConflict
+		}
 		if flags&filesystem.WriteFlagCreate == 0 {
+			if expectedRevision == 0 {
+				return 0, datastore.ErrRevisionConflict
+			}
 			return 0, datastore.ErrNotFound
 		}
-		return b.createAndWriteCtx(ctx, path, data)
+		n, err := b.createAndWriteCtx(ctx, path, data)
+		if expectedRevision == 0 && errors.Is(err, datastore.ErrPathConflict) {
+			return 0, datastore.ErrRevisionConflict
+		}
+		return n, err
 	}
 	if err != nil {
 		return 0, err
+	}
+	if expectedRevision == 0 {
+		return 0, datastore.ErrRevisionConflict
 	}
 	if existing.Node.IsDirectory {
 		return 0, fmt.Errorf("is a directory: %s", path)
@@ -317,7 +340,10 @@ func (b *Dat9Backend) WriteCtx(ctx context.Context, path string, data []byte, of
 	if flags&filesystem.WriteFlagExclusive != 0 {
 		return 0, fmt.Errorf("file already exists: %s", path)
 	}
-	return b.overwriteFileCtx(ctx, existing, data, offset, flags)
+	if expectedRevision > 0 && (existing.File == nil || existing.File.Revision != expectedRevision) {
+		return 0, datastore.ErrRevisionConflict
+	}
+	return b.overwriteFileCtx(ctx, existing, data, offset, flags, expectedRevision)
 }
 
 func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte) (int64, error) {
@@ -393,7 +419,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	return int64(len(data)), nil
 }
 
-func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag) (int64, error) {
+func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64) (int64, error) {
 	if nf.File == nil {
 		return 0, fmt.Errorf("no file entity")
 	}
@@ -452,15 +478,29 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		}
 		var txErr error
 		if b.UsesDatabaseAutoEmbedding() {
-			newRev, txErr = b.store.UpdateFileContentAutoEmbeddingTx(tx,
-				nf.File.FileID, storageType, storageRef,
-				contentType, checksum, contentText, contentBlob, int64(len(finalData)),
-			)
+			if expectedRevision > 0 {
+				newRev, txErr = b.store.UpdateFileContentAutoEmbeddingIfRevisionTx(tx,
+					nf.File.FileID, expectedRevision, storageType, storageRef,
+					contentType, checksum, contentText, contentBlob, int64(len(finalData)),
+				)
+			} else {
+				newRev, txErr = b.store.UpdateFileContentAutoEmbeddingTx(tx,
+					nf.File.FileID, storageType, storageRef,
+					contentType, checksum, contentText, contentBlob, int64(len(finalData)),
+				)
+			}
 		} else {
-			newRev, txErr = b.store.UpdateFileContentTx(tx,
-				nf.File.FileID, storageType, storageRef,
-				contentType, checksum, contentText, contentBlob, int64(len(finalData)),
-			)
+			if expectedRevision > 0 {
+				newRev, txErr = b.store.UpdateFileContentIfRevisionTx(tx,
+					nf.File.FileID, expectedRevision, storageType, storageRef,
+					contentType, checksum, contentText, contentBlob, int64(len(finalData)),
+				)
+			} else {
+				newRev, txErr = b.store.UpdateFileContentTx(tx,
+					nf.File.FileID, storageType, storageRef,
+					contentType, checksum, contentText, contentBlob, int64(len(finalData)),
+				)
+			}
 		}
 		if txErr != nil {
 			return txErr

@@ -8,12 +8,13 @@ import (
 
 // InodeEntry holds metadata for a single inode in the FUSE filesystem.
 type InodeEntry struct {
-	Ino     uint64
-	Path    string
-	IsDir   bool
-	Nlookup int64 // kernel lookup reference count
-	Size    int64
-	Mtime   time.Time
+	Ino      uint64
+	Path     string
+	IsDir    bool
+	Nlookup  int64 // kernel lookup reference count
+	Size     int64
+	Mtime    time.Time
+	Revision int64 // server-side revision for cache validation
 }
 
 // InodeToPath provides a bidirectional mapping between inode numbers and
@@ -196,6 +197,16 @@ func (m *InodeToPath) UpdateMtime(ino uint64, mtime time.Time) {
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Mtime = mtime
+	}
+}
+
+// UpdateRevision updates the server revision of the entry identified by ino.
+func (m *InodeToPath) UpdateRevision(ino uint64, revision int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Revision = revision
 	}
 }
 
