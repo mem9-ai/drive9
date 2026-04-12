@@ -103,11 +103,12 @@ func (s *ShadowStore) Ensure(remotePath string, size int64, baseRev int64) error
 	if err != nil {
 		return err
 	}
-	if err := sf.fd.Truncate(size); err != nil {
-		return fmt.Errorf("shadow ensure truncate: %w", err)
-	}
 
 	s.mu.Lock()
+	if err := sf.fd.Truncate(size); err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("shadow ensure truncate: %w", err)
+	}
 	sf.size = size
 	if baseRev != 0 {
 		sf.baseRev = baseRev
@@ -236,10 +237,11 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *WriteBuffer, baseRev i
 	if baseRev != 0 {
 		sf.baseRev = baseRev
 	}
+	targetSize := sf.size
 	s.mu.Unlock()
 
 	// Truncate to exact size if needed (handle shrinks).
-	if err := sf.fd.Truncate(sf.size); err != nil {
+	if err := sf.fd.Truncate(targetSize); err != nil {
 		return fmt.Errorf("shadow truncate: %w", err)
 	}
 
@@ -271,7 +273,12 @@ func (s *ShadowStore) ReadAt(remotePath string, offset int64, buf []byte) (int, 
 			fd.Close()
 			sf = existingSf
 		} else {
-			fi, _ := fd.Stat()
+			fi, err := fd.Stat()
+			if err != nil {
+				fd.Close()
+				s.mu.Unlock()
+				return 0, fmt.Errorf("shadow stat: %w", err)
+			}
 			sf = &ShadowFile{fd: fd, size: fi.Size()}
 			s.files[remotePath] = sf
 		}
@@ -285,6 +292,10 @@ func (s *ShadowStore) ReadAt(remotePath string, offset int64, buf []byte) (int, 
 func (s *ShadowStore) ReadAll(remotePath string) ([]byte, error) {
 	s.mu.RLock()
 	sf, ok := s.files[remotePath]
+	var size int64
+	if ok {
+		size = sf.size
+	}
 	s.mu.RUnlock()
 
 	if !ok {
@@ -293,7 +304,7 @@ func (s *ShadowStore) ReadAll(remotePath string) ([]byte, error) {
 		return os.ReadFile(sp)
 	}
 
-	data := make([]byte, sf.size)
+	data := make([]byte, size)
 	_, err := sf.fd.ReadAt(data, 0)
 	if err != nil {
 		return nil, err
@@ -305,10 +316,14 @@ func (s *ShadowStore) ReadAll(remotePath string) ([]byte, error) {
 func (s *ShadowStore) Size(remotePath string) int64 {
 	s.mu.RLock()
 	sf, ok := s.files[remotePath]
+	var size int64
+	if ok {
+		size = sf.size
+	}
 	s.mu.RUnlock()
 
 	if ok {
-		return sf.size
+		return size
 	}
 
 	// Check disk.
@@ -359,8 +374,14 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 	// Rename on disk.
 	oldSP := s.shadowPath(oldPath)
 	newSP := s.shadowPath(newPath)
-	_ = os.Rename(oldSP, newSP)
-
+	if err := os.Rename(oldSP, newSP); err != nil {
+		// Rollback in-memory state on disk failure.
+		s.mu.Lock()
+		delete(s.files, newPath)
+		s.files[oldPath] = sf
+		s.mu.Unlock()
+		return false
+	}
 	return true
 }
 

@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 )
@@ -32,17 +33,18 @@ func (m SyncMode) String() string {
 	}
 }
 
-// ParseSyncMode converts a string to SyncMode.
-func ParseSyncMode(s string) SyncMode {
+// ParseSyncMode converts a string to SyncMode. Returns an error for unknown values
+// so that typos like "strcit" fail fast instead of silently falling back to auto.
+func ParseSyncMode(s string) (SyncMode, error) {
 	switch s {
 	case "interactive":
-		return SyncInteractive
+		return SyncInteractive, nil
 	case "strict":
-		return SyncStrict
-	case "auto":
-		return SyncAuto
+		return SyncStrict, nil
+	case "auto", "":
+		return SyncAuto, nil
 	default:
-		return SyncAuto
+		return SyncAuto, fmt.Errorf("unknown sync mode %q (valid: auto, interactive, strict)", s)
 	}
 }
 

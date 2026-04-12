@@ -60,6 +60,11 @@ func MountCmd(args []string) error {
 		return fmt.Errorf("API key required (--api-key or $DRIVE9_API_KEY)")
 	}
 
+	syncModeVal, err := drive9fuse.ParseSyncMode(*syncMode)
+	if err != nil {
+		return err
+	}
+
 	opts := &drive9fuse.MountOptions{
 		Server:        *server,
 		APIKey:        *apiKey,
@@ -69,7 +74,7 @@ func MountCmd(args []string) error {
 		AttrTTL:       *attrTTL,
 		EntryTTL:      *entryTTL,
 		FlushDebounce: *flushDebounce,
-		SyncMode:      drive9fuse.ParseSyncMode(*syncMode),
+		SyncMode:      syncModeVal,
 		Profile:       *profile,
 		AllowOther:    *allowOther,
 		ReadOnly:      *readOnly,

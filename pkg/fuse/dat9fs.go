@@ -749,6 +749,20 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		// Remove pending cache entry to prevent future background uploads.
 		fs.writeBack.Remove(childP)
 	}
+	// Also check pendingIndex for the pending-new flag before clearing.
+	if !pendingNew && fs.pendingIndex != nil {
+		if meta, ok := fs.pendingIndex.GetMeta(childP); ok && meta.Kind == PendingNew {
+			pendingNew = true
+		}
+	}
+	// Clean up shadow and pending index so background commits / recovery
+	// cannot resurrect the deleted file.
+	if fs.pendingIndex != nil {
+		fs.pendingIndex.Remove(childP)
+	}
+	if fs.shadowStore != nil {
+		fs.shadowStore.Remove(childP)
+	}
 
 	if !pendingNew {
 		ctx, cf := fuseCtx(cancel)
@@ -789,8 +803,8 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 
 	// Clean write-back entries for files under the removed directory.
 	// Without this, the uploader would try to PUT to paths under a deleted dir.
+	prefix := childP + "/"
 	if fs.writeBack != nil {
-		prefix := childP + "/"
 		for p := range fs.writeBack.ListPendingPaths() {
 			if strings.HasPrefix(p, prefix) {
 				if fs.uploader != nil {
@@ -798,6 +812,16 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 				}
 				fs.writeBack.Remove(p)
 			}
+		}
+	}
+	// Also clean pendingIndex and shadowStore for the subtree so that
+	// background commits and crash recovery cannot resurrect deleted files.
+	if fs.pendingIndex != nil {
+		for _, meta := range fs.pendingIndex.ListByPrefix(prefix) {
+			if fs.shadowStore != nil {
+				fs.shadowStore.Remove(meta.Path)
+			}
+			fs.pendingIndex.Remove(meta.Path)
 		}
 	}
 
@@ -882,8 +906,8 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	// After server-side rename, migrate pending descendants.
 	// If oldP is a directory, pending children under oldP+"/", must be
 	// re-keyed to newP+"/". Without this the uploader would PUT to stale paths.
+	prefix := oldP + "/"
 	if fs.writeBack != nil {
-		prefix := oldP + "/"
 		for p := range fs.writeBack.ListPendingPaths() {
 			if strings.HasPrefix(p, prefix) {
 				newChild := newP + p[len(oldP):]
@@ -891,13 +915,20 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 					fs.uploader.WaitPath(p)
 				}
 				fs.writeBack.RenamePending(p, newChild)
-				// Re-submit so the uploader picks up the new path.
-				// The old path's queued entry (if any) will be a no-op
-				// because GetMeta returns false after RenamePending.
 				if fs.uploader != nil {
 					fs.uploader.Submit(newChild)
 				}
 			}
+		}
+	}
+	// Also migrate pendingIndex and shadowStore entries for descendants.
+	if fs.pendingIndex != nil {
+		for _, meta := range fs.pendingIndex.ListByPrefix(prefix) {
+			newChild := newP + meta.Path[len(oldP):]
+			if fs.shadowStore != nil {
+				fs.shadowStore.Rename(meta.Path, newChild)
+			}
+			fs.pendingIndex.RenamePending(meta.Path, newChild)
 		}
 	}
 
@@ -1219,6 +1250,16 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		if fs.opts.ReadOnly {
 			return gofuse.EROFS
 		}
+
+		// If BaseRev is 0 (e.g. inode came from readdir without revision),
+		// fetch the authoritative revision so CAS uploads work correctly.
+		if fh.BaseRev == 0 && !fh.IsNew {
+			if stat, err := fs.client.StatCtx(ctx, p); err == nil && stat != nil {
+				fh.BaseRev = stat.Revision
+				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
+			}
+		}
+
 		fh.Dirty = NewWriteBuffer(p, maxPreloadSize, 0)
 
 		// Preload existing content for non-truncating opens so that
@@ -1717,6 +1758,11 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					if err := fs.commitQueue.Enqueue(entry); err != nil {
 						// Backpressure — fall back to legacy uploader.
 						fs.uploader.Submit(fh.Path)
+					} else {
+						// CommitQueue owns the upload via shadow; remove the
+						// writeBack .dat/.meta snapshot so it doesn't leak or
+						// serve stale data to Lookup/Read.
+						fs.writeBack.Remove(fh.Path)
 					}
 				} else {
 					// Async upload — the uploader will read from cache and upload.

@@ -166,8 +166,10 @@ func (j *Journal) Compact() error {
 		return err
 	}
 
-	// First pass: find committed sequences.
-	committed := make(map[string]bool) // path → committed
+	// First pass: find the highest committed sequence per path.
+	// Only entries with Seq <= committedUpTo[path] are safe to discard.
+	// Entries written after the commit must be preserved for recovery.
+	committedUpTo := make(map[string]uint64) // path → max committed seq
 	pos := 0
 	for pos+8 <= len(data) {
 		payloadLen := binary.LittleEndian.Uint32(data[pos : pos+4])
@@ -187,16 +189,19 @@ func (j *Journal) Compact() error {
 			continue
 		}
 		if entry.Op == JournalCommit {
-			committed[entry.Path] = true
+			if entry.Seq > committedUpTo[entry.Path] {
+				committedUpTo[entry.Path] = entry.Seq
+			}
 		}
 		pos = frameEnd
 	}
 
-	if len(committed) == 0 {
+	if len(committedUpTo) == 0 {
 		return nil // nothing to compact
 	}
 
-	// Second pass: collect non-committed frames.
+	// Second pass: keep frames that are newer than the commit boundary
+	// for their path, and all frames for paths without a commit marker.
 	var kept []byte
 	pos = 0
 	for pos+8 <= len(data) {
@@ -216,7 +221,8 @@ func (j *Journal) Compact() error {
 			pos = frameEnd
 			continue
 		}
-		if !committed[entry.Path] {
+		boundary, hasCommit := committedUpTo[entry.Path]
+		if !hasCommit || entry.Seq > boundary {
 			kept = append(kept, data[pos:frameEnd]...)
 		}
 		pos = frameEnd

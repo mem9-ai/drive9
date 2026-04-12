@@ -152,13 +152,13 @@ func (idx *PendingIndex) Generation(remotePath string) uint64 {
 // RenamePending atomically moves a pending entry from oldPath to newPath.
 // Returns true if there was a pending entry to rename.
 func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
-	idx.mu.Lock()
+	idx.mu.RLock()
 	meta, ok := idx.items[oldPath]
 	if !ok {
-		idx.mu.Unlock()
+		idx.mu.RUnlock()
 		return false
 	}
-
+	// Copy fields under read lock.
 	gen := idx.nextGen.Add(1)
 	newMeta := &WriteBackMeta{
 		Path:       newPath,
@@ -169,14 +169,20 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 		Kind:       meta.Kind,
 		BaseRev:    meta.BaseRev,
 	}
+	idx.mu.RUnlock()
+
+	// Persist new meta to disk BEFORE updating memory so that crash
+	// recovery always has a consistent view.
+	metaBytes, _ := json.Marshal(newMeta)
+	newMetaPath := filepath.Join(idx.dir, hashPath(newPath)+".meta")
+	if err := atomicWrite(newMetaPath, metaBytes); err != nil {
+		return false
+	}
+
+	idx.mu.Lock()
 	delete(idx.items, oldPath)
 	idx.items[newPath] = newMeta
 	idx.mu.Unlock()
-
-	// Update disk: write new meta, remove old.
-	metaBytes, _ := json.Marshal(newMeta)
-	newMetaPath := filepath.Join(idx.dir, hashPath(newPath)+".meta")
-	_ = atomicWrite(newMetaPath, metaBytes)
 
 	oldMetaPath := filepath.Join(idx.dir, hashPath(oldPath)+".meta")
 	_ = os.Remove(oldMetaPath)

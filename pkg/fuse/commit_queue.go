@@ -32,10 +32,10 @@ type CommitQueue struct {
 	index      *PendingIndex
 	journal    *Journal
 	wg         sync.WaitGroup
-	stopCh     chan struct{}
 	stopped    bool
 
-	// Upload workers
+	// workCh dispatches entries to upload workers. The buffer is always
+	// larger than maxPending so Enqueue never blocks.
 	workCh chan *CommitEntry
 }
 
@@ -47,14 +47,18 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 	if maxPending <= 0 {
 		maxPending = maxCommitQueuePending
 	}
+	// Buffer must be > maxPending so Enqueue's send never blocks.
+	bufSize := maxPending * 2
+	if bufSize < 256 {
+		bufSize = 256
+	}
 	cq := &CommitQueue{
 		maxPending: maxPending,
 		client:     c,
 		shadows:    shadows,
 		index:      index,
 		journal:    journal,
-		stopCh:     make(chan struct{}),
-		workCh:     make(chan *CommitEntry, 256),
+		workCh:     make(chan *CommitEntry, bufSize),
 	}
 	for i := 0; i < numWorkers; i++ {
 		cq.wg.Add(1)
@@ -78,13 +82,9 @@ func (cq *CommitQueue) Enqueue(entry *CommitEntry) error {
 	cq.queue = append(cq.queue, entry)
 	cq.mu.Unlock()
 
-	// Send to worker channel (non-blocking with fallback).
-	select {
-	case cq.workCh <- entry:
-	default:
-		// Channel full — will be picked up when a worker becomes free.
-		log.Printf("commit queue: work channel full, entry for %s queued", entry.Path)
-	}
+	// Send to workers. The channel buffer is always > maxPending, so this
+	// will not block as long as the backpressure check above holds.
+	cq.workCh <- entry
 	return nil
 }
 
@@ -107,9 +107,11 @@ func (cq *CommitQueue) DrainAll() {
 	cq.mu.Lock()
 	if !cq.stopped {
 		cq.stopped = true
-		close(cq.workCh)
 	}
 	cq.mu.Unlock()
+
+	// Close workCh so workers exit after processing remaining entries.
+	close(cq.workCh)
 	cq.wg.Wait()
 }
 
@@ -224,20 +226,24 @@ func (cq *CommitQueue) removeFromQueue(entry *CommitEntry) {
 func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry) {
 	cq.removeFromQueue(entry)
 
+	// Write durable commit record BEFORE cleaning up local state so that
+	// crash recovery never re-uploads an already committed entry.
+	if cq.journal != nil {
+		if err := cq.journal.Append(JournalEntry{
+			Op:   JournalCommit,
+			Path: entry.Path,
+		}); err != nil {
+			log.Printf("commit queue: journal commit marker failed for %s: %v (keeping local state)", entry.Path, err)
+			return
+		}
+	}
+
 	// Clean up shadow and pending index.
 	if cq.shadows != nil {
 		cq.shadows.Remove(entry.Path)
 	}
 	if cq.index != nil {
 		cq.index.Remove(entry.Path)
-	}
-
-	// Mark as committed in journal.
-	if cq.journal != nil {
-		_ = cq.journal.Append(JournalEntry{
-			Op:   JournalCommit,
-			Path: entry.Path,
-		})
 	}
 
 	log.Printf("commit queue: successfully uploaded %s (%d bytes)", entry.Path, entry.Size)

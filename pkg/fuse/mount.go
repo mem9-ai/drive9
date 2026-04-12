@@ -126,12 +126,16 @@ func Mount(opts *MountOptions) error {
 				fmt.Fprintf(os.Stderr, "dat9: journal init failed: %v (continuing without)\n", err)
 			} else {
 				dat9fs.journal = journal
-				// Replay journal for crash recovery.
+				// Replay journal for crash recovery. Preserve the original kind
+				// and base revision so CommitQueue.RecoverPending can re-enqueue.
 				_ = journal.Replay(func(e JournalEntry) {
-					// Re-register pending paths from journal.
 					if pendingIdx != nil && e.Op != JournalCommit && e.Op != JournalUnlink {
 						if !pendingIdx.HasPending(e.Path) {
-							_, _ = pendingIdx.Put(e.Path, 0, PendingOverwrite)
+							kind := PendingOverwrite
+							if e.BaseRev == 0 {
+								kind = PendingNew
+							}
+							_, _ = pendingIdx.PutWithBaseRev(e.Path, e.Length, kind, e.BaseRev)
 						}
 					}
 				})
