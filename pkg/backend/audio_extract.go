@@ -64,14 +64,13 @@ func (b *Dat9Backend) SupportsAsyncAudioExtract() bool {
 // audio_extract_text closed set. It is consulted only when content_type is
 // missing or too generic.
 //
-// The shipped set intentionally stays small: MP3, WAV, and MP4 container
-// uploads. Broader formats remain deferred; see TODO(post-MVP audio) and
+// The shipped set stays small: MP3, WAV, MP4, and M4A (audio in MP4
+// container). Broader formats remain deferred; see TODO(post-MVP audio) and
 // TODO(WebM) below.
 //
-// TODO(post-MVP audio): Restore M4A, AAC, FLAC, OGG extensions (and MIME /
+// TODO(post-MVP audio): Restore AAC, FLAC, OGG extensions (and MIME /
 // alias allowlist entries) once the extractor and tests cover them.
 //
-//	".m4a":  "audio/mp4",
 //	".aac":  "audio/aac",
 //	".ogg":  "audio/ogg",
 //	".flac": "audio/flac",
@@ -84,16 +83,16 @@ var audioExtensionMIME = map[string]string{
 	".mp3": "audio/mpeg",
 	".wav": "audio/wav",
 	".mp4": "audio/mp4",
+	".m4a": "audio/mp4",
 }
 
 // allowedAudioMIME is the current closed set for durable audio_extract_text.
 // MP4 container uploads are admitted here even though detectContentType()
 // commonly reports video/mp4 for .mp4 paths.
 //
-// TODO(post-MVP audio): Re-add closed-set entries for M4A, AAC, OGG, FLAC
-// (and aliases such as audio/mp4a-latm) when those formats return to scope.
+// TODO(post-MVP audio): Re-add closed-set entries for AAC, OGG, FLAC
+// (and further aliases) when those formats return to scope.
 //
-//	"audio/x-m4a": {},
 //	"audio/aac":   {},
 //	"audio/ogg":   {},
 //	"audio/flac":  {},
@@ -104,6 +103,7 @@ var allowedAudioMIME = map[string]struct{}{
 	"audio/wav":   {},
 	"audio/x-wav": {},
 	"audio/mp4":   {},
+	"audio/x-m4a": {},
 }
 
 func stripMIMEParams(ct string) string {
@@ -126,25 +126,16 @@ func stripMIMEParams(ct string) string {
 // semantic routing can treat .mp4 uploads as audio_extract_text candidates
 // without changing detectContentType().
 //
-// TODO(post-MVP audio): When M4A, AAC, and FLAC are allowlisted again,
-// restore alias normalization, for example:
-//
-//	switch ct {
-//	case "audio/mp4a-latm":
-//		return "audio/mp4"
-//	case "audio/x-aac":
-//		return "audio/aac"
-//	case "audio/x-flac":
-//		return "audio/flac"
-//	default:
-//		return ct
-//	}
+// TODO(post-MVP audio): When AAC and FLAC are allowlisted again, restore
+// further alias normalization (e.g. audio/x-aac -> audio/aac).
 func normalizeStdlibAudioMIMEAliases(ct string) string {
 	ct = stripMIMEParams(ct)
 	switch ct {
 	case "audio/wave", "audio/vnd.wave", "audio/x-pn-wav":
 		return "audio/wav"
 	case "video/mp4", "application/mp4":
+		return "audio/mp4"
+	case "audio/mp4a-latm":
 		return "audio/mp4"
 	default:
 		return ct
@@ -230,7 +221,7 @@ func resolvedAudioExtractContentType(storedContentType, payloadContentType, reso
 	}
 	for _, candidate := range []string{storedContentType, payloadContentType} {
 		switch stripMIMEParams(candidate) {
-		case "video/mp4", "application/mp4":
+		case "video/mp4", "application/mp4", "audio/x-m4a":
 			return stripMIMEParams(candidate)
 		}
 	}

@@ -281,7 +281,7 @@ func TestWriteCreateAutoEmbeddingMP4EnqueuesAudioExtractTask(t *testing.T) {
 	}
 }
 
-func TestWriteCreateAutoEmbeddingSkipsM4AForAudioExtract(t *testing.T) {
+func TestWriteCreateAutoEmbeddingM4AEnqueuesAudioExtractTask(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
 		DatabaseAutoEmbedding: true,
 		AsyncAudioExtract: AsyncAudioExtractOptions{
@@ -292,15 +292,26 @@ func TestWriteCreateAutoEmbeddingSkipsM4AForAudioExtract(t *testing.T) {
 	if _, err := b.Write("/tracks/create.m4a", []byte{0x00, 0x00, 0x00}, 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}
-	fileID, revision, _, _ := mustFileForPath(t, b, "/tracks/create.m4a")
+	fileID, revision, _, contentType := mustFileForPath(t, b, "/tracks/create.m4a")
 	if revision != 1 {
 		t.Fatalf("revision=%d, want 1", revision)
 	}
+	wantCT := detectContentType("/tracks/create.m4a", nil)
+	if contentType != wantCT {
+		t.Fatalf("content_type=%q, want %q", contentType, wantCT)
+	}
 	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var audioSeen bool
 	for _, tsk := range tasks {
 		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
-			t.Fatalf("MVP audio_extract_text is MP3/WAV only; unexpected task: %+v", tsk)
+			audioSeen = true
+			if tsk.Status != string(semantic.TaskQueued) || tsk.ResourceVersion != 1 {
+				t.Fatalf("unexpected audio task: %+v", tsk)
+			}
 		}
+	}
+	if !audioSeen {
+		t.Fatalf("expected audio_extract_text among %+v", tasks)
 	}
 }
 
@@ -900,7 +911,7 @@ func TestConfirmUploadOverwriteAutoEmbeddingEnqueuesAudioExtractTask(t *testing.
 	}
 }
 
-func TestConfirmUploadAutoEmbeddingSkipsM4AUploadCompletion(t *testing.T) {
+func TestConfirmUploadAutoEmbeddingEnqueuesAudioExtractTaskForM4A(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
 		DatabaseAutoEmbedding: true,
 		AsyncAudioExtract: AsyncAudioExtractOptions{
@@ -918,12 +929,26 @@ func TestConfirmUploadAutoEmbeddingSkipsM4AUploadCompletion(t *testing.T) {
 	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
 		t.Fatal(err)
 	}
-	fileID, _, _, _ := mustFileForPath(t, b, "/upload/clip.m4a")
+	fileID, revision, _, contentType := mustFileForPath(t, b, "/upload/clip.m4a")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	wantCT := detectContentType("/upload/clip.m4a", nil)
+	if contentType != wantCT {
+		t.Fatalf("content_type=%q, want %q", contentType, wantCT)
+	}
 	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var audioSeen bool
 	for _, tsk := range tasks {
 		if tsk.TaskType == string(semantic.TaskTypeAudioExtractText) {
-			t.Fatalf("MVP closed set excludes .m4a upload completion, got %+v", tsk)
+			audioSeen = true
+			if tsk.Status != string(semantic.TaskQueued) || tsk.ResourceVersion != 1 {
+				t.Fatalf("unexpected audio task: %+v", tsk)
+			}
 		}
+	}
+	if !audioSeen {
+		t.Fatalf("expected audio_extract_text for upload completion .m4a among %+v", tasks)
 	}
 }
 

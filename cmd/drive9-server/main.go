@@ -162,6 +162,11 @@ func main() {
 	}
 
 	if pool != nil {
+		// TODO: Run ValidateDurableAsyncExtractRequiresSemanticWorker only when this process
+		// can serve tenants that enqueue durable audio_extract_text / img_extract_text
+		// (database auto-embedding: tidb_zero, tidb_cloud_starter). pool != nil is too broad
+		// for db9-only pools, which never hit that path but still get forced to configure
+		// DRIVE9_EMBED_* when async extract is wired on the template (PR #159 review).
 		if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
 			Meta:             store,
 			Pool:             pool,
@@ -248,7 +253,10 @@ environment:
   DRIVE9_IMAGE_EXTRACT_MODEL    model name for vision extraction (optional)
   DRIVE9_IMAGE_EXTRACT_PROMPT   custom extraction prompt (optional)
   DRIVE9_IMAGE_EXTRACT_MAX_TOKENS max model output tokens (default: 256)
-  Audio extraction (async audio -> text for search, requires explicit provider wiring):
+  Audio extraction (async audio -> text for search; MVP durable path is TiDB auto-embedding only):
+  Durable audio_extract_text tasks enqueue only for tenants with database auto-embedding
+  (tidb_zero / tidb_cloud_starter). For db9-only or other app-managed tenants these vars do
+  not enable that semantic_tasks pipeline. When enabled, explicit provider wiring is required:
   DRIVE9_AUDIO_EXTRACT_ENABLED true|false (default: false)
   DRIVE9_AUDIO_EXTRACT_MAX_BYTES max audio bytes processed per task (default: 33554432)
   DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS extractor timeout seconds (default: 120)

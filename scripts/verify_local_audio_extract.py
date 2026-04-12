@@ -8,8 +8,8 @@ Exercises HTTP paths aligned with docs/impl/audio-extract-local-e2e-validation-i
 - Overwrite via second PUT to the same path
 - Multipart v1: `/v1/uploads/initiate` -> part PUTs -> `/complete`
 - Multipart v2: `/v2/uploads/initiate` -> `presign-batch` -> part PUTs -> `/complete`
-- Closed-set negative: `.m4a` must not get `audio_extract_text` (server must have
-  stub audio enabled for other scenarios)
+- Closed-set negative: `.webm` must not get `audio_extract_text` (WebM is outside the
+  MVP closed set; server must have stub audio enabled for other scenarios)
 - Optional: `--expect-no-audio-tasks` for a server *without* audio runtime (upload  `.mp3` and assert no succeeded audio task)
 
 Requires TiDB auto-embedding + `DRIVE9_AUDIO_EXTRACT_ENABLED=true`.
@@ -192,7 +192,7 @@ class Verifier:
         )
 
     def assert_no_audio_extract_task(self, path: str, settle_seconds: float) -> None:
-        """After `settle_seconds`, fail if a succeeded audio_extract_text exists for this path."""
+        """After `settle_seconds`, fail if any audio_extract_text task exists for this path (any status)."""
         path_lit = sql_string_literal(path)
         query = (
             "SELECT n.path, f.revision, t.task_id, t.task_type, t.status "
@@ -208,10 +208,9 @@ class Verifier:
             return
         row = rows[0]
         tt = row.get("task_type")
-        st = row.get("status")
-        if tt == "audio_extract_text" and st == "succeeded":
+        if tt == "audio_extract_text":
             raise RuntimeError(
-                f"unexpected audio_extract_text success for {path}: {json.dumps(rows, ensure_ascii=False)}"
+                f"unexpected audio_extract_text task for {path}: {json.dumps(rows, ensure_ascii=False)}"
             )
 
     def verify_grep_under_prefix(
@@ -501,9 +500,12 @@ def parse_args() -> argparse.Namespace:
         help="skip v2 multipart flow",
     )
     p.add_argument(
+        "--skip-negative-webm",
         "--skip-negative-m4a",
         action="store_true",
-        help="skip closed-set negative (.m4a)",
+        dest="skip_negative_webm",
+        help="skip closed-set negative (.webm excluded from MVP). "
+        "--skip-negative-m4a is a deprecated alias.",
     )
     p.add_argument(
         "--expect-no-audio-tasks",
@@ -628,13 +630,13 @@ def main() -> int:
             v.verify_grep_under_prefix("/audio/", "transcript", mp2)
         print_result(r)
 
-    if not args.skip_negative_m4a:
-        neg = make_unique_path("closed-neg", ".m4a")
+    if not args.skip_negative_webm:
+        neg = make_unique_path("closed-neg", ".webm")
         v.put_small_file_best_effort(neg, fake_mp3)
         v.assert_no_audio_extract_task(neg, args.settle_seconds)
         print(
             json.dumps(
-                {"ok": True, "scenario": "closed_set_m4a_no_audio_task", "path": neg},
+                {"ok": True, "scenario": "closed_set_webm_no_audio_task", "path": neg},
                 ensure_ascii=False,
             )
         )

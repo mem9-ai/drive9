@@ -234,18 +234,20 @@ This boundary is intentional. In Phase 1, the upload completion path does not in
 
 Those approaches would all expand the transaction boundary and implementation complexity significantly, weakening the "minimal shippable closure" that the proposal is trying to preserve.
 
-The **shipped Phase 1 MVP** keeps the supported audio set intentionally small (MP3 + WAV + `.mp4` container uploads), matching the current allowlist and tests (for example `.m4a` must not enqueue `audio_extract_text` in this phase):
+The **shipped Phase 1 MVP** keeps the supported audio set intentionally small (MP3 + WAV + MP4/M4A container uploads), matching the current allowlist and tests:
 
 - MIME (after platform alias normalization where applicable):
   - `audio/mpeg`
   - `audio/wav` (including common synonyms normalized to this value, such as `audio/wave`, `audio/x-wav`, `audio/vnd.wave`, `audio/x-pn-wav`)
   - `audio/mp4` for semantic routing, with `.mp4` container uploads commonly detected and persisted as `video/mp4`
+  - `audio/x-m4a` (and `audio/mp4a-latm` normalized to `audio/mp4` where applicable) for M4A uploads
 - extensions:
   - `.mp3`
   - `.wav`
   - `.mp4`
+  - `.m4a`
 
-**Deferred (post‑MVP in this codebase):** formats such as M4A/AAC, OGG, FLAC, WebM, and their MIME aliases remain out of the Phase 1 closure until allowlist, sniffing, and negative tests are extended together. The implementation carries TODOs / comments for re‑enabling those paths without expanding the transaction or completion contract in Phase 1.
+**Deferred (post‑MVP in this codebase):** formats such as OGG, FLAC, WebM, and additional MIME-only paths remain out of the Phase 1 closure until allowlist, sniffing, and negative tests are extended together. The implementation carries TODOs / comments for re‑enabling those paths without expanding the transaction or completion contract in Phase 1.
 
 This also implies a clear limitation: some files that are truly audio, but lack reliable MIME and also lack standard extensions, may not enter the audio semantic retrieval closure in Phase 1. This limitation is stronger on multipart upload completion, because that path guarantees only extension-based recognition in the current phase. This is acceptable for now; if higher recognition rates are needed later, they should be handled as a separate enhancement.
 
@@ -514,7 +516,7 @@ There are no blocking design questions at this stage. The audio provider has bee
 | P1 | Media Type Detection Hardening | Improve media type recognition rates in upload completion and other write paths, evaluate stronger metadata detection strategies without breaking transaction boundaries, and separately assess whether upload-init MIME / `content_type` persistence is needed. |
 | P1 | Long-Content Overview Extraction | Bring long audio and long text files into a shared overview-extraction design, addressing the current retrieval fragility caused by using only truncated transcripts for long content. |
 | P1 | Chunked Audio Retrieval | Design segment/chunk-level transcript storage and retrieval, addressing the limited retrieval quality of file-level `content_text` for long audio. |
-| P2 | Audio Format Expansion | Gradually expand the audio closed set while keeping the current closure shape unchanged, adding common formats such as M4A / AAC / FLAC / OGG and their MIME aliases across create, overwrite, and upload completion paths; WebM and stronger MIME contracts remain separate evaluation topics. |
+| P2 | Audio Format Expansion | Gradually expand the audio closed set while keeping the current closure shape unchanged, adding formats beyond MP3/WAV/MP4/M4A (for example standalone AAC containers, FLAC, OGG, WebM) and their MIME aliases across create, overwrite, and upload completion paths; stronger MIME contracts remain a separate evaluation topic. |
 | P2 | App-Managed Audio Bridging | Turn transcript writeback and `embed` bridging under app-managed embedding into a separate implementation proposal. |
 | P3 | Media Runtime/Delivery Decoupling Cleanup | Gradually converge historical media tasks such as image extraction away from the backend-owned queue / worker model toward the same runtime / delivery split as audio, so the backend holds only runtime dependencies and `semantic worker` exclusively owns delivery. |
 | P3 | Semantic Worker Capability Cleanup | Further converge `semantic worker` away from task-specific capability checks toward a more stable task-capability model, and evaluate whether the runtime representation should be unified across image, audio, and future generated task types. |
