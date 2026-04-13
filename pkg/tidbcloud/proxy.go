@@ -45,6 +45,7 @@ func CreateServiceUserViaProxy(ctx context.Context, proxyEndpoint string, cluste
 
 	queries := []string{
 		fmt.Sprintf("CREATE USER IF NOT EXISTS '%s' IDENTIFIED BY '%s'", newUser, newPass),
+		fmt.Sprintf("ALTER USER '%s' IDENTIFIED BY '%s'", newUser, newPass),
 		fmt.Sprintf("GRANT 'role_admin' TO '%s'", newUser),
 		fmt.Sprintf("SET DEFAULT ROLE ALL TO '%s'", newUser),
 	}
