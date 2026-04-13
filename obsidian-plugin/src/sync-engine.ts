@@ -179,7 +179,9 @@ export class SyncEngine {
     }
 
     const data = await this.vault.readBinary(file);
-    const expectedRevision = existingState?.remoteRevision;
+    // If no state exists, this is a new file — use 0 (create-if-absent).
+    // Never send undefined (unconditional overwrite).
+    const expectedRevision = existingState ? existingState.remoteRevision : 0;
 
     try {
       const result = await this.client.write(path, data, expectedRevision);

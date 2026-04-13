@@ -16,9 +16,9 @@ export class Drive9Client {
     this.apiKey = apiKey;
   }
 
-  /** Test connectivity. Throws on failure. */
+  /** Test connectivity and auth. Throws on failure. */
   async ping(): Promise<void> {
-    await this.request("GET", "/healthz");
+    await this.list("/");
   }
 
   /** HEAD — get file/dir metadata including revision. */
