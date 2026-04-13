@@ -23,8 +23,9 @@ var (
 	ErrUploadNotActive  = errors.New("upload is not in UPLOADING state")
 	ErrUploadExpired    = errors.New("upload has expired")
 	ErrPathConflict     = errors.New("path already exists")
-	ErrUploadConflict   = errors.New("active upload already exists for this path")
-	ErrRevisionConflict = errors.New("revision conflict")
+	ErrUploadConflict      = errors.New("active upload already exists for this path")
+	ErrIdempotencyConflict = errors.New("duplicate idempotency key")
+	ErrRevisionConflict    = errors.New("revision conflict")
 )
 
 type StorageType string
@@ -153,7 +154,7 @@ func (s *Store) InTx(ctx context.Context, fn func(tx *sql.Tx) error) (err error)
 func (s *Store) columnExists(table, column string) bool {
 	var count int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = ? AND column_name = ?`,
+		`SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
 		table, column).Scan(&count)
 	return err == nil && count > 0
 }
@@ -671,7 +672,7 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 
 	var fileID sql.NullString
 	var isDir bool
-	err = tx.QueryRow(`SELECT file_id, is_directory FROM file_nodes WHERE path = ?`, path).Scan(&fileID, &isDir)
+	err = tx.QueryRow(`SELECT file_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, path).Scan(&fileID, &isDir)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -688,7 +689,7 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	}
 
 	var count int64
-	err = tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE file_id = ?`, fileID.String).Scan(&count)
+	err = tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE file_id = ? FOR UPDATE`, fileID.String).Scan(&count)
 	if err != nil {
 		return nil, err
 	}
@@ -804,6 +805,9 @@ func (s *Store) InsertUploadTx(db execer, u *Upload) error {
 		nullStr(u.FingerprintSHA), nullStr(u.IdempotencyKey),
 		u.CreatedAt.UTC(), u.UpdatedAt.UTC(), u.ExpiresAt.UTC())
 	if isUniqueViolation(err) {
+		if strings.Contains(err.Error(), "idx_idempotency") {
+			return ErrIdempotencyConflict
+		}
 		return ErrUploadConflict
 	}
 	return err
@@ -1145,7 +1149,7 @@ func observeStoreOp(ctx context.Context, op string, start time.Time, errp *error
 		switch {
 		case errors.Is(*errp, ErrNotFound):
 			result = "not_found"
-		case errors.Is(*errp, ErrPathConflict), errors.Is(*errp, ErrUploadConflict):
+		case errors.Is(*errp, ErrPathConflict), errors.Is(*errp, ErrUploadConflict), errors.Is(*errp, ErrIdempotencyConflict):
 			result = "conflict"
 		default:
 			result = "error"
