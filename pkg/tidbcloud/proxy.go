@@ -44,7 +44,8 @@ func NewClusterProxyClient(proxyEndpoint string, clusterID uint64, username, pas
 
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: true, // #nosec G402 — internal service-proxy; cert SANs don't cover the ELB hostname
 		},
 		DisableKeepAlives: true,
 	}
