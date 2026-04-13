@@ -1,0 +1,17 @@
+{
+  "name": "obsidian-drive9",
+  "version": "0.1.0",
+  "description": "Sync your Obsidian vault to drive9 — semantic search & AI-agent accessibility",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "typecheck": "tsc -noEmit -skipLibCheck"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.21.0",
+    "obsidian": "^1.5.0",
+    "typescript": "^5.4.0"
+  }
+}
