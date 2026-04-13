@@ -23,6 +23,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/traceid"
+	"github.com/mem9-ai/dat9/pkg/vault"
 	"go.uber.org/zap"
 )
 
@@ -31,6 +32,7 @@ type Config struct {
 	Pool             *tenant.Pool
 	Provisioner      tenant.Provisioner
 	TokenSecret      []byte
+	VaultMasterKey   []byte // 32-byte AES key for vault DEK wrapping; nil disables vault
 	Backend          *backend.Dat9Backend
 	LocalS3          *s3client.LocalS3Client
 	S3Dir            string
@@ -46,6 +48,7 @@ type Server struct {
 	pool           *tenant.Pool
 	provisioner    tenant.Provisioner
 	tokenSecret    []byte
+	vaultMK        *vault.MasterKey
 	maxUploadBytes int64
 	metrics        *serverMetrics
 	logger         *zap.Logger
@@ -76,11 +79,20 @@ func NewWithConfig(cfg Config) *Server {
 	if logger == nil {
 		logger, _ = zap.NewProduction()
 	}
+	var vaultMK *vault.MasterKey
+	if len(cfg.VaultMasterKey) > 0 {
+		var err error
+		vaultMK, err = vault.NewMasterKey(cfg.VaultMasterKey)
+		if err != nil {
+			logger.Warn("vault master key invalid, vault disabled", zap.Error(err))
+		}
+	}
 	s := &Server{
 		fallback:       cfg.Backend,
 		meta:           cfg.Meta,
 		pool:           cfg.Pool,
 		tokenSecret:    cfg.TokenSecret,
+		vaultMK:        vaultMK,
 		provisioner:    cfg.Provisioner,
 		maxUploadBytes: maxUpload,
 		metrics:        newServerMetrics(),
@@ -99,6 +111,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/uploads/", business)
 	mux.Handle("/v2/uploads/", business)
 	mux.Handle("/v1/sql", business)
+	mux.Handle("/v1/vault/", business)
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
 	mux.HandleFunc("/healthz", s.handleHealthz)
@@ -251,6 +264,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleV2Uploads(w, r)
 	case r.URL.Path == "/v1/sql":
 		s.handleSQL(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v1/vault/"):
+		s.handleVault(w, r)
 	default:
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "business_route_not_found", "path", r.URL.Path, "method", r.Method)...)
 		errJSON(w, http.StatusNotFound, "not found")
