@@ -154,21 +154,36 @@ func (c *ClusterProxyClient) CreateServiceUser(ctx context.Context, userPrefix s
 	escapedUser := escapeSQLString(qualifiedUser)
 	escapedPassword := escapeSQLString(password)
 
-	stmts := []string{
-		fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s'",
-			escapedUser, escapedPassword),
-		fmt.Sprintf("ALTER USER '%s'@'%%' IDENTIFIED BY '%s'",
-			escapedUser, escapedPassword),
+	stmts := []struct {
+		step string
+		stmt string
+	}{
+		{
+			step: "create user",
+			stmt: fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s'",
+				escapedUser, escapedPassword),
+		},
+		{
+			step: "alter user password",
+			stmt: fmt.Sprintf("ALTER USER '%s'@'%%' IDENTIFIED BY '%s'",
+				escapedUser, escapedPassword),
+		},
 		// Use GRANT ROLE instead of GRANT privilege — cloud_admin has ROLE_ADMIN
 		// but NOT GRANT OPTION, so explicit privilege grants would fail with
 		// error 8121 ("privilege check for 'Grant Option' fail").
-		fmt.Sprintf("GRANT 'role_admin' TO '%s'@'%%'", escapedUser),
-		fmt.Sprintf("SET DEFAULT ROLE ALL TO '%s'@'%%'", escapedUser),
+		{
+			step: "grant role_admin",
+			stmt: fmt.Sprintf("GRANT 'role_admin' TO '%s'@'%%'", escapedUser),
+		},
+		{
+			step: "set default role",
+			stmt: fmt.Sprintf("SET DEFAULT ROLE ALL TO '%s'@'%%'", escapedUser),
+		},
 	}
 
-	for _, stmt := range stmts {
-		if err := c.ExecuteSQL(ctx, stmt); err != nil {
-			return nil, fmt.Errorf("create service user: %w", err)
+	for _, s := range stmts {
+		if err := c.ExecuteSQL(ctx, s.stmt); err != nil {
+			return nil, fmt.Errorf("create service user (%s): %w", s.step, err)
 		}
 	}
 

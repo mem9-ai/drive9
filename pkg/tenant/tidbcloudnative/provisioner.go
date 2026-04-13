@@ -143,6 +143,9 @@ func (p *Provisioner) GetClusterProxyInfo(ctx context.Context, clusterID string)
 	if err != nil {
 		return nil, fmt.Errorf("decode encrypted password for cluster %s: %w", clusterID, err)
 	}
+	if p.enc == nil {
+		return nil, fmt.Errorf("decrypt password for cluster %s: provisioner encryptor is not configured", clusterID)
+	}
 	plaintext, err := p.enc.Decrypt(ctx, ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt password for cluster %s: %w", clusterID, err)
