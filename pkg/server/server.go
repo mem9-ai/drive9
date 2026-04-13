@@ -21,6 +21,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/tidbcloud"
 	"github.com/mem9-ai/dat9/pkg/traceid"
@@ -228,6 +229,37 @@ func (s *Server) resumeProvisioningTenants() {
 
 func (s *Server) resumeTenantSchemaInit(t meta.Tenant) {
 	ctx := backgroundWithTrace(context.Background())
+
+	// For tidbcloud-native tenants that still have the initial cloud_admin
+	// credentials (the async goroutine had not finished before a restart),
+	// re-run the full provision flow which creates fs_admin and then inits
+	// the schema with it. cloud_admin cannot connect through the public LB.
+	if t.Provider == tenant.ProviderTiDBCloudNative {
+		np, ok := s.provisioner.(*tidbcloudnative.Provisioner)
+		if !ok {
+			logger.Warn(ctx, "resume_schema_init_skipped_provisioner_type",
+				zap.String("tenant_id", t.ID))
+			return
+		}
+		plain, err := s.pool.Decrypt(ctx, t.DBPasswordCipher)
+		if err != nil {
+			logger.Warn(ctx, "resume_schema_init_skipped", zap.String("tenant_id", t.ID), zap.Error(err))
+			return
+		}
+		cluster := &tenant.ClusterInfo{
+			TenantID:  t.ID,
+			ClusterID: t.ClusterID,
+			Host:      t.DBHost,
+			Port:      t.DBPort,
+			Username:  t.DBUser,
+			Password:  string(plain),
+			DBName:    t.DBName,
+			Provider:  t.Provider,
+		}
+		s.nativeProvisionAsync(ctx, np, t.ID, cluster, t.Provider)
+		return
+	}
+
 	plain, err := s.pool.Decrypt(ctx, t.DBPasswordCipher)
 	if err != nil {
 		logger.Warn(ctx, "resume_schema_init_skipped", zap.String("tenant_id", t.ID), zap.Error(err))
