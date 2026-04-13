@@ -17,6 +17,7 @@ type mockGlobalClient struct {
 	getClusterInfoFn          func(ctx context.Context, clusterID string) (*tidbcloud.ClusterInfo, error)
 	getEncryptedCloudAdminFn  func(ctx context.Context, clusterID string) (string, error)
 	getZeroInstanceFn         func(ctx context.Context, instanceID string) (*tidbcloud.ZeroInstanceInfo, error)
+	createServiceUserFn       func(ctx context.Context, clusterID, operatorUser, operatorEncPwd, username, password string) error
 }
 
 func (m *mockGlobalClient) GetClusterInfo(ctx context.Context, clusterID string) (*tidbcloud.ClusterInfo, error) {
@@ -29,6 +30,13 @@ func (m *mockGlobalClient) GetEncryptedCloudAdminPwd(ctx context.Context, cluste
 
 func (m *mockGlobalClient) GetZeroInstance(ctx context.Context, instanceID string) (*tidbcloud.ZeroInstanceInfo, error) {
 	return m.getZeroInstanceFn(ctx, instanceID)
+}
+
+func (m *mockGlobalClient) CreateServiceUser(ctx context.Context, clusterID, operatorUser, operatorEncPwd, username, password string) error {
+	if m.createServiceUserFn != nil {
+		return m.createServiceUserFn(ctx, clusterID, operatorUser, operatorEncPwd, username, password)
+	}
+	return nil
 }
 
 // --- mock Encryptor ---
@@ -266,149 +274,103 @@ func TestAuthorize_ClusterNotFound(t *testing.T) {
 	}
 }
 
-func TestGetClusterProxyInfo_Success(t *testing.T) {
-	password := "s3cret"
-	encrypted := base64.StdEncoding.EncodeToString([]byte("encrypted-pwd"))
+func TestCreateServiceUser_Success(t *testing.T) {
+	var gotClusterID, gotOperator, gotEncPwd, gotUsername string
 
 	global := &mockGlobalClient{
-		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
-			return &tidbcloud.ClusterInfo{
-				ClusterID:     "12345",
-				Host:          "h",
-				Port:          4000,
-				Username:      "pfx.cloud_admin",
-				ProxyEndpoint: "proxy.internal:443",
-				Version:       "v8.1.1",
-			}, nil
-		},
 		getEncryptedCloudAdminFn: func(_ context.Context, _ string) (string, error) {
-			return encrypted, nil
+			return "encrypted-pwd-base64", nil
 		},
-	}
-	enc := &mockEncryptor{
-		decryptFn: func(_ context.Context, _ []byte) ([]byte, error) {
-			return []byte(password), nil
-		},
-	}
-
-	p := NewProvisioner(global, nil, enc)
-	info, err := p.GetClusterProxyInfo(context.Background(), "12345")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if info == nil {
-		t.Fatal("expected non-nil info")
-	}
-	if info.ClusterID != 12345 {
-		t.Fatalf("got cluster ID %d, want 12345", info.ClusterID)
-	}
-	if info.ProxyEndpoint != "proxy.internal:443" {
-		t.Fatalf("got proxy endpoint %s, want proxy.internal:443", info.ProxyEndpoint)
-	}
-	if info.Username != "pfx.cloud_admin" {
-		t.Fatalf("got username %s, want pfx.cloud_admin", info.Username)
-	}
-	if info.Password != password {
-		t.Fatalf("got password %s, want %s", info.Password, password)
-	}
-}
-
-func TestGetClusterProxyInfo_NoProxy(t *testing.T) {
-	global := &mockGlobalClient{
-		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
-			return &tidbcloud.ClusterInfo{
-				ClusterID:     "12345",
-				Host:          "h",
-				Port:          4000,
-				Username:      "u",
-				ProxyEndpoint: "", // no proxy
-			}, nil
+		createServiceUserFn: func(_ context.Context, clusterID, operatorUser, operatorEncPwd, username, password string) error {
+			gotClusterID = clusterID
+			gotOperator = operatorUser
+			gotEncPwd = operatorEncPwd
+			gotUsername = username
+			if password == "" {
+				t.Fatal("expected non-empty password")
+			}
+			return nil
 		},
 	}
 
 	p := NewProvisioner(global, nil, nil)
-	info, err := p.GetClusterProxyInfo(context.Background(), "12345")
+	svc, err := p.CreateServiceUser(context.Background(), "12345", "2wCQ.cloud_admin")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if info != nil {
-		t.Fatalf("expected nil when no proxy, got %+v", info)
+	if gotClusterID != "12345" {
+		t.Fatalf("got cluster ID %s, want 12345", gotClusterID)
+	}
+	if gotOperator != "2wCQ.cloud_admin" {
+		t.Fatalf("got operator %s, want 2wCQ.cloud_admin", gotOperator)
+	}
+	if gotEncPwd != "encrypted-pwd-base64" {
+		t.Fatalf("got enc pwd %s, want encrypted-pwd-base64", gotEncPwd)
+	}
+	if gotUsername != "2wCQ.fs_admin" {
+		t.Fatalf("got username %s, want 2wCQ.fs_admin", gotUsername)
+	}
+	if svc.Username != "2wCQ.fs_admin" {
+		t.Fatalf("got svc username %s, want 2wCQ.fs_admin", svc.Username)
+	}
+	if len(svc.Password) != 64 { // 32 bytes → 64 hex chars
+		t.Fatalf("expected 64-char hex password, got len %d", len(svc.Password))
 	}
 }
 
-func TestGetClusterProxyInfo_ClusterInfoError(t *testing.T) {
+func TestCreateServiceUser_NoPrefix(t *testing.T) {
+	var gotUsername string
+
 	global := &mockGlobalClient{
-		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
-			return nil, fmt.Errorf("get cluster: %w", tidbcloud.ErrClusterNotFound)
+		getEncryptedCloudAdminFn: func(_ context.Context, _ string) (string, error) {
+			return "enc", nil
+		},
+		createServiceUserFn: func(_ context.Context, _, _, _, username, _ string) error {
+			gotUsername = username
+			return nil
 		},
 	}
 
 	p := NewProvisioner(global, nil, nil)
-	_, err := p.GetClusterProxyInfo(context.Background(), "99999")
-	if err == nil {
-		t.Fatal("expected error")
+	svc, err := p.CreateServiceUser(context.Background(), "1", "cloud_admin")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if !errors.Is(err, tidbcloud.ErrClusterNotFound) {
-		t.Fatalf("expected ErrClusterNotFound, got: %v", err)
+	if gotUsername != "fs_admin" {
+		t.Fatalf("got username %s, want fs_admin (no prefix)", gotUsername)
 	}
-}
-
-func TestGetClusterProxyInfo_DecryptError(t *testing.T) {
-	encrypted := base64.StdEncoding.EncodeToString([]byte("bad"))
-
-	global := &mockGlobalClient{
-		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
-			return &tidbcloud.ClusterInfo{
-				ClusterID:     "1",
-				Host:          "h",
-				Port:          4000,
-				Username:      "u",
-				ProxyEndpoint: "proxy:443",
-			}, nil
-		},
-		getEncryptedCloudAdminFn: func(_ context.Context, _ string) (string, error) {
-			return encrypted, nil
-		},
-	}
-	enc := &mockEncryptor{
-		decryptFn: func(_ context.Context, _ []byte) ([]byte, error) {
-			return nil, errors.New("kms failure")
-		},
-	}
-
-	p := NewProvisioner(global, nil, enc)
-	_, err := p.GetClusterProxyInfo(context.Background(), "1")
-	if err == nil {
-		t.Fatal("expected error from decrypt")
+	if svc.Username != "fs_admin" {
+		t.Fatalf("got svc username %s, want fs_admin", svc.Username)
 	}
 }
 
-func TestGetClusterProxyInfo_InvalidClusterID(t *testing.T) {
-	encrypted := base64.StdEncoding.EncodeToString([]byte("enc"))
-
+func TestCreateServiceUser_GetEncPwdError(t *testing.T) {
 	global := &mockGlobalClient{
-		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
-			return &tidbcloud.ClusterInfo{
-				ClusterID:     "not-a-number",
-				Host:          "h",
-				Port:          4000,
-				Username:      "u",
-				ProxyEndpoint: "proxy:443",
-			}, nil
-		},
 		getEncryptedCloudAdminFn: func(_ context.Context, _ string) (string, error) {
-			return encrypted, nil
-		},
-	}
-	enc := &mockEncryptor{
-		decryptFn: func(_ context.Context, _ []byte) ([]byte, error) {
-			return []byte("pwd"), nil
+			return "", errors.New("kms unavailable")
 		},
 	}
 
-	p := NewProvisioner(global, nil, enc)
-	_, err := p.GetClusterProxyInfo(context.Background(), "not-a-number")
+	p := NewProvisioner(global, nil, nil)
+	_, err := p.CreateServiceUser(context.Background(), "1", "u")
 	if err == nil {
-		t.Fatal("expected error for invalid cluster ID")
+		t.Fatal("expected error from GetEncryptedCloudAdminPwd")
+	}
+}
+
+func TestCreateServiceUser_GlobalClientError(t *testing.T) {
+	global := &mockGlobalClient{
+		getEncryptedCloudAdminFn: func(_ context.Context, _ string) (string, error) {
+			return "enc", nil
+		},
+		createServiceUserFn: func(_ context.Context, _, _, _, _, _ string) error {
+			return errors.New("grpc: unavailable")
+		},
+	}
+
+	p := NewProvisioner(global, nil, nil)
+	_, err := p.CreateServiceUser(context.Background(), "1", "pfx.cloud_admin")
+	if err == nil {
+		t.Fatal("expected error from GlobalClient.CreateServiceUser")
 	}
 }

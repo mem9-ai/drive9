@@ -322,6 +322,25 @@ func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status Tenant
 	return nil
 }
 
+// UpdateTenantDBCredentials updates the DB user and encrypted password for a
+// tenant. Used by the async provisioning flow after dedicated tenant DB
+// credentials have been created.
+func (s *Store) UpdateTenantDBCredentials(ctx context.Context, id, dbUser string, dbPasswordCipher []byte) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tenant_db_credentials", start, &err)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tenants SET db_user = ?, db_password = ?, updated_at = ? WHERE id = ?`,
+		dbUser, dbPasswordCipher, time.Now().UTC(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func observeMeta(ctx context.Context, op string, start time.Time, errp *error) {
 	result := "ok"
 	if errp != nil && *errp != nil {
