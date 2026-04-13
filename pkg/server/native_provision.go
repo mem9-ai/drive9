@@ -64,7 +64,7 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 
 	// Parse root database credentials from request body.
 	var req nativeProvisionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_bad_body", "tenant_id", tenantID, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "bad_request")
 		errJSON(w, http.StatusBadRequest, "invalid request body: user and password are required")
@@ -194,7 +194,10 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.Provisioner, tenantID string, cluster *tenant.ClusterInfo, provider string) {
 	dbUser := cluster.Username
 	dbPassword := cluster.Password
-	dbName := "mysql"
+	dbName := cluster.DBName
+	if dbName == "" {
+		dbName = "mysql"
+	}
 
 	// If the persisted user is already fs_admin (resume after partial
 	// completion), skip user creation and go straight to schema init.
