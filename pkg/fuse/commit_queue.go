@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,8 @@ type CommitEntry struct {
 type CommitQueue struct {
 	mu         sync.Mutex
 	queue      []*CommitEntry
+	inFlight   map[string]struct{} // paths currently being processed by workers
+	canceled   map[string]struct{} // paths canceled by Unlink/Rmdir (workers skip these)
 	maxPending int
 	client     *client.Client
 	shadows    *ShadowStore
@@ -58,6 +61,8 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 		shadows:    shadows,
 		index:      index,
 		journal:    journal,
+		inFlight:   make(map[string]struct{}),
+		canceled:   make(map[string]struct{}),
 		workCh:     make(chan *CommitEntry, bufSize),
 	}
 	for i := 0; i < numWorkers; i++ {
@@ -134,6 +139,10 @@ func (cq *CommitQueue) RecoverPending() {
 			cq.index.Remove(path)
 			continue
 		}
+		if meta.Kind == PendingConflict {
+			log.Printf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
+			continue
+		}
 		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
 			log.Printf("commit queue: skip legacy pending overwrite without base revision for %s", path)
 			continue
@@ -150,10 +159,144 @@ func (cq *CommitQueue) RecoverPending() {
 	}
 }
 
+// WaitPath blocks until any in-flight or queued commit for the given path
+// completes (including post-commit cleanup). This prevents namespace
+// operations from racing with background commits.
+func (cq *CommitQueue) WaitPath(path string) {
+	for {
+		cq.mu.Lock()
+		_, inflight := cq.inFlight[path]
+		queued := false
+		for _, e := range cq.queue {
+			if e.Path == path {
+				queued = true
+				break
+			}
+		}
+		cq.mu.Unlock()
+		if !inflight && !queued {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// WaitPrefix blocks until all in-flight or queued commits under the given
+// prefix complete. Used by Rename to wait for descendant commits.
+func (cq *CommitQueue) WaitPrefix(prefix string) {
+	for {
+		cq.mu.Lock()
+		found := false
+		for p := range cq.inFlight {
+			if strings.HasPrefix(p, prefix) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			for _, e := range cq.queue {
+				if strings.HasPrefix(e.Path, prefix) {
+					found = true
+					break
+				}
+			}
+		}
+		cq.mu.Unlock()
+		if !found {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// CancelPath marks a path as canceled so workers skip it, removes it from
+// the queue, and cleans up its shadow/index state. Used by Unlink to
+// prevent background commits from resurrecting deleted files.
+func (cq *CommitQueue) CancelPath(path string) {
+	cq.mu.Lock()
+	cq.canceled[path] = struct{}{}
+	for i, e := range cq.queue {
+		if e.Path == path {
+			cq.queue = append(cq.queue[:i], cq.queue[i+1:]...)
+			break
+		}
+	}
+	cq.mu.Unlock()
+
+	if cq.shadows != nil {
+		cq.shadows.Remove(path)
+	}
+	if cq.index != nil {
+		cq.index.Remove(path)
+	}
+}
+
+// CancelPrefix marks all paths under prefix as canceled, removes them from
+// the queue, and cleans up their shadow/index state. Used by Rmdir.
+// Workers that have already dequeued entries will check the canceled set
+// before uploading.
+func (cq *CommitQueue) CancelPrefix(prefix string) {
+	cq.mu.Lock()
+	var remaining []*CommitEntry
+	var cancelled []string
+	for _, e := range cq.queue {
+		if strings.HasPrefix(e.Path, prefix) {
+			cancelled = append(cancelled, e.Path)
+			cq.canceled[e.Path] = struct{}{}
+		} else {
+			remaining = append(remaining, e)
+		}
+	}
+	cq.queue = remaining
+	cq.mu.Unlock()
+
+	for _, p := range cancelled {
+		if cq.shadows != nil {
+			cq.shadows.Remove(p)
+		}
+		if cq.index != nil {
+			cq.index.Remove(p)
+		}
+	}
+}
+
+// isCanceled checks whether the path has been canceled by Unlink/Rmdir.
+func (cq *CommitQueue) isCanceled(path string) bool {
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if _, ok := cq.canceled[path]; ok {
+		return true
+	}
+	// Also check prefix cancellations.
+	for p := range cq.canceled {
+		if strings.HasSuffix(p, "/") && strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func (cq *CommitQueue) worker() {
 	defer cq.wg.Done()
 	for entry := range cq.workCh {
+		// Check if this entry was canceled while buffered in workCh.
+		if cq.isCanceled(entry.Path) {
+			cq.removeFromQueue(entry)
+			log.Printf("commit queue: skipping canceled entry for %s", entry.Path)
+			continue
+		}
+
+		// Mark as in-flight so WaitPath blocks until cleanup finishes.
+		cq.mu.Lock()
+		cq.inFlight[entry.Path] = struct{}{}
+		cq.mu.Unlock()
+
 		cq.commitOne(entry)
+
+		// Clear in-flight after all cleanup is done.
+		cq.mu.Lock()
+		delete(cq.inFlight, entry.Path)
+		cq.mu.Unlock()
 	}
 }
 
@@ -165,6 +308,13 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Re-check cancelation between retries.
+		if cq.isCanceled(entry.Path) {
+			cq.removeFromQueue(entry)
+			log.Printf("commit queue: entry for %s was canceled during retry", entry.Path)
+			return
+		}
+
 		if attempt > 0 {
 			delay := time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt-1)))
 			if delay > maxDelay {
@@ -230,8 +380,6 @@ func (cq *CommitQueue) removeFromQueue(entry *CommitEntry) {
 }
 
 func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry) {
-	cq.removeFromQueue(entry)
-
 	// Write durable commit record BEFORE cleaning up local state so that
 	// crash recovery never re-uploads an already committed entry.
 	if cq.journal != nil {
@@ -240,6 +388,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry) {
 			Path: entry.Path,
 		}); err != nil {
 			log.Printf("commit queue: journal commit marker failed for %s: %v (keeping local state)", entry.Path, err)
+			cq.removeFromQueue(entry)
 			return
 		}
 	}
@@ -252,19 +401,42 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry) {
 		cq.index.Remove(entry.Path)
 	}
 
+	// Remove from queue AFTER all cleanup so WaitPath sees the entry
+	// until bookkeeping is complete.
+	cq.removeFromQueue(entry)
+
 	log.Printf("commit queue: successfully uploaded %s (%d bytes)", entry.Path, entry.Size)
 }
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
+	// Mark the entry as conflicted in the pending index so that crash
+	// recovery (RecoverPending) skips it instead of retrying forever.
+	// Preserve both the shadow file and the pending metadata so the user
+	// can recover their local edits manually — deleting them here would
+	// silently discard the only durable copy of unsynchronised data.
+	//
+	// The conflict marker MUST be durable before we journal or dequeue;
+	// otherwise a restart could re-enqueue the same upload.
+	if cq.index != nil {
+		if err := cq.index.MarkConflict(entry.Path); err != nil {
+			// Conflict marker not durable — leave the entry queued so
+			// RecoverPending can retry on next startup rather than
+			// silently dropping it.
+			log.Printf("commit queue: failed to mark conflict for %s: %v (entry remains queued)", entry.Path, err)
+			cq.removeFromQueue(entry)
+			return
+		}
+	}
+	if cq.journal != nil {
+		_ = cq.journal.Append(JournalEntry{
+			Op:   JournalCommit, // treated as "done" so recovery won't re-enqueue
+			Path: entry.Path,
+		})
+	}
+
+	// Remove from queue AFTER all cleanup so WaitPath sees the entry
+	// until bookkeeping is complete.
 	cq.removeFromQueue(entry)
 
-	// Clean up local state to prevent infinite retry loop on restart.
-	// The data is either stale (conflict) or unrecoverable (max retries).
-	if cq.shadows != nil {
-		cq.shadows.Remove(entry.Path)
-	}
-	if cq.index != nil {
-		cq.index.Remove(entry.Path)
-	}
-	log.Printf("commit queue: terminal failure for %s, local state cleaned up", entry.Path)
+	log.Printf("commit queue: terminal failure for %s — local data preserved for manual recovery", entry.Path)
 }
