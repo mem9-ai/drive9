@@ -167,7 +167,7 @@ interface SyncState {
   remoteRevision: number;
   lastSyncedContentHash?: string;  // sha256 → shadow store lookup
   syncedAt: number;
-  status: 'synced' | 'local_dirty' | 'remote_dirty' | 'conflict';
+  status: 'synced' | 'local_dirty' | 'remote_dirty' | 'remote_deleted' | 'conflict';
 }
 ```
 
@@ -175,13 +175,15 @@ Persisted to `plugin data.json`, loaded on startup.
 
 ### 4.5 Pull/Push State Machine
 
-| Local State | Remote State | Action |
+Phase 2A (#176) handles detection and non-destructive actions. Destructive actions (delete apply, conflict merge) are deferred to Phase 2B (#183, §5).
+
+| Local State | Remote State | Action (Phase 2A) |
 |-------------|-------------|--------|
 | — | New file | Pull (download) |
 | synced | Modified | Safe pull |
-| synced | Deleted | Move to `.trash/` (never silent delete) |
+| synced | Deleted | **Mark `remote_deleted`** — defer to §5 |
 | local_dirty | Unchanged | Push |
-| local_dirty | Modified | → Conflict resolution (§5) |
+| local_dirty | Modified | **Mark `conflict`** — defer to §5 |
 
 ---
 
@@ -220,11 +222,14 @@ Cannot merge → show ConflictModal directly.
 - **Keep remote** — overwrite local with remote version
 - **Keep both** — save remote as `{name}.conflict.{ext}`
 
-### Delete Safety
+### Remote Delete Apply
 
-Remote delete is the most irreversible sync action. Rules:
-- Remote deleted file → move to Obsidian `.trash/` (never `adapter.remove()`)
-- Polling fallback: require stable absence across 2 consecutive polls before treating as deleted
+**Phase 2B (#183) is the single owner of remote delete apply.** Phase 2A only marks `remote_deleted` in SyncState.
+
+Remote delete is the most irreversible sync action. Safety rules:
+1. **Never silent `adapter.remove()`** — always move to Obsidian `.trash/`
+2. **Polling stability guard:** When deletion detected via polling (not SSE), require **2 consecutive polls** with stable absence before applying. A single missing entry may be transient.
+3. **SSE delete events** are more authoritative — a single `delete` op event is sufficient to apply (still moves to `.trash/`).
 
 ---
 
