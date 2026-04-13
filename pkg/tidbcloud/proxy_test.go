@@ -15,8 +15,8 @@ func TestCreateServiceUserViaProxy_Success(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Fatalf("method=%s, want POST", r.Method)
 		}
-		if r.URL.Path != "/v1beta1/execute" {
-			t.Fatalf("path=%s, want /v1beta1/execute", r.URL.Path)
+		if r.URL.Path != "/v1beta2/execute" {
+			t.Fatalf("path=%s, want /v1beta2/execute", r.URL.Path)
 		}
 		if ct := r.Header.Get("Content-Type"); ct != "application/json" {
 			t.Fatalf("content-type=%s, want application/json", ct)

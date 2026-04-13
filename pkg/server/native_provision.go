@@ -212,7 +212,7 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 
 // nativeProvisionAsync runs in a background goroutine after the tenant record
 // has been persisted. It creates a dedicated fs_admin service user via the
-// internal cluster proxy (using cloud_admin as the operator), updates the
+// internal cluster proxy (using root credentials as the operator), updates the
 // tenant record with fs_admin credentials, and runs schema init.
 func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.Provisioner, tenantID string, cluster *tenant.ClusterInfo, provider string) {
 	dbName := cluster.DBName
@@ -227,8 +227,8 @@ func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.P
 	}
 	fsAdminPass := tidbcloud.GeneratePassword()
 
-	// Create fs_admin via the internal cluster proxy.
-	if err := np.CreateServiceUser(ctx, cluster.ClusterID, cluster.ProxyEndpoint, cluster.UserPrefix, fsAdminUser, fsAdminPass); err != nil {
+	// Create fs_admin via the internal cluster proxy, using root credentials as operator.
+	if err := np.CreateServiceUser(ctx, cluster.ClusterID, cluster.ProxyEndpoint, cluster.Username, cluster.Password, fsAdminUser, fsAdminPass); err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "create_service_user_failed",
 			"tenant_id", tenantID, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "create_user_error")
