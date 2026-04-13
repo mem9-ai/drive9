@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -225,6 +226,17 @@ func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.P
 	if cluster.UserPrefix != "" {
 		fsAdminUser = cluster.UserPrefix + ".fs_admin"
 	}
+
+	// If the tenant record already has fs_admin credentials (e.g. resume
+	// after restart), skip CreateServiceUser and go straight to schema init.
+	if strings.HasSuffix(cluster.Username, ".fs_admin") || cluster.Username == "fs_admin" {
+		logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_resume_schema_init",
+			"tenant_id", tenantID, "db_user", cluster.Username)...)
+		dsn := tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, dbName, true)
+		s.initTenantSchemaAsync(ctx, tenantID, dsn, provider, np.InitSchema)
+		return
+	}
+
 	fsAdminPass := tidbcloud.GeneratePassword()
 
 	// Create fs_admin via the internal cluster proxy, using root credentials as operator.
