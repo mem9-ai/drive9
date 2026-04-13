@@ -5,6 +5,8 @@ import type { SyncState, Drive9Settings } from "./types";
 
 export type SyncStatus = "idle" | "syncing" | "error";
 
+const LOCAL_EVENT_SUPPRESS_WINDOW_MS = 1000;
+
 /**
  * SyncEngine owns the local/remote sync state machine.
  * Phase 2A adds remote detection, safe pull, and non-destructive delete/conflict handling.
@@ -50,6 +52,7 @@ export class SyncEngine {
     if (!(file instanceof TFile)) return;
     if (this.shouldIgnore(file.path)) return;
     if (this.isLocalEventSuppressed(file.path)) return;
+    if (this.matchesSyncedSnapshot(file.path, file)) return;
     this.markDirty(file.path);
   }
 
@@ -57,6 +60,7 @@ export class SyncEngine {
     if (!(file instanceof TFile)) return;
     if (this.shouldIgnore(file.path)) return;
     if (this.isLocalEventSuppressed(file.path)) return;
+    if (this.matchesSyncedSnapshot(file.path, file)) return;
     this.markDirty(file.path);
   }
 
@@ -70,11 +74,14 @@ export class SyncEngine {
   onLocalRename(file: TAbstractFile, oldPath: string): void {
     if (!(file instanceof TFile)) return;
     if (this.shouldIgnore(file.path) && this.shouldIgnore(oldPath)) return;
-    if (this.isLocalEventSuppressed(file.path) || this.isLocalEventSuppressed(oldPath)) return;
-    if (!this.shouldIgnore(oldPath)) {
+    if (!this.shouldIgnore(oldPath) && !this.isLocalEventSuppressed(oldPath)) {
       this.markDirty(oldPath);
     }
-    if (!this.shouldIgnore(file.path)) {
+    if (
+      !this.shouldIgnore(file.path) &&
+      !this.isLocalEventSuppressed(file.path) &&
+      !this.matchesSyncedSnapshot(file.path, file)
+    ) {
       this.markDirty(file.path);
     }
   }
@@ -275,7 +282,7 @@ export class SyncEngine {
         } else {
           this.suppressedPaths.set(path, current - 1);
         }
-      }, 0);
+      }, LOCAL_EVENT_SUPPRESS_WINDOW_MS);
     }
   }
 
@@ -286,10 +293,21 @@ export class SyncEngine {
 
   private hasUnpushedLocalChange(path: string, file: TFile | null, state: SyncState | undefined): boolean {
     if (this.dirtyPaths.has(path)) return true;
-    if (!file) return false;
+    if (!file) {
+      // Remote-only paths should pull instead of turning into conflicts.
+      return false;
+    }
     if (!state) return true;
     if (state.status === "local_dirty" || state.status === "conflict") return true;
     return file.stat.mtime !== state.localMtime || file.stat.size !== state.localSize;
+  }
+
+  private matchesSyncedSnapshot(path: string, file: TFile): boolean {
+    const state = this.syncStates[path];
+    if (!state || state.status !== "synced") {
+      return false;
+    }
+    return state.localMtime === file.stat.mtime && state.localSize === file.stat.size;
   }
 
   private async reconcileRemotePath(path: string): Promise<void> {
