@@ -32,13 +32,7 @@ func (s *Server) handleVault(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Consumption API: /v1/vault/read/*
-	// Authenticated by capability token.
-	if strings.HasPrefix(rest, "read") {
-		s.handleVaultRead(w, r, strings.TrimPrefix(rest, "read"))
-		return
-	}
-
+	// /v1/vault/read/* is routed separately via capabilityAuthMiddleware.
 	errJSON(w, http.StatusNotFound, "not found")
 }
 
@@ -283,6 +277,14 @@ func (s *Server) handleVaultTokenIssue(w http.ResponseWriter, r *http.Request, v
 		errJSON(w, http.StatusBadRequest, "scope is required")
 		return
 	}
+	// Reject wildcard scope entries — not yet implemented.
+	// Without expansion, a wildcard token would silently fail scope checks.
+	for _, entry := range req.Scope {
+		if strings.Contains(entry, "*") {
+			errJSON(w, http.StatusBadRequest, "wildcard scope is not supported yet; specify exact secret names")
+			return
+		}
+	}
 	ttl := time.Duration(req.TTLSecs) * time.Second
 	if ttl <= 0 {
 		ttl = time.Hour // default 1 hour
@@ -322,7 +324,7 @@ func (s *Server) handleVaultTokenRevoke(w http.ResponseWriter, r *http.Request, 
 		req.RevokedBy = "api"
 	}
 
-	err := vs.RevokeCapToken(r.Context(), tokenID, req.RevokedBy, req.Reason)
+	err := vs.RevokeCapToken(r.Context(), tenantID, tokenID, req.RevokedBy, req.Reason)
 	if err != nil {
 		if errors.Is(err, vault.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "token not found or already revoked")

@@ -326,7 +326,7 @@ func (s *Store) ReadSecretField(ctx context.Context, tenantID, name, fieldName s
 
 // IssueCapToken creates a capability token and persists its server-side state.
 func (s *Store) IssueCapToken(ctx context.Context, tenantID, agentID, taskID string, scope []string, ttl time.Duration) (string, *CapToken, error) {
-	tokenID := "cap_" + uuid.NewString()[:8]
+	tokenID := "cap_" + uuid.NewString()
 	now := time.Now()
 	expiresAt := now.Add(ttl)
 
@@ -382,11 +382,11 @@ func (s *Store) VerifyAndResolveCapToken(ctx context.Context, tenantID, raw stri
 		return nil, err
 	}
 
-	// DB revocation check.
+	// DB revocation check — scoped to tenant for isolation.
 	var revokedAt *time.Time
 	err = s.db.QueryRowContext(ctx,
-		`SELECT revoked_at FROM vault_tokens WHERE token_id = $1`,
-		claims.TokenID,
+		`SELECT revoked_at FROM vault_tokens WHERE tenant_id = $1 AND token_id = $2`,
+		tenantID, claims.TokenID,
 	).Scan(&revokedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("token not found")
@@ -402,12 +402,13 @@ func (s *Store) VerifyAndResolveCapToken(ctx context.Context, tenantID, raw stri
 }
 
 // RevokeCapToken sets revoked_at on a capability token.
-func (s *Store) RevokeCapToken(ctx context.Context, tokenID, revokedBy, reason string) error {
+// tenantID is required to enforce tenant isolation.
+func (s *Store) RevokeCapToken(ctx context.Context, tenantID, tokenID, revokedBy, reason string) error {
 	now := time.Now()
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE vault_tokens SET revoked_at = $1, revoked_by = $2, revoke_reason = $3
-		 WHERE token_id = $4 AND revoked_at IS NULL`,
-		now, revokedBy, reason, tokenID,
+		 WHERE tenant_id = $4 AND token_id = $5 AND revoked_at IS NULL`,
+		now, revokedBy, reason, tenantID, tokenID,
 	)
 	if err != nil {
 		return err

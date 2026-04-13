@@ -178,6 +178,44 @@ func VerifyCapToken(csk []byte, raw string, now time.Time) (*CapTokenClaims, err
 	return &claims, nil
 }
 
+// PeekCapTokenTenantID extracts the tenant_id from a capability token's payload
+// WITHOUT verifying the HMAC signature. This is used only to resolve the tenant
+// backend so that the full verification can proceed. The caller MUST still do
+// full verification (SignCapToken/VerifyCapToken) before trusting any claims.
+func PeekCapTokenTenantID(raw string) (string, error) {
+	if len(raw) < len(capTokenPrefix) {
+		return "", fmt.Errorf("invalid capability token format")
+	}
+	body := raw[len(capTokenPrefix):]
+
+	dotIdx := -1
+	for i := len(body) - 1; i >= 0; i-- {
+		if body[i] == '.' {
+			dotIdx = i
+			break
+		}
+	}
+	if dotIdx < 0 {
+		return "", fmt.Errorf("invalid capability token format")
+	}
+	payloadB64 := body[:dotIdx]
+
+	payloadJSON, err := base64.RawURLEncoding.DecodeString(payloadB64)
+	if err != nil {
+		return "", fmt.Errorf("decode payload: %w", err)
+	}
+	var peek struct {
+		TenantID string `json:"tenant_id"`
+	}
+	if err := json.Unmarshal(payloadJSON, &peek); err != nil {
+		return "", fmt.Errorf("unmarshal claims: %w", err)
+	}
+	if peek.TenantID == "" {
+		return "", fmt.Errorf("missing tenant_id in token")
+	}
+	return peek.TenantID, nil
+}
+
 // GenerateNonce returns a random 16-byte nonce as hex string.
 func GenerateNonce() (string, error) {
 	b := make([]byte, 16)

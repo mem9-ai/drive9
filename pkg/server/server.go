@@ -111,7 +111,25 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/uploads/", business)
 	mux.Handle("/v2/uploads/", business)
 	mux.Handle("/v1/sql", business)
-	mux.Handle("/v1/vault/", business)
+	// Vault management API goes through tenant auth.
+	mux.Handle("/v1/vault/secrets", business)
+	mux.Handle("/v1/vault/secrets/", business)
+	mux.Handle("/v1/vault/tokens", business)
+	mux.Handle("/v1/vault/tokens/", business)
+	mux.Handle("/v1/vault/audit", business)
+	// Vault read (consumption) API: authenticated by capability token, NOT tenant token.
+	if s.vaultMK != nil && cfg.Pool != nil && cfg.Meta != nil {
+		mux.Handle("/v1/vault/read/", s.capabilityAuthMiddleware(cfg.Meta, cfg.Pool))
+		mux.Handle("/v1/vault/read", s.capabilityAuthMiddleware(cfg.Meta, cfg.Pool))
+	} else if s.vaultMK != nil && cfg.Backend != nil {
+		// Single-tenant fallback: inject local scope and serve directly.
+		mux.Handle("/v1/vault/read/", injectFallbackBackend(cfg.Backend, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			s.handleVaultRead(w, r, strings.TrimPrefix(r.URL.Path, "/v1/vault/read"))
+		})))
+		mux.Handle("/v1/vault/read", injectFallbackBackend(cfg.Backend, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			s.handleVaultRead(w, r, "")
+		})))
+	}
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
 	mux.HandleFunc("/healthz", s.handleHealthz)
@@ -264,7 +282,7 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleV2Uploads(w, r)
 	case r.URL.Path == "/v1/sql":
 		s.handleSQL(w, r)
-	case strings.HasPrefix(r.URL.Path, "/v1/vault/"):
+	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
 		s.handleVault(w, r)
 	default:
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "business_route_not_found", "path", r.URL.Path, "method", r.Method)...)
