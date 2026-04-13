@@ -16,7 +16,8 @@ Live end-to-end scripts for validating deployed `drive9-server` behavior.
 | `api-smoke-test-existing-key.sh` | Existing API key status/list checks |
 | `cli-smoke-test.sh` | End-to-end CLI workflow including `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
 | `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/rename/stat semantics, cross-channel consistency, read-only and error-path checks |
-| `smoke-all.sh` | Runs API + CLI + FUSE smoke scripts in sequence with aggregated pass/fail |
+| `tidbcloud-native-smoke-test.sh` | TiDB Cloud native provisioning via zero-instance header, status poll, file CRUD, search, copy/rename/delete |
+| `smoke-all.sh` | Runs API + CLI + FUSE + tidbcloud-native (if configured) smoke scripts in sequence with aggregated pass/fail |
 
 ## Run
 
@@ -36,6 +37,9 @@ DRIVE9_BASE=$DEPLOY bash e2e/fuse-smoke-test.sh
 
 # Use official released drive9 CLI for FUSE smoke
 DRIVE9_BASE=$DEPLOY CLI_SOURCE=official bash e2e/fuse-smoke-test.sh
+
+# TiDB Cloud native smoke (provision via zero-instance header + file ops)
+DRIVE9_BASE=$DEPLOY TIDB_ZERO_INSTANCE_ID=<instance-id> bash e2e/tidbcloud-native-smoke-test.sh
 
 DRIVE9_BASE=$DEPLOY bash e2e/smoke-all.sh
 ```

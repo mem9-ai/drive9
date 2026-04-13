@@ -35,6 +35,12 @@ run_case "api" "e2e/api-smoke-test.sh"
 run_case "cli" "e2e/cli-smoke-test.sh"
 run_case "fuse" "e2e/fuse-smoke-test.sh"
 
+if [ -n "${TIDB_ZERO_INSTANCE_ID:-}" ]; then
+  run_case "tidbcloud-native" "e2e/tidbcloud-native-smoke-test.sh"
+else
+  echo "\nSKIP [tidbcloud-native] TIDB_ZERO_INSTANCE_ID not set"
+fi
+
 echo
 echo "=== smoke-all result ==="
 echo "PASS=$PASS FAIL=$FAIL"
