@@ -6,6 +6,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
+	"github.com/mem9-ai/dat9/pkg/vault"
 )
 
 func initDB9Schema(dsn string) error {
@@ -112,5 +113,9 @@ func initDB9Schema(dsn string) error {
 		`CREATE INDEX IF NOT EXISTS idx_task_claim_type ON semantic_tasks(status, task_type, available_at, created_at, task_id)`,
 	}
 
-	return schema.ExecSchemaStatements(db, stmts)
+	if err := schema.ExecSchemaStatements(db, stmts); err != nil {
+		return err
+	}
+	// Initialize vault tables alongside core tables.
+	return vault.InitSchema(db)
 }
