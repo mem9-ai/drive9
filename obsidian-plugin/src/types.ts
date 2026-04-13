@@ -1,3 +1,6 @@
+/** Progress callback for multipart uploads. */
+export type ProgressFn = (partNumber: number, totalParts: number) => void;
+
 /** Plugin settings persisted in data.json. */
 export interface Drive9Settings {
   serverUrl: string;
@@ -5,6 +8,7 @@ export interface Drive9Settings {
   pushDebounce: number;
   ignorePaths: string[];
   maxFileSize: number; // bytes
+  mobileMaxFileSize: number; // bytes — lower limit on mobile to avoid OOM
 }
 
 export const DEFAULT_SETTINGS: Drive9Settings = {
@@ -13,6 +17,7 @@ export const DEFAULT_SETTINGS: Drive9Settings = {
   pushDebounce: 2000,
   ignorePaths: [".obsidian/**", ".trash/**", "*.tmp", ".DS_Store"],
   maxFileSize: 100 * 1024 * 1024, // 100MB
+  mobileMaxFileSize: 20 * 1024 * 1024, // 20MB — lower limit on mobile to avoid OOM
 };
 
 /** Result of HEAD /v1/fs/{path} */

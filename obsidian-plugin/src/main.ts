@@ -253,16 +253,25 @@ export default class Drive9Plugin extends Plugin {
     const engine = this.syncEngine;
     if (!engine) return;
 
+    const skipped = engine.skippedLargeFiles.length;
     switch (engine.status) {
-      case "syncing":
-        this.setStatusBar(`↕ drive9: syncing ${engine.pendingCount} files`);
+      case "syncing": {
+        const progress = engine.uploadProgressText;
+        if (progress) {
+          this.setStatusBar(`↕ drive9: ${progress}`);
+        } else {
+          this.setStatusBar(`↕ drive9: syncing ${engine.pendingCount} files`);
+        }
         break;
+      }
       case "error":
         this.setStatusBar("✗ drive9: error");
         break;
       case "idle":
         if (engine.pendingCount > 0) {
           this.setStatusBar(`↕ drive9: queued ${engine.pendingCount} files`);
+        } else if (skipped > 0) {
+          this.setStatusBar(`✓ drive9: synced (${skipped} skipped — too large)`);
         } else {
           this.setStatusBar("✓ drive9: synced");
         }
