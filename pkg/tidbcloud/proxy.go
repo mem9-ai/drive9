@@ -157,11 +157,22 @@ func (c *ClusterProxyClient) ExecuteSQL(ctx context.Context, sql string) error {
 	return nil
 }
 
+const (
+	// drive9DBName is the dedicated database created for fs_admin when
+	// role_admin is unavailable and the user cannot access "mysql".
+	drive9DBName = "_drive9_fs"
+)
+
 // CreateServiceUser creates a dedicated database user for drive9 runtime
 // operations via the cluster proxy. It always creates the user and sets a
-// password. Role grants (role_admin + SET DEFAULT ROLE) are best-effort:
-// if cloud_admin lacks ROLE_ADMIN privilege they are skipped with a warning,
-// and the returned user may have limited privileges.
+// password.
+//
+// Privilege strategy (in order of preference):
+//  1. GRANT role_admin — gives full admin on "mysql" database.
+//  2. If role_admin unavailable: return DBName = _drive9_fs so provisioning
+//     can create and initialize the dedicated database via the public LB.
+//
+// The returned ServiceUser.DBName indicates which database to use.
 func (c *ClusterProxyClient) CreateServiceUser(ctx context.Context, userPrefix string) (*ServiceUser, error) {
 	password, err := generatePassword(32)
 	if err != nil {
@@ -199,11 +210,9 @@ func (c *ClusterProxyClient) CreateServiceUser(ctx context.Context, userPrefix s
 		}
 	}
 
-	// Phase 2 — best-effort: grant role_admin and enable it.
-	// Some clusters' cloud_admin lacks ROLE_ADMIN (error 1227) or
-	// GRANT OPTION (error 8121). We log a warning and proceed without
-	// the grant so that fs_admin can still attempt DDL/DML directly.
-	bestEffort := []struct {
+	// Phase 2 — try granting role_admin (full admin on "mysql").
+	roleGranted := true
+	roleStmts := []struct {
 		step string
 		stmt string
 	}{
@@ -216,25 +225,43 @@ func (c *ClusterProxyClient) CreateServiceUser(ctx context.Context, userPrefix s
 			stmt: fmt.Sprintf("SET DEFAULT ROLE ALL TO '%s'@'%%'", escapedUser),
 		},
 	}
-	for _, s := range bestEffort {
+	for _, s := range roleStmts {
 		if err := c.ExecuteSQL(ctx, s.stmt); err != nil {
 			if !isGrantPrivilegeError(err) {
 				return nil, fmt.Errorf("create service user (%s): %w", s.step, err)
 			}
-			logger.Warn(ctx, "proxy_service_user_grant_skipped",
+			logger.Warn(ctx, "proxy_service_user_grant_role_skipped",
 				zap.String("step", s.step),
 				zap.String("user", qualifiedUser),
 				zap.Error(err))
-			break // skip remaining grant steps
+			roleGranted = false
+			break
 		}
 	}
 
+	if roleGranted {
+		logger.Info(ctx, "proxy_service_user_created",
+			zap.String("user", qualifiedUser),
+			zap.String("db", "mysql"))
+		return &ServiceUser{
+			Username: qualifiedUser,
+			Password: password,
+			DBName:   "mysql",
+		}, nil
+	}
+
+	// Phase 3 — role_admin unavailable: fs_admin will use a dedicated
+	// database instead of "mysql". The database will be created by
+	// fs_admin itself during provisioning (no cloud_admin GRANT needed).
 	logger.Info(ctx, "proxy_service_user_created",
-		zap.String("user", qualifiedUser))
+		zap.String("user", qualifiedUser),
+		zap.String("db", drive9DBName),
+		zap.Bool("role_granted", false))
 
 	return &ServiceUser{
 		Username: qualifiedUser,
 		Password: password,
+		DBName:   drive9DBName,
 	}, nil
 }
 

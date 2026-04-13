@@ -130,6 +130,9 @@ func TestCreateServiceUser_Success(t *testing.T) {
 	if len(svc.Password) != 64 { // 32 bytes → 64 hex chars
 		t.Fatalf("expected 64-char hex password, got len %d", len(svc.Password))
 	}
+	if svc.DBName != "mysql" {
+		t.Fatalf("got DBName %q, want %q", svc.DBName, "mysql")
+	}
 
 	if len(stmts) != 4 {
 		t.Fatalf("expected 4 SQL statements, got %d", len(stmts))
@@ -171,6 +174,9 @@ func TestCreateServiceUser_NoPrefix(t *testing.T) {
 	if svc.Username != "fs_admin" {
 		t.Fatalf("got username %q, want %q", svc.Username, "fs_admin")
 	}
+	if svc.DBName != "mysql" {
+		t.Fatalf("got DBName %q, want %q", svc.DBName, "mysql")
+	}
 }
 
 func TestCreateServiceUser_SQLFailure_IncludesStep(t *testing.T) {
@@ -204,13 +210,13 @@ func TestCreateServiceUser_SQLFailure_IncludesStep(t *testing.T) {
 	}
 }
 
-func TestCreateServiceUser_GrantFailure_BestEffort(t *testing.T) {
-	// Phase 2 failure (GRANT role_admin) should be non-fatal.
+func TestCreateServiceUser_GrantFailure_FallbackDB(t *testing.T) {
+	// Phase 2 failure (GRANT role_admin 1227) → Phase 3 sets DBName to _drive9_fs.
 	callCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		callCount++
 		w.Header().Set("Content-Type", "application/json")
-		if callCount == 3 { // fail on GRANT (3rd statement)
+		if callCount == 3 { // fail on GRANT role_admin (3rd statement)
 			_, _ = w.Write([]byte(`{"errNumber":1227,"errMessage":"Access denied; need ROLE_ADMIN"}`))
 			return
 		}
@@ -233,9 +239,12 @@ func TestCreateServiceUser_GrantFailure_BestEffort(t *testing.T) {
 	if svc.Username != "pfx.fs_admin" {
 		t.Fatalf("got username %q, want %q", svc.Username, "pfx.fs_admin")
 	}
-	// GRANT failed at call 3, SET DEFAULT ROLE (call 4) should be skipped.
+	if svc.DBName != "_drive9_fs" {
+		t.Fatalf("got DBName %q, want %q", svc.DBName, "_drive9_fs")
+	}
+	// Expect: CREATE USER, ALTER USER, GRANT role_admin (fail) — no more proxy calls.
 	if callCount != 3 {
-		t.Fatalf("expected 3 proxy calls (create + alter + grant), got %d", callCount)
+		t.Fatalf("expected 3 proxy calls, got %d", callCount)
 	}
 }
 
@@ -267,6 +276,44 @@ func TestCreateServiceUser_GrantUnexpectedError_Fatal(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "grant role_admin") {
 		t.Fatalf("expected error to mention step 'grant role_admin', got: %v", err)
+	}
+}
+
+func TestCreateServiceUser_CreateDBFailure_NotApplicable(t *testing.T) {
+	// Phase 3 no longer does CREATE DATABASE via proxy, so even if
+	// cloud_admin can't create databases, CreateServiceUser still succeeds
+	// with DBName = _drive9_fs. The actual CREATE DATABASE is done by
+	// fs_admin in the provisioning flow.
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		if callCount == 3 { // GRANT role_admin fails
+			_, _ = w.Write([]byte(`{"errNumber":1227,"errMessage":"Access denied; need ROLE_ADMIN"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"errNumber":0,"errMessage":""}`))
+	}))
+	defer srv.Close()
+
+	c := &ClusterProxyClient{
+		baseURL:   srv.URL,
+		clusterID: 1,
+		username:  "u",
+		password:  "p",
+		client:    srv.Client(),
+	}
+
+	svc, err := c.CreateServiceUser(context.Background(), "pfx")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if svc.DBName != "_drive9_fs" {
+		t.Fatalf("got DBName %q, want %q", svc.DBName, "_drive9_fs")
+	}
+	// Only 3 proxy calls: CREATE USER, ALTER USER, GRANT role_admin (fail)
+	if callCount != 3 {
+		t.Fatalf("expected 3 proxy calls, got %d", callCount)
 	}
 }
 

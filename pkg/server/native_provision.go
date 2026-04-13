@@ -2,11 +2,17 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"time"
+
+	"go.uber.org/zap"
+
+	_ "github.com/go-sql-driver/mysql" // register MySQL driver for sql.Open
 
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
@@ -187,10 +193,11 @@ func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.P
 
 	dbUser := svcUser.Username
 	dbPassword := svcUser.Password
+	dbName := svcUser.DBName
 	logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_svc_user_created",
-		"tenant_id", tenantID, "db_user", dbUser)...)
+		"tenant_id", tenantID, "db_user", dbUser, "db_name", dbName)...)
 
-	// Step 2: persist the service user credentials.
+	// Step 2: persist the service user credentials and database name.
 	cipherPass, encErr := s.pool.Encrypt(ctx, []byte(dbPassword))
 	if encErr != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_encrypt_db_password_failed",
@@ -199,7 +206,7 @@ func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.P
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
 		return
 	}
-	if updErr := s.meta.UpdateTenantDBCredentials(ctx, tenantID, dbUser, cipherPass); updErr != nil {
+	if updErr := s.meta.UpdateTenantDBCredentials(ctx, tenantID, dbUser, cipherPass, dbName); updErr != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_update_db_creds_failed",
 			"tenant_id", tenantID, "error", updErr)...)
 		_ = s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed)
@@ -208,9 +215,51 @@ func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.P
 	}
 	s.pool.Invalidate(tenantID)
 
-	// Step 3: schema init with the determined credentials.
-	dsn := tenantDSN(dbUser, dbPassword, cluster.Host, cluster.Port, cluster.DBName, true)
+	// Step 3: if using a dedicated database, fs_admin creates it first.
+	if dbName != "mysql" {
+		bootDSN := tenantDSN(dbUser, dbPassword, cluster.Host, cluster.Port, "", true)
+		if err := createDatabaseIfNotExists(ctx, bootDSN, dbName); err != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_create_db_failed",
+				"tenant_id", tenantID, "db_name", dbName, "error", err)...)
+			_ = s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+			return
+		}
+	}
+
+	// Step 4: schema init with the service user's database.
+	dsn := tenantDSN(dbUser, dbPassword, cluster.Host, cluster.Port, dbName, true)
 	s.initTenantSchemaAsync(ctx, tenantID, dsn, provider, np.InitSchema)
+}
+
+// validDBName matches safe database identifiers: ASCII letters, digits, underscores.
+var validDBName = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
+// createDatabaseIfNotExists connects to the cluster without a database and
+// executes CREATE DATABASE IF NOT EXISTS. Used when fs_admin cannot access the
+// default "mysql" database and needs a dedicated database.
+func createDatabaseIfNotExists(ctx context.Context, dsn, dbName string) error {
+	if !validDBName.MatchString(dbName) {
+		return fmt.Errorf("invalid database name: %q", dbName)
+	}
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return fmt.Errorf("open bootstrap connection: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.PingContext(ctx); err != nil {
+		return fmt.Errorf("ping bootstrap connection: %w", err)
+	}
+
+	stmt := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", dbName)
+	if _, err := db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("create database %s: %w", dbName, err)
+	}
+
+	logger.Info(ctx, "native_provision_database_created", zap.String("db_name", dbName))
+	return nil
 }
 
 // handleNativeTenantStatus checks for tidbcloud-native headers on /v1/status.

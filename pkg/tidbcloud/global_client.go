@@ -31,6 +31,7 @@ type ZeroInstanceInfo struct {
 type ServiceUser struct {
 	Username string
 	Password string
+	DBName   string // database the user has access to ("mysql" if role_admin granted, otherwise "_drive9_fs")
 }
 
 // GlobalClient abstracts calls to TiDB Cloud Global Server.
