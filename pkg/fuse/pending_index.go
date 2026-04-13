@@ -231,6 +231,27 @@ func (idx *PendingIndex) UpdateSize(remotePath string, size int64) {
 	}
 }
 
+// MarkConflict marks a pending entry as conflicted so that RecoverPending
+// skips it on restart. The entry is kept on disk for manual recovery.
+func (idx *PendingIndex) MarkConflict(remotePath string) {
+	idx.mu.Lock()
+	meta, ok := idx.items[remotePath]
+	if !ok {
+		idx.mu.Unlock()
+		return
+	}
+	meta.Kind = PendingConflict
+	idx.mu.Unlock()
+
+	// Persist to disk so crash recovery also sees the conflict marker.
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		return
+	}
+	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
+	_ = atomicWrite(metaPath, metaBytes)
+}
+
 // Count returns the number of pending entries.
 func (idx *PendingIndex) Count() int {
 	idx.mu.RLock()

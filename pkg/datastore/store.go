@@ -805,6 +805,9 @@ func (s *Store) InsertUploadTx(db execer, u *Upload) error {
 		nullStr(u.FingerprintSHA), nullStr(u.IdempotencyKey),
 		u.CreatedAt.UTC(), u.UpdatedAt.UTC(), u.ExpiresAt.UTC())
 	if isUniqueViolation(err) {
+		// Distinguish constraint: idx_idempotency (duplicate key) vs idx_uploads_active (concurrent path).
+		// MySQL embeds the constraint name in the error message; no structured alternative exists.
+		// If the constraint is renamed, update this string and corresponding tests.
 		if strings.Contains(err.Error(), "idx_idempotency") {
 			return ErrIdempotencyConflict
 		}

@@ -755,13 +755,19 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 			pendingNew = true
 		}
 	}
-	// Clean up shadow and pending index so background commits / recovery
-	// cannot resurrect the deleted file.
-	if fs.pendingIndex != nil {
-		fs.pendingIndex.Remove(childP)
-	}
-	if fs.shadowStore != nil {
-		fs.shadowStore.Remove(childP)
+	// Wait for any in-flight commitQueue upload and cancel it so the
+	// background commit cannot resurrect the deleted file.
+	if fs.commitQueue != nil {
+		fs.commitQueue.WaitPath(childP)
+		fs.commitQueue.CancelPath(childP)
+	} else {
+		// Clean up shadow and pending index directly when no commit queue.
+		if fs.pendingIndex != nil {
+			fs.pendingIndex.Remove(childP)
+		}
+		if fs.shadowStore != nil {
+			fs.shadowStore.Remove(childP)
+		}
 	}
 
 	if !pendingNew {
@@ -814,14 +820,19 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			}
 		}
 	}
-	// Also clean pendingIndex and shadowStore for the subtree so that
-	// background commits and crash recovery cannot resurrect deleted files.
-	if fs.pendingIndex != nil {
-		for _, meta := range fs.pendingIndex.ListByPrefix(prefix) {
-			if fs.shadowStore != nil {
-				fs.shadowStore.Remove(meta.Path)
+	// Cancel commitQueue entries for the subtree so background commits
+	// cannot resurrect deleted files. CancelPrefix handles shadow+index cleanup.
+	if fs.commitQueue != nil {
+		fs.commitQueue.CancelPrefix(prefix)
+	} else {
+		// Clean pendingIndex and shadowStore directly when no commit queue.
+		if fs.pendingIndex != nil {
+			for _, meta := range fs.pendingIndex.ListByPrefix(prefix) {
+				if fs.shadowStore != nil {
+					fs.shadowStore.Remove(meta.Path)
+				}
+				fs.pendingIndex.Remove(meta.Path)
 			}
-			fs.pendingIndex.Remove(meta.Path)
 		}
 	}
 
@@ -848,6 +859,13 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	newP, st := fs.childPath(input.Newdir, newName)
 	if st != gofuse.OK {
 		return st
+	}
+
+	// Wait for any in-flight commitQueue uploads for both paths so a
+	// background commit cannot PUT to the old path after we rename it.
+	if fs.commitQueue != nil {
+		fs.commitQueue.WaitPath(oldP)
+		fs.commitQueue.WaitPath(newP)
 	}
 
 	if fs.writeBack != nil && fs.uploader != nil {

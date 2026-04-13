@@ -142,6 +142,26 @@ func Mount(opts *MountOptions) error {
 				})
 			}
 
+			// Initialize WriteBackCache before CommitQueue so that legacy
+			// pending entries can be migrated to shadow files. Without this,
+			// RecoverPending would prune them as orphans (shadow missing).
+			wbCache, err := NewWriteBackCache(pendingDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "dat9: write-back cache init failed: %v (continuing without)\n", err)
+			}
+
+			// Migrate legacy writeBack entries to shadow store so
+			// CommitQueue.RecoverPending sees them and doesn't prune.
+			if wbCache != nil && shadowStore != nil {
+				for _, pe := range wbCache.ListPending() {
+					if !shadowStore.Has(pe.Meta.Path) {
+						if err := shadowStore.WriteFull(pe.Meta.Path, pe.Data, pe.Meta.BaseRev); err != nil {
+							fmt.Fprintf(os.Stderr, "dat9: migrate legacy entry %s to shadow: %v\n", pe.Meta.Path, err)
+						}
+					}
+				}
+			}
+
 			// Initialize CommitQueue for background remote commits.
 			if shadowStore != nil && pendingIdx != nil {
 				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, maxCommitQueuePending)
@@ -149,10 +169,7 @@ func Mount(opts *MountOptions) error {
 				dat9fs.commitQueue = cq
 			}
 
-			wbCache, err := NewWriteBackCache(pendingDir)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "dat9: write-back cache init failed: %v (continuing without)\n", err)
-			} else {
+			if wbCache != nil {
 				uploader := NewWriteBackUploader(c, wbCache, opts.UploadConcurrency)
 				dat9fs.SetWriteBack(wbCache, uploader)
 				// Recover pending uploads only when the newer commit queue is
