@@ -13,8 +13,7 @@ import type { SyncState } from "./types";
 export class ConflictResolver {
   private shadowStore: ShadowStore;
   private resolving = false;
-  /** Paths that should not be synced (e.g. .conflict copies). */
-  private ignoredPaths = new Set<string>();
+  private suppressLocalEvent: ((path: string, fn: () => Promise<void>) => Promise<void>) | null = null;
 
   constructor(
     private app: App,
@@ -26,14 +25,8 @@ export class ConflictResolver {
     this.shadowStore = new ShadowStore(vault.adapter);
   }
 
-  /** Register a path that should be ignored by the sync engine. */
-  addIgnoredPath(path: string): void {
-    this.ignoredPaths.add(path);
-  }
-
-  /** Check if a path is ignored (e.g. conflict copies). */
-  isIgnoredPath(path: string): boolean {
-    return this.ignoredPaths.has(path);
+  setSuppressLocalEvent(fn: (path: string, cb: () => Promise<void>) => Promise<void>): void {
+    this.suppressLocalEvent = fn;
   }
 
   /**
@@ -186,7 +179,7 @@ export class ConflictResolver {
   ): Promise<void> {
     switch (choice) {
       case "keep_local": {
-        // Overwrite remote with local — use CAS to avoid clobbering concurrent edits
+        // Overwrite remote with local — use CAS to avoid overwriting newer remote versions
         try {
           const result = await this.client.write(path, localData, remoteRevision);
           const hash = await this.shadowStore.save(localData);
@@ -202,11 +195,10 @@ export class ConflictResolver {
           new Notice(`drive9: kept local version of ${path}`);
         } catch (e) {
           if (e instanceof Drive9Error && e.status === 409) {
-            this.syncStates[path] = { ...this.syncStates[path], status: "conflict" };
-            new Notice(`drive9: remote changed again during resolution of ${path}`);
-          } else {
-            throw e;
+            new Notice(`drive9: remote changed again for ${path}, retrying next cycle`);
+            return;
           }
+          throw e;
         }
         break;
       }
@@ -230,17 +222,22 @@ export class ConflictResolver {
       }
 
       case "keep_both": {
-        // Save remote as {name}.conflict.{ext} — suppress local events so
-        // the conflict copy is not treated as a new file to sync.
+        // Save remote as {name}.conflict.{ext} — suppress to prevent push-back
         const conflictPath = makeConflictPath(path);
-        const dir = conflictPath.includes("/")
-          ? conflictPath.slice(0, conflictPath.lastIndexOf("/"))
-          : "";
-        if (dir && !this.vault.getAbstractFileByPath(dir)) {
-          await this.vault.createFolder(dir);
+        const createConflictCopy = async () => {
+          const dir = conflictPath.includes("/")
+            ? conflictPath.slice(0, conflictPath.lastIndexOf("/"))
+            : "";
+          if (dir && !this.vault.getAbstractFileByPath(dir)) {
+            await this.vault.createFolder(dir);
+          }
+          await this.vault.createBinary(conflictPath, remoteData);
+        };
+        if (this.suppressLocalEvent) {
+          await this.suppressLocalEvent(conflictPath, createConflictCopy);
+        } else {
+          await createConflictCopy();
         }
-        this.addIgnoredPath(conflictPath);
-        await this.vault.createBinary(conflictPath, remoteData);
 
         // Mark local as synced (push it to remote) — use CAS
         try {
@@ -258,11 +255,10 @@ export class ConflictResolver {
           new Notice(`drive9: kept both versions of ${path}`);
         } catch (e) {
           if (e instanceof Drive9Error && e.status === 409) {
-            this.syncStates[path] = { ...this.syncStates[path], status: "conflict" };
-            new Notice(`drive9: remote changed again during resolution of ${path}`);
-          } else {
-            throw e;
+            new Notice(`drive9: remote changed again for ${path}, retrying next cycle`);
+            return;
           }
+          throw e;
         }
         break;
       }
@@ -279,7 +275,7 @@ export class ConflictResolver {
 
     const localFile = this.getLocalFile(path);
     if (localFile) {
-      // Move to Obsidian's local .trash — never system trash or permanent delete
+      // Move to Obsidian .trash — never permanent delete
       await this.vault.trash(localFile, false);
     }
     delete this.syncStates[path];

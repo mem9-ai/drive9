@@ -192,11 +192,6 @@ export async function pullAllRemote(
       await vault.createBinary(entry.name, data);
     }
 
-    let contentHash: string | undefined;
-    if (shadowStore) {
-      try { contentHash = await shadowStore.save(data); } catch { /* ignore */ }
-    }
-
     const file = vault.getAbstractFileByPath(entry.name);
     if (file instanceof TFile) {
       let revision: number | null = null;
@@ -204,6 +199,10 @@ export async function pullAllRemote(
         const st = await client.stat(entry.name);
         revision = st.revision;
       } catch { /* revision stays null */ }
+      let contentHash: string | undefined;
+      if (shadowStore) {
+        try { contentHash = await shadowStore.save(data); } catch { /* shadow save best-effort */ }
+      }
       syncStates[entry.name] = {
         path: entry.name,
         localMtime: file.stat.mtime,

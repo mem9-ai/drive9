@@ -55,8 +55,9 @@ export default class Drive9Plugin extends Plugin {
       this.syncStates,
       () => this.savePluginData(),
     );
-
-    this.syncEngine.setExtraIgnoreCheck((path) => this.conflictResolver.isIgnoredPath(path));
+    this.conflictResolver.setSuppressLocalEvent(
+      (path, fn) => this.syncEngine.withSuppressedLocalEvents(path, fn),
+    );
 
     this.remoteWatcher = new RemoteWatcher(this.client, {
       onChange: (event) => this.syncEngine.onRemoteChange(event.path, event.op),

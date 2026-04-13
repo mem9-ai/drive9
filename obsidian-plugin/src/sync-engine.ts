@@ -23,7 +23,6 @@ export class SyncEngine {
   private statusListeners: Array<() => void> = [];
 
   private shadowStore: ShadowStore | null = null;
-  private extraIgnoreCheck: ((path: string) => boolean) | null = null;
 
   constructor(
     private vault: Vault,
@@ -37,11 +36,6 @@ export class SyncEngine {
 
   setShadowStore(store: ShadowStore): void {
     this.shadowStore = store;
-  }
-
-  /** Register an additional ignore check (e.g. for conflict resolver ignored paths). */
-  setExtraIgnoreCheck(fn: (path: string) => boolean): void {
-    this.extraIgnoreCheck = fn;
   }
 
   get status(): SyncStatus {
@@ -141,9 +135,7 @@ export class SyncEngine {
   }
 
   private shouldIgnore(path: string): boolean {
-    if (this.ignoreMatcher.isIgnored(path)) return true;
-    if (this.extraIgnoreCheck?.(path)) return true;
-    return false;
+    return this.ignoreMatcher.isIgnored(path);
   }
 
   private markDirty(path: string): void {
@@ -288,7 +280,7 @@ export class SyncEngine {
     return (this.suppressedPaths.get(path) ?? 0) > 0;
   }
 
-  private async withSuppressedLocalEvents(path: string, fn: () => Promise<void>): Promise<void> {
+  async withSuppressedLocalEvents(path: string, fn: () => Promise<void>): Promise<void> {
     this.suppressedPaths.set(path, (this.suppressedPaths.get(path) ?? 0) + 1);
     try {
       await fn();
