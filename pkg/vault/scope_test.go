@@ -48,6 +48,31 @@ func TestScopedSecretNames(t *testing.T) {
 	}
 }
 
+func TestValidateScope(t *testing.T) {
+	tests := []struct {
+		name    string
+		scope   []string
+		wantErr bool
+	}{
+		{"valid simple", []string{"aws-prod", "db-prod/password"}, false},
+		{"wildcard rejected", []string{"aws-*"}, true},
+		{"wildcard in field", []string{"db-prod/*"}, true},
+		{"empty entry", []string{""}, true},
+		{"empty secret name", []string{"/password"}, true},
+		{"empty field name", []string{"db-prod/"}, true},
+		{"valid single", []string{"github-token"}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateScope(tt.scope)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateScope(%v) error = %v, wantErr %v", tt.scope, err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestAllowedFields(t *testing.T) {
 	scope := []string{"aws-prod", "db-prod/password", "db-prod/host"}
 

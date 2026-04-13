@@ -184,6 +184,38 @@ func TestCapTokenBadSignature(t *testing.T) {
 	}
 }
 
+func TestPeekCapTokenTenantID(t *testing.T) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	mk, _ := NewMasterKey(key)
+	csk := mk.DeriveCSK("tenant-42")
+
+	claims := &CapTokenClaims{
+		TokenID:   "cap_test",
+		TenantID:  "tenant-42",
+		AgentID:   "agent-1",
+		Scope:     []string{"secret-a"},
+		IssuedAt:  time.Now().Unix(),
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		Nonce:     "abc",
+	}
+	tokenStr, _ := SignCapToken(csk, claims)
+
+	tenantID, err := PeekCapTokenTenantID(tokenStr)
+	if err != nil {
+		t.Fatalf("PeekCapTokenTenantID failed: %v", err)
+	}
+	if tenantID != "tenant-42" {
+		t.Fatalf("expected tenant-42, got %s", tenantID)
+	}
+
+	// Invalid token.
+	_, err = PeekCapTokenTenantID("garbage")
+	if err == nil {
+		t.Fatal("expected error for invalid token")
+	}
+}
+
 func TestDeriveCSKDifferentTenants(t *testing.T) {
 	key := make([]byte, 32)
 	rand.Read(key)

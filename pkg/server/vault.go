@@ -277,13 +277,9 @@ func (s *Server) handleVaultTokenIssue(w http.ResponseWriter, r *http.Request, v
 		errJSON(w, http.StatusBadRequest, "scope is required")
 		return
 	}
-	// Reject wildcard scope entries — not yet implemented.
-	// Without expansion, a wildcard token would silently fail scope checks.
-	for _, entry := range req.Scope {
-		if strings.Contains(entry, "*") {
-			errJSON(w, http.StatusBadRequest, "wildcard scope is not supported yet; specify exact secret names")
-			return
-		}
+	if err := vault.ValidateScope(req.Scope); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	ttl := time.Duration(req.TTLSecs) * time.Second
 	if ttl <= 0 {

@@ -1,6 +1,30 @@
 package vault
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
+
+// ValidateScope checks that all scope entries are well-formed. Returns an error
+// for entries containing wildcards (*) or empty segments.
+func ValidateScope(scope []string) error {
+	for _, entry := range scope {
+		if entry == "" {
+			return fmt.Errorf("empty scope entry")
+		}
+		if strings.Contains(entry, "*") {
+			return fmt.Errorf("wildcard scope entries are not supported: %q", entry)
+		}
+		parts := strings.SplitN(entry, "/", 2)
+		if parts[0] == "" {
+			return fmt.Errorf("empty secret name in scope entry: %q", entry)
+		}
+		if len(parts) == 2 && parts[1] == "" {
+			return fmt.Errorf("empty field name in scope entry: %q", entry)
+		}
+	}
+	return nil
+}
 
 // CheckScope verifies that a requested secret/field is within the token's scope.
 // Scope entries:
