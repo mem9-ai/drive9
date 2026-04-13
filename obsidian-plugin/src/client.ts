@@ -6,6 +6,8 @@ import type { StatResult, FileInfo } from "./types";
  * (bypasses CORS, works on mobile).
  */
 export class Drive9Client {
+  private actorId = "";
+
   constructor(
     private serverUrl: string,
     private apiKey: string,
@@ -14,6 +16,10 @@ export class Drive9Client {
   updateConfig(serverUrl: string, apiKey: string): void {
     this.serverUrl = serverUrl;
     this.apiKey = apiKey;
+  }
+
+  setActorId(actorId: string): void {
+    this.actorId = actorId;
   }
 
   /** Test connectivity and auth. Throws on failure. */
@@ -56,6 +62,9 @@ export class Drive9Client {
     if (expectedRevision !== undefined && expectedRevision !== null) {
       headers["X-Dat9-Expected-Revision"] = String(expectedRevision);
     }
+    if (this.actorId) {
+      headers["X-Dat9-Actor"] = this.actorId;
+    }
     await this.request("PUT", `/v1/fs/${encodePath(path)}`, {
       body: data,
       headers,
@@ -73,19 +82,23 @@ export class Drive9Client {
 
   /** DELETE — remove a file. */
   async delete(path: string): Promise<void> {
-    await this.request("DELETE", `/v1/fs/${encodePath(path)}`);
+    const headers: Record<string, string> = {};
+    if (this.actorId) headers["X-Dat9-Actor"] = this.actorId;
+    await this.request("DELETE", `/v1/fs/${encodePath(path)}`, { headers });
   }
 
   /** POST ?rename — rename/move a file. */
   async rename(oldPath: string, newPath: string): Promise<void> {
-    await this.request("POST", `/v1/fs/${encodePath(newPath)}?rename`, {
-      headers: { "X-Dat9-Rename-Source": oldPath },
-    });
+    const headers: Record<string, string> = { "X-Dat9-Rename-Source": oldPath };
+    if (this.actorId) headers["X-Dat9-Actor"] = this.actorId;
+    await this.request("POST", `/v1/fs/${encodePath(newPath)}?rename`, { headers });
   }
 
   /** POST ?mkdir — create a directory. */
   async mkdir(path: string): Promise<void> {
-    await this.request("POST", `/v1/fs/${encodePath(path)}?mkdir`);
+    const headers: Record<string, string> = {};
+    if (this.actorId) headers["X-Dat9-Actor"] = this.actorId;
+    await this.request("POST", `/v1/fs/${encodePath(path)}?mkdir`, { headers });
   }
 
   /** GET ?list=1 — list directory contents. */

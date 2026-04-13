@@ -51,10 +51,12 @@ export interface PluginData {
   settings: Drive9Settings;
   syncStates: Record<string, SyncState>;
   firstRunComplete: boolean;
+  actorId: string;
 }
 
 export const DEFAULT_PLUGIN_DATA: PluginData = {
   settings: DEFAULT_SETTINGS,
   syncStates: {},
   firstRunComplete: false,
+  actorId: "",
 };

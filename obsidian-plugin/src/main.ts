@@ -1,6 +1,7 @@
 import { Plugin, Notice, TFile } from "obsidian";
 import { Drive9Client } from "./client";
 import { SyncEngine } from "./sync-engine";
+import { SSEWatcher } from "./sse-watcher";
 import { Drive9SettingTab } from "./settings";
 import { runFirstRunReconciliation, pullAllRemote } from "./first-run";
 import type { PluginData, Drive9Settings, SyncState } from "./types";
@@ -10,17 +11,27 @@ export default class Drive9Plugin extends Plugin {
   settings: Drive9Settings = DEFAULT_SETTINGS;
   private client!: Drive9Client;
   private syncEngine!: SyncEngine;
+  private sseWatcher: SSEWatcher | null = null;
   private syncStates: Record<string, SyncState> = {};
   private firstRunComplete = false;
   private statusBarEl: HTMLElement | null = null;
+  private actorId = "";
 
   async onload(): Promise<void> {
     await this.loadPluginData();
+
+    // Generate a stable actor ID for this plugin instance.
+    // Persisted so the same vault installation keeps the same actor ID.
+    if (!this.actorId) {
+      this.actorId = generateActorId();
+      await this.savePluginData();
+    }
 
     this.client = new Drive9Client(
       this.settings.serverUrl,
       this.settings.apiKey,
     );
+    this.client.setActorId(this.actorId);
 
     this.syncEngine = new SyncEngine(
       this.app.vault,
@@ -28,6 +39,7 @@ export default class Drive9Plugin extends Plugin {
       this.syncStates,
       this.settings,
       () => this.savePluginData(),
+      this.actorId,
     );
 
     // Status bar.
@@ -78,7 +90,28 @@ export default class Drive9Plugin extends Plugin {
       ),
     );
 
+    // Start SSE watcher for remote change detection.
+    this.startSSEWatcher();
+
     this.setStatusBar("✓ drive9: synced");
+  }
+
+  private startSSEWatcher(): void {
+    if (this.sseWatcher) {
+      this.sseWatcher.stop();
+    }
+
+    this.sseWatcher = new SSEWatcher(
+      this.settings.serverUrl,
+      this.settings.apiKey,
+      this.actorId,
+      {
+        onRemoteChange: (path, op) => this.syncEngine.onRemoteChange(path, op),
+        onFullSync: () => this.syncEngine.onFullSync(),
+      },
+    );
+
+    this.sseWatcher.start();
   }
 
   private async doFirstRun(): Promise<void> {
@@ -93,7 +126,6 @@ export default class Drive9Plugin extends Plugin {
 
     switch (result.action) {
       case "push_all":
-        // Mark all local files as dirty so the sync engine pushes them.
         new Notice("drive9: uploading vault to drive9...");
         for (const file of this.app.vault.getFiles()) {
           this.syncEngine.onLocalCreate(file);
@@ -132,12 +164,11 @@ export default class Drive9Plugin extends Plugin {
                 await this.app.vault.createFolder(dir);
               }
               await this.app.vault.createBinary(path, data);
-              // Refresh revision if it was unknown from first-run.
               if (state.remoteRevision === null) {
                 try {
                   const st = await this.client.stat(path);
                   state.remoteRevision = st.revision;
-                } catch { /* stays null — will refresh before next push */ }
+                } catch { /* stays null */ }
               }
               const pulled = this.app.vault.getAbstractFileByPath(path);
               if (pulled instanceof TFile) {
@@ -172,19 +203,27 @@ export default class Drive9Plugin extends Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings);
     this.syncStates = data.syncStates ?? {};
     this.firstRunComplete = data.firstRunComplete ?? false;
+    this.actorId = (raw as Record<string, unknown>)?.actorId as string ?? "";
   }
 
   async savePluginData(): Promise<void> {
-    const data: PluginData = {
+    const data = {
       settings: this.settings,
       syncStates: this.syncStates,
       firstRunComplete: this.firstRunComplete,
+      actorId: this.actorId,
     };
     await this.saveData(data);
 
     // Keep client and sync engine in sync with settings.
     this.client.updateConfig(this.settings.serverUrl, this.settings.apiKey);
+    this.client.setActorId(this.actorId);
     this.syncEngine?.updateSettings(this.settings);
+
+    // Update SSE watcher config if it exists.
+    if (this.sseWatcher) {
+      this.sseWatcher.updateConfig(this.settings.serverUrl, this.settings.apiKey);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -197,7 +236,7 @@ export default class Drive9Plugin extends Plugin {
 
     switch (engine.status) {
       case "syncing":
-        this.setStatusBar(`↑ drive9: uploading ${engine.pendingCount} files`);
+        this.setStatusBar(`↕ drive9: syncing ${engine.pendingCount} files`);
         break;
       case "error":
         this.setStatusBar("✗ drive9: error");
@@ -215,6 +254,19 @@ export default class Drive9Plugin extends Plugin {
   }
 
   onunload(): void {
-    // Nothing to clean up — Obsidian handles event deregistration.
+    if (this.sseWatcher) {
+      this.sseWatcher.stop();
+      this.sseWatcher = null;
+    }
   }
+}
+
+/** Generate a random actor ID for self-filtering. */
+function generateActorId(): string {
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let id = "obsidian-";
+  for (let i = 0; i < 12; i++) {
+    id += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return id;
 }
