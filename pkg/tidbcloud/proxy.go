@@ -32,28 +32,36 @@ type proxyExecuteResponse struct {
 	ErrMsg    string `json:"errMessage"`
 }
 
-// CreateServiceUserViaProxy creates a SQL user with role_admin privileges
-// by calling the internal cluster proxy's execute endpoint.
+// CreateServiceUserViaProxy creates a dedicated fs_admin SQL user for drive9
+// by calling the internal cluster proxy's /v1beta2/execute endpoint.
+//
+// It creates a custom role_fs_admin role with the minimum DDL/DML privileges
+// needed on the mysql database (CREATE, ALTER, DROP, INDEX, SELECT, INSERT,
+// UPDATE, DELETE), then creates (or updates) the service user and assigns the
+// role as its default role.
 //
 // operatorUser / operatorPass are credentials for an existing DB user
 // (typically root) that the proxy uses to authenticate the request.
 // newUser / newPass are the credentials for the new service user to create.
-//
-// The function creates a custom role_fs_admin role with full privileges on the
-// mysql database, then creates (or updates) the service user and assigns the role.
 func CreateServiceUserViaProxy(ctx context.Context, proxyEndpoint string, clusterID uint64, operatorUser, operatorPass, newUser, newPass string) error {
 	if proxyEndpoint == "" {
 		return fmt.Errorf("create service user: proxy endpoint is empty")
+	}
+	if err := validateSQLIdentifier(newUser); err != nil {
+		return fmt.Errorf("create service user: invalid username: %w", err)
+	}
+	if err := validateSQLPassword(newPass); err != nil {
+		return fmt.Errorf("create service user: invalid password: %w", err)
 	}
 
 	const roleName = "role_fs_admin"
 	queries := []string{
 		fmt.Sprintf("CREATE ROLE IF NOT EXISTS '%s'", roleName),
-		fmt.Sprintf("GRANT ALL PRIVILEGES ON mysql.* TO '%s'", roleName),
+		fmt.Sprintf("GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON mysql.* TO '%s'", roleName),
 		fmt.Sprintf("CREATE USER IF NOT EXISTS '%s' IDENTIFIED BY '%s'", newUser, newPass),
 		fmt.Sprintf("ALTER USER '%s' IDENTIFIED BY '%s'", newUser, newPass),
 		fmt.Sprintf("GRANT '%s' TO '%s'", roleName, newUser),
-		fmt.Sprintf("SET DEFAULT ROLE ALL TO '%s'", newUser),
+		fmt.Sprintf("SET DEFAULT ROLE '%s' TO '%s'", roleName, newUser),
 	}
 
 	body := proxyExecuteRequest{
@@ -109,5 +117,33 @@ func CreateServiceUserViaProxy(ctx context.Context, proxyEndpoint string, cluste
 		return fmt.Errorf("create service user: SQL error %d: %s", result.ErrNumber, result.ErrMsg)
 	}
 
+	return nil
+}
+
+// validateSQLIdentifier rejects strings that contain characters unsafe for
+// SQL single-quoted identifiers (single quotes, backslashes, control chars).
+func validateSQLIdentifier(s string) error {
+	if s == "" {
+		return fmt.Errorf("must not be empty")
+	}
+	for _, c := range s {
+		if c == '\'' || c == '\\' || c < 0x20 {
+			return fmt.Errorf("contains forbidden character %q", c)
+		}
+	}
+	return nil
+}
+
+// validateSQLPassword rejects passwords that could break single-quoted SQL
+// string literals.
+func validateSQLPassword(s string) error {
+	if s == "" {
+		return fmt.Errorf("must not be empty")
+	}
+	for _, c := range s {
+		if c == '\'' || c == '\\' || c < 0x20 {
+			return fmt.Errorf("contains forbidden character %q", c)
+		}
+	}
 	return nil
 }
