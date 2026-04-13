@@ -745,17 +745,17 @@ func TestOpenWritableLargeFileGetsLazyPreload(t *testing.T) {
 	}
 }
 
-func TestDefaultTTLIs1Second(t *testing.T) {
+func TestDefaultTTLIs10Seconds(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	if opts.AttrTTL != 1*time.Second {
-		t.Fatalf("default AttrTTL = %v, want 1s", opts.AttrTTL)
+	if opts.AttrTTL != 10*time.Second {
+		t.Fatalf("default AttrTTL = %v, want 10s", opts.AttrTTL)
 	}
-	if opts.EntryTTL != 1*time.Second {
-		t.Fatalf("default EntryTTL = %v, want 1s", opts.EntryTTL)
+	if opts.EntryTTL != 10*time.Second {
+		t.Fatalf("default EntryTTL = %v, want 10s", opts.EntryTTL)
 	}
-	if opts.NegativeEntryTTL != 1*time.Second {
-		t.Fatalf("default NegativeEntryTTL = %v, want 1s", opts.NegativeEntryTTL)
+	if opts.NegativeEntryTTL != 10*time.Second {
+		t.Fatalf("default NegativeEntryTTL = %v, want 10s", opts.NegativeEntryTTL)
 	}
 }
 
@@ -770,14 +770,13 @@ func TestLookupReturnsTTLInEntryOut(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("Lookup status = %v, want OK", st)
 	}
-	// The entry timeout should match the configured TTL (1s default).
+	// The entry timeout should match the configured TTL (10s default).
 	// go-fuse stores timeouts in seconds + nanoseconds.
-	// With 1s TTL, EntryValid should be ~1.
-	if out.EntryValid < 1 || out.EntryValid > 2 {
-		t.Fatalf("EntryValid = %d, want ~1 (1s TTL)", out.EntryValid)
+	if out.EntryValid < 10 || out.EntryValid > 11 {
+		t.Fatalf("EntryValid = %d, want ~10 (10s TTL)", out.EntryValid)
 	}
-	if out.AttrValid < 1 || out.AttrValid > 2 {
-		t.Fatalf("AttrValid = %d, want ~1 (1s TTL)", out.AttrValid)
+	if out.AttrValid < 10 || out.AttrValid > 11 {
+		t.Fatalf("AttrValid = %d, want ~10 (10s TTL)", out.AttrValid)
 	}
 }
 
