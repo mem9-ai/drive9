@@ -3,6 +3,8 @@ import type Drive9Plugin from "./main";
 import { Drive9Client } from "./client";
 
 export class Drive9SettingTab extends PluginSettingTab {
+  private validateTimer: ReturnType<typeof setTimeout> | null = null;
+
   constructor(
     app: App,
     private plugin: Drive9Plugin,
@@ -26,6 +28,7 @@ export class Drive9SettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.serverUrl = value.trim();
             await this.plugin.savePluginData();
+            this.scheduleValidation();
           }),
       );
 
@@ -34,12 +37,14 @@ export class Drive9SettingTab extends PluginSettingTab {
       .setDesc("drive9 API key for authentication")
       .addText((text) => {
         text.inputEl.type = "password";
+        text.inputEl.autocomplete = "off";
         text
           .setPlaceholder("your-api-key")
           .setValue(this.plugin.settings.apiKey)
           .onChange(async (value) => {
             this.plugin.settings.apiKey = value.trim();
             await this.plugin.savePluginData();
+            this.scheduleValidation();
           });
       });
 
@@ -48,20 +53,7 @@ export class Drive9SettingTab extends PluginSettingTab {
       .setDesc("Verify server URL and API key")
       .addButton((btn) =>
         btn.setButtonText("Test").onClick(async () => {
-          if (!this.plugin.settings.serverUrl) {
-            new Notice("Please enter a server URL first");
-            return;
-          }
-          try {
-            const testClient = new Drive9Client(
-              this.plugin.settings.serverUrl,
-              this.plugin.settings.apiKey,
-            );
-            await testClient.ping();
-            new Notice("drive9: connection successful!");
-          } catch (e) {
-            new Notice(`drive9: connection failed — ${e instanceof Error ? e.message : String(e)}`);
-          }
+          await this.testConnection();
         }),
       );
 
@@ -112,5 +104,86 @@ export class Drive9SettingTab extends PluginSettingTab {
             }
           }),
       );
+
+    // .gitignore warning
+    void this.checkGitignore(containerEl);
   }
+
+  private scheduleValidation(): void {
+    if (this.validateTimer) clearTimeout(this.validateTimer);
+    this.validateTimer = setTimeout(() => {
+      this.validateTimer = null;
+      void this.testConnection();
+    }, 1500);
+  }
+
+  private async testConnection(): Promise<void> {
+    if (!this.plugin.settings.serverUrl) {
+      new Notice("Please enter a server URL first");
+      return;
+    }
+    if (!this.plugin.settings.apiKey) {
+      new Notice("Please enter an API key first");
+      return;
+    }
+    try {
+      const testClient = new Drive9Client(
+        this.plugin.settings.serverUrl,
+        this.plugin.settings.apiKey,
+      );
+      await testClient.ping();
+      new Notice("drive9: connection successful!");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      new Notice(`drive9: connection failed — ${sanitizeError(msg)}`);
+    }
+  }
+
+  private async checkGitignore(containerEl: HTMLElement): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    const vaultRoot = (adapter as { getBasePath?: () => string }).getBasePath?.();
+    if (!vaultRoot) return;
+
+    try {
+      const gitignorePath = `${vaultRoot}/.gitignore`;
+      const fs = (globalThis as { require?: (name: string) => { existsSync: (p: string) => boolean; readFileSync: (p: string, e: string) => string } }).require?.("fs");
+      if (!fs) return;
+
+      if (!fs.existsSync(`${vaultRoot}/.git`)) return;
+
+      if (!fs.existsSync(gitignorePath)) {
+        this.addGitignoreWarning(containerEl, "No .gitignore found. Your API key in .obsidian/ could be committed to git.");
+        return;
+      }
+
+      const content = fs.readFileSync(gitignorePath, "utf-8");
+      const lines = content.split("\n").map((l: string) => l.trim());
+      const coversObsidian = lines.some((l: string) =>
+        l === ".obsidian" || l === ".obsidian/" || l === ".obsidian/**" || l === ".obsidian/*",
+      );
+
+      if (!coversObsidian) {
+        this.addGitignoreWarning(containerEl, ".gitignore does not cover .obsidian/ — your API key could be committed to git.");
+      }
+    } catch {
+      // Not on desktop or fs access failed — skip warning
+    }
+  }
+
+  private addGitignoreWarning(containerEl: HTMLElement, message: string): void {
+    const warning = containerEl.createEl("div", { cls: "drive9-gitignore-warning" });
+    warning.style.padding = "8px 12px";
+    warning.style.marginTop = "12px";
+    warning.style.borderRadius = "4px";
+    warning.style.backgroundColor = "var(--background-modifier-error)";
+    warning.style.color = "var(--text-on-accent)";
+    warning.createEl("strong", { text: "⚠ Security Warning: " });
+    warning.createSpan({ text: message });
+  }
+}
+
+/** Strip any potential API key / auth token from error messages. */
+function sanitizeError(msg: string): string {
+  // Remove Bearer tokens
+  return msg.replace(/Bearer\s+\S+/gi, "Bearer ***");
 }
