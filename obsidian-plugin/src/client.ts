@@ -18,16 +18,18 @@ export class Drive9Client {
 
   /** Test connectivity. Throws on failure. */
   async ping(): Promise<void> {
-    await this.list("/");
+    await this.request("GET", "/healthz");
   }
 
   /** HEAD — get file/dir metadata including revision. */
   async stat(path: string): Promise<StatResult> {
-    // requestUrl doesn't support HEAD directly, use GET with a query param
-    // to get metadata. We'll use list on parent + filter, or just GET the file
-    // and use headers. For now, use a lightweight approach.
-    const resp = await this.request("GET", `/v1/fs/${encodePath(path)}?stat=1`);
-    return resp.json as StatResult;
+    const resp = await this.request("HEAD", `/v1/fs/${encodePath(path)}`);
+    return {
+      size: parseInt(resp.headers["content-length"] ?? "0", 10),
+      isDir: resp.headers["x-dat9-isdir"] === "true",
+      revision: parseInt(resp.headers["x-dat9-revision"] ?? "0", 10),
+      mtime: parseInt(resp.headers["x-dat9-mtime"] ?? "0", 10),
+    };
   }
 
   /** GET — read file content. */
@@ -67,9 +69,8 @@ export class Drive9Client {
 
   /** POST ?rename — rename/move a file. */
   async rename(oldPath: string, newPath: string): Promise<void> {
-    await this.request("POST", `/v1/fs/${encodePath(oldPath)}?rename`, {
-      body: JSON.stringify({ destination: newPath }),
-      headers: { "Content-Type": "application/json" },
+    await this.request("POST", `/v1/fs/${encodePath(newPath)}?rename`, {
+      headers: { "X-Dat9-Rename-Source": oldPath },
     });
   }
 
@@ -151,9 +152,14 @@ export class Drive9Client {
     const resp = await requestUrl(params);
 
     if (resp.status >= 400) {
-      const msg = typeof resp.json?.error === "string"
-        ? resp.json.error
-        : `HTTP ${resp.status}`;
+      let msg = `HTTP ${resp.status}`;
+      try {
+        if (typeof resp.json?.error === "string") {
+          msg = resp.json.error;
+        }
+      } catch {
+        // HEAD responses have no body — json access may throw.
+      }
       throw new Drive9Error(msg, resp.status);
     }
 

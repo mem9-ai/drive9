@@ -1,4 +1,4 @@
-import { Plugin, Notice } from "obsidian";
+import { Plugin, Notice, TFile } from "obsidian";
 import { Drive9Client } from "./client";
 import { SyncEngine } from "./sync-engine";
 import { Drive9SettingTab } from "./settings";
@@ -132,6 +132,11 @@ export default class Drive9Plugin extends Plugin {
                 await this.app.vault.createFolder(dir);
               }
               await this.app.vault.createBinary(path, data);
+              const pulled = this.app.vault.getAbstractFileByPath(path);
+              if (pulled instanceof TFile) {
+                state.localMtime = pulled.stat.mtime;
+                state.localSize = pulled.stat.size;
+              }
               state.status = "synced";
               state.syncedAt = Date.now();
             } catch (e) {

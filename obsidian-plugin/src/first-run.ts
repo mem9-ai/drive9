@@ -192,11 +192,18 @@ export async function pullAllRemote(
 
     const file = vault.getAbstractFileByPath(entry.name);
     if (file instanceof TFile) {
+      let revision = 0;
+      try {
+        const st = await client.stat(entry.name);
+        revision = st.revision;
+      } catch {
+        // Best-effort; will be corrected on next successful push.
+      }
       syncStates[entry.name] = {
         path: entry.name,
         localMtime: file.stat.mtime,
         localSize: file.stat.size,
-        remoteRevision: 0,
+        remoteRevision: revision,
         syncedAt: Date.now(),
         status: "synced",
       };
