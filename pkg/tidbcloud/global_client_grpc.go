@@ -97,17 +97,20 @@ func (g *grpcGlobalClient) GetClusterInfo(ctx context.Context, clusterID string)
 	}
 
 	username := "cloud_admin"
-	if prefix := regional.GetUserPrefix(); prefix != "" {
+	prefix := regional.GetUserPrefix()
+	if prefix != "" {
 		username = prefix + ".cloud_admin"
 	}
 
 	return &ClusterInfo{
-		ClusterID: clusterID,
-		OrgID:     clusters[0].GetOrganizationId(),
-		Host:      pub.GetHost(),
-		Port:      int(pub.GetPort()),
-		Username:  username,
-		Version:   regional.GetVersion(),
+		ClusterID:     clusterID,
+		OrgID:         clusters[0].GetOrganizationId(),
+		Host:          pub.GetHost(),
+		Port:          int(pub.GetPort()),
+		Username:      username,
+		Version:       regional.GetVersion(),
+		ProxyEndpoint: sc.GetInternalEndpoint(),
+		UserPrefix:    prefix,
 	}, nil
 }
 

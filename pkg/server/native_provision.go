@@ -104,9 +104,9 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	// Encrypt root password — root is used directly for all DB operations.
-	// TiDB Cloud Serverless root lacks GRANT OPTION, so we cannot create
-	// a dedicated service user. The root credentials are persisted as-is.
+	// Encrypt root password for initial tenant record. After the async
+	// provisioning creates fs_admin via the cluster proxy, the tenant
+	// record will be updated with fs_admin credentials.
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_db_password_failed", "tenant_id", tenantID, "error", err)...)
@@ -163,8 +163,9 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 
 	// Service user creation and schema init run in a background goroutine.
 	// The tenant is already persisted with status=provisioning and root
-	// credentials, so /v1/status returns "provisioning" and server restarts
-	// can resume via resumeProvisioningTenants.
+	// credentials. The async flow creates fs_admin via the cluster proxy,
+	// updates the tenant record with fs_admin credentials, and runs
+	// schema init. Server restarts can resume via resumeProvisioningTenants.
 	go s.nativeProvisionAsync(backgroundWithTrace(ctx), np, tenantID, cluster, provider)
 
 	logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_accepted", "tenant_id", tenantID, "provider", provider)...)
@@ -178,16 +179,56 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 }
 
 // nativeProvisionAsync runs in a background goroutine after the tenant record
-// has been persisted. It runs schema init using the root credentials directly.
-// TiDB Cloud Serverless root lacks GRANT OPTION, so no dedicated service user
-// (fs_admin) is created — root is used for all DB operations.
+// has been persisted. It creates a dedicated fs_admin service user via the
+// internal cluster proxy (using cloud_admin as the operator), updates the
+// tenant record with fs_admin credentials, and runs schema init.
 func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.Provisioner, tenantID string, cluster *tenant.ClusterInfo, provider string) {
 	dbName := cluster.DBName
 	if dbName == "" {
 		dbName = "mysql"
 	}
 
-	dsn := tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, dbName, true)
+	// Build the fs_admin username with the serverless user prefix.
+	fsAdminUser := "fs_admin"
+	if cluster.UserPrefix != "" {
+		fsAdminUser = cluster.UserPrefix + ".fs_admin"
+	}
+	fsAdminPass := tidbcloud.GeneratePassword()
+
+	// Create fs_admin via the internal cluster proxy.
+	if err := np.CreateServiceUser(ctx, cluster.ClusterID, cluster.ProxyEndpoint, cluster.UserPrefix, fsAdminUser, fsAdminPass); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "create_service_user_failed",
+			"tenant_id", tenantID, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "create_user_error")
+		if uerr := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed); uerr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_error",
+				"tenant_id", tenantID, "error", uerr)...)
+		}
+		return
+	}
+
+	// Encrypt fs_admin password and update tenant record.
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(fsAdminPass))
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_fs_admin_password_failed",
+			"tenant_id", tenantID, "error", err)...)
+		if uerr := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed); uerr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_error",
+				"tenant_id", tenantID, "error", uerr)...)
+		}
+		return
+	}
+	if err := s.meta.UpdateTenantDBCredentials(ctx, tenantID, fsAdminUser, cipherPass, dbName); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_update_db_creds_failed",
+			"tenant_id", tenantID, "error", err)...)
+		if uerr := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed); uerr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_error",
+				"tenant_id", tenantID, "error", uerr)...)
+		}
+		return
+	}
+
+	dsn := tenantDSN(fsAdminUser, fsAdminPass, cluster.Host, cluster.Port, dbName, true)
 	s.initTenantSchemaAsync(ctx, tenantID, dsn, provider, np.InitSchema)
 }
 
