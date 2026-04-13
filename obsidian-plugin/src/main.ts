@@ -2,6 +2,8 @@ import { Plugin, Notice, TFile } from "obsidian";
 import { Drive9Client } from "./client";
 import { RemoteWatcher } from "./remote-watcher";
 import { SyncEngine } from "./sync-engine";
+import { ShadowStore } from "./shadow-store";
+import { ConflictResolver } from "./conflict-resolver";
 import { Drive9SettingTab } from "./settings";
 import { runFirstRunReconciliation, pullAllRemote } from "./first-run";
 import type { PluginData, Drive9Settings, SyncState } from "./types";
@@ -12,6 +14,10 @@ export default class Drive9Plugin extends Plugin {
   private client!: Drive9Client;
   private remoteWatcher: RemoteWatcher | null = null;
   private syncEngine!: SyncEngine;
+  private conflictResolver!: ConflictResolver;
+  private shadowStore!: ShadowStore;
+  private resolutionTimer: ReturnType<typeof setInterval> | null = null;
+  private shadowGCTimer: ReturnType<typeof setInterval> | null = null;
   private syncStates: Record<string, SyncState> = {};
   private firstRunComplete = false;
   private statusBarEl: HTMLElement | null = null;
@@ -38,6 +44,21 @@ export default class Drive9Plugin extends Plugin {
       this.settings,
       () => this.savePluginData(),
     );
+
+    this.shadowStore = new ShadowStore(this.app.vault.adapter);
+    this.syncEngine.setShadowStore(this.shadowStore);
+
+    this.conflictResolver = new ConflictResolver(
+      this.app,
+      this.app.vault,
+      this.client,
+      this.syncStates,
+      () => this.savePluginData(),
+    );
+    this.conflictResolver.setSuppressLocalEvent(
+      (path, fn) => this.syncEngine.withSuppressedLocalEvents(path, fn),
+    );
+
     this.remoteWatcher = new RemoteWatcher(this.client, {
       onChange: (event) => this.syncEngine.onRemoteChange(event.path, event.op),
       onReset: () => this.syncEngine.fullSync(),
@@ -92,6 +113,17 @@ export default class Drive9Plugin extends Plugin {
     );
 
     this.remoteWatcher?.start();
+
+    // Resolution loop: scan for conflicts and remote_deleted every 10s
+    this.resolutionTimer = setInterval(() => {
+      void this.conflictResolver.resolveAll();
+    }, 10_000);
+
+    // Shadow GC: clean up unreferenced shadow files every 5 minutes
+    this.shadowGCTimer = setInterval(() => {
+      void this.conflictResolver.gcShadows();
+    }, 5 * 60_000);
+
     this.setStatusBar("✓ drive9: synced");
   }
 
@@ -120,6 +152,7 @@ export default class Drive9Plugin extends Plugin {
           this.client,
           this.syncStates,
           this.settings.ignorePaths,
+          this.shadowStore,
         );
         break;
 
@@ -151,6 +184,9 @@ export default class Drive9Plugin extends Plugin {
                   // Leave revision unknown; push path will refresh before write.
                 }
               }
+              try {
+                state.lastSyncedContentHash = await this.shadowStore.save(data);
+              } catch { /* shadow save is best-effort */ }
               const pulled = this.app.vault.getAbstractFileByPath(path);
               if (pulled instanceof TFile) {
                 state.localMtime = pulled.stat.mtime;
@@ -242,6 +278,14 @@ export default class Drive9Plugin extends Plugin {
 
   onunload(): void {
     this.remoteWatcher?.stop();
+    if (this.resolutionTimer) {
+      clearInterval(this.resolutionTimer);
+      this.resolutionTimer = null;
+    }
+    if (this.shadowGCTimer) {
+      clearInterval(this.shadowGCTimer);
+      this.shadowGCTimer = null;
+    }
   }
 }
 
