@@ -1,5 +1,5 @@
 import { Vault, TFile, TAbstractFile, Notice } from "obsidian";
-import { Drive9Client, Drive9Error } from "./client";
+import { Drive9Client, Drive9Error, sanitizeError } from "./client";
 import { IgnoreMatcher } from "./ignore";
 import type { ShadowStore } from "./shadow-store";
 import type { SyncState, Drive9Settings } from "./types";
@@ -171,7 +171,7 @@ export class SyncEngine {
           await this.pushOne(path);
         } catch (e) {
           errorOccurred = true;
-          console.error(`[drive9] push failed: ${path}`, e);
+          console.error(`[drive9] push failed: ${path}`, e instanceof Error ? e.message : sanitizeError(String(e)));
           this.dirtyPaths.add(path);
         }
       }
