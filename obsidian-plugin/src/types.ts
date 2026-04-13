@@ -31,6 +31,21 @@ export interface FileInfo {
   mtime: number;
 }
 
+/** Remote filesystem mutation event from /v1/events. */
+export interface ChangeEvent {
+  seq: number;
+  path: string;
+  op: string;
+  actor?: string;
+  ts: number;
+}
+
+/** Reset event from /v1/events when targeted replay is not possible. */
+export interface ResetEvent {
+  seq: number;
+  reason: string;
+}
+
 /** Per-file sync tracking. */
 export interface SyncState {
   path: string;
@@ -51,10 +66,12 @@ export interface PluginData {
   settings: Drive9Settings;
   syncStates: Record<string, SyncState>;
   firstRunComplete: boolean;
+  actorId: string;
 }
 
 export const DEFAULT_PLUGIN_DATA: PluginData = {
   settings: DEFAULT_SETTINGS,
   syncStates: {},
   firstRunComplete: false,
+  actorId: "",
 };
