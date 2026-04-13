@@ -293,7 +293,7 @@ func logLocalStartupStep(ctx context.Context, startupStart, stepStart time.Time,
 
 var (
 	localTiDBEmbeddingModeDetector = schema.DetectTiDBEmbeddingMode
-	localTiDBSchemaValidator       = schema.ValidateTiDBSchemaForMode
+	localTiDBSchemaValidator       = schema.EnsureTiDBSchemaForMode
 	localTiDBSchemaInitializer     = schema.InitTiDBTenantSchemaForMode
 )
 
