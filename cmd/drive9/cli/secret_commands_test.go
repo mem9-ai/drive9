@@ -124,6 +124,40 @@ func TestSecretLsFallsBackToReadableScopeWithCapabilityToken(t *testing.T) {
 	}
 }
 
+func TestSecretLsPrefersExplicitCapabilityTokenOverAmbientAPIKey(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DRIVE9_SERVER", "http://example.invalid")
+	t.Setenv("DRIVE9_API_KEY", "tenant-key")
+	t.Setenv(vaultTokenEnv, "cap-token")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/vault/read":
+			if got := r.Header.Get("Authorization"); got != "Bearer cap-token" {
+				t.Fatalf("Authorization = %q, want Bearer cap-token", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"secrets":["scoped-secret"]}`))
+		case "/v1/vault/secrets":
+			t.Fatalf("management list should not be used when an explicit capability token is set")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("DRIVE9_SERVER", srv.URL)
+
+	out := captureStdout(t, func() {
+		if err := SecretLs(nil); err != nil {
+			t.Fatalf("SecretLs: %v", err)
+		}
+	})
+	if out != "scoped-secret\n" {
+		t.Fatalf("output = %q", out)
+	}
+}
+
 func TestSecretExecInjectsSecretIntoChildEnv(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/vault/read/aws-prod" {

@@ -18,6 +18,8 @@ func TestParseSecretRef(t *testing.T) {
 	}{
 		{in: "aws-prod", wantName: "aws-prod"},
 		{in: "db-prod/password", wantName: "db-prod", wantField: "password"},
+		{in: "prod/*", wantErr: true},
+		{in: "db-prod/pass*", wantErr: true},
 		{in: "", wantErr: true},
 		{in: "/password", wantErr: true},
 		{in: "db-prod/", wantErr: true},
@@ -53,6 +55,14 @@ func TestParseFieldAssignmentsReadsLiteralAndFile(t *testing.T) {
 	}
 	if !reflect.DeepEqual(fields, want) {
 		t.Fatalf("fields = %#v, want %#v", fields, want)
+	}
+}
+
+func TestValidateSecretNameRejectsWildcard(t *testing.T) {
+	t.Parallel()
+
+	if err := validateSecretName("prod-*"); err == nil {
+		t.Fatal("expected wildcard rejection")
 	}
 }
 

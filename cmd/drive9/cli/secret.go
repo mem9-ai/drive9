@@ -186,8 +186,9 @@ func SecretExec(args []string) error {
 	return cmd.Run()
 }
 
-// SecretLs lists secret names. With a management token it lists all secrets;
-// with only a capability token it enumerates the visible scope.
+// SecretLs lists secret names. An explicit capability token always wins over
+// any ambient tenant API key/config so agents do not silently enumerate the
+// whole tenant when a scoped token was intentionally provided.
 func SecretLs(args []string) error {
 	asJSON := false
 	for _, arg := range args {
@@ -200,7 +201,17 @@ func SecretLs(args []string) error {
 	}
 
 	var names []string
-	if c, ok := optionalVaultManagementClientFromEnv(); ok {
+	if currentCapabilityToken() != "" {
+		c, err := newVaultReadClientFromEnv()
+		if err != nil {
+			return err
+		}
+		var errList error
+		names, errList = c.ListReadableVaultSecrets(context.Background())
+		if errList != nil {
+			return errList
+		}
+	} else if c, ok := optionalVaultManagementClientFromEnv(); ok {
 		secrets, err := c.ListVaultSecrets(context.Background())
 		if err != nil {
 			return err
@@ -481,6 +492,9 @@ func validateSecretName(name string) error {
 	if strings.Contains(name, "/") {
 		return fmt.Errorf("secret name %q must be flat in v0; use <name/field> only for reads and scopes", name)
 	}
+	if strings.Contains(name, "*") {
+		return fmt.Errorf("wildcard scope entries are not supported in v0: %q", name)
+	}
 	return nil
 }
 
@@ -499,6 +513,9 @@ func parseSecretRef(raw string) (string, string, error) {
 	field := parts[1]
 	if field == "" {
 		return "", "", fmt.Errorf("field name is required in %q", raw)
+	}
+	if strings.Contains(field, "*") {
+		return "", "", fmt.Errorf("wildcard scope entries are not supported in v0: %q", raw)
 	}
 	return name, field, nil
 }
