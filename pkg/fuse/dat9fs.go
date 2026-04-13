@@ -861,11 +861,12 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		return st
 	}
 
-	// Wait for any in-flight commitQueue uploads for both paths so a
-	// background commit cannot PUT to the old path after we rename it.
+	// Wait for any in-flight commitQueue uploads for both paths (and
+	// descendants) so a background commit cannot PUT to stale paths.
 	if fs.commitQueue != nil {
 		fs.commitQueue.WaitPath(oldP)
 		fs.commitQueue.WaitPath(newP)
+		fs.commitQueue.WaitPrefix(oldP + "/")
 	}
 
 	if fs.writeBack != nil && fs.uploader != nil {

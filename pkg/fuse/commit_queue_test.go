@@ -94,13 +94,17 @@ func TestCommitQueueConflictKeepsPendingState(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("conflict should stop retries after first attempt, got %d calls", calls)
 	}
-	// Terminal failure cleans up shadow and pending index to prevent
-	// infinite retry loop on restart.
-	if pending.HasPending("/conflict.txt") {
-		t.Fatal("pending entry should be cleaned up after terminal conflict")
+	// Terminal failure preserves shadow and pending data for manual recovery,
+	// but marks the entry as PendingConflict so RecoverPending skips it.
+	if !pending.HasPending("/conflict.txt") {
+		t.Fatal("pending entry should be preserved after terminal conflict")
 	}
-	if shadow.Has("/conflict.txt") {
-		t.Fatal("shadow should be cleaned up after terminal conflict")
+	meta, ok := pending.GetMeta("/conflict.txt")
+	if !ok || meta.Kind != PendingConflict {
+		t.Fatalf("pending entry should be marked as PendingConflict, got kind=%v ok=%v", meta.Kind, ok)
+	}
+	if !shadow.Has("/conflict.txt") {
+		t.Fatal("shadow should be preserved after terminal conflict")
 	}
 	if got := cq.Pending(); got != 0 {
 		t.Fatalf("queue pending count = %d, want 0 after terminal conflict", got)
