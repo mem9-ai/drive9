@@ -123,7 +123,7 @@ Master Key (MK)
 | T2 | Agent subprocess/tool captures secrets from filesystem or env | High | FUSE adapter: `readdir` returns empty for subprocess PIDs not matching agent (best-effort). API adapter: secrets never touch filesystem. Env adapter: recommend short-lived subshell, not `export`. |
 | T3 | Agent logs/prints secret values (prompt capture, debug dump) | Medium | Out of scope for infrastructure — this is an agent behavior problem. Mitigation: short-lived capability tokens limit blast radius. Audit log enables post-incident tracing. |
 | T4 | Database compromise exposes secret values | High | Secrets encrypted at rest with per-tenant DEK. Attacker needs both DB dump and MK to recover plaintext. |
-| T5 | Capability token stolen / replayed | Medium | Tokens are short-lived (TTL, default 1 hour). Tokens are bound to agent identity + task scope. Tokens cannot be used to issue new tokens. Server can revoke tokens instantly. |
+| T5 | Capability token stolen / replayed | Medium | **Mitigated, not eliminated.** Tokens are short-lived scoped bearer tokens (TTL, default 1 hour). A stolen token can be replayed within its TTL window from any machine — there is no holder binding (no mTLS, no channel binding, no agent-specific proof). Mitigations: (1) short TTL limits replay window, (2) narrow scope limits blast radius, (3) server-side revocation (`DELETE /v1/vault/tokens/{id}`) can kill a compromised token immediately, (4) audit log records all materializations for post-incident tracing. Tokens cannot be used to issue new tokens. Future enhancement: optional IP/session pinning at grant time (not in Phase 0 scope). |
 | T6 | MK compromise | Critical | Rotate MK → re-wrap all DEKs. Plaintext secrets not affected (only DEK wrapping changes). Alert on anomalous MK access patterns. |
 | T7 | Network eavesdropping | High | TLS required. FUSE adapter uses localhost loopback (no network exposure). API adapter over TLS only. |
 | T8 | Stale secret used after rotation | Medium | See Materialization Contract §4. New reads get new value. Stale in-memory values are the agent's responsibility. |
@@ -151,7 +151,15 @@ The core authorization primitive is a **capability token** — a short-lived, ta
 }
 ```
 
-**Token format**: HMAC-SHA256 signed, base64url encoded. Same pattern as drive9's existing upload token (#116).
+**Token format**: HMAC-SHA256 signed, base64url encoded. Same pattern as drive9's existing upload token (#116). The signed payload is self-describing (contains scope, TTL, etc.), but the server **also persists token state** in the `vault_tokens` table (see §6.1) to support revocation.
+
+**Token verification flow** (every consumption request):
+1. Verify HMAC signature (fast, no DB hit — rejects tampered/forged tokens)
+2. Check `expires_at` from token payload (fast, no DB hit — rejects expired tokens)
+3. Query `vault_tokens` table: confirm `token_id` exists AND `revoked_at IS NULL` (DB hit — rejects revoked tokens)
+4. If all checks pass, extract scope from token payload and serve request
+
+Step 3 is the critical addition: without server-side state, revocation before TTL expiry would be impossible. The DB lookup adds latency (~1ms for indexed primary key), but is required for revocation correctness.
 
 **Scope semantics**:
 - `"aws-prod"` — access all fields of the `aws-prod` secret
@@ -160,10 +168,10 @@ The core authorization primitive is a **capability token** — a short-lived, ta
 
 **Lifecycle**:
 1. Orchestrator calls `POST /v1/vault/tokens` with agent identity + desired scope
-2. Server validates orchestrator credentials, checks ACL policy, issues token
+2. Server validates orchestrator credentials, checks ACL policy, issues token, **persists token record to `vault_tokens`**
 3. Orchestrator passes token to agent (env var, file, or direct injection)
-4. Agent uses token to consume secrets through any adapter
-5. Token expires or is revoked. Agent loses access.
+4. Agent uses token to consume secrets through any adapter. **Every request is validated against server-side token state** (see verification flow above).
+5. Token expires or is explicitly revoked (`DELETE /v1/vault/tokens/{token_id}` sets `revoked_at`). Agent loses access on next request.
 
 ### 3.2 Consumption Adapters
 
@@ -249,7 +257,7 @@ When an agent mounts via FUSE or calls `GET /v1/vault/secrets`:
 | **Already-opened file descriptor** | NOT guaranteed to update. Reads on an existing FD may return the version that was current when the FD was opened. (FUSE adapter may choose to invalidate, but this is best-effort.) |
 | **Env var after exec injection** | Snapshot at process start. Never updates. This is inherent to how env vars work. |
 | **In-memory value in agent code** | Agent's responsibility. Infrastructure cannot reach into process memory. |
-| **After token expiry/revocation** | New `open()`/`GET` fails with 401. Existing in-memory values remain (cannot be forcibly cleared). Existing FUSE FDs return EIO. |
+| **After token expiry/revocation** | New `open()`/`GET` fails with 401/EACCES. Existing in-memory values remain (cannot be forcibly cleared). Existing FUSE FDs: **best-effort invalidation** — adapter attempts to return EIO on subsequent reads, but this depends on kernel page cache state and is not a hard guarantee. Data already read into userspace buffers or kernel page cache may remain accessible until the FD is closed. |
 
 ### 4.2 Materialization Formats
 
@@ -301,7 +309,7 @@ When a capability token is revoked or expires:
 
 | Adapter | Behavior |
 |---------|----------|
-| FUSE | Existing open FDs return `EIO`. New `open()` returns `EACCES`. `readdir` returns empty. Mount stays alive (for graceful degradation) but serves no secrets. |
+| FUSE | New `open()` returns `EACCES`. `readdir` returns empty. Mount stays alive (for graceful degradation) but serves no secrets. **Existing open FDs**: best-effort invalidation — adapter sets an internal revoked flag and attempts to return `EIO` on subsequent `read()` calls, but data already in kernel page cache or userspace buffers may still be readable until the FD is closed. This is NOT a hard guarantee. |
 | API | Returns `401 Unauthorized` for all requests with the revoked token. |
 | Exec | No effect on already-running process (env vars are in-memory). New `dat9 vault exec` with expired token fails. |
 
@@ -370,6 +378,22 @@ CREATE TABLE vault_secret_fields (
     nonce         BYTEA NOT NULL,          -- GCM nonce (12 bytes)
     PRIMARY KEY (secret_id, field_name)
 );
+
+-- Capability tokens (server-side state for revocation + audit)
+CREATE TABLE vault_tokens (
+    token_id      VARCHAR(64) PRIMARY KEY,
+    tenant_id     VARCHAR(64) NOT NULL,
+    agent_id      VARCHAR(255) NOT NULL,
+    task_id       VARCHAR(255),
+    scope_json    JSONB NOT NULL,            -- ["aws-prod","db-prod/password"]
+    issued_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at    TIMESTAMPTZ NOT NULL,
+    revoked_at    TIMESTAMPTZ,               -- NULL = active; non-NULL = revoked
+    revoked_by    VARCHAR(255),
+    revoke_reason VARCHAR(255)
+);
+CREATE INDEX idx_token_tenant ON vault_tokens(tenant_id);
+CREATE INDEX idx_token_agent ON vault_tokens(agent_id);
 
 -- ACL policies
 CREATE TABLE vault_policies (
