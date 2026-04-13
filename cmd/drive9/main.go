@@ -9,6 +9,7 @@
 //	create  provision a new database
 //	ctx     switch or list contexts
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, sh, grep, find)
+//	secret  secret manager operations (set, get, exec, ls, rm, grant, revoke, audit)
 //	mount   mount drive9 as a local FUSE filesystem
 //	umount  unmount a drive9 FUSE mount
 package main
@@ -79,6 +80,21 @@ func main() {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "fs"), zap.String("subcommand", sub))
 		}
 		runFS(args)
+	case "secret":
+		if cliLogger != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = args[0]
+			}
+			logger.Info(context.Background(), "cli_command", zap.String("command", "secret"), zap.String("subcommand", sub))
+		}
+		if err := cli.Secret(args); err != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = " " + args[0]
+			}
+			fatal("secret"+sub, err)
+		}
 	case "mount":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "mount"))
@@ -150,6 +166,10 @@ func fatal(cmd string, err error) {
 		logger.Error(context.Background(), "cli_command_failed", zap.String("command", cmd), zap.Error(err))
 	}
 	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, err)
+	type exitCoder interface{ ExitCode() int }
+	if ec, ok := err.(exitCoder); ok && ec.ExitCode() > 0 {
+		os.Exit(ec.ExitCode())
+	}
 	os.Exit(1)
 }
 
@@ -161,6 +181,7 @@ commands:
   ctx [name]       switch context (or show current)
   ctx list         list all contexts
   fs               filesystem operations
+  secret           secret manager operations
   mount <dir>      mount drive9 as a local FUSE filesystem
   umount <dir>     unmount a drive9 FUSE mount
 `)
