@@ -39,10 +39,6 @@ func (s *stubGlobalClient) GetEncryptedCloudAdminPwd(ctx context.Context, cluste
 	return "", nil
 }
 
-func (s *stubGlobalClient) CreateServiceUser(ctx context.Context, clusterID, operatorUser, operatorEncPwd, username, password string) error {
-	return nil
-}
-
 // stubAccountClient implements tidbcloud.AccountClient for testing.
 type stubAccountClient struct {
 	authorizeFn func(ctx context.Context, r *http.Request, clusterID string) (uint64, error)

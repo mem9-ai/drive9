@@ -45,10 +45,6 @@ type GlobalClient interface {
 	// GetEncryptedCloudAdminPwd returns the base64-encoded encrypted cloud_admin
 	// password for the given cluster.
 	GetEncryptedCloudAdminPwd(ctx context.Context, clusterID string) (string, error)
-
-	// CreateServiceUser creates a dedicated SQL user for drive9 on the given cluster
-	// via the SqlUserService gRPC API. The operator authenticates as cloud_admin.
-	CreateServiceUser(ctx context.Context, clusterID, operatorUser, operatorEncPwd, username, password string) error
 }
 
 // ErrClusterNotFound indicates a cluster was not found in the global server.

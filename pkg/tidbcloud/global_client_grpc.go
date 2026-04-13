@@ -16,23 +16,20 @@ import (
 type grpcGlobalClient struct {
 	mgmtCluster mgmtv1.ClusterServiceClient
 	serverless  serverlessv1.ServerlessServiceClient
-	sqlUser     serverlessv1.SqlUserServiceClient
 	zero        zerov1beta1.ZeroInstanceServiceClient
 }
 
 // NewGRPCGlobalClient creates a GlobalClient backed by the given gRPC service stubs.
 // mgmtCluster and zero both live on the tidb-mgmt-service address.
-// serverless and sqlUser live on the serverless-global-service address.
+// serverless lives on the serverless-global-service address.
 func NewGRPCGlobalClient(
 	mgmtCluster mgmtv1.ClusterServiceClient,
 	serverless serverlessv1.ServerlessServiceClient,
-	sqlUser serverlessv1.SqlUserServiceClient,
 	zero zerov1beta1.ZeroInstanceServiceClient,
 ) GlobalClient {
 	return &grpcGlobalClient{
 		mgmtCluster: mgmtCluster,
 		serverless:  serverless,
-		sqlUser:     sqlUser,
 		zero:        zero,
 	}
 }
@@ -126,27 +123,4 @@ func (g *grpcGlobalClient) GetEncryptedCloudAdminPwd(ctx context.Context, cluste
 		return "", fmt.Errorf("get encrypted password for cluster %s: %w", clusterID, err)
 	}
 	return resp.GetEncryptedPasswd(), nil
-}
-
-func (g *grpcGlobalClient) CreateServiceUser(ctx context.Context, clusterID, operatorUser, operatorEncPwd, username, password string) error {
-	_, err := g.sqlUser.CreateSqlUser(ctx, &serverlessv1.SqlUserServiceCreateSqlUserRequest{
-		Operator: &serverlessv1.SqlUserOperator{
-			Username:   operatorUser,
-			AuthMethod: serverlessv1.SqlUser_AUTH_METHOD_PASSWORD,
-			Credential: operatorEncPwd,
-		},
-		ClusterId:   clusterID,
-		UserType:    serverlessv1.SqlUser_TYPE_USER_DEFINED,
-		Username:    username,
-		Credential:  &password,
-		AuthMethod:  serverlessv1.SqlUser_AUTH_METHOD_PASSWORD,
-		BuiltinRole: serverlessv1.SqlUser_BUILTIN_ROLE_USER_ADMIN,
-		Settings: &serverlessv1.SqlUserServiceCreateSqlUserRequest_Settings{
-			IgnoreExists: true,
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("create service user %s on cluster %s: %w", username, clusterID, err)
-	}
-	return nil
 }
