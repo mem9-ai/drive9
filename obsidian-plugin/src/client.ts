@@ -18,7 +18,7 @@ export class Drive9Client {
 
   /** Test connectivity. Throws on failure. */
   async ping(): Promise<void> {
-    await this.request("GET", "/v1/fs/");
+    await this.list("/");
   }
 
   /** HEAD — get file/dir metadata including revision. */
@@ -36,7 +36,11 @@ export class Drive9Client {
     return resp.arrayBuffer;
   }
 
-  /** PUT — write file content with optional CAS revision check. */
+  /**
+   * PUT — write file content with optional CAS revision check.
+   * Server returns {"status":"ok"} without revision, so we stat()
+   * after write to get the actual revision for future CAS.
+   */
   async write(
     path: string,
     data: ArrayBuffer,
@@ -46,11 +50,14 @@ export class Drive9Client {
     if (expectedRevision !== undefined) {
       headers["X-Dat9-Expected-Revision"] = String(expectedRevision);
     }
-    const resp = await this.request("PUT", `/v1/fs/${encodePath(path)}`, {
+    await this.request("PUT", `/v1/fs/${encodePath(path)}`, {
       body: data,
       headers,
     });
-    return resp.json as { revision: number };
+    // Server does not return revision in write response.
+    // Stat to get the actual revision for future CAS writes.
+    const st = await this.stat(path);
+    return { revision: st.revision };
   }
 
   /** DELETE — remove a file. */
@@ -86,25 +93,33 @@ export class Drive9Client {
   /**
    * Recursively list all files under a path.
    * Returns flat list of relative paths (no leading slash).
+   *
+   * Root list errors are propagated (auth/network failures must not
+   * be silently treated as "remote empty"). Only subdirectory list
+   * errors are swallowed.
    */
   async listRecursive(basePath: string): Promise<FileInfo[]> {
+    // Root list must succeed — propagate errors to caller.
+    const rootEntries = await this.list(basePath);
+
     const all: FileInfo[] = [];
-    const queue = [basePath];
+    const queue: Array<{ dir: string; entries: FileInfo[] }> = [
+      { dir: basePath, entries: rootEntries },
+    ];
 
     while (queue.length > 0) {
-      const dir = queue.pop()!;
-      let entries: FileInfo[];
-      try {
-        entries = await this.list(dir);
-      } catch {
-        continue;
-      }
+      const { dir, entries } = queue.pop()!;
       for (const entry of entries) {
         const fullPath = dir === "/" || dir === ""
           ? entry.name
           : `${dir}/${entry.name}`;
         if (entry.isDir) {
-          queue.push(fullPath);
+          try {
+            const subEntries = await this.list(fullPath);
+            queue.push({ dir: fullPath, entries: subEntries });
+          } catch {
+            // Subdirectory list failures are non-fatal.
+          }
         } else {
           all.push({ ...entry, name: fullPath });
         }

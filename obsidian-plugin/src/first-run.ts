@@ -72,25 +72,17 @@ export async function runFirstRunReconciliation(
   // Scenario 4: Both have content → reconcile.
   const onlyLocal: string[] = [];
   const onlyRemote: string[] = [];
-  const bothDifferent: string[] = [];
+  const bothPresent: string[] = []; // exists on both sides — always conflict without checksum
   const states: Record<string, SyncState> = {};
 
-  for (const [path, file] of localFiles) {
+  for (const [path] of localFiles) {
     const remote = remoteFiles.get(path);
     if (!remote) {
       onlyLocal.push(path);
-    } else if (file.stat.size !== remote.size) {
-      bothDifferent.push(path);
     } else {
-      // Same size — treat as synced (best effort without checksum).
-      states[path] = {
-        path,
-        localMtime: file.stat.mtime,
-        localSize: file.stat.size,
-        remoteRevision: 0, // unknown until stat()
-        syncedAt: Date.now(),
-        status: "synced",
-      };
+      // Without checksum, we cannot prove content is identical even if
+      // size matches. Mark as conflict per stop-and-ask safety invariant.
+      bothPresent.push(path);
     }
   }
 
@@ -100,23 +92,22 @@ export async function runFirstRunReconciliation(
     }
   }
 
-  // If there are conflicts (both have different content), stop and ask.
-  if (bothDifferent.length > 0) {
+  if (bothPresent.length > 0) {
     const msg = [
-      `Found ${bothDifferent.length} file(s) with different content on both sides.`,
+      `Found ${bothPresent.length} file(s) that exist on both sides.`,
       "",
-      bothDifferent.slice(0, 10).join("\n"),
-      bothDifferent.length > 10 ? `...and ${bothDifferent.length - 10} more` : "",
+      bothPresent.slice(0, 10).join("\n"),
+      bothPresent.length > 10 ? `...and ${bothPresent.length - 10} more` : "",
       "",
-      "These files need manual resolution. Plugin will not auto-sync until resolved.",
-      "For now, only files unique to each side will be synced.",
+      "Without checksums, content equality cannot be verified.",
+      "These files are marked as conflicts until manually resolved.",
+      "Files unique to each side will be synced normally.",
     ].join("\n");
 
     new Notice(msg, 15000);
   }
 
-  // Mark only-local files for push, only-remote for pull,
-  // both-different as conflict.
+  // Only-local files: push (no expectedRevision needed for new files).
   for (const path of onlyLocal) {
     const file = localFiles.get(path)!;
     states[path] = {
@@ -129,25 +120,36 @@ export async function runFirstRunReconciliation(
     };
   }
 
+  // Only-remote files: need real revision for future CAS.
   for (const path of onlyRemote) {
-    const remote = remoteFiles.get(path)!;
+    let revision = 0;
+    try {
+      const st = await client.stat(path);
+      revision = st.revision;
+    } catch { /* best effort */ }
     states[path] = {
       path,
       localMtime: 0,
       localSize: 0,
-      remoteRevision: 0,
+      remoteRevision: revision,
       syncedAt: 0,
       status: "remote_dirty",
     };
   }
 
-  for (const path of bothDifferent) {
+  // Both-present files: conflict. Seed revision for future resolution.
+  for (const path of bothPresent) {
     const file = localFiles.get(path)!;
+    let revision = 0;
+    try {
+      const st = await client.stat(path);
+      revision = st.revision;
+    } catch { /* best effort */ }
     states[path] = {
       path,
       localMtime: file.stat.mtime,
       localSize: file.stat.size,
-      remoteRevision: 0,
+      remoteRevision: revision,
       syncedAt: 0,
       status: "conflict",
     };
