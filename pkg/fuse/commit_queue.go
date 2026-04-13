@@ -414,9 +414,17 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
 	// Preserve both the shadow file and the pending metadata so the user
 	// can recover their local edits manually — deleting them here would
 	// silently discard the only durable copy of unsynchronised data.
+	//
+	// The conflict marker MUST be durable before we journal or dequeue;
+	// otherwise a restart could re-enqueue the same upload.
 	if cq.index != nil {
 		if err := cq.index.MarkConflict(entry.Path); err != nil {
-			log.Printf("commit queue: failed to mark conflict for %s: %v", entry.Path, err)
+			// Conflict marker not durable — leave the entry queued so
+			// RecoverPending can retry on next startup rather than
+			// silently dropping it.
+			log.Printf("commit queue: failed to mark conflict for %s: %v (entry remains queued)", entry.Path, err)
+			cq.removeFromQueue(entry)
+			return
 		}
 	}
 	if cq.journal != nil {
