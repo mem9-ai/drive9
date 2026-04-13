@@ -128,26 +128,8 @@ func (p *Provisioner) ProvisionWithRootCreds(ctx context.Context, tenantID, root
 }
 
 // CreateServiceUser creates an fs_admin SQL user on the cluster via the internal
-// cluster proxy, using the cloud_admin credentials as the operator.
-func (p *Provisioner) CreateServiceUser(ctx context.Context, clusterID, proxyEndpoint, userPrefix, newUser, newPass string) error {
-	encryptedPwd, err := p.global.GetEncryptedCloudAdminPwd(ctx, clusterID)
-	if err != nil {
-		return fmt.Errorf("get cloud_admin password for cluster %s: %w", clusterID, err)
-	}
-	ciphertext, err := base64.StdEncoding.DecodeString(encryptedPwd)
-	if err != nil {
-		return fmt.Errorf("decode cloud_admin password for cluster %s: %w", clusterID, err)
-	}
-	plaintext, err := p.enc.Decrypt(ctx, ciphertext)
-	if err != nil {
-		return fmt.Errorf("decrypt cloud_admin password for cluster %s: %w", clusterID, err)
-	}
-
-	operatorUser := "cloud_admin"
-	if userPrefix != "" {
-		operatorUser = userPrefix + ".cloud_admin"
-	}
-
+// cluster proxy, using the caller-provided root credentials as the operator.
+func (p *Provisioner) CreateServiceUser(ctx context.Context, clusterID, proxyEndpoint, operatorUser, operatorPass, newUser, newPass string) error {
 	clusterIDUint, err := tidbcloud.ParseClusterIDUint64(clusterID)
 	if err != nil {
 		return err
@@ -159,7 +141,7 @@ func (p *Provisioner) CreateServiceUser(ctx context.Context, clusterID, proxyEnd
 		zap.String("operator", operatorUser),
 		zap.String("new_user", newUser))
 
-	return tidbcloud.CreateServiceUserViaProxy(ctx, proxyEndpoint, clusterIDUint, operatorUser, string(plaintext), newUser, newPass)
+	return tidbcloud.CreateServiceUserViaProxy(ctx, proxyEndpoint, clusterIDUint, operatorUser, operatorPass, newUser, newPass)
 }
 
 // VerifyZeroInstance calls the zero-instance service to confirm the instance ID

@@ -131,6 +131,38 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		UpdatedAt:        now,
 	}); err != nil {
 		if errors.Is(err, meta.ErrDuplicate) {
+			// If the existing tenant is in a terminal failure state,
+			// allow re-provisioning by resetting it back to provisioning
+			// and re-running the async flow.
+			existing, getErr := s.meta.GetTenant(ctx, tenantID)
+			if getErr == nil && (existing.Status == meta.TenantFailed || existing.Status == meta.TenantProvisioning) {
+				logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_retrying_failed_tenant",
+					"tenant_id", tenantID, "old_status", string(existing.Status))...)
+
+				// Update credentials and reset status to provisioning.
+				if uerr := s.meta.UpdateTenantDBCredentials(ctx, tenantID, cluster.Username, cipherPass, cluster.DBName); uerr != nil {
+					logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_retry_update_creds_failed",
+						"tenant_id", tenantID, "error", uerr)...)
+					errJSON(w, http.StatusInternalServerError, "failed to update tenant credentials")
+					return
+				}
+				if uerr := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantProvisioning); uerr != nil {
+					logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_retry_reset_status_failed",
+						"tenant_id", tenantID, "error", uerr)...)
+					errJSON(w, http.StatusInternalServerError, "failed to reset tenant status")
+					return
+				}
+
+				go s.nativeProvisionAsync(backgroundWithTrace(ctx), np, tenantID, cluster, provider)
+
+				w.WriteHeader(http.StatusAccepted)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"tenant_id": tenantID,
+					"status":    string(meta.TenantProvisioning),
+				})
+				return
+			}
+
 			logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_already_exists", "tenant_id", tenantID, "provider", provider)...)
 			errJSON(w, http.StatusConflict, "tenant already provisioned")
 			return
@@ -180,7 +212,7 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 
 // nativeProvisionAsync runs in a background goroutine after the tenant record
 // has been persisted. It creates a dedicated fs_admin service user via the
-// internal cluster proxy (using cloud_admin as the operator), updates the
+// internal cluster proxy (using root credentials as the operator), updates the
 // tenant record with fs_admin credentials, and runs schema init.
 func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.Provisioner, tenantID string, cluster *tenant.ClusterInfo, provider string) {
 	dbName := cluster.DBName
@@ -195,8 +227,8 @@ func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.P
 	}
 	fsAdminPass := tidbcloud.GeneratePassword()
 
-	// Create fs_admin via the internal cluster proxy.
-	if err := np.CreateServiceUser(ctx, cluster.ClusterID, cluster.ProxyEndpoint, cluster.UserPrefix, fsAdminUser, fsAdminPass); err != nil {
+	// Create fs_admin via the internal cluster proxy, using root credentials as operator.
+	if err := np.CreateServiceUser(ctx, cluster.ClusterID, cluster.ProxyEndpoint, cluster.Username, cluster.Password, fsAdminUser, fsAdminPass); err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "create_service_user_failed",
 			"tenant_id", tenantID, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "create_user_error")
