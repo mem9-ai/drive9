@@ -216,9 +216,16 @@ export class Drive9Error extends Error {
     message: string,
     public status: number,
   ) {
-    super(message);
+    super(sanitizeError(message));
     this.name = "Drive9Error";
   }
+}
+
+/** Strip auth material (Bearer tokens, API keys) from error strings. */
+export function sanitizeError(msg: string): string {
+  return msg
+    .replace(/Bearer\s+\S+/gi, "Bearer ***")
+    .replace(/Authorization:\s*\S+/gi, "Authorization: ***");
 }
 
 /** Encode path segments for URL (don't encode slashes). */

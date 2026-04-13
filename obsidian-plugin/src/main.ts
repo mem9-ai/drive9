@@ -1,5 +1,5 @@
 import { Plugin, Notice, TFile } from "obsidian";
-import { Drive9Client } from "./client";
+import { Drive9Client, sanitizeError } from "./client";
 import { RemoteWatcher } from "./remote-watcher";
 import { SyncEngine } from "./sync-engine";
 import { ShadowStore } from "./shadow-store";
@@ -90,8 +90,8 @@ export default class Drive9Plugin extends Plugin {
       try {
         await this.doFirstRun();
       } catch (e) {
-        console.error("[drive9] first-run failed", e);
-        new Notice(`drive9: first-run failed — ${e instanceof Error ? e.message : String(e)}`);
+        console.error("[drive9] first-run failed", e instanceof Error ? e.message : sanitizeError(String(e)));
+        new Notice(`drive9: first-run failed — ${e instanceof Error ? e.message : sanitizeError(String(e))}`);
         this.setStatusBar("✗ drive9: first-run failed");
         return;
       }
@@ -195,7 +195,7 @@ export default class Drive9Plugin extends Plugin {
               state.status = state.remoteRevision !== null ? "synced" : "needs_refresh";
               state.syncedAt = Date.now();
             } catch (e) {
-              console.error(`[drive9] pull failed: ${path}`, e);
+              console.error(`[drive9] pull failed: ${path}`, e instanceof Error ? e.message : sanitizeError(String(e)));
             }
           }
         }
