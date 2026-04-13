@@ -136,34 +136,37 @@ export class ConflictResolver {
     const result = merge3(baseText, localText, remoteText);
 
     if (!result.hasConflicts) {
-      // Auto-merge succeeded — apply merged content
+      // Auto-merge succeeded — push to remote first, only apply locally after CAS succeeds
       const mergedData = encodeText(result.merged);
-      await this.vault.modifyBinary(this.getLocalFile(path)!, mergedData);
 
-      // Push merged version to remote — use CAS
+      let writeResult: { revision: number | null; writeSucceeded: boolean };
       try {
-        const writeResult = await this.client.write(path, mergedData, state.remoteRevision);
-
-        const updatedFile = this.getLocalFile(path);
-        const hash = await this.shadowStore.save(mergedData);
-        this.syncStates[path] = {
-          path,
-          localMtime: updatedFile?.stat.mtime ?? 0,
-          localSize: updatedFile?.stat.size ?? 0,
-          remoteRevision: writeResult.revision ?? remoteStat.revision,
-          syncedAt: Date.now(),
-          status: "synced",
-          lastSyncedContentHash: hash,
-        };
-        new Notice(`drive9: auto-merged ${path}`);
-        return true;
+        writeResult = await this.client.write(path, mergedData, state.remoteRevision);
       } catch (e) {
         if (e instanceof Drive9Error && e.status === 409) {
           // Remote changed again during merge — stay in conflict for next cycle
-          return false;
+          // Do NOT modify local vault; caller will not show modal either
+          return true;
         }
         throw e;
       }
+
+      // CAS succeeded — now apply merged content to local vault
+      await this.vault.modifyBinary(this.getLocalFile(path)!, mergedData);
+
+      const updatedFile = this.getLocalFile(path);
+      const hash = await this.shadowStore.save(mergedData);
+      this.syncStates[path] = {
+        path,
+        localMtime: updatedFile?.stat.mtime ?? 0,
+        localSize: updatedFile?.stat.size ?? 0,
+        remoteRevision: writeResult.revision ?? remoteStat.revision,
+        syncedAt: Date.now(),
+        status: "synced",
+        lastSyncedContentHash: hash,
+      };
+      new Notice(`drive9: auto-merged ${path}`);
+      return true;
     }
 
     return false;
