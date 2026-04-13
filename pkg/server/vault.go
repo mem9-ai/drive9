@@ -408,14 +408,14 @@ func (s *Server) handleVaultRead(w http.ResponseWriter, r *http.Request, sub str
 
 	vs := vault.NewStore(scope.Backend.Store().DB(), s.vaultMK)
 
-	// Full 4-step verification.
+	// Full 4-step verification: HMAC signature → TTL → DB revocation → claims.
+	// IMPORTANT: Do NOT write audit events before verification succeeds.
+	// The tenant_id comes from an unverified peek and could be forged;
+	// writing to tenant audit before proving token authenticity would let
+	// an attacker inject events into any tenant's audit log.
 	claims, err := vs.VerifyAndResolveCapToken(r.Context(), tenantID, raw)
 	if err != nil {
-		_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
-			TenantID:  tenantID,
-			EventType: "secret.denied",
-			Detail:    map[string]string{"reason": err.Error()},
-		})
+		// Log to server-level observability only — not tenant audit.
 		if strings.Contains(err.Error(), "expired") {
 			errJSON(w, http.StatusUnauthorized, "token expired")
 		} else if strings.Contains(err.Error(), "revoked") {

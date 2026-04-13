@@ -162,14 +162,12 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 			return
 		}
 
-		// Look up tenant to make sure it exists and is active.
+		// Look up tenant and load backend. Use a uniform 401 for all
+		// failure modes to avoid leaking tenant existence or status to
+		// unauthenticated callers (tenant_id is from unverified peek).
 		tenant, err := metaStore.GetTenant(r.Context(), tenantID)
-		if err != nil {
-			errJSON(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-		if tenant.Status != meta.TenantActive {
-			errJSON(w, http.StatusForbidden, "tenant is unavailable")
+		if err != nil || tenant.Status != meta.TenantActive {
+			errJSON(w, http.StatusUnauthorized, "invalid capability token")
 			return
 		}
 
