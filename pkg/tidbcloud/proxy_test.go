@@ -56,20 +56,26 @@ func TestCreateServiceUserViaProxy_Success(t *testing.T) {
 	}
 
 	// Verify queries.
-	if len(gotReq.Queries) != 4 {
-		t.Fatalf("queries count=%d, want 4", len(gotReq.Queries))
+	if len(gotReq.Queries) != 6 {
+		t.Fatalf("queries count=%d, want 6", len(gotReq.Queries))
 	}
-	if gotReq.Queries[0] != "CREATE USER IF NOT EXISTS 'pfx.fs_admin' IDENTIFIED BY 'fs-pass'" {
+	if gotReq.Queries[0] != "CREATE ROLE IF NOT EXISTS 'role_fs_admin'" {
 		t.Fatalf("queries[0]=%q", gotReq.Queries[0])
 	}
-	if gotReq.Queries[1] != "ALTER USER 'pfx.fs_admin' IDENTIFIED BY 'fs-pass'" {
+	if gotReq.Queries[1] != "GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON mysql.* TO 'role_fs_admin'" {
 		t.Fatalf("queries[1]=%q", gotReq.Queries[1])
 	}
-	if gotReq.Queries[2] != "GRANT 'role_admin' TO 'pfx.fs_admin'" {
+	if gotReq.Queries[2] != "CREATE USER IF NOT EXISTS 'pfx.fs_admin' IDENTIFIED BY 'fs-pass'" {
 		t.Fatalf("queries[2]=%q", gotReq.Queries[2])
 	}
-	if gotReq.Queries[3] != "SET DEFAULT ROLE ALL TO 'pfx.fs_admin'" {
+	if gotReq.Queries[3] != "ALTER USER 'pfx.fs_admin' IDENTIFIED BY 'fs-pass'" {
 		t.Fatalf("queries[3]=%q", gotReq.Queries[3])
+	}
+	if gotReq.Queries[4] != "GRANT 'role_fs_admin' TO 'pfx.fs_admin'" {
+		t.Fatalf("queries[4]=%q", gotReq.Queries[4])
+	}
+	if gotReq.Queries[5] != "SET DEFAULT ROLE 'role_fs_admin' TO 'pfx.fs_admin'" {
+		t.Fatalf("queries[5]=%q", gotReq.Queries[5])
 	}
 }
 
@@ -115,6 +121,28 @@ func TestCreateServiceUserViaProxy_HTTPError(t *testing.T) {
 	}
 	if got := err.Error(); !contains(got, "proxy returned 500") {
 		t.Fatalf("error=%q, want 'proxy returned 500'", got)
+	}
+}
+
+func TestCreateServiceUserViaProxy_InvalidUsername(t *testing.T) {
+	err := CreateServiceUserViaProxy(context.Background(), "https://proxy", 1,
+		"op", "pass", "user'inject", "safe-pass")
+	if err == nil {
+		t.Fatal("expected error for username with single quote")
+	}
+	if got := err.Error(); !contains(got, "invalid username") {
+		t.Fatalf("error=%q, want 'invalid username'", got)
+	}
+}
+
+func TestCreateServiceUserViaProxy_InvalidPassword(t *testing.T) {
+	err := CreateServiceUserViaProxy(context.Background(), "https://proxy", 1,
+		"op", "pass", "safe-user", "pass'word")
+	if err == nil {
+		t.Fatal("expected error for password with single quote")
+	}
+	if got := err.Error(); !contains(got, "invalid password") {
+		t.Fatalf("error=%q, want 'invalid password'", got)
 	}
 }
 
