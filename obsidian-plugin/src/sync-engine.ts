@@ -5,14 +5,18 @@ import type { SyncState, Drive9Settings } from "./types";
 
 export type SyncStatus = "idle" | "syncing" | "error";
 
+const LOCAL_EVENT_SUPPRESS_WINDOW_MS = 1000;
+
 /**
- * SyncEngine handles one-way push from local vault to drive9.
- * Phase 1: local changes → debounce → push with CAS.
+ * SyncEngine owns the local/remote sync state machine.
+ * Phase 2A adds remote detection, safe pull, and non-destructive delete/conflict handling.
  */
 export class SyncEngine {
   private dirtyPaths = new Set<string>();
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private ignoreMatcher: IgnoreMatcher;
+  private suppressedPaths = new Map<string, number>();
+  private operationQueue: Promise<void> = Promise.resolve();
   private _status: SyncStatus = "idle";
   private _pendingCount = 0;
   private statusListeners: Array<() => void> = [];
@@ -44,43 +48,84 @@ export class SyncEngine {
     this.ignoreMatcher = new IgnoreMatcher(settings.ignorePaths);
   }
 
-  // ---------------------------------------------------------------------------
-  // Vault event handlers
-  // ---------------------------------------------------------------------------
-
   onLocalCreate(file: TAbstractFile): void {
     if (!(file instanceof TFile)) return;
     if (this.shouldIgnore(file.path)) return;
+    if (this.isLocalEventSuppressed(file.path)) return;
+    if (this.matchesSyncedSnapshot(file.path, file)) return;
     this.markDirty(file.path);
   }
 
   onLocalModify(file: TAbstractFile): void {
     if (!(file instanceof TFile)) return;
     if (this.shouldIgnore(file.path)) return;
+    if (this.isLocalEventSuppressed(file.path)) return;
+    if (this.matchesSyncedSnapshot(file.path, file)) return;
     this.markDirty(file.path);
   }
 
   onLocalDelete(file: TAbstractFile): void {
     if (!(file instanceof TFile)) return;
     if (this.shouldIgnore(file.path)) return;
+    if (this.isLocalEventSuppressed(file.path)) return;
     this.markDirty(file.path);
   }
 
   onLocalRename(file: TAbstractFile, oldPath: string): void {
     if (!(file instanceof TFile)) return;
     if (this.shouldIgnore(file.path) && this.shouldIgnore(oldPath)) return;
-    // Treat rename as delete old + create new.
-    if (!this.shouldIgnore(oldPath)) {
+    if (!this.shouldIgnore(oldPath) && !this.isLocalEventSuppressed(oldPath)) {
       this.markDirty(oldPath);
     }
-    if (!this.shouldIgnore(file.path)) {
+    if (
+      !this.shouldIgnore(file.path) &&
+      !this.isLocalEventSuppressed(file.path) &&
+      !this.matchesSyncedSnapshot(file.path, file)
+    ) {
       this.markDirty(file.path);
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Core sync logic
-  // ---------------------------------------------------------------------------
+  async onRemoteChange(path: string, _op: string): Promise<void> {
+    if (this.shouldIgnore(path)) return;
+    await this.enqueue(async () => {
+      this.setStatus("syncing", 1);
+      try {
+        await this.reconcileRemotePath(path);
+      } finally {
+        this.setStatus("idle", this.dirtyPaths.size);
+        await this.persistData();
+      }
+    });
+  }
+
+  async fullSync(): Promise<void> {
+    await this.enqueue(async () => {
+      const scan = await this.client.listRecursiveDetailed("/");
+      const remotePaths = new Set<string>();
+
+      this.setStatus("syncing", scan.entries.length);
+      try {
+        for (const entry of scan.entries) {
+          if (this.shouldIgnore(entry.name)) continue;
+          remotePaths.add(entry.name);
+          await this.reconcileRemotePath(entry.name);
+        }
+
+        if (scan.complete) {
+          for (const path of Object.keys(this.syncStates)) {
+            if (this.shouldIgnore(path) || remotePaths.has(path)) continue;
+            await this.handleRemoteMissing(path);
+          }
+        } else {
+          console.warn("[drive9] remote tree scan incomplete; skipping delete detection");
+        }
+      } finally {
+        this.setStatus("idle", this.dirtyPaths.size);
+        await this.persistData();
+      }
+    });
+  }
 
   private shouldIgnore(path: string): boolean {
     return this.ignoreMatcher.isIgnored(path);
@@ -99,49 +144,46 @@ export class SyncEngine {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
-      this.flush();
+      void this.flush();
     }, this.settings.pushDebounce);
   }
 
   private async flush(): Promise<void> {
-    if (this.dirtyPaths.size === 0) return;
+    await this.enqueue(async () => {
+      if (this.dirtyPaths.size === 0) return;
 
-    const paths = [...this.dirtyPaths];
-    this.dirtyPaths.clear();
+      const paths = [...this.dirtyPaths];
+      this.dirtyPaths.clear();
 
-    this.setStatus("syncing", paths.length);
+      this.setStatus("syncing", paths.length);
 
-    let errorOccurred = false;
+      let errorOccurred = false;
 
-    for (const path of paths) {
-      try {
-        await this.pushOne(path);
-      } catch (e) {
-        errorOccurred = true;
-        console.error(`[drive9] push failed: ${path}`, e);
-        // Re-add to dirty set for retry on next flush.
-        this.dirtyPaths.add(path);
+      for (const path of paths) {
+        try {
+          await this.pushOne(path);
+        } catch (e) {
+          errorOccurred = true;
+          console.error(`[drive9] push failed: ${path}`, e);
+          this.dirtyPaths.add(path);
+        }
       }
-    }
 
-    this.setStatus(errorOccurred ? "error" : "idle", this.dirtyPaths.size);
-    await this.persistData();
+      this.setStatus(errorOccurred ? "error" : "idle", this.dirtyPaths.size);
+      await this.persistData();
+    });
   }
 
   private async pushOne(path: string): Promise<void> {
     const file = this.vault.getAbstractFileByPath(path);
 
-    // File was deleted locally.
     if (!file || !(file instanceof TFile)) {
       const state = this.syncStates[path];
       if (state) {
         try {
           await this.client.delete(path);
         } catch (e) {
-          // 404 is fine — already gone on remote.
-          if (e instanceof Drive9Error && e.status === 404) {
-            // ok
-          } else {
+          if (!(e instanceof Drive9Error && e.status === 404)) {
             throw e;
           }
         }
@@ -150,28 +192,22 @@ export class SyncEngine {
       return;
     }
 
-    // Skip files exceeding size limit.
     if (file.stat.size > this.settings.maxFileSize) {
       console.warn(`[drive9] skipping large file: ${path} (${file.stat.size} bytes)`);
       return;
     }
 
-    // Skip files in needs_refresh or conflict state — must resolve first.
     const existingState = this.syncStates[path];
     if (existingState?.status === "conflict") {
       return;
     }
 
-    // If revision is unknown (null), try to refresh before pushing.
-    // This prevents sending expectedRevision=undefined (unconditional write)
-    // for files that actually exist on the remote.
     if (existingState && existingState.remoteRevision === null) {
       try {
         const st = await this.client.stat(path);
         existingState.remoteRevision = st.revision;
         existingState.status = "local_dirty";
       } catch {
-        // Cannot determine revision — block push to prevent silent overwrite.
         existingState.status = "needs_refresh";
         console.warn(`[drive9] cannot refresh revision for ${path}, blocking push`);
         return;
@@ -179,8 +215,6 @@ export class SyncEngine {
     }
 
     const data = await this.vault.readBinary(file);
-    // If no state exists, this is a new file — use 0 (create-if-absent).
-    // Never send undefined (unconditional overwrite).
     const expectedRevision = existingState ? existingState.remoteRevision : 0;
 
     try {
@@ -195,9 +229,6 @@ export class SyncEngine {
           status: "synced",
         };
       } else {
-        // PUT succeeded but post-write stat failed.
-        // Do NOT re-add to dirty set — the write already committed.
-        // Mark as needs_refresh so next edit will refresh before pushing.
         this.syncStates[path] = {
           path,
           localMtime: file.stat.mtime,
@@ -210,7 +241,6 @@ export class SyncEngine {
       }
     } catch (e) {
       if (e instanceof Drive9Error && e.status === 409) {
-        // CAS conflict — mark but don't overwrite.
         if (existingState) {
           existingState.status = "conflict";
         } else {
@@ -230,11 +260,163 @@ export class SyncEngine {
     }
   }
 
+  private enqueue(fn: () => Promise<void>): Promise<void> {
+    const next = this.operationQueue.then(fn, fn);
+    this.operationQueue = next.catch(() => undefined);
+    return next;
+  }
+
+  private isLocalEventSuppressed(path: string): boolean {
+    return (this.suppressedPaths.get(path) ?? 0) > 0;
+  }
+
+  private async withSuppressedLocalEvents(path: string, fn: () => Promise<void>): Promise<void> {
+    this.suppressedPaths.set(path, (this.suppressedPaths.get(path) ?? 0) + 1);
+    try {
+      await fn();
+    } finally {
+      setTimeout(() => {
+        const current = this.suppressedPaths.get(path) ?? 0;
+        if (current <= 1) {
+          this.suppressedPaths.delete(path);
+        } else {
+          this.suppressedPaths.set(path, current - 1);
+        }
+      }, LOCAL_EVENT_SUPPRESS_WINDOW_MS);
+    }
+  }
+
+  private getLocalFile(path: string): TFile | null {
+    const file = this.vault.getAbstractFileByPath(path);
+    return file instanceof TFile ? file : null;
+  }
+
+  private hasUnpushedLocalChange(path: string, file: TFile | null, state: SyncState | undefined): boolean {
+    if (this.dirtyPaths.has(path)) return true;
+    if (!file) {
+      // Remote-only paths should pull instead of turning into conflicts.
+      return false;
+    }
+    if (!state) return true;
+    if (state.status === "local_dirty" || state.status === "conflict") return true;
+    return file.stat.mtime !== state.localMtime || file.stat.size !== state.localSize;
+  }
+
+  private matchesSyncedSnapshot(path: string, file: TFile): boolean {
+    const state = this.syncStates[path];
+    if (!state || state.status !== "synced") {
+      return false;
+    }
+    return state.localMtime === file.stat.mtime && state.localSize === file.stat.size;
+  }
+
+  private async reconcileRemotePath(path: string): Promise<void> {
+    const state = this.syncStates[path];
+    if (state?.status === "conflict") {
+      return;
+    }
+
+    const localFile = this.getLocalFile(path);
+
+    let remoteRevision: number;
+    try {
+      const remoteStat = await this.client.stat(path);
+      remoteRevision = remoteStat.revision;
+    } catch (error) {
+      if (error instanceof Drive9Error && error.status === 404) {
+        await this.handleRemoteMissing(path);
+        return;
+      }
+      throw error;
+    }
+
+    if (
+      state?.status === "synced" &&
+      state.remoteRevision === remoteRevision &&
+      !this.hasUnpushedLocalChange(path, localFile, state)
+    ) {
+      return;
+    }
+
+    if (this.hasUnpushedLocalChange(path, localFile, state)) {
+      this.markConflict(path, localFile, remoteRevision);
+      return;
+    }
+
+    await this.pullRemoteFile(path, remoteRevision, localFile);
+  }
+
+  private async handleRemoteMissing(path: string): Promise<void> {
+    const state = this.syncStates[path];
+    if (!state || state.status === "conflict") return;
+
+    const localFile = this.getLocalFile(path);
+    if (this.hasUnpushedLocalChange(path, localFile, state)) {
+      this.markConflict(path, localFile, state.remoteRevision);
+      return;
+    }
+
+    state.status = "remote_deleted";
+    state.syncedAt = Date.now();
+  }
+
+  private markConflict(path: string, localFile: TFile | null, remoteRevision: number | null): void {
+    const existingState = this.syncStates[path];
+    const wasConflict = existingState?.status === "conflict";
+
+    this.syncStates[path] = {
+      path,
+      localMtime: localFile?.stat.mtime ?? existingState?.localMtime ?? 0,
+      localSize: localFile?.stat.size ?? existingState?.localSize ?? 0,
+      remoteRevision,
+      syncedAt: existingState?.syncedAt ?? 0,
+      status: "conflict",
+    };
+
+    if (!wasConflict) {
+      new Notice(`drive9: conflict detected for ${path}`);
+    }
+  }
+
+  private async pullRemoteFile(path: string, remoteRevision: number, localFile: TFile | null): Promise<void> {
+    const data = await this.client.read(path);
+
+    await this.withSuppressedLocalEvents(path, async () => {
+      const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+      if (dir && !this.vault.getAbstractFileByPath(dir)) {
+        await this.vault.createFolder(dir);
+      }
+      if (localFile) {
+        await this.vault.modifyBinary(localFile, data);
+      } else {
+        await this.vault.createBinary(path, data);
+      }
+    });
+
+    const updatedFile = this.getLocalFile(path);
+    this.syncStates[path] = {
+      path,
+      localMtime: updatedFile?.stat.mtime ?? 0,
+      localSize: updatedFile?.stat.size ?? 0,
+      remoteRevision,
+      syncedAt: Date.now(),
+      status: "synced",
+    };
+  }
+
   private setStatus(status: SyncStatus, pending: number): void {
     this._status = status;
     this._pendingCount = pending;
+    this.notifyStatusChange();
+  }
+
+  private notifyStatusChange(): void {
     for (const fn of this.statusListeners) {
-      try { fn(); } catch { /* ignore */ }
+      try {
+        fn();
+      } catch {
+        // Ignore status listener failures.
+      }
     }
   }
 }

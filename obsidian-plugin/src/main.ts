@@ -1,5 +1,6 @@
 import { Plugin, Notice, TFile } from "obsidian";
 import { Drive9Client } from "./client";
+import { RemoteWatcher } from "./remote-watcher";
 import { SyncEngine } from "./sync-engine";
 import { Drive9SettingTab } from "./settings";
 import { runFirstRunReconciliation, pullAllRemote } from "./first-run";
@@ -9,18 +10,26 @@ import { DEFAULT_PLUGIN_DATA, DEFAULT_SETTINGS } from "./types";
 export default class Drive9Plugin extends Plugin {
   settings: Drive9Settings = DEFAULT_SETTINGS;
   private client!: Drive9Client;
+  private remoteWatcher: RemoteWatcher | null = null;
   private syncEngine!: SyncEngine;
   private syncStates: Record<string, SyncState> = {};
   private firstRunComplete = false;
   private statusBarEl: HTMLElement | null = null;
+  private actorId = "";
 
   async onload(): Promise<void> {
     await this.loadPluginData();
+
+    const needsActorId = !this.actorId;
+    if (needsActorId) {
+      this.actorId = generateActorId();
+    }
 
     this.client = new Drive9Client(
       this.settings.serverUrl,
       this.settings.apiKey,
     );
+    this.client.setActorId(this.actorId);
 
     this.syncEngine = new SyncEngine(
       this.app.vault,
@@ -29,18 +38,24 @@ export default class Drive9Plugin extends Plugin {
       this.settings,
       () => this.savePluginData(),
     );
+    this.remoteWatcher = new RemoteWatcher(this.client, {
+      onChange: (event) => this.syncEngine.onRemoteChange(event.path, event.op),
+      onReset: () => this.syncEngine.fullSync(),
+      onPoll: () => this.syncEngine.fullSync(),
+    });
 
-    // Status bar.
+    if (needsActorId) {
+      await this.savePluginData();
+    }
+
     this.statusBarEl = this.addStatusBarItem();
     this.updateStatusBar();
     this.syncEngine.onStatusChange(() => this.updateStatusBar());
 
-    // Settings tab.
     this.addSettingTab(new Drive9SettingTab(this.app, this));
 
-    // Wait for layout ready before registering vault events.
     this.app.workspace.onLayoutReady(() => {
-      this.onLayoutReady();
+      void this.onLayoutReady();
     });
   }
 
@@ -50,7 +65,6 @@ export default class Drive9Plugin extends Plugin {
       return;
     }
 
-    // First-run reconciliation.
     if (!this.firstRunComplete) {
       try {
         await this.doFirstRun();
@@ -62,7 +76,6 @@ export default class Drive9Plugin extends Plugin {
       }
     }
 
-    // Register vault events for ongoing sync.
     this.registerEvent(
       this.app.vault.on("create", (file) => this.syncEngine.onLocalCreate(file)),
     );
@@ -78,6 +91,7 @@ export default class Drive9Plugin extends Plugin {
       ),
     );
 
+    this.remoteWatcher?.start();
     this.setStatusBar("✓ drive9: synced");
   }
 
@@ -93,7 +107,6 @@ export default class Drive9Plugin extends Plugin {
 
     switch (result.action) {
       case "push_all":
-        // Mark all local files as dirty so the sync engine pushes them.
         new Notice("drive9: uploading vault to drive9...");
         for (const file of this.app.vault.getFiles()) {
           this.syncEngine.onLocalCreate(file);
@@ -112,7 +125,6 @@ export default class Drive9Plugin extends Plugin {
 
       case "reconciled":
         Object.assign(this.syncStates, result.states);
-        // Push files that are only local.
         for (const [path, state] of Object.entries(result.states)) {
           if (state.status === "local_dirty") {
             this.syncEngine.onLocalCreate(
@@ -120,7 +132,6 @@ export default class Drive9Plugin extends Plugin {
             );
           }
         }
-        // Pull files that are only remote.
         for (const [path, state] of Object.entries(result.states)) {
           if (state.status === "remote_dirty") {
             try {
@@ -132,12 +143,13 @@ export default class Drive9Plugin extends Plugin {
                 await this.app.vault.createFolder(dir);
               }
               await this.app.vault.createBinary(path, data);
-              // Refresh revision if it was unknown from first-run.
               if (state.remoteRevision === null) {
                 try {
                   const st = await this.client.stat(path);
                   state.remoteRevision = st.revision;
-                } catch { /* stays null — will refresh before next push */ }
+                } catch {
+                  // Leave revision unknown; push path will refresh before write.
+                }
               }
               const pulled = this.app.vault.getAbstractFileByPath(path);
               if (pulled instanceof TFile) {
@@ -162,16 +174,13 @@ export default class Drive9Plugin extends Plugin {
     await this.savePluginData();
   }
 
-  // ---------------------------------------------------------------------------
-  // Data persistence
-  // ---------------------------------------------------------------------------
-
   async loadPluginData(): Promise<void> {
     const raw = await this.loadData();
     const data: PluginData = Object.assign({}, DEFAULT_PLUGIN_DATA, raw ?? {});
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings);
     this.syncStates = data.syncStates ?? {};
     this.firstRunComplete = data.firstRunComplete ?? false;
+    this.actorId = data.actorId ?? "";
   }
 
   async savePluginData(): Promise<void> {
@@ -179,17 +188,30 @@ export default class Drive9Plugin extends Plugin {
       settings: this.settings,
       syncStates: this.syncStates,
       firstRunComplete: this.firstRunComplete,
+      actorId: this.actorId,
     };
     await this.saveData(data);
 
-    // Keep client and sync engine in sync with settings.
-    this.client.updateConfig(this.settings.serverUrl, this.settings.apiKey);
-    this.syncEngine?.updateSettings(this.settings);
-  }
+    if (!this.client) {
+      return;
+    }
 
-  // ---------------------------------------------------------------------------
-  // Status bar
-  // ---------------------------------------------------------------------------
+    const urlChanged =
+      this.client.getServerUrl() !== this.settings.serverUrl ||
+      this.client.getAPIKey() !== this.settings.apiKey;
+
+    this.client.updateConfig(this.settings.serverUrl, this.settings.apiKey);
+    this.client.setActorId(this.actorId);
+    this.syncEngine?.updateSettings(this.settings);
+
+    if (this.remoteWatcher && urlChanged) {
+      if (this.firstRunComplete && this.settings.serverUrl) {
+        this.remoteWatcher.restart();
+      } else {
+        this.remoteWatcher.stop();
+      }
+    }
+  }
 
   private updateStatusBar(): void {
     const engine = this.syncEngine;
@@ -197,13 +219,17 @@ export default class Drive9Plugin extends Plugin {
 
     switch (engine.status) {
       case "syncing":
-        this.setStatusBar(`↑ drive9: uploading ${engine.pendingCount} files`);
+        this.setStatusBar(`↕ drive9: syncing ${engine.pendingCount} files`);
         break;
       case "error":
         this.setStatusBar("✗ drive9: error");
         break;
       case "idle":
-        this.setStatusBar("✓ drive9: synced");
+        if (engine.pendingCount > 0) {
+          this.setStatusBar(`↕ drive9: queued ${engine.pendingCount} files`);
+        } else {
+          this.setStatusBar("✓ drive9: synced");
+        }
         break;
     }
   }
@@ -215,6 +241,13 @@ export default class Drive9Plugin extends Plugin {
   }
 
   onunload(): void {
-    // Nothing to clean up — Obsidian handles event deregistration.
+    this.remoteWatcher?.stop();
   }
+}
+
+function generateActorId(): string {
+  if (globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID();
+  }
+  return `obsidian-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
