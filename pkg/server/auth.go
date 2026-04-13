@@ -12,6 +12,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
+	"github.com/mem9-ai/dat9/pkg/vault"
 )
 
 type scopeKey int
@@ -138,6 +139,53 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 		scope := &TenantScope{TenantID: resolved.Tenant.ID, APIKeyID: resolved.APIKey.ID, TokenVersion: resolved.APIKey.TokenVersion, Backend: b}
 		next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 	})
+}
+
+// capabilityAuthMiddleware returns a handler that resolves the tenant backend
+// from a capability token's tenant_id claim. It does NOT do full token verification
+// (signature, TTL, revocation) — that is handled by handleVaultRead itself.
+// This middleware only exists to load the correct tenant DB so the handler can
+// access vault tables.
+func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok := bearerToken(r)
+		if tok == "" {
+			errJSON(w, http.StatusUnauthorized, "missing capability token")
+			return
+		}
+
+		// Peek at claims to get tenant_id. We only need the payload, not
+		// full HMAC verification (handleVaultRead does that).
+		tenantID, err := peekCapTokenTenantID(tok)
+		if err != nil {
+			errJSON(w, http.StatusUnauthorized, "invalid capability token")
+			return
+		}
+
+		// Look up tenant and load backend. Use a uniform 401 for all
+		// failure modes to avoid leaking tenant existence or status to
+		// unauthenticated callers (tenant_id is from unverified peek).
+		tenant, err := metaStore.GetTenant(r.Context(), tenantID)
+		if err != nil || tenant.Status != meta.TenantActive {
+			errJSON(w, http.StatusUnauthorized, "invalid capability token")
+			return
+		}
+
+		b, release, err := pool.Acquire(r.Context(), tenant)
+		if err != nil {
+			errJSON(w, http.StatusInternalServerError, "backend unavailable")
+			return
+		}
+		defer release()
+
+		scope := &TenantScope{TenantID: tenantID, Backend: b}
+		sub := strings.TrimPrefix(r.URL.Path, "/v1/vault/read")
+		s.handleVaultRead(w, r.WithContext(withScope(r.Context(), scope)), sub)
+	})
+}
+
+func peekCapTokenTenantID(raw string) (string, error) {
+	return vault.PeekCapTokenTenantID(raw)
 }
 
 func poolDecryptToken(ctx context.Context, pool *tenant.Pool, cipher []byte) ([]byte, error) {
