@@ -89,7 +89,7 @@ export class SyncEngine {
   private markDirty(path: string): void {
     this.dirtyPaths.add(path);
     const state = this.syncStates[path];
-    if (state) {
+    if (state && state.status !== "conflict") {
       state.status = "local_dirty";
     }
     this.scheduleFlush();
@@ -156,31 +156,67 @@ export class SyncEngine {
       return;
     }
 
+    // Skip files in needs_refresh or conflict state — must resolve first.
+    const existingState = this.syncStates[path];
+    if (existingState?.status === "conflict") {
+      return;
+    }
+
+    // If revision is unknown (null), try to refresh before pushing.
+    // This prevents sending expectedRevision=undefined (unconditional write)
+    // for files that actually exist on the remote.
+    if (existingState && existingState.remoteRevision === null) {
+      try {
+        const st = await this.client.stat(path);
+        existingState.remoteRevision = st.revision;
+        existingState.status = "local_dirty";
+      } catch {
+        // Cannot determine revision — block push to prevent silent overwrite.
+        existingState.status = "needs_refresh";
+        console.warn(`[drive9] cannot refresh revision for ${path}, blocking push`);
+        return;
+      }
+    }
+
     const data = await this.vault.readBinary(file);
-    const state = this.syncStates[path];
-    const expectedRevision = state?.remoteRevision;
+    const expectedRevision = existingState?.remoteRevision;
 
     try {
       const result = await this.client.write(path, data, expectedRevision);
-      this.syncStates[path] = {
-        path,
-        localMtime: file.stat.mtime,
-        localSize: file.stat.size,
-        remoteRevision: result.revision,
-        syncedAt: Date.now(),
-        status: "synced",
-      };
+      if (result.revision !== null) {
+        this.syncStates[path] = {
+          path,
+          localMtime: file.stat.mtime,
+          localSize: file.stat.size,
+          remoteRevision: result.revision,
+          syncedAt: Date.now(),
+          status: "synced",
+        };
+      } else {
+        // PUT succeeded but post-write stat failed.
+        // Do NOT re-add to dirty set — the write already committed.
+        // Mark as needs_refresh so next edit will refresh before pushing.
+        this.syncStates[path] = {
+          path,
+          localMtime: file.stat.mtime,
+          localSize: file.stat.size,
+          remoteRevision: null,
+          syncedAt: Date.now(),
+          status: "needs_refresh",
+        };
+        console.warn(`[drive9] write succeeded but revision unknown for ${path}`);
+      }
     } catch (e) {
       if (e instanceof Drive9Error && e.status === 409) {
         // CAS conflict — mark but don't overwrite.
-        if (state) {
-          state.status = "conflict";
+        if (existingState) {
+          existingState.status = "conflict";
         } else {
           this.syncStates[path] = {
             path,
             localMtime: file.stat.mtime,
             localSize: file.stat.size,
-            remoteRevision: 0,
+            remoteRevision: null,
             syncedAt: 0,
             status: "conflict",
           };

@@ -132,12 +132,19 @@ export default class Drive9Plugin extends Plugin {
                 await this.app.vault.createFolder(dir);
               }
               await this.app.vault.createBinary(path, data);
+              // Refresh revision if it was unknown from first-run.
+              if (state.remoteRevision === null) {
+                try {
+                  const st = await this.client.stat(path);
+                  state.remoteRevision = st.revision;
+                } catch { /* stays null — will refresh before next push */ }
+              }
               const pulled = this.app.vault.getAbstractFileByPath(path);
               if (pulled instanceof TFile) {
                 state.localMtime = pulled.stat.mtime;
                 state.localSize = pulled.stat.size;
               }
-              state.status = "synced";
+              state.status = state.remoteRevision !== null ? "synced" : "needs_refresh";
               state.syncedAt = Date.now();
             } catch (e) {
               console.error(`[drive9] pull failed: ${path}`, e);

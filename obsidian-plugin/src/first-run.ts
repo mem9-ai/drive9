@@ -122,11 +122,11 @@ export async function runFirstRunReconciliation(
 
   // Only-remote files: need real revision for future CAS.
   for (const path of onlyRemote) {
-    let revision = 0;
+    let revision: number | null = null;
     try {
       const st = await client.stat(path);
       revision = st.revision;
-    } catch { /* best effort */ }
+    } catch { /* stat failed — revision stays null (unknown) */ }
     states[path] = {
       path,
       localMtime: 0,
@@ -140,11 +140,11 @@ export async function runFirstRunReconciliation(
   // Both-present files: conflict. Seed revision for future resolution.
   for (const path of bothPresent) {
     const file = localFiles.get(path)!;
-    let revision = 0;
+    let revision: number | null = null;
     try {
       const st = await client.stat(path);
       revision = st.revision;
-    } catch { /* best effort */ }
+    } catch { /* stat failed — revision stays null (unknown) */ }
     states[path] = {
       path,
       localMtime: file.stat.mtime,
@@ -192,20 +192,18 @@ export async function pullAllRemote(
 
     const file = vault.getAbstractFileByPath(entry.name);
     if (file instanceof TFile) {
-      let revision = 0;
+      let revision: number | null = null;
       try {
         const st = await client.stat(entry.name);
         revision = st.revision;
-      } catch {
-        // Best-effort; will be corrected on next successful push.
-      }
+      } catch { /* revision stays null */ }
       syncStates[entry.name] = {
         path: entry.name,
         localMtime: file.stat.mtime,
         localSize: file.stat.size,
         remoteRevision: revision,
         syncedAt: Date.now(),
-        status: "synced",
+        status: revision !== null ? "synced" : "needs_refresh",
       };
     }
     count++;

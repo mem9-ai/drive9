@@ -36,9 +36,14 @@ export interface SyncState {
   path: string;
   localMtime: number;
   localSize: number;
-  remoteRevision: number;
+  /**
+   * null means "remote exists but revision is unknown" (e.g. stat failed).
+   * 0 means "create-if-absent" (file not yet on remote).
+   * Positive number is a real CAS revision.
+   */
+  remoteRevision: number | null;
   syncedAt: number;
-  status: "synced" | "local_dirty" | "remote_dirty" | "remote_deleted" | "conflict";
+  status: "synced" | "local_dirty" | "remote_dirty" | "remote_deleted" | "conflict" | "needs_refresh";
 }
 
 /** Persisted plugin data (settings + sync state). */

@@ -42,24 +42,33 @@ export class Drive9Client {
    * PUT — write file content with optional CAS revision check.
    * Server returns {"status":"ok"} without revision, so we stat()
    * after write to get the actual revision for future CAS.
+   *
+   * Returns { revision: number } on full success, or
+   * { revision: null, writeSucceeded: true } if PUT succeeded but
+   * post-write stat failed (caller must not treat this as a write failure).
    */
   async write(
     path: string,
     data: ArrayBuffer,
-    expectedRevision?: number,
-  ): Promise<{ revision: number }> {
+    expectedRevision?: number | null,
+  ): Promise<{ revision: number | null; writeSucceeded: boolean }> {
     const headers: Record<string, string> = {};
-    if (expectedRevision !== undefined) {
+    if (expectedRevision !== undefined && expectedRevision !== null) {
       headers["X-Dat9-Expected-Revision"] = String(expectedRevision);
     }
     await this.request("PUT", `/v1/fs/${encodePath(path)}`, {
       body: data,
       headers,
     });
-    // Server does not return revision in write response.
-    // Stat to get the actual revision for future CAS writes.
-    const st = await this.stat(path);
-    return { revision: st.revision };
+    // PUT succeeded. Try to get the new revision for future CAS.
+    try {
+      const st = await this.stat(path);
+      return { revision: st.revision, writeSucceeded: true };
+    } catch {
+      // Post-write stat failed — write DID succeed on the server.
+      // Caller must handle this as "committed but revision unknown".
+      return { revision: null, writeSucceeded: true };
+    }
   }
 
   /** DELETE — remove a file. */
