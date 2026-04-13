@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 
 	serverlessv1 "github.com/tidbcloud/tidb-management-service/api/spec/global/serverless/v1"
 	zerov1beta1 "github.com/tidbcloud/tidb-management-service/api/spec/tidb_cloud_open_api/zero/v1beta1"
@@ -102,6 +103,11 @@ func (g *grpcGlobalClient) GetClusterInfo(ctx context.Context, clusterID string)
 		username = prefix + ".cloud_admin"
 	}
 
+	proxyEndpoint := sc.GetInternalEndpoint()
+	if proxyEndpoint != "" && !strings.HasPrefix(proxyEndpoint, "http://") && !strings.HasPrefix(proxyEndpoint, "https://") {
+		proxyEndpoint = "https://" + proxyEndpoint
+	}
+
 	return &ClusterInfo{
 		ClusterID:     clusterID,
 		OrgID:         clusters[0].GetOrganizationId(),
@@ -109,7 +115,7 @@ func (g *grpcGlobalClient) GetClusterInfo(ctx context.Context, clusterID string)
 		Port:          int(pub.GetPort()),
 		Username:      username,
 		Version:       regional.GetVersion(),
-		ProxyEndpoint: sc.GetInternalEndpoint(),
+		ProxyEndpoint: proxyEndpoint,
 		UserPrefix:    prefix,
 	}, nil
 }
