@@ -153,26 +153,37 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 }
 
 // nativeProvisionAsync runs in a background goroutine after the tenant record
-// has been persisted. It tries to create a dedicated service user via
-// SqlUserService gRPC, falls back to the existing cluster credentials if that
-// fails, updates the tenant DB credentials, then runs schema init. On success
-// it marks the tenant active; on unrecoverable errors it marks the tenant failed.
+// has been persisted. It tries to create a dedicated service user via the
+// cluster proxy (using GRANT ROLE to avoid GRANT OPTION issues), falls back to
+// the existing cluster credentials if that fails, updates the tenant DB
+// credentials, then runs schema init. On success it marks the tenant active;
+// on unrecoverable errors it marks the tenant failed.
 func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.Provisioner, tenantID string, cluster *tenant.ClusterInfo, provider string) {
 	dbUser := cluster.Username
 	dbPassword := cluster.Password
 
-	// Step 1: try to create a dedicated service user via SqlUserService gRPC.
-	svcUser, svcErr := np.CreateServiceUser(ctx, tenantID, cluster.Username)
-	if svcErr != nil {
-		logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_create_svc_user_failed",
-			"tenant_id", tenantID, "error", svcErr)...)
-		logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_fallback_cloud_admin",
-			"tenant_id", tenantID, "db_user", dbUser)...)
+	// Step 1: try to create a dedicated service user via cluster proxy.
+	proxyInfo, err := np.GetClusterProxyInfo(ctx, tenantID)
+	if err != nil {
+		logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_get_proxy_info_failed",
+			"tenant_id", tenantID, "error", err)...)
+		// Fall through: use cloud_admin credentials.
+	} else if proxyInfo == nil {
+		logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_no_proxy_endpoint",
+			"tenant_id", tenantID)...)
 	} else {
-		dbUser = svcUser.Username
-		dbPassword = svcUser.Password
-		logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_svc_user_created",
-			"tenant_id", tenantID, "db_user", dbUser)...)
+		svcUser, svcErr := np.CreateServiceUser(ctx, tenantID, proxyInfo)
+		if svcErr != nil {
+			logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_create_svc_user_failed",
+				"tenant_id", tenantID, "error", svcErr)...)
+			logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_fallback_cloud_admin",
+				"tenant_id", tenantID, "db_user", dbUser)...)
+		} else {
+			dbUser = svcUser.Username
+			dbPassword = svcUser.Password
+			logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_svc_user_created",
+				"tenant_id", tenantID, "db_user", dbUser)...)
+		}
 	}
 
 	// Step 2: persist the chosen credentials (service user or cloud_admin fallback).

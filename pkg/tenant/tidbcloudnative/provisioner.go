@@ -11,9 +11,7 @@ package tidbcloudnative
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
@@ -117,41 +115,73 @@ func (p *Provisioner) Authorize(ctx context.Context, r *http.Request, clusterID 
 	return nil
 }
 
-// CreateServiceUser creates a dedicated fs_admin SQL user on the given cluster
-// via the SqlUserService gRPC API. The operator authenticates as cloud_admin
-// using its encrypted password. operatorUsername is the cloud_admin username
-// (e.g. "2wCQ.cloud_admin") used to derive the user prefix and as the gRPC
-// operator identity. Returns the ServiceUser credentials.
-func (p *Provisioner) CreateServiceUser(ctx context.Context, clusterID string, operatorUsername string) (*tidbcloud.ServiceUser, error) {
+// ClusterProxyInfo holds the cluster proxy endpoint and credentials needed to
+// execute SQL via the proxy HTTP API.
+type ClusterProxyInfo struct {
+	ClusterID     uint64
+	ProxyEndpoint string
+	Username      string // cloud_admin username (with prefix)
+	Password      string // cloud_admin password (plaintext)
+}
+
+// GetClusterProxyInfo fetches the proxy endpoint and cloud_admin credentials
+// for the given cluster. Returns nil if no proxy endpoint is available.
+func (p *Provisioner) GetClusterProxyInfo(ctx context.Context, clusterID string) (*ClusterProxyInfo, error) {
+	info, err := p.global.GetClusterInfo(ctx, clusterID)
+	if err != nil {
+		return nil, fmt.Errorf("get cluster info %s: %w", clusterID, err)
+	}
+	if info.ProxyEndpoint == "" {
+		return nil, nil // no proxy available
+	}
+
 	encryptedPwd, err := p.global.GetEncryptedCloudAdminPwd(ctx, clusterID)
 	if err != nil {
-		return nil, fmt.Errorf("get encrypted cloud_admin password for cluster %s: %w", clusterID, err)
+		return nil, fmt.Errorf("get encrypted password for cluster %s: %w", clusterID, err)
 	}
-
-	password, err := generateRandomHex(32)
+	ciphertext, err := base64.StdEncoding.DecodeString(encryptedPwd)
 	if err != nil {
-		return nil, fmt.Errorf("generate service user password: %w", err)
+		return nil, fmt.Errorf("decode encrypted password for cluster %s: %w", clusterID, err)
+	}
+	plaintext, err := p.enc.Decrypt(ctx, ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt password for cluster %s: %w", clusterID, err)
 	}
 
-	userPrefix := extractUserPrefix(operatorUsername)
-	bareUser := "fs_admin"
-	qualifiedUser := bareUser
-	if userPrefix != "" {
-		qualifiedUser = userPrefix + "." + bareUser
-	}
-
-	if err := p.global.CreateServiceUser(ctx, clusterID, operatorUsername, encryptedPwd, qualifiedUser, password); err != nil {
+	cid, err := tidbcloud.ParseClusterIDUint64(clusterID)
+	if err != nil {
 		return nil, err
 	}
 
-	logger.Info(ctx, "service_user_created_via_global",
-		zap.String("cluster_id", clusterID),
-		zap.String("user", qualifiedUser))
-
-	return &tidbcloud.ServiceUser{
-		Username: qualifiedUser,
-		Password: password,
+	return &ClusterProxyInfo{
+		ClusterID:     cid,
+		ProxyEndpoint: info.ProxyEndpoint,
+		Username:      info.Username,
+		Password:      string(plaintext),
 	}, nil
+}
+
+// CreateServiceUser creates a dedicated fs_admin SQL user on the given cluster
+// via the cluster proxy HTTP API. The user is assigned the role_admin role via
+// GRANT ROLE (which does not require GRANT OPTION, unlike explicit privilege
+// GRANTs that fail with error 8121). Returns the ServiceUser credentials.
+func (p *Provisioner) CreateServiceUser(ctx context.Context, clusterID string, proxyInfo *ClusterProxyInfo) (*tidbcloud.ServiceUser, error) {
+	proxy := tidbcloud.NewClusterProxyClient(
+		proxyInfo.ProxyEndpoint, proxyInfo.ClusterID,
+		proxyInfo.Username, proxyInfo.Password)
+
+	userPrefix := extractUserPrefix(proxyInfo.Username)
+
+	svcUser, err := proxy.CreateServiceUser(ctx, userPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("create service user on cluster %s: %w", clusterID, err)
+	}
+
+	logger.Info(ctx, "service_user_created_via_proxy",
+		zap.String("cluster_id", clusterID),
+		zap.String("user", svcUser.Username))
+
+	return svcUser, nil
 }
 
 // extractUserPrefix extracts the user prefix from a serverless username.
@@ -161,13 +191,4 @@ func extractUserPrefix(username string) string {
 		return username[:i]
 	}
 	return ""
-}
-
-// generateRandomHex returns a hex-encoded random string of n bytes.
-func generateRandomHex(n int) (string, error) {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
 }
