@@ -3,6 +3,7 @@ package tidbcloud
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -70,7 +71,14 @@ func CreateServiceUserViaProxy(ctx context.Context, proxyEndpoint string, cluste
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	// The internal cluster proxy uses a certificate that does not match
+	// the ELB hostname, so we skip TLS verification for this internal call.
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // internal service proxy with mismatched cert
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("create service user via proxy: %w", err)
