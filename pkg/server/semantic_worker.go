@@ -594,6 +594,10 @@ func (m *semanticWorkerManager) listTenantRefs(ctx context.Context) ([]semanticT
 	return nil, nil
 }
 
+// TODO(JaySon-Huang): DB9/Postgres tenants are not yet supported in the semantic
+// worker runtime path. pool.Acquire returns MySQL-based stores only. When DB9
+// tenants need semantic task processing, this method must be extended to handle
+// the Postgres backend and its different SQL dialect.
 func (m *semanticWorkerManager) targetForRef(ctx context.Context, ref semanticTenantRef) (*semanticTarget, error) {
 	if ref.id == semanticLocalTenantID {
 		if m.fallback == nil {

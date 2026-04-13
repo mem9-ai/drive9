@@ -31,6 +31,10 @@ const (
 	// PendingOverwrite means the file already existed on the remote server
 	// and local edits have been cached.  Rename must upload first.
 	PendingOverwrite
+	// PendingConflict means the upload failed terminally (conflict or max
+	// retries). The local data is preserved for manual recovery but will
+	// not be re-enqueued by RecoverPending.
+	PendingConflict
 )
 
 // WriteBackMeta stores metadata alongside cached file data so that the

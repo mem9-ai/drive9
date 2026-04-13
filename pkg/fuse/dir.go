@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	defaultDirCacheTTL = 5 * time.Second
+	defaultDirCacheTTL = 10 * time.Second
 )
 
 // CachedFileInfo matches the client.FileInfo shape but avoids importing client.

@@ -81,6 +81,7 @@ func initDB9Schema(dsn string) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_upload_path ON uploads(target_path, status)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency ON uploads(idempotency_key)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_uploads_active ON uploads(active_target_path)`,
 		// semantic_tasks groups fields by responsibility:
 		// - identity/resource binding: task_id, task_type, resource_id, resource_version
 		// - delivery state: status, attempt_count, max_attempts

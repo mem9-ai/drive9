@@ -73,6 +73,7 @@ func tidbAppEmbeddingSchemaStatements() []string {
 		`ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL`,
 		`CREATE INDEX idx_upload_path ON uploads(target_path, status)`,
 		`CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)`,
+		`CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path)`,
 		`CREATE TABLE IF NOT EXISTS semantic_tasks (
 			task_id           VARCHAR(64) PRIMARY KEY,
 			task_type         VARCHAR(32) NOT NULL,

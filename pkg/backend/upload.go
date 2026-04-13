@@ -728,7 +728,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			}
 			confirmedRevision = newRev
 
-			_, err = tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, upload.FileID)
+			_, err = tx.Exec(`UPDATE files SET status = 'DELETED', storage_ref = '' WHERE file_id = ?`, upload.FileID)
 			if err != nil {
 				return err
 			}
