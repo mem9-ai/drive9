@@ -6,21 +6,18 @@ import type { SyncState, Drive9Settings } from "./types";
 export type SyncStatus = "idle" | "syncing" | "error";
 
 /**
- * SyncEngine handles bidirectional sync between local vault and drive9.
- * Phase 1: local changes → debounce → push with CAS.
- * Phase 2A: remote changes → detect via SSE/polling → pull or mark conflict.
+ * SyncEngine owns the local/remote sync state machine.
+ * Phase 2A adds remote detection, safe pull, and non-destructive delete/conflict handling.
  */
 export class SyncEngine {
   private dirtyPaths = new Set<string>();
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private ignoreMatcher: IgnoreMatcher;
+  private suppressedPaths = new Map<string, number>();
+  private operationQueue: Promise<void> = Promise.resolve();
   private _status: SyncStatus = "idle";
   private _pendingCount = 0;
   private statusListeners: Array<() => void> = [];
-  private _actorId: string;
-  /** Paths currently being written by pull — suppress vault events for these. */
-  private pullingPaths = new Set<string>();
-  private syncLock = false;
 
   constructor(
     private vault: Vault,
@@ -28,10 +25,8 @@ export class SyncEngine {
     private syncStates: Record<string, SyncState>,
     private settings: Drive9Settings,
     private persistData: () => Promise<void>,
-    actorId: string,
   ) {
     this.ignoreMatcher = new IgnoreMatcher(settings.ignorePaths);
-    this._actorId = actorId;
   }
 
   get status(): SyncStatus {
@@ -40,10 +35,6 @@ export class SyncEngine {
 
   get pendingCount(): number {
     return this._pendingCount;
-  }
-
-  get actorId(): string {
-    return this._actorId;
   }
 
   onStatusChange(fn: () => void): void {
@@ -55,35 +46,31 @@ export class SyncEngine {
     this.ignoreMatcher = new IgnoreMatcher(settings.ignorePaths);
   }
 
-  // ---------------------------------------------------------------------------
-  // Vault event handlers (local changes)
-  // ---------------------------------------------------------------------------
-
   onLocalCreate(file: TAbstractFile): void {
     if (!(file instanceof TFile)) return;
     if (this.shouldIgnore(file.path)) return;
-    if (this.pullingPaths.has(file.path)) return;
+    if (this.isLocalEventSuppressed(file.path)) return;
     this.markDirty(file.path);
   }
 
   onLocalModify(file: TAbstractFile): void {
     if (!(file instanceof TFile)) return;
     if (this.shouldIgnore(file.path)) return;
-    if (this.pullingPaths.has(file.path)) return;
+    if (this.isLocalEventSuppressed(file.path)) return;
     this.markDirty(file.path);
   }
 
   onLocalDelete(file: TAbstractFile): void {
     if (!(file instanceof TFile)) return;
     if (this.shouldIgnore(file.path)) return;
-    if (this.pullingPaths.has(file.path)) return;
+    if (this.isLocalEventSuppressed(file.path)) return;
     this.markDirty(file.path);
   }
 
   onLocalRename(file: TAbstractFile, oldPath: string): void {
     if (!(file instanceof TFile)) return;
     if (this.shouldIgnore(file.path) && this.shouldIgnore(oldPath)) return;
-    if (this.pullingPaths.has(file.path) || this.pullingPaths.has(oldPath)) return;
+    if (this.isLocalEventSuppressed(file.path) || this.isLocalEventSuppressed(oldPath)) return;
     if (!this.shouldIgnore(oldPath)) {
       this.markDirty(oldPath);
     }
@@ -92,243 +79,46 @@ export class SyncEngine {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Remote change handlers (SSE / polling callbacks)
-  // ---------------------------------------------------------------------------
-
-  /** Called by SSEWatcher when a single remote file changed. */
-  onRemoteChange(path: string, op: string): void {
+  async onRemoteChange(path: string, _op: string): Promise<void> {
     if (this.shouldIgnore(path)) return;
-
-    const state = this.syncStates[path];
-
-    if (op === "delete") {
-      if (state) {
-        // Mark remote_deleted — Phase 2B will apply the actual delete.
-        state.status = "remote_deleted";
-      }
-      this.notifyStatusChange();
-      this.persistData();
-      return;
-    }
-
-    // write op — schedule a pull check.
-    if (state) {
-      if (state.status === "local_dirty" || state.status === "conflict") {
-        // Local is also dirty → conflict.
-        state.status = "conflict";
-        this.notifyStatusChange();
-        this.persistData();
-        return;
-      }
-      state.status = "remote_dirty";
-    } else {
-      // New remote file — create a placeholder state to trigger pull.
-      this.syncStates[path] = {
-        path,
-        localMtime: 0,
-        localSize: 0,
-        remoteRevision: null,
-        syncedAt: 0,
-        status: "remote_dirty",
-      };
-    }
-
-    this.schedulePull();
-  }
-
-  /** Called by SSEWatcher on reset event or polling interval. */
-  async onFullSync(): Promise<void> {
-    if (this.syncLock) return;
-    this.syncLock = true;
-    try {
-      await this.pollRemoteChanges();
-    } catch (e) {
-      console.error("[drive9] full sync failed", e);
-    } finally {
-      this.syncLock = false;
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Polling: diff remote state against local SyncState
-  // ---------------------------------------------------------------------------
-
-  private async pollRemoteChanges(): Promise<void> {
-    const remoteFiles = await this.buildRemoteFileMap();
-
-    let changed = false;
-
-    // Check for remote deletions and modifications of tracked files.
-    for (const [path, state] of Object.entries(this.syncStates)) {
-      if (this.shouldIgnore(path)) continue;
-      if (state.status === "conflict") continue; // don't touch conflicts
-
-      if (!remoteFiles.has(path)) {
-        if (state.status === "synced") {
-          state.status = "remote_deleted";
-          changed = true;
-        }
-        continue;
-      }
-
-      const remote = remoteFiles.get(path)!;
-      if (remote.revision !== state.remoteRevision && state.status === "synced") {
-        state.status = "remote_dirty";
-        changed = true;
-      } else if (remote.revision !== state.remoteRevision && state.status === "local_dirty") {
-        state.status = "conflict";
-        changed = true;
-      }
-    }
-
-    // Check for new remote files not in SyncState.
-    for (const [path, info] of remoteFiles) {
-      if (this.shouldIgnore(path)) continue;
-      if (this.syncStates[path]) continue;
-
-      // Check if file exists locally already (e.g. created between polls).
-      const localFile = this.vault.getAbstractFileByPath(path);
-      if (localFile instanceof TFile) {
-        // Both exist but no sync state — treat as conflict.
-        this.syncStates[path] = {
-          path,
-          localMtime: localFile.stat.mtime,
-          localSize: localFile.stat.size,
-          remoteRevision: info.revision,
-          syncedAt: 0,
-          status: "conflict",
-        };
-      } else {
-        // New remote file — mark for pull.
-        this.syncStates[path] = {
-          path,
-          localMtime: 0,
-          localSize: 0,
-          remoteRevision: info.revision,
-          syncedAt: 0,
-          status: "remote_dirty",
-        };
-      }
-      changed = true;
-    }
-
-    if (changed) {
-      this.notifyStatusChange();
-      await this.persistData();
-      await this.pullDirtyFiles();
-    }
-  }
-
-  /**
-   * Build a map of all remote files with their revisions.
-   * Uses listRecursive + stat for revision data.
-   */
-  private async buildRemoteFileMap(): Promise<Map<string, { revision: number }>> {
-    const entries = await this.client.listRecursive("/");
-    const result = new Map<string, { revision: number }>();
-
-    for (const entry of entries) {
-      if (this.shouldIgnore(entry.name)) continue;
-      if (entry.isDir) continue;
+    await this.enqueue(async () => {
+      this.setStatus("syncing", 1);
       try {
-        const st = await this.client.stat(entry.name);
-        result.set(entry.name, { revision: st.revision });
-      } catch {
-        // stat failed — skip this file for this poll cycle.
+        await this.reconcileRemotePath(path);
+      } finally {
+        this.setStatus("idle", this.dirtyPaths.size);
+        await this.persistData();
       }
-    }
-
-    return result;
+    });
   }
 
-  // ---------------------------------------------------------------------------
-  // Pull logic: download remote changes to local vault
-  // ---------------------------------------------------------------------------
+  async fullSync(): Promise<void> {
+    await this.enqueue(async () => {
+      const scan = await this.client.listRecursiveDetailed("/");
+      const remotePaths = new Set<string>();
 
-  private pullTimer: ReturnType<typeof setTimeout> | null = null;
-
-  private schedulePull(): void {
-    if (this.pullTimer) return; // already scheduled
-    this.pullTimer = setTimeout(() => {
-      this.pullTimer = null;
-      this.pullDirtyFiles();
-    }, 500); // small delay to batch multiple SSE events
-  }
-
-  private async pullDirtyFiles(): Promise<void> {
-    const toPull = Object.values(this.syncStates).filter(
-      (s) => s.status === "remote_dirty",
-    );
-
-    if (toPull.length === 0) return;
-
-    this.setStatus("syncing", toPull.length);
-
-    let errorOccurred = false;
-
-    for (const state of toPull) {
+      this.setStatus("syncing", scan.entries.length);
       try {
-        await this.pullOne(state);
-      } catch (e) {
-        errorOccurred = true;
-        console.error(`[drive9] pull failed: ${state.path}`, e);
-      }
-    }
-
-    this.setStatus(errorOccurred ? "error" : "idle", 0);
-    await this.persistData();
-  }
-
-  private async pullOne(state: SyncState): Promise<void> {
-    const path = state.path;
-
-    // Get the latest remote content.
-    const data = await this.client.read(path);
-
-    // Get the latest revision.
-    let revision: number | null = state.remoteRevision;
-    try {
-      const st = await this.client.stat(path);
-      revision = st.revision;
-    } catch {
-      // Keep whatever revision we had.
-    }
-
-    // Write to local vault, suppressing vault events.
-    this.pullingPaths.add(path);
-    try {
-      const existing = this.vault.getAbstractFileByPath(path);
-      if (existing instanceof TFile) {
-        await this.vault.modifyBinary(existing, data);
-      } else {
-        // Ensure parent directory exists.
-        const dir = path.contains("/")
-          ? path.substring(0, path.lastIndexOf("/"))
-          : "";
-        if (dir && !this.vault.getAbstractFileByPath(dir)) {
-          await this.vault.createFolder(dir);
+        for (const entry of scan.entries) {
+          if (this.shouldIgnore(entry.name)) continue;
+          remotePaths.add(entry.name);
+          await this.reconcileRemotePath(entry.name);
         }
-        await this.vault.createBinary(path, data);
-      }
 
-      // Update sync state.
-      const file = this.vault.getAbstractFileByPath(path);
-      if (file instanceof TFile) {
-        state.localMtime = file.stat.mtime;
-        state.localSize = file.stat.size;
+        if (scan.complete) {
+          for (const path of Object.keys(this.syncStates)) {
+            if (this.shouldIgnore(path) || remotePaths.has(path)) continue;
+            await this.handleRemoteMissing(path);
+          }
+        } else {
+          console.warn("[drive9] remote tree scan incomplete; skipping delete detection");
+        }
+      } finally {
+        this.setStatus("idle", this.dirtyPaths.size);
+        await this.persistData();
       }
-      state.remoteRevision = revision;
-      state.syncedAt = Date.now();
-      state.status = revision !== null ? "synced" : "needs_refresh";
-    } finally {
-      this.pullingPaths.delete(path);
-    }
+    });
   }
-
-  // ---------------------------------------------------------------------------
-  // Push logic (from Phase 1, unchanged)
-  // ---------------------------------------------------------------------------
 
   private shouldIgnore(path: string): boolean {
     return this.ignoreMatcher.isIgnored(path);
@@ -347,47 +137,46 @@ export class SyncEngine {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
-      this.flush();
+      void this.flush();
     }, this.settings.pushDebounce);
   }
 
   private async flush(): Promise<void> {
-    if (this.dirtyPaths.size === 0) return;
+    await this.enqueue(async () => {
+      if (this.dirtyPaths.size === 0) return;
 
-    const paths = [...this.dirtyPaths];
-    this.dirtyPaths.clear();
+      const paths = [...this.dirtyPaths];
+      this.dirtyPaths.clear();
 
-    this.setStatus("syncing", paths.length);
+      this.setStatus("syncing", paths.length);
 
-    let errorOccurred = false;
+      let errorOccurred = false;
 
-    for (const path of paths) {
-      try {
-        await this.pushOne(path);
-      } catch (e) {
-        errorOccurred = true;
-        console.error(`[drive9] push failed: ${path}`, e);
-        this.dirtyPaths.add(path);
+      for (const path of paths) {
+        try {
+          await this.pushOne(path);
+        } catch (e) {
+          errorOccurred = true;
+          console.error(`[drive9] push failed: ${path}`, e);
+          this.dirtyPaths.add(path);
+        }
       }
-    }
 
-    this.setStatus(errorOccurred ? "error" : "idle", this.dirtyPaths.size);
-    await this.persistData();
+      this.setStatus(errorOccurred ? "error" : "idle", this.dirtyPaths.size);
+      await this.persistData();
+    });
   }
 
   private async pushOne(path: string): Promise<void> {
     const file = this.vault.getAbstractFileByPath(path);
 
-    // File was deleted locally.
     if (!file || !(file instanceof TFile)) {
       const state = this.syncStates[path];
       if (state) {
         try {
           await this.client.delete(path);
         } catch (e) {
-          if (e instanceof Drive9Error && e.status === 404) {
-            // ok
-          } else {
+          if (!(e instanceof Drive9Error && e.status === 404)) {
             throw e;
           }
         }
@@ -396,19 +185,16 @@ export class SyncEngine {
       return;
     }
 
-    // Skip files exceeding size limit.
     if (file.stat.size > this.settings.maxFileSize) {
       console.warn(`[drive9] skipping large file: ${path} (${file.stat.size} bytes)`);
       return;
     }
 
-    // Skip files in conflict or remote_deleted state.
     const existingState = this.syncStates[path];
-    if (existingState?.status === "conflict" || existingState?.status === "remote_deleted") {
+    if (existingState?.status === "conflict") {
       return;
     }
 
-    // If revision is unknown (null), try to refresh before pushing.
     if (existingState && existingState.remoteRevision === null) {
       try {
         const st = await this.client.stat(path);
@@ -422,7 +208,6 @@ export class SyncEngine {
     }
 
     const data = await this.vault.readBinary(file);
-    // If no state exists, this is a new file — use 0 (create-if-absent).
     const expectedRevision = existingState ? existingState.remoteRevision : 0;
 
     try {
@@ -468,9 +253,138 @@ export class SyncEngine {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Status
-  // ---------------------------------------------------------------------------
+  private enqueue(fn: () => Promise<void>): Promise<void> {
+    const next = this.operationQueue.then(fn, fn);
+    this.operationQueue = next.catch(() => undefined);
+    return next;
+  }
+
+  private isLocalEventSuppressed(path: string): boolean {
+    return (this.suppressedPaths.get(path) ?? 0) > 0;
+  }
+
+  private async withSuppressedLocalEvents(path: string, fn: () => Promise<void>): Promise<void> {
+    this.suppressedPaths.set(path, (this.suppressedPaths.get(path) ?? 0) + 1);
+    try {
+      await fn();
+    } finally {
+      setTimeout(() => {
+        const current = this.suppressedPaths.get(path) ?? 0;
+        if (current <= 1) {
+          this.suppressedPaths.delete(path);
+        } else {
+          this.suppressedPaths.set(path, current - 1);
+        }
+      }, 0);
+    }
+  }
+
+  private getLocalFile(path: string): TFile | null {
+    const file = this.vault.getAbstractFileByPath(path);
+    return file instanceof TFile ? file : null;
+  }
+
+  private hasUnpushedLocalChange(path: string, file: TFile | null, state: SyncState | undefined): boolean {
+    if (this.dirtyPaths.has(path)) return true;
+    if (!file) return false;
+    if (!state) return true;
+    if (state.status === "local_dirty" || state.status === "conflict") return true;
+    return file.stat.mtime !== state.localMtime || file.stat.size !== state.localSize;
+  }
+
+  private async reconcileRemotePath(path: string): Promise<void> {
+    const state = this.syncStates[path];
+    if (state?.status === "conflict") {
+      return;
+    }
+
+    const localFile = this.getLocalFile(path);
+
+    let remoteRevision: number;
+    try {
+      const remoteStat = await this.client.stat(path);
+      remoteRevision = remoteStat.revision;
+    } catch (error) {
+      if (error instanceof Drive9Error && error.status === 404) {
+        await this.handleRemoteMissing(path);
+        return;
+      }
+      throw error;
+    }
+
+    if (
+      state?.status === "synced" &&
+      state.remoteRevision === remoteRevision &&
+      !this.hasUnpushedLocalChange(path, localFile, state)
+    ) {
+      return;
+    }
+
+    if (this.hasUnpushedLocalChange(path, localFile, state)) {
+      this.markConflict(path, localFile, remoteRevision);
+      return;
+    }
+
+    await this.pullRemoteFile(path, remoteRevision, localFile);
+  }
+
+  private async handleRemoteMissing(path: string): Promise<void> {
+    const state = this.syncStates[path];
+    if (!state || state.status === "conflict") return;
+
+    const localFile = this.getLocalFile(path);
+    if (this.hasUnpushedLocalChange(path, localFile, state)) {
+      this.markConflict(path, localFile, state.remoteRevision);
+      return;
+    }
+
+    state.status = "remote_deleted";
+    state.syncedAt = Date.now();
+  }
+
+  private markConflict(path: string, localFile: TFile | null, remoteRevision: number | null): void {
+    const existingState = this.syncStates[path];
+    const wasConflict = existingState?.status === "conflict";
+
+    this.syncStates[path] = {
+      path,
+      localMtime: localFile?.stat.mtime ?? existingState?.localMtime ?? 0,
+      localSize: localFile?.stat.size ?? existingState?.localSize ?? 0,
+      remoteRevision,
+      syncedAt: existingState?.syncedAt ?? 0,
+      status: "conflict",
+    };
+
+    if (!wasConflict) {
+      new Notice(`drive9: conflict detected for ${path}`);
+    }
+  }
+
+  private async pullRemoteFile(path: string, remoteRevision: number, localFile: TFile | null): Promise<void> {
+    const data = await this.client.read(path);
+
+    await this.withSuppressedLocalEvents(path, async () => {
+      const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+      if (dir && !this.vault.getAbstractFileByPath(dir)) {
+        await this.vault.createFolder(dir);
+      }
+      if (localFile) {
+        await this.vault.modifyBinary(localFile, data);
+      } else {
+        await this.vault.createBinary(path, data);
+      }
+    });
+
+    const updatedFile = this.getLocalFile(path);
+    this.syncStates[path] = {
+      path,
+      localMtime: updatedFile?.stat.mtime ?? 0,
+      localSize: updatedFile?.stat.size ?? 0,
+      remoteRevision,
+      syncedAt: Date.now(),
+      status: "synced",
+    };
+  }
 
   private setStatus(status: SyncStatus, pending: number): void {
     this._status = status;
@@ -480,7 +394,11 @@ export class SyncEngine {
 
   private notifyStatusChange(): void {
     for (const fn of this.statusListeners) {
-      try { fn(); } catch { /* ignore */ }
+      try {
+        fn();
+      } catch {
+        // Ignore status listener failures.
+      }
     }
   }
 }

@@ -6,11 +6,10 @@ import type { StatResult, FileInfo } from "./types";
  * (bypasses CORS, works on mobile).
  */
 export class Drive9Client {
-  private actorId = "";
-
   constructor(
     private serverUrl: string,
     private apiKey: string,
+    private actorId = "",
   ) {}
 
   updateConfig(serverUrl: string, apiKey: string): void {
@@ -20,6 +19,18 @@ export class Drive9Client {
 
   setActorId(actorId: string): void {
     this.actorId = actorId;
+  }
+
+  getServerUrl(): string {
+    return this.serverUrl;
+  }
+
+  getAPIKey(): string {
+    return this.apiKey;
+  }
+
+  getActorId(): string {
+    return this.actorId;
   }
 
   /** Test connectivity and auth. Throws on failure. */
@@ -58,54 +69,52 @@ export class Drive9Client {
     data: ArrayBuffer,
     expectedRevision?: number | null,
   ): Promise<{ revision: number | null; writeSucceeded: boolean }> {
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = this.mutationHeaders();
     if (expectedRevision !== undefined && expectedRevision !== null) {
       headers["X-Dat9-Expected-Revision"] = String(expectedRevision);
     }
-    if (this.actorId) {
-      headers["X-Dat9-Actor"] = this.actorId;
-    }
+
     await this.request("PUT", `/v1/fs/${encodePath(path)}`, {
       body: data,
       headers,
     });
-    // PUT succeeded. Try to get the new revision for future CAS.
+
     try {
       const st = await this.stat(path);
       return { revision: st.revision, writeSucceeded: true };
     } catch {
-      // Post-write stat failed — write DID succeed on the server.
-      // Caller must handle this as "committed but revision unknown".
       return { revision: null, writeSucceeded: true };
     }
   }
 
   /** DELETE — remove a file. */
   async delete(path: string): Promise<void> {
-    const headers: Record<string, string> = {};
-    if (this.actorId) headers["X-Dat9-Actor"] = this.actorId;
-    await this.request("DELETE", `/v1/fs/${encodePath(path)}`, { headers });
+    await this.request("DELETE", `/v1/fs/${encodePath(path)}`, {
+      headers: this.mutationHeaders(),
+    });
   }
 
   /** POST ?rename — rename/move a file. */
   async rename(oldPath: string, newPath: string): Promise<void> {
-    const headers: Record<string, string> = { "X-Dat9-Rename-Source": oldPath };
-    if (this.actorId) headers["X-Dat9-Actor"] = this.actorId;
-    await this.request("POST", `/v1/fs/${encodePath(newPath)}?rename`, { headers });
+    await this.request("POST", `/v1/fs/${encodePath(newPath)}?rename`, {
+      headers: {
+        ...this.mutationHeaders(),
+        "X-Dat9-Rename-Source": oldPath,
+      },
+    });
   }
 
   /** POST ?mkdir — create a directory. */
   async mkdir(path: string): Promise<void> {
-    const headers: Record<string, string> = {};
-    if (this.actorId) headers["X-Dat9-Actor"] = this.actorId;
-    await this.request("POST", `/v1/fs/${encodePath(path)}?mkdir`, { headers });
+    await this.request("POST", `/v1/fs/${encodePath(path)}?mkdir`, {
+      headers: this.mutationHeaders(),
+    });
   }
 
   /** GET ?list=1 — list directory contents. */
   async list(path: string): Promise<FileInfo[]> {
     const resp = await this.request("GET", `/v1/fs/${encodePath(path)}?list=1`);
     const data = resp.json;
-    // API may return { entries: [...] } or just an array
     if (Array.isArray(data)) return data as FileInfo[];
     if (data && Array.isArray((data as Record<string, unknown>).entries)) {
       return (data as Record<string, unknown>).entries as FileInfo[];
@@ -122,10 +131,19 @@ export class Drive9Client {
    * errors are swallowed.
    */
   async listRecursive(basePath: string): Promise<FileInfo[]> {
-    // Root list must succeed — propagate errors to caller.
+    const result = await this.listRecursiveDetailed(basePath);
+    return result.entries;
+  }
+
+  /**
+   * Recursively list all files under a path and report whether the tree scan
+   * completed without any subdirectory list failures.
+   */
+  async listRecursiveDetailed(basePath: string): Promise<{ entries: FileInfo[]; complete: boolean }> {
     const rootEntries = await this.list(basePath);
 
     const all: FileInfo[] = [];
+    let complete = true;
     const queue: Array<{ dir: string; entries: FileInfo[] }> = [
       { dir: basePath, entries: rootEntries },
     ];
@@ -141,7 +159,7 @@ export class Drive9Client {
             const subEntries = await this.list(fullPath);
             queue.push({ dir: fullPath, entries: subEntries });
           } catch {
-            // Subdirectory list failures are non-fatal.
+            complete = false;
           }
         } else {
           all.push({ ...entry, name: fullPath });
@@ -149,7 +167,7 @@ export class Drive9Client {
       }
     }
 
-    return all;
+    return { entries: all, complete };
   }
 
   private async request(
@@ -186,6 +204,10 @@ export class Drive9Client {
     }
 
     return resp;
+  }
+
+  private mutationHeaders(): Record<string, string> {
+    return this.actorId ? { "X-Dat9-Actor": this.actorId } : {};
   }
 }
 
