@@ -27,7 +27,7 @@ const (
 // Secret dispatches drive9 secret subcommands.
 func Secret(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: drive9 secret <set|get|exec|ls|rm|grant|revoke|audit> ...")
+		return fmt.Errorf("usage drive9 secret <set|get|exec|ls|rm|grant|revoke|audit> ...")
 	}
 	switch args[0] {
 	case "set":
@@ -47,7 +47,7 @@ func Secret(args []string) error {
 	case "audit":
 		return SecretAudit(args[1:])
 	case "-h", "--help", "help":
-		return fmt.Errorf("usage: drive9 secret <set|get|exec|ls|rm|grant|revoke|audit> ...")
+		return fmt.Errorf("usage drive9 secret <set|get|exec|ls|rm|grant|revoke|audit> ...")
 	default:
 		return fmt.Errorf("unknown secret command %q", args[0])
 	}
@@ -56,7 +56,7 @@ func Secret(args []string) error {
 // SecretSet creates or updates a secret.
 func SecretSet(args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage: drive9 secret set <name> <field=value|field=@file|field=->...")
+		return fmt.Errorf("usage drive9 secret set <name> <field=value|field=@file|field=->...")
 	}
 	name := args[0]
 	if err := validateSecretName(name); err != nil {
@@ -86,7 +86,7 @@ func SecretSet(args []string) error {
 // SecretGet reads a whole secret or one field.
 func SecretGet(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: drive9 secret get <name[/field]> [--json|--env]")
+		return fmt.Errorf("usage drive9 secret get <name[/field]> [--json|--env]")
 	}
 	ref := args[0]
 	name, field, err := parseSecretRef(ref)
@@ -147,7 +147,7 @@ func SecretGet(args []string) error {
 // SecretExec injects a secret into a child process environment and executes it.
 func SecretExec(args []string) error {
 	if len(args) < 3 {
-		return fmt.Errorf("usage: drive9 secret exec <name> -- <command...>")
+		return fmt.Errorf("usage drive9 secret exec <name> -- <command...>")
 	}
 	name := args[0]
 	if err := validateSecretName(name); err != nil {
@@ -161,7 +161,7 @@ func SecretExec(args []string) error {
 		}
 	}
 	if sep < 0 || sep == len(args)-1 {
-		return fmt.Errorf("usage: drive9 secret exec <name> -- <command...>")
+		return fmt.Errorf("usage drive9 secret exec <name> -- <command...>")
 	}
 	cmdArgs := args[sep+1:]
 
@@ -196,7 +196,7 @@ func SecretLs(args []string) error {
 		case "--json":
 			asJSON = true
 		default:
-			return fmt.Errorf("usage: drive9 secret ls [--json]")
+			return fmt.Errorf("usage drive9 secret ls [--json]")
 		}
 	}
 
@@ -244,7 +244,7 @@ func SecretLs(args []string) error {
 // SecretRm deletes a secret.
 func SecretRm(args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: drive9 secret rm <name>")
+		return fmt.Errorf("usage drive9 secret rm <name>")
 	}
 	name := args[0]
 	if err := validateSecretName(name); err != nil {
@@ -347,7 +347,7 @@ func SecretGrant(args []string) error {
 // SecretRevoke revokes a capability token.
 func SecretRevoke(args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: drive9 secret revoke <token-id>")
+		return fmt.Errorf("usage drive9 secret revoke <token-id>")
 	}
 	c, err := newVaultManagementClientFromEnv()
 	if err != nil {
@@ -425,7 +425,6 @@ func SecretAudit(args []string) error {
 			return fmt.Errorf("--since must be positive")
 		}
 		events = filterAuditEvents(events, agentID, time.Now().Add(-d))
-		agentID = ""
 	} else if agentID != "" {
 		events = filterAuditEvents(events, agentID, time.Time{})
 	}
@@ -622,14 +621,6 @@ func envMapFromSecret(fields map[string]string) map[string]string {
 		panic(err)
 	}
 	return env
-}
-
-func secretEnvVars(fields map[string]string) []string {
-	env, err := buildSecretEnvMap(fields)
-	if err != nil {
-		panic(err)
-	}
-	return mergeEnv(nil, env)
 }
 
 func filterAuditEvents(events []client.VaultAuditEvent, agentID string, since time.Time) []client.VaultAuditEvent {
