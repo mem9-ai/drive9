@@ -51,6 +51,35 @@ func TestValidateTiDBAppEmbeddingFilesTableRejectsGeneratedEmbedding(t *testing.
 	}
 }
 
+func TestValidateTiDBUploadsTableBaseAcceptsExpectedRevision(t *testing.T) {
+	if err := validateTiDBUploadsTableBase(testUploadsTableMeta(true)); err != nil {
+		t.Fatalf("expected uploads table to validate: %v", err)
+	}
+}
+
+func TestValidateTiDBUploadsTableBaseRejectsMissingExpectedRevision(t *testing.T) {
+	err := validateTiDBUploadsTableBase(testUploadsTableMeta(false))
+	if err == nil {
+		t.Fatal("expected missing expected_revision to fail validation")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "expected_revision") {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+}
+
+func TestLegacyTiDBUploadsRepairStatements(t *testing.T) {
+	if got := legacyTiDBUploadsRepairStatements(testUploadsTableMeta(true)); len(got) != 0 {
+		t.Fatalf("expected no repair statements when expected_revision exists, got %#v", got)
+	}
+	got := legacyTiDBUploadsRepairStatements(testUploadsTableMeta(false))
+	if len(got) != 1 {
+		t.Fatalf("expected one repair statement, got %#v", got)
+	}
+	if !strings.Contains(strings.ToLower(got[0]), "add column expected_revision") {
+		t.Fatalf("unexpected repair statement: %q", got[0])
+	}
+}
+
 func testFilesTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
 	meta := tidbTableMeta{
 		tableName: "files",
@@ -69,6 +98,21 @@ func testFilesTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
 			generationExpression: "embed_text(_utf8mb4'tidbcloud_free/amazon/titan-embed-text-v2', `content_text`, _utf8mb4'{\"dimensions\":1024}')",
 		}
 		return meta
+	}
+	return meta
+}
+
+func testUploadsTableMeta(includeExpectedRevision bool) tidbTableMeta {
+	meta := tidbTableMeta{
+		tableName: "uploads",
+		columns: map[string]tidbColumnMeta{
+			"upload_id":   {columnType: "varchar(64)"},
+			"target_path": {columnType: "varchar(512)"},
+			"status":      {columnType: "varchar(32)"},
+		},
+	}
+	if includeExpectedRevision {
+		meta.columns["expected_revision"] = tidbColumnMeta{columnType: "bigint"}
 	}
 	return meta
 }
