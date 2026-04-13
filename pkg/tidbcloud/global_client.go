@@ -8,13 +8,12 @@ import (
 
 // ClusterInfo holds cluster metadata returned from the global server.
 type ClusterInfo struct {
-	ClusterID     string
-	OrgID         uint64
-	Host          string
-	Port          int
-	Username      string
-	ProxyEndpoint string // cluster proxy HTTP endpoint for internal SQL execution
-	Version       string // TiDB version string (e.g. "v8.1.1")
+	ClusterID string
+	OrgID     uint64
+	Host      string
+	Port      int
+	Username  string
+	Version   string // TiDB version string (e.g. "v8.1.1")
 }
 
 // ZeroInstanceInfo holds connection info returned directly from the zero-instance service.
@@ -25,13 +24,6 @@ type ZeroInstanceInfo struct {
 	Port     int
 	Username string
 	Password string
-}
-
-// ServiceUser holds credentials for a newly created SQL user.
-type ServiceUser struct {
-	Username string
-	Password string
-	DBName   string // database the user has access to ("mysql" if role_admin granted, otherwise "_drive9_fs")
 }
 
 // GlobalClient abstracts calls to TiDB Cloud Global Server.

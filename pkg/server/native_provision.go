@@ -2,12 +2,14 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"regexp"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -22,10 +24,20 @@ import (
 	"github.com/mem9-ai/dat9/pkg/tidbcloud"
 )
 
+// nativeProvisionRequest holds the root database credentials sent by the client.
+type nativeProvisionRequest struct {
+	User     string `json:"user"`
+	Password string `json:"password"`
+}
+
 // handleNativeProvision handles the tidbcloud-native provision flow.
 // Two paths:
 //   - Zero instance: verify instance exists via Global Server, then provision by clusterID
 //   - Cluster: authorize via account service, then provision by clusterID
+//
+// Both paths require the caller to supply root database credentials in the
+// JSON request body ({"user":"...","password":"..."}). These are used to
+// create the fs_admin service user directly via the public load balancer.
 //
 // In both cases tenantID = clusterID (always populated by ParseHeaders).
 func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, target *tidbcloud.ResolvedTarget) {
@@ -50,8 +62,24 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 			"tenant_id", tenantID, "provider", provider, "target_type", "cluster")...)
 	}
 
-	// Both paths converge: provision by clusterID.
-	cluster, err := np.Provision(ctx, tenantID)
+	// Parse root database credentials from request body.
+	var req nativeProvisionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_bad_body", "tenant_id", tenantID, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "bad_request")
+		errJSON(w, http.StatusBadRequest, "invalid request body: user and password are required")
+		return
+	}
+	if req.User == "" || req.Password == "" {
+		logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_missing_creds", "tenant_id", tenantID)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "bad_request")
+		errJSON(w, http.StatusBadRequest, "user and password are required")
+		return
+	}
+
+	// Both paths converge: resolve cluster connection info (host/port),
+	// using the caller-supplied root credentials.
+	cluster, err := np.ProvisionWithRootCreds(ctx, tenantID, req.User, req.Password)
 
 	if err != nil {
 		if tidbcloud.IsNotFound(err) {
@@ -84,7 +112,7 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	// Encrypt cloud_admin password as the initial credential.
+	// Encrypt root password as the initial credential.
 	// The async goroutine will overwrite these with a dedicated service user
 	// (fs_admin) once created. If the server restarts before that happens,
 	// resumeProvisioningTenants re-runs the full nativeProvisionAsync flow
@@ -144,7 +172,7 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 	}
 
 	// Service user creation and schema init run in a background goroutine.
-	// The tenant is already persisted with status=provisioning and cloud_admin
+	// The tenant is already persisted with status=provisioning and root
 	// credentials, so /v1/status returns "provisioning" and server restarts
 	// can resume via resumeProvisioningTenants.
 	go s.nativeProvisionAsync(backgroundWithTrace(ctx), np, tenantID, cluster, provider)
@@ -160,106 +188,141 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 }
 
 // nativeProvisionAsync runs in a background goroutine after the tenant record
-// has been persisted. It creates a dedicated service user (fs_admin) via the
-// cluster proxy, updates the tenant DB credentials, then runs schema init.
-// GRANT role_admin is best-effort inside CreateServiceUser; fs_admin may have
-// limited privileges but we still attempt schema init with it.
+// has been persisted. It creates a dedicated service user (fs_admin) by
+// connecting directly with the caller-supplied root credentials, updates the
+// tenant DB credentials, then runs schema init.
 func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.Provisioner, tenantID string, cluster *tenant.ClusterInfo, provider string) {
-	// Step 1: create a dedicated service user via cluster proxy.
-	proxyInfo, err := np.GetClusterProxyInfo(ctx, tenantID)
-	if err != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_get_proxy_info_failed",
-			"tenant_id", tenantID, "error", err)...)
-		_ = s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed)
-		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		return
-	}
-	if proxyInfo == nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_no_proxy_endpoint",
-			"tenant_id", tenantID)...)
-		_ = s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed)
-		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		return
-	}
+	dbUser := cluster.Username
+	dbPassword := cluster.Password
+	dbName := "mysql"
 
-	svcUser, svcErr := np.CreateServiceUser(ctx, tenantID, proxyInfo)
-	if svcErr != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_create_svc_user_failed",
-			"tenant_id", tenantID, "error", svcErr)...)
-		_ = s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed)
-		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		return
-	}
-
-	dbUser := svcUser.Username
-	dbPassword := svcUser.Password
-	dbName := svcUser.DBName
-	logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_svc_user_created",
-		"tenant_id", tenantID, "db_user", dbUser, "db_name", dbName)...)
-
-	// Step 2: persist the service user credentials and database name.
-	cipherPass, encErr := s.pool.Encrypt(ctx, []byte(dbPassword))
-	if encErr != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_encrypt_db_password_failed",
-			"tenant_id", tenantID, "error", encErr)...)
-		_ = s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed)
-		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		return
-	}
-	if updErr := s.meta.UpdateTenantDBCredentials(ctx, tenantID, dbUser, cipherPass, dbName); updErr != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_update_db_creds_failed",
-			"tenant_id", tenantID, "error", updErr)...)
-		_ = s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed)
-		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		return
-	}
-	s.pool.Invalidate(tenantID)
-
-	// Step 3: if using a dedicated database, fs_admin creates it first.
-	if dbName != "mysql" {
-		bootDSN := tenantDSN(dbUser, dbPassword, cluster.Host, cluster.Port, "", true)
-		if err := createDatabaseIfNotExists(ctx, bootDSN, dbName); err != nil {
-			logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_create_db_failed",
-				"tenant_id", tenantID, "db_name", dbName, "error", err)...)
+	// If the persisted user is already fs_admin (resume after partial
+	// completion), skip user creation and go straight to schema init.
+	if !strings.HasSuffix(dbUser, ".fs_admin") && dbUser != "fs_admin" {
+		// Step 1: create fs_admin using root credentials via public LB.
+		fsUser, fsPassword, err := createFsAdminUser(ctx,
+			cluster.Host, cluster.Port, dbUser, dbPassword, true)
+		if err != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_create_fs_admin_failed",
+				"tenant_id", tenantID, "error", err)...)
 			_ = s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
 			return
 		}
+
+		dbUser = fsUser
+		dbPassword = fsPassword
+		logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_fs_admin_created",
+			"tenant_id", tenantID, "db_user", dbUser, "db_name", dbName)...)
+
+		// Step 2: persist the fs_admin credentials.
+		cipherPass, encErr := s.pool.Encrypt(ctx, []byte(dbPassword))
+		if encErr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_encrypt_db_password_failed",
+				"tenant_id", tenantID, "error", encErr)...)
+			_ = s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+			return
+		}
+		if updErr := s.meta.UpdateTenantDBCredentials(ctx, tenantID, dbUser, cipherPass, dbName); updErr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_update_db_creds_failed",
+				"tenant_id", tenantID, "error", updErr)...)
+			_ = s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+			return
+		}
+		s.pool.Invalidate(tenantID)
 	}
 
-	// Step 4: schema init with the service user's database.
+	// Step 3: schema init with fs_admin on mysql.
 	dsn := tenantDSN(dbUser, dbPassword, cluster.Host, cluster.Port, dbName, true)
 	s.initTenantSchemaAsync(ctx, tenantID, dsn, provider, np.InitSchema)
 }
 
-// validDBName matches safe database identifiers: ASCII letters, digits, underscores.
-var validDBName = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
-
-// createDatabaseIfNotExists connects to the cluster without a database and
-// executes CREATE DATABASE IF NOT EXISTS. Used when fs_admin cannot access the
-// default "mysql" database and needs a dedicated database.
-func createDatabaseIfNotExists(ctx context.Context, dsn, dbName string) error {
-	if !validDBName.MatchString(dbName) {
-		return fmt.Errorf("invalid database name: %q", dbName)
+// createFsAdminUser connects to the cluster with root credentials and creates
+// the fs_admin service user with full privileges on the mysql database.
+func createFsAdminUser(ctx context.Context, host string, port int, rootUser, rootPassword string, tlsEnabled bool) (string, string, error) {
+	prefix := extractUserPrefix(rootUser)
+	bareUser := "fs_admin"
+	qualifiedUser := bareUser
+	if prefix != "" {
+		qualifiedUser = prefix + "." + bareUser
 	}
 
+	password, err := generatePassword(32)
+	if err != nil {
+		return "", "", fmt.Errorf("generate password: %w", err)
+	}
+
+	dsn := tenantDSN(rootUser, rootPassword, host, port, "mysql", tlsEnabled)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		return fmt.Errorf("open bootstrap connection: %w", err)
+		return "", "", fmt.Errorf("open root connection: %w", err)
 	}
 	defer func() { _ = db.Close() }()
 
 	if err := db.PingContext(ctx); err != nil {
-		return fmt.Errorf("ping bootstrap connection: %w", err)
+		return "", "", fmt.Errorf("ping root connection: %w", err)
 	}
 
-	stmt := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", dbName)
-	if _, err := db.ExecContext(ctx, stmt); err != nil {
-		return fmt.Errorf("create database %s: %w", dbName, err)
+	escapedUser := escapeSQLString(qualifiedUser)
+	escapedPass := escapeSQLString(password)
+
+	stmts := []struct {
+		step string
+		stmt string
+	}{
+		{
+			step: "create user",
+			stmt: fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s'",
+				escapedUser, escapedPass),
+		},
+		{
+			step: "alter user",
+			stmt: fmt.Sprintf("ALTER USER '%s'@'%%' IDENTIFIED BY '%s'",
+				escapedUser, escapedPass),
+		},
+		{
+			step: "grant privileges",
+			stmt: fmt.Sprintf("GRANT ALL PRIVILEGES ON `mysql`.* TO '%s'@'%%'",
+				escapedUser),
+		},
 	}
 
-	logger.Info(ctx, "native_provision_database_created", zap.String("db_name", dbName))
-	return nil
+	for _, s := range stmts {
+		if _, err := db.ExecContext(ctx, s.stmt); err != nil {
+			return "", "", fmt.Errorf("%s: %w", s.step, err)
+		}
+	}
+
+	logger.Info(ctx, "native_provision_fs_admin_created_via_root",
+		zap.String("user", qualifiedUser),
+		zap.String("db", "mysql"))
+
+	return qualifiedUser, password, nil
+}
+
+// extractUserPrefix extracts the tenant prefix from a qualified username.
+// e.g. "pfx.root" → "pfx", "root" → ""
+func extractUserPrefix(username string) string {
+	if i := strings.LastIndex(username, "."); i >= 0 {
+		return username[:i]
+	}
+	return ""
+}
+
+func generatePassword(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func escapeSQLString(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `'`, `''`)
+	return s
 }
 
 // handleNativeTenantStatus checks for tidbcloud-native headers on /v1/status.

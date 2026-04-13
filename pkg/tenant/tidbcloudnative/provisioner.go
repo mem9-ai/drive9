@@ -14,7 +14,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -87,6 +86,34 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 	}, nil
 }
 
+// ProvisionWithRootCreds resolves cluster connection info via Global Server
+// and returns a ClusterInfo populated with the caller-provided root credentials.
+// Unlike Provision, it does not fetch or decrypt cloud_admin passwords.
+func (p *Provisioner) ProvisionWithRootCreds(ctx context.Context, tenantID, rootUser, rootPassword string) (*tenant.ClusterInfo, error) {
+	clusterID := tenantID
+
+	info, err := p.global.GetClusterInfo(ctx, clusterID)
+	if err != nil {
+		return nil, fmt.Errorf("get cluster info %s: %w", clusterID, err)
+	}
+
+	logger.Info(ctx, "tidbcloud_cluster_provisioned_with_root_creds",
+		zap.String("cluster_id", clusterID),
+		zap.String("host", info.Host),
+		zap.Int("port", info.Port))
+
+	return &tenant.ClusterInfo{
+		TenantID:  clusterID,
+		ClusterID: clusterID,
+		Host:      info.Host,
+		Port:      info.Port,
+		Username:  rootUser,
+		Password:  rootPassword,
+		DBName:    "mysql",
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}, nil
+}
+
 // VerifyZeroInstance calls the zero-instance service to confirm the instance ID
 // exists. This prevents forged instance IDs from reaching the provision path.
 func (p *Provisioner) VerifyZeroInstance(ctx context.Context, instanceID string) error {
@@ -113,85 +140,4 @@ func (p *Provisioner) Authorize(ctx context.Context, r *http.Request, clusterID 
 		return fmt.Errorf("%w: cluster %s does not belong to org %d", tidbcloud.ErrAuthForbidden, clusterID, orgID)
 	}
 	return nil
-}
-
-// ClusterProxyInfo holds the cluster proxy endpoint and credentials needed to
-// execute SQL via the proxy HTTP API.
-type ClusterProxyInfo struct {
-	ClusterID     uint64
-	ProxyEndpoint string
-	Username      string // cloud_admin username (with prefix)
-	Password      string // cloud_admin password (plaintext)
-}
-
-// GetClusterProxyInfo fetches the proxy endpoint and cloud_admin credentials
-// for the given cluster. Returns nil if no proxy endpoint is available.
-func (p *Provisioner) GetClusterProxyInfo(ctx context.Context, clusterID string) (*ClusterProxyInfo, error) {
-	info, err := p.global.GetClusterInfo(ctx, clusterID)
-	if err != nil {
-		return nil, fmt.Errorf("get cluster info %s: %w", clusterID, err)
-	}
-	if info.ProxyEndpoint == "" {
-		return nil, nil // no proxy available
-	}
-
-	encryptedPwd, err := p.global.GetEncryptedCloudAdminPwd(ctx, clusterID)
-	if err != nil {
-		return nil, fmt.Errorf("get encrypted password for cluster %s: %w", clusterID, err)
-	}
-	ciphertext, err := base64.StdEncoding.DecodeString(encryptedPwd)
-	if err != nil {
-		return nil, fmt.Errorf("decode encrypted password for cluster %s: %w", clusterID, err)
-	}
-	if p.enc == nil {
-		return nil, fmt.Errorf("decrypt password for cluster %s: provisioner encryptor is not configured", clusterID)
-	}
-	plaintext, err := p.enc.Decrypt(ctx, ciphertext)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt password for cluster %s: %w", clusterID, err)
-	}
-
-	cid, err := tidbcloud.ParseClusterIDUint64(clusterID)
-	if err != nil {
-		return nil, err
-	}
-
-	return &ClusterProxyInfo{
-		ClusterID:     cid,
-		ProxyEndpoint: info.ProxyEndpoint,
-		Username:      info.Username,
-		Password:      string(plaintext),
-	}, nil
-}
-
-// CreateServiceUser creates a dedicated fs_admin SQL user on the given cluster
-// via the cluster proxy HTTP API. The user is assigned the role_admin role via
-// GRANT ROLE (which does not require GRANT OPTION, unlike explicit privilege
-// GRANTs that fail with error 8121). Returns the ServiceUser credentials.
-func (p *Provisioner) CreateServiceUser(ctx context.Context, clusterID string, proxyInfo *ClusterProxyInfo) (*tidbcloud.ServiceUser, error) {
-	proxy := tidbcloud.NewClusterProxyClient(
-		proxyInfo.ProxyEndpoint, proxyInfo.ClusterID,
-		proxyInfo.Username, proxyInfo.Password)
-
-	userPrefix := extractUserPrefix(proxyInfo.Username)
-
-	svcUser, err := proxy.CreateServiceUser(ctx, userPrefix)
-	if err != nil {
-		return nil, fmt.Errorf("create service user on cluster %s: %w", clusterID, err)
-	}
-
-	logger.Info(ctx, "service_user_created_via_proxy",
-		zap.String("cluster_id", clusterID),
-		zap.String("user", svcUser.Username))
-
-	return svcUser, nil
-}
-
-// extractUserPrefix extracts the user prefix from a serverless username.
-// e.g. "2wCQKHWXMegHiR8.cloud_admin" → "2wCQKHWXMegHiR8"
-func extractUserPrefix(username string) string {
-	if i := strings.LastIndex(username, "."); i >= 0 {
-		return username[:i]
-	}
-	return ""
 }
