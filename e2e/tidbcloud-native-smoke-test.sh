@@ -20,6 +20,8 @@
 # Required environment variables:
 #   DRIVE9_BASE                  — server URL (e.g. https://fs.dev.tidbapi.com)
 #   TIDB_ZERO_INSTANCE_ID        — zero-instance ID from TiDB Cloud
+#   TIDB_ZERO_ROOT_USER          — root username (e.g. prefix.root)
+#   TIDB_ZERO_ROOT_PASSWORD      — root password
 #
 # Optional:
 #   POLL_TIMEOUT_S               — max wait for tenant to become active (default: 180)
@@ -31,6 +33,8 @@ set -euo pipefail
 
 BASE="${DRIVE9_BASE:?DRIVE9_BASE is required}"
 INSTANCE_ID="${TIDB_ZERO_INSTANCE_ID:?TIDB_ZERO_INSTANCE_ID is required}"
+ROOT_USER="${TIDB_ZERO_ROOT_USER:?TIDB_ZERO_ROOT_USER is required}"
+ROOT_PASSWORD="${TIDB_ZERO_ROOT_PASSWORD:?TIDB_ZERO_ROOT_PASSWORD is required}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-180}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 REQUEST_MAX_RETRIES="${REQUEST_MAX_RETRIES:-8}"
@@ -112,12 +116,18 @@ curl_body_code() {
 curl_native_provision() {
   local url="$1"
   local instance_id="$2"
+  local root_user="$3"
+  local root_password="$4"
 
   local body_file
   body_file="$(mktemp)"
+  local data
+  data=$(jq -n --arg u "$root_user" --arg p "$root_password" '{user: $u, password: $p}')
   local code
   code=$(curl -sS -o "$body_file" -w "%{http_code}" -X POST \
     -H "X-TIDBCLOUD-ZERO-INSTANCE-ID: $instance_id" \
+    -H "Content-Type: application/json" \
+    --data-binary "$data" \
     "$url")
   cat "$body_file"
   echo
@@ -141,7 +151,7 @@ NESTED_DIR="${ROOT_DIR}/sub/deep"
 
 # ──────────────────────────────────────────────────────────────
 step "1" "Provision tenant via X-TIDBCLOUD-ZERO-INSTANCE-ID"
-resp=$(curl_native_provision "$BASE/v1/provision" "$INSTANCE_ID")
+resp=$(curl_native_provision "$BASE/v1/provision" "$INSTANCE_ID" "$ROOT_USER" "$ROOT_PASSWORD")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 

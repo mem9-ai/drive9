@@ -230,10 +230,10 @@ func (s *Server) resumeProvisioningTenants() {
 func (s *Server) resumeTenantSchemaInit(t meta.Tenant) {
 	ctx := backgroundWithTrace(context.Background())
 
-	// For tidbcloud-native tenants that still have the initial cloud_admin
+	// For tidbcloud-native tenants that still have the initial root
 	// credentials (the async goroutine had not finished before a restart),
 	// re-run the full provision flow which creates fs_admin and then inits
-	// the schema with it. cloud_admin cannot connect through the public LB.
+	// the schema with it.
 	if t.Provider == tenant.ProviderTiDBCloudNative {
 		np, ok := s.provisioner.(*tidbcloudnative.Provisioner)
 		if !ok {
