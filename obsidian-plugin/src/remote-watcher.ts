@@ -1,5 +1,5 @@
 import { Platform } from "obsidian";
-import { Drive9Client } from "./client";
+import { Drive9Client, sanitizeError } from "./client";
 import type { ChangeEvent, ResetEvent } from "./types";
 
 const POLL_INTERVAL_MS = 30_000;
@@ -75,7 +75,7 @@ export class RemoteWatcher {
         try {
           await this.streamOnce();
         } catch (error) {
-          console.warn("[drive9] SSE disconnected", error);
+          console.warn("[drive9] SSE disconnected", error instanceof Error ? error.message : sanitizeError(String(error)));
         }
         if (this.stopped) return;
 
@@ -112,7 +112,7 @@ export class RemoteWatcher {
     try {
       await this.callbacks.onPoll();
     } catch (error) {
-      console.warn("[drive9] polling sync failed", error);
+      console.warn("[drive9] polling sync failed", error instanceof Error ? error.message : sanitizeError(String(error)));
     } finally {
       this.pollInFlight = false;
     }

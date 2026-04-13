@@ -1,6 +1,6 @@
 import { App, PluginSettingTab, Setting, Notice } from "obsidian";
 import type Drive9Plugin from "./main";
-import { Drive9Client } from "./client";
+import { Drive9Client, sanitizeError } from "./client";
 
 export class Drive9SettingTab extends PluginSettingTab {
   private validateTimer: ReturnType<typeof setTimeout> | null = null;
@@ -158,9 +158,16 @@ export class Drive9SettingTab extends PluginSettingTab {
 
       const content = fs.readFileSync(gitignorePath, "utf-8");
       const lines = content.split("\n").map((l: string) => l.trim());
-      const coversObsidian = lines.some((l: string) =>
-        l === ".obsidian" || l === ".obsidian/" || l === ".obsidian/**" || l === ".obsidian/*",
-      );
+      const coversObsidian = lines.some((l: string) => {
+        // Strip comments and empty lines
+        if (!l || l.startsWith("#")) return false;
+        // Match common patterns that cover .obsidian/ or the plugin data dir
+        return /^\/?\.obsidian(\/.*)?$/.test(l)
+          || l === ".obsidian"
+          || l === ".obsidian/"
+          || l === ".obsidian/**"
+          || l === ".obsidian/*";
+      });
 
       if (!coversObsidian) {
         this.addGitignoreWarning(containerEl, ".gitignore does not cover .obsidian/ — your API key could be committed to git.");
@@ -182,8 +189,3 @@ export class Drive9SettingTab extends PluginSettingTab {
   }
 }
 
-/** Strip any potential API key / auth token from error messages. */
-function sanitizeError(msg: string): string {
-  // Remove Bearer tokens
-  return msg.replace(/Bearer\s+\S+/gi, "Bearer ***");
-}
