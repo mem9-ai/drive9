@@ -745,17 +745,17 @@ func TestOpenWritableLargeFileGetsLazyPreload(t *testing.T) {
 	}
 }
 
-func TestDefaultTTLIs1Second(t *testing.T) {
+func TestDefaultTTLIs10Seconds(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	if opts.AttrTTL != 1*time.Second {
-		t.Fatalf("default AttrTTL = %v, want 1s", opts.AttrTTL)
+	if opts.AttrTTL != 10*time.Second {
+		t.Fatalf("default AttrTTL = %v, want 10s", opts.AttrTTL)
 	}
-	if opts.EntryTTL != 1*time.Second {
-		t.Fatalf("default EntryTTL = %v, want 1s", opts.EntryTTL)
+	if opts.EntryTTL != 10*time.Second {
+		t.Fatalf("default EntryTTL = %v, want 10s", opts.EntryTTL)
 	}
-	if opts.NegativeEntryTTL != 1*time.Second {
-		t.Fatalf("default NegativeEntryTTL = %v, want 1s", opts.NegativeEntryTTL)
+	if opts.NegativeEntryTTL != 10*time.Second {
+		t.Fatalf("default NegativeEntryTTL = %v, want 10s", opts.NegativeEntryTTL)
 	}
 }
 

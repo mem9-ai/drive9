@@ -43,13 +43,13 @@ func (o *MountOptions) setDefaults() {
 		o.DirTTL = defaultDirCacheTTL
 	}
 	if o.AttrTTL <= 0 {
-		o.AttrTTL = 1 * time.Second
+		o.AttrTTL = 10 * time.Second
 	}
 	if o.EntryTTL <= 0 {
-		o.EntryTTL = 1 * time.Second
+		o.EntryTTL = 10 * time.Second
 	}
 	if o.NegativeEntryTTL <= 0 {
-		o.NegativeEntryTTL = 1 * time.Second
+		o.NegativeEntryTTL = 10 * time.Second
 	}
 	// FlushDebounce: 0 means disabled, negative means unset (use default).
 	if o.FlushDebounce < 0 {
