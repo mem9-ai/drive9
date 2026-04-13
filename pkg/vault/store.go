@@ -158,7 +158,7 @@ func (s *Store) ListSecrets(ctx context.Context, tenantID string) ([]*Secret, er
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var secrets []*Secret
 	for rows.Next() {
@@ -279,7 +279,7 @@ func (s *Store) ReadSecretFields(ctx context.Context, tenantID, name string) (ma
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	fields := make(map[string][]byte)
 	for rows.Next() {
@@ -462,7 +462,7 @@ func (s *Store) QueryAuditLog(ctx context.Context, tenantID string, secretName s
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var events []*AuditEvent
 	for rows.Next() {

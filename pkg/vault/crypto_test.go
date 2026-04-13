@@ -136,7 +136,7 @@ func TestCapTokenSignVerify(t *testing.T) {
 
 func TestCapTokenExpired(t *testing.T) {
 	key := make([]byte, 32)
-	rand.Read(key)
+	_, _ = rand.Read(key)
 	mk, _ := NewMasterKey(key)
 	csk := mk.DeriveCSK("tenant-1")
 
@@ -160,7 +160,7 @@ func TestCapTokenExpired(t *testing.T) {
 
 func TestCapTokenBadSignature(t *testing.T) {
 	key := make([]byte, 32)
-	rand.Read(key)
+	_, _ = rand.Read(key)
 	mk, _ := NewMasterKey(key)
 	csk := mk.DeriveCSK("tenant-1")
 
@@ -186,7 +186,7 @@ func TestCapTokenBadSignature(t *testing.T) {
 
 func TestPeekCapTokenTenantID(t *testing.T) {
 	key := make([]byte, 32)
-	rand.Read(key)
+	_, _ = rand.Read(key)
 	mk, _ := NewMasterKey(key)
 	csk := mk.DeriveCSK("tenant-42")
 
@@ -218,7 +218,7 @@ func TestPeekCapTokenTenantID(t *testing.T) {
 
 func TestDeriveCSKDifferentTenants(t *testing.T) {
 	key := make([]byte, 32)
-	rand.Read(key)
+	_, _ = rand.Read(key)
 	mk, _ := NewMasterKey(key)
 
 	csk1 := mk.DeriveCSK("tenant-1")

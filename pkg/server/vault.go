@@ -530,7 +530,7 @@ func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, v
 	case "env":
 		w.Header().Set("Content-Type", "text/plain")
 		for k, v := range fields {
-			fmt.Fprintf(w, "%s=%s\n", strings.ToUpper(k), string(v))
+			_, _ = fmt.Fprintf(w, "%s=%s\n", strings.ToUpper(k), string(v))
 		}
 	case "json", "":
 		result := make(map[string]string, len(fields))
