@@ -59,6 +59,15 @@ export interface SyncState {
   remoteRevision: number | null;
   syncedAt: number;
   status: "synced" | "local_dirty" | "remote_dirty" | "remote_deleted" | "conflict" | "needs_refresh";
+  /** SHA-256 hex of content at last successful sync (for 3-way merge base). */
+  lastSyncedContentHash?: string;
+  /**
+   * How a remote_deleted status was detected.
+   * 'polling' requires 2 consecutive absences before apply; 'sse' is immediate.
+   */
+  deleteDetectionSource?: "polling" | "sse";
+  /** Number of consecutive polls where this file was absent from remote. */
+  consecutiveAbsences?: number;
 }
 
 /** Persisted plugin data (settings + sync state). */

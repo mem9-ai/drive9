@@ -1,6 +1,7 @@
 import { Vault, TFile, TAbstractFile, Notice } from "obsidian";
 import { Drive9Client, Drive9Error } from "./client";
 import { IgnoreMatcher } from "./ignore";
+import type { ShadowStore } from "./shadow-store";
 import type { SyncState, Drive9Settings } from "./types";
 
 export type SyncStatus = "idle" | "syncing" | "error";
@@ -21,6 +22,8 @@ export class SyncEngine {
   private _pendingCount = 0;
   private statusListeners: Array<() => void> = [];
 
+  private shadowStore: ShadowStore | null = null;
+
   constructor(
     private vault: Vault,
     private client: Drive9Client,
@@ -29,6 +32,10 @@ export class SyncEngine {
     private persistData: () => Promise<void>,
   ) {
     this.ignoreMatcher = new IgnoreMatcher(settings.ignorePaths);
+  }
+
+  setShadowStore(store: ShadowStore): void {
+    this.shadowStore = store;
   }
 
   get status(): SyncStatus {
@@ -86,12 +93,12 @@ export class SyncEngine {
     }
   }
 
-  async onRemoteChange(path: string, _op: string): Promise<void> {
+  async onRemoteChange(path: string, op: string): Promise<void> {
     if (this.shouldIgnore(path)) return;
     await this.enqueue(async () => {
       this.setStatus("syncing", 1);
       try {
-        await this.reconcileRemotePath(path);
+        await this.reconcileRemotePath(path, op === "delete" ? "sse" : undefined);
       } finally {
         this.setStatus("idle", this.dirtyPaths.size);
         await this.persistData();
@@ -219,6 +226,7 @@ export class SyncEngine {
 
     try {
       const result = await this.client.write(path, data, expectedRevision);
+      const contentHash = await this.saveShadowIfAvailable(data);
       if (result.revision !== null) {
         this.syncStates[path] = {
           path,
@@ -227,6 +235,7 @@ export class SyncEngine {
           remoteRevision: result.revision,
           syncedAt: Date.now(),
           status: "synced",
+          lastSyncedContentHash: contentHash,
         };
       } else {
         this.syncStates[path] = {
@@ -236,6 +245,7 @@ export class SyncEngine {
           remoteRevision: null,
           syncedAt: Date.now(),
           status: "needs_refresh",
+          lastSyncedContentHash: contentHash,
         };
         console.warn(`[drive9] write succeeded but revision unknown for ${path}`);
       }
@@ -270,7 +280,7 @@ export class SyncEngine {
     return (this.suppressedPaths.get(path) ?? 0) > 0;
   }
 
-  private async withSuppressedLocalEvents(path: string, fn: () => Promise<void>): Promise<void> {
+  async withSuppressedLocalEvents(path: string, fn: () => Promise<void>): Promise<void> {
     this.suppressedPaths.set(path, (this.suppressedPaths.get(path) ?? 0) + 1);
     try {
       await fn();
@@ -310,7 +320,7 @@ export class SyncEngine {
     return state.localMtime === file.stat.mtime && state.localSize === file.stat.size;
   }
 
-  private async reconcileRemotePath(path: string): Promise<void> {
+  private async reconcileRemotePath(path: string, deleteSource?: "polling" | "sse"): Promise<void> {
     const state = this.syncStates[path];
     if (state?.status === "conflict") {
       return;
@@ -324,7 +334,7 @@ export class SyncEngine {
       remoteRevision = remoteStat.revision;
     } catch (error) {
       if (error instanceof Drive9Error && error.status === 404) {
-        await this.handleRemoteMissing(path);
+        await this.handleRemoteMissing(path, deleteSource ?? "polling");
         return;
       }
       throw error;
@@ -346,7 +356,7 @@ export class SyncEngine {
     await this.pullRemoteFile(path, remoteRevision, localFile);
   }
 
-  private async handleRemoteMissing(path: string): Promise<void> {
+  private async handleRemoteMissing(path: string, source: "polling" | "sse" = "polling"): Promise<void> {
     const state = this.syncStates[path];
     if (!state || state.status === "conflict") return;
 
@@ -356,8 +366,18 @@ export class SyncEngine {
       return;
     }
 
+    if (state.status === "remote_deleted") {
+      // Already marked — increment consecutive absence count for polling
+      if (source === "polling") {
+        state.consecutiveAbsences = (state.consecutiveAbsences ?? 1) + 1;
+      }
+      return;
+    }
+
     state.status = "remote_deleted";
     state.syncedAt = Date.now();
+    state.deleteDetectionSource = source;
+    state.consecutiveAbsences = source === "polling" ? 1 : undefined;
   }
 
   private markConflict(path: string, localFile: TFile | null, remoteRevision: number | null): void {
@@ -393,6 +413,7 @@ export class SyncEngine {
       }
     });
 
+    const contentHash = await this.saveShadowIfAvailable(data);
     const updatedFile = this.getLocalFile(path);
     this.syncStates[path] = {
       path,
@@ -401,7 +422,17 @@ export class SyncEngine {
       remoteRevision,
       syncedAt: Date.now(),
       status: "synced",
+      lastSyncedContentHash: contentHash,
     };
+  }
+
+  private async saveShadowIfAvailable(data: ArrayBuffer): Promise<string | undefined> {
+    if (!this.shadowStore) return undefined;
+    try {
+      return await this.shadowStore.save(data);
+    } catch {
+      return undefined;
+    }
   }
 
   private setStatus(status: SyncStatus, pending: number): void {
