@@ -1,5 +1,6 @@
 import { Vault, TFile, Modal, App, Setting, Notice } from "obsidian";
 import { Drive9Client, Drive9Error } from "./client";
+import type { ShadowStore } from "./shadow-store";
 import type { SyncState } from "./types";
 import { IgnoreMatcher } from "./ignore";
 
@@ -166,6 +167,7 @@ export async function pullAllRemote(
   client: Drive9Client,
   syncStates: Record<string, SyncState>,
   ignorePaths: string[],
+  shadowStore?: ShadowStore,
 ): Promise<void> {
   const ignore = new IgnoreMatcher(ignorePaths);
   const entries = await client.listRecursive("/");
@@ -190,6 +192,11 @@ export async function pullAllRemote(
       await vault.createBinary(entry.name, data);
     }
 
+    let contentHash: string | undefined;
+    if (shadowStore) {
+      try { contentHash = await shadowStore.save(data); } catch { /* ignore */ }
+    }
+
     const file = vault.getAbstractFileByPath(entry.name);
     if (file instanceof TFile) {
       let revision: number | null = null;
@@ -204,6 +211,7 @@ export async function pullAllRemote(
         remoteRevision: revision,
         syncedAt: Date.now(),
         status: revision !== null ? "synced" : "needs_refresh",
+        lastSyncedContentHash: contentHash,
       };
     }
     count++;

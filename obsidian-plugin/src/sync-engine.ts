@@ -23,6 +23,7 @@ export class SyncEngine {
   private statusListeners: Array<() => void> = [];
 
   private shadowStore: ShadowStore | null = null;
+  private extraIgnoreCheck: ((path: string) => boolean) | null = null;
 
   constructor(
     private vault: Vault,
@@ -36,6 +37,11 @@ export class SyncEngine {
 
   setShadowStore(store: ShadowStore): void {
     this.shadowStore = store;
+  }
+
+  /** Register an additional ignore check (e.g. for conflict resolver ignored paths). */
+  setExtraIgnoreCheck(fn: (path: string) => boolean): void {
+    this.extraIgnoreCheck = fn;
   }
 
   get status(): SyncStatus {
@@ -135,7 +141,9 @@ export class SyncEngine {
   }
 
   private shouldIgnore(path: string): boolean {
-    return this.ignoreMatcher.isIgnored(path);
+    if (this.ignoreMatcher.isIgnored(path)) return true;
+    if (this.extraIgnoreCheck?.(path)) return true;
+    return false;
   }
 
   private markDirty(path: string): void {

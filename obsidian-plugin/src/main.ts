@@ -15,6 +15,7 @@ export default class Drive9Plugin extends Plugin {
   private remoteWatcher: RemoteWatcher | null = null;
   private syncEngine!: SyncEngine;
   private conflictResolver!: ConflictResolver;
+  private shadowStore!: ShadowStore;
   private resolutionTimer: ReturnType<typeof setInterval> | null = null;
   private shadowGCTimer: ReturnType<typeof setInterval> | null = null;
   private syncStates: Record<string, SyncState> = {};
@@ -44,8 +45,8 @@ export default class Drive9Plugin extends Plugin {
       () => this.savePluginData(),
     );
 
-    const shadowStore = new ShadowStore(this.app.vault.adapter);
-    this.syncEngine.setShadowStore(shadowStore);
+    this.shadowStore = new ShadowStore(this.app.vault.adapter);
+    this.syncEngine.setShadowStore(this.shadowStore);
 
     this.conflictResolver = new ConflictResolver(
       this.app,
@@ -54,6 +55,8 @@ export default class Drive9Plugin extends Plugin {
       this.syncStates,
       () => this.savePluginData(),
     );
+
+    this.syncEngine.setExtraIgnoreCheck((path) => this.conflictResolver.isIgnoredPath(path));
 
     this.remoteWatcher = new RemoteWatcher(this.client, {
       onChange: (event) => this.syncEngine.onRemoteChange(event.path, event.op),
@@ -148,6 +151,7 @@ export default class Drive9Plugin extends Plugin {
           this.client,
           this.syncStates,
           this.settings.ignorePaths,
+          this.shadowStore,
         );
         break;
 
@@ -179,6 +183,9 @@ export default class Drive9Plugin extends Plugin {
                   // Leave revision unknown; push path will refresh before write.
                 }
               }
+              try {
+                state.lastSyncedContentHash = await this.shadowStore.save(data);
+              } catch { /* shadow save is best-effort */ }
               const pulled = this.app.vault.getAbstractFileByPath(path);
               if (pulled instanceof TFile) {
                 state.localMtime = pulled.stat.mtime;
