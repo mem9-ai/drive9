@@ -174,12 +174,13 @@ func TestCreateServiceUser_NoPrefix(t *testing.T) {
 }
 
 func TestCreateServiceUser_SQLFailure_IncludesStep(t *testing.T) {
+	// Phase 1 failure (CREATE USER) must still be fatal.
 	callCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		callCount++
 		w.Header().Set("Content-Type", "application/json")
-		if callCount == 3 { // fail on GRANT (3rd statement)
-			_, _ = w.Write([]byte(`{"errNumber":8121,"errMessage":"privilege check fail"}`))
+		if callCount == 1 { // fail on CREATE USER (1st statement)
+			_, _ = w.Write([]byte(`{"errNumber":1396,"errMessage":"create user failed"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"errNumber":0,"errMessage":""}`))
@@ -198,8 +199,43 @@ func TestCreateServiceUser_SQLFailure_IncludesStep(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if !strings.Contains(err.Error(), "grant role_admin") {
-		t.Fatalf("expected error to mention step 'grant role_admin', got: %v", err)
+	if !strings.Contains(err.Error(), "create user") {
+		t.Fatalf("expected error to mention step 'create user', got: %v", err)
+	}
+}
+
+func TestCreateServiceUser_GrantFailure_BestEffort(t *testing.T) {
+	// Phase 2 failure (GRANT role_admin) should be non-fatal.
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		if callCount == 3 { // fail on GRANT (3rd statement)
+			_, _ = w.Write([]byte(`{"errNumber":1227,"errMessage":"Access denied; need ROLE_ADMIN"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"errNumber":0,"errMessage":""}`))
+	}))
+	defer srv.Close()
+
+	c := &ClusterProxyClient{
+		baseURL:   srv.URL,
+		clusterID: 1,
+		username:  "u",
+		password:  "p",
+		client:    srv.Client(),
+	}
+
+	svc, err := c.CreateServiceUser(context.Background(), "pfx")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if svc.Username != "pfx.fs_admin" {
+		t.Fatalf("got username %q, want %q", svc.Username, "pfx.fs_admin")
+	}
+	// GRANT failed at call 3, SET DEFAULT ROLE (call 4) should be skipped.
+	if callCount != 3 {
+		t.Fatalf("expected 3 proxy calls (create + alter + grant), got %d", callCount)
 	}
 }
 
