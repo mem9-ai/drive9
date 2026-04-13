@@ -196,10 +196,35 @@ func ValidateTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) error {
 	if err := validateTiDBTableForMode(mode, filesMeta); err != nil {
 		return fmt.Errorf("files schema contract: %w", err)
 	}
+	uploadsMeta, err := loadTiDBTableMeta(db, "uploads")
+	if err != nil {
+		return fmt.Errorf("load uploads table metadata: %w", err)
+	}
+	if err := validateTiDBUploadsTableBase(uploadsMeta); err != nil {
+		return fmt.Errorf("uploads schema contract: %w", err)
+	}
 	if err := ensureTiDBTableExists(db, "semantic_tasks"); err != nil {
 		return fmt.Errorf("semantic_tasks schema contract: %w", err)
 	}
 	return nil
+}
+
+// EnsureTiDBSchemaForMode repairs known launch-schema drift that can be fixed
+// in place, then validates the full TiDB schema contract for the requested mode.
+func EnsureTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) error {
+	if db == nil {
+		return fmt.Errorf("nil db")
+	}
+	if !IsTiDBCluster(db) {
+		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
+	}
+	if err := validateTiDBSchemaMode(mode); err != nil {
+		return err
+	}
+	if err := repairLegacyTiDBUploadsSchema(db); err != nil {
+		return fmt.Errorf("repair uploads schema: %w", err)
+	}
+	return ValidateTiDBSchemaForMode(db, mode)
 }
 
 func validateTiDBSchemaMode(mode TiDBEmbeddingMode) error {
@@ -352,6 +377,34 @@ func validateTiDBFilesTableBase(meta tidbTableMeta) error {
 		return err
 	}
 	return meta.requireColumnType("embedding_revision", "bigint")
+}
+
+func validateTiDBUploadsTableBase(meta tidbTableMeta) error {
+	if err := meta.requireColumnType("upload_id", "varchar(64)"); err != nil {
+		return err
+	}
+	if err := meta.requireColumnType("target_path", "varchar(512)"); err != nil {
+		return err
+	}
+	if err := meta.requireColumnType("status", "varchar(32)"); err != nil {
+		return err
+	}
+	return meta.requireColumnType("expected_revision", "bigint")
+}
+
+func repairLegacyTiDBUploadsSchema(db *sql.DB) error {
+	uploadsMeta, err := loadTiDBTableMeta(db, "uploads")
+	if err != nil {
+		return fmt.Errorf("load uploads table metadata: %w", err)
+	}
+	return ExecSchemaStatements(db, legacyTiDBUploadsRepairStatements(uploadsMeta))
+}
+
+func legacyTiDBUploadsRepairStatements(meta tidbTableMeta) []string {
+	if _, ok := meta.columns["expected_revision"]; ok {
+		return nil
+	}
+	return []string{`ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL`}
 }
 
 func loadTiDBTableMeta(db *sql.DB, tableName string) (tidbTableMeta, error) {
