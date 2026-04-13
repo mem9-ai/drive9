@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -11,7 +12,9 @@ import (
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
+	"github.com/mem9-ai/dat9/pkg/tidbcloud"
 )
 
 type scopeKey int
@@ -34,8 +37,21 @@ func withScope(ctx context.Context, scope *TenantScope) context.Context {
 	return context.WithValue(ctx, tenantScopeKey, scope)
 }
 
-func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret []byte, next http.Handler) http.Handler {
+func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret []byte, provisioner tenant.Provisioner, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Try tidbcloud-native header auth first.
+		if scope, release, handled := nativeAuthScope(w, r, metaStore, pool, provisioner); handled {
+			if scope == nil {
+				// nativeAuthScope wrote the error response already.
+				return
+			}
+			if release != nil {
+				defer release()
+			}
+			next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
+			return
+		}
+
 		tok := bearerToken(r)
 		if tok == "" {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_missing_token")...)
@@ -144,6 +160,112 @@ func poolDecryptToken(ctx context.Context, pool *tenant.Pool, cipher []byte) ([]
 	// Decrypt is tenant-independent and uses pool encryptor shared for API key storage.
 	// Keep this helper to avoid exposing raw encryptor in handlers.
 	return pool.Decrypt(ctx, cipher)
+}
+
+// nativeAuthScope checks for tidbcloud-native headers and returns a TenantScope
+// if native auth succeeds. Returns (nil, nil, true) if headers were present but auth
+// failed (error already written to w). Returns (nil, nil, false) if no native headers.
+func nativeAuthScope(w http.ResponseWriter, r *http.Request, metaStore *meta.Store, pool *tenant.Pool, provisioner tenant.Provisioner) (*TenantScope, func(), bool) {
+	target, err := tidbcloud.ParseHeaders(r)
+	if err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_bad_tidbcloud_header", "error", err)...)
+		metricEvent(r.Context(), "auth", "result", "bad_tidbcloud_header")
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return nil, nil, true
+	}
+	if target == nil {
+		return nil, nil, false
+	}
+
+	np, ok := provisioner.(*tidbcloudnative.Provisioner)
+	if !ok {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_native_not_configured")...)
+		metricEvent(r.Context(), "auth", "result", "native_not_configured")
+		errJSON(w, http.StatusBadRequest, fmt.Sprintf("unsupported %s header", tidbcloud.HeaderForTarget(target.Type)))
+		return nil, nil, true
+	}
+
+	ctx := r.Context()
+
+	switch target.Type {
+	case tidbcloud.TargetZeroInstance:
+		if err := np.VerifyZeroInstance(ctx, target.InstanceID); err != nil {
+			if tidbcloud.IsNotFound(err) {
+				logger.Warn(ctx, "server_event", eventFields(ctx, "auth_native_instance_not_found", "instance_id", target.InstanceID)...)
+				metricEvent(ctx, "auth", "result", "instance_not_found")
+				errJSON(w, http.StatusNotFound, err.Error())
+				return nil, nil, true
+			}
+			logger.Error(ctx, "server_event", eventFields(ctx, "auth_native_verify_instance_failed", "instance_id", target.InstanceID, "error", err)...)
+			metricEvent(ctx, "auth", "result", "verify_instance_failed")
+			errJSON(w, http.StatusBadGateway, fmt.Sprintf("verify instance failed: %v", err))
+			return nil, nil, true
+		}
+	case tidbcloud.TargetCluster:
+		if authErr := np.Authorize(ctx, r, target.ClusterID); authErr != nil {
+			if status, ok := tidbcloud.IsAuthError(authErr); ok {
+				logger.Warn(ctx, "server_event", eventFields(ctx, "auth_native_auth_failed", "cluster_id", target.ClusterID, "error", authErr)...)
+				metricEvent(ctx, "auth", "result", "auth_failed")
+				errJSON(w, status, authErr.Error())
+				return nil, nil, true
+			}
+			logger.Error(ctx, "server_event", eventFields(ctx, "auth_native_auth_failed", "cluster_id", target.ClusterID, "error", authErr)...)
+			metricEvent(ctx, "auth", "result", "auth_failed")
+			errJSON(w, http.StatusForbidden, authErr.Error())
+			return nil, nil, true
+		}
+	}
+
+	tenantID := target.ClusterID
+	t, err := metaStore.GetTenant(ctx, tenantID)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			logger.Warn(ctx, "server_event", eventFields(ctx, "auth_native_tenant_not_found", "tenant_id", tenantID)...)
+			metricEvent(ctx, "auth", "result", "tenant_not_found")
+			errJSON(w, http.StatusNotFound, "tenant not found")
+			return nil, nil, true
+		}
+		logger.Error(ctx, "server_event", eventFields(ctx, "auth_native_meta_error", "tenant_id", tenantID, "error", err)...)
+		metricEvent(ctx, "auth", "result", "meta_error")
+		errJSON(w, http.StatusInternalServerError, "meta backend unavailable")
+		return nil, nil, true
+	}
+
+	switch t.Status {
+	case meta.TenantActive:
+	case meta.TenantProvisioning:
+		logger.Warn(ctx, "server_event", eventFields(ctx, "tenant_provisioning", "tenant_id", t.ID)...)
+		metricEvent(ctx, "tenant_status", "status", string(meta.TenantProvisioning))
+		errJSON(w, http.StatusServiceUnavailable, "tenant is provisioning")
+		return nil, nil, true
+	case meta.TenantFailed:
+		logger.Warn(ctx, "server_event", eventFields(ctx, "tenant_failed", "tenant_id", t.ID)...)
+		metricEvent(ctx, "tenant_status", "status", string(meta.TenantFailed))
+		errJSON(w, http.StatusServiceUnavailable, "tenant provisioning failed")
+		return nil, nil, true
+	case meta.TenantSuspended, meta.TenantDeleted:
+		pool.Invalidate(t.ID)
+		logger.Warn(ctx, "server_event", eventFields(ctx, "tenant_blocked", "tenant_id", t.ID, "status", t.Status)...)
+		metricEvent(ctx, "tenant_status", "status", string(t.Status))
+		errJSON(w, http.StatusForbidden, "tenant is suspended")
+		return nil, nil, true
+	default:
+		logger.Warn(ctx, "server_event", eventFields(ctx, "tenant_unavailable", "tenant_id", t.ID, "status", t.Status)...)
+		metricEvent(ctx, "tenant_status", "status", string(t.Status))
+		errJSON(w, http.StatusForbidden, "tenant is unavailable")
+		return nil, nil, true
+	}
+
+	b, release, err := pool.Acquire(ctx, t)
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "backend_load_failed", "tenant_id", t.ID, "error", err)...)
+		metricEvent(ctx, "tenant_backend", "result", "load_failed")
+		errJSON(w, http.StatusInternalServerError, "backend unavailable")
+		return nil, nil, true
+	}
+	metricEvent(ctx, "auth", "result", "ok_native")
+
+	return &TenantScope{TenantID: t.ID, Backend: b}, release, true
 }
 
 func bearerToken(r *http.Request) string {
