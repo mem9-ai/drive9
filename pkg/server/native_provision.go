@@ -78,17 +78,25 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	// DB credentials left empty; the async goroutine writes them after
-	// determining the best credentials (service user or cloud_admin fallback).
-	// While status=provisioning the auth middleware returns 503, so no one
-	// will attempt to use the empty credentials.
+	// Encrypt cloud_admin password as the initial fallback credential.
+	// The async goroutine may overwrite these with a dedicated service user,
+	// but storing valid credentials now ensures resumeProvisioningTenants
+	// can decrypt and use them if the server restarts mid-provision.
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_db_password_failed", "tenant_id", tenantID, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		errJSON(w, http.StatusInternalServerError, "failed to encrypt db password")
+		return
+	}
+
 	if err := s.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantProvisioning,
 		DBHost:           cluster.Host,
 		DBPort:           cluster.Port,
-		DBUser:           "",
-		DBPasswordCipher: []byte{},
+		DBUser:           cluster.Username,
+		DBPasswordCipher: cipherPass,
 		DBName:           cluster.DBName,
 		DBTLS:            true,
 		Provider:         provider,
@@ -128,9 +136,10 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	// Everything heavy (proxy info, service user creation, schema init) runs
-	// in a background goroutine. The tenant is already persisted with
-	// status=provisioning, so /v1/status returns "provisioning" immediately.
+	// Service user creation and schema init run in a background goroutine.
+	// The tenant is already persisted with status=provisioning and cloud_admin
+	// credentials, so /v1/status returns "provisioning" and server restarts
+	// can resume via resumeProvisioningTenants.
 	go s.nativeProvisionAsync(backgroundWithTrace(ctx), np, tenantID, cluster, provider)
 
 	logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_accepted", "tenant_id", tenantID, "provider", provider)...)
@@ -144,33 +153,26 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 }
 
 // nativeProvisionAsync runs in a background goroutine after the tenant record
-// has been persisted. It tries to create a dedicated service user via the
-// cluster proxy, updates the tenant DB credentials if successful, then runs
-// schema init. On success it marks the tenant active; on exhausted retries it
-// marks the tenant failed.
+// has been persisted. It tries to create a dedicated service user via
+// SqlUserService gRPC, falls back to the existing cluster credentials if that
+// fails, updates the tenant DB credentials, then runs schema init. On success
+// it marks the tenant active; on unrecoverable errors it marks the tenant failed.
 func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.Provisioner, tenantID string, cluster *tenant.ClusterInfo, provider string) {
 	dbUser := cluster.Username
 	dbPassword := cluster.Password
 
 	// Step 1: try to create a dedicated service user via SqlUserService gRPC.
-	clusterInfo, err := np.GetClusterInfo(ctx, tenantID)
-	if err != nil {
-		logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_get_cluster_info_failed",
-			"tenant_id", tenantID, "error", err)...)
-		// Fall through: use cloud_admin credentials.
+	svcUser, svcErr := np.CreateServiceUser(ctx, tenantID, cluster.Username)
+	if svcErr != nil {
+		logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_create_svc_user_failed",
+			"tenant_id", tenantID, "error", svcErr)...)
+		logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_fallback_cloud_admin",
+			"tenant_id", tenantID, "db_user", dbUser)...)
 	} else {
-		svcUser, svcErr := np.CreateServiceUser(ctx, tenantID, clusterInfo)
-		if svcErr != nil {
-			logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_create_svc_user_failed",
-				"tenant_id", tenantID, "error", svcErr)...)
-			logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_fallback_cloud_admin",
-				"tenant_id", tenantID, "db_user", dbUser)...)
-		} else {
-			dbUser = svcUser.Username
-			dbPassword = svcUser.Password
-			logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_svc_user_created",
-				"tenant_id", tenantID, "db_user", dbUser)...)
-		}
+		dbUser = svcUser.Username
+		dbPassword = svcUser.Password
+		logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_svc_user_created",
+			"tenant_id", tenantID, "db_user", dbUser)...)
 	}
 
 	// Step 2: persist the chosen credentials (service user or cloud_admin fallback).

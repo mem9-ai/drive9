@@ -117,15 +117,12 @@ func (p *Provisioner) Authorize(ctx context.Context, r *http.Request, clusterID 
 	return nil
 }
 
-// GetClusterInfo returns cluster metadata from the global server.
-func (p *Provisioner) GetClusterInfo(ctx context.Context, clusterID string) (*tidbcloud.ClusterInfo, error) {
-	return p.global.GetClusterInfo(ctx, clusterID)
-}
-
 // CreateServiceUser creates a dedicated fs_admin SQL user on the given cluster
 // via the SqlUserService gRPC API. The operator authenticates as cloud_admin
-// using its encrypted password. Returns the ServiceUser credentials.
-func (p *Provisioner) CreateServiceUser(ctx context.Context, clusterID string, cluster *tidbcloud.ClusterInfo) (*tidbcloud.ServiceUser, error) {
+// using its encrypted password. operatorUsername is the cloud_admin username
+// (e.g. "2wCQ.cloud_admin") used to derive the user prefix and as the gRPC
+// operator identity. Returns the ServiceUser credentials.
+func (p *Provisioner) CreateServiceUser(ctx context.Context, clusterID string, operatorUsername string) (*tidbcloud.ServiceUser, error) {
 	encryptedPwd, err := p.global.GetEncryptedCloudAdminPwd(ctx, clusterID)
 	if err != nil {
 		return nil, fmt.Errorf("get encrypted cloud_admin password for cluster %s: %w", clusterID, err)
@@ -136,14 +133,14 @@ func (p *Provisioner) CreateServiceUser(ctx context.Context, clusterID string, c
 		return nil, fmt.Errorf("generate service user password: %w", err)
 	}
 
-	userPrefix := extractUserPrefix(cluster.Username)
+	userPrefix := extractUserPrefix(operatorUsername)
 	bareUser := "fs_admin"
 	qualifiedUser := bareUser
 	if userPrefix != "" {
 		qualifiedUser = userPrefix + "." + bareUser
 	}
 
-	if err := p.global.CreateServiceUser(ctx, clusterID, cluster.Username, encryptedPwd, qualifiedUser, password); err != nil {
+	if err := p.global.CreateServiceUser(ctx, clusterID, operatorUsername, encryptedPwd, qualifiedUser, password); err != nil {
 		return nil, err
 	}
 
