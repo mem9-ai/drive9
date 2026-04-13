@@ -11,9 +11,12 @@ package tidbcloudnative
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -114,51 +117,60 @@ func (p *Provisioner) Authorize(ctx context.Context, r *http.Request, clusterID 
 	return nil
 }
 
-// ClusterProxyInfo holds the cluster proxy endpoint and version needed to
-// execute SQL via the proxy HTTP API.
-type ClusterProxyInfo struct {
-	ClusterID     uint64
-	ProxyEndpoint string
-	Version       string
-	Username      string // cloud_admin username (with prefix)
-	Password      string // cloud_admin password (plaintext)
+// GetClusterInfo returns cluster metadata from the global server.
+func (p *Provisioner) GetClusterInfo(ctx context.Context, clusterID string) (*tidbcloud.ClusterInfo, error) {
+	return p.global.GetClusterInfo(ctx, clusterID)
 }
 
-// GetClusterProxyInfo fetches the proxy endpoint, version, and cloud_admin
-// credentials for the given cluster. This is called separately from Provision()
-// to avoid polluting tenant.ClusterInfo with proxy-specific fields.
-func (p *Provisioner) GetClusterProxyInfo(ctx context.Context, clusterID string) (*ClusterProxyInfo, error) {
-	info, err := p.global.GetClusterInfo(ctx, clusterID)
-	if err != nil {
-		return nil, fmt.Errorf("get cluster info %s: %w", clusterID, err)
-	}
-	if info.ProxyEndpoint == "" {
-		return nil, nil // no proxy available
-	}
-
+// CreateServiceUser creates a dedicated fs_admin SQL user on the given cluster
+// via the SqlUserService gRPC API. The operator authenticates as cloud_admin
+// using its encrypted password. Returns the ServiceUser credentials.
+func (p *Provisioner) CreateServiceUser(ctx context.Context, clusterID string, cluster *tidbcloud.ClusterInfo) (*tidbcloud.ServiceUser, error) {
 	encryptedPwd, err := p.global.GetEncryptedCloudAdminPwd(ctx, clusterID)
 	if err != nil {
-		return nil, fmt.Errorf("get encrypted password for cluster %s: %w", clusterID, err)
-	}
-	ciphertext, err := base64.StdEncoding.DecodeString(encryptedPwd)
-	if err != nil {
-		return nil, fmt.Errorf("decode encrypted password for cluster %s: %w", clusterID, err)
-	}
-	plaintext, err := p.enc.Decrypt(ctx, ciphertext)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt password for cluster %s: %w", clusterID, err)
+		return nil, fmt.Errorf("get encrypted cloud_admin password for cluster %s: %w", clusterID, err)
 	}
 
-	cid, err := tidbcloud.ParseClusterIDUint64(clusterID)
+	password, err := generateRandomHex(32)
 	if err != nil {
+		return nil, fmt.Errorf("generate service user password: %w", err)
+	}
+
+	userPrefix := extractUserPrefix(cluster.Username)
+	bareUser := "fs_admin"
+	qualifiedUser := bareUser
+	if userPrefix != "" {
+		qualifiedUser = userPrefix + "." + bareUser
+	}
+
+	if err := p.global.CreateServiceUser(ctx, clusterID, cluster.Username, encryptedPwd, qualifiedUser, password); err != nil {
 		return nil, err
 	}
 
-	return &ClusterProxyInfo{
-		ClusterID:     cid,
-		ProxyEndpoint: info.ProxyEndpoint,
-		Version:       info.Version,
-		Username:      info.Username,
-		Password:      string(plaintext),
+	logger.Info(ctx, "service_user_created_via_global",
+		zap.String("cluster_id", clusterID),
+		zap.String("user", qualifiedUser))
+
+	return &tidbcloud.ServiceUser{
+		Username: qualifiedUser,
+		Password: password,
 	}, nil
+}
+
+// extractUserPrefix extracts the user prefix from a serverless username.
+// e.g. "2wCQKHWXMegHiR8.cloud_admin" → "2wCQKHWXMegHiR8"
+func extractUserPrefix(username string) string {
+	if i := strings.LastIndex(username, "."); i >= 0 {
+		return username[:i]
+	}
+	return ""
+}
+
+// generateRandomHex returns a hex-encoded random string of n bytes.
+func generateRandomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }

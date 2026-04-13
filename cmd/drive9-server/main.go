@@ -208,6 +208,7 @@ func main() {
 			globalClient := tidbcloud.NewGRPCGlobalClient(
 				mgmtv1.NewClusterServiceClient(mgmtConn),
 				serverlessv1.NewServerlessServiceClient(serverlessConn),
+				serverlessv1.NewSqlUserServiceClient(serverlessConn),
 				zerov1beta1.NewZeroInstanceServiceClient(mgmtConn),
 			)
 			accountClient := tidbcloud.NewGRPCAccountClient(

@@ -1,17 +1,17 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
-
+	"github.com/mem9-ai/dat9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/tidbcloud"
 )
@@ -60,48 +60,6 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	// Fetch cluster proxy info (proxy endpoint, cloud_admin credentials).
-	// The LB blocks cloud_admin, so we use the proxy to create a dedicated
-	// service user (fs_admin) with ALL PRIVILEGES on the target database.
-	// fs_admin handles both schema init DDL and runtime CRUD.
-	proxyInfo, err := np.GetClusterProxyInfo(ctx, tenantID)
-	if err != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_get_proxy_info_failed", "tenant_id", tenantID, "error", err)...)
-		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		errJSON(w, http.StatusBadGateway, fmt.Sprintf("get proxy info failed: %v", err))
-		return
-	}
-
-	// Determine the DB user and password for all operations (schema init + runtime).
-	// When proxy is available, create fs_admin via proxy; otherwise fall back to cloud_admin.
-	dbUser := cluster.Username
-	dbPassword := cluster.Password
-
-	if proxyInfo != nil {
-		proxy := tidbcloud.NewClusterProxyClient(
-			proxyInfo.ProxyEndpoint, proxyInfo.ClusterID,
-			proxyInfo.Username, proxyInfo.Password)
-
-		// Extract the user prefix from the cloud_admin username (e.g. "2wCQ.cloud_admin" → "2wCQ").
-		userPrefix := extractUserPrefix(proxyInfo.Username)
-
-		// Create fs_admin via proxy with ALL PRIVILEGES on the target database,
-		// so it can run both schema init DDL and runtime CRUD.
-		svcUser, svcErr := proxy.CreateServiceUser(ctx, userPrefix, cluster.DBName)
-		if svcErr != nil {
-			logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_create_svc_user_failed",
-				"tenant_id", tenantID, "error", svcErr)...)
-			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-			errJSON(w, http.StatusBadGateway, fmt.Sprintf("create service user failed: %v", svcErr))
-			return
-		}
-		dbUser = svcUser.Username
-		dbPassword = svcUser.Password
-
-		logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_svc_user_created",
-			"tenant_id", tenantID, "db_user", dbUser)...)
-	}
-
 	apiToken, err := token.IssueToken(s.tokenSecret, tenantID, 1)
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_issue_token_failed", "tenant_id", tenantID, "error", err)...)
@@ -112,13 +70,6 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 	hash := token.HashToken(apiToken)
 	now := time.Now().UTC()
 
-	cipherPass, err := s.pool.Encrypt(ctx, []byte(dbPassword))
-	if err != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_db_password_failed", "tenant_id", tenantID, "error", err)...)
-		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		errJSON(w, http.StatusInternalServerError, "failed to encrypt db password")
-		return
-	}
 	cipherToken, err := s.pool.Encrypt(ctx, []byte(apiToken))
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_api_key_failed", "tenant_id", tenantID, "error", err)...)
@@ -127,13 +78,17 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
+	// DB credentials left empty; the async goroutine writes them after
+	// determining the best credentials (service user or cloud_admin fallback).
+	// While status=provisioning the auth middleware returns 503, so no one
+	// will attempt to use the empty credentials.
 	if err := s.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantProvisioning,
 		DBHost:           cluster.Host,
 		DBPort:           cluster.Port,
-		DBUser:           dbUser,
-		DBPasswordCipher: cipherPass,
+		DBUser:           "",
+		DBPasswordCipher: []byte{},
 		DBName:           cluster.DBName,
 		DBTLS:            true,
 		Provider:         provider,
@@ -173,10 +128,10 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	// fs_admin has ALL PRIVILEGES on the target database, so it handles both
-	// schema init DDL and runtime CRUD via standard MySQL connection.
-	dsn := tenantDSN(dbUser, dbPassword, cluster.Host, cluster.Port, cluster.DBName, true)
-	go s.initTenantSchemaAsync(backgroundWithTrace(ctx), tenantID, dsn, provider, np.InitSchema)
+	// Everything heavy (proxy info, service user creation, schema init) runs
+	// in a background goroutine. The tenant is already persisted with
+	// status=provisioning, so /v1/status returns "provisioning" immediately.
+	go s.nativeProvisionAsync(backgroundWithTrace(ctx), np, tenantID, cluster, provider)
 
 	logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_accepted", "tenant_id", tenantID, "provider", provider)...)
 	metricEvent(ctx, "tenant_provision", "provider", provider, "result", "accepted")
@@ -188,14 +143,57 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 	})
 }
 
-// extractUserPrefix extracts the user prefix from a serverless username.
-// e.g. "2wCQKHWXMegHiR8.cloud_admin" → "2wCQKHWXMegHiR8"
-// Returns empty string if no prefix is present.
-func extractUserPrefix(username string) string {
-	if i := strings.LastIndex(username, "."); i >= 0 {
-		return username[:i]
+// nativeProvisionAsync runs in a background goroutine after the tenant record
+// has been persisted. It tries to create a dedicated service user via the
+// cluster proxy, updates the tenant DB credentials if successful, then runs
+// schema init. On success it marks the tenant active; on exhausted retries it
+// marks the tenant failed.
+func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.Provisioner, tenantID string, cluster *tenant.ClusterInfo, provider string) {
+	dbUser := cluster.Username
+	dbPassword := cluster.Password
+
+	// Step 1: try to create a dedicated service user via SqlUserService gRPC.
+	clusterInfo, err := np.GetClusterInfo(ctx, tenantID)
+	if err != nil {
+		logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_get_cluster_info_failed",
+			"tenant_id", tenantID, "error", err)...)
+		// Fall through: use cloud_admin credentials.
+	} else {
+		svcUser, svcErr := np.CreateServiceUser(ctx, tenantID, clusterInfo)
+		if svcErr != nil {
+			logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_create_svc_user_failed",
+				"tenant_id", tenantID, "error", svcErr)...)
+			logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_fallback_cloud_admin",
+				"tenant_id", tenantID, "db_user", dbUser)...)
+		} else {
+			dbUser = svcUser.Username
+			dbPassword = svcUser.Password
+			logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_svc_user_created",
+				"tenant_id", tenantID, "db_user", dbUser)...)
+		}
 	}
-	return ""
+
+	// Step 2: persist the chosen credentials (service user or cloud_admin fallback).
+	cipherPass, encErr := s.pool.Encrypt(ctx, []byte(dbPassword))
+	if encErr != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_encrypt_db_password_failed",
+			"tenant_id", tenantID, "error", encErr)...)
+		_ = s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		return
+	}
+	if updErr := s.meta.UpdateTenantDBCredentials(ctx, tenantID, dbUser, cipherPass); updErr != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_update_db_creds_failed",
+			"tenant_id", tenantID, "error", updErr)...)
+		_ = s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		return
+	}
+	s.pool.Invalidate(tenantID)
+
+	// Step 3: schema init with the determined credentials.
+	dsn := tenantDSN(dbUser, dbPassword, cluster.Host, cluster.Port, cluster.DBName, true)
+	s.initTenantSchemaAsync(ctx, tenantID, dsn, provider, np.InitSchema)
 }
 
 // handleNativeTenantStatus checks for tidbcloud-native headers on /v1/status.

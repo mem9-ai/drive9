@@ -31,6 +31,10 @@ func (m *mockGlobalClient) GetZeroInstance(ctx context.Context, instanceID strin
 	return m.getZeroInstanceFn(ctx, instanceID)
 }
 
+func (m *mockGlobalClient) CreateServiceUser(ctx context.Context, clusterID, operatorUser, operatorEncPwd, username, password string) error {
+	return nil
+}
+
 // --- mock Encryptor ---
 
 type mockEncryptor struct {
@@ -263,152 +267,5 @@ func TestAuthorize_ClusterNotFound(t *testing.T) {
 	}
 	if !errors.Is(err, tidbcloud.ErrClusterNotFound) {
 		t.Fatalf("expected ErrClusterNotFound, got: %v", err)
-	}
-}
-
-func TestGetClusterProxyInfo_Success(t *testing.T) {
-	password := "s3cret"
-	encrypted := base64.StdEncoding.EncodeToString([]byte("encrypted-pwd"))
-
-	global := &mockGlobalClient{
-		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
-			return &tidbcloud.ClusterInfo{
-				ClusterID:     "12345",
-				Host:          "h",
-				Port:          4000,
-				Username:      "pfx.cloud_admin",
-				ProxyEndpoint: "proxy.internal:443",
-				Version:       "v8.1.1",
-			}, nil
-		},
-		getEncryptedCloudAdminFn: func(_ context.Context, _ string) (string, error) {
-			return encrypted, nil
-		},
-	}
-	enc := &mockEncryptor{
-		decryptFn: func(_ context.Context, _ []byte) ([]byte, error) {
-			return []byte(password), nil
-		},
-	}
-
-	p := NewProvisioner(global, nil, enc)
-	info, err := p.GetClusterProxyInfo(context.Background(), "12345")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if info == nil {
-		t.Fatal("expected non-nil info")
-	}
-	if info.ClusterID != 12345 {
-		t.Fatalf("got cluster ID %d, want 12345", info.ClusterID)
-	}
-	if info.ProxyEndpoint != "proxy.internal:443" {
-		t.Fatalf("got proxy endpoint %s, want proxy.internal:443", info.ProxyEndpoint)
-	}
-	if info.Username != "pfx.cloud_admin" {
-		t.Fatalf("got username %s, want pfx.cloud_admin", info.Username)
-	}
-	if info.Password != password {
-		t.Fatalf("got password %s, want %s", info.Password, password)
-	}
-}
-
-func TestGetClusterProxyInfo_NoProxy(t *testing.T) {
-	global := &mockGlobalClient{
-		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
-			return &tidbcloud.ClusterInfo{
-				ClusterID:     "12345",
-				Host:          "h",
-				Port:          4000,
-				Username:      "u",
-				ProxyEndpoint: "", // no proxy
-			}, nil
-		},
-	}
-
-	p := NewProvisioner(global, nil, nil)
-	info, err := p.GetClusterProxyInfo(context.Background(), "12345")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if info != nil {
-		t.Fatalf("expected nil when no proxy, got %+v", info)
-	}
-}
-
-func TestGetClusterProxyInfo_ClusterInfoError(t *testing.T) {
-	global := &mockGlobalClient{
-		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
-			return nil, fmt.Errorf("get cluster: %w", tidbcloud.ErrClusterNotFound)
-		},
-	}
-
-	p := NewProvisioner(global, nil, nil)
-	_, err := p.GetClusterProxyInfo(context.Background(), "99999")
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if !errors.Is(err, tidbcloud.ErrClusterNotFound) {
-		t.Fatalf("expected ErrClusterNotFound, got: %v", err)
-	}
-}
-
-func TestGetClusterProxyInfo_DecryptError(t *testing.T) {
-	encrypted := base64.StdEncoding.EncodeToString([]byte("bad"))
-
-	global := &mockGlobalClient{
-		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
-			return &tidbcloud.ClusterInfo{
-				ClusterID:     "1",
-				Host:          "h",
-				Port:          4000,
-				Username:      "u",
-				ProxyEndpoint: "proxy:443",
-			}, nil
-		},
-		getEncryptedCloudAdminFn: func(_ context.Context, _ string) (string, error) {
-			return encrypted, nil
-		},
-	}
-	enc := &mockEncryptor{
-		decryptFn: func(_ context.Context, _ []byte) ([]byte, error) {
-			return nil, errors.New("kms failure")
-		},
-	}
-
-	p := NewProvisioner(global, nil, enc)
-	_, err := p.GetClusterProxyInfo(context.Background(), "1")
-	if err == nil {
-		t.Fatal("expected error from decrypt")
-	}
-}
-
-func TestGetClusterProxyInfo_InvalidClusterID(t *testing.T) {
-	encrypted := base64.StdEncoding.EncodeToString([]byte("enc"))
-
-	global := &mockGlobalClient{
-		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
-			return &tidbcloud.ClusterInfo{
-				ClusterID:     "not-a-number",
-				Host:          "h",
-				Port:          4000,
-				Username:      "u",
-				ProxyEndpoint: "proxy:443",
-			}, nil
-		},
-		getEncryptedCloudAdminFn: func(_ context.Context, _ string) (string, error) {
-			return encrypted, nil
-		},
-	}
-	enc := &mockEncryptor{
-		decryptFn: func(_ context.Context, _ []byte) ([]byte, error) {
-			return []byte("pwd"), nil
-		},
-	}
-
-	p := NewProvisioner(global, nil, enc)
-	_, err := p.GetClusterProxyInfo(context.Background(), "not-a-number")
-	if err == nil {
-		t.Fatal("expected error for invalid cluster ID")
 	}
 }
