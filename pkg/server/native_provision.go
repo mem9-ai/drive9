@@ -12,7 +12,6 @@ import (
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 
-	"github.com/mem9-ai/dat9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/tidbcloud"
 )
@@ -27,11 +26,9 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 	provider := tenant.ProviderTiDBCloudNative
 	ctx := r.Context()
 
-	np, ok := s.provisioner.(*tidbcloudnative.Provisioner)
+	np, ok := authorizeNativeTarget(ctx, w, r, s.provisioner, target)
 	if !ok {
-		logger.Warn(ctx, "server_event", eventFields(ctx, "native_provisioner_not_configured")...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		errJSON(w, http.StatusBadRequest, fmt.Sprintf("unsupported %s header", tidbcloud.HeaderForTarget(target.Type)))
 		return
 	}
 
@@ -39,39 +36,10 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 
 	switch target.Type {
 	case tidbcloud.TargetZeroInstance:
-		// Verify the instance ID actually exists in TiDB Cloud to prevent forgery.
-		if err := np.VerifyZeroInstance(ctx, target.InstanceID); err != nil {
-			if tidbcloud.IsNotFound(err) {
-				logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_instance_not_found",
-					"instance_id", target.InstanceID, "error", err)...)
-				metricEvent(ctx, "tenant_provision", "provider", provider, "result", "not_found")
-				errJSON(w, http.StatusNotFound, err.Error())
-				return
-			}
-			logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_verify_instance_failed",
-				"instance_id", target.InstanceID, "error", err)...)
-			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-			errJSON(w, http.StatusBadGateway, fmt.Sprintf("verify instance failed: %v", err))
-			return
-		}
 		logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_requested",
 			"tenant_id", tenantID, "provider", provider, "target_type", "instance",
 			"instance_id", target.InstanceID)...)
-
 	case tidbcloud.TargetCluster:
-		// Authorize via account service.
-		if authErr := np.Authorize(ctx, r, target.ClusterID); authErr != nil {
-			if status, ok := tidbcloud.IsAuthError(authErr); ok {
-				logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_auth_failed", "cluster_id", target.ClusterID, "error", authErr)...)
-				metricEvent(ctx, "tenant_provision", "provider", provider, "result", "auth_error")
-				errJSON(w, status, authErr.Error())
-				return
-			}
-			logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_auth_failed", "cluster_id", target.ClusterID, "error", authErr)...)
-			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "auth_error")
-			errJSON(w, http.StatusForbidden, authErr.Error())
-			return
-		}
 		logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_requested",
 			"tenant_id", tenantID, "provider", provider, "target_type", "cluster")...)
 	}
@@ -228,4 +196,39 @@ func extractUserPrefix(username string) string {
 		return username[:i]
 	}
 	return ""
+}
+
+// handleNativeTenantStatus checks for tidbcloud-native headers on /v1/status.
+// Returns (status, true) if handled; ("", false) if no native headers present.
+func (s *Server) handleNativeTenantStatus(w http.ResponseWriter, r *http.Request) (string, bool) {
+	target, err := tidbcloud.ParseHeaders(r)
+	if err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_bad_tidbcloud_header", "error", err)...)
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return "", true
+	}
+	if target == nil {
+		return "", false
+	}
+
+	ctx := r.Context()
+	if _, ok := authorizeNativeTarget(ctx, w, r, s.provisioner, target); !ok {
+		return "", true
+	}
+
+	tenantID := target.ClusterID
+	t, err := s.meta.GetTenant(ctx, tenantID)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			logger.Warn(ctx, "server_event", eventFields(ctx, "tenant_status_native_not_found", "tenant_id", tenantID)...)
+			errJSON(w, http.StatusNotFound, "tenant not found")
+			return "", true
+		}
+		logger.Error(ctx, "server_event", eventFields(ctx, "tenant_status_native_meta_error", "tenant_id", tenantID, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, "meta backend unavailable")
+		return "", true
+	}
+
+	logger.Info(ctx, "server_event", eventFields(ctx, "tenant_status_native_ok", "tenant_id", tenantID, "status", t.Status)...)
+	return string(t.Status), true
 }

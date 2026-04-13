@@ -178,7 +178,7 @@ func TestAuthValidKeyCanWrite(t *testing.T) {
 func TestAuthKeepsBorrowedBackendValidDuringRequestAfterInvalidate(t *testing.T) {
 	rt, cleanup := newAuthRuntime(t)
 	defer cleanup()
-	h := tenantAuthMiddleware(rt.meta, rt.pool, rt.tokenSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := tenantAuthMiddleware(rt.meta, rt.pool, rt.tokenSecret, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		scope := ScopeFromContext(r.Context())
 		if scope == nil || scope.Backend == nil {
 			t.Fatal("expected tenant scope backend")

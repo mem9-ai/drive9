@@ -7,12 +7,15 @@
 #
 # Coverage:
 #  1) Provision tenant via zero-instance header (expect 202)
-#  2) Poll tenant status via GET /v1/status until active
+#  2) Poll tenant status via GET /v1/status with instance ID header until active
 #  3) Root list
 #  4) Nested mkdir + multi-file write/read
 #  5) Content search (grep) and attribute search (find)
 #  6) Copy, rename, delete
 #  7) Final list verification
+#
+# All API calls use X-TIDBCLOUD-ZERO-INSTANCE-ID header for authentication —
+# the unified tidbcloud-native auth mode (provision included).
 #
 # Required environment variables:
 #   DRIVE9_BASE                  — server URL (e.g. https://fs.dev.tidbapi.com)
@@ -76,7 +79,7 @@ check_cmd() {
 curl_body_code() {
   local method="$1"
   local url="$2"
-  local auth="${3:-}"
+  local instance_id="$3"
   local data="${4:-}"
 
   local attempt=1
@@ -85,9 +88,7 @@ curl_body_code() {
     body_file="$(mktemp)"
     local code
     local -a curl_args=(-sS -o "$body_file" -w "%{http_code}" -X "$method")
-    if [ -n "$auth" ]; then
-      curl_args+=(-H "Authorization: Bearer $auth")
-    fi
+    curl_args+=(-H "X-TIDBCLOUD-ZERO-INSTANCE-ID: $instance_id")
     if [ -n "$data" ]; then
       curl_args+=(--data-binary "$data")
     fi
@@ -144,18 +145,11 @@ resp=$(curl_native_provision "$BASE/v1/provision" "$INSTANCE_ID")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 
-# Handle idempotent re-provision (409 = already provisioned, use existing key)
+# Handle idempotent re-provision (409 = already provisioned)
 if [ "$code" = "409" ]; then
-  info "tenant already provisioned (409), need existing API key"
-  if [ -z "${DRIVE9_API_KEY:-}" ]; then
-    fail "409 Conflict but DRIVE9_API_KEY not set — cannot continue"
-    echo -e "\nResults: PASS=$PASS FAIL=$((FAIL+1)) TOTAL=$((TOTAL+1))"
-    exit 1
-  fi
-  API_KEY="$DRIVE9_API_KEY"
-  info "using existing API key from DRIVE9_API_KEY"
+  info "tenant already provisioned (409)"
   TOTAL=$((TOTAL+1)); PASS=$((PASS+1))
-  ok "provision: tenant already exists, using existing key"
+  ok "provision: tenant already exists"
 else
   check_eq "POST /v1/provision returns 202" "$code" "202"
   API_KEY=$(printf '%s' "$body" | jq -r '.api_key // empty')
@@ -164,14 +158,12 @@ else
   check_eq "provision status is provisioning" "$INIT_STATUS" "provisioning"
 fi
 
-info "API_KEY=${API_KEY:0:20}..."
-
 # ──────────────────────────────────────────────────────────────
 step "2" "Poll tenant status via /v1/status until active"
 deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))
 LAST_STATUS=""
 while :; do
-  sresp=$(curl_body_code GET "$BASE/v1/status" "$API_KEY")
+  sresp=$(curl_body_code GET "$BASE/v1/status" "$INSTANCE_ID")
   scode=$(http_code "$sresp")
   sbody=$(json_body "$sresp")
   LAST_STATUS=$(printf '%s' "$sbody" | jq -r '.status // empty')
@@ -188,13 +180,13 @@ check_eq "tenant status is active" "$LAST_STATUS" "active"
 
 # ──────────────────────────────────────────────────────────────
 step "3" "Root list"
-resp=$(curl_body_code GET "$BASE/v1/fs/?list" "$API_KEY")
+resp=$(curl_body_code GET "$BASE/v1/fs/?list" "$INSTANCE_ID")
 code=$(http_code "$resp")
 check_eq "GET /v1/fs/?list returns 200" "$code" "200"
 
 # ──────────────────────────────────────────────────────────────
 step "4" "Nested mkdir"
-resp=$(curl_body_code PUT "$BASE/v1/fs/${NESTED_DIR}/" "$API_KEY")
+resp=$(curl_body_code PUT "$BASE/v1/fs/${NESTED_DIR}/" "$INSTANCE_ID")
 code=$(http_code "$resp")
 check_eq "PUT nested dir returns 200 or 201" "$(echo "$code" | grep -cE '200|201')" "1"
 
@@ -205,23 +197,23 @@ FILE_B="${NESTED_DIR}/world.txt"
 CONTENT_A="Hello from tidbcloud-native e2e test ${TS}"
 CONTENT_B="World file content ${TS}"
 
-resp=$(curl_body_code PUT "$BASE/v1/fs/${FILE_A}" "$API_KEY" "$CONTENT_A")
+resp=$(curl_body_code PUT "$BASE/v1/fs/${FILE_A}" "$INSTANCE_ID" "$CONTENT_A")
 code=$(http_code "$resp")
 check_eq "PUT ${FILE_A} returns 200" "$code" "200"
 
-resp=$(curl_body_code PUT "$BASE/v1/fs/${FILE_B}" "$API_KEY" "$CONTENT_B")
+resp=$(curl_body_code PUT "$BASE/v1/fs/${FILE_B}" "$INSTANCE_ID" "$CONTENT_B")
 code=$(http_code "$resp")
 check_eq "PUT ${FILE_B} returns 200" "$code" "200"
 
 # ──────────────────────────────────────────────────────────────
 step "6" "Read files back"
-resp=$(curl_body_code GET "$BASE/v1/fs/${FILE_A}" "$API_KEY")
+resp=$(curl_body_code GET "$BASE/v1/fs/${FILE_A}" "$INSTANCE_ID")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 check_eq "GET ${FILE_A} returns 200" "$code" "200"
 check_eq "content matches" "$body" "$CONTENT_A"
 
-resp=$(curl_body_code GET "$BASE/v1/fs/${FILE_B}" "$API_KEY")
+resp=$(curl_body_code GET "$BASE/v1/fs/${FILE_B}" "$INSTANCE_ID")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 check_eq "GET ${FILE_B} returns 200" "$code" "200"
@@ -229,7 +221,7 @@ check_eq "content matches" "$body" "$CONTENT_B"
 
 # ──────────────────────────────────────────────────────────────
 step "7" "List nested directory"
-resp=$(curl_body_code GET "$BASE/v1/fs/${NESTED_DIR}/?list" "$API_KEY")
+resp=$(curl_body_code GET "$BASE/v1/fs/${NESTED_DIR}/?list" "$INSTANCE_ID")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 check_eq "GET list returns 200" "$code" "200"
@@ -239,7 +231,7 @@ check_eq "nested dir has 2 files" "$count" "2"
 # ──────────────────────────────────────────────────────────────
 step "8" "Grep search"
 query=$(printf '%s' "tidbcloud-native" | jq -sRr @uri)
-resp=$(curl_body_code GET "$BASE/v1/fs/${ROOT_DIR}/?grep=${query}&limit=10" "$API_KEY")
+resp=$(curl_body_code GET "$BASE/v1/fs/${ROOT_DIR}/?grep=${query}&limit=10" "$INSTANCE_ID")
 code=$(http_code "$resp")
 check_eq "grep returns 200" "$code" "200"
 body=$(json_body "$resp")
@@ -248,7 +240,7 @@ check_cmd "grep finds hello.txt" test "$found" -ge 1
 
 # ──────────────────────────────────────────────────────────────
 step "9" "Find by name"
-resp=$(curl_body_code GET "$BASE/v1/fs/${ROOT_DIR}/?find=&name=*.txt&limit=10" "$API_KEY")
+resp=$(curl_body_code GET "$BASE/v1/fs/${ROOT_DIR}/?find=&name=*.txt&limit=10" "$INSTANCE_ID")
 code=$(http_code "$resp")
 check_eq "find returns 200" "$code" "200"
 body=$(json_body "$resp")
@@ -258,11 +250,11 @@ check_cmd "find returns at least 2 .txt files" test "$count" -ge 2
 # ──────────────────────────────────────────────────────────────
 step "10" "Copy file"
 COPY_TARGET="${NESTED_DIR}/hello-copy.txt"
-resp=$(curl_body_code POST "$BASE/v1/fs/${FILE_A}?cp=${COPY_TARGET}" "$API_KEY")
+resp=$(curl_body_code POST "$BASE/v1/fs/${FILE_A}?cp=${COPY_TARGET}" "$INSTANCE_ID")
 code=$(http_code "$resp")
 check_eq "copy returns 200" "$code" "200"
 
-resp=$(curl_body_code GET "$BASE/v1/fs/${COPY_TARGET}" "$API_KEY")
+resp=$(curl_body_code GET "$BASE/v1/fs/${COPY_TARGET}" "$INSTANCE_ID")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 check_eq "copied file returns 200" "$code" "200"
@@ -271,31 +263,31 @@ check_eq "copied content matches" "$body" "$CONTENT_A"
 # ──────────────────────────────────────────────────────────────
 step "11" "Rename file"
 RENAME_TARGET="${NESTED_DIR}/hello-renamed.txt"
-resp=$(curl_body_code POST "$BASE/v1/fs/${COPY_TARGET}?mv=${RENAME_TARGET}" "$API_KEY")
+resp=$(curl_body_code POST "$BASE/v1/fs/${COPY_TARGET}?mv=${RENAME_TARGET}" "$INSTANCE_ID")
 code=$(http_code "$resp")
 check_eq "rename returns 200" "$code" "200"
 
-resp=$(curl_body_code GET "$BASE/v1/fs/${RENAME_TARGET}" "$API_KEY")
+resp=$(curl_body_code GET "$BASE/v1/fs/${RENAME_TARGET}" "$INSTANCE_ID")
 code=$(http_code "$resp")
 check_eq "renamed file accessible" "$code" "200"
 
-resp=$(curl_body_code GET "$BASE/v1/fs/${COPY_TARGET}" "$API_KEY")
+resp=$(curl_body_code GET "$BASE/v1/fs/${COPY_TARGET}" "$INSTANCE_ID")
 code=$(http_code "$resp")
 check_eq "old path returns 404" "$code" "404"
 
 # ──────────────────────────────────────────────────────────────
 step "12" "Delete file"
-resp=$(curl_body_code DELETE "$BASE/v1/fs/${RENAME_TARGET}" "$API_KEY")
+resp=$(curl_body_code DELETE "$BASE/v1/fs/${RENAME_TARGET}" "$INSTANCE_ID")
 code=$(http_code "$resp")
 check_eq "delete returns 200" "$code" "200"
 
-resp=$(curl_body_code GET "$BASE/v1/fs/${RENAME_TARGET}" "$API_KEY")
+resp=$(curl_body_code GET "$BASE/v1/fs/${RENAME_TARGET}" "$INSTANCE_ID")
 code=$(http_code "$resp")
 check_eq "deleted file returns 404" "$code" "404"
 
 # ──────────────────────────────────────────────────────────────
 step "13" "Final list verification"
-resp=$(curl_body_code GET "$BASE/v1/fs/${NESTED_DIR}/?list" "$API_KEY")
+resp=$(curl_body_code GET "$BASE/v1/fs/${NESTED_DIR}/?list" "$INSTANCE_ID")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 check_eq "final list returns 200" "$code" "200"

@@ -91,7 +91,7 @@ func NewWithConfig(cfg Config) *Server {
 
 	var business http.Handler = http.HandlerFunc(s.handleBusiness)
 	if cfg.Meta != nil && cfg.Pool != nil && len(cfg.TokenSecret) > 0 {
-		business = tenantAuthMiddleware(cfg.Meta, cfg.Pool, cfg.TokenSecret, business)
+		business = tenantAuthMiddleware(cfg.Meta, cfg.Pool, cfg.TokenSecret, cfg.Provisioner, business)
 	} else if cfg.Backend != nil {
 		business = injectFallbackBackend(cfg.Backend, business)
 	}
@@ -278,6 +278,15 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "tenant status not enabled")
 		return
 	}
+
+	// tidbcloud-native auth: instance ID or cluster ID header.
+	if status, handled := s.handleNativeTenantStatus(w, r); handled {
+		if status != "" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": status})
+		}
+		return
+	}
+
 	tok := bearerToken(r)
 	if tok == "" {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_missing_token")...)
