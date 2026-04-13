@@ -1,0 +1,27 @@
+{
+  "name": "obsidian-drive9-plugin",
+  "version": "0.1.0",
+  "description": "Sync your Obsidian vault to drive9 — semantic search and AI-agent accessibility for your notes",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "typecheck": "tsc -noEmit -skipLibCheck"
+  },
+  "keywords": [
+    "obsidian",
+    "drive9",
+    "sync",
+    "semantic-search"
+  ],
+  "author": "qiffang",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.21.0",
+    "obsidian": "latest",
+    "tslib": "2.6.2",
+    "typescript": "5.5.4"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "id": "drive9",
+  "name": "drive9 Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Sync your vault to drive9 — semantic search and AI-agent accessibility for your notes",
+  "author": "qiffang",
+  "authorUrl": "https://github.com/qiffang",
+  "isDesktopOnly": false
+}
