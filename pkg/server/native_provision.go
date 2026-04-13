@@ -78,10 +78,11 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	// Encrypt cloud_admin password as the initial fallback credential.
-	// The async goroutine may overwrite these with a dedicated service user,
-	// but storing valid credentials now ensures resumeProvisioningTenants
-	// can decrypt and use them if the server restarts mid-provision.
+	// Encrypt cloud_admin password as the initial credential.
+	// The async goroutine will overwrite these with a dedicated service user
+	// (fs_admin) once created. If the server restarts before that happens,
+	// resumeProvisioningTenants re-runs the full nativeProvisionAsync flow
+	// which creates fs_admin and updates the persisted credentials.
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_db_password_failed", "tenant_id", tenantID, "error", err)...)
@@ -189,7 +190,7 @@ func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.P
 	logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_svc_user_created",
 		"tenant_id", tenantID, "db_user", dbUser)...)
 
-	// Step 2: persist the chosen credentials (service user or cloud_admin fallback).
+	// Step 2: persist the service user credentials.
 	cipherPass, encErr := s.pool.Encrypt(ctx, []byte(dbPassword))
 	if encErr != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_encrypt_db_password_failed",

@@ -239,6 +239,37 @@ func TestCreateServiceUser_GrantFailure_BestEffort(t *testing.T) {
 	}
 }
 
+func TestCreateServiceUser_GrantUnexpectedError_Fatal(t *testing.T) {
+	// Phase 2 failure with a non-privilege error (e.g. syntax error) should be fatal.
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		if callCount == 3 { // fail on GRANT with unexpected error
+			_, _ = w.Write([]byte(`{"errNumber":1064,"errMessage":"syntax error"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"errNumber":0,"errMessage":""}`))
+	}))
+	defer srv.Close()
+
+	c := &ClusterProxyClient{
+		baseURL:   srv.URL,
+		clusterID: 1,
+		username:  "u",
+		password:  "p",
+		client:    srv.Client(),
+	}
+
+	_, err := c.CreateServiceUser(context.Background(), "pfx")
+	if err == nil {
+		t.Fatal("expected error for non-privilege grant failure")
+	}
+	if !strings.Contains(err.Error(), "grant role_admin") {
+		t.Fatalf("expected error to mention step 'grant role_admin', got: %v", err)
+	}
+}
+
 func TestEscapeSQLString(t *testing.T) {
 	tests := []struct {
 		input string

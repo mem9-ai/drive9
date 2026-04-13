@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +24,27 @@ const (
 	proxyAuthMethod  = "password"
 	proxyTimeout     = 120 * time.Second
 )
+
+// ProxySQLError is returned when the cluster proxy reports a SQL-level error.
+type ProxySQLError struct {
+	ErrNumber  int
+	ErrMessage string
+}
+
+func (e *ProxySQLError) Error() string {
+	return fmt.Sprintf("sql err: %d %s", e.ErrNumber, e.ErrMessage)
+}
+
+// isGrantPrivilegeError returns true for SQL errors that indicate the operator
+// lacks privilege to grant roles (1227 = need SUPER/ROLE_ADMIN) or grant
+// specific privileges (8121 = need GRANT OPTION).
+func isGrantPrivilegeError(err error) bool {
+	var sqlErr *ProxySQLError
+	if errors.As(err, &sqlErr) {
+		return sqlErr.ErrNumber == 1227 || sqlErr.ErrNumber == 8121
+	}
+	return false
+}
 
 // ClusterProxyClient executes SQL against a TiDB cluster through the cluster
 // proxy HTTP service (service-proxy). This bypasses the public load balancer,
@@ -129,7 +151,7 @@ func (c *ClusterProxyClient) ExecuteSQL(ctx context.Context, sql string) error {
 	}
 
 	if result.ErrNumber != 0 {
-		return fmt.Errorf("sql err: %d %s", result.ErrNumber, result.ErrMessage)
+		return &ProxySQLError{ErrNumber: result.ErrNumber, ErrMessage: result.ErrMessage}
 	}
 
 	return nil
@@ -196,6 +218,9 @@ func (c *ClusterProxyClient) CreateServiceUser(ctx context.Context, userPrefix s
 	}
 	for _, s := range bestEffort {
 		if err := c.ExecuteSQL(ctx, s.stmt); err != nil {
+			if !isGrantPrivilegeError(err) {
+				return nil, fmt.Errorf("create service user (%s): %w", s.step, err)
+			}
 			logger.Warn(ctx, "proxy_service_user_grant_skipped",
 				zap.String("step", s.step),
 				zap.String("user", qualifiedUser),
