@@ -105,6 +105,22 @@ export class Drive9SettingTab extends PluginSettingTab {
           }),
       );
 
+    new Setting(containerEl)
+      .setName("Mobile Max File Size (MB)")
+      .setDesc("Lower file size limit on mobile to avoid OOM (default: 20)")
+      .addText((text) =>
+        text
+          .setPlaceholder("20")
+          .setValue(String(Math.round(this.plugin.settings.mobileMaxFileSize / (1024 * 1024))))
+          .onChange(async (value) => {
+            const n = parseInt(value, 10);
+            if (!isNaN(n) && n >= 1) {
+              this.plugin.settings.mobileMaxFileSize = n * 1024 * 1024;
+              await this.plugin.savePluginData();
+            }
+          }),
+      );
+
     // .gitignore warning
     void this.checkGitignore(containerEl);
   }
