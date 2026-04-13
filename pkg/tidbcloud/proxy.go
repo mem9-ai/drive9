@@ -136,9 +136,10 @@ func (c *ClusterProxyClient) ExecuteSQL(ctx context.Context, sql string) error {
 }
 
 // CreateServiceUser creates a dedicated database user for drive9 runtime
-// operations via the cluster proxy. The user is assigned the role_admin role
-// (via GRANT ROLE, which does not require GRANT OPTION) instead of individual
-// privilege GRANTs that would fail with error 8121.
+// operations via the cluster proxy. It always creates the user and sets a
+// password. Role grants (role_admin + SET DEFAULT ROLE) are best-effort:
+// if cloud_admin lacks ROLE_ADMIN privilege they are skipped with a warning,
+// and the returned user may have limited privileges.
 func (c *ClusterProxyClient) CreateServiceUser(ctx context.Context, userPrefix string) (*ServiceUser, error) {
 	password, err := generatePassword(32)
 	if err != nil {
@@ -154,7 +155,8 @@ func (c *ClusterProxyClient) CreateServiceUser(ctx context.Context, userPrefix s
 	escapedUser := escapeSQLString(qualifiedUser)
 	escapedPassword := escapeSQLString(password)
 
-	stmts := []struct {
+	// Phase 1 — must succeed: create the user and set its password.
+	required := []struct {
 		step string
 		stmt string
 	}{
@@ -168,9 +170,21 @@ func (c *ClusterProxyClient) CreateServiceUser(ctx context.Context, userPrefix s
 			stmt: fmt.Sprintf("ALTER USER '%s'@'%%' IDENTIFIED BY '%s'",
 				escapedUser, escapedPassword),
 		},
-		// Use GRANT ROLE instead of GRANT privilege — cloud_admin has ROLE_ADMIN
-		// but NOT GRANT OPTION, so explicit privilege grants would fail with
-		// error 8121 ("privilege check for 'Grant Option' fail").
+	}
+	for _, s := range required {
+		if err := c.ExecuteSQL(ctx, s.stmt); err != nil {
+			return nil, fmt.Errorf("create service user (%s): %w", s.step, err)
+		}
+	}
+
+	// Phase 2 — best-effort: grant role_admin and enable it.
+	// Some clusters' cloud_admin lacks ROLE_ADMIN (error 1227) or
+	// GRANT OPTION (error 8121). We log a warning and proceed without
+	// the grant so that fs_admin can still attempt DDL/DML directly.
+	bestEffort := []struct {
+		step string
+		stmt string
+	}{
 		{
 			step: "grant role_admin",
 			stmt: fmt.Sprintf("GRANT 'role_admin' TO '%s'@'%%'", escapedUser),
@@ -180,10 +194,13 @@ func (c *ClusterProxyClient) CreateServiceUser(ctx context.Context, userPrefix s
 			stmt: fmt.Sprintf("SET DEFAULT ROLE ALL TO '%s'@'%%'", escapedUser),
 		},
 	}
-
-	for _, s := range stmts {
+	for _, s := range bestEffort {
 		if err := c.ExecuteSQL(ctx, s.stmt); err != nil {
-			return nil, fmt.Errorf("create service user (%s): %w", s.step, err)
+			logger.Warn(ctx, "proxy_service_user_grant_skipped",
+				zap.String("step", s.step),
+				zap.String("user", qualifiedUser),
+				zap.Error(err))
+			break // skip remaining grant steps
 		}
 	}
 
