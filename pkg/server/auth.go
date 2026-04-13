@@ -162,6 +162,53 @@ func poolDecryptToken(ctx context.Context, pool *tenant.Pool, cipher []byte) ([]
 	return pool.Decrypt(ctx, cipher)
 }
 
+// authorizeNativeTarget asserts the provisioner is a tidbcloudnative.Provisioner
+// and verifies/authorizes the resolved target. On failure it writes an HTTP error
+// to w and returns (nil, false).
+//
+// TODO: consider caching VerifyZeroInstance results with a short TTL to avoid
+// per-request RPCs on the hot path.
+func authorizeNativeTarget(ctx context.Context, w http.ResponseWriter, r *http.Request, provisioner tenant.Provisioner, target *tidbcloud.ResolvedTarget) (*tidbcloudnative.Provisioner, bool) {
+	np, ok := provisioner.(*tidbcloudnative.Provisioner)
+	if !ok {
+		logger.Warn(ctx, "server_event", eventFields(ctx, "native_not_configured")...)
+		metricEvent(ctx, "native_auth", "result", "not_configured")
+		errJSON(w, http.StatusNotImplemented, fmt.Sprintf("unsupported %s header", tidbcloud.HeaderForTarget(target.Type)))
+		return nil, false
+	}
+
+	switch target.Type {
+	case tidbcloud.TargetZeroInstance:
+		if err := np.VerifyZeroInstance(ctx, target.InstanceID); err != nil {
+			if tidbcloud.IsNotFound(err) {
+				logger.Warn(ctx, "server_event", eventFields(ctx, "native_instance_not_found", "instance_id", target.InstanceID)...)
+				metricEvent(ctx, "native_auth", "result", "instance_not_found")
+				errJSON(w, http.StatusNotFound, err.Error())
+				return nil, false
+			}
+			logger.Error(ctx, "server_event", eventFields(ctx, "native_verify_instance_failed", "instance_id", target.InstanceID, "error", err)...)
+			metricEvent(ctx, "native_auth", "result", "verify_instance_failed")
+			errJSON(w, http.StatusBadGateway, fmt.Sprintf("verify instance failed: %v", err))
+			return nil, false
+		}
+	case tidbcloud.TargetCluster:
+		if authErr := np.Authorize(ctx, r, target.ClusterID); authErr != nil {
+			if status, ok := tidbcloud.IsAuthError(authErr); ok {
+				logger.Warn(ctx, "server_event", eventFields(ctx, "native_auth_failed", "cluster_id", target.ClusterID, "error", authErr)...)
+				metricEvent(ctx, "native_auth", "result", "auth_failed")
+				errJSON(w, status, authErr.Error())
+				return nil, false
+			}
+			logger.Error(ctx, "server_event", eventFields(ctx, "native_auth_failed", "cluster_id", target.ClusterID, "error", authErr)...)
+			metricEvent(ctx, "native_auth", "result", "auth_failed")
+			errJSON(w, http.StatusForbidden, authErr.Error())
+			return nil, false
+		}
+	}
+
+	return np, true
+}
+
 // nativeAuthScope checks for tidbcloud-native headers and returns a TenantScope
 // if native auth succeeds. Returns (nil, nil, true) if headers were present but auth
 // failed (error already written to w). Returns (nil, nil, false) if no native headers.
@@ -177,43 +224,9 @@ func nativeAuthScope(w http.ResponseWriter, r *http.Request, metaStore *meta.Sto
 		return nil, nil, false
 	}
 
-	np, ok := provisioner.(*tidbcloudnative.Provisioner)
-	if !ok {
-		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_native_not_configured")...)
-		metricEvent(r.Context(), "auth", "result", "native_not_configured")
-		errJSON(w, http.StatusBadRequest, fmt.Sprintf("unsupported %s header", tidbcloud.HeaderForTarget(target.Type)))
-		return nil, nil, true
-	}
-
 	ctx := r.Context()
-
-	switch target.Type {
-	case tidbcloud.TargetZeroInstance:
-		if err := np.VerifyZeroInstance(ctx, target.InstanceID); err != nil {
-			if tidbcloud.IsNotFound(err) {
-				logger.Warn(ctx, "server_event", eventFields(ctx, "auth_native_instance_not_found", "instance_id", target.InstanceID)...)
-				metricEvent(ctx, "auth", "result", "instance_not_found")
-				errJSON(w, http.StatusNotFound, err.Error())
-				return nil, nil, true
-			}
-			logger.Error(ctx, "server_event", eventFields(ctx, "auth_native_verify_instance_failed", "instance_id", target.InstanceID, "error", err)...)
-			metricEvent(ctx, "auth", "result", "verify_instance_failed")
-			errJSON(w, http.StatusBadGateway, fmt.Sprintf("verify instance failed: %v", err))
-			return nil, nil, true
-		}
-	case tidbcloud.TargetCluster:
-		if authErr := np.Authorize(ctx, r, target.ClusterID); authErr != nil {
-			if status, ok := tidbcloud.IsAuthError(authErr); ok {
-				logger.Warn(ctx, "server_event", eventFields(ctx, "auth_native_auth_failed", "cluster_id", target.ClusterID, "error", authErr)...)
-				metricEvent(ctx, "auth", "result", "auth_failed")
-				errJSON(w, status, authErr.Error())
-				return nil, nil, true
-			}
-			logger.Error(ctx, "server_event", eventFields(ctx, "auth_native_auth_failed", "cluster_id", target.ClusterID, "error", authErr)...)
-			metricEvent(ctx, "auth", "result", "auth_failed")
-			errJSON(w, http.StatusForbidden, authErr.Error())
-			return nil, nil, true
-		}
+	if _, ok := authorizeNativeTarget(ctx, w, r, provisioner, target); !ok {
+		return nil, nil, true
 	}
 
 	tenantID := target.ClusterID

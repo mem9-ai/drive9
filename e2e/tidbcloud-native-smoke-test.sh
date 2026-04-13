@@ -14,8 +14,8 @@
 #  6) Copy, rename, delete
 #  7) Final list verification
 #
-# All API calls (except provision) use X-TIDBCLOUD-ZERO-INSTANCE-ID header
-# for authentication — the unified tidbcloud-native auth mode.
+# All API calls use X-TIDBCLOUD-ZERO-INSTANCE-ID header for authentication —
+# the unified tidbcloud-native auth mode (provision included).
 #
 # Required environment variables:
 #   DRIVE9_BASE                  — server URL (e.g. https://fs.dev.tidbapi.com)
