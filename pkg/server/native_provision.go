@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+
 	"github.com/mem9-ai/dat9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/tidbcloud"
@@ -90,6 +92,48 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
+	// Fetch cluster proxy info (proxy endpoint, cloud_admin credentials).
+	// The LB blocks cloud_admin, so we use the proxy to create a dedicated
+	// service user (fs_admin) with ALL PRIVILEGES on the target database.
+	// fs_admin handles both schema init DDL and runtime CRUD.
+	proxyInfo, err := np.GetClusterProxyInfo(ctx, tenantID)
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_get_proxy_info_failed", "tenant_id", tenantID, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		errJSON(w, http.StatusBadGateway, fmt.Sprintf("get proxy info failed: %v", err))
+		return
+	}
+
+	// Determine the DB user and password for all operations (schema init + runtime).
+	// When proxy is available, create fs_admin via proxy; otherwise fall back to cloud_admin.
+	dbUser := cluster.Username
+	dbPassword := cluster.Password
+
+	if proxyInfo != nil {
+		proxy := tidbcloud.NewClusterProxyClient(
+			proxyInfo.ProxyEndpoint, proxyInfo.ClusterID,
+			proxyInfo.Username, proxyInfo.Password)
+
+		// Extract the user prefix from the cloud_admin username (e.g. "2wCQ.cloud_admin" → "2wCQ").
+		userPrefix := extractUserPrefix(proxyInfo.Username)
+
+		// Create fs_admin via proxy with ALL PRIVILEGES on the target database,
+		// so it can run both schema init DDL and runtime CRUD.
+		svcUser, svcErr := proxy.CreateServiceUser(ctx, userPrefix, cluster.DBName)
+		if svcErr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_create_svc_user_failed",
+				"tenant_id", tenantID, "error", svcErr)...)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+			errJSON(w, http.StatusBadGateway, fmt.Sprintf("create service user failed: %v", svcErr))
+			return
+		}
+		dbUser = svcUser.Username
+		dbPassword = svcUser.Password
+
+		logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_svc_user_created",
+			"tenant_id", tenantID, "db_user", dbUser)...)
+	}
+
 	apiToken, err := token.IssueToken(s.tokenSecret, tenantID, 1)
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_issue_token_failed", "tenant_id", tenantID, "error", err)...)
@@ -100,7 +144,7 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 	hash := token.HashToken(apiToken)
 	now := time.Now().UTC()
 
-	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(dbPassword))
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_db_password_failed", "tenant_id", tenantID, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
@@ -120,7 +164,7 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		Status:           meta.TenantProvisioning,
 		DBHost:           cluster.Host,
 		DBPort:           cluster.Port,
-		DBUser:           cluster.Username,
+		DBUser:           dbUser,
 		DBPasswordCipher: cipherPass,
 		DBName:           cluster.DBName,
 		DBTLS:            true,
@@ -161,7 +205,9 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	dsn := tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true)
+	// fs_admin has ALL PRIVILEGES on the target database, so it handles both
+	// schema init DDL and runtime CRUD via standard MySQL connection.
+	dsn := tenantDSN(dbUser, dbPassword, cluster.Host, cluster.Port, cluster.DBName, true)
 	go s.initTenantSchemaAsync(backgroundWithTrace(ctx), tenantID, dsn, provider, np.InitSchema)
 
 	logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_accepted", "tenant_id", tenantID, "provider", provider)...)
@@ -172,4 +218,14 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		"api_key": apiToken,
 		"status":  string(meta.TenantProvisioning),
 	})
+}
+
+// extractUserPrefix extracts the user prefix from a serverless username.
+// e.g. "2wCQKHWXMegHiR8.cloud_admin" → "2wCQKHWXMegHiR8"
+// Returns empty string if no prefix is present.
+func extractUserPrefix(username string) string {
+	if i := strings.LastIndex(username, "."); i >= 0 {
+		return username[:i]
+	}
+	return ""
 }

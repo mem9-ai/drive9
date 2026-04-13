@@ -3,15 +3,18 @@ package tidbcloud
 import (
 	"context"
 	"fmt"
+	"strconv"
 )
 
 // ClusterInfo holds cluster metadata returned from the global server.
 type ClusterInfo struct {
-	ClusterID string
-	OrgID     uint64
-	Host      string
-	Port      int
-	Username  string
+	ClusterID     string
+	OrgID         uint64
+	Host          string
+	Port          int
+	Username      string
+	ProxyEndpoint string // cluster proxy HTTP endpoint for internal SQL execution
+	Version       string // TiDB version string (e.g. "v8.1.1")
 }
 
 // ZeroInstanceInfo holds connection info returned directly from the zero-instance service.
@@ -43,3 +46,12 @@ var ErrClusterNotFound = fmt.Errorf("cluster not found")
 
 // ErrInstanceNotFound indicates a zero instance was not found.
 var ErrInstanceNotFound = fmt.Errorf("zero instance not found")
+
+// ParseClusterIDUint64 parses a cluster ID string to uint64.
+func ParseClusterIDUint64(clusterID string) (uint64, error) {
+	id, err := strconv.ParseUint(clusterID, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid cluster id %s: %w", clusterID, err)
+	}
+	return id, nil
+}

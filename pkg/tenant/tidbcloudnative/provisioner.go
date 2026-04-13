@@ -113,3 +113,52 @@ func (p *Provisioner) Authorize(ctx context.Context, r *http.Request, clusterID 
 	}
 	return nil
 }
+
+// ClusterProxyInfo holds the cluster proxy endpoint and version needed to
+// execute SQL via the proxy HTTP API.
+type ClusterProxyInfo struct {
+	ClusterID     uint64
+	ProxyEndpoint string
+	Version       string
+	Username      string // cloud_admin username (with prefix)
+	Password      string // cloud_admin password (plaintext)
+}
+
+// GetClusterProxyInfo fetches the proxy endpoint, version, and cloud_admin
+// credentials for the given cluster. This is called separately from Provision()
+// to avoid polluting tenant.ClusterInfo with proxy-specific fields.
+func (p *Provisioner) GetClusterProxyInfo(ctx context.Context, clusterID string) (*ClusterProxyInfo, error) {
+	info, err := p.global.GetClusterInfo(ctx, clusterID)
+	if err != nil {
+		return nil, fmt.Errorf("get cluster info %s: %w", clusterID, err)
+	}
+	if info.ProxyEndpoint == "" {
+		return nil, nil // no proxy available
+	}
+
+	encryptedPwd, err := p.global.GetEncryptedCloudAdminPwd(ctx, clusterID)
+	if err != nil {
+		return nil, fmt.Errorf("get encrypted password for cluster %s: %w", clusterID, err)
+	}
+	ciphertext, err := base64.StdEncoding.DecodeString(encryptedPwd)
+	if err != nil {
+		return nil, fmt.Errorf("decode encrypted password for cluster %s: %w", clusterID, err)
+	}
+	plaintext, err := p.enc.Decrypt(ctx, ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt password for cluster %s: %w", clusterID, err)
+	}
+
+	cid, err := tidbcloud.ParseClusterIDUint64(clusterID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ClusterProxyInfo{
+		ClusterID:     cid,
+		ProxyEndpoint: info.ProxyEndpoint,
+		Version:       info.Version,
+		Username:      info.Username,
+		Password:      string(plaintext),
+	}, nil
+}

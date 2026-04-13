@@ -40,6 +40,11 @@ type tidbTableMeta struct {
 	columns   map[string]tidbColumnMeta
 }
 
+// TiDBAutoEmbeddingSchemaStatements returns the DDL statements for the auto-embedding schema.
+func TiDBAutoEmbeddingSchemaStatements() []string {
+	return tidbAutoEmbeddingSchemaStatements()
+}
+
 func tidbAutoEmbeddingSchemaStatements() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
