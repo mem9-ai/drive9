@@ -86,6 +86,17 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 	}, nil
 }
 
+// FetchProxyInfo returns the ProxyEndpoint and UserPrefix for a cluster by
+// calling GlobalServer. This is used by the resume path where these fields
+// are not stored in the tenant record.
+func (p *Provisioner) FetchProxyInfo(ctx context.Context, clusterID string) (proxyEndpoint, userPrefix string, err error) {
+	info, err := p.global.GetClusterInfo(ctx, clusterID)
+	if err != nil {
+		return "", "", fmt.Errorf("get cluster info %s: %w", clusterID, err)
+	}
+	return info.ProxyEndpoint, info.UserPrefix, nil
+}
+
 // ProvisionWithRootCreds resolves cluster connection info via Global Server
 // and returns a ClusterInfo populated with the caller-provided root credentials.
 // Unlike Provision, it does not fetch or decrypt cloud_admin passwords.

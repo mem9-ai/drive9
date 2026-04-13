@@ -3,9 +3,11 @@ package tidbcloudnative
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/tidbcloud"
@@ -263,5 +265,190 @@ func TestAuthorize_ClusterNotFound(t *testing.T) {
 	}
 	if !errors.Is(err, tidbcloud.ErrClusterNotFound) {
 		t.Fatalf("expected ErrClusterNotFound, got: %v", err)
+	}
+}
+
+func TestProvisionWithRootCreds_Success(t *testing.T) {
+	global := &mockGlobalClient{
+		getClusterInfoFn: func(_ context.Context, clusterID string) (*tidbcloud.ClusterInfo, error) {
+			return &tidbcloud.ClusterInfo{
+				ClusterID:     clusterID,
+				Host:          "host.example.com",
+				Port:          4000,
+				Username:      "pfx.cloud_admin",
+				ProxyEndpoint: "http://proxy:8080",
+				UserPrefix:    "pfx",
+			}, nil
+		},
+	}
+
+	p := NewProvisioner(global, nil, nil)
+	info, err := p.ProvisionWithRootCreds(context.Background(), "99", "pfx.root", "rootpw")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.Username != "pfx.root" {
+		t.Fatalf("Username=%q, want pfx.root", info.Username)
+	}
+	if info.Password != "rootpw" {
+		t.Fatalf("Password=%q, want rootpw", info.Password)
+	}
+	if info.ProxyEndpoint != "http://proxy:8080" {
+		t.Fatalf("ProxyEndpoint=%q, want http://proxy:8080", info.ProxyEndpoint)
+	}
+	if info.UserPrefix != "pfx" {
+		t.Fatalf("UserPrefix=%q, want pfx", info.UserPrefix)
+	}
+}
+
+func TestCreateServiceUser_Success(t *testing.T) {
+	cloudAdminPwd := "admin-secret"
+	encrypted := base64.StdEncoding.EncodeToString([]byte("cipher"))
+
+	// Start a fake proxy server.
+	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"errNumber": 0, "errMessage": ""})
+	}))
+	defer proxySrv.Close()
+
+	global := &mockGlobalClient{
+		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
+			return &tidbcloud.ClusterInfo{}, nil
+		},
+		getEncryptedCloudAdminFn: func(_ context.Context, _ string) (string, error) {
+			return encrypted, nil
+		},
+	}
+
+	enc := &mockEncryptor{
+		decryptFn: func(_ context.Context, _ []byte) ([]byte, error) {
+			return []byte(cloudAdminPwd), nil
+		},
+	}
+
+	p := NewProvisioner(global, nil, enc)
+	err := p.CreateServiceUser(context.Background(), "12345", proxySrv.URL, "pfx", "pfx.fs_admin", "fs-pass")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCreateServiceUser_DecryptError(t *testing.T) {
+	encrypted := base64.StdEncoding.EncodeToString([]byte("cipher"))
+
+	global := &mockGlobalClient{
+		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
+			return &tidbcloud.ClusterInfo{}, nil
+		},
+		getEncryptedCloudAdminFn: func(_ context.Context, _ string) (string, error) {
+			return encrypted, nil
+		},
+	}
+
+	enc := &mockEncryptor{
+		decryptFn: func(_ context.Context, _ []byte) ([]byte, error) {
+			return nil, errors.New("kms failure")
+		},
+	}
+
+	p := NewProvisioner(global, nil, enc)
+	err := p.CreateServiceUser(context.Background(), "12345", "http://proxy", "pfx", "pfx.fs_admin", "pw")
+	if err == nil {
+		t.Fatal("expected error from decrypt")
+	}
+}
+
+func TestCreateServiceUser_ProxyError(t *testing.T) {
+	encrypted := base64.StdEncoding.EncodeToString([]byte("cipher"))
+
+	// Fake proxy that returns HTTP 500.
+	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer proxySrv.Close()
+
+	global := &mockGlobalClient{
+		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
+			return &tidbcloud.ClusterInfo{}, nil
+		},
+		getEncryptedCloudAdminFn: func(_ context.Context, _ string) (string, error) {
+			return encrypted, nil
+		},
+	}
+
+	enc := &mockEncryptor{
+		decryptFn: func(_ context.Context, _ []byte) ([]byte, error) {
+			return []byte("admin-pass"), nil
+		},
+	}
+
+	p := NewProvisioner(global, nil, enc)
+	err := p.CreateServiceUser(context.Background(), "12345", proxySrv.URL, "pfx", "pfx.fs_admin", "pw")
+	if err == nil {
+		t.Fatal("expected error from proxy HTTP 500")
+	}
+}
+
+func TestCreateServiceUser_InvalidClusterID(t *testing.T) {
+	encrypted := base64.StdEncoding.EncodeToString([]byte("cipher"))
+
+	global := &mockGlobalClient{
+		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
+			return &tidbcloud.ClusterInfo{}, nil
+		},
+		getEncryptedCloudAdminFn: func(_ context.Context, _ string) (string, error) {
+			return encrypted, nil
+		},
+	}
+
+	enc := &mockEncryptor{
+		decryptFn: func(_ context.Context, _ []byte) ([]byte, error) {
+			return []byte("admin-pass"), nil
+		},
+	}
+
+	p := NewProvisioner(global, nil, enc)
+	err := p.CreateServiceUser(context.Background(), "not-a-number", "http://proxy", "", "fs_admin", "pw")
+	if err == nil {
+		t.Fatal("expected error for invalid cluster ID")
+	}
+}
+
+func TestFetchProxyInfo_Success(t *testing.T) {
+	global := &mockGlobalClient{
+		getClusterInfoFn: func(_ context.Context, clusterID string) (*tidbcloud.ClusterInfo, error) {
+			return &tidbcloud.ClusterInfo{
+				ClusterID:     clusterID,
+				ProxyEndpoint: "http://proxy:8080",
+				UserPrefix:    "pfx",
+			}, nil
+		},
+	}
+
+	p := NewProvisioner(global, nil, nil)
+	ep, prefix, err := p.FetchProxyInfo(context.Background(), "12345")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep != "http://proxy:8080" {
+		t.Fatalf("ProxyEndpoint=%q, want http://proxy:8080", ep)
+	}
+	if prefix != "pfx" {
+		t.Fatalf("UserPrefix=%q, want pfx", prefix)
+	}
+}
+
+func TestFetchProxyInfo_Error(t *testing.T) {
+	global := &mockGlobalClient{
+		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
+			return nil, errors.New("rpc failure")
+		},
+	}
+
+	p := NewProvisioner(global, nil, nil)
+	_, _, err := p.FetchProxyInfo(context.Background(), "12345")
+	if err == nil {
+		t.Fatal("expected error")
 	}
 }
