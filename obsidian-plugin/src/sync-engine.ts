@@ -1,4 +1,4 @@
-import { Vault, TFile, TAbstractFile, Notice } from "obsidian";
+import { Vault, TFile, TAbstractFile, Notice, Platform } from "obsidian";
 import { Drive9Client, Drive9Error, sanitizeError } from "./client";
 import { IgnoreMatcher } from "./ignore";
 import type { ShadowStore } from "./shadow-store";
@@ -199,8 +199,11 @@ export class SyncEngine {
       return;
     }
 
-    if (file.stat.size > this.settings.maxFileSize) {
-      console.warn(`[drive9] skipping large file: ${path} (${file.stat.size} bytes)`);
+    const effectiveMaxSize = Platform.isMobile
+      ? Math.min(this.settings.maxFileSize, this.settings.mobileMaxFileSize)
+      : this.settings.maxFileSize;
+    if (file.stat.size > effectiveMaxSize) {
+      console.warn(`[drive9] skipping large file: ${path} (${file.stat.size} bytes, limit ${effectiveMaxSize})`);
       return;
     }
 
@@ -225,7 +228,9 @@ export class SyncEngine {
     const expectedRevision = existingState ? existingState.remoteRevision : 0;
 
     try {
-      const result = await this.client.write(path, data, expectedRevision);
+      const result = await this.client.write(path, data, expectedRevision, (part, total) => {
+        this.setStatus("syncing", this._pendingCount);
+      });
       const contentHash = await this.saveShadowIfAvailable(data);
       if (result.revision !== null) {
         this.syncStates[path] = {
