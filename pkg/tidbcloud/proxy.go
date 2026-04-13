@@ -38,15 +38,22 @@ type proxyExecuteResponse struct {
 // operatorUser / operatorPass are credentials for an existing DB user
 // (typically root) that the proxy uses to authenticate the request.
 // newUser / newPass are the credentials for the new service user to create.
+//
+// The function creates a custom role_fs_admin role with full privileges on the
+// mysql database, then creates (or updates) the service user and assigns the role.
 func CreateServiceUserViaProxy(ctx context.Context, proxyEndpoint string, clusterID uint64, operatorUser, operatorPass, newUser, newPass string) error {
 	if proxyEndpoint == "" {
 		return fmt.Errorf("create service user: proxy endpoint is empty")
 	}
 
+	const roleName = "role_fs_admin"
 	queries := []string{
+		fmt.Sprintf("CREATE ROLE IF NOT EXISTS '%s'", roleName),
+		fmt.Sprintf("GRANT ALL PRIVILEGES ON mysql.* TO '%s'", roleName),
 		fmt.Sprintf("CREATE USER IF NOT EXISTS '%s' IDENTIFIED BY '%s'", newUser, newPass),
 		fmt.Sprintf("ALTER USER '%s' IDENTIFIED BY '%s'", newUser, newPass),
-		fmt.Sprintf("GRANT ALL PRIVILEGES ON mysql.* TO '%s'", newUser),
+		fmt.Sprintf("GRANT '%s' TO '%s'", roleName, newUser),
+		fmt.Sprintf("SET DEFAULT ROLE ALL TO '%s'", newUser),
 	}
 
 	body := proxyExecuteRequest{
