@@ -27,7 +27,7 @@ const (
 // Secret dispatches drive9 secret subcommands.
 func Secret(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage drive9 secret <set|get|exec|ls|rm|grant|revoke|audit> ...")
+		return fmt.Errorf("usage drive9 secret <set|get|exec|ls|rm|grant|revoke|audit>")
 	}
 	switch args[0] {
 	case "set":
@@ -47,7 +47,7 @@ func Secret(args []string) error {
 	case "audit":
 		return SecretAudit(args[1:])
 	case "-h", "--help", "help":
-		return fmt.Errorf("usage drive9 secret <set|get|exec|ls|rm|grant|revoke|audit> ...")
+		return fmt.Errorf("usage drive9 secret <set|get|exec|ls|rm|grant|revoke|audit>")
 	default:
 		return fmt.Errorf("unknown secret command %q", args[0])
 	}
@@ -56,7 +56,7 @@ func Secret(args []string) error {
 // SecretSet creates or updates a secret.
 func SecretSet(args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage drive9 secret set <name> <field=value|field=@file|field=->...")
+		return fmt.Errorf("usage drive9 secret set <name> <field=value|field=@file|field=-> [more fields]")
 	}
 	name := args[0]
 	if err := validateSecretName(name); err != nil {
