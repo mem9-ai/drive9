@@ -230,10 +230,9 @@ func (s *Server) resumeProvisioningTenants() {
 func (s *Server) resumeTenantSchemaInit(t meta.Tenant) {
 	ctx := backgroundWithTrace(context.Background())
 
-	// For tidbcloud-native tenants that still have the initial root
-	// credentials (the async goroutine had not finished before a restart),
-	// re-run the full provision flow which creates fs_admin and then inits
-	// the schema with it.
+	// For tidbcloud-native tenants, re-run the full provision async flow
+	// which creates fs_admin (if not yet created) and runs schema init
+	// with the persisted DB credentials.
 	if t.Provider == tenant.ProviderTiDBCloudNative {
 		np, ok := s.provisioner.(*tidbcloudnative.Provisioner)
 		if !ok {
@@ -246,15 +245,22 @@ func (s *Server) resumeTenantSchemaInit(t meta.Tenant) {
 			logger.Warn(ctx, "resume_schema_init_skipped", zap.String("tenant_id", t.ID), zap.Error(err))
 			return
 		}
+		proxyEndpoint, userPrefix, err := np.FetchProxyInfo(ctx, t.ClusterID)
+		if err != nil {
+			logger.Warn(ctx, "resume_fetch_proxy_info_failed", zap.String("tenant_id", t.ID), zap.Error(err))
+			return
+		}
 		cluster := &tenant.ClusterInfo{
-			TenantID:  t.ID,
-			ClusterID: t.ClusterID,
-			Host:      t.DBHost,
-			Port:      t.DBPort,
-			Username:  t.DBUser,
-			Password:  string(plain),
-			DBName:    t.DBName,
-			Provider:  t.Provider,
+			TenantID:      t.ID,
+			ClusterID:     t.ClusterID,
+			Host:          t.DBHost,
+			Port:          t.DBPort,
+			Username:      t.DBUser,
+			Password:      string(plain),
+			DBName:        t.DBName,
+			Provider:      t.Provider,
+			ProxyEndpoint: proxyEndpoint,
+			UserPrefix:    userPrefix,
 		}
 		s.nativeProvisionAsync(ctx, np, t.ID, cluster, t.Provider)
 		return

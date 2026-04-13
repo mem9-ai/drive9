@@ -17,6 +17,8 @@ type ClusterInfo struct {
 	Provider       string
 	ClaimURL       string
 	ClaimExpiresAt *time.Time
+	ProxyEndpoint  string // internal cluster proxy URL for privileged SQL execution
+	UserPrefix     string // serverless user prefix (e.g. "2pVhryfrqtWscoV")
 }
 
 type Provisioner interface {

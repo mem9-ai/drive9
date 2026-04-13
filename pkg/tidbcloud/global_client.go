@@ -2,18 +2,22 @@ package tidbcloud
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"strconv"
 )
 
 // ClusterInfo holds cluster metadata returned from the global server.
 type ClusterInfo struct {
-	ClusterID string
-	OrgID     uint64
-	Host      string
-	Port      int
-	Username  string
-	Version   string // TiDB version string (e.g. "v8.1.1")
+	ClusterID     string
+	OrgID         uint64
+	Host          string
+	Port          int
+	Username      string
+	Version       string // TiDB version string (e.g. "v8.1.1")
+	ProxyEndpoint string // internal cluster proxy URL for privileged SQL execution
+	UserPrefix    string // serverless user prefix (e.g. "2pVhryfrqtWscoV")
 }
 
 // ZeroInstanceInfo holds connection info returned directly from the zero-instance service.
@@ -53,4 +57,13 @@ func ParseClusterIDUint64(clusterID string) (uint64, error) {
 		return 0, fmt.Errorf("invalid cluster id %s: %w", clusterID, err)
 	}
 	return id, nil
+}
+
+// GeneratePassword returns a cryptographically random 32-character hex password.
+func GeneratePassword() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand failed: " + err.Error())
+	}
+	return hex.EncodeToString(b)
 }

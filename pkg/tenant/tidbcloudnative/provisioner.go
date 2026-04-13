@@ -86,6 +86,17 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 	}, nil
 }
 
+// FetchProxyInfo returns the ProxyEndpoint and UserPrefix for a cluster by
+// calling GlobalServer. This is used by the resume path where these fields
+// are not stored in the tenant record.
+func (p *Provisioner) FetchProxyInfo(ctx context.Context, clusterID string) (proxyEndpoint, userPrefix string, err error) {
+	info, err := p.global.GetClusterInfo(ctx, clusterID)
+	if err != nil {
+		return "", "", fmt.Errorf("get cluster info %s: %w", clusterID, err)
+	}
+	return info.ProxyEndpoint, info.UserPrefix, nil
+}
+
 // ProvisionWithRootCreds resolves cluster connection info via Global Server
 // and returns a ClusterInfo populated with the caller-provided root credentials.
 // Unlike Provision, it does not fetch or decrypt cloud_admin passwords.
@@ -103,15 +114,52 @@ func (p *Provisioner) ProvisionWithRootCreds(ctx context.Context, tenantID, root
 		zap.Int("port", info.Port))
 
 	return &tenant.ClusterInfo{
-		TenantID:  clusterID,
-		ClusterID: clusterID,
-		Host:      info.Host,
-		Port:      info.Port,
-		Username:  rootUser,
-		Password:  rootPassword,
-		DBName:    "mysql",
-		Provider:  tenant.ProviderTiDBCloudNative,
+		TenantID:      clusterID,
+		ClusterID:     clusterID,
+		Host:          info.Host,
+		Port:          info.Port,
+		Username:      rootUser,
+		Password:      rootPassword,
+		DBName:        "mysql",
+		Provider:      tenant.ProviderTiDBCloudNative,
+		ProxyEndpoint: info.ProxyEndpoint,
+		UserPrefix:    info.UserPrefix,
 	}, nil
+}
+
+// CreateServiceUser creates an fs_admin SQL user on the cluster via the internal
+// cluster proxy, using the cloud_admin credentials as the operator.
+func (p *Provisioner) CreateServiceUser(ctx context.Context, clusterID, proxyEndpoint, userPrefix, newUser, newPass string) error {
+	encryptedPwd, err := p.global.GetEncryptedCloudAdminPwd(ctx, clusterID)
+	if err != nil {
+		return fmt.Errorf("get cloud_admin password for cluster %s: %w", clusterID, err)
+	}
+	ciphertext, err := base64.StdEncoding.DecodeString(encryptedPwd)
+	if err != nil {
+		return fmt.Errorf("decode cloud_admin password for cluster %s: %w", clusterID, err)
+	}
+	plaintext, err := p.enc.Decrypt(ctx, ciphertext)
+	if err != nil {
+		return fmt.Errorf("decrypt cloud_admin password for cluster %s: %w", clusterID, err)
+	}
+
+	operatorUser := "cloud_admin"
+	if userPrefix != "" {
+		operatorUser = userPrefix + ".cloud_admin"
+	}
+
+	clusterIDUint, err := tidbcloud.ParseClusterIDUint64(clusterID)
+	if err != nil {
+		return err
+	}
+
+	logger.Info(ctx, "creating_service_user_via_proxy",
+		zap.String("cluster_id", clusterID),
+		zap.String("proxy_endpoint", proxyEndpoint),
+		zap.String("operator", operatorUser),
+		zap.String("new_user", newUser))
+
+	return tidbcloud.CreateServiceUserViaProxy(ctx, proxyEndpoint, clusterIDUint, operatorUser, string(plaintext), newUser, newPass)
 }
 
 // VerifyZeroInstance calls the zero-instance service to confirm the instance ID
