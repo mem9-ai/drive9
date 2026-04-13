@@ -230,10 +230,9 @@ func (s *Server) resumeProvisioningTenants() {
 func (s *Server) resumeTenantSchemaInit(t meta.Tenant) {
 	ctx := backgroundWithTrace(context.Background())
 
-	// For tidbcloud-native tenants that still have the initial root
-	// credentials (the async goroutine had not finished before a restart),
-	// re-run the full provision flow which creates fs_admin and then inits
-	// the schema with it.
+	// For tidbcloud-native tenants, re-run schema init with the persisted
+	// root credentials. No service user creation needed — root is used
+	// directly for all DB operations.
 	if t.Provider == tenant.ProviderTiDBCloudNative {
 		np, ok := s.provisioner.(*tidbcloudnative.Provisioner)
 		if !ok {
