@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +11,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
-	"github.com/mem9-ai/dat9/pkg/tenant/schema"
+
 	"github.com/mem9-ai/dat9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/tidbcloud"
@@ -93,10 +92,10 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	// Fetch cluster proxy info (proxy endpoint, version, cloud_admin credentials).
-	// When the LB blocks cloud_admin, we use the proxy to:
-	// 1) execute schema init DDL
-	// 2) create a dedicated service user for runtime SQL operations
+	// Fetch cluster proxy info (proxy endpoint, cloud_admin credentials).
+	// The LB blocks cloud_admin, so we use the proxy to create a dedicated
+	// service user (fs_admin) with ALL PRIVILEGES on the target database.
+	// fs_admin handles both schema init DDL and runtime CRUD.
 	proxyInfo, err := np.GetClusterProxyInfo(ctx, tenantID)
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_get_proxy_info_failed", "tenant_id", tenantID, "error", err)...)
@@ -105,22 +104,21 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	// Determine the DB user and password for runtime operations.
-	// When proxy is available, create a dedicated service user (fs_admin)
-	// that the LB allows. Otherwise fall back to cloud_admin.
+	// Determine the DB user and password for all operations (schema init + runtime).
+	// When proxy is available, create fs_admin via proxy; otherwise fall back to cloud_admin.
 	dbUser := cluster.Username
 	dbPassword := cluster.Password
-	schemaInit := np.InitSchema
 
 	if proxyInfo != nil {
 		proxy := tidbcloud.NewClusterProxyClient(
 			proxyInfo.ProxyEndpoint, proxyInfo.ClusterID,
-			proxyInfo.Username, proxyInfo.Password, proxyInfo.Version)
+			proxyInfo.Username, proxyInfo.Password)
 
 		// Extract the user prefix from the cloud_admin username (e.g. "2wCQ.cloud_admin" → "2wCQ").
 		userPrefix := extractUserPrefix(proxyInfo.Username)
 
-		// Create a service user via proxy for runtime SQL.
+		// Create fs_admin via proxy with ALL PRIVILEGES on the target database,
+		// so it can run both schema init DDL and runtime CRUD.
 		svcUser, svcErr := proxy.CreateServiceUser(ctx, userPrefix, cluster.DBName)
 		if svcErr != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_create_svc_user_failed",
@@ -134,12 +132,6 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 
 		logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_svc_user_created",
 			"tenant_id", tenantID, "db_user", dbUser)...)
-
-		// Schema init uses proxy (cloud_admin) since DDL needs higher privileges.
-		schemaInit = func(initCtx context.Context, _ string) error {
-			stmts := schema.TiDBAutoEmbeddingSchemaStatements()
-			return proxy.ExecSchemaStatements(initCtx, stmts)
-		}
 	}
 
 	apiToken, err := token.IssueToken(s.tokenSecret, tenantID, 1)
@@ -213,9 +205,10 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	// Schema init uses proxy (cloud_admin privileges); runtime DSN uses service user.
+	// fs_admin has ALL PRIVILEGES on the target database, so it handles both
+	// schema init DDL and runtime CRUD via standard MySQL connection.
 	dsn := tenantDSN(dbUser, dbPassword, cluster.Host, cluster.Port, cluster.DBName, true)
-	go s.initTenantSchemaAsync(backgroundWithTrace(ctx), tenantID, dsn, provider, schemaInit)
+	go s.initTenantSchemaAsync(backgroundWithTrace(ctx), tenantID, dsn, provider, np.InitSchema)
 
 	logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_accepted", "tenant_id", tenantID, "provider", provider)...)
 	metricEvent(ctx, "tenant_provision", "provider", provider, "result", "accepted")

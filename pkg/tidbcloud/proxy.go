@@ -21,7 +21,7 @@ import (
 const (
 	proxyExecutePath = "/v1beta2/execute"
 	proxyAuthMethod  = "password"
-	proxyTimeout     = 30 * time.Second
+	proxyTimeout     = 120 * time.Second
 )
 
 // ClusterProxyClient executes SQL against a TiDB cluster through the cluster
@@ -36,7 +36,7 @@ type ClusterProxyClient struct {
 }
 
 // NewClusterProxyClient creates a proxy client for the given cluster.
-func NewClusterProxyClient(proxyEndpoint string, clusterID uint64, username, password, version string) *ClusterProxyClient {
+func NewClusterProxyClient(proxyEndpoint string, clusterID uint64, username, password string) *ClusterProxyClient {
 	baseURL := proxyEndpoint
 	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
 		baseURL = "https://" + baseURL
@@ -198,10 +198,14 @@ func (c *ClusterProxyClient) CreateServiceUser(ctx context.Context, userPrefix, 
 	escapedUser := escapeSQLString(qualifiedUser)
 	escapedDB := escapeSQLIdent(dbName)
 
+	escapedPassword := escapeSQLString(password)
+
 	stmts := []string{
 		fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s'",
-			escapedUser, escapeSQLString(password)),
-		fmt.Sprintf("GRANT SELECT, INSERT, UPDATE, DELETE ON `%s`.* TO '%s'@'%%'",
+			escapedUser, escapedPassword),
+		fmt.Sprintf("ALTER USER '%s'@'%%' IDENTIFIED BY '%s'",
+			escapedUser, escapedPassword),
+		fmt.Sprintf("GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX ON `%s`.* TO '%s'@'%%'",
 			escapedDB, escapedUser),
 	}
 
