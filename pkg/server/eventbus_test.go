@@ -150,6 +150,27 @@ func TestEventBusConcurrentPublish(t *testing.T) {
 	}
 }
 
+func TestEventBusSinceBoundaryNoFalseReset(t *testing.T) {
+	bus := NewEventBus()
+	// Fill ring so oldestSeq > 1: publish eventBusRingSize+2 events
+	// so ring contains seqs [3, 4, ..., ringSize+2] with oldestSeq=3.
+	for i := 0; i < eventBusRingSize+2; i++ {
+		bus.Publish("/file.txt", "write", "")
+	}
+	// since=2 means client needs seq 3+, which is exactly oldestSeq.
+	// This should NOT trigger a reset — all needed events are in the ring.
+	events, _, ok := bus.EventsSince(2)
+	if !ok {
+		t.Fatal("expected ok=true for since=oldestSeq-1 (all needed events are in the ring)")
+	}
+	if len(events) != eventBusRingSize {
+		t.Fatalf("expected %d events, got %d", eventBusRingSize, len(events))
+	}
+	if events[0].Seq != 3 {
+		t.Fatalf("first event seq=%d, want 3", events[0].Seq)
+	}
+}
+
 func TestEventBusEmptyRingSincePositive(t *testing.T) {
 	bus := NewEventBus()
 	// No events published; client has since=5 (stale from previous server life).

@@ -123,8 +123,10 @@ func (eb *EventBus) EventsSince(since uint64) (events []ChangeEvent, headSeq uin
 	oldestSeq := eb.ring[oldestIdx].Seq
 	newestSeq := eb.ring[(eb.head-1+eventBusRingSize)%eventBusRingSize].Seq
 
-	if since < oldestSeq {
+	if since+1 < oldestSeq {
 		// Ring has wrapped past the client's position.
+		// since+1 is the first seq the client needs; if it's older than
+		// the oldest retained event, we can't replay.
 		return nil, headSeq, false
 	}
 	if since > newestSeq {
