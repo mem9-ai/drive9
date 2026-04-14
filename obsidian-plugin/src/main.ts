@@ -1,4 +1,4 @@
-import { Plugin, Notice, TFile } from "obsidian";
+import { Plugin, Notice, TFile, addIcon } from "obsidian";
 import { Drive9Client, sanitizeError } from "./client";
 import { RemoteWatcher } from "./remote-watcher";
 import { SyncEngine } from "./sync-engine";
@@ -102,7 +102,8 @@ export default class Drive9Plugin extends Plugin {
       },
     });
 
-    this.addRibbonIcon("search", t("cmd.searchRibbon"), () => {
+    addIcon("drive9", DRIVE9_ICON_SVG);
+    this.addRibbonIcon("drive9", t("cmd.searchRibbon"), () => {
       if (!this.settings.serverUrl || !this.settings.apiKey) {
         new Notice(t("notice.configureFirst"));
         return;
@@ -384,6 +385,9 @@ export default class Drive9Plugin extends Plugin {
     }
   }
 }
+
+/** drive9 logo as SVG for Obsidian's addIcon (100x100 viewBox, no fill — inherits currentColor). */
+const DRIVE9_ICON_SVG = `<text x="50" y="68" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" font-weight="bold" font-size="48" fill="currentColor">D9</text>`;
 
 function generateActorId(): string {
   if (globalThis.crypto?.randomUUID) {
