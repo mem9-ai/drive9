@@ -241,10 +241,14 @@ func authorizeNativeTarget(ctx context.Context, w http.ResponseWriter, r *http.R
 			errJSON(w, http.StatusBadGateway, fmt.Sprintf("verify instance failed: %v", err))
 			return nil, false
 		}
-		// Stash the zero instance info in the request context so the
-		// provision handler can read the expiration timestamp.
+		// Stash only non-sensitive zero instance info in the request
+		// context so the provision handler can read the expiration
+		// timestamp without exposing plaintext credentials.
 		if zeroInfo != nil {
-			*r = *r.WithContext(contextWithZeroInfo(r.Context(), zeroInfo))
+			sanitized := *zeroInfo
+			sanitized.Username = ""
+			sanitized.Password = ""
+			*r = *r.WithContext(contextWithZeroInfo(r.Context(), &sanitized))
 		}
 	case tidbcloud.TargetCluster:
 		if authErr := np.Authorize(ctx, r, target.ClusterID); authErr != nil {
@@ -305,7 +309,13 @@ func nativeAuthScope(w http.ResponseWriter, r *http.Request, metaStore *meta.Sto
 	if t.ClaimExpiresAt != nil && time.Now().After(*t.ClaimExpiresAt) && t.Status != meta.TenantDeleted {
 		logger.Info(ctx, "server_event", eventFields(ctx, "tenant_expired_auto_delete",
 			"tenant_id", t.ID, "claim_expires_at", t.ClaimExpiresAt.Format(time.RFC3339))...)
-		_ = metaStore.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted)
+		if err := metaStore.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted); err != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "tenant_expired_update_status_failed",
+				"tenant_id", t.ID, "error", err)...)
+			metricEvent(ctx, "tenant_status", "status", "expired_delete_failed")
+			errJSON(w, http.StatusInternalServerError, "failed to update expired tenant")
+			return nil, nil, true
+		}
 		pool.Invalidate(t.ID)
 		metricEvent(ctx, "tenant_status", "status", "expired_deleted")
 		errJSON(w, http.StatusForbidden, "tenant has expired")

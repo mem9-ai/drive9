@@ -37,7 +37,11 @@ jobs:
             echo "merge_clean=true" >> "$GITHUB_OUTPUT"
             git push origin main
           else
-            # Merge has conflicts — abort and prepare a PR branch instead.
+            # Merge has conflicts — capture conflicting paths before aborting.
+            CONFLICTS=$(git diff --name-only --diff-filter=U | head -20)
+            echo "conflicts<<CONFLICTS_EOF" >> "$GITHUB_OUTPUT"
+            echo "$CONFLICTS" >> "$GITHUB_OUTPUT"
+            echo "CONFLICTS_EOF" >> "$GITHUB_OUTPUT"
             git merge --abort
             echo "merge_clean=false" >> "$GITHUB_OUTPUT"
 
@@ -52,7 +56,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          CONFLICTS=$(git diff --name-only main..upstream/main -- '*.go' | head -20)
+          CONFLICTS="${{ steps.sync.outputs.conflicts }}"
           gh pr create \
             --base main \
             --head "${{ steps.sync.outputs.pr_branch }}" \
