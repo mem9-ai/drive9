@@ -53,13 +53,18 @@ func (g *grpcGlobalClient) GetZeroInstance(ctx context.Context, instanceID strin
 	if conn == nil {
 		return nil, fmt.Errorf("get zero instance %s: no connection info", instanceID)
 	}
-	return &ZeroInstanceInfo{
+	info := &ZeroInstanceInfo{
 		ID:       inst.GetId(),
 		Host:     conn.GetHost(),
 		Port:     int(conn.GetPort()),
 		Username: conn.GetUsername(),
 		Password: conn.GetPassword(),
-	}, nil
+	}
+	if ts := inst.GetExpiresAt(); ts != nil {
+		t := ts.AsTime().UTC()
+		info.ExpiresAt = &t
+	}
+	return info, nil
 }
 
 func (g *grpcGlobalClient) GetClusterInfo(ctx context.Context, clusterID string) (*ClusterInfo, error) {

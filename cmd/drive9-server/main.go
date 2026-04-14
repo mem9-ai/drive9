@@ -227,13 +227,13 @@ func main() {
 				accountpb.NewAccountAPIServiceClient(accountConn),
 			)
 			provisioner = tidbcloudnative.NewProvisioner(globalClient, accountClient, enc)
-				logger.Info(context.Background(), "provisioner_configured",
-					zap.String("provider", providerType),
-					zap.String("mgmt_addr", mgmtAddr),
-					zap.String("serverless_addr", serverlessAddr),
-					zap.String("account_addr", accountAddr))
-			}
+			logger.Info(context.Background(), "provisioner_configured",
+				zap.String("provider", providerType),
+				zap.String("mgmt_addr", mgmtAddr),
+				zap.String("serverless_addr", serverlessAddr),
+				zap.String("account_addr", accountAddr))
 		}
+	}
 
 	if pool != nil {
 		// TODO: Run ValidateDurableAsyncExtractRequiresSemanticWorker only when this process
@@ -565,4 +565,25 @@ func envInt64(key string, fallback int64) int64 {
 		return fallback
 	}
 	return v
+}
+
+// normalizeGRPCTarget rewrites kubernetes scheme targets to the dns resolver
+// so that gRPC can resolve Kubernetes service names correctly.
+func normalizeGRPCTarget(target string) string {
+	if strings.HasPrefix(target, "kubernetes:///") {
+		return "dns:///" + strings.TrimPrefix(target, "kubernetes:///")
+	}
+	if strings.HasPrefix(target, "kubernetes://") {
+		return "dns:///" + strings.TrimPrefix(target, "kubernetes://")
+	}
+	return target
+}
+
+// newGRPCClientConn dials a gRPC target. When insecureMode is true, the
+// connection uses no TLS (suitable for cluster-internal traffic).
+func newGRPCClientConn(target string, insecureMode bool) (*grpc.ClientConn, error) {
+	if insecureMode {
+		return grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	return grpc.NewClient(target, grpc.WithTransportCredentials(credentials.NewTLS(nil)))
 }

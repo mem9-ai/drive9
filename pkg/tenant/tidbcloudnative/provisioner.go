@@ -146,12 +146,14 @@ func (p *Provisioner) CreateServiceUser(ctx context.Context, clusterID, proxyEnd
 
 // VerifyZeroInstance calls the zero-instance service to confirm the instance ID
 // exists. This prevents forged instance IDs from reaching the provision path.
-func (p *Provisioner) VerifyZeroInstance(ctx context.Context, instanceID string) error {
-	_, err := p.global.GetZeroInstance(ctx, instanceID)
+// The returned ZeroInstanceInfo includes connection details and the instance
+// expiration timestamp when available.
+func (p *Provisioner) VerifyZeroInstance(ctx context.Context, instanceID string) (*tidbcloud.ZeroInstanceInfo, error) {
+	info, err := p.global.GetZeroInstance(ctx, instanceID)
 	if err != nil {
-		return fmt.Errorf("verify zero instance %s: %w", instanceID, err)
+		return nil, fmt.Errorf("verify zero instance %s: %w", instanceID, err)
 	}
-	return nil
+	return info, nil
 }
 
 // Authorize delegates authentication to the account service, then verifies that

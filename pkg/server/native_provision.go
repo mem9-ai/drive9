@@ -116,6 +116,12 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
+	// If a zero instance was verified during auth, capture its expiration.
+	var claimExpiresAt *time.Time
+	if zi := zeroInfoFromContext(ctx); zi != nil {
+		claimExpiresAt = zi.ExpiresAt
+	}
+
 	if err := s.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantProvisioning,
@@ -127,6 +133,7 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		DBTLS:            true,
 		Provider:         provider,
 		ClusterID:        cluster.ClusterID,
+		ClaimExpiresAt:   claimExpiresAt,
 		SchemaVersion:    1,
 		CreatedAt:        now,
 		UpdatedAt:        now,

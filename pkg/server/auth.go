@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -227,7 +228,8 @@ func authorizeNativeTarget(ctx context.Context, w http.ResponseWriter, r *http.R
 
 	switch target.Type {
 	case tidbcloud.TargetZeroInstance:
-		if err := np.VerifyZeroInstance(ctx, target.InstanceID); err != nil {
+		zeroInfo, err := np.VerifyZeroInstance(ctx, target.InstanceID)
+		if err != nil {
 			if tidbcloud.IsNotFound(err) {
 				logger.Warn(ctx, "server_event", eventFields(ctx, "native_instance_not_found", "instance_id", target.InstanceID)...)
 				metricEvent(ctx, "native_auth", "result", "instance_not_found")
@@ -238,6 +240,11 @@ func authorizeNativeTarget(ctx context.Context, w http.ResponseWriter, r *http.R
 			metricEvent(ctx, "native_auth", "result", "verify_instance_failed")
 			errJSON(w, http.StatusBadGateway, fmt.Sprintf("verify instance failed: %v", err))
 			return nil, false
+		}
+		// Stash the zero instance info in the request context so the
+		// provision handler can read the expiration timestamp.
+		if zeroInfo != nil {
+			*r = *r.WithContext(contextWithZeroInfo(r.Context(), zeroInfo))
 		}
 	case tidbcloud.TargetCluster:
 		if authErr := np.Authorize(ctx, r, target.ClusterID); authErr != nil {
@@ -292,6 +299,19 @@ func nativeAuthScope(w http.ResponseWriter, r *http.Request, metaStore *meta.Sto
 		return nil, nil, true
 	}
 
+	// If the tenant has an expiration timestamp and it has passed, mark
+	// the tenant as deleted so the underlying (destroyed) resources are
+	// no longer accessed.
+	if t.ClaimExpiresAt != nil && time.Now().After(*t.ClaimExpiresAt) && t.Status != meta.TenantDeleted {
+		logger.Info(ctx, "server_event", eventFields(ctx, "tenant_expired_auto_delete",
+			"tenant_id", t.ID, "claim_expires_at", t.ClaimExpiresAt.Format(time.RFC3339))...)
+		_ = metaStore.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted)
+		pool.Invalidate(t.ID)
+		metricEvent(ctx, "tenant_status", "status", "expired_deleted")
+		errJSON(w, http.StatusForbidden, "tenant has expired")
+		return nil, nil, true
+	}
+
 	switch t.Status {
 	case meta.TenantActive:
 	case meta.TenantProvisioning:
@@ -343,4 +363,19 @@ func bearerToken(r *http.Request) string {
 		return ""
 	}
 	return strings.TrimSpace(h[len(prefix):])
+}
+
+// zeroInfoKey is a context key for stashing ZeroInstanceInfo resolved during
+// authorizeNativeTarget so the provision handler can read the expiration.
+type zeroInfoKeyType struct{}
+
+var zeroInfoKey = zeroInfoKeyType{}
+
+func contextWithZeroInfo(ctx context.Context, info *tidbcloud.ZeroInstanceInfo) context.Context {
+	return context.WithValue(ctx, zeroInfoKey, info)
+}
+
+func zeroInfoFromContext(ctx context.Context) *tidbcloud.ZeroInstanceInfo {
+	v, _ := ctx.Value(zeroInfoKey).(*tidbcloud.ZeroInstanceInfo)
+	return v
 }

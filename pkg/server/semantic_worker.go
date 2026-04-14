@@ -578,9 +578,18 @@ func (m *semanticWorkerManager) listTenantRefs(ctx context.Context) ([]semanticT
 		if err != nil {
 			return nil, err
 		}
+		now := time.Now()
 		refs := make([]semanticTenantRef, 0, len(tenants))
 		for i := range tenants {
 			t := tenants[i]
+			// Auto-expire tenants whose claim has passed (e.g. destroyed Zero instances).
+			if t.ClaimExpiresAt != nil && now.After(*t.ClaimExpiresAt) {
+				logger.Info(ctx, "server_event", eventFields(ctx, "tenant_expired_auto_delete",
+					"tenant_id", t.ID, "claim_expires_at", t.ClaimExpiresAt.Format(time.RFC3339))...)
+				_ = m.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted)
+				m.pool.Invalidate(t.ID)
+				continue
+			}
 			if !hasAnyTaskTypes(m.taskTypesForProvider(t.Provider)) {
 				continue
 			}

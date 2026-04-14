@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strconv"
+	"time"
 )
 
 // ClusterInfo holds cluster metadata returned from the global server.
@@ -23,11 +24,12 @@ type ClusterInfo struct {
 // ZeroInstanceInfo holds connection info returned directly from the zero-instance service.
 // Unlike the cluster path, the password is returned in plaintext (no KMS decryption needed).
 type ZeroInstanceInfo struct {
-	ID       string
-	Host     string
-	Port     int
-	Username string
-	Password string
+	ID        string
+	Host      string
+	Port      int
+	Username  string
+	Password  string
+	ExpiresAt *time.Time
 }
 
 // GlobalClient abstracts calls to TiDB Cloud Global Server.
