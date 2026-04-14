@@ -53,6 +53,7 @@ type Server struct {
 	metrics        *serverMetrics
 	logger         *zap.Logger
 	mux            *http.ServeMux
+	events         *eventBuses
 	semanticWorker *semanticWorkerManager
 }
 
@@ -97,6 +98,7 @@ func NewWithConfig(cfg Config) *Server {
 		maxUploadBytes: maxUpload,
 		metrics:        newServerMetrics(),
 		logger:         logger,
+		events:         newEventBuses(),
 	}
 	mux := http.NewServeMux()
 
@@ -111,6 +113,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/uploads/", business)
 	mux.Handle("/v2/uploads/", business)
 	mux.Handle("/v1/sql", business)
+	mux.Handle("/v1/events", business)
 	// Vault management API goes through tenant auth.
 	mux.Handle("/v1/vault/secrets", business)
 	mux.Handle("/v1/vault/secrets/", business)
@@ -282,6 +285,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleV2Uploads(w, r)
 	case r.URL.Path == "/v1/sql":
 		s.handleSQL(w, r)
+	case r.URL.Path == "/v1/events":
+		s.handleEvents(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
 		s.handleVault(w, r)
 	default:
@@ -629,6 +634,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "write_ok", "path", path, "bytes", len(data))...)
 	metricEvent(r.Context(), "fs_write", "result", "ok")
+	s.publishEvent(r, path, "write")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
@@ -791,6 +797,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "delete_ok", "path", path, "recursive", recursive)...)
+	s.publishEvent(r, path, "delete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
@@ -818,6 +825,7 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "copy_ok", "src_path", srcPath, "dst_path", dstPath)...)
+	s.publishEvent(r, dstPath, "copy")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
@@ -845,6 +853,7 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "rename_ok", "old_path", oldPath, "new_path", newPath)...)
+	s.publishEvent(r, newPath, "rename")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
@@ -861,6 +870,7 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "mkdir_ok", "path", path)...)
+	s.publishEvent(r, path, "mkdir")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
@@ -1055,6 +1065,20 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
+	// Fetch upload before confirming so we can publish the target path in the event.
+	upload, err := b.Store().GetUpload(r.Context(), uploadID)
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_not_found", "upload_id", uploadID)...)
+			metricEvent(r.Context(), "upload_complete", "result", "error")
+			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_failed", "upload_id", uploadID, "error", err)...)
+		metricEvent(r.Context(), "upload_complete", "result", "error")
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	if err := b.ConfirmUpload(r.Context(), uploadID); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_not_found", "upload_id", uploadID)...)
@@ -1081,6 +1105,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_ok", "upload_id", uploadID)...)
 	metricEvent(r.Context(), "upload_complete", "result", "ok")
+	s.publishEvent(r, upload.TargetPath, "upload_complete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
@@ -1467,6 +1492,18 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 		errJSON(w, http.StatusBadRequest, "parts must not be empty")
 		return
 	}
+	// Fetch upload before confirming so we can publish the target path in the event.
+	upload, err := b.Store().GetUpload(r.Context(), uploadID)
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "upload not found")
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_failed", "upload_id", uploadID, "error", err)...)
+		metricEvent(r.Context(), "v2_upload_complete", "result", "error")
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	if err := b.ConfirmUploadV2(r.Context(), uploadID, req.Parts); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "upload not found")
@@ -1500,6 +1537,7 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_ok", "upload_id", uploadID)...)
 	metricEvent(r.Context(), "v2_upload_complete", "result", "ok")
+	s.publishEvent(r, upload.TargetPath, "upload_complete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "completed"})
 }
 

@@ -2,6 +2,8 @@ package fuse
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -73,8 +75,12 @@ func Mount(opts *MountOptions) error {
 		return fmt.Errorf("create mount point: %w", err)
 	}
 
+	// Generate per-mount actor ID for SSE self-filtering.
+	actorID := generateMountID()
+
 	// Create client and verify connectivity
 	c := client.New(opts.Server, opts.APIKey)
+	c.SetActor(actorID)
 	if _, err := c.List("/"); err != nil {
 		return fmt.Errorf("cannot reach dat9 server: %w", err)
 	}
@@ -204,6 +210,9 @@ func Mount(opts *MountOptions) error {
 		return fmt.Errorf("fuse mount: %w", err)
 	}
 
+	// Start SSE watcher for remote change notifications.
+	sseWatcher := StartSSEWatcher(dat9fs, c, actorID)
+
 	// Start serving in a background goroutine so WaitMount can proceed.
 	// On macOS, Serve() must be running before WaitMount() returns because
 	// mount_macfuse waits for STATFS (handled in the serve loop) before
@@ -236,6 +245,7 @@ func Mount(opts *MountOptions) error {
 			os.Exit(1)
 		}()
 
+		sseWatcher.Stop()
 		dat9fs.FlushAll()
 
 		// Retry unmount up to 5 times — EBUSY is transient (Spotlight, Finder).
@@ -256,8 +266,9 @@ func Mount(opts *MountOptions) error {
 		forceUnmount(opts.MountPoint)
 	}()
 
-	fmt.Fprintf(os.Stderr, "dat9: mounted on %s (server: %s)\n", opts.MountPoint, opts.Server)
+	fmt.Fprintf(os.Stderr, "dat9: mounted on %s (server: %s, actor: %s)\n", opts.MountPoint, opts.Server, actorID)
 	server.Wait()
+	sseWatcher.Stop()
 	return nil
 }
 
@@ -279,4 +290,14 @@ func forceUnmount(mountpoint string) {
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "dat9: force unmount failed: %v\n", err)
 	}
+}
+
+// generateMountID creates a random 16-byte hex ID for this mount instance.
+func generateMountID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback to timestamp if crypto/rand fails (shouldn't happen).
+		return fmt.Sprintf("mount-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
