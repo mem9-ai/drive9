@@ -35,7 +35,7 @@ func isIgnorableSchemaError(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "duplicate key") ||
-		strings.Contains(msg, "already exists") ||
+		strings.Contains(msg, "already exist") ||
 		strings.Contains(msg, "duplicate column")
 }
 
