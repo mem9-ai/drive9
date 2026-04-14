@@ -2,6 +2,7 @@ import { Client } from "./client.js";
 import { bodyInit } from "./compat.js";
 import { Drive9Error, StatusError, checkError } from "./error.js";
 import type { CompletePart, PresignedPart, UploadMeta, UploadPlan, UploadPlanV2 } from "./models.js";
+import { Semaphore } from "./utils.js";
 
 const PART_SIZE = 8 * 1024 * 1024;
 const UPLOAD_MAX_CONCURRENCY = 16;
@@ -511,25 +512,3 @@ async function uploadMissingParts(client: Client, plan: UploadPlan, data: Uint8A
   await Promise.all(tasks);
 }
 
-class Semaphore {
-  private permits: number;
-  private waiters: (() => void)[] = [];
-  constructor(n: number) {
-    this.permits = n;
-  }
-  acquire(): Promise<void> {
-    if (this.permits > 0) {
-      this.permits--;
-      return Promise.resolve();
-    }
-    return new Promise((resolve) => this.waiters.push(resolve));
-  }
-  release(): void {
-    const next = this.waiters.shift();
-    if (next) {
-      next();
-    } else {
-      this.permits++;
-    }
-  }
-}

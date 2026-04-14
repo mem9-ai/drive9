@@ -2,7 +2,10 @@
 
 import threading
 
+import requests
+
 from .exceptions import Drive9Error
+from .transfer import _V2NotAvailable
 
 _UPLOAD_MAX_CONCURRENCY = 16
 
@@ -49,7 +52,7 @@ class StreamWriter:
             msg = f"initiate stream upload: {exc}"
             if isinstance(exc, Drive9Error) and "v2 protocol" in str(exc):
                 raise
-            if hasattr(exc, "__class__") and exc.__class__.__name__ == "_V2NotAvailable":
+            if isinstance(exc, _V2NotAvailable):
                 raise Drive9Error("streaming upload requires v2 protocol: v2 upload API not available") from exc
             raise Drive9Error(msg) from exc
         self._plan = plan
@@ -89,7 +92,7 @@ class StreamWriter:
                 etag = self._client._upload_one_part_v2(pp, buf)
                 with self._mu:
                     self._uploaded[part_num] = {"number": part_num, "etag": etag}
-            except Exception as exc:
+            except (requests.RequestException, OSError) as exc:
                 self._set_error(Drive9Error(f"upload part {part_num}: {exc}"))
             finally:
                 self._sem.release()
@@ -145,7 +148,9 @@ class StreamWriter:
                 parts.append(cp)
 
             self._completed = True
-            self._client._complete_upload_v2(plan["upload_id"], parts)
+            upload_id = plan["upload_id"]
+
+        self._client._complete_upload_v2(upload_id, parts)
 
     def abort(self) -> None:
         """Cancel the multipart upload and clean up server-side state."""

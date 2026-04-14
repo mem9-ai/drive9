@@ -1,5 +1,6 @@
 """Tests for StreamWriter."""
 
+import pytest
 import responses
 
 from drive9 import Client, Drive9Error
@@ -164,8 +165,5 @@ def test_stream_writer_v2_not_available():
         status=404,
     )
     sw = client.new_stream_writer("/stream4.bin", total_size=500)
-    try:
+    with pytest.raises(Drive9Error, match="v2 protocol"):
         sw.write_part(1, b"x")
-        assert False, "expected error"
-    except Drive9Error as exc:
-        assert "v2 protocol" in str(exc)

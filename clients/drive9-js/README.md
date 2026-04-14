@@ -25,7 +25,7 @@ async function main() {
   console.log(`size=${info.size} revision=${info.revision}`);
 }
 
-main();
+main().catch(console.error);
 ```
 
 ## Config auto-loading

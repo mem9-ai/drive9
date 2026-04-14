@@ -37,7 +37,11 @@ function loadConfigFile(): { server: string; apiKey?: string } | undefined {
       apiKey = cfg.contexts[cfg.current_context]?.api_key;
     }
     return { server, apiKey };
-  } catch {
+  } catch (err) {
+    if (typeof err === "object" && err && "code" in err && err.code === "ENOENT") {
+      return undefined;
+    }
+    console.warn(`drive9: failed to load config from ${cfgPath}: ${err}`);
     return undefined;
   }
 }
@@ -109,8 +113,13 @@ export class Client {
   async list(path: string): Promise<FileInfo[]> {
     const resp = await fetch(`${this.fsUrl(path)}?list=1`, { headers: this.authHeaders() });
     await checkError(resp);
-    const body = (await resp.json()) as { entries?: FileInfo[] };
-    return body.entries || [];
+    const body = (await resp.json()) as { entries?: Array<{ name: string; size: number; isDir: boolean; mtime?: number }> };
+    return (body.entries || []).map((e) => ({
+      name: e.name,
+      size: e.size,
+      isDir: e.isDir,
+      mtime: e.mtime != null ? new Date(e.mtime * 1000) : undefined,
+    }));
   }
 
   async stat(path: string): Promise<StatResult> {

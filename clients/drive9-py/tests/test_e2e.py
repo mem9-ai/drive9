@@ -17,7 +17,7 @@ from io import BytesIO
 
 import pytest
 
-from drive9 import Client, Drive9Error
+from drive9 import Client, ConflictError, Drive9Error
 
 E2E_BASE = os.environ.get("DRIVE9_E2E_BASE", "http://127.0.0.1:9009").rstrip("/")
 E2E_API_KEY = os.environ.get("DRIVE9_E2E_API_KEY")
@@ -194,5 +194,5 @@ class TestConditionalWrite:
         assert got == b"first"
 
         # Second write with 0 should conflict
-        with pytest.raises(Drive9Error):
+        with pytest.raises(ConflictError):
             client.write(path, b"second", expected_revision=0)

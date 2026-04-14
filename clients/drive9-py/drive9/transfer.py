@@ -375,12 +375,18 @@ class TransferMixin:
         try:
             parts = self._upload_parts_v2(plan, file_obj, progress)
         except Exception:
-            self._abort_upload_v2(plan["upload_id"])
+            try:
+                self._abort_upload_v2(plan["upload_id"])
+            except Exception:
+                pass
             raise
         try:
             self._complete_upload_v2(plan["upload_id"], parts)
         except Exception:
-            self._abort_upload_v2(plan["upload_id"])
+            try:
+                self._abort_upload_v2(plan["upload_id"])
+            except Exception:
+                pass
             raise
 
     def _initiate_upload_v2(
@@ -508,9 +514,10 @@ class TransferMixin:
     # ------------------------------------------------------------------
 
     def _query_upload(self, path: str) -> UploadMeta:
+        from urllib.parse import quote
         resp = self._request(
             "GET",
-            f"{self.base_url}/v1/uploads?path={path}&status=UPLOADING",
+            f"{self.base_url}/v1/uploads?path={quote(path, safe='')}&status=UPLOADING",
         )
         if resp.status_code >= 300:
             raise StatusError(resp.text, status_code=resp.status_code, response=resp)

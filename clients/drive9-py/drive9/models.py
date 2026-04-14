@@ -49,7 +49,7 @@ class UploadPlan:
     """The server's 202 response for large file uploads."""
     upload_id: str
     part_size: int
-    parts: list
+    parts: list["PartURL"]
 
 
 @dataclass
@@ -69,8 +69,8 @@ class PatchPlan:
     """The server's response for a PATCH request."""
     upload_id: str
     part_size: int
-    upload_parts: list
-    copied_parts: list
+    upload_parts: list["PatchPartURL"]
+    copied_parts: list[int]
 
 
 @dataclass

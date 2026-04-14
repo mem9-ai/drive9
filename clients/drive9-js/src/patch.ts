@@ -2,6 +2,7 @@ import { Client } from "./client.js";
 import { bodyInit, bufferSource } from "./compat.js";
 import { checkError, Drive9Error } from "./error.js";
 import type { PatchPartURL, PatchPlan } from "./models.js";
+import { Semaphore } from "./utils.js";
 
 const DEFAULT_PART_SIZE = 8 * 1024 * 1024;
 
@@ -80,25 +81,3 @@ async function sha256Base64(data: Uint8Array): Promise<string> {
   return Buffer.from(hash).toString("base64");
 }
 
-class Semaphore {
-  private permits: number;
-  private waiters: (() => void)[] = [];
-  constructor(n: number) {
-    this.permits = n;
-  }
-  acquire(): Promise<void> {
-    if (this.permits > 0) {
-      this.permits--;
-      return Promise.resolve();
-    }
-    return new Promise((resolve) => this.waiters.push(resolve));
-  }
-  release(): void {
-    const next = this.waiters.shift();
-    if (next) {
-      next();
-    } else {
-      this.permits++;
-    }
-  }
-}
