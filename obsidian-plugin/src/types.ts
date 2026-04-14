@@ -75,6 +75,14 @@ export interface SyncState {
   consecutiveAbsences?: number;
 }
 
+/** Result from GET /v1/fs/{path}?grep=<query> */
+export interface SearchResult {
+  path: string;
+  name: string;
+  size_bytes: number;
+  score?: number;
+}
+
 /** Persisted plugin data (settings + sync state). */
 export interface PluginData {
   settings: Drive9Settings;
