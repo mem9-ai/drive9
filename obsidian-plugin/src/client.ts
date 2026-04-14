@@ -1,5 +1,5 @@
 import { requestUrl, RequestUrlParam, Platform } from "obsidian";
-import type { StatResult, FileInfo, ProgressFn } from "./types";
+import type { StatResult, FileInfo, ProgressFn, SearchResult } from "./types";
 
 /** Files >= this size use multipart upload (matches server threshold). */
 const MULTIPART_THRESHOLD = 50_000; // 50 KB
@@ -281,6 +281,18 @@ export class Drive9Client {
     if (data && Array.isArray((data as Record<string, unknown>).entries)) {
       return (data as Record<string, unknown>).entries as FileInfo[];
     }
+    return [];
+  }
+
+  /** GET ?grep= — hybrid search (FTS + vector + keyword fallback). */
+  async grep(query: string, limit = 20): Promise<SearchResult[]> {
+    const q = encodeURIComponent(query);
+    const resp = await this.request(
+      "GET",
+      `/v1/fs/?grep=${q}&limit=${limit}`,
+    );
+    const data = resp.json;
+    if (Array.isArray(data)) return data as SearchResult[];
     return [];
   }
 

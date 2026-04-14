@@ -5,6 +5,7 @@ import { SyncEngine } from "./sync-engine";
 import { ShadowStore } from "./shadow-store";
 import { ConflictResolver } from "./conflict-resolver";
 import { Drive9SettingTab } from "./settings";
+import { Drive9SearchModal } from "./search-modal";
 import { runFirstRunReconciliation, pullAllRemote } from "./first-run";
 import type { PluginData, Drive9Settings, SyncState } from "./types";
 import { DEFAULT_PLUGIN_DATA, DEFAULT_SETTINGS } from "./types";
@@ -74,6 +75,19 @@ export default class Drive9Plugin extends Plugin {
     this.syncEngine.onStatusChange(() => this.updateStatusBar());
 
     this.addSettingTab(new Drive9SettingTab(this.app, this));
+
+    this.addCommand({
+      id: "drive9-search",
+      name: "Search (drive9)",
+      hotkeys: [{ modifiers: ["Mod", "Shift"], key: "s" }],
+      callback: () => {
+        if (!this.settings.serverUrl) {
+          new Notice("drive9: configure server URL in settings first");
+          return;
+        }
+        new Drive9SearchModal(this.app, this.client).open();
+      },
+    });
 
     this.app.workspace.onLayoutReady(() => {
       void this.onLayoutReady();
