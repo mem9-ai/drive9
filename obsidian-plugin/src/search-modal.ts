@@ -32,9 +32,9 @@ export class Drive9SearchModal extends SuggestModal<SearchResult> {
     super(app);
     this.setPlaceholder(t("search.placeholder"));
     this.setInstructions([
-      { command: "↑↓", purpose: "navigate" },
-      { command: "↵", purpose: "open file" },
-      { command: "esc", purpose: "dismiss" },
+      { command: "↑↓", purpose: t("search.navigate") },
+      { command: "↵", purpose: t("search.open") },
+      { command: "esc", purpose: t("search.dismiss") },
     ]);
   }
 
@@ -66,9 +66,9 @@ export class Drive9SearchModal extends SuggestModal<SearchResult> {
         this.lastQuery = query;
         this.cachedResults = [];
         if (e instanceof Drive9Error) {
-          new Notice(`drive9 search: ${e.message}`);
+          new Notice(t("search.error", { detail: e.message }));
         } else {
-          new Notice(`drive9 search: ${sanitizeError(e instanceof Error ? e.message : String(e))}`);
+          new Notice(t("search.error", { detail: sanitizeError(e instanceof Error ? e.message : String(e)) }));
         }
       }
       this.searching = false;
@@ -115,7 +115,7 @@ export class Drive9SearchModal extends SuggestModal<SearchResult> {
       parts.push(formatSize(result.size_bytes));
     }
     if (result.score != null) {
-      parts.push(`score: ${result.score.toFixed(2)}`);
+      parts.push(t("search.score", { score: result.score.toFixed(2) }));
     }
     if (parts.length > 0) {
       meta.setText(parts.join(" · "));

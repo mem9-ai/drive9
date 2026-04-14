@@ -73,6 +73,11 @@ const zhCN: Record<LocaleKeys, string> = {
   "search.minChars": "请输入至少 3 个字符以搜索",
   "search.searching": "搜索中...",
   "search.noResults": "未找到结果",
+  "search.navigate": "导航",
+  "search.open": "打开文件",
+  "search.dismiss": "关闭",
+  "search.error": "drive9 搜索：{detail}",
+  "search.score": "分数：{score}",
   "search.notFoundLocally": "drive9：本地未找到文件 — {path}",
 
   // Conflict modal

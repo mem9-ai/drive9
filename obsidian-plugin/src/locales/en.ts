@@ -71,6 +71,11 @@ const en = {
   "search.minChars": "Type at least 3 characters to search",
   "search.searching": "Searching...",
   "search.noResults": "No results found",
+  "search.navigate": "navigate",
+  "search.open": "open file",
+  "search.dismiss": "dismiss",
+  "search.error": "drive9 search: {detail}",
+  "search.score": "score: {score}",
   "search.notFoundLocally": "drive9: file not found locally — {path}",
 
   // Conflict modal
