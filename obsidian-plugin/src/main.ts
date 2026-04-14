@@ -1,4 +1,4 @@
-import { Plugin, Notice, TFile } from "obsidian";
+import { Plugin, Notice, TFile, addIcon } from "obsidian";
 import { Drive9Client, sanitizeError } from "./client";
 import { RemoteWatcher } from "./remote-watcher";
 import { SyncEngine } from "./sync-engine";
@@ -85,7 +85,7 @@ export default class Drive9Plugin extends Plugin {
       id: "drive9-search",
       name: t("cmd.search"),
       callback: () => {
-        if (!this.settings.serverUrl) {
+        if (!this.settings.serverUrl || !this.settings.apiKey) {
           new Notice(t("notice.configureFirst"));
           return;
         }
@@ -102,8 +102,9 @@ export default class Drive9Plugin extends Plugin {
       },
     });
 
-    this.addRibbonIcon("search", t("cmd.searchRibbon"), () => {
-      if (!this.settings.serverUrl) {
+    addIcon("drive9", DRIVE9_ICON_SVG);
+    this.addRibbonIcon("drive9", t("cmd.searchRibbon"), () => {
+      if (!this.settings.serverUrl || !this.settings.apiKey) {
         new Notice(t("notice.configureFirst"));
         return;
       }
@@ -116,7 +117,7 @@ export default class Drive9Plugin extends Plugin {
   }
 
   private async onLayoutReady(): Promise<void> {
-    if (!this.settings.serverUrl) {
+    if (!this.settings.serverUrl || !this.settings.apiKey) {
       this.setStatusBar(t("status.configure"));
       return;
     }
@@ -256,6 +257,10 @@ export default class Drive9Plugin extends Plugin {
     const raw = await this.loadData();
     const data: PluginData = Object.assign({}, DEFAULT_PLUGIN_DATA, raw ?? {});
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings);
+    // Migration: existing installs may have empty serverUrl from before it was hardcoded
+    if (!this.settings.serverUrl) {
+      this.settings.serverUrl = DEFAULT_SETTINGS.serverUrl;
+    }
     this.syncStates = data.syncStates ?? {};
     this.firstRunComplete = data.firstRunComplete ?? false;
     this.actorId = data.actorId ?? "";
@@ -384,6 +389,9 @@ export default class Drive9Plugin extends Plugin {
     }
   }
 }
+
+/** drive9 logo as SVG for Obsidian's addIcon (100x100 viewBox, no fill — inherits currentColor). */
+const DRIVE9_ICON_SVG = `<text x="50" y="68" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" font-weight="bold" font-size="48" fill="currentColor">D9</text>`;
 
 function generateActorId(): string {
   if (globalThis.crypto?.randomUUID) {

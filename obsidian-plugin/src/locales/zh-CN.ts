@@ -5,7 +5,7 @@ const zhCN: Record<LocaleKeys, string> = {
   // Settings
   "settings.title": "drive9 设置",
   "settings.serverUrl": "服务器地址",
-  "settings.serverUrl.desc": "drive9 服务器地址（例如 https://api.drive9.ai）",
+  "settings.serverUrl.desc": "drive9 服务器地址（仅自建服务器时修改）",
   "settings.apiKey": "API 密钥",
   "settings.apiKey.desc": "drive9 身份验证密钥",
   "settings.testConnection": "测试连接",
@@ -19,6 +19,7 @@ const zhCN: Record<LocaleKeys, string> = {
   "settings.maxFileSize.desc": "跳过超过此大小的文件（默认：100）",
   "settings.mobileMaxFileSize": "移动端最大文件大小（MB）",
   "settings.mobileMaxFileSize.desc": "移动端文件大小上限，避免内存不足（默认：20）",
+  "settings.advanced": "高级设置",
   "settings.enterServerUrl": "请先输入服务器地址",
   "settings.enterApiKey": "请先输入 API 密钥",
   "settings.connectionSuccess": "drive9：连接成功！",
@@ -49,7 +50,7 @@ const zhCN: Record<LocaleKeys, string> = {
   "cmd.searchRibbon": "搜索 drive9",
 
   // Notices — main
-  "notice.configureFirst": "drive9：请先在设置中配置服务器地址",
+  "notice.configureFirst": "drive9：请先在设置中配置 API 密钥",
   "notice.retrying": "drive9：正在重试同步...",
   "notice.firstRunFailed": "drive9：首次运行失败 — {error}",
   "notice.uploading": "drive9：正在上传 {count} 个文件到 drive9...",

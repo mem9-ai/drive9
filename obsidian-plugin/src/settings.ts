@@ -19,19 +19,7 @@ export class Drive9SettingTab extends PluginSettingTab {
 
     containerEl.createEl("h2", { text: t("settings.title") });
 
-    new Setting(containerEl)
-      .setName(t("settings.serverUrl"))
-      .setDesc(t("settings.serverUrl.desc"))
-      .addText((text) =>
-        text
-          .setPlaceholder("https://api.drive9.ai")
-          .setValue(this.plugin.settings.serverUrl)
-          .onChange(async (value) => {
-            this.plugin.settings.serverUrl = value.trim();
-            await this.plugin.savePluginData();
-            this.scheduleValidation();
-          }),
-      );
+    // --- Main settings: API Key + Test Connection ---
 
     new Setting(containerEl)
       .setName(t("settings.apiKey"))
@@ -58,7 +46,26 @@ export class Drive9SettingTab extends PluginSettingTab {
         }),
       );
 
-    new Setting(containerEl)
+    // --- Advanced settings (collapsed) ---
+
+    const details = containerEl.createEl("details");
+    details.createEl("summary", { text: t("settings.advanced"), cls: "drive9-advanced-summary" });
+
+    new Setting(details)
+      .setName(t("settings.serverUrl"))
+      .setDesc(t("settings.serverUrl.desc"))
+      .addText((text) =>
+        text
+          .setPlaceholder("https://api.drive9.ai")
+          .setValue(this.plugin.settings.serverUrl)
+          .onChange(async (value) => {
+            this.plugin.settings.serverUrl = value.trim();
+            await this.plugin.savePluginData();
+            this.scheduleValidation();
+          }),
+      );
+
+    new Setting(details)
       .setName(t("settings.pushDebounce"))
       .setDesc(t("settings.pushDebounce.desc"))
       .addText((text) =>
@@ -74,7 +81,7 @@ export class Drive9SettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(details)
       .setName(t("settings.ignorePaths"))
       .setDesc(t("settings.ignorePaths.desc"))
       .addTextArea((text) =>
@@ -90,7 +97,7 @@ export class Drive9SettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(details)
       .setName(t("settings.maxFileSize"))
       .setDesc(t("settings.maxFileSize.desc"))
       .addText((text) =>
@@ -106,7 +113,7 @@ export class Drive9SettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(details)
       .setName(t("settings.mobileMaxFileSize"))
       .setDesc(t("settings.mobileMaxFileSize.desc"))
       .addText((text) =>
@@ -135,10 +142,6 @@ export class Drive9SettingTab extends PluginSettingTab {
   }
 
   private async testConnection(): Promise<void> {
-    if (!this.plugin.settings.serverUrl) {
-      new Notice(t("settings.enterServerUrl"));
-      return;
-    }
     if (!this.plugin.settings.apiKey) {
       new Notice(t("settings.enterApiKey"));
       return;
@@ -205,4 +208,3 @@ export class Drive9SettingTab extends PluginSettingTab {
     warning.createSpan({ text: message });
   }
 }
-
