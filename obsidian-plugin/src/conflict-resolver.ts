@@ -98,7 +98,14 @@ export class ConflictResolver {
       if (resolved) return;
     }
 
-    // Auto-merge failed or binary file — show modal
+    // Auto-merge failed or binary file — check if user already dismissed this conflict
+    // Only use fingerprint when we have a real revision (not the fallback 0)
+    const hasRealRevision = remoteStat.revision > 0;
+    const fingerprint = hasRealRevision ? `${path}:${remoteStat.revision}` : null;
+    if (fingerprint && state.dismissedFingerprint === fingerprint) {
+      return;
+    }
+
     const info = createConflictInfo(
       path,
       localFile.stat.size,
@@ -108,9 +115,14 @@ export class ConflictResolver {
     );
     const choice = await new ConflictModal(this.app, info).open();
     if (choice === null) {
-      // User dismissed modal — keep conflict for next cycle
+      // User dismissed modal — only record fingerprint if we have a real revision
+      // When revision is unknown, allow re-popup next cycle rather than permanently suppress
+      if (fingerprint) {
+        state.dismissedFingerprint = fingerprint;
+      }
       return;
     }
+    state.dismissedFingerprint = undefined;
     await this.applyChoice(path, choice, localFile, localData, remoteData, remoteStat.revision);
   }
 

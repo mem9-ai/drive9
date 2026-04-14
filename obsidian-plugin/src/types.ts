@@ -81,6 +81,8 @@ export interface SyncState {
   deleteDetectionSource?: "polling" | "sse";
   /** Number of consecutive polls where this file was absent from remote. */
   consecutiveAbsences?: number;
+  /** Fingerprint of a dismissed conflict (path:remoteRevision). Suppresses re-popup until conflict changes. */
+  dismissedFingerprint?: string;
 }
 
 /** Persisted plugin data (settings + sync state). */
