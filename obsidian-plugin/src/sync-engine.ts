@@ -22,6 +22,7 @@ export class SyncEngine {
   private _pendingCount = 0;
   private _uploadProgressText = "";
   private _skippedLargeFiles: string[] = [];
+  private _lastErrorDetail = "";
   private statusListeners: Array<() => void> = [];
 
   private shadowStore: ShadowStore | null = null;
@@ -56,8 +57,20 @@ export class SyncEngine {
     return this._skippedLargeFiles;
   }
 
+  get lastErrorDetail(): string {
+    return this._lastErrorDetail;
+  }
+
   onStatusChange(fn: () => void): void {
     this.statusListeners.push(fn);
+  }
+
+  retrySync(): void {
+    if (this._status === "error" && this.dirtyPaths.size > 0) {
+      this._lastErrorDetail = "";
+      this.setStatus("idle", this.dirtyPaths.size);
+      this.scheduleFlush();
+    }
   }
 
   updateSettings(settings: Drive9Settings): void {
@@ -176,17 +189,20 @@ export class SyncEngine {
       this.setStatus("syncing", paths.length);
 
       let errorOccurred = false;
+      let lastFailedPath = "";
 
       for (const path of paths) {
         try {
           await this.pushOne(path);
         } catch (e) {
           errorOccurred = true;
+          lastFailedPath = path;
           console.error(`[drive9] push failed: ${path}`, e instanceof Error ? e.message : sanitizeError(String(e)));
           this.dirtyPaths.add(path);
         }
       }
 
+      this._lastErrorDetail = lastFailedPath;
       this.setStatus(errorOccurred ? "error" : "idle", this.dirtyPaths.size);
       await this.persistData();
     });

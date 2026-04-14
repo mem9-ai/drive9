@@ -98,7 +98,12 @@ export class ConflictResolver {
       if (resolved) return;
     }
 
-    // Auto-merge failed or binary file — show modal
+    // Auto-merge failed or binary file — check if user already dismissed this conflict
+    const fingerprint = `${path}:${remoteStat.revision}`;
+    if (state.dismissedFingerprint === fingerprint) {
+      return;
+    }
+
     const info = createConflictInfo(
       path,
       localFile.stat.size,
@@ -108,9 +113,11 @@ export class ConflictResolver {
     );
     const choice = await new ConflictModal(this.app, info).open();
     if (choice === null) {
-      // User dismissed modal — keep conflict for next cycle
+      // User dismissed modal — record fingerprint to suppress re-popup until conflict changes
+      state.dismissedFingerprint = fingerprint;
       return;
     }
+    state.dismissedFingerprint = undefined;
     await this.applyChoice(path, choice, localFile, localData, remoteData, remoteStat.revision);
   }
 
