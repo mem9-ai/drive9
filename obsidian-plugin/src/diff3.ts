@@ -187,6 +187,35 @@ function longestCommonSubsequence(a: string[], b: string[]): LCSEntry[] {
   return result;
 }
 
+/**
+ * Generate a compact unified-style diff preview between two texts.
+ * Shows only changed lines with minimal context, truncated to maxLines.
+ */
+export function simpleDiff(local: string, remote: string, maxLines = 30): string {
+  const localLines = splitLines(local);
+  const remoteLines = splitLines(remote);
+  const edits = diffLines(localLines, remoteLines);
+
+  const output: string[] = [];
+  for (const edit of edits) {
+    if (output.length >= maxLines) {
+      output.push("...");
+      break;
+    }
+    switch (edit.type) {
+      case "remove":
+        output.push(`- ${edit.line}`);
+        break;
+      case "add":
+        output.push(`+ ${edit.line}`);
+        break;
+      // skip "keep" lines to keep preview compact
+    }
+  }
+
+  return output.length > 0 ? output.join("\n") : "(no textual differences)";
+}
+
 function splitLines(text: string): string[] {
   if (text === "") return [];
   return text.split("\n");

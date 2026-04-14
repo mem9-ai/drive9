@@ -1,7 +1,7 @@
 import { App, Vault, TFile, Notice } from "obsidian";
 import { Drive9Client, Drive9Error } from "./client";
 import { ShadowStore } from "./shadow-store";
-import { merge3 } from "./diff3";
+import { merge3, simpleDiff } from "./diff3";
 import { ConflictModal, createConflictInfo, isTextFile } from "./conflict-modal";
 import type { ConflictChoice } from "./conflict-modal";
 import type { SyncState } from "./types";
@@ -106,12 +106,24 @@ export class ConflictResolver {
       return;
     }
 
+    let diffPreview: string | undefined;
+    if (isTextFile(path)) {
+      try {
+        const localText = decodeText(localData);
+        const remoteText = decodeText(remoteData);
+        diffPreview = simpleDiff(localText, remoteText);
+      } catch {
+        // diff preview is best-effort
+      }
+    }
+
     const info = createConflictInfo(
       path,
       localFile.stat.size,
       localFile.stat.mtime,
       remoteStat.size,
       remoteStat.mtime,
+      diffPreview,
     );
     const choice = await new ConflictModal(this.app, info).open();
     if (choice === null) {
