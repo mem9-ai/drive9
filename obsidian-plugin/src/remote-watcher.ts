@@ -2,7 +2,8 @@ import { Platform } from "obsidian";
 import { Drive9Client, sanitizeError } from "./client";
 import type { ChangeEvent, ResetEvent } from "./types";
 
-const POLL_INTERVAL_MS = 30_000;
+const POLL_INTERVAL_DESKTOP_MS = 30_000;
+const POLL_INTERVAL_MOBILE_MS = 60_000;
 const SSE_INITIAL_BACKOFF_MS = 1_000;
 const SSE_MAX_BACKOFF_MS = 30_000;
 
@@ -90,9 +91,10 @@ export class RemoteWatcher {
 
   private startPolling(runImmediately: boolean): void {
     if (!this.pollTimer) {
+      const interval = Platform.isMobile ? POLL_INTERVAL_MOBILE_MS : POLL_INTERVAL_DESKTOP_MS;
       this.pollTimer = setInterval(() => {
         void this.runPoll();
-      }, POLL_INTERVAL_MS);
+      }, interval);
     }
     if (runImmediately) {
       void this.runPoll();
