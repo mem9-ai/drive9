@@ -1,4 +1,4 @@
-import { App, SuggestModal, Notice } from "obsidian";
+import { App, SuggestModal, Notice, TFile } from "obsidian";
 import { Drive9Client, Drive9Error, sanitizeError } from "./client";
 import { isTextFile } from "./conflict-modal";
 import type { SearchResult } from "./types";
@@ -21,7 +21,7 @@ export class Drive9SearchModal extends SuggestModal<SearchResult> {
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private lastQuery = "";
   private cachedResults: SearchResult[] = [];
-  private previewCache = new Map<string, string | null>();
+  private previewCache = new Map<string, Promise<string | null>>();
   private searching = false;
 
   constructor(
@@ -128,19 +128,13 @@ export class Drive9SearchModal extends SuggestModal<SearchResult> {
       previewEl.style.overflow = "hidden";
       previewEl.style.textOverflow = "ellipsis";
 
-      const cached = this.previewCache.get(result.path);
-      if (cached !== undefined) {
-        if (cached) previewEl.setText(cached);
-      } else {
-        previewEl.setText("loading preview...");
-        this.fetchPreview(result.path).then((text) => {
-          if (text) {
-            previewEl.setText(text);
-          } else {
-            previewEl.remove();
-          }
-        });
-      }
+      this.fetchPreview(result.path).then((text) => {
+        if (text) {
+          previewEl.setText(text);
+        } else {
+          previewEl.remove();
+        }
+      });
     }
   }
 
@@ -161,18 +155,24 @@ export class Drive9SearchModal extends SuggestModal<SearchResult> {
     }
   }
 
-  private async fetchPreview(path: string): Promise<string | null> {
-    if (this.previewCache.has(path)) {
-      return this.previewCache.get(path) ?? null;
-    }
+  private fetchPreview(path: string): Promise<string | null> {
+    const existing = this.previewCache.get(path);
+    if (existing) return existing;
+
+    const promise = this.doFetchPreview(path);
+    this.previewCache.set(path, promise);
+    return promise;
+  }
+
+  private async doFetchPreview(path: string): Promise<string | null> {
     try {
-      const data = await this.client.read(path);
-      const text = new TextDecoder().decode(data.slice(0, PREVIEW_MAX_CHARS * 4));
-      const preview = text.slice(0, PREVIEW_MAX_CHARS).replace(/\n/g, " ").trim();
-      this.previewCache.set(path, preview || null);
+      // Read from local vault — file is already synced, no remote call needed
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) return null;
+      const content = await this.app.vault.cachedRead(file);
+      const preview = content.slice(0, PREVIEW_MAX_CHARS).replace(/\n/g, " ").trim();
       return preview || null;
     } catch {
-      this.previewCache.set(path, null);
       return null;
     }
   }
