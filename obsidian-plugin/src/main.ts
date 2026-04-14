@@ -6,6 +6,7 @@ import { ShadowStore } from "./shadow-store";
 import { ConflictResolver } from "./conflict-resolver";
 import { Drive9SettingTab } from "./settings";
 import { Drive9SearchModal } from "./search-modal";
+import { SyncPanelModal } from "./sync-panel-modal";
 import { runFirstRunReconciliation, pullAllRemote } from "./first-run";
 import type { PluginData, Drive9Settings, SyncState } from "./types";
 import { DEFAULT_PLUGIN_DATA, DEFAULT_SETTINGS } from "./types";
@@ -336,40 +337,31 @@ export default class Drive9Plugin extends Plugin {
 
   private showSyncPanel(): void {
     const engine = this.syncEngine;
-    const conflicts = this.countConflicts();
-    const pending = engine.pendingCount;
-    const skipped = engine.skippedLargeFiles;
-    const status = engine.status;
 
-    const lines: string[] = [];
-
-    if (status === "offline") {
-      lines.push("Offline: server unreachable");
-      lines.push("Run command \"Retry failed sync\" when back online");
-    } else if (status === "error") {
-      const detail = engine.lastErrorDetail;
-      lines.push(detail ? `Error: ${detail} failed to sync` : "Error: sync failed");
-      lines.push("Run command \"Retry failed sync\" to retry");
-    } else if (status === "syncing") {
-      lines.push(`Syncing ${pending} file${pending !== 1 ? "s" : ""}...`);
-    } else {
-      lines.push("Sync: idle");
+    const conflicts: Array<{ path: string; state: SyncState }> = [];
+    for (const [path, state] of Object.entries(this.syncStates)) {
+      if (state.status === "conflict") {
+        conflicts.push({ path, state });
+      }
     }
 
-    if (conflicts > 0) {
-      lines.push(`${conflicts} conflict${conflicts > 1 ? "s" : ""} pending`);
-    }
-    if (pending > 0 && status !== "syncing") {
-      lines.push(`${pending} file${pending !== 1 ? "s" : ""} queued`);
-    }
-    if (skipped.length > 0) {
-      lines.push(`${skipped.length} file${skipped.length > 1 ? "s" : ""} skipped (too large)`);
-    }
-    if (lines.length === 1 && status === "idle" && conflicts === 0) {
-      lines.push("All files synced");
-    }
-
-    new Notice(lines.join("\n"), 8000);
+    new SyncPanelModal(this.app, {
+      status: engine.status,
+      pendingCount: engine.pendingCount,
+      lastErrorDetail: engine.lastErrorDetail,
+      skippedLargeFiles: engine.skippedLargeFiles,
+      conflicts,
+      onRetry: () => {
+        this.syncEngine.retrySync();
+        new Notice("drive9: retrying sync...");
+      },
+      onOpenFile: (path) => {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (file instanceof TFile) {
+          void this.app.workspace.getLeaf().openFile(file);
+        }
+      },
+    }).open();
   }
 
   private setStatusBar(text: string): void {
