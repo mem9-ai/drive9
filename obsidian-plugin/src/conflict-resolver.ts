@@ -6,6 +6,8 @@ import { ConflictModal, createConflictInfo, isTextFile } from "./conflict-modal"
 import type { ConflictChoice } from "./conflict-modal";
 import type { SyncState } from "./types";
 
+const CONFLICT_DISMISS_MS = 30 * 60_000; // 30 minutes
+
 /**
  * ConflictResolver handles conflict and remote_deleted states
  * produced by the SyncEngine.
@@ -91,6 +93,16 @@ export class ConflictResolver {
       remoteStat = { revision: 0, mtime: 0, size: remoteData.byteLength };
     }
 
+    // Check if this conflict was recently dismissed with the same fingerprint
+    const fingerprint = conflictFingerprint(path, remoteStat.revision, state.lastSyncedContentHash);
+    if (
+      state.conflictDismissedFingerprint === fingerprint &&
+      state.conflictDismissedAt &&
+      Date.now() - state.conflictDismissedAt < CONFLICT_DISMISS_MS
+    ) {
+      return;
+    }
+
     const localData = await this.vault.readBinary(localFile);
 
     if (isTextFile(path)) {
@@ -108,9 +120,14 @@ export class ConflictResolver {
     );
     const choice = await new ConflictModal(this.app, info).open();
     if (choice === null) {
-      // User dismissed modal — keep conflict for next cycle
+      // User dismissed modal — suppress for 30 min with this fingerprint
+      state.conflictDismissedFingerprint = fingerprint;
+      state.conflictDismissedAt = Date.now();
       return;
     }
+    // Clear dismiss state on explicit resolution
+    delete state.conflictDismissedFingerprint;
+    delete state.conflictDismissedAt;
     await this.applyChoice(path, choice, localFile, localData, remoteData, remoteStat.revision);
   }
 
@@ -296,6 +313,10 @@ function makeConflictPath(path: string): string {
     return `${path}.conflict`;
   }
   return `${path.slice(0, lastDot)}.conflict${path.slice(lastDot)}`;
+}
+
+function conflictFingerprint(path: string, remoteRevision: number, contentHash?: string): string {
+  return `${path}:${remoteRevision}:${contentHash ?? ""}`;
 }
 
 function decodeText(data: ArrayBuffer): string {

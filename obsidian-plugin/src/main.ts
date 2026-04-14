@@ -6,6 +6,7 @@ import { ShadowStore } from "./shadow-store";
 import { ConflictResolver } from "./conflict-resolver";
 import { Drive9SettingTab } from "./settings";
 import { Drive9SearchModal } from "./search-modal";
+import { SyncPanelModal, buildSyncPanelInfo } from "./sync-panel";
 import { runFirstRunReconciliation, pullAllRemote } from "./first-run";
 import type { PluginData, Drive9Settings, SyncState } from "./types";
 import { DEFAULT_PLUGIN_DATA, DEFAULT_SETTINGS } from "./types";
@@ -71,21 +72,39 @@ export default class Drive9Plugin extends Plugin {
     }
 
     this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.addEventListener("click", () => this.openSyncPanel());
+    this.statusBarEl.style.cursor = "pointer";
     this.updateStatusBar();
     this.syncEngine.onStatusChange(() => this.updateStatusBar());
 
     this.addSettingTab(new Drive9SettingTab(this.app, this));
 
+    this.addRibbonIcon("search", "Search drive9", () => {
+      if (!this.settings.serverUrl) {
+        new Notice("drive9: configure server URL in settings first");
+        return;
+      }
+      new Drive9SearchModal(this.app, this.client).open();
+    });
+
     this.addCommand({
       id: "drive9-search",
       name: "Search (drive9)",
-      hotkeys: [{ modifiers: ["Mod", "Shift"], key: "s" }],
       callback: () => {
         if (!this.settings.serverUrl) {
           new Notice("drive9: configure server URL in settings first");
           return;
         }
         new Drive9SearchModal(this.app, this.client).open();
+      },
+    });
+
+    this.addCommand({
+      id: "drive9-retry-sync",
+      name: "Retry failed sync (drive9)",
+      callback: () => {
+        this.syncEngine.retryFailed();
+        new Notice("drive9: retrying failed files...");
       },
     });
 
@@ -263,6 +282,30 @@ export default class Drive9Plugin extends Plugin {
     }
   }
 
+  private openSyncPanel(): void {
+    const engine = this.syncEngine;
+    if (!engine) return;
+    const info = buildSyncPanelInfo(
+      this.syncStates,
+      engine.pendingCount,
+      engine.skippedLargeFiles,
+      engine.lastErrorPath,
+      engine.status === "error",
+      engine.status === "idle" && engine.consecutiveNetworkFailures >= 3,
+    );
+    new SyncPanelModal(
+      this.app,
+      info,
+      () => {
+        engine.retryFailed();
+        new Notice("drive9: retrying failed files...");
+      },
+      (path) => {
+        void this.app.workspace.openLinkText(path, "", false);
+      },
+    ).open();
+  }
+
   private updateStatusBar(): void {
     const engine = this.syncEngine;
     if (!engine) return;
@@ -270,17 +313,31 @@ export default class Drive9Plugin extends Plugin {
     const skipped = engine.skippedLargeFiles.length;
     switch (engine.status) {
       case "syncing": {
-        const progress = engine.uploadProgressText;
-        if (progress) {
-          this.setStatusBar(`↕ drive9: ${progress}`);
+        const upload = engine.uploadProgressText;
+        const push = engine.pushProgressText;
+        if (upload) {
+          this.setStatusBar(`↕ drive9: ${upload}`);
+        } else if (push) {
+          this.setStatusBar(`↕ drive9: syncing ${push}`);
         } else {
           this.setStatusBar(`↕ drive9: syncing ${engine.pendingCount} files`);
         }
         break;
       }
-      case "error":
-        this.setStatusBar("✗ drive9: error");
+      case "error": {
+        if (engine.consecutiveNetworkFailures >= 3) {
+          this.setStatusBar("◌ drive9: offline");
+        } else {
+          const errPath = engine.lastErrorPath;
+          if (errPath) {
+            const name = errPath.includes("/") ? errPath.slice(errPath.lastIndexOf("/") + 1) : errPath;
+            this.setStatusBar(`✗ drive9: failed ${name}`);
+          } else {
+            this.setStatusBar("✗ drive9: error");
+          }
+        }
         break;
+      }
       case "idle":
         if (engine.pendingCount > 0) {
           this.setStatusBar(`↕ drive9: queued ${engine.pendingCount} files`);

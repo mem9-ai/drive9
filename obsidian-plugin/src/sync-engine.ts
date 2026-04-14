@@ -21,7 +21,10 @@ export class SyncEngine {
   private _status: SyncStatus = "idle";
   private _pendingCount = 0;
   private _uploadProgressText = "";
+  private _pushProgressText = "";
   private _skippedLargeFiles: string[] = [];
+  private _lastErrorPath = "";
+  private _consecutiveNetworkFailures = 0;
   private statusListeners: Array<() => void> = [];
 
   private shadowStore: ShadowStore | null = null;
@@ -52,12 +55,31 @@ export class SyncEngine {
     return this._uploadProgressText;
   }
 
+  get pushProgressText(): string {
+    return this._pushProgressText;
+  }
+
   get skippedLargeFiles(): string[] {
     return this._skippedLargeFiles;
   }
 
+  get lastErrorPath(): string {
+    return this._lastErrorPath;
+  }
+
+  get consecutiveNetworkFailures(): number {
+    return this._consecutiveNetworkFailures;
+  }
+
   onStatusChange(fn: () => void): void {
     this.statusListeners.push(fn);
+  }
+
+  retryFailed(): void {
+    if (this.dirtyPaths.size > 0) {
+      this._lastErrorPath = "";
+      this.scheduleFlush();
+    }
   }
 
   updateSettings(settings: Drive9Settings): void {
@@ -173,20 +195,34 @@ export class SyncEngine {
       this.dirtyPaths.clear();
       this._skippedLargeFiles = [];
 
-      this.setStatus("syncing", paths.length);
+      const total = paths.length;
+      this.setStatus("syncing", total);
 
       let errorOccurred = false;
+      let completed = 0;
 
       for (const path of paths) {
+        if (total > 1) {
+          this._pushProgressText = `${completed + 1}/${total}`;
+          this.notifyStatusChange();
+        }
         try {
           await this.pushOne(path);
+          this._consecutiveNetworkFailures = 0;
         } catch (e) {
           errorOccurred = true;
+          this._lastErrorPath = path;
+          this._consecutiveNetworkFailures++;
           console.error(`[drive9] push failed: ${path}`, e instanceof Error ? e.message : sanitizeError(String(e)));
           this.dirtyPaths.add(path);
         }
+        completed++;
       }
 
+      this._pushProgressText = "";
+      if (!errorOccurred) {
+        this._lastErrorPath = "";
+      }
       this.setStatus(errorOccurred ? "error" : "idle", this.dirtyPaths.size);
       await this.persistData();
     });
