@@ -1,6 +1,7 @@
 import { Vault, TFile, TAbstractFile, Notice, Platform } from "obsidian";
 import { Drive9Client, Drive9Error, sanitizeError } from "./client";
 import { IgnoreMatcher } from "./ignore";
+import { t } from "./i18n";
 import type { ShadowStore } from "./shadow-store";
 import type { SyncState, Drive9Settings } from "./types";
 
@@ -250,7 +251,7 @@ export class SyncEngine {
       const sizeMB = (file.stat.size / (1024 * 1024)).toFixed(1);
       const limitMB = (effectiveMaxSize / (1024 * 1024)).toFixed(0);
       console.warn(`[drive9] skipping large file: ${path} (${file.stat.size} bytes, limit ${effectiveMaxSize})`);
-      new Notice(`drive9: skipped ${path} (${sizeMB} MB exceeds ${limitMB} MB limit)`);
+      new Notice(t("notice.skippedLarge", { path, sizeMB, limitMB }));
       if (!this._skippedLargeFiles.includes(path)) {
         this._skippedLargeFiles.push(path);
       }
@@ -322,7 +323,7 @@ export class SyncEngine {
             status: "conflict",
           };
         }
-        new Notice(`drive9: conflict detected for ${path}`);
+        new Notice(t("notice.conflictDetected", { path }));
         return;
       }
       throw e;
@@ -453,7 +454,7 @@ export class SyncEngine {
     };
 
     if (!wasConflict) {
-      new Notice(`drive9: conflict detected for ${path}`);
+      new Notice(t("notice.conflictDetected", { path }));
     }
   }
 

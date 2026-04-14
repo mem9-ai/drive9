@@ -8,6 +8,7 @@ import { Drive9SettingTab } from "./settings";
 import { Drive9SearchModal } from "./search-modal";
 import { SyncPanelModal } from "./sync-panel-modal";
 import { runFirstRunReconciliation, pullAllRemote } from "./first-run";
+import { initLocale, t } from "./i18n";
 import type { PluginData, Drive9Settings, SyncState } from "./types";
 import { DEFAULT_PLUGIN_DATA, DEFAULT_SETTINGS } from "./types";
 
@@ -26,6 +27,7 @@ export default class Drive9Plugin extends Plugin {
   private actorId = "";
 
   async onload(): Promise<void> {
+    initLocale();
     await this.loadPluginData();
 
     const needsActorId = !this.actorId;
@@ -81,10 +83,10 @@ export default class Drive9Plugin extends Plugin {
 
     this.addCommand({
       id: "drive9-search",
-      name: "Search (drive9)",
+      name: t("cmd.search"),
       callback: () => {
         if (!this.settings.serverUrl) {
-          new Notice("drive9: configure server URL in settings first");
+          new Notice(t("notice.configureFirst"));
           return;
         }
         new Drive9SearchModal(this.app, this.client).open();
@@ -93,16 +95,16 @@ export default class Drive9Plugin extends Plugin {
 
     this.addCommand({
       id: "drive9-retry-sync",
-      name: "Retry failed sync (drive9)",
+      name: t("cmd.retrySync"),
       callback: () => {
         this.syncEngine.retrySync();
-        new Notice("drive9: retrying sync...");
+        new Notice(t("notice.retrying"));
       },
     });
 
-    this.addRibbonIcon("search", "Search drive9", () => {
+    this.addRibbonIcon("search", t("cmd.searchRibbon"), () => {
       if (!this.settings.serverUrl) {
-        new Notice("drive9: configure server URL in settings first");
+        new Notice(t("notice.configureFirst"));
         return;
       }
       new Drive9SearchModal(this.app, this.client).open();
@@ -115,7 +117,7 @@ export default class Drive9Plugin extends Plugin {
 
   private async onLayoutReady(): Promise<void> {
     if (!this.settings.serverUrl) {
-      this.setStatusBar("⚙ drive9: configure in settings");
+      this.setStatusBar(t("status.configure"));
       return;
     }
 
@@ -124,8 +126,8 @@ export default class Drive9Plugin extends Plugin {
         await this.doFirstRun();
       } catch (e) {
         console.error("[drive9] first-run failed", e instanceof Error ? e.message : sanitizeError(String(e)));
-        new Notice(`drive9: first-run failed — ${e instanceof Error ? e.message : sanitizeError(String(e))}`);
-        this.setStatusBar("✗ drive9: first-run failed");
+        new Notice(t("notice.firstRunFailed", { error: e instanceof Error ? e.message : sanitizeError(String(e)) }));
+        this.setStatusBar(t("status.firstRunFailed"));
         return;
       }
     }
@@ -157,11 +159,11 @@ export default class Drive9Plugin extends Plugin {
       void this.conflictResolver.gcShadows();
     }, 5 * 60_000);
 
-    this.setStatusBar("✓ drive9: synced");
+    this.setStatusBar(t("status.synced"));
   }
 
   private async doFirstRun(): Promise<void> {
-    this.setStatusBar("↕ drive9: reconciling...");
+    this.setStatusBar(t("status.reconciling"));
 
     const result = await runFirstRunReconciliation(
       this.app,
@@ -174,19 +176,19 @@ export default class Drive9Plugin extends Plugin {
       case "push_all": {
         const files = this.app.vault.getFiles();
         const total = files.length;
-        new Notice(`drive9: uploading ${total} files to drive9...`);
-        this.setStatusBar(`↕ drive9: queuing 0/${total} files`);
+        new Notice(t("notice.uploading", { count: total }));
+        this.setStatusBar(t("status.queuing", { current: 0, total }));
         for (let i = 0; i < files.length; i++) {
           this.syncEngine.onLocalCreate(files[i]);
           if ((i + 1) % 50 === 0 || i === files.length - 1) {
-            this.setStatusBar(`↕ drive9: queuing ${i + 1}/${total} files`);
+            this.setStatusBar(t("status.queuing", { current: i + 1, total }));
           }
         }
         break;
       }
 
       case "pull_all":
-        new Notice("drive9: downloading from drive9...");
+        new Notice(t("notice.downloading"));
         await pullAllRemote(
           this.app.vault,
           this.client,
@@ -242,7 +244,7 @@ export default class Drive9Plugin extends Plugin {
         break;
 
       case "cancelled":
-        new Notice("drive9: first-run cancelled. Sync is disabled.");
+        new Notice(t("notice.firstRunCancelled"));
         return;
     }
 
@@ -299,29 +301,29 @@ export default class Drive9Plugin extends Plugin {
       case "syncing": {
         const progress = engine.uploadProgressText;
         if (progress) {
-          this.setStatusBar(`↕ drive9: ${progress}`);
+          this.setStatusBar(t("status.syncingProgress", { progress }));
         } else {
-          this.setStatusBar(`↕ drive9: syncing ${engine.pendingCount} files`);
+          this.setStatusBar(t("status.syncing", { count: engine.pendingCount }));
         }
         break;
       }
       case "offline":
-        this.setStatusBar("⏸ drive9: offline");
+        this.setStatusBar(t("status.offline"));
         break;
       case "error": {
         const detail = engine.lastErrorDetail;
-        this.setStatusBar(detail ? `✗ drive9: ${detail} failed` : "✗ drive9: error");
+        this.setStatusBar(detail ? t("status.errorDetail", { detail }) : t("status.error"));
         break;
       }
       case "idle":
         if (engine.pendingCount > 0) {
-          this.setStatusBar(`↕ drive9: queued ${engine.pendingCount} files`);
+          this.setStatusBar(t("status.queued", { count: engine.pendingCount }));
         } else if (conflicts > 0) {
-          this.setStatusBar(`⚠ drive9: ${conflicts} conflict${conflicts > 1 ? "s" : ""}`);
+          this.setStatusBar(t(conflicts > 1 ? "status.conflictsPlural" : "status.conflicts", { count: conflicts }));
         } else if (skipped > 0) {
-          this.setStatusBar(`✓ drive9: synced (${skipped} skipped — too large)`);
+          this.setStatusBar(t("status.syncedSkipped", { count: skipped }));
         } else {
-          this.setStatusBar("✓ drive9: synced");
+          this.setStatusBar(t("status.synced"));
         }
         break;
     }
@@ -353,7 +355,7 @@ export default class Drive9Plugin extends Plugin {
       conflicts,
       onRetry: () => {
         this.syncEngine.retrySync();
-        new Notice("drive9: retrying sync...");
+        new Notice(t("notice.retrying"));
       },
       onOpenFile: (path) => {
         const file = this.app.vault.getAbstractFileByPath(path);

@@ -1,5 +1,6 @@
 import { Vault, TFile, Modal, App, Setting, Notice } from "obsidian";
 import { Drive9Client, Drive9Error } from "./client";
+import { t } from "./i18n";
 import type { ShadowStore } from "./shadow-store";
 import type { SyncState } from "./types";
 import { IgnoreMatcher } from "./ignore";
@@ -59,8 +60,8 @@ export async function runFirstRunReconciliation(
   if (!remoteEmpty && localEmpty) {
     const confirmed = await askUser(
       app,
-      "Download from drive9?",
-      `drive9 has ${remoteFiles.size} files. Download them to your vault?`,
+      t("firstRun.downloadTitle"),
+      t("firstRun.downloadMsg", { count: remoteFiles.size }),
     );
     return confirmed ? { action: "pull_all" } : { action: "cancelled" };
   }
@@ -94,16 +95,10 @@ export async function runFirstRunReconciliation(
   }
 
   if (bothPresent.length > 0) {
-    const msg = [
-      `Found ${bothPresent.length} file(s) that exist on both sides.`,
-      "",
-      bothPresent.slice(0, 10).join("\n"),
-      bothPresent.length > 10 ? `...and ${bothPresent.length - 10} more` : "",
-      "",
-      "Without checksums, content equality cannot be verified.",
-      "These files are marked as conflicts until manually resolved.",
-      "Files unique to each side will be synced normally.",
-    ].join("\n");
+    const fileList = bothPresent.slice(0, 10).join("\n");
+    const more = bothPresent.length > 10 ? t("firstRun.andMore", { count: bothPresent.length - 10 }) : "";
+    const files = more ? `${fileList}\n${more}` : fileList;
+    const msg = t("firstRun.bothSidesNotice", { count: bothPresent.length, files });
 
     new Notice(msg, 15000);
   }
@@ -216,7 +211,7 @@ export async function pullAllRemote(
     count++;
   }
 
-  new Notice(`drive9: downloaded ${count} files`);
+  new Notice(t("notice.downloaded", { count }));
 }
 
 // ---------------------------------------------------------------------------
@@ -247,13 +242,13 @@ class ConfirmModal extends Modal {
 
     new Setting(contentEl)
       .addButton((btn) =>
-        btn.setButtonText("Yes").setCta().onClick(() => {
+        btn.setButtonText(t("firstRun.yes")).setCta().onClick(() => {
           this.resolve(true);
           this.close();
         }),
       )
       .addButton((btn) =>
-        btn.setButtonText("Cancel").onClick(() => {
+        btn.setButtonText(t("firstRun.cancel")).onClick(() => {
           this.resolve(false);
           this.close();
         }),
