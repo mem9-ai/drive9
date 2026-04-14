@@ -6,6 +6,12 @@ import (
 	"strconv"
 )
 
+// Keep this statement list aligned with the externally managed tidb_zero
+// schema. If you change columns, indexes, generated expressions, or
+// constraints here, update the corresponding external TiDB schema workflow.
+// For tidb_zero's exported init SQL, rerun:
+//
+//	drive9-server schema dump-init-sql --provider tidb_zero
 func tidbAppEmbeddingSchemaStatements() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (

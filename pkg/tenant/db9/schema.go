@@ -9,17 +9,15 @@ import (
 	"github.com/mem9-ai/dat9/pkg/vault"
 )
 
-func initDB9Schema(dsn string) error {
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = db.Close() }()
-	if err := db.Ping(); err != nil {
-		return err
-	}
-
-	stmts := []string{
+// InitSchemaStatements returns the exact DDL statements used by db9 tenant
+// schema initialization, including vault tables.
+func InitSchemaStatements() []string {
+	// Keep this statement list aligned with the externally managed tidb_zero
+	// schema. If you change columns, indexes, generated expressions, or
+	// constraints here, rerun:
+	//   drive9-server schema dump-init-sql --provider db9
+	// and update tidb_zero with the exported SQL.
+	core := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
 			path         VARCHAR(512) NOT NULL,
@@ -112,10 +110,24 @@ func initDB9Schema(dsn string) error {
 		`CREATE INDEX IF NOT EXISTS idx_task_claim ON semantic_tasks(status, available_at, lease_until, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_task_claim_type ON semantic_tasks(status, task_type, available_at, created_at, task_id)`,
 	}
+	stmts := make([]string, 0, len(core)+len(vault.SchemaStatements()))
+	stmts = append(stmts, core...)
+	stmts = append(stmts, vault.SchemaStatements()...)
+	return stmts
+}
 
-	if err := schema.ExecSchemaStatements(db, stmts); err != nil {
+func initDB9Schema(dsn string) error {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
 		return err
 	}
-	// Initialize vault tables alongside core tables.
-	return vault.InitSchema(db)
+	defer func() { _ = db.Close() }()
+	if err := db.Ping(); err != nil {
+		return err
+	}
+
+	if err := schema.ExecSchemaStatements(db, InitSchemaStatements()); err != nil {
+		return err
+	}
+	return nil
 }
