@@ -4,7 +4,7 @@ import { IgnoreMatcher } from "./ignore";
 import type { ShadowStore } from "./shadow-store";
 import type { SyncState, Drive9Settings } from "./types";
 
-export type SyncStatus = "idle" | "syncing" | "error";
+export type SyncStatus = "idle" | "syncing" | "error" | "offline";
 
 const LOCAL_EVENT_SUPPRESS_WINDOW_MS = 1000;
 
@@ -223,7 +223,10 @@ export class SyncEngine {
       if (!errorOccurred) {
         this._lastErrorPath = "";
       }
-      this.setStatus(errorOccurred ? "error" : "idle", this.dirtyPaths.size);
+      const finalStatus: SyncStatus = errorOccurred
+        ? (this._consecutiveNetworkFailures >= 3 ? "offline" : "error")
+        : "idle";
+      this.setStatus(finalStatus, this.dirtyPaths.size);
       await this.persistData();
     });
   }

@@ -290,8 +290,8 @@ export default class Drive9Plugin extends Plugin {
       engine.pendingCount,
       engine.skippedLargeFiles,
       engine.lastErrorPath,
-      engine.status === "error",
-      engine.status === "idle" && engine.consecutiveNetworkFailures >= 3,
+      engine.status === "error" || engine.status === "offline",
+      engine.status === "offline",
     );
     new SyncPanelModal(
       this.app,
@@ -325,19 +325,18 @@ export default class Drive9Plugin extends Plugin {
         break;
       }
       case "error": {
-        if (engine.consecutiveNetworkFailures >= 3) {
-          this.setStatusBar("◌ drive9: offline");
+        const errPath = engine.lastErrorPath;
+        if (errPath) {
+          const name = errPath.includes("/") ? errPath.slice(errPath.lastIndexOf("/") + 1) : errPath;
+          this.setStatusBar(`✗ drive9: failed ${name}`);
         } else {
-          const errPath = engine.lastErrorPath;
-          if (errPath) {
-            const name = errPath.includes("/") ? errPath.slice(errPath.lastIndexOf("/") + 1) : errPath;
-            this.setStatusBar(`✗ drive9: failed ${name}`);
-          } else {
-            this.setStatusBar("✗ drive9: error");
-          }
+          this.setStatusBar("✗ drive9: error");
         }
         break;
       }
+      case "offline":
+        this.setStatusBar("◌ drive9: offline");
+        break;
       case "idle":
         if (engine.pendingCount > 0) {
           this.setStatusBar(`↕ drive9: queued ${engine.pendingCount} files`);

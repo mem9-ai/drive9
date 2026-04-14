@@ -93,14 +93,19 @@ export class ConflictResolver {
       remoteStat = { revision: 0, mtime: 0, size: remoteData.byteLength };
     }
 
-    // Check if this conflict was recently dismissed with the same fingerprint
-    const fingerprint = conflictFingerprint(path, remoteStat.revision, state.lastSyncedContentHash);
-    if (
-      state.conflictDismissedFingerprint === fingerprint &&
-      state.conflictDismissedAt &&
-      Date.now() - state.conflictDismissedAt < CONFLICT_DISMISS_MS
-    ) {
-      return;
+    // Check if this conflict was recently dismissed with the same fingerprint.
+    // Only use fingerprint when we have a real revision — fallback revision 0
+    // is ambiguous and could suppress unrelated future conflicts.
+    const hasRealRevision = remoteStat.revision > 0;
+    if (hasRealRevision) {
+      const fingerprint = conflictFingerprint(path, remoteStat.revision, state.lastSyncedContentHash);
+      if (
+        state.conflictDismissedFingerprint === fingerprint &&
+        state.conflictDismissedAt &&
+        Date.now() - state.conflictDismissedAt < CONFLICT_DISMISS_MS
+      ) {
+        return;
+      }
     }
 
     const localData = await this.vault.readBinary(localFile);
@@ -120,9 +125,13 @@ export class ConflictResolver {
     );
     const choice = await new ConflictModal(this.app, info).open();
     if (choice === null) {
-      // User dismissed modal — suppress for 30 min with this fingerprint
-      state.conflictDismissedFingerprint = fingerprint;
-      state.conflictDismissedAt = Date.now();
+      // User dismissed modal — suppress for 30 min, but only if we have a
+      // reliable fingerprint (real revision). Otherwise let it re-trigger.
+      if (hasRealRevision) {
+        const fingerprint = conflictFingerprint(path, remoteStat.revision, state.lastSyncedContentHash);
+        state.conflictDismissedFingerprint = fingerprint;
+        state.conflictDismissedAt = Date.now();
+      }
       return;
     }
     // Clear dismiss state on explicit resolution
