@@ -163,14 +163,16 @@ export async function pullAllRemote(
   syncStates: Record<string, SyncState>,
   ignorePaths: string[],
   shadowStore?: ShadowStore,
+  onProgress?: (current: number, total: number) => void,
+  persistData?: () => Promise<void>,
 ): Promise<void> {
   const ignore = new IgnoreMatcher(ignorePaths);
   const entries = await client.listRecursive("/");
+  const filtered = entries.filter((e) => !ignore.isIgnored(e.name));
+  const total = filtered.length;
   let count = 0;
 
-  for (const entry of entries) {
-    if (ignore.isIgnored(entry.name)) continue;
-
+  for (const entry of filtered) {
     // Ensure parent directories exist.
     const dir = entry.name.contains("/")
       ? entry.name.substring(0, entry.name.lastIndexOf("/"))
@@ -209,6 +211,17 @@ export async function pullAllRemote(
       };
     }
     count++;
+    onProgress?.(count, total);
+
+    // Persist every 10 files so interrupted downloads retain progress
+    if (persistData && count % 10 === 0) {
+      await persistData();
+    }
+  }
+
+  // Final persist to capture any remaining state
+  if (persistData) {
+    await persistData();
   }
 
   new Notice(t("notice.downloaded", { count }));

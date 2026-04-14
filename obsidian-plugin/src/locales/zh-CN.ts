@@ -8,6 +8,9 @@ const zhCN: Record<LocaleKeys, string> = {
   "settings.serverUrl.desc": "drive9 服务器地址（仅自建服务器时修改）",
   "settings.apiKey": "API 密钥",
   "settings.apiKey.desc": "drive9 身份验证密钥",
+  "settings.apiKey.toggle": "显示/隐藏密钥",
+  "settings.apiKey.copy": "复制密钥",
+  "settings.apiKey.copied": "已复制到剪贴板",
   "settings.testConnection": "测试连接",
   "settings.testConnection.desc": "验证服务器地址和 API 密钥",
   "settings.testConnection.btn": "测试",
@@ -29,8 +32,15 @@ const zhCN: Record<LocaleKeys, string> = {
   "settings.gitignoreNoCoverage": ".gitignore 未覆盖 .obsidian/ — API 密钥可能会被提交到 git。",
   "settings.quickSetup": "⚡ 快速设置",
   "settings.quickSetupConnected": "已配置 — 账号已连接。",
-  "settings.quickSetupDesc": "一键创建免费 drive9 账号。",
-  "settings.quickSetupAlt": "或在下方输入已有的 API 密钥。",
+  "settings.quickSetupNewUser": "首次使用？一键创建免费 drive9 账号。",
+  "settings.quickSetupOr": "或",
+  "settings.quickSetupExistingUser": "已有账号？",
+  "settings.quickSetupExistingHint": "从其他设备粘贴 API 密钥即可同步。",
+  "settings.quickSetupKeyPlaceholder": "粘贴 API 密钥",
+  "settings.quickSetupConnect": "连接",
+  "settings.quickSetupConnecting": "连接中...",
+  "settings.quickSetupVerifying": "正在验证密钥...",
+  "settings.quickSetupKeySuccess": "已连接！同步将自动开始。",
   "settings.createAccount": "创建账号",
   "settings.creatingAccount": "正在创建账号...",
   "settings.provisionConnecting": "正在连接 drive9 服务器...",
@@ -60,6 +70,7 @@ const zhCN: Record<LocaleKeys, string> = {
   "status.conflictsPlural": "⚠ drive9：{count} 个冲突",
   "status.firstRunFailed": "✗ drive9：首次运行失败",
   "status.queuing": "↕ drive9：排队中 {current}/{total} 个文件",
+  "status.downloading": "↕ drive9：正在下载 {current}/{total} 个文件",
 
   // Commands
   "cmd.search": "搜索（drive9）",
@@ -78,6 +89,7 @@ const zhCN: Record<LocaleKeys, string> = {
   // Notices — sync engine
   "notice.skippedLarge": "drive9：已跳过 {path}（{sizeMB} MB 超过 {limitMB} MB 限制）",
   "notice.conflictDetected": "drive9：检测到 {path} 的冲突",
+  "notice.conflictsBatch": "drive9：检测到 {count} 个冲突，点击状态栏查看详情。",
 
   // Notices — conflict resolver
   "notice.autoMerged": "drive9：已自动合并 {path}",

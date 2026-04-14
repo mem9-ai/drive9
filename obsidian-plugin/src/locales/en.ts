@@ -6,6 +6,9 @@ const en = {
   "settings.serverUrl.desc": "drive9 server address (only change for self-hosted servers)",
   "settings.apiKey": "API Key",
   "settings.apiKey.desc": "drive9 API key for authentication",
+  "settings.apiKey.toggle": "Show/hide API key",
+  "settings.apiKey.copy": "Copy API key",
+  "settings.apiKey.copied": "API key copied to clipboard",
   "settings.testConnection": "Test Connection",
   "settings.testConnection.desc": "Verify server URL and API key",
   "settings.testConnection.btn": "Test",
@@ -27,8 +30,15 @@ const en = {
   "settings.gitignoreNoCoverage": ".gitignore does not cover .obsidian/ — your API key could be committed to git.",
   "settings.quickSetup": "⚡ Quick Setup",
   "settings.quickSetupConnected": "Already configured — your account is connected.",
-  "settings.quickSetupDesc": "Create a free drive9 account in one click.",
-  "settings.quickSetupAlt": "Or enter an existing API key below.",
+  "settings.quickSetupNewUser": "New to drive9? Create a free account in one click.",
+  "settings.quickSetupOr": "or",
+  "settings.quickSetupExistingUser": "Already have an account?",
+  "settings.quickSetupExistingHint": "Paste the API key from your other device.",
+  "settings.quickSetupKeyPlaceholder": "Paste your API key",
+  "settings.quickSetupConnect": "Connect",
+  "settings.quickSetupConnecting": "Connecting...",
+  "settings.quickSetupVerifying": "Verifying API key...",
+  "settings.quickSetupKeySuccess": "Connected! Sync will start automatically.",
   "settings.createAccount": "Create Account",
   "settings.creatingAccount": "Creating account...",
   "settings.provisionConnecting": "Connecting to drive9 servers...",
@@ -58,6 +68,7 @@ const en = {
   "status.conflictsPlural": "⚠ drive9: {count} conflicts",
   "status.firstRunFailed": "✗ drive9: first-run failed",
   "status.queuing": "↕ drive9: queuing {current}/{total} files",
+  "status.downloading": "↕ drive9: downloading {current}/{total} files",
 
   // Commands
   "cmd.search": "Search (drive9)",
@@ -76,6 +87,7 @@ const en = {
   // Notices — sync engine
   "notice.skippedLarge": "drive9: skipped {path} ({sizeMB} MB exceeds {limitMB} MB limit)",
   "notice.conflictDetected": "drive9: conflict detected for {path}",
+  "notice.conflictsBatch": "drive9: {count} conflicts detected. Click the status bar to review.",
 
   // Notices — conflict resolver
   "notice.autoMerged": "drive9: auto-merged {path}",
