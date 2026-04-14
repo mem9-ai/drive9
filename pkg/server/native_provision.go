@@ -116,6 +116,14 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
+	// If a zero instance was verified during auth, capture its expiration.
+	// Use r.Context() because authorizeNativeTarget mutates the request
+	// context (not the local ctx captured earlier).
+	var claimExpiresAt *time.Time
+	if zi := zeroInfoFromContext(r.Context()); zi != nil {
+		claimExpiresAt = zi.ExpiresAt
+	}
+
 	if err := s.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantProvisioning,
@@ -127,6 +135,7 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 		DBTLS:            true,
 		Provider:         provider,
 		ClusterID:        cluster.ClusterID,
+		ClaimExpiresAt:   claimExpiresAt,
 		SchemaVersion:    1,
 		CreatedAt:        now,
 		UpdatedAt:        now,
@@ -139,6 +148,45 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 			if getErr == nil && (existing.Status == meta.TenantFailed || existing.Status == meta.TenantProvisioning) {
 				logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_retrying_failed_tenant",
 					"tenant_id", tenantID, "old_status", string(existing.Status))...)
+
+				// If the existing tenant already has fs_admin credentials,
+				// reuse them (decrypted via KMS) instead of resetting to
+				// root and generating a new password.
+				if strings.HasSuffix(existing.DBUser, ".fs_admin") || existing.DBUser == "fs_admin" {
+					plain, decErr := s.pool.Decrypt(ctx, existing.DBPasswordCipher)
+					if decErr == nil {
+						logger.Info(ctx, "server_event", eventFields(ctx, "native_provision_reuse_fs_admin",
+							"tenant_id", tenantID, "db_user", existing.DBUser)...)
+						resumeCluster := &tenant.ClusterInfo{
+							TenantID:      tenantID,
+							ClusterID:     cluster.ClusterID,
+							Host:          cluster.Host,
+							Port:          cluster.Port,
+							Username:      existing.DBUser,
+							Password:      string(plain),
+							DBName:        existing.DBName,
+							Provider:      cluster.Provider,
+							ProxyEndpoint: cluster.ProxyEndpoint,
+							UserPrefix:    cluster.UserPrefix,
+						}
+						if uerr := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantProvisioning); uerr != nil {
+							logger.Error(ctx, "server_event", eventFields(ctx, "native_provision_retry_reset_status_failed",
+								"tenant_id", tenantID, "error", uerr)...)
+							errJSON(w, http.StatusInternalServerError, "failed to reset tenant status")
+							return
+						}
+						go s.nativeProvisionAsync(backgroundWithTrace(ctx), np, tenantID, resumeCluster, provider)
+						w.WriteHeader(http.StatusAccepted)
+						_ = json.NewEncoder(w).Encode(map[string]string{
+							"tenant_id": tenantID,
+							"status":    string(meta.TenantProvisioning),
+						})
+						return
+					}
+					logger.Warn(ctx, "server_event", eventFields(ctx, "native_provision_decrypt_existing_failed",
+						"tenant_id", tenantID, "error", decErr)...)
+					// Fall through to re-provision with root credentials.
+				}
 
 				// Update credentials and reset status to provisioning.
 				if uerr := s.meta.UpdateTenantDBCredentials(ctx, tenantID, cluster.Username, cipherPass, cluster.DBName); uerr != nil {

@@ -149,8 +149,12 @@ func TestVerifyZeroInstance_Success(t *testing.T) {
 	}
 
 	p := NewProvisioner(global, nil, nil)
-	if err := p.VerifyZeroInstance(context.Background(), "inst-abc"); err != nil {
+	info, err := p.VerifyZeroInstance(context.Background(), "inst-abc")
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if info == nil || info.ID != "inst-abc" {
+		t.Fatalf("unexpected info: %+v", info)
 	}
 }
 
@@ -162,7 +166,7 @@ func TestVerifyZeroInstance_NotFound(t *testing.T) {
 	}
 
 	p := NewProvisioner(global, nil, nil)
-	err := p.VerifyZeroInstance(context.Background(), "fake-id")
+	_, err := p.VerifyZeroInstance(context.Background(), "fake-id")
 	if err == nil {
 		t.Fatal("expected error")
 	}

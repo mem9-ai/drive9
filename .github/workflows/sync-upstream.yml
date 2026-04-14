@@ -16,17 +16,69 @@ jobs:
           token: ${{ secrets.PAT_TOKEN }}
 
       - name: Sync upstream
+        id: sync
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/mem9-ai/drive9.git || true
           git fetch upstream
-          git checkout main
-          if ! git merge upstream/main --no-edit -X theirs; then
-            git diff --name-only --diff-filter=U | while read f; do
-              git checkout upstream/main -- "$f" 2>/dev/null || git rm "$f" 2>/dev/null || true
-            done
-            git add -A
-            git commit --no-edit
+
+          # Nothing to do if already up-to-date.
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "already_up_to_date=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          git push origin main
+
+          echo "already_up_to_date=false" >> "$GITHUB_OUTPUT"
+
+          # Try a clean fast-forward or conflict-free merge directly to main.
+          git checkout main
+          if git merge upstream/main --no-edit; then
+            echo "merge_clean=true" >> "$GITHUB_OUTPUT"
+            git push origin main
+          else
+            # Merge has conflicts — capture conflicting paths before aborting.
+            CONFLICTS=$(git diff --name-only --diff-filter=U | head -20)
+            echo "conflicts<<CONFLICTS_EOF" >> "$GITHUB_OUTPUT"
+            echo "$CONFLICTS" >> "$GITHUB_OUTPUT"
+            echo "CONFLICTS_EOF" >> "$GITHUB_OUTPUT"
+            git merge --abort
+            echo "merge_clean=false" >> "$GITHUB_OUTPUT"
+
+            BRANCH="sync-upstream/$(date +%Y%m%d-%H%M%S)"
+            git checkout -b "$BRANCH" upstream/main
+            echo "pr_branch=$BRANCH" >> "$GITHUB_OUTPUT"
+            git push origin "$BRANCH"
+          fi
+
+      - name: Create PR for conflicting merge
+        if: steps.sync.outputs.merge_clean == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          CONFLICTS="${{ steps.sync.outputs.conflicts }}"
+          gh pr create \
+            --base main \
+            --head "${{ steps.sync.outputs.pr_branch }}" \
+            --title "sync: merge upstream/main (conflicts need manual resolution)" \
+            --body "$(cat <<EOF
+          Automatic upstream sync detected merge conflicts and skipped the auto-merge
+          to avoid silently overwriting fork-specific code.
+
+          **Conflicting files (Go):**
+          \`\`\`
+          $CONFLICTS
+          \`\`\`
+
+          Please merge \`main\` into this branch, resolve conflicts manually, then merge the PR.
+
+          \`\`\`bash
+          git fetch origin
+          git checkout ${{ steps.sync.outputs.pr_branch }}
+          git merge origin/main
+          # resolve conflicts, then:
+          git add -A && git commit
+          git push
+          \`\`\`
+          EOF
+          )"
