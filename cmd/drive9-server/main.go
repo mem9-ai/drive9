@@ -281,7 +281,7 @@ environment:
 
 schema tooling:
   dump-init-sql writes the exact init schema SQL to stdout so external systems
-  such as tidb_zero can stay in sync with drive9's schema source of truth.
+  such as tidb_cloud_starter can stay in sync with drive9's schema source of truth.
 `, server.DefaultMaxUploadBytes)
 	os.Exit(2)
 }

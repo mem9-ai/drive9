@@ -40,7 +40,7 @@ type tidbTableMeta struct {
 	columns   map[string]tidbColumnMeta
 }
 
-// Keep this statement list aligned with the externally managed tidb_zero
+// Keep this statement list aligned with the externally managed tidb_cloud_starter
 // schema. If you change columns, indexes, generated expressions, or
 // constraints here, rerun:
 //

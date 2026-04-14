@@ -12,11 +12,11 @@ import (
 // InitSchemaStatements returns the exact DDL statements used by db9 tenant
 // schema initialization, including vault tables.
 func InitSchemaStatements() []string {
-	// Keep this statement list aligned with the externally managed tidb_zero
+	// Keep this statement list aligned with the externally managed tidb_cloud_starter
 	// schema. If you change columns, indexes, generated expressions, or
 	// constraints here, rerun:
 	//   drive9-server schema dump-init-sql --provider db9
-	// and update tidb_zero with the exported SQL.
+	// and update tidb_cloud_starter with the exported SQL.
 	core := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,

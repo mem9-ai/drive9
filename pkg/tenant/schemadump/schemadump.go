@@ -14,7 +14,7 @@ const usage = "usage: drive9-server schema dump-init-sql --provider <db9|tidb_ze
 // ResolveProvider normalizes a schema dump provider selection.
 func ResolveProvider(provider string) (string, error) {
 	if provider == "" {
-		return "", fmt.Errorf(usage)
+		return "", fmt.Errorf("%s", usage)
 	}
 	normalized, err := tenant.NormalizeProvider(provider)
 	if err != nil {

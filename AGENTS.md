@@ -261,7 +261,7 @@ Obtain a logger from `pkg/logger` or accept `*zap.Logger` via `Config`.
 - `pkg/tenant/schema/tidb_auto.go`, `pkg/tenant/schema/tidb_app.go`, and `pkg/tenant/db9/schema.go`
   are the source of truth for tenant init schema SQL.
 - If you change schema shape in those files — columns, indexes, generated columns, constraints,
-  defaults, or table definitions — you must also update the externally managed `tidb_zero`
+  defaults, or table definitions — you must also update the externally managed `tidb_cloud_starter`
   schema using the exported SQL from:
 
 ```bash
