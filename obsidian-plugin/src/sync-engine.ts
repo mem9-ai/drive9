@@ -325,7 +325,7 @@ export class SyncEngine {
             status: "conflict",
           };
         }
-        new Notice(t("notice.conflictDetected", { path }));
+        this.notifyConflict(path);
         return;
       }
       throw e;

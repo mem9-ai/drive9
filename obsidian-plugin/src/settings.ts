@@ -346,6 +346,7 @@ export class Drive9SettingTab extends PluginSettingTab {
     btn: HTMLButtonElement,
     statusEl: HTMLElement,
   ): Promise<void> {
+    if (btn.disabled) return;
     const key = input.value.trim();
     if (!key) {
       statusEl.style.display = "block";

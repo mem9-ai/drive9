@@ -14,6 +14,7 @@ import type { SyncState } from "./types";
 export class ConflictResolver {
   private shadowStore: ShadowStore;
   private resolving = false;
+  private lastBatchRemaining = 0;
   private suppressLocalEvent: ((path: string, fn: () => Promise<void>) => Promise<void>) | null = null;
 
   constructor(
@@ -83,9 +84,14 @@ export class ConflictResolver {
         for (const state of Object.values(this.syncStates)) {
           if (state.status === "conflict") remaining++;
         }
-        if (remaining > 0) {
+        // Only show batch notice when count changes to avoid repeating
+        // the same toast every 10s resolver tick
+        if (remaining > 0 && remaining !== this.lastBatchRemaining) {
           new Notice(t("notice.conflictsBatch", { count: remaining }), 10000);
         }
+        this.lastBatchRemaining = remaining;
+      } else {
+        this.lastBatchRemaining = 0;
       }
 
       await this.persistData();
