@@ -1,6 +1,7 @@
 import { App, SuggestModal, Notice, TFile } from "obsidian";
 import { Drive9Client, Drive9Error, sanitizeError } from "./client";
 import { isTextFile } from "./conflict-modal";
+import { t } from "./i18n";
 import type { SearchResult } from "./types";
 
 const DEBOUNCE_MS = 300;
@@ -29,11 +30,11 @@ export class Drive9SearchModal extends SuggestModal<SearchResult> {
     private client: Drive9Client,
   ) {
     super(app);
-    this.setPlaceholder("Search files in drive9...");
+    this.setPlaceholder(t("search.placeholder"));
     this.setInstructions([
-      { command: "↑↓", purpose: "navigate" },
-      { command: "↵", purpose: "open file" },
-      { command: "esc", purpose: "dismiss" },
+      { command: "↑↓", purpose: t("search.navigate") },
+      { command: "↵", purpose: t("search.open") },
+      { command: "esc", purpose: t("search.dismiss") },
     ]);
   }
 
@@ -65,9 +66,9 @@ export class Drive9SearchModal extends SuggestModal<SearchResult> {
         this.lastQuery = query;
         this.cachedResults = [];
         if (e instanceof Drive9Error) {
-          new Notice(`drive9 search: ${e.message}`);
+          new Notice(t("search.error", { detail: e.message }));
         } else {
-          new Notice(`drive9 search: ${sanitizeError(e instanceof Error ? e.message : String(e))}`);
+          new Notice(t("search.error", { detail: sanitizeError(e instanceof Error ? e.message : String(e)) }));
         }
       }
       this.searching = false;
@@ -80,19 +81,19 @@ export class Drive9SearchModal extends SuggestModal<SearchResult> {
 
   renderSuggestion(result: SearchResult, el: HTMLElement): void {
     if (result === EMPTY_STATE) {
-      el.createDiv({ cls: "drive9-search-state", text: "Type at least 3 characters to search" });
+      el.createDiv({ cls: "drive9-search-state", text: t("search.minChars") });
       el.style.color = "var(--text-muted)";
       el.style.fontStyle = "italic";
       return;
     }
     if (result === LOADING_STATE) {
-      el.createDiv({ cls: "drive9-search-state", text: "Searching..." });
+      el.createDiv({ cls: "drive9-search-state", text: t("search.searching") });
       el.style.color = "var(--text-muted)";
       el.style.fontStyle = "italic";
       return;
     }
     if (result === NO_RESULTS_STATE) {
-      el.createDiv({ cls: "drive9-search-state", text: "No results found" });
+      el.createDiv({ cls: "drive9-search-state", text: t("search.noResults") });
       el.style.color = "var(--text-muted)";
       el.style.fontStyle = "italic";
       return;
@@ -114,7 +115,7 @@ export class Drive9SearchModal extends SuggestModal<SearchResult> {
       parts.push(formatSize(result.size_bytes));
     }
     if (result.score != null) {
-      parts.push(`score: ${result.score.toFixed(2)}`);
+      parts.push(t("search.score", { score: result.score.toFixed(2) }));
     }
     if (parts.length > 0) {
       meta.setText(parts.join(" · "));
@@ -146,7 +147,7 @@ export class Drive9SearchModal extends SuggestModal<SearchResult> {
     if (file) {
       void this.app.workspace.openLinkText(result.path, "", false);
     } else {
-      new Notice(`drive9: file not found locally — ${result.path}`);
+      new Notice(t("search.notFoundLocally", { path: result.path }));
     }
   }
 

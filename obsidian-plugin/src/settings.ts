@@ -1,6 +1,7 @@
 import { App, PluginSettingTab, Setting, Notice } from "obsidian";
 import type Drive9Plugin from "./main";
 import { Drive9Client, sanitizeError } from "./client";
+import { t } from "./i18n";
 
 export class Drive9SettingTab extends PluginSettingTab {
   private validateTimer: ReturnType<typeof setTimeout> | null = null;
@@ -16,11 +17,11 @@ export class Drive9SettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "drive9 Settings" });
+    containerEl.createEl("h2", { text: t("settings.title") });
 
     new Setting(containerEl)
-      .setName("Server URL")
-      .setDesc("drive9 server address (e.g. https://api.drive9.ai)")
+      .setName(t("settings.serverUrl"))
+      .setDesc(t("settings.serverUrl.desc"))
       .addText((text) =>
         text
           .setPlaceholder("https://api.drive9.ai")
@@ -33,8 +34,8 @@ export class Drive9SettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("API Key")
-      .setDesc("drive9 API key for authentication")
+      .setName(t("settings.apiKey"))
+      .setDesc(t("settings.apiKey.desc"))
       .addText((text) => {
         text.inputEl.type = "password";
         text.inputEl.autocomplete = "off";
@@ -49,17 +50,17 @@ export class Drive9SettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("Test Connection")
-      .setDesc("Verify server URL and API key")
+      .setName(t("settings.testConnection"))
+      .setDesc(t("settings.testConnection.desc"))
       .addButton((btn) =>
-        btn.setButtonText("Test").onClick(async () => {
+        btn.setButtonText(t("settings.testConnection.btn")).onClick(async () => {
           await this.testConnection();
         }),
       );
 
     new Setting(containerEl)
-      .setName("Push Debounce (ms)")
-      .setDesc("Delay before syncing after a file change (default: 2000)")
+      .setName(t("settings.pushDebounce"))
+      .setDesc(t("settings.pushDebounce.desc"))
       .addText((text) =>
         text
           .setPlaceholder("2000")
@@ -74,8 +75,8 @@ export class Drive9SettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Ignore Paths")
-      .setDesc("Glob patterns to exclude from sync (one per line)")
+      .setName(t("settings.ignorePaths"))
+      .setDesc(t("settings.ignorePaths.desc"))
       .addTextArea((text) =>
         text
           .setPlaceholder(".obsidian/**\n.trash/**")
@@ -90,8 +91,8 @@ export class Drive9SettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Max File Size (MB)")
-      .setDesc("Skip files larger than this (default: 100)")
+      .setName(t("settings.maxFileSize"))
+      .setDesc(t("settings.maxFileSize.desc"))
       .addText((text) =>
         text
           .setPlaceholder("100")
@@ -106,8 +107,8 @@ export class Drive9SettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Mobile Max File Size (MB)")
-      .setDesc("Lower file size limit on mobile to avoid OOM (default: 20)")
+      .setName(t("settings.mobileMaxFileSize"))
+      .setDesc(t("settings.mobileMaxFileSize.desc"))
       .addText((text) =>
         text
           .setPlaceholder("20")
@@ -135,11 +136,11 @@ export class Drive9SettingTab extends PluginSettingTab {
 
   private async testConnection(): Promise<void> {
     if (!this.plugin.settings.serverUrl) {
-      new Notice("Please enter a server URL first");
+      new Notice(t("settings.enterServerUrl"));
       return;
     }
     if (!this.plugin.settings.apiKey) {
-      new Notice("Please enter an API key first");
+      new Notice(t("settings.enterApiKey"));
       return;
     }
     try {
@@ -148,10 +149,10 @@ export class Drive9SettingTab extends PluginSettingTab {
         this.plugin.settings.apiKey,
       );
       await testClient.ping();
-      new Notice("drive9: connection successful!");
+      new Notice(t("settings.connectionSuccess"));
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      new Notice(`drive9: connection failed — ${sanitizeError(msg)}`);
+      new Notice(t("settings.connectionFailed", { error: sanitizeError(msg) }));
     }
   }
 
@@ -168,7 +169,7 @@ export class Drive9SettingTab extends PluginSettingTab {
       if (!fs.existsSync(`${vaultRoot}/.git`)) return;
 
       if (!fs.existsSync(gitignorePath)) {
-        this.addGitignoreWarning(containerEl, "No .gitignore found. Your API key in .obsidian/ could be committed to git.");
+        this.addGitignoreWarning(containerEl, t("settings.gitignoreNoFile"));
         return;
       }
 
@@ -186,7 +187,7 @@ export class Drive9SettingTab extends PluginSettingTab {
       });
 
       if (!coversObsidian) {
-        this.addGitignoreWarning(containerEl, ".gitignore does not cover .obsidian/ — your API key could be committed to git.");
+        this.addGitignoreWarning(containerEl, t("settings.gitignoreNoCoverage"));
       }
     } catch {
       // Not on desktop or fs access failed — skip warning
@@ -200,7 +201,7 @@ export class Drive9SettingTab extends PluginSettingTab {
     warning.style.borderRadius = "4px";
     warning.style.backgroundColor = "var(--background-modifier-error)";
     warning.style.color = "var(--text-on-accent)";
-    warning.createEl("strong", { text: "⚠ Security Warning: " });
+    warning.createEl("strong", { text: t("settings.securityWarning") });
     warning.createSpan({ text: message });
   }
 }
