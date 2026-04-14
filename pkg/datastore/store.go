@@ -15,6 +15,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/metrics"
+	"github.com/mem9-ai/dat9/pkg/mysqlutil"
 	"go.uber.org/zap"
 )
 
@@ -123,11 +124,16 @@ func Open(dsn string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
+	applyMySQLPoolDefaults(db)
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
 	return &Store{db: db}, nil
+}
+
+func applyMySQLPoolDefaults(db *sql.DB) {
+	mysqlutil.ApplyPoolDefaults(db)
 }
 
 func (s *Store) Close() error { return s.db.Close() }
