@@ -14,6 +14,7 @@ import type { SyncState } from "./types";
 export class ConflictResolver {
   private shadowStore: ShadowStore;
   private resolving = false;
+  private lastBatchRemaining = 0;
   private suppressLocalEvent: ((path: string, fn: () => Promise<void>) => Promise<void>) | null = null;
 
   constructor(
@@ -46,28 +47,60 @@ export class ConflictResolver {
   /**
    * Scan all SyncState entries and resolve pending conflicts and remote deletes.
    * Only one resolution loop runs at a time.
+   *
+   * When there are many conflicts (e.g. after an interrupted first-run),
+   * only auto-merge is attempted. Individual modals are suppressed to avoid
+   * burying the user in popups — a single summary notice directs them to the
+   * sync panel instead.
    */
   async resolveAll(): Promise<void> {
     if (this.resolving) return;
     this.resolving = true;
     try {
+      const conflicts: Array<[string, SyncState]> = [];
       for (const [path, state] of Object.entries(this.syncStates)) {
         switch (state.status) {
           case "conflict":
-            await this.resolveConflict(path, state);
+            conflicts.push([path, state]);
             break;
           case "remote_deleted":
             await this.applyRemoteDelete(path, state);
             break;
         }
       }
+
+      // When many conflicts exist, only attempt auto-merge (no modal popups).
+      // Show a single batch notice pointing to the sync panel.
+      const BATCH_THRESHOLD = 5;
+      const batchMode = conflicts.length >= BATCH_THRESHOLD;
+
+      for (const [path, state] of conflicts) {
+        await this.resolveConflict(path, state, batchMode);
+      }
+
+      if (batchMode) {
+        // Re-count remaining conflicts after auto-merge attempts
+        let remaining = 0;
+        for (const state of Object.values(this.syncStates)) {
+          if (state.status === "conflict") remaining++;
+        }
+        // Only show batch notice when count changes to avoid repeating
+        // the same toast every 10s resolver tick
+        if (remaining > 0 && remaining !== this.lastBatchRemaining) {
+          new Notice(t("notice.conflictsBatch", { count: remaining }), 10000);
+        }
+        this.lastBatchRemaining = remaining;
+      } else {
+        this.lastBatchRemaining = 0;
+      }
+
       await this.persistData();
     } finally {
       this.resolving = false;
     }
   }
 
-  private async resolveConflict(path: string, state: SyncState): Promise<void> {
+  private async resolveConflict(path: string, state: SyncState, batchMode = false): Promise<void> {
     const localFile = this.getLocalFile(path);
 
     if (!localFile) {
@@ -99,7 +132,12 @@ export class ConflictResolver {
       if (resolved) return;
     }
 
-    // Auto-merge failed or binary file — check if user already dismissed this conflict
+    // Auto-merge failed or binary file.
+    // In batch mode (many conflicts), skip individual modals entirely —
+    // the caller will show a single summary notice.
+    if (batchMode) return;
+
+    // Check if user already dismissed this conflict.
     // Only use fingerprint when we have a real revision (not the fallback 0)
     const hasRealRevision = remoteStat.revision > 0;
     const fingerprint = hasRealRevision ? `${path}:${remoteStat.revision}` : null;
