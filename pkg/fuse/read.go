@@ -163,6 +163,16 @@ func (rc *ReadCache) InvalidatePrefix(prefix string) {
 	}
 }
 
+// InvalidateAll removes all entries from the cache.
+func (rc *ReadCache) InvalidateAll() {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	rc.items = make(map[string]*cacheEntry)
+	rc.order.Init()
+	rc.size = 0
+}
+
 // evict removes an entry from the items map, the LRU list, and decrements
 // the total cached size. The caller must hold rc.mu.
 func (rc *ReadCache) evict(entry *cacheEntry) {

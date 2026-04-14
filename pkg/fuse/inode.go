@@ -252,6 +252,20 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 	}
 }
 
+// Snapshot returns a copy of all entries. The caller can iterate outside
+// the lock, avoiding holding the read-lock during expensive callbacks
+// (e.g. kernel inode/entry notifications).
+func (m *InodeToPath) Snapshot() []InodeEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entries := make([]InodeEntry, 0, len(m.byInode))
+	for _, e := range m.byInode {
+		entries = append(entries, *e)
+	}
+	return entries
+}
+
 // Remove deletes the entry for the given path from both maps.
 func (m *InodeToPath) Remove(path string) {
 	m.mu.Lock()
