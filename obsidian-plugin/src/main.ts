@@ -85,7 +85,7 @@ export default class Drive9Plugin extends Plugin {
       id: "drive9-search",
       name: t("cmd.search"),
       callback: () => {
-        if (!this.settings.serverUrl) {
+        if (!this.settings.serverUrl || !this.settings.apiKey) {
           new Notice(t("notice.configureFirst"));
           return;
         }
@@ -103,7 +103,7 @@ export default class Drive9Plugin extends Plugin {
     });
 
     this.addRibbonIcon("search", t("cmd.searchRibbon"), () => {
-      if (!this.settings.serverUrl) {
+      if (!this.settings.serverUrl || !this.settings.apiKey) {
         new Notice(t("notice.configureFirst"));
         return;
       }
@@ -116,7 +116,7 @@ export default class Drive9Plugin extends Plugin {
   }
 
   private async onLayoutReady(): Promise<void> {
-    if (!this.settings.serverUrl) {
+    if (!this.settings.serverUrl || !this.settings.apiKey) {
       this.setStatusBar(t("status.configure"));
       return;
     }

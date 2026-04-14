@@ -12,7 +12,7 @@ export interface Drive9Settings {
 }
 
 export const DEFAULT_SETTINGS: Drive9Settings = {
-  serverUrl: "",
+  serverUrl: "https://api.drive9.ai",
   apiKey: "",
   pushDebounce: 2000,
   ignorePaths: [".obsidian/**", ".trash/**", "*.tmp", ".DS_Store"],
