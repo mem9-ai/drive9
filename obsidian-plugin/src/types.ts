@@ -36,6 +36,14 @@ export interface FileInfo {
   mtime: number;
 }
 
+/** Search result from GET /v1/fs/{path}?grep=... */
+export interface SearchResult {
+  path: string;
+  name: string;
+  size_bytes: number;
+  score?: number;
+}
+
 /** Remote filesystem mutation event from /v1/events. */
 export interface ChangeEvent {
   seq: number;
