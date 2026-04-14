@@ -48,7 +48,7 @@ export class Drive9SearchModal extends SuggestModal<SearchResult> {
           } else {
             new Notice(`drive9 search: ${sanitizeError(e instanceof Error ? e.message : String(e))}`);
           }
-          resolve(this.cachedResults);
+          resolve([]);
         }
       }, DEBOUNCE_MS);
     });
