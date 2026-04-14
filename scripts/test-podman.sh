@@ -29,8 +29,15 @@ case "$(uname -s)" in
     ;;
   Linux)
     podman_socket="$(podman info --format '{{.Host.RemoteSocket.Path}}' 2>/dev/null || true)"
+    podman_socket_exists="$(podman info --format '{{.Host.RemoteSocket.Exists}}' 2>/dev/null || true)"
     if [ -z "$podman_socket" ]; then
       fail "could not determine the Podman socket path from podman info"
+    fi
+    if [ "$podman_socket_exists" != "true" ]; then
+      fail "Podman reports remote socket unavailable at $podman_socket; start the Podman API service (for example: systemctl --user start podman.socket or podman system service --time=0 unix://$podman_socket)"
+    fi
+    if [ ! -S "$podman_socket" ]; then
+      fail "Podman socket path does not exist or is not a Unix socket: $podman_socket"
     fi
     ;;
   *)
@@ -46,3 +53,4 @@ if ! podman info >/dev/null 2>&1; then
 fi
 
 unset podman_socket
+unset podman_socket_exists
