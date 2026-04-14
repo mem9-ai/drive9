@@ -21,6 +21,7 @@ export default class Drive9Plugin extends Plugin {
   private shadowGCTimer: ReturnType<typeof setInterval> | null = null;
   private syncStates: Record<string, SyncState> = {};
   private firstRunComplete = false;
+  private syncStarted = false;
   private statusBarEl: HTMLElement | null = null;
   private actorId = "";
 
@@ -100,6 +101,21 @@ export default class Drive9Plugin extends Plugin {
       return;
     }
 
+    await this.startSyncIfReady();
+  }
+
+  /**
+   * Run first-run reconciliation (if needed) then register vault events
+   * and start the remote watcher. Safe to call multiple times — subsequent
+   * calls are no-ops once sync is running.
+   *
+   * Called from onLayoutReady() and from the settings page after provision.
+   */
+  async startSyncIfReady(): Promise<void> {
+    if (!this.settings.serverUrl || !this.settings.apiKey) {
+      return;
+    }
+
     if (!this.firstRunComplete) {
       try {
         await this.doFirstRun();
@@ -110,6 +126,10 @@ export default class Drive9Plugin extends Plugin {
         return;
       }
     }
+
+    // Guard against duplicate event registration
+    if (this.syncStarted) return;
+    this.syncStarted = true;
 
     this.registerEvent(
       this.app.vault.on("create", (file) => this.syncEngine.onLocalCreate(file)),
