@@ -257,6 +257,10 @@ export default class Drive9Plugin extends Plugin {
     const raw = await this.loadData();
     const data: PluginData = Object.assign({}, DEFAULT_PLUGIN_DATA, raw ?? {});
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings);
+    // Migration: existing installs may have empty serverUrl from before it was hardcoded
+    if (!this.settings.serverUrl) {
+      this.settings.serverUrl = DEFAULT_SETTINGS.serverUrl;
+    }
     this.syncStates = data.syncStates ?? {};
     this.firstRunComplete = data.firstRunComplete ?? false;
     this.actorId = data.actorId ?? "";
