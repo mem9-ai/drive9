@@ -26,6 +26,7 @@ export class Drive9SearchModal extends SuggestModal<SearchResult> {
 
   getSuggestions(query: string): SearchResult[] | Promise<SearchResult[]> {
     if (query.length < MIN_QUERY_LENGTH) {
+      this.lastQuery = "";
       this.cachedResults = [];
       return [];
     }
