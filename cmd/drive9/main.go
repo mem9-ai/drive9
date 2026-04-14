@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime/pprof"
 
 	"github.com/mem9-ai/dat9/cmd/drive9/cli"
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -38,6 +39,13 @@ func main() {
 			fmt.Fprintf(os.Stderr, "drive9: failed to initialize CLI logger: %v\n", err)
 		}
 	}
+
+	stopCPUProfile, err := startCPUProfileFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "drive9: %v\n", err)
+		os.Exit(1)
+	}
+	defer stopCPUProfile()
 
 	if len(os.Args) < 2 {
 		usage()
@@ -120,6 +128,27 @@ func main() {
 
 func versionString() string {
 	return fmt.Sprintf("drive9 %s\nGit Commit Hash: %s\n", version, gitHash)
+}
+
+func startCPUProfileFromEnv() (func(), error) {
+	profilePath := os.Getenv("DRIVE9_PROF_CPU_PROFILE")
+	if profilePath == "" {
+		return func() {}, nil
+	}
+
+	f, err := os.Create(profilePath)
+	if err != nil {
+		return nil, fmt.Errorf("create cpu profile %s: %w", profilePath, err)
+	}
+	if err := pprof.StartCPUProfile(f); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("start cpu profile %s: %w", profilePath, err)
+	}
+
+	return func() {
+		pprof.StopCPUProfile()
+		_ = f.Close()
+	}, nil
 }
 
 func runFS(args []string) {

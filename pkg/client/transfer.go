@@ -112,6 +112,30 @@ type DownloadSummary struct {
 	LocalPath      string    `json:"local_path"`
 }
 
+// UploadSummary exposes coarse-grained upload timings for CLI benchmark and
+// diagnosis workflows.
+type UploadSummary struct {
+	Type               string    `json:"type"`
+	Mode               string    `json:"mode"`
+	StartedAt          time.Time `json:"started_at"`
+	FinishedAt         time.Time `json:"finished_at"`
+	ElapsedSeconds     float64   `json:"elapsed_seconds"`
+	RemotePath         string    `json:"remote_path"`
+	TotalBytes         int64     `json:"total_bytes"`
+	PartSizeBytes      int64     `json:"part_size_bytes"`
+	TotalParts         int       `json:"total_parts"`
+	UploadedParts      int       `json:"uploaded_parts"`
+	Parallelism        int       `json:"parallelism"`
+	QuerySeconds       float64   `json:"query_seconds"`
+	ChecksumSeconds    float64   `json:"checksum_seconds"`
+	InitiateSeconds    float64   `json:"initiate_seconds"`
+	ResumeSeconds      float64   `json:"resume_seconds"`
+	PresignSeconds     float64   `json:"presign_seconds"`
+	UploadSeconds      float64   `json:"upload_seconds"`
+	CompleteSeconds    float64   `json:"complete_seconds"`
+	DirectWriteSeconds float64   `json:"direct_write_seconds"`
+}
+
 type downloadRange struct {
 	offset int64
 	length int64
@@ -197,52 +221,139 @@ func (p *uploadBufferPool) put(buf []byte) {
 // it does a direct PUT with body. For large files, it tries the v2 protocol
 // (on-demand presign, no upfront checksum) first, falling back to v1 on 404.
 func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc) error {
-	return c.WriteStreamConditional(ctx, path, r, size, progress, -1)
+	_, err := c.WriteStreamWithSummary(ctx, path, r, size, progress)
+	return err
+}
+
+// WriteStreamWithSummary uploads data from a reader and returns coarse-grained
+// phase timings for the completed upload.
+func (c *Client) WriteStreamWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc) (*UploadSummary, error) {
+	return c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, -1)
 }
 
 // WriteStreamConditional uploads data from a reader with optional CAS semantics.
 func (c *Client) WriteStreamConditional(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64) error {
+	_, err := c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, expectedRevision)
+	return err
+}
+
+func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64) (*UploadSummary, error) {
 	threshold := int64(DefaultSmallFileThreshold)
 	if c.smallFileThreshold > 0 {
 		threshold = c.smallFileThreshold
 	}
+	summary := &UploadSummary{
+		Type:       "upload_summary",
+		StartedAt:  time.Now(),
+		RemotePath: path,
+		TotalBytes: size,
+	}
 	if size < threshold {
+		summary.Mode = "direct_put"
+		summary.PartSizeBytes = size
+		summary.TotalParts = 1
+		summary.UploadedParts = 1
+		summary.Parallelism = 1
 		// Small file: direct PUT with body
+		directWriteStart := time.Now()
 		data, err := io.ReadAll(r)
 		if err != nil {
-			return fmt.Errorf("read data: %w", err)
+			return nil, fmt.Errorf("read data: %w", err)
 		}
-		return c.WriteCtxConditional(ctx, path, data, expectedRevision)
+		if err := c.WriteCtxConditional(ctx, path, data, expectedRevision); err != nil {
+			return nil, err
+		}
+		summary.DirectWriteSeconds = time.Since(directWriteStart).Seconds()
+		return finishUploadSummary(summary), nil
 	}
 	ra, ok := r.(io.ReaderAt)
 	if !ok {
-		return fmt.Errorf("large uploads require an io.ReaderAt (seekable source)")
+		return nil, fmt.Errorf("large uploads require an io.ReaderAt (seekable source)")
 	}
 
 	// Try v2 protocol first (on-demand presign, no checksum pre-computation).
-	err := c.writeStreamV2(ctx, path, ra, size, progress, expectedRevision)
+	err := c.writeStreamV2WithSummary(ctx, path, ra, size, progress, expectedRevision, summary)
 	if err == errV2NotAvailable {
 		// Server doesn't support v2 — fall back to v1.
-		return c.writeStreamV1(ctx, path, ra, size, progress, expectedRevision)
+		if err := c.writeStreamV1WithSummary(ctx, path, ra, size, progress, expectedRevision, summary); err != nil {
+			return nil, err
+		}
+		return finishUploadSummary(summary), nil
 	}
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return finishUploadSummary(summary), nil
 }
 
 // errV2NotAvailable is a sentinel indicating the server returned 404 for
 // the v2 initiate endpoint, so the caller should fall back to v1.
 var errV2NotAvailable = fmt.Errorf("v2 upload API not available")
 
+func finishUploadSummary(summary *UploadSummary) *UploadSummary {
+	if summary == nil {
+		return nil
+	}
+	summary.FinishedAt = time.Now()
+	summary.ElapsedSeconds = summary.FinishedAt.Sub(summary.StartedAt).Seconds()
+	return summary
+}
+
 // writeStreamV1 is the original v1 upload path: pre-compute checksums → initiate → upload all.
 func (c *Client) writeStreamV1(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
+	return c.writeStreamV1WithSummary(ctx, path, ra, size, progress, expectedRevision, nil)
+}
+
+func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary) error {
+	if summary != nil {
+		summary.Mode = "multipart_v1"
+	}
+
+	checksumStart := time.Now()
 	checksums, err := computePartChecksumsFromReaderAt(ra, size, s3client.PartSize)
 	if err != nil {
 		return fmt.Errorf("compute part checksums: %w", err)
 	}
+	if summary != nil {
+		summary.ChecksumSeconds = time.Since(checksumStart).Seconds()
+	}
+
+	initiateStart := time.Now()
 	plan, err := c.initiateUpload(ctx, path, size, checksums, expectedRevision)
 	if err != nil {
 		return err
 	}
-	return c.uploadParts(ctx, plan, ra, progress)
+	if summary != nil {
+		summary.InitiateSeconds = time.Since(initiateStart).Seconds()
+		stdPartSize := plan.PartSize
+		if stdPartSize <= 0 && len(plan.Parts) > 0 {
+			stdPartSize = plan.Parts[0].Size
+		}
+		if stdPartSize <= 0 {
+			stdPartSize = s3client.PartSize
+		}
+		summary.PartSizeBytes = stdPartSize
+		summary.TotalParts = len(plan.Parts)
+		summary.UploadedParts = len(plan.Parts)
+		summary.Parallelism = uploadParallelism(stdPartSize)
+	}
+
+	uploadStart := time.Now()
+	if err := c.uploadPartsOnly(ctx, plan, ra, progress); err != nil {
+		return err
+	}
+	if summary != nil {
+		summary.UploadSeconds = time.Since(uploadStart).Seconds()
+	}
+
+	completeStart := time.Now()
+	if err := c.completeUpload(ctx, plan.UploadID); err != nil {
+		return err
+	}
+	if summary != nil {
+		summary.CompleteSeconds = time.Since(completeStart).Seconds()
+	}
+	return nil
 }
 
 // writeStreamV2 implements the v2 upload protocol:
@@ -251,9 +362,22 @@ func (c *Client) writeStreamV1(ctx context.Context, path string, ra io.ReaderAt,
 // 3. Upload goroutines consume presigned URLs from channel
 // 4. Complete with part ETags, or abort on failure
 func (c *Client) writeStreamV2(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
+	return c.writeStreamV2WithSummary(ctx, path, ra, size, progress, expectedRevision, nil)
+}
+
+func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary) error {
+	initiateStart := time.Now()
 	plan, err := c.initiateUploadV2(ctx, path, size, expectedRevision)
 	if err != nil {
 		return err
+	}
+	if summary != nil {
+		summary.Mode = "multipart_v2"
+		summary.InitiateSeconds = time.Since(initiateStart).Seconds()
+		summary.PartSizeBytes = plan.PartSize
+		summary.TotalParts = plan.TotalParts
+		summary.UploadedParts = plan.TotalParts
+		summary.Parallelism = uploadParallelism(plan.PartSize)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -263,21 +387,39 @@ func (c *Client) writeStreamV2(ctx context.Context, path string, ra io.ReaderAt,
 	parallelism := uploadParallelism(plan.PartSize)
 	presignCh := make(chan presignedPart, parallelism)
 	presignErrCh := make(chan error, 1)
+	presignDurationCh := make(chan time.Duration, 1)
 
-	go c.presignPipeline(ctx, plan, parallelism, presignCh, presignErrCh)
+	go func() {
+		start := time.Now()
+		c.presignPipeline(ctx, plan, parallelism, presignCh, presignErrCh)
+		presignDurationCh <- time.Since(start)
+	}()
 
 	// Upload parts, collecting ETags for the complete call.
+	uploadStart := time.Now()
 	parts, err := c.uploadPartsV2(ctx, plan, ra, presignCh, presignErrCh, progress)
 	if err != nil {
 		_ = c.abortUploadV2(context.Background(), plan.UploadID)
 		return err
 	}
+	if summary != nil {
+		summary.UploadSeconds = time.Since(uploadStart).Seconds()
+		select {
+		case dur := <-presignDurationCh:
+			summary.PresignSeconds = dur.Seconds()
+		default:
+		}
+	}
 
+	completeStart := time.Now()
 	if err := c.completeUploadV2(ctx, plan.UploadID, parts); err != nil {
 		// Complete failed (network error, 5xx, 409, 410) — best-effort abort
 		// to avoid leaving orphaned multipart uploads / upload rows.
 		_ = c.abortUploadV2(context.Background(), plan.UploadID)
 		return err
+	}
+	if summary != nil {
+		summary.CompleteSeconds = time.Since(completeStart).Seconds()
 	}
 	return nil
 }
@@ -385,6 +527,13 @@ func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int
 // Each goroutine reads its part directly via ReaderAt (parallel disk reads),
 // with at most maxConcurrency in-flight to bound memory usage.
 func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderAt, progress ProgressFunc) error {
+	if err := c.uploadPartsOnly(ctx, plan, ra, progress); err != nil {
+		return err
+	}
+	return c.completeUpload(ctx, plan.UploadID)
+}
+
+func (c *Client) uploadPartsOnly(ctx context.Context, plan UploadPlan, ra io.ReaderAt, progress ProgressFunc) error {
 	stdPartSize := plan.PartSize
 	if stdPartSize <= 0 && len(plan.Parts) > 0 {
 		stdPartSize = plan.Parts[0].Size
@@ -474,7 +623,7 @@ func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderA
 	default:
 	}
 
-	return c.completeUpload(ctx, plan.UploadID)
+	return nil
 }
 
 // uploadOnePart PUTs data to a presigned URL and returns the ETag.
@@ -1240,34 +1389,72 @@ type UploadMeta struct {
 // ResumeUpload queries for an incomplete upload and resumes it.
 // Two-step flow: GET query → POST resume (get missing part URLs) → upload → complete.
 func (c *Client) ResumeUpload(ctx context.Context, path string, r io.ReaderAt, totalSize int64, progress ProgressFunc) error {
-	// Step 1: Query for active upload (no side effects)
-	meta, err := c.queryUpload(ctx, path)
-	if err != nil {
-		return err
+	_, err := c.ResumeUploadWithSummary(ctx, path, r, totalSize, progress)
+	return err
+}
+
+// ResumeUploadWithSummary resumes an incomplete upload and returns coarse-grained
+// phase timings for the completed resume flow.
+func (c *Client) ResumeUploadWithSummary(ctx context.Context, path string, r io.ReaderAt, totalSize int64, progress ProgressFunc) (*UploadSummary, error) {
+	summary := &UploadSummary{
+		Type:       "upload_summary",
+		Mode:       "resume_v1",
+		StartedAt:  time.Now(),
+		RemotePath: path,
+		TotalBytes: totalSize,
 	}
 
+	// Step 1: Query for active upload (no side effects)
+	queryStart := time.Now()
+	meta, err := c.queryUpload(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	summary.QuerySeconds = time.Since(queryStart).Seconds()
+
 	// Step 2: Request resume — server returns presigned URLs for missing parts
+	checksumStart := time.Now()
 	checksums, err := computePartChecksumsFromReaderAt(r, totalSize, s3client.PartSize)
 	if err != nil {
-		return fmt.Errorf("compute part checksums: %w", err)
+		return nil, fmt.Errorf("compute part checksums: %w", err)
 	}
+	summary.ChecksumSeconds = time.Since(checksumStart).Seconds()
+
+	resumeStart := time.Now()
 	plan, err := c.requestResume(ctx, meta.UploadID, checksums)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	summary.ResumeSeconds = time.Since(resumeStart).Seconds()
+	summary.PartSizeBytes = plan.PartSize
+	summary.TotalParts = meta.PartsTotal
+	summary.UploadedParts = len(plan.Parts)
+	summary.Parallelism = uploadParallelism(plan.PartSize)
 
 	if len(plan.Parts) == 0 {
 		// All parts uploaded, just complete
-		return c.completeUpload(ctx, plan.UploadID)
+		completeStart := time.Now()
+		if err := c.completeUpload(ctx, plan.UploadID); err != nil {
+			return nil, err
+		}
+		summary.CompleteSeconds = time.Since(completeStart).Seconds()
+		return finishUploadSummary(summary), nil
 	}
 
 	// Step 3: Upload missing parts concurrently
+	uploadStart := time.Now()
 	if err := c.uploadMissingParts(ctx, *plan, r, meta.PartsTotal, progress); err != nil {
-		return err
+		return nil, err
 	}
+	summary.UploadSeconds = time.Since(uploadStart).Seconds()
 
 	// Step 4: Complete
-	return c.completeUpload(ctx, plan.UploadID)
+	completeStart := time.Now()
+	if err := c.completeUpload(ctx, plan.UploadID); err != nil {
+		return nil, err
+	}
+	summary.CompleteSeconds = time.Since(completeStart).Seconds()
+	return finishUploadSummary(summary), nil
 }
 
 // queryUpload finds an active upload for the given path.

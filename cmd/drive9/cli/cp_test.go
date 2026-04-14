@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -173,5 +174,69 @@ func TestDownloadFileSkipsDownloadSummaryWhenCLILogDisabled(t *testing.T) {
 	}
 	if strings.Contains(string(logBytes), "\"msg\":\"download_summary\"") {
 		t.Fatalf("expected no download summary in cli log, got %q", string(logBytes))
+	}
+}
+
+func TestUploadFileEmitsUploadSummaryToCLILog(t *testing.T) {
+	var uploaded bytes.Buffer
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "PUT /v1/fs/upload.txt":
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			uploaded.Write(data)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("DRIVE9_CLI_LOG_ENABLED", "true")
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	restoreLogger := logger.L()
+	cliLogger, err := logger.NewCLILogger()
+	if err != nil {
+		t.Fatalf("NewCLILogger: %v", err)
+	}
+	logger.Set(cliLogger)
+	defer logger.Set(restoreLogger)
+	defer func() { _ = cliLogger.Sync() }()
+
+	localPath := filepath.Join(t.TempDir(), "upload.txt")
+	if err := os.WriteFile(localPath, []byte("hello upload"), 0o644); err != nil {
+		t.Fatalf("WriteFile(local): %v", err)
+	}
+
+	c := client.New(srv.URL, "")
+	if err := uploadFile(context.Background(), c, localPath, "/upload.txt"); err != nil {
+		t.Fatalf("uploadFile: %v", err)
+	}
+	if got := uploaded.String(); got != "hello upload" {
+		t.Fatalf("uploaded body = %q, want %q", got, "hello upload")
+	}
+	if err := cliLogger.Sync(); err != nil {
+		t.Fatalf("Sync(cli log): %v", err)
+	}
+
+	logPath, err := logger.CLILogPath()
+	if err != nil {
+		t.Fatalf("CLILogPath: %v", err)
+	}
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile(cli log): %v", err)
+	}
+	got := string(logBytes)
+	if !strings.Contains(got, "\"msg\":\"upload_summary\"") || !strings.Contains(got, "\"type\":\"upload_summary\"") {
+		t.Fatalf("cli log missing upload summary JSON: %q", got)
+	}
+	if !strings.Contains(got, "\"mode\":\"direct_put\"") {
+		t.Fatalf("cli log missing upload mode: %q", got)
 	}
 }

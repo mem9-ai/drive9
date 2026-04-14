@@ -159,6 +159,42 @@ func TestWriteStreamSmallFile(t *testing.T) {
 	}
 }
 
+func TestWriteStreamWithSummarySmallFile(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.URL.Path == "/v1/fs/small-summary.txt" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	data := []byte("summary me")
+	summary, err := c.WriteStreamWithSummary(context.Background(), "/small-summary.txt", bytes.NewReader(data), int64(len(data)), nil)
+	if err != nil {
+		t.Fatalf("WriteStreamWithSummary: %v", err)
+	}
+	if summary == nil {
+		t.Fatal("summary is nil")
+	}
+	if summary.Type != "upload_summary" {
+		t.Fatalf("summary.Type = %q, want upload_summary", summary.Type)
+	}
+	if summary.Mode != "direct_put" {
+		t.Fatalf("summary.Mode = %q, want direct_put", summary.Mode)
+	}
+	if summary.TotalBytes != int64(len(data)) {
+		t.Fatalf("summary.TotalBytes = %d, want %d", summary.TotalBytes, len(data))
+	}
+	if summary.DirectWriteSeconds < 0 {
+		t.Fatalf("summary.DirectWriteSeconds = %f, want >= 0", summary.DirectWriteSeconds)
+	}
+	if summary.ElapsedSeconds < 0 {
+		t.Fatalf("summary.ElapsedSeconds = %f, want >= 0", summary.ElapsedSeconds)
+	}
+}
+
 // TestWriteStreamLargeFile verifies the 202 + multipart upload flow.
 func TestWriteStreamLargeFile(t *testing.T) {
 	var mu sync.Mutex

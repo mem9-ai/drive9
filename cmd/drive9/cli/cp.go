@@ -50,7 +50,12 @@ func Cp(c *client.Client, args []string) error {
 		if err != nil {
 			return fmt.Errorf("read stdin: %w", err)
 		}
-		return c.WriteStream(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress)
+		summary, err := c.WriteStreamWithSummary(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress)
+		if err != nil {
+			return err
+		}
+		emitUploadSummary(summary, "-")
+		return nil
 
 	case srcIsRemote && dst == "-":
 		return streamToStdout(ctx, c, srcRP.Path)
@@ -84,7 +89,12 @@ func uploadFile(ctx context.Context, c *client.Client, localPath, remotePath str
 		return fmt.Errorf("stat %s: %w", localPath, err)
 	}
 
-	return c.WriteStream(ctx, remotePath, f, info.Size(), printProgress)
+	summary, err := c.WriteStreamWithSummary(ctx, remotePath, f, info.Size(), printProgress)
+	if err != nil {
+		return err
+	}
+	emitUploadSummary(summary, localPath)
+	return nil
 }
 
 func resumeUpload(ctx context.Context, c *client.Client, localPath, remotePath string) error {
@@ -99,7 +109,12 @@ func resumeUpload(ctx context.Context, c *client.Client, localPath, remotePath s
 		return fmt.Errorf("stat %s: %w", localPath, err)
 	}
 
-	return c.ResumeUpload(ctx, remotePath, f, info.Size(), printProgress)
+	summary, err := c.ResumeUploadWithSummary(ctx, remotePath, f, info.Size(), printProgress)
+	if err != nil {
+		return err
+	}
+	emitUploadSummary(summary, localPath)
+	return nil
 }
 
 func downloadFile(ctx context.Context, c *client.Client, remotePath, localPath string) error {
@@ -155,5 +170,35 @@ func emitDownloadSummary(summary *client.DownloadSummary) {
 		zap.Float64("elapsed_seconds", summary.ElapsedSeconds),
 		zap.String("remote_path", summary.RemotePath),
 		zap.String("local_path", summary.LocalPath),
+	)
+}
+
+func emitUploadSummary(summary *client.UploadSummary, localPath string) {
+	if summary == nil || !logger.CLIEnabled() {
+		return
+	}
+	logger.Info(
+		context.Background(),
+		"upload_summary",
+		zap.String("type", summary.Type),
+		zap.String("mode", summary.Mode),
+		zap.Int64("total_bytes", summary.TotalBytes),
+		zap.Int64("part_size_bytes", summary.PartSizeBytes),
+		zap.Int("total_parts", summary.TotalParts),
+		zap.Int("uploaded_parts", summary.UploadedParts),
+		zap.Int("parallelism", summary.Parallelism),
+		zap.Time("started_at", summary.StartedAt),
+		zap.Time("finished_at", summary.FinishedAt),
+		zap.Float64("elapsed_seconds", summary.ElapsedSeconds),
+		zap.Float64("query_seconds", summary.QuerySeconds),
+		zap.Float64("checksum_seconds", summary.ChecksumSeconds),
+		zap.Float64("initiate_seconds", summary.InitiateSeconds),
+		zap.Float64("resume_seconds", summary.ResumeSeconds),
+		zap.Float64("presign_seconds", summary.PresignSeconds),
+		zap.Float64("upload_seconds", summary.UploadSeconds),
+		zap.Float64("complete_seconds", summary.CompleteSeconds),
+		zap.Float64("direct_write_seconds", summary.DirectWriteSeconds),
+		zap.String("remote_path", summary.RemotePath),
+		zap.String("local_path", localPath),
 	)
 }
