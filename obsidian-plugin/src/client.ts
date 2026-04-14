@@ -41,6 +41,33 @@ export class Drive9Client {
     await this.list("/");
   }
 
+  /** POST /v1/provision — create a new tenant. No auth required. */
+  async provision(): Promise<{ api_key: string; status: string }> {
+    const url = `${this.serverUrl}/v1/provision`;
+    const resp = await requestUrl({
+      url,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      throw: false,
+    });
+    if (resp.status >= 400) {
+      let msg = `HTTP ${resp.status}`;
+      try {
+        if (typeof resp.json?.error === "string") {
+          msg = resp.json.error;
+        }
+      } catch { /* no body */ }
+      throw new Drive9Error(msg, resp.status);
+    }
+    return resp.json as { api_key: string; status: string };
+  }
+
+  /** GET /v1/status — check tenant provisioning status. Requires auth. */
+  async getStatus(): Promise<{ status: string }> {
+    const resp = await this.request("GET", "/v1/status");
+    return resp.json as { status: string };
+  }
+
   /** HEAD — get file/dir metadata including revision. */
   async stat(path: string): Promise<StatResult> {
     const resp = await this.request("HEAD", `/v1/fs/${encodePath(path)}`);
