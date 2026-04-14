@@ -74,19 +74,29 @@ func TestEventBusCaughtUp(t *testing.T) {
 
 func TestEventBusRingOverflow(t *testing.T) {
 	bus := NewEventBus()
-	// Fill ring + 1 to trigger wrap.
-	for i := 0; i < eventBusRingSize+1; i++ {
+	// Fill ring + 2 to trigger wrap; ring holds seqs [3..ringSize+2],
+	// so seq 1 is truly evicted (since+1=2 < oldestSeq=3 → reset).
+	for i := 0; i < eventBusRingSize+2; i++ {
 		bus.Publish("/file.txt", "write", "")
 	}
 
-	// Seq 1 should be evicted from the ring.
+	// Seq 1 is evicted: client needs seq 2, but oldest in ring is 3.
 	_, _, ok := bus.EventsSince(1)
 	if ok {
 		t.Fatal("expected ok=false for seq that's been overwritten")
 	}
 
+	// since=2 is the boundary: client needs seq 3 = oldestSeq, all present.
+	events, _, ok := bus.EventsSince(2)
+	if !ok {
+		t.Fatal("expected ok=true for since=oldestSeq-1 (boundary)")
+	}
+	if len(events) != eventBusRingSize {
+		t.Fatalf("expected %d events, got %d", eventBusRingSize, len(events))
+	}
+
 	// Most recent seq should still be reachable.
-	events, _, ok := bus.EventsSince(uint64(eventBusRingSize))
+	events, _, ok = bus.EventsSince(uint64(eventBusRingSize + 1))
 	if !ok {
 		t.Fatal("expected ok=true for recent seq")
 	}
