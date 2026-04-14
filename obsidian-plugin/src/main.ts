@@ -304,6 +304,9 @@ export default class Drive9Plugin extends Plugin {
         }
         break;
       }
+      case "offline":
+        this.setStatusBar("⏸ drive9: offline");
+        break;
       case "error": {
         const detail = engine.lastErrorDetail;
         this.setStatusBar(detail ? `✗ drive9: ${detail} failed` : "✗ drive9: error");
@@ -340,7 +343,10 @@ export default class Drive9Plugin extends Plugin {
 
     const lines: string[] = [];
 
-    if (status === "error") {
+    if (status === "offline") {
+      lines.push("Offline: server unreachable");
+      lines.push("Run command \"Retry failed sync\" when back online");
+    } else if (status === "error") {
       const detail = engine.lastErrorDetail;
       lines.push(detail ? `Error: ${detail} failed to sync` : "Error: sync failed");
       lines.push("Run command \"Retry failed sync\" to retry");

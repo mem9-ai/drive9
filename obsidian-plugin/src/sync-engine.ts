@@ -4,9 +4,10 @@ import { IgnoreMatcher } from "./ignore";
 import type { ShadowStore } from "./shadow-store";
 import type { SyncState, Drive9Settings } from "./types";
 
-export type SyncStatus = "idle" | "syncing" | "error";
+export type SyncStatus = "idle" | "syncing" | "error" | "offline";
 
 const LOCAL_EVENT_SUPPRESS_WINDOW_MS = 1000;
+const OFFLINE_THRESHOLD = 3; // consecutive network failures before going offline
 
 /**
  * SyncEngine owns the local/remote sync state machine.
@@ -23,6 +24,7 @@ export class SyncEngine {
   private _uploadProgressText = "";
   private _skippedLargeFiles: string[] = [];
   private _lastErrorDetail = "";
+  private _consecutiveNetworkFailures = 0;
   private statusListeners: Array<() => void> = [];
 
   private shadowStore: ShadowStore | null = null;
@@ -66,8 +68,9 @@ export class SyncEngine {
   }
 
   retrySync(): void {
-    if (this._status === "error" && this.dirtyPaths.size > 0) {
+    if ((this._status === "error" || this._status === "offline") && this.dirtyPaths.size > 0) {
       this._lastErrorDetail = "";
+      this._consecutiveNetworkFailures = 0;
       this.setStatus("idle", this.dirtyPaths.size);
       this.scheduleFlush();
     }
@@ -190,20 +193,31 @@ export class SyncEngine {
 
       let errorOccurred = false;
       let lastFailedPath = "";
+      let networkError = false;
 
       for (const path of paths) {
         try {
           await this.pushOne(path);
+          this._consecutiveNetworkFailures = 0;
         } catch (e) {
           errorOccurred = true;
           lastFailedPath = path;
+          if (this.isNetworkError(e)) {
+            networkError = true;
+          }
           console.error(`[drive9] push failed: ${path}`, e instanceof Error ? e.message : sanitizeError(String(e)));
           this.dirtyPaths.add(path);
         }
       }
 
       this._lastErrorDetail = lastFailedPath;
-      this.setStatus(errorOccurred ? "error" : "idle", this.dirtyPaths.size);
+      if (networkError) {
+        this._consecutiveNetworkFailures++;
+      }
+      const finalStatus: SyncStatus = errorOccurred
+        ? (this._consecutiveNetworkFailures >= OFFLINE_THRESHOLD ? "offline" : "error")
+        : "idle";
+      this.setStatus(finalStatus, this.dirtyPaths.size);
       await this.persistData();
     });
   }
@@ -491,5 +505,18 @@ export class SyncEngine {
         // Ignore status listener failures.
       }
     }
+  }
+
+  private isNetworkError(e: unknown): boolean {
+    if (e instanceof Drive9Error) {
+      // 0 = no response (network), 502/503/504 = server unreachable
+      return e.status === 0 || e.status >= 502;
+    }
+    if (e instanceof TypeError) {
+      // fetch() throws TypeError on network failure
+      return true;
+    }
+    const msg = e instanceof Error ? e.message : "";
+    return /network|fetch|ECONNREFUSED|ENOTFOUND|ETIMEDOUT/i.test(msg);
   }
 }
