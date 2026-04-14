@@ -259,6 +259,17 @@ func ValidateTiDBSchemaForModeDSN(dsn string, mode TiDBEmbeddingMode) error {
 	return ValidateTiDBSchemaForMode(db, mode)
 }
 
+// EnsureTiDBSchemaForModeDSN opens a DSN, repairs known launch-schema drift,
+// validates the schema contract, and closes.
+func EnsureTiDBSchemaForModeDSN(dsn string, mode TiDBEmbeddingMode) error {
+	db, err := OpenTiDBSchemaDB(dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	return EnsureTiDBSchemaForMode(db, mode)
+}
+
 func OpenTiDBSchemaDB(dsn string) (*sql.DB, error) {
 	if HasMultiStatements(dsn) {
 		return nil, fmt.Errorf("multiStatements is not allowed")

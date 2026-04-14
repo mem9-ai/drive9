@@ -123,11 +123,18 @@ func Open(dsn string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
+	applyMySQLPoolDefaults(db)
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
 	return &Store{db: db}, nil
+}
+
+func applyMySQLPoolDefaults(db *sql.DB) {
+	// Rotate and prune idle conns before common LB/NAT idle timeout windows.
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(45 * time.Second)
 }
 
 func (s *Store) Close() error { return s.db.Close() }
