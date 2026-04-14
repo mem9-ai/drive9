@@ -71,6 +71,8 @@ export default class Drive9Plugin extends Plugin {
     }
 
     this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.addClass("mod-clickable");
+    this.statusBarEl.addEventListener("click", () => this.showSyncPanel());
     this.updateStatusBar();
     this.syncEngine.onStatusChange(() => this.updateStatusBar());
 
@@ -79,7 +81,6 @@ export default class Drive9Plugin extends Plugin {
     this.addCommand({
       id: "drive9-search",
       name: "Search (drive9)",
-      hotkeys: [{ modifiers: ["Mod", "Shift"], key: "s" }],
       callback: () => {
         if (!this.settings.serverUrl) {
           new Notice("drive9: configure server URL in settings first");
@@ -87,6 +88,23 @@ export default class Drive9Plugin extends Plugin {
         }
         new Drive9SearchModal(this.app, this.client).open();
       },
+    });
+
+    this.addCommand({
+      id: "drive9-retry-sync",
+      name: "Retry failed sync (drive9)",
+      callback: () => {
+        this.syncEngine.retrySync();
+        new Notice("drive9: retrying sync...");
+      },
+    });
+
+    this.addRibbonIcon("search", "Search drive9", () => {
+      if (!this.settings.serverUrl) {
+        new Notice("drive9: configure server URL in settings first");
+        return;
+      }
+      new Drive9SearchModal(this.app, this.client).open();
     });
 
     this.app.workspace.onLayoutReady(() => {
@@ -152,12 +170,19 @@ export default class Drive9Plugin extends Plugin {
     );
 
     switch (result.action) {
-      case "push_all":
-        new Notice("drive9: uploading vault to drive9...");
-        for (const file of this.app.vault.getFiles()) {
-          this.syncEngine.onLocalCreate(file);
+      case "push_all": {
+        const files = this.app.vault.getFiles();
+        const total = files.length;
+        new Notice(`drive9: uploading ${total} files to drive9...`);
+        this.setStatusBar(`↕ drive9: queuing 0/${total} files`);
+        for (let i = 0; i < files.length; i++) {
+          this.syncEngine.onLocalCreate(files[i]);
+          if ((i + 1) % 50 === 0 || i === files.length - 1) {
+            this.setStatusBar(`↕ drive9: queuing ${i + 1}/${total} files`);
+          }
         }
         break;
+      }
 
       case "pull_all":
         new Notice("drive9: downloading from drive9...");
@@ -268,6 +293,7 @@ export default class Drive9Plugin extends Plugin {
     if (!engine) return;
 
     const skipped = engine.skippedLargeFiles.length;
+    const conflicts = this.countConflicts();
     switch (engine.status) {
       case "syncing": {
         const progress = engine.uploadProgressText;
@@ -278,12 +304,19 @@ export default class Drive9Plugin extends Plugin {
         }
         break;
       }
-      case "error":
-        this.setStatusBar("✗ drive9: error");
+      case "offline":
+        this.setStatusBar("⏸ drive9: offline");
         break;
+      case "error": {
+        const detail = engine.lastErrorDetail;
+        this.setStatusBar(detail ? `✗ drive9: ${detail} failed` : "✗ drive9: error");
+        break;
+      }
       case "idle":
         if (engine.pendingCount > 0) {
           this.setStatusBar(`↕ drive9: queued ${engine.pendingCount} files`);
+        } else if (conflicts > 0) {
+          this.setStatusBar(`⚠ drive9: ${conflicts} conflict${conflicts > 1 ? "s" : ""}`);
         } else if (skipped > 0) {
           this.setStatusBar(`✓ drive9: synced (${skipped} skipped — too large)`);
         } else {
@@ -291,6 +324,52 @@ export default class Drive9Plugin extends Plugin {
         }
         break;
     }
+  }
+
+  private countConflicts(): number {
+    let count = 0;
+    for (const state of Object.values(this.syncStates)) {
+      if (state.status === "conflict") count++;
+    }
+    return count;
+  }
+
+  private showSyncPanel(): void {
+    const engine = this.syncEngine;
+    const conflicts = this.countConflicts();
+    const pending = engine.pendingCount;
+    const skipped = engine.skippedLargeFiles;
+    const status = engine.status;
+
+    const lines: string[] = [];
+
+    if (status === "offline") {
+      lines.push("Offline: server unreachable");
+      lines.push("Run command \"Retry failed sync\" when back online");
+    } else if (status === "error") {
+      const detail = engine.lastErrorDetail;
+      lines.push(detail ? `Error: ${detail} failed to sync` : "Error: sync failed");
+      lines.push("Run command \"Retry failed sync\" to retry");
+    } else if (status === "syncing") {
+      lines.push(`Syncing ${pending} file${pending !== 1 ? "s" : ""}...`);
+    } else {
+      lines.push("Sync: idle");
+    }
+
+    if (conflicts > 0) {
+      lines.push(`${conflicts} conflict${conflicts > 1 ? "s" : ""} pending`);
+    }
+    if (pending > 0 && status !== "syncing") {
+      lines.push(`${pending} file${pending !== 1 ? "s" : ""} queued`);
+    }
+    if (skipped.length > 0) {
+      lines.push(`${skipped.length} file${skipped.length > 1 ? "s" : ""} skipped (too large)`);
+    }
+    if (lines.length === 1 && status === "idle" && conflicts === 0) {
+      lines.push("All files synced");
+    }
+
+    new Notice(lines.join("\n"), 8000);
   }
 
   private setStatusBar(text: string): void {

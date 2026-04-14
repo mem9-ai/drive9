@@ -6,9 +6,17 @@ import (
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
 
-// InitSchema creates the vault tables in the tenant database.
-func InitSchema(db *sql.DB) error {
-	stmts := []string{
+// SchemaStatements returns the vault DDL statements used during tenant schema
+// initialization.
+//
+// These statements are appended into the exported db9 init schema. If you
+// change vault columns, indexes, or constraints here, rerun:
+//
+//	drive9-server schema dump-init-sql --provider db9
+//
+// and update any external db9 schema copy that consumes that exported SQL.
+func SchemaStatements() []string {
+	return []string{
 		`CREATE TABLE IF NOT EXISTS vault_deks (
 			tenant_id    VARCHAR(64) PRIMARY KEY,
 			wrapped_dek  BYTEA NOT NULL,
@@ -76,5 +84,9 @@ func InitSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_vault_audit_tenant_time ON vault_audit_log(tenant_id, timestamp)`,
 		`CREATE INDEX IF NOT EXISTS idx_vault_audit_secret ON vault_audit_log(secret_name, timestamp)`,
 	}
-	return schema.ExecSchemaStatements(db, stmts)
+}
+
+// InitSchema creates the vault tables in the tenant database.
+func InitSchema(db *sql.DB) error {
+	return schema.ExecSchemaStatements(db, SchemaStatements())
 }
