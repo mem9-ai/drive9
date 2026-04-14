@@ -7,8 +7,9 @@ import (
 )
 
 var (
-	ErrUploadTooLarge       = errors.New("upload too large")
-	ErrStorageQuotaExceeded = errors.New("tenant storage quota exceeded")
+	ErrUploadTooLarge        = errors.New("upload too large")
+	ErrStorageQuotaExceeded  = errors.New("tenant storage quota exceeded")
+	ErrMediaLLMQuotaExceeded = errors.New("tenant media LLM file quota exceeded")
 )
 
 func (b *Dat9Backend) ensureUploadSizeAllowed(size int64) error {
@@ -19,6 +20,35 @@ func (b *Dat9Backend) ensureUploadSizeAllowed(size int64) error {
 		return fmt.Errorf("%w: max %d bytes", ErrUploadTooLarge, b.maxUploadBytes)
 	}
 	return nil
+}
+
+// mediaLLMQuotaExceededTx checks whether the tenant has exceeded its media LLM
+// file quota inside a transaction. Returns true when the count of confirmed
+// image+audio files meets or exceeds the configured limit. Files are still
+// stored; only LLM task enqueue is skipped.
+func (b *Dat9Backend) mediaLLMQuotaExceededTx(tx *sql.Tx) bool {
+	if b.maxMediaLLMFiles <= 0 {
+		return false
+	}
+	count, err := b.store.ConfirmedMediaFileCountTx(tx)
+	if err != nil {
+		return false // on error, allow enqueue (fail open)
+	}
+	return count >= b.maxMediaLLMFiles
+}
+
+// mediaLLMQuotaExceeded is the non-transactional variant for code paths that
+// enqueue LLM tasks outside a database transaction (e.g. the legacy in-memory
+// image extract queue).
+func (b *Dat9Backend) mediaLLMQuotaExceeded() bool {
+	if b.maxMediaLLMFiles <= 0 {
+		return false
+	}
+	count, err := b.store.ConfirmedMediaFileCountTx(b.store.DB())
+	if err != nil {
+		return false
+	}
+	return count >= b.maxMediaLLMFiles
 }
 
 func (b *Dat9Backend) ensureTenantStorageQuotaTx(tx *sql.Tx, path string, newSize int64) error {
