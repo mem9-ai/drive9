@@ -1,4 +1,4 @@
-import { Vault, TFile, TAbstractFile, Notice } from "obsidian";
+import { Vault, TFile, TAbstractFile, Notice, Platform } from "obsidian";
 import { Drive9Client, Drive9Error, sanitizeError } from "./client";
 import { IgnoreMatcher } from "./ignore";
 import type { ShadowStore } from "./shadow-store";
@@ -20,6 +20,8 @@ export class SyncEngine {
   private operationQueue: Promise<void> = Promise.resolve();
   private _status: SyncStatus = "idle";
   private _pendingCount = 0;
+  private _uploadProgressText = "";
+  private _skippedLargeFiles: string[] = [];
   private statusListeners: Array<() => void> = [];
 
   private shadowStore: ShadowStore | null = null;
@@ -44,6 +46,14 @@ export class SyncEngine {
 
   get pendingCount(): number {
     return this._pendingCount;
+  }
+
+  get uploadProgressText(): string {
+    return this._uploadProgressText;
+  }
+
+  get skippedLargeFiles(): string[] {
+    return this._skippedLargeFiles;
   }
 
   onStatusChange(fn: () => void): void {
@@ -161,6 +171,7 @@ export class SyncEngine {
 
       const paths = [...this.dirtyPaths];
       this.dirtyPaths.clear();
+      this._skippedLargeFiles = [];
 
       this.setStatus("syncing", paths.length);
 
@@ -199,8 +210,18 @@ export class SyncEngine {
       return;
     }
 
-    if (file.stat.size > this.settings.maxFileSize) {
-      console.warn(`[drive9] skipping large file: ${path} (${file.stat.size} bytes)`);
+    const effectiveMaxSize = Platform.isMobile
+      ? Math.min(this.settings.maxFileSize, this.settings.mobileMaxFileSize)
+      : this.settings.maxFileSize;
+    if (file.stat.size > effectiveMaxSize) {
+      const sizeMB = (file.stat.size / (1024 * 1024)).toFixed(1);
+      const limitMB = (effectiveMaxSize / (1024 * 1024)).toFixed(0);
+      console.warn(`[drive9] skipping large file: ${path} (${file.stat.size} bytes, limit ${effectiveMaxSize})`);
+      new Notice(`drive9: skipped ${path} (${sizeMB} MB exceeds ${limitMB} MB limit)`);
+      if (!this._skippedLargeFiles.includes(path)) {
+        this._skippedLargeFiles.push(path);
+      }
+      this.notifyStatusChange();
       return;
     }
 
@@ -225,7 +246,12 @@ export class SyncEngine {
     const expectedRevision = existingState ? existingState.remoteRevision : 0;
 
     try {
-      const result = await this.client.write(path, data, expectedRevision);
+      const result = await this.client.write(path, data, expectedRevision, (part, total) => {
+        const fileName = path.includes("/") ? path.slice(path.lastIndexOf("/") + 1) : path;
+        this._uploadProgressText = `${fileName} part ${part}/${total}`;
+        this.notifyStatusChange();
+      });
+      this._uploadProgressText = "";
       const contentHash = await this.saveShadowIfAvailable(data);
       if (result.revision !== null) {
         this.syncStates[path] = {

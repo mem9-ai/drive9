@@ -1,5 +1,8 @@
-import { requestUrl, RequestUrlParam } from "obsidian";
-import type { StatResult, FileInfo } from "./types";
+import { requestUrl, RequestUrlParam, Platform } from "obsidian";
+import type { StatResult, FileInfo, ProgressFn } from "./types";
+
+/** Files >= this size use multipart upload (matches server threshold). */
+const MULTIPART_THRESHOLD = 50_000; // 50 KB
 
 /**
  * Drive9Client wraps the drive9 REST API using Obsidian's requestUrl
@@ -56,19 +59,32 @@ export class Drive9Client {
   }
 
   /**
-   * PUT — write file content with optional CAS revision check.
-   * Server returns {"status":"ok"} without revision, so we stat()
-   * after write to get the actual revision for future CAS.
+   * Write file content with optional CAS revision check.
+   * Files >= MULTIPART_THRESHOLD use v2 multipart upload;
+   * smaller files use direct PUT.
    *
    * Returns { revision: number } on full success, or
-   * { revision: null, writeSucceeded: true } if PUT succeeded but
+   * { revision: null, writeSucceeded: true } if write succeeded but
    * post-write stat failed (caller must not treat this as a write failure).
    */
   async write(
     path: string,
     data: ArrayBuffer,
     expectedRevision?: number | null,
+    onProgress?: ProgressFn,
   ): Promise<{ revision: number | null; writeSucceeded: boolean }> {
+    if (data.byteLength >= MULTIPART_THRESHOLD) {
+      try {
+        return await this.writeMultipart(path, data, expectedRevision, onProgress);
+      } catch (e) {
+        if (e instanceof Drive9Error && e.status === 404) {
+          // Server doesn't support v2 uploads — fall through to direct PUT.
+        } else {
+          throw e;
+        }
+      }
+    }
+
     const headers: Record<string, string> = this.mutationHeaders();
     if (expectedRevision !== undefined && expectedRevision !== null) {
       headers["X-Dat9-Expected-Revision"] = String(expectedRevision);
@@ -85,6 +101,152 @@ export class Drive9Client {
     } catch {
       return { revision: null, writeSucceeded: true };
     }
+  }
+
+  /**
+   * v2 multipart upload: initiate → presign-batch → PUT parts → complete.
+   * Parts are uploaded sequentially to keep memory bounded.
+   */
+  private async writeMultipart(
+    path: string,
+    data: ArrayBuffer,
+    expectedRevision?: number | null,
+    onProgress?: ProgressFn,
+  ): Promise<{ revision: number | null; writeSucceeded: boolean }> {
+    // 1. Initiate
+    const initBody: Record<string, unknown> = {
+      path,
+      total_size: data.byteLength,
+    };
+    if (expectedRevision !== undefined && expectedRevision !== null) {
+      initBody.expected_revision = expectedRevision;
+    }
+
+    const initResp = await this.request("POST", "/v2/uploads/initiate", {
+      body: JSON.stringify(initBody),
+      headers: { ...this.mutationHeaders(), "Content-Type": "application/json" },
+    });
+    const plan = initResp.json as {
+      upload_id: string;
+      part_size: number;
+      total_parts: number;
+    };
+
+    const uploadId = plan.upload_id;
+    const partSize = plan.part_size;
+    const totalParts = plan.total_parts;
+
+    try {
+      // 2. Presign all parts in one batch
+      const partEntries = Array.from({ length: totalParts }, (_, i) => ({
+        part_number: i + 1,
+      }));
+      const presignResp = await this.request(
+        "POST",
+        `/v2/uploads/${uploadId}/presign-batch`,
+        {
+          body: JSON.stringify({ parts: partEntries }),
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+      const presigned = (presignResp.json as { parts: PresignedPart[] }).parts;
+
+      // 3. Upload parts sequentially
+      const completedParts: Array<{ number: number; etag: string }> = [];
+
+      for (const part of presigned) {
+        const offset = (part.number - 1) * partSize;
+        const end = Math.min(offset + part.size, data.byteLength);
+        const chunk = data.slice(offset, end);
+
+        const etag = await this.uploadOnePart(uploadId, part, chunk);
+        completedParts.push({ number: part.number, etag });
+
+        if (onProgress) {
+          onProgress(part.number, totalParts);
+        }
+      }
+
+      // 4. Complete
+      await this.request("POST", `/v2/uploads/${uploadId}/complete`, {
+        body: JSON.stringify({ parts: completedParts }),
+        headers: { "Content-Type": "application/json" },
+      });
+
+      // 5. Stat to get revision
+      try {
+        const st = await this.stat(path);
+        return { revision: st.revision, writeSucceeded: true };
+      } catch {
+        return { revision: null, writeSucceeded: true };
+      }
+    } catch (e) {
+      // Best-effort abort on failure
+      try {
+        await this.request("POST", `/v2/uploads/${uploadId}/abort`, {
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch {
+        // Abort is best-effort.
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * PUT a single part to its presigned S3 URL.
+   * Returns the ETag from the response header.
+   */
+  private async uploadOnePart(
+    uploadId: string,
+    part: PresignedPart,
+    data: ArrayBuffer,
+    isRetry = false,
+  ): Promise<string> {
+    const headers: Record<string, string> = {};
+    if (part.headers) {
+      for (const [k, v] of Object.entries(part.headers)) {
+        if (k.toLowerCase() !== "host") {
+          headers[k] = v;
+        }
+      }
+    }
+
+    const resp = await requestUrl({
+      url: part.url,
+      method: "PUT",
+      body: data,
+      headers,
+      throw: false,
+    });
+
+    if (resp.status === 403 && !isRetry) {
+      // Presigned URL expired — re-presign and retry once
+      const fresh = await this.presignOnePart(uploadId, part.number);
+      return this.uploadOnePart(uploadId, fresh, data, true);
+    }
+
+    if (resp.status >= 300) {
+      throw new Drive9Error(`part upload failed: HTTP ${resp.status}`, resp.status);
+    }
+
+    return resp.headers["etag"] ?? resp.headers["ETag"] ?? "";
+  }
+
+  /** Fetch a fresh presigned URL for a single part (retry path). */
+  private async presignOnePart(
+    uploadId: string,
+    partNumber: number,
+  ): Promise<PresignedPart> {
+    const resp = await this.request(
+      "POST",
+      `/v2/uploads/${uploadId}/presign`,
+      {
+        body: JSON.stringify({ part_number: partNumber }),
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+    return resp.json as PresignedPart;
   }
 
   /** DELETE — remove a file. */
@@ -226,6 +388,14 @@ export function sanitizeError(msg: string): string {
   return msg
     .replace(/Bearer\s+\S+/gi, "Bearer ***")
     .replace(/Authorization:\s*\S+/gi, "Authorization: ***");
+}
+
+/** Presigned part URL from the v2 presign-batch endpoint. */
+interface PresignedPart {
+  number: number;
+  url: string;
+  size: number;
+  headers?: Record<string, string>;
 }
 
 /** Encode path segments for URL (don't encode slashes). */
