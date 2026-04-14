@@ -235,7 +235,7 @@ func validateTiDBSchemaMode(mode TiDBEmbeddingMode) error {
 }
 
 func initTiDBAutoEmbeddingSchema(dsn string) error {
-	db, err := OpenTiDBSchemaDB(dsn)
+	db, err := OpenTiDBSchemaDB(context.Background(), dsn)
 	if err != nil {
 		return err
 	}
@@ -251,7 +251,7 @@ func initTiDBAutoEmbeddingSchema(dsn string) error {
 
 // ValidateTiDBSchemaForModeDSN opens a DSN, validates the schema, and closes.
 func ValidateTiDBSchemaForModeDSN(dsn string, mode TiDBEmbeddingMode) error {
-	db, err := OpenTiDBSchemaDB(dsn)
+	db, err := OpenTiDBSchemaDB(context.Background(), dsn)
 	if err != nil {
 		return err
 	}
@@ -259,7 +259,18 @@ func ValidateTiDBSchemaForModeDSN(dsn string, mode TiDBEmbeddingMode) error {
 	return ValidateTiDBSchemaForMode(db, mode)
 }
 
-func OpenTiDBSchemaDB(dsn string) (*sql.DB, error) {
+// EnsureTiDBSchemaForModeDSN opens a DSN, repairs known launch-schema drift,
+// validates the schema contract, and closes.
+func EnsureTiDBSchemaForModeDSN(ctx context.Context, dsn string, mode TiDBEmbeddingMode) error {
+	db, err := OpenTiDBSchemaDB(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	return EnsureTiDBSchemaForMode(db, mode)
+}
+
+func OpenTiDBSchemaDB(ctx context.Context, dsn string) (*sql.DB, error) {
 	if HasMultiStatements(dsn) {
 		return nil, fmt.Errorf("multiStatements is not allowed")
 	}
@@ -267,7 +278,7 @@ func OpenTiDBSchemaDB(dsn string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.Ping(); err != nil {
+	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
