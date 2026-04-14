@@ -119,7 +119,7 @@ export default class Drive9Plugin extends Plugin {
   }
 
   private async onLayoutReady(): Promise<void> {
-    if (!this.settings.serverUrl) {
+    if (!this.settings.serverUrl || !this.settings.apiKey) {
       this.setStatusBar(t("status.configure"));
       return;
     }

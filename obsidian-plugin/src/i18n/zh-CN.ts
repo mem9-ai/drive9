@@ -85,4 +85,24 @@ export default {
 
   // Ribbon
   "ribbon.search": "搜索 drive9",
+
+  // Search modal
+  "search.placeholder": "在 drive9 中搜索文件...",
+  "search.navigate": "导航",
+  "search.open": "打开文件",
+  "search.dismiss": "关闭",
+  "search.emptyState": "输入至少 3 个字符开始搜索",
+  "search.loading": "搜索中...",
+  "search.noResults": "未找到结果",
+  "search.error": "drive9 搜索：{detail}",
+  "search.notFound": "drive9: 本地未找到文件 — {path}",
+
+  // First run
+  "firstRun.downloadTitle": "从 drive9 下载？",
+  "firstRun.downloadMsg": "drive9 上有 {count} 个文件。下载到你的库中？",
+  "firstRun.conflictNotice": "发现 {count} 个文件在两端都存在。\n\n{files}\n\n无法验证内容是否一致。\n这些文件标记为冲突，需手动解决。\n仅存在于一端的文件将正常同步。",
+  "firstRun.andMore": "...以及 {count} 个更多",
+  "firstRun.downloaded": "drive9: 已下载 {count} 个文件",
+  "firstRun.yes": "确认",
+  "firstRun.cancel": "取消",
 } as const;

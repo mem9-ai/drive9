@@ -85,4 +85,24 @@ export default {
 
   // Ribbon
   "ribbon.search": "Search drive9",
+
+  // Search modal
+  "search.placeholder": "Search files in drive9...",
+  "search.navigate": "navigate",
+  "search.open": "open file",
+  "search.dismiss": "dismiss",
+  "search.emptyState": "Type at least 3 characters to search",
+  "search.loading": "Searching...",
+  "search.noResults": "No results found",
+  "search.error": "drive9 search: {detail}",
+  "search.notFound": "drive9: file not found locally — {path}",
+
+  // First run
+  "firstRun.downloadTitle": "Download from drive9?",
+  "firstRun.downloadMsg": "drive9 has {count} files. Download them to your vault?",
+  "firstRun.conflictNotice": "Found {count} file(s) that exist on both sides.\n\n{files}\n\nWithout checksums, content equality cannot be verified.\nThese files are marked as conflicts until manually resolved.\nFiles unique to each side will be synced normally.",
+  "firstRun.andMore": "...and {count} more",
+  "firstRun.downloaded": "drive9: downloaded {count} files",
+  "firstRun.yes": "Yes",
+  "firstRun.cancel": "Cancel",
 } as const;
