@@ -57,7 +57,7 @@ jobs:
             --base main \
             --head "${{ steps.sync.outputs.pr_branch }}" \
             --title "sync: merge upstream/main (conflicts need manual resolution)" \
-            --body "$(cat <<'EOF'
+            --body "$(cat <<EOF
           Automatic upstream sync detected merge conflicts and skipped the auto-merge
           to avoid silently overwriting fork-specific code.
 
@@ -68,13 +68,13 @@ jobs:
 
           Please merge \`main\` into this branch, resolve conflicts manually, then merge the PR.
 
-          ```bash
+          \`\`\`bash
           git fetch origin
           git checkout ${{ steps.sync.outputs.pr_branch }}
           git merge origin/main
           # resolve conflicts, then:
           git add -A && git commit
           git push
-          ```
+          \`\`\`
           EOF
           )"

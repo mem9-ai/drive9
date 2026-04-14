@@ -586,7 +586,9 @@ func (m *semanticWorkerManager) listTenantRefs(ctx context.Context) ([]semanticT
 			if t.ClaimExpiresAt != nil && now.After(*t.ClaimExpiresAt) {
 				logger.Info(ctx, "server_event", eventFields(ctx, "tenant_expired_auto_delete",
 					"tenant_id", t.ID, "claim_expires_at", t.ClaimExpiresAt.Format(time.RFC3339))...)
-				_ = m.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted)
+				if err := m.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted); err != nil {
+					return nil, fmt.Errorf("auto-delete expired tenant %s: %w", t.ID, err)
+				}
 				m.pool.Invalidate(t.ID)
 				continue
 			}

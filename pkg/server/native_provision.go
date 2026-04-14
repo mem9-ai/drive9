@@ -117,8 +117,10 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 	}
 
 	// If a zero instance was verified during auth, capture its expiration.
+	// Use r.Context() because authorizeNativeTarget mutates the request
+	// context (not the local ctx captured earlier).
 	var claimExpiresAt *time.Time
-	if zi := zeroInfoFromContext(ctx); zi != nil {
+	if zi := zeroInfoFromContext(r.Context()); zi != nil {
 		claimExpiresAt = zi.ExpiresAt
 	}
 
