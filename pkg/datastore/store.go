@@ -15,6 +15,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/metrics"
+	"github.com/mem9-ai/dat9/pkg/mysqlutil"
 	"go.uber.org/zap"
 )
 
@@ -132,9 +133,7 @@ func Open(dsn string) (*Store, error) {
 }
 
 func applyMySQLPoolDefaults(db *sql.DB) {
-	// Rotate and prune idle conns before common LB/NAT idle timeout windows.
-	db.SetConnMaxLifetime(5 * time.Minute)
-	db.SetConnMaxIdleTime(45 * time.Second)
+	mysqlutil.ApplyPoolDefaults(db)
 }
 
 func (s *Store) Close() error { return s.db.Close() }

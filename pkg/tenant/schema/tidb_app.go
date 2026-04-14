@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 )
@@ -99,7 +100,7 @@ func tidbAppEmbeddingSchemaStatements() []string {
 }
 
 func initTiDBAppEmbeddingSchema(dsn string) error {
-	db, err := OpenTiDBSchemaDB(dsn)
+	db, err := OpenTiDBSchemaDB(context.Background(), dsn)
 	if err != nil {
 		return err
 	}

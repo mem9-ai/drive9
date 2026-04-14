@@ -55,8 +55,8 @@ func (p *Provisioner) ProviderType() string { return tenant.ProviderTiDBCloudSta
 
 // InitSchema repairs known launch-schema drift (for example, missing uploads
 // columns from legacy tenants) and validates the TiDB auto-embedding contract.
-func (p *Provisioner) InitSchema(_ context.Context, dsn string) error {
-	return schema.EnsureTiDBSchemaForModeDSN(dsn, schema.TiDBEmbeddingModeAuto)
+func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {
+	return schema.EnsureTiDBSchemaForModeDSN(ctx, dsn, schema.TiDBEmbeddingModeAuto)
 }
 
 func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.ClusterInfo, error) {
