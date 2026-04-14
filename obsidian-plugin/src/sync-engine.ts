@@ -213,6 +213,9 @@ export class SyncEngine {
       this._lastErrorDetail = lastFailedPath;
       if (networkError) {
         this._consecutiveNetworkFailures++;
+      } else if (errorOccurred) {
+        // Non-network error breaks the consecutive network failure streak
+        this._consecutiveNetworkFailures = 0;
       }
       const finalStatus: SyncStatus = errorOccurred
         ? (this._consecutiveNetworkFailures >= OFFLINE_THRESHOLD ? "offline" : "error")
