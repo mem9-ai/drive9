@@ -3,7 +3,7 @@ const en = {
   // Settings
   "settings.title": "drive9 Settings",
   "settings.serverUrl": "Server URL",
-  "settings.serverUrl.desc": "drive9 server address (e.g. https://api.drive9.ai)",
+  "settings.serverUrl.desc": "drive9 server address (only change for self-hosted servers)",
   "settings.apiKey": "API Key",
   "settings.apiKey.desc": "drive9 API key for authentication",
   "settings.testConnection": "Test Connection",
@@ -17,6 +17,7 @@ const en = {
   "settings.maxFileSize.desc": "Skip files larger than this (default: 100)",
   "settings.mobileMaxFileSize": "Mobile Max File Size (MB)",
   "settings.mobileMaxFileSize.desc": "Lower file size limit on mobile to avoid OOM (default: 20)",
+  "settings.advanced": "Advanced Settings",
   "settings.enterServerUrl": "Please enter a server URL first",
   "settings.enterApiKey": "Please enter an API key first",
   "settings.connectionSuccess": "drive9: connection successful!",
@@ -47,7 +48,7 @@ const en = {
   "cmd.searchRibbon": "Search drive9",
 
   // Notices — main
-  "notice.configureFirst": "drive9: configure server URL in settings first",
+  "notice.configureFirst": "drive9: please configure API key in settings first",
   "notice.retrying": "drive9: retrying sync...",
   "notice.firstRunFailed": "drive9: first-run failed — {error}",
   "notice.uploading": "drive9: uploading {count} files to drive9...",
