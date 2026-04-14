@@ -51,29 +51,31 @@ export class Drive9SearchModal extends SuggestModal<SearchResult> {
       return [NO_RESULTS_STATE];
     }
 
-    return new Promise<SearchResult[]>((resolve) => {
-      if (this.debounceTimer) clearTimeout(this.debounceTimer);
-      this.searching = true;
-      this.debounceTimer = setTimeout(async () => {
-        try {
-          const results = await this.client.grep(query, SEARCH_LIMIT);
-          this.lastQuery = query;
-          this.cachedResults = results;
-          this.searching = false;
-          resolve(results.length > 0 ? results : [NO_RESULTS_STATE]);
-        } catch (e) {
-          this.searching = false;
-          if (e instanceof Drive9Error) {
-            new Notice(`drive9 search: ${e.message}`);
-          } else {
-            new Notice(`drive9 search: ${sanitizeError(e instanceof Error ? e.message : String(e))}`);
-          }
-          resolve([]);
+    // Schedule a debounced search. Return loading state synchronously;
+    // when results arrive, update cache and re-trigger getSuggestions
+    // via an input event so SuggestModal re-renders.
+    if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    this.searching = true;
+    this.debounceTimer = setTimeout(async () => {
+      try {
+        const results = await this.client.grep(query, SEARCH_LIMIT);
+        this.lastQuery = query;
+        this.cachedResults = results;
+      } catch (e) {
+        this.lastQuery = query;
+        this.cachedResults = [];
+        if (e instanceof Drive9Error) {
+          new Notice(`drive9 search: ${e.message}`);
+        } else {
+          new Notice(`drive9 search: ${sanitizeError(e instanceof Error ? e.message : String(e))}`);
         }
-      }, DEBOUNCE_MS);
-      // Show loading state immediately while debouncing
-      resolve([LOADING_STATE]);
-    });
+      }
+      this.searching = false;
+      // Re-trigger SuggestModal to call getSuggestions with updated cache
+      this.inputEl.dispatchEvent(new Event("input"));
+    }, DEBOUNCE_MS);
+
+    return [LOADING_STATE];
   }
 
   renderSuggestion(result: SearchResult, el: HTMLElement): void {
