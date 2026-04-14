@@ -41,7 +41,22 @@ export class Drive9SettingTab extends PluginSettingTab {
             await this.plugin.savePluginData();
             this.scheduleValidation();
           });
-      });
+      })
+      .addExtraButton((btn) =>
+        btn.setIcon("eye").setTooltip(t("settings.apiKey.toggle")).onClick(() => {
+          const input = btn.extraSettingsEl.parentElement?.querySelector("input");
+          if (!input) return;
+          const hidden = input.type === "password";
+          input.type = hidden ? "text" : "password";
+          btn.setIcon(hidden ? "eye-off" : "eye");
+        }),
+      )
+      .addExtraButton((btn) =>
+        btn.setIcon("copy").setTooltip(t("settings.apiKey.copy")).onClick(() => {
+          navigator.clipboard.writeText(this.plugin.settings.apiKey);
+          new Notice(t("settings.apiKey.copied"));
+        }),
+      );
 
     new Setting(containerEl)
       .setName(t("settings.testConnection"))
@@ -174,8 +189,9 @@ export class Drive9SettingTab extends PluginSettingTab {
     try {
       await testClient.ping();
       new Notice(t("settings.connectionSuccess"));
-      // If sync hasn't started yet (e.g. provision timed out earlier), start it now
-      await this.plugin.startSyncIfReady();
+      // If sync hasn't started yet (e.g. provision timed out earlier), kick it off
+      // in the background so the Test button returns immediately.
+      void this.plugin.startSyncIfReady();
     } catch (e) {
       if (e instanceof Drive9Error && e.status === 503) {
         new Notice(t("settings.provisioningInProgress"));
@@ -258,28 +274,119 @@ export class Drive9SettingTab extends PluginSettingTab {
       return;
     }
 
+    // --- Path 1: Create new account ---
     wrapper.createEl("div", {
-      text: t("settings.quickSetupDesc"),
+      text: t("settings.quickSetupNewUser"),
       cls: "drive9-quick-setup-desc",
-    }).style.marginTop = "4px";
+    }).style.cssText = "margin-top: 8px; font-size: 0.9em;";
 
-    const btnRow = wrapper.createEl("div");
-    btnRow.style.marginTop = "8px";
+    const createBtnRow = wrapper.createEl("div");
+    createBtnRow.style.marginTop = "6px";
 
-    const btn = btnRow.createEl("button", { text: t("settings.createAccount") });
-    btn.classList.add("mod-cta");
+    const createBtn = createBtnRow.createEl("button", { text: t("settings.createAccount") });
+    createBtn.classList.add("mod-cta");
 
     const statusEl = wrapper.createEl("div", { cls: "drive9-quick-setup-status" });
     statusEl.style.cssText = "margin-top: 8px; font-size: 0.85em; color: var(--text-muted); display: none;";
 
-    wrapper.createEl("div", {
-      text: t("settings.quickSetupAlt"),
-      cls: "drive9-quick-setup-alt",
-    }).style.cssText = "margin-top: 8px; font-size: 0.85em; color: var(--text-muted);";
+    // --- Divider ---
+    const divider = wrapper.createEl("div", { cls: "drive9-quick-setup-divider" });
+    divider.style.cssText = "display: flex; align-items: center; margin: 12px 0; gap: 8px;";
+    const line = () => {
+      const el = divider.createEl("div");
+      el.style.cssText = "flex: 1; height: 1px; background: var(--background-modifier-border);";
+    };
+    line();
+    divider.createEl("span", { text: t("settings.quickSetupOr") }).style.cssText =
+      "font-size: 0.8em; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em;";
+    line();
 
-    btn.addEventListener("click", () => {
-      void this.doProvision(btn, statusEl);
+    // --- Path 2: Existing API key ---
+    wrapper.createEl("div", {
+      text: t("settings.quickSetupExistingUser"),
+      cls: "drive9-quick-setup-desc",
+    }).style.cssText = "font-size: 0.9em;";
+
+    wrapper.createEl("div", {
+      text: t("settings.quickSetupExistingHint"),
+      cls: "drive9-quick-setup-hint",
+    }).style.cssText = "font-size: 0.8em; color: var(--text-muted); margin-top: 2px;";
+
+    const keyRow = wrapper.createEl("div", { cls: "drive9-quick-setup-key-row" });
+    keyRow.style.cssText = "display: flex; gap: 8px; margin-top: 6px; align-items: center;";
+
+    const keyInput = keyRow.createEl("input", { type: "password", placeholder: t("settings.quickSetupKeyPlaceholder") });
+    keyInput.style.cssText = "flex: 1; padding: 6px 8px; border-radius: 4px; border: 1px solid var(--background-modifier-border); background: var(--background-primary); color: var(--text-normal); font-size: 0.9em;";
+    keyInput.autocomplete = "off";
+
+    const connectBtn = keyRow.createEl("button", { text: t("settings.quickSetupConnect") });
+
+    const keyStatusEl = wrapper.createEl("div", { cls: "drive9-quick-setup-key-status" });
+    keyStatusEl.style.cssText = "margin-top: 6px; font-size: 0.85em; display: none;";
+
+    connectBtn.addEventListener("click", () => {
+      void this.connectExistingKey(keyInput, connectBtn, keyStatusEl);
     });
+
+    // Also connect on Enter key
+    keyInput.addEventListener("keydown", (e: KeyboardEvent) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void this.connectExistingKey(keyInput, connectBtn, keyStatusEl);
+      }
+    });
+
+    createBtn.addEventListener("click", () => {
+      void this.doProvision(createBtn, statusEl);
+    });
+  }
+
+  private async connectExistingKey(
+    input: HTMLInputElement,
+    btn: HTMLButtonElement,
+    statusEl: HTMLElement,
+  ): Promise<void> {
+    const key = input.value.trim();
+    if (!key) {
+      statusEl.style.display = "block";
+      statusEl.style.color = "var(--text-error)";
+      statusEl.setText(t("settings.enterApiKey"));
+      return;
+    }
+
+    btn.disabled = true;
+    btn.setText(t("settings.quickSetupConnecting"));
+    statusEl.style.display = "block";
+    statusEl.style.color = "var(--text-muted)";
+    statusEl.setText(t("settings.quickSetupVerifying"));
+
+    const testClient = new Drive9Client(
+      this.plugin.settings.serverUrl,
+      key,
+    );
+
+    try {
+      await testClient.ping();
+
+      // Key is valid — save and start sync
+      this.plugin.settings.apiKey = key;
+      await this.plugin.savePluginData();
+
+      statusEl.style.color = "var(--text-success)";
+      statusEl.setText(t("settings.quickSetupKeySuccess"));
+      new Notice(t("settings.connectionSuccess"));
+
+      void this.plugin.startSyncIfReady();
+
+      // Re-render to show "connected" state
+      this.display();
+    } catch (e) {
+      btn.disabled = false;
+      btn.setText(t("settings.quickSetupConnect"));
+      const msg = e instanceof Error ? e.message : String(e);
+      statusEl.style.color = "var(--text-error)";
+      statusEl.setText(t("settings.connectionFailed", { error: sanitizeError(msg) }));
+    }
   }
 
   private async doProvision(btn: HTMLButtonElement, statusEl: HTMLElement): Promise<void> {

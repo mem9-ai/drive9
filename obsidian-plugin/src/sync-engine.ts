@@ -27,6 +27,8 @@ export class SyncEngine {
   private _lastErrorDetail = "";
   private _consecutiveNetworkFailures = 0;
   private statusListeners: Array<() => void> = [];
+  private _conflictNoticeCount = 0;
+  private _conflictNoticeTimer: ReturnType<typeof setTimeout> | null = null;
 
   private shadowStore: ShadowStore | null = null;
 
@@ -454,8 +456,40 @@ export class SyncEngine {
     };
 
     if (!wasConflict) {
+      this.notifyConflict(path);
+    }
+  }
+
+  /**
+   * Batched conflict notification: show individual notices for the first few,
+   * then a single summary notice for the rest.
+   */
+  private notifyConflict(path: string): void {
+    this._conflictNoticeCount++;
+
+    // Show individual notices only for the first 3 conflicts in a batch
+    if (this._conflictNoticeCount <= 3) {
       new Notice(t("notice.conflictDetected", { path }));
     }
+
+    // Reset batch window after 5 seconds of no new conflicts
+    if (this._conflictNoticeTimer) clearTimeout(this._conflictNoticeTimer);
+    this._conflictNoticeTimer = setTimeout(() => {
+      if (this._conflictNoticeCount > 3) {
+        const total = this.countConflicts();
+        new Notice(t("notice.conflictsBatch", { count: total }), 10000);
+      }
+      this._conflictNoticeCount = 0;
+      this._conflictNoticeTimer = null;
+    }, 5000);
+  }
+
+  private countConflicts(): number {
+    let count = 0;
+    for (const state of Object.values(this.syncStates)) {
+      if (state.status === "conflict") count++;
+    }
+    return count;
   }
 
   private async pullRemoteFile(path: string, remoteRevision: number, localFile: TFile | null): Promise<void> {
