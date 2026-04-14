@@ -26,15 +26,18 @@ pub(crate) async fn check_error(resp: reqwest::Response) -> Result<reqwest::Resp
     if status.is_success() {
         return Ok(resp);
     }
-    let message = resp
-        .json::<serde_json::Value>()
-        .await
+    let bytes = resp.bytes().await.unwrap_or_default();
+    let message = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
         .and_then(|v| {
             v.get("error")
                 .or_else(|| v.get("message"))
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            let text = String::from_utf8_lossy(&bytes).trim().to_string();
+            if text.is_empty() { None } else { Some(text) }
         })
         .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
     if status == StatusCode::CONFLICT {

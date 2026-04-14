@@ -13,6 +13,11 @@ from .patch import PatchMixin
 from .stream import StreamWriter
 
 
+def _parse_iso_datetime(s: str) -> datetime:
+    """Parse ISO8601 datetime, handling Z suffix for Python < 3.11."""
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
 class Client(TransferMixin, PatchMixin):
     """The Drive9 HTTP client."""
 
@@ -56,12 +61,13 @@ class Client(TransferMixin, PatchMixin):
             small_file_threshold or self.DEFAULT_SMALL_FILE_THRESHOLD
         )
         self.session = session or requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=16,
-            pool_maxsize=16,
-        )
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
+        if session is None:
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=16,
+                pool_maxsize=16,
+            )
+            self.session.mount("http://", adapter)
+            self.session.mount("https://", adapter)
 
     def _url(self, path: str) -> str:
         if not path.startswith("/"):
@@ -272,12 +278,8 @@ class Client(TransferMixin, PatchMixin):
             secret_type=data["secret_type"],
             revision=data["revision"],
             created_by=data["created_by"],
-            created_at=datetime.fromisoformat(
-                data["created_at"].replace("Z", "+00:00")
-            ),
-            updated_at=datetime.fromisoformat(
-                data["updated_at"].replace("Z", "+00:00")
-            ),
+            created_at=_parse_iso_datetime(data["created_at"]),
+            updated_at=_parse_iso_datetime(data["updated_at"]),
         )
 
     def update_vault_secret(
@@ -299,12 +301,8 @@ class Client(TransferMixin, PatchMixin):
             secret_type=data["secret_type"],
             revision=data["revision"],
             created_by=data["created_by"],
-            created_at=datetime.fromisoformat(
-                data["created_at"].replace("Z", "+00:00")
-            ),
-            updated_at=datetime.fromisoformat(
-                data["updated_at"].replace("Z", "+00:00")
-            ),
+            created_at=_parse_iso_datetime(data["created_at"]),
+            updated_at=_parse_iso_datetime(data["updated_at"]),
         )
 
     def delete_vault_secret(self, name: str) -> None:

@@ -2,7 +2,8 @@ export interface FileInfo {
   name: string;
   size: number;
   isDir: boolean;
-  mtime?: number;
+  /** UTC epoch seconds from server; converted to Date by the client. */
+  mtime?: Date;
 }
 
 export interface StatResult {
@@ -15,6 +16,7 @@ export interface StatResult {
 export interface SearchResult {
   path: string;
   name: string;
+  /** Mirrors the snake_case field name used by the server API. */
   size_bytes: number;
   score?: number;
 }

@@ -1,7 +1,7 @@
 use crate::error::{check_error, Drive9Error};
 use crate::models::{FileInfo, SearchResult, StatResult};
 use crate::stream::StreamWriter;
-use chrono::Utc;
+
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde_json::json;
 use std::collections::HashMap;
@@ -36,7 +36,8 @@ fn load_config_file() -> Option<(String, Option<String>)> {
 fn load_config() -> (String, Option<String>) {
     let env_server = std::env::var("DRIVE9_SERVER").ok().filter(|s| !s.is_empty());
     let env_key = std::env::var("DRIVE9_API_KEY").ok().filter(|s| !s.is_empty());
-    let (file_server, file_key) = load_config_file().unwrap_or_default();
+    let (file_server, file_key) = load_config_file()
+        .unwrap_or_else(|| ("https://api.drive9.ai".to_string(), None));
     (
         env_server.unwrap_or(file_server),
         env_key.or(file_key),
@@ -64,13 +65,14 @@ impl Client {
     }
 
     fn new_with_opts(base_url: String, api_key: String) -> Self {
+        let (cfg_base, cfg_api) = load_config();
         let mut base = base_url.trim_end_matches('/').to_string();
         let mut api = Some(api_key).filter(|s| !s.is_empty());
         if api.is_none() {
-            api = load_config().1;
+            api = cfg_api;
         }
         if base.is_empty() {
-            base = load_config().0;
+            base = cfg_base;
         }
         let http = reqwest::Client::builder()
             .user_agent(concat!("drive9-rs/", env!("CARGO_PKG_VERSION")))
@@ -214,7 +216,7 @@ impl Client {
             .get("X-Dat9-Mtime")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<i64>().ok())
-            .map(|ts| chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(|| Utc::now()));
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
         Ok(StatResult {
             size,
             is_dir: headers

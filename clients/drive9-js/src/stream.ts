@@ -2,6 +2,7 @@ import { Client } from "./client.js";
 import { bodyInit } from "./compat.js";
 import { checkError, Drive9Error } from "./error.js";
 import type { CompletePart, PresignedPart, UploadPlanV2 } from "./models.js";
+import { Semaphore } from "./utils.js";
 
 const UPLOAD_MAX_CONCURRENCY = 16;
 
@@ -21,6 +22,8 @@ export class StreamWriter {
   private expectedRevision: number;
   private state: StreamState;
   private sem: Semaphore;
+  private inflight: number;
+  private inflightZeroResolvers: (() => void)[];
 
   constructor(client: Client, path: string, totalSize: number, expectedRevision = -1) {
     this.client = client;
@@ -35,6 +38,8 @@ export class StreamWriter {
       uploaded: new Map(),
     };
     this.sem = new Semaphore(UPLOAD_MAX_CONCURRENCY);
+    this.inflight = 0;
+    this.inflightZeroResolvers = [];
   }
 
   async writePart(partNum: number, data: Uint8Array): Promise<void> {
@@ -63,14 +68,20 @@ export class StreamWriter {
 
     const plan = this.state.plan!;
     await this.sem.acquire();
+    this.inflight++;
     const client = this.client;
     const uploadId = plan.upload_id;
-    const p = await presignOnePart(client, uploadId, partNum);
     try {
+      const p = await presignOnePart(client, uploadId, partNum);
       const etag = await uploadOnePartV2(client, uploadId, p, data);
       this.state.uploaded.set(partNum, { number: partNum, etag });
     } finally {
       this.sem.release();
+      this.inflight--;
+      if (this.inflight === 0) {
+        for (const r of this.inflightZeroResolvers) r();
+        this.inflightZeroResolvers = [];
+      }
     }
   }
 
@@ -112,9 +123,15 @@ export class StreamWriter {
   async abort(): Promise<void> {
     if (this.state.completed || this.state.aborted) return;
     this.state.aborted = true;
+    await this.waitInflight();
     if (this.state.plan) {
       await abortUploadV2(this.client, this.state.plan.upload_id);
     }
+  }
+
+  private async waitInflight(): Promise<void> {
+    if (this.inflight === 0) return;
+    await new Promise<void>((resolve) => this.inflightZeroResolvers.push(resolve));
   }
 
   private async initiate(): Promise<UploadPlanV2> {
@@ -182,25 +199,3 @@ async function abortUploadV2(client: Client, uploadId: string): Promise<void> {
   });
 }
 
-class Semaphore {
-  private permits: number;
-  private waiters: (() => void)[] = [];
-  constructor(n: number) {
-    this.permits = n;
-  }
-  acquire(): Promise<void> {
-    if (this.permits > 0) {
-      this.permits--;
-      return Promise.resolve();
-    }
-    return new Promise((resolve) => this.waiters.push(resolve));
-  }
-  release(): void {
-    const next = this.waiters.shift();
-    if (next) {
-      next();
-    } else {
-      this.permits++;
-    }
-  }
-}

@@ -11,6 +11,7 @@ pip install -e ".[dev]"
 ## Usage
 
 ```python
+import os
 from drive9 import Client
 
 client = Client("http://localhost:8080", api_key="your-api-key")

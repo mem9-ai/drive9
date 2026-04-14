@@ -66,6 +66,8 @@ Expected config format:
 }
 ```
 
+Environment variables `DRIVE9_SERVER` and `DRIVE9_API_KEY` override values from the config file when set.
+
 ## Supported operations
 
 | Operation | Method |

@@ -109,8 +109,18 @@ async fn test_grep() {
 
 #[test]
 fn test_default_client_loads_config() {
-    // This test just ensures default_client compiles and runs without panic when no config exists.
+    let original = std::env::var("HOME").ok();
+    let temp_home = std::env::temp_dir().join(format!("drive9-test-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_home).unwrap();
+    std::env::set_var("HOME", &temp_home);
+
     let client = Client::default_client();
-    // Just ensure it doesn't panic; values depend on whether ~/.drive9/config exists.
-    assert!(!client.base_url().is_empty());
+    assert_eq!(client.base_url(), "https://api.drive9.ai");
+    assert!(client.api_key().is_none());
+
+    match original {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    let _ = std::fs::remove_dir_all(&temp_home);
 }

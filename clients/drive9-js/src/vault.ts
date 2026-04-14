@@ -5,12 +5,13 @@ import type { VaultAuditEvent, VaultSecret, VaultTokenIssueResponse } from "./mo
 export async function createVaultSecret(
   client: Client,
   name: string,
-  fields: Record<string, unknown>
+  fields: Record<string, unknown>,
+  createdBy = "drive9-js"
 ): Promise<VaultSecret> {
   const resp = await fetch(client.vaultUrl("/secrets"), {
     method: "POST",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ name, fields, created_by: "drive9-cli" }),
+    body: JSON.stringify({ name, fields, created_by: createdBy }),
   });
   await checkError(resp);
   return (await resp.json()) as VaultSecret;
@@ -19,12 +20,13 @@ export async function createVaultSecret(
 export async function updateVaultSecret(
   client: Client,
   name: string,
-  fields: Record<string, unknown>
+  fields: Record<string, unknown>,
+  updatedBy = "drive9-js"
 ): Promise<VaultSecret> {
   const resp = await fetch(client.vaultUrl(`/secrets/${encodeURIComponent(name)}`), {
     method: "PUT",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ fields, updated_by: "drive9-cli" }),
+    body: JSON.stringify({ fields, updated_by: updatedBy }),
   });
   await checkError(resp);
   return (await resp.json()) as VaultSecret;

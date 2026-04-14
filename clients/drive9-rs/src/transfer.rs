@@ -200,9 +200,20 @@ impl Client {
             .http
             .get(self.fs_url(path))
             .headers(self.auth_headers())
+            .header("Range", format!("bytes={}-{}", offset, offset + length - 1))
             .send()
             .await?;
         let status = resp.status();
+        if status.as_u16() == 206 {
+            let stream = resp.bytes_stream();
+            let reader = StreamReader::new(stream.map(|item| {
+                item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            }));
+            return Ok(Box::new(reader));
+        }
+        if status.as_u16() == 416 {
+            return Ok(Box::new(std::io::Cursor::new(Vec::new())));
+        }
         if status.as_u16() == 302 || status.as_u16() == 307 {
             let location = resp
                 .headers()
