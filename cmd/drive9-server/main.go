@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -38,14 +39,15 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "-h", "--help", "help":
-			usage()
+			usage(os.Stdout, 0)
+			return
 		case "schema":
 			die(runSchemaCommand(os.Args[2:]))
 			return
 		}
 	}
 	if len(os.Args) > 2 {
-		usage()
+		usage(os.Stderr, 2)
 	}
 
 	addr := envOr("DRIVE9_LISTEN_ADDR", defaultListenAddr)
@@ -213,8 +215,8 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-func usage() {
-	fmt.Fprintf(os.Stderr, `usage:
+func usage(out io.Writer, exitCode int) {
+	_, _ = fmt.Fprintf(out, `usage:
   drive9-server [listen-addr]
   drive9-server schema dump-init-sql --provider <db9|tidb_zero|tidb_cloud_starter>
 
@@ -283,7 +285,7 @@ schema tooling:
   dump-init-sql writes the exact init schema SQL to stdout so external systems
   such as tidb_cloud_starter can stay in sync with drive9's schema source of truth.
 `, server.DefaultMaxUploadBytes)
-	os.Exit(2)
+	os.Exit(exitCode)
 }
 
 func die(err error) {

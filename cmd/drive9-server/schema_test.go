@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"strings"
@@ -8,23 +9,27 @@ import (
 )
 
 func TestSchemaDumpInitSQLByProvider(t *testing.T) {
-	out := captureSchemaStdout(t, func() {
-		if err := runSchemaCommand([]string{"dump-init-sql", "--provider", "tidb_zero"}); err != nil {
-			t.Fatalf("dump provider schema: %v", err)
-		}
-	})
+	for _, provider := range []string{"tidb_zero", "tidb_cloud_starter"} {
+		t.Run(provider, func(t *testing.T) {
+			out := captureSchemaStdout(t, func() {
+				if err := runSchemaCommand([]string{"dump-init-sql", "--provider", provider}); err != nil {
+					t.Fatalf("dump provider schema: %v", err)
+				}
+			})
 
-	if !strings.Contains(out, "CREATE TABLE IF NOT EXISTS files") {
-		t.Fatalf("dump missing files table: %q", out)
-	}
-	if !strings.Contains(out, "GENERATED ALWAYS AS (EMBED_TEXT") {
-		t.Fatalf("dump missing auto-embedding expression: %q", out)
-	}
-	if !strings.Contains(out, "CREATE INDEX idx_task_claim_type ON semantic_tasks") {
-		t.Fatalf("dump missing semantic_tasks index: %q", out)
-	}
-	if !strings.Contains(out, ";\n") {
-		t.Fatalf("dump missing SQL statement terminators: %q", out)
+			if !strings.Contains(out, "CREATE TABLE IF NOT EXISTS files") {
+				t.Fatalf("dump missing files table: %q", out)
+			}
+			if !strings.Contains(out, "GENERATED ALWAYS AS (EMBED_TEXT") {
+				t.Fatalf("dump missing auto-embedding expression: %q", out)
+			}
+			if !strings.Contains(out, "CREATE INDEX idx_task_claim_type ON semantic_tasks") {
+				t.Fatalf("dump missing semantic_tasks index: %q", out)
+			}
+			if !strings.Contains(out, ";\n") {
+				t.Fatalf("dump missing SQL statement terminators: %q", out)
+			}
+		})
 	}
 }
 
@@ -67,17 +72,21 @@ func captureSchemaStdout(t *testing.T, fn func()) string {
 		os.Stdout = originalStdout
 	})
 
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, reader)
+		done <- buf.String()
+	}()
+
 	fn()
 
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close stdout writer: %v", err)
 	}
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatalf("read stdout: %v", err)
-	}
+	data := <-done
 	if err := reader.Close(); err != nil {
 		t.Fatalf("close stdout reader: %v", err)
 	}
-	return string(data)
+	return data
 }

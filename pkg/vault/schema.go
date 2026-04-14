@@ -8,6 +8,13 @@ import (
 
 // SchemaStatements returns the vault DDL statements used during tenant schema
 // initialization.
+//
+// These statements are appended into the exported db9 init schema. If you
+// change vault columns, indexes, or constraints here, rerun:
+//
+//	drive9-server schema dump-init-sql --provider db9
+//
+// and update any external db9 schema copy that consumes that exported SQL.
 func SchemaStatements() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS vault_deks (
