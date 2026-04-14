@@ -1,4 +1,5 @@
 import { App, Modal } from "obsidian";
+import { t } from "./i18n";
 
 export type ConflictChoice = "keep_local" | "keep_remote" | "keep_both";
 
@@ -38,7 +39,7 @@ export class ConflictModal extends Modal {
     contentEl.empty();
     contentEl.addClass("drive9-conflict-modal");
 
-    contentEl.createEl("h2", { text: "Sync Conflict" });
+    contentEl.createEl("h2", { text: t("conflict.title") });
     contentEl.createEl("p", {
       text: this.info.path,
       cls: "drive9-conflict-path",
@@ -47,35 +48,35 @@ export class ConflictModal extends Modal {
     const table = contentEl.createEl("table", { cls: "drive9-conflict-table" });
     const header = table.createEl("tr");
     header.createEl("th", { text: "" });
-    header.createEl("th", { text: "Local" });
-    header.createEl("th", { text: "Remote" });
+    header.createEl("th", { text: t("conflict.local") });
+    header.createEl("th", { text: t("conflict.remote") });
 
     const sizeRow = table.createEl("tr");
-    sizeRow.createEl("td", { text: "Size" });
+    sizeRow.createEl("td", { text: t("conflict.size") });
     sizeRow.createEl("td", { text: formatSize(this.info.localSize) });
     sizeRow.createEl("td", { text: formatSize(this.info.remoteSize) });
 
     const mtimeRow = table.createEl("tr");
-    mtimeRow.createEl("td", { text: "Modified" });
+    mtimeRow.createEl("td", { text: t("conflict.modified") });
     mtimeRow.createEl("td", { text: formatTime(this.info.localMtime) });
     mtimeRow.createEl("td", { text: formatTime(this.info.remoteMtime) });
 
     if (this.info.diffPreview) {
       const details = contentEl.createEl("details");
-      details.createEl("summary", { text: "Diff preview" });
+      details.createEl("summary", { text: t("conflict.diffPreview") });
       const pre = details.createEl("pre", { cls: "drive9-conflict-diff" });
       pre.createEl("code", { text: this.info.diffPreview });
     }
 
     const actions = contentEl.createEl("div", { cls: "drive9-conflict-actions" });
 
-    const localBtn = actions.createEl("button", { text: "Keep Local", cls: "mod-warning" });
+    const localBtn = actions.createEl("button", { text: t("conflict.keepLocal"), cls: "mod-warning" });
     localBtn.addEventListener("click", () => this.choose("keep_local"));
 
-    const remoteBtn = actions.createEl("button", { text: "Keep Remote" });
+    const remoteBtn = actions.createEl("button", { text: t("conflict.keepRemote") });
     remoteBtn.addEventListener("click", () => this.choose("keep_remote"));
 
-    const bothBtn = actions.createEl("button", { text: "Keep Both" });
+    const bothBtn = actions.createEl("button", { text: t("conflict.keepBoth") });
     bothBtn.addEventListener("click", () => this.choose("keep_both"));
   }
 

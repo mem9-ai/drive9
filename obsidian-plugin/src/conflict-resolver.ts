@@ -3,6 +3,7 @@ import { Drive9Client, Drive9Error } from "./client";
 import { ShadowStore } from "./shadow-store";
 import { merge3, simpleDiff } from "./diff3";
 import { ConflictModal, createConflictInfo, isTextFile } from "./conflict-modal";
+import { t } from "./i18n";
 import type { ConflictChoice } from "./conflict-modal";
 import type { SyncState } from "./types";
 
@@ -189,7 +190,7 @@ export class ConflictResolver {
         status: "synced",
         lastSyncedContentHash: hash,
       };
-      new Notice(`drive9: auto-merged ${path}`);
+      new Notice(t("notice.autoMerged", { path }));
       return true;
     }
 
@@ -219,10 +220,10 @@ export class ConflictResolver {
             status: "synced",
             lastSyncedContentHash: hash,
           };
-          new Notice(`drive9: kept local version of ${path}`);
+          new Notice(t("notice.keptLocal", { path }));
         } catch (e) {
           if (e instanceof Drive9Error && e.status === 409) {
-            new Notice(`drive9: remote changed again for ${path}, retrying next cycle`);
+            new Notice(t("notice.remoteChangedRetry", { path }));
             return;
           }
           throw e;
@@ -244,7 +245,7 @@ export class ConflictResolver {
           status: "synced",
           lastSyncedContentHash: hash,
         };
-        new Notice(`drive9: kept remote version of ${path}`);
+        new Notice(t("notice.keptRemote", { path }));
         break;
       }
 
@@ -279,10 +280,10 @@ export class ConflictResolver {
             status: "synced",
             lastSyncedContentHash: hash,
           };
-          new Notice(`drive9: kept both versions of ${path}`);
+          new Notice(t("notice.keptBoth", { path }));
         } catch (e) {
           if (e instanceof Drive9Error && e.status === 409) {
-            new Notice(`drive9: remote changed again for ${path}, retrying next cycle`);
+            new Notice(t("notice.remoteChangedRetry", { path }));
             return;
           }
           throw e;
