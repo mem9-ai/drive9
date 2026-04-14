@@ -6,6 +6,27 @@ import (
 	"strings"
 )
 
+// CloneStatements returns a copy of the given schema statements so callers can
+// format or extend them without mutating the init-schema source of truth.
+func CloneStatements(stmts []string) []string {
+	cloned := make([]string, len(stmts))
+	copy(cloned, stmts)
+	return cloned
+}
+
+// FormatStatementsSQL renders schema statements as executable SQL text.
+func FormatStatementsSQL(stmts []string) string {
+	var b strings.Builder
+	for i, stmt := range stmts {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(strings.TrimSpace(stmt))
+		b.WriteString(";\n")
+	}
+	return b.String()
+}
+
 // ExecSchemaStatements executes a sequence of DDL statements, ignoring
 // duplicate-key / already-exists errors that arise from racing migrations.
 func ExecSchemaStatements(db *sql.DB, stmts []string) error {

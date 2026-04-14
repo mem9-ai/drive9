@@ -255,3 +255,20 @@ Obtain a logger from `pkg/logger` or accept `*zap.Logger` via `Config`.
 - All drive9 paths are absolute, UTF-8, NFC-normalized, no backslashes, no `..` segments.
 - Directories always end with `/`; files never do.
 - Use `pkg/pathutil` for all path normalization — never manipulate raw strings directly.
+
+### Schema synchronization
+
+- `pkg/tenant/schema/tidb_auto.go`, `pkg/tenant/schema/tidb_app.go`, and `pkg/tenant/db9/schema.go`
+  are the source of truth for tenant init schema SQL.
+- If you change schema shape in those files — columns, indexes, generated columns, constraints,
+  defaults, or table definitions — you must also update the externally managed `tidb_cloud_starter`
+  schema using the exported SQL from:
+
+```bash
+drive9-server schema dump-init-sql --provider tidb_zero
+drive9-server schema dump-init-sql --provider tidb_cloud_starter
+drive9-server schema dump-init-sql --provider db9
+```
+
+- Do not maintain a second handwritten copy of those init SQL statements when a command can
+  export the exact runtime source of truth.

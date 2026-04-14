@@ -1,14 +1,17 @@
-// Command drive9-server starts the drive9 HTTP server.
+// Command drive9-server starts the drive9 HTTP server and exposes operational
+// schema tooling.
 //
 // Usage:
 //
 //	drive9-server [listen-addr]
+//	drive9-server schema dump-init-sql [flags]
 package main
 
 import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -33,8 +36,18 @@ const (
 )
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-h", "--help", "help":
+			usage(os.Stdout, 0)
+			return
+		case "schema":
+			die(runSchemaCommand(os.Args[2:]))
+			return
+		}
+	}
 	if len(os.Args) > 2 {
-		usage()
+		usage(os.Stderr, 2)
 	}
 
 	addr := envOr("DRIVE9_LISTEN_ADDR", defaultListenAddr)
@@ -202,8 +215,10 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-func usage() {
-	fmt.Fprintf(os.Stderr, `usage: drive9-server [listen-addr]
+func usage(out io.Writer, exitCode int) {
+	_, _ = fmt.Fprintf(out, `usage:
+  drive9-server [listen-addr]
+  drive9-server schema dump-init-sql --provider <db9|tidb_zero|tidb_cloud_starter>
 
 environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: :9009)
@@ -265,8 +280,12 @@ environment:
   DRIVE9_AUDIO_EXTRACT_API_KEY  API key for DRIVE9_AUDIO_EXTRACT_API_BASE (required when enabled)
   DRIVE9_AUDIO_EXTRACT_MODEL    model name for audio transcription (required when enabled)
   DRIVE9_AUDIO_EXTRACT_PROMPT   optional provider prompt for transcription
+
+schema tooling:
+  dump-init-sql writes the exact init schema SQL to stdout so external systems
+  such as tidb_cloud_starter can stay in sync with drive9's schema source of truth.
 `, server.DefaultMaxUploadBytes)
-	os.Exit(2)
+	os.Exit(exitCode)
 }
 
 func die(err error) {

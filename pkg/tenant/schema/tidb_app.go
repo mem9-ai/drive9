@@ -6,6 +6,13 @@ import (
 	"strconv"
 )
 
+// Keep this statement list aligned with any external workflow that manages the
+// app-embedding TiDB schema directly. If you change columns, indexes,
+// generated expressions, or constraints here, update that external workflow at
+// the same time.
+//
+// There is intentionally no drive9-server dump-init-sql --provider export path
+// for this app-managed statement list.
 func tidbAppEmbeddingSchemaStatements() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
