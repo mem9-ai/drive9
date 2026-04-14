@@ -40,6 +40,13 @@ type tidbTableMeta struct {
 	columns   map[string]tidbColumnMeta
 }
 
+// Keep this statement list aligned with the externally managed tidb_cloud_starter
+// schema. If you change columns, indexes, generated expressions, or
+// constraints here, rerun:
+//
+//	drive9-server schema dump-init-sql --provider tidb_cloud_starter
+//
+// and update tidb_cloud_starter with the exported SQL.
 func tidbAutoEmbeddingSchemaStatements() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
