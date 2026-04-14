@@ -4,7 +4,7 @@ import { Drive9Client, Drive9Error, sanitizeError } from "./client";
 import { t } from "./i18n";
 
 const PROVISION_POLL_INTERVAL = 2000;
-const PROVISION_POLL_TIMEOUT = 120_000;
+const PROVISION_POLL_TIMEOUT = 600_000; // 10 minutes — matches server retry window
 
 export class Drive9SettingTab extends PluginSettingTab {
   private validateTimer: ReturnType<typeof setTimeout> | null = null;
@@ -174,6 +174,8 @@ export class Drive9SettingTab extends PluginSettingTab {
     try {
       await testClient.ping();
       new Notice(t("settings.connectionSuccess"));
+      // If sync hasn't started yet (e.g. provision timed out earlier), start it now
+      await this.plugin.startSyncIfReady();
     } catch (e) {
       if (e instanceof Drive9Error && e.status === 503) {
         new Notice(t("settings.provisioningInProgress"));
