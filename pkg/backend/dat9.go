@@ -43,6 +43,7 @@ type Dat9Backend struct {
 	databaseAutoEmbedding bool
 	maxUploadBytes        int64
 	maxTenantStorageBytes int64
+	maxMediaLLMFiles      int64
 	mu                    sync.Mutex
 	entropy               io.Reader
 
