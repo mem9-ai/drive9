@@ -18,8 +18,8 @@ type staticImageExtractor struct {
 	text string
 }
 
-func (e *staticImageExtractor) ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, error) {
-	return e.text, nil
+func (e *staticImageExtractor) ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, ImageExtractUsage, error) {
+	return e.text, ImageExtractUsage{}, nil
 }
 
 type gatedImageExtractor struct {
@@ -30,7 +30,7 @@ type gatedImageExtractor struct {
 	calls int
 }
 
-func (e *gatedImageExtractor) ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, error) {
+func (e *gatedImageExtractor) ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, ImageExtractUsage, error) {
 	e.mu.Lock()
 	e.calls++
 	call := e.calls
@@ -43,11 +43,11 @@ func (e *gatedImageExtractor) ExtractImageText(ctx context.Context, req ImageExt
 		select {
 		case <-e.release:
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", ImageExtractUsage{}, ctx.Err()
 		}
-		return "old caption", nil
+		return "old caption", ImageExtractUsage{}, nil
 	}
-	return "new caption", nil
+	return "new caption", ImageExtractUsage{}, nil
 }
 
 func TestAsyncImageExtractUpdatesContentText(t *testing.T) {

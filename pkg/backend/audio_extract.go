@@ -11,6 +11,7 @@ import (
 	"github.com/pingcap/failpoint"
 
 	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 )
 
 // AudioExtractRequest is the input to a pluggable audio->text extractor.
@@ -23,7 +24,7 @@ type AudioExtractRequest struct {
 
 // AudioTextExtractor extracts searchable transcript text from audio bytes.
 type AudioTextExtractor interface {
-	ExtractAudioText(ctx context.Context, req AudioExtractRequest) (string, error)
+	ExtractAudioText(ctx context.Context, req AudioExtractRequest) (string, AudioExtractUsage, error)
 }
 
 // AudioExtractTaskSpec carries the revision-scoped inputs needed to extract
@@ -51,6 +52,7 @@ const (
 	AudioExtractResultEmptyText            AudioExtractResult = "empty_text"
 	AudioExtractResultUpdateError          AudioExtractResult = "update_error"
 	AudioExtractResultWritten              AudioExtractResult = "written"
+	AudioExtractResultBudgetExhausted      AudioExtractResult = "budget_exhausted"
 )
 
 // SupportsAsyncAudioExtract reports whether this backend instance has a fully
@@ -235,6 +237,10 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 	if !b.SupportsAsyncAudioExtract() {
 		return AudioExtractResultRuntimeNotConfigured, fmt.Errorf("async audio extract runtime not configured")
 	}
+	if b.monthlyLLMCostExceeded() {
+		metrics.RecordOperation("llm_cost_budget", "process_skip", "budget_exhausted", 0)
+		return AudioExtractResultBudgetExhausted, nil
+	}
 
 	f, err := b.store.GetFile(ctx, task.FileID)
 	if err != nil {
@@ -267,7 +273,7 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 	}
 
 	taskCtx, cancel := context.WithTimeout(ctx, b.audioExtractTimeout)
-	text, err := b.audioExtractor.ExtractAudioText(taskCtx, AudioExtractRequest{
+	text, audioUsage, err := b.audioExtractor.ExtractAudioText(taskCtx, AudioExtractRequest{
 		FileID:      task.FileID,
 		Path:        task.Path,
 		ContentType: extractorContentType,
@@ -277,6 +283,7 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 	if err != nil {
 		return AudioExtractResultExtractError, fmt.Errorf("extract audio text: %w", err)
 	}
+	b.recordAudioExtractUsage(task.FileID, audioUsage)
 	text = sanitizeExtractedText(text, b.maxAudioExtractTextBytes)
 	if text == "" {
 		return AudioExtractResultEmptyText, nil

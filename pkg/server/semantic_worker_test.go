@@ -69,11 +69,11 @@ type staticServerImageExtractor struct {
 	err  error
 }
 
-func (e staticServerImageExtractor) ExtractImageText(context.Context, backend.ImageExtractRequest) (string, error) {
+func (e staticServerImageExtractor) ExtractImageText(_ context.Context, _ backend.ImageExtractRequest) (string, backend.ImageExtractUsage, error) {
 	if e.err != nil {
-		return "", e.err
+		return "", backend.ImageExtractUsage{}, e.err
 	}
-	return e.text, nil
+	return e.text, backend.ImageExtractUsage{}, nil
 }
 
 type staticServerAudioExtractor struct {
@@ -81,11 +81,11 @@ type staticServerAudioExtractor struct {
 	err  error
 }
 
-func (e staticServerAudioExtractor) ExtractAudioText(context.Context, backend.AudioExtractRequest) (string, error) {
+func (e staticServerAudioExtractor) ExtractAudioText(_ context.Context, _ backend.AudioExtractRequest) (string, backend.AudioExtractUsage, error) {
 	if e.err != nil {
-		return "", e.err
+		return "", backend.AudioExtractUsage{}, e.err
 	}
-	return e.text, nil
+	return e.text, backend.AudioExtractUsage{}, nil
 }
 
 func newTestTenantPool(t *testing.T) *tenant.Pool {

@@ -152,7 +152,7 @@ func TestOpenAIAudioTextExtractorExtractAudioText(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+	got, _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
 		Path:        "/audio/clip.mp3",
 		ContentType: "audio/mpeg",
 		Data:        []byte("fake-mp3"),
@@ -180,7 +180,7 @@ func TestOpenAIAudioTextExtractorExtractAudioTextErrorMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{}); err == nil || err.Error() != "audio transcription api status 502: upstream unavailable" {
+	if _, _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{}); err == nil || err.Error() != "audio transcription api status 502: upstream unavailable" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -200,7 +200,7 @@ func TestOpenAIAudioTextExtractorExtractAudioTextRawErrorBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{}); err == nil || err.Error() != "audio transcription api status 400: bad gateway from proxy" {
+	if _, _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{}); err == nil || err.Error() != "audio transcription api status 400: bad gateway from proxy" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -219,7 +219,7 @@ func TestOpenAIAudioTextExtractorExtractAudioTextEmptyText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{}); err == nil || err.Error() != "audio transcription api returned empty text" {
+	if _, _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{}); err == nil || err.Error() != "audio transcription api returned empty text" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -265,7 +265,7 @@ func TestOpenAIAudioTextExtractorFallsBackToGenericFilenameAndContentType(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+	if _, _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
 		Path: " ",
 		Data: []byte("x"),
 	}); err != nil {
@@ -314,7 +314,7 @@ func TestOpenAIAudioTextExtractorOmitsBlankPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+	if _, _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
 		Path: "/clip.mp3",
 		Data: []byte("x"),
 	}); err != nil {
@@ -332,7 +332,7 @@ func TestOpenAIAudioTextExtractorRejectsUnsafeMultipartFilename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+	_, _, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
 		Path:        `/music/a"b.mp3`,
 		ContentType: "audio/mpeg",
 		Data:        []byte("x"),
@@ -361,7 +361,7 @@ func TestWriteAudioMultipartFileRejectsCancelledContextIndirectly(t *testing.T) 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := extractor.ExtractAudioText(ctx, AudioExtractRequest{}); err == nil || !strings.Contains(err.Error(), "context canceled") {
+	if _, _, err := extractor.ExtractAudioText(ctx, AudioExtractRequest{}); err == nil || !strings.Contains(err.Error(), "context canceled") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

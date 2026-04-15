@@ -46,6 +46,29 @@ type Options struct {
 	// Files beyond this limit are still stored but their LLM tasks are not enqueued.
 	// Zero or negative means use the default (500).
 	MaxMediaLLMFiles int64
+	// LLMCostBudget configures the monthly LLM cost budget for this tenant.
+	LLMCostBudget LLMCostBudgetOptions
+}
+
+// LLMCostBudgetOptions configures the monthly LLM cost budget.
+type LLMCostBudgetOptions struct {
+	// MaxMonthlyMillicents is the monthly cost cap in millicents (0.001 cents).
+	// Zero or negative disables the monthly cost budget gate.
+	MaxMonthlyMillicents int64
+	// VisionCostPerKTokenMillicents is the cost per 1K tokens for Vision API calls.
+	VisionCostPerKTokenMillicents int64
+	// AudioLLMCostPerKTokenMillicents is the cost per 1K tokens for token-based
+	// audio models (e.g. gpt-4o-transcribe).
+	AudioLLMCostPerKTokenMillicents int64
+	// WhisperCostPerMinuteMillicents is the cost per minute for duration-based
+	// audio models (e.g. whisper-1).
+	WhisperCostPerMinuteMillicents int64
+	// FallbackImageCostMillicents is used when the Vision API does not return
+	// token usage. Must be > 0 for cost tracking to work with such providers.
+	FallbackImageCostMillicents int64
+	// FallbackAudioCostMillicents is used when the audio API returns neither
+	// duration nor token usage. Must be > 0 for cost tracking to work.
+	FallbackAudioCostMillicents int64
 }
 
 // AsyncImageExtractOptions controls async image->text extraction.
@@ -106,6 +129,14 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	} else {
 		b.maxTenantStorageBytes = defaultMaxTenantStorageBytes
 	}
+
+	cb := opts.LLMCostBudget
+	b.maxMonthlyLLMCostMillicents = cb.MaxMonthlyMillicents
+	b.visionCostPerKTokenMillicents = cb.VisionCostPerKTokenMillicents
+	b.audioLLMCostPerKTokenMillicents = cb.AudioLLMCostPerKTokenMillicents
+	b.whisperCostPerMinuteMillicents = cb.WhisperCostPerMinuteMillicents
+	b.fallbackImageCostMillicents = cb.FallbackImageCostMillicents
+	b.fallbackAudioCostMillicents = cb.FallbackAudioCostMillicents
 
 	if opts.QueryEmbedding.Client != nil {
 		b.queryEmbedder = opts.QueryEmbedding.Client

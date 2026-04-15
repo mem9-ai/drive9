@@ -34,16 +34,16 @@ const (
 type localStubAudioTextExtractor struct{}
 
 // ExtractAudioText implements [backend.AudioTextExtractor].
-func (localStubAudioTextExtractor) ExtractAudioText(ctx context.Context, req backend.AudioExtractRequest) (string, error) {
+func (localStubAudioTextExtractor) ExtractAudioText(ctx context.Context, req backend.AudioExtractRequest) (string, backend.AudioExtractUsage, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return "", backend.AudioExtractUsage{}, err
 	}
 	p := strings.TrimSpace(req.Path)
 	base := path.Base(p)
 	if base == "." || base == "/" || base == "" {
 		base = "unknown"
 	}
-	return "audio transcript for " + base, nil
+	return "audio transcript for " + base, backend.AudioExtractUsage{}, nil
 }
 
 // buildLocalAudioExtractOptionsFromEnv returns [backend.AsyncAudioExtractOptions] for

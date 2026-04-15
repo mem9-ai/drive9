@@ -361,7 +361,7 @@ func TestBuildBackendOptionsFromEnvAudioOpenAI(t *testing.T) {
 
 func TestLocalStubAudioTextExtractorTranscript(t *testing.T) {
 	var ex localStubAudioTextExtractor
-	got, err := ex.ExtractAudioText(context.Background(), backend.AudioExtractRequest{Path: "/audio/clip.mp3"})
+	got, _, err := ex.ExtractAudioText(context.Background(), backend.AudioExtractRequest{Path: "/audio/clip.mp3"})
 	if err != nil {
 		t.Fatal(err)
 	}
