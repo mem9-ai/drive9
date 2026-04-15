@@ -85,6 +85,7 @@ curl_body_code() {
   local url="$2"
   local instance_id="$3"
   local data="${4:-}"
+  local extra_header="${5:-}"
 
   local attempt=1
   while :; do
@@ -95,6 +96,9 @@ curl_body_code() {
     curl_args+=(-H "X-TIDBCLOUD-ZERO-INSTANCE-ID: $instance_id")
     if [ -n "$data" ]; then
       curl_args+=(--data-binary "$data")
+    fi
+    if [ -n "$extra_header" ]; then
+      curl_args+=(-H "$extra_header")
     fi
     code=$(curl "${curl_args[@]}" "$url")
 
@@ -235,7 +239,7 @@ resp=$(curl_body_code GET "$BASE/v1/fs/${NESTED_DIR}/?list" "$INSTANCE_ID")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 check_eq "GET list returns 200" "$code" "200"
-count=$(printf '%s' "$body" | jq 'length')
+count=$(printf '%s' "$body" | jq '.entries | length')
 check_eq "nested dir has 2 files" "$count" "2"
 
 # ──────────────────────────────────────────────────────────────
@@ -260,7 +264,7 @@ check_cmd "find returns at least 2 .txt files" test "$count" -ge 2
 # ──────────────────────────────────────────────────────────────
 step "10" "Copy file"
 COPY_TARGET="${NESTED_DIR}/hello-copy.txt"
-resp=$(curl_body_code POST "$BASE/v1/fs/${FILE_A}?cp=${COPY_TARGET}" "$INSTANCE_ID")
+resp=$(curl_body_code POST "$BASE/v1/fs/${COPY_TARGET}?copy" "$INSTANCE_ID" "" "X-Dat9-Copy-Source: /${FILE_A}")
 code=$(http_code "$resp")
 check_eq "copy returns 200" "$code" "200"
 
@@ -273,7 +277,7 @@ check_eq "copied content matches" "$body" "$CONTENT_A"
 # ──────────────────────────────────────────────────────────────
 step "11" "Rename file"
 RENAME_TARGET="${NESTED_DIR}/hello-renamed.txt"
-resp=$(curl_body_code POST "$BASE/v1/fs/${COPY_TARGET}?mv=${RENAME_TARGET}" "$INSTANCE_ID")
+resp=$(curl_body_code POST "$BASE/v1/fs/${RENAME_TARGET}?rename" "$INSTANCE_ID" "" "X-Dat9-Rename-Source: /${COPY_TARGET}")
 code=$(http_code "$resp")
 check_eq "rename returns 200" "$code" "200"
 
@@ -301,7 +305,7 @@ resp=$(curl_body_code GET "$BASE/v1/fs/${NESTED_DIR}/?list" "$INSTANCE_ID")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 check_eq "final list returns 200" "$code" "200"
-count=$(printf '%s' "$body" | jq 'length')
+count=$(printf '%s' "$body" | jq '.entries | length')
 check_eq "nested dir has 2 files after mutations" "$count" "2"
 
 # ──────────────────────────────────────────────────────────────
