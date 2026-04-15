@@ -221,8 +221,8 @@ export class Client {
     return patchFileImpl(this, path, newSize, dirtyParts, readPart, progress, partSize);
   }
 
-  newStreamWriter(path: string, totalSize: number, expectedRevision = -1): StreamWriter {
-    return new StreamWriter(this, path, totalSize, expectedRevision);
+  newStreamWriter(path: string, totalSize: number, expectedRevision = -1, abortOnError = true): StreamWriter {
+    return new StreamWriter(this, path, totalSize, expectedRevision, abortOnError);
   }
 
   // Vault methods

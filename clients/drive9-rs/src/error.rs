@@ -6,7 +6,11 @@ pub enum Drive9Error {
     Status { status_code: u16, message: String },
 
     #[error("Conflict: {message}")]
-    Conflict { status_code: u16, message: String },
+    Conflict {
+        status_code: u16,
+        message: String,
+        server_revision: Option<i64>,
+    },
 
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
@@ -27,8 +31,9 @@ pub(crate) async fn check_error(resp: reqwest::Response) -> Result<reqwest::Resp
         return Ok(resp);
     }
     let bytes = resp.bytes().await.unwrap_or_default();
-    let message = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
+    let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    let message = parsed
+        .as_ref()
         .and_then(|v| {
             v.get("error")
                 .or_else(|| v.get("message"))
@@ -41,9 +46,13 @@ pub(crate) async fn check_error(resp: reqwest::Response) -> Result<reqwest::Resp
         })
         .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
     if status == StatusCode::CONFLICT {
+        let server_revision = parsed
+            .as_ref()
+            .and_then(|v| v.get("server_revision").and_then(|n| n.as_i64()));
         Err(Drive9Error::Conflict {
             status_code: status.as_u16(),
             message,
+            server_revision,
         })
     } else {
         Err(Drive9Error::Status {

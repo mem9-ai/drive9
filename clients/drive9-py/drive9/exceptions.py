@@ -32,5 +32,7 @@ class ConflictError(StatusError):
         message: str,
         status_code: int = 409,
         response: Optional[object] = None,
+        server_revision: Optional[int] = None,
     ):
         super().__init__(message, status_code, response)
+        self.server_revision = server_revision

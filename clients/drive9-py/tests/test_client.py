@@ -351,6 +351,21 @@ def test_conflict_error_raises_conflict_error(client):
     with pytest.raises(ConflictError) as exc_info:
         client.write("/conflict.txt", b"x")
     assert exc_info.value.status_code == 409
+    assert exc_info.value.server_revision is None
+
+
+@responses.activate
+def test_conflict_error_exposes_server_revision(client):
+    responses.add(
+        responses.PUT,
+        f"{BASE_URL}/v1/fs/conflict2.txt",
+        json={"error": "revision mismatch", "server_revision": 42},
+        status=409,
+    )
+    with pytest.raises(ConflictError) as exc_info:
+        client.write("/conflict2.txt", b"x")
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.server_revision == 42
 
 
 @responses.activate

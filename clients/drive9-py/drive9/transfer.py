@@ -431,7 +431,7 @@ class TransferMixin:
                 raise Drive9Error(
                     f"short read for part {pp['number']}: got {len(data)} want {pp['size']}"
                 )
-            etag = self._upload_one_part_v2(pp, data)
+            etag = self._upload_one_part_v2(upload_id, pp, data)
             results[pp["number"] - 1] = {"number": pp["number"], "etag": etag}
             if progress:
                 progress(pp["number"], total_parts, len(data))
@@ -460,7 +460,7 @@ class TransferMixin:
             raise StatusError(resp.text, status_code=resp.status_code, response=resp)
         return resp.json().get("parts", [])
 
-    def _upload_one_part_v2(self, part: dict, data: bytes) -> str:
+    def _upload_one_part_v2(self, upload_id: str, part: dict, data: bytes) -> str:
         headers = {}
         for k, v in part.get("headers", {}).items():
             if k.lower() == "host":
@@ -468,7 +468,7 @@ class TransferMixin:
             headers[k] = v
         resp = self.session.put(part["url"], data=data, headers=headers)
         if resp.status_code == 403:
-            fresh = self._presign_one_part(part.get("upload_id", ""), part["number"])
+            fresh = self._presign_one_part(upload_id, part["number"])
             resp = self.session.put(fresh["url"], data=data, headers=headers)
         if resp.status_code >= 300:
             raise StatusError(

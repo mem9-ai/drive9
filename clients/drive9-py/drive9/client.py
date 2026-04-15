@@ -101,10 +101,24 @@ class Client(TransferMixin, PatchMixin):
             data = resp.json()
             msg = data.get("error") or data.get("message")
         except Exception:
+            data = None
             msg = resp.text
         message = msg or f"HTTP {resp.status_code}"
         if resp.status_code == 409:
-            raise ConflictError(message, status_code=resp.status_code, response=resp)
+            server_revision = None
+            if isinstance(data, dict):
+                try:
+                    srv = data.get("server_revision")
+                    if srv is not None:
+                        server_revision = int(srv)
+                except Exception:
+                    pass
+            raise ConflictError(
+                message,
+                status_code=resp.status_code,
+                response=resp,
+                server_revision=server_revision,
+            )
         raise StatusError(message, status_code=resp.status_code, response=resp)
 
     def write(

@@ -1,5 +1,6 @@
 """Streaming multipart upload helpers."""
 
+from concurrent.futures import ThreadPoolExecutor
 import threading
 
 import requests
@@ -34,7 +35,7 @@ class StreamWriter:
         self._aborted = False
         self._closing = False
 
-        self._sem = threading.Semaphore(_UPLOAD_MAX_CONCURRENCY)
+        self._executor = None
 
     @property
     def started(self) -> bool:
@@ -63,6 +64,9 @@ class StreamWriter:
 
         Data is copied internally so the caller may reuse the buffer after return.
         """
+        if part_num < 1:
+            raise Drive9Error("part number must be >= 1")
+
         with self._mu:
             if self._err is not None:
                 raise self._err
@@ -72,36 +76,39 @@ class StreamWriter:
                 raise Drive9Error("stream writer already aborted")
             if self._closing:
                 raise Drive9Error("stream writer is closing")
+            if part_num in self._uploaded:
+                raise Drive9Error(f"part {part_num} already uploaded")
 
             self._init_locked()
             plan = self._plan
 
+            total_parts = plan.get("total_parts")
+            if total_parts is not None and part_num > total_parts:
+                raise Drive9Error(
+                    f"part number {part_num} exceeds total_parts {total_parts}"
+                )
+
             self._inflight += 1
 
-        buf = bytes(data)
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=_UPLOAD_MAX_CONCURRENCY)
 
-        acquired = self._sem.acquire(timeout=30.0)
-        if not acquired:
-            with self._mu:
-                self._inflight -= 1
-            raise Drive9Error("failed to acquire upload semaphore")
+        buf = bytes(data)
 
         def do_upload():
             try:
                 pp = self._client._presign_one_part(plan["upload_id"], part_num)
-                etag = self._client._upload_one_part_v2(pp, buf)
+                etag = self._client._upload_one_part_v2(plan["upload_id"], pp, buf)
                 with self._mu:
                     self._uploaded[part_num] = {"number": part_num, "etag": etag}
             except (requests.RequestException, OSError) as exc:
                 self._set_error(Drive9Error(f"upload part {part_num}: {exc}"))
             finally:
-                self._sem.release()
                 with self._mu:
                     self._inflight -= 1
                     self._cond.notify_all()
 
-        t = threading.Thread(target=do_upload, daemon=True)
-        t.start()
+        self._executor.submit(do_upload)
 
     def complete(self, final_part_num: int = 0, final_part_data: bytes = b"") -> None:
         """Wait for inflight parts, upload the final part (if provided), and finalize."""
@@ -125,7 +132,7 @@ class StreamWriter:
 
         if final_part_data:
             pp = self._client._presign_one_part(plan["upload_id"], final_part_num)
-            etag = self._client._upload_one_part_v2(pp, final_part_data)
+            etag = self._client._upload_one_part_v2(plan["upload_id"], pp, final_part_data)
             with self._mu:
                 self._uploaded[final_part_num] = {
                     "number": final_part_num,
@@ -150,7 +157,10 @@ class StreamWriter:
             self._completed = True
             upload_id = plan["upload_id"]
 
-        self._client._complete_upload_v2(upload_id, parts)
+        try:
+            self._client._complete_upload_v2(upload_id, parts)
+        finally:
+            self._shutdown_executor()
 
     def abort(self) -> None:
         """Cancel the multipart upload and clean up server-side state."""
@@ -164,14 +174,24 @@ class StreamWriter:
         with self._mu:
             self._aborted = True
             if not self._started or self._plan is None:
+                self._shutdown_executor()
                 return
             upload_id = self._plan["upload_id"]
-        self._client._abort_upload_v2(upload_id)
+        try:
+            self._client._abort_upload_v2(upload_id)
+        finally:
+            self._shutdown_executor()
 
     def _wait_inflight(self):
         with self._mu:
             while self._inflight > 0:
                 self._cond.wait(timeout=1.0)
+
+    def _shutdown_executor(self):
+        with self._mu:
+            if self._executor is not None:
+                self._executor.shutdown(wait=True)
+                self._executor = None
 
     def _set_error(self, err):
         with self._mu:
