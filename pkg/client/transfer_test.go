@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -602,6 +603,74 @@ func TestWriteStreamV2RePresignsExpiredPart(t *testing.T) {
 	}
 	if !completeCalled.Load() {
 		t.Fatal("complete was not called after re-presign retry")
+	}
+}
+
+func TestPresignPipelineRecorderExcludesSendBlocking(t *testing.T) {
+	var requests atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-blocked/presign-batch":
+			requests.Add(1)
+			_ = json.NewEncoder(w).Encode(struct {
+				Parts []presignedPart `json:"parts"`
+			}{
+				Parts: []presignedPart{
+					{Number: 1, URL: "http://example.invalid/1", Size: 1, ExpiresAt: time.Now().Add(time.Minute)},
+					{Number: 2, URL: "http://example.invalid/2", Size: 1, ExpiresAt: time.Now().Add(time.Minute)},
+					{Number: 3, URL: "http://example.invalid/3", Size: 1, ExpiresAt: time.Now().Add(time.Minute)},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	recorder := &uploadDurationRecorder{}
+	presignCh := make(chan presignedPart, 1)
+	errCh := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		c.presignPipeline(ctx, &uploadPlanV2{UploadID: "v2-blocked", TotalParts: 3}, 3, presignCh, errCh, recorder)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for len(presignCh) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("presign pipeline did not enqueue the first part")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	time.Sleep(75 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("presign pipeline did not exit after cancellation")
+	}
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("presign pipeline error = %v, want context canceled", err)
+		}
+	default:
+		t.Fatal("expected presign pipeline to report cancellation")
+	}
+
+	if requests.Load() != 1 {
+		t.Fatalf("presign batch requests = %d, want 1", requests.Load())
+	}
+	if got := recorder.Seconds(); got >= 0.05 {
+		t.Fatalf("presign recorder included channel blocking: got %.3fs", got)
 	}
 }
 

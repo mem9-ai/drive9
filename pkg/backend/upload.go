@@ -60,6 +60,9 @@ type PresignPartEntry struct {
 }
 
 var ErrPartChecksumCountMismatch = errors.New("part checksum count mismatch")
+var lookupActiveUploadByPath = func(store *datastore.Store, ctx context.Context, path string) (*datastore.Upload, error) {
+	return store.GetUploadByPath(ctx, path)
+}
 
 func normalizeETag(etag string) string {
 	return strings.Trim(etag, "\"")
@@ -85,6 +88,17 @@ func uploadExpectedRevision(upload *datastore.Upload) int64 {
 		return -1
 	}
 	return *upload.ExpectedRevision
+}
+
+func (b *Dat9Backend) activeUploadByPath(ctx context.Context, path string) (*datastore.Upload, error) {
+	upload, err := lookupActiveUploadByPath(b.store, ctx, path)
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return upload, nil
 }
 
 func (b *Dat9Backend) validateUploadTargetRevision(ctx context.Context, path string, expectedRevision int64) error {
@@ -175,8 +189,12 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 	}
 
 	// Enforce one active upload per path
-	existing, err := b.store.GetUploadByPath(ctx, path)
-	if err == nil && existing != nil {
+	existing, err := b.activeUploadByPath(ctx, path)
+	if err != nil {
+		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
+		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
+	}
+	if existing != nil {
 		metrics.RecordOperation("backend", "initiate_upload", "conflict", time.Since(start))
 		return nil, datastore.ErrUploadConflict
 	}
@@ -303,12 +321,16 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 	validateDurationMs := uploadPhaseMs(validateStart)
 
 	activeUploadLookupStart := time.Now()
-	existing, err := b.store.GetUploadByPath(ctx, path)
-	if err == nil && existing != nil {
+	existing, err := b.activeUploadByPath(ctx, path)
+	activeUploadLookupDurationMs := uploadPhaseMs(activeUploadLookupStart)
+	if err != nil {
+		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
+	}
+	if existing != nil {
 		metrics.RecordOperation("backend", "initiate_upload_v2", "conflict", time.Since(start))
 		return nil, datastore.ErrUploadConflict
 	}
-	activeUploadLookupDurationMs := uploadPhaseMs(activeUploadLookupStart)
 
 	partSize := s3client.CalcAdaptivePartSize(totalSize)
 	parts := s3client.CalcParts(totalSize, partSize)

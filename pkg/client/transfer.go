@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/s3client"
@@ -153,6 +154,24 @@ type readTarget struct {
 type uploadBufferPool struct {
 	size int64
 	ch   chan []byte
+}
+
+type uploadDurationRecorder struct {
+	nanos atomic.Int64
+}
+
+func (r *uploadDurationRecorder) Add(d time.Duration) {
+	if r == nil || d <= 0 {
+		return
+	}
+	r.nanos.Add(d.Nanoseconds())
+}
+
+func (r *uploadDurationRecorder) Seconds() float64 {
+	if r == nil {
+		return 0
+	}
+	return time.Duration(r.nanos.Load()).Seconds()
 }
 
 func uploadParallelism(partSize int64) int {
@@ -373,28 +392,22 @@ func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra i
 	parallelism := uploadParallelism(plan.PartSize)
 	presignCh := make(chan presignedPart, parallelism)
 	presignErrCh := make(chan error, 1)
-	presignDurationCh := make(chan time.Duration, 1)
+	presignRecorder := &uploadDurationRecorder{}
 
 	go func() {
-		start := time.Now()
-		c.presignPipeline(ctx, plan, parallelism, presignCh, presignErrCh)
-		presignDurationCh <- time.Since(start)
+		c.presignPipeline(ctx, plan, parallelism, presignCh, presignErrCh, presignRecorder)
 	}()
 
 	// Upload parts, collecting ETags for the complete call.
 	uploadStart := time.Now()
-	parts, err := c.uploadPartsV2(ctx, plan, ra, presignCh, presignErrCh, progress)
+	parts, err := c.uploadPartsV2(ctx, plan, ra, presignCh, presignErrCh, presignRecorder, progress)
 	if err != nil {
 		_ = c.abortUploadV2(context.Background(), plan.UploadID)
 		return err
 	}
 	if summary != nil {
 		summary.UploadSeconds = time.Since(uploadStart).Seconds()
-		select {
-		case dur := <-presignDurationCh:
-			summary.PresignSeconds = dur.Seconds()
-		default:
-		}
+		summary.PresignSeconds = presignRecorder.Seconds()
 	}
 
 	completeStart := time.Now()
@@ -698,7 +711,7 @@ func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64, 
 // presignPipeline runs in a background goroutine. It fetches presigned URLs
 // in batches via POST /v2/uploads/{id}/presign-batch and sends them to presignCh.
 // The channel is closed when all parts have been presigned or an error occurs.
-func (c *Client) presignPipeline(ctx context.Context, plan *uploadPlanV2, batchSize int, presignCh chan<- presignedPart, errCh chan<- error) {
+func (c *Client) presignPipeline(ctx context.Context, plan *uploadPlanV2, batchSize int, presignCh chan<- presignedPart, errCh chan<- error, recorder *uploadDurationRecorder) {
 	defer close(presignCh)
 
 	for start := 1; start <= plan.TotalParts; start += batchSize {
@@ -733,6 +746,7 @@ func (c *Client) presignPipeline(ctx context.Context, plan *uploadPlanV2, batchS
 		}
 		req.Header.Set("Content-Type", "application/json")
 
+		batchStart := time.Now()
 		resp, err := c.do(req)
 		if err != nil {
 			errCh <- fmt.Errorf("presign batch: %w", err)
@@ -755,6 +769,7 @@ func (c *Client) presignPipeline(ctx context.Context, plan *uploadPlanV2, batchS
 			return
 		}
 		_ = resp.Body.Close()
+		recorder.Add(time.Since(batchStart))
 
 		for _, p := range result.Parts {
 			select {
@@ -770,7 +785,7 @@ func (c *Client) presignPipeline(ctx context.Context, plan *uploadPlanV2, batchS
 // uploadPartsV2 reads presigned URLs from presignCh and uploads parts concurrently.
 // Returns the completed parts (number + etag) in order.
 func (c *Client) uploadPartsV2(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt,
-	presignCh <-chan presignedPart, presignErrCh <-chan error, progress ProgressFunc) ([]completePart, error) {
+	presignCh <-chan presignedPart, presignErrCh <-chan error, recorder *uploadDurationRecorder, progress ProgressFunc) ([]completePart, error) {
 
 	parallelism := uploadParallelism(plan.PartSize)
 	bufferPool := newUploadBufferPool(plan.PartSize, parallelism)
@@ -842,7 +857,9 @@ func (c *Client) uploadPartsV2(ctx context.Context, plan *uploadPlanV2, ra io.Re
 			etag, err := c.uploadOnePartV2(ctx, p, data)
 			if err == errPresignExpired {
 				// Presigned URL expired — fetch a fresh one and retry once.
+				presignStart := time.Now()
 				fresh, presignErr := c.presignOnePart(ctx, plan.UploadID, p.Number)
+				recorder.Add(time.Since(presignStart))
 				if presignErr != nil {
 					select {
 					case errCh <- fmt.Errorf("re-presign part %d: %w", p.Number, presignErr):
