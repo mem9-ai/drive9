@@ -568,6 +568,19 @@ func (s *Store) ConfirmedStorageBytesTx(db execer) (int64, error) {
 	return total.Int64, nil
 }
 
+// ConfirmedMediaFileCountTx returns the number of confirmed files whose
+// content_type starts with "image/" or "audio/". This count drives the
+// per-tenant media LLM budget gate: files that exceed the quota are still
+// stored but their LLM extraction tasks (img_extract_text, audio_extract_text)
+// are not enqueued.
+func (s *Store) ConfirmedMediaFileCountTx(db execer) (int64, error) {
+	var count sql.NullInt64
+	if err := db.QueryRow(`SELECT COUNT(*) FROM files WHERE status = 'CONFIRMED' AND (content_type LIKE 'image/%' OR content_type LIKE 'audio/%')`).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count.Int64, nil
+}
+
 // ActiveUploadReservedBytesTx returns the additional bytes reserved by active
 // multipart uploads beyond what is already counted by the confirmed file set.
 func (s *Store) ActiveUploadReservedBytesTx(db execer) (int64, error) {

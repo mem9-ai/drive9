@@ -22,6 +22,7 @@ const (
 	defaultMaxAudioExtractedTextBytes = 8 << 10          // 8 KiB
 	defaultMaxUploadBytes        = int64(10 * (1 << 30)) // 10 GiB
 	defaultMaxTenantStorageBytes = int64(50 * (1 << 30)) // 50 GiB
+	defaultMaxMediaLLMFiles      = int64(500)            // 500 media files per tenant
 )
 
 // Options configures Dat9Backend behavior.
@@ -40,6 +41,11 @@ type Options struct {
 	// database itself rather than by the app-managed embed worker. When enabled,
 	// runtime write/query paths rely on database-side embedding behavior.
 	DatabaseAutoEmbedding bool
+	// MaxMediaLLMFiles caps the number of confirmed image+audio files per tenant
+	// that trigger LLM extraction tasks (img_extract_text, audio_extract_text).
+	// Files beyond this limit are still stored but their LLM tasks are not enqueued.
+	// Zero or negative means use the default (500).
+	MaxMediaLLMFiles int64
 }
 
 // AsyncImageExtractOptions controls async image->text extraction.
@@ -89,6 +95,11 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 		b.maxUploadBytes = opts.MaxUploadBytes
 	} else {
 		b.maxUploadBytes = defaultMaxUploadBytes
+	}
+	if opts.MaxMediaLLMFiles > 0 {
+		b.maxMediaLLMFiles = opts.MaxMediaLLMFiles
+	} else {
+		b.maxMediaLLMFiles = defaultMaxMediaLLMFiles
 	}
 	if opts.MaxTenantStorageBytes > 0 {
 		b.maxTenantStorageBytes = opts.MaxTenantStorageBytes

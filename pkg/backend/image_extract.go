@@ -96,6 +96,10 @@ func (b *Dat9Backend) enqueueImageExtract(fileID, path, contentType string, revi
 			return
 		}
 	}
+	if b.mediaLLMQuotaExceeded() {
+		metrics.RecordOperation("media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
+		return
+	}
 	task := ImageExtractTaskSpec{
 		FileID:      fileID,
 		Path:        path,
