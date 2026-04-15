@@ -59,13 +59,13 @@ func TestCreateServiceUserViaProxy_Success(t *testing.T) {
 	if len(gotReq.Queries) != 7 {
 		t.Fatalf("queries count=%d, want 7", len(gotReq.Queries))
 	}
-	if gotReq.Queries[0] != "CREATE DATABASE IF NOT EXISTS `_drive9_fs`" {
+	if gotReq.Queries[0] != "CREATE DATABASE IF NOT EXISTS `_tidbcloud_fs`" {
 		t.Fatalf("queries[0]=%q", gotReq.Queries[0])
 	}
 	if gotReq.Queries[1] != "CREATE ROLE IF NOT EXISTS 'role_fs_admin'" {
 		t.Fatalf("queries[1]=%q", gotReq.Queries[1])
 	}
-	if gotReq.Queries[2] != "GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON _drive9_fs.* TO 'role_fs_admin'" {
+	if gotReq.Queries[2] != "GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON _tidbcloud_fs.* TO 'role_fs_admin'" {
 		t.Fatalf("queries[2]=%q", gotReq.Queries[2])
 	}
 	if gotReq.Queries[3] != "CREATE USER IF NOT EXISTS 'pfx.fs_admin' IDENTIFIED BY 'fs-pass'" {

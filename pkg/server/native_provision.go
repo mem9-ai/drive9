@@ -266,7 +266,7 @@ func (s *Server) handleNativeProvision(w http.ResponseWriter, r *http.Request, t
 func (s *Server) nativeProvisionAsync(ctx context.Context, np *tidbcloudnative.Provisioner, tenantID string, cluster *tenant.ClusterInfo, provider string) {
 	dbName := cluster.DBName
 	if dbName == "" {
-		dbName = "_drive9_fs"
+		dbName = "_tidbcloud_fs"
 	}
 
 	// Build the fs_admin username with the serverless user prefix.

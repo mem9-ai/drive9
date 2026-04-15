@@ -91,8 +91,8 @@ func TestProvision_Success(t *testing.T) {
 	if info.Password != password {
 		t.Fatalf("got password %s, want %s", info.Password, password)
 	}
-	if info.DBName != "_drive9_fs" {
-		t.Fatalf("got db %s, want _drive9_fs", info.DBName)
+	if info.DBName != "_tidbcloud_fs" {
+		t.Fatalf("got db %s, want _tidbcloud_fs", info.DBName)
 	}
 }
 
