@@ -9,7 +9,7 @@ on:
       region:
         description: 'The region to deploy to'
         required: true
-        default: 'us-west-2'
+        default: '*'
         type: string
 
 # IMPORTANT: Do NOT add concurrency with cancel-in-progress here.
@@ -81,15 +81,11 @@ jobs:
       - name: Define region to deploy
         id: prepare-region
         run: |
-          if [[ "${{ github.event.inputs.region }}" == "" ]]; then
-            echo 'region=["us-west-2"]' >> "$GITHUB_OUTPUT"
+          input="${{ github.event.inputs.region }}"
+          if [[ -z "$input" || "$input" == "*" ]]; then
+            echo 'region=["*"]' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if [[ "${{ github.event.inputs.region }}" == "*" ]]; then
-            echo 'region must be specified, but not *' >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          input="${{ github.event.inputs.region }}"
           echo "region=[\"${input//,/\",\"}\"]" >> "$GITHUB_OUTPUT"
 
   deploy:
