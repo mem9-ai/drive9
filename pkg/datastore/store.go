@@ -859,7 +859,7 @@ func (s *Store) GetUpload(ctx context.Context, uploadID string) (out *Upload, er
 			opErr = err
 			return nil, err
 		}
-		logger.Info(ctx, "datastore_get_upload_timing",
+		logger.InfoBenchTiming(ctx, "datastore_get_upload_timing",
 			zap.String("upload_id", uploadID),
 			zap.Float64("query_context_ms", queryContextDurationMs),
 			zap.Float64("first_row_ms", firstRowDurationMs),
@@ -904,7 +904,7 @@ func (s *Store) GetUpload(ctx context.Context, uploadID string) (out *Upload, er
 	u.ExpiresAt = expiresAt.UTC()
 	hydrateDurationMs := datastorePhaseMs(hydrateStart)
 
-	logger.Info(ctx, "datastore_get_upload_timing",
+	logger.InfoBenchTiming(ctx, "datastore_get_upload_timing",
 		zap.String("upload_id", uploadID),
 		zap.Int("parts_total", u.PartsTotal),
 		zap.String("status", string(u.Status)),

@@ -249,6 +249,7 @@ environment:
   DRIVE9_LOCAL_DSN   local tenant TiDB/MySQL DSN (required)
   DRIVE9_LOCAL_INIT_SCHEMA initialize tenant schema on startup (default: false)
   DRIVE9_LOCAL_EMBEDDING_MODE auto|app|detect (default: auto when initing schema, detect otherwise)
+  DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
 
   S3 storage:
   Set DRIVE9_S3_BUCKET to enable AWS S3 mode.

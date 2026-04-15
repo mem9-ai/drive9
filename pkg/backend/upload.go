@@ -410,7 +410,7 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		return nil, err
 	}
 	txDurationMs := uploadPhaseMs(txStart)
-	logger.Info(ctx, "backend_initiate_upload_v2_timing",
+	logger.InfoBenchTiming(ctx, "backend_initiate_upload_v2_timing",
 		zap.String("path", path),
 		zap.Int64("total_size", totalSize),
 		zap.Int("total_parts", len(parts)),
@@ -595,7 +595,7 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, entries
 	if len(entries) > 0 {
 		s3PresignAvgMs = s3PresignTotalMs / float64(len(entries))
 	}
-	logger.Info(ctx, "backend_presign_parts_timing",
+	logger.InfoBenchTiming(ctx, "backend_presign_parts_timing",
 		zap.String("upload_id", uploadID),
 		zap.String("status_before", string(statusBefore)),
 		zap.Int("entries_total", len(entries)),
@@ -714,7 +714,7 @@ func (b *Dat9Backend) ConfirmUploadV2(ctx context.Context, uploadID string, clie
 		return err
 	}
 	finalizeDurationMs := uploadPhaseMs(finalizeStart)
-	logger.Info(ctx, "backend_confirm_upload_v2_timing",
+	logger.InfoBenchTiming(ctx, "backend_confirm_upload_v2_timing",
 		zap.String("upload_id", uploadID),
 		zap.Int("parts_total", upload.PartsTotal),
 		zap.Float64("get_upload_ms", getUploadDurationMs),
@@ -975,7 +975,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	if isOverwrite {
 		b.deleteBlobIfS3Ctx(ctx, oldStorageType, oldStorageRef, upload.S3Key)
 	}
-	logger.Info(ctx, "backend_finalize_upload_timing",
+	logger.InfoBenchTiming(ctx, "backend_finalize_upload_timing",
 		zap.String("upload_id", uploadID),
 		zap.String("path", upload.TargetPath),
 		zap.String("branch", branch),

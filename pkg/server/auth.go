@@ -150,7 +150,7 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 		}
 		defer release()
 		metricEvent(r.Context(), "auth", "result", "ok")
-		logger.Info(r.Context(), "tenant_auth_timing",
+		logger.InfoBenchTiming(r.Context(), "tenant_auth_timing",
 			zap.String("path", r.URL.Path),
 			zap.String("method", r.Method),
 			zap.String("tenant_id", resolved.Tenant.ID),
