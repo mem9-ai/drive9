@@ -20,10 +20,10 @@ import (
 )
 
 var (
-	ErrNotFound         = errors.New("not found")
-	ErrUploadNotActive  = errors.New("upload is not in UPLOADING state")
-	ErrUploadExpired    = errors.New("upload has expired")
-	ErrPathConflict     = errors.New("path already exists")
+	ErrNotFound            = errors.New("not found")
+	ErrUploadNotActive     = errors.New("upload is not in UPLOADING state")
+	ErrUploadExpired       = errors.New("upload has expired")
+	ErrPathConflict        = errors.New("path already exists")
 	ErrUploadConflict      = errors.New("active upload already exists for this path")
 	ErrIdempotencyConflict = errors.New("duplicate idempotency key")
 	ErrRevisionConflict    = errors.New("revision conflict")
@@ -837,14 +837,87 @@ func (s *Store) InsertUploadTx(db execer, u *Upload) error {
 
 func (s *Store) GetUpload(ctx context.Context, uploadID string) (out *Upload, err error) {
 	start := time.Now()
-	defer observeStoreOp(ctx, "get_upload", start, &err)
+	var opErr error
+	defer observeStoreOp(ctx, "get_upload", start, &opErr)
 
-	row := s.db.QueryRowContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
+	queryStart := time.Now()
+	rows, err := s.db.QueryContext(ctx, `SELECT upload_id, file_id, target_path, s3_upload_id, s3_key,
 		total_size, part_size, parts_total, expected_revision, status, fingerprint_sha256, idempotency_key,
 		created_at, updated_at, expires_at
 		FROM uploads WHERE upload_id = ?`, uploadID)
-	out, err = scanUpload(row)
-	return out, err
+	queryContextDurationMs := datastorePhaseMs(queryStart)
+	if err != nil {
+		opErr = err
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	firstRowStart := time.Now()
+	if !rows.Next() {
+		firstRowDurationMs := datastorePhaseMs(firstRowStart)
+		if err := rows.Err(); err != nil {
+			opErr = err
+			return nil, err
+		}
+		logger.Info(ctx, "datastore_get_upload_timing",
+			zap.String("upload_id", uploadID),
+			zap.Float64("query_context_ms", queryContextDurationMs),
+			zap.Float64("first_row_ms", firstRowDurationMs),
+			zap.Float64("scan_ms", 0),
+			zap.Float64("hydrate_ms", 0),
+			zap.String("result", "not_found"),
+			zap.Float64("total_ms", datastorePhaseMs(start)),
+		)
+		opErr = ErrNotFound
+		return nil, ErrNotFound
+	}
+	firstRowDurationMs := datastorePhaseMs(firstRowStart)
+
+	var u Upload
+	var fingerprint, idempotencyKey sql.NullString
+	var expectedRevision sql.NullInt64
+	var createdAt, updatedAt, expiresAt time.Time
+	scanStart := time.Now()
+	err = rows.Scan(&u.UploadID, &u.FileID, &u.TargetPath, &u.S3UploadID, &u.S3Key,
+		&u.TotalSize, &u.PartSize, &u.PartsTotal, &expectedRevision, &u.Status,
+		&fingerprint, &idempotencyKey,
+		&createdAt, &updatedAt, &expiresAt)
+	scanDurationMs := datastorePhaseMs(scanStart)
+	if err != nil {
+		opErr = err
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		opErr = err
+		return nil, err
+	}
+
+	hydrateStart := time.Now()
+	u.FingerprintSHA = fingerprint.String
+	u.IdempotencyKey = idempotencyKey.String
+	if expectedRevision.Valid {
+		rev := expectedRevision.Int64
+		u.ExpectedRevision = &rev
+	}
+	u.CreatedAt = createdAt.UTC()
+	u.UpdatedAt = updatedAt.UTC()
+	u.ExpiresAt = expiresAt.UTC()
+	hydrateDurationMs := datastorePhaseMs(hydrateStart)
+
+	logger.Info(ctx, "datastore_get_upload_timing",
+		zap.String("upload_id", uploadID),
+		zap.Int("parts_total", u.PartsTotal),
+		zap.String("status", string(u.Status)),
+		zap.Float64("query_context_ms", queryContextDurationMs),
+		zap.Float64("first_row_ms", firstRowDurationMs),
+		zap.Float64("scan_ms", scanDurationMs),
+		zap.Float64("hydrate_ms", hydrateDurationMs),
+		zap.String("result", "ok"),
+		zap.Float64("total_ms", datastorePhaseMs(start)),
+	)
+
+	out = &u
+	return out, nil
 }
 
 func (s *Store) GetUploadByPath(ctx context.Context, targetPath string) (out *Upload, err error) {
@@ -1163,6 +1236,10 @@ var wsNorm = regexp.MustCompile(`\s+`)
 
 func normalizeSQL(s string) string {
 	return wsNorm.ReplaceAllString(strings.TrimSpace(s), " ")
+}
+
+func datastorePhaseMs(start time.Time) float64 {
+	return float64(time.Since(start).Microseconds()) / 1000.0
 }
 
 func observeStoreOp(ctx context.Context, op string, start time.Time, errp *error) {

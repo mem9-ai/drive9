@@ -132,14 +132,20 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		e.refs++
 		p.order.MoveToFront(e.elem)
 		p.mu.Unlock()
+		logger.Info(ctx, "tenant_pool_acquire_timing",
+			zap.String("tenant_id", t.ID),
+			zap.Bool("cache_hit", true),
+			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		return e.backend, p.makeRelease(e), nil
 	}
 	p.mu.Unlock()
 
+	createBackendStart := time.Now()
 	b, st, err := p.createBackend(ctx, t)
 	if err != nil {
 		return nil, nil, err
 	}
+	createBackendDurationMs := float64(time.Since(createBackendStart).Microseconds()) / 1000.0
 
 	p.mu.Lock()
 	if e, ok := p.items[t.ID]; ok {
@@ -148,6 +154,11 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		p.mu.Unlock()
 		b.Close()
 		_ = st.Close()
+		logger.Info(ctx, "tenant_pool_acquire_timing",
+			zap.String("tenant_id", t.ID),
+			zap.Bool("cache_hit", true),
+			zap.Float64("create_backend_ms", createBackendDurationMs),
+			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		return e.backend, p.makeRelease(e), nil
 	}
 	e := &entry{tenantID: t.ID, backend: b, store: st, refs: 1}
@@ -166,6 +177,11 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	for _, retired := range toClose {
 		closeEntry(retired)
 	}
+	logger.Info(ctx, "tenant_pool_acquire_timing",
+		zap.String("tenant_id", t.ID),
+		zap.Bool("cache_hit", false),
+		zap.Float64("create_backend_ms", createBackendDurationMs),
+		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	return b, p.makeRelease(e), nil
 }
 
@@ -269,10 +285,13 @@ func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantI
 }
 
 func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9Backend, *datastore.Store, error) {
+	start := time.Now()
+	decryptStart := time.Now()
 	pass, err := p.enc.Decrypt(ctx, t.DBPasswordCipher)
 	if err != nil {
 		return nil, nil, fmt.Errorf("decrypt db password: %w", err)
 	}
+	decryptDurationMs := float64(time.Since(decryptStart).Microseconds()) / 1000.0
 	opts := p.cfg.BackendOptions
 	if UsesTiDBAutoEmbedding(t.Provider) {
 		opts.DatabaseAutoEmbedding = true
@@ -282,15 +301,20 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		query += "&tls=true"
 	}
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, query)
+	openStoreStart := time.Now()
 	store, err := datastore.Open(dsn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open datastore: %w", err)
 	}
+	openStoreDurationMs := float64(time.Since(openStoreStart).Microseconds()) / 1000.0
+	ensureSchemaDurationMs := 0.0
 	if opts.DatabaseAutoEmbedding && (t.Provider == ProviderTiDBZero || t.Provider == ProviderTiDBCloudStarter) {
+		ensureSchemaStart := time.Now()
 		if err := schema.EnsureTiDBSchemaForMode(store.DB(), schema.TiDBEmbeddingModeAuto); err != nil {
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("ensure tidb auto-embedding schema: %w", err)
 		}
+		ensureSchemaDurationMs = float64(time.Since(ensureSchemaStart).Microseconds()) / 1000.0
 	}
 	if p.cfg.S3Bucket != "" {
 		prefix := strings.Trim(p.cfg.S3Prefix, "/")
@@ -298,6 +322,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			prefix += "/"
 		}
 		prefix += t.ID + "/"
+		s3ClientStart := time.Now()
 		s3c, err := s3client.NewAWS(ctx, s3client.AWSConfig{
 			Region:  p.cfg.S3Region,
 			Bucket:  p.cfg.S3Bucket,
@@ -308,35 +333,74 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("create aws s3 client: %w", err)
 		}
+		s3ClientDurationMs := float64(time.Since(s3ClientStart).Microseconds()) / 1000.0
 		smallInDB := SmallInDB(t.Provider)
+		backendCreateStart := time.Now()
 		b, err := backend.NewWithS3ModeAndOptions(store, s3c, smallInDB, opts)
 		if err != nil {
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("create backend with s3 mode: %w", err)
 		}
+		backendCreateDurationMs := float64(time.Since(backendCreateStart).Microseconds()) / 1000.0
+		logger.Info(ctx, "tenant_pool_create_backend_timing",
+			zap.String("tenant_id", t.ID),
+			zap.String("provider", t.Provider),
+			zap.String("storage_mode", "aws_s3"),
+			zap.Float64("decrypt_db_password_ms", decryptDurationMs),
+			zap.Float64("open_datastore_ms", openStoreDurationMs),
+			zap.Float64("ensure_schema_ms", ensureSchemaDurationMs),
+			zap.Float64("create_s3_client_ms", s3ClientDurationMs),
+			zap.Float64("create_backend_ms", backendCreateDurationMs),
+			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		return b, store, nil
 	}
 	if p.cfg.S3Dir != "" {
 		s3Dir := p.cfg.S3Dir + "/" + t.ID
 		s3BaseURL := p.cfg.PublicURL + "/s3/" + t.ID
+		s3ClientStart := time.Now()
 		s3c, err := s3client.NewLocal(s3Dir, s3BaseURL)
 		if err != nil {
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("create local s3 client: %w", err)
 		}
+		s3ClientDurationMs := float64(time.Since(s3ClientStart).Microseconds()) / 1000.0
 		smallInDB := SmallInDB(t.Provider)
+		backendCreateStart := time.Now()
 		b, err := backend.NewWithS3ModeAndOptions(store, s3c, smallInDB, opts)
 		if err != nil {
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("create backend with local s3 mode: %w", err)
 		}
+		backendCreateDurationMs := float64(time.Since(backendCreateStart).Microseconds()) / 1000.0
+		logger.Info(ctx, "tenant_pool_create_backend_timing",
+			zap.String("tenant_id", t.ID),
+			zap.String("provider", t.Provider),
+			zap.String("storage_mode", "local_s3"),
+			zap.Float64("decrypt_db_password_ms", decryptDurationMs),
+			zap.Float64("open_datastore_ms", openStoreDurationMs),
+			zap.Float64("ensure_schema_ms", ensureSchemaDurationMs),
+			zap.Float64("create_s3_client_ms", s3ClientDurationMs),
+			zap.Float64("create_backend_ms", backendCreateDurationMs),
+			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		return b, store, nil
 	}
+	backendCreateStart := time.Now()
 	b, err := backend.NewWithOptions(store, opts)
 	if err != nil {
 		_ = store.Close()
 		return nil, nil, fmt.Errorf("create backend: %w", err)
 	}
+	backendCreateDurationMs := float64(time.Since(backendCreateStart).Microseconds()) / 1000.0
+	logger.Info(ctx, "tenant_pool_create_backend_timing",
+		zap.String("tenant_id", t.ID),
+		zap.String("provider", t.Provider),
+		zap.String("storage_mode", "db_only"),
+		zap.Float64("decrypt_db_password_ms", decryptDurationMs),
+		zap.Float64("open_datastore_ms", openStoreDurationMs),
+		zap.Float64("ensure_schema_ms", ensureSchemaDurationMs),
+		zap.Float64("create_s3_client_ms", 0),
+		zap.Float64("create_backend_ms", backendCreateDurationMs),
+		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	return b, store, nil
 }
 
