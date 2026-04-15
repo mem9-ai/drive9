@@ -28,8 +28,10 @@ func (b *Dat9Backend) ensureUploadSizeAllowed(size int64) error {
 
 // mediaLLMQuotaExceededTx checks whether the tenant has exceeded its media LLM
 // file quota inside a transaction. Returns true when the count of confirmed
-// image+audio files meets or exceeds the configured limit. Files are still
-// stored; only LLM task enqueue is skipped.
+// image+audio files strictly exceeds the configured limit. Using ">" (not ">=")
+// is deliberate: the current file may already be counted (new inserts are
+// CONFIRMED before enqueue in the same Tx), so ">" ensures the Nth file is
+// still allowed and overwrites of existing media files are never blocked.
 func (b *Dat9Backend) mediaLLMQuotaExceededTx(tx *sql.Tx) bool {
 	if b.maxMediaLLMFiles <= 0 {
 		return false
@@ -40,7 +42,7 @@ func (b *Dat9Backend) mediaLLMQuotaExceededTx(tx *sql.Tx) bool {
 		metrics.RecordOperation("media_llm_budget", "quota_check", "fail_open", 0)
 		return false
 	}
-	return count >= b.maxMediaLLMFiles
+	return count > b.maxMediaLLMFiles
 }
 
 // mediaLLMQuotaExceeded is the non-transactional variant for code paths that
@@ -56,7 +58,7 @@ func (b *Dat9Backend) mediaLLMQuotaExceeded() bool {
 		metrics.RecordOperation("media_llm_budget", "quota_check", "fail_open", 0)
 		return false
 	}
-	return count >= b.maxMediaLLMFiles
+	return count > b.maxMediaLLMFiles
 }
 
 func (b *Dat9Backend) ensureTenantStorageQuotaTx(tx *sql.Tx, path string, newSize int64) error {
