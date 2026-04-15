@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -13,6 +14,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/vault"
+	"go.uber.org/zap"
 )
 
 type scopeKey int
@@ -35,8 +37,13 @@ func withScope(ctx context.Context, scope *TenantScope) context.Context {
 	return context.WithValue(ctx, tenantScopeKey, scope)
 }
 
+func authPhaseMs(start time.Time) float64 {
+	return float64(time.Since(start).Microseconds()) / 1000.0
+}
+
 func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret []byte, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authStart := time.Now()
 		tok := bearerToken(r)
 		if tok == "" {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_missing_token")...)
@@ -45,7 +52,9 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			return
 		}
 
+		resolveStart := time.Now()
 		resolved, err := metaStore.ResolveByAPIKeyHash(r.Context(), token.HashToken(tok))
+		resolveDurationMs := authPhaseMs(resolveStart)
 		if err != nil {
 			if errors.Is(err, meta.ErrNotFound) {
 				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_key_not_found")...)
@@ -73,7 +82,9 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			return
 		}
 
+		decryptStart := time.Now()
 		plain, err := poolDecryptToken(r.Context(), pool, resolved.APIKey.JWTCiphertext)
+		decryptDurationMs := authPhaseMs(decryptStart)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "auth_decrypt_failed", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 			metricEvent(r.Context(), "auth", "result", "decrypt_failed")
@@ -87,7 +98,9 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			return
 		}
 
+		verifyStart := time.Now()
 		claims, err := token.ParseAndVerifyToken(tokenSecret, tok)
+		verifyDurationMs := authPhaseMs(verifyStart)
 		if err != nil {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_token_invalid", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 			metricEvent(r.Context(), "auth", "result", "token_invalid")
@@ -126,7 +139,9 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			return
 		}
 
+		acquireStart := time.Now()
 		b, release, err := pool.Acquire(r.Context(), &resolved.Tenant)
+		acquireDurationMs := authPhaseMs(acquireStart)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "backend_load_failed", "tenant_id", resolved.Tenant.ID, "error", err)...)
 			metricEvent(r.Context(), "tenant_backend", "result", "load_failed")
@@ -135,6 +150,17 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 		}
 		defer release()
 		metricEvent(r.Context(), "auth", "result", "ok")
+		logger.InfoBenchTiming(r.Context(), "tenant_auth_timing",
+			zap.String("path", r.URL.Path),
+			zap.String("method", r.Method),
+			zap.String("tenant_id", resolved.Tenant.ID),
+			zap.String("api_key_id", resolved.APIKey.ID),
+			zap.Float64("resolve_api_key_hash_ms", resolveDurationMs),
+			zap.Float64("decrypt_token_ms", decryptDurationMs),
+			zap.Float64("verify_token_ms", verifyDurationMs),
+			zap.Float64("pool_acquire_ms", acquireDurationMs),
+			zap.Float64("total_ms", authPhaseMs(authStart)),
+		)
 
 		scope := &TenantScope{TenantID: resolved.Tenant.ID, APIKeyID: resolved.APIKey.ID, TokenVersion: resolved.APIKey.TokenVersion, Backend: b}
 		next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))

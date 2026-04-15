@@ -229,6 +229,7 @@ environment:
   DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms)
   DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
   DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)
+  DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
   S3 storage (set DRIVE9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DRIVE9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)

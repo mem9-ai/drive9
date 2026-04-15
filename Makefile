@@ -49,7 +49,13 @@ test:
 		test_p_flag="-p $(TEST_P)"; \
 	fi; \
 	if [ -z "$${DRIVE9_TEST_MYSQL_DSN:-}" ] && command -v podman >/dev/null 2>&1; then \
-		source ./scripts/test-podman.sh; \
+		if podman_env="$$(bash -lc 'source ./scripts/test-podman.sh && env | grep -E "^(DOCKER_HOST|TESTCONTAINERS_RYUK_DISABLED)="')"; then \
+			while IFS= read -r line; do \
+				export "$$line"; \
+			done <<< "$$podman_env"; \
+		else \
+			echo "make test: Podman testcontainers setup unavailable, falling back to default runtime" >&2; \
+		fi; \
 	fi; \
 	$(GO) test $$test_p_flag -v ./...
 

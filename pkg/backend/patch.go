@@ -90,8 +90,12 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	origSize := nf.File.SizeBytes
 
 	// Enforce one active upload per path
-	existing, err := b.store.GetUploadByPath(ctx, path)
-	if err == nil && existing != nil {
+	existing, err := b.activeUploadByPath(ctx, path)
+	if err != nil {
+		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
+	}
+	if existing != nil {
 		metrics.RecordOperation("backend", "patch_upload", "conflict", time.Since(start))
 		return nil, datastore.ErrUploadConflict
 	}

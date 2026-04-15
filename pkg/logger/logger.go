@@ -56,6 +56,13 @@ func Info(ctx context.Context, msg string, fields ...zap.Field) {
 	FromContext(ctx).WithOptions(zap.AddCallerSkip(1)).Info(msg, fields...)
 }
 
+func InfoBenchTiming(ctx context.Context, msg string, fields ...zap.Field) {
+	if !BenchTimingLogEnabled() {
+		return
+	}
+	FromContext(ctx).WithOptions(zap.AddCallerSkip(1)).Info(msg, fields...)
+}
+
 func Warn(ctx context.Context, msg string, fields ...zap.Field) {
 	FromContext(ctx).WithOptions(zap.AddCallerSkip(1)).Warn(msg, fields...)
 }

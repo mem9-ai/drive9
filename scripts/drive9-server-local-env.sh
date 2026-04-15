@@ -21,8 +21,17 @@
 # Leave DRIVE9_LOCAL_INIT_SCHEMA unset to use the built-in default (false).
 # : "${DRIVE9_LOCAL_INIT_SCHEMA:=false}"
 
-# Local mock S3 mode.
+# S3 mode selection for drive9-server-local.
+# Default: local mock S3 when DRIVE9_S3_BUCKET is unset.
+# AWS mode: set DRIVE9_S3_BUCKET (and optionally DRIVE9_S3_REGION,
+# DRIVE9_S3_PREFIX, DRIVE9_S3_ROLE_ARN). In AWS mode, do not export
+# DRIVE9_S3_DIR; drive9-server-local treats it as a configuration error.
 : "${DRIVE9_S3_DIR:=${TMPDIR:-/tmp}/drive9-local-s3}"
+# Example AWS mode:
+# export DRIVE9_S3_BUCKET=my-drive9-test-bucket
+# export DRIVE9_S3_REGION=us-east-1
+# export DRIVE9_S3_PREFIX=drive9-local
+# export DRIVE9_S3_ROLE_ARN=arn:aws:iam::123456789012:role/drive9-local
 
 # Run the following command to pull the embedding model before starting drive9-server-local.
 # ollama pull all-minilm
@@ -70,12 +79,21 @@
 
 export DRIVE9_PUBLIC_URL
 export DRIVE9_LOCAL_DSN
-export DRIVE9_S3_DIR
+if [[ -z "${DRIVE9_S3_BUCKET:-}" ]]; then
+  export DRIVE9_S3_DIR
+else
+  unset DRIVE9_S3_DIR
+fi
 export DRIVE9_EMBED_API_BASE
 export DRIVE9_EMBED_API_KEY
 export DRIVE9_EMBED_MODEL
 
 echo "Environment loaded for drive9-server-local."
+if [[ -n "${DRIVE9_S3_BUCKET:-}" ]]; then
+  echo "S3 mode: aws (${DRIVE9_S3_BUCKET} in ${DRIVE9_S3_REGION:-us-east-1})"
+else
+  echo "S3 mode: local (${DRIVE9_S3_DIR})"
+fi
 echo "Run: make run-server-local"
 echo ""
 echo "Audio extract e2e (optional): enable stub runtime, then run the verifier, e.g."

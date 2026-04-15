@@ -108,6 +108,42 @@ func TestIsLargeFile(t *testing.T) {
 	}
 }
 
+func TestInitiateUploadPropagatesActiveUploadLookupError(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	origLookup := lookupActiveUploadByPath
+	t.Cleanup(func() { lookupActiveUploadByPath = origLookup })
+
+	lookupActiveUploadByPath = func(*datastore.Store, context.Context, string) (*datastore.Upload, error) {
+		return nil, errors.New("lookup failed")
+	}
+
+	_, err := b.InitiateUpload(context.Background(), "/lookup-error.bin", 2<<20)
+	if err == nil {
+		t.Fatal("expected initiate upload to fail")
+	}
+	if !strings.Contains(err.Error(), "lookup active upload") || !strings.Contains(err.Error(), "lookup failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestInitiateUploadV2PropagatesActiveUploadLookupError(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	origLookup := lookupActiveUploadByPath
+	t.Cleanup(func() { lookupActiveUploadByPath = origLookup })
+
+	lookupActiveUploadByPath = func(*datastore.Store, context.Context, string) (*datastore.Upload, error) {
+		return nil, errors.New("lookup failed")
+	}
+
+	_, err := b.InitiateUploadV2(context.Background(), "/lookup-error-v2.bin", 2<<20)
+	if err == nil {
+		t.Fatal("expected initiate upload v2 to fail")
+	}
+	if !strings.Contains(err.Error(), "lookup active upload") || !strings.Contains(err.Error(), "lookup failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestInitiateAndConfirmUpload(t *testing.T) {
 	b := newTestBackendWithS3(t)
 	ctx := context.Background()

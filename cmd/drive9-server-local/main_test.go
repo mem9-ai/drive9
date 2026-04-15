@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
@@ -144,6 +145,92 @@ func TestLocalEmbeddingModeFromEnv(t *testing.T) {
 	}
 	if _, _, err := localEmbeddingModeFromEnv(); err == nil {
 		t.Fatal("expected invalid mode to fail")
+	}
+}
+
+func TestLocalS3ConfigFromEnv(t *testing.T) {
+	keys := []string{
+		"TMPDIR",
+		"DRIVE9_S3_BUCKET",
+		"DRIVE9_S3_DIR",
+		"DRIVE9_S3_REGION",
+		"DRIVE9_S3_PREFIX",
+		"DRIVE9_S3_ROLE_ARN",
+	}
+	prev := make(map[string]string, len(keys))
+	for _, k := range keys {
+		prev[k] = os.Getenv(k)
+	}
+	t.Cleanup(func() {
+		for _, k := range keys {
+			if prev[k] == "" {
+				_ = os.Unsetenv(k)
+			} else {
+				_ = os.Setenv(k, prev[k])
+			}
+		}
+	})
+
+	unsetAll := func() {
+		for _, k := range keys {
+			_ = os.Unsetenv(k)
+		}
+	}
+
+	unsetAll()
+	if err := os.Setenv("TMPDIR", filepath.Join(string(os.PathSeparator), "tmp", "podman")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_S3_BUCKET", "  bench-bucket  "); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_S3_DIR", filepath.Join(os.Getenv("TMPDIR"), "drive9-local-s3")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_S3_REGION", "  us-west-2  "); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_S3_PREFIX", "  uploads/  "); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_S3_ROLE_ARN", "  arn:aws:iam::123456789012:role/test  "); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := localS3ConfigFromEnv()
+	if err != nil {
+		t.Fatalf("aws config with default local dir should succeed: %v", err)
+	}
+	if cfg.Mode != "aws" || cfg.Bucket != "bench-bucket" || cfg.Region != "us-west-2" {
+		t.Fatalf("unexpected aws config: %+v", cfg)
+	}
+	if cfg.Prefix != "uploads/" || cfg.RoleARN != "arn:aws:iam::123456789012:role/test" {
+		t.Fatalf("unexpected trimmed aws fields: %+v", cfg)
+	}
+
+	unsetAll()
+	if err := os.Setenv("DRIVE9_S3_BUCKET", "bucket"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_S3_DIR", " /tmp/custom-local-s3 "); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := localS3ConfigFromEnv(); err == nil {
+		t.Fatal("expected explicit local dir to conflict with aws bucket")
+	}
+
+	unsetAll()
+	if err := os.Setenv("DRIVE9_S3_DIR", " /tmp/local-s3//nested/ "); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = localS3ConfigFromEnv()
+	if err != nil {
+		t.Fatalf("local config returned error: %v", err)
+	}
+	if cfg.Mode != "local" {
+		t.Fatalf("mode = %q, want local", cfg.Mode)
+	}
+	if cfg.Dir != "/tmp/local-s3/nested" {
+		t.Fatalf("dir = %q, want %q", cfg.Dir, "/tmp/local-s3/nested")
 	}
 }
 
