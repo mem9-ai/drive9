@@ -41,16 +41,21 @@ func (b *Dat9Backend) enqueueAudioExtractTaskTx(tx *sql.Tx, fileID string, revis
 // When the tenant's media LLM file quota is exceeded, no extraction tasks are
 // enqueued but the file write itself succeeds normally.
 func (b *Dat9Backend) enqueueTiDBAutoSemanticTasksTx(tx *sql.Tx, fileID string, revision int64, path, contentType string) error {
+	isImage := b.hasAsyncImageTextSource(path, contentType)
+	isAudio := b.shouldEnqueueAudioExtractTask(path, contentType)
+	if !isImage && !isAudio {
+		return nil
+	}
 	if b.mediaLLMQuotaExceededTx(tx) {
 		metrics.RecordOperation("media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
 		return nil
 	}
-	if b.hasAsyncImageTextSource(path, contentType) {
+	if isImage {
 		if err := b.enqueueImgExtractTaskTx(tx, fileID, revision, path, contentType); err != nil {
 			return err
 		}
 	}
-	if b.shouldEnqueueAudioExtractTask(path, contentType) {
+	if isAudio {
 		if err := b.enqueueAudioExtractTaskTx(tx, fileID, revision, path, contentType); err != nil {
 			return err
 		}

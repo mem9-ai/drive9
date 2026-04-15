@@ -4,6 +4,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/metrics"
+	"go.uber.org/zap"
 )
 
 var (
@@ -32,7 +36,9 @@ func (b *Dat9Backend) mediaLLMQuotaExceededTx(tx *sql.Tx) bool {
 	}
 	count, err := b.store.ConfirmedMediaFileCountTx(tx)
 	if err != nil {
-		return false // on error, allow enqueue (fail open)
+		logger.Warn(backgroundWithTrace(), "media_llm_quota_check_fail_open", zap.Error(err))
+		metrics.RecordOperation("media_llm_budget", "quota_check", "fail_open", 0)
+		return false
 	}
 	return count >= b.maxMediaLLMFiles
 }
@@ -46,6 +52,8 @@ func (b *Dat9Backend) mediaLLMQuotaExceeded() bool {
 	}
 	count, err := b.store.ConfirmedMediaFileCountTx(b.store.DB())
 	if err != nil {
+		logger.Warn(backgroundWithTrace(), "media_llm_quota_check_fail_open", zap.Error(err))
+		metrics.RecordOperation("media_llm_budget", "quota_check", "fail_open", 0)
 		return false
 	}
 	return count >= b.maxMediaLLMFiles
