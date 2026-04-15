@@ -81,7 +81,7 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 		Port:      info.Port,
 		Username:  info.Username,
 		Password:  string(plaintext),
-		DBName:    "_drive9_fs",
+		DBName:    "_tidbcloud_fs",
 		Provider:  tenant.ProviderTiDBCloudNative,
 	}, nil
 }
@@ -120,7 +120,7 @@ func (p *Provisioner) ProvisionWithRootCreds(ctx context.Context, tenantID, root
 		Port:          info.Port,
 		Username:      rootUser,
 		Password:      rootPassword,
-		DBName:        "_drive9_fs",
+		DBName:        "_tidbcloud_fs",
 		Provider:      tenant.ProviderTiDBCloudNative,
 		ProxyEndpoint: info.ProxyEndpoint,
 		UserPrefix:    info.UserPrefix,

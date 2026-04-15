@@ -35,7 +35,7 @@ type proxyExecuteResponse struct {
 // CreateServiceUserViaProxy creates a dedicated fs_admin SQL user for drive9
 // by calling the internal cluster proxy's /v1beta2/execute endpoint.
 //
-// It creates a dedicated _drive9_fs database and a custom role_fs_admin role
+// It creates a dedicated _tidbcloud_fs database and a custom role_fs_admin role
 // with the minimum DDL/DML privileges needed on that database (CREATE, ALTER,
 // DROP, INDEX, SELECT, INSERT, UPDATE, DELETE), then creates (or updates) the
 // service user and assigns the role as its default role.
@@ -55,7 +55,7 @@ func CreateServiceUserViaProxy(ctx context.Context, proxyEndpoint string, cluste
 	}
 
 	const roleName = "role_fs_admin"
-	const dbName = "_drive9_fs"
+	const dbName = "_tidbcloud_fs"
 	queries := []string{
 		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", dbName),
 		fmt.Sprintf("CREATE ROLE IF NOT EXISTS '%s'", roleName),
