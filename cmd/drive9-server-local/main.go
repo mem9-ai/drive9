@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -344,9 +345,10 @@ func logLocalStartupStep(ctx context.Context, startupStart, stepStart time.Time,
 
 func localS3ConfigFromEnv() (localS3Config, error) {
 	bucket := strings.TrimSpace(os.Getenv("DRIVE9_S3_BUCKET"))
-	dirSet := strings.TrimSpace(os.Getenv("DRIVE9_S3_DIR"))
+	dirSet := normalizeLocalS3Dir(os.Getenv("DRIVE9_S3_DIR"))
+	defaultDir := defaultLocalS3Dir()
 	if bucket != "" {
-		if dirSet != "" {
+		if dirSet != "" && dirSet != defaultDir {
 			return localS3Config{}, fmt.Errorf("DRIVE9_S3_BUCKET and DRIVE9_S3_DIR are mutually exclusive; unset DRIVE9_S3_DIR when using AWS S3 mode")
 		}
 		return localS3Config{
@@ -357,9 +359,12 @@ func localS3ConfigFromEnv() (localS3Config, error) {
 			RoleARN: strings.TrimSpace(os.Getenv("DRIVE9_S3_ROLE_ARN")),
 		}, nil
 	}
+	if dirSet == "" {
+		dirSet = defaultDir
+	}
 	return localS3Config{
 		Mode: "local",
-		Dir:  envOr("DRIVE9_S3_DIR", defaultS3Dir),
+		Dir:  dirSet,
 	}, nil
 }
 
@@ -573,10 +578,26 @@ func redactDSN(dsn string) string {
 }
 
 func envOr(key, fallback string) string {
-	if value := os.Getenv(key); value != "" {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 		return value
 	}
 	return fallback
+}
+
+func defaultLocalS3Dir() string {
+	base := strings.TrimSpace(os.Getenv("TMPDIR"))
+	if base == "" {
+		return defaultS3Dir
+	}
+	return filepath.Join(base, "drive9-local-s3")
+}
+
+func normalizeLocalS3Dir(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return filepath.Clean(value)
 }
 
 func envBool(key string, fallback bool) bool {

@@ -14,6 +14,8 @@ import (
 
 	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/logger"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestParseRemote(t *testing.T) {
@@ -238,5 +240,33 @@ func TestUploadFileEmitsUploadSummaryToCLILog(t *testing.T) {
 	}
 	if !strings.Contains(got, "\"mode\":\"direct_put\"") {
 		t.Fatalf("cli log missing upload mode: %q", got)
+	}
+}
+
+func TestEmitUploadSummaryUsesContextLogger(t *testing.T) {
+	t.Setenv("DRIVE9_CLI_LOG_ENABLED", "true")
+
+	core, recorded := observer.New(zap.InfoLevel)
+	ctx := logger.WithContext(context.Background(), zap.New(core))
+
+	emitUploadSummary(ctx, &client.UploadSummary{
+		Type:       "upload_summary",
+		Mode:       "direct_put",
+		RemotePath: "/upload.txt",
+	}, "/tmp/upload.txt")
+
+	entries := recorded.All()
+	if len(entries) != 1 {
+		t.Fatalf("recorded %d log entries, want 1", len(entries))
+	}
+	if entries[0].Message != "upload_summary" {
+		t.Fatalf("message = %q, want upload_summary", entries[0].Message)
+	}
+	fields := entries[0].ContextMap()
+	if fields["remote_path"] != "/upload.txt" {
+		t.Fatalf("remote_path = %#v, want %q", fields["remote_path"], "/upload.txt")
+	}
+	if fields["local_path"] != "/tmp/upload.txt" {
+		t.Fatalf("local_path = %#v, want %q", fields["local_path"], "/tmp/upload.txt")
 	}
 }

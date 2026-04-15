@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"runtime/pprof"
+	"sync"
 
 	"github.com/mem9-ai/dat9/cmd/drive9/cli"
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -28,6 +29,8 @@ import (
 var version = "dev"
 var gitHash = "unknown"
 var cliLogger *zap.Logger
+var cpuProfileStop = func() {}
+var exitFunc = os.Exit
 
 func main() {
 	if logger.CLIEnabled() {
@@ -45,7 +48,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "drive9: %v\n", err)
 		os.Exit(1)
 	}
-	defer stopCPUProfile()
+	cpuProfileStop = stopCPUProfile
+	defer cpuProfileStop()
 
 	if len(os.Args) < 2 {
 		usage()
@@ -145,9 +149,12 @@ func startCPUProfileFromEnv() (func(), error) {
 		return nil, fmt.Errorf("start cpu profile %s: %w", profilePath, err)
 	}
 
+	var stopOnce sync.Once
 	return func() {
-		pprof.StopCPUProfile()
-		_ = f.Close()
+		stopOnce.Do(func() {
+			pprof.StopCPUProfile()
+			_ = f.Close()
+		})
 	}, nil
 }
 
@@ -197,9 +204,9 @@ func fatal(cmd string, err error) {
 	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, err)
 	type exitCoder interface{ ExitCode() int }
 	if ec, ok := err.(exitCoder); ok && ec.ExitCode() > 0 {
-		os.Exit(ec.ExitCode())
+		exitWithCode(ec.ExitCode())
 	}
-	os.Exit(1)
+	exitWithCode(1)
 }
 
 func usage() {
@@ -214,7 +221,7 @@ commands:
   mount <dir>      mount drive9 as a local FUSE filesystem
   umount <dir>     unmount a drive9 FUSE mount
 `)
-	os.Exit(2)
+	exitWithCode(2)
 }
 
 func fsUsage() {
@@ -236,5 +243,10 @@ commands:
     -older <YYYY-MM-DD>  modified before date
     -size <+N|-N>        size filter in bytes
 `)
-	os.Exit(2)
+	exitWithCode(2)
+}
+
+func exitWithCode(code int) {
+	cpuProfileStop()
+	exitFunc(code)
 }

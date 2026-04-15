@@ -54,7 +54,7 @@ func Cp(c *client.Client, args []string) error {
 		if err != nil {
 			return err
 		}
-		emitUploadSummary(summary, "-")
+		emitUploadSummary(ctx, summary, "-")
 		return nil
 
 	case srcIsRemote && dst == "-":
@@ -93,7 +93,7 @@ func uploadFile(ctx context.Context, c *client.Client, localPath, remotePath str
 	if err != nil {
 		return err
 	}
-	emitUploadSummary(summary, localPath)
+	emitUploadSummary(ctx, summary, localPath)
 	return nil
 }
 
@@ -113,7 +113,7 @@ func resumeUpload(ctx context.Context, c *client.Client, localPath, remotePath s
 	if err != nil {
 		return err
 	}
-	emitUploadSummary(summary, localPath)
+	emitUploadSummary(ctx, summary, localPath)
 	return nil
 }
 
@@ -173,12 +173,12 @@ func emitDownloadSummary(summary *client.DownloadSummary) {
 	)
 }
 
-func emitUploadSummary(summary *client.UploadSummary, localPath string) {
+func emitUploadSummary(ctx context.Context, summary *client.UploadSummary, localPath string) {
 	if summary == nil || !logger.CLIEnabled() {
 		return
 	}
 	logger.Info(
-		context.Background(),
+		ctx,
 		"upload_summary",
 		zap.String("type", summary.Type),
 		zap.String("mode", summary.Mode),
