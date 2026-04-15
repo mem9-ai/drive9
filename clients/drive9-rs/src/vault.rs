@@ -13,7 +13,7 @@ impl Client {
             .http
             .post(self.vault_url("/secrets"))
             .headers(self.auth_headers())
-            .json(&json!({"name": name, "fields": fields, "created_by": "drive9-cli"}))
+            .json(&json!({"name": name, "fields": fields, "created_by": "drive9-rs"}))
             .send()
             .await?;
         let resp = check_error(resp).await?;
@@ -29,7 +29,7 @@ impl Client {
             .http
             .put(self.vault_url(&format!("/secrets/{}", urlencoding::encode(name))))
             .headers(self.auth_headers())
-            .json(&json!({"fields": fields, "updated_by": "drive9-cli"}))
+            .json(&json!({"fields": fields, "updated_by": "drive9-rs"}))
             .send()
             .await?;
         let resp = check_error(resp).await?;

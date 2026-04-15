@@ -68,7 +68,31 @@ async fn test_conflict_error() {
     let client = Client::new(server.url(), "test-key");
     let err = client.write("/conflict.txt", b"x").await.unwrap_err();
     match err {
-        Drive9Error::Conflict { status_code, .. } => assert_eq!(status_code, 409),
+        Drive9Error::Conflict { status_code, server_revision, .. } => {
+            assert_eq!(status_code, 409);
+            assert_eq!(server_revision, None);
+        }
+        _ => panic!("expected Conflict error, got {:?}", err),
+    }
+}
+
+#[tokio::test]
+async fn test_conflict_error_with_server_revision() {
+    let mut server = mockito::Server::new_async().await;
+    let _m = server
+        .mock("PUT", "/v1/fs/conflict2.txt")
+        .with_status(409)
+        .with_body(r#"{"error":"revision mismatch","server_revision":42}"#)
+        .create_async()
+        .await;
+
+    let client = Client::new(server.url(), "test-key");
+    let err = client.write("/conflict2.txt", b"x").await.unwrap_err();
+    match err {
+        Drive9Error::Conflict { status_code, server_revision, .. } => {
+            assert_eq!(status_code, 409);
+            assert_eq!(server_revision, Some(42));
+        }
         _ => panic!("expected Conflict error, got {:?}", err),
     }
 }

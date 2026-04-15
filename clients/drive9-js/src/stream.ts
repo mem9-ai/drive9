@@ -13,6 +13,7 @@ interface StreamState {
   aborted: boolean;
   plan?: UploadPlanV2;
   uploaded: Map<number, CompletePart>;
+  err?: Drive9Error;
 }
 
 export class StreamWriter {
@@ -20,16 +21,24 @@ export class StreamWriter {
   private path: string;
   private totalSize: number;
   private expectedRevision: number;
+  private abortOnError: boolean;
   private state: StreamState;
   private sem: Semaphore;
   private inflight: number;
   private inflightZeroResolvers: (() => void)[];
 
-  constructor(client: Client, path: string, totalSize: number, expectedRevision = -1) {
+  constructor(
+    client: Client,
+    path: string,
+    totalSize: number,
+    expectedRevision = -1,
+    abortOnError = true
+  ) {
     this.client = client;
     this.path = path;
     this.totalSize = totalSize;
     this.expectedRevision = expectedRevision;
+    this.abortOnError = abortOnError;
     this.state = {
       started: false,
       closing: false,
@@ -43,6 +52,9 @@ export class StreamWriter {
   }
 
   async writePart(partNum: number, data: Uint8Array): Promise<void> {
+    if (partNum < 1) {
+      throw new Drive9Error("part number must be >= 1");
+    }
     if (!this.state.started) {
       try {
         const plan = await this.initiate();
@@ -56,6 +68,9 @@ export class StreamWriter {
         throw new Drive9Error(`initiate stream upload: ${msg}`);
       }
     }
+    if (this.state.err) {
+      throw this.state.err;
+    }
     if (this.state.completed) {
       throw new Drive9Error("stream writer already completed");
     }
@@ -67,6 +82,15 @@ export class StreamWriter {
     }
 
     const plan = this.state.plan!;
+    if (plan.total_parts && partNum > plan.total_parts) {
+      throw new Drive9Error(
+        `part number ${partNum} exceeds total_parts ${plan.total_parts}`
+      );
+    }
+    if (this.state.uploaded.has(partNum)) {
+      throw new Drive9Error(`part ${partNum} already uploaded`);
+    }
+
     await this.sem.acquire();
     this.inflight++;
     const client = this.client;
@@ -75,6 +99,13 @@ export class StreamWriter {
       const p = await presignOnePart(client, uploadId, partNum);
       const etag = await uploadOnePartV2(client, uploadId, p, data);
       this.state.uploaded.set(partNum, { number: partNum, etag });
+    } catch (e) {
+      if (this.abortOnError && !this.state.aborted && !this.state.completed) {
+        this.abort().catch(() => {});
+      }
+      const msg = e instanceof Error ? e.message : String(e);
+      this.state.err = new Drive9Error(`upload part ${partNum}: ${msg}`);
+      throw this.state.err;
     } finally {
       this.sem.release();
       this.inflight--;
@@ -94,12 +125,17 @@ export class StreamWriter {
     }
     this.state.closing = true;
 
+    if (finalPartData.length > 0) {
+      await this.writePart(finalPartNum, finalPartData);
+    }
+
+    await this.waitInflight();
+
     if (!this.state.started || !this.state.plan) {
       throw new Drive9Error("stream writer was never started");
     }
-
-    if (finalPartData.length > 0) {
-      await this.writePart(finalPartNum, finalPartData);
+    if (this.state.err) {
+      throw this.state.err;
     }
 
     const plan = this.state.plan;
@@ -140,7 +176,7 @@ export class StreamWriter {
       headers: this.client["authHeaders"]({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         path: this.path,
-        size: this.totalSize,
+        total_size: this.totalSize,
         expected_revision: this.expectedRevision,
       }),
     });
@@ -198,4 +234,3 @@ async function abortUploadV2(client: Client, uploadId: string): Promise<void> {
     headers: client["authHeaders"](),
   });
 }
-

@@ -83,6 +83,9 @@ impl StreamWriter {
     }
 
     pub async fn write_part(&self, part_num: i32, data: Vec<u8>) -> Result<(), Drive9Error> {
+        if part_num < 1 {
+            return Err(Drive9Error::Other("part number must be >= 1".to_string()));
+        }
         let mut state = self.state.lock().await;
         if let Some(ref e) = state.err {
             return Err(Drive9Error::Other(format!("{}", e)));
@@ -100,7 +103,22 @@ impl StreamWriter {
         if state.closing {
             return Err(Drive9Error::Other("stream writer is closing".to_string()));
         }
+        if state.uploaded.contains_key(&part_num) {
+            return Err(Drive9Error::Other(
+                format!("part {} already uploaded", part_num),
+            ));
+        }
         self.init_locked(&mut state).await?;
+        if let Some(ref plan) = state.plan {
+            if part_num > plan.total_parts {
+                return Err(Drive9Error::Other(
+                    format!(
+                        "part number {} exceeds total_parts {}",
+                        part_num, plan.total_parts
+                    ),
+                ));
+            }
+        }
         let plan = state.plan.clone().unwrap();
         state.inflight += 1;
         drop(state);
