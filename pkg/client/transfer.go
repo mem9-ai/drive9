@@ -299,11 +299,6 @@ func finishUploadSummary(summary *UploadSummary) *UploadSummary {
 	return summary
 }
 
-// writeStreamV1 is the original v1 upload path: pre-compute checksums → initiate → upload all.
-func (c *Client) writeStreamV1(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
-	return c.writeStreamV1WithSummary(ctx, path, ra, size, progress, expectedRevision, nil)
-}
-
 func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary) error {
 	if summary != nil {
 		summary.Mode = "multipart_v1"
@@ -354,15 +349,6 @@ func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra i
 		summary.CompleteSeconds = time.Since(completeStart).Seconds()
 	}
 	return nil
-}
-
-// writeStreamV2 implements the v2 upload protocol:
-// 1. Initiate (no checksums, server returns part_size + total_parts)
-// 2. Pipelined presign: background goroutine fetches presigned URLs in batches
-// 3. Upload goroutines consume presigned URLs from channel
-// 4. Complete with part ETags, or abort on failure
-func (c *Client) writeStreamV2(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
-	return c.writeStreamV2WithSummary(ctx, path, ra, size, progress, expectedRevision, nil)
 }
 
 func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary) error {
@@ -521,16 +507,6 @@ func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int
 		return UploadPlan{}, fmt.Errorf("decode upload plan: %w", err)
 	}
 	return plan, nil
-}
-
-// uploadParts concurrently uploads parts to presigned URLs.
-// Each goroutine reads its part directly via ReaderAt (parallel disk reads),
-// with at most maxConcurrency in-flight to bound memory usage.
-func (c *Client) uploadParts(ctx context.Context, plan UploadPlan, ra io.ReaderAt, progress ProgressFunc) error {
-	if err := c.uploadPartsOnly(ctx, plan, ra, progress); err != nil {
-		return err
-	}
-	return c.completeUpload(ctx, plan.UploadID)
 }
 
 func (c *Client) uploadPartsOnly(ctx context.Context, plan UploadPlan, ra io.ReaderAt, progress ProgressFunc) error {
