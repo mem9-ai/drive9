@@ -355,7 +355,7 @@ Audit events are written to a dedicated append-only table (`vault_audit_log`) in
 
 ### 6.1 Server-Side Tables
 
-> **Note**: All DDL uses TiDB/MySQL-compatible syntax. The tenant DB is TiDB — do NOT use PostgreSQL-only types (`BYTEA`, `TIMESTAMPTZ`, `JSONB`) or syntax (`$N` placeholders, `ON CONFLICT`). Runtime SQL must use `?` positional placeholders. See Bad Case #11.
+> **Provider scope**: Vault targets **TiDB/MySQL tenant DB only**. Both schema DDL and runtime SQL use TiDB/MySQL dialect exclusively. The `db9` Postgres schema init path (`pkg/tenant/db9/schema.go`) must NOT contain vault DDL — vault tables are created via the TiDB tenant schema init path (`pkg/tenant/schema/tidb_*.go`). Do NOT use PostgreSQL-only types (`BYTEA`, `TIMESTAMPTZ`, `JSONB`) or syntax (`$N` placeholders, `ON CONFLICT`). Runtime SQL must use `?` positional placeholders. See Bad Case #11.
 
 ```sql
 -- Secret metadata and encrypted values
