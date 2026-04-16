@@ -1,12 +1,82 @@
 # drive9 E2E tests
 
-Live end-to-end scripts for validating deployed `drive9-server` behavior.
+Live end-to-end scripts for validating deployed `drive9-server` behavior,
+including local single-tenant validation via `drive9-server-local`.
 
 ## Prerequisites
 
 - A running server endpoint (`DRIVE9_BASE`)
 - `jq` installed
 - Bash 4+
+
+## Run Against `drive9-server-local`
+
+The local smoke flow that is currently exercised on this machine uses
+`drive9-server-local`, not the old hosted/local-server path.
+
+1. Start `drive9-server-local`.
+
+```bash
+cd /home/ubuntu/bench
+./run-drive9-server-local.sh 2>&1 | tee local-server.log
+```
+
+2. Confirm the server is healthy.
+
+```bash
+curl http://127.0.0.1:9009/healthz
+```
+
+Expected response:
+
+```json
+{"status":"ok"}
+```
+
+3. Run the e2e smoke scripts against the local endpoint.
+
+```bash
+cd /home/ubuntu/drive9
+
+export DRIVE9_BASE=http://127.0.0.1:9009
+
+# Full API smoke on a fresh locally provisioned tenant.
+bash e2e/api-smoke-test.sh
+
+# Existing-key regression against the built-in local tenant.
+DRIVE9_API_KEY=local-dev-key bash e2e/api-smoke-test-existing-key.sh
+
+# CLI smoke using the repo build.
+bash e2e/cli-smoke-test.sh
+
+# FUSE smoke using the repo build.
+bash e2e/fuse-smoke-test.sh
+
+# Run API + CLI + FUSE in sequence.
+bash e2e/smoke-all.sh
+```
+
+4. Optional: use an already-built or official CLI instead of rebuilding.
+
+```bash
+CLI_SOURCE=official bash e2e/cli-smoke-test.sh
+CLI_SOURCE=official bash e2e/fuse-smoke-test.sh
+```
+
+### `drive9-server-local` notes
+
+- `drive9-server-local` serves a single local tenant with API key `local-dev-key`.
+- `api-smoke-test.sh`, `cli-smoke-test.sh`, and `fuse-smoke-test.sh` still
+  provision fresh timestamped test paths as part of the smoke flow.
+- `api-smoke-test-existing-key.sh` is the script that should be pointed at the
+  built-in local tenant key.
+- If the final upload-limit boundary check unexpectedly returns `507` instead of
+  `202`, inspect tenant `uploads` records before blaming the test itself.
+  Stale `INITIATED` / `UPLOADING` multipart rows can consume reserved quota even
+  when the file tree looks empty.
+- On this branch, `api` and `cli` smoke are passing against
+  `drive9-server-local`. `fuse` still has a known directory-rename failure path
+  tracked separately, so `smoke-all.sh` can still end in `PASS=2 FAIL=1`.
 
 ## Scripts
 

@@ -28,6 +28,52 @@ DRIVE9_BASE=$DEPLOY bash e2e/fuse-smoke-test.sh
 DRIVE9_BASE=$DEPLOY bash e2e/smoke-all.sh
 ```
 
+## `drive9-server-local` workflow
+
+When the task is specifically about local validation on this machine, prefer
+`drive9-server-local` over hosted endpoints.
+
+### Server startup
+
+```bash
+cd /home/ubuntu/bench
+./run-drive9-server-local.sh 2>&1 | tee local-server.log
+curl http://127.0.0.1:9009/healthz
+```
+
+Use `http://127.0.0.1:9009` as `DRIVE9_BASE` once `healthz` returns
+`{"status":"ok"}`.
+
+### E2E execution against `drive9-server-local`
+
+```bash
+cd /home/ubuntu/drive9
+export DRIVE9_BASE=http://127.0.0.1:9009
+
+bash e2e/api-smoke-test.sh
+DRIVE9_API_KEY=local-dev-key bash e2e/api-smoke-test-existing-key.sh
+bash e2e/cli-smoke-test.sh
+bash e2e/fuse-smoke-test.sh
+bash e2e/smoke-all.sh
+```
+
+### Local-server-specific expectations
+
+- `drive9-server-local` exposes a built-in single tenant key via
+  `DRIVE9_LOCAL_API_KEY`; on this machine it is `local-dev-key`.
+- `api-smoke-test-existing-key.sh` should use that built-in key instead of
+  provisioning a new tenant.
+- `api-smoke-test.sh` and `cli-smoke-test.sh` have been validated end-to-end
+  against `drive9-server-local`.
+- `fuse-smoke-test.sh` still has a known failure on directory rename via the
+  mount path; do not mislabel that as a new regression unless the failure shape
+  changes.
+- Upload-limit boundary failures (`507` on the `limit-1g.bin` initiate step)
+  can be caused by stale multipart reservations in the tenant `uploads` table,
+  not by current file-tree contents.
+- If quota looks polluted, inspect and clear `INITIATED` / `UPLOADING` rows for
+  the tenant before rerunning the smoke suite.
+
 ## Dev endpoint
 
 Current shared dev deployment:
