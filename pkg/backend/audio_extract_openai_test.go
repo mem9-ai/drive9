@@ -170,6 +170,88 @@ func TestOpenAIAudioTextExtractorExtractAudioText(t *testing.T) {
 	}
 }
 
+func TestOpenAIAudioTextExtractorVerboseJSONWhisperDuration(t *testing.T) {
+	var gotResponseFormat string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mediaType, params, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if mediaType != "multipart/form-data" {
+			t.Fatalf("mediaType=%q", mediaType)
+		}
+		reader := multipart.NewReader(r.Body, params["boundary"])
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("next part: %v", err)
+			}
+			data, _ := io.ReadAll(part)
+			if part.FormName() == "response_format" {
+				gotResponseFormat = string(data)
+			}
+		}
+		_, _ = w.Write([]byte(`{"text":"whisper transcript","duration":42.5}`))
+	}))
+	defer server.Close()
+
+	extractor, err := NewOpenAIAudioTextExtractor(OpenAIAudioTextExtractorConfig{
+		BaseURL:        server.URL,
+		APIKey:         "secret",
+		Model:          "whisper-1",
+		ResponseFormat: "verbose_json",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, usage, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+		Path: "/clip.mp3", ContentType: "audio/mpeg", Data: []byte("x"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotResponseFormat != "verbose_json" {
+		t.Fatalf("response_format=%q, want verbose_json", gotResponseFormat)
+	}
+	if text != "whisper transcript" {
+		t.Fatalf("text=%q", text)
+	}
+	if usage.DurationSeconds != 42.5 {
+		t.Fatalf("duration=%v, want 42.5", usage.DurationSeconds)
+	}
+}
+
+func TestOpenAIAudioTextExtractorTokenUsageParsing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"text":"token transcript","usage":{"input_tokens":100,"output_tokens":50}}`))
+	}))
+	defer server.Close()
+
+	extractor, err := NewOpenAIAudioTextExtractor(OpenAIAudioTextExtractorConfig{
+		BaseURL: server.URL,
+		APIKey:  "secret",
+		Model:   "gpt-4o-transcribe",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, usage, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+		Path: "/clip.mp3", ContentType: "audio/mpeg", Data: []byte("x"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "token transcript" {
+		t.Fatalf("text=%q", text)
+	}
+	if usage.InputTokens != 100 {
+		t.Fatalf("input_tokens=%d, want 100", usage.InputTokens)
+	}
+	if usage.OutputTokens != 50 {
+		t.Fatalf("output_tokens=%d, want 50", usage.OutputTokens)
+	}
+}
+
 func TestOpenAIAudioTextExtractorExtractAudioTextErrorMessage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
