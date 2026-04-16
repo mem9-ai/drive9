@@ -22,13 +22,18 @@ import (
 )
 
 type PoolConfig struct {
-	MaxTenants int
-	S3Dir      string
-	PublicURL  string
-	S3Bucket   string
-	S3Region   string
-	S3Prefix   string
-	S3RoleARN  string
+	MaxTenants        int
+	S3Dir             string
+	PublicURL         string
+	S3Bucket          string
+	S3Region          string
+	S3Prefix          string
+	S3RoleARN         string
+	S3Endpoint        string
+	S3ForcePathStyle  bool
+	S3AccessKeyID     string
+	S3SecretAccessKey string
+	S3SessionToken    string
 
 	BackendOptions backend.Options
 }
@@ -324,10 +329,15 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		prefix += t.ID + "/"
 		s3ClientStart := time.Now()
 		s3c, err := s3client.NewAWS(ctx, s3client.AWSConfig{
-			Region:  p.cfg.S3Region,
-			Bucket:  p.cfg.S3Bucket,
-			Prefix:  prefix,
-			RoleARN: p.cfg.S3RoleARN,
+			Region:          p.cfg.S3Region,
+			Bucket:          p.cfg.S3Bucket,
+			Prefix:          prefix,
+			RoleARN:         p.cfg.S3RoleARN,
+			Endpoint:        p.cfg.S3Endpoint,
+			ForcePathStyle:  p.cfg.S3ForcePathStyle,
+			AccessKeyID:     p.cfg.S3AccessKeyID,
+			SecretAccessKey: p.cfg.S3SecretAccessKey,
+			SessionToken:    p.cfg.S3SessionToken,
 		})
 		if err != nil {
 			_ = store.Close()

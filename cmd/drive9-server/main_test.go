@@ -118,6 +118,60 @@ func TestBuildBackendOptionsFromEnvAudioOpenAI(t *testing.T) {
 	}
 }
 
+func TestS3ConfigFromEnv(t *testing.T) {
+	keys := []string{
+		"DRIVE9_S3_DIR",
+		"DRIVE9_S3_BUCKET",
+		"DRIVE9_S3_REGION",
+		"DRIVE9_S3_PREFIX",
+		"DRIVE9_S3_ROLE_ARN",
+		"DRIVE9_S3_ENDPOINT",
+		"DRIVE9_S3_FORCE_PATH_STYLE",
+		"DRIVE9_S3_ACCESS_KEY_ID",
+		"DRIVE9_S3_SECRET_ACCESS_KEY",
+		"DRIVE9_S3_SESSION_TOKEN",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+
+	cfg := s3ConfigFromEnv()
+	if cfg.Dir != defaultS3Dir {
+		t.Fatalf("default dir = %q, want %q", cfg.Dir, defaultS3Dir)
+	}
+	if cfg.Bucket != "" {
+		t.Fatalf("default bucket = %q, want empty", cfg.Bucket)
+	}
+
+	setEnv(t, "DRIVE9_S3_DIR", " custom-s3 ")
+	setEnv(t, "DRIVE9_S3_BUCKET", " bench-bucket ")
+	setEnv(t, "DRIVE9_S3_REGION", " us-west-2 ")
+	setEnv(t, "DRIVE9_S3_PREFIX", " uploads/ ")
+	setEnv(t, "DRIVE9_S3_ROLE_ARN", " arn:aws:iam::123456789012:role/test ")
+	setEnv(t, "DRIVE9_S3_ENDPOINT", " http://127.0.0.1:9000 ")
+	setEnv(t, "DRIVE9_S3_FORCE_PATH_STYLE", " true ")
+	setEnv(t, "DRIVE9_S3_ACCESS_KEY_ID", " minioadmin ")
+	setEnv(t, "DRIVE9_S3_SECRET_ACCESS_KEY", " miniosecret ")
+	setEnv(t, "DRIVE9_S3_SESSION_TOKEN", " session-token ")
+
+	cfg = s3ConfigFromEnv()
+	if cfg.Dir != "custom-s3" {
+		t.Fatalf("Dir = %q, want %q", cfg.Dir, "custom-s3")
+	}
+	if cfg.Bucket != "bench-bucket" || cfg.Region != "us-west-2" {
+		t.Fatalf("unexpected bucket/region config: %+v", cfg)
+	}
+	if cfg.Prefix != "uploads/" || cfg.RoleARN != "arn:aws:iam::123456789012:role/test" {
+		t.Fatalf("unexpected prefix/role config: %+v", cfg)
+	}
+	if cfg.Endpoint != "http://127.0.0.1:9000" || !cfg.ForcePathStyle {
+		t.Fatalf("unexpected endpoint config: %+v", cfg)
+	}
+	if cfg.AccessKeyID != "minioadmin" || cfg.SecretAccessKey != "miniosecret" || cfg.SessionToken != "session-token" {
+		t.Fatalf("unexpected static credential config: %+v", cfg)
+	}
+}
+
 func snapshotEnv(t *testing.T, keys []string) map[string]string {
 	t.Helper()
 	out := make(map[string]string, len(keys))

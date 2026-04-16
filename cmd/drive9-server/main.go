@@ -37,6 +37,19 @@ const (
 	defaultS3Dir      = "s3"
 )
 
+type s3Config struct {
+	Dir             string
+	Bucket          string
+	Region          string
+	Prefix          string
+	RoleARN         string
+	Endpoint        string
+	ForcePathStyle  bool
+	AccessKeyID     string
+	SecretAccessKey string
+	SessionToken    string
+}
+
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -76,11 +89,7 @@ func main() {
 		die(fmt.Errorf("DRIVE9_META_DSN is required"))
 	}
 
-	s3Dir := envOr("DRIVE9_S3_DIR", defaultS3Dir)
-	s3Bucket := os.Getenv("DRIVE9_S3_BUCKET")
-	s3Region := envOr("DRIVE9_S3_REGION", "us-east-1")
-	s3Prefix := os.Getenv("DRIVE9_S3_PREFIX")
-	s3RoleARN := os.Getenv("DRIVE9_S3_ROLE_ARN")
+	s3cfg := s3ConfigFromEnv()
 	backendOptions, err := buildBackendOptionsFromEnv()
 	if err != nil {
 		die(err)
@@ -99,13 +108,19 @@ func main() {
 	}
 	defer func() { _ = store.Close() }()
 
-	if s3Bucket == "" {
-		if err := os.MkdirAll(s3Dir, 0o755); err != nil {
+	if s3cfg.Bucket == "" {
+		if err := os.MkdirAll(s3cfg.Dir, 0o755); err != nil {
 			die(fmt.Errorf("create s3 dir: %w", err))
 		}
-		logger.Info(context.Background(), "s3_mode_local", zap.String("dir", s3Dir))
+		logger.Info(context.Background(), "s3_mode_local", zap.String("dir", s3cfg.Dir))
 	} else {
-		logger.Info(context.Background(), "s3_mode_aws", zap.String("bucket", s3Bucket), zap.String("region", s3Region), zap.String("role", envOr("DRIVE9_S3_ROLE_ARN", "default-credentials")))
+		logger.Info(context.Background(), "s3_mode_aws",
+			zap.String("bucket", s3cfg.Bucket),
+			zap.String("region", s3cfg.Region),
+			zap.String("endpoint", s3cfg.Endpoint),
+			zap.Bool("path_style", s3cfg.ForcePathStyle),
+			zap.String("credentials", s3CredentialLogValue(s3cfg.AccessKeyID)),
+			zap.String("role", s3RoleLogValue(s3cfg.RoleARN)))
 	}
 
 	encryptType := envOr("DRIVE9_ENCRYPT_TYPE", "local_aes")
@@ -170,7 +185,7 @@ func main() {
 		enc, err := encrypt.New(context.Background(), encrypt.Config{
 			Type:   eType,
 			Key:    eKey,
-			Region: envOr("DRIVE9_S3_REGION", "us-east-1"),
+			Region: s3cfg.Region,
 		})
 		if err != nil {
 			die(fmt.Errorf("create encryptor: %w", err))
@@ -181,13 +196,18 @@ func main() {
 		}
 
 		pool = tenant.NewPool(tenant.PoolConfig{
-			S3Dir:          s3Dir,
-			PublicURL:      publicBaseURL(addr),
-			S3Bucket:       s3Bucket,
-			S3Region:       s3Region,
-			S3Prefix:       s3Prefix,
-			S3RoleARN:      s3RoleARN,
-			BackendOptions: backendOptions,
+			S3Dir:             s3cfg.Dir,
+			PublicURL:         publicBaseURL(addr),
+			S3Bucket:          s3cfg.Bucket,
+			S3Region:          s3cfg.Region,
+			S3Prefix:          s3cfg.Prefix,
+			S3RoleARN:         s3cfg.RoleARN,
+			S3Endpoint:        s3cfg.Endpoint,
+			S3ForcePathStyle:  s3cfg.ForcePathStyle,
+			S3AccessKeyID:     s3cfg.AccessKeyID,
+			S3SecretAccessKey: s3cfg.SecretAccessKey,
+			S3SessionToken:    s3cfg.SessionToken,
+			BackendOptions:    backendOptions,
 		}, enc)
 		defer pool.Close()
 	}
@@ -204,7 +224,7 @@ func main() {
 			Provisioner:      provisioner,
 			TokenSecret:      tokenSecret,
 			VaultMasterKey:   vaultMasterKey,
-			S3Dir:            s3Dir,
+			S3Dir:            s3cfg.Dir,
 			MaxUploadBytes:   maxUploadBytes,
 			Logger:           srvLogger,
 			SemanticEmbedder: semanticEmbedder,
@@ -220,7 +240,7 @@ func main() {
 		Provisioner:      provisioner,
 		TokenSecret:      tokenSecret,
 		VaultMasterKey:   vaultMasterKey,
-		S3Dir:            s3Dir,
+		S3Dir:            s3cfg.Dir,
 		MaxUploadBytes:   maxUploadBytes,
 		Logger:           srvLogger,
 		SemanticEmbedder: semanticEmbedder,
@@ -233,6 +253,43 @@ func envOr(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func s3ConfigFromEnv() s3Config {
+	dir := strings.TrimSpace(os.Getenv("DRIVE9_S3_DIR"))
+	if dir == "" {
+		dir = defaultS3Dir
+	}
+	region := strings.TrimSpace(os.Getenv("DRIVE9_S3_REGION"))
+	if region == "" {
+		region = "us-east-1"
+	}
+	return s3Config{
+		Dir:             dir,
+		Bucket:          strings.TrimSpace(os.Getenv("DRIVE9_S3_BUCKET")),
+		Region:          region,
+		Prefix:          strings.TrimSpace(os.Getenv("DRIVE9_S3_PREFIX")),
+		RoleARN:         strings.TrimSpace(os.Getenv("DRIVE9_S3_ROLE_ARN")),
+		Endpoint:        strings.TrimSpace(os.Getenv("DRIVE9_S3_ENDPOINT")),
+		ForcePathStyle:  envBool("DRIVE9_S3_FORCE_PATH_STYLE", false),
+		AccessKeyID:     strings.TrimSpace(os.Getenv("DRIVE9_S3_ACCESS_KEY_ID")),
+		SecretAccessKey: strings.TrimSpace(os.Getenv("DRIVE9_S3_SECRET_ACCESS_KEY")),
+		SessionToken:    strings.TrimSpace(os.Getenv("DRIVE9_S3_SESSION_TOKEN")),
+	}
+}
+
+func s3CredentialLogValue(accessKeyID string) string {
+	if accessKeyID != "" {
+		return "static"
+	}
+	return "default-credentials"
+}
+
+func s3RoleLogValue(roleARN string) string {
+	if roleARN == "" {
+		return "none"
+	}
+	return roleARN
 }
 
 func versionText() string {
@@ -261,6 +318,11 @@ environment:
   DRIVE9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
   DRIVE9_S3_REGION   AWS region (default: us-east-1)
   DRIVE9_S3_PREFIX   S3 key prefix (e.g. "tenants")
+  DRIVE9_S3_ENDPOINT custom S3 endpoint URL for S3-compatible stores such as MinIO (optional)
+  DRIVE9_S3_FORCE_PATH_STYLE true|false to force path-style S3 URLs (default: false)
+  DRIVE9_S3_ACCESS_KEY_ID static S3 access key id (optional; requires DRIVE9_S3_SECRET_ACCESS_KEY)
+  DRIVE9_S3_SECRET_ACCESS_KEY static S3 secret access key (optional; requires DRIVE9_S3_ACCESS_KEY_ID)
+  DRIVE9_S3_SESSION_TOKEN static S3 session token (optional; requires DRIVE9_S3_ACCESS_KEY_ID and DRIVE9_S3_SECRET_ACCESS_KEY)
   DRIVE9_S3_ROLE_ARN IAM role ARN to assume via STS (optional)
   DRIVE9_S3_DIR      local s3 mock root directory (default: ./s3, only used without DRIVE9_S3_BUCKET)
   Query embedding (app-side semantic query embedding for grep):

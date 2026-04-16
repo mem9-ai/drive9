@@ -164,6 +164,11 @@ func TestLocalS3ConfigFromEnv(t *testing.T) {
 		"DRIVE9_S3_REGION",
 		"DRIVE9_S3_PREFIX",
 		"DRIVE9_S3_ROLE_ARN",
+		"DRIVE9_S3_ENDPOINT",
+		"DRIVE9_S3_FORCE_PATH_STYLE",
+		"DRIVE9_S3_ACCESS_KEY_ID",
+		"DRIVE9_S3_SECRET_ACCESS_KEY",
+		"DRIVE9_S3_SESSION_TOKEN",
 	}
 	prev := make(map[string]string, len(keys))
 	for _, k := range keys {
@@ -204,6 +209,21 @@ func TestLocalS3ConfigFromEnv(t *testing.T) {
 	if err := os.Setenv("DRIVE9_S3_ROLE_ARN", "  arn:aws:iam::123456789012:role/test  "); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Setenv("DRIVE9_S3_ENDPOINT", "  http://127.0.0.1:9000  "); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_S3_FORCE_PATH_STYLE", " true "); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_S3_ACCESS_KEY_ID", "  minioadmin  "); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_S3_SECRET_ACCESS_KEY", "  miniosecret  "); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_S3_SESSION_TOKEN", "  session-token  "); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := localS3ConfigFromEnv()
 	if err != nil {
 		t.Fatalf("aws config with default local dir should succeed: %v", err)
@@ -213,6 +233,12 @@ func TestLocalS3ConfigFromEnv(t *testing.T) {
 	}
 	if cfg.Prefix != "uploads/" || cfg.RoleARN != "arn:aws:iam::123456789012:role/test" {
 		t.Fatalf("unexpected trimmed aws fields: %+v", cfg)
+	}
+	if cfg.Endpoint != "http://127.0.0.1:9000" || !cfg.ForcePathStyle {
+		t.Fatalf("unexpected endpoint config: %+v", cfg)
+	}
+	if cfg.AccessKeyID != "minioadmin" || cfg.SecretAccessKey != "miniosecret" || cfg.SessionToken != "session-token" {
+		t.Fatalf("unexpected static credential config: %+v", cfg)
 	}
 
 	unsetAll()
