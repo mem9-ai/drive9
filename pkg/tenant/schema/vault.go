@@ -1,7 +1,8 @@
 package schema
 
 // VaultTiDBSchemaStatements returns the vault DDL statements in TiDB/MySQL
-// dialect. These are appended to the tenant schema init for all TiDB providers.
+// dialect. These are appended to the tenant init schema statement set for all
+// TiDB providers, including drive9-server schema dump-init-sql output.
 func VaultTiDBSchemaStatements() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS vault_deks (
