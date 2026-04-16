@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/buildinfo"
 	"github.com/mem9-ai/dat9/pkg/datastore"
@@ -22,7 +24,6 @@ import (
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/server"
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
-	"go.uber.org/zap"
 )
 
 const (
@@ -43,9 +44,6 @@ type localS3Config struct {
 
 func main() {
 	if len(os.Args) > 2 {
-		if len(os.Args) > 1 && os.Args[1] == "version" {
-			usage()
-		}
 		usage()
 	}
 	if len(os.Args) == 2 && os.Args[1] == "version" {

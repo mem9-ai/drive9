@@ -1,3 +1,4 @@
+// Package buildinfo provides shared build metadata for drive9 binaries.
 package buildinfo
 
 import (

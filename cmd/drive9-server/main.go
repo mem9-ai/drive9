@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/buildinfo"
 	"github.com/mem9-ai/dat9/pkg/embedding"
@@ -28,7 +30,6 @@ import (
 	"github.com/mem9-ai/dat9/pkg/tenant/db9"
 	"github.com/mem9-ai/dat9/pkg/tenant/starter"
 	"github.com/mem9-ai/dat9/pkg/tenant/tidbzero"
-	"go.uber.org/zap"
 )
 
 const (

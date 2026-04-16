@@ -9,7 +9,8 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
-func TestStringIncludesAllFields(t *testing.T) {
+func setBuildInfoForTest(t *testing.T, version, gitHash, gitBranch, buildTime string) {
+	t.Helper()
 	origVersion := Version
 	origGitHash := GitHash
 	origGitBranch := GitBranch
@@ -21,10 +22,14 @@ func TestStringIncludesAllFields(t *testing.T) {
 		BuildTime = origBuildTime
 	})
 
-	Version = "v1.2.3"
-	GitHash = "abc123"
-	GitBranch = "feature/build-info"
-	BuildTime = "2026-04-16T08:15:00Z"
+	Version = version
+	GitHash = gitHash
+	GitBranch = gitBranch
+	BuildTime = buildTime
+}
+
+func TestStringIncludesAllFields(t *testing.T) {
+	setBuildInfoForTest(t, "v1.2.3", "abc123", "feature/build-info", "2026-04-16T08:15:00Z")
 
 	got := String("drive9-server")
 	checks := []string{
@@ -43,21 +48,7 @@ func TestStringIncludesAllFields(t *testing.T) {
 }
 
 func TestFieldsIncludeAllValues(t *testing.T) {
-	origVersion := Version
-	origGitHash := GitHash
-	origGitBranch := GitBranch
-	origBuildTime := BuildTime
-	t.Cleanup(func() {
-		Version = origVersion
-		GitHash = origGitHash
-		GitBranch = origGitBranch
-		BuildTime = origBuildTime
-	})
-
-	Version = "v9.9.9"
-	GitHash = "deadbeef"
-	GitBranch = "main"
-	BuildTime = "2026-04-16T09:00:00Z"
+	setBuildInfoForTest(t, "v9.9.9", "deadbeef", "main", "2026-04-16T09:00:00Z")
 
 	core, recorded := observer.New(zap.InfoLevel)
 	zap.New(core).Info("build_info", Fields("drive9-server-local")...)

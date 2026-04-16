@@ -21,10 +21,11 @@ import (
 	"runtime/pprof"
 	"sync"
 
+	"go.uber.org/zap"
+
 	"github.com/mem9-ai/dat9/cmd/drive9/cli"
 	"github.com/mem9-ai/dat9/pkg/buildinfo"
 	"github.com/mem9-ai/dat9/pkg/logger"
-	"go.uber.org/zap"
 )
 
 var cliLogger *zap.Logger
