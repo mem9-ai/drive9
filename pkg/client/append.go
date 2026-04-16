@@ -176,5 +176,6 @@ func shouldRewriteAppend(err error) bool {
 	if statusErr.StatusCode != http.StatusBadRequest {
 		return false
 	}
-	return strings.HasPrefix(statusErr.Message, "file is not S3-stored:")
+	return strings.HasPrefix(statusErr.Message, "file is not S3-stored:") ||
+		strings.Contains(statusErr.Message, "unknown POST action")
 }

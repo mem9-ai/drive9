@@ -244,6 +244,54 @@ func TestAppendStreamRewriteUsesStreamingUploadWhenFinalFileIsLarge(t *testing.T
 	}
 }
 
+func TestAppendStreamFallsBackToRewriteWhenAppendActionUnsupported(t *testing.T) {
+	var appendInitiateCalled bool
+	var putBody []byte
+	var gotExpectedRevision string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/legacy.txt":
+			w.Header().Set("Content-Length", "5")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/legacy.txt" && r.URL.Query().Has("append"):
+			appendInitiateCalled = true
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unknown POST action"})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/legacy.txt":
+			_, _ = io.WriteString(w, "hello")
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/legacy.txt":
+			gotExpectedRevision = r.Header.Get("X-Dat9-Expected-Revision")
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			putBody = append([]byte(nil), body...)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	if err := c.AppendStream(context.Background(), "/legacy.txt", strings.NewReader(" world"), 6, nil); err != nil {
+		t.Fatalf("AppendStream: %v", err)
+	}
+	if !appendInitiateCalled {
+		t.Fatal("append initiate endpoint was not called")
+	}
+	if gotExpectedRevision != "7" {
+		t.Fatalf("expected revision header = %q, want %q", gotExpectedRevision, "7")
+	}
+	if got := string(putBody); got != "hello world" {
+		t.Fatalf("rewritten body = %q, want %q", got, "hello world")
+	}
+}
+
 func TestAppendStreamUsesFinalSizeForAdaptivePartSize(t *testing.T) {
 	baseSize := int64(s3client.PartSize) * 10000
 	appendSize := int64(1)
