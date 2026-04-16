@@ -71,7 +71,7 @@ func (b *Dat9Backend) InitiateAppendUploadIfRevision(ctx context.Context, path s
 
 	path, err := pathutil.Canonicalize(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("canonicalize append path %q: %w", path, err)
 	}
 	if b.s3 == nil {
 		return nil, ErrS3NotConfigured
@@ -79,7 +79,7 @@ func (b *Dat9Backend) InitiateAppendUploadIfRevision(ctx context.Context, path s
 
 	nf, err := b.store.Stat(ctx, path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("stat append target %q: %w", path, err)
 	}
 	if nf.File == nil || nf.File.StorageType != datastore.StorageS3 {
 		return nil, fmt.Errorf("%w: %s", ErrNotS3Stored, path)
@@ -100,15 +100,15 @@ func (b *Dat9Backend) InitiateAppendUploadIfRevision(ctx context.Context, path s
 	partSize := clientPartSize
 	if partSize < s3client.MinPartSize {
 		partSize = s3client.CalcAdaptivePartSize(baseSize)
-		if len(s3client.CalcParts(newSize, partSize)) > MaxMultipartParts {
-			partSize = s3client.CalcAdaptivePartSize(newSize)
-		}
+	}
+	if len(s3client.CalcParts(newSize, partSize)) > MaxMultipartParts {
+		partSize = s3client.CalcAdaptivePartSize(newSize)
 	}
 
 	dirtyParts := appendDirtyPartNumbers(baseSize, newSize, partSize)
 	plan, err := b.InitiatePatchUploadIfRevision(ctx, path, newSize, dirtyParts, partSize, expectedRevision)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("initiate append patch upload for %q: %w", path, err)
 	}
 	return &AppendPlan{
 		BaseSize:  baseSize,

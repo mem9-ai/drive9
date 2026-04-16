@@ -1174,6 +1174,10 @@ func (b *Dat9Backend) PresignGetObject(ctx context.Context, path string) (string
 		metrics.RecordOperation("backend", "presign_get_object", "error", time.Since(start))
 		return "", fmt.Errorf("%w: %s", ErrNotS3Stored, path)
 	}
+	if b.s3 == nil {
+		metrics.RecordOperation("backend", "presign_get_object", "error", time.Since(start))
+		return "", ErrS3NotConfigured
+	}
 	url, err := b.s3.PresignGetObject(ctx, nf.File.StorageRef, s3client.DownloadTTL)
 	if err != nil {
 		logger.Error(ctx, "backend_presign_get_object_failed", zap.String("path", path), zap.Error(err))
