@@ -367,7 +367,7 @@ func TestLLMCostCacheColdCacheInterleaving(t *testing.T) {
 
 	// Stale fallback must return a non-zero value (the installed DB result),
 	// NOT 0 (which would mean the valid DB read was discarded).
-	total, err = cache.MonthlyLLMCostMillicents(ctx, "t1")
+	total, err := cache.MonthlyLLMCostMillicents(ctx, "t1")
 	if err != nil {
 		t.Fatalf("expected stale cache hit (no error), got err: %v", err)
 	}
