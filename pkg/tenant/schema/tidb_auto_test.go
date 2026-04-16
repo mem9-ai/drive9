@@ -80,6 +80,25 @@ func TestLegacyTiDBUploadsRepairStatements(t *testing.T) {
 	}
 }
 
+func TestInitTiDBTenantSchemaStatementsForModeIncludesVault(t *testing.T) {
+	for _, mode := range []TiDBEmbeddingMode{TiDBEmbeddingModeAuto, TiDBEmbeddingModeApp} {
+		t.Run(string(mode), func(t *testing.T) {
+			stmts, err := InitTiDBTenantSchemaStatementsForMode(mode)
+			if err != nil {
+				t.Fatalf("init statements for mode %q: %v", mode, err)
+			}
+
+			sqlText := strings.Join(stmts, "\n")
+			if !strings.Contains(sqlText, "CREATE TABLE IF NOT EXISTS vault_deks") {
+				t.Fatalf("mode %q missing vault_deks in init schema", mode)
+			}
+			if !strings.Contains(sqlText, "CREATE TABLE IF NOT EXISTS vault_audit_log") {
+				t.Fatalf("mode %q missing vault_audit_log in init schema", mode)
+			}
+		})
+	}
+}
+
 func testFilesTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
 	meta := tidbTableMeta{
 		tableName: "files",
