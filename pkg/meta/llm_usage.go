@@ -64,9 +64,22 @@ func NewLLMCostCache(store *Store, tenantID string, ttl time.Duration) *LLMCostC
 	return &LLMCostCache{store: store, ttl: ttl}
 }
 
-// InsertLLMUsage delegates to the underlying Store.
+// InsertLLMUsage delegates to the underlying Store. On success, it advances
+// the cached monthly total so that a subsequent stale-cache fallback reflects
+// the newly recorded cost.
 func (c *LLMCostCache) InsertLLMUsage(ctx context.Context, tenantID, taskType, taskID string, costMillicents, rawUnits int64, rawUnitType string) error {
-	return c.store.InsertLLMUsage(ctx, tenantID, taskType, taskID, costMillicents, rawUnits, rawUnitType)
+	err := c.store.InsertLLMUsage(ctx, tenantID, taskType, taskID, costMillicents, rawUnits, rawUnitType)
+	if err == nil && costMillicents > 0 {
+		c.mu.Lock()
+		if c.cached != nil {
+			c.cached = &llmCostCacheEntry{
+				total:     c.cached.total + costMillicents,
+				fetchedAt: c.cached.fetchedAt,
+			}
+		}
+		c.mu.Unlock()
+	}
+	return err
 }
 
 // MonthlyLLMCostMillicents returns the current monthly cost, using the cache

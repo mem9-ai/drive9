@@ -155,6 +155,44 @@ func TestLLMCostCacheExpired_FailOpen(t *testing.T) {
 	}
 }
 
+func TestLLMCostCacheInsertAdvancesStaleFallback(t *testing.T) {
+	s := newControlStore(t)
+	_, _ = s.DB().Exec("DELETE FROM llm_usage")
+
+	ctx := context.Background()
+	if err := s.InsertLLMUsage(ctx, "t1", "img_extract_text", "task-1", 4900, 100, "tokens"); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := NewLLMCostCache(s, "t1", 1*time.Hour)
+
+	// Populate cache with 4900.
+	total, err := cache.MonthlyLLMCostMillicents(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 4900 {
+		t.Fatalf("got %d, want 4900", total)
+	}
+
+	// Insert 200 via cache — should advance cached total to 5100.
+	if err := cache.InsertLLMUsage(ctx, "t1", "img_extract_text", "task-2", 200, 50, "tokens"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Close the store to simulate meta store failure.
+	_ = s.Close()
+
+	// Stale fallback should return 5100 (4900 + 200), not 4900.
+	total, err = cache.MonthlyLLMCostMillicents(ctx, "t1")
+	if err != nil {
+		t.Fatalf("expected stale cache hit (no error), got err: %v", err)
+	}
+	if total != 5100 {
+		t.Fatalf("stale cache after insert: got %d, want 5100", total)
+	}
+}
+
 func TestLLMCostCacheColdStart_FailOpen(t *testing.T) {
 	s := newControlStore(t)
 
