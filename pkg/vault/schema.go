@@ -6,84 +6,11 @@ import (
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
 
-// SchemaStatements returns the vault DDL statements used during tenant schema
-// initialization (TiDB/MySQL-compatible).
-//
-// These statements are appended into the exported db9 init schema. If you
-// change vault columns, indexes, or constraints here, rerun:
-//
-//	drive9-server schema dump-init-sql --provider db9
-//
-// and update any external db9 schema copy that consumes that exported SQL.
+// SchemaStatements returns the vault DDL statements (TiDB/MySQL-compatible).
+// The canonical DDL lives in pkg/tenant/schema.VaultTiDBSchemaStatements();
+// this is a convenience re-export.
 func SchemaStatements() []string {
-	return []string{
-		`CREATE TABLE IF NOT EXISTS vault_deks (
-			tenant_id    VARCHAR(64) PRIMARY KEY,
-			wrapped_dek  BLOB NOT NULL,
-			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
-		)`,
-
-		`CREATE TABLE IF NOT EXISTS vault_secrets (
-			secret_id    VARCHAR(64) PRIMARY KEY,
-			tenant_id    VARCHAR(64) NOT NULL,
-			name         VARCHAR(255) NOT NULL,
-			secret_type  VARCHAR(32) NOT NULL DEFAULT 'generic',
-			revision     BIGINT NOT NULL DEFAULT 1,
-			created_by   VARCHAR(255) NOT NULL,
-			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			deleted_at   DATETIME(3),
-			UNIQUE INDEX uk_vault_secrets_tenant_name (tenant_id, name),
-			INDEX idx_vault_secrets_tenant (tenant_id)
-		)`,
-
-		`CREATE TABLE IF NOT EXISTS vault_secret_fields (
-			secret_id       VARCHAR(64) NOT NULL,
-			field_name      VARCHAR(255) NOT NULL,
-			encrypted_value BLOB NOT NULL,
-			nonce           BLOB NOT NULL,
-			PRIMARY KEY (secret_id, field_name)
-		)`,
-
-		`CREATE TABLE IF NOT EXISTS vault_tokens (
-			token_id      VARCHAR(64) PRIMARY KEY,
-			tenant_id     VARCHAR(64) NOT NULL,
-			agent_id      VARCHAR(255) NOT NULL,
-			task_id       VARCHAR(255),
-			scope_json    JSON NOT NULL,
-			issued_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			expires_at    DATETIME(3) NOT NULL,
-			revoked_at    DATETIME(3),
-			revoked_by    VARCHAR(255),
-			revoke_reason VARCHAR(255),
-			INDEX idx_vault_token_tenant (tenant_id),
-			INDEX idx_vault_token_agent (agent_id)
-		)`,
-
-		`CREATE TABLE IF NOT EXISTS vault_policies (
-			policy_id   VARCHAR(64) PRIMARY KEY,
-			tenant_id   VARCHAR(64) NOT NULL,
-			name        VARCHAR(255) NOT NULL,
-			rules_json  JSON NOT NULL,
-			created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
-		)`,
-
-		`CREATE TABLE IF NOT EXISTS vault_audit_log (
-			event_id     VARCHAR(64) PRIMARY KEY,
-			tenant_id    VARCHAR(64) NOT NULL,
-			event_type   VARCHAR(32) NOT NULL,
-			token_id     VARCHAR(64),
-			agent_id     VARCHAR(255),
-			task_id      VARCHAR(255),
-			secret_name  VARCHAR(255),
-			field_name   VARCHAR(255),
-			adapter      VARCHAR(16),
-			detail_json  JSON,
-			timestamp    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			INDEX idx_vault_audit_tenant_time (tenant_id, timestamp),
-			INDEX idx_vault_audit_secret (secret_name, timestamp)
-		)`,
-	}
+	return schema.VaultTiDBSchemaStatements()
 }
 
 // InitSchema creates the vault tables in the tenant database.
