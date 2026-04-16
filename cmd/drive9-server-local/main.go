@@ -29,6 +29,7 @@ import (
 
 const (
 	defaultListenAddr     = "127.0.0.1:9009"
+	defaultLocalAPIKey    = "local-dev-key"
 	defaultS3Dir          = "/tmp/drive9-local-s3"
 	defaultS3Region       = "us-east-1"
 	envLocalEmbeddingMode = "DRIVE9_LOCAL_EMBEDDING_MODE"
@@ -210,15 +211,17 @@ func main() {
 	}
 
 	stepStart = time.Now()
+	localAPIKey := envOr("DRIVE9_LOCAL_API_KEY", defaultLocalAPIKey)
 	srv := server.NewWithConfig(server.Config{
-		Backend:          b,
-		LocalS3:          localS3,
-		VaultMasterKey:   vaultMasterKey,
-		S3Dir:            s3cfg.localDir(),
-		MaxUploadBytes:   maxUploadBytes,
-		Logger:           srvLogger,
-		SemanticEmbedder: semanticEmbedder,
-		SemanticWorkers:  workerOpts,
+		Backend:           b,
+		LocalTenantAPIKey: localAPIKey,
+		VaultMasterKey:    vaultMasterKey,
+		LocalS3:           localS3,
+		S3Dir:             s3cfg.localDir(),
+		MaxUploadBytes:    maxUploadBytes,
+		Logger:            srvLogger,
+		SemanticEmbedder:  semanticEmbedder,
+		SemanticWorkers:   workerOpts,
 	})
 	defer srv.Close()
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_server")
@@ -226,6 +229,7 @@ func main() {
 	audioRuntime := backend.AsyncAudioExtractWillWireRuntime(backendOpts.AsyncAudioExtract)
 	logger.Info(startupCtx, "local_server_mode",
 		zap.String("listen_addr", addr),
+		zap.Bool("custom_local_api_key", strings.TrimSpace(os.Getenv("DRIVE9_LOCAL_API_KEY")) != ""),
 		zap.String("local_dsn", redactDSN(localDSN)),
 		zap.String("s3_mode", s3cfg.Mode),
 		zap.String("s3_dir", s3cfg.localDir()),
@@ -265,6 +269,7 @@ environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: 127.0.0.1:9009)
   DRIVE9_PUBLIC_URL  externally reachable base URL (optional for loopback listen address)
   DRIVE9_LOCAL_DSN   local tenant TiDB/MySQL DSN (required)
+  DRIVE9_LOCAL_API_KEY fixed API key returned by local /v1/provision and accepted by /v1/status (default: local-dev-key)
   DRIVE9_LOCAL_INIT_SCHEMA initialize tenant schema on startup (default: false)
   DRIVE9_LOCAL_EMBEDDING_MODE auto|app|detect (default: auto when initing schema, detect otherwise)
   DRIVE9_VAULT_MASTER_KEY 32-byte hex key for vault DEK wrapping (omit to disable vault)

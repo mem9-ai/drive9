@@ -30,33 +30,35 @@ import (
 )
 
 type Config struct {
-	Meta             *meta.Store
-	Pool             *tenant.Pool
-	Provisioner      tenant.Provisioner
-	TokenSecret      []byte
-	VaultMasterKey   []byte // 32-byte AES key for vault DEK wrapping; nil disables vault
-	Backend          *backend.Dat9Backend
-	LocalS3          *s3client.LocalS3Client
-	S3Dir            string
-	MaxUploadBytes   int64
-	Logger           *zap.Logger
-	SemanticEmbedder embedding.Client
-	SemanticWorkers  SemanticWorkerOptions
+	Meta              *meta.Store
+	Pool              *tenant.Pool
+	Provisioner       tenant.Provisioner
+	TokenSecret       []byte
+	LocalTenantAPIKey string
+	VaultMasterKey    []byte // 32-byte AES key for vault DEK wrapping; nil disables vault
+	Backend           *backend.Dat9Backend
+	LocalS3           *s3client.LocalS3Client
+	S3Dir             string
+	MaxUploadBytes    int64
+	Logger            *zap.Logger
+	SemanticEmbedder  embedding.Client
+	SemanticWorkers   SemanticWorkerOptions
 }
 
 type Server struct {
-	fallback       *backend.Dat9Backend
-	meta           *meta.Store
-	pool           *tenant.Pool
-	provisioner    tenant.Provisioner
-	tokenSecret    []byte
-	vaultMK        *vault.MasterKey
-	maxUploadBytes int64
-	metrics        *serverMetrics
-	logger         *zap.Logger
-	mux            *http.ServeMux
-	events         *eventBuses
-	semanticWorker *semanticWorkerManager
+	fallback          *backend.Dat9Backend
+	meta              *meta.Store
+	pool              *tenant.Pool
+	provisioner       tenant.Provisioner
+	tokenSecret       []byte
+	localTenantAPIKey string
+	vaultMK           *vault.MasterKey
+	maxUploadBytes    int64
+	metrics           *serverMetrics
+	logger            *zap.Logger
+	mux               *http.ServeMux
+	events            *eventBuses
+	semanticWorker    *semanticWorkerManager
 }
 
 var (
@@ -91,16 +93,17 @@ func NewWithConfig(cfg Config) *Server {
 		}
 	}
 	s := &Server{
-		fallback:       cfg.Backend,
-		meta:           cfg.Meta,
-		pool:           cfg.Pool,
-		tokenSecret:    cfg.TokenSecret,
-		vaultMK:        vaultMK,
-		provisioner:    cfg.Provisioner,
-		maxUploadBytes: maxUpload,
-		metrics:        newServerMetrics(),
-		logger:         logger,
-		events:         newEventBuses(),
+		fallback:          cfg.Backend,
+		meta:              cfg.Meta,
+		pool:              cfg.Pool,
+		tokenSecret:       cfg.TokenSecret,
+		localTenantAPIKey: strings.TrimSpace(cfg.LocalTenantAPIKey),
+		vaultMK:           vaultMK,
+		provisioner:       cfg.Provisioner,
+		maxUploadBytes:    maxUpload,
+		metrics:           newServerMetrics(),
+		logger:            logger,
+		events:            newEventBuses(),
 	}
 	mux := http.NewServeMux()
 
@@ -349,6 +352,10 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if s.localTenantShimEnabled() {
+		s.handleLocalTenantStatus(w, r)
+		return
+	}
 	if s.meta == nil || s.pool == nil || len(s.tokenSecret) == 0 {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_not_enabled")...)
 		errJSON(w, http.StatusNotFound, "tenant status not enabled")
@@ -424,6 +431,30 @@ func backendFromRequest(r *http.Request) *backend.Dat9Backend {
 		return nil
 	}
 	return scope.Backend
+}
+
+func (s *Server) localTenantShimEnabled() bool {
+	return s.fallback != nil && s.meta == nil && s.pool == nil && len(s.tokenSecret) == 0 && s.localTenantAPIKey != ""
+}
+
+// handleLocalTenantStatus serves drive9-server-local's single-tenant compatibility
+// path so e2e scripts can probe tenant status without enabling the multi-tenant
+// control plane.
+func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request) {
+	tok := bearerToken(r)
+	if tok == "" {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_missing_token")...)
+		errJSON(w, http.StatusUnauthorized, "missing or malformed Authorization header")
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(tok), []byte(s.localTenantAPIKey)) != 1 {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_key_not_found", "tenant_id", "local", "api_key_id", "local")...)
+		errJSON(w, http.StatusUnauthorized, "invalid API key")
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", "local", "status", "active")...)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "active"})
 }
 
 func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
@@ -1614,6 +1645,10 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if s.localTenantShimEnabled() {
+		s.handleLocalTenantProvision(w, r)
+		return
+	}
 	if s.meta == nil || s.pool == nil || len(s.tokenSecret) == 0 {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_not_enabled")...)
 		metricEvent(r.Context(), "tenant_provision", "result", "error")
@@ -1744,6 +1779,20 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"api_key": apiToken,
 		"status":  string(meta.TenantProvisioning),
+	})
+}
+
+// handleLocalTenantProvision serves drive9-server-local's single-tenant
+// compatibility path so e2e scripts can obtain one stable API key without
+// enabling the multi-tenant provision flow.
+func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Request) {
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_requested", "tenant_id", "local", "provider", "local")...)
+	metricEvent(r.Context(), "tenant_provision", "provider", "local", "result", "ok")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"api_key": s.localTenantAPIKey,
+		"status":  "provisioning",
 	})
 }
 
