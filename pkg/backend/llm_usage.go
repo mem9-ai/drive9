@@ -1,10 +1,10 @@
 package backend
 
 import (
+	"go.uber.org/zap"
+
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/metrics"
-
-	"go.uber.org/zap"
 )
 
 // ImageExtractUsage reports the resource consumption of one Vision API call.

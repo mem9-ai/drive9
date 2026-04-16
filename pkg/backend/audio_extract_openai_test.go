@@ -79,6 +79,30 @@ func TestNewOpenAIAudioTextExtractorEndpointCanonicalization(t *testing.T) {
 	}
 }
 
+func TestNewOpenAIAudioTextExtractorResponseFormatAutoSelect(t *testing.T) {
+	tests := []struct {
+		model string
+		want  string
+	}{
+		{model: "whisper-1", want: "verbose_json"},
+		{model: "gpt-4o-transcribe", want: "json"},
+		{model: "gpt-4o-mini-transcribe", want: "json"},
+	}
+	for _, tc := range tests {
+		extractor, err := NewOpenAIAudioTextExtractor(OpenAIAudioTextExtractorConfig{
+			BaseURL: "https://example.com",
+			APIKey:  "secret",
+			Model:   tc.model,
+		})
+		if err != nil {
+			t.Fatalf("NewOpenAIAudioTextExtractor(model=%q): %v", tc.model, err)
+		}
+		if extractor.responseFormat != tc.want {
+			t.Fatalf("model=%q: responseFormat=%q, want %q", tc.model, extractor.responseFormat, tc.want)
+		}
+	}
+}
+
 func TestOpenAIAudioTextExtractorExtractAudioText(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/audio/transcriptions" {
@@ -128,8 +152,8 @@ func TestOpenAIAudioTextExtractorExtractAudioText(t *testing.T) {
 		if model != "whisper-1" {
 			t.Fatalf("model=%q, want whisper-1", model)
 		}
-		if responseFormat != "json" {
-			t.Fatalf("response_format=%q, want json", responseFormat)
+		if responseFormat != "verbose_json" {
+			t.Fatalf("response_format=%q, want verbose_json", responseFormat)
 		}
 		if prompt != "transcribe in zh" {
 			t.Fatalf("prompt=%q, want transcribe in zh", prompt)

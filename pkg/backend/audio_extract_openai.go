@@ -56,7 +56,11 @@ func NewOpenAIAudioTextExtractor(cfg OpenAIAudioTextExtractorConfig) (*OpenAIAud
 	}
 	responseFormat := cfg.ResponseFormat
 	if responseFormat == "" {
-		responseFormat = "json"
+		if strings.HasPrefix(cfg.Model, "whisper") {
+			responseFormat = "verbose_json"
+		} else {
+			responseFormat = "json"
+		}
 	}
 	client := cfg.Client
 	if client == nil {
