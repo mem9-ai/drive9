@@ -23,6 +23,7 @@ const (
 	envAudioExtractAPIKey         = "DRIVE9_AUDIO_EXTRACT_API_KEY"
 	envAudioExtractModel          = "DRIVE9_AUDIO_EXTRACT_MODEL"
 	envAudioExtractPrompt         = "DRIVE9_AUDIO_EXTRACT_PROMPT"
+	envAudioExtractResponseFormat = "DRIVE9_AUDIO_EXTRACT_RESPONSE_FORMAT"
 	localAudioExtractStubMode     = "stub"
 	localAudioExtractOpenAIMode   = "openai"
 )
@@ -34,16 +35,16 @@ const (
 type localStubAudioTextExtractor struct{}
 
 // ExtractAudioText implements [backend.AudioTextExtractor].
-func (localStubAudioTextExtractor) ExtractAudioText(ctx context.Context, req backend.AudioExtractRequest) (string, error) {
+func (localStubAudioTextExtractor) ExtractAudioText(ctx context.Context, req backend.AudioExtractRequest) (string, backend.AudioExtractUsage, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return "", backend.AudioExtractUsage{}, err
 	}
 	p := strings.TrimSpace(req.Path)
 	base := path.Base(p)
 	if base == "." || base == "/" || base == "" {
 		base = "unknown"
 	}
-	return "audio transcript for " + base, nil
+	return "audio transcript for " + base, backend.AudioExtractUsage{}, nil
 }
 
 // buildLocalAudioExtractOptionsFromEnv returns [backend.AsyncAudioExtractOptions] for
@@ -71,11 +72,12 @@ func buildLocalAudioExtractOptionsFromEnv() (backend.AsyncAudioExtractOptions, e
 		}, nil
 	case localAudioExtractOpenAIMode:
 		extractor, err := backend.NewOpenAIAudioTextExtractor(backend.OpenAIAudioTextExtractorConfig{
-			BaseURL: strings.TrimSpace(os.Getenv(envAudioExtractAPIBase)),
-			APIKey:  strings.TrimSpace(os.Getenv(envAudioExtractAPIKey)),
-			Model:   strings.TrimSpace(os.Getenv(envAudioExtractModel)),
-			Prompt:  strings.TrimSpace(os.Getenv(envAudioExtractPrompt)),
-			Timeout: time.Duration(envInt(envAudioExtractTimeoutSeconds, 0)) * time.Second,
+			BaseURL:        strings.TrimSpace(os.Getenv(envAudioExtractAPIBase)),
+			APIKey:         strings.TrimSpace(os.Getenv(envAudioExtractAPIKey)),
+			Model:          strings.TrimSpace(os.Getenv(envAudioExtractModel)),
+			Prompt:         strings.TrimSpace(os.Getenv(envAudioExtractPrompt)),
+			ResponseFormat: strings.TrimSpace(os.Getenv(envAudioExtractResponseFormat)),
+			Timeout:        time.Duration(envInt(envAudioExtractTimeoutSeconds, 0)) * time.Second,
 		})
 		if err != nil {
 			return backend.AsyncAudioExtractOptions{}, fmt.Errorf("init local openai audio extractor: %w", err)

@@ -430,12 +430,14 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 			return backend.Options{}, fmt.Errorf("DRIVE9_AUDIO_EXTRACT_API_BASE, DRIVE9_AUDIO_EXTRACT_API_KEY and DRIVE9_AUDIO_EXTRACT_MODEL must be set together when DRIVE9_AUDIO_EXTRACT_ENABLED=true")
 		}
 		audioTimeout := time.Duration(envInt("DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS", 120)) * time.Second
+		audioResponseFormat := strings.TrimSpace(os.Getenv("DRIVE9_AUDIO_EXTRACT_RESPONSE_FORMAT"))
 		audioExtractor, err := backend.NewOpenAIAudioTextExtractor(backend.OpenAIAudioTextExtractorConfig{
-			BaseURL: audioBaseURL,
-			APIKey:  audioAPIKey,
-			Model:   audioModel,
-			Prompt:  audioPrompt,
-			Timeout: audioTimeout,
+			BaseURL:        audioBaseURL,
+			APIKey:         audioAPIKey,
+			Model:          audioModel,
+			Prompt:         audioPrompt,
+			ResponseFormat: audioResponseFormat,
+			Timeout:        audioTimeout,
 		})
 		if err != nil {
 			return backend.Options{}, fmt.Errorf("init audio extractor: %w", err)

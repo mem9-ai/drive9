@@ -251,6 +251,6 @@ func TestPoolAutoSemanticTaskTypes(t *testing.T) {
 
 type poolDummyAudioExtractor struct{}
 
-func (poolDummyAudioExtractor) ExtractAudioText(context.Context, backend.AudioExtractRequest) (string, error) {
-	return "", nil
+func (poolDummyAudioExtractor) ExtractAudioText(context.Context, backend.AudioExtractRequest) (string, backend.AudioExtractUsage, error) {
+	return "", backend.AudioExtractUsage{}, nil
 }

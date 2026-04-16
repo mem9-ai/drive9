@@ -76,7 +76,7 @@ func NewOpenAIImageTextExtractor(cfg OpenAIImageTextExtractorConfig) (*OpenAIIma
 	}, nil
 }
 
-func (e *OpenAIImageTextExtractor) ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, error) {
+func (e *OpenAIImageTextExtractor) ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, ImageExtractUsage, error) {
 	contentType := req.ContentType
 	if contentType == "" {
 		contentType = "image/png"
@@ -98,24 +98,24 @@ func (e *OpenAIImageTextExtractor) ExtractImageText(ctx context.Context, req Ima
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", err
+		return "", ImageExtractUsage{}, err
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint, bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", ImageExtractUsage{}, err
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+e.apiKey)
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := e.client.Do(httpReq)
 	if err != nil {
-		return "", err
+		return "", ImageExtractUsage{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", err
+		return "", ImageExtractUsage{}, err
 	}
 	var parsed struct {
 		Error *struct {
@@ -126,27 +126,36 @@ func (e *OpenAIImageTextExtractor) ExtractImageText(ctx context.Context, req Ima
 				Content any `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage *struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		if resp.StatusCode >= 300 {
-			return "", fmt.Errorf("vision api status %d: %s", resp.StatusCode, truncateString(string(raw), 256))
+			return "", ImageExtractUsage{}, fmt.Errorf("vision api status %d: %s", resp.StatusCode, truncateString(string(raw), 256))
 		}
-		return "", fmt.Errorf("decode vision response: %w", err)
+		return "", ImageExtractUsage{}, fmt.Errorf("decode vision response: %w", err)
 	}
 	if resp.StatusCode >= 300 {
 		if parsed.Error != nil && parsed.Error.Message != "" {
-			return "", fmt.Errorf("vision api status %d: %s", resp.StatusCode, parsed.Error.Message)
+			return "", ImageExtractUsage{}, fmt.Errorf("vision api status %d: %s", resp.StatusCode, parsed.Error.Message)
 		}
-		return "", fmt.Errorf("vision api status %d", resp.StatusCode)
+		return "", ImageExtractUsage{}, fmt.Errorf("vision api status %d", resp.StatusCode)
 	}
 	if len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("vision api returned no choices")
+		return "", ImageExtractUsage{}, fmt.Errorf("vision api returned no choices")
 	}
 	text := extractOpenAIContentText(parsed.Choices[0].Message.Content)
 	if strings.TrimSpace(text) == "" {
-		return "", fmt.Errorf("vision api returned empty text")
+		return "", ImageExtractUsage{}, fmt.Errorf("vision api returned empty text")
 	}
-	return text, nil
+	var usage ImageExtractUsage
+	if parsed.Usage != nil {
+		usage.PromptTokens = parsed.Usage.PromptTokens
+		usage.CompletionTokens = parsed.Usage.CompletionTokens
+	}
+	return text, usage, nil
 }
 
 func extractOpenAIContentText(content any) string {

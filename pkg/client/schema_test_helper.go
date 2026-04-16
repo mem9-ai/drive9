@@ -35,6 +35,8 @@ func initClientTenantSchema(t *testing.T, dsn string) {
 		`CREATE UNIQUE INDEX uk_task_resource_version ON semantic_tasks(task_type, resource_id, resource_version)`,
 		`CREATE INDEX idx_task_claim ON semantic_tasks(status, available_at, lease_until, created_at)`,
 		`CREATE INDEX idx_task_claim_type ON semantic_tasks(status, task_type, available_at, created_at, task_id)`,
+		`CREATE TABLE IF NOT EXISTS llm_usage (id BIGINT AUTO_INCREMENT PRIMARY KEY, task_type VARCHAR(32) NOT NULL, task_id VARCHAR(64) NOT NULL, cost_millicents BIGINT NOT NULL DEFAULT 0, raw_units BIGINT NOT NULL DEFAULT 0, raw_unit_type VARCHAR(16) NOT NULL, created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3))`,
+		`CREATE INDEX idx_llm_usage_created ON llm_usage(created_at)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

@@ -79,6 +79,30 @@ func TestNewOpenAIAudioTextExtractorEndpointCanonicalization(t *testing.T) {
 	}
 }
 
+func TestNewOpenAIAudioTextExtractorResponseFormatAutoSelect(t *testing.T) {
+	tests := []struct {
+		model string
+		want  string
+	}{
+		{model: "whisper-1", want: "verbose_json"},
+		{model: "gpt-4o-transcribe", want: "json"},
+		{model: "gpt-4o-mini-transcribe", want: "json"},
+	}
+	for _, tc := range tests {
+		extractor, err := NewOpenAIAudioTextExtractor(OpenAIAudioTextExtractorConfig{
+			BaseURL: "https://example.com",
+			APIKey:  "secret",
+			Model:   tc.model,
+		})
+		if err != nil {
+			t.Fatalf("NewOpenAIAudioTextExtractor(model=%q): %v", tc.model, err)
+		}
+		if extractor.responseFormat != tc.want {
+			t.Fatalf("model=%q: responseFormat=%q, want %q", tc.model, extractor.responseFormat, tc.want)
+		}
+	}
+}
+
 func TestOpenAIAudioTextExtractorExtractAudioText(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/audio/transcriptions" {
@@ -97,7 +121,7 @@ func TestOpenAIAudioTextExtractorExtractAudioText(t *testing.T) {
 		reader := multipart.NewReader(r.Body, params["boundary"])
 		defer func() { _ = r.Body.Close() }()
 
-		var model, prompt, fileName, fileContentType, fileBody string
+		var model, prompt, responseFormat, fileName, fileContentType, fileBody string
 		for {
 			part, err := reader.NextPart()
 			if err == io.EOF {
@@ -115,6 +139,8 @@ func TestOpenAIAudioTextExtractorExtractAudioText(t *testing.T) {
 				model = string(data)
 			case "prompt":
 				prompt = string(data)
+			case "response_format":
+				responseFormat = string(data)
 			case "file":
 				fileName = part.FileName()
 				fileContentType = part.Header.Get("Content-Type")
@@ -125,6 +151,9 @@ func TestOpenAIAudioTextExtractorExtractAudioText(t *testing.T) {
 		}
 		if model != "whisper-1" {
 			t.Fatalf("model=%q, want whisper-1", model)
+		}
+		if responseFormat != "verbose_json" {
+			t.Fatalf("response_format=%q, want verbose_json", responseFormat)
 		}
 		if prompt != "transcribe in zh" {
 			t.Fatalf("prompt=%q, want transcribe in zh", prompt)
@@ -152,7 +181,7 @@ func TestOpenAIAudioTextExtractorExtractAudioText(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+	got, _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
 		Path:        "/audio/clip.mp3",
 		ContentType: "audio/mpeg",
 		Data:        []byte("fake-mp3"),
@@ -162,6 +191,88 @@ func TestOpenAIAudioTextExtractorExtractAudioText(t *testing.T) {
 	}
 	if got != "spoken transcript" {
 		t.Fatalf("text=%q, want spoken transcript", got)
+	}
+}
+
+func TestOpenAIAudioTextExtractorVerboseJSONWhisperDuration(t *testing.T) {
+	var gotResponseFormat string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mediaType, params, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if mediaType != "multipart/form-data" {
+			t.Fatalf("mediaType=%q", mediaType)
+		}
+		reader := multipart.NewReader(r.Body, params["boundary"])
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("next part: %v", err)
+			}
+			data, _ := io.ReadAll(part)
+			if part.FormName() == "response_format" {
+				gotResponseFormat = string(data)
+			}
+		}
+		_, _ = w.Write([]byte(`{"text":"whisper transcript","duration":42.5}`))
+	}))
+	defer server.Close()
+
+	extractor, err := NewOpenAIAudioTextExtractor(OpenAIAudioTextExtractorConfig{
+		BaseURL:        server.URL,
+		APIKey:         "secret",
+		Model:          "whisper-1",
+		ResponseFormat: "verbose_json",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, usage, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+		Path: "/clip.mp3", ContentType: "audio/mpeg", Data: []byte("x"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotResponseFormat != "verbose_json" {
+		t.Fatalf("response_format=%q, want verbose_json", gotResponseFormat)
+	}
+	if text != "whisper transcript" {
+		t.Fatalf("text=%q", text)
+	}
+	if usage.DurationSeconds != 42.5 {
+		t.Fatalf("duration=%v, want 42.5", usage.DurationSeconds)
+	}
+}
+
+func TestOpenAIAudioTextExtractorTokenUsageParsing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"text":"token transcript","usage":{"input_tokens":100,"output_tokens":50}}`))
+	}))
+	defer server.Close()
+
+	extractor, err := NewOpenAIAudioTextExtractor(OpenAIAudioTextExtractorConfig{
+		BaseURL: server.URL,
+		APIKey:  "secret",
+		Model:   "gpt-4o-transcribe",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, usage, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+		Path: "/clip.mp3", ContentType: "audio/mpeg", Data: []byte("x"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "token transcript" {
+		t.Fatalf("text=%q", text)
+	}
+	if usage.InputTokens != 100 {
+		t.Fatalf("input_tokens=%d, want 100", usage.InputTokens)
+	}
+	if usage.OutputTokens != 50 {
+		t.Fatalf("output_tokens=%d, want 50", usage.OutputTokens)
 	}
 }
 
@@ -180,7 +291,7 @@ func TestOpenAIAudioTextExtractorExtractAudioTextErrorMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{}); err == nil || err.Error() != "audio transcription api status 502: upstream unavailable" {
+	if _, _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{}); err == nil || err.Error() != "audio transcription api status 502: upstream unavailable" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -200,7 +311,7 @@ func TestOpenAIAudioTextExtractorExtractAudioTextRawErrorBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{}); err == nil || err.Error() != "audio transcription api status 400: bad gateway from proxy" {
+	if _, _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{}); err == nil || err.Error() != "audio transcription api status 400: bad gateway from proxy" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -219,7 +330,7 @@ func TestOpenAIAudioTextExtractorExtractAudioTextEmptyText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{}); err == nil || err.Error() != "audio transcription api returned empty text" {
+	if _, _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{}); err == nil || err.Error() != "audio transcription api returned empty text" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -265,7 +376,7 @@ func TestOpenAIAudioTextExtractorFallsBackToGenericFilenameAndContentType(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+	if _, _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
 		Path: " ",
 		Data: []byte("x"),
 	}); err != nil {
@@ -314,7 +425,7 @@ func TestOpenAIAudioTextExtractorOmitsBlankPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+	if _, _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
 		Path: "/clip.mp3",
 		Data: []byte("x"),
 	}); err != nil {
@@ -332,7 +443,7 @@ func TestOpenAIAudioTextExtractorRejectsUnsafeMultipartFilename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+	_, _, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
 		Path:        `/music/a"b.mp3`,
 		ContentType: "audio/mpeg",
 		Data:        []byte("x"),
@@ -361,7 +472,7 @@ func TestWriteAudioMultipartFileRejectsCancelledContextIndirectly(t *testing.T) 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := extractor.ExtractAudioText(ctx, AudioExtractRequest{}); err == nil || !strings.Contains(err.Error(), "context canceled") {
+	if _, _, err := extractor.ExtractAudioText(ctx, AudioExtractRequest{}); err == nil || !strings.Contains(err.Error(), "context canceled") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
