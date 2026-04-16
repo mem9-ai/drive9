@@ -193,6 +193,58 @@ func TestLLMCostCacheInsertAdvancesStaleFallback(t *testing.T) {
 	}
 }
 
+// TestLLMCostCacheInsertRefreshesFreshness verifies that a successful insert
+// resets the cache freshness (fetchedAt) so the stale fallback doesn't expire
+// prematurely. Regression test for: insert near TTL expiry should extend the
+// cache lifetime, not leave fetchedAt at the original DB read time.
+func TestLLMCostCacheInsertRefreshesFreshness(t *testing.T) {
+	s := newControlStore(t)
+	_, _ = s.DB().Exec("DELETE FROM llm_usage")
+
+	ctx := context.Background()
+	if err := s.InsertLLMUsage(ctx, "t1", "img_extract_text", "task-1", 4900, 100, "tokens"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a short TTL so we can test near-expiry behavior.
+	cache := NewLLMCostCache(s, "t1", 100*time.Millisecond)
+
+	// Populate cache at t=0.
+	total, err := cache.MonthlyLLMCostMillicents(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 4900 {
+		t.Fatalf("got %d, want 4900", total)
+	}
+
+	// Wait until close to TTL expiry.
+	time.Sleep(80 * time.Millisecond)
+
+	// Insert near expiry — should refresh fetchedAt to now.
+	if err := cache.InsertLLMUsage(ctx, "t1", "img_extract_text", "task-2", 200, 50, "tokens"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait past the original TTL (>100ms from initial read).
+	time.Sleep(50 * time.Millisecond)
+
+	// Close DB to force stale fallback.
+	_ = s.Close()
+
+	// If fetchedAt was refreshed by the insert, cache is still fresh (only ~50ms
+	// since insert, well within 100ms TTL). Stale fallback should return 5100.
+	// If fetchedAt was NOT refreshed, the cache expired (>100ms since original
+	// read) and we'd get 0 (fail-open).
+	total, err = cache.MonthlyLLMCostMillicents(ctx, "t1")
+	if err != nil {
+		t.Fatalf("expected stale cache hit, got err: %v", err)
+	}
+	if total != 5100 {
+		t.Fatalf("near-expiry insert freshness: got %d, want 5100", total)
+	}
+}
+
 // TestLLMCostCacheReadInsertInterleaving is a regression test for the
 // read/insert race: a slow DB refresh must NOT overwrite a cache that was
 // bumped by a concurrent insert.
@@ -238,7 +290,7 @@ func TestLLMCostCacheReadInsertInterleaving(t *testing.T) {
 
 	// This read triggers the hook: DB read completes, then insert bumps cache,
 	// then the read tries to overwrite — version check should prevent it.
-	total, err = cache.MonthlyLLMCostMillicents(ctx, "t1")
+	_, err = cache.MonthlyLLMCostMillicents(ctx, "t1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +353,7 @@ func TestLLMCostCacheColdCacheInterleaving(t *testing.T) {
 
 	// DB read succeeds (returns 3000 or 3200 depending on insert timing).
 	// Despite version mismatch, the result must be installed because cached is nil.
-	total, err := cache.MonthlyLLMCostMillicents(ctx, "t1")
+	_, err := cache.MonthlyLLMCostMillicents(ctx, "t1")
 	if err != nil {
 		t.Fatal(err)
 	}

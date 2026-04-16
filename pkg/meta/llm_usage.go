@@ -80,7 +80,7 @@ func (c *LLMCostCache) InsertLLMUsage(ctx context.Context, tenantID, taskType, t
 		if c.cached != nil {
 			c.cached = &llmCostCacheEntry{
 				total:     c.cached.total + costMillicents,
-				fetchedAt: c.cached.fetchedAt,
+				fetchedAt: time.Now(),
 			}
 		}
 		c.version++
