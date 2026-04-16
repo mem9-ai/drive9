@@ -17,7 +17,10 @@ import (
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/mem9-ai/dat9/pkg/backend"
+	"github.com/mem9-ai/dat9/pkg/buildinfo"
 	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -27,7 +30,6 @@ import (
 	"github.com/mem9-ai/dat9/pkg/tenant/db9"
 	"github.com/mem9-ai/dat9/pkg/tenant/starter"
 	"github.com/mem9-ai/dat9/pkg/tenant/tidbzero"
-	"go.uber.org/zap"
 )
 
 const (
@@ -40,6 +42,12 @@ func main() {
 		switch os.Args[1] {
 		case "-h", "--help", "help":
 			usage(os.Stdout, 0)
+			return
+		case "version":
+			if len(os.Args) != 2 {
+				usage(os.Stderr, 2)
+			}
+			_, _ = fmt.Fprint(os.Stdout, versionText())
 			return
 		case "schema":
 			die(runSchemaCommand(os.Args[2:]))
@@ -61,6 +69,7 @@ func main() {
 	}
 	defer func() { _ = srvLogger.Sync() }()
 	logger.Set(srvLogger)
+	logger.Info(context.Background(), "build_info", buildinfo.Fields("drive9-server")...)
 
 	metaDSN := os.Getenv("DRIVE9_META_DSN")
 	if metaDSN == "" {
@@ -215,9 +224,14 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+func versionText() string {
+	return buildinfo.String("drive9-server")
+}
+
 func usage(out io.Writer, exitCode int) {
 	_, _ = fmt.Fprintf(out, `usage:
   drive9-server [listen-addr]
+  drive9-server version
   drive9-server schema dump-init-sql --provider <db9|tidb_zero|tidb_cloud_starter>
 
 environment:

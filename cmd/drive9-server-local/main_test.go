@@ -6,11 +6,19 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
+
+func TestVersionTextUsesDrive9ServerLocalComponent(t *testing.T) {
+	got := versionText()
+	if !strings.Contains(got, "component: drive9-server-local\n") {
+		t.Fatalf("versionText() missing drive9-server-local component line: %q", got)
+	}
+}
 
 func TestDetectLocalTiDBEmbeddingMode(t *testing.T) {
 	origDetector := localTiDBEmbeddingModeDetector
