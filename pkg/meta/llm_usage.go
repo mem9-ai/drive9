@@ -2,6 +2,7 @@ package meta
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/metrics"
@@ -48,16 +49,19 @@ type llmCostCacheEntry struct {
 // It also delegates InsertLLMUsage to the underlying Store so callers can
 // use a single object for both reads and writes.
 type LLMCostCache struct {
-	store    *Store
-	tenantID string
-	ttl      time.Duration
+	store *Store
+	ttl   time.Duration
 
+	mu     sync.Mutex
 	cached *llmCostCacheEntry
 }
 
 // NewLLMCostCache creates a cache that wraps meta store budget lookups.
 func NewLLMCostCache(store *Store, tenantID string, ttl time.Duration) *LLMCostCache {
-	return &LLMCostCache{store: store, tenantID: tenantID, ttl: ttl}
+	// tenantID is accepted for API compatibility but not stored — callers
+	// pass tenantID per-call via MonthlyLLMCostMillicents.
+	_ = tenantID
+	return &LLMCostCache{store: store, ttl: ttl}
 }
 
 // InsertLLMUsage delegates to the underlying Store.
@@ -71,15 +75,20 @@ func (c *LLMCostCache) InsertLLMUsage(ctx context.Context, tenantID, taskType, t
 func (c *LLMCostCache) MonthlyLLMCostMillicents(ctx context.Context, tenantID string) (int64, error) {
 	total, err := c.store.MonthlyLLMCostMillicents(ctx, tenantID)
 	if err == nil {
+		c.mu.Lock()
 		c.cached = &llmCostCacheEntry{total: total, fetchedAt: time.Now()}
+		c.mu.Unlock()
 		return total, nil
 	}
 	// Meta store failure: return stale cache if available and not expired.
-	if c.cached != nil && time.Since(c.cached.fetchedAt) < c.ttl {
+	c.mu.Lock()
+	entry := c.cached
+	c.mu.Unlock()
+	if entry != nil && time.Since(entry.fetchedAt) < c.ttl {
 		metrics.RecordOperation("llm_cost_budget", "cache_stale_hit", "ok", 0)
-		return c.cached.total, nil
+		return entry.total, nil
 	}
 	// Cold start or cache expired: fail-open.
 	metrics.RecordOperation("llm_cost_budget", "cache_miss_fail_open", "ok", 0)
-	return 0, err
+	return 0, nil
 }

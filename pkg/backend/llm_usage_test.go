@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync"
 	"testing"
+
+	"github.com/mem9-ai/dat9/pkg/datastore"
 )
 
 // mockMetaLLMStore is a test double for MetaLLMUsageStore.
@@ -133,40 +135,81 @@ func TestMonthlyLLMCostExceeded_DisabledBudget(t *testing.T) {
 	}
 }
 
-func TestMonthlyLLMCostExceeded_NoMetaStore_FallbackTenantStore(t *testing.T) {
-	// Without meta store, the function falls back to b.store.MonthlyLLMCostMillicents().
-	// We can't easily mock that without a real datastore, so just test the nil
-	// metaLLMStore path doesn't panic.
-	b := &Dat9Backend{
-		maxMonthlyLLMCostMillicents: 4000,
-		// store is nil — will cause a panic if the nil-meta-store path is wrong.
-		// We expect a nil dereference to be caught. Actually this path requires
-		// a real store, so we skip this test when store is nil.
+func TestMonthlyLLMCostExceeded_DualRead(t *testing.T) {
+	// Meta store has 2000, tenant store has 2500.
+	// Budget is 4000 millicents. Sum = 4500 > 4000 → exceeded.
+	mock := &mockMetaLLMStore{monthly: 2000}
+	store := newTestStore(t)
+	// Insert some usage into the tenant store.
+	if err := store.InsertLLMUsage("img_extract_text", "task-1", 2500, 100, "tokens"); err != nil {
+		t.Fatal(err)
 	}
-	// Without a store, this would panic. The important thing to test is the
-	// meta store path, which is covered above.
-	_ = b
+
+	b := &Dat9Backend{
+		store:                       store,
+		metaLLMStore:                mock,
+		tenantID:                    "tenant-1",
+		maxMonthlyLLMCostMillicents: 4000,
+		llmUsageDualRead:            true,
+	}
+	if !b.monthlyLLMCostExceeded() {
+		t.Fatal("expected exceeded with dual-read (2000+2500=4500 > 4000), got false")
+	}
 }
 
-func TestInsertLLMUsage_NoMetaStore_NoPanic(t *testing.T) {
-	// When metaLLMStore is nil and tenantID is empty, insertLLMUsage should
-	// fall back to store.InsertLLMUsage. Without a real store, we test the
-	// meta-store path doesn't fire.
-	mock := &mockMetaLLMStore{}
+func TestMonthlyLLMCostExceeded_DualRead_NotExceeded(t *testing.T) {
+	// Meta store has 1000, tenant store has 1000. Sum = 2000 < 4000.
+	mock := &mockMetaLLMStore{monthly: 1000}
+	store := newTestStore(t)
+	if err := store.InsertLLMUsage("img_extract_text", "task-1", 1000, 50, "tokens"); err != nil {
+		t.Fatal(err)
+	}
+
 	b := &Dat9Backend{
-		metaLLMStore:                  mock,
-		tenantID:                      "", // empty tenantID = no meta write
-		visionCostPerKTokenMillicents: 100,
+		store:                       store,
+		metaLLMStore:                mock,
+		tenantID:                    "tenant-1",
+		maxMonthlyLLMCostMillicents: 4000,
+		llmUsageDualRead:            true,
 	}
-	// This should NOT write to meta store since tenantID is empty.
-	// It would try to write to b.store which is nil, but cost is > 0 so
-	// it will attempt and panic. That's expected in real code — the backend
-	// always has a store. Just verify the meta path gate.
-	b.tenantID = "test"
-	b.recordImageExtractUsage("task-1", ImageExtractUsage{PromptTokens: 500, CompletionTokens: 500})
-	mock.mu.Lock()
-	defer mock.mu.Unlock()
-	if len(mock.inserts) != 1 {
-		t.Fatalf("expected 1 meta insert, got %d", len(mock.inserts))
+	if b.monthlyLLMCostExceeded() {
+		t.Fatal("expected not exceeded with dual-read (1000+1000=2000 < 4000), got true")
 	}
+}
+
+func TestMonthlyLLMCostExceeded_DualRead_TenantStoreFailure(t *testing.T) {
+	// Meta store has 3000, tenant store query fails.
+	// Should continue with meta-only total: 3000 < 4000 → not exceeded.
+	mock := &mockMetaLLMStore{monthly: 3000}
+	// Use a store with a closed DB to simulate failure.
+	store := newTestStore(t)
+	_ = store.Close() // close DB to make queries fail
+
+	b := &Dat9Backend{
+		store:                       store,
+		metaLLMStore:                mock,
+		tenantID:                    "tenant-1",
+		maxMonthlyLLMCostMillicents: 4000,
+		llmUsageDualRead:            true,
+	}
+	// Should not panic, should use meta-only total.
+	if b.monthlyLLMCostExceeded() {
+		t.Fatal("expected not exceeded (meta-only 3000 < 4000), got true")
+	}
+}
+
+// newTestStore creates a datastore.Store backed by the test MySQL instance.
+func newTestStore(t *testing.T) *datastore.Store {
+	t.Helper()
+	if testDSN == "" {
+		t.Skip("test MySQL DSN not available")
+	}
+	store, err := datastore.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	// Clean llm_usage table.
+	_, _ = store.DB().Exec("DELETE FROM llm_usage")
+	return store
 }

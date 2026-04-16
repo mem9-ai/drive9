@@ -50,7 +50,7 @@ func TestInsertAndQueryLLMUsage(t *testing.T) {
 	}
 }
 
-func TestLLMCostCacheStaleHit(t *testing.T) {
+func TestLLMCostCacheFreshHit(t *testing.T) {
 	s := newControlStore(t)
 	_, _ = s.DB().Exec("DELETE FROM llm_usage")
 
@@ -82,5 +82,94 @@ func TestLLMCostCacheStaleHit(t *testing.T) {
 	}
 	if total != 1500 {
 		t.Fatalf("got %d, want 1500", total)
+	}
+}
+
+func TestLLMCostCacheStaleHit(t *testing.T) {
+	s := newControlStore(t)
+	_, _ = s.DB().Exec("DELETE FROM llm_usage")
+
+	ctx := context.Background()
+	if err := s.InsertLLMUsage(ctx, "t1", "img_extract_text", "task-1", 2000, 100, "tokens"); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := NewLLMCostCache(s, "t1", 1*time.Hour) // long TTL so cache won't expire
+
+	// Populate cache.
+	total, err := cache.MonthlyLLMCostMillicents(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2000 {
+		t.Fatalf("got %d, want 2000", total)
+	}
+
+	// Close the store's DB to simulate meta store failure.
+	_ = s.Close()
+
+	// Cache should return stale value.
+	total, err = cache.MonthlyLLMCostMillicents(ctx, "t1")
+	if err != nil {
+		t.Fatalf("expected stale cache hit (no error), got err: %v", err)
+	}
+	if total != 2000 {
+		t.Fatalf("stale cache: got %d, want 2000", total)
+	}
+}
+
+func TestLLMCostCacheExpired_FailOpen(t *testing.T) {
+	s := newControlStore(t)
+	_, _ = s.DB().Exec("DELETE FROM llm_usage")
+
+	ctx := context.Background()
+	if err := s.InsertLLMUsage(ctx, "t1", "img_extract_text", "task-1", 3000, 100, "tokens"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a very short TTL that will expire immediately.
+	cache := NewLLMCostCache(s, "t1", 1*time.Nanosecond)
+
+	// Populate cache.
+	total, err := cache.MonthlyLLMCostMillicents(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3000 {
+		t.Fatalf("got %d, want 3000", total)
+	}
+
+	// Wait for cache to expire.
+	time.Sleep(10 * time.Millisecond)
+
+	// Close the store's DB to simulate meta store failure.
+	_ = s.Close()
+
+	// Cache is expired + meta store down → fail-open (return 0, nil).
+	total, err = cache.MonthlyLLMCostMillicents(ctx, "t1")
+	if err != nil {
+		t.Fatalf("expected fail-open (no error), got err: %v", err)
+	}
+	if total != 0 {
+		t.Fatalf("fail-open: got %d, want 0", total)
+	}
+}
+
+func TestLLMCostCacheColdStart_FailOpen(t *testing.T) {
+	s := newControlStore(t)
+
+	// Close immediately — meta store is unreachable from the start.
+	_ = s.Close()
+
+	cache := NewLLMCostCache(s, "t1", 30*time.Second)
+	ctx := context.Background()
+
+	// Cold start + meta store down → fail-open (return 0, nil).
+	total, err := cache.MonthlyLLMCostMillicents(ctx, "t1")
+	if err != nil {
+		t.Fatalf("expected fail-open (no error), got err: %v", err)
+	}
+	if total != 0 {
+		t.Fatalf("cold-start fail-open: got %d, want 0", total)
 	}
 }
