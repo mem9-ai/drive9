@@ -1,0 +1,41 @@
+{
+  "name": "drive9",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for drive9 — an agent-native filesystem with semantic search",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean --platform node",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "drive9",
+    "filesystem",
+    "sdk"
+  ],
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "msw": "^2.7",
+    "tsup": "^8.4",
+    "typescript": "^5.8",
+    "vitest": "^3.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
