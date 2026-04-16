@@ -2,10 +2,18 @@ package main
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
 )
+
+func TestVersionTextUsesDrive9ServerComponent(t *testing.T) {
+	got := versionText()
+	if !strings.Contains(got, "component: drive9-server\n") {
+		t.Fatalf("versionText() missing drive9-server component line: %q", got)
+	}
+}
 
 func TestBuildBackendOptionsFromEnvAudioDisabled(t *testing.T) {
 	keys := []string{

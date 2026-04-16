@@ -12,18 +12,26 @@ GOARCH ?= $(HOST_GOARCH)
 
 APP_NAME ?= drive9-server
 CLI_NAME ?= drive9
+LOCAL_SERVER_NAME ?= drive9-server-local
 
 BIN_DIR ?= bin
+# Use an absolute GOBIN for tool installation; `go install` is more predictable
+# with an absolute path than a repo-relative bin dir.
+BIN_DIR_ABS := $(abspath $(BIN_DIR))
 DIST_DIR ?= dist
 SERVER_BIN ?= $(BIN_DIR)/$(APP_NAME)
 CLI_BIN ?= $(BIN_DIR)/$(CLI_NAME)
-LOCAL_BIN ?= $(CURDIR)/bin
+LOCAL_SERVER_BIN ?= $(BIN_DIR)/$(LOCAL_SERVER_NAME)
+
 VERSION ?=
 GIT_HASH ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+
 CLI_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 GOLANGCI_LINT_VERSION ?= v2.5.0
-GOLANGCI_LINT_BIN ?= $(LOCAL_BIN)/golangci-lint
+GOLANGCI_LINT_BIN ?= $(BIN_DIR)/golangci-lint
 
 IMAGE_REPO ?= drive9-server
 IMAGE_TAG ?= latest
@@ -31,7 +39,12 @@ IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
 LINT_TIMEOUT ?= 10m
 TEST_P ?=
 
-.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-cli build-cli-release run-server-local docker-build
+BUILDINFO_LDFLAGS = -X github.com/mem9-ai/dat9/pkg/buildinfo.Version=$(if $(VERSION),$(VERSION),dev) \
+	-X github.com/mem9-ai/dat9/pkg/buildinfo.GitHash=$(GIT_HASH) \
+	-X github.com/mem9-ai/dat9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
+	-X github.com/mem9-ai/dat9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
+
+.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release run-server-local docker-build
 
 mod:
 	$(GO) mod tidy
@@ -49,7 +62,13 @@ test:
 		test_p_flag="-p $(TEST_P)"; \
 	fi; \
 	if [ -z "$${DRIVE9_TEST_MYSQL_DSN:-}" ] && command -v podman >/dev/null 2>&1; then \
-		source ./scripts/test-podman.sh; \
+		if podman_env="$$(bash -lc 'source ./scripts/test-podman.sh && env | grep -E "^(DOCKER_HOST|TESTCONTAINERS_RYUK_DISABLED)="')"; then \
+			while IFS= read -r line; do \
+				export "$$line"; \
+			done <<< "$$podman_env"; \
+		else \
+			echo "make test: Podman testcontainers setup unavailable, falling back to default runtime" >&2; \
+		fi; \
 	fi; \
 	$(GO) test $$test_p_flag -v ./...
 
@@ -70,9 +89,9 @@ lint:
 install-lint:
 	@echo "Checking for golangci-lint..."
 	@if [ ! -x "$(GOLANGCI_LINT_BIN)" ]; then \
-		echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION) to $(LOCAL_BIN)..."; \
-		mkdir -p "$(LOCAL_BIN)"; \
-		GOBIN="$(LOCAL_BIN)" $(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
+		echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION) to $(BIN_DIR)..."; \
+		mkdir -p "$(BIN_DIR)"; \
+		GOBIN="$(BIN_DIR_ABS)" $(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
 	else \
 		echo "golangci-lint already installed at $(GOLANGCI_LINT_BIN)"; \
 	fi
@@ -81,22 +100,18 @@ build: build-server build-cli
 
 build-server:
 	mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(SERVER_BIN) ./cmd/drive9-server
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(SERVER_BIN) ./cmd/drive9-server
 
-run-server-local:
-	@source ./scripts/drive9-server-local-env.sh && $(GO) run ./cmd/drive9-server-local
+build-server-local:
+	mkdir -p $(BIN_DIR)
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(LOCAL_SERVER_BIN) ./cmd/drive9-server-local
+
+run-server-local: build-server-local
+	@source ./scripts/drive9-server-local-env.sh && "./$(LOCAL_SERVER_BIN)"
 
 build-cli:
 	mkdir -p $(BIN_DIR)
-	@set -euo pipefail; \
-	ldflags="-X main.gitHash=$(GIT_HASH)"; \
-	if [ -n "$(VERSION)" ]; then \
-		ldflags="$$ldflags -X main.version=$(VERSION)"; \
-	else \
-		ldflags="$$ldflags -X main.version=dev"; \
-	fi; \
-	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$$ldflags" -o $(CLI_BIN) ./cmd/drive9; \
-	true
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(CLI_BIN) ./cmd/drive9
 
 build-cli-release:
 	@set -euo pipefail; \

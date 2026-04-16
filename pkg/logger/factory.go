@@ -5,14 +5,42 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+const envBenchTimingLogEnabled = "DRIVE9_BENCH_TIMING_LOG_ENABLED"
+
+const (
+	benchTimingLogUnknown uint32 = iota
+	benchTimingLogDisabled
+	benchTimingLogEnabled
+)
+
+var benchTimingLogState atomic.Uint32
+
 func NewServerLogger() (*zap.Logger, error) {
 	return zap.NewProduction()
+}
+
+func BenchTimingLogEnabled() bool {
+	switch benchTimingLogState.Load() {
+	case benchTimingLogDisabled:
+		return false
+	case benchTimingLogEnabled:
+		return true
+	}
+
+	enabled := envBool(envBenchTimingLogEnabled, false)
+	if enabled {
+		benchTimingLogState.Store(benchTimingLogEnabled)
+		return true
+	}
+	benchTimingLogState.Store(benchTimingLogDisabled)
+	return false
 }
 
 func CLIEnabled() bool {
@@ -92,4 +120,8 @@ func envBool(key string, fallback bool) bool {
 		return fallback
 	}
 	return v
+}
+
+func resetBenchTimingLogEnabledForTest() {
+	benchTimingLogState.Store(benchTimingLogUnknown)
 }

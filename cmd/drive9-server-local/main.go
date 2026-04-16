@@ -9,34 +9,51 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/mem9-ai/dat9/pkg/backend"
+	"github.com/mem9-ai/dat9/pkg/buildinfo"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/server"
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
-	"go.uber.org/zap"
 )
 
 const (
 	defaultListenAddr     = "127.0.0.1:9009"
 	defaultS3Dir          = "/tmp/drive9-local-s3"
+	defaultS3Region       = "us-east-1"
 	envLocalEmbeddingMode = "DRIVE9_LOCAL_EMBEDDING_MODE"
 )
 
-func main() {
-	startupCtx := context.Background()
-	startupStart := time.Now()
-	logLocalStartupStep(startupCtx, startupStart, startupStart, "process_start")
+type localS3Config struct {
+	Mode    string
+	Dir     string
+	Bucket  string
+	Region  string
+	Prefix  string
+	RoleARN string
+}
 
+func main() {
 	if len(os.Args) > 2 {
 		usage()
 	}
+	if len(os.Args) == 2 && os.Args[1] == "version" {
+		_, _ = fmt.Fprint(os.Stdout, versionText())
+		return
+	}
+
+	startupCtx := context.Background()
+	startupStart := time.Now()
+	logLocalStartupStep(startupCtx, startupStart, startupStart, "process_start")
 
 	addr := envOr("DRIVE9_LISTEN_ADDR", defaultListenAddr)
 	if len(os.Args) == 2 {
@@ -49,6 +66,7 @@ func main() {
 	}
 	defer func() { _ = srvLogger.Sync() }()
 	logger.Set(srvLogger)
+	logger.Info(startupCtx, "build_info", buildinfo.Fields("drive9-server-local")...)
 	logLocalStartupStep(startupCtx, startupStart, time.Now(), "logger_ready")
 
 	localDSN := strings.TrimSpace(os.Getenv("DRIVE9_LOCAL_DSN"))
@@ -57,6 +75,10 @@ func main() {
 	}
 	localInitSchema := envBool("DRIVE9_LOCAL_INIT_SCHEMA", false)
 	requestedEmbeddingMode, explicitEmbeddingMode, err := localEmbeddingModeFromEnv()
+	if err != nil {
+		die(err)
+	}
+	s3cfg, err := localS3ConfigFromEnv()
 	if err != nil {
 		die(err)
 	}
@@ -123,18 +145,43 @@ func main() {
 		backendOpts.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
 	}
 
-	s3Dir := envOr("DRIVE9_S3_DIR", defaultS3Dir)
-	// Even in local single-tenant mode we keep the same S3-facing upload code path
-	// by backing it with the local mock implementation.
+	var (
+		s3c     s3client.S3Client
+		localS3 *s3client.LocalS3Client
+	)
 	stepStart = time.Now()
-	localS3, err := s3client.NewLocal(s3Dir, publicBaseURL(addr)+"/s3")
-	if err != nil {
-		die(fmt.Errorf("create local s3: %w", err))
+	switch s3cfg.Mode {
+	case "aws":
+		s3c, err = s3client.NewAWS(startupCtx, s3client.AWSConfig{
+			Region:  s3cfg.Region,
+			Bucket:  s3cfg.Bucket,
+			Prefix:  s3cfg.Prefix,
+			RoleARN: s3cfg.RoleARN,
+		})
+		if err != nil {
+			die(fmt.Errorf("create aws s3 client: %w", err))
+		}
+		logLocalStartupStep(startupCtx, startupStart, stepStart, "create_aws_s3",
+			zap.String("bucket", s3cfg.Bucket),
+			zap.String("region", s3cfg.Region),
+			zap.String("prefix", s3cfg.Prefix),
+			zap.String("role", localS3RoleLogValue(s3cfg.RoleARN)))
+	case "local":
+		// Even in local single-tenant mode we keep the same S3-facing upload code path
+		// by backing it with the local mock implementation.
+		localS3, err = s3client.NewLocal(s3cfg.Dir, publicBaseURL(addr)+"/s3")
+		if err != nil {
+			die(fmt.Errorf("create local s3: %w", err))
+		}
+		s3c = localS3
+		logLocalStartupStep(startupCtx, startupStart, stepStart, "create_local_s3",
+			zap.String("dir", s3cfg.Dir))
+	default:
+		die(fmt.Errorf("unsupported local S3 mode %q", s3cfg.Mode))
 	}
-	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_local_s3")
 
 	stepStart = time.Now()
-	b, err := backend.NewWithS3ModeAndOptions(store, localS3, true, backendOpts)
+	b, err := backend.NewWithS3ModeAndOptions(store, s3c, true, backendOpts)
 	if err != nil {
 		die(fmt.Errorf("create local backend: %w", err))
 	}
@@ -144,7 +191,7 @@ func main() {
 	if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
 		Backend:          b,
 		LocalS3:          localS3,
-		S3Dir:            s3Dir,
+		S3Dir:            s3cfg.localDir(),
 		MaxUploadBytes:   maxUploadBytes,
 		Logger:           srvLogger,
 		SemanticEmbedder: semanticEmbedder,
@@ -157,7 +204,7 @@ func main() {
 	srv := server.NewWithConfig(server.Config{
 		Backend:          b,
 		LocalS3:          localS3,
-		S3Dir:            s3Dir,
+		S3Dir:            s3cfg.localDir(),
 		MaxUploadBytes:   maxUploadBytes,
 		Logger:           srvLogger,
 		SemanticEmbedder: semanticEmbedder,
@@ -170,7 +217,12 @@ func main() {
 	logger.Info(startupCtx, "local_server_mode",
 		zap.String("listen_addr", addr),
 		zap.String("local_dsn", redactDSN(localDSN)),
-		zap.String("s3_dir", s3Dir),
+		zap.String("s3_mode", s3cfg.Mode),
+		zap.String("s3_dir", s3cfg.localDir()),
+		zap.String("s3_bucket", s3cfg.Bucket),
+		zap.String("s3_region", s3cfg.Region),
+		zap.String("s3_prefix", s3cfg.Prefix),
+		zap.String("s3_role", localS3RoleLogValue(s3cfg.RoleARN)),
 		zap.Bool("local_init_schema", localInitSchema),
 		zap.String("requested_embedding_mode", localEmbeddingModeLabel(requestedEmbeddingMode, explicitEmbeddingMode)),
 		zap.String("embedding_mode", string(localEmbeddingMode)),
@@ -197,6 +249,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage: drive9-server-local [listen-addr]
+       drive9-server-local version
 
 environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: 127.0.0.1:9009)
@@ -204,7 +257,15 @@ environment:
   DRIVE9_LOCAL_DSN   local tenant TiDB/MySQL DSN (required)
   DRIVE9_LOCAL_INIT_SCHEMA initialize tenant schema on startup (default: false)
   DRIVE9_LOCAL_EMBEDDING_MODE auto|app|detect (default: auto when initing schema, detect otherwise)
-  DRIVE9_S3_DIR      local S3 mock root directory (default: /tmp/drive9-local-s3)
+  DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
+
+  S3 storage:
+  Set DRIVE9_S3_BUCKET to enable AWS S3 mode.
+  DRIVE9_S3_BUCKET   S3 bucket name (enables AWS S3 mode; mutually exclusive with DRIVE9_S3_DIR)
+  DRIVE9_S3_REGION   AWS region (default: us-east-1)
+  DRIVE9_S3_PREFIX   S3 key prefix (optional)
+  DRIVE9_S3_ROLE_ARN IAM role ARN to assume via STS (optional)
+  DRIVE9_S3_DIR      local S3 mock root directory (default: /tmp/drive9-local-s3, only used without DRIVE9_S3_BUCKET)
 
   Query embedding (app-side semantic query embedding for grep):
   DRIVE9_QUERY_EMBED_API_BASE OpenAI-compatible base URL (optional)
@@ -254,6 +315,10 @@ environment:
 	os.Exit(2)
 }
 
+func versionText() string {
+	return buildinfo.String("drive9-server-local")
+}
+
 func die(err error) {
 	if err == nil {
 		return
@@ -289,6 +354,45 @@ func logLocalStartupStep(ctx context.Context, startupStart, stepStart time.Time,
 	}
 	fields = append(fields, extra...)
 	logger.Info(ctx, "local_server_startup_step", fields...)
+}
+
+func localS3ConfigFromEnv() (localS3Config, error) {
+	bucket := strings.TrimSpace(os.Getenv("DRIVE9_S3_BUCKET"))
+	dirSet := normalizeLocalS3Dir(os.Getenv("DRIVE9_S3_DIR"))
+	defaultDir := defaultLocalS3Dir()
+	if bucket != "" {
+		if dirSet != "" && dirSet != defaultDir {
+			return localS3Config{}, fmt.Errorf("DRIVE9_S3_BUCKET and DRIVE9_S3_DIR are mutually exclusive; unset DRIVE9_S3_DIR when using AWS S3 mode")
+		}
+		return localS3Config{
+			Mode:    "aws",
+			Bucket:  bucket,
+			Region:  envOr("DRIVE9_S3_REGION", defaultS3Region),
+			Prefix:  strings.TrimSpace(os.Getenv("DRIVE9_S3_PREFIX")),
+			RoleARN: strings.TrimSpace(os.Getenv("DRIVE9_S3_ROLE_ARN")),
+		}, nil
+	}
+	if dirSet == "" {
+		dirSet = defaultDir
+	}
+	return localS3Config{
+		Mode: "local",
+		Dir:  dirSet,
+	}, nil
+}
+
+func (c localS3Config) localDir() string {
+	if c.Mode != "local" {
+		return ""
+	}
+	return c.Dir
+}
+
+func localS3RoleLogValue(roleARN string) string {
+	if roleARN == "" {
+		return "default-credentials"
+	}
+	return roleARN
 }
 
 var (
@@ -487,10 +591,26 @@ func redactDSN(dsn string) string {
 }
 
 func envOr(key, fallback string) string {
-	if value := os.Getenv(key); value != "" {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 		return value
 	}
 	return fallback
+}
+
+func defaultLocalS3Dir() string {
+	base := strings.TrimSpace(os.Getenv("TMPDIR"))
+	if base == "" {
+		return defaultS3Dir
+	}
+	return filepath.Join(base, "drive9-local-s3")
+}
+
+func normalizeLocalS3Dir(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return filepath.Clean(value)
 }
 
 func envBool(key string, fallback bool) bool {

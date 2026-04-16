@@ -267,6 +267,63 @@ c.Write("/output.json", result)</code>
                         <span class="replaces-item">HTTP boilerplate</span>
                     </div>
                 </div>
+
+                <!-- Feature 6: Python SDK -->
+                <div class="feature-card">
+                    <div class="feature-icon">🐍</div>
+                    <h3>Python SDK</h3>
+                    <p>Build AI pipelines with the Python SDK. Streaming uploads, vault secrets, and semantic search out of the box.</p>
+                    <div class="code-block">
+                        <code>from drive9 import Client<br>
+<br>
+c = Client("http://localhost:9009", api_key="")<br>
+c.write("/data/hello.txt", b"Hello, drive9!")<br>
+data = c.read("/data/hello.txt")</code>
+                    </div>
+                    <div class="replaces">
+                        <span class="replaces-label">replaces</span>
+                        <span class="replaces-item">boto3</span>
+                        <span class="replaces-item">requests boilerplate</span>
+                    </div>
+                </div>
+
+                <!-- Feature 7: TypeScript SDK -->
+                <div class="feature-card">
+                    <div class="feature-icon">📘</div>
+                    <h3>TypeScript SDK</h3>
+                    <p>Integrate drive9 into Node.js and browser apps with full type safety. CJS and ESM builds included.</p>
+                    <div class="code-block">
+                        <code>import { Client } from "drive9";<br>
+<br>
+const c = new Client("http://localhost:9009", "");<br>
+await c.write("/data/hello.txt", new TextEncoder().encode("Hello"));<br>
+const data = await c.read("/data/hello.txt");</code>
+                    </div>
+                    <div class="replaces">
+                        <span class="replaces-label">replaces</span>
+                        <span class="replaces-item">S3 SDKs</span>
+                        <span class="replaces-item">HTTP boilerplate</span>
+                    </div>
+                </div>
+
+                <!-- Feature 8: Rust SDK -->
+                <div class="feature-card">
+                    <div class="feature-icon">🦀</div>
+                    <h3>Rust SDK</h3>
+                    <p>High-performance async Rust SDK with Tokio. Zero-allocation reads and native multipart resume.</p>
+                    <div class="code-block">
+                        <code>use drive9::Client;<br>
+<br>
+let c = Client::new("http://localhost:9009", "test-key");<br>
+c.write("/data/hello.txt", b"Hello, drive9!").await?;<br>
+let data = c.read("/data/hello.txt").await?;</code>
+                    </div>
+                    <div class="replaces">
+                        <span class="replaces-label">replaces</span>
+                        <span class="replaces-item">rusoto</span>
+                        <span class="replaces-item">HTTP boilerplate</span>
+                    </div>
+                </div>
             </div>
         </div>
     </section>
@@ -360,11 +417,18 @@ c.Write("/output.json", result)</code>
     <!-- SDK Section -->
     <section class="sdk-section" id="sdk">
         <div class="container">
-            <h2 class="section-title">Go SDK</h2>
-            <p class="section-subtitle">Build agent tools with streaming, resume, and context support.</p>
+            <h2 class="section-title">Multi-language SDKs</h2>
+            <p class="section-subtitle">Build agent tools with streaming, resume, and context support in your language of choice.</p>
 
             <div class="sdk-code">
-                <div class="code-window">
+                <div class="sdk-tabs">
+                    <button class="sdk-tab active" data-tab="go">Go</button>
+                    <button class="sdk-tab" data-tab="python">Python</button>
+                    <button class="sdk-tab" data-tab="ts">TypeScript</button>
+                    <button class="sdk-tab" data-tab="rust">Rust</button>
+                </div>
+
+                <div class="code-window sdk-panel active" data-panel="go">
                     <div class="code-window-header">
                         <div class="code-window-dots">
                             <span></span>
@@ -379,29 +443,29 @@ c.Write("/output.json", result)</code>
     <span class="code-string">"context"</span>
     <span class="code-string">"fmt"</span>
     <span class="code-string">"log"</span>
-    
+
     <span class="code-string">"github.com/mem9-ai/drive9/pkg/client"</span>
 )
 
 <span class="code-keyword">func</span> <span class="code-function">main</span>() {
     ctx := context.Background()
-    
+
     <span class="code-comment">// Create client</span>
     c := client.New(<span class="code-string">"http://localhost:9009"</span>, <span class="code-string">""</span>)
-    
+
     <span class="code-comment">// Write file</span>
     err := c.Write(ctx, <span class="code-string">"/data/hello.txt"</span>, []byte(<span class="code-string">"Hello, drive9!"</span>))
     <span class="code-keyword">if</span> err != <span class="code-keyword">nil</span> {
         log.Fatal(err)
     }
-    
+
     <span class="code-comment">// Read file</span>
     data, err := c.Read(ctx, <span class="code-string">"/data/hello.txt"</span>)
     <span class="code-keyword">if</span> err != <span class="code-keyword">nil</span> {
         log.Fatal(err)
     }
     fmt.Println(<span class="code-keyword">string</span>(data))
-    
+
     <span class="code-comment">// List directory</span>
     entries, err := c.List(ctx, <span class="code-string">"/data/"</span>)
     <span class="code-keyword">if</span> err != <span class="code-keyword">nil</span> {
@@ -410,12 +474,125 @@ c.Write("/output.json", result)</code>
     <span class="code-keyword">for</span> _, e := <span class="code-keyword">range</span> entries {
         fmt.Println(e.Name, e.Size, e.ModTime)
     }
-    
+
     <span class="code-comment">// Zero-copy link</span>
     err = c.Copy(ctx, <span class="code-string">"/data/hello.txt"</span>, <span class="code-string">"/backup/hello.txt"</span>)
     <span class="code-keyword">if</span> err != <span class="code-keyword">nil</span> {
         log.Fatal(err)
     }
+}</code></pre>
+                </div>
+
+                <div class="code-window sdk-panel" data-panel="python">
+                    <div class="code-window-header">
+                        <div class="code-window-dots">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                        </div>
+                        <span class="code-window-title">main.py</span>
+                    </div>
+                    <pre class="code-window-content"><code><span class="code-keyword">from</span> drive9 <span class="code-keyword">import</span> Client
+
+<span class="code-comment"># Create client</span>
+c = Client(<span class="code-string">"http://localhost:9009"</span>, api_key=<span class="code-string">""</span>)
+
+<span class="code-comment"># Write file</span>
+c.write(<span class="code-string">"/data/hello.txt"</span>, <span class="code-string">b"Hello, drive9!"</span>)
+
+<span class="code-comment"># Read file</span>
+data = c.read(<span class="code-string">"/data/hello.txt"</span>)
+<span class="code-keyword">print</span>(data.decode(<span class="code-string">"utf-8"</span>))
+
+<span class="code-comment"># List directory</span>
+entries = c.list(<span class="code-string">"/data/"</span>)
+<span class="code-keyword">for</span> e <span class="code-keyword">in</span> entries:
+    <span class="code-keyword">print</span>(e.name, e.size, e.mtime)
+
+<span class="code-comment"># Zero-copy link</span>
+c.copy(<span class="code-string">"/data/hello.txt"</span>, <span class="code-string">"/backup/hello.txt"</span>)
+
+<span class="code-comment"># Stream upload</span>
+<span class="code-keyword">with</span> <span class="code-keyword">open</span>(<span class="code-string">"large.bin"</span>, <span class="code-string">"rb"</span>) <span class="code-keyword">as</span> f:
+    c.write_stream(<span class="code-string">"/data/large.bin"</span>, f, size=<span class="code-number">1024</span>*<span class="code-number">1024</span>)</code></pre>
+                </div>
+
+                <div class="code-window sdk-panel" data-panel="ts">
+                    <div class="code-window-header">
+                        <div class="code-window-dots">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                        </div>
+                        <span class="code-window-title">main.ts</span>
+                    </div>
+                    <pre class="code-window-content"><code><span class="code-keyword">import</span> { Client } <span class="code-keyword">from</span> <span class="code-string">"drive9"</span>;
+
+<span class="code-keyword">async function</span> <span class="code-function">main</span>() {
+    <span class="code-comment">// Create client</span>
+    <span class="code-keyword">const</span> c = <span class="code-keyword">new</span> Client(<span class="code-string">"http://localhost:9009"</span>, <span class="code-string">""</span>);
+
+    <span class="code-comment">// Write file</span>
+    <span class="code-keyword">await</span> c.write(<span class="code-string">"/data/hello.txt"</span>, <span class="code-keyword">new</span> TextEncoder().encode(<span class="code-string">"Hello, drive9!"</span>));
+
+    <span class="code-comment">// Read file</span>
+    <span class="code-keyword">const</span> data = <span class="code-keyword">await</span> c.read(<span class="code-string">"/data/hello.txt"</span>);
+    console.log(<span class="code-keyword">new</span> TextDecoder().decode(data));
+
+    <span class="code-comment">// List directory</span>
+    <span class="code-keyword">const</span> entries = <span class="code-keyword">await</span> c.list(<span class="code-string">"/data/"</span>);
+    <span class="code-keyword">for</span> (<span class="code-keyword">const</span> e <span class="code-keyword">of</span> entries) {
+        console.log(e.name, e.size, e.mtime);
+    }
+
+    <span class="code-comment">// Zero-copy link</span>
+    <span class="code-keyword">await</span> c.copy(<span class="code-string">"/data/hello.txt"</span>, <span class="code-string">"/backup/hello.txt"</span>);
+
+    <span class="code-comment">// Stream upload</span>
+    <span class="code-keyword">const</span> stream = await Deno.open(<span class="code-string">"large.bin"</span>);
+    <span class="code-keyword">await</span> c.writeStream(<span class="code-string">"/data/large.bin"</span>, stream.readable, size);
+}
+
+main();</code></pre>
+                </div>
+
+                <div class="code-window sdk-panel" data-panel="rust">
+                    <div class="code-window-header">
+                        <div class="code-window-dots">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                        </div>
+                        <span class="code-window-title">main.rs</span>
+                    </div>
+                    <pre class="code-window-content"><code><span class="code-keyword">use</span> drive9::Client;
+
+#[tokio::main]
+<span class="code-keyword">async fn</span> <span class="code-function">main</span>() -> Result&lt;(), drive9::Drive9Error&gt; {
+    <span class="code-comment">// Create client</span>
+    <span class="code-keyword">let</span> c = Client::new(<span class="code-string">"http://localhost:9009"</span>, <span class="code-string">""</span>);
+
+    <span class="code-comment">// Write file</span>
+    c.write(<span class="code-string">"/data/hello.txt"</span>, <span class="code-string">b"Hello, drive9!"</span>).<span class="code-keyword">await</span>?;
+
+    <span class="code-comment">// Read file</span>
+    <span class="code-keyword">let</span> data = c.read(<span class="code-string">"/data/hello.txt"</span>).<span class="code-keyword">await</span>?;
+    println!(<span class="code-string">"{}"</span>, String::from_utf8_lossy(&data));
+
+    <span class="code-comment">// List directory</span>
+    <span class="code-keyword">let</span> entries = c.list(<span class="code-string">"/data/"</span>).<span class="code-keyword">await</span>?;
+    <span class="code-keyword">for</span> e <span class="code-keyword">in</span> entries {
+        println!(<span class="code-string">"{} {} {:?}"</span>, e.name, e.size, e.mtime);
+    }
+
+    <span class="code-comment">// Zero-copy link</span>
+    c.copy(<span class="code-string">"/data/hello.txt"</span>, <span class="code-string">"/backup/hello.txt"</span>).<span class="code-keyword">await</span>?;
+
+    <span class="code-comment">// Stream upload</span>
+    <span class="code-keyword">let</span> file = tokio::fs::File::open(<span class="code-string">"large.bin"</span>).<span class="code-keyword">await</span>?;
+    c.write_stream(<span class="code-string">"/data/large.bin"</span>, file, size).<span class="code-keyword">await</span>?;
+
+    Ok(())
 }</code></pre>
                 </div>
             </div>
@@ -517,6 +694,17 @@ c.Write("/output.json", result)</code>
                 const y = e.clientY - rect.top;
                 card.style.setProperty('--mouse-x', `${x}px`);
                 card.style.setProperty('--mouse-y', `${y}px`);
+            });
+        });
+
+        // SDK tabs
+        document.querySelectorAll('.sdk-tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                const target = tab.dataset.tab;
+                document.querySelectorAll('.sdk-tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.sdk-panel').forEach(p => p.classList.remove('active'));
+                tab.classList.add('active');
+                document.querySelector(`.sdk-panel[data-panel="${target}"]`).classList.add('active');
             });
         });
     </script>

@@ -1,0 +1,25 @@
+[package]
+name = "drive9"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+crc32c = "0.6"
+base64 = "0.22"
+bytes = "1.6"
+tokio = { version = "1.37", features = ["sync", "rt", "macros", "time", "fs", "io-util"] }
+futures = "0.3"
+url = "2.5"
+tokio-util = { version = "0.7", features = ["io"] }
+sha2 = "0.10"
+urlencoding = "2.1"
+
+[dev-dependencies]
+mockito = "1.4"
+tokio = { version = "1.37", features = ["full"] }
+tempfile = "3.10"
