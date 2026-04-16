@@ -199,10 +199,13 @@ type observedResponseWriter struct {
 	size   int
 }
 
-func (w *observedResponseWriter) Flush() {
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
+type flusherResponseWriter struct {
+	*observedResponseWriter
+	flusher http.Flusher
+}
+
+func (w *flusherResponseWriter) Flush() {
+	w.flusher.Flush()
 }
 
 func (w *observedResponseWriter) WriteHeader(code int) {
@@ -261,10 +264,14 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 
 	start := time.Now()
 	ow := &observedResponseWriter{ResponseWriter: w}
+	rw := http.ResponseWriter(ow)
+	if f, ok := w.(http.Flusher); ok {
+		rw = &flusherResponseWriter{observedResponseWriter: ow, flusher: f}
+	}
 	s.metrics.inFlight.Add(1)
 	defer s.metrics.inFlight.Add(-1)
 
-	next.ServeHTTP(ow, r)
+	next.ServeHTTP(rw, r)
 	if ow.status == 0 {
 		ow.status = http.StatusOK
 	}
