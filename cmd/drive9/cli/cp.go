@@ -95,18 +95,13 @@ func Cp(c *client.Client, args []string) error {
 }
 
 func uploadFile(ctx context.Context, c *client.Client, localPath, remotePath string) error {
-	f, err := os.Open(localPath)
+	f, size, err := openLocalFile(localPath)
 	if err != nil {
-		return fmt.Errorf("open %s: %w", localPath, err)
+		return err
 	}
 	defer func() { _ = f.Close() }()
 
-	info, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("stat %s: %w", localPath, err)
-	}
-
-	summary, err := c.WriteStreamWithSummary(ctx, remotePath, f, info.Size(), printProgress)
+	summary, err := c.WriteStreamWithSummary(ctx, remotePath, f, size, printProgress)
 	if err != nil {
 		return err
 	}
@@ -115,18 +110,13 @@ func uploadFile(ctx context.Context, c *client.Client, localPath, remotePath str
 }
 
 func resumeUpload(ctx context.Context, c *client.Client, localPath, remotePath string) error {
-	f, err := os.Open(localPath)
+	f, size, err := openLocalFile(localPath)
 	if err != nil {
-		return fmt.Errorf("open %s: %w", localPath, err)
+		return err
 	}
 	defer func() { _ = f.Close() }()
 
-	info, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("stat %s: %w", localPath, err)
-	}
-
-	summary, err := c.ResumeUploadWithSummary(ctx, remotePath, f, info.Size(), printProgress)
+	summary, err := c.ResumeUploadWithSummary(ctx, remotePath, f, size, printProgress)
 	if err != nil {
 		return err
 	}
@@ -135,18 +125,28 @@ func resumeUpload(ctx context.Context, c *client.Client, localPath, remotePath s
 }
 
 func appendFile(ctx context.Context, c *client.Client, localPath, remotePath string) error {
-	f, err := os.Open(localPath)
+	f, size, err := openLocalFile(localPath)
 	if err != nil {
-		return fmt.Errorf("open %s: %w", localPath, err)
+		return err
 	}
 	defer func() { _ = f.Close() }()
 
-	info, err := f.Stat()
+	return c.AppendStream(ctx, remotePath, f, size, printProgress)
+}
+
+func openLocalFile(localPath string) (*os.File, int64, error) {
+	f, err := os.Open(localPath)
 	if err != nil {
-		return fmt.Errorf("stat %s: %w", localPath, err)
+		return nil, 0, fmt.Errorf("open %s: %w", localPath, err)
 	}
 
-	return c.AppendStream(ctx, remotePath, f, info.Size(), printProgress)
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, 0, fmt.Errorf("stat %s: %w", localPath, err)
+	}
+
+	return f, info.Size(), nil
 }
 
 func downloadFile(ctx context.Context, c *client.Client, remotePath, localPath string) error {

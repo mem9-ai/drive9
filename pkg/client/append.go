@@ -177,5 +177,6 @@ func shouldRewriteAppend(err error) bool {
 		return false
 	}
 	return strings.HasPrefix(statusErr.Message, "file is not S3-stored:") ||
+		strings.Contains(statusErr.Message, "S3 not configured") ||
 		strings.Contains(statusErr.Message, "unknown POST action")
 }
