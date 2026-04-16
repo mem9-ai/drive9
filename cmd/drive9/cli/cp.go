@@ -28,11 +28,12 @@ func Cp(c *client.Client, args []string) error {
 	appendMode := false
 	filtered := args[:0]
 	for _, a := range args {
-		if a == "--resume" {
+		switch a {
+		case "--resume":
 			resume = true
-		} else if a == "--append" {
+		case "--append":
 			appendMode = true
-		} else {
+		default:
 			filtered = append(filtered, a)
 		}
 	}
