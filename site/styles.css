@@ -1053,3 +1053,45 @@ body {
 .hero > .container > *:nth-child(4) { animation-delay: 0.4s; }
 .hero > .container > *:nth-child(5) { animation-delay: 0.5s; }
 .hero > .container > *:nth-child(6) { animation-delay: 0.6s; }
+
+/* SDK Tabs */
+.sdk-tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+    justify-content: center;
+    flex-wrap: wrap;
+}
+
+.sdk-tab {
+    padding: 8px 16px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.sdk-tab:hover {
+    border-color: var(--accent-gray);
+    color: var(--text-primary);
+}
+
+.sdk-tab.active {
+    background: var(--text-primary);
+    color: var(--bg-primary);
+    border-color: var(--text-primary);
+}
+
+.sdk-panel {
+    display: none;
+}
+
+.sdk-panel.active {
+    display: block;
+}
+
+.code-number { color: #ff9f43; }
