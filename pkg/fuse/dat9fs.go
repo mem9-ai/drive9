@@ -1247,10 +1247,10 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		}
 	}
 
-	// Attach the multipart helper used at flush/close time.
-	// The current multipart protocol needs the exact total size at initiate
-	// time, so create/truncate handles defer actual network uploads until
-	// close rather than trying to stream parts during Write().
+	// Attach a streaming uploader for sequential write streaming.
+	// For pure sequential writes (cp, dd, ffmpeg), parts are uploaded
+	// as they fill during Write() and memory is released immediately.
+	// For non-sequential writes, falls back to flush-time UploadAll.
 	fh.Streamer = NewStreamUploader(fs.client, childP, expectedRevisionForHandle(fh))
 
 	// Wire up the OnPartFull callback: when a sequential write fills
@@ -1371,7 +1371,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 				}
 			}
 
-			// Attach the multipart helper used at flush/close time.
+			// Attach streaming uploader with OnPartFull wiring.
 			fh.Streamer = NewStreamUploader(fs.client, p, expectedRevisionForHandle(fh))
 			streamer := fh.Streamer
 			filePath := p
