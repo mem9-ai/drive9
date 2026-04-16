@@ -7,7 +7,7 @@ import (
 )
 
 // SchemaStatements returns the vault DDL statements used during tenant schema
-// initialization.
+// initialization (TiDB/MySQL-compatible).
 //
 // These statements are appended into the exported db9 init schema. If you
 // change vault columns, indexes, or constraints here, rerun:
@@ -19,8 +19,8 @@ func SchemaStatements() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS vault_deks (
 			tenant_id    VARCHAR(64) PRIMARY KEY,
-			wrapped_dek  BYTEA NOT NULL,
-			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			wrapped_dek  BLOB NOT NULL,
+			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS vault_secrets (
@@ -30,18 +30,18 @@ func SchemaStatements() []string {
 			secret_type  VARCHAR(32) NOT NULL DEFAULT 'generic',
 			revision     BIGINT NOT NULL DEFAULT 1,
 			created_by   VARCHAR(255) NOT NULL,
-			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			deleted_at   TIMESTAMPTZ,
-			UNIQUE (tenant_id, name)
+			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			deleted_at   DATETIME(3),
+			UNIQUE INDEX uk_vault_secrets_tenant_name (tenant_id, name),
+			INDEX idx_vault_secrets_tenant (tenant_id)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_vault_secrets_tenant ON vault_secrets(tenant_id)`,
 
 		`CREATE TABLE IF NOT EXISTS vault_secret_fields (
 			secret_id       VARCHAR(64) NOT NULL,
 			field_name      VARCHAR(255) NOT NULL,
-			encrypted_value BYTEA NOT NULL,
-			nonce           BYTEA NOT NULL,
+			encrypted_value BLOB NOT NULL,
+			nonce           BLOB NOT NULL,
 			PRIMARY KEY (secret_id, field_name)
 		)`,
 
@@ -50,22 +50,22 @@ func SchemaStatements() []string {
 			tenant_id     VARCHAR(64) NOT NULL,
 			agent_id      VARCHAR(255) NOT NULL,
 			task_id       VARCHAR(255),
-			scope_json    JSONB NOT NULL,
-			issued_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			expires_at    TIMESTAMPTZ NOT NULL,
-			revoked_at    TIMESTAMPTZ,
+			scope_json    JSON NOT NULL,
+			issued_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			expires_at    DATETIME(3) NOT NULL,
+			revoked_at    DATETIME(3),
 			revoked_by    VARCHAR(255),
-			revoke_reason VARCHAR(255)
+			revoke_reason VARCHAR(255),
+			INDEX idx_vault_token_tenant (tenant_id),
+			INDEX idx_vault_token_agent (agent_id)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_vault_token_tenant ON vault_tokens(tenant_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_vault_token_agent ON vault_tokens(agent_id)`,
 
 		`CREATE TABLE IF NOT EXISTS vault_policies (
 			policy_id   VARCHAR(64) PRIMARY KEY,
 			tenant_id   VARCHAR(64) NOT NULL,
 			name        VARCHAR(255) NOT NULL,
-			rules_json  JSONB NOT NULL,
-			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			rules_json  JSON NOT NULL,
+			created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS vault_audit_log (
@@ -78,11 +78,11 @@ func SchemaStatements() []string {
 			secret_name  VARCHAR(255),
 			field_name   VARCHAR(255),
 			adapter      VARCHAR(16),
-			detail_json  JSONB,
-			timestamp    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			detail_json  JSON,
+			timestamp    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			INDEX idx_vault_audit_tenant_time (tenant_id, timestamp),
+			INDEX idx_vault_audit_secret (secret_name, timestamp)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_vault_audit_tenant_time ON vault_audit_log(tenant_id, timestamp)`,
-		`CREATE INDEX IF NOT EXISTS idx_vault_audit_secret ON vault_audit_log(secret_name, timestamp)`,
 	}
 }
 
