@@ -293,7 +293,7 @@ func (s *Store) AtomicReserveUpload(ctx context.Context, tenantID string, reserv
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		err = fmt.Errorf("tenant storage quota exceeded")
+		err = ErrStorageQuotaExceeded
 		return err
 	}
 	return nil
@@ -595,11 +595,21 @@ func (s *Store) ListPendingMutations(ctx context.Context, minAge time.Duration, 
 }
 
 // MarkMutationApplied marks a mutation log entry as applied within a transaction.
+// The WHERE clause includes status = 'pending' so that concurrent replay workers
+// cannot both apply the same mutation: the second worker's UPDATE will affect 0 rows,
+// causing the transaction to roll back and preventing double-apply of counter mutations.
 func (s *Store) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {
-	_, err := tx.Exec(
-		`UPDATE quota_mutation_log SET status = 'applied', applied_at = ? WHERE id = ?`,
+	res, err := tx.Exec(
+		`UPDATE quota_mutation_log SET status = 'applied', applied_at = ? WHERE id = ? AND status = 'pending'`,
 		time.Now().UTC(), id)
-	return err
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("mutation %d already applied or not pending", id)
+	}
+	return nil
 }
 
 // IncrMutationRetry increments the retry count. If max retries exceeded, marks as failed.

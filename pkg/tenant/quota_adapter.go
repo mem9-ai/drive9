@@ -3,6 +3,7 @@ package tenant
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
@@ -22,10 +23,6 @@ func NewMetaQuotaAdapter(s *meta.Store) backend.MetaQuotaStore {
 		return nil
 	}
 	return &metaQuotaAdapter{s: s}
-}
-
-func newMetaQuotaAdapter(s *meta.Store) backend.MetaQuotaStore {
-	return NewMetaQuotaAdapter(s)
 }
 
 func (a *metaQuotaAdapter) GetQuotaConfig(ctx context.Context, tenantID string) (*backend.QuotaConfigView, error) {
@@ -91,7 +88,11 @@ func (a *metaQuotaAdapter) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID st
 }
 
 func (a *metaQuotaAdapter) AtomicReserveUpload(ctx context.Context, tenantID string, reserveBytes int64) error {
-	return a.s.AtomicReserveUpload(ctx, tenantID, reserveBytes)
+	err := a.s.AtomicReserveUpload(ctx, tenantID, reserveBytes)
+	if errors.Is(err, meta.ErrStorageQuotaExceeded) {
+		return backend.ErrStorageQuotaExceeded
+	}
+	return err
 }
 
 func (a *metaQuotaAdapter) UpsertFileMeta(ctx context.Context, fm *backend.FileMetaView) error {

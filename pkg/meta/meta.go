@@ -17,8 +17,9 @@ import (
 )
 
 var (
-	ErrNotFound  = errors.New("not found")
-	ErrDuplicate = errors.New("duplicate entry")
+	ErrNotFound              = errors.New("not found")
+	ErrDuplicate             = errors.New("duplicate entry")
+	ErrStorageQuotaExceeded  = errors.New("tenant storage quota exceeded")
 )
 
 type TenantStatus string

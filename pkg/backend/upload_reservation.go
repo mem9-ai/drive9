@@ -75,15 +75,25 @@ func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targe
 // --- Upload abort: release reservation ---
 
 // abortUploadReservation is called after a tenant-DB upload abort.
-// It releases the reserved_bytes back to the pool.
+// It releases the reserved_bytes back to the pool. Only adjusts counters
+// if a server-side reservation row exists and is active, preventing
+// counter corruption when the initiate-time reserve was a fail-open no-op.
 func (b *Dat9Backend) abortUploadReservation(ctx context.Context, uploadID string, totalSize int64) {
 	if b.metaStore == nil {
 		return
 	}
 	start := time.Now()
 
+	// Check if a reservation row actually exists and is active.
+	r, err := b.metaStore.GetUploadReservation(ctx, b.tenantID, uploadID)
+	if err != nil || r.Status != "active" {
+		// No active reservation — initiate was a fail-open no-op; nothing to release.
+		metrics.RecordOperation("central_quota", "abort_reservation", "skip_no_reservation", time.Since(start))
+		return
+	}
+
 	// Release reserved bytes.
-	if err := b.metaStore.IncrReservedBytes(ctx, b.tenantID, -totalSize); err != nil {
+	if err := b.metaStore.IncrReservedBytes(ctx, b.tenantID, -r.ReservedBytes); err != nil {
 		logger.Warn(ctx, "central_quota_abort_release_reserved_failed",
 			zap.String("tenant_id", b.tenantID),
 			zap.String("upload_id", uploadID),
@@ -120,6 +130,18 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 		return
 	}
 	start := time.Now()
+
+	// Check if a reservation row actually exists and is active before
+	// touching counters. If the initiate-time reserve was a fail-open no-op,
+	// there is no reservation to complete.
+	r, err := b.metaStore.GetUploadReservation(ctx, b.tenantID, uploadID)
+	if err != nil || r.Status != "active" {
+		// No active reservation — log the file mutation via the outbox anyway
+		// so the file meta shadow state stays in sync, but use 0 reserved bytes
+		// to avoid touching the reserved_bytes counter.
+		reservedBytes = 0
+	}
+
 	data, err := json.Marshal(uploadCompleteMutationData{
 		UploadID:      uploadID,
 		FileID:        fileID,
