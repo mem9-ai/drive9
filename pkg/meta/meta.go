@@ -145,6 +145,20 @@ func (s *Store) migrate() error {
 			INDEX idx_api_keys_tenant (tenant_id, status),
 			UNIQUE INDEX idx_api_keys_tenant_name (tenant_id, key_name)
 		)`,
+		// --- LLM usage table (PR #245 migration) ---
+
+		`CREATE TABLE IF NOT EXISTS llm_usage (
+			id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+			tenant_id       VARCHAR(64) NOT NULL,
+			task_type       VARCHAR(64) NOT NULL,
+			task_id         VARCHAR(255) NOT NULL,
+			cost_millicents BIGINT NOT NULL,
+			raw_units       BIGINT NOT NULL DEFAULT 0,
+			raw_unit_type   VARCHAR(32) NOT NULL DEFAULT '',
+			created_at      DATETIME(3) NOT NULL,
+			INDEX idx_llm_usage_tenant_created (tenant_id, created_at),
+			INDEX idx_llm_usage_created (created_at)
+		)`,
 
 		// --- Quota tables (Rev 4 migration) ---
 

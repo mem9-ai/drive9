@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Validate a pre-existing dat9 API key against deployed endpoints.
+# Validate a pre-existing drive9 API key against deployed endpoints.
 
 set -euo pipefail
 

@@ -101,7 +101,9 @@ func (b *Dat9Backend) audioDurationCostMillicents(durationSeconds float64) int64
 }
 
 // monthlyLLMCostExceeded checks whether the tenant has exceeded its monthly
-// LLM cost budget. Returns true when the total settled cost exceeds the limit.
+// LLM cost budget. When meta store is configured, it reads from there
+// (with optional dual-read summing costs from both stores during transition).
+// Returns true when the total settled cost exceeds the limit.
 func (b *Dat9Backend) monthlyLLMCostExceeded() bool {
 	if b.maxMonthlyLLMCostMillicents <= 0 {
 		return false

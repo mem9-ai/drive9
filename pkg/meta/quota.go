@@ -543,25 +543,6 @@ func (s *Store) IncrMonthlyLLMCostTx(tx *sql.Tx, tenantID string, costMC int64) 
 	return err
 }
 
-// MonthlyLLMCostMillicents returns the total LLM cost for the current month.
-func (s *Store) MonthlyLLMCostMillicents(ctx context.Context, tenantID string) (int64, error) {
-	start := time.Now()
-	var err error
-	defer observeMeta(ctx, "monthly_llm_cost_millicents", start, &err)
-
-	now := time.Now().UTC()
-	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
-	var total int64
-	err = s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(total_mc, 0) FROM tenant_monthly_llm_cost
-		 WHERE tenant_id = ? AND month_start = ?`,
-		tenantID, monthStart).Scan(&total)
-	if err == sql.ErrNoRows {
-		return 0, nil
-	}
-	return total, err
-}
-
 // --- Mutation log operations ---
 
 // InsertMutationLog writes a pending mutation to the outbox.
