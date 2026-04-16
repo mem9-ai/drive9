@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/http"
@@ -81,6 +82,13 @@ func main() {
 	s3cfg, err := localS3ConfigFromEnv()
 	if err != nil {
 		die(err)
+	}
+	var vaultMasterKey []byte
+	if raw := os.Getenv("DRIVE9_VAULT_MASTER_KEY"); raw != "" {
+		vaultMasterKey, err = hex.DecodeString(raw)
+		if err != nil {
+			die(fmt.Errorf("invalid DRIVE9_VAULT_MASTER_KEY: %w", err))
+		}
 	}
 
 	// Local validation should be able to bootstrap a fresh tenant database without
@@ -191,6 +199,7 @@ func main() {
 	if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
 		Backend:          b,
 		LocalS3:          localS3,
+		VaultMasterKey:   vaultMasterKey,
 		S3Dir:            s3cfg.localDir(),
 		MaxUploadBytes:   maxUploadBytes,
 		Logger:           srvLogger,
@@ -204,6 +213,7 @@ func main() {
 	srv := server.NewWithConfig(server.Config{
 		Backend:          b,
 		LocalS3:          localS3,
+		VaultMasterKey:   vaultMasterKey,
 		S3Dir:            s3cfg.localDir(),
 		MaxUploadBytes:   maxUploadBytes,
 		Logger:           srvLogger,
@@ -257,6 +267,7 @@ environment:
   DRIVE9_LOCAL_DSN   local tenant TiDB/MySQL DSN (required)
   DRIVE9_LOCAL_INIT_SCHEMA initialize tenant schema on startup (default: false)
   DRIVE9_LOCAL_EMBEDDING_MODE auto|app|detect (default: auto when initing schema, detect otherwise)
+  DRIVE9_VAULT_MASTER_KEY 32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
 
   S3 storage:
