@@ -169,7 +169,6 @@ type semanticTaskAction string
 const (
 	semanticTaskActionAck   semanticTaskAction = "ack"
 	semanticTaskActionRetry semanticTaskAction = "retry"
-	semanticTaskActionDefer semanticTaskAction = "defer"
 )
 
 type semanticTaskOutcome struct {
@@ -405,8 +404,6 @@ func (m *semanticWorkerManager) processTask(ctx context.Context, target *semanti
 		m.ackTask(ctx, target.tenantID, target.store, task, outcome.message)
 	case semanticTaskActionRetry:
 		m.retryTask(ctx, target.tenantID, target.store, task, outcome.message)
-	case semanticTaskActionDefer:
-		m.deferTask(ctx, target.tenantID, target.store, task, outcome.message)
 	}
 }
 
@@ -457,30 +454,6 @@ func (m *semanticWorkerManager) retryTask(ctx context.Context, tenantID string, 
 		fields = append(fields, zap.Time("retry_at", retryAt))
 	}
 	logger.Warn(ctx, logMessage, fields...)
-}
-
-func (m *semanticWorkerManager) deferTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task, message string) {
-	start := time.Now()
-	now := time.Now().UTC()
-	nextMonth := time.Date(now.Year(), now.Month()+1, 1, 0, 0, 0, 0, time.UTC)
-	if err := store.DeferSemanticTask(ctx, task.TaskID, task.Receipt, nextMonth); err != nil {
-		metrics.RecordOperation("semantic_worker", "defer", "error", time.Since(start))
-		logger.Warn(ctx, "semantic_worker_defer_failed",
-			append([]zap.Field{
-				zap.String("tenant_id", tenantID),
-				zap.String("result", "error"),
-				zap.String("message", message),
-			}, append(semanticTaskLogFields(task), zap.Error(err))...)...)
-		return
-	}
-	metrics.RecordOperation("semantic_worker", "defer", "ok", time.Since(start))
-	logger.Info(ctx, "semantic_worker_defer_ok",
-		append([]zap.Field{
-			zap.String("tenant_id", tenantID),
-			zap.String("result", "deferred"),
-			zap.String("message", message),
-			zap.Time("available_at", nextMonth),
-		}, semanticTaskLogFields(task)...)...)
 }
 
 func (m *semanticWorkerManager) retryDelay(attemptCount int) time.Duration {
@@ -918,7 +891,7 @@ func (m *semanticWorkerManager) processImgExtractTask(ctx context.Context, b *ba
 		return semanticTaskOutcome{action: semanticTaskActionRetry, result: string(result), message: err.Error()}
 	}
 	if result == backend.ImageExtractResultBudgetExhausted {
-		return semanticTaskOutcome{action: semanticTaskActionDefer, result: string(result), message: "monthly_llm_cost_budget_exhausted"}
+		return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: "monthly_llm_cost_budget_exhausted"}
 	}
 	return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: string(result)}
 }
@@ -929,7 +902,7 @@ func (m *semanticWorkerManager) processAudioExtractTask(ctx context.Context, b *
 		return semanticTaskOutcome{action: semanticTaskActionRetry, result: string(result), message: err.Error()}
 	}
 	if result == backend.AudioExtractResultBudgetExhausted {
-		return semanticTaskOutcome{action: semanticTaskActionDefer, result: string(result), message: "monthly_llm_cost_budget_exhausted"}
+		return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: "monthly_llm_cost_budget_exhausted"}
 	}
 	return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: string(result)}
 }

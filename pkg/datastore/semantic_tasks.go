@@ -461,40 +461,6 @@ func (s *Store) RetrySemanticTask(ctx context.Context, taskID, receipt string, r
 	return tx.Commit()
 }
 
-// DeferSemanticTask requeues a leased task to a future time without consuming
-// an attempt. The claim-time attempt_count increment is rolled back so that
-// budget-deferred tasks are not penalized toward max_attempts.
-func (s *Store) DeferSemanticTask(ctx context.Context, taskID, receipt string, availableAt time.Time) (err error) {
-	start := time.Now()
-	defer observeStoreOp(ctx, "defer_semantic_task", start, &err)
-
-	now := semanticTaskLeaseNow()
-	if availableAt.IsZero() {
-		availableAt = now
-	} else {
-		availableAt = availableAt.UTC()
-	}
-
-	res, err := s.db.ExecContext(ctx, `UPDATE semantic_tasks
-		SET status = ?, attempt_count = GREATEST(attempt_count - 1, 0),
-		    receipt = NULL, leased_at = NULL, lease_until = NULL,
-		    available_at = ?, last_error = 'budget_exhausted', updated_at = ?
-		WHERE task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`,
-		semantic.TaskQueued, availableAt, now,
-		taskID, semantic.TaskProcessing, receipt, now)
-	if err != nil {
-		return err
-	}
-	rowsAffected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rowsAffected > 0 {
-		return nil
-	}
-	return s.semanticTaskLeaseError(ctx, taskID)
-}
-
 // RecoverExpiredSemanticTasks requeues expired processing tasks.
 func (s *Store) RecoverExpiredSemanticTasks(ctx context.Context, now time.Time, limit int) (recovered int, err error) {
 	start := time.Now()
