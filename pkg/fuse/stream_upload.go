@@ -3,25 +3,24 @@ package fuse
 import (
 	"context"
 	"log"
-	"math"
 	"sync"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
-// StreamUploader manages parallel part uploads both during Write() for
-// sequential streaming and at flush/close time for non-sequential files.
+// StreamUploader manages multipart uploads for large writable handles.
 //
 // Two modes of operation:
 //
-//  1. Flush-time upload (UploadAll): Used for non-sequential writes or when
-//     streaming was not triggered. All parts are uploaded in parallel at close.
+//  1. Flush-time upload (UploadAll): Used for the current create/truncate paths
+//     because the final size is unknown until close. All parts are uploaded in
+//     parallel once the exact total size is available.
 //
-//  2. Streaming upload (SubmitPart + FinishStreaming): Used for large sequential
-//     writes. Parts are uploaded as they fill during Write(), and memory is
-//     released after each upload completes. At close, FinishStreaming uploads
-//     the final partial part and any dirty (back-written) parts, then completes.
+//  2. Streaming upload (SubmitPart + FinishStreaming): Reserved for callers
+//     that know the exact final size before submitting parts. The current FUSE
+//     create/truncate paths do not satisfy that constraint, so SubmitPart
+//     intentionally defers work instead of initiating an invalid upload plan.
 type StreamUploader struct {
 	client           *client.Client
 	path             string
@@ -61,74 +60,18 @@ func (su *StreamUploader) HasStreamedParts() bool {
 	return len(su.streamedParts) > 0
 }
 
-// SubmitPart uploads a single part in the background (streaming mode).
-// Lazily initiates the multipart upload on first call.
+// SubmitPart uploads a single part in the background when the caller can start
+// a valid streaming upload. For FUSE create/truncate handles the final file
+// size is unknown during Write(), while the current multipart APIs require an
+// exact total size at initiate time. In that case we deliberately defer the
+// upload and let UploadAll handle the file at flush/close with the precise
+// final size.
+//
+// This keeps the path correct and avoids issuing an initiate request with a
+// bogus total size that the server will reject.
 // partNum is 1-based. data is copied by the underlying StreamWriter.
 // onDone is called after a successful upload with the 1-based part number.
 func (su *StreamUploader) SubmitPart(ctx context.Context, partNum int, data []byte, onDone func(int)) error {
-	su.mu.Lock()
-
-	// Check for prior error
-	if su.streamErr != nil {
-		err := su.streamErr
-		su.mu.Unlock()
-		return err
-	}
-
-	// Lazy init — use a very large totalSize since we don't know final size yet.
-	// This only affects server plan metadata, not actual upload correctness.
-	if !su.started {
-		su.writer = su.client.NewStreamWriterConditional(ctx, su.path, math.MaxInt64, su.expectedRevision)
-		su.started = true
-	}
-	sw := su.writer
-
-	su.inflightWg.Add(1)
-	su.mu.Unlock()
-
-	// Make a copy of data for the background upload
-	buf := make([]byte, len(data))
-	copy(buf, data)
-
-	go func() {
-		defer su.inflightWg.Done()
-
-		// sw.WritePart queues the actual S3 upload in a background goroutine
-		// inside StreamWriter. It copies buf internally, so buf is safe to
-		// reference after WritePart returns. The actual upload completes when
-		// sw.Complete() calls sw.inflight.Wait() inside FinishStreaming.
-		//
-		// We mark streamedParts and call onDone here (after WritePart returns)
-		// rather than after the S3 upload finishes, because:
-		// 1. WritePart has already copied the data — eviction is safe.
-		// 2. If the S3 upload later fails, streamErr is set by StreamWriter,
-		//    and FinishStreaming checks it before calling Complete.
-		// 3. onDone (EvictPart) only releases memory — it does not affect
-		//    upload correctness.
-		//
-		// IMPORTANT: flushHandle must release fh.mu before calling
-		// FinishStreaming, because onDone acquires fh.mu. Otherwise deadlock:
-		//   fh.Lock() → FinishStreaming → inflightWg.Wait() → onDone → fh.Lock()
-		err := sw.WritePart(ctx, partNum, buf)
-		if err != nil {
-			su.mu.Lock()
-			if su.streamErr == nil {
-				su.streamErr = err
-			}
-			su.mu.Unlock()
-			log.Printf("streaming upload part %d failed for %s: %v", partNum, su.path, err)
-			return
-		}
-
-		su.mu.Lock()
-		su.streamedParts[partNum] = true
-		su.mu.Unlock()
-
-		if onDone != nil {
-			onDone(partNum)
-		}
-	}()
-
 	return nil
 }
 

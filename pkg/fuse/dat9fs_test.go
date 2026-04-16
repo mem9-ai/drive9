@@ -15,6 +15,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
 func newTestDat9FS(t *testing.T, size int64, get func(http.ResponseWriter, *http.Request)) (*Dat9FS, uint64, func()) {
@@ -524,6 +525,172 @@ func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 	}
 	if completeParts != 1 {
 		t.Fatalf("complete parts = %d, want 1", completeParts)
+	}
+}
+
+func TestCreateLargeSequentialWriteDefersInitiateUntilFlush(t *testing.T) {
+	const fileSize = 2 * s3client.PartSize
+
+	var initiateCalls atomic.Int32
+	var completeParts atomic.Int32
+	var uploadedBytes atomic.Int64
+	var gotTotalSize atomic.Int64
+	var gotExpected int64 = -1
+	var reqMu sync.Mutex
+	var requests []string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqMu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		reqMu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			initiateCalls.Add(1)
+			var req struct {
+				Path             string `json:"path"`
+				TotalSize        int64  `json:"total_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad initiate body", http.StatusBadRequest)
+				return
+			}
+			gotTotalSize.Store(req.TotalSize)
+			if req.ExpectedRevision == nil {
+				http.Error(w, "missing expected_revision", http.StatusBadRequest)
+				return
+			}
+			gotExpected = *req.ExpectedRevision
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "up-1",
+				"key":         "blobs/up-1",
+				"part_size":   int64(s3client.PartSize),
+				"total_parts": 2,
+				"expires_at":  time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+				"resumable":   false,
+				"checksum_contract": map[string]any{
+					"supported": []string{"SHA-256"},
+					"required":  false,
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/up-1/presign-batch":
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number":     1,
+					"url":        "http://" + r.Host + "/upload/1",
+					"size":       s3client.PartSize,
+					"headers":    map[string]string{},
+					"expires_at": time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+				}, {
+					"number":     2,
+					"url":        "http://" + r.Host + "/upload/2",
+					"size":       s3client.PartSize,
+					"headers":    map[string]string{},
+					"expires_at": time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+				}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/up-1/presign":
+			var req struct {
+				PartNumber int `json:"part_number"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad presign body", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number":     req.PartNumber,
+				"url":        fmt.Sprintf("http://%s/upload/%d", r.Host, req.PartNumber),
+				"size":       s3client.PartSize,
+				"headers":    map[string]string{},
+				"expires_at": time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+			})
+		case r.Method == http.MethodPut && (r.URL.Path == "/upload/1" || r.URL.Path == "/upload/2"):
+			body, _ := io.ReadAll(r.Body)
+			uploadedBytes.Add(int64(len(body)))
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/up-1/complete":
+			var req struct {
+				Parts []struct {
+					Number int    `json:"number"`
+					ETag   string `json:"etag"`
+				} `json:"parts"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad complete body", http.StatusBadRequest)
+				return
+			}
+			completeParts.Store(int32(len(req.Parts)))
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "large.bin", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	data := make([]byte, fileSize)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: out.NodeId},
+		Fh:       out.Fh,
+		Offset:   0,
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	if initiateCalls.Load() != 0 {
+		t.Fatalf("initiate calls during Write = %d, want 0", initiateCalls.Load())
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.Streamer == nil {
+		t.Fatal("expected streamer to remain attached")
+	}
+	if fh.Streamer.HasStreamedParts() {
+		t.Fatal("streamed parts should remain false before Flush")
+	}
+
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: out.NodeId},
+		Fh:       out.Fh,
+	})
+	if st != gofuse.OK {
+		reqMu.Lock()
+		defer reqMu.Unlock()
+		t.Fatalf("Flush status = %v, want OK; requests=%v", st, requests)
+	}
+
+	if initiateCalls.Load() != 1 {
+		t.Fatalf("initiate calls after Flush = %d, want 1", initiateCalls.Load())
+	}
+	if gotTotalSize.Load() != fileSize {
+		t.Fatalf("initiate total_size = %d, want %d", gotTotalSize.Load(), fileSize)
+	}
+	if gotExpected != 0 {
+		t.Fatalf("expected_revision = %d, want 0", gotExpected)
+	}
+	if uploadedBytes.Load() != fileSize {
+		t.Fatalf("uploaded bytes = %d, want %d", uploadedBytes.Load(), fileSize)
+	}
+	if completeParts.Load() != 2 {
+		t.Fatalf("complete parts = %d, want 2", completeParts.Load())
 	}
 }
 
