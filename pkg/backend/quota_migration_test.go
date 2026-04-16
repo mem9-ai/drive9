@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,13 +13,16 @@ import (
 )
 
 type fakeMutationRecord struct {
-	id     int64
-	typ    string
-	status string
-	data   []byte
+	tenantID   string
+	id         int64
+	typ        string
+	status     string
+	retryCount int
+	data       []byte
 }
 
 type fakeMetaQuotaStore struct {
+	mu                sync.Mutex
 	usage             map[string]*QuotaUsageView
 	config            map[string]*QuotaConfigView
 	fileMeta          map[string]*FileMetaView
@@ -46,7 +50,7 @@ func metaKey(tenantID, id string) string {
 	return tenantID + "::" + id
 }
 
-func (f *fakeMetaQuotaStore) ensureUsage(tenantID string) *QuotaUsageView {
+func (f *fakeMetaQuotaStore) ensureUsageLocked(tenantID string) *QuotaUsageView {
 	if u, ok := f.usage[tenantID]; ok {
 		return u
 	}
@@ -56,6 +60,8 @@ func (f *fakeMetaQuotaStore) ensureUsage(tenantID string) *QuotaUsageView {
 }
 
 func (f *fakeMetaQuotaStore) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConfigView, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if cfg, ok := f.config[tenantID]; ok {
 		cp := *cfg
 		return &cp, nil
@@ -64,17 +70,23 @@ func (f *fakeMetaQuotaStore) GetQuotaConfig(ctx context.Context, tenantID string
 }
 
 func (f *fakeMetaQuotaStore) GetQuotaUsage(ctx context.Context, tenantID string) (*QuotaUsageView, error) {
-	u := *f.ensureUsage(tenantID)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	u := *f.ensureUsageLocked(tenantID)
 	return &u, nil
 }
 
 func (f *fakeMetaQuotaStore) EnsureQuotaUsageRow(ctx context.Context, tenantID string) error {
-	f.ensureUsage(tenantID)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureUsageLocked(tenantID)
 	return nil
 }
 
 func (f *fakeMetaQuotaStore) IncrStorageBytes(ctx context.Context, tenantID string, delta int64) error {
-	f.ensureUsage(tenantID).StorageBytes += delta
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureUsageLocked(tenantID).StorageBytes += delta
 	return nil
 }
 
@@ -83,7 +95,9 @@ func (f *fakeMetaQuotaStore) IncrStorageBytesTx(tx *sql.Tx, tenantID string, del
 }
 
 func (f *fakeMetaQuotaStore) IncrReservedBytes(ctx context.Context, tenantID string, delta int64) error {
-	f.ensureUsage(tenantID).ReservedBytes += delta
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureUsageLocked(tenantID).ReservedBytes += delta
 	return nil
 }
 
@@ -92,7 +106,9 @@ func (f *fakeMetaQuotaStore) IncrReservedBytesTx(tx *sql.Tx, tenantID string, de
 }
 
 func (f *fakeMetaQuotaStore) IncrMediaFileCount(ctx context.Context, tenantID string, delta int64) error {
-	f.ensureUsage(tenantID).MediaFileCount += delta
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureUsageLocked(tenantID).MediaFileCount += delta
 	return nil
 }
 
@@ -101,7 +117,9 @@ func (f *fakeMetaQuotaStore) IncrMediaFileCountTx(tx *sql.Tx, tenantID string, d
 }
 
 func (f *fakeMetaQuotaStore) TransferReservedToConfirmed(ctx context.Context, tenantID string, reservedDelta, storageDelta int64) error {
-	u := f.ensureUsage(tenantID)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	u := f.ensureUsageLocked(tenantID)
 	u.ReservedBytes += reservedDelta
 	u.StorageBytes += storageDelta
 	return nil
@@ -112,8 +130,13 @@ func (f *fakeMetaQuotaStore) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID 
 }
 
 func (f *fakeMetaQuotaStore) AtomicReserveUpload(ctx context.Context, tenantID string, reserveBytes int64) error {
-	cfg, _ := f.GetQuotaConfig(ctx, tenantID)
-	u := f.ensureUsage(tenantID)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cfg, ok := f.config[tenantID]
+	if !ok {
+		cfg = &QuotaConfigView{TenantID: tenantID}
+	}
+	u := f.ensureUsageLocked(tenantID)
 	if cfg.MaxStorageBytes > 0 && u.StorageBytes+u.ReservedBytes+reserveBytes > cfg.MaxStorageBytes {
 		return ErrStorageQuotaExceeded
 	}
@@ -122,6 +145,8 @@ func (f *fakeMetaQuotaStore) AtomicReserveUpload(ctx context.Context, tenantID s
 }
 
 func (f *fakeMetaQuotaStore) UpsertFileMeta(ctx context.Context, fm *FileMetaView) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	cp := *fm
 	f.fileMeta[metaKey(fm.TenantID, fm.FileID)] = &cp
 	return nil
@@ -132,6 +157,8 @@ func (f *fakeMetaQuotaStore) UpsertFileMetaTx(tx *sql.Tx, fm *FileMetaView) erro
 }
 
 func (f *fakeMetaQuotaStore) GetFileMeta(ctx context.Context, tenantID, fileID string) (*FileMetaView, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	fm, ok := f.fileMeta[metaKey(tenantID, fileID)]
 	if !ok {
 		return nil, errors.New("not found")
@@ -141,6 +168,8 @@ func (f *fakeMetaQuotaStore) GetFileMeta(ctx context.Context, tenantID, fileID s
 }
 
 func (f *fakeMetaQuotaStore) DeleteFileMeta(ctx context.Context, tenantID, fileID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	delete(f.fileMeta, metaKey(tenantID, fileID))
 	return nil
 }
@@ -150,12 +179,16 @@ func (f *fakeMetaQuotaStore) DeleteFileMetaTx(tx *sql.Tx, tenantID, fileID strin
 }
 
 func (f *fakeMetaQuotaStore) InsertUploadReservation(ctx context.Context, r *UploadReservationView) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	cp := *r
 	f.reservations[metaKey(r.TenantID, r.UploadID)] = &cp
 	return nil
 }
 
 func (f *fakeMetaQuotaStore) UpdateUploadReservationStatus(ctx context.Context, tenantID, uploadID, status string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if r, ok := f.reservations[metaKey(tenantID, uploadID)]; ok {
 		r.Status = status
 	}
@@ -167,6 +200,8 @@ func (f *fakeMetaQuotaStore) UpdateUploadReservationStatusTx(tx *sql.Tx, tenantI
 }
 
 func (f *fakeMetaQuotaStore) GetUploadReservation(ctx context.Context, tenantID, uploadID string) (*UploadReservationView, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	r, ok := f.reservations[metaKey(tenantID, uploadID)]
 	if !ok {
 		return nil, errors.New("not found")
@@ -176,6 +211,8 @@ func (f *fakeMetaQuotaStore) GetUploadReservation(ctx context.Context, tenantID,
 }
 
 func (f *fakeMetaQuotaStore) InsertCentralLLMUsage(ctx context.Context, r *LLMUsageView) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.llmUsage = append(f.llmUsage, *r)
 	return nil
 }
@@ -185,6 +222,8 @@ func (f *fakeMetaQuotaStore) InsertCentralLLMUsageTx(tx *sql.Tx, r *LLMUsageView
 }
 
 func (f *fakeMetaQuotaStore) IncrMonthlyLLMCost(ctx context.Context, tenantID string, costMC int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.monthly[tenantID] += costMC
 	return nil
 }
@@ -194,6 +233,8 @@ func (f *fakeMetaQuotaStore) IncrMonthlyLLMCostTx(tx *sql.Tx, tenantID string, c
 }
 
 func (f *fakeMetaQuotaStore) MonthlyLLMCostMillicents(ctx context.Context, tenantID string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.monthlyCostErr != nil {
 		return 0, f.monthlyCostErr
 	}
@@ -201,21 +242,26 @@ func (f *fakeMetaQuotaStore) MonthlyLLMCostMillicents(ctx context.Context, tenan
 }
 
 func (f *fakeMetaQuotaStore) InsertMutationLog(ctx context.Context, entry *MutationLogView) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.insertMutationErr != nil {
 		return 0, f.insertMutationErr
 	}
 	id := f.nextID
 	f.nextID++
 	f.mutations = append(f.mutations, fakeMutationRecord{
-		id:     id,
-		typ:    entry.MutationType,
-		status: "pending",
-		data:   append([]byte(nil), entry.MutationData...),
+		tenantID: entry.TenantID,
+		id:       id,
+		typ:      entry.MutationType,
+		status:   "pending",
+		data:     append([]byte(nil), entry.MutationData...),
 	})
 	return id, nil
 }
 
 func (f *fakeMetaQuotaStore) ListPendingMutations(ctx context.Context, minAge time.Duration, limit int) ([]MutationLogView, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if limit <= 0 {
 		limit = len(f.mutations)
 	}
@@ -226,8 +272,10 @@ func (f *fakeMetaQuotaStore) ListPendingMutations(ctx context.Context, minAge ti
 		}
 		out = append(out, MutationLogView{
 			ID:           m.id,
+			TenantID:     m.tenantID,
 			MutationType: m.typ,
 			MutationData: append([]byte(nil), m.data...),
+			RetryCount:   m.retryCount,
 		})
 		if len(out) >= limit {
 			break
@@ -237,6 +285,8 @@ func (f *fakeMetaQuotaStore) ListPendingMutations(ctx context.Context, minAge ti
 }
 
 func (f *fakeMetaQuotaStore) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	for i := range f.mutations {
 		if f.mutations[i].id == id {
 			f.mutations[i].status = "applied"
@@ -247,11 +297,39 @@ func (f *fakeMetaQuotaStore) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {
 }
 
 func (f *fakeMetaQuotaStore) IncrMutationRetry(ctx context.Context, id int64, maxRetries int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.mutations {
+		if f.mutations[i].id != id {
+			continue
+		}
+		f.mutations[i].retryCount++
+		if maxRetries > 0 && f.mutations[i].retryCount >= maxRetries {
+			f.mutations[i].status = "failed"
+		}
+		return nil
+	}
 	return nil
 }
 
 func (f *fakeMetaQuotaStore) InTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	return fn(nil)
+}
+
+func (f *fakeMetaQuotaStore) ExpireActiveReservations(ctx context.Context) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := time.Now()
+	var released int64
+	for _, r := range f.reservations {
+		if r.Status != "active" || !r.ExpiresAt.Before(now) {
+			continue
+		}
+		r.Status = "aborted"
+		f.ensureUsageLocked(r.TenantID).ReservedBytes -= r.ReservedBytes
+		released += r.ReservedBytes
+	}
+	return released, nil
 }
 
 func newCentralQuotaBackend(t *testing.T) (*Dat9Backend, *fakeMetaQuotaStore) {
