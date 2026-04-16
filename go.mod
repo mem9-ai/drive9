@@ -9,12 +9,13 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/kms v1.50.4
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.88.4
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.10
-	github.com/c4pt0r/agfs/agfs-server v0.0.0
+	github.com/c4pt0r/agfs/agfs-server v0.0.0-20260410081414-678f51854d2a
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/google/uuid v1.6.0
 	github.com/hanwen/go-fuse/v2 v2.9.0
 	github.com/jackc/pgx/v5 v5.9.1
 	github.com/oklog/ulid/v2 v2.1.0
+	github.com/pingcap/failpoint v0.0.0-20260406204437-bbc9d102c19e
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.41.0
 	github.com/tidbcloud/tidb-management-service/api v0.0.0-20260409104828-3391ea2e1652
 	go.uber.org/zap v1.27.0
@@ -82,7 +83,6 @@ require (
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/pingcap/errors v0.11.4 // indirect
-	github.com/pingcap/failpoint v0.0.0-20260406204437-bbc9d102c19e
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
@@ -110,7 +110,4 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/c4pt0r/agfs/agfs-server => ../agfs/agfs-server
-
 replace go.buf.build/protocolbuffers/go/linuxgit/tidbcloud => buf.build/gen/go/linuxgit/tidbcloud/protocolbuffers/go v1.31.0-20220906123915-0bcf82e34c7b.1

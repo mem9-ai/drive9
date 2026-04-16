@@ -901,6 +901,9 @@ func (m *semanticWorkerManager) processImgExtractTask(ctx context.Context, b *ba
 	if err != nil {
 		return semanticTaskOutcome{action: semanticTaskActionRetry, result: string(result), message: err.Error()}
 	}
+	if result == backend.ImageExtractResultBudgetExhausted {
+		return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: "monthly_llm_cost_budget_exhausted"}
+	}
 	return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: string(result)}
 }
 
@@ -908,6 +911,9 @@ func (m *semanticWorkerManager) processAudioExtractTask(ctx context.Context, b *
 	result, err := b.ProcessAudioExtractTask(ctx, audioExtractTaskSpecFromSemanticTask(task))
 	if err != nil {
 		return semanticTaskOutcome{action: semanticTaskActionRetry, result: string(result), message: err.Error()}
+	}
+	if result == backend.AudioExtractResultBudgetExhausted {
+		return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: "monthly_llm_cost_budget_exhausted"}
 	}
 	return semanticTaskOutcome{action: semanticTaskActionAck, result: string(result), message: string(result)}
 }

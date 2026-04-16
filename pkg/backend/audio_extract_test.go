@@ -14,11 +14,11 @@ type staticAudioExtractor struct {
 	err  error
 }
 
-func (e *staticAudioExtractor) ExtractAudioText(ctx context.Context, req AudioExtractRequest) (string, error) {
+func (e *staticAudioExtractor) ExtractAudioText(ctx context.Context, req AudioExtractRequest) (string, AudioExtractUsage, error) {
 	if e.err != nil {
-		return "", e.err
+		return "", AudioExtractUsage{}, e.err
 	}
-	return e.text, nil
+	return e.text, AudioExtractUsage{}, nil
 }
 
 type recordingAudioExtractor struct {
@@ -27,12 +27,12 @@ type recordingAudioExtractor struct {
 	gotContentType string
 }
 
-func (e *recordingAudioExtractor) ExtractAudioText(ctx context.Context, req AudioExtractRequest) (string, error) {
+func (e *recordingAudioExtractor) ExtractAudioText(ctx context.Context, req AudioExtractRequest) (string, AudioExtractUsage, error) {
 	e.gotContentType = req.ContentType
 	if e.err != nil {
-		return "", e.err
+		return "", AudioExtractUsage{}, e.err
 	}
-	return e.text, nil
+	return e.text, AudioExtractUsage{}, nil
 }
 
 func TestProcessAudioExtractTaskWritesContentText(t *testing.T) {

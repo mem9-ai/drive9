@@ -28,7 +28,7 @@ type ImageExtractRequest struct {
 
 // ImageTextExtractor extracts searchable text from image bytes.
 type ImageTextExtractor interface {
-	ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, error)
+	ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, ImageExtractUsage, error)
 }
 
 // ImageExtractTaskSpec carries the revision-scoped inputs needed to extract
@@ -56,6 +56,7 @@ const (
 	ImageExtractResultEmptyText            ImageExtractResult = "empty_text"
 	ImageExtractResultUpdateError          ImageExtractResult = "update_error"
 	ImageExtractResultWritten              ImageExtractResult = "written"
+	ImageExtractResultBudgetExhausted      ImageExtractResult = "budget_exhausted"
 )
 
 func isImageContentType(contentType string) bool {
@@ -232,6 +233,10 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 	if !b.SupportsAsyncImageExtract() {
 		return ImageExtractResultRuntimeNotConfigured, fmt.Errorf("async image extract runtime not configured")
 	}
+	if b.monthlyLLMCostExceeded() {
+		metrics.RecordOperation("llm_cost_budget", "process_skip", "budget_exhausted", 0)
+		return ImageExtractResultBudgetExhausted, nil
+	}
 
 	f, err := b.store.GetFile(ctx, task.FileID)
 	if err != nil {
@@ -266,7 +271,7 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 	}
 
 	taskCtx, cancel := context.WithTimeout(ctx, b.imageExtractTimeout)
-	text, err := b.imageExtractor.ExtractImageText(taskCtx, ImageExtractRequest{
+	text, imageUsage, err := b.imageExtractor.ExtractImageText(taskCtx, ImageExtractRequest{
 		FileID:      task.FileID,
 		Path:        task.Path,
 		ContentType: ct,
@@ -276,6 +281,7 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 	if err != nil {
 		return ImageExtractResultExtractError, fmt.Errorf("extract image text: %w", err)
 	}
+	b.recordImageExtractUsage(task.FileID, imageUsage)
 	text = sanitizeExtractedText(text, b.maxExtractTextBytes)
 	if text == "" {
 		return ImageExtractResultEmptyText, nil

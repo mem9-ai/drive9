@@ -34,14 +34,14 @@ type gatedServerImageExtractor struct {
 	canceled chan struct{}
 }
 
-func (e *gatedServerImageExtractor) ExtractImageText(ctx context.Context, req backend.ImageExtractRequest) (string, error) {
+func (e *gatedServerImageExtractor) ExtractImageText(ctx context.Context, req backend.ImageExtractRequest) (string, backend.ImageExtractUsage, error) {
 	select {
 	case e.started <- struct{}{}:
 	default:
 	}
 	select {
 	case <-e.release:
-		return e.text, nil
+		return e.text, backend.ImageExtractUsage{}, nil
 	case <-ctx.Done():
 		if e.canceled != nil {
 			select {
@@ -49,7 +49,7 @@ func (e *gatedServerImageExtractor) ExtractImageText(ctx context.Context, req ba
 			default:
 			}
 		}
-		return "", ctx.Err()
+		return "", backend.ImageExtractUsage{}, ctx.Err()
 	}
 }
 
@@ -58,7 +58,7 @@ type gatedPanicServerImageExtractor struct {
 	release chan struct{}
 }
 
-func (e *gatedPanicServerImageExtractor) ExtractImageText(context.Context, backend.ImageExtractRequest) (string, error) {
+func (e *gatedPanicServerImageExtractor) ExtractImageText(context.Context, backend.ImageExtractRequest) (string, backend.ImageExtractUsage, error) {
 	if e != nil && e.started != nil {
 		select {
 		case e.started <- struct{}{}:
