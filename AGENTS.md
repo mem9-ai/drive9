@@ -10,13 +10,6 @@ TiDB/MySQL (metadata), S3 (large files), and db9 (small files + embeddings).
 Module: `github.com/mem9-ai/drive9`  
 Go version: 1.25.1 (see `go.mod`)
 
-**Critical prerequisite**: the project has a local `replace` directive pointing to a sibling
-repo. Clone it before building or testing:
-
-```bash
-git clone --depth 1 https://github.com/c4pt0r/agfs ../agfs
-```
-
 ---
 
 ## Build commands
