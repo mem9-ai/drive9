@@ -112,6 +112,7 @@ func main() {
 	masterHex := os.Getenv("DRIVE9_MASTER_KEY")
 	kmsKey := os.Getenv("DRIVE9_ENCRYPT_KEY")
 	tokenHex := os.Getenv("DRIVE9_TOKEN_SIGNING_KEY")
+	vaultMKHex := os.Getenv("DRIVE9_VAULT_MASTER_KEY")
 	providerType := envOr("DRIVE9_TENANT_PROVIDER", tenant.ProviderTiDBZero)
 	maxUploadBytes := server.DefaultMaxUploadBytes
 	if raw := os.Getenv("DRIVE9_MAX_UPLOAD_BYTES"); raw != "" {
@@ -144,6 +145,14 @@ func main() {
 		logger.Warn(context.Background(), "provisioner_not_configured", zap.String("provider", providerType), zap.Error(provisionerErr))
 	} else {
 		logger.Info(context.Background(), "provisioner_configured", zap.String("provider", providerType))
+	}
+
+	var vaultMasterKey []byte
+	if vaultMKHex != "" {
+		vaultMasterKey, err = hex.DecodeString(vaultMKHex)
+		if err != nil {
+			die(fmt.Errorf("invalid DRIVE9_VAULT_MASTER_KEY: %w", err))
+		}
 	}
 
 	var pool *tenant.Pool
@@ -194,6 +203,7 @@ func main() {
 			Pool:             pool,
 			Provisioner:      provisioner,
 			TokenSecret:      tokenSecret,
+			VaultMasterKey:   vaultMasterKey,
 			S3Dir:            s3Dir,
 			MaxUploadBytes:   maxUploadBytes,
 			Logger:           srvLogger,
@@ -209,6 +219,7 @@ func main() {
 		Pool:             pool,
 		Provisioner:      provisioner,
 		TokenSecret:      tokenSecret,
+		VaultMasterKey:   vaultMasterKey,
 		S3Dir:            s3Dir,
 		MaxUploadBytes:   maxUploadBytes,
 		Logger:           srvLogger,
@@ -242,6 +253,7 @@ environment:
   DRIVE9_MASTER_KEY  32-byte hex key for local_aes encryptor
   DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms)
   DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
+  DRIVE9_VAULT_MASTER_KEY   32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
