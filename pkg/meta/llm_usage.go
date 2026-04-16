@@ -108,7 +108,9 @@ func (c *LLMCostCache) MonthlyLLMCostMillicents(ctx context.Context, tenantID st
 		// Only overwrite the cache if no insert bumped the version since the
 		// DB read started. This prevents a stale DB result from reverting a
 		// more recent insert-advanced total.
-		if c.version == vBefore {
+		// Exception: if cached is nil (cold cache), always install — discarding
+		// a valid DB result when there's no fallback value is strictly worse.
+		if c.version == vBefore || c.cached == nil {
 			c.cached = &llmCostCacheEntry{total: total, fetchedAt: time.Now()}
 		}
 		c.mu.Unlock()

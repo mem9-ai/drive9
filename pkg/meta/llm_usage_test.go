@@ -264,6 +264,69 @@ func TestLLMCostCacheReadInsertInterleaving(t *testing.T) {
 	}
 }
 
+// TestLLMCostCacheColdCacheInterleaving is a regression test for the cold-cache
+// variant of the read/insert interleaving race. When cached is nil, a concurrent
+// insert bumps the version but cannot materialize a cache entry (it doesn't know
+// the total). The DB read must still install its result so the stale fallback
+// has a value to return.
+//
+// Timeline:
+//   1. cache = nil (cold start)
+//   2. goroutine A starts MonthlyLLMCostMillicents, snapshots vBefore = 0
+//   3. (hook) goroutine B InsertLLMUsage(+200), bumps version to 1, but cached stays nil
+//   4. goroutine A's DB read succeeds — must install cache despite version mismatch
+//   5. meta store goes down; stale fallback must return the DB result, not 0
+func TestLLMCostCacheColdCacheInterleaving(t *testing.T) {
+	s := newControlStore(t)
+	_, _ = s.DB().Exec("DELETE FROM llm_usage")
+
+	ctx := context.Background()
+	// Pre-insert so the DB has a non-zero total to return.
+	if err := s.InsertLLMUsage(ctx, "t1", "img_extract_text", "task-1", 3000, 100, "tokens"); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := NewLLMCostCache(s, "t1", 1*time.Hour)
+	// cache.cached is nil at this point (cold cache).
+
+	hookCalled := false
+	cache.afterDBRead = func() {
+		hookCalled = true
+		// Simulate a concurrent insert during the DB read.
+		// This bumps version but cannot create a cache entry (cached is nil).
+		if err := cache.InsertLLMUsage(ctx, "t1", "img_extract_text", "task-2", 200, 50, "tokens"); err != nil {
+			t.Errorf("insert in hook: %v", err)
+		}
+	}
+
+	// DB read succeeds (returns 3000 or 3200 depending on insert timing).
+	// Despite version mismatch, the result must be installed because cached is nil.
+	total, err := cache.MonthlyLLMCostMillicents(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hookCalled {
+		t.Fatal("afterDBRead hook was not called")
+	}
+
+	// Clear hook and close DB to force stale fallback.
+	cache.afterDBRead = nil
+	_ = s.Close()
+
+	// Stale fallback must return a non-zero value (the installed DB result),
+	// NOT 0 (which would mean the valid DB read was discarded).
+	total, err = cache.MonthlyLLMCostMillicents(ctx, "t1")
+	if err != nil {
+		t.Fatalf("expected stale cache hit (no error), got err: %v", err)
+	}
+	if total == 0 {
+		t.Fatal("cold-cache interleaving: stale fallback returned 0, expected non-zero (DB result was discarded)")
+	}
+	// The exact value depends on whether the DB read saw the insert (3000 or 3200).
+	// Either is acceptable; the key invariant is total != 0.
+	t.Logf("cold-cache interleaving: stale fallback returned %d (valid)", total)
+}
+
 func TestLLMCostCacheColdStart_FailOpen(t *testing.T) {
 	s := newControlStore(t)
 
