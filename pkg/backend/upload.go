@@ -239,7 +239,8 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 
 	// Server-reserve-first saga: claim reserved_bytes on server DB before
 	// touching the tenant DB. Fail-open on server DB errors.
-	if err := b.reserveUploadOnServer(ctx, uploadID, path, totalSize); err != nil {
+	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, totalSize)
+	if err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		metrics.RecordOperation("backend", "initiate_upload", "quota_exceeded", time.Since(start))
 		return nil, err
@@ -281,7 +282,9 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		})
 	}); err != nil {
 		// Compensating abort: release server reservation on tenant DB failure.
-		b.abortUploadReservation(ctx, uploadID, totalSize)
+		if reserved {
+			b.abortUploadReservation(ctx, uploadID, totalSize)
+		}
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		logger.Error(ctx, "backend_initiate_upload_insert_upload_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
@@ -376,7 +379,8 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 
 	// Server-reserve-first saga: claim reserved_bytes on server DB before
 	// touching the tenant DB. Fail-open on server DB errors.
-	if err := b.reserveUploadOnServer(ctx, uploadID, path, totalSize); err != nil {
+	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, totalSize)
+	if err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		metrics.RecordOperation("backend", "initiate_upload_v2", "quota_exceeded", time.Since(start))
 		return nil, err
@@ -431,7 +435,9 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		return nil
 	}); err != nil {
 		// Compensating abort: release server reservation on tenant DB failure.
-		b.abortUploadReservation(ctx, uploadID, totalSize)
+		if reserved {
+			b.abortUploadReservation(ctx, uploadID, totalSize)
+		}
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		logger.Error(ctx, "backend_initiate_upload_v2_insert_upload_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
@@ -920,7 +926,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			}
 			if b.UsesDatabaseAutoEmbedding() {
 				stepStart = time.Now()
-				err := b.enqueueTiDBAutoSemanticTasksTx(tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+				err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 				return err
 			}
@@ -987,7 +993,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		insertNodeDurationMs = uploadPhaseMs(stepStart)
 		if b.UsesDatabaseAutoEmbedding() {
 			stepStart = time.Now()
-			err := b.enqueueTiDBAutoSemanticTasksTx(tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+			err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 			return err
 		}

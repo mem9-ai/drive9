@@ -148,24 +148,43 @@ func (s *Store) EnsureQuotaUsageRow(ctx context.Context, tenantID string) error 
 	return err
 }
 
+// ensureRowsAffected checks that an UPDATE touched at least one row.
+// Returns an error if the tenant_quota_usage row is missing.
+func ensureRowsAffected(res sql.Result, tenantID string) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("tenant_quota_usage row missing for tenant %s", tenantID)
+	}
+	return nil
+}
+
 // IncrStorageBytes atomically adjusts the storage_bytes counter.
 func (s *Store) IncrStorageBytes(ctx context.Context, tenantID string, delta int64) error {
 	start := time.Now()
 	var err error
 	defer observeMeta(ctx, "incr_storage_bytes", start, &err)
 
-	_, err = s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE tenant_quota_usage SET storage_bytes = storage_bytes + ? WHERE tenant_id = ?`,
 		delta, tenantID)
-	return err
+	if err != nil {
+		return err
+	}
+	return ensureRowsAffected(res, tenantID)
 }
 
 // IncrStorageBytesTx atomically adjusts the storage_bytes counter inside a transaction.
 func (s *Store) IncrStorageBytesTx(tx *sql.Tx, tenantID string, delta int64) error {
-	_, err := tx.Exec(
+	res, err := tx.Exec(
 		`UPDATE tenant_quota_usage SET storage_bytes = storage_bytes + ? WHERE tenant_id = ?`,
 		delta, tenantID)
-	return err
+	if err != nil {
+		return err
+	}
+	return ensureRowsAffected(res, tenantID)
 }
 
 // IncrReservedBytes atomically adjusts the reserved_bytes counter.
@@ -174,18 +193,24 @@ func (s *Store) IncrReservedBytes(ctx context.Context, tenantID string, delta in
 	var err error
 	defer observeMeta(ctx, "incr_reserved_bytes", start, &err)
 
-	_, err = s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE tenant_quota_usage SET reserved_bytes = reserved_bytes + ? WHERE tenant_id = ?`,
 		delta, tenantID)
-	return err
+	if err != nil {
+		return err
+	}
+	return ensureRowsAffected(res, tenantID)
 }
 
 // IncrReservedBytesTx atomically adjusts the reserved_bytes counter inside a transaction.
 func (s *Store) IncrReservedBytesTx(tx *sql.Tx, tenantID string, delta int64) error {
-	_, err := tx.Exec(
+	res, err := tx.Exec(
 		`UPDATE tenant_quota_usage SET reserved_bytes = reserved_bytes + ? WHERE tenant_id = ?`,
 		delta, tenantID)
-	return err
+	if err != nil {
+		return err
+	}
+	return ensureRowsAffected(res, tenantID)
 }
 
 // IncrMediaFileCount atomically adjusts the media_file_count counter.
@@ -194,18 +219,24 @@ func (s *Store) IncrMediaFileCount(ctx context.Context, tenantID string, delta i
 	var err error
 	defer observeMeta(ctx, "incr_media_file_count", start, &err)
 
-	_, err = s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE tenant_quota_usage SET media_file_count = media_file_count + ? WHERE tenant_id = ?`,
 		delta, tenantID)
-	return err
+	if err != nil {
+		return err
+	}
+	return ensureRowsAffected(res, tenantID)
 }
 
 // IncrMediaFileCountTx atomically adjusts the media_file_count counter inside a transaction.
 func (s *Store) IncrMediaFileCountTx(tx *sql.Tx, tenantID string, delta int64) error {
-	_, err := tx.Exec(
+	res, err := tx.Exec(
 		`UPDATE tenant_quota_usage SET media_file_count = media_file_count + ? WHERE tenant_id = ?`,
 		delta, tenantID)
-	return err
+	if err != nil {
+		return err
+	}
+	return ensureRowsAffected(res, tenantID)
 }
 
 // TransferReservedToConfirmed atomically moves bytes from reserved to confirmed storage.
@@ -214,27 +245,37 @@ func (s *Store) TransferReservedToConfirmed(ctx context.Context, tenantID string
 	var err error
 	defer observeMeta(ctx, "transfer_reserved_to_confirmed", start, &err)
 
-	_, err = s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE tenant_quota_usage
 		 SET reserved_bytes = reserved_bytes + ?, storage_bytes = storage_bytes + ?
 		 WHERE tenant_id = ?`,
 		reservedDelta, storageDelta, tenantID)
-	return err
+	if err != nil {
+		return err
+	}
+	return ensureRowsAffected(res, tenantID)
 }
 
-// TransferReservedToConfirmed atomically moves bytes from reserved to confirmed storage in a transaction.
+// TransferReservedToConfirmedTx atomically moves bytes from reserved to confirmed storage in a transaction.
 func (s *Store) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID string, reservedDelta, storageDelta int64) error {
-	_, err := tx.Exec(
+	res, err := tx.Exec(
 		`UPDATE tenant_quota_usage
 		 SET reserved_bytes = reserved_bytes + ?, storage_bytes = storage_bytes + ?
 		 WHERE tenant_id = ?`,
 		reservedDelta, storageDelta, tenantID)
-	return err
+	if err != nil {
+		return err
+	}
+	return ensureRowsAffected(res, tenantID)
 }
+
+// defaultMaxStorageBytes is the fallback limit when no per-tenant config row exists.
+const defaultMaxStorageBytes = int64(50 * (1 << 30)) // 50 GiB
 
 // AtomicReserveUpload performs an atomic check-and-claim for upload reservation.
 // Returns ErrStorageQuotaExceeded if the projected total exceeds the quota.
 // This is the server-reserve-first protocol for upload initiate.
+// When no tenant_quota_config row exists, falls back to the default 50 GiB limit.
 func (s *Store) AtomicReserveUpload(ctx context.Context, tenantID string, reserveBytes int64) error {
 	start := time.Now()
 	var err error
@@ -245,8 +286,8 @@ func (s *Store) AtomicReserveUpload(ctx context.Context, tenantID string, reserv
 		 SET reserved_bytes = reserved_bytes + ?
 		 WHERE tenant_id = ?
 		   AND storage_bytes + reserved_bytes + ? <=
-		       (SELECT max_storage_bytes FROM tenant_quota_config WHERE tenant_id = ?)`,
-		reserveBytes, tenantID, reserveBytes, tenantID)
+		       COALESCE((SELECT max_storage_bytes FROM tenant_quota_config WHERE tenant_id = ?), ?)`,
+		reserveBytes, tenantID, reserveBytes, tenantID, defaultMaxStorageBytes)
 	if err != nil {
 		return err
 	}
@@ -391,42 +432,62 @@ func (s *Store) GetUploadReservation(ctx context.Context, tenantID, uploadID str
 
 // ExpireActiveReservations marks expired active reservations as aborted and
 // returns the total bytes released. This is called by the expiry sweep worker.
+// All changes are applied in a single transaction to prevent double-release
+// if the process crashes mid-sweep.
 func (s *Store) ExpireActiveReservations(ctx context.Context) (int64, error) {
 	start := time.Now()
 	var err error
 	defer observeMeta(ctx, "expire_active_reservations", start, &err)
 
 	now := time.Now().UTC()
-	// Collect tenant-level totals so we can adjust quota counters.
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT tenant_id, SUM(reserved_bytes)
-		 FROM tenant_upload_reservations
-		 WHERE status = 'active' AND expires_at < ?
-		 GROUP BY tenant_id`, now)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = rows.Close() }()
-
 	var totalReleased int64
-	for rows.Next() {
-		var tid string
-		var released int64
-		if err := rows.Scan(&tid, &released); err != nil {
-			return totalReleased, err
-		}
-		if err := s.IncrReservedBytes(ctx, tid, -released); err != nil {
-			return totalReleased, fmt.Errorf("release reserved bytes for %s: %w", tid, err)
-		}
-		totalReleased += released
-	}
-	if err := rows.Err(); err != nil {
-		return totalReleased, err
-	}
 
-	_, err = s.db.ExecContext(ctx,
-		`UPDATE tenant_upload_reservations SET status = 'aborted'
-		 WHERE status = 'active' AND expires_at < ?`, now)
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		// Collect tenant-level totals so we can adjust quota counters.
+		rows, err := tx.QueryContext(ctx,
+			`SELECT tenant_id, SUM(reserved_bytes)
+			 FROM tenant_upload_reservations
+			 WHERE status = 'active' AND expires_at < ?
+			 GROUP BY tenant_id`, now)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rows.Close() }()
+
+		type tenantRelease struct {
+			tenantID string
+			released int64
+		}
+		var releases []tenantRelease
+		for rows.Next() {
+			var tr tenantRelease
+			if err := rows.Scan(&tr.tenantID, &tr.released); err != nil {
+				return err
+			}
+			releases = append(releases, tr)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		for _, tr := range releases {
+			res, err := tx.Exec(
+				`UPDATE tenant_quota_usage SET reserved_bytes = reserved_bytes + ? WHERE tenant_id = ?`,
+				-tr.released, tr.tenantID)
+			if err != nil {
+				return fmt.Errorf("release reserved bytes for %s: %w", tr.tenantID, err)
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return fmt.Errorf("tenant_quota_usage row missing for tenant %s", tr.tenantID)
+			}
+			totalReleased += tr.released
+		}
+
+		_, err = tx.ExecContext(ctx,
+			`UPDATE tenant_upload_reservations SET status = 'aborted'
+			 WHERE status = 'active' AND expires_at < ?`, now)
+		return err
+	})
 	return totalReleased, err
 }
 
@@ -571,6 +632,23 @@ func (s *Store) IncrMutationRetry(ctx context.Context, id int64, maxRetries int)
 		 SET retry_count = retry_count + 1,
 		     status = CASE WHEN retry_count + 1 >= ? THEN 'failed' ELSE 'pending' END
 		 WHERE id = ?`, maxRetries, id)
+	return err
+}
+
+// SetQuotaCounters atomically sets the absolute quota counter values for a
+// tenant. Used by the backfill CLI to bootstrap counters from tenant DBs.
+func (s *Store) SetQuotaCounters(ctx context.Context, tenantID string, storageBytes, mediaFileCount int64) error {
+	start := time.Now()
+	var err error
+	defer observeMeta(ctx, "set_quota_counters", start, &err)
+
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO tenant_quota_usage (tenant_id, storage_bytes, reserved_bytes, media_file_count)
+		 VALUES (?, ?, 0, ?)
+		 ON DUPLICATE KEY UPDATE
+		   storage_bytes = VALUES(storage_bytes),
+		   media_file_count = VALUES(media_file_count)`,
+		tenantID, storageBytes, mediaFileCount)
 	return err
 }
 

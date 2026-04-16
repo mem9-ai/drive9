@@ -33,7 +33,18 @@ func (b *Dat9Backend) UseServerQuota() bool {
 // For small writes: delegates to ensureStorageQuotaServer or ensureTenantStorageQuotaTx.
 func (b *Dat9Backend) ensureStorageQuota(ctx context.Context, tx *sql.Tx, path string, newSize int64) error {
 	if b.UseServerQuota() {
-		return b.ensureStorageQuotaServer(ctx, newSize)
+		// Server quota tracks total storage_bytes. For overwrites we need the
+		// delta (newSize - currentSize) not the full newSize, otherwise the
+		// check double-charges the existing file's bytes.
+		currentSize, err := b.store.ConfirmedFileSizeByPathTx(tx, path)
+		if err != nil {
+			return fmt.Errorf("load current file size: %w", err)
+		}
+		deltaBytes := newSize - currentSize
+		if deltaBytes <= 0 {
+			return nil // shrinking or same size — no additional quota needed
+		}
+		return b.ensureStorageQuotaServer(ctx, deltaBytes)
 	}
 	return b.ensureTenantStorageQuotaTx(tx, path, newSize)
 }
@@ -62,7 +73,8 @@ func (b *Dat9Backend) monthlyLLMCostExceededCheck(ctx context.Context) bool {
 	return b.monthlyLLMCostExceeded()
 }
 
-// monthlyLLMCostExceededServer checks the server DB monthly cost counter.
+// monthlyLLMCostExceededServer checks the server DB monthly cost counter
+// against the per-tenant config (falling back to the global default).
 func (b *Dat9Backend) monthlyLLMCostExceededServer(ctx context.Context) bool {
 	if b.metaStore == nil || b.maxMonthlyLLMCostMillicents <= 0 {
 		return false
@@ -75,7 +87,13 @@ func (b *Dat9Backend) monthlyLLMCostExceededServer(ctx context.Context) bool {
 		metrics.RecordOperation("server_quota", "llm_cost_check", "fail_open", time.Since(start))
 		return false // fail-open
 	}
-	return total > b.maxMonthlyLLMCostMillicents
+	// Use per-tenant config if available, otherwise fall back to global default.
+	limit := b.maxMonthlyLLMCostMillicents
+	cfg, err := b.metaStore.GetQuotaConfig(ctx, b.tenantID)
+	if err == nil && cfg.MaxMonthlyCostMC > 0 {
+		limit = cfg.MaxMonthlyCostMC
+	}
+	return total > limit
 }
 
 func (b *Dat9Backend) ensureUploadSizeAllowed(size int64) error {

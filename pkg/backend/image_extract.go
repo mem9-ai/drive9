@@ -233,7 +233,7 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 	if !b.SupportsAsyncImageExtract() {
 		return ImageExtractResultRuntimeNotConfigured, fmt.Errorf("async image extract runtime not configured")
 	}
-	if b.monthlyLLMCostExceededCheck(backgroundWithTrace()) {
+	if b.monthlyLLMCostExceededCheck(ctx) {
 		metrics.RecordOperation("llm_cost_budget", "process_skip", "budget_exhausted", 0)
 		return ImageExtractResultBudgetExhausted, nil
 	}

@@ -475,8 +475,12 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	}
 
 	// Quota enforcement source: "tenant" (default) or "server" (central server DB).
-	if qs := strings.ToLower(strings.TrimSpace(os.Getenv("DRIVE9_QUOTA_SOURCE"))); qs == "server" {
+	switch qs := strings.ToLower(strings.TrimSpace(os.Getenv("DRIVE9_QUOTA_SOURCE"))); qs {
+	case "", "tenant":
+	case "server":
 		opts.QuotaSource = backend.QuotaSourceServer
+	default:
+		die(fmt.Errorf("DRIVE9_QUOTA_SOURCE must be one of tenant or server, got %q", qs))
 	}
 
 	queryBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_BASE"))

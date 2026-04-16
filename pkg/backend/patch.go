@@ -214,7 +214,8 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	expiresAt := now.Add(24 * time.Hour)
 
 	// Server-reserve-first saga (same as upload initiate).
-	if err := b.reserveUploadOnServer(ctx, uploadID, path, newSize); err != nil {
+	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, newSize)
+	if err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
 		metrics.RecordOperation("backend", "patch_upload", "quota_exceeded", time.Since(start))
 		return nil, err
@@ -251,7 +252,9 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 			ExpiresAt:        expiresAt,
 		})
 	}); err != nil {
-		b.abortUploadReservation(ctx, uploadID, newSize)
+		if reserved {
+			b.abortUploadReservation(ctx, uploadID, newSize)
+		}
 		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
 		logger.Error(ctx, "backend_patch_upload_insert_upload_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))

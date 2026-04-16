@@ -32,12 +32,15 @@ func (b *Dat9Backend) recordImageExtractUsage(taskID string, usage ImageExtractU
 	if cost <= 0 {
 		return
 	}
-	if err := b.store.InsertLLMUsage("img_extract_text", taskID, cost, totalTokens, "tokens"); err != nil {
-		logger.Warn(backgroundWithTrace(), "llm_usage_insert_failed",
-			zap.String("task_type", "img_extract_text"),
-			zap.String("task_id", taskID),
-			zap.Error(err))
-		metrics.RecordOperation("llm_cost_budget", "usage_insert", "error", 0)
+	// Write to tenant DB only when server quota is not active.
+	if !b.UseServerQuota() {
+		if err := b.store.InsertLLMUsage("img_extract_text", taskID, cost, totalTokens, "tokens"); err != nil {
+			logger.Warn(backgroundWithTrace(), "llm_usage_insert_failed",
+				zap.String("task_type", "img_extract_text"),
+				zap.String("task_id", taskID),
+				zap.Error(err))
+			metrics.RecordOperation("llm_cost_budget", "usage_insert", "error", 0)
+		}
 	}
 	b.syncCentralLLMCostRecord(backgroundWithTrace(), "img_extract_text", taskID, cost, totalTokens, "tokens")
 }
@@ -63,12 +66,15 @@ func (b *Dat9Backend) recordAudioExtractUsage(taskID string, usage AudioExtractU
 	if cost <= 0 {
 		return
 	}
-	if err := b.store.InsertLLMUsage("audio_extract_text", taskID, cost, rawUnits, rawUnitType); err != nil {
-		logger.Warn(backgroundWithTrace(), "llm_usage_insert_failed",
-			zap.String("task_type", "audio_extract_text"),
-			zap.String("task_id", taskID),
-			zap.Error(err))
-		metrics.RecordOperation("llm_cost_budget", "usage_insert", "error", 0)
+	// Write to tenant DB only when server quota is not active.
+	if !b.UseServerQuota() {
+		if err := b.store.InsertLLMUsage("audio_extract_text", taskID, cost, rawUnits, rawUnitType); err != nil {
+			logger.Warn(backgroundWithTrace(), "llm_usage_insert_failed",
+				zap.String("task_type", "audio_extract_text"),
+				zap.String("task_id", taskID),
+				zap.Error(err))
+			metrics.RecordOperation("llm_cost_budget", "usage_insert", "error", 0)
+		}
 	}
 	b.syncCentralLLMCostRecord(backgroundWithTrace(), "audio_extract_text", taskID, cost, rawUnits, rawUnitType)
 }
@@ -100,7 +106,7 @@ func (b *Dat9Backend) monthlyLLMCostExceeded() bool {
 	if b.maxMonthlyLLMCostMillicents <= 0 {
 		return false
 	}
-	if b.metaStore != nil && b.tenantID != "" {
+	if b.UseServerQuota() && b.metaStore != nil && b.tenantID != "" {
 		total, err := b.metaStore.MonthlyLLMCostMillicents(backgroundWithTrace(), b.tenantID)
 		if err != nil {
 			logger.Warn(backgroundWithTrace(), "llm_cost_budget_check_fail_open", zap.Error(err))

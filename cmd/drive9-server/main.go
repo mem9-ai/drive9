@@ -52,6 +52,9 @@ func main() {
 		case "schema":
 			die(runSchemaCommand(os.Args[2:]))
 			return
+		case "backfill-quota":
+			die(runBackfillQuota(os.Args[2:]))
+			return
 		}
 	}
 	if len(os.Args) > 2 {
@@ -199,6 +202,12 @@ func main() {
 		replayWorker := backend.StartMutationReplayWorker(tenant.NewMetaQuotaAdapter(store))
 		if replayWorker != nil {
 			defer replayWorker.Stop()
+		}
+
+		// Start the upload reservation expiry sweep worker.
+		expirySweepWorker := backend.StartExpirySweepWorker(store)
+		if expirySweepWorker != nil {
+			defer expirySweepWorker.Stop()
 		}
 
 		// TODO: Run ValidateDurableAsyncExtractRequiresSemanticWorker only when this process
@@ -361,8 +370,12 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	}
 
 	// Quota enforcement source: "tenant" (default, per-tenant DB) or "server" (central server DB).
-	if qs := strings.ToLower(strings.TrimSpace(os.Getenv("DRIVE9_QUOTA_SOURCE"))); qs == "server" {
+	switch qs := strings.ToLower(strings.TrimSpace(os.Getenv("DRIVE9_QUOTA_SOURCE"))); qs {
+	case "", "tenant":
+	case "server":
 		opts.QuotaSource = backend.QuotaSourceServer
+	default:
+		return backend.Options{}, fmt.Errorf("DRIVE9_QUOTA_SOURCE must be one of tenant or server, got %q", qs)
 	}
 
 	queryBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_BASE"))

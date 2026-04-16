@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -17,16 +18,21 @@ import (
 // 1. AtomicReserveUpload (check + claim reserved_bytes in one UPDATE)
 // 2. InsertUploadReservation (tracking row)
 //
-// Returns nil on success. On failure, any partial state is compensated.
-// When metaStore is nil (central quota not wired), this is a no-op.
-func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targetPath string, totalSize int64) error {
+// Returns (reserved, nil) on success where reserved indicates whether bytes
+// were actually claimed on the server. On quota exceeded returns (false, err).
+// When metaStore is nil (central quota not wired), this is a no-op returning (false, nil).
+func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targetPath string, totalSize int64) (bool, error) {
 	if b.metaStore == nil {
-		return nil
+		return false, nil
 	}
 	start := time.Now()
 
 	// Step 1: atomic reserve — check+claim in a single UPDATE.
 	if err := b.metaStore.AtomicReserveUpload(ctx, b.tenantID, totalSize); err != nil {
+		if errors.Is(err, ErrStorageQuotaExceeded) {
+			metrics.RecordOperation("central_quota", "reserve_upload", "quota_exceeded", time.Since(start))
+			return false, err
+		}
 		logger.Warn(ctx, "central_quota_reserve_upload_failed",
 			zap.String("tenant_id", b.tenantID),
 			zap.String("upload_id", uploadID),
@@ -34,7 +40,7 @@ func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targe
 			zap.Error(err))
 		metrics.RecordOperation("central_quota", "reserve_upload", "fail_open", time.Since(start))
 		// Fail-open: allow the upload to proceed even if server DB is down.
-		return nil
+		return false, nil
 	}
 
 	// Step 2: record the reservation row.
@@ -59,11 +65,11 @@ func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targe
 			zap.Error(err))
 		metrics.RecordOperation("central_quota", "reserve_upload", "fail_open", time.Since(start))
 		// Fail-open.
-		return nil
+		return false, nil
 	}
 
 	metrics.RecordOperation("central_quota", "reserve_upload", "ok", time.Since(start))
-	return nil
+	return true, nil
 }
 
 // --- Upload abort: release reservation ---
