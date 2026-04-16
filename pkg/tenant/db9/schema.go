@@ -109,6 +109,16 @@ func InitSchemaStatements() []string {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_task_claim ON semantic_tasks(status, available_at, lease_until, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_task_claim_type ON semantic_tasks(status, task_type, available_at, created_at, task_id)`,
+		`CREATE TABLE IF NOT EXISTS llm_usage (
+			id              BIGSERIAL PRIMARY KEY,
+			task_type       VARCHAR(32) NOT NULL,
+			task_id         VARCHAR(64) NOT NULL,
+			cost_millicents BIGINT NOT NULL DEFAULT 0,
+			raw_units       BIGINT NOT NULL DEFAULT 0,
+			raw_unit_type   VARCHAR(16) NOT NULL,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_llm_usage_created ON llm_usage(created_at)`,
 	}
 	stmts := make([]string, 0, len(core)+len(vault.SchemaStatements()))
 	stmts = append(stmts, core...)

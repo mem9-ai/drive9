@@ -22,22 +22,22 @@ type BasicImageTextExtractor struct{}
 
 func NewBasicImageTextExtractor() *BasicImageTextExtractor { return &BasicImageTextExtractor{} }
 
-func (e *BasicImageTextExtractor) ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, error) {
+func (e *BasicImageTextExtractor) ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, ImageExtractUsage, error) {
 	select {
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return "", ImageExtractUsage{}, ctx.Err()
 	default:
 	}
 
 	name := pathutil.BaseName(req.Path)
 	cfg, format, err := image.DecodeConfig(bytes.NewReader(req.Data))
 	if err == nil {
-		return strings.TrimSpace(fmt.Sprintf("image file %s format %s width %d height %d", name, strings.ToLower(format), cfg.Width, cfg.Height)), nil
+		return strings.TrimSpace(fmt.Sprintf("image file %s format %s width %d height %d", name, strings.ToLower(format), cfg.Width, cfg.Height)), ImageExtractUsage{}, nil
 	}
 	if req.ContentType != "" {
-		return strings.TrimSpace(fmt.Sprintf("image file %s content type %s", name, req.ContentType)), nil
+		return strings.TrimSpace(fmt.Sprintf("image file %s content type %s", name, req.ContentType)), ImageExtractUsage{}, nil
 	}
-	return strings.TrimSpace(fmt.Sprintf("image file %s", name)), nil
+	return strings.TrimSpace(fmt.Sprintf("image file %s", name)), ImageExtractUsage{}, nil
 }
 
 type fallbackImageTextExtractor struct {
@@ -56,10 +56,10 @@ func NewFallbackImageTextExtractor(primary, fallback ImageTextExtractor) ImageTe
 	return &fallbackImageTextExtractor{primary: primary, fallback: fallback}
 }
 
-func (e *fallbackImageTextExtractor) ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, error) {
-	text, err := e.primary.ExtractImageText(ctx, req)
+func (e *fallbackImageTextExtractor) ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, ImageExtractUsage, error) {
+	text, usage, err := e.primary.ExtractImageText(ctx, req)
 	if err == nil && strings.TrimSpace(text) != "" {
-		return text, nil
+		return text, usage, nil
 	}
 	if err != nil {
 		logger.Warn(ctx, "backend_image_extract_primary_failed_use_fallback",

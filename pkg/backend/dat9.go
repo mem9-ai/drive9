@@ -63,6 +63,14 @@ type Dat9Backend struct {
 	audioExtractTimeout      time.Duration
 	audioExtractMaxSize      int64
 	maxAudioExtractTextBytes int
+
+	// Monthly LLM cost budget (P1).
+	maxMonthlyLLMCostMillicents    int64
+	visionCostPerKTokenMillicents  int64
+	audioLLMCostPerKTokenMillicents int64
+	whisperCostPerMinuteMillicents int64
+	fallbackImageCostMillicents    int64
+	fallbackAudioCostMillicents    int64
 }
 
 func newBaseBackend(store *datastore.Store) *Dat9Backend {
