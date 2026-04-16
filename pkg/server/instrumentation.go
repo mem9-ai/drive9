@@ -199,6 +199,12 @@ type observedResponseWriter struct {
 	size   int
 }
 
+func (w *observedResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 func (w *observedResponseWriter) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
