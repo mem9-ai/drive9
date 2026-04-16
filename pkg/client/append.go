@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/mem9-ai/dat9/pkg/s3client"
@@ -26,9 +27,6 @@ func (c *Client) AppendStream(ctx context.Context, path string, r io.Reader, siz
 	if size < 0 {
 		return fmt.Errorf("append size must be non-negative")
 	}
-	if size == 0 {
-		return nil
-	}
 
 	stat, err := c.StatCtx(ctx, path)
 	if err != nil {
@@ -40,12 +38,20 @@ func (c *Client) AppendStream(ctx context.Context, path string, r io.Reader, siz
 	if stat.IsDir {
 		return fmt.Errorf("is a directory: %s", path)
 	}
+	if size == 0 {
+		return nil
+	}
 
-	partSize := s3client.CalcAdaptivePartSize(stat.Size)
+	finalSize := stat.Size + size
+	if finalSize < stat.Size {
+		return fmt.Errorf("append size overflows file size")
+	}
+
+	partSize := s3client.CalcAdaptivePartSize(finalSize)
 	plan, err := c.initiateAppend(ctx, path, size, partSize, stat.Revision)
 	if err != nil {
 		if shouldRewriteAppend(err) {
-			return c.appendByRewrite(ctx, path, r, size, stat.Revision)
+			return c.appendByRewrite(ctx, path, r, size, finalSize, stat.Revision, progress)
 		}
 		return err
 	}
@@ -120,24 +126,38 @@ func (c *Client) initiateAppend(ctx context.Context, path string, appendSize int
 	return &plan, nil
 }
 
-func (c *Client) appendByRewrite(ctx context.Context, path string, r io.Reader, appendSize int64, expectedRevision int64) error {
-	existing, err := c.ReadCtx(ctx, path)
+func (c *Client) appendByRewrite(ctx context.Context, path string, r io.Reader, appendSize int64, finalSize int64, expectedRevision int64, progress ProgressFunc) error {
+	tmp, err := os.CreateTemp("", "drive9-append-*")
+	if err != nil {
+		return fmt.Errorf("create append temp file: %w", err)
+	}
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+	}()
+
+	existing, err := c.ReadStream(ctx, path)
 	if err != nil {
 		return err
 	}
+	defer func() { _ = existing.Close() }()
 
-	appendData, err := io.ReadAll(io.LimitReader(r, appendSize))
+	if _, err := io.Copy(tmp, existing); err != nil {
+		return fmt.Errorf("copy existing file into temp file: %w", err)
+	}
+
+	written, err := io.Copy(tmp, io.LimitReader(r, appendSize))
 	if err != nil {
-		return fmt.Errorf("read append data: %w", err)
+		return fmt.Errorf("copy append data into temp file: %w", err)
 	}
-	if int64(len(appendData)) != appendSize {
-		return fmt.Errorf("read append data: got %d bytes, want %d", len(appendData), appendSize)
+	if written != appendSize {
+		return fmt.Errorf("copy append data into temp file: got %d bytes, want %d", written, appendSize)
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind append temp file: %w", err)
 	}
 
-	final := make([]byte, 0, len(existing)+len(appendData))
-	final = append(final, existing...)
-	final = append(final, appendData...)
-	return c.WriteCtxConditional(ctx, path, final, expectedRevision)
+	return c.WriteStreamConditional(ctx, path, tmp, finalSize, progress, expectedRevision)
 }
 
 func isClientNotFound(err error) bool {

@@ -73,13 +73,16 @@ func (b *Dat9Backend) InitiateAppendUploadIfRevision(ctx context.Context, path s
 	if err != nil {
 		return nil, err
 	}
+	if b.s3 == nil {
+		return nil, ErrS3NotConfigured
+	}
 
 	nf, err := b.store.Stat(ctx, path)
 	if err != nil {
 		return nil, err
 	}
 	if nf.File == nil || nf.File.StorageType != datastore.StorageS3 {
-		return nil, fmt.Errorf("file is not S3-stored: %s", path)
+		return nil, fmt.Errorf("%w: %s", ErrNotS3Stored, path)
 	}
 	if expectedRevision == 0 {
 		return nil, datastore.ErrRevisionConflict
@@ -156,7 +159,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	}
 	if b.s3 == nil {
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
-		return nil, fmt.Errorf("S3 not configured")
+		return nil, ErrS3NotConfigured
 	}
 
 	// Look up existing file to get its S3 key
@@ -167,7 +170,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	}
 	if nf.File == nil || nf.File.StorageType != datastore.StorageS3 {
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
-		return nil, fmt.Errorf("file is not S3-stored: %s", path)
+		return nil, fmt.Errorf("%w: %s", ErrNotS3Stored, path)
 	}
 	if expectedRevision == 0 {
 		metrics.RecordOperation("backend", "patch_upload", "conflict", time.Since(start))

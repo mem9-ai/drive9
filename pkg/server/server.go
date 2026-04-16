@@ -716,7 +716,7 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
-		if strings.Contains(err.Error(), "file is not S3-stored") || strings.Contains(err.Error(), "S3 not configured") {
+		if errors.Is(err, backend.ErrNotS3Stored) || errors.Is(err, backend.ErrS3NotConfigured) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_unsupported_target", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_patch", "result", "error")
 			errJSON(w, http.StatusBadRequest, err.Error())
@@ -802,7 +802,7 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
-		if strings.HasPrefix(err.Error(), "file is not S3-stored:") {
+		if errors.Is(err, backend.ErrNotS3Stored) || errors.Is(err, backend.ErrS3NotConfigured) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_bad_target", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_append", "result", "error")
 			errJSON(w, http.StatusBadRequest, err.Error())
