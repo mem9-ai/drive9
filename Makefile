@@ -12,14 +12,18 @@ GOARCH ?= $(HOST_GOARCH)
 
 APP_NAME ?= drive9-server
 CLI_NAME ?= drive9
+LOCAL_SERVER_NAME ?= drive9-server-local
 
 BIN_DIR ?= bin
 DIST_DIR ?= dist
 SERVER_BIN ?= $(BIN_DIR)/$(APP_NAME)
 CLI_BIN ?= $(BIN_DIR)/$(CLI_NAME)
+LOCAL_SERVER_BIN ?= $(BIN_DIR)/$(LOCAL_SERVER_NAME)
 LOCAL_BIN ?= $(CURDIR)/bin
 VERSION ?=
 GIT_HASH ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 CLI_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 GOLANGCI_LINT_VERSION ?= v2.5.0
@@ -31,7 +35,12 @@ IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
 LINT_TIMEOUT ?= 10m
 TEST_P ?=
 
-.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-cli build-cli-release run-server-local docker-build
+BUILDINFO_LDFLAGS = -X github.com/mem9-ai/dat9/pkg/buildinfo.Version=$(if $(VERSION),$(VERSION),dev) \
+	-X github.com/mem9-ai/dat9/pkg/buildinfo.GitHash=$(GIT_HASH) \
+	-X github.com/mem9-ai/dat9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
+	-X github.com/mem9-ai/dat9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
+
+.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release run-server-local docker-build
 
 mod:
 	$(GO) mod tidy
@@ -87,22 +96,18 @@ build: build-server build-cli
 
 build-server:
 	mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -o $(SERVER_BIN) ./cmd/drive9-server
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(SERVER_BIN) ./cmd/drive9-server
+
+build-server-local:
+	mkdir -p $(BIN_DIR)
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(LOCAL_SERVER_BIN) ./cmd/drive9-server-local
 
 run-server-local:
 	@source ./scripts/drive9-server-local-env.sh && $(GO) run ./cmd/drive9-server-local
 
 build-cli:
 	mkdir -p $(BIN_DIR)
-	@set -euo pipefail; \
-	ldflags="-X main.gitHash=$(GIT_HASH)"; \
-	if [ -n "$(VERSION)" ]; then \
-		ldflags="$$ldflags -X main.version=$(VERSION)"; \
-	else \
-		ldflags="$$ldflags -X main.version=dev"; \
-	fi; \
-	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$$ldflags" -o $(CLI_BIN) ./cmd/drive9; \
-	true
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(CLI_BIN) ./cmd/drive9
 
 build-cli-release:
 	@set -euo pipefail; \

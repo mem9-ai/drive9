@@ -6,23 +6,34 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/buildinfo"
 )
 
 func TestVersionStringIncludesGitHash(t *testing.T) {
-	origVersion := version
-	origGitHash := gitHash
-	version = "v1.2.3"
-	gitHash = "abc123"
+	origVersion := buildinfo.Version
+	origGitHash := buildinfo.GitHash
+	origGitBranch := buildinfo.GitBranch
+	origBuildTime := buildinfo.BuildTime
+	buildinfo.Version = "v1.2.3"
+	buildinfo.GitHash = "abc123"
+	buildinfo.GitBranch = "feature/cli"
+	buildinfo.BuildTime = "2026-04-16T09:30:00Z"
 	t.Cleanup(func() {
-		version = origVersion
-		gitHash = origGitHash
+		buildinfo.Version = origVersion
+		buildinfo.GitHash = origGitHash
+		buildinfo.GitBranch = origGitBranch
+		buildinfo.BuildTime = origBuildTime
 	})
 
 	got := versionString()
-	if !strings.Contains(got, "drive9 v1.2.3\n") {
+	if !strings.Contains(got, "component: drive9\n") {
+		t.Fatalf("versionString() missing component line: %q", got)
+	}
+	if !strings.Contains(got, "version: v1.2.3\n") {
 		t.Fatalf("versionString() missing version line: %q", got)
 	}
-	if !strings.Contains(got, "Git Commit Hash: abc123\n") {
+	if !strings.Contains(got, "git_hash: abc123\n") {
 		t.Fatalf("versionString() missing git hash line: %q", got)
 	}
 }

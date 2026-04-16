@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
+	"github.com/mem9-ai/dat9/pkg/buildinfo"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -41,13 +42,20 @@ type localS3Config struct {
 }
 
 func main() {
+	if len(os.Args) > 2 {
+		if len(os.Args) > 1 && os.Args[1] == "version" {
+			usage()
+		}
+		usage()
+	}
+	if len(os.Args) == 2 && os.Args[1] == "version" {
+		_, _ = fmt.Fprint(os.Stdout, versionText())
+		return
+	}
+
 	startupCtx := context.Background()
 	startupStart := time.Now()
 	logLocalStartupStep(startupCtx, startupStart, startupStart, "process_start")
-
-	if len(os.Args) > 2 {
-		usage()
-	}
 
 	addr := envOr("DRIVE9_LISTEN_ADDR", defaultListenAddr)
 	if len(os.Args) == 2 {
@@ -60,6 +68,7 @@ func main() {
 	}
 	defer func() { _ = srvLogger.Sync() }()
 	logger.Set(srvLogger)
+	logger.Info(startupCtx, "build_info", buildinfo.Fields("drive9-server-local")...)
 	logLocalStartupStep(startupCtx, startupStart, time.Now(), "logger_ready")
 
 	localDSN := strings.TrimSpace(os.Getenv("DRIVE9_LOCAL_DSN"))
@@ -242,6 +251,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage: drive9-server-local [listen-addr]
+       drive9-server-local version
 
 environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: 127.0.0.1:9009)
@@ -305,6 +315,10 @@ environment:
   DRIVE9_AUDIO_EXTRACT_PROMPT   optional provider prompt for transcription (openai mode)
 `)
 	os.Exit(2)
+}
+
+func versionText() string {
+	return buildinfo.String("drive9-server-local")
 }
 
 func die(err error) {

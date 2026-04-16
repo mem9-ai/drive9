@@ -22,12 +22,11 @@ import (
 	"sync"
 
 	"github.com/mem9-ai/dat9/cmd/drive9/cli"
+	"github.com/mem9-ai/dat9/pkg/buildinfo"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"go.uber.org/zap"
 )
 
-var version = "dev"
-var gitHash = "unknown"
 var cliLogger *zap.Logger
 var cpuProfileStop = func() {}
 var exitFunc = os.Exit
@@ -131,7 +130,7 @@ func main() {
 }
 
 func versionString() string {
-	return fmt.Sprintf("drive9 %s\nGit Commit Hash: %s\n", version, gitHash)
+	return buildinfo.String("drive9")
 }
 
 func startCPUProfileFromEnv() (func(), error) {

@@ -2,10 +2,44 @@ package main
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
+	"github.com/mem9-ai/dat9/pkg/buildinfo"
 )
+
+func TestVersionTextIncludesBuildInfo(t *testing.T) {
+	origVersion := buildinfo.Version
+	origGitHash := buildinfo.GitHash
+	origGitBranch := buildinfo.GitBranch
+	origBuildTime := buildinfo.BuildTime
+	t.Cleanup(func() {
+		buildinfo.Version = origVersion
+		buildinfo.GitHash = origGitHash
+		buildinfo.GitBranch = origGitBranch
+		buildinfo.BuildTime = origBuildTime
+	})
+
+	buildinfo.Version = "v2.0.0"
+	buildinfo.GitHash = "feedface"
+	buildinfo.GitBranch = "main"
+	buildinfo.BuildTime = "2026-04-16T10:00:00Z"
+
+	got := versionText()
+	checks := []string{
+		"component: drive9-server\n",
+		"version: v2.0.0\n",
+		"git_hash: feedface\n",
+		"git_branch: main\n",
+		"build_time: 2026-04-16T10:00:00Z\n",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Fatalf("versionText() missing %q in %q", want, got)
+		}
+	}
+}
 
 func TestBuildBackendOptionsFromEnvAudioDisabled(t *testing.T) {
 	keys := []string{
