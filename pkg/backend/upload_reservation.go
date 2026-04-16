@@ -156,8 +156,8 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 		reservedBytes = 0
 	} else if err != nil {
 		// Transient DB error — we cannot tell whether a reservation exists.
-		// Bail out entirely; the mutation log entry will be picked up by the
-		// replay worker once the DB recovers, preventing a reserved_bytes leak.
+		// Bail out before writing the mutation log; the active reservation's
+		// 24h TTL ensures the expiry sweep releases reserved_bytes.
 		logger.Warn(ctx, "central_quota_complete_lookup_failed",
 			zap.String("tenant_id", b.tenantID),
 			zap.String("upload_id", uploadID),
