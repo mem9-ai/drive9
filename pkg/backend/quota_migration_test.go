@@ -204,7 +204,7 @@ func (f *fakeMetaQuotaStore) GetUploadReservation(ctx context.Context, tenantID,
 	defer f.mu.Unlock()
 	r, ok := f.reservations[metaKey(tenantID, uploadID)]
 	if !ok {
-		return nil, errors.New("not found")
+		return nil, ErrReservationNotFound
 	}
 	cp := *r
 	return &cp, nil

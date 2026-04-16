@@ -86,8 +86,22 @@ func (b *Dat9Backend) abortUploadReservation(ctx context.Context, uploadID strin
 
 	// Check if a reservation row actually exists and is active.
 	r, err := b.metaStore.GetUploadReservation(ctx, b.tenantID, uploadID)
-	if err != nil || r.Status != "active" {
-		// No active reservation — initiate was a fail-open no-op; nothing to release.
+	if errors.Is(err, ErrReservationNotFound) {
+		// No reservation row — initiate was a fail-open no-op; nothing to release.
+		metrics.RecordOperation("central_quota", "abort_reservation", "skip_no_reservation", time.Since(start))
+		return
+	}
+	if err != nil {
+		// Transient DB error — don't touch counters to avoid corruption.
+		logger.Warn(ctx, "central_quota_abort_lookup_failed",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("upload_id", uploadID),
+			zap.Error(err))
+		metrics.RecordOperation("central_quota", "abort_reservation", "lookup_error", time.Since(start))
+		return
+	}
+	if r.Status != "active" {
+		// Already completed or aborted — nothing to release.
 		metrics.RecordOperation("central_quota", "abort_reservation", "skip_no_reservation", time.Since(start))
 		return
 	}
@@ -135,10 +149,23 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 	// touching counters. If the initiate-time reserve was a fail-open no-op,
 	// there is no reservation to complete.
 	r, err := b.metaStore.GetUploadReservation(ctx, b.tenantID, uploadID)
-	if err != nil || r.Status != "active" {
-		// No active reservation — log the file mutation via the outbox anyway
-		// so the file meta shadow state stays in sync, but use 0 reserved bytes
-		// to avoid touching the reserved_bytes counter.
+	if errors.Is(err, ErrReservationNotFound) {
+		// No reservation row — initiate was a fail-open no-op.
+		// Still log the file mutation so meta stays in sync, but use 0
+		// reserved bytes to avoid touching the reserved_bytes counter.
+		reservedBytes = 0
+	} else if err != nil {
+		// Transient DB error — we cannot tell whether a reservation exists.
+		// Bail out entirely; the mutation log entry will be picked up by the
+		// replay worker once the DB recovers, preventing a reserved_bytes leak.
+		logger.Warn(ctx, "central_quota_complete_lookup_failed",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("upload_id", uploadID),
+			zap.Error(err))
+		metrics.RecordOperation("central_quota", "upload_complete", "lookup_error", time.Since(start))
+		return
+	} else if r.Status != "active" {
+		// Already completed or aborted — don't touch reserved_bytes counter.
 		reservedBytes = 0
 	}
 

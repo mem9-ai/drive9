@@ -17,6 +17,7 @@ var (
 	ErrUploadTooLarge        = errors.New("upload too large")
 	ErrStorageQuotaExceeded  = errors.New("tenant storage quota exceeded")
 	ErrMediaLLMQuotaExceeded = errors.New("tenant media LLM file quota exceeded")
+	ErrReservationNotFound   = errors.New("upload reservation not found")
 )
 
 // UseServerQuota reports whether this backend reads authoritative quota state

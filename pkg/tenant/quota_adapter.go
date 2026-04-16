@@ -155,6 +155,9 @@ func (a *metaQuotaAdapter) UpdateUploadReservationStatusTx(tx *sql.Tx, tenantID,
 
 func (a *metaQuotaAdapter) GetUploadReservation(ctx context.Context, tenantID, uploadID string) (*backend.UploadReservationView, error) {
 	r, err := a.s.GetUploadReservation(ctx, tenantID, uploadID)
+	if errors.Is(err, meta.ErrNotFound) {
+		return nil, backend.ErrReservationNotFound
+	}
 	if err != nil {
 		return nil, err
 	}
