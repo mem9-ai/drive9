@@ -27,6 +27,7 @@ Inspired by Plan 9's "everything is a file" and the idea that naming things is t
 ```bash
 # CLI
 drive9 cp ./data.tar :/data/data.tar
+drive9 fs cp --append ./tail.log :/logs/app.log
 drive9 cat :/config/app.json
 drive9 ls :/data/
 drive9 cp :/a.bin :/b.bin        # zero-copy
@@ -151,6 +152,7 @@ GET    /v1/fs/{path}?list         List directory
 HEAD   /v1/fs/{path}              Stat
 DELETE /v1/fs/{path}              Delete
 DELETE /v1/fs/{path}?recursive    Recursive delete
+POST   /v1/fs/{path}?append       Initiate incremental append upload
 POST   /v1/fs/{path}?copy         Zero-copy (X-Drive9-Copy-Source header)
 POST   /v1/fs/{path}?rename       Rename (X-Drive9-Rename-Source header)
 POST   /v1/fs/{path}?mkdir        Mkdir
