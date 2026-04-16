@@ -229,7 +229,7 @@ func main() {
 	audioRuntime := backend.AsyncAudioExtractWillWireRuntime(backendOpts.AsyncAudioExtract)
 	logger.Info(startupCtx, "local_server_mode",
 		zap.String("listen_addr", addr),
-		zap.String("local_api_key", localAPIKey),
+		zap.Bool("custom_local_api_key", strings.TrimSpace(os.Getenv("DRIVE9_LOCAL_API_KEY")) != ""),
 		zap.String("local_dsn", redactDSN(localDSN)),
 		zap.String("s3_mode", s3cfg.Mode),
 		zap.String("s3_dir", s3cfg.localDir()),

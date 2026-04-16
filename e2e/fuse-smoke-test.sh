@@ -629,13 +629,16 @@ PY
   renamed_text=$(drive9_retry fs cat "$RW_TEXT_RENAMED_REMOTE")
   check_eq "renamed file readable via remote" "$renamed_text" "create-${TS}"
 
+  rename_dir_ready=false
   if wait_path_exists "$RW_ALPHA_MOUNT"; then
     if mv "$RW_ALPHA_MOUNT" "$RW_ALPHA_RENAMED_MOUNT"; then
       check_eq "rename directory via mount succeeds" "true" "true"
       check_cmd "renamed directory visible via remote list" wait_remote_ls_has_name "$ROOT_REMOTE" "alpha-renamed"
       renamed_nested_text=$(drive9_retry fs cat "$RW_ALPHA_RENAMED_REMOTE/text-renamed.txt")
       check_eq "renamed directory keeps file content" "$renamed_nested_text" "create-${TS}"
+      rename_dir_ready=true
     else
+      check_eq "rename directory via mount succeeds" "false" "true"
       for _ in $(seq 1 "$CLI_MAX_RETRIES"); do
         drive9_retry fs mv "$RW_ALPHA_REMOTE" "$RW_ALPHA_RENAMED_REMOTE" >/dev/null 2>&1 || true
         if wait_remote_ls_has_name "$ROOT_REMOTE" "alpha-renamed"; then
@@ -644,45 +647,58 @@ PY
         sleep "$CLI_RETRY_SLEEP_S"
       done
       if wait_remote_ls_has_name "$ROOT_REMOTE" "alpha-renamed"; then
-        check_eq "rename directory via mount succeeds" "fallback" "fallback"
-      else
-        check_eq "rename directory via mount succeeds" "false" "true"
+        echo "SKIP remote fallback restored alpha-renamed for cleanup only (tracked in issue #248)"
+        if wait_path_exists "$RW_ALPHA_RENAMED_MOUNT"; then
+          rename_dir_ready=true
+        fi
       fi
     fi
   else
     drive9_retry fs mv "$RW_ALPHA_REMOTE" "$RW_ALPHA_RENAMED_REMOTE" >/dev/null 2>&1 || true
     if wait_remote_ls_has_name "$ROOT_REMOTE" "alpha-renamed"; then
-      check_eq "rename directory source exists" "fallback" "fallback"
+      echo "SKIP remote fallback restored alpha-renamed after mount path disappeared (tracked in issue #248)"
+      if wait_path_exists "$RW_ALPHA_RENAMED_MOUNT"; then
+        rename_dir_ready=true
+      fi
+      check_eq "rename directory source exists" "false" "true"
     else
       check_eq "rename directory source exists" "false" "true"
     fi
   fi
 
   echo "[9] cross-channel consistency"
-  drive9_retry fs cp "$SEED_LOCAL" ":$CLI_TO_MOUNT_REMOTE" >/dev/null
-  if wait_path_exists "$CLI_TO_MOUNT_MOUNT"; then
-    check_eq "cli write appears in mount" "true" "true"
-  else
-    check_eq "cli write appears in mount" "false" "true"
-  fi
-  cli_to_mount_content=$(cat "$CLI_TO_MOUNT_MOUNT")
-  check_eq "mount reads cli-written content" "$cli_to_mount_content" "seed-${TS}"
+  if [ "$rename_dir_ready" = "true" ]; then
+    drive9_retry fs cp "$SEED_LOCAL" ":$CLI_TO_MOUNT_REMOTE" >/dev/null
+    if wait_path_exists "$CLI_TO_MOUNT_MOUNT"; then
+      check_eq "cli write appears in mount" "true" "true"
+    else
+      check_eq "cli write appears in mount" "false" "true"
+    fi
+    cli_to_mount_content=$(cat "$CLI_TO_MOUNT_MOUNT")
+    check_eq "mount reads cli-written content" "$cli_to_mount_content" "seed-${TS}"
 
-  # The CLI read here is a cross-channel visibility check, not a guarantee
-  # that mount Flush immediately made the object remotely readable.
-  printf "from-mount-%s" "$TS" > "$MOUNT_TO_CLI_MOUNT"
-  mount_to_cli_content=$(wait_remote_cat_eq "$MOUNT_TO_CLI_REMOTE" "from-mount-${TS}")
-  check_eq "remote reads mount-written content" "$mount_to_cli_content" "from-mount-${TS}"
+    # The CLI read here is a cross-channel visibility check, not a guarantee
+    # that mount Flush immediately made the object remotely readable.
+    printf "from-mount-%s" "$TS" > "$MOUNT_TO_CLI_MOUNT"
+    mount_to_cli_content=$(wait_remote_cat_eq "$MOUNT_TO_CLI_REMOTE" "from-mount-${TS}")
+    check_eq "remote reads mount-written content" "$mount_to_cli_content" "from-mount-${TS}"
+  else
+    echo "SKIP cross-channel consistency after mount directory rename failure (tracked in issue #248)"
+  fi
 
   echo "[10] large-file boundary"
-  dd if=/dev/zero of="$LARGE_MOUNT" bs=1M count=8 status=none
-  large_size=$(stat_field "$LARGE_REMOTE" "size")
-  check_eq "8MB mounted file size matches remote stat" "$large_size" "8388608"
-  drive9_retry fs cp ":$LARGE_REMOTE" "$LARGE_DOWNLOADED" >/dev/null
-  check_cmd "downloaded large file exists" test -f "$LARGE_DOWNLOADED"
-  large_src_hash=$(sha256_file "$LARGE_MOUNT")
-  large_dst_hash=$(sha256_file "$LARGE_DOWNLOADED")
-  check_eq "large file checksum matches" "$large_dst_hash" "$large_src_hash"
+  if [ "$rename_dir_ready" = "true" ]; then
+    dd if=/dev/zero of="$LARGE_MOUNT" bs=1M count=8 status=none
+    large_size=$(stat_field "$LARGE_REMOTE" "size")
+    check_eq "8MB mounted file size matches remote stat" "$large_size" "8388608"
+    drive9_retry fs cp ":$LARGE_REMOTE" "$LARGE_DOWNLOADED" >/dev/null
+    check_cmd "downloaded large file exists" test -f "$LARGE_DOWNLOADED"
+    large_src_hash=$(sha256_file "$LARGE_MOUNT")
+    large_dst_hash=$(sha256_file "$LARGE_DOWNLOADED")
+    check_eq "large file checksum matches" "$large_dst_hash" "$large_src_hash"
+  else
+    echo "SKIP large-file boundary after mount directory rename failure (tracked in issue #248)"
+  fi
 
   echo "[11] error semantics"
   check_cmd_fail "cat missing file via mount fails" cat "$MOUNT_POINT/${ROOT_REL}/no-such-file.txt"

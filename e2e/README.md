@@ -17,7 +17,8 @@ The local smoke flow that is currently exercised on this machine uses
 1. Start `drive9-server-local`.
 
 ```bash
-cd /home/ubuntu/bench
+export DRIVE9_LOCAL_DIR=/path/to/dir-containing-run-drive9-server-local.sh
+cd "$DRIVE9_LOCAL_DIR"
 ./run-drive9-server-local.sh 2>&1 | tee local-server.log
 ```
 
@@ -36,7 +37,8 @@ Expected response:
 3. Run the e2e smoke scripts against the local endpoint.
 
 ```bash
-cd /home/ubuntu/drive9
+export DRIVE9_REPO_ROOT=/path/to/drive9
+cd "$DRIVE9_REPO_ROOT"
 
 export DRIVE9_BASE=http://127.0.0.1:9009
 
@@ -44,7 +46,7 @@ export DRIVE9_BASE=http://127.0.0.1:9009
 bash e2e/api-smoke-test.sh
 
 # Existing-key regression against the built-in local tenant.
-DRIVE9_API_KEY=local-dev-key bash e2e/api-smoke-test-existing-key.sh
+DRIVE9_API_KEY="${DRIVE9_LOCAL_API_KEY:-local-dev-key}" bash e2e/api-smoke-test-existing-key.sh
 
 # CLI smoke using the repo build.
 bash e2e/cli-smoke-test.sh
@@ -65,7 +67,8 @@ CLI_SOURCE=official bash e2e/fuse-smoke-test.sh
 
 ### `drive9-server-local` notes
 
-- `drive9-server-local` serves a single local tenant with API key `local-dev-key`.
+- `drive9-server-local` serves a single local tenant with API key
+  `${DRIVE9_LOCAL_API_KEY:-local-dev-key}` by default.
 - `api-smoke-test.sh`, `cli-smoke-test.sh`, and `fuse-smoke-test.sh` still
   provision fresh timestamped test paths as part of the smoke flow.
 - `api-smoke-test-existing-key.sh` is the script that should be pointed at the

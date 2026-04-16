@@ -405,6 +405,7 @@ func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", "local", "status", "active")...)
+	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "active"})
 }
 
@@ -1722,6 +1723,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Request) {
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_requested", "tenant_id", "local", "provider", "local")...)
 	metricEvent(r.Context(), "tenant_provision", "provider", "local", "result", "ok")
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"api_key": s.localTenantAPIKey,
