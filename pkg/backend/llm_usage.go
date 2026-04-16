@@ -39,6 +39,7 @@ func (b *Dat9Backend) recordImageExtractUsage(taskID string, usage ImageExtractU
 			zap.Error(err))
 		metrics.RecordOperation("llm_cost_budget", "usage_insert", "error", 0)
 	}
+	b.syncCentralLLMCostRecord(backgroundWithTrace(), "img_extract_text", taskID, cost, totalTokens, "tokens")
 }
 
 func (b *Dat9Backend) recordAudioExtractUsage(taskID string, usage AudioExtractUsage) {
@@ -69,6 +70,7 @@ func (b *Dat9Backend) recordAudioExtractUsage(taskID string, usage AudioExtractU
 			zap.Error(err))
 		metrics.RecordOperation("llm_cost_budget", "usage_insert", "error", 0)
 	}
+	b.syncCentralLLMCostRecord(backgroundWithTrace(), "audio_extract_text", taskID, cost, rawUnits, rawUnitType)
 }
 
 func (b *Dat9Backend) imageTokenCostMillicents(totalTokens int64) int64 {
@@ -97,6 +99,15 @@ func (b *Dat9Backend) audioDurationCostMillicents(durationSeconds float64) int64
 func (b *Dat9Backend) monthlyLLMCostExceeded() bool {
 	if b.maxMonthlyLLMCostMillicents <= 0 {
 		return false
+	}
+	if b.metaStore != nil && b.tenantID != "" {
+		total, err := b.metaStore.MonthlyLLMCostMillicents(backgroundWithTrace(), b.tenantID)
+		if err != nil {
+			logger.Warn(backgroundWithTrace(), "llm_cost_budget_check_fail_open", zap.Error(err))
+			metrics.RecordOperation("llm_cost_budget", "quota_check", "fail_open", 0)
+			return false
+		}
+		return total > b.maxMonthlyLLMCostMillicents
 	}
 	total, err := b.store.MonthlyLLMCostMillicents()
 	if err != nil {

@@ -25,6 +25,20 @@ const (
 	defaultMaxMediaLLMFiles      = int64(500)            // 500 media files per tenant
 )
 
+// QuotaSource controls where quota checks read authoritative state from.
+// During migration from per-tenant DB to server DB, this flag selects the
+// active source.
+type QuotaSource string
+
+const (
+	// QuotaSourceTenant reads quota state from the per-tenant TiDB cluster
+	// (current/legacy behavior). This is the default.
+	QuotaSourceTenant QuotaSource = "tenant"
+	// QuotaSourceServer reads quota state from the drive9 server DB (meta).
+	// Requires that central quota tables are populated (backfill complete).
+	QuotaSourceServer QuotaSource = "server"
+)
+
 // Options configures Dat9Backend behavior.
 type Options struct {
 	AsyncImageExtract AsyncImageExtractOptions
@@ -48,6 +62,9 @@ type Options struct {
 	MaxMediaLLMFiles int64
 	// LLMCostBudget configures the monthly LLM cost budget for this tenant.
 	LLMCostBudget LLMCostBudgetOptions
+	// QuotaSource selects where quota enforcement reads authoritative state.
+	// "tenant" (default) uses per-tenant DB; "server" uses the central server DB.
+	QuotaSource QuotaSource
 }
 
 // LLMCostBudgetOptions configures the monthly LLM cost budget.
@@ -114,6 +131,11 @@ type QueryEmbeddingOptions struct {
 
 func (b *Dat9Backend) configureOptions(opts Options) {
 	b.databaseAutoEmbedding = opts.DatabaseAutoEmbedding
+	if opts.QuotaSource == QuotaSourceServer {
+		b.quotaSource = QuotaSourceServer
+	} else {
+		b.quotaSource = QuotaSourceTenant
+	}
 	if opts.MaxUploadBytes > 0 {
 		b.maxUploadBytes = opts.MaxUploadBytes
 	} else {

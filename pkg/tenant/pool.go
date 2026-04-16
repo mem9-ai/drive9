@@ -34,12 +34,13 @@ type PoolConfig struct {
 }
 
 type Pool struct {
-	mu      sync.Mutex
-	cfg     PoolConfig
-	enc     encrypt.Encryptor
-	items   map[string]*entry
-	order   *list.List
-	maxSize int
+	mu        sync.Mutex
+	cfg       PoolConfig
+	enc       encrypt.Encryptor
+	metaStore *meta.Store // central server DB for quota operations; nil disables central quota
+	items     map[string]*entry
+	order     *list.List
+	maxSize   int
 }
 
 type entry struct {
@@ -57,6 +58,14 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 		max = 128
 	}
 	return &Pool{cfg: cfg, enc: enc, items: map[string]*entry{}, order: list.New(), maxSize: max}
+}
+
+// SetMetaStore sets the central server DB store for quota operations.
+// Must be called before any backend is created via Get/Acquire.
+func (p *Pool) SetMetaStore(ms *meta.Store) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.metaStore = ms
 }
 
 func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backend, err error) {
@@ -352,6 +361,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_s3_client_ms", s3ClientDurationMs),
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
+		p.wireQuotaStore(b, t.ID)
 		return b, store, nil
 	}
 	if p.cfg.S3Dir != "" {
@@ -382,6 +392,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_s3_client_ms", s3ClientDurationMs),
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
+		p.wireQuotaStore(b, t.ID)
 		return b, store, nil
 	}
 	backendCreateStart := time.Now()
@@ -401,7 +412,17 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		zap.Float64("create_s3_client_ms", 0),
 		zap.Float64("create_backend_ms", backendCreateDurationMs),
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
+	p.wireQuotaStore(b, t.ID)
 	return b, store, nil
+}
+
+// wireQuotaStore sets the central quota store on a newly created backend.
+// No-op when the pool's metaStore is nil (tests, non-multi-tenant mode).
+func (p *Pool) wireQuotaStore(b *backend.Dat9Backend, tenantID string) {
+	if p.metaStore == nil {
+		return
+	}
+	b.SetMetaQuotaStore(tenantID, NewMetaQuotaAdapter(p.metaStore))
 }
 
 func (p *Pool) removeLocked(elem *list.Element) *entry {

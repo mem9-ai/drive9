@@ -46,7 +46,7 @@ func (b *Dat9Backend) enqueueTiDBAutoSemanticTasksTx(tx *sql.Tx, fileID string, 
 	if !isImage && !isAudio {
 		return nil
 	}
-	if b.mediaLLMQuotaExceededTx(tx) {
+	if b.mediaLLMQuotaExceededCheckTx(backgroundWithTrace(), tx) {
 		metrics.RecordOperation("media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
 		return nil
 	}

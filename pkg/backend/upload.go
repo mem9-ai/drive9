@@ -237,9 +237,21 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 	now := time.Now()
 	uploadID := b.genID()
 
+	// Server-reserve-first saga: claim reserved_bytes on server DB before
+	// touching the tenant DB. Fail-open on server DB errors.
+	if err := b.reserveUploadOnServer(ctx, uploadID, path, totalSize); err != nil {
+		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
+		metrics.RecordOperation("backend", "initiate_upload", "quota_exceeded", time.Since(start))
+		return nil, err
+	}
+
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
-		if err := b.ensureTenantStorageQuotaTx(tx, path, totalSize); err != nil {
-			return err
+		// Tenant-DB quota check only when server quota is not active
+		// (server-reserve-first saga above already claimed reserved_bytes).
+		if !b.UseServerQuota() {
+			if err := b.ensureTenantStorageQuotaTx(tx, path, totalSize); err != nil {
+				return err
+			}
 		}
 		if err := b.store.InsertFileTx(tx, &datastore.File{
 			FileID:      fileID,
@@ -268,6 +280,8 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 			ExpiresAt:        now.Add(24 * time.Hour),
 		})
 	}); err != nil {
+		// Compensating abort: release server reservation on tenant DB failure.
+		b.abortUploadReservation(ctx, uploadID, totalSize)
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		logger.Error(ctx, "backend_initiate_upload_insert_upload_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
@@ -360,14 +374,26 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 	uploadID := b.genID()
 	expiresAt := now.Add(24 * time.Hour)
 
+	// Server-reserve-first saga: claim reserved_bytes on server DB before
+	// touching the tenant DB. Fail-open on server DB errors.
+	if err := b.reserveUploadOnServer(ctx, uploadID, path, totalSize); err != nil {
+		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
+		metrics.RecordOperation("backend", "initiate_upload_v2", "quota_exceeded", time.Since(start))
+		return nil, err
+	}
+
 	txStart := time.Now()
 	var quotaDurationMs float64
 	var insertFileDurationMs float64
 	var insertUploadDurationMs float64
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
 		stepStart := time.Now()
-		if err := b.ensureTenantStorageQuotaTx(tx, path, totalSize); err != nil {
-			return err
+		// Tenant-DB quota check only when server quota is not active
+		// (server-reserve-first saga above already claimed reserved_bytes).
+		if !b.UseServerQuota() {
+			if err := b.ensureTenantStorageQuotaTx(tx, path, totalSize); err != nil {
+				return err
+			}
 		}
 		quotaDurationMs = uploadPhaseMs(stepStart)
 		stepStart = time.Now()
@@ -404,6 +430,8 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		insertUploadDurationMs = uploadPhaseMs(stepStart)
 		return nil
 	}); err != nil {
+		// Compensating abort: release server reservation on tenant DB failure.
+		b.abortUploadReservation(ctx, uploadID, totalSize)
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		logger.Error(ctx, "backend_initiate_upload_v2_insert_upload_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
@@ -796,9 +824,12 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	var oldStorageRef string
 	var oldStorageType datastore.StorageType
 	var isOverwrite bool
+	var oldSizeBytes int64
+	var oldIsMedia bool
 	var confirmedFileID string
 	var confirmedRevision int64
 	contentType := detectContentType(upload.TargetPath, nil)
+	newIsMedia := isQuotaMediaContentType(contentType)
 	branch := "create"
 	txStart := time.Now()
 	var completeUploadTxDurationMs float64
@@ -836,9 +867,11 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 
 			var oldRef string
 			var currentRevision int64
+			var oldContentType string
 			stepStart = time.Now()
-			if err := tx.QueryRow(`SELECT storage_type, storage_ref, revision FROM files WHERE file_id = ? AND status = 'CONFIRMED' FOR UPDATE`, existingFileID.String).Scan(&oldStorageType, &oldRef, &currentRevision); err == nil {
+			if err := tx.QueryRow(`SELECT storage_type, storage_ref, revision, size_bytes, COALESCE(content_type, '') FROM files WHERE file_id = ? AND status = 'CONFIRMED' FOR UPDATE`, existingFileID.String).Scan(&oldStorageType, &oldRef, &currentRevision, &oldSizeBytes, &oldContentType); err == nil {
 				oldStorageRef = oldRef
+				oldIsMedia = isQuotaMediaContentType(oldContentType)
 				if expectedRevision > 0 && currentRevision != expectedRevision {
 					return datastore.ErrRevisionConflict
 				}
@@ -968,10 +1001,17 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	}); err != nil {
 		logger.Error(ctx, "backend_finalize_upload_tx_failed", zap.String("upload_id", uploadID), zap.Error(err))
 		b.cleanupFailedFinalizeUpload(ctx, upload)
+		// Abort the server-side reservation since the tenant DB tx failed.
+		b.abortUploadReservation(ctx, uploadID, upload.TotalSize)
 		metrics.RecordOperation("backend", "finalize_upload", "error", time.Since(start))
 		return err
 	}
 	txDurationMs := uploadPhaseMs(txStart)
+
+	// Transfer server-side reservation, update file shadow state, and mark the
+	// upload-complete mutation applied in one server-DB transaction.
+	b.completeUploadReservation(ctx, uploadID, upload.TotalSize, confirmedFileID, oldSizeBytes, oldIsMedia, upload.TotalSize, newIsMedia)
+
 	if isOverwrite {
 		b.deleteBlobIfS3Ctx(ctx, oldStorageType, oldStorageRef, upload.S3Key)
 	}
@@ -1099,6 +1139,8 @@ func (b *Dat9Backend) AbortUpload(ctx context.Context, uploadID string) error {
 		metrics.RecordOperation("backend", "abort_upload", "error", time.Since(start))
 		return err
 	}
+	// Release server-side reservation.
+	b.abortUploadReservation(ctx, uploadID, upload.TotalSize)
 	metrics.RecordOperation("backend", "abort_upload", "ok", time.Since(start))
 	return nil
 }
@@ -1135,6 +1177,8 @@ func (b *Dat9Backend) AbortUploadV2(ctx context.Context, uploadID string) error 
 			logger.Warn(ctx, "backend_abort_upload_v2_mark_file_deleted_failed", zap.String("upload_id", uploadID), zap.String("file_id", upload.FileID), zap.Error(err))
 		}
 	}
+	// Release server-side reservation.
+	b.abortUploadReservation(ctx, uploadID, upload.TotalSize)
 	metrics.RecordOperation("backend", "abort_upload_v2", "ok", time.Since(start))
 	return nil
 }

@@ -474,6 +474,11 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 		return backend.Options{}, fmt.Errorf("DRIVE9_MAX_TENANT_STORAGE_BYTES must be a positive integer")
 	}
 
+	// Quota enforcement source: "tenant" (default) or "server" (central server DB).
+	if qs := strings.ToLower(strings.TrimSpace(os.Getenv("DRIVE9_QUOTA_SOURCE"))); qs == "server" {
+		opts.QuotaSource = backend.QuotaSourceServer
+	}
+
 	queryBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_BASE"))
 	queryAPIKey := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_KEY"))
 	queryModel := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_MODEL"))

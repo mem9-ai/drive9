@@ -193,6 +193,14 @@ func main() {
 	}
 
 	if pool != nil {
+		pool.SetMetaStore(store)
+
+		// Start the mutation log replay worker for central quota.
+		replayWorker := backend.StartMutationReplayWorker(tenant.NewMetaQuotaAdapter(store))
+		if replayWorker != nil {
+			defer replayWorker.Stop()
+		}
+
 		// TODO: Run ValidateDurableAsyncExtractRequiresSemanticWorker only when this process
 		// can serve tenants that enqueue durable audio_extract_text / img_extract_text
 		// (database auto-embedding: tidb_zero, tidb_cloud_starter). pool != nil is too broad
@@ -256,6 +264,7 @@ environment:
   DRIVE9_VAULT_MASTER_KEY   32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
+  DRIVE9_QUOTA_SOURCE tenant|server quota enforcement source (default: tenant)
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
   S3 storage (set DRIVE9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DRIVE9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
@@ -349,6 +358,11 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	opts.MaxTenantStorageBytes = envInt64("DRIVE9_MAX_TENANT_STORAGE_BYTES", 50*(1<<30))
 	if opts.MaxTenantStorageBytes <= 0 {
 		return backend.Options{}, fmt.Errorf("DRIVE9_MAX_TENANT_STORAGE_BYTES must be a positive integer")
+	}
+
+	// Quota enforcement source: "tenant" (default, per-tenant DB) or "server" (central server DB).
+	if qs := strings.ToLower(strings.TrimSpace(os.Getenv("DRIVE9_QUOTA_SOURCE"))); qs == "server" {
+		opts.QuotaSource = backend.QuotaSourceServer
 	}
 
 	queryBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_BASE"))
