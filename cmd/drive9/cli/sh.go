@@ -109,11 +109,24 @@ func Sh(c *client.Client, _ []string) error {
 			}
 
 		case "rm":
-			if len(args) != 1 {
-				fmt.Fprintln(os.Stderr, "usage: rm <path>")
+			if len(args) < 1 {
+				fmt.Fprintln(os.Stderr, "usage: rm [-r|--recursive] <path>")
 				continue
 			}
-			if err := Rm(c, []string{resolve(cwd, args[0])}); err != nil {
+			resolvedArgs := make([]string, 0, len(args))
+			for _, arg := range args {
+				switch arg {
+				case "-r", "--recursive":
+					resolvedArgs = append(resolvedArgs, arg)
+				default:
+					if strings.HasPrefix(arg, "-") {
+						resolvedArgs = append(resolvedArgs, arg)
+						continue
+					}
+					resolvedArgs = append(resolvedArgs, resolve(cwd, arg))
+				}
+			}
+			if err := Rm(c, resolvedArgs); err != nil {
 				fmt.Fprintf(os.Stderr, "rm: %v\n", err)
 			}
 
@@ -159,7 +172,7 @@ func shHelp() {
   cat <path>      read file
   cp <src> <dst>  copy files
   mv <old> <new>  rename/move
-  rm <path>       remove
+  rm [-r] <path>  remove
   stat <path>     file metadata
   help            this help
   exit            quit shell`)

@@ -115,6 +115,34 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+func TestRemoveAll(t *testing.T) {
+	c, cleanup := newTestClient(t)
+	defer cleanup()
+
+	if err := c.Mkdir("/data"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Write("/data/a.txt", []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Mkdir("/data/nested"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Write("/data/nested/b.txt", []byte("b")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.RemoveAll("/data/"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Stat("/data/"); err == nil {
+		t.Fatal("expected error after recursive delete")
+	}
+	if _, err := c.Read("/data/nested/b.txt"); err == nil {
+		t.Fatal("expected nested file read to fail after recursive delete")
+	}
+}
+
 func TestCopy(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()

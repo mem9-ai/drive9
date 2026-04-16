@@ -311,7 +311,26 @@ func (c *Client) Delete(path string) error {
 
 // DeleteCtx removes a file or directory with context support.
 func (c *Client) DeleteCtx(ctx context.Context, path string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.url(path), nil)
+	return c.deleteCtx(ctx, path, false)
+}
+
+// RemoveAll removes a file or directory tree recursively.
+func (c *Client) RemoveAll(path string) error {
+	return c.RemoveAllCtx(context.Background(), path)
+}
+
+// RemoveAllCtx removes a file or directory tree recursively with context support.
+func (c *Client) RemoveAllCtx(ctx context.Context, path string) error {
+	return c.deleteCtx(ctx, path, true)
+}
+
+func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool) error {
+	requestURL := c.url(path)
+	if recursive {
+		requestURL += "?recursive"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL, nil)
 	if err != nil {
 		return err
 	}
