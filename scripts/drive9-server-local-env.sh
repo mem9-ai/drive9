@@ -18,6 +18,7 @@
 # Create the database ahead of time, for example:
 #   mycli --host 127.0.0.1 --port 4000 -u root -e "CREATE DATABASE IF NOT EXISTS drive9_local;"
 : "${DRIVE9_LOCAL_DSN:=root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true}"
+: "${DRIVE9_LOCAL_API_KEY:=local-dev-key}"
 # Leave DRIVE9_LOCAL_INIT_SCHEMA unset to use the built-in default (false).
 # : "${DRIVE9_LOCAL_INIT_SCHEMA:=false}"
 
@@ -79,6 +80,7 @@
 
 export DRIVE9_PUBLIC_URL
 export DRIVE9_LOCAL_DSN
+export DRIVE9_LOCAL_API_KEY
 if [[ -z "${DRIVE9_S3_BUCKET:-}" ]]; then
   export DRIVE9_S3_DIR
 else

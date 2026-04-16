@@ -43,6 +43,35 @@ func newTestServer(t *testing.T) *Server {
 	}
 	return New(b)
 }
+
+func newLocalTenantShimServer(t *testing.T, apiKey string) *Server {
+	t.Helper()
+
+	s3Dir, err := os.MkdirTemp("", "dat9-srv-s3-local-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(s3Dir) })
+
+	initServerTenantSchema(t, testDSN)
+	store, err := datastore.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testmysql.ResetDB(t, store.DB())
+	t.Cleanup(func() { _ = store.Close() })
+
+	s3c, err := s3client.NewLocal(s3Dir, "/s3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := backend.NewWithS3(store, s3c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewWithConfig(Config{Backend: b, LocalTenantAPIKey: apiKey})
+}
+
 func TestWriteAndRead(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
@@ -229,6 +258,70 @@ func TestDelete(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != 404 {
 		t.Errorf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestLocalTenantShimProvisionAndStatus(t *testing.T) {
+	s := newLocalTenantShimServer(t, "local-dev-key")
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	provisionReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", nil)
+	provisionResp, err := http.DefaultClient.Do(provisionReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = provisionResp.Body.Close() }()
+	if provisionResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("provision: %d", provisionResp.StatusCode)
+	}
+	var provisionBody map[string]string
+	if err := json.NewDecoder(provisionResp.Body).Decode(&provisionBody); err != nil {
+		t.Fatal(err)
+	}
+	if got := provisionBody["api_key"]; got != "local-dev-key" {
+		t.Fatalf("api_key = %q, want local-dev-key", got)
+	}
+	if got := provisionBody["status"]; got != "provisioning" {
+		t.Fatalf("status = %q, want provisioning", got)
+	}
+	if len(provisionBody) != 2 {
+		t.Fatalf("provision body keys = %v, want only api_key/status", provisionBody)
+	}
+
+	statusReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)
+	statusReq.Header.Set("Authorization", "Bearer local-dev-key")
+	statusResp, err := http.DefaultClient.Do(statusReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = statusResp.Body.Close() }()
+	if statusResp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d", statusResp.StatusCode)
+	}
+	var statusBody map[string]string
+	if err := json.NewDecoder(statusResp.Body).Decode(&statusBody); err != nil {
+		t.Fatal(err)
+	}
+	if got := statusBody["status"]; got != "active" {
+		t.Fatalf("status = %q, want active", got)
+	}
+}
+
+func TestLocalTenantShimStatusRejectsWrongToken(t *testing.T) {
+	s := newLocalTenantShimServer(t, "local-dev-key")
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	statusReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)
+	statusReq.Header.Set("Authorization", "Bearer wrong-key")
+	statusResp, err := http.DefaultClient.Do(statusReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = statusResp.Body.Close() }()
+	if statusResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", statusResp.StatusCode)
 	}
 }
 
