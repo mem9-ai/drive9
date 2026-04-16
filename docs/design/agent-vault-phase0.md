@@ -355,57 +355,59 @@ Audit events are written to a dedicated append-only table (`vault_audit_log`) in
 
 ### 6.1 Server-Side Tables
 
+> **Provider scope**: Vault targets **TiDB/MySQL tenant DB only**. Both schema DDL and runtime SQL use TiDB/MySQL dialect exclusively. The `db9` Postgres schema init path (`pkg/tenant/db9/schema.go`) must NOT contain vault DDL — vault tables are created via the TiDB tenant schema init path (`pkg/tenant/schema/tidb_*.go`). Do NOT use PostgreSQL-only types (`BYTEA`, `TIMESTAMPTZ`, `JSONB`) or syntax (`$N` placeholders, `ON CONFLICT`). Runtime SQL must use `?` positional placeholders. See Bad Case #11.
+
 ```sql
 -- Secret metadata and encrypted values
-CREATE TABLE vault_secrets (
+CREATE TABLE IF NOT EXISTS vault_secrets (
     secret_id     VARCHAR(64) PRIMARY KEY,
     tenant_id     VARCHAR(64) NOT NULL,
     name          VARCHAR(255) NOT NULL,
     secret_type   VARCHAR(32) NOT NULL DEFAULT 'generic',
     revision      BIGINT NOT NULL DEFAULT 1,
     created_by    VARCHAR(255) NOT NULL,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    deleted_at    TIMESTAMPTZ,
-    UNIQUE (tenant_id, name)
+    created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    deleted_at    DATETIME(3),
+    UNIQUE KEY uk_tenant_name (tenant_id, name)
 );
 
 -- Individual fields within a secret (each encrypted separately)
-CREATE TABLE vault_secret_fields (
+CREATE TABLE IF NOT EXISTS vault_secret_fields (
     secret_id     VARCHAR(64) NOT NULL,
     field_name    VARCHAR(255) NOT NULL,
-    encrypted_value BYTEA NOT NULL,       -- AES-256-GCM encrypted
-    nonce         BYTEA NOT NULL,          -- GCM nonce (12 bytes)
+    encrypted_value BLOB NOT NULL,          -- AES-256-GCM encrypted
+    nonce         BLOB NOT NULL,            -- GCM nonce (12 bytes)
     PRIMARY KEY (secret_id, field_name)
 );
 
 -- Capability tokens (server-side state for revocation + audit)
-CREATE TABLE vault_tokens (
+CREATE TABLE IF NOT EXISTS vault_tokens (
     token_id      VARCHAR(64) PRIMARY KEY,
     tenant_id     VARCHAR(64) NOT NULL,
     agent_id      VARCHAR(255) NOT NULL,
     task_id       VARCHAR(255),
-    scope_json    JSONB NOT NULL,            -- ["aws-prod","db-prod/password"]
-    issued_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at    TIMESTAMPTZ NOT NULL,
-    revoked_at    TIMESTAMPTZ,               -- NULL = active; non-NULL = revoked
+    scope_json    JSON NOT NULL,              -- ["aws-prod","db-prod/password"]
+    issued_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    expires_at    DATETIME(3) NOT NULL,
+    revoked_at    DATETIME(3),                -- NULL = active; non-NULL = revoked
     revoked_by    VARCHAR(255),
-    revoke_reason VARCHAR(255)
+    revoke_reason VARCHAR(255),
+    KEY idx_token_tenant (tenant_id),
+    KEY idx_token_agent (agent_id)
 );
-CREATE INDEX idx_token_tenant ON vault_tokens(tenant_id);
-CREATE INDEX idx_token_agent ON vault_tokens(agent_id);
 
 -- ACL policies
-CREATE TABLE vault_policies (
+CREATE TABLE IF NOT EXISTS vault_policies (
     policy_id     VARCHAR(64) PRIMARY KEY,
     tenant_id     VARCHAR(64) NOT NULL,
     name          VARCHAR(255) NOT NULL,
-    rules_json    JSONB NOT NULL,          -- [{"match":"agent:senior-*","secrets":["aws-*","db-*"]}]
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    rules_json    JSON NOT NULL,            -- [{"match":"agent:senior-*","secrets":["aws-*","db-*"]}]
+    created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 );
 
 -- Audit log (append-only)
-CREATE TABLE vault_audit_log (
+CREATE TABLE IF NOT EXISTS vault_audit_log (
     event_id      VARCHAR(64) PRIMARY KEY,
     tenant_id     VARCHAR(64) NOT NULL,
     event_type    VARCHAR(32) NOT NULL,
@@ -415,11 +417,11 @@ CREATE TABLE vault_audit_log (
     secret_name   VARCHAR(255),
     field_name    VARCHAR(255),
     adapter       VARCHAR(16),
-    detail_json   JSONB,
-    timestamp     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    detail_json   JSON,
+    timestamp     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    KEY idx_audit_tenant_time (tenant_id, timestamp),
+    KEY idx_audit_secret (secret_name, timestamp)
 );
-CREATE INDEX idx_audit_tenant_time ON vault_audit_log(tenant_id, timestamp);
-CREATE INDEX idx_audit_secret ON vault_audit_log(secret_name, timestamp);
 ```
 
 ### 6.2 Secret Types

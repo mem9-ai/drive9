@@ -30,7 +30,7 @@ func (s *Store) DB() *sql.DB { return s.db }
 func (s *Store) GetOrCreateDEK(ctx context.Context, tenantID string) ([]byte, error) {
 	var wrappedDEK []byte
 	err := s.db.QueryRowContext(ctx,
-		`SELECT wrapped_dek FROM vault_deks WHERE tenant_id = $1`, tenantID,
+		`SELECT wrapped_dek FROM vault_deks WHERE tenant_id = ?`, tenantID,
 	).Scan(&wrappedDEK)
 
 	if err == nil {
@@ -46,7 +46,7 @@ func (s *Store) GetOrCreateDEK(ctx context.Context, tenantID string) ([]byte, er
 		return nil, err
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO vault_deks (tenant_id, wrapped_dek) VALUES ($1, $2) ON CONFLICT (tenant_id) DO NOTHING`,
+		`INSERT IGNORE INTO vault_deks (tenant_id, wrapped_dek) VALUES (?, ?)`,
 		tenantID, wrappedDEK,
 	)
 	if err != nil {
@@ -55,7 +55,7 @@ func (s *Store) GetOrCreateDEK(ctx context.Context, tenantID string) ([]byte, er
 
 	// Re-read in case of race (another process inserted first).
 	err = s.db.QueryRowContext(ctx,
-		`SELECT wrapped_dek FROM vault_deks WHERE tenant_id = $1`, tenantID,
+		`SELECT wrapped_dek FROM vault_deks WHERE tenant_id = ?`, tenantID,
 	).Scan(&wrappedDEK)
 	if err != nil {
 		return nil, fmt.Errorf("re-read DEK: %w", err)
@@ -92,8 +92,8 @@ func (s *Store) CreateSecret(ctx context.Context, tenantID, name, createdBy stri
 
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO vault_secrets (secret_id, tenant_id, name, secret_type, revision, created_by, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, 1, $5, $6, $6)`,
-		secretID, tenantID, name, string(secretType), createdBy, now,
+		 VALUES (?, ?, ?, ?, 1, ?, ?, ?)`,
+		secretID, tenantID, name, string(secretType), createdBy, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert secret: %w", err)
@@ -106,7 +106,7 @@ func (s *Store) CreateSecret(ctx context.Context, tenantID, name, createdBy stri
 		}
 		_, err = tx.ExecContext(ctx,
 			`INSERT INTO vault_secret_fields (secret_id, field_name, encrypted_value, nonce)
-			 VALUES ($1, $2, $3, $4)`,
+			 VALUES (?, ?, ?, ?)`,
 			secretID, fieldName, ciphertext, nonce,
 		)
 		if err != nil {
@@ -135,7 +135,7 @@ func (s *Store) GetSecret(ctx context.Context, tenantID, name string) (*Secret, 
 	var sec Secret
 	err := s.db.QueryRowContext(ctx,
 		`SELECT secret_id, tenant_id, name, secret_type, revision, created_by, created_at, updated_at, deleted_at
-		 FROM vault_secrets WHERE tenant_id = $1 AND name = $2 AND deleted_at IS NULL`,
+		 FROM vault_secrets WHERE tenant_id = ? AND name = ? AND deleted_at IS NULL`,
 		tenantID, name,
 	).Scan(&sec.SecretID, &sec.TenantID, &sec.Name, &sec.SecretType, &sec.Revision,
 		&sec.CreatedBy, &sec.CreatedAt, &sec.UpdatedAt, &sec.DeletedAt)
@@ -152,7 +152,7 @@ func (s *Store) GetSecret(ctx context.Context, tenantID, name string) (*Secret, 
 func (s *Store) ListSecrets(ctx context.Context, tenantID string) ([]*Secret, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT secret_id, tenant_id, name, secret_type, revision, created_by, created_at, updated_at
-		 FROM vault_secrets WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY name`,
+		 FROM vault_secrets WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY name`,
 		tenantID,
 	)
 	if err != nil {
@@ -191,7 +191,7 @@ func (s *Store) UpdateSecret(ctx context.Context, tenantID, name, updatedBy stri
 
 	err = tx.QueryRowContext(ctx,
 		`SELECT secret_id, revision FROM vault_secrets
-		 WHERE tenant_id = $1 AND name = $2 AND deleted_at IS NULL
+		 WHERE tenant_id = ? AND name = ? AND deleted_at IS NULL
 		 FOR UPDATE`,
 		tenantID, name,
 	).Scan(&secretID, &revision)
@@ -204,7 +204,7 @@ func (s *Store) UpdateSecret(ctx context.Context, tenantID, name, updatedBy stri
 
 	newRevision := revision + 1
 	_, err = tx.ExecContext(ctx,
-		`UPDATE vault_secrets SET revision = $1, updated_at = $2 WHERE secret_id = $3`,
+		`UPDATE vault_secrets SET revision = ?, updated_at = ? WHERE secret_id = ?`,
 		newRevision, now, secretID,
 	)
 	if err != nil {
@@ -212,7 +212,7 @@ func (s *Store) UpdateSecret(ctx context.Context, tenantID, name, updatedBy stri
 	}
 
 	// Delete old fields, insert new ones.
-	_, err = tx.ExecContext(ctx, `DELETE FROM vault_secret_fields WHERE secret_id = $1`, secretID)
+	_, err = tx.ExecContext(ctx, `DELETE FROM vault_secret_fields WHERE secret_id = ?`, secretID)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +223,7 @@ func (s *Store) UpdateSecret(ctx context.Context, tenantID, name, updatedBy stri
 		}
 		_, err = tx.ExecContext(ctx,
 			`INSERT INTO vault_secret_fields (secret_id, field_name, encrypted_value, nonce)
-			 VALUES ($1, $2, $3, $4)`,
+			 VALUES (?, ?, ?, ?)`,
 			secretID, fieldName, ciphertext, nonce,
 		)
 		if err != nil {
@@ -248,7 +248,7 @@ func (s *Store) UpdateSecret(ctx context.Context, tenantID, name, updatedBy stri
 func (s *Store) DeleteSecret(ctx context.Context, tenantID, name string) error {
 	now := time.Now()
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE vault_secrets SET deleted_at = $1 WHERE tenant_id = $2 AND name = $3 AND deleted_at IS NULL`,
+		`UPDATE vault_secrets SET deleted_at = ? WHERE tenant_id = ? AND name = ? AND deleted_at IS NULL`,
 		now, tenantID, name,
 	)
 	if err != nil {
@@ -273,7 +273,7 @@ func (s *Store) ReadSecretFields(ctx context.Context, tenantID, name string) (ma
 	}
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT field_name, encrypted_value, nonce FROM vault_secret_fields WHERE secret_id = $1`,
+		`SELECT field_name, encrypted_value, nonce FROM vault_secret_fields WHERE secret_id = ?`,
 		sec.SecretID,
 	)
 	if err != nil {
@@ -310,7 +310,7 @@ func (s *Store) ReadSecretField(ctx context.Context, tenantID, name, fieldName s
 
 	var ciphertext, nonce []byte
 	err = s.db.QueryRowContext(ctx,
-		`SELECT encrypted_value, nonce FROM vault_secret_fields WHERE secret_id = $1 AND field_name = $2`,
+		`SELECT encrypted_value, nonce FROM vault_secret_fields WHERE secret_id = ? AND field_name = ?`,
 		sec.SecretID, fieldName,
 	).Scan(&ciphertext, &nonce)
 	if err == sql.ErrNoRows {
@@ -355,7 +355,7 @@ func (s *Store) IssueCapToken(ctx context.Context, tenantID, agentID, taskID str
 	scopeJSON, _ := json.Marshal(scope)
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO vault_tokens (token_id, tenant_id, agent_id, task_id, scope_json, issued_at, expires_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		tokenID, tenantID, agentID, taskID, scopeJSON, now, expiresAt,
 	)
 	if err != nil {
@@ -385,7 +385,7 @@ func (s *Store) VerifyAndResolveCapToken(ctx context.Context, tenantID, raw stri
 	// DB revocation check — scoped to tenant for isolation.
 	var revokedAt *time.Time
 	err = s.db.QueryRowContext(ctx,
-		`SELECT revoked_at FROM vault_tokens WHERE tenant_id = $1 AND token_id = $2`,
+		`SELECT revoked_at FROM vault_tokens WHERE tenant_id = ? AND token_id = ?`,
 		tenantID, claims.TokenID,
 	).Scan(&revokedAt)
 	if err == sql.ErrNoRows {
@@ -406,8 +406,8 @@ func (s *Store) VerifyAndResolveCapToken(ctx context.Context, tenantID, raw stri
 func (s *Store) RevokeCapToken(ctx context.Context, tenantID, tokenID, revokedBy, reason string) error {
 	now := time.Now()
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE vault_tokens SET revoked_at = $1, revoked_by = $2, revoke_reason = $3
-		 WHERE tenant_id = $4 AND token_id = $5 AND revoked_at IS NULL`,
+		`UPDATE vault_tokens SET revoked_at = ?, revoked_by = ?, revoke_reason = ?
+		 WHERE tenant_id = ? AND token_id = ? AND revoked_at IS NULL`,
 		now, revokedBy, reason, tenantID, tokenID,
 	)
 	if err != nil {
@@ -436,7 +436,7 @@ func (s *Store) WriteAuditEvent(ctx context.Context, event *AuditEvent) error {
 	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO vault_audit_log (event_id, tenant_id, event_type, token_id, agent_id, task_id, secret_name, field_name, adapter, detail_json, timestamp)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		event.EventID, event.TenantID, event.EventType, event.TokenID, event.AgentID,
 		event.TaskID, event.SecretName, event.FieldName, event.Adapter, detailJSON, event.Timestamp,
 	)
@@ -450,11 +450,11 @@ func (s *Store) QueryAuditLog(ctx context.Context, tenantID string, secretName s
 
 	if secretName != "" {
 		query = `SELECT event_id, tenant_id, event_type, token_id, agent_id, task_id, secret_name, field_name, adapter, detail_json, timestamp
-			FROM vault_audit_log WHERE tenant_id = $1 AND secret_name = $2 ORDER BY timestamp DESC LIMIT $3`
+			FROM vault_audit_log WHERE tenant_id = ? AND secret_name = ? ORDER BY timestamp DESC LIMIT ?`
 		args = []any{tenantID, secretName, limit}
 	} else {
 		query = `SELECT event_id, tenant_id, event_type, token_id, agent_id, task_id, secret_name, field_name, adapter, detail_json, timestamp
-			FROM vault_audit_log WHERE tenant_id = $1 ORDER BY timestamp DESC LIMIT $2`
+			FROM vault_audit_log WHERE tenant_id = ? ORDER BY timestamp DESC LIMIT ?`
 		args = []any{tenantID, limit}
 	}
 
