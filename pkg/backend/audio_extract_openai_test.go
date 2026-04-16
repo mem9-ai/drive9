@@ -97,7 +97,7 @@ func TestOpenAIAudioTextExtractorExtractAudioText(t *testing.T) {
 		reader := multipart.NewReader(r.Body, params["boundary"])
 		defer func() { _ = r.Body.Close() }()
 
-		var model, prompt, fileName, fileContentType, fileBody string
+		var model, prompt, responseFormat, fileName, fileContentType, fileBody string
 		for {
 			part, err := reader.NextPart()
 			if err == io.EOF {
@@ -115,6 +115,8 @@ func TestOpenAIAudioTextExtractorExtractAudioText(t *testing.T) {
 				model = string(data)
 			case "prompt":
 				prompt = string(data)
+			case "response_format":
+				responseFormat = string(data)
 			case "file":
 				fileName = part.FileName()
 				fileContentType = part.Header.Get("Content-Type")
@@ -125,6 +127,9 @@ func TestOpenAIAudioTextExtractorExtractAudioText(t *testing.T) {
 		}
 		if model != "whisper-1" {
 			t.Fatalf("model=%q, want whisper-1", model)
+		}
+		if responseFormat != "json" {
+			t.Fatalf("response_format=%q, want json", responseFormat)
 		}
 		if prompt != "transcribe in zh" {
 			t.Fatalf("prompt=%q, want transcribe in zh", prompt)
