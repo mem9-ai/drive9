@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run all dat9 smoke tests (API + CLI + FUSE).
+# Run all drive9 smoke tests (API + CLI + FUSE).
 
 set -euo pipefail
 
@@ -28,7 +28,7 @@ run_case() {
   fi
 }
 
-echo "=== dat9 smoke-all ==="
+echo "=== drive9 smoke-all ==="
 echo "BASE=$BASE"
 
 run_case "api" "e2e/api-smoke-test.sh"

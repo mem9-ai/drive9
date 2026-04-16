@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dat9 FUSE smoke test against a live deployment.
+# drive9 FUSE smoke test against a live deployment.
 
 set -euo pipefail
 
@@ -168,7 +168,7 @@ stat_field() {
   local path="$1"
   local field="$2"
   local out
-  out=$(dat9_retry fs stat "$path")
+  out=$(drive9_retry fs stat "$path")
   python3 - "$out" "$field" <<'PY'
 import sys
 text, field = sys.argv[1], sys.argv[2].lower()
@@ -252,7 +252,7 @@ wait_remote_ls_has_name() {
   local out rc
   while :; do
     set +e
-    out=$(dat9 fs ls "$parent" 2>&1)
+    out=$(drive9 fs ls "$parent" 2>&1)
     rc=$?
     set -e
     if [ "$rc" -eq 0 ]; then
@@ -285,7 +285,7 @@ wait_remote_ls_missing_name() {
   local out rc
   while :; do
     set +e
-    out=$(dat9 fs ls "$parent" 2>&1)
+    out=$(drive9 fs ls "$parent" 2>&1)
     rc=$?
     set -e
     if [ "$rc" -eq 0 ]; then
@@ -325,7 +325,7 @@ PY
 
   while :; do
     set +e
-    out=$(dat9 fs cat "$path" 2>&1)
+    out=$(drive9 fs cat "$path" 2>&1)
     rc=$?
     set -e
     if [ "$rc" -eq 0 ]; then
@@ -358,9 +358,9 @@ start_mount() {
   local mode="$1"
   : >"$MOUNT_LOG"
   if [ "$mode" = "ro" ]; then
-    dat9 mount --read-only "$MOUNT_POINT" >"$MOUNT_LOG" 2>&1 &
+    drive9 mount --read-only "$MOUNT_POINT" >"$MOUNT_LOG" 2>&1 &
   else
-    dat9 mount "$MOUNT_POINT" >"$MOUNT_LOG" 2>&1 &
+    drive9 mount "$MOUNT_POINT" >"$MOUNT_LOG" 2>&1 &
   fi
   MOUNT_PID="$!"
 
@@ -377,7 +377,7 @@ start_mount() {
 stop_mount() {
   set +e
   if is_mounted "$MOUNT_POINT"; then
-    dat9 umount "$MOUNT_POINT" >/dev/null 2>&1 || true
+    drive9 umount "$MOUNT_POINT" >/dev/null 2>&1 || true
     wait_mount_state unmounted >/dev/null 2>&1 || true
   fi
   if [ -n "${MOUNT_PID:-}" ] && kill -0 "$MOUNT_PID" >/dev/null 2>&1; then
@@ -388,7 +388,7 @@ stop_mount() {
   set -e
 }
 
-echo "=== dat9 FUSE smoke test ==="
+echo "=== drive9 FUSE smoke test ==="
 echo "BASE=$BASE"
 echo "CLI_SOURCE=$CLI_SOURCE"
 
@@ -449,16 +449,16 @@ echo "[3] prepare drive9 cli"
 prepare_cli_binary
 check_cmd "drive9 binary ready" test -x "$CLI_BIN"
 
-dat9() {
+drive9() {
   DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
 }
 
-dat9_retry() {
+drive9_retry() {
   local attempt=1
   local out rc
   while :; do
     set +e
-    out=$(dat9 "$@" 2>&1)
+    out=$(drive9 "$@" 2>&1)
     rc=$?
     set -e
     if [ "$rc" -eq 0 ]; then
@@ -479,14 +479,14 @@ echo "[3.1] mount compatibility precheck"
 TS="$(date +%s)"
 ROOT_REL="fuse-e2e-${TS}"
 ROOT_REMOTE="/${ROOT_REL}"
-ROOT_MOUNT="$FUSE_MOUNT_ROOT/dat9-fuse-smoke-${TS}"
+ROOT_MOUNT="$FUSE_MOUNT_ROOT/drive9-fuse-smoke-${TS}"
 MOUNT_POINT="$ROOT_MOUNT"
-MOUNT_LOG="$FUSE_MOUNT_ROOT/dat9-fuse-smoke-${TS}.log"
-SEED_LOCAL="$FUSE_MOUNT_ROOT/dat9-fuse-seed-${TS}.txt"
-LARGE_DOWNLOADED="$FUSE_MOUNT_ROOT/dat9-fuse-large-down-${TS}.bin"
+MOUNT_LOG="$FUSE_MOUNT_ROOT/drive9-fuse-smoke-${TS}.log"
+SEED_LOCAL="$FUSE_MOUNT_ROOT/drive9-fuse-seed-${TS}.txt"
+LARGE_DOWNLOADED="$FUSE_MOUNT_ROOT/drive9-fuse-large-down-${TS}.bin"
 
 set +e
-ls_out=$(dat9 fs ls / 2>&1)
+ls_out=$(drive9 fs ls / 2>&1)
 ls_rc=$?
 set -e
 if [ "$ls_rc" -eq 0 ]; then
@@ -547,8 +547,8 @@ if is_mounted "$MOUNT_POINT"; then
     check_eq "mkdir -p nested directory via mount" "true" "true"
   else
     check_eq "mkdir -p nested directory via mount" "false" "true"
-    dat9_retry fs mkdir "$RW_ALPHA_REMOTE" >/dev/null 2>&1 || true
-    dat9_retry fs mkdir "$RW_ALPHA_REMOTE/beta" >/dev/null 2>&1 || true
+    drive9_retry fs mkdir "$RW_ALPHA_REMOTE" >/dev/null 2>&1 || true
+    drive9_retry fs mkdir "$RW_ALPHA_REMOTE/beta" >/dev/null 2>&1 || true
   fi
   check_cmd "nested directory visible in mount" wait_path_exists "$RW_BETA_MOUNT"
   check_cmd "nested directory visible in remote list" wait_remote_ls_has_name "$RW_ALPHA_REMOTE" "beta"
@@ -626,18 +626,18 @@ PY
   echo "[8] rename semantics"
   mv "$RW_TEXT_MOUNT" "$RW_TEXT_RENAMED_MOUNT"
   check_cmd_fail "old file path missing after rename" test -f "$RW_TEXT_MOUNT"
-  renamed_text=$(dat9_retry fs cat "$RW_TEXT_RENAMED_REMOTE")
+  renamed_text=$(drive9_retry fs cat "$RW_TEXT_RENAMED_REMOTE")
   check_eq "renamed file readable via remote" "$renamed_text" "create-${TS}"
 
   if wait_path_exists "$RW_ALPHA_MOUNT"; then
     if mv "$RW_ALPHA_MOUNT" "$RW_ALPHA_RENAMED_MOUNT"; then
       check_eq "rename directory via mount succeeds" "true" "true"
       check_cmd "renamed directory visible via remote list" wait_remote_ls_has_name "$ROOT_REMOTE" "alpha-renamed"
-      renamed_nested_text=$(dat9_retry fs cat "$RW_ALPHA_RENAMED_REMOTE/text-renamed.txt")
+      renamed_nested_text=$(drive9_retry fs cat "$RW_ALPHA_RENAMED_REMOTE/text-renamed.txt")
       check_eq "renamed directory keeps file content" "$renamed_nested_text" "create-${TS}"
     else
       for _ in $(seq 1 "$CLI_MAX_RETRIES"); do
-        dat9_retry fs mv "$RW_ALPHA_REMOTE" "$RW_ALPHA_RENAMED_REMOTE" >/dev/null 2>&1 || true
+        drive9_retry fs mv "$RW_ALPHA_REMOTE" "$RW_ALPHA_RENAMED_REMOTE" >/dev/null 2>&1 || true
         if wait_remote_ls_has_name "$ROOT_REMOTE" "alpha-renamed"; then
           break
         fi
@@ -650,7 +650,7 @@ PY
       fi
     fi
   else
-    dat9_retry fs mv "$RW_ALPHA_REMOTE" "$RW_ALPHA_RENAMED_REMOTE" >/dev/null 2>&1 || true
+    drive9_retry fs mv "$RW_ALPHA_REMOTE" "$RW_ALPHA_RENAMED_REMOTE" >/dev/null 2>&1 || true
     if wait_remote_ls_has_name "$ROOT_REMOTE" "alpha-renamed"; then
       check_eq "rename directory source exists" "fallback" "fallback"
     else
@@ -659,7 +659,7 @@ PY
   fi
 
   echo "[9] cross-channel consistency"
-  dat9_retry fs cp "$SEED_LOCAL" ":$CLI_TO_MOUNT_REMOTE" >/dev/null
+  drive9_retry fs cp "$SEED_LOCAL" ":$CLI_TO_MOUNT_REMOTE" >/dev/null
   if wait_path_exists "$CLI_TO_MOUNT_MOUNT"; then
     check_eq "cli write appears in mount" "true" "true"
   else
@@ -678,7 +678,7 @@ PY
   dd if=/dev/zero of="$LARGE_MOUNT" bs=1M count=8 status=none
   large_size=$(stat_field "$LARGE_REMOTE" "size")
   check_eq "8MB mounted file size matches remote stat" "$large_size" "8388608"
-  dat9_retry fs cp ":$LARGE_REMOTE" "$LARGE_DOWNLOADED" >/dev/null
+  drive9_retry fs cp ":$LARGE_REMOTE" "$LARGE_DOWNLOADED" >/dev/null
   check_cmd "downloaded large file exists" test -f "$LARGE_DOWNLOADED"
   large_src_hash=$(sha256_file "$LARGE_MOUNT")
   large_dst_hash=$(sha256_file "$LARGE_DOWNLOADED")
@@ -710,7 +710,7 @@ PY
   stop_mount
   check_cmd "rw mount unmounted" wait_mount_state unmounted
 
-  dat9_retry fs cp "$SEED_LOCAL" ":$RO_SEED_REMOTE" >/dev/null
+  drive9_retry fs cp "$SEED_LOCAL" ":$RO_SEED_REMOTE" >/dev/null
   if start_mount ro; then
     check_eq "read-only mount point is mounted" "true" "true"
   else
