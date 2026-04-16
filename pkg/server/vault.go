@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/vault"
 )
 
@@ -37,10 +38,14 @@ func (s *Server) handleVault(w http.ResponseWriter, r *http.Request) {
 }
 
 // vaultStore returns the vault store for the current tenant.
+// Vault is only supported on TiDB providers; db9 tenants get a clear error.
 func (s *Server) vaultStore(r *http.Request) (*vault.Store, error) {
 	scope := ScopeFromContext(r.Context())
 	if scope == nil || scope.Backend == nil {
 		return nil, fmt.Errorf("no tenant scope")
+	}
+	if scope.Provider == tenant.ProviderDB9 {
+		return nil, fmt.Errorf("vault is not supported for provider %q", scope.Provider)
 	}
 	if s.vaultMK == nil {
 		return nil, fmt.Errorf("vault master key not configured")
@@ -401,6 +406,10 @@ func (s *Server) handleVaultRead(w http.ResponseWriter, r *http.Request, sub str
 	}
 	tenantID := scope.TenantID
 
+	if scope.Provider == tenant.ProviderDB9 {
+		errJSON(w, http.StatusNotImplemented, "vault is not supported for this provider")
+		return
+	}
 	if s.vaultMK == nil {
 		errJSON(w, http.StatusInternalServerError, "vault master key not configured")
 		return
