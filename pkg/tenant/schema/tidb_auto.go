@@ -48,7 +48,7 @@ type tidbTableMeta struct {
 //
 // and update tidb_cloud_starter with the exported SQL.
 func tidbAutoEmbeddingSchemaStatements() []string {
-	return []string{
+	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
 			path         VARCHAR(512) NOT NULL,
@@ -152,6 +152,8 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 		)`,
 		`CREATE INDEX idx_llm_usage_created ON llm_usage(created_at)`,
 	}
+	stmts = append(stmts, VaultTiDBSchemaStatements()...)
+	return stmts
 }
 
 // DetectTiDBEmbeddingMode inspects the TiDB files-table embedding contract and
@@ -222,6 +224,11 @@ func ValidateTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) error {
 	}
 	if err := ensureTiDBTableExists(db, "semantic_tasks"); err != nil {
 		return fmt.Errorf("semantic_tasks schema contract: %w", err)
+	}
+	for _, t := range []string{"vault_deks", "vault_secrets", "vault_secret_fields", "vault_tokens", "vault_policies", "vault_audit_log"} {
+		if err := ensureTiDBTableExists(db, t); err != nil {
+			return fmt.Errorf("%s schema contract: %w", t, err)
+		}
 	}
 	return nil
 }

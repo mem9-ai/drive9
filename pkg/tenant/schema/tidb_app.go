@@ -14,7 +14,7 @@ import (
 // There is intentionally no drive9-server dump-init-sql --provider export path
 // for this app-managed statement list.
 func tidbAppEmbeddingSchemaStatements() []string {
-	return []string{
+	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
 			path         VARCHAR(512) NOT NULL,
@@ -114,6 +114,8 @@ func tidbAppEmbeddingSchemaStatements() []string {
 		)`,
 		`CREATE INDEX idx_llm_usage_created ON llm_usage(created_at)`,
 	}
+	stmts = append(stmts, VaultTiDBSchemaStatements()...)
+	return stmts
 }
 
 func initTiDBAppEmbeddingSchema(dsn string) error {

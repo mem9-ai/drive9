@@ -34,17 +34,21 @@ func TestSchemaDumpInitSQLByProvider(t *testing.T) {
 }
 
 func TestSchemaDumpInitSQLByProviderIncludesVault(t *testing.T) {
-	out := captureSchemaStdout(t, func() {
-		if err := runSchemaCommand([]string{"dump-init-sql", "--provider", "db9"}); err != nil {
-			t.Fatalf("dump provider schema: %v", err)
-		}
-	})
+	for _, provider := range []string{"tidb_zero", "tidb_cloud_starter"} {
+		t.Run(provider, func(t *testing.T) {
+			out := captureSchemaStdout(t, func() {
+				if err := runSchemaCommand([]string{"dump-init-sql", "--provider", provider}); err != nil {
+					t.Fatalf("dump provider schema: %v", err)
+				}
+			})
 
-	if !strings.Contains(out, "CREATE TABLE IF NOT EXISTS vault_deks") {
-		t.Fatalf("db9 dump missing vault_deks: %q", out)
-	}
-	if !strings.Contains(out, "CREATE TABLE IF NOT EXISTS vault_audit_log") {
-		t.Fatalf("db9 dump missing vault_audit_log: %q", out)
+			if !strings.Contains(out, "CREATE TABLE IF NOT EXISTS vault_deks") {
+				t.Fatalf("%s dump missing vault_deks: %q", provider, out)
+			}
+			if !strings.Contains(out, "CREATE TABLE IF NOT EXISTS vault_audit_log") {
+				t.Fatalf("%s dump missing vault_audit_log: %q", provider, out)
+			}
+		})
 	}
 }
 

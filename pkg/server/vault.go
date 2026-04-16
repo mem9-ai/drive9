@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/vault"
 )
 
@@ -36,11 +37,17 @@ func (s *Server) handleVault(w http.ResponseWriter, r *http.Request) {
 	errJSON(w, http.StatusNotFound, "not found")
 }
 
+var errVaultUnsupported = errors.New("vault is not supported for this provider")
+
 // vaultStore returns the vault store for the current tenant.
+// Vault is only supported on TiDB providers; db9 tenants get a clear error.
 func (s *Server) vaultStore(r *http.Request) (*vault.Store, error) {
 	scope := ScopeFromContext(r.Context())
 	if scope == nil || scope.Backend == nil {
 		return nil, fmt.Errorf("no tenant scope")
+	}
+	if scope.Provider == tenant.ProviderDB9 {
+		return nil, errVaultUnsupported
 	}
 	if s.vaultMK == nil {
 		return nil, fmt.Errorf("vault master key not configured")
@@ -53,6 +60,10 @@ func (s *Server) vaultStore(r *http.Request) (*vault.Store, error) {
 func (s *Server) handleVaultSecrets(w http.ResponseWriter, r *http.Request, sub string) {
 	vs, err := s.vaultStore(r)
 	if err != nil {
+		if errors.Is(err, errVaultUnsupported) {
+			errJSON(w, http.StatusNotImplemented, err.Error())
+			return
+		}
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -234,6 +245,10 @@ func (s *Server) handleVaultSecretDelete(w http.ResponseWriter, r *http.Request,
 func (s *Server) handleVaultTokens(w http.ResponseWriter, r *http.Request, sub string) {
 	vs, err := s.vaultStore(r)
 	if err != nil {
+		if errors.Is(err, errVaultUnsupported) {
+			errJSON(w, http.StatusNotImplemented, err.Error())
+			return
+		}
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -349,6 +364,10 @@ func (s *Server) handleVaultAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	vs, err := s.vaultStore(r)
 	if err != nil {
+		if errors.Is(err, errVaultUnsupported) {
+			errJSON(w, http.StatusNotImplemented, err.Error())
+			return
+		}
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -401,6 +420,10 @@ func (s *Server) handleVaultRead(w http.ResponseWriter, r *http.Request, sub str
 	}
 	tenantID := scope.TenantID
 
+	if scope.Provider == tenant.ProviderDB9 {
+		errJSON(w, http.StatusNotImplemented, "vault is not supported for this provider")
+		return
+	}
 	if s.vaultMK == nil {
 		errJSON(w, http.StatusInternalServerError, "vault master key not configured")
 		return
