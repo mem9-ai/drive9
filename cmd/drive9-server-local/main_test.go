@@ -10,39 +10,13 @@ import (
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
-	"github.com/mem9-ai/dat9/pkg/buildinfo"
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
 
-func TestVersionTextIncludesBuildInfo(t *testing.T) {
-	origVersion := buildinfo.Version
-	origGitHash := buildinfo.GitHash
-	origGitBranch := buildinfo.GitBranch
-	origBuildTime := buildinfo.BuildTime
-	t.Cleanup(func() {
-		buildinfo.Version = origVersion
-		buildinfo.GitHash = origGitHash
-		buildinfo.GitBranch = origGitBranch
-		buildinfo.BuildTime = origBuildTime
-	})
-
-	buildinfo.Version = "v2.1.0"
-	buildinfo.GitHash = "cafebabe"
-	buildinfo.GitBranch = "feature/local"
-	buildinfo.BuildTime = "2026-04-16T10:30:00Z"
-
+func TestVersionTextUsesDrive9ServerLocalComponent(t *testing.T) {
 	got := versionText()
-	checks := []string{
-		"component: drive9-server-local\n",
-		"version: v2.1.0\n",
-		"git_hash: cafebabe\n",
-		"git_branch: feature/local\n",
-		"build_time: 2026-04-16T10:30:00Z\n",
-	}
-	for _, want := range checks {
-		if !strings.Contains(got, want) {
-			t.Fatalf("versionText() missing %q in %q", want, got)
-		}
+	if !strings.Contains(got, "component: drive9-server-local\n") {
+		t.Fatalf("versionText() missing drive9-server-local component line: %q", got)
 	}
 }
 

@@ -15,19 +15,23 @@ CLI_NAME ?= drive9
 LOCAL_SERVER_NAME ?= drive9-server-local
 
 BIN_DIR ?= bin
+# Use an absolute GOBIN for tool installation; `go install` is more predictable
+# with an absolute path than a repo-relative bin dir.
+BIN_DIR_ABS := $(abspath $(BIN_DIR))
 DIST_DIR ?= dist
 SERVER_BIN ?= $(BIN_DIR)/$(APP_NAME)
 CLI_BIN ?= $(BIN_DIR)/$(CLI_NAME)
 LOCAL_SERVER_BIN ?= $(BIN_DIR)/$(LOCAL_SERVER_NAME)
-LOCAL_BIN ?= $(CURDIR)/bin
+
 VERSION ?=
 GIT_HASH ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+
 CLI_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 GOLANGCI_LINT_VERSION ?= v2.5.0
-GOLANGCI_LINT_BIN ?= $(LOCAL_BIN)/golangci-lint
+GOLANGCI_LINT_BIN ?= $(BIN_DIR)/golangci-lint
 
 IMAGE_REPO ?= drive9-server
 IMAGE_TAG ?= latest
@@ -85,9 +89,9 @@ lint:
 install-lint:
 	@echo "Checking for golangci-lint..."
 	@if [ ! -x "$(GOLANGCI_LINT_BIN)" ]; then \
-		echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION) to $(LOCAL_BIN)..."; \
-		mkdir -p "$(LOCAL_BIN)"; \
-		GOBIN="$(LOCAL_BIN)" $(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
+		echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION) to $(BIN_DIR)..."; \
+		mkdir -p "$(BIN_DIR)"; \
+		GOBIN="$(BIN_DIR_ABS)" $(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
 	else \
 		echo "golangci-lint already installed at $(GOLANGCI_LINT_BIN)"; \
 	fi
@@ -102,8 +106,8 @@ build-server-local:
 	mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(LOCAL_SERVER_BIN) ./cmd/drive9-server-local
 
-run-server-local:
-	@source ./scripts/drive9-server-local-env.sh && $(GO) run ./cmd/drive9-server-local
+run-server-local: build-server-local
+	@source ./scripts/drive9-server-local-env.sh && "./$(LOCAL_SERVER_BIN)"
 
 build-cli:
 	mkdir -p $(BIN_DIR)
