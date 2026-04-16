@@ -1,14 +1,10 @@
 name: Release CLI binaries
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'cmd/**'
-      - 'pkg/**'
-      - 'go.mod'
-      - 'go.sum'
-      - 'Makefile'
+  workflow_run:
+    workflows: ["Deploy server to prod"]
+    types:
+      - completed
   workflow_dispatch:
 
 concurrency:
@@ -18,12 +14,15 @@ concurrency:
 jobs:
   release:
     name: Build and publish CLI
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Checkout agfs dependency
         run: |
@@ -37,7 +36,8 @@ jobs:
 
       - name: Determine version
         run: |
-          VERSION="${GITHUB_SHA::7}"
+          SOURCE_SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          VERSION="${SOURCE_SHA::7}"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Build CLI for all platforms
