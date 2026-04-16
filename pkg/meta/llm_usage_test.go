@@ -193,6 +193,77 @@ func TestLLMCostCacheInsertAdvancesStaleFallback(t *testing.T) {
 	}
 }
 
+// TestLLMCostCacheReadInsertInterleaving is a regression test for the
+// read/insert race: a slow DB refresh must NOT overwrite a cache that was
+// bumped by a concurrent insert.
+//
+// Timeline simulated via afterDBRead hook:
+//   1. cache = 4900 (populated by initial read)
+//   2. goroutine A starts MonthlyLLMCostMillicents, DB returns 4900
+//   3. (between DB read and cache update) goroutine B InsertLLMUsage(+200),
+//      bumping cache to 5100 and version to 1
+//   4. goroutine A tries to overwrite cache with 4900 — version check prevents it
+//   5. meta store goes down; stale fallback must return 5100, not 4900
+func TestLLMCostCacheReadInsertInterleaving(t *testing.T) {
+	s := newControlStore(t)
+	_, _ = s.DB().Exec("DELETE FROM llm_usage")
+
+	ctx := context.Background()
+	if err := s.InsertLLMUsage(ctx, "t1", "img_extract_text", "task-1", 4900, 100, "tokens"); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := NewLLMCostCache(s, "t1", 1*time.Hour)
+
+	// Step 1: populate cache with 4900.
+	total, err := cache.MonthlyLLMCostMillicents(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 4900 {
+		t.Fatalf("initial cache: got %d, want 4900", total)
+	}
+
+	// Step 2-4: set up the interleaving hook. After the next DB read completes
+	// (returning 4900 or 5100 depending on timing), inject a concurrent insert
+	// that bumps the cache to 5100 and the version counter.
+	hookCalled := false
+	cache.afterDBRead = func() {
+		hookCalled = true
+		// Simulate a concurrent insert happening between DB read and cache update.
+		if err := cache.InsertLLMUsage(ctx, "t1", "img_extract_text", "task-2", 200, 50, "tokens"); err != nil {
+			t.Errorf("insert in hook: %v", err)
+		}
+	}
+
+	// This read triggers the hook: DB read completes, then insert bumps cache,
+	// then the read tries to overwrite — version check should prevent it.
+	total, err = cache.MonthlyLLMCostMillicents(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hookCalled {
+		t.Fatal("afterDBRead hook was not called")
+	}
+
+	// Clear the hook so it doesn't fire again.
+	cache.afterDBRead = nil
+
+	// Step 5: close DB to force stale fallback.
+	_ = s.Close()
+
+	// The stale fallback must return 5100 (4900 + 200), NOT the DB-read value
+	// that the refresh tried to write. This proves the version check prevented
+	// the stale overwrite.
+	total, err = cache.MonthlyLLMCostMillicents(ctx, "t1")
+	if err != nil {
+		t.Fatalf("expected stale cache hit (no error), got err: %v", err)
+	}
+	if total != 5100 {
+		t.Fatalf("stale cache after interleaved insert: got %d, want 5100", total)
+	}
+}
+
 func TestLLMCostCacheColdStart_FailOpen(t *testing.T) {
 	s := newControlStore(t)
 

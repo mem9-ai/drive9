@@ -52,8 +52,14 @@ type LLMCostCache struct {
 	store *Store
 	ttl   time.Duration
 
-	mu     sync.Mutex
-	cached *llmCostCacheEntry
+	mu      sync.Mutex
+	cached  *llmCostCacheEntry
+	version uint64 // bumped on every successful insert; prevents stale DB reads from overwriting insert-advanced cache
+
+	// afterDBRead is a test hook called after the DB read completes but before
+	// the cache is updated. It allows tests to inject concurrent inserts to
+	// exercise the read/insert interleaving race.
+	afterDBRead func()
 }
 
 // NewLLMCostCache creates a cache that wraps meta store budget lookups.
@@ -77,6 +83,7 @@ func (c *LLMCostCache) InsertLLMUsage(ctx context.Context, tenantID, taskType, t
 				fetchedAt: c.cached.fetchedAt,
 			}
 		}
+		c.version++
 		c.mu.Unlock()
 	}
 	return err
@@ -86,10 +93,24 @@ func (c *LLMCostCache) InsertLLMUsage(ctx context.Context, tenantID, taskType, t
 // on meta store failure. Returns (0, nil) on cold-start + meta store failure
 // (fail-open).
 func (c *LLMCostCache) MonthlyLLMCostMillicents(ctx context.Context, tenantID string) (int64, error) {
+	// Snapshot version before the (potentially slow) DB read so we can detect
+	// concurrent inserts that advanced the cache while we were querying.
+	c.mu.Lock()
+	vBefore := c.version
+	c.mu.Unlock()
+
 	total, err := c.store.MonthlyLLMCostMillicents(ctx, tenantID)
+	if c.afterDBRead != nil {
+		c.afterDBRead()
+	}
 	if err == nil {
 		c.mu.Lock()
-		c.cached = &llmCostCacheEntry{total: total, fetchedAt: time.Now()}
+		// Only overwrite the cache if no insert bumped the version since the
+		// DB read started. This prevents a stale DB result from reverting a
+		// more recent insert-advanced total.
+		if c.version == vBefore {
+			c.cached = &llmCostCacheEntry{total: total, fetchedAt: time.Now()}
+		}
 		c.mu.Unlock()
 		return total, nil
 	}
