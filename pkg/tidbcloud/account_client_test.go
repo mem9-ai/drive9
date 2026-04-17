@@ -63,8 +63,11 @@ func TestAuthorize_OAuthToken_Success(t *testing.T) {
 	}
 
 	client := NewGRPCAccountClient(mock)
+
+	// Kong path: X-Auth-Method=bear + X-Auth-Raw
 	r, _ := http.NewRequest("GET", "/", nil)
-	r.Header.Set("Authorization", "Bearer valid-token")
+	r.Header.Set("X-Auth-Method", "bear")
+	r.Header.Set("X-Auth-Raw", "Bearer valid-token")
 
 	orgID, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err != nil {
@@ -72,6 +75,18 @@ func TestAuthorize_OAuthToken_Success(t *testing.T) {
 	}
 	if orgID != 200 {
 		t.Fatalf("got orgID %d, want 200", orgID)
+	}
+
+	// Fallback path: direct Authorization header (local dev without Kong)
+	r2, _ := http.NewRequest("GET", "/", nil)
+	r2.Header.Set("Authorization", "Bearer valid-token")
+
+	orgID2, err := client.Authorize(context.Background(), r2, "cluster-1")
+	if err != nil {
+		t.Fatalf("fallback: unexpected error: %v", err)
+	}
+	if orgID2 != 200 {
+		t.Fatalf("fallback: got orgID %d, want 200", orgID2)
 	}
 }
 
@@ -134,7 +149,8 @@ func TestAuthorize_OAuthToken_InactiveUser(t *testing.T) {
 
 	client := NewGRPCAccountClient(mock)
 	r, _ := http.NewRequest("GET", "/", nil)
-	r.Header.Set("Authorization", "Bearer some-token")
+	r.Header.Set("X-Auth-Method", "bear")
+	r.Header.Set("X-Auth-Raw", "Bearer some-token")
 
 	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
@@ -159,7 +175,8 @@ func TestAuthorize_OAuthToken_NoOrgs(t *testing.T) {
 
 	client := NewGRPCAccountClient(mock)
 	r, _ := http.NewRequest("GET", "/", nil)
-	r.Header.Set("Authorization", "Bearer some-token")
+	r.Header.Set("X-Auth-Method", "bear")
+	r.Header.Set("X-Auth-Raw", "Bearer some-token")
 
 	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
@@ -189,7 +206,8 @@ func TestAuthorize_OAuthToken_VerifyFails(t *testing.T) {
 
 	client := NewGRPCAccountClient(mock)
 	r, _ := http.NewRequest("GET", "/", nil)
-	r.Header.Set("Authorization", "Bearer some-token")
+	r.Header.Set("X-Auth-Method", "bear")
+	r.Header.Set("X-Auth-Raw", "Bearer some-token")
 
 	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {

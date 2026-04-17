@@ -69,17 +69,32 @@ func (c *grpcAccountClient) Authorize(ctx context.Context, r *http.Request, _ st
 }
 
 // authenticate extracts credentials from the request and resolves identity via
-// the account service. Logic mirrors authsdk.AuthnIdentity.
+// the account service.
+//
+// In production, Kong authenticates the request first and forwards identity via
+// headers:
+//   - Bearer token: X-Auth-Method=bear, X-Auth-Raw=Bearer <token>
+//   - API key:      X-Auth-Method=digest/basic, X-Auth-Content={"public_key":"<ak>"}
+//
+// As a fallback (e.g. local dev without Kong), the raw Authorization header is
+// also accepted.
 func (c *grpcAccountClient) authenticate(ctx context.Context, r *http.Request) (*identityInfo, error) {
-	// 1. OAuth token: Authorization: Bearer <token>
-	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-		token := strings.TrimPrefix(auth, "Bearer ")
+	method := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Auth-Method")))
+
+	// 1. Bearer token via Kong: X-Auth-Method=bear, X-Auth-Raw=Bearer <token>
+	if method == "bear" {
+		raw := r.Header.Get("X-Auth-Raw")
+		if raw == "" {
+			return nil, fmt.Errorf("%w: X-Auth-Raw is empty", ErrAuthMissing)
+		}
+		token := raw
+		if strings.HasPrefix(strings.ToLower(raw), "bearer ") {
+			token = raw[7:]
+		}
 		return c.authByUserToken(ctx, token)
 	}
 
-	method := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Auth-Method")))
-
-	// 2. API key: X-Auth-Method: digest/basic + X-Auth-Content: {"public_key":"<ak>"}
+	// 2. API key via Kong: X-Auth-Method=digest/basic, X-Auth-Content={"public_key":"<ak>"}
 	if method == "digest" || method == "basic" {
 		content := r.Header.Get("X-Auth-Content")
 		if content == "" {
@@ -94,11 +109,16 @@ func (c *grpcAccountClient) authenticate(ctx context.Context, r *http.Request) (
 		return c.authByAPIKey(ctx, payload.PublicKey)
 	}
 
+	// 3. Fallback: direct Authorization header (local dev without Kong).
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		token := strings.TrimPrefix(auth, "Bearer ")
+		return c.authByUserToken(ctx, token)
+	}
+
 	return nil, fmt.Errorf("%w: no valid auth credentials found", ErrAuthMissing)
 }
 
 // authByUserToken validates an OAuth token via GetUserByToken.
-// Mirrors authsdk.AuthnUserToken.
 func (c *grpcAccountClient) authByUserToken(ctx context.Context, token string) (*identityInfo, error) {
 	resp, err := c.account.GetUserByToken(ctx, &accountpb.GetUserByTokenRequest{
 		Token: token,
@@ -132,7 +152,6 @@ func (c *grpcAccountClient) authByUserToken(ctx context.Context, token string) (
 }
 
 // authByAPIKey validates an API key (public_key) via GetApiKeyByAccessKey.
-// Mirrors authsdk.AuthnApiKeyAK + GetOrgIdFromApiKeyRsp.
 func (c *grpcAccountClient) authByAPIKey(ctx context.Context, accessKey string) (*identityInfo, error) {
 	resp, err := c.account.GetApiKeyByAccessKey(ctx, &accountpb.GetApiKeyByAccessKeyReq{
 		AccessKey: accessKey,
