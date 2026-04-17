@@ -8,11 +8,13 @@ type FileHandle struct {
 	Ino          uint64
 	Path         string
 	Flags        uint32          // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
+	OpenPID      uint32          // PID that opened the handle, when supplied by the kernel
 	Dirty        *WriteBuffer    // write buffer, nil for read-only opens
 	DirtySeq     uint64          // monotonic sequence for authoritative dirty-size tracking
 	WriteBackSeq uint64          // DirtySeq at time of write-back cache snapshot (0 = no snapshot)
 	OrigSize     int64           // original file size at open time (for patch detection)
 	BaseRev      int64           // server revision at open time (for conflict detection)
+	ZeroBase     bool            // true when the handle has adopted an explicit empty-file baseline
 	IsNew        bool            // true if created via Create() (no prior remote existence)
 	ShadowReady  bool            // true when the local shadow file is a safe full snapshot
 	Streamer     *StreamUploader // nil for small files / read-only; manages background part uploads
@@ -105,4 +107,17 @@ func (ht *HandleTable[T]) ForEach(fn func(fh uint64, val T)) {
 	for fh, val := range ht.table {
 		fn(fh, val)
 	}
+}
+
+// Snapshot returns a copy of the handle values present at the time of call.
+// The returned slice can be iterated without holding the table lock.
+func (ht *HandleTable[T]) Snapshot() []T {
+	ht.mu.Lock()
+	defer ht.mu.Unlock()
+
+	vals := make([]T, 0, len(ht.table))
+	for _, val := range ht.table {
+		vals = append(vals, val)
+	}
+	return vals
 }
