@@ -781,7 +781,7 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 		PartSize         int64  `json:"part_size,omitempty"`
 		ExpectedRevision *int64 `json:"expected_revision,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_bad_body", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_append", "result", "error")
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())

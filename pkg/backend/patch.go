@@ -132,9 +132,6 @@ func appendDirtyPartNumbers(baseSize int64, newSize int64, partSize int64) []int
 		dirty = append(dirty, basePartCount)
 	}
 	start := basePartCount + 1
-	if baseSize > 0 && baseSize%partSize != 0 {
-		start = basePartCount + 1
-	}
 	for pn := start; pn <= len(newParts); pn++ {
 		dirty = append(dirty, pn)
 	}
