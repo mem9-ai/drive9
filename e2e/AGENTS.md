@@ -82,7 +82,7 @@ bash e2e/smoke-all.sh
 Current shared dev deployment:
 
 ```bash
-export DRIVE9_BASE="https://xkopoerih4.execute-api.ap-southeast-1.amazonaws.com"
+export DRIVE9_BASE="http://k8s-dat9-dat9serv-d5e02e7d07-1645488597.ap-southeast-1.elb.amazonaws.com"
 ```
 
 Use this value unless the environment owner announces a new endpoint.
