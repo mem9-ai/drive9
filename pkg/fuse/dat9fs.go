@@ -185,6 +185,26 @@ func (fs *Dat9FS) clearDirtySize(ino uint64, seq uint64) {
 	}
 }
 
+func (fs *Dat9FS) updateOpenHandleBaseRevision(path string, revision int64) {
+	if revision <= 0 {
+		return
+	}
+
+	fs.fileHandles.ForEach(func(_ uint64, fh *FileHandle) {
+		if fh == nil || fh.Path != path {
+			return
+		}
+		fh.Lock()
+		fh.BaseRev = revision
+		if fh.ShadowReady && fs.shadowStore != nil {
+			if err := fs.shadowStore.Ensure(fh.Path, fh.Dirty.Size(), revision); err != nil {
+				log.Printf("shadow base revision refresh failed for %s: %v", fh.Path, err)
+			}
+		}
+		fh.Unlock()
+	})
+}
+
 func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
 	stat, err := fs.client.StatCtx(ctx, fh.Path)
 	if err != nil {
@@ -691,6 +711,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					if stat.Revision > 0 {
 						entry.Revision = stat.Revision
 						fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
+						fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision)
 					}
 					if !stat.Mtime.IsZero() {
 						entry.Mtime = stat.Mtime
