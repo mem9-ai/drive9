@@ -229,9 +229,8 @@ import time
 raise SystemExit(0 if time.time() >= float(sys.argv[1]) else 1)
 PY
     then
-      if [ "$rc" -eq 0 ] && [ -n "$got" ]; then
-        printf '%s\n' "$got" >&2
-      fi
+      printf 'wait_remote_stat_field_eq: timeout path=%s field=%s want=%s last_got=%s\n' \
+        "$path" "$field" "$want" "${got:-<none>}" >&2
       return 1
     fi
 

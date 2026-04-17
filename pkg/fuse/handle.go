@@ -8,6 +8,7 @@ type FileHandle struct {
 	Ino          uint64
 	Path         string
 	Flags        uint32          // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
+	OpenPID      uint32          // PID that opened the handle, when supplied by the kernel
 	Dirty        *WriteBuffer    // write buffer, nil for read-only opens
 	DirtySeq     uint64          // monotonic sequence for authoritative dirty-size tracking
 	WriteBackSeq uint64          // DirtySeq at time of write-back cache snapshot (0 = no snapshot)
