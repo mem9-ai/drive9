@@ -25,7 +25,9 @@
 # S3 mode selection for drive9-server-local.
 # Default: local mock S3 when DRIVE9_S3_BUCKET is unset.
 # AWS mode: set DRIVE9_S3_BUCKET (and optionally DRIVE9_S3_REGION,
-# DRIVE9_S3_PREFIX, DRIVE9_S3_ROLE_ARN). In AWS mode, do not export
+# DRIVE9_S3_PREFIX, DRIVE9_S3_ENDPOINT, DRIVE9_S3_FORCE_PATH_STYLE,
+# DRIVE9_S3_ACCESS_KEY_ID, DRIVE9_S3_SECRET_ACCESS_KEY,
+# DRIVE9_S3_SESSION_TOKEN, DRIVE9_S3_ROLE_ARN). In AWS mode, do not export
 # DRIVE9_S3_DIR; drive9-server-local treats it as a configuration error.
 : "${DRIVE9_S3_DIR:=${TMPDIR:-/tmp}/drive9-local-s3}"
 # Example AWS mode:
@@ -33,6 +35,13 @@
 # export DRIVE9_S3_REGION=us-east-1
 # export DRIVE9_S3_PREFIX=drive9-local
 # export DRIVE9_S3_ROLE_ARN=arn:aws:iam::123456789012:role/drive9-local
+# Example MinIO mode:
+# export DRIVE9_S3_BUCKET=drive9
+# export DRIVE9_S3_REGION=us-east-1
+# export DRIVE9_S3_ENDPOINT=http://127.0.0.1:9000
+# export DRIVE9_S3_FORCE_PATH_STYLE=true
+# export DRIVE9_S3_ACCESS_KEY_ID=minioadmin
+# export DRIVE9_S3_SECRET_ACCESS_KEY=minioadmin
 
 # Run the following command to pull the embedding model before starting drive9-server-local.
 # ollama pull all-minilm
@@ -93,6 +102,9 @@ export DRIVE9_EMBED_MODEL
 echo "Environment loaded for drive9-server-local."
 if [[ -n "${DRIVE9_S3_BUCKET:-}" ]]; then
   echo "S3 mode: aws (${DRIVE9_S3_BUCKET} in ${DRIVE9_S3_REGION:-us-east-1})"
+  if [[ -n "${DRIVE9_S3_ENDPOINT:-}" ]]; then
+    echo "S3 endpoint: ${DRIVE9_S3_ENDPOINT} (path-style: ${DRIVE9_S3_FORCE_PATH_STYLE:-false})"
+  fi
 else
   echo "S3 mode: local (${DRIVE9_S3_DIR})"
 fi
