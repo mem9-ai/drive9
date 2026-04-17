@@ -13,6 +13,7 @@ type FileHandle struct {
 	WriteBackSeq uint64          // DirtySeq at time of write-back cache snapshot (0 = no snapshot)
 	OrigSize     int64           // original file size at open time (for patch detection)
 	BaseRev      int64           // server revision at open time (for conflict detection)
+	ZeroBase     bool            // true when the handle has adopted an explicit empty-file baseline
 	IsNew        bool            // true if created via Create() (no prior remote existence)
 	ShadowReady  bool            // true when the local shadow file is a safe full snapshot
 	Streamer     *StreamUploader // nil for small files / read-only; manages background part uploads

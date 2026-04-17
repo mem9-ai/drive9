@@ -1,6 +1,8 @@
 package fuse
 
+
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1176,6 +1178,145 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 	}
 	if revision != 3 {
 		t.Fatalf("remote revision = %d, want 3", revision)
+	}
+}
+
+func TestSetAttr_PathTruncateDoesNotRefreshStaleWriterHandle(t *testing.T) {
+	var (
+		mu         sync.Mutex
+		revision   int64 = 1
+		content         = []byte("orig")
+		handlerErr error
+	)
+	recordHandlerErr := func(err error) {
+		if err == nil {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			mu.Lock()
+			defer mu.Unlock()
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(len(content)), 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				recordHandlerErr(fmt.Errorf("read body: %w", err))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			expected := r.Header.Get("X-Dat9-Expected-Revision")
+			if expected != "" && expected != strconv.FormatInt(revision, 10) {
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			content = append([]byte(nil), body...)
+			revision++
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			_, _ = w.Write(content)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, int64(len(content)), time.Now())
+	fs.inodes.UpdateRevision(ino, revision)
+	fs.inodes.UpdateSize(ino, int64(len(content)))
+
+	var staleOut gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY),
+	}, &staleOut)
+	if st != gofuse.OK {
+		t.Fatalf("stale writer Open status = %v, want OK", st)
+	}
+	staleFH, ok := fs.fileHandles.Get(staleOut.Fh)
+	if !ok {
+		t.Fatal("stale writer handle not found")
+	}
+
+	var truncOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &truncOut)
+	if st != gofuse.OK {
+		t.Fatalf("truncate handle Open status = %v, want OK", st)
+	}
+	truncFH, ok := fs.fileHandles.Get(truncOut.Fh)
+	if !ok {
+		t.Fatal("truncate handle not found")
+	}
+
+	var attrOut gofuse.AttrOut
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	if staleFH.BaseRev != 1 {
+		t.Fatalf("stale writer base revision = %d, want 1", staleFH.BaseRev)
+	}
+	if truncFH.BaseRev != 2 {
+		t.Fatalf("truncate handle base revision = %d, want 2", truncFH.BaseRev)
+	}
+
+	if _, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       staleOut.Fh,
+		Offset:   0,
+	}, []byte("stale")); st != gofuse.OK {
+		t.Fatalf("stale writer Write status = %v, want OK", st)
+	}
+
+	staleFH.Lock()
+	flushStatus := fs.flushHandle(context.Background(), staleFH)
+	staleFH.Unlock()
+	if flushStatus != gofuse.EIO {
+		t.Fatalf("stale writer flush status = %v, want %v", flushStatus, gofuse.EIO)
+	}
+
+	mu.Lock()
+	if handlerErr != nil {
+		mu.Unlock()
+		t.Fatal(handlerErr)
+	}
+	defer mu.Unlock()
+	if got := string(content); got != "" {
+		t.Fatalf("remote content after stale writer conflict = %q, want empty", got)
+	}
+	if revision != 2 {
+		t.Fatalf("remote revision after stale writer conflict = %d, want 2", revision)
 	}
 }
 

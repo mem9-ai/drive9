@@ -185,16 +185,31 @@ func (fs *Dat9FS) clearDirtySize(ino uint64, seq uint64) {
 	}
 }
 
+func shouldRefreshHandleAfterPathTruncate(fh *FileHandle) bool {
+	if fh == nil || fh.Dirty == nil {
+		return false
+	}
+	return fh.ZeroBase
+}
+
 func (fs *Dat9FS) updateOpenHandleBaseRevision(path string, revision int64) {
 	if revision <= 0 {
 		return
 	}
 
+	var matching []*FileHandle
 	for _, fh := range fs.fileHandles.Snapshot() {
-		if fh == nil || fh.Path != path {
+		if fh != nil && fh.Path == path && fh.Dirty != nil {
+			matching = append(matching, fh)
+		}
+	}
+
+	for _, fh := range matching {
+		fh.Lock()
+		if len(matching) > 1 && !shouldRefreshHandleAfterPathTruncate(fh) {
+			fh.Unlock()
 			continue
 		}
-		fh.Lock()
 		fh.BaseRev = revision
 		if fh.Streamer != nil {
 			fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
@@ -695,6 +710,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				// subsequent writes starting at the new size are not
 				// misdetected as back-writes (appendCursor may be stale).
 				fh.Dirty.ResetSequentialState(newSize)
+				fh.ZeroBase = newSize == 0
 				fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
 				fh.Unlock()
 			}
@@ -1405,6 +1421,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.Dirty.sequential = true
 			fh.Dirty.uploadedParts = make(map[int]bool)
 			_ = fh.Dirty.Truncate(0)
+			fh.ZeroBase = true
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 			fs.inodes.UpdateSize(fh.Ino, 0)
 			if fs.shadowStore != nil && fs.pendingIndex != nil {
