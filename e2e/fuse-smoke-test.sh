@@ -637,7 +637,7 @@ if is_mounted "$MOUNT_POINT"; then
 
   if : > "$RW_TEXT_MOUNT"; then
     check_eq "truncate via mount succeeds" "true" "true"
-    truncated_size=$(stat_field "$RW_TEXT_REMOTE" "size")
+    truncated_size=$(wait_remote_stat_field_eq "$RW_TEXT_REMOTE" "size" "0")
     check_eq "truncate sets size to 0" "$truncated_size" "0"
   else
     check_eq "truncate via mount succeeds" "false" "true"

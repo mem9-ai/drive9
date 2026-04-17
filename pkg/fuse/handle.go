@@ -106,3 +106,16 @@ func (ht *HandleTable[T]) ForEach(fn func(fh uint64, val T)) {
 		fn(fh, val)
 	}
 }
+
+// Snapshot returns a copy of the handle values present at the time of call.
+// The returned slice can be iterated without holding the table lock.
+func (ht *HandleTable[T]) Snapshot() []T {
+	ht.mu.Lock()
+	defer ht.mu.Unlock()
+
+	vals := make([]T, 0, len(ht.table))
+	for _, val := range ht.table {
+		vals = append(vals, val)
+	}
+	return vals
+}

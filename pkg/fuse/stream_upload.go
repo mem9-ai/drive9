@@ -53,6 +53,22 @@ func (su *StreamUploader) Started() bool {
 	return su.started
 }
 
+// RefreshExpectedRevision updates the conditional revision used for future
+// upload initiation if streaming has not started yet.
+func (su *StreamUploader) RefreshExpectedRevision(revision int64) bool {
+	if revision < 0 {
+		return false
+	}
+
+	su.mu.Lock()
+	defer su.mu.Unlock()
+	if su.started {
+		return false
+	}
+	su.expectedRevision = revision
+	return true
+}
+
 // HasStreamedParts reports whether any parts were uploaded during streaming
 // (i.e., during Write() calls, not at flush time).
 func (su *StreamUploader) HasStreamedParts() bool {

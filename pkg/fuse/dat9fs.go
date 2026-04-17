@@ -190,19 +190,26 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(path string, revision int64) {
 		return
 	}
 
-	fs.fileHandles.ForEach(func(_ uint64, fh *FileHandle) {
+	for _, fh := range fs.fileHandles.Snapshot() {
 		if fh == nil || fh.Path != path {
-			return
+			continue
 		}
 		fh.Lock()
 		fh.BaseRev = revision
+		if fh.Streamer != nil {
+			fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+		}
 		if fh.ShadowReady && fs.shadowStore != nil {
-			if err := fs.shadowStore.Ensure(fh.Path, fh.Dirty.Size(), revision); err != nil {
+			size := int64(0)
+			if fh.Dirty != nil {
+				size = fh.Dirty.Size()
+			}
+			if err := fs.shadowStore.Ensure(fh.Path, size, revision); err != nil {
 				log.Printf("shadow base revision refresh failed for %s: %v", fh.Path, err)
 			}
 		}
 		fh.Unlock()
-	})
+	}
 }
 
 func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gofuse.Status {

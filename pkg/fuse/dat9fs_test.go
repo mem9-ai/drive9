@@ -1054,10 +1054,21 @@ func TestSetAttr_TruncateWithoutHandleRefreshesRevision(t *testing.T) {
 
 func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 	var (
-		mu       sync.Mutex
-		revision int64 = 1
-		content       = []byte("orig")
+		mu         sync.Mutex
+		revision   int64 = 1
+		content         = []byte("orig")
+		handlerErr error
 	)
+	recordHandlerErr := func(err error) {
+		if err == nil {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -1071,7 +1082,9 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 		case http.MethodPut:
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
-				t.Fatalf("read body: %v", err)
+				recordHandlerErr(fmt.Errorf("read body: %w", err))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			mu.Lock()
 			defer mu.Unlock()
@@ -1132,6 +1145,15 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 	if fh.BaseRev != 2 {
 		t.Fatalf("open handle base revision after path truncate = %d, want 2", fh.BaseRev)
 	}
+	if fh.Streamer == nil {
+		t.Fatal("expected stream uploader on O_TRUNC handle")
+	}
+	fh.Streamer.mu.Lock()
+	streamerRevision := fh.Streamer.expectedRevision
+	fh.Streamer.mu.Unlock()
+	if streamerRevision != 2 {
+		t.Fatalf("streamer expected revision after path truncate = %d, want 2", streamerRevision)
+	}
 
 	if _, st = fs.Write(nil, &gofuse.WriteIn{
 		InHeader: gofuse.InHeader{NodeId: ino},
@@ -1144,6 +1166,10 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 	fs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
 
 	mu.Lock()
+	if handlerErr != nil {
+		mu.Unlock()
+		t.Fatal(handlerErr)
+	}
 	defer mu.Unlock()
 	if got := string(content); got != "overwrite" {
 		t.Fatalf("remote content = %q, want %q", got, "overwrite")
