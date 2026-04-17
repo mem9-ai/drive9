@@ -123,8 +123,8 @@ func main() {
 			zap.String("region", s3cfg.Region),
 			zap.String("endpoint", s3cfg.Endpoint),
 			zap.Bool("path_style", s3cfg.ForcePathStyle),
-			zap.String("credentials", s3CredentialLogValue(s3cfg.AccessKeyID)),
-			zap.String("role", s3RoleLogValue(s3cfg.RoleARN)))
+			zap.String("credentials", s3client.CredentialLogValue(s3cfg.AccessKeyID)),
+			zap.String("role", s3client.RoleLogValue(s3cfg.RoleARN)))
 	}
 
 	encryptType := envOr("DRIVE9_ENCRYPT_TYPE", "local_aes")
@@ -304,20 +304,6 @@ func (cfg s3Config) awsConfig() s3client.AWSConfig {
 		SecretAccessKey: cfg.SecretAccessKey,
 		SessionToken:    cfg.SessionToken,
 	}
-}
-
-func s3CredentialLogValue(accessKeyID string) string {
-	if accessKeyID != "" {
-		return "static"
-	}
-	return "default-credentials"
-}
-
-func s3RoleLogValue(roleARN string) string {
-	if roleARN == "" {
-		return "none"
-	}
-	return roleARN
 }
 
 func versionText() string {

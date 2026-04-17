@@ -186,8 +186,8 @@ func main() {
 			zap.String("prefix", s3cfg.Prefix),
 			zap.String("endpoint", s3cfg.Endpoint),
 			zap.Bool("path_style", s3cfg.ForcePathStyle),
-			zap.String("credentials", localS3CredentialLogValue(s3cfg.AccessKeyID)),
-			zap.String("role", localS3RoleLogValue(s3cfg.RoleARN)))
+			zap.String("credentials", s3client.CredentialLogValue(s3cfg.AccessKeyID)),
+			zap.String("role", s3client.RoleLogValue(s3cfg.RoleARN)))
 	case "local":
 		// Even in local single-tenant mode we keep the same S3-facing upload code path
 		// by backing it with the local mock implementation.
@@ -251,8 +251,8 @@ func main() {
 		zap.String("s3_prefix", s3cfg.Prefix),
 		zap.String("s3_endpoint", s3cfg.Endpoint),
 		zap.Bool("s3_path_style", s3cfg.ForcePathStyle),
-		zap.String("s3_credentials", localS3CredentialLogValue(s3cfg.AccessKeyID)),
-		zap.String("s3_role", localS3RoleLogValue(s3cfg.RoleARN)),
+		zap.String("s3_credentials", s3client.CredentialLogValue(s3cfg.AccessKeyID)),
+		zap.String("s3_role", s3client.RoleLogValue(s3cfg.RoleARN)),
 		zap.Bool("local_init_schema", localInitSchema),
 		zap.String("requested_embedding_mode", localEmbeddingModeLabel(requestedEmbeddingMode, explicitEmbeddingMode)),
 		zap.String("embedding_mode", string(localEmbeddingMode)),
@@ -428,20 +428,6 @@ func (c localS3Config) localDir() string {
 		return ""
 	}
 	return c.Dir
-}
-
-func localS3RoleLogValue(roleARN string) string {
-	if roleARN == "" {
-		return "none"
-	}
-	return roleARN
-}
-
-func localS3CredentialLogValue(accessKeyID string) string {
-	if accessKeyID != "" {
-		return "static"
-	}
-	return "default-credentials"
 }
 
 var (

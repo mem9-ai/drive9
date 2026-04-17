@@ -58,16 +58,25 @@ func (cfg AWSConfig) Validate() error {
 	return cfg.validate()
 }
 
+// CredentialLogValue reports the credential source label for startup logs.
+func CredentialLogValue(accessKeyID string) string {
+	if accessKeyID != "" {
+		return "static"
+	}
+	return "default-credentials"
+}
+
+// RoleLogValue reports the role-assumption label for startup logs.
+func RoleLogValue(roleARN string) string {
+	if roleARN == "" {
+		return "none"
+	}
+	return roleARN
+}
+
 func staticCredentialsProvider(cfg AWSConfig) (aws.CredentialsProvider, bool, error) {
 	hasAccessKey := cfg.AccessKeyID != ""
-	hasSecretKey := cfg.SecretAccessKey != ""
-	if hasAccessKey != hasSecretKey {
-		return nil, false, fmt.Errorf("s3 access key id and secret access key must be set together")
-	}
 	if !hasAccessKey {
-		if cfg.SessionToken != "" {
-			return nil, false, fmt.Errorf("s3 session token requires access key id and secret access key")
-		}
 		return nil, false, nil
 	}
 	return credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken), true, nil

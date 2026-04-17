@@ -116,6 +116,21 @@ func TestStaticCredentialsProviderFromAWSConfig(t *testing.T) {
 	}
 }
 
+func TestS3LogValueHelpers(t *testing.T) {
+	if got := CredentialLogValue("ak"); got != "static" {
+		t.Fatalf("CredentialLogValue(static) = %q, want %q", got, "static")
+	}
+	if got := CredentialLogValue(""); got != "default-credentials" {
+		t.Fatalf("CredentialLogValue(default) = %q, want %q", got, "default-credentials")
+	}
+	if got := RoleLogValue(""); got != "none" {
+		t.Fatalf("RoleLogValue(empty) = %q, want %q", got, "none")
+	}
+	if got := RoleLogValue("arn:aws:iam::123456789012:role/test"); got != "arn:aws:iam::123456789012:role/test" {
+		t.Fatalf("RoleLogValue(arn) = %q, want %q", got, "arn:aws:iam::123456789012:role/test")
+	}
+}
+
 func TestApplyS3Options(t *testing.T) {
 	opts := s3.Options{}
 	applyS3Options(AWSConfig{
