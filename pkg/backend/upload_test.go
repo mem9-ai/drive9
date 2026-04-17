@@ -436,7 +436,7 @@ func TestPresignPartConcurrentTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const workers = 32
+	workers := plan.TotalParts
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	errCh := make(chan error, workers)
@@ -577,6 +577,53 @@ func TestPresignAfterAbortFails(t *testing.T) {
 	_, err = b.PresignParts(ctx, plan.UploadID, entriesFromInts([]int{1, 2}))
 	if err == nil {
 		t.Error("expected error batch presigning after abort")
+	}
+}
+
+func TestPresignPartsInactiveUploadTakesPrecedenceOverBatchValidation(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	plan, err := b.InitiateUploadV2(ctx, "/presign-inactive-priority.bin", 20<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.AbortUploadV2(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = b.PresignParts(ctx, plan.UploadID, entriesFromInts([]int{1, 1}))
+	if !errors.Is(err, datastore.ErrUploadNotActive) {
+		t.Fatalf("expected ErrUploadNotActive, got %v", err)
+	}
+}
+
+func TestPresignPartsExpiredUploadTakesPrecedenceOverBatchValidation(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	totalSize := int64(5000 << 20)
+	plan, err := b.InitiateUploadV2(ctx, "/presign-expired-priority.bin", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = b.store.DB().ExecContext(ctx, `UPDATE uploads SET expires_at = ? WHERE upload_id = ?`,
+		time.Now().Add(-1*time.Hour), plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parts := make([]int, MaxPresignBatch+1)
+	for i := range parts {
+		parts[i] = i + 1
+	}
+	if parts[len(parts)-1] > plan.TotalParts {
+		t.Skipf("not enough parts (%d) to test batch limit precedence", plan.TotalParts)
+	}
+
+	_, err = b.PresignParts(ctx, plan.UploadID, entriesFromInts(parts))
+	if !errors.Is(err, datastore.ErrUploadExpired) {
+		t.Fatalf("expected ErrUploadExpired, got %v", err)
 	}
 }
 

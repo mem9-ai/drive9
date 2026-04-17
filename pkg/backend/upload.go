@@ -113,14 +113,17 @@ func (b *Dat9Backend) ensureUploadPresignable(ctx context.Context, uploadID stri
 	if err != nil {
 		return nil, err
 	}
-	if refreshed.Status != datastore.UploadUploading {
-		if time.Now().After(refreshed.ExpiresAt) {
-			_ = b.AbortUploadV2(ctx, uploadID)
-			return nil, datastore.ErrUploadExpired
-		}
+	if refreshed.Status == datastore.UploadUploading {
+		return refreshed, nil
+	}
+	if refreshed.Status != datastore.UploadInitiated {
 		return nil, datastore.ErrUploadNotActive
 	}
-	return refreshed, nil
+	if time.Now().After(refreshed.ExpiresAt) {
+		_ = b.AbortUploadV2(ctx, uploadID)
+		return nil, datastore.ErrUploadExpired
+	}
+	return nil, datastore.ErrUploadNotActive
 }
 
 func (b *Dat9Backend) activeUploadByPath(ctx context.Context, path string) (*datastore.Upload, error) {
@@ -508,7 +511,7 @@ func (b *Dat9Backend) PresignPart(ctx context.Context, uploadID string, partNumb
 		case errors.Is(err, datastore.ErrUploadNotActive):
 			metrics.RecordOperation("backend", "presign_part", "not_active", time.Since(start))
 		default:
-			logger.Error(ctx, "backend_presign_part_status_transition_failed", zap.String("upload_id", uploadID), zap.Error(err))
+			logger.Error(ctx, "backend_presign_part_ensure_presignable_failed", zap.String("upload_id", uploadID), zap.Error(err))
 			metrics.RecordOperation("backend", "presign_part", "error", time.Since(start))
 		}
 		return nil, err
@@ -549,6 +552,24 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, entries
 	}
 	getUploadDurationMs := uploadPhaseMs(getUploadStart)
 	statusBefore := upload.Status
+	statusTransitionDurationMs := 0.0
+	statusTransitionStart := time.Now()
+	upload, err = b.ensureUploadPresignable(ctx, uploadID, upload)
+	if err != nil {
+		switch {
+		case errors.Is(err, datastore.ErrUploadExpired):
+			metrics.RecordOperation("backend", "presign_parts", "expired", time.Since(start))
+		case errors.Is(err, datastore.ErrUploadNotActive):
+			metrics.RecordOperation("backend", "presign_parts", "not_active", time.Since(start))
+		default:
+			logger.Error(ctx, "backend_presign_parts_ensure_presignable_failed", zap.String("upload_id", uploadID), zap.Error(err))
+			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
+		}
+		return nil, err
+	}
+	if statusBefore == datastore.UploadInitiated {
+		statusTransitionDurationMs = uploadPhaseMs(statusTransitionStart)
+	}
 	if len(entries) > MaxPresignBatch {
 		metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
 		return nil, fmt.Errorf("batch too large: %d parts exceeds limit of %d", len(entries), MaxPresignBatch)
@@ -561,24 +582,6 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, entries
 			return nil, fmt.Errorf("duplicate part number %d in batch", e.PartNumber)
 		}
 		seen[e.PartNumber] = true
-	}
-	statusTransitionDurationMs := 0.0
-	statusTransitionStart := time.Now()
-	upload, err = b.ensureUploadPresignable(ctx, uploadID, upload)
-	if err != nil {
-		switch {
-		case errors.Is(err, datastore.ErrUploadExpired):
-			metrics.RecordOperation("backend", "presign_parts", "expired", time.Since(start))
-		case errors.Is(err, datastore.ErrUploadNotActive):
-			metrics.RecordOperation("backend", "presign_parts", "not_active", time.Since(start))
-		default:
-			logger.Error(ctx, "backend_presign_parts_status_transition_failed", zap.String("upload_id", uploadID), zap.Error(err))
-			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
-		}
-		return nil, err
-	}
-	if statusBefore == datastore.UploadInitiated {
-		statusTransitionDurationMs = uploadPhaseMs(statusTransitionStart)
 	}
 
 	calcPartsStart := time.Now()
