@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -423,6 +424,54 @@ func TestPresignPartSingle(t *testing.T) {
 	}
 	if u.Number != plan.TotalParts {
 		t.Errorf("expected part number %d, got %d", plan.TotalParts, u.Number)
+	}
+}
+
+func TestPresignPartConcurrentTransition(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	plan, err := b.InitiateUploadV2(ctx, "/presign-concurrent.bin", 256<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const workers = 32
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+
+	for i := 0; i < workers; i++ {
+		partNumber := i + 1
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			u, err := b.PresignPart(ctx, plan.UploadID, partNumber, nil)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if u == nil || u.URL == "" || u.Number != partNumber {
+				errCh <- errors.New("unexpected presign response")
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent presign failed: %v", err)
+	}
+
+	upload, err := b.GetUpload(ctx, plan.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upload.Status != datastore.UploadUploading {
+		t.Fatalf("expected UPLOADING after concurrent presign, got %s", upload.Status)
 	}
 }
 
