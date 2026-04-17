@@ -19,7 +19,6 @@ import (
 	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
-	"github.com/mem9-ai/dat9/pkg/pathutil"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
@@ -773,13 +772,7 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
-	nf, err := b.Store().Stat(r.Context(), path)
-	if err != nil && errors.Is(err, datastore.ErrNotFound) && !pathutil.IsDir(path) {
-		dirPath, dirErr := pathutil.CanonicalizeDir(path)
-		if dirErr == nil && dirPath != path {
-			nf, err = b.Store().Stat(r.Context(), dirPath)
-		}
-	}
+	nf, err := b.StatNodeCtx(r.Context(), path)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "stat_not_found", "path", path)...)

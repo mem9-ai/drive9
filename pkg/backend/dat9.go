@@ -582,13 +582,33 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 	return infos, nil
 }
 
-func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
-	ctx := backgroundWithTrace()
-	resolvedPath, _, err := b.resolveNodePath(ctx, path)
-	if err != nil {
+func (b *Dat9Backend) StatNodeCtx(ctx context.Context, path string) (*datastore.NodeWithFile, error) {
+	resolvedPath := normalizePath(path)
+	nf, err := b.store.Stat(ctx, resolvedPath)
+	if err == nil {
+		return nf, nil
+	}
+	if !errors.Is(err, datastore.ErrNotFound) || pathutil.IsDir(path) {
 		return nil, err
 	}
-	nf, err := b.store.Stat(ctx, resolvedPath)
+
+	dirPath, dirErr := pathutil.CanonicalizeDir(path)
+	if dirErr != nil || dirPath == resolvedPath {
+		return nil, err
+	}
+	dirStat, dirStatErr := b.store.Stat(ctx, dirPath)
+	if dirStatErr != nil {
+		if errors.Is(dirStatErr, datastore.ErrNotFound) {
+			return nil, err
+		}
+		return nil, dirStatErr
+	}
+	return dirStat, nil
+}
+
+func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
+	ctx := backgroundWithTrace()
+	nf, err := b.StatNodeCtx(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -805,7 +825,10 @@ func (b *Dat9Backend) resolveNodePath(ctx context.Context, rawPath string) (stri
 	}
 	dirNode, dirLookupErr := b.store.GetNode(ctx, dirPath)
 	if dirLookupErr != nil {
-		return resolvedPath, nil, err
+		if errors.Is(dirLookupErr, datastore.ErrNotFound) {
+			return resolvedPath, nil, err
+		}
+		return resolvedPath, nil, dirLookupErr
 	}
 	return dirPath, dirNode, nil
 }
