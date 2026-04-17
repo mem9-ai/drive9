@@ -228,7 +228,7 @@ func (u *WriteBackUploader) uploadOne(remotePath string) {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
-		lastErr = u.client.WriteCtxConditional(ctx, remotePath, data, expectedRevision)
+		lastErr = uploadBufferedRemoteFile(ctx, u.client, remotePath, data, expectedRevision)
 		cancel()
 
 		if lastErr == nil {
@@ -292,7 +292,7 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, remotePath string) e
 		}
 	}
 
-	if err := u.client.WriteCtxConditional(ctx, remotePath, data, expectedRevision); err != nil {
+	if err := uploadBufferedRemoteFile(ctx, u.client, remotePath, data, expectedRevision); err != nil {
 		return err
 	}
 

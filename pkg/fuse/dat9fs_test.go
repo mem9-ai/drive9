@@ -334,7 +334,8 @@ func TestFlushLargeOverwritePatchCarriesExpectedRevision(t *testing.T) {
 		partSize = 5 << 20
 	)
 
-	var gotExpected int64 = -1
+	var gotExpected atomic.Int64
+	gotExpected.Store(-1)
 	var uploadedBytes int
 	var completeCalled bool
 
@@ -355,7 +356,7 @@ func TestFlushLargeOverwritePatchCarriesExpectedRevision(t *testing.T) {
 				http.Error(w, "missing expected_revision", http.StatusBadRequest)
 				return
 			}
-			gotExpected = *req.ExpectedRevision
+			gotExpected.Store(*req.ExpectedRevision)
 			if req.NewSize != fileSize {
 				http.Error(w, "bad new_size", http.StatusBadRequest)
 				return
@@ -411,8 +412,8 @@ func TestFlushLargeOverwritePatchCarriesExpectedRevision(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("Flush status = %v, want OK", st)
 	}
-	if gotExpected != 17 {
-		t.Fatalf("expected_revision = %d, want 17", gotExpected)
+	if gotExpected.Load() != 17 {
+		t.Fatalf("expected_revision = %d, want 17", gotExpected.Load())
 	}
 	if uploadedBytes != int(fileSize) {
 		t.Fatalf("uploaded bytes = %d, want %d", uploadedBytes, fileSize)
@@ -425,7 +426,8 @@ func TestFlushLargeOverwritePatchCarriesExpectedRevision(t *testing.T) {
 func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 	const fileSize = smallFileThreshold + 2048
 
-	var gotExpected int64 = -1
+	var gotExpected atomic.Int64
+	gotExpected.Store(-1)
 	var completeParts int
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -444,7 +446,7 @@ func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 				http.Error(w, "missing expected_revision", http.StatusBadRequest)
 				return
 			}
-			gotExpected = *req.ExpectedRevision
+			gotExpected.Store(*req.ExpectedRevision)
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"upload_id":   "up-1",
@@ -519,8 +521,8 @@ func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("Flush status = %v, want OK", st)
 	}
-	if gotExpected != 0 {
-		t.Fatalf("expected_revision = %d, want 0", gotExpected)
+	if gotExpected.Load() != 0 {
+		t.Fatalf("expected_revision = %d, want 0", gotExpected.Load())
 	}
 	if completeParts != 1 {
 		t.Fatalf("complete parts = %d, want 1", completeParts)
