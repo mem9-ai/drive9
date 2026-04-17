@@ -360,8 +360,10 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) erro
 		return fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
 	}
 
-	// Upload to server with a revision gate.
-	if err := cq.client.WriteCtxConditional(ctx, entry.Path, data, expectedRevision); err != nil {
+	// Upload through the same small-file vs multipart client path used by
+	// foreground flushes so large write-back entries don't regress to the
+	// legacy direct PUT code path.
+	if err := uploadBufferedRemoteFile(ctx, cq.client, entry.Path, data, expectedRevision); err != nil {
 		return err
 	}
 
