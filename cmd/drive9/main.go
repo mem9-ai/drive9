@@ -233,7 +233,8 @@ commands:
   ls [path]            list directory
   stat <path>          file metadata
   mv <old> <new>       rename/move
-  rm <path>            remove
+  rm [-r|--recursive] <path>
+                       remove file or directory tree
   sh                   interactive shell
   grep <pattern> [dir] search file contents
   find [dir] [flags]   find files by attributes

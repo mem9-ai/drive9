@@ -115,6 +115,46 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+func TestRemoveAll(t *testing.T) {
+	c, cleanup := newTestClient(t)
+	defer cleanup()
+
+	if err := c.Mkdir("/data"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Write("/data/a.txt", []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Mkdir("/data/nested"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Write("/data/nested/b.txt", []byte("b")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.RemoveAll("/data/"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Stat("/data/"); err == nil {
+		t.Fatal("expected error after recursive delete")
+	}
+	if _, err := c.Read("/data/a.txt"); err == nil {
+		t.Fatal("expected sibling file read to fail after recursive delete")
+	}
+	if _, err := c.Read("/data/nested/b.txt"); err == nil {
+		t.Fatal("expected nested file read to fail after recursive delete")
+	}
+	entries, err := c.List("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name == "data" || entry.Name == "data/" {
+			t.Fatalf("expected removed directory to be absent from root listing, got entries %+v", entries)
+		}
+	}
+}
+
 func TestCopy(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()
