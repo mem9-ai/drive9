@@ -43,10 +43,12 @@ func TestRm(t *testing.T) {
 	t.Run("recursive_delete", func(t *testing.T) {
 		var gotPath string
 		var gotRecursive bool
+		var gotRawQuery string
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			gotPath = r.URL.Path
 			gotRecursive = r.URL.Query().Has("recursive")
+			gotRawQuery = r.URL.RawQuery
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		}))
@@ -63,15 +65,20 @@ func TestRm(t *testing.T) {
 		if !gotRecursive {
 			t.Fatal("Rm(recursive) did not send recursive query")
 		}
+		if gotRawQuery != "recursive=1" {
+			t.Fatalf("Rm(recursive) raw query = %q, want %q", gotRawQuery, "recursive=1")
+		}
 	})
 
 	t.Run("recursive_remote_path", func(t *testing.T) {
 		var gotPath string
 		var gotRecursive bool
+		var gotRawQuery string
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			gotPath = r.URL.Path
 			gotRecursive = r.URL.Query().Has("recursive")
+			gotRawQuery = r.URL.RawQuery
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		}))
@@ -87,6 +94,9 @@ func TestRm(t *testing.T) {
 		}
 		if !gotRecursive {
 			t.Fatal("Rm(recursive remote) did not send recursive query")
+		}
+		if gotRawQuery != "recursive=1" {
+			t.Fatalf("Rm(recursive remote) raw query = %q, want %q", gotRawQuery, "recursive=1")
 		}
 	})
 

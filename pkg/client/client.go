@@ -332,7 +332,8 @@ func (c *Client) RemoveAllCtx(ctx context.Context, path string) error {
 func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool) error {
 	requestURL := c.url(path)
 	if recursive {
-		requestURL += "?recursive"
+		// Use an explicit value to avoid intermediaries dropping bare "?recursive".
+		requestURL += "?recursive=1"
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL, nil)
