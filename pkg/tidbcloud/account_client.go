@@ -84,12 +84,15 @@ func (c *grpcAccountClient) authenticate(ctx context.Context, r *http.Request) (
 	// 1. Bearer token via Kong: X-Auth-Method=bear, X-Auth-Raw=Bearer <token>
 	if method == "bear" {
 		raw := r.Header.Get("X-Auth-Raw")
-		if raw == "" {
+		if strings.TrimSpace(raw) == "" {
 			return nil, fmt.Errorf("%w: X-Auth-Raw is empty", ErrAuthMissing)
 		}
-		token := raw
+		token := strings.TrimSpace(raw)
 		if strings.HasPrefix(strings.ToLower(raw), "bearer ") {
-			token = raw[7:]
+			token = strings.TrimSpace(raw[len("Bearer "):])
+		}
+		if token == "" {
+			return nil, fmt.Errorf("%w: X-Auth-Raw bearer token is empty", ErrAuthMissing)
 		}
 		return c.authByUserToken(ctx, token)
 	}
@@ -111,7 +114,10 @@ func (c *grpcAccountClient) authenticate(ctx context.Context, r *http.Request) (
 
 	// 3. Fallback: direct Authorization header (local dev without Kong).
 	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-		token := strings.TrimPrefix(auth, "Bearer ")
+		token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+		if token == "" {
+			return nil, fmt.Errorf("%w: bearer token is empty", ErrAuthMissing)
+		}
 		return c.authByUserToken(ctx, token)
 	}
 
