@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 
+	"go.uber.org/zap"
+
 	accountpb "github.com/tidbcloud/account/idl/pbgen/proto/account"
 
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -121,6 +123,13 @@ func (c *grpcAccountClient) authenticate(ctx context.Context, r *http.Request) (
 		return c.authByUserToken(ctx, token)
 	}
 
+	// Log actual auth headers to diagnose unexpected combinations.
+	logger.L().Warn("authenticate: unrecognized auth headers",
+		zap.String("x-auth-method", method),
+		zap.Bool("has-x-auth-raw", r.Header.Get("X-Auth-Raw") != ""),
+		zap.Bool("has-x-auth-content", r.Header.Get("X-Auth-Content") != ""),
+		zap.Bool("has-authorization", r.Header.Get("Authorization") != ""),
+	)
 	return nil, fmt.Errorf("%w: no valid auth credentials found", ErrAuthMissing)
 }
 
