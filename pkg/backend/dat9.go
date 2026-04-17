@@ -219,8 +219,7 @@ func (b *Dat9Backend) RemoveCtx(ctx context.Context, path string) (err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, "remove", err, start) }()
 
-	path = normalizePath(path)
-	node, err := b.store.GetNode(ctx, path)
+	path, node, err := b.resolveNodePath(ctx, path)
 	if err != nil {
 		return err
 	}
@@ -245,8 +244,7 @@ func (b *Dat9Backend) RemoveAllCtx(ctx context.Context, path string) (err error)
 	start := time.Now()
 	defer func() { observeBackend(ctx, "remove_all", err, start) }()
 
-	path = normalizePath(path)
-	node, err := b.store.GetNode(ctx, path)
+	path, node, err := b.resolveNodePath(ctx, path)
 	if err != nil {
 		return err
 	}
@@ -585,8 +583,11 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 }
 
 func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
-	path = normalizePath(path)
-	nf, err := b.store.Stat(backgroundWithTrace(), path)
+	resolvedPath, _, err := b.resolveNodePath(backgroundWithTrace(), path)
+	if err != nil {
+		return nil, err
+	}
+	nf, err := b.store.Stat(backgroundWithTrace(), resolvedPath)
 	if err != nil {
 		return nil, err
 	}
@@ -617,13 +618,11 @@ func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (e
 	start := time.Now()
 	defer func() { observeBackend(ctx, "rename", err, start) }()
 
-	oldPath = normalizePath(oldPath)
-	newPath = normalizePath(newPath)
-
-	node, err := b.store.GetNode(ctx, oldPath)
+	oldPath, node, err := b.resolveNodePath(ctx, oldPath)
 	if err != nil {
 		return err
 	}
+	newPath = canonicalizePathForKind(newPath, node.IsDirectory)
 	if node.IsDirectory {
 		err = b.store.EnsureParentDirs(ctx, newPath, b.genID)
 		if err != nil {
@@ -776,6 +775,38 @@ func normalizePath(path string) string {
 		return path
 	}
 	return p
+}
+
+func canonicalizePathForKind(path string, isDir bool) string {
+	if isDir {
+		p, err := pathutil.CanonicalizeDir(path)
+		if err == nil {
+			return p
+		}
+		return path
+	}
+	return normalizePath(path)
+}
+
+func (b *Dat9Backend) resolveNodePath(ctx context.Context, rawPath string) (string, *datastore.FileNode, error) {
+	resolvedPath := normalizePath(rawPath)
+	node, err := b.store.GetNode(ctx, resolvedPath)
+	if err == nil {
+		return resolvedPath, node, nil
+	}
+	if !errors.Is(err, datastore.ErrNotFound) || pathutil.IsDir(rawPath) {
+		return resolvedPath, nil, err
+	}
+
+	dirPath, dirErr := pathutil.CanonicalizeDir(rawPath)
+	if dirErr != nil || dirPath == resolvedPath {
+		return resolvedPath, nil, err
+	}
+	dirNode, dirLookupErr := b.store.GetNode(ctx, dirPath)
+	if dirLookupErr != nil {
+		return resolvedPath, nil, err
+	}
+	return dirPath, dirNode, nil
 }
 
 func backgroundWithTrace() context.Context {
