@@ -583,11 +583,12 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 }
 
 func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
-	resolvedPath, _, err := b.resolveNodePath(backgroundWithTrace(), path)
+	ctx := backgroundWithTrace()
+	resolvedPath, _, err := b.resolveNodePath(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	nf, err := b.store.Stat(backgroundWithTrace(), resolvedPath)
+	nf, err := b.store.Stat(ctx, resolvedPath)
 	if err != nil {
 		return nil, err
 	}
