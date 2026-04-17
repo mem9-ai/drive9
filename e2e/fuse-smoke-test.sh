@@ -11,6 +11,8 @@ MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-20}"
 MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
 REMOTE_VISIBILITY_TIMEOUT_S="${REMOTE_VISIBILITY_TIMEOUT_S:-5}"
 REMOTE_VISIBILITY_INTERVAL_S="${REMOTE_VISIBILITY_INTERVAL_S:-0.2}"
+LARGE_FILE_VISIBILITY_TIMEOUT_S="${LARGE_FILE_VISIBILITY_TIMEOUT_S:-30}"
+LARGE_FILE_VISIBILITY_INTERVAL_S="${LARGE_FILE_VISIBILITY_INTERVAL_S:-1}"
 FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
 CLI_SOURCE="${CLI_SOURCE:-build}"
 CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://drive9.ai/releases}"
@@ -178,6 +180,62 @@ for line in text.splitlines():
         raise SystemExit(0)
 raise SystemExit(1)
 PY
+}
+
+wait_remote_stat_field_eq() {
+  local path="$1"
+  local field="$2"
+  local want="$3"
+  local timeout_s="${4:-$REMOTE_VISIBILITY_TIMEOUT_S}"
+  local interval_s="${5:-$REMOTE_VISIBILITY_INTERVAL_S}"
+  local deadline
+  local out rc got
+  deadline=$(python3 - "$timeout_s" <<'PY'
+import sys
+import time
+print(time.time() + float(sys.argv[1]))
+PY
+)
+
+  while :; do
+    set +e
+    out=$(drive9 fs stat "$path" 2>&1)
+    rc=$?
+    set -e
+
+    if [ "$rc" -eq 0 ]; then
+      got=$(python3 - "$out" "$field" <<'PY'
+import sys
+text, field = sys.argv[1], sys.argv[2].lower()
+for line in text.splitlines():
+    if line.strip().lower().startswith(field + ":"):
+        print(line.split(":", 1)[1].strip())
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+      ) || got=""
+      if [ "$got" = "$want" ]; then
+        printf '%s' "$got"
+        return 0
+      fi
+    elif [[ "$out" != *"not found"* && "$out" != *"Too Many Requests"* && "$out" != *"HTTP 429"* && "$out" != *"HTTP 403"* && "$out" != *"403 Forbidden"* ]]; then
+      printf '%s\n' "$out" >&2
+      return 1
+    fi
+
+    if python3 - "$deadline" <<'PY'
+import sys
+import time
+raise SystemExit(0 if time.time() >= float(sys.argv[1]) else 1)
+PY
+    then
+      printf 'wait_remote_stat_field_eq: timeout path=%s field=%s want=%s last_got=%s\n' \
+        "$path" "$field" "$want" "${got:-<none>}" >&2
+      return 1
+    fi
+
+    sleep "$interval_s"
+  done
 }
 
 local_size_mtime() {
@@ -506,6 +564,9 @@ RW_TEXT_MOUNT="$MOUNT_POINT/$RW_TEXT_REL"
 RW_TEXT_RENAMED_REL="${RW_ALPHA_REL}/text-renamed.txt"
 RW_TEXT_RENAMED_REMOTE="/${RW_TEXT_RENAMED_REL}"
 RW_TEXT_RENAMED_MOUNT="$MOUNT_POINT/$RW_TEXT_RENAMED_REL"
+RW_ATTR_REL="${RW_ALPHA_REL}/attr.txt"
+RW_ATTR_REMOTE="/${RW_ATTR_REL}"
+RW_ATTR_MOUNT="$MOUNT_POINT/$RW_ATTR_REL"
 RW_ALPHA_RENAMED_REL="${ROOT_REL}/alpha-renamed"
 RW_ALPHA_RENAMED_REMOTE="/${RW_ALPHA_RENAMED_REL}"
 RW_ALPHA_RENAMED_MOUNT="$MOUNT_POINT/$RW_ALPHA_RENAMED_REL"
@@ -565,46 +626,36 @@ if is_mounted "$MOUNT_POINT"; then
   check_eq "create/read via mount" "$mounted_text" "create-${TS}"
   check_eq "create visible via remote cat" "$remote_text" "create-${TS}"
 
-  # Skip overwrite/truncate coverage for now. The mounted overwrite path can
-  # self-conflict after a truncate-to-zero write advances the server revision:
-  # https://github.com/mem9-ai/drive9/issues/247
-  #
-  echo "SKIP overwrite visible via remote cat (tracked in issue #247)"
-  echo "SKIP append visible via remote cat (blocked by issue #247)"
-  echo "SKIP truncate via mount semantics (tracked in issue #247)"
-  #
-  # printf "overwrite-%s" "$TS" > "$RW_TEXT_MOUNT"
-  # remote_overwrite=$(wait_remote_cat_eq "$RW_TEXT_REMOTE" "overwrite-${TS}")
-  # check_eq "overwrite visible via remote cat" "$remote_overwrite" "overwrite-${TS}"
-  #
-  # printf -- "-append" >> "$RW_TEXT_MOUNT"
-  # remote_append=$(wait_remote_cat_eq "$RW_TEXT_REMOTE" "overwrite-${TS}-append")
-  # check_eq "append visible via remote cat" "$remote_append" "overwrite-${TS}-append"
-  #
-  # if : > "$RW_TEXT_MOUNT"; then
-  #   check_eq "truncate via mount succeeds" "true" "true"
-  #   truncated_size=$(stat_field "$RW_TEXT_REMOTE" "size")
-  #   check_eq "truncate sets size to 0" "$truncated_size" "0"
-  # else
-  #   check_eq "truncate via mount succeeds" "false" "true"
-  # fi
-  #
+  printf "overwrite-%s" "$TS" > "$RW_TEXT_MOUNT"
+  remote_overwrite=$(wait_remote_cat_eq "$RW_TEXT_REMOTE" "overwrite-${TS}")
+  check_eq "overwrite visible via remote cat" "$remote_overwrite" "overwrite-${TS}"
+
+  printf -- "-append" >> "$RW_TEXT_MOUNT"
+  remote_append=$(wait_remote_cat_eq "$RW_TEXT_REMOTE" "overwrite-${TS}-append")
+  check_eq "append visible via remote cat" "$remote_append" "overwrite-${TS}-append"
+
+  if : > "$RW_TEXT_MOUNT"; then
+    check_eq "truncate via mount succeeds" "true" "true"
+    truncated_size=$(wait_remote_stat_field_eq "$RW_TEXT_REMOTE" "size" "0")
+    check_eq "truncate sets size to 0" "$truncated_size" "0"
+  else
+    check_eq "truncate via mount succeeds" "false" "true"
+  fi
+
   echo "[6] attribute semantics"
-  echo "SKIP attribute semantics on in-place overwrite path (blocked by issue #247)"
-  echo "SKIP mounted size / mtime checks on overwrite path (tracked in issue #247)"
-  # printf "attr-base-%s" "$TS" > "$RW_TEXT_MOUNT"
-  # stat1=$(local_size_mtime "$RW_TEXT_MOUNT")
-  # size1="${stat1%%:*}"
-  # mtime1="${stat1##*:}"
-  # sleep 1
-  # printf -- "-x" >> "$RW_TEXT_MOUNT"
-  # stat2=$(local_size_mtime "$RW_TEXT_MOUNT")
-  # size2="${stat2%%:*}"
-  # mtime2="${stat2##*:}"
-  # remote_attr_size=$(stat_field "$RW_TEXT_REMOTE" "size")
-  # check_cmd "mounted size increases after append" test "$size2" -gt "$size1"
-  # check_cmd "mounted mtime is monotonic" test "$mtime2" -ge "$mtime1"
-  # check_eq "remote stat size matches mounted size" "$remote_attr_size" "$size2"
+  printf "attr-base-%s" "$TS" > "$RW_ATTR_MOUNT"
+  stat1=$(local_size_mtime "$RW_ATTR_MOUNT")
+  size1="${stat1%%:*}"
+  mtime1="${stat1##*:}"
+  sleep 1
+  printf -- "-x" >> "$RW_ATTR_MOUNT"
+  stat2=$(local_size_mtime "$RW_ATTR_MOUNT")
+  size2="${stat2%%:*}"
+  mtime2="${stat2##*:}"
+  remote_attr_size=$(wait_remote_stat_field_eq "$RW_ATTR_REMOTE" "size" "$size2")
+  check_cmd "mounted size increases after append" test "$size2" -gt "$size1"
+  check_cmd "mounted mtime is monotonic" test "$mtime2" -ge "$mtime1"
+  check_eq "remote stat size matches mounted size" "$remote_attr_size" "$size2"
 
   echo "[7] readdir semantics"
   alpha_ls=$(ls -1 "$RW_ALPHA_MOUNT")
@@ -627,7 +678,7 @@ PY
   mv "$RW_TEXT_MOUNT" "$RW_TEXT_RENAMED_MOUNT"
   check_cmd_fail "old file path missing after rename" test -f "$RW_TEXT_MOUNT"
   renamed_text=$(drive9_retry fs cat "$RW_TEXT_RENAMED_REMOTE")
-  check_eq "renamed file readable via remote" "$renamed_text" "create-${TS}"
+  check_eq "renamed file readable via remote" "$renamed_text" ""
 
   rename_dir_ready=false
   if wait_path_exists "$RW_ALPHA_MOUNT"; then
@@ -635,7 +686,7 @@ PY
       check_eq "rename directory via mount succeeds" "true" "true"
       check_cmd "renamed directory visible via remote list" wait_remote_ls_has_name "$ROOT_REMOTE" "alpha-renamed"
       renamed_nested_text=$(drive9_retry fs cat "$RW_ALPHA_RENAMED_REMOTE/text-renamed.txt")
-      check_eq "renamed directory keeps file content" "$renamed_nested_text" "create-${TS}"
+      check_eq "renamed directory keeps file content" "$renamed_nested_text" ""
       rename_dir_ready=true
     else
       check_eq "rename directory via mount succeeds" "false" "true"
@@ -689,7 +740,7 @@ PY
   echo "[10] large-file boundary"
   if [ "$rename_dir_ready" = "true" ]; then
     dd if=/dev/zero of="$LARGE_MOUNT" bs=1M count=8 status=none
-    large_size=$(stat_field "$LARGE_REMOTE" "size")
+    large_size=$(wait_remote_stat_field_eq "$LARGE_REMOTE" "size" "8388608" "$LARGE_FILE_VISIBILITY_TIMEOUT_S" "$LARGE_FILE_VISIBILITY_INTERVAL_S")
     check_eq "8MB mounted file size matches remote stat" "$large_size" "8388608"
     drive9_retry fs cp ":$LARGE_REMOTE" "$LARGE_DOWNLOADED" >/dev/null
     check_cmd "downloaded large file exists" test -f "$LARGE_DOWNLOADED"
@@ -708,6 +759,7 @@ PY
 
   mkdir -p "$MOUNT_POINT/${ROOT_REL}/nonempty"
   printf "x" > "$MOUNT_POINT/${ROOT_REL}/nonempty/x.txt"
+  check_eq "non-empty dir child visible via remote" "$(wait_remote_cat_eq "/${ROOT_REL}/nonempty/x.txt" "x")" "x"
   check_cmd_fail "rmdir non-empty dir fails" rmdir "$MOUNT_POINT/${ROOT_REL}/nonempty"
   rm -f "$MOUNT_POINT/${ROOT_REL}/nonempty/x.txt"
   if [ -d "$MOUNT_POINT/${ROOT_REL}/nonempty" ]; then
