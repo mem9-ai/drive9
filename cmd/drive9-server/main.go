@@ -199,6 +199,7 @@ func main() {
 			die(fmt.Errorf("control-plane db unavailable: %w", err))
 		}
 
+		llmUsageDualRead := os.Getenv("DRIVE9_LLM_USAGE_DUAL_READ") == "true"
 		pool = tenant.NewPool(tenant.PoolConfig{
 			S3Dir:             s3cfg.Dir,
 			PublicURL:         publicBaseURL(addr),
@@ -212,6 +213,8 @@ func main() {
 			S3SecretAccessKey: s3cfg.SecretAccessKey,
 			S3SessionToken:    s3cfg.SessionToken,
 			BackendOptions:    backendOptions,
+			MetaStore:         store,
+			LLMUsageDualRead:  llmUsageDualRead,
 		}, enc)
 		defer pool.Close()
 	}

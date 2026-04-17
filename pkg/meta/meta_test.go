@@ -15,6 +15,7 @@ func newControlStore(t *testing.T) *Store {
 	t.Cleanup(func() { _ = s.Close() })
 	_, _ = s.DB().Exec("DELETE FROM tenant_api_keys")
 	_, _ = s.DB().Exec("DELETE FROM tenants")
+	_, _ = s.DB().Exec("DELETE FROM llm_usage")
 	return s
 }
 

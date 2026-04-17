@@ -6,7 +6,6 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
-	"github.com/mem9-ai/dat9/pkg/vault"
 )
 
 // InitSchemaStatements returns the exact DDL statements used by db9 tenant
@@ -120,10 +119,10 @@ func InitSchemaStatements() []string {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_llm_usage_created ON llm_usage(created_at)`,
 	}
-	stmts := make([]string, 0, len(core)+len(vault.SchemaStatements()))
-	stmts = append(stmts, core...)
-	stmts = append(stmts, vault.SchemaStatements()...)
-	return stmts
+	// Vault tables are TiDB/MySQL-only and are not created via the db9
+	// PostgreSQL schema init path. They are initialized through the TiDB
+	// tenant schema init (see pkg/tenant/schema/vault.go).
+	return core
 }
 
 func initDB9Schema(dsn string) error {

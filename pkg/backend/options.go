@@ -48,6 +48,16 @@ type Options struct {
 	MaxMediaLLMFiles int64
 	// LLMCostBudget configures the monthly LLM cost budget for this tenant.
 	LLMCostBudget LLMCostBudgetOptions
+	// MetaStore is the control-plane meta store. When set, LLM usage is
+	// recorded to (and budgets read from) the meta store instead of the
+	// per-tenant datastore.
+	MetaStore MetaLLMUsageStore
+	// TenantID identifies this tenant in the meta store's llm_usage table.
+	TenantID string
+	// LLMUsageDualRead enables dual-read mode during transition: budget checks
+	// sum costs from both meta store and tenant datastore. Set this to true
+	// during the first month of migration to avoid mid-month budget resets.
+	LLMUsageDualRead bool
 }
 
 // LLMCostBudgetOptions configures the monthly LLM cost budget.
@@ -137,6 +147,10 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	b.whisperCostPerMinuteMillicents = cb.WhisperCostPerMinuteMillicents
 	b.fallbackImageCostMillicents = cb.FallbackImageCostMillicents
 	b.fallbackAudioCostMillicents = cb.FallbackAudioCostMillicents
+
+	b.metaLLMStore = opts.MetaStore
+	b.tenantID = opts.TenantID
+	b.llmUsageDualRead = opts.LLMUsageDualRead
 
 	if opts.QueryEmbedding.Client != nil {
 		b.queryEmbedder = opts.QueryEmbedding.Client

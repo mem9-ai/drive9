@@ -36,6 +36,13 @@ type PoolConfig struct {
 	S3SessionToken    string
 
 	BackendOptions backend.Options
+
+	// MetaStore is the control-plane store for LLM usage. When set, tenant
+	// backends write LLM usage to and read budgets from this store.
+	MetaStore *meta.Store
+	// LLMUsageDualRead enables summing LLM costs from both meta store and
+	// tenant datastore during the transition month.
+	LLMUsageDualRead bool
 }
 
 type Pool struct {
@@ -300,6 +307,11 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	opts := p.cfg.BackendOptions
 	if UsesTiDBAutoEmbedding(t.Provider) {
 		opts.DatabaseAutoEmbedding = true
+	}
+	if p.cfg.MetaStore != nil {
+		opts.MetaStore = meta.NewLLMCostCache(p.cfg.MetaStore, t.ID, 30*time.Second)
+		opts.TenantID = t.ID
+		opts.LLMUsageDualRead = p.cfg.LLMUsageDualRead
 	}
 	query := "parseTime=true"
 	if t.DBTLS {
