@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -25,21 +26,90 @@ type AWSS3Client struct {
 }
 
 type AWSConfig struct {
-	Region  string
-	Bucket  string
-	Prefix  string // key prefix, e.g. "tenants/<id>/" — keys already contain "blobs/"
-	RoleARN string
+	Region          string
+	Bucket          string
+	Prefix          string // key prefix, e.g. "tenants/<id>/" — keys already contain "blobs/"
+	RoleARN         string
+	Endpoint        string
+	ForcePathStyle  bool
+	AccessKeyID     string
+	SecretAccessKey string
+	SessionToken    string
+}
+
+func (cfg AWSConfig) validate() error {
+	if cfg.Bucket == "" {
+		return fmt.Errorf("s3 bucket is required")
+	}
+	hasAccessKey := cfg.AccessKeyID != ""
+	hasSecretKey := cfg.SecretAccessKey != ""
+	if hasAccessKey != hasSecretKey {
+		return fmt.Errorf("s3 access key id and secret access key must be set together")
+	}
+	if cfg.SessionToken != "" && !hasAccessKey {
+		return fmt.Errorf("s3 session token requires access key id and secret access key")
+	}
+	return nil
+}
+
+// Validate checks whether the S3 config has a legal combination of required
+// fields before any SDK clients are constructed.
+func (cfg AWSConfig) Validate() error {
+	return cfg.validate()
+}
+
+// CredentialLogValue reports the credential source label for startup logs.
+func CredentialLogValue(accessKeyID string) string {
+	if accessKeyID != "" {
+		return "static"
+	}
+	return "default-credentials"
+}
+
+// RoleLogValue reports the role-assumption label for startup logs.
+func RoleLogValue(roleARN string) string {
+	if roleARN == "" {
+		return "none"
+	}
+	return roleARN
+}
+
+func staticCredentialsProvider(cfg AWSConfig) (aws.CredentialsProvider, bool, error) {
+	hasAccessKey := cfg.AccessKeyID != ""
+	if !hasAccessKey {
+		return nil, false, nil
+	}
+	return credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken), true, nil
+}
+
+func applyS3Options(cfg AWSConfig) func(*s3.Options) {
+	return func(o *s3.Options) {
+		if cfg.Endpoint != "" {
+			o.BaseEndpoint = aws.String(cfg.Endpoint)
+		}
+		o.UsePathStyle = cfg.ForcePathStyle
+	}
 }
 
 func NewAWS(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
-	if cfg.Bucket == "" {
-		return nil, fmt.Errorf("s3 bucket is required")
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
+	loadOptions := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(cfg.Region),
 		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
-	)
+	}
+
+	provider, ok, err := staticCredentialsProvider(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		loadOptions = append(loadOptions, awsconfig.WithCredentialsProvider(provider))
+	}
+
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
@@ -55,7 +125,7 @@ func NewAWS(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 		)
 	}
 
-	client := s3.NewFromConfig(awsCfg)
+	client := s3.NewFromConfig(awsCfg, applyS3Options(cfg))
 	return &AWSS3Client{
 		client:  client,
 		presign: s3.NewPresignClient(client),
