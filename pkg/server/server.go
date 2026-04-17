@@ -483,7 +483,9 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPatch:
 		s.handlePatch(w, r, path)
 	case http.MethodPost:
-		if r.URL.Query().Has("copy") {
+		if r.URL.Query().Has("append") {
+			s.handleAppend(w, r, path)
+		} else if r.URL.Query().Has("copy") {
 			s.handleCopy(w, r, path)
 		} else if r.URL.Query().Has("rename") {
 			s.handleRename(w, r, path)
@@ -793,7 +795,7 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
-		if strings.Contains(err.Error(), "file is not S3-stored") || strings.Contains(err.Error(), "S3 not configured") {
+		if errors.Is(err, backend.ErrNotS3Stored) || errors.Is(err, backend.ErrS3NotConfigured) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_unsupported_target", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_patch", "result", "error")
 			errJSON(w, http.StatusBadRequest, err.Error())
@@ -808,6 +810,92 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "patch_upload_initiated", "path", path,
 		"dirty_parts", len(plan.UploadParts), "copied_parts", len(plan.CopiedParts))...)
 	metricEvent(r.Context(), "fs_patch", "result", "accepted")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(plan)
+}
+
+func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_missing_scope", "path", path)...)
+		metricEvent(r.Context(), "fs_append", "result", "error")
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+
+	var req struct {
+		AppendSize       int64  `json:"append_size"`
+		PartSize         int64  `json:"part_size,omitempty"`
+		ExpectedRevision *int64 `json:"expected_revision,omitempty"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_bad_body", "path", path, "error", err)...)
+		metricEvent(r.Context(), "fs_append", "result", "error")
+		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if req.AppendSize <= 0 {
+		errJSON(w, http.StatusBadRequest, "append_size must be positive")
+		return
+	}
+	if req.ExpectedRevision != nil && *req.ExpectedRevision < 0 {
+		errJSON(w, http.StatusBadRequest, "expected_revision must be >= 0")
+		return
+	}
+
+	expectedRevision := int64(-1)
+	if req.ExpectedRevision != nil {
+		expectedRevision = *req.ExpectedRevision
+	}
+
+	plan, err := b.InitiateAppendUploadIfRevision(r.Context(), path, req.AppendSize, req.PartSize, expectedRevision)
+	if err != nil {
+		if errors.Is(err, backend.ErrUploadTooLarge) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_upload_too_large", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_append", "result", "error")
+			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_storage_quota_exceeded", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_append", "result", "error")
+			errJSON(w, http.StatusInsufficientStorage, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrUploadConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_upload_conflict", "path", path)...)
+			metricEvent(r.Context(), "fs_append", "result", "conflict")
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrRevisionConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_revision_conflict", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_append", "result", "conflict")
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_not_found", "path", path)...)
+			metricEvent(r.Context(), "fs_append", "result", "error")
+			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrNotS3Stored) || errors.Is(err, backend.ErrS3NotConfigured) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_bad_target", "path", path, "error", err)...)
+			metricEvent(r.Context(), "fs_append", "result", "error")
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "append_upload_failed", "path", path, "error", err)...)
+		metricEvent(r.Context(), "fs_append", "result", "error")
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "append_upload_initiated", "path", path,
+		"dirty_parts", len(plan.UploadParts), "copied_parts", len(plan.CopiedParts), "base_size", plan.BaseSize)...)
+	metricEvent(r.Context(), "fs_append", "result", "accepted")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(plan)

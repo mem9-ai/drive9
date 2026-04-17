@@ -210,7 +210,7 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		return nil, err
 	}
 	if b.s3 == nil {
-		err := fmt.Errorf("S3 not configured")
+		err := ErrS3NotConfigured
 		logger.Error(ctx, "backend_initiate_upload_s3_missing", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, err
@@ -341,7 +341,7 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		return nil, err
 	}
 	if b.s3 == nil {
-		err := fmt.Errorf("S3 not configured")
+		err := ErrS3NotConfigured
 		logger.Error(ctx, "backend_initiate_upload_v2_s3_missing", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		return nil, err
@@ -1204,7 +1204,11 @@ func (b *Dat9Backend) PresignGetObject(ctx context.Context, path string) (string
 	}
 	if nf.File.StorageType != datastore.StorageS3 {
 		metrics.RecordOperation("backend", "presign_get_object", "error", time.Since(start))
-		return "", fmt.Errorf("file is not S3-stored: %s", path)
+		return "", fmt.Errorf("%w: %s", ErrNotS3Stored, path)
+	}
+	if b.s3 == nil {
+		metrics.RecordOperation("backend", "presign_get_object", "error", time.Since(start))
+		return "", ErrS3NotConfigured
 	}
 	url, err := b.s3.PresignGetObject(ctx, nf.File.StorageRef, s3client.DownloadTTL)
 	if err != nil {

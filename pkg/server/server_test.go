@@ -503,6 +503,77 @@ func TestPatchDBBackedFileReturnsBadRequest(t *testing.T) {
 	}
 }
 
+func TestAppendMissingPathReturnsNotFound(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	appendReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/missing.bin?append", strings.NewReader(`{"append_size":16}`))
+	appendReq.Header.Set("Content-Type", "application/json")
+	appendResp, err := http.DefaultClient.Do(appendReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = appendResp.Body.Close()
+	if appendResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("append missing path: got %d, want 404", appendResp.StatusCode)
+	}
+}
+
+func TestAppendDBBackedFileReturnsBadRequest(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	writeReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/small-append.txt", strings.NewReader("hello"))
+	writeResp, err := http.DefaultClient.Do(writeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = writeResp.Body.Close()
+	if writeResp.StatusCode != http.StatusOK {
+		t.Fatalf("write small file: got %d, want 200", writeResp.StatusCode)
+	}
+
+	appendReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/small-append.txt?append", strings.NewReader(`{"append_size":16}`))
+	appendReq.Header.Set("Content-Type", "application/json")
+	appendResp, err := http.DefaultClient.Do(appendReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = appendResp.Body.Close()
+	if appendResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("append small file: got %d, want 400", appendResp.StatusCode)
+	}
+}
+
+func TestAppendRejectsOversizedRequestBody(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	body := `{"append_size":16,"padding":"` + strings.Repeat("a", 1<<20) + `"}`
+	appendReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/missing.bin?append", strings.NewReader(body))
+	appendReq.Header.Set("Content-Type", "application/json")
+
+	appendResp, err := http.DefaultClient.Do(appendReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	respBody, err := io.ReadAll(appendResp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = appendResp.Body.Close()
+
+	if appendResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("append oversized body: got %d, want 400", appendResp.StatusCode)
+	}
+	if !strings.Contains(string(respBody), "invalid request body") {
+		t.Fatalf("append oversized body response = %q, want invalid request body", respBody)
+	}
+}
+
 func TestNotFound(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
