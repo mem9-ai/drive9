@@ -63,6 +63,42 @@ func TestAuthorize_OAuthToken_Success(t *testing.T) {
 	}
 
 	client := NewGRPCAccountClient(mock)
+
+	// Kong path: X-Auth-Method=bear + X-Auth-Raw
+	r, _ := http.NewRequest("GET", "/", nil)
+	r.Header.Set("X-Auth-Method", "bear")
+	r.Header.Set("X-Auth-Raw", "Bearer valid-token")
+
+	orgID, err := client.Authorize(context.Background(), r, "cluster-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if orgID != 200 {
+		t.Fatalf("got orgID %d, want 200", orgID)
+	}
+}
+
+func TestAuthorize_OAuthToken_Fallback(t *testing.T) {
+	mock := &mockAccountClient{
+		getUserByTokenFn: func(_ context.Context, in *accountpb.GetUserByTokenRequest, _ ...grpc.CallOption) (*accountpb.GetUserByTokenResponse, error) {
+			if in.Token != "valid-token" {
+				t.Fatalf("unexpected token: %s", in.Token)
+			}
+			return &accountpb.GetUserByTokenResponse{
+				User: &accountpb.User{Id: 100, Status: accountpb.UserStatus_USER_STATUS_ACTIVE},
+			}, nil
+		},
+		listOrgsByUserFn: func(_ context.Context, in *accountpb.ListOrgsByUserRequest, _ ...grpc.CallOption) (*accountpb.ListOrgsByUserResponse, error) {
+			return &accountpb.ListOrgsByUserResponse{
+				Orgs: []*accountpb.Org{{Id: 200}},
+			}, nil
+		},
+		verifyUserOrgAndProjectsFn: func(_ context.Context, in *accountpb.VerifyUserOrgAndProjectsReq, _ ...grpc.CallOption) (*accountpb.VerifyUserOrgAndProjectsResp, error) {
+			return &accountpb.VerifyUserOrgAndProjectsResp{Result: true}, nil
+		},
+	}
+
+	client := NewGRPCAccountClient(mock)
 	r, _ := http.NewRequest("GET", "/", nil)
 	r.Header.Set("Authorization", "Bearer valid-token")
 
@@ -123,6 +159,50 @@ func TestAuthorize_NoCredentials(t *testing.T) {
 	}
 }
 
+func TestAuthorize_BearMethod_EmptyRaw(t *testing.T) {
+	client := NewGRPCAccountClient(&mockAccountClient{})
+	r, _ := http.NewRequest("GET", "/", nil)
+	r.Header.Set("X-Auth-Method", "bear")
+	// No X-Auth-Raw header
+
+	_, err := client.Authorize(context.Background(), r, "cluster-1")
+	if err == nil {
+		t.Fatal("expected error for empty X-Auth-Raw")
+	}
+	if !errors.Is(err, ErrAuthMissing) {
+		t.Fatalf("expected ErrAuthMissing, got: %v", err)
+	}
+}
+
+func TestAuthorize_BearMethod_EmptyToken(t *testing.T) {
+	client := NewGRPCAccountClient(&mockAccountClient{})
+	r, _ := http.NewRequest("GET", "/", nil)
+	r.Header.Set("X-Auth-Method", "bear")
+	r.Header.Set("X-Auth-Raw", "Bearer ")
+
+	_, err := client.Authorize(context.Background(), r, "cluster-1")
+	if err == nil {
+		t.Fatal("expected error for empty bearer token")
+	}
+	if !errors.Is(err, ErrAuthMissing) {
+		t.Fatalf("expected ErrAuthMissing, got: %v", err)
+	}
+}
+
+func TestAuthorize_Fallback_EmptyToken(t *testing.T) {
+	client := NewGRPCAccountClient(&mockAccountClient{})
+	r, _ := http.NewRequest("GET", "/", nil)
+	r.Header.Set("Authorization", "Bearer ")
+
+	_, err := client.Authorize(context.Background(), r, "cluster-1")
+	if err == nil {
+		t.Fatal("expected error for empty fallback bearer token")
+	}
+	if !errors.Is(err, ErrAuthMissing) {
+		t.Fatalf("expected ErrAuthMissing, got: %v", err)
+	}
+}
+
 func TestAuthorize_OAuthToken_InactiveUser(t *testing.T) {
 	mock := &mockAccountClient{
 		getUserByTokenFn: func(_ context.Context, _ *accountpb.GetUserByTokenRequest, _ ...grpc.CallOption) (*accountpb.GetUserByTokenResponse, error) {
@@ -134,7 +214,8 @@ func TestAuthorize_OAuthToken_InactiveUser(t *testing.T) {
 
 	client := NewGRPCAccountClient(mock)
 	r, _ := http.NewRequest("GET", "/", nil)
-	r.Header.Set("Authorization", "Bearer some-token")
+	r.Header.Set("X-Auth-Method", "bear")
+	r.Header.Set("X-Auth-Raw", "Bearer some-token")
 
 	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
@@ -159,7 +240,8 @@ func TestAuthorize_OAuthToken_NoOrgs(t *testing.T) {
 
 	client := NewGRPCAccountClient(mock)
 	r, _ := http.NewRequest("GET", "/", nil)
-	r.Header.Set("Authorization", "Bearer some-token")
+	r.Header.Set("X-Auth-Method", "bear")
+	r.Header.Set("X-Auth-Raw", "Bearer some-token")
 
 	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
@@ -189,7 +271,8 @@ func TestAuthorize_OAuthToken_VerifyFails(t *testing.T) {
 
 	client := NewGRPCAccountClient(mock)
 	r, _ := http.NewRequest("GET", "/", nil)
-	r.Header.Set("Authorization", "Bearer some-token")
+	r.Header.Set("X-Auth-Method", "bear")
+	r.Header.Set("X-Auth-Raw", "Bearer some-token")
 
 	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
