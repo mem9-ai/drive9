@@ -315,11 +315,16 @@ func (c *Client) DeleteCtx(ctx context.Context, path string) error {
 }
 
 // RemoveAll removes a file or directory tree recursively.
+// If path names a regular file, RemoveAll behaves like Delete.
+// If path does not exist, RemoveAll returns the same 404 *StatusError as Delete
+// instead of succeeding like os.RemoveAll.
 func (c *Client) RemoveAll(path string) error {
 	return c.RemoveAllCtx(context.Background(), path)
 }
 
 // RemoveAllCtx removes a file or directory tree recursively with context support.
+// It forwards to deleteCtx with recursive=true, so regular files use Delete
+// semantics and missing paths return the same 404 *StatusError as RemoveAll.
 func (c *Client) RemoveAllCtx(ctx context.Context, path string) error {
 	return c.deleteCtx(ctx, path, true)
 }

@@ -138,8 +138,20 @@ func TestRemoveAll(t *testing.T) {
 	if _, err := c.Stat("/data/"); err == nil {
 		t.Fatal("expected error after recursive delete")
 	}
+	if _, err := c.Read("/data/a.txt"); err == nil {
+		t.Fatal("expected sibling file read to fail after recursive delete")
+	}
 	if _, err := c.Read("/data/nested/b.txt"); err == nil {
 		t.Fatal("expected nested file read to fail after recursive delete")
+	}
+	entries, err := c.List("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name == "data" || entry.Name == "data/" {
+			t.Fatalf("expected removed directory to be absent from root listing, got entries %+v", entries)
+		}
 	}
 }
 

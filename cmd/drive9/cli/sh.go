@@ -113,20 +113,7 @@ func Sh(c *client.Client, _ []string) error {
 				fmt.Fprintln(os.Stderr, "usage: rm [-r|--recursive] <path>")
 				continue
 			}
-			resolvedArgs := make([]string, 0, len(args))
-			for _, arg := range args {
-				switch arg {
-				case "-r", "--recursive":
-					resolvedArgs = append(resolvedArgs, arg)
-				default:
-					if strings.HasPrefix(arg, "-") {
-						resolvedArgs = append(resolvedArgs, arg)
-						continue
-					}
-					resolvedArgs = append(resolvedArgs, resolve(cwd, arg))
-				}
-			}
-			if err := Rm(c, resolvedArgs); err != nil {
+			if err := Rm(c, resolveRmArgs(cwd, args)); err != nil {
 				fmt.Fprintf(os.Stderr, "rm: %v\n", err)
 			}
 
@@ -164,6 +151,30 @@ func resolve(cwd, path string) string {
 	return canon
 }
 
+func resolveRmArgs(cwd string, args []string) []string {
+	resolvedArgs := make([]string, 0, len(args))
+	parseFlags := true
+	for _, arg := range args {
+		if parseFlags {
+			switch arg {
+			case "-r", "--recursive":
+				resolvedArgs = append(resolvedArgs, arg)
+				continue
+			case "--":
+				parseFlags = false
+				resolvedArgs = append(resolvedArgs, arg)
+				continue
+			}
+			if strings.HasPrefix(arg, "-") {
+				resolvedArgs = append(resolvedArgs, arg)
+				continue
+			}
+		}
+		resolvedArgs = append(resolvedArgs, resolve(cwd, arg))
+	}
+	return resolvedArgs
+}
+
 func shHelp() {
 	fmt.Println(`commands:
   cd [path]       change directory
@@ -172,7 +183,7 @@ func shHelp() {
   cat <path>      read file
   cp <src> <dst>  copy files
   mv <old> <new>  rename/move
-  rm [-r] <path>  remove
+  rm [-r|--recursive] <path>  remove
   stat <path>     file metadata
   help            this help
   exit            quit shell`)

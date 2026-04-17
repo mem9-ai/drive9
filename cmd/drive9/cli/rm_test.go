@@ -89,6 +89,31 @@ func TestRm(t *testing.T) {
 			t.Fatal("Rm(recursive remote) did not send recursive query")
 		}
 	})
+
+	t.Run("double_dash_allows_dash_prefixed_path", func(t *testing.T) {
+		var gotPath string
+		var gotRecursive bool
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			gotRecursive = r.URL.Query().Has("recursive")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		}))
+		defer srv.Close()
+
+		c := client.New(srv.URL, "")
+		if err := Rm(c, []string{"--", "-dash.txt"}); err != nil {
+			t.Fatalf("Rm(double dash) error = %v", err)
+		}
+
+		if gotPath != "/v1/fs/-dash.txt" {
+			t.Fatalf("Rm(double dash) path = %q, want %q", gotPath, "/v1/fs/-dash.txt")
+		}
+		if gotRecursive {
+			t.Fatal("Rm(double dash) unexpectedly sent recursive query")
+		}
+	})
 }
 
 func TestRmInvalidArgs(t *testing.T) {
@@ -107,7 +132,7 @@ func TestRmInvalidArgs(t *testing.T) {
 		{
 			name:    "missing_path",
 			args:    nil,
-			wantErr: "usage: drive9 rm [-r|--recursive] <path>",
+			wantErr: "usage: drive9 fs rm [-r|--recursive] <path>",
 		},
 		{
 			name:    "unknown_flag",
@@ -117,7 +142,7 @@ func TestRmInvalidArgs(t *testing.T) {
 		{
 			name:    "extra_path",
 			args:    []string{"-r", "/dir/", "/extra"},
-			wantErr: "usage: drive9 rm [-r|--recursive] <path>",
+			wantErr: "usage: drive9 fs rm [-r|--recursive] <path>",
 		},
 	}
 

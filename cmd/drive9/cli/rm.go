@@ -13,27 +13,33 @@ import (
 //	drive9 fs rm --recursive :/path/to/dir/
 func Rm(c *client.Client, args []string) error {
 	var (
-		path      string
-		recursive bool
+		path       string
+		parseFlags = true
+		recursive  bool
 	)
 
 	for _, arg := range args {
-		switch arg {
-		case "-r", "--recursive":
-			recursive = true
-		default:
+		if parseFlags {
+			switch arg {
+			case "-r", "--recursive":
+				recursive = true
+				continue
+			case "--":
+				parseFlags = false
+				continue
+			}
 			if len(arg) > 0 && arg[0] == '-' {
 				return fmt.Errorf("unknown flag %q", arg)
 			}
-			if path != "" {
-				return fmt.Errorf("usage: drive9 rm [-r|--recursive] <path>")
-			}
-			path = arg
 		}
+		if path != "" {
+			return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] <path>")
+		}
+		path = arg
 	}
 
 	if path == "" {
-		return fmt.Errorf("usage: drive9 rm [-r|--recursive] <path>")
+		return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] <path>")
 	}
 
 	// Handle ":" prefixed remote paths like cp command
