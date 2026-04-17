@@ -1,4 +1,4 @@
-FROM public.ecr.aws/docker/library/alpine:3.19
+FROM gcr.io/pingcap-public/pingcap/alpine:3.15.5
 RUN apk add --no-cache ca-certificates
 
 COPY ./bin/drive9-server /drive9-server
