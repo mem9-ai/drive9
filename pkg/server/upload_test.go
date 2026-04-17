@@ -78,6 +78,52 @@ func partChecksumHeader(data []byte) string {
 	return strings.Join(out, ",")
 }
 
+func mustUploadLargeServerFile(t *testing.T, ts *httptest.Server, s *Server, s3c *s3client.LocalS3Client, path string, body []byte) {
+	t.Helper()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs"+path, bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("initiate upload: got %d, want 202: %s", resp.StatusCode, respBody)
+	}
+
+	var plan backend.UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatalf("decode upload plan: %v", err)
+	}
+
+	upload, err := s.fallback.GetUpload(context.Background(), plan.UploadID)
+	if err != nil {
+		t.Fatalf("GetUpload(%q): %v", plan.UploadID, err)
+	}
+
+	for _, p := range plan.Parts {
+		start := int64(p.Number-1) * plan.PartSize
+		end := start + p.Size
+		if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, p.Number, bytes.NewReader(body[start:end])); err != nil {
+			t.Fatalf("upload part %d: %v", p.Number, err)
+		}
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/"+plan.UploadID+"/complete", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("complete upload: got %d, want 200: %s", resp.StatusCode, respBody)
+	}
+}
+
 func TestLargeFilePut202(t *testing.T) {
 	s, _ := newTestServerWithS3(t)
 	ts := httptest.NewServer(s)
@@ -625,6 +671,69 @@ func TestV1PatchUsesFixedPartSizeBoundary(t *testing.T) {
 	}
 	if len(plan.CopiedParts) != 2 || plan.CopiedParts[0] != 1 || plan.CopiedParts[1] != 3 {
 		t.Fatalf("copied parts = %v, want [1 3]", plan.CopiedParts)
+	}
+}
+
+func TestAppendEndpointUsesTailDirtyPartOnly(t *testing.T) {
+	s, s3c := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	origSize := int64(2*s3client.PartSize + s3client.PartSize/2)
+	body := make([]byte, origSize)
+	mustUploadLargeServerFile(t, ts, s, s3c, "/append-tail.bin", body)
+
+	appendReq := map[string]any{
+		"append_size": s3client.PartSize + s3client.PartSize/4,
+		"part_size":   s3client.PartSize,
+	}
+	reqBody, _ := json.Marshal(appendReq)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/append-tail.bin?append", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("append initiate: got %d, want 202: %s", resp.StatusCode, respBody)
+	}
+
+	var plan backend.AppendPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatalf("decode append plan: %v", err)
+	}
+	if plan.BaseSize != origSize {
+		t.Fatalf("base size = %d, want %d", plan.BaseSize, origSize)
+	}
+	if plan.PartSize != s3client.PartSize {
+		t.Fatalf("part size = %d, want %d", plan.PartSize, s3client.PartSize)
+	}
+	if len(plan.UploadParts) != 2 {
+		t.Fatalf("upload parts = %d, want 2", len(plan.UploadParts))
+	}
+	if plan.UploadParts[0].Number != 3 || plan.UploadParts[1].Number != 4 {
+		t.Fatalf("upload part numbers = [%d %d], want [3 4]", plan.UploadParts[0].Number, plan.UploadParts[1].Number)
+	}
+	if plan.UploadParts[0].Size != s3client.PartSize {
+		t.Fatalf("part 3 size = %d, want %d", plan.UploadParts[0].Size, s3client.PartSize)
+	}
+	if plan.UploadParts[1].Size != 3*s3client.PartSize/4 {
+		t.Fatalf("part 4 size = %d, want %d", plan.UploadParts[1].Size, 3*s3client.PartSize/4)
+	}
+	if plan.UploadParts[0].ReadURL == "" {
+		t.Fatal("expected read_url for tail part")
+	}
+	wantRange := fmt.Sprintf("bytes=%d-%d", 2*s3client.PartSize, origSize-1)
+	if got := plan.UploadParts[0].ReadHeaders["Range"]; got != wantRange {
+		t.Fatalf("tail part range = %q, want %q", got, wantRange)
+	}
+	if plan.UploadParts[1].ReadURL != "" {
+		t.Fatal("new append-only part should not have read_url")
+	}
+	if len(plan.CopiedParts) != 2 || plan.CopiedParts[0] != 1 || plan.CopiedParts[1] != 2 {
+		t.Fatalf("copied parts = %v, want [1 2]", plan.CopiedParts)
 	}
 }
 

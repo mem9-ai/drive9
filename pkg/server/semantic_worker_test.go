@@ -732,13 +732,7 @@ func TestSemanticWorkerAcksObsoleteRevisionAndWritesLatest(t *testing.T) {
 }
 
 func TestSemanticWorkerRetriesThenDeadLetters(t *testing.T) {
-	_, b := newTestServerWithSemanticWorker(t, staticSemanticEmbedder{err: errors.New("embed failed")}, SemanticWorkerOptions{
-		Workers:         1,
-		PollInterval:    10 * time.Millisecond,
-		RecoverInterval: 30 * time.Millisecond,
-		LeaseDuration:   100 * time.Millisecond,
-		RetryBaseDelay:  20 * time.Millisecond,
-	})
+	b := newTestBackendForSemanticWorker(t)
 	if _, err := b.Write("/docs/c.txt", []byte("will dead letter"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}
@@ -749,6 +743,14 @@ func TestSemanticWorkerRetriesThenDeadLetters(t *testing.T) {
 	if _, err := b.Store().DB().Exec(`UPDATE semantic_tasks SET max_attempts = 2 WHERE resource_id = ? AND resource_version = 1`, nf.File.FileID); err != nil {
 		t.Fatal(err)
 	}
+	s := NewWithConfig(Config{Backend: b, SemanticEmbedder: staticSemanticEmbedder{err: errors.New("embed failed")}, SemanticWorkers: SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 30 * time.Millisecond,
+		LeaseDuration:   100 * time.Millisecond,
+		RetryBaseDelay:  20 * time.Millisecond,
+	}})
+	t.Cleanup(func() { s.Close() })
 	waitForTaskStatus(t, b, nf.File.FileID, 1, string(semantic.TaskDeadLettered), 3*time.Second)
 	if got := mustServerFile(t, b, "/docs/c.txt").EmbeddingRevision; got != nil {
 		t.Fatalf("embedding revision=%d, want nil", *got)
@@ -1359,13 +1361,7 @@ func TestSemanticWorkerDeadLetterLogIncludesTaskFields(t *testing.T) {
 	logger.Set(zap.New(core))
 	t.Cleanup(func() { logger.Set(restoreLogger) })
 
-	_, b := newTestServerWithSemanticWorker(t, staticSemanticEmbedder{err: errors.New("embed failed")}, SemanticWorkerOptions{
-		Workers:         1,
-		PollInterval:    10 * time.Millisecond,
-		RecoverInterval: 30 * time.Millisecond,
-		LeaseDuration:   100 * time.Millisecond,
-		RetryBaseDelay:  20 * time.Millisecond,
-	})
+	b := newTestBackendForSemanticWorker(t)
 	if _, err := b.Write("/docs/dead.txt", []byte("dead letter logs"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}
@@ -1373,6 +1369,14 @@ func TestSemanticWorkerDeadLetterLogIncludesTaskFields(t *testing.T) {
 	if _, err := b.Store().DB().Exec(`UPDATE semantic_tasks SET max_attempts = 1 WHERE resource_id = ? AND resource_version = 1`, nf.FileID); err != nil {
 		t.Fatal(err)
 	}
+	s := NewWithConfig(Config{Backend: b, SemanticEmbedder: staticSemanticEmbedder{err: errors.New("embed failed")}, SemanticWorkers: SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 30 * time.Millisecond,
+		LeaseDuration:   100 * time.Millisecond,
+		RetryBaseDelay:  20 * time.Millisecond,
+	}})
+	t.Cleanup(func() { s.Close() })
 	waitForTaskStatus(t, b, nf.FileID, 1, string(semantic.TaskDeadLettered), 3*time.Second)
 
 	entry := waitForObservedLog(t, recorded, "semantic_worker_dead_lettered", 3*time.Second)
