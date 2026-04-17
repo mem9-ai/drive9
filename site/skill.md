@@ -76,6 +76,7 @@ drive9 fs stat :/path/to/file              # metadata (size, type, mtime)
 # move / remove
 drive9 fs mv :/old.txt :/new.txt
 drive9 fs rm :/path/to/file
+drive9 fs rm -r :/path/to/dir/
 
 # interactive shell
 drive9 fs sh

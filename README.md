@@ -26,12 +26,14 @@ Inspired by Plan 9's "everything is a file" and the idea that naming things is t
 
 ```bash
 # CLI
-drive9 cp ./data.tar :/data/data.tar
+drive9 fs cp ./data.tar :/data/data.tar
 drive9 fs cp --append ./tail.log :/logs/app.log
-drive9 cat :/config/app.json
-drive9 ls :/data/
-drive9 cp :/a.bin :/b.bin        # zero-copy
-drive9 mv :/old.bin :/new.bin    # metadata-only
+drive9 fs cat :/config/app.json
+drive9 fs ls :/data/
+drive9 fs cp :/a.bin :/b.bin        # zero-copy
+drive9 fs mv :/old.bin :/new.bin    # metadata-only
+drive9 fs rm :/old.bin              # remove file
+drive9 fs rm -r :/old-dir/          # recursive delete
 
 # Mount
 drive9 mount /mnt/drive9
