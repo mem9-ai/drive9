@@ -49,8 +49,11 @@ func Cp(c *client.Client, args []string) error {
 
 	srcRP, srcIsRemote := ParseRemote(src)
 	dstRP, dstIsRemote := ParseRemote(dst)
+	if appendMode && src == "-" {
+		return fmt.Errorf("--append does not support stdin source; use a local file")
+	}
 	if appendMode && (srcIsRemote || !dstIsRemote) {
-		return fmt.Errorf("--append only supports local file or stdin source to remote destination")
+		return fmt.Errorf("--append only supports local file source to remote destination")
 	}
 
 	ctx := context.Background()

@@ -461,3 +461,57 @@ func TestAppendStreamUsesAppendPlanForLargeFile(t *testing.T) {
 		t.Fatal("complete endpoint was not called")
 	}
 }
+
+func TestAppendStreamRejectsOverlappingAppendPartWithoutReadURL(t *testing.T) {
+	var uploadCalled bool
+	var completeCalled bool
+	var srv *httptest.Server
+
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/large.bin":
+			w.Header().Set("Content-Length", "10")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "9")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/large.bin" && r.URL.Query().Has("append"):
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(AppendPlan{
+				BaseSize: 10,
+				PatchPlan: PatchPlan{
+					UploadID: "append-123",
+					PartSize: 8,
+					UploadParts: []*PatchPartURL{{
+						Number:    2,
+						URL:       srv.URL + "/upload/2",
+						Size:      8,
+						Headers:   map[string]string{"X-Upload-Token": "append"},
+						ExpiresAt: "2099-01-01T00:00:00Z",
+					}},
+					CopiedParts: []int{1},
+				},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/upload/2":
+			uploadCalled = true
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/append-123/complete":
+			completeCalled = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	err := c.AppendStream(context.Background(), "/large.bin", strings.NewReader("KLMNOP"), 6, nil)
+	if err == nil || !strings.Contains(err.Error(), "missing read_url") {
+		t.Fatalf("AppendStream error = %v, want missing read_url", err)
+	}
+	if uploadCalled {
+		t.Fatal("upload endpoint should not be called")
+	}
+	if completeCalled {
+		t.Fatal("complete endpoint should not be called")
+	}
+}

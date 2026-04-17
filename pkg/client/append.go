@@ -55,6 +55,11 @@ func (c *Client) AppendStream(ctx context.Context, path string, r io.Reader, siz
 		}
 		return err
 	}
+	for _, part := range plan.UploadParts {
+		if appendPartOverlapsExisting(plan.BaseSize, plan.PartSize, part) && part.ReadURL == "" {
+			return fmt.Errorf("append part %d overlaps existing data but is missing read_url", part.Number)
+		}
+	}
 
 	remaining := size
 	totalParts := len(plan.UploadParts) + len(plan.CopiedParts)
@@ -158,6 +163,14 @@ func (c *Client) appendByRewrite(ctx context.Context, path string, r io.Reader, 
 	}
 
 	return c.WriteStreamConditional(ctx, path, tmp, finalSize, progress, expectedRevision)
+}
+
+func appendPartOverlapsExisting(baseSize int64, partSize int64, part *PatchPartURL) bool {
+	if baseSize <= 0 || partSize <= 0 || part == nil || part.Number <= 0 {
+		return false
+	}
+	partStart := int64(part.Number-1) * partSize
+	return partStart < baseSize
 }
 
 func isClientNotFound(err error) bool {

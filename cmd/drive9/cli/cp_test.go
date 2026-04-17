@@ -351,7 +351,7 @@ func TestCpAppendRejectsRemoteToLocal(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for remote -> local append")
 	}
-	if !strings.Contains(err.Error(), "--append only supports local file or stdin source to remote destination") {
+	if !strings.Contains(err.Error(), "--append only supports local file source to remote destination") {
 		t.Fatalf("error = %q, want append usage rejection", err)
 	}
 }
@@ -367,7 +367,23 @@ func TestCpAppendRejectsRemoteToRemote(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for remote -> remote append")
 	}
-	if !strings.Contains(err.Error(), "--append only supports local file or stdin source to remote destination") {
+	if !strings.Contains(err.Error(), "--append only supports local file source to remote destination") {
 		t.Fatalf("error = %q, want append usage rejection", err)
+	}
+}
+
+func TestCpAppendRejectsStdinSource(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("server should not be called, got %s %s", r.Method, r.URL.String())
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	err := Cp(c, []string{"--append", "-", ":/dst.txt"})
+	if err == nil {
+		t.Fatal("expected error for stdin append")
+	}
+	if !strings.Contains(err.Error(), "--append does not support stdin source") {
+		t.Fatalf("error = %q, want stdin append rejection", err)
 	}
 }
