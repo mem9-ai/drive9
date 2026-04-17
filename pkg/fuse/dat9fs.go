@@ -681,6 +681,22 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				if err := fs.client.WriteCtx(ctx, entry.Path, nil); err != nil {
 					return httpToFuseStatus(err)
 				}
+				// Refresh the inode revision after the server-side truncate so a
+				// subsequent writable open does not reuse the stale pre-truncate
+				// base revision and conflict with its own zero-byte write.
+				stat, statErr := fs.client.StatCtx(ctx, entry.Path)
+				if statErr != nil {
+					log.Printf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, input.NodeId, statErr)
+				} else if stat != nil {
+					if stat.Revision > 0 {
+						entry.Revision = stat.Revision
+						fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
+					}
+					if !stat.Mtime.IsZero() {
+						entry.Mtime = stat.Mtime
+						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+					}
+				}
 				fs.readCache.Invalidate(entry.Path)
 				fs.dirCache.Invalidate(parentDir(entry.Path))
 			} else if newSize != entry.Size {

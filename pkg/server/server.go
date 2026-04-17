@@ -820,7 +820,7 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
-	nf, err := b.Store().Stat(r.Context(), path)
+	nf, err := b.StatNodeCtx(r.Context(), path)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "stat_not_found", "path", path)...)
