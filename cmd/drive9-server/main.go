@@ -25,6 +25,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/server"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/db9"
@@ -90,6 +91,9 @@ func main() {
 	}
 
 	s3cfg := s3ConfigFromEnv()
+	if err := s3cfg.validate(); err != nil {
+		die(err)
+	}
 	backendOptions, err := buildBackendOptionsFromEnv()
 	if err != nil {
 		die(err)
@@ -275,6 +279,27 @@ func s3ConfigFromEnv() s3Config {
 		AccessKeyID:     strings.TrimSpace(os.Getenv("DRIVE9_S3_ACCESS_KEY_ID")),
 		SecretAccessKey: strings.TrimSpace(os.Getenv("DRIVE9_S3_SECRET_ACCESS_KEY")),
 		SessionToken:    strings.TrimSpace(os.Getenv("DRIVE9_S3_SESSION_TOKEN")),
+	}
+}
+
+func (cfg s3Config) validate() error {
+	if cfg.Bucket == "" {
+		return nil
+	}
+	return cfg.awsConfig().Validate()
+}
+
+func (cfg s3Config) awsConfig() s3client.AWSConfig {
+	return s3client.AWSConfig{
+		Region:          cfg.Region,
+		Bucket:          cfg.Bucket,
+		Prefix:          cfg.Prefix,
+		RoleARN:         cfg.RoleARN,
+		Endpoint:        cfg.Endpoint,
+		ForcePathStyle:  cfg.ForcePathStyle,
+		AccessKeyID:     cfg.AccessKeyID,
+		SecretAccessKey: cfg.SecretAccessKey,
+		SessionToken:    cfg.SessionToken,
 	}
 }
 

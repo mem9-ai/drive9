@@ -52,6 +52,12 @@ func (cfg AWSConfig) validate() error {
 	return nil
 }
 
+// Validate checks whether the S3 config has a legal combination of required
+// fields before any SDK clients are constructed.
+func (cfg AWSConfig) Validate() error {
+	return cfg.validate()
+}
+
 func staticCredentialsProvider(cfg AWSConfig) (aws.CredentialsProvider, bool, error) {
 	hasAccessKey := cfg.AccessKeyID != ""
 	hasSecretKey := cfg.SecretAccessKey != ""
@@ -77,7 +83,7 @@ func applyS3Options(cfg AWSConfig) func(*s3.Options) {
 }
 
 func NewAWS(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
-	if err := cfg.validate(); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 

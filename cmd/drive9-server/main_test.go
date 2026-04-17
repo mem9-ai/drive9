@@ -172,6 +172,70 @@ func TestS3ConfigFromEnv(t *testing.T) {
 	}
 }
 
+func TestS3ConfigValidateRejectsInvalidStaticCredentialCombinations(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     s3Config
+		wantErr bool
+	}{
+		{
+			name: "local mode ignores static credential fields",
+			cfg: s3Config{
+				Dir:         defaultS3Dir,
+				AccessKeyID: "ak",
+			},
+			wantErr: false,
+		},
+		{
+			name: "access key without secret",
+			cfg: s3Config{
+				Bucket:      "bucket",
+				Region:      "us-east-1",
+				AccessKeyID: "ak",
+			},
+			wantErr: true,
+		},
+		{
+			name: "secret without access key",
+			cfg: s3Config{
+				Bucket:          "bucket",
+				Region:          "us-east-1",
+				SecretAccessKey: "sk",
+			},
+			wantErr: true,
+		},
+		{
+			name: "session token without static credentials",
+			cfg: s3Config{
+				Bucket:       "bucket",
+				Region:       "us-east-1",
+				SessionToken: "token",
+			},
+			wantErr: true,
+		},
+		{
+			name: "valid static credentials",
+			cfg: s3Config{
+				Bucket:          "bucket",
+				Region:          "us-east-1",
+				AccessKeyID:     "ak",
+				SecretAccessKey: "sk",
+				SessionToken:    "token",
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func snapshotEnv(t *testing.T, keys []string) map[string]string {
 	t.Helper()
 	out := make(map[string]string, len(keys))
