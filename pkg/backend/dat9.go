@@ -584,26 +584,15 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 
 func (b *Dat9Backend) StatNodeCtx(ctx context.Context, path string) (*datastore.NodeWithFile, error) {
 	resolvedPath := normalizePath(path)
-	nf, err := b.store.Stat(ctx, resolvedPath)
-	if err == nil {
-		return nf, nil
-	}
-	if !errors.Is(err, datastore.ErrNotFound) || pathutil.IsDir(path) {
-		return nil, err
+	if pathutil.IsDir(path) {
+		return b.store.Stat(ctx, resolvedPath)
 	}
 
 	dirPath, dirErr := pathutil.CanonicalizeDir(path)
 	if dirErr != nil || dirPath == resolvedPath {
-		return nil, err
+		return b.store.Stat(ctx, resolvedPath)
 	}
-	dirStat, dirStatErr := b.store.Stat(ctx, dirPath)
-	if dirStatErr != nil {
-		if errors.Is(dirStatErr, datastore.ErrNotFound) {
-			return nil, err
-		}
-		return nil, dirStatErr
-	}
-	return dirStat, nil
+	return b.store.StatPathFallback(ctx, resolvedPath, dirPath)
 }
 
 func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
