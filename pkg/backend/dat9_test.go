@@ -295,6 +295,49 @@ func TestRemoveAll(t *testing.T) {
 	}
 }
 
+func TestStatDirWithoutTrailingSlash(t *testing.T) {
+	b := newTestBackend(t)
+	if err := b.Mkdir("/data", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	info, err := b.Stat("/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir {
+		t.Fatal("expected /data to resolve as a directory without trailing slash")
+	}
+}
+
+func TestRemoveDirWithoutTrailingSlash(t *testing.T) {
+	b := newTestBackend(t)
+	if err := b.Mkdir("/data", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Remove("/data"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Stat("/data/"); err != datastore.ErrNotFound {
+		t.Errorf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestRemoveAllDirWithoutTrailingSlash(t *testing.T) {
+	b := newTestBackend(t)
+	if err := b.Mkdir("/data", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/data/a.txt", []byte("a"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.RemoveAll("/data"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Stat("/data/"); err != datastore.ErrNotFound {
+		t.Errorf("expected ErrNotFound, got %v", err)
+	}
+}
+
 func TestRename(t *testing.T) {
 	b := newTestBackend(t)
 	if _, err := b.Write("/old.txt", []byte("data"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -407,6 +450,29 @@ func TestRenameDirUpdatesName(t *testing.T) {
 	}
 	if info.Name != "beta" {
 		t.Errorf("expected name 'beta', got %q", info.Name)
+	}
+}
+
+func TestRenameDirWithoutTrailingSlash(t *testing.T) {
+	b := newTestBackend(t)
+	if err := b.Mkdir("/alpha", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/alpha/file.txt", []byte("data"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Rename("/alpha", "/beta"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Stat("/alpha/"); err != datastore.ErrNotFound {
+		t.Errorf("expected old path to be gone, got %v", err)
+	}
+	data, err := b.Read("/beta/file.txt", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "data" {
+		t.Errorf("got %q", data)
 	}
 }
 

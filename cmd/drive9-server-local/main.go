@@ -36,12 +36,17 @@ const (
 )
 
 type localS3Config struct {
-	Mode    string
-	Dir     string
-	Bucket  string
-	Region  string
-	Prefix  string
-	RoleARN string
+	Mode            string
+	Dir             string
+	Bucket          string
+	Region          string
+	Prefix          string
+	RoleARN         string
+	Endpoint        string
+	ForcePathStyle  bool
+	AccessKeyID     string
+	SecretAccessKey string
+	SessionToken    string
 }
 
 func main() {
@@ -100,7 +105,14 @@ func main() {
 		if !explicitEmbeddingMode {
 			initMode = schema.TiDBEmbeddingModeAuto
 		}
-		if err := localTiDBSchemaInitializer(localDSN, initMode); err != nil {
+		initOpts := schema.InitTiDBTenantSchemaOptions{}
+		if initMode == schema.TiDBEmbeddingModeApp {
+			// drive9-server-local can bootstrap app-managed schema on TiDB builds
+			// that lack optional FTS/vector index features; shared schema init paths
+			// remain strict.
+			initOpts.AllowUnsupportedOptionalIndexes = true
+		}
+		if err := localTiDBSchemaInitializer(startupCtx, localDSN, initMode, initOpts); err != nil {
 			die(fmt.Errorf("init local tenant schema: %w", err))
 		}
 		logLocalStartupStep(startupCtx, startupStart, stepStart, "init_local_tenant_schema",
@@ -162,10 +174,15 @@ func main() {
 	switch s3cfg.Mode {
 	case "aws":
 		s3c, err = s3client.NewAWS(startupCtx, s3client.AWSConfig{
-			Region:  s3cfg.Region,
-			Bucket:  s3cfg.Bucket,
-			Prefix:  s3cfg.Prefix,
-			RoleARN: s3cfg.RoleARN,
+			Region:          s3cfg.Region,
+			Bucket:          s3cfg.Bucket,
+			Prefix:          s3cfg.Prefix,
+			RoleARN:         s3cfg.RoleARN,
+			Endpoint:        s3cfg.Endpoint,
+			ForcePathStyle:  s3cfg.ForcePathStyle,
+			AccessKeyID:     s3cfg.AccessKeyID,
+			SecretAccessKey: s3cfg.SecretAccessKey,
+			SessionToken:    s3cfg.SessionToken,
 		})
 		if err != nil {
 			die(fmt.Errorf("create aws s3 client: %w", err))
@@ -174,7 +191,10 @@ func main() {
 			zap.String("bucket", s3cfg.Bucket),
 			zap.String("region", s3cfg.Region),
 			zap.String("prefix", s3cfg.Prefix),
-			zap.String("role", localS3RoleLogValue(s3cfg.RoleARN)))
+			zap.String("endpoint", s3cfg.Endpoint),
+			zap.Bool("path_style", s3cfg.ForcePathStyle),
+			zap.String("credentials", s3client.CredentialLogValue(s3cfg.AccessKeyID)),
+			zap.String("role", s3client.RoleLogValue(s3cfg.RoleARN)))
 	case "local":
 		// Even in local single-tenant mode we keep the same S3-facing upload code path
 		// by backing it with the local mock implementation.
@@ -236,7 +256,10 @@ func main() {
 		zap.String("s3_bucket", s3cfg.Bucket),
 		zap.String("s3_region", s3cfg.Region),
 		zap.String("s3_prefix", s3cfg.Prefix),
-		zap.String("s3_role", localS3RoleLogValue(s3cfg.RoleARN)),
+		zap.String("s3_endpoint", s3cfg.Endpoint),
+		zap.Bool("s3_path_style", s3cfg.ForcePathStyle),
+		zap.String("s3_credentials", s3client.CredentialLogValue(s3cfg.AccessKeyID)),
+		zap.String("s3_role", s3client.RoleLogValue(s3cfg.RoleARN)),
 		zap.Bool("local_init_schema", localInitSchema),
 		zap.String("requested_embedding_mode", localEmbeddingModeLabel(requestedEmbeddingMode, explicitEmbeddingMode)),
 		zap.String("embedding_mode", string(localEmbeddingMode)),
@@ -280,6 +303,11 @@ environment:
   DRIVE9_S3_BUCKET   S3 bucket name (enables AWS S3 mode; mutually exclusive with DRIVE9_S3_DIR)
   DRIVE9_S3_REGION   AWS region (default: us-east-1)
   DRIVE9_S3_PREFIX   S3 key prefix (optional)
+  DRIVE9_S3_ENDPOINT custom S3 endpoint URL for S3-compatible stores such as MinIO (optional)
+  DRIVE9_S3_FORCE_PATH_STYLE true|false to force path-style S3 URLs (default: false)
+  DRIVE9_S3_ACCESS_KEY_ID static S3 access key id (optional; requires DRIVE9_S3_SECRET_ACCESS_KEY)
+  DRIVE9_S3_SECRET_ACCESS_KEY static S3 secret access key (optional; requires DRIVE9_S3_ACCESS_KEY_ID)
+  DRIVE9_S3_SESSION_TOKEN static S3 session token (optional; requires DRIVE9_S3_ACCESS_KEY_ID and DRIVE9_S3_SECRET_ACCESS_KEY)
   DRIVE9_S3_ROLE_ARN IAM role ARN to assume via STS (optional)
   DRIVE9_S3_DIR      local S3 mock root directory (default: /tmp/drive9-local-s3, only used without DRIVE9_S3_BUCKET)
 
@@ -381,11 +409,16 @@ func localS3ConfigFromEnv() (localS3Config, error) {
 			return localS3Config{}, fmt.Errorf("DRIVE9_S3_BUCKET and DRIVE9_S3_DIR are mutually exclusive; unset DRIVE9_S3_DIR when using AWS S3 mode")
 		}
 		return localS3Config{
-			Mode:    "aws",
-			Bucket:  bucket,
-			Region:  envOr("DRIVE9_S3_REGION", defaultS3Region),
-			Prefix:  strings.TrimSpace(os.Getenv("DRIVE9_S3_PREFIX")),
-			RoleARN: strings.TrimSpace(os.Getenv("DRIVE9_S3_ROLE_ARN")),
+			Mode:            "aws",
+			Bucket:          bucket,
+			Region:          envOr("DRIVE9_S3_REGION", defaultS3Region),
+			Prefix:          strings.TrimSpace(os.Getenv("DRIVE9_S3_PREFIX")),
+			RoleARN:         strings.TrimSpace(os.Getenv("DRIVE9_S3_ROLE_ARN")),
+			Endpoint:        strings.TrimSpace(os.Getenv("DRIVE9_S3_ENDPOINT")),
+			ForcePathStyle:  envBool("DRIVE9_S3_FORCE_PATH_STYLE", false),
+			AccessKeyID:     strings.TrimSpace(os.Getenv("DRIVE9_S3_ACCESS_KEY_ID")),
+			SecretAccessKey: strings.TrimSpace(os.Getenv("DRIVE9_S3_SECRET_ACCESS_KEY")),
+			SessionToken:    strings.TrimSpace(os.Getenv("DRIVE9_S3_SESSION_TOKEN")),
 		}, nil
 	}
 	if dirSet == "" {
@@ -404,17 +437,10 @@ func (c localS3Config) localDir() string {
 	return c.Dir
 }
 
-func localS3RoleLogValue(roleARN string) string {
-	if roleARN == "" {
-		return "default-credentials"
-	}
-	return roleARN
-}
-
 var (
 	localTiDBEmbeddingModeDetector = schema.DetectTiDBEmbeddingMode
 	localTiDBSchemaValidator       = schema.EnsureTiDBSchemaForMode
-	localTiDBSchemaInitializer     = schema.InitTiDBTenantSchemaForMode
+	localTiDBSchemaInitializer     = schema.InitTiDBTenantSchemaForModeWithOptionsContext
 )
 
 func detectLocalTiDBEmbeddingMode(db *sql.DB, schemaInitialized bool, requestedMode schema.TiDBEmbeddingMode, explicitMode bool) (schema.TiDBEmbeddingMode, error) {

@@ -26,6 +26,13 @@ type PatchPlan struct {
 	CopiedParts []int              `json:"copied_parts"` // part numbers copied server-side
 }
 
+// AppendPlan is returned by InitiateAppendUpload. It is a specialized patch
+// plan for appending bytes to an existing large S3-backed file.
+type AppendPlan struct {
+	BaseSize int64 `json:"base_size"`
+	PatchPlan
+}
+
 // PatchUploadPart describes one dirty part that the client needs to upload.
 type PatchUploadPart struct {
 	Number      int               `json:"number"`
@@ -49,6 +56,91 @@ func (b *Dat9Backend) InitiatePatchUpload(ctx context.Context, path string, newS
 	return b.InitiatePatchUploadIfRevision(ctx, path, newSize, dirtyParts, clientPartSize, -1)
 }
 
+// InitiateAppendUpload starts an incremental append upload for an existing
+// large S3-backed file.
+func (b *Dat9Backend) InitiateAppendUpload(ctx context.Context, path string, appendSize int64, clientPartSize int64) (*AppendPlan, error) {
+	return b.InitiateAppendUploadIfRevision(ctx, path, appendSize, clientPartSize, -1)
+}
+
+// InitiateAppendUploadIfRevision starts an incremental append upload with
+// optional CAS semantics.
+func (b *Dat9Backend) InitiateAppendUploadIfRevision(ctx context.Context, path string, appendSize int64, clientPartSize int64, expectedRevision int64) (*AppendPlan, error) {
+	if appendSize <= 0 {
+		return nil, fmt.Errorf("append_size must be positive")
+	}
+
+	path, err := pathutil.Canonicalize(path)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize append path %q: %w", path, err)
+	}
+	if b.s3 == nil {
+		return nil, ErrS3NotConfigured
+	}
+
+	nf, err := b.store.Stat(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("stat append target %q: %w", path, err)
+	}
+	if nf.File == nil || nf.File.StorageType != datastore.StorageS3 {
+		return nil, fmt.Errorf("%w: %s", ErrNotS3Stored, path)
+	}
+	if expectedRevision == 0 {
+		return nil, datastore.ErrRevisionConflict
+	}
+	if expectedRevision > 0 && nf.File.Revision != expectedRevision {
+		return nil, datastore.ErrRevisionConflict
+	}
+
+	baseSize := nf.File.SizeBytes
+	newSize := baseSize + appendSize
+	if newSize < baseSize {
+		return nil, fmt.Errorf("append_size overflows file size")
+	}
+
+	partSize := clientPartSize
+	if partSize < s3client.MinPartSize {
+		partSize = s3client.CalcAdaptivePartSize(baseSize)
+	}
+	if len(s3client.CalcParts(newSize, partSize)) > MaxMultipartParts {
+		partSize = s3client.CalcAdaptivePartSize(newSize)
+	}
+
+	dirtyParts := appendDirtyPartNumbers(baseSize, newSize, partSize)
+	plan, err := b.InitiatePatchUploadIfRevision(ctx, path, newSize, dirtyParts, partSize, expectedRevision)
+	if err != nil {
+		return nil, fmt.Errorf("initiate append patch upload for %q: %w", path, err)
+	}
+	return &AppendPlan{
+		BaseSize:  baseSize,
+		PatchPlan: *plan,
+	}, nil
+}
+
+func appendDirtyPartNumbers(baseSize int64, newSize int64, partSize int64) []int {
+	if newSize <= baseSize || partSize <= 0 {
+		return nil
+	}
+
+	newParts := s3client.CalcParts(newSize, partSize)
+	basePartCount := 0
+	if baseSize > 0 {
+		basePartCount = len(s3client.CalcParts(baseSize, partSize))
+	}
+
+	dirty := make([]int, 0, len(newParts)-basePartCount+1)
+	if baseSize > 0 && baseSize%partSize != 0 {
+		dirty = append(dirty, basePartCount)
+	}
+	start := basePartCount + 1
+	for pn := start; pn <= len(newParts); pn++ {
+		dirty = append(dirty, pn)
+	}
+	if len(dirty) == 0 && len(newParts) > 0 {
+		dirty = append(dirty, len(newParts))
+	}
+	return dirty
+}
+
 // InitiatePatchUploadIfRevision starts a patch upload with optional CAS semantics.
 func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path string, newSize int64, dirtyParts []int, clientPartSize int64, expectedRevision int64) (*PatchPlan, error) {
 	start := time.Now()
@@ -64,7 +156,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	}
 	if b.s3 == nil {
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
-		return nil, fmt.Errorf("S3 not configured")
+		return nil, ErrS3NotConfigured
 	}
 
 	// Look up existing file to get its S3 key
@@ -75,7 +167,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	}
 	if nf.File == nil || nf.File.StorageType != datastore.StorageS3 {
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
-		return nil, fmt.Errorf("file is not S3-stored: %s", path)
+		return nil, fmt.Errorf("%w: %s", ErrNotS3Stored, path)
 	}
 	if expectedRevision == 0 {
 		metrics.RecordOperation("backend", "patch_upload", "conflict", time.Since(start))

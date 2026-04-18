@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -334,7 +335,8 @@ func TestFlushLargeOverwritePatchCarriesExpectedRevision(t *testing.T) {
 		partSize = 5 << 20
 	)
 
-	var gotExpected int64 = -1
+	var gotExpected atomic.Int64
+	gotExpected.Store(-1)
 	var uploadedBytes int
 	var completeCalled bool
 
@@ -355,7 +357,7 @@ func TestFlushLargeOverwritePatchCarriesExpectedRevision(t *testing.T) {
 				http.Error(w, "missing expected_revision", http.StatusBadRequest)
 				return
 			}
-			gotExpected = *req.ExpectedRevision
+			gotExpected.Store(*req.ExpectedRevision)
 			if req.NewSize != fileSize {
 				http.Error(w, "bad new_size", http.StatusBadRequest)
 				return
@@ -411,8 +413,8 @@ func TestFlushLargeOverwritePatchCarriesExpectedRevision(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("Flush status = %v, want OK", st)
 	}
-	if gotExpected != 17 {
-		t.Fatalf("expected_revision = %d, want 17", gotExpected)
+	if gotExpected.Load() != 17 {
+		t.Fatalf("expected_revision = %d, want 17", gotExpected.Load())
 	}
 	if uploadedBytes != int(fileSize) {
 		t.Fatalf("uploaded bytes = %d, want %d", uploadedBytes, fileSize)
@@ -425,7 +427,8 @@ func TestFlushLargeOverwritePatchCarriesExpectedRevision(t *testing.T) {
 func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 	const fileSize = smallFileThreshold + 2048
 
-	var gotExpected int64 = -1
+	var gotExpected atomic.Int64
+	gotExpected.Store(-1)
 	var completeParts int
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -444,7 +447,7 @@ func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 				http.Error(w, "missing expected_revision", http.StatusBadRequest)
 				return
 			}
-			gotExpected = *req.ExpectedRevision
+			gotExpected.Store(*req.ExpectedRevision)
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"upload_id":   "up-1",
@@ -519,8 +522,8 @@ func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("Flush status = %v, want OK", st)
 	}
-	if gotExpected != 0 {
-		t.Fatalf("expected_revision = %d, want 0", gotExpected)
+	if gotExpected.Load() != 0 {
+		t.Fatalf("expected_revision = %d, want 0", gotExpected.Load())
 	}
 	if completeParts != 1 {
 		t.Fatalf("complete parts = %d, want 1", completeParts)
@@ -973,6 +976,613 @@ func TestSetAttr_MtimeNow(t *testing.T) {
 	}
 	if entry.Mtime.Before(before) || entry.Mtime.After(after) {
 		t.Fatalf("Mtime = %v, expected between %v and %v", entry.Mtime, before, after)
+	}
+}
+
+func TestSetAttr_TruncateWithoutHandleRefreshesRevision(t *testing.T) {
+	var currentRevision atomic.Int64
+	currentRevision.Store(1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(currentRevision.Load(), 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			if len(body) != 0 {
+				t.Fatalf("truncate write body = %q, want empty", string(body))
+			}
+			currentRevision.Store(2)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			http.NotFound(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, 42, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	var attrOut gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if entry.Revision != 2 {
+		t.Fatalf("inode revision = %d, want 2", entry.Revision)
+	}
+
+	var openOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.BaseRev != 2 {
+		t.Fatalf("open base revision = %d, want 2", fh.BaseRev)
+	}
+}
+
+func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
+	const callerPID = 4242
+
+	var (
+		mu         sync.Mutex
+		revision   int64 = 1
+		content          = []byte("orig")
+		handlerErr error
+	)
+	recordHandlerErr := func(err error) {
+		if err == nil {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			mu.Lock()
+			defer mu.Unlock()
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(len(content)), 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				recordHandlerErr(fmt.Errorf("read body: %w", err))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			expected := r.Header.Get("X-Dat9-Expected-Revision")
+			if expected != "" && expected != strconv.FormatInt(revision, 10) {
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			content = append([]byte(nil), body...)
+			revision++
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			mu.Lock()
+			defer mu.Unlock()
+			_, _ = w.Write(content)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, int64(len(content)), time.Now())
+	fs.inodes.UpdateRevision(ino, revision)
+	fs.inodes.UpdateSize(ino, int64(len(content)))
+
+	var openOut gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: callerPID}},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.BaseRev != 1 {
+		t.Fatalf("open base revision = %d, want 1", fh.BaseRev)
+	}
+
+	var attrOut gofuse.AttrOut
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: callerPID}},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	if fh.BaseRev != 2 {
+		t.Fatalf("open handle base revision after path truncate = %d, want 2", fh.BaseRev)
+	}
+	if fh.Streamer == nil {
+		t.Fatal("expected stream uploader on O_TRUNC handle")
+	}
+	fh.Streamer.mu.Lock()
+	streamerRevision := fh.Streamer.expectedRevision
+	fh.Streamer.mu.Unlock()
+	if streamerRevision != 2 {
+		t.Fatalf("streamer expected revision after path truncate = %d, want 2", streamerRevision)
+	}
+
+	if _, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       openOut.Fh,
+		Offset:   0,
+	}, []byte("overwrite")); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+
+	mu.Lock()
+	if handlerErr != nil {
+		mu.Unlock()
+		t.Fatal(handlerErr)
+	}
+	defer mu.Unlock()
+	if got := string(content); got != "overwrite" {
+		t.Fatalf("remote content = %q, want %q", got, "overwrite")
+	}
+	if revision != 3 {
+		t.Fatalf("remote revision = %d, want 3", revision)
+	}
+}
+
+func TestSetAttr_PathTruncateSingleCallerWriterAdoptsZeroBase(t *testing.T) {
+	const callerPID = 5151
+
+	var (
+		mu         sync.Mutex
+		revision   int64 = 1
+		content          = []byte("orig")
+		handlerErr error
+	)
+	recordHandlerErr := func(err error) {
+		if err == nil {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			mu.Lock()
+			defer mu.Unlock()
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(len(content)), 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				recordHandlerErr(fmt.Errorf("read body: %w", err))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			expected := r.Header.Get("X-Dat9-Expected-Revision")
+			if expected != "" && expected != strconv.FormatInt(revision, 10) {
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			content = append([]byte(nil), body...)
+			revision++
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			_, _ = w.Write(content)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, int64(len(content)), time.Now())
+	fs.inodes.UpdateRevision(ino, revision)
+	fs.inodes.UpdateSize(ino, int64(len(content)))
+
+	var openOut gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: callerPID}},
+		Flags:    uint32(syscall.O_WRONLY),
+	}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+
+	var attrOut gofuse.AttrOut
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: callerPID}},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	if fh.BaseRev != 2 {
+		t.Fatalf("open handle base revision after path truncate = %d, want 2", fh.BaseRev)
+	}
+	if !fh.ZeroBase {
+		t.Fatal("expected same-caller writer handle to adopt zero base")
+	}
+	if got := fh.Dirty.Size(); got != 0 {
+		t.Fatalf("dirty size after path truncate = %d, want 0", got)
+	}
+
+	if _, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       openOut.Fh,
+		Offset:   0,
+	}, []byte("overwrite")); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	fh.Lock()
+	flushStatus := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if flushStatus != gofuse.OK {
+		t.Fatalf("flush status = %v, want %v", flushStatus, gofuse.OK)
+	}
+
+	mu.Lock()
+	if handlerErr != nil {
+		mu.Unlock()
+		t.Fatal(handlerErr)
+	}
+	defer mu.Unlock()
+	if got := string(content); got != "overwrite" {
+		t.Fatalf("remote content = %q, want %q", got, "overwrite")
+	}
+	if revision != 3 {
+		t.Fatalf("remote revision = %d, want 3", revision)
+	}
+}
+
+func TestSetAttr_PathTruncateDoesNotRefreshStaleWriterHandle(t *testing.T) {
+	const (
+		stalePID    = 7001
+		truncatePID = 7002
+	)
+
+	var (
+		mu         sync.Mutex
+		revision   int64 = 1
+		content          = []byte("orig")
+		handlerErr error
+	)
+	recordHandlerErr := func(err error) {
+		if err == nil {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			mu.Lock()
+			defer mu.Unlock()
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(len(content)), 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				recordHandlerErr(fmt.Errorf("read body: %w", err))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			expected := r.Header.Get("X-Dat9-Expected-Revision")
+			if expected != "" && expected != strconv.FormatInt(revision, 10) {
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			content = append([]byte(nil), body...)
+			revision++
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			_, _ = w.Write(content)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, int64(len(content)), time.Now())
+	fs.inodes.UpdateRevision(ino, revision)
+	fs.inodes.UpdateSize(ino, int64(len(content)))
+
+	var staleOut gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: stalePID}},
+		Flags:    uint32(syscall.O_WRONLY),
+	}, &staleOut)
+	if st != gofuse.OK {
+		t.Fatalf("stale writer Open status = %v, want OK", st)
+	}
+	staleFH, ok := fs.fileHandles.Get(staleOut.Fh)
+	if !ok {
+		t.Fatal("stale writer handle not found")
+	}
+
+	var truncOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: truncatePID}},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &truncOut)
+	if st != gofuse.OK {
+		t.Fatalf("truncate handle Open status = %v, want OK", st)
+	}
+	truncFH, ok := fs.fileHandles.Get(truncOut.Fh)
+	if !ok {
+		t.Fatal("truncate handle not found")
+	}
+
+	var attrOut gofuse.AttrOut
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: truncatePID}},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	if staleFH.BaseRev != 1 {
+		t.Fatalf("stale writer base revision = %d, want 1", staleFH.BaseRev)
+	}
+	if truncFH.BaseRev != 2 {
+		t.Fatalf("truncate handle base revision = %d, want 2", truncFH.BaseRev)
+	}
+
+	if _, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       staleOut.Fh,
+		Offset:   0,
+	}, []byte("stale")); st != gofuse.OK {
+		t.Fatalf("stale writer Write status = %v, want OK", st)
+	}
+
+	staleFH.Lock()
+	flushStatus := fs.flushHandle(context.Background(), staleFH)
+	staleFH.Unlock()
+	if flushStatus != gofuse.EIO {
+		t.Fatalf("stale writer flush status = %v, want %v", flushStatus, gofuse.EIO)
+	}
+
+	mu.Lock()
+	if handlerErr != nil {
+		mu.Unlock()
+		t.Fatal(handlerErr)
+	}
+	defer mu.Unlock()
+	if got := string(content); got != "" {
+		t.Fatalf("remote content after stale writer conflict = %q, want empty", got)
+	}
+	if revision != 2 {
+		t.Fatalf("remote revision after stale writer conflict = %d, want 2", revision)
+	}
+}
+
+func TestSetAttr_PathTruncateSingleStaleWriterHandleKeepsOriginalRevision(t *testing.T) {
+	const (
+		stalePID    = 8001
+		truncatePID = 8002
+	)
+
+	var (
+		mu         sync.Mutex
+		revision   int64 = 1
+		content          = []byte("orig")
+		handlerErr error
+	)
+	recordHandlerErr := func(err error) {
+		if err == nil {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			mu.Lock()
+			defer mu.Unlock()
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(len(content)), 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				recordHandlerErr(fmt.Errorf("read body: %w", err))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			expected := r.Header.Get("X-Dat9-Expected-Revision")
+			if expected != "" && expected != strconv.FormatInt(revision, 10) {
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			content = append([]byte(nil), body...)
+			revision++
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			_, _ = w.Write(content)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, int64(len(content)), time.Now())
+	fs.inodes.UpdateRevision(ino, revision)
+	fs.inodes.UpdateSize(ino, int64(len(content)))
+
+	var staleOut gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: stalePID}},
+		Flags:    uint32(syscall.O_WRONLY),
+	}, &staleOut)
+	if st != gofuse.OK {
+		t.Fatalf("stale writer Open status = %v, want OK", st)
+	}
+	staleFH, ok := fs.fileHandles.Get(staleOut.Fh)
+	if !ok {
+		t.Fatal("stale writer handle not found")
+	}
+
+	var attrOut gofuse.AttrOut
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: truncatePID}},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	if staleFH.BaseRev != 1 {
+		t.Fatalf("single stale writer base revision = %d, want 1", staleFH.BaseRev)
+	}
+
+	if _, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       staleOut.Fh,
+		Offset:   0,
+	}, []byte("stale")); st != gofuse.OK {
+		t.Fatalf("single stale writer Write status = %v, want OK", st)
+	}
+
+	staleFH.Lock()
+	flushStatus := fs.flushHandle(context.Background(), staleFH)
+	staleFH.Unlock()
+	if flushStatus != gofuse.EIO {
+		t.Fatalf("single stale writer flush status = %v, want %v", flushStatus, gofuse.EIO)
+	}
+
+	mu.Lock()
+	if handlerErr != nil {
+		mu.Unlock()
+		t.Fatal(handlerErr)
+	}
+	defer mu.Unlock()
+	if got := string(content); got != "" {
+		t.Fatalf("remote content after single stale writer conflict = %q, want empty", got)
+	}
+	if revision != 2 {
+		t.Fatalf("remote revision after single stale writer conflict = %d, want 2", revision)
 	}
 }
 

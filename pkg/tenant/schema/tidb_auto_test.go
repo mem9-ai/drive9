@@ -1,8 +1,11 @@
 package schema
 
 import (
+	"errors"
 	"strings"
 	"testing"
+
+	mysql "github.com/go-sql-driver/mysql"
 )
 
 func TestDetectTiDBEmbeddingModeFromFilesMeta(t *testing.T) {
@@ -77,6 +80,82 @@ func TestLegacyTiDBUploadsRepairStatements(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(got[0]), "add column expected_revision") {
 		t.Fatalf("unexpected repair statement: %q", got[0])
+	}
+}
+
+func TestInitTiDBTenantSchemaStatementsForModeIncludesVault(t *testing.T) {
+	for _, mode := range []TiDBEmbeddingMode{TiDBEmbeddingModeAuto, TiDBEmbeddingModeApp} {
+		t.Run(string(mode), func(t *testing.T) {
+			stmts, err := InitTiDBTenantSchemaStatementsForMode(mode)
+			if err != nil {
+				t.Fatalf("init statements for mode %q: %v", mode, err)
+			}
+
+			sqlText := strings.Join(stmts, "\n")
+			if !strings.Contains(sqlText, "CREATE TABLE IF NOT EXISTS vault_deks") {
+				t.Fatalf("mode %q missing vault_deks in init schema", mode)
+			}
+			if !strings.Contains(sqlText, "CREATE TABLE IF NOT EXISTS vault_audit_log") {
+				t.Fatalf("mode %q missing vault_audit_log in init schema", mode)
+			}
+		})
+	}
+}
+
+func TestIsIgnorableOptionalSchemaError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "columnar replica syntax",
+			err:  &mysql.MySQLError{Number: 1064, Message: "syntax error near \"ADD_COLUMNAR_REPLICA_ON_DEMAND\""},
+			want: true,
+		},
+		{
+			name: "fulltext unsupported",
+			err:  &mysql.MySQLError{Number: 1105, Message: "FULLTEXT index is not supported"},
+			want: true,
+		},
+		{
+			name: "vector index unsupported",
+			err:  &mysql.MySQLError{Number: 8200, Message: "VECTOR INDEX is not supported"},
+			want: true,
+		},
+		{
+			name: "vec cosine unsupported",
+			err:  errors.New("vec_cosine_distance is not supported"),
+			want: true,
+		},
+		{
+			name: "parser multilingual unsupported",
+			err:  errors.New("WITH PARSER multilingual is not supported"),
+			want: true,
+		},
+		{
+			name: "mysql syntax without optional markers",
+			err:  &mysql.MySQLError{Number: 1064, Message: "syntax error near \"ALTER TABLE files ADD INDEX idx_status\""},
+			want: false,
+		},
+		{
+			name: "unrelated error",
+			err:  errors.New("permission denied"),
+			want: false,
+		},
+		{
+			name: "mysql unrelated code with keyword should not skip",
+			err:  &mysql.MySQLError{Number: 1146, Message: "FULLTEXT index is not supported"},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isIgnorableOptionalSchemaError(tt.err); got != tt.want {
+				t.Fatalf("isIgnorableOptionalSchemaError()=%v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

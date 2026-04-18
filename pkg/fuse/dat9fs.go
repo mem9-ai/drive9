@@ -185,6 +185,95 @@ func (fs *Dat9FS) clearDirtySize(ino uint64, seq uint64) {
 	}
 }
 
+func shouldRefreshHandleAfterPathTruncate(fh *FileHandle) bool {
+	if fh == nil || fh.Dirty == nil {
+		return false
+	}
+	if fh.ZeroBase {
+		return true
+	}
+	return fh.Flags&syscall.O_TRUNC != 0
+}
+
+func shouldAdoptSingleHandlePathTruncate(fh *FileHandle, callerPID uint32, matchCount int) bool {
+	if fh == nil || fh.Dirty == nil {
+		return false
+	}
+	if callerPID == 0 || matchCount != 1 {
+		return false
+	}
+	return fh.OpenPID == callerPID
+}
+
+func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) error {
+	if fh == nil || fh.Dirty == nil {
+		return nil
+	}
+	if err := fh.Dirty.Truncate(newSize); err != nil {
+		return err
+	}
+	if fs.shadowStore != nil && fs.pendingIndex != nil {
+		if fh.ShadowReady || fh.IsNew || newSize == 0 {
+			if err := fs.shadowStore.Truncate(fh.Path, newSize, fh.BaseRev); err != nil {
+				log.Printf("shadow truncate failed for %s: %v", fh.Path, err)
+				fs.shadowStore.Remove(fh.Path)
+				fh.ShadowReady = false
+			} else {
+				fh.ShadowReady = true
+			}
+		}
+	}
+	// Reset sequential write tracking after truncate so that
+	// subsequent writes starting at the new size are not
+	// misdetected as back-writes (appendCursor may be stale).
+	fh.Dirty.ResetSequentialState(newSize)
+	fh.ZeroBase = newSize == 0
+	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+	return nil
+}
+
+func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64, callerPID uint32) {
+	if revision <= 0 {
+		return
+	}
+
+	var matching []*FileHandle
+	for _, fh := range fs.fileHandles.Snapshot() {
+		if fh != nil && fh.Path == remotePath && fh.Dirty != nil {
+			matching = append(matching, fh)
+		}
+	}
+
+	for _, fh := range matching {
+		fh.Lock()
+		if shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
+			if err := fs.truncateWritableHandleLocked(fh, 0); err != nil {
+				log.Printf("handle truncate sync failed for %s: %v", fh.Path, err)
+				fh.Unlock()
+				continue
+			}
+		}
+		if !shouldRefreshHandleAfterPathTruncate(fh) {
+			fh.Unlock()
+			continue
+		}
+		fh.BaseRev = revision
+		if fh.Streamer != nil {
+			fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+		}
+		if fh.ShadowReady && fs.shadowStore != nil {
+			size := int64(0)
+			if fh.Dirty != nil {
+				size = fh.Dirty.Size()
+			}
+			if err := fs.shadowStore.Ensure(fh.Path, size, revision); err != nil {
+				log.Printf("shadow base revision refresh failed for %s: %v", fh.Path, err)
+			}
+		}
+		fh.Unlock()
+	}
+}
+
 func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
 	stat, err := fs.client.StatCtx(ctx, fh.Path)
 	if err != nil {
@@ -649,26 +738,10 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			fh, ok := fs.fileHandles.Get(input.Fh)
 			if ok && fh.Dirty != nil {
 				fh.Lock()
-				if err := fh.Dirty.Truncate(newSize); err != nil {
+				if err := fs.truncateWritableHandleLocked(fh, newSize); err != nil {
 					fh.Unlock()
 					return gofuse.Status(syscall.EFBIG)
 				}
-				if fs.shadowStore != nil && fs.pendingIndex != nil {
-					if fh.ShadowReady || fh.IsNew || newSize == 0 {
-						if err := fs.shadowStore.Truncate(fh.Path, newSize, fh.BaseRev); err != nil {
-							log.Printf("shadow truncate failed for %s: %v", fh.Path, err)
-							fs.shadowStore.Remove(fh.Path)
-							fh.ShadowReady = false
-						} else {
-							fh.ShadowReady = true
-						}
-					}
-				}
-				// Reset sequential write tracking after truncate so that
-				// subsequent writes starting at the new size are not
-				// misdetected as back-writes (appendCursor may be stale).
-				fh.Dirty.ResetSequentialState(newSize)
-				fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
 				fh.Unlock()
 			}
 		} else {
@@ -680,6 +753,23 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				defer cf()
 				if err := fs.client.WriteCtx(ctx, entry.Path, nil); err != nil {
 					return httpToFuseStatus(err)
+				}
+				// Refresh the inode revision after the server-side truncate so a
+				// subsequent writable open does not reuse the stale pre-truncate
+				// base revision and conflict with its own zero-byte write.
+				stat, statErr := fs.client.StatCtx(ctx, entry.Path)
+				if statErr != nil {
+					log.Printf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, input.NodeId, statErr)
+				} else if stat != nil {
+					if stat.Revision > 0 {
+						entry.Revision = stat.Revision
+						fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
+						fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, input.Pid)
+					}
+					if !stat.Mtime.IsZero() {
+						entry.Mtime = stat.Mtime
+						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+					}
 				}
 				fs.readCache.Invalidate(entry.Path)
 				fs.dirCache.Invalidate(parentDir(entry.Path))
@@ -1293,9 +1383,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	}
 
 	fh := &FileHandle{
-		Ino:   input.NodeId,
-		Path:  p,
-		Flags: input.Flags,
+		Ino:     input.NodeId,
+		Path:    p,
+		Flags:   input.Flags,
+		OpenPID: input.Pid,
 	}
 	entry, _ := fs.inodes.GetEntry(input.NodeId)
 	if entry != nil {
@@ -1361,6 +1452,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.Dirty.sequential = true
 			fh.Dirty.uploadedParts = make(map[int]bool)
 			_ = fh.Dirty.Truncate(0)
+			fh.ZeroBase = true
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 			fs.inodes.UpdateSize(fh.Ino, 0)
 			if fs.shadowStore != nil && fs.pendingIndex != nil {

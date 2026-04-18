@@ -694,6 +694,23 @@ func (s *Store) Stat(ctx context.Context, path string) (out *NodeWithFile, err e
 	return out, nil
 }
 
+func (s *Store) StatPathFallback(ctx context.Context, primaryPath, fallbackPath string) (out *NodeWithFile, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "stat_path_fallback", start, &err)
+
+	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
+		f.file_id, f.storage_type, f.storage_ref, f.content_blob, f.content_type, f.size_bytes,
+		f.checksum_sha256, f.revision, f.embedding_revision, f.status, f.source_id, f.content_text,
+		f.created_at, f.confirmed_at, f.expires_at
+		FROM file_nodes fn
+		LEFT JOIN files f ON fn.file_id = f.file_id AND fn.is_directory = 0 AND f.status = 'CONFIRMED'
+		WHERE fn.path = ? OR fn.path = ?
+		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
+		LIMIT 1`, primaryPath, fallbackPath, primaryPath)
+	out, err = scanNodeWithFileWithBlob(row)
+	return out, err
+}
+
 func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWithFile, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "list_dir", start, &err)
@@ -1137,7 +1154,7 @@ func scanFileWithBlob(s scanner) (*File, error) {
 	return &f, nil
 }
 
-func scanNodeWithFileWithBlob(rows *sql.Rows) (*NodeWithFile, error) {
+func scanNodeWithFileWithBlob(s scanner) (*NodeWithFile, error) {
 	var n FileNode
 	var isDir int
 	var nodeFileID sql.NullString
@@ -1150,11 +1167,14 @@ func scanNodeWithFileWithBlob(rows *sql.Rows) (*NodeWithFile, error) {
 	var fStatus sql.NullString
 	var fCreatedAt, fConfirmedAt, fExpiresAt sql.NullTime
 
-	err := rows.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
+	err := s.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
 		&fFileID, &fStorageType, &fStorageRef, &fContentBlob, &fContentType, &fSizeBytes,
 		&fChecksum, &fRevision, &fEmbeddingRevision, &fStatus, &fSourceID, &fContentText,
 		&fCreatedAt, &fConfirmedAt, &fExpiresAt)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
 		return nil, err
 	}
 

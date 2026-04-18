@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -268,5 +269,121 @@ func TestEmitUploadSummaryUsesContextLogger(t *testing.T) {
 	}
 	if fields["local_path"] != "/tmp/upload.txt" {
 		t.Fatalf("local_path = %#v, want %q", fields["local_path"], "/tmp/upload.txt")
+	}
+}
+
+func TestCpAppendUploadsToRemote(t *testing.T) {
+	localPath := filepath.Join(t.TempDir(), "append.txt")
+	if err := os.WriteFile(localPath, []byte("KLMNOP"), 0o644); err != nil {
+		t.Fatalf("WriteFile(local): %v", err)
+	}
+
+	var uploaded bytes.Buffer
+	var completeCalled bool
+	var srv *httptest.Server
+
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/dest.txt":
+			w.Header().Set("Content-Length", "10")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "9")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/dest.txt" && r.URL.Query().Has("append"):
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(client.AppendPlan{
+				BaseSize: 10,
+				PatchPlan: client.PatchPlan{
+					UploadID: "append-123",
+					PartSize: 8,
+					UploadParts: []*client.PatchPartURL{{
+						Number:      2,
+						URL:         srv.URL + "/upload/2",
+						Size:        8,
+						Headers:     map[string]string{"X-Upload-Token": "append"},
+						ExpiresAt:   "2099-01-01T00:00:00Z",
+						ReadURL:     srv.URL + "/read/2",
+						ReadHeaders: map[string]string{"Range": "bytes=8-9"},
+					}},
+					CopiedParts: []int{1},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/read/2":
+			_, _ = io.WriteString(w, "ij")
+		case r.Method == http.MethodPut && r.URL.Path == "/upload/2":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			_, _ = uploaded.Write(body)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/append-123/complete":
+			completeCalled = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	if err := Cp(c, []string{"--append", localPath, ":/dest.txt"}); err != nil {
+		t.Fatalf("Cp(--append): %v", err)
+	}
+	if got := uploaded.String(); got != "ijKLMNOP" {
+		t.Fatalf("uploaded append body = %q, want %q", got, "ijKLMNOP")
+	}
+	if !completeCalled {
+		t.Fatal("complete endpoint was not called")
+	}
+}
+
+func TestCpAppendRejectsRemoteToLocal(t *testing.T) {
+	localPath := filepath.Join(t.TempDir(), "out.txt")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("server should not be called, got %s %s", r.Method, r.URL.String())
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	err := Cp(c, []string{"--append", ":/src.txt", localPath})
+	if err == nil {
+		t.Fatal("expected error for remote -> local append")
+	}
+	if !strings.Contains(err.Error(), "--append only supports local file source to remote destination") {
+		t.Fatalf("error = %q, want append usage rejection", err)
+	}
+}
+
+func TestCpAppendRejectsRemoteToRemote(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("server should not be called, got %s %s", r.Method, r.URL.String())
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	err := Cp(c, []string{"--append", ":/src.txt", ":/dst.txt"})
+	if err == nil {
+		t.Fatal("expected error for remote -> remote append")
+	}
+	if !strings.Contains(err.Error(), "--append only supports local file source to remote destination") {
+		t.Fatalf("error = %q, want append usage rejection", err)
+	}
+}
+
+func TestCpAppendRejectsStdinSource(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("server should not be called, got %s %s", r.Method, r.URL.String())
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	err := Cp(c, []string{"--append", "-", ":/dst.txt"})
+	if err == nil {
+		t.Fatal("expected error for stdin append")
+	}
+	if !strings.Contains(err.Error(), "--append does not support stdin source") {
+		t.Fatalf("error = %q, want stdin append rejection", err)
 	}
 }

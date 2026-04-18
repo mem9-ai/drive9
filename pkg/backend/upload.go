@@ -90,6 +90,42 @@ func uploadExpectedRevision(upload *datastore.Upload) int64 {
 	return *upload.ExpectedRevision
 }
 
+func (b *Dat9Backend) ensureUploadPresignable(ctx context.Context, uploadID string, upload *datastore.Upload) (*datastore.Upload, error) {
+	if upload.Status != datastore.UploadUploading && upload.Status != datastore.UploadInitiated {
+		return nil, datastore.ErrUploadNotActive
+	}
+	if time.Now().After(upload.ExpiresAt) {
+		_ = b.AbortUploadV2(ctx, uploadID)
+		return nil, datastore.ErrUploadExpired
+	}
+	if upload.Status != datastore.UploadInitiated {
+		return upload, nil
+	}
+	if err := b.store.TransitionUploadStatus(ctx, uploadID, datastore.UploadInitiated, datastore.UploadUploading); err == nil {
+		upload.Status = datastore.UploadUploading
+		return upload, nil
+	} else if !errors.Is(err, datastore.ErrUploadNotActive) {
+		return nil, err
+	}
+
+	// Another concurrent presign may have already advanced INITIATED -> UPLOADING.
+	refreshed, err := b.store.GetUpload(ctx, uploadID)
+	if err != nil {
+		return nil, err
+	}
+	if refreshed.Status == datastore.UploadUploading {
+		return refreshed, nil
+	}
+	if refreshed.Status != datastore.UploadInitiated {
+		return nil, datastore.ErrUploadNotActive
+	}
+	if time.Now().After(refreshed.ExpiresAt) {
+		_ = b.AbortUploadV2(ctx, uploadID)
+		return nil, datastore.ErrUploadExpired
+	}
+	return nil, datastore.ErrUploadNotActive
+}
+
 func (b *Dat9Backend) activeUploadByPath(ctx context.Context, path string) (*datastore.Upload, error) {
 	upload, err := lookupActiveUploadByPath(b.store, ctx, path)
 	if err != nil {
@@ -174,7 +210,7 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		return nil, err
 	}
 	if b.s3 == nil {
-		err := fmt.Errorf("S3 not configured")
+		err := ErrS3NotConfigured
 		logger.Error(ctx, "backend_initiate_upload_s3_missing", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, err
@@ -322,7 +358,7 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		return nil, err
 	}
 	if b.s3 == nil {
-		err := fmt.Errorf("S3 not configured")
+		err := ErrS3NotConfigured
 		logger.Error(ctx, "backend_initiate_upload_v2_s3_missing", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		return nil, err
@@ -501,21 +537,18 @@ func (b *Dat9Backend) PresignPart(ctx context.Context, uploadID string, partNumb
 		metrics.RecordOperation("backend", "presign_part", "error", time.Since(start))
 		return nil, err
 	}
-	if upload.Status != datastore.UploadUploading && upload.Status != datastore.UploadInitiated {
-		metrics.RecordOperation("backend", "presign_part", "not_active", time.Since(start))
-		return nil, datastore.ErrUploadNotActive
-	}
-	if time.Now().After(upload.ExpiresAt) {
-		_ = b.AbortUploadV2(ctx, uploadID)
-		metrics.RecordOperation("backend", "presign_part", "expired", time.Since(start))
-		return nil, datastore.ErrUploadExpired
-	}
-	if upload.Status == datastore.UploadInitiated {
-		if err := b.store.TransitionUploadStatus(ctx, uploadID, datastore.UploadInitiated, datastore.UploadUploading); err != nil {
-			logger.Error(ctx, "backend_presign_part_status_transition_failed", zap.String("upload_id", uploadID), zap.Error(err))
+	upload, err = b.ensureUploadPresignable(ctx, uploadID, upload)
+	if err != nil {
+		switch {
+		case errors.Is(err, datastore.ErrUploadExpired):
+			metrics.RecordOperation("backend", "presign_part", "expired", time.Since(start))
+		case errors.Is(err, datastore.ErrUploadNotActive):
+			metrics.RecordOperation("backend", "presign_part", "not_active", time.Since(start))
+		default:
+			logger.Error(ctx, "backend_presign_part_ensure_presignable_failed", zap.String("upload_id", uploadID), zap.Error(err))
 			metrics.RecordOperation("backend", "presign_part", "error", time.Since(start))
-			return nil, err
 		}
+		return nil, err
 	}
 	if partNumber < 1 || partNumber > upload.PartsTotal {
 		metrics.RecordOperation("backend", "presign_part", "error", time.Since(start))
@@ -553,14 +586,23 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, entries
 	}
 	getUploadDurationMs := uploadPhaseMs(getUploadStart)
 	statusBefore := upload.Status
-	if upload.Status != datastore.UploadUploading && upload.Status != datastore.UploadInitiated {
-		metrics.RecordOperation("backend", "presign_parts", "not_active", time.Since(start))
-		return nil, datastore.ErrUploadNotActive
+	statusTransitionDurationMs := 0.0
+	statusTransitionStart := time.Now()
+	upload, err = b.ensureUploadPresignable(ctx, uploadID, upload)
+	if err != nil {
+		switch {
+		case errors.Is(err, datastore.ErrUploadExpired):
+			metrics.RecordOperation("backend", "presign_parts", "expired", time.Since(start))
+		case errors.Is(err, datastore.ErrUploadNotActive):
+			metrics.RecordOperation("backend", "presign_parts", "not_active", time.Since(start))
+		default:
+			logger.Error(ctx, "backend_presign_parts_ensure_presignable_failed", zap.String("upload_id", uploadID), zap.Error(err))
+			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
+		}
+		return nil, err
 	}
-	if time.Now().After(upload.ExpiresAt) {
-		_ = b.AbortUploadV2(ctx, uploadID)
-		metrics.RecordOperation("backend", "presign_parts", "expired", time.Since(start))
-		return nil, datastore.ErrUploadExpired
+	if statusBefore == datastore.UploadInitiated {
+		statusTransitionDurationMs = uploadPhaseMs(statusTransitionStart)
 	}
 	if len(entries) > MaxPresignBatch {
 		metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
@@ -574,16 +616,6 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, entries
 			return nil, fmt.Errorf("duplicate part number %d in batch", e.PartNumber)
 		}
 		seen[e.PartNumber] = true
-	}
-	statusTransitionDurationMs := 0.0
-	if upload.Status == datastore.UploadInitiated {
-		statusTransitionStart := time.Now()
-		if err := b.store.TransitionUploadStatus(ctx, uploadID, datastore.UploadInitiated, datastore.UploadUploading); err != nil {
-			logger.Error(ctx, "backend_presign_parts_status_transition_failed", zap.String("upload_id", uploadID), zap.Error(err))
-			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
-			return nil, err
-		}
-		statusTransitionDurationMs = uploadPhaseMs(statusTransitionStart)
 	}
 
 	calcPartsStart := time.Now()
@@ -1222,7 +1254,11 @@ func (b *Dat9Backend) PresignGetObject(ctx context.Context, path string) (string
 	}
 	if nf.File.StorageType != datastore.StorageS3 {
 		metrics.RecordOperation("backend", "presign_get_object", "error", time.Since(start))
-		return "", fmt.Errorf("file is not S3-stored: %s", path)
+		return "", fmt.Errorf("%w: %s", ErrNotS3Stored, path)
+	}
+	if b.s3 == nil {
+		metrics.RecordOperation("backend", "presign_get_object", "error", time.Since(start))
+		return "", ErrS3NotConfigured
 	}
 	url, err := b.s3.PresignGetObject(ctx, nf.File.StorageRef, s3client.DownloadTTL)
 	if err != nil {

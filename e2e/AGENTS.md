@@ -7,57 +7,102 @@ title: e2e - Live end-to-end scripts
 This directory contains live end-to-end tests for deployed drive9-server instances.
 These scripts are integration probes (not unit tests) and call real HTTP endpoints.
 
-## Quick start
+## Run
+
+Use a hosted deployment by default. For local development on this machine, use
+`drive9-server-local` instead.
+
+### Hosted endpoints
+
+#### Deployment endpoints
+
+Current shared dev deployment:
 
 ```bash
-DEPLOY=https://<your-api-gateway-or-server>
+# Dev
+export DRIVE9_BASE="http://k8s-dat9-dat9serv-d5e02e7d07-1645488597.ap-southeast-1.elb.amazonaws.com"
 
-# Full smoke (provision -> status poll -> nested dirs -> file ops)
-DRIVE9_BASE=$DEPLOY bash e2e/api-smoke-test.sh
-
-# Existing key regression
-DRIVE9_BASE=$DEPLOY DRIVE9_API_KEY=drive9_xxx bash e2e/api-smoke-test-existing-key.sh
-
-# CLI smoke (provision + drive9 fs workflows + large file cp)
-DRIVE9_BASE=$DEPLOY bash e2e/cli-smoke-test.sh
-
-# FUSE smoke (mount + bidirectional filesystem checks)
-DRIVE9_BASE=$DEPLOY bash e2e/fuse-smoke-test.sh
-
-# Run all smoke scripts in sequence
-DRIVE9_BASE=$DEPLOY bash e2e/smoke-all.sh
+# Prod
+export DRIVE9_BASE="https://api.drive9.ai"
 ```
 
-## `drive9-server-local` workflow
+Use the dev value unless the environment owner announces a new endpoint.
+
+#### Run smoke scripts
+
+```bash
+# Full smoke (provision -> status poll -> nested dirs -> file ops)
+bash e2e/api-smoke-test.sh
+
+# Existing key regression
+DRIVE9_API_KEY=drive9_xxx bash e2e/api-smoke-test-existing-key.sh
+
+# CLI smoke (provision + drive9 fs workflows + large file cp)
+bash e2e/cli-smoke-test.sh
+
+# FUSE smoke (mount + bidirectional filesystem checks)
+bash e2e/fuse-smoke-test.sh
+
+# Run all smoke scripts in sequence
+bash e2e/smoke-all.sh
+```
+
+### Local via `drive9-server-local`
 
 When the task is specifically about local validation on this machine, prefer
 `drive9-server-local` over hosted endpoints.
 
-### Server startup
+`scripts/drive9-server-local-env.sh` is the source of truth for local default
+environment values.
+
+### Prerequisites
+
+- Choose one of the following local validation setups before startup:
+- Use TiDB Starter with auto-embedding enabled. Set `DRIVE9_LOCAL_DSN` to the
+  Starter instance DSN. This is the easier path for semantic smoke coverage
+  because it does not require a local Ollama deployment.
+- Use a local TiDB/MySQL instance together with a local embedding service.
+  Create the database referenced by `DRIVE9_LOCAL_DSN` before startup, then
+  make sure the embedding endpoint is available. The default env script expects
+  Ollama at `http://127.0.0.1:11434` with model `bge-m3`.
+
+### Terminal 1: start `drive9-server-local`
 
 ```bash
-export DRIVE9_LOCAL_DIR=/path/to/dir-containing-run-drive9-server-local.sh
-cd "$DRIVE9_LOCAL_DIR"
-./run-drive9-server-local.sh 2>&1 | tee local-server.log
-curl http://127.0.0.1:9009/healthz
+export DRIVE9_REPO_ROOT=/path/to/drive9
+cd "$DRIVE9_REPO_ROOT"
+
+export DRIVE9_LOCAL_DSN='root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true'   # optional if you use the default local DSN; replace with your TiDB Starter DSN when applicable
+export DRIVE9_LOCAL_INIT_SCHEMA=true   # only for a fresh/disposable database
+make run-server-local
+```
+
+`make run-server-local` already sources `scripts/drive9-server-local-env.sh` and
+stays attached to the foreground. Export any overrides before invoking it, then
+run the smoke scripts from a second terminal after the server is healthy.
+
+### Terminal 2: verify health and run E2E
+
+```bash
+export DRIVE9_REPO_ROOT=/path/to/drive9
+cd "$DRIVE9_REPO_ROOT"
+
+export DRIVE9_BASE=http://127.0.0.1:9009
+
+curl "$DRIVE9_BASE/healthz"
+
+bash e2e/api-smoke-test.sh
+DRIVE9_API_KEY='local-dev-key' bash e2e/api-smoke-test-existing-key.sh
+bash e2e/cli-smoke-test.sh
+bash e2e/fuse-smoke-test.sh
+bash e2e/smoke-all.sh
 ```
 
 Use `http://127.0.0.1:9009` as `DRIVE9_BASE` once `healthz` returns
 `{"status":"ok"}`.
 
-### E2E execution against `drive9-server-local`
-
-```bash
-export DRIVE9_REPO_ROOT=/path/to/drive9
-cd "$DRIVE9_REPO_ROOT"
-export DRIVE9_BASE=http://127.0.0.1:9009
-
-bash e2e/api-smoke-test.sh
-DRIVE9_API_KEY="${DRIVE9_LOCAL_API_KEY:-local-dev-key}" bash e2e/api-smoke-test-existing-key.sh
-bash e2e/cli-smoke-test.sh
-bash e2e/fuse-smoke-test.sh
-bash e2e/smoke-all.sh
-```
+If you overrode `DRIVE9_LOCAL_API_KEY` before starting `drive9-server-local`,
+use the same value as `DRIVE9_API_KEY` here.
 
 ### Local-server-specific expectations
 
@@ -66,32 +111,11 @@ bash e2e/smoke-all.sh
   not overridden.
 - `api-smoke-test-existing-key.sh` should use that built-in key instead of
   provisioning a new tenant.
-- `api-smoke-test.sh` and `cli-smoke-test.sh` have been validated end-to-end
-  against `drive9-server-local`.
-- `fuse-smoke-test.sh` still has a known failure on directory rename via the
-  mount path; do not mislabel that as a new regression unless the failure shape
-  changes.
 - Upload-limit boundary failures (`507` on the `limit-1g.bin` initiate step)
   can be caused by stale multipart reservations in the tenant `uploads` table,
   not by current file-tree contents.
 - If quota looks polluted, inspect and clear `INITIATED` / `UPLOADING` rows for
   the tenant before rerunning the smoke suite.
-
-## Dev endpoint
-
-Current shared dev deployment:
-
-```bash
-export DRIVE9_BASE="https://xkopoerih4.execute-api.ap-southeast-1.amazonaws.com"
-```
-
-Use this value unless the environment owner announces a new endpoint.
-
-## Prod endpoint
-
-```bash
-export DRIVE9_BASE="https://api.drive9.ai"
-```
 
 ## Coverage
 
@@ -175,6 +199,7 @@ Notes:
 | `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh` |
 | `RUN_UPLOAD_LIMIT_BOUNDARY` | `1` | `api-smoke-test.sh` |
 | `UPLOAD_LIMIT_BYTES` | `10737418240` | `api-smoke-test.sh` |
+| `RUN_SEMANTIC_CHECKS` | `1` | `api-smoke-test.sh` |
 | `SEMANTIC_TIMEOUT_S` | `90` | `api-smoke-test.sh` |
 | `SEMANTIC_INTERVAL_S` | `3` | `api-smoke-test.sh` |
 | `CLI_LARGE_FILE_MB` | `100` | `cli-smoke-test.sh` |
@@ -183,6 +208,7 @@ Notes:
 | `CLI_RETRY_SLEEP_S` | `2` | `cli-smoke-test.sh` |
 | `RUN_CLI_UPLOAD_LIMIT_BOUNDARY` | `1` | `cli-smoke-test.sh` |
 | `CLI_UPLOAD_LIMIT_BYTES` | `10737418240` | `cli-smoke-test.sh` |
+| `RUN_CLI_SEMANTIC_CHECKS` | `1` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_TIMEOUT_S` | `90` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_INTERVAL_S` | `3` | `cli-smoke-test.sh` |
 | `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh` |

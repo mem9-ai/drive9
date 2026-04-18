@@ -26,11 +26,14 @@ Inspired by Plan 9's "everything is a file" and the idea that naming things is t
 
 ```bash
 # CLI
-drive9 cp ./data.tar :/data/data.tar
-drive9 cat :/config/app.json
-drive9 ls :/data/
-drive9 cp :/a.bin :/b.bin        # zero-copy
-drive9 mv :/old.bin :/new.bin    # metadata-only
+drive9 fs cp ./data.tar :/data/data.tar
+drive9 fs cp --append ./tail.log :/logs/app.log
+drive9 fs cat :/config/app.json
+drive9 fs ls :/data/
+drive9 fs cp :/a.bin :/b.bin        # zero-copy
+drive9 fs mv :/old.bin :/new.bin    # metadata-only
+drive9 fs rm :/old.bin              # remove file
+drive9 fs rm -r :/old-dir/          # recursive delete
 
 # Mount
 drive9 mount /mnt/drive9
@@ -151,6 +154,7 @@ GET    /v1/fs/{path}?list         List directory
 HEAD   /v1/fs/{path}              Stat
 DELETE /v1/fs/{path}              Delete
 DELETE /v1/fs/{path}?recursive    Recursive delete
+POST   /v1/fs/{path}?append       Initiate incremental append upload
 POST   /v1/fs/{path}?copy         Zero-copy (X-Drive9-Copy-Source header)
 POST   /v1/fs/{path}?rename       Rename (X-Drive9-Rename-Source header)
 POST   /v1/fs/{path}?mkdir        Mkdir
@@ -196,9 +200,12 @@ go build -o bin/drive9-server ./cmd/drive9-server
 
 ```bash
 make test
+make test TEST_RUN='TestInsertAndGetNode' TEST_PKGS='./pkg/datastore/...'
 ```
 
 Uses `DRIVE9_TEST_MYSQL_DSN` if set, otherwise spins up a container via testcontainers.
+Set `TEST_RUN` to pass a `go test -run` regex and `TEST_PKGS` to narrow the target packages
+while still reusing the Podman-aware test setup from `make test`.
 
 ### Failpoint tests
 

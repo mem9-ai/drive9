@@ -13,7 +13,10 @@ import (
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/s3client"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -161,6 +164,73 @@ func TestStat(t *testing.T) {
 	}
 	if resp.Header.Get("X-Dat9-IsDir") != "false" {
 		t.Errorf("expected X-Dat9-IsDir false, got %s", resp.Header.Get("X-Dat9-IsDir"))
+	}
+}
+
+func TestStatDirectoryWithoutTrailingSlash(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/dir?mkdir", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mkdir: %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/dir", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stat dir without trailing slash: %d", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Dat9-IsDir") != "true" {
+		t.Errorf("expected X-Dat9-IsDir true, got %s", resp.Header.Get("X-Dat9-IsDir"))
+	}
+	if resp.Header.Get("Content-Length") != "0" {
+		t.Errorf("expected Content-Length 0, got %s", resp.Header.Get("Content-Length"))
+	}
+}
+
+func TestStatDirectoryWithoutTrailingSlashDoesNotLogDatastoreError(t *testing.T) {
+	core, recorded := observer.New(zap.ErrorLevel)
+	restoreLogger := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(restoreLogger) })
+
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/dir?mkdir", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mkdir: %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/dir", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stat dir without trailing slash: %d", resp.StatusCode)
+	}
+
+	if entries := recorded.FilterMessage("datastore_op_failed").AllUntimed(); len(entries) != 0 {
+		t.Fatalf("expected no datastore_op_failed logs, got %d", len(entries))
 	}
 }
 
@@ -430,6 +500,77 @@ func TestPatchDBBackedFileReturnsBadRequest(t *testing.T) {
 	_ = patchResp.Body.Close()
 	if patchResp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("patch small file: got %d, want 400", patchResp.StatusCode)
+	}
+}
+
+func TestAppendMissingPathReturnsNotFound(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	appendReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/missing.bin?append", strings.NewReader(`{"append_size":16}`))
+	appendReq.Header.Set("Content-Type", "application/json")
+	appendResp, err := http.DefaultClient.Do(appendReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = appendResp.Body.Close()
+	if appendResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("append missing path: got %d, want 404", appendResp.StatusCode)
+	}
+}
+
+func TestAppendDBBackedFileReturnsBadRequest(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	writeReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/small-append.txt", strings.NewReader("hello"))
+	writeResp, err := http.DefaultClient.Do(writeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = writeResp.Body.Close()
+	if writeResp.StatusCode != http.StatusOK {
+		t.Fatalf("write small file: got %d, want 200", writeResp.StatusCode)
+	}
+
+	appendReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/small-append.txt?append", strings.NewReader(`{"append_size":16}`))
+	appendReq.Header.Set("Content-Type", "application/json")
+	appendResp, err := http.DefaultClient.Do(appendReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = appendResp.Body.Close()
+	if appendResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("append small file: got %d, want 400", appendResp.StatusCode)
+	}
+}
+
+func TestAppendRejectsOversizedRequestBody(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	body := `{"append_size":16,"padding":"` + strings.Repeat("a", 1<<20) + `"}`
+	appendReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/missing.bin?append", strings.NewReader(body))
+	appendReq.Header.Set("Content-Type", "application/json")
+
+	appendResp, err := http.DefaultClient.Do(appendReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	respBody, err := io.ReadAll(appendResp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = appendResp.Body.Close()
+
+	if appendResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("append oversized body: got %d, want 400", appendResp.StatusCode)
+	}
+	if !strings.Contains(string(respBody), "invalid request body") {
+		t.Fatalf("append oversized body response = %q, want invalid request body", respBody)
 	}
 }
 
