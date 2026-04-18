@@ -21,7 +21,6 @@ type MetaQuotaStore interface {
 	IncrReservedBytes(ctx context.Context, tenantID string, delta int64) error
 	IncrMediaFileCount(ctx context.Context, tenantID string, delta int64) error
 	TransferReservedToConfirmed(ctx context.Context, tenantID string, reservedDelta, storageDelta int64) error
-	AtomicReserveUpload(ctx context.Context, tenantID string, reserveBytes int64) error
 	AtomicReserveAndInsertUpload(ctx context.Context, r *UploadReservationView) error
 	IncrStorageBytesTx(tx *sql.Tx, tenantID string, delta int64) error
 	IncrReservedBytesTx(tx *sql.Tx, tenantID string, delta int64) error

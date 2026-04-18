@@ -132,21 +132,6 @@ func (f *fakeMetaQuotaStore) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID 
 	return f.TransferReservedToConfirmed(context.Background(), tenantID, reservedDelta, storageDelta)
 }
 
-func (f *fakeMetaQuotaStore) AtomicReserveUpload(ctx context.Context, tenantID string, reserveBytes int64) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	cfg, ok := f.config[tenantID]
-	if !ok {
-		cfg = &QuotaConfigView{TenantID: tenantID}
-	}
-	u := f.ensureUsageLocked(tenantID)
-	if cfg.MaxStorageBytes > 0 && u.StorageBytes+u.ReservedBytes+reserveBytes > cfg.MaxStorageBytes {
-		return ErrStorageQuotaExceeded
-	}
-	u.ReservedBytes += reserveBytes
-	return nil
-}
-
 // AtomicReserveAndInsertUpload models the real Store contract: claim
 // reserved_bytes and insert the reservation row inside a single (fake) tx.
 // If either step fails the state is fully rolled back — reserved_bytes is

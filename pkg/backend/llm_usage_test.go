@@ -34,7 +34,6 @@ func (m *mockQuotaStore) IncrMediaFileCount(_ context.Context, _ string, _ int64
 func (m *mockQuotaStore) TransferReservedToConfirmed(_ context.Context, _ string, _, _ int64) error {
 	return nil
 }
-func (m *mockQuotaStore) AtomicReserveUpload(_ context.Context, _ string, _ int64) error { return nil }
 func (m *mockQuotaStore) AtomicReserveAndInsertUpload(_ context.Context, _ *UploadReservationView) error {
 	return nil
 }

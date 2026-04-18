@@ -272,46 +272,9 @@ func (s *Store) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID string, reser
 // defaultMaxStorageBytes is the fallback limit when no per-tenant config row exists.
 const defaultMaxStorageBytes = int64(50 * (1 << 30)) // 50 GiB
 
-// AtomicReserveUpload performs an atomic check-and-claim for upload reservation.
-// Returns ErrStorageQuotaExceeded if the projected total exceeds the quota.
-// This is the server-reserve-first protocol for upload initiate.
-// When no tenant_quota_config row exists, falls back to the default 50 GiB limit.
-//
-// Deprecated: prefer AtomicReserveAndInsertUpload for the initiate path so that
-// the reserved_bytes bump and the reservation row are written in the same
-// transaction. A naked AtomicReserveUpload that succeeds without a paired
-// reservation row leaves reserved_bytes unrecoverable by the expiry sweep.
-func (s *Store) AtomicReserveUpload(ctx context.Context, tenantID string, reserveBytes int64) error {
-	start := time.Now()
-	var err error
-	defer observeMeta(ctx, "atomic_reserve_upload", start, &err)
-
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE tenant_quota_usage
-		 SET reserved_bytes = reserved_bytes + ?
-		 WHERE tenant_id = ?
-		   AND storage_bytes + reserved_bytes + ? <=
-		       COALESCE((SELECT max_storage_bytes FROM tenant_quota_config WHERE tenant_id = ?), ?)`,
-		reserveBytes, tenantID, reserveBytes, tenantID, defaultMaxStorageBytes)
-	if err != nil {
-		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		err = ErrStorageQuotaExceeded
-		return err
-	}
-	return nil
-}
-
 // AtomicReserveAndInsertUpload claims reserved_bytes and inserts the reservation
 // tracking row inside a single server DB transaction. This is the correct API
 // for the upload-initiate path: either both rows are written, or neither is.
-//
-// The previous split (AtomicReserveUpload + InsertUploadReservation with a
-// best-effort compensating -reserveBytes) leaked reserved_bytes permanently
-// when the compensating UPDATE also failed, because the expiry sweep has no
-// reservation row to discover.
 //
 // Returns:
 //   - ErrStorageQuotaExceeded when the projected total exceeds the per-tenant

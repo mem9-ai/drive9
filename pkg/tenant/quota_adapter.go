@@ -87,14 +87,6 @@ func (a *metaQuotaAdapter) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID st
 	return a.s.TransferReservedToConfirmedTx(tx, tenantID, reservedDelta, storageDelta)
 }
 
-func (a *metaQuotaAdapter) AtomicReserveUpload(ctx context.Context, tenantID string, reserveBytes int64) error {
-	err := a.s.AtomicReserveUpload(ctx, tenantID, reserveBytes)
-	if errors.Is(err, meta.ErrStorageQuotaExceeded) {
-		return backend.ErrStorageQuotaExceeded
-	}
-	return err
-}
-
 // AtomicReserveAndInsertUpload is the preferred single-transaction API for the
 // upload-initiate path. See meta.Store.AtomicReserveAndInsertUpload for
 // invariants. Translates meta sentinels to backend sentinels for the caller.
