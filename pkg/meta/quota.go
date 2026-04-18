@@ -276,6 +276,11 @@ const defaultMaxStorageBytes = int64(50 * (1 << 30)) // 50 GiB
 // Returns ErrStorageQuotaExceeded if the projected total exceeds the quota.
 // This is the server-reserve-first protocol for upload initiate.
 // When no tenant_quota_config row exists, falls back to the default 50 GiB limit.
+//
+// Deprecated: prefer AtomicReserveAndInsertUpload for the initiate path so that
+// the reserved_bytes bump and the reservation row are written in the same
+// transaction. A naked AtomicReserveUpload that succeeds without a paired
+// reservation row leaves reserved_bytes unrecoverable by the expiry sweep.
 func (s *Store) AtomicReserveUpload(ctx context.Context, tenantID string, reserveBytes int64) error {
 	start := time.Now()
 	var err error
@@ -297,6 +302,58 @@ func (s *Store) AtomicReserveUpload(ctx context.Context, tenantID string, reserv
 		return err
 	}
 	return nil
+}
+
+// AtomicReserveAndInsertUpload claims reserved_bytes and inserts the reservation
+// tracking row inside a single server DB transaction. This is the correct API
+// for the upload-initiate path: either both rows are written, or neither is.
+//
+// The previous split (AtomicReserveUpload + InsertUploadReservation with a
+// best-effort compensating -reserveBytes) leaked reserved_bytes permanently
+// when the compensating UPDATE also failed, because the expiry sweep has no
+// reservation row to discover.
+//
+// Returns:
+//   - ErrStorageQuotaExceeded when the projected total exceeds the per-tenant
+//     limit (or the default when no config row exists). Transaction rolls back
+//     so reserved_bytes and the reservation table are both untouched.
+//   - ErrReservationAlreadyExists when a row with the same (tenant_id, upload_id)
+//     already exists (primary-key collision). Idempotent-retry callers should
+//     detect this sentinel and NOT bump reserved_bytes a second time.
+//   - Any other DB error causes the transaction to roll back.
+func (s *Store) AtomicReserveAndInsertUpload(ctx context.Context, r *UploadReservation) error {
+	start := time.Now()
+	var err error
+	defer observeMeta(ctx, "atomic_reserve_and_insert_upload", start, &err)
+
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		res, execErr := tx.ExecContext(ctx,
+			`UPDATE tenant_quota_usage
+			 SET reserved_bytes = reserved_bytes + ?
+			 WHERE tenant_id = ?
+			   AND storage_bytes + reserved_bytes + ? <=
+			       COALESCE((SELECT max_storage_bytes FROM tenant_quota_config WHERE tenant_id = ?), ?)`,
+			r.ReservedBytes, r.TenantID, r.ReservedBytes, r.TenantID, defaultMaxStorageBytes)
+		if execErr != nil {
+			return execErr
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return ErrStorageQuotaExceeded
+		}
+		if _, execErr := tx.ExecContext(ctx,
+			`INSERT INTO tenant_upload_reservations
+			   (tenant_id, upload_id, reserved_bytes, target_path, status, expires_at)
+			 VALUES (?, ?, ?, ?, 'active', ?)`,
+			r.TenantID, r.UploadID, r.ReservedBytes, r.TargetPath, r.ExpiresAt); execErr != nil {
+			if isDuplicateEntry(execErr) {
+				return ErrReservationAlreadyExists
+			}
+			return execErr
+		}
+		return nil
+	})
+	return err
 }
 
 // --- FileMeta operations ---
@@ -406,6 +463,37 @@ func (s *Store) UpdateUploadReservationStatusTx(tx *sql.Tx, tenantID, uploadID, 
 		`UPDATE tenant_upload_reservations SET status = ? WHERE tenant_id = ? AND upload_id = ? AND status = 'active'`,
 		status, tenantID, uploadID)
 	return err
+}
+
+// SettleActiveReservationTx transitions a reservation from 'active' to the
+// given terminal status inside a transaction, reporting whether a row was
+// actually updated. Callers use this to decide — inside the same tx — whether
+// to apply reserved_bytes-related counter changes.
+//
+// settled=true means an 'active' row was atomically flipped to status; the
+// caller should do the reserved→storage transfer. settled=false signals "do
+// not touch reserved_bytes" and covers three indistinguishable sub-cases:
+//   - fail-open initiate: no reservation row was ever written because the
+//     server DB was down at initiate time.
+//   - already-settled terminal row: a concurrent replay or abort flipped
+//     the row before this tx ran.
+//   - apply-time expiry sweep race: the expiry sweep released reserved_bytes
+//     and marked the row aborted between initiate and apply.
+//
+// This is the atomic replacement for a separate GetUploadReservation lookup
+// outside the transaction, which has two failure modes we care about:
+//   - Transient error: we cannot tell whether a reservation exists, so we
+//     would otherwise have to bail out and silently drop the paired mutation.
+//   - TOCTOU: between lookup and apply another worker could settle the row.
+func (s *Store) SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (settled bool, err error) {
+	res, err := tx.Exec(
+		`UPDATE tenant_upload_reservations SET status = ? WHERE tenant_id = ? AND upload_id = ? AND status = 'active'`,
+		status, tenantID, uploadID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 // GetUploadReservation returns a single reservation.
@@ -612,7 +700,13 @@ func (s *Store) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {
 	return nil
 }
 
-// IncrMutationRetry increments the retry count. If max retries exceeded, marks as failed.
+// IncrMutationRetry increments the retry count for a pending mutation.
+// The WHERE status='pending' guard mirrors MarkMutationAppliedTx and prevents
+// any caller (test fakes, backfill CLI, future refactors) from silently flipping
+// applied/failed terminal rows back to pending or bumping retry_count on a row
+// that has already been settled. If max retries is reached, transitions to
+// the terminal 'failed' status. Calls against rows not in 'pending' state
+// are no-ops.
 func (s *Store) IncrMutationRetry(ctx context.Context, id int64, maxRetries int) error {
 	start := time.Now()
 	var err error
@@ -622,7 +716,7 @@ func (s *Store) IncrMutationRetry(ctx context.Context, id int64, maxRetries int)
 		`UPDATE quota_mutation_log
 		 SET retry_count = retry_count + 1,
 		     status = CASE WHEN retry_count + 1 >= ? THEN 'failed' ELSE 'pending' END
-		 WHERE id = ?`, maxRetries, id)
+		 WHERE id = ? AND status = 'pending'`, maxRetries, id)
 	return err
 }
 

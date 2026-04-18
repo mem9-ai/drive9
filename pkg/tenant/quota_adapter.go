@@ -95,6 +95,27 @@ func (a *metaQuotaAdapter) AtomicReserveUpload(ctx context.Context, tenantID str
 	return err
 }
 
+// AtomicReserveAndInsertUpload is the preferred single-transaction API for the
+// upload-initiate path. See meta.Store.AtomicReserveAndInsertUpload for
+// invariants. Translates meta sentinels to backend sentinels for the caller.
+func (a *metaQuotaAdapter) AtomicReserveAndInsertUpload(ctx context.Context, r *backend.UploadReservationView) error {
+	err := a.s.AtomicReserveAndInsertUpload(ctx, &meta.UploadReservation{
+		TenantID:      r.TenantID,
+		UploadID:      r.UploadID,
+		ReservedBytes: r.ReservedBytes,
+		TargetPath:    r.TargetPath,
+		Status:        r.Status,
+		ExpiresAt:     r.ExpiresAt,
+	})
+	switch {
+	case errors.Is(err, meta.ErrStorageQuotaExceeded):
+		return backend.ErrStorageQuotaExceeded
+	case errors.Is(err, meta.ErrReservationAlreadyExists):
+		return backend.ErrReservationAlreadyExists
+	}
+	return err
+}
+
 func (a *metaQuotaAdapter) UpsertFileMeta(ctx context.Context, fm *backend.FileMetaView) error {
 	return a.s.UpsertFileMeta(ctx, &meta.FileMeta{
 		TenantID:  fm.TenantID,
@@ -151,6 +172,10 @@ func (a *metaQuotaAdapter) UpdateUploadReservationStatus(ctx context.Context, te
 
 func (a *metaQuotaAdapter) UpdateUploadReservationStatusTx(tx *sql.Tx, tenantID, uploadID, status string) error {
 	return a.s.UpdateUploadReservationStatusTx(tx, tenantID, uploadID, status)
+}
+
+func (a *metaQuotaAdapter) SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (bool, error) {
+	return a.s.SettleActiveReservationTx(tx, tenantID, uploadID, status)
 }
 
 func (a *metaQuotaAdapter) GetUploadReservation(ctx context.Context, tenantID, uploadID string) (*backend.UploadReservationView, error) {

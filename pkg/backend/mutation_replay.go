@@ -81,9 +81,23 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) {
 		return
 	}
 
+	// Per-tenant failure barrier invariant: once any entry for tenant T fails in
+	// this batch, all subsequent entries for T are skipped until the next batch.
+	// ListPendingMutations orders by (tenant_id, id) so a "barrier" set is
+	// sufficient — we do not need to re-sort. This invariant matters for
+	// non-counter mutations where ordering affects convergence, e.g.
+	// UpsertFileMetaTx followed by DeleteFileMetaTx on the same fileID: if the
+	// upsert fails transiently and we then run the delete, we have effectively
+	// reordered create+delete and the shadow state will not converge.
 	applied := 0
 	failed := 0
+	skipped := 0
+	blockedTenants := make(map[string]struct{})
 	for _, entry := range entries {
+		if _, blocked := blockedTenants[entry.TenantID]; blocked {
+			skipped++
+			continue
+		}
 		if err := w.replayOne(ctx, entry); err != nil {
 			logger.Warn(ctx, "mutation_replay_entry_failed",
 				zap.Int64("log_id", entry.ID),
@@ -95,6 +109,7 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) {
 					zap.Int64("log_id", entry.ID),
 					zap.Error(rErr))
 			}
+			blockedTenants[entry.TenantID] = struct{}{}
 			failed++
 		} else {
 			applied++
@@ -103,10 +118,12 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) {
 
 	metrics.RecordGauge("mutation_replay", "batch_applied", float64(applied))
 	metrics.RecordGauge("mutation_replay", "batch_failed", float64(failed))
+	metrics.RecordGauge("mutation_replay", "batch_skipped", float64(skipped))
 	logger.Info(ctx, "mutation_replay_batch_complete",
 		zap.Int("total", len(entries)),
 		zap.Int("applied", applied),
 		zap.Int("failed", failed),
+		zap.Int("skipped_after_barrier", skipped),
 		zap.Float64("duration_ms", float64(time.Since(start).Milliseconds())))
 }
 
@@ -204,8 +221,26 @@ func (w *MutationReplayWorker) applyMutation(tx *sql.Tx, entry MutationLogView) 
 		if err := json.Unmarshal(entry.MutationData, &data); err != nil {
 			return err
 		}
-		if err := w.store.TransferReservedToConfirmedTx(tx, entry.TenantID, -data.ReservedBytes, data.ReservedBytes); err != nil {
+		// Make the reservation-state decision inside the tx via
+		// SettleActiveReservationTx. When no active row exists (fail-open
+		// initiate or already-settled), we skip the reserved→storage transfer
+		// and instead add newSizeBytes directly. MarkMutationAppliedTx is the
+		// caller's responsibility (replayOne) so this branch only handles the
+		// state mutations.
+		settled, err := w.store.SettleActiveReservationTx(tx, entry.TenantID, data.UploadID, "completed")
+		if err != nil {
 			return err
+		}
+		if settled {
+			if err := w.store.TransferReservedToConfirmedTx(tx, entry.TenantID, -data.ReservedBytes, data.ReservedBytes); err != nil {
+				return err
+			}
+		} else {
+			if data.NewSizeBytes != 0 {
+				if err := w.store.IncrStorageBytesTx(tx, entry.TenantID, data.NewSizeBytes); err != nil {
+					return err
+				}
+			}
 		}
 		if data.OldSizeBytes != 0 {
 			if err := w.store.IncrStorageBytesTx(tx, entry.TenantID, -data.OldSizeBytes); err != nil {
@@ -231,9 +266,6 @@ func (w *MutationReplayWorker) applyMutation(tx *sql.Tx, entry MutationLogView) 
 			if err := w.store.IncrMediaFileCountTx(tx, entry.TenantID, mediaDelta); err != nil {
 				return err
 			}
-		}
-		if err := w.store.UpdateUploadReservationStatusTx(tx, entry.TenantID, data.UploadID, "completed"); err != nil {
-			return err
 		}
 		return nil
 

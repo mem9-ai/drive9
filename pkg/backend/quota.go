@@ -14,10 +14,11 @@ import (
 )
 
 var (
-	ErrUploadTooLarge        = errors.New("upload too large")
-	ErrStorageQuotaExceeded  = errors.New("tenant storage quota exceeded")
-	ErrMediaLLMQuotaExceeded = errors.New("tenant media LLM file quota exceeded")
-	ErrReservationNotFound   = errors.New("upload reservation not found")
+	ErrUploadTooLarge           = errors.New("upload too large")
+	ErrStorageQuotaExceeded     = errors.New("tenant storage quota exceeded")
+	ErrMediaLLMQuotaExceeded    = errors.New("tenant media LLM file quota exceeded")
+	ErrReservationNotFound      = errors.New("upload reservation not found")
+	ErrReservationAlreadyExists = errors.New("upload reservation already exists")
 )
 
 // UseServerQuota reports whether this backend reads authoritative quota state
@@ -116,6 +117,17 @@ func (b *Dat9Backend) ensureUploadSizeAllowed(size int64) error {
 // the server DB. Used for small writes (create, overwrite, patch) where the
 // server-reserve-first protocol would add unnecessary latency.
 // Falls back to the tenant-DB check when metaStore is not wired.
+//
+// Accepted race (Rev 4 / PR #251 review): this check is optimistic and can
+// undercount when concurrent small overwrites on the same file race between
+// read (GetQuotaUsage) and the paired mutation log entry that adjusts
+// storage_bytes. The window is bounded by the small-write path (not
+// multipart uploads, which use the server-reserve-first saga with a single
+// atomic reserve+insert transaction — see upload_reservation.go). Reviewers
+// @adversary / @adversary-1 accepted this tradeoff in thread #pr251:000001d1
+// rather than paying the latency of a server-side reserve for every small
+// write. Hard quota convergence is restored by the mutation replay worker
+// and the nightly reconciliation sweep.
 func (b *Dat9Backend) ensureStorageQuotaServer(ctx context.Context, deltaBytes int64) error {
 	if b.metaStore == nil || deltaBytes <= 0 {
 		return nil // fail-open or no-op

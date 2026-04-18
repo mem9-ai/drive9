@@ -22,6 +22,7 @@ type MetaQuotaStore interface {
 	IncrMediaFileCount(ctx context.Context, tenantID string, delta int64) error
 	TransferReservedToConfirmed(ctx context.Context, tenantID string, reservedDelta, storageDelta int64) error
 	AtomicReserveUpload(ctx context.Context, tenantID string, reserveBytes int64) error
+	AtomicReserveAndInsertUpload(ctx context.Context, r *UploadReservationView) error
 	IncrStorageBytesTx(tx *sql.Tx, tenantID string, delta int64) error
 	IncrReservedBytesTx(tx *sql.Tx, tenantID string, delta int64) error
 	IncrMediaFileCountTx(tx *sql.Tx, tenantID string, delta int64) error
@@ -39,6 +40,7 @@ type MetaQuotaStore interface {
 	UpdateUploadReservationStatus(ctx context.Context, tenantID, uploadID, status string) error
 	GetUploadReservation(ctx context.Context, tenantID, uploadID string) (*UploadReservationView, error)
 	UpdateUploadReservationStatusTx(tx *sql.Tx, tenantID, uploadID, status string) error
+	SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (settled bool, err error)
 
 	// LLM cost
 	InsertCentralLLMUsage(ctx context.Context, r *LLMUsageView) error

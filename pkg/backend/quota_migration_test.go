@@ -22,17 +22,19 @@ type fakeMutationRecord struct {
 }
 
 type fakeMetaQuotaStore struct {
-	mu                sync.Mutex
-	usage             map[string]*QuotaUsageView
-	config            map[string]*QuotaConfigView
-	fileMeta          map[string]*FileMetaView
-	reservations      map[string]*UploadReservationView
-	monthly           map[string]int64
-	llmUsage          []LLMUsageView
-	mutations         []fakeMutationRecord
-	nextID            int64
-	monthlyCostErr    error
-	insertMutationErr error
+	mu                   sync.Mutex
+	usage                map[string]*QuotaUsageView
+	config               map[string]*QuotaConfigView
+	fileMeta             map[string]*FileMetaView
+	reservations         map[string]*UploadReservationView
+	monthly              map[string]int64
+	llmUsage             []LLMUsageView
+	mutations            []fakeMutationRecord
+	nextID               int64
+	monthlyCostErr       error
+	insertMutationErr    error
+	insertReservationErr error // injected into AtomicReserveAndInsertUpload to simulate INSERT failure inside the tx
+	getReservationErr    error // injected into GetUploadReservation to simulate transient DB error
 }
 
 func newFakeMetaQuotaStore() *fakeMetaQuotaStore {
@@ -144,6 +146,35 @@ func (f *fakeMetaQuotaStore) AtomicReserveUpload(ctx context.Context, tenantID s
 	return nil
 }
 
+// AtomicReserveAndInsertUpload models the real Store contract: claim
+// reserved_bytes and insert the reservation row inside a single (fake) tx.
+// If either step fails the state is fully rolled back — reserved_bytes is
+// never bumped without a paired reservation row. Used by Round A / B1 tests.
+func (f *fakeMetaQuotaStore) AtomicReserveAndInsertUpload(ctx context.Context, r *UploadReservationView) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cfg, ok := f.config[r.TenantID]
+	if !ok {
+		cfg = &QuotaConfigView{TenantID: r.TenantID}
+	}
+	u := f.ensureUsageLocked(r.TenantID)
+	if cfg.MaxStorageBytes > 0 && u.StorageBytes+u.ReservedBytes+r.ReservedBytes > cfg.MaxStorageBytes {
+		return ErrStorageQuotaExceeded
+	}
+	if _, exists := f.reservations[metaKey(r.TenantID, r.UploadID)]; exists {
+		// Duplicate primary key; real tx would roll back here.
+		return ErrReservationAlreadyExists
+	}
+	if f.insertReservationErr != nil {
+		// Simulated INSERT failure inside the tx: reserved_bytes stays untouched.
+		return f.insertReservationErr
+	}
+	u.ReservedBytes += r.ReservedBytes
+	cp := *r
+	f.reservations[metaKey(r.TenantID, r.UploadID)] = &cp
+	return nil
+}
+
 func (f *fakeMetaQuotaStore) UpsertFileMeta(ctx context.Context, fm *FileMetaView) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -199,9 +230,29 @@ func (f *fakeMetaQuotaStore) UpdateUploadReservationStatusTx(tx *sql.Tx, tenantI
 	return f.UpdateUploadReservationStatus(context.Background(), tenantID, uploadID, status)
 }
 
+// SettleActiveReservationTx models the atomic "active → status" transition
+// and reports whether an active row was actually settled. Mirrors the real
+// Store contract used by Round A / fix 4.
+func (f *fakeMetaQuotaStore) SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.reservations[metaKey(tenantID, uploadID)]
+	if !ok || r.Status != "active" {
+		return false, nil
+	}
+	r.Status = status
+	return true, nil
+}
+
 func (f *fakeMetaQuotaStore) GetUploadReservation(ctx context.Context, tenantID, uploadID string) (*UploadReservationView, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Simulated transient DB error distinct from ErrReservationNotFound. Used
+	// by Round A / fix 4 tests to prove completeUploadReservation does NOT
+	// silently drop the upload_complete mutation on transient lookup failure.
+	if f.getReservationErr != nil {
+		return nil, f.getReservationErr
+	}
 	r, ok := f.reservations[metaKey(tenantID, uploadID)]
 	if !ok {
 		return nil, ErrReservationNotFound
@@ -302,6 +353,11 @@ func (f *fakeMetaQuotaStore) IncrMutationRetry(ctx context.Context, id int64, ma
 	for i := range f.mutations {
 		if f.mutations[i].id != id {
 			continue
+		}
+		// Mirror the WHERE status='pending' guard of the real Store: refuse to
+		// bump retry_count or flip status on an already-terminal row.
+		if f.mutations[i].status != "pending" {
+			return nil
 		}
 		f.mutations[i].retryCount++
 		if maxRetries > 0 && f.mutations[i].retryCount >= maxRetries {

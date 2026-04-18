@@ -35,6 +35,9 @@ func (m *mockQuotaStore) TransferReservedToConfirmed(_ context.Context, _ string
 	return nil
 }
 func (m *mockQuotaStore) AtomicReserveUpload(_ context.Context, _ string, _ int64) error { return nil }
+func (m *mockQuotaStore) AtomicReserveAndInsertUpload(_ context.Context, _ *UploadReservationView) error {
+	return nil
+}
 func (m *mockQuotaStore) IncrStorageBytesTx(_ *sql.Tx, _ string, _ int64) error { return nil }
 func (m *mockQuotaStore) IncrReservedBytesTx(_ *sql.Tx, _ string, _ int64) error { return nil }
 func (m *mockQuotaStore) IncrMediaFileCountTx(_ *sql.Tx, _ string, _ int64) error { return nil }
@@ -55,6 +58,9 @@ func (m *mockQuotaStore) InsertUploadReservation(_ context.Context, _ *UploadRes
 }
 func (m *mockQuotaStore) UpdateUploadReservationStatus(_ context.Context, _, _, _ string) error {
 	return nil
+}
+func (m *mockQuotaStore) SettleActiveReservationTx(_ *sql.Tx, _, _, _ string) (bool, error) {
+	return false, nil
 }
 func (m *mockQuotaStore) GetUploadReservation(_ context.Context, _, _ string) (*UploadReservationView, error) {
 	return nil, nil

@@ -17,9 +17,10 @@ import (
 )
 
 var (
-	ErrNotFound              = errors.New("not found")
-	ErrDuplicate             = errors.New("duplicate entry")
-	ErrStorageQuotaExceeded  = errors.New("tenant storage quota exceeded")
+	ErrNotFound                 = errors.New("not found")
+	ErrDuplicate                = errors.New("duplicate entry")
+	ErrStorageQuotaExceeded     = errors.New("tenant storage quota exceeded")
+	ErrReservationAlreadyExists = errors.New("upload reservation already exists")
 )
 
 type TenantStatus string
