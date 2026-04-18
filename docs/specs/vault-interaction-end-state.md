@@ -140,8 +140,12 @@ Rules:
 ## 7. The Delegatee Side
 
 ```bash
-# Alice receives the one-line install command from §6
-drive9 ctx import <jwt>               # writes a new delegated context into ~/.drive9/config
+# Alice receives the grant block from §6, saves the JWT body to a 0600 file
+install -m 600 /dev/null ~/alice-grant.jwt
+$EDITOR ~/alice-grant.jwt                        # paste the JWT line
+drive9 ctx import --from-file ~/alice-grant.jwt  # writes a new delegated context
+rm ~/alice-grant.jwt
+
 drive9 ctx use alice-prod-db          # activate it
 
 drive9 mount vault /n/vault
@@ -345,17 +349,23 @@ drive9 vault put /n/vault/prod-db --from ./prod-db.envdir
 
 drive9 vault grant /n/vault/prod-db/DB_URL --agent alice --perm read --ttl 1h
 # stdout:
-# drive9 ctx import vt_eyJhbGc...
+# drive9 ctx import --from-file -
+# vt_eyJhbGc...
+# ---
 # grant_id:   grt_7f2a
 # expires_at: 2026-04-18T19:00:00Z
 ```
 
-Owner sends Alice the first line through a secure channel.
+Owner sends Alice the whole block through a secure channel (password-manager share, Signal, password-protected email). The JWT line is the bearer credential; do not paste it as a positional arg into a shell.
 
 ### Alice
 
 ```bash
-drive9 ctx import vt_eyJhbGc...          # decodes JWT locally, writes delegated context
+install -m 600 /dev/null ~/alice-grant.jwt
+$EDITOR ~/alice-grant.jwt                # paste the JWT body, save
+drive9 ctx import --from-file ~/alice-grant.jwt  # decodes JWT locally, writes delegated context
+rm ~/alice-grant.jwt
+
 drive9 ctx use alice-prod-db             # activates it
 drive9 mount vault /n/vault
 
@@ -460,8 +470,9 @@ Appendix A — Command surface at a glance:
 | `drive9 mount vault <path>` | Mount the vault namespace under `<path>`. |
 | `drive9 umount <path>` | Unmount. |
 | `drive9 ctx add --api-key <k>` | Register an owner context. |
-| `drive9 ctx import <jwt>` | Register a delegated context from a grant JWT (primary UX). |
-| `drive9 ctx add --from-token <jwt>` | Low-level alias of `ctx import`. |
+| `drive9 ctx import --from-file <path>` | Register a delegated context from a grant JWT file (primary UX). |
+| `drive9 ctx import --from-file -` | Same, reading the JWT from stdin (recommended for piping). |
+| `drive9 ctx import <jwt>` | Convenience form; leaks to shell history (see §13.3 / §16). |
 | `drive9 ctx ls / use / rm` | Manage contexts (offline). |
 | `drive9 vault put <path> --from <dir> [--prune]` | Atomic batch write. |
 | `drive9 vault grant <scope>... --agent --perm --ttl` | Issue a scoped JWT. |

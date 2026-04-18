@@ -322,7 +322,7 @@ cat /n/vault/prod-db/DB_URL
 | Action | Command |
 |---|---|
 | Add owner credential | `drive9 ctx add --api-key <k> --name <n>` |
-| Add delegated credential | `drive9 ctx import <jwt>` |
+| Add delegated credential | `drive9 ctx import --from-file <path>` (or `--from-file -` for stdin) |
 | List credentials | `drive9 ctx ls` |
 | Switch | `drive9 ctx use <name>` |
 | Mount | `drive9 mount vault /n/vault` |
