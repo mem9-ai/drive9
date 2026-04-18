@@ -515,3 +515,109 @@ func TestRoundA_Fix4_CompleteUpload_ApplyAfterReservationSwept(t *testing.T) {
 		t.Fatalf("apply-after-sweep mutation status = %q, want applied", last.status)
 	}
 }
+
+// --- Finding B: MarkMutationAppliedTx must be called exactly once per apply ---
+//
+// After the Option 1 real-sharing refactor, applyUploadCompleteTx is a
+// package-level helper shared by both the inline fast path
+// (completeUploadReservation) and the replay worker (replayOne). The helper
+// itself MUST NOT call MarkMutationAppliedTx — the caller owns that call.
+// Otherwise we double-mark the row in the replay path (helper marks, then
+// replayOne marks again) which, even though the real Store's WHERE
+// status='pending' guard makes the second mark a silent no-op, is a latent
+// trap: a future caller that forgets the guard would roll the tx back.
+//
+// This test asserts the invariant from three angles so any future regression
+// (e.g. someone re-inlines the mark into the helper) trips at least one
+// subtest. Requested by @adversary-1 in the Finding B review plan.
+func TestRoundA_Fix4_CompleteUpload_MarkAppliedCalledExactlyOnce(t *testing.T) {
+	t.Run("inline_path", func(t *testing.T) {
+		b, fake := newCentralQuotaBackend(t)
+		b.completeUploadReservation(context.Background(),
+			"u1", /*reservedBytes*/ 0, "file-1",
+			/*oldSize*/ 0, /*oldMedia*/ false,
+			/*newSize*/ 40, /*newMedia*/ false)
+		if fake.markAppliedCalls != 1 {
+			t.Fatalf("inline path markAppliedCalls = %d, want exactly 1", fake.markAppliedCalls)
+		}
+	})
+
+	t.Run("replay_path", func(t *testing.T) {
+		// Exercise the replay branch directly via replayOne so the test
+		// isolates the helper + MarkMutationAppliedTx wiring. This
+		// deliberately bypasses ListPendingMutations/replayBatch — those
+		// are covered by Fix 3 tests. The invariant under test is simply:
+		// one apply → one MarkMutationAppliedTx call, regardless of
+		// whether applyUploadCompleteTx ever calls MarkMutationAppliedTx
+		// itself (it must not).
+		fake := newFakeMetaQuotaStore()
+		fake.config["tenant-a"] = &QuotaConfigView{
+			TenantID: "tenant-a", MaxStorageBytes: 1 << 30,
+		}
+		data, err := json.Marshal(uploadCompleteMutationData{
+			UploadID:     "u1",
+			FileID:       "file-1",
+			NewSizeBytes: 40,
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		id, err := fake.InsertMutationLog(context.Background(), &MutationLogView{
+			TenantID:     "tenant-a",
+			MutationType: "upload_complete",
+			MutationData: data,
+		})
+		if err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		w := &MutationReplayWorker{store: fake}
+		if err := w.replayOne(context.Background(), MutationLogView{
+			ID:           id,
+			TenantID:     "tenant-a",
+			MutationType: "upload_complete",
+			MutationData: data,
+		}); err != nil {
+			t.Fatalf("replayOne: %v", err)
+		}
+		if fake.markAppliedCalls != 1 {
+			t.Fatalf("replay path markAppliedCalls = %d, want exactly 1", fake.markAppliedCalls)
+		}
+		if got := fake.mutationStatus(id); got != "applied" {
+			t.Fatalf("replay path row status = %q, want applied", got)
+		}
+	})
+
+	t.Run("helper_returns_row_still_pending", func(t *testing.T) {
+		// Direct call to applyUploadCompleteTx (no surrounding caller).
+		// The helper MUST NOT call MarkMutationAppliedTx — otherwise the
+		// caller's subsequent mark would double-count, and in a future
+		// caller that forgets the WHERE status='pending' guard the tx
+		// would roll back.
+		fake := newFakeMetaQuotaStore()
+		fake.config["tenant-a"] = &QuotaConfigView{
+			TenantID: "tenant-a", MaxStorageBytes: 1 << 30,
+		}
+		id, err := fake.InsertMutationLog(context.Background(), &MutationLogView{
+			TenantID:     "tenant-a",
+			MutationType: "upload_complete",
+			MutationData: []byte(`{}`),
+		})
+		if err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		if err := applyUploadCompleteTx(fake, nil, "tenant-a", uploadCompleteMutationData{
+			UploadID:     "u1",
+			FileID:       "file-1",
+			NewSizeBytes: 40,
+		}); err != nil {
+			t.Fatalf("applyUploadCompleteTx: %v", err)
+		}
+		if fake.markAppliedCalls != 0 {
+			t.Fatalf("helper called MarkMutationAppliedTx %d times; it MUST leave that to the caller",
+				fake.markAppliedCalls)
+		}
+		if got := fake.mutationStatus(id); got != "pending" {
+			t.Fatalf("helper flipped row status to %q; must stay pending for caller to mark", got)
+		}
+	})
+}

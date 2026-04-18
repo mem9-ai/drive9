@@ -31,6 +31,7 @@ type fakeMetaQuotaStore struct {
 	llmUsage             []LLMUsageView
 	mutations            []fakeMutationRecord
 	nextID               int64
+	markAppliedCalls     int // Finding B invariant: count MarkMutationAppliedTx calls (pre-guard, on-entry)
 	monthlyCostErr       error
 	insertMutationErr    error
 	insertReservationErr error // injected into AtomicReserveAndInsertUpload to simulate INSERT failure inside the tx
@@ -338,13 +339,36 @@ func (f *fakeMetaQuotaStore) ListPendingMutations(ctx context.Context, minAge ti
 func (f *fakeMetaQuotaStore) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Count BEFORE the guard — we want double-call regressions to fail the
+	// MarkAppliedCalledExactlyOnce test even when the second call is a silent
+	// no-op on an already-applied row.
+	f.markAppliedCalls++
 	for i := range f.mutations {
 		if f.mutations[i].id == id {
+			// Mirror the real Store's WHERE status='pending' guard
+			// (pkg/meta/quota.go). Silent no-op on non-pending — same symmetry
+			// as fake.IncrMutationRetry.
+			if f.mutations[i].status != "pending" {
+				return nil
+			}
 			f.mutations[i].status = "applied"
 			return nil
 		}
 	}
 	return fmt.Errorf("mutation %d not found", id)
+}
+
+// mutationStatus is a test-only helper for reading mutation row status by id
+// without exposing the slice internals. Used by Finding B invariant tests.
+func (f *fakeMetaQuotaStore) mutationStatus(id int64) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.mutations {
+		if f.mutations[i].id == id {
+			return f.mutations[i].status
+		}
+	}
+	return ""
 }
 
 func (f *fakeMetaQuotaStore) IncrMutationRetry(ctx context.Context, id int64, maxRetries int) error {

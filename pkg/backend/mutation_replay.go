@@ -221,53 +221,12 @@ func (w *MutationReplayWorker) applyMutation(tx *sql.Tx, entry MutationLogView) 
 		if err := json.Unmarshal(entry.MutationData, &data); err != nil {
 			return err
 		}
-		// Make the reservation-state decision inside the tx via
-		// SettleActiveReservationTx. When no active row exists (fail-open
-		// initiate or already-settled), we skip the reserved→storage transfer
-		// and instead add newSizeBytes directly. MarkMutationAppliedTx is the
-		// caller's responsibility (replayOne) so this branch only handles the
-		// state mutations.
-		settled, err := w.store.SettleActiveReservationTx(tx, entry.TenantID, data.UploadID, "completed")
-		if err != nil {
-			return err
-		}
-		if settled {
-			if err := w.store.TransferReservedToConfirmedTx(tx, entry.TenantID, -data.ReservedBytes, data.ReservedBytes); err != nil {
-				return err
-			}
-		} else {
-			if data.NewSizeBytes != 0 {
-				if err := w.store.IncrStorageBytesTx(tx, entry.TenantID, data.NewSizeBytes); err != nil {
-					return err
-				}
-			}
-		}
-		if data.OldSizeBytes != 0 {
-			if err := w.store.IncrStorageBytesTx(tx, entry.TenantID, -data.OldSizeBytes); err != nil {
-				return err
-			}
-		}
-		if err := w.store.UpsertFileMetaTx(tx, &FileMetaView{
-			TenantID:  entry.TenantID,
-			FileID:    data.FileID,
-			SizeBytes: data.NewSizeBytes,
-			IsMedia:   data.NewIsMedia,
-		}); err != nil {
-			return err
-		}
-		mediaDelta := int64(0)
-		switch {
-		case !data.OldIsMedia && data.NewIsMedia:
-			mediaDelta = 1
-		case data.OldIsMedia && !data.NewIsMedia:
-			mediaDelta = -1
-		}
-		if mediaDelta != 0 {
-			if err := w.store.IncrMediaFileCountTx(tx, entry.TenantID, mediaDelta); err != nil {
-				return err
-			}
-		}
-		return nil
+		// Real shared helper — same body as the inline fast path in
+		// completeUploadReservation. MarkMutationAppliedTx stays with the
+		// caller (replayOne wraps applyMutation + MarkMutationAppliedTx in
+		// the same InTx), so this delegation is safe w.r.t. the Fix 2
+		// status='pending' guard.
+		return applyUploadCompleteTx(w.store, tx, entry.TenantID, data)
 
 	case "llm_cost_record":
 		var data llmCostMutationData

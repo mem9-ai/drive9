@@ -187,15 +187,19 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 		metrics.RecordOperation("central_quota", "upload_complete", "fail_open", time.Since(start))
 		return
 	}
-	mediaDelta := int64(0)
-	switch {
-	case !oldIsMedia && newIsMedia:
-		mediaDelta = 1
-	case oldIsMedia && !newIsMedia:
-		mediaDelta = -1
-	}
 	if err := b.metaStore.InTx(ctx, func(tx *sql.Tx) error {
-		return b.applyUploadCompleteTx(tx, uploadID, fileID, reservedBytes, oldSizeBytes, newSizeBytes, newIsMedia, mediaDelta, logID)
+		if err := applyUploadCompleteTx(b.metaStore, tx, b.tenantID, uploadCompleteMutationData{
+			UploadID:      uploadID,
+			FileID:        fileID,
+			ReservedBytes: reservedBytes,
+			OldSizeBytes:  oldSizeBytes,
+			OldIsMedia:    oldIsMedia,
+			NewSizeBytes:  newSizeBytes,
+			NewIsMedia:    newIsMedia,
+		}); err != nil {
+			return err
+		}
+		return b.metaStore.MarkMutationAppliedTx(tx, logID)
 	}); err != nil {
 		logger.Warn(ctx, "central_quota_upload_complete_apply_failed",
 			zap.String("tenant_id", b.tenantID),
@@ -210,10 +214,11 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 	metrics.RecordOperation("central_quota", "upload_complete", "ok", time.Since(start))
 }
 
-// applyUploadCompleteTx is the single tx-scoped apply body shared by the
-// inline fast path and the replay worker. The reservation-state branch lives
-// here (inside the tx) so that transient lookup failures outside never cause
-// silent data loss of the paired shadow-state mutation.
+// applyUploadCompleteTx is the single tx-scoped apply body shared by both
+// the inline fast path (completeUploadReservation) and the replay worker
+// (mutation_replay.go upload_complete case). The reservation-state branch
+// lives here (inside the tx) so that transient lookup failures outside
+// never cause silent data loss of the paired shadow-state mutation.
 //
 // The settled flag from SettleActiveReservationTx partitions the
 // reservation-state space into exactly two branches:
@@ -238,41 +243,56 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 //     In all three sub-cases reserved_bytes is either untouched (case 1) or
 //     already balanced (cases 2, 3), so we skip the reserved→storage
 //     transfer and charge storage_bytes directly with newSizeBytes.
-func (b *Dat9Backend) applyUploadCompleteTx(tx *sql.Tx, uploadID, fileID string, reservedBytes, oldSizeBytes, newSizeBytes int64, newIsMedia bool, mediaDelta int64, logID int64) error {
-	settled, err := b.metaStore.SettleActiveReservationTx(tx, b.tenantID, uploadID, "completed")
+//
+// This function is package-level (not a *Dat9Backend method) so that the
+// replay worker — which only holds a MetaQuotaStore, no backend — can call
+// it directly without duplicating logic. Caller owns MarkMutationAppliedTx:
+// the inline path calls it inside completeUploadReservation's InTx, and the
+// replay path calls it inside replayOne. Keeping the mark-applied call out
+// of this helper prevents a double-mark rollback trap if any future caller
+// also marks applied in the outer tx.
+func applyUploadCompleteTx(store MetaQuotaStore, tx *sql.Tx, tenantID string, data uploadCompleteMutationData) error {
+	mediaDelta := int64(0)
+	switch {
+	case !data.OldIsMedia && data.NewIsMedia:
+		mediaDelta = 1
+	case data.OldIsMedia && !data.NewIsMedia:
+		mediaDelta = -1
+	}
+	settled, err := store.SettleActiveReservationTx(tx, tenantID, data.UploadID, "completed")
 	if err != nil {
 		return err
 	}
 	if settled {
-		if err := b.metaStore.TransferReservedToConfirmedTx(tx, b.tenantID, -reservedBytes, reservedBytes); err != nil {
+		if err := store.TransferReservedToConfirmedTx(tx, tenantID, -data.ReservedBytes, data.ReservedBytes); err != nil {
 			return err
 		}
 	} else {
 		// settled=false: fail-open initiate / already-settled / expiry sweep
 		// race. reserved_bytes is already balanced; charge storage directly.
-		if newSizeBytes != 0 {
-			if err := b.metaStore.IncrStorageBytesTx(tx, b.tenantID, newSizeBytes); err != nil {
+		if data.NewSizeBytes != 0 {
+			if err := store.IncrStorageBytesTx(tx, tenantID, data.NewSizeBytes); err != nil {
 				return err
 			}
 		}
 	}
-	if oldSizeBytes != 0 {
-		if err := b.metaStore.IncrStorageBytesTx(tx, b.tenantID, -oldSizeBytes); err != nil {
+	if data.OldSizeBytes != 0 {
+		if err := store.IncrStorageBytesTx(tx, tenantID, -data.OldSizeBytes); err != nil {
 			return err
 		}
 	}
-	if err := b.metaStore.UpsertFileMetaTx(tx, &FileMetaView{
-		TenantID:  b.tenantID,
-		FileID:    fileID,
-		SizeBytes: newSizeBytes,
-		IsMedia:   newIsMedia,
+	if err := store.UpsertFileMetaTx(tx, &FileMetaView{
+		TenantID:  tenantID,
+		FileID:    data.FileID,
+		SizeBytes: data.NewSizeBytes,
+		IsMedia:   data.NewIsMedia,
 	}); err != nil {
 		return err
 	}
 	if mediaDelta != 0 {
-		if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, mediaDelta); err != nil {
+		if err := store.IncrMediaFileCountTx(tx, tenantID, mediaDelta); err != nil {
 			return err
 		}
 	}
-	return b.metaStore.MarkMutationAppliedTx(tx, logID)
+	return nil
 }
