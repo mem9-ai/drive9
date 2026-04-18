@@ -77,7 +77,7 @@ func (b *Dat9Backend) monthlyLLMCostExceededCheck(ctx context.Context) bool {
 // monthlyLLMCostExceededServer checks the server DB monthly cost counter
 // against the per-tenant config (falling back to the global default).
 func (b *Dat9Backend) monthlyLLMCostExceededServer(ctx context.Context) bool {
-	if b.metaStore == nil || b.maxMonthlyLLMCostMillicents <= 0 {
+	if b.metaStore == nil {
 		return false
 	}
 	start := time.Now()
@@ -93,6 +93,9 @@ func (b *Dat9Backend) monthlyLLMCostExceededServer(ctx context.Context) bool {
 	cfg, err := b.metaStore.GetQuotaConfig(ctx, b.tenantID)
 	if err == nil && cfg.MaxMonthlyCostMC > 0 {
 		limit = cfg.MaxMonthlyCostMC
+	}
+	if limit <= 0 {
+		return false // no limit configured (global or per-tenant)
 	}
 	return total > limit
 }

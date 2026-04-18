@@ -176,6 +176,9 @@ func buildEncryptor() (encrypt.Encryptor, error) {
 	eType := encrypt.Type(encryptType)
 	if eType == encrypt.TypeKMS {
 		eKey = kmsKey
+		if eKey == "" {
+			return nil, fmt.Errorf("DRIVE9_ENCRYPT_KEY is required when DRIVE9_ENCRYPT_TYPE=kms")
+		}
 	}
 	if eKey == "" && eType != encrypt.TypeKMS {
 		// Attempt hex decode — if DRIVE9_MASTER_KEY is not set, fail early.

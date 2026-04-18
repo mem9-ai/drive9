@@ -106,22 +106,19 @@ func (b *Dat9Backend) abortUploadReservation(ctx context.Context, uploadID strin
 		return
 	}
 
-	// Release reserved bytes.
-	if err := b.metaStore.IncrReservedBytes(ctx, b.tenantID, -r.ReservedBytes); err != nil {
-		logger.Warn(ctx, "central_quota_abort_release_reserved_failed",
+	// Atomically release reserved bytes and mark reservation aborted.
+	if err := b.metaStore.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.metaStore.IncrReservedBytesTx(tx, b.tenantID, -r.ReservedBytes); err != nil {
+			return err
+		}
+		return b.metaStore.UpdateUploadReservationStatusTx(tx, b.tenantID, uploadID, "aborted")
+	}); err != nil {
+		logger.Warn(ctx, "central_quota_abort_failed",
 			zap.String("tenant_id", b.tenantID),
 			zap.String("upload_id", uploadID),
 			zap.Error(err))
 		metrics.RecordOperation("central_quota", "abort_reservation", "error", time.Since(start))
 		return
-	}
-
-	// Mark reservation aborted.
-	if err := b.metaStore.UpdateUploadReservationStatus(ctx, b.tenantID, uploadID, "aborted"); err != nil {
-		logger.Warn(ctx, "central_quota_update_reservation_status_failed",
-			zap.String("tenant_id", b.tenantID),
-			zap.String("upload_id", uploadID),
-			zap.Error(err))
 	}
 
 	metrics.RecordOperation("central_quota", "abort_reservation", "ok", time.Since(start))
@@ -148,6 +145,7 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 	// Check if a reservation row actually exists and is active before
 	// touching counters. If the initiate-time reserve was a fail-open no-op,
 	// there is no reservation to complete.
+	reservationActive := false
 	r, err := b.metaStore.GetUploadReservation(ctx, b.tenantID, uploadID)
 	if errors.Is(err, ErrReservationNotFound) {
 		// No reservation row — initiate was a fail-open no-op.
@@ -165,8 +163,11 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 		metrics.RecordOperation("central_quota", "upload_complete", "lookup_error", time.Since(start))
 		return
 	} else if r.Status != "active" {
-		// Already completed or aborted — don't touch reserved_bytes counter.
+		// Already completed or aborted — don't touch reserved_bytes counter
+		// and don't overwrite the existing terminal status.
 		reservedBytes = 0
+	} else {
+		reservationActive = true
 	}
 
 	data, err := json.Marshal(uploadCompleteMutationData{
@@ -227,8 +228,10 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 				return err
 			}
 		}
-		if err := b.metaStore.UpdateUploadReservationStatusTx(tx, b.tenantID, uploadID, "completed"); err != nil {
-			return err
+		if reservationActive {
+			if err := b.metaStore.UpdateUploadReservationStatusTx(tx, b.tenantID, uploadID, "completed"); err != nil {
+				return err
+			}
 		}
 		return b.metaStore.MarkMutationAppliedTx(tx, logID)
 	}); err != nil {
