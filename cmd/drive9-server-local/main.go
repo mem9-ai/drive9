@@ -105,7 +105,14 @@ func main() {
 		if !explicitEmbeddingMode {
 			initMode = schema.TiDBEmbeddingModeAuto
 		}
-		if err := localTiDBSchemaInitializer(localDSN, initMode); err != nil {
+		initOpts := schema.InitTiDBTenantSchemaOptions{}
+		if initMode == schema.TiDBEmbeddingModeApp {
+			// drive9-server-local can bootstrap app-managed schema on TiDB builds
+			// that lack optional FTS/vector index features; shared schema init paths
+			// remain strict.
+			initOpts.AllowUnsupportedOptionalIndexes = true
+		}
+		if err := localTiDBSchemaInitializer(startupCtx, localDSN, initMode, initOpts); err != nil {
 			die(fmt.Errorf("init local tenant schema: %w", err))
 		}
 		logLocalStartupStep(startupCtx, startupStart, stepStart, "init_local_tenant_schema",
@@ -433,7 +440,7 @@ func (c localS3Config) localDir() string {
 var (
 	localTiDBEmbeddingModeDetector = schema.DetectTiDBEmbeddingMode
 	localTiDBSchemaValidator       = schema.EnsureTiDBSchemaForMode
-	localTiDBSchemaInitializer     = schema.InitTiDBTenantSchemaForMode
+	localTiDBSchemaInitializer     = schema.InitTiDBTenantSchemaForModeWithOptionsContext
 )
 
 func detectLocalTiDBEmbeddingMode(db *sql.DB, schemaInitialized bool, requestedMode schema.TiDBEmbeddingMode, explicitMode bool) (schema.TiDBEmbeddingMode, error) {

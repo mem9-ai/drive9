@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+
+	"github.com/mem9-ai/dat9/pkg/logger"
+	"go.uber.org/zap"
 )
 
 // Keep this statement list aligned with any external workflow that manages the
@@ -14,6 +17,12 @@ import (
 // There is intentionally no drive9-server dump-init-sql --provider export path
 // for this app-managed statement list.
 func tidbAppEmbeddingSchemaStatements() []string {
+	stmts := tidbAppEmbeddingBaseSchemaStatements()
+	stmts = append(stmts, tidbAppEmbeddingOptionalSchemaStatements()...)
+	return stmts
+}
+
+func tidbAppEmbeddingBaseSchemaStatements() []string {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
@@ -46,13 +55,6 @@ func tidbAppEmbeddingSchemaStatements() []string {
 			expires_at         DATETIME(3)
 		)`,
 		`CREATE INDEX idx_status ON files(status, created_at)`,
-		`ALTER TABLE files
-			ADD FULLTEXT INDEX idx_fts_content(content_text)
-			WITH PARSER MULTILINGUAL
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-		`ALTER TABLE files
-			ADD VECTOR INDEX idx_files_cosine((VEC_COSINE_DISTANCE(embedding)))
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
 		`CREATE TABLE IF NOT EXISTS file_tags (
 			file_id   VARCHAR(64) NOT NULL,
 			tag_key   VARCHAR(255) NOT NULL,
@@ -118,8 +120,20 @@ func tidbAppEmbeddingSchemaStatements() []string {
 	return stmts
 }
 
-func initTiDBAppEmbeddingSchema(dsn string) error {
-	db, err := OpenTiDBSchemaDB(context.Background(), dsn)
+func tidbAppEmbeddingOptionalSchemaStatements() []string {
+	return []string{
+		`ALTER TABLE files
+			ADD FULLTEXT INDEX idx_fts_content(content_text)
+			WITH PARSER MULTILINGUAL
+			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
+		`ALTER TABLE files
+			ADD VECTOR INDEX idx_files_cosine((VEC_COSINE_DISTANCE(embedding)))
+			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
+	}
+}
+
+func initTiDBAppEmbeddingSchema(ctx context.Context, dsn string, opts InitTiDBTenantSchemaOptions) error {
+	db, err := OpenTiDBSchemaDB(ctx, dsn)
 	if err != nil {
 		return err
 	}
@@ -127,7 +141,22 @@ func initTiDBAppEmbeddingSchema(dsn string) error {
 	if !IsTiDBCluster(db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
-	if err := ExecSchemaStatements(db, tidbAppEmbeddingSchemaStatements()); err != nil {
+	if err := ExecSchemaStatements(db, tidbAppEmbeddingBaseSchemaStatements()); err != nil {
+		return err
+	}
+	if opts.AllowUnsupportedOptionalIndexes {
+		// Local-only compatibility mode can continue without these indexes; other
+		// callers still execute the same statements strictly below.
+		skipped, err := ExecOptionalSchemaStatements(ctx, db, tidbAppEmbeddingOptionalSchemaStatements())
+		if err != nil {
+			return err
+		}
+		if skipped > 0 {
+			logger.Warn(ctx, "tidb_app_optional_indexes_skipped",
+				zap.Int("skipped_count", skipped),
+				zap.String("reason", "allow_unsupported_optional_indexes"))
+		}
+	} else if err := ExecSchemaStatements(db, tidbAppEmbeddingOptionalSchemaStatements()); err != nil {
 		return err
 	}
 	return ValidateTiDBSchemaForMode(db, TiDBEmbeddingModeApp)

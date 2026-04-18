@@ -34,9 +34,11 @@ RUN_UPLOAD_LIMIT_BOUNDARY="${RUN_UPLOAD_LIMIT_BOUNDARY:-1}"
 UPLOAD_LIMIT_BYTES="${UPLOAD_LIMIT_BYTES:-10737418240}"
 SEMANTIC_TIMEOUT_S="${SEMANTIC_TIMEOUT_S:-90}"
 SEMANTIC_INTERVAL_S="${SEMANTIC_INTERVAL_S:-3}"
+RUN_SEMANTIC_CHECKS="${RUN_SEMANTIC_CHECKS:-1}"
 
 PASS=0
 FAIL=0
+SKIP=0
 TOTAL=0
 
 RED='\033[0;31m'
@@ -48,6 +50,12 @@ RESET='\033[0m'
 step() { echo -e "\n${YELLOW}[$1]${RESET} $2"; }
 ok() { echo -e "${GREEN}  PASS${RESET} $*"; }
 fail() { echo -e "${RED}  FAIL${RESET} $*"; }
+skip_check() {
+  local desc="$1"
+  TOTAL=$((TOTAL+1))
+  SKIP=$((SKIP+1))
+  echo -e "${YELLOW}  SKIP${RESET} $desc"
+}
 info() { echo -e "${CYAN}  ->${RESET} $*"; }
 
 check_eq() {
@@ -453,45 +461,64 @@ fi
 check_eq "find by name returns jpg file" "$find_has_png" "true"
 
 step "9" "Semantic text recall checks"
-resp=$(curl_body_code POST "$BASE/v1/fs/${ROOT_DIR}/notes?mkdir" "$API_KEY")
-code=$(http_code "$resp")
-check_eq "POST /v1/fs/${ROOT_DIR}/notes?mkdir returns 200" "$code" "200"
+if [ "$RUN_SEMANTIC_CHECKS" = "1" ]; then
+  resp=$(curl_body_code POST "$BASE/v1/fs/${ROOT_DIR}/notes?mkdir" "$API_KEY")
+  code=$(http_code "$resp")
+  check_eq "POST /v1/fs/${ROOT_DIR}/notes?mkdir returns 200" "$code" "200"
 
-resp=$(curl_body_code PUT "$BASE/v1/fs/$SEM_TEXT_TARGET" "$API_KEY" "A cat is resting on a sofa near a window.")
-code=$(http_code "$resp")
-check_eq "PUT semantic target text returns 200" "$code" "200"
+  resp=$(curl_body_code PUT "$BASE/v1/fs/$SEM_TEXT_TARGET" "$API_KEY" "A cat is resting on a sofa near a window.")
+  code=$(http_code "$resp")
+  check_eq "PUT semantic target text returns 200" "$code" "200"
 
-resp=$(curl_body_code PUT "$BASE/v1/fs/$SEM_TEXT_OTHER" "$API_KEY" "A dog is running in a field under bright sun.")
-code=$(http_code "$resp")
-check_eq "PUT semantic distractor text returns 200" "$code" "200"
+  resp=$(curl_body_code PUT "$BASE/v1/fs/$SEM_TEXT_OTHER" "$API_KEY" "A dog is running in a field under bright sun.")
+  code=$(http_code "$resp")
+  check_eq "PUT semantic distractor text returns 200" "$code" "200"
 
-resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?grep=feline%20sofa&limit=20" "$API_KEY")
-code=$(http_code "$resp")
-body=$(json_body "$resp")
-check_eq "GET semantic grep returns 200" "$code" "200"
-wait_grep_contains_path "semantic grep includes cat-story target" "feline%20sofa" "${ROOT_DIR}/notes" "$SEM_TEXT_TARGET" "cat-story"
-wait_grep_contains_path "semantic grep includes dog-story target" "canine%20field" "${ROOT_DIR}/notes" "$SEM_TEXT_OTHER" "dog-story"
+  resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?grep=feline%20sofa&limit=20" "$API_KEY")
+  code=$(http_code "$resp")
+  body=$(json_body "$resp")
+  check_eq "GET semantic grep returns 200" "$code" "200"
+  wait_grep_contains_path "semantic grep includes cat-story target" "feline%20sofa" "${ROOT_DIR}/notes" "$SEM_TEXT_TARGET" "cat-story"
+  wait_grep_contains_path "semantic grep includes dog-story target" "canine%20field" "${ROOT_DIR}/notes" "$SEM_TEXT_OTHER" "dog-story"
+else
+  info "semantic text recall checks skipped (RUN_SEMANTIC_CHECKS=$RUN_SEMANTIC_CHECKS)"
+  skip_check "POST /v1/fs/${ROOT_DIR}/notes?mkdir returns 200"
+  skip_check "PUT semantic target text returns 200"
+  skip_check "PUT semantic distractor text returns 200"
+  skip_check "GET semantic grep returns 200"
+  skip_check "semantic grep includes cat-story target"
+  skip_check "semantic grep includes dog-story target"
+fi
 
 step "10" "Image-associated recall checks"
-resp=$(curl_body_code PUT "$BASE/v1/fs/$IMAGE_CAPTION_REMOTE" "$API_KEY" "This image shows a cat face icon.")
-code=$(http_code "$resp")
-check_eq "PUT image caption text returns 200" "$code" "200"
+if [ "$RUN_SEMANTIC_CHECKS" = "1" ]; then
+  resp=$(curl_body_code PUT "$BASE/v1/fs/$IMAGE_CAPTION_REMOTE" "$API_KEY" "This image shows a cat face icon.")
+  code=$(http_code "$resp")
+  check_eq "PUT image caption text returns 200" "$code" "200"
 
-resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?grep=feline%20face%20icon&limit=20" "$API_KEY")
-code=$(http_code "$resp")
-body=$(json_body "$resp")
-check_eq "GET image-associated grep returns 200" "$code" "200"
-wait_grep_contains_path "image-associated recall includes caption" "feline%20face%20icon" "${ROOT_DIR}/assets" "$IMAGE_CAPTION_REMOTE" "caption"
+  resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?grep=feline%20face%20icon&limit=20" "$API_KEY")
+  code=$(http_code "$resp")
+  body=$(json_body "$resp")
+  check_eq "GET image-associated grep returns 200" "$code" "200"
+  wait_grep_contains_path "image-associated recall includes caption" "feline%20face%20icon" "${ROOT_DIR}/assets" "$IMAGE_CAPTION_REMOTE" "caption"
 
-resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?find=&name=*.jpg" "$API_KEY")
-code=$(http_code "$resp")
-body=$(json_body "$resp")
-check_eq "GET image find returns 200" "$code" "200"
-image_file_present=$(printf '%s' "$body" | jq -r --arg p "$IMAGE_REMOTE" 'any(.[]; .path==$p)')
-if [ "$image_file_present" != "true" ]; then
-  image_file_present=$(printf '%s' "$body" | jq -r 'any(.[]; (.path // "") | endswith(".jpg"))')
+  resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?find=&name=*.jpg" "$API_KEY")
+  code=$(http_code "$resp")
+  body=$(json_body "$resp")
+  check_eq "GET image find returns 200" "$code" "200"
+  image_file_present=$(printf '%s' "$body" | jq -r --arg p "$IMAGE_REMOTE" 'any(.[]; .path==$p)')
+  if [ "$image_file_present" != "true" ]; then
+    image_file_present=$(printf '%s' "$body" | jq -r 'any(.[]; (.path // "") | endswith(".jpg"))')
+  fi
+  check_eq "image file remains discoverable" "$image_file_present" "true"
+else
+  info "image-associated recall checks skipped (RUN_SEMANTIC_CHECKS=$RUN_SEMANTIC_CHECKS)"
+  skip_check "PUT image caption text returns 200"
+  skip_check "GET image-associated grep returns 200"
+  skip_check "image-associated recall includes caption"
+  skip_check "GET image find returns 200"
+  skip_check "image file remains discoverable"
 fi
-check_eq "image file remains discoverable" "$image_file_present" "true"
 
 step "11" "SQL endpoint sanity"
 sql_req='{"query":"SELECT 1 AS n"}'
@@ -789,11 +816,15 @@ rm -f "$IMAGE_LOCAL"
 
 echo
 echo "========================================================"
-echo "  RESULTS: $PASS / $TOTAL passed, $FAIL failed"
+echo "  RESULTS: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"
 echo "  Base URL : $BASE"
 echo "  Finished : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if [ "$FAIL" -eq 0 ]; then
-  echo -e "  ${GREEN}All tests passed.${RESET}"
+  if [ "$SKIP" -eq 0 ]; then
+    echo -e "  ${GREEN}All tests passed.${RESET}"
+  else
+    echo -e "  ${GREEN}All executed tests passed.${RESET}"
+  fi
 else
   echo -e "  ${RED}$FAIL test(s) failed.${RESET}"
 fi
