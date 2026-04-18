@@ -15,9 +15,9 @@ Go version: 1.25.1 (see `go.mod`)
 ## Build commands
 
 ```bash
-make build           # build server + CLI → bin/drive9-server, bin/drive9
-make build-server    # server only
-make build-cli       # CLI only (supports VERSION= for ldflags)
+make build              # build server + CLI → bin/drive9-server, bin/drive9
+make build-server       # server only
+make build-cli          # CLI only (supports VERSION= for ldflags)
 make build-cli-release  # cross-compile for linux/amd64|arm64, darwin/amd64|arm64
 ```
 
@@ -35,10 +35,12 @@ All binaries are built with `CGO_ENABLED=0`.
 ## Test commands
 
 ```bash
-make test                          # go test -v ./... (all packages)
-go test -v ./pkg/datastore/...     # single package
-go test -v -run TestInsertAndGetNode ./pkg/datastore/   # single test
-go test -v ./...                   # full suite
+# full suite
+make test
+# single package
+make test TEST_PKGS='./pkg/datastore/...'
+# single test
+make test TEST_RUN='TestInsertAndGetNode' TEST_PKGS='./pkg/datastore/...'
 ```
 
 MySQL-backed tests require a container runtime or an explicit DSN:
@@ -54,7 +56,11 @@ testcontainers via `scripts/test-podman.sh`. Otherwise a Docker-compatible runti
 If a direct `go test` run fails with `rootless Docker not found`, retry with `make test`
 so the project can use `scripts/test-podman.sh` to route testcontainers through Podman.
 
-**E2E smoke tests** (not `go test`) live in `e2e/` and target live deployments:
+**E2E smoke tests** (not `go test`) live in `e2e/` and target live deployments.
+Read `e2e/AGENTS.md` first for endpoint selection, `drive9-server-local` workflow,
+environment variables, script coverage, and known expectations.
+
+Common entry points:
 
 ```bash
 DRIVE9_BASE=https://... bash e2e/api-smoke-test.sh
@@ -114,7 +120,7 @@ pkg/
   traceid/              Trace ID helpers
 internal/
   testmysql/            MySQL test helpers (shared across packages)
-e2e/                    Live bash smoke tests (not go test)
+e2e/                    Live bash smoke tests; read e2e/AGENTS.md first
 scripts/                Shell helpers for local dev and test
 docs/                   Design documents
 site/                   Frontend / release assets

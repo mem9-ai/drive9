@@ -1,0 +1,206 @@
+name: local-e2e
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/local-e2e.yml"
+      - "cmd/**"
+      - "pkg/**"
+      - "internal/**"
+      - "scripts/**"
+      - "e2e/**"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TIDB_VERSION: v8.5.5
+  DRIVE9_BASE: http://127.0.0.1:9009
+  DRIVE9_LOCAL_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true
+  DRIVE9_LOCAL_INIT_SCHEMA: "true"
+  DRIVE9_LOCAL_EMBEDDING_MODE: app
+  RUN_SEMANTIC_CHECKS: "0"
+  RUN_CLI_SEMANTIC_CHECKS: "0"
+
+jobs:
+  local-e2e:
+    name: drive9-server-local e2e smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-mysql-client fuse3
+
+      - name: Cache TiUP artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.tiup/bin
+            ~/.tiup/components
+            ~/.tiup/manifests
+            ~/.tiup/manifest
+          key: ${{ runner.os }}-tiup-${{ env.TIDB_VERSION }}
+
+      - name: Install TiUP and TiDB components
+        run: |
+          if [ ! -x "$HOME/.tiup/bin/tiup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+          fi
+          echo "$HOME/.tiup/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.tiup/bin:$PATH"
+          tiup telemetry disable || true
+          tiup install playground
+          tiup install "tidb:${TIDB_VERSION}" "pd:${TIDB_VERSION}" "tikv:${TIDB_VERSION}"
+          tiup --version
+
+      - name: Start TiDB playground
+        run: |
+          export PATH="$HOME/.tiup/bin:$PATH"
+          nohup tiup playground "${TIDB_VERSION}" --tiflash 0 --without-monitor > /tmp/tiup-playground.log 2>&1 &
+          echo $! > /tmp/tiup-playground.pid
+
+      - name: Wait for TiDB readiness and create local database
+        run: |
+          for _ in {1..60}; do
+            if curl -sf http://127.0.0.1:10080/status > /tmp/tidb-status.json \
+              && mysql --protocol=tcp -h 127.0.0.1 -P 4000 -u root \
+                -e "CREATE DATABASE IF NOT EXISTS drive9_local;" > /tmp/tidb-sql-ready.log 2>&1; then
+              cat /tmp/tidb-status.json
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "TiDB playground did not become ready in time" >&2
+          cat /tmp/tidb-sql-ready.log >&2 || true
+          exit 1
+
+      - name: Start drive9-server-local
+        run: |
+          nohup make run-server-local > /tmp/drive9-server-local.log 2>&1 &
+          echo $! > /tmp/drive9-server-local.pid
+
+      - name: Wait for drive9-server-local readiness
+        run: |
+          for _ in {1..60}; do
+            if curl -sf "$DRIVE9_BASE/healthz" > /tmp/drive9-healthz.json; then
+              cat /tmp/drive9-healthz.json
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "drive9-server-local did not become ready in time" >&2
+          exit 1
+
+      - name: Run API smoke
+        id: api-smoke
+        continue-on-error: true
+        run: bash e2e/api-smoke-test.sh
+
+      - name: Run existing-key smoke
+        id: existing-key-smoke
+        continue-on-error: true
+        env:
+          DRIVE9_API_KEY: local-dev-key
+        run: bash e2e/api-smoke-test-existing-key.sh
+
+      - name: Run CLI smoke
+        id: cli-smoke
+        continue-on-error: true
+        run: bash e2e/cli-smoke-test.sh
+
+      - name: Run FUSE smoke
+        id: fuse-smoke
+        continue-on-error: true
+        run: bash e2e/fuse-smoke-test.sh
+
+      - name: Publish local e2e summary
+        if: always()
+        run: |
+          {
+            echo "## drive9-server-local e2e"
+            echo
+            echo "| Check | Outcome |"
+            echo "| --- | --- |"
+            echo "| API smoke | ${{ steps.api-smoke.outcome || 'skipped' }} |"
+            echo "| Existing-key smoke | ${{ steps.existing-key-smoke.outcome || 'skipped' }} |"
+            echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
+            echo "| FUSE smoke | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dump TiDB playground logs
+        if: always()
+        run: |
+          if [ -f /tmp/tiup-playground.log ]; then
+            echo "=== tiup playground log ==="
+            cat /tmp/tiup-playground.log
+          fi
+
+      - name: Dump drive9-server-local logs
+        if: always()
+        run: |
+          if [ -f /tmp/drive9-server-local.log ]; then
+            echo "=== drive9-server-local log ==="
+            cat /tmp/drive9-server-local.log
+          fi
+
+      - name: Stop drive9-server-local
+        if: always()
+        run: |
+          if [ -f /tmp/drive9-server-local.pid ]; then
+            kill "$(cat /tmp/drive9-server-local.pid)" || true
+          fi
+
+      - name: Stop TiDB playground
+        if: always()
+        run: |
+          if [ -f /tmp/tiup-playground.pid ]; then
+            kill "$(cat /tmp/tiup-playground.pid)" || true
+          fi
+
+      - name: Enforce smoke results
+        if: always()
+        run: |
+          failed=0
+
+          check_required() {
+            local name="$1"
+            local outcome="$2"
+            if [ "$outcome" != "success" ]; then
+              echo "$name did not succeed (outcome: $outcome)"
+              failed=1
+            fi
+          }
+
+          check_required "API smoke" "${{ steps.api-smoke.outcome }}"
+          check_required "Existing-key smoke" "${{ steps.existing-key-smoke.outcome }}"
+          check_required "CLI smoke" "${{ steps.cli-smoke.outcome }}"
+          check_required "FUSE smoke" "${{ steps.fuse-smoke.outcome }}"
+
+          exit "$failed"

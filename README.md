@@ -200,9 +200,12 @@ go build -o bin/drive9-server ./cmd/drive9-server
 
 ```bash
 make test
+make test TEST_RUN='TestInsertAndGetNode' TEST_PKGS='./pkg/datastore/...'
 ```
 
 Uses `DRIVE9_TEST_MYSQL_DSN` if set, otherwise spins up a container via testcontainers.
+Set `TEST_RUN` to pass a `go test -run` regex and `TEST_PKGS` to narrow the target packages
+while still reusing the Podman-aware test setup from `make test`.
 
 ### Failpoint tests
 

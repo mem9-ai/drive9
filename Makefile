@@ -38,6 +38,8 @@ IMAGE_TAG ?= latest
 IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
 LINT_TIMEOUT ?= 10m
 TEST_P ?=
+TEST_RUN ?=
+TEST_PKGS ?= ./...
 
 BUILDINFO_LDFLAGS = -X github.com/mem9-ai/dat9/pkg/buildinfo.Version=$(if $(VERSION),$(VERSION),dev) \
 	-X github.com/mem9-ai/dat9/pkg/buildinfo.GitHash=$(GIT_HASH) \
@@ -50,16 +52,21 @@ mod:
 	$(GO) mod tidy
 	$(GO) mod download
 
-# Run all tests. MySQL-backed suites reuse DRIVE9_TEST_MYSQL_DSN when provided. When
+# Run tests. MySQL-backed suites reuse DRIVE9_TEST_MYSQL_DSN when provided. When
 # it is unset and podman is available locally, automatically configure the
-# podman-backed testcontainers environment before running go test. Set TEST_P
-# to pass `-p <value>` to `go test`; by default package parallelism is not
-# limited.
+# podman-backed testcontainers environment before running go test.
+# - TEST_P to pass `-p <value>` to `go test`
+# - TEST_RUN to pass `-run <regex>` to `go test`
+# - TEST_PKGS to choose the packages under test (defaults to `./...`).
 test:
 	@set -euo pipefail; \
 	test_p_flag=""; \
+	test_run_flag=""; \
 	if [ -n "$(TEST_P)" ]; then \
 		test_p_flag="-p $(TEST_P)"; \
+	fi; \
+	if [ -n "$(TEST_RUN)" ]; then \
+		test_run_flag="-run $(TEST_RUN)"; \
 	fi; \
 	if [ -z "$${DRIVE9_TEST_MYSQL_DSN:-}" ] && command -v podman >/dev/null 2>&1; then \
 		if podman_env="$$(bash -lc 'source ./scripts/test-podman.sh && env | grep -E "^(DOCKER_HOST|TESTCONTAINERS_RYUK_DISABLED)="')"; then \
@@ -70,7 +77,7 @@ test:
 			echo "make test: Podman testcontainers setup unavailable, falling back to default runtime" >&2; \
 		fi; \
 	fi; \
-	$(GO) test $$test_p_flag -v ./...
+	$(GO) test $$test_p_flag $$test_run_flag -v $(TEST_PKGS)
 
 # Run only failpoint-tagged tests through repository-wide instrumentation.
 # Do not run this concurrently with the normal test target because failpoint-ctl
