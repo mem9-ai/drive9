@@ -124,6 +124,8 @@ Owner sends this message to the delegatee over a secure channel. The delegatee c
 
 Delegatees **SHOULD NOT** paste the JWT as a positional argument in an interactive shell — it would land in shell history and in `/proc/<pid>/cmdline` while the import is running. `ctx import --from-file <path>` and `ctx import --from-file -` (stdin) are the safe forms; see §13.3.
 
+The default human output is **not a stable parse target** — the exact layout (label prefix, `---` separator, field ordering) may change for readability. Scripts **MUST** use `--json` or `--token-only`.
+
 ### Machine output
 
 ```bash
@@ -296,9 +298,11 @@ In all three modes, the JWT must be a single token with surrounding whitespace t
 Contract rules:
 
 - Input **MUST** be a delegated JWT. If the payload indicates `principal_type=owner` (or any non-delegated credential), `ctx import` **MUST** refuse and instruct the user to use `ctx add --api-key`. `ctx import` is not a universal credential importer.
-- If the JWT's `exp` is already in the past at import time, `ctx import` **MUST** refuse (local short-circuit #1 — see §17).
+- If the JWT's `exp` is already in the past at import time, `ctx import` **MUST** refuse (local short-circuit #1 — see §17). The `exp` check uses the local wall clock with no skew tolerance in v0; delegatees with badly skewed clocks will see spurious refusals or admissions and are expected to fix their clocks (NTP).
 - Default context name is the JWT's `label_hint`; on collision or absence, fall back to `<agent>-<scope-root>` with a numeric suffix as needed. `--name` overrides.
 - The positional-argument form **SHOULD NOT** be used in interactive shells — the JWT would be recorded in shell history and exposed via `/proc/<pid>/cmdline` while the process runs. Owners **SHOULD** distribute grants as files or piped input; the default grant output (§6) is formatted accordingly.
+
+**Issuer trust note (client-side first-use trust).** `ctx import` populates the delegated context's `server` field from the JWT's `iss` claim with **no network round-trip and no allow-list check**. This is trust-on-first-use: a fresh delegatee who imports a maliciously crafted JWT with attacker-controlled `iss` (self-signed by the attacker) will write an attacker server URL into their config, and subsequent requests will be routed there. Invariant #7 ("server MUST re-validate") does **not** protect against this path — the server being contacted is itself attacker-controlled and will happily validate its own signatures. Mitigation is out of scope for v1 and lives with the owner's distribution channel: grants **MUST** be transmitted through a channel that authenticates the sender (password-manager share, Signal, GPG-signed email — not plaintext email, not public paste services). A follow-up hardening path (issuer allow-list pinned at `ctx add --api-key` time, or an explicit `--expect-issuer` flag on `ctx import`) is tracked as a non-blocking follow-up; it is additive to the current payload and does not change §13.1 / §13.2 / §16.
 
 ## 14. Environment Variables — Explicit Override
 
@@ -412,6 +416,8 @@ However:
 
 This is locked as Invariant #7.
 
+**Client endpoint trust is outside §16.** The three `MUST` clauses above bind the server's side of the contract. They do **not** protect a client from being pointed at a rogue server via a malicious `iss` claim — because a rogue server will happily "re-validate" its own signatures. On the delegatee bootstrap path, `ctx import` trusts the JWT's `iss` on first use with no allow-list check; see §13.3 for the TOFU note and the recommended follow-up hardening. Mitigation in v0 rests on the owner's grant-distribution channel authenticating the sender.
+
 ## 17. Auth Lifecycle — Local Short-Circuits vs Server Checks
 
 A mount is bound to one credential at mount time and does not silently follow later context changes (Invariant #3). Running `ctx use <other>` after mounting **does not re-bind** the mount; the owner must call `vault reauth <mountpoint>` (§12) to rebind to the current active context. This is the intended behaviour — it keeps the authority model predictable for long-running mounts — and is captured in Invariant #6.
@@ -456,6 +462,7 @@ The three local short-circuits (`ctx import` / `ctx ls` / `ctx use`) are client-
 - No wildcard scopes in v0 (`*` in key/scope is rejected at parse time).
 - No client-side authorization (Invariant #7).
 - No automatic token auto-mint on behalf of the owner; every delegated credential must come from an explicit `vault grant`.
+- No client-side issuer pinning or allow-list in v0. `ctx import` trusts the JWT `iss` on first use (§13.3 TOFU note). A follow-up spec may introduce `ctx add --trusted-issuer` and/or an `--expect-issuer` flag on `ctx import`; both are additive and do not change §13.1 or §16.
 
 ## 21. Open Questions (Spec-Level)
 
