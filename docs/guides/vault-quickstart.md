@@ -8,7 +8,7 @@ This guide walks through using `drive9 vault` end-to-end. For the normative spec
 - A **key** is a file inside that directory (e.g. `prod-db/DB_URL`).
 - You read/write keys with ordinary POSIX commands (`cat`, `printf >`, `ls`, `rm`).
 - The control plane has 5 verbs: `put`, `grant`, `revoke`, `with`, `reauth`.
-- Credentials live in `~/.drive9/config` as **contexts**. The active context determines what you can see.
+- Credentials live in `~/.drive9/config` as **contexts**. The active context governs what **new** `mount` and invocation-time verbs (`vault grant`, `vault with`, `ctx import`) authenticate as. Already-mounted mounts are bound to whichever credential was active at mount time and keep that binding until `vault reauth` (Invariant #3 / §17 in the spec).
 
 ---
 
@@ -27,8 +27,8 @@ Verify:
 
 ```bash
 drive9 ctx ls
-# NAME         TYPE   SCOPE  PERM  EXPIRES_AT  STATUS
-# owner-prod   owner  *      rw    —           active *
+# CURRENT   NAME         TYPE   SCOPE  PERM  EXPIRES_AT  STATUS
+# *         owner-prod   owner  *      rw    —           active
 ```
 
 ### 2. Mount
@@ -74,6 +74,8 @@ drive9 vault with /n/vault/prod-db -- ./myapp
 ```
 
 Reads `@env`, forks, injects into the child’s environment, execs. The parent shell never sees the values.
+
+The child's environment is deliberately **not** inherited wholesale: `vault with` strips `DRIVE9_API_KEY`, `DRIVE9_VAULT_TOKEN`, and `DRIVE9_SERVER` before injecting `@env`, so a child process cannot accidentally pick up the caller's drive9 credentials for a different principal. If the child itself needs to talk to drive9, it should read `@env` entries or use its own `ctx`.
 
 ### 7. Delete
 
@@ -191,11 +193,11 @@ Owners and delegatees run the **same** commands. Only the active context differs
 
 ```bash
 drive9 ctx ls
-# NAME            TYPE        SCOPE                 PERM   EXPIRES_AT            STATUS
-# alice-prod-db   delegated   prod-db/DB_URL        read   2026-04-18T19:00:00Z  active *
+# CURRENT   NAME            TYPE        SCOPE                 PERM   EXPIRES_AT            STATUS
+# *         alice-prod-db   delegated   prod-db/DB_URL        read   2026-04-18T19:00:00Z  active
 ```
 
-`ctx ls` is offline — it reads the local config only. Status (`active` / `expired`) is computed from `expires_at` at display time.
+`ctx ls` is offline — it reads the local config only. `CURRENT` marks the active context; `STATUS` (`active` / `expired`) is computed from `expires_at` at display time and is independent of `CURRENT`.
 
 ---
 
@@ -245,6 +247,8 @@ Credential priority (first match wins):
 3. Active context in `~/.drive9/config`
 
 `DRIVE9_SERVER` is resolved independently: if set, it overrides the active context's `server` field even when credentials come from the active context.
+
+"First match wins" applies to **presence**, not to validity. A set-but-invalid `DRIVE9_VAULT_TOKEN` (malformed, expired, revoked, or issued by an unknown server) fails as `Permission denied` — it does not silently fall through to `DRIVE9_API_KEY` or the active context. To use the owner credential, unset `DRIVE9_VAULT_TOKEN`.
 
 Example CI job:
 

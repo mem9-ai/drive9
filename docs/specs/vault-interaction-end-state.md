@@ -1,6 +1,6 @@
 # drive9 vault — End-State Interaction Spec
 
-Status: Proposed (four-way review: dev1 author, architect-1 / dev2 / adversary-2 review)
+Status: Proposed (dev1 author; architect-1 / dev2 / adversary-1 / adversary-2 reviewed)
 Scope: End-state CLI only. No current-implementation references, no transition/migration, no P0 tactics.
 
 This spec is the single source of truth for the terminal shape of vault UX. It is the merged canonical of:
@@ -177,6 +177,8 @@ drive9 vault with /n/vault/prod-db -- ./myapp
 
 Semantics: read `@env`, fork, inject env vars into the child, exec. When the child exits, the env is gone (the parent shell never sees the values).
 
+`vault with` **MUST** strip `DRIVE9_API_KEY`, `DRIVE9_VAULT_TOKEN`, and `DRIVE9_SERVER` from the child's environment before injecting `@env`. Rationale: the parent shell may hold drive9 credentials for a different principal (e.g. the caller is a delegatee in one tenant and an owner in another); inheriting those alongside the injected `@env` would give the child ambient authority beyond the scope of the grant being used. The strip is unconditional — it applies even when the parent's `DRIVE9_*` variables are unset, absent, or identical to the current mount's credential — to keep the child's environment a function of `@env` alone.
+
 ## 10. Audit
 
 ```bash
@@ -199,6 +201,8 @@ cat /n/vault/prod-db/@grants/grt_7f2a
 # last_used:  2026-04-18T18:05:12Z from 10.0.3.42
 ```
 
+`@audit` (global and per-secret) and `@grants/` are **owner-only**. Delegated principals receive `ENOENT` for these pseudo-entries and their contents — including `ls @grants/` returning no entries and `cat @grants/<id>` returning `ENOENT` for every grant id, even the delegatee's own. This is a direct application of the existence-oracle rule (Invariant #2 / §11): audit metadata and grant identity/activity would otherwise leak other agents' IDs, scopes, and source IPs to every delegatee in the tenant. The rule reuses the locked `ENOENT` case in §11; no new errno is introduced.
+
 ## 11. Errno Table (Normative)
 
 | Scenario | errno |
@@ -216,6 +220,8 @@ Core rules:
 - **Stale auth**: `EACCES`, distinguished from “not found.”
 
 This table is locked. The auth lifecycle (§17) layers **local short-circuits** (e.g. `ctx use` on an expired context refuses client-side) **on top of** the server-side stale-auth case — those short-circuits do not introduce a new errno.
+
+**Annotation convention.** Where example outputs in this spec and the quickstart show errno lines followed by parenthetical guidance (e.g. `cat: Permission denied  (run 'drive9 vault reauth' after updating the context)`), the parenthetical is a **documentation annotation** intended for the reader, not literal `cat`/`ls` stderr output. The POSIX `cat`/`ls` utilities emit only the errno text; the reauth hint is a spec-level explanation of what the user should do next, delivered out-of-band (man page, quickstart, CLI `drive9 vault reauth` documentation). No new verb is introduced to deliver this hint inline.
 
 ## 12. Recovery After Credential Rotation
 
@@ -269,14 +275,14 @@ All three `ctx import` forms are equivalent in effect. The file-based and stdin 
 `ctx ls` output:
 
 ```
-NAME              TYPE        SCOPE                      PERM   EXPIRES_AT            STATUS
-owner-prod        owner       *                          rw     —                     active
-alice-prod-db     delegated   prod-db/DB_URL             read   2026-04-18T19:00:00Z  active *
-alice-multi       delegated   prod-db/DB_URL +1          read   2026-04-18T19:00:00Z  active
-rotator-pwd       delegated   prod-db/DB_PASSWORD        write  2026-04-18T18:10:00Z  expired
+CURRENT   NAME              TYPE        SCOPE                      PERM   EXPIRES_AT            STATUS
+          owner-prod        owner       *                          rw     —                     active
+*         alice-prod-db     delegated   prod-db/DB_URL             read   2026-04-18T19:00:00Z  active
+          alice-multi       delegated   prod-db/DB_URL +1          read   2026-04-18T19:00:00Z  active
+          rotator-pwd       delegated   prod-db/DB_PASSWORD        write  2026-04-18T18:10:00Z  expired
 ```
 
-`*` in the NAME column marks the currently active context. `STATUS` is computed locally from `expires_at` at display time.
+`CURRENT` is a dedicated column (modeled on `kubectl config get-contexts`): exactly one row holds `*`, the rest are blank. `STATUS` is computed locally from `expires_at` at display time and is independent of `CURRENT`.
 
 SCOPE rendering:
 
@@ -325,6 +331,8 @@ Credential resolution (first match wins):
 3. Active context in `~/.drive9/config`
 
 Rule 1 vs 2 implements narrower-wins so that a scoped token never falls back to owner authority within the env channel. Rule 3 means the active context only applies when no env override is present.
+
+A set-but-invalid `DRIVE9_VAULT_TOKEN` (malformed, expired, revoked, or signed by an unknown issuer) fails as `EACCES` via the standard stale-auth path in §11. It **MUST NOT** fall through to `DRIVE9_API_KEY` or to the active context — "first match wins" is token-presence, not token-validity. Users who want the broader owner authority must unset `DRIVE9_VAULT_TOKEN` explicitly.
 
 Server URL resolution is **orthogonal** to credential resolution:
 
@@ -429,10 +437,11 @@ Local short-circuits exist to make UX responsive. They are layered **on top of**
 | `ctx import <jwt>` | `exp` in past? | local refuse (no new errno; command error) |
 | `ctx ls` | `exp` in past? | row marked `expired` |
 | `ctx use <name>` | target context expired? | local error, do not activate |
+| `vault reauth <mountpoint>` | active context valid locally? | local refuse if target context is already locally expired; otherwise proceed and let the server bind |
 | `mount` | context valid locally? | proceed; server then validates |
 | Any FS op | server says stale / revoked | `EACCES` + reauth hint (§11) |
 
-The three local short-circuits (`ctx import` / `ctx ls` / `ctx use`) are client-side UX. They do **not** introduce a new errno case. The locked 6-row errno table in §11 is unchanged.
+The four local short-circuits (`ctx import` / `ctx ls` / `ctx use` / `vault reauth`) are client-side UX. They do **not** introduce a new errno case. The locked 6-row errno table in §11 is unchanged.
 
 ## 18. Invariants (Normative, numbered)
 
