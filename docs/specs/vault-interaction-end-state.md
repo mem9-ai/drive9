@@ -113,12 +113,16 @@ drive9 vault grant /n/vault/prod-db/DB_PASSWORD --agent rotator --perm write --t
 ### Default output (human)
 
 ```
-drive9 ctx import <jwt>
+drive9 ctx import --from-file -
+<jwt>
+---
 grant_id:   grt_7f2a...
 expires_at: 2026-04-18T19:00:00Z
 ```
 
-The first line is a ready-to-paste command the delegatee runs to install the grant into their own `~/.drive9/config` (see §13). The JWT is displayed once and not re-fetchable.
+Owner sends this message to the delegatee over a secure channel. The delegatee copies the JWT line and pipes it into `ctx import` (see §13.3 for supported input modes). The JWT is displayed once by the server and is not re-fetchable.
+
+Delegatees **SHOULD NOT** paste the JWT as a positional argument in an interactive shell — it would land in shell history and in `/proc/<pid>/cmdline` while the import is running. `ctx import --from-file <path>` and `ctx import --from-file -` (stdin) are the safe forms; see §13.3.
 
 ### Machine output
 
@@ -230,44 +234,67 @@ Each context entry contains:
 |---|---|---|
 | `name` | required | required |
 | `type` | `owner` | `delegated` |
-| `server` | required | required |
+| `server` | required (from `--server`) | required (from JWT `iss`) |
 | `api_key` | required | — |
 | `token` (JWT) | — | required |
+| `agent` | — | required (from JWT) |
 | `scope[]` | — | required (from JWT) |
 | `perm` | — | required (from JWT) |
 | `expires_at` | — | required (from JWT) |
 | `grant_id` | — | required (from JWT) |
 | `label_hint` | — | optional (from JWT, used as default `name`) |
 
-The delegated fields are populated by locally decoding the JWT payload. See Invariant #7 — this decoding is UX-only; authorization is still server-side.
+The delegated fields are populated by locally decoding the JWT payload (see §16 for the claim list). This decoding is UX-only; authorization is still server-side (Invariant #7).
 
 ### 13.2 Context verbs
 
 ```bash
 drive9 ctx add --api-key <key> [--name <n>] [--server <url>]      # add owner context
-drive9 ctx import <jwt>                                           # add delegated context (primary UX for grants)
-drive9 ctx add --from-token <jwt> [--name <n>]                    # low-level alias of ctx import (not promoted)
-drive9 ctx ls                                                     # list contexts (offline — reads only local config)
+drive9 ctx import --from-file <path>                              # add delegated context from a file (recommended)
+drive9 ctx import --from-file -                                   # add delegated context from stdin (recommended)
+drive9 ctx import <jwt>                                           # convenience form; JWT leaks to shell history
+drive9 ctx ls [-l|--json]                                         # list contexts (offline — reads only local config)
 drive9 ctx use <name>                                             # activate a context
 drive9 ctx rm <name>                                              # delete a context
 ```
 
+All three `ctx import` forms are equivalent in effect. The file-based and stdin forms are safer for bearer credentials because the JWT never touches the shell's history file or `/proc/<pid>/cmdline`. The positional-argument form is retained for scripting and local testing only.
+
 `ctx ls` output:
 
 ```
-NAME              TYPE        SCOPE                         PERM   EXPIRES_AT            STATUS
-owner-prod        owner       *                             rw     —                     active
-alice-prod-db     delegated   prod-db/DB_URL                read   2026-04-18T19:00:00Z  active *
-rotator-pwd       delegated   prod-db/DB_PASSWORD           write  2026-04-18T18:10:00Z  expired
+NAME              TYPE        SCOPE                      PERM   EXPIRES_AT            STATUS
+owner-prod        owner       *                          rw     —                     active
+alice-prod-db     delegated   prod-db/DB_URL             read   2026-04-18T19:00:00Z  active *
+alice-multi       delegated   prod-db/DB_URL +1          read   2026-04-18T19:00:00Z  active
+rotator-pwd       delegated   prod-db/DB_PASSWORD        write  2026-04-18T18:10:00Z  expired
 ```
 
-`*` marks the currently active context. `STATUS` is computed locally from `expires_at` at display time.
+`*` in the NAME column marks the currently active context. `STATUS` is computed locally from `expires_at` at display time.
+
+SCOPE rendering:
+
+- Single-scope delegated contexts show the full scope path.
+- Multi-scope delegated contexts (§6 allows multiple scopes per grant) show the first scope followed by `+N`, where `N` is the count of remaining scopes.
+- Owner contexts render as `*` (unbounded).
+- To see the full scope list, use `drive9 ctx ls -l` (long form) or `drive9 ctx ls --json`.
 
 ### 13.3 `ctx import` contract (MUST)
 
-- Input **MUST** be a delegated-JWT. If the payload indicates `principal_type=owner` (or any non-delegated credential), `ctx import` **MUST** refuse and instruct the user to use `ctx add --api-key`. `ctx import` is not a universal credential importer.
-- If the JWT’s `exp` is already in the past at import time, `ctx import` **MUST** refuse (local short-circuit #1).
-- Default context name is the JWT’s `label_hint`; on collision or absence, fall back to `<agent>-<scope-root>` with a numeric suffix as needed. `--name` overrides.
+Input modes:
+
+- `drive9 ctx import --from-file <path>` reads the JWT from a file.
+- `drive9 ctx import --from-file -` reads the JWT from stdin.
+- `drive9 ctx import <jwt>` reads the JWT from the positional argument (convenience; see security note below).
+
+In all three modes, the JWT must be a single token with surrounding whitespace trimmed.
+
+Contract rules:
+
+- Input **MUST** be a delegated JWT. If the payload indicates `principal_type=owner` (or any non-delegated credential), `ctx import` **MUST** refuse and instruct the user to use `ctx add --api-key`. `ctx import` is not a universal credential importer.
+- If the JWT's `exp` is already in the past at import time, `ctx import` **MUST** refuse (local short-circuit #1 — see §17).
+- Default context name is the JWT's `label_hint`; on collision or absence, fall back to `<agent>-<scope-root>` with a numeric suffix as needed. `--name` overrides.
+- The positional-argument form **SHOULD NOT** be used in interactive shells — the JWT would be recorded in shell history and exposed via `/proc/<pid>/cmdline` while the process runs. Owners **SHOULD** distribute grants as files or piped input; the default grant output (§6) is formatted accordingly.
 
 ## 14. Environment Variables — Explicit Override
 
@@ -277,19 +304,26 @@ Environment variables are **not** the primary credential channel. They exist as 
 
 - `DRIVE9_API_KEY` — owner credential override.
 - `DRIVE9_VAULT_TOKEN` — delegated credential override (JWT).
-- `DRIVE9_SERVER` — server URL override.
+- `DRIVE9_SERVER` — server URL override (orthogonal to credentials — see §14.2).
 
 The **dual-principal separation is locked**: there is no single combined variable. `DRIVE9_VAULT_TOKEN` and `DRIVE9_API_KEY` remain distinct knobs; collapsing them is prohibited.
 
 ### 14.2 Priority
 
-The effective credential at mount / reauth time is resolved in this order (first match wins):
+Credential resolution (first match wins):
 
 1. `DRIVE9_VAULT_TOKEN` (narrower — delegated)
 2. `DRIVE9_API_KEY` (broader — owner)
 3. Active context in `~/.drive9/config`
 
-Rule 1 vs 2 implements narrower-wins so that a scoped token never falls back to owner authority within the env channel. Rule 3 means `current_context` only applies when no env override is present.
+Rule 1 vs 2 implements narrower-wins so that a scoped token never falls back to owner authority within the env channel. Rule 3 means the active context only applies when no env override is present.
+
+Server URL resolution is **orthogonal** to credential resolution:
+
+1. `DRIVE9_SERVER` (if set)
+2. The `server` field of the active context
+
+`ctx use` does **not** lock server and credential together: if `DRIVE9_SERVER` is set, it overrides the context's `server` field even when the active context is used for credentials. If the resulting (server, credential) pair is mismatched (e.g. a JWT signed by a different issuer), the server rejects the request with `EACCES` via the standard stale-auth path (§11). No new error model is introduced.
 
 ### 14.3 Activation mechanics
 
@@ -345,7 +379,20 @@ cat /n/vault/prod-db/DB_URL
 
 ## 16. Security Note (Normative MUST)
 
-The JWT payload is self-describing. Clients **MAY** decode it locally to populate `ctx` metadata (`scope[]`, `perm`, `expires_at`, `grant_id`, `label_hint`) and to render `ctx ls` offline.
+The JWT payload is self-describing and **MUST** contain the following claims:
+
+| Claim | Purpose |
+|---|---|
+| `iss` | Issuer server URL; used by `ctx import` to populate the context's `server` field with no network call. |
+| `grant_id` | Server-assigned grant identifier (e.g. `grt_7f2a`); appears in audit and is the argument to `vault revoke`. |
+| `principal_type` | `delegated` (see §13.3 for the refusal rule on other kinds). |
+| `agent` | Agent ID as named by the owner at `vault grant --agent`; appears in audit and is the default prefix for context `name`. |
+| `scope[]` | List of granted paths (whole-secret or single-key; §6). |
+| `perm` | `read` or `write`. |
+| `exp` | Unix expiration timestamp. |
+| `label_hint` | Optional short display label; used as default context `name` when present. |
+
+Clients **MAY** decode this payload locally to populate `ctx` metadata and to render `ctx ls` offline.
 
 However:
 
@@ -356,6 +403,8 @@ However:
 This is locked as Invariant #7.
 
 ## 17. Auth Lifecycle — Local Short-Circuits vs Server Checks
+
+A mount is bound to one credential at mount time and does not silently follow later context changes (Invariant #3). Running `ctx use <other>` after mounting **does not re-bind** the mount; the owner must call `vault reauth <mountpoint>` (§12) to rebind to the current active context. This is the intended behaviour — it keeps the authority model predictable for long-running mounts — and is captured in Invariant #6.
 
 Local short-circuits exist to make UX responsive. They are layered **on top of** the normative errno table (§11), not instead of it.
 

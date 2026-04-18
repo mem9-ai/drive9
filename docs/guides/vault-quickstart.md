@@ -99,12 +99,16 @@ drive9 vault grant /n/vault/prod-db/DB_URL --agent alice --perm read --ttl 1h
 Output (human default):
 
 ```
-drive9 ctx import vt_eyJhbGc...
+drive9 ctx import --from-file -
+vt_eyJhbGc...
+---
 grant_id:   grt_7f2a
 expires_at: 2026-04-18T19:00:00Z
 ```
 
-The first line is a ready-to-paste command. Send it to Alice over a secure channel. The token is displayed once and is not re-fetchable.
+Send the whole block to Alice over a secure channel (email with a password-protected attachment, password manager share, Signal, etc.). Alice will save the JWT to a file and pipe it into `ctx import` (see Part 3). The JWT is displayed once and is not re-fetchable — if it is lost, issue a new grant.
+
+Avoid distributing the JWT as a copyable one-liner (`drive9 ctx import <jwt>`). That form is valid (see Part 3) but records the token in the delegatee's shell history and process argument list.
 
 ### Script-friendly output
 
@@ -138,15 +142,32 @@ cat /n/vault/prod-db/@grants/grt_7f2a
 
 ## Part 3 — Delegatee workflow
 
-Alice receives `drive9 ctx import vt_eyJhbGc...` from the owner.
+Alice receives a grant message from the owner containing the JWT.
 
-### 1. Import the grant
+### 1. Save and import the grant
+
+Save the JWT to a file (e.g. from a password manager download):
 
 ```bash
-drive9 ctx import vt_eyJhbGc...
+# Save the JWT body to a file that only Alice can read
+install -m 600 /dev/null ~/alice-grant.jwt
+# paste the JWT into the editor, or save it from your password manager
+$EDITOR ~/alice-grant.jwt
+
+drive9 ctx import --from-file ~/alice-grant.jwt
+rm ~/alice-grant.jwt
 ```
 
-This writes a **delegated** context to Alice’s `~/.drive9/config`. The JWT is decoded locally; no server round-trip is required. If the token is already expired, import is refused immediately.
+Or, if the JWT is already on the clipboard and the shell supports it, pipe via stdin:
+
+```bash
+pbpaste | drive9 ctx import --from-file -
+# or on Linux: xclip -o | drive9 ctx import --from-file -
+```
+
+Either form writes a **delegated** context to Alice's `~/.drive9/config`. The JWT is decoded locally; no server round-trip is required. If the token is already expired, import is refused immediately. The JWT never lands in shell history or `/proc/<pid>/cmdline`.
+
+`drive9 ctx import <jwt>` (positional) also works, but it will be recorded in shell history. Use it only for scripting and testing.
 
 ### 2. Activate and mount
 
@@ -198,7 +219,11 @@ cat /n/vault/prod-db/DB_URL
 If the delegatee receives a new grant, they import it, switch, and rebind the running mount without unmounting:
 
 ```bash
-drive9 ctx import vt_newJwt...
+install -m 600 /dev/null ~/alice-grant-v2.jwt
+$EDITOR ~/alice-grant-v2.jwt
+drive9 ctx import --from-file ~/alice-grant-v2.jwt
+rm ~/alice-grant-v2.jwt
+
 drive9 ctx use alice-prod-db-v2
 drive9 vault reauth /n/vault
 ```
@@ -207,17 +232,19 @@ drive9 vault reauth /n/vault
 
 ## Part 5 — Environment variable overrides (CI / one-off)
 
-Contexts are the primary channel. For ephemeral or non-interactive shells, two env vars act as overrides:
+Contexts are the primary channel. For ephemeral or non-interactive shells, three env vars act as overrides:
 
 - `DRIVE9_API_KEY` — owner credential override
 - `DRIVE9_VAULT_TOKEN` — delegated credential override (JWT)
-- `DRIVE9_SERVER` — server URL override
+- `DRIVE9_SERVER` — server URL override (resolved independently of credentials)
 
-Priority (first match wins):
+Credential priority (first match wins):
 
 1. `DRIVE9_VAULT_TOKEN` (narrower — delegated)
 2. `DRIVE9_API_KEY` (broader — owner)
 3. Active context in `~/.drive9/config`
+
+`DRIVE9_SERVER` is resolved independently: if set, it overrides the active context's `server` field even when credentials come from the active context.
 
 Example CI job:
 
@@ -251,7 +278,9 @@ drive9 vault put /n/vault/prod-db --from ./prod-db.envdir
 cat /n/vault/prod-db/DB_URL
 
 drive9 vault grant /n/vault/prod-db/DB_URL --agent alice --perm read --ttl 1h
-# -> drive9 ctx import vt_...
+# -> drive9 ctx import --from-file -
+#    vt_eyJhbGc...
+#    ---
 #    grant_id:   grt_7f2a
 #    expires_at: 2026-04-18T19:00:00Z
 ```
@@ -259,7 +288,12 @@ drive9 vault grant /n/vault/prod-db/DB_URL --agent alice --perm read --ttl 1h
 ### Alice terminal
 
 ```bash
-drive9 ctx import vt_...
+# Save the JWT (e.g. from a secure channel into a file with 0600 perms)
+install -m 600 /dev/null ~/alice-grant.jwt
+$EDITOR ~/alice-grant.jwt
+drive9 ctx import --from-file ~/alice-grant.jwt
+rm ~/alice-grant.jwt
+
 drive9 ctx use alice-prod-db
 drive9 mount vault /n/vault
 
