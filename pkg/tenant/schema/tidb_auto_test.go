@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -94,6 +95,43 @@ func TestInitTiDBTenantSchemaStatementsForModeIncludesVault(t *testing.T) {
 			}
 			if !strings.Contains(sqlText, "CREATE TABLE IF NOT EXISTS vault_audit_log") {
 				t.Fatalf("mode %q missing vault_audit_log in init schema", mode)
+			}
+		})
+	}
+}
+
+func TestIsIgnorableOptionalSchemaError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "columnar replica syntax",
+			err:  errors.New("Error 1064 (42000): syntax error near \"ADD_COLUMNAR_REPLICA_ON_DEMAND\""),
+			want: true,
+		},
+		{
+			name: "fulltext unsupported",
+			err:  errors.New("FULLTEXT index is not supported"),
+			want: true,
+		},
+		{
+			name: "vector index unsupported",
+			err:  errors.New("VECTOR INDEX is not supported"),
+			want: true,
+		},
+		{
+			name: "unrelated error",
+			err:  errors.New("permission denied"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isIgnorableOptionalSchemaError(tt.err); got != tt.want {
+				t.Fatalf("isIgnorableOptionalSchemaError()=%v, want %v", got, tt.want)
 			}
 		})
 	}
