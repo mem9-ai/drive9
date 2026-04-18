@@ -444,6 +444,7 @@ func TestCentralQuotaUploadCompleteUpdatesShadowState(t *testing.T) {
 
 func TestMonthlyLLMCostExceededUsesCentralCounter(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
+	b.quotaSource = QuotaSourceServer // enable server-side cost check
 	b.maxMonthlyLLMCostMillicents = 100
 	fake.monthly["tenant-a"] = 101
 	if !b.monthlyLLMCostExceeded() {

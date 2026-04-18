@@ -58,6 +58,12 @@ func TestServerModeBudgetGateWritesCentralOnly(t *testing.T) {
 		},
 	})
 
+	// Override per-tenant config to match the test's budget limit; otherwise the
+	// server-side check uses the shared default (1 << 30) from newServerQuotaBackend.
+	fake.mu.Lock()
+	fake.config["tenant-a"].MaxMonthlyCostMC = 100
+	fake.mu.Unlock()
+
 	b.recordImageExtractUsage("task-server-budget", ImageExtractUsage{
 		PromptTokens:     120,
 		CompletionTokens: 80,
