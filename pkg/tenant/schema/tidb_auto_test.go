@@ -4,6 +4,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	mysql "github.com/go-sql-driver/mysql"
 )
 
 func TestDetectTiDBEmbeddingModeFromFilesMeta(t *testing.T) {
@@ -108,22 +110,42 @@ func TestIsIgnorableOptionalSchemaError(t *testing.T) {
 	}{
 		{
 			name: "columnar replica syntax",
-			err:  errors.New("Error 1064 (42000): syntax error near \"ADD_COLUMNAR_REPLICA_ON_DEMAND\""),
+			err:  &mysql.MySQLError{Number: 1064, Message: "syntax error near \"ADD_COLUMNAR_REPLICA_ON_DEMAND\""},
 			want: true,
 		},
 		{
 			name: "fulltext unsupported",
-			err:  errors.New("FULLTEXT index is not supported"),
+			err:  &mysql.MySQLError{Number: 1105, Message: "FULLTEXT index is not supported"},
 			want: true,
 		},
 		{
 			name: "vector index unsupported",
-			err:  errors.New("VECTOR INDEX is not supported"),
+			err:  &mysql.MySQLError{Number: 8200, Message: "VECTOR INDEX is not supported"},
 			want: true,
+		},
+		{
+			name: "vec cosine unsupported",
+			err:  errors.New("vec_cosine_distance is not supported"),
+			want: true,
+		},
+		{
+			name: "parser multilingual unsupported",
+			err:  errors.New("WITH PARSER multilingual is not supported"),
+			want: true,
+		},
+		{
+			name: "mysql syntax without optional markers",
+			err:  &mysql.MySQLError{Number: 1064, Message: "syntax error near \"ALTER TABLE files ADD INDEX idx_status\""},
+			want: false,
 		},
 		{
 			name: "unrelated error",
 			err:  errors.New("permission denied"),
+			want: false,
+		},
+		{
+			name: "mysql unrelated code with keyword should not skip",
+			err:  &mysql.MySQLError{Number: 1146, Message: "FULLTEXT index is not supported"},
 			want: false,
 		},
 	}

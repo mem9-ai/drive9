@@ -112,7 +112,7 @@ func main() {
 			// remain strict.
 			initOpts.AllowUnsupportedOptionalIndexes = true
 		}
-		if err := localTiDBSchemaInitializer(localDSN, initMode, initOpts); err != nil {
+		if err := localTiDBSchemaInitializer(startupCtx, localDSN, initMode, initOpts); err != nil {
 			die(fmt.Errorf("init local tenant schema: %w", err))
 		}
 		logLocalStartupStep(startupCtx, startupStart, stepStart, "init_local_tenant_schema",
@@ -440,7 +440,7 @@ func (c localS3Config) localDir() string {
 var (
 	localTiDBEmbeddingModeDetector = schema.DetectTiDBEmbeddingMode
 	localTiDBSchemaValidator       = schema.EnsureTiDBSchemaForMode
-	localTiDBSchemaInitializer     = schema.InitTiDBTenantSchemaForModeWithOptions
+	localTiDBSchemaInitializer     = schema.InitTiDBTenantSchemaForModeWithOptionsContext
 )
 
 func detectLocalTiDBEmbeddingMode(db *sql.DB, schemaInitialized bool, requestedMode schema.TiDBEmbeddingMode, explicitMode bool) (schema.TiDBEmbeddingMode, error) {

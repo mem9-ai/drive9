@@ -3,9 +3,11 @@ package schema
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"go.uber.org/zap"
 )
@@ -53,7 +55,7 @@ func ExecSchemaStatements(db *sql.DB, stmts []string) error {
 // feature-specific failures that can happen on TiDB deployments without FTS,
 // vector indexing, or columnar replica support. It returns the number of
 // statements skipped for those unsupported features.
-func ExecOptionalSchemaStatements(db *sql.DB, stmts []string) (int, error) {
+func ExecOptionalSchemaStatements(ctx context.Context, db *sql.DB, stmts []string) (int, error) {
 	skipped := 0
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -62,7 +64,7 @@ func ExecOptionalSchemaStatements(db *sql.DB, stmts []string) (int, error) {
 			}
 			if isIgnorableOptionalSchemaError(err) {
 				skipped++
-				logger.Warn(context.Background(), "optional_schema_statement_skipped",
+				logger.Warn(ctx, "optional_schema_statement_skipped",
 					zap.String("statement", schemaStatementSnippet(stmt)),
 					zap.Error(err))
 				continue
@@ -92,12 +94,25 @@ func isIgnorableOptionalSchemaError(err error) bool {
 	if err == nil {
 		return false
 	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && !isIgnorableOptionalMySQLErrorCode(mysqlErr.Number) {
+		return false
+	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "add_columnar_replica_on_demand") ||
 		strings.Contains(msg, "with parser multilingual") ||
 		strings.Contains(msg, "fulltext") ||
 		strings.Contains(msg, "vector index") ||
 		strings.Contains(msg, "vec_cosine_distance")
+}
+
+func isIgnorableOptionalMySQLErrorCode(code uint16) bool {
+	switch code {
+	case 1064, 1105, 1235, 8200:
+		return true
+	default:
+		return false
+	}
 }
 
 func schemaStatementSnippet(stmt string) string {

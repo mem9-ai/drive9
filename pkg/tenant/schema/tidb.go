@@ -1,5 +1,7 @@
 package schema
 
+import "context"
+
 type InitTiDBTenantSchemaOptions struct {
 	// AllowUnsupportedOptionalIndexes is only for local bootstrap flows that need
 	// the app-managed schema without requiring every TiDB deployment to support
@@ -36,11 +38,18 @@ func InitTiDBTenantSchemaForMode(dsn string, mode TiDBEmbeddingMode) error {
 // the requested local embedding mode with caller-controlled compatibility
 // toggles.
 func InitTiDBTenantSchemaForModeWithOptions(dsn string, mode TiDBEmbeddingMode, opts InitTiDBTenantSchemaOptions) error {
+	return InitTiDBTenantSchemaForModeWithOptionsContext(context.Background(), dsn, mode, opts)
+}
+
+// InitTiDBTenantSchemaForModeWithOptionsContext initializes the TiDB tenant
+// schema for the requested local embedding mode with caller-controlled
+// compatibility toggles and log context.
+func InitTiDBTenantSchemaForModeWithOptionsContext(ctx context.Context, dsn string, mode TiDBEmbeddingMode, opts InitTiDBTenantSchemaOptions) error {
 	switch mode {
 	case TiDBEmbeddingModeAuto:
 		return initTiDBAutoEmbeddingSchema(dsn)
 	case TiDBEmbeddingModeApp:
-		return initTiDBAppEmbeddingSchema(dsn, opts)
+		return initTiDBAppEmbeddingSchema(ctx, dsn, opts)
 	default:
 		return validateTiDBSchemaMode(mode)
 	}

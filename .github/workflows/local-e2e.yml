@@ -77,30 +77,29 @@ jobs:
           export PATH="$HOME/.tiup/bin:$PATH"
           tiup telemetry disable || true
           tiup install playground
-          tiup install tidb:${TIDB_VERSION} pd:${TIDB_VERSION} tikv:${TIDB_VERSION}
+          tiup install "tidb:${TIDB_VERSION}" "pd:${TIDB_VERSION}" "tikv:${TIDB_VERSION}"
           tiup --version
 
       - name: Start TiDB playground
         run: |
           export PATH="$HOME/.tiup/bin:$PATH"
-          nohup tiup playground ${TIDB_VERSION} --tiflash 0 --without-monitor > /tmp/tiup-playground.log 2>&1 &
+          nohup tiup playground "${TIDB_VERSION}" --tiflash 0 --without-monitor > /tmp/tiup-playground.log 2>&1 &
           echo $! > /tmp/tiup-playground.pid
 
-      - name: Wait for TiDB readiness
+      - name: Wait for TiDB readiness and create local database
         run: |
           for _ in {1..60}; do
-            if curl -sf http://127.0.0.1:10080/status > /tmp/tidb-status.json; then
+            if curl -sf http://127.0.0.1:10080/status > /tmp/tidb-status.json \
+              && mysql --protocol=tcp -h 127.0.0.1 -P 4000 -u root \
+                -e "CREATE DATABASE IF NOT EXISTS drive9_local;" > /tmp/tidb-sql-ready.log 2>&1; then
               cat /tmp/tidb-status.json
               exit 0
             fi
             sleep 5
           done
           echo "TiDB playground did not become ready in time" >&2
+          cat /tmp/tidb-sql-ready.log >&2 || true
           exit 1
-
-      - name: Create drive9 local database
-        run: |
-          mysql --protocol=tcp -h 127.0.0.1 -P 4000 -u root -e "CREATE DATABASE IF NOT EXISTS drive9_local;"
 
       - name: Start drive9-server-local
         run: |

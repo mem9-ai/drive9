@@ -132,8 +132,8 @@ func tidbAppEmbeddingOptionalSchemaStatements() []string {
 	}
 }
 
-func initTiDBAppEmbeddingSchema(dsn string, opts InitTiDBTenantSchemaOptions) error {
-	db, err := OpenTiDBSchemaDB(context.Background(), dsn)
+func initTiDBAppEmbeddingSchema(ctx context.Context, dsn string, opts InitTiDBTenantSchemaOptions) error {
+	db, err := OpenTiDBSchemaDB(ctx, dsn)
 	if err != nil {
 		return err
 	}
@@ -147,12 +147,12 @@ func initTiDBAppEmbeddingSchema(dsn string, opts InitTiDBTenantSchemaOptions) er
 	if opts.AllowUnsupportedOptionalIndexes {
 		// Local-only compatibility mode can continue without these indexes; other
 		// callers still execute the same statements strictly below.
-		skipped, err := ExecOptionalSchemaStatements(db, tidbAppEmbeddingOptionalSchemaStatements())
+		skipped, err := ExecOptionalSchemaStatements(ctx, db, tidbAppEmbeddingOptionalSchemaStatements())
 		if err != nil {
 			return err
 		}
 		if skipped > 0 {
-			logger.Warn(context.Background(), "tidb_app_optional_indexes_skipped",
+			logger.Warn(ctx, "tidb_app_optional_indexes_skipped",
 				zap.Int("skipped_count", skipped),
 				zap.String("reason", "allow_unsupported_optional_indexes"))
 		}
