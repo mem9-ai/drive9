@@ -217,16 +217,25 @@ Core rules:
 - **Writes**: `EACCES`. The write intent already names the key, so a fake-not-found would be a lie without benefit.
 - **Stale auth**: `EACCES`, distinguished from “not found.”
 
-`ctx import` refusal causes — these are client-side command errors that also map to POSIX errno when the CLI exits:
+`ctx import` refusal causes — these are client-side command errors that also map to POSIX errno when the CLI exits. The CLI exit code convention is `2` for `EINVAL` (usage, per `sysexits.h` `EX_USAGE`) and `1` for `EACCES` / `ENOENT`.
 
-| `ctx import` refusal cause | Errno |
-|---|---|
-| Empty / unparseable / structurally invalid JWT | `EINVAL` |
-| Missing required claim (`iss`, `exp`, `perm`, `principal_type`, `agent`) | `EINVAL` |
-| Token `principal_type` is not `"delegated"` | `EINVAL` |
-| Token `exp` already in the past at import | `EACCES` |
-| `--from-file <path>` names a non-existent or unreadable file | `ENOENT` |
-| Stdin is a TTY and no input flag given | `EINVAL` (with help pointer) |
+| `ctx import` refusal cause | Errno | Exit code |
+|---|---|---|
+| Input empty after whitespace trim | `EINVAL` | `2` |
+| Not a structurally valid JWT (three base64url segments, JSON middle) | `EINVAL` | `2` |
+| Missing `principal_type` claim | `EINVAL` | `2` |
+| `principal_type` is not `"delegated"` | `EINVAL` | `2` |
+| Missing `exp` claim | `EINVAL` | `2` |
+| `exp` already in the past at import | `EACCES` | `1` |
+| Missing `iss` claim | `EINVAL` | `2` |
+| Missing `agent` claim | `EINVAL` | `2` |
+| Missing `grant_id` claim | `EINVAL` | `2` |
+| Missing or empty `scope[]` claim | `EINVAL` | `2` |
+| Missing `perm` claim | `EINVAL` | `2` |
+| `perm` not in `{read, write}` | `EINVAL` | `2` |
+| `--from-file <path>` names a non-existent or unreadable file | `ENOENT` | `1` |
+| `--from-file <path>` has mode group- or world-readable (`mode & 0o077 != 0`) | `EACCES` | `1` |
+| Stdin is a TTY and no input flag given | `EINVAL` (with help pointer) | `2` |
 
 This table is locked. The auth lifecycle (§17) layers **local short-circuits** (e.g. `ctx use` on an expired context refuses client-side) **on top of** the server-side stale-auth case — those short-circuits do not introduce a new errno.
 
@@ -280,6 +289,14 @@ drive9 ctx rm <name>                                              # delete a con
 
 Both `ctx import` forms are equivalent in effect. Stdin is read by default when stdin is a pipe (`isatty(0) == false`); the explicit `--from-file -` form is accepted for scripts that want the intent to be unambiguous. When stdin is a TTY and no `--from-file` is supplied, `ctx import` exits with `EINVAL` and prints a one-line help pointing at the two canonical forms (see §13.3).
 
+**Canonical pipe handoff.** The default human output of `drive9 vault grant` (see §6) is *not* pipe-safe — it prints `grant_id` and `expires_at` lines in addition to the JWT. To pipe grant output directly into `ctx import`, use `drive9 vault grant ... --token-only`, which prints only the bare JWT. The end-to-end canonical pipeline is:
+
+```bash
+drive9 vault grant <scope> --agent <a> --perm <p> --ttl <t> --token-only | drive9 ctx import
+```
+
+The human default form is intentionally non-parseable; it exists so an owner reading their terminal can eyeball the grant id and expiry, not so it can be piped.
+
 `ctx ls` output:
 
 ```
@@ -319,6 +336,8 @@ Contract rules:
 
 - Input **MUST** be a delegated JWT. If the payload indicates `principal_type=owner` (or any non-delegated credential), `ctx import` **MUST** refuse and instruct the user to use `ctx add --api-key`. `ctx import` is not a universal credential importer.
 - If the JWT's `exp` is already in the past at import time, `ctx import` **MUST** refuse (local short-circuit #1 — see §17). The `exp` check uses the local wall clock with no skew tolerance in v0; delegatees with badly skewed clocks will see spurious refusals or admissions and are expected to fix their clocks (NTP).
+- The JWT **MUST** contain all required delegated-context claims: `iss`, `exp`, `principal_type=delegated`, `agent`, `grant_id`, `scope[]` (non-empty array), and `perm` ∈ `{read, write}`. Missing or malformed required claims refuse at import; the full per-claim error mapping is in §11.
+- When `--from-file <path>` is given, the file **MUST** be mode `0600` (no group or world permission bits). If `stat.Mode().Perm() & 0o077 != 0`, `ctx import` refuses **before reading the contents** with `EACCES` and points the user at `chmod 600`. Rationale: a bearer-token file that has leaked to other local users is already-exposed credential; silently consuming it makes the CLI complicit in the lifecycle breach. This matches the argv-removal posture: the tool does not ingest credentials that have already escaped their intended confidentiality boundary.
 - Default context name is the JWT's `label_hint`; on collision or absence, fall back to `<agent>-<scope-root>` with a numeric suffix as needed. `--name` overrides.
 
 **Issuer trust note (client-side first-use trust).** `ctx import` populates the delegated context's `server` field from the JWT's `iss` claim with **no network round-trip and no allow-list check**. This is trust-on-first-use: a fresh delegatee who imports a maliciously crafted JWT with attacker-controlled `iss` (self-signed by the attacker) will write an attacker server URL into their config, and subsequent requests will be routed there. Invariant #7 ("server MUST re-validate") does **not** protect against this path — the server being contacted is itself attacker-controlled and will happily validate its own signatures. Mitigation is out of scope for v0 and lives with the owner's distribution channel: grants **MUST** be transmitted through a channel that authenticates the sender (password-manager share, Signal, GPG-signed email — not plaintext email, not public paste services). A follow-up hardening path (issuer allow-list pinned at `ctx add --api-key` time, or an explicit `--expect-issuer` flag on `ctx import`) is tracked as a non-blocking follow-up; it is additive to the current payload and does not change §13.1 / §13.2 / §16.

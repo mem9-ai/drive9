@@ -55,7 +55,7 @@ Spec (this PR):
 | `docs/specs/pr-b-ctx-implementation.md` | **new** — this document |
 | `docs/specs/pr-b-review-checklist.md` | **new** — mirrors `pr-a-review-checklist.md` shape |
 | `docs/specs/vault-interaction-end-state.md` | **edit** §13.2 / §13.3 / §15 / §6 / §11 — drop positional-JWT import, add TTY/pipe default, consistent Alice example |
-| `docs/guides/vault-quickstart.md` | **edit** lines 113, 172, 329 — drop positional mentions, align with stdin/`--from-file` canonical forms |
+| `docs/guides/vault-quickstart.md` | **edit** lines 113 + 172 — drop positional mentions, align with stdin/`--from-file` canonical forms (line 329 quick-reference already correct, not touched) |
 
 Explicitly NOT touched:
 - `pkg/server/**` — no server change.
@@ -77,7 +77,7 @@ drive9 ctx add --api-key <key> [--name <n>] [--server <url>]
 
 Owner-principal context bootstrap. Writes a `Context{Type: "owner", APIKey: <key>, Server: <resolved>}` entry.
 
-- `--api-key`: **required**. No prompt, no stdin fallback in PR-B (API keys are pasted once at setup; a prompt would be kubectl-style bloat). Empty / missing → error `"--api-key is required"`, exit 1.
+- `--api-key`: **required**. No prompt, no stdin fallback in PR-B (API keys are pasted once at setup; a prompt would be kubectl-style bloat). Empty / missing → error `"--api-key is required"`, CLI exit code `2` (usage).
 - `--name`: optional. On absence, generate a random two-word name (adjective-noun, ~10 bits) so first-time users never have to think of one. On collision with an existing context, append a numeric suffix.
 - `--server`: optional. On absence, inherit from `Config.Server` (populated by a prior `ctx add` or `ctx use`); if that is also empty, fall back to the compiled default `https://drive9.dev` `[fill]` — this matches §14.3 resolution for unset `DRIVE9_SERVER`.
 - If `Config.CurrentContext == ""` at save time, the new context becomes current. Spec §13.1 invariant: "exactly one current context, or zero iff Contexts is empty".
@@ -103,7 +103,10 @@ Delegated-principal context bootstrap from a JWT minted by `drive9 vault grant`.
 
 **Input resolution ladder (PR-B lock):**
 
-1. If `--from-file <path>` given and `path != "-"` → read file.
+1. If `--from-file <path>` given and `path != "-"`:
+   - If the path does not exist or is unreadable → `ENOENT`, CLI exit `1`, message `"ctx import: cannot read %q: %s"` (underlying OS error).
+   - If the file exists but `stat.Mode().Perm() & 0o077 != 0` (i.e. any group or world bit set) → refuse **before reading the contents**, `EACCES`, CLI exit `1`, message `"ctx import: refusing to read grant file %q: mode %#o is group- or world-readable; run: chmod 600 %q"`. Rationale: a bearer-token file with `0644`/`0640` has already leaked to any local user; accepting it silently makes the CLI complicit in the credential lifecycle breach. The same reasoning that drops positional-argv applies to permissive file modes.
+   - Otherwise → read file.
 2. If `--from-file -` given → read stdin until EOF.
 3. If no flag given AND `isatty(0) == false` → read stdin until EOF (matches `pass insert`, `gpg --import`, `vault login -method=token`).
 4. If no flag given AND `isatty(0) == true` → **error** with exact message:
@@ -114,20 +117,42 @@ Delegated-principal context bootstrap from a JWT minted by `drive9 vault grant`.
      <producer> | drive9 ctx import
    ```
 
-   Exit 1, mapped to `EINVAL` per §11.
+   CLI exit code `2` (usage error, per `sysexits.h` `EX_USAGE`). The end-state §11 errno column classifies this as `EINVAL`; `EINVAL` is the POSIX errno *class* the scenario maps to, and the CLI *exit code* is `2`. The two are distinct concepts — §11 is the errno classification (for man-page / spec reasoning), and the CLI exit code is what a shell `$?` observes.
 
 The positional-JWT form (`drive9 ctx import <jwt>`) is **not** accepted — see §3 for the end-state spec edit that drops it. If a bare positional argument is present (e.g. `drive9 ctx import eyJhbGc...`), the verb errors with the same "no JWT on stdin" message **plus** a one-line postscript: `note: the positional-JWT form was removed; paste via stdin or save to a file first.` This protects users migrating from older docs or the PR #274 prior draft.
 
+**CLI exit code convention (PR-B lock):**
+
+| Errno class (§11) | CLI exit code | Rationale |
+| --- | --- | --- |
+| `EINVAL` | `2` | Usage / input-shape error (`sysexits.h` `EX_USAGE`). Shell tools that diff usage errors from runtime denials rely on this split. |
+| `EACCES` | `1` | Authoritative denial (expired token, permission refused). |
+| `ENOENT` | `1` | Resource not found (e.g. `--from-file` path missing). |
+
+CLI exit code is what `$?` observes after the process exits. Errno class is the POSIX-named category used in §11 for semantic reasoning / man pages. The two are distinct concepts; both are pinned so implementations cannot diverge.
+
 **Parse-stability fork (end-state §19 / §13.3 refusal cases), in order:**
+
+The fork is exhaustive over all required delegated-context claims enumerated by end-state §13.1 + §16. Order is chosen so cheap structural checks run before claim checks, and so error messages guide the user to the most actionable fix first.
 
 1. Input empty after whitespace trim → `EINVAL`, message `"ctx import: empty input"`.
 2. Not a structurally valid JWT (three base64url segments, JSON middle) → `EINVAL`, message `"ctx import: not a valid JWT: <decode error>"`.
-3. `principal_type` claim is not `"delegated"` → `EINVAL`, message `"ctx import: token principal_type is %q, not \"delegated\"; use \`drive9 ctx add --api-key\` for owner credentials"`.
-4. `exp` claim is in the past (local wall clock, no skew tolerance — matches end-state §17 short-circuit #1) → `EACCES`, message `"ctx import: token already expired at <RFC3339>"`.
-5. `iss` claim is empty → `EINVAL`, message `"ctx import: token is missing the \`iss\` claim"`.
-6. `perm` claim is not one of `{"read", "write"}` → `EINVAL`, message `"ctx import: token perm is %q, expected one of {read, write}"`.
+3. Missing or empty `principal_type` claim → `EINVAL`, message `"ctx import: token is missing the \`principal_type\` claim"`.
+4. `principal_type` claim is not `"delegated"` → `EINVAL`, message `"ctx import: token principal_type is %q, not \"delegated\"; use \`drive9 ctx add --api-key\` for owner credentials"`.
+5. Missing or zero `exp` claim → `EINVAL`, message `"ctx import: token is missing the \`exp\` claim"`.
+6. `exp` claim is in the past (local wall clock, no skew tolerance — matches end-state §17 short-circuit #1) → `EACCES`, message `"ctx import: token already expired at <RFC3339>"`.
+7. Missing or empty `iss` claim → `EINVAL`, message `"ctx import: token is missing the \`iss\` claim"`.
+8. Missing or empty `agent` claim → `EINVAL`, message `"ctx import: token is missing the \`agent\` claim"`.
+9. Missing or empty `grant_id` claim → `EINVAL`, message `"ctx import: token is missing the \`grant_id\` claim"`.
+10. Missing `scope` claim, or `scope` is not a non-empty JSON array of non-empty strings → `EINVAL`, message `"ctx import: token is missing a non-empty \`scope\` array"`.
+11. Missing or empty `perm` claim → `EINVAL`, message `"ctx import: token is missing the \`perm\` claim"`.
+12. `perm` claim is not one of `{"read", "write"}` → `EINVAL`, message `"ctx import: token perm is %q, expected one of {read, write}"`.
 
-All six refusals happen **before** any write to `~/.drive9/config`. No partial-write state is ever reachable.
+All twelve refusals happen **before** any write to `~/.drive9/config`. No partial-write state is ever reachable.
+
+Rationale for exhaustiveness: end-state §13.1 lists the required fields of a delegated context, and §16 lists the required JWT payload claims. A JWT that passes partial checks but is missing `grant_id` or `scope[]` cannot populate a valid delegated `Context` entry — accepting it would either silently insert an invalid row or silently drop claims, both undefined-behavior contract violations. The twelve-step fork is the union of {structural, principal_type, lifecycle, identity, payload schema, authority} required claims.
+
+The end-state §11 errno sub-table for `ctx import` is a 1:1 mapping of the twelve refusals above, plus the file-mode and file-read rows defined under the `--from-file` contract. See §11 for the full row-by-row mapping.
 
 **On success:**
 - Default name derivation (matches merged §13.3):
@@ -282,7 +307,17 @@ drive9 ctx import --from-file -
 ...
 ```
 
-This remains pipe-friendly and correct after the positional drop. No edit.
+This default form is **human-only** (not pipe-safe): `vault grant` also prints `grant_id` and `expires_at` metadata to stdout (`cmd/drive9/cli/secret.go:340-342`), so piping the default output directly into `ctx import` would feed those extra lines through the JWT parser.
+
+The **canonical pipe form** is:
+
+```
+drive9 vault grant <scope> --agent <a> --perm <p> --ttl <t> --token-only | drive9 ctx import
+```
+
+`--token-only` exists already (`cmd/drive9/cli/secret.go:293-294, 335-336`): in that mode, stdout is a single line containing only the bare JWT. `drive9 ctx import` with no flag reads stdin by default when stdin is not a TTY (§2.2), so the handoff is pipe-safe end-to-end.
+
+Add a corresponding bullet in §13.2 (end-state) after the verb table that names the canonical pipe form. No change to the default human output; it stays human-only / non-parseable by design.
 
 Line 125 (the `SHOULD NOT` paragraph about positional paste) is deleted as noted in §3.2 above.
 
@@ -299,18 +334,27 @@ No other doc files require edits (verified by `git grep -l 'ctx import <jwt>' --
 
 ### 3.6 §11 errno table
 
-Current `§11 Errno Table (Normative)` lines 208–215 do not explicitly cover `ctx import` EINVAL / EACCES / ENOENT cases. Add a new sub-table under the existing one:
+Current `§11 Errno Table (Normative)` does not explicitly cover `ctx import` EINVAL / EACCES / ENOENT cases. Add a new sub-table under the existing one, 1:1 with the parse-stability fork in §2.2 plus the `--from-file` contract. The full row set is:
 
-```
-| `ctx import` refusal cause | Errno |
-| --- | --- |
-| Empty / unparseable / structurally invalid JWT | `EINVAL` |
-| Missing required claim (`iss`, `exp`, `perm`, `principal_type`, `agent`) | `EINVAL` |
-| Token `principal_type` is not `"delegated"` | `EINVAL` |
-| Token `exp` already in the past at import | `EACCES` |
-| `--from-file <path>` names a non-existent or unreadable file | `ENOENT` |
-| Stdin is a TTY and no input flag given | `EINVAL` (with help pointer) |
-```
+| `ctx import` refusal cause | Errno | Exit code |
+| --- | --- | --- |
+| Input empty after whitespace trim | `EINVAL` | `2` |
+| Not a structurally valid JWT (three base64url segments, JSON middle) | `EINVAL` | `2` |
+| Missing `principal_type` claim | `EINVAL` | `2` |
+| `principal_type` is not `"delegated"` | `EINVAL` | `2` |
+| Missing `exp` claim | `EINVAL` | `2` |
+| `exp` already in the past at import | `EACCES` | `1` |
+| Missing `iss` claim | `EINVAL` | `2` |
+| Missing `agent` claim | `EINVAL` | `2` |
+| Missing `grant_id` claim | `EINVAL` | `2` |
+| Missing or empty `scope[]` claim | `EINVAL` | `2` |
+| Missing `perm` claim | `EINVAL` | `2` |
+| `perm` not in `{read, write}` | `EINVAL` | `2` |
+| `--from-file <path>` names a non-existent or unreadable file | `ENOENT` | `1` |
+| `--from-file <path>` has mode group- or world-readable (`mode & 0o077 != 0`) | `EACCES` | `1` |
+| Stdin is a TTY and no input flag given | `EINVAL` (with help pointer) | `2` |
+
+The end-state §11 sub-table mirrors this exactly. Any future addition to the parse fork **MUST** add a row here and in end-state §11 in the same change; the checklist enforces this.
 
 ---
 
@@ -411,11 +455,19 @@ End-state §13.3 locks **zero** clock skew on the local short-circuit. Test: gra
 
 Server-side verification has ±60s leeway (§16 / PR-A). Client-side has 0. Document this asymmetry in `pr-b-review-checklist.md` for reviewer awareness.
 
+### 5.7 Grant file permissions
+
+`--from-file <path>` **MUST** refuse any file whose mode has group or world permission bits set (`stat.Mode().Perm() & 0o077 != 0`). The refusal happens **before** reading the file contents: a `0644` bearer-token file has already leaked to any local user; silently consuming it would make the CLI complicit in the credential lifecycle breach.
+
+Rationale symmetry with positional-drop: argv removal was motivated by credential hygiene (JWT in `/proc/<pid>/cmdline` is post-hoc unrecoverable). Ingesting a world-readable token file is the same category of breach. The spec posture is consistent: credentials that have already escaped their intended confidentiality boundary are refused, not consumed.
+
+Test: `TestCtxImport_InsecureGrantFileMode_Refused` — create a temp grant file with `0644`, run `ctx import --from-file <path>`, assert: exit code `1`, errno class `EACCES`, error message contains `"chmod 600"`, file contents **not** read (verify via afero / fake-fs spy or by checking that the parser was never invoked).
+
 ---
 
 ## 6. Test plan (must ship with PR)
 
-Reconciles PR #274's test coverage (18 tests) with B3-new tests from §4.2. Full list (22 cases after consolidation):
+Reconciles PR #274's test coverage (14 ports — three prototype tests in PR #274 are dropped as superseded: the positional-form happy path, the positional-form warning, and the positional-form collision case, all obsolete after §3 drops positional entirely) with B3-new tests from §4.2 / §5. Full list (28 cases):
 
 **From PR #274 (port as-is):**
 1. `TestCtxAdd_Owner_WritesConfig`
@@ -439,14 +491,17 @@ Reconciles PR #274's test coverage (18 tests) with B3-new tests from §4.2. Full
 17. `TestCtxImport_ExpiredToken_NoConfigWrite` (§4.2)
 18. `TestCtxImport_PrincipalTypeOwner_Rejected` (§4.2)
 19. `TestCtxImport_EmptyIss_Rejected` (§4.2)
-20. `TestCtxImport_LabelHintNewlineEscape` (§5.5)
-21. `TestCtxUse_ExpiredDelegated_Refused` (§5.6)
-22. `TestConfig_LoadDefaultTypeBackfill` (§4.2)
-23. `TestConfig_AtomicWriteSurvivesPartialCrash` (§4.4)
-24. `TestCtxAdd_ConfigMode0600` (§5.2)
-25. `TestCtxImport_TofuIssuerPopulated` (§5.4, documents behavior)
+20. `TestCtxImport_MissingGrantID_Rejected` (§2.2 step 9)
+21. `TestCtxImport_EmptyScope_Rejected` (§2.2 step 10)
+22. `TestCtxImport_InsecureGrantFileMode_Refused` (§5.7 / §2.2 step 1)
+23. `TestCtxImport_LabelHintNewlineEscape` (§5.5)
+24. `TestCtxUse_ExpiredDelegated_Refused` (§5.6)
+25. `TestConfig_LoadDefaultTypeBackfill` (§4.2)
+26. `TestConfig_AtomicWriteSurvivesPartialCrash` (§4.4)
+27. `TestCtxAdd_ConfigMode0600` (§5.2)
+28. `TestCtxImport_TofuIssuerPopulated` (§5.4, documents behavior)
 
-(Final count may shift; B3 adds any missing per review.)
+If review surfaces additional required cases, they are added to this enumeration and the count is updated in the same delta — the header number and the enumeration are kept in lock-step.
 
 **CI matrix:** linux-amd64, darwin-amd64, darwin-arm64 (already covered by main matrix). No Windows (FUSE dep elsewhere already excludes Windows).
 

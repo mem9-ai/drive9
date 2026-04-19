@@ -12,7 +12,7 @@ Per `feedback_review_gate_axis_enumeration.md`: before sign-off, walk every numb
 
 ## A. Spec conformance (§13.1 / §13.2 / §13.3 / §14 / §15)
 
-- [ ] **[spec+code]** Verb set is exactly `{add, import, ls, use, rm}`. No `create`, no `sh`, no `login`, no aliases beyond the `ls` / `list` synonym already in merged §13.2.
+- [ ] **[spec+code]** Verb set is exactly `{add, import, ls, use, rm}` plus the bare `ctx` (no-verb) carry-over whose contract is "print the current context name, or 'no current context'; no side effects; not listed in §13.2". No `create`, no `sh`, no `login`, no other aliases beyond the `ls` / `list` synonym already in merged §13.2. The bare form is a documented non-spec compat (impl §4.5), not a silent sixth verb.
 - [ ] **[spec]** §13.2 verb table in `vault-interaction-end-state.md` has positional-JWT row removed; `ctx import` rows show `--from-file <path>` and `--from-file -` only.
 - [ ] **[spec]** §13.3 "Input modes" bullet list contains exactly three bullets: `--from-file <path>`, `--from-file -`, and no-arg (pipe default).
 - [ ] **[spec]** §13.3 includes the literal TTY-detection error string:
@@ -25,12 +25,12 @@ Per `feedback_review_gate_axis_enumeration.md`: before sign-off, walk every numb
 - [ ] **[spec]** §13.3 no longer contains the `SHOULD NOT` paragraph about positional-in-interactive-shell (line 309 of pre-B1) — it is obsolete after positional removal.
 - [ ] **[spec]** §15 Alice flow uses `ctx import --from-file ~/alice-grant.jwt` (or piped stdin); no positional form.
 - [ ] **[spec]** §6 grant default output block line 125 `SHOULD NOT` paragraph is removed (positional no longer exists to warn about).
-- [ ] **[spec]** `docs/guides/vault-quickstart.md` line 113 rewritten; line 172 deleted. `grep -n 'ctx import <jwt>' docs/` returns zero matches.
+- [ ] **[spec]** `docs/guides/vault-quickstart.md` line 113 rewritten (from endorsement to anti-endorsement with explicit removal note); line 172 deleted. Grep gate is scoped to **normative user-facing docs and executable code**: `git grep -n 'ctx import <jwt>' -- 'docs/guides/**' 'docs/reference/**' 'README.md' 'cmd/**' 'pkg/**'` returns zero matches. The PR-B impl spec and checklist in `docs/specs/` are exempt because they intentionally cite the removed form in migration / before-after / gate text; treating those as violations would make the gate unsatisfiable.
 - [ ] **[code]** `cmd/drive9/cli/ctx.go` dispatcher does not accept a bare positional JWT. A bare non-flag arg on `ctx import` triggers the §2.2 error message (including migration postscript).
 
 ## B. Zero-legacy gate (§10 deletion contract)
 
-- [ ] **[code]** `git diff main...<pr-b-branch>` returns **zero** matches for: `CapToken`, `CapTokenClaims`, `vault_tokens`, `cap_token`. This is mechanical; any hit blocks.
+- [ ] **[code]** `git diff main...<pr-b-branch> -- 'cmd/**' 'pkg/**'` returns **zero** matches for: `CapToken`, `CapTokenClaims`, `vault_tokens`, `cap_token`. Scope is **executable code only** (`cmd/** pkg/**`) — not `docs/**`, because the impl spec and checklist intentionally cite the removed positional form in migration / before-after / gate text. This is mechanical; any hit in the scoped paths blocks.
 - [ ] **[code]** No new call into `pkg/vault/tokens*.go` or any file owned by the PR-E deletion list.
 - [ ] **[code]** `pkg/**` is not modified at all by PR-B code diff. (Spec edits allowed in `docs/specs/`.)
 
@@ -41,16 +41,34 @@ Per `feedback_review_gate_axis_enumeration.md`: before sign-off, walk every numb
 - [ ] **[code]** Bare positional arg on `ctx import` → same `EINVAL` plus migration postscript. Regression test: `TestCtxImport_TTYWithBarePositional`.
 - [ ] **[code]** `--from-file <path>` and `--from-file -` both work regardless of `isatty(0)`.
 - [ ] **[code]** `--from-file <path>` where `path` is unreadable → `ENOENT`. Regression test required.
+- [ ] **[code]** `--from-file <path>` where `path` has mode bits `0o077` set (group- or world-readable) → `EACCES`, refused **before reading file contents**, error message names `chmod 600`. Regression test: `TestCtxImport_InsecureGrantFileMode_Refused`. Verify the file body is never parsed (fake-fs spy or parser-invocation assertion).
 - [ ] **[code]** `ctx add --api-key <key>` passes the key in argv. This is a known-accepted tradeoff for bootstrap (see impl §5.3). Confirm it is **flagged in the PR-B body** as a non-regression tradeoff. No silent shipping.
 
 ## D. Parse-stability fork (§13.3 + §17 short-circuit #1)
 
-- [ ] **[code]** Order of refusal on `ctx import`, enforced in code: empty → not-JWT → `principal_type` != delegated → `exp` past → `iss` empty → `perm` not in {read,write}. **Each** refusal happens before any config write. Regression test per case.
+- [ ] **[code]** Order of refusal on `ctx import`, enforced in code (twelve steps per impl §2.2):
+  1. empty input → `EINVAL`
+  2. not-JWT → `EINVAL`
+  3. missing `principal_type` → `EINVAL`
+  4. `principal_type` != `delegated` → `EINVAL`
+  5. missing `exp` → `EINVAL`
+  6. `exp` in past → `EACCES`
+  7. missing `iss` → `EINVAL`
+  8. missing `agent` → `EINVAL`
+  9. missing `grant_id` → `EINVAL`
+  10. missing or empty `scope[]` → `EINVAL`
+  11. missing `perm` → `EINVAL`
+  12. `perm` not in `{read, write}` → `EINVAL`
+
+  **Each** refusal happens before any config write. Regression test per case.
 - [ ] **[code]** `principal_type=owner` → `EINVAL` with message directing to `ctx add --api-key`. Regression test: `TestCtxImport_PrincipalTypeOwner_Rejected`.
 - [ ] **[code]** `exp` already-past → `EACCES`, no config write. Regression test: `TestCtxImport_ExpiredToken_NoConfigWrite`. After the test, `~/.drive9/config` does not contain the rejected context — verify via read-back, not just err check.
 - [ ] **[code]** `exp` check uses local wall clock with **zero** skew tolerance (matches merged §13.3). Server verify tolerates ±60s (§16); client does not. Asymmetry documented in impl §5.6.
 - [ ] **[code]** `iss` empty → `EINVAL`. Regression test: `TestCtxImport_EmptyIss_Rejected`.
+- [ ] **[code]** Missing `grant_id` → `EINVAL`. Regression test: `TestCtxImport_MissingGrantID_Rejected`.
+- [ ] **[code]** Missing or empty `scope[]` → `EINVAL`. Regression test: `TestCtxImport_EmptyScope_Rejected`.
 - [ ] **[code]** `perm` not in enum → `EINVAL`. Regression test required.
+- [ ] **[spec+code]** Parse fork in impl §2.2, end-state §11 sub-table, and `cmd/drive9/cli/ctx.go` are 1:1 in rows and order. Any row added to one MUST be added to all three in the same change — enforced at review time by column-count diff.
 
 ## E. Config file security (§5.2 of impl spec)
 
@@ -89,7 +107,7 @@ Per `feedback_review_gate_axis_enumeration.md`: before sign-off, walk every numb
 
 ## J. Test suite
 
-- [ ] **[code]** All 22+ test cases from impl §6 present and passing in CI.
+- [ ] **[code]** All 28 test cases from impl §6 present and passing in CI. If the enumeration changes, header count updates in the same delta.
 - [ ] **[code]** No `t.Skip` in the new tests.
 - [ ] **[code]** Tests assert exact errno / exit code, not just `err != nil`.
 - [ ] **[code]** Tests use `testify/require` per agent standard. No hand-rolled assertions.
@@ -113,8 +131,8 @@ If any silent-requirement item uncovers a gap, the fix is typically a MUST line 
 ## L. Doc-cascade (per `e4f41feb` / `bb68b6e6` convergence)
 
 - [ ] **[spec]** `docs/guides/vault-quickstart.md` edits listed in impl §3.5 are applied in the same spec PR.
-- [ ] **[spec]** After the spec PR merges, `git grep 'ctx import <jwt>'` across `docs/ README.md` returns zero matches.
-- [ ] **[spec]** No other doc file (CHANGELOG, cmd-help strings in Go, e2e test fixtures) contains stale positional-form references that would survive the spec edit. Grep check at B1 review time; flag any findings as "fold into B1 or ship as B1.1 doc-only PR".
+- [ ] **[spec]** After the spec PR merges, `git grep 'ctx import <jwt>' -- 'docs/guides/**' 'docs/reference/**' 'README.md' 'cmd/**' 'pkg/**'` returns zero matches. Scope excludes `docs/specs/` because the PR-B impl spec and checklist intentionally cite the removed form in migration / before-after / gate text — treating those as violations would make the gate unsatisfiable.
+- [ ] **[spec]** No other user-facing doc file (CHANGELOG, cmd-help strings in Go, e2e test fixtures) contains stale positional-form references that would survive the spec edit. Grep check at B1 review time; flag any findings as "fold into B1 or ship as B1.1 doc-only PR".
 
 ## M. Axis-enumeration sweep (per `feedback_review_gate_axis_enumeration.md`)
 
