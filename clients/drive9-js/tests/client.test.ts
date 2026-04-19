@@ -175,18 +175,92 @@ describe("Vault", () => {
     expect(list.length).toBe(1);
   });
 
-  it("issue and revoke token", async () => {
+  it("issueVaultToken wire shape (spec 083aab8 line 133)", async () => {
+    // Native assertion of the terminal wire shape:
+    //   request  = {agent, scope[], perm, ttl_seconds, label_hint?}
+    //   response = {token, grant_id, expires_at, scope[], perm, ttl}
+    let capturedBody: Record<string, unknown> | undefined;
     server.use(
       http.post("http://localhost:9009/v1/vault/tokens", async ({ request }) => {
-        const body = (await request.json()) as { agent_id: string };
-        expect(body.agent_id).toBe("agent-1");
-        return HttpResponse.json({ token: "tok", token_id: "tid-1", expires_at: "2024-01-01T00:00:00Z" });
+        capturedBody = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(
+          {
+            token: "vault_abc",
+            grant_id: "grt_123",
+            expires_at: "2026-04-14T00:00:00Z",
+            scope: ["aws-prod", "db-prod/password"],
+            perm: "read",
+            ttl: 3600,
+          },
+          { status: 201 }
+        );
       }),
-      http.delete("http://localhost:9009/v1/vault/tokens/tid-1", () => HttpResponse.text("ok"))
+      http.delete("http://localhost:9009/v1/vault/tokens/grt_123", () => HttpResponse.text("ok"))
     );
     const client = new Client("http://localhost:9009", "test-key");
-    const tok = await client.issueVaultToken("agent-1", "task-1", ["read"], 3600);
-    expect(tok.token_id).toBe("tid-1");
-    await client.revokeVaultToken(tok.token_id);
+    const grant = await client.issueVaultToken(
+      "deploy-agent",
+      ["aws-prod", "db-prod/password"],
+      "read",
+      3600,
+      "nightly"
+    );
+    expect(grant.token).toBe("vault_abc");
+    expect(grant.grant_id).toBe("grt_123");
+    expect(grant.scope).toEqual(["aws-prod", "db-prod/password"]);
+    expect(grant.perm).toBe("read");
+    expect(grant.ttl).toBe(3600);
+
+    expect(capturedBody).toBeDefined();
+    expect(capturedBody!.agent).toBe("deploy-agent");
+    expect(capturedBody!.scope).toEqual(["aws-prod", "db-prod/password"]);
+    expect(capturedBody!.perm).toBe("read");
+    expect(capturedBody!.ttl_seconds).toBe(3600);
+    expect(capturedBody!.label_hint).toBe("nightly");
+    // Terminal-state reshape removed agent_id/task_id per spec §20.
+    expect(capturedBody!.agent_id).toBeUndefined();
+    expect(capturedBody!.task_id).toBeUndefined();
+
+    await client.revokeVaultToken(grant.grant_id);
+  });
+
+  it("audit event wire shape (spec §16)", async () => {
+    // Native assertion that audit events carry {grant_id, agent}
+    // instead of the legacy {token_id, agent_id, task_id} trio.
+    server.use(
+      http.get("http://localhost:9009/v1/vault/audit", () =>
+        HttpResponse.json({
+          events: [
+            {
+              event_id: "e1",
+              event_type: "secret.read",
+              timestamp: "2026-04-14T00:00:00Z",
+              grant_id: "grt_123",
+              agent: "deploy-agent",
+              secret_name: "aws-prod",
+              field_name: "access_key",
+              adapter: "api",
+            },
+          ],
+        })
+      )
+    );
+    const client = new Client("http://localhost:9009", "test-key");
+    const events = await client.queryVaultAudit("aws-prod", 5);
+    expect(events.length).toBe(1);
+    const ev = events[0];
+    expect(ev.grant_id).toBe("grt_123");
+    expect(ev.agent).toBe("deploy-agent");
+    expect(ev.secret_name).toBe("aws-prod");
+    expect(ev.field_name).toBe("access_key");
+    expect(ev.adapter).toBe("api");
+    // The dataclass-equivalent assertion: legacy fields do not exist on
+    // VaultAuditEvent per the terminal type.
+    // @ts-expect-error — legacy field removed from VaultAuditEvent
+    expect(ev.token_id).toBeUndefined();
+    // @ts-expect-error — legacy field removed from VaultAuditEvent
+    expect(ev.agent_id).toBeUndefined();
+    // @ts-expect-error — legacy field removed from VaultAuditEvent
+    expect(ev.task_id).toBeUndefined();
   });
 });

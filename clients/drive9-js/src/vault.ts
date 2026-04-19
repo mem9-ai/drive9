@@ -49,24 +49,37 @@ export async function listVaultSecrets(client: Client): Promise<VaultSecret[]> {
   return body.secrets || [];
 }
 
+/**
+ * Issue a scoped capability grant (spec §6).
+ * Request body: {agent, scope[], perm, ttl_seconds, label_hint?}.
+ * Response: {token, grant_id, expires_at, scope[], perm, ttl}.
+ */
 export async function issueVaultToken(
   client: Client,
-  agentId: string,
-  taskId: string,
+  agent: string,
   scope: string[],
-  ttlSeconds: number
+  perm: string,
+  ttlSeconds: number,
+  labelHint?: string
 ): Promise<VaultTokenIssueResponse> {
+  const body: Record<string, unknown> = {
+    agent,
+    scope,
+    perm,
+    ttl_seconds: ttlSeconds,
+  };
+  if (labelHint) body.label_hint = labelHint;
   const resp = await fetch(client.vaultUrl("/tokens"), {
     method: "POST",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ agent_id: agentId, task_id: taskId, scope, ttl_seconds: ttlSeconds }),
+    body: JSON.stringify(body),
   });
   await checkError(resp);
   return (await resp.json()) as VaultTokenIssueResponse;
 }
 
-export async function revokeVaultToken(client: Client, tokenId: string): Promise<void> {
-  const resp = await fetch(client.vaultUrl(`/tokens/${encodeURIComponent(tokenId)}`), {
+export async function revokeVaultToken(client: Client, grantId: string): Promise<void> {
+  const resp = await fetch(client.vaultUrl(`/tokens/${encodeURIComponent(grantId)}`), {
     method: "DELETE",
     headers: client["authHeaders"](),
   });

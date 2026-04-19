@@ -28,13 +28,13 @@ async function main() {
     console.log(`  ${s.name}`);
   }
 
-  // Issue token
-  const token = await client.issueVaultToken("agent-1", "task-1", ["read"], 3600);
-  console.log("Issued token:", token.token_id);
+  // Issue grant (spec §6)
+  const grant = await client.issueVaultToken("agent-1", [secretName], "read", 3600);
+  console.log("Issued grant:", grant.grant_id, "perm:", grant.perm, "ttl:", grant.ttl);
 
   // Revoke
-  await client.revokeVaultToken(token.token_id);
-  console.log("Revoked token");
+  await client.revokeVaultToken(grant.grant_id);
+  console.log("Revoked grant");
 
   // Clean up
   await client.deleteVaultSecret(secretName);

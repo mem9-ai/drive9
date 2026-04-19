@@ -242,12 +242,18 @@ export class Client {
     return listVaultSecrets(this);
   }
 
-  async issueVaultToken(agentId: string, taskId: string, scope: string[], ttlSeconds: number): Promise<import("./models.js").VaultTokenIssueResponse> {
-    return issueVaultToken(this, agentId, taskId, scope, ttlSeconds);
+  async issueVaultToken(
+    agent: string,
+    scope: string[],
+    perm: string,
+    ttlSeconds: number,
+    labelHint?: string,
+  ): Promise<import("./models.js").VaultTokenIssueResponse> {
+    return issueVaultToken(this, agent, scope, perm, ttlSeconds, labelHint);
   }
 
-  async revokeVaultToken(tokenId: string): Promise<void> {
-    return revokeVaultToken(this, tokenId);
+  async revokeVaultToken(grantId: string): Promise<void> {
+    return revokeVaultToken(this, grantId);
   }
 
   async queryVaultAudit(secretName?: string, limit?: number): Promise<import("./models.js").VaultAuditEvent[]> {

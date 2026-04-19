@@ -70,19 +70,26 @@ export interface VaultSecret {
   updated_at: string;
 }
 
+/**
+ * Response for POST /v1/vault/tokens per spec 083aab8 line 133.
+ * Wire shape: {token, grant_id, expires_at, scope[], perm, ttl}.
+ */
 export interface VaultTokenIssueResponse {
   token: string;
-  token_id: string;
+  grant_id: string;
   expires_at: string;
+  scope: string[];
+  perm: string;
+  ttl: number;
 }
 
+/** Audit event returned by GET /v1/vault/audit (spec §16). */
 export interface VaultAuditEvent {
   event_id: string;
   event_type: string;
   timestamp: string;
-  token_id?: string;
-  agent_id?: string;
-  task_id?: string;
+  grant_id?: string;
+  agent?: string;
   secret_name?: string;
   field_name?: string;
   adapter?: string;
