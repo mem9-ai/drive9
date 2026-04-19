@@ -3,6 +3,10 @@ package schema
 // VaultTiDBSchemaStatements returns the vault DDL statements in TiDB/MySQL
 // dialect. These are appended to the tenant init schema statement set for all
 // TiDB providers, including drive9-server schema dump-init-sql output.
+//
+// Schema shape follows spec 083aab8 §16: capability grants are identified by
+// grant_id (stable revocation handle), bind to a single agent + issuer +
+// principal_type + perm, and carry a scope list plus optional label_hint.
 func VaultTiDBSchemaStatements() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS vault_deks (
@@ -34,18 +38,21 @@ func VaultTiDBSchemaStatements() []string {
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS vault_tokens (
-			token_id      VARCHAR(64) PRIMARY KEY,
-			tenant_id     VARCHAR(64) NOT NULL,
-			agent_id      VARCHAR(255) NOT NULL,
-			task_id       VARCHAR(255),
-			scope_json    JSON NOT NULL,
-			issued_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			expires_at    DATETIME(3) NOT NULL,
-			revoked_at    DATETIME(3),
-			revoked_by    VARCHAR(255),
-			revoke_reason VARCHAR(255),
+			grant_id       VARCHAR(64) PRIMARY KEY,
+			tenant_id      VARCHAR(64) NOT NULL,
+			issuer         VARCHAR(512) NOT NULL,
+			principal_type VARCHAR(16) NOT NULL,
+			agent          VARCHAR(255) NOT NULL,
+			scope_json     JSON NOT NULL,
+			perm           VARCHAR(16) NOT NULL,
+			label_hint     VARCHAR(255),
+			issued_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			expires_at     DATETIME(3) NOT NULL,
+			revoked_at     DATETIME(3),
+			revoked_by     VARCHAR(255),
+			revoke_reason  VARCHAR(255),
 			INDEX idx_vault_token_tenant (tenant_id),
-			INDEX idx_vault_token_agent (agent_id)
+			INDEX idx_vault_token_agent (agent)
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS vault_policies (
@@ -60,9 +67,8 @@ func VaultTiDBSchemaStatements() []string {
 			event_id     VARCHAR(64) PRIMARY KEY,
 			tenant_id    VARCHAR(64) NOT NULL,
 			event_type   VARCHAR(32) NOT NULL,
-			token_id     VARCHAR(64),
-			agent_id     VARCHAR(255),
-			task_id      VARCHAR(255),
+			grant_id     VARCHAR(64),
+			agent        VARCHAR(255),
 			secret_name  VARCHAR(255),
 			field_name   VARCHAR(255),
 			adapter      VARCHAR(16),

@@ -322,13 +322,26 @@ func (s *Store) ReadSecretField(ctx context.Context, tenantID, name, fieldName s
 	return fe.Decrypt(ciphertext, nonce)
 }
 
-// ---- Capability Token ----
+// ---- Capability Grant ----
 
-// IssueCapToken creates a capability token and persists its server-side state.
-func (s *Store) IssueCapToken(ctx context.Context, tenantID, agentID, taskID string, scope []string, ttl time.Duration) (string, *CapToken, error) {
-	tokenID := "cap_" + uuid.NewString()
+// IssueCapTokenParams holds the parameters for issuing a capability grant (spec §6).
+type IssueCapTokenParams struct {
+	TenantID      string
+	Issuer        string        // JWT iss claim — the server URL the delegatee will contact
+	PrincipalType PrincipalType // owner or delegated; vault grant always emits delegated
+	Agent         string
+	Scope         []string
+	Perm          Perm
+	LabelHint     string
+	TTL           time.Duration
+}
+
+// IssueCapToken creates a capability grant and persists its server-side row.
+// Returns the signed JWT bearer string and the CapToken row.
+func (s *Store) IssueCapToken(ctx context.Context, p IssueCapTokenParams) (string, *CapToken, error) {
+	grantID := "grt_" + uuid.NewString()[:8]
 	now := time.Now()
-	expiresAt := now.Add(ttl)
+	expiresAt := now.Add(p.TTL)
 
 	nonce, err := GenerateNonce()
 	if err != nil {
@@ -336,40 +349,46 @@ func (s *Store) IssueCapToken(ctx context.Context, tenantID, agentID, taskID str
 	}
 
 	claims := &CapTokenClaims{
-		TokenID:   tokenID,
-		TenantID:  tenantID,
-		AgentID:   agentID,
-		TaskID:    taskID,
-		Scope:     scope,
-		IssuedAt:  now.Unix(),
-		ExpiresAt: expiresAt.Unix(),
-		Nonce:     nonce,
+		Issuer:        p.Issuer,
+		PrincipalType: p.PrincipalType,
+		GrantID:       grantID,
+		TenantID:      p.TenantID,
+		Agent:         p.Agent,
+		Scope:         p.Scope,
+		Perm:          p.Perm,
+		IssuedAt:      now.Unix(),
+		ExpiresAt:     expiresAt.Unix(),
+		LabelHint:     p.LabelHint,
+		Nonce:         nonce,
 	}
 
-	csk := s.mk.DeriveCSK(tenantID)
+	csk := s.mk.DeriveCSK(p.TenantID)
 	tokenStr, err := SignCapToken(csk, claims)
 	if err != nil {
 		return "", nil, err
 	}
 
-	scopeJSON, _ := json.Marshal(scope)
+	scopeJSON, _ := json.Marshal(p.Scope)
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO vault_tokens (token_id, tenant_id, agent_id, task_id, scope_json, issued_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		tokenID, tenantID, agentID, taskID, scopeJSON, now, expiresAt,
+		`INSERT INTO vault_tokens (grant_id, tenant_id, issuer, principal_type, agent, scope_json, perm, label_hint, issued_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		grantID, p.TenantID, p.Issuer, string(p.PrincipalType), p.Agent, scopeJSON, string(p.Perm), p.LabelHint, now, expiresAt,
 	)
 	if err != nil {
-		return "", nil, fmt.Errorf("insert token: %w", err)
+		return "", nil, fmt.Errorf("insert grant: %w", err)
 	}
 
 	return tokenStr, &CapToken{
-		TokenID:   tokenID,
-		TenantID:  tenantID,
-		AgentID:   agentID,
-		TaskID:    taskID,
-		Scope:     scope,
-		IssuedAt:  now,
-		ExpiresAt: expiresAt,
+		GrantID:       grantID,
+		TenantID:      p.TenantID,
+		Issuer:        p.Issuer,
+		PrincipalType: p.PrincipalType,
+		Agent:         p.Agent,
+		Scope:         p.Scope,
+		Perm:          p.Perm,
+		LabelHint:     p.LabelHint,
+		IssuedAt:      now,
+		ExpiresAt:     expiresAt,
 	}, nil
 }
 
@@ -385,30 +404,30 @@ func (s *Store) VerifyAndResolveCapToken(ctx context.Context, tenantID, raw stri
 	// DB revocation check — scoped to tenant for isolation.
 	var revokedAt *time.Time
 	err = s.db.QueryRowContext(ctx,
-		`SELECT revoked_at FROM vault_tokens WHERE tenant_id = ? AND token_id = ?`,
-		tenantID, claims.TokenID,
+		`SELECT revoked_at FROM vault_tokens WHERE tenant_id = ? AND grant_id = ?`,
+		tenantID, claims.GrantID,
 	).Scan(&revokedAt)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("token not found")
+		return nil, fmt.Errorf("grant not found")
 	}
 	if err != nil {
-		return nil, fmt.Errorf("query token: %w", err)
+		return nil, fmt.Errorf("query grant: %w", err)
 	}
 	if revokedAt != nil {
-		return nil, fmt.Errorf("token revoked")
+		return nil, fmt.Errorf("grant revoked")
 	}
 
 	return claims, nil
 }
 
-// RevokeCapToken sets revoked_at on a capability token.
+// RevokeCapToken sets revoked_at on a capability grant (spec §8).
 // tenantID is required to enforce tenant isolation.
-func (s *Store) RevokeCapToken(ctx context.Context, tenantID, tokenID, revokedBy, reason string) error {
+func (s *Store) RevokeCapToken(ctx context.Context, tenantID, grantID, revokedBy, reason string) error {
 	now := time.Now()
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE vault_tokens SET revoked_at = ?, revoked_by = ?, revoke_reason = ?
-		 WHERE tenant_id = ? AND token_id = ? AND revoked_at IS NULL`,
-		now, revokedBy, reason, tenantID, tokenID,
+		 WHERE tenant_id = ? AND grant_id = ? AND revoked_at IS NULL`,
+		now, revokedBy, reason, tenantID, grantID,
 	)
 	if err != nil {
 		return err
@@ -435,10 +454,10 @@ func (s *Store) WriteAuditEvent(ctx context.Context, event *AuditEvent) error {
 		detailJSON, _ = json.Marshal(event.Detail)
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO vault_audit_log (event_id, tenant_id, event_type, token_id, agent_id, task_id, secret_name, field_name, adapter, detail_json, timestamp)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		event.EventID, event.TenantID, event.EventType, event.TokenID, event.AgentID,
-		event.TaskID, event.SecretName, event.FieldName, event.Adapter, detailJSON, event.Timestamp,
+		`INSERT INTO vault_audit_log (event_id, tenant_id, event_type, grant_id, agent, secret_name, field_name, adapter, detail_json, timestamp)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.EventID, event.TenantID, event.EventType, event.GrantID, event.Agent,
+		event.SecretName, event.FieldName, event.Adapter, detailJSON, event.Timestamp,
 	)
 	return err
 }
@@ -449,11 +468,11 @@ func (s *Store) QueryAuditLog(ctx context.Context, tenantID string, secretName s
 	var args []any
 
 	if secretName != "" {
-		query = `SELECT event_id, tenant_id, event_type, token_id, agent_id, task_id, secret_name, field_name, adapter, detail_json, timestamp
+		query = `SELECT event_id, tenant_id, event_type, grant_id, agent, secret_name, field_name, adapter, detail_json, timestamp
 			FROM vault_audit_log WHERE tenant_id = ? AND secret_name = ? ORDER BY timestamp DESC LIMIT ?`
 		args = []any{tenantID, secretName, limit}
 	} else {
-		query = `SELECT event_id, tenant_id, event_type, token_id, agent_id, task_id, secret_name, field_name, adapter, detail_json, timestamp
+		query = `SELECT event_id, tenant_id, event_type, grant_id, agent, secret_name, field_name, adapter, detail_json, timestamp
 			FROM vault_audit_log WHERE tenant_id = ? ORDER BY timestamp DESC LIMIT ?`
 		args = []any{tenantID, limit}
 	}
@@ -468,10 +487,13 @@ func (s *Store) QueryAuditLog(ctx context.Context, tenantID string, secretName s
 	for rows.Next() {
 		var ev AuditEvent
 		var detailJSON []byte
-		if err := rows.Scan(&ev.EventID, &ev.TenantID, &ev.EventType, &ev.TokenID, &ev.AgentID,
-			&ev.TaskID, &ev.SecretName, &ev.FieldName, &ev.Adapter, &detailJSON, &ev.Timestamp); err != nil {
+		var grantID, agent sql.NullString
+		if err := rows.Scan(&ev.EventID, &ev.TenantID, &ev.EventType, &grantID, &agent,
+			&ev.SecretName, &ev.FieldName, &ev.Adapter, &detailJSON, &ev.Timestamp); err != nil {
 			return nil, err
 		}
+		ev.GrantID = grantID.String
+		ev.Agent = agent.String
 		if detailJSON != nil {
 			_ = json.Unmarshal(detailJSON, &ev.Detail)
 		}

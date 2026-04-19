@@ -156,12 +156,24 @@ func TestStoreCapTokenIssueRevokeVerify(t *testing.T) {
 	ctx := context.Background()
 	tenantID := "tenant-token"
 
-	tokenStr, capToken, err := s.IssueCapToken(ctx, tenantID, "agent-1", "task-1", []string{"secret-a"}, time.Hour)
+	tokenStr, capToken, err := s.IssueCapToken(ctx, IssueCapTokenParams{
+		TenantID:      tenantID,
+		Issuer:        "https://drive9.example.com",
+		PrincipalType: PrincipalDelegated,
+		Agent:         "agent-1",
+		Scope:         []string{"secret-a"},
+		Perm:          PermRead,
+		LabelHint:     "agent-1-secret-a",
+		TTL:           time.Hour,
+	})
 	if err != nil {
 		t.Fatalf("IssueCapToken: %v", err)
 	}
-	if tokenStr == "" || capToken.TokenID == "" {
+	if tokenStr == "" || capToken.GrantID == "" {
 		t.Fatal("empty token")
+	}
+	if capToken.Perm != PermRead {
+		t.Fatalf("perm not set: %s", capToken.Perm)
 	}
 
 	// Verify should succeed.
@@ -169,12 +181,15 @@ func TestStoreCapTokenIssueRevokeVerify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifyAndResolveCapToken: %v", err)
 	}
-	if resolved.TokenID != capToken.TokenID {
-		t.Fatalf("token ID mismatch: %s != %s", resolved.TokenID, capToken.TokenID)
+	if resolved.GrantID != capToken.GrantID {
+		t.Fatalf("grant ID mismatch: %s != %s", resolved.GrantID, capToken.GrantID)
+	}
+	if resolved.Issuer != "https://drive9.example.com" {
+		t.Fatalf("issuer mismatch: %s", resolved.Issuer)
 	}
 
 	// Revoke.
-	if err := s.RevokeCapToken(ctx, tenantID, capToken.TokenID, "admin", "test revoke"); err != nil {
+	if err := s.RevokeCapToken(ctx, tenantID, capToken.GrantID, "admin", "test revoke"); err != nil {
 		t.Fatalf("RevokeCapToken: %v", err)
 	}
 
@@ -185,7 +200,7 @@ func TestStoreCapTokenIssueRevokeVerify(t *testing.T) {
 	}
 
 	// Double revoke should fail.
-	if err := s.RevokeCapToken(ctx, tenantID, capToken.TokenID, "admin", "again"); err != ErrNotFound {
+	if err := s.RevokeCapToken(ctx, tenantID, capToken.GrantID, "admin", "again"); err != ErrNotFound {
 		t.Fatalf("expected ErrNotFound for double revoke, got: %v", err)
 	}
 }
@@ -199,7 +214,7 @@ func TestStoreAuditWriteQuery(t *testing.T) {
 		EventID:    "evt-1",
 		TenantID:   tenantID,
 		EventType:  "secret.read",
-		AgentID:    "agent-1",
+		Agent:      "agent-1",
 		SecretName: "db-prod",
 		FieldName:  "password",
 		Adapter:    "env",

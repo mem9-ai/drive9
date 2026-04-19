@@ -103,14 +103,17 @@ func TestCapTokenSignVerify(t *testing.T) {
 	csk := mk.DeriveCSK("tenant-1")
 
 	claims := &CapTokenClaims{
-		TokenID:   "cap_test123",
-		TenantID:  "tenant-1",
-		AgentID:   "agent-1",
-		TaskID:    "task-1",
-		Scope:     []string{"aws-prod", "db-prod/password"},
-		IssuedAt:  time.Now().Unix(),
-		ExpiresAt: time.Now().Add(time.Hour).Unix(),
-		Nonce:     "deadbeef",
+		Issuer:        "https://drive9.example.com",
+		PrincipalType: PrincipalDelegated,
+		GrantID:       "grt_test123",
+		TenantID:      "tenant-1",
+		Agent:         "agent-1",
+		Scope:         []string{"aws-prod", "db-prod/password"},
+		Perm:          PermRead,
+		IssuedAt:      time.Now().Unix(),
+		ExpiresAt:     time.Now().Add(time.Hour).Unix(),
+		LabelHint:     "agent-1-aws-prod",
+		Nonce:         "deadbeef",
 	}
 
 	tokenStr, err := SignCapToken(csk, claims)
@@ -123,11 +126,23 @@ func TestCapTokenSignVerify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify failed: %v", err)
 	}
-	if parsed.TokenID != claims.TokenID {
-		t.Fatalf("token_id mismatch: %s != %s", parsed.TokenID, claims.TokenID)
+	if parsed.GrantID != claims.GrantID {
+		t.Fatalf("grant_id mismatch: %s != %s", parsed.GrantID, claims.GrantID)
 	}
-	if parsed.AgentID != claims.AgentID {
-		t.Fatalf("agent_id mismatch")
+	if parsed.Agent != claims.Agent {
+		t.Fatalf("agent mismatch")
+	}
+	if parsed.Issuer != claims.Issuer {
+		t.Fatalf("iss mismatch: %s != %s", parsed.Issuer, claims.Issuer)
+	}
+	if parsed.PrincipalType != PrincipalDelegated {
+		t.Fatalf("principal_type mismatch: %s", parsed.PrincipalType)
+	}
+	if parsed.Perm != PermRead {
+		t.Fatalf("perm mismatch: %s", parsed.Perm)
+	}
+	if parsed.LabelHint != claims.LabelHint {
+		t.Fatalf("label_hint mismatch")
 	}
 	if len(parsed.Scope) != 2 {
 		t.Fatalf("scope length mismatch")
@@ -141,13 +156,16 @@ func TestCapTokenExpired(t *testing.T) {
 	csk := mk.DeriveCSK("tenant-1")
 
 	claims := &CapTokenClaims{
-		TokenID:   "cap_expired",
-		TenantID:  "tenant-1",
-		AgentID:   "agent-1",
-		Scope:     []string{"test"},
-		IssuedAt:  time.Now().Add(-2 * time.Hour).Unix(),
-		ExpiresAt: time.Now().Add(-1 * time.Hour).Unix(),
-		Nonce:     "abc",
+		Issuer:        "https://drive9.example.com",
+		PrincipalType: PrincipalDelegated,
+		GrantID:       "grt_expired",
+		TenantID:      "tenant-1",
+		Agent:         "agent-1",
+		Scope:         []string{"test"},
+		Perm:          PermRead,
+		IssuedAt:      time.Now().Add(-2 * time.Hour).Unix(),
+		ExpiresAt:     time.Now().Add(-1 * time.Hour).Unix(),
+		Nonce:         "abc",
 	}
 
 	tokenStr, _ := SignCapToken(csk, claims)
@@ -165,13 +183,16 @@ func TestCapTokenBadSignature(t *testing.T) {
 	csk := mk.DeriveCSK("tenant-1")
 
 	claims := &CapTokenClaims{
-		TokenID:   "cap_badsig",
-		TenantID:  "tenant-1",
-		AgentID:   "agent-1",
-		Scope:     []string{"test"},
-		IssuedAt:  time.Now().Unix(),
-		ExpiresAt: time.Now().Add(time.Hour).Unix(),
-		Nonce:     "xyz",
+		Issuer:        "https://drive9.example.com",
+		PrincipalType: PrincipalDelegated,
+		GrantID:       "grt_badsig",
+		TenantID:      "tenant-1",
+		Agent:         "agent-1",
+		Scope:         []string{"test"},
+		Perm:          PermRead,
+		IssuedAt:      time.Now().Unix(),
+		ExpiresAt:     time.Now().Add(time.Hour).Unix(),
+		Nonce:         "xyz",
 	}
 
 	tokenStr, _ := SignCapToken(csk, claims)
@@ -191,13 +212,16 @@ func TestPeekCapTokenTenantID(t *testing.T) {
 	csk := mk.DeriveCSK("tenant-42")
 
 	claims := &CapTokenClaims{
-		TokenID:   "cap_test",
-		TenantID:  "tenant-42",
-		AgentID:   "agent-1",
-		Scope:     []string{"secret-a"},
-		IssuedAt:  time.Now().Unix(),
-		ExpiresAt: time.Now().Add(time.Hour).Unix(),
-		Nonce:     "abc",
+		Issuer:        "https://drive9.example.com",
+		PrincipalType: PrincipalDelegated,
+		GrantID:       "grt_peek",
+		TenantID:      "tenant-42",
+		Agent:         "agent-1",
+		Scope:         []string{"secret-a"},
+		Perm:          PermRead,
+		IssuedAt:      time.Now().Unix(),
+		ExpiresAt:     time.Now().Add(time.Hour).Unix(),
+		Nonce:         "abc",
 	}
 	tokenStr, _ := SignCapToken(csk, claims)
 

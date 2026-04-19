@@ -264,28 +264,31 @@ func (s *Server) handleVaultTokens(w http.ResponseWriter, r *http.Request, sub s
 		return
 	}
 
-	// DELETE /v1/vault/tokens/{token_id}
-	tokenID := strings.TrimPrefix(sub, "/")
+	// DELETE /v1/vault/tokens/{grant_id}
+	grantID := strings.TrimPrefix(sub, "/")
 	if r.Method == http.MethodDelete {
-		s.handleVaultTokenRevoke(w, r, vs, tenantID, tokenID)
+		s.handleVaultTokenRevoke(w, r, vs, tenantID, grantID)
 		return
 	}
 	errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 }
 
 func (s *Server) handleVaultTokenIssue(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID string) {
+	// Request body matches spec §6 `vault grant`:
+	//   {agent, scope[], perm: "read"|"write", ttl_seconds, label_hint?}
 	var req struct {
-		AgentID string   `json:"agent_id"`
-		TaskID  string   `json:"task_id"`
-		Scope   []string `json:"scope"`
-		TTLSecs int      `json:"ttl_seconds"`
+		Agent     string   `json:"agent"`
+		Scope     []string `json:"scope"`
+		Perm      string   `json:"perm"`
+		TTLSecs   int      `json:"ttl_seconds"`
+		LabelHint string   `json:"label_hint"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if req.AgentID == "" {
-		errJSON(w, http.StatusBadRequest, "agent_id is required")
+	if req.Agent == "" {
+		errJSON(w, http.StatusBadRequest, "agent is required")
 		return
 	}
 	if len(req.Scope) == 0 {
@@ -296,35 +299,74 @@ func (s *Server) handleVaultTokenIssue(w http.ResponseWriter, r *http.Request, v
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	ttl := time.Duration(req.TTLSecs) * time.Second
-	if ttl <= 0 {
-		ttl = time.Hour // default 1 hour
+	perm := vault.Perm(req.Perm)
+	if perm != vault.PermRead && perm != vault.PermWrite {
+		errJSON(w, http.StatusBadRequest, "perm must be 'read' or 'write'")
+		return
 	}
+	// Spec §6: --ttl is required; reject zero / negative.
+	if req.TTLSecs <= 0 {
+		errJSON(w, http.StatusBadRequest, "ttl_seconds is required and must be positive")
+		return
+	}
+	ttl := time.Duration(req.TTLSecs) * time.Second
 
-	tokenStr, capToken, err := vs.IssueCapToken(r.Context(), tenantID, req.AgentID, req.TaskID, req.Scope, ttl)
+	issuer := requestIssuer(r)
+	tokenStr, capToken, err := vs.IssueCapToken(r.Context(), vault.IssueCapTokenParams{
+		TenantID:      tenantID,
+		Issuer:        issuer,
+		PrincipalType: vault.PrincipalDelegated,
+		Agent:         req.Agent,
+		Scope:         req.Scope,
+		Perm:          perm,
+		LabelHint:     req.LabelHint,
+		TTL:           ttl,
+	})
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "failed to issue token")
+		errJSON(w, http.StatusInternalServerError, "failed to issue grant")
 		return
 	}
 
 	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
 		TenantID:  tenantID,
-		EventType: "token.issued",
-		TokenID:   capToken.TokenID,
-		AgentID:   req.AgentID,
-		TaskID:    req.TaskID,
+		EventType: "grant.issued",
+		GrantID:   capToken.GrantID,
+		Agent:     req.Agent,
 	})
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
+	// Response shape matches spec §6 line 133: {token, grant_id, expires_at, scope[], perm, ttl}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"token":      tokenStr,
-		"token_id":   capToken.TokenID,
+		"grant_id":   capToken.GrantID,
 		"expires_at": capToken.ExpiresAt,
+		"scope":      capToken.Scope,
+		"perm":       string(capToken.Perm),
+		"ttl":        int(ttl / time.Second),
 	})
 }
 
-func (s *Server) handleVaultTokenRevoke(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, tokenID string) {
+// requestIssuer derives the iss claim for grants issued on this request.
+// Uses the request's scheme+host; for production deployments behind a proxy,
+// the reverse proxy MUST set X-Forwarded-Proto / Host correctly.
+func requestIssuer(r *http.Request) string {
+	scheme := "https"
+	if r.TLS == nil {
+		if xfp := r.Header.Get("X-Forwarded-Proto"); xfp != "" {
+			scheme = xfp
+		} else {
+			scheme = "http"
+		}
+	}
+	host := r.Host
+	if xfh := r.Header.Get("X-Forwarded-Host"); xfh != "" {
+		host = xfh
+	}
+	return scheme + "://" + host
+}
+
+func (s *Server) handleVaultTokenRevoke(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, grantID string) {
 	var req struct {
 		RevokedBy string `json:"revoked_by"`
 		Reason    string `json:"reason"`
@@ -335,20 +377,20 @@ func (s *Server) handleVaultTokenRevoke(w http.ResponseWriter, r *http.Request, 
 		req.RevokedBy = "api"
 	}
 
-	err := vs.RevokeCapToken(r.Context(), tenantID, tokenID, req.RevokedBy, req.Reason)
+	err := vs.RevokeCapToken(r.Context(), tenantID, grantID, req.RevokedBy, req.Reason)
 	if err != nil {
 		if errors.Is(err, vault.ErrNotFound) {
-			errJSON(w, http.StatusNotFound, "token not found or already revoked")
+			errJSON(w, http.StatusNotFound, "grant not found or already revoked")
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, "failed to revoke token")
+		errJSON(w, http.StatusInternalServerError, "failed to revoke grant")
 		return
 	}
 
 	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
 		TenantID:  tenantID,
-		EventType: "token.revoked",
-		TokenID:   tokenID,
+		EventType: "grant.revoked",
+		GrantID:   grantID,
 	})
 
 	w.Header().Set("Content-Type", "application/json")
@@ -485,9 +527,8 @@ func (s *Server) handleVaultReadEnumerate(w http.ResponseWriter, r *http.Request
 	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
 		TenantID:  claims.TenantID,
 		EventType: "secret.list",
-		TokenID:   claims.TokenID,
-		AgentID:   claims.AgentID,
-		TaskID:    claims.TaskID,
+		GrantID:   claims.GrantID,
+		Agent:     claims.Agent,
 		Adapter:   "api",
 	})
 
@@ -505,8 +546,8 @@ func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, v
 		_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
 			TenantID:   claims.TenantID,
 			EventType:  "secret.denied",
-			TokenID:    claims.TokenID,
-			AgentID:    claims.AgentID,
+			GrantID:    claims.GrantID,
+			Agent:      claims.Agent,
 			SecretName: secretName,
 			Detail:     map[string]string{"reason": "out_of_scope"},
 		})
@@ -541,9 +582,8 @@ func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, v
 	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
 		TenantID:   claims.TenantID,
 		EventType:  "secret.read",
-		TokenID:    claims.TokenID,
-		AgentID:    claims.AgentID,
-		TaskID:     claims.TaskID,
+		GrantID:    claims.GrantID,
+		Agent:      claims.Agent,
 		SecretName: secretName,
 		Adapter:    "api",
 	})
@@ -573,8 +613,8 @@ func (s *Server) handleVaultReadField(w http.ResponseWriter, r *http.Request, vs
 		_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
 			TenantID:   claims.TenantID,
 			EventType:  "secret.denied",
-			TokenID:    claims.TokenID,
-			AgentID:    claims.AgentID,
+			GrantID:    claims.GrantID,
+			Agent:      claims.Agent,
 			SecretName: secretName,
 			FieldName:  fieldName,
 			Detail:     map[string]string{"reason": "out_of_scope"},
@@ -596,9 +636,8 @@ func (s *Server) handleVaultReadField(w http.ResponseWriter, r *http.Request, vs
 	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
 		TenantID:   claims.TenantID,
 		EventType:  "secret.read",
-		TokenID:    claims.TokenID,
-		AgentID:    claims.AgentID,
-		TaskID:     claims.TaskID,
+		GrantID:    claims.GrantID,
+		Agent:      claims.Agent,
 		SecretName: secretName,
 		FieldName:  fieldName,
 		Adapter:    "api",

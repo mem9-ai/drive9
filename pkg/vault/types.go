@@ -14,6 +14,23 @@ const (
 	SecretTypeTLSCert        SecretType = "tls_cert"
 )
 
+// PrincipalType is the kind of principal bound to a credential (spec §16).
+// "owner" credentials come from ctx add --api-key; "delegated" from vault grant.
+type PrincipalType string
+
+const (
+	PrincipalOwner     PrincipalType = "owner"
+	PrincipalDelegated PrincipalType = "delegated"
+)
+
+// Perm is the permission level carried by a delegated grant (spec §6).
+type Perm string
+
+const (
+	PermRead  Perm = "read"
+	PermWrite Perm = "write"
+)
+
 // Secret is the metadata for a stored secret (no plaintext values).
 type Secret struct {
 	SecretID   string     `json:"secret_id"`
@@ -35,45 +52,52 @@ type SecretField struct {
 	Nonce          []byte `json:"-"`
 }
 
-// CapToken is the server-side state for a capability token.
+// CapToken is the server-side row for a capability grant (spec §16).
+// GrantID is the stable identifier used by `vault revoke grt_...`.
 type CapToken struct {
-	TokenID     string     `json:"token_id"`
-	TenantID    string     `json:"tenant_id"`
-	AgentID     string     `json:"agent_id"`
-	TaskID      string     `json:"task_id,omitempty"`
-	Scope       []string   `json:"scope"`
-	IssuedAt    time.Time  `json:"issued_at"`
-	ExpiresAt   time.Time  `json:"expires_at"`
-	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
-	RevokedBy   string     `json:"revoked_by,omitempty"`
-	RevokeReason string    `json:"revoke_reason,omitempty"`
+	GrantID       string        `json:"grant_id"`
+	TenantID      string        `json:"tenant_id"`
+	Issuer        string        `json:"iss"`
+	PrincipalType PrincipalType `json:"principal_type"`
+	Agent         string        `json:"agent"`
+	Scope         []string      `json:"scope"`
+	Perm          Perm          `json:"perm"`
+	LabelHint     string        `json:"label_hint,omitempty"`
+	IssuedAt      time.Time     `json:"issued_at"`
+	ExpiresAt     time.Time     `json:"expires_at"`
+	RevokedAt     *time.Time    `json:"revoked_at,omitempty"`
+	RevokedBy     string        `json:"revoked_by,omitempty"`
+	RevokeReason  string        `json:"revoke_reason,omitempty"`
 }
 
-// CapTokenClaims is the payload signed into the bearer token.
+// CapTokenClaims is the signed JWT-style payload (spec §16).
+// Wire shape is fixed by spec; JSON tags MUST match exactly.
 type CapTokenClaims struct {
-	TokenID   string   `json:"token_id"`
-	TenantID  string   `json:"tenant_id"`
-	AgentID   string   `json:"agent_id"`
-	TaskID    string   `json:"task_id,omitempty"`
-	Scope     []string `json:"scope"`
-	IssuedAt  int64    `json:"iat"`
-	ExpiresAt int64    `json:"exp"`
-	Nonce     string   `json:"nonce"`
+	Issuer        string        `json:"iss"`
+	PrincipalType PrincipalType `json:"principal_type"`
+	GrantID       string        `json:"grant_id"`
+	TenantID      string        `json:"tenant_id"`
+	Agent         string        `json:"agent"`
+	Scope         []string      `json:"scope"`
+	Perm          Perm          `json:"perm"`
+	IssuedAt      int64         `json:"iat"`
+	ExpiresAt     int64         `json:"exp"`
+	LabelHint     string        `json:"label_hint,omitempty"`
+	Nonce         string        `json:"nonce"`
 }
 
 // AuditEvent is an append-only audit log entry.
 type AuditEvent struct {
-	EventID    string     `json:"event_id"`
-	TenantID   string     `json:"tenant_id"`
-	EventType  string     `json:"event_type"`
-	TokenID    string     `json:"token_id,omitempty"`
-	AgentID    string     `json:"agent_id,omitempty"`
-	TaskID     string     `json:"task_id,omitempty"`
-	SecretName string     `json:"secret_name,omitempty"`
-	FieldName  string     `json:"field_name,omitempty"`
-	Adapter    string     `json:"adapter,omitempty"`
-	Detail     any        `json:"detail,omitempty"`
-	Timestamp  time.Time  `json:"timestamp"`
+	EventID    string    `json:"event_id"`
+	TenantID   string    `json:"tenant_id"`
+	EventType  string    `json:"event_type"`
+	GrantID    string    `json:"grant_id,omitempty"`
+	Agent      string    `json:"agent,omitempty"`
+	SecretName string    `json:"secret_name,omitempty"`
+	FieldName  string    `json:"field_name,omitempty"`
+	Adapter    string    `json:"adapter,omitempty"`
+	Detail     any       `json:"detail,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
 }
 
 // TenantDEK holds the wrapped (encrypted) data encryption key for a tenant.
