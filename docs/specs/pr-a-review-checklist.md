@@ -25,7 +25,7 @@ Reviewers: `@adversary-1`, `@adversary-2`. Walk every item. If any item fails, b
 - [ ] `scope` empty or invalid → EACCES. Tested.
 - [ ] `iss` mismatch with server's canonical URL → EACCES AND audit event. Tested.
 - [ ] Clock skew on `exp`: within ±60s leeway → pass; beyond → fail. Both sides tested.
-- [ ] **No audit event on HMAC failure.** (Grep `WriteAuditEvent` before `VerifyCapToken`-returning-error paths. If present, block — attacker can flood audit.)
+- [ ] **No audit event on HMAC failure.** (Grep `WriteAuditEvent` before `VerifyAndResolveGrant`-returning-error paths. If present, block — attacker can flood audit.)
 - [ ] No information leak in error strings returned to HTTP clients — `"invalid grant"` / `"grant expired"` / `"grant revoked"` are OK; `"grant not found for tenant foo"` is NOT.
 
 ## C. Authorization (§13 one-active-ctx, §20 non-goal)
@@ -39,7 +39,7 @@ Reviewers: `@adversary-1`, `@adversary-2`. Walk every item. If any item fails, b
 ## D. Schema & migration (§20 — no backward compat)
 
 - [ ] `vault_grants` table created with the exact column set from `pr-a-jwt-implementation.md` §3.
-- [ ] `vault_tokens` table dropped (or at least flagged for drop in a follow-up). No dual-write code.
+- [ ] `vault_tokens` table is **NOT** touched by PR-A (additive scope per `pr-a-jwt-implementation.md` §3 and §10 deletion contract — the only permitted drop point is PR-E). No dual-write code on the new `vault_grants` path.
 - [ ] No code path references `task_id`.
 - [ ] Indexes on `tenant_id` and `expires_at` present (revocation queries + pruning).
 

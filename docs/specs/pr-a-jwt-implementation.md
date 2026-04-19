@@ -36,7 +36,7 @@ Submitting a PR that grows beyond the table above = automatic block. Keep sub-PR
 
 ## 2. JWT payload — the **exact** claim set (§16)
 
-The payload MUST contain **all** of these claims and **only** these claims (no `task_id`, no `tenant_id` in the token body, no `iat` if you don't verify it — see note):
+The payload MUST contain **all** of these claims and **only** these claims (no `task_id`, no `tenant_id`, no `iat` in the token body — `VerifyGrant` uses `DisallowUnknownFields` and `VaultGrantClaims` has exactly the 8 fields below):
 
 | JSON key | Go field | Type | Required | Notes |
 |---|---|---|---|---|
@@ -54,7 +54,7 @@ The payload MUST contain **all** of these claims and **only** these claims (no `
 - `tenant_id` → **removed from the token body**. Server derives tenant from the `iss` + its own registry, or from the auth middleware scope (for owner endpoints); tenant MUST NOT be trusted from the token body. (This closes a forgery class where an attacker sets `tenant_id` in an unsigned portion of the token.)
 - `task_id` → removed entirely (§20 no-backward-compat; was a Phase-0 concept).
 - `agent_id` → renamed to `agent`.
-- `iat` → keep as `int64` `iat` if you want freshness logs, but verify paths rely only on `exp`. If removed, remove from signing too — no asymmetric shape.
+- `iat` → **removed entirely**. Not in `VaultGrantClaims`, not signed, and rejected at verify time by `DisallowUnknownFields`. Freshness is via `exp` only. (Earlier drafts left `iat` optional; the shipped code forbids it — this line is the source of truth.)
 - `nonce` → keep as a signing-layer detail (outside the claims struct, inside the HMAC computation) to prevent deterministic-token replay. Do not expose in JSON.
 
 **Signing algorithm:** unchanged — HMAC-SHA256 with the tenant-derived CSK (`MasterKey.DeriveCSK(tenantID)`). v0 does NOT need asymmetric keys; the delegatee trusts `iss` via TOFU and verifies by calling the server.
@@ -65,7 +65,7 @@ The payload MUST contain **all** of these claims and **only** these claims (no `
 
 ## 3. SQL schema — `vault_grants` table
 
-ADD alongside `vault_tokens` (old table untouched; removed in PR-F):
+ADD alongside `vault_tokens` (old table untouched; removed in PR-E per §10 deletion contract):
 
 ```sql
 CREATE TABLE vault_grants (
@@ -167,7 +167,7 @@ Every issue/revoke/validate path writes to `vault_audit_log` (reuse existing `Wr
 
 ## 6. Test plan (MUST ship with the PR)
 
-New tests (add to `pkg/vault/store_test.go` + `crypto_test.go`):
+New tests live in `pkg/vault/grant_test.go` + `pkg/vault/grant_sign_test.go` (new files, per §1 file map). Do NOT touch `store_test.go` / `crypto_test.go` — those stay with the legacy CapToken surface until PR-E.
 
 1. **Happy path (delegated)**: `IssueGrant` with `PrincipalDelegated` → `VerifyAndResolveGrant` → success; claims round-trip all §16 fields (iss, grant_id, principal_type, agent, scope, perm, exp, label_hint).
 2. **Wire format lock**: `SignGrant` emits `vt_<headerB64>.<payloadB64>.<macB64>` with header = `{"alg":"HS256","typ":"JWT"}`. `VerifyGrant` is HS256-only regardless of header `alg` value (alg-confusion hardcoded closed).
