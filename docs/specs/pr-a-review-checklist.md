@@ -30,10 +30,11 @@ Reviewers: `@adversary-1`, `@adversary-2`. Walk every item. If any item fails, b
 
 ## C. Authorization (§13 one-active-ctx, §20 non-goal)
 
-- [ ] Issuing as `principal_type=delegated` is refused (HTTP 403). Tested.
-- [ ] Issuing as `principal_type=owner` works only when caller presents owner API key; tenant middleware correctly gates this.
+- [ ] `/v1/vault/grants` mints `principal_type=delegated` **unconditionally**. `principal_type` MUST NOT be a caller-controllable request field — the handler hardcodes `vault.PrincipalDelegated` regardless of request body. (Per end-state spec §16 `vault grant` output is delegated-only.)
+- [ ] Owner grants are NOT mintable through this endpoint. If you see a request-struct field for `principal_type` or a code path that honors a client-supplied principal, block.
+- [ ] Router layer (`tenantAuthMiddleware`) restricts the endpoint to tenant owners — delegated JWTs cannot structurally reach the handler. This is the outer guard; the delegated-only minting above is the inner guard (belt + suspenders).
 - [ ] Scope at issue time is validated by `ValidateScope` — no `../` escape, no wildcard, no absolute paths. Tested.
-- [ ] TTL has a server-side upper bound (suggest 24h default cap) OR a rationale if unbounded. Doc the choice in PR body.
+- [ ] `ttl_seconds` is REQUIRED at the HTTP boundary: missing / 0 / negative → HTTP 400 with `"ttl_seconds is required and must be > 0"`. No silent default. (Per spec §6 "--ttl is required".) No server-side upper bound in PR-A; any cap is a follow-up spec amendment.
 
 ## D. Schema & migration (§20 — no backward compat)
 
@@ -51,7 +52,7 @@ Reviewers: `@adversary-1`, `@adversary-2`. Walk every item. If any item fails, b
 ## F. CLI/client decode (Invariant #7, looking forward to PR-B)
 
 - [ ] `pkg/client/vault.go` helpers return `{token_string, grant_id, expires_at, scope, perm}`. Client-side decode of the JWT payload is OK for UX (Invariant #7), but NO client code may gate behavior on the payload — server is always authoritative.
-- [ ] Display prefix (`vt_`) NOT added in `pkg/client` or `pkg/vault` — that's a CLI concern in PR-E.
+- [ ] Wire-format prefix (`vt_`) IS emitted by `SignGrant` in `pkg/vault/grant_sign.go` as part of the token string per merged spec §16. The token the server returns and the client receives already carries `vt_`; it is not a CLI display concern. If you see CLI code concatenating `vt_` on top of server output, block.
 
 ## G. Audit event correctness
 
@@ -76,7 +77,7 @@ Specific cases to check:
 - [ ] **Scope narrowing at verify time**: if scope in DB differs from scope in JWT (DB tampered), which wins? Spec says JWT is authoritative post-HMAC, but DB has revocation → does narrowing in DB actually work? (Expected: JWT scope wins; revocation is DB-only. Document.)
 - [ ] **`label_hint` with newlines / escape sequences**: can it break an audit log line? (Expected: detail_json escapes; test with `"evil\n[INJECTED]"`.)
 - [ ] **Empty string `agent`**: accepted or rejected? Spec doesn't say. (Recommend: reject at issue time with 400 — close the silent default.)
-- [ ] **TTL = 0 or negative**: spec defaults to 1h if ≤0 (current code does). Is that safe-default or surprising? (Owner asked for ttl=0 — probably wanted "forever" — we silently gave 1h. Surface this in PR body, consider 400 instead.)
+- [ ] **TTL = 0 or negative**: handler rejects with HTTP 400 (`"ttl_seconds is required and must be > 0"`). No silent default. Confirm the rejection fires before any DB / audit write (fail-closed at the request edge).
 - [ ] **HMAC timing**: is verify using `hmac.Equal` / `subtle.ConstantTimeCompare`, not `bytes.Equal`? Timing side-channel.
 
 If any silent-requirement item uncovers a gap, the fix is typically a MUST line added to `vault-interaction-end-state.md` §16 (follow-up PR to spec) plus a check in `VerifyAndResolveGrant`. Do not let the PR merge with a known silent-requirement gap.

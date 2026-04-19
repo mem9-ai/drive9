@@ -117,7 +117,7 @@ Issuer (`iss` claim): server-side only, sourced from `server.Config.VaultIssuerU
 Response (201):
 ```json
 {
-  "token": "eyJhbGc...",      // the signed JWT, display-prefix added by CLI later
+  "token": "vt_eyJhbGc...",   // the signed JWT, `vt_` prefix emitted by SignGrant per §16 wire format
   "grant_id": "grt_7f2a",
   "expires_at": "2026-04-18T19:00:00Z",
   "scope": ["prod-db/DB_URL"],
@@ -169,18 +169,24 @@ Every issue/revoke/validate path writes to `vault_audit_log` (reuse existing `Wr
 
 New tests (add to `pkg/vault/store_test.go` + `crypto_test.go`):
 
-1. **Happy path**: issue owner grant → verify → success; claims round-trip all 8 fields.
-2. **Happy path**: issue delegated grant → verify → success.
+1. **Happy path (delegated)**: `IssueGrant` with `PrincipalDelegated` → `VerifyAndResolveGrant` → success; claims round-trip all §16 fields (iss, grant_id, principal_type, agent, scope, perm, exp, label_hint).
+2. **Wire format lock**: `SignGrant` emits `vt_<headerB64>.<payloadB64>.<macB64>` with header = `{"alg":"HS256","typ":"JWT"}`. `VerifyGrant` is HS256-only regardless of header `alg` value (alg-confusion hardcoded closed).
 3. **Expired**: issue with ttl=1s, sleep 2s, verify → EACCES "expired".
-4. **Revoked**: issue → revoke → verify → EACCES "revoked".
-5. **Cross-tenant replay**: issue under tenant A, verify under tenant B with forged DB row → CSK mismatch → EACCES "invalid".
-6. **Missing `principal_type`**: hand-craft a JWT missing the claim → EACCES "malformed".
-7. **Bad `perm` value** (e.g. `"admin"`) → EACCES "malformed".
-8. **Empty scope** → rejected at issue time (400 at HTTP boundary, validation error at store layer).
-9. **Re-delegation denied** (principal_type of caller == "delegated") → HTTP 403 from `/v1/vault/grants`.
-10. **`iss` mismatch**: mint with server URL A, verify under server URL B → EACCES "invalid issuer" (and audit event).
-11. **`exp` with −30s clock skew**: should still verify (within leeway).
-12. **`exp` with −61s clock skew**: should fail.
+4. **Revoked**: issue → revoke → verify → EACCES "revoked". Double-revoke returns `ErrNotFound`.
+5. **Cross-tenant replay**: issue under tenant A, verify under tenant B → CSK mismatch → EACCES "invalid".
+6. **Missing required claim**: table-driven over all §16 required claims — hand-craft HMAC-valid token with one claim deleted → `VerifyGrant` rejects. (Lives in `grant_sign_test.go`.)
+7. **Unknown claim**: hand-craft HMAC-valid token with a smuggled field (e.g. `tenant_id`) → `VerifyGrant` rejects via `DisallowUnknownFields`.
+8. **Bad `perm` value** at issue time (e.g. `"admin"`) → `IssueGrant` rejects. At sign time, `SignGrant` also rejects.
+9. **Bad `principal_type`** at issue time (e.g. `"root"`) → `IssueGrant` rejects. `SignGrant` also rejects.
+10. **Empty scope / empty agent / empty issuer / ttl≤0** at issue time → `IssueGrant` rejects. At HTTP boundary, ttl≤0 → HTTP 400 `"ttl_seconds is required and must be > 0"`.
+11. **Delegated-only mint contract**: client helper `IssueVaultGrant` MUST NOT send `principal_type` on the wire; test decodes request into `map[string]any` and asserts the key is absent. Server hardcodes `vault.PrincipalDelegated` — not caller-controllable. (Re-delegation from delegated callers is blocked upstream by `tenantAuthMiddleware`; no handler-level HTTP 403 test needed in PR-A because delegated JWTs cannot structurally reach the owner-only handler. Active delegated-caller rejection lands in PR-D when `VerifyAndResolveGrant` is wired into middleware.)
+12. **`iss` mismatch**: mint with server URL A, verify under server URL B → EACCES "issuer mismatch". Empty `expectedIssuer` skips the check (test-only carve-out, documented in `VerifyAndResolveGrant`).
+13. **`exp` with −30s clock skew**: still verifies (within ±60s leeway).
+14. **`exp` with −61s clock skew (beyond skew)**: EACCES "expired".
+15. **Tampered signature**: replace last segment with valid-looking bytes → `VerifyGrant` rejects.
+16. **Wrong CSK**: sign with CSK1, verify with CSK2 → rejects (cross-tenant replay guard at crypto layer).
+17. **Missing `vt_` prefix**: strip prefix from a valid token → `VerifyGrant` rejects.
+18. **Client helper round-trip**: `IssueVaultGrant` / `RevokeVaultGrant` against `httptest.NewServer` — payload shape, auth header (`Bearer tenant-key`), decoded response, and `*StatusError` propagation on 4xx (400 on bad ttl, 404 on revoke-missing).
 
 No integration tests for HTTP in PR-A — leave that to PR-B onward once there's a full `ctx` flow to exercise.
 
