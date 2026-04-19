@@ -63,7 +63,7 @@ Reviewers: `@adversary-1`, `@adversary-2`. Walk every item. If any item fails, b
 
 ## H. Test suite
 
-- [ ] All 12 cases from `pr-a-jwt-implementation.md` §6 present and passing.
+- [ ] All 18 cases from `pr-a-jwt-implementation.md` §6 present and passing.
 - [ ] No `t.Skip` in the new tests (only in the existing `secret_commands_test.go` if needed, with a comment pointing to PR-E).
 - [ ] Failure-case assertions check the returned errno/HTTP-code, not just "err != nil".
 

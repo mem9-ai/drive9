@@ -19,7 +19,7 @@ This document is the hand-off for whoever implements PR-A. Follow it literally; 
 | `pkg/vault/grant_sign.go` (**new file**) | New file for `SignGrant`/`VerifyGrant` (JWT-style HMAC-SHA256 on the new payload shape). Do NOT touch `crypto.go`. Prefix constant: `vt_`. |
 | `pkg/vault/schema.go` + `pkg/tenant/schema/vault.go` + `pkg/tenant/schema/tidb_auto.go` | **ADD** `vault_grants` table DDL. Leave `vault_tokens` DDL untouched. |
 | `pkg/server/vault.go` | **ADD** `handleVaultGrants`/`handleVaultGrantIssue`/`handleVaultGrantRevoke` and route `/v1/vault/grants`. Leave `/v1/vault/tokens` handlers untouched. |
-| `pkg/vault/grant_test.go` + `pkg/vault/grant_sign_test.go` (**new**) | Tests for the 12 cases in §6. Do NOT touch `store_test.go` / `crypto_test.go`. |
+| `pkg/vault/grant_test.go` + `pkg/vault/grant_sign_test.go` (**new**) | Tests for the 18 cases in §6. Do NOT touch `store_test.go` / `crypto_test.go`. |
 | `pkg/client/vault.go` | **ADD** `IssueVaultGrant(ctx, scope, agent, perm, ttl, labelHint)` and `RevokeVaultGrant(grantID)` helpers. Leave existing `IssueVaultToken`/`RevokeVaultToken` untouched. |
 | `pkg/client/vault_test.go` | **ADD** tests for the two new helpers; do not touch existing tests. |
 
