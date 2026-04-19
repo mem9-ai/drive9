@@ -562,6 +562,7 @@ func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, v
 			GrantID:    claims.GrantID,
 			Agent:      claims.Agent,
 			SecretName: secretName,
+			Adapter:    "api",
 			Detail:     map[string]string{"reason": "out_of_scope"},
 		})
 		// Return 404 to avoid leaking secret existence.
@@ -630,6 +631,7 @@ func (s *Server) handleVaultReadField(w http.ResponseWriter, r *http.Request, vs
 			Agent:      claims.Agent,
 			SecretName: secretName,
 			FieldName:  fieldName,
+			Adapter:    "api",
 			Detail:     map[string]string{"reason": "out_of_scope"},
 		})
 		errJSON(w, http.StatusNotFound, "not found")
