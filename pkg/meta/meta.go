@@ -17,8 +17,10 @@ import (
 )
 
 var (
-	ErrNotFound  = errors.New("not found")
-	ErrDuplicate = errors.New("duplicate entry")
+	ErrNotFound                 = errors.New("not found")
+	ErrDuplicate                = errors.New("duplicate entry")
+	ErrStorageQuotaExceeded     = errors.New("tenant storage quota exceeded")
+	ErrReservationAlreadyExists = errors.New("upload reservation already exists")
 )
 
 type TenantStatus string
@@ -145,6 +147,8 @@ func (s *Store) migrate() error {
 			INDEX idx_api_keys_tenant (tenant_id, status),
 			UNIQUE INDEX idx_api_keys_tenant_name (tenant_id, key_name)
 		)`,
+		// --- LLM usage table (PR #245 migration) ---
+
 		`CREATE TABLE IF NOT EXISTS llm_usage (
 			id              BIGINT AUTO_INCREMENT PRIMARY KEY,
 			tenant_id       VARCHAR(64) NOT NULL,
@@ -156,6 +160,80 @@ func (s *Store) migrate() error {
 			created_at      DATETIME(3) NOT NULL,
 			INDEX idx_llm_usage_tenant_created (tenant_id, created_at),
 			INDEX idx_llm_usage_created (created_at)
+		)`,
+
+		// --- Quota tables (Rev 4 migration) ---
+
+		`CREATE TABLE IF NOT EXISTS tenant_quota_config (
+			tenant_id             VARCHAR(64) PRIMARY KEY,
+			max_storage_bytes     BIGINT NOT NULL DEFAULT 53687091200,
+			max_media_llm_files   BIGINT NOT NULL DEFAULT 500,
+			max_monthly_cost_mc   BIGINT NOT NULL DEFAULT 0,
+			created_at            DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at            DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS tenant_quota_usage (
+			tenant_id          VARCHAR(64) PRIMARY KEY,
+			storage_bytes      BIGINT NOT NULL DEFAULT 0,
+			reserved_bytes     BIGINT NOT NULL DEFAULT 0,
+			media_file_count   BIGINT NOT NULL DEFAULT 0,
+			updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS tenant_file_meta (
+			tenant_id    VARCHAR(64) NOT NULL,
+			file_id      VARCHAR(64) NOT NULL,
+			size_bytes   BIGINT NOT NULL DEFAULT 0,
+			is_media     TINYINT(1) NOT NULL DEFAULT 0,
+			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (tenant_id, file_id)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS tenant_upload_reservations (
+			tenant_id      VARCHAR(64) NOT NULL,
+			upload_id      VARCHAR(64) NOT NULL,
+			reserved_bytes BIGINT NOT NULL,
+			target_path    VARCHAR(4096) NOT NULL,
+			status         VARCHAR(20) NOT NULL DEFAULT 'active',
+			expires_at     DATETIME(3) NOT NULL,
+			created_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (tenant_id, upload_id),
+			INDEX idx_active_reservations (tenant_id, status, expires_at)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS tenant_llm_usage (
+			id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+			tenant_id       VARCHAR(64) NOT NULL,
+			task_type       VARCHAR(32) NOT NULL,
+			task_id         VARCHAR(64) NOT NULL,
+			cost_millicents BIGINT NOT NULL DEFAULT 0,
+			raw_units       BIGINT NOT NULL DEFAULT 0,
+			raw_unit_type   VARCHAR(16) NOT NULL,
+			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			INDEX idx_tenant_month (tenant_id, created_at)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS tenant_monthly_llm_cost (
+			tenant_id    VARCHAR(64) NOT NULL,
+			month_start  DATE NOT NULL,
+			total_mc     BIGINT NOT NULL DEFAULT 0,
+			PRIMARY KEY (tenant_id, month_start)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS quota_mutation_log (
+			id             BIGINT AUTO_INCREMENT PRIMARY KEY,
+			tenant_id      VARCHAR(64) NOT NULL,
+			mutation_type  VARCHAR(32) NOT NULL,
+			mutation_data  JSON NOT NULL,
+			status         VARCHAR(20) NOT NULL DEFAULT 'pending',
+			retry_count    INT NOT NULL DEFAULT 0,
+			created_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			applied_at     DATETIME(3) NULL,
+			INDEX idx_pending (status, created_at),
+			INDEX idx_tenant_order (tenant_id, id)
 		)`,
 	}
 	for _, stmt := range stmts {

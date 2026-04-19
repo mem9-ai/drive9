@@ -237,7 +237,7 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 	if !b.SupportsAsyncAudioExtract() {
 		return AudioExtractResultRuntimeNotConfigured, fmt.Errorf("async audio extract runtime not configured")
 	}
-	if b.monthlyLLMCostExceeded() {
+	if b.monthlyLLMCostExceededCheck(ctx) {
 		metrics.RecordOperation("llm_cost_budget", "process_skip", "budget_exhausted", 0)
 		return AudioExtractResultBudgetExhausted, nil
 	}

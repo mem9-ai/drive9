@@ -32,7 +32,17 @@ func (b *Dat9Backend) recordImageExtractUsage(taskID string, usage ImageExtractU
 	if cost <= 0 {
 		return
 	}
-	b.insertLLMUsage("img_extract_text", taskID, cost, totalTokens, "tokens")
+	// Write to tenant DB only when server quota is not active.
+	if !b.UseServerQuota() {
+		if err := b.store.InsertLLMUsage("img_extract_text", taskID, cost, totalTokens, "tokens"); err != nil {
+			logger.Warn(backgroundWithTrace(), "llm_usage_insert_failed",
+				zap.String("task_type", "img_extract_text"),
+				zap.String("task_id", taskID),
+				zap.Error(err))
+			metrics.RecordOperation("llm_cost_budget", "usage_insert", "error", 0)
+		}
+	}
+	b.syncCentralLLMCostRecord(backgroundWithTrace(), "img_extract_text", taskID, cost, totalTokens, "tokens")
 }
 
 func (b *Dat9Backend) recordAudioExtractUsage(taskID string, usage AudioExtractUsage) {
@@ -56,32 +66,17 @@ func (b *Dat9Backend) recordAudioExtractUsage(taskID string, usage AudioExtractU
 	if cost <= 0 {
 		return
 	}
-	b.insertLLMUsage("audio_extract_text", taskID, cost, rawUnits, rawUnitType)
-}
-
-// insertLLMUsage writes a usage record to the meta store (if configured) or
-// falls back to the per-tenant datastore.
-func (b *Dat9Backend) insertLLMUsage(taskType, taskID string, costMillicents, rawUnits int64, rawUnitType string) {
-	if b.metaLLMStore != nil && b.tenantID != "" {
-		ctx := backgroundWithTrace()
-		if err := b.metaLLMStore.InsertLLMUsage(ctx, b.tenantID, taskType, taskID, costMillicents, rawUnits, rawUnitType); err != nil {
-			logger.Warn(ctx, "llm_usage_meta_insert_failed",
-				zap.String("task_type", taskType),
+	// Write to tenant DB only when server quota is not active.
+	if !b.UseServerQuota() {
+		if err := b.store.InsertLLMUsage("audio_extract_text", taskID, cost, rawUnits, rawUnitType); err != nil {
+			logger.Warn(backgroundWithTrace(), "llm_usage_insert_failed",
+				zap.String("task_type", "audio_extract_text"),
 				zap.String("task_id", taskID),
-				zap.String("tenant_id", b.tenantID),
 				zap.Error(err))
-			metrics.RecordOperation("llm_cost_budget", "meta_usage_insert", "error", 0)
+			metrics.RecordOperation("llm_cost_budget", "usage_insert", "error", 0)
 		}
-		return
 	}
-	// Fallback: write to tenant datastore (pre-migration path).
-	if err := b.store.InsertLLMUsage(taskType, taskID, costMillicents, rawUnits, rawUnitType); err != nil {
-		logger.Warn(backgroundWithTrace(), "llm_usage_insert_failed",
-			zap.String("task_type", taskType),
-			zap.String("task_id", taskID),
-			zap.Error(err))
-		metrics.RecordOperation("llm_cost_budget", "usage_insert", "error", 0)
-	}
+	b.syncCentralLLMCostRecord(backgroundWithTrace(), "audio_extract_text", taskID, cost, rawUnits, rawUnitType)
 }
 
 func (b *Dat9Backend) imageTokenCostMillicents(totalTokens int64) int64 {
@@ -113,44 +108,20 @@ func (b *Dat9Backend) monthlyLLMCostExceeded() bool {
 	if b.maxMonthlyLLMCostMillicents <= 0 {
 		return false
 	}
-
-	var total int64
-
-	// Read from meta store if configured.
-	if b.metaLLMStore != nil && b.tenantID != "" {
-		ctx := backgroundWithTrace()
-		metaTotal, err := b.metaLLMStore.MonthlyLLMCostMillicents(ctx, b.tenantID)
+	if b.UseServerQuota() && b.metaStore != nil && b.tenantID != "" {
+		total, err := b.metaStore.MonthlyLLMCostMillicents(backgroundWithTrace(), b.tenantID)
 		if err != nil {
-			logger.Warn(ctx, "llm_cost_budget_meta_check_fail_open",
-				zap.String("tenant_id", b.tenantID),
-				zap.Error(err))
-			metrics.RecordOperation("llm_cost_budget", "meta_quota_check", "fail_open", 0)
+			logger.Warn(backgroundWithTrace(), "llm_cost_budget_check_fail_open", zap.Error(err))
+			metrics.RecordOperation("llm_cost_budget", "quota_check", "fail_open", 0)
 			return false
-		}
-		total = metaTotal
-
-		// Dual-read: also sum from tenant datastore for transition month.
-		if b.llmUsageDualRead {
-			tenantTotal, err := b.store.MonthlyLLMCostMillicents()
-			if err != nil {
-				logger.Warn(ctx, "llm_cost_budget_tenant_dual_read_failed",
-					zap.String("tenant_id", b.tenantID),
-					zap.Error(err))
-				// Continue with meta-only total; don't fail-open here since
-				// we already have a valid meta store reading.
-			} else {
-				total += tenantTotal
-			}
 		}
 		return total > b.maxMonthlyLLMCostMillicents
 	}
-
-	// Pre-migration: read from tenant datastore only.
-	tenantTotal, err := b.store.MonthlyLLMCostMillicents()
+	total, err := b.store.MonthlyLLMCostMillicents()
 	if err != nil {
 		logger.Warn(backgroundWithTrace(), "llm_cost_budget_check_fail_open", zap.Error(err))
 		metrics.RecordOperation("llm_cost_budget", "quota_check", "fail_open", 0)
 		return false
 	}
-	return tenantTotal > b.maxMonthlyLLMCostMillicents
+	return total > b.maxMonthlyLLMCostMillicents
 }

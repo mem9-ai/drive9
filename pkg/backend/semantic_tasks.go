@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"strings"
@@ -40,13 +41,13 @@ func (b *Dat9Backend) enqueueAudioExtractTaskTx(tx *sql.Tx, fileID string, revis
 // audio_extract_text tasks for one confirmed file revision in TiDB auto-embedding mode.
 // When the tenant's media LLM file quota is exceeded, no extraction tasks are
 // enqueued but the file write itself succeeds normally.
-func (b *Dat9Backend) enqueueTiDBAutoSemanticTasksTx(tx *sql.Tx, fileID string, revision int64, path, contentType string) error {
+func (b *Dat9Backend) enqueueTiDBAutoSemanticTasksTx(ctx context.Context, tx *sql.Tx, fileID string, revision int64, path, contentType string) error {
 	isImage := b.hasAsyncImageTextSource(path, contentType)
 	isAudio := b.shouldEnqueueAudioExtractTask(path, contentType)
 	if !isImage && !isAudio {
 		return nil
 	}
-	if b.mediaLLMQuotaExceededTx(tx) {
+	if b.mediaLLMQuotaExceededCheckTx(ctx, tx) {
 		metrics.RecordOperation("media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
 		return nil
 	}

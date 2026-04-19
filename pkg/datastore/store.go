@@ -622,6 +622,56 @@ func (s *Store) ConfirmedFileSizeByPathTx(db execer, path string) (int64, error)
 	return size.Int64, nil
 }
 
+// ConfirmedFileSummary holds the minimal per-file info needed for quota backfill.
+type ConfirmedFileSummary struct {
+	FileID      string
+	SizeBytes   int64
+	ContentType string
+}
+
+// ListConfirmedFileSummaries returns confirmed files in cursor-paginated batches,
+// ordered by file_id. Pass cursor="" for the first page. Returns an empty cursor
+// when there are no more rows.
+func (s *Store) ListConfirmedFileSummaries(ctx context.Context, cursor string, limit int) ([]ConfirmedFileSummary, string, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	var rows *sql.Rows
+	var err error
+	if cursor == "" {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT file_id, size_bytes, COALESCE(content_type, '')
+			 FROM files WHERE status = 'CONFIRMED'
+			 ORDER BY file_id ASC LIMIT ?`, limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT file_id, size_bytes, COALESCE(content_type, '')
+			 FROM files WHERE status = 'CONFIRMED' AND file_id > ?
+			 ORDER BY file_id ASC LIMIT ?`, cursor, limit)
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("query confirmed files: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []ConfirmedFileSummary
+	for rows.Next() {
+		var f ConfirmedFileSummary
+		if err := rows.Scan(&f.FileID, &f.SizeBytes, &f.ContentType); err != nil {
+			return nil, "", fmt.Errorf("scan confirmed file: %w", err)
+		}
+		out = append(out, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	nextCursor := ""
+	if len(out) == limit {
+		nextCursor = out[len(out)-1].FileID
+	}
+	return out, nextCursor, nil
+}
+
 // --- composite operations ---
 
 func (s *Store) Stat(ctx context.Context, path string) (out *NodeWithFile, err error) {
