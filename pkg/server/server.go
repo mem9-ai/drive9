@@ -34,6 +34,7 @@ type Config struct {
 	TokenSecret       []byte
 	LocalTenantAPIKey string
 	VaultMasterKey    []byte // 32-byte AES key for vault DEK wrapping; nil disables vault
+	VaultIssuerURL    string // canonical server URL placed in grant `iss` claim; empty = server hostname unknown, grants disabled
 	Backend           *backend.Dat9Backend
 	LocalS3           *s3client.LocalS3Client
 	S3Dir             string
@@ -51,6 +52,7 @@ type Server struct {
 	tokenSecret       []byte
 	localTenantAPIKey string
 	vaultMK           *vault.MasterKey
+	vaultIssuerURL    string
 	maxUploadBytes    int64
 	metrics           *serverMetrics
 	logger            *zap.Logger
@@ -97,6 +99,7 @@ func NewWithConfig(cfg Config) *Server {
 		tokenSecret:       cfg.TokenSecret,
 		localTenantAPIKey: strings.TrimSpace(cfg.LocalTenantAPIKey),
 		vaultMK:           vaultMK,
+		vaultIssuerURL:    strings.TrimSpace(cfg.VaultIssuerURL),
 		provisioner:       cfg.Provisioner,
 		maxUploadBytes:    maxUpload,
 		metrics:           newServerMetrics(),
@@ -122,6 +125,8 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/vault/secrets/", business)
 	mux.Handle("/v1/vault/tokens", business)
 	mux.Handle("/v1/vault/tokens/", business)
+	mux.Handle("/v1/vault/grants", business)
+	mux.Handle("/v1/vault/grants/", business)
 	mux.Handle("/v1/vault/audit", business)
 	// Vault read (consumption) API: authenticated by capability token, NOT tenant token.
 	if s.vaultMK != nil && cfg.Pool != nil && cfg.Meta != nil {
