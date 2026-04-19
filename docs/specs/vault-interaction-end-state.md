@@ -122,8 +122,6 @@ expires_at: 2026-04-18T19:00:00Z
 
 Owner sends this message to the delegatee over a secure channel. The delegatee copies the JWT line and pipes it into `ctx import` (see §13.3 for supported input modes). The JWT is displayed once by the server and is not re-fetchable.
 
-Delegatees **SHOULD NOT** paste the JWT as a positional argument in an interactive shell — it would land in shell history and in `/proc/<pid>/cmdline` while the import is running. `ctx import --from-file <path>` and `ctx import --from-file -` (stdin) are the safe forms; see §13.3.
-
 The default human output is **not a stable parse target** — the exact layout (label prefix, `---` separator, field ordering) may change for readability. Scripts **MUST** use `--json` or `--token-only`.
 
 ### Machine output
@@ -219,6 +217,17 @@ Core rules:
 - **Writes**: `EACCES`. The write intent already names the key, so a fake-not-found would be a lie without benefit.
 - **Stale auth**: `EACCES`, distinguished from “not found.”
 
+`ctx import` refusal causes — these are client-side command errors that also map to POSIX errno when the CLI exits:
+
+| `ctx import` refusal cause | Errno |
+|---|---|
+| Empty / unparseable / structurally invalid JWT | `EINVAL` |
+| Missing required claim (`iss`, `exp`, `perm`, `principal_type`, `agent`) | `EINVAL` |
+| Token `principal_type` is not `"delegated"` | `EINVAL` |
+| Token `exp` already in the past at import | `EACCES` |
+| `--from-file <path>` names a non-existent or unreadable file | `ENOENT` |
+| Stdin is a TTY and no input flag given | `EINVAL` (with help pointer) |
+
 This table is locked. The auth lifecycle (§17) layers **local short-circuits** (e.g. `ctx use` on an expired context refuses client-side) **on top of** the server-side stale-auth case — those short-circuits do not introduce a new errno.
 
 **Annotation convention.** Where example outputs in this spec and the quickstart show errno lines followed by parenthetical guidance (e.g. `cat: Permission denied  (run 'drive9 vault reauth' after updating the context)`), the parenthetical is a **documentation annotation** intended for the reader, not literal `cat`/`ls` stderr output. The POSIX `cat`/`ls` utilities emit only the errno text; the reauth hint is a spec-level explanation of what the user should do next, delivered out-of-band (man page, quickstart, CLI `drive9 vault reauth` documentation). No new verb is introduced to deliver this hint inline.
@@ -262,15 +271,14 @@ The delegated fields are populated by locally decoding the JWT payload (see §16
 
 ```bash
 drive9 ctx add --api-key <key> [--name <n>] [--server <url>]      # add owner context
-drive9 ctx import --from-file <path>                              # add delegated context from a file (recommended)
-drive9 ctx import --from-file -                                   # add delegated context from stdin (recommended)
-drive9 ctx import <jwt>                                           # convenience form; JWT leaks to shell history
+drive9 ctx import --from-file <path>                              # add delegated context from a file
+drive9 ctx import [--from-file -]                                 # add delegated context from stdin (default when stdin is a pipe)
 drive9 ctx ls [-l|--json]                                         # list contexts (offline — reads only local config)
 drive9 ctx use <name>                                             # activate a context
 drive9 ctx rm <name>                                              # delete a context
 ```
 
-All three `ctx import` forms are equivalent in effect. The file-based and stdin forms are safer for bearer credentials because the JWT never touches the shell's history file or `/proc/<pid>/cmdline`. The positional-argument form is retained for scripting and local testing only.
+Both `ctx import` forms are equivalent in effect. Stdin is read by default when stdin is a pipe (`isatty(0) == false`); the explicit `--from-file -` form is accepted for scripts that want the intent to be unambiguous. When stdin is a TTY and no `--from-file` is supplied, `ctx import` exits with `EINVAL` and prints a one-line help pointing at the two canonical forms (see §13.3).
 
 `ctx ls` output:
 
@@ -296,17 +304,22 @@ SCOPE rendering:
 Input modes:
 
 - `drive9 ctx import --from-file <path>` reads the JWT from a file.
-- `drive9 ctx import --from-file -` reads the JWT from stdin.
-- `drive9 ctx import <jwt>` reads the JWT from the positional argument (convenience; see security note below).
+- `drive9 ctx import --from-file -` reads the JWT from stdin explicitly.
+- `drive9 ctx import` (no arguments) reads the JWT from stdin iff stdin is not a TTY. When stdin is a TTY, `ctx import` exits `EINVAL` and prints:
 
-In all three modes, the JWT must be a single token with surrounding whitespace trimmed.
+  ```
+  error: no JWT on stdin. Use one of:
+    drive9 ctx import --from-file <path>
+    <producer> | drive9 ctx import
+  ```
+
+In both modes (file and stdin), the JWT must be a single token with surrounding whitespace trimmed. The JWT **MUST NOT** be passed as a positional argument; that form was removed because a runtime warning cannot unexpose a secret that has already reached shell history and `/proc/<pid>/cmdline`.
 
 Contract rules:
 
 - Input **MUST** be a delegated JWT. If the payload indicates `principal_type=owner` (or any non-delegated credential), `ctx import` **MUST** refuse and instruct the user to use `ctx add --api-key`. `ctx import` is not a universal credential importer.
 - If the JWT's `exp` is already in the past at import time, `ctx import` **MUST** refuse (local short-circuit #1 — see §17). The `exp` check uses the local wall clock with no skew tolerance in v0; delegatees with badly skewed clocks will see spurious refusals or admissions and are expected to fix their clocks (NTP).
 - Default context name is the JWT's `label_hint`; on collision or absence, fall back to `<agent>-<scope-root>` with a numeric suffix as needed. `--name` overrides.
-- The positional-argument form **SHOULD NOT** be used in interactive shells — the JWT would be recorded in shell history and exposed via `/proc/<pid>/cmdline` while the process runs. Owners **SHOULD** distribute grants as files or piped input; the default grant output (§6) is formatted accordingly.
 
 **Issuer trust note (client-side first-use trust).** `ctx import` populates the delegated context's `server` field from the JWT's `iss` claim with **no network round-trip and no allow-list check**. This is trust-on-first-use: a fresh delegatee who imports a maliciously crafted JWT with attacker-controlled `iss` (self-signed by the attacker) will write an attacker server URL into their config, and subsequent requests will be routed there. Invariant #7 ("server MUST re-validate") does **not** protect against this path — the server being contacted is itself attacker-controlled and will happily validate its own signatures. Mitigation is out of scope for v0 and lives with the owner's distribution channel: grants **MUST** be transmitted through a channel that authenticates the sender (password-manager share, Signal, GPG-signed email — not plaintext email, not public paste services). A follow-up hardening path (issuer allow-list pinned at `ctx add --api-key` time, or an explicit `--expect-issuer` flag on `ctx import`) is tracked as a non-blocking follow-up; it is additive to the current payload and does not change §13.1 / §13.2 / §16.
 
@@ -368,7 +381,7 @@ drive9 vault grant /n/vault/prod-db/DB_URL --agent alice --perm read --ttl 1h
 # expires_at: 2026-04-18T19:00:00Z
 ```
 
-Owner sends Alice the whole block through a secure channel (password-manager share, Signal, password-protected email). The JWT line is the bearer credential; do not paste it as a positional arg into a shell.
+Owner sends Alice the whole block through a secure channel (password-manager share, Signal, password-protected email). The JWT line is the bearer credential; Alice saves it to a file or pipes it into `ctx import` — see §13.3.
 
 ### Alice
 
@@ -434,7 +447,7 @@ Local short-circuits exist to make UX responsive. They are layered **on top of**
 
 | Stage | Check | Outcome |
 |---|---|---|
-| `ctx import <jwt>` | `exp` in past? | local refuse (no new errno; command error) |
+| `ctx import` | `exp` in past? | local refuse (no new errno; command error) |
 | `ctx ls` | `exp` in past? | row marked `expired` |
 | `ctx use <name>` | target context expired? | local error, do not activate |
 | `vault reauth <mountpoint>` | active context valid locally? | local refuse if target context is already locally expired; otherwise proceed and let the server bind |
@@ -489,8 +502,7 @@ Appendix A — Command surface at a glance:
 | `drive9 umount <path>` | Unmount. |
 | `drive9 ctx add --api-key <k>` | Register an owner context. |
 | `drive9 ctx import --from-file <path>` | Register a delegated context from a grant JWT file (primary UX). |
-| `drive9 ctx import --from-file -` | Same, reading the JWT from stdin (recommended for piping). |
-| `drive9 ctx import <jwt>` | Convenience form; leaks to shell history (see §13.3 / §16). |
+| `drive9 ctx import [--from-file -]` | Same, reading the JWT from stdin (default when stdin is a pipe). |
 | `drive9 ctx ls / use / rm` | Manage contexts (offline). |
 | `drive9 vault put <path> --from <dir> [--prune]` | Atomic batch write. |
 | `drive9 vault grant <scope>... --agent --perm --ttl` | Issue a scoped JWT. |
