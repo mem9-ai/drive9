@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -79,8 +80,13 @@ func VerifyGrant(csk []byte, raw string, now time.Time) (*VaultGrantClaims, erro
 	if err != nil {
 		return nil, fmt.Errorf("decode payload: %w", err)
 	}
+	// Reject unknown claims: a locked claim set (§16) means any extra
+	// field is either a malformed forgery or a silently-introduced payload
+	// from a newer signer we don't trust.
 	var claims VaultGrantClaims
-	if err := json.Unmarshal(payloadJSON, &claims); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(payloadJSON))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&claims); err != nil {
 		return nil, fmt.Errorf("unmarshal claims: %w", err)
 	}
 

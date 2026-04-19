@@ -87,7 +87,7 @@ CREATE TABLE vault_grants (
 );
 ```
 
-**No migration from `vault_tokens`** (§20). Drop the old table in the same schema-change PR or a fast-follow. Existing cap tokens will stop working — document this in the PR description; it is intentional.
+**No migration from `vault_tokens`** (§20). PR-A is additive: `vault_tokens` and its CapToken code path stay intact and keep serving existing bearer tokens until PR-E performs the one-shot DROP per the explicit deletion list in [`pr-e-removal-contract.md`](pr-e-removal-contract.md). Do not drop `vault_tokens` in this PR or any PR-B/C/D fast-follow — the only permitted drop point is PR-E.
 
 ---
 

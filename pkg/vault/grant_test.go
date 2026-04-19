@@ -2,6 +2,7 @@ package vault
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -91,7 +92,7 @@ func TestVerifyGrantRevoked(t *testing.T) {
 	}
 
 	// Second revoke must return ErrNotFound (already revoked).
-	if err := s.RevokeGrant(ctx, "tenant-a", grant.GrantID, "admin", "again"); err != ErrNotFound {
+	if err := s.RevokeGrant(ctx, "tenant-a", grant.GrantID, "admin", "again"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound on second revoke, got %v", err)
 	}
 }
@@ -206,5 +207,17 @@ func TestIssueGrantRejectsNonPositiveTTL(t *testing.T) {
 		GrantPermRead, 0, "",
 	); err == nil {
 		t.Fatal("expected ttl=0 to be rejected")
+	}
+}
+
+func TestIssueGrantRejectsTTLAboveMax(t *testing.T) {
+	s := newGrantTestStore(t)
+	ctx := context.Background()
+	if _, _, err := s.IssueGrant(
+		ctx, "tenant-a", "https://srv.invalid",
+		PrincipalOwner, "agent-1", []string{"aws-prod"},
+		GrantPermRead, MaxGrantTTL+time.Second, "",
+	); err == nil {
+		t.Fatal("expected ttl > MaxGrantTTL to be rejected at store boundary")
 	}
 }

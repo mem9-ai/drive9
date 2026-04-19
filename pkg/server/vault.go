@@ -28,7 +28,7 @@ func (s *Server) handleVault(w http.ResponseWriter, r *http.Request) {
 		s.handleVaultTokens(w, r, strings.TrimPrefix(rest, "tokens"))
 		return
 	}
-	if strings.HasPrefix(rest, "grants") {
+	if rest == "grants" || strings.HasPrefix(rest, "grants/") {
 		s.handleVaultGrants(w, r, strings.TrimPrefix(rest, "grants"))
 		return
 	}

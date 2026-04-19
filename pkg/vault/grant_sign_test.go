@@ -1,8 +1,11 @@
 package vault
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -126,6 +129,41 @@ func TestVerifyGrantAcceptsWithinSkew(t *testing.T) {
 	}
 	if _, err := VerifyGrant(csk, tok, time.Now()); err != nil {
 		t.Fatalf("VerifyGrant should accept token within skew: %v", err)
+	}
+}
+
+// TestVerifyGrantRejectsUnknownClaims ensures the locked §16 claim set is
+// enforced on decode: extra JSON fields must make VerifyGrant fail, so a
+// signer that sneaks in (for example) `"tenant_id": "other"` can't smuggle
+// bonus authority into a verifier that ignores unknown keys.
+func TestVerifyGrantRejectsUnknownClaims(t *testing.T) {
+	csk := randomCSK(t)
+
+	// Build a payload with a bogus extra field, using the same HMAC scheme
+	// SignGrant uses so the signature still verifies; only the new
+	// DisallowUnknownFields check should fail the verify.
+	payload := map[string]any{
+		"iss":            "https://example.invalid",
+		"grant_id":       "grt_test",
+		"principal_type": string(PrincipalOwner),
+		"agent":          "agent-a",
+		"scope":          []string{"aws-prod"},
+		"perm":           string(GrantPermRead),
+		"exp":            time.Now().Add(time.Hour).Unix(),
+		"bogus":          "smuggled",
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadB64 := base64.RawURLEncoding.EncodeToString(payloadJSON)
+	mac := hmac.New(sha256.New, csk)
+	mac.Write([]byte(payloadB64))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	tok := grantTokenPrefix + payloadB64 + "." + sig
+
+	if _, err := VerifyGrant(csk, tok, time.Now()); err == nil {
+		t.Fatal("expected VerifyGrant to reject unknown claim field")
 	}
 }
 

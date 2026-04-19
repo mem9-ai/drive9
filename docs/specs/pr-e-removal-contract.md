@@ -15,7 +15,7 @@ PR-E is the sub-PR that reaches terminal state per `docs/specs/vault-interaction
 ### Storage
 - Drop `vault_tokens` DDL from `pkg/vault/schema.go`.
 - Drop all `vault_tokens` references from `pkg/tenant/schema/vault.go` and `pkg/tenant/schema/tidb_auto.go`.
-- Add a one-shot DROP migration for the `vault_tokens` table (name it `drop_vault_tokens_v1.sql` or equivalent).
+- Add a one-shot DROP migration for the `vault_tokens` table, named to match the repo's existing migration convention `NNNN_drop_vault_tokens.sql` (where `NNNN` is the next sequential migration number).
 
 ### HTTP
 - Delete `handleVaultTokens`, `handleVaultTokenIssue`, `handleVaultTokenRevoke` in `pkg/server/vault.go`.

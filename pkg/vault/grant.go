@@ -10,6 +10,12 @@ import (
 	"github.com/google/uuid"
 )
 
+// MaxGrantTTL is the hard upper bound on a grant's lifetime. Any call to
+// IssueGrant with ttl > MaxGrantTTL is rejected at the store boundary; HTTP
+// handlers that derive ttl from untrusted input do NOT get to widen this cap.
+// 24h is picked to force periodic re-minting under the owner's review.
+const MaxGrantTTL = 24 * time.Hour
+
 // IssueGrant mints a grant token and persists its server-side row.
 //
 // Authorization: the caller is responsible for establishing that the
@@ -33,6 +39,9 @@ func (s *Store) IssueGrant(
 ) (string, *VaultGrant, error) {
 	if ttl <= 0 {
 		return "", nil, fmt.Errorf("ttl must be positive")
+	}
+	if ttl > MaxGrantTTL {
+		return "", nil, fmt.Errorf("ttl exceeds MaxGrantTTL (%s)", MaxGrantTTL)
 	}
 	if len(scope) == 0 {
 		return "", nil, fmt.Errorf("scope must not be empty")
@@ -158,7 +167,7 @@ func (s *Store) RevokeGrant(ctx context.Context, tenantID, grantID, revokedBy, r
 		now, revokedBy, reason, tenantID, grantID,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("revoke grant: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {

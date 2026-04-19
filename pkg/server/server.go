@@ -295,7 +295,7 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleSQL(w, r)
 	case r.URL.Path == "/v1/events":
 		s.handleEvents(w, r)
-	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
+	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/grants"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
 		s.handleVault(w, r)
 	default:
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "business_route_not_found", "path", r.URL.Path, "method", r.Method)...)
