@@ -59,7 +59,7 @@ The payload MUST contain **all** of these claims and **only** these claims (no `
 
 **Signing algorithm:** unchanged — HMAC-SHA256 with the tenant-derived CSK (`MasterKey.DeriveCSK(tenantID)`). v0 does NOT need asymmetric keys; the delegatee trusts `iss` via TOFU and verifies by calling the server.
 
-**Wire format:** unchanged compact form — base64url(header).base64url(payload).base64url(mac). Header stays `{"alg":"HS256","typ":"JWT"}`. Display-prefix `vt_` used by `vault grant` output is a CLI concern — add it in PR-E, not here. The raw HMAC-JWT is what this PR ships.
+**Wire format (locked to end-state spec §16):** `vt_` + base64url(header) + `.` + base64url(payload) + `.` + base64url(mac). Header is the literal bytes `{"alg":"HS256","typ":"JWT"}`. Verify computes `HMAC-SHA256` unconditionally — the header `alg` value is informational for downstream JWT tooling (PR-B `ctx import`) and MUST NOT be parsed to pick an algorithm (alg-confusion prevention). The `vt_` display prefix lives on the token everywhere the token lives (wire, CLI output, `--token-only`, ctx import input) — it is NOT a CLI-only decoration. This supersedes an earlier draft that suggested header-less v0 wire; header-less requires a spec-amendment PR per adversary review `c8e3dd17`/`67796681`.
 
 ---
 
@@ -106,7 +106,13 @@ Request:
 }
 ```
 
-Auth: tenant owner token (existing middleware). Principal type is derived as `"owner"` if the caller is the tenant owner API key, `"delegated"` if the caller is re-delegating under a `perm=write`+ scope (disallow re-delegation in v0 — return 403 if principal_type on caller == "delegated"; see §13 one-active-ctx and §20 non-goal).
+`ttl_seconds` is REQUIRED and MUST be > 0. Omitted / zero / negative values return HTTP 400 with `ttl_seconds is required and must be > 0` — the handler MUST NOT silently default (end-state spec §6 "`--ttl` is required"; no silent policy).
+
+`principal_type` is NOT a caller-controllable field. It is DELIBERATELY absent from the request shape because `vault grant` output is delegated-only per end-state spec §16 (claim table) and §13.3 (`ctx import` refuses non-delegated JWTs). The server mints `principal_type="delegated"` unconditionally; any field named `principal_type` in the request body is silently ignored, not honored. Re-delegation ("delegated caller mints a further grant") is blocked structurally by the router — `/v1/vault/grants` sits behind the tenant-owner auth middleware, which delegated JWTs cannot satisfy. This removes the HTTP 403 re-delegation case entirely: the delegated caller cannot reach the handler to begin with.
+
+Auth: tenant owner API key (existing `tenantAuthMiddleware`).
+
+Issuer (`iss` claim): server-side only, sourced from `server.Config.VaultIssuerURL` which entrypoints populate from `DRIVE9_VAULT_ISSUER_URL` (with a sane default of `publicBaseURL(addr)` for loopback / `DRIVE9_PUBLIC_URL` deployments). If `VaultIssuerURL` is empty when a request lands, the handler returns HTTP 503 `vault issuer URL not configured` — fail-closed; no forgeable issuer-less grant is ever minted.
 
 Response (201):
 ```json
@@ -201,10 +207,13 @@ No integration tests for HTTP in PR-A — leave that to PR-B onward once there's
 | `drive9 ctx import` decoding the JWT client-side | PR-B |
 | Server URL override / `DRIVE9_SERVER` | PR-C |
 | `drive9 mount vault` binding a principal | PR-D |
+| HTTP auth middleware wiring `VerifyAndResolveGrant` on data-plane reads | PR-D |
 | `drive9 vault grant` CLI wrapping this HTTP endpoint | PR-E |
 | `vault with` env scrub (F14) | PR-E |
 | `@grants/` pseudo-dir visibility (F8 owner-only) | PR-F |
 | Errno mapping for FUSE readdir/open | PR-F |
+
+**Explicit on verify wiring** (adversary review `6fa20200` / `67796681` Q C): `vault.Store.VerifyAndResolveGrant` ships in PR-A as exercised-by-unit-test code only. It is intentionally NOT wired into any HTTP auth middleware in this PR — no active grant-auth integration path exists on the data plane yet. PR-D is where the middleware that calls `VerifyAndResolveGrant` on every vault read/write request lands (bound at `drive9 mount vault --principal vault-token` time). Reviewers should NOT expect HTTP-auth integration tests in PR-A's diff.
 
 If a reviewer says "but PR-A doesn't implement X" and X is in the right-hand column, point them here.
 

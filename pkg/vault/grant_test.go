@@ -19,31 +19,6 @@ func newGrantTestStore(t *testing.T) *Store {
 	return s
 }
 
-func TestIssueAndVerifyGrantOwner(t *testing.T) {
-	s := newGrantTestStore(t)
-	ctx := context.Background()
-
-	tok, grant, err := s.IssueGrant(
-		ctx, "tenant-a", "https://srv.invalid",
-		PrincipalOwner, "agent-1", []string{"aws-prod"},
-		GrantPermRead, time.Hour, "",
-	)
-	if err != nil {
-		t.Fatalf("IssueGrant: %v", err)
-	}
-	if grant.GrantID == "" {
-		t.Fatal("grant_id should be set")
-	}
-
-	claims, err := s.VerifyAndResolveGrant(ctx, "tenant-a", "https://srv.invalid", tok)
-	if err != nil {
-		t.Fatalf("VerifyAndResolveGrant: %v", err)
-	}
-	if claims.PrincipalType != PrincipalOwner {
-		t.Fatalf("principal_type: got %q", claims.PrincipalType)
-	}
-}
-
 func TestIssueAndVerifyGrantDelegated(t *testing.T) {
 	s := newGrantTestStore(t)
 	ctx := context.Background()
@@ -77,7 +52,7 @@ func TestVerifyGrantRevoked(t *testing.T) {
 
 	tok, grant, err := s.IssueGrant(
 		ctx, "tenant-a", "https://srv.invalid",
-		PrincipalOwner, "agent-1", []string{"aws-prod"},
+		PrincipalDelegated, "agent-1", []string{"aws-prod"},
 		GrantPermRead, time.Hour, "",
 	)
 	if err != nil {
@@ -103,7 +78,7 @@ func TestVerifyGrantCrossTenantReplay(t *testing.T) {
 
 	tok, _, err := s.IssueGrant(
 		ctx, "tenant-a", "https://srv.invalid",
-		PrincipalOwner, "agent-1", []string{"aws-prod"},
+		PrincipalDelegated, "agent-1", []string{"aws-prod"},
 		GrantPermRead, time.Hour, "",
 	)
 	if err != nil {
@@ -122,7 +97,7 @@ func TestVerifyGrantIssuerMismatch(t *testing.T) {
 
 	tok, _, err := s.IssueGrant(
 		ctx, "tenant-a", "https://srv-a.invalid",
-		PrincipalOwner, "agent-1", []string{"aws-prod"},
+		PrincipalDelegated, "agent-1", []string{"aws-prod"},
 		GrantPermRead, time.Hour, "",
 	)
 	if err != nil {
@@ -143,7 +118,7 @@ func TestIssueGrantRejectsEmptyScope(t *testing.T) {
 	ctx := context.Background()
 	if _, _, err := s.IssueGrant(
 		ctx, "tenant-a", "https://srv.invalid",
-		PrincipalOwner, "agent-1", nil,
+		PrincipalDelegated, "agent-1", nil,
 		GrantPermRead, time.Hour, "",
 	); err == nil {
 		t.Fatal("expected empty scope to be rejected")
@@ -155,7 +130,7 @@ func TestIssueGrantRejectsBadPerm(t *testing.T) {
 	ctx := context.Background()
 	if _, _, err := s.IssueGrant(
 		ctx, "tenant-a", "https://srv.invalid",
-		PrincipalOwner, "agent-1", []string{"aws-prod"},
+		PrincipalDelegated, "agent-1", []string{"aws-prod"},
 		GrantPerm("admin"), time.Hour, "",
 	); err == nil {
 		t.Fatal("expected bad perm to be rejected")
@@ -179,7 +154,7 @@ func TestIssueGrantRejectsEmptyAgent(t *testing.T) {
 	ctx := context.Background()
 	if _, _, err := s.IssueGrant(
 		ctx, "tenant-a", "https://srv.invalid",
-		PrincipalOwner, "", []string{"aws-prod"},
+		PrincipalDelegated, "", []string{"aws-prod"},
 		GrantPermRead, time.Hour, "",
 	); err == nil {
 		t.Fatal("expected empty agent to be rejected")
@@ -191,7 +166,7 @@ func TestIssueGrantRejectsEmptyIssuer(t *testing.T) {
 	ctx := context.Background()
 	if _, _, err := s.IssueGrant(
 		ctx, "tenant-a", "",
-		PrincipalOwner, "agent-1", []string{"aws-prod"},
+		PrincipalDelegated, "agent-1", []string{"aws-prod"},
 		GrantPermRead, time.Hour, "",
 	); err == nil {
 		t.Fatal("expected empty issuer to be rejected")
@@ -203,7 +178,7 @@ func TestIssueGrantRejectsNonPositiveTTL(t *testing.T) {
 	ctx := context.Background()
 	if _, _, err := s.IssueGrant(
 		ctx, "tenant-a", "https://srv.invalid",
-		PrincipalOwner, "agent-1", []string{"aws-prod"},
+		PrincipalDelegated, "agent-1", []string{"aws-prod"},
 		GrantPermRead, 0, "",
 	); err == nil {
 		t.Fatal("expected ttl=0 to be rejected")

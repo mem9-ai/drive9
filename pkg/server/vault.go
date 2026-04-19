@@ -411,28 +411,32 @@ func (s *Server) handleVaultGrantIssue(w http.ResponseWriter, r *http.Request, v
 		return
 	}
 	var req struct {
-		PrincipalType string   `json:"principal_type"`
-		Agent         string   `json:"agent"`
-		Scope         []string `json:"scope"`
-		Perm          string   `json:"perm"`
-		TTLSecs       int      `json:"ttl_seconds"`
-		LabelHint     string   `json:"label_hint"`
+		Agent     string   `json:"agent"`
+		Scope     []string `json:"scope"`
+		Perm      string   `json:"perm"`
+		TTLSecs   int      `json:"ttl_seconds"`
+		LabelHint string   `json:"label_hint"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if req.PrincipalType == "" {
-		// Default to owner when caller hasn't specified: this endpoint is
-		// owner-gated by the router, so the practical effect is unchanged.
-		req.PrincipalType = string(vault.PrincipalOwner)
-	}
-	principal := vault.PrincipalType(req.PrincipalType)
+	// principal_type is NOT caller-controlled. The end-state spec (§16 claim
+	// table + §13.3 ctx-import contract) requires `vault grant` output to be
+	// a delegated JWT; owner grants are a non-sequitur on this endpoint. By
+	// fixing principal_type server-side we also get defense-in-depth against
+	// a future router misconfiguration that lets a delegated caller reach
+	// here (adv-2 Block B).
+	principal := vault.PrincipalDelegated
 	perm := vault.GrantPerm(req.Perm)
-	ttl := time.Duration(req.TTLSecs) * time.Second
-	if ttl <= 0 {
-		ttl = time.Hour
+	if req.TTLSecs <= 0 {
+		// Spec §6 "--ttl is required". Silent defaulting at the handler
+		// would emit a grant the caller didn't ask for — audit/debug trap
+		// (adv-1 Block 4, adv-2 Block B context).
+		errJSON(w, http.StatusBadRequest, "ttl_seconds is required and must be > 0")
+		return
 	}
+	ttl := time.Duration(req.TTLSecs) * time.Second
 
 	tokenStr, grant, err := vs.IssueGrant(
 		r.Context(), tenantID, s.vaultIssuerURL,

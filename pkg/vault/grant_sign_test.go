@@ -24,12 +24,31 @@ func validClaims(exp time.Time) *VaultGrantClaims {
 	return &VaultGrantClaims{
 		Issuer:        "https://example.invalid",
 		GrantID:       "grt_test",
-		PrincipalType: PrincipalOwner,
+		PrincipalType: PrincipalDelegated,
 		Agent:         "agent-a",
 		Scope:         []string{"aws-prod"},
 		Perm:          GrantPermRead,
 		ExpiresAt:     exp.Unix(),
 	}
+}
+
+// signHandCraftedClaims signs an arbitrary JSON payload with the grant wire
+// format so tests can construct HMAC-valid tokens that bypass SignGrant's
+// structural validation. Used to exercise VerifyGrant's reject paths for
+// missing-claim / unknown-claim scenarios.
+func signHandCraftedClaims(t *testing.T, csk []byte, payload map[string]any) string {
+	t.Helper()
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headerB64 := base64.RawURLEncoding.EncodeToString(grantHeaderJSON)
+	payloadB64 := base64.RawURLEncoding.EncodeToString(payloadJSON)
+	signingInput := headerB64 + "." + payloadB64
+	mac := hmac.New(sha256.New, csk)
+	mac.Write([]byte(signingInput))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return grantTokenPrefix + signingInput + "." + sig
 }
 
 func TestSignVerifyGrantHappyPath(t *testing.T) {
@@ -48,8 +67,36 @@ func TestSignVerifyGrantHappyPath(t *testing.T) {
 	if claims.GrantID != "grt_test" {
 		t.Fatalf("grant_id roundtrip: %q", claims.GrantID)
 	}
-	if claims.PrincipalType != PrincipalOwner {
+	if claims.PrincipalType != PrincipalDelegated {
 		t.Fatalf("principal_type roundtrip: %q", claims.PrincipalType)
+	}
+}
+
+// TestSignGrantWireFormatHasHeader locks the §16 wire format: the token after
+// the vt_ prefix MUST be header.payload.sig with a base64url-decodable header
+// carrying {"alg":"HS256","typ":"JWT"}. PR-B's ctx import will depend on this
+// shape; a regression here cascades into the downstream decoder.
+func TestSignGrantWireFormatHasHeader(t *testing.T) {
+	csk := randomCSK(t)
+	tok, err := SignGrant(csk, validClaims(time.Now().Add(time.Hour)))
+	if err != nil {
+		t.Fatalf("SignGrant: %v", err)
+	}
+	body := strings.TrimPrefix(tok, grantTokenPrefix)
+	parts := strings.Split(body, ".")
+	if len(parts) != 3 {
+		t.Fatalf("wire format must be 3-segment header.payload.sig, got %d segments", len(parts))
+	}
+	headerJSON, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		t.Fatalf("header base64 decode: %v", err)
+	}
+	var h map[string]string
+	if err := json.Unmarshal(headerJSON, &h); err != nil {
+		t.Fatalf("header JSON decode: %v", err)
+	}
+	if h["alg"] != "HS256" || h["typ"] != "JWT" {
+		t.Fatalf("header mismatch: got %v", h)
 	}
 }
 
@@ -138,32 +185,49 @@ func TestVerifyGrantAcceptsWithinSkew(t *testing.T) {
 // bonus authority into a verifier that ignores unknown keys.
 func TestVerifyGrantRejectsUnknownClaims(t *testing.T) {
 	csk := randomCSK(t)
-
-	// Build a payload with a bogus extra field, using the same HMAC scheme
-	// SignGrant uses so the signature still verifies; only the new
-	// DisallowUnknownFields check should fail the verify.
-	payload := map[string]any{
+	tok := signHandCraftedClaims(t, csk, map[string]any{
 		"iss":            "https://example.invalid",
 		"grant_id":       "grt_test",
-		"principal_type": string(PrincipalOwner),
+		"principal_type": string(PrincipalDelegated),
 		"agent":          "agent-a",
 		"scope":          []string{"aws-prod"},
 		"perm":           string(GrantPermRead),
 		"exp":            time.Now().Add(time.Hour).Unix(),
 		"bogus":          "smuggled",
-	}
-	payloadJSON, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	payloadB64 := base64.RawURLEncoding.EncodeToString(payloadJSON)
-	mac := hmac.New(sha256.New, csk)
-	mac.Write([]byte(payloadB64))
-	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	tok := grantTokenPrefix + payloadB64 + "." + sig
-
+	})
 	if _, err := VerifyGrant(csk, tok, time.Now()); err == nil {
 		t.Fatal("expected VerifyGrant to reject unknown claim field")
+	}
+}
+
+// TestVerifyGrantRejectsMissingRequiredClaim covers adv-2 Block A: an
+// HMAC-valid token that omits one required §16 claim must be rejected at
+// verify time, not silently zero-valued. Each required claim is tested
+// independently to prevent a future refactor from widening the acceptance
+// set.
+func TestVerifyGrantRejectsMissingRequiredClaim(t *testing.T) {
+	csk := randomCSK(t)
+	fullPayload := func() map[string]any {
+		return map[string]any{
+			"iss":            "https://example.invalid",
+			"grant_id":       "grt_test",
+			"principal_type": string(PrincipalDelegated),
+			"agent":          "agent-a",
+			"scope":          []string{"aws-prod"},
+			"perm":           string(GrantPermRead),
+			"exp":            time.Now().Add(time.Hour).Unix(),
+		}
+	}
+	required := []string{"iss", "grant_id", "principal_type", "agent", "scope", "perm", "exp"}
+	for _, claim := range required {
+		t.Run("missing_"+claim, func(t *testing.T) {
+			payload := fullPayload()
+			delete(payload, claim)
+			tok := signHandCraftedClaims(t, csk, payload)
+			if _, err := VerifyGrant(csk, tok, time.Now()); err == nil {
+				t.Fatalf("expected VerifyGrant to reject token missing %q", claim)
+			}
+		})
 	}
 }
 

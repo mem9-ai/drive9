@@ -18,11 +18,19 @@ const grantTokenPrefix = "vt_"
 // grantClockSkew is the ±leeway applied to exp verification (spec §16).
 const grantClockSkew = 60 * time.Second
 
+// grantHeaderJSON is the fixed JWT header for grant tokens. v0 hardcodes
+// alg=HS256/typ=JWT per vault-interaction-end-state.md §16; verify does NOT
+// trust this header — HS256 is enforced regardless of what the header says,
+// so alg=none / alg-confusion attacks are moot. The header ships because the
+// merged spec's wire examples (`vt_eyJhbGc...`) require it and PR-B's
+// `ctx import` decoder is the downstream consumer.
+var grantHeaderJSON = []byte(`{"alg":"HS256","typ":"JWT"}`)
+
 // SignGrant signs a VaultGrantClaims payload with the tenant-derived CSK.
 //
-// Wire format: "vt_" + base64url(payload) + "." + base64url(mac).
-// Header-less JWT: v0 uses a fixed HS256/HMAC-SHA256 algorithm; there is no
-// negotiation, so a header would only be attack surface.
+// Wire format per spec §16: "vt_" + base64url(header) + "." +
+// base64url(payload) + "." + base64url(mac). The MAC input is
+// base64url(header) + "." + base64url(payload) (JWT convention).
 func SignGrant(csk []byte, claims *VaultGrantClaims) (string, error) {
 	if err := validateClaimsForSign(claims); err != nil {
 		return "", err
@@ -31,13 +39,15 @@ func SignGrant(csk []byte, claims *VaultGrantClaims) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal claims: %w", err)
 	}
+	headerB64 := base64.RawURLEncoding.EncodeToString(grantHeaderJSON)
 	payloadB64 := base64.RawURLEncoding.EncodeToString(payload)
+	signingInput := headerB64 + "." + payloadB64
 
 	mac := hmac.New(sha256.New, csk)
-	mac.Write([]byte(payloadB64))
+	mac.Write([]byte(signingInput))
 	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 
-	return grantTokenPrefix + payloadB64 + "." + sig, nil
+	return grantTokenPrefix + signingInput + "." + sig, nil
 }
 
 // VerifyGrant verifies the HMAC signature, unmarshals the claims, enforces the
@@ -55,17 +65,16 @@ func VerifyGrant(csk []byte, raw string, now time.Time) (*VaultGrantClaims, erro
 	}
 	body := raw[len(grantTokenPrefix):]
 
-	// Split payload.sig on the last dot. Using LastIndex ensures we handle the
-	// payload-first layout correctly even though our payloads do not contain '.'.
-	dotIdx := strings.LastIndex(body, ".")
-	if dotIdx < 0 {
+	// Wire per §16: header.payload.sig. Verify is HS256-only regardless of
+	// what the header claims — we do not parse `alg` to pick an algorithm.
+	parts := strings.Split(body, ".")
+	if len(parts) != 3 {
 		return nil, fmt.Errorf("invalid grant format")
 	}
-	payloadB64 := body[:dotIdx]
-	sigB64 := body[dotIdx+1:]
+	headerB64, payloadB64, sigB64 := parts[0], parts[1], parts[2]
 
 	mac := hmac.New(sha256.New, csk)
-	mac.Write([]byte(payloadB64))
+	mac.Write([]byte(headerB64 + "." + payloadB64))
 	expectedSig := mac.Sum(nil)
 
 	sig, err := base64.RawURLEncoding.DecodeString(sigB64)

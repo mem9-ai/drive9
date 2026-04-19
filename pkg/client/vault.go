@@ -202,14 +202,17 @@ func (c *Client) RevokeVaultToken(ctx context.Context, tokenID string) error {
 }
 
 // VaultGrantIssueRequest is the wire payload sent to /v1/vault/grants.
-// Fields mirror the server handler; principal_type defaults to "owner" when empty.
+//
+// principal_type is deliberately NOT a caller-controllable field: the endstate
+// spec §16 fixes `vault grant` output to delegated-only and the server mints
+// delegated JWTs unconditionally. Exposing a caller-supplied principal_type
+// here would invite confusion about a contract the server no longer honors.
 type VaultGrantIssueRequest struct {
-	PrincipalType string   `json:"principal_type,omitempty"`
-	Agent         string   `json:"agent"`
-	Scope         []string `json:"scope"`
-	Perm          string   `json:"perm"`
-	TTLSeconds    int      `json:"ttl_seconds"`
-	LabelHint     string   `json:"label_hint,omitempty"`
+	Agent      string   `json:"agent"`
+	Scope      []string `json:"scope"`
+	Perm       string   `json:"perm"`
+	TTLSeconds int      `json:"ttl_seconds"`
+	LabelHint  string   `json:"label_hint,omitempty"`
 }
 
 // VaultGrantIssueResponse is the decoded response from /v1/vault/grants.
