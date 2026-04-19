@@ -1,6 +1,6 @@
 # drive9 vault — End-State Interaction Spec
 
-Status: Proposed (dev1 author; architect-1 / dev2 / adversary-1 / adversary-2 reviewed)
+Status: Proposed (four-way review: dev1 author, architect-1 / dev2 / adversary-2 review)
 Scope: End-state CLI only. No current-implementation references, no transition/migration, no P0 tactics.
 
 This spec is the single source of truth for the terminal shape of vault UX. It is the merged canonical of:
@@ -452,6 +452,7 @@ The four local short-circuits (`ctx import` / `ctx ls` / `ctx use` / `vault reau
 5. **Grants do not cascade-revoke on `rm`**: removing a key leaves existing grants syntactically intact; holders observe `ENOENT`, and audit records `affected_grants`.
 6. **One active context at a time**: `~/.drive9/config` MAY hold any number of contexts (owner and delegated, mixed); at most one is active. Switching contexts does not silently re-bind an already-mounted mount (use `reauth`).
 7. **Client-side JWT decoding is UX-only**: local decode populates `ctx` metadata and enables offline `ctx ls`; it **MUST NOT** substitute for server-side validation. The server **MUST** re-check signature, TTL, and revocation on every request.
+8. **Issuer trust is TOFU (trust-on-first-use) in v0**: `ctx import` populates the context's `server` field from the JWT's `iss` claim with no network round-trip and no allow-list check. Invariant #7 does **not** protect against a malicious `iss` — the server being contacted is itself attacker-controlled and will validate its own signatures. Mitigation is delivery-channel-level (see §13.3 and §16); an issuer allow-list / `--expect-issuer` path is deferred (see §21). Implementations **MUST NOT** add a silent issuer check that only validates shape or reachability; such a check provides false assurance and is prohibited.
 
 ## 19. Failure Model (Summary)
 
@@ -475,7 +476,8 @@ The four local short-circuits (`ctx import` / `ctx ls` / `ctx use` / `vault reau
 
 ## 21. Open Questions (Spec-Level)
 
-- None at publication time. Review may add.
+- **Issuer trust hardening (TOFU → pinned).** Invariant #8 locks v0 at trust-on-first-use. A follow-up spec should decide between (a) an issuer allow-list pinned at `ctx add --api-key` time, (b) an `--expect-issuer <url>` flag on `ctx import`, or (c) an out-of-band manifest fetched from the owner server during `ctx add`. Each has different forward-compat implications for `/etc/drive9.conf` site-policy files; none are trivially additive once deployed. Resolution target: the release that introduces multi-issuer federation.
+- **Forward-compat of the `iss` claim under server rebranding / domain migration.** If an owner server migrates from `https://d9.old.example` to `https://d9.new.example`, all outstanding delegated contexts hold the old `iss` and will route to the old host. v0 has no in-band way to rotate `iss` across existing grants. A follow-up should specify whether this is handled by (a) explicit re-grant + `ctx import`, (b) a server-signed redirect manifest keyed off the old `iss`, or (c) left as "owner reissues all delegated tokens". Resolution target: the release that introduces `vault reauth --server <new>` or equivalent.
 
 ---
 
