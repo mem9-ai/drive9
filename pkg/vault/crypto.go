@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -160,14 +161,29 @@ func VerifyCapToken(csk []byte, raw string, now time.Time) (*CapTokenClaims, err
 		return nil, fmt.Errorf("invalid token signature")
 	}
 
-	// Decode claims.
+	// Decode claims. CapTokenClaims is a locked payload shape (spec §16);
+	// any extra field is either a malformed forgery or a silently-introduced
+	// payload from a newer signer we don't trust, so reject unknown fields.
 	payloadJSON, err := base64.RawURLEncoding.DecodeString(payloadB64)
 	if err != nil {
 		return nil, fmt.Errorf("decode payload: %w", err)
 	}
 	var claims CapTokenClaims
-	if err := json.Unmarshal(payloadJSON, &claims); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(payloadJSON))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&claims); err != nil {
 		return nil, fmt.Errorf("unmarshal claims: %w", err)
+	}
+
+	// Enum fail-closed (spec §16): a forged payload carrying an unknown
+	// principal_type or perm must be rejected here, not silently propagated
+	// to downstream handlers / audit log writers that treat claims.Perm as
+	// a trusted string.
+	if claims.PrincipalType != PrincipalOwner && claims.PrincipalType != PrincipalDelegated {
+		return nil, fmt.Errorf("invalid principal_type")
+	}
+	if claims.Perm != PermRead && claims.Perm != PermWrite {
+		return nil, fmt.Errorf("invalid perm")
 	}
 
 	// Check TTL.

@@ -1,7 +1,10 @@
 package vault
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"testing"
 	"time"
 )
@@ -250,5 +253,62 @@ func TestDeriveCSKDifferentTenants(t *testing.T) {
 
 	if string(csk1) == string(csk2) {
 		t.Fatal("different tenants should have different CSKs")
+	}
+}
+
+// TestVerifyCapToken_RejectsUnknownFields covers the locked-payload invariant:
+// a forged payload carrying a silently-introduced field must be rejected even
+// if the HMAC matches, to prevent attackers (or a compromised signer) from
+// smuggling fields a future verifier might start honoring.
+func TestVerifyCapToken_RejectsUnknownFields(t *testing.T) {
+	key := make([]byte, 32)
+	_, _ = rand.Read(key)
+	mk, _ := NewMasterKey(key)
+	csk := mk.DeriveCSK("tenant-unk")
+
+	// Forge a payload with a valid MAC but an extra `admin` field the struct
+	// doesn't declare. We do the MAC ourselves since SignCapToken marshals
+	// CapTokenClaims directly and can't emit unknown fields.
+	forgedPayload := []byte(`{"iss":"https://drive9.example.com","principal_type":"delegated","grant_id":"grt_x","tenant_id":"tenant-unk","agent":"a","scope":["s"],"perm":"read","iat":1,"exp":9999999999,"nonce":"n","admin":true}`)
+	payloadB64 := base64.RawURLEncoding.EncodeToString(forgedPayload)
+	mac := hmac.New(sha256.New, csk)
+	mac.Write([]byte(payloadB64))
+	sigB64 := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	tokenStr := capTokenPrefix + payloadB64 + "." + sigB64
+
+	_, err := VerifyCapToken(csk, tokenStr, time.Now())
+	if err == nil {
+		t.Fatal("expected rejection of payload with unknown field, got nil")
+	}
+}
+
+// TestVerifyCapToken_RejectsBadEnums covers fail-closed enum validation on the
+// verify path: a forged payload with an out-of-spec principal_type or perm
+// must not propagate to downstream callers (handlers / audit writers) that
+// treat claims.Perm as a trusted string.
+func TestVerifyCapToken_RejectsBadEnums(t *testing.T) {
+	key := make([]byte, 32)
+	_, _ = rand.Read(key)
+	mk, _ := NewMasterKey(key)
+	csk := mk.DeriveCSK("tenant-enum")
+
+	forgeSigned := func(payload string) string {
+		payloadB64 := base64.RawURLEncoding.EncodeToString([]byte(payload))
+		mac := hmac.New(sha256.New, csk)
+		mac.Write([]byte(payloadB64))
+		sigB64 := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+		return capTokenPrefix + payloadB64 + "." + sigB64
+	}
+
+	// Bad principal_type.
+	tokBadPrincipal := forgeSigned(`{"iss":"https://drive9.example.com","principal_type":"superuser","grant_id":"grt_x","tenant_id":"tenant-enum","agent":"a","scope":["s"],"perm":"read","iat":1,"exp":9999999999,"nonce":"n"}`)
+	if _, err := VerifyCapToken(csk, tokBadPrincipal, time.Now()); err == nil {
+		t.Fatal("expected rejection of bad principal_type, got nil")
+	}
+
+	// Bad perm.
+	tokBadPerm := forgeSigned(`{"iss":"https://drive9.example.com","principal_type":"delegated","grant_id":"grt_x","tenant_id":"tenant-enum","agent":"a","scope":["s"],"perm":"admin","iat":1,"exp":9999999999,"nonce":"n"}`)
+	if _, err := VerifyCapToken(csk, tokBadPerm, time.Now()); err == nil {
+		t.Fatal("expected rejection of bad perm, got nil")
 	}
 }
