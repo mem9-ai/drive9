@@ -61,33 +61,41 @@ impl Client {
         )?)
     }
 
+    /// Issue a scoped capability grant (spec §6).
+    /// Request body: {agent, scope[], perm, ttl_seconds, label_hint?}.
+    /// Response: {token, grant_id, expires_at, scope[], perm, ttl}.
     pub async fn issue_vault_token(
         &self,
-        agent_id: &str,
-        task_id: &str,
+        agent: &str,
         scope: &[String],
+        perm: &str,
         ttl_seconds: i64,
+        label_hint: Option<&str>,
     ) -> Result<VaultTokenIssueResponse, Drive9Error> {
+        let mut body = json!({
+            "agent": agent,
+            "scope": scope,
+            "perm": perm,
+            "ttl_seconds": ttl_seconds,
+        });
+        if let Some(hint) = label_hint {
+            body["label_hint"] = json!(hint);
+        }
         let resp = self
             .http
             .post(self.vault_url("/tokens"))
             .headers(self.auth_headers())
-            .json(&json!({
-                "agent_id": agent_id,
-                "task_id": task_id,
-                "scope": scope,
-                "ttl_seconds": ttl_seconds,
-            }))
+            .json(&body)
             .send()
             .await?;
         let resp = check_error(resp).await?;
         Ok(resp.json().await?)
     }
 
-    pub async fn revoke_vault_token(&self, token_id: &str) -> Result<(), Drive9Error> {
+    pub async fn revoke_vault_token(&self, grant_id: &str) -> Result<(), Drive9Error> {
         let resp = self
             .http
-            .delete(self.vault_url(&format!("/tokens/{}", urlencoding::encode(token_id))))
+            .delete(self.vault_url(&format!("/tokens/{}", urlencoding::encode(grant_id))))
             .headers(self.auth_headers())
             .send()
             .await?;

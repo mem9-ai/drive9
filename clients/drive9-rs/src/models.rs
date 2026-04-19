@@ -83,23 +83,26 @@ pub struct VaultSecret {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Response for POST /v1/vault/tokens per spec 083aab8 line 133.
+/// Wire shape: {token, grant_id, expires_at, scope[], perm, ttl}.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VaultTokenIssueResponse {
     pub token: String,
-    pub token_id: String,
-    #[serde(rename = "expires_at")]
+    pub grant_id: String,
     pub expires_at: DateTime<Utc>,
+    pub scope: Vec<String>,
+    pub perm: String,
+    pub ttl: i64,
 }
 
+/// Audit event returned by GET /v1/vault/audit (spec §16).
 #[derive(Debug, Clone, Deserialize)]
 pub struct VaultAuditEvent {
     pub event_id: String,
     pub event_type: String,
     pub timestamp: DateTime<Utc>,
-    #[serde(rename = "token_id")]
-    pub token_id: Option<String>,
-    pub agent_id: Option<String>,
-    pub task_id: Option<String>,
+    pub grant_id: Option<String>,
+    pub agent: Option<String>,
     pub secret_name: Option<String>,
     pub field_name: Option<String>,
     pub adapter: Option<String>,

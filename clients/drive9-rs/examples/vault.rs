@@ -32,15 +32,21 @@ async fn main() -> Result<(), drive9::Drive9Error> {
         println!("  {}", s.name);
     }
 
-    // Issue a token
-    let token = client
-        .issue_vault_token("agent-1", "task-1", &["read".to_string()], 3600)
+    // Issue a capability grant (spec §6)
+    let grant = client
+        .issue_vault_token(
+            "agent-1",
+            &["example-secret".to_string()],
+            "read",
+            3600,
+            Some("example-grant"),
+        )
         .await?;
-    println!("Issued token: {}", token.token_id);
+    println!("Issued grant: {} (perm={}, ttl={}s)", grant.grant_id, grant.perm, grant.ttl);
 
-    // Revoke the token
-    client.revoke_vault_token(&token.token_id).await?;
-    println!("Revoked token");
+    // Revoke the grant
+    client.revoke_vault_token(&grant.grant_id).await?;
+    println!("Revoked grant");
 
     // Clean up
     client.delete_vault_secret(secret_name).await?;

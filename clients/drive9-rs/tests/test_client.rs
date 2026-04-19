@@ -148,3 +148,74 @@ fn test_default_client_loads_config() {
     }
     let _ = std::fs::remove_dir_all(&temp_home);
 }
+
+/// Asserts the new terminal-state wire shape for POST /v1/vault/tokens
+/// (spec 083aab8 line 133: {token, grant_id, expires_at, scope[], perm, ttl}).
+/// This is the field-level native assertion required by reviewer pin
+/// msg 000002c8, not a mechanical smoke test.
+#[tokio::test]
+async fn test_issue_vault_token_wire_shape() {
+    let mut server = mockito::Server::new_async().await;
+    let _m = server
+        .mock("POST", "/v1/vault/tokens")
+        .match_body(mockito::Matcher::JsonString(
+            r#"{"agent":"deploy-agent","scope":["aws-prod","db-prod/password"],"perm":"read","ttl_seconds":3600,"label_hint":"deploy-2026"}"#
+                .to_string(),
+        ))
+        .with_status(201)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"token":"vault_abc","grant_id":"grt_123","expires_at":"2026-04-14T00:00:00Z","scope":["aws-prod","db-prod/password"],"perm":"read","ttl":3600}"#,
+        )
+        .create_async()
+        .await;
+
+    let client = Client::new(server.url(), "tenant-key");
+    let grant = client
+        .issue_vault_token(
+            "deploy-agent",
+            &["aws-prod".to_string(), "db-prod/password".to_string()],
+            "read",
+            3600,
+            Some("deploy-2026"),
+        )
+        .await
+        .unwrap();
+
+    // Field-level new-shape assertions (not smoke tests).
+    assert_eq!(grant.token, "vault_abc");
+    assert_eq!(grant.grant_id, "grt_123");
+    assert_eq!(grant.perm, "read");
+    assert_eq!(grant.ttl, 3600);
+    assert_eq!(grant.scope.len(), 2);
+    assert_eq!(grant.scope[0], "aws-prod");
+    assert_eq!(grant.scope[1], "db-prod/password");
+}
+
+/// Asserts VaultAuditEvent deserializes from the new-shape wire
+/// ({grant_id, agent}) and NOT from the old-shape ({token_id, agent_id, task_id}).
+#[tokio::test]
+async fn test_audit_event_wire_shape() {
+    let mut server = mockito::Server::new_async().await;
+    let _m = server
+        .mock("GET", "/v1/vault/audit?secret=aws-prod&limit=10")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"events":[{"event_id":"ev_1","event_type":"secret.read","grant_id":"grt_123","agent":"deploy-agent","secret_name":"aws-prod","field_name":"password","adapter":"api","timestamp":"2026-04-14T00:00:00Z"}]}"#,
+        )
+        .create_async()
+        .await;
+
+    let client = Client::new(server.url(), "tenant-key");
+    let events = client.query_vault_audit(Some("aws-prod"), 10).await.unwrap();
+
+    assert_eq!(events.len(), 1);
+    let ev = &events[0];
+    assert_eq!(ev.event_type, "secret.read");
+    assert_eq!(ev.grant_id.as_deref(), Some("grt_123"));
+    assert_eq!(ev.agent.as_deref(), Some("deploy-agent"));
+    assert_eq!(ev.adapter.as_deref(), Some("api"));
+    assert_eq!(ev.secret_name.as_deref(), Some("aws-prod"));
+    assert_eq!(ev.field_name.as_deref(), Some("password"));
+}
