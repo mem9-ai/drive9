@@ -247,6 +247,7 @@ func main() {
 		Provisioner:      provisioner,
 		TokenSecret:      tokenSecret,
 		VaultMasterKey:   vaultMasterKey,
+		VaultIssuerURL:   vaultIssuerURL(addr),
 		S3Dir:            s3cfg.Dir,
 		MaxUploadBytes:   maxUploadBytes,
 		Logger:           srvLogger,
@@ -397,6 +398,19 @@ func die(err error) {
 	}
 	fmt.Fprintf(os.Stderr, "drive9-server: %v\n", err)
 	os.Exit(1)
+}
+
+// vaultIssuerURL returns the canonical issuer URL used as the `iss` claim on
+// vault grants. DRIVE9_VAULT_ISSUER_URL is the explicit override for sites that
+// want the grant issuer to be a different URL than the public object URL (e.g.
+// when signed URLs go to a CDN and grant validation happens at a control-plane
+// host). When unset, we fall back to the same canonical URL the object plane
+// uses, which is what the end-state spec §16 expects (single server identity).
+func vaultIssuerURL(listenAddr string) string {
+	if v := strings.TrimRight(strings.TrimSpace(os.Getenv("DRIVE9_VAULT_ISSUER_URL")), "/"); v != "" {
+		return v
+	}
+	return publicBaseURL(listenAddr)
 }
 
 func publicBaseURL(listenAddr string) string {

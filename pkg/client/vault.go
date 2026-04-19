@@ -201,6 +201,83 @@ func (c *Client) RevokeVaultToken(ctx context.Context, tokenID string) error {
 	return nil
 }
 
+// VaultGrantIssueRequest is the wire payload sent to /v1/vault/grants.
+//
+// principal_type is deliberately NOT a caller-controllable field: the endstate
+// spec §16 fixes `vault grant` output to delegated-only and the server mints
+// delegated JWTs unconditionally. Exposing a caller-supplied principal_type
+// here would invite confusion about a contract the server no longer honors.
+type VaultGrantIssueRequest struct {
+	Agent      string   `json:"agent"`
+	Scope      []string `json:"scope"`
+	Perm       string   `json:"perm"`
+	TTLSeconds int      `json:"ttl_seconds"`
+	LabelHint  string   `json:"label_hint,omitempty"`
+}
+
+// VaultGrantIssueResponse is the decoded response from /v1/vault/grants.
+// ExpiresAt is an RFC3339 timestamp; Token is the `vt_`-prefixed bearer string.
+type VaultGrantIssueResponse struct {
+	Token     string    `json:"token"`
+	GrantID   string    `json:"grant_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+	Scope     []string  `json:"scope"`
+	Perm      string    `json:"perm"`
+}
+
+// IssueVaultGrant mints a vault grant via the management API. Requires the
+// caller to be authenticated as the tenant owner (API key); delegated callers
+// cannot reach this endpoint so re-delegation is blocked at the router layer.
+func (c *Client) IssueVaultGrant(ctx context.Context, req VaultGrantIssueRequest) (*VaultGrantIssueResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal grant issue request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.vaultURL("/grants"), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var result VaultGrantIssueResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode grant issue response: %w", err)
+	}
+	return &result, nil
+}
+
+// RevokeVaultGrant revokes a vault grant by grant_id via the management API.
+func (c *Client) RevokeVaultGrant(ctx context.Context, grantID, revokedBy, reason string) error {
+	body, err := json.Marshal(map[string]any{
+		"revoked_by": revokedBy,
+		"reason":     reason,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal grant revoke request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.vaultURL("/grants/"+url.PathEscape(grantID)), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return readError(resp)
+	}
+	return nil
+}
+
 // QueryVaultAudit queries the audit log via the management API.
 func (c *Client) QueryVaultAudit(ctx context.Context, secretName string, limit int) ([]VaultAuditEvent, error) {
 	u, err := url.Parse(c.vaultURL("/audit"))

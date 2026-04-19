@@ -48,6 +48,26 @@ func VaultTiDBSchemaStatements() []string {
 			INDEX idx_vault_token_agent (agent_id)
 		)`,
 
+		// vault_grants — end-state token storage per docs/specs/vault-interaction-end-state.md §16.
+		// Coexists with vault_tokens until PR-E per docs/specs/pr-e-removal-contract.md.
+		`CREATE TABLE IF NOT EXISTS vault_grants (
+			grant_id       VARCHAR(64) PRIMARY KEY,
+			tenant_id      VARCHAR(64) NOT NULL,
+			issuer         VARCHAR(256) NOT NULL,
+			principal_type VARCHAR(16) NOT NULL,
+			agent          VARCHAR(128) NOT NULL,
+			scope_json     JSON NOT NULL,
+			perm           VARCHAR(8) NOT NULL,
+			label_hint     VARCHAR(128),
+			issued_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			expires_at     DATETIME(3) NOT NULL,
+			revoked_at     DATETIME(3),
+			revoked_by     VARCHAR(128),
+			revoke_reason  VARCHAR(256),
+			INDEX idx_vault_grants_tenant (tenant_id),
+			INDEX idx_vault_grants_expires (expires_at)
+		)`,
+
 		`CREATE TABLE IF NOT EXISTS vault_policies (
 			policy_id   VARCHAR(64) PRIMARY KEY,
 			tenant_id   VARCHAR(64) NOT NULL,
