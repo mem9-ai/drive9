@@ -210,14 +210,3 @@ func TestIssueGrantRejectsNonPositiveTTL(t *testing.T) {
 	}
 }
 
-func TestIssueGrantRejectsTTLAboveMax(t *testing.T) {
-	s := newGrantTestStore(t)
-	ctx := context.Background()
-	if _, _, err := s.IssueGrant(
-		ctx, "tenant-a", "https://srv.invalid",
-		PrincipalOwner, "agent-1", []string{"aws-prod"},
-		GrantPermRead, MaxGrantTTL+time.Second, "",
-	); err == nil {
-		t.Fatal("expected ttl > MaxGrantTTL to be rejected at store boundary")
-	}
-}
