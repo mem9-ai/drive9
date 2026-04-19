@@ -377,11 +377,11 @@ Port PR #274's `ctx_test.go`, then add (B3-new) tests for:
 - `TestCtxImport_TTYWithoutFlag`: fake TTY stdin, no flag → `EINVAL` exit, stderr contains the exact help-pointer string.
 - `TestCtxImport_TTYWithBarePositional`: fake TTY stdin, bare positional → same error + postscript line.
 - `TestCtxImport_PipedStdinDefault`: non-TTY stdin with JWT bytes, no flag → imports successfully.
-- `TestCtxImport_ExpiredToken`: JWT with `exp = now - 1h` → `EACCES` exit, no config write. Read `~/.drive9/config` afterwards, assert the context does **not** appear.
-- `TestCtxImport_PrincipalTypeOwner`: JWT with `principal_type=owner` → `EINVAL` exit, stderr directs to `ctx add --api-key`.
-- `TestCtxImport_EmptyIss`: JWT missing `iss` claim → `EINVAL` exit.
+- `TestCtxImport_ExpiredToken_NoConfigWrite`: JWT with `exp = now - 1h` → `EACCES` exit, no config write. Read `~/.drive9/config` afterwards, assert the context does **not** appear.
+- `TestCtxImport_PrincipalTypeOwner_Rejected`: JWT with `principal_type=owner` → `EINVAL` exit, stderr directs to `ctx add --api-key`.
+- `TestCtxImport_EmptyIss_Rejected`: JWT missing `iss` claim → `EINVAL` exit.
 - `TestCtxImport_LabelHintNewlineEscape`: `label_hint` = `"evil\n[INJECTED]"`. After import, `ctx ls` renders it on a single line (tabwriter). Matches `pr-a-review-checklist.md` §I silent-requirement bullet on `label_hint` injection.
-- `TestCtxUse_ExpiredDelegated`: importing a not-yet-expired grant, then fast-forwarding time past `exp` and calling `ctx use` → refused with exact message.
+- `TestCtxUse_ExpiredDelegated_Refused`: importing a not-yet-expired grant, then fast-forwarding time past `exp` and calling `ctx use` → refused with exact message.
 - `TestCtxUse_ActivateOwner`: owner context descriptor line format check.
 - `TestCtxAdd_GeneratesName`: no `--name` → generated name of form `<adj>-<noun>` (regex `^[a-z]+-[a-z]+$`).
 - `TestCtxAdd_CollisionSuffix`: two `ctx add` without `--name`, force seed to collide → second gets `-2` suffix.
@@ -467,7 +467,7 @@ Test: `TestCtxImport_InsecureGrantFileMode_Refused` — create a temp grant file
 
 ## 6. Test plan (must ship with PR)
 
-Reconciles PR #274's test coverage (14 ports — three prototype tests in PR #274 are dropped as superseded: the positional-form happy path, the positional-form warning, and the positional-form collision case, all obsolete after §3 drops positional entirely) with B3-new tests from §4.2 / §5. Full list (28 cases):
+Reconciles PR #274's test coverage (14 ports — three prototype tests in PR #274 are dropped as superseded: the positional-form happy path, the positional-form warning, and the positional-form collision case, all obsolete after §3 drops positional entirely) with B3-new tests from §4.2 / §5. Full list (33 cases). This enumeration is **canonical** — any test mentioned in §4.2 / §5 / checklist must appear here with matching name; any addition updates the count in the same delta.
 
 **From PR #274 (port as-is):**
 1. `TestCtxAdd_Owner_WritesConfig`
@@ -488,18 +488,23 @@ Reconciles PR #274's test coverage (14 ports — three prototype tests in PR #27
 **B3-new:**
 15. `TestCtxImport_TTYWithoutFlag` (§5.3, §4.2)
 16. `TestCtxImport_TTYWithBarePositional` (§5.3, §4.2)
-17. `TestCtxImport_ExpiredToken_NoConfigWrite` (§4.2)
-18. `TestCtxImport_PrincipalTypeOwner_Rejected` (§4.2)
-19. `TestCtxImport_EmptyIss_Rejected` (§4.2)
-20. `TestCtxImport_MissingGrantID_Rejected` (§2.2 step 9)
-21. `TestCtxImport_EmptyScope_Rejected` (§2.2 step 10)
-22. `TestCtxImport_InsecureGrantFileMode_Refused` (§5.7 / §2.2 step 1)
-23. `TestCtxImport_LabelHintNewlineEscape` (§5.5)
-24. `TestCtxUse_ExpiredDelegated_Refused` (§5.6)
-25. `TestConfig_LoadDefaultTypeBackfill` (§4.2)
-26. `TestConfig_AtomicWriteSurvivesPartialCrash` (§4.4)
-27. `TestCtxAdd_ConfigMode0600` (§5.2)
-28. `TestCtxImport_TofuIssuerPopulated` (§5.4, documents behavior)
+17. `TestCtxImport_PipedStdinDefault` (§4.2)
+18. `TestCtxImport_ExpiredToken_NoConfigWrite` (§4.2)
+19. `TestCtxImport_PrincipalTypeOwner_Rejected` (§4.2)
+20. `TestCtxImport_EmptyIss_Rejected` (§4.2)
+21. `TestCtxImport_MissingGrantID_Rejected` (§2.2 step 9)
+22. `TestCtxImport_EmptyScope_Rejected` (§2.2 step 10)
+23. `TestCtxImport_InsecureGrantFileMode_Refused` (§5.7 / §2.2 step 1)
+24. `TestCtxImport_LabelHintNewlineEscape` (§5.5)
+25. `TestCtxUse_ExpiredDelegated_Refused` (§5.6)
+26. `TestCtxUse_ActivateOwner` (§4.2)
+27. `TestCtxAdd_GeneratesName` (§4.2 / §4.3)
+28. `TestCtxAdd_CollisionSuffix` (§4.2 / §4.3)
+29. `TestCtxRm_CurrentClears` (§4.2)
+30. `TestConfig_LoadDefaultTypeBackfill` (§4.2)
+31. `TestConfig_AtomicWriteSurvivesPartialCrash` (§4.4)
+32. `TestCtxAdd_ConfigMode0600` (§5.2)
+33. `TestCtxImport_TofuIssuerPopulated` (§5.4, documents behavior)
 
 If review surfaces additional required cases, they are added to this enumeration and the count is updated in the same delta — the header number and the enumeration are kept in lock-step.
 
