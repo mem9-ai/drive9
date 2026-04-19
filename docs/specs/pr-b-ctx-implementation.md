@@ -467,7 +467,7 @@ Test: `TestCtxImport_InsecureGrantFileMode_Refused` — create a temp grant file
 
 ## 6. Test plan (must ship with PR)
 
-Reconciles PR #274's test coverage (14 ports — three prototype tests in PR #274 are dropped as superseded: the positional-form happy path, the positional-form warning, and the positional-form collision case, all obsolete after §3 drops positional entirely) with B3-new tests from §4.2 / §5. Full list (33 cases). This enumeration is **canonical** — any test mentioned in §4.2 / §5 / checklist must appear here with matching name; any addition updates the count in the same delta.
+Reconciles PR #274's test coverage (14 ports — three prototype tests in PR #274 are dropped as superseded: the positional-form happy path, the positional-form warning, and the positional-form collision case, all obsolete after §3 drops positional entirely) with B3-new tests from §4.2 / §5 / checklist §K. Full list (34 cases). This enumeration is **canonical** — any test mentioned in §4.2 / §5 / checklist must appear here with matching name; any addition updates the count in the same delta.
 
 **From PR #274 (port as-is):**
 1. `TestCtxAdd_Owner_WritesConfig`
@@ -505,6 +505,7 @@ Reconciles PR #274's test coverage (14 ports — three prototype tests in PR #27
 31. `TestConfig_AtomicWriteSurvivesPartialCrash` (§4.4)
 32. `TestCtxAdd_ConfigMode0600` (§5.2)
 33. `TestCtxImport_TofuIssuerPopulated` (§5.4, documents behavior)
+34. `TestCtxImport_LabelHintCollidesWithExistingOwner` (checklist §K silent-requirement — attacker-chosen label_hint matching an existing owner name; default-name collision appends numeric suffix, owner not overwritten)
 
 If review surfaces additional required cases, they are added to this enumeration and the count is updated in the same delta — the header number and the enumeration are kept in lock-step.
 

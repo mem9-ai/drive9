@@ -107,7 +107,7 @@ Per `feedback_review_gate_axis_enumeration.md`: before sign-off, walk every numb
 
 ## J. Test suite
 
-- [ ] **[code]** All 33 test cases from impl §6 present and passing in CI. §6 is the **canonical** enumeration; §4.2 / §5 prose mentions must name tests by the same identifier as §6. If the enumeration changes, header count + prose + checklist update in the same delta.
+- [ ] **[code]** All 34 test cases from impl §6 present and passing in CI. §6 is the **canonical** enumeration; §4.2 / §5 / §K prose mentions must name tests by the same identifier as §6. If the enumeration changes, header count + prose + checklist update in the same delta.
 - [ ] **[code]** No `t.Skip` in the new tests.
 - [ ] **[code]** Tests assert exact errno / exit code, not just `err != nil`.
 - [ ] **[code]** Tests use `testify/require` per agent standard. No hand-rolled assertions.
