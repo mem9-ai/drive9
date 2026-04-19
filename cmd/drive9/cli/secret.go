@@ -257,12 +257,13 @@ func SecretRm(args []string) error {
 	return c.DeleteVaultSecret(context.Background(), name)
 }
 
-// SecretGrant issues a scoped capability token.
+// SecretGrant issues a scoped capability grant per spec §6.
 func SecretGrant(args []string) error {
 	var (
-		agentID   string
-		taskID    string
+		agent     string
+		perm      string
 		ttlRaw    string
+		labelHint string
 		asJSON    bool
 		tokenOnly bool
 		scope     []string
@@ -275,19 +276,25 @@ func SecretGrant(args []string) error {
 				return fmt.Errorf("--agent requires a value")
 			}
 			i++
-			agentID = args[i]
-		case "--task":
+			agent = args[i]
+		case "--perm":
 			if i+1 >= len(args) {
-				return fmt.Errorf("--task requires a value")
+				return fmt.Errorf("--perm requires a value")
 			}
 			i++
-			taskID = args[i]
+			perm = args[i]
 		case "--ttl":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--ttl requires a value")
 			}
 			i++
 			ttlRaw = args[i]
+		case "--label-hint":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--label-hint requires a value")
+			}
+			i++
+			labelHint = args[i]
 		case "--json":
 			asJSON = true
 		case "--token-only":
@@ -302,8 +309,14 @@ func SecretGrant(args []string) error {
 	if asJSON && tokenOnly {
 		return fmt.Errorf("--json and --token-only are mutually exclusive")
 	}
-	if agentID == "" {
+	if agent == "" {
 		return fmt.Errorf("--agent is required")
+	}
+	if perm == "" {
+		return fmt.Errorf("--perm is required (read|write)")
+	}
+	if perm != "read" && perm != "write" {
+		return fmt.Errorf("--perm must be 'read' or 'write'")
 	}
 	if ttlRaw == "" {
 		return fmt.Errorf("--ttl is required")
@@ -327,7 +340,7 @@ func SecretGrant(args []string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.IssueVaultToken(context.Background(), agentID, taskID, scope, ttl)
+	resp, err := c.IssueVaultToken(context.Background(), agent, scope, perm, ttl, labelHint)
 	if err != nil {
 		return err
 	}
@@ -338,16 +351,19 @@ func SecretGrant(args []string) error {
 		return writeJSON(resp)
 	default:
 		_, _ = fmt.Fprintf(os.Stdout, "token=%s\n", resp.Token)
-		_, _ = fmt.Fprintf(os.Stdout, "token_id=%s\n", resp.TokenID)
+		_, _ = fmt.Fprintf(os.Stdout, "grant_id=%s\n", resp.GrantID)
+		_, _ = fmt.Fprintf(os.Stdout, "perm=%s\n", resp.Perm)
+		_, _ = fmt.Fprintf(os.Stdout, "scope=%s\n", strings.Join(resp.Scope, ","))
+		_, _ = fmt.Fprintf(os.Stdout, "ttl=%d\n", resp.TTL)
 		_, _ = fmt.Fprintf(os.Stdout, "expires_at=%s\n", resp.ExpiresAt.Format(time.RFC3339))
 	}
 	return nil
 }
 
-// SecretRevoke revokes a capability token.
+// SecretRevoke revokes a capability grant.
 func SecretRevoke(args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage drive9 secret revoke <token-id>")
+		return fmt.Errorf("usage drive9 secret revoke <grant-id>")
 	}
 	c, err := newVaultManagementClientFromEnv()
 	if err != nil {
@@ -586,7 +602,7 @@ func printAudit(events []client.VaultAuditEvent) {
 	for _, ev := range events {
 		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
 			ev.Timestamp.Format(time.RFC3339),
-			ev.AgentID,
+			ev.Agent,
 			ev.EventType,
 			ev.SecretName,
 			ev.FieldName,
@@ -623,10 +639,10 @@ func envMapFromSecret(fields map[string]string) map[string]string {
 	return env
 }
 
-func filterAuditEvents(events []client.VaultAuditEvent, agentID string, since time.Time) []client.VaultAuditEvent {
+func filterAuditEvents(events []client.VaultAuditEvent, agent string, since time.Time) []client.VaultAuditEvent {
 	filtered := make([]client.VaultAuditEvent, 0, len(events))
 	for _, ev := range events {
-		if agentID != "" && ev.AgentID != agentID {
+		if agent != "" && ev.Agent != agent {
 			continue
 		}
 		if !since.IsZero() && ev.Timestamp.Before(since) {

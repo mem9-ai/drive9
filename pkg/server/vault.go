@@ -142,6 +142,7 @@ func (s *Server) handleVaultSecretCreate(w http.ResponseWriter, r *http.Request,
 	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
 		TenantID:   tenantID,
 		EventType:  "secret.created",
+		Agent:      req.CreatedBy,
 		SecretName: req.Name,
 	})
 
@@ -212,6 +213,7 @@ func (s *Server) handleVaultSecretUpdate(w http.ResponseWriter, r *http.Request,
 	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
 		TenantID:   tenantID,
 		EventType:  "secret.rotated",
+		Agent:      req.UpdatedBy,
 		SecretName: name,
 	})
 
@@ -220,6 +222,15 @@ func (s *Server) handleVaultSecretUpdate(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *Server) handleVaultSecretDelete(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, name string) {
+	var req struct {
+		DeletedBy string `json:"deleted_by"`
+	}
+	// Body is optional for DELETE.
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req)
+	if req.DeletedBy == "" {
+		req.DeletedBy = "api"
+	}
+
 	err := vs.DeleteSecret(r.Context(), tenantID, name)
 	if err != nil {
 		if errors.Is(err, vault.ErrNotFound) {
@@ -233,6 +244,7 @@ func (s *Server) handleVaultSecretDelete(w http.ResponseWriter, r *http.Request,
 	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
 		TenantID:   tenantID,
 		EventType:  "secret.deleted",
+		Agent:      req.DeletedBy,
 		SecretName: name,
 	})
 
@@ -391,6 +403,7 @@ func (s *Server) handleVaultTokenRevoke(w http.ResponseWriter, r *http.Request, 
 		TenantID:  tenantID,
 		EventType: "grant.revoked",
 		GrantID:   grantID,
+		Agent:     req.RevokedBy,
 	})
 
 	w.Header().Set("Content-Type", "application/json")

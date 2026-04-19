@@ -22,20 +22,23 @@ type VaultSecret struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
-// VaultTokenIssueResponse is returned when issuing a scoped capability token.
+// VaultTokenIssueResponse is returned when issuing a scoped capability grant.
+// Wire shape per spec 083aab8 line 133: {token, grant_id, expires_at, scope[], perm, ttl}.
 type VaultTokenIssueResponse struct {
 	Token     string    `json:"token"`
-	TokenID   string    `json:"token_id"`
+	GrantID   string    `json:"grant_id"`
 	ExpiresAt time.Time `json:"expires_at"`
+	Scope     []string  `json:"scope"`
+	Perm      string    `json:"perm"`
+	TTL       int       `json:"ttl"`
 }
 
-// VaultAuditEvent is an audit event returned by the vault audit API.
+// VaultAuditEvent is an audit event returned by the vault audit API (spec §16).
 type VaultAuditEvent struct {
 	EventID    string         `json:"event_id"`
 	EventType  string         `json:"event_type"`
-	TokenID    string         `json:"token_id,omitempty"`
-	AgentID    string         `json:"agent_id,omitempty"`
-	TaskID     string         `json:"task_id,omitempty"`
+	GrantID    string         `json:"grant_id,omitempty"`
+	Agent      string         `json:"agent,omitempty"`
 	SecretName string         `json:"secret_name,omitempty"`
 	FieldName  string         `json:"field_name,omitempty"`
 	Adapter    string         `json:"adapter,omitempty"`
@@ -152,17 +155,22 @@ func (c *Client) ListVaultSecrets(ctx context.Context) ([]VaultSecret, error) {
 	return result.Secrets, nil
 }
 
-// IssueVaultToken issues a scoped capability token via the management API.
-func (c *Client) IssueVaultToken(ctx context.Context, agentID, taskID string, scope []string, ttl time.Duration) (*VaultTokenIssueResponse, error) {
+// IssueVaultToken issues a scoped capability grant via the management API.
+// Request shape matches spec §6 `vault grant`: {agent, scope[], perm, ttl_seconds, label_hint?}.
+func (c *Client) IssueVaultToken(ctx context.Context, agent string, scope []string, perm string, ttl time.Duration, labelHint string) (*VaultTokenIssueResponse, error) {
 	ttlSeconds := int(ttl / time.Second)
-	body, err := json.Marshal(map[string]any{
-		"agent_id":    agentID,
-		"task_id":     taskID,
+	payload := map[string]any{
+		"agent":       agent,
 		"scope":       scope,
+		"perm":        perm,
 		"ttl_seconds": ttlSeconds,
-	})
+	}
+	if labelHint != "" {
+		payload["label_hint"] = labelHint
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("marshal token issue request: %w", err)
+		return nil, fmt.Errorf("marshal grant issue request: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.vaultURL("/tokens"), bytes.NewReader(body))
 	if err != nil {
@@ -179,14 +187,14 @@ func (c *Client) IssueVaultToken(ctx context.Context, agentID, taskID string, sc
 	}
 	var result VaultTokenIssueResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode token issue response: %w", err)
+		return nil, fmt.Errorf("decode grant issue response: %w", err)
 	}
 	return &result, nil
 }
 
-// RevokeVaultToken revokes a capability token via the management API.
-func (c *Client) RevokeVaultToken(ctx context.Context, tokenID string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.vaultURL("/tokens/"+url.PathEscape(tokenID)), nil)
+// RevokeVaultToken revokes a capability grant via the management API.
+func (c *Client) RevokeVaultToken(ctx context.Context, grantID string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.vaultURL("/tokens/"+url.PathEscape(grantID)), nil)
 	if err != nil {
 		return err
 	}

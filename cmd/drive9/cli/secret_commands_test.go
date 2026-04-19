@@ -81,7 +81,7 @@ func TestSecretGrantPrintsTokenMetadata(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"token":"vault_abc","token_id":"cap_123","expires_at":"2026-04-14T00:00:00Z"}`))
+		_, _ = w.Write([]byte(`{"token":"vault_abc","grant_id":"grt_123","expires_at":"2026-04-14T00:00:00Z","scope":["aws-prod","db-prod/password"],"perm":"read","ttl":3600}`))
 	}))
 	defer srv.Close()
 
@@ -90,12 +90,15 @@ func TestSecretGrantPrintsTokenMetadata(t *testing.T) {
 	t.Setenv("DRIVE9_API_KEY", "tenant-key")
 
 	out := captureStdout(t, func() {
-		if err := SecretGrant([]string{"aws-prod", "db-prod/password", "--agent", "deploy-agent", "--ttl", "1h"}); err != nil {
+		if err := SecretGrant([]string{"aws-prod", "db-prod/password", "--agent", "deploy-agent", "--perm", "read", "--ttl", "1h"}); err != nil {
 			t.Fatalf("SecretGrant: %v", err)
 		}
 	})
-	if !strings.Contains(out, "token=vault_abc") || !strings.Contains(out, "token_id=cap_123") {
+	if !strings.Contains(out, "token=vault_abc") || !strings.Contains(out, "grant_id=grt_123") {
 		t.Fatalf("output = %q", out)
+	}
+	if !strings.Contains(out, "perm=read") || !strings.Contains(out, "ttl=3600") {
+		t.Fatalf("output missing perm/ttl: %q", out)
 	}
 }
 
@@ -192,8 +195,8 @@ func TestSecretAuditFiltersClientSide(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"events":[` +
-			`{"event_id":"1","event_type":"secret.read","agent_id":"deploy-agent","secret_name":"aws-prod","timestamp":"` + now.Add(-10*time.Minute).Format(time.RFC3339) + `"},` +
-			`{"event_id":"2","event_type":"secret.read","agent_id":"test-agent","secret_name":"aws-prod","timestamp":"` + now.Add(-2*time.Hour).Format(time.RFC3339) + `"}` +
+			`{"event_id":"1","event_type":"secret.read","agent":"deploy-agent","secret_name":"aws-prod","timestamp":"` + now.Add(-10*time.Minute).Format(time.RFC3339) + `"},` +
+			`{"event_id":"2","event_type":"secret.read","agent":"test-agent","secret_name":"aws-prod","timestamp":"` + now.Add(-2*time.Hour).Format(time.RFC3339) + `"}` +
 			`]}`))
 	}))
 	defer srv.Close()
@@ -207,7 +210,7 @@ func TestSecretAuditFiltersClientSide(t *testing.T) {
 			t.Fatalf("SecretAudit: %v", err)
 		}
 	})
-	if !strings.Contains(out, `"agent_id": "deploy-agent"`) || strings.Contains(out, `"agent_id": "test-agent"`) {
+	if !strings.Contains(out, `"agent": "deploy-agent"`) || strings.Contains(out, `"agent": "test-agent"`) {
 		t.Fatalf("output = %q", out)
 	}
 }

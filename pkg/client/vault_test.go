@@ -24,19 +24,26 @@ func TestIssueVaultTokenUsesManagementAuthAndPayload(t *testing.T) {
 			t.Fatalf("Authorization = %q", got)
 		}
 		var req struct {
-			AgentID string   `json:"agent_id"`
-			TaskID  string   `json:"task_id"`
-			Scope   []string `json:"scope"`
-			TTLSecs int      `json:"ttl_seconds"`
+			Agent     string   `json:"agent"`
+			Scope     []string `json:"scope"`
+			Perm      string   `json:"perm"`
+			TTLSecs   int      `json:"ttl_seconds"`
+			LabelHint string   `json:"label_hint"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("Decode: %v", err)
 		}
-		if req.AgentID != "deploy-agent" || req.TaskID != "task-123" {
-			t.Fatalf("unexpected request: %+v", req)
+		if req.Agent != "deploy-agent" {
+			t.Fatalf("agent = %q, want deploy-agent", req.Agent)
+		}
+		if req.Perm != "read" {
+			t.Fatalf("perm = %q, want read", req.Perm)
 		}
 		if req.TTLSecs != 3600 {
 			t.Fatalf("ttl_seconds = %d, want 3600", req.TTLSecs)
+		}
+		if req.LabelHint != "deploy-2026" {
+			t.Fatalf("label_hint = %q, want deploy-2026", req.LabelHint)
 		}
 		if len(req.Scope) != 2 || req.Scope[0] != "aws-prod" || req.Scope[1] != "db-prod/password" {
 			t.Fatalf("scope = %+v", req.Scope)
@@ -44,19 +51,28 @@ func TestIssueVaultTokenUsesManagementAuthAndPayload(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"token":      "vault_token",
-			"token_id":   "cap_123",
+			"grant_id":   "grt_123",
 			"expires_at": "2026-04-14T00:00:00Z",
+			"scope":      []string{"aws-prod", "db-prod/password"},
+			"perm":       "read",
+			"ttl":        3600,
 		})
 	}))
 	defer srv.Close()
 
 	c := New(srv.URL, "tenant-key")
-	resp, err := c.IssueVaultToken(context.Background(), "deploy-agent", "task-123", []string{"aws-prod", "db-prod/password"}, time.Hour)
+	resp, err := c.IssueVaultToken(context.Background(), "deploy-agent", []string{"aws-prod", "db-prod/password"}, "read", time.Hour, "deploy-2026")
 	if err != nil {
 		t.Fatalf("IssueVaultToken: %v", err)
 	}
-	if resp.Token != "vault_token" || resp.TokenID != "cap_123" {
+	if resp.Token != "vault_token" || resp.GrantID != "grt_123" {
 		t.Fatalf("unexpected response: %+v", resp)
+	}
+	if resp.Perm != "read" || resp.TTL != 3600 {
+		t.Fatalf("unexpected shape: perm=%q ttl=%d", resp.Perm, resp.TTL)
+	}
+	if len(resp.Scope) != 2 {
+		t.Fatalf("scope = %+v", resp.Scope)
 	}
 }
 
