@@ -353,40 +353,51 @@ class Client(TransferMixin, PatchMixin):
 
     def issue_vault_token(
         self,
-        agent_id: str,
-        task_id: str,
+        agent: str,
         scope: list,
+        perm: str,
         ttl_seconds: int,
+        label_hint: str = "",
     ):
-        """Issue a scoped capability token via the management API."""
+        """Issue a scoped capability grant via the management API (spec §6).
+
+        Request body: {agent, scope[], perm, ttl_seconds, label_hint?}.
+        Response: {token, grant_id, expires_at, scope[], perm, ttl}.
+        """
         from .models import VaultTokenIssueResponse
 
+        body = {
+            "agent": agent,
+            "scope": scope,
+            "perm": perm,
+            "ttl_seconds": ttl_seconds,
+        }
+        if label_hint:
+            body["label_hint"] = label_hint
         resp = self._request(
             "POST",
             self._vault_url("/tokens"),
-            json={
-                "agent_id": agent_id,
-                "task_id": task_id,
-                "scope": scope,
-                "ttl_seconds": ttl_seconds,
-            },
+            json=body,
             headers={"Content-Type": "application/json"},
         )
         self._check_error(resp)
         data = resp.json()
         return VaultTokenIssueResponse(
             token=data["token"],
-            token_id=data["token_id"],
+            grant_id=data["grant_id"],
             expires_at=datetime.fromisoformat(
                 data["expires_at"].replace("Z", "+00:00")
             ),
+            scope=data.get("scope", []) or [],
+            perm=data["perm"],
+            ttl=data["ttl"],
         )
 
-    def revoke_vault_token(self, token_id: str) -> None:
-        """Revoke a capability token via the management API."""
+    def revoke_vault_token(self, grant_id: str) -> None:
+        """Revoke a capability grant via the management API."""
         resp = self._request(
             "DELETE",
-            self._vault_url("/tokens/" + quote(token_id, safe="")),
+            self._vault_url("/tokens/" + quote(grant_id, safe="")),
         )
         self._check_error(resp)
 
@@ -411,9 +422,8 @@ class Client(TransferMixin, PatchMixin):
                 event_id=e["event_id"],
                 event_type=e["event_type"],
                 timestamp=datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00")),
-                token_id=e.get("token_id"),
-                agent_id=e.get("agent_id"),
-                task_id=e.get("task_id"),
+                grant_id=e.get("grant_id"),
+                agent=e.get("agent"),
                 secret_name=e.get("secret_name"),
                 field_name=e.get("field_name"),
                 adapter=e.get("adapter"),

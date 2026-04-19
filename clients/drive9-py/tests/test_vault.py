@@ -14,33 +14,86 @@ def client():
 
 
 @responses.activate
-def test_issue_vault_token(client):
+def test_issue_vault_token_wire_shape(client):
+    """Native assertion of spec 083aab8 line 133 wire shape:
+    request  = {agent, scope[], perm, ttl_seconds, label_hint?}
+    response = {token, grant_id, expires_at, scope[], perm, ttl}
+    """
+    import json as _json
+
     responses.add(
         responses.POST,
         f"{BASE_URL}/v1/vault/tokens",
         json={
-            "token": "vault_token",
-            "token_id": "cap_123",
+            "token": "vault_abc",
+            "grant_id": "grt_123",
             "expires_at": "2026-04-14T00:00:00Z",
+            "scope": ["aws-prod", "db-prod/password"],
+            "perm": "read",
+            "ttl": 3600,
         },
-        status=200,
+        status=201,
     )
     resp = client.issue_vault_token(
         "deploy-agent",
-        "task-123",
         ["aws-prod", "db-prod/password"],
+        perm="read",
         ttl_seconds=3600,
+        label_hint="nightly",
     )
-    assert resp.token == "vault_token"
-    assert resp.token_id == "cap_123"
+    assert resp.token == "vault_abc"
+    assert resp.grant_id == "grt_123"
+    assert resp.scope == ["aws-prod", "db-prod/password"]
+    assert resp.perm == "read"
+    assert resp.ttl == 3600
 
-    req = responses.calls[0].request
-    body = req.body
-    assert b"agent_id" in body
-    assert b"task_id" in body
-    assert b"scope" in body
-    assert b"ttl_seconds" in body
-    assert b"3600" in body
+    req_body = _json.loads(responses.calls[0].request.body)
+    assert req_body["agent"] == "deploy-agent"
+    assert req_body["scope"] == ["aws-prod", "db-prod/password"]
+    assert req_body["perm"] == "read"
+    assert req_body["ttl_seconds"] == 3600
+    assert req_body["label_hint"] == "nightly"
+    # Terminal-state reshape removed agent_id/task_id per spec §20.
+    assert "agent_id" not in req_body
+    assert "task_id" not in req_body
+
+
+@responses.activate
+def test_audit_event_wire_shape(client):
+    """Native assertion of spec §16 audit event shape:
+    {grant_id, agent} — not {token_id, agent_id, task_id}.
+    """
+    responses.add(
+        responses.GET,
+        f"{BASE_URL}/v1/vault/audit?secret=aws-prod&limit=5",
+        json={
+            "events": [
+                {
+                    "event_id": "e1",
+                    "event_type": "secret.read",
+                    "timestamp": "2026-04-14T00:00:00Z",
+                    "grant_id": "grt_123",
+                    "agent": "deploy-agent",
+                    "secret_name": "aws-prod",
+                    "field_name": "access_key",
+                    "adapter": "api",
+                }
+            ]
+        },
+        status=200,
+    )
+    events = client.query_vault_audit("aws-prod", limit=5)
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.grant_id == "grt_123"
+    assert ev.agent == "deploy-agent"
+    assert ev.secret_name == "aws-prod"
+    assert ev.field_name == "access_key"
+    assert ev.adapter == "api"
+    # Terminal state removed the legacy attributes.
+    assert not hasattr(ev, "token_id")
+    assert not hasattr(ev, "agent_id")
+    assert not hasattr(ev, "task_id")
 
 
 @responses.activate

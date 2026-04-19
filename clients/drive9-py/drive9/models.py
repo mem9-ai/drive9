@@ -95,21 +95,26 @@ class VaultSecret:
 
 @dataclass
 class VaultTokenIssueResponse:
-    """Response when issuing a scoped capability token."""
+    """Response when issuing a scoped capability grant (spec 083aab8 line 133).
+
+    Wire shape: {token, grant_id, expires_at, scope[], perm, ttl}.
+    """
     token: str
-    token_id: str
+    grant_id: str
     expires_at: datetime
+    scope: list
+    perm: str
+    ttl: int
 
 
 @dataclass
 class VaultAuditEvent:
-    """Audit event returned by the vault audit API."""
+    """Audit event returned by the vault audit API (spec §16)."""
     event_id: str
     event_type: str
     timestamp: datetime
-    token_id: Optional[str] = None
-    agent_id: Optional[str] = None
-    task_id: Optional[str] = None
+    grant_id: Optional[str] = None
+    agent: Optional[str] = None
     secret_name: Optional[str] = None
     field_name: Optional[str] = None
     adapter: Optional[str] = None
