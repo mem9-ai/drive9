@@ -97,7 +97,7 @@ func (b *Dat9Backend) enqueueImageExtract(fileID, path, contentType string, revi
 			return
 		}
 	}
-	if b.mediaLLMQuotaExceeded() {
+	if b.mediaLLMQuotaExceededCheck(backgroundWithTrace()) {
 		metrics.RecordOperation("media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
 		return
 	}
@@ -233,7 +233,7 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 	if !b.SupportsAsyncImageExtract() {
 		return ImageExtractResultRuntimeNotConfigured, fmt.Errorf("async image extract runtime not configured")
 	}
-	if b.monthlyLLMCostExceeded() {
+	if b.monthlyLLMCostExceededCheck(ctx) {
 		metrics.RecordOperation("llm_cost_budget", "process_skip", "budget_exhausted", 0)
 		return ImageExtractResultBudgetExhausted, nil
 	}

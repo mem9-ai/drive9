@@ -303,9 +303,18 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	// Insert DB records (same pattern as InitiateUploadWithChecksums)
 	now := time.Now()
 	uploadID := b.genID()
+	expiresAt := now.Add(24 * time.Hour)
+
+	// Server-reserve-first saga (same as upload initiate).
+	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, newSize)
+	if err != nil {
+		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
+		metrics.RecordOperation("backend", "patch_upload", "quota_exceeded", time.Since(start))
+		return nil, err
+	}
 
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
-		if err := b.ensureTenantStorageQuotaTx(tx, path, newSize); err != nil {
+		if err := b.ensureStorageQuota(ctx, tx, path, newSize); err != nil {
 			return err
 		}
 		if err := b.store.InsertFileTx(tx, &datastore.File{
@@ -332,9 +341,12 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 			Status:           datastore.UploadUploading,
 			CreatedAt:        now,
 			UpdatedAt:        now,
-			ExpiresAt:        now.Add(24 * time.Hour),
+			ExpiresAt:        expiresAt,
 		})
 	}); err != nil {
+		if reserved {
+			b.abortUploadReservation(ctx, uploadID, newSize)
+		}
 		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
 		logger.Error(ctx, "backend_patch_upload_insert_upload_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))

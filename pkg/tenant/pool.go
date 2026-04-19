@@ -36,22 +36,16 @@ type PoolConfig struct {
 	S3SessionToken    string
 
 	BackendOptions backend.Options
-
-	// MetaStore is the control-plane store for LLM usage. When set, tenant
-	// backends write LLM usage to and read budgets from this store.
-	MetaStore *meta.Store
-	// LLMUsageDualRead enables summing LLM costs from both meta store and
-	// tenant datastore during the transition month.
-	LLMUsageDualRead bool
 }
 
 type Pool struct {
-	mu      sync.Mutex
-	cfg     PoolConfig
-	enc     encrypt.Encryptor
-	items   map[string]*entry
-	order   *list.List
-	maxSize int
+	mu        sync.Mutex
+	cfg       PoolConfig
+	enc       encrypt.Encryptor
+	metaStore *meta.Store // central server DB for quota operations; nil disables central quota
+	items     map[string]*entry
+	order     *list.List
+	maxSize   int
 }
 
 type entry struct {
@@ -69,6 +63,14 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 		max = 128
 	}
 	return &Pool{cfg: cfg, enc: enc, items: map[string]*entry{}, order: list.New(), maxSize: max}
+}
+
+// SetMetaStore sets the central server DB store for quota operations.
+// Must be called before any backend is created via Get/Acquire.
+func (p *Pool) SetMetaStore(ms *meta.Store) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.metaStore = ms
 }
 
 func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backend, err error) {
@@ -308,11 +310,6 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	if UsesTiDBAutoEmbedding(t.Provider) {
 		opts.DatabaseAutoEmbedding = true
 	}
-	if p.cfg.MetaStore != nil {
-		opts.MetaStore = meta.NewLLMCostCache(p.cfg.MetaStore, t.ID, 30*time.Second)
-		opts.TenantID = t.ID
-		opts.LLMUsageDualRead = p.cfg.LLMUsageDualRead
-	}
 	query := "parseTime=true"
 	if t.DBTLS {
 		query += "&tls=true"
@@ -374,6 +371,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_s3_client_ms", s3ClientDurationMs),
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
+		p.wireQuotaStore(b, t.ID)
 		return b, store, nil
 	}
 	if p.cfg.S3Dir != "" {
@@ -404,6 +402,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_s3_client_ms", s3ClientDurationMs),
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
+		p.wireQuotaStore(b, t.ID)
 		return b, store, nil
 	}
 	backendCreateStart := time.Now()
@@ -423,7 +422,26 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		zap.Float64("create_s3_client_ms", 0),
 		zap.Float64("create_backend_ms", backendCreateDurationMs),
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
+	p.wireQuotaStore(b, t.ID)
 	return b, store, nil
+}
+
+// wireQuotaStore sets the central quota store on a newly created backend.
+// No-op when the pool's metaStore is nil (tests, non-multi-tenant mode).
+// Also ensures a tenant_quota_usage row exists so that counter UPDATEs
+// do not fail for newly provisioned tenants.
+func (p *Pool) wireQuotaStore(b *backend.Dat9Backend, tenantID string) {
+	if p.metaStore == nil {
+		return
+	}
+	adapter := NewMetaQuotaAdapter(p.metaStore)
+	b.SetMetaQuotaStore(tenantID, adapter)
+	// Bootstrap quota usage row (INSERT IGNORE — idempotent, cheap).
+	if err := p.metaStore.EnsureQuotaUsageRow(context.Background(), tenantID); err != nil {
+		logger.Warn(context.Background(), "wire_quota_store_ensure_usage_row_failed",
+			zap.String("tenant_id", tenantID),
+			zap.Error(err))
+	}
 }
 
 func (p *Pool) removeLocked(elem *list.Element) *entry {
