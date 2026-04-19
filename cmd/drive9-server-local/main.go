@@ -236,6 +236,7 @@ func main() {
 		Backend:           b,
 		LocalTenantAPIKey: localAPIKey,
 		VaultMasterKey:    vaultMasterKey,
+		VaultIssuerURL:    vaultIssuerURL(addr),
 		LocalS3:           localS3,
 		S3Dir:             s3cfg.localDir(),
 		MaxUploadBytes:    maxUploadBytes,
@@ -369,6 +370,16 @@ func die(err error) {
 	}
 	fmt.Fprintf(os.Stderr, "drive9-server-local: %v\n", err)
 	os.Exit(1)
+}
+
+// vaultIssuerURL returns the canonical issuer URL used as the `iss` claim on
+// vault grants. DRIVE9_VAULT_ISSUER_URL overrides; default falls back to the
+// same canonical URL the object plane uses.
+func vaultIssuerURL(listenAddr string) string {
+	if v := strings.TrimRight(strings.TrimSpace(os.Getenv("DRIVE9_VAULT_ISSUER_URL")), "/"); v != "" {
+		return v
+	}
+	return publicBaseURL(listenAddr)
 }
 
 func publicBaseURL(listenAddr string) string {

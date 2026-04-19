@@ -82,3 +82,70 @@ type TenantDEK struct {
 	WrappedDEK []byte    `json:"-"`
 	CreatedAt  time.Time `json:"created_at"`
 }
+
+// ---- Vault grant (terminal state per docs/specs/vault-interaction-end-state.md §16) ----
+//
+// VaultGrant and VaultGrantClaims implement the end-state token shape defined in
+// the vault-interaction-end-state spec. They are added alongside the existing
+// CapToken/CapTokenClaims types; the older types are deleted in PR-E per
+// docs/specs/pr-e-removal-contract.md.
+
+// PrincipalType enumerates the authorization principal behind a grant.
+// Exactly one of "owner" or "delegated" — no other values are accepted.
+type PrincipalType string
+
+const (
+	PrincipalOwner     PrincipalType = "owner"
+	PrincipalDelegated PrincipalType = "delegated"
+)
+
+// GrantPerm enumerates the permission a grant carries.
+// Exactly one of "read" or "write" — no other values are accepted.
+type GrantPerm string
+
+const (
+	GrantPermRead  GrantPerm = "read"
+	GrantPermWrite GrantPerm = "write"
+)
+
+// VaultGrant is the server-side state for a vault grant. The fields that are
+// security-relevant (principal_type, perm, scope, issuer, exp) mirror the
+// signed JWT claims, so a forged DB row cannot upgrade a grant's authority.
+type VaultGrant struct {
+	GrantID       string        `json:"grant_id"`
+	TenantID      string        `json:"tenant_id"`
+	Issuer        string        `json:"issuer"`
+	PrincipalType PrincipalType `json:"principal_type"`
+	Agent         string        `json:"agent"`
+	Scope         []string      `json:"scope"`
+	Perm          GrantPerm     `json:"perm"`
+	LabelHint     string        `json:"label_hint,omitempty"`
+	IssuedAt      time.Time     `json:"issued_at"`
+	ExpiresAt     time.Time     `json:"expires_at"`
+	RevokedAt     *time.Time    `json:"revoked_at,omitempty"`
+	RevokedBy     string        `json:"revoked_by,omitempty"`
+	RevokeReason  string        `json:"revoke_reason,omitempty"`
+}
+
+// VaultGrantClaims is the JWT payload signed into the grant token.
+//
+// Claim set is locked by spec §16:
+//   - iss, grant_id, principal_type, agent, scope, perm, exp are required
+//   - label_hint is optional and UX-only (Invariant #7 — never authz)
+//
+// tenant_id is deliberately NOT in the payload: tenant is resolved by the
+// server from its own registry keyed on iss + the tenant-scoped CSK used for
+// HMAC verification. Putting tenant_id in the body would be forgeable prior to
+// HMAC check.
+//
+// task_id is deliberately absent (legacy Phase-0 concept; removed per §20).
+type VaultGrantClaims struct {
+	Issuer        string        `json:"iss"`
+	GrantID       string        `json:"grant_id"`
+	PrincipalType PrincipalType `json:"principal_type"`
+	Agent         string        `json:"agent"`
+	Scope         []string      `json:"scope"`
+	Perm          GrantPerm     `json:"perm"`
+	ExpiresAt     int64         `json:"exp"`
+	LabelHint     string        `json:"label_hint,omitempty"`
+}
