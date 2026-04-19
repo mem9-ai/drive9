@@ -454,11 +454,21 @@ func (s *Server) handleVaultGrantIssue(w http.ResponseWriter, r *http.Request, v
 		return
 	}
 
+	// Per impl spec §5: grant.issued Detail carries grant_id, agent,
+	// principal_type, perm, scope so downstream audit tooling can
+	// reconstruct the minted grant without re-reading the DB.
 	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
 		TenantID:  tenantID,
 		EventType: "grant.issued",
 		TokenID:   grant.GrantID,
 		AgentID:   grant.Agent,
+		Detail: map[string]any{
+			"grant_id":       grant.GrantID,
+			"agent":          grant.Agent,
+			"principal_type": string(grant.PrincipalType),
+			"perm":           string(grant.Perm),
+			"scope":          grant.Scope,
+		},
 	})
 
 	w.Header().Set("Content-Type", "application/json")
@@ -492,10 +502,19 @@ func (s *Server) handleVaultGrantRevoke(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	// Per impl spec §5: grant.revoked Detail carries grant_id, revoked_by,
+	// reason. AgentID mirrors revoked_by so the top-level column reflects
+	// "who did this" for filter queries.
 	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
 		TenantID:  tenantID,
 		EventType: "grant.revoked",
 		TokenID:   grantID,
+		AgentID:   req.RevokedBy,
+		Detail: map[string]any{
+			"grant_id":   grantID,
+			"revoked_by": req.RevokedBy,
+			"reason":     req.Reason,
+		},
 	})
 
 	w.Header().Set("Content-Type", "application/json")

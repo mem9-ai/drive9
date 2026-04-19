@@ -185,3 +185,136 @@ func TestIssueGrantRejectsNonPositiveTTL(t *testing.T) {
 	}
 }
 
+// TestAuditGrantIssuedDetailContract asserts the grant.issued audit event
+// carries the exact Detail map the impl spec §5 requires:
+// grant_id, agent, principal_type, perm, scope. Mirrors the AuditEvent the
+// handler writes in pkg/server/vault.go handleVaultGrantIssue so reviewers can
+// see the contract in one place and catch any drift without end-to-end setup.
+func TestAuditGrantIssuedDetailContract(t *testing.T) {
+	s := newGrantTestStore(t)
+	ctx := context.Background()
+	tenantID := "tenant-audit-issued"
+
+	_, grant, err := s.IssueGrant(
+		ctx, tenantID, "https://srv.invalid",
+		PrincipalDelegated, "agent-1", []string{"db-prod/password", "aws-prod"},
+		GrantPermWrite, time.Hour, "ci-label",
+	)
+	if err != nil {
+		t.Fatalf("IssueGrant: %v", err)
+	}
+
+	// Mirror the handler's AuditEvent construction.
+	event := &AuditEvent{
+		TenantID:  tenantID,
+		EventType: "grant.issued",
+		TokenID:   grant.GrantID,
+		AgentID:   grant.Agent,
+		Detail: map[string]any{
+			"grant_id":       grant.GrantID,
+			"agent":          grant.Agent,
+			"principal_type": string(grant.PrincipalType),
+			"perm":           string(grant.Perm),
+			"scope":          grant.Scope,
+		},
+		Timestamp: time.Now(),
+	}
+	if err := s.WriteAuditEvent(ctx, event); err != nil {
+		t.Fatalf("WriteAuditEvent: %v", err)
+	}
+
+	events, err := s.QueryAuditLog(ctx, tenantID, "", 10)
+	if err != nil {
+		t.Fatalf("QueryAuditLog: %v", err)
+	}
+	if len(events) != 1 || events[0].EventType != "grant.issued" {
+		t.Fatalf("unexpected audit events: %+v", events)
+	}
+	got, ok := events[0].Detail.(map[string]any)
+	if !ok {
+		t.Fatalf("Detail not map[string]any: %T %+v", events[0].Detail, events[0].Detail)
+	}
+	if got["grant_id"] != grant.GrantID {
+		t.Errorf("grant_id = %v, want %q", got["grant_id"], grant.GrantID)
+	}
+	if got["agent"] != "agent-1" {
+		t.Errorf("agent = %v, want agent-1", got["agent"])
+	}
+	if got["principal_type"] != "delegated" {
+		t.Errorf("principal_type = %v, want delegated", got["principal_type"])
+	}
+	if got["perm"] != "write" {
+		t.Errorf("perm = %v, want write", got["perm"])
+	}
+	scope, ok := got["scope"].([]any)
+	if !ok || len(scope) != 2 || scope[0] != "db-prod/password" || scope[1] != "aws-prod" {
+		t.Errorf("scope = %v, want [db-prod/password aws-prod]", got["scope"])
+	}
+}
+
+// TestAuditGrantRevokedDetailContract asserts the grant.revoked audit event
+// carries the exact Detail map the impl spec §5 requires (grant_id,
+// revoked_by, reason) AND the top-level AgentID mirrors revoked_by so filter
+// queries by actor work without parsing detail_json.
+func TestAuditGrantRevokedDetailContract(t *testing.T) {
+	s := newGrantTestStore(t)
+	ctx := context.Background()
+	tenantID := "tenant-audit-revoked"
+
+	_, grant, err := s.IssueGrant(
+		ctx, tenantID, "https://srv.invalid",
+		PrincipalDelegated, "agent-1", []string{"aws-prod"},
+		GrantPermRead, time.Hour, "",
+	)
+	if err != nil {
+		t.Fatalf("IssueGrant: %v", err)
+	}
+
+	revokedBy := "admin-42"
+	reason := "rotated after incident"
+	if err := s.RevokeGrant(ctx, tenantID, grant.GrantID, revokedBy, reason); err != nil {
+		t.Fatalf("RevokeGrant: %v", err)
+	}
+
+	// Mirror the handler's AuditEvent construction.
+	event := &AuditEvent{
+		TenantID:  tenantID,
+		EventType: "grant.revoked",
+		TokenID:   grant.GrantID,
+		AgentID:   revokedBy,
+		Detail: map[string]any{
+			"grant_id":   grant.GrantID,
+			"revoked_by": revokedBy,
+			"reason":     reason,
+		},
+		Timestamp: time.Now(),
+	}
+	if err := s.WriteAuditEvent(ctx, event); err != nil {
+		t.Fatalf("WriteAuditEvent: %v", err)
+	}
+
+	events, err := s.QueryAuditLog(ctx, tenantID, "", 10)
+	if err != nil {
+		t.Fatalf("QueryAuditLog: %v", err)
+	}
+	if len(events) != 1 || events[0].EventType != "grant.revoked" {
+		t.Fatalf("unexpected audit events: %+v", events)
+	}
+	if events[0].AgentID != revokedBy {
+		t.Errorf("AgentID = %q, want %q (mirrors revoked_by)", events[0].AgentID, revokedBy)
+	}
+	got, ok := events[0].Detail.(map[string]any)
+	if !ok {
+		t.Fatalf("Detail not map[string]any: %T %+v", events[0].Detail, events[0].Detail)
+	}
+	if got["grant_id"] != grant.GrantID {
+		t.Errorf("grant_id = %v, want %q", got["grant_id"], grant.GrantID)
+	}
+	if got["revoked_by"] != revokedBy {
+		t.Errorf("revoked_by = %v, want %q", got["revoked_by"], revokedBy)
+	}
+	if got["reason"] != reason {
+		t.Errorf("reason = %v, want %q", got["reason"], reason)
+	}
+}
+

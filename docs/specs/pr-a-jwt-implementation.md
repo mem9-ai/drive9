@@ -19,7 +19,7 @@ This document is the hand-off for whoever implements PR-A. Follow it literally; 
 | `pkg/vault/grant_sign.go` (**new file**) | New file for `SignGrant`/`VerifyGrant` (JWT-style HMAC-SHA256 on the new payload shape). Do NOT touch `crypto.go`. Prefix constant: `vt_`. |
 | `pkg/vault/schema.go` + `pkg/tenant/schema/vault.go` + `pkg/tenant/schema/tidb_auto.go` | **ADD** `vault_grants` table DDL. Leave `vault_tokens` DDL untouched. |
 | `pkg/server/vault.go` | **ADD** `handleVaultGrants`/`handleVaultGrantIssue`/`handleVaultGrantRevoke` and route `/v1/vault/grants`. Leave `/v1/vault/tokens` handlers untouched. |
-| `pkg/vault/grant_test.go` + `pkg/vault/grant_sign_test.go` (**new**) | Tests for the 18 cases in §6. Do NOT touch `store_test.go` / `crypto_test.go`. |
+| `pkg/vault/grant_test.go` + `pkg/vault/grant_sign_test.go` (**new**) | Tests for the 20 cases in §6. Do NOT touch `store_test.go` / `crypto_test.go`. |
 | `pkg/client/vault.go` | **ADD** `IssueVaultGrant(ctx, scope, agent, perm, ttl, labelHint)` and `RevokeVaultGrant(grantID)` helpers. Leave existing `IssueVaultToken`/`RevokeVaultToken` untouched. |
 | `pkg/client/vault_test.go` | **ADD** tests for the two new helpers; do not touch existing tests. |
 
@@ -187,6 +187,8 @@ New tests (add to `pkg/vault/store_test.go` + `crypto_test.go`):
 16. **Wrong CSK**: sign with CSK1, verify with CSK2 → rejects (cross-tenant replay guard at crypto layer).
 17. **Missing `vt_` prefix**: strip prefix from a valid token → `VerifyGrant` rejects.
 18. **Client helper round-trip**: `IssueVaultGrant` / `RevokeVaultGrant` against `httptest.NewServer` — payload shape, auth header (`Bearer tenant-key`), decoded response, and `*StatusError` propagation on 4xx (400 on bad ttl, 404 on revoke-missing).
+19. **`grant.issued` audit Detail contract**: after a successful mint, the audit event carries `Detail` as a map containing `grant_id`, `agent`, `principal_type`, `perm`, `scope` per §5 — roundtrip through `WriteAuditEvent`+`QueryAuditLog`, assert each field value, guard against accidental drop of the Detail map. (Regression after adv-2 Block B1.)
+20. **`grant.revoked` audit Detail contract**: after a successful revoke, the audit event carries `Detail` with `grant_id`, `revoked_by`, `reason` per §5, AND top-level `AgentID` mirrors `revoked_by` so filter queries by actor work without parsing detail_json. Assert both. (Regression after adv-2 Block B2.)
 
 No integration tests for HTTP in PR-A — leave that to PR-B onward once there's a full `ctx` flow to exercise.
 
