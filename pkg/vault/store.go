@@ -392,13 +392,24 @@ func (s *Store) IssueCapToken(ctx context.Context, p IssueCapTokenParams) (strin
 	}, nil
 }
 
-// VerifyAndResolveCapToken performs the full 4-step verification flow.
-// 1. HMAC signature check  2. TTL check  3. DB revocation check  4. Returns claims for scope check
-func (s *Store) VerifyAndResolveCapToken(ctx context.Context, tenantID, raw string) (*CapTokenClaims, error) {
+// VerifyAndResolveCapToken performs the full 5-step verification flow (spec Invariant #7).
+// 1. HMAC signature check  2. TTL check  3. Issuer match check  4. DB revocation check  5. Returns claims for scope check
+//
+// expectedIssuer is the issuer URL this server would mint under right now (derived from
+// the incoming request at the call site). Tokens carrying a different iss claim —
+// e.g. minted for a sibling deployment of the same tenant — are rejected. Prevents
+// cross-server token replay within a tenant.
+func (s *Store) VerifyAndResolveCapToken(ctx context.Context, tenantID, expectedIssuer, raw string) (*CapTokenClaims, error) {
 	csk := s.mk.DeriveCSK(tenantID)
 	claims, err := VerifyCapToken(csk, raw, time.Now())
 	if err != nil {
 		return nil, err
+	}
+
+	// Issuer match (spec Invariant #7). Empty expectedIssuer disables the check
+	// for call paths that cannot derive a canonical server URL (e.g. batch jobs).
+	if expectedIssuer != "" && claims.Issuer != expectedIssuer {
+		return nil, fmt.Errorf("issuer mismatch")
 	}
 
 	// DB revocation check — scoped to tenant for isolation.

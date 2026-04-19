@@ -3,6 +3,7 @@ package vault
 import (
 	"context"
 	"crypto/rand"
+	"strings"
 	"testing"
 	"time"
 )
@@ -176,8 +177,8 @@ func TestStoreCapTokenIssueRevokeVerify(t *testing.T) {
 		t.Fatalf("perm not set: %s", capToken.Perm)
 	}
 
-	// Verify should succeed.
-	resolved, err := s.VerifyAndResolveCapToken(ctx, tenantID, tokenStr)
+	// Verify should succeed when expected issuer matches.
+	resolved, err := s.VerifyAndResolveCapToken(ctx, tenantID, "https://drive9.example.com", tokenStr)
 	if err != nil {
 		t.Fatalf("VerifyAndResolveCapToken: %v", err)
 	}
@@ -194,7 +195,7 @@ func TestStoreCapTokenIssueRevokeVerify(t *testing.T) {
 	}
 
 	// Verify after revoke should fail.
-	_, err = s.VerifyAndResolveCapToken(ctx, tenantID, tokenStr)
+	_, err = s.VerifyAndResolveCapToken(ctx, tenantID, "https://drive9.example.com", tokenStr)
 	if err == nil {
 		t.Fatal("expected error for revoked token")
 	}
@@ -250,5 +251,48 @@ func TestStoreAuditWriteQuery(t *testing.T) {
 	}
 	if len(events3) != 0 {
 		t.Fatalf("expected 0 events for nonexistent, got %d", len(events3))
+	}
+}
+
+// TestVerifyAndResolveCapToken_RejectsCrossIssuer covers spec Invariant #7:
+// a token minted by server A (iss=A) presented to server B (expecting iss=B)
+// must be rejected even though HMAC, TTL, and DB revocation checks all pass
+// (CSK derives from tenant MK and is identical across both servers).
+func TestVerifyAndResolveCapToken_RejectsCrossIssuer(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	tenantID := "tenant-iss"
+
+	tokenStr, _, err := s.IssueCapToken(ctx, IssueCapTokenParams{
+		TenantID:      tenantID,
+		Issuer:        "https://server-a.drive9.example.com",
+		PrincipalType: PrincipalDelegated,
+		Agent:         "agent-iss",
+		Scope:         []string{"secret-a"},
+		Perm:          PermRead,
+		TTL:           time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("IssueCapToken: %v", err)
+	}
+
+	// Same server URL: accept.
+	if _, err := s.VerifyAndResolveCapToken(ctx, tenantID, "https://server-a.drive9.example.com", tokenStr); err != nil {
+		t.Fatalf("same-issuer verify should succeed: %v", err)
+	}
+
+	// Sibling server URL: reject with issuer-mismatch error.
+	_, err = s.VerifyAndResolveCapToken(ctx, tenantID, "https://server-b.drive9.example.com", tokenStr)
+	if err == nil {
+		t.Fatal("expected issuer mismatch rejection, got nil")
+	}
+	if !strings.Contains(err.Error(), "issuer mismatch") {
+		t.Fatalf("expected 'issuer mismatch' error, got: %v", err)
+	}
+
+	// Empty expected issuer: backward-compat path for call sites that cannot derive
+	// a canonical URL (batch jobs). Must still accept the token (other checks still run).
+	if _, err := s.VerifyAndResolveCapToken(ctx, tenantID, "", tokenStr); err != nil {
+		t.Fatalf("empty-expected-issuer verify should succeed: %v", err)
 	}
 }

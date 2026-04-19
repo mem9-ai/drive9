@@ -486,12 +486,18 @@ func (s *Server) handleVaultRead(w http.ResponseWriter, r *http.Request, sub str
 
 	vs := vault.NewStore(scope.Backend.Store().DB(), s.vaultMK)
 
-	// Full 4-step verification: HMAC signature → TTL → DB revocation → claims.
+	// Full 5-step verification: HMAC signature → TTL → issuer match → DB revocation → claims.
 	// IMPORTANT: Do NOT write audit events before verification succeeds.
 	// The tenant_id comes from an unverified peek and could be forged;
 	// writing to tenant audit before proving token authenticity would let
 	// an attacker inject events into any tenant's audit log.
-	claims, err := vs.VerifyAndResolveCapToken(r.Context(), tenantID, raw)
+	//
+	// The expected issuer is derived from this request (spec Invariant #7):
+	// a token minted on server A for tenant T must not be accepted by server B
+	// for the same tenant. Derivation matches IssueCapToken's issuer derivation
+	// at handleVaultTokenIssue so a token re-presented to the same deployment
+	// always passes.
+	claims, err := vs.VerifyAndResolveCapToken(r.Context(), tenantID, requestIssuer(r), raw)
 	if err != nil {
 		// Log to server-level observability only — not tenant audit.
 		if strings.Contains(err.Error(), "expired") {
