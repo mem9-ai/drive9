@@ -2049,6 +2049,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		// Only clear dirty if no writes occurred since the snapshot was taken.
 		// If DirtySeq changed, the buffer has new data that wasn't uploaded.
 		handle.Lock()
+		fs.refreshRevisionAfterFlush(dCtx, handle)
 		if handle.Dirty != nil && handle.DirtySeq == snapshotSeq {
 			handle.Dirty.ClearDirty()
 		}
@@ -2072,7 +2073,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 // with the latest server revision so that subsequent writes use the correct
 // base revision for CAS uploads. Callers must hold fh.mu.
 func (fs *Dat9FS) refreshRevisionAfterFlush(ctx context.Context, fh *FileHandle) {
-	if stat, err := fs.client.StatCtx(ctx, fh.Path); err == nil && stat != nil {
+	if stat, err := fs.client.StatCtx(ctx, fh.Path); err == nil && stat != nil && stat.Revision > 0 {
 		fs.inodes.UpdateRevision(fh.Ino, stat.Revision)
 		fh.BaseRev = stat.Revision
 		fh.IsNew = false
