@@ -7,8 +7,8 @@ This guide walks through using `drive9 vault` end-to-end. For the normative spec
 - A **secret** is a directory (e.g. `prod-db`).
 - A **key** is a file inside that directory (e.g. `prod-db/DB_URL`).
 - You read/write keys with ordinary POSIX commands (`cat`, `printf >`, `ls`, `rm`).
-- The control plane has 5 verbs: `put`, `grant`, `revoke`, `with`, `reauth`.
-- Credentials live in `~/.drive9/config` as **contexts**. The active context governs what **new** `mount` and invocation-time verbs (`vault grant`, `vault with`, `ctx import`) authenticate as. Already-mounted mounts are bound to whichever credential was active at mount time and keep that binding until `vault reauth` (Invariant #3 / §17 in the spec).
+- The control plane has 4 verbs: `put`, `grant`, `revoke`, `with`. (A post-M1 `reauth` verb is deferred — see spec §17.)
+- Credentials live in `~/.drive9/config` as **contexts**. The active context governs what **new** `mount` and invocation-time verbs (`vault grant`, `vault with`, `ctx import`) authenticate as. Already-mounted mounts are bound to whichever credential was active at mount time and keep that binding for the mount's lifetime — to rotate, `umount` and `mount` again (Invariant #3 / §17 in the spec).
 
 ---
 
@@ -201,7 +201,9 @@ drive9 ctx ls
 
 ---
 
-## Part 4 — Revocation and re-auth
+## Part 4 — Revocation and remount
+
+A running mount is bound to the credential that was active at mount time (Invariant #3). In M1 there is no in-process rebind — to rotate to a new credential you `umount` and `mount` again. A post-M1 `vault reauth` verb is tracked as a follow-up (see spec §17).
 
 ### Owner revokes early
 
@@ -213,12 +215,12 @@ drive9 vault revoke grt_7f2a
 
 ```bash
 cat /n/vault/prod-db/DB_URL
-# cat: Permission denied  (run `drive9 vault reauth` after updating the context)
+# cat: Permission denied   (rotate the context, then umount and mount again)
 ```
 
-### Rotate the context and rebind
+### Rotate the context and remount
 
-If the delegatee receives a new grant, they import it, switch, and rebind the running mount without unmounting:
+If the delegatee receives a new grant, they import it, switch contexts, and then remount:
 
 ```bash
 install -m 600 /dev/null ~/alice-grant-v2.jwt
@@ -227,8 +229,15 @@ drive9 ctx import --from-file ~/alice-grant-v2.jwt
 rm ~/alice-grant-v2.jwt
 
 drive9 ctx use alice-prod-db-v2
-drive9 vault reauth /n/vault
+drive9 umount /n/vault
+drive9 mount vault /n/vault
 ```
+
+### Operator notes for remount
+
+- **Close open FDs first.** `umount` fails with `EBUSY` (Linux) or "Resource busy" (macOS) while any process still has a file open under the mount point. Stop editors, shells with `cwd` inside the mount, and any long-running readers before calling `umount`. On Linux, `fuser -vm /n/vault` and `lsof /n/vault` list holders.
+- **Pending writes are best-effort across the remount boundary.** Writes that were queued against the old credential may not replay cleanly under the new credential (the new principal may lack permission on the same paths, or the owner may have revoked the underlying grant). M1 preserves the write-back cache on disk and re-plays what it can on the next mount, but does not promise lossless recovery. If loss is unacceptable, drain writes (`sync` on files of interest, wait for the cache to settle) **before** `umount`.
+- **The new mount picks up whatever context is active at `mount` time.** If you forgot to `ctx use` after import, the new mount will bind to the previous active context. `drive9 ctx ls` before `mount` is the cheapest way to confirm.
 
 ---
 
@@ -330,7 +339,7 @@ drive9 vault revoke grt_7f2a
 
 ```bash
 cat /n/vault/prod-db/DB_URL
-# cat: Permission denied   (run `drive9 vault reauth` after rotating the context)
+# cat: Permission denied   (rotate the context, then umount and mount again)
 ```
 
 ---
@@ -352,7 +361,7 @@ cat /n/vault/prod-db/DB_URL
 | Inject env | `drive9 vault with /n/vault/<s> -- <cmd>` |
 | Grant | `drive9 vault grant <scope>... --agent <a> --perm <p> --ttl <t>` |
 | Revoke | `drive9 vault revoke <grant-id>` |
-| Rebind after rotation | `drive9 vault reauth /n/vault` |
+| Rebind after rotation (M1) | `drive9 umount /n/vault && drive9 mount vault /n/vault` |
 
 ## Errno quick reference
 
@@ -361,7 +370,7 @@ cat /n/vault/prod-db/DB_URL
 | Key/secret not found | `ENOENT` |
 | Key exists but not visible under current context | `ENOENT` (intentional) |
 | Write without permission | `EACCES` |
-| Context/token expired or revoked (runtime) | `EACCES` + `vault reauth` hint |
+| Context/token expired or revoked (runtime) | `EACCES` + umount+mount hint |
 | `ctx use` on a locally-expired context | client-side error (not a new errno) |
 | Backend / FUSE failure | `EIO` |
 
