@@ -78,6 +78,41 @@ ls /n/vault/prod-db
 
 `ls` lists only the keys the current principal can see. Keys the principal cannot see are **indistinguishable from non-existent** (see §11 Errno table).
 
+## 4.1 Virtual-File Output Contract (`@env`)
+
+`@env` is a virtual file whose byte contract is normative. Consumers (human pipeline, `drive9 vault with`, CI scripts) MUST be able to parse it with no ambiguity.
+
+### 4.1.1 Output format
+
+For each key–value pair visible under the current principal, `cat @env` emits exactly one line:
+
+```
+<KEY>=<QUOTED_VALUE>\n
+```
+
+- `<KEY>` is the secret key name, unchanged, restricted to the charset `[A-Z_][A-Z0-9_]*`. Any key outside this charset MUST NOT appear in `@env`; see §4.1.3.
+- `<QUOTED_VALUE>` is the value escaped per POSIX `printf %q` semantics (shell-safe round-trippable).
+- Line terminator is `\n` (LF) only. The last line MUST also be LF-terminated.
+- Lines are emitted in **lexicographic order of `<KEY>`** (byte-wise ASCII sort) so output is deterministic and diff-stable.
+
+### 4.1.2 Empty-secret semantics
+
+- Secret exists but has zero visible keys → `cat @env` writes 0 bytes and exits 0.
+- Secret does not exist (or is invisible under the current principal) → `cat @env` fails with `ENOENT` (see §11). Consumers MUST distinguish "empty" (exit 0, 0 bytes) from "missing" (ENOENT) by exit code, not by byte count.
+
+### 4.1.3 Illegal-key handling (fail-fast)
+
+If any visible key violates `[A-Z_][A-Z0-9_]*`, `cat @env` MUST fail with `EACCES` and emit no partial output. The spec does not silently skip illegal keys, and does not coerce them (no lower-to-upper casing, no `-` → `_` substitution). Callers wanting to inject such keys into a child process must materialise them explicitly via `drive9 vault with` (which applies the same rejection) or handle them out of band.
+
+If any value contains a control character (`\x00`–`\x1f` except `\t`) the same `EACCES` rule applies; `printf %q` is not defined over unrestricted control bytes and the contract refuses to invent framing.
+
+### 4.1.4 Other whole-secret views
+
+- `cat @all` — JSON object of all visible keys. **Byte-exact contract (key ordering, whitespace, escaping) is deferred to a follow-up spec** (PR-F). In v0, `@all` is consumed as valid JSON only; consumers MUST NOT depend on formatting.
+- `cat @grants/<grant-id>` — owner-only introspection of a grant. **Byte-exact contract deferred to PR-F** (same reason). In v0, only presence/absence and the grant's scope/perm/expiry fields are stable; string representation is not.
+
+Consumers that need stable byte output today MUST use `@env` (or `--json` on a control-plane verb; see §20).
+
 ## 5. Delete
 
 ```bash
@@ -484,7 +519,7 @@ The four local short-circuits (`ctx import` / `ctx ls` / `ctx use` / `vault reau
 5. **Grants do not cascade-revoke on `rm`**: removing a key leaves existing grants syntactically intact; holders observe `ENOENT`, and audit records `affected_grants`.
 6. **One active context at a time**: `~/.drive9/config` MAY hold any number of contexts (owner and delegated, mixed); at most one is active. Switching contexts does not silently re-bind an already-mounted mount (use `reauth`).
 7. **Client-side JWT decoding is UX-only**: local decode populates `ctx` metadata and enables offline `ctx ls`; it **MUST NOT** substitute for server-side validation. The server **MUST** re-check signature, TTL, and revocation on every request.
-8. **Issuer trust is TOFU (trust-on-first-use) in v0**: `ctx import` populates the context's `server` field from the JWT's `iss` claim with no network round-trip and no allow-list check. Invariant #7 does **not** protect against a malicious `iss` — the server being contacted is itself attacker-controlled and will validate its own signatures. Mitigation is delivery-channel-level (see §13.3 and §16); an issuer allow-list / `--expect-issuer` path is deferred (see §21). Implementations **MUST NOT** add a silent issuer check that only validates shape or reachability; such a check provides false assurance and is prohibited.
+8. **Issuer trust is TOFU (trust-on-first-use) in v0**: `ctx import` populates the context's `server` field from the JWT's `iss` claim with no network round-trip and no allow-list check. Invariant #7 does **not** protect against a malicious `iss` — the server being contacted is itself attacker-controlled and will validate its own signatures. Mitigation is delivery-channel-level (see §13.3 and §16); an issuer allow-list / `--expect-issuer` path is deferred (see §22). Implementations **MUST NOT** add a silent issuer check that only validates shape or reachability; such a check provides false assurance and is prohibited.
 
 ## 19. Failure Model (Summary)
 
@@ -497,7 +532,79 @@ The four local short-circuits (`ctx import` / `ctx ls` / `ctx use` / `vault reau
 | Import of wrong credential kind (owner JWT, random string) | client local decode | command error, directing user to `ctx add --api-key` |
 | Concurrent `put --prune` reads during transaction | server transaction | atomic — readers see old or new (Invariant #1) |
 
-## 20. Non-Goals
+## 20. I/O Contracts (CLI Emit Surface, Normative)
+
+§20 defines the I/O framing contract for every `drive9` CLI verb specified at or after this section. It exists to preserve Unix-pipe composability ("reuse POSIX, don't invent new fan-in/fan-out protocols") while keeping credential-material and identifier-material on strictly separated channels.
+
+**Scope.** Rules 1–5 apply to **Layer 2 (control-plane emit surface)** and **Layer 3 (state-binding verbs)** of the CLI. They do **not** apply to:
+- **Layer 1** data-plane reads through the mounted FUSE tree (`cat /n/vault/<s>/<k>`, `ls`, `rm`, `printf >`) — the POSIX byte contract governs those, not §20.
+- Verbs specified **before** this spec increment (legacy `drive9 secret get/grant/revoke/exec` etc.) — §20 is **applies-forward** and does not re-spec those surfaces.
+
+**Identifier Invariant (Normative MUST).** The tokens `grant_id`, context name, and `scope path` are **handles**, not credentials. No verb MUST accept them as authentication input or as a means to re-derive/retrieve a token. They are safe to pass as command-line arguments, to log, and to distribute in-band. Credentials (`DRIVE9_API_KEY`, `DRIVE9_VAULT_TOKEN`, JWT bodies) remain §14 / §16 governed and MUST NOT flow through argv.
+
+### Rule 1 — Emit mode is a three-way mutex
+
+Every Layer-2 verb that produces machine-readable output MUST expose exactly one of three emit modes per invocation, selected by mutually-exclusive flags:
+
+| Mode | Flag | Shape |
+|---|---|---|
+| `human` (default) | (no flag) | Unstructured multi-line text for terminal use. Not a stable contract. |
+| `json` | `--json` | Single JSON object to stdout, trailing LF. Stable contract. |
+| `token-only` | `--token-only` | Raw credential/artifact bytes to stdout, trailing LF. Stable contract. Intended for pipe composition. |
+
+Any two flags combined → `EINVAL` with message `"--<a> and --<b> are mutually exclusive"`. The mutex is enforced per-verb with a spec-locked flag-class table; a verb MUST declare which modes it supports and MUST reject unsupported mode flags at argv-parse time.
+
+**Out of scope for Rule 1.** Layer-3 state-binding verbs (§Rule 4) emit a single human confirmation line only; they do **not** expose `--json` or `--token-only`.
+
+### Rule 2 — Exit codes follow sysexits.h
+
+- `0` — success
+- `1` — runtime errno mapped from the operation (e.g. ENOENT, EACCES). stderr carries the human errno hint.
+- `2` — EINVAL: argv parse failure, flag mutex violation, missing required flag. stderr carries the usage line.
+- `≥64` — reserved for future sysexits codes; not used in v0.
+
+No verb may exit 0 on a partially-satisfied request. See Rule 3 for multi-scope continue-on-error semantics.
+
+### Rule 3 — Stdin vs argv is determined by payload class
+
+Verbs MUST route input by the **class of payload**, not by convenience:
+
+| Class | Channel | Rationale |
+|---|---|---|
+| **1. Credential / bulk payload** (JWT body, large blob) | stdin (default when stdin is a pipe); optional `--from-file <path>` for explicit file read; `--from-file -` for explicit stdin | Credential material MUST NOT appear in argv (visible in `ps`, shell history, `/proc/<pid>/cmdline`). Bulk payloads exceed argv size limits on some platforms. |
+| **2. Identifier list** (`grant_id`, context name, scope path) | Variadic argv: `<id1> <id2> …` | Identifiers are non-credential handles (Identifier Invariant). Fan-in composition MUST use POSIX `xargs`, not a CLI-internal stdin protocol. |
+
+**Fan-in example** (class 2):
+
+```bash
+drive9 vault revoke grt_7f2a grt_9c13 grt_bbaa
+# or via xargs:
+cat ids.txt | xargs drive9 vault revoke
+```
+
+**Continue-on-error semantics for variadic class-2 verbs.** When processing more than one identifier, the verb MUST attempt every identifier, collect per-identifier errors, and exit with the **first** non-zero errno (preserving the semantic of the earliest failure). stderr emits one line per failed identifier. A partial success MUST NOT exit 0.
+
+**Class-2 verbs ignore stdin.** When argv supplies one or more identifiers, stdin is not consumed. Redirecting stdin into a class-2 verb is not an error but the input is discarded — the verb is not a filter.
+
+**Not in scope for Rule 3.** `drive9 ctx rm <name>` remains single-arg per §13 / B1; this increment does not re-spec it as variadic. A future spec increment may extend `ctx rm` if needed.
+
+### Rule 4 — State-binding verbs are not filters
+
+Verbs that bind local state (current context, mount credential binding, filesystem mount point) — `ctx use`, `mount`, `vault reauth` — MUST take their target as an explicit argv argument and MUST NOT read stdin. They produce a single human confirmation line on stdout and are **exempt from Rule 1's `--json`/`--token-only` surface**.
+
+Rationale: state-binding verbs change global principal or mount identity. Allowing them to be the right-hand side of a pipe (`… | ctx use`) would let an unrelated producer silently rebind credentials for subsequent commands. The contract forbids it structurally; if a caller wants scripted rebinding, they compose with argv (`ctx use "$(compute_name)"`) so the data flow is explicit.
+
+### Rule 5 — Advertised composition requires an executable example
+
+Every verb that documents a pipe or composition pattern (`A | B`, `A | xargs B`) MUST ship at least one runnable example in the quickstart (`docs/guides/vault-quickstart.md`) whose exit code is asserted. Compliance is checked by the `quickstart-smoke-test` CI harness when available.
+
+**Transition clause (rule #5 enforcement deferral).** Until the `quickstart-smoke-test` CI harness (introduced by a future PR, PR-G) lands, "literal runnable" is satisfied by **review-time manual grep plus an exit-code assertion written in the code block's inline comment** (e.g. `# exit 0`). **PR-G merge is the sole triggering SHA for rule #5 enforcement**: once PR-G merges, the harness MUST run on CI before the next spec/code PR cycle (i.e. the harness becomes a required check). PR-G is the sole deferral gate; **no calendar fallback is set**. If PR-G is re-scoped or cancelled, the owner of this spec (`dev1` as §20 author) MUST open a follow-up spec-increment to explicitly adjust rule #5's enforcement path. Silent decay is not permitted.
+
+---
+
+**Appliesforward scope.** §20 applies to verbs specified at or after this section's merge SHA. Pre-existing verbs retain their current contract; any subsequent spec increment that touches one of them MUST bring it into §20 compliance as part of the same delta.
+
+## 21. Non-Goals
 
 - No migration or backward-compatibility surface in this spec; this document is terminal-state only.
 - No single unified credential variable that merges `DRIVE9_API_KEY` and `DRIVE9_VAULT_TOKEN` (the dual-principal separation is a contract, §14.1).
@@ -506,7 +613,7 @@ The four local short-circuits (`ctx import` / `ctx ls` / `ctx use` / `vault reau
 - No automatic token auto-mint on behalf of the owner; every delegated credential must come from an explicit `vault grant`.
 - No client-side issuer pinning or allow-list in v0. `ctx import` trusts the JWT `iss` on first use (§13.3 TOFU note). A follow-up spec may introduce `ctx add --trusted-issuer` and/or an `--expect-issuer` flag on `ctx import`; both are additive and do not change §13.1 or §16.
 
-## 21. Open Questions (Spec-Level)
+## 22. Open Questions (Spec-Level)
 
 - **Issuer trust hardening (TOFU → pinned).** Invariant #8 locks v0 at trust-on-first-use. A follow-up spec should decide between (a) an issuer allow-list pinned at `ctx add --api-key` time, (b) an `--expect-issuer <url>` flag on `ctx import`, or (c) an out-of-band manifest fetched from the owner server during `ctx add`. Each has different forward-compat implications for `/etc/drive9.conf` site-policy files; none are trivially additive once deployed. Resolution target: the release that introduces multi-issuer federation.
 - **Forward-compat of the `iss` claim under server rebranding / domain migration.** If an owner server migrates from `https://d9.old.example` to `https://d9.new.example`, all outstanding delegated contexts hold the old `iss` and will route to the old host. v0 has no in-band way to rotate `iss` across existing grants. A follow-up should specify whether this is handled by (a) explicit re-grant + `ctx import`, (b) a server-signed redirect manifest keyed off the old `iss`, or (c) left as "owner reissues all delegated tokens". Resolution target: the release that introduces `vault reauth --server <new>` or equivalent.
