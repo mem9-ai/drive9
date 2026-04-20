@@ -43,8 +43,9 @@ func Ctx(args []string) error {
 func ctxUsage() string {
 	return `usage: drive9 ctx <add|import|ls|use|rm>
   add --api-key <key> [--name <n>] [--server <url>]   add owner context
-  import --from-file <path|->                         add delegated context from file or stdin
-  import <jwt>                                        add delegated context from positional arg (unsafe)
+  import --from-file <path>                           add delegated context from file (must be mode 0600)
+  import --from-file -                                add delegated context from stdin explicitly
+  import                                              add delegated context from stdin (default when stdin is a pipe)
   ls [-l|--json]                                      list contexts
   use <name>                                          activate a context
   rm <name>                                           delete a context`
@@ -155,8 +156,14 @@ func ctxAdd(cfg *Config, name string, ctx *Context) (*Context, error) {
 }
 
 // ctxImportCmd implements `drive9 ctx import` per spec §13.2/§13.3. Input
-// modes: --from-file <path>, --from-file -, positional <jwt>. All three forms
-// are equivalent after whitespace trim.
+// modes:
+//   --from-file <path>   read JWT from file (file MUST be mode 0600)
+//   --from-file -        read JWT from stdin explicitly
+//   (no args, stdin piped) read JWT from stdin (auto-detected when !isatty)
+//
+// Per §13.3, the JWT MUST NOT be passed as a positional argument — the
+// positional form was removed because a runtime warning cannot unexpose a
+// secret that has already reached shell history and /proc/<pid>/cmdline.
 //
 // The §19 parse-stability fork rejects before any config write:
 //  1. structurally unparseable JWT                 -> command error
@@ -167,7 +174,6 @@ func ctxImportCmd(args []string) error {
 	var (
 		fromFile string
 		name     string
-		positional string
 	)
 	haveFromFile := false
 	for i := 0; i < len(args); i++ {
@@ -189,17 +195,15 @@ func ctxImportCmd(args []string) error {
 			if strings.HasPrefix(args[i], "--") {
 				return fmt.Errorf("unknown flag %q", args[i])
 			}
-			if positional != "" {
-				return fmt.Errorf("ctx import takes at most one positional JWT argument")
-			}
-			positional = args[i]
+			// Per §13.3: positional JWT is rejected. A token on the
+			// command line would already be in shell history and
+			// /proc/<pid>/cmdline by the time we see it; there is no
+			// safe way to accept it.
+			return fmt.Errorf("ctx import: positional JWT is not accepted (it leaks into shell history and /proc/<pid>/cmdline); use one of:\n  drive9 ctx import --from-file <path>\n  <producer> | drive9 ctx import\n  drive9 ctx import --from-file -")
 		}
 	}
-	if haveFromFile && positional != "" {
-		return fmt.Errorf("--from-file and positional JWT are mutually exclusive")
-	}
 
-	raw, err := readImportToken(fromFile, haveFromFile, positional)
+	raw, err := readImportToken(fromFile, haveFromFile)
 	if err != nil {
 		return err
 	}
@@ -250,25 +254,78 @@ func ctxImportCmd(args []string) error {
 	return nil
 }
 
-func readImportToken(fromFile string, haveFromFile bool, positional string) (string, error) {
+// readImportToken returns the JWT body per §13.3. The three accepted modes:
+//
+//  1. --from-file <path>  : read file (MUST be regular, mode 0600 — checked
+//     before any read so a world-readable drop file cannot silently succeed).
+//  2. --from-file -       : read stdin explicitly.
+//  3. no flag, stdin piped: auto-detect (stdin is not a TTY).
+//
+// A bare `drive9 ctx import` with stdin attached to a TTY is refused with a
+// one-line help pointing at the canonical forms. This is a client-side input
+// error (EINVAL shape) — we return it before any config write.
+func readImportToken(fromFile string, haveFromFile bool) (string, error) {
 	switch {
 	case haveFromFile && fromFile == "-":
-		data, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			return "", fmt.Errorf("read stdin: %w", err)
-		}
-		return strings.TrimSpace(string(data)), nil
+		return readTrimmedStdin()
 	case haveFromFile:
+		if err := checkImportFilePerm(fromFile); err != nil {
+			return "", err
+		}
 		data, err := os.ReadFile(fromFile)
 		if err != nil {
 			return "", fmt.Errorf("read %s: %w", fromFile, err)
 		}
 		return strings.TrimSpace(string(data)), nil
-	case positional != "":
-		return strings.TrimSpace(positional), nil
 	default:
-		return "", fmt.Errorf("ctx import requires a token: --from-file <path>, --from-file -, or a positional JWT argument")
+		// No flag — auto-detect. Only accept if stdin is a pipe / not a TTY.
+		piped, err := stdinIsPiped()
+		if err != nil {
+			return "", fmt.Errorf("ctx import: stat stdin: %w", err)
+		}
+		if !piped {
+			return "", fmt.Errorf("ctx import: no JWT on stdin. Use one of:\n  drive9 ctx import --from-file <path>\n  <producer> | drive9 ctx import\n  drive9 ctx import --from-file -")
+		}
+		return readTrimmedStdin()
 	}
+}
+
+func readTrimmedStdin() (string, error) {
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return "", fmt.Errorf("read stdin: %w", err)
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// stdinIsPiped reports whether stdin is attached to a pipe / redirect
+// (i.e. not a character device / TTY). A Stat error is surfaced.
+func stdinIsPiped() (bool, error) {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false, err
+	}
+	// If the mode reports ModeCharDevice, the fd is a terminal.
+	return (fi.Mode() & os.ModeCharDevice) == 0, nil
+}
+
+// checkImportFilePerm enforces §13.3's 0600-or-stricter rule on --from-file
+// paths: any bits set outside the owner triad → refuse BEFORE reading
+// contents. A JWT sitting in a world-readable drop file is already
+// compromised; failing before the read surfaces the leak to the operator
+// at the earliest possible point.
+func checkImportFilePerm(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("ctx import: %s is not a regular file", path)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("ctx import: %s has mode %#o; JWT files MUST be mode 0600 (owner-only) — run: chmod 600 %s", path, fi.Mode().Perm(), path)
+	}
+	return nil
 }
 
 // defaultImportName derives the default context name from (in order):
