@@ -30,7 +30,7 @@ drive9 mount vault /n/vault
 - One mount binds one principal; the namespace the user sees is exactly what that principal can access.
 - After the bound credential becomes invalid (expired / revoked), the mount does **not** fall back — the next syscall returns `EACCES`.
 
-## 2. Create a Secret (Batch Write)
+## 2. Create or Replace a Secret (Batch Write)
 
 ```bash
 mkdir -p ./prod-db.envdir
