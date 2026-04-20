@@ -14,14 +14,22 @@ impl Client {
         new_size: i64,
         dirty_parts: &[i32],
         read_part: F,
+        part_size: Option<i64>,
+        expected_revision: Option<i64>,
     ) -> Result<(), Drive9Error>
     where
         F: Fn(i32, i64, Option<&[u8]>) -> Result<Vec<u8>, Drive9Error> + Send + Sync + 'static,
     {
-        let body = json!({
+        let mut body = json!({
             "new_size": new_size,
             "dirty_parts": dirty_parts,
         });
+        if let Some(ps) = part_size {
+            body["part_size"] = json!(ps);
+        }
+        if let Some(er) = expected_revision {
+            body["expected_revision"] = json!(er);
+        }
         let resp = self
             .http
             .patch(self.fs_url(path))
