@@ -524,9 +524,11 @@ func formatExpiresAt(t time.Time) string {
 //	<type-specific descriptor line>
 //
 // Per Invariant #6, activating a context does NOT re-bind any running mount.
-// The only way to rebind a mount is `drive9 vault reauth`. This is enforced
-// by `ctx use` doing no FUSE-side work; it only rewrites the active context
-// pointer in ~/.drive9/config.
+// The only way to rebind a mount in M1 is `umount` + `mount` again (see
+// spec §12, §17). An in-process `vault reauth` verb was considered and
+// deferred post-M1 (#302). This is enforced by `ctx use` doing no
+// FUSE-side work; it only rewrites the active context pointer in
+// ~/.drive9/config.
 //
 // Per §17 short-circuit, an already-expired delegated context is refused.
 func ctxUseCmd(args []string) error {
