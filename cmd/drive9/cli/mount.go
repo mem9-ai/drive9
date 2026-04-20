@@ -12,10 +12,19 @@ import (
 )
 
 // MountCmd handles the "drive9 mount" command.
+//
+// Credential precedence matches spec §14.2: explicit --server / --api-key flag
+// > DRIVE9_SERVER / DRIVE9_API_KEY env > active config context. The flag
+// defaults are empty strings so we can distinguish "unset" from "explicit
+// empty"; the latter is rejected (see rejectEmptyFlag).
+//
+// drive9fuse.Mount runs in-process (no fork/exec); credentials flow through
+// MountOptions{Server, APIKey}, not through the child's environment. This
+// makes the resolver's Unsetenv-after-read mitigation safe for mount.
 func MountCmd(args []string) error {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
-	server := fs.String("server", os.Getenv("DRIVE9_SERVER"), "drive9 server URL")
-	apiKey := fs.String("api-key", os.Getenv("DRIVE9_API_KEY"), "API key")
+	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
+	apiKey := fs.String("api-key", "", "API key (overrides $DRIVE9_API_KEY and config)")
 	cacheSize := fs.Int("cache-size", 128, "read cache size in MB")
 	dirTTL := fs.Duration("dir-ttl", 10*time.Second, "directory cache TTL")
 	attrTTL := fs.Duration("attr-ttl", 10*time.Second, "kernel attr cache TTL")
@@ -42,22 +51,29 @@ func MountCmd(args []string) error {
 
 	mountPoint := fs.Arg(0)
 
-	// Fill server/api-key from config if not set via flags/env
-	if *server == "" || *apiKey == "" {
-		cfg := loadConfig()
-		if *server == "" {
-			*server = cfg.ResolveServer()
-		}
-		if *apiKey == "" {
-			*apiKey = cfg.CurrentAPIKey()
+	serverGiven, apiKeyGiven := flagProvided(fs, "server"), flagProvided(fs, "api-key")
+	if err := rejectEmptyFlag("server", *server, serverGiven); err != nil {
+		return err
+	}
+	if err := rejectEmptyFlag("api-key", *apiKey, apiKeyGiven); err != nil {
+		return err
+	}
+
+	r := ResolveCredentials()
+	if *server == "" {
+		*server = r.Server
+	}
+	if *apiKey == "" {
+		if r.Kind == CredentialOwner {
+			*apiKey = r.APIKey
 		}
 	}
 
 	if *server == "" {
-		return fmt.Errorf("drive9 server URL required (--server or $DRIVE9_SERVER)")
+		return fmt.Errorf("drive9 server URL required (--server, $%s, or `drive9 ctx`)", EnvServer)
 	}
 	if *apiKey == "" {
-		return fmt.Errorf("API key required (--api-key or $DRIVE9_API_KEY)")
+		return fmt.Errorf("owner API key required (--api-key, $%s, or `drive9 ctx`)", EnvAPIKey)
 	}
 
 	syncModeVal, err := drive9fuse.ParseSyncMode(*syncMode)

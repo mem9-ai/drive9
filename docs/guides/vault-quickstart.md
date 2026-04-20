@@ -242,9 +242,12 @@ Contexts are the primary channel. For ephemeral or non-interactive shells, three
 
 Credential priority (first match wins):
 
-1. `DRIVE9_VAULT_TOKEN` (narrower — delegated)
-2. `DRIVE9_API_KEY` (broader — owner)
-3. Active context in `~/.drive9/config`
+1. Explicit CLI flag (e.g. `--api-key`)
+2. `DRIVE9_VAULT_TOKEN` (narrower — delegated)
+3. `DRIVE9_API_KEY` (broader — owner)
+4. Active context in `~/.drive9/config`
+
+An explicitly-empty flag (`--api-key=""`) is rejected at parse time — it is not treated as "unset and fall through." Pass a non-empty value or omit the flag entirely.
 
 `DRIVE9_SERVER` is resolved independently: if set, it overrides the active context's `server` field even when credentials come from the active context.
 
@@ -261,6 +264,17 @@ drive9 umount /n/vault
 ```
 
 The dual-principal separation (`DRIVE9_API_KEY` vs `DRIVE9_VAULT_TOKEN`) is intentional. Do not collapse them.
+
+### Operator risk notes
+
+Env-based ingress has real leak surfaces. drive9 narrows the in-process window by unsetting `DRIVE9_VAULT_TOKEN`, `DRIVE9_API_KEY`, and `DRIVE9_SERVER` immediately after the credential resolver reads them — child processes forked by drive9 (`vault with`, subprocesses) do **not** inherit the credential. That guarantee is drive9-specific; the remaining surfaces below are standard operator hygiene concerns shared by any env-based credential channel (AWS CLI, kubectl, gh, etc.).
+
+- **`/proc/<pid>/environ`**: readable by the owning user. Any other same-user process (a stray shell, an editor, a monitoring agent) can snapshot it between the moment you `export` and the moment drive9's resolver unsets. Prefer inline form `DRIVE9_VAULT_TOKEN=... drive9 ...` so the variable is scoped to a single command rather than the whole shell session.
+- **Core dumps**: if drive9 crashes with `ulimit -c > 0`, the core file contains memory at crash time — including any credential that was still resident. Set `ulimit -c 0` on CI runners, or ensure core files land on a volume scrubbed between jobs.
+- **`printenv` / `env` in debug logs**: CI systems that log the environment of failed steps capture `DRIVE9_*` if exported at shell scope. Prefer per-command scoping: GitHub Actions `env:` on a single `run:` step, GitLab `variables:` with `protected: true`, etc.
+- **Shell history**: `export` writes to `~/.bash_history` / `~/.zsh_history`. Inline form avoids the `export` but the full command line still lands in history unless your shell has `HISTCONTROL=ignorespace` (or equivalent) and you prefix with a leading space.
+
+These are footguns, not drive9 bugs — the same applies to any tool that accepts credentials via env. drive9 adds the Unsetenv-after-read guarantee; the rest is up to the operator.
 
 ---
 
