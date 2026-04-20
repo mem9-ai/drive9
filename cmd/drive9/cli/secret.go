@@ -255,12 +255,22 @@ func SecretRm(args []string) error {
 	return c.DeleteVaultSecret(context.Background(), name)
 }
 
-// SecretGrant issues a scoped capability token.
+// SecretGrant issues a scoped capability grant via /v1/vault/grants.
+//
+// --perm is required (one of read|write); we do not default because the spec
+// does not specify one and a silent default would bake an undocumented
+// contract into the CLI. Unknown values fail-closed before any request.
+//
+// Output:
+//   - human:  token=<token>\ngrant_id=<id>\nexpires_at=<rfc3339>
+//     (only the id label flips from token_id= to grant_id=; token= is unchanged)
+//   - --json: full VaultGrantIssueResponse (adds scope and perm to the key set)
+//   - --token-only: <token>\n  (byte-identical to the pre-V2a shape)
 func SecretGrant(args []string) error {
 	var (
 		agentID   string
-		taskID    string
 		ttlRaw    string
+		permRaw   string
 		asJSON    bool
 		tokenOnly bool
 		scope     []string
@@ -274,18 +284,18 @@ func SecretGrant(args []string) error {
 			}
 			i++
 			agentID = args[i]
-		case "--task":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--task requires a value")
-			}
-			i++
-			taskID = args[i]
 		case "--ttl":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--ttl requires a value")
 			}
 			i++
 			ttlRaw = args[i]
+		case "--perm":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--perm requires a value")
+			}
+			i++
+			permRaw = args[i]
 		case "--json":
 			asJSON = true
 		case "--token-only":
@@ -306,6 +316,12 @@ func SecretGrant(args []string) error {
 	if ttlRaw == "" {
 		return fmt.Errorf("--ttl is required")
 	}
+	if permRaw == "" {
+		return fmt.Errorf("--perm is required (read|write)")
+	}
+	if permRaw != "read" && permRaw != "write" {
+		return fmt.Errorf("invalid --perm %q: must be one of read, write", permRaw)
+	}
 	if len(scope) == 0 {
 		return fmt.Errorf("at least one scope entry is required")
 	}
@@ -325,7 +341,16 @@ func SecretGrant(args []string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.IssueVaultToken(context.Background(), agentID, taskID, scope, ttl)
+	// `--task` was removed in V2a: task_id is not part of the /v1/vault/grants
+	// contract. Passing --task now fails loudly via the `unknown flag` branch
+	// above — we deliberately do NOT silently accept-and-drop it, because a
+	// successful return with dropped semantics is worse than a clean break.
+	resp, err := c.IssueVaultGrant(context.Background(), client.VaultGrantIssueRequest{
+		Agent:      agentID,
+		Scope:      scope,
+		Perm:       permRaw,
+		TTLSeconds: int(ttl / time.Second),
+	})
 	if err != nil {
 		return err
 	}
@@ -336,22 +361,31 @@ func SecretGrant(args []string) error {
 		return writeJSON(resp)
 	default:
 		_, _ = fmt.Fprintf(os.Stdout, "token=%s\n", resp.Token)
-		_, _ = fmt.Fprintf(os.Stdout, "token_id=%s\n", resp.TokenID)
+		_, _ = fmt.Fprintf(os.Stdout, "grant_id=%s\n", resp.GrantID)
 		_, _ = fmt.Fprintf(os.Stdout, "expires_at=%s\n", resp.ExpiresAt.Format(time.RFC3339))
 	}
 	return nil
 }
 
-// SecretRevoke revokes a capability token.
+// SecretRevoke revokes a capability token or grant. The id space is split:
+// ids with the `grt_` prefix are grants (issued via /v1/vault/grants in V2a)
+// and dispatch to RevokeVaultGrant; everything else is a legacy token id
+// (still accepted by the server under /v1/vault/tokens/<id>) and dispatches
+// to RevokeVaultToken. Both endpoints remain live until the legacy cleanup
+// wave.
 func SecretRevoke(args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage drive9 secret revoke <token-id>")
+		return fmt.Errorf("usage drive9 secret revoke <id>")
 	}
+	id := args[0]
 	c, err := newVaultManagementClientFromEnv()
 	if err != nil {
 		return err
 	}
-	return c.RevokeVaultToken(context.Background(), args[0])
+	if strings.HasPrefix(id, "grt_") {
+		return c.RevokeVaultGrant(context.Background(), id, "cli", "")
+	}
+	return c.RevokeVaultToken(context.Background(), id)
 }
 
 // SecretAudit queries vault audit events and applies client-side filters.
