@@ -1053,6 +1053,104 @@ func TestSetAttr_TruncateWithoutHandleRefreshesRevision(t *testing.T) {
 	}
 }
 
+func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
+	var (
+		putCalls  int32
+		headCalls int32
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "7" {
+				t.Fatalf("X-Dat9-Expected-Revision = %q, want %q", got, "7")
+			}
+			putCalls++
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			headCalls++
+			http.Error(w, "unexpected post-flush HEAD", http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	ino := fs.inodes.Lookup("/flush.bin", false, 4, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/flush.bin",
+		Dirty:   NewWriteBuffer("/flush.bin", maxPreloadSize, 0),
+		BaseRev: 7,
+	}
+	if _, err := fh.Dirty.Write(0, []byte("next")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+	if putCalls != 1 {
+		t.Fatalf("PUT calls = %d, want 1", putCalls)
+	}
+	if headCalls != 0 {
+		t.Fatalf("HEAD calls = %d, want 0", headCalls)
+	}
+	if fh.BaseRev != 8 {
+		t.Fatalf("fh.BaseRev = %d, want 8", fh.BaseRev)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if entry.Revision != 8 {
+		t.Fatalf("inode revision = %d, want 8", entry.Revision)
+	}
+}
+
+func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	ino := fs.inodes.Lookup("/stream.bin", false, 0, time.Now())
+
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     "/stream.bin",
+		Dirty:    NewWriteBuffer("/stream.bin", maxPreloadSize, 0),
+		BaseRev:  11,
+		Streamer: NewStreamUploader(nil, "/stream.bin", 11),
+	}
+	fh.Streamer.started = true
+	fh.Streamer.streamedParts[1] = true
+
+	fh.Lock()
+	fs.finalizeHandleFlushLocked(fh, 11)
+	fh.Unlock()
+
+	if fh.BaseRev != 12 {
+		t.Fatalf("fh.BaseRev = %d, want 12", fh.BaseRev)
+	}
+	if got := fh.Streamer.ExpectedRevision(); got != 12 {
+		t.Fatalf("streamer expected revision = %d, want 12", got)
+	}
+	if fh.Streamer.Started() {
+		t.Fatal("streamer should be reset to not-started after successful flush")
+	}
+	if fh.Streamer.HasStreamedParts() {
+		t.Fatal("streamer should clear prior streamed parts after successful flush")
+	}
+}
+
 func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 	const callerPID = 4242
 
