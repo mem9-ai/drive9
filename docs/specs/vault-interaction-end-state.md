@@ -13,7 +13,7 @@ This spec is the single source of truth for the terminal shape of vault UX. It i
 - **secret** = directory (e.g. `prod-db`)
 - **key** = file inside that directory (e.g. `prod-db/DB_URL`)
 - **Read/write a key**: POSIX file ops on `/n/vault/**` (`cat`, `printf >`, `ls`, `rm`)
-- **Control plane**: 5 verbs — `put`, `grant`, `revoke`, `with`, `reauth`
+- **Control plane**: 4 verbs — `put`, `grant`, `revoke`, `with`. A running mount's credential binding is fixed at mount time (Invariant #3); to change it, `umount` and `mount` again. An in-process rebind verb (`vault reauth`) was considered for M1 and deferred to a post-M1 increment — see §17.
 
 One principle: authority follows the credential, not the command. Owners and delegatees use the same CLI; only the credential binding differs.
 
@@ -219,7 +219,7 @@ tail -f /n/vault/@audit                   # global stream
 tail -f /n/vault/prod-db/@audit           # per-secret stream
 ```
 
-Events: `put / read / write / grant / revoke / rm / reauth`.
+Events: `put / read / write / grant / revoke / rm`.
 `rm key` events carry `affected_grants`.
 
 Grant introspection:
@@ -244,7 +244,7 @@ cat /n/vault/prod-db/@grants/grt_7f2a
 | Key does not exist | `ENOENT` |
 | Key exists but current principal has no permission | `ENOENT` (existence-oracle defense) |
 | Current principal attempts an unauthorized **write** | `EACCES` |
-| Bound credential expired / revoked | `EACCES` + reauth hint |
+| Bound credential expired / revoked | `EACCES` + remount hint |
 | Infrastructure failure (FUSE daemon, backend) | `EIO` |
 
 Core rules:
@@ -274,16 +274,19 @@ Core rules:
 
 This table is locked. The auth lifecycle (§17) layers **local short-circuits** (e.g. `ctx use` on an expired context refuses client-side) **on top of** the server-side stale-auth case — those short-circuits do not introduce a new errno.
 
-**Annotation convention.** Where example outputs in this spec and the quickstart show errno lines followed by parenthetical guidance (e.g. `cat: Permission denied  (run 'drive9 vault reauth' after updating the context)`), the parenthetical is a **documentation annotation** intended for the reader, not literal `cat`/`ls` stderr output. The POSIX `cat`/`ls` utilities emit only the errno text; the reauth hint is a spec-level explanation of what the user should do next, delivered out-of-band (man page, quickstart, CLI `drive9 vault reauth` documentation). No new verb is introduced to deliver this hint inline.
+**Annotation convention.** Where example outputs in this spec and the quickstart show errno lines followed by parenthetical guidance (e.g. `cat: Permission denied  (run 'drive9 umount /n/vault && drive9 mount vault /n/vault' after updating the context)`), the parenthetical is a **documentation annotation** intended for the reader, not literal `cat`/`ls` stderr output. The POSIX `cat`/`ls` utilities emit only the errno text; the remount hint is a spec-level explanation of what the user should do next, delivered out-of-band (man page, quickstart). No new verb is introduced to deliver this hint inline.
 
 ## 12. Recovery After Credential Rotation
 
 ```bash
 drive9 ctx use <new-context>
-drive9 vault reauth /n/vault
+drive9 umount /n/vault
+drive9 mount vault /n/vault
 ```
 
-`reauth` rebinds the running mount to the current active context without unmount/remount. The next syscall succeeds if the new credential is valid.
+A mount's credential binding is fixed at mount time (Invariant #3). To rotate to a new context, `umount` the running mount and `mount` again — the new mount picks up the active context on startup. There is no in-process rebind in M1; `vault reauth` is deferred to a post-M1 increment (§17).
+
+Operator note: `umount` refuses with `EBUSY` while any process holds an open file descriptor under the mount (Linux `fusermount3 -u`; macOS `umount`). Stop or detach those processes before unmounting. Best-effort: writes that are already staged in the write-back cache survive a clean `umount` and are re-attempted by the next `mount` instance; they are **not** guaranteed to recover losslessly under arbitrary failure modes (e.g. token expiry mid-flush) — the supported pattern is to quiesce writers before remounting.
 
 ---
 
@@ -469,7 +472,7 @@ drive9 vault revoke grt_7f2a
 
 ```bash
 cat /n/vault/prod-db/DB_URL
-# cat: Permission denied  (run `drive9 vault reauth` after updating the context)
+# cat: Permission denied  (run `drive9 umount /n/vault && drive9 mount vault /n/vault` after updating the context)
 ```
 
 ## 16. Security Note (Normative MUST)
@@ -501,7 +504,9 @@ This is locked as Invariant #7.
 
 ## 17. Auth Lifecycle — Local Short-Circuits vs Server Checks
 
-A mount is bound to one credential at mount time and does not silently follow later context changes (Invariant #3). Running `ctx use <other>` after mounting **does not re-bind** the mount; the owner must call `vault reauth <mountpoint>` (§12) to rebind to the current active context. This is the intended behaviour — it keeps the authority model predictable for long-running mounts — and is captured in Invariant #6.
+A mount is bound to one credential at mount time and does not silently follow later context changes (Invariant #3). Running `ctx use <other>` after mounting **does not re-bind** the mount. To change a running mount's credential, the owner `umount`s and then `mount`s again; the new mount binds to whatever the active context (or env override) resolves to at startup. This is the intended behaviour — it keeps the authority model predictable for long-running mounts — and is captured in Invariant #6.
+
+**`vault reauth` is deferred.** An in-process rebind verb was considered for M1 and excluded: introducing it requires a second drive9-process control plane (Unix-domain socket listener in the mount process, a CLI-side dialer, a mount-disambiguation identity, and atomic client-pointer swap inside every FUSE op). The `umount + mount` escape hatch covers the same functional contract without expanding the IPC surface. A post-M1 spec increment MAY reintroduce `vault reauth` if operational evidence shows the remount cadence is disruptive; that increment is additive and does not alter the rules below.
 
 Local short-circuits exist to make UX responsive. They are layered **on top of** the normative errno table (§11), not instead of it.
 
@@ -510,11 +515,10 @@ Local short-circuits exist to make UX responsive. They are layered **on top of**
 | `ctx import` | `exp` in past? | local refuse (no new errno; command error) |
 | `ctx ls` | `exp` in past? | row marked `expired` |
 | `ctx use <name>` | target context expired? | local error, do not activate |
-| `vault reauth <mountpoint>` | active context valid locally? | local refuse if target context is already locally expired; otherwise proceed and let the server bind |
 | `mount` | context valid locally? | proceed; server then validates |
-| Any FS op | server says stale / revoked | `EACCES` + reauth hint (§11) |
+| Any FS op | server says stale / revoked | `EACCES` + remount hint (§11) |
 
-The four local short-circuits (`ctx import` / `ctx ls` / `ctx use` / `vault reauth`) are client-side UX. They do **not** introduce a new errno case. The locked 6-row errno table in §11 is unchanged.
+The three local short-circuits (`ctx import` / `ctx ls` / `ctx use`) are client-side UX. They do **not** introduce a new errno case. The locked 6-row errno table in §11 is unchanged.
 
 ## 18. Invariants (Normative, numbered)
 
@@ -523,7 +527,7 @@ The four local short-circuits (`ctx import` / `ctx ls` / `ctx use` / `vault reau
 3. **One mount, one principal**: a mount is bound to exactly one credential at mount time; stale/revoked credentials do not silently fall back to any other identity.
 4. **Field names are sensitive metadata**: key names are not disclosed via errno, audit (to the delegatee), or listing unless the principal has permission.
 5. **Grants do not cascade-revoke on `rm`**: removing a key leaves existing grants syntactically intact; holders observe `ENOENT`, and audit records `affected_grants`.
-6. **One active context at a time**: `~/.drive9/config` MAY hold any number of contexts (owner and delegated, mixed); at most one is active. Switching contexts does not silently re-bind an already-mounted mount (use `reauth`).
+6. **One active context at a time**: `~/.drive9/config` MAY hold any number of contexts (owner and delegated, mixed); at most one is active. Switching contexts does not silently re-bind an already-mounted mount. To change a running mount's credential, `umount` and `mount` again; the new mount picks up the current active context (or env override) at startup. An in-process rebind (`vault reauth`) is **not** part of M1 (§17) — it MAY be added in a later spec increment without altering this invariant.
 7. **Client-side JWT decoding is UX-only**: local decode populates `ctx` metadata and enables offline `ctx ls`; it **MUST NOT** substitute for server-side validation. The server **MUST** re-check signature, TTL, and revocation on every request.
 8. **Issuer trust is TOFU (trust-on-first-use) in v0**: `ctx import` populates the context's `server` field from the JWT's `iss` claim with no network round-trip and no allow-list check. Invariant #7 does **not** protect against a malicious `iss` — the server being contacted is itself attacker-controlled and will validate its own signatures. Mitigation is delivery-channel-level (see §13.3 and §16); an issuer allow-list / `--expect-issuer` path is deferred (see §22). Implementations **MUST NOT** add a silent issuer check that only validates shape or reachability; such a check provides false assurance and is prohibited.
 
@@ -531,7 +535,7 @@ The four local short-circuits (`ctx import` / `ctx ls` / `ctx use` / `vault reau
 
 | Failure | Detection | Client visible |
 |---|---|---|
-| Expired / revoked credential | server on next request | `EACCES` + reauth hint |
+| Expired / revoked credential | server on next request | `EACCES` + remount hint |
 | Server unreachable | client | `EIO` |
 | FUSE daemon crash | kernel | `EIO` |
 | Malformed JWT at `ctx import` | client local decode | command error, no context written |
@@ -596,7 +600,7 @@ cat ids.txt | xargs drive9 vault revoke
 
 ### Rule 4 — State-binding verbs are not filters
 
-Verbs that bind local state (current context, mount credential binding, filesystem mount point) — `ctx use`, `mount`, `vault reauth` — MUST take their target as an explicit argv argument and MUST NOT read stdin. They produce a single human confirmation line on stdout and are **exempt from Rule 1's `--json`/`--token-only` surface**.
+Verbs that bind local state (current context, filesystem mount point) — `ctx use`, `mount` — MUST take their target as an explicit argv argument and MUST NOT read stdin. They produce a single human confirmation line on stdout and are **exempt from Rule 1's `--json`/`--token-only` surface**. A future `vault reauth` verb (see §17, deferred post-M1) falls under this rule when introduced.
 
 Rationale: state-binding verbs change global principal or mount identity. Allowing them to be the right-hand side of a pipe (`… | ctx use`) would let an unrelated producer silently rebind credentials for subsequent commands. The contract forbids it structurally; if a caller wants scripted rebinding, they compose with argv (`ctx use "$(compute_name)"`) so the data flow is explicit.
 
@@ -640,7 +644,8 @@ Appendix A — Command surface at a glance:
 | `drive9 vault grant <scope>... --agent --perm --ttl` | Issue a scoped JWT. |
 | `drive9 vault revoke <grant-id>` | Revoke a grant. |
 | `drive9 vault with <path> -- <cmd>` | Exec child with `@env` injected. |
-| `drive9 vault reauth <mountpoint>` | Rebind a running mount to the current context. |
 | `cat / ls / rm / printf >` on `/n/vault/**` | Data plane. |
+
+Deferred post-M1 (tracked as a follow-up increment, see §17): `drive9 vault reauth <mountpoint>` — rebind a running mount to the current context without `umount`.
 
 Appendix B — Canonical history: §0–§12 absorb `89603ee6`; §13–§17 are the v2 context-unified credential increment over that canonical; Invariants #1–#5 derive from `89603ee6`; Invariants #6–#7 are new.
