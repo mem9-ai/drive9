@@ -69,6 +69,27 @@ func (su *StreamUploader) RefreshExpectedRevision(revision int64) bool {
 	return true
 }
 
+// ExpectedRevision reports the CAS revision that will be used when the next
+// upload starts or resumes.
+func (su *StreamUploader) ExpectedRevision() int64 {
+	su.mu.Lock()
+	defer su.mu.Unlock()
+	return su.expectedRevision
+}
+
+// ResetForNextWrite prepares the uploader for another flush cycle after a
+// successful commit on the same open handle.
+func (su *StreamUploader) ResetForNextWrite(revision int64) {
+	su.mu.Lock()
+	defer su.mu.Unlock()
+
+	su.expectedRevision = revision
+	su.writer = nil
+	su.started = false
+	su.streamErr = nil
+	su.streamedParts = make(map[int]bool)
+}
+
 // HasStreamedParts reports whether any parts were uploaded during streaming
 // (i.e., during Write() calls, not at flush time).
 func (su *StreamUploader) HasStreamedParts() bool {
