@@ -249,17 +249,16 @@ Renamed in 0.001s</code>
                     </div>
                 </div>
 
-                <!-- Feature 5: Go SDK -->
+                <!-- Feature 5: Multi-language SDKs -->
                 <div class="feature-card">
-                    <div class="feature-icon">🚀</div>
-                    <h3>Native Go SDK</h3>
-                    <p>Build agent tools with the Go SDK. Streaming, resume support, and context cancellation built in.</p>
+                    <div class="feature-icon">🛠</div>
+                    <h3>Multi-language SDKs</h3>
+                    <p>Build agent tools in Go, Python, TypeScript, or Rust. Streaming, resume, and context cancellation built in.</p>
                     <div class="code-block">
-                        <code>import "github.com/mem9-ai/drive9/pkg/client"<br>
-<br>
-c := client.New("http://localhost:9009", "")<br>
-data, _ := c.Read("/config.json")<br>
-c.Write("/output.json", result)</code>
+                        <code>$ go get github.com/mem9-ai/drive9/pkg/client<br>
+$ pip install drive9<br>
+$ npm install drive9<br>
+$ cargo add drive9</code>
                     </div>
                     <div class="replaces">
                         <span class="replaces-label">replaces</span>
@@ -268,89 +267,23 @@ c.Write("/output.json", result)</code>
                     </div>
                 </div>
 
-                <!-- Feature 6: Python SDK -->
+                <!-- Feature 6: Tagging -->
                 <div class="feature-card">
-                    <div class="feature-icon">🐍</div>
-                    <h3>Python SDK</h3>
-                    <p>Build AI pipelines with the Python SDK. Streaming uploads, vault secrets, and semantic search out of the box.</p>
+                    <div class="feature-icon">🏷️</div>
+                    <h3>Tagging &amp; metadata</h3>
+                    <p>Organize and filter files with key-value tags. Query by tags across directories. Build agent workflows with structured metadata.</p>
                     <div class="code-block">
-                        <code>from drive9 import Client<br>
+                        <code>$ drive9 tag set :/data/report.pdf type=invoice year=2024<br>
 <br>
-c = Client("http://localhost:9009", api_key="")<br>
-c.write("/data/hello.txt", b"Hello, drive9!")<br>
-data = c.read("/data/hello.txt")</code>
+$ drive9 tag find type=invoice<br>
+/data/report.pdf<br>
+/data/invoice_q2.pdf</code>
                     </div>
                     <div class="replaces">
                         <span class="replaces-label">replaces</span>
-                        <span class="replaces-item">boto3</span>
-                        <span class="replaces-item">requests boilerplate</span>
+                        <span class="replaces-item">manual organization</span>
+                        <span class="replaces-item">folder hierarchies</span>
                     </div>
-                </div>
-
-                <!-- Feature 7: TypeScript SDK -->
-                <div class="feature-card">
-                    <div class="feature-icon">📘</div>
-                    <h3>TypeScript SDK</h3>
-                    <p>Integrate drive9 into Node.js and browser apps with full type safety. CJS and ESM builds included.</p>
-                    <div class="code-block">
-                        <code>import { Client } from "drive9";<br>
-<br>
-const c = new Client("http://localhost:9009", "");<br>
-await c.write("/data/hello.txt", new TextEncoder().encode("Hello"));<br>
-const data = await c.read("/data/hello.txt");</code>
-                    </div>
-                    <div class="replaces">
-                        <span class="replaces-label">replaces</span>
-                        <span class="replaces-item">S3 SDKs</span>
-                        <span class="replaces-item">HTTP boilerplate</span>
-                    </div>
-                </div>
-
-                <!-- Feature 8: Rust SDK -->
-                <div class="feature-card">
-                    <div class="feature-icon">🦀</div>
-                    <h3>Rust SDK</h3>
-                    <p>High-performance async Rust SDK with Tokio. Zero-allocation reads and native multipart resume.</p>
-                    <div class="code-block">
-                        <code>use drive9::Client;<br>
-<br>
-let c = Client::new("http://localhost:9009", "test-key");<br>
-c.write("/data/hello.txt", b"Hello, drive9!").await?;<br>
-let data = c.read("/data/hello.txt").await?;</code>
-                    </div>
-                    <div class="replaces">
-                        <span class="replaces-label">replaces</span>
-                        <span class="replaces-item">rusoto</span>
-                        <span class="replaces-item">HTTP boilerplate</span>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- Highlights Section -->
-    <section class="highlights">
-        <div class="container">
-            <div class="highlights-grid">
-                <div class="highlight-card">
-                    <div class="highlight-icon">🔍</div>
-                    <h4>Semantic Search</h4>
-                    <p>Find files by meaning with vector similarity and full-text search</p>
-                </div>
-                <div class="highlight-card">
-                    <div class="highlight-icon">⚡</div>
-                    <h4>Zero-Copy</h4>
-                    <p>Instant copy and rename without data movement</p>
-                </div>
-                <div class="highlight-card">
-                    <div class="highlight-icon">🏷️</div>
-                    <h4>Tagging</h4>
-                    <p>Organize and filter files with key-value tags</p>
-                </div>
-                <div class="highlight-card">
-                    <div class="highlight-icon">⬆️</div>
-                    <h4>Resumable Uploads</h4>
-                    <p>Reliable upload with automatic resume support</p>
                 </div>
             </div>
         </div>
