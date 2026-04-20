@@ -78,12 +78,15 @@ impl Client {
             let mut headers = HeaderMap::new();
             if let Some(ref rh) = part.read_headers {
                 for (k, v) in rh {
+                    if k.eq_ignore_ascii_case("host") {
+                        continue;
+                    }
                     if let Ok(hv) = reqwest::header::HeaderValue::from_str(v.as_str().unwrap_or(""))
                     {
-                        headers.insert(
-                            HeaderName::from_bytes(k.as_bytes()).unwrap_or(CONTENT_TYPE),
-                            hv,
-                        );
+                        let name = HeaderName::from_bytes(k.as_bytes()).map_err(|_| {
+                            Drive9Error::Other(format!("invalid header name: {}", k))
+                        })?;
+                        headers.insert(name, hv);
                     }
                 }
             }
@@ -107,14 +110,14 @@ impl Client {
         );
         if let Some(ref ph) = part.headers {
             for (k, v) in ph {
+                if k.eq_ignore_ascii_case("host") {
+                    continue;
+                }
                 if let Ok(hv) = reqwest::header::HeaderValue::from_str(v.as_str().unwrap_or("")) {
-                    if k.eq_ignore_ascii_case("host") {
-                        continue;
-                    }
-                    headers.insert(
-                        HeaderName::from_bytes(k.as_bytes()).unwrap_or(CONTENT_TYPE),
-                        hv,
-                    );
+                    let name = HeaderName::from_bytes(k.as_bytes()).map_err(|_| {
+                        Drive9Error::Other(format!("invalid header name: {}", k))
+                    })?;
+                    headers.insert(name, hv);
                 }
             }
         }
