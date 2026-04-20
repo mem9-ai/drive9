@@ -271,7 +271,21 @@ func main() {
 			accountClient := tidbcloud.NewGRPCAccountClient(
 				accountpb.NewAccountAPIServiceClient(accountConn),
 			)
-			provisioner = tidbcloudnative.NewProvisioner(globalClient, accountClient, enc)
+
+			// Auth0 client-credentials for the cluster proxy JWT middleware.
+			// Optional: when unset, proxy requests are sent without a JWT
+			// (suitable for dev/staging where Auth0 is disabled on the proxy).
+			var auth0Cfg *tidbcloud.ProxyAuth0Config
+			if d := os.Getenv("DRIVE9_PROXY_AUTH0_DOMAIN"); d != "" {
+				auth0Cfg = &tidbcloud.ProxyAuth0Config{
+					Domain:       d,
+					ClientID:     os.Getenv("DRIVE9_PROXY_AUTH0_CLIENT_ID"),
+					ClientSecret: os.Getenv("DRIVE9_PROXY_AUTH0_CLIENT_SECRET"),
+					Audience:     os.Getenv("DRIVE9_PROXY_AUTH0_AUDIENCE"),
+				}
+			}
+
+			provisioner = tidbcloudnative.NewProvisioner(globalClient, accountClient, enc, auth0Cfg)
 			logger.Info(context.Background(), "provisioner_configured",
 				zap.String("provider", providerType),
 				zap.String("mgmt_addr", mgmtAddr),

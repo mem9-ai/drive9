@@ -74,7 +74,7 @@ func TestProvision_Success(t *testing.T) {
 		},
 	}
 
-	p := NewProvisioner(global, nil, enc)
+	p := NewProvisioner(global, nil, enc, nil)
 	info, err := p.Provision(context.Background(), "12345")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -103,7 +103,7 @@ func TestProvision_ClusterInfoError(t *testing.T) {
 		},
 	}
 
-	p := NewProvisioner(global, nil, nil)
+	p := NewProvisioner(global, nil, nil, nil)
 	_, err := p.Provision(context.Background(), "99999")
 	if err == nil {
 		t.Fatal("expected error")
@@ -131,7 +131,7 @@ func TestProvision_DecryptError(t *testing.T) {
 		},
 	}
 
-	p := NewProvisioner(global, nil, enc)
+	p := NewProvisioner(global, nil, enc, nil)
 	_, err := p.Provision(context.Background(), "1")
 	if err == nil {
 		t.Fatal("expected error from decrypt")
@@ -148,7 +148,7 @@ func TestVerifyZeroInstance_Success(t *testing.T) {
 		},
 	}
 
-	p := NewProvisioner(global, nil, nil)
+	p := NewProvisioner(global, nil, nil, nil)
 	info, err := p.VerifyZeroInstance(context.Background(), "inst-abc")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -165,7 +165,7 @@ func TestVerifyZeroInstance_NotFound(t *testing.T) {
 		},
 	}
 
-	p := NewProvisioner(global, nil, nil)
+	p := NewProvisioner(global, nil, nil, nil)
 	_, err := p.VerifyZeroInstance(context.Background(), "fake-id")
 	if err == nil {
 		t.Fatal("expected error")
@@ -173,7 +173,7 @@ func TestVerifyZeroInstance_NotFound(t *testing.T) {
 }
 
 func TestProviderType(t *testing.T) {
-	p := NewProvisioner(nil, nil, nil)
+	p := NewProvisioner(nil, nil, nil, nil)
 	if got := p.ProviderType(); got != "tidbcloud-native" {
 		t.Fatalf("got %s, want tidbcloud-native", got)
 	}
@@ -201,7 +201,7 @@ func TestAuthorize_OrgMatch(t *testing.T) {
 		},
 	}
 
-	p := NewProvisioner(global, account, nil)
+	p := NewProvisioner(global, account, nil, nil)
 	r, _ := http.NewRequest("GET", "/", nil)
 	if err := p.Authorize(context.Background(), r, "12345"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -220,7 +220,7 @@ func TestAuthorize_OrgMismatch(t *testing.T) {
 		},
 	}
 
-	p := NewProvisioner(global, account, nil)
+	p := NewProvisioner(global, account, nil, nil)
 	r, _ := http.NewRequest("GET", "/", nil)
 	err := p.Authorize(context.Background(), r, "12345")
 	if err == nil {
@@ -238,7 +238,7 @@ func TestAuthorize_AccountError(t *testing.T) {
 		},
 	}
 
-	p := NewProvisioner(nil, account, nil)
+	p := NewProvisioner(nil, account, nil, nil)
 	r, _ := http.NewRequest("GET", "/", nil)
 	err := p.Authorize(context.Background(), r, "12345")
 	if err == nil {
@@ -261,7 +261,7 @@ func TestAuthorize_ClusterNotFound(t *testing.T) {
 		},
 	}
 
-	p := NewProvisioner(global, account, nil)
+	p := NewProvisioner(global, account, nil, nil)
 	r, _ := http.NewRequest("GET", "/", nil)
 	err := p.Authorize(context.Background(), r, "12345")
 	if err == nil {
@@ -286,7 +286,7 @@ func TestProvisionWithRootCreds_Success(t *testing.T) {
 		},
 	}
 
-	p := NewProvisioner(global, nil, nil)
+	p := NewProvisioner(global, nil, nil, nil)
 	info, err := p.ProvisionWithRootCreds(context.Background(), "99", "pfx.root", "rootpw")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -313,7 +313,7 @@ func TestCreateServiceUser_Success(t *testing.T) {
 	}))
 	defer proxySrv.Close()
 
-	p := NewProvisioner(nil, nil, nil)
+	p := NewProvisioner(nil, nil, nil, nil)
 	err := p.CreateServiceUser(context.Background(), "12345", proxySrv.URL, "pfx.root", "root-pass", "pfx.fs_admin", "fs-pass")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -327,7 +327,7 @@ func TestCreateServiceUser_ProxyError(t *testing.T) {
 	}))
 	defer proxySrv.Close()
 
-	p := NewProvisioner(nil, nil, nil)
+	p := NewProvisioner(nil, nil, nil, nil)
 	err := p.CreateServiceUser(context.Background(), "12345", proxySrv.URL, "pfx.root", "root-pass", "pfx.fs_admin", "pw")
 	if err == nil {
 		t.Fatal("expected error from proxy HTTP 500")
@@ -335,7 +335,7 @@ func TestCreateServiceUser_ProxyError(t *testing.T) {
 }
 
 func TestCreateServiceUser_InvalidClusterID(t *testing.T) {
-	p := NewProvisioner(nil, nil, nil)
+	p := NewProvisioner(nil, nil, nil, nil)
 	err := p.CreateServiceUser(context.Background(), "not-a-number", "http://proxy", "root", "pw", "fs_admin", "pw")
 	if err == nil {
 		t.Fatal("expected error for invalid cluster ID")
@@ -353,7 +353,7 @@ func TestFetchProxyInfo_Success(t *testing.T) {
 		},
 	}
 
-	p := NewProvisioner(global, nil, nil)
+	p := NewProvisioner(global, nil, nil, nil)
 	ep, prefix, err := p.FetchProxyInfo(context.Background(), "12345")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -373,7 +373,7 @@ func TestFetchProxyInfo_Error(t *testing.T) {
 		},
 	}
 
-	p := NewProvisioner(global, nil, nil)
+	p := NewProvisioner(global, nil, nil, nil)
 	_, _, err := p.FetchProxyInfo(context.Background(), "12345")
 	if err == nil {
 		t.Fatal("expected error")

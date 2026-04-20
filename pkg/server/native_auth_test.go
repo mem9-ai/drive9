@@ -63,7 +63,7 @@ func (stubEncryptor) Decrypt(_ context.Context, ciphertext []byte) ([]byte, erro
 
 func newTestNativeProvisioner(global *stubGlobalClient, account *stubAccountClient) *tidbcloudnative.Provisioner {
 	var enc encrypt.Encryptor = stubEncryptor{}
-	return tidbcloudnative.NewProvisioner(global, account, enc)
+	return tidbcloudnative.NewProvisioner(global, account, enc, nil)
 }
 
 func TestAuthorizeNativeTarget_ZeroInstance_Success(t *testing.T) {

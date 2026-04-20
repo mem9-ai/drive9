@@ -25,14 +25,15 @@ import (
 
 // Provisioner implements tenant.Provisioner for the tidbcloud-native provider.
 type Provisioner struct {
-	global  tidbcloud.GlobalClient
-	account tidbcloud.AccountClient
-	enc     encrypt.Encryptor
+	global   tidbcloud.GlobalClient
+	account  tidbcloud.AccountClient
+	enc      encrypt.Encryptor
+	auth0Cfg *tidbcloud.ProxyAuth0Config
 }
 
 // NewProvisioner creates a Provisioner with the given dependencies.
-func NewProvisioner(global tidbcloud.GlobalClient, account tidbcloud.AccountClient, enc encrypt.Encryptor) *Provisioner {
-	return &Provisioner{global: global, account: account, enc: enc}
+func NewProvisioner(global tidbcloud.GlobalClient, account tidbcloud.AccountClient, enc encrypt.Encryptor, auth0Cfg *tidbcloud.ProxyAuth0Config) *Provisioner {
+	return &Provisioner{global: global, account: account, enc: enc, auth0Cfg: auth0Cfg}
 }
 
 func (p *Provisioner) ProviderType() string { return tenant.ProviderTiDBCloudNative }
@@ -141,7 +142,7 @@ func (p *Provisioner) CreateServiceUser(ctx context.Context, clusterID, proxyEnd
 		zap.String("operator", operatorUser),
 		zap.String("new_user", newUser))
 
-	return tidbcloud.CreateServiceUserViaProxy(ctx, proxyEndpoint, clusterIDUint, operatorUser, operatorPass, newUser, newPass)
+	return tidbcloud.CreateServiceUserViaProxy(ctx, proxyEndpoint, clusterIDUint, operatorUser, operatorPass, newUser, newPass, p.auth0Cfg)
 }
 
 // VerifyZeroInstance calls the zero-instance service to confirm the instance ID
