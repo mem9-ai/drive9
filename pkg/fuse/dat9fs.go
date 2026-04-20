@@ -3,8 +3,10 @@ package fuse
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path"
 	"strings"
@@ -480,6 +482,35 @@ func httpToFuseStatus(err error) gofuse.Status {
 	if err == nil {
 		return gofuse.OK
 	}
+
+	// Prefer typed StatusError so we map by status code even when the
+	// server returns a JSON error body that doesn't contain "HTTP NNN".
+	var se *client.StatusError
+	if errors.As(err, &se) {
+		switch se.StatusCode {
+		case http.StatusNotFound:
+			return gofuse.ENOENT
+		case http.StatusConflict:
+			if strings.Contains(strings.ToLower(se.Message), "already exists") {
+				return gofuse.Status(syscall.EEXIST)
+			}
+			return gofuse.EIO
+		case http.StatusForbidden:
+			return gofuse.EACCES
+		case http.StatusRequestEntityTooLarge:
+			return gofuse.Status(syscall.EFBIG)
+		case http.StatusPreconditionFailed:
+			return gofuse.Status(syscall.ESTALE)
+		case http.StatusBadRequest:
+			return gofuse.Status(syscall.EINVAL)
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable:
+			return gofuse.Status(syscall.EAGAIN)
+		default:
+			return gofuse.EIO
+		}
+	}
+
+	// Fallback to string matching for non-StatusError errors.
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "not found") || strings.Contains(msg, "HTTP 404"):
@@ -1099,6 +1130,7 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 		defer cf()
 		entries, err := fs.listDir(ctx, dh.Path)
 		if err != nil {
+			log.Printf("list dir failed for %s: %v", dh.Path, err)
 			return httpToFuseStatus(err)
 		}
 		dh.Entries = entries
@@ -1129,6 +1161,7 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 		defer cf()
 		entries, err := fs.listDir(ctx, dh.Path)
 		if err != nil {
+			log.Printf("list dir plus failed for %s: %v", dh.Path, err)
 			return httpToFuseStatus(err)
 		}
 		dh.Entries = entries
@@ -2026,6 +2059,15 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	return gofuse.OK
 }
 
+// refreshRevisionAfterFlush updates the inode cache with the latest server
+// revision so that subsequent opens see the correct base revision for CAS
+// uploads. Callers must hold fh.mu.
+func (fs *Dat9FS) refreshRevisionAfterFlush(ctx context.Context, fh *FileHandle) {
+	if stat, err := fs.client.StatCtx(ctx, fh.Path); err == nil && stat != nil {
+		fs.inodes.UpdateRevision(fh.Ino, stat.Revision)
+	}
+}
+
 // flushHandle uploads buffered data to the server. Caller must hold fh.mu.
 // NOTE: This method temporarily releases fh.mu during network calls
 // (FinishStreaming, UploadAll) to avoid deadlock with streaming upload
@@ -2079,6 +2121,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fh.Lock()
 
 		if err != nil {
+			log.Printf("finish streaming failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 
@@ -2091,6 +2134,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fs.notifyInode(fh.Ino)
 		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
 		fs.notifyInode(parentIno)
+		fs.refreshRevisionAfterFlush(ctx, fh)
 		return gofuse.OK
 	}
 
@@ -2116,6 +2160,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fh.Lock()
 
 		if err != nil {
+			log.Printf("upload all parts failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 
@@ -2128,6 +2173,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fs.notifyInode(fh.Ino)
 		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
 		fs.notifyInode(parentIno)
+		fs.refreshRevisionAfterFlush(ctx, fh)
 		return gofuse.OK
 	}
 
@@ -2178,6 +2224,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		)
 	}
 	if err != nil {
+		log.Printf("flush upload failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
 	}
 
@@ -2191,6 +2238,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	fs.notifyInode(fh.Ino)
 	parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
 	fs.notifyInode(parentIno)
+	fs.refreshRevisionAfterFlush(ctx, fh)
 	return gofuse.OK
 }
 
