@@ -628,12 +628,11 @@ Every verb that documents a pipe or composition pattern (`A | B`, `A | xargs B`)
 
 ## Implementation status
 
-The table below tracks whether each Appendix A verb is live on `main`. It is the single source of truth that reviewers use to decide when `Status: Proposed` may flip to `Accepted` (see header): the flip happens only once every row in the `drive9 vault` / `drive9 mount vault` block reads either `implemented` or `descoped-#NNN` (i.e. no row is left `not-yet`). Rows for verbs already shipped by merged PRs are pinned here for auditability; subsequent PRs in the Appendix-A alignment track MUST update this table in the same commit that ships the verb.
+The table below tracks whether each Appendix A verb is live on `main`. It is the single source of truth that reviewers use to decide when `Status: Proposed` may flip to `Accepted` (see header): the flip happens only once every row in the `drive9 vault` / `drive9 mount vault` block reads `implemented`. Rows for verbs already shipped by merged PRs are pinned here for auditability; subsequent PRs in the Appendix-A alignment track MUST update this table in the same commit that ships the verb. Verbs explicitly deferred post-M1 (e.g. `drive9 vault reauth`, see §17 and Appendix A tail) are not tracked here; they have no accounting row and do not gate the flip.
 
 Legend:
 - **implemented** — landed on `main`; verb shape matches the spec row above.
 - **not-yet** — verb defined in Appendix A; no CLI entry on `main` yet. Scheduled within the Appendix-A alignment PR track; status flips in the PR that ships the verb.
-- **descoped-#NNN** — explicitly removed from M1; follow-up issue carries the residual scope.
 
 | Verb (Appendix A) | Status | Landed / tracked |
 |---|---|---|
@@ -646,7 +645,6 @@ Legend:
 | `drive9 vault grant <scope>... --agent --perm --ttl` | not-yet | Appendix-A alignment PR track (server endpoint live in #273; CLI still on legacy `drive9 secret grant` with no `--perm`) |
 | `drive9 vault revoke <grant-id>` | not-yet | Appendix-A alignment PR track |
 | `drive9 vault with <path> -- <cmd>` | not-yet | Appendix-A alignment PR track |
-| `drive9 vault reauth <mountpoint>` | descoped-#302 | deferred post-M1 (§17) |
 | Data-plane `cat / ls / rm / printf >` on `/n/vault/**` | implemented | pre-M1 |
 
 Rows record the **final user-visible verb**. Interim steps (for example, fixing the legacy `drive9 secret grant` call path to hit `/v1/vault/grants` with `--perm` before the `vault` verb lands) do **not** flip `drive9 vault grant` to `implemented` — that row only flips when the `drive9 vault grant` CLI surface itself is live on `main`.
