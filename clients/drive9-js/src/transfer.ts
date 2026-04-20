@@ -25,23 +25,30 @@ const CRC32C_TABLE = new Int32Array(256);
   }
 })();
 
+function bytesToBase64(bytes: Uint8Array): string {
+  const binString = Array.from(bytes, (b) => String.fromCharCode(b)).join("");
+  return (globalThis as any).btoa(binString);
+}
+
 export function computeCrc32c(data: Uint8Array): string {
   let crc = ~0;
   for (let i = 0; i < data.length; i++) {
     crc = (crc >>> 8) ^ CRC32C_TABLE[(crc ^ data[i]) & 0xff];
   }
   crc = ~crc >>> 0;
-  return Buffer.from([
-    (crc >>> 24) & 0xff,
-    (crc >>> 16) & 0xff,
-    (crc >>> 8) & 0xff,
-    crc & 0xff,
-  ]).toString("base64");
+  return bytesToBase64(
+    new Uint8Array([
+      (crc >>> 24) & 0xff,
+      (crc >>> 16) & 0xff,
+      (crc >>> 8) & 0xff,
+      crc & 0xff,
+    ])
+  );
 }
 
 async function sha256Base64(data: Uint8Array): Promise<string> {
   const hash = await crypto.subtle.digest("SHA-256", data);
-  return Buffer.from(hash).toString("base64");
+  return bytesToBase64(new Uint8Array(hash));
 }
 
 async function streamToUint8Array(stream: ReadableStream<Uint8Array>, size: number): Promise<Uint8Array> {
@@ -204,8 +211,8 @@ async function writeStreamV2(
   expectedRevision: number
 ): Promise<void> {
   const plan = await initiateUploadV2(client, path, data.length, expectedRevision);
-  const parts = await uploadPartsV2(client, plan, data);
   try {
+    const parts = await uploadPartsV2(client, plan, data);
     await completeUploadV2(client, plan.upload_id, parts);
   } catch (err) {
     await abortUploadV2(client, plan.upload_id);
@@ -334,7 +341,7 @@ async function initiateUploadV2(
   const resp = await fetch(`${client.baseUrl}/v2/uploads/initiate`, {
     method: "POST",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ path, size, expected_revision: expectedRevision }),
+    body: JSON.stringify({ path, total_size: size, expected_revision: expectedRevision }),
   });
   if (resp.status === 404) {
     throw new Drive9Error("v2 upload API not available");

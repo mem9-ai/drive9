@@ -14,14 +14,22 @@ impl Client {
         new_size: i64,
         dirty_parts: &[i32],
         read_part: F,
+        part_size: Option<i64>,
+        expected_revision: Option<i64>,
     ) -> Result<(), Drive9Error>
     where
         F: Fn(i32, i64, Option<&[u8]>) -> Result<Vec<u8>, Drive9Error> + Send + Sync + 'static,
     {
-        let body = json!({
+        let mut body = json!({
             "new_size": new_size,
             "dirty_parts": dirty_parts,
         });
+        if let Some(ps) = part_size {
+            body["part_size"] = json!(ps);
+        }
+        if let Some(er) = expected_revision {
+            body["expected_revision"] = json!(er);
+        }
         let resp = self
             .http
             .patch(self.fs_url(path))
@@ -78,12 +86,15 @@ impl Client {
             let mut headers = HeaderMap::new();
             if let Some(ref rh) = part.read_headers {
                 for (k, v) in rh {
+                    if k.eq_ignore_ascii_case("host") {
+                        continue;
+                    }
                     if let Ok(hv) = reqwest::header::HeaderValue::from_str(v.as_str().unwrap_or(""))
                     {
-                        headers.insert(
-                            HeaderName::from_bytes(k.as_bytes()).unwrap_or(CONTENT_TYPE),
-                            hv,
-                        );
+                        let name = HeaderName::from_bytes(k.as_bytes()).map_err(|_| {
+                            Drive9Error::Other(format!("invalid header name: {}", k))
+                        })?;
+                        headers.insert(name, hv);
                     }
                 }
             }
@@ -107,14 +118,14 @@ impl Client {
         );
         if let Some(ref ph) = part.headers {
             for (k, v) in ph {
+                if k.eq_ignore_ascii_case("host") {
+                    continue;
+                }
                 if let Ok(hv) = reqwest::header::HeaderValue::from_str(v.as_str().unwrap_or("")) {
-                    if k.eq_ignore_ascii_case("host") {
-                        continue;
-                    }
-                    headers.insert(
-                        HeaderName::from_bytes(k.as_bytes()).unwrap_or(CONTENT_TYPE),
-                        hv,
-                    );
+                    let name = HeaderName::from_bytes(k.as_bytes()).map_err(|_| {
+                        Drive9Error::Other(format!("invalid header name: {}", k))
+                    })?;
+                    headers.insert(name, hv);
                 }
             }
         }
