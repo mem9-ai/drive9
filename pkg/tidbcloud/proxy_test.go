@@ -30,7 +30,7 @@ func TestCreateServiceUserViaProxy_Success(t *testing.T) {
 	defer srv.Close()
 
 	err := CreateServiceUserViaProxy(context.Background(), srv.URL, 12345,
-		"pfx.cloud_admin", "admin-pass", "pfx.fs_admin", "fs-pass")
+		"pfx.cloud_admin", "admin-pass", "pfx.fs_admin", "fs-pass", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestCreateServiceUserViaProxy_Success(t *testing.T) {
 
 func TestCreateServiceUserViaProxy_EmptyEndpoint(t *testing.T) {
 	err := CreateServiceUserViaProxy(context.Background(), "", 1,
-		"user", "pass", "new", "new-pass")
+		"user", "pass", "new", "new-pass", nil)
 	if err == nil {
 		t.Fatal("expected error for empty endpoint")
 	}
@@ -101,7 +101,7 @@ func TestCreateServiceUserViaProxy_SQLError(t *testing.T) {
 	defer srv.Close()
 
 	err := CreateServiceUserViaProxy(context.Background(), srv.URL, 1,
-		"op", "pass", "new", "np")
+		"op", "pass", "new", "np", nil)
 	if err == nil {
 		t.Fatal("expected error for SQL error response")
 	}
@@ -118,7 +118,7 @@ func TestCreateServiceUserViaProxy_HTTPError(t *testing.T) {
 	defer srv.Close()
 
 	err := CreateServiceUserViaProxy(context.Background(), srv.URL, 1,
-		"op", "pass", "new", "np")
+		"op", "pass", "new", "np", nil)
 	if err == nil {
 		t.Fatal("expected error for HTTP 500")
 	}
@@ -129,7 +129,7 @@ func TestCreateServiceUserViaProxy_HTTPError(t *testing.T) {
 
 func TestCreateServiceUserViaProxy_InvalidUsername(t *testing.T) {
 	err := CreateServiceUserViaProxy(context.Background(), "https://proxy", 1,
-		"op", "pass", "user'inject", "safe-pass")
+		"op", "pass", "user'inject", "safe-pass", nil)
 	if err == nil {
 		t.Fatal("expected error for username with single quote")
 	}
@@ -140,12 +140,89 @@ func TestCreateServiceUserViaProxy_InvalidUsername(t *testing.T) {
 
 func TestCreateServiceUserViaProxy_InvalidPassword(t *testing.T) {
 	err := CreateServiceUserViaProxy(context.Background(), "https://proxy", 1,
-		"op", "pass", "safe-user", "pass'word")
+		"op", "pass", "safe-user", "pass'word", nil)
 	if err == nil {
 		t.Fatal("expected error for password with single quote")
 	}
 	if got := err.Error(); !contains(got, "invalid password") {
 		t.Fatalf("error=%q, want 'invalid password'", got)
+	}
+}
+
+func TestCreateServiceUserViaProxy_WithAuth0Token(t *testing.T) {
+	var gotAuthHeader string
+	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthHeader = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(proxyExecuteResponse{ErrNumber: 0})
+	}))
+	defer proxySrv.Close()
+
+	// TLS auth0 mock that validates the request.
+	auth0TLS := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("auth0: method=%s, want POST", r.Method)
+		}
+		if r.URL.Path != "/oauth/token" {
+			t.Fatalf("auth0: path=%s, want /oauth/token", r.URL.Path)
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "application/x-www-form-urlencoded" {
+			t.Fatalf("auth0: content-type=%s, want application/x-www-form-urlencoded", ct)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("auth0: parse form: %v", err)
+		}
+		if got := r.FormValue("grant_type"); got != "client_credentials" {
+			t.Fatalf("auth0: grant_type=%q, want client_credentials", got)
+		}
+		if got := r.FormValue("client_id"); got != "test-client-id" {
+			t.Fatalf("auth0: client_id=%q, want test-client-id", got)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"access_token":"test-jwt-token"}`))
+	}))
+	defer auth0TLS.Close()
+
+	auth0Domain := auth0TLS.URL[len("https://"):]
+
+	// Override default transport so the TLS cert is trusted.
+	origTransport := http.DefaultTransport
+	http.DefaultTransport = auth0TLS.Client().Transport
+	defer func() { http.DefaultTransport = origTransport }()
+
+	cfg := &ProxyAuth0Config{
+		Domain:       auth0Domain,
+		ClientID:     "test-client-id",
+		ClientSecret: "test-client-secret",
+		Audience:     "test-audience",
+	}
+
+	err := CreateServiceUserViaProxy(context.Background(), proxySrv.URL, 12345,
+		"op", "pass", "new_user", "new_pass", cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotAuthHeader != "Bearer test-jwt-token" {
+		t.Fatalf("Authorization=%q, want %q", gotAuthHeader, "Bearer test-jwt-token")
+	}
+}
+
+func TestCreateServiceUserViaProxy_NilAuth0Config(t *testing.T) {
+	var gotAuthHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthHeader = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(proxyExecuteResponse{ErrNumber: 0})
+	}))
+	defer srv.Close()
+
+	err := CreateServiceUserViaProxy(context.Background(), srv.URL, 12345,
+		"op", "pass", "new_user", "new_pass", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotAuthHeader != "" {
+		t.Fatalf("Authorization should be empty when auth0 config is nil, got %q", gotAuthHeader)
 	}
 }
 

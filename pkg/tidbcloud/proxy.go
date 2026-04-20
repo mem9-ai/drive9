@@ -9,8 +9,20 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
+
+// ProxyAuth0Config holds OAuth2 client-credentials configuration for
+// authenticating requests to the cluster proxy's JWT middleware.
+// When all fields are non-empty, CreateServiceUserViaProxy obtains a
+// Bearer token and attaches it to the request.
+type ProxyAuth0Config struct {
+	Domain       string // Auth0 domain, e.g. "foo.us.auth0.com"
+	ClientID     string
+	ClientSecret string
+	Audience     string
+}
 
 // proxyOperator represents the JSON operator in a proxy request.
 type proxyOperator struct {
@@ -43,7 +55,10 @@ type proxyExecuteResponse struct {
 // operatorUser / operatorPass are credentials for an existing DB user
 // (typically root) that the proxy uses to authenticate the request.
 // newUser / newPass are the credentials for the new service user to create.
-func CreateServiceUserViaProxy(ctx context.Context, proxyEndpoint string, clusterID uint64, operatorUser, operatorPass, newUser, newPass string) error {
+// auth0Cfg provides OAuth2 client-credentials for the proxy's JWT middleware;
+// when nil or empty, no Authorization header is sent (suitable for dev/staging
+// environments where Auth0 is disabled).
+func CreateServiceUserViaProxy(ctx context.Context, proxyEndpoint string, clusterID uint64, operatorUser, operatorPass, newUser, newPass string, auth0Cfg *ProxyAuth0Config) error {
 	if proxyEndpoint == "" {
 		return fmt.Errorf("create service user: proxy endpoint is empty")
 	}
@@ -87,6 +102,15 @@ func CreateServiceUserViaProxy(ctx context.Context, proxyEndpoint string, cluste
 		return fmt.Errorf("create service user: new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	// Attach Auth0 JWT if configured.
+	if auth0Cfg != nil && auth0Cfg.Domain != "" && auth0Cfg.ClientID != "" && auth0Cfg.ClientSecret != "" && auth0Cfg.Audience != "" {
+		token, err := getAuth0ClientToken(ctx, auth0Cfg)
+		if err != nil {
+			return fmt.Errorf("create service user: get auth0 token: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	// The internal cluster proxy uses a certificate that does not match
 	// the ELB hostname, so we skip TLS verification for this internal call.
@@ -148,4 +172,50 @@ func validateSQLPassword(s string) error {
 		}
 	}
 	return nil
+}
+
+// getAuth0ClientToken obtains an OAuth2 client-credentials token from Auth0,
+// matching the pattern used by tidb-management-service's cluster proxy client.
+func getAuth0ClientToken(ctx context.Context, cfg *ProxyAuth0Config) (string, error) {
+	tokenURL := "https://" + cfg.Domain + "/oauth/token"
+
+	form := url.Values{
+		"grant_type":    {"client_credentials"},
+		"client_id":     {cfg.ClientID},
+		"client_secret": {cfg.ClientSecret},
+		"audience":      {cfg.Audience},
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL,
+		bytes.NewBufferString(form.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("build auth0 token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	auth0Client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := auth0Client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("auth0 token request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("read auth0 response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("auth0 returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return "", fmt.Errorf("decode auth0 response: %w", err)
+	}
+	if tokenResp.AccessToken == "" {
+		return "", fmt.Errorf("auth0 returned empty access_token")
+	}
+	return tokenResp.AccessToken, nil
 }
