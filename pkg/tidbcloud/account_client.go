@@ -55,18 +55,6 @@ func (c *grpcAccountClient) Authorize(ctx context.Context, r *http.Request, _ st
 	if err != nil {
 		return 0, err
 	}
-
-	// Verify the user belongs to the org.
-	resp, err := c.account.VerifyUserOrgAndProjects(ctx, &accountpb.VerifyUserOrgAndProjectsReq{
-		UserId: identity.userID,
-		OrgId:  identity.orgID,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("verify user org: %w", err)
-	}
-	if !resp.GetResult() {
-		return 0, fmt.Errorf("%w: user %d not authorized for org %d", ErrAuthForbidden, identity.userID, identity.orgID)
-	}
 	return identity.orgID, nil
 }
 
