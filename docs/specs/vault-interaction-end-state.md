@@ -1,7 +1,7 @@
 # drive9 vault — End-State Interaction Spec
 
 Status: Proposed (four-way review: dev1 author, architect-1 / dev2 / adversary-2 review)
-Scope: End-state CLI only. No current-implementation references, no transition/migration, no P0 tactics.
+Scope: End-state CLI is the normative surface (§0–§22 + Appendices). No P0 tactics. The `## Implementation status` section is the single allowed exception to "end-state only": it exists purely so reviewers can audit whether every Appendix A verb is live on `main` and gate the `Proposed → Accepted` flip; the normative spec itself does not describe any transitional shape.
 
 This spec is the single source of truth for the terminal shape of vault UX. It is the merged canonical of:
 
@@ -628,7 +628,7 @@ Every verb that documents a pipe or composition pattern (`A | B`, `A | xargs B`)
 
 ## Implementation status
 
-The table below tracks whether each Appendix A verb is live on `main`. It is the single source of truth that reviewers use to decide when `Status: Proposed` may flip to `Accepted` (see header): the flip happens only once every row in the `drive9 vault` / `drive9 mount vault` block reads `implemented`. Rows for verbs already shipped by merged PRs are pinned here for auditability; subsequent PRs in the Appendix-A alignment track MUST update this table in the same commit that ships the verb.
+The table below tracks whether each Appendix A verb is live on `main`. It is the single source of truth that reviewers use to decide when `Status: Proposed` may flip to `Accepted` (see header): the flip happens only once every row in the `drive9 vault` / `drive9 mount vault` block reads either `implemented` or `descoped-#NNN` (i.e. no row is left `not-yet`). Rows for verbs already shipped by merged PRs are pinned here for auditability; subsequent PRs in the Appendix-A alignment track MUST update this table in the same commit that ships the verb.
 
 Legend:
 - **implemented** — landed on `main`; verb shape matches the spec row above.
