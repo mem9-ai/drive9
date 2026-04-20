@@ -14,17 +14,26 @@ import (
 // MountCmd handles the "drive9 mount" command.
 //
 // Credential precedence matches spec §14.2: explicit --server / --api-key flag
-// > DRIVE9_SERVER / DRIVE9_API_KEY env > active config context. The flag
-// defaults are empty strings so we can distinguish "unset" from "explicit
-// empty"; the latter is rejected (see rejectEmptyFlag).
+// > DRIVE9_SERVER / DRIVE9_API_KEY / DRIVE9_VAULT_TOKEN env > active config
+// context. The flag defaults are empty strings so we can distinguish "unset"
+// from "explicit empty"; the latter is rejected (see rejectEmptyFlag).
+//
+// A mount is bound to exactly one principal at mount time (Invariant #3).
+// If the resolver returns a delegated credential (owner JWT / `ctx use <alice>`),
+// Mount is created via client.NewWithToken and bound to that capability for
+// the mount's lifetime. If the active principal changes later (`ctx use` to
+// another context), the running mount keeps its original binding — changing
+// a running mount's credential requires umount + remount (Invariant #6).
+// `vault reauth` is not part of M1; see docs/specs/vault-interaction-end-state.md
+// §17.
 //
 // drive9fuse.Mount runs in-process (no fork/exec); credentials flow through
-// MountOptions{Server, APIKey}, not through the child's environment. This
-// makes the resolver's Unsetenv-after-read mitigation safe for mount.
+// MountOptions{Server, APIKey, Token}, not through the child's environment.
+// This makes the resolver's Unsetenv-after-read mitigation safe for mount.
 func MountCmd(args []string) error {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
-	apiKey := fs.String("api-key", "", "API key (overrides $DRIVE9_API_KEY and config)")
+	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
 	cacheSize := fs.Int("cache-size", 128, "read cache size in MB")
 	dirTTL := fs.Duration("dir-ttl", 10*time.Second, "directory cache TTL")
 	attrTTL := fs.Duration("attr-ttl", 10*time.Second, "kernel attr cache TTL")
@@ -59,22 +68,12 @@ func MountCmd(args []string) error {
 		return err
 	}
 
-	r := ResolveCredentials()
-	if *server == "" {
-		*server = r.Server
+	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
+	if err != nil {
+		return err
 	}
-	if *apiKey == "" {
-		if r.Kind == CredentialOwner {
-			*apiKey = r.APIKey
-		}
-	}
-
-	if *server == "" {
-		return fmt.Errorf("drive9 server URL required (--server, $%s, or `drive9 ctx`)", EnvServer)
-	}
-	if *apiKey == "" {
-		return fmt.Errorf("owner API key required (--api-key, $%s, or `drive9 ctx`)", EnvAPIKey)
-	}
+	*server, *apiKey = serverVal, apiKeyVal
+	token := tokenVal
 
 	syncModeVal, err := drive9fuse.ParseSyncMode(*syncMode)
 	if err != nil {
@@ -84,6 +83,7 @@ func MountCmd(args []string) error {
 	opts := &drive9fuse.MountOptions{
 		Server:        *server,
 		APIKey:        *apiKey,
+		Token:         token,
 		MountPoint:    mountPoint,
 		CacheSize:     int64(*cacheSize) << 20,
 		DirTTL:        *dirTTL,
@@ -115,6 +115,41 @@ func UmountCmd(args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// resolveMountCredentials selects the (server, apiKey, token) triple that a
+// fresh mount will be bound to. It locks the principal kind at mount time
+// per Invariant #3 — once this function returns, the chosen credential is
+// fixed for the mount's lifetime. An explicit --api-key flag always means
+// owner; delegated JWTs only reach this layer through the active context
+// or DRIVE9_VAULT_TOKEN (resolver output).
+//
+// Returned token is non-empty iff the resolver produced a delegated
+// credential and no --api-key flag was passed. apiKey and token are
+// mutually exclusive; exactly one is non-empty on success.
+func resolveMountCredentials(r ResolvedCredentials, flagServer, flagAPIKey string) (server, apiKey, token string, err error) {
+	server = flagServer
+	if server == "" {
+		server = r.Server
+	}
+
+	apiKey = flagAPIKey
+	if apiKey == "" {
+		switch r.Kind {
+		case CredentialOwner:
+			apiKey = r.APIKey
+		case CredentialDelegated:
+			token = r.Token
+		}
+	}
+
+	if server == "" {
+		return "", "", "", fmt.Errorf("drive9 server URL required (--server, $%s, or `drive9 ctx`)", EnvServer)
+	}
+	if apiKey == "" && token == "" {
+		return "", "", "", fmt.Errorf("owner API key or delegated token required (--api-key, $%s, $%s, or `drive9 ctx`)", EnvAPIKey, EnvVaultToken)
+	}
+	return server, apiKey, token, nil
 }
 
 func umountArgv(goos string, lookPath func(string) (string, error), mountPoint string) ([]string, error) {

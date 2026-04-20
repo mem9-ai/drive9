@@ -18,9 +18,17 @@ import (
 )
 
 // MountOptions configures the FUSE mount.
+//
+// Credential kind: APIKey and Token are mutually exclusive. APIKey is an
+// owner tenant API key (full management + data plane); Token is a delegated
+// capability JWT (read-path only). Exactly one must be non-empty at
+// Mount() time — the running mount is bound to that single credential for
+// its entire lifetime (Invariant #3). To change credentials, umount and
+// remount; there is no in-process rebind.
 type MountOptions struct {
 	Server            string        // dat9 server URL
-	APIKey            string        // dat9 API key
+	APIKey            string        // owner API key (mutually exclusive with Token)
+	Token             string        // delegated capability JWT (mutually exclusive with APIKey)
 	MountPoint        string        // local mount point
 	CacheDir          string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
 	CacheSize         int64         // ReadCache max size in bytes (default 128MB)
@@ -75,11 +83,30 @@ func Mount(opts *MountOptions) error {
 		return fmt.Errorf("create mount point: %w", err)
 	}
 
+	// Validate credential inputs. MountOptions.APIKey and MountOptions.Token
+	// are mutually exclusive (Invariant #3 — one mount, one principal).
+	// Both empty is caller error; both non-empty would let a silent
+	// priority rule override what the caller wrote, which we refuse.
+	if opts.APIKey != "" && opts.Token != "" {
+		return fmt.Errorf("mount: APIKey and Token are mutually exclusive (choose one principal kind at mount time)")
+	}
+	if opts.APIKey == "" && opts.Token == "" {
+		return fmt.Errorf("mount: either APIKey (owner) or Token (delegated) is required")
+	}
+
 	// Generate per-mount actor ID for SSE self-filtering.
 	actorID := generateMountID()
 
-	// Create client and verify connectivity
-	c := client.New(opts.Server, opts.APIKey)
+	// Create client and verify connectivity. The constructor choice binds
+	// the mount's principal kind for its entire lifetime (see Invariant #3
+	// and Invariant #6 — running mount credential change requires umount
+	// and remount).
+	var c *client.Client
+	if opts.Token != "" {
+		c = client.NewWithToken(opts.Server, opts.Token)
+	} else {
+		c = client.New(opts.Server, opts.APIKey)
+	}
 	c.SetActor(actorID)
 	if _, err := c.List("/"); err != nil {
 		return fmt.Errorf("cannot reach dat9 server: %w", err)

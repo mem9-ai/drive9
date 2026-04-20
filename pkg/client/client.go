@@ -46,8 +46,36 @@ func (e *StatusError) Is(target error) bool {
 	return target == ErrConflict && e.StatusCode == http.StatusConflict
 }
 
-// New creates a new dat9 client.
+// New creates a new dat9 client authenticated with an owner API key.
+//
+// Owner credentials reach the tenant management plane (CreateVaultSecret,
+// IssueVaultGrant, audit, etc.) as well as the data plane. Use NewWithToken
+// for delegated capability tokens; the two kinds are distinct in caller
+// capability even though both are carried as `Authorization: Bearer` on the
+// wire (server-side middleware disambiguates — see pkg/server/auth.go).
 func New(baseURL, apiKey string) *Client {
+	return newClient(baseURL, apiKey)
+}
+
+// NewWithToken creates a new dat9 client authenticated with a delegated
+// capability token (JWT). Delegated callers can only reach read-path vault
+// endpoints and the FUSE data-plane routes that capabilityAuthMiddleware
+// resolves; admin-plane endpoints will 401 server-side. Choosing the
+// constructor at the call site makes the principal kind explicit per Plan 9
+// orthogonality — a "forget to check kind" bug class doesn't get a
+// construction path.
+func NewWithToken(baseURL, token string) *Client {
+	return newClient(baseURL, token)
+}
+
+// newClient is the shared internal constructor for New and NewWithToken.
+// Both credential kinds travel as `Authorization: Bearer` on the wire, so
+// they share the same httpClient/transport wiring. Kind differentiation
+// lives at the call site (constructor name) — there is no internal
+// discriminator field. If a per-call-kind bug surfaces later, the minimal
+// fix is a discriminator; meanwhile Invariant #7 keeps all authorization
+// decisions server-side.
+func newClient(baseURL, credential string) *Client {
 	// Clone DefaultTransport to preserve Proxy, HTTP/2, dialer, and TLS defaults,
 	// then tune connection pooling for concurrent multipart uploads to S3.
 	// Default MaxIdleConnsPerHost=2 forces new TLS handshakes for every
@@ -103,7 +131,7 @@ func New(baseURL, apiKey string) *Client {
 	}
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		apiKey:  apiKey,
+		apiKey:  credential,
 		httpClient: &http.Client{
 			Transport: transport,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
