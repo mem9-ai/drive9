@@ -3,8 +3,10 @@ package fuse
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path"
 	"strings"
@@ -357,6 +359,40 @@ func expectedRevisionForHandle(fh *FileHandle) int64 {
 	return -1
 }
 
+func committedRevisionFromExpectedRevision(expectedRevision int64) (int64, bool) {
+	if expectedRevision < 0 {
+		return 0, false
+	}
+	return expectedRevision + 1, true
+}
+
+// finalizeHandleFlushLocked updates the live handle and inode cache after a
+// successful upload using the exact CAS revision that completed, when known.
+// Callers must hold fh.mu.
+func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int64) {
+	if fh == nil {
+		return
+	}
+
+	fh.IsNew = false
+	if revision, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
+		fh.BaseRev = revision
+		fs.inodes.UpdateRevision(fh.Ino, revision)
+	} else {
+		// The flush succeeded, but it was unconditional, so the precise
+		// post-commit revision is unknown. Clear the cached revision instead of
+		// keeping a known-stale positive value.
+		fh.BaseRev = 0
+		fs.inodes.UpdateRevision(fh.Ino, 0)
+	}
+	if fh.Streamer != nil {
+		fh.Streamer.ResetForNextWrite(expectedRevisionForHandle(fh))
+	}
+	if fh.ZeroBase && fh.Dirty != nil && fh.Dirty.Size() > 0 {
+		fh.ZeroBase = false
+	}
+}
+
 func (fs *Dat9FS) canStageShadowFastLocked(fh *FileHandle) bool {
 	if fs.shadowStore == nil || fs.pendingIndex == nil || fh == nil || fh.Dirty == nil {
 		return false
@@ -480,16 +516,54 @@ func httpToFuseStatus(err error) gofuse.Status {
 	if err == nil {
 		return gofuse.OK
 	}
+
+	// Prefer typed StatusError so we map by status code even when the
+	// server returns a JSON error body that doesn't contain "HTTP NNN".
+	var se *client.StatusError
+	if errors.As(err, &se) {
+		switch se.StatusCode {
+		case http.StatusNotFound:
+			return gofuse.ENOENT
+		case http.StatusConflict:
+			if strings.Contains(strings.ToLower(se.Message), "already exists") {
+				return gofuse.Status(syscall.EEXIST)
+			}
+			return gofuse.EIO
+		case http.StatusForbidden:
+			return gofuse.EACCES
+		case http.StatusRequestEntityTooLarge:
+			return gofuse.Status(syscall.EFBIG)
+		case http.StatusPreconditionFailed:
+			return gofuse.Status(syscall.ESTALE)
+		case http.StatusBadRequest:
+			return gofuse.Status(syscall.EINVAL)
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable:
+			return gofuse.Status(syscall.EAGAIN)
+		default:
+			return gofuse.EIO
+		}
+	}
+
+	// Fallback to string matching for non-StatusError errors.
 	msg := err.Error()
+	lowerMsg := strings.ToLower(msg)
 	switch {
-	case strings.Contains(msg, "not found") || strings.Contains(msg, "HTTP 404"):
+	case strings.Contains(lowerMsg, "not found") || strings.Contains(msg, "HTTP 404"):
 		return gofuse.ENOENT
-	case strings.Contains(msg, "HTTP 409") || strings.Contains(msg, "already exists"):
+	case strings.Contains(lowerMsg, "already exists"):
 		return gofuse.Status(syscall.EEXIST)
 	case strings.Contains(msg, "HTTP 403"):
 		return gofuse.EACCES
 	case strings.Contains(msg, "HTTP 413"):
 		return gofuse.Status(syscall.EFBIG)
+	case strings.Contains(msg, "HTTP 412"):
+		return gofuse.Status(syscall.ESTALE)
+	case strings.Contains(msg, "HTTP 400"):
+		return gofuse.Status(syscall.EINVAL)
+	case strings.Contains(msg, "HTTP 500") ||
+		strings.Contains(msg, "HTTP 502") ||
+		strings.Contains(msg, "HTTP 503"):
+		return gofuse.Status(syscall.EAGAIN)
 	default:
 		return gofuse.EIO
 	}
@@ -1099,6 +1173,7 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 		defer cf()
 		entries, err := fs.listDir(ctx, dh.Path)
 		if err != nil {
+			log.Printf("list dir failed for %s: %v", dh.Path, err)
 			return httpToFuseStatus(err)
 		}
 		dh.Entries = entries
@@ -1129,6 +1204,7 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 		defer cf()
 		entries, err := fs.listDir(ctx, dh.Path)
 		if err != nil {
+			log.Printf("list dir plus failed for %s: %v", dh.Path, err)
 			return httpToFuseStatus(err)
 		}
 		dh.Entries = entries
@@ -1996,17 +2072,26 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	ino := fh.Ino
 	handle := fh               // capture for goroutine
 	snapshotSeq := fh.DirtySeq // capture current dirty sequence
+	expectedRevision := expectedRevisionForHandle(fh)
 
 	fs.debouncer.Schedule(filePath, func() {
+		handle.Lock()
+		if handle.Dirty == nil || handle.DirtySeq != snapshotSeq {
+			handle.Unlock()
+			return
+		}
+
 		dCtx, dCf := context.WithTimeout(context.Background(), fuseTimeout)
-		defer dCf()
-		if err := fs.client.WriteCtx(dCtx, filePath, data); err != nil {
+		err := fs.client.WriteCtxConditional(dCtx, filePath, data, expectedRevision)
+		dCf()
+		if err != nil {
+			handle.Unlock()
 			log.Printf("debounced flush failed for %s: %v", filePath, err)
 			return
 		}
-		// Only clear dirty if no writes occurred since the snapshot was taken.
-		// If DirtySeq changed, the buffer has new data that wasn't uploaded.
-		handle.Lock()
+		// The handle stays locked across upload + finalize so concurrent writes
+		// cannot advance live state for data outside this committed snapshot.
+		fs.finalizeHandleFlushLocked(handle, expectedRevision)
 		if handle.Dirty != nil && handle.DirtySeq == snapshotSeq {
 			handle.Dirty.ClearDirty()
 		}
@@ -2046,6 +2131,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	// This path is used for large sequential writes (cp, dd, ffmpeg).
 	// Only the final partial part and any dirty (back-written) parts need uploading.
 	if fh.Streamer != nil && fh.Streamer.HasStreamedParts() {
+		expectedRevision := fh.Streamer.ExpectedRevision()
 		partSize := fh.Dirty.PartSize()
 		numParts := int((size + partSize - 1) / partSize)
 		lastPartNum := numParts // 1-based
@@ -2079,6 +2165,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fh.Lock()
 
 		if err != nil {
+			log.Printf("finish streaming failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 
@@ -2088,6 +2175,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fs.readCache.Invalidate(fh.Path)
 		fs.dirCache.Invalidate(parentDir(fh.Path))
 		fs.inodes.UpdateSize(fh.Ino, size)
+		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		fs.notifyInode(fh.Ino)
 		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
 		fs.notifyInode(parentIno)
@@ -2097,6 +2185,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	// Path 1b: Large new file with streaming uploader but no streaming parts
 	// (non-sequential writes) — upload all parts in parallel at flush time.
 	if fh.Streamer != nil && size >= smallFileThreshold {
+		expectedRevision := fh.Streamer.ExpectedRevision()
 		numParts := int((size + fh.Dirty.PartSize() - 1) / fh.Dirty.PartSize())
 		partSnapshots := make(map[int][]byte, numParts)
 		for pn := 1; pn <= numParts; pn++ {
@@ -2116,6 +2205,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fh.Lock()
 
 		if err != nil {
+			log.Printf("upload all parts failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
 
@@ -2125,6 +2215,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fs.readCache.Invalidate(fh.Path)
 		fs.dirCache.Invalidate(parentDir(fh.Path))
 		fs.inodes.UpdateSize(fh.Ino, size)
+		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		fs.notifyInode(fh.Ino)
 		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
 		fs.notifyInode(parentIno)
@@ -2133,10 +2224,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 
 	// Path 2: No streaming uploader or small file — materialize all data for upload.
 	data := fh.Dirty.Bytes()
+	expectedRevision := expectedRevisionForHandle(fh)
 
 	if size < smallFileThreshold {
 		// Small file: direct PUT.
-		err = fs.client.WriteCtxConditional(ctx, fh.Path, data, expectedRevisionForHandle(fh))
+		err = fs.client.WriteCtxConditional(ctx, fh.Path, data, expectedRevision)
 	} else if fh.OrigSize >= smallFileThreshold {
 		dirtyParts := fh.Dirty.DirtyPartNumbers()
 		if len(dirtyParts) > 0 {
@@ -2162,7 +2254,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 				},
 				nil,
 				client.WithPartSize(fh.Dirty.PartSize()),
-				client.WithExpectedRevision(expectedRevisionForHandle(fh)),
+				client.WithExpectedRevision(expectedRevision),
 			)
 		}
 		// If no dirty parts, nothing changed — skip upload.
@@ -2174,10 +2266,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 			bytes.NewReader(data),
 			size,
 			nil,
-			expectedRevisionForHandle(fh),
+			expectedRevision,
 		)
 	}
 	if err != nil {
+		log.Printf("flush upload failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
 	}
 
@@ -2187,6 +2280,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	fs.readCache.Invalidate(fh.Path)
 	fs.dirCache.Invalidate(parentDir(fh.Path))
 	fs.inodes.UpdateSize(fh.Ino, size)
+	fs.finalizeHandleFlushLocked(fh, expectedRevision)
 	// Invalidate kernel attr/data cache for this inode and parent dir listing.
 	fs.notifyInode(fh.Ino)
 	parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
