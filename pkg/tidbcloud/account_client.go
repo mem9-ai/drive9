@@ -14,10 +14,12 @@ import (
 	"github.com/mem9-ai/dat9/pkg/logger"
 )
 
-// AccountClient abstracts calls to TiDB Cloud Account service for authorization.
+// AccountClient abstracts calls to TiDB Cloud Account service for authentication.
 type AccountClient interface {
-	// Authorize verifies the request's auth context has permission to operate
-	// the given cluster. Returns the authenticated org ID on success.
+	// Authorize authenticates the request and returns the caller's org ID.
+	// It does NOT perform cluster-level authorization; callers (e.g.
+	// tidbcloudnative.Provisioner.Authorize) must verify that the returned
+	// orgID matches the target cluster's org via GetClusterInfo.
 	// Returns ErrAuthMissing if no credentials are found in the request.
 	// Returns ErrAuthForbidden if credentials are valid but lack permission.
 	Authorize(ctx context.Context, r *http.Request, clusterID string) (orgID uint64, err error)
