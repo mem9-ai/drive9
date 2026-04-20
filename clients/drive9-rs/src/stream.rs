@@ -123,7 +123,7 @@ impl StreamWriter {
         state.inflight += 1;
         drop(state);
 
-        let _permit = self.sem.acquire().await.unwrap();
+        let permit = self.sem.acquire().await.unwrap();
         let client = self.client.clone();
         let data = data.clone();
         let upload_id = plan.upload_id;
@@ -132,6 +132,7 @@ impl StreamWriter {
         // The caller must later call complete()/abort() which wait for inflight.
         let this_state = std::sync::Arc::clone(&self.state);
         tokio::spawn(async move {
+            let _permit = permit;
             let result = async {
                 let pp = client.presign_one_part(&upload_id, part_num).await?;
                 let etag = client.upload_one_part_v2(&upload_id, &pp, &data).await?;
