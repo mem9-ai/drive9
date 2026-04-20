@@ -150,22 +150,6 @@ func TestCreateServiceUserViaProxy_InvalidPassword(t *testing.T) {
 }
 
 func TestCreateServiceUserViaProxy_WithAuth0Token(t *testing.T) {
-	// Mock Auth0 token endpoint.
-	auth0Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/oauth/token" {
-			t.Fatalf("auth0: unexpected %s %s", r.Method, r.URL.Path)
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"access_token":"test-jwt-token"}`))
-	}))
-	defer auth0Srv.Close()
-	// Strip "https://" — getAuth0ClientToken prepends it, so use the httptest
-	// host directly via http (the test helper already listens on http).
-	// We override the scheme by using the full URL as the domain which will
-	// result in "https://127.0.0.1:PORT" — but httptest uses http. Instead,
-	// start a TLS server or adjust. For simplicity, test that the Authorization
-	// header IS set by capturing it at the proxy side.
-
 	var gotAuthHeader string
 	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuthHeader = r.Header.Get("Authorization")
@@ -174,17 +158,34 @@ func TestCreateServiceUserViaProxy_WithAuth0Token(t *testing.T) {
 	}))
 	defer proxySrv.Close()
 
-	// Use a TLS auth0 server so the https:// prefix works.
+	// TLS auth0 mock that validates the request.
 	auth0TLS := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("auth0: method=%s, want POST", r.Method)
+		}
+		if r.URL.Path != "/oauth/token" {
+			t.Fatalf("auth0: path=%s, want /oauth/token", r.URL.Path)
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "application/x-www-form-urlencoded" {
+			t.Fatalf("auth0: content-type=%s, want application/x-www-form-urlencoded", ct)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("auth0: parse form: %v", err)
+		}
+		if got := r.FormValue("grant_type"); got != "client_credentials" {
+			t.Fatalf("auth0: grant_type=%q, want client_credentials", got)
+		}
+		if got := r.FormValue("client_id"); got != "test-client-id" {
+			t.Fatalf("auth0: client_id=%q, want test-client-id", got)
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"access_token":"test-jwt-token"}`))
 	}))
 	defer auth0TLS.Close()
 
-	// Extract host:port from the TLS server URL (strip "https://").
 	auth0Domain := auth0TLS.URL[len("https://"):]
 
-	// Inject the test TLS client so the token request succeeds.
+	// Override default transport so the TLS cert is trusted.
 	origTransport := http.DefaultTransport
 	http.DefaultTransport = auth0TLS.Client().Transport
 	defer func() { http.DefaultTransport = origTransport }()

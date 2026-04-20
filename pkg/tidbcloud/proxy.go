@@ -104,7 +104,7 @@ func CreateServiceUserViaProxy(ctx context.Context, proxyEndpoint string, cluste
 	req.Header.Set("Content-Type", "application/json")
 
 	// Attach Auth0 JWT if configured.
-	if auth0Cfg != nil && auth0Cfg.Domain != "" && auth0Cfg.ClientID != "" && auth0Cfg.ClientSecret != "" {
+	if auth0Cfg != nil && auth0Cfg.Domain != "" && auth0Cfg.ClientID != "" && auth0Cfg.ClientSecret != "" && auth0Cfg.Audience != "" {
 		token, err := getAuth0ClientToken(ctx, auth0Cfg)
 		if err != nil {
 			return fmt.Errorf("create service user: get auth0 token: %w", err)
@@ -193,7 +193,8 @@ func getAuth0ClientToken(ctx context.Context, cfg *ProxyAuth0Config) (string, er
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := http.DefaultClient.Do(req)
+	auth0Client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := auth0Client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("auth0 token request: %w", err)
 	}

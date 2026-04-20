@@ -277,11 +277,23 @@ func main() {
 			// (suitable for dev/staging where Auth0 is disabled on the proxy).
 			var auth0Cfg *tidbcloud.ProxyAuth0Config
 			if d := os.Getenv("DRIVE9_PROXY_AUTH0_DOMAIN"); d != "" {
+				clientID := os.Getenv("DRIVE9_PROXY_AUTH0_CLIENT_ID")
+				if clientID == "" {
+					die(fmt.Errorf("DRIVE9_PROXY_AUTH0_CLIENT_ID is required when DRIVE9_PROXY_AUTH0_DOMAIN is set"))
+				}
+				clientSecret := os.Getenv("DRIVE9_PROXY_AUTH0_CLIENT_SECRET")
+				if clientSecret == "" {
+					die(fmt.Errorf("DRIVE9_PROXY_AUTH0_CLIENT_SECRET is required when DRIVE9_PROXY_AUTH0_DOMAIN is set"))
+				}
+				audience := os.Getenv("DRIVE9_PROXY_AUTH0_AUDIENCE")
+				if audience == "" {
+					die(fmt.Errorf("DRIVE9_PROXY_AUTH0_AUDIENCE is required when DRIVE9_PROXY_AUTH0_DOMAIN is set"))
+				}
 				auth0Cfg = &tidbcloud.ProxyAuth0Config{
 					Domain:       d,
-					ClientID:     os.Getenv("DRIVE9_PROXY_AUTH0_CLIENT_ID"),
-					ClientSecret: os.Getenv("DRIVE9_PROXY_AUTH0_CLIENT_SECRET"),
-					Audience:     os.Getenv("DRIVE9_PROXY_AUTH0_AUDIENCE"),
+					ClientID:     clientID,
+					ClientSecret: clientSecret,
+					Audience:     audience,
 				}
 			}
 
