@@ -14,10 +14,9 @@ import (
 type mockAccountClient struct {
 	accountpb.AccountAPIServiceClient // embed to satisfy the full interface
 
-	getUserByTokenFn           func(ctx context.Context, in *accountpb.GetUserByTokenRequest, opts ...grpc.CallOption) (*accountpb.GetUserByTokenResponse, error)
-	listOrgsByUserFn           func(ctx context.Context, in *accountpb.ListOrgsByUserRequest, opts ...grpc.CallOption) (*accountpb.ListOrgsByUserResponse, error)
-	getApiKeyByAccessKeyFn     func(ctx context.Context, in *accountpb.GetApiKeyByAccessKeyReq, opts ...grpc.CallOption) (*accountpb.GetApiKeyByAccessKeyRsp, error)
-	verifyUserOrgAndProjectsFn func(ctx context.Context, in *accountpb.VerifyUserOrgAndProjectsReq, opts ...grpc.CallOption) (*accountpb.VerifyUserOrgAndProjectsResp, error)
+	getUserByTokenFn       func(ctx context.Context, in *accountpb.GetUserByTokenRequest, opts ...grpc.CallOption) (*accountpb.GetUserByTokenResponse, error)
+	listOrgsByUserFn       func(ctx context.Context, in *accountpb.ListOrgsByUserRequest, opts ...grpc.CallOption) (*accountpb.ListOrgsByUserResponse, error)
+	getApiKeyByAccessKeyFn func(ctx context.Context, in *accountpb.GetApiKeyByAccessKeyReq, opts ...grpc.CallOption) (*accountpb.GetApiKeyByAccessKeyRsp, error)
 }
 
 func (m *mockAccountClient) GetUserByToken(ctx context.Context, in *accountpb.GetUserByTokenRequest, opts ...grpc.CallOption) (*accountpb.GetUserByTokenResponse, error) {
@@ -30,10 +29,6 @@ func (m *mockAccountClient) ListOrgsByUser(ctx context.Context, in *accountpb.Li
 
 func (m *mockAccountClient) GetApiKeyByAccessKey(ctx context.Context, in *accountpb.GetApiKeyByAccessKeyReq, opts ...grpc.CallOption) (*accountpb.GetApiKeyByAccessKeyRsp, error) {
 	return m.getApiKeyByAccessKeyFn(ctx, in, opts...)
-}
-
-func (m *mockAccountClient) VerifyUserOrgAndProjects(ctx context.Context, in *accountpb.VerifyUserOrgAndProjectsReq, opts ...grpc.CallOption) (*accountpb.VerifyUserOrgAndProjectsResp, error) {
-	return m.verifyUserOrgAndProjectsFn(ctx, in, opts...)
 }
 
 func TestAuthorize_OAuthToken_Success(t *testing.T) {
@@ -53,12 +48,6 @@ func TestAuthorize_OAuthToken_Success(t *testing.T) {
 			return &accountpb.ListOrgsByUserResponse{
 				Orgs: []*accountpb.Org{{Id: 200}},
 			}, nil
-		},
-		verifyUserOrgAndProjectsFn: func(_ context.Context, in *accountpb.VerifyUserOrgAndProjectsReq, _ ...grpc.CallOption) (*accountpb.VerifyUserOrgAndProjectsResp, error) {
-			if in.UserId != 100 || in.OrgId != 200 {
-				t.Fatalf("unexpected verify params: user=%d org=%d", in.UserId, in.OrgId)
-			}
-			return &accountpb.VerifyUserOrgAndProjectsResp{Result: true}, nil
 		},
 	}
 
@@ -93,9 +82,6 @@ func TestAuthorize_OAuthToken_Fallback(t *testing.T) {
 				Orgs: []*accountpb.Org{{Id: 200}},
 			}, nil
 		},
-		verifyUserOrgAndProjectsFn: func(_ context.Context, in *accountpb.VerifyUserOrgAndProjectsReq, _ ...grpc.CallOption) (*accountpb.VerifyUserOrgAndProjectsResp, error) {
-			return &accountpb.VerifyUserOrgAndProjectsResp{Result: true}, nil
-		},
 	}
 
 	client := NewGRPCAccountClient(mock)
@@ -123,12 +109,6 @@ func TestAuthorize_APIKey_Success(t *testing.T) {
 					{ScopeType: "ORG", ResourceId: 400},
 				},
 			}, nil
-		},
-		verifyUserOrgAndProjectsFn: func(_ context.Context, in *accountpb.VerifyUserOrgAndProjectsReq, _ ...grpc.CallOption) (*accountpb.VerifyUserOrgAndProjectsResp, error) {
-			if in.UserId != 300 || in.OrgId != 400 {
-				t.Fatalf("unexpected verify params: user=%d org=%d", in.UserId, in.OrgId)
-			}
-			return &accountpb.VerifyUserOrgAndProjectsResp{Result: true}, nil
 		},
 	}
 
@@ -246,37 +226,6 @@ func TestAuthorize_OAuthToken_NoOrgs(t *testing.T) {
 	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
 		t.Fatal("expected error for user with no orgs")
-	}
-	if !errors.Is(err, ErrAuthForbidden) {
-		t.Fatalf("expected ErrAuthForbidden, got: %v", err)
-	}
-}
-
-func TestAuthorize_OAuthToken_VerifyFails(t *testing.T) {
-	mock := &mockAccountClient{
-		getUserByTokenFn: func(_ context.Context, _ *accountpb.GetUserByTokenRequest, _ ...grpc.CallOption) (*accountpb.GetUserByTokenResponse, error) {
-			return &accountpb.GetUserByTokenResponse{
-				User: &accountpb.User{Id: 100, Status: accountpb.UserStatus_USER_STATUS_ACTIVE},
-			}, nil
-		},
-		listOrgsByUserFn: func(_ context.Context, _ *accountpb.ListOrgsByUserRequest, _ ...grpc.CallOption) (*accountpb.ListOrgsByUserResponse, error) {
-			return &accountpb.ListOrgsByUserResponse{
-				Orgs: []*accountpb.Org{{Id: 200}},
-			}, nil
-		},
-		verifyUserOrgAndProjectsFn: func(_ context.Context, _ *accountpb.VerifyUserOrgAndProjectsReq, _ ...grpc.CallOption) (*accountpb.VerifyUserOrgAndProjectsResp, error) {
-			return &accountpb.VerifyUserOrgAndProjectsResp{Result: false}, nil
-		},
-	}
-
-	client := NewGRPCAccountClient(mock)
-	r, _ := http.NewRequest("GET", "/", nil)
-	r.Header.Set("X-Auth-Method", "bear")
-	r.Header.Set("X-Auth-Raw", "Bearer some-token")
-
-	_, err := client.Authorize(context.Background(), r, "cluster-1")
-	if err == nil {
-		t.Fatal("expected error for failed verify")
 	}
 	if !errors.Is(err, ErrAuthForbidden) {
 		t.Fatalf("expected ErrAuthForbidden, got: %v", err)
