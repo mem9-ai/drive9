@@ -334,7 +334,7 @@ async function initiateUploadV2(
   const resp = await fetch(`${client.baseUrl}/v2/uploads/initiate`, {
     method: "POST",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ path, size, expected_revision: expectedRevision }),
+    body: JSON.stringify({ path, total_size: size, expected_revision: expectedRevision }),
   });
   if (resp.status === 404) {
     throw new Drive9Error("v2 upload API not available");
