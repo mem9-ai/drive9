@@ -51,6 +51,7 @@ class PatchMixin:
             headers={"Content-Type": "application/json"},
         )
         if resp.status_code != 202:
+            self._check_error(resp)
             raise StatusError(
                 resp.text,
                 status_code=resp.status_code,
