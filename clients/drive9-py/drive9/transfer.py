@@ -59,6 +59,7 @@ def _compute_part_checksums(file_obj, total_size: int, part_size: int) -> list:
     checksums = [None] * len(parts)
     first_err = None
     err_lock = threading.Lock()
+    file_lock = threading.Lock()
 
     def worker(chunk_indices):
         nonlocal first_err
@@ -68,8 +69,9 @@ def _compute_part_checksums(file_obj, total_size: int, part_size: int) -> list:
                 return
             p = parts[idx]
             offset = (p["number"] - 1) * part_size
-            file_obj.seek(offset)
-            n = file_obj.readinto(buf)
+            with file_lock:
+                file_obj.seek(offset)
+                n = file_obj.readinto(buf)
             if n != p["size"]:
                 with err_lock:
                     if first_err is None:
@@ -315,11 +317,13 @@ class TransferMixin:
         if std_part_size <= 0:
             std_part_size = _PART_SIZE
         max_concurrency = _upload_parallelism(std_part_size)
+        file_lock = threading.Lock()
 
         def upload_one(part: PartURL):
             offset = (part.number - 1) * std_part_size
-            file_obj.seek(offset)
-            data = file_obj.read(part.size)
+            with file_lock:
+                file_obj.seek(offset)
+                data = file_obj.read(part.size)
             if len(data) != part.size:
                 raise Drive9Error(
                     f"short read for part {part.number}: got {len(data)} want {part.size}"
@@ -422,11 +426,13 @@ class TransferMixin:
             presigned.extend(batch)
 
         results = [None] * total_parts
+        file_lock = threading.Lock()
 
         def upload_one(pp: dict):
             offset = (pp["number"] - 1) * part_size
-            file_obj.seek(offset)
-            data = file_obj.read(pp["size"])
+            with file_lock:
+                file_obj.seek(offset)
+                data = file_obj.read(pp["size"])
             if len(data) != pp["size"]:
                 raise Drive9Error(
                     f"short read for part {pp['number']}: got {len(data)} want {pp['size']}"
@@ -581,11 +587,13 @@ class TransferMixin:
         if std_part_size <= 0:
             std_part_size = _PART_SIZE
         max_concurrency = _upload_parallelism(std_part_size)
+        file_lock = threading.Lock()
 
         def upload_one(part: PartURL):
             offset = (part.number - 1) * std_part_size
-            file_obj.seek(offset)
-            data = file_obj.read(part.size)
+            with file_lock:
+                file_obj.seek(offset)
+                data = file_obj.read(part.size)
             if len(data) != part.size:
                 raise Drive9Error(
                     f"short read for part {part.number}: got {len(data)} want {part.size}"
