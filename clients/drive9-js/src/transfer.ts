@@ -211,8 +211,8 @@ async function writeStreamV2(
   expectedRevision: number
 ): Promise<void> {
   const plan = await initiateUploadV2(client, path, data.length, expectedRevision);
-  const parts = await uploadPartsV2(client, plan, data);
   try {
+    const parts = await uploadPartsV2(client, plan, data);
     await completeUploadV2(client, plan.upload_id, parts);
   } catch (err) {
     await abortUploadV2(client, plan.upload_id);
