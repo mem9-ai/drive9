@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -18,7 +17,8 @@ import (
 // See migration call-out #4 in the impl PR body.
 func Create(args []string) error {
 	name := ""
-	server := os.Getenv("DRIVE9_SERVER")
+	serverFlag := ""
+	serverFlagGiven := false
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -33,17 +33,28 @@ func Create(args []string) error {
 				return fmt.Errorf("--server requires an argument")
 			}
 			i++
-			server = args[i]
+			serverFlag = args[i]
+			serverFlagGiven = true
 		default:
 			return fmt.Errorf("unknown flag %q\nusage: drive9 create [--name NAME] [--server URL]", args[i])
 		}
 	}
 
-	cfg := loadConfig()
-
-	if server == "" {
-		server = cfg.ResolveServer()
+	if err := rejectEmptyFlag("server", serverFlag, serverFlagGiven); err != nil {
+		return err
 	}
+
+	// Precedence per §14.2: explicit --server flag > DRIVE9_SERVER env > config.
+	// ResolveCredentials consumes the env var (Unsetenv mitigation), so even when
+	// the flag wins we still sink the env to keep downstream forks from inheriting
+	// it. Credential resolution is not used here — provisioning is unauthenticated.
+	r := ResolveCredentials()
+	server := serverFlag
+	if server == "" {
+		server = r.Server
+	}
+
+	cfg := loadConfig()
 
 	if name == "" {
 		name = randomName()

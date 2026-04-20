@@ -393,24 +393,30 @@ The **dual-principal separation is locked**: there is no single combined variabl
 
 Credential resolution (first match wins):
 
-1. `DRIVE9_VAULT_TOKEN` (narrower — delegated)
-2. `DRIVE9_API_KEY` (broader — owner)
-3. Active context in `~/.drive9/config`
+1. Explicit CLI flag (`--api-key`, etc., where the verb accepts one)
+2. `DRIVE9_VAULT_TOKEN` (narrower — delegated)
+3. `DRIVE9_API_KEY` (broader — owner)
+4. Active context in `~/.drive9/config`
 
-Rule 1 vs 2 implements narrower-wins so that a scoped token never falls back to owner authority within the env channel. Rule 3 means the active context only applies when no env override is present.
+Rules 2 vs 3 implement narrower-wins so that a scoped token never falls back to owner authority within the env channel. Rule 4 means the active context only applies when no flag or env override is present.
+
+**Explicit-empty flag values are rejected at parse time.** `--api-key=""` (or `--server=""`) MUST fail with a client-side error before any credential resolution runs. Treating an explicit empty string as "unset and fall through" would reintroduce the same silent-fallthrough class the set-but-invalid rule below closes — named, empty, and missing are three distinct states, and the only safe handling for "named-but-empty" is to refuse.
 
 A set-but-invalid `DRIVE9_VAULT_TOKEN` (malformed, expired, revoked, or signed by an unknown issuer) fails as `EACCES` via the standard stale-auth path in §11. It **MUST NOT** fall through to `DRIVE9_API_KEY` or to the active context — "first match wins" is token-presence, not token-validity. Users who want the broader owner authority must unset `DRIVE9_VAULT_TOKEN` explicitly.
 
 Server URL resolution is **orthogonal** to credential resolution:
 
-1. `DRIVE9_SERVER` (if set)
-2. The `server` field of the active context
+1. Explicit `--server` flag
+2. `DRIVE9_SERVER`
+3. The `server` field of the active context
 
 `ctx use` does **not** lock server and credential together: if `DRIVE9_SERVER` is set, it overrides the context's `server` field even when the active context is used for credentials. If the resulting (server, credential) pair is mismatched (e.g. a JWT signed by a different issuer), the server rejects the request with `EACCES` via the standard stale-auth path (§11). No new error model is introduced.
 
 ### 14.3 Activation mechanics
 
 At most one credential is bound to a mount. When both env overrides and an active context exist, the env override wins. This is a mechanism detail, not a second authorization layer — the chosen credential is then validated by the server on every request (Invariant #7).
+
+**Unsetenv-after-read (mitigation).** After the credential resolver reads `DRIVE9_VAULT_TOKEN`, `DRIVE9_API_KEY`, and `DRIVE9_SERVER`, it **MUST** unset those variables in the current process before spawning any child (e.g. `secret exec`, subprocesses invoked by CLI verbs). This prevents a drive9 invocation from leaking the caller's credential into a descendant process through `/proc/<pid>/environ` or through `os.Environ()` propagation. Callers that explicitly need a child to see a drive9 credential must re-inject it through the child's declared ingress (a file, a `--token` argument the child accepts, or its own env lookup before spawning drive9). This rule applies even when another credential "won" priority — all three variables are always sunk, regardless of which one was consumed, to avoid stranded leakable values.
 
 ## 15. Grant → Context Flow (End-to-End)
 
