@@ -30,9 +30,28 @@ def _checksum_parallelism(part_size: int, part_count: int) -> int:
     return min(part_count, by_memory)
 
 
+def _make_crc32c_table():
+    table = [0] * 256
+    for i in range(256):
+        crc = i
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0x82F63B78
+            else:
+                crc >>= 1
+        table[i] = crc
+    return table
+
+
+_CRC32C_TABLE = _make_crc32c_table()
+
+
 def _compute_crc32c(data: bytes) -> str:
-    v = zlib.crc32(data, 0xFFFFFFFF) & 0xFFFFFFFF
-    b = struct.pack(">I", v)
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc = _CRC32C_TABLE[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    crc = (~crc) & 0xFFFFFFFF
+    b = struct.pack(">I", crc)
     return base64.b64encode(b).decode("ascii")
 
 
