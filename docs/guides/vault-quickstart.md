@@ -110,7 +110,7 @@ expires_at: 2026-04-18T19:00:00Z
 
 Send the whole block to Alice over a secure channel (email with a password-protected attachment, password manager share, Signal, etc.). Alice will save the JWT to a file and pipe it into `ctx import` (see Part 3). The JWT is displayed once and is not re-fetchable — if it is lost, issue a new grant.
 
-Avoid distributing the JWT as a copyable one-liner (`drive9 ctx import <jwt>`). That form is valid (see Part 3) but records the token in the delegatee's shell history and process argument list.
+Distribute the JWT as a file attachment or as piped input — never as a positional argument to a shell command. The positional form (`drive9 ctx import <jwt>`) is not accepted; it was removed because a runtime warning cannot unexpose a secret that has already reached shell history and `/proc/<pid>/cmdline`.
 
 ### Script-friendly output
 
@@ -169,7 +169,7 @@ pbpaste | drive9 ctx import --from-file -
 
 Either form writes a **delegated** context to Alice's `~/.drive9/config`. The JWT is decoded locally; no server round-trip is required. If the token is already expired, import is refused immediately. The JWT never lands in shell history or `/proc/<pid>/cmdline`.
 
-`drive9 ctx import <jwt>` (positional) also works, but it will be recorded in shell history. Use it only for scripting and testing.
+When stdin is a pipe (`isatty(0) == false`), `drive9 ctx import` with no arguments reads the JWT from stdin by default — the explicit `--from-file -` form is accepted for scripts that want the intent to be unambiguous. When stdin is a TTY and no flag is given, `ctx import` exits with a one-line help pointing at the canonical forms.
 
 ### 2. Activate and mount
 
