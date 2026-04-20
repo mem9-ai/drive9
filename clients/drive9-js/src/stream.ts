@@ -123,12 +123,11 @@ export class StreamWriter {
     if (this.state.aborted) {
       throw new Drive9Error("stream writer already aborted");
     }
-    this.state.closing = true;
-
     if (finalPartData.length > 0) {
       await this.writePart(finalPartNum, finalPartData);
     }
 
+    this.state.closing = true;
     await this.waitInflight();
 
     if (!this.state.started || !this.state.plan) {
