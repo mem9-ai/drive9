@@ -101,7 +101,7 @@ class StreamWriter:
                 etag = self._client._upload_one_part_v2(plan["upload_id"], pp, buf)
                 with self._mu:
                     self._uploaded[part_num] = {"number": part_num, "etag": etag}
-            except (requests.RequestException, OSError) as exc:
+            except Exception as exc:
                 self._set_error(Drive9Error(f"upload part {part_num}: {exc}"))
             finally:
                 with self._mu:
