@@ -24,7 +24,7 @@ PR-B is the **CLI side** of the grant → context flow: the verbs that take a JW
 **Explicitly deferred to later PRs:**
 - Env-var resolution (`DRIVE9_VAULT_TOKEN` / `DRIVE9_API_KEY` / `DRIVE9_SERVER`) → **PR-C**
 - Legacy `cap_token` / `CapTokenClaims` / `vault_tokens` table deletion → **PR-E** (§10 deletion contract, binding)
-- Mount-layer credential re-binding (`drive9 vault reauth`, Invariant #6) → **PR-D**
+- Mount-layer credential consume (delegated JWT in `cmd/drive9/cli/mount.go` resolver path, Invariant #6) → **PR-D**. An in-process `drive9 vault reauth` verb was originally scoped here and has been deferred post-M1 (#302); M1 rebind path is `umount + mount` (see `vault-interaction-end-state.md` §12, §17).
 - Any issuer allow-list hardening beyond trust-on-first-use → follow-up (§13.3 issuer trust note)
 
 ### Non-goals
@@ -219,7 +219,7 @@ switched to context "owner-prod"
   owner credentials, server https://drive9.dev
 ```
 
-**Invariant #6 (no auto-rebind):** `ctx use` does **no** FUSE-side work. It only rewrites `~/.drive9/config`. Running mounts continue to hold whatever credential they were bound to at mount time; the only way to rebind is `drive9 vault reauth` (PR-D). This is enforced structurally by `ctx use` not depending on any mount-manager package.
+**Invariant #6 (no auto-rebind):** `ctx use` does **no** FUSE-side work. It only rewrites `~/.drive9/config`. Running mounts continue to hold whatever credential they were bound to at mount time; the only way to rebind in M1 is `umount` + `mount` again (see `vault-interaction-end-state.md` §12, §17). A `drive9 vault reauth` verb was considered for in-process rebind and deferred post-M1 (#302). This is enforced structurally by `ctx use` not depending on any mount-manager package.
 
 ### 2.5 `drive9 ctx rm <name>`
 
@@ -535,7 +535,7 @@ See `docs/specs/pr-b-review-checklist.md`. Each item is traceable to a numbered 
 | `DRIVE9_VAULT_TOKEN` env var resolution | PR-C | Per `pr-a-jwt-implementation.md` line 31, env vars are a separate concern. Folding them here doubles the review surface. |
 | `DRIVE9_API_KEY` env var resolution | PR-C | Same. |
 | `DRIVE9_SERVER` env var resolution | PR-C | Same. |
-| `drive9 vault reauth` (mount rebind) | PR-D | Mount-layer work; depends on FUSE manager refactor that is not in PR-B. |
+| `drive9 vault reauth` (in-process mount rebind) | post-M1 (#302) | Originally scoped to PR-D; descoped per qiffang directive `06f1cd95` to keep M1 as a minimal Unix/Plan 9-shaped prototype. M1 rebind path is `umount + mount` (see `vault-interaction-end-state.md` §12, §17). |
 | `CapToken*` / `vault_tokens` deletion | PR-E | §10 deletion contract is binding. PR-B adds **zero** references to legacy types. |
 | Issuer allow-list / `--expect-issuer` | future hardening | Out of scope per end-state §13.3 trust note. |
 | `drive9 ctx` bare-form removal | separate UX-cleanup PR | Non-spec compat carry-over, noted in §4.5. |
