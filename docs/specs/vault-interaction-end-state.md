@@ -41,11 +41,7 @@ printf '%s' 'super-secret-password'              > ./prod-db.envdir/DB_PASSWORD
 drive9 vault put /n/vault/prod-db --from ./prod-db.envdir
 ```
 
-Whole-replace (delete keys not present in the source directory):
-
-```bash
-drive9 vault put /n/vault/prod-db --from ./prod-db.envdir --prune
-```
+`put` is defined as **wholesale replace**: the secret's visible key set after the call equals the key set in `<dir>`. Keys that exist server-side but are absent from `<dir>` are deleted; keys present in `<dir>` are written. There is exactly one mode — no merge/upsert flag, no `--prune` flag. Incremental edits use the data-plane (§3 `printf >` / §5 `rm`).
 
 Contract: `put` is a single transaction; concurrent readers see either the old complete state or the new complete state, never a half-update.
 
@@ -522,7 +518,7 @@ The three local short-circuits (`ctx import` / `ctx ls` / `ctx use`) are client-
 
 ## 18. Invariants (Normative, numbered)
 
-1. **Atomic `put --prune`**: a put transaction is visible to concurrent readers either entirely in the old state or entirely in the new state; no half-update is observable.
+1. **Atomic `put`**: a put transaction is visible to concurrent readers either entirely in the old state or entirely in the new state; no half-update is observable. `put` has exactly one mode (wholesale replace, §2).
 2. **Existence oracle defense**: reads return `ENOENT` for both non-existent and invisible keys; the two are indistinguishable to clients.
 3. **One mount, one principal**: a mount is bound to exactly one credential at mount time; stale/revoked credentials do not silently fall back to any other identity.
 4. **Field names are sensitive metadata**: key names are not disclosed via errno, audit (to the delegatee), or listing unless the principal has permission.
@@ -540,7 +536,7 @@ The three local short-circuits (`ctx import` / `ctx ls` / `ctx use`) are client-
 | FUSE daemon crash | kernel | `EIO` |
 | Malformed JWT at `ctx import` | client local decode | command error, no context written |
 | Import of wrong credential kind (owner JWT, random string) | client local decode | command error, directing user to `ctx add --api-key` |
-| Concurrent `put --prune` reads during transaction | server transaction | atomic — readers see old or new (Invariant #1) |
+| Concurrent `put` reads during transaction | server transaction | atomic — readers see old or new (Invariant #1) |
 
 ## 20. I/O Contracts (CLI Emit Surface, Normative)
 
@@ -630,6 +626,33 @@ Every verb that documents a pipe or composition pattern (`A | B`, `A | xargs B`)
 
 ---
 
+## Implementation status
+
+The table below tracks whether each Appendix A verb is live on `main`. It is the single source of truth that reviewers use to decide when `Status: Proposed` may flip to `Accepted` (see header): the flip happens only once every row in the `drive9 vault` / `drive9 mount vault` block reads `implemented`. Rows for verbs already shipped by merged PRs are pinned here for auditability; subsequent PRs in the Appendix-A alignment track MUST update this table in the same commit that ships the verb.
+
+Legend:
+- **implemented** — landed on `main`; verb shape matches the spec row above.
+- **not-yet** — verb defined in Appendix A; no CLI entry on `main` yet. Scheduled within the Appendix-A alignment PR track; status flips in the PR that ships the verb.
+- **descoped-#NNN** — explicitly removed from M1; follow-up issue carries the residual scope.
+
+| Verb (Appendix A) | Status | Landed / tracked |
+|---|---|---|
+| `drive9 mount vault <path>` | not-yet | Appendix-A alignment PR track |
+| `drive9 umount <path>` | implemented | pre-M1 |
+| `drive9 ctx add --api-key` | implemented | #284 (PR-B) |
+| `drive9 ctx import --from-file` | implemented | #284 (PR-B) |
+| `drive9 ctx ls` / `use` / `rm` | implemented | #284 (PR-B) |
+| `drive9 vault put <path> --from <dir>` | not-yet | Appendix-A alignment PR track |
+| `drive9 vault grant <scope>... --agent --perm --ttl` | not-yet | Appendix-A alignment PR track (server endpoint live in #273; CLI still on legacy `drive9 secret grant` with no `--perm`) |
+| `drive9 vault revoke <grant-id>` | not-yet | Appendix-A alignment PR track |
+| `drive9 vault with <path> -- <cmd>` | not-yet | Appendix-A alignment PR track |
+| `drive9 vault reauth <mountpoint>` | descoped-#302 | deferred post-M1 (§17) |
+| Data-plane `cat / ls / rm / printf >` on `/n/vault/**` | implemented | pre-M1 |
+
+Rows record the **final user-visible verb**. Interim steps (for example, fixing the legacy `drive9 secret grant` call path to hit `/v1/vault/grants` with `--perm` before the `vault` verb lands) do **not** flip `drive9 vault grant` to `implemented` — that row only flips when the `drive9 vault grant` CLI surface itself is live on `main`.
+
+---
+
 Appendix A — Command surface at a glance:
 
 | Command | Role |
@@ -640,7 +663,7 @@ Appendix A — Command surface at a glance:
 | `drive9 ctx import --from-file <path>` | Register a delegated context from a grant JWT file (primary UX). |
 | `drive9 ctx import [--from-file -]` | Same, reading the JWT from stdin (default when stdin is a pipe). |
 | `drive9 ctx ls / use / rm` | Manage contexts (offline). |
-| `drive9 vault put <path> --from <dir> [--prune]` | Atomic batch write. |
+| `drive9 vault put <path> --from <dir>` | Atomic wholesale-replace batch write (§2). |
 | `drive9 vault grant <scope>... --agent --perm --ttl` | Issue a scoped JWT. |
 | `drive9 vault revoke <grant-id>` | Revoke a grant. |
 | `drive9 vault with <path> -- <cmd>` | Exec child with `@env` injected. |
