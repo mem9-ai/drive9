@@ -34,6 +34,8 @@ func TestSecretSetFallsBackToUpdateOnConflict(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("DRIVE9_SERVER", srv.URL)
 	t.Setenv("DRIVE9_API_KEY", "tenant-key")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
 
 	if err := SecretSet([]string{"aws-prod", "access_key=AKIA", "secret_key=secret"}); err != nil {
 		t.Fatalf("SecretSet: %v", err)
@@ -61,7 +63,7 @@ func TestSecretGetUsesCapabilityToken(t *testing.T) {
 
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("DRIVE9_SERVER", srv.URL)
-	t.Setenv(vaultTokenEnv, "cap-token")
+	t.Setenv(EnvVaultToken, "cap-token")
 
 	out := captureStdout(t, func() {
 		if err := SecretGet([]string{"aws-prod"}); err != nil {
@@ -112,7 +114,7 @@ func TestSecretLsFallsBackToReadableScopeWithCapabilityToken(t *testing.T) {
 
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("DRIVE9_SERVER", srv.URL)
-	t.Setenv(vaultTokenEnv, "cap-token")
+	t.Setenv(EnvVaultToken, "cap-token")
 
 	out := captureStdout(t, func() {
 		if err := SecretLs(nil); err != nil {
@@ -128,7 +130,7 @@ func TestSecretLsPrefersExplicitCapabilityTokenOverAmbientAPIKey(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("DRIVE9_SERVER", "http://example.invalid")
 	t.Setenv("DRIVE9_API_KEY", "tenant-key")
-	t.Setenv(vaultTokenEnv, "cap-token")
+	t.Setenv(EnvVaultToken, "cap-token")
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -171,7 +173,7 @@ func TestSecretExecInjectsSecretIntoChildEnv(t *testing.T) {
 
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("DRIVE9_SERVER", srv.URL)
-	t.Setenv(vaultTokenEnv, "cap-token")
+	t.Setenv(EnvVaultToken, "cap-token")
 
 	out := captureStdout(t, func() {
 		if err := SecretExec([]string{"aws-prod", "--", "/bin/sh", "-c", "printf '%s:%s' \"$ACCESS_KEY\" \"$SECRET_KEY\""}); err != nil {
@@ -214,6 +216,13 @@ func TestSecretAuditFiltersClientSide(t *testing.T) {
 
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
+	// Reset the credential resolver cache before invoking the CLI entry point.
+	// The resolver uses sync.Once, so per-test t.Setenv values only flow
+	// through if the cache is cleared first. Also reset on cleanup so any
+	// later test that calls the resolver directly sees a clean slate.
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
 	oldStdout := os.Stdout
 	r, w, err := os.Pipe()
 	if err != nil {
