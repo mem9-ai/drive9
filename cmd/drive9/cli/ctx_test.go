@@ -479,7 +479,7 @@ func TestCtxImport_TTYRefusesWithHelp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen empty: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	os.Stdin = f
 
 	cmdErr := Ctx([]string{"import"})

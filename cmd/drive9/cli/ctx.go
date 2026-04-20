@@ -436,7 +436,8 @@ func writeCtxListTable(cfg *Config, longForm bool) error {
 		return nil
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "CURRENT\tNAME\tTYPE\tSCOPE\tPERM\tEXPIRES_AT\tSTATUS")
+	// tabwriter.Writer buffers internally; errors surface at Flush().
+	_, _ = fmt.Fprintln(w, "CURRENT\tNAME\tTYPE\tSCOPE\tPERM\tEXPIRES_AT\tSTATUS")
 	for _, e := range entries {
 		cur := " "
 		if e.Current {
@@ -447,7 +448,7 @@ func writeCtxListTable(cfg *Config, longForm bool) error {
 		if e.Type == string(PrincipalOwner) {
 			perm = "rw"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			cur,
 			e.Name,
 			e.Type,
