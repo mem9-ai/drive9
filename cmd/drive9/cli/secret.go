@@ -18,8 +18,6 @@ import (
 )
 
 const (
-	vaultTokenEnv       = "DRIVE9_VAULT_TOKEN"
-	legacyCapTokenEnv   = "DRIVE9_CAP_TOKEN"
 	defaultAuditLimit   = 100
 	maxClientAuditLimit = 1000
 )
@@ -438,50 +436,50 @@ func SecretAudit(args []string) error {
 	return nil
 }
 
-func resolveVaultServer() string {
-	server := os.Getenv("DRIVE9_SERVER")
-	if server != "" {
-		return server
-	}
-	return loadConfig().ResolveServer()
-}
-
-func currentAPIKey() string {
-	if apiKey := os.Getenv("DRIVE9_API_KEY"); apiKey != "" {
-		return apiKey
-	}
-	return loadConfig().CurrentAPIKey()
-}
-
+// currentCapabilityToken returns the active delegated/capability token for
+// call sites that explicitly need "is there a token in play" (e.g. SecretLs's
+// branch to avoid silently enumerating the whole tenant when a scoped token
+// was intentionally provided). It uses the unified resolver so env > config
+// priority + Unsetenv mitigation apply.
 func currentCapabilityToken() string {
-	if tok := os.Getenv(vaultTokenEnv); tok != "" {
-		return tok
+	r := ResolveCredentials()
+	if r.Kind == CredentialDelegated {
+		return r.Token
 	}
-	return os.Getenv(legacyCapTokenEnv)
+	return ""
 }
 
+// optionalVaultManagementClientFromEnv returns a tenant-scoped (owner API key)
+// client when one can be resolved, or false when no owner credential is in
+// play. Used by SecretLs to distinguish "owner enumeration" from "delegated
+// readable-only enumeration". A delegated token in env/config does NOT satisfy
+// this — the caller must hold an owner credential.
 func optionalVaultManagementClientFromEnv() (*client.Client, bool) {
-	apiKey := currentAPIKey()
-	if apiKey == "" {
+	r := ResolveCredentials()
+	if r.Kind != CredentialOwner {
 		return nil, false
 	}
-	return client.New(resolveVaultServer(), apiKey), true
+	return client.New(r.Server, r.APIKey), true
 }
 
 func newVaultManagementClientFromEnv() (*client.Client, error) {
 	c, ok := optionalVaultManagementClientFromEnv()
 	if !ok {
-		return nil, fmt.Errorf("missing tenant API key; set DRIVE9_API_KEY or run drive9 create")
+		return nil, fmt.Errorf("missing tenant API key; set %s or run drive9 create", EnvAPIKey)
 	}
 	return c, nil
 }
 
+// newVaultReadClientFromEnv requires a delegated capability token (server's
+// vault read path is token-gated — an owner API key alone will be rejected
+// server-side with EACCES). Resolution goes through the unified resolver so
+// env > config priority + Unsetenv mitigation apply uniformly.
 func newVaultReadClientFromEnv() (*client.Client, error) {
-	token := currentCapabilityToken()
-	if token == "" {
-		return nil, fmt.Errorf("missing capability token; set %s (or %s) before using drive9 secret get/exec", vaultTokenEnv, legacyCapTokenEnv)
+	r := ResolveCredentials()
+	if r.Kind != CredentialDelegated {
+		return nil, fmt.Errorf("missing capability token; set %s before using drive9 secret get/exec", EnvVaultToken)
 	}
-	return client.New(resolveVaultServer(), token), nil
+	return client.New(r.Server, r.Token), nil
 }
 
 func validateSecretName(name string) error {
