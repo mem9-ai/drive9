@@ -19,9 +19,11 @@ RUN_CLI_UPLOAD_LIMIT_BOUNDARY="${RUN_CLI_UPLOAD_LIMIT_BOUNDARY:-1}"
 CLI_UPLOAD_LIMIT_BYTES="${CLI_UPLOAD_LIMIT_BYTES:-10737418240}"
 CLI_SEMANTIC_TIMEOUT_S="${CLI_SEMANTIC_TIMEOUT_S:-90}"
 CLI_SEMANTIC_INTERVAL_S="${CLI_SEMANTIC_INTERVAL_S:-3}"
+RUN_CLI_SEMANTIC_CHECKS="${RUN_CLI_SEMANTIC_CHECKS:-1}"
 
 PASS=0
 FAIL=0
+SKIP=0
 TOTAL=0
 
 check_eq() {
@@ -47,6 +49,13 @@ check_cmd() {
     echo "FAIL $desc"
     FAIL=$((FAIL+1))
   fi
+}
+
+skip_check() {
+  local desc="$1"
+  TOTAL=$((TOTAL+1))
+  SKIP=$((SKIP+1))
+  echo "SKIP $desc"
 }
 
 detect_release_target() {
@@ -249,6 +258,7 @@ LARGE_LOCAL="/tmp/drive9-cli-large-${TS}.bin"
 LARGE_REMOTE="/cli-${TS}-large-${CLI_LARGE_FILE_MB}m.bin"
 LARGE_DOWNLOADED="/tmp/drive9-cli-large-${TS}.download.bin"
 LARGE_BYTES=$((CLI_LARGE_FILE_MB * 1024 * 1024))
+CLI_IMAGE_UPLOADED=0
 
 echo "[4] small file ops via cli"
 printf "cli-smoke-%s" "$TS" > "$SMALL_LOCAL"
@@ -337,32 +347,46 @@ PY
 check_eq "cli find by name returns txt files" "$find_has_txt" "true"
 
 echo "[6.1] cli semantic text recall checks"
-printf "A cat is resting on a sofa near a window." > "/tmp/drive9-cli-sem-target-${TS}.txt"
-printf "A dog is running in a field under bright sun." > "/tmp/drive9-cli-sem-other-${TS}.txt"
-drive9_retry fs cp "/tmp/drive9-cli-sem-target-${TS}.txt" ":$SEM_TEXT_TARGET" >/dev/null
-drive9_retry fs cp "/tmp/drive9-cli-sem-other-${TS}.txt" ":$SEM_TEXT_OTHER" >/dev/null
+if [ "$RUN_CLI_SEMANTIC_CHECKS" = "1" ]; then
+  printf "A cat is resting on a sofa near a window." > "/tmp/drive9-cli-sem-target-${TS}.txt"
+  printf "A dog is running in a field under bright sun." > "/tmp/drive9-cli-sem-other-${TS}.txt"
+  drive9_retry fs cp "/tmp/drive9-cli-sem-target-${TS}.txt" ":$SEM_TEXT_TARGET" >/dev/null
+  drive9_retry fs cp "/tmp/drive9-cli-sem-other-${TS}.txt" ":$SEM_TEXT_OTHER" >/dev/null
 
-wait_cli_grep_target "cli semantic grep includes cat-story target" "feline sofa" "$SEM_TEXT_TARGET"
-wait_cli_grep_target "cli semantic grep includes dog-story target" "canine field" "$SEM_TEXT_OTHER"
+  wait_cli_grep_target "cli semantic grep includes cat-story target" "feline sofa" "$SEM_TEXT_TARGET"
+  wait_cli_grep_target "cli semantic grep includes dog-story target" "canine field" "$SEM_TEXT_OTHER"
+else
+  echo "semantic text recall checks skipped (RUN_CLI_SEMANTIC_CHECKS=$RUN_CLI_SEMANTIC_CHECKS)"
+  skip_check "cli semantic grep includes cat-story target"
+  skip_check "cli semantic grep includes dog-story target"
+fi
 
 echo "[6.2] cli image-associated recall checks"
-cp "$DRIVE9_IMAGE_FIXTURE_PATH" "$IMAGE_LOCAL"
-check_cmd "local cli jpg fixture exists" test -s "$IMAGE_LOCAL"
-drive9_retry fs cp "$IMAGE_LOCAL" ":$IMAGE_REMOTE" >/dev/null
-printf "This image shows a cat face icon." > "/tmp/drive9-cli-image-caption-${TS}.txt"
-drive9_retry fs cp "/tmp/drive9-cli-image-caption-${TS}.txt" ":$IMAGE_CAPTION_REMOTE" >/dev/null
+if [ "$RUN_CLI_SEMANTIC_CHECKS" = "1" ]; then
+  cp "$DRIVE9_IMAGE_FIXTURE_PATH" "$IMAGE_LOCAL"
+  check_cmd "local cli jpg fixture exists" test -s "$IMAGE_LOCAL"
+  drive9_retry fs cp "$IMAGE_LOCAL" ":$IMAGE_REMOTE" >/dev/null
+  CLI_IMAGE_UPLOADED=1
+  printf "This image shows a cat face icon." > "/tmp/drive9-cli-image-caption-${TS}.txt"
+  drive9_retry fs cp "/tmp/drive9-cli-image-caption-${TS}.txt" ":$IMAGE_CAPTION_REMOTE" >/dev/null
 
-wait_cli_grep_target "cli image-associated grep includes caption" "feline face icon" "$IMAGE_CAPTION_REMOTE"
+  wait_cli_grep_target "cli image-associated grep includes caption" "feline face icon" "$IMAGE_CAPTION_REMOTE"
 
-find_png_out="$(drive9_retry fs find / -name "*.jpg")"
-find_has_png=$(python3 - "$find_png_out" "$IMAGE_REMOTE" <<'PY'
+  find_png_out="$(drive9_retry fs find / -name "*.jpg")"
+  find_has_png=$(python3 - "$find_png_out" "$IMAGE_REMOTE" <<'PY'
 import sys
 lines=[ln.strip() for ln in sys.argv[1].splitlines() if ln.strip()]
 target=sys.argv[2]
 print("true" if any(line == target or line.endswith('.jpg') for line in lines) else "false")
 PY
 )
-check_eq "cli find by name returns jpg files" "$find_has_png" "true"
+  check_eq "cli find by name returns jpg files" "$find_has_png" "true"
+else
+  echo "image-associated recall checks skipped (RUN_CLI_SEMANTIC_CHECKS=$RUN_CLI_SEMANTIC_CHECKS)"
+  skip_check "local cli jpg fixture exists"
+  skip_check "cli image-associated grep includes caption"
+  skip_check "cli find by name returns jpg files"
+fi
 
 echo "[7] large multipart upload via cli cp"
 dd if=/dev/zero of="$LARGE_LOCAL" bs=1M count="$CLI_LARGE_FILE_MB" status=none
@@ -388,7 +412,9 @@ check_eq "downloaded large file sha256 matches" "$sum_dst" "$sum_src"
 
 echo "[8] cleanup via cli"
 drive9_retry fs rm "$SMALL_RENAMED" >/dev/null
-drive9_retry fs rm "$IMAGE_REMOTE" >/dev/null
+if [ "$CLI_IMAGE_UPLOADED" = "1" ]; then
+  drive9_retry fs rm "$IMAGE_REMOTE" >/dev/null
+fi
 drive9_retry fs rm "$LARGE_REMOTE" >/dev/null
 for i in $(seq 1 "$CLI_BATCH_SMALL_FILE_COUNT"); do
   drive9_retry fs rm "$BATCH_REMOTE_DIR/file-${i}.txt" >/dev/null
@@ -531,5 +557,5 @@ rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$IMAGE_LOCAL" "$LARGE_LOCAL" "$LARGE_D
 rm -f "/tmp/drive9-cli-sem-target-${TS}.txt" "/tmp/drive9-cli-sem-other-${TS}.txt" "/tmp/drive9-cli-image-caption-${TS}.txt"
 rm -rf "$BATCH_LOCAL_DIR"
 
-echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"
+echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"
 exit "$FAIL"

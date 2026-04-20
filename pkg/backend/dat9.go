@@ -47,6 +47,11 @@ type Dat9Backend struct {
 	mu                    sync.Mutex
 	entropy               io.Reader
 
+	// Central quota enforcement (Rev 4 migration).
+	tenantID    string
+	metaStore   MetaQuotaStore // nil when central quota is not wired (tests, fallback)
+	quotaSource QuotaSource    // "tenant" (default) or "server"
+
 	// Async image -> text extraction worker (in-memory queue for P0).
 	imageExtractEnabled bool
 	imageExtractor      ImageTextExtractor
@@ -71,11 +76,6 @@ type Dat9Backend struct {
 	whisperCostPerMinuteMillicents  int64
 	fallbackImageCostMillicents     int64
 	fallbackAudioCostMillicents     int64
-
-	// Control-plane LLM usage (meta store migration).
-	metaLLMStore     MetaLLMUsageStore // nil = write to tenant datastore only
-	tenantID         string
-	llmUsageDualRead bool
 }
 
 func newBaseBackend(store *datastore.Store) *Dat9Backend {
@@ -185,6 +185,9 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
 		Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
 	})
+	if err == nil {
+		b.syncCentralFileCreate(ctx, fileID, 0, "")
+	}
 	return err
 }
 
@@ -231,6 +234,7 @@ func (b *Dat9Backend) RemoveCtx(ctx context.Context, path string) (err error) {
 		return err
 	}
 	if deleted != nil {
+		b.syncCentralFileDelete(ctx, deleted.FileID, deleted.SizeBytes, deleted.ContentType)
 		b.deleteBlobCtx(ctx, deleted.StorageRef)
 	}
 	return nil
@@ -256,6 +260,7 @@ func (b *Dat9Backend) RemoveAllCtx(ctx context.Context, path string) (err error)
 		return err
 	}
 	for _, f := range orphaned {
+		b.syncCentralFileDelete(ctx, f.FileID, f.SizeBytes, f.ContentType)
 		b.deleteBlobCtx(ctx, f.StorageRef)
 	}
 	return nil
@@ -387,7 +392,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	}
 
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
-		if err := b.ensureTenantStorageQuotaTx(tx, path, int64(len(data))); err != nil {
+		if err := b.ensureStorageQuota(ctx, tx, path, int64(len(data))); err != nil {
 			return err
 		}
 		if err := b.store.InsertFileTx(tx, &datastore.File{
@@ -409,7 +414,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			return err
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			return b.enqueueTiDBAutoSemanticTasksTx(tx, fileID, 1, path, contentType)
+			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
 		}
 		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText) {
 			return b.enqueueEmbedTaskTx(tx, fileID, 1)
@@ -425,8 +430,10 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	// backend-owned image queue until its image task flow also moves to
 	// semantic_tasks.
 	if b.UsesDatabaseAutoEmbedding() {
+		b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
 		return int64(len(data)), nil
 	}
+	b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
 	b.enqueueImageExtract(fileID, path, contentType, 1)
 	return int64(len(data)), nil
 }
@@ -485,7 +492,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 
 	var newRev int64
 	err := b.store.InTx(ctx, func(tx *sql.Tx) error {
-		if err := b.ensureTenantStorageQuotaTx(tx, nf.Node.Path, int64(len(finalData))); err != nil {
+		if err := b.ensureStorageQuota(ctx, tx, nf.Node.Path, int64(len(finalData))); err != nil {
 			return err
 		}
 		var txErr error
@@ -518,7 +525,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 			return txErr
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			return b.enqueueTiDBAutoSemanticTasksTx(tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
+			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
 		}
 		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText) {
 			return b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
@@ -531,6 +538,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		}
 		return 0, err
 	}
+	b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
 	b.deleteBlobIfS3Ctx(ctx, nf.File.StorageType, nf.File.StorageRef, storageRef)
 	// Temporary compatibility: app embedding still relies on the legacy
 	// backend-owned image queue until its image task flow also moves to

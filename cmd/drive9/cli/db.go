@@ -5,11 +5,17 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"sort"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
+// Create provisions a new tenant and registers the returned API key as a
+// local owner context. Both steps are performed from a single Go code path:
+// Create calls ctxAdd(name, &Context{...}) after provisioning, which is the
+// same helper `drive9 ctx add` calls. There is one writer for
+// ~/.drive9/config — not a sub-command spawn, not a cmd re-entry.
+//
+// See migration call-out #4 in the impl PR body.
 func Create(args []string) error {
 	name := ""
 	server := os.Getenv("DRIVE9_SERVER")
@@ -71,12 +77,12 @@ func Create(args []string) error {
 		return fmt.Errorf("decode response: %w", err)
 	}
 
-	if cfg.Server == "" {
-		cfg.Server = server
-	}
-	cfg.Contexts[name] = &Context{APIKey: result.APIKey}
-	if cfg.CurrentContext == "" {
-		cfg.CurrentContext = name
+	if _, err := ctxAdd(cfg, name, &Context{
+		Type:   PrincipalOwner,
+		Server: server,
+		APIKey: result.APIKey,
+	}); err != nil {
+		return err
 	}
 	if err := saveConfig(cfg); err != nil {
 		return fmt.Errorf("save config: %w", err)
@@ -87,67 +93,5 @@ func Create(args []string) error {
 		fmt.Printf("switched to context %q\n", name)
 	}
 	fmt.Printf("config: %s\n", configPath())
-	return nil
-}
-
-func Ctx(args []string) error {
-	if len(args) == 0 {
-		return ctxShow()
-	}
-	switch args[0] {
-	case "list", "ls":
-		return ctxList()
-	default:
-		return ctxSwitch(args[0])
-	}
-}
-
-func ctxShow() error {
-	cfg := loadConfig()
-	if cfg.CurrentContext == "" {
-		fmt.Println("no current context")
-		return nil
-	}
-	fmt.Println(cfg.CurrentContext)
-	return nil
-}
-
-func ctxList() error {
-	cfg := loadConfig()
-	if len(cfg.Contexts) == 0 {
-		fmt.Println("no contexts configured")
-		fmt.Println("run: drive9 create --name <name>")
-		return nil
-	}
-	names := make([]string, 0, len(cfg.Contexts))
-	for name := range cfg.Contexts {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		marker := "  "
-		if name == cfg.CurrentContext {
-			marker = "* "
-		}
-		ctx := cfg.Contexts[name]
-		masked := ctx.APIKey
-		if len(masked) > 12 {
-			masked = masked[:8] + "..." + masked[len(masked)-4:]
-		}
-		fmt.Printf("%s%s  (key=%s)\n", marker, name, masked)
-	}
-	return nil
-}
-
-func ctxSwitch(name string) error {
-	cfg := loadConfig()
-	if _, ok := cfg.Contexts[name]; !ok {
-		return fmt.Errorf("context %q not found; run: drive9 ctx list", name)
-	}
-	cfg.CurrentContext = name
-	if err := saveConfig(cfg); err != nil {
-		return err
-	}
-	fmt.Printf("switched to context %q\n", name)
 	return nil
 }

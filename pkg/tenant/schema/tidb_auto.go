@@ -225,7 +225,7 @@ func ValidateTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) error {
 	if err := ensureTiDBTableExists(db, "semantic_tasks"); err != nil {
 		return fmt.Errorf("semantic_tasks schema contract: %w", err)
 	}
-	for _, t := range []string{"vault_deks", "vault_secrets", "vault_secret_fields", "vault_tokens", "vault_policies", "vault_audit_log"} {
+	for _, t := range []string{"vault_deks", "vault_secrets", "vault_secret_fields", "vault_tokens", "vault_grants", "vault_policies", "vault_audit_log"} {
 		if err := ensureTiDBTableExists(db, t); err != nil {
 			return fmt.Errorf("%s schema contract: %w", t, err)
 		}

@@ -105,7 +105,14 @@ func main() {
 		if !explicitEmbeddingMode {
 			initMode = schema.TiDBEmbeddingModeAuto
 		}
-		if err := localTiDBSchemaInitializer(localDSN, initMode); err != nil {
+		initOpts := schema.InitTiDBTenantSchemaOptions{}
+		if initMode == schema.TiDBEmbeddingModeApp {
+			// drive9-server-local can bootstrap app-managed schema on TiDB builds
+			// that lack optional FTS/vector index features; shared schema init paths
+			// remain strict.
+			initOpts.AllowUnsupportedOptionalIndexes = true
+		}
+		if err := localTiDBSchemaInitializer(startupCtx, localDSN, initMode, initOpts); err != nil {
 			die(fmt.Errorf("init local tenant schema: %w", err))
 		}
 		logLocalStartupStep(startupCtx, startupStart, stepStart, "init_local_tenant_schema",
@@ -229,6 +236,7 @@ func main() {
 		Backend:           b,
 		LocalTenantAPIKey: localAPIKey,
 		VaultMasterKey:    vaultMasterKey,
+		VaultIssuerURL:    vaultIssuerURL(addr),
 		LocalS3:           localS3,
 		S3Dir:             s3cfg.localDir(),
 		MaxUploadBytes:    maxUploadBytes,
@@ -364,6 +372,16 @@ func die(err error) {
 	os.Exit(1)
 }
 
+// vaultIssuerURL returns the canonical issuer URL used as the `iss` claim on
+// vault grants. DRIVE9_VAULT_ISSUER_URL overrides; default falls back to the
+// same canonical URL the object plane uses.
+func vaultIssuerURL(listenAddr string) string {
+	if v := strings.TrimRight(strings.TrimSpace(os.Getenv("DRIVE9_VAULT_ISSUER_URL")), "/"); v != "" {
+		return v
+	}
+	return publicBaseURL(listenAddr)
+}
+
 func publicBaseURL(listenAddr string) string {
 	if v := strings.TrimRight(os.Getenv("DRIVE9_PUBLIC_URL"), "/"); v != "" {
 		return v
@@ -433,7 +451,7 @@ func (c localS3Config) localDir() string {
 var (
 	localTiDBEmbeddingModeDetector = schema.DetectTiDBEmbeddingMode
 	localTiDBSchemaValidator       = schema.EnsureTiDBSchemaForMode
-	localTiDBSchemaInitializer     = schema.InitTiDBTenantSchemaForMode
+	localTiDBSchemaInitializer     = schema.InitTiDBTenantSchemaForModeWithOptionsContext
 )
 
 func detectLocalTiDBEmbeddingMode(db *sql.DB, schemaInitialized bool, requestedMode schema.TiDBEmbeddingMode, explicitMode bool) (schema.TiDBEmbeddingMode, error) {
@@ -496,6 +514,15 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	opts.MaxTenantStorageBytes = envInt64("DRIVE9_MAX_TENANT_STORAGE_BYTES", 50*(1<<30))
 	if opts.MaxTenantStorageBytes <= 0 {
 		return backend.Options{}, fmt.Errorf("DRIVE9_MAX_TENANT_STORAGE_BYTES must be a positive integer")
+	}
+
+	// Quota enforcement source: "tenant" (default) or "server" (central server DB).
+	switch qs := strings.ToLower(strings.TrimSpace(os.Getenv("DRIVE9_QUOTA_SOURCE"))); qs {
+	case "", "tenant":
+	case "server":
+		opts.QuotaSource = backend.QuotaSourceServer
+	default:
+		die(fmt.Errorf("DRIVE9_QUOTA_SOURCE must be one of tenant or server, got %q", qs))
 	}
 
 	queryBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_QUERY_EMBED_API_BASE"))

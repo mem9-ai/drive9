@@ -25,6 +25,20 @@ const (
 	defaultMaxMediaLLMFiles      = int64(500)            // 500 media files per tenant
 )
 
+// QuotaSource controls where quota checks read authoritative state from.
+// During migration from per-tenant DB to server DB, this flag selects the
+// active source.
+type QuotaSource string
+
+const (
+	// QuotaSourceTenant reads quota state from the per-tenant TiDB cluster
+	// (current/legacy behavior). This is the default.
+	QuotaSourceTenant QuotaSource = "tenant"
+	// QuotaSourceServer reads quota state from the drive9 server DB (meta).
+	// Requires that central quota tables are populated (backfill complete).
+	QuotaSourceServer QuotaSource = "server"
+)
+
 // Options configures Dat9Backend behavior.
 type Options struct {
 	AsyncImageExtract AsyncImageExtractOptions
@@ -48,16 +62,9 @@ type Options struct {
 	MaxMediaLLMFiles int64
 	// LLMCostBudget configures the monthly LLM cost budget for this tenant.
 	LLMCostBudget LLMCostBudgetOptions
-	// MetaStore is the control-plane meta store. When set, LLM usage is
-	// recorded to (and budgets read from) the meta store instead of the
-	// per-tenant datastore.
-	MetaStore MetaLLMUsageStore
-	// TenantID identifies this tenant in the meta store's llm_usage table.
-	TenantID string
-	// LLMUsageDualRead enables dual-read mode during transition: budget checks
-	// sum costs from both meta store and tenant datastore. Set this to true
-	// during the first month of migration to avoid mid-month budget resets.
-	LLMUsageDualRead bool
+	// QuotaSource selects where quota enforcement reads authoritative state.
+	// "tenant" (default) uses per-tenant DB; "server" uses the central server DB.
+	QuotaSource QuotaSource
 }
 
 // LLMCostBudgetOptions configures the monthly LLM cost budget.
@@ -124,6 +131,11 @@ type QueryEmbeddingOptions struct {
 
 func (b *Dat9Backend) configureOptions(opts Options) {
 	b.databaseAutoEmbedding = opts.DatabaseAutoEmbedding
+	if opts.QuotaSource == QuotaSourceServer {
+		b.quotaSource = QuotaSourceServer
+	} else {
+		b.quotaSource = QuotaSourceTenant
+	}
 	if opts.MaxUploadBytes > 0 {
 		b.maxUploadBytes = opts.MaxUploadBytes
 	} else {
@@ -147,10 +159,6 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	b.whisperCostPerMinuteMillicents = cb.WhisperCostPerMinuteMillicents
 	b.fallbackImageCostMillicents = cb.FallbackImageCostMillicents
 	b.fallbackAudioCostMillicents = cb.FallbackAudioCostMillicents
-
-	b.metaLLMStore = opts.MetaStore
-	b.tenantID = opts.TenantID
-	b.llmUsageDualRead = opts.LLMUsageDualRead
 
 	if opts.QueryEmbedding.Client != nil {
 		b.queryEmbedder = opts.QueryEmbedding.Client

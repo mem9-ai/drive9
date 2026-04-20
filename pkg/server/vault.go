@@ -28,6 +28,10 @@ func (s *Server) handleVault(w http.ResponseWriter, r *http.Request) {
 		s.handleVaultTokens(w, r, strings.TrimPrefix(rest, "tokens"))
 		return
 	}
+	if rest == "grants" || strings.HasPrefix(rest, "grants/") {
+		s.handleVaultGrants(w, r, strings.TrimPrefix(rest, "grants"))
+		return
+	}
 	if rest == "audit" || strings.HasPrefix(rest, "audit") {
 		s.handleVaultAudit(w, r)
 		return
@@ -349,6 +353,168 @@ func (s *Server) handleVaultTokenRevoke(w http.ResponseWriter, r *http.Request, 
 		TenantID:  tenantID,
 		EventType: "token.revoked",
 		TokenID:   tokenID,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// ---- Management API: /v1/vault/grants ----
+//
+// Grants are the end-state token shape per
+// docs/specs/vault-interaction-end-state.md §16. They coexist with the legacy
+// /v1/vault/tokens endpoint in PR-A (additive); the legacy endpoint is deleted
+// in PR-E per docs/specs/pr-e-removal-contract.md.
+//
+// Owner-only enforcement is structural: this route is wired through
+// tenantAuthMiddleware, which requires a tenant API key. Grant (vt_) JWTs do
+// not satisfy tenantAuthMiddleware, so a delegated caller cannot reach this
+// handler to mint further grants — re-delegation is blocked at the router
+// layer, not here.
+
+func (s *Server) handleVaultGrants(w http.ResponseWriter, r *http.Request, sub string) {
+	vs, err := s.vaultStore(r)
+	if err != nil {
+		if errors.Is(err, errVaultUnsupported) {
+			errJSON(w, http.StatusNotImplemented, err.Error())
+			return
+		}
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	scope := ScopeFromContext(r.Context())
+	tenantID := scope.TenantID
+
+	if sub == "" || sub == "/" {
+		if r.Method == http.MethodPost {
+			s.handleVaultGrantIssue(w, r, vs, tenantID)
+			return
+		}
+		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	grantID := strings.TrimPrefix(sub, "/")
+	if r.Method == http.MethodDelete {
+		s.handleVaultGrantRevoke(w, r, vs, tenantID, grantID)
+		return
+	}
+	errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+}
+
+func (s *Server) handleVaultGrantIssue(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID string) {
+	// Grants require a canonical server URL for the `iss` claim. If the
+	// operator hasn't configured one, we cannot mint non-forgeable tokens:
+	// fail closed rather than emit a grant without issuer binding.
+	if s.vaultIssuerURL == "" {
+		errJSON(w, http.StatusServiceUnavailable, "vault issuer URL not configured")
+		return
+	}
+	var req struct {
+		Agent     string   `json:"agent"`
+		Scope     []string `json:"scope"`
+		Perm      string   `json:"perm"`
+		TTLSecs   int      `json:"ttl_seconds"`
+		LabelHint string   `json:"label_hint"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		errJSON(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	// principal_type is NOT caller-controlled. The end-state spec (§16 claim
+	// table + §13.3 ctx-import contract) requires `vault grant` output to be
+	// a delegated JWT; owner grants are a non-sequitur on this endpoint. By
+	// fixing principal_type server-side we also get defense-in-depth against
+	// a future router misconfiguration that lets a delegated caller reach
+	// here (adv-2 Block B).
+	principal := vault.PrincipalDelegated
+	perm := vault.GrantPerm(req.Perm)
+	if req.TTLSecs <= 0 {
+		// Spec §6 "--ttl is required". Silent defaulting at the handler
+		// would emit a grant the caller didn't ask for — audit/debug trap
+		// (adv-1 Block 4, adv-2 Block B context).
+		errJSON(w, http.StatusBadRequest, "ttl_seconds is required and must be > 0")
+		return
+	}
+	ttl := time.Duration(req.TTLSecs) * time.Second
+
+	tokenStr, grant, err := vs.IssueGrant(
+		r.Context(), tenantID, s.vaultIssuerURL,
+		principal, req.Agent, req.Scope, perm, ttl, req.LabelHint,
+	)
+	if err != nil {
+		// IssueGrant returns user-visible validation errors (bad scope /
+		// enum / agent / issuer); map them to 400. Internal DB errors
+		// surface the same way but prefixed "insert grant:" — map to 500.
+		if strings.HasPrefix(err.Error(), "insert grant") {
+			errJSON(w, http.StatusInternalServerError, "failed to issue grant")
+			return
+		}
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Per impl spec §5: grant.issued Detail carries grant_id, agent,
+	// principal_type, perm, scope so downstream audit tooling can
+	// reconstruct the minted grant without re-reading the DB.
+	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
+		TenantID:  tenantID,
+		EventType: "grant.issued",
+		TokenID:   grant.GrantID,
+		AgentID:   grant.Agent,
+		Detail: map[string]any{
+			"grant_id":       grant.GrantID,
+			"agent":          grant.Agent,
+			"principal_type": string(grant.PrincipalType),
+			"perm":           string(grant.Perm),
+			"scope":          grant.Scope,
+		},
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"token":      tokenStr,
+		"grant_id":   grant.GrantID,
+		"expires_at": grant.ExpiresAt,
+		"scope":      grant.Scope,
+		"perm":       grant.Perm,
+	})
+}
+
+func (s *Server) handleVaultGrantRevoke(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, grantID string) {
+	var req struct {
+		RevokedBy string `json:"revoked_by"`
+		Reason    string `json:"reason"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req)
+	if req.RevokedBy == "" {
+		req.RevokedBy = "api"
+	}
+
+	err := vs.RevokeGrant(r.Context(), tenantID, grantID, req.RevokedBy, req.Reason)
+	if err != nil {
+		if errors.Is(err, vault.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "grant not found or already revoked")
+			return
+		}
+		errJSON(w, http.StatusInternalServerError, "failed to revoke grant")
+		return
+	}
+
+	// Per impl spec §5: grant.revoked Detail carries grant_id, revoked_by,
+	// reason. AgentID mirrors revoked_by so the top-level column reflects
+	// "who did this" for filter queries.
+	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
+		TenantID:  tenantID,
+		EventType: "grant.revoked",
+		TokenID:   grantID,
+		AgentID:   req.RevokedBy,
+		Detail: map[string]any{
+			"grant_id":   grantID,
+			"revoked_by": req.RevokedBy,
+			"reason":     req.Reason,
+		},
 	})
 
 	w.Header().Set("Content-Type", "application/json")

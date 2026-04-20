@@ -40,17 +40,17 @@
 # export DRIVE9_S3_REGION=us-east-1
 # export DRIVE9_S3_ENDPOINT=http://127.0.0.1:9000
 # export DRIVE9_S3_FORCE_PATH_STYLE=true
-# export DRIVE9_S3_ACCESS_KEY_ID=minioadmin
-# export DRIVE9_S3_SECRET_ACCESS_KEY=minioadmin
+# Set the S3 access key env var for your MinIO user.
+# Set the S3 secret key env var for your MinIO user.
 
 # Run the following command to pull the embedding model before starting drive9-server-local.
-# ollama pull all-minilm
-# curl http://localhost:11434/v1/embeddings -H "Content-Type: application/json" -d '{"model":"all-minilm", "input": "This is an embedding test"}'
+# ollama pull bge-m3 # "bge-m3" provide 1024-dimensional embeddings.
+# curl http://localhost:11434/v1/embeddings -H "Content-Type: application/json" -d '{"model":"bge-m3", "input": "This is an embedding test"}'
 
 # Background semantic embedding worker.
 : "${DRIVE9_EMBED_API_BASE:=http://127.0.0.1:11434}"
 : "${DRIVE9_EMBED_API_KEY:=ollama}"
-: "${DRIVE9_EMBED_MODEL:=all-minilm}"
+: "${DRIVE9_EMBED_MODEL:=bge-m3}"
 # Leave the following unset to keep using the program defaults:
 # DRIVE9_EMBED_TIMEOUT_SECONDS=20
 # DRIVE9_SEMANTIC_WORKERS=1

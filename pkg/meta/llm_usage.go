@@ -18,8 +18,10 @@ func (s *Store) InsertLLMUsage(ctx context.Context, tenantID, taskType, taskID s
 	return err
 }
 
-// MonthlyLLMCostMillicents returns the sum of cost_millicents for a tenant in
-// the current calendar month (UTC).
+// MonthlyLLMCostMillicents returns the total LLM cost for a tenant in the
+// current calendar month (UTC). Reads from the pre-aggregated counter table
+// (tenant_monthly_llm_cost) for O(1) lookups. Falls back to the raw
+// llm_usage SUM scan when no counter row exists yet.
 func (s *Store) MonthlyLLMCostMillicents(ctx context.Context, tenantID string) (total int64, err error) {
 	start := time.Now()
 	defer func() {
@@ -31,6 +33,17 @@ func (s *Store) MonthlyLLMCostMillicents(ctx context.Context, tenantID string) (
 	}()
 	now := time.Now().UTC()
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+
+	// Try the pre-aggregated counter first (Rev 4 path).
+	scanErr := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(total_mc, 0) FROM tenant_monthly_llm_cost
+		 WHERE tenant_id = ? AND month_start = ?`,
+		tenantID, monthStart).Scan(&total)
+	if scanErr == nil {
+		return total, nil
+	}
+
+	// Fallback: SUM scan on raw llm_usage rows (pre-Rev 4 / transition).
 	err = s.db.QueryRowContext(ctx,
 		`SELECT COALESCE(SUM(cost_millicents), 0) FROM llm_usage WHERE tenant_id = ? AND created_at >= ?`,
 		tenantID, monthStart).Scan(&total)
