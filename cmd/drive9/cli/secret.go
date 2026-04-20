@@ -269,7 +269,6 @@ func SecretRm(args []string) error {
 func SecretGrant(args []string) error {
 	var (
 		agentID   string
-		taskID    string
 		ttlRaw    string
 		permRaw   string
 		asJSON    bool
@@ -285,12 +284,6 @@ func SecretGrant(args []string) error {
 			}
 			i++
 			agentID = args[i]
-		case "--task":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--task requires a value")
-			}
-			i++
-			taskID = args[i]
 		case "--ttl":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--ttl requires a value")
@@ -348,7 +341,10 @@ func SecretGrant(args []string) error {
 	if err != nil {
 		return err
 	}
-	_ = taskID // task_id is not part of the /v1/vault/grants contract; kept as a recognized flag for CLI continuity.
+	// `--task` was removed in V2a: task_id is not part of the /v1/vault/grants
+	// contract. Passing --task now fails loudly via the `unknown flag` branch
+	// above — we deliberately do NOT silently accept-and-drop it, because a
+	// successful return with dropped semantics is worse than a clean break.
 	resp, err := c.IssueVaultGrant(context.Background(), client.VaultGrantIssueRequest{
 		Agent:      agentID,
 		Scope:      scope,

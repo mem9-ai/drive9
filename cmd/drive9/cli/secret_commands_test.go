@@ -266,6 +266,26 @@ func TestSecretGrantPermValidation(t *testing.T) {
 	}
 }
 
+// V2a removed `--task` from `secret grant` (task_id is not part of the
+// /v1/vault/grants contract). Accepting a removed flag silently would be a
+// hidden downgrade of semantics for callers still passing it; instead we
+// fail loudly via the `unknown flag` branch so automation breaks at the
+// earliest possible point rather than getting a successful return with
+// dropped inputs.
+func TestSecretGrantRejectsRemovedTaskFlag(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DRIVE9_SERVER", "http://example.invalid")
+	t.Setenv("DRIVE9_API_KEY", "tenant-key")
+
+	err := SecretGrant([]string{"aws-prod", "--agent", "a", "--task", "t-42", "--ttl", "1h", "--perm", "read"})
+	if err == nil {
+		t.Fatal("expected error for removed --task flag, got nil")
+	}
+	if !strings.Contains(err.Error(), `unknown flag "--task"`) {
+		t.Fatalf("error = %q, want substring `unknown flag \"--task\"`", err)
+	}
+}
+
 // G-V2a-5 (positive half): both valid --perm values MUST reach the server
 // with the request body echoing the flag verbatim. Server-side validation
 // of perm semantics is out of scope here; the contract is "pass through".
