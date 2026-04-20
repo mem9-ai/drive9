@@ -512,15 +512,24 @@ func httpToFuseStatus(err error) gofuse.Status {
 
 	// Fallback to string matching for non-StatusError errors.
 	msg := err.Error()
+	lowerMsg := strings.ToLower(msg)
 	switch {
-	case strings.Contains(msg, "not found") || strings.Contains(msg, "HTTP 404"):
+	case strings.Contains(lowerMsg, "not found") || strings.Contains(msg, "HTTP 404"):
 		return gofuse.ENOENT
-	case strings.Contains(msg, "HTTP 409") || strings.Contains(msg, "already exists"):
+	case strings.Contains(lowerMsg, "already exists"):
 		return gofuse.Status(syscall.EEXIST)
 	case strings.Contains(msg, "HTTP 403"):
 		return gofuse.EACCES
 	case strings.Contains(msg, "HTTP 413"):
 		return gofuse.Status(syscall.EFBIG)
+	case strings.Contains(msg, "HTTP 412"):
+		return gofuse.Status(syscall.ESTALE)
+	case strings.Contains(msg, "HTTP 400"):
+		return gofuse.Status(syscall.EINVAL)
+	case strings.Contains(msg, "HTTP 500") ||
+		strings.Contains(msg, "HTTP 502") ||
+		strings.Contains(msg, "HTTP 503"):
+		return gofuse.Status(syscall.EAGAIN)
 	default:
 		return gofuse.EIO
 	}
@@ -2059,12 +2068,14 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	return gofuse.OK
 }
 
-// refreshRevisionAfterFlush updates the inode cache with the latest server
-// revision so that subsequent opens see the correct base revision for CAS
-// uploads. Callers must hold fh.mu.
+// refreshRevisionAfterFlush updates the inode cache and the open FileHandle
+// with the latest server revision so that subsequent writes use the correct
+// base revision for CAS uploads. Callers must hold fh.mu.
 func (fs *Dat9FS) refreshRevisionAfterFlush(ctx context.Context, fh *FileHandle) {
 	if stat, err := fs.client.StatCtx(ctx, fh.Path); err == nil && stat != nil {
 		fs.inodes.UpdateRevision(fh.Ino, stat.Revision)
+		fh.BaseRev = stat.Revision
+		fh.IsNew = false
 	}
 }
 
