@@ -1055,20 +1055,31 @@ func TestSetAttr_TruncateWithoutHandleRefreshesRevision(t *testing.T) {
 
 func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
 	var (
-		putCalls  int32
-		headCalls int32
+		mu         sync.Mutex
+		handlerErr error
+		putCalls   atomic.Int32
+		headCalls  atomic.Int32
 	)
+	recordHandlerErr := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPut:
 			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "7" {
-				t.Fatalf("X-Dat9-Expected-Revision = %q, want %q", got, "7")
+				recordHandlerErr(fmt.Errorf("X-Dat9-Expected-Revision = %q, want %q", got, "7"))
+				http.Error(w, "bad expected revision", http.StatusBadRequest)
+				return
 			}
-			putCalls++
+			putCalls.Add(1)
 			w.WriteHeader(http.StatusOK)
 		case http.MethodHead:
-			headCalls++
+			headCalls.Add(1)
 			http.Error(w, "unexpected post-flush HEAD", http.StatusInternalServerError)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1099,11 +1110,17 @@ func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("flushHandle status = %v, want OK", st)
 	}
-	if putCalls != 1 {
-		t.Fatalf("PUT calls = %d, want 1", putCalls)
+	mu.Lock()
+	err := handlerErr
+	mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if headCalls != 0 {
-		t.Fatalf("HEAD calls = %d, want 0", headCalls)
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("PUT calls = %d, want 1", got)
+	}
+	if got := headCalls.Load(); got != 0 {
+		t.Fatalf("HEAD calls = %d, want 0", got)
 	}
 	if fh.BaseRev != 8 {
 		t.Fatalf("fh.BaseRev = %d, want 8", fh.BaseRev)

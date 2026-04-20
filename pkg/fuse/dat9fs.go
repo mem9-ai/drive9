@@ -2075,15 +2075,22 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	expectedRevision := expectedRevisionForHandle(fh)
 
 	fs.debouncer.Schedule(filePath, func() {
+		handle.Lock()
+		if handle.Dirty == nil || handle.DirtySeq != snapshotSeq {
+			handle.Unlock()
+			return
+		}
+
 		dCtx, dCf := context.WithTimeout(context.Background(), fuseTimeout)
-		defer dCf()
-		if err := fs.client.WriteCtxConditional(dCtx, filePath, data, expectedRevision); err != nil {
+		err := fs.client.WriteCtxConditional(dCtx, filePath, data, expectedRevision)
+		dCf()
+		if err != nil {
+			handle.Unlock()
 			log.Printf("debounced flush failed for %s: %v", filePath, err)
 			return
 		}
-		// Only clear dirty if no writes occurred since the snapshot was taken.
-		// If DirtySeq changed, the buffer has new data that wasn't uploaded.
-		handle.Lock()
+		// The handle stays locked across upload + finalize so concurrent writes
+		// cannot advance live state for data outside this committed snapshot.
 		fs.finalizeHandleFlushLocked(handle, expectedRevision)
 		if handle.Dirty != nil && handle.DirtySeq == snapshotSeq {
 			handle.Dirty.ClearDirty()
