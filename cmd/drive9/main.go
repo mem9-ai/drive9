@@ -9,7 +9,7 @@
 //	create  provision a new database
 //	ctx     switch or list contexts
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, sh, grep, find)
-//	secret  secret manager operations (set, get, exec, ls, rm, grant, revoke, audit)
+//	vault   vault operations (set, get, exec, ls, rm, grant, revoke, audit)
 //	mount   mount drive9 as a local FUSE filesystem
 //	umount  unmount a drive9 FUSE mount
 package main
@@ -31,6 +31,12 @@ import (
 var cliLogger *zap.Logger
 var cpuProfileStop = func() {}
 var exitFunc = os.Exit
+
+// vaultHandler is the `drive9 vault` command entry point, indirected through
+// a var so dispatch tests can swap in a spy and assert "handler reached" vs
+// "handler not reached". Production callers see no change: the default value
+// is the real cli.Secret and nothing else reassigns it outside tests.
+var vaultHandler = cli.Secret
 
 func main() {
 	if logger.CLIEnabled() {
@@ -55,9 +61,15 @@ func main() {
 		usage()
 	}
 
-	cmd := os.Args[1]
-	args := os.Args[2:]
+	dispatch(os.Args[1], os.Args[2:])
+}
 
+// dispatch routes a parsed (verb, args) pair to the matching command handler.
+// Extracted from main() so the verb table is testable without spawning a
+// subprocess. The `secret` verb was removed in V2b (hard-cut); callers
+// that still type `drive9 secret ...` fall into the default branch and hit
+// the generic `unknown command` path — there is no alias, no legacy shim.
+func dispatch(cmd string, args []string) {
 	switch cmd {
 	case "--version", "-v", "version":
 		if cliLogger != nil {
@@ -92,20 +104,20 @@ func main() {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "fs"), zap.String("subcommand", sub))
 		}
 		runFS(args)
-	case "secret":
+	case "vault":
 		if cliLogger != nil {
 			sub := ""
 			if len(args) > 0 {
 				sub = args[0]
 			}
-			logger.Info(context.Background(), "cli_command", zap.String("command", "secret"), zap.String("subcommand", sub))
+			logger.Info(context.Background(), "cli_command", zap.String("command", "vault"), zap.String("subcommand", sub))
 		}
-		if err := cli.Secret(args); err != nil {
+		if err := vaultHandler(args); err != nil {
 			sub := ""
 			if len(args) > 0 {
 				sub = " " + args[0]
 			}
-			fatal("secret"+sub, err)
+			fatal("vault"+sub, err)
 		}
 	case "mount":
 		if cliLogger != nil {
@@ -217,7 +229,7 @@ commands:
   ctx [name]       switch context (or show current)
   ctx list         list all contexts
   fs               filesystem operations
-  secret           secret manager operations
+  vault            vault operations
   mount <dir>      mount drive9 as a local FUSE filesystem
   umount <dir>     unmount a drive9 FUSE mount
 `)
