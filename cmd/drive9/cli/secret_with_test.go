@@ -220,6 +220,34 @@ func TestSecretWithEmptySecretStillForksChild(t *testing.T) {
 	}
 }
 
+// G-V2c-5 (missing half): a secret that doesn't exist (server 404) MUST
+// surface an error BEFORE the child is forked. This is the symmetric twin
+// of the empty-secret test — both halves of "empty ≠ missing" are pinned
+// by user-visible behavior. captureStdout asserting an empty stdout is
+// the same "no-fork witness" shape used by G-V2c-9 so the two gates share
+// the same test form.
+func TestSecretWithMissingSecretNoFork(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DRIVE9_SERVER", srv.URL)
+	t.Setenv(EnvVaultToken, "cap-token")
+
+	out := captureStdout(t, func() {
+		// Child would print something on stdout if it ever ran.
+		err := SecretWith([]string{"/n/vault/does-not-exist", "--", "/bin/sh", "-c", "printf CHILD-RAN"})
+		if err == nil {
+			t.Fatal("expected error for missing secret, got nil")
+		}
+	})
+	if out != "" {
+		t.Fatalf("child forked despite missing secret: stdout = %q", out)
+	}
+}
+
 // G-V2c-7: when the child exits non-zero, SecretWith returns an error that
 // carries the child's exit code via the exitCoder interface that main.go's
 // fatal() already understands (see cmd/drive9/main.go exitCoder branch).
@@ -253,8 +281,9 @@ func TestSecretWithPropagatesChildExitCode(t *testing.T) {
 // G-V2c-8: a single illegal key fails the WHOLE command with an EACCES
 // message. The error mentions the offending key so operators can fix the
 // secret. No partial injection — validateVaultEnvFields never returns a
-// mixed map. We assert via SecretWith end-to-end: if the child had been
-// forked, the command would have succeeded (/bin/true returns 0).
+// mixed map. We assert via SecretWith end-to-end and use the same
+// no-fork witness shape (captureStdout == "") as G-V2c-9 so the two
+// symmetric gates have symmetric tests.
 func TestSecretWithIllegalKeyFailsWhole(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/vault/read/bad-keys" {
@@ -270,15 +299,22 @@ func TestSecretWithIllegalKeyFailsWhole(t *testing.T) {
 	t.Setenv("DRIVE9_SERVER", srv.URL)
 	t.Setenv(EnvVaultToken, "cap-token")
 
-	err := SecretWith([]string{"/n/vault/bad-keys", "--", "/bin/true"})
-	if err == nil {
+	var gotErr error
+	out := captureStdout(t, func() {
+		// Child would print something on stdout if it ever ran.
+		gotErr = SecretWith([]string{"/n/vault/bad-keys", "--", "/bin/sh", "-c", "printf CHILD-RAN"})
+	})
+	if gotErr == nil {
 		t.Fatal("expected EACCES-shaped error for illegal key, got nil")
 	}
-	if !strings.Contains(err.Error(), `"access-key"`) {
-		t.Fatalf("error should name offending key: %q", err)
+	if !strings.Contains(gotErr.Error(), `"access-key"`) {
+		t.Fatalf("error should name offending key: %q", gotErr)
 	}
-	if !strings.Contains(err.Error(), "EACCES") {
-		t.Fatalf("error should mention EACCES: %q", err)
+	if !strings.Contains(gotErr.Error(), "EACCES") {
+		t.Fatalf("error should mention EACCES: %q", gotErr)
+	}
+	if out != "" {
+		t.Fatalf("child forked despite illegal key: stdout = %q", out)
 	}
 }
 
