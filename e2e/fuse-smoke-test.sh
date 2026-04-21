@@ -685,7 +685,7 @@ PY
   mv "$RW_TEXT_MOUNT" "$RW_TEXT_RENAMED_MOUNT"
   check_cmd_fail "old file path missing after rename" test -f "$RW_TEXT_MOUNT"
   renamed_text=$(drive9_retry fs cat "$RW_TEXT_RENAMED_REMOTE")
-  check_eq "renamed file readable via remote" "$renamed_text" ""
+  check_eq "renamed file preserves truncated content" "$renamed_text" ""
 
   rename_dir_ready=false
   if wait_path_exists "$RW_ALPHA_MOUNT"; then
@@ -693,7 +693,7 @@ PY
       check_eq "rename directory via mount succeeds" "true" "true"
       check_cmd "renamed directory visible via remote list" wait_remote_ls_has_name "$ROOT_REMOTE" "alpha-renamed"
       renamed_nested_text=$(drive9_retry fs cat "$RW_ALPHA_RENAMED_REMOTE/text-renamed.txt")
-      check_eq "renamed directory keeps file content" "$renamed_nested_text" ""
+      check_eq "renamed directory preserves truncated file content" "$renamed_nested_text" ""
       rename_dir_ready=true
     else
       check_eq "rename directory via mount succeeds" "false" "true"
