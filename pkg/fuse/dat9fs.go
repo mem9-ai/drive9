@@ -1202,8 +1202,7 @@ func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
 func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, error) {
 	// Check dir cache first
 	if cached, ok := fs.dirCache.Get(dirPath); ok {
-		entries := fs.cachedToDirEntries(dirPath, cached)
-		return fs.mergePendingDirEntries(dirPath, entries), nil
+		return fs.cachedToDirEntries(dirPath, cached), nil
 	}
 
 	items, err := fs.client.ListCtx(ctx, dirPath)
@@ -1227,81 +1226,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	}
 	fs.dirCache.Put(dirPath, cached)
 
-	entries := fs.cachedToDirEntries(dirPath, cached)
-	return fs.mergePendingDirEntries(dirPath, entries), nil
-}
-
-// mergePendingDirEntries overlays pending write-back entries onto a directory
-// listing. Files that exist in the write-back cache or pendingIndex (commit
-// queue backed) but are not yet on the server are added to the listing so
-// that ls, tab-completion, and editors can see them.
-func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []DirEntry {
-	// Build set of already-listed names for dedup.
-	existing := make(map[string]struct{}, len(entries))
-	for _, e := range entries {
-		existing[e.Name] = struct{}{}
-	}
-
-	// Overlay write-back cache entries.
-	if fs.writeBack != nil {
-		for p := range fs.writeBack.ListPendingPaths() {
-			if parentDir(p) != dirPath {
-				continue
-			}
-			name := path.Base(p)
-			if _, ok := existing[name]; ok {
-				continue
-			}
-			meta, ok := fs.writeBack.GetMeta(p)
-			if !ok {
-				continue
-			}
-			mtime := meta.Mtime
-			if mtime.IsZero() {
-				mtime = time.Now()
-			}
-			ino := fs.inodes.EnsureInode(p, false, meta.Size, mtime)
-			entries = append(entries, DirEntry{
-				Name: name,
-				Ino:  ino,
-				Mode: syscall.S_IFREG,
-			})
-			existing[name] = struct{}{}
-		}
-	}
-
-	// Overlay commit-queue-backed entries from pendingIndex. These are files
-	// handed to commitQueue after Release but not yet uploaded to the server.
-	if fs.pendingIndex != nil {
-		prefix := dirPath
-		if prefix != "/" {
-			prefix += "/"
-		} else {
-			prefix = "/"
-		}
-		for _, meta := range fs.pendingIndex.ListByPrefix(prefix) {
-			if parentDir(meta.Path) != dirPath {
-				continue
-			}
-			name := path.Base(meta.Path)
-			if _, ok := existing[name]; ok {
-				continue // already listed from writeBack or remote
-			}
-			mtime := meta.Mtime
-			if mtime.IsZero() {
-				mtime = time.Now()
-			}
-			ino := fs.inodes.EnsureInode(meta.Path, false, meta.Size, mtime)
-			entries = append(entries, DirEntry{
-				Name: name,
-				Ino:  ino,
-				Mode: syscall.S_IFREG,
-			})
-			existing[name] = struct{}{}
-		}
-	}
-
-	return entries
+	return fs.cachedToDirEntries(dirPath, cached), nil
 }
 
 func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []DirEntry {

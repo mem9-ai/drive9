@@ -725,6 +725,111 @@ func TestGetAttrDirectoryDoesNotRequireRemoteStat(t *testing.T) {
 	}
 }
 
+func TestReadDirDoesNotMergePendingEntries(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.RawQuery == "list=1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.SetWriteBack(cache, nil)
+
+	if err := cache.Put("/pending.txt", []byte("local only"), 10, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+
+	var openOut gofuse.OpenOut
+	if st := fs.OpenDir(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: 1}}, &openOut); st != gofuse.OK {
+		t.Fatalf("OpenDir status = %v, want OK", st)
+	}
+	list := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{Fh: openOut.Fh}, list); st != gofuse.OK {
+		t.Fatalf("ReadDir status = %v, want OK", st)
+	}
+	dh, ok := fs.dirHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("dir handle not found")
+	}
+	if len(dh.Entries) != 0 {
+		t.Fatalf("dir entries = %d, want 0", len(dh.Entries))
+	}
+}
+
+func TestReadDirHandleKeepsSnapshotUntilReopen(t *testing.T) {
+	var entries atomic.Value
+	entries.Store([]map[string]any{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.RawQuery == "list=1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": entries.Load()})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{DirTTL: time.Millisecond}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var openOut gofuse.OpenOut
+	if st := fs.OpenDir(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: 1}}, &openOut); st != gofuse.OK {
+		t.Fatalf("OpenDir status = %v, want OK", st)
+	}
+	list := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{Fh: openOut.Fh}, list); st != gofuse.OK {
+		t.Fatalf("first ReadDir status = %v, want OK", st)
+	}
+	dh, ok := fs.dirHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("dir handle not found")
+	}
+	if len(dh.Entries) != 0 {
+		t.Fatalf("initial dir entries = %d, want 0", len(dh.Entries))
+	}
+
+	entries.Store([]map[string]any{{"name": "new.txt", "size": 0, "isDir": false, "mtime": time.Now().Unix()}})
+	list = gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{Fh: openOut.Fh}, list); st != gofuse.OK {
+		t.Fatalf("second ReadDir status = %v, want OK", st)
+	}
+	dh, ok = fs.dirHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("dir handle not found after second read")
+	}
+	if len(dh.Entries) != 0 {
+		t.Fatalf("same-handle entries = %d, want 0", len(dh.Entries))
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	fs.ReleaseDir(&gofuse.ReleaseIn{Fh: openOut.Fh})
+	if st := fs.OpenDir(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: 1}}, &openOut); st != gofuse.OK {
+		t.Fatalf("reopen OpenDir status = %v, want OK", st)
+	}
+	list = gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{Fh: openOut.Fh}, list); st != gofuse.OK {
+		t.Fatalf("reopen ReadDir status = %v, want OK", st)
+	}
+	dh, ok = fs.dirHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("dir handle not found after reopen")
+	}
+	if len(dh.Entries) != 1 || dh.Entries[0].Name != "new.txt" {
+		t.Fatalf("reopened dir entries = %+v, want [new.txt]", dh.Entries)
+	}
+}
+
 func TestLookupFallsBackToParentListWhenDirStatUnsupported(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
