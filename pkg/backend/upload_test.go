@@ -222,6 +222,45 @@ func TestInitiateAndConfirmUpload(t *testing.T) {
 	}
 }
 
+func TestCreateMetadataOnlyThenConfirmUploadAdvancesRevision(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	if _, err := b.CreateMetadataOnlyCtx(ctx, "/upload-after-create.bin"); err != nil {
+		t.Fatal(err)
+	}
+
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUploadIfRevision(ctx, "/upload-after-create.bin", totalSize, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadAllPartsForPlan(t, b, plan, plan.UploadID, totalSize)
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+
+	nf, err := b.StatNodeCtx(ctx, "/upload-after-create.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nf.File == nil {
+		t.Fatal("expected confirmed file after upload completion")
+	}
+	if nf.File.Revision != 2 {
+		t.Fatalf("revision=%d, want 2", nf.File.Revision)
+	}
+	if nf.File.SizeBytes != totalSize {
+		t.Fatalf("size=%d, want %d", nf.File.SizeBytes, totalSize)
+	}
+	if nf.File.Status != datastore.StatusConfirmed {
+		t.Fatalf("status=%s, want %s", nf.File.Status, datastore.StatusConfirmed)
+	}
+	if nf.File.StorageType != datastore.StorageS3 {
+		t.Fatalf("storage_type=%s, want %s", nf.File.StorageType, datastore.StorageS3)
+	}
+}
+
 func TestResumeUpload(t *testing.T) {
 	b := newTestBackendWithS3(t)
 	ctx := context.Background()

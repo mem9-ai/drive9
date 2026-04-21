@@ -169,6 +169,48 @@ func TestCreateMetadataOnlyCtxDoesNotWriteZeroByteObject(t *testing.T) {
 	}
 }
 
+func TestCreateMetadataOnlyCtxThenConditionalWriteAdvancesRevision(t *testing.T) {
+	b := newTestBackend(t)
+	ctx := context.Background()
+
+	if _, err := b.CreateMetadataOnlyCtx(ctx, "/after-create.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.WriteCtxIfRevision(ctx, "/after-create.txt", []byte("hello"), 0, filesystem.WriteFlagTruncate, 0); !errors.Is(err, datastore.ErrRevisionConflict) {
+		t.Fatalf("expected revision conflict for create-if-absent write, got %v", err)
+	}
+
+	n, err := b.WriteCtxIfRevision(ctx, "/after-create.txt", []byte("hello"), 0, filesystem.WriteFlagTruncate, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 {
+		t.Fatalf("bytes written=%d, want 5", n)
+	}
+
+	nf, err := b.StatNodeCtx(ctx, "/after-create.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nf.File == nil {
+		t.Fatal("expected file after conditional write")
+	}
+	if nf.File.Revision != 2 {
+		t.Fatalf("revision=%d, want 2", nf.File.Revision)
+	}
+	if nf.File.SizeBytes != 5 {
+		t.Fatalf("size=%d, want 5", nf.File.SizeBytes)
+	}
+
+	data, err := b.Read("/after-create.txt", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello" {
+		t.Fatalf("data=%q, want hello", data)
+	}
+}
+
 func TestUsesDatabaseAutoEmbeddingDefaultsToFalse(t *testing.T) {
 	b := newTestBackend(t)
 	if b.UsesDatabaseAutoEmbedding() {
