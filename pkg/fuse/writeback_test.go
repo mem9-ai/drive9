@@ -413,6 +413,9 @@ func TestMountHash_Deterministic(t *testing.T) {
 func TestFlush_WriteBack_SmallFile(t *testing.T) {
 	var httpPutCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -512,6 +515,9 @@ func TestFlush_WriteBack_SmallFile(t *testing.T) {
 func TestFlush_WriteBack_Lifecycle(t *testing.T) {
 	uploadedCh := make(chan []byte, 10)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -606,6 +612,9 @@ func TestFlush_WriteBack_Lifecycle(t *testing.T) {
 func TestFlush_WriteBack_MultipleFiles(t *testing.T) {
 	var uploadedFiles sync.Map
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -696,12 +705,96 @@ func TestFlush_WriteBack_MultipleFiles(t *testing.T) {
 	}
 }
 
+func TestMetadataCreatedWriteBackUploadUsesRevisionOne(t *testing.T) {
+	var gotExpected atomic.Value
+	uploadedCh := make(chan []byte, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
+		switch r.Method {
+		case http.MethodPut:
+			gotExpected.Store(r.Header.Get("X-Dat9-Expected-Revision"))
+			body, _ := io.ReadAll(r.Body)
+			uploadedCh <- append([]byte(nil), body...)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := client.New(ts.URL, "")
+	uploader := NewWriteBackUploader(c, cache, 2)
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.SetWriteBack(cache, uploader)
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}, "rev1.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+
+	_, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}, []byte("phase-c"))
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	if st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	uploader.DrainAll()
+
+	if got, _ := gotExpected.Load().(string); got != "1" {
+		t.Fatalf("X-Dat9-Expected-Revision = %q, want %q", got, "1")
+	}
+	select {
+	case uploaded := <-uploadedCh:
+		if string(uploaded) != "phase-c" {
+			t.Fatalf("uploaded = %q, want %q", uploaded, "phase-c")
+		}
+	default:
+		t.Fatal("expected write-back upload to happen")
+	}
+}
+
 // TestFlush_WriteBack_WriteBetweenFlushAndRelease verifies that if a Write
 // occurs between Flush and Release, the latest data is uploaded (not the
 // stale cache snapshot). This is a regression test for data loss.
 func TestFlush_WriteBack_WriteBetweenFlushAndRelease(t *testing.T) {
 	uploadedCh := make(chan []byte, 10)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -802,6 +895,9 @@ done:
 func TestFlush_WriteBack_NoWriteBack_LargeFile(t *testing.T) {
 	var httpPutCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -887,6 +983,9 @@ func TestRenameFlushesWriteBack(t *testing.T) {
 	}
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -974,6 +1073,9 @@ func TestRenameFlushesWriteBack(t *testing.T) {
 func TestUnlinkClearsPendingWriteBack(t *testing.T) {
 	var deleteCalled atomic.Bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodDelete:
 			deleteCalled.Store(true)
@@ -1026,6 +1128,9 @@ func TestUnlinkClearsPendingWriteBack(t *testing.T) {
 // pending write-back data (not stale server data).
 func TestReopenAfterClose_ReadsPendingCache(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -1099,6 +1204,9 @@ func TestReopenAfterClose_ReadsPendingCache(t *testing.T) {
 func TestFsync_NoDuplicateUpload(t *testing.T) {
 	var httpPutCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")

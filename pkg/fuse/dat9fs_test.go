@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,10 +19,28 @@ import (
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
+func serveMetadataCreate(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost || !r.URL.Query().Has("create") {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"path":     strings.TrimPrefix(r.URL.Path, "/v1/fs"),
+		"revision": 1,
+		"size":     0,
+		"status":   "CONFIRMED",
+		"mtime":    time.Now().Unix(),
+	})
+	return true
+}
+
 func newTestDat9FS(t *testing.T, size int64, get func(http.ResponseWriter, *http.Request)) (*Dat9FS, uint64, func()) {
 	t.Helper()
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
@@ -81,6 +100,9 @@ func TestOpenWritableLargeFileLazyPreload(t *testing.T) {
 
 func TestCreateWriteThroughShadow(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}))
 	defer ts.Close()
@@ -799,6 +821,9 @@ func TestInitStoresServer(t *testing.T) {
 
 func TestCreateFileGetsStreamUploader(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.WriteHeader(http.StatusOK)
@@ -835,6 +860,135 @@ func TestCreateFileGetsStreamUploader(t *testing.T) {
 	}
 	if fh.Streamer == nil {
 		t.Fatal("expected StreamUploader to be set for new file")
+	}
+}
+
+func TestCreateUsesMetadataAuthorityResult(t *testing.T) {
+	mtime := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Has("create") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"path":     "/created.txt",
+				"revision": 1,
+				"size":     0,
+				"status":   "CONFIRMED",
+				"mtime":    mtime.Unix(),
+			})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}, "created.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.IsNew {
+		t.Fatal("metadata-created handle should not retain create-if-absent semantics")
+	}
+	if fh.BaseRev != 1 {
+		t.Fatalf("fh.BaseRev = %d, want 1", fh.BaseRev)
+	}
+	if fh.Streamer == nil {
+		t.Fatal("expected StreamUploader to be set")
+	}
+	if got := fh.Streamer.ExpectedRevision(); got != 1 {
+		t.Fatalf("streamer expected revision = %d, want 1", got)
+	}
+
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Revision != 1 {
+		t.Fatalf("entry.Revision = %d, want 1", entry.Revision)
+	}
+	if !entry.Mtime.Equal(mtime) {
+		t.Fatalf("entry.Mtime = %v, want %v", entry.Mtime, mtime)
+	}
+}
+
+func TestRenameMetadataCreatedFileUsesRemoteRename(t *testing.T) {
+	var renameCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Query().Has("rename"):
+			renameCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}, "old.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	st = fs.Rename(nil, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1}, "old.txt", "new.txt")
+	if st != gofuse.OK {
+		t.Fatalf("Rename status = %v, want OK", st)
+	}
+	if renameCalls.Load() != 1 {
+		t.Fatalf("rename calls = %d, want 1", renameCalls.Load())
+	}
+}
+
+func TestUnlinkMetadataCreatedFileUsesRemoteDelete(t *testing.T) {
+	var deleteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
+		switch r.Method {
+		case http.MethodDelete:
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}, "remove.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	st = fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "remove.txt")
+	if st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if deleteCalls.Load() != 1 {
+		t.Fatalf("delete calls = %d, want 1", deleteCalls.Load())
 	}
 }
 
@@ -1741,6 +1895,9 @@ func newTestServer(t *testing.T) (*httptest.Server, chan []byte) {
 	t.Helper()
 	uploadedCh := make(chan []byte, 10)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -1843,6 +2000,9 @@ func TestConcurrentGetAttrDuringWrite(t *testing.T) {
 	// reach the server.
 	var headCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			headCalls.Add(1)
@@ -1955,6 +2115,9 @@ func TestNotifyEntry_NonBlocking(t *testing.T) {
 // time. If kernel notifications were synchronous, these could deadlock.
 func TestMutationHandlers_CompleteWithinTimeout(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "100")
@@ -2051,6 +2214,9 @@ func TestMutationHandlers_CompleteWithinTimeout(t *testing.T) {
 // lock ordering deadlocks between dirtyMu, inodes.mu, and fileHandles.mu.
 func TestParallelCreateAndGetAttr(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -2203,6 +2369,9 @@ func TestFlushHandle_SmallFile_ServerUnreachable(t *testing.T) {
 func TestDebounce_ReleaseAfterFlush_NoDataLoss(t *testing.T) {
 	uploadedCh := make(chan []byte, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")

@@ -15,7 +15,7 @@ type FileHandle struct {
 	OrigSize     int64           // original file size at open time (for patch detection)
 	BaseRev      int64           // server revision at open time (for conflict detection)
 	ZeroBase     bool            // true when the handle has adopted an explicit empty-file baseline
-	IsNew        bool            // true if created via Create() (no prior remote existence)
+	IsNew        bool            // true only while this handle still needs create-if-absent server semantics
 	ShadowReady  bool            // true when the local shadow file is a safe full snapshot
 	Streamer     *StreamUploader // nil for small files / read-only; manages background part uploads
 	Prefetch     *Prefetcher     // nil for writable handles; sequential read prefetcher

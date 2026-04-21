@@ -1386,7 +1386,27 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		return st
 	}
 
-	ino := fs.inodes.Lookup(childP, false, 0, time.Now())
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
+	// Server metadata is the namespace authority, so create must commit there
+	// before we expose the local handle to the kernel.
+	created, err := fs.client.CreateCtx(ctx, childP)
+	if err != nil {
+		return httpToFuseStatus(err)
+	}
+
+	mtime := created.Mtime
+	if mtime.IsZero() {
+		mtime = time.Now()
+	}
+
+	ino := fs.inodes.Lookup(childP, false, created.Size, mtime)
+	if created.Revision > 0 {
+		fs.inodes.UpdateRevision(ino, created.Revision)
+	}
+	fs.inodes.UpdateSize(ino, created.Size)
+	fs.inodes.UpdateMtime(ino, mtime)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
@@ -1401,12 +1421,13 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		Path:        childP,
 		Flags:       input.Flags,
 		Dirty:       wb,
-		IsNew:       true,
+		OrigSize:    created.Size,
+		BaseRev:     created.Revision,
 		ShadowReady: false,
 	}
 
 	if fs.shadowStore != nil && fs.pendingIndex != nil {
-		if err := fs.shadowStore.Ensure(childP, 0, 0); err != nil {
+		if err := fs.shadowStore.Ensure(childP, 0, fh.BaseRev); err != nil {
 			log.Printf("shadow ensure failed for create %s: %v", childP, err)
 		} else {
 			fh.ShadowReady = true
