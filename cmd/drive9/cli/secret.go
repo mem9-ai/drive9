@@ -23,17 +23,23 @@ const (
 )
 
 // Secret dispatches drive9 vault subcommands.
+//
+// V2c hard-cut: `exec` is removed. Callers that still type `drive9 vault exec`
+// fall into the `unknown vault command` branch — no bespoke rename hint, no
+// alias — identical framing to any other typo. The replacement is
+// `drive9 vault with <path> -- <cmd>` (spec §9). See PR body for the
+// rationale on fail-loud > silent-drop.
 func Secret(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage drive9 vault <set|get|exec|ls|rm|grant|revoke|audit>")
+		return fmt.Errorf("usage drive9 vault <set|get|with|ls|rm|grant|revoke|audit>")
 	}
 	switch args[0] {
 	case "set":
 		return SecretSet(args[1:])
 	case "get":
 		return SecretGet(args[1:])
-	case "exec":
-		return SecretExec(args[1:])
+	case "with":
+		return SecretWith(args[1:])
 	case "ls":
 		return SecretLs(args[1:])
 	case "rm":
@@ -45,7 +51,7 @@ func Secret(args []string) error {
 	case "audit":
 		return SecretAudit(args[1:])
 	case "-h", "--help", "help":
-		return fmt.Errorf("usage drive9 vault <set|get|exec|ls|rm|grant|revoke|audit>")
+		return fmt.Errorf("usage drive9 vault <set|get|with|ls|rm|grant|revoke|audit>")
 	default:
 		return fmt.Errorf("unknown vault command %q", args[0])
 	}
@@ -142,26 +148,55 @@ func SecretGet(args []string) error {
 	return writeJSON(fields)
 }
 
-// SecretExec injects a secret into a child process environment and executes it.
-func SecretExec(args []string) error {
+// vaultPathPrefix is the only accepted CLI spelling for a vault secret path,
+// per spec §9 L204 (`drive9 vault with /n/vault/<secret> -- <cmd>`). Bare
+// secret names (`drive9 vault with aws-prod -- env`) are NOT accepted: that
+// would create a second path-shape contract outside the spec, and would
+// collide with the mount-path namespace (§7) when V2e ships. Rejecting
+// here — loudly, at the CLI boundary — keeps the namespace single-valued.
+const vaultPathPrefix = "/n/vault/"
+
+// SecretWith implements `drive9 vault with /n/vault/<secret> -- <cmd...>`
+// per spec §9. It reads the secret via the normal vault read path, parses
+// the `@env` byte contract (§4.1) strictly, scrubs DRIVE9_* credential env
+// vars (§9 L209 F14 scrub), then execs the child with the parsed key/value
+// pairs injected. The child's exit code is propagated verbatim.
+//
+// Semantics that deliberately DIFFER from the removed `SecretExec`:
+//   - Path shape: only `/n/vault/<secret>` is accepted; bare names rejected.
+//   - Env key charset: strict `^[A-Z_][A-Z0-9_]*$` (spec §4.1 L89). No
+//     coerce-normalize (no lowercase→upper, no `-`→`_`). An illegal key
+//     fails the whole command with an EACCES-shaped error — no partial
+//     injection (spec §4.1.3 L101).
+//   - Value charset: control bytes `\x00`–`\x1f` except `\t` are rejected
+//     identically (spec §4.1.3 L103).
+//   - Empty ≠ missing: a secret with 0 visible keys still forks the child
+//     with no injected env (§4.1.2 L96). A missing/invisible secret
+//     surfaces as an error before fork (ENOENT-shaped).
+//   - Credential scrub: DRIVE9_API_KEY, DRIVE9_VAULT_TOKEN, DRIVE9_SERVER
+//     are removed from the child's base env unconditionally (§9 L209).
+//     Only those three are scrubbed; unrelated DRIVE9_* (profiling, log
+//     level) pass through untouched.
+func SecretWith(args []string) error {
 	if len(args) < 3 {
-		return fmt.Errorf("usage drive9 vault exec <name> -- <command...>")
+		return fmt.Errorf("usage drive9 vault with /n/vault/<secret> -- <command...>")
 	}
-	name := args[0]
-	if err := validateSecretName(name); err != nil {
+	name, err := parseVaultPath(args[0])
+	if err != nil {
 		return err
 	}
-	sep := -1
-	for i := 1; i < len(args); i++ {
-		if args[i] == "--" {
-			sep = i
-			break
-		}
+	// Strict argv shape: exactly one path, then `--`, then the child
+	// command. Anything between the path and `--` is rejected rather
+	// than silently dropped — V2c pinned a single explicit argv shape
+	// for `vault with`, and accept-and-ignore here would undercut that
+	// contract (reviewer blocker flagged by adv-1 on PR #306).
+	if args[1] != "--" {
+		return fmt.Errorf("usage drive9 vault with /n/vault/<secret> -- <command...> (unexpected argument %q before `--`)", args[1])
 	}
-	if sep < 0 || sep == len(args)-1 {
-		return fmt.Errorf("usage drive9 vault exec <name> -- <command...>")
+	cmdArgs := args[2:]
+	if len(cmdArgs) == 0 {
+		return fmt.Errorf("usage drive9 vault with /n/vault/<secret> -- <command...>")
 	}
-	cmdArgs := args[sep+1:]
 
 	c, err := newVaultReadClientFromEnv()
 	if err != nil {
@@ -171,17 +206,127 @@ func SecretExec(args []string) error {
 	if err != nil {
 		return err
 	}
+	envMap, err := validateVaultEnvFields(fields)
+	if err != nil {
+		return err
+	}
 
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	envMap, err := buildSecretEnvMap(fields)
-	if err != nil {
-		return err
-	}
-	cmd.Env = mergeEnv(os.Environ(), envMap)
+	cmd.Env = mergeEnv(scrubDrive9CredEnv(os.Environ()), envMap)
 	return cmd.Run()
+}
+
+// parseVaultPath enforces G-V2c-1: the only accepted CLI spelling is
+// `/n/vault/<secret>` with a non-empty, single-segment secret name. Bare
+// names, subpaths (`/n/vault/a/b`), empty names, and any other path prefix
+// are rejected. validateSecretName pins the `*` / empty rules so this
+// stays in sync with the read-path validation used by `vault get`.
+func parseVaultPath(raw string) (string, error) {
+	if !strings.HasPrefix(raw, vaultPathPrefix) {
+		return "", fmt.Errorf("vault path %q must start with %s (bare secret names are not accepted)", raw, vaultPathPrefix)
+	}
+	rest := raw[len(vaultPathPrefix):]
+	if rest == "" {
+		return "", fmt.Errorf("vault path %q is missing a secret name", raw)
+	}
+	if strings.Contains(rest, "/") {
+		return "", fmt.Errorf("vault path %q must name exactly one secret; subpath selection is not supported by `vault with`", raw)
+	}
+	if err := validateSecretName(rest); err != nil {
+		return "", err
+	}
+	return rest, nil
+}
+
+// validateVaultEnvFields is the CLI-side enforcement of the `@env` byte
+// contract (spec §4.1 + §4.1.3). It is intentionally separate from
+// buildSecretEnvMap: that function coerce-normalizes (lowercase→upper,
+// non-alnum→`_`) to fit the legacy `SecretExec` shape, which directly
+// contradicts §4.1.3 L101 ("does not coerce them"). `vault with` must
+// reject, not coerce.
+//
+// Returns an error on the FIRST illegal key or value. No partial map is
+// returned — §4.1.3 L101 forbids partial output, so partial injection is
+// equally forbidden.
+func validateVaultEnvFields(fields map[string]string) (map[string]string, error) {
+	env := make(map[string]string, len(fields))
+	for key, value := range fields {
+		if !isValidVaultEnvKey(key) {
+			return nil, fmt.Errorf("secret key %q violates @env charset [A-Z_][A-Z0-9_]*: refusing to inject (EACCES)", key)
+		}
+		if idx := indexOfForbiddenEnvByte(value); idx >= 0 {
+			return nil, fmt.Errorf("secret value for key %q contains forbidden control byte 0x%02x at offset %d: refusing to inject (EACCES)", key, value[idx], idx)
+		}
+		env[key] = value
+	}
+	return env, nil
+}
+
+// isValidVaultEnvKey implements the strict charset `^[A-Z_][A-Z0-9_]*$`
+// from spec §4.1 L89. No Unicode, no lowercase, no non-alnum punctuation.
+func isValidVaultEnvKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		ch := key[i]
+		switch {
+		case ch >= 'A' && ch <= 'Z', ch == '_':
+			// allowed in any position
+		case ch >= '0' && ch <= '9':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// indexOfForbiddenEnvByte returns the index of the first control byte
+// outlawed by spec §4.1.3 L103 (`\x00`–`\x1f` except `\t`), or -1 if the
+// value is clean. Bytes ≥ 0x20 and DEL (0x7f) pass through — the contract
+// only singles out the C0 control range because `printf %q` is undefined
+// over it. Tab (`\t`, 0x09) is explicitly carved out.
+func indexOfForbiddenEnvByte(value string) int {
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if b < 0x20 && b != '\t' {
+			return i
+		}
+	}
+	return -1
+}
+
+// scrubDrive9CredEnv implements the F14 scrub from spec §9 L209. Exactly
+// three variables are dropped from the child's base env:
+//
+//	DRIVE9_API_KEY, DRIVE9_VAULT_TOKEN, DRIVE9_SERVER
+//
+// Any other DRIVE9_* (e.g. DRIVE9_PROF_CPU_PROFILE, DRIVE9_CLI_LOG_*) is
+// preserved — profiling and logging controls are developer-side knobs that
+// do not grant authority and MUST flow through to children. The scrub is
+// unconditional: we drop the names whether or not they are present in
+// os.Environ(), so behavior does not depend on parent state (§9 L209).
+func scrubDrive9CredEnv(base []string) []string {
+	out := make([]string, 0, len(base))
+	for _, entry := range base {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			out = append(out, entry)
+			continue
+		}
+		switch key {
+		case EnvAPIKey, EnvVaultToken, EnvServer:
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // SecretLs lists secret names. An explicit capability token always wins over
@@ -511,7 +656,7 @@ func newVaultManagementClientFromEnv() (*client.Client, error) {
 func newVaultReadClientFromEnv() (*client.Client, error) {
 	r := ResolveCredentials()
 	if r.Kind != CredentialDelegated {
-		return nil, fmt.Errorf("missing capability token; set %s before using drive9 vault get/exec", EnvVaultToken)
+		return nil, fmt.Errorf("missing capability token; set %s before using drive9 vault get/with", EnvVaultToken)
 	}
 	return client.New(r.Server, r.Token), nil
 }
