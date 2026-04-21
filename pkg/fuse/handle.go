@@ -22,6 +22,17 @@ type FileHandle struct {
 	mu           sync.Mutex
 }
 
+type livePendingSnapshot struct {
+	Path      string
+	Ino       uint64
+	Size      int64
+	Mtime     int64
+	IsNew     bool
+	BaseRev   int64
+	HasShadow bool
+	Data      []byte
+}
+
 // Lock acquires the file handle mutex.
 func (fh *FileHandle) Lock() { fh.mu.Lock() }
 

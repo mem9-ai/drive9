@@ -1604,6 +1604,346 @@ func TestLookupUsesServerMetadataBeforePendingWriteBack(t *testing.T) {
 	}
 }
 
+func TestLookupAndOpenReadUseLivePendingForNewFile(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	cacheDir := t.TempDir()
+	pendingIdx, err := NewPendingIndex(cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadowStore, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := client.New(ts.URL, "")
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.pendingIndex = pendingIdx
+	fs.shadowStore = shadowStore
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}, "live.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+
+	writeData := []byte("live data")
+	_, st = fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: 1}, Fh: createOut.Fh, Offset: 0}, writeData)
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	var lookupOut gofuse.EntryOut
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "live.txt", &lookupOut)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup: %v", st)
+	}
+	if lookupOut.Size != uint64(len(writeData)) {
+		t.Fatalf("Lookup size = %d, want %d", lookupOut.Size, len(writeData))
+	}
+
+	var openOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId}, Flags: uint32(os.O_RDONLY)}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open: %v", st)
+	}
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId}, Fh: openOut.Fh, Offset: 0, Size: uint32(len(buf))}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read: %v", st)
+	}
+	data, _ := result.Bytes(buf)
+	if string(data) != string(writeData) {
+		t.Fatalf("Read = %q, want %q", string(data), string(writeData))
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+}
+
+func TestGetAttrUsesLivePendingForNewFile(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	pendingIdx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadowStore, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := client.New(ts.URL, "")
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.pendingIndex = pendingIdx
+	fs.shadowStore = shadowStore
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}, "attr-live.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+
+	writeData := []byte("attr pending")
+	_, st = fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: 1}, Fh: createOut.Fh, Offset: 0}, writeData)
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	var lookupOut gofuse.EntryOut
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "attr-live.txt", &lookupOut)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup: %v", st)
+	}
+
+	var attrOut gofuse.AttrOut
+	st = fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId}}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr: %v", st)
+	}
+	if attrOut.Attr.Size != uint64(len(writeData)) {
+		t.Fatalf("GetAttr size = %d, want %d", attrOut.Attr.Size, len(writeData))
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+}
+
+func TestUnlinkPendingNewFileSkipsRemoteDelete(t *testing.T) {
+	var remoteDeleteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
+		switch r.Method {
+		case http.MethodDelete:
+			remoteDeleteCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	cache, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingIdx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadowStore, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := client.New(ts.URL, "")
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.SetWriteBack(cache, nil)
+	fs.pendingIndex = pendingIdx
+	fs.shadowStore = shadowStore
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}, "unlink-live.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+
+	_, st = fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: 1}, Fh: createOut.Fh, Offset: 0}, []byte("pending unlink"))
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	st = fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "unlink-live.txt")
+	if st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+	if remoteDeleteCalls.Load() != 0 {
+		t.Fatalf("remote delete calls = %d, want 0 for pending-new file", remoteDeleteCalls.Load())
+	}
+	if _, ok := fs.getLivePending("/unlink-live.txt"); ok {
+		t.Fatal("live pending entry should be removed after unlink")
+	}
+}
+
+func TestCreateEntryTracksLivePendingSizeAfterWrite(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	pendingIdx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadowStore, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := client.New(ts.URL, "")
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.pendingIndex = pendingIdx
+	fs.shadowStore = shadowStore
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}, "entry-live.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if createOut.EntryOut.Attr.Size != 0 {
+		t.Fatalf("Create initial size = %d, want 0", createOut.EntryOut.Attr.Size)
+	}
+
+	writeData := []byte("entry data")
+	_, st = fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: 1}, Fh: createOut.Fh, Offset: 0}, writeData)
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	entry, ok := fs.inodes.GetEntry(createOut.EntryOut.NodeId)
+	if !ok {
+		t.Fatal("inode entry missing after write")
+	}
+	if entry.Size != int64(len(writeData)) {
+		t.Fatalf("inode entry size after write = %d, want %d", entry.Size, len(writeData))
+	}
+
+	live, ok := fs.getLivePending("/entry-live.txt")
+	if !ok {
+		t.Fatal("expected live pending entry after write")
+	}
+	if live.Size != int64(len(writeData)) {
+		t.Fatalf("live pending size = %d, want %d", live.Size, len(writeData))
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+}
+
+func TestLookupReusesLivePendingInode(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
+		switch r.Method {
+		case http.MethodHead:
+			http.Error(w, "not found", http.StatusNotFound)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			http.Error(w, "not found", http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	pendingIdx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadowStore, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := client.New(ts.URL, "")
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.pendingIndex = pendingIdx
+	fs.shadowStore = shadowStore
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}, "reuse-live.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+
+	writeData := []byte("reuse data")
+	_, st = fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: 1}, Fh: createOut.Fh, Offset: 0}, writeData)
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	var out1 gofuse.EntryOut
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "reuse-live.txt", &out1)
+	if st != gofuse.OK {
+		t.Fatalf("First Lookup: %v", st)
+	}
+	var out2 gofuse.EntryOut
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "reuse-live.txt", &out2)
+	if st != gofuse.OK {
+		t.Fatalf("Second Lookup: %v", st)
+	}
+	if out1.NodeId != createOut.EntryOut.NodeId || out2.NodeId != createOut.EntryOut.NodeId {
+		t.Fatalf("lookup node IDs = (%d,%d), want create inode %d", out1.NodeId, out2.NodeId, createOut.EntryOut.NodeId)
+	}
+	if out2.Attr.Size != uint64(len(writeData)) {
+		t.Fatalf("lookup size = %d, want %d", out2.Attr.Size, len(writeData))
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+}
+
 // TestOpenWritable_PreloadsFromWriteBackCache verifies that opening a file
 // for writing preloads data from the write-back cache instead of the remote.
 func TestOpenWritable_PreloadsFromWriteBackCache(t *testing.T) {

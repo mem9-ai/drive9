@@ -14,6 +14,7 @@ REMOTE_VISIBILITY_INTERVAL_S="${REMOTE_VISIBILITY_INTERVAL_S:-0.2}"
 LARGE_FILE_VISIBILITY_TIMEOUT_S="${LARGE_FILE_VISIBILITY_TIMEOUT_S:-30}"
 LARGE_FILE_VISIBILITY_INTERVAL_S="${LARGE_FILE_VISIBILITY_INTERVAL_S:-1}"
 FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
+FUSE_MOUNT_LOG_DIR="${FUSE_MOUNT_LOG_DIR:-$SCRIPT_DIR/../bench/fuse_test}"
 CLI_SOURCE="${CLI_SOURCE:-build}"
 CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://drive9.ai/releases}"
 CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
@@ -420,6 +421,7 @@ PY
 
 start_mount() {
   local mode="$1"
+  mkdir -p "$FUSE_MOUNT_LOG_DIR"
   : >"$MOUNT_LOG"
   if [ "$mode" = "ro" ]; then
     drive9 mount --read-only "$MOUNT_POINT" >"$MOUNT_LOG" 2>&1 &
@@ -546,7 +548,7 @@ ROOT_REL="fuse-e2e-${TS}"
 ROOT_REMOTE="/${ROOT_REL}"
 ROOT_MOUNT="$FUSE_MOUNT_ROOT/drive9-fuse-smoke-${TS}"
 MOUNT_POINT="$ROOT_MOUNT"
-MOUNT_LOG="$FUSE_MOUNT_ROOT/drive9-fuse-smoke-${TS}.log"
+MOUNT_LOG="$FUSE_MOUNT_LOG_DIR/fuse-mount-live-${TS}.log"
 SEED_LOCAL="$FUSE_MOUNT_ROOT/drive9-fuse-seed-${TS}.txt"
 LARGE_DOWNLOADED="$FUSE_MOUNT_ROOT/drive9-fuse-large-down-${TS}.bin"
 

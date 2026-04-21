@@ -70,6 +70,9 @@ type Dat9FS struct {
 	// (EntryNotify, InodeNotify). FlushAll waits on this to ensure all
 	// notifications complete before shutdown.
 	notifyWg sync.WaitGroup
+
+	livePendingMu sync.RWMutex
+	livePending   map[string]livePendingSnapshot
 }
 
 type dirtyInodeState struct {
@@ -92,6 +95,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		gid:           uint32(os.Getgid()),
 		opts:          opts,
 		debouncer:     newFlushDebouncer(opts.FlushDebounce),
+		livePending:   make(map[string]livePendingSnapshot),
 	}
 }
 
@@ -199,6 +203,97 @@ func (fs *Dat9FS) clearDirtySize(ino uint64, seq uint64) {
 	state, ok := fs.dirtyInodes[ino]
 	if ok && state.seq == seq {
 		delete(fs.dirtyInodes, ino)
+	}
+}
+
+func (fs *Dat9FS) setLivePendingLocked(fh *FileHandle) {
+	if fh == nil || fh.Dirty == nil || fh.Path == "" {
+		return
+	}
+	snap := livePendingSnapshot{
+		Path:      fh.Path,
+		Ino:       fh.Ino,
+		Size:      fh.Dirty.Size(),
+		Mtime:     time.Now().Unix(),
+		IsNew:     fh.IsNew,
+		BaseRev:   fh.BaseRev,
+		HasShadow: fh.ShadowReady,
+	}
+	if fh.Dirty.CanMaterializeFull() {
+		snap.Data = append([]byte(nil), fh.Dirty.Bytes()...)
+	}
+	fs.livePendingMu.Lock()
+	fs.livePending[fh.Path] = snap
+	fs.livePendingMu.Unlock()
+}
+
+func (fs *Dat9FS) clearLivePending(path string) {
+	if path == "" {
+		return
+	}
+	fs.livePendingMu.Lock()
+	delete(fs.livePending, path)
+	fs.livePendingMu.Unlock()
+}
+
+func (fs *Dat9FS) getLivePending(path string) (livePendingSnapshot, bool) {
+	fs.livePendingMu.RLock()
+	defer fs.livePendingMu.RUnlock()
+	snap, ok := fs.livePending[path]
+	return snap, ok
+}
+
+func traceFusePath(path string) bool {
+	return strings.Contains(path, "/fuse-e2e-")
+}
+
+func logFuseTrace(format string, args ...any) {
+	log.Printf("fuse trace: "+format, args...)
+}
+
+func (fs *Dat9FS) dirtyHandleByPath(path string) *FileHandle {
+	if path == "" {
+		return nil
+	}
+	var target *FileHandle
+	fs.fileHandles.ForEach(func(_ uint64, fh *FileHandle) {
+		if target != nil || fh == nil || fh.Path != path {
+			return
+		}
+		fh.Lock()
+		if fh.Dirty != nil {
+			target = fh
+			return
+		}
+		fh.Unlock()
+	})
+	return target
+}
+
+func (fs *Dat9FS) snapshotDirtyHandleByPath(path string) ([]byte, int64, int64, bool) {
+	fh := fs.dirtyHandleByPath(path)
+	if fh == nil {
+		return nil, 0, 0, false
+	}
+	defer fh.Unlock()
+	if fh.Dirty == nil || !fh.Dirty.CanMaterializeFull() {
+		return nil, 0, 0, false
+	}
+	data := append([]byte(nil), fh.Dirty.Bytes()...)
+	return data, fh.Dirty.Size(), fh.BaseRev, fh.IsNew
+}
+
+func (fs *Dat9FS) renameLivePending(oldPath, newPath string) {
+	if oldPath == "" || newPath == "" || oldPath == newPath {
+		return
+	}
+	fs.livePendingMu.Lock()
+	defer fs.livePendingMu.Unlock()
+	if snap, ok := fs.livePending[oldPath]; ok {
+		delete(fs.livePending, oldPath)
+		snap.Path = newPath
+		snap.Mtime = time.Now().Unix()
+		fs.livePending[newPath] = snap
 	}
 }
 
@@ -564,6 +659,9 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 }
 
 func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
+	if entry != nil && traceFusePath(entry.Path) {
+		logFuseTrace("fillAttr path=%s ino=%d size=%d is_dir=%t rev=%d", entry.Path, entry.Ino, entry.Size, entry.IsDir, entry.Revision)
+	}
 	out.Ino = entry.Ino
 	out.Size = uint64(entry.Size)
 	out.Blocks = (uint64(entry.Size) + 511) / 512
@@ -586,6 +684,9 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 }
 
 func (fs *Dat9FS) fillEntryOut(entry *InodeEntry, out *gofuse.EntryOut) {
+	if entry != nil && traceFusePath(entry.Path) {
+		logFuseTrace("fillEntryOut path=%s ino=%d size=%d is_dir=%t", entry.Path, entry.Ino, entry.Size, entry.IsDir)
+	}
 	out.NodeId = entry.Ino
 	out.Generation = 1
 	fs.fillAttr(entry, &out.Attr)
@@ -699,12 +800,42 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if st != gofuse.OK {
 		return st
 	}
+	if traceFusePath(childP) {
+		logFuseTrace("lookup path=%s", childP)
+	}
 
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
+	if live, ok := fs.getLivePending(childP); ok {
+		if traceFusePath(childP) {
+			logFuseTrace("lookup live-pending path=%s size=%d is_new=%t ino=%d", childP, live.Size, live.IsNew, live.Ino)
+		}
+		mtime := time.Unix(live.Mtime, 0)
+		ino := live.Ino
+		if ino == 0 {
+			ino = fs.inodes.Lookup(childP, false, live.Size, mtime)
+		}
+		fs.inodes.UpdateSize(ino, live.Size)
+		fs.inodes.UpdateMtime(ino, mtime)
+		if live.IsNew {
+			fs.inodes.UpdateRevision(ino, 0)
+		} else if live.BaseRev > 0 {
+			fs.inodes.UpdateRevision(ino, live.BaseRev)
+		}
+		entry, ok := fs.inodes.GetEntry(ino)
+		if !ok {
+			return gofuse.EIO
+		}
+		fs.fillEntryOut(entry, out)
+		return gofuse.OK
+	}
+
 	stat, err := fs.client.StatCtx(ctx, childP)
 	if err != nil {
+		if traceFusePath(childP) {
+			logFuseTrace("lookup remote-stat-error path=%s err=%v", childP, err)
+		}
 		if !isNotFoundErr(err) {
 			return httpToFuseStatus(err)
 		}
@@ -745,6 +876,9 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	mtime := time.Now()
 	if !stat.Mtime.IsZero() {
 		mtime = stat.Mtime
+	}
+	if traceFusePath(childP) {
+		logFuseTrace("lookup remote-ok path=%s size=%d is_dir=%t rev=%d", childP, stat.Size, stat.IsDir, stat.Revision)
 	}
 	ino := fs.inodes.Lookup(childP, stat.IsDir, stat.Size, mtime)
 	// Store server revision for cache validation.
@@ -794,6 +928,9 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	if !ok {
 		return gofuse.ENOENT
 	}
+	if traceFusePath(entry.Path) {
+		logFuseTrace("getattr path=%s node=%d", entry.Path, input.NodeId)
+	}
 
 	entry, st := fs.refreshRegularFileEntryBase(cancel, input.NodeId, entry)
 	if st != gofuse.OK {
@@ -803,7 +940,16 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	// Server metadata is the base view. The local mount only overlays
 	// uncommitted writable state on top of that base.
 	if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
+		if traceFusePath(entry.Path) {
+			logFuseTrace("getattr dirty-size path=%s size=%d", entry.Path, size)
+		}
 		entry.Size = size
+	} else if live, ok := fs.getLivePending(entry.Path); ok {
+		if traceFusePath(entry.Path) {
+			logFuseTrace("getattr live-pending path=%s size=%d is_new=%t", entry.Path, live.Size, live.IsNew)
+		}
+		entry.Size = live.Size
+		entry.Mtime = time.Unix(live.Mtime, 0)
 	} else if fs.writeBack != nil && !entry.IsDir {
 		// Check pending index first (in-memory, O(1)), then fall back
 		// to old GetMeta for backward compatibility.
@@ -941,8 +1087,17 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if st != gofuse.OK {
 		return st
 	}
+	if traceFusePath(childP) {
+		logFuseTrace("unlink path=%s", childP)
+	}
 
 	pendingNew := false
+	if live, ok := fs.getLivePending(childP); ok && live.IsNew {
+		if traceFusePath(childP) {
+			logFuseTrace("unlink live-pending new path=%s", childP)
+		}
+		pendingNew = true
+	}
 	if fs.writeBack != nil && fs.uploader != nil {
 		// Wait for any in-flight upload to finish so it doesn't "revive"
 		// the file on the server after we delete it.
@@ -974,6 +1129,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 			fs.shadowStore.Remove(childP)
 		}
 	}
+	fs.clearLivePending(childP)
 
 	if !pendingNew {
 		ctx, cf := fuseCtx(cancel)
@@ -1105,6 +1261,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 			}
 		}
 		if isPendingNew {
+			fs.renameLivePending(oldP, newP)
 			fs.inodes.Rename(oldP, newP)
 			fs.readCache.Invalidate(oldP)
 			fs.readCache.InvalidatePrefix(oldP + "/")
@@ -1138,6 +1295,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	if err := fs.client.RenameCtx(ctx, oldP, newP); err != nil {
 		return httpToFuseStatus(err)
 	}
+	fs.renameLivePending(oldP, newP)
 
 	// After server-side rename, migrate pending descendants.
 	// If oldP is a directory, pending children under oldP+"/", must be
@@ -1386,9 +1544,11 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		Ino:         ino,
 		Path:        childP,
 		Flags:       input.Flags,
+		OpenPID:     input.Pid,
 		Dirty:       wb,
 		OrigSize:    created.Size,
 		BaseRev:     created.Revision,
+		IsNew:       true,
 		ShadowReady: false,
 	}
 
@@ -1421,6 +1581,10 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	}
 
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
+	fs.setLivePendingLocked(fh)
+	if traceFusePath(childP) {
+		logFuseTrace("create path=%s ino=%d base_rev=%d", childP, ino, fh.BaseRev)
+	}
 	out.Fh = fs.fileHandles.Allocate(fh)
 	// Use cached I/O for small/interactive files. Kernel coalesces writes
 	// and serves reads from page cache after first access.
@@ -1443,6 +1607,92 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	p, ok := fs.inodes.GetPath(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
+	}
+	if traceFusePath(p) {
+		logFuseTrace("open path=%s flags=%d", p, input.Flags)
+	}
+	if live, ok := fs.getLivePending(p); ok {
+		if traceFusePath(p) {
+			logFuseTrace("open live-pending path=%s size=%d is_new=%t has_shadow=%t data_len=%d", p, live.Size, live.IsNew, live.HasShadow, len(live.Data))
+		}
+		fh := &FileHandle{
+			Ino:        input.NodeId,
+			Path:       p,
+			Flags:      input.Flags,
+			OpenPID:    input.Pid,
+			OrigSize:   live.Size,
+			BaseRev:    live.BaseRev,
+			IsNew:      live.IsNew,
+			ShadowReady: live.HasShadow,
+		}
+		if len(live.Data) > 0 || live.Size == 0 {
+			wb := NewWriteBuffer(p, maxPreloadSize, 0)
+			if len(live.Data) > 0 {
+				if _, err := wb.Write(0, live.Data); err != nil {
+					return gofuse.EIO
+				}
+				wb.ClearDirty()
+			} else {
+				wb.totalSize = live.Size
+			}
+			fh.Dirty = wb
+			out.Fh = fs.fileHandles.Allocate(fh)
+			out.OpenFlags = gofuse.FOPEN_DIRECT_IO
+			return gofuse.OK
+		}
+		if snap, size, baseRev, isNew := fs.snapshotDirtyHandleByPath(p); snap != nil {
+			if traceFusePath(p) {
+				logFuseTrace("open using dirty snapshot path=%s size=%d base_rev=%d is_new=%t", p, size, baseRev, isNew)
+			}
+			wb := NewWriteBuffer(p, maxPreloadSize, 0)
+			if len(snap) > 0 {
+				if _, err := wb.Write(0, snap); err != nil {
+					return gofuse.EIO
+				}
+				wb.ClearDirty()
+			} else {
+				wb.totalSize = size
+			}
+			fh.Dirty = wb
+			fh.OrigSize = size
+			fh.BaseRev = baseRev
+			fh.IsNew = isNew
+			out.Fh = fs.fileHandles.Allocate(fh)
+			out.OpenFlags = gofuse.FOPEN_DIRECT_IO
+			return gofuse.OK
+		}
+		if live.IsNew {
+			if traceFusePath(p) {
+				logFuseTrace("open live-pending new path=%s returning ENOENT", p)
+			}
+			return gofuse.ENOENT
+		}
+		if fs.pendingIndex != nil && fs.shadowStore != nil {
+			if meta, ok := fs.pendingIndex.GetMeta(p); ok && fs.shadowStore.Has(p) {
+				if err := fs.loadWritableHandleFromShadowLocked(fh, meta); err == nil {
+					if fh.Dirty != nil {
+						fh.Dirty.ClearDirty()
+					}
+				}
+			}
+		}
+		if fh.Dirty == nil && fs.writeBack != nil {
+			if wbData, ok := fs.writeBack.Get(p); ok {
+				wb := NewWriteBuffer(p, maxPreloadSize, 0)
+				if len(wbData) > 0 {
+					if _, err := wb.Write(0, wbData); err != nil {
+						return gofuse.EIO
+					}
+					wb.ClearDirty()
+				} else {
+					wb.totalSize = live.Size
+				}
+				fh.Dirty = wb
+			}
+		}
+		out.Fh = fs.fileHandles.Allocate(fh)
+		out.OpenFlags = gofuse.FOPEN_DIRECT_IO
+		return gofuse.OK
 	}
 
 	fh := &FileHandle{
@@ -1572,6 +1822,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	if !ok {
 		return nil, gofuse.ENOENT
 	}
+	if traceFusePath(fh.Path) {
+		logFuseTrace("read path=%s fh=%d offset=%d size=%d dirty=%t shadow=%t", fh.Path, input.Fh, input.Offset, input.Size, fh.Dirty != nil, fh.ShadowReady)
+	}
 
 	fh.Lock()
 	// If there's a dirty buffer (even empty — e.g. after Create or truncate-to-zero),
@@ -1609,6 +1862,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		}
 
 		if !touchesEvicted {
+			if traceFusePath(fh.Path) {
+				logFuseTrace("read serving dirty buffer path=%s fh=%d", fh.Path, input.Fh)
+			}
 			// Ensure parts touched by this read are loaded from the server
 			// before calling ReadAt. Without this, ReadAt returns zeros for
 			// unloaded parts in lazily-loaded files.
@@ -1641,6 +1897,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		// on the server, so fall through to ReadStreamRange.
 		fh.Unlock()
 	} else if fh.Dirty != nil && fh.ShadowReady {
+		if traceFusePath(fh.Path) {
+			logFuseTrace("read serving shadow-ready dirty handle path=%s fh=%d", fh.Path, input.Fh)
+		}
 		offset := int64(input.Offset)
 		size := fh.Dirty.Size()
 		if offset >= size {
@@ -1674,6 +1933,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// 1. ShadowStore.ReadAt (local SSD) — for files staged by Flush
 	// 2. WriteBackCache.Get (local disk, full file) — legacy path
 	if fh.Dirty == nil && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path) {
+		if traceFusePath(fh.Path) {
+			logFuseTrace("read serving standalone shadow path=%s fh=%d", fh.Path, input.Fh)
+		}
 		offset := int64(input.Offset)
 		sz := fs.shadowStore.Size(fh.Path)
 		if sz >= 0 {
@@ -1696,6 +1958,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// that cached data instead of going to the server (which has stale data).
 	if fh.Dirty == nil && fs.writeBack != nil {
 		if wbData, ok := fs.writeBack.Get(fh.Path); ok {
+			if traceFusePath(fh.Path) {
+				logFuseTrace("read serving writeback path=%s fh=%d", fh.Path, input.Fh)
+			}
 			offset := int64(input.Offset)
 			if offset >= int64(len(wbData)) {
 				return gofuse.ReadResultData(nil), gofuse.OK
@@ -1708,10 +1973,10 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		}
 	}
 
+	p := fh.Path
+
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-
-	p := fh.Path
 
 	// Try prefetcher for large read-only files
 	if fh.Prefetch != nil {
@@ -1733,6 +1998,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// it to the cache for validation. Cache hit only if revision matches.
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
 	if entry != nil && entry.Size <= smallFileThreshold && entry.Size > 0 {
+		if traceFusePath(fh.Path) {
+			logFuseTrace("read falling back to remote small read path=%s fh=%d entry_size=%d", fh.Path, input.Fh, entry.Size)
+		}
 		cacheRev := entry.Revision // use revision from last Stat/Lookup
 		// Fast path: serve from cache without any HTTP call.
 		if data, ok := fs.readCache.Get(p, cacheRev); ok {
@@ -1767,6 +2035,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	// Large file or unknown size: range read (avoids O(offset) discard)
+	if traceFusePath(fh.Path) {
+		logFuseTrace("read falling back to remote range read path=%s fh=%d", fh.Path, input.Fh)
+	}
 	rc, err := fs.client.ReadStreamRange(ctx, p, int64(input.Offset), int64(input.Size))
 	if err != nil {
 		return nil, httpToFuseStatus(err)
@@ -1810,6 +2081,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		}
 	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+	fs.setLivePendingLocked(fh)
 	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
 	return n, gofuse.OK
 }
@@ -2111,6 +2383,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		return gofuse.OK
 	}
 	if !fh.Dirty.HasDirtyParts() {
+		fs.clearLivePending(fh.Path)
 		return gofuse.OK
 	}
 
@@ -2163,6 +2436,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fh.Dirty.ClearDirty()
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
+		fs.clearLivePending(fh.Path)
 		fs.readCache.Invalidate(fh.Path)
 		fs.dirCache.Invalidate(parentDir(fh.Path))
 		fs.inodes.UpdateSize(fh.Ino, size)
@@ -2203,6 +2477,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fh.Dirty.ClearDirty()
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
+		fs.clearLivePending(fh.Path)
 		fs.readCache.Invalidate(fh.Path)
 		fs.dirCache.Invalidate(parentDir(fh.Path))
 		fs.inodes.UpdateSize(fh.Ino, size)
@@ -2268,6 +2543,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	fh.Dirty.ClearDirty()
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 	fh.DirtySeq = 0
+	fs.clearLivePending(fh.Path)
 	fs.readCache.Invalidate(fh.Path)
 	fs.dirCache.Invalidate(parentDir(fh.Path))
 	fs.inodes.UpdateSize(fh.Ino, size)
