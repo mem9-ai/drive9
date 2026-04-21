@@ -13,6 +13,23 @@ import (
 
 // MountCmd handles the "drive9 mount" command.
 //
+// Dispatch fork (Row A, V2e): the first positional argument selects the
+// mount flavour. `drive9 mount vault <path>` routes to the read-only vault
+// FUSE filesystem; anything else retains the pre-V2e fs-mount behaviour
+// below. We MUST peek at the first arg before flag.Parse because the
+// vault flag set is smaller (no cache-size / write-path knobs), and a
+// single flag set would quietly accept write-path flags for a vault mount
+// — that would violate Row C (read-only) in a subtle, mount-time-visible
+// way. See docs/specs/vault-interaction-end-state.md §14.2.
+func MountCmd(args []string) error {
+	if len(args) > 0 && args[0] == "vault" {
+		return VaultMountCmd(args[1:])
+	}
+	return fsMountCmd(args)
+}
+
+// fsMountCmd is the pre-V2e writable fs mount entry point.
+//
 // Credential precedence matches spec §14.2: explicit --server / --api-key flag
 // > DRIVE9_SERVER / DRIVE9_API_KEY / DRIVE9_VAULT_TOKEN env > active config
 // context. The flag defaults are empty strings so we can distinguish "unset"
@@ -30,7 +47,7 @@ import (
 // drive9fuse.Mount runs in-process (no fork/exec); credentials flow through
 // MountOptions{Server, APIKey, Token}, not through the child's environment.
 // This makes the resolver's Unsetenv-after-read mitigation safe for mount.
-func MountCmd(args []string) error {
+func fsMountCmd(args []string) error {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
