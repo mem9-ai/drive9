@@ -642,6 +642,64 @@ func TestGetAttrUsesLatestDirtyHandleSize(t *testing.T) {
 	}
 }
 
+func TestGetAttrUsesServerBaseThenWriteBackOverlay(t *testing.T) {
+	mtime := time.Date(2026, 4, 21, 13, 0, 0, 0, time.UTC)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(mtime.Unix(), 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.SetWriteBack(cache, nil)
+	ino := fs.inodes.Lookup("/file.bin", false, 0, time.Time{})
+
+	if err := cache.PutWithBaseRev("/file.bin", []byte("overlay-data"), int64(len("overlay-data")), PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	var out gofuse.AttrOut
+	st := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr status = %v, want OK", st)
+	}
+	if got, want := out.Size, uint64(len("overlay-data")); got != want {
+		t.Fatalf("GetAttr size = %d, want %d", got, want)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Revision != 7 {
+		t.Fatalf("entry.Revision = %d, want 7", entry.Revision)
+	}
+	if !entry.Mtime.Equal(mtime) {
+		t.Fatalf("entry.Mtime = %v, want %v", entry.Mtime, mtime)
+	}
+}
+
 func TestGetAttrDirectoryDoesNotRequireRemoteStat(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {

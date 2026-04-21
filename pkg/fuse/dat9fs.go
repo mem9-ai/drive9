@@ -619,38 +619,6 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		return st
 	}
 
-	// Pending namespace overlay: check in-memory PendingIndex first (O(1)),
-	// then fall back to the write-back cache GetMeta for backward compat.
-	if fs.pendingIndex != nil {
-		if meta, ok := fs.pendingIndex.GetMeta(childP); ok {
-			mtime := meta.Mtime
-			if mtime.IsZero() {
-				mtime = time.Now()
-			}
-			ino := fs.inodes.Lookup(childP, false, meta.Size, mtime)
-			entry, ok := fs.inodes.GetEntry(ino)
-			if !ok {
-				return gofuse.EIO
-			}
-			fs.fillEntryOut(entry, out)
-			return gofuse.OK
-		}
-	} else if fs.writeBack != nil {
-		if meta, ok := fs.writeBack.GetMeta(childP); ok {
-			mtime := meta.Mtime
-			if mtime.IsZero() {
-				mtime = time.Now()
-			}
-			ino := fs.inodes.Lookup(childP, false, meta.Size, mtime)
-			entry, ok := fs.inodes.GetEntry(ino)
-			if !ok {
-				return gofuse.EIO
-			}
-			fs.fillEntryOut(entry, out)
-			return gofuse.OK
-		}
-	}
-
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
@@ -714,13 +682,45 @@ func (fs *Dat9FS) Forget(nodeId uint64, nlookup uint64) {
 	fs.inodes.Forget(nodeId, nlookup)
 }
 
+func (fs *Dat9FS) refreshRegularFileEntryBase(cancel <-chan struct{}, nodeID uint64, entry *InodeEntry) (*InodeEntry, gofuse.Status) {
+	if entry == nil || nodeID == 1 || entry.IsDir || entry.Revision > 0 {
+		return entry, gofuse.OK
+	}
+
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
+	stat, err := fs.client.StatCtx(ctx, entry.Path)
+	if err != nil {
+		return nil, httpToFuseStatus(err)
+	}
+	entry.Size = stat.Size
+	entry.IsDir = stat.IsDir
+	fs.inodes.UpdateSize(nodeID, stat.Size)
+	if stat.Revision > 0 {
+		entry.Revision = stat.Revision
+		fs.inodes.UpdateRevision(nodeID, stat.Revision)
+	}
+	if !stat.Mtime.IsZero() {
+		entry.Mtime = stat.Mtime
+		fs.inodes.UpdateMtime(nodeID, stat.Mtime)
+	}
+	return entry, gofuse.OK
+}
+
 func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut) gofuse.Status {
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
 	}
 
-	// Prefer unflushed writable state over the remote object size.
+	entry, st := fs.refreshRegularFileEntryBase(cancel, input.NodeId, entry)
+	if st != gofuse.OK {
+		return st
+	}
+
+	// Server metadata is the base view. The local mount only overlays
+	// uncommitted writable state on top of that base.
 	if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
 		entry.Size = size
 	} else if fs.writeBack != nil && !entry.IsDir {
@@ -743,45 +743,6 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 					entry.Mtime = meta.Mtime
 				}
 				pendingFound = true
-			}
-		}
-		if !pendingFound && input.NodeId != 1 {
-			ctx, cf := fuseCtx(cancel)
-			defer cf()
-			stat, err := fs.client.StatCtx(ctx, entry.Path)
-			if err != nil {
-				return httpToFuseStatus(err)
-			}
-			entry.Size = stat.Size
-			entry.IsDir = stat.IsDir
-			fs.inodes.UpdateSize(input.NodeId, stat.Size)
-			if stat.Revision > 0 {
-				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
-			}
-			if !stat.Mtime.IsZero() {
-				entry.Mtime = stat.Mtime
-				fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
-			}
-		}
-	} else if input.NodeId != 1 {
-		// Some deployments do not support HEAD/stat on directories.
-		// Keep directory attrs from inode map and only refresh regular files.
-		if !entry.IsDir {
-			ctx, cf := fuseCtx(cancel)
-			defer cf()
-			stat, err := fs.client.StatCtx(ctx, entry.Path)
-			if err != nil {
-				return httpToFuseStatus(err)
-			}
-			entry.Size = stat.Size
-			entry.IsDir = stat.IsDir
-			fs.inodes.UpdateSize(input.NodeId, stat.Size)
-			if stat.Revision > 0 {
-				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
-			}
-			if !stat.Mtime.IsZero() {
-				entry.Mtime = stat.Mtime
-				fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
 			}
 		}
 	}

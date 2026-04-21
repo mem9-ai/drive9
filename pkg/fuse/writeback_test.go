@@ -1342,9 +1342,10 @@ func TestSamePathConsecutiveSaves(t *testing.T) {
 	}
 }
 
-// TestLookupFindsPendingWriteBack verifies that Lookup returns metadata
-// for files that only exist in the write-back cache (pending upload).
-func TestLookupFindsPendingWriteBack(t *testing.T) {
+// TestLookupIgnoresPendingWriteBackWithoutServerMetadata verifies that local
+// write-back state no longer acts as namespace truth once FUSE is
+// server-metadata-first.
+func TestLookupIgnoresPendingWriteBackWithoutServerMetadata(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodHead:
@@ -1376,11 +1377,43 @@ func TestLookupFindsPendingWriteBack(t *testing.T) {
 
 	var out gofuse.EntryOut
 	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "pending.txt", &out)
-	if st != gofuse.OK {
-		t.Fatalf("Lookup: %v — file should be visible from write-back cache", st)
+	if st != gofuse.ENOENT {
+		t.Fatalf("Lookup status = %v, want ENOENT", st)
 	}
-	if out.Size != 10 {
-		t.Fatalf("Lookup size = %d, want 10", out.Size)
+}
+
+func TestLookupUsesServerMetadataBeforePendingWriteBack(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := client.New(ts.URL, "")
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.SetWriteBack(cache, nil)
+
+	_ = cache.PutWithBaseRev("/server.txt", []byte("local overlay"), int64(len("local overlay")), PendingOverwrite, 7)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "server.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if out.Size != 4 {
+		t.Fatalf("Lookup size = %d, want 4", out.Size)
 	}
 }
 
