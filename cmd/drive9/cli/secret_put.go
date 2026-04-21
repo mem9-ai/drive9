@@ -41,38 +41,16 @@ import (
 // wholesale-replace model. Fail-loud > silent-drop: extra flags and stdin
 // input both hit explicit rejections rather than being ignored.
 
-// errorKind is the anchor class surfaced in error strings for Row H
-// observability. Each value's String() is a user-visible anchor substring
-// that operators can grep on and that tests assert verbatim.
-type errorKind int
-
-const (
-	// errAbortedLocally is reserved strictly for the pre-send path where
-	// the CLI can prove no byte reached the server (len(requests)==0 in
-	// tests). Do NOT use this for network errors during or after the PUT —
-	// once bytes are on the wire, local code cannot prove zero-byte peer
-	// delivery from socket errno alone.
-	errAbortedLocally errorKind = iota
-	// errServerRefused: 4xx response received. Server actively rejected;
-	// no ambiguity about whether the state changed (server says no).
-	errServerRefused
-	// errStatusUnknown: 5xx, transport-level failure mid-request, or any
-	// ack-lost condition. The CLI CANNOT prove from the local side whether
-	// the server applied the write or not. Operators must reconcile.
-	errStatusUnknown
-)
-
-func (k errorKind) anchor() string {
-	switch k {
-	case errAbortedLocally:
-		return "aborted locally"
-	case errServerRefused:
-		return "server refused"
-	case errStatusUnknown:
-		return "status unknown"
-	}
-	return ""
-}
+// Row H observability anchors are user-visible grep targets, asserted
+// verbatim by tests. They are inlined into the relevant fmt.Errorf call
+// sites (see SecretPut body) rather than routed through a helper — the
+// three call sites are the entire vocabulary, and a typed shim would
+// just add indirection and a second source of truth.
+//
+//   "aborted locally"  — pre-send path; CLI proves zero bytes reached peer
+//   "server refused"   — 4xx response; server actively rejected
+//   "status unknown"   — 5xx / transport / ack-lost; delivery uncertain,
+//                        operator must reconcile
 
 // stdinIsTTY is indirected through a var so tests can force-override it.
 // Production callers go through the real isatty check.

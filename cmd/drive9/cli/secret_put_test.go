@@ -338,8 +338,12 @@ func TestSecretPut_RowE_PrincipalOwnerOnly(t *testing.T) {
 		withTTY(t, true)
 		t.Setenv("HOME", t.TempDir())
 		t.Setenv("DRIVE9_SERVER", "http://example.invalid")
-		os.Unsetenv(EnvAPIKey)
-		os.Unsetenv(EnvVaultToken)
+		// Setenv-then-unset so t.Cleanup restores the caller's env state;
+		// a bare os.Unsetenv would leak across tests AND fail errcheck.
+		t.Setenv(EnvAPIKey, "")
+		t.Setenv(EnvVaultToken, "")
+		_ = os.Unsetenv(EnvAPIKey)
+		_ = os.Unsetenv(EnvVaultToken)
 		resetCredentialCacheForTest()
 		t.Cleanup(resetCredentialCacheForTest)
 
