@@ -2100,6 +2100,9 @@ func TestRename_Directory_MigratesPendingDescendants(t *testing.T) {
 func TestFlush_SkipsRedundantCacheWrite(t *testing.T) {
 	var putCount atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
