@@ -18,6 +18,7 @@ require (
 	github.com/pingcap/failpoint v0.0.0-20260406204437-bbc9d102c19e
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.41.0
 	go.uber.org/zap v1.27.0
+	golang.org/x/term v0.40.0
 	golang.org/x/text v0.35.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
