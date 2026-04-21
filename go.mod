@@ -19,6 +19,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.41.0
 	github.com/tidbcloud/tidb-management-service/api v0.0.0-20260409104828-3391ea2e1652
 	go.uber.org/zap v1.27.0
+	golang.org/x/term v0.40.0
 	golang.org/x/text v0.35.0
 	google.golang.org/grpc v1.79.1
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1

@@ -31,13 +31,15 @@ const (
 // rationale on fail-loud > silent-drop.
 func Secret(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage drive9 vault <set|get|with|ls|rm|grant|revoke|audit>")
+		return fmt.Errorf("usage drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>")
 	}
 	switch args[0] {
 	case "set":
 		return SecretSet(args[1:])
 	case "get":
 		return SecretGet(args[1:])
+	case "put":
+		return SecretPut(args[1:])
 	case "with":
 		return SecretWith(args[1:])
 	case "ls":
@@ -51,7 +53,7 @@ func Secret(args []string) error {
 	case "audit":
 		return SecretAudit(args[1:])
 	case "-h", "--help", "help":
-		return fmt.Errorf("usage drive9 vault <set|get|with|ls|rm|grant|revoke|audit>")
+		return fmt.Errorf("usage drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>")
 	default:
 		return fmt.Errorf("unknown vault command %q", args[0])
 	}
