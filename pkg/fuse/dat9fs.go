@@ -742,7 +742,6 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 				if !meta.Mtime.IsZero() {
 					entry.Mtime = meta.Mtime
 				}
-				pendingFound = true
 			}
 		}
 	}
