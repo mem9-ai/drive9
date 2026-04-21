@@ -9,7 +9,7 @@
 //	create  provision a new database
 //	ctx     switch or list contexts
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, sh, grep, find)
-//	vault   vault operations (set, get, with, ls, rm, grant, revoke, audit)
+//	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
 //	mount   mount drive9 as a local FUSE filesystem
 //	umount  unmount a drive9 FUSE mount
 package main
