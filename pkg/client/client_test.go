@@ -63,6 +63,56 @@ func TestWriteAndRead(t *testing.T) {
 	}
 }
 
+func TestCreateMetadataOnly(t *testing.T) {
+	c, cleanup := newTestClient(t)
+	defer cleanup()
+
+	created, err := c.Create("/meta-only.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Path != "/meta-only.txt" {
+		t.Fatalf("path=%q, want /meta-only.txt", created.Path)
+	}
+	if created.Revision != 1 {
+		t.Fatalf("revision=%d, want 1", created.Revision)
+	}
+	if created.Size != 0 {
+		t.Fatalf("size=%d, want 0", created.Size)
+	}
+	if created.Status != "CONFIRMED" {
+		t.Fatalf("status=%q, want CONFIRMED", created.Status)
+	}
+
+	info, err := c.Stat("/meta-only.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Revision != 1 || info.Size != 0 || info.IsDir {
+		t.Fatalf("unexpected stat after create: %+v", info)
+	}
+}
+
+func TestCreateMetadataOnlyConflict(t *testing.T) {
+	c, cleanup := newTestClient(t)
+	defer cleanup()
+
+	if _, err := c.Create("/dup.txt"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.Create("/dup.txt")
+	if err == nil {
+		t.Fatal("expected conflict on duplicate metadata create")
+	}
+	statusErr, ok := err.(*StatusError)
+	if !ok {
+		t.Fatalf("error type=%T, want *StatusError", err)
+	}
+	if statusErr.StatusCode != 409 {
+		t.Fatalf("status=%d, want 409", statusErr.StatusCode)
+	}
+}
+
 func TestListDir(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()

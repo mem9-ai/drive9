@@ -164,6 +164,16 @@ type StatResult struct {
 	Mtime    time.Time
 }
 
+// CreateResult describes the authoritative metadata returned by a metadata-only
+// file create.
+type CreateResult struct {
+	Path     string
+	Revision int64
+	Size     int64
+	Status   string
+	Mtime    time.Time
+}
+
 func (c *Client) url(path string) string {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
@@ -423,6 +433,49 @@ func (c *Client) RenameCtx(ctx context.Context, oldPath, newPath string) error {
 // Mkdir creates a directory.
 func (c *Client) Mkdir(path string) error {
 	return c.MkdirCtx(context.Background(), path)
+}
+
+// Create issues a metadata-only file create.
+func (c *Client) Create(path string) (*CreateResult, error) {
+	return c.CreateCtx(context.Background(), path)
+}
+
+// CreateCtx issues a metadata-only file create with context support.
+func (c *Client) CreateCtx(ctx context.Context, path string) (*CreateResult, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?create", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+
+	var raw struct {
+		Path     string `json:"path"`
+		Revision int64  `json:"revision"`
+		Size     int64  `json:"size"`
+		Status   string `json:"status"`
+		Mtime    int64  `json:"mtime"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+
+	result := &CreateResult{
+		Path:     raw.Path,
+		Revision: raw.Revision,
+		Size:     raw.Size,
+		Status:   raw.Status,
+	}
+	if raw.Mtime > 0 {
+		result.Mtime = time.Unix(raw.Mtime, 0)
+	}
+	return result, nil
 }
 
 // MkdirCtx creates a directory with context support.
