@@ -641,7 +641,7 @@ Legend:
 | `drive9 ctx add --api-key` | implemented | #284 (PR-B) |
 | `drive9 ctx import --from-file` | implemented | #284 (PR-B) |
 | `drive9 ctx ls` / `use` / `rm` | implemented | #284 (PR-B) |
-| `drive9 vault put <path> --from <dir>` | not-yet | Appendix-A alignment PR track |
+| `drive9 vault put <path> --from <dir>` | implemented | V2d (#307) |
 | `drive9 vault grant <scope>... --agent --perm --ttl` | implemented | Appendix-A alignment PR track |
 | `drive9 vault revoke <grant-id>` | implemented | Appendix-A alignment PR track |
 | `drive9 vault with <path> -- <cmd>` | implemented | Appendix-A alignment PR track |
