@@ -185,17 +185,18 @@ func SecretWith(args []string) error {
 	if err != nil {
 		return err
 	}
-	sep := -1
-	for i := 1; i < len(args); i++ {
-		if args[i] == "--" {
-			sep = i
-			break
-		}
+	// Strict argv shape: exactly one path, then `--`, then the child
+	// command. Anything between the path and `--` is rejected rather
+	// than silently dropped — V2c pinned a single explicit argv shape
+	// for `vault with`, and accept-and-ignore here would undercut that
+	// contract (reviewer blocker flagged by adv-1 on PR #306).
+	if args[1] != "--" {
+		return fmt.Errorf("usage drive9 vault with /n/vault/<secret> -- <command...> (unexpected argument %q before `--`)", args[1])
 	}
-	if sep < 0 || sep == len(args)-1 {
+	cmdArgs := args[2:]
+	if len(cmdArgs) == 0 {
 		return fmt.Errorf("usage drive9 vault with /n/vault/<secret> -- <command...>")
 	}
-	cmdArgs := args[sep+1:]
 
 	c, err := newVaultReadClientFromEnv()
 	if err != nil {
@@ -655,7 +656,7 @@ func newVaultManagementClientFromEnv() (*client.Client, error) {
 func newVaultReadClientFromEnv() (*client.Client, error) {
 	r := ResolveCredentials()
 	if r.Kind != CredentialDelegated {
-		return nil, fmt.Errorf("missing capability token; set %s before using drive9 vault get/exec", EnvVaultToken)
+		return nil, fmt.Errorf("missing capability token; set %s before using drive9 vault get/with", EnvVaultToken)
 	}
 	return client.New(r.Server, r.Token), nil
 }

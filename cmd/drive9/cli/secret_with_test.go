@@ -60,6 +60,29 @@ func TestSecretWithPathShapeEnforcement(t *testing.T) {
 	}
 }
 
+// G-V2c-1 (argv shape): the single-path-then-`--` argv contract is pinned.
+// V2c picked a single explicit CLI shape; accept-and-ignore of extra args
+// between the path and `--` would be a silent second contract. Fail-fast
+// with a message that names the offending argument.
+func TestSecretWithRejectsGarbageBeforeSeparator(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DRIVE9_SERVER", "http://example.invalid")
+	t.Setenv(EnvVaultToken, "cap-token")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	err := SecretWith([]string{"/n/vault/aws-prod", "garbage", "--", "/bin/true"})
+	if err == nil {
+		t.Fatal("expected error for stray argument before `--`, got nil")
+	}
+	if !strings.Contains(err.Error(), "unexpected argument") {
+		t.Fatalf("error should flag unexpected argument: %q", err)
+	}
+	if !strings.Contains(err.Error(), `"garbage"`) {
+		t.Fatalf("error should name offending argument: %q", err)
+	}
+}
+
 // G-V2c-2: the F14 scrub MUST drop exactly DRIVE9_API_KEY, DRIVE9_VAULT_TOKEN,
 // and DRIVE9_SERVER from the child's environment, and MUST preserve every
 // other variable — including unrelated DRIVE9_* knobs like profiling or log
@@ -206,6 +229,8 @@ func TestSecretWithEmptySecretStillForksChild(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("DRIVE9_SERVER", srv.URL)
 	t.Setenv(EnvVaultToken, "cap-token")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
 
 	out := captureStdout(t, func() {
 		// The child writes `ran-with-no-injection` to stdout unconditionally.
@@ -235,6 +260,8 @@ func TestSecretWithMissingSecretNoFork(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("DRIVE9_SERVER", srv.URL)
 	t.Setenv(EnvVaultToken, "cap-token")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
 
 	out := captureStdout(t, func() {
 		// Child would print something on stdout if it ever ran.
@@ -298,6 +325,8 @@ func TestSecretWithIllegalKeyFailsWhole(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("DRIVE9_SERVER", srv.URL)
 	t.Setenv(EnvVaultToken, "cap-token")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
 
 	var gotErr error
 	out := captureStdout(t, func() {
@@ -337,6 +366,8 @@ func TestSecretWithLegalPlusIllegalFailsWhole(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("DRIVE9_SERVER", srv.URL)
 	t.Setenv(EnvVaultToken, "cap-token")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
 
 	out := captureStdout(t, func() {
 		err := SecretWith([]string{"/n/vault/mixed", "--", "/bin/sh", "-c", `printf 'LEAK:%s' "$ACCESS_KEY"`})
@@ -369,6 +400,8 @@ func TestSecretWithControlByteValueFailsWhole(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("DRIVE9_SERVER", srv.URL)
 	t.Setenv(EnvVaultToken, "cap-token")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
 
 	err := SecretWith([]string{"/n/vault/has-nl", "--", "/bin/true"})
 	if err == nil {
