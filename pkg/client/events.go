@@ -14,7 +14,7 @@ import (
 type ChangeEvent struct {
 	Seq   uint64 `json:"seq"`
 	Path  string `json:"path"`
-	Op    string `json:"op"`
+	Op    string `json:"op"` // "create" | "write" | "delete" | "rename" | "mkdir" | "copy" | "upload_complete"
 	Actor string `json:"actor,omitempty"`
 	Ts    int64  `json:"ts"`
 }

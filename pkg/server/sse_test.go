@@ -140,6 +140,46 @@ func TestSSEEndpointReplay(t *testing.T) {
 	}
 }
 
+func TestSSECreateReplayEmitsFileChanged(t *testing.T) {
+	srv := &Server{events: newEventBuses()}
+	bus := srv.events.get("")
+
+	bus.Publish("/existing.txt", "write", "actor1")
+	bus.Publish("/new.txt", "create", "actor2")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected replayed create event")
+	}
+	if ev.Event != "file_changed" {
+		t.Fatalf("event=%q, want file_changed", ev.Event)
+	}
+	var data ChangeEvent
+	if err := json.Unmarshal([]byte(ev.Data), &data); err != nil {
+		t.Fatalf("unmarshal create event: %v", err)
+	}
+	if data.Path != "/new.txt" || data.Op != "create" {
+		t.Fatalf("unexpected create replay payload: %+v", data)
+	}
+}
+
 func TestSSEEndpointLiveEvent(t *testing.T) {
 	srv := &Server{events: newEventBuses()}
 	bus := srv.events.get("")
@@ -184,6 +224,50 @@ func TestSSEEndpointLiveEvent(t *testing.T) {
 	}
 	if data.Path != "/new.txt" || data.Actor != "remote-actor" {
 		t.Errorf("live event data: %+v", data)
+	}
+}
+
+func TestSSECreateLiveEmitsFileChanged(t *testing.T) {
+	srv := &Server{events: newEventBuses()}
+	bus := srv.events.get("")
+
+	bus.Publish("/existing.txt", "write", "")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		bus.Publish("/brand-new.txt", "create", "remote-actor")
+	}()
+
+	scanner := bufio.NewScanner(resp.Body)
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected live create event")
+	}
+	if ev.Event != "file_changed" {
+		t.Fatalf("event=%q, want file_changed", ev.Event)
+	}
+	var data ChangeEvent
+	if err := json.Unmarshal([]byte(ev.Data), &data); err != nil {
+		t.Fatalf("unmarshal live create event: %v", err)
+	}
+	if data.Path != "/brand-new.txt" || data.Op != "create" || data.Actor != "remote-actor" {
+		t.Fatalf("unexpected live create payload: %+v", data)
 	}
 }
 
