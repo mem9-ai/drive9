@@ -165,14 +165,19 @@ func TestSecretLsPrefersExplicitCapabilityTokenOverAmbientAPIKey(t *testing.T) {
 	}
 }
 
-func TestSecretExecInjectsSecretIntoChildEnv(t *testing.T) {
+// G-V2c-1 (positive half): the spec-shaped path `/n/vault/<secret>` MUST
+// reach the server at `/v1/vault/read/<secret>` and the child MUST see the
+// injected env vars. The two keys are strict-charset legal and values are
+// plain printable, so the happy path exercises the "uncoerced pass-through"
+// side of SecretWith in isolation.
+func TestSecretWithInjectsSecretIntoChildEnv(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/vault/read/aws-prod" {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"access_key":"AKIA","secret_key":"SECRET"}`))
+		_, _ = w.Write([]byte(`{"ACCESS_KEY":"AKIA","SECRET_KEY":"SECRET"}`))
 	}))
 	defer srv.Close()
 
@@ -181,8 +186,8 @@ func TestSecretExecInjectsSecretIntoChildEnv(t *testing.T) {
 	t.Setenv(EnvVaultToken, "cap-token")
 
 	out := captureStdout(t, func() {
-		if err := SecretExec([]string{"aws-prod", "--", "/bin/sh", "-c", "printf '%s:%s' \"$ACCESS_KEY\" \"$SECRET_KEY\""}); err != nil {
-			t.Fatalf("SecretExec: %v", err)
+		if err := SecretWith([]string{"/n/vault/aws-prod", "--", "/bin/sh", "-c", "printf '%s:%s' \"$ACCESS_KEY\" \"$SECRET_KEY\""}); err != nil {
+			t.Fatalf("SecretWith: %v", err)
 		}
 	})
 	if out != "AKIA:SECRET" {

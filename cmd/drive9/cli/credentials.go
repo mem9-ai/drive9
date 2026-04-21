@@ -10,6 +10,16 @@ import (
 // Environment variable names recognised by the credential resolver. See spec
 // §14.1. The dual-principal separation is locked — there is no single combined
 // variable; DRIVE9_VAULT_TOKEN and DRIVE9_API_KEY remain distinct knobs.
+//
+// This exact set of three names is also the F14 scrub whitelist for
+// `drive9 vault with` (spec §9 L209): the child process MUST NOT inherit
+// any of these three from the parent, even when they are unset, absent, or
+// identical to the current mount's credential. Other DRIVE9_* vars
+// (profiling, log level, etc.) are outside the scrub — they do not grant
+// authority — and flow through untouched. `scrubDrive9CredEnv` in
+// secret.go imports these constants by name, so adding a new credential
+// env var here requires a matching update there (and a new V2c-style
+// review gate). The exactness of this list IS the contract.
 const (
 	EnvVaultToken = "DRIVE9_VAULT_TOKEN"
 	EnvAPIKey     = "DRIVE9_API_KEY"

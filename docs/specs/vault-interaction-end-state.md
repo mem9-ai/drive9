@@ -644,7 +644,7 @@ Legend:
 | `drive9 vault put <path> --from <dir>` | not-yet | Appendix-A alignment PR track |
 | `drive9 vault grant <scope>... --agent --perm --ttl` | implemented | Appendix-A alignment PR track |
 | `drive9 vault revoke <grant-id>` | implemented | Appendix-A alignment PR track |
-| `drive9 vault with <path> -- <cmd>` | not-yet | Appendix-A alignment PR track |
+| `drive9 vault with <path> -- <cmd>` | implemented | Appendix-A alignment PR track |
 | Data-plane `cat / ls / rm / printf >` on `/n/vault/**` | implemented | pre-M1 |
 
 Rows record the **final user-visible verb**. Interim steps (for example, fixing the legacy `drive9 secret grant` call path to hit `/v1/vault/grants` with `--perm` before the `vault` verb lands) do **not** flip `drive9 vault grant` to `implemented` — that row only flips when the `drive9 vault grant` CLI surface itself is live on `main`.
