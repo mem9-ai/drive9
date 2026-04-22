@@ -323,12 +323,22 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	openStoreDurationMs := float64(time.Since(openStoreStart).Microseconds()) / 1000.0
 	ensureSchemaDurationMs := 0.0
 	if opts.DatabaseAutoEmbedding && (t.Provider == ProviderTiDBZero || t.Provider == ProviderTiDBCloudStarter) {
-		ensureSchemaStart := time.Now()
-		if err := schema.EnsureTiDBSchemaForMode(store.DB(), schema.TiDBEmbeddingModeAuto); err != nil {
-			_ = store.Close()
-			return nil, nil, fmt.Errorf("ensure tidb auto-embedding schema: %w", err)
+		if t.SchemaVersion < schema.CurrentTiDBTenantSchemaVersion {
+			ensureSchemaStart := time.Now()
+			if err := schema.EnsureTiDBSchemaForMode(store.DB(), schema.TiDBEmbeddingModeAuto); err != nil {
+				_ = store.Close()
+				return nil, nil, fmt.Errorf("ensure tidb auto-embedding schema: %w", err)
+			}
+			ensureSchemaDurationMs = float64(time.Since(ensureSchemaStart).Microseconds()) / 1000.0
+			if p.metaStore != nil {
+				if verErr := p.metaStore.UpdateTenantSchemaVersion(ctx, t.ID, schema.CurrentTiDBTenantSchemaVersion); verErr != nil {
+					logger.Warn(ctx, "tenant_pool_update_schema_version_failed",
+						zap.String("tenant_id", t.ID),
+						zap.Int("version", schema.CurrentTiDBTenantSchemaVersion),
+						zap.Error(verErr))
+				}
+			}
 		}
-		ensureSchemaDurationMs = float64(time.Since(ensureSchemaStart).Microseconds()) / 1000.0
 	}
 	if p.cfg.S3Bucket != "" {
 		prefix := strings.Trim(p.cfg.S3Prefix, "/")

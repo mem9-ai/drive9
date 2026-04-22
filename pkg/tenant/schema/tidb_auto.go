@@ -28,6 +28,15 @@ const (
 	TiDBAutoEmbeddingDimensions = 1024
 )
 
+// CurrentTiDBTenantSchemaVersion is the expected schema version for TiDB tenant
+// databases. It must be bumped (as an integer) whenever tenant init SQL
+// statements change so that the next pool.createBackend call re-runs
+// EnsureTiDBSchemaForMode for all existing tenants.
+//
+// Tenants recorded with schema_version >= CurrentTiDBTenantSchemaVersion in
+// the meta store are considered up-to-date and skip the diff entirely.
+const CurrentTiDBTenantSchemaVersion = 2
+
 var tidbAutoEmbeddingOptionsJSON = fmt.Sprintf(`{"dimensions":%d}`, TiDBAutoEmbeddingDimensions)
 
 type tidbColumnMeta struct {

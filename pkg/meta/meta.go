@@ -1057,6 +1057,25 @@ func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status Tenant
 	return nil
 }
 
+// UpdateTenantSchemaVersion records the tenant DB schema version after a
+// successful ensure/repair cycle.  Callers should treat failures as best-
+// effort: log the error but do not fail the overall operation.
+func (s *Store) UpdateTenantSchemaVersion(ctx context.Context, id string, version int) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tenant_schema_version", start, &err)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tenants SET schema_version = ?, updated_at = ? WHERE id = ?`,
+		version, time.Now().UTC(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func observeMeta(ctx context.Context, op string, start time.Time, errp *error) {
 	result := "ok"
 	if errp != nil && *errp != nil {
