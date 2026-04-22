@@ -479,6 +479,58 @@ func TestIsIgnorableOptionalSchemaError(t *testing.T) {
 	}
 }
 
+func TestIsIgnorableTiDBSchemaError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "duplicate table",
+			err:  &mysql.MySQLError{Number: 1050, Message: "Table 'files' already exists"},
+			want: true,
+		},
+		{
+			name: "duplicate column",
+			err:  &mysql.MySQLError{Number: 1060, Message: "Duplicate column name 'embedding_revision'"},
+			want: true,
+		},
+		{
+			name: "duplicate key name",
+			err:  &mysql.MySQLError{Number: 1061, Message: "Duplicate key name 'idx_files_status'"},
+			want: true,
+		},
+		{
+			name: "plain already exists",
+			err:  errors.New("index already exists"),
+			want: true,
+		},
+		{
+			name: "plain duplicate",
+			err:  errors.New("duplicate entry"),
+			want: true,
+		},
+		{
+			name: "non ignorable mysql",
+			err:  &mysql.MySQLError{Number: 1146, Message: "Table 'missing' doesn't exist"},
+			want: false,
+		},
+		{
+			name: "non ignorable plain",
+			err:  errors.New("permission denied"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isIgnorableTiDBSchemaError(tt.err); got != tt.want {
+				t.Fatalf("isIgnorableTiDBSchemaError()=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func testFilesTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
 	meta := tidbTableMeta{
 		tableName: "files",

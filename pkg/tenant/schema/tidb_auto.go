@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"go.uber.org/zap"
 )
@@ -262,11 +263,11 @@ func DetectTiDBEmbeddingMode(db *sql.DB) (TiDBEmbeddingMode, error) {
 	if db == nil {
 		return TiDBEmbeddingModeUnknown, fmt.Errorf("nil db")
 	}
-	if !IsTiDBCluster(db) {
+	if !IsTiDBCluster(ctx, db) {
 		return TiDBEmbeddingModeUnknown, fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
 	loadStart := time.Now()
-	filesMeta, err := loadTiDBTableMeta(db, "files")
+	filesMeta, err := loadTiDBTableMeta(ctx, db, "files")
 	if err != nil {
 		logger.Warn(ctx, "tenant_detect_tidb_embedding_mode_load_files_failed",
 			zap.Duration("elapsed", time.Since(loadStart)),
@@ -295,17 +296,17 @@ func DetectTiDBEmbeddingMode(db *sql.DB) (TiDBEmbeddingMode, error) {
 
 // ValidateTiDBSchemaForMode validates that an already-open TiDB connection
 // matches exactly one supported dat9 embedding contract for the requested mode.
-func ValidateTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) error {
+func ValidateTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode) error {
 	if db == nil {
 		return fmt.Errorf("nil db")
 	}
-	if !IsTiDBCluster(db) {
+	if !IsTiDBCluster(ctx, db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
 	if err := validateTiDBSchemaMode(mode); err != nil {
 		return err
 	}
-	diffs, err := diffTiDBSchemaForMode(db, mode)
+	diffs, err := diffTiDBSchemaForMode(ctx, db, mode)
 	if err != nil {
 		return err
 	}
@@ -317,11 +318,11 @@ func ValidateTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) error {
 
 // EnsureTiDBSchemaForMode repairs known launch-schema drift that can be fixed
 // in place, then validates the full TiDB schema contract for the requested mode.
-func EnsureTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) error {
+func EnsureTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode) error {
 	if db == nil {
 		return fmt.Errorf("nil db")
 	}
-	if !IsTiDBCluster(db) {
+	if !IsTiDBCluster(ctx, db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
 	if err := validateTiDBSchemaMode(mode); err != nil {
@@ -329,7 +330,7 @@ func EnsureTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) error {
 	}
 	const maxRepairPasses = 3
 	for i := 0; i < maxRepairPasses; i++ {
-		diffs, err := diffTiDBSchemaForMode(db, mode)
+		diffs, err := diffTiDBSchemaForMode(ctx, db, mode)
 		if err != nil {
 			return err
 		}
@@ -340,11 +341,11 @@ func EnsureTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) error {
 		if len(repairs) == 0 {
 			break
 		}
-		if err := applyTiDBSchemaRepairs(db, repairs); err != nil {
+		if err := applyTiDBSchemaRepairs(ctx, db, repairs); err != nil {
 			return err
 		}
 	}
-	return ValidateTiDBSchemaForMode(db, mode)
+	return ValidateTiDBSchemaForMode(ctx, db, mode)
 }
 
 func validateTiDBSchemaMode(mode TiDBEmbeddingMode) error {
@@ -360,23 +361,23 @@ func initTiDBAutoEmbeddingSchema(dsn string) error {
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	if !IsTiDBCluster(db) {
+	if !IsTiDBCluster(context.Background(), db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
 	if err := ExecSchemaStatements(db, tidbAutoEmbeddingSchemaStatements()); err != nil {
 		return err
 	}
-	return ValidateTiDBSchemaForMode(db, TiDBEmbeddingModeAuto)
+	return ValidateTiDBSchemaForMode(context.Background(), db, TiDBEmbeddingModeAuto)
 }
 
 // ValidateTiDBSchemaForModeDSN opens a DSN, validates the schema, and closes.
-func ValidateTiDBSchemaForModeDSN(dsn string, mode TiDBEmbeddingMode) error {
-	db, err := OpenTiDBSchemaDB(context.Background(), dsn)
+func ValidateTiDBSchemaForModeDSN(ctx context.Context, dsn string, mode TiDBEmbeddingMode) error {
+	db, err := OpenTiDBSchemaDB(ctx, dsn)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	return ValidateTiDBSchemaForMode(db, mode)
+	return ValidateTiDBSchemaForMode(ctx, db, mode)
 }
 
 // EnsureTiDBSchemaForModeDSN opens a DSN, repairs known launch-schema drift,
@@ -387,7 +388,7 @@ func EnsureTiDBSchemaForModeDSN(ctx context.Context, dsn string, mode TiDBEmbedd
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	return EnsureTiDBSchemaForMode(db, mode)
+	return EnsureTiDBSchemaForMode(ctx, db, mode)
 }
 
 func OpenTiDBSchemaDB(ctx context.Context, dsn string) (*sql.DB, error) {
@@ -480,16 +481,16 @@ func legacyTiDBUploadsRepairStatements(meta tidbTableMeta) []string {
 	return []string{`ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL`}
 }
 
-func loadTiDBTableMeta(db *sql.DB, tableName string) (tidbTableMeta, error) {
-	columns, err := loadTiDBColumnMeta(db, tableName)
+func loadTiDBTableMeta(ctx context.Context, db *sql.DB, tableName string) (tidbTableMeta, error) {
+	columns, err := loadTiDBColumnMeta(ctx, db, tableName)
 	if err != nil {
 		return tidbTableMeta{}, fmt.Errorf("load columns: %w", err)
 	}
 	return tidbTableMeta{tableName: tableName, columns: columns}, nil
 }
 
-func loadTiDBColumnMeta(db *sql.DB, tableName string) (map[string]tidbColumnMeta, error) {
-	rows, err := db.Query(`SELECT column_name, column_type, extra, generation_expression
+func loadTiDBColumnMeta(ctx context.Context, db *sql.DB, tableName string) (map[string]tidbColumnMeta, error) {
+	rows, err := db.QueryContext(ctx, `SELECT column_name, column_type, extra, generation_expression
 		FROM information_schema.columns
 		WHERE table_schema = DATABASE() AND table_name = ?`, tableName)
 	if err != nil {
@@ -538,11 +539,11 @@ func (m tidbTableMeta) requireColumnType(name, want string) error {
 	return nil
 }
 
-func loadShowCreateTable(db *sql.DB, tableName string) (string, error) {
+func loadShowCreateTable(ctx context.Context, db *sql.DB, tableName string) (string, error) {
 	var gotTable string
 	var createStmt string
 	query := fmt.Sprintf("SHOW CREATE TABLE %s", tableName)
-	if err := db.QueryRow(query).Scan(&gotTable, &createStmt); err != nil {
+	if err := db.QueryRowContext(ctx, query).Scan(&gotTable, &createStmt); err != nil {
 		return "", err
 	}
 	return createStmt, nil
@@ -566,14 +567,14 @@ func normalizeColumnTypeForCompare(s string) string {
 	}
 }
 
-func diffTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) ([]tidbSchemaDiff, error) {
+func diffTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode) ([]tidbSchemaDiff, error) {
 	spec, err := tidbSchemaSpecForMode(mode)
 	if err != nil {
 		return nil, err
 	}
 	var diffs []tidbSchemaDiff
 	for _, table := range spec.tables {
-		tableDiffs, err := diffTiDBTable(db, table)
+		tableDiffs, err := diffTiDBTable(ctx, db, table)
 		if err != nil {
 			return nil, err
 		}
@@ -582,15 +583,15 @@ func diffTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) ([]tidbSchemaDiff
 	return diffs, nil
 }
 
-func diffTiDBTable(db *sql.DB, table tidbTableSpec) ([]tidbSchemaDiff, error) {
-	meta, err := loadTiDBTableMeta(db, table.name)
+func diffTiDBTable(ctx context.Context, db *sql.DB, table tidbTableSpec) ([]tidbSchemaDiff, error) {
+	meta, err := loadTiDBTableMeta(ctx, db, table.name)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return missingTableAndIndexDiffs(table), nil
 		}
 		return nil, fmt.Errorf("load %s table metadata: %w", table.name, err)
 	}
-	createStmt, err := loadShowCreateTable(db, table.name)
+	createStmt, err := loadShowCreateTable(ctx, db, table.name)
 	if err != nil {
 		return nil, fmt.Errorf("show create %s: %w", table.name, err)
 	}
@@ -1192,14 +1193,36 @@ func isSafeAddIndexRepairSQL(sqlText string, tableMissing bool) bool {
 	return false
 }
 
-func applyTiDBSchemaRepairs(db *sql.DB, statements []string) error {
+func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string) error {
 	if len(statements) == 0 {
 		return nil
 	}
-	if err := ExecSchemaStatements(db, statements); err != nil {
-		return fmt.Errorf("apply tidb schema repairs: %w", err)
+	for _, stmt := range statements {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			if isIgnorableTiDBSchemaError(err) {
+				continue
+			}
+			return fmt.Errorf("apply tidb schema repair %q: %w", schemaStatementSnippet(stmt), err)
+		}
 	}
 	return nil
+}
+
+func isIgnorableTiDBSchemaError(err error) bool {
+	var me *mysql.MySQLError
+	if errors.As(err, &me) {
+		switch me.Number {
+		case 1050, 1060, 1061:
+			return true
+		}
+		msg := strings.ToLower(me.Message)
+		if strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate") {
+			return true
+		}
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate")
 }
 
 func validateTiDBAutoEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {

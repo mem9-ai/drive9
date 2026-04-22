@@ -123,9 +123,9 @@ func schemaStatementSnippet(stmt string) string {
 	return snippet
 }
 
-func IsTiDBCluster(db *sql.DB) bool {
+func IsTiDBCluster(ctx context.Context, db *sql.DB) bool {
 	var ver string
-	if err := db.QueryRow(`SELECT VERSION()`).Scan(&ver); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT VERSION()`).Scan(&ver); err != nil {
 		return false
 	}
 	return strings.Contains(strings.ToLower(ver), "tidb")
