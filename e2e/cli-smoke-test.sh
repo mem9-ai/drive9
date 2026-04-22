@@ -295,61 +295,26 @@ printf "cli-tag-%s" "$TS" > "$TAG_LOCAL"
 drive9_retry fs cp --tag owner=smoke --tag topic=e2e "$TAG_LOCAL" ":$TAG_REMOTE" >/dev/null
 
 tag_stat_json="$(drive9_retry fs stat --json "$TAG_REMOTE")"
-tag_owner=$(python3 - "$tag_stat_json" <<'PY'
-import json
-import sys
-doc = json.loads(sys.argv[1])
-print((doc.get("tags") or {}).get("owner", ""))
-PY
-)
+tag_owner="$(jq -r '.tags.owner // ""' <<<"$tag_stat_json")"
 check_eq "stat --json returns owner tag" "$tag_owner" "smoke"
 
-tag_topic=$(python3 - "$tag_stat_json" <<'PY'
-import json
-import sys
-doc = json.loads(sys.argv[1])
-print((doc.get("tags") or {}).get("topic", ""))
-PY
-)
+tag_topic="$(jq -r '.tags.topic // ""' <<<"$tag_stat_json")"
 check_eq "stat --json returns topic tag" "$tag_topic" "e2e"
 
-tag_semantic=$(python3 - "$tag_stat_json" <<'PY'
-import json
-import sys
-doc = json.loads(sys.argv[1])
-print(doc.get("semantic_text", ""))
-PY
-)
+tag_semantic="$(jq -r '.semantic_text // ""' <<<"$tag_stat_json")"
 check_eq "stat --json includes semantic_text for tagged file" "$tag_semantic" "cli-tag-${TS}"
 
-check_cmd "stat --json includes non-empty content_type for tagged file" python3 - "$tag_stat_json" <<'PY'
-import json
-import sys
-doc = json.loads(sys.argv[1])
-raise SystemExit(0 if (doc.get("content_type") or "").strip() else 1)
-PY
+check_cmd "stat --json includes non-empty content_type for tagged file" \
+  bash -c 'jq -e '"'"'(.content_type // "") | length > 0'"'"' >/dev/null <<<"$1"' -- "$tag_stat_json"
 
 printf "cli-tag-updated-%s" "$TS" > "$TAG_LOCAL"
 drive9_retry fs cp --tag owner=updated "$TAG_LOCAL" ":$TAG_REMOTE" >/dev/null
 
 tag_stat_json2="$(drive9_retry fs stat --json "$TAG_REMOTE")"
-tag_owner2=$(python3 - "$tag_stat_json2" <<'PY'
-import json
-import sys
-doc = json.loads(sys.argv[1])
-print((doc.get("tags") or {}).get("owner", ""))
-PY
-)
+tag_owner2="$(jq -r '.tags.owner // ""' <<<"$tag_stat_json2")"
 check_eq "overwrite with single --tag updates owner" "$tag_owner2" "updated"
 
-tag_topic2=$(python3 - "$tag_stat_json2" <<'PY'
-import json
-import sys
-doc = json.loads(sys.argv[1])
-tags = doc.get("tags") or {}
-print("present" if "topic" in tags else "missing")
-PY
-)
+tag_topic2="$(jq -r 'if (.tags // {} | has("topic")) then "present" else "missing" end' <<<"$tag_stat_json2")"
 check_eq "overwrite with single --tag clears old topic tag" "$tag_topic2" "missing"
 
 echo "[5] batch small-file upload/list/read via cli"
