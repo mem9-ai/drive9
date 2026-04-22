@@ -348,6 +348,48 @@ func TestTiDBSchemaSpecForModeIncludesVaultIndexes(t *testing.T) {
 	}
 }
 
+func TestTiDBSchemaSpecForModeIncludesAlterTableIndexes(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "files")
+	if _, ok := spec.indexes["idx_fts_content"]; !ok {
+		t.Fatal("files missing idx_fts_content index spec from ALTER TABLE statement")
+	}
+	if _, ok := spec.indexes["idx_files_cosine"]; !ok {
+		t.Fatal("files missing idx_files_cosine index spec from ALTER TABLE statement")
+	}
+}
+
+func TestPlannedTiDBSchemaRepairsIncludesAlterTableIndexRepairs(t *testing.T) {
+	diffs := []tidbSchemaDiff{
+		{
+			kind:      tidbSchemaDiffMissingIndex,
+			tableName: "files",
+			detail:    "files schema contract: missing idx_fts_content index",
+			repairSQL: "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)",
+		},
+	}
+
+	got := plannedTiDBSchemaRepairs(diffs)
+	if len(got) != 1 {
+		t.Fatalf("expected one repair statement, got %#v", got)
+	}
+	if got[0] != "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)" {
+		t.Fatalf("unexpected repair statement: %q", got[0])
+	}
+}
+
+func TestIsSafeAddColumnRepairSQLRejectsStoredAndVirtualGeneratedColumns(t *testing.T) {
+	tests := []string{
+		"ALTER TABLE uploads ADD COLUMN active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED",
+		"ALTER TABLE files ADD COLUMN embedding VECTOR(1024) AS (EMBED_TEXT('m', content_text, '{\"dimensions\":1024}')) VIRTUAL",
+	}
+
+	for _, stmt := range tests {
+		if isSafeAddColumnRepairSQL(stmt) {
+			t.Fatalf("expected generated column repair to be unsafe: %s", stmt)
+		}
+	}
+}
+
 func TestInitTiDBTenantSchemaStatementsForModeIncludesVault(t *testing.T) {
 	for _, mode := range []TiDBEmbeddingMode{TiDBEmbeddingModeAuto, TiDBEmbeddingModeApp} {
 		t.Run(string(mode), func(t *testing.T) {

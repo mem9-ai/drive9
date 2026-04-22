@@ -601,6 +601,9 @@ func tidbSchemaSpecFromStatements(stmts []string) (tidbSchemaSpec, error) {
 	for _, stmt := range stmts {
 		tableName, indexName, createSQL, ok := parseCreateIndexStatement(stmt)
 		if !ok {
+			tableName, indexName, createSQL, ok = parseAlterTableAddIndexStatement(stmt)
+		}
+		if !ok {
 			continue
 		}
 		tableIndex, exists := byName[tableName]
@@ -946,6 +949,46 @@ func parseCreateIndexStatement(stmt string) (tableName, indexName, createSQL str
 	return strings.ToLower(table), strings.ToLower(nameFields[0]), strings.TrimSpace(stmt), true
 }
 
+func parseAlterTableAddIndexStatement(stmt string) (tableName, indexName, createSQL string, ok bool) {
+	normalized := normalizeSQLFragment(stmt)
+	const prefix = "alter table "
+	if !strings.HasPrefix(normalized, prefix) {
+		return "", "", "", false
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(normalized, prefix))
+	if rest == "" {
+		return "", "", "", false
+	}
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return "", "", "", false
+	}
+	table := strings.ToLower(fields[0])
+
+	markers := []string{" add fulltext index ", " add vector index ", " add unique index ", " add index ", " add key "}
+	for _, marker := range markers {
+		pos := strings.Index(normalized, marker)
+		if pos < 0 {
+			continue
+		}
+		indexPart := strings.TrimSpace(normalized[pos+len(marker):])
+		if indexPart == "" {
+			return "", "", "", false
+		}
+		name := indexPart
+		if open := strings.Index(name, "("); open >= 0 {
+			name = name[:open]
+		}
+		nameFields := strings.Fields(name)
+		if len(nameFields) == 0 {
+			return "", "", "", false
+		}
+		return table, strings.ToLower(nameFields[0]), strings.TrimSpace(stmt), true
+	}
+
+	return "", "", "", false
+}
+
 func diffTiDBTableMeta(table tidbTableSpec, meta tidbTableMeta, createStmt string) []tidbSchemaDiff {
 	var diffs []tidbSchemaDiff
 	for _, name := range sortedColumnNames(table.columns) {
@@ -1048,14 +1091,7 @@ func isSafeTiDBRepairDiff(diff tidbSchemaDiff, tableMissing map[string]bool) boo
 	case tidbSchemaDiffMissingColumn:
 		return isSafeAddColumnRepairSQL(diff.repairSQL)
 	case tidbSchemaDiffMissingIndex:
-		normalized := normalizeSQLFragment(diff.repairSQL)
-		if strings.HasPrefix(normalized, "create index ") {
-			return true
-		}
-		if strings.HasPrefix(normalized, "create unique index ") {
-			return tableMissing[diff.tableName]
-		}
-		return false
+		return isSafeAddIndexRepairSQL(diff.repairSQL, tableMissing[diff.tableName])
 	default:
 		return false
 	}
@@ -1066,13 +1102,43 @@ func isSafeAddColumnRepairSQL(sqlText string) bool {
 	if !strings.HasPrefix(n, "alter table ") || !strings.Contains(n, " add column ") {
 		return false
 	}
-	if strings.Contains(n, " generated ") {
+	if isGeneratedColumnAddSQL(n) {
 		return false
 	}
 	if strings.Contains(n, " not null") && !strings.Contains(n, " default ") {
 		return false
 	}
 	return true
+}
+
+func isGeneratedColumnAddSQL(normalizedSQL string) bool {
+	if strings.Contains(normalizedSQL, " generated ") {
+		return true
+	}
+	hasAsExpr := strings.Contains(normalizedSQL, " as (")
+	if !hasAsExpr {
+		return false
+	}
+	return strings.Contains(normalizedSQL, " stored") || strings.Contains(normalizedSQL, " virtual")
+}
+
+func isSafeAddIndexRepairSQL(sqlText string, tableMissing bool) bool {
+	normalized := normalizeSQLFragment(sqlText)
+	if strings.HasPrefix(normalized, "create index ") {
+		return true
+	}
+	if strings.HasPrefix(normalized, "create unique index ") {
+		return tableMissing
+	}
+	if strings.HasPrefix(normalized, "alter table ") {
+		if strings.Contains(normalized, " add unique index ") || strings.Contains(normalized, " add unique key ") {
+			return tableMissing
+		}
+		if strings.Contains(normalized, " add fulltext index ") || strings.Contains(normalized, " add vector index ") || strings.Contains(normalized, " add index ") || strings.Contains(normalized, " add key ") {
+			return true
+		}
+	}
+	return false
 }
 
 func applyTiDBSchemaRepairs(db *sql.DB, statements []string) error {
