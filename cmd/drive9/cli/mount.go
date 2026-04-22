@@ -53,24 +53,23 @@ func MountCmd(args []string) error {
 
 // looksLikeMountBackendKeyword decides whether s should be treated as a
 // (potentially unknown) backend selector rather than as a mount point.
-// The heuristic intentionally errs toward "is a backend keyword" so that
-// typos surface as Row A errors rather than silent accepts:
 //
-//   - leading "-" → flag, not a backend keyword
-//   - contains "/" or "." → path, not a backend keyword
-//   - empty → not a keyword
-//   - otherwise (bare alphanumeric word) → treat as a backend keyword
+// We use a closed set of plausible backend-style keywords that a user might
+// type by mistake. Bare relative paths like "mnt", "tmp", "vaultdir" must
+// NOT be caught here — they are valid legacy mountpoints.
+//
+// The set includes storage-system nouns that could plausibly be confused
+// with a drive9 mount backend but are not supported:
+//
+//	kv, s3, gcs, nfs, smb, ftp, ssh, blob, block, object
+//
+// "vault" itself is matched before this function is called.
 func looksLikeMountBackendKeyword(s string) bool {
-	if s == "" {
-		return false
+	switch strings.ToLower(s) {
+	case "kv", "s3", "gcs", "nfs", "smb", "ftp", "ssh", "blob", "block", "object":
+		return true
 	}
-	if strings.HasPrefix(s, "-") {
-		return false
-	}
-	if strings.ContainsAny(s, "/.") {
-		return false
-	}
-	return true
+	return false
 }
 
 // fsMountCmd is the pre-V2e writable fs mount entry point.

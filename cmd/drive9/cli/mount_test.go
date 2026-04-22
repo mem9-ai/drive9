@@ -219,18 +219,18 @@ func TestMountCmd_UnsupportedBackendRejected(t *testing.T) {
 }
 
 func TestMountCmd_PathFirstArgFlowsToLegacy(t *testing.T) {
-	// A path-like first arg (contains "/") must NOT be rejected as an
-	// unknown backend — it should flow into the legacy fs mount path.
-	// We can't fully exercise fsMountCmd here (it calls flag.ExitOnError),
-	// so we just verify looksLikeMountBackendKeyword returns false.
-	if looksLikeMountBackendKeyword("/mnt/drive9") {
-		t.Fatal("/mnt/drive9 should not look like a backend keyword")
+	// Path-like and bare relative paths must NOT be rejected as unknown
+	// backends — they should flow into the legacy fs mount path.
+	for _, s := range []string{"/mnt/drive9", "./rel", "-debug", "mnt", "tmp", "vaultdir", "data"} {
+		if looksLikeMountBackendKeyword(s) {
+			t.Fatalf("%q should not look like a backend keyword", s)
+		}
 	}
-	if looksLikeMountBackendKeyword("./rel") {
-		t.Fatal("./rel should not look like a backend keyword")
-	}
-	if looksLikeMountBackendKeyword("-debug") {
-		t.Fatal("-debug should not look like a backend keyword")
+	// Only known storage-system nouns should be caught.
+	for _, s := range []string{"kv", "s3", "gcs", "nfs"} {
+		if !looksLikeMountBackendKeyword(s) {
+			t.Fatalf("%q should look like a backend keyword", s)
+		}
 	}
 }
 

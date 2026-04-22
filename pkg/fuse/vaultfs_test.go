@@ -322,30 +322,8 @@ func TestVaultMountNoInProcessCache(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Row I — empty-scope = EACCES. Mount probe rejects a credential whose
-// readable-secret list is empty.
-// ---------------------------------------------------------------------------
-
-func TestVaultMountEmptyScopeRejected(t *testing.T) {
-	fv := newFakeVault()
-	srv := httptest.NewServer(fv.handler())
-	defer srv.Close()
-	// secrets list is empty by default.
-
-	tmp := t.TempDir()
-	opts := &VaultMountOptions{
-		Server:     srv.URL,
-		Token:      "test-token",
-		MountPoint: tmp,
-		DirTTL:     100 * time.Millisecond,
-	}
-	err := MountVault(opts)
-	require.Error(t, err, "empty scope must reject mount")
-	require.Contains(t, err.Error(), "EACCES", "rejection must surface EACCES contract per Row I")
-}
-
-// ---------------------------------------------------------------------------
-// Row I (companion) — revoked credential at probe time also rejected.
+// Row I — revoked credential at probe time is rejected (server returns 403).
+// Empty scope (zero secrets, valid token) is NOT rejected — see vault_mount.go.
 // ---------------------------------------------------------------------------
 
 func TestVaultMountRevokedCredentialRejected(t *testing.T) {
@@ -367,33 +345,37 @@ func TestVaultMountRevokedCredentialRejected(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Row I (Blocker 2 regression) — owner with zero secrets MUST be allowed.
-// An owner API key with an empty vault is a normal new-tenant startup state;
-// only delegated tokens are rejected for empty scope.
+// Row I — empty scope (zero secrets) must NOT be rejected for either
+// principal kind. Owner: normal new-tenant startup. Delegated: valid grant
+// whose scope targets secrets that don't exist yet. Revoked/malformed tokens
+// are caught by the server returning 403, not by counting secrets.
 // ---------------------------------------------------------------------------
 
-func TestVaultMountOwnerEmptyVaultAllowed(t *testing.T) {
-	fv := newFakeVault()
-	// secrets list is empty — simulates a fresh tenant with no secrets yet.
-	srv := httptest.NewServer(fv.handler())
-	defer srv.Close()
+func TestVaultMountEmptyScopeAllowed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts func(url string, tmp string) *VaultMountOptions
+	}{
+		{"owner", func(url, tmp string) *VaultMountOptions {
+			return &VaultMountOptions{Server: url, APIKey: "owner-key", MountPoint: tmp, DirTTL: 100 * time.Millisecond}
+		}},
+		{"delegated", func(url, tmp string) *VaultMountOptions {
+			return &VaultMountOptions{Server: url, Token: "delegated-token", MountPoint: tmp, DirTTL: 100 * time.Millisecond}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fv := newFakeVault()
+			srv := httptest.NewServer(fv.handler())
+			defer srv.Close()
 
-	tmp := t.TempDir()
-	opts := &VaultMountOptions{
-		Server:     srv.URL,
-		APIKey:     "owner-key", // owner, not delegated
-		MountPoint: tmp,
-		DirTTL:     100 * time.Millisecond,
-	}
-	// MountVault will try to actually FUSE-mount, which we can't do in
-	// unit tests. But the probe (Row I) runs BEFORE the mount call, so
-	// if the probe wrongly rejects an owner with empty secrets, we'd get
-	// an EACCES error. We verify it does NOT return an EACCES error.
-	err := MountVault(opts)
-	// We expect an error (FUSE mount will fail in test env), but it must
-	// NOT be the "no readable secrets (EACCES)" rejection.
-	if err != nil {
-		require.NotContains(t, err.Error(), "EACCES",
-			"owner with empty vault must NOT be rejected with EACCES")
+			tmp := t.TempDir()
+			err := MountVault(tc.opts(srv.URL, tmp))
+			// FUSE mount will fail in test env, but the probe must NOT
+			// produce an EACCES rejection for empty scope.
+			if err != nil {
+				require.NotContains(t, err.Error(), "EACCES",
+					"%s with empty vault must NOT be rejected with EACCES", tc.name)
+			}
+		})
 	}
 }
