@@ -1419,6 +1419,11 @@ func (s *Server) parseResumePartChecksums(w http.ResponseWriter, r *http.Request
 
 func parseUploadCompleteTags(w http.ResponseWriter, r *http.Request) (map[string]string, error) {
 	// Keep v1 complete backward compatible: legacy clients send an empty body.
+	// Tags keys must be unique. Official CLI/SDK callers always satisfy this
+	// because they construct tags from map[string]string and reject duplicate
+	// --tag keys before issuing requests. Callers that send duplicate JSON object
+	// keys are providing invalid input; server behavior for such payloads is
+	// unspecified and not guaranteed to remain stable across versions.
 	var req struct {
 		Tags map[string]string `json:"tags,omitempty"`
 	}
@@ -1733,6 +1738,11 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
+	// Tags keys must be unique. Official CLI/SDK callers always satisfy this
+	// because they construct tags from map[string]string and reject duplicate
+	// --tag keys before issuing requests. Callers that send duplicate JSON object
+	// keys are providing invalid input; server behavior for such payloads is
+	// unspecified and not guaranteed to remain stable across versions.
 	var req struct {
 		Parts []backend.CompletePart `json:"parts"`
 		Tags  map[string]string      `json:"tags,omitempty"`

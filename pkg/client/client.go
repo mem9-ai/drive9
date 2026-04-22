@@ -384,6 +384,10 @@ func (c *Client) StatMetadataCtx(ctx context.Context, path string) (*StatMetadat
 	if resp.StatusCode >= 300 {
 		return nil, readError(resp)
 	}
+	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+	if !strings.HasPrefix(contentType, "application/json") {
+		return nil, fmt.Errorf("decode stat metadata: unexpected Content-Type %q", resp.Header.Get("Content-Type"))
+	}
 	var out StatMetadataResult
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode stat metadata: %w", err)
