@@ -199,6 +199,21 @@ func TestPlannedTiDBSchemaRepairsIncludesSafeStatementsOnly(t *testing.T) {
 	}
 }
 
+func TestPlannedTiDBSchemaRepairsSkipsUnsafeUniqueIndexOnExistingTable(t *testing.T) {
+	diffs := []tidbSchemaDiff{
+		{kind: tidbSchemaDiffMissingIndex, tableName: "uploads", detail: "uploads schema contract: missing idx_upload_path index", repairSQL: "CREATE INDEX idx_upload_path ON uploads(target_path, status)"},
+		{kind: tidbSchemaDiffMissingIndex, tableName: "uploads", detail: "uploads schema contract: missing idx_idempotency index", repairSQL: "CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)"},
+	}
+
+	got := plannedTiDBSchemaRepairs(diffs)
+	if len(got) != 1 {
+		t.Fatalf("expected one safe repair statement, got %#v", got)
+	}
+	if got[0] != "CREATE INDEX idx_upload_path ON uploads(target_path, status)" {
+		t.Fatalf("unexpected repair statement: %q", got[0])
+	}
+}
+
 func TestValidateTiDBAutoEmbeddingFilesDiffsReportsGeneratedContractMismatch(t *testing.T) {
 	meta := testFilesTableMeta(TiDBEmbeddingModeApp)
 	diffs := validateTiDBAutoEmbeddingFilesDiffs(meta)

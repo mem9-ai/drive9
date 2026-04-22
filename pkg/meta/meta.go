@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/mysqlutil"
@@ -155,6 +155,7 @@ type metaSchemaDiff struct {
 	kind       metaSchemaDiffKind
 	tableName  string
 	columnName string
+	indexName  string
 	detail     string
 	repairSQL  string
 }
@@ -191,7 +192,10 @@ type metaColumnSpec struct {
 }
 
 type metaIndexSpec struct {
-	createSQL string
+	createSQL   string
+	isUnique    bool
+	isPrimary   bool
+	isRepairable bool
 }
 
 func metaInitSchemaStatements() []string {
@@ -341,8 +345,12 @@ func parseCreateMetaTableSpec(stmt string) (metaTableSpec, bool, error) {
 		if def == "" {
 			continue
 		}
+		if idxName, idxSpec, ok := parseMetaConstraintIndexDefinition(tableName, def); ok {
+			indexes[idxName] = idxSpec
+			continue
+		}
 		if idxName, idxSQL, ok := parseMetaInlineIndexDefinition(tableName, def); ok {
-			indexes[idxName] = metaIndexSpec{createSQL: idxSQL}
+			indexes[idxName] = metaIndexSpec{createSQL: idxSQL, isRepairable: true, isUnique: strings.Contains(normalizeMetaSQLFragment(idxSQL), "create unique index ")}
 			continue
 		}
 		if isMetaConstraintDefinition(def) {
@@ -351,6 +359,10 @@ func parseCreateMetaTableSpec(stmt string) (metaTableSpec, bool, error) {
 		colName, colSpec, ok := parseMetaColumnDefinition(tableName, def)
 		if ok {
 			columns[colName] = colSpec
+			normalizedDef := normalizeMetaSQLFragment(def)
+			if strings.Contains(normalizedDef, " primary key") {
+				indexes["primary"] = metaIndexSpec{isPrimary: true, isRepairable: false}
+			}
 		}
 	}
 	return metaTableSpec{
@@ -420,11 +432,16 @@ func diffMetaTableMeta(table metaTableSpec, meta metaTableMeta, createStmt strin
 	normalizedCreate := normalizeMetaSQLFragment(createStmt)
 	for _, name := range sortedMetaIndexNames(table.indexes) {
 		spec := table.indexes[name]
-		if !strings.Contains(normalizedCreate, name+" (") {
+		if !showCreateHasMetaIndex(normalizedCreate, name, spec) {
+			detail := fmt.Sprintf("%s schema contract: missing %s index", table.name, name)
+			if spec.isPrimary {
+				detail = fmt.Sprintf("%s schema contract: missing primary key constraint", table.name)
+			}
 			diffs = append(diffs, metaSchemaDiff{
 				kind:      metaSchemaDiffMissingIndex,
 				tableName: table.name,
-				detail:    fmt.Sprintf("%s schema contract: missing %s index", table.name, name),
+				indexName: name,
+				detail:    detail,
 				repairSQL: spec.createSQL,
 			})
 		}
@@ -433,10 +450,20 @@ func diffMetaTableMeta(table metaTableSpec, meta metaTableMeta, createStmt strin
 }
 
 func plannedMetaSchemaRepairs(diffs []metaSchemaDiff) []string {
+	tableMissing := make(map[string]bool)
+	for _, diff := range diffs {
+		if diff.kind == metaSchemaDiffMissingTable {
+			tableMissing[diff.tableName] = true
+		}
+	}
+
 	seen := make(map[string]struct{})
 	plans := make([]string, 0, len(diffs))
 	for _, diff := range diffs {
 		if diff.repairSQL == "" {
+			continue
+		}
+		if !isSafeMetaRepairDiff(diff, tableMissing) {
 			continue
 		}
 		if _, ok := seen[diff.repairSQL]; ok {
@@ -451,6 +478,9 @@ func plannedMetaSchemaRepairs(diffs []metaSchemaDiff) []string {
 func applyMetaSchemaRepairs(db *sql.DB, stmts []string) error {
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
+			if isIgnorableMetaSchemaError(err) {
+				continue
+			}
 			return fmt.Errorf("apply meta schema repair %q: %w", schemaSnippet(stmt), err)
 		}
 	}
@@ -584,6 +614,37 @@ func parseMetaInlineIndexDefinition(tableName, def string) (indexName, createSQL
 	return "", "", false
 }
 
+func parseMetaConstraintIndexDefinition(tableName, def string) (indexName string, spec metaIndexSpec, ok bool) {
+	n := normalizeMetaSQLFragment(def)
+	if strings.HasPrefix(n, "primary key") {
+		return "primary", metaIndexSpec{isPrimary: true, isRepairable: false}, true
+	}
+	if strings.HasPrefix(n, "unique key ") {
+		name, cols := parseMetaIndexNameAndColumns(def, "UNIQUE KEY")
+		if name == "" || cols == "" {
+			return "", metaIndexSpec{}, false
+		}
+		return name, metaIndexSpec{
+			createSQL:    fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s%s", name, tableName, cols),
+			isUnique:     true,
+			isRepairable: false,
+		}, true
+	}
+	if strings.HasPrefix(n, "constraint ") && strings.Contains(n, " unique key ") {
+		// CONSTRAINT name UNIQUE KEY idx_name (...) -> parse using UNIQUE KEY token.
+		name, cols := parseMetaIndexNameAndColumns(def, "UNIQUE KEY")
+		if name == "" || cols == "" {
+			return "", metaIndexSpec{}, false
+		}
+		return name, metaIndexSpec{
+			createSQL:    fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s%s", name, tableName, cols),
+			isUnique:     true,
+			isRepairable: false,
+		}, true
+	}
+	return "", metaIndexSpec{}, false
+}
+
 func parseMetaIndexNameAndColumns(def, prefix string) (indexName, columns string) {
 	trimmed := strings.TrimSpace(def)
 	upper := strings.ToUpper(trimmed)
@@ -694,6 +755,57 @@ func isMetaConstraintDefinition(def string) bool {
 	return strings.HasPrefix(n, "primary key") || strings.HasPrefix(n, "constraint ") || strings.HasPrefix(n, "unique key ")
 }
 
+func isSafeMetaRepairDiff(diff metaSchemaDiff, tableMissing map[string]bool) bool {
+	switch diff.kind {
+	case metaSchemaDiffMissingTable:
+		return true
+	case metaSchemaDiffMissingColumn:
+		return isSafeAddColumnRepairSQL(diff.repairSQL)
+	case metaSchemaDiffMissingIndex:
+		normalized := normalizeMetaSQLFragment(diff.repairSQL)
+		if strings.HasPrefix(normalized, "create index ") {
+			return true
+		}
+		if strings.HasPrefix(normalized, "create unique index ") {
+			return tableMissing[diff.tableName]
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func isSafeAddColumnRepairSQL(sqlText string) bool {
+	n := normalizeMetaSQLFragment(sqlText)
+	if !strings.HasPrefix(n, "alter table ") || !strings.Contains(n, " add column ") {
+		return false
+	}
+	if strings.Contains(n, " generated ") {
+		return false
+	}
+	if strings.Contains(n, " not null") && !strings.Contains(n, " default ") {
+		return false
+	}
+	return true
+}
+
+func isIgnorableMetaSchemaError(err error) bool {
+	var me *mysql.MySQLError
+	if errors.As(err, &me) {
+		switch me.Number {
+		case 1050, 1060, 1061:
+			return true
+		}
+		msg := strings.ToLower(me.Message)
+		if strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate") {
+			return true
+		}
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate")
+}
+
 func loadMetaTableMeta(db *sql.DB, tableName string) (metaTableMeta, error) {
 	rows, err := db.Query(`SELECT column_name, column_type
 		FROM information_schema.columns
@@ -754,6 +866,13 @@ func sortedMetaIndexNames(indexes map[string]metaIndexSpec) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func showCreateHasMetaIndex(normalizedCreate, indexName string, spec metaIndexSpec) bool {
+	if spec.isPrimary {
+		return strings.Contains(normalizedCreate, "primary key (")
+	}
+	return strings.Contains(normalizedCreate, indexName+" (")
 }
 
 func schemaSnippet(stmt string) string {

@@ -1016,10 +1016,20 @@ func missingTableAndIndexDiffs(table tidbTableSpec) []tidbSchemaDiff {
 }
 
 func plannedTiDBSchemaRepairs(diffs []tidbSchemaDiff) []string {
+	tableMissing := make(map[string]bool)
+	for _, diff := range diffs {
+		if diff.kind == tidbSchemaDiffMissingTable {
+			tableMissing[diff.tableName] = true
+		}
+	}
+
 	seen := make(map[string]struct{})
 	plans := make([]string, 0, len(diffs))
 	for _, diff := range diffs {
 		if diff.repairSQL == "" {
+			continue
+		}
+		if !isSafeTiDBRepairDiff(diff, tableMissing) {
 			continue
 		}
 		if _, ok := seen[diff.repairSQL]; ok {
@@ -1029,6 +1039,40 @@ func plannedTiDBSchemaRepairs(diffs []tidbSchemaDiff) []string {
 		plans = append(plans, diff.repairSQL)
 	}
 	return plans
+}
+
+func isSafeTiDBRepairDiff(diff tidbSchemaDiff, tableMissing map[string]bool) bool {
+	switch diff.kind {
+	case tidbSchemaDiffMissingTable:
+		return true
+	case tidbSchemaDiffMissingColumn:
+		return isSafeAddColumnRepairSQL(diff.repairSQL)
+	case tidbSchemaDiffMissingIndex:
+		normalized := normalizeSQLFragment(diff.repairSQL)
+		if strings.HasPrefix(normalized, "create index ") {
+			return true
+		}
+		if strings.HasPrefix(normalized, "create unique index ") {
+			return tableMissing[diff.tableName]
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func isSafeAddColumnRepairSQL(sqlText string) bool {
+	n := normalizeSQLFragment(sqlText)
+	if !strings.HasPrefix(n, "alter table ") || !strings.Contains(n, " add column ") {
+		return false
+	}
+	if strings.Contains(n, " generated ") {
+		return false
+	}
+	if strings.Contains(n, " not null") && !strings.Contains(n, " default ") {
+		return false
+	}
+	return true
 }
 
 func applyTiDBSchemaRepairs(db *sql.DB, statements []string) error {
