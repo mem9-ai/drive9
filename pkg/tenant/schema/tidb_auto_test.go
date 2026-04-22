@@ -132,6 +132,49 @@ func TestTiDBSchemaSpecFromStatementsParsesNewTableAutomatically(t *testing.T) {
 	}
 }
 
+func TestTiDBSchemaSpecFromStatementsAttachesExternalIndexesWithoutStalePointers(t *testing.T) {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS t1 (
+			id VARCHAR(64) PRIMARY KEY
+		)`,
+		`CREATE TABLE IF NOT EXISTS t2 (
+			id VARCHAR(64) PRIMARY KEY
+		)`,
+		`CREATE INDEX idx_t1_id ON t1(id)`,
+	}
+
+	spec, err := tidbSchemaSpecFromStatements(stmts)
+	if err != nil {
+		t.Fatalf("tidbSchemaSpecFromStatements: %v", err)
+	}
+	t1 := mustTableSpecFromSchemaSpec(t, spec, "t1")
+	if _, ok := t1.indexes["idx_t1_id"]; !ok {
+		t.Fatalf("expected idx_t1_id on t1, got indexes=%#v", t1.indexes)
+	}
+}
+
+func TestMissingTableAndIndexDiffsIncludesExternalIndexes(t *testing.T) {
+	table := tidbTableSpec{
+		name:            "uploads",
+		createStatement: "CREATE TABLE IF NOT EXISTS uploads (...)",
+		indexes: map[string]tidbIndexSpec{
+			"idx_upload_path": {createSQL: "CREATE INDEX idx_upload_path ON uploads(target_path, status)"},
+			"idx_idempotency": {createSQL: "CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)"},
+		},
+	}
+
+	diffs := missingTableAndIndexDiffs(table)
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingTable, "missing table") {
+		t.Fatalf("expected missing table diff, got %#v", diffs)
+	}
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "idx_upload_path") {
+		t.Fatalf("expected missing idx_upload_path diff, got %#v", diffs)
+	}
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "idx_idempotency") {
+		t.Fatalf("expected missing idx_idempotency diff, got %#v", diffs)
+	}
+}
+
 func TestPlannedTiDBSchemaRepairsIncludesSafeStatementsOnly(t *testing.T) {
 	diffs := []tidbSchemaDiff{
 		{kind: tidbSchemaDiffMissingTable, tableName: "semantic_tasks", repairSQL: "CREATE TABLE IF NOT EXISTS semantic_tasks (...)"},

@@ -286,12 +286,22 @@ func EnsureTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) error {
 	if err := validateTiDBSchemaMode(mode); err != nil {
 		return err
 	}
-	diffs, err := diffTiDBSchemaForMode(db, mode)
-	if err != nil {
-		return err
-	}
-	if err := applyTiDBSchemaRepairs(db, plannedTiDBSchemaRepairs(diffs)); err != nil {
-		return err
+	const maxRepairPasses = 3
+	for i := 0; i < maxRepairPasses; i++ {
+		diffs, err := diffTiDBSchemaForMode(db, mode)
+		if err != nil {
+			return err
+		}
+		if len(diffs) == 0 {
+			return nil
+		}
+		repairs := plannedTiDBSchemaRepairs(diffs)
+		if len(repairs) == 0 {
+			break
+		}
+		if err := applyTiDBSchemaRepairs(db, repairs); err != nil {
+			return err
+		}
 	}
 	return ValidateTiDBSchemaForMode(db, mode)
 }
@@ -535,7 +545,7 @@ func diffTiDBTable(db *sql.DB, table tidbTableSpec) ([]tidbSchemaDiff, error) {
 	meta, err := loadTiDBTableMeta(db, table.name)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return []tidbSchemaDiff{missingTableDiff(table)}, nil
+			return missingTableAndIndexDiffs(table), nil
 		}
 		return nil, fmt.Errorf("load %s table metadata: %w", table.name, err)
 	}
@@ -576,7 +586,7 @@ func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
 
 func tidbSchemaSpecFromStatements(stmts []string) (tidbSchemaSpec, error) {
 	tables := make([]tidbTableSpec, 0)
-	byName := make(map[string]*tidbTableSpec)
+	byName := make(map[string]int)
 	for _, stmt := range stmts {
 		table, ok, err := parseCreateTableSpec(stmt)
 		if err != nil {
@@ -586,21 +596,21 @@ func tidbSchemaSpecFromStatements(stmts []string) (tidbSchemaSpec, error) {
 			continue
 		}
 		tables = append(tables, table)
-		byName[table.name] = &tables[len(tables)-1]
+		byName[table.name] = len(tables) - 1
 	}
 	for _, stmt := range stmts {
 		tableName, indexName, createSQL, ok := parseCreateIndexStatement(stmt)
 		if !ok {
 			continue
 		}
-		t, exists := byName[tableName]
+		tableIndex, exists := byName[tableName]
 		if !exists {
 			continue
 		}
-		if t.indexes == nil {
-			t.indexes = make(map[string]tidbIndexSpec)
+		if tables[tableIndex].indexes == nil {
+			tables[tableIndex].indexes = make(map[string]tidbIndexSpec)
 		}
-		t.indexes[indexName] = tidbIndexSpec{createSQL: strings.TrimSpace(createSQL)}
+		tables[tableIndex].indexes[indexName] = tidbIndexSpec{createSQL: strings.TrimSpace(createSQL)}
 	}
 	return tidbSchemaSpec{tables: tables}, nil
 }
@@ -989,6 +999,20 @@ func missingTableDiff(table tidbTableSpec) tidbSchemaDiff {
 		detail:    detail,
 		repairSQL: table.createStatement,
 	}
+}
+
+func missingTableAndIndexDiffs(table tidbTableSpec) []tidbSchemaDiff {
+	diffs := []tidbSchemaDiff{missingTableDiff(table)}
+	for _, name := range sortedIndexNames(table.indexes) {
+		spec := table.indexes[name]
+		diffs = append(diffs, tidbSchemaDiff{
+			kind:      tidbSchemaDiffMissingIndex,
+			tableName: table.name,
+			detail:    fmt.Sprintf("%s schema contract: missing %s index", table.name, name),
+			repairSQL: spec.createSQL,
+		})
+	}
+	return diffs
 }
 
 func plannedTiDBSchemaRepairs(diffs []tidbSchemaDiff) []string {
