@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +39,61 @@ type tidbColumnMeta struct {
 type tidbTableMeta struct {
 	tableName string
 	columns   map[string]tidbColumnMeta
+}
+
+type tidbSchemaDiffKind string
+
+const (
+	tidbSchemaDiffMissingTable  tidbSchemaDiffKind = "missing_table"
+	tidbSchemaDiffMissingColumn tidbSchemaDiffKind = "missing_column"
+	tidbSchemaDiffMissingIndex  tidbSchemaDiffKind = "missing_index"
+	tidbSchemaDiffColumnType    tidbSchemaDiffKind = "column_type_mismatch"
+	tidbSchemaDiffTableContract tidbSchemaDiffKind = "table_contract_mismatch"
+)
+
+type tidbSchemaDiff struct {
+	kind       tidbSchemaDiffKind
+	tableName  string
+	columnName string
+	detail     string
+	repairSQL  string
+}
+
+type tidbSchemaSpec struct {
+	tables []tidbTableSpec
+}
+
+type tidbTableSpec struct {
+	name            string
+	createStatement string
+	columns         map[string]tidbColumnSpec
+	indexes         map[string]tidbIndexSpec
+	validate        func(tidbTableMeta) []tidbSchemaDiff
+}
+
+type tidbColumnSpec struct {
+	columnType string
+	addSQL     string
+}
+
+type tidbIndexSpec struct {
+	createSQL string
+}
+
+type tidbSchemaDiffError struct {
+	mode  TiDBEmbeddingMode
+	diffs []tidbSchemaDiff
+}
+
+func (e *tidbSchemaDiffError) Error() string {
+	if e == nil || len(e.diffs) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(e.diffs))
+	for _, diff := range e.diffs {
+		parts = append(parts, diff.detail)
+	}
+	return fmt.Sprintf("tidb schema contract mismatch for mode %q: %s", e.mode, strings.Join(parts, "; "))
 }
 
 // Keep this statement list aligned with the externally managed tidb_cloud_starter
@@ -208,27 +264,12 @@ func ValidateTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) error {
 	if err := validateTiDBSchemaMode(mode); err != nil {
 		return err
 	}
-	filesMeta, err := loadTiDBTableMeta(db, "files")
+	diffs, err := diffTiDBSchemaForMode(db, mode)
 	if err != nil {
-		return fmt.Errorf("load files table metadata: %w", err)
+		return err
 	}
-	if err := validateTiDBTableForMode(mode, filesMeta); err != nil {
-		return fmt.Errorf("files schema contract: %w", err)
-	}
-	uploadsMeta, err := loadTiDBTableMeta(db, "uploads")
-	if err != nil {
-		return fmt.Errorf("load uploads table metadata: %w", err)
-	}
-	if err := validateTiDBUploadsTableBase(uploadsMeta); err != nil {
-		return fmt.Errorf("uploads schema contract: %w", err)
-	}
-	if err := ensureTiDBTableExists(db, "semantic_tasks"); err != nil {
-		return fmt.Errorf("semantic_tasks schema contract: %w", err)
-	}
-	for _, t := range []string{"vault_deks", "vault_secrets", "vault_secret_fields", "vault_tokens", "vault_grants", "vault_policies", "vault_audit_log"} {
-		if err := ensureTiDBTableExists(db, t); err != nil {
-			return fmt.Errorf("%s schema contract: %w", t, err)
-		}
+	if len(diffs) > 0 {
+		return &tidbSchemaDiffError{mode: mode, diffs: diffs}
 	}
 	return nil
 }
@@ -245,8 +286,12 @@ func EnsureTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) error {
 	if err := validateTiDBSchemaMode(mode); err != nil {
 		return err
 	}
-	if err := repairLegacyTiDBUploadsSchema(db); err != nil {
-		return fmt.Errorf("repair uploads schema: %w", err)
+	diffs, err := diffTiDBSchemaForMode(db, mode)
+	if err != nil {
+		return err
+	}
+	if err := applyTiDBSchemaRepairs(db, plannedTiDBSchemaRepairs(diffs)); err != nil {
+		return err
 	}
 	return ValidateTiDBSchemaForMode(db, mode)
 }
@@ -354,48 +399,14 @@ func validateTiDBAutoEmbeddingFilesTable(meta tidbTableMeta) error {
 	if err := validateTiDBFilesTableBase(meta); err != nil {
 		return err
 	}
-	col, err := meta.requireColumn("embedding")
-	if err != nil {
-		return err
-	}
-	extra := normalizeSQLFragment(col.extra)
-	if !strings.Contains(extra, "generated") || !strings.Contains(extra, "stored") {
-		return errors.New("embedding column must be a stored generated column")
-	}
-	expr := normalizeSQLFragment(col.generationExpression)
-	checks := []struct {
-		pattern string
-		errMsg  string
-	}{
-		{"embed_text(", "embedding generated expression must use EMBED_TEXT"},
-		{tidbAutoEmbeddingModel, "embedding model contract mismatch"},
-		{"content_text", "generated expression must derive from content_text"},
-		{tidbAutoEmbeddingOptionsJSON, "embedding dimensions option mismatch"},
-	}
-	for _, check := range checks {
-		if !strings.Contains(expr, check.pattern) {
-			return errors.New(check.errMsg)
-		}
-	}
-	return nil
+	return schemaDiffsToError(validateTiDBAutoEmbeddingFilesDiffs(meta))
 }
 
 func validateTiDBAppEmbeddingFilesTable(meta tidbTableMeta) error {
 	if err := validateTiDBFilesTableBase(meta); err != nil {
 		return err
 	}
-	col, err := meta.requireColumn("embedding")
-	if err != nil {
-		return err
-	}
-	extra := normalizeSQLFragment(col.extra)
-	if strings.Contains(extra, "generated") {
-		return errors.New("embedding column must be writable in app mode")
-	}
-	if expr := normalizeSQLFragment(col.generationExpression); expr != "" {
-		return errors.New("embedding column must not define a generation expression in app mode")
-	}
-	return nil
+	return schemaDiffsToError(validateTiDBAppEmbeddingFilesDiffs(meta))
 }
 
 func validateTiDBFilesTableBase(meta tidbTableMeta) error {
@@ -523,4 +534,618 @@ func normalizeSQLFragment(s string) string {
 	s = strings.ReplaceAll(s, "_utf8mb4", "")
 	fields := strings.Fields(s)
 	return strings.Join(fields, " ")
+}
+
+func diffTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) ([]tidbSchemaDiff, error) {
+	spec, err := tidbSchemaSpecForMode(mode)
+	if err != nil {
+		return nil, err
+	}
+	var diffs []tidbSchemaDiff
+	for _, table := range spec.tables {
+		tableDiffs, err := diffTiDBTable(db, table)
+		if err != nil {
+			return nil, err
+		}
+		diffs = append(diffs, tableDiffs...)
+	}
+	return diffs, nil
+}
+
+func diffTiDBTable(db *sql.DB, table tidbTableSpec) ([]tidbSchemaDiff, error) {
+	meta, err := loadTiDBTableMeta(db, table.name)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return []tidbSchemaDiff{missingTableDiff(table)}, nil
+		}
+		return nil, fmt.Errorf("load %s table metadata: %w", table.name, err)
+	}
+	createStmt, err := loadShowCreateTable(db, table.name)
+	if err != nil {
+		return nil, fmt.Errorf("show create %s: %w", table.name, err)
+	}
+	return diffTiDBTableMeta(table, meta, createStmt), nil
+}
+
+func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
+	stmts, err := InitTiDBTenantSchemaStatementsForMode(mode)
+	if err != nil {
+		return tidbSchemaSpec{}, err
+	}
+	spec, err := tidbSchemaSpecFromStatements(stmts)
+	if err != nil {
+		return tidbSchemaSpec{}, err
+	}
+	for i := range spec.tables {
+		if spec.tables[i].name != "files" {
+			continue
+		}
+		spec.tables[i].validate = func(meta tidbTableMeta) []tidbSchemaDiff {
+			switch mode {
+			case TiDBEmbeddingModeAuto:
+				return validateTiDBAutoEmbeddingFilesDiffs(meta)
+			case TiDBEmbeddingModeApp:
+				return validateTiDBAppEmbeddingFilesDiffs(meta)
+			default:
+				return []tidbSchemaDiff{{kind: tidbSchemaDiffTableContract, tableName: "files", detail: fmt.Sprintf("files schema contract: unsupported TiDB embedding mode %q", mode)}}
+			}
+		}
+		break
+	}
+	return spec, nil
+}
+
+func tidbSchemaSpecFromStatements(stmts []string) (tidbSchemaSpec, error) {
+	tables := make([]tidbTableSpec, 0)
+	byName := make(map[string]*tidbTableSpec)
+	for _, stmt := range stmts {
+		table, ok, err := parseCreateTableSpec(stmt)
+		if err != nil {
+			return tidbSchemaSpec{}, err
+		}
+		if !ok {
+			continue
+		}
+		tables = append(tables, table)
+		byName[table.name] = &tables[len(tables)-1]
+	}
+	for _, stmt := range stmts {
+		tableName, indexName, createSQL, ok := parseCreateIndexStatement(stmt)
+		if !ok {
+			continue
+		}
+		t, exists := byName[tableName]
+		if !exists {
+			continue
+		}
+		if t.indexes == nil {
+			t.indexes = make(map[string]tidbIndexSpec)
+		}
+		t.indexes[indexName] = tidbIndexSpec{createSQL: strings.TrimSpace(createSQL)}
+	}
+	return tidbSchemaSpec{tables: tables}, nil
+}
+
+func parseCreateTableSpec(stmt string) (tidbTableSpec, bool, error) {
+	tableName, defs, ok, err := parseCreateTableStatement(stmt)
+	if err != nil {
+		return tidbTableSpec{}, false, err
+	}
+	if !ok {
+		return tidbTableSpec{}, false, nil
+	}
+	columns := make(map[string]tidbColumnSpec)
+	indexes := make(map[string]tidbIndexSpec)
+	for _, def := range splitTopLevelComma(defs) {
+		def = strings.TrimSpace(def)
+		if def == "" {
+			continue
+		}
+		if indexName, createSQL, ok := parseInlineIndexDefinition(tableName, def); ok {
+			indexes[indexName] = tidbIndexSpec{createSQL: createSQL}
+			continue
+		}
+		if isConstraintDefinition(def) {
+			continue
+		}
+		colName, colSpec, ok := parseColumnDefinition(tableName, def)
+		if !ok {
+			continue
+		}
+		columns[colName] = colSpec
+	}
+	return tidbTableSpec{
+		name:            tableName,
+		createStatement: strings.TrimSpace(stmt),
+		columns:         columns,
+		indexes:         indexes,
+	}, true, nil
+}
+
+func parseCreateTableStatement(stmt string) (tableName string, definitions string, ok bool, err error) {
+	lower := strings.ToLower(stmt)
+	const prefix = "create table if not exists"
+	start := strings.Index(lower, prefix)
+	if start < 0 {
+		return "", "", false, nil
+	}
+	i := start + len(prefix)
+	for i < len(stmt) && (stmt[i] == ' ' || stmt[i] == '\n' || stmt[i] == '\t' || stmt[i] == '\r') {
+		i++
+	}
+	if i >= len(stmt) {
+		return "", "", false, fmt.Errorf("parse create table: missing table name")
+	}
+	nameStart := i
+	if stmt[i] == '`' {
+		i++
+		for i < len(stmt) && stmt[i] != '`' {
+			i++
+		}
+		if i >= len(stmt) {
+			return "", "", false, fmt.Errorf("parse create table: unterminated quoted table name")
+		}
+		tableName = strings.ToLower(stmt[nameStart+1 : i])
+		i++
+	} else {
+		for i < len(stmt) && stmt[i] != ' ' && stmt[i] != '\n' && stmt[i] != '\t' && stmt[i] != '(' {
+			i++
+		}
+		tableName = strings.ToLower(strings.TrimSpace(stmt[nameStart:i]))
+	}
+	for i < len(stmt) && stmt[i] != '(' {
+		i++
+	}
+	if i >= len(stmt) || stmt[i] != '(' {
+		return "", "", false, fmt.Errorf("parse create table %s: missing opening parenthesis", tableName)
+	}
+	bodyStart := i + 1
+	depth := 1
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	for i = bodyStart; i < len(stmt); i++ {
+		ch := stmt[i]
+		switch ch {
+		case '\\':
+			i++
+			continue
+		case '\'':
+			if !inDouble && !inBacktick {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle && !inBacktick {
+				inDouble = !inDouble
+			}
+		case '`':
+			if !inSingle && !inDouble {
+				inBacktick = !inBacktick
+			}
+		case '(':
+			if !inSingle && !inDouble && !inBacktick {
+				depth++
+			}
+		case ')':
+			if !inSingle && !inDouble && !inBacktick {
+				depth--
+				if depth == 0 {
+					return tableName, stmt[bodyStart:i], true, nil
+				}
+			}
+		}
+	}
+	return "", "", false, fmt.Errorf("parse create table %s: unbalanced parentheses", tableName)
+}
+
+func splitTopLevelComma(definitions string) []string {
+	parts := make([]string, 0)
+	start := 0
+	depth := 0
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	for i := 0; i < len(definitions); i++ {
+		ch := definitions[i]
+		switch ch {
+		case '\\':
+			i++
+			continue
+		case '\'':
+			if !inDouble && !inBacktick {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle && !inBacktick {
+				inDouble = !inDouble
+			}
+		case '`':
+			if !inSingle && !inDouble {
+				inBacktick = !inBacktick
+			}
+		case '(':
+			if !inSingle && !inDouble && !inBacktick {
+				depth++
+			}
+		case ')':
+			if !inSingle && !inDouble && !inBacktick && depth > 0 {
+				depth--
+			}
+		case ',':
+			if !inSingle && !inDouble && !inBacktick && depth == 0 {
+				parts = append(parts, strings.TrimSpace(definitions[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if start < len(definitions) {
+		parts = append(parts, strings.TrimSpace(definitions[start:]))
+	}
+	return parts
+}
+
+func parseInlineIndexDefinition(tableName, def string) (indexName, createSQL string, ok bool) {
+	normalized := normalizeSQLFragment(def)
+	if strings.HasPrefix(normalized, "unique index ") {
+		name, cols := parseIndexNameAndColumns(def, "UNIQUE INDEX")
+		if name == "" || cols == "" {
+			return "", "", false
+		}
+		return name, fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s%s", name, tableName, cols), true
+	}
+	if strings.HasPrefix(normalized, "index ") || strings.HasPrefix(normalized, "key ") {
+		prefix := "INDEX"
+		if strings.HasPrefix(normalized, "key ") {
+			prefix = "KEY"
+		}
+		name, cols := parseIndexNameAndColumns(def, prefix)
+		if name == "" || cols == "" {
+			return "", "", false
+		}
+		return name, fmt.Sprintf("CREATE INDEX %s ON %s%s", name, tableName, cols), true
+	}
+	return "", "", false
+}
+
+func parseIndexNameAndColumns(def, prefix string) (indexName, columns string) {
+	trimmed := strings.TrimSpace(def)
+	upper := strings.ToUpper(trimmed)
+	p := strings.Index(upper, prefix)
+	if p < 0 {
+		return "", ""
+	}
+	rest := strings.TrimSpace(trimmed[p+len(prefix):])
+	if rest == "" {
+		return "", ""
+	}
+	name, remainder := splitIdentifierAndRest(rest)
+	if name == "" {
+		return "", ""
+	}
+	open := strings.Index(remainder, "(")
+	if open < 0 {
+		return "", ""
+	}
+	return strings.ToLower(name), strings.TrimSpace(remainder[open:])
+}
+
+func parseColumnDefinition(tableName, def string) (string, tidbColumnSpec, bool) {
+	name, rest := splitIdentifierAndRest(strings.TrimSpace(def))
+	if name == "" || rest == "" {
+		return "", tidbColumnSpec{}, false
+	}
+	colType := parseColumnType(rest)
+	if colType == "" {
+		return "", tidbColumnSpec{}, false
+	}
+	return strings.ToLower(name), tidbColumnSpec{
+		columnType: strings.ToLower(strings.TrimSpace(colType)),
+		addSQL:     fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, name, strings.TrimSpace(rest)),
+	}, true
+}
+
+func parseColumnType(rest string) string {
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return ""
+	}
+	keywords := []string{" not ", " null", " default ", " generated ", " as ", " primary ", " unique ", " comment ", " references ", " auto_increment", " on update"}
+	depth := 0
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	for i := 0; i < len(rest); i++ {
+		ch := rest[i]
+		switch ch {
+		case '\\':
+			i++
+			continue
+		case '\'':
+			if !inDouble && !inBacktick {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle && !inBacktick {
+				inDouble = !inDouble
+			}
+		case '`':
+			if !inSingle && !inDouble {
+				inBacktick = !inBacktick
+			}
+		case '(':
+			if !inSingle && !inDouble && !inBacktick {
+				depth++
+			}
+		case ')':
+			if !inSingle && !inDouble && !inBacktick && depth > 0 {
+				depth--
+			}
+		}
+		if inSingle || inDouble || inBacktick || depth > 0 {
+			continue
+		}
+		suffix := " " + strings.ToLower(rest[i:])
+		for _, kw := range keywords {
+			if strings.HasPrefix(suffix, kw) {
+				return strings.TrimSpace(rest[:i])
+			}
+		}
+	}
+	return strings.TrimSpace(rest)
+}
+
+func splitIdentifierAndRest(s string) (identifier string, rest string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", ""
+	}
+	if s[0] == '`' {
+		end := strings.Index(s[1:], "`")
+		if end < 0 {
+			return "", ""
+		}
+		id := s[1 : 1+end]
+		return id, strings.TrimSpace(s[1+end+1:])
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' {
+			return s[:i], strings.TrimSpace(s[i+1:])
+		}
+	}
+	return s, ""
+}
+
+func isConstraintDefinition(def string) bool {
+	normalized := normalizeSQLFragment(def)
+	return strings.HasPrefix(normalized, "primary key") ||
+		strings.HasPrefix(normalized, "constraint ") ||
+		strings.HasPrefix(normalized, "unique key ")
+}
+
+func parseCreateIndexStatement(stmt string) (tableName, indexName, createSQL string, ok bool) {
+	normalized := normalizeSQLFragment(stmt)
+	prefix := ""
+	switch {
+	case strings.HasPrefix(normalized, "create unique index "):
+		prefix = "create unique index "
+	case strings.HasPrefix(normalized, "create index "):
+		prefix = "create index "
+	default:
+		return "", "", "", false
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(normalized, prefix))
+	parts := strings.SplitN(rest, " on ", 2)
+	if len(parts) != 2 {
+		return "", "", "", false
+	}
+	nameFields := strings.Fields(parts[0])
+	if len(nameFields) == 0 {
+		return "", "", "", false
+	}
+	afterOn := strings.TrimSpace(parts[1])
+	if afterOn == "" {
+		return "", "", "", false
+	}
+	tableEnd := strings.IndexAny(afterOn, " (")
+	if tableEnd < 0 {
+		tableEnd = len(afterOn)
+	}
+	table := strings.TrimSpace(afterOn[:tableEnd])
+	if table == "" {
+		return "", "", "", false
+	}
+	return strings.ToLower(table), strings.ToLower(nameFields[0]), strings.TrimSpace(stmt), true
+}
+
+func diffTiDBTableMeta(table tidbTableSpec, meta tidbTableMeta, createStmt string) []tidbSchemaDiff {
+	var diffs []tidbSchemaDiff
+	for _, name := range sortedColumnNames(table.columns) {
+		spec := table.columns[name]
+		col, err := meta.requireColumn(name)
+		if err != nil {
+			diffs = append(diffs, tidbSchemaDiff{
+				kind:       tidbSchemaDiffMissingColumn,
+				tableName:  table.name,
+				columnName: name,
+				detail:     fmt.Sprintf("%s schema contract: missing %s column", table.name, name),
+				repairSQL:  spec.addSQL,
+			})
+			continue
+		}
+		if normalizeSQLFragment(col.columnType) != normalizeSQLFragment(spec.columnType) {
+			diffs = append(diffs, tidbSchemaDiff{
+				kind:       tidbSchemaDiffColumnType,
+				tableName:  table.name,
+				columnName: name,
+				detail:     fmt.Sprintf("%s schema contract: %s column type = %q, want %s", table.name, name, col.columnType, spec.columnType),
+			})
+		}
+	}
+	normalizedCreate := normalizeSQLFragment(createStmt)
+	for _, name := range sortedIndexNames(table.indexes) {
+		spec := table.indexes[name]
+		if !showCreateHasIndex(normalizedCreate, name) {
+			diffs = append(diffs, tidbSchemaDiff{
+				kind:      tidbSchemaDiffMissingIndex,
+				tableName: table.name,
+				detail:    fmt.Sprintf("%s schema contract: missing %s index", table.name, name),
+				repairSQL: spec.createSQL,
+			})
+		}
+	}
+	if table.validate != nil {
+		diffs = append(diffs, table.validate(meta)...)
+	}
+	return diffs
+}
+
+func createTableStatementsByName(stmts []string) map[string]string {
+	out := make(map[string]string)
+	for _, stmt := range stmts {
+		normalized := normalizeSQLFragment(stmt)
+		const prefix = "create table if not exists "
+		if !strings.HasPrefix(normalized, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(normalized, prefix)
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			continue
+		}
+		out[fields[0]] = stmt
+	}
+	return out
+}
+
+func missingTableDiff(table tidbTableSpec) tidbSchemaDiff {
+	detail := fmt.Sprintf("%s schema contract: missing table", table.name)
+	if table.createStatement == "" {
+		detail = fmt.Sprintf("%s schema contract: missing table and no repair statement available", table.name)
+	}
+	return tidbSchemaDiff{
+		kind:      tidbSchemaDiffMissingTable,
+		tableName: table.name,
+		detail:    detail,
+		repairSQL: table.createStatement,
+	}
+}
+
+func plannedTiDBSchemaRepairs(diffs []tidbSchemaDiff) []string {
+	seen := make(map[string]struct{})
+	plans := make([]string, 0, len(diffs))
+	for _, diff := range diffs {
+		if diff.repairSQL == "" {
+			continue
+		}
+		if _, ok := seen[diff.repairSQL]; ok {
+			continue
+		}
+		seen[diff.repairSQL] = struct{}{}
+		plans = append(plans, diff.repairSQL)
+	}
+	return plans
+}
+
+func applyTiDBSchemaRepairs(db *sql.DB, statements []string) error {
+	if len(statements) == 0 {
+		return nil
+	}
+	if err := ExecSchemaStatements(db, statements); err != nil {
+		return fmt.Errorf("apply tidb schema repairs: %w", err)
+	}
+	return nil
+}
+
+func validateTiDBAutoEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
+	col, err := meta.requireColumn("embedding")
+	if err != nil {
+		return nil
+	}
+	var diffs []tidbSchemaDiff
+	extra := normalizeSQLFragment(col.extra)
+	if !strings.Contains(extra, "generated") || !strings.Contains(extra, "stored") {
+		diffs = append(diffs, tidbSchemaDiff{
+			kind:       tidbSchemaDiffTableContract,
+			tableName:  "files",
+			columnName: "embedding",
+			detail:     "files schema contract: embedding column must be a stored generated column",
+		})
+	}
+	expr := normalizeSQLFragment(col.generationExpression)
+	checks := []struct {
+		pattern string
+		errMsg  string
+	}{
+		{"embed_text(", "files schema contract: embedding generated expression must use EMBED_TEXT"},
+		{tidbAutoEmbeddingModel, "files schema contract: embedding model contract mismatch"},
+		{"content_text", "files schema contract: generated expression must derive from content_text"},
+		{tidbAutoEmbeddingOptionsJSON, "files schema contract: embedding dimensions option mismatch"},
+	}
+	for _, check := range checks {
+		if !strings.Contains(expr, check.pattern) {
+			diffs = append(diffs, tidbSchemaDiff{
+				kind:       tidbSchemaDiffTableContract,
+				tableName:  "files",
+				columnName: "embedding",
+				detail:     check.errMsg,
+			})
+		}
+	}
+	return diffs
+}
+
+func validateTiDBAppEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
+	col, err := meta.requireColumn("embedding")
+	if err != nil {
+		return nil
+	}
+	var diffs []tidbSchemaDiff
+	extra := normalizeSQLFragment(col.extra)
+	if strings.Contains(extra, "generated") {
+		diffs = append(diffs, tidbSchemaDiff{
+			kind:       tidbSchemaDiffTableContract,
+			tableName:  "files",
+			columnName: "embedding",
+			detail:     "files schema contract: embedding column must be writable in app mode",
+		})
+	}
+	if expr := normalizeSQLFragment(col.generationExpression); expr != "" {
+		diffs = append(diffs, tidbSchemaDiff{
+			kind:       tidbSchemaDiffTableContract,
+			tableName:  "files",
+			columnName: "embedding",
+			detail:     "files schema contract: embedding column must not define a generation expression in app mode",
+		})
+	}
+	return diffs
+}
+
+func schemaDiffsToError(diffs []tidbSchemaDiff) error {
+	if len(diffs) == 0 {
+		return nil
+	}
+	return errors.New(diffs[0].detail)
+}
+
+func sortedColumnNames(columns map[string]tidbColumnSpec) []string {
+	names := make([]string, 0, len(columns))
+	for name := range columns {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sortedIndexNames(indexes map[string]tidbIndexSpec) []string {
+	names := make([]string, 0, len(indexes))
+	for name := range indexes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func showCreateHasIndex(normalizedCreate, indexName string) bool {
+	needle := strings.ToLower(indexName) + " ("
+	return strings.Contains(normalizedCreate, needle)
 }

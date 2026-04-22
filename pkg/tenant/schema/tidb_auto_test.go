@@ -83,6 +83,181 @@ func TestLegacyTiDBUploadsRepairStatements(t *testing.T) {
 	}
 }
 
+func TestTiDBSchemaSpecForModeIncludesCreateStatements(t *testing.T) {
+	spec, err := tidbSchemaSpecForMode(TiDBEmbeddingModeAuto)
+	if err != nil {
+		t.Fatalf("schema spec: %v", err)
+	}
+
+	createByTable := make(map[string]string, len(spec.tables))
+	for _, table := range spec.tables {
+		createByTable[table.name] = table.createStatement
+	}
+
+	for _, tableName := range []string{"file_nodes", "file_tags", "files", "uploads", "semantic_tasks", "vault_deks", "vault_audit_log"} {
+		stmt := createByTable[tableName]
+		if stmt == "" {
+			t.Fatalf("missing create statement for %s", tableName)
+		}
+		if !strings.Contains(strings.ToLower(stmt), "create table if not exists "+tableName) {
+			t.Fatalf("unexpected create statement for %s: %q", tableName, stmt)
+		}
+	}
+}
+
+func TestTiDBSchemaSpecFromStatementsParsesNewTableAutomatically(t *testing.T) {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS example_events (
+			event_id VARCHAR(64) PRIMARY KEY,
+			tenant_id VARCHAR(64) NOT NULL,
+			payload JSON,
+			created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+		)`,
+		`CREATE INDEX idx_example_events_tenant ON example_events(tenant_id)`,
+	}
+
+	spec, err := tidbSchemaSpecFromStatements(stmts)
+	if err != nil {
+		t.Fatalf("tidbSchemaSpecFromStatements: %v", err)
+	}
+	table := mustTableSpecFromSchemaSpec(t, spec, "example_events")
+	if _, ok := table.columns["event_id"]; !ok {
+		t.Fatal("expected event_id column in parsed schema spec")
+	}
+	if got := table.columns["created_at"].columnType; got != "datetime(3)" {
+		t.Fatalf("created_at column type=%q, want datetime(3)", got)
+	}
+	if _, ok := table.indexes["idx_example_events_tenant"]; !ok {
+		t.Fatal("expected idx_example_events_tenant index in parsed schema spec")
+	}
+}
+
+func TestPlannedTiDBSchemaRepairsIncludesSafeStatementsOnly(t *testing.T) {
+	diffs := []tidbSchemaDiff{
+		{kind: tidbSchemaDiffMissingTable, tableName: "semantic_tasks", repairSQL: "CREATE TABLE IF NOT EXISTS semantic_tasks (...)"},
+		{kind: tidbSchemaDiffMissingColumn, tableName: "uploads", columnName: "expected_revision", repairSQL: "ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL"},
+		{kind: tidbSchemaDiffMissingIndex, tableName: "uploads", detail: "uploads schema contract: missing idx_upload_path index", repairSQL: "CREATE INDEX idx_upload_path ON uploads(target_path, status)"},
+		{kind: tidbSchemaDiffMissingColumn, tableName: "uploads", columnName: "expected_revision", repairSQL: "ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL"},
+		{kind: tidbSchemaDiffColumnType, tableName: "files", columnName: "embedding_revision", detail: "files schema contract: embedding_revision column type = \"int\", want bigint"},
+	}
+
+	got := plannedTiDBSchemaRepairs(diffs)
+	if len(got) != 3 {
+		t.Fatalf("plannedTiDBSchemaRepairs() len=%d, want 3 (%#v)", len(got), got)
+	}
+	if got[0] != "CREATE TABLE IF NOT EXISTS semantic_tasks (...)" {
+		t.Fatalf("unexpected first repair statement: %q", got[0])
+	}
+	if got[1] != "ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL" {
+		t.Fatalf("unexpected second repair statement: %q", got[1])
+	}
+	if got[2] != "CREATE INDEX idx_upload_path ON uploads(target_path, status)" {
+		t.Fatalf("unexpected third repair statement: %q", got[2])
+	}
+}
+
+func TestValidateTiDBAutoEmbeddingFilesDiffsReportsGeneratedContractMismatch(t *testing.T) {
+	meta := testFilesTableMeta(TiDBEmbeddingModeApp)
+	diffs := validateTiDBAutoEmbeddingFilesDiffs(meta)
+	if len(diffs) == 0 {
+		t.Fatal("expected auto embedding diffs for writable embedding column")
+	}
+	if !strings.Contains(strings.ToLower(diffs[0].detail), "stored generated") {
+		t.Fatalf("unexpected diff detail: %#v", diffs)
+	}
+}
+
+func TestDiffTiDBTableMetaReportsMissingRequiredIndex(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "uploads")
+	meta := testUploadsTableMeta(true)
+	createStmt := `CREATE TABLE uploads (
+		upload_id VARCHAR(64) PRIMARY KEY,
+		target_path VARCHAR(512) NOT NULL,
+		status VARCHAR(32) NOT NULL,
+		expected_revision BIGINT NULL
+	)`
+
+	diffs := diffTiDBTableMeta(spec, meta, createStmt)
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "idx_upload_path") {
+		t.Fatalf("expected missing idx_upload_path diff, got %#v", diffs)
+	}
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "idx_idempotency") {
+		t.Fatalf("expected missing idx_idempotency diff, got %#v", diffs)
+	}
+}
+
+func TestDiffTiDBTableMetaReportsFileNodesAndFileTagsMissingIndexes(t *testing.T) {
+	nodesSpec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "file_nodes")
+	nodesMeta := tidbTableMeta{
+		tableName: "file_nodes",
+		columns: map[string]tidbColumnMeta{
+			"node_id":     {columnType: "varchar(64)"},
+			"path":        {columnType: "varchar(512)"},
+			"parent_path": {columnType: "varchar(512)"},
+			"name":        {columnType: "varchar(255)"},
+			"file_id":     {columnType: "varchar(64)"},
+			"created_at":  {columnType: "datetime(3)"},
+		},
+	}
+	nodesDiffs := diffTiDBTableMeta(nodesSpec, nodesMeta, `CREATE TABLE file_nodes (node_id VARCHAR(64) PRIMARY KEY)`)
+	if !hasDiffKindAndDetail(nodesDiffs, tidbSchemaDiffMissingIndex, "idx_path") {
+		t.Fatalf("expected missing idx_path diff, got %#v", nodesDiffs)
+	}
+
+	tagsSpec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "file_tags")
+	tagsMeta := tidbTableMeta{
+		tableName: "file_tags",
+		columns: map[string]tidbColumnMeta{
+			"file_id":   {columnType: "varchar(64)"},
+			"tag_key":   {columnType: "varchar(255)"},
+			"tag_value": {columnType: "varchar(255)"},
+		},
+	}
+	tagsDiffs := diffTiDBTableMeta(tagsSpec, tagsMeta, `CREATE TABLE file_tags (file_id VARCHAR(64), tag_key VARCHAR(255), tag_value VARCHAR(255))`)
+	if !hasDiffKindAndDetail(tagsDiffs, tidbSchemaDiffMissingIndex, "idx_kv") {
+		t.Fatalf("expected missing idx_kv diff, got %#v", tagsDiffs)
+	}
+}
+
+func TestDiffTiDBTableMetaReportsSemanticTasksMissingKeyColumn(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "semantic_tasks")
+	meta := tidbTableMeta{
+		tableName: "semantic_tasks",
+		columns: map[string]tidbColumnMeta{
+			"task_id":          {columnType: "varchar(64)"},
+			"task_type":        {columnType: "varchar(32)"},
+			"resource_id":      {columnType: "varchar(64)"},
+			"resource_version": {columnType: "bigint"},
+			"status":           {columnType: "varchar(20)"},
+		},
+	}
+	createStmt := `CREATE TABLE semantic_tasks (
+		task_id VARCHAR(64) PRIMARY KEY,
+		task_type VARCHAR(32) NOT NULL,
+		resource_id VARCHAR(64) NOT NULL,
+		resource_version BIGINT NOT NULL,
+		status VARCHAR(20) NOT NULL
+	)`
+
+	diffs := diffTiDBTableMeta(spec, meta, createStmt)
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingColumn, "available_at") {
+		t.Fatalf("expected missing available_at diff, got %#v", diffs)
+	}
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "uk_task_resource_version") {
+		t.Fatalf("expected missing uk_task_resource_version diff, got %#v", diffs)
+	}
+}
+
+func TestTiDBSchemaSpecForModeIncludesVaultIndexes(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "vault_secrets")
+	if _, ok := spec.indexes["uk_vault_secrets_tenant_name"]; !ok {
+		t.Fatal("vault_secrets missing uk_vault_secrets_tenant_name index spec")
+	}
+	if _, ok := spec.indexes["idx_vault_secrets_tenant"]; !ok {
+		t.Fatal("vault_secrets missing idx_vault_secrets_tenant index spec")
+	}
+}
+
 func TestInitTiDBTenantSchemaStatementsForModeIncludesVault(t *testing.T) {
 	for _, mode := range []TiDBEmbeddingMode{TiDBEmbeddingModeAuto, TiDBEmbeddingModeApp} {
 		t.Run(string(mode), func(t *testing.T) {
@@ -194,4 +369,39 @@ func testUploadsTableMeta(includeExpectedRevision bool) tidbTableMeta {
 		meta.columns["expected_revision"] = tidbColumnMeta{columnType: "bigint"}
 	}
 	return meta
+}
+
+func mustTiDBTableSpecByName(t *testing.T, mode TiDBEmbeddingMode, tableName string) tidbTableSpec {
+	t.Helper()
+	spec, err := tidbSchemaSpecForMode(mode)
+	if err != nil {
+		t.Fatalf("schema spec for %q: %v", mode, err)
+	}
+	for _, table := range spec.tables {
+		if table.name == tableName {
+			return table
+		}
+	}
+	t.Fatalf("missing table spec %q", tableName)
+	return tidbTableSpec{}
+}
+
+func hasDiffKindAndDetail(diffs []tidbSchemaDiff, kind tidbSchemaDiffKind, detailSubstring string) bool {
+	for _, diff := range diffs {
+		if diff.kind == kind && strings.Contains(strings.ToLower(diff.detail), strings.ToLower(detailSubstring)) {
+			return true
+		}
+	}
+	return false
+}
+
+func mustTableSpecFromSchemaSpec(t *testing.T, spec tidbSchemaSpec, tableName string) tidbTableSpec {
+	t.Helper()
+	for _, table := range spec.tables {
+		if table.name == tableName {
+			return table
+		}
+	}
+	t.Fatalf("missing table spec %q", tableName)
+	return tidbTableSpec{}
 }
