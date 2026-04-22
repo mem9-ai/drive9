@@ -247,6 +247,8 @@ TS="$(date +%s)"
 SMALL_LOCAL="/tmp/drive9-cli-small-${TS}.txt"
 SMALL_REMOTE="/cli-${TS}-small.txt"
 SMALL_RENAMED="/cli-${TS}-small-renamed.txt"
+TAG_LOCAL="/tmp/drive9-cli-tag-${TS}.txt"
+TAG_REMOTE="/cli-${TS}-tagged.txt"
 IMAGE_LOCAL="/tmp/drive9-cli-image-${TS}.jpg"
 IMAGE_REMOTE="/cli-${TS}-image.jpg"
 SEM_TEXT_TARGET="/cli-${TS}-cat-story.txt"
@@ -287,6 +289,68 @@ print("true" if any(line.strip()==name for line in out) else "false")
 PY
 )
 check_eq "mv renames remote file" "$renamed_present" "true"
+
+echo "[4.1] cli tag/stat metadata checks"
+printf "cli-tag-%s" "$TS" > "$TAG_LOCAL"
+drive9_retry fs cp --tag owner=smoke --tag topic=e2e "$TAG_LOCAL" ":$TAG_REMOTE" >/dev/null
+
+tag_stat_json="$(drive9_retry fs stat --json "$TAG_REMOTE")"
+tag_owner=$(python3 - "$tag_stat_json" <<'PY'
+import json
+import sys
+doc = json.loads(sys.argv[1])
+print((doc.get("tags") or {}).get("owner", ""))
+PY
+)
+check_eq "stat --json returns owner tag" "$tag_owner" "smoke"
+
+tag_topic=$(python3 - "$tag_stat_json" <<'PY'
+import json
+import sys
+doc = json.loads(sys.argv[1])
+print((doc.get("tags") or {}).get("topic", ""))
+PY
+)
+check_eq "stat --json returns topic tag" "$tag_topic" "e2e"
+
+tag_semantic=$(python3 - "$tag_stat_json" <<'PY'
+import json
+import sys
+doc = json.loads(sys.argv[1])
+print(doc.get("semantic_text", ""))
+PY
+)
+check_eq "stat --json includes semantic_text for tagged file" "$tag_semantic" "cli-tag-${TS}"
+
+check_cmd "stat --json includes non-empty content_type for tagged file" python3 - "$tag_stat_json" <<'PY'
+import json
+import sys
+doc = json.loads(sys.argv[1])
+raise SystemExit(0 if (doc.get("content_type") or "").strip() else 1)
+PY
+
+printf "cli-tag-updated-%s" "$TS" > "$TAG_LOCAL"
+drive9_retry fs cp --tag owner=updated "$TAG_LOCAL" ":$TAG_REMOTE" >/dev/null
+
+tag_stat_json2="$(drive9_retry fs stat --json "$TAG_REMOTE")"
+tag_owner2=$(python3 - "$tag_stat_json2" <<'PY'
+import json
+import sys
+doc = json.loads(sys.argv[1])
+print((doc.get("tags") or {}).get("owner", ""))
+PY
+)
+check_eq "overwrite with single --tag updates owner" "$tag_owner2" "updated"
+
+tag_topic2=$(python3 - "$tag_stat_json2" <<'PY'
+import json
+import sys
+doc = json.loads(sys.argv[1])
+tags = doc.get("tags") or {}
+print("present" if "topic" in tags else "missing")
+PY
+)
+check_eq "overwrite with single --tag clears old topic tag" "$tag_topic2" "missing"
 
 echo "[5] batch small-file upload/list/read via cli"
 mkdir -p "$BATCH_LOCAL_DIR"
@@ -412,6 +476,7 @@ check_eq "downloaded large file sha256 matches" "$sum_dst" "$sum_src"
 
 echo "[8] cleanup via cli"
 drive9_retry fs rm "$SMALL_RENAMED" >/dev/null
+drive9_retry fs rm "$TAG_REMOTE" >/dev/null
 if [ "$CLI_IMAGE_UPLOADED" = "1" ]; then
   drive9_retry fs rm "$IMAGE_REMOTE" >/dev/null
 fi
@@ -554,6 +619,7 @@ PY
 fi
 
 rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$IMAGE_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
+rm -f "$TAG_LOCAL"
 rm -f "/tmp/drive9-cli-sem-target-${TS}.txt" "/tmp/drive9-cli-sem-other-${TS}.txt" "/tmp/drive9-cli-image-caption-${TS}.txt"
 rm -rf "$BATCH_LOCAL_DIR"
 
