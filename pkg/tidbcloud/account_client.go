@@ -65,7 +65,7 @@ func (c *grpcAccountClient) Authorize(ctx context.Context, r *http.Request, _ st
 //
 // In production, Kong authenticates the request first and forwards identity via
 // headers:
-//   - Bearer token: X-Auth-Method=bear, X-Auth-Raw=Bearer <token>
+//   - Access token: X-Auth-Method=bear, X-Auth-Raw=Bearer <token>
 //   - API key:      X-Auth-Method=digest/basic, X-Auth-Content={"public_key":"<ak>"}
 //
 // As a fallback (e.g. local dev without Kong), the raw Authorization header is
@@ -73,7 +73,7 @@ func (c *grpcAccountClient) Authorize(ctx context.Context, r *http.Request, _ st
 func (c *grpcAccountClient) authenticate(ctx context.Context, r *http.Request) (*identityInfo, error) {
 	method := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Auth-Method")))
 
-	// 1. Bearer token via Kong: X-Auth-Method=bear, X-Auth-Raw=Bearer <token>
+	// 1. Access token via Kong: X-Auth-Method=bear, X-Auth-Raw=Bearer <token>
 	if method == "bear" {
 		raw := r.Header.Get("X-Auth-Raw")
 		if strings.TrimSpace(raw) == "" {
@@ -86,7 +86,7 @@ func (c *grpcAccountClient) authenticate(ctx context.Context, r *http.Request) (
 		if token == "" {
 			return nil, fmt.Errorf("%w: X-Auth-Raw bearer token is empty", ErrAuthMissing)
 		}
-		return c.authByUserToken(ctx, token)
+		return c.authByAccessToken(ctx, token)
 	}
 
 	// 2. API key via Kong: X-Auth-Method=digest/basic, X-Auth-Content={"public_key":"<ak>"}
@@ -121,6 +121,24 @@ func (c *grpcAccountClient) authenticate(ctx context.Context, r *http.Request) (
 		zap.Bool("has-authorization", r.Header.Get("Authorization") != ""),
 	)
 	return nil, fmt.Errorf("%w: no valid auth credentials found", ErrAuthMissing)
+}
+
+// authByAccessToken validates an access token via GetIdentityByAccessToken.
+func (c *grpcAccountClient) authByAccessToken(ctx context.Context, token string) (*identityInfo, error) {
+	resp, err := c.account.GetIdentityByAccessToken(ctx, &accountpb.GetIdentityByAccessTokenReq{
+		RawAccessToken: token,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrAuthMissing, err)
+	}
+	if resp.GetBaseResp().GetErrCode() != 0 {
+		return nil, fmt.Errorf("%w: %s", ErrAuthMissing, resp.GetBaseResp().GetErrMsg())
+	}
+	identity := resp.GetAccessTokenIdentity()
+	if identity == nil || identity.GetUserId() == 0 || identity.GetOrgId() == 0 {
+		return nil, fmt.Errorf("%w: invalid access token identity", ErrAuthMissing)
+	}
+	return &identityInfo{userID: identity.GetUserId(), orgID: identity.GetOrgId()}, nil
 }
 
 // authByUserToken validates an OAuth token via GetUserByToken.

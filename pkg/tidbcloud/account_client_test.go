@@ -14,9 +14,14 @@ import (
 type mockAccountClient struct {
 	accountpb.AccountAPIServiceClient // embed to satisfy the full interface
 
-	getUserByTokenFn       func(ctx context.Context, in *accountpb.GetUserByTokenRequest, opts ...grpc.CallOption) (*accountpb.GetUserByTokenResponse, error)
-	listOrgsByUserFn       func(ctx context.Context, in *accountpb.ListOrgsByUserRequest, opts ...grpc.CallOption) (*accountpb.ListOrgsByUserResponse, error)
-	getApiKeyByAccessKeyFn func(ctx context.Context, in *accountpb.GetApiKeyByAccessKeyReq, opts ...grpc.CallOption) (*accountpb.GetApiKeyByAccessKeyRsp, error)
+	getIdentityByAccessTokenFn func(ctx context.Context, in *accountpb.GetIdentityByAccessTokenReq, opts ...grpc.CallOption) (*accountpb.GetIdentityByAccessTokenResp, error)
+	getUserByTokenFn           func(ctx context.Context, in *accountpb.GetUserByTokenRequest, opts ...grpc.CallOption) (*accountpb.GetUserByTokenResponse, error)
+	listOrgsByUserFn           func(ctx context.Context, in *accountpb.ListOrgsByUserRequest, opts ...grpc.CallOption) (*accountpb.ListOrgsByUserResponse, error)
+	getApiKeyByAccessKeyFn     func(ctx context.Context, in *accountpb.GetApiKeyByAccessKeyReq, opts ...grpc.CallOption) (*accountpb.GetApiKeyByAccessKeyRsp, error)
+}
+
+func (m *mockAccountClient) GetIdentityByAccessToken(ctx context.Context, in *accountpb.GetIdentityByAccessTokenReq, opts ...grpc.CallOption) (*accountpb.GetIdentityByAccessTokenResp, error) {
+	return m.getIdentityByAccessTokenFn(ctx, in, opts...)
 }
 
 func (m *mockAccountClient) GetUserByToken(ctx context.Context, in *accountpb.GetUserByTokenRequest, opts ...grpc.CallOption) (*accountpb.GetUserByTokenResponse, error) {
@@ -33,20 +38,12 @@ func (m *mockAccountClient) GetApiKeyByAccessKey(ctx context.Context, in *accoun
 
 func TestAuthorize_OAuthToken_Success(t *testing.T) {
 	mock := &mockAccountClient{
-		getUserByTokenFn: func(_ context.Context, in *accountpb.GetUserByTokenRequest, _ ...grpc.CallOption) (*accountpb.GetUserByTokenResponse, error) {
-			if in.Token != "valid-token" {
-				t.Fatalf("unexpected token: %s", in.Token)
+		getIdentityByAccessTokenFn: func(_ context.Context, in *accountpb.GetIdentityByAccessTokenReq, _ ...grpc.CallOption) (*accountpb.GetIdentityByAccessTokenResp, error) {
+			if in.RawAccessToken != "valid-token" {
+				t.Fatalf("unexpected raw access token: %s", in.RawAccessToken)
 			}
-			return &accountpb.GetUserByTokenResponse{
-				User: &accountpb.User{Id: 100, Status: accountpb.UserStatus_USER_STATUS_ACTIVE},
-			}, nil
-		},
-		listOrgsByUserFn: func(_ context.Context, in *accountpb.ListOrgsByUserRequest, _ ...grpc.CallOption) (*accountpb.ListOrgsByUserResponse, error) {
-			if in.UserId != 100 {
-				t.Fatalf("unexpected user ID: %d", in.UserId)
-			}
-			return &accountpb.ListOrgsByUserResponse{
-				Orgs: []*accountpb.Org{{Id: 200}},
+			return &accountpb.GetIdentityByAccessTokenResp{
+				AccessTokenIdentity: &accountpb.AccessTokenIdentity{UserId: 100, OrgId: 200},
 			}, nil
 		},
 	}
@@ -194,8 +191,7 @@ func TestAuthorize_OAuthToken_InactiveUser(t *testing.T) {
 
 	client := NewGRPCAccountClient(mock)
 	r, _ := http.NewRequest("GET", "/", nil)
-	r.Header.Set("X-Auth-Method", "bear")
-	r.Header.Set("X-Auth-Raw", "Bearer some-token")
+	r.Header.Set("Authorization", "Bearer some-token")
 
 	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
@@ -220,8 +216,7 @@ func TestAuthorize_OAuthToken_NoOrgs(t *testing.T) {
 
 	client := NewGRPCAccountClient(mock)
 	r, _ := http.NewRequest("GET", "/", nil)
-	r.Header.Set("X-Auth-Method", "bear")
-	r.Header.Set("X-Auth-Raw", "Bearer some-token")
+	r.Header.Set("Authorization", "Bearer some-token")
 
 	_, err := client.Authorize(context.Background(), r, "cluster-1")
 	if err == nil {
