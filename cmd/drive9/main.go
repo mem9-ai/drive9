@@ -241,9 +241,10 @@ func fsUsage() {
 
 commands:
   cp <src> <dst>       copy files (local↔remote)
+    --tag <key=value>    set file tag (repeatable, upload only)
   cat <path>           read file to stdout
   ls [path]            list directory
-  stat <path>          file metadata
+  stat [--json] <path> file metadata
   mv <old> <new>       rename/move
   rm [-r|--recursive] <path>
                        remove file or directory tree

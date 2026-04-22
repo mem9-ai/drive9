@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -26,13 +27,31 @@ import (
 func Cp(c *client.Client, args []string) error {
 	resume := false
 	appendMode := false
-	filtered := args[:0]
-	for _, a := range args {
-		switch a {
-		case "--resume":
+	var tags map[string]string
+	filtered := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--resume":
 			resume = true
-		case "--append":
+		case a == "--append":
 			appendMode = true
+		case a == "--tag":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--tag requires key=value argument")
+			}
+			i++
+			var err error
+			tags, err = parseAndMergeTag(tags, args[i])
+			if err != nil {
+				return err
+			}
+		case strings.HasPrefix(a, "--tag="):
+			var err error
+			tags, err = parseAndMergeTag(tags, strings.TrimPrefix(a, "--tag="))
+			if err != nil {
+				return err
+			}
 		default:
 			filtered = append(filtered, a)
 		}
@@ -40,7 +59,7 @@ func Cp(c *client.Client, args []string) error {
 	args = filtered
 
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs cp [--resume] [--append] <src> <dst>")
+		return fmt.Errorf("usage: drive9 fs cp [--resume] [--append] [--tag key=value]... <src> <dst>")
 	}
 	if resume && appendMode {
 		return fmt.Errorf("--resume and --append cannot be used together")
@@ -55,6 +74,11 @@ func Cp(c *client.Client, args []string) error {
 	if appendMode && (srcIsRemote || !dstIsRemote) {
 		return fmt.Errorf("--append only supports local file source to remote destination")
 	}
+	if len(tags) > 0 {
+		if srcIsRemote || !dstIsRemote {
+			return fmt.Errorf("--tag is only supported for uploads (local/stdin -> remote)")
+		}
+	}
 
 	ctx := context.Background()
 
@@ -65,9 +89,9 @@ func Cp(c *client.Client, args []string) error {
 			return fmt.Errorf("read stdin: %w", err)
 		}
 		if appendMode {
-			return c.AppendStream(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress)
+			return c.AppendStreamWithTags(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress, tags)
 		}
-		summary, err := c.WriteStreamWithSummary(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress)
+		summary, err := c.WriteStreamWithSummaryAndTags(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress, tags)
 		if err != nil {
 			return err
 		}
@@ -79,12 +103,12 @@ func Cp(c *client.Client, args []string) error {
 
 	case !srcIsRemote && dstIsRemote:
 		if appendMode {
-			return appendFile(ctx, c, src, dstRP.Path)
+			return appendFileWithTags(ctx, c, src, dstRP.Path, tags)
 		}
 		if resume {
-			return resumeUpload(ctx, c, src, dstRP.Path)
+			return resumeUploadWithTags(ctx, c, src, dstRP.Path, tags)
 		}
-		return uploadFile(ctx, c, src, dstRP.Path)
+		return uploadFileWithTags(ctx, c, src, dstRP.Path, tags)
 
 	case srcIsRemote && !dstIsRemote:
 		return downloadFile(ctx, c, srcRP.Path, dst)
@@ -97,14 +121,37 @@ func Cp(c *client.Client, args []string) error {
 	}
 }
 
+func parseAndMergeTag(tags map[string]string, raw string) (map[string]string, error) {
+	key, value, ok := strings.Cut(raw, "=")
+	if !ok {
+		return nil, fmt.Errorf("invalid --tag %q (expected key=value)", raw)
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil, fmt.Errorf("invalid --tag %q (expected key=value)", raw)
+	}
+	if tags == nil {
+		tags = make(map[string]string)
+	}
+	if _, dup := tags[key]; dup {
+		return nil, fmt.Errorf("duplicate --tag key %q", key)
+	}
+	tags[key] = value
+	return tags, nil
+}
+
 func uploadFile(ctx context.Context, c *client.Client, localPath, remotePath string) error {
+	return uploadFileWithTags(ctx, c, localPath, remotePath, nil)
+}
+
+func uploadFileWithTags(ctx context.Context, c *client.Client, localPath, remotePath string, tags map[string]string) error {
 	f, size, err := openLocalFile(localPath)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = f.Close() }()
 
-	summary, err := c.WriteStreamWithSummary(ctx, remotePath, f, size, printProgress)
+	summary, err := c.WriteStreamWithSummaryAndTags(ctx, remotePath, f, size, printProgress, tags)
 	if err != nil {
 		return err
 	}
@@ -113,13 +160,17 @@ func uploadFile(ctx context.Context, c *client.Client, localPath, remotePath str
 }
 
 func resumeUpload(ctx context.Context, c *client.Client, localPath, remotePath string) error {
+	return resumeUploadWithTags(ctx, c, localPath, remotePath, nil)
+}
+
+func resumeUploadWithTags(ctx context.Context, c *client.Client, localPath, remotePath string, tags map[string]string) error {
 	f, size, err := openLocalFile(localPath)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = f.Close() }()
 
-	summary, err := c.ResumeUploadWithSummary(ctx, remotePath, f, size, printProgress)
+	summary, err := c.ResumeUploadWithSummaryAndTags(ctx, remotePath, f, size, printProgress, tags)
 	if err != nil {
 		return err
 	}
@@ -128,13 +179,17 @@ func resumeUpload(ctx context.Context, c *client.Client, localPath, remotePath s
 }
 
 func appendFile(ctx context.Context, c *client.Client, localPath, remotePath string) error {
+	return appendFileWithTags(ctx, c, localPath, remotePath, nil)
+}
+
+func appendFileWithTags(ctx context.Context, c *client.Client, localPath, remotePath string, tags map[string]string) error {
 	f, size, err := openLocalFile(localPath)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = f.Close() }()
 
-	return c.AppendStream(ctx, remotePath, f, size, printProgress)
+	return c.AppendStreamWithTags(ctx, remotePath, f, size, printProgress, tags)
 }
 
 func openLocalFile(localPath string) (*os.File, int64, error) {

@@ -1,7 +1,11 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"sort"
+	"strings"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -11,20 +15,52 @@ import (
 //	drive9 stat /path/to/file
 //	drive9 stat :/path/to/file
 func Stat(c *client.Client, args []string) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: drive9 stat <path>")
+	jsonOutput := false
+	path := ""
+	for _, arg := range args {
+		switch arg {
+		case "--json":
+			jsonOutput = true
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return fmt.Errorf("usage: drive9 stat [--json] <path>")
+			}
+			if path != "" {
+				return fmt.Errorf("usage: drive9 stat [--json] <path>")
+			}
+			path = arg
+		}
 	}
-	path := args[0]
+	if path == "" {
+		return fmt.Errorf("usage: drive9 stat [--json] <path>")
+	}
 	// Handle ":" prefixed remote paths like cp command
 	if rp, isRemote := ParseRemote(path); isRemote {
 		path = rp.Path
 	}
-	s, err := c.Stat(path)
+	m, err := c.StatMetadata(path)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("size:     %d\n", s.Size)
-	fmt.Printf("isdir:    %v\n", s.IsDir)
-	fmt.Printf("revision: %d\n", s.Revision)
+	if jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(m)
+	}
+
+	fmt.Printf("size: %d\n", m.Size)
+	fmt.Printf("isdir: %v\n", m.IsDir)
+	fmt.Printf("revision: %d\n", m.Revision)
+	fmt.Printf("content_type: %s\n", m.ContentType)
+	fmt.Printf("semantic_text: %s\n", m.SemanticText)
+
+	keys := make([]string, 0, len(m.Tags))
+	for k := range m.Tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Printf("tags.%s: %s\n", k, m.Tags[k])
+	}
 	return nil
 }

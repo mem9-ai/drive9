@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -164,6 +165,16 @@ type StatResult struct {
 	Mtime    time.Time
 }
 
+// StatMetadataResult represents enriched metadata from GET /v1/fs/{path}?stat=1.
+type StatMetadataResult struct {
+	Size         int64             `json:"size"`
+	IsDir        bool              `json:"isdir"`
+	Revision     int64             `json:"revision"`
+	ContentType  string            `json:"content_type"`
+	SemanticText string            `json:"semantic_text"`
+	Tags         map[string]string `json:"tags"`
+}
+
 func (c *Client) url(path string) string {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
@@ -223,6 +234,17 @@ func (c *Client) WriteCtx(ctx context.Context, path string, data []byte) error {
 // - zero: path must not already exist
 // - positive: file must exist at exactly that revision
 func (c *Client) WriteCtxConditional(ctx context.Context, path string, data []byte, expectedRevision int64) error {
+	return c.WriteCtxConditionalWithTags(ctx, path, data, expectedRevision, nil)
+}
+
+// WriteCtxConditionalWithTags uploads data to a remote path with optional
+// compare-and-set semantics and optional file tags.
+//
+// expectedRevision semantics:
+// - negative: unconditional write
+// - zero: path must not already exist
+// - positive: file must exist at exactly that revision
+func (c *Client) WriteCtxConditionalWithTags(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -231,6 +253,7 @@ func (c *Client) WriteCtxConditional(ctx context.Context, path string, data []by
 	if expectedRevision >= 0 {
 		req.Header.Set("X-Dat9-Expected-Revision", strconv.FormatInt(expectedRevision, 10))
 	}
+	setTagHeaders(req, tags)
 	resp, err := c.do(req)
 	if err != nil {
 		return err
@@ -330,6 +353,36 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 		}
 	}
 	return s, nil
+}
+
+// StatMetadata returns enriched metadata for a path, including content_type,
+// semantic_text, and tags.
+func (c *Client) StatMetadata(path string) (*StatMetadataResult, error) {
+	return c.StatMetadataCtx(context.Background(), path)
+}
+
+// StatMetadataCtx returns enriched metadata for a path with context support.
+func (c *Client) StatMetadataCtx(ctx context.Context, path string) (*StatMetadataResult, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path)+"?stat=1", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var out StatMetadataResult
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode stat metadata: %w", err)
+	}
+	if out.Tags == nil {
+		out.Tags = map[string]string{}
+	}
+	return &out, nil
 }
 
 // Delete removes a file or directory.
@@ -529,4 +582,18 @@ func (c *Client) Find(pathPrefix string, params url.Values) ([]SearchResult, err
 		return nil, err
 	}
 	return results, nil
+}
+
+func setTagHeaders(req *http.Request, tags map[string]string) {
+	if len(tags) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		req.Header.Add("X-Dat9-Tag", k+"="+tags[k])
+	}
 }
