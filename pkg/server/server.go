@@ -435,6 +435,9 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 		}
 	case http.MethodPut:
 		s.handleWrite(w, r, path)
+	// Compatibility: keep HEAD stat for clients that predate commit
+	// b7efda9527f758b772f235abb9a2ccc65ed17447.
+	// Newer clients use GET "?stat=1" via s.handleStatMetadata(...).
 	case http.MethodHead:
 		s.handleStat(w, r, path)
 	case http.MethodDelete:

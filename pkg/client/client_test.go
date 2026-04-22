@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
@@ -145,6 +147,73 @@ func TestStatMetadataIncludesTagsAndSupportsTagReplace(t *testing.T) {
 	}
 	if meta.Tags["owner"] != "bob" || len(meta.Tags) != 1 {
 		t.Fatalf("tags after replace = %+v, want only owner=bob", meta.Tags)
+	}
+}
+
+func TestStatMetadataCompatFallsBackOnDecodeError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/legacy.txt" && r.URL.Query().Has("stat"):
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write([]byte("legacy response"))
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/legacy.txt":
+			w.Header().Set("Content-Length", "14")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	got, err := c.StatMetadataCompat("/legacy.txt")
+	if err != nil {
+		t.Fatalf("StatMetadataCompat: %v", err)
+	}
+	if got.Size != 14 || got.IsDir || got.Revision != 7 {
+		t.Fatalf("unexpected fallback metadata: %+v", got)
+	}
+	if got.ContentType != "" || got.SemanticText != "" {
+		t.Fatalf("fallback metadata should keep enriched fields empty: %+v", got)
+	}
+	if len(got.Tags) != 0 {
+		t.Fatalf("fallback metadata should return empty tags, got: %+v", got.Tags)
+	}
+}
+
+func TestStatMetadataCompatDoesNotFallbackOnUnauthorized(t *testing.T) {
+	headCalled := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/secure.txt" && r.URL.Query().Has("stat"):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/secure.txt":
+			headCalled = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	_, err := c.StatMetadataCompat("/secure.txt")
+	if err == nil {
+		t.Fatal("StatMetadataCompat error = nil, want unauthorized error")
+	}
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("StatMetadataCompat error type = %T, want *StatusError", err)
+	}
+	if statusErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status code = %d, want %d", statusErr.StatusCode, http.StatusUnauthorized)
+	}
+	if headCalled {
+		t.Fatal("HEAD fallback should not run on unauthorized metadata request")
 	}
 }
 

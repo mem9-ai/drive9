@@ -317,11 +317,19 @@ func (c *Client) ListCtx(ctx context.Context, path string) ([]FileInfo, error) {
 }
 
 // Stat returns metadata for a path.
+//
+// Deprecated: use StatMetadataCompat. Stat relies on legacy HEAD metadata and
+// does not provide enriched fields such as content_type, semantic_text, and
+// tags.
 func (c *Client) Stat(path string) (*StatResult, error) {
 	return c.StatCtx(context.Background(), path)
 }
 
 // StatCtx returns metadata for a path with context support.
+//
+// Deprecated: use StatMetadataCompatCtx. StatCtx relies on legacy HEAD
+// metadata and does not provide enriched fields such as content_type,
+// semantic_text, and tags.
 func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.url(path), nil)
 	if err != nil {
@@ -383,6 +391,48 @@ func (c *Client) StatMetadataCtx(ctx context.Context, path string) (*StatMetadat
 		out.Tags = map[string]string{}
 	}
 	return &out, nil
+}
+
+// StatMetadataCompat returns enriched metadata for a path and transparently
+// falls back to legacy HEAD stat when the server does not support ?stat=1.
+func (c *Client) StatMetadataCompat(path string) (*StatMetadataResult, error) {
+	return c.StatMetadataCompatCtx(context.Background(), path)
+}
+
+// StatMetadataCompatCtx returns enriched metadata for a path with context
+// support, and falls back to HEAD stat when ?stat=1 is unsupported by older
+// servers.
+func (c *Client) StatMetadataCompatCtx(ctx context.Context, path string) (*StatMetadataResult, error) {
+	out, err := c.StatMetadataCtx(ctx, path)
+	if err == nil {
+		return out, nil
+	}
+	if !shouldFallbackStatMetadata(err) {
+		return nil, err
+	}
+	statOut, statErr := c.StatCtx(ctx, path)
+	if statErr != nil {
+		return nil, statErr
+	}
+	return &StatMetadataResult{
+		Size:         statOut.Size,
+		IsDir:        statOut.IsDir,
+		Revision:     statOut.Revision,
+		ContentType:  "",
+		SemanticText: "",
+		Tags:         map[string]string{},
+	}, nil
+}
+
+func shouldFallbackStatMetadata(err error) bool {
+	var statusErr *StatusError
+	if errors.As(err, &statusErr) {
+		switch statusErr.StatusCode {
+		case http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusNotFound, http.StatusNotImplemented:
+			return true
+		}
+	}
+	return strings.Contains(err.Error(), "decode stat metadata:")
 }
 
 // Delete removes a file or directory.

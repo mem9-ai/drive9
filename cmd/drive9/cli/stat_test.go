@@ -86,6 +86,36 @@ func TestStatJSONOutput(t *testing.T) {
 	}
 }
 
+func TestStatFallsBackToLegacyHead(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/legacy.txt" && r.URL.Query().Has("stat"):
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write([]byte("legacy stat body"))
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/legacy.txt":
+			w.Header().Set("Content-Length", "9")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "11")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	out, err := captureStdoutE(t, func() error { return Stat(c, []string{"/legacy.txt"}) })
+	if err != nil {
+		t.Fatalf("Stat(fallback): %v", err)
+	}
+	if !strings.Contains(out, "size: 9\n") {
+		t.Fatalf("fallback output missing size: %q", out)
+	}
+	if !strings.Contains(out, "revision: 11\n") {
+		t.Fatalf("fallback output missing revision: %q", out)
+	}
+}
+
 func TestStatRejectsUnknownFlag(t *testing.T) {
 	c := client.New("http://example.invalid", "")
 	err := Stat(c, []string{"--verbose", "/x.txt"})

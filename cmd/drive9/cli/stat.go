@@ -38,7 +38,7 @@ func Stat(c *client.Client, args []string) error {
 	if rp, isRemote := ParseRemote(path); isRemote {
 		path = rp.Path
 	}
-	m, err := c.StatMetadata(path)
+	m, err := c.StatMetadataCompat(path)
 	if err != nil {
 		return err
 	}
