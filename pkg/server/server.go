@@ -646,6 +646,12 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	if cl > 0 && b.IsLargeFile(cl) {
+		if len(writeTags) > 0 {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_large_put_tag_unsupported", "path", path)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			errJSON(w, http.StatusBadRequest, "X-Dat9-Tag is not supported on large-file PUT initiate; send tags in upload complete request")
+			return
+		}
 		partChecksums, err := parsePartChecksumsHeader(r.Header.Get("X-Dat9-Part-Checksums"))
 		if err != nil {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_bad_checksums_header", "path", path, "error", err)...)
@@ -1462,6 +1468,15 @@ func validateTagsMap(tags map[string]string) error {
 		if strings.TrimSpace(key) == "" {
 			return fmt.Errorf("invalid tags: empty key")
 		}
+		if strings.Contains(key, "=") {
+			return fmt.Errorf("invalid tag key %q: contains '='", key)
+		}
+		if hasTagControlChars(key) {
+			return fmt.Errorf("invalid tag key %q: contains control characters", key)
+		}
+		if hasTagControlChars(value) {
+			return fmt.Errorf("invalid tag value for key %q: contains control characters", key)
+		}
 		if utf8.RuneCountInString(key) > maxTagLen {
 			return fmt.Errorf("invalid tags: key exceeds %d characters", maxTagLen)
 		}
@@ -1470,6 +1485,15 @@ func validateTagsMap(tags map[string]string) error {
 		}
 	}
 	return nil
+}
+
+func hasTagControlChars(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || !utf8.ValidRune(r) {
+			return true
+		}
+	}
+	return false
 }
 
 func parsePartChecksumsHeader(raw string) ([]string, error) {

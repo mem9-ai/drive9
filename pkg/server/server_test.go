@@ -282,12 +282,69 @@ func TestWriteRejectsOverlongTagHeaders(t *testing.T) {
 	}
 }
 
-func TestValidateTagsMapRejectsOverlongKeyOrValue(t *testing.T) {
-	if err := validateTagsMap(map[string]string{strings.Repeat("k", 256): "v"}); err == nil || !strings.Contains(err.Error(), "key exceeds 255 characters") {
-		t.Fatalf("key length validation err = %v, want key length rejection", err)
+func TestWriteRejectsTagsOnLegacyLargeFileInitiate(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/large-tags.bin", strings.NewReader(""))
+	req.Header.Set("X-Dat9-Content-Length", "50000")
+	req.Header.Set("X-Dat9-Part-Checksums", "AAAAAA==")
+	req.Header.Add("X-Dat9-Tag", "owner=alice")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := validateTagsMap(map[string]string{"owner": strings.Repeat("v", 256)}); err == nil || !strings.Contains(err.Error(), "value exceeds 255 characters") {
-		t.Fatalf("value length validation err = %v, want value length rejection", err)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "X-Dat9-Tag is not supported on large-file PUT initiate") {
+		t.Fatalf("response = %q, want unsupported large PUT tag error", body)
+	}
+}
+
+func TestValidateTagsMapRejectsInvalidKeysOrValues(t *testing.T) {
+	tests := []struct {
+		name string
+		tags map[string]string
+		want string
+	}{
+		{
+			name: "key too long",
+			tags: map[string]string{strings.Repeat("k", 256): "v"},
+			want: "key exceeds 255 characters",
+		},
+		{
+			name: "value too long",
+			tags: map[string]string{"owner": strings.Repeat("v", 256)},
+			want: "value exceeds 255 characters",
+		},
+		{
+			name: "key contains equals",
+			tags: map[string]string{"owner=id": "alice"},
+			want: "contains '='",
+		},
+		{
+			name: "key contains control chars",
+			tags: map[string]string{"owner\n": "alice"},
+			want: "contains control characters",
+		},
+		{
+			name: "value contains control chars",
+			tags: map[string]string{"owner": "alice\t"},
+			want: "contains control characters",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateTagsMap(tc.tags); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validateTagsMap(%v) err = %v, want %q", tc.tags, err, tc.want)
+			}
+		})
 	}
 }
 
