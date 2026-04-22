@@ -241,7 +241,7 @@ func fsUsage() {
 
 commands:
   cp <src> <dst>       copy files (local↔remote)
-    --tag <key=value>    set file tag (repeatable, upload only)
+    --tag <key=value>    set file tag (repeatable, upload only; not with --append)
   cat <path>           read file to stdout
   ls [path]            list directory
   stat [--json] <path> file metadata

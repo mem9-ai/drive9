@@ -388,6 +388,27 @@ func TestCpAppendRejectsStdinSource(t *testing.T) {
 	}
 }
 
+func TestCpAppendRejectsTags(t *testing.T) {
+	localPath := filepath.Join(t.TempDir(), "append.txt")
+	if err := os.WriteFile(localPath, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("WriteFile(local): %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("server should not be called, got %s %s", r.Method, r.URL.String())
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	err := Cp(c, []string{"--append", "--tag", "owner=alice", localPath, ":/dst.txt"})
+	if err == nil {
+		t.Fatal("expected error for append with tags")
+	}
+	if !strings.Contains(err.Error(), "--append and --tag cannot be used together") {
+		t.Fatalf("error = %q, want append/tag rejection", err)
+	}
+}
+
 func TestCpUploadWithTagsSendsHeaders(t *testing.T) {
 	localPath := filepath.Join(t.TempDir(), "upload.txt")
 	if err := os.WriteFile(localPath, []byte("hello tags"), 0o644); err != nil {

@@ -24,12 +24,6 @@ type AppendPlan struct {
 // existing files fall back to read-modify-write, and large S3-backed files use
 // the incremental append upload flow.
 func (c *Client) AppendStream(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc) error {
-	return c.AppendStreamWithTags(ctx, path, r, size, progress, nil)
-}
-
-// AppendStreamWithTags appends bytes from r to path and applies tags on the
-// resulting file revision.
-func (c *Client) AppendStreamWithTags(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, tags map[string]string) error {
 	if size < 0 {
 		return fmt.Errorf("append size must be non-negative")
 	}
@@ -37,7 +31,7 @@ func (c *Client) AppendStreamWithTags(ctx context.Context, path string, r io.Rea
 	stat, err := c.StatCtx(ctx, path)
 	if err != nil {
 		if isClientNotFound(err) {
-			return c.writeStreamConditional(ctx, path, r, size, progress, 0, tags)
+			return c.WriteStreamConditional(ctx, path, r, size, progress, 0)
 		}
 		return err
 	}
@@ -98,12 +92,7 @@ func (c *Client) AppendStreamWithTags(ctx context.Context, path string, r io.Rea
 		return fmt.Errorf("append source size mismatch: %d bytes remaining", remaining)
 	}
 
-	return c.completeUploadWithTags(ctx, plan.UploadID, tags)
-}
-
-func (c *Client) writeStreamConditional(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, tags map[string]string) error {
-	_, err := c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, expectedRevision, tags)
-	return err
+	return c.completeUpload(ctx, plan.UploadID)
 }
 
 func (c *Client) initiateAppend(ctx context.Context, path string, appendSize int64, partSize int64, expectedRevision int64) (*AppendPlan, error) {

@@ -462,67 +462,6 @@ func TestAppendStreamUsesAppendPlanForLargeFile(t *testing.T) {
 	}
 }
 
-func TestAppendStreamWithTagsSendsTagsOnComplete(t *testing.T) {
-	var completeReq struct {
-		Tags map[string]string `json:"tags"`
-	}
-	var srv *httptest.Server
-
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/large-tagged.bin":
-			w.Header().Set("Content-Length", "10")
-			w.Header().Set("X-Dat9-IsDir", "false")
-			w.Header().Set("X-Dat9-Revision", "9")
-			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/large-tagged.bin" && r.URL.Query().Has("append"):
-			w.WriteHeader(http.StatusAccepted)
-			_ = json.NewEncoder(w).Encode(AppendPlan{
-				BaseSize: 10,
-				PatchPlan: PatchPlan{
-					UploadID: "append-tags",
-					PartSize: 8,
-					UploadParts: []*PatchPartURL{{
-						Number:      2,
-						URL:         srv.URL + "/append-tags/upload/2",
-						Size:        8,
-						Headers:     map[string]string{"X-Upload-Token": "append"},
-						ExpiresAt:   "2099-01-01T00:00:00Z",
-						ReadURL:     srv.URL + "/append-tags/read/2",
-						ReadHeaders: map[string]string{"Range": "bytes=8-9"},
-					}},
-					CopiedParts: []int{1},
-				},
-			})
-		case r.Method == http.MethodGet && r.URL.Path == "/append-tags/read/2":
-			_, _ = io.WriteString(w, "ij")
-		case r.Method == http.MethodPut && r.URL.Path == "/append-tags/upload/2":
-			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/append-tags/complete":
-			if err := json.NewDecoder(r.Body).Decode(&completeReq); err != nil {
-				http.Error(w, "bad complete json", http.StatusBadRequest)
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	c := New(srv.URL, "")
-	err := c.AppendStreamWithTags(context.Background(), "/large-tagged.bin", strings.NewReader("KLMNOP"), 6, nil, map[string]string{
-		"owner": "alice",
-		"topic": "cat",
-	})
-	if err != nil {
-		t.Fatalf("AppendStreamWithTags: %v", err)
-	}
-	if completeReq.Tags["owner"] != "alice" || completeReq.Tags["topic"] != "cat" || len(completeReq.Tags) != 2 {
-		t.Fatalf("complete tags = %+v, want owner/topic", completeReq.Tags)
-	}
-}
-
 func TestAppendStreamRejectsOverlappingAppendPartWithoutReadURL(t *testing.T) {
 	var uploadCalled bool
 	var completeCalled bool
