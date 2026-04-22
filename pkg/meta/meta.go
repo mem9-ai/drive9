@@ -111,19 +111,20 @@ func applyMySQLPoolDefaults(db *sql.DB) {
 }
 
 func (s *Store) migrate() error {
+	ctx := context.Background()
 	stmts := metaInitSchemaStatements()
 	spec, err := metaSchemaSpecFromStatements(stmts)
 	if err != nil {
 		return fmt.Errorf("parse meta schema statements: %w", err)
 	}
-	diffs, err := diffMetaSchema(s.db, spec)
+	diffs, err := diffMetaSchema(ctx, s.db, spec)
 	if err != nil {
 		return fmt.Errorf("diff meta schema: %w", err)
 	}
-	if err := applyMetaSchemaRepairs(s.db, plannedMetaSchemaRepairs(diffs)); err != nil {
+	if err := applyMetaSchemaRepairs(ctx, s.db, plannedMetaSchemaRepairs(diffs)); err != nil {
 		return err
 	}
-	diffs, err = diffMetaSchema(s.db, spec)
+	diffs, err = diffMetaSchema(ctx, s.db, spec)
 	if err != nil {
 		return fmt.Errorf("re-diff meta schema: %w", err)
 	}
@@ -192,10 +193,8 @@ type metaColumnSpec struct {
 }
 
 type metaIndexSpec struct {
-	createSQL   string
-	isUnique    bool
-	isPrimary   bool
-	isRepairable bool
+	createSQL string
+	isPrimary bool
 }
 
 func metaInitSchemaStatements() []string {
@@ -350,7 +349,7 @@ func parseCreateMetaTableSpec(stmt string) (metaTableSpec, bool, error) {
 			continue
 		}
 		if idxName, idxSQL, ok := parseMetaInlineIndexDefinition(tableName, def); ok {
-			indexes[idxName] = metaIndexSpec{createSQL: idxSQL, isRepairable: true, isUnique: strings.Contains(normalizeMetaSQLFragment(idxSQL), "create unique index ")}
+			indexes[idxName] = metaIndexSpec{createSQL: idxSQL}
 			continue
 		}
 		if isMetaConstraintDefinition(def) {
@@ -361,7 +360,7 @@ func parseCreateMetaTableSpec(stmt string) (metaTableSpec, bool, error) {
 			columns[colName] = colSpec
 			normalizedDef := normalizeMetaSQLFragment(def)
 			if strings.Contains(normalizedDef, " primary key") {
-				indexes["primary"] = metaIndexSpec{isPrimary: true, isRepairable: false}
+				indexes["primary"] = metaIndexSpec{isPrimary: true}
 			}
 		}
 	}
@@ -373,10 +372,10 @@ func parseCreateMetaTableSpec(stmt string) (metaTableSpec, bool, error) {
 	}, true, nil
 }
 
-func diffMetaSchema(db *sql.DB, spec metaSchemaSpec) ([]metaSchemaDiff, error) {
+func diffMetaSchema(ctx context.Context, db *sql.DB, spec metaSchemaSpec) ([]metaSchemaDiff, error) {
 	var diffs []metaSchemaDiff
 	for _, table := range spec.tables {
-		tableDiffs, err := diffMetaTable(db, table)
+		tableDiffs, err := diffMetaTable(ctx, db, table)
 		if err != nil {
 			return nil, err
 		}
@@ -385,8 +384,8 @@ func diffMetaSchema(db *sql.DB, spec metaSchemaSpec) ([]metaSchemaDiff, error) {
 	return diffs, nil
 }
 
-func diffMetaTable(db *sql.DB, table metaTableSpec) ([]metaSchemaDiff, error) {
-	meta, err := loadMetaTableMeta(db, table.name)
+func diffMetaTable(ctx context.Context, db *sql.DB, table metaTableSpec) ([]metaSchemaDiff, error) {
+	meta, err := loadMetaTableMeta(ctx, db, table.name)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return []metaSchemaDiff{{
@@ -398,7 +397,7 @@ func diffMetaTable(db *sql.DB, table metaTableSpec) ([]metaSchemaDiff, error) {
 		}
 		return nil, fmt.Errorf("load %s table metadata: %w", table.name, err)
 	}
-	createStmt, err := loadMetaShowCreateTable(db, table.name)
+	createStmt, err := loadMetaShowCreateTable(ctx, db, table.name)
 	if err != nil {
 		return nil, fmt.Errorf("show create %s: %w", table.name, err)
 	}
@@ -475,9 +474,9 @@ func plannedMetaSchemaRepairs(diffs []metaSchemaDiff) []string {
 	return plans
 }
 
-func applyMetaSchemaRepairs(db *sql.DB, stmts []string) error {
+func applyMetaSchemaRepairs(ctx context.Context, db *sql.DB, stmts []string) error {
 	for _, stmt := range stmts {
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			if isIgnorableMetaSchemaError(err) {
 				continue
 			}
@@ -617,7 +616,7 @@ func parseMetaInlineIndexDefinition(tableName, def string) (indexName, createSQL
 func parseMetaConstraintIndexDefinition(tableName, def string) (indexName string, spec metaIndexSpec, ok bool) {
 	n := normalizeMetaSQLFragment(def)
 	if strings.HasPrefix(n, "primary key") {
-		return "primary", metaIndexSpec{isPrimary: true, isRepairable: false}, true
+		return "primary", metaIndexSpec{isPrimary: true}, true
 	}
 	if strings.HasPrefix(n, "unique key ") {
 		name, cols := parseMetaIndexNameAndColumns(def, "UNIQUE KEY")
@@ -625,9 +624,7 @@ func parseMetaConstraintIndexDefinition(tableName, def string) (indexName string
 			return "", metaIndexSpec{}, false
 		}
 		return name, metaIndexSpec{
-			createSQL:    fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s%s", name, tableName, cols),
-			isUnique:     true,
-			isRepairable: false,
+			createSQL: fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s%s", name, tableName, cols),
 		}, true
 	}
 	if strings.HasPrefix(n, "constraint ") && strings.Contains(n, " unique key ") {
@@ -637,9 +634,7 @@ func parseMetaConstraintIndexDefinition(tableName, def string) (indexName string
 			return "", metaIndexSpec{}, false
 		}
 		return name, metaIndexSpec{
-			createSQL:    fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s%s", name, tableName, cols),
-			isUnique:     true,
-			isRepairable: false,
+			createSQL: fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s%s", name, tableName, cols),
 		}, true
 	}
 	return "", metaIndexSpec{}, false
@@ -780,7 +775,12 @@ func isSafeAddColumnRepairSQL(sqlText string) bool {
 	if !strings.HasPrefix(n, "alter table ") || !strings.Contains(n, " add column ") {
 		return false
 	}
+	// Reject generated columns in any form: GENERATED ALWAYS AS / AS (...) STORED / AS (...) VIRTUAL
 	if strings.Contains(n, " generated ") {
+		return false
+	}
+	if strings.Contains(n, " as (") &&
+		(strings.Contains(n, " stored") || strings.Contains(n, " virtual")) {
 		return false
 	}
 	if strings.Contains(n, " not null") && !strings.Contains(n, " default ") {
@@ -806,8 +806,8 @@ func isIgnorableMetaSchemaError(err error) bool {
 	return strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate")
 }
 
-func loadMetaTableMeta(db *sql.DB, tableName string) (metaTableMeta, error) {
-	rows, err := db.Query(`SELECT column_name, column_type
+func loadMetaTableMeta(ctx context.Context, db *sql.DB, tableName string) (metaTableMeta, error) {
+	rows, err := db.QueryContext(ctx, `SELECT column_name, column_type
 		FROM information_schema.columns
 		WHERE table_schema = DATABASE() AND table_name = ?`, tableName)
 	if err != nil {
@@ -832,11 +832,11 @@ func loadMetaTableMeta(db *sql.DB, tableName string) (metaTableMeta, error) {
 	return metaTableMeta{tableName: tableName, columns: columns}, nil
 }
 
-func loadMetaShowCreateTable(db *sql.DB, tableName string) (string, error) {
+func loadMetaShowCreateTable(ctx context.Context, db *sql.DB, tableName string) (string, error) {
 	var gotTable string
 	var createStmt string
 	query := fmt.Sprintf("SHOW CREATE TABLE %s", tableName)
-	if err := db.QueryRow(query).Scan(&gotTable, &createStmt); err != nil {
+	if err := db.QueryRowContext(ctx, query).Scan(&gotTable, &createStmt); err != nil {
 		return "", err
 	}
 	return createStmt, nil

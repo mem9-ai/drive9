@@ -47,8 +47,26 @@ const (
 // change and trigger a one-time re-Ensure for all tenants.
 var CurrentTiDBTenantSchemaVersion = func() int {
 	stmts := tidbAutoEmbeddingSchemaStatements()
-	h := crc32.ChecksumIEEE([]byte(strings.Join(stmts, "\n")))
-	return int(int32(h))
+	// Hash only statements that are parsed into the schema spec (CREATE TABLE,
+	// CREATE [UNIQUE] INDEX, ALTER TABLE ... ADD ... INDEX).  Statements that
+	// fall into none of these categories (e.g. SET, comments) do not affect
+	// what ValidateTiDBSchemaForMode checks, so including them would cause
+	// unnecessary re-Ensures on unrelated edits.
+	//
+	// int(h) is safe: uint32 → int on a 64-bit platform is always non-negative,
+	// unlike int(int32(h)) which sign-extends for values with bit 31 set.
+	var specStmts []string
+	for _, stmt := range stmts {
+		n := normalizeSQLFragment(stmt)
+		if strings.HasPrefix(n, "create table ") ||
+			strings.HasPrefix(n, "create index ") ||
+			strings.HasPrefix(n, "create unique index ") ||
+			(strings.HasPrefix(n, "alter table ") && strings.Contains(n, " add ") && strings.Contains(n, " index ")) {
+			specStmts = append(specStmts, stmt)
+		}
+	}
+	h := crc32.ChecksumIEEE([]byte(strings.Join(specStmts, "\n")))
+	return int(h)
 }()
 
 var tidbAutoEmbeddingOptionsJSON = fmt.Sprintf(`{"dimensions":%d}`, TiDBAutoEmbeddingDimensions)

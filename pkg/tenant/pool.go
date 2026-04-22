@@ -331,6 +331,13 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			}
 			ensureSchemaDurationMs = float64(time.Since(ensureSchemaStart).Microseconds()) / 1000.0
 			if p.metaStore != nil {
+				// Record the version only after EnsureTiDBSchemaForMode has
+				// succeeded. EnsureTiDBSchemaForMode ends with a call to
+				// ValidateTiDBSchemaForMode, so by the time we reach this
+				// point the schema has been confirmed to match the spec.
+				// Any tenant whose schema diverges between two consecutive
+				// opens will be caught on the next open because its stored
+				// version will differ from CurrentTiDBTenantSchemaVersion.
 				if verErr := p.metaStore.UpdateTenantSchemaVersion(ctx, t.ID, schema.CurrentTiDBTenantSchemaVersion); verErr != nil {
 					logger.Warn(ctx, "tenant_pool_update_schema_version_failed",
 						zap.String("tenant_id", t.ID),
