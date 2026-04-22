@@ -424,6 +424,9 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		if r.URL.Query().Has("stat") {
+			// HEAD and GET ?stat=1 serve different stat contracts:
+			// - GET ?stat=1 (s.handleStatMetadata): enriched JSON metadata
+			//   (content_type/semantic_text/tags in addition to core attrs).
 			s.handleStatMetadata(w, r, path)
 		} else if r.URL.Query().Has("grep") {
 			s.handleGrep(w, r, path)
@@ -436,9 +439,7 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 		}
 	case http.MethodPut:
 		s.handleWrite(w, r, path)
-	// Compatibility: keep HEAD stat for clients that predate commit
-	// b7efda9527f758b772f235abb9a2ccc65ed17447.
-	// Newer clients use GET "?stat=1" via s.handleStatMetadata(...).
+	// - HEAD (s.handleStat): lightweight attrs in headers (size/isdir/revision/mtime)
 	case http.MethodHead:
 		s.handleStat(w, r, path)
 	case http.MethodDelete:
@@ -563,11 +564,17 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	tags := make(map[string]string)
 	var size int64
 	var revision int64
+	var mtime int64
 	var contentType string
 	var semanticText string
 	if nf.File != nil {
 		size = nf.File.SizeBytes
 		revision = nf.File.Revision
+		if nf.File.ConfirmedAt != nil {
+			mtime = nf.File.ConfirmedAt.Unix()
+		} else {
+			mtime = nf.File.CreatedAt.Unix()
+		}
 		contentType = nf.File.ContentType
 		semanticText = nf.File.ContentText
 
@@ -577,6 +584,8 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 			errJSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+	} else {
+		mtime = nf.Node.CreatedAt.Unix()
 	}
 
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_ok", "path", path, "is_dir", nf.Node.IsDirectory)...)
@@ -585,6 +594,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 		"size":          size,
 		"isdir":         nf.Node.IsDirectory,
 		"revision":      revision,
+		"mtime":         mtime,
 		"content_type":  contentType,
 		"semantic_text": semanticText,
 		"tags":          tags,

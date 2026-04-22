@@ -122,6 +122,9 @@ func TestStatMetadataIncludesTagsAndSupportsTagReplace(t *testing.T) {
 	if meta.Size != 5 || meta.IsDir || meta.Revision != 1 {
 		t.Fatalf("unexpected stat metadata: %+v", meta)
 	}
+	if meta.Mtime <= 0 {
+		t.Fatalf("mtime = %d, want > 0", meta.Mtime)
+	}
 	if meta.ContentType == "" {
 		t.Fatal("content_type should not be empty")
 	}
@@ -161,6 +164,7 @@ func TestStatMetadataCompatFallsBackOnDecodeError(t *testing.T) {
 			w.Header().Set("Content-Length", "14")
 			w.Header().Set("X-Dat9-IsDir", "false")
 			w.Header().Set("X-Dat9-Revision", "7")
+			w.Header().Set("X-Dat9-Mtime", "1700000000")
 			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
@@ -175,6 +179,9 @@ func TestStatMetadataCompatFallsBackOnDecodeError(t *testing.T) {
 	}
 	if got.Size != 14 || got.IsDir || got.Revision != 7 {
 		t.Fatalf("unexpected fallback metadata: %+v", got)
+	}
+	if got.Mtime != 1700000000 {
+		t.Fatalf("fallback metadata mtime = %d, want 1700000000", got.Mtime)
 	}
 	if got.ContentType != "" || got.SemanticText != "" {
 		t.Fatalf("fallback metadata should keep enriched fields empty: %+v", got)

@@ -197,6 +197,7 @@ func TestStatMetadataIncludesTagsAndSemanticText(t *testing.T) {
 		Size         int64             `json:"size"`
 		IsDir        bool              `json:"isdir"`
 		Revision     int64             `json:"revision"`
+		Mtime        int64             `json:"mtime"`
 		ContentType  string            `json:"content_type"`
 		SemanticText string            `json:"semantic_text"`
 		Tags         map[string]string `json:"tags"`
@@ -209,6 +210,9 @@ func TestStatMetadataIncludesTagsAndSemanticText(t *testing.T) {
 	}
 	if out.ContentType == "" || out.SemanticText == "" {
 		t.Fatalf("expected content_type and semantic_text, got %+v", out)
+	}
+	if out.Mtime <= 0 {
+		t.Fatalf("expected mtime > 0, got %+v", out)
 	}
 	if out.Tags["owner"] != "alice" || out.Tags["topic"] != "note" || len(out.Tags) != 2 {
 		t.Fatalf("unexpected tags: %+v", out.Tags)

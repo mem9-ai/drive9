@@ -171,6 +171,7 @@ type StatMetadataResult struct {
 	Size         int64             `json:"size"`
 	IsDir        bool              `json:"isdir"`
 	Revision     int64             `json:"revision"`
+	Mtime        int64             `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
 	ContentType  string            `json:"content_type"`
 	SemanticText string            `json:"semantic_text"`
 	Tags         map[string]string `json:"tags"`
@@ -321,18 +322,17 @@ func (c *Client) ListCtx(ctx context.Context, path string) ([]FileInfo, error) {
 
 // Stat returns metadata for a path.
 //
-// Deprecated: use StatMetadataCompat. Stat relies on legacy HEAD metadata and
-// does not provide enriched fields such as content_type, semantic_text, and
-// tags.
+// Stat is the lightweight metadata interface based on HEAD. It is intended for
+// callers that only need compact attributes (size/isdir/revision/mtime) and do
+// not need enriched fields such as content_type, semantic_text, and tags.
 func (c *Client) Stat(path string) (*StatResult, error) {
 	return c.StatCtx(context.Background(), path)
 }
 
 // StatCtx returns metadata for a path with context support.
 //
-// Deprecated: use StatMetadataCompatCtx. StatCtx relies on legacy HEAD
-// metadata and does not provide enriched fields such as content_type,
-// semantic_text, and tags.
+// StatCtx is the context-aware form of the lightweight HEAD-based Stat
+// interface. Use StatMetadataCompatCtx when enriched metadata is required.
 func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.url(path), nil)
 	if err != nil {
@@ -366,8 +366,8 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 	return s, nil
 }
 
-// StatMetadata returns enriched metadata for a path, including content_type,
-// semantic_text, and tags.
+// StatMetadata returns enriched metadata for a path, including mtime,
+// content_type, semantic_text, and tags.
 func (c *Client) StatMetadata(path string) (*StatMetadataResult, error) {
 	return c.StatMetadataCtx(context.Background(), path)
 }
@@ -417,10 +417,15 @@ func (c *Client) StatMetadataCompatCtx(ctx context.Context, path string) (*StatM
 	if statErr != nil {
 		return nil, statErr
 	}
+	var mtime int64
+	if !statOut.Mtime.IsZero() {
+		mtime = statOut.Mtime.Unix()
+	}
 	return &StatMetadataResult{
 		Size:         statOut.Size,
 		IsDir:        statOut.IsDir,
 		Revision:     statOut.Revision,
+		Mtime:        mtime,
 		ContentType:  "",
 		SemanticText: "",
 		Tags:         map[string]string{},
