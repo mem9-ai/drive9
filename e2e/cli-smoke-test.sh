@@ -294,23 +294,23 @@ echo "[4.1] cli tag/stat metadata checks"
 printf "cli-tag-%s" "$TS" > "$TAG_LOCAL"
 drive9_retry fs cp --tag owner=smoke --tag topic=e2e "$TAG_LOCAL" ":$TAG_REMOTE" >/dev/null
 
-tag_stat_json="$(drive9_retry fs stat --json "$TAG_REMOTE")"
+tag_stat_json="$(drive9_retry fs stat -o json "$TAG_REMOTE")"
 tag_owner="$(jq -r '.tags.owner // ""' <<<"$tag_stat_json")"
-check_eq "stat --json returns owner tag" "$tag_owner" "smoke"
+check_eq "stat -o json returns owner tag" "$tag_owner" "smoke"
 
 tag_topic="$(jq -r '.tags.topic // ""' <<<"$tag_stat_json")"
-check_eq "stat --json returns topic tag" "$tag_topic" "e2e"
+check_eq "stat -o json returns topic tag" "$tag_topic" "e2e"
 
 tag_semantic="$(jq -r '.semantic_text // ""' <<<"$tag_stat_json")"
-check_eq "stat --json includes semantic_text for tagged file" "$tag_semantic" "cli-tag-${TS}"
+check_eq "stat -o json includes semantic_text for tagged file" "$tag_semantic" "cli-tag-${TS}"
 
-check_cmd "stat --json includes non-empty content_type for tagged file" \
+check_cmd "stat -o json includes non-empty content_type for tagged file" \
   bash -c 'jq -e '"'"'(.content_type // "") | length > 0'"'"' >/dev/null <<<"$1"' -- "$tag_stat_json"
 
 printf "cli-tag-updated-%s" "$TS" > "$TAG_LOCAL"
 drive9_retry fs cp --tag owner=updated "$TAG_LOCAL" ":$TAG_REMOTE" >/dev/null
 
-tag_stat_json2="$(drive9_retry fs stat --json "$TAG_REMOTE")"
+tag_stat_json2="$(drive9_retry fs stat -o json "$TAG_REMOTE")"
 tag_owner2="$(jq -r '.tags.owner // ""' <<<"$tag_stat_json2")"
 check_eq "overwrite with single --tag updates owner" "$tag_owner2" "updated"
 

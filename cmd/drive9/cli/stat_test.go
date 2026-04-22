@@ -73,9 +73,41 @@ func TestStatJSONOutput(t *testing.T) {
 	defer srv.Close()
 
 	c := client.New(srv.URL, "")
-	out, err := captureStdoutE(t, func() error { return Stat(c, []string{"--json", "/doc.txt"}) })
+	out, err := captureStdoutE(t, func() error { return Stat(c, []string{"-o", "json", "/doc.txt"}) })
 	if err != nil {
-		t.Fatalf("Stat(--json): %v", err)
+		t.Fatalf("Stat(-o json): %v", err)
+	}
+	var got client.StatMetadataResult
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("json.Unmarshal output: %v\noutput=%q", err, out)
+	}
+	if got.Size != 5 || got.Revision != 1 || got.Tags["k"] != "v" {
+		t.Fatalf("unexpected json output: %+v", got)
+	}
+}
+
+func TestStatJSONOutputLongFlag(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs/doc.txt" || !r.URL.Query().Has("stat") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"size":          5,
+			"isdir":         false,
+			"revision":      1,
+			"content_type":  "text/plain",
+			"semantic_text": "hello",
+			"tags":          map[string]string{"k": "v"},
+		})
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	out, err := captureStdoutE(t, func() error { return Stat(c, []string{"--output", "json", "/doc.txt"}) })
+	if err != nil {
+		t.Fatalf("Stat(--output json): %v", err)
 	}
 	var got client.StatMetadataResult
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
@@ -122,7 +154,18 @@ func TestStatRejectsUnknownFlag(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected usage error")
 	}
-	if !strings.Contains(err.Error(), "usage: drive9 fs stat [--json] <path>") {
+	if !strings.Contains(err.Error(), "usage: drive9 fs stat [-o text|json] <path>") {
 		t.Fatalf("error = %q, want usage", err)
+	}
+}
+
+func TestStatRejectsUnsupportedOutputFormat(t *testing.T) {
+	c := client.New("http://example.invalid", "")
+	err := Stat(c, []string{"--output", "yaml", "/x.txt"})
+	if err == nil {
+		t.Fatal("expected output format error")
+	}
+	if !strings.Contains(err.Error(), `unsupported output format "yaml"`) {
+		t.Fatalf("error = %q, want output format rejection", err)
 	}
 }

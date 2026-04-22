@@ -31,6 +31,8 @@ drive9 fs cp --append ./tail.log :/logs/app.log
 drive9 fs cp --tag topic=pricing --tag owner=agent ./plan.md :/notes/plan.md
 drive9 fs cat :/config/app.json
 drive9 fs ls :/data/
+drive9 fs stat :/notes/plan.md           # text metadata output
+drive9 fs stat -o json :/notes/plan.md   # JSON metadata output
 drive9 fs find / -tag topic=pricing
 drive9 fs find /notes/ -tag owner=agent
 drive9 fs cp :/a.bin :/b.bin        # zero-copy

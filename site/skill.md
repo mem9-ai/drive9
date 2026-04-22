@@ -72,7 +72,12 @@ drive9 fs cp :/src.txt :/dst.txt
 drive9 fs cat :/path/to/file               # print content to stdout
 drive9 fs ls :/                            # list root
 drive9 fs ls :/path/                       # list subdirectory
-drive9 fs stat :/path/to/file              # metadata (size, type, mtime)
+drive9 fs stat :/path/to/file              # text metadata (size, type, mtime)
+drive9 fs stat -o json :/path/to/file      # JSON metadata
+
+# inspect semantic metadata and tags
+drive9 fs stat :/notes/plan.md             # includes semantic_text and tags
+drive9 fs stat -o json :/notes/plan.md     # JSON includes semantic_text and tags object
 
 # move / remove
 drive9 fs mv :/old.txt :/new.txt
@@ -133,7 +138,7 @@ Use `grep` to find files by what they contain. Use `find` to find files by name,
 | `fs ls` | one entry per line, directories end with `/` |
 | `fs ls -l` | tab-separated: `type  size  name` (type: `d` or `-`) |
 | `fs cat` | raw file content to stdout |
-| `fs stat` | key-value lines: `size`, `isdir`, `revision` |
+| `fs stat` | key-value text lines by default; use `-o json` / `--output json` for JSON |
 | `fs grep` | tab-separated: `path  score` per match |
 | `fs find` | one path per line |
 

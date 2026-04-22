@@ -13,26 +13,35 @@ import (
 // Stat shows metadata for a remote path.
 //
 //	drive9 fs stat /path/to/file
+//	drive9 fs stat -o json /path/to/file
 //	drive9 fs stat :/path/to/file
 func Stat(c *client.Client, args []string) error {
-	jsonOutput := false
+	outputFormat := "text"
 	path := ""
-	for _, arg := range args {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
 		switch arg {
-		case "--json":
-			jsonOutput = true
+		case "-o", "--output":
+			if i+1 >= len(args) {
+				return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
+			}
+			i++
+			outputFormat = args[i]
+			if outputFormat != "text" && outputFormat != "json" {
+				return fmt.Errorf("unsupported output format %q (want text or json)", outputFormat)
+			}
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return fmt.Errorf("usage: drive9 fs stat [--json] <path>")
+				return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
 			}
 			if path != "" {
-				return fmt.Errorf("usage: drive9 fs stat [--json] <path>")
+				return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
 			}
 			path = arg
 		}
 	}
 	if path == "" {
-		return fmt.Errorf("usage: drive9 fs stat [--json] <path>")
+		return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
 	}
 	// Handle ":" prefixed remote paths like cp command
 	if rp, isRemote := ParseRemote(path); isRemote {
@@ -42,7 +51,7 @@ func Stat(c *client.Client, args []string) error {
 	if err != nil {
 		return err
 	}
-	if jsonOutput {
+	if outputFormat == "json" {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(m)
