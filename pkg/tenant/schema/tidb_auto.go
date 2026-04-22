@@ -354,22 +354,6 @@ func OpenTiDBSchemaDB(ctx context.Context, dsn string) (*sql.DB, error) {
 	return db, nil
 }
 
-func validateTiDBTableForMode(mode TiDBEmbeddingMode, meta tidbTableMeta) error {
-	switch meta.tableName {
-	case "files":
-		switch mode {
-		case TiDBEmbeddingModeAuto:
-			return validateTiDBAutoEmbeddingFilesTable(meta)
-		case TiDBEmbeddingModeApp:
-			return validateTiDBAppEmbeddingFilesTable(meta)
-		default:
-			return fmt.Errorf("unsupported TiDB embedding mode %q", mode)
-		}
-	default:
-		return fmt.Errorf("unsupported table %q", meta.tableName)
-	}
-}
-
 func detectTiDBEmbeddingModeFromFilesMeta(meta tidbTableMeta) (TiDBEmbeddingMode, error) {
 	col, err := meta.requireColumn("embedding")
 	if err != nil {
@@ -438,14 +422,6 @@ func validateTiDBUploadsTableBase(meta tidbTableMeta) error {
 	return meta.requireColumnType("expected_revision", "bigint")
 }
 
-func repairLegacyTiDBUploadsSchema(db *sql.DB) error {
-	uploadsMeta, err := loadTiDBTableMeta(db, "uploads")
-	if err != nil {
-		return fmt.Errorf("load uploads table metadata: %w", err)
-	}
-	return ExecSchemaStatements(db, legacyTiDBUploadsRepairStatements(uploadsMeta))
-}
-
 func legacyTiDBUploadsRepairStatements(meta tidbTableMeta) []string {
 	if _, ok := meta.columns["expected_revision"]; ok {
 		return nil
@@ -459,13 +435,6 @@ func loadTiDBTableMeta(db *sql.DB, tableName string) (tidbTableMeta, error) {
 		return tidbTableMeta{}, fmt.Errorf("load columns: %w", err)
 	}
 	return tidbTableMeta{tableName: tableName, columns: columns}, nil
-}
-
-func ensureTiDBTableExists(db *sql.DB, tableName string) error {
-	if _, err := loadShowCreateTable(db, tableName); err != nil {
-		return fmt.Errorf("show create table: %w", err)
-	}
-	return nil
 }
 
 func loadTiDBColumnMeta(db *sql.DB, tableName string) (map[string]tidbColumnMeta, error) {
@@ -512,7 +481,7 @@ func (m tidbTableMeta) requireColumnType(name, want string) error {
 	if err != nil {
 		return err
 	}
-	if normalizeSQLFragment(col.columnType) != normalizeSQLFragment(want) {
+	if normalizeColumnTypeForCompare(col.columnType) != normalizeColumnTypeForCompare(want) {
 		return fmt.Errorf("%s column type = %q, want %s", name, col.columnType, want)
 	}
 	return nil
@@ -534,6 +503,16 @@ func normalizeSQLFragment(s string) string {
 	s = strings.ReplaceAll(s, "_utf8mb4", "")
 	fields := strings.Fields(s)
 	return strings.Join(fields, " ")
+}
+
+func normalizeColumnTypeForCompare(s string) string {
+	normalized := normalizeSQLFragment(s)
+	switch normalized {
+	case "bool", "boolean", "tinyint(1)":
+		return "boolean"
+	default:
+		return normalized
+	}
 }
 
 func diffTiDBSchemaForMode(db *sql.DB, mode TiDBEmbeddingMode) ([]tidbSchemaDiff, error) {
@@ -972,7 +951,7 @@ func diffTiDBTableMeta(table tidbTableSpec, meta tidbTableMeta, createStmt strin
 			})
 			continue
 		}
-		if normalizeSQLFragment(col.columnType) != normalizeSQLFragment(spec.columnType) {
+		if normalizeColumnTypeForCompare(col.columnType) != normalizeColumnTypeForCompare(spec.columnType) {
 			diffs = append(diffs, tidbSchemaDiff{
 				kind:       tidbSchemaDiffColumnType,
 				tableName:  table.name,
@@ -997,24 +976,6 @@ func diffTiDBTableMeta(table tidbTableSpec, meta tidbTableMeta, createStmt strin
 		diffs = append(diffs, table.validate(meta)...)
 	}
 	return diffs
-}
-
-func createTableStatementsByName(stmts []string) map[string]string {
-	out := make(map[string]string)
-	for _, stmt := range stmts {
-		normalized := normalizeSQLFragment(stmt)
-		const prefix = "create table if not exists "
-		if !strings.HasPrefix(normalized, prefix) {
-			continue
-		}
-		rest := strings.TrimPrefix(normalized, prefix)
-		fields := strings.Fields(rest)
-		if len(fields) == 0 {
-			continue
-		}
-		out[fields[0]] = stmt
-	}
-	return out
 }
 
 func missingTableDiff(table tidbTableSpec) tidbSchemaDiff {

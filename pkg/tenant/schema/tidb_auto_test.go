@@ -219,6 +219,38 @@ func TestDiffTiDBTableMetaReportsFileNodesAndFileTagsMissingIndexes(t *testing.T
 	}
 }
 
+func TestDiffTiDBTableMetaTreatsBooleanAndTinyIntAsEquivalent(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "file_nodes")
+	meta := tidbTableMeta{
+		tableName: "file_nodes",
+		columns: map[string]tidbColumnMeta{
+			"node_id":      {columnType: "varchar(64)"},
+			"path":         {columnType: "varchar(512)"},
+			"parent_path":  {columnType: "varchar(512)"},
+			"name":         {columnType: "varchar(255)"},
+			"is_directory": {columnType: "tinyint(1)"},
+			"file_id":      {columnType: "varchar(64)"},
+			"created_at":   {columnType: "datetime(3)"},
+		},
+	}
+
+	diffs := diffTiDBTableMeta(spec, meta, `CREATE TABLE file_nodes (
+		node_id VARCHAR(64) PRIMARY KEY,
+		path VARCHAR(512) NOT NULL,
+		parent_path VARCHAR(512) NOT NULL,
+		name VARCHAR(255) NOT NULL,
+		is_directory TINYINT(1) NOT NULL DEFAULT 0,
+		file_id VARCHAR(64),
+		created_at DATETIME(3) NOT NULL
+	)`)
+
+	for _, diff := range diffs {
+		if diff.kind == tidbSchemaDiffColumnType && diff.columnName == "is_directory" {
+			t.Fatalf("unexpected boolean/tinyint(1) column type mismatch: %#v", diff)
+		}
+	}
+}
+
 func TestDiffTiDBTableMetaReportsSemanticTasksMissingKeyColumn(t *testing.T) {
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "semantic_tasks")
 	meta := tidbTableMeta{
