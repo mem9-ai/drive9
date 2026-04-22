@@ -53,14 +53,6 @@ type VaultFS struct {
 	inodeToPath map[uint64]string
 	nextInode   uint64
 
-	// rootCache caches the secret-name list at the root.
-	rootCache       []string
-	rootCacheExpiry time.Time
-
-	// secretCache caches per-secret field maps so that Lookup → GetAttr →
-	// Open from the kernel for a single field share one server round-trip.
-	secretCache map[string]secretCacheEntry
-
 	// openFiles snapshots field bytes at Open() time so that revoke during
 	// an open FD never produces a post-revoke value (Row F).
 	openFiles map[uint64]*vaultOpenFile
@@ -70,17 +62,13 @@ type VaultFS struct {
 	gid uint32
 }
 
-type secretCacheEntry struct {
-	fields map[string]string
-	expiry time.Time
-}
-
 type vaultOpenFile struct {
 	data []byte
 }
 
-// NewVaultFS builds a read-only vault filesystem bound to c. dirTTL controls
-// how long secret-list / field-map results are cached before refresh.
+// NewVaultFS builds a read-only vault filesystem bound to c. dirTTL is used
+// as the kernel entry/attr TTL hint only — there is intentionally no
+// in-process auth-decision cache (see listSecrets for the Row E rationale).
 func NewVaultFS(c *client.Client, dirTTL time.Duration) *VaultFS {
 	if dirTTL <= 0 {
 		dirTTL = 5 * time.Second
@@ -92,7 +80,6 @@ func NewVaultFS(c *client.Client, dirTTL time.Duration) *VaultFS {
 		pathToInode:   make(map[string]uint64),
 		inodeToPath:   make(map[uint64]string),
 		nextInode:     2, // 1 is reserved for root
-		secretCache:   make(map[string]secretCacheEntry),
 		openFiles:     make(map[uint64]*vaultOpenFile),
 		uid:           uint32(os.Getuid()),
 		gid:           uint32(os.Getgid()),
@@ -123,51 +110,23 @@ func (fs *VaultFS) pathForInode(ino uint64) (string, bool) {
 	return p, ok
 }
 
-// listSecrets returns the cached or freshly-fetched list of readable secrets.
+// listSecrets fetches the list of readable secrets fresh on every call.
+//
+// ❌ No in-process caching. Row E (new-op-after-revoke → EACCES) REQUIRES
+// that the very next lookup/readdir after server-side revocation returns
+// EACCES; any in-process cache served during a TTL window would create a
+// fail-open hole. DirTTL is used only as a kernel entry/attr TTL hint (so
+// the kernel may skip repeated Lookup/GetAttr roundtrips), not as an
+// in-process auth decision cache. Inner helpers intentionally have no
+// memoisation.
 func (fs *VaultFS) listSecrets(ctx context.Context) ([]string, error) {
-	fs.mu.Lock()
-	if time.Now().Before(fs.rootCacheExpiry) && fs.rootCache != nil {
-		out := append([]string(nil), fs.rootCache...)
-		fs.mu.Unlock()
-		return out, nil
-	}
-	fs.mu.Unlock()
-
-	secrets, err := fs.client.ListReadableVaultSecrets(ctx)
-	if err != nil {
-		return nil, err
-	}
-	fs.mu.Lock()
-	fs.rootCache = append([]string(nil), secrets...)
-	fs.rootCacheExpiry = time.Now().Add(fs.dirTTL)
-	fs.mu.Unlock()
-	return secrets, nil
+	return fs.client.ListReadableVaultSecrets(ctx)
 }
 
-// readSecret returns the cached or freshly-fetched field map for secretName.
+// readSecret fetches a secret's field map fresh on every call. See the
+// docstring on listSecrets for why no in-process cache exists.
 func (fs *VaultFS) readSecret(ctx context.Context, secretName string) (map[string]string, error) {
-	fs.mu.Lock()
-	if entry, ok := fs.secretCache[secretName]; ok && time.Now().Before(entry.expiry) {
-		out := make(map[string]string, len(entry.fields))
-		for k, v := range entry.fields {
-			out[k] = v
-		}
-		fs.mu.Unlock()
-		return out, nil
-	}
-	fs.mu.Unlock()
-
-	fields, err := fs.client.ReadVaultSecret(ctx, secretName)
-	if err != nil {
-		return nil, err
-	}
-	fs.mu.Lock()
-	fs.secretCache[secretName] = secretCacheEntry{
-		fields: fields,
-		expiry: time.Now().Add(fs.dirTTL),
-	}
-	fs.mu.Unlock()
-	return fields, nil
+	return fs.client.ReadVaultSecret(ctx, secretName)
 }
 
 // splitPath turns "/secret/field" into ("secret", "field"). Empty components
@@ -451,11 +410,6 @@ func (fs *VaultFS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofus
 	fs.openSeq++
 	fh := fs.openSeq
 	fs.openFiles[fh] = &vaultOpenFile{data: snapshot}
-	// Refresh the secretCache so neighbouring lookups see a coherent size.
-	fs.secretCache[secretName] = secretCacheEntry{
-		fields: fields,
-		expiry: time.Now().Add(fs.dirTTL),
-	}
 	fs.mu.Unlock()
 
 	out.Fh = fh

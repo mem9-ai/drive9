@@ -189,30 +189,42 @@ func TestVaultMountScopeVisibility(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // Row E — new operation after revoke must surface as EACCES.
-// Witness: after server flips to 403, the next readdir/lookup propagates
-// EACCES once the cached list expires.
+// Witness: there is NO TTL-sized fail-open window. Each FUSE op hits the
+// server, so the very NEXT op after revoke returns EACCES — no wait, no
+// Eventually. An in-process cache would violate this row (see the
+// docstring on VaultFS.listSecrets for why there is no such cache).
 // ---------------------------------------------------------------------------
 
 func TestVaultMountNewOpAfterRevokeEACCES(t *testing.T) {
-	const ttl = 100 * time.Millisecond
-	vfs, fv, cleanup := newTestVaultFS(t, ttl)
+	vfs, fv, cleanup := newTestVaultFS(t, 5*time.Second)
 	defer cleanup()
 	fv.setSecrets([]string{"alpha"})
 	fv.setField("alpha", "k", "v1")
 
-	// Warm up: succeeds.
+	// Warm up: succeeds. This also populates any hypothetical cache — if
+	// one ever regresses into the code, the post-revoke assertion below
+	// will catch it.
 	_, st := lookupRoot(t, vfs, "alpha")
+	require.True(t, st.Ok())
+	alphaIno, st := lookupRoot(t, vfs, "alpha")
+	require.True(t, st.Ok())
+	keyIno, _, st := lookupChild(t, vfs, alphaIno, "k")
 	require.True(t, st.Ok())
 
 	// Revoke at the server.
 	fv.revoke()
 
-	// Eventually, after cache expires, a new lookup must surface EACCES
-	// (Row E — *new* op after revoke).
-	require.Eventually(t, func() bool {
-		_, st := lookupRoot(t, vfs, "alpha")
-		return st == gofuse.EACCES
-	}, 5*time.Second, 25*time.Millisecond, "new lookup after revoke must surface EACCES once TTL expires")
+	// IMMEDIATE — the NEXT op is already EACCES. No Eventually, no TTL wait.
+	_, st = lookupRoot(t, vfs, "alpha")
+	require.Equal(t, gofuse.EACCES, st, "next root Lookup after revoke must be EACCES (no TTL fail-open)")
+
+	_, _, st = lookupChild(t, vfs, alphaIno, "k")
+	require.Equal(t, gofuse.EACCES, st, "next field Lookup after revoke must be EACCES (no TTL fail-open)")
+
+	// GetAttr on a previously-known field inode must also refuse.
+	attrIn := &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: keyIno}}
+	attrSt := vfs.GetAttr(nil, attrIn, &gofuse.AttrOut{})
+	require.Equal(t, gofuse.EACCES, attrSt, "GetAttr on field inode after revoke must be EACCES")
 }
 
 // ---------------------------------------------------------------------------
@@ -288,36 +300,25 @@ func TestVaultMountSettleAfterPut(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Row H — TTL: cached list survives a full TTL window then refreshes.
-// Witness: list_calls is exactly 1 across N rapid lookups within TTL, then
-// strictly greater than 1 after TTL expires.
+// Row H — no in-process cache: every lookup hits the server.
+// Witness: N lookups produce N server calls (DirTTL is a kernel hint only,
+// not an in-process auth cache — see Row E rationale in listSecrets).
 // ---------------------------------------------------------------------------
 
-func TestVaultMountTTL(t *testing.T) {
-	const ttl = 100 * time.Millisecond
-	vfs, fv, cleanup := newTestVaultFS(t, ttl)
+func TestVaultMountNoInProcessCache(t *testing.T) {
+	vfs, fv, cleanup := newTestVaultFS(t, 5*time.Second)
 	defer cleanup()
-	fv.setSecrets([]string{"alpha", "beta"})
+	fv.setSecrets([]string{"alpha"})
 	fv.setField("alpha", "k", "x")
-	fv.setField("beta", "k", "y")
 
-	// Warm up.
-	_, st := lookupRoot(t, vfs, "alpha")
-	require.True(t, st.Ok())
-	initial := atomic.LoadInt32(&fv.listCalls)
-
-	// Hammer many lookups well within TTL — list_calls must NOT grow.
-	for i := 0; i < 20; i++ {
-		_, st := lookupRoot(t, vfs, "beta")
+	before := atomic.LoadInt32(&fv.listCalls)
+	const N = 5
+	for i := 0; i < N; i++ {
+		_, st := lookupRoot(t, vfs, "alpha")
 		require.True(t, st.Ok())
 	}
-	require.Equal(t, initial, atomic.LoadInt32(&fv.listCalls), "lookups within TTL must reuse cache")
-
-	// Wait past TTL; the next call should refresh.
-	time.Sleep(ttl + 50*time.Millisecond)
-	_, st = lookupRoot(t, vfs, "alpha")
-	require.True(t, st.Ok())
-	require.Greater(t, atomic.LoadInt32(&fv.listCalls), initial, "lookup after TTL expiry must refresh")
+	after := atomic.LoadInt32(&fv.listCalls)
+	require.Equal(t, int32(N), after-before, "every lookup must hit the server (no in-process cache)")
 }
 
 // ---------------------------------------------------------------------------
@@ -363,4 +364,36 @@ func TestVaultMountRevokedCredentialRejected(t *testing.T) {
 	}
 	err := MountVault(opts)
 	require.Error(t, err, "revoked credential must reject mount")
+}
+
+// ---------------------------------------------------------------------------
+// Row I (Blocker 2 regression) — owner with zero secrets MUST be allowed.
+// An owner API key with an empty vault is a normal new-tenant startup state;
+// only delegated tokens are rejected for empty scope.
+// ---------------------------------------------------------------------------
+
+func TestVaultMountOwnerEmptyVaultAllowed(t *testing.T) {
+	fv := newFakeVault()
+	// secrets list is empty — simulates a fresh tenant with no secrets yet.
+	srv := httptest.NewServer(fv.handler())
+	defer srv.Close()
+
+	tmp := t.TempDir()
+	opts := &VaultMountOptions{
+		Server:     srv.URL,
+		APIKey:     "owner-key", // owner, not delegated
+		MountPoint: tmp,
+		DirTTL:     100 * time.Millisecond,
+	}
+	// MountVault will try to actually FUSE-mount, which we can't do in
+	// unit tests. But the probe (Row I) runs BEFORE the mount call, so
+	// if the probe wrongly rejects an owner with empty secrets, we'd get
+	// an EACCES error. We verify it does NOT return an EACCES error.
+	err := MountVault(opts)
+	// We expect an error (FUSE mount will fail in test env), but it must
+	// NOT be the "no readable secrets (EACCES)" rejection.
+	if err != nil {
+		require.NotContains(t, err.Error(), "EACCES",
+			"owner with empty vault must NOT be rejected with EACCES")
+	}
 }

@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -199,3 +200,37 @@ func TestResolveMountCredentials_MissingServer(t *testing.T) {
 		t.Fatal("expected error when no server URL is available")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Row A — unknown mount backend must be rejected, not silently treated as
+// a legacy fs mount path.
+// ---------------------------------------------------------------------------
+
+func TestMountCmd_UnsupportedBackendRejected(t *testing.T) {
+	// "kv" is a bare word — not a flag, not a path — so it should be
+	// treated as an unsupported backend keyword and rejected.
+	err := MountCmd([]string{"kv", "/mnt/x"})
+	if err == nil {
+		t.Fatal("expected error for unsupported backend 'kv'")
+	}
+	if got := err.Error(); !strings.Contains(got, "unsupported mount backend") {
+		t.Fatalf("error = %q, want 'unsupported mount backend'", got)
+	}
+}
+
+func TestMountCmd_PathFirstArgFlowsToLegacy(t *testing.T) {
+	// A path-like first arg (contains "/") must NOT be rejected as an
+	// unknown backend — it should flow into the legacy fs mount path.
+	// We can't fully exercise fsMountCmd here (it calls flag.ExitOnError),
+	// so we just verify looksLikeMountBackendKeyword returns false.
+	if looksLikeMountBackendKeyword("/mnt/drive9") {
+		t.Fatal("/mnt/drive9 should not look like a backend keyword")
+	}
+	if looksLikeMountBackendKeyword("./rel") {
+		t.Fatal("./rel should not look like a backend keyword")
+	}
+	if looksLikeMountBackendKeyword("-debug") {
+		t.Fatal("-debug should not look like a backend keyword")
+	}
+}
+

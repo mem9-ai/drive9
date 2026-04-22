@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 
 	drive9fuse "github.com/mem9-ai/dat9/pkg/fuse"
@@ -14,18 +15,62 @@ import (
 // MountCmd handles the "drive9 mount" command.
 //
 // Dispatch fork (Row A, V2e): the first positional argument selects the
-// mount flavour. `drive9 mount vault <path>` routes to the read-only vault
-// FUSE filesystem; anything else retains the pre-V2e fs-mount behaviour
-// below. We MUST peek at the first arg before flag.Parse because the
-// vault flag set is smaller (no cache-size / write-path knobs), and a
-// single flag set would quietly accept write-path flags for a vault mount
-// — that would violate Row C (read-only) in a subtle, mount-time-visible
-// way. See docs/specs/vault-interaction-end-state.md §14.2.
+// mount flavour.
+//
+//   - `drive9 mount vault <path>`             → read-only vault FUSE filesystem
+//   - `drive9 mount [flags] <path>`           → legacy writable fs mount (no
+//     subcommand keyword; first positional is the mount point)
+//   - `drive9 mount <unknown> ...`            → rejected as unsupported backend
+//
+// We MUST peek at the first arg before flag.Parse because the vault flag
+// set is smaller (no cache-size / write-path knobs), and a single flag
+// set would quietly accept write-path flags for a vault mount — that
+// would violate Row C (read-only) in a subtle, mount-time-visible way.
+//
+// The unsupported-backend branch (Row A) prevents typos like
+// `drive9 mount kv /mnt/x` from being silently treated as
+// `drive9 mount kv` (with `/mnt/x` ignored). A bare-word first positional
+// that isn't a known backend keyword and isn't a path is rejected. Paths
+// (containing `/` or `.`) and flag-style args (leading `-`) flow into
+// the legacy fs mount path. See docs/specs/vault-interaction-end-state.md
+// §14.2.
 func MountCmd(args []string) error {
-	if len(args) > 0 && args[0] == "vault" {
-		return VaultMountCmd(args[1:])
+	if len(args) > 0 {
+		first := args[0]
+		switch {
+		case first == "vault":
+			return VaultMountCmd(args[1:])
+		case looksLikeMountBackendKeyword(first):
+			fmt.Fprintf(os.Stderr, "drive9 mount: unsupported backend %q (supported: vault)\n", first)
+			fmt.Fprintf(os.Stderr, "usage:\n")
+			fmt.Fprintf(os.Stderr, "  drive9 mount [flags] <mountpoint>\n")
+			fmt.Fprintf(os.Stderr, "  drive9 mount vault [flags] <mountpoint>\n")
+			return fmt.Errorf("unsupported mount backend: %s", first)
+		}
 	}
 	return fsMountCmd(args)
+}
+
+// looksLikeMountBackendKeyword decides whether s should be treated as a
+// (potentially unknown) backend selector rather than as a mount point.
+// The heuristic intentionally errs toward "is a backend keyword" so that
+// typos surface as Row A errors rather than silent accepts:
+//
+//   - leading "-" → flag, not a backend keyword
+//   - contains "/" or "." → path, not a backend keyword
+//   - empty → not a keyword
+//   - otherwise (bare alphanumeric word) → treat as a backend keyword
+func looksLikeMountBackendKeyword(s string) bool {
+	if s == "" {
+		return false
+	}
+	if strings.HasPrefix(s, "-") {
+		return false
+	}
+	if strings.ContainsAny(s, "/.") {
+		return false
+	}
+	return true
 }
 
 // fsMountCmd is the pre-V2e writable fs mount entry point.

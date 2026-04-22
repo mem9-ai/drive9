@@ -63,18 +63,26 @@ func MountVault(opts *VaultMountOptions) error {
 		c = client.New(opts.Server, opts.APIKey)
 	}
 
-	// Row I — empty-scope = EACCES. Probe the vault before standing up FUSE
-	// so a token whose grant has been revoked, or that simply has no
-	// readable secrets, fails fast with a useful error rather than an
-	// empty mount point that silently swallows reads.
+	// Row I — empty-scope = EACCES, but ONLY for delegated tokens.
+	//
+	// A delegated capability JWT with zero readable secrets means the
+	// grant has no scope (or has been revoked) — failing fast here gives
+	// the user a useful error instead of an empty mountpoint that
+	// silently swallows reads.
+	//
+	// An owner API key with zero secrets is a normal new-tenant startup
+	// state (see docs/guides/vault-quickstart.md: owner mounts the vault
+	// FIRST and then creates the first secret). For the owner kind we
+	// still probe — to surface a connectivity / auth failure early — but
+	// an empty list is allowed.
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	secrets, err := c.ListReadableVaultSecrets(probeCtx)
 	probeCancel()
 	if err != nil {
 		return fmt.Errorf("vault probe: %w", err)
 	}
-	if len(secrets) == 0 {
-		return fmt.Errorf("vault probe: no readable secrets for the supplied credential (EACCES)")
+	if opts.Token != "" && len(secrets) == 0 {
+		return fmt.Errorf("vault probe: delegated token has no readable secrets (EACCES)")
 	}
 
 	vfs := NewVaultFS(c, opts.DirTTL)
