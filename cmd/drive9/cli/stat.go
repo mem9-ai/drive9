@@ -12,8 +12,8 @@ import (
 
 // Stat shows metadata for a remote path.
 //
-//	drive9 stat /path/to/file
-//	drive9 stat :/path/to/file
+//	drive9 fs stat /path/to/file
+//	drive9 fs stat :/path/to/file
 func Stat(c *client.Client, args []string) error {
 	jsonOutput := false
 	path := ""
@@ -23,16 +23,16 @@ func Stat(c *client.Client, args []string) error {
 			jsonOutput = true
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return fmt.Errorf("usage: drive9 stat [--json] <path>")
+				return fmt.Errorf("usage: drive9 fs stat [--json] <path>")
 			}
 			if path != "" {
-				return fmt.Errorf("usage: drive9 stat [--json] <path>")
+				return fmt.Errorf("usage: drive9 fs stat [--json] <path>")
 			}
 			path = arg
 		}
 	}
 	if path == "" {
-		return fmt.Errorf("usage: drive9 stat [--json] <path>")
+		return fmt.Errorf("usage: drive9 fs stat [--json] <path>")
 	}
 	// Handle ":" prefixed remote paths like cp command
 	if rp, isRemote := ParseRemote(path); isRemote {

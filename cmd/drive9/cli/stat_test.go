@@ -122,7 +122,7 @@ func TestStatRejectsUnknownFlag(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected usage error")
 	}
-	if !strings.Contains(err.Error(), "usage: drive9 stat [--json] <path>") {
+	if !strings.Contains(err.Error(), "usage: drive9 fs stat [--json] <path>") {
 		t.Fatalf("error = %q, want usage", err)
 	}
 }

@@ -12,7 +12,7 @@ import (
 
 // Sh runs an interactive shell.
 //
-//	drive9 sh
+//	drive9 fs sh
 //
 // The shell supports: cd, pwd, ls, cat, cp, mv, rm, stat, help, exit.
 // Paths are resolved relative to the current working directory.
