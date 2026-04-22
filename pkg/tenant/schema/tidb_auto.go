@@ -598,9 +598,19 @@ func diffTiDBTable(db *sql.DB, table tidbTableSpec) ([]tidbSchemaDiff, error) {
 }
 
 func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
-	stmts, err := InitTiDBTenantSchemaStatementsForMode(mode)
-	if err != nil {
-		return tidbSchemaSpec{}, err
+	// For app mode, use only the base (required) statements. The optional
+	// indexes (FULLTEXT, VECTOR with ADD_COLUMNAR_REPLICA_ON_DEMAND) may be
+	// silently skipped on TiDB versions that do not support that syntax, so
+	// they must not be part of the enforceable schema contract.
+	var stmts []string
+	if mode == TiDBEmbeddingModeApp {
+		stmts = tidbAppEmbeddingBaseSchemaStatements()
+	} else {
+		var err error
+		stmts, err = InitTiDBTenantSchemaStatementsForMode(mode)
+		if err != nil {
+			return tidbSchemaSpec{}, err
+		}
 	}
 	spec, err := tidbSchemaSpecFromStatements(stmts)
 	if err != nil {

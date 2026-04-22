@@ -358,6 +358,19 @@ func TestTiDBSchemaSpecForModeIncludesAlterTableIndexes(t *testing.T) {
 	}
 }
 
+func TestTiDBSchemaSpecForAppModeExcludesOptionalIndexes(t *testing.T) {
+	// Optional FULLTEXT/VECTOR indexes use ADD_COLUMNAR_REPLICA_ON_DEMAND which
+	// is not supported on all TiDB versions. They must not appear in the app
+	// mode schema contract so that validation does not fail when they are skipped.
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeApp, "files")
+	if _, ok := spec.indexes["idx_fts_content"]; ok {
+		t.Fatal("files app mode spec must not include optional idx_fts_content index")
+	}
+	if _, ok := spec.indexes["idx_files_cosine"]; ok {
+		t.Fatal("files app mode spec must not include optional idx_files_cosine index")
+	}
+}
+
 func TestPlannedTiDBSchemaRepairsIncludesAlterTableIndexRepairs(t *testing.T) {
 	diffs := []tidbSchemaDiff{
 		{
