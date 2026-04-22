@@ -31,10 +31,20 @@ const (
 
 // CurrentTiDBTenantSchemaVersion is derived automatically from the content of
 // the tenant auto-embedding init SQL statements. It changes whenever any
-// statement changes, so callers never have to maintain a manual counter.
+// statement in the Go source changes, so callers never have to maintain a
+// manual counter.
 //
 // Tenants recorded with schema_version == CurrentTiDBTenantSchemaVersion in
-// the meta store are considered up-to-date and skip the diff entirely.
+// the meta store are skipped by EnsureTiDBSchemaForMode entirely.
+//
+// NOTE: this hash captures only changes to our Go-side SQL definitions, NOT
+// changes to the TiDB server version.  Upgrading TiDB itself does not change
+// the hash; existing tenant schemas therefore continue to be skipped
+// correctly, because a TiDB version upgrade does not alter the user table
+// structure that our init SQL created.  If a TiDB upgrade ever requires
+// re-applying our schema (e.g., a required migration for a new major version),
+// update any statement in tidbAutoEmbeddingSchemaStatements() to force a hash
+// change and trigger a one-time re-Ensure for all tenants.
 var CurrentTiDBTenantSchemaVersion = func() int {
 	stmts := tidbAutoEmbeddingSchemaStatements()
 	h := crc32.ChecksumIEEE([]byte(strings.Join(stmts, "\n")))
