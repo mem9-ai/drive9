@@ -671,9 +671,9 @@ func (c *Client) completeUpload(ctx context.Context, uploadID string) error {
 
 func (c *Client) completeUploadWithTags(ctx context.Context, uploadID string, tags map[string]string) error {
 	var body io.Reader
-	if len(tags) > 0 {
+	if tags != nil {
 		payload, err := json.Marshal(struct {
-			Tags map[string]string `json:"tags,omitempty"`
+			Tags map[string]string `json:"tags"`
 		}{Tags: tags})
 		if err != nil {
 			return err
@@ -685,7 +685,7 @@ func (c *Client) completeUploadWithTags(ctx context.Context, uploadID string, ta
 	if err != nil {
 		return err
 	}
-	if len(tags) > 0 {
+	if tags != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 
@@ -1007,7 +1007,7 @@ func (c *Client) presignOnePart(ctx context.Context, uploadID string, partNumber
 func (c *Client) completeUploadV2(ctx context.Context, uploadID string, parts []completePart, tags map[string]string) error {
 	body, err := json.Marshal(struct {
 		Parts []completePart    `json:"parts"`
-		Tags  map[string]string `json:"tags,omitempty"`
+		Tags  map[string]string `json:"tags"`
 	}{Parts: parts, Tags: tags})
 	if err != nil {
 		return err

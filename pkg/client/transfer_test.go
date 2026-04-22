@@ -390,6 +390,71 @@ func TestWriteStreamWithSummaryAndTagsLegacyCompleteCarriesTags(t *testing.T) {
 	}
 }
 
+func TestWriteStreamWithSummaryAndTagsLegacyCompleteClearsTagsWithEmptyMap(t *testing.T) {
+	var completeContentType string
+	var completeReq struct {
+		Tags map[string]string `json:"tags"`
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			http.NotFound(w, r)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(UploadPlan{
+				UploadID: "legacy-clear-tags",
+				PartSize: 8,
+				Parts: []PartURL{{
+					Number: 1,
+					URL:    fmt.Sprintf("http://%s/legacy-clear-tags/part/1", r.Host),
+					Size:   8,
+				}},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/legacy-clear-tags/part/1":
+			w.Header().Set("ETag", `"etag-legacy-clear-1"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/legacy-clear-tags/complete":
+			completeContentType = r.Header.Get("Content-Type")
+			if err := json.NewDecoder(r.Body).Decode(&completeReq); err != nil {
+				http.Error(w, "bad complete json", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	_, err := c.WriteStreamWithSummaryAndTags(
+		context.Background(),
+		"/legacy-clear-tags.bin",
+		bytes.NewReader([]byte("12345678")),
+		8,
+		nil,
+		map[string]string{},
+	)
+	if err != nil {
+		t.Fatalf("WriteStreamWithSummaryAndTags: %v", err)
+	}
+	if completeContentType != "application/json" {
+		t.Fatalf("complete Content-Type = %q, want application/json", completeContentType)
+	}
+	if completeReq.Tags == nil {
+		t.Fatal("complete tags = nil, want explicit empty map")
+	}
+	if len(completeReq.Tags) != 0 {
+		t.Fatalf("complete tags = %+v, want explicit empty map", completeReq.Tags)
+	}
+}
+
 func TestWriteStreamV2SinglePart(t *testing.T) {
 	var uploaded []byte
 	var progressCalls [][2]int
@@ -563,6 +628,76 @@ func TestWriteStreamWithSummaryAndTagsV2CompleteCarriesTags(t *testing.T) {
 	}
 	if completeReq.Tags["owner"] != "alice" || completeReq.Tags["topic"] != "cat" || len(completeReq.Tags) != 2 {
 		t.Fatalf("complete tags = %+v, want owner/topic", completeReq.Tags)
+	}
+}
+
+func TestWriteStreamWithSummaryAndTagsV2CompleteClearsTagsWithEmptyMap(t *testing.T) {
+	var completeReq struct {
+		Parts []completePart    `json:"parts"`
+		Tags  map[string]string `json:"tags"`
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(uploadPlanV2{
+				UploadID:         "v2-clear-tags",
+				PartSize:         8,
+				TotalParts:       1,
+				ChecksumContract: checksumContract{Supported: []string{"SHA-256"}},
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-clear-tags/presign-batch":
+			_ = json.NewEncoder(w).Encode(struct {
+				Parts []presignedPart `json:"parts"`
+			}{
+				Parts: []presignedPart{{
+					Number:    1,
+					URL:       fmt.Sprintf("http://%s/v2-clear-tags/part/1", r.Host),
+					Size:      8,
+					ExpiresAt: time.Now().Add(time.Minute),
+				}},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/v2-clear-tags/part/1":
+			w.Header().Set("ETag", `"etag-v2-clear-tags-1"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-clear-tags/complete":
+			if err := json.NewDecoder(r.Body).Decode(&completeReq); err != nil {
+				http.Error(w, "bad complete json", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	_, err := c.WriteStreamWithSummaryAndTags(
+		context.Background(),
+		"/v2-clear-tags.bin",
+		bytes.NewReader([]byte("abcdefgh")),
+		8,
+		nil,
+		map[string]string{},
+	)
+	if err != nil {
+		t.Fatalf("WriteStreamWithSummaryAndTags: %v", err)
+	}
+	if len(completeReq.Parts) != 1 || completeReq.Parts[0].Number != 1 {
+		t.Fatalf("complete parts = %+v, want one part", completeReq.Parts)
+	}
+	if completeReq.Tags == nil {
+		t.Fatal("complete tags = nil, want explicit empty map")
+	}
+	if len(completeReq.Tags) != 0 {
+		t.Fatalf("complete tags = %+v, want explicit empty map", completeReq.Tags)
 	}
 }
 
@@ -1544,6 +1679,65 @@ func TestResumeUploadWithSummaryAndTagsSendsTagsOnComplete(t *testing.T) {
 	}
 	if completeReq.Tags["owner"] != "alice" || completeReq.Tags["topic"] != "cat" || len(completeReq.Tags) != 2 {
 		t.Fatalf("complete tags = %+v, want owner/topic", completeReq.Tags)
+	}
+}
+
+func TestResumeUploadWithSummaryAndTagsClearsTagsWithEmptyMap(t *testing.T) {
+	var completeReq struct {
+		Tags map[string]string `json:"tags"`
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/uploads":
+			_ = json.NewEncoder(w).Encode(struct {
+				Uploads []UploadMeta `json:"uploads"`
+			}{Uploads: []UploadMeta{{UploadID: "resume-clear-tags", PartsTotal: 2, Status: "UPLOADING"}}})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-clear-tags/resume":
+			_ = json.NewEncoder(w).Encode(UploadPlan{
+				UploadID: "resume-clear-tags",
+				PartSize: 4,
+				Parts: []PartURL{{
+					Number: 2,
+					URL:    fmt.Sprintf("http://%s/resume-clear-tags/part/2", r.Host),
+					Size:   4,
+				}},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/resume-clear-tags/part/2":
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-clear-tags/complete":
+			if err := json.NewDecoder(r.Body).Decode(&completeReq); err != nil {
+				http.Error(w, "bad complete json", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	_, err := c.ResumeUploadWithSummaryAndTags(
+		context.Background(),
+		"/resume-clear-tags.bin",
+		bytes.NewReader([]byte("aaaabbbb")),
+		8,
+		nil,
+		map[string]string{},
+	)
+	if err != nil {
+		t.Fatalf("ResumeUploadWithSummaryAndTags: %v", err)
+	}
+	if completeReq.Tags == nil {
+		t.Fatal("complete tags = nil, want explicit empty map")
+	}
+	if len(completeReq.Tags) != 0 {
+		t.Fatalf("complete tags = %+v, want explicit empty map", completeReq.Tags)
 	}
 }
 
