@@ -646,7 +646,7 @@ func setTagHeaders(req *http.Request, tags map[string]string) error {
 	}
 	keys := make([]string, 0, len(tags))
 	for k := range tags {
-		if err := validateTagHeaderEntry(k, tags[k]); err != nil {
+		if err := tagutil.ValidateEntry(k, tags[k]); err != nil {
 			return err
 		}
 		keys = append(keys, k)
@@ -656,8 +656,4 @@ func setTagHeaders(req *http.Request, tags map[string]string) error {
 		req.Header.Add("X-Dat9-Tag", k+"="+tags[k])
 	}
 	return nil
-}
-
-func validateTagHeaderEntry(key, value string) error {
-	return tagutil.ValidateEntry(key, value)
 }

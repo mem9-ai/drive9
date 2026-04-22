@@ -1428,7 +1428,7 @@ func parseUploadCompleteTags(w http.ResponseWriter, r *http.Request) (map[string
 		}
 		return nil, fmt.Errorf("invalid request body: %w", err)
 	}
-	if err := validateTagsMap(req.Tags); err != nil {
+	if err := tagutil.ValidateMap(req.Tags); err != nil {
 		return nil, err
 	}
 	return req.Tags, nil
@@ -1455,16 +1455,10 @@ func parseWriteTagsHeader(header http.Header) (map[string]string, error) {
 		}
 		tags[key] = value
 	}
-	if err := validateTagsMap(tags); err != nil {
+	if err := tagutil.ValidateMap(tags); err != nil {
 		return nil, err
 	}
 	return tags, nil
-}
-
-const maxTagLen = 255
-
-func validateTagsMap(tags map[string]string) error {
-	return tagutil.ValidateMap(tags)
 }
 
 func parsePartChecksumsHeader(raw string) ([]string, error) {
@@ -1752,7 +1746,7 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 		errJSON(w, http.StatusBadRequest, "parts must not be empty")
 		return
 	}
-	if err := validateTagsMap(req.Tags); err != nil {
+	if err := tagutil.ValidateMap(req.Tags); err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
