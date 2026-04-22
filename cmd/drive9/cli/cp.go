@@ -159,10 +159,6 @@ func uploadFileWithTags(ctx context.Context, c *client.Client, localPath, remote
 	return nil
 }
 
-func resumeUpload(ctx context.Context, c *client.Client, localPath, remotePath string) error {
-	return resumeUploadWithTags(ctx, c, localPath, remotePath, nil)
-}
-
 func resumeUploadWithTags(ctx context.Context, c *client.Client, localPath, remotePath string, tags map[string]string) error {
 	f, size, err := openLocalFile(localPath)
 	if err != nil {
@@ -176,10 +172,6 @@ func resumeUploadWithTags(ctx context.Context, c *client.Client, localPath, remo
 	}
 	emitUploadSummary(ctx, summary, localPath)
 	return nil
-}
-
-func appendFile(ctx context.Context, c *client.Client, localPath, remotePath string) error {
-	return appendFileWithTags(ctx, c, localPath, remotePath, nil)
 }
 
 func appendFileWithTags(ctx context.Context, c *client.Client, localPath, remotePath string, tags map[string]string) error {
