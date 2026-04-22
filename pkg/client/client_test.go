@@ -225,6 +225,67 @@ func TestStatMetadataCompatDoesNotFallbackOnUnauthorized(t *testing.T) {
 	}
 }
 
+func TestStatMetadataCompatDoesNotFallbackOnNotFound(t *testing.T) {
+	headCalled := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/missing.txt" && r.URL.Query().Has("stat"):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"missing metadata"}`))
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/missing.txt":
+			headCalled = true
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	_, err := c.StatMetadataCompat("/missing.txt")
+	if err == nil {
+		t.Fatal("StatMetadataCompat error = nil, want not found error")
+	}
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("StatMetadataCompat error type = %T, want *StatusError", err)
+	}
+	if statusErr.StatusCode != http.StatusNotFound {
+		t.Fatalf("status code = %d, want %d", statusErr.StatusCode, http.StatusNotFound)
+	}
+	if headCalled {
+		t.Fatal("HEAD fallback should not run on not found metadata request")
+	}
+}
+
+func TestStatCtxPreservesStatusErrorOnNotFound(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/missing.txt":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"missing stat"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	_, err := c.StatCtx(context.Background(), "/missing.txt")
+	if err == nil {
+		t.Fatal("StatCtx error = nil, want not found error")
+	}
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("StatCtx error type = %T, want *StatusError", err)
+	}
+	if statusErr.StatusCode != http.StatusNotFound {
+		t.Fatalf("status code = %d, want %d", statusErr.StatusCode, http.StatusNotFound)
+	}
+}
+
 func TestWriteCtxConditionalWithTagsRejectsInvalidHeaderTags(t *testing.T) {
 	requests := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

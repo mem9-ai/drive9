@@ -343,12 +343,9 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 	if err != nil {
 		return nil, err
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode == 404 {
-		return nil, fmt.Errorf("not found: %s", path)
-	}
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, readError(resp)
 	}
 	s := &StatResult{
 		IsDir: resp.Header.Get("X-Dat9-IsDir") == "true",
@@ -437,7 +434,7 @@ func shouldFallbackStatMetadata(err error) bool {
 	var statusErr *StatusError
 	if errors.As(err, &statusErr) {
 		switch statusErr.StatusCode {
-		case http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusNotFound, http.StatusNotImplemented:
+		case http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusNotImplemented:
 			return true
 		}
 	}
