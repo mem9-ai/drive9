@@ -320,8 +320,22 @@ func (b *Dat9Backend) WriteCtx(ctx context.Context, path string, data []byte, of
 // - zero: path must not already exist
 // - positive: file must exist at exactly that revision
 func (b *Dat9Backend) WriteCtxIfRevision(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64) (n int64, err error) {
+	return b.WriteCtxIfRevisionWithTags(ctx, path, data, offset, flags, expectedRevision, nil)
+}
+
+// WriteCtxIfRevisionWithTags applies the write only when expectedRevision
+// matches the current file revision, and optionally replaces file tags in the
+// same transaction when tags is non-nil.
+//
+// expectedRevision semantics:
+// - negative: unconditional write
+// - zero: path must not already exist
+// - positive: file must exist at exactly that revision
+func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string) (n int64, err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, "write", err, start) }()
+
+	tags = cloneFileTags(tags)
 
 	path, err = pathutil.Canonicalize(path)
 	if err != nil {
@@ -339,7 +353,7 @@ func (b *Dat9Backend) WriteCtxIfRevision(ctx context.Context, path string, data 
 			}
 			return 0, datastore.ErrNotFound
 		}
-		n, err := b.createAndWriteCtx(ctx, path, data)
+		n, err := b.createAndWriteCtx(ctx, path, data, tags)
 		if expectedRevision == 0 && errors.Is(err, datastore.ErrPathConflict) {
 			return 0, datastore.ErrRevisionConflict
 		}
@@ -360,10 +374,21 @@ func (b *Dat9Backend) WriteCtxIfRevision(ctx context.Context, path string, data 
 	if expectedRevision > 0 && (existing.File == nil || existing.File.Revision != expectedRevision) {
 		return 0, datastore.ErrRevisionConflict
 	}
-	return b.overwriteFileCtx(ctx, existing, data, offset, flags, expectedRevision)
+	return b.overwriteFileCtx(ctx, existing, data, offset, flags, expectedRevision, tags)
 }
 
-func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte) (int64, error) {
+func cloneFileTags(tags map[string]string) map[string]string {
+	if tags == nil {
+		return nil
+	}
+	out := make(map[string]string, len(tags))
+	for k, v := range tags {
+		out[k] = v
+	}
+	return out
+}
+
+func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte, tags map[string]string) (int64, error) {
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
 		return 0, err
 	}
@@ -413,6 +438,11 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}); err != nil {
 			return err
 		}
+		if tags != nil {
+			if err := b.store.ReplaceFileTagsTx(tx, fileID, tags); err != nil {
+				return err
+			}
+		}
 		if b.UsesDatabaseAutoEmbedding() {
 			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
 		}
@@ -438,7 +468,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	return int64(len(data)), nil
 }
 
-func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64) (int64, error) {
+func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string) (int64, error) {
 	if nf.File == nil {
 		return 0, fmt.Errorf("no file entity")
 	}
@@ -523,6 +553,11 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		}
 		if txErr != nil {
 			return txErr
+		}
+		if tags != nil {
+			if err := b.store.ReplaceFileTagsTx(tx, nf.File.FileID, tags); err != nil {
+				return err
+			}
 		}
 		if b.UsesDatabaseAutoEmbedding() {
 			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType)

@@ -689,7 +689,15 @@ type CompletePart struct {
 // ConfirmUploadV2 validates client-supplied parts against S3, then completes the upload.
 // It shares finalizeUpload with ConfirmUpload, so TiDB auto-semantic task enqueue matches the v1 path.
 func (b *Dat9Backend) ConfirmUploadV2(ctx context.Context, uploadID string, clientParts []CompletePart) error {
+	return b.ConfirmUploadV2WithTags(ctx, uploadID, clientParts, nil)
+}
+
+// ConfirmUploadV2WithTags validates client-supplied parts against S3, then
+// completes the upload and optionally replaces file tags in the same
+// completion transaction when tags is non-nil.
+func (b *Dat9Backend) ConfirmUploadV2WithTags(ctx context.Context, uploadID string, clientParts []CompletePart, tags map[string]string) error {
 	start := time.Now()
+	tags = cloneFileTags(tags)
 
 	getUploadStart := time.Now()
 	upload, err := b.store.GetUpload(ctx, uploadID)
@@ -776,7 +784,7 @@ func (b *Dat9Backend) ConfirmUploadV2(ctx context.Context, uploadID string, clie
 
 	// Complete using the already-validated parts — no second ListParts.
 	finalizeStart := time.Now()
-	if err := b.finalizeUpload(ctx, upload, s3Parts); err != nil {
+	if err := b.finalizeUpload(ctx, upload, s3Parts, tags); err != nil {
 		return err
 	}
 	finalizeDurationMs := uploadPhaseMs(finalizeStart)
@@ -799,7 +807,14 @@ func (b *Dat9Backend) ConfirmUploadV2(ctx context.Context, uploadID string, clie
 // TiDB auto-embedding tenants: when applicable, finalizeUpload enqueues durable
 // img_extract_text / audio_extract_text in the completion transaction (same contract as create/overwrite).
 func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error {
+	return b.ConfirmUploadWithTags(ctx, uploadID, nil)
+}
+
+// ConfirmUploadWithTags completes the multipart upload and optionally replaces
+// file tags in the same completion transaction when tags is non-nil.
+func (b *Dat9Backend) ConfirmUploadWithTags(ctx context.Context, uploadID string, tags map[string]string) error {
 	start := time.Now()
+	tags = cloneFileTags(tags)
 
 	upload, err := b.store.GetUpload(ctx, uploadID)
 	if err != nil {
@@ -837,7 +852,7 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 	}
 
 	metrics.RecordOperation("backend", "confirm_upload", "ok", time.Since(start))
-	return b.finalizeUpload(ctx, upload, parts)
+	return b.finalizeUpload(ctx, upload, parts, tags)
 }
 
 // finalizeUpload completes the S3 multipart upload and creates the file node.
@@ -846,7 +861,7 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 // For TiDB auto-embedding tenants, durable img_extract_text / audio_extract_text
 // tasks are registered in the same transaction via enqueueTiDBAutoSemanticTasksTx,
 // matching create/overwrite semantics (MP3/WAV closed set, runtime gates, payloads).
-func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Upload, parts []s3client.Part) error {
+func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Upload, parts []s3client.Part, tags map[string]string) error {
 	start := time.Now()
 	uploadID := upload.UploadID
 	expectedRevision := uploadExpectedRevision(upload)
@@ -948,6 +963,11 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			}
 			updateFileContentDurationMs = uploadPhaseMs(stepStart)
 			confirmedRevision = newRev
+			if tags != nil {
+				if err := b.store.ReplaceFileTagsTx(tx, confirmedFileID, tags); err != nil {
+					return err
+				}
+			}
 
 			if _, err = tx.Exec(`UPDATE files SET status = 'DELETED', storage_ref = '' WHERE file_id = ?`, upload.FileID); err != nil {
 				return err
@@ -1023,6 +1043,11 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			return err
 		}
 		insertNodeDurationMs = uploadPhaseMs(stepStart)
+		if tags != nil {
+			if err := b.store.ReplaceFileTagsTx(tx, upload.FileID, tags); err != nil {
+				return err
+			}
+		}
 		if b.UsesDatabaseAutoEmbedding() {
 			stepStart = time.Now()
 			err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
