@@ -323,7 +323,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	openStoreDurationMs := float64(time.Since(openStoreStart).Microseconds()) / 1000.0
 	ensureSchemaDurationMs := 0.0
 	if opts.DatabaseAutoEmbedding && (t.Provider == ProviderTiDBZero || t.Provider == ProviderTiDBCloudStarter) {
-		if t.SchemaVersion < schema.CurrentTiDBTenantSchemaVersion {
+		if t.SchemaVersion != schema.CurrentTiDBTenantSchemaVersion {
 			ensureSchemaStart := time.Now()
 			if err := schema.EnsureTiDBSchemaForMode(store.DB(), schema.TiDBEmbeddingModeAuto); err != nil {
 				_ = store.Close()
