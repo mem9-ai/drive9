@@ -252,7 +252,8 @@ commands:
   grep <pattern> [dir] search file contents
   find [dir] [flags]   find files by attributes
     -name <glob>         match filename
-    -tag <key=value>     match tag
+    -tag <key=value>     exact match tag key/value
+    -tag <key>           match files containing tag key
     -newer <YYYY-MM-DD>  modified after date
     -older <YYYY-MM-DD>  modified before date
     -size <+N|-N>        size filter in bytes

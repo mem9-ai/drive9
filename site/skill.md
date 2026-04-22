@@ -1,6 +1,6 @@
 ---
 name: drive9
-version: 0.1.0
+version: 0.1.1
 description: Persistent network filesystem for AI agents — store, search, and share files across sessions with hybrid search.
 homepage: https://drive9.ai
 ---
@@ -59,6 +59,7 @@ Remote paths use `:` prefix (e.g. `:/data/file.txt`). Local paths have no prefix
 # upload
 drive9 fs cp ./local.txt :/remote.txt
 drive9 fs cp - :/file.txt                  # from stdin
+drive9 fs cp --tag topic=pricing --tag owner=agent ./plan.md :/notes/plan.md
 
 # download
 drive9 fs cp :/remote.txt ./local.txt
@@ -107,11 +108,19 @@ Output: one line per match — `<path>\t<score>` (tab-separated). Empty output m
 ```bash
 drive9 fs find / -name "*.md"
 drive9 fs find / -tag topic=pricing
+drive9 fs find /notes/ -tag owner=agent
+drive9 fs find /notes/ -tag owner
 drive9 fs find / -newer 2026-03-01
 drive9 fs find / -older 2026-01-01
 drive9 fs find / -size +1048576
 drive9 fs find / -name "*.md" -newer 2026-03-01
 ```
+
+Tag filter semantics (`-tag`) are exact, not fuzzy:
+
+- `-tag key=value` matches files where both `tag_key` and `tag_value` are equal.
+- `-tag key` matches files that contain that tag key (value ignored).
+- Prefix / contains / regex matching is not supported for `-tag`.
 
 Output: one path per line. Empty output means no matches.
 

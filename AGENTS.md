@@ -129,6 +129,12 @@ site/                   Frontend / release assets
 When creating a new GitHub issue, follow the templates under `.github/ISSUE_TEMPLATE/`
 to keep issue structure and required context consistent.
 
+### CLI find tag semantics
+
+- `drive9 fs find ... -tag key=value` is an exact key/value match.
+- `drive9 fs find ... -tag key` means tag-key existence match.
+- `-tag` does not support fuzzy, prefix, contains, or regex matching.
+
 ---
 
 ## Code style guidelines
