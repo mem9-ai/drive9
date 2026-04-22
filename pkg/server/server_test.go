@@ -167,6 +167,76 @@ func TestStat(t *testing.T) {
 	}
 }
 
+func TestStatMetadataIncludesTagsAndSemanticText(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	writeReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/meta.txt", strings.NewReader("hello metadata"))
+	writeReq.Header.Add("X-Dat9-Tag", "owner=alice")
+	writeReq.Header.Add("X-Dat9-Tag", "topic=note")
+	writeResp, err := http.DefaultClient.Do(writeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = writeResp.Body.Close()
+	if writeResp.StatusCode != http.StatusOK {
+		t.Fatalf("write: %d", writeResp.StatusCode)
+	}
+
+	resp, err := http.Get(ts.URL + "/v1/fs/meta.txt?stat=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stat metadata: %d", resp.StatusCode)
+	}
+
+	var out struct {
+		Size         int64             `json:"size"`
+		IsDir        bool              `json:"isdir"`
+		Revision     int64             `json:"revision"`
+		ContentType  string            `json:"content_type"`
+		SemanticText string            `json:"semantic_text"`
+		Tags         map[string]string `json:"tags"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode metadata: %v", err)
+	}
+	if out.Size != int64(len("hello metadata")) || out.IsDir || out.Revision != 1 {
+		t.Fatalf("unexpected metadata shape: %+v", out)
+	}
+	if out.ContentType == "" || out.SemanticText == "" {
+		t.Fatalf("expected content_type and semantic_text, got %+v", out)
+	}
+	if out.Tags["owner"] != "alice" || out.Tags["topic"] != "note" || len(out.Tags) != 2 {
+		t.Fatalf("unexpected tags: %+v", out.Tags)
+	}
+}
+
+func TestWriteRejectsDuplicateTagHeaders(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/dup-tags.txt", strings.NewReader("x"))
+	req.Header.Add("X-Dat9-Tag", "owner=alice")
+	req.Header.Add("X-Dat9-Tag", "owner=bob")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "duplicate X-Dat9-Tag key") {
+		t.Fatalf("response = %q, want duplicate tag error", body)
+	}
+}
+
 func TestStatDirectoryWithoutTrailingSlash(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)

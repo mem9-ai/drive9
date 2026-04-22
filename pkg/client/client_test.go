@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"net/http/httptest"
 	"os"
 	"testing"
@@ -96,6 +97,54 @@ func TestStat(t *testing.T) {
 	}
 	if info.Size != 4 || info.IsDir {
 		t.Errorf("unexpected: %+v", info)
+	}
+}
+
+func TestStatMetadataIncludesTagsAndSupportsTagReplace(t *testing.T) {
+	c, cleanup := newTestClient(t)
+	defer cleanup()
+
+	err := c.WriteCtxConditionalWithTags(context.Background(), "/meta.txt", []byte("hello"), -1, map[string]string{
+		"owner": "alice",
+		"topic": "note",
+	})
+	if err != nil {
+		t.Fatalf("WriteCtxConditionalWithTags(create): %v", err)
+	}
+
+	meta, err := c.StatMetadata("/meta.txt")
+	if err != nil {
+		t.Fatalf("StatMetadata(create): %v", err)
+	}
+	if meta.Size != 5 || meta.IsDir || meta.Revision != 1 {
+		t.Fatalf("unexpected stat metadata: %+v", meta)
+	}
+	if meta.ContentType == "" {
+		t.Fatal("content_type should not be empty")
+	}
+	if meta.SemanticText == "" {
+		t.Fatal("semantic_text should not be empty")
+	}
+	if meta.Tags["owner"] != "alice" || meta.Tags["topic"] != "note" || len(meta.Tags) != 2 {
+		t.Fatalf("tags = %+v, want owner/topic", meta.Tags)
+	}
+
+	err = c.WriteCtxConditionalWithTags(context.Background(), "/meta.txt", []byte("hello v2"), -1, map[string]string{
+		"owner": "bob",
+	})
+	if err != nil {
+		t.Fatalf("WriteCtxConditionalWithTags(overwrite): %v", err)
+	}
+
+	meta, err = c.StatMetadata("/meta.txt")
+	if err != nil {
+		t.Fatalf("StatMetadata(overwrite): %v", err)
+	}
+	if meta.Revision != 2 {
+		t.Fatalf("revision = %d, want 2", meta.Revision)
+	}
+	if meta.Tags["owner"] != "bob" || len(meta.Tags) != 1 {
+		t.Fatalf("tags after replace = %+v, want only owner=bob", meta.Tags)
 	}
 }
 

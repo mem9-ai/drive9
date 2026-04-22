@@ -1,0 +1,98 @@
+package cli
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/mem9-ai/dat9/pkg/client"
+)
+
+func TestStatDefaultOutputIncludesMetadataFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs/meta.txt" || !r.URL.Query().Has("stat") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"size":          12,
+			"isdir":         false,
+			"revision":      3,
+			"content_type":  "text/plain",
+			"semantic_text": "hello world",
+			"tags": map[string]string{
+				"topic": "memo",
+				"owner": "alice",
+			},
+		})
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	out, err := captureStdoutE(t, func() error { return Stat(c, []string{":/meta.txt"}) })
+	if err != nil {
+		t.Fatalf("Stat(default): %v", err)
+	}
+	if !strings.Contains(out, "size: 12\n") {
+		t.Fatalf("output missing size: %q", out)
+	}
+	if !strings.Contains(out, "semantic_text: hello world\n") {
+		t.Fatalf("output missing semantic_text: %q", out)
+	}
+	ownerIdx := strings.Index(out, "tags.owner: alice\n")
+	topicIdx := strings.Index(out, "tags.topic: memo\n")
+	if ownerIdx < 0 || topicIdx < 0 {
+		t.Fatalf("output missing tags: %q", out)
+	}
+	if ownerIdx > topicIdx {
+		t.Fatalf("tags are not sorted by key: %q", out)
+	}
+}
+
+func TestStatJSONOutput(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs/doc.txt" || !r.URL.Query().Has("stat") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"size":          5,
+			"isdir":         false,
+			"revision":      1,
+			"content_type":  "text/plain",
+			"semantic_text": "hello",
+			"tags": map[string]string{
+				"k": "v",
+			},
+		})
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	out, err := captureStdoutE(t, func() error { return Stat(c, []string{"--json", "/doc.txt"}) })
+	if err != nil {
+		t.Fatalf("Stat(--json): %v", err)
+	}
+	var got client.StatMetadataResult
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("json.Unmarshal output: %v\noutput=%q", err, out)
+	}
+	if got.Size != 5 || got.Revision != 1 || got.Tags["k"] != "v" {
+		t.Fatalf("unexpected json output: %+v", got)
+	}
+}
+
+func TestStatRejectsUnknownFlag(t *testing.T) {
+	c := client.New("http://example.invalid", "")
+	err := Stat(c, []string{"--verbose", "/x.txt"})
+	if err == nil {
+		t.Fatal("expected usage error")
+	}
+	if !strings.Contains(err.Error(), "usage: drive9 stat [--json] <path>") {
+		t.Fatalf("error = %q, want usage", err)
+	}
+}
