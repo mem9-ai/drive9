@@ -19,8 +19,11 @@ import (
 // Like MountOptions, APIKey and Token are mutually exclusive — exactly one
 // must be set, and the chosen credential is locked for the mount's lifetime
 // (Invariant #3, #6). A read-only vault mount served by a delegated token
-// can only see secrets the token's grant covers (Row D); an empty scope
-// causes Mount to fail with EACCES at probe time (Row I).
+// can only see secrets the token's grant covers (Row D). Probe-time mount
+// rejection is driven by the server's auth response, not by the size of the
+// readable secret set: valid credentials may legitimately enumerate zero
+// secrets, while malformed / expired / revoked tokens are rejected by the
+// server with 401 (Row I).
 type VaultMountOptions struct {
 	Server     string
 	APIKey     string        // owner API key (mutually exclusive with Token)
@@ -74,7 +77,7 @@ func MountVault(opts *VaultMountOptions) error {
 	//   - Delegated token with zero existing secrets = valid grant whose
 	//     scope targets secrets that don't exist yet or were deleted. This
 	//     is NOT the same as a revoked/malformed token (which the server
-	//     surfaces as 403, caught by the error check above).
+	//     surfaces as 401, caught by the error check above).
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	secrets, err := c.ListReadableVaultSecrets(probeCtx)
 	probeCancel()

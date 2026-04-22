@@ -19,7 +19,8 @@ import (
 //
 // Witness tests for V2e contract rows interact with VaultFS through this
 // server so that revocation, value-rotation, and TTL behaviour can be
-// driven deterministically — no live tenant required.
+// driven deterministically — no live tenant required. Auth failures use 401
+// to match pkg/server/vault.go.
 type fakeVaultServer struct {
 	mu sync.Mutex
 
@@ -65,7 +66,7 @@ func (f *fakeVaultServer) handler() http.Handler {
 		f.mu.Unlock()
 		atomic.AddInt32(&f.listCalls, 1)
 		if revoked {
-			http.Error(w, `{"error":"revoked"}`, http.StatusForbidden)
+			http.Error(w, `{"error":"revoked"}`, http.StatusUnauthorized)
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"secrets": secrets})
@@ -82,7 +83,7 @@ func (f *fakeVaultServer) handler() http.Handler {
 		f.mu.Unlock()
 		atomic.AddInt32(&f.readCalls, 1)
 		if revoked {
-			http.Error(w, `{"error":"revoked"}`, http.StatusForbidden)
+			http.Error(w, `{"error":"revoked"}`, http.StatusUnauthorized)
 			return
 		}
 		if !hasSecret {
@@ -322,7 +323,7 @@ func TestVaultMountNoInProcessCache(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Row I — revoked credential at probe time is rejected (server returns 403).
+// Row I — revoked credential at probe time is rejected (server returns 401).
 // Empty scope (zero secrets, valid token) is NOT rejected — see vault_mount.go.
 // ---------------------------------------------------------------------------
 
@@ -348,7 +349,7 @@ func TestVaultMountRevokedCredentialRejected(t *testing.T) {
 // Row I — empty scope (zero secrets) must NOT be rejected for either
 // principal kind. Owner: normal new-tenant startup. Delegated: valid grant
 // whose scope targets secrets that don't exist yet. Revoked/malformed tokens
-// are caught by the server returning 403, not by counting secrets.
+// are caught by the server returning 401, not by counting secrets.
 // ---------------------------------------------------------------------------
 
 func TestVaultMountEmptyScopeAllowed(t *testing.T) {

@@ -44,6 +44,9 @@ func VaultMountCmd(args []string) error {
 		fs.Usage()
 		os.Exit(2)
 	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("drive9 mount vault: exactly one mountpoint required")
+	}
 	mountPoint := fs.Arg(0)
 
 	serverGiven, apiKeyGiven := flagProvided(fs, "server"), flagProvided(fs, "api-key")
