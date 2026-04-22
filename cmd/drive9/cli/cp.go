@@ -128,7 +128,7 @@ func parseAndMergeTag(tags map[string]string, raw string) (map[string]string, er
 	}
 	key = strings.TrimSpace(key)
 	if key == "" {
-		return nil, fmt.Errorf("invalid --tag %q (expected key=value)", raw)
+		return nil, fmt.Errorf("invalid --tag %q (empty key)", raw)
 	}
 	if tags == nil {
 		tags = make(map[string]string)

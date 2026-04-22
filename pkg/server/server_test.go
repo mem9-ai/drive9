@@ -237,6 +237,56 @@ func TestWriteRejectsDuplicateTagHeaders(t *testing.T) {
 	}
 }
 
+func TestWriteRejectsOverlongTagHeaders(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	tests := []struct {
+		name   string
+		header string
+		want   string
+	}{
+		{
+			name:   "key too long",
+			header: strings.Repeat("k", 256) + "=v",
+			want:   "key exceeds 255 characters",
+		},
+		{
+			name:   "value too long",
+			header: "owner=" + strings.Repeat("v", 256),
+			want:   "value exceeds 255 characters",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/long-tags.txt", strings.NewReader("x"))
+			req.Header.Add("X-Dat9-Tag", tc.header)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", resp.StatusCode)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			if !strings.Contains(string(body), tc.want) {
+				t.Fatalf("response = %q, want %q", body, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateTagsMapRejectsOverlongKeyOrValue(t *testing.T) {
+	if err := validateTagsMap(map[string]string{strings.Repeat("k", 256): "v"}); err == nil || !strings.Contains(err.Error(), "key exceeds 255 characters") {
+		t.Fatalf("key length validation err = %v, want key length rejection", err)
+	}
+	if err := validateTagsMap(map[string]string{"owner": strings.Repeat("v", 256)}); err == nil || !strings.Contains(err.Error(), "value exceeds 255 characters") {
+		t.Fatalf("value length validation err = %v, want value length rejection", err)
+	}
+}
+
 func TestStatDirectoryWithoutTrailingSlash(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)

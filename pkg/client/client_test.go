@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/mem9-ai/dat9/internal/testmysql"
@@ -214,6 +215,50 @@ func TestStatMetadataCompatDoesNotFallbackOnUnauthorized(t *testing.T) {
 	}
 	if headCalled {
 		t.Fatal("HEAD fallback should not run on unauthorized metadata request")
+	}
+}
+
+func TestWriteCtxConditionalWithTagsRejectsInvalidHeaderTags(t *testing.T) {
+	requests := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	tests := []struct {
+		name    string
+		tags    map[string]string
+		wantErr string
+	}{
+		{
+			name:    "key contains equals",
+			tags:    map[string]string{"a=b": "v"},
+			wantErr: "contains '='",
+		},
+		{
+			name:    "key contains control characters",
+			tags:    map[string]string{"owner\n": "alice"},
+			wantErr: "contains control characters",
+		},
+		{
+			name:    "value contains control characters",
+			tags:    map[string]string{"owner": "alice\r\nbob"},
+			wantErr: "contains control characters",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			requests = 0
+			c := New(ts.URL, "")
+			err := c.WriteCtxConditionalWithTags(context.Background(), "/bad-tags.txt", []byte("x"), -1, tc.tags)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tc.wantErr)
+			}
+			if requests != 0 {
+				t.Fatalf("request count = %d, want 0", requests)
+			}
+		})
 	}
 }
 

@@ -462,4 +462,7 @@ func TestParseAndMergeTagValidation(t *testing.T) {
 	if _, err := parseAndMergeTag(tags, "invalid"); err == nil || !strings.Contains(err.Error(), `invalid --tag "invalid" (expected key=value)`) {
 		t.Fatalf("invalid format error = %v, want key=value rejection", err)
 	}
+	if _, err := parseAndMergeTag(tags, "=alice"); err == nil || !strings.Contains(err.Error(), `invalid --tag "=alice" (empty key)`) {
+		t.Fatalf("empty key error = %v, want empty key rejection", err)
+	}
 }

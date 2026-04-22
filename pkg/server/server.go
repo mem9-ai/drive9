@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/backend"
@@ -1438,13 +1439,24 @@ func parseWriteTagsHeader(header http.Header) (map[string]string, error) {
 		}
 		tags[key] = value
 	}
+	if err := validateTagsMap(tags); err != nil {
+		return nil, err
+	}
 	return tags, nil
 }
 
+const maxTagLen = 255
+
 func validateTagsMap(tags map[string]string) error {
-	for key := range tags {
+	for key, value := range tags {
 		if strings.TrimSpace(key) == "" {
 			return fmt.Errorf("invalid tags: empty key")
+		}
+		if utf8.RuneCountInString(key) > maxTagLen {
+			return fmt.Errorf("invalid tags: key exceeds %d characters", maxTagLen)
+		}
+		if utf8.RuneCountInString(value) > maxTagLen {
+			return fmt.Errorf("invalid tags: value exceeds %d characters", maxTagLen)
 		}
 	}
 	return nil

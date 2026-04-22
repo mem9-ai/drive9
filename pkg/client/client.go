@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Client is the dat9 HTTP client.
@@ -253,7 +254,9 @@ func (c *Client) WriteCtxConditionalWithTags(ctx context.Context, path string, d
 	if expectedRevision >= 0 {
 		req.Header.Set("X-Dat9-Expected-Revision", strconv.FormatInt(expectedRevision, 10))
 	}
-	setTagHeaders(req, tags)
+	if err := setTagHeaders(req, tags); err != nil {
+		return err
+	}
 	resp, err := c.do(req)
 	if err != nil {
 		return err
@@ -634,16 +637,45 @@ func (c *Client) Find(pathPrefix string, params url.Values) ([]SearchResult, err
 	return results, nil
 }
 
-func setTagHeaders(req *http.Request, tags map[string]string) {
+func setTagHeaders(req *http.Request, tags map[string]string) error {
 	if len(tags) == 0 {
-		return
+		return nil
 	}
 	keys := make([]string, 0, len(tags))
 	for k := range tags {
+		if err := validateTagHeaderEntry(k, tags[k]); err != nil {
+			return err
+		}
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
 		req.Header.Add("X-Dat9-Tag", k+"="+tags[k])
 	}
+	return nil
+}
+
+func validateTagHeaderEntry(key, value string) error {
+	if strings.TrimSpace(key) == "" {
+		return fmt.Errorf("invalid tag key %q: empty key", key)
+	}
+	if strings.Contains(key, "=") {
+		return fmt.Errorf("invalid tag key %q: contains '='", key)
+	}
+	if hasControlChars(key) {
+		return fmt.Errorf("invalid tag key %q: contains control characters", key)
+	}
+	if hasControlChars(value) {
+		return fmt.Errorf("invalid tag value for key %q: contains control characters", key)
+	}
+	return nil
+}
+
+func hasControlChars(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || !utf8.ValidRune(r) {
+			return true
+		}
+	}
+	return false
 }
