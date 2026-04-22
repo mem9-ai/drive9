@@ -337,6 +337,16 @@ func TestValidateTagsMapRejectsInvalidKeysOrValues(t *testing.T) {
 			tags: map[string]string{"owner": "alice\t"},
 			want: "contains control characters",
 		},
+		{
+			name: "key contains invalid utf8",
+			tags: map[string]string{string([]byte{0xff}): "alice"},
+			want: "invalid UTF-8",
+		},
+		{
+			name: "value contains invalid utf8",
+			tags: map[string]string{"owner": string([]byte{0xff})},
+			want: "invalid UTF-8",
+		},
 	}
 
 	for _, tc := range tests {

@@ -253,6 +253,21 @@ func TestWriteCtxConditionalWithTagsRejectsInvalidHeaderTags(t *testing.T) {
 			tags:    map[string]string{"owner": "alice\r\nbob"},
 			wantErr: "contains control characters",
 		},
+		{
+			name:    "key contains invalid utf8",
+			tags:    map[string]string{string([]byte{0xff}): "alice"},
+			wantErr: "invalid UTF-8",
+		},
+		{
+			name:    "value contains invalid utf8",
+			tags:    map[string]string{"owner": string([]byte{0xff})},
+			wantErr: "invalid UTF-8",
+		},
+		{
+			name:    "key too long",
+			tags:    map[string]string{strings.Repeat("k", 256): "alice"},
+			wantErr: "key exceeds 255 characters",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

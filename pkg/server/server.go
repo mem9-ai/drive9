@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/backend"
@@ -21,6 +20,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/dat9/pkg/tagutil"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/traceid"
@@ -1464,36 +1464,7 @@ func parseWriteTagsHeader(header http.Header) (map[string]string, error) {
 const maxTagLen = 255
 
 func validateTagsMap(tags map[string]string) error {
-	for key, value := range tags {
-		if strings.TrimSpace(key) == "" {
-			return fmt.Errorf("invalid tags: empty key")
-		}
-		if strings.Contains(key, "=") {
-			return fmt.Errorf("invalid tag key %q: contains '='", key)
-		}
-		if hasTagControlChars(key) {
-			return fmt.Errorf("invalid tag key %q: contains control characters", key)
-		}
-		if hasTagControlChars(value) {
-			return fmt.Errorf("invalid tag value for key %q: contains control characters", key)
-		}
-		if utf8.RuneCountInString(key) > maxTagLen {
-			return fmt.Errorf("invalid tags: key exceeds %d characters", maxTagLen)
-		}
-		if utf8.RuneCountInString(value) > maxTagLen {
-			return fmt.Errorf("invalid tags: value exceeds %d characters", maxTagLen)
-		}
-	}
-	return nil
-}
-
-func hasTagControlChars(s string) bool {
-	for _, r := range s {
-		if r < 0x20 || r == 0x7f || !utf8.ValidRune(r) {
-			return true
-		}
-	}
-	return false
+	return tagutil.ValidateMap(tags)
 }
 
 func parsePartChecksumsHeader(raw string) ([]string, error) {
