@@ -429,10 +429,11 @@ start_mount() {
   MOUNT_PID="$!"
 
   if wait_mount_state mounted; then
+    echo "mount log: $MOUNT_LOG"
     return 0
   fi
   if [ -f "$MOUNT_LOG" ]; then
-    echo "mount log:"
+    echo "mount log: $MOUNT_LOG"
     cat "$MOUNT_LOG"
   fi
   return 1
