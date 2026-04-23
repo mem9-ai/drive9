@@ -20,6 +20,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/dat9/pkg/tagutil"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
@@ -470,7 +471,12 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		if r.URL.Query().Has("grep") {
+		if r.URL.Query().Has("stat") {
+			// HEAD and GET ?stat=1 serve different stat contracts:
+			// - GET ?stat=1 (s.handleStatMetadata): enriched JSON metadata
+			//   (content_type/semantic_text/tags in addition to core attrs).
+			s.handleStatMetadata(w, r, path)
+		} else if r.URL.Query().Has("grep") {
 			s.handleGrep(w, r, path)
 		} else if r.URL.Query().Has("find") {
 			s.handleFind(w, r, path)
@@ -482,6 +488,8 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		s.handleWrite(w, r, path)
 	case http.MethodHead:
+		// HEAD (s.handleStat) serves the lightweight header-based stat contract
+		// (size/isdir/revision/mtime).
 		s.handleStat(w, r, path)
 	case http.MethodDelete:
 		s.handleDelete(w, r, path)
@@ -583,6 +591,77 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 	_ = json.NewEncoder(w).Encode(map[string]any{"entries": out})
 }
 
+func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_missing_scope", "path", path)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	nf, err := b.StatNodeCtx(r.Context(), path)
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_not_found", "path", path)...)
+			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_failed", "path", path, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	tags := make(map[string]string)
+	var size int64
+	var revision int64
+	var mtime *int64
+	var contentType string
+	var semanticText string
+	if nf.File != nil {
+		size = nf.File.SizeBytes
+		revision = nf.File.Revision
+		if nf.File.ConfirmedAt != nil {
+			unix := nf.File.ConfirmedAt.Unix()
+			mtime = &unix
+		} else {
+			unix := nf.File.CreatedAt.Unix()
+			mtime = &unix
+		}
+		contentType = nf.File.ContentType
+		semanticText = nf.File.ContentText
+
+		tags, err = b.Store().GetFileTags(r.Context(), nf.File.FileID)
+		if err != nil {
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_load_tags_failed", "path", path, "error", err)...)
+			errJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	} else {
+		unix := nf.Node.CreatedAt.Unix()
+		mtime = &unix
+	}
+
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_ok", "path", path, "is_dir", nf.Node.IsDirectory)...)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(*mtime, 10))
+	_ = json.NewEncoder(w).Encode(struct {
+		Size         int64             `json:"size"`
+		IsDir        bool              `json:"isdir"`
+		Revision     int64             `json:"revision"`
+		Mtime        *int64            `json:"mtime,omitempty"`
+		ContentType  string            `json:"content_type"`
+		SemanticText string            `json:"semantic_text"`
+		Tags         map[string]string `json:"tags"`
+	}{
+		Size:         size,
+		IsDir:        nf.Node.IsDirectory,
+		Revision:     revision,
+		Mtime:        mtime,
+		ContentType:  contentType,
+		SemanticText: semanticText,
+		Tags:         tags,
+	})
+}
+
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string) {
 	b := backendFromRequest(r)
 	if b == nil {
@@ -594,6 +673,13 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	expectedRevision, err := parseExpectedRevisionHeader(r.Header.Get("X-Dat9-Expected-Revision"))
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid X-Dat9-Expected-Revision header")
+		return
+	}
+	writeTags, err := parseWriteTagsHeader(r.Header)
+	if err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_invalid_tag_header", "path", path, "error", err)...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
+		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actualCL := r.ContentLength
@@ -621,6 +707,12 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	if cl > 0 && b.IsLargeFile(cl) {
+		if len(writeTags) > 0 {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_large_put_tag_unsupported", "path", path)...)
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			errJSON(w, http.StatusBadRequest, "X-Dat9-Tag is not supported on large-file PUT initiate; send tags in upload complete request")
+			return
+		}
 		partChecksums, err := parsePartChecksumsHeader(r.Header.Get("X-Dat9-Part-Checksums"))
 		if err != nil {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_bad_checksums_header", "path", path, "error", err)...)
@@ -693,7 +785,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		errJSON(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}
-	_, err = b.WriteCtxIfRevision(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, expectedRevision)
+	_, err = b.WriteCtxIfRevisionWithTags(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, expectedRevision, writeTags)
 	if err != nil {
 		if errors.Is(err, backend.ErrUploadTooLarge) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_too_large_backend", "path", path, "error", err)...)
@@ -1251,7 +1343,13 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := b.ConfirmUpload(r.Context(), uploadID); err != nil {
+	tags, err := parseUploadCompleteTags(w, r)
+	if err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_bad_body", "upload_id", uploadID, "error", err)...)
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := b.ConfirmUploadWithTags(r.Context(), uploadID, tags); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_not_found", "upload_id", uploadID)...)
 			metricEvent(r.Context(), "upload_complete", "result", "error")
@@ -1378,6 +1476,54 @@ func (s *Server) parseResumePartChecksums(w http.ResponseWriter, r *http.Request
 		return nil, errors.New("missing x-dat9-part-checksums header")
 	}
 	return partChecksums, nil
+}
+
+func parseUploadCompleteTags(w http.ResponseWriter, r *http.Request) (map[string]string, error) {
+	// Keep v1 complete backward compatible: legacy clients send an empty body.
+	// Tags keys must be unique. Official CLI/SDK callers always satisfy this
+	// because they construct tags from map[string]string and reject duplicate
+	// --tag keys before issuing requests. Callers that send duplicate JSON object
+	// keys are providing invalid input; Go's encoding/json silently keeps the
+	// last value for duplicate keys, so callers that need deterministic results
+	// must deduplicate before sending.
+	var req struct {
+		Tags map[string]string `json:"tags,omitempty"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("invalid request body: %w", err)
+	}
+	if err := tagutil.ValidateMap(req.Tags); err != nil {
+		return nil, err
+	}
+	return req.Tags, nil
+}
+
+func parseWriteTagsHeader(header http.Header) (map[string]string, error) {
+	raw := header.Values("X-Dat9-Tag")
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	tags := make(map[string]string, len(raw))
+	for _, entry := range raw {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			return nil, fmt.Errorf("invalid X-Dat9-Tag %q (expected key=value)", entry)
+		}
+		if key == "" {
+			return nil, fmt.Errorf("invalid X-Dat9-Tag %q (empty key)", entry)
+		}
+		if err := tagutil.ValidateEntry(key, value); err != nil {
+			return nil, err
+		}
+		if _, dup := tags[key]; dup {
+			return nil, fmt.Errorf("duplicate X-Dat9-Tag key %q", key)
+		}
+		tags[key] = value
+	}
+	return tags, nil
 }
 
 func parsePartChecksumsHeader(raw string) ([]string, error) {
@@ -1652,8 +1798,15 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
+	// Tags keys must be unique. Official CLI/SDK callers always satisfy this
+	// because they construct tags from map[string]string and reject duplicate
+	// --tag keys before issuing requests. Callers that send duplicate JSON object
+	// keys are providing invalid input; Go's encoding/json silently keeps the
+	// last value for duplicate keys, so callers that need deterministic results
+	// must deduplicate before sending.
 	var req struct {
 		Parts []backend.CompletePart `json:"parts"`
+		Tags  map[string]string      `json:"tags,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_bad_body", "upload_id", uploadID, "error", err)...)
@@ -1662,6 +1815,10 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 	}
 	if len(req.Parts) == 0 {
 		errJSON(w, http.StatusBadRequest, "parts must not be empty")
+		return
+	}
+	if err := tagutil.ValidateMap(req.Tags); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	// Fetch upload before confirming so we can publish the target path in the event.
@@ -1676,7 +1833,7 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := b.ConfirmUploadV2(r.Context(), uploadID, req.Parts); err != nil {
+	if err := b.ConfirmUploadV2WithTags(r.Context(), uploadID, req.Parts, req.Tags); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "upload not found")
 			return

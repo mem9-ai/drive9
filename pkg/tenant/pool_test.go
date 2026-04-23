@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"fmt"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,7 +17,9 @@ import (
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/semantic"
+	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
 
 func TestPoolAcquireInvalidateDefersCloseUntilRelease(t *testing.T) {
@@ -247,6 +251,112 @@ func TestPoolAutoSemanticTaskTypes(t *testing.T) {
 	if len(gotBoth) != 2 || gotBoth[0] != semantic.TaskTypeImgExtractText || gotBoth[1] != semantic.TaskTypeAudioExtractText {
 		t.Fatalf("got %#v, want [img_extract_text audio_extract_text]", gotBoth)
 	}
+}
+
+func TestPoolCreateBackendPeriodicallyValidatesSchemaWhenVersionMatches(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-validate")
+	tenant.Provider = ProviderTiDBZero
+	tenant.SchemaVersion = schema.CurrentTiDBTenantSchemaVersion
+
+	origEnsure := ensureTiDBSchemaForMode
+	origValidate := validateTiDBSchemaForMode
+	origEvery := periodicTiDBSchemaValidationEvery
+	ensureCalls := 0
+	validateCalls := 0
+	ensureTiDBSchemaForMode = func(context.Context, *sql.DB, schema.TiDBEmbeddingMode) error {
+		ensureCalls++
+		return nil
+	}
+	validateTiDBSchemaForMode = func(context.Context, *sql.DB, schema.TiDBEmbeddingMode) error {
+		validateCalls++
+		return nil
+	}
+	periodicTiDBSchemaValidationEvery = 4
+	t.Cleanup(func() {
+		ensureTiDBSchemaForMode = origEnsure
+		validateTiDBSchemaForMode = origValidate
+		periodicTiDBSchemaValidationEvery = origEvery
+	})
+
+	for i := 0; i < 4; i++ {
+		backend, store, err := pool.createBackend(context.Background(), tenant)
+		if err != nil {
+			t.Fatalf("createBackend() iteration %d: %v", i, err)
+		}
+		backend.Close()
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store iteration %d: %v", i, err)
+		}
+	}
+
+	if ensureCalls != 0 {
+		t.Fatalf("ensureTiDBSchemaForMode called %d times, want 0", ensureCalls)
+	}
+	if validateCalls != 2 {
+		t.Fatalf("validateTiDBSchemaForMode called %d times, want 2", validateCalls)
+	}
+}
+
+func TestPoolCreateBackendReturnsValidationErrorWhenPeriodicCheckFails(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-validate-fail")
+	tenant.Provider = ProviderTiDBZero
+	tenant.SchemaVersion = schema.CurrentTiDBTenantSchemaVersion
+
+	origEnsure := ensureTiDBSchemaForMode
+	origValidate := validateTiDBSchemaForMode
+	origEvery := periodicTiDBSchemaValidationEvery
+	ensureTiDBSchemaForMode = func(context.Context, *sql.DB, schema.TiDBEmbeddingMode) error {
+		return nil
+	}
+	validateTiDBSchemaForMode = func(context.Context, *sql.DB, schema.TiDBEmbeddingMode) error {
+		return fmt.Errorf("schema drift")
+	}
+	periodicTiDBSchemaValidationEvery = 1
+	t.Cleanup(func() {
+		ensureTiDBSchemaForMode = origEnsure
+		validateTiDBSchemaForMode = origValidate
+		periodicTiDBSchemaValidationEvery = origEvery
+	})
+
+	if _, _, err := pool.createBackend(context.Background(), tenant); err == nil {
+		t.Fatal("expected periodic validation failure to propagate")
+	} else if !strings.Contains(err.Error(), "validate tidb auto-embedding schema") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// This test reads global metrics emitted by recordTenantSchemaVersionUpdateFailure
+// via operationMetricValue, so it must stay non-parallel unless the metric state
+// is isolated.
+func TestRecordTenantSchemaVersionUpdateFailureRecordsMetric(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	before := operationMetricValue(t, recorder.Body.String(), `component="tenant_pool",operation="update_schema_version_failed",result="error"`)
+
+	recordTenantSchemaVersionUpdateFailure(context.Background(), "tenant-metric", 42, time.Millisecond, fmt.Errorf("meta unavailable"))
+
+	recorder = httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	after := operationMetricValue(t, recorder.Body.String(), `component="tenant_pool",operation="update_schema_version_failed",result="error"`)
+	if after != before+1 {
+		t.Fatalf("expected update_schema_version_failed metric to increment by 1, before=%d after=%d", before, after)
+	}
+}
+
+func operationMetricValue(t *testing.T, output, labels string) uint64 {
+	t.Helper()
+	prefix := `dat9_service_operations_total{` + labels + `} `
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		value, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, prefix)), 10, 64)
+		if err != nil {
+			t.Fatalf("parse metric %q: %v", line, err)
+		}
+		return value
+	}
+	return 0
 }
 
 type poolDummyAudioExtractor struct{}

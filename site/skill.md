@@ -1,6 +1,6 @@
 ---
 name: drive9
-version: 0.1.0
+version: 0.1.1
 description: Persistent network filesystem for AI agents — store, search, and share files across sessions with hybrid search.
 homepage: https://drive9.ai
 ---
@@ -59,6 +59,7 @@ Remote paths use `:` prefix (e.g. `:/data/file.txt`). Local paths have no prefix
 # upload
 drive9 fs cp ./local.txt :/remote.txt
 drive9 fs cp - :/file.txt                  # from stdin
+drive9 fs cp --tag topic=pricing --tag owner=agent ./plan.md :/notes/plan.md
 
 # download
 drive9 fs cp :/remote.txt ./local.txt
@@ -71,7 +72,12 @@ drive9 fs cp :/src.txt :/dst.txt
 drive9 fs cat :/path/to/file               # print content to stdout
 drive9 fs ls :/                            # list root
 drive9 fs ls :/path/                       # list subdirectory
-drive9 fs stat :/path/to/file              # metadata (size, type, mtime)
+drive9 fs stat :/path/to/file              # text metadata (size, type, mtime)
+drive9 fs stat -o json :/path/to/file      # JSON metadata
+
+# inspect semantic metadata and tags
+drive9 fs stat :/notes/plan.md             # includes semantic_text and tags
+drive9 fs stat -o json :/notes/plan.md     # JSON includes semantic_text and tags object
 
 # move / remove
 drive9 fs mv :/old.txt :/new.txt
@@ -81,6 +87,8 @@ drive9 fs rm -r :/path/to/dir/
 # interactive shell
 drive9 fs sh
 ```
+
+Use `drive9 fs cp --tag` only for uploads from local->remote or stdin->remote. Any provided `--tag` flags replace the file's existing tag set on re-upload; omit `--tag` to preserve existing tags. Do not use `drive9 fs cp --tag` for remote->local or remote->remote transfers, and do not combine it with `--append`.
 
 ### FUSE mount
 
@@ -107,11 +115,19 @@ Output: one line per match — `<path>\t<score>` (tab-separated). Empty output m
 ```bash
 drive9 fs find / -name "*.md"
 drive9 fs find / -tag topic=pricing
+drive9 fs find /notes/ -tag owner=agent
+drive9 fs find /notes/ -tag owner
 drive9 fs find / -newer 2026-03-01
 drive9 fs find / -older 2026-01-01
 drive9 fs find / -size +1048576
 drive9 fs find / -name "*.md" -newer 2026-03-01
 ```
+
+Tag filter semantics (`-tag`) are exact, not fuzzy:
+
+- `-tag key=value` matches files where both `tag_key` and `tag_value` are equal.
+- `-tag key` matches files that contain that tag key (value ignored).
+- Prefix / contains / regex matching is not supported for `-tag`.
 
 Output: one path per line. Empty output means no matches.
 
@@ -124,7 +140,7 @@ Use `grep` to find files by what they contain. Use `find` to find files by name,
 | `fs ls` | one entry per line, directories end with `/` |
 | `fs ls -l` | tab-separated: `type  size  name` (type: `d` or `-`) |
 | `fs cat` | raw file content to stdout |
-| `fs stat` | key-value lines: `size`, `isdir`, `revision` |
+| `fs stat` | key-value text lines by default; use `-o json` / `--output json` for JSON |
 | `fs grep` | tab-separated: `path  score` per match |
 | `fs find` | one path per line |
 

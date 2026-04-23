@@ -237,13 +237,19 @@ commands:
 }
 
 func fsUsage() {
+	// Keep this usage block visually aligned. When editing wrapped help text,
+	// preserve the column layout so subcommand descriptions remain easy to scan.
 	fmt.Fprintf(os.Stderr, `usage: drive9 fs <command> [arguments]
 
 commands:
   cp <src> <dst>       copy files (local↔remote)
+    --tag <key=value>  set file tag (repeatable, upload only; not with --append;
+                       any --tag on re-upload replaces the existing tag set;
+                       omit --tag to preserve existing tags)
   cat <path>           read file to stdout
   ls [path]            list directory
-  stat <path>          file metadata
+  stat [-o text|json] <path>
+                       file metadata
   mv <old> <new>       rename/move
   rm [-r|--recursive] <path>
                        remove file or directory tree
@@ -251,7 +257,8 @@ commands:
   grep <pattern> [dir] search file contents
   find [dir] [flags]   find files by attributes
     -name <glob>         match filename
-    -tag <key=value>     match tag
+    -tag <key=value>     exact match tag key/value
+    -tag <key>           match files containing tag key
     -newer <YYYY-MM-DD>  modified after date
     -older <YYYY-MM-DD>  modified before date
     -size <+N|-N>        size filter in bytes

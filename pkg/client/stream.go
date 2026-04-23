@@ -244,7 +244,7 @@ func (sw *StreamWriter) Complete(ctx context.Context, finalPartNum int, finalPar
 	}
 
 	sw.completed = true
-	return sw.client.completeUploadV2(ctx, sw.plan.UploadID, parts)
+	return sw.client.completeUploadV2(ctx, sw.plan.UploadID, parts, nil)
 }
 
 // Abort cancels the multipart upload and cleans up server-side state.

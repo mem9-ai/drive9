@@ -138,7 +138,7 @@ func initTiDBAppEmbeddingSchema(ctx context.Context, dsn string, opts InitTiDBTe
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	if !IsTiDBCluster(db) {
+	if !IsTiDBCluster(ctx, db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
 	if err := ExecSchemaStatements(db, tidbAppEmbeddingBaseSchemaStatements()); err != nil {
@@ -159,5 +159,5 @@ func initTiDBAppEmbeddingSchema(ctx context.Context, dsn string, opts InitTiDBTe
 	} else if err := ExecSchemaStatements(db, tidbAppEmbeddingOptionalSchemaStatements()); err != nil {
 		return err
 	}
-	return ValidateTiDBSchemaForMode(db, TiDBEmbeddingModeApp)
+	return ValidateTiDBSchemaForMode(ctx, db, TiDBEmbeddingModeApp)
 }
