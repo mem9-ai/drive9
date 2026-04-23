@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
@@ -39,14 +40,24 @@ type PoolConfig struct {
 }
 
 type Pool struct {
-	mu        sync.Mutex
-	cfg       PoolConfig
-	enc       encrypt.Encryptor
-	metaStore *meta.Store // central server DB for quota operations; nil disables central quota
-	items     map[string]*entry
-	order     *list.List
-	maxSize   int
+	mu                        sync.Mutex
+	cfg                       PoolConfig
+	enc                       encrypt.Encryptor
+	metaStore                 *meta.Store // central server DB for quota operations; nil disables central quota
+	items                     map[string]*entry
+	order                     *list.List
+	maxSize                   int
+	tidbSchemaValidationOpens atomic.Uint64
 }
+
+var (
+	ensureTiDBSchemaForMode   = schema.EnsureTiDBSchemaForMode
+	validateTiDBSchemaForMode = schema.ValidateTiDBSchemaForMode
+	// Validate once on the first version-matched open after process start, then
+	// periodically thereafter to catch out-of-band schema drift without putting a
+	// full schema diff on every tenant open.
+	periodicTiDBSchemaValidationEvery uint64 = 32
+)
 
 type entry struct {
 	tenantID string
@@ -323,12 +334,36 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	openStoreDurationMs := float64(time.Since(openStoreStart).Microseconds()) / 1000.0
 	ensureSchemaDurationMs := 0.0
 	if opts.DatabaseAutoEmbedding && (t.Provider == ProviderTiDBZero || t.Provider == ProviderTiDBCloudStarter) {
-		ensureSchemaStart := time.Now()
-		if err := schema.EnsureTiDBSchemaForMode(store.DB(), schema.TiDBEmbeddingModeAuto); err != nil {
-			_ = store.Close()
-			return nil, nil, fmt.Errorf("ensure tidb auto-embedding schema: %w", err)
+		if t.SchemaVersion != schema.CurrentTiDBTenantSchemaVersion {
+			ensureSchemaStart := time.Now()
+			if err := ensureTiDBSchemaForMode(ctx, store.DB(), schema.TiDBEmbeddingModeAuto); err != nil {
+				_ = store.Close()
+				return nil, nil, fmt.Errorf("ensure tidb auto-embedding schema: %w", err)
+			}
+			ensureSchemaDurationMs = float64(time.Since(ensureSchemaStart).Microseconds()) / 1000.0
+			if p.metaStore != nil {
+				// Record the version only after EnsureTiDBSchemaForMode has
+				// succeeded. EnsureTiDBSchemaForMode ends with a call to
+				// ValidateTiDBSchemaForMode, so by the time we reach this
+				// point the schema has been confirmed to match the spec.
+				// Any tenant whose schema diverges between two consecutive
+				// opens will be caught on the next open because its stored
+				// version will differ from CurrentTiDBTenantSchemaVersion.
+				if verErr := p.metaStore.UpdateTenantSchemaVersion(ctx, t.ID, schema.CurrentTiDBTenantSchemaVersion); verErr != nil {
+					logger.Warn(ctx, "tenant_pool_update_schema_version_failed",
+						zap.String("tenant_id", t.ID),
+						zap.Int("version", schema.CurrentTiDBTenantSchemaVersion),
+						zap.Error(verErr))
+				}
+			}
+		} else if p.shouldPeriodicValidateTiDBSchemaOnOpen() {
+			validateSchemaStart := time.Now()
+			if err := validateTiDBSchemaForMode(ctx, store.DB(), schema.TiDBEmbeddingModeAuto); err != nil {
+				_ = store.Close()
+				return nil, nil, fmt.Errorf("validate tidb auto-embedding schema: %w", err)
+			}
+			ensureSchemaDurationMs = float64(time.Since(validateSchemaStart).Microseconds()) / 1000.0
 		}
-		ensureSchemaDurationMs = float64(time.Since(ensureSchemaStart).Microseconds()) / 1000.0
 	}
 	if p.cfg.S3Bucket != "" {
 		prefix := strings.Trim(p.cfg.S3Prefix, "/")
@@ -424,6 +459,18 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	p.wireQuotaStore(b, t.ID)
 	return b, store, nil
+}
+
+func (p *Pool) shouldPeriodicValidateTiDBSchemaOnOpen() bool {
+	if p == nil {
+		return false
+	}
+	every := periodicTiDBSchemaValidationEvery
+	if every == 0 {
+		return false
+	}
+	count := p.tidbSchemaValidationOpens.Add(1)
+	return count == 1 || count%every == 0
 }
 
 // wireQuotaStore sets the central quota store on a newly created backend.

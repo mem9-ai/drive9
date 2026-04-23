@@ -2,6 +2,7 @@ package meta
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -142,4 +143,140 @@ func TestListTenantsByStatus(t *testing.T) {
 	if got[0].Status != TenantProvisioning || got[1].Status != TenantProvisioning {
 		t.Fatalf("unexpected statuses: %s, %s", got[0].Status, got[1].Status)
 	}
+}
+
+func TestMetaSchemaSpecFromStatementsParsesNewTable(t *testing.T) {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS tenant_custom_events (
+			event_id VARCHAR(64) PRIMARY KEY,
+			tenant_id VARCHAR(64) NOT NULL,
+			payload JSON,
+			created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			INDEX idx_tenant_custom_events_tenant (tenant_id)
+		)`,
+	}
+	spec, err := metaSchemaSpecFromStatements(stmts)
+	if err != nil {
+		t.Fatalf("metaSchemaSpecFromStatements: %v", err)
+	}
+	table := mustMetaTableSpec(t, spec, "tenant_custom_events")
+	if _, ok := table.columns["tenant_id"]; !ok {
+		t.Fatal("expected tenant_id in parsed columns")
+	}
+	if _, ok := table.indexes["idx_tenant_custom_events_tenant"]; !ok {
+		t.Fatal("expected idx_tenant_custom_events_tenant in parsed indexes")
+	}
+}
+
+func TestDiffMetaTableMetaReportsMissingColumnAndIndex(t *testing.T) {
+	spec := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_api_keys")
+	meta := metaTableMeta{
+		tableName: "tenant_api_keys",
+		columns: map[string]metaColumnMeta{
+			"id":             {columnType: "varchar(64)"},
+			"tenant_id":      {columnType: "varchar(64)"},
+			"jwt_ciphertext": {columnType: "varbinary(4096)"},
+			"jwt_hash":       {columnType: "varchar(128)"},
+		},
+	}
+	createStmt := `CREATE TABLE tenant_api_keys (
+		id VARCHAR(64) PRIMARY KEY,
+		tenant_id VARCHAR(64) NOT NULL,
+		jwt_ciphertext VARBINARY(4096) NOT NULL,
+		jwt_hash VARCHAR(128) NOT NULL
+	)`
+	diffs := diffMetaTableMeta(spec, meta, createStmt)
+	if !hasMetaDiff(diffs, metaSchemaDiffMissingColumn, "key_name") {
+		t.Fatalf("expected missing key_name diff, got %#v", diffs)
+	}
+	if !hasMetaDiff(diffs, metaSchemaDiffMissingIndex, "idx_api_keys_tenant") {
+		t.Fatalf("expected missing idx_api_keys_tenant diff, got %#v", diffs)
+	}
+}
+
+func TestMetaSchemaSpecTracksPrimaryKeyConstraint(t *testing.T) {
+	spec := mustMetaSpec(t)
+	table := mustMetaTableSpec(t, spec, "tenant_quota_config")
+	pk, ok := table.indexes["primary"]
+	if !ok {
+		t.Fatal("expected primary key constraint to be tracked in schema spec")
+	}
+	if !pk.isPrimary {
+		t.Fatal("expected primary constraint marker")
+	}
+}
+
+func TestDiffMetaTableMetaReportsMissingPrimaryKeyConstraint(t *testing.T) {
+	spec := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_quota_config")
+	meta := metaTableMeta{
+		tableName: "tenant_quota_config",
+		columns: map[string]metaColumnMeta{
+			"tenant_id":           {columnType: "varchar(64)"},
+			"max_storage_bytes":   {columnType: "bigint"},
+			"max_media_llm_files": {columnType: "bigint"},
+			"max_monthly_cost_mc": {columnType: "bigint"},
+			"created_at":          {columnType: "datetime(3)"},
+			"updated_at":          {columnType: "datetime(3)"},
+		},
+	}
+	createStmt := `CREATE TABLE tenant_quota_config (
+		tenant_id VARCHAR(64) NOT NULL,
+		max_storage_bytes BIGINT NOT NULL,
+		max_media_llm_files BIGINT NOT NULL,
+		max_monthly_cost_mc BIGINT NOT NULL,
+		created_at DATETIME(3) NOT NULL,
+		updated_at DATETIME(3) NOT NULL
+	)`
+	diffs := diffMetaTableMeta(spec, meta, createStmt)
+	if !hasMetaDiff(diffs, metaSchemaDiffMissingIndex, "missing primary key constraint") {
+		t.Fatalf("expected missing primary key diff, got %#v", diffs)
+	}
+}
+
+func TestPlannedMetaSchemaRepairsSkipsUnsafeRepairs(t *testing.T) {
+	diffs := []metaSchemaDiff{
+		{kind: metaSchemaDiffMissingColumn, tableName: "tenant_api_keys", columnName: "must_fill", repairSQL: "ALTER TABLE tenant_api_keys ADD COLUMN must_fill BIGINT NOT NULL"},
+		{kind: metaSchemaDiffMissingIndex, tableName: "tenant_api_keys", indexName: "uk_key_name", repairSQL: "CREATE UNIQUE INDEX uk_key_name ON tenant_api_keys(key_name)"},
+		{kind: metaSchemaDiffMissingIndex, tableName: "tenant_api_keys", indexName: "idx_api_keys_tenant", repairSQL: "CREATE INDEX idx_api_keys_tenant ON tenant_api_keys(tenant_id, status)"},
+	}
+
+	plans := plannedMetaSchemaRepairs(diffs)
+	if len(plans) != 1 {
+		t.Fatalf("expected exactly one safe repair, got %#v", plans)
+	}
+	if plans[0] != "CREATE INDEX idx_api_keys_tenant ON tenant_api_keys(tenant_id, status)" {
+		t.Fatalf("unexpected plan: %#v", plans)
+	}
+}
+
+func mustMetaSpec(t *testing.T) metaSchemaSpec {
+	t.Helper()
+	spec, err := metaSchemaSpecFromStatements(metaInitSchemaStatements())
+	if err != nil {
+		t.Fatalf("meta schema spec: %v", err)
+	}
+	return spec
+}
+
+func mustMetaTableSpec(t *testing.T, spec metaSchemaSpec, tableName string) metaTableSpec {
+	t.Helper()
+	for _, table := range spec.tables {
+		if table.name == tableName {
+			return table
+		}
+	}
+	t.Fatalf("missing table %q in meta schema spec", tableName)
+	return metaTableSpec{}
+}
+
+func hasMetaDiff(diffs []metaSchemaDiff, kind metaSchemaDiffKind, contains string) bool {
+	for _, diff := range diffs {
+		if diff.kind != kind {
+			continue
+		}
+		if strings.Contains(strings.ToLower(diff.detail), strings.ToLower(contains)) {
+			return true
+		}
+	}
+	return false
 }

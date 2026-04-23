@@ -27,8 +27,9 @@ func TestDetectLocalTiDBEmbeddingMode(t *testing.T) {
 		localTiDBEmbeddingModeDetector = origDetector
 		localTiDBSchemaValidator = origValidator
 	})
+	ctx := context.Background()
 
-	mode, err := detectLocalTiDBEmbeddingMode(nil, true, schema.TiDBEmbeddingModeApp, true)
+	mode, err := detectLocalTiDBEmbeddingMode(ctx, nil, true, schema.TiDBEmbeddingModeApp, true)
 	if err != nil {
 		t.Fatalf("schema-initialized explicit app mode returned error: %v", err)
 	}
@@ -39,7 +40,7 @@ func TestDetectLocalTiDBEmbeddingMode(t *testing.T) {
 	localTiDBEmbeddingModeDetector = func(*sql.DB) (schema.TiDBEmbeddingMode, error) {
 		return schema.TiDBEmbeddingModeUnknown, errors.New("should not be called")
 	}
-	mode, err = detectLocalTiDBEmbeddingMode(nil, true, schema.TiDBEmbeddingModeUnknown, false)
+	mode, err = detectLocalTiDBEmbeddingMode(ctx, nil, true, schema.TiDBEmbeddingModeUnknown, false)
 	if err != nil {
 		t.Fatalf("schema-initialized default mode returned error: %v", err)
 	}
@@ -47,8 +48,8 @@ func TestDetectLocalTiDBEmbeddingMode(t *testing.T) {
 		t.Fatalf("schema-initialized default mode=%q, want %q", mode, schema.TiDBEmbeddingModeAuto)
 	}
 
-	localTiDBSchemaValidator = func(*sql.DB, schema.TiDBEmbeddingMode) error { return nil }
-	mode, err = detectLocalTiDBEmbeddingMode(&sql.DB{}, false, schema.TiDBEmbeddingModeApp, true)
+	localTiDBSchemaValidator = func(context.Context, *sql.DB, schema.TiDBEmbeddingMode) error { return nil }
+	mode, err = detectLocalTiDBEmbeddingMode(ctx, &sql.DB{}, false, schema.TiDBEmbeddingModeApp, true)
 	if err != nil {
 		t.Fatalf("explicit app mode returned error: %v", err)
 	}
@@ -59,7 +60,7 @@ func TestDetectLocalTiDBEmbeddingMode(t *testing.T) {
 	localTiDBEmbeddingModeDetector = func(*sql.DB) (schema.TiDBEmbeddingMode, error) {
 		return schema.TiDBEmbeddingModeAuto, nil
 	}
-	mode, err = detectLocalTiDBEmbeddingMode(&sql.DB{}, false, schema.TiDBEmbeddingModeUnknown, false)
+	mode, err = detectLocalTiDBEmbeddingMode(ctx, &sql.DB{}, false, schema.TiDBEmbeddingModeUnknown, false)
 	if err != nil {
 		t.Fatalf("detect auto mode returned error: %v", err)
 	}
@@ -70,7 +71,7 @@ func TestDetectLocalTiDBEmbeddingMode(t *testing.T) {
 	localTiDBEmbeddingModeDetector = func(*sql.DB) (schema.TiDBEmbeddingMode, error) {
 		return schema.TiDBEmbeddingModeApp, nil
 	}
-	mode, err = detectLocalTiDBEmbeddingMode(&sql.DB{}, false, schema.TiDBEmbeddingModeUnknown, false)
+	mode, err = detectLocalTiDBEmbeddingMode(ctx, &sql.DB{}, false, schema.TiDBEmbeddingModeUnknown, false)
 	if err != nil {
 		t.Fatalf("detect app mode returned error: %v", err)
 	}
@@ -81,17 +82,17 @@ func TestDetectLocalTiDBEmbeddingMode(t *testing.T) {
 	localTiDBEmbeddingModeDetector = func(*sql.DB) (schema.TiDBEmbeddingMode, error) {
 		return schema.TiDBEmbeddingModeUnknown, nil
 	}
-	if _, err := detectLocalTiDBEmbeddingMode(&sql.DB{}, false, schema.TiDBEmbeddingModeUnknown, false); err == nil {
+	if _, err := detectLocalTiDBEmbeddingMode(ctx, &sql.DB{}, false, schema.TiDBEmbeddingModeUnknown, false); err == nil {
 		t.Fatal("expected unknown mode to fail")
 	}
 
 	localTiDBEmbeddingModeDetector = func(*sql.DB) (schema.TiDBEmbeddingMode, error) {
 		return schema.TiDBEmbeddingModeAuto, nil
 	}
-	localTiDBSchemaValidator = func(*sql.DB, schema.TiDBEmbeddingMode) error {
+	localTiDBSchemaValidator = func(context.Context, *sql.DB, schema.TiDBEmbeddingMode) error {
 		return errors.New("bad schema")
 	}
-	if _, err := detectLocalTiDBEmbeddingMode(&sql.DB{}, false, schema.TiDBEmbeddingModeUnknown, false); err == nil {
+	if _, err := detectLocalTiDBEmbeddingMode(ctx, &sql.DB{}, false, schema.TiDBEmbeddingModeUnknown, false); err == nil {
 		t.Fatal("expected validation failure to propagate")
 	}
 }
