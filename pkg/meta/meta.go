@@ -249,6 +249,7 @@ type metaTableSpec struct {
 type metaColumnSpec struct {
 	columnType string
 	addSQL     string
+	modifySQL  string
 }
 
 type metaIndexSpec struct {
@@ -271,7 +272,7 @@ func metaInitSchemaStatements() []string {
 			cluster_id       VARCHAR(255) NULL,
 			claim_url        TEXT NULL,
 			claim_expires_at DATETIME(3) NULL,
-			schema_version   INT NOT NULL DEFAULT 1,
+			schema_version   INT UNSIGNED NOT NULL DEFAULT 1,
 			created_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			deleted_at       DATETIME(3) NULL,
@@ -488,6 +489,7 @@ func diffMetaTableMetaWithObservedIndexes(table metaTableSpec, meta metaTableMet
 				tableName:  table.name,
 				columnName: name,
 				detail:     fmt.Sprintf("%s schema contract: %s column type = %q, want %s", table.name, name, col.columnType, spec.columnType),
+				repairSQL:  spec.modifySQL,
 			})
 		}
 	}
@@ -671,6 +673,7 @@ func parseMetaColumnDefinition(tableName, def string) (string, metaColumnSpec, b
 	return strings.ToLower(name), metaColumnSpec{
 		columnType: strings.ToLower(strings.TrimSpace(colType)),
 		addSQL:     fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, name, strings.TrimSpace(rest)),
+		modifySQL:  fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s", tableName, name, strings.TrimSpace(rest)),
 	}, true
 }
 
@@ -702,6 +705,8 @@ func isSafeMetaRepairDiff(diff metaSchemaDiff, tableMissing map[string]bool) boo
 			return tableMissing[diff.tableName]
 		}
 		return false
+	case metaSchemaDiffColumnType:
+		return isSafeModifyColumnRepairSQL(diff.repairSQL)
 	default:
 		return false
 	}
@@ -709,6 +714,15 @@ func isSafeMetaRepairDiff(diff metaSchemaDiff, tableMissing map[string]bool) boo
 
 func isSafeAddColumnRepairSQL(sqlText string) bool {
 	return schemaspec.IsSafeAddColumnRepairSQL(sqlText)
+}
+
+// isSafeModifyColumnRepairSQL returns true for MODIFY COLUMN statements that
+// only widen a column type without data loss (e.g. INT → INT UNSIGNED).
+func isSafeModifyColumnRepairSQL(sqlText string) bool {
+	n := normalizeMetaSQLFragment(sqlText)
+	// Only allow: ALTER TABLE <t> MODIFY COLUMN <col> INT UNSIGNED ...
+	// This covers the schema_version INT → INT UNSIGNED upgrade path.
+	return strings.Contains(n, " modify column ") && strings.Contains(n, " int unsigned ")
 }
 
 func isIgnorableMetaSchemaError(err error) bool {
