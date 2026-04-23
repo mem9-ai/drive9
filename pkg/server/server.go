@@ -662,7 +662,15 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			return
 		}
 		if errors.Is(err, datastore.ErrRevisionConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_conflict", "path", path, "error", err)...)
+			fields := eventFields(r.Context(), "write_conflict", "path", path, "error", err, "expected_revision", expectedRevision)
+			if nf, statErr := b.StatNodeCtx(r.Context(), path); statErr == nil && nf != nil && nf.File != nil {
+				fields = append(fields, zap.Int64("current_revision", nf.File.Revision))
+			} else if errors.Is(statErr, datastore.ErrNotFound) {
+				fields = append(fields, zap.String("current_revision", "not_found"))
+			} else if statErr != nil {
+				fields = append(fields, zap.String("current_revision", "unknown"), zap.String("current_revision_error", statErr.Error()))
+			}
+			logger.Warn(r.Context(), "server_event", fields...)
 			metricEvent(r.Context(), "fs_write", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return

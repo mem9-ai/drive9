@@ -1485,6 +1485,68 @@ func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.
 	}
 }
 
+func TestApplyAsyncCommittedRevision_UpdatesInodeAndCleanHandlesOnly(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	ino := fs.inodes.Lookup("/async.bin", false, 8, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+
+	clean := &FileHandle{
+		Ino:      ino,
+		Path:     "/async.bin",
+		Dirty:    NewWriteBuffer("/async.bin", maxPreloadSize, 0),
+		BaseRev:  7,
+		IsNew:    true,
+		ZeroBase: true,
+		Streamer: NewStreamUploader(nil, "/async.bin", 7),
+	}
+	clean.Streamer.started = true
+	clean.Streamer.streamedParts[1] = true
+	if _, err := clean.Dirty.Write(0, []byte("existing")); err != nil {
+		t.Fatal(err)
+	}
+	clean.Dirty.ClearDirty()
+
+	dirty := &FileHandle{
+		Ino:     ino,
+		Path:    "/async.bin",
+		Dirty:   NewWriteBuffer("/async.bin", maxPreloadSize, 0),
+		BaseRev: 7,
+	}
+	if _, err := dirty.Dirty.Write(0, []byte("pending")); err != nil {
+		t.Fatal(err)
+	}
+
+	fs.fileHandles.Allocate(clean)
+	fs.fileHandles.Allocate(dirty)
+
+	fs.applyAsyncCommittedRevision("/async.bin", 8)
+
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if entry.Revision != 8 {
+		t.Fatalf("inode revision = %d, want 8", entry.Revision)
+	}
+	if clean.BaseRev != 8 {
+		t.Fatalf("clean handle BaseRev = %d, want 8", clean.BaseRev)
+	}
+	if clean.IsNew {
+		t.Fatal("clean handle should no longer be marked new")
+	}
+	if clean.ZeroBase {
+		t.Fatal("clean handle should clear zero-base after successful async commit")
+	}
+	if got := clean.Streamer.ExpectedRevision(); got != 8 {
+		t.Fatalf("clean streamer expected revision = %d, want 8", got)
+	}
+	if dirty.BaseRev != 7 {
+		t.Fatalf("dirty handle BaseRev = %d, want 7", dirty.BaseRev)
+	}
+}
+
 func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 	const callerPID = 4242
 

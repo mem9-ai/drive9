@@ -100,6 +100,21 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 func (fs *Dat9FS) SetWriteBack(cache *WriteBackCache, uploader *WriteBackUploader) {
 	fs.writeBack = cache
 	fs.uploader = uploader
+	if uploader != nil {
+		// Keep FUSE's in-memory revision view aligned with successful async uploads.
+		uploader.SetSuccessCallback(fs.applyAsyncCommittedRevision)
+	}
+}
+
+// SetCommitQueue configures the async commit queue on the filesystem.
+// Must be called before the filesystem starts serving requests.
+func (fs *Dat9FS) SetCommitQueue(cq *CommitQueue) {
+	fs.commitQueue = cq
+	if cq != nil {
+		// Commit queue workers complete after Release returns, so they must repair
+		// cached inode/handle revisions on the filesystem side.
+		cq.SetSuccessCallback(fs.applyAsyncCommittedRevision)
+	}
 }
 
 // flushPendingWriteBack synchronously uploads a pending write-back cache
@@ -271,6 +286,43 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 			if err := fs.shadowStore.Ensure(fh.Path, size, revision); err != nil {
 				log.Printf("shadow base revision refresh failed for %s: %v", fh.Path, err)
 			}
+		}
+		fh.Unlock()
+	}
+}
+
+// applyAsyncCommittedRevision updates FUSE-side cached state after a background
+// upload commits remotely. It only refreshes clean handles; a handle with local
+// dirty data must keep its older BaseRev so a stale remote success does not mask
+// newer uncommitted local edits.
+func (fs *Dat9FS) applyAsyncCommittedRevision(remotePath string, revision int64) {
+	if revision <= 0 {
+		return
+	}
+
+	if ino, ok := fs.inodes.GetInode(remotePath); ok {
+		fs.inodes.UpdateRevision(ino, revision)
+	}
+
+	for _, fh := range fs.fileHandles.Snapshot() {
+		if fh == nil || fh.Path != remotePath || fh.Dirty == nil {
+			continue
+		}
+
+		fh.Lock()
+		// Do not advance a handle that still has dirty pages. That handle now
+		// represents a newer local snapshot than the async commit that just finished.
+		if fh.Dirty.HasDirtyParts() {
+			fh.Unlock()
+			continue
+		}
+		fh.IsNew = false
+		fh.BaseRev = revision
+		if fh.Streamer != nil {
+			fh.Streamer.ResetForNextWrite(expectedRevisionForHandle(fh))
+		}
+		if fh.ZeroBase && fh.Dirty.Size() > 0 {
+			fh.ZeroBase = false
 		}
 		fh.Unlock()
 	}

@@ -659,9 +659,9 @@ if is_mounted "$MOUNT_POINT"; then
   size2="${stat2%%:*}"
   mtime2="${stat2##*:}"
   remote_attr_size=$(wait_remote_stat_field_eq "$RW_ATTR_REMOTE" "size" "$size2")
-  check_cmd "mounted size increases after append" test "$size2" -gt "$size1"
-  check_cmd "mounted mtime is monotonic" test "$mtime2" -ge "$mtime1"
-  check_eq "remote stat size matches mounted size" "$remote_attr_size" "$size2"
+  check_cmd "mounted size increases after append (before=$size1 after=$size2)" test "$size2" -gt "$size1"
+  check_cmd "mounted mtime is monotonic (before=$mtime1 after=$mtime2)" test "$mtime2" -ge "$mtime1"
+  check_eq "remote stat size matches mounted size (remote=$remote_attr_size local=$size2)" "$remote_attr_size" "$size2"
 
   echo "[7] readdir semantics"
   alpha_ls=$(ls -1 "$RW_ALPHA_MOUNT")

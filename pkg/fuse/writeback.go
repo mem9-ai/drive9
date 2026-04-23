@@ -37,6 +37,18 @@ const (
 	PendingConflict
 )
 
+func committedRevisionForPending(kind PendingKind, baseRev int64) (int64, bool) {
+	switch kind {
+	case PendingNew:
+		return 1, true
+	case PendingOverwrite:
+		if baseRev > 0 {
+			return baseRev + 1, true
+		}
+	}
+	return 0, false
+}
+
 // WriteBackMeta stores metadata alongside cached file data so that the
 // background uploader (and crash-recovery) knows the remote path and size.
 type WriteBackMeta struct {

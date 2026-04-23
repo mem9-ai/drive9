@@ -40,6 +40,8 @@ type CommitQueue struct {
 	// workCh dispatches entries to upload workers. The buffer is always
 	// larger than maxPending so Enqueue never blocks.
 	workCh chan *CommitEntry
+
+	onSuccess func(path string, committedRevision int64)
 }
 
 // NewCommitQueue creates a CommitQueue with background workers.
@@ -72,6 +74,13 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 	return cq
 }
 
+// SetSuccessCallback installs a hook that runs after an async commit succeeds.
+// committedRevision is the post-commit remote revision when it can be derived
+// from the queued entry metadata. Callers should set the hook before starting uploads.
+func (cq *CommitQueue) SetSuccessCallback(fn func(path string, committedRevision int64)) {
+	cq.onSuccess = fn
+}
+
 // Enqueue adds a commit entry to the queue. Returns an error if the queue
 // is full (backpressure).
 func (cq *CommitQueue) Enqueue(entry *CommitEntry) error {
@@ -83,6 +92,8 @@ func (cq *CommitQueue) Enqueue(entry *CommitEntry) error {
 	if len(cq.queue) >= cq.maxPending {
 		return fmt.Errorf("commit queue full (%d pending)", cq.maxPending)
 	}
+	// The entry is a snapshot of the caller's close-time view. Workers use this
+	// frozen BaseRev later, so any path-level coalescing must happen before append.
 	cq.queue = append(cq.queue, entry)
 
 	// Send to workers while holding the lock. The channel buffer is always
@@ -408,6 +419,14 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry) {
 	cq.removeFromQueue(entry)
 
 	log.Printf("commit queue: successfully uploaded %s (%d bytes)", entry.Path, entry.Size)
+	if committedRev, ok := committedRevisionForPending(entry.Kind, entry.BaseRev); ok {
+		if cq.onSuccess != nil {
+			cq.onSuccess(entry.Path, committedRev)
+		}
+		log.Printf("commit queue: async commit success for %s: base_rev=%d committed_rev=%d kind=%d; refreshed FUSE revision state", entry.Path, entry.BaseRev, committedRev, entry.Kind)
+	} else {
+		log.Printf("commit queue: async commit success for %s: base_rev=%d kind=%d; committed revision unknown, FUSE revision state unchanged", entry.Path, entry.BaseRev, entry.Kind)
+	}
 }
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {

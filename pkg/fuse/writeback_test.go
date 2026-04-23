@@ -300,6 +300,7 @@ func TestWriteBackUploader_PendingNewUsesCreateIfAbsent(t *testing.T) {
 
 func TestWriteBackUploader_PendingOverwriteUsesBaseRevision(t *testing.T) {
 	var gotExpected string
+	var gotCommitted int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
 			gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
@@ -314,6 +315,9 @@ func TestWriteBackUploader_PendingOverwriteUsesBaseRevision(t *testing.T) {
 	cache, _ := NewWriteBackCache(dir)
 	c := client.New(ts.URL, "")
 	uploader := NewWriteBackUploader(c, cache, 1)
+	uploader.SetSuccessCallback(func(_ string, committedRevision int64) {
+		gotCommitted = committedRevision
+	})
 
 	_ = cache.PutWithBaseRev("/existing.txt", []byte("edit"), 4, PendingOverwrite, 23)
 	uploader.Submit("/existing.txt")
@@ -321,6 +325,9 @@ func TestWriteBackUploader_PendingOverwriteUsesBaseRevision(t *testing.T) {
 
 	if gotExpected != "23" {
 		t.Fatalf("X-Dat9-Expected-Revision = %q, want %q", gotExpected, "23")
+	}
+	if gotCommitted != 24 {
+		t.Fatalf("committed revision callback = %d, want 24", gotCommitted)
 	}
 }
 
