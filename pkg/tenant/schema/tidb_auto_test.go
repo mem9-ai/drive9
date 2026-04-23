@@ -1,8 +1,14 @@
 package schema
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
 	"errors"
+	"io"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	mysql "github.com/go-sql-driver/mysql"
@@ -222,6 +228,50 @@ func TestPlannedTiDBSchemaRepairsAllowsUniqueIndexOnExistingTable(t *testing.T) 
 	}
 }
 
+func TestParseUniqueIndexRepairStatement(t *testing.T) {
+	repair, ok := parseUniqueIndexRepairStatement("ALTER TABLE semantic_tasks ADD UNIQUE KEY uk_task_resource_version(task_type, resource_id, resource_version)")
+	if !ok {
+		t.Fatal("expected unique index repair statement to parse")
+	}
+	if repair.tableName != "semantic_tasks" || repair.indexName != "uk_task_resource_version" {
+		t.Fatalf("unexpected repair target: %#v", repair)
+	}
+	if !equalStringSlices(repair.columns, []string{"task_type", "resource_id", "resource_version"}) {
+		t.Fatalf("unexpected repair columns: %#v", repair.columns)
+	}
+}
+
+func TestBuildUniqueIndexDuplicateCheckSQL(t *testing.T) {
+	repair := tidbUniqueIndexRepair{
+		tableName: "uploads",
+		indexName: "idx_uploads_active",
+		columns:   []string{"active_target_path"},
+	}
+	got := buildUniqueIndexDuplicateCheckSQL(repair)
+	want := "SELECT 1 FROM `uploads` WHERE `active_target_path` IS NOT NULL GROUP BY `active_target_path` HAVING COUNT(*) > 1 LIMIT 1"
+	if got != want {
+		t.Fatalf("duplicate check SQL=%q, want %q", got, want)
+	}
+}
+
+func TestApplyTiDBSchemaRepairsPreflightsUniqueIndexDuplicates(t *testing.T) {
+	db, cleanup := newTestRepairDB(t, func(query string) testRepairQueryResult {
+		if strings.Contains(query, "GROUP BY `idempotency_key`") {
+			return testRepairQueryResult{columns: []string{"1"}, rows: [][]driver.Value{{int64(1)}}}
+		}
+		return testRepairQueryResult{}
+	}, nil)
+	defer cleanup()
+
+	err := applyTiDBSchemaRepairs(context.Background(), db, []string{"CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)"})
+	if err == nil {
+		t.Fatal("expected duplicate preflight to reject repair")
+	}
+	if !strings.Contains(err.Error(), "duplicate rows exist") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestValidateTiDBAutoEmbeddingFilesDiffsReportsGeneratedContractMismatch(t *testing.T) {
 	meta := testFilesTableMeta(TiDBEmbeddingModeApp)
 	diffs := validateTiDBAutoEmbeddingFilesDiffs(meta)
@@ -267,6 +317,51 @@ func TestDiffTiDBTableMetaRecognizesUniqueIndexFromCreateStatement(t *testing.T)
 	diffs := diffTiDBTableMeta(spec, meta, createStmt)
 	if hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "idx_uploads_active") {
 		t.Fatalf("did not expect idx_uploads_active to be reported missing, got %#v", diffs)
+	}
+}
+
+func TestDiffTiDBTableMetaReportsIndexInspectionFailureInsteadOfFalsePositives(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "uploads")
+	meta := testUploadsTableMeta(true)
+	diffs := diffTiDBTableMetaWithObservedIndexes(spec, meta, `CREATE TABLE uploads (upload_id VARCHAR(64) PRIMARY KEY)`, nil, false)
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffTableContract, "unable to inspect indexes") {
+		t.Fatalf("expected unable to inspect indexes diff, got %#v", diffs)
+	}
+	if hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "idx_uploads_active") {
+		t.Fatalf("did not expect false-positive missing index diff, got %#v", diffs)
+	}
+}
+
+func TestParseObservedTiDBIndexesRecognizesConstraintUnique(t *testing.T) {
+	createStmt := `CREATE TABLE uploads (
+		upload_id VARCHAR(64) PRIMARY KEY,
+		active_target_path VARCHAR(512),
+		CONSTRAINT idx_uploads_active UNIQUE (active_target_path)
+	)`
+	observed, ok := parseObservedTiDBIndexes(createStmt)
+	if !ok {
+		t.Fatal("expected observed indexes parse to succeed")
+	}
+	if !hasObservedTiDBIndex(observed, "idx_uploads_active") {
+		t.Fatalf("expected idx_uploads_active to be observed, got %#v", observed)
+	}
+}
+
+func TestTiDBSchemaSpecFromStatementsParsesConstraintUniqueDefinition(t *testing.T) {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS uploads (
+			upload_id VARCHAR(64) PRIMARY KEY,
+			active_target_path VARCHAR(512),
+			CONSTRAINT idx_uploads_active UNIQUE (active_target_path)
+		)`,
+	}
+	spec, err := tidbSchemaSpecFromStatements(stmts)
+	if err != nil {
+		t.Fatalf("tidbSchemaSpecFromStatements: %v", err)
+	}
+	table := mustTableSpecFromSchemaSpec(t, spec, "uploads")
+	if _, ok := table.indexes["idx_uploads_active"]; !ok {
+		t.Fatalf("expected idx_uploads_active index in parsed schema spec, got %#v", table.indexes)
 	}
 }
 
@@ -681,4 +776,81 @@ func mustTableSpecFromSchemaSpec(t *testing.T, spec tidbSchemaSpec, tableName st
 	}
 	t.Fatalf("missing table spec %q", tableName)
 	return tidbTableSpec{}
+}
+
+type testRepairQueryResult struct {
+	columns []string
+	rows    [][]driver.Value
+	err     error
+}
+
+type testRepairDriver struct {
+	queryFn func(string) testRepairQueryResult
+	execFn  func(string) error
+}
+
+type testRepairConn struct {
+	queryFn func(string) testRepairQueryResult
+	execFn  func(string) error
+}
+
+type testRepairRows struct {
+	columns []string
+	rows    [][]driver.Value
+	index   int
+}
+
+var testRepairDriverCounter uint64
+
+func newTestRepairDB(t *testing.T, queryFn func(string) testRepairQueryResult, execFn func(string) error) (*sql.DB, func()) {
+	t.Helper()
+	name := "test-repair-driver-" + strconv.FormatUint(atomic.AddUint64(&testRepairDriverCounter, 1), 10)
+	sql.Register(name, testRepairDriver{queryFn: queryFn, execFn: execFn})
+	db, err := sql.Open(name, "")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	return db, func() { _ = db.Close() }
+}
+
+func (d testRepairDriver) Open(string) (driver.Conn, error) {
+	return testRepairConn{queryFn: d.queryFn, execFn: d.execFn}, nil
+}
+
+func (c testRepairConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("not implemented")
+}
+func (c testRepairConn) Close() error              { return nil }
+func (c testRepairConn) Begin() (driver.Tx, error) { return nil, errors.New("not implemented") }
+
+func (c testRepairConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	result := c.queryFn(query)
+	if result.err != nil {
+		return nil, result.err
+	}
+	if len(result.columns) == 0 {
+		return &testRepairRows{}, nil
+	}
+	return &testRepairRows{columns: result.columns, rows: result.rows}, nil
+}
+
+func (c testRepairConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	if c.execFn != nil {
+		if err := c.execFn(query); err != nil {
+			return nil, err
+		}
+	}
+	return driver.RowsAffected(1), nil
+}
+
+func (r *testRepairRows) Columns() []string { return r.columns }
+func (r *testRepairRows) Close() error      { return nil }
+
+func (r *testRepairRows) Next(dest []driver.Value) error {
+	if r.index >= len(r.rows) {
+		return io.EOF
+	}
+	copy(dest, r.rows[r.index])
+	r.index++
+	return nil
 }

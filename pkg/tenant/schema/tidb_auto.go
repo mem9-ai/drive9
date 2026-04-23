@@ -124,6 +124,12 @@ type tidbPrimaryKeySpec struct {
 	columns []string
 }
 
+type tidbUniqueIndexRepair struct {
+	tableName string
+	indexName string
+	columns   []string
+}
+
 type tidbSchemaDiffError struct {
 	mode  TiDBEmbeddingMode
 	diffs []tidbSchemaDiff
@@ -610,11 +616,25 @@ func diffTiDBTable(ctx context.Context, db *sql.DB, table tidbTableSpec) ([]tidb
 	if err != nil {
 		return nil, fmt.Errorf("show create %s: %w", table.name, err)
 	}
-	indexNames, err := loadTiDBIndexNames(ctx, db, table.name)
-	if err != nil {
-		return nil, fmt.Errorf("load %s index metadata: %w", table.name, err)
+	observedIndexes, indexesObserved := loadObservedTiDBIndexes(ctx, db, table.name, createStmt)
+	return diffTiDBTableMetaWithObservedIndexes(table, meta, createStmt, observedIndexes, indexesObserved), nil
+}
+
+func loadObservedTiDBIndexes(ctx context.Context, db *sql.DB, tableName, createStmt string) (map[string]struct{}, bool) {
+	indexNames, err := loadTiDBIndexNames(ctx, db, tableName)
+	if err == nil {
+		return indexNames, true
 	}
-	return diffTiDBTableMetaWithObservedIndexes(table, meta, createStmt, indexNames), nil
+	logger.Warn(ctx, "tenant_tidb_schema_load_index_metadata_failed",
+		zap.String("table", tableName),
+		zap.Error(err))
+	observedIndexes, ok := parseObservedTiDBIndexes(createStmt)
+	if ok {
+		return observedIndexes, true
+	}
+	logger.Warn(ctx, "tenant_tidb_schema_parse_show_create_indexes_failed",
+		zap.String("table", tableName))
+	return nil, false
 }
 
 func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
@@ -744,11 +764,18 @@ func splitTopLevelComma(definitions string) []string {
 
 func parseInlineIndexDefinition(tableName, def string) (indexName, createSQL string, ok bool) {
 	normalized := normalizeSQLFragment(def)
-	if strings.HasPrefix(normalized, "unique index ") {
-		name, cols := parseIndexNameAndColumns(def, "UNIQUE INDEX")
+	if strings.HasPrefix(normalized, "unique index ") || strings.HasPrefix(normalized, "unique key ") {
+		prefix := "UNIQUE INDEX"
+		if strings.HasPrefix(normalized, "unique key ") {
+			prefix = "UNIQUE KEY"
+		}
+		name, cols := parseIndexNameAndColumns(def, prefix)
 		if name == "" || cols == "" {
 			return "", "", false
 		}
+		return name, fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s%s", name, tableName, cols), true
+	}
+	if name, cols, ok := parseConstraintUniqueIndexDefinition(def); ok {
 		return name, fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s%s", name, tableName, cols), true
 	}
 	if strings.HasPrefix(normalized, "index ") || strings.HasPrefix(normalized, "key ") {
@@ -763,6 +790,31 @@ func parseInlineIndexDefinition(tableName, def string) (indexName, createSQL str
 		return name, fmt.Sprintf("CREATE INDEX %s ON %s%s", name, tableName, cols), true
 	}
 	return "", "", false
+}
+
+func parseConstraintUniqueIndexDefinition(def string) (indexName, columns string, ok bool) {
+	trimmed := strings.TrimSpace(def)
+	upper := strings.ToUpper(trimmed)
+	if !strings.HasPrefix(upper, "CONSTRAINT ") {
+		return "", "", false
+	}
+	rest := strings.TrimSpace(trimmed[len("CONSTRAINT "):])
+	name, remainder := splitIdentifierAndRest(rest)
+	if name == "" || remainder == "" {
+		return "", "", false
+	}
+	remainder = strings.TrimSpace(remainder)
+	upperRemainder := strings.ToUpper(remainder)
+	switch {
+	case strings.HasPrefix(upperRemainder, "UNIQUE KEY"):
+		return strings.ToLower(name), parseIndexColumnsSuffix(remainder[len("UNIQUE KEY"):]), true
+	case strings.HasPrefix(upperRemainder, "UNIQUE INDEX"):
+		return strings.ToLower(name), parseIndexColumnsSuffix(remainder[len("UNIQUE INDEX"):]), true
+	case strings.HasPrefix(upperRemainder, "UNIQUE"):
+		return strings.ToLower(name), parseIndexColumnsSuffix(remainder[len("UNIQUE"):]), true
+	default:
+		return "", "", false
+	}
 }
 
 func parseIndexNameAndColumns(def, prefix string) (indexName, columns string) {
@@ -785,6 +837,15 @@ func parseIndexNameAndColumns(def, prefix string) (indexName, columns string) {
 		return "", ""
 	}
 	return strings.ToLower(name), strings.TrimSpace(remainder[open:])
+}
+
+func parseIndexColumnsSuffix(s string) string {
+	trimmed := strings.TrimSpace(s)
+	open := strings.Index(trimmed, "(")
+	if open < 0 {
+		return ""
+	}
+	return strings.TrimSpace(trimmed[open:])
 }
 
 func parsePrimaryKeyDefinition(def string) (tidbPrimaryKeySpec, bool) {
@@ -884,6 +945,27 @@ func splitIdentifierAndRest(s string) (identifier string, rest string) {
 	return schemaspec.SplitIdentifierAndRest(s)
 }
 
+func splitIdentifierAndSuffix(s string) (identifier string, rest string) {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return "", ""
+	}
+	if trimmed[0] == '`' {
+		end := strings.Index(trimmed[1:], "`")
+		if end < 0 {
+			return "", ""
+		}
+		return trimmed[1 : 1+end], strings.TrimSpace(trimmed[1+end+1:])
+	}
+	for i := 0; i < len(trimmed); i++ {
+		switch trimmed[i] {
+		case ' ', '\t', '\n', '\r', '(':
+			return trimmed[:i], strings.TrimSpace(trimmed[i:])
+		}
+	}
+	return trimmed, ""
+}
+
 func isConstraintDefinition(def string) bool {
 	normalized := normalizeSQLFragment(def)
 	return strings.HasPrefix(normalized, "primary key") ||
@@ -967,10 +1049,11 @@ func parseAlterTableAddIndexStatement(stmt string) (tableName, indexName, create
 }
 
 func diffTiDBTableMeta(table tidbTableSpec, meta tidbTableMeta, createStmt string) []tidbSchemaDiff {
-	return diffTiDBTableMetaWithObservedIndexes(table, meta, createStmt, parseObservedTiDBIndexes(createStmt))
+	observedIndexes, ok := parseObservedTiDBIndexes(createStmt)
+	return diffTiDBTableMetaWithObservedIndexes(table, meta, createStmt, observedIndexes, ok)
 }
 
-func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMeta, createStmt string, observedIndexes map[string]struct{}) []tidbSchemaDiff {
+func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMeta, createStmt string, observedIndexes map[string]struct{}, indexesObserved bool) []tidbSchemaDiff {
 	var diffs []tidbSchemaDiff
 	for _, name := range sortedColumnNames(table.columns) {
 		spec := table.columns[name]
@@ -1010,15 +1093,25 @@ func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMet
 			})
 		}
 	}
-	for _, name := range sortedIndexNames(table.indexes) {
-		spec := table.indexes[name]
-		if !hasObservedTiDBIndex(observedIndexes, name) {
+	if !indexesObserved {
+		if len(table.indexes) > 0 {
 			diffs = append(diffs, tidbSchemaDiff{
-				kind:      tidbSchemaDiffMissingIndex,
+				kind:      tidbSchemaDiffTableContract,
 				tableName: table.name,
-				detail:    fmt.Sprintf("%s schema contract: missing %s index", table.name, name),
-				repairSQL: spec.createSQL,
+				detail:    fmt.Sprintf("%s schema contract: unable to inspect indexes", table.name),
 			})
+		}
+	} else {
+		for _, name := range sortedIndexNames(table.indexes) {
+			spec := table.indexes[name]
+			if !hasObservedTiDBIndex(observedIndexes, name) {
+				diffs = append(diffs, tidbSchemaDiff{
+					kind:      tidbSchemaDiffMissingIndex,
+					tableName: table.name,
+					detail:    fmt.Sprintf("%s schema contract: missing %s index", table.name, name),
+					repairSQL: spec.createSQL,
+				})
+			}
 		}
 	}
 	if table.validate != nil {
@@ -1035,10 +1128,10 @@ func hasObservedTiDBIndex(observedIndexes map[string]struct{}, indexName string)
 	return ok
 }
 
-func parseObservedTiDBIndexes(createStmt string) map[string]struct{} {
+func parseObservedTiDBIndexes(createStmt string) (map[string]struct{}, bool) {
 	_, defs, ok, err := parseCreateTableStatement(createStmt)
 	if err != nil || !ok {
-		return nil
+		return nil, false
 	}
 	observed := make(map[string]struct{})
 	for _, def := range splitTopLevelComma(defs) {
@@ -1050,8 +1143,8 @@ func parseObservedTiDBIndexes(createStmt string) map[string]struct{} {
 		switch {
 		case strings.HasPrefix(normalized, "primary key") || strings.Contains(normalized, " primary key"):
 			observed["primary"] = struct{}{}
-		case strings.HasPrefix(normalized, "constraint ") && strings.Contains(normalized, " unique key "):
-			if name, _ := parseIndexNameAndColumns(def, "UNIQUE KEY"); name != "" {
+		case strings.HasPrefix(normalized, "constraint "):
+			if name, _, ok := parseConstraintUniqueIndexDefinition(def); ok {
 				observed[name] = struct{}{}
 			}
 		case strings.HasPrefix(normalized, "unique key "):
@@ -1072,7 +1165,44 @@ func parseObservedTiDBIndexes(createStmt string) map[string]struct{} {
 			}
 		}
 	}
-	return observed
+	return observed, true
+}
+
+func parseIndexColumnList(def string) []string {
+	inner, ok := parseParenthesizedList(def)
+	if !ok {
+		return nil
+	}
+	parts := splitTopLevelComma(inner)
+	columns := make([]string, 0, len(parts))
+	for _, part := range parts {
+		name := parseColumnReferenceName(part)
+		if name == "" {
+			return nil
+		}
+		columns = append(columns, name)
+	}
+	return columns
+}
+
+func parseParenthesizedList(s string) (string, bool) {
+	open := strings.Index(s, "(")
+	if open < 0 {
+		return "", false
+	}
+	depth := 0
+	for i := open; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return strings.TrimSpace(s[open+1 : i]), true
+			}
+		}
+	}
+	return "", false
 }
 
 func parsePrimaryKeyColumnsFromCreateStatement(createStmt string) ([]string, bool) {
@@ -1201,6 +1331,15 @@ func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string
 		return nil
 	}
 	for _, stmt := range statements {
+		if isUniqueIndexRepairSQL(stmt) {
+			repair, ok := parseUniqueIndexRepairStatement(stmt)
+			if !ok {
+				return fmt.Errorf("preflight unique index repair %q: unsupported statement", schemaStatementSnippet(stmt))
+			}
+			if err := ensureUniqueIndexRepairSafe(ctx, db, repair); err != nil {
+				return err
+			}
+		}
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			if isIgnorableTiDBSchemaError(err) {
 				continue
@@ -1209,6 +1348,116 @@ func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string
 		}
 	}
 	return nil
+}
+
+func isUniqueIndexRepairSQL(sqlText string) bool {
+	normalized := normalizeSQLFragment(sqlText)
+	if strings.HasPrefix(normalized, "create unique index ") {
+		return true
+	}
+	return strings.HasPrefix(normalized, "alter table ") &&
+		(strings.Contains(normalized, " add unique index ") || strings.Contains(normalized, " add unique key "))
+}
+
+func parseUniqueIndexRepairStatement(stmt string) (tidbUniqueIndexRepair, bool) {
+	if tableName, indexName, columns, ok := parseCreateUniqueIndexRepairStatement(stmt); ok {
+		return tidbUniqueIndexRepair{tableName: tableName, indexName: indexName, columns: columns}, true
+	}
+	if tableName, indexName, columns, ok := parseAlterTableAddUniqueIndexRepairStatement(stmt); ok {
+		return tidbUniqueIndexRepair{tableName: tableName, indexName: indexName, columns: columns}, true
+	}
+	return tidbUniqueIndexRepair{}, false
+}
+
+func parseCreateUniqueIndexRepairStatement(stmt string) (tableName, indexName string, columns []string, ok bool) {
+	trimmed := strings.TrimSpace(stmt)
+	upper := strings.ToUpper(trimmed)
+	const prefix = "CREATE UNIQUE INDEX "
+	if !strings.HasPrefix(upper, prefix) {
+		return "", "", nil, false
+	}
+	rest := strings.TrimSpace(trimmed[len(prefix):])
+	name, remainder := splitIdentifierAndSuffix(rest)
+	if name == "" || remainder == "" {
+		return "", "", nil, false
+	}
+	remainder = strings.TrimSpace(remainder)
+	upperRemainder := strings.ToUpper(remainder)
+	if !strings.HasPrefix(upperRemainder, "ON ") {
+		return "", "", nil, false
+	}
+	afterOn := strings.TrimSpace(remainder[len("ON "):])
+	table, columnRemainder := splitIdentifierAndSuffix(afterOn)
+	if table == "" || columnRemainder == "" {
+		return "", "", nil, false
+	}
+	parsedColumns := parseIndexColumnList(columnRemainder)
+	if len(parsedColumns) == 0 {
+		return "", "", nil, false
+	}
+	return strings.ToLower(table), strings.ToLower(name), parsedColumns, true
+}
+
+func parseAlterTableAddUniqueIndexRepairStatement(stmt string) (tableName, indexName string, columns []string, ok bool) {
+	trimmed := strings.TrimSpace(stmt)
+	upper := strings.ToUpper(trimmed)
+	const prefix = "ALTER TABLE "
+	if !strings.HasPrefix(upper, prefix) {
+		return "", "", nil, false
+	}
+	rest := strings.TrimSpace(trimmed[len(prefix):])
+	table, remainder := splitIdentifierAndRest(rest)
+	if table == "" || remainder == "" {
+		return "", "", nil, false
+	}
+	remainder = strings.TrimSpace(remainder)
+	upperRemainder := strings.ToUpper(remainder)
+	for _, marker := range []string{"ADD UNIQUE INDEX ", "ADD UNIQUE KEY "} {
+		if !strings.HasPrefix(upperRemainder, marker) {
+			continue
+		}
+		afterMarker := strings.TrimSpace(remainder[len(marker):])
+		name, columnRemainder := splitIdentifierAndSuffix(afterMarker)
+		if name == "" || columnRemainder == "" {
+			return "", "", nil, false
+		}
+		parsedColumns := parseIndexColumnList(columnRemainder)
+		if len(parsedColumns) == 0 {
+			return "", "", nil, false
+		}
+		return strings.ToLower(table), strings.ToLower(name), parsedColumns, true
+	}
+	return "", "", nil, false
+}
+
+func ensureUniqueIndexRepairSafe(ctx context.Context, db *sql.DB, repair tidbUniqueIndexRepair) error {
+	var exists int
+	err := db.QueryRowContext(ctx, buildUniqueIndexDuplicateCheckSQL(repair)).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("preflight unique index repair %s on %s: %w", repair.indexName, repair.tableName, err)
+	}
+	return fmt.Errorf("cannot auto-repair unique index %s on %s: duplicate rows exist for columns (%s)", repair.indexName, repair.tableName, strings.Join(repair.columns, ", "))
+}
+
+func buildUniqueIndexDuplicateCheckSQL(repair tidbUniqueIndexRepair) string {
+	quotedColumns := make([]string, 0, len(repair.columns))
+	nonNullPredicates := make([]string, 0, len(repair.columns))
+	for _, column := range repair.columns {
+		quoted := quoteSQLIdentifier(column)
+		quotedColumns = append(quotedColumns, quoted)
+		nonNullPredicates = append(nonNullPredicates, quoted+" IS NOT NULL")
+	}
+	return fmt.Sprintf("SELECT 1 FROM %s WHERE %s GROUP BY %s HAVING COUNT(*) > 1 LIMIT 1",
+		quoteSQLIdentifier(repair.tableName),
+		strings.Join(nonNullPredicates, " AND "),
+		strings.Join(quotedColumns, ", "))
+}
+
+func quoteSQLIdentifier(identifier string) string {
+	return "`" + strings.ReplaceAll(identifier, "`", "``") + "`"
 }
 
 func isIgnorableTiDBSchemaError(err error) bool {
