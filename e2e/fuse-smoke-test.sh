@@ -801,7 +801,8 @@ PY
     fi
 
     check_cmd_fail "write fails on read-only mount" bash -c "printf 'x' > '$RO_WRITE_MOUNT'"
-    check_cmd_fail "delete fails on read-only mount" rm "$RO_SEED_MOUNT"
+    # The rm -f here is intentional to avoid manual rm confirmation prompts under macos
+    check_cmd_fail "delete fails on read-only mount" rm -f "$RO_SEED_MOUNT"
   fi
 
     echo "[14] unmount"
