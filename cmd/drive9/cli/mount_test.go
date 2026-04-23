@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -197,5 +198,36 @@ func TestResolveMountCredentials_MissingServer(t *testing.T) {
 	_, _, _, err := resolveMountCredentials(r, "", "")
 	if err == nil {
 		t.Fatal("expected error when no server URL is available")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Row A — only the CURRENT backend keyword ("vault") is special. All other
+// first positionals flow into the legacy parser, which rejects extra
+// positionals instead of pre-reserving names for future backends.
+// ---------------------------------------------------------------------------
+
+func TestMountCmd_BareWordFirstArgFlowsToLegacyArityCheck(t *testing.T) {
+	for _, s := range []string{"kv", "s3", "gcs", "nfs", "mnt", "tmp", "vaultdir", "data"} {
+		err := MountCmd([]string{s, "/mnt/x"})
+		if err == nil {
+			t.Fatalf("%q: expected positional-arity error", s)
+		}
+		if got := err.Error(); !strings.Contains(got, "exactly one mountpoint required") {
+			t.Fatalf("%q: error = %q, want positional-arity rejection", s, got)
+		}
+		if strings.Contains(err.Error(), "unsupported mount backend") {
+			t.Fatalf("%q: must not be rejected as reserved backend keyword", s)
+		}
+	}
+}
+
+func TestMountCmd_VaultStillDispatchesSeparately(t *testing.T) {
+	err := MountCmd([]string{"vault", "/mnt/a", "/mnt/b"})
+	if err == nil {
+		t.Fatal("expected vault subcommand arity error")
+	}
+	if got := err.Error(); !strings.Contains(got, "drive9 mount vault: exactly one mountpoint required") {
+		t.Fatalf("error = %q, want vault-specific arity rejection", got)
 	}
 }
