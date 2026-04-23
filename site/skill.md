@@ -88,7 +88,7 @@ drive9 fs rm -r :/path/to/dir/
 drive9 fs sh
 ```
 
-When uploading with `drive9 fs cp --tag`, any provided `--tag` flags replace the file's existing tag set on re-upload. Omit `--tag` to preserve existing tags.
+Use `drive9 fs cp --tag` only for uploads from local->remote or stdin->remote. Any provided `--tag` flags replace the file's existing tag set on re-upload; omit `--tag` to preserve existing tags. Do not use `drive9 fs cp --tag` for remote->local or remote->remote transfers, and do not combine it with `--append`.
 
 ### FUSE mount
 

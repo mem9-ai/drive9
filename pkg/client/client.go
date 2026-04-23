@@ -397,6 +397,9 @@ func (c *Client) StatMetadataCtx(ctx context.Context, path string) (*StatMetadat
 	if !strings.HasPrefix(contentType, "application/json") {
 		return nil, fmt.Errorf("%w: unexpected Content-Type %q", errStatMetadataCompatFallback, resp.Header.Get("Content-Type"))
 	}
+	// Intentionally do not require X-Dat9-Mtime here yet. The stat-specific
+	// marker check will become useful once the server rollout is complete, and
+	// for now we only gate the compat fallback on obvious non-JSON responses.
 	var out StatMetadataResult
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode stat metadata: %w", err)
