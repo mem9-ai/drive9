@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	mysql "github.com/go-sql-driver/mysql"
+	"github.com/mem9-ai/dat9/internal/schemaspec"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"go.uber.org/zap"
 )
@@ -41,11 +42,7 @@ func ExecSchemaStatements(db *sql.DB, stmts []string) error {
 			if isIgnorableSchemaError(err) {
 				continue
 			}
-			snippet := stmt
-			if len(snippet) > 80 {
-				snippet = snippet[:80]
-			}
-			return fmt.Errorf("exec %q: %w", snippet, err)
+			return fmt.Errorf("exec %q: %w", schemaspec.SQLSnippet(stmt), err)
 		}
 	}
 	return nil
@@ -116,16 +113,12 @@ func isIgnorableOptionalMySQLErrorCode(code uint16) bool {
 }
 
 func schemaStatementSnippet(stmt string) string {
-	snippet := stmt
-	if len(snippet) > 80 {
-		snippet = snippet[:80]
-	}
-	return snippet
+	return schemaspec.SQLSnippet(stmt)
 }
 
-func IsTiDBCluster(db *sql.DB) bool {
+func IsTiDBCluster(ctx context.Context, db *sql.DB) bool {
 	var ver string
-	if err := db.QueryRow(`SELECT VERSION()`).Scan(&ver); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT VERSION()`).Scan(&ver); err != nil {
 		return false
 	}
 	return strings.Contains(strings.ToLower(ver), "tidb")

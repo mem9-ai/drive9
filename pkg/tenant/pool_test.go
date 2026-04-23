@@ -16,6 +16,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/semantic"
+	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
 
 func TestPoolAcquireInvalidateDefersCloseUntilRelease(t *testing.T) {
@@ -246,6 +247,78 @@ func TestPoolAutoSemanticTaskTypes(t *testing.T) {
 	gotBoth := both.AutoSemanticTaskTypes()
 	if len(gotBoth) != 2 || gotBoth[0] != semantic.TaskTypeImgExtractText || gotBoth[1] != semantic.TaskTypeAudioExtractText {
 		t.Fatalf("got %#v, want [img_extract_text audio_extract_text]", gotBoth)
+	}
+}
+
+func TestPoolCreateBackendPeriodicallyValidatesSchemaWhenVersionMatches(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-validate")
+	tenant.Provider = ProviderTiDBZero
+	tenant.SchemaVersion = schema.CurrentTiDBTenantSchemaVersion
+
+	origEnsure := ensureTiDBSchemaForMode
+	origValidate := validateTiDBSchemaForMode
+	origEvery := periodicTiDBSchemaValidationEvery
+	ensureCalls := 0
+	validateCalls := 0
+	ensureTiDBSchemaForMode = func(context.Context, *sql.DB, schema.TiDBEmbeddingMode) error {
+		ensureCalls++
+		return nil
+	}
+	validateTiDBSchemaForMode = func(context.Context, *sql.DB, schema.TiDBEmbeddingMode) error {
+		validateCalls++
+		return nil
+	}
+	periodicTiDBSchemaValidationEvery = 4
+	t.Cleanup(func() {
+		ensureTiDBSchemaForMode = origEnsure
+		validateTiDBSchemaForMode = origValidate
+		periodicTiDBSchemaValidationEvery = origEvery
+	})
+
+	for i := 0; i < 4; i++ {
+		backend, store, err := pool.createBackend(context.Background(), tenant)
+		if err != nil {
+			t.Fatalf("createBackend() iteration %d: %v", i, err)
+		}
+		backend.Close()
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store iteration %d: %v", i, err)
+		}
+	}
+
+	if ensureCalls != 0 {
+		t.Fatalf("ensureTiDBSchemaForMode called %d times, want 0", ensureCalls)
+	}
+	if validateCalls != 2 {
+		t.Fatalf("validateTiDBSchemaForMode called %d times, want 2", validateCalls)
+	}
+}
+
+func TestPoolCreateBackendReturnsValidationErrorWhenPeriodicCheckFails(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-validate-fail")
+	tenant.Provider = ProviderTiDBZero
+	tenant.SchemaVersion = schema.CurrentTiDBTenantSchemaVersion
+
+	origEnsure := ensureTiDBSchemaForMode
+	origValidate := validateTiDBSchemaForMode
+	origEvery := periodicTiDBSchemaValidationEvery
+	ensureTiDBSchemaForMode = func(context.Context, *sql.DB, schema.TiDBEmbeddingMode) error {
+		return nil
+	}
+	validateTiDBSchemaForMode = func(context.Context, *sql.DB, schema.TiDBEmbeddingMode) error {
+		return fmt.Errorf("schema drift")
+	}
+	periodicTiDBSchemaValidationEvery = 1
+	t.Cleanup(func() {
+		ensureTiDBSchemaForMode = origEnsure
+		validateTiDBSchemaForMode = origValidate
+		periodicTiDBSchemaValidationEvery = origEvery
+	})
+
+	if _, _, err := pool.createBackend(context.Background(), tenant); err == nil {
+		t.Fatal("expected periodic validation failure to propagate")
+	} else if !strings.Contains(err.Error(), "validate tidb auto-embedding schema") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

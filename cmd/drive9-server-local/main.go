@@ -146,7 +146,7 @@ func main() {
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "build_backend_options")
 
 	stepStart = time.Now()
-	localEmbeddingMode, err := detectLocalTiDBEmbeddingMode(store.DB(), localInitSchema, requestedEmbeddingMode, explicitEmbeddingMode)
+	localEmbeddingMode, err := detectLocalTiDBEmbeddingMode(startupCtx, store.DB(), localInitSchema, requestedEmbeddingMode, explicitEmbeddingMode)
 	if err != nil {
 		die(fmt.Errorf("detect local embedding mode: %w", err))
 	}
@@ -454,7 +454,7 @@ var (
 	localTiDBSchemaInitializer     = schema.InitTiDBTenantSchemaForModeWithOptionsContext
 )
 
-func detectLocalTiDBEmbeddingMode(db *sql.DB, schemaInitialized bool, requestedMode schema.TiDBEmbeddingMode, explicitMode bool) (schema.TiDBEmbeddingMode, error) {
+func detectLocalTiDBEmbeddingMode(ctx context.Context, db *sql.DB, schemaInitialized bool, requestedMode schema.TiDBEmbeddingMode, explicitMode bool) (schema.TiDBEmbeddingMode, error) {
 	if explicitMode {
 		if schemaInitialized {
 			return requestedMode, nil
@@ -462,7 +462,7 @@ func detectLocalTiDBEmbeddingMode(db *sql.DB, schemaInitialized bool, requestedM
 		if db == nil {
 			return schema.TiDBEmbeddingModeUnknown, fmt.Errorf("nil db")
 		}
-		if err := localTiDBSchemaValidator(db, requestedMode); err != nil {
+		if err := localTiDBSchemaValidator(ctx, db, requestedMode); err != nil {
 			return schema.TiDBEmbeddingModeUnknown, err
 		}
 		return requestedMode, nil
@@ -480,7 +480,7 @@ func detectLocalTiDBEmbeddingMode(db *sql.DB, schemaInitialized bool, requestedM
 	if mode != schema.TiDBEmbeddingModeAuto && mode != schema.TiDBEmbeddingModeApp {
 		return schema.TiDBEmbeddingModeUnknown, fmt.Errorf("unsupported TiDB embedding mode %q", mode)
 	}
-	if err := localTiDBSchemaValidator(db, mode); err != nil {
+	if err := localTiDBSchemaValidator(ctx, db, mode); err != nil {
 		return schema.TiDBEmbeddingModeUnknown, err
 	}
 	return mode, nil

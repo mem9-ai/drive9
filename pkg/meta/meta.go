@@ -6,10 +6,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/mem9-ai/dat9/internal/schemaspec"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/mysqlutil"
@@ -110,7 +111,94 @@ func applyMySQLPoolDefaults(db *sql.DB) {
 }
 
 func (s *Store) migrate() error {
-	stmts := []string{
+	ctx := context.Background()
+	stmts := metaInitSchemaStatements()
+	spec, err := metaSchemaSpecFromStatements(stmts)
+	if err != nil {
+		return fmt.Errorf("parse meta schema statements: %w", err)
+	}
+	diffs, err := diffMetaSchema(ctx, s.db, spec)
+	if err != nil {
+		return fmt.Errorf("diff meta schema: %w", err)
+	}
+	if err := applyMetaSchemaRepairs(ctx, s.db, plannedMetaSchemaRepairs(diffs)); err != nil {
+		return err
+	}
+	diffs, err = diffMetaSchema(ctx, s.db, spec)
+	if err != nil {
+		return fmt.Errorf("re-diff meta schema: %w", err)
+	}
+	if len(diffs) > 0 {
+		return &metaSchemaDiffError{diffs: diffs}
+	}
+	return nil
+}
+
+type metaColumnMeta struct {
+	columnType string
+}
+
+type metaTableMeta struct {
+	tableName string
+	columns   map[string]metaColumnMeta
+}
+
+type metaSchemaDiffKind string
+
+const (
+	metaSchemaDiffMissingTable  metaSchemaDiffKind = "missing_table"
+	metaSchemaDiffMissingColumn metaSchemaDiffKind = "missing_column"
+	metaSchemaDiffMissingIndex  metaSchemaDiffKind = "missing_index"
+	metaSchemaDiffColumnType    metaSchemaDiffKind = "column_type_mismatch"
+)
+
+type metaSchemaDiff struct {
+	kind       metaSchemaDiffKind
+	tableName  string
+	columnName string
+	indexName  string
+	detail     string
+	repairSQL  string
+}
+
+type metaSchemaDiffError struct {
+	diffs []metaSchemaDiff
+}
+
+func (e *metaSchemaDiffError) Error() string {
+	if e == nil || len(e.diffs) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(e.diffs))
+	for _, d := range e.diffs {
+		parts = append(parts, d.detail)
+	}
+	return "meta schema contract mismatch: " + strings.Join(parts, "; ")
+}
+
+type metaSchemaSpec struct {
+	tables []metaTableSpec
+}
+
+type metaTableSpec struct {
+	name            string
+	createStatement string
+	columns         map[string]metaColumnSpec
+	indexes         map[string]metaIndexSpec
+}
+
+type metaColumnSpec struct {
+	columnType string
+	addSQL     string
+}
+
+type metaIndexSpec struct {
+	createSQL string
+	isPrimary bool
+}
+
+func metaInitSchemaStatements() []string {
+	return []string{
 		`CREATE TABLE IF NOT EXISTS tenants (
 			id               VARCHAR(64) PRIMARY KEY,
 			status           VARCHAR(20) NOT NULL DEFAULT 'provisioning',
@@ -147,8 +235,6 @@ func (s *Store) migrate() error {
 			INDEX idx_api_keys_tenant (tenant_id, status),
 			UNIQUE INDEX idx_api_keys_tenant_name (tenant_id, key_name)
 		)`,
-		// --- LLM usage table (PR #245 migration) ---
-
 		`CREATE TABLE IF NOT EXISTS llm_usage (
 			id              BIGINT AUTO_INCREMENT PRIMARY KEY,
 			tenant_id       VARCHAR(64) NOT NULL,
@@ -161,9 +247,6 @@ func (s *Store) migrate() error {
 			INDEX idx_llm_usage_tenant_created (tenant_id, created_at),
 			INDEX idx_llm_usage_created (created_at)
 		)`,
-
-		// --- Quota tables (Rev 4 migration) ---
-
 		`CREATE TABLE IF NOT EXISTS tenant_quota_config (
 			tenant_id             VARCHAR(64) PRIMARY KEY,
 			max_storage_bytes     BIGINT NOT NULL DEFAULT 53687091200,
@@ -172,7 +255,6 @@ func (s *Store) migrate() error {
 			created_at            DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at            DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,
-
 		`CREATE TABLE IF NOT EXISTS tenant_quota_usage (
 			tenant_id          VARCHAR(64) PRIMARY KEY,
 			storage_bytes      BIGINT NOT NULL DEFAULT 0,
@@ -180,7 +262,6 @@ func (s *Store) migrate() error {
 			media_file_count   BIGINT NOT NULL DEFAULT 0,
 			updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,
-
 		`CREATE TABLE IF NOT EXISTS tenant_file_meta (
 			tenant_id    VARCHAR(64) NOT NULL,
 			file_id      VARCHAR(64) NOT NULL,
@@ -190,7 +271,6 @@ func (s *Store) migrate() error {
 			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			PRIMARY KEY (tenant_id, file_id)
 		)`,
-
 		`CREATE TABLE IF NOT EXISTS tenant_upload_reservations (
 			tenant_id      VARCHAR(64) NOT NULL,
 			upload_id      VARCHAR(64) NOT NULL,
@@ -203,7 +283,6 @@ func (s *Store) migrate() error {
 			PRIMARY KEY (tenant_id, upload_id),
 			INDEX idx_active_reservations (tenant_id, status, expires_at)
 		)`,
-
 		`CREATE TABLE IF NOT EXISTS tenant_llm_usage (
 			id              BIGINT AUTO_INCREMENT PRIMARY KEY,
 			tenant_id       VARCHAR(64) NOT NULL,
@@ -215,14 +294,12 @@ func (s *Store) migrate() error {
 			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			INDEX idx_tenant_month (tenant_id, created_at)
 		)`,
-
 		`CREATE TABLE IF NOT EXISTS tenant_monthly_llm_cost (
 			tenant_id    VARCHAR(64) NOT NULL,
 			month_start  DATE NOT NULL,
 			total_mc     BIGINT NOT NULL DEFAULT 0,
 			PRIMARY KEY (tenant_id, month_start)
 		)`,
-
 		`CREATE TABLE IF NOT EXISTS quota_mutation_log (
 			id             BIGINT AUTO_INCREMENT PRIMARY KEY,
 			tenant_id      VARCHAR(64) NOT NULL,
@@ -236,12 +313,375 @@ func (s *Store) migrate() error {
 			INDEX idx_tenant_order (tenant_id, id)
 		)`,
 	}
+}
+
+func metaSchemaSpecFromStatements(stmts []string) (metaSchemaSpec, error) {
+	tables := make([]metaTableSpec, 0)
 	for _, stmt := range stmts {
-		if _, err := s.db.Exec(stmt); err != nil {
-			return err
+		table, ok, err := parseCreateMetaTableSpec(stmt)
+		if err != nil {
+			return metaSchemaSpec{}, err
+		}
+		if ok {
+			tables = append(tables, table)
+		}
+	}
+	return metaSchemaSpec{tables: tables}, nil
+}
+
+func parseCreateMetaTableSpec(stmt string) (metaTableSpec, bool, error) {
+	tableName, defs, ok, err := parseMetaCreateTableStatement(stmt)
+	if err != nil {
+		return metaTableSpec{}, false, err
+	}
+	if !ok {
+		return metaTableSpec{}, false, nil
+	}
+	columns := make(map[string]metaColumnSpec)
+	indexes := make(map[string]metaIndexSpec)
+	for _, def := range splitMetaTopLevelComma(defs) {
+		def = strings.TrimSpace(def)
+		if def == "" {
+			continue
+		}
+		if idxName, idxSpec, ok := parseMetaConstraintIndexDefinition(tableName, def); ok {
+			indexes[idxName] = idxSpec
+			continue
+		}
+		if idxName, idxSQL, ok := parseMetaInlineIndexDefinition(tableName, def); ok {
+			indexes[idxName] = metaIndexSpec{createSQL: idxSQL}
+			continue
+		}
+		if isMetaConstraintDefinition(def) {
+			continue
+		}
+		colName, colSpec, ok := parseMetaColumnDefinition(tableName, def)
+		if ok {
+			columns[colName] = colSpec
+			normalizedDef := normalizeMetaSQLFragment(def)
+			if strings.Contains(normalizedDef, " primary key") {
+				indexes["primary"] = metaIndexSpec{isPrimary: true}
+			}
+		}
+	}
+	return metaTableSpec{
+		name:            tableName,
+		createStatement: strings.TrimSpace(stmt),
+		columns:         columns,
+		indexes:         indexes,
+	}, true, nil
+}
+
+func diffMetaSchema(ctx context.Context, db *sql.DB, spec metaSchemaSpec) ([]metaSchemaDiff, error) {
+	var diffs []metaSchemaDiff
+	for _, table := range spec.tables {
+		tableDiffs, err := diffMetaTable(ctx, db, table)
+		if err != nil {
+			return nil, err
+		}
+		diffs = append(diffs, tableDiffs...)
+	}
+	return diffs, nil
+}
+
+func diffMetaTable(ctx context.Context, db *sql.DB, table metaTableSpec) ([]metaSchemaDiff, error) {
+	meta, err := loadMetaTableMeta(ctx, db, table.name)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return []metaSchemaDiff{{
+				kind:      metaSchemaDiffMissingTable,
+				tableName: table.name,
+				detail:    fmt.Sprintf("%s schema contract: missing table", table.name),
+				repairSQL: table.createStatement,
+			}}, nil
+		}
+		return nil, fmt.Errorf("load %s table metadata: %w", table.name, err)
+	}
+	createStmt, err := loadMetaShowCreateTable(ctx, db, table.name)
+	if err != nil {
+		return nil, fmt.Errorf("show create %s: %w", table.name, err)
+	}
+	return diffMetaTableMeta(table, meta, createStmt), nil
+}
+
+func diffMetaTableMeta(table metaTableSpec, meta metaTableMeta, createStmt string) []metaSchemaDiff {
+	var diffs []metaSchemaDiff
+	for _, name := range sortedMetaColumnNames(table.columns) {
+		spec := table.columns[name]
+		col, ok := meta.columns[name]
+		if !ok {
+			diffs = append(diffs, metaSchemaDiff{
+				kind:       metaSchemaDiffMissingColumn,
+				tableName:  table.name,
+				columnName: name,
+				detail:     fmt.Sprintf("%s schema contract: missing %s column", table.name, name),
+				repairSQL:  spec.addSQL,
+			})
+			continue
+		}
+		if normalizeMetaSQLFragment(col.columnType) != normalizeMetaSQLFragment(spec.columnType) {
+			diffs = append(diffs, metaSchemaDiff{
+				kind:       metaSchemaDiffColumnType,
+				tableName:  table.name,
+				columnName: name,
+				detail:     fmt.Sprintf("%s schema contract: %s column type = %q, want %s", table.name, name, col.columnType, spec.columnType),
+			})
+		}
+	}
+	normalizedCreate := normalizeMetaSQLFragment(createStmt)
+	for _, name := range sortedMetaIndexNames(table.indexes) {
+		spec := table.indexes[name]
+		if !showCreateHasMetaIndex(normalizedCreate, name, spec) {
+			detail := fmt.Sprintf("%s schema contract: missing %s index", table.name, name)
+			if spec.isPrimary {
+				detail = fmt.Sprintf("%s schema contract: missing primary key constraint", table.name)
+			}
+			diffs = append(diffs, metaSchemaDiff{
+				kind:      metaSchemaDiffMissingIndex,
+				tableName: table.name,
+				indexName: name,
+				detail:    detail,
+				repairSQL: spec.createSQL,
+			})
+		}
+	}
+	return diffs
+}
+
+func plannedMetaSchemaRepairs(diffs []metaSchemaDiff) []string {
+	tableMissing := make(map[string]bool)
+	for _, diff := range diffs {
+		if diff.kind == metaSchemaDiffMissingTable {
+			tableMissing[diff.tableName] = true
+		}
+	}
+
+	seen := make(map[string]struct{})
+	plans := make([]string, 0, len(diffs))
+	for _, diff := range diffs {
+		if diff.repairSQL == "" {
+			continue
+		}
+		if !isSafeMetaRepairDiff(diff, tableMissing) {
+			continue
+		}
+		if _, ok := seen[diff.repairSQL]; ok {
+			continue
+		}
+		seen[diff.repairSQL] = struct{}{}
+		plans = append(plans, diff.repairSQL)
+	}
+	return plans
+}
+
+func applyMetaSchemaRepairs(ctx context.Context, db *sql.DB, stmts []string) error {
+	for _, stmt := range stmts {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			if isIgnorableMetaSchemaError(err) {
+				continue
+			}
+			return fmt.Errorf("apply meta schema repair %q: %w", schemaSnippet(stmt), err)
 		}
 	}
 	return nil
+}
+
+func parseMetaCreateTableStatement(stmt string) (tableName string, definitions string, ok bool, err error) {
+	return schemaspec.ParseCreateTableStatement(stmt)
+}
+
+func splitMetaTopLevelComma(definitions string) []string {
+	return schemaspec.SplitTopLevelComma(definitions)
+}
+
+func parseMetaInlineIndexDefinition(tableName, def string) (indexName, createSQL string, ok bool) {
+	n := normalizeMetaSQLFragment(def)
+	if strings.HasPrefix(n, "unique index ") {
+		name, cols := parseMetaIndexNameAndColumns(def, "UNIQUE INDEX")
+		if name == "" || cols == "" {
+			return "", "", false
+		}
+		return name, fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s%s", name, tableName, cols), true
+	}
+	if strings.HasPrefix(n, "index ") {
+		name, cols := parseMetaIndexNameAndColumns(def, "INDEX")
+		if name == "" || cols == "" {
+			return "", "", false
+		}
+		return name, fmt.Sprintf("CREATE INDEX %s ON %s%s", name, tableName, cols), true
+	}
+	return "", "", false
+}
+
+func parseMetaConstraintIndexDefinition(tableName, def string) (indexName string, spec metaIndexSpec, ok bool) {
+	n := normalizeMetaSQLFragment(def)
+	if strings.HasPrefix(n, "primary key") {
+		return "primary", metaIndexSpec{isPrimary: true}, true
+	}
+	if strings.HasPrefix(n, "unique key ") {
+		name, cols := parseMetaIndexNameAndColumns(def, "UNIQUE KEY")
+		if name == "" || cols == "" {
+			return "", metaIndexSpec{}, false
+		}
+		return name, metaIndexSpec{
+			createSQL: fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s%s", name, tableName, cols),
+		}, true
+	}
+	if strings.HasPrefix(n, "constraint ") && strings.Contains(n, " unique key ") {
+		// CONSTRAINT name UNIQUE KEY idx_name (...) -> parse using UNIQUE KEY token.
+		name, cols := parseMetaIndexNameAndColumns(def, "UNIQUE KEY")
+		if name == "" || cols == "" {
+			return "", metaIndexSpec{}, false
+		}
+		return name, metaIndexSpec{
+			createSQL: fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s%s", name, tableName, cols),
+		}, true
+	}
+	return "", metaIndexSpec{}, false
+}
+
+func parseMetaIndexNameAndColumns(def, prefix string) (indexName, columns string) {
+	trimmed := strings.TrimSpace(def)
+	upper := strings.ToUpper(trimmed)
+	p := strings.Index(upper, prefix)
+	if p < 0 {
+		return "", ""
+	}
+	rest := strings.TrimSpace(trimmed[p+len(prefix):])
+	name, remainder := splitMetaIdentifierAndRest(rest)
+	if name == "" {
+		return "", ""
+	}
+	open := strings.Index(remainder, "(")
+	if open < 0 {
+		return "", ""
+	}
+	return strings.ToLower(name), strings.TrimSpace(remainder[open:])
+}
+
+func parseMetaColumnDefinition(tableName, def string) (string, metaColumnSpec, bool) {
+	name, rest := splitMetaIdentifierAndRest(def)
+	if name == "" || rest == "" {
+		return "", metaColumnSpec{}, false
+	}
+	colType := parseMetaColumnType(rest)
+	if colType == "" {
+		return "", metaColumnSpec{}, false
+	}
+	return strings.ToLower(name), metaColumnSpec{
+		columnType: strings.ToLower(strings.TrimSpace(colType)),
+		addSQL:     fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, name, strings.TrimSpace(rest)),
+	}, true
+}
+
+func parseMetaColumnType(rest string) string {
+	return schemaspec.ParseColumnType(rest)
+}
+
+func splitMetaIdentifierAndRest(s string) (identifier string, rest string) {
+	return schemaspec.SplitIdentifierAndRest(s)
+}
+
+func isMetaConstraintDefinition(def string) bool {
+	n := normalizeMetaSQLFragment(def)
+	return strings.HasPrefix(n, "primary key") || strings.HasPrefix(n, "constraint ") || strings.HasPrefix(n, "unique key ")
+}
+
+func isSafeMetaRepairDiff(diff metaSchemaDiff, tableMissing map[string]bool) bool {
+	switch diff.kind {
+	case metaSchemaDiffMissingTable:
+		return true
+	case metaSchemaDiffMissingColumn:
+		return isSafeAddColumnRepairSQL(diff.repairSQL)
+	case metaSchemaDiffMissingIndex:
+		normalized := normalizeMetaSQLFragment(diff.repairSQL)
+		if strings.HasPrefix(normalized, "create index ") {
+			return true
+		}
+		if strings.HasPrefix(normalized, "create unique index ") {
+			return tableMissing[diff.tableName]
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func isSafeAddColumnRepairSQL(sqlText string) bool {
+	return schemaspec.IsSafeAddColumnRepairSQL(sqlText)
+}
+
+func isIgnorableMetaSchemaError(err error) bool {
+	return schemaspec.IsIgnorableMySQLError(err)
+}
+
+func loadMetaTableMeta(ctx context.Context, db *sql.DB, tableName string) (metaTableMeta, error) {
+	rows, err := db.QueryContext(ctx, `SELECT column_name, column_type
+		FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = ?`, tableName)
+	if err != nil {
+		return metaTableMeta{}, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	columns := make(map[string]metaColumnMeta)
+	for rows.Next() {
+		var name, columnType string
+		if err := rows.Scan(&name, &columnType); err != nil {
+			return metaTableMeta{}, err
+		}
+		columns[strings.ToLower(name)] = metaColumnMeta{columnType: columnType}
+	}
+	if err := rows.Err(); err != nil {
+		return metaTableMeta{}, err
+	}
+	if len(columns) == 0 {
+		return metaTableMeta{}, sql.ErrNoRows
+	}
+	return metaTableMeta{tableName: tableName, columns: columns}, nil
+}
+
+func loadMetaShowCreateTable(ctx context.Context, db *sql.DB, tableName string) (string, error) {
+	var gotTable string
+	var createStmt string
+	query := fmt.Sprintf("SHOW CREATE TABLE %s", tableName)
+	if err := db.QueryRowContext(ctx, query).Scan(&gotTable, &createStmt); err != nil {
+		return "", err
+	}
+	return createStmt, nil
+}
+
+func normalizeMetaSQLFragment(s string) string {
+	return schemaspec.NormalizeSQLFragment(s)
+}
+
+func sortedMetaColumnNames(columns map[string]metaColumnSpec) []string {
+	names := make([]string, 0, len(columns))
+	for name := range columns {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sortedMetaIndexNames(indexes map[string]metaIndexSpec) []string {
+	names := make([]string, 0, len(indexes))
+	for name := range indexes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func showCreateHasMetaIndex(normalizedCreate, indexName string, spec metaIndexSpec) bool {
+	if spec.isPrimary {
+		return strings.Contains(normalizedCreate, "primary key (")
+	}
+	return strings.Contains(normalizedCreate, indexName+" (")
+}
+
+func schemaSnippet(stmt string) string {
+	return schemaspec.SQLSnippet(stmt)
 }
 
 func (s *Store) InsertTenant(ctx context.Context, t *Tenant) (err error) {
@@ -408,6 +848,25 @@ func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status Tenant
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_status", start, &err)
 	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`, status, time.Now().UTC(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateTenantSchemaVersion records the tenant DB schema version after a
+// successful ensure/repair cycle.  Callers should treat failures as best-
+// effort: log the error but do not fail the overall operation.
+func (s *Store) UpdateTenantSchemaVersion(ctx context.Context, id string, version int) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tenant_schema_version", start, &err)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tenants SET schema_version = ?, updated_at = ? WHERE id = ?`,
+		version, time.Now().UTC(), id)
 	if err != nil {
 		return err
 	}
