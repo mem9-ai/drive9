@@ -1093,7 +1093,6 @@ func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMet
 			})
 		}
 	}
-<<<<<<< HEAD
 	if !indexesObserved {
 		if len(table.indexes) > 0 {
 			diffs = append(diffs, tidbSchemaDiff{
