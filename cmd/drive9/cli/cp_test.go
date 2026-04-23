@@ -486,4 +486,13 @@ func TestParseAndMergeTagValidation(t *testing.T) {
 	if _, err := parseAndMergeTag(tags, "=alice"); err == nil || !strings.Contains(err.Error(), `invalid --tag "=alice" (empty key)`) {
 		t.Fatalf("empty key error = %v, want empty key rejection", err)
 	}
+	if _, err := parseAndMergeTag(tags, " owner =alice"); err == nil || !strings.Contains(err.Error(), "leading or trailing whitespace") {
+		t.Fatalf("whitespace key error = %v, want whitespace rejection", err)
+	}
+	if _, err := parseAndMergeTag(tags, "owner=alice "); err == nil || !strings.Contains(err.Error(), "leading or trailing whitespace") {
+		t.Fatalf("whitespace value error = %v, want whitespace rejection", err)
+	}
+	if _, err := parseAndMergeTag(tags, strings.Repeat("k", 256)+"=alice"); err == nil || !strings.Contains(err.Error(), "key exceeds 255 characters") {
+		t.Fatalf("long key error = %v, want max length rejection", err)
+	}
 }

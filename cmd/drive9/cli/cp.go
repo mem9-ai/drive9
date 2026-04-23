@@ -10,6 +10,7 @@ import (
 
 	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/tagutil"
 	"go.uber.org/zap"
 )
 
@@ -129,9 +130,11 @@ func parseAndMergeTag(tags map[string]string, raw string) (map[string]string, er
 	if !ok {
 		return nil, fmt.Errorf("invalid --tag %q (expected key=value)", raw)
 	}
-	key = strings.TrimSpace(key)
 	if key == "" {
 		return nil, fmt.Errorf("invalid --tag %q (empty key)", raw)
+	}
+	if err := tagutil.ValidateEntry(key, value); err != nil {
+		return nil, err
 	}
 	if tags == nil {
 		tags = make(map[string]string)

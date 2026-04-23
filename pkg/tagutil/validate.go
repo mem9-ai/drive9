@@ -12,7 +12,7 @@ const MaxLen = 255
 
 // ValidateEntry validates one tag key/value pair for header-style usage.
 func ValidateEntry(key, value string) error {
-	if strings.TrimSpace(key) == "" {
+	if key == "" {
 		return fmt.Errorf("invalid tag key %q: empty key", key)
 	}
 	return validateNonEmptyEntry(key, value)
@@ -21,10 +21,7 @@ func ValidateEntry(key, value string) error {
 // ValidateMap validates a full tag map for JSON request bodies.
 func ValidateMap(tags map[string]string) error {
 	for key, value := range tags {
-		if strings.TrimSpace(key) == "" {
-			return fmt.Errorf("invalid tags: empty key")
-		}
-		if err := validateNonEmptyEntry(key, value); err != nil {
+		if err := ValidateEntry(key, value); err != nil {
 			return err
 		}
 	}
@@ -32,21 +29,30 @@ func ValidateMap(tags map[string]string) error {
 }
 
 func validateNonEmptyEntry(key, value string) error {
-	if strings.Contains(key, "=") {
-		return fmt.Errorf("invalid tag key %q: contains '='", key)
-	}
+	// key constraints
 	if !utf8.ValidString(key) {
 		return fmt.Errorf("invalid tag key %q: contains invalid UTF-8", key)
 	}
 	if containsControlChars(key) {
 		return fmt.Errorf("invalid tag key %q: contains control characters", key)
 	}
+	if key != strings.TrimSpace(key) {
+		return fmt.Errorf("invalid tag key %q: must not have leading or trailing whitespace", key)
+	}
+	if strings.Contains(key, "=") {
+		return fmt.Errorf("invalid tag key %q: contains '='", key)
+	}
+	// value constraints
 	if !utf8.ValidString(value) {
 		return fmt.Errorf("invalid tag value for key %q: contains invalid UTF-8", key)
 	}
 	if containsControlChars(value) {
 		return fmt.Errorf("invalid tag value for key %q: contains control characters", key)
 	}
+	if value != strings.TrimSpace(value) {
+		return fmt.Errorf("invalid tag value for key %q: must not have leading or trailing whitespace", key)
+	}
+	// length constraints
 	if utf8.RuneCountInString(key) > MaxLen {
 		return fmt.Errorf("invalid tags: key exceeds %d characters", MaxLen)
 	}

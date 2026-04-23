@@ -32,9 +32,19 @@ func TestValidateTagsMapRejectsInvalidKeysOrValues(t *testing.T) {
 			want: "contains control characters",
 		},
 		{
+			name: "key has leading or trailing whitespace",
+			tags: map[string]string{" owner ": "alice"},
+			want: "leading or trailing whitespace",
+		},
+		{
 			name: "value contains control chars",
 			tags: map[string]string{"owner": "alice\t"},
 			want: "contains control characters",
+		},
+		{
+			name: "value has leading or trailing whitespace",
+			tags: map[string]string{"owner": " alice "},
+			want: "leading or trailing whitespace",
 		},
 		{
 			name: "key contains invalid utf8",

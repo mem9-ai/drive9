@@ -88,6 +88,8 @@ drive9 fs rm -r :/path/to/dir/
 drive9 fs sh
 ```
 
+When uploading with `drive9 fs cp --tag`, any provided `--tag` flags replace the file's existing tag set on re-upload. Omit `--tag` to preserve existing tags.
+
 ### FUSE mount
 
 Mount the remote filesystem as a local directory (requires FUSE):

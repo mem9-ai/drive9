@@ -1461,22 +1461,20 @@ func parseWriteTagsHeader(header http.Header) (map[string]string, error) {
 	}
 	tags := make(map[string]string, len(raw))
 	for _, entry := range raw {
-		trimmed := strings.TrimSpace(entry)
-		key, value, ok := strings.Cut(trimmed, "=")
+		key, value, ok := strings.Cut(entry, "=")
 		if !ok {
 			return nil, fmt.Errorf("invalid X-Dat9-Tag %q (expected key=value)", entry)
 		}
-		key = strings.TrimSpace(key)
 		if key == "" {
 			return nil, fmt.Errorf("invalid X-Dat9-Tag %q (empty key)", entry)
+		}
+		if err := tagutil.ValidateEntry(key, value); err != nil {
+			return nil, err
 		}
 		if _, dup := tags[key]; dup {
 			return nil, fmt.Errorf("duplicate X-Dat9-Tag key %q", key)
 		}
 		tags[key] = value
-	}
-	if err := tagutil.ValidateMap(tags); err != nil {
-		return nil, err
 	}
 	return tags, nil
 }

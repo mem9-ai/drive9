@@ -264,6 +264,16 @@ func TestWriteRejectsOverlongTagHeaders(t *testing.T) {
 			header: "owner=" + strings.Repeat("v", 256),
 			want:   "value exceeds 255 characters",
 		},
+		{
+			name:   "key has leading or trailing whitespace",
+			header: " owner =alice",
+			want:   "leading or trailing whitespace",
+		},
+		{
+			name:   "value has leading or trailing whitespace",
+			header: "owner=alice ",
+			want:   "leading or trailing whitespace",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
