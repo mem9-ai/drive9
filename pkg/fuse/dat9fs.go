@@ -291,6 +291,35 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 	}
 }
 
+// waitForPriorPathCommitLocked blocks until any earlier async commit for the
+// same path completes, then rebases this handle onto the latest committed inode
+// revision before a new local snapshot is staged. Callers must hold fh.mu.
+func (fs *Dat9FS) waitForPriorPathCommitLocked(fh *FileHandle) {
+	if fs.commitQueue == nil || fh == nil {
+		return
+	}
+
+	path := fh.Path
+	ino := fh.Ino
+	fh.Unlock()
+	fs.commitQueue.WaitPath(path)
+	fh.Lock()
+
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok || entry == nil || entry.Path != path || entry.Revision <= 0 {
+		return
+	}
+	if entry.Revision < fh.BaseRev {
+		return
+	}
+
+	fh.BaseRev = entry.Revision
+	fh.IsNew = false
+	if fh.Streamer != nil {
+		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+	}
+}
+
 // applyAsyncCommittedRevision updates FUSE-side cached state after a background
 // upload commits remotely. It only refreshes clean handles; a handle with local
 // dirty data must keep its older BaseRev so a stale remote success does not mask
@@ -1808,6 +1837,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.St
 		if fh.WriteBackSeq > 0 && fh.WriteBackSeq == fh.DirtySeq {
 			return gofuse.OK
 		}
+		// Preserve close-to-open ordering for the same path: a later close must
+		// stage its snapshot after the prior async commit finishes.
+		fs.waitForPriorPathCommitLocked(fh)
 		size := fh.Dirty.Size()
 		// Only use write-back for small files that haven't started streaming.
 		// A Streamer may exist (Create always attaches one) but as long as
@@ -1866,6 +1898,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.St
 		if fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
 			return gofuse.OK
 		}
+		fs.waitForPriorPathCommitLocked(fh)
 		if err := fs.stageShadowLocked(fh, true); err == nil {
 			if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
 				log.Printf("fsync writeback snapshot failed for %s: %v", fh.Path, err)

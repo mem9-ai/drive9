@@ -9,8 +9,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -894,6 +896,184 @@ done:
 	}
 	if string(lastUploaded) != "version2-longer" {
 		t.Fatalf("uploaded = %q, want %q (stale cache data was used!)", lastUploaded, "version2-longer")
+	}
+}
+
+func TestCommitQueueCloseToOpenWaitsForPriorCommit(t *testing.T) {
+	const remotePath = "/attr.txt"
+	const firstContent = "attr-base"
+	const secondSuffix = "-x"
+
+	var currentRevision atomic.Int64
+	currentRevision.Store(1)
+	var putCount atomic.Int32
+	putExpected := make(chan string, 2)
+	releaseFirstPut := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(currentRevision.Load(), 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read put body: %v", err)
+			}
+			expected := r.Header.Get("X-Dat9-Expected-Revision")
+			putExpected <- expected
+			if putCount.Add(1) == 1 {
+				<-releaseFirstPut
+			}
+			wantExpected := strconv.FormatInt(currentRevision.Load(), 10)
+			if expected != wantExpected {
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			currentRevision.Add(1)
+			w.Header().Set("X-Test-Size", strconv.Itoa(len(body)))
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	cache, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+
+	c := client.New(ts.URL, "")
+	uploader := NewWriteBackUploader(c, cache, 1)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.pendingIndex = pending
+	fs.shadowStore = shadow
+	fs.SetWriteBack(cache, uploader)
+	fs.SetCommitQueue(cq)
+
+	ino := fs.inodes.Lookup(remotePath, false, 0, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	var firstOpen gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &firstOpen)
+	if st != gofuse.OK {
+		t.Fatalf("first Open: %v", st)
+	}
+	if _, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       firstOpen.Fh,
+		Offset:   0,
+	}, []byte(firstContent)); st != gofuse.OK {
+		t.Fatalf("first Write: %v", st)
+	}
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       firstOpen.Fh,
+	})
+	if st != gofuse.OK {
+		t.Fatalf("first Flush: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       firstOpen.Fh,
+	})
+
+	select {
+	case got := <-putExpected:
+		if got != "1" {
+			t.Fatalf("first expected revision = %q, want 1", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first commit never started")
+	}
+
+	var secondOpen gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY),
+	}, &secondOpen)
+	if st != gofuse.OK {
+		t.Fatalf("second Open: %v", st)
+	}
+	secondFH, ok := fs.fileHandles.Get(secondOpen.Fh)
+	if !ok {
+		t.Fatal("second file handle not found")
+	}
+	if secondFH.BaseRev != 1 {
+		t.Fatalf("second handle base revision before wait = %d, want 1", secondFH.BaseRev)
+	}
+	if _, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       secondOpen.Fh,
+		Offset:   uint64(len(firstContent)),
+	}, []byte(secondSuffix)); st != gofuse.OK {
+		t.Fatalf("second Write: %v", st)
+	}
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		flushDone <- fs.Flush(nil, &gofuse.FlushIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       secondOpen.Fh,
+		})
+	}()
+
+	select {
+	case st := <-flushDone:
+		t.Fatalf("second Flush returned before prior commit completed: %v", st)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(releaseFirstPut)
+
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("second Flush: %v", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Flush did not resume after prior commit finished")
+	}
+	if secondFH.BaseRev != 2 {
+		t.Fatalf("second handle base revision after wait = %d, want 2", secondFH.BaseRev)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       secondOpen.Fh,
+	})
+	cq.DrainAll()
+	uploader.DrainAll()
+
+	select {
+	case got := <-putExpected:
+		if got != "2" {
+			t.Fatalf("second expected revision = %q, want 2", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second commit never started")
+	}
+	if got := currentRevision.Load(); got != 3 {
+		t.Fatalf("current revision = %d, want 3", got)
 	}
 }
 
