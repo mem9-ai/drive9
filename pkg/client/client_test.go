@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -32,17 +33,27 @@ func newTestClient(t *testing.T) (*Client, func()) {
 	}
 	testmysql.ResetDB(t, store.DB())
 
-	s3c, err := s3client.NewLocal(s3Dir, "/s3")
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := backend.NewWithS3(store, s3c)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	baseURL := "http://" + ln.Addr().String()
+	s3c, err := s3client.NewLocal(s3Dir, baseURL+"/s3")
+	if err != nil {
+		_ = ln.Close()
+		t.Fatal(err)
+	}
+	b, err := backend.NewWithS3(store, s3c)
+	if err != nil {
+		_ = ln.Close()
+		t.Fatal(err)
+	}
+
 	srv := server.New(b)
-	ts := httptest.NewServer(srv)
+	ts := httptest.NewUnstartedServer(srv)
+	ts.Listener = ln
+	ts.Start()
 
 	cleanup := func() {
 		ts.Close()

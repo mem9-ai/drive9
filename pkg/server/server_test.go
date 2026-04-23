@@ -271,7 +271,7 @@ func TestWriteRejectsOverlongTagHeaders(t *testing.T) {
 		},
 		{
 			name:   "value has leading or trailing whitespace",
-			header: "owner=alice ",
+			header: "owner= alice",
 			want:   "leading or trailing whitespace",
 		},
 	}
