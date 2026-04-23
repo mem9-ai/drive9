@@ -655,15 +655,32 @@ func (c *Client) Find(pathPrefix string, params url.Values) ([]SearchResult, err
 	return results, nil
 }
 
-func setTagHeaders(req *http.Request, tags map[string]string) error {
+// validateTags applies the same client-side validation across direct PUT,
+// multipart upload, and resume flows. Multipart tags are still sent only in
+// the final complete request, but validating up front avoids uploading parts
+// before discovering an invalid tag and prevents json.Marshal from silently
+// replacing invalid UTF-8 in complete payloads.
+func validateTags(tags map[string]string) error {
 	if len(tags) == 0 {
 		return nil
 	}
-	keys := make([]string, 0, len(tags))
 	for k := range tags {
 		if err := tagutil.ValidateEntry(k, tags[k]); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func setTagHeaders(req *http.Request, tags map[string]string) error {
+	if len(tags) == 0 {
+		return nil
+	}
+	if err := validateTags(tags); err != nil {
+		return err
+	}
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)

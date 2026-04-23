@@ -455,6 +455,33 @@ func TestWriteStreamWithSummaryAndTagsLegacyCompleteClearsTagsWithEmptyMap(t *te
 	}
 }
 
+func TestWriteStreamV1WithSummaryRejectsInvalidTagsBeforeInitiate(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	err := c.writeStreamV1WithSummary(
+		context.Background(),
+		"/legacy-invalid-tags.bin",
+		bytes.NewReader([]byte("12345678")),
+		8,
+		nil,
+		-1,
+		&UploadSummary{},
+		map[string]string{"owner": string([]byte{0xff})},
+	)
+	if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
+		t.Fatalf("error = %v, want invalid UTF-8", err)
+	}
+	if requests != 0 {
+		t.Fatalf("request count = %d, want 0", requests)
+	}
+}
+
 func TestWriteStreamV2SinglePart(t *testing.T) {
 	var uploaded []byte
 	var progressCalls [][2]int
@@ -699,6 +726,78 @@ func TestWriteStreamWithSummaryAndTagsV2CompleteClearsTagsWithEmptyMap(t *testin
 	if len(completeReq.Tags) != 0 {
 		t.Fatalf("complete tags = %+v, want explicit empty map", completeReq.Tags)
 	}
+}
+
+func TestWriteStreamV2WithSummaryRejectsInvalidTagsBeforeInitiate(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	err := c.writeStreamV2WithSummary(
+		context.Background(),
+		"/v2-invalid-tags.bin",
+		bytes.NewReader([]byte("abcdefgh")),
+		8,
+		nil,
+		-1,
+		&UploadSummary{},
+		map[string]string{"owner": string([]byte{0xff})},
+	)
+	if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
+		t.Fatalf("error = %v, want invalid UTF-8", err)
+	}
+	if requests != 0 {
+		t.Fatalf("request count = %d, want 0", requests)
+	}
+}
+
+func TestCompleteUploadHelpersRejectInvalidTagsBeforeRequest(t *testing.T) {
+	t.Run("v1", func(t *testing.T) {
+		requests := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			http.NotFound(w, r)
+		}))
+		defer srv.Close()
+
+		c := New(srv.URL, "")
+		err := c.completeUploadWithTags(context.Background(), "legacy-invalid-tags", map[string]string{
+			"owner": string([]byte{0xff}),
+		})
+		if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
+			t.Fatalf("error = %v, want invalid UTF-8", err)
+		}
+		if requests != 0 {
+			t.Fatalf("request count = %d, want 0", requests)
+		}
+	})
+
+	t.Run("v2", func(t *testing.T) {
+		requests := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			http.NotFound(w, r)
+		}))
+		defer srv.Close()
+
+		c := New(srv.URL, "")
+		err := c.completeUploadV2(context.Background(), "v2-invalid-tags", []completePart{{
+			Number: 1,
+			ETag:   `"etag-1"`,
+		}}, map[string]string{
+			"owner": string([]byte{0xff}),
+		})
+		if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
+			t.Fatalf("error = %v, want invalid UTF-8", err)
+		}
+		if requests != 0 {
+			t.Fatalf("request count = %d, want 0", requests)
+		}
+	})
 }
 
 func TestWriteStreamV2MultiPartUsesPlanPartSize(t *testing.T) {
@@ -1738,6 +1837,31 @@ func TestResumeUploadWithSummaryAndTagsClearsTagsWithEmptyMap(t *testing.T) {
 	}
 	if len(completeReq.Tags) != 0 {
 		t.Fatalf("complete tags = %+v, want explicit empty map", completeReq.Tags)
+	}
+}
+
+func TestResumeUploadWithSummaryAndTagsRejectsInvalidTagsBeforeRequests(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	_, err := c.ResumeUploadWithSummaryAndTags(
+		context.Background(),
+		"/resume-invalid-tags.bin",
+		bytes.NewReader([]byte("aaaabbbb")),
+		8,
+		nil,
+		map[string]string{"owner": string([]byte{0xff})},
+	)
+	if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
+		t.Fatalf("error = %v, want invalid UTF-8", err)
+	}
+	if requests != 0 {
+		t.Fatalf("request count = %d, want 0", requests)
 	}
 }
 

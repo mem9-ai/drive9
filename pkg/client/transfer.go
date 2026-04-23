@@ -270,6 +270,11 @@ func (c *Client) WriteStreamConditional(ctx context.Context, path string, r io.R
 }
 
 func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, tags map[string]string) (*UploadSummary, error) {
+	// Large uploads only send tags on complete, but validation must happen
+	// before any initiate/presign/upload work so invalid tags fail early.
+	if err := validateTags(tags); err != nil {
+		return nil, err
+	}
 	threshold := int64(DefaultSmallFileThreshold)
 	if c.smallFileThreshold > 0 {
 		threshold = c.smallFileThreshold
@@ -332,6 +337,9 @@ func finishUploadSummary(summary *UploadSummary) *UploadSummary {
 }
 
 func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string) error {
+	if err := validateTags(tags); err != nil {
+		return err
+	}
 	if summary != nil {
 		summary.Mode = "multipart_v1"
 	}
@@ -384,6 +392,9 @@ func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra i
 }
 
 func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string) error {
+	if err := validateTags(tags); err != nil {
+		return err
+	}
 	initiateStart := time.Now()
 	plan, err := c.initiateUploadV2(ctx, path, size, expectedRevision)
 	if err != nil {
@@ -676,6 +687,9 @@ func (c *Client) completeUpload(ctx context.Context, uploadID string) error {
 func (c *Client) completeUploadWithTags(ctx context.Context, uploadID string, tags map[string]string) error {
 	var body io.Reader
 	if tags != nil {
+		if err := validateTags(tags); err != nil {
+			return err
+		}
 		payload, err := json.Marshal(struct {
 			Tags map[string]string `json:"tags"`
 		}{Tags: tags})
@@ -1009,6 +1023,9 @@ func (c *Client) presignOnePart(ctx context.Context, uploadID string, partNumber
 // completeUploadV2 sends the part list (and optional tags) to
 // POST /v2/uploads/{id}/complete.
 func (c *Client) completeUploadV2(ctx context.Context, uploadID string, parts []completePart, tags map[string]string) error {
+	if err := validateTags(tags); err != nil {
+		return err
+	}
 	body, err := json.Marshal(struct {
 		Parts []completePart    `json:"parts"`
 		Tags  map[string]string `json:"tags"`
@@ -1439,6 +1456,11 @@ func (c *Client) ResumeUploadWithSummary(ctx context.Context, path string, r io.
 // the resulting revision on completion, and returns coarse-grained phase
 // timings for the completed resume flow.
 func (c *Client) ResumeUploadWithSummaryAndTags(ctx context.Context, path string, r io.ReaderAt, totalSize int64, progress ProgressFunc, tags map[string]string) (*UploadSummary, error) {
+	// Resume also applies tags only during complete, so validate here before we
+	// query/resume/upload additional parts.
+	if err := validateTags(tags); err != nil {
+		return nil, err
+	}
 	summary := &UploadSummary{
 		Type:       "upload_summary",
 		Mode:       "resume_v1",
