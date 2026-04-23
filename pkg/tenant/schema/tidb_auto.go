@@ -545,6 +545,29 @@ func loadShowCreateTable(ctx context.Context, db *sql.DB, tableName string) (str
 	return createStmt, nil
 }
 
+func loadTiDBIndexNames(ctx context.Context, db *sql.DB, tableName string) (map[string]struct{}, error) {
+	rows, err := db.QueryContext(ctx, `SELECT DISTINCT index_name
+		FROM information_schema.statistics
+		WHERE table_schema = DATABASE() AND table_name = ?`, tableName)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	indexNames := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		indexNames[strings.ToLower(name)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return indexNames, nil
+}
+
 func normalizeSQLFragment(s string) string {
 	return schemaspec.NormalizeSQLFragment(s)
 }
@@ -587,7 +610,11 @@ func diffTiDBTable(ctx context.Context, db *sql.DB, table tidbTableSpec) ([]tidb
 	if err != nil {
 		return nil, fmt.Errorf("show create %s: %w", table.name, err)
 	}
-	return diffTiDBTableMeta(table, meta, createStmt), nil
+	indexNames, err := loadTiDBIndexNames(ctx, db, table.name)
+	if err != nil {
+		return nil, fmt.Errorf("load %s index metadata: %w", table.name, err)
+	}
+	return diffTiDBTableMetaWithObservedIndexes(table, meta, createStmt, indexNames), nil
 }
 
 func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
@@ -940,6 +967,10 @@ func parseAlterTableAddIndexStatement(stmt string) (tableName, indexName, create
 }
 
 func diffTiDBTableMeta(table tidbTableSpec, meta tidbTableMeta, createStmt string) []tidbSchemaDiff {
+	return diffTiDBTableMetaWithObservedIndexes(table, meta, createStmt, parseObservedTiDBIndexes(createStmt))
+}
+
+func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMeta, createStmt string, observedIndexes map[string]struct{}) []tidbSchemaDiff {
 	var diffs []tidbSchemaDiff
 	for _, name := range sortedColumnNames(table.columns) {
 		spec := table.columns[name]
@@ -979,10 +1010,9 @@ func diffTiDBTableMeta(table tidbTableSpec, meta tidbTableMeta, createStmt strin
 			})
 		}
 	}
-	normalizedCreate := normalizeSQLFragment(createStmt)
 	for _, name := range sortedIndexNames(table.indexes) {
 		spec := table.indexes[name]
-		if !showCreateHasIndex(normalizedCreate, name) {
+		if !hasObservedTiDBIndex(observedIndexes, name) {
 			diffs = append(diffs, tidbSchemaDiff{
 				kind:      tidbSchemaDiffMissingIndex,
 				tableName: table.name,
@@ -995,6 +1025,54 @@ func diffTiDBTableMeta(table tidbTableSpec, meta tidbTableMeta, createStmt strin
 		diffs = append(diffs, table.validate(meta)...)
 	}
 	return diffs
+}
+
+func hasObservedTiDBIndex(observedIndexes map[string]struct{}, indexName string) bool {
+	if len(observedIndexes) == 0 {
+		return false
+	}
+	_, ok := observedIndexes[strings.ToLower(indexName)]
+	return ok
+}
+
+func parseObservedTiDBIndexes(createStmt string) map[string]struct{} {
+	_, defs, ok, err := parseCreateTableStatement(createStmt)
+	if err != nil || !ok {
+		return nil
+	}
+	observed := make(map[string]struct{})
+	for _, def := range splitTopLevelComma(defs) {
+		def = strings.TrimSpace(def)
+		if def == "" {
+			continue
+		}
+		normalized := normalizeSQLFragment(def)
+		switch {
+		case strings.HasPrefix(normalized, "primary key") || strings.Contains(normalized, " primary key"):
+			observed["primary"] = struct{}{}
+		case strings.HasPrefix(normalized, "constraint ") && strings.Contains(normalized, " unique key "):
+			if name, _ := parseIndexNameAndColumns(def, "UNIQUE KEY"); name != "" {
+				observed[name] = struct{}{}
+			}
+		case strings.HasPrefix(normalized, "unique key "):
+			if name, _ := parseIndexNameAndColumns(def, "UNIQUE KEY"); name != "" {
+				observed[name] = struct{}{}
+			}
+		case strings.HasPrefix(normalized, "unique index "):
+			if name, _ := parseIndexNameAndColumns(def, "UNIQUE INDEX"); name != "" {
+				observed[name] = struct{}{}
+			}
+		case strings.HasPrefix(normalized, "index "):
+			if name, _ := parseIndexNameAndColumns(def, "INDEX"); name != "" {
+				observed[name] = struct{}{}
+			}
+		case strings.HasPrefix(normalized, "key "):
+			if name, _ := parseIndexNameAndColumns(def, "KEY"); name != "" {
+				observed[name] = struct{}{}
+			}
+		}
+	}
+	return observed
 }
 
 func parsePrimaryKeyColumnsFromCreateStatement(createStmt string) ([]string, bool) {
@@ -1105,11 +1183,11 @@ func isSafeAddIndexRepairSQL(sqlText string, tableMissing bool) bool {
 		return true
 	}
 	if strings.HasPrefix(normalized, "create unique index ") {
-		return tableMissing
+		return true
 	}
 	if strings.HasPrefix(normalized, "alter table ") {
 		if strings.Contains(normalized, " add unique index ") || strings.Contains(normalized, " add unique key ") {
-			return tableMissing
+			return true
 		}
 		if strings.Contains(normalized, " add fulltext index ") || strings.Contains(normalized, " add vector index ") || strings.Contains(normalized, " add index ") || strings.Contains(normalized, " add key ") {
 			return true
@@ -1224,9 +1302,4 @@ func sortedIndexNames(indexes map[string]tidbIndexSpec) []string {
 	}
 	sort.Strings(names)
 	return names
-}
-
-func showCreateHasIndex(normalizedCreate, indexName string) bool {
-	needle := strings.ToLower(indexName) + " ("
-	return strings.Contains(normalizedCreate, needle)
 }

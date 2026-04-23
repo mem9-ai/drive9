@@ -204,18 +204,21 @@ func TestPlannedTiDBSchemaRepairsIncludesSafeStatementsOnly(t *testing.T) {
 	}
 }
 
-func TestPlannedTiDBSchemaRepairsSkipsUnsafeUniqueIndexOnExistingTable(t *testing.T) {
+func TestPlannedTiDBSchemaRepairsAllowsUniqueIndexOnExistingTable(t *testing.T) {
 	diffs := []tidbSchemaDiff{
 		{kind: tidbSchemaDiffMissingIndex, tableName: "uploads", detail: "uploads schema contract: missing idx_upload_path index", repairSQL: "CREATE INDEX idx_upload_path ON uploads(target_path, status)"},
 		{kind: tidbSchemaDiffMissingIndex, tableName: "uploads", detail: "uploads schema contract: missing idx_idempotency index", repairSQL: "CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)"},
 	}
 
 	got := plannedTiDBSchemaRepairs(diffs)
-	if len(got) != 1 {
-		t.Fatalf("expected one safe repair statement, got %#v", got)
+	if len(got) != 2 {
+		t.Fatalf("expected both missing indexes to be auto-repaired, got %#v", got)
 	}
 	if got[0] != "CREATE INDEX idx_upload_path ON uploads(target_path, status)" {
-		t.Fatalf("unexpected repair statement: %q", got[0])
+		t.Fatalf("unexpected first repair statement: %q", got[0])
+	}
+	if got[1] != "CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)" {
+		t.Fatalf("unexpected second repair statement: %q", got[1])
 	}
 }
 
@@ -246,6 +249,24 @@ func TestDiffTiDBTableMetaReportsMissingRequiredIndex(t *testing.T) {
 	}
 	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "idx_idempotency") {
 		t.Fatalf("expected missing idx_idempotency diff, got %#v", diffs)
+	}
+}
+
+func TestDiffTiDBTableMetaRecognizesUniqueIndexFromCreateStatement(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "uploads")
+	meta := testUploadsTableMeta(true)
+	createStmt := `CREATE TABLE uploads (
+		upload_id VARCHAR(64) PRIMARY KEY,
+		target_path VARCHAR(512) NOT NULL,
+		status VARCHAR(32) NOT NULL,
+		expected_revision BIGINT NULL,
+		active_target_path VARCHAR(512),
+		UNIQUE KEY idx_uploads_active (active_target_path)
+	)`
+
+	diffs := diffTiDBTableMeta(spec, meta, createStmt)
+	if hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "idx_uploads_active") {
+		t.Fatalf("did not expect idx_uploads_active to be reported missing, got %#v", diffs)
 	}
 }
 
