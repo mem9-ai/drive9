@@ -130,6 +130,9 @@ func TestTiDBSchemaSpecFromStatementsParsesNewTableAutomatically(t *testing.T) {
 	if _, ok := table.indexes["idx_example_events_tenant"]; !ok {
 		t.Fatal("expected idx_example_events_tenant index in parsed schema spec")
 	}
+	if !equalStringSlices(table.primaryKey.columns, []string{"event_id"}) {
+		t.Fatalf("primary key columns=%#v, want [event_id]", table.primaryKey.columns)
+	}
 }
 
 func TestTiDBSchemaSpecFromStatementsAttachesExternalIndexesWithoutStalePointers(t *testing.T) {
@@ -274,6 +277,60 @@ func TestDiffTiDBTableMetaReportsFileNodesAndFileTagsMissingIndexes(t *testing.T
 	tagsDiffs := diffTiDBTableMeta(tagsSpec, tagsMeta, `CREATE TABLE file_tags (file_id VARCHAR(64), tag_key VARCHAR(255), tag_value VARCHAR(255))`)
 	if !hasDiffKindAndDetail(tagsDiffs, tidbSchemaDiffMissingIndex, "idx_kv") {
 		t.Fatalf("expected missing idx_kv diff, got %#v", tagsDiffs)
+	}
+}
+
+func TestTiDBSchemaSpecForModeCapturesCompositePrimaryKey(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "file_tags")
+	if !equalStringSlices(spec.primaryKey.columns, []string{"file_id", "tag_key"}) {
+		t.Fatalf("file_tags primary key=%#v, want [file_id tag_key]", spec.primaryKey.columns)
+	}
+}
+
+func TestDiffTiDBTableMetaReportsMissingPrimaryKeyConstraint(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "file_tags")
+	meta := tidbTableMeta{
+		tableName: "file_tags",
+		columns: map[string]tidbColumnMeta{
+			"file_id":   {columnType: "varchar(64)"},
+			"tag_key":   {columnType: "varchar(255)"},
+			"tag_value": {columnType: "varchar(255)"},
+		},
+	}
+	createStmt := `CREATE TABLE file_tags (
+		file_id VARCHAR(64) NOT NULL,
+		tag_key VARCHAR(255) NOT NULL,
+		tag_value VARCHAR(255),
+		KEY idx_kv (tag_key, tag_value)
+	)`
+
+	diffs := diffTiDBTableMeta(spec, meta, createStmt)
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffTableContract, "missing primary key") {
+		t.Fatalf("expected missing primary key diff, got %#v", diffs)
+	}
+}
+
+func TestDiffTiDBTableMetaReportsPrimaryKeyColumnMismatch(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "file_tags")
+	meta := tidbTableMeta{
+		tableName: "file_tags",
+		columns: map[string]tidbColumnMeta{
+			"file_id":   {columnType: "varchar(64)"},
+			"tag_key":   {columnType: "varchar(255)"},
+			"tag_value": {columnType: "varchar(255)"},
+		},
+	}
+	createStmt := `CREATE TABLE file_tags (
+		file_id VARCHAR(64) NOT NULL,
+		tag_key VARCHAR(255) NOT NULL,
+		tag_value VARCHAR(255),
+		PRIMARY KEY (tag_key, file_id),
+		KEY idx_kv (tag_key, tag_value)
+	)`
+
+	diffs := diffTiDBTableMeta(spec, meta, createStmt)
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffTableContract, "primary key columns") {
+		t.Fatalf("expected primary key mismatch diff, got %#v", diffs)
 	}
 }
 

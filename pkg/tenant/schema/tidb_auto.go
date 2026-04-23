@@ -110,6 +110,7 @@ type tidbTableSpec struct {
 	createStatement string
 	columns         map[string]tidbColumnSpec
 	indexes         map[string]tidbIndexSpec
+	primaryKey      tidbPrimaryKeySpec
 	validate        func(tidbTableMeta) []tidbSchemaDiff
 }
 
@@ -120,6 +121,10 @@ type tidbColumnSpec struct {
 
 type tidbIndexSpec struct {
 	createSQL string
+}
+
+type tidbPrimaryKeySpec struct {
+	columns []string
 }
 
 type tidbSchemaDiffError struct {
@@ -680,9 +685,14 @@ func parseCreateTableSpec(stmt string) (tidbTableSpec, bool, error) {
 	}
 	columns := make(map[string]tidbColumnSpec)
 	indexes := make(map[string]tidbIndexSpec)
+	var primaryKey tidbPrimaryKeySpec
 	for _, def := range splitTopLevelComma(defs) {
 		def = strings.TrimSpace(def)
 		if def == "" {
+			continue
+		}
+		if pkSpec, ok := parsePrimaryKeyDefinition(def); ok {
+			primaryKey = pkSpec
 			continue
 		}
 		if indexName, createSQL, ok := parseInlineIndexDefinition(tableName, def); ok {
@@ -697,23 +707,35 @@ func parseCreateTableSpec(stmt string) (tidbTableSpec, bool, error) {
 			continue
 		}
 		columns[colName] = colSpec
+		if pkCol, ok := parseInlinePrimaryKeyColumn(def); ok {
+			primaryKey = tidbPrimaryKeySpec{columns: []string{pkCol}}
+		}
 	}
 	return tidbTableSpec{
 		name:            tableName,
 		createStatement: strings.TrimSpace(stmt),
 		columns:         columns,
 		indexes:         indexes,
+		primaryKey:      primaryKey,
 	}, true, nil
 }
 
 func parseCreateTableStatement(stmt string) (tableName string, definitions string, ok bool, err error) {
 	lower := strings.ToLower(stmt)
-	const prefix = "create table if not exists"
-	start := strings.Index(lower, prefix)
+	prefixes := []string{"create table if not exists", "create table"}
+	start := -1
+	prefixLen := 0
+	for _, prefix := range prefixes {
+		if idx := strings.Index(lower, prefix); idx >= 0 {
+			start = idx
+			prefixLen = len(prefix)
+			break
+		}
+	}
 	if start < 0 {
 		return "", "", false, nil
 	}
-	i := start + len(prefix)
+	i := start + prefixLen
 	for i < len(stmt) && (stmt[i] == ' ' || stmt[i] == '\n' || stmt[i] == '\t' || stmt[i] == '\r') {
 		i++
 	}
@@ -871,6 +893,80 @@ func parseIndexNameAndColumns(def, prefix string) (indexName, columns string) {
 		return "", ""
 	}
 	return strings.ToLower(name), strings.TrimSpace(remainder[open:])
+}
+
+func parsePrimaryKeyDefinition(def string) (tidbPrimaryKeySpec, bool) {
+	normalized := normalizeSQLFragment(def)
+	isPrimaryConstraint := strings.HasPrefix(normalized, "primary key")
+	isNamedPrimaryConstraint := strings.HasPrefix(normalized, "constraint ") && strings.Contains(normalized, " primary key ")
+	if !isPrimaryConstraint && !isNamedPrimaryConstraint {
+		return tidbPrimaryKeySpec{}, false
+	}
+	columns := parseKeyColumnList(def, "PRIMARY KEY")
+	if len(columns) == 0 {
+		return tidbPrimaryKeySpec{}, false
+	}
+	return tidbPrimaryKeySpec{columns: columns}, true
+}
+
+func parseInlinePrimaryKeyColumn(def string) (string, bool) {
+	if !strings.Contains(normalizeSQLFragment(def), " primary key") {
+		return "", false
+	}
+	name, rest := splitIdentifierAndRest(strings.TrimSpace(def))
+	if name == "" || rest == "" {
+		return "", false
+	}
+	return strings.ToLower(name), true
+}
+
+func parseKeyColumnList(def, token string) []string {
+	upper := strings.ToUpper(def)
+	pos := strings.Index(upper, token)
+	if pos < 0 {
+		return nil
+	}
+	rest := strings.TrimSpace(def[pos+len(token):])
+	open := strings.Index(rest, "(")
+	close := strings.LastIndex(rest, ")")
+	if open < 0 || close <= open {
+		return nil
+	}
+	inner := strings.TrimSpace(rest[open+1 : close])
+	if inner == "" {
+		return nil
+	}
+	parts := splitTopLevelComma(inner)
+	columns := make([]string, 0, len(parts))
+	for _, part := range parts {
+		name := parseColumnReferenceName(part)
+		if name == "" {
+			return nil
+		}
+		columns = append(columns, name)
+	}
+	return columns
+}
+
+func parseColumnReferenceName(def string) string {
+	trimmed := strings.TrimSpace(def)
+	if trimmed == "" {
+		return ""
+	}
+	if trimmed[0] == '`' {
+		end := strings.Index(trimmed[1:], "`")
+		if end < 0 {
+			return ""
+		}
+		return strings.ToLower(trimmed[1 : 1+end])
+	}
+	for i := 0; i < len(trimmed); i++ {
+		switch trimmed[i] {
+		case ' ', '\t', '\n', '\r', '(':
+			return strings.ToLower(trimmed[:i])
+		}
+	}
+	return strings.ToLower(trimmed)
 }
 
 func parseColumnDefinition(tableName, def string) (string, tidbColumnSpec, bool) {
@@ -1065,6 +1161,22 @@ func diffTiDBTableMeta(table tidbTableSpec, meta tidbTableMeta, createStmt strin
 			})
 		}
 	}
+	if len(table.primaryKey.columns) > 0 {
+		actualPrimaryKey, ok := parsePrimaryKeyColumnsFromCreateStatement(createStmt)
+		if !ok {
+			diffs = append(diffs, tidbSchemaDiff{
+				kind:      tidbSchemaDiffTableContract,
+				tableName: table.name,
+				detail:    fmt.Sprintf("%s schema contract: missing primary key constraint", table.name),
+			})
+		} else if !equalStringSlices(actualPrimaryKey, table.primaryKey.columns) {
+			diffs = append(diffs, tidbSchemaDiff{
+				kind:      tidbSchemaDiffTableContract,
+				tableName: table.name,
+				detail:    fmt.Sprintf("%s schema contract: primary key columns = (%s), want (%s)", table.name, strings.Join(actualPrimaryKey, ", "), strings.Join(table.primaryKey.columns, ", ")),
+			})
+		}
+	}
 	normalizedCreate := normalizeSQLFragment(createStmt)
 	for _, name := range sortedIndexNames(table.indexes) {
 		spec := table.indexes[name]
@@ -1081,6 +1193,38 @@ func diffTiDBTableMeta(table tidbTableSpec, meta tidbTableMeta, createStmt strin
 		diffs = append(diffs, table.validate(meta)...)
 	}
 	return diffs
+}
+
+func parsePrimaryKeyColumnsFromCreateStatement(createStmt string) ([]string, bool) {
+	_, defs, ok, err := parseCreateTableStatement(createStmt)
+	if err != nil || !ok {
+		return nil, false
+	}
+	for _, def := range splitTopLevelComma(defs) {
+		def = strings.TrimSpace(def)
+		if def == "" {
+			continue
+		}
+		if pkSpec, ok := parsePrimaryKeyDefinition(def); ok {
+			return pkSpec.columns, true
+		}
+		if columnName, ok := parseInlinePrimaryKeyColumn(def); ok {
+			return []string{columnName}, true
+		}
+	}
+	return nil, false
+}
+
+func equalStringSlices(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func missingTableDiff(table tidbTableSpec) tidbSchemaDiff {
