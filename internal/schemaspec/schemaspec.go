@@ -215,6 +215,7 @@ func ParseColumnType(rest string) string {
 	if rest == "" {
 		return ""
 	}
+	lowerRest := strings.ToLower(rest)
 	keywords := []string{
 		" not ",
 		" null",
@@ -267,7 +268,7 @@ func ParseColumnType(rest string) string {
 		if inSingle || inDouble || inBacktick || depth > 0 {
 			continue
 		}
-		suffix := " " + strings.ToLower(rest[i:])
+		suffix := " " + lowerRest[i:]
 		for _, kw := range keywords {
 			if strings.HasPrefix(suffix, kw) {
 				return strings.TrimSpace(rest[:i])
@@ -287,10 +288,16 @@ func IsSafeAddColumnRepairSQL(sqlText string) bool {
 	if isGeneratedColumnAddSQL(n) {
 		return false
 	}
-	if strings.Contains(n, " not null") && !strings.Contains(n, " default ") {
+	if strings.Contains(n, " not null") && !hasDefaultClause(n) {
 		return false
 	}
 	return true
+}
+
+func hasDefaultClause(normalizedSQL string) bool {
+	return strings.Contains(normalizedSQL, " default ") ||
+		strings.Contains(normalizedSQL, " default(") ||
+		strings.HasSuffix(normalizedSQL, " default")
 }
 
 func isGeneratedColumnAddSQL(normalizedSQL string) bool {
@@ -312,11 +319,16 @@ func IsIgnorableMySQLError(err error) bool {
 		case 1050, 1060, 1061:
 			return true
 		}
-		msg := strings.ToLower(me.Message)
-		return strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate")
+		return isIgnorableDDLMessage(me.Message)
 	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate")
+	return isIgnorableDDLMessage(err.Error())
+}
+
+func isIgnorableDDLMessage(msg string) bool {
+	msg = strings.ToLower(msg)
+	return strings.Contains(msg, "already exists") ||
+		strings.Contains(msg, "duplicate column name") ||
+		strings.Contains(msg, "duplicate key name")
 }
 
 // CRC32Version hashes normalized schema statements and always returns a

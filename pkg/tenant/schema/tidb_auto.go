@@ -1024,7 +1024,7 @@ func parseAlterTableAddIndexStatement(stmt string) (tableName, indexName, create
 	}
 	table := strings.ToLower(fields[0])
 
-	markers := []string{" add fulltext index ", " add vector index ", " add unique index ", " add index ", " add key "}
+	markers := []string{" add fulltext index ", " add vector index ", " add unique index ", " add unique key ", " add index ", " add key "}
 	for _, marker := range markers {
 		pos := strings.Index(normalized, marker)
 		if pos < 0 {
@@ -1093,6 +1093,7 @@ func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMet
 			})
 		}
 	}
+<<<<<<< HEAD
 	if !indexesObserved {
 		if len(table.indexes) > 0 {
 			diffs = append(diffs, tidbSchemaDiff{
@@ -1319,7 +1320,10 @@ func isSafeAddIndexRepairSQL(sqlText string, tableMissing bool) bool {
 		if strings.Contains(normalized, " add unique index ") || strings.Contains(normalized, " add unique key ") {
 			return true
 		}
-		if strings.Contains(normalized, " add fulltext index ") || strings.Contains(normalized, " add vector index ") || strings.Contains(normalized, " add index ") || strings.Contains(normalized, " add key ") {
+		if strings.Contains(normalized, " add fulltext index ") || strings.Contains(normalized, " add vector index ") {
+			return tableMissing
+		}
+		if strings.Contains(normalized, " add index ") || strings.Contains(normalized, " add key ") {
 			return true
 		}
 	}

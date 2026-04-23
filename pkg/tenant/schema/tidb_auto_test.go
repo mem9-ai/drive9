@@ -546,7 +546,7 @@ func TestTiDBSchemaSpecForAppModeExcludesOptionalIndexes(t *testing.T) {
 	}
 }
 
-func TestPlannedTiDBSchemaRepairsIncludesAlterTableIndexRepairs(t *testing.T) {
+func TestPlannedTiDBSchemaRepairsSkipsHeavyAlterTableIndexRepairsOnExistingTable(t *testing.T) {
 	diffs := []tidbSchemaDiff{
 		{
 			kind:      tidbSchemaDiffMissingIndex,
@@ -557,11 +557,32 @@ func TestPlannedTiDBSchemaRepairsIncludesAlterTableIndexRepairs(t *testing.T) {
 	}
 
 	got := plannedTiDBSchemaRepairs(diffs)
-	if len(got) != 1 {
-		t.Fatalf("expected one repair statement, got %#v", got)
+	if len(got) != 0 {
+		t.Fatalf("expected heavy index repair to be skipped on existing table, got %#v", got)
 	}
-	if got[0] != "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)" {
-		t.Fatalf("unexpected repair statement: %q", got[0])
+}
+
+func TestPlannedTiDBSchemaRepairsAllowsHeavyAlterTableIndexRepairsWhenTableMissing(t *testing.T) {
+	diffs := []tidbSchemaDiff{
+		{
+			kind:      tidbSchemaDiffMissingTable,
+			tableName: "files",
+			repairSQL: "CREATE TABLE IF NOT EXISTS files (...)",
+		},
+		{
+			kind:      tidbSchemaDiffMissingIndex,
+			tableName: "files",
+			detail:    "files schema contract: missing idx_fts_content index",
+			repairSQL: "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)",
+		},
+	}
+
+	got := plannedTiDBSchemaRepairs(diffs)
+	if len(got) != 2 {
+		t.Fatalf("expected create table and heavy index repair, got %#v", got)
+	}
+	if got[1] != "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)" {
+		t.Fatalf("unexpected second repair statement: %q", got[1])
 	}
 }
 
@@ -683,7 +704,7 @@ func TestIsIgnorableTiDBSchemaError(t *testing.T) {
 		{
 			name: "plain duplicate",
 			err:  errors.New("duplicate entry"),
-			want: true,
+			want: false,
 		},
 		{
 			name: "non ignorable mysql",
@@ -703,6 +724,24 @@ func TestIsIgnorableTiDBSchemaError(t *testing.T) {
 				t.Fatalf("isIgnorableTiDBSchemaError()=%v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseAlterTableAddIndexStatementAcceptsUniqueKey(t *testing.T) {
+	tableName, indexName, createSQL, ok := parseAlterTableAddIndexStatement(
+		"ALTER TABLE uploads ADD UNIQUE KEY uk_uploads_target (target_path)",
+	)
+	if !ok {
+		t.Fatal("expected ALTER TABLE ... ADD UNIQUE KEY to parse")
+	}
+	if tableName != "uploads" {
+		t.Fatalf("tableName=%q, want uploads", tableName)
+	}
+	if indexName != "uk_uploads_target" {
+		t.Fatalf("indexName=%q, want uk_uploads_target", indexName)
+	}
+	if createSQL != "ALTER TABLE uploads ADD UNIQUE KEY uk_uploads_target (target_path)" {
+		t.Fatalf("createSQL=%q", createSQL)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"fmt"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/semantic"
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
@@ -319,6 +321,24 @@ func TestPoolCreateBackendReturnsValidationErrorWhenPeriodicCheckFails(t *testin
 		t.Fatal("expected periodic validation failure to propagate")
 	} else if !strings.Contains(err.Error(), "validate tidb auto-embedding schema") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRecordTenantSchemaVersionUpdateFailureRecordsMetric(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	before := recorder.Body.String()
+	if strings.Contains(before, `dat9_service_operations_total{component="tenant_pool",operation="update_schema_version_failed",result="error"}`) {
+		t.Fatal("unexpected pre-existing update_schema_version_failed metric")
+	}
+
+	recordTenantSchemaVersionUpdateFailure(context.Background(), "tenant-metric", 42, fmt.Errorf("meta unavailable"))
+
+	recorder = httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	after := recorder.Body.String()
+	if !strings.Contains(after, `dat9_service_operations_total{component="tenant_pool",operation="update_schema_version_failed",result="error"} 1`) {
+		t.Fatalf("expected update_schema_version_failed metric in output: %s", after)
 	}
 }
 

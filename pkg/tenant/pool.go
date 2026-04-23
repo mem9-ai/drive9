@@ -350,10 +350,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 				// opens will be caught on the next open because its stored
 				// version will differ from CurrentTiDBTenantSchemaVersion.
 				if verErr := p.metaStore.UpdateTenantSchemaVersion(ctx, t.ID, schema.CurrentTiDBTenantSchemaVersion); verErr != nil {
-					logger.Warn(ctx, "tenant_pool_update_schema_version_failed",
-						zap.String("tenant_id", t.ID),
-						zap.Int("version", schema.CurrentTiDBTenantSchemaVersion),
-						zap.Error(verErr))
+					recordTenantSchemaVersionUpdateFailure(ctx, t.ID, schema.CurrentTiDBTenantSchemaVersion, verErr)
 				}
 			}
 		} else if p.shouldPeriodicValidateTiDBSchemaOnOpen() {
@@ -471,6 +468,14 @@ func (p *Pool) shouldPeriodicValidateTiDBSchemaOnOpen() bool {
 	}
 	count := p.tidbSchemaValidationOpens.Add(1)
 	return count == 1 || count%every == 0
+}
+
+func recordTenantSchemaVersionUpdateFailure(ctx context.Context, tenantID string, version int, err error) {
+	logger.Warn(ctx, "tenant_pool_update_schema_version_failed",
+		zap.String("tenant_id", tenantID),
+		zap.Int("version", version),
+		zap.Error(err))
+	metrics.RecordOperation("tenant_pool", "update_schema_version_failed", "error", 0)
 }
 
 // wireQuotaStore sets the central quota store on a newly created backend.

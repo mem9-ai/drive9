@@ -110,8 +110,20 @@ func applyMySQLPoolDefaults(db *sql.DB) {
 	mysqlutil.ApplyPoolDefaults(db)
 }
 
-func (s *Store) migrate() error {
+const metaSchemaMigrateLockTimeoutSeconds = 30
+
+func (s *Store) migrate() (err error) {
 	ctx := context.Background()
+	releaseLock, err := acquireMetaSchemaMigrationLock(ctx, s.db)
+	if err != nil {
+		return fmt.Errorf("acquire meta schema migration lock: %w", err)
+	}
+	defer func() {
+		if releaseErr := releaseLock(); releaseErr != nil {
+			err = errors.Join(err, fmt.Errorf("release meta schema migration lock: %w", releaseErr))
+		}
+	}()
+
 	stmts := metaInitSchemaStatements()
 	spec, err := metaSchemaSpecFromStatements(stmts)
 	if err != nil {
@@ -132,6 +144,48 @@ func (s *Store) migrate() error {
 		return &metaSchemaDiffError{diffs: diffs}
 	}
 	return nil
+}
+
+func acquireMetaSchemaMigrationLock(ctx context.Context, db *sql.DB) (func() error, error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var got sql.NullInt64
+	if err := conn.QueryRowContext(ctx,
+		"SELECT GET_LOCK(CONCAT('drive9_meta_schema_migrate:', DATABASE()), ?)",
+		metaSchemaMigrateLockTimeoutSeconds,
+	).Scan(&got); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if !got.Valid {
+		_ = conn.Close()
+		return nil, fmt.Errorf("named lock returned NULL")
+	}
+	if got.Int64 != 1 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("timed out waiting for named lock")
+	}
+
+	return func() error {
+		defer func() { _ = conn.Close() }()
+
+		var released sql.NullInt64
+		if err := conn.QueryRowContext(ctx,
+			"SELECT RELEASE_LOCK(CONCAT('drive9_meta_schema_migrate:', DATABASE()))",
+		).Scan(&released); err != nil {
+			return err
+		}
+		if !released.Valid {
+			return fmt.Errorf("named lock release returned NULL")
+		}
+		if released.Int64 != 1 {
+			return fmt.Errorf("named lock was not held by current connection")
+		}
+		return nil
+	}, nil
 }
 
 type metaColumnMeta struct {
@@ -397,14 +451,18 @@ func diffMetaTable(ctx context.Context, db *sql.DB, table metaTableSpec) ([]meta
 		}
 		return nil, fmt.Errorf("load %s table metadata: %w", table.name, err)
 	}
-	createStmt, err := loadMetaShowCreateTable(ctx, db, table.name)
+	indexNames, err := loadMetaIndexNames(ctx, db, table.name)
 	if err != nil {
-		return nil, fmt.Errorf("show create %s: %w", table.name, err)
+		return nil, fmt.Errorf("load %s index metadata: %w", table.name, err)
 	}
-	return diffMetaTableMeta(table, meta, createStmt), nil
+	return diffMetaTableMetaWithObservedIndexes(table, meta, "", indexNames), nil
 }
 
 func diffMetaTableMeta(table metaTableSpec, meta metaTableMeta, createStmt string) []metaSchemaDiff {
+	return diffMetaTableMetaWithObservedIndexes(table, meta, createStmt, parseObservedMetaIndexes(createStmt))
+}
+
+func diffMetaTableMetaWithObservedIndexes(table metaTableSpec, meta metaTableMeta, createStmt string, observedIndexes map[string]struct{}) []metaSchemaDiff {
 	var diffs []metaSchemaDiff
 	for _, name := range sortedMetaColumnNames(table.columns) {
 		spec := table.columns[name]
@@ -428,10 +486,9 @@ func diffMetaTableMeta(table metaTableSpec, meta metaTableMeta, createStmt strin
 			})
 		}
 	}
-	normalizedCreate := normalizeMetaSQLFragment(createStmt)
 	for _, name := range sortedMetaIndexNames(table.indexes) {
 		spec := table.indexes[name]
-		if !showCreateHasMetaIndex(normalizedCreate, name, spec) {
+		if !hasObservedMetaIndex(observedIndexes, name, spec) {
 			detail := fmt.Sprintf("%s schema contract: missing %s index", table.name, name)
 			if spec.isPrimary {
 				detail = fmt.Sprintf("%s schema contract: missing primary key constraint", table.name)
@@ -446,6 +503,44 @@ func diffMetaTableMeta(table metaTableSpec, meta metaTableMeta, createStmt strin
 		}
 	}
 	return diffs
+}
+
+func hasObservedMetaIndex(observedIndexes map[string]struct{}, indexName string, spec metaIndexSpec) bool {
+	if len(observedIndexes) == 0 {
+		return false
+	}
+	name := strings.ToLower(indexName)
+	if spec.isPrimary {
+		name = "primary"
+	}
+	_, ok := observedIndexes[name]
+	return ok
+}
+
+func parseObservedMetaIndexes(createStmt string) map[string]struct{} {
+	_, defs, ok, err := parseMetaCreateTableStatement(createStmt)
+	if err != nil || !ok {
+		return nil
+	}
+	observed := make(map[string]struct{})
+	for _, def := range splitMetaTopLevelComma(defs) {
+		def = strings.TrimSpace(def)
+		if def == "" {
+			continue
+		}
+		if idxName, _, ok := parseMetaConstraintIndexDefinition("", def); ok {
+			observed[strings.ToLower(idxName)] = struct{}{}
+			continue
+		}
+		if idxName, _, ok := parseMetaInlineIndexDefinition("", def); ok {
+			observed[strings.ToLower(idxName)] = struct{}{}
+			continue
+		}
+		if strings.Contains(normalizeMetaSQLFragment(def), " primary key") {
+			observed["primary"] = struct{}{}
+		}
+	}
+	return observed
 }
 
 func plannedMetaSchemaRepairs(diffs []metaSchemaDiff) []string {
@@ -641,14 +736,27 @@ func loadMetaTableMeta(ctx context.Context, db *sql.DB, tableName string) (metaT
 	return metaTableMeta{tableName: tableName, columns: columns}, nil
 }
 
-func loadMetaShowCreateTable(ctx context.Context, db *sql.DB, tableName string) (string, error) {
-	var gotTable string
-	var createStmt string
-	query := fmt.Sprintf("SHOW CREATE TABLE %s", tableName)
-	if err := db.QueryRowContext(ctx, query).Scan(&gotTable, &createStmt); err != nil {
-		return "", err
+func loadMetaIndexNames(ctx context.Context, db *sql.DB, tableName string) (map[string]struct{}, error) {
+	rows, err := db.QueryContext(ctx, `SELECT DISTINCT index_name
+		FROM information_schema.statistics
+		WHERE table_schema = DATABASE() AND table_name = ?`, tableName)
+	if err != nil {
+		return nil, err
 	}
-	return createStmt, nil
+	defer func() { _ = rows.Close() }()
+
+	indexNames := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		indexNames[strings.ToLower(name)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return indexNames, nil
 }
 
 func normalizeMetaSQLFragment(s string) string {
@@ -671,13 +779,6 @@ func sortedMetaIndexNames(indexes map[string]metaIndexSpec) []string {
 	}
 	sort.Strings(names)
 	return names
-}
-
-func showCreateHasMetaIndex(normalizedCreate, indexName string, spec metaIndexSpec) bool {
-	if spec.isPrimary {
-		return strings.Contains(normalizedCreate, "primary key (")
-	}
-	return strings.Contains(normalizedCreate, indexName+" (")
 }
 
 func schemaSnippet(stmt string) string {
