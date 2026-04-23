@@ -112,6 +112,7 @@ func applyMySQLPoolDefaults(db *sql.DB) {
 	mysqlutil.ApplyPoolDefaults(db)
 }
 
+const metaSchemaMigrateLockNamePrefix = "dat9_meta_schema_migrate:"
 const metaSchemaMigrateLockTimeoutSeconds = 30
 
 func (s *Store) migrate() (err error) {
@@ -156,7 +157,8 @@ func acquireMetaSchemaMigrationLock(ctx context.Context, db *sql.DB) (func() err
 
 	var got sql.NullInt64
 	if err := conn.QueryRowContext(ctx,
-		"SELECT GET_LOCK(CONCAT('drive9_meta_schema_migrate:', DATABASE()), ?)",
+		"SELECT GET_LOCK(CONCAT(?, DATABASE()), ?)",
+		metaSchemaMigrateLockNamePrefix,
 		metaSchemaMigrateLockTimeoutSeconds,
 	).Scan(&got); err != nil {
 		_ = conn.Close()
@@ -176,7 +178,8 @@ func acquireMetaSchemaMigrationLock(ctx context.Context, db *sql.DB) (func() err
 
 		var released sql.NullInt64
 		if err := conn.QueryRowContext(ctx,
-			"SELECT RELEASE_LOCK(CONCAT('drive9_meta_schema_migrate:', DATABASE()))",
+			"SELECT RELEASE_LOCK(CONCAT(?, DATABASE()))",
+			metaSchemaMigrateLockNamePrefix,
 		).Scan(&released); err != nil {
 			return err
 		}
