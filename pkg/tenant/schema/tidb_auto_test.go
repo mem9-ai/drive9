@@ -853,7 +853,7 @@ func newTestRepairDB(t *testing.T, queryFn func(string) testRepairQueryResult, e
 }
 
 func (d testRepairDriver) Open(string) (driver.Conn, error) {
-	return testRepairConn{queryFn: d.queryFn, execFn: d.execFn}, nil
+	return testRepairConn(d), nil
 }
 
 func (c testRepairConn) Prepare(string) (driver.Stmt, error) {
