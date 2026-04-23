@@ -249,6 +249,7 @@ type metaTableSpec struct {
 type metaColumnSpec struct {
 	columnType string
 	addSQL     string
+	modifySQL  string
 }
 
 type metaIndexSpec struct {
@@ -271,7 +272,7 @@ func metaInitSchemaStatements() []string {
 			cluster_id       VARCHAR(255) NULL,
 			claim_url        TEXT NULL,
 			claim_expires_at DATETIME(3) NULL,
-			schema_version   INT NOT NULL DEFAULT 1,
+			schema_version   INT UNSIGNED NOT NULL DEFAULT 1,
 			created_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			deleted_at       DATETIME(3) NULL,
@@ -482,12 +483,22 @@ func diffMetaTableMetaWithObservedIndexes(table metaTableSpec, meta metaTableMet
 			})
 			continue
 		}
-		if normalizeMetaSQLFragment(col.columnType) != normalizeMetaSQLFragment(spec.columnType) {
+		observedType := normalizeMetaSQLFragment(col.columnType)
+		desiredType := normalizeMetaSQLFragment(spec.columnType)
+		if observedType != desiredType {
+			// Only generate repair SQL for the one known-safe widening:
+			// tenants.schema_version INT → INT UNSIGNED.
+			var repairSQL string
+			if table.name == "tenants" && name == "schema_version" &&
+				observedType == "int" && desiredType == "int unsigned" {
+				repairSQL = spec.modifySQL
+			}
 			diffs = append(diffs, metaSchemaDiff{
 				kind:       metaSchemaDiffColumnType,
 				tableName:  table.name,
 				columnName: name,
 				detail:     fmt.Sprintf("%s schema contract: %s column type = %q, want %s", table.name, name, col.columnType, spec.columnType),
+				repairSQL:  repairSQL,
 			})
 		}
 	}
@@ -671,6 +682,7 @@ func parseMetaColumnDefinition(tableName, def string) (string, metaColumnSpec, b
 	return strings.ToLower(name), metaColumnSpec{
 		columnType: strings.ToLower(strings.TrimSpace(colType)),
 		addSQL:     fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, name, strings.TrimSpace(rest)),
+		modifySQL:  fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s", tableName, name, strings.TrimSpace(rest)),
 	}, true
 }
 
@@ -702,6 +714,8 @@ func isSafeMetaRepairDiff(diff metaSchemaDiff, tableMissing map[string]bool) boo
 			return tableMissing[diff.tableName]
 		}
 		return false
+	case metaSchemaDiffColumnType:
+		return isSafeModifyColumnRepairSQL(diff)
 	default:
 		return false
 	}
@@ -709,6 +723,19 @@ func isSafeMetaRepairDiff(diff metaSchemaDiff, tableMissing map[string]bool) boo
 
 func isSafeAddColumnRepairSQL(sqlText string) bool {
 	return schemaspec.IsSafeAddColumnRepairSQL(sqlText)
+}
+
+// isSafeModifyColumnRepairSQL returns true only for the single known-safe
+// column widening: tenants.schema_version INT → INT UNSIGNED.
+// schema_version values come from CRC32Version which produces uint32 (non-negative);
+// widening from INT to INT UNSIGNED is data-preserving for this column.
+// General MODIFY COLUMN is not considered safe without an explicit entry here.
+func isSafeModifyColumnRepairSQL(diff metaSchemaDiff) bool {
+	if diff.tableName != "tenants" || diff.columnName != "schema_version" {
+		return false
+	}
+	n := strings.TrimSuffix(normalizeMetaSQLFragment(diff.repairSQL), ";")
+	return n == "alter table tenants modify column schema_version int unsigned not null default 1"
 }
 
 func isIgnorableMetaSchemaError(err error) bool {

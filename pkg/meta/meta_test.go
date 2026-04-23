@@ -280,3 +280,83 @@ func hasMetaDiff(diffs []metaSchemaDiff, kind metaSchemaDiffKind, contains strin
 	}
 	return false
 }
+
+func TestColumnTypeMismatchSchemaVersionPlansRepair(t *testing.T) {
+	spec := mustMetaSpec(t)
+	tenantsSpec := mustMetaTableSpec(t, spec, "tenants")
+
+	// Simulate tenants table with schema_version as INT (old type).
+	observed := metaTableMeta{
+		tableName: "tenants",
+		columns:   map[string]metaColumnMeta{"schema_version": {columnType: "int"}},
+	}
+	diffs := diffMetaTableMetaWithObservedIndexes(tenantsSpec, observed, "", map[string]struct{}{})
+
+	var typeDiff *metaSchemaDiff
+	for i := range diffs {
+		if diffs[i].kind == metaSchemaDiffColumnType && diffs[i].columnName == "schema_version" {
+			typeDiff = &diffs[i]
+			break
+		}
+	}
+	if typeDiff == nil {
+		t.Fatal("expected a column_type_mismatch diff for schema_version, got none")
+	}
+	if typeDiff.repairSQL == "" {
+		t.Fatal("expected repairSQL to be set for schema_version type mismatch")
+	}
+
+	plans := plannedMetaSchemaRepairs([]metaSchemaDiff{*typeDiff})
+	if len(plans) != 1 {
+		t.Fatalf("expected exactly one planned repair, got %#v", plans)
+	}
+	want := "ALTER TABLE tenants MODIFY COLUMN schema_version INT UNSIGNED NOT NULL DEFAULT 1"
+	if plans[0] != want {
+		t.Fatalf("unexpected repair plan:\n  got  %q\n  want %q", plans[0], want)
+	}
+}
+
+func TestColumnTypeMismatchOtherColumnsNoRepair(t *testing.T) {
+	spec := mustMetaSpec(t)
+	tenantsSpec := mustMetaTableSpec(t, spec, "tenants")
+
+	// Simulate a type mismatch on a column other than schema_version — no auto-repair expected.
+	observed := metaTableMeta{
+		tableName: "tenants",
+		columns:   map[string]metaColumnMeta{"db_port": {columnType: "bigint"}},
+	}
+	diffs := diffMetaTableMetaWithObservedIndexes(tenantsSpec, observed, "", map[string]struct{}{})
+
+	for _, d := range diffs {
+		if d.kind == metaSchemaDiffColumnType && d.columnName != "schema_version" && d.repairSQL != "" {
+			t.Errorf("unexpected repairSQL for non-schema_version column %q: %q", d.columnName, d.repairSQL)
+		}
+	}
+}
+
+func TestIsSafeModifyColumnRepairSQLAcceptsSchemaVersion(t *testing.T) {
+	diff := metaSchemaDiff{
+		tableName:  "tenants",
+		columnName: "schema_version",
+		repairSQL:  "ALTER TABLE tenants MODIFY COLUMN schema_version INT UNSIGNED NOT NULL DEFAULT 1",
+	}
+	if !isSafeModifyColumnRepairSQL(diff) {
+		t.Fatal("expected isSafeModifyColumnRepairSQL to return true for schema_version repair")
+	}
+}
+
+func TestIsSafeModifyColumnRepairSQLRejectsOtherCases(t *testing.T) {
+	cases := []metaSchemaDiff{
+		{tableName: "tenants", columnName: "db_port", repairSQL: "ALTER TABLE tenants MODIFY COLUMN db_port INT UNSIGNED NOT NULL"},
+		{tableName: "tenant_api_keys", columnName: "schema_version", repairSQL: "ALTER TABLE tenant_api_keys MODIFY COLUMN schema_version INT UNSIGNED NOT NULL DEFAULT 1"},
+		{tableName: "tenants", columnName: "schema_version", repairSQL: "ALTER TABLE tenants MODIFY COLUMN schema_version BIGINT NOT NULL DEFAULT 1"},
+		{tableName: "tenants", columnName: "schema_version", repairSQL: ""},
+		{tableName: "tenants", columnName: "schema_version", repairSQL: "ALTER TABLE tenants MODIFY COLUMN schema_version INT UNSIGNED"},
+	}
+	for _, diff := range cases {
+		if isSafeModifyColumnRepairSQL(diff) {
+			t.Errorf("isSafeModifyColumnRepairSQL(%q.%q sql=%q) = true, want false",
+				diff.tableName, diff.columnName, diff.repairSQL)
+		}
+	}
+}
