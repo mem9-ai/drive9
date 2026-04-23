@@ -130,7 +130,13 @@ is_mounted() {
     mountpoint -q "$mount_point"
     return
   fi
-  awk -v mp="$mount_point" '$2 == mp { found = 1 } END { exit !found }' /proc/mounts
+  # Use Python for a cross-platform mount check
+  python3 - "$mount_point" <<'PY'
+import os
+import sys
+
+raise SystemExit(0 if os.path.ismount(sys.argv[1]) else 1)
+PY
 }
 
 curl_body_code() {
