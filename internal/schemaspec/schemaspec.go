@@ -313,6 +313,9 @@ func isGeneratedColumnAddSQL(normalizedSQL string) bool {
 // IsIgnorableMySQLError reports whether a DDL error is benign for idempotent
 // schema repair paths.
 func IsIgnorableMySQLError(err error) bool {
+	if err == nil {
+		return false
+	}
 	var me *mysql.MySQLError
 	if errors.As(err, &me) {
 		switch me.Number {

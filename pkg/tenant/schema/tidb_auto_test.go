@@ -255,13 +255,12 @@ func TestBuildUniqueIndexDuplicateCheckSQL(t *testing.T) {
 }
 
 func TestApplyTiDBSchemaRepairsPreflightsUniqueIndexDuplicates(t *testing.T) {
-	db, cleanup := newTestRepairDB(t, func(query string) testRepairQueryResult {
+	db := newTestRepairDB(t, func(query string) testRepairQueryResult {
 		if strings.Contains(query, "GROUP BY `idempotency_key`") {
 			return testRepairQueryResult{columns: []string{"1"}, rows: [][]driver.Value{{int64(1)}}}
 		}
 		return testRepairQueryResult{}
 	}, nil)
-	defer cleanup()
 
 	err := applyTiDBSchemaRepairs(context.Background(), db, []string{"CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)"})
 	if err == nil {
@@ -275,7 +274,7 @@ func TestApplyTiDBSchemaRepairsPreflightsUniqueIndexDuplicates(t *testing.T) {
 func TestApplyTiDBSchemaRepairsPreflightsUniqueIndexNoDuplicatesExecutesRepair(t *testing.T) {
 	var executed atomic.Int32
 
-	db, cleanup := newTestRepairDB(t, func(query string) testRepairQueryResult {
+	db := newTestRepairDB(t, func(query string) testRepairQueryResult {
 		if strings.Contains(query, "GROUP BY `idempotency_key`") {
 			return testRepairQueryResult{}
 		}
@@ -286,7 +285,6 @@ func TestApplyTiDBSchemaRepairsPreflightsUniqueIndexNoDuplicatesExecutesRepair(t
 		}
 		return nil
 	})
-	defer cleanup()
 
 	err := applyTiDBSchemaRepairs(context.Background(), db, []string{"CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)"})
 	if err != nil {
@@ -791,7 +789,6 @@ func testFilesTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
 	}
 	return meta
 }
-
 func testUploadsTableMeta(includeExpectedRevision bool) tidbTableMeta {
 	meta := tidbTableMeta{
 		tableName: "uploads",
@@ -805,6 +802,21 @@ func testUploadsTableMeta(includeExpectedRevision bool) tidbTableMeta {
 		meta.columns["expected_revision"] = tidbColumnMeta{columnType: "bigint"}
 	}
 	return meta
+}
+
+func TestParseConstraintUniqueIndexDefinitionUsesExplicitIndexName(t *testing.T) {
+	indexName, columns, ok := parseConstraintUniqueIndexDefinition(
+		"CONSTRAINT uploads_active_constraint UNIQUE KEY idx_uploads_active (active_target_path)",
+	)
+	if !ok {
+		t.Fatal("expected constraint unique definition to parse")
+	}
+	if indexName != "idx_uploads_active" {
+		t.Fatalf("indexName=%q, want idx_uploads_active", indexName)
+	}
+	if columns != "(active_target_path)" {
+		t.Fatalf("columns=%q, want (active_target_path)", columns)
+	}
 }
 
 func mustTiDBTableSpecByName(t *testing.T, mode TiDBEmbeddingMode, tableName string) tidbTableSpec {
@@ -866,7 +878,7 @@ type testRepairRows struct {
 
 var testRepairDriverCounter uint64
 
-func newTestRepairDB(t *testing.T, queryFn func(string) testRepairQueryResult, execFn func(string) error) (*sql.DB, func()) {
+func newTestRepairDB(t *testing.T, queryFn func(string) testRepairQueryResult, execFn func(string) error) *sql.DB {
 	t.Helper()
 	name := "test-repair-driver-" + strconv.FormatUint(atomic.AddUint64(&testRepairDriverCounter, 1), 10)
 	sql.Register(name, testRepairDriver{queryFn: queryFn, execFn: execFn})
@@ -874,7 +886,8 @@ func newTestRepairDB(t *testing.T, queryFn func(string) testRepairQueryResult, e
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
-	return db, func() { _ = db.Close() }
+	t.Cleanup(func() { _ = db.Close() })
+	return db
 }
 
 func (d testRepairDriver) Open(string) (driver.Conn, error) {

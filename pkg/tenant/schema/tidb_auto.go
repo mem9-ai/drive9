@@ -807,14 +807,31 @@ func parseConstraintUniqueIndexDefinition(def string) (indexName, columns string
 	upperRemainder := strings.ToUpper(remainder)
 	switch {
 	case strings.HasPrefix(upperRemainder, "UNIQUE KEY"):
-		return strings.ToLower(name), parseIndexColumnsSuffix(remainder[len("UNIQUE KEY"):]), true
+		return parseConstraintUniqueIndexSuffix(name, remainder[len("UNIQUE KEY"):])
 	case strings.HasPrefix(upperRemainder, "UNIQUE INDEX"):
-		return strings.ToLower(name), parseIndexColumnsSuffix(remainder[len("UNIQUE INDEX"):]), true
+		return parseConstraintUniqueIndexSuffix(name, remainder[len("UNIQUE INDEX"):])
 	case strings.HasPrefix(upperRemainder, "UNIQUE"):
-		return strings.ToLower(name), parseIndexColumnsSuffix(remainder[len("UNIQUE"):]), true
+		return parseConstraintUniqueIndexSuffix(name, remainder[len("UNIQUE"):])
 	default:
 		return "", "", false
 	}
+}
+
+func parseConstraintUniqueIndexSuffix(defaultName, suffix string) (indexName, columns string, ok bool) {
+	suffix = strings.TrimSpace(suffix)
+	if suffix == "" {
+		return "", "", false
+	}
+	name, columnSuffix := splitIdentifierAndSuffix(suffix)
+	if name == "" {
+		name = defaultName
+		columnSuffix = suffix
+	}
+	cols := parseIndexColumnsSuffix(columnSuffix)
+	if cols == "" {
+		return "", "", false
+	}
+	return strings.ToLower(name), cols, true
 }
 
 func parseIndexNameAndColumns(def, prefix string) (indexName, columns string) {

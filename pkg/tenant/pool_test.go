@@ -325,12 +325,15 @@ func TestPoolCreateBackendReturnsValidationErrorWhenPeriodicCheckFails(t *testin
 	}
 }
 
+// This test reads global metrics emitted by recordTenantSchemaVersionUpdateFailure
+// via operationMetricValue, so it must stay non-parallel unless the metric state
+// is isolated.
 func TestRecordTenantSchemaVersionUpdateFailureRecordsMetric(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	metrics.WritePrometheus(recorder)
 	before := operationMetricValue(t, recorder.Body.String(), `component="tenant_pool",operation="update_schema_version_failed",result="error"`)
 
-	recordTenantSchemaVersionUpdateFailure(context.Background(), "tenant-metric", 42, fmt.Errorf("meta unavailable"))
+	recordTenantSchemaVersionUpdateFailure(context.Background(), "tenant-metric", 42, time.Millisecond, fmt.Errorf("meta unavailable"))
 
 	recorder = httptest.NewRecorder()
 	metrics.WritePrometheus(recorder)

@@ -66,12 +66,17 @@ func TestIsIgnorableMySQLErrorRejectsDuplicateEntry(t *testing.T) {
 			err:  errors.New("index already exists"),
 			want: true,
 		},
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := IsIgnorableMySQLError(tt.err); got != tt.want {
-				t.Fatalf("IsIgnorableMySQLError()=%v, want %v", got, tt.want)
+				t.Errorf("IsIgnorableMySQLError()=%v, want %v", got, tt.want)
 			}
 		})
 	}
