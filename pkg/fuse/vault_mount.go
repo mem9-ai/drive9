@@ -40,26 +40,26 @@ func (o *VaultMountOptions) setDefaults() {
 	}
 }
 
-// MountVault creates and serves a read-only FUSE mount that exposes vault
-// secrets readable by the bound credential. It blocks until the filesystem
-// is unmounted or SIGINT/SIGTERM is received.
-//
-// The contract row mapping is documented at the top of vaultfs.go.
-func MountVault(opts *VaultMountOptions) error {
+// probeVaultMount validates opts, constructs the vault client, and runs the
+// Row I probe. Returns the bound client and the readable-secret set on
+// success; empty secret sets are NOT an error (see the rationale on the
+// error path below). Split out so tests can exercise probe acceptance
+// without going through the full FUSE-mount blocking path.
+func probeVaultMount(opts *VaultMountOptions) (*client.Client, []string, error) {
 	if opts == nil {
-		return fmt.Errorf("mount vault: options are required")
+		return nil, nil, fmt.Errorf("mount vault: options are required")
 	}
 	opts.setDefaults()
 
 	if err := os.MkdirAll(opts.MountPoint, 0o755); err != nil {
-		return fmt.Errorf("create mount point: %w", err)
+		return nil, nil, fmt.Errorf("create mount point: %w", err)
 	}
 
 	if opts.APIKey != "" && opts.Token != "" {
-		return fmt.Errorf("mount vault: APIKey and Token are mutually exclusive (choose one principal kind at mount time)")
+		return nil, nil, fmt.Errorf("mount vault: APIKey and Token are mutually exclusive (choose one principal kind at mount time)")
 	}
 	if opts.APIKey == "" && opts.Token == "" {
-		return fmt.Errorf("mount vault: either APIKey (owner) or Token (delegated) is required")
+		return nil, nil, fmt.Errorf("mount vault: either APIKey (owner) or Token (delegated) is required")
 	}
 
 	var c *client.Client
@@ -85,7 +85,20 @@ func MountVault(opts *VaultMountOptions) error {
 	secrets, err := c.ListReadableVaultSecrets(probeCtx)
 	probeCancel()
 	if err != nil {
-		return fmt.Errorf("vault probe: %w", err)
+		return nil, nil, fmt.Errorf("vault probe: %w", err)
+	}
+	return c, secrets, nil
+}
+
+// MountVault creates and serves a read-only FUSE mount that exposes vault
+// secrets readable by the bound credential. It blocks until the filesystem
+// is unmounted or SIGINT/SIGTERM is received.
+//
+// The contract row mapping is documented at the top of vaultfs.go.
+func MountVault(opts *VaultMountOptions) error {
+	c, secrets, err := probeVaultMount(opts)
+	if err != nil {
+		return err
 	}
 
 	vfs := NewVaultFS(c, opts.DirTTL)

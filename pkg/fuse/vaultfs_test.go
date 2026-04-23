@@ -407,9 +407,11 @@ func TestVaultMountRevokedCredentialRejected(t *testing.T) {
 		MountPoint: tmp,
 		DirTTL:     100 * time.Millisecond,
 	}
-	err := MountVault(opts)
+	// Exercise the probe directly — the server returns 401 for revoked tokens,
+	// which must propagate as a non-nil error before any FUSE wiring.
+	_, _, err := probeVaultMount(opts)
 	if err == nil {
-		t.Fatalf("MountVault with revoked credential returned nil error, want non-nil")
+		t.Fatalf("probeVaultMount with revoked credential returned nil error, want non-nil")
 	}
 }
 
@@ -438,11 +440,17 @@ func TestVaultMountEmptyScopeAllowed(t *testing.T) {
 			defer srv.Close()
 
 			tmp := t.TempDir()
-			err := MountVault(tc.opts(srv.URL, tmp))
-			// FUSE mount will fail in test env, but the probe must NOT
-			// produce an EACCES rejection for empty scope.
-			if err != nil && strings.Contains(err.Error(), "EACCES") {
-				t.Fatalf("%s with empty vault returned EACCES: %v (must NOT be rejected for empty scope)", tc.name, err)
+			// Exercise the probe directly, not the full MountVault path:
+			// MountVault blocks on server.Wait() once the FUSE mount succeeds
+			// (which it can on Linux CI with /dev/fuse available), while this
+			// test only cares about the probe verdict — empty scope must NOT
+			// be rejected with EACCES for either owner or delegated callers.
+			_, secrets, err := probeVaultMount(tc.opts(srv.URL, tmp))
+			if err != nil {
+				t.Fatalf("%s: probeVaultMount with empty vault returned %v, want nil", tc.name, err)
+			}
+			if len(secrets) != 0 {
+				t.Fatalf("%s: expected empty secret list, got %v", tc.name, secrets)
 			}
 		})
 	}
