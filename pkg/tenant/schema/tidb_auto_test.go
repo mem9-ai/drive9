@@ -272,6 +272,31 @@ func TestApplyTiDBSchemaRepairsPreflightsUniqueIndexDuplicates(t *testing.T) {
 	}
 }
 
+func TestApplyTiDBSchemaRepairsPreflightsUniqueIndexNoDuplicatesExecutesRepair(t *testing.T) {
+	var executed atomic.Int32
+
+	db, cleanup := newTestRepairDB(t, func(query string) testRepairQueryResult {
+		if strings.Contains(query, "GROUP BY `idempotency_key`") {
+			return testRepairQueryResult{}
+		}
+		return testRepairQueryResult{}
+	}, func(query string) error {
+		if strings.Contains(query, "CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)") {
+			executed.Add(1)
+		}
+		return nil
+	})
+	defer cleanup()
+
+	err := applyTiDBSchemaRepairs(context.Background(), db, []string{"CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)"})
+	if err != nil {
+		t.Fatalf("expected repair to succeed when preflight finds no duplicates: %v", err)
+	}
+	if executed.Load() != 1 {
+		t.Fatalf("expected repair statement to execute once, executed=%d", executed.Load())
+	}
+}
+
 func TestValidateTiDBAutoEmbeddingFilesDiffsReportsGeneratedContractMismatch(t *testing.T) {
 	meta := testFilesTableMeta(TiDBEmbeddingModeApp)
 	diffs := validateTiDBAutoEmbeddingFilesDiffs(meta)
