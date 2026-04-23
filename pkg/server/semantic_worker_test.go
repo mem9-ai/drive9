@@ -30,6 +30,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/semantic"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
+	"github.com/mem9-ai/dat9/pkg/tidbcloud"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
@@ -1043,6 +1044,143 @@ func TestSemanticWorkerListTenantRefsEmbedOnlySkipsAutoProviders(t *testing.T) {
 	}
 	if refs[0].id != keepTenantID {
 		t.Fatalf("tenant ref id=%q, want %q", refs[0].id, keepTenantID)
+	}
+}
+
+func TestSemanticWorkerListTenantRefsKeepsNativeTenantWhenClusterActive(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	pool := newTestTenantPool(t)
+	passCipher, err := pool.Encrypt(context.Background(), []byte("pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().UTC().Add(-time.Hour)
+	now := time.Now().UTC()
+	tenantID := token.NewID()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: passCipher,
+		DBName:           "app",
+		DBTLS:            false,
+		Provider:         tenant.ProviderTiDBCloudNative,
+		ClusterID:        tenantID,
+		ClaimExpiresAt:   &past,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	global := &stubGlobalClient{
+		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
+			return &tidbcloud.ClusterInfo{Lifecycle: tidbcloud.ClusterLifecycleActive}, nil
+		},
+	}
+	orig := semanticWorkerUsesTiDBAutoEmbedding
+	semanticWorkerUsesTiDBAutoEmbedding = func(string) bool { return false }
+	defer func() {
+		semanticWorkerUsesTiDBAutoEmbedding = orig
+	}()
+	m := newSemanticWorkerManager(nil, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{}, newTestNativeProvisioner(global, &stubAccountClient{}))
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+
+	refs, err := m.listTenantRefs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("tenant ref count=%d, want 1", len(refs))
+	}
+	if refs[0].id != tenantID {
+		t.Fatalf("tenant ref id=%q, want %q", refs[0].id, tenantID)
+	}
+
+	var status string
+	if err := metaStore.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", tenantID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantActive) {
+		t.Fatalf("status=%s, want %s", status, meta.TenantActive)
+	}
+}
+
+func TestSemanticWorkerListTenantRefsDeletesNativeTenantWhenClusterDeleted(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	pool := newTestTenantPool(t)
+	passCipher, err := pool.Encrypt(context.Background(), []byte("pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	tenantID := token.NewID()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: passCipher,
+		DBName:           "app",
+		DBTLS:            false,
+		Provider:         tenant.ProviderTiDBCloudNative,
+		ClusterID:        tenantID,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	global := &stubGlobalClient{
+		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
+			return &tidbcloud.ClusterInfo{Lifecycle: tidbcloud.ClusterLifecycleDeleted}, nil
+		},
+	}
+	orig := semanticWorkerUsesTiDBAutoEmbedding
+	semanticWorkerUsesTiDBAutoEmbedding = func(string) bool { return false }
+	defer func() {
+		semanticWorkerUsesTiDBAutoEmbedding = orig
+	}()
+	m := newSemanticWorkerManager(nil, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{}, newTestNativeProvisioner(global, &stubAccountClient{}))
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+
+	refs, err := m.listTenantRefs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 0 {
+		t.Fatalf("tenant ref count=%d, want 0", len(refs))
+	}
+
+	var status string
+	if err := metaStore.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", tenantID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantDeleted) {
+		t.Fatalf("status=%s, want %s", status, meta.TenantDeleted)
 	}
 }
 

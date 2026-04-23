@@ -11,6 +11,7 @@ import (
 
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/dat9/pkg/tidbcloud"
 )
@@ -471,6 +472,114 @@ func TestNativeAuthScope_ActiveTenant_Success(t *testing.T) {
 	}
 	if scope.Backend == nil {
 		t.Fatal("expected non-nil backend")
+	}
+}
+
+func TestNativeAuthScope_KeepsDeletedTenantBlockedWhenClusterIsActive(t *testing.T) {
+	if testDSN == "" {
+		t.Skip("no test database available")
+	}
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+
+	var tenantID string
+	if err := rt.meta.DB().QueryRow("SELECT id FROM tenants LIMIT 1").Scan(&tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.meta.DB().Exec("UPDATE tenants SET status = ?, provider = ?, cluster_id = ?", string(meta.TenantDeleted), tenant.ProviderTiDBCloudNative, tenantID); err != nil {
+		t.Fatal(err)
+	}
+
+	global := &stubGlobalClient{
+		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
+			return &tidbcloud.ClusterInfo{OrgID: 1, Lifecycle: tidbcloud.ClusterLifecycleActive}, nil
+		},
+	}
+	account := &stubAccountClient{
+		authorizeFn: func(_ context.Context, _ *http.Request, _ string) (uint64, error) {
+			return 1, nil
+		},
+	}
+	prov := newTestNativeProvisioner(global, account)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/v1/fs/test.txt", nil)
+	r.Header.Set(tidbcloud.HeaderClusterID, tenantID)
+
+	scope, release, handled := nativeAuthScope(w, r, rt.meta, rt.pool, prov)
+	if !handled {
+		t.Fatal("expected handled")
+	}
+	if scope != nil {
+		t.Fatal("expected nil scope")
+	}
+	if release != nil {
+		t.Fatal("expected nil release")
+	}
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status=%d, want %d", w.Code, http.StatusForbidden)
+	}
+
+	var status string
+	if err := rt.meta.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", tenantID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantDeleted) {
+		t.Fatalf("status=%s, want %s", status, meta.TenantDeleted)
+	}
+}
+
+func TestNativeAuthScope_DeletesTenantWhenClusterIsDeleted(t *testing.T) {
+	if testDSN == "" {
+		t.Skip("no test database available")
+	}
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+
+	var tenantID string
+	if err := rt.meta.DB().QueryRow("SELECT id FROM tenants LIMIT 1").Scan(&tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.meta.DB().Exec("UPDATE tenants SET provider = ?, cluster_id = ?", tenant.ProviderTiDBCloudNative, tenantID); err != nil {
+		t.Fatal(err)
+	}
+
+	global := &stubGlobalClient{
+		getClusterInfoFn: func(_ context.Context, _ string) (*tidbcloud.ClusterInfo, error) {
+			return &tidbcloud.ClusterInfo{OrgID: 1, Lifecycle: tidbcloud.ClusterLifecycleDeleted}, nil
+		},
+	}
+	account := &stubAccountClient{
+		authorizeFn: func(_ context.Context, _ *http.Request, _ string) (uint64, error) {
+			return 1, nil
+		},
+	}
+	prov := newTestNativeProvisioner(global, account)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/v1/fs/test.txt", nil)
+	r.Header.Set(tidbcloud.HeaderClusterID, tenantID)
+
+	scope, release, handled := nativeAuthScope(w, r, rt.meta, rt.pool, prov)
+	if !handled {
+		t.Fatal("expected handled")
+	}
+	if scope != nil {
+		t.Fatal("expected nil scope")
+	}
+	if release != nil {
+		t.Fatal("expected nil release")
+	}
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status=%d, want %d", w.Code, http.StatusForbidden)
+	}
+
+	var status string
+	if err := rt.meta.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", tenantID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantDeleted) {
+		t.Fatalf("status=%s, want %s", status, meta.TenantDeleted)
 	}
 }
 

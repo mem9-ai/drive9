@@ -131,6 +131,13 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			return
 		}
 
+		if err := reconcileNativeTenantLifecycle(r.Context(), metaStore, pool, provisioner, &resolved.Tenant); err != nil {
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "auth_native_lifecycle_error", "tenant_id", resolved.Tenant.ID, "error", err)...)
+			metricEvent(r.Context(), "auth", "result", "native_lifecycle_error")
+			errJSON(w, http.StatusBadGateway, "native tenant lifecycle unavailable")
+			return
+		}
+
 		switch resolved.Tenant.Status {
 		case meta.TenantActive:
 		case meta.TenantProvisioning:
@@ -209,7 +216,15 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 		// failure modes to avoid leaking tenant existence or status to
 		// unauthenticated callers (tenant_id is from unverified peek).
 		tenant, err := metaStore.GetTenant(r.Context(), tenantID)
-		if err != nil || tenant.Status != meta.TenantActive {
+		if err != nil {
+			errJSON(w, http.StatusUnauthorized, "invalid capability token")
+			return
+		}
+		if err := reconcileNativeTenantLifecycle(r.Context(), metaStore, pool, s.provisioner, tenant); err != nil {
+			errJSON(w, http.StatusBadGateway, "backend unavailable")
+			return
+		}
+		if tenant.Status != meta.TenantActive {
 			errJSON(w, http.StatusUnauthorized, "invalid capability token")
 			return
 		}
@@ -329,22 +344,10 @@ func nativeAuthScope(w http.ResponseWriter, r *http.Request, metaStore *meta.Sto
 		return nil, nil, true
 	}
 
-	// If the tenant has an expiration timestamp and it has passed, mark
-	// the tenant as deleted so the underlying (destroyed) resources are
-	// no longer accessed.
-	if t.ClaimExpiresAt != nil && time.Now().After(*t.ClaimExpiresAt) && t.Status != meta.TenantDeleted {
-		logger.Info(ctx, "server_event", eventFields(ctx, "tenant_expired_auto_delete",
-			"tenant_id", t.ID, "claim_expires_at", t.ClaimExpiresAt.Format(time.RFC3339))...)
-		if err := metaStore.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted); err != nil {
-			logger.Error(ctx, "server_event", eventFields(ctx, "tenant_expired_update_status_failed",
-				"tenant_id", t.ID, "error", err)...)
-			metricEvent(ctx, "tenant_status", "status", "expired_delete_failed")
-			errJSON(w, http.StatusInternalServerError, "failed to update expired tenant")
-			return nil, nil, true
-		}
-		pool.Invalidate(t.ID)
-		metricEvent(ctx, "tenant_status", "status", "expired_deleted")
-		errJSON(w, http.StatusForbidden, "tenant has expired")
+	if err := reconcileNativeTenantLifecycle(ctx, metaStore, pool, provisioner, t); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "auth_native_lifecycle_error", "tenant_id", t.ID, "error", err)...)
+		metricEvent(ctx, "auth", "result", "native_lifecycle_error")
+		errJSON(w, http.StatusBadGateway, "native tenant lifecycle unavailable")
 		return nil, nil, true
 	}
 

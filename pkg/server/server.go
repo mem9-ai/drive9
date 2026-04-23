@@ -184,7 +184,7 @@ func NewWithConfig(cfg Config) *Server {
 	if s.meta != nil && s.pool != nil && s.provisioner != nil {
 		s.resumeProvisioningTenants()
 	}
-	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
+	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers, cfg.Provisioner)
 	appManagedTaskTypes := semanticWorkerLogTaskTypesFromTypes(appManagedSemanticTaskTypes(cfg.SemanticEmbedder))
 	var fallbackTaskTypes, poolAutoTaskTypes []string
 	if cfg.Backend != nil {
@@ -424,6 +424,11 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 	if claims.TenantID != resolved.Tenant.ID || claims.TokenVersion != resolved.APIKey.TokenVersion {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_claims_mismatch", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "claim_tenant", claims.TenantID, "claim_version", claims.TokenVersion)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
+		return
+	}
+	if err := reconcileNativeTenantLifecycle(r.Context(), s.meta, s.pool, s.provisioner, &resolved.Tenant); err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_native_lifecycle_error", "tenant_id", resolved.Tenant.ID, "error", err)...)
+		errJSON(w, http.StatusBadGateway, "native tenant lifecycle unavailable")
 		return
 	}
 

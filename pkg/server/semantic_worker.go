@@ -128,11 +128,12 @@ func ValidateDurableAsyncExtractRequiresSemanticWorker(cfg Config, template back
 }
 
 type semanticWorkerManager struct {
-	fallback *backend.Dat9Backend
-	meta     *meta.Store
-	pool     *tenant.Pool
-	embedder embedding.Client
-	opts     SemanticWorkerOptions
+	fallback    *backend.Dat9Backend
+	meta        *meta.Store
+	pool        *tenant.Pool
+	provisioner tenant.Provisioner
+	embedder    embedding.Client
+	opts        SemanticWorkerOptions
 
 	mu         sync.Mutex
 	inflight   map[string]int
@@ -197,16 +198,21 @@ type semanticTaskLeaseOutcome struct {
 	lastLeaseUntil *time.Time
 }
 
-func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store, pool *tenant.Pool, embedder embedding.Client, opts SemanticWorkerOptions) *semanticWorkerManager {
+func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store, pool *tenant.Pool, embedder embedding.Client, opts SemanticWorkerOptions, provisioners ...tenant.Provisioner) *semanticWorkerManager {
 	hasMultiTenant := metaStore != nil && pool != nil
 	if fallback == nil && !hasMultiTenant {
 		return nil
 	}
+	var provisioner tenant.Provisioner
+	if len(provisioners) > 0 {
+		provisioner = provisioners[0]
+	}
 	m := &semanticWorkerManager{
-		fallback: fallback,
-		meta:     metaStore,
-		pool:     pool,
-		embedder: embedder,
+		fallback:    fallback,
+		meta:        metaStore,
+		pool:        pool,
+		provisioner: provisioner,
+		embedder:    embedder,
 	}
 	app := m.appManagedTaskTypes()
 	var poolAuto []semantic.TaskType
@@ -578,18 +584,13 @@ func (m *semanticWorkerManager) listTenantRefs(ctx context.Context) ([]semanticT
 		if err != nil {
 			return nil, err
 		}
-		now := time.Now()
 		refs := make([]semanticTenantRef, 0, len(tenants))
 		for i := range tenants {
 			t := tenants[i]
-			// Auto-expire tenants whose claim has passed (e.g. destroyed Zero instances).
-			if t.ClaimExpiresAt != nil && now.After(*t.ClaimExpiresAt) {
-				logger.Info(ctx, "server_event", eventFields(ctx, "tenant_expired_auto_delete",
-					"tenant_id", t.ID, "claim_expires_at", t.ClaimExpiresAt.Format(time.RFC3339))...)
-				if err := m.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted); err != nil {
-					return nil, fmt.Errorf("auto-delete expired tenant %s: %w", t.ID, err)
-				}
-				m.pool.Invalidate(t.ID)
+			if err := reconcileNativeTenantLifecycle(ctx, m.meta, m.pool, m.provisioner, &t); err != nil {
+				return nil, fmt.Errorf("reconcile native tenant lifecycle %s: %w", t.ID, err)
+			}
+			if t.Status != meta.TenantActive {
 				continue
 			}
 			if !hasAnyTaskTypes(m.taskTypesForProvider(t.Provider)) {

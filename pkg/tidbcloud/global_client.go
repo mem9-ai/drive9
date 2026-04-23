@@ -9,6 +9,16 @@ import (
 	"time"
 )
 
+type ClusterLifecycleState string
+
+const (
+	ClusterLifecycleUnknown      ClusterLifecycleState = "unknown"
+	ClusterLifecycleProvisioning ClusterLifecycleState = "provisioning"
+	ClusterLifecycleActive       ClusterLifecycleState = "active"
+	ClusterLifecycleDeleting     ClusterLifecycleState = "deleting"
+	ClusterLifecycleDeleted      ClusterLifecycleState = "deleted"
+)
+
 // ClusterInfo holds cluster metadata returned from the global server.
 type ClusterInfo struct {
 	ClusterID     string
@@ -19,6 +29,7 @@ type ClusterInfo struct {
 	Version       string // TiDB version string (e.g. "v8.1.1")
 	ProxyEndpoint string // internal cluster proxy URL for privileged SQL execution
 	UserPrefix    string // serverless user prefix (e.g. "2pVhryfrqtWscoV")
+	Lifecycle     ClusterLifecycleState
 }
 
 // ZeroInstanceInfo holds connection info returned directly from the zero-instance service.

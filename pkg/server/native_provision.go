@@ -294,6 +294,11 @@ func (s *Server) handleNativeTenantStatus(w http.ResponseWriter, r *http.Request
 		errJSON(w, http.StatusInternalServerError, "meta backend unavailable")
 		return "", true
 	}
+	if err := reconcileNativeTenantLifecycle(ctx, s.meta, s.pool, s.provisioner, t); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "tenant_status_native_lifecycle_error", "tenant_id", tenantID, "error", err)...)
+		errJSON(w, http.StatusBadGateway, "native tenant lifecycle unavailable")
+		return "", true
+	}
 
 	logger.Info(ctx, "server_event", eventFields(ctx, "tenant_status_native_ok", "tenant_id", tenantID, "status", t.Status)...)
 	return string(t.Status), true

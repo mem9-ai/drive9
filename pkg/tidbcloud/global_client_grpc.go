@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	serverlessv1 "github.com/tidbcloud/tidb-management-service/api/spec/global/serverless/v1"
+	regionalserverlessv1 "github.com/tidbcloud/tidb-management-service/api/spec/regional/serverless/v1"
 	zerov1beta1 "github.com/tidbcloud/tidb-management-service/api/spec/tidb_cloud_open_api/zero/v1beta1"
 	mgmtv1 "github.com/tidbcloud/tidb-management-service/api/spec/tidb_mgmt_service/v1"
 	"google.golang.org/grpc/codes"
@@ -18,6 +19,21 @@ type grpcGlobalClient struct {
 	mgmtCluster mgmtv1.ClusterServiceClient
 	serverless  serverlessv1.ServerlessServiceClient
 	zero        zerov1beta1.ZeroInstanceServiceClient
+}
+
+func mapRegionalClusterLifecycle(state regionalserverlessv1.ClusterState) ClusterLifecycleState {
+	switch state {
+	case regionalserverlessv1.ClusterState_CLUSTER_STATE_READY:
+		return ClusterLifecycleActive
+	case regionalserverlessv1.ClusterState_CLUSTER_STATE_CREATING:
+		return ClusterLifecycleProvisioning
+	case regionalserverlessv1.ClusterState_CLUSTER_STATE_DELETING:
+		return ClusterLifecycleDeleting
+	case regionalserverlessv1.ClusterState_CLUSTER_STATE_DELETED:
+		return ClusterLifecycleDeleted
+	default:
+		return ClusterLifecycleUnknown
+	}
 }
 
 // NewGRPCGlobalClient creates a GlobalClient backed by the given gRPC service stubs.
@@ -122,6 +138,7 @@ func (g *grpcGlobalClient) GetClusterInfo(ctx context.Context, clusterID string)
 		Version:       regional.GetVersion(),
 		ProxyEndpoint: proxyEndpoint,
 		UserPrefix:    prefix,
+		Lifecycle:     mapRegionalClusterLifecycle(regional.GetState()),
 	}, nil
 }
 

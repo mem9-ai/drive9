@@ -98,6 +98,15 @@ func (p *Provisioner) FetchProxyInfo(ctx context.Context, clusterID string) (pro
 	return info.ProxyEndpoint, info.UserPrefix, nil
 }
 
+// ClusterLifecycleState returns the current cluster lifecycle as reported by mgmt.
+func (p *Provisioner) ClusterLifecycleState(ctx context.Context, clusterID string) (tidbcloud.ClusterLifecycleState, error) {
+	info, err := p.global.GetClusterInfo(ctx, clusterID)
+	if err != nil {
+		return tidbcloud.ClusterLifecycleUnknown, fmt.Errorf("get cluster info %s: %w", clusterID, err)
+	}
+	return info.Lifecycle, nil
+}
+
 // ProvisionWithRootCreds resolves cluster connection info via Global Server
 // and returns a ClusterInfo populated with the caller-provided root credentials.
 // Unlike Provision, it does not fetch or decrypt cloud_admin passwords.
