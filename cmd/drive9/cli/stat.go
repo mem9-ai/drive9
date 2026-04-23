@@ -6,6 +6,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -60,8 +61,14 @@ func Stat(c *client.Client, args []string) error {
 	fmt.Printf("size: %d\n", m.Size)
 	fmt.Printf("isdir: %v\n", m.IsDir)
 	fmt.Printf("revision: %d\n", m.Revision)
+	if m.Mtime != nil {
+		fmt.Printf("mtime: %s\n", time.Unix(*m.Mtime, 0).UTC().Format(time.RFC3339))
+	}
 	fmt.Printf("content_type: %s\n", m.ContentType)
 	fmt.Printf("semantic_text: %s\n", m.SemanticText)
+	if m.Degraded {
+		fmt.Printf("degraded: true\n")
+	}
 
 	keys := make([]string, 0, len(m.Tags))
 	for k := range m.Tags {

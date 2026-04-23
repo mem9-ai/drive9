@@ -21,6 +21,7 @@ func TestStatDefaultOutputIncludesMetadataFields(t *testing.T) {
 			"size":          12,
 			"isdir":         false,
 			"revision":      3,
+			"mtime":         1700000000,
 			"content_type":  "text/plain",
 			"semantic_text": "hello world",
 			"tags": map[string]string{
@@ -41,6 +42,9 @@ func TestStatDefaultOutputIncludesMetadataFields(t *testing.T) {
 	}
 	if !strings.Contains(out, "semantic_text: hello world\n") {
 		t.Fatalf("output missing semantic_text: %q", out)
+	}
+	if !strings.Contains(out, "mtime: 2023-11-14T22:13:20Z\n") {
+		t.Fatalf("output missing RFC3339 mtime: %q", out)
 	}
 	ownerIdx := strings.Index(out, "tags.owner: alice\n")
 	topicIdx := strings.Index(out, "tags.topic: memo\n")
@@ -128,6 +132,7 @@ func TestStatFallsBackToLegacyHead(t *testing.T) {
 			w.Header().Set("Content-Length", "9")
 			w.Header().Set("X-Dat9-IsDir", "false")
 			w.Header().Set("X-Dat9-Revision", "11")
+			w.Header().Set("X-Dat9-Mtime", "1700000123")
 			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
@@ -145,6 +150,12 @@ func TestStatFallsBackToLegacyHead(t *testing.T) {
 	}
 	if !strings.Contains(out, "revision: 11\n") {
 		t.Fatalf("fallback output missing revision: %q", out)
+	}
+	if !strings.Contains(out, "mtime: 2023-11-14T22:15:23Z\n") {
+		t.Fatalf("fallback output missing RFC3339 mtime: %q", out)
+	}
+	if !strings.Contains(out, "degraded: true\n") {
+		t.Fatalf("fallback output missing degraded marker: %q", out)
 	}
 }
 

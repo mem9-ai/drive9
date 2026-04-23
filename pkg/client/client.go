@@ -172,11 +172,14 @@ type StatMetadataResult struct {
 	Size         int64             `json:"size"`
 	IsDir        bool              `json:"isdir"`
 	Revision     int64             `json:"revision"`
-	Mtime        int64             `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
+	Mtime        *int64            `json:"mtime,omitempty"` // Unix seconds when known
 	ContentType  string            `json:"content_type"`
 	SemanticText string            `json:"semantic_text"`
 	Tags         map[string]string `json:"tags"`
+	Degraded     bool              `json:"degraded,omitempty"`
 }
+
+var errStatMetadataCompatFallback = errors.New("stat metadata fallback to legacy HEAD")
 
 func (c *Client) url(path string) string {
 	if !strings.HasPrefix(path, "/") {
@@ -386,7 +389,7 @@ func (c *Client) StatMetadataCtx(ctx context.Context, path string) (*StatMetadat
 	}
 	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
 	if !strings.HasPrefix(contentType, "application/json") {
-		return nil, fmt.Errorf("decode stat metadata: unexpected Content-Type %q", resp.Header.Get("Content-Type"))
+		return nil, fmt.Errorf("%w: unexpected Content-Type %q", errStatMetadataCompatFallback, resp.Header.Get("Content-Type"))
 	}
 	var out StatMetadataResult
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -419,9 +422,10 @@ func (c *Client) StatMetadataCompatCtx(ctx context.Context, path string) (*StatM
 	if statErr != nil {
 		return nil, statErr
 	}
-	var mtime int64
+	var mtime *int64
 	if !statOut.Mtime.IsZero() {
-		mtime = statOut.Mtime.Unix()
+		unix := statOut.Mtime.Unix()
+		mtime = &unix
 	}
 	return &StatMetadataResult{
 		Size:         statOut.Size,
@@ -431,6 +435,7 @@ func (c *Client) StatMetadataCompatCtx(ctx context.Context, path string) (*StatM
 		ContentType:  "",
 		SemanticText: "",
 		Tags:         map[string]string{},
+		Degraded:     true,
 	}, nil
 }
 
@@ -442,7 +447,7 @@ func shouldFallbackStatMetadata(err error) bool {
 			return true
 		}
 	}
-	return strings.Contains(err.Error(), "decode stat metadata:")
+	return errors.Is(err, errStatMetadataCompatFallback)
 }
 
 // Delete removes a file or directory.

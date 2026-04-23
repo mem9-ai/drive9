@@ -122,8 +122,8 @@ func TestStatMetadataIncludesTagsAndSupportsTagReplace(t *testing.T) {
 	if meta.Size != 5 || meta.IsDir || meta.Revision != 1 {
 		t.Fatalf("unexpected stat metadata: %+v", meta)
 	}
-	if meta.Mtime <= 0 {
-		t.Fatalf("mtime = %d, want > 0", meta.Mtime)
+	if meta.Mtime == nil || *meta.Mtime <= 0 {
+		t.Fatalf("mtime = %v, want > 0", meta.Mtime)
 	}
 	if meta.ContentType == "" {
 		t.Fatal("content_type should not be empty")
@@ -154,7 +154,7 @@ func TestStatMetadataIncludesTagsAndSupportsTagReplace(t *testing.T) {
 	}
 }
 
-func TestStatMetadataCompatFallsBackOnDecodeError(t *testing.T) {
+func TestStatMetadataCompatFallsBackOnUnexpectedContentType(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/legacy.txt" && r.URL.Query().Has("stat"):
@@ -180,14 +180,17 @@ func TestStatMetadataCompatFallsBackOnDecodeError(t *testing.T) {
 	if got.Size != 14 || got.IsDir || got.Revision != 7 {
 		t.Fatalf("unexpected fallback metadata: %+v", got)
 	}
-	if got.Mtime != 1700000000 {
-		t.Fatalf("fallback metadata mtime = %d, want 1700000000", got.Mtime)
+	if got.Mtime == nil || *got.Mtime != 1700000000 {
+		t.Fatalf("fallback metadata mtime = %v, want 1700000000", got.Mtime)
 	}
 	if got.ContentType != "" || got.SemanticText != "" {
 		t.Fatalf("fallback metadata should keep enriched fields empty: %+v", got)
 	}
 	if len(got.Tags) != 0 {
 		t.Fatalf("fallback metadata should return empty tags, got: %+v", got.Tags)
+	}
+	if !got.Degraded {
+		t.Fatalf("fallback metadata degraded = false, want true: %+v", got)
 	}
 }
 
@@ -217,14 +220,46 @@ func TestStatMetadataCompatFallsBackOnNonJSONContentType(t *testing.T) {
 	if got.Size != 22 || got.IsDir || got.Revision != 9 {
 		t.Fatalf("unexpected fallback metadata: %+v", got)
 	}
-	if got.Mtime != 1700000123 {
-		t.Fatalf("fallback metadata mtime = %d, want 1700000123", got.Mtime)
+	if got.Mtime == nil || *got.Mtime != 1700000123 {
+		t.Fatalf("fallback metadata mtime = %v, want 1700000123", got.Mtime)
 	}
 	if got.ContentType != "" || got.SemanticText != "" {
 		t.Fatalf("fallback metadata should keep enriched fields empty: %+v", got)
 	}
 	if len(got.Tags) != 0 {
 		t.Fatalf("fallback metadata should return empty tags, got: %+v", got.Tags)
+	}
+	if !got.Degraded {
+		t.Fatalf("fallback metadata degraded = false, want true: %+v", got)
+	}
+}
+
+func TestStatMetadataCompatDoesNotFallbackOnMalformedJSON(t *testing.T) {
+	headCalled := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/broken.txt" && r.URL.Query().Has("stat"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("{"))
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/broken.txt":
+			headCalled = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	_, err := c.StatMetadataCompat("/broken.txt")
+	if err == nil {
+		t.Fatal("StatMetadataCompat error = nil, want decode error")
+	}
+	if !strings.Contains(err.Error(), "decode stat metadata:") {
+		t.Fatalf("error = %v, want decode stat metadata error", err)
+	}
+	if headCalled {
+		t.Fatal("HEAD fallback should not run on malformed JSON metadata response")
 	}
 }
 

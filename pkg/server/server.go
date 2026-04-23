@@ -564,16 +564,18 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	tags := make(map[string]string)
 	var size int64
 	var revision int64
-	var mtime int64
+	var mtime *int64
 	var contentType string
 	var semanticText string
 	if nf.File != nil {
 		size = nf.File.SizeBytes
 		revision = nf.File.Revision
 		if nf.File.ConfirmedAt != nil {
-			mtime = nf.File.ConfirmedAt.Unix()
+			unix := nf.File.ConfirmedAt.Unix()
+			mtime = &unix
 		} else {
-			mtime = nf.File.CreatedAt.Unix()
+			unix := nf.File.CreatedAt.Unix()
+			mtime = &unix
 		}
 		contentType = nf.File.ContentType
 		semanticText = nf.File.ContentText
@@ -585,19 +587,31 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 			return
 		}
 	} else {
-		mtime = nf.Node.CreatedAt.Unix()
+		unix := nf.Node.CreatedAt.Unix()
+		mtime = &unix
 	}
 
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_ok", "path", path, "is_dir", nf.Node.IsDirectory)...)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"size":          size,
-		"isdir":         nf.Node.IsDirectory,
-		"revision":      revision,
-		"mtime":         mtime,
-		"content_type":  contentType,
-		"semantic_text": semanticText,
-		"tags":          tags,
+	if mtime != nil {
+		w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(*mtime, 10))
+	}
+	_ = json.NewEncoder(w).Encode(struct {
+		Size         int64             `json:"size"`
+		IsDir        bool              `json:"isdir"`
+		Revision     int64             `json:"revision"`
+		Mtime        *int64            `json:"mtime,omitempty"`
+		ContentType  string            `json:"content_type"`
+		SemanticText string            `json:"semantic_text"`
+		Tags         map[string]string `json:"tags"`
+	}{
+		Size:         size,
+		IsDir:        nf.Node.IsDirectory,
+		Revision:     revision,
+		Mtime:        mtime,
+		ContentType:  contentType,
+		SemanticText: semanticText,
+		Tags:         tags,
 	})
 }
 
