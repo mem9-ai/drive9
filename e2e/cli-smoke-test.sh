@@ -247,6 +247,8 @@ TS="$(date +%s)"
 SMALL_LOCAL="/tmp/drive9-cli-small-${TS}.txt"
 SMALL_REMOTE="/cli-${TS}-small.txt"
 SMALL_RENAMED="/cli-${TS}-small-renamed.txt"
+TAG_LOCAL="/tmp/drive9-cli-tag-${TS}.txt"
+TAG_REMOTE="/cli-${TS}-tagged.txt"
 IMAGE_LOCAL="/tmp/drive9-cli-image-${TS}.jpg"
 IMAGE_REMOTE="/cli-${TS}-image.jpg"
 SEM_TEXT_TARGET="/cli-${TS}-cat-story.txt"
@@ -287,6 +289,33 @@ print("true" if any(line.strip()==name for line in out) else "false")
 PY
 )
 check_eq "mv renames remote file" "$renamed_present" "true"
+
+echo "[4.1] cli tag/stat metadata checks"
+printf "cli-tag-%s" "$TS" > "$TAG_LOCAL"
+drive9_retry fs cp --tag owner=smoke --tag topic=e2e "$TAG_LOCAL" ":$TAG_REMOTE" >/dev/null
+
+tag_stat_json="$(drive9_retry fs stat -o json "$TAG_REMOTE")"
+tag_owner="$(jq -r '.tags.owner // ""' <<<"$tag_stat_json")"
+check_eq "stat -o json returns owner tag" "$tag_owner" "smoke"
+
+tag_topic="$(jq -r '.tags.topic // ""' <<<"$tag_stat_json")"
+check_eq "stat -o json returns topic tag" "$tag_topic" "e2e"
+
+tag_semantic="$(jq -r '.semantic_text // ""' <<<"$tag_stat_json")"
+check_eq "stat -o json includes semantic_text for tagged file" "$tag_semantic" "cli-tag-${TS}"
+
+check_cmd "stat -o json includes non-empty content_type for tagged file" \
+  bash -c 'jq -e '"'"'(.content_type // "") | length > 0'"'"' >/dev/null <<<"$1"' -- "$tag_stat_json"
+
+printf "cli-tag-updated-%s" "$TS" > "$TAG_LOCAL"
+drive9_retry fs cp --tag owner=updated "$TAG_LOCAL" ":$TAG_REMOTE" >/dev/null
+
+tag_stat_json2="$(drive9_retry fs stat -o json "$TAG_REMOTE")"
+tag_owner2="$(jq -r '.tags.owner // ""' <<<"$tag_stat_json2")"
+check_eq "overwrite with single --tag updates owner" "$tag_owner2" "updated"
+
+tag_topic2="$(jq -r 'if (.tags // {} | has("topic")) then "present" else "missing" end' <<<"$tag_stat_json2")"
+check_eq "overwrite with single --tag clears old topic tag" "$tag_topic2" "missing"
 
 echo "[5] batch small-file upload/list/read via cli"
 mkdir -p "$BATCH_LOCAL_DIR"
@@ -412,6 +441,7 @@ check_eq "downloaded large file sha256 matches" "$sum_dst" "$sum_src"
 
 echo "[8] cleanup via cli"
 drive9_retry fs rm "$SMALL_RENAMED" >/dev/null
+drive9_retry fs rm "$TAG_REMOTE" >/dev/null
 if [ "$CLI_IMAGE_UPLOADED" = "1" ]; then
   drive9_retry fs rm "$IMAGE_REMOTE" >/dev/null
 fi
@@ -554,6 +584,7 @@ PY
 fi
 
 rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$IMAGE_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
+rm -f "$TAG_LOCAL"
 rm -f "/tmp/drive9-cli-sem-target-${TS}.txt" "/tmp/drive9-cli-sem-other-${TS}.txt" "/tmp/drive9-cli-image-caption-${TS}.txt"
 rm -rf "$BATCH_LOCAL_DIR"
 
