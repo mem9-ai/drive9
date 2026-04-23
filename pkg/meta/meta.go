@@ -483,13 +483,22 @@ func diffMetaTableMetaWithObservedIndexes(table metaTableSpec, meta metaTableMet
 			})
 			continue
 		}
-		if normalizeMetaSQLFragment(col.columnType) != normalizeMetaSQLFragment(spec.columnType) {
+		observedType := normalizeMetaSQLFragment(col.columnType)
+		desiredType := normalizeMetaSQLFragment(spec.columnType)
+		if observedType != desiredType {
+			// Only generate repair SQL for the one known-safe widening:
+			// tenants.schema_version INT → INT UNSIGNED.
+			var repairSQL string
+			if table.name == "tenants" && name == "schema_version" &&
+				observedType == "int" && desiredType == "int unsigned" {
+				repairSQL = spec.modifySQL
+			}
 			diffs = append(diffs, metaSchemaDiff{
 				kind:       metaSchemaDiffColumnType,
 				tableName:  table.name,
 				columnName: name,
 				detail:     fmt.Sprintf("%s schema contract: %s column type = %q, want %s", table.name, name, col.columnType, spec.columnType),
-				repairSQL:  spec.modifySQL,
+				repairSQL:  repairSQL,
 			})
 		}
 	}
@@ -706,7 +715,7 @@ func isSafeMetaRepairDiff(diff metaSchemaDiff, tableMissing map[string]bool) boo
 		}
 		return false
 	case metaSchemaDiffColumnType:
-		return isSafeModifyColumnRepairSQL(diff.repairSQL)
+		return isSafeModifyColumnRepairSQL(diff)
 	default:
 		return false
 	}
@@ -716,13 +725,17 @@ func isSafeAddColumnRepairSQL(sqlText string) bool {
 	return schemaspec.IsSafeAddColumnRepairSQL(sqlText)
 }
 
-// isSafeModifyColumnRepairSQL returns true for MODIFY COLUMN statements that
-// only widen a column type without data loss (e.g. INT → INT UNSIGNED).
-func isSafeModifyColumnRepairSQL(sqlText string) bool {
-	n := normalizeMetaSQLFragment(sqlText)
-	// Only allow: ALTER TABLE <t> MODIFY COLUMN <col> INT UNSIGNED ...
-	// This covers the schema_version INT → INT UNSIGNED upgrade path.
-	return strings.Contains(n, " modify column ") && strings.Contains(n, " int unsigned ")
+// isSafeModifyColumnRepairSQL returns true only for the single known-safe
+// column widening: tenants.schema_version INT → INT UNSIGNED.
+// schema_version values come from CRC32Version which produces uint32 (non-negative);
+// widening from INT to INT UNSIGNED is data-preserving for this column.
+// General MODIFY COLUMN is not considered safe without an explicit entry here.
+func isSafeModifyColumnRepairSQL(diff metaSchemaDiff) bool {
+	if diff.tableName != "tenants" || diff.columnName != "schema_version" {
+		return false
+	}
+	n := strings.TrimSuffix(normalizeMetaSQLFragment(diff.repairSQL), ";")
+	return n == "alter table tenants modify column schema_version int unsigned not null default 1"
 }
 
 func isIgnorableMetaSchemaError(err error) bool {
