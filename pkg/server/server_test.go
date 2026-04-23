@@ -106,6 +106,76 @@ func TestWriteAndRead(t *testing.T) {
 	}
 }
 
+func TestCreateMetadataOnly(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/meta-only.txt?create", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create: %d", resp.StatusCode)
+	}
+
+	var created struct {
+		Path     string `json:"path"`
+		Revision int64  `json:"revision"`
+		Size     int64  `json:"size"`
+		Status   string `json:"status"`
+		Mtime    int64  `json:"mtime"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Path != "/meta-only.txt" || created.Revision != 1 || created.Size != 0 || created.Status != "CONFIRMED" {
+		t.Fatalf("unexpected create response: %+v", created)
+	}
+	if created.Mtime == 0 {
+		t.Fatal("create response should include mtime")
+	}
+
+	statReq, _ := http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/meta-only.txt", nil)
+	statResp, err := http.DefaultClient.Do(statReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = statResp.Body.Close()
+	if statResp.StatusCode != http.StatusOK {
+		t.Fatalf("stat after create: %d", statResp.StatusCode)
+	}
+	if statResp.Header.Get("Content-Length") != "0" {
+		t.Fatalf("Content-Length=%s, want 0", statResp.Header.Get("Content-Length"))
+	}
+	if statResp.Header.Get("X-Dat9-Revision") != "1" {
+		t.Fatalf("revision header=%s, want 1", statResp.Header.Get("X-Dat9-Revision"))
+	}
+}
+
+func TestCreateMetadataOnlyConflict(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	for i := 0; i < 2; i++ {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/dup.txt?create", nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if i == 0 && resp.StatusCode != http.StatusOK {
+			t.Fatalf("first create: %d", resp.StatusCode)
+		}
+		if i == 1 && resp.StatusCode != http.StatusConflict {
+			t.Fatalf("second create: %d, want 409", resp.StatusCode)
+		}
+	}
+}
+
 func TestListDir(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)

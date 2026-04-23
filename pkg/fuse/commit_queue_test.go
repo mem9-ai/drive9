@@ -10,6 +10,7 @@ import (
 
 func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 	var gotExpected string
+	var gotCommitted int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
 		w.WriteHeader(http.StatusOK)
@@ -34,6 +35,9 @@ func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	cq.SetSuccessCallback(func(_ string, committedRevision int64) {
+		gotCommitted = committedRevision
+	})
 	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/ok.txt",
 		BaseRev: 7,
@@ -46,6 +50,9 @@ func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 
 	if gotExpected != "7" {
 		t.Fatalf("expected revision header = %q, want 7", gotExpected)
+	}
+	if gotCommitted != 8 {
+		t.Fatalf("committed revision callback = %d, want 8", gotCommitted)
 	}
 	if pending.HasPending("/ok.txt") {
 		t.Fatal("pending entry should be removed after successful commit")

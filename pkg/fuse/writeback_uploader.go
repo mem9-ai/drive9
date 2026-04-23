@@ -43,13 +43,14 @@ type pathState struct {
 // any time. WaitPath() allows Rename/Unlink/Fsync to block until the current
 // upload for a path finishes.
 type WriteBackUploader struct {
-	client   *client.Client
-	cache    *WriteBackCache
-	uploadCh chan string // remote paths to upload
-	wg       sync.WaitGroup
-	stopOnce sync.Once
-	stopped  atomic.Bool
-	stopCh   chan struct{}
+	client    *client.Client
+	cache     *WriteBackCache
+	uploadCh  chan string // remote paths to upload
+	wg        sync.WaitGroup
+	stopOnce  sync.Once
+	stopped   atomic.Bool
+	stopCh    chan struct{}
+	onSuccess func(remotePath string, committedRevision int64)
 
 	// Per-path in-flight tracking.
 	inflightMu sync.Mutex
@@ -74,6 +75,13 @@ func NewWriteBackUploader(c *client.Client, cache *WriteBackCache, numWorkers in
 		go u.worker()
 	}
 	return u
+}
+
+// SetSuccessCallback installs a hook that runs after a cached upload commits.
+// committedRevision is the post-commit remote revision when it can be derived
+// from the cached metadata. Callers should set the hook before starting uploads.
+func (u *WriteBackUploader) SetSuccessCallback(fn func(remotePath string, committedRevision int64)) {
+	u.onSuccess = fn
 }
 
 // Submit enqueues a remote path for background upload. Blocks up to 5s if the
@@ -257,6 +265,14 @@ func (u *WriteBackUploader) uploadOne(remotePath string) {
 	curMeta, ok := u.cache.GetMeta(remotePath)
 	if ok && curMeta.Generation == gen {
 		u.cache.Remove(remotePath)
+	}
+	if committedRev, ok := committedRevisionForPending(meta.Kind, meta.BaseRev); ok {
+		if u.onSuccess != nil {
+			u.onSuccess(remotePath, committedRev)
+		}
+		log.Printf("writeback upload success for %s: base_rev=%d committed_rev=%d kind=%d; refreshed FUSE revision state", remotePath, meta.BaseRev, committedRev, meta.Kind)
+	} else {
+		log.Printf("writeback upload success for %s: base_rev=%d kind=%d; committed revision unknown, FUSE revision state unchanged", remotePath, meta.BaseRev, meta.Kind)
 	}
 }
 

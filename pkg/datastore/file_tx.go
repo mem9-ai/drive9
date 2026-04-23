@@ -5,6 +5,47 @@ import (
 	"time"
 )
 
+// CreateConfirmedEmptyFileParams defines the metadata needed to create a
+// confirmed empty file entity and its namespace entry in one transaction.
+type CreateConfirmedEmptyFileParams struct {
+	Path      string
+	FileID    string
+	NodeID    string
+	CreatedAt time.Time
+}
+
+// CreateConfirmedEmptyFileTx creates a confirmed empty file row plus its file
+// node inside an existing transaction.
+func (s *Store) CreateConfirmedEmptyFileTx(db execer, params CreateConfirmedEmptyFileParams, genID func() string) error {
+	createdAt := params.CreatedAt.UTC()
+	confirmedAt := createdAt
+
+	if err := s.InsertFileTx(db, &File{
+		FileID:      params.FileID,
+		StorageType: StorageDB9,
+		StorageRef:  "inline",
+		ContentBlob: []byte{},
+		SizeBytes:   0,
+		Revision:    1,
+		Status:      StatusConfirmed,
+		CreatedAt:   createdAt,
+		ConfirmedAt: &confirmedAt,
+	}); err != nil {
+		return err
+	}
+	if err := s.EnsureParentDirsTx(db, params.Path, genID); err != nil {
+		return err
+	}
+	return s.InsertNodeTx(db, &FileNode{
+		NodeID:     params.NodeID,
+		Path:       params.Path,
+		ParentPath: parentPath(params.Path),
+		Name:       baseName(params.Path),
+		FileID:     params.FileID,
+		CreatedAt:  createdAt,
+	})
+}
+
 // InsertFileTx inserts a file row inside an existing transaction.
 func (s *Store) InsertFileTx(db execer, f *File) error {
 	_, err := db.Exec(`INSERT INTO files

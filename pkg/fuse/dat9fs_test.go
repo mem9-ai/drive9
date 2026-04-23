@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,10 +19,28 @@ import (
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
+func serveMetadataCreate(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost || !r.URL.Query().Has("create") {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"path":     strings.TrimPrefix(r.URL.Path, "/v1/fs"),
+		"revision": 1,
+		"size":     0,
+		"status":   "CONFIRMED",
+		"mtime":    time.Now().Unix(),
+	})
+	return true
+}
+
 func newTestDat9FS(t *testing.T, size int64, get func(http.ResponseWriter, *http.Request)) (*Dat9FS, uint64, func()) {
 	t.Helper()
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
@@ -81,6 +100,9 @@ func TestOpenWritableLargeFileLazyPreload(t *testing.T) {
 
 func TestCreateWriteThroughShadow(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}))
 	defer ts.Close()
@@ -620,6 +642,64 @@ func TestGetAttrUsesLatestDirtyHandleSize(t *testing.T) {
 	}
 }
 
+func TestGetAttrUsesServerBaseThenWriteBackOverlay(t *testing.T) {
+	mtime := time.Date(2026, 4, 21, 13, 0, 0, 0, time.UTC)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(mtime.Unix(), 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.SetWriteBack(cache, nil)
+	ino := fs.inodes.Lookup("/file.bin", false, 0, time.Time{})
+
+	if err := cache.PutWithBaseRev("/file.bin", []byte("overlay-data"), int64(len("overlay-data")), PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	var out gofuse.AttrOut
+	st := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr status = %v, want OK", st)
+	}
+	if got, want := out.Size, uint64(len("overlay-data")); got != want {
+		t.Fatalf("GetAttr size = %d, want %d", got, want)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Revision != 7 {
+		t.Fatalf("entry.Revision = %d, want 7", entry.Revision)
+	}
+	if !entry.Mtime.Equal(mtime) {
+		t.Fatalf("entry.Mtime = %v, want %v", entry.Mtime, mtime)
+	}
+}
+
 func TestGetAttrDirectoryDoesNotRequireRemoteStat(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
@@ -642,6 +722,111 @@ func TestGetAttrDirectoryDoesNotRequireRemoteStat(t *testing.T) {
 	}
 	if out.Mode&syscall.S_IFDIR == 0 {
 		t.Fatalf("GetAttr mode = %o, want directory mode", out.Mode)
+	}
+}
+
+func TestReadDirDoesNotMergePendingEntries(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.RawQuery == "list=1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.SetWriteBack(cache, nil)
+
+	if err := cache.Put("/pending.txt", []byte("local only"), 10, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+
+	var openOut gofuse.OpenOut
+	if st := fs.OpenDir(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: 1}}, &openOut); st != gofuse.OK {
+		t.Fatalf("OpenDir status = %v, want OK", st)
+	}
+	list := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{Fh: openOut.Fh}, list); st != gofuse.OK {
+		t.Fatalf("ReadDir status = %v, want OK", st)
+	}
+	dh, ok := fs.dirHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("dir handle not found")
+	}
+	if len(dh.Entries) != 0 {
+		t.Fatalf("dir entries = %d, want 0", len(dh.Entries))
+	}
+}
+
+func TestReadDirHandleKeepsSnapshotUntilReopen(t *testing.T) {
+	var entries atomic.Value
+	entries.Store([]map[string]any{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.RawQuery == "list=1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": entries.Load()})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{DirTTL: time.Millisecond}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var openOut gofuse.OpenOut
+	if st := fs.OpenDir(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: 1}}, &openOut); st != gofuse.OK {
+		t.Fatalf("OpenDir status = %v, want OK", st)
+	}
+	list := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{Fh: openOut.Fh}, list); st != gofuse.OK {
+		t.Fatalf("first ReadDir status = %v, want OK", st)
+	}
+	dh, ok := fs.dirHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("dir handle not found")
+	}
+	if len(dh.Entries) != 0 {
+		t.Fatalf("initial dir entries = %d, want 0", len(dh.Entries))
+	}
+
+	entries.Store([]map[string]any{{"name": "new.txt", "size": 0, "isDir": false, "mtime": time.Now().Unix()}})
+	list = gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{Fh: openOut.Fh}, list); st != gofuse.OK {
+		t.Fatalf("second ReadDir status = %v, want OK", st)
+	}
+	dh, ok = fs.dirHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("dir handle not found after second read")
+	}
+	if len(dh.Entries) != 0 {
+		t.Fatalf("same-handle entries = %d, want 0", len(dh.Entries))
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	fs.ReleaseDir(&gofuse.ReleaseIn{Fh: openOut.Fh})
+	if st := fs.OpenDir(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: 1}}, &openOut); st != gofuse.OK {
+		t.Fatalf("reopen OpenDir status = %v, want OK", st)
+	}
+	list = gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := fs.ReadDir(nil, &gofuse.ReadIn{Fh: openOut.Fh}, list); st != gofuse.OK {
+		t.Fatalf("reopen ReadDir status = %v, want OK", st)
+	}
+	dh, ok = fs.dirHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("dir handle not found after reopen")
+	}
+	if len(dh.Entries) != 1 || dh.Entries[0].Name != "new.txt" {
+		t.Fatalf("reopened dir entries = %+v, want [new.txt]", dh.Entries)
 	}
 }
 
@@ -799,6 +984,9 @@ func TestInitStoresServer(t *testing.T) {
 
 func TestCreateFileGetsStreamUploader(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.WriteHeader(http.StatusOK)
@@ -835,6 +1023,135 @@ func TestCreateFileGetsStreamUploader(t *testing.T) {
 	}
 	if fh.Streamer == nil {
 		t.Fatal("expected StreamUploader to be set for new file")
+	}
+}
+
+func TestCreateUsesMetadataAuthorityResult(t *testing.T) {
+	mtime := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Has("create") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"path":     "/created.txt",
+				"revision": 1,
+				"size":     0,
+				"status":   "CONFIRMED",
+				"mtime":    mtime.Unix(),
+			})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}, "created.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.IsNew {
+		t.Fatal("metadata-created handle should not retain create-if-absent semantics")
+	}
+	if fh.BaseRev != 1 {
+		t.Fatalf("fh.BaseRev = %d, want 1", fh.BaseRev)
+	}
+	if fh.Streamer == nil {
+		t.Fatal("expected StreamUploader to be set")
+	}
+	if got := fh.Streamer.ExpectedRevision(); got != 1 {
+		t.Fatalf("streamer expected revision = %d, want 1", got)
+	}
+
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Revision != 1 {
+		t.Fatalf("entry.Revision = %d, want 1", entry.Revision)
+	}
+	if !entry.Mtime.Equal(mtime) {
+		t.Fatalf("entry.Mtime = %v, want %v", entry.Mtime, mtime)
+	}
+}
+
+func TestRenameMetadataCreatedFileUsesRemoteRename(t *testing.T) {
+	var renameCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Query().Has("rename"):
+			renameCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}, "old.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	st = fs.Rename(nil, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1}, "old.txt", "new.txt")
+	if st != gofuse.OK {
+		t.Fatalf("Rename status = %v, want OK", st)
+	}
+	if renameCalls.Load() != 1 {
+		t.Fatalf("rename calls = %d, want 1", renameCalls.Load())
+	}
+}
+
+func TestUnlinkMetadataCreatedFileUsesRemoteDelete(t *testing.T) {
+	var deleteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
+		switch r.Method {
+		case http.MethodDelete:
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}, "remove.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	st = fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "remove.txt")
+	if st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if deleteCalls.Load() != 1 {
+		t.Fatalf("delete calls = %d, want 1", deleteCalls.Load())
 	}
 }
 
@@ -1165,6 +1482,68 @@ func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.
 	}
 	if fh.Streamer.HasStreamedParts() {
 		t.Fatal("streamer should clear prior streamed parts after successful flush")
+	}
+}
+
+func TestApplyAsyncCommittedRevision_UpdatesInodeAndCleanHandlesOnly(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	ino := fs.inodes.Lookup("/async.bin", false, 8, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+
+	clean := &FileHandle{
+		Ino:      ino,
+		Path:     "/async.bin",
+		Dirty:    NewWriteBuffer("/async.bin", maxPreloadSize, 0),
+		BaseRev:  7,
+		IsNew:    true,
+		ZeroBase: true,
+		Streamer: NewStreamUploader(nil, "/async.bin", 7),
+	}
+	clean.Streamer.started = true
+	clean.Streamer.streamedParts[1] = true
+	if _, err := clean.Dirty.Write(0, []byte("existing")); err != nil {
+		t.Fatal(err)
+	}
+	clean.Dirty.ClearDirty()
+
+	dirty := &FileHandle{
+		Ino:     ino,
+		Path:    "/async.bin",
+		Dirty:   NewWriteBuffer("/async.bin", maxPreloadSize, 0),
+		BaseRev: 7,
+	}
+	if _, err := dirty.Dirty.Write(0, []byte("pending")); err != nil {
+		t.Fatal(err)
+	}
+
+	fs.fileHandles.Allocate(clean)
+	fs.fileHandles.Allocate(dirty)
+
+	fs.applyAsyncCommittedRevision("/async.bin", 8)
+
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if entry.Revision != 8 {
+		t.Fatalf("inode revision = %d, want 8", entry.Revision)
+	}
+	if clean.BaseRev != 8 {
+		t.Fatalf("clean handle BaseRev = %d, want 8", clean.BaseRev)
+	}
+	if clean.IsNew {
+		t.Fatal("clean handle should no longer be marked new")
+	}
+	if clean.ZeroBase {
+		t.Fatal("clean handle should clear zero-base after successful async commit")
+	}
+	if got := clean.Streamer.ExpectedRevision(); got != 8 {
+		t.Fatalf("clean streamer expected revision = %d, want 8", got)
+	}
+	if dirty.BaseRev != 7 {
+		t.Fatalf("dirty handle BaseRev = %d, want 7", dirty.BaseRev)
 	}
 }
 
@@ -1741,6 +2120,9 @@ func newTestServer(t *testing.T) (*httptest.Server, chan []byte) {
 	t.Helper()
 	uploadedCh := make(chan []byte, 10)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -1843,6 +2225,9 @@ func TestConcurrentGetAttrDuringWrite(t *testing.T) {
 	// reach the server.
 	var headCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			headCalls.Add(1)
@@ -1955,6 +2340,9 @@ func TestNotifyEntry_NonBlocking(t *testing.T) {
 // time. If kernel notifications were synchronous, these could deadlock.
 func TestMutationHandlers_CompleteWithinTimeout(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "100")
@@ -2051,6 +2439,9 @@ func TestMutationHandlers_CompleteWithinTimeout(t *testing.T) {
 // lock ordering deadlocks between dirtyMu, inodes.mu, and fileHandles.mu.
 func TestParallelCreateAndGetAttr(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -2203,6 +2594,9 @@ func TestFlushHandle_SmallFile_ServerUnreachable(t *testing.T) {
 func TestDebounce_ReleaseAfterFlush_NoDataLoss(t *testing.T) {
 	uploadedCh := make(chan []byte, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")

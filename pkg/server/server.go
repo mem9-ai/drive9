@@ -442,6 +442,8 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		if r.URL.Query().Has("append") {
 			s.handleAppend(w, r, path)
+		} else if r.URL.Query().Has("create") {
+			s.handleCreate(w, r, path)
 		} else if r.URL.Query().Has("copy") {
 			s.handleCopy(w, r, path)
 		} else if r.URL.Query().Has("rename") {
@@ -660,7 +662,15 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			return
 		}
 		if errors.Is(err, datastore.ErrRevisionConflict) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_conflict", "path", path, "error", err)...)
+			fields := eventFields(r.Context(), "write_conflict", "path", path, "error", err, "expected_revision", expectedRevision)
+			if nf, statErr := b.StatNodeCtx(r.Context(), path); statErr == nil && nf != nil && nf.File != nil {
+				fields = append(fields, zap.Int64("current_revision", nf.File.Revision))
+			} else if errors.Is(statErr, datastore.ErrNotFound) {
+				fields = append(fields, zap.String("current_revision", "not_found"))
+			} else if statErr != nil {
+				fields = append(fields, zap.String("current_revision", "unknown"), zap.String("current_revision_error", statErr.Error()))
+			}
+			logger.Warn(r.Context(), "server_event", fields...)
 			metricEvent(r.Context(), "fs_write", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
 			return
@@ -996,6 +1006,38 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "mkdir_ok", "path", path)...)
 	s.publishEvent(r, path, "mkdir")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_missing_scope", "path", path)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+
+	created, err := b.CreateMetadataOnlyCtx(r.Context(), path)
+	if err != nil {
+		if errors.Is(err, datastore.ErrPathConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_conflict", "path", path, "error", err)...)
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "create_failed", "path", path, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "create_ok", "path", path, "revision", created.Revision)...)
+	s.publishEvent(r, path, "create")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"path":     created.Path,
+		"revision": created.Revision,
+		"size":     created.SizeBytes,
+		"status":   string(created.Status),
+		"mtime":    created.CreatedAt.Unix(),
+	})
 }
 
 func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {

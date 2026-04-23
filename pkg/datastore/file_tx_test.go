@@ -3,6 +3,7 @@ package datastore
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -35,6 +36,107 @@ func TestInsertFileTx(t *testing.T) {
 	}
 	if got.StorageRef != "/blobs/f1" || got.Revision != 1 {
 		t.Fatalf("unexpected inserted file: %+v", got)
+	}
+}
+
+func TestCreateConfirmedEmptyFileTx(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+
+	genIDSeq := 0
+	genID := func() string {
+		genIDSeq++
+		return fmt.Sprintf("gen-%d", genIDSeq)
+	}
+
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.CreateConfirmedEmptyFileTx(tx, CreateConfirmedEmptyFileParams{
+			Path:      "/docs/specs/design.md",
+			FileID:    "file-meta-1",
+			NodeID:    "node-meta-1",
+			CreatedAt: now,
+		}, genID)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	nf, err := s.Stat(context.Background(), "/docs/specs/design.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nf.Node.FileID != "file-meta-1" {
+		t.Fatalf("node file_id=%q, want file-meta-1", nf.Node.FileID)
+	}
+	if nf.File == nil {
+		t.Fatal("expected file entity for created path")
+	}
+	if nf.File.Status != StatusConfirmed {
+		t.Fatalf("status=%s, want %s", nf.File.Status, StatusConfirmed)
+	}
+	if nf.File.Revision != 1 {
+		t.Fatalf("revision=%d, want 1", nf.File.Revision)
+	}
+	if nf.File.StorageType != StorageDB9 || nf.File.StorageRef != "inline" {
+		t.Fatalf("storage=(%s,%s), want (db9,inline)", nf.File.StorageType, nf.File.StorageRef)
+	}
+	if nf.File.SizeBytes != 0 {
+		t.Fatalf("size=%d, want 0", nf.File.SizeBytes)
+	}
+	if nf.File.ConfirmedAt == nil {
+		t.Fatal("confirmed_at should be set for metadata-created file")
+	}
+
+	parent, err := s.GetNode(context.Background(), "/docs/specs/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !parent.IsDirectory {
+		t.Fatalf("parent %+v should be a directory", parent)
+	}
+}
+
+func TestCreateConfirmedEmptyFileTxRollsBackOnConflict(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+
+	if err := s.InsertFile(context.Background(), &File{
+		FileID:      "existing-file",
+		StorageType: StorageDB9,
+		StorageRef:  "inline",
+		ContentBlob: []byte{},
+		SizeBytes:   0,
+		Revision:    1,
+		Status:      StatusConfirmed,
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{
+		NodeID:     "existing-node",
+		Path:       "/conflict.txt",
+		ParentPath: "/",
+		Name:       "conflict.txt",
+		FileID:     "existing-file",
+		CreatedAt:  now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.CreateConfirmedEmptyFileTx(tx, CreateConfirmedEmptyFileParams{
+			Path:      "/conflict.txt",
+			FileID:    "new-file",
+			NodeID:    "new-node",
+			CreatedAt: now.Add(time.Second),
+		}, func() string { return "gen-conflict" })
+	})
+	if err != ErrPathConflict {
+		t.Fatalf("error=%v, want %v", err, ErrPathConflict)
+	}
+
+	if _, err := s.GetFile(context.Background(), "new-file"); err != ErrNotFound {
+		t.Fatalf("rolled-back file lookup error=%v, want %v", err, ErrNotFound)
 	}
 }
 

@@ -178,6 +178,7 @@ func TestWriteStreamWithSummarySmallFile(t *testing.T) {
 	}
 	if summary == nil {
 		t.Fatal("summary is nil")
+		return
 	}
 	if summary.Type != "upload_summary" {
 		t.Fatalf("summary.Type = %q, want upload_summary", summary.Type)
@@ -1089,6 +1090,7 @@ func TestDownloadToFileWithSummaryReusesPresignedURL(t *testing.T) {
 	}
 	if summary == nil {
 		t.Fatal("expected download summary for large-file path")
+		return
 	}
 	if got := readRequests.Load(); got != 1 {
 		t.Fatalf("expected one /v1/fs request, got %d", got)

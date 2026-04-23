@@ -40,6 +40,7 @@ func requireEmbeddingRevision(t *testing.T, got *int64, want int64) {
 	t.Helper()
 	if got == nil {
 		t.Fatalf("embedding_revision=nil, want %d", want)
+		return
 	}
 	if *got != want {
 		t.Fatalf("embedding_revision=%d, want %d", *got, want)

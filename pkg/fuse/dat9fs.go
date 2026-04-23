@@ -100,6 +100,21 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 func (fs *Dat9FS) SetWriteBack(cache *WriteBackCache, uploader *WriteBackUploader) {
 	fs.writeBack = cache
 	fs.uploader = uploader
+	if uploader != nil {
+		// Keep FUSE's in-memory revision view aligned with successful async uploads.
+		uploader.SetSuccessCallback(fs.applyAsyncCommittedRevision)
+	}
+}
+
+// SetCommitQueue configures the async commit queue on the filesystem.
+// Must be called before the filesystem starts serving requests.
+func (fs *Dat9FS) SetCommitQueue(cq *CommitQueue) {
+	fs.commitQueue = cq
+	if cq != nil {
+		// Commit queue workers complete after Release returns, so they must repair
+		// cached inode/handle revisions on the filesystem side.
+		cq.SetSuccessCallback(fs.applyAsyncCommittedRevision)
+	}
 }
 
 // flushPendingWriteBack synchronously uploads a pending write-back cache
@@ -271,6 +286,72 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 			if err := fs.shadowStore.Ensure(fh.Path, size, revision); err != nil {
 				log.Printf("shadow base revision refresh failed for %s: %v", fh.Path, err)
 			}
+		}
+		fh.Unlock()
+	}
+}
+
+// waitForPriorPathCommitLocked blocks until any earlier async commit for the
+// same path completes, then rebases this handle onto the latest committed inode
+// revision before a new local snapshot is staged. Callers must hold fh.mu.
+func (fs *Dat9FS) waitForPriorPathCommitLocked(fh *FileHandle) {
+	if fs.commitQueue == nil || fh == nil {
+		return
+	}
+
+	path := fh.Path
+	ino := fh.Ino
+	fh.Unlock()
+	fs.commitQueue.WaitPath(path)
+	fh.Lock()
+
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok || entry == nil || entry.Path != path || entry.Revision <= 0 {
+		return
+	}
+	if entry.Revision < fh.BaseRev {
+		return
+	}
+
+	fh.BaseRev = entry.Revision
+	fh.IsNew = false
+	if fh.Streamer != nil {
+		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+	}
+}
+
+// applyAsyncCommittedRevision updates FUSE-side cached state after a background
+// upload commits remotely. It only refreshes clean handles; a handle with local
+// dirty data must keep its older BaseRev so a stale remote success does not mask
+// newer uncommitted local edits.
+func (fs *Dat9FS) applyAsyncCommittedRevision(remotePath string, revision int64) {
+	if revision <= 0 {
+		return
+	}
+
+	if ino, ok := fs.inodes.GetInode(remotePath); ok {
+		fs.inodes.UpdateRevision(ino, revision)
+	}
+
+	for _, fh := range fs.fileHandles.Snapshot() {
+		if fh == nil || fh.Path != remotePath || fh.Dirty == nil {
+			continue
+		}
+
+		fh.Lock()
+		// Do not advance a handle that still has dirty pages. That handle now
+		// represents a newer local snapshot than the async commit that just finished.
+		if fh.Dirty.HasDirtyParts() {
+			fh.Unlock()
+			continue
+		}
+		fh.IsNew = false
+		fh.BaseRev = revision
+		if fh.Streamer != nil {
+			fh.Streamer.ResetForNextWrite(expectedRevisionForHandle(fh))
+		}
+		if fh.ZeroBase && fh.Dirty.Size() > 0 {
+			fh.ZeroBase = false
 		}
 		fh.Unlock()
 	}
@@ -619,38 +700,6 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		return st
 	}
 
-	// Pending namespace overlay: check in-memory PendingIndex first (O(1)),
-	// then fall back to the write-back cache GetMeta for backward compat.
-	if fs.pendingIndex != nil {
-		if meta, ok := fs.pendingIndex.GetMeta(childP); ok {
-			mtime := meta.Mtime
-			if mtime.IsZero() {
-				mtime = time.Now()
-			}
-			ino := fs.inodes.Lookup(childP, false, meta.Size, mtime)
-			entry, ok := fs.inodes.GetEntry(ino)
-			if !ok {
-				return gofuse.EIO
-			}
-			fs.fillEntryOut(entry, out)
-			return gofuse.OK
-		}
-	} else if fs.writeBack != nil {
-		if meta, ok := fs.writeBack.GetMeta(childP); ok {
-			mtime := meta.Mtime
-			if mtime.IsZero() {
-				mtime = time.Now()
-			}
-			ino := fs.inodes.Lookup(childP, false, meta.Size, mtime)
-			entry, ok := fs.inodes.GetEntry(ino)
-			if !ok {
-				return gofuse.EIO
-			}
-			fs.fillEntryOut(entry, out)
-			return gofuse.OK
-		}
-	}
-
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
@@ -714,13 +763,45 @@ func (fs *Dat9FS) Forget(nodeId uint64, nlookup uint64) {
 	fs.inodes.Forget(nodeId, nlookup)
 }
 
+func (fs *Dat9FS) refreshRegularFileEntryBase(cancel <-chan struct{}, nodeID uint64, entry *InodeEntry) (*InodeEntry, gofuse.Status) {
+	if entry == nil || nodeID == 1 || entry.IsDir || entry.Revision > 0 {
+		return entry, gofuse.OK
+	}
+
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
+	stat, err := fs.client.StatCtx(ctx, entry.Path)
+	if err != nil {
+		return nil, httpToFuseStatus(err)
+	}
+	entry.Size = stat.Size
+	entry.IsDir = stat.IsDir
+	fs.inodes.UpdateSize(nodeID, stat.Size)
+	if stat.Revision > 0 {
+		entry.Revision = stat.Revision
+		fs.inodes.UpdateRevision(nodeID, stat.Revision)
+	}
+	if !stat.Mtime.IsZero() {
+		entry.Mtime = stat.Mtime
+		fs.inodes.UpdateMtime(nodeID, stat.Mtime)
+	}
+	return entry, gofuse.OK
+}
+
 func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut) gofuse.Status {
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
 	}
 
-	// Prefer unflushed writable state over the remote object size.
+	entry, st := fs.refreshRegularFileEntryBase(cancel, input.NodeId, entry)
+	if st != gofuse.OK {
+		return st
+	}
+
+	// Server metadata is the base view. The local mount only overlays
+	// uncommitted writable state on top of that base.
 	if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
 		entry.Size = size
 	} else if fs.writeBack != nil && !entry.IsDir {
@@ -742,46 +823,6 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 				if !meta.Mtime.IsZero() {
 					entry.Mtime = meta.Mtime
 				}
-				pendingFound = true
-			}
-		}
-		if !pendingFound && input.NodeId != 1 {
-			ctx, cf := fuseCtx(cancel)
-			defer cf()
-			stat, err := fs.client.StatCtx(ctx, entry.Path)
-			if err != nil {
-				return httpToFuseStatus(err)
-			}
-			entry.Size = stat.Size
-			entry.IsDir = stat.IsDir
-			fs.inodes.UpdateSize(input.NodeId, stat.Size)
-			if stat.Revision > 0 {
-				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
-			}
-			if !stat.Mtime.IsZero() {
-				entry.Mtime = stat.Mtime
-				fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
-			}
-		}
-	} else if input.NodeId != 1 {
-		// Some deployments do not support HEAD/stat on directories.
-		// Keep directory attrs from inode map and only refresh regular files.
-		if !entry.IsDir {
-			ctx, cf := fuseCtx(cancel)
-			defer cf()
-			stat, err := fs.client.StatCtx(ctx, entry.Path)
-			if err != nil {
-				return httpToFuseStatus(err)
-			}
-			entry.Size = stat.Size
-			entry.IsDir = stat.IsDir
-			fs.inodes.UpdateSize(input.NodeId, stat.Size)
-			if stat.Revision > 0 {
-				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
-			}
-			if !stat.Mtime.IsZero() {
-				entry.Mtime = stat.Mtime
-				fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
 			}
 		}
 	}
@@ -1241,8 +1282,7 @@ func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
 func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, error) {
 	// Check dir cache first
 	if cached, ok := fs.dirCache.Get(dirPath); ok {
-		entries := fs.cachedToDirEntries(dirPath, cached)
-		return fs.mergePendingDirEntries(dirPath, entries), nil
+		return fs.cachedToDirEntries(dirPath, cached), nil
 	}
 
 	items, err := fs.client.ListCtx(ctx, dirPath)
@@ -1266,81 +1306,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	}
 	fs.dirCache.Put(dirPath, cached)
 
-	entries := fs.cachedToDirEntries(dirPath, cached)
-	return fs.mergePendingDirEntries(dirPath, entries), nil
-}
-
-// mergePendingDirEntries overlays pending write-back entries onto a directory
-// listing. Files that exist in the write-back cache or pendingIndex (commit
-// queue backed) but are not yet on the server are added to the listing so
-// that ls, tab-completion, and editors can see them.
-func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []DirEntry {
-	// Build set of already-listed names for dedup.
-	existing := make(map[string]struct{}, len(entries))
-	for _, e := range entries {
-		existing[e.Name] = struct{}{}
-	}
-
-	// Overlay write-back cache entries.
-	if fs.writeBack != nil {
-		for p := range fs.writeBack.ListPendingPaths() {
-			if parentDir(p) != dirPath {
-				continue
-			}
-			name := path.Base(p)
-			if _, ok := existing[name]; ok {
-				continue
-			}
-			meta, ok := fs.writeBack.GetMeta(p)
-			if !ok {
-				continue
-			}
-			mtime := meta.Mtime
-			if mtime.IsZero() {
-				mtime = time.Now()
-			}
-			ino := fs.inodes.EnsureInode(p, false, meta.Size, mtime)
-			entries = append(entries, DirEntry{
-				Name: name,
-				Ino:  ino,
-				Mode: syscall.S_IFREG,
-			})
-			existing[name] = struct{}{}
-		}
-	}
-
-	// Overlay commit-queue-backed entries from pendingIndex. These are files
-	// handed to commitQueue after Release but not yet uploaded to the server.
-	if fs.pendingIndex != nil {
-		prefix := dirPath
-		if prefix != "/" {
-			prefix += "/"
-		} else {
-			prefix = "/"
-		}
-		for _, meta := range fs.pendingIndex.ListByPrefix(prefix) {
-			if parentDir(meta.Path) != dirPath {
-				continue
-			}
-			name := path.Base(meta.Path)
-			if _, ok := existing[name]; ok {
-				continue // already listed from writeBack or remote
-			}
-			mtime := meta.Mtime
-			if mtime.IsZero() {
-				mtime = time.Now()
-			}
-			ino := fs.inodes.EnsureInode(meta.Path, false, meta.Size, mtime)
-			entries = append(entries, DirEntry{
-				Name: name,
-				Ino:  ino,
-				Mode: syscall.S_IFREG,
-			})
-			existing[name] = struct{}{}
-		}
-	}
-
-	return entries
+	return fs.cachedToDirEntries(dirPath, cached), nil
 }
 
 func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []DirEntry {
@@ -1386,7 +1352,27 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		return st
 	}
 
-	ino := fs.inodes.Lookup(childP, false, 0, time.Now())
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
+	// Server metadata is the namespace authority, so create must commit there
+	// before we expose the local handle to the kernel.
+	created, err := fs.client.CreateCtx(ctx, childP)
+	if err != nil {
+		return httpToFuseStatus(err)
+	}
+
+	mtime := created.Mtime
+	if mtime.IsZero() {
+		mtime = time.Now()
+	}
+
+	ino := fs.inodes.Lookup(childP, false, created.Size, mtime)
+	if created.Revision > 0 {
+		fs.inodes.UpdateRevision(ino, created.Revision)
+	}
+	fs.inodes.UpdateSize(ino, created.Size)
+	fs.inodes.UpdateMtime(ino, mtime)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
@@ -1401,12 +1387,13 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		Path:        childP,
 		Flags:       input.Flags,
 		Dirty:       wb,
-		IsNew:       true,
+		OrigSize:    created.Size,
+		BaseRev:     created.Revision,
 		ShadowReady: false,
 	}
 
 	if fs.shadowStore != nil && fs.pendingIndex != nil {
-		if err := fs.shadowStore.Ensure(childP, 0, 0); err != nil {
+		if err := fs.shadowStore.Ensure(childP, 0, fh.BaseRev); err != nil {
 			log.Printf("shadow ensure failed for create %s: %v", childP, err)
 		} else {
 			fh.ShadowReady = true
@@ -1850,6 +1837,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.St
 		if fh.WriteBackSeq > 0 && fh.WriteBackSeq == fh.DirtySeq {
 			return gofuse.OK
 		}
+		// Preserve close-to-open ordering for the same path: a later close must
+		// stage its snapshot after the prior async commit finishes.
+		fs.waitForPriorPathCommitLocked(fh)
 		size := fh.Dirty.Size()
 		// Only use write-back for small files that haven't started streaming.
 		// A Streamer may exist (Create always attaches one) but as long as
@@ -1908,6 +1898,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.St
 		if fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
 			return gofuse.OK
 		}
+		fs.waitForPriorPathCommitLocked(fh)
 		if err := fs.stageShadowLocked(fh, true); err == nil {
 			if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
 				log.Printf("fsync writeback snapshot failed for %s: %v", fh.Path, err)

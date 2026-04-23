@@ -9,8 +9,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -300,6 +302,7 @@ func TestWriteBackUploader_PendingNewUsesCreateIfAbsent(t *testing.T) {
 
 func TestWriteBackUploader_PendingOverwriteUsesBaseRevision(t *testing.T) {
 	var gotExpected string
+	var gotCommitted int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
 			gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
@@ -314,6 +317,9 @@ func TestWriteBackUploader_PendingOverwriteUsesBaseRevision(t *testing.T) {
 	cache, _ := NewWriteBackCache(dir)
 	c := client.New(ts.URL, "")
 	uploader := NewWriteBackUploader(c, cache, 1)
+	uploader.SetSuccessCallback(func(_ string, committedRevision int64) {
+		gotCommitted = committedRevision
+	})
 
 	_ = cache.PutWithBaseRev("/existing.txt", []byte("edit"), 4, PendingOverwrite, 23)
 	uploader.Submit("/existing.txt")
@@ -321,6 +327,9 @@ func TestWriteBackUploader_PendingOverwriteUsesBaseRevision(t *testing.T) {
 
 	if gotExpected != "23" {
 		t.Fatalf("X-Dat9-Expected-Revision = %q, want %q", gotExpected, "23")
+	}
+	if gotCommitted != 24 {
+		t.Fatalf("committed revision callback = %d, want 24", gotCommitted)
 	}
 }
 
@@ -413,6 +422,9 @@ func TestMountHash_Deterministic(t *testing.T) {
 func TestFlush_WriteBack_SmallFile(t *testing.T) {
 	var httpPutCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -512,6 +524,9 @@ func TestFlush_WriteBack_SmallFile(t *testing.T) {
 func TestFlush_WriteBack_Lifecycle(t *testing.T) {
 	uploadedCh := make(chan []byte, 10)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -606,6 +621,9 @@ func TestFlush_WriteBack_Lifecycle(t *testing.T) {
 func TestFlush_WriteBack_MultipleFiles(t *testing.T) {
 	var uploadedFiles sync.Map
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -696,12 +714,96 @@ func TestFlush_WriteBack_MultipleFiles(t *testing.T) {
 	}
 }
 
+func TestMetadataCreatedWriteBackUploadUsesRevisionOne(t *testing.T) {
+	var gotExpected atomic.Value
+	uploadedCh := make(chan []byte, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
+		switch r.Method {
+		case http.MethodPut:
+			gotExpected.Store(r.Header.Get("X-Dat9-Expected-Revision"))
+			body, _ := io.ReadAll(r.Body)
+			uploadedCh <- append([]byte(nil), body...)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := client.New(ts.URL, "")
+	uploader := NewWriteBackUploader(c, cache, 2)
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.SetWriteBack(cache, uploader)
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}, "rev1.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+
+	_, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}, []byte("phase-c"))
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	if st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	uploader.DrainAll()
+
+	if got, _ := gotExpected.Load().(string); got != "1" {
+		t.Fatalf("X-Dat9-Expected-Revision = %q, want %q", got, "1")
+	}
+	select {
+	case uploaded := <-uploadedCh:
+		if string(uploaded) != "phase-c" {
+			t.Fatalf("uploaded = %q, want %q", uploaded, "phase-c")
+		}
+	default:
+		t.Fatal("expected write-back upload to happen")
+	}
+}
+
 // TestFlush_WriteBack_WriteBetweenFlushAndRelease verifies that if a Write
 // occurs between Flush and Release, the latest data is uploaded (not the
 // stale cache snapshot). This is a regression test for data loss.
 func TestFlush_WriteBack_WriteBetweenFlushAndRelease(t *testing.T) {
 	uploadedCh := make(chan []byte, 10)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -797,11 +899,192 @@ done:
 	}
 }
 
+func TestCommitQueueCloseToOpenWaitsForPriorCommit(t *testing.T) {
+	const remotePath = "/attr.txt"
+	const firstContent = "attr-base"
+	const secondSuffix = "-x"
+
+	var currentRevision atomic.Int64
+	currentRevision.Store(1)
+	var putCount atomic.Int32
+	putExpected := make(chan string, 2)
+	releaseFirstPut := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(currentRevision.Load(), 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read put body: %v", err)
+			}
+			expected := r.Header.Get("X-Dat9-Expected-Revision")
+			putExpected <- expected
+			if putCount.Add(1) == 1 {
+				<-releaseFirstPut
+			}
+			wantExpected := strconv.FormatInt(currentRevision.Load(), 10)
+			if expected != wantExpected {
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			currentRevision.Add(1)
+			w.Header().Set("X-Test-Size", strconv.Itoa(len(body)))
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	cache, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+
+	c := client.New(ts.URL, "")
+	uploader := NewWriteBackUploader(c, cache, 1)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.pendingIndex = pending
+	fs.shadowStore = shadow
+	fs.SetWriteBack(cache, uploader)
+	fs.SetCommitQueue(cq)
+
+	ino := fs.inodes.Lookup(remotePath, false, 0, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	var firstOpen gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &firstOpen)
+	if st != gofuse.OK {
+		t.Fatalf("first Open: %v", st)
+	}
+	if _, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       firstOpen.Fh,
+		Offset:   0,
+	}, []byte(firstContent)); st != gofuse.OK {
+		t.Fatalf("first Write: %v", st)
+	}
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       firstOpen.Fh,
+	})
+	if st != gofuse.OK {
+		t.Fatalf("first Flush: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       firstOpen.Fh,
+	})
+
+	select {
+	case got := <-putExpected:
+		if got != "1" {
+			t.Fatalf("first expected revision = %q, want 1", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first commit never started")
+	}
+
+	var secondOpen gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY),
+	}, &secondOpen)
+	if st != gofuse.OK {
+		t.Fatalf("second Open: %v", st)
+	}
+	secondFH, ok := fs.fileHandles.Get(secondOpen.Fh)
+	if !ok {
+		t.Fatal("second file handle not found")
+	}
+	if secondFH.BaseRev != 1 {
+		t.Fatalf("second handle base revision before wait = %d, want 1", secondFH.BaseRev)
+	}
+	if _, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       secondOpen.Fh,
+		Offset:   uint64(len(firstContent)),
+	}, []byte(secondSuffix)); st != gofuse.OK {
+		t.Fatalf("second Write: %v", st)
+	}
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		flushDone <- fs.Flush(nil, &gofuse.FlushIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       secondOpen.Fh,
+		})
+	}()
+
+	select {
+	case st := <-flushDone:
+		t.Fatalf("second Flush returned before prior commit completed: %v", st)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(releaseFirstPut)
+
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("second Flush: %v", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Flush did not resume after prior commit finished")
+	}
+	if secondFH.BaseRev != 2 {
+		t.Fatalf("second handle base revision after wait = %d, want 2", secondFH.BaseRev)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       secondOpen.Fh,
+	})
+	cq.DrainAll()
+	uploader.DrainAll()
+
+	select {
+	case got := <-putExpected:
+		if got != "2" {
+			t.Fatalf("second expected revision = %q, want 2", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second commit never started")
+	}
+	if got := currentRevision.Load(); got != 3 {
+		t.Fatalf("current revision = %d, want 3", got)
+	}
+}
+
 // TestFlush_WriteBack_NoWriteBack_LargeFile verifies that files >= 10MB
 // do NOT use write-back cache and follow the normal upload path.
 func TestFlush_WriteBack_NoWriteBack_LargeFile(t *testing.T) {
 	var httpPutCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -887,6 +1170,9 @@ func TestRenameFlushesWriteBack(t *testing.T) {
 	}
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -974,6 +1260,9 @@ func TestRenameFlushesWriteBack(t *testing.T) {
 func TestUnlinkClearsPendingWriteBack(t *testing.T) {
 	var deleteCalled atomic.Bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodDelete:
 			deleteCalled.Store(true)
@@ -1026,6 +1315,9 @@ func TestUnlinkClearsPendingWriteBack(t *testing.T) {
 // pending write-back data (not stale server data).
 func TestReopenAfterClose_ReadsPendingCache(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -1099,6 +1391,9 @@ func TestReopenAfterClose_ReadsPendingCache(t *testing.T) {
 func TestFsync_NoDuplicateUpload(t *testing.T) {
 	var httpPutCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")
@@ -1234,9 +1529,10 @@ func TestSamePathConsecutiveSaves(t *testing.T) {
 	}
 }
 
-// TestLookupFindsPendingWriteBack verifies that Lookup returns metadata
-// for files that only exist in the write-back cache (pending upload).
-func TestLookupFindsPendingWriteBack(t *testing.T) {
+// TestLookupIgnoresPendingWriteBackWithoutServerMetadata verifies that local
+// write-back state no longer acts as namespace truth once FUSE is
+// server-metadata-first.
+func TestLookupIgnoresPendingWriteBackWithoutServerMetadata(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodHead:
@@ -1268,11 +1564,43 @@ func TestLookupFindsPendingWriteBack(t *testing.T) {
 
 	var out gofuse.EntryOut
 	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "pending.txt", &out)
-	if st != gofuse.OK {
-		t.Fatalf("Lookup: %v — file should be visible from write-back cache", st)
+	if st != gofuse.ENOENT {
+		t.Fatalf("Lookup status = %v, want ENOENT", st)
 	}
-	if out.Size != 10 {
-		t.Fatalf("Lookup size = %d, want 10", out.Size)
+}
+
+func TestLookupUsesServerMetadataBeforePendingWriteBack(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := client.New(ts.URL, "")
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.SetWriteBack(cache, nil)
+
+	_ = cache.PutWithBaseRev("/server.txt", []byte("local overlay"), int64(len("local overlay")), PendingOverwrite, 7)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "server.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if out.Size != 4 {
+		t.Fatalf("Lookup size = %d, want 4", out.Size)
 	}
 }
 
@@ -1959,6 +2287,9 @@ func TestRename_Directory_MigratesPendingDescendants(t *testing.T) {
 func TestFlush_SkipsRedundantCacheWrite(t *testing.T) {
 	var putCount atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMetadataCreate(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", "0")

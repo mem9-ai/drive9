@@ -1,10 +1,12 @@
 package backend
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/internal/testmysql"
@@ -12,6 +14,56 @@ import (
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/semantic"
 )
+
+type countingS3Client struct {
+	inner     s3client.S3Client
+	putObject int
+}
+
+func (c *countingS3Client) CreateMultipartUpload(ctx context.Context, key string, algo s3client.ChecksumAlgo) (*s3client.MultipartUpload, error) {
+	return c.inner.CreateMultipartUpload(ctx, key, algo)
+}
+
+func (c *countingS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, algo s3client.ChecksumAlgo, checksumValue string, ttl time.Duration) (*s3client.UploadPartURL, error) {
+	return c.inner.PresignUploadPart(ctx, key, uploadID, partNumber, partSize, algo, checksumValue, ttl)
+}
+
+func (c *countingS3Client) CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []s3client.Part) error {
+	return c.inner.CompleteMultipartUpload(ctx, key, uploadID, parts)
+}
+
+func (c *countingS3Client) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
+	return c.inner.AbortMultipartUpload(ctx, key, uploadID)
+}
+
+func (c *countingS3Client) ListParts(ctx context.Context, key, uploadID string) ([]s3client.Part, error) {
+	return c.inner.ListParts(ctx, key, uploadID)
+}
+
+func (c *countingS3Client) PresignGetObject(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	return c.inner.PresignGetObject(ctx, key, ttl)
+}
+
+func (c *countingS3Client) PutObject(ctx context.Context, key string, body io.Reader, size int64) error {
+	c.putObject++
+	return c.inner.PutObject(ctx, key, body, size)
+}
+
+func (c *countingS3Client) GetObject(ctx context.Context, key string) (io.ReadCloser, error) {
+	return c.inner.GetObject(ctx, key)
+}
+
+func (c *countingS3Client) DeleteObject(ctx context.Context, key string) error {
+	return c.inner.DeleteObject(ctx, key)
+}
+
+func (c *countingS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID string, partNumber int, sourceKey string, startByte, endByte int64) (string, error) {
+	return c.inner.UploadPartCopy(ctx, destKey, uploadID, partNumber, sourceKey, startByte, endByte)
+}
+
+func (c *countingS3Client) PresignGetObjectRange(ctx context.Context, key string, startByte, endByte int64, ttl time.Duration) (string, error) {
+	return c.inner.PresignGetObjectRange(ctx, key, startByte, endByte, ttl)
+}
 
 func newTestBackend(t *testing.T) *Dat9Backend {
 	return newTestBackendWithOptions(t, Options{})
@@ -59,6 +111,103 @@ func TestCreateAndStat(t *testing.T) {
 	}
 	if info.Name != "hello.txt" || info.IsDir || info.Size != 0 {
 		t.Errorf("unexpected: %+v", info)
+	}
+}
+
+func TestCreateMetadataOnlyCtxCreatesConfirmedEmptyFile(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	result, err := b.CreateMetadataOnlyCtx(ctx, "/meta-only.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Path != "/meta-only.txt" {
+		t.Fatalf("path=%q, want /meta-only.txt", result.Path)
+	}
+	if result.Revision != 1 {
+		t.Fatalf("revision=%d, want 1", result.Revision)
+	}
+	if result.SizeBytes != 0 {
+		t.Fatalf("size=%d, want 0", result.SizeBytes)
+	}
+	if result.Status != datastore.StatusConfirmed {
+		t.Fatalf("status=%s, want %s", result.Status, datastore.StatusConfirmed)
+	}
+
+	nf, err := b.StatNodeCtx(ctx, "/meta-only.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nf.File == nil {
+		t.Fatal("expected file entity for metadata-only create")
+	}
+	if nf.File.Status != datastore.StatusConfirmed || nf.File.Revision != 1 {
+		t.Fatalf("unexpected file metadata: %+v", nf.File)
+	}
+	if nf.File.StorageType != datastore.StorageDB9 || nf.File.StorageRef != "inline" {
+		t.Fatalf("storage=(%s,%s), want (db9,inline)", nf.File.StorageType, nf.File.StorageRef)
+	}
+
+	tasks := loadSemanticTasksForFile(t, b, nf.File.FileID)
+	if len(tasks) != 0 {
+		t.Fatalf("semantic task count=%d, want 0", len(tasks))
+	}
+}
+
+func TestCreateMetadataOnlyCtxDoesNotWriteZeroByteObject(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	counting := &countingS3Client{inner: b.S3()}
+	b.s3 = counting
+	b.smallInDB = false
+
+	if _, err := b.CreateMetadataOnlyCtx(context.Background(), "/objectless.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if counting.putObject != 0 {
+		t.Fatalf("PutObject calls=%d, want 0", counting.putObject)
+	}
+}
+
+func TestCreateMetadataOnlyCtxThenConditionalWriteAdvancesRevision(t *testing.T) {
+	b := newTestBackend(t)
+	ctx := context.Background()
+
+	if _, err := b.CreateMetadataOnlyCtx(ctx, "/after-create.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.WriteCtxIfRevision(ctx, "/after-create.txt", []byte("hello"), 0, filesystem.WriteFlagTruncate, 0); !errors.Is(err, datastore.ErrRevisionConflict) {
+		t.Fatalf("expected revision conflict for create-if-absent write, got %v", err)
+	}
+
+	n, err := b.WriteCtxIfRevision(ctx, "/after-create.txt", []byte("hello"), 0, filesystem.WriteFlagTruncate, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 {
+		t.Fatalf("bytes written=%d, want 5", n)
+	}
+
+	nf, err := b.StatNodeCtx(ctx, "/after-create.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nf.File == nil {
+		t.Fatal("expected file after conditional write")
+	}
+	if nf.File.Revision != 2 {
+		t.Fatalf("revision=%d, want 2", nf.File.Revision)
+	}
+	if nf.File.SizeBytes != 5 {
+		t.Fatalf("size=%d, want 5", nf.File.SizeBytes)
+	}
+
+	data, err := b.Read("/after-create.txt", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello" {
+		t.Fatalf("data=%q, want hello", data)
 	}
 }
 

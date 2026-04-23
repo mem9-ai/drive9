@@ -170,6 +170,17 @@ jobs:
             cat /tmp/drive9-server-local.log
           fi
 
+      - name: Upload FUSE failure logs
+        if: always() && steps.fuse-smoke.outcome != 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-e2e-fuse-logs
+          if-no-files-found: warn
+          path: |
+            /tmp/drive9-fuse-smoke-*.log
+            /tmp/drive9-server-local.log
+            /tmp/tiup-playground.log
+
       - name: Stop drive9-server-local
         if: always()
         run: |

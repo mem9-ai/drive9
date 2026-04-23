@@ -99,6 +99,38 @@ func TestSSEWatcherHandleChangeInvalidatesCache(t *testing.T) {
 	}
 }
 
+func TestSSEWatcherHandleCreateInvalidatesParentAndTargetCaches(t *testing.T) {
+	opts := &MountOptions{
+		CacheSize: 1 << 20,
+		DirTTL:    5 * time.Second,
+	}
+	opts.setDefaults()
+	fs := &Dat9FS{
+		inodes:    NewInodeToPath(),
+		readCache: NewReadCache(opts.CacheSize, 0),
+		dirCache:  NewDirCache(opts.DirTTL),
+	}
+
+	fs.inodes.Lookup("/docs/new.txt", false, 0, time.Now())
+	fs.readCache.Put("/docs/new.txt", []byte("stale"), 1)
+	fs.dirCache.Put("/docs", []CachedFileInfo{{Name: "old.txt", Size: 50}})
+
+	w := &SSEWatcher{fs: fs, actor: "my-actor"}
+	w.handleChange(&client.ChangeEvent{
+		Seq:   1,
+		Path:  "/docs/new.txt",
+		Op:    "create",
+		Actor: "other-actor",
+	})
+
+	if _, ok := fs.readCache.Get("/docs/new.txt", 1); ok {
+		t.Error("readCache entry should be invalidated after create")
+	}
+	if _, ok := fs.dirCache.Get("/docs"); ok {
+		t.Error("dirCache entry for parent dir should be invalidated after create")
+	}
+}
+
 func TestSSEWatcherSelfFilterSkipsOwnEvents(t *testing.T) {
 	opts := &MountOptions{
 		CacheSize: 1 << 20,

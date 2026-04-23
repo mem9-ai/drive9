@@ -130,7 +130,13 @@ is_mounted() {
     mountpoint -q "$mount_point"
     return
   fi
-  awk -v mp="$mount_point" '$2 == mp { found = 1 } END { exit !found }' /proc/mounts
+  # Use Python for a cross-platform mount check
+  python3 - "$mount_point" <<'PY'
+import os
+import sys
+
+raise SystemExit(0 if os.path.ismount(sys.argv[1]) else 1)
+PY
 }
 
 curl_body_code() {
@@ -423,10 +429,11 @@ start_mount() {
   MOUNT_PID="$!"
 
   if wait_mount_state mounted; then
+    echo "mount log: $MOUNT_LOG"
     return 0
   fi
   if [ -f "$MOUNT_LOG" ]; then
-    echo "mount log:"
+    echo "mount log: $MOUNT_LOG"
     cat "$MOUNT_LOG"
   fi
   return 1
@@ -653,9 +660,9 @@ if is_mounted "$MOUNT_POINT"; then
   size2="${stat2%%:*}"
   mtime2="${stat2##*:}"
   remote_attr_size=$(wait_remote_stat_field_eq "$RW_ATTR_REMOTE" "size" "$size2")
-  check_cmd "mounted size increases after append" test "$size2" -gt "$size1"
-  check_cmd "mounted mtime is monotonic" test "$mtime2" -ge "$mtime1"
-  check_eq "remote stat size matches mounted size" "$remote_attr_size" "$size2"
+  check_cmd "mounted size increases after append (before=$size1 after=$size2)" test "$size2" -gt "$size1"
+  check_cmd "mounted mtime is monotonic (before=$mtime1 after=$mtime2)" test "$mtime2" -ge "$mtime1"
+  check_eq "remote stat size matches mounted size (remote=$remote_attr_size local=$size2)" "$remote_attr_size" "$size2"
 
   echo "[7] readdir semantics"
   alpha_ls=$(ls -1 "$RW_ALPHA_MOUNT")
@@ -795,7 +802,8 @@ PY
     fi
 
     check_cmd_fail "write fails on read-only mount" bash -c "printf 'x' > '$RO_WRITE_MOUNT'"
-    check_cmd_fail "delete fails on read-only mount" rm "$RO_SEED_MOUNT"
+    # The rm -f here is intentional to avoid manual rm confirmation prompts under macos
+    check_cmd_fail "delete fails on read-only mount" rm -f "$RO_SEED_MOUNT"
   fi
 
     echo "[14] unmount"

@@ -9,7 +9,7 @@ import (
 type ChangeEvent struct {
 	Seq   uint64 `json:"seq"`              // monotonic per-bus sequence number
 	Path  string `json:"path"`             // affected path
-	Op    string `json:"op"`               // "write" | "delete" | "rename" | "mkdir" | "copy" | "upload_complete"
+	Op    string `json:"op"`               // "create" | "write" | "delete" | "rename" | "mkdir" | "copy" | "upload_complete"
 	Actor string `json:"actor,omitempty"`  // X-Dat9-Actor header value (per-mount ID)
 	Ts    int64  `json:"ts"`               // unix milliseconds
 }
