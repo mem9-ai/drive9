@@ -44,6 +44,9 @@ type UploadPlanV2 struct {
 // MaxMultipartParts is the S3 hard limit on parts per multipart upload.
 const MaxMultipartParts = 10000
 
+// MaxDescriptionLen is the maximum length of a file description in characters.
+const MaxDescriptionLen = 2000
+
 // MaxPresignBatch is the maximum number of parts that can be presigned in a single batch request.
 const MaxPresignBatch = 500
 
@@ -189,14 +192,14 @@ func (b *Dat9Backend) InitiateUpload(ctx context.Context, path string, totalSize
 
 // InitiateUploadIfRevision starts a v1 multipart upload with optional CAS semantics.
 func (b *Dat9Backend) InitiateUploadIfRevision(ctx context.Context, path string, totalSize int64, expectedRevision int64) (*UploadPlan, error) {
-	return b.InitiateUploadWithChecksumsIfRevision(ctx, path, totalSize, nil, expectedRevision)
+	return b.InitiateUploadWithChecksumsIfRevision(ctx, path, totalSize, nil, expectedRevision, "")
 }
 
 func (b *Dat9Backend) InitiateUploadWithChecksums(ctx context.Context, path string, totalSize int64, partChecksums []string) (*UploadPlan, error) {
-	return b.InitiateUploadWithChecksumsIfRevision(ctx, path, totalSize, partChecksums, -1)
+	return b.InitiateUploadWithChecksumsIfRevision(ctx, path, totalSize, partChecksums, -1, "")
 }
 
-func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context, path string, totalSize int64, partChecksums []string, expectedRevision int64) (*UploadPlan, error) {
+func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context, path string, totalSize int64, partChecksums []string, expectedRevision int64, description string) (*UploadPlan, error) {
 	start := time.Now()
 	if err := b.ensureUploadSizeAllowed(totalSize); err != nil {
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
@@ -312,6 +315,7 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 			PartsTotal:       len(parts),
 			ExpectedRevision: expectedRevisionPtr(expectedRevision),
 			Status:           datastore.UploadUploading,
+			Description:      description,
 			CreatedAt:        now,
 			UpdatedAt:        now,
 			ExpiresAt:        now.Add(24 * time.Hour),
@@ -339,11 +343,11 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 // InitiateUploadV2 creates a multipart upload with adaptive part size.
 // Unlike v1, it does NOT presign any URLs — clients fetch them on demand.
 func (b *Dat9Backend) InitiateUploadV2(ctx context.Context, path string, totalSize int64) (*UploadPlanV2, error) {
-	return b.InitiateUploadV2IfRevision(ctx, path, totalSize, -1)
+	return b.InitiateUploadV2IfRevision(ctx, path, totalSize, -1, "")
 }
 
 // InitiateUploadV2IfRevision starts a v2 multipart upload with optional CAS semantics.
-func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path string, totalSize int64, expectedRevision int64) (*UploadPlanV2, error) {
+func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path string, totalSize int64, expectedRevision int64, description string) (*UploadPlanV2, error) {
 	start := time.Now()
 	validateStart := time.Now()
 	if err := b.ensureUploadSizeAllowed(totalSize); err != nil {
@@ -461,6 +465,7 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 			PartsTotal:       len(parts),
 			ExpectedRevision: expectedRevisionPtr(expectedRevision),
 			Status:           datastore.UploadInitiated,
+			Description:      description,
 			CreatedAt:        now,
 			UpdatedAt:        now,
 			ExpiresAt:        expiresAt,
@@ -943,22 +948,22 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			if b.UsesDatabaseAutoEmbedding() && expectedRevision > 0 {
 				newRev, err = b.store.UpdateFileContentAutoEmbeddingIfRevisionTx(tx,
 					existingFileID.String, expectedRevision, datastore.StorageS3, upload.S3Key,
-					contentType, "", "", nil, upload.TotalSize,
+					contentType, "", "", nil, upload.TotalSize, upload.Description,
 				)
 			} else if b.UsesDatabaseAutoEmbedding() {
 				newRev, err = b.store.UpdateFileContentAutoEmbeddingTx(tx,
 					existingFileID.String, datastore.StorageS3, upload.S3Key,
-					contentType, "", "", nil, upload.TotalSize,
+					contentType, "", "", nil, upload.TotalSize, upload.Description,
 				)
 			} else if expectedRevision > 0 {
 				newRev, err = b.store.UpdateFileContentIfRevisionTx(tx,
 					existingFileID.String, expectedRevision, datastore.StorageS3, upload.S3Key,
-					contentType, "", "", nil, upload.TotalSize,
+					contentType, "", "", nil, upload.TotalSize, upload.Description,
 				)
 			} else {
 				newRev, err = b.store.UpdateFileContentTx(tx,
 					existingFileID.String, datastore.StorageS3, upload.S3Key,
-					contentType, "", "", nil, upload.TotalSize,
+					contentType, "", "", nil, upload.TotalSize, upload.Description,
 				)
 			}
 			if err != nil {
@@ -985,7 +990,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 				return err
 			}
-			if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "") {
+			if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "", upload.Description) {
 				stepStart = time.Now()
 				err := b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
@@ -1003,7 +1008,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		if b.UsesDatabaseAutoEmbedding() {
 			stepStart = time.Now()
 			if err := b.store.ConfirmPendingFileAutoEmbeddingTx(tx,
-				upload.FileID, datastore.StorageS3, upload.S3Key, contentType, upload.TotalSize,
+				upload.FileID, datastore.StorageS3, upload.S3Key, contentType, upload.TotalSize, upload.Description,
 			); err != nil {
 				return err
 			}
@@ -1011,12 +1016,17 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		} else {
 			now := time.Now().UTC()
 			stepStart = time.Now()
-			res, err := tx.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
+			query := `UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
 				size_bytes = ?, checksum_sha256 = NULL, content_text = NULL,
-				embedding = NULL, embedding_revision = NULL,
-				status = 'CONFIRMED', confirmed_at = ?
-				WHERE file_id = ? AND status = 'PENDING'`,
-				datastore.StorageS3, upload.S3Key, contentType, upload.TotalSize, now, upload.FileID)
+				embedding = NULL, embedding_revision = NULL`
+			args := []any{datastore.StorageS3, upload.S3Key, contentType, upload.TotalSize}
+			if upload.Description != "" {
+				query += `, description = ?`
+				args = append(args, upload.Description)
+			}
+			query += `, status = 'CONFIRMED', confirmed_at = ? WHERE file_id = ? AND status = 'PENDING'`
+			args = append(args, now, upload.FileID)
+			res, err := tx.Exec(query, args...)
 			if err != nil {
 				return err
 			}
@@ -1057,7 +1067,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 			return err
 		}
-		if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "") {
+		if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "", upload.Description) {
 			stepStart = time.Now()
 			err := b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)

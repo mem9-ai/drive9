@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/tagutil"
@@ -29,6 +30,7 @@ func Cp(c *client.Client, args []string) error {
 	resume := false
 	appendMode := false
 	var tags map[string]string
+	var description string
 	filtered := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -53,14 +55,24 @@ func Cp(c *client.Client, args []string) error {
 			if err != nil {
 				return err
 			}
+		case a == "--description":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--description requires argument")
+			}
+			i++
+			description = args[i]
 		default:
-			filtered = append(filtered, a)
+			filtered = append(filtered, args[i])
 		}
 	}
 	args = filtered
 
+	if len(description) > backend.MaxDescriptionLen {
+		return fmt.Errorf("description exceeds %d characters", backend.MaxDescriptionLen)
+	}
+
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs cp [--resume] [--append] [--tag key=value]... <src> <dst>")
+		return fmt.Errorf("usage: drive9 fs cp [--resume] [--append] [--tag key=value]... [--description <text>] <src> <dst>")
 	}
 	if resume && appendMode {
 		return fmt.Errorf("--resume and --append cannot be used together")
@@ -95,7 +107,16 @@ func Cp(c *client.Client, args []string) error {
 		if appendMode {
 			return c.AppendStream(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress)
 		}
-		summary, err := c.WriteStreamWithSummaryAndTags(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress, tags)
+		var summary *client.UploadSummary
+		if tags != nil && description != "" {
+			summary, err = c.WriteStreamWithSummaryAndTagsAndDescription(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress, tags, description)
+		} else if tags != nil {
+			summary, err = c.WriteStreamWithSummaryAndTags(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress, tags)
+		} else if description != "" {
+			summary, err = c.WriteStreamWithSummaryAndDescription(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress, description)
+		} else {
+			summary, err = c.WriteStreamWithSummary(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress)
+		}
 		if err != nil {
 			return err
 		}
@@ -112,7 +133,7 @@ func Cp(c *client.Client, args []string) error {
 		if resume {
 			return resumeUploadWithTags(ctx, c, src, dstRP.Path, tags)
 		}
-		return uploadFileWithTags(ctx, c, src, dstRP.Path, tags)
+		return uploadFileWithTagsAndDescription(ctx, c, src, dstRP.Path, tags, description)
 
 	case srcIsRemote && !dstIsRemote:
 		return downloadFile(ctx, c, srcRP.Path, dst)
@@ -123,6 +144,10 @@ func Cp(c *client.Client, args []string) error {
 	default:
 		return fmt.Errorf("at least one path must be remote (e.g. :/path or mydb:/path)")
 	}
+}
+
+func uploadFile(ctx context.Context, c *client.Client, localPath, remotePath string, description string) error {
+	return uploadFileWithTagsAndDescription(ctx, c, localPath, remotePath, nil, description)
 }
 
 func parseAndMergeTag(tags map[string]string, raw string) (map[string]string, error) {
@@ -146,18 +171,23 @@ func parseAndMergeTag(tags map[string]string, raw string) (map[string]string, er
 	return tags, nil
 }
 
-func uploadFile(ctx context.Context, c *client.Client, localPath, remotePath string) error {
-	return uploadFileWithTags(ctx, c, localPath, remotePath, nil)
-}
-
-func uploadFileWithTags(ctx context.Context, c *client.Client, localPath, remotePath string, tags map[string]string) error {
+func uploadFileWithTagsAndDescription(ctx context.Context, c *client.Client, localPath, remotePath string, tags map[string]string, description string) error {
 	f, size, err := openLocalFile(localPath)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = f.Close() }()
 
-	summary, err := c.WriteStreamWithSummaryAndTags(ctx, remotePath, f, size, printProgress, tags)
+	var summary *client.UploadSummary
+	if tags != nil && description != "" {
+		summary, err = c.WriteStreamWithSummaryAndTagsAndDescription(ctx, remotePath, f, size, printProgress, tags, description)
+	} else if tags != nil {
+		summary, err = c.WriteStreamWithSummaryAndTags(ctx, remotePath, f, size, printProgress, tags)
+	} else if description != "" {
+		summary, err = c.WriteStreamWithSummaryAndDescription(ctx, remotePath, f, size, printProgress, description)
+	} else {
+		summary, err = c.WriteStreamWithSummary(ctx, remotePath, f, size, printProgress)
+	}
 	if err != nil {
 		return err
 	}

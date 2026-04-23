@@ -48,8 +48,11 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			status             VARCHAR(32) NOT NULL DEFAULT 'PENDING',
 			source_id          VARCHAR(255),
 			content_text       LONGTEXT,
+			description        LONGTEXT,
 			embedding          VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `),
 			embedding_revision BIGINT,
+			description_embedding VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `),
+			description_embedding_revision BIGINT,
 			created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			confirmed_at       DATETIME(3),
 			expires_at         DATETIME(3)
@@ -75,6 +78,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			status             VARCHAR(32) NOT NULL DEFAULT 'UPLOADING',
 			fingerprint_sha256 VARCHAR(128),
 			idempotency_key    VARCHAR(255),
+			description        LONGTEXT,
 			created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			expires_at         DATETIME(3) NOT NULL,
@@ -127,7 +131,14 @@ func tidbAppEmbeddingOptionalSchemaStatements() []string {
 			WITH PARSER MULTILINGUAL
 			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
 		`ALTER TABLE files
+			ADD FULLTEXT INDEX idx_fts_description(description)
+			WITH PARSER MULTILINGUAL
+			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
+		`ALTER TABLE files
 			ADD VECTOR INDEX idx_files_cosine((VEC_COSINE_DISTANCE(embedding)))
+			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
+		`ALTER TABLE files
+			ADD VECTOR INDEX idx_files_desc_cosine((VEC_COSINE_DISTANCE(description_embedding)))
 			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
 	}
 }

@@ -1149,7 +1149,7 @@ func TestCopyFileDoesNotCreateAdditionalSemanticTasks(t *testing.T) {
 
 func TestShouldEnqueueEmbedForRevisionWithSynchronousText(t *testing.T) {
 	b := newTestBackend(t)
-	if !b.shouldEnqueueEmbedForRevision("/docs/a.txt", "text/plain", "hello world") {
+	if !b.shouldEnqueueEmbedForRevision("/docs/a.txt", "text/plain", "hello world", "") {
 		t.Fatal("expected synchronous text content to enqueue embed work")
 	}
 }
@@ -1163,14 +1163,14 @@ func TestShouldEnqueueEmbedForRevisionWithAsyncImageSource(t *testing.T) {
 			Extractor: &staticImageExtractor{text: "caption"},
 		},
 	})
-	if !b.shouldEnqueueEmbedForRevision("/img/a.png", "application/octet-stream", "") {
+	if !b.shouldEnqueueEmbedForRevision("/img/a.png", "application/octet-stream", "", "") {
 		t.Fatal("expected image path with async extractor to enqueue embed work")
 	}
 }
 
 func TestShouldEnqueueEmbedForRevisionWithoutTextSource(t *testing.T) {
 	b := newTestBackend(t)
-	if b.shouldEnqueueEmbedForRevision("/bin/a.bin", "application/octet-stream", "") {
+	if b.shouldEnqueueEmbedForRevision("/bin/a.bin", "application/octet-stream", "", "") {
 		t.Fatal("generic binary object should not enqueue embed work without text source")
 	}
 }

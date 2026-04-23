@@ -863,23 +863,43 @@ func (m *semanticWorkerManager) processEmbedTask(ctx context.Context, store *dat
 		}
 		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "get_file_error", message: fmt.Sprintf("get file: %v", err)}
 	}
-	if file.Status != datastore.StatusConfirmed || file.Revision != task.ResourceVersion || strings.TrimSpace(file.ContentText) == "" {
-		return semanticTaskOutcome{action: semanticTaskActionAck, result: "obsolete", message: "stale_or_empty"}
+	if file.Status != datastore.StatusConfirmed || file.Revision != task.ResourceVersion {
+		return semanticTaskOutcome{action: semanticTaskActionAck, result: "obsolete", message: "stale"}
+	}
+	if strings.TrimSpace(file.ContentText) == "" && strings.TrimSpace(file.Description) == "" {
+		return semanticTaskOutcome{action: semanticTaskActionAck, result: "obsolete", message: "empty_content_and_description"}
 	}
 
-	vec, err := m.embedder.EmbedText(ctx, file.ContentText)
-	if err != nil {
-		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "embed_error", message: fmt.Sprintf("embed text: %v", err)}
-	}
-	if len(vec) == 0 {
-		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "embed_empty", message: "embed text returned empty vector"}
+	var contentUpdated, descUpdated bool
+	if strings.TrimSpace(file.ContentText) != "" {
+		vec, err := m.embedder.EmbedText(ctx, file.ContentText)
+		if err != nil {
+			return semanticTaskOutcome{action: semanticTaskActionRetry, result: "embed_error", message: fmt.Sprintf("embed text: %v", err)}
+		}
+		if len(vec) == 0 {
+			return semanticTaskOutcome{action: semanticTaskActionRetry, result: "embed_empty", message: "embed text returned empty vector"}
+		}
+		contentUpdated, err = store.UpdateFileEmbedding(ctx, task.ResourceID, task.ResourceVersion, vec)
+		if err != nil {
+			return semanticTaskOutcome{action: semanticTaskActionRetry, result: "writeback_error", message: fmt.Sprintf("write embedding: %v", err)}
+		}
 	}
 
-	updated, err := store.UpdateFileEmbedding(ctx, task.ResourceID, task.ResourceVersion, vec)
-	if err != nil {
-		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "writeback_error", message: fmt.Sprintf("write embedding: %v", err)}
+	if strings.TrimSpace(file.Description) != "" {
+		vecDesc, err := m.embedder.EmbedText(ctx, file.Description)
+		if err != nil {
+			return semanticTaskOutcome{action: semanticTaskActionRetry, result: "embed_desc_error", message: fmt.Sprintf("embed description: %v", err)}
+		}
+		if len(vecDesc) == 0 {
+			return semanticTaskOutcome{action: semanticTaskActionRetry, result: "embed_desc_empty", message: "embed description returned empty vector"}
+		}
+		descUpdated, err = store.UpdateFileDescriptionEmbedding(ctx, task.ResourceID, task.ResourceVersion, vecDesc)
+		if err != nil {
+			return semanticTaskOutcome{action: semanticTaskActionRetry, result: "writeback_desc_error", message: fmt.Sprintf("write description embedding: %v", err)}
+		}
 	}
-	if !updated {
+
+	if !contentUpdated && !descUpdated {
 		return semanticTaskOutcome{action: semanticTaskActionAck, result: "obsolete", message: "conditional_write_miss"}
 	}
 	return semanticTaskOutcome{action: semanticTaskActionAck, result: "ok", message: "written"}

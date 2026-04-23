@@ -185,6 +185,120 @@ func buildVectorSearchByTextQuery(queryText, pathPrefix string, limit int) (stri
 	return q, args, true
 }
 
+// VectorSearchDescription runs a vector similarity search over files.description_embedding.
+func (s *Store) VectorSearchDescription(ctx context.Context, queryEmbedding []float32, pathPrefix string, limit int) ([]SearchResult, error) {
+	q, args, ok := buildVectorSearchDescriptionQuery(queryEmbedding, pathPrefix, limit)
+	if !ok {
+		return nil, nil
+	}
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []SearchResult
+	for rows.Next() {
+		var r SearchResult
+		var dist float64
+		if err := rows.Scan(&r.Path, &r.Name, &r.SizeBytes, &dist); err != nil {
+			return nil, err
+		}
+		sc := 1.0 - dist
+		if sc < 0.3 {
+			continue
+		}
+		r.Score = &sc
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// VectorSearchDescriptionByText runs a TiDB-side text-query vector similarity search
+// over files.description_embedding.
+func (s *Store) VectorSearchDescriptionByText(ctx context.Context, queryText, pathPrefix string, limit int) ([]SearchResult, error) {
+	q, args, ok := buildVectorSearchDescriptionByTextQuery(queryText, pathPrefix, limit)
+	if !ok {
+		return nil, nil
+	}
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []SearchResult
+	for rows.Next() {
+		var r SearchResult
+		var dist float64
+		if err := rows.Scan(&r.Path, &r.Name, &r.SizeBytes, &dist); err != nil {
+			return nil, err
+		}
+		sc := 1.0 - dist
+		if sc < 0.3 {
+			continue
+		}
+		r.Score = &sc
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func buildVectorSearchDescriptionQuery(queryEmbedding []float32, pathPrefix string, limit int) (string, []any, bool) {
+	if len(queryEmbedding) == 0 {
+		return "", nil, false
+	}
+	conds := []string{"f.status = 'CONFIRMED'", "f.description_embedding IS NOT NULL", "f.description_embedding_revision = f.revision"}
+	vecParam := embedding.FormatVector(queryEmbedding)
+	args := []any{vecParam}
+
+	if pathPrefix != "" && pathPrefix != "/" {
+		cond, pargs := subtreeCond(pathPrefix)
+		conds = append(conds, cond)
+		args = append(args, pargs...)
+	}
+	args = append(args, vecParam, limit)
+
+	q := `SELECT fn.path, fn.name, f.size_bytes,
+		VEC_EMBED_COSINE_DISTANCE(f.description_embedding, ?) AS distance
+		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
+		WHERE ` + strings.Join(conds, " AND ") + `
+		ORDER BY VEC_EMBED_COSINE_DISTANCE(f.description_embedding, ?)
+	LIMIT ?`
+	return q, args, true
+}
+
+func buildVectorSearchDescriptionByTextQuery(queryText, pathPrefix string, limit int) (string, []any, bool) {
+	if strings.TrimSpace(queryText) == "" {
+		return "", nil, false
+	}
+	conds := []string{"f.status = 'CONFIRMED'", "f.description_embedding IS NOT NULL"}
+	args := []any{queryText}
+
+	if pathPrefix != "" && pathPrefix != "/" {
+		cond, pargs := subtreeCond(pathPrefix)
+		conds = append(conds, cond)
+		args = append(args, pargs...)
+	}
+	args = append(args, limit)
+
+	q := `SELECT fn.path, fn.name, f.size_bytes,
+		VEC_EMBED_COSINE_DISTANCE(f.description_embedding, ?) AS distance
+		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
+		WHERE ` + strings.Join(conds, " AND ") + `
+		ORDER BY distance
+	LIMIT ?`
+	return q, args, true
+}
+
 func ftsSafe(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `'`, `''`)

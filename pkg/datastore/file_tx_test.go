@@ -59,7 +59,7 @@ func TestUpdateFileContentTxClearsEmbeddingState(t *testing.T) {
 	var newRev int64
 	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
 		var err error
-		newRev, err = s.UpdateFileContentTx(tx, "f1", StorageDB9, "/blobs/f1-v2", "text/markdown", "sum-2", "new text", []byte("blob-2"), 22)
+		newRev, err = s.UpdateFileContentTx(tx, "f1", StorageDB9, "/blobs/f1-v2", "text/markdown", "sum-2", "new text", []byte("blob-2"), 22, "")
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -132,7 +132,7 @@ func TestUpdateFileContentAutoEmbeddingTxPreservesEmbeddingState(t *testing.T) {
 	var newRev int64
 	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
 		var err error
-		newRev, err = s.UpdateFileContentAutoEmbeddingTx(tx, "f1", StorageDB9, "/blobs/f1-v2", "text/markdown", "sum-2", "new text", []byte("blob-2"), 22)
+		newRev, err = s.UpdateFileContentAutoEmbeddingTx(tx, "f1", StorageDB9, "/blobs/f1-v2", "text/markdown", "sum-2", "new text", []byte("blob-2"), 22, "")
 		return err
 	}); err != nil {
 		t.Fatal(err)

@@ -9,11 +9,11 @@ import (
 func (s *Store) InsertFileTx(db execer, f *File) error {
 	_, err := db.Exec(`INSERT INTO files
 		(file_id, storage_type, storage_ref, content_blob, content_type, size_bytes, checksum_sha256,
-		 revision, status, source_id, content_text, created_at, confirmed_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 revision, status, source_id, content_text, description, created_at, confirmed_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		f.FileID, f.StorageType, f.StorageRef, nilBytes(f.ContentBlob), nullStr(f.ContentType),
 		f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
-		nullStr(f.SourceID), nullStr(f.ContentText),
+		nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
 		f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
 	return err
 }
@@ -21,20 +21,28 @@ func (s *Store) InsertFileTx(db execer, f *File) error {
 // UpdateFileContentTx updates file bytes/metadata inside an existing transaction.
 // The helper also clears embedding state so later semantic processing recomputes
 // vectors for the new revision.
-func (s *Store) UpdateFileContentTx(db execer, fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64) (int64, error) {
-	return s.updateFileContentTx(db, fileID, 0, false, storageType, storageRef, contentType, checksum, contentText, contentBlob, size)
+func (s *Store) UpdateFileContentTx(db execer, fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64, description string) (int64, error) {
+	return s.updateFileContentTx(db, fileID, 0, false, storageType, storageRef, contentType, checksum, contentText, contentBlob, size, description)
 }
 
 // UpdateFileContentIfRevisionTx updates file bytes/metadata only if the
 // current revision exactly matches expectedRevision.
-func (s *Store) UpdateFileContentIfRevisionTx(db execer, fileID string, expectedRevision int64, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64) (int64, error) {
-	return s.updateFileContentTx(db, fileID, expectedRevision, false, storageType, storageRef, contentType, checksum, contentText, contentBlob, size)
+func (s *Store) UpdateFileContentIfRevisionTx(db execer, fileID string, expectedRevision int64, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64, description string) (int64, error) {
+	return s.updateFileContentTx(db, fileID, expectedRevision, false, storageType, storageRef, contentType, checksum, contentText, contentBlob, size, description)
 }
 
-func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision int64, preserveEmbedding bool, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64) (int64, error) {
+func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision int64, preserveEmbedding bool, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64, description string) (int64, error) {
 	now := time.Now().UTC()
 	query := `UPDATE files SET storage_type = ?, storage_ref = ?,
 		content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,`
+	args := []any{
+		storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
+		nullStr(checksum), nullStr(contentText),
+	}
+	if description != "" {
+		query += ` description = ?, description_embedding = NULL, description_embedding_revision = NULL,`
+		args = append(args, description)
+	}
 	if preserveEmbedding {
 		query += `
 		revision = revision + 1, status = 'CONFIRMED', confirmed_at = ?
@@ -45,10 +53,7 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 		revision = revision + 1, status = 'CONFIRMED', confirmed_at = ?
 		WHERE file_id = ?`
 	}
-	args := []any{
-		storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
-		nullStr(checksum), nullStr(contentText), now, fileID,
-	}
+	args = append(args, now, fileID)
 	if expectedRevision > 0 {
 		query += ` AND revision = ? AND status = 'CONFIRMED'`
 		args = append(args, expectedRevision)
@@ -77,26 +82,31 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 // UpdateFileContentAutoEmbeddingTx updates file bytes/metadata without touching
 // embedding columns. TiDB auto-embedding mode relies on the database to derive
 // vectors from content_text, so the write path must stop clearing vector state.
-func (s *Store) UpdateFileContentAutoEmbeddingTx(db execer, fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64) (int64, error) {
-	return s.updateFileContentTx(db, fileID, 0, true, storageType, storageRef, contentType, checksum, contentText, contentBlob, size)
+func (s *Store) UpdateFileContentAutoEmbeddingTx(db execer, fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64, description string) (int64, error) {
+	return s.updateFileContentTx(db, fileID, 0, true, storageType, storageRef, contentType, checksum, contentText, contentBlob, size, description)
 }
 
 // UpdateFileContentAutoEmbeddingIfRevisionTx updates file bytes/metadata
 // without touching embedding columns and only if expectedRevision matches.
-func (s *Store) UpdateFileContentAutoEmbeddingIfRevisionTx(db execer, fileID string, expectedRevision int64, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64) (int64, error) {
-	return s.updateFileContentTx(db, fileID, expectedRevision, true, storageType, storageRef, contentType, checksum, contentText, contentBlob, size)
+func (s *Store) UpdateFileContentAutoEmbeddingIfRevisionTx(db execer, fileID string, expectedRevision int64, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64, description string) (int64, error) {
+	return s.updateFileContentTx(db, fileID, expectedRevision, true, storageType, storageRef, contentType, checksum, contentText, contentBlob, size, description)
 }
 
 // ConfirmPendingFileAutoEmbeddingTx marks a pending uploaded file as confirmed
 // without rewriting embedding columns. The auto-embedding mode lets TiDB own
 // derived vector state after content_text becomes available.
-func (s *Store) ConfirmPendingFileAutoEmbeddingTx(db execer, fileID string, storageType StorageType, storageRef, contentType string, size int64) error {
+func (s *Store) ConfirmPendingFileAutoEmbeddingTx(db execer, fileID string, storageType StorageType, storageRef, contentType string, size int64, description string) error {
 	now := time.Now().UTC()
-	res, err := db.Exec(`UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
-		size_bytes = ?, checksum_sha256 = NULL, content_text = NULL,
-		status = 'CONFIRMED', confirmed_at = ?
-		WHERE file_id = ? AND status = 'PENDING'`,
-		storageType, storageRef, nullStr(contentType), size, now, fileID)
+	query := `UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
+		size_bytes = ?, checksum_sha256 = NULL, content_text = NULL`
+	args := []any{storageType, storageRef, nullStr(contentType), size}
+	if description != "" {
+		query += `, description = ?`
+		args = append(args, description)
+	}
+	query += `, status = 'CONFIRMED', confirmed_at = ? WHERE file_id = ? AND status = 'PENDING'`
+	args = append(args, now, fileID)
+	res, err := db.Exec(query, args...)
 	if err != nil {
 		return err
 	}

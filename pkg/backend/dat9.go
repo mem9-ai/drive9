@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/rand"
 	"mime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -310,7 +311,7 @@ func (b *Dat9Backend) Write(path string, data []byte, offset int64, flags filesy
 }
 
 func (b *Dat9Backend) WriteCtx(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag) (n int64, err error) {
-	return b.WriteCtxIfRevision(ctx, path, data, offset, flags, -1)
+	return b.WriteCtxIfRevisionWithTags(ctx, path, data, offset, flags, -1, nil, "")
 }
 
 // WriteCtxIfRevision applies the write only when expectedRevision matches the
@@ -320,18 +321,19 @@ func (b *Dat9Backend) WriteCtx(ctx context.Context, path string, data []byte, of
 // - zero: path must not already exist
 // - positive: file must exist at exactly that revision
 func (b *Dat9Backend) WriteCtxIfRevision(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64) (n int64, err error) {
-	return b.WriteCtxIfRevisionWithTags(ctx, path, data, offset, flags, expectedRevision, nil)
+	return b.WriteCtxIfRevisionWithTags(ctx, path, data, offset, flags, expectedRevision, nil, "")
 }
 
 // WriteCtxIfRevisionWithTags applies the write only when expectedRevision
 // matches the current file revision, and optionally replaces file tags in the
-// same transaction when tags is non-nil.
+// same transaction when tags is non-nil. It also accepts an optional
+// description for the file.
 //
 // expectedRevision semantics:
 // - negative: unconditional write
 // - zero: path must not already exist
 // - positive: file must exist at exactly that revision
-func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string) (n int64, err error) {
+func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (n int64, err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, "write", err, start) }()
 
@@ -353,7 +355,7 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path strin
 			}
 			return 0, datastore.ErrNotFound
 		}
-		n, err := b.createAndWriteCtx(ctx, path, data, tags)
+		n, err := b.createAndWriteCtx(ctx, path, data, tags, description)
 		if expectedRevision == 0 && errors.Is(err, datastore.ErrPathConflict) {
 			return 0, datastore.ErrRevisionConflict
 		}
@@ -374,7 +376,7 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path strin
 	if expectedRevision > 0 && (existing.File == nil || existing.File.Revision != expectedRevision) {
 		return 0, datastore.ErrRevisionConflict
 	}
-	return b.overwriteFileCtx(ctx, existing, data, offset, flags, expectedRevision, tags)
+	return b.overwriteFileCtx(ctx, existing, data, offset, flags, expectedRevision, tags, description)
 }
 
 func cloneFileTags(tags map[string]string) map[string]string {
@@ -388,7 +390,7 @@ func cloneFileTags(tags map[string]string) map[string]string {
 	return out
 }
 
-func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte, tags map[string]string) (int64, error) {
+func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte, tags map[string]string, description string) (int64, error) {
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
 		return 0, err
 	}
@@ -425,7 +427,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			ContentBlob: contentBlob,
 			ContentType: contentType, SizeBytes: int64(len(data)),
 			ChecksumSHA256: checksum, Revision: 1, Status: datastore.StatusConfirmed,
-			ContentText: contentText, CreatedAt: now, ConfirmedAt: &now,
+			ContentText: contentText, Description: description, CreatedAt: now, ConfirmedAt: &now,
 		}); err != nil {
 			return err
 		}
@@ -446,7 +448,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		if b.UsesDatabaseAutoEmbedding() {
 			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
 		}
-		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText) {
+		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText, description) {
 			return b.enqueueEmbedTaskTx(tx, fileID, 1)
 		}
 		return nil
@@ -468,7 +470,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	return int64(len(data)), nil
 }
 
-func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string) (int64, error) {
+func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (int64, error) {
 	if nf.File == nil {
 		return 0, fmt.Errorf("no file entity")
 	}
@@ -530,24 +532,24 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 			if expectedRevision > 0 {
 				newRev, txErr = b.store.UpdateFileContentAutoEmbeddingIfRevisionTx(tx,
 					nf.File.FileID, expectedRevision, storageType, storageRef,
-					contentType, checksum, contentText, contentBlob, int64(len(finalData)),
+					contentType, checksum, contentText, contentBlob, int64(len(finalData)), description,
 				)
 			} else {
 				newRev, txErr = b.store.UpdateFileContentAutoEmbeddingTx(tx,
 					nf.File.FileID, storageType, storageRef,
-					contentType, checksum, contentText, contentBlob, int64(len(finalData)),
+					contentType, checksum, contentText, contentBlob, int64(len(finalData)), description,
 				)
 			}
 		} else {
 			if expectedRevision > 0 {
 				newRev, txErr = b.store.UpdateFileContentIfRevisionTx(tx,
 					nf.File.FileID, expectedRevision, storageType, storageRef,
-					contentType, checksum, contentText, contentBlob, int64(len(finalData)),
+					contentType, checksum, contentText, contentBlob, int64(len(finalData)), description,
 				)
 			} else {
 				newRev, txErr = b.store.UpdateFileContentTx(tx,
 					nf.File.FileID, storageType, storageRef,
-					contentType, checksum, contentText, contentBlob, int64(len(finalData)),
+					contentType, checksum, contentText, contentBlob, int64(len(finalData)), description,
 				)
 			}
 		}
@@ -562,7 +564,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		if b.UsesDatabaseAutoEmbedding() {
 			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
 		}
-		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText) {
+		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText, description) {
 			return b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
 		}
 		return nil
@@ -944,12 +946,17 @@ func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit 
 		ftsCh <- grepResp{rows: rows, err: searchErr}
 	}()
 
-	var vecCh chan grepResp
+	var vecCh, vecDescCh chan grepResp
 	if b.UsesDatabaseAutoEmbedding() {
 		vecCh = make(chan grepResp, 1)
 		go func() {
 			rows, searchErr := b.store.VectorSearchByText(ctx, query, pathPrefix, fetch)
 			vecCh <- grepResp{rows: rows, err: searchErr}
+		}()
+		vecDescCh = make(chan grepResp, 1)
+		go func() {
+			rows, searchErr := b.store.VectorSearchDescriptionByText(ctx, query, pathPrefix, fetch)
+			vecDescCh <- grepResp{rows: rows, err: searchErr}
 		}()
 	} else if b.queryEmbedder != nil {
 		vecCh = make(chan grepResp, 1)
@@ -962,6 +969,16 @@ func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit 
 			rows, searchErr := b.store.VectorSearch(ctx, queryVec, pathPrefix, fetch)
 			vecCh <- grepResp{rows: rows, err: searchErr}
 		}()
+		vecDescCh = make(chan grepResp, 1)
+		go func() {
+			queryVec, embedErr := b.queryEmbedder.EmbedText(ctx, query)
+			if embedErr != nil || len(queryVec) == 0 {
+				vecDescCh <- grepResp{err: embedErr}
+				return
+			}
+			rows, searchErr := b.store.VectorSearchDescription(ctx, queryVec, pathPrefix, fetch)
+			vecDescCh <- grepResp{rows: rows, err: searchErr}
+		}()
 	}
 
 	ftsResp := <-ftsCh
@@ -973,7 +990,7 @@ func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit 
 			zap.Error(ftsResp.err))
 	}
 
-	var vecResp grepResp
+	var vecResp, vecDescResp grepResp
 	if vecCh != nil {
 		vecResp = <-vecCh
 		if vecResp.err != nil {
@@ -984,13 +1001,26 @@ func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit 
 				zap.Error(vecResp.err))
 		}
 	}
+	if vecDescCh != nil {
+		vecDescResp = <-vecDescCh
+		if vecDescResp.err != nil {
+			logger.Warn(ctx, "backend_grep_vector_desc_failed",
+				zap.Int("query_len", len(query)),
+				zap.String("path_prefix", pathPrefix),
+				zap.Int("limit", fetch),
+				zap.Error(vecDescResp.err))
+		}
+	}
+
+	// Merge content vector and description vector results: same file keeps best (min distance) score.
+	mergedVec := mergeVectorResults(vecResp.rows, vecDescResp.rows)
 
 	// Decision rule for grep:
 	// 1. FTS and vector search are ranking signals; either one may fail independently.
 	// 2. If either path returns ranked rows, serve those rows directly after RRF merge.
 	// 3. Only fall back to LIKE-based keyword search when both ranking paths produce no rows.
 	// This keeps semantic ranking as an enhancement while preserving a text-search safety net.
-	hasRankedResults := len(ftsResp.rows) > 0 || len(vecResp.rows) > 0
+	hasRankedResults := len(ftsResp.rows) > 0 || len(mergedVec) > 0
 	if !hasRankedResults {
 		rows, searchErr := b.store.KeywordSearch(ctx, query, pathPrefix, limit)
 		if searchErr != nil {
@@ -1000,7 +1030,33 @@ func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit 
 		}
 		return rows, nil
 	}
-	return datastore.RRFMerge(ftsResp.rows, vecResp.rows, limit), nil
+	return datastore.RRFMerge(ftsResp.rows, mergedVec, limit), nil
+}
+
+// mergeVectorResults merges two vector search result sets, keeping the best score
+// (minimum distance / maximum similarity) for each path.
+func mergeVectorResults(a, b []datastore.SearchResult) []datastore.SearchResult {
+	best := make(map[string]datastore.SearchResult)
+	for _, r := range a {
+		best[r.Path] = r
+	}
+	for _, r := range b {
+		if existing, ok := best[r.Path]; ok {
+			if *r.Score > *existing.Score {
+				best[r.Path] = r
+			}
+		} else {
+			best[r.Path] = r
+		}
+	}
+	out := make([]datastore.SearchResult, 0, len(best))
+	for _, r := range best {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return *out[i].Score > *out[j].Score
+	})
+	return out
 }
 
 func (b *Dat9Backend) Find(ctx context.Context, f *datastore.FindFilter) ([]datastore.SearchResult, error) {

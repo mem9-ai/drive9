@@ -68,7 +68,7 @@ func (sw *StreamWriter) initLocked(ctx context.Context) error {
 	if sw.started {
 		return nil
 	}
-	plan, err := sw.client.initiateUploadV2(ctx, sw.path, sw.totalSize, sw.expectedRevision)
+	plan, err := sw.client.initiateUploadV2(ctx, sw.path, sw.totalSize, sw.expectedRevision, "")
 	if err == errV2NotAvailable {
 		return fmt.Errorf("streaming upload requires v2 protocol: %w", err)
 	}

@@ -485,7 +485,7 @@ func TestUpdateFileContent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newRev, err := s.UpdateFileContent(context.Background(), "f1", StorageDB9, "/blobs/f1-v2", "text/plain", "abc123", "new content", []byte("blob"), 42)
+	newRev, err := s.UpdateFileContent(context.Background(), "f1", StorageDB9, "/blobs/f1-v2", "text/plain", "abc123", "new content", []byte("blob"), 42, "")
 	if err != nil {
 		t.Fatal(err)
 	}
