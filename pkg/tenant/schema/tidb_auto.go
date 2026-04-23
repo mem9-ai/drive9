@@ -5,13 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	"github.com/mem9-ai/dat9/internal/schemaspec"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"go.uber.org/zap"
 )
@@ -46,16 +45,15 @@ const (
 // re-applying our schema (e.g., a required migration for a new major version),
 // update any statement in tidbAutoEmbeddingSchemaStatements() to force a hash
 // change and trigger a one-time re-Ensure for all tenants.
-var CurrentTiDBTenantSchemaVersion = func() int {
-	stmts := tidbAutoEmbeddingSchemaStatements()
+var CurrentTiDBTenantSchemaVersion = currentTiDBTenantSchemaVersion(tidbAutoEmbeddingSchemaStatements())
+
+func currentTiDBTenantSchemaVersion(stmts []string) int {
 	// Hash only statements that are parsed into the schema spec (CREATE TABLE,
 	// CREATE [UNIQUE] INDEX, ALTER TABLE ... ADD ... INDEX).  Statements that
 	// fall into none of these categories (e.g. SET, comments) do not affect
 	// what ValidateTiDBSchemaForMode checks, so including them would cause
 	// unnecessary re-Ensures on unrelated edits.
 	//
-	// int(h) is safe: uint32 → int on a 64-bit platform is always non-negative,
-	// unlike int(int32(h)) which sign-extends for values with bit 31 set.
 	var specStmts []string
 	for _, stmt := range stmts {
 		n := normalizeSQLFragment(stmt)
@@ -63,12 +61,11 @@ var CurrentTiDBTenantSchemaVersion = func() int {
 			strings.HasPrefix(n, "create index ") ||
 			strings.HasPrefix(n, "create unique index ") ||
 			(strings.HasPrefix(n, "alter table ") && strings.Contains(n, " add ") && strings.Contains(n, " index ")) {
-			specStmts = append(specStmts, stmt)
+			specStmts = append(specStmts, schemaspec.CanonicalStatementForHash(stmt))
 		}
 	}
-	h := crc32.ChecksumIEEE([]byte(strings.Join(specStmts, "\n")))
-	return int(h)
-}()
+	return schemaspec.CRC32Version(specStmts)
+}
 
 var tidbAutoEmbeddingOptionsJSON = fmt.Sprintf(`{"dimensions":%d}`, TiDBAutoEmbeddingDimensions)
 
@@ -344,6 +341,7 @@ func EnsureTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbedding
 		}
 		repairs := plannedTiDBSchemaRepairs(diffs)
 		if len(repairs) == 0 {
+			// Drift remains but nothing in it is safe to repair automatically.
 			break
 		}
 		if err := applyTiDBSchemaRepairs(ctx, db, repairs); err != nil {
@@ -479,13 +477,6 @@ func validateTiDBUploadsTableBase(meta tidbTableMeta) error {
 	return meta.requireColumnType("expected_revision", "bigint")
 }
 
-func legacyTiDBUploadsRepairStatements(meta tidbTableMeta) []string {
-	if _, ok := meta.columns["expected_revision"]; ok {
-		return nil
-	}
-	return []string{`ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL`}
-}
-
 func loadTiDBTableMeta(ctx context.Context, db *sql.DB, tableName string) (tidbTableMeta, error) {
 	columns, err := loadTiDBColumnMeta(ctx, db, tableName)
 	if err != nil {
@@ -555,11 +546,7 @@ func loadShowCreateTable(ctx context.Context, db *sql.DB, tableName string) (str
 }
 
 func normalizeSQLFragment(s string) string {
-	s = strings.ToLower(s)
-	s = strings.ReplaceAll(s, "`", "")
-	s = strings.ReplaceAll(s, "_utf8mb4", "")
-	fields := strings.Fields(s)
-	return strings.Join(fields, " ")
+	return schemaspec.NormalizeSQLFragment(s)
 }
 
 func normalizeColumnTypeForCompare(s string) string {
@@ -721,133 +708,11 @@ func parseCreateTableSpec(stmt string) (tidbTableSpec, bool, error) {
 }
 
 func parseCreateTableStatement(stmt string) (tableName string, definitions string, ok bool, err error) {
-	lower := strings.ToLower(stmt)
-	prefixes := []string{"create table if not exists", "create table"}
-	start := -1
-	prefixLen := 0
-	for _, prefix := range prefixes {
-		if idx := strings.Index(lower, prefix); idx >= 0 {
-			start = idx
-			prefixLen = len(prefix)
-			break
-		}
-	}
-	if start < 0 {
-		return "", "", false, nil
-	}
-	i := start + prefixLen
-	for i < len(stmt) && (stmt[i] == ' ' || stmt[i] == '\n' || stmt[i] == '\t' || stmt[i] == '\r') {
-		i++
-	}
-	if i >= len(stmt) {
-		return "", "", false, fmt.Errorf("parse create table: missing table name")
-	}
-	nameStart := i
-	if stmt[i] == '`' {
-		i++
-		for i < len(stmt) && stmt[i] != '`' {
-			i++
-		}
-		if i >= len(stmt) {
-			return "", "", false, fmt.Errorf("parse create table: unterminated quoted table name")
-		}
-		tableName = strings.ToLower(stmt[nameStart+1 : i])
-		i++
-	} else {
-		for i < len(stmt) && stmt[i] != ' ' && stmt[i] != '\n' && stmt[i] != '\t' && stmt[i] != '(' {
-			i++
-		}
-		tableName = strings.ToLower(strings.TrimSpace(stmt[nameStart:i]))
-	}
-	for i < len(stmt) && stmt[i] != '(' {
-		i++
-	}
-	if i >= len(stmt) || stmt[i] != '(' {
-		return "", "", false, fmt.Errorf("parse create table %s: missing opening parenthesis", tableName)
-	}
-	bodyStart := i + 1
-	depth := 1
-	inSingle := false
-	inDouble := false
-	inBacktick := false
-	for i = bodyStart; i < len(stmt); i++ {
-		ch := stmt[i]
-		switch ch {
-		case '\\':
-			i++
-			continue
-		case '\'':
-			if !inDouble && !inBacktick {
-				inSingle = !inSingle
-			}
-		case '"':
-			if !inSingle && !inBacktick {
-				inDouble = !inDouble
-			}
-		case '`':
-			if !inSingle && !inDouble {
-				inBacktick = !inBacktick
-			}
-		case '(':
-			if !inSingle && !inDouble && !inBacktick {
-				depth++
-			}
-		case ')':
-			if !inSingle && !inDouble && !inBacktick {
-				depth--
-				if depth == 0 {
-					return tableName, stmt[bodyStart:i], true, nil
-				}
-			}
-		}
-	}
-	return "", "", false, fmt.Errorf("parse create table %s: unbalanced parentheses", tableName)
+	return schemaspec.ParseCreateTableStatement(stmt)
 }
 
 func splitTopLevelComma(definitions string) []string {
-	parts := make([]string, 0)
-	start := 0
-	depth := 0
-	inSingle := false
-	inDouble := false
-	inBacktick := false
-	for i := 0; i < len(definitions); i++ {
-		ch := definitions[i]
-		switch ch {
-		case '\\':
-			i++
-			continue
-		case '\'':
-			if !inDouble && !inBacktick {
-				inSingle = !inSingle
-			}
-		case '"':
-			if !inSingle && !inBacktick {
-				inDouble = !inDouble
-			}
-		case '`':
-			if !inSingle && !inDouble {
-				inBacktick = !inBacktick
-			}
-		case '(':
-			if !inSingle && !inDouble && !inBacktick {
-				depth++
-			}
-		case ')':
-			if !inSingle && !inDouble && !inBacktick && depth > 0 {
-				depth--
-			}
-		case ',':
-			if !inSingle && !inDouble && !inBacktick && depth == 0 {
-				parts = append(parts, strings.TrimSpace(definitions[start:i]))
-				start = i + 1
-			}
-		}
-	}
-	if start < len(definitions) {
-		parts = append(parts, strings.TrimSpace(definitions[start:]))
-	}
-	return parts
+	return schemaspec.SplitTopLevelComma(definitions)
 }
 
 func parseInlineIndexDefinition(tableName, def string) (indexName, createSQL string, ok bool) {
@@ -985,74 +850,11 @@ func parseColumnDefinition(tableName, def string) (string, tidbColumnSpec, bool)
 }
 
 func parseColumnType(rest string) string {
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return ""
-	}
-	keywords := []string{" not ", " null", " default ", " generated ", " as ", " primary ", " unique ", " comment ", " references ", " auto_increment", " on update"}
-	depth := 0
-	inSingle := false
-	inDouble := false
-	inBacktick := false
-	for i := 0; i < len(rest); i++ {
-		ch := rest[i]
-		switch ch {
-		case '\\':
-			i++
-			continue
-		case '\'':
-			if !inDouble && !inBacktick {
-				inSingle = !inSingle
-			}
-		case '"':
-			if !inSingle && !inBacktick {
-				inDouble = !inDouble
-			}
-		case '`':
-			if !inSingle && !inDouble {
-				inBacktick = !inBacktick
-			}
-		case '(':
-			if !inSingle && !inDouble && !inBacktick {
-				depth++
-			}
-		case ')':
-			if !inSingle && !inDouble && !inBacktick && depth > 0 {
-				depth--
-			}
-		}
-		if inSingle || inDouble || inBacktick || depth > 0 {
-			continue
-		}
-		suffix := " " + strings.ToLower(rest[i:])
-		for _, kw := range keywords {
-			if strings.HasPrefix(suffix, kw) {
-				return strings.TrimSpace(rest[:i])
-			}
-		}
-	}
-	return strings.TrimSpace(rest)
+	return schemaspec.ParseColumnType(rest)
 }
 
 func splitIdentifierAndRest(s string) (identifier string, rest string) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "", ""
-	}
-	if s[0] == '`' {
-		end := strings.Index(s[1:], "`")
-		if end < 0 {
-			return "", ""
-		}
-		id := s[1 : 1+end]
-		return id, strings.TrimSpace(s[1+end+1:])
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' {
-			return s[:i], strings.TrimSpace(s[i+1:])
-		}
-	}
-	return s, ""
+	return schemaspec.SplitIdentifierAndRest(s)
 }
 
 func isConstraintDefinition(def string) bool {
@@ -1294,28 +1096,7 @@ func isSafeTiDBRepairDiff(diff tidbSchemaDiff, tableMissing map[string]bool) boo
 }
 
 func isSafeAddColumnRepairSQL(sqlText string) bool {
-	n := normalizeSQLFragment(sqlText)
-	if !strings.HasPrefix(n, "alter table ") || !strings.Contains(n, " add column ") {
-		return false
-	}
-	if isGeneratedColumnAddSQL(n) {
-		return false
-	}
-	if strings.Contains(n, " not null") && !strings.Contains(n, " default ") {
-		return false
-	}
-	return true
-}
-
-func isGeneratedColumnAddSQL(normalizedSQL string) bool {
-	if strings.Contains(normalizedSQL, " generated ") {
-		return true
-	}
-	hasAsExpr := strings.Contains(normalizedSQL, " as (")
-	if !hasAsExpr {
-		return false
-	}
-	return strings.Contains(normalizedSQL, " stored") || strings.Contains(normalizedSQL, " virtual")
+	return schemaspec.IsSafeAddColumnRepairSQL(sqlText)
 }
 
 func isSafeAddIndexRepairSQL(sqlText string, tableMissing bool) bool {
@@ -1353,20 +1134,7 @@ func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string
 }
 
 func isIgnorableTiDBSchemaError(err error) bool {
-	var me *mysql.MySQLError
-	if errors.As(err, &me) {
-		switch me.Number {
-		case 1050, 1060, 1061:
-			return true
-		}
-		msg := strings.ToLower(me.Message)
-		if strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate") {
-			return true
-		}
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate")
+	return schemaspec.IsIgnorableMySQLError(err)
 }
 
 func validateTiDBAutoEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {

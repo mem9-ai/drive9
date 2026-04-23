@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	"github.com/mem9-ai/dat9/internal/schemaspec"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/mysqlutil"
@@ -487,111 +487,11 @@ func applyMetaSchemaRepairs(ctx context.Context, db *sql.DB, stmts []string) err
 }
 
 func parseMetaCreateTableStatement(stmt string) (tableName string, definitions string, ok bool, err error) {
-	lower := strings.ToLower(stmt)
-	const prefix = "create table if not exists"
-	pos := strings.Index(lower, prefix)
-	if pos < 0 {
-		return "", "", false, nil
-	}
-	i := pos + len(prefix)
-	for i < len(stmt) && (stmt[i] == ' ' || stmt[i] == '\n' || stmt[i] == '\t' || stmt[i] == '\r') {
-		i++
-	}
-	if i >= len(stmt) {
-		return "", "", false, fmt.Errorf("parse create table: missing table name")
-	}
-	name, rest := splitMetaIdentifierAndRest(stmt[i:])
-	if name == "" {
-		return "", "", false, fmt.Errorf("parse create table: invalid table name")
-	}
-	tableName = strings.ToLower(name)
-	open := strings.Index(rest, "(")
-	if open < 0 {
-		return "", "", false, fmt.Errorf("parse create table %s: missing opening parenthesis", tableName)
-	}
-	bodyStart := i + (len(stmt[i:]) - len(rest)) + open + 1
-	depth := 1
-	inSingle := false
-	inDouble := false
-	inBacktick := false
-	for j := bodyStart; j < len(stmt); j++ {
-		ch := stmt[j]
-		switch ch {
-		case '\\':
-			j++
-			continue
-		case '\'':
-			if !inDouble && !inBacktick {
-				inSingle = !inSingle
-			}
-		case '"':
-			if !inSingle && !inBacktick {
-				inDouble = !inDouble
-			}
-		case '`':
-			if !inSingle && !inDouble {
-				inBacktick = !inBacktick
-			}
-		case '(':
-			if !inSingle && !inDouble && !inBacktick {
-				depth++
-			}
-		case ')':
-			if !inSingle && !inDouble && !inBacktick {
-				depth--
-				if depth == 0 {
-					return tableName, stmt[bodyStart:j], true, nil
-				}
-			}
-		}
-	}
-	return "", "", false, fmt.Errorf("parse create table %s: unbalanced parentheses", tableName)
+	return schemaspec.ParseCreateTableStatement(stmt)
 }
 
 func splitMetaTopLevelComma(definitions string) []string {
-	parts := make([]string, 0)
-	start := 0
-	depth := 0
-	inSingle := false
-	inDouble := false
-	inBacktick := false
-	for i := 0; i < len(definitions); i++ {
-		ch := definitions[i]
-		switch ch {
-		case '\\':
-			i++
-			continue
-		case '\'':
-			if !inDouble && !inBacktick {
-				inSingle = !inSingle
-			}
-		case '"':
-			if !inSingle && !inBacktick {
-				inDouble = !inDouble
-			}
-		case '`':
-			if !inSingle && !inDouble {
-				inBacktick = !inBacktick
-			}
-		case '(':
-			if !inSingle && !inDouble && !inBacktick {
-				depth++
-			}
-		case ')':
-			if !inSingle && !inDouble && !inBacktick && depth > 0 {
-				depth--
-			}
-		case ',':
-			if !inSingle && !inDouble && !inBacktick && depth == 0 {
-				parts = append(parts, strings.TrimSpace(definitions[start:i]))
-				start = i + 1
-			}
-		}
-	}
-	if start < len(definitions) {
-		parts = append(parts, strings.TrimSpace(definitions[start:]))
-	}
-	return parts
+	return schemaspec.SplitTopLevelComma(definitions)
 }
 
 func parseMetaInlineIndexDefinition(tableName, def string) (indexName, createSQL string, ok bool) {
@@ -675,74 +575,11 @@ func parseMetaColumnDefinition(tableName, def string) (string, metaColumnSpec, b
 }
 
 func parseMetaColumnType(rest string) string {
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return ""
-	}
-	keywords := []string{" not ", " null", " default ", " generated ", " as ", " primary ", " unique ", " comment ", " references ", " auto_increment", " on update"}
-	depth := 0
-	inSingle := false
-	inDouble := false
-	inBacktick := false
-	for i := 0; i < len(rest); i++ {
-		ch := rest[i]
-		switch ch {
-		case '\\':
-			i++
-			continue
-		case '\'':
-			if !inDouble && !inBacktick {
-				inSingle = !inSingle
-			}
-		case '"':
-			if !inSingle && !inBacktick {
-				inDouble = !inDouble
-			}
-		case '`':
-			if !inSingle && !inDouble {
-				inBacktick = !inBacktick
-			}
-		case '(':
-			if !inSingle && !inDouble && !inBacktick {
-				depth++
-			}
-		case ')':
-			if !inSingle && !inDouble && !inBacktick && depth > 0 {
-				depth--
-			}
-		}
-		if inSingle || inDouble || inBacktick || depth > 0 {
-			continue
-		}
-		suffix := " " + strings.ToLower(rest[i:])
-		for _, kw := range keywords {
-			if strings.HasPrefix(suffix, kw) {
-				return strings.TrimSpace(rest[:i])
-			}
-		}
-	}
-	return strings.TrimSpace(rest)
+	return schemaspec.ParseColumnType(rest)
 }
 
 func splitMetaIdentifierAndRest(s string) (identifier string, rest string) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "", ""
-	}
-	if s[0] == '`' {
-		end := strings.Index(s[1:], "`")
-		if end < 0 {
-			return "", ""
-		}
-		id := s[1 : 1+end]
-		return id, strings.TrimSpace(s[1+end+1:])
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' {
-			return s[:i], strings.TrimSpace(s[i+1:])
-		}
-	}
-	return s, ""
+	return schemaspec.SplitIdentifierAndRest(s)
 }
 
 func isMetaConstraintDefinition(def string) bool {
@@ -771,39 +608,11 @@ func isSafeMetaRepairDiff(diff metaSchemaDiff, tableMissing map[string]bool) boo
 }
 
 func isSafeAddColumnRepairSQL(sqlText string) bool {
-	n := normalizeMetaSQLFragment(sqlText)
-	if !strings.HasPrefix(n, "alter table ") || !strings.Contains(n, " add column ") {
-		return false
-	}
-	// Reject generated columns in any form: GENERATED ALWAYS AS / AS (...) STORED / AS (...) VIRTUAL
-	if strings.Contains(n, " generated ") {
-		return false
-	}
-	if strings.Contains(n, " as (") &&
-		(strings.Contains(n, " stored") || strings.Contains(n, " virtual")) {
-		return false
-	}
-	if strings.Contains(n, " not null") && !strings.Contains(n, " default ") {
-		return false
-	}
-	return true
+	return schemaspec.IsSafeAddColumnRepairSQL(sqlText)
 }
 
 func isIgnorableMetaSchemaError(err error) bool {
-	var me *mysql.MySQLError
-	if errors.As(err, &me) {
-		switch me.Number {
-		case 1050, 1060, 1061:
-			return true
-		}
-		msg := strings.ToLower(me.Message)
-		if strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate") {
-			return true
-		}
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate")
+	return schemaspec.IsIgnorableMySQLError(err)
 }
 
 func loadMetaTableMeta(ctx context.Context, db *sql.DB, tableName string) (metaTableMeta, error) {
@@ -843,11 +652,7 @@ func loadMetaShowCreateTable(ctx context.Context, db *sql.DB, tableName string) 
 }
 
 func normalizeMetaSQLFragment(s string) string {
-	s = strings.ToLower(s)
-	s = strings.ReplaceAll(s, "`", "")
-	s = strings.ReplaceAll(s, "_utf8mb4", "")
-	fields := strings.Fields(s)
-	return strings.Join(fields, " ")
+	return schemaspec.NormalizeSQLFragment(s)
 }
 
 func sortedMetaColumnNames(columns map[string]metaColumnSpec) []string {
@@ -876,11 +681,7 @@ func showCreateHasMetaIndex(normalizedCreate, indexName string, spec metaIndexSp
 }
 
 func schemaSnippet(stmt string) string {
-	snippet := stmt
-	if len(snippet) > 80 {
-		snippet = snippet[:80]
-	}
-	return snippet
+	return schemaspec.SQLSnippet(stmt)
 }
 
 func (s *Store) InsertTenant(ctx context.Context, t *Tenant) (err error) {

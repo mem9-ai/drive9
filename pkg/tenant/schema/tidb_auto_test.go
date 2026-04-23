@@ -70,19 +70,6 @@ func TestValidateTiDBUploadsTableBaseRejectsMissingExpectedRevision(t *testing.T
 	}
 }
 
-func TestLegacyTiDBUploadsRepairStatements(t *testing.T) {
-	if got := legacyTiDBUploadsRepairStatements(testUploadsTableMeta(true)); len(got) != 0 {
-		t.Fatalf("expected no repair statements when expected_revision exists, got %#v", got)
-	}
-	got := legacyTiDBUploadsRepairStatements(testUploadsTableMeta(false))
-	if len(got) != 1 {
-		t.Fatalf("expected one repair statement, got %#v", got)
-	}
-	if !strings.Contains(strings.ToLower(got[0]), "add column expected_revision") {
-		t.Fatalf("unexpected repair statement: %q", got[0])
-	}
-}
-
 func TestTiDBSchemaSpecForModeIncludesCreateStatements(t *testing.T) {
 	spec, err := tidbSchemaSpecForMode(TiDBEmbeddingModeAuto)
 	if err != nil {
@@ -132,6 +119,21 @@ func TestTiDBSchemaSpecFromStatementsParsesNewTableAutomatically(t *testing.T) {
 	}
 	if !equalStringSlices(table.primaryKey.columns, []string{"event_id"}) {
 		t.Fatalf("primary key columns=%#v, want [event_id]", table.primaryKey.columns)
+	}
+}
+
+func TestCurrentTiDBTenantSchemaVersionIgnoresFormattingOnlyChanges(t *testing.T) {
+	base := []string{
+		"CREATE TABLE IF NOT EXISTS example_events (event_id VARCHAR(64) PRIMARY KEY, tenant_id VARCHAR(64) NOT NULL)",
+		"CREATE INDEX idx_example_events_tenant ON example_events(tenant_id)",
+	}
+	formatted := []string{
+		"\nCREATE TABLE IF NOT EXISTS example_events (\n    event_id VARCHAR(64) PRIMARY KEY,\n    tenant_id VARCHAR(64) NOT NULL\n)\n",
+		"CREATE   INDEX idx_example_events_tenant   ON   example_events(tenant_id)",
+	}
+
+	if got, want := currentTiDBTenantSchemaVersion(formatted), currentTiDBTenantSchemaVersion(base); got != want {
+		t.Fatalf("formatted schema version=%d, want %d", got, want)
 	}
 }
 
