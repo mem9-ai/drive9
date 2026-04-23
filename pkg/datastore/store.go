@@ -486,6 +486,7 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 //
 // Callers should only invoke this when they intend to replace the tag set for
 // the current write revision. Passing an empty map clears all existing tags.
+// Callers that intend to preserve the current tag set must skip this call.
 func (s *Store) ReplaceFileTagsTx(db execer, fileID string, tags map[string]string) error {
 	if _, err := db.Exec(`DELETE FROM file_tags WHERE file_id = ?`, fileID); err != nil {
 		return err

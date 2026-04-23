@@ -1436,8 +1436,9 @@ func parseUploadCompleteTags(w http.ResponseWriter, r *http.Request) (map[string
 	// Tags keys must be unique. Official CLI/SDK callers always satisfy this
 	// because they construct tags from map[string]string and reject duplicate
 	// --tag keys before issuing requests. Callers that send duplicate JSON object
-	// keys are providing invalid input; server behavior for such payloads is
-	// unspecified and not guaranteed to remain stable across versions.
+	// keys are providing invalid input; Go's encoding/json silently keeps the
+	// last value for duplicate keys, so callers that need deterministic results
+	// must deduplicate before sending.
 	var req struct {
 		Tags map[string]string `json:"tags,omitempty"`
 	}
@@ -1755,8 +1756,9 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 	// Tags keys must be unique. Official CLI/SDK callers always satisfy this
 	// because they construct tags from map[string]string and reject duplicate
 	// --tag keys before issuing requests. Callers that send duplicate JSON object
-	// keys are providing invalid input; server behavior for such payloads is
-	// unspecified and not guaranteed to remain stable across versions.
+	// keys are providing invalid input; Go's encoding/json silently keeps the
+	// last value for duplicate keys, so callers that need deterministic results
+	// must deduplicate before sending.
 	var req struct {
 		Parts []backend.CompletePart `json:"parts"`
 		Tags  map[string]string      `json:"tags,omitempty"`

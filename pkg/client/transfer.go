@@ -669,6 +669,10 @@ func (c *Client) completeUpload(ctx context.Context, uploadID string) error {
 	return c.completeUploadWithTags(ctx, uploadID, nil)
 }
 
+// completeUploadWithTags notifies the server that all parts are uploaded and,
+// when tags is non-nil, includes a replacement tag set in the complete payload.
+// Passing nil preserves any existing tags on the file; passing a non-nil empty
+// map requests clearing all existing tags.
 func (c *Client) completeUploadWithTags(ctx context.Context, uploadID string, tags map[string]string) error {
 	var body io.Reader
 	if tags != nil {

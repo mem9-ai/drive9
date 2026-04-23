@@ -694,7 +694,8 @@ func (b *Dat9Backend) ConfirmUploadV2(ctx context.Context, uploadID string, clie
 
 // ConfirmUploadV2WithTags validates client-supplied parts against S3, then
 // completes the upload and optionally replaces file tags in the same
-// completion transaction when tags is non-nil.
+// completion transaction. Passing nil preserves any existing tags on the file;
+// passing a non-nil empty map clears all existing tags.
 func (b *Dat9Backend) ConfirmUploadV2WithTags(ctx context.Context, uploadID string, clientParts []CompletePart, tags map[string]string) error {
 	start := time.Now()
 	tags = cloneFileTags(tags)
@@ -811,7 +812,9 @@ func (b *Dat9Backend) ConfirmUpload(ctx context.Context, uploadID string) error 
 }
 
 // ConfirmUploadWithTags completes the multipart upload and optionally replaces
-// file tags in the same completion transaction when tags is non-nil.
+// file tags in the same completion transaction. Passing nil preserves any
+// existing tags on the file; passing a non-nil empty map clears all existing
+// tags.
 func (b *Dat9Backend) ConfirmUploadWithTags(ctx context.Context, uploadID string, tags map[string]string) error {
 	start := time.Now()
 	tags = cloneFileTags(tags)

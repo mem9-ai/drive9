@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -151,6 +152,47 @@ func TestStatMetadataIncludesTagsAndSupportsTagReplace(t *testing.T) {
 	}
 	if meta.Tags["owner"] != "bob" || len(meta.Tags) != 1 {
 		t.Fatalf("tags after replace = %+v, want only owner=bob", meta.Tags)
+	}
+}
+
+func TestWriteStreamWithSummaryPreservesExistingTagsWhenTagsNil(t *testing.T) {
+	c, cleanup := newTestClient(t)
+	defer cleanup()
+
+	c.smallFileThreshold = 1
+
+	_, err := c.WriteStreamWithSummaryAndTags(
+		context.Background(),
+		"/preserve-tags.bin",
+		bytes.NewReader([]byte("abcdefgh")),
+		8,
+		nil,
+		map[string]string{"owner": "alice", "topic": "note"},
+	)
+	if err != nil {
+		t.Fatalf("WriteStreamWithSummaryAndTags(create): %v", err)
+	}
+
+	_, err = c.WriteStreamWithSummary(
+		context.Background(),
+		"/preserve-tags.bin",
+		bytes.NewReader([]byte("ijklmnop")),
+		8,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("WriteStreamWithSummary(overwrite): %v", err)
+	}
+
+	meta, err := c.StatMetadata("/preserve-tags.bin")
+	if err != nil {
+		t.Fatalf("StatMetadata: %v", err)
+	}
+	if meta.Revision != 2 {
+		t.Fatalf("revision = %d, want 2", meta.Revision)
+	}
+	if meta.Tags["owner"] != "alice" || meta.Tags["topic"] != "note" || len(meta.Tags) != 2 {
+		t.Fatalf("tags after nil-tag overwrite = %+v, want owner/topic preserved", meta.Tags)
 	}
 }
 
