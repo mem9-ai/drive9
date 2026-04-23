@@ -12,7 +12,6 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
-	"github.com/stretchr/testify/require"
 )
 
 // fakeVaultServer is the test double for /v1/vault/read[/<name>].
@@ -118,7 +117,9 @@ func lookupChild(t *testing.T, vfs *VaultFS, parentIno uint64, name string) (uin
 	hdr := &gofuse.InHeader{NodeId: parentIno}
 	out := &gofuse.EntryOut{}
 	st := vfs.Lookup(nil, hdr, name, out)
-	return out.NodeId, out.Attr.Size, st
+	// out.Size — Attr is embedded in EntryOut; the explicit selector trips
+	// staticcheck QF1008.
+	return out.NodeId, out.Size, st
 }
 
 // ---------------------------------------------------------------------------
@@ -134,34 +135,52 @@ func TestVaultMountReadOnly(t *testing.T) {
 
 	mkdirIn := &gofuse.MkdirIn{InHeader: gofuse.InHeader{NodeId: 1}}
 	st := vfs.Mkdir(nil, mkdirIn, "newdir", &gofuse.EntryOut{})
-	require.Equal(t, gofuse.EROFS, st, "mkdir under root must be EROFS")
+	if st != gofuse.EROFS {
+		t.Fatalf("mkdir under root status = %v, want EROFS", st)
+	}
 
 	st = vfs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "alpha")
-	require.Equal(t, gofuse.EROFS, st, "unlink under root must be EROFS")
+	if st != gofuse.EROFS {
+		t.Fatalf("unlink under root status = %v, want EROFS", st)
+	}
 
 	st = vfs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "alpha")
-	require.Equal(t, gofuse.EROFS, st, "rmdir must be EROFS")
+	if st != gofuse.EROFS {
+		t.Fatalf("rmdir status = %v, want EROFS", st)
+	}
 
 	createIn := &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}
 	st = vfs.Create(nil, createIn, "x", &gofuse.CreateOut{})
-	require.Equal(t, gofuse.EROFS, st, "create must be EROFS")
+	if st != gofuse.EROFS {
+		t.Fatalf("create status = %v, want EROFS", st)
+	}
 
 	writeIn := &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: 1}}
 	_, st = vfs.Write(nil, writeIn, []byte("hi"))
-	require.Equal(t, gofuse.EROFS, st, "write must be EROFS")
+	if st != gofuse.EROFS {
+		t.Fatalf("write status = %v, want EROFS", st)
+	}
 
 	setattrIn := &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{InHeader: gofuse.InHeader{NodeId: 1}}}
 	st = vfs.SetAttr(nil, setattrIn, &gofuse.AttrOut{})
-	require.Equal(t, gofuse.EROFS, st, "setattr must be EROFS")
+	if st != gofuse.EROFS {
+		t.Fatalf("setattr status = %v, want EROFS", st)
+	}
 
 	// Open with write flags must also be refused.
 	alphaIno, st := lookupRoot(t, vfs, "alpha")
-	require.True(t, st.Ok(), "lookup alpha should succeed")
+	if !st.Ok() {
+		t.Fatalf("lookup alpha status = %v, want OK", st)
+	}
 	keyIno, _, st := lookupChild(t, vfs, alphaIno, "key")
-	require.True(t, st.Ok(), "lookup alpha/key should succeed")
+	if !st.Ok() {
+		t.Fatalf("lookup alpha/key status = %v, want OK", st)
+	}
 	openIn := &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: keyIno}, Flags: 0x0001 /* O_WRONLY */}
 	st = vfs.Open(nil, openIn, &gofuse.OpenOut{})
-	require.Equal(t, gofuse.EROFS, st, "open(O_WRONLY) on field must be EROFS")
+	if st != gofuse.EROFS {
+		t.Fatalf("open(O_WRONLY) on field status = %v, want EROFS", st)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -179,13 +198,19 @@ func TestVaultMountScopeVisibility(t *testing.T) {
 	fv.setField("hidden", "f2", "y") // populated but NOT in the published list
 
 	ino, st := lookupRoot(t, vfs, "visible")
-	require.True(t, st.Ok())
-	require.NotZero(t, ino)
+	if !st.Ok() {
+		t.Fatalf("lookup visible status = %v, want OK", st)
+	}
+	if ino == 0 {
+		t.Fatalf("lookup visible returned zero NodeId")
+	}
 
 	// "hidden" must not be reachable via root readdir even though the field
 	// map is internally populated — the bearer cannot see it.
 	_, st = lookupRoot(t, vfs, "hidden")
-	require.Equal(t, gofuse.ENOENT, st, "secret outside published scope must be ENOENT at root lookup")
+	if st != gofuse.ENOENT {
+		t.Fatalf("lookup hidden status = %v, want ENOENT (outside published scope)", st)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -206,26 +231,38 @@ func TestVaultMountNewOpAfterRevokeEACCES(t *testing.T) {
 	// one ever regresses into the code, the post-revoke assertion below
 	// will catch it.
 	_, st := lookupRoot(t, vfs, "alpha")
-	require.True(t, st.Ok())
+	if !st.Ok() {
+		t.Fatalf("warmup lookup status = %v, want OK", st)
+	}
 	alphaIno, st := lookupRoot(t, vfs, "alpha")
-	require.True(t, st.Ok())
+	if !st.Ok() {
+		t.Fatalf("lookup alpha status = %v, want OK", st)
+	}
 	keyIno, _, st := lookupChild(t, vfs, alphaIno, "k")
-	require.True(t, st.Ok())
+	if !st.Ok() {
+		t.Fatalf("lookup alpha/k status = %v, want OK", st)
+	}
 
 	// Revoke at the server.
 	fv.revoke()
 
 	// IMMEDIATE — the NEXT op is already EACCES. No Eventually, no TTL wait.
 	_, st = lookupRoot(t, vfs, "alpha")
-	require.Equal(t, gofuse.EACCES, st, "next root Lookup after revoke must be EACCES (no TTL fail-open)")
+	if st != gofuse.EACCES {
+		t.Fatalf("next root Lookup after revoke status = %v, want EACCES (no TTL fail-open)", st)
+	}
 
 	_, _, st = lookupChild(t, vfs, alphaIno, "k")
-	require.Equal(t, gofuse.EACCES, st, "next field Lookup after revoke must be EACCES (no TTL fail-open)")
+	if st != gofuse.EACCES {
+		t.Fatalf("next field Lookup after revoke status = %v, want EACCES (no TTL fail-open)", st)
+	}
 
 	// GetAttr on a previously-known field inode must also refuse.
 	attrIn := &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: keyIno}}
 	attrSt := vfs.GetAttr(nil, attrIn, &gofuse.AttrOut{})
-	require.Equal(t, gofuse.EACCES, attrSt, "GetAttr on field inode after revoke must be EACCES")
+	if attrSt != gofuse.EACCES {
+		t.Fatalf("GetAttr on field inode after revoke status = %v, want EACCES", attrSt)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -241,14 +278,20 @@ func TestVaultMountRevokeExistingFD_NeverServesPostRevokeValue(t *testing.T) {
 	fv.setField("alpha", "k", "V1")
 
 	alphaIno, st := lookupRoot(t, vfs, "alpha")
-	require.True(t, st.Ok())
+	if !st.Ok() {
+		t.Fatalf("lookup alpha status = %v, want OK", st)
+	}
 	keyIno, _, st := lookupChild(t, vfs, alphaIno, "k")
-	require.True(t, st.Ok())
+	if !st.Ok() {
+		t.Fatalf("lookup alpha/k status = %v, want OK", st)
+	}
 
 	openIn := &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: keyIno}, Flags: 0}
 	openOut := &gofuse.OpenOut{}
 	st = vfs.Open(nil, openIn, openOut)
-	require.True(t, st.Ok(), "open should succeed pre-revoke")
+	if !st.Ok() {
+		t.Fatalf("open pre-revoke status = %v, want OK", st)
+	}
 	fh := openOut.Fh
 
 	// Mutate value and revoke at the server.
@@ -263,10 +306,16 @@ func TestVaultMountRevokeExistingFD_NeverServesPostRevokeValue(t *testing.T) {
 		buf := make([]byte, 64)
 		readIn := &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: keyIno}, Fh: fh, Offset: 0, Size: uint32(len(buf))}
 		rr, st := vfs.Read(nil, readIn, buf)
-		require.True(t, st.Ok(), "read on held FD must not error post-revoke (snapshot lives in memory)")
+		if !st.Ok() {
+			t.Fatalf("read on held FD post-revoke status = %v, want OK (snapshot lives in memory)", st)
+		}
 		out, _ := rr.Bytes(buf)
-		require.NotContains(t, string(out), "V2", "held FD must NEVER serve a post-revoke value")
-		require.Equal(t, "V1", string(out))
+		if strings.Contains(string(out), "V2") {
+			t.Fatalf("held FD served post-revoke value %q; must NEVER contain V2", string(out))
+		}
+		if string(out) != "V1" {
+			t.Fatalf("held FD read = %q, want V1", string(out))
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
 }
@@ -284,20 +333,33 @@ func TestVaultMountSettleAfterPut(t *testing.T) {
 	fv.setField("alpha", "k", "before")
 
 	alphaIno, st := lookupRoot(t, vfs, "alpha")
-	require.True(t, st.Ok())
+	if !st.Ok() {
+		t.Fatalf("lookup alpha status = %v, want OK", st)
+	}
 	_, sz, st := lookupChild(t, vfs, alphaIno, "k")
-	require.True(t, st.Ok())
-	require.EqualValues(t, len("before"), sz)
+	if !st.Ok() {
+		t.Fatalf("lookup alpha/k status = %v, want OK", st)
+	}
+	if sz != uint64(len("before")) {
+		t.Fatalf("initial size = %d, want %d", sz, len("before"))
+	}
 
 	// Update the value server-side (a "put").
 	fv.setField("alpha", "k", "after-put")
 
 	// Eventually, the new size is visible (Row G witness — settle window
 	// = TTL + safety margin per pre-PR contract v4 row G).
-	require.Eventually(t, func() bool {
+	deadline := time.Now().Add(ttl + 5*time.Second)
+	for {
 		_, sz, st := lookupChild(t, vfs, alphaIno, "k")
-		return st.Ok() && sz == uint64(len("after-put"))
-	}, ttl+5*time.Second, 25*time.Millisecond, "value put must settle within TTL window")
+		if st.Ok() && sz == uint64(len("after-put")) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("value put did not settle within TTL window (last sz = %d, st = %v)", sz, st)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -316,10 +378,14 @@ func TestVaultMountNoInProcessCache(t *testing.T) {
 	const N = 5
 	for i := 0; i < N; i++ {
 		_, st := lookupRoot(t, vfs, "alpha")
-		require.True(t, st.Ok())
+		if !st.Ok() {
+			t.Fatalf("lookup #%d status = %v, want OK", i, st)
+		}
 	}
 	after := atomic.LoadInt32(&fv.listCalls)
-	require.Equal(t, int32(N), after-before, "every lookup must hit the server (no in-process cache)")
+	if got := after - before; got != int32(N) {
+		t.Fatalf("listCalls delta = %d, want %d (every lookup must hit the server, no in-process cache)", got, N)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -342,7 +408,9 @@ func TestVaultMountRevokedCredentialRejected(t *testing.T) {
 		DirTTL:     100 * time.Millisecond,
 	}
 	err := MountVault(opts)
-	require.Error(t, err, "revoked credential must reject mount")
+	if err == nil {
+		t.Fatalf("MountVault with revoked credential returned nil error, want non-nil")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -373,10 +441,56 @@ func TestVaultMountEmptyScopeAllowed(t *testing.T) {
 			err := MountVault(tc.opts(srv.URL, tmp))
 			// FUSE mount will fail in test env, but the probe must NOT
 			// produce an EACCES rejection for empty scope.
-			if err != nil {
-				require.NotContains(t, err.Error(), "EACCES",
-					"%s with empty vault must NOT be rejected with EACCES", tc.name)
+			if err != nil && strings.Contains(err.Error(), "EACCES") {
+				t.Fatalf("%s with empty vault returned EACCES: %v (must NOT be rejected for empty scope)", tc.name, err)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Read must guard input.Offset (uint64) against math.MaxInt64 overflow and
+// uint64 wraparound when computing end = offset + len(buf). A hostile
+// ^uint64(0) offset or a near-max offset + buf_len wrap must be rejected as
+// empty read, never panic with a negative slice index.
+// ---------------------------------------------------------------------------
+
+func TestVaultMountReadOffsetOverflowSafe(t *testing.T) {
+	vfs, fv, cleanup := newTestVaultFS(t, 5*time.Second)
+	defer cleanup()
+	fv.setSecrets([]string{"alpha"})
+	fv.setField("alpha", "k", "payload")
+
+	alphaIno, st := lookupRoot(t, vfs, "alpha")
+	if !st.Ok() {
+		t.Fatalf("lookup alpha status = %v, want OK", st)
+	}
+	keyIno, _, st := lookupChild(t, vfs, alphaIno, "k")
+	if !st.Ok() {
+		t.Fatalf("lookup alpha/k status = %v, want OK", st)
+	}
+
+	openIn := &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: keyIno}, Flags: 0}
+	openOut := &gofuse.OpenOut{}
+	if st := vfs.Open(nil, openIn, openOut); !st.Ok() {
+		t.Fatalf("open status = %v, want OK", st)
+	}
+	fh := openOut.Fh
+
+	for _, offset := range []uint64{
+		^uint64(0),               // math.MaxUint64
+		^uint64(0) - 10,          // near-max; offset + len(buf) wraps
+		uint64(1) << 63,          // math.MaxInt64+1 (first offset that overflows int64)
+	} {
+		buf := make([]byte, 64)
+		readIn := &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: keyIno}, Fh: fh, Offset: offset, Size: uint32(len(buf))}
+		rr, rst := vfs.Read(nil, readIn, buf)
+		if !rst.Ok() {
+			t.Fatalf("Read(offset=%#x) status = %v, want OK (must not panic or error)", offset, rst)
+		}
+		out, _ := rr.Bytes(buf)
+		if len(out) != 0 {
+			t.Fatalf("Read(offset=%#x) returned %d bytes, want 0 (past-EOF)", offset, len(out))
+		}
 	}
 }

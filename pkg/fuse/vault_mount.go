@@ -46,6 +46,9 @@ func (o *VaultMountOptions) setDefaults() {
 //
 // The contract row mapping is documented at the top of vaultfs.go.
 func MountVault(opts *VaultMountOptions) error {
+	if opts == nil {
+		return fmt.Errorf("mount vault: options are required")
+	}
 	opts.setDefaults()
 
 	if err := os.MkdirAll(opts.MountPoint, 0o755); err != nil {
@@ -143,7 +146,10 @@ func forceUnmountVault(mountpoint string) {
 	if runtime.GOOS == "darwin" {
 		cmd = exec.Command("diskutil", "unmount", "force", mountpoint)
 	} else {
-		if _, err := exec.LookPath("fusermount"); err == nil {
+		// Prefer fusermount3 (matches canonical selection in cmd/drive9/cli/mount.go).
+		if _, err := exec.LookPath("fusermount3"); err == nil {
+			cmd = exec.Command("fusermount3", "-u", mountpoint)
+		} else if _, err := exec.LookPath("fusermount"); err == nil {
 			cmd = exec.Command("fusermount", "-u", mountpoint)
 		} else {
 			cmd = exec.Command("umount", "-l", mountpoint)

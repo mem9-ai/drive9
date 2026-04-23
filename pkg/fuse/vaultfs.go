@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -352,6 +353,11 @@ func (fs *VaultFS) readDirCommon(cancel <-chan struct{}, input *gofuse.ReadIn, o
 		}
 	}
 
+	// Stable order across paginated ReadDir calls — fields come from a Go map
+	// whose iteration order is nondeterministic, so without a sort the kernel
+	// could see entries skipped or duplicated across successive Offsets.
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+
 	for i := int(input.Offset); i < len(entries); i++ {
 		e := entries[i]
 		de := gofuse.DirEntry{Name: e.name, Ino: e.ino, Mode: e.mode}
@@ -426,15 +432,20 @@ func (fs *VaultFS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte
 	if !ok {
 		return nil, gofuse.EBADF
 	}
-	off := int64(input.Offset)
-	if off >= int64(len(of.data)) {
+	// input.Offset is uint64 and can exceed math.MaxInt64. Validate bounds in
+	// uint64 space, and only narrow to int after proving safety so a hostile
+	// ^uint64(0) offset cannot produce a negative slice index.
+	dataLen := uint64(len(of.data))
+	if input.Offset >= dataLen {
 		return gofuse.ReadResultData(nil), gofuse.OK
 	}
-	end := off + int64(len(buf))
-	if end > int64(len(of.data)) {
-		end = int64(len(of.data))
+	end := input.Offset + uint64(len(buf))
+	// end < input.Offset detects uint64 wraparound; end > dataLen clamps a
+	// read that would run past EOF.
+	if end < input.Offset || end > dataLen {
+		end = dataLen
 	}
-	return gofuse.ReadResultData(of.data[off:end]), gofuse.OK
+	return gofuse.ReadResultData(of.data[int(input.Offset):int(end)]), gofuse.OK
 }
 
 func (fs *VaultFS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
