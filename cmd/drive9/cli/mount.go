@@ -13,6 +13,34 @@ import (
 
 // MountCmd handles the "drive9 mount" command.
 //
+// Dispatch fork (Row A, V2e): the first positional argument selects the
+// mount flavour.
+//
+//   - `drive9 mount vault <path>`   → read-only vault FUSE filesystem
+//   - `drive9 mount [flags] <path>` → legacy writable fs mount (no
+//     subcommand keyword; first positional is the mount point)
+//
+// We MUST peek at the first arg before flag.Parse because the vault flag
+// set is smaller (no cache-size / write-path knobs), and a single flag
+// set would quietly accept write-path flags for a vault mount — that
+// would violate Row C (read-only) in a subtle, mount-time-visible way.
+//
+// Only the CURRENT supported backend keyword ("vault") is reserved here.
+// Every other first positional falls through to the legacy parser, which
+// enforces "exactly one mountpoint" so `drive9 mount kv /mnt/x` fails as
+// a positional-arity error rather than by pre-reserving backend-shaped
+// words that do not exist yet.
+func MountCmd(args []string) error {
+	if len(args) > 0 {
+		if args[0] == "vault" {
+			return VaultMountCmd(args[1:])
+		}
+	}
+	return fsMountCmd(args)
+}
+
+// fsMountCmd is the pre-V2e writable fs mount entry point.
+//
 // Credential precedence matches spec §14.2: explicit --server / --api-key flag
 // > DRIVE9_SERVER / DRIVE9_API_KEY / DRIVE9_VAULT_TOKEN env > active config
 // context. The flag defaults are empty strings so we can distinguish "unset"
@@ -30,7 +58,7 @@ import (
 // drive9fuse.Mount runs in-process (no fork/exec); credentials flow through
 // MountOptions{Server, APIKey, Token}, not through the child's environment.
 // This makes the resolver's Unsetenv-after-read mitigation safe for mount.
-func MountCmd(args []string) error {
+func fsMountCmd(args []string) error {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
@@ -56,6 +84,9 @@ func MountCmd(args []string) error {
 	if fs.NArg() < 1 {
 		fs.Usage()
 		os.Exit(2)
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("drive9 mount: exactly one mountpoint required")
 	}
 
 	mountPoint := fs.Arg(0)
