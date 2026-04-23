@@ -594,9 +594,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_ok", "path", path, "is_dir", nf.Node.IsDirectory)...)
 	w.Header().Set("Content-Type", "application/json")
-	if mtime != nil {
-		w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(*mtime, 10))
-	}
+	w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(*mtime, 10))
 	_ = json.NewEncoder(w).Encode(struct {
 		Size         int64             `json:"size"`
 		IsDir        bool              `json:"isdir"`
