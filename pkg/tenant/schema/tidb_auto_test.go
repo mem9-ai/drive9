@@ -343,6 +343,53 @@ func TestDiffTiDBTableMetaRecognizesUniqueIndexFromCreateStatement(t *testing.T)
 	}
 }
 
+func TestDiffTiDBTableUsesInformationSchemaIndexesForUploads(t *testing.T) {
+	if testDSN == "" {
+		t.Skip("mysql test DSN not configured")
+	}
+
+	db, err := sql.Open("mysql", testDSN)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if _, err := db.Exec("DROP TABLE IF EXISTS uploads"); err != nil {
+		t.Fatalf("drop uploads: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec("DROP TABLE IF EXISTS uploads")
+	})
+
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "uploads")
+	if _, err := db.Exec(spec.createStatement); err != nil {
+		t.Fatalf("create uploads table: %v", err)
+	}
+	for _, indexName := range sortedIndexNames(spec.indexes) {
+		if _, err := db.Exec(spec.indexes[indexName].createSQL); err != nil {
+			t.Fatalf("create %s: %v", indexName, err)
+		}
+	}
+
+	diffs, err := diffTiDBTable(context.Background(), db, spec)
+	if err != nil {
+		t.Fatalf("diffTiDBTable: %v", err)
+	}
+	if hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "idx_uploads_active") {
+		t.Fatalf("did not expect idx_uploads_active to be reported missing via information_schema path, got %#v", diffs)
+	}
+	if len(diffs) != 0 {
+		t.Fatalf("expected uploads table created from schema spec to have no diffs, got %#v", diffs)
+	}
+	observed, ok := loadObservedTiDBIndexes(context.Background(), db, "uploads", spec.createStatement)
+	if !ok {
+		t.Fatal("expected loadObservedTiDBIndexes to observe indexes from information_schema")
+	}
+	if !hasObservedTiDBIndex(observed, "idx_uploads_active") {
+		t.Fatalf("expected idx_uploads_active in observed indexes, got %#v", observed)
+	}
+}
+
 func TestDiffTiDBTableMetaReportsIndexInspectionFailureInsteadOfFalsePositives(t *testing.T) {
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "uploads")
 	meta := testUploadsTableMeta(true)
