@@ -245,6 +245,12 @@ func (c *Client) WriteCtxConditional(ctx context.Context, path string, data []by
 
 // WriteCtxConditionalWithTags uploads data to a remote path with optional
 // compare-and-set semantics and optional file tags.
+// This method issues a single PUT request and is therefore intended for direct
+// write paths. When tags are provided for a large file, the server rejects the
+// request because large-file uploads must send tags in the multipart complete
+// request instead of X-Dat9-Tag headers. Callers that need tag-aware uploads
+// for large files should use WriteStreamWithSummaryAndTags or
+// ResumeUploadWithSummaryAndTags.
 //
 // expectedRevision semantics:
 // - negative: unconditional write

@@ -439,8 +439,9 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 		}
 	case http.MethodPut:
 		s.handleWrite(w, r, path)
-	// - HEAD (s.handleStat): lightweight attrs in headers (size/isdir/revision/mtime)
 	case http.MethodHead:
+		// HEAD (s.handleStat) serves the lightweight header-based stat contract
+		// (size/isdir/revision/mtime).
 		s.handleStat(w, r, path)
 	case http.MethodDelete:
 		s.handleDelete(w, r, path)
