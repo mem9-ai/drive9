@@ -502,3 +502,54 @@ func TestVaultMountReadOffsetOverflowSafe(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// readDirCommon must apply the same uint64-overflow hardening as Read: a
+// ReadDir/ReadDirPlus call with input.Offset = ^uint64(0) used to narrow to
+// int(-1) and panic with "index out of range [-1]". Validate in uint64 space
+// before narrowing; any past-end offset returns an empty page.
+// ---------------------------------------------------------------------------
+
+func TestVaultMountReadDirOffsetOverflowSafe(t *testing.T) {
+	vfs, fv, cleanup := newTestVaultFS(t, 5*time.Second)
+	defer cleanup()
+	fv.setSecrets([]string{"alpha", "beta"})
+	fv.setField("alpha", "f1", "x")
+	fv.setField("alpha", "f2", "y")
+
+	// Exercise both root (listSecrets path) and secret-directory (readSecret
+	// path). Each must survive a hostile Offset without panicking.
+	alphaIno, st := lookupRoot(t, vfs, "alpha")
+	if !st.Ok() {
+		t.Fatalf("lookup alpha status = %v, want OK", st)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		nodeID uint64
+	}{
+		{"root", 1},
+		{"secret-dir", alphaIno},
+	} {
+		for _, offset := range []uint64{
+			^uint64(0),      // math.MaxUint64
+			^uint64(0) - 10, // near-max
+			uint64(1) << 63, // math.MaxInt64+1 (first int64 overflow)
+		} {
+			readIn := &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: tc.nodeID}, Offset: offset, Size: 4096}
+			// 4 KiB backing buffer matches what the kernel hands us for a
+			// normal directory read.
+			buf := make([]byte, 4096)
+			out := gofuse.NewDirEntryList(buf, offset)
+			// Both ReadDir and ReadDirPlus go through readDirCommon; smoke
+			// both so a future divergence can't hide a regression.
+			if st := vfs.ReadDir(nil, readIn, out); !st.Ok() {
+				t.Fatalf("%s ReadDir(offset=%#x) status = %v, want OK (must not panic)", tc.name, offset, st)
+			}
+			out2 := gofuse.NewDirEntryList(make([]byte, 4096), offset)
+			if st := vfs.ReadDirPlus(nil, readIn, out2); !st.Ok() {
+				t.Fatalf("%s ReadDirPlus(offset=%#x) status = %v, want OK (must not panic)", tc.name, offset, st)
+			}
+		}
+	}
+}

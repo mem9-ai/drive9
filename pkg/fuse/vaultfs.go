@@ -358,6 +358,13 @@ func (fs *VaultFS) readDirCommon(cancel <-chan struct{}, input *gofuse.ReadIn, o
 	// could see entries skipped or duplicated across successive Offsets.
 	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
 
+	// input.Offset is uint64 and can exceed math.MaxInt64; narrowing via
+	// int(input.Offset) on 64-bit turns ^uint64(0) into -1, which then
+	// indexes entries[-1] and panics. Treat any past-end offset (including
+	// overflow cases) as an empty page, consistent with the Read hardening.
+	if input.Offset >= uint64(len(entries)) {
+		return gofuse.OK
+	}
 	for i := int(input.Offset); i < len(entries); i++ {
 		e := entries[i]
 		de := gofuse.DirEntry{Name: e.name, Ino: e.ino, Mode: e.mode}
