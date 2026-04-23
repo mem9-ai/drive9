@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -479,6 +480,60 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 	return db.Exec(`UPDATE files SET content_text = ?
 		WHERE file_id = ? AND status = 'CONFIRMED'`,
 		nullStr(contentText), fileID)
+}
+
+// ReplaceFileTagsTx replaces all tags for fileID inside an existing transaction.
+//
+// Callers should only invoke this when they intend to replace the tag set for
+// the current write revision. Passing an empty map clears all existing tags.
+// Callers that intend to preserve the current tag set must skip this call.
+func (s *Store) ReplaceFileTagsTx(db execer, fileID string, tags map[string]string) error {
+	if _, err := db.Exec(`DELETE FROM file_tags WHERE file_id = ?`, fileID); err != nil {
+		return err
+	}
+	if len(tags) == 0 {
+		return nil
+	}
+
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		if _, err := db.Exec(`INSERT INTO file_tags (file_id, tag_key, tag_value) VALUES (?, ?, ?)`, fileID, k, tags[k]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// GetFileTags returns all tags for fileID.
+func (s *Store) GetFileTags(ctx context.Context, fileID string) (out map[string]string, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "get_file_tags", start, &err)
+
+	rows, err := s.db.QueryContext(ctx, `SELECT tag_key, tag_value FROM file_tags WHERE file_id = ? ORDER BY tag_key`, fileID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	tags := make(map[string]string)
+	for rows.Next() {
+		var k string
+		var v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		tags[k] = v
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out = tags
+	return out, nil
 }
 
 func (s *Store) ConfirmFile(ctx context.Context, fileID string) (err error) {

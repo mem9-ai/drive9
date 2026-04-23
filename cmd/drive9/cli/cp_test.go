@@ -387,3 +387,112 @@ func TestCpAppendRejectsStdinSource(t *testing.T) {
 		t.Fatalf("error = %q, want stdin append rejection", err)
 	}
 }
+
+func TestCpAppendRejectsTags(t *testing.T) {
+	localPath := filepath.Join(t.TempDir(), "append.txt")
+	if err := os.WriteFile(localPath, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("WriteFile(local): %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("server should not be called, got %s %s", r.Method, r.URL.String())
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	err := Cp(c, []string{"--append", "--tag", "owner=alice", localPath, ":/dst.txt"})
+	if err == nil {
+		t.Fatal("expected error for append with tags")
+	}
+	if !strings.Contains(err.Error(), "--append and --tag cannot be used together") {
+		t.Fatalf("error = %q, want append/tag rejection", err)
+	}
+}
+
+func TestCpUploadWithTagsSendsHeaders(t *testing.T) {
+	localPath := filepath.Join(t.TempDir(), "upload.txt")
+	if err := os.WriteFile(localPath, []byte("hello tags"), 0o644); err != nil {
+		t.Fatalf("WriteFile(local): %v", err)
+	}
+
+	var gotTagHeaders []string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "PUT /v1/fs/tagged.txt":
+			gotTagHeaders = append([]string(nil), r.Header.Values("X-Dat9-Tag")...)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			gotBody = append([]byte(nil), body...)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	err := Cp(c, []string{"--tag", "topic=cat", "--tag=owner=alice", localPath, ":/tagged.txt"})
+	if err != nil {
+		t.Fatalf("Cp(upload with tags): %v", err)
+	}
+	if got := string(gotBody); got != "hello tags" {
+		t.Fatalf("uploaded body = %q, want %q", got, "hello tags")
+	}
+	if len(gotTagHeaders) != 2 {
+		t.Fatalf("X-Dat9-Tag header count = %d, want 2 (%v)", len(gotTagHeaders), gotTagHeaders)
+	}
+	// Client sorts tag keys before setting repeated headers for deterministic requests.
+	if gotTagHeaders[0] != "owner=alice" || gotTagHeaders[1] != "topic=cat" {
+		t.Fatalf("X-Dat9-Tag headers = %v, want [owner=alice topic=cat]", gotTagHeaders)
+	}
+}
+
+func TestCpRejectsTagForDownloadDirection(t *testing.T) {
+	localPath := filepath.Join(t.TempDir(), "out.txt")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("server should not be called, got %s %s", r.Method, r.URL.String())
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	err := Cp(c, []string{"--tag", "owner=alice", ":/src.txt", localPath})
+	if err == nil {
+		t.Fatal("expected direction validation error")
+	}
+	if !strings.Contains(err.Error(), "--tag is only supported for uploads (local/stdin -> remote)") {
+		t.Fatalf("error = %q, want tag direction rejection", err)
+	}
+}
+
+func TestParseAndMergeTagValidation(t *testing.T) {
+	tags, err := parseAndMergeTag(nil, "owner=alice")
+	if err != nil {
+		t.Fatalf("parseAndMergeTag(owner=alice): %v", err)
+	}
+	if got := tags["owner"]; got != "alice" {
+		t.Fatalf("owner tag = %q, want %q", got, "alice")
+	}
+
+	if _, err := parseAndMergeTag(tags, "owner=bob"); err == nil || !strings.Contains(err.Error(), `duplicate --tag key "owner"`) {
+		t.Fatalf("duplicate key error = %v, want duplicate rejection", err)
+	}
+	if _, err := parseAndMergeTag(tags, "invalid"); err == nil || !strings.Contains(err.Error(), `invalid --tag "invalid" (expected key=value)`) {
+		t.Fatalf("invalid format error = %v, want key=value rejection", err)
+	}
+	if _, err := parseAndMergeTag(tags, "=alice"); err == nil || !strings.Contains(err.Error(), `invalid --tag "=alice" (empty key)`) {
+		t.Fatalf("empty key error = %v, want empty key rejection", err)
+	}
+	if _, err := parseAndMergeTag(tags, " owner =alice"); err == nil || !strings.Contains(err.Error(), "leading or trailing whitespace") {
+		t.Fatalf("whitespace key error = %v, want whitespace rejection", err)
+	}
+	if _, err := parseAndMergeTag(tags, "owner=alice "); err == nil || !strings.Contains(err.Error(), "leading or trailing whitespace") {
+		t.Fatalf("whitespace value error = %v, want whitespace rejection", err)
+	}
+	if _, err := parseAndMergeTag(tags, strings.Repeat("k", 256)+"=alice"); err == nil || !strings.Contains(err.Error(), "key exceeds 255 characters") {
+		t.Fatalf("long key error = %v, want max length rejection", err)
+	}
+}

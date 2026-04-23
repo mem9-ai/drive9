@@ -196,6 +196,46 @@ func TestWriteStreamWithSummarySmallFile(t *testing.T) {
 	}
 }
 
+func TestWriteStreamWithSummaryAndTagsSmallFileSetsTagHeaders(t *testing.T) {
+	var gotTagHeaders []string
+	var gotBody []byte
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/v1/fs/tagged-small.txt" {
+			http.NotFound(w, r)
+			return
+		}
+		gotTagHeaders = append([]string(nil), r.Header.Values("X-Dat9-Tag")...)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		gotBody = append([]byte(nil), body...)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	data := []byte("hello")
+	_, err := c.WriteStreamWithSummaryAndTags(context.Background(), "/tagged-small.txt", bytes.NewReader(data), int64(len(data)), nil, map[string]string{
+		"topic": "cat",
+		"owner": "alice",
+	})
+	if err != nil {
+		t.Fatalf("WriteStreamWithSummaryAndTags: %v", err)
+	}
+	if got := string(gotBody); got != "hello" {
+		t.Fatalf("uploaded body = %q, want %q", got, "hello")
+	}
+	if len(gotTagHeaders) != 2 {
+		t.Fatalf("X-Dat9-Tag count = %d, want 2 (%v)", len(gotTagHeaders), gotTagHeaders)
+	}
+	if gotTagHeaders[0] != "owner=alice" || gotTagHeaders[1] != "topic=cat" {
+		t.Fatalf("X-Dat9-Tag = %v, want [owner=alice topic=cat]", gotTagHeaders)
+	}
+}
+
 // TestWriteStreamLargeFile verifies the 202 + multipart upload flow.
 func TestWriteStreamLargeFile(t *testing.T) {
 	var mu sync.Mutex
@@ -287,6 +327,158 @@ func TestWriteStreamLargeFile(t *testing.T) {
 	}
 	if len(progressCalls) != 2 {
 		t.Errorf("progress called %d times, want 2", len(progressCalls))
+	}
+}
+
+func TestWriteStreamWithSummaryAndTagsLegacyCompleteCarriesTags(t *testing.T) {
+	var completeContentType string
+	var completeReq struct {
+		Tags map[string]string `json:"tags"`
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			http.NotFound(w, r)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(UploadPlan{
+				UploadID: "legacy-tags",
+				PartSize: 8,
+				Parts: []PartURL{
+					{Number: 1, URL: fmt.Sprintf("http://%s/legacy-tags/part/1", r.Host), Size: 8},
+				},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/legacy-tags/part/1":
+			w.Header().Set("ETag", `"etag-legacy-1"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/legacy-tags/complete":
+			completeContentType = r.Header.Get("Content-Type")
+			if err := json.NewDecoder(r.Body).Decode(&completeReq); err != nil {
+				http.Error(w, "bad complete json", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	_, err := c.WriteStreamWithSummaryAndTags(
+		context.Background(),
+		"/legacy-tags.bin",
+		bytes.NewReader([]byte("12345678")),
+		8,
+		nil,
+		map[string]string{"topic": "cat", "owner": "alice"},
+	)
+	if err != nil {
+		t.Fatalf("WriteStreamWithSummaryAndTags: %v", err)
+	}
+	if completeContentType != "application/json" {
+		t.Fatalf("complete Content-Type = %q, want application/json", completeContentType)
+	}
+	if completeReq.Tags["owner"] != "alice" || completeReq.Tags["topic"] != "cat" || len(completeReq.Tags) != 2 {
+		t.Fatalf("complete tags = %+v, want owner/topic", completeReq.Tags)
+	}
+}
+
+func TestWriteStreamWithSummaryAndTagsLegacyCompleteClearsTagsWithEmptyMap(t *testing.T) {
+	var completeContentType string
+	var completeReq struct {
+		Tags map[string]string `json:"tags"`
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			http.NotFound(w, r)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(UploadPlan{
+				UploadID: "legacy-clear-tags",
+				PartSize: 8,
+				Parts: []PartURL{{
+					Number: 1,
+					URL:    fmt.Sprintf("http://%s/legacy-clear-tags/part/1", r.Host),
+					Size:   8,
+				}},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/legacy-clear-tags/part/1":
+			w.Header().Set("ETag", `"etag-legacy-clear-1"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/legacy-clear-tags/complete":
+			completeContentType = r.Header.Get("Content-Type")
+			if err := json.NewDecoder(r.Body).Decode(&completeReq); err != nil {
+				http.Error(w, "bad complete json", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	_, err := c.WriteStreamWithSummaryAndTags(
+		context.Background(),
+		"/legacy-clear-tags.bin",
+		bytes.NewReader([]byte("12345678")),
+		8,
+		nil,
+		map[string]string{},
+	)
+	if err != nil {
+		t.Fatalf("WriteStreamWithSummaryAndTags: %v", err)
+	}
+	if completeContentType != "application/json" {
+		t.Fatalf("complete Content-Type = %q, want application/json", completeContentType)
+	}
+	if completeReq.Tags == nil {
+		t.Fatal("complete tags = nil, want explicit empty map")
+	}
+	if len(completeReq.Tags) != 0 {
+		t.Fatalf("complete tags = %+v, want explicit empty map", completeReq.Tags)
+	}
+}
+
+func TestWriteStreamV1WithSummaryRejectsInvalidTagsBeforeInitiate(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	err := c.writeStreamV1WithSummary(
+		context.Background(),
+		"/legacy-invalid-tags.bin",
+		bytes.NewReader([]byte("12345678")),
+		8,
+		nil,
+		-1,
+		&UploadSummary{},
+		map[string]string{"owner": string([]byte{0xff})},
+	)
+	if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
+		t.Fatalf("error = %v, want invalid UTF-8", err)
+	}
+	if requests != 0 {
+		t.Fatalf("request count = %d, want 0", requests)
 	}
 }
 
@@ -395,6 +587,217 @@ func TestWriteStreamV2SinglePart(t *testing.T) {
 	if len(completeReq.Parts) != 1 || completeReq.Parts[0] != (completePart{Number: 1, ETag: `"etag-v2-1"`}) {
 		t.Fatalf("complete payload = %+v, want one part with etag", completeReq.Parts)
 	}
+}
+
+func TestWriteStreamWithSummaryAndTagsV2CompleteCarriesTags(t *testing.T) {
+	var completeReq struct {
+		Parts []completePart    `json:"parts"`
+		Tags  map[string]string `json:"tags"`
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(uploadPlanV2{
+				UploadID:   "v2-tags",
+				PartSize:   8,
+				TotalParts: 1,
+				ChecksumContract: checksumContract{
+					Supported: []string{"SHA-256"},
+				},
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-tags/presign-batch":
+			_ = json.NewEncoder(w).Encode(struct {
+				Parts []presignedPart `json:"parts"`
+			}{
+				Parts: []presignedPart{{
+					Number:    1,
+					URL:       fmt.Sprintf("http://%s/v2-tags/part/1", r.Host),
+					Size:      8,
+					ExpiresAt: time.Now().Add(time.Minute),
+				}},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/v2-tags/part/1":
+			w.Header().Set("ETag", `"etag-v2-tags-1"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-tags/complete":
+			if err := json.NewDecoder(r.Body).Decode(&completeReq); err != nil {
+				http.Error(w, "bad complete json", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	_, err := c.WriteStreamWithSummaryAndTags(
+		context.Background(),
+		"/v2-tags.bin",
+		bytes.NewReader([]byte("abcdefgh")),
+		8,
+		nil,
+		map[string]string{"topic": "cat", "owner": "alice"},
+	)
+	if err != nil {
+		t.Fatalf("WriteStreamWithSummaryAndTags: %v", err)
+	}
+	if len(completeReq.Parts) != 1 || completeReq.Parts[0].Number != 1 {
+		t.Fatalf("complete parts = %+v, want one part", completeReq.Parts)
+	}
+	if completeReq.Tags["owner"] != "alice" || completeReq.Tags["topic"] != "cat" || len(completeReq.Tags) != 2 {
+		t.Fatalf("complete tags = %+v, want owner/topic", completeReq.Tags)
+	}
+}
+
+func TestWriteStreamWithSummaryAndTagsV2CompleteClearsTagsWithEmptyMap(t *testing.T) {
+	var completeReq struct {
+		Parts []completePart    `json:"parts"`
+		Tags  map[string]string `json:"tags"`
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(uploadPlanV2{
+				UploadID:         "v2-clear-tags",
+				PartSize:         8,
+				TotalParts:       1,
+				ChecksumContract: checksumContract{Supported: []string{"SHA-256"}},
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-clear-tags/presign-batch":
+			_ = json.NewEncoder(w).Encode(struct {
+				Parts []presignedPart `json:"parts"`
+			}{
+				Parts: []presignedPart{{
+					Number:    1,
+					URL:       fmt.Sprintf("http://%s/v2-clear-tags/part/1", r.Host),
+					Size:      8,
+					ExpiresAt: time.Now().Add(time.Minute),
+				}},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/v2-clear-tags/part/1":
+			w.Header().Set("ETag", `"etag-v2-clear-tags-1"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-clear-tags/complete":
+			if err := json.NewDecoder(r.Body).Decode(&completeReq); err != nil {
+				http.Error(w, "bad complete json", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	_, err := c.WriteStreamWithSummaryAndTags(
+		context.Background(),
+		"/v2-clear-tags.bin",
+		bytes.NewReader([]byte("abcdefgh")),
+		8,
+		nil,
+		map[string]string{},
+	)
+	if err != nil {
+		t.Fatalf("WriteStreamWithSummaryAndTags: %v", err)
+	}
+	if len(completeReq.Parts) != 1 || completeReq.Parts[0].Number != 1 {
+		t.Fatalf("complete parts = %+v, want one part", completeReq.Parts)
+	}
+	if completeReq.Tags == nil {
+		t.Fatal("complete tags = nil, want explicit empty map")
+	}
+	if len(completeReq.Tags) != 0 {
+		t.Fatalf("complete tags = %+v, want explicit empty map", completeReq.Tags)
+	}
+}
+
+func TestWriteStreamV2WithSummaryRejectsInvalidTagsBeforeInitiate(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	err := c.writeStreamV2WithSummary(
+		context.Background(),
+		"/v2-invalid-tags.bin",
+		bytes.NewReader([]byte("abcdefgh")),
+		8,
+		nil,
+		-1,
+		&UploadSummary{},
+		map[string]string{"owner": string([]byte{0xff})},
+	)
+	if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
+		t.Fatalf("error = %v, want invalid UTF-8", err)
+	}
+	if requests != 0 {
+		t.Fatalf("request count = %d, want 0", requests)
+	}
+}
+
+func TestCompleteUploadHelpersRejectInvalidTagsBeforeRequest(t *testing.T) {
+	t.Run("v1", func(t *testing.T) {
+		requests := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			http.NotFound(w, r)
+		}))
+		defer srv.Close()
+
+		c := New(srv.URL, "")
+		err := c.completeUploadWithTags(context.Background(), "legacy-invalid-tags", map[string]string{
+			"owner": string([]byte{0xff}),
+		})
+		if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
+			t.Fatalf("error = %v, want invalid UTF-8", err)
+		}
+		if requests != 0 {
+			t.Fatalf("request count = %d, want 0", requests)
+		}
+	})
+
+	t.Run("v2", func(t *testing.T) {
+		requests := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			http.NotFound(w, r)
+		}))
+		defer srv.Close()
+
+		c := New(srv.URL, "")
+		err := c.completeUploadV2(context.Background(), "v2-invalid-tags", []completePart{{
+			Number: 1,
+			ETag:   `"etag-1"`,
+		}}, map[string]string{
+			"owner": string([]byte{0xff}),
+		})
+		if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
+			t.Fatalf("error = %v, want invalid UTF-8", err)
+		}
+		if requests != 0 {
+			t.Fatalf("request count = %d, want 0", requests)
+		}
+	})
 }
 
 func TestWriteStreamV2MultiPartUsesPlanPartSize(t *testing.T) {
@@ -1315,6 +1718,150 @@ func TestResumeUpload(t *testing.T) {
 	}
 	if progressCalls[0] != [2]int{2, 3} {
 		t.Fatalf("progress = %v, want [[2 3]]", progressCalls)
+	}
+}
+
+func TestResumeUploadWithSummaryAndTagsSendsTagsOnComplete(t *testing.T) {
+	var completeReq struct {
+		Tags map[string]string `json:"tags"`
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/uploads":
+			_ = json.NewEncoder(w).Encode(struct {
+				Uploads []UploadMeta `json:"uploads"`
+			}{
+				Uploads: []UploadMeta{{
+					UploadID:   "resume-tags",
+					PartsTotal: 2,
+					Status:     "UPLOADING",
+				}},
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-tags/resume":
+			_ = json.NewEncoder(w).Encode(UploadPlan{
+				UploadID: "resume-tags",
+				PartSize: 4,
+				Parts: []PartURL{
+					{Number: 2, URL: fmt.Sprintf("http://%s/resume-tags/part/2", r.Host), Size: 4},
+				},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/resume-tags/part/2":
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-tags/complete":
+			if err := json.NewDecoder(r.Body).Decode(&completeReq); err != nil {
+				http.Error(w, "bad complete json", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	_, err := c.ResumeUploadWithSummaryAndTags(
+		context.Background(),
+		"/resume-tags.bin",
+		bytes.NewReader([]byte("aaaabbbb")),
+		8,
+		nil,
+		map[string]string{"owner": "alice", "topic": "cat"},
+	)
+	if err != nil {
+		t.Fatalf("ResumeUploadWithSummaryAndTags: %v", err)
+	}
+	if completeReq.Tags["owner"] != "alice" || completeReq.Tags["topic"] != "cat" || len(completeReq.Tags) != 2 {
+		t.Fatalf("complete tags = %+v, want owner/topic", completeReq.Tags)
+	}
+}
+
+func TestResumeUploadWithSummaryAndTagsClearsTagsWithEmptyMap(t *testing.T) {
+	var completeReq struct {
+		Tags map[string]string `json:"tags"`
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/uploads":
+			_ = json.NewEncoder(w).Encode(struct {
+				Uploads []UploadMeta `json:"uploads"`
+			}{Uploads: []UploadMeta{{UploadID: "resume-clear-tags", PartsTotal: 2, Status: "UPLOADING"}}})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-clear-tags/resume":
+			_ = json.NewEncoder(w).Encode(UploadPlan{
+				UploadID: "resume-clear-tags",
+				PartSize: 4,
+				Parts: []PartURL{{
+					Number: 2,
+					URL:    fmt.Sprintf("http://%s/resume-clear-tags/part/2", r.Host),
+					Size:   4,
+				}},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/resume-clear-tags/part/2":
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/resume-clear-tags/complete":
+			if err := json.NewDecoder(r.Body).Decode(&completeReq); err != nil {
+				http.Error(w, "bad complete json", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	_, err := c.ResumeUploadWithSummaryAndTags(
+		context.Background(),
+		"/resume-clear-tags.bin",
+		bytes.NewReader([]byte("aaaabbbb")),
+		8,
+		nil,
+		map[string]string{},
+	)
+	if err != nil {
+		t.Fatalf("ResumeUploadWithSummaryAndTags: %v", err)
+	}
+	if completeReq.Tags == nil {
+		t.Fatal("complete tags = nil, want explicit empty map")
+	}
+	if len(completeReq.Tags) != 0 {
+		t.Fatalf("complete tags = %+v, want explicit empty map", completeReq.Tags)
+	}
+}
+
+func TestResumeUploadWithSummaryAndTagsRejectsInvalidTagsBeforeRequests(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	_, err := c.ResumeUploadWithSummaryAndTags(
+		context.Background(),
+		"/resume-invalid-tags.bin",
+		bytes.NewReader([]byte("aaaabbbb")),
+		8,
+		nil,
+		map[string]string{"owner": string([]byte{0xff})},
+	)
+	if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
+		t.Fatalf("error = %v, want invalid UTF-8", err)
+	}
+	if requests != 0 {
+		t.Fatalf("request count = %d, want 0", requests)
 	}
 }
 

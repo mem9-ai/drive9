@@ -12,9 +12,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/tagutil"
 )
 
 // Client is the dat9 HTTP client.
@@ -164,6 +167,20 @@ type StatResult struct {
 	Mtime    time.Time
 }
 
+// StatMetadataResult represents enriched metadata from GET /v1/fs/{path}?stat=1.
+type StatMetadataResult struct {
+	Size         int64             `json:"size"`
+	IsDir        bool              `json:"isdir"`
+	Revision     int64             `json:"revision"`
+	Mtime        *int64            `json:"mtime,omitempty"` // Unix seconds when known
+	ContentType  string            `json:"content_type"`
+	SemanticText string            `json:"semantic_text"`
+	Tags         map[string]string `json:"tags"`
+	Degraded     bool              `json:"degraded,omitempty"`
+}
+
+var errStatMetadataCompatFallback = errors.New("stat metadata fallback to legacy HEAD")
+
 func (c *Client) url(path string) string {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
@@ -223,6 +240,23 @@ func (c *Client) WriteCtx(ctx context.Context, path string, data []byte) error {
 // - zero: path must not already exist
 // - positive: file must exist at exactly that revision
 func (c *Client) WriteCtxConditional(ctx context.Context, path string, data []byte, expectedRevision int64) error {
+	return c.WriteCtxConditionalWithTags(ctx, path, data, expectedRevision, nil)
+}
+
+// WriteCtxConditionalWithTags uploads data to a remote path with optional
+// compare-and-set semantics and optional file tags.
+// This method issues a single PUT request and is therefore intended for direct
+// write paths. When tags are provided for a large file, the server rejects the
+// request because large-file uploads must send tags in the multipart complete
+// request instead of X-Dat9-Tag headers. Callers that need tag-aware uploads
+// for large files should use WriteStreamWithSummaryAndTags or
+// ResumeUploadWithSummaryAndTags.
+//
+// expectedRevision semantics:
+// - negative: unconditional write
+// - zero: path must not already exist
+// - positive: file must exist at exactly that revision
+func (c *Client) WriteCtxConditionalWithTags(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -230,6 +264,9 @@ func (c *Client) WriteCtxConditional(ctx context.Context, path string, data []by
 	req.Header.Set("Content-Type", "application/octet-stream")
 	if expectedRevision >= 0 {
 		req.Header.Set("X-Dat9-Expected-Revision", strconv.FormatInt(expectedRevision, 10))
+	}
+	if err := setTagHeaders(req, tags); err != nil {
+		return err
 	}
 	resp, err := c.do(req)
 	if err != nil {
@@ -294,11 +331,18 @@ func (c *Client) ListCtx(ctx context.Context, path string) ([]FileInfo, error) {
 }
 
 // Stat returns metadata for a path.
+//
+// Stat is the lightweight metadata interface based on HEAD. It is intended for
+// callers that only need compact attributes (size/isdir/revision/mtime) and do
+// not need enriched fields such as content_type, semantic_text, and tags.
 func (c *Client) Stat(path string) (*StatResult, error) {
 	return c.StatCtx(context.Background(), path)
 }
 
 // StatCtx returns metadata for a path with context support.
+//
+// StatCtx is the context-aware form of the lightweight HEAD-based Stat
+// interface. Use StatMetadataCompatCtx when enriched metadata is required.
 func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.url(path), nil)
 	if err != nil {
@@ -308,12 +352,9 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 	if err != nil {
 		return nil, err
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode == 404 {
-		return nil, fmt.Errorf("not found: %s", path)
-	}
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, readError(resp)
 	}
 	s := &StatResult{
 		IsDir: resp.Header.Get("X-Dat9-IsDir") == "true",
@@ -330,6 +371,92 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 		}
 	}
 	return s, nil
+}
+
+// StatMetadata returns enriched metadata for a path, including mtime,
+// content_type, semantic_text, and tags.
+func (c *Client) StatMetadata(path string) (*StatMetadataResult, error) {
+	return c.StatMetadataCtx(context.Background(), path)
+}
+
+// StatMetadataCtx returns enriched metadata for a path with context support.
+func (c *Client) StatMetadataCtx(ctx context.Context, path string) (*StatMetadataResult, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path)+"?stat=1", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+	if !strings.HasPrefix(contentType, "application/json") {
+		return nil, fmt.Errorf("%w: unexpected Content-Type %q", errStatMetadataCompatFallback, resp.Header.Get("Content-Type"))
+	}
+	// Intentionally do not require X-Dat9-Mtime here yet. The stat-specific
+	// marker check will become useful once the server rollout is complete, and
+	// for now we only gate the compat fallback on obvious non-JSON responses.
+	var out StatMetadataResult
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode stat metadata: %w", err)
+	}
+	if out.Tags == nil {
+		out.Tags = map[string]string{}
+	}
+	return &out, nil
+}
+
+// StatMetadataCompat returns enriched metadata for a path and transparently
+// falls back to legacy HEAD stat when the server does not support ?stat=1.
+func (c *Client) StatMetadataCompat(path string) (*StatMetadataResult, error) {
+	return c.StatMetadataCompatCtx(context.Background(), path)
+}
+
+// StatMetadataCompatCtx returns enriched metadata for a path with context
+// support, and falls back to HEAD stat when ?stat=1 is unsupported by older
+// servers.
+func (c *Client) StatMetadataCompatCtx(ctx context.Context, path string) (*StatMetadataResult, error) {
+	out, err := c.StatMetadataCtx(ctx, path)
+	if err == nil {
+		return out, nil
+	}
+	if !shouldFallbackStatMetadata(err) {
+		return nil, err
+	}
+	statOut, statErr := c.StatCtx(ctx, path)
+	if statErr != nil {
+		return nil, statErr
+	}
+	var mtime *int64
+	if !statOut.Mtime.IsZero() {
+		unix := statOut.Mtime.Unix()
+		mtime = &unix
+	}
+	return &StatMetadataResult{
+		Size:         statOut.Size,
+		IsDir:        statOut.IsDir,
+		Revision:     statOut.Revision,
+		Mtime:        mtime,
+		ContentType:  "",
+		SemanticText: "",
+		Tags:         map[string]string{},
+		Degraded:     true,
+	}, nil
+}
+
+func shouldFallbackStatMetadata(err error) bool {
+	var statusErr *StatusError
+	if errors.As(err, &statusErr) {
+		switch statusErr.StatusCode {
+		case http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+			return true
+		}
+	}
+	return errors.Is(err, errStatMetadataCompatFallback)
 }
 
 // Delete removes a file or directory.
@@ -529,4 +656,39 @@ func (c *Client) Find(pathPrefix string, params url.Values) ([]SearchResult, err
 		return nil, err
 	}
 	return results, nil
+}
+
+// validateTags applies the same client-side validation across direct PUT,
+// multipart upload, and resume flows. Multipart tags are still sent only in
+// the final complete request, but validating up front avoids uploading parts
+// before discovering an invalid tag and prevents json.Marshal from silently
+// replacing invalid UTF-8 in complete payloads.
+func validateTags(tags map[string]string) error {
+	if len(tags) == 0 {
+		return nil
+	}
+	for k := range tags {
+		if err := tagutil.ValidateEntry(k, tags[k]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func setTagHeaders(req *http.Request, tags map[string]string) error {
+	if len(tags) == 0 {
+		return nil
+	}
+	if err := validateTags(tags); err != nil {
+		return err
+	}
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		req.Header.Add("X-Dat9-Tag", k+"="+tags[k])
+	}
+	return nil
 }

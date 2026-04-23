@@ -10,10 +10,10 @@ import (
 
 // Ls lists directory contents.
 //
-//	drive9 ls           list /
-//	drive9 ls /path/    list /path/
-//	drive9 ls -l /path  long format with size
-//	drive9 ls :/path    list using remote path prefix
+//	drive9 fs ls           list /
+//	drive9 fs ls /path/    list /path/
+//	drive9 fs ls -l /path  long format with size
+//	drive9 fs ls :/path    list using remote path prefix
 func Ls(c *client.Client, args []string) error {
 	long := false
 	path := "/"

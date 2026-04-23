@@ -244,19 +244,37 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 	return err
 }
 
+// WriteStreamWithTags uploads data from a reader and applies tags to the
+// resulting file revision.
+func (c *Client) WriteStreamWithTags(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, tags map[string]string) error {
+	_, err := c.WriteStreamWithSummaryAndTags(ctx, path, r, size, progress, tags)
+	return err
+}
+
 // WriteStreamWithSummary uploads data from a reader and returns coarse-grained
 // phase timings for the completed upload.
 func (c *Client) WriteStreamWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc) (*UploadSummary, error) {
-	return c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, -1)
+	return c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, -1, nil)
+}
+
+// WriteStreamWithSummaryAndTags uploads data from a reader, applies tags to
+// the resulting file revision, and returns coarse-grained phase timings.
+func (c *Client) WriteStreamWithSummaryAndTags(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, tags map[string]string) (*UploadSummary, error) {
+	return c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, -1, tags)
 }
 
 // WriteStreamConditional uploads data from a reader with optional CAS semantics.
 func (c *Client) WriteStreamConditional(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64) error {
-	_, err := c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, expectedRevision)
+	_, err := c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, expectedRevision, nil)
 	return err
 }
 
-func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64) (*UploadSummary, error) {
+func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, tags map[string]string) (*UploadSummary, error) {
+	// Large uploads only send tags on complete, but validation must happen
+	// before any initiate/presign/upload work so invalid tags fail early.
+	if err := validateTags(tags); err != nil {
+		return nil, err
+	}
 	threshold := int64(DefaultSmallFileThreshold)
 	if c.smallFileThreshold > 0 {
 		threshold = c.smallFileThreshold
@@ -279,7 +297,7 @@ func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path str
 		if err != nil {
 			return nil, fmt.Errorf("read data: %w", err)
 		}
-		if err := c.WriteCtxConditional(ctx, path, data, expectedRevision); err != nil {
+		if err := c.WriteCtxConditionalWithTags(ctx, path, data, expectedRevision, tags); err != nil {
 			return nil, err
 		}
 		summary.DirectWriteSeconds = time.Since(directWriteStart).Seconds()
@@ -291,10 +309,10 @@ func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path str
 	}
 
 	// Try v2 protocol first (on-demand presign, no checksum pre-computation).
-	err := c.writeStreamV2WithSummary(ctx, path, ra, size, progress, expectedRevision, summary)
+	err := c.writeStreamV2WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, tags)
 	if err == errV2NotAvailable {
 		// Server doesn't support v2 — fall back to v1.
-		if err := c.writeStreamV1WithSummary(ctx, path, ra, size, progress, expectedRevision, summary); err != nil {
+		if err := c.writeStreamV1WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, tags); err != nil {
 			return nil, err
 		}
 		return finishUploadSummary(summary), nil
@@ -318,7 +336,10 @@ func finishUploadSummary(summary *UploadSummary) *UploadSummary {
 	return summary
 }
 
-func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary) error {
+func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string) error {
+	if err := validateTags(tags); err != nil {
+		return err
+	}
 	if summary != nil {
 		summary.Mode = "multipart_v1"
 	}
@@ -361,7 +382,7 @@ func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra i
 	}
 
 	completeStart := time.Now()
-	if err := c.completeUpload(ctx, plan.UploadID); err != nil {
+	if err := c.completeUploadWithTags(ctx, plan.UploadID, tags); err != nil {
 		return err
 	}
 	if summary != nil {
@@ -370,7 +391,10 @@ func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra i
 	return nil
 }
 
-func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary) error {
+func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string) error {
+	if err := validateTags(tags); err != nil {
+		return err
+	}
 	initiateStart := time.Now()
 	plan, err := c.initiateUploadV2(ctx, path, size, expectedRevision)
 	if err != nil {
@@ -411,7 +435,7 @@ func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra i
 	}
 
 	completeStart := time.Now()
-	if err := c.completeUploadV2(ctx, plan.UploadID, parts); err != nil {
+	if err := c.completeUploadV2(ctx, plan.UploadID, parts, tags); err != nil {
 		// Complete failed (network error, 5xx, 409, 410) — best-effort abort
 		// to avoid leaving orphaned multipart uploads / upload rows.
 		_ = c.abortUploadV2(context.Background(), plan.UploadID)
@@ -653,10 +677,34 @@ func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (
 // completeUpload notifies the server that all parts are uploaded.
 // No body needed — server rebuilds the part list via S3 ListParts.
 func (c *Client) completeUpload(ctx context.Context, uploadID string) error {
+	return c.completeUploadWithTags(ctx, uploadID, nil)
+}
+
+// completeUploadWithTags notifies the server that all parts are uploaded and,
+// when tags is non-nil, includes a replacement tag set in the complete payload.
+// Passing nil preserves any existing tags on the file; passing a non-nil empty
+// map requests clearing all existing tags.
+func (c *Client) completeUploadWithTags(ctx context.Context, uploadID string, tags map[string]string) error {
+	var body io.Reader
+	if tags != nil {
+		if err := validateTags(tags); err != nil {
+			return err
+		}
+		payload, err := json.Marshal(struct {
+			Tags map[string]string `json:"tags"`
+		}{Tags: tags})
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(payload)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+"/v1/uploads/"+uploadID+"/complete", nil)
+		c.baseURL+"/v1/uploads/"+uploadID+"/complete", body)
 	if err != nil {
 		return err
+	}
+	if tags != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 
 	resp, err := c.do(req)
@@ -972,11 +1020,16 @@ func (c *Client) presignOnePart(ctx context.Context, uploadID string, partNumber
 	return &p, nil
 }
 
-// completeUploadV2 sends the part list to POST /v2/uploads/{id}/complete.
-func (c *Client) completeUploadV2(ctx context.Context, uploadID string, parts []completePart) error {
+// completeUploadV2 sends the part list (and optional tags) to
+// POST /v2/uploads/{id}/complete.
+func (c *Client) completeUploadV2(ctx context.Context, uploadID string, parts []completePart, tags map[string]string) error {
+	if err := validateTags(tags); err != nil {
+		return err
+	}
 	body, err := json.Marshal(struct {
-		Parts []completePart `json:"parts"`
-	}{Parts: parts})
+		Parts []completePart    `json:"parts"`
+		Tags  map[string]string `json:"tags"`
+	}{Parts: parts, Tags: tags})
 	if err != nil {
 		return err
 	}
@@ -1386,9 +1439,28 @@ func (c *Client) ResumeUpload(ctx context.Context, path string, r io.ReaderAt, t
 	return err
 }
 
+// ResumeUploadWithTags resumes an incomplete upload and applies tags to the
+// resulting revision when completion succeeds.
+func (c *Client) ResumeUploadWithTags(ctx context.Context, path string, r io.ReaderAt, totalSize int64, progress ProgressFunc, tags map[string]string) error {
+	_, err := c.ResumeUploadWithSummaryAndTags(ctx, path, r, totalSize, progress, tags)
+	return err
+}
+
 // ResumeUploadWithSummary resumes an incomplete upload and returns coarse-grained
 // phase timings for the completed resume flow.
 func (c *Client) ResumeUploadWithSummary(ctx context.Context, path string, r io.ReaderAt, totalSize int64, progress ProgressFunc) (*UploadSummary, error) {
+	return c.ResumeUploadWithSummaryAndTags(ctx, path, r, totalSize, progress, nil)
+}
+
+// ResumeUploadWithSummaryAndTags resumes an incomplete upload, applies tags to
+// the resulting revision on completion, and returns coarse-grained phase
+// timings for the completed resume flow.
+func (c *Client) ResumeUploadWithSummaryAndTags(ctx context.Context, path string, r io.ReaderAt, totalSize int64, progress ProgressFunc, tags map[string]string) (*UploadSummary, error) {
+	// Resume also applies tags only during complete, so validate here before we
+	// query/resume/upload additional parts.
+	if err := validateTags(tags); err != nil {
+		return nil, err
+	}
 	summary := &UploadSummary{
 		Type:       "upload_summary",
 		Mode:       "resume_v1",
@@ -1427,7 +1499,7 @@ func (c *Client) ResumeUploadWithSummary(ctx context.Context, path string, r io.
 	if len(plan.Parts) == 0 {
 		// All parts uploaded, just complete
 		completeStart := time.Now()
-		if err := c.completeUpload(ctx, plan.UploadID); err != nil {
+		if err := c.completeUploadWithTags(ctx, plan.UploadID, tags); err != nil {
 			return nil, err
 		}
 		summary.CompleteSeconds = time.Since(completeStart).Seconds()
@@ -1443,7 +1515,7 @@ func (c *Client) ResumeUploadWithSummary(ctx context.Context, path string, r io.
 
 	// Step 4: Complete
 	completeStart := time.Now()
-	if err := c.completeUpload(ctx, plan.UploadID); err != nil {
+	if err := c.completeUploadWithTags(ctx, plan.UploadID, tags); err != nil {
 		return nil, err
 	}
 	summary.CompleteSeconds = time.Since(completeStart).Seconds()

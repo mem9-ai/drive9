@@ -242,6 +242,67 @@ func TestUpdateFileSearchTextTxRollsBackWithOuterTransaction(t *testing.T) {
 	}
 }
 
+func TestReplaceFileTagsTxAndGetFileTags(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID:      "f-tags",
+		StorageType: StorageDB9,
+		StorageRef:  "inline",
+		Revision:    1,
+		Status:      StatusConfirmed,
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.ReplaceFileTagsTx(tx, "f-tags", map[string]string{
+			"owner": "alice",
+			"topic": "cat",
+		})
+	}); err != nil {
+		t.Fatalf("ReplaceFileTagsTx(initial): %v", err)
+	}
+
+	tags, err := s.GetFileTags(context.Background(), "f-tags")
+	if err != nil {
+		t.Fatalf("GetFileTags(initial): %v", err)
+	}
+	if tags["owner"] != "alice" || tags["topic"] != "cat" || len(tags) != 2 {
+		t.Fatalf("initial tags = %+v, want owner/topic", tags)
+	}
+
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.ReplaceFileTagsTx(tx, "f-tags", map[string]string{
+			"owner": "bob",
+		})
+	}); err != nil {
+		t.Fatalf("ReplaceFileTagsTx(replace): %v", err)
+	}
+	tags, err = s.GetFileTags(context.Background(), "f-tags")
+	if err != nil {
+		t.Fatalf("GetFileTags(replace): %v", err)
+	}
+	if tags["owner"] != "bob" || len(tags) != 1 {
+		t.Fatalf("replaced tags = %+v, want only owner=bob", tags)
+	}
+
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.ReplaceFileTagsTx(tx, "f-tags", map[string]string{})
+	}); err != nil {
+		t.Fatalf("ReplaceFileTagsTx(clear): %v", err)
+	}
+	tags, err = s.GetFileTags(context.Background(), "f-tags")
+	if err != nil {
+		t.Fatalf("GetFileTags(clear): %v", err)
+	}
+	if len(tags) != 0 {
+		t.Fatalf("cleared tags = %+v, want empty", tags)
+	}
+}
+
 func TestZeroCopyCp(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()

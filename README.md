@@ -28,8 +28,13 @@ Inspired by Plan 9's "everything is a file" and the idea that naming things is t
 # CLI
 drive9 fs cp ./data.tar :/data/data.tar
 drive9 fs cp --append ./tail.log :/logs/app.log
+drive9 fs cp --tag topic=pricing --tag owner=agent ./plan.md :/notes/plan.md
 drive9 fs cat :/config/app.json
 drive9 fs ls :/data/
+drive9 fs stat :/notes/plan.md           # text metadata output
+drive9 fs stat -o json :/notes/plan.md   # JSON metadata output
+drive9 fs find / -tag topic=pricing
+drive9 fs find /notes/ -tag owner=agent
 drive9 fs cp :/a.bin :/b.bin        # zero-copy
 drive9 fs mv :/old.bin :/new.bin    # metadata-only
 drive9 fs rm :/old.bin              # remove file
@@ -40,6 +45,19 @@ drive9 mount /mnt/drive9
 
 # Unmount
 drive9 umount /mnt/drive9
+```
+
+### Tag Filter Semantics
+
+`drive9 fs find -tag` uses exact matching, not fuzzy matching:
+
+- `-tag key=value` matches files where both `tag_key` and `tag_value` are equal.
+- `-tag key` matches files that contain that tag key (value ignored).
+- Prefix / contains / regex matching is not supported for `-tag`.
+
+```bash
+drive9 fs find / -tag topic=pricing   # exact key/value match
+drive9 fs find /notes/ -tag owner     # key-exists match
 ```
 
 ### FUSE prerequisites

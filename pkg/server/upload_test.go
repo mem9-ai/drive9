@@ -156,6 +156,66 @@ func TestLargeFilePut202(t *testing.T) {
 	}
 }
 
+func TestUploadCompleteRejectsInvalidJSONTags(t *testing.T) {
+	s, s3c := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	body := make([]byte, 1<<20)
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/bad-tags.bin", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("initiate upload: got %d, want 202: %s", resp.StatusCode, respBody)
+	}
+
+	var plan backend.UploadPlan
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatalf("decode upload plan: %v", err)
+	}
+
+	upload, err := s.fallback.GetUpload(context.Background(), plan.UploadID)
+	if err != nil {
+		t.Fatalf("GetUpload(%q): %v", plan.UploadID, err)
+	}
+	for _, p := range plan.Parts {
+		start := int64(p.Number-1) * plan.PartSize
+		end := start + p.Size
+		if _, err := s3c.UploadPart(context.Background(), upload.S3UploadID, p.Number, bytes.NewReader(body[start:end])); err != nil {
+			t.Fatalf("upload part %d: %v", p.Number, err)
+		}
+	}
+
+	completeBody, err := json.Marshal(map[string]any{
+		"tags": map[string]string{"owner=id": "alice"},
+	})
+	if err != nil {
+		t.Fatalf("marshal complete body: %v", err)
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/uploads/"+plan.UploadID+"/complete", bytes.NewReader(completeBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("complete upload: got %d, want 400: %s", resp.StatusCode, respBody)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(respBody), "contains '='") {
+		t.Fatalf("complete upload response = %q, want invalid tag key error", respBody)
+	}
+}
+
 func TestUploadInitiateByBody202(t *testing.T) {
 	s, _ := newTestServerWithS3(t)
 	ts := httptest.NewServer(s)
