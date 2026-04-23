@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"fmt"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/semantic"
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
@@ -320,6 +323,40 @@ func TestPoolCreateBackendReturnsValidationErrorWhenPeriodicCheckFails(t *testin
 	} else if !strings.Contains(err.Error(), "validate tidb auto-embedding schema") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+// This test reads global metrics emitted by recordTenantSchemaVersionUpdateFailure
+// via operationMetricValue, so it must stay non-parallel unless the metric state
+// is isolated.
+func TestRecordTenantSchemaVersionUpdateFailureRecordsMetric(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	before := operationMetricValue(t, recorder.Body.String(), `component="tenant_pool",operation="update_schema_version_failed",result="error"`)
+
+	recordTenantSchemaVersionUpdateFailure(context.Background(), "tenant-metric", 42, time.Millisecond, fmt.Errorf("meta unavailable"))
+
+	recorder = httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	after := operationMetricValue(t, recorder.Body.String(), `component="tenant_pool",operation="update_schema_version_failed",result="error"`)
+	if after != before+1 {
+		t.Fatalf("expected update_schema_version_failed metric to increment by 1, before=%d after=%d", before, after)
+	}
+}
+
+func operationMetricValue(t *testing.T, output, labels string) uint64 {
+	t.Helper()
+	prefix := `dat9_service_operations_total{` + labels + `} `
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		value, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, prefix)), 10, 64)
+		if err != nil {
+			t.Fatalf("parse metric %q: %v", line, err)
+		}
+		return value
+	}
+	return 0
 }
 
 type poolDummyAudioExtractor struct{}
