@@ -682,6 +682,183 @@ func TestLookupFallsBackToParentListWhenDirStatUnsupported(t *testing.T) {
 	}
 }
 
+func TestLookupRetriesTransientCanceledStat(t *testing.T) {
+	var headCalls atomic.Int32
+	firstHeadStarted := make(chan struct{}, 1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			if headCalls.Add(1) == 1 {
+				firstHeadStarted <- struct{}{}
+				<-r.Context().Done()
+				return
+			}
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	cancel := make(chan struct{})
+	var out gofuse.EntryOut
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Lookup(cancel, &gofuse.InHeader{NodeId: 1}, "file.bin", &out)
+	}()
+
+	select {
+	case <-firstHeadStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first HEAD request")
+	}
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("Lookup status = %v, want OK", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Lookup timed out")
+	}
+
+	if out.NodeId == 0 {
+		t.Fatal("Lookup returned zero NodeId")
+	}
+	if headCalls.Load() < 2 {
+		t.Fatalf("HEAD calls = %d, want at least 2", headCalls.Load())
+	}
+}
+
+func TestLookupReturnsENOENTAfterTransientCanceledStat(t *testing.T) {
+	var headCalls atomic.Int32
+	firstHeadStarted := make(chan struct{}, 1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			if headCalls.Add(1) == 1 {
+				firstHeadStarted <- struct{}{}
+				<-r.Context().Done()
+				return
+			}
+			http.Error(w, "not found", http.StatusNotFound)
+		case http.MethodGet:
+			if r.URL.Path == "/v1/fs/" && r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			http.NotFound(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	cancel := make(chan struct{})
+	var out gofuse.EntryOut
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Lookup(cancel, &gofuse.InHeader{NodeId: 1}, "missing.bin", &out)
+	}()
+
+	select {
+	case <-firstHeadStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first HEAD request")
+	}
+
+	select {
+	case st := <-done:
+		if st != gofuse.ENOENT {
+			t.Fatalf("Lookup status = %v, want ENOENT", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Lookup timed out")
+	}
+
+	if headCalls.Load() < 2 {
+		t.Fatalf("HEAD calls = %d, want at least 2", headCalls.Load())
+	}
+}
+
+func TestLookupTransientRetryExhaustedReturnsEAGAIN(t *testing.T) {
+	var headCalls atomic.Int32
+	firstHeadStarted := make(chan struct{}, 1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			if headCalls.Add(1) == 1 {
+				firstHeadStarted <- struct{}{}
+				<-r.Context().Done()
+				return
+			}
+			http.Error(w, "temporary unavailable", http.StatusServiceUnavailable)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	cancel := make(chan struct{})
+	var out gofuse.EntryOut
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Lookup(cancel, &gofuse.InHeader{NodeId: 1}, "retry.bin", &out)
+	}()
+
+	select {
+	case <-firstHeadStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first HEAD request")
+	}
+
+	select {
+	case st := <-done:
+		want := gofuse.Status(syscall.EAGAIN)
+		if st != want {
+			t.Fatalf("Lookup status = %v, want %v", st, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Lookup timed out")
+	}
+
+	wantCalls := int32(1 + lookupTransientRetryCount)
+	if got := headCalls.Load(); got != wantCalls {
+		t.Fatalf("HEAD calls = %d, want %d", got, wantCalls)
+	}
+}
+
+func TestHTTPToFuseStatus_ContextErrorsMapToEAGAIN(t *testing.T) {
+	want := gofuse.Status(syscall.EAGAIN)
+	if got := httpToFuseStatus(context.Canceled); got != want {
+		t.Fatalf("context canceled status = %v, want %v", got, want)
+	}
+	if got := httpToFuseStatus(context.DeadlineExceeded); got != want {
+		t.Fatalf("context deadline status = %v, want %v", got, want)
+	}
+}
+
 func TestOpenReadOnlyLargeFileGetsPrefetcher(t *testing.T) {
 	size := int64(1024 * 1024) // 1MB — above smallFileThreshold
 	data := make([]byte, size)

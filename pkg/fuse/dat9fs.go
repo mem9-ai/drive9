@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -115,6 +116,16 @@ func (fs *Dat9FS) flushPendingWriteBack(ctx context.Context, remotePath string) 
 // fuseTimeout is the default timeout for FUSE operations that make HTTP calls.
 // This prevents slow/dead servers from blocking the FUSE event loop forever.
 const fuseTimeout = 30 * time.Second
+
+const (
+	// lookupTransientRetryCount is the number of detached retries after the
+	// initial Lookup StatCtx attempt fails with a transient error.
+	lookupTransientRetryCount = 2
+
+	// lookupTransientRetryTimeout keeps each detached retry short so interrupted
+	// lookups do not block the caller for long.
+	lookupTransientRetryTimeout = 250 * time.Millisecond
+)
 
 // fuseCtx converts a FUSE cancel channel into a context.Context with a timeout.
 // The context is cancelled when either the FUSE operation is interrupted or the
@@ -516,6 +527,13 @@ func httpToFuseStatus(err error) gofuse.Status {
 	if err == nil {
 		return gofuse.OK
 	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return gofuse.Status(syscall.EAGAIN)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return gofuse.Status(syscall.EAGAIN)
+	}
 
 	// Prefer typed StatusError so we map by status code even when the
 	// server returns a JSON error body that doesn't contain "HTTP NNN".
@@ -573,8 +591,76 @@ func isNotFoundErr(err error) bool {
 	if err == nil {
 		return false
 	}
+	var se *client.StatusError
+	if errors.As(err, &se) && se.StatusCode == http.StatusNotFound {
+		return true
+	}
 	msg := err.Error()
 	return strings.Contains(msg, "not found") || strings.Contains(msg, "HTTP 404")
+}
+
+func isTransientLookupErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var se *client.StatusError
+	if errors.As(err, &se) {
+		switch se.StatusCode {
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		}
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func (fs *Dat9FS) lookupStatWithRetry(cancel <-chan struct{}, childP string) (*client.StatResult, error) {
+	ctx, cf := fuseCtx(cancel)
+	stat, err := fs.client.StatCtx(ctx, childP)
+	cf()
+	if err == nil || isNotFoundErr(err) || !isTransientLookupErr(err) {
+		return stat, err
+	}
+
+	lastErr := err
+	for range lookupTransientRetryCount {
+		// Detached retries absorb interrupt races from probing callers that do not
+		// retry open/stat failures in user space.
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), lookupTransientRetryTimeout)
+		stat, err = fs.client.StatCtx(retryCtx, childP)
+		retryCancel()
+		if err == nil || isNotFoundErr(err) || !isTransientLookupErr(err) {
+			return stat, err
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string) ([]client.FileInfo, error) {
+	ctx, cf := fuseCtx(cancel)
+	items, err := fs.client.ListCtx(ctx, parentPath)
+	cf()
+	if err == nil || !isTransientLookupErr(err) {
+		return items, err
+	}
+
+	lastErr := err
+	for range lookupTransientRetryCount {
+		// Keep list fallback bounded; this path only runs when HEAD/stat said
+		// "not found" and we need directory-list compatibility probing.
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), lookupTransientRetryTimeout)
+		items, err = fs.client.ListCtx(retryCtx, parentPath)
+		retryCancel()
+		if err == nil || !isTransientLookupErr(err) {
+			return items, err
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 // --- RawFileSystem methods ---------------------------------------------------
@@ -651,10 +737,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		}
 	}
 
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
-
-	stat, err := fs.client.StatCtx(ctx, childP)
+	stat, err := fs.lookupStatWithRetry(cancel, childP)
 	if err != nil {
 		if !isNotFoundErr(err) {
 			return httpToFuseStatus(err)
@@ -666,7 +749,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		if !ok {
 			return gofuse.ENOENT
 		}
-		items, listErr := fs.client.ListCtx(ctx, parentPath)
+		items, listErr := fs.lookupListWithRetry(cancel, parentPath)
 		if listErr != nil {
 			return httpToFuseStatus(listErr)
 		}
