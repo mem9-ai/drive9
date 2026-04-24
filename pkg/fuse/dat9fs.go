@@ -132,6 +132,10 @@ const (
 	// lookupTransientRetryTimeout keeps each detached retry short so interrupted
 	// lookups do not block the caller for long.
 	lookupTransientRetryTimeout = 250 * time.Millisecond
+
+	// lookupRetrySuccessLogEvery controls how often successful retry recovery is
+	// logged, to avoid noisy logs on hot lookup paths.
+	lookupRetrySuccessLogEvery uint64 = 200
 )
 
 // fuseCtx converts a FUSE cancel channel into a context.Context with a timeout.
@@ -653,6 +657,10 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, remotePath stri
 		return stat, err
 	}
 
+	// Mapping interruption to a retryable errno alone is insufficient for callers
+	// that treat open/stat failures as terminal and never retry in user space.
+	// Absorb short-lived metadata probe interruptions here before returning to
+	// the kernel-facing path.
 	if trackLookupMetrics {
 		fs.lookupStatRetryTotal.Add(1)
 	}
@@ -666,7 +674,10 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, remotePath stri
 		retryCancel()
 		if err == nil {
 			if trackLookupMetrics {
-				fs.lookupStatRetrySuccess.Add(1)
+				successCount := fs.lookupStatRetrySuccess.Add(1)
+				if successCount <= 3 || successCount%lookupRetrySuccessLogEvery == 0 {
+					log.Printf("lookup stat retry recovered for %s (success_count=%d)", remotePath, successCount)
+				}
 			}
 			return stat, nil
 		}
