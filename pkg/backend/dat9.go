@@ -959,9 +959,9 @@ func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit 
 			vecDescCh <- grepResp{rows: rows, err: searchErr}
 		}()
 	} else if b.queryEmbedder != nil {
+		queryVec, embedErr := b.queryEmbedder.EmbedText(ctx, query)
 		vecCh = make(chan grepResp, 1)
 		go func() {
-			queryVec, embedErr := b.queryEmbedder.EmbedText(ctx, query)
 			if embedErr != nil || len(queryVec) == 0 {
 				vecCh <- grepResp{err: embedErr}
 				return
@@ -971,7 +971,6 @@ func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit 
 		}()
 		vecDescCh = make(chan grepResp, 1)
 		go func() {
-			queryVec, embedErr := b.queryEmbedder.EmbedText(ctx, query)
 			if embedErr != nil || len(queryVec) == 0 {
 				vecDescCh <- grepResp{err: embedErr}
 				return
@@ -1012,16 +1011,8 @@ func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit 
 		}
 	}
 
-	// Merge content vector and description vector results: same file keeps best (min distance) score.
-	mergedVec := mergeVectorResults(vecResp.rows, vecDescResp.rows)
-
-	// Decision rule for grep:
-	// 1. FTS and vector search are ranking signals; either one may fail independently.
-	// 2. If either path returns ranked rows, serve those rows directly after RRF merge.
-	// 3. Only fall back to LIKE-based keyword search when both ranking paths produce no rows.
-	// This keeps semantic ranking as an enhancement while preserving a text-search safety net.
-	hasRankedResults := len(ftsResp.rows) > 0 || len(mergedVec) > 0
-	if !hasRankedResults {
+	rows := b.grepMerge(ftsResp.rows, vecResp.rows, vecDescResp.rows, limit)
+	if rows == nil {
 		rows, searchErr := b.store.KeywordSearch(ctx, query, pathPrefix, limit)
 		if searchErr != nil {
 			logger.Error(ctx, "backend_grep_failed", zap.Int("query_len", len(query)), zap.String("path_prefix", pathPrefix), zap.Int("limit", limit), zap.Error(searchErr))
@@ -1030,7 +1021,27 @@ func (b *Dat9Backend) Grep(ctx context.Context, query, pathPrefix string, limit 
 		}
 		return rows, nil
 	}
-	return datastore.RRFMerge(ftsResp.rows, mergedVec, limit), nil
+	return rows, nil
+}
+
+// grepMerge takes the raw results from FTS, content-vector, and description-vector
+// searches and produces the final ranked output. It is extracted for testability.
+// When all ranking paths are empty it returns nil to signal the caller to fall back
+// to keyword search.
+func (b *Dat9Backend) grepMerge(ftsRows, vecRows, vecDescRows []datastore.SearchResult, limit int) []datastore.SearchResult {
+	// Merge content vector and description vector results: same file keeps best (min distance) score.
+	mergedVec := mergeVectorResults(vecRows, vecDescRows)
+
+	// Decision rule for grep:
+	// 1. FTS and vector search are ranking signals; either one may fail independently.
+	// 2. If either path returns ranked rows, serve those rows directly after RRF merge.
+	// 3. Only fall back to LIKE-based keyword search when both ranking paths produce no rows.
+	// This keeps semantic ranking as an enhancement while preserving a text-search safety net.
+	hasRankedResults := len(ftsRows) > 0 || len(mergedVec) > 0
+	if !hasRankedResults {
+		return nil
+	}
+	return datastore.RRFMerge(ftsRows, mergedVec, limit)
 }
 
 // mergeVectorResults merges two vector search result sets, keeping the best score
@@ -1042,7 +1053,7 @@ func mergeVectorResults(a, b []datastore.SearchResult) []datastore.SearchResult 
 	}
 	for _, r := range b {
 		if existing, ok := best[r.Path]; ok {
-			if *r.Score > *existing.Score {
+			if existing.Score == nil || (r.Score != nil && *r.Score > *existing.Score) {
 				best[r.Path] = r
 			}
 		} else {

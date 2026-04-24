@@ -1,6 +1,7 @@
 package datastore
 
 import (
+	"database/sql"
 	"fmt"
 	"time"
 )
@@ -40,8 +41,15 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 		nullStr(checksum), nullStr(contentText),
 	}
 	if description != "" {
-		query += ` description = ?, description_embedding = NULL, description_embedding_revision = NULL,`
+		var currentDesc sql.NullString
+		if err := db.QueryRow(`SELECT description FROM files WHERE file_id = ?`, fileID).Scan(&currentDesc); err != nil {
+			return 0, fmt.Errorf("read current description: %w", err)
+		}
+		query += ` description = ?,`
 		args = append(args, description)
+		if currentDesc.String != description {
+			query += ` description_embedding = NULL, description_embedding_revision = NULL,`
+		}
 	}
 	if preserveEmbedding {
 		query += `

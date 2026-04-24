@@ -198,11 +198,14 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 		)`,
 		`CREATE INDEX idx_status ON files(status, created_at)`,
 		`ALTER TABLE files
-			ADD FULLTEXT INDEX idx_fts_content(content_text)
+			ADD FULLTEXT INDEX idx_fts_content_desc(content_text, description)
 			WITH PARSER MULTILINGUAL
 			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
 		`ALTER TABLE files
 			ADD VECTOR INDEX idx_files_cosine((VEC_COSINE_DISTANCE(embedding)))
+			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
+		`ALTER TABLE files
+			ADD VECTOR INDEX idx_files_desc_cosine((VEC_COSINE_DISTANCE(description_embedding)))
 			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
 		`CREATE TABLE IF NOT EXISTS file_tags (
 			file_id   VARCHAR(64) NOT NULL,
@@ -475,7 +478,16 @@ func validateTiDBFilesTableBase(meta tidbTableMeta) error {
 	if err := meta.requireColumnType("embedding", fmt.Sprintf("vector(%d)", TiDBAutoEmbeddingDimensions)); err != nil {
 		return err
 	}
-	return meta.requireColumnType("embedding_revision", "bigint")
+	if err := meta.requireColumnType("embedding_revision", "bigint"); err != nil {
+		return err
+	}
+	if err := meta.requireColumnType("description", "longtext"); err != nil {
+		return err
+	}
+	if err := meta.requireColumnType("description_embedding", fmt.Sprintf("vector(%d)", TiDBAutoEmbeddingDimensions)); err != nil {
+		return err
+	}
+	return meta.requireColumnType("description_embedding_revision", "bigint")
 }
 
 func validateTiDBUploadsTableBase(meta tidbTableMeta) error {
@@ -1493,65 +1505,75 @@ func isIgnorableTiDBSchemaError(err error) bool {
 }
 
 func validateTiDBAutoEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
-	col, err := meta.requireColumn("embedding")
-	if err != nil {
-		return nil
-	}
 	var diffs []tidbSchemaDiff
-	extra := normalizeSQLFragment(col.extra)
-	if !strings.Contains(extra, "generated") || !strings.Contains(extra, "stored") {
-		diffs = append(diffs, tidbSchemaDiff{
-			kind:       tidbSchemaDiffTableContract,
-			tableName:  "files",
-			columnName: "embedding",
-			detail:     "files schema contract: embedding column must be a stored generated column",
-		})
-	}
-	expr := normalizeSQLFragment(col.generationExpression)
-	checks := []struct {
-		pattern string
-		errMsg  string
+	for _, spec := range []struct {
+		column string
+		source string
 	}{
-		{"embed_text(", "files schema contract: embedding generated expression must use EMBED_TEXT"},
-		{tidbAutoEmbeddingModel, "files schema contract: embedding model contract mismatch"},
-		{"content_text", "files schema contract: generated expression must derive from content_text"},
-		{tidbAutoEmbeddingOptionsJSON, "files schema contract: embedding dimensions option mismatch"},
-	}
-	for _, check := range checks {
-		if !strings.Contains(expr, check.pattern) {
+		{"embedding", "content_text"},
+		{"description_embedding", "description"},
+	} {
+		col, err := meta.requireColumn(spec.column)
+		if err != nil {
+			return nil
+		}
+		extra := normalizeSQLFragment(col.extra)
+		if !strings.Contains(extra, "generated") || !strings.Contains(extra, "stored") {
 			diffs = append(diffs, tidbSchemaDiff{
 				kind:       tidbSchemaDiffTableContract,
 				tableName:  "files",
-				columnName: "embedding",
-				detail:     check.errMsg,
+				columnName: spec.column,
+				detail:     fmt.Sprintf("files schema contract: %s column must be a stored generated column", spec.column),
 			})
+		}
+		expr := normalizeSQLFragment(col.generationExpression)
+		checks := []struct {
+			pattern string
+			errMsg  string
+		}{
+			{"embed_text(", fmt.Sprintf("files schema contract: %s generated expression must use EMBED_TEXT", spec.column)},
+			{tidbAutoEmbeddingModel, fmt.Sprintf("files schema contract: %s model contract mismatch", spec.column)},
+			{spec.source, fmt.Sprintf("files schema contract: generated expression must derive from %s", spec.source)},
+			{tidbAutoEmbeddingOptionsJSON, fmt.Sprintf("files schema contract: %s dimensions option mismatch", spec.column)},
+		}
+		for _, check := range checks {
+			if !strings.Contains(expr, check.pattern) {
+				diffs = append(diffs, tidbSchemaDiff{
+					kind:       tidbSchemaDiffTableContract,
+					tableName:  "files",
+					columnName: spec.column,
+					detail:     check.errMsg,
+				})
+			}
 		}
 	}
 	return diffs
 }
 
 func validateTiDBAppEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
-	col, err := meta.requireColumn("embedding")
-	if err != nil {
-		return nil
-	}
 	var diffs []tidbSchemaDiff
-	extra := normalizeSQLFragment(col.extra)
-	if strings.Contains(extra, "generated") {
-		diffs = append(diffs, tidbSchemaDiff{
-			kind:       tidbSchemaDiffTableContract,
-			tableName:  "files",
-			columnName: "embedding",
-			detail:     "files schema contract: embedding column must be writable in app mode",
-		})
-	}
-	if expr := normalizeSQLFragment(col.generationExpression); expr != "" {
-		diffs = append(diffs, tidbSchemaDiff{
-			kind:       tidbSchemaDiffTableContract,
-			tableName:  "files",
-			columnName: "embedding",
-			detail:     "files schema contract: embedding column must not define a generation expression in app mode",
-		})
+	for _, colName := range []string{"embedding", "description_embedding"} {
+		col, err := meta.requireColumn(colName)
+		if err != nil {
+			return nil
+		}
+		extra := normalizeSQLFragment(col.extra)
+		if strings.Contains(extra, "generated") {
+			diffs = append(diffs, tidbSchemaDiff{
+				kind:       tidbSchemaDiffTableContract,
+				tableName:  "files",
+				columnName: colName,
+				detail:     fmt.Sprintf("files schema contract: %s column must be writable in app mode", colName),
+			})
+		}
+		if expr := normalizeSQLFragment(col.generationExpression); expr != "" {
+			diffs = append(diffs, tidbSchemaDiff{
+				kind:       tidbSchemaDiffTableContract,
+				tableName:  "files",
+				columnName: colName,
+				detail:     fmt.Sprintf("files schema contract: %s column must not define a generation expression in app mode", colName),
+			})
+		}
 	}
 	return diffs
 }

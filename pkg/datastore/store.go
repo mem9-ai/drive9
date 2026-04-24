@@ -435,6 +435,11 @@ func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageTyp
 	if description != "" {
 		query += `, description = ?, description_embedding = NULL, description_embedding_revision = NULL`
 		args = append(args, description)
+	} else {
+		query += `, description_embedding_revision = CASE
+			WHEN description_embedding IS NOT NULL THEN revision + 1
+			ELSE description_embedding_revision
+			END`
 	}
 	query += `, revision = revision + 1, status = 'CONFIRMED', confirmed_at = ? WHERE file_id = ?`
 	args = append(args, time.Now().UTC(), fileID)

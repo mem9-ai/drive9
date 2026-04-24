@@ -497,3 +497,27 @@ func TestUpdateFileContent(t *testing.T) {
 		t.Errorf("unexpected: %+v", got)
 	}
 }
+
+func TestUpdateFileContentWithDescription(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertFile(context.Background(), &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+
+	newRev, err := s.UpdateFileContent(context.Background(), "f1", StorageDB9, "/blobs/f1-v2", "text/plain", "abc123", "new content", []byte("blob"), 42, "my description")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newRev != 2 {
+		t.Errorf("expected newRev=2, got %d", newRev)
+	}
+	got, _ := s.GetFile(context.Background(), "f1")
+	if got.Revision != 2 || got.Description != "my description" {
+		t.Errorf("unexpected: %+v", got)
+	}
+	if got.DescriptionEmbeddingRevision != nil {
+		t.Errorf("expected description_embedding_revision to be nil after content update, got %v", got.DescriptionEmbeddingRevision)
+	}
+}

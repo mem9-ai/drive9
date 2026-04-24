@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -44,7 +45,7 @@ type UploadPlanV2 struct {
 // MaxMultipartParts is the S3 hard limit on parts per multipart upload.
 const MaxMultipartParts = 10000
 
-// MaxDescriptionLen is the maximum length of a file description in characters.
+// MaxDescriptionLen is the maximum length of a file description in UTF-8 runes (characters).
 const MaxDescriptionLen = 2000
 
 // MaxPresignBatch is the maximum number of parts that can be presigned in a single batch request.
@@ -201,6 +202,10 @@ func (b *Dat9Backend) InitiateUploadWithChecksums(ctx context.Context, path stri
 
 func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context, path string, totalSize int64, partChecksums []string, expectedRevision int64, description string) (*UploadPlan, error) {
 	start := time.Now()
+	if utf8.RuneCountInString(description) > MaxDescriptionLen {
+		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
+		return nil, fmt.Errorf("description exceeds %d characters", MaxDescriptionLen)
+	}
 	if err := b.ensureUploadSizeAllowed(totalSize); err != nil {
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, err
@@ -349,6 +354,10 @@ func (b *Dat9Backend) InitiateUploadV2(ctx context.Context, path string, totalSi
 // InitiateUploadV2IfRevision starts a v2 multipart upload with optional CAS semantics.
 func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path string, totalSize int64, expectedRevision int64, description string) (*UploadPlanV2, error) {
 	start := time.Now()
+	if utf8.RuneCountInString(description) > MaxDescriptionLen {
+		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+		return nil, fmt.Errorf("description exceeds %d characters", MaxDescriptionLen)
+	}
 	validateStart := time.Now()
 	if err := b.ensureUploadSizeAllowed(totalSize); err != nil {
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))

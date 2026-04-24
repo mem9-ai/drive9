@@ -192,10 +192,10 @@ fi
 # ------------------------------------------------------------------
 log_info "Starting drive9-server-local..."
 
-export DRIVE9_LOCAL_DSN="root@tcp(127.0.0.1:${TIDB_PORT})/drive9_local?parseTime=true"
-export DRIVE9_LOCAL_INIT_SCHEMA=true
+export DRIVE9_LOCAL_DSN="${DRIVE9_LOCAL_DSN:-root@tcp(127.0.0.1:${TIDB_PORT})/drive9_local?parseTime=true}"
+export DRIVE9_LOCAL_INIT_SCHEMA="${DRIVE9_LOCAL_INIT_SCHEMA:-true}"
 export DRIVE9_LOCAL_EMBEDDING_MODE=app
-export DRIVE9_LOCAL_API_KEY=local-dev-key
+export DRIVE9_LOCAL_API_KEY="${DRIVE9_API_KEY:-local-dev-key}"
 
 if [ "$USE_STUB_EMBEDDER" = "1" ]; then
     export DRIVE9_EMBED_API_BASE="${STUB_API_BASE}/v1"
@@ -226,16 +226,19 @@ export DRIVE9_SEMANTIC_POLL_INTERVAL_MS=200
 "${PROJECT_ROOT}/bin/drive9-server-local" > /tmp/drive9-server-local-e2e.log 2>&1 &
 SERVER_PID=$!
 
+POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
+POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
+
 log_info "Waiting for drive9-server-local at http://127.0.0.1:${SERVER_PORT}/v1/status..."
-API_KEY="local-dev-key"
+API_KEY="${DRIVE9_API_KEY:-local-dev-key}"
 waited=0
 while ! curl -sf "http://127.0.0.1:${SERVER_PORT}/v1/status" -H "Authorization: Bearer ${API_KEY}" >/dev/null 2>&1; do
-    if [ "$waited" -ge 30 ]; then
-        log_err "Timeout: drive9-server-local did not become ready within 30s"
+    if [ "$waited" -ge "$POLL_TIMEOUT_S" ]; then
+        log_err "Timeout: drive9-server-local did not become ready within ${POLL_TIMEOUT_S}s"
         exit 1
     fi
-    sleep 1
-    waited=$((waited+1))
+    sleep "$POLL_INTERVAL_S"
+    waited=$((waited+POLL_INTERVAL_S))
 done
 log_info "drive9-server-local is ready (waited ${waited}s)"
 
@@ -245,8 +248,8 @@ log_info "drive9-server-local is ready (waited ${waited}s)"
 log_info "Running description smoke tests..."
 
 CLI="${PROJECT_ROOT}/bin/drive9"
-BASE="http://127.0.0.1:${SERVER_PORT}"
-API_KEY="local-dev-key"
+BASE="${DRIVE9_BASE:-http://127.0.0.1:${SERVER_PORT}}"
+API_KEY="${DRIVE9_API_KEY:-local-dev-key}"
 DB_DSN="root@tcp(127.0.0.1:${TIDB_PORT})/drive9_local"
 
 if command -v mycli >/dev/null 2>&1; then
@@ -314,7 +317,7 @@ echo ""
 log_info "[0/5] Cleaning up previous test artifacts..."
 $MYSQL_CLIENT -e "DELETE FROM semantic_tasks WHERE task_type = 'embed';" 2>/dev/null || true
 $MYSQL_CLIENT -e "DELETE FROM file_nodes WHERE path LIKE '/smoke-%';" 2>/dev/null || true
-$MYSQL_CLIENT -e "DELETE FROM files WHERE file_id NOT IN (SELECT file_id FROM file_nodes);" 2>/dev/null || true
+$MYSQL_CLIENT -e "DELETE f FROM files f LEFT JOIN file_nodes fn ON f.file_id = fn.file_id WHERE fn.file_id IS NULL;" 2>/dev/null || true
 $MYSQL_CLIENT -e "DELETE FROM uploads WHERE target_path LIKE '/smoke-%';" 2>/dev/null || true
 
 # ---- 1. Small file upload with description ----

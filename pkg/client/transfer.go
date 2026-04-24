@@ -244,36 +244,55 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 	return err
 }
 
+// WriteOption configures an upload written via WriteStreamWithSummary.
+type WriteOption func(*writeOptions)
+
+type writeOptions struct {
+	tags        map[string]string
+	description string
+}
+
+// WithTags sets file tags for the upload.
+func WithTags(tags map[string]string) WriteOption {
+	return func(o *writeOptions) {
+		o.tags = tags
+	}
+}
+
+// WithDescription sets a file description for the upload.
+func WithDescription(description string) WriteOption {
+	return func(o *writeOptions) {
+		o.description = description
+	}
+}
+
 // WriteStreamWithTags uploads data from a reader and applies tags to the
 // resulting file revision.
 func (c *Client) WriteStreamWithTags(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, tags map[string]string) error {
-	_, err := c.WriteStreamWithSummaryAndTags(ctx, path, r, size, progress, tags)
+	_, err := c.WriteStreamWithSummary(ctx, path, r, size, progress, WithTags(tags))
 	return err
 }
 
 // WriteStreamWithSummary uploads data from a reader and returns coarse-grained
 // phase timings for the completed upload.
-func (c *Client) WriteStreamWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc) (*UploadSummary, error) {
-	return c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, -1, nil, "")
+func (c *Client) WriteStreamWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, opts ...WriteOption) (*UploadSummary, error) {
+	o := &writeOptions{}
+	for _, opt := range opts {
+		opt(o)
+	}
+	return c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, -1, o.tags, o.description)
 }
 
 // WriteStreamWithSummaryAndTags uploads data from a reader, applies tags to
 // the resulting file revision, and returns coarse-grained phase timings.
 func (c *Client) WriteStreamWithSummaryAndTags(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, tags map[string]string) (*UploadSummary, error) {
-	return c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, -1, tags, "")
+	return c.WriteStreamWithSummary(ctx, path, r, size, progress, WithTags(tags))
 }
 
 // WriteStreamWithSummaryAndDescription is like WriteStreamWithSummary but also
 // sends a file description to the server.
 func (c *Client) WriteStreamWithSummaryAndDescription(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, description string) (*UploadSummary, error) {
-	return c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, -1, nil, description)
-}
-
-// WriteStreamWithSummaryAndTagsAndDescription uploads data from a reader, applies
-// tags and a description to the resulting file revision, and returns coarse-grained
-// phase timings.
-func (c *Client) WriteStreamWithSummaryAndTagsAndDescription(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, tags map[string]string, description string) (*UploadSummary, error) {
-	return c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, -1, tags, description)
+	return c.WriteStreamWithSummary(ctx, path, r, size, progress, WithDescription(description))
 }
 
 // WriteStreamConditional uploads data from a reader with optional CAS semantics.

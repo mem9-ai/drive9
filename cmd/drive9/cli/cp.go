@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/client"
@@ -67,7 +68,7 @@ func Cp(c *client.Client, args []string) error {
 	}
 	args = filtered
 
-	if len(description) > backend.MaxDescriptionLen {
+	if utf8.RuneCountInString(description) > backend.MaxDescriptionLen {
 		return fmt.Errorf("description exceeds %d characters", backend.MaxDescriptionLen)
 	}
 
@@ -80,10 +81,22 @@ func Cp(c *client.Client, args []string) error {
 	if appendMode && len(tags) > 0 {
 		return fmt.Errorf("--append and --tag cannot be used together")
 	}
+	if appendMode && description != "" {
+		return fmt.Errorf("--append and --description cannot be used together")
+	}
+	if resume && description != "" {
+		return fmt.Errorf("--resume and --description cannot be used together")
+	}
 	src, dst := args[0], args[1]
 
 	srcRP, srcIsRemote := ParseRemote(src)
 	dstRP, dstIsRemote := ParseRemote(dst)
+	if description != "" {
+		descriptionSupported := dstIsRemote && !appendMode && !resume && (src == "-" || !srcIsRemote)
+		if !descriptionSupported {
+			return fmt.Errorf("--description is only supported for local/stdin uploads to a remote path")
+		}
+	}
 	if appendMode && src == "-" {
 		return fmt.Errorf("--append does not support stdin source; use a local file")
 	}
@@ -107,16 +120,14 @@ func Cp(c *client.Client, args []string) error {
 		if appendMode {
 			return c.AppendStream(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress)
 		}
-		var summary *client.UploadSummary
-		if tags != nil && description != "" {
-			summary, err = c.WriteStreamWithSummaryAndTagsAndDescription(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress, tags, description)
-		} else if tags != nil {
-			summary, err = c.WriteStreamWithSummaryAndTags(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress, tags)
-		} else if description != "" {
-			summary, err = c.WriteStreamWithSummaryAndDescription(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress, description)
-		} else {
-			summary, err = c.WriteStreamWithSummary(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress)
+		var opts []client.WriteOption
+		if tags != nil {
+			opts = append(opts, client.WithTags(tags))
 		}
+		if description != "" {
+			opts = append(opts, client.WithDescription(description))
+		}
+		summary, err := c.WriteStreamWithSummary(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress, opts...)
 		if err != nil {
 			return err
 		}
@@ -178,16 +189,14 @@ func uploadFileWithTagsAndDescription(ctx context.Context, c *client.Client, loc
 	}
 	defer func() { _ = f.Close() }()
 
-	var summary *client.UploadSummary
-	if tags != nil && description != "" {
-		summary, err = c.WriteStreamWithSummaryAndTagsAndDescription(ctx, remotePath, f, size, printProgress, tags, description)
-	} else if tags != nil {
-		summary, err = c.WriteStreamWithSummaryAndTags(ctx, remotePath, f, size, printProgress, tags)
-	} else if description != "" {
-		summary, err = c.WriteStreamWithSummaryAndDescription(ctx, remotePath, f, size, printProgress, description)
-	} else {
-		summary, err = c.WriteStreamWithSummary(ctx, remotePath, f, size, printProgress)
+	var opts []client.WriteOption
+	if tags != nil {
+		opts = append(opts, client.WithTags(tags))
 	}
+	if description != "" {
+		opts = append(opts, client.WithDescription(description))
+	}
+	summary, err := c.WriteStreamWithSummary(ctx, remotePath, f, size, printProgress, opts...)
 	if err != nil {
 		return err
 	}

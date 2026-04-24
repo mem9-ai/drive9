@@ -5,14 +5,17 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"time"
 )
 
 func main() {
-	http.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
+		body := http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB limit
 		var req struct {
 			Input string `json:"input"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(body).Decode(&req)
 
 		vec := make([]float32, 1024)
 		for i := range vec {
@@ -33,5 +36,10 @@ func main() {
 	if port == "" {
 		port = "11435"
 	}
-	_ = http.ListenAndServe(":"+port, nil)
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	_ = srv.ListenAndServe()
 }

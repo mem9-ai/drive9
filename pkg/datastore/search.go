@@ -9,6 +9,8 @@ import (
 	"github.com/mem9-ai/dat9/pkg/embedding"
 )
 
+const vectorScoreThreshold = 0.3
+
 type SearchResult struct {
 	Path      string   `json:"path"`
 	Name      string   `json:"name"`
@@ -78,31 +80,7 @@ func (s *Store) VectorSearch(ctx context.Context, queryEmbedding []float32, path
 	if !ok {
 		return nil, nil
 	}
-
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-
-	var out []SearchResult
-	for rows.Next() {
-		var r SearchResult
-		var dist float64
-		if err := rows.Scan(&r.Path, &r.Name, &r.SizeBytes, &dist); err != nil {
-			return nil, err
-		}
-		sc := 1.0 - dist
-		if sc < 0.3 {
-			continue
-		}
-		r.Score = &sc
-		out = append(out, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return s.runVectorSearch(ctx, q, args)
 }
 
 // VectorSearchByText runs a TiDB-side text-query vector similarity search.
@@ -111,7 +89,10 @@ func (s *Store) VectorSearchByText(ctx context.Context, queryText, pathPrefix st
 	if !ok {
 		return nil, nil
 	}
+	return s.runVectorSearch(ctx, q, args)
+}
 
+func (s *Store) runVectorSearch(ctx context.Context, q string, args []any) ([]SearchResult, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -126,7 +107,7 @@ func (s *Store) VectorSearchByText(ctx context.Context, queryText, pathPrefix st
 			return nil, err
 		}
 		sc := 1.0 - dist
-		if sc < 0.3 {
+		if sc < vectorScoreThreshold {
 			continue
 		}
 		r.Score = &sc
@@ -191,31 +172,7 @@ func (s *Store) VectorSearchDescription(ctx context.Context, queryEmbedding []fl
 	if !ok {
 		return nil, nil
 	}
-
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-
-	var out []SearchResult
-	for rows.Next() {
-		var r SearchResult
-		var dist float64
-		if err := rows.Scan(&r.Path, &r.Name, &r.SizeBytes, &dist); err != nil {
-			return nil, err
-		}
-		sc := 1.0 - dist
-		if sc < 0.3 {
-			continue
-		}
-		r.Score = &sc
-		out = append(out, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return s.runVectorSearch(ctx, q, args)
 }
 
 // VectorSearchDescriptionByText runs a TiDB-side text-query vector similarity search
@@ -225,31 +182,7 @@ func (s *Store) VectorSearchDescriptionByText(ctx context.Context, queryText, pa
 	if !ok {
 		return nil, nil
 	}
-
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-
-	var out []SearchResult
-	for rows.Next() {
-		var r SearchResult
-		var dist float64
-		if err := rows.Scan(&r.Path, &r.Name, &r.SizeBytes, &dist); err != nil {
-			return nil, err
-		}
-		sc := 1.0 - dist
-		if sc < 0.3 {
-			continue
-		}
-		r.Score = &sc
-		out = append(out, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return s.runVectorSearch(ctx, q, args)
 }
 
 func buildVectorSearchDescriptionQuery(queryEmbedding []float32, pathPrefix string, limit int) (string, []any, bool) {
@@ -280,7 +213,7 @@ func buildVectorSearchDescriptionByTextQuery(queryText, pathPrefix string, limit
 	if strings.TrimSpace(queryText) == "" {
 		return "", nil, false
 	}
-	conds := []string{"f.status = 'CONFIRMED'", "f.description_embedding IS NOT NULL"}
+	conds := []string{"f.status = 'CONFIRMED'", "f.description_embedding IS NOT NULL", "f.description_embedding_revision = f.revision"}
 	args := []any{queryText}
 
 	if pathPrefix != "" && pathPrefix != "/" {
@@ -313,7 +246,7 @@ func ftsSafe(s string) string {
 // FTSSearch runs a full-text search over files.content_text.
 func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit int) ([]SearchResult, error) {
 	safe := ftsSafe(query)
-	ftsExpr := "fts_match_word('" + safe + "', content_text)"
+	ftsExpr := "fts_match_word('" + safe + "', content_text, description)"
 
 	var args []any
 	args = append(args, limit)

@@ -73,7 +73,6 @@ type File struct {
     ContentText    string
     Description    string          // new
     EmbeddingRevision       *int64 // existing: revision of the content_text embedding
-    DescriptionEmbedding    []float32 // ?? incorrect: embedding is a vector column in the DB, but the File struct currently does not store embedding values
     DescriptionEmbeddingRevision *int64 // new
     // ...
 }
@@ -482,3 +481,70 @@ Currently `FTSSearch` only searches `content_text`. To include description in fu
 1. **Standalone PATCH description API**: Later support `PATCH /v1/fs/{path}?description=...` to update description without modifying file content.
 2. **AI-generated description**: The semantic worker could, after `img_extract_text` / `audio_extract_text`, call an LLM to generate a description, write it back to `files.description`, and trigger embedding.
 3. **Markdown / Rich Text support for descriptions**: The current design uses plain TEXT; if structured content is needed in the future, it can be migrated to `description_json JSON`.
+
+
+---
+
+## 10. Integration Testing on TiDB Cloud
+
+Local TiDB (tiup playground / Docker) does **not** support `VEC_COSINE_DISTANCE`, `fts_match_word`, or `EMBED_TEXT`, so the vector and full-text recall paths cannot be validated locally. To verify that description recall works end-to-end, run the following against a **TiDB Cloud Serverless** instance that has VECTOR and FTS enabled.
+
+### Prerequisites
+
+- A TiDB Cloud Serverless cluster with VECTOR and FULLTEXT support.
+- An embedding provider (e.g., OpenAI, Ollama) reachable from the test machine.
+
+### Steps
+
+1. **Provision the tenant schema** (auto-embedding or app-embedding mode):
+   ```bash
+   export DRIVE9_BASE="https://<your-drive9-server>/v1"
+   export DRIVE9_API_KEY="<tenant-api-key>"
+   ```
+
+2. **Upload a file with a description**:
+   ```bash
+   drive9 cp --description "quarterly financial report Q3 2024" ./report.pdf :/reports/q3.pdf
+   ```
+
+3. **Wait for embedding writeback** (app-managed mode) or verify auto-embedding (TiDB auto mode):
+   ```bash
+   drive9 stat :/reports/q3.pdf
+   # Confirm description_embedding_revision matches revision.
+   ```
+
+4. **Test keyword recall via description**:
+   ```bash
+   drive9 grep "financial report"
+   # Expected: /reports/q3.pdf appears in results even though content_text is empty (binary file).
+   ```
+
+5. **Test semantic recall via description**:
+   ```bash
+   drive9 grep "company earnings overview"
+   # Expected: /reports/q3.pdf appears due to semantic similarity of description_embedding.
+   ```
+
+6. **Test overwrite semantics**:
+   ```bash
+   drive9 cp --description "updated Q3 report" ./report-v2.pdf :/reports/q3.pdf
+   drive9 grep "quarterly financial report"
+   # Expected: old description no longer matches; new description matches.
+   ```
+
+### CI Integration
+
+For automated CI, point `e2e/verify-description-e2e.sh` at a TiDB Cloud test instance:
+
+```bash
+export DRIVE9_BASE="https://drive9-e2e.example.com/v1"
+export DRIVE9_LOCAL_DSN="<tidb-cloud-dsn>"
+export DRIVE9_LOCAL_INIT_SCHEMA=true
+export DRIVE9_EMBED_API_BASE="https://api.openai.com/v1"
+export DRIVE9_EMBED_API_KEY="<openai-key>"
+export DRIVE9_EMBED_MODEL="text-embedding-3-small"
+export DRIVE9_EMBED_DIMENSIONS=1024
+bash e2e/verify-description-e2e.sh
+```
+
+> Note: Remove or adjust the "known limitation" skip in the Grep test section when running against TiDB Cloud.

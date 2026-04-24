@@ -49,11 +49,11 @@ check_cmd() {
 }
 
 sql_query() {
-    $MYSQL_CLIENT -e "$1" --table 2>/dev/null | tail -1 | sed 's/|/ /g' | awk '{$1=$1};1'
+    $MYSQL_CLIENT -e "$1" --batch --skip-column-names 2>/dev/null | head -n 1 | awk '{$1=$1};1'
 }
 
 sql_scalar() {
-    $MYSQL_CLIENT -e "$1" --table 2>/dev/null | tail -1 | sed 's/|/ /g' | awk '{$1=$1};1'
+    $MYSQL_CLIENT -e "$1" --batch --skip-column-names 2>/dev/null | head -n 1 | awk '{$1=$1};1'
 }
 
 wait_for_task() {
@@ -92,7 +92,7 @@ echo ""
 echo "[0/5] Cleaning up previous test artifacts..."
 $MYSQL_CLIENT -e "DELETE FROM semantic_tasks WHERE task_type = 'embed';" 2>/dev/null || true
 $MYSQL_CLIENT -e "DELETE FROM file_nodes WHERE path LIKE '/smoke-%';" 2>/dev/null || true
-$MYSQL_CLIENT -e "DELETE FROM files WHERE file_id NOT IN (SELECT file_id FROM file_nodes);" 2>/dev/null || true
+$MYSQL_CLIENT -e "DELETE FROM files WHERE NOT EXISTS (SELECT 1 FROM file_nodes WHERE file_nodes.file_id = files.file_id);" 2>/dev/null || true
 $MYSQL_CLIENT -e "DELETE FROM uploads WHERE target_path LIKE '/smoke-%';" 2>/dev/null || true
 echo "  Done."
 

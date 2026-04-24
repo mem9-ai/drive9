@@ -1195,3 +1195,10 @@ func TestNewImgExtractTaskCarriesPayloadHints(t *testing.T) {
 		t.Fatalf("unexpected payload: %+v", payload)
 	}
 }
+
+func TestShouldEnqueueEmbedForRevisionWithDescriptionOnly(t *testing.T) {
+	b := newTestBackend(t)
+	if !b.shouldEnqueueEmbedForRevision("/bin/a.bin", "application/octet-stream", "", "some description") {
+		t.Fatal("expected non-empty description to enqueue embed work")
+	}
+}
