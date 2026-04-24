@@ -149,7 +149,19 @@ The owner-read endpoints MUST return **byte-identical response shape** as the co
 | `GET .../value?format=env` vs `GET /v1/vault/read/{name}?format=env` | `text/plain` | `KEY=value\n` per field |
 | `GET .../value/{field}` vs `GET /v1/vault/read/{name}/{field}` | `text/plain` | raw plaintext bytes |
 
-Status codes: `200` success, `404` secret/field not found, `500` internal error. The dual-dispatch is purely a **routing** concern, not a **formatting** concern. Clients (CLI, FUSE, SDK) MUST be able to consume either endpoint's output with the same parser. This is locked as Invariant #9 (§18).
+Status codes (exhaustive, matching capability-read contract):
+
+| Code | Condition |
+|---|---|
+| `200` | Success |
+| `400` | Unsupported `format` value (neither `json`, `env`, nor omitted/empty) |
+| `401` | Authentication failure (invalid/missing API key for owner path; invalid/missing token for capability path) |
+| `404` | Secret or field not found |
+| `500` | Internal server error |
+
+When `format` is omitted or empty, the default is JSON (`application/json`). This matches the capability-read default (`case "json", "":` branch).
+
+The dual-dispatch is purely a **routing** concern, not a **formatting** concern. Clients (CLI, FUSE, SDK) MUST be able to consume either endpoint's output with the same parser. This is locked as Invariant #9 (§18).
 
 ### Audit
 
