@@ -595,8 +595,8 @@ func TestTiDBSchemaSpecForModeIncludesVaultIndexes(t *testing.T) {
 
 func TestTiDBSchemaSpecForModeIncludesAlterTableIndexes(t *testing.T) {
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "files")
-	if _, ok := spec.indexes["idx_fts_content"]; !ok {
-		t.Fatal("files missing idx_fts_content index spec from ALTER TABLE statement")
+	if _, ok := spec.indexes["idx_fts_content_desc"]; !ok {
+		t.Fatal("files missing idx_fts_content_desc index spec from ALTER TABLE statement")
 	}
 	if _, ok := spec.indexes["idx_files_cosine"]; !ok {
 		t.Fatal("files missing idx_files_cosine index spec from ALTER TABLE statement")
@@ -608,8 +608,8 @@ func TestTiDBSchemaSpecForAppModeExcludesOptionalIndexes(t *testing.T) {
 	// is not supported on all TiDB versions. They must not appear in the app
 	// mode schema contract so that validation does not fail when they are skipped.
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeApp, "files")
-	if _, ok := spec.indexes["idx_fts_content"]; ok {
-		t.Fatal("files app mode spec must not include optional idx_fts_content index")
+	if _, ok := spec.indexes["idx_fts_content_desc"]; ok {
+		t.Fatal("files app mode spec must not include optional idx_fts_content_desc index")
 	}
 	if _, ok := spec.indexes["idx_files_cosine"]; ok {
 		t.Fatal("files app mode spec must not include optional idx_files_cosine index")
@@ -621,8 +621,8 @@ func TestPlannedTiDBSchemaRepairsSkipsHeavyAlterTableIndexRepairsOnExistingTable
 		{
 			kind:      tidbSchemaDiffMissingIndex,
 			tableName: "files",
-			detail:    "files schema contract: missing idx_fts_content index",
-			repairSQL: "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)",
+			detail:    "files schema contract: missing idx_fts_content_desc index",
+			repairSQL: "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content_desc(content_text, description)",
 		},
 	}
 
@@ -642,8 +642,8 @@ func TestPlannedTiDBSchemaRepairsAllowsHeavyAlterTableIndexRepairsWhenTableMissi
 		{
 			kind:      tidbSchemaDiffMissingIndex,
 			tableName: "files",
-			detail:    "files schema contract: missing idx_fts_content index",
-			repairSQL: "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)",
+			detail:    "files schema contract: missing idx_fts_content_desc index",
+			repairSQL: "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content_desc(content_text, description)",
 		},
 	}
 
@@ -651,7 +651,7 @@ func TestPlannedTiDBSchemaRepairsAllowsHeavyAlterTableIndexRepairsWhenTableMissi
 	if len(got) != 2 {
 		t.Fatalf("expected create table and heavy index repair, got %#v", got)
 	}
-	if got[1] != "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)" {
+	if got[1] != "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content_desc(content_text, description)" {
 		t.Fatalf("unexpected second repair statement: %q", got[1])
 	}
 }
@@ -819,11 +819,14 @@ func testFilesTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
 	meta := tidbTableMeta{
 		tableName: "files",
 		columns: map[string]tidbColumnMeta{
-			"file_id":            {columnType: "varchar(64)"},
-			"status":             {columnType: "varchar(32)"},
-			"content_text":       {columnType: "longtext"},
-			"embedding":          {columnType: "vector(1024)"},
-			"embedding_revision": {columnType: "bigint"},
+			"file_id":                         {columnType: "varchar(64)"},
+			"status":                          {columnType: "varchar(32)"},
+			"content_text":                    {columnType: "longtext"},
+			"embedding":                       {columnType: "vector(1024)"},
+			"embedding_revision":              {columnType: "bigint"},
+			"description":                     {columnType: "longtext"},
+			"description_embedding":           {columnType: "vector(1024)"},
+			"description_embedding_revision":  {columnType: "bigint"},
 		},
 	}
 	if mode == TiDBEmbeddingModeAuto {
@@ -831,6 +834,11 @@ func testFilesTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
 			columnType:           "vector(1024)",
 			extra:                "STORED GENERATED",
 			generationExpression: "embed_text(_utf8mb4'tidbcloud_free/amazon/titan-embed-text-v2', `content_text`, _utf8mb4'{\"dimensions\":1024}')",
+		}
+		meta.columns["description_embedding"] = tidbColumnMeta{
+			columnType:           "vector(1024)",
+			extra:                "STORED GENERATED",
+			generationExpression: "embed_text(_utf8mb4'tidbcloud_free/amazon/titan-embed-text-v2', `description`, _utf8mb4'{\"dimensions\":1024}')",
 		}
 		return meta
 	}

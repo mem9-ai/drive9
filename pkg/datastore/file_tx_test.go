@@ -59,7 +59,7 @@ func TestUpdateFileContentTxClearsEmbeddingState(t *testing.T) {
 	var newRev int64
 	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
 		var err error
-		newRev, err = s.UpdateFileContentTx(tx, "f1", StorageDB9, "/blobs/f1-v2", "text/markdown", "sum-2", "new text", []byte("blob-2"), 22)
+		newRev, err = s.UpdateFileContentTx(tx, "f1", StorageDB9, "/blobs/f1-v2", "text/markdown", "sum-2", "new text", []byte("blob-2"), 22, "")
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -132,7 +132,7 @@ func TestUpdateFileContentAutoEmbeddingTxPreservesEmbeddingState(t *testing.T) {
 	var newRev int64
 	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
 		var err error
-		newRev, err = s.UpdateFileContentAutoEmbeddingTx(tx, "f1", StorageDB9, "/blobs/f1-v2", "text/markdown", "sum-2", "new text", []byte("blob-2"), 22)
+		newRev, err = s.UpdateFileContentAutoEmbeddingTx(tx, "f1", StorageDB9, "/blobs/f1-v2", "text/markdown", "sum-2", "new text", []byte("blob-2"), 22, "")
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -199,5 +199,44 @@ func TestEnqueueSemanticTaskTxRollsBackWithOuterTransaction(t *testing.T) {
 	}
 	if count := countSemanticTasks(t, s); count != 1 {
 		t.Fatalf("semantic task count after commit=%d, want 1", count)
+	}
+}
+
+func TestUpdateFileContentTxWithDescription(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID:      "f1",
+		StorageType: StorageDB9,
+		StorageRef:  "/blobs/f1",
+		Revision:    1,
+		Status:      StatusConfirmed,
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var newRev int64
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		var err error
+		newRev, err = s.UpdateFileContentTx(tx, "f1", StorageDB9, "/blobs/f1-v2", "text/markdown", "sum-2", "new text", []byte("blob-2"), 22, "my description")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if newRev != 2 {
+		t.Fatalf("new revision=%d, want 2", newRev)
+	}
+
+	got, err := s.GetFile(context.Background(), "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Description != "my description" {
+		t.Fatalf("description=%q, want %q", got.Description, "my description")
+	}
+	if got.DescriptionEmbeddingRevision != nil {
+		t.Fatalf("description_embedding_revision should be cleared, got %v", got.DescriptionEmbeddingRevision)
 	}
 }

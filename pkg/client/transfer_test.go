@@ -473,6 +473,7 @@ func TestWriteStreamV1WithSummaryRejectsInvalidTagsBeforeInitiate(t *testing.T) 
 		-1,
 		&UploadSummary{},
 		map[string]string{"owner": string([]byte{0xff})},
+		"",
 	)
 	if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
 		t.Fatalf("error = %v, want invalid UTF-8", err)
@@ -746,6 +747,7 @@ func TestWriteStreamV2WithSummaryRejectsInvalidTagsBeforeInitiate(t *testing.T) 
 		-1,
 		&UploadSummary{},
 		map[string]string{"owner": string([]byte{0xff})},
+		"",
 	)
 	if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
 		t.Fatalf("error = %v, want invalid UTF-8", err)
