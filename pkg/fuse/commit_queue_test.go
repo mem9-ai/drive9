@@ -120,14 +120,14 @@ func TestCommitQueueConflictKeepsPendingState(t *testing.T) {
 func TestCommitQueueAutoResolveLWW(t *testing.T) {
 	var uploadCalls, statCalls, readCalls int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodHead:
+		switch r.Method {
+		case http.MethodHead:
 			// Stat: return current revision.
 			statCalls++
 			w.Header().Set("X-Dat9-Revision", "10")
 			w.Header().Set("Content-Length", "12")
 			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodGet:
+		case http.MethodGet:
 			// Read: return different content (triggers LWW).
 			readCalls++
 			w.Header().Set("Content-Type", "application/octet-stream")
@@ -201,12 +201,12 @@ func TestCommitQueueAutoResolveLWW(t *testing.T) {
 func TestCommitQueueAutoResolveIdempotent(t *testing.T) {
 	sameContent := []byte("identical!")
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodHead:
+		switch r.Method {
+		case http.MethodHead:
 			w.Header().Set("X-Dat9-Revision", "8")
 			w.Header().Set("Content-Length", "10")
 			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodGet:
+		case http.MethodGet:
 			w.Header().Set("Content-Type", "application/octet-stream")
 			_, _ = w.Write(sameContent)
 		default:
@@ -256,12 +256,12 @@ func TestCommitQueueAutoResolveIdempotent(t *testing.T) {
 // Test axis 3: 409 → fetch → LWW re-upload → second 409 → PendingConflict fallback.
 func TestCommitQueueAutoResolveLWWSecond409Fallback(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodHead:
+		switch r.Method {
+		case http.MethodHead:
 			w.Header().Set("X-Dat9-Revision", "10")
 			w.Header().Set("Content-Length", "12")
 			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodGet:
+		case http.MethodGet:
 			w.Header().Set("Content-Type", "application/octet-stream")
 			_, _ = w.Write([]byte("server-data!"))
 		default:
