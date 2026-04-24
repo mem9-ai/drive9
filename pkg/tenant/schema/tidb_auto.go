@@ -1302,20 +1302,13 @@ func missingTableAndIndexDiffs(table tidbTableSpec) []tidbSchemaDiff {
 }
 
 func plannedTiDBSchemaRepairs(diffs []tidbSchemaDiff) []string {
-	tableMissing := make(map[string]bool)
-	for _, diff := range diffs {
-		if diff.kind == tidbSchemaDiffMissingTable {
-			tableMissing[diff.tableName] = true
-		}
-	}
-
 	seen := make(map[string]struct{})
 	plans := make([]string, 0, len(diffs))
 	for _, diff := range diffs {
 		if diff.repairSQL == "" {
 			continue
 		}
-		if !isSafeTiDBRepairDiff(diff, tableMissing) {
+		if !isSafeTiDBRepairDiff(diff) {
 			continue
 		}
 		if _, ok := seen[diff.repairSQL]; ok {
@@ -1327,24 +1320,38 @@ func plannedTiDBSchemaRepairs(diffs []tidbSchemaDiff) []string {
 	return plans
 }
 
-func isSafeTiDBRepairDiff(diff tidbSchemaDiff, tableMissing map[string]bool) bool {
+func isSafeTiDBRepairDiff(diff tidbSchemaDiff) bool {
 	switch diff.kind {
 	case tidbSchemaDiffMissingTable:
 		return true
 	case tidbSchemaDiffMissingColumn:
 		return isSafeAddColumnRepairSQL(diff.repairSQL)
 	case tidbSchemaDiffMissingIndex:
-		return isSafeAddIndexRepairSQL(diff.repairSQL, tableMissing[diff.tableName])
+		return isSafeAddIndexRepairSQL(diff.repairSQL)
 	default:
 		return false
 	}
 }
 
 func isSafeAddColumnRepairSQL(sqlText string) bool {
+	// STORED GENERATED VECTOR columns whose expression uses EMBED_TEXT are
+	// safe to add to existing tables via ALTER TABLE in the correctness sense:
+	// TiDB computes the values server-side rather than requiring the client to
+	// backfill. Note that this still materializes one EMBED_TEXT call per
+	// existing row at ALTER time, which can be slow and carry inference cost
+	// for large tables. This covers the description_embedding column introduced
+	// for auto-embedding mode.
+	normalized := normalizeSQLFragment(sqlText)
+	if strings.Contains(normalized, " generated ") &&
+		strings.Contains(normalized, " stored") &&
+		strings.Contains(normalized, " vector(") &&
+		strings.Contains(normalized, "embed_text(") {
+		return true
+	}
 	return schemaspec.IsSafeAddColumnRepairSQL(sqlText)
 }
 
-func isSafeAddIndexRepairSQL(sqlText string, tableMissing bool) bool {
+func isSafeAddIndexRepairSQL(sqlText string) bool {
 	normalized := normalizeSQLFragment(sqlText)
 	if strings.HasPrefix(normalized, "create index ") {
 		return true
@@ -1357,7 +1364,11 @@ func isSafeAddIndexRepairSQL(sqlText string, tableMissing bool) bool {
 			return true
 		}
 		if strings.Contains(normalized, " add fulltext index ") || strings.Contains(normalized, " add vector index ") {
-			return tableMissing
+			// FULLTEXT and VECTOR indexes are always safe to add on an existing
+			// table in auto-embedding mode: TiDB Cloud supports the syntax, and
+			// applyTiDBSchemaRepairs will gracefully skip with a warning if the
+			// current TiDB version does not.
+			return true
 		}
 		if strings.Contains(normalized, " add index ") || strings.Contains(normalized, " add key ") {
 			return true
@@ -1384,6 +1395,17 @@ func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string
 			if isIgnorableTiDBSchemaError(err) {
 				continue
 			}
+			// FULLTEXT and VECTOR index repairs may fail with optional-feature
+			// errors on TiDB versions or configurations that do not support
+			// them (e.g. 8200: FULLTEXT index must specify one column name,
+			// 1105: FULLTEXT index is not supported). Treat these the same as
+			// when the statement was skipped during initial provisioning.
+			if isFulltextOrVectorIndexRepairSQL(stmt) && isIgnorableOptionalSchemaError(err) {
+				logger.Warn(ctx, "tidb_schema_repair_optional_index_skipped",
+					zap.String("statement", schemaStatementSnippet(stmt)),
+					zap.Error(err))
+				continue
+			}
 			return fmt.Errorf("apply tidb schema repair %q: %w", schemaStatementSnippet(stmt), err)
 		}
 	}
@@ -1397,6 +1419,12 @@ func isUniqueIndexRepairSQL(sqlText string) bool {
 	}
 	return strings.HasPrefix(normalized, "alter table ") &&
 		(strings.Contains(normalized, " add unique index ") || strings.Contains(normalized, " add unique key "))
+}
+
+func isFulltextOrVectorIndexRepairSQL(sqlText string) bool {
+	normalized := normalizeSQLFragment(sqlText)
+	return strings.Contains(normalized, " add fulltext index ") ||
+		strings.Contains(normalized, " add vector index ")
 }
 
 func parseUniqueIndexRepairStatement(stmt string) (tidbUniqueIndexRepair, bool) {
