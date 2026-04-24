@@ -85,7 +85,7 @@ func SecretSet(args []string) error {
 	ctx := context.Background()
 	if _, err := c.CreateVaultSecret(ctx, name, fields); err != nil {
 		if errors.Is(err, client.ErrConflict) {
-			return fmt.Errorf("secret %q already exists; `drive9 vault set` will not overwrite — "+
+			return fmt.Errorf("secret %q already exists; `drive9 vault set` will not overwrite; "+
 				"to replace it wholesale use `drive9 vault put /n/vault/%s --from <dir>`, "+
 				"or delete first with `drive9 vault rm %s` and re-run", name, name, name)
 		}
