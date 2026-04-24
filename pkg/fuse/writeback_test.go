@@ -2604,6 +2604,87 @@ func TestPreload_LazyLoad_SmallFile(t *testing.T) {
 	}
 }
 
+func TestLookupCanceledStatReturnsEIO(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+			if err := r.Context().Err(); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	c := client.New(ts.URL, "")
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+
+	cancel := make(chan struct{})
+	resultCh := make(chan gofuse.Status, 1)
+
+	go func() {
+		var out gofuse.EntryOut
+		resultCh <- fs.Lookup(cancel, &gofuse.InHeader{NodeId: 1}, "canceled.txt", &out)
+	}()
+
+	<-started
+	close(cancel)
+	close(release)
+
+	st := <-resultCh
+	if st != gofuse.EIO {
+		t.Fatalf("Lookup status = %v, want EIO", st)
+	}
+}
+
+func TestLookupNotFoundReturnsENOENT(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			http.Error(w, "not found", http.StatusNotFound)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			http.Error(w, "not found", http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	c := client.New(ts.URL, "")
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "missing.txt", &out)
+	if st != gofuse.ENOENT {
+		t.Fatalf("Lookup status = %v, want ENOENT", st)
+	}
+	if out.NodeId != 0 {
+		t.Fatalf("Lookup NodeId = %d, want 0 for negative lookup", out.NodeId)
+	}
+}
+
 // TestRmdir_CleansPendingDescendants verifies that Rmdir removes write-back
 // cache entries for files under the deleted directory.
 func TestRmdir_CleansPendingDescendants(t *testing.T) {

@@ -259,6 +259,9 @@ func traceFusePath(path string) bool {
 	if strings.Contains(path, "/fuse-e2e-") {
 		return true
 	}
+	if strings.Contains(path, "/__juicefs_benchmark_") {
+		return true
+	}
 	if path == "/fuse-it" || strings.HasPrefix(path, "/fuse-it/") {
 		return true
 	}
@@ -442,6 +445,18 @@ func (fs *Dat9FS) applyAsyncCommittedRevision(remotePath string, revision int64)
 	if revision <= 0 {
 		return
 	}
+	if traceFusePath(remotePath) {
+		_, hadLivePending := fs.getLivePending(remotePath)
+		if ino, ok := fs.inodes.GetInode(remotePath); ok {
+			if entry, ok := fs.inodes.GetEntry(ino); ok && entry != nil {
+				logFuseTrace("async-commit-success begin path=%s revision=%d had_live_pending=%t inode=%d inode_rev=%d inode_size=%d", remotePath, revision, hadLivePending, ino, entry.Revision, entry.Size)
+			} else {
+				logFuseTrace("async-commit-success begin path=%s revision=%d had_live_pending=%t inode=%d inode_entry_missing=true", remotePath, revision, hadLivePending, ino)
+			}
+		} else {
+			logFuseTrace("async-commit-success begin path=%s revision=%d had_live_pending=%t inode_missing=true", remotePath, revision, hadLivePending)
+		}
+	}
 
 	if ino, ok := fs.inodes.GetInode(remotePath); ok {
 		fs.inodes.UpdateRevision(ino, revision)
@@ -474,7 +489,10 @@ func (fs *Dat9FS) applyAsyncCommittedRevision(remotePath string, revision int64)
 	}
 
 	fs.livePendingMu.Lock()
+	clearedLivePending := false
+	hadLivePending := false
 	if snap, ok := fs.livePending[remotePath]; ok {
+		hadLivePending = true
 		if hasDirtyHandle {
 			snap.IsNew = false
 			if snap.BaseRev < revision {
@@ -483,9 +501,22 @@ func (fs *Dat9FS) applyAsyncCommittedRevision(remotePath string, revision int64)
 			fs.livePending[remotePath] = snap
 		} else {
 			delete(fs.livePending, remotePath)
+			clearedLivePending = true
 		}
 	}
 	fs.livePendingMu.Unlock()
+
+	if traceFusePath(remotePath) {
+		if ino, ok := fs.inodes.GetInode(remotePath); ok {
+			if entry, ok := fs.inodes.GetEntry(ino); ok && entry != nil {
+				logFuseTrace("async-commit-success end path=%s revision=%d had_live_pending=%t cleared_live_pending=%t has_dirty_handle=%t inode=%d inode_rev=%d inode_size=%d notify_inode=false notify_entry=false", remotePath, revision, hadLivePending, clearedLivePending, hasDirtyHandle, ino, entry.Revision, entry.Size)
+			} else {
+				logFuseTrace("async-commit-success end path=%s revision=%d had_live_pending=%t cleared_live_pending=%t has_dirty_handle=%t inode=%d inode_entry_missing=true notify_inode=false notify_entry=false", remotePath, revision, hadLivePending, clearedLivePending, hasDirtyHandle, ino)
+			}
+		} else {
+			logFuseTrace("async-commit-success end path=%s revision=%d had_live_pending=%t cleared_live_pending=%t has_dirty_handle=%t inode_missing=true notify_inode=false notify_entry=false", remotePath, revision, hadLivePending, clearedLivePending, hasDirtyHandle)
+		}
+	}
 }
 
 func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
@@ -877,7 +908,16 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	stat, err := fs.client.StatCtx(ctx, childP)
 	if err != nil {
 		if traceFusePath(childP) {
-			logFuseTrace("lookup remote-stat-error path=%s err=%v", childP, err)
+			_, hasLivePending := fs.getLivePending(childP)
+			if ino, ok := fs.inodes.GetInode(childP); ok {
+				if entry, ok := fs.inodes.GetEntry(ino); ok && entry != nil {
+					logFuseTrace("lookup remote-stat-error path=%s err=%v fuse_status=%d has_live_pending=%t inode=%d inode_rev=%d inode_size=%d", childP, err, httpToFuseStatus(err), hasLivePending, ino, entry.Revision, entry.Size)
+				} else {
+					logFuseTrace("lookup remote-stat-error path=%s err=%v fuse_status=%d has_live_pending=%t inode=%d inode_entry_missing=true", childP, err, httpToFuseStatus(err), hasLivePending, ino)
+				}
+			} else {
+				logFuseTrace("lookup remote-stat-error path=%s err=%v fuse_status=%d has_live_pending=%t inode_missing=true", childP, err, httpToFuseStatus(err), hasLivePending)
+			}
 		}
 		if !isNotFoundErr(err) {
 			return httpToFuseStatus(err)

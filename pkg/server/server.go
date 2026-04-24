@@ -870,7 +870,11 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 
 func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string) {
 	b := backendFromRequest(r)
+	tracePath := path == "/.stats" || path == "/.jfs.stats" || strings.Contains(path, "/__juicefs_benchmark_")
 	if b == nil {
+		if tracePath {
+			logger.Warn(r.Context(), "server_stat_trace", eventFields(r.Context(), "stat_missing_scope_trace", "path", path)...)
+		}
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "stat_missing_scope", "path", path)...)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
@@ -878,9 +882,15 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	nf, err := b.StatNodeCtx(r.Context(), path)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
+			if tracePath {
+				logger.Warn(r.Context(), "server_stat_trace", eventFields(r.Context(), "stat_not_found_trace", "path", path)...)
+			}
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "stat_not_found", "path", path)...)
 			w.WriteHeader(http.StatusNotFound)
 			return
+		}
+		if tracePath {
+			logger.Error(r.Context(), "server_stat_trace", eventFields(r.Context(), "stat_failed_trace", "path", path, "error", err)...)
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_failed", "path", path, "error", err)...)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -901,6 +911,9 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 		}
 	} else {
 		w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(nf.Node.CreatedAt.Unix(), 10))
+	}
+	if tracePath {
+		logger.Info(r.Context(), "server_stat_trace", eventFields(r.Context(), "stat_ok_trace", "path", path, "is_dir", nf.Node.IsDirectory, "size", size)...)
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_ok", "path", path, "is_dir", nf.Node.IsDirectory)...)
 	w.WriteHeader(http.StatusOK)
