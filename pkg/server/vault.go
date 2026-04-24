@@ -101,8 +101,30 @@ func (s *Server) handleVaultSecrets(w http.ResponseWriter, r *http.Request, sub 
 		return
 	}
 
-	// /v1/vault/secrets/{name}
+	// /v1/vault/secrets/{name}[/value[/{field}]]
 	name := strings.TrimPrefix(sub, "/")
+
+	// Owner-read: /v1/vault/secrets/{name}/value[/{field}]
+	if i := strings.Index(name, "/value"); i >= 0 {
+		secretName := name[:i]
+		rest := name[i+len("/value"):]
+		if r.Method != http.MethodGet {
+			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if rest == "" {
+			s.handleVaultSecretReadValue(w, r, vs, tenantID, secretName)
+		} else {
+			fieldName := strings.TrimPrefix(rest, "/")
+			if fieldName == "" {
+				errJSON(w, http.StatusBadRequest, "field name required after /value/")
+				return
+			}
+			s.handleVaultSecretReadField(w, r, vs, tenantID, secretName, fieldName)
+		}
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
 		s.handleVaultSecretGet(w, r, vs, tenantID, name)
@@ -198,6 +220,74 @@ func (s *Server) handleVaultSecretGet(w http.ResponseWriter, r *http.Request, vs
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(sec)
+}
+
+// handleVaultSecretReadValue returns all decrypted fields for a secret (owner-read path).
+// Response shape matches handleVaultReadSecret (Invariant #9: response schema parity).
+func (s *Server) handleVaultSecretReadValue(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, secretName string) {
+	fields, err := vs.ReadSecretFields(r.Context(), tenantID, secretName)
+	if err != nil {
+		if errors.Is(err, vault.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "not found")
+			return
+		}
+		errJSON(w, http.StatusInternalServerError, "failed to read secret")
+		return
+	}
+
+	scope := ScopeFromContext(r.Context())
+	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
+		TenantID:   tenantID,
+		EventType:  "secret.read",
+		TokenID:    "owner:" + scope.APIKeyID,
+		SecretName: secretName,
+		Adapter:    "management-api",
+	})
+
+	format := r.URL.Query().Get("format")
+	switch format {
+	case "env":
+		w.Header().Set("Content-Type", "text/plain")
+		for k, v := range fields {
+			_, _ = fmt.Fprintf(w, "%s=%s\n", strings.ToUpper(k), string(v))
+		}
+	case "json", "":
+		result := make(map[string]string, len(fields))
+		for k, v := range fields {
+			result[k] = string(v)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(result)
+	default:
+		errJSON(w, http.StatusBadRequest, "unsupported format")
+	}
+}
+
+// handleVaultSecretReadField returns a single decrypted field (owner-read path).
+// Response shape matches handleVaultReadField (Invariant #9: response schema parity).
+func (s *Server) handleVaultSecretReadField(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, secretName, fieldName string) {
+	plaintext, err := vs.ReadSecretField(r.Context(), tenantID, secretName, fieldName)
+	if err != nil {
+		if errors.Is(err, vault.ErrNotFound) || errors.Is(err, vault.ErrFieldNotFound) {
+			errJSON(w, http.StatusNotFound, "not found")
+			return
+		}
+		errJSON(w, http.StatusInternalServerError, "failed to read field")
+		return
+	}
+
+	scope := ScopeFromContext(r.Context())
+	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
+		TenantID:   tenantID,
+		EventType:  "secret.read",
+		TokenID:    "owner:" + scope.APIKeyID,
+		SecretName: secretName,
+		FieldName:  fieldName,
+		Adapter:    "management-api",
+	})
+
+	w.Header().Set("Content-Type", "text/plain")
+	_, _ = w.Write(plaintext)
 }
 
 func (s *Server) handleVaultSecretUpdate(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, name string) {
