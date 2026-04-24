@@ -244,21 +244,50 @@ func (s *Store) UpdateSecret(ctx context.Context, tenantID, name, updatedBy stri
 	}, nil
 }
 
-// DeleteSecret soft-deletes a secret.
+// DeleteSecret hard-deletes a secret and all of its fields.
+//
+// Previously this was a soft-delete (UPDATE ... SET deleted_at = NOW()), but
+// the unique index uk_vault_secrets_tenant_name does not include deleted_at,
+// so a subsequent `vault set <same-name>` collided with the tombstoned row and
+// surfaced as "already exists" — a surprising and broken UX given the user
+// just ran `vault rm`. Audit history lives in vault_audit_log, not in the
+// secret row itself, so a hard delete preserves the audit trail while making
+// rm + set work the way users expect.
+//
+// For backward compatibility with any historical soft-deleted rows, we drop
+// the row regardless of deleted_at state (no `AND deleted_at IS NULL`), so a
+// `vault rm` over a tombstoned row from the old scheme also clears the unique
+// slot.
 func (s *Store) DeleteSecret(ctx context.Context, tenantID, name string) error {
-	now := time.Now()
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE vault_secrets SET deleted_at = ? WHERE tenant_id = ? AND name = ? AND deleted_at IS NULL`,
-		now, tenantID, name,
-	)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
+	defer func() { _ = tx.Rollback() }()
+
+	var secretID string
+	err = tx.QueryRowContext(ctx,
+		`SELECT secret_id FROM vault_secrets WHERE tenant_id = ? AND name = ?`,
+		tenantID, name,
+	).Scan(&secretID)
+	if err == sql.ErrNoRows {
 		return ErrNotFound
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM vault_secret_fields WHERE secret_id = ?`, secretID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM vault_secrets WHERE secret_id = ?`, secretID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ReadSecretFields decrypts and returns all fields of a secret.
