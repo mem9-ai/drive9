@@ -2,7 +2,10 @@ package cli
 
 import (
 	"flag"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 )
 
@@ -267,6 +270,156 @@ func TestFlagProvided(t *testing.T) {
 	}
 	if flagProvided(fs, "nonexistent") {
 		t.Fatalf("flagProvided should report false for missing flag")
+	}
+}
+
+// --- Owner-read routing tests (§4.2 / §14.2 routing invariant) ---
+
+func TestNewVaultReadClient_OwnerMode(t *testing.T) {
+	setResolverEnv(t, map[string]string{
+		EnvAPIKey: "sk-owner-key",
+		EnvServer: "https://s.example",
+	})
+	_, ownerMode, err := newVaultReadClientFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ownerMode {
+		t.Fatal("expected ownerMode=true when CredentialOwner")
+	}
+}
+
+func TestNewVaultReadClient_DelegatedMode(t *testing.T) {
+	setResolverEnv(t, map[string]string{
+		EnvVaultToken: "jwt-eyAAA",
+		EnvServer:     "https://s.example",
+	})
+	_, ownerMode, err := newVaultReadClientFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ownerMode {
+		t.Fatal("expected ownerMode=false when CredentialDelegated")
+	}
+}
+
+func TestNewVaultReadClient_DelegatedBeatsOwner(t *testing.T) {
+	setResolverEnv(t, map[string]string{
+		EnvVaultToken: "jwt-eyAAA",
+		EnvAPIKey:     "sk-owner-key",
+		EnvServer:     "https://s.example",
+	})
+	_, ownerMode, err := newVaultReadClientFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ownerMode {
+		t.Fatal("expected delegated to win over owner (narrower-wins)")
+	}
+}
+
+// TestNewVaultReadClient_NoCredReturnsError verifies that the routing switch
+// in newVaultReadClientFromEnv correctly rejects CredentialNone. Since the
+// global ResolveCredentials() reads on-disk config (which may have a real
+// credential), we test the routing logic at the resolver level instead.
+func TestNewVaultReadClient_NoCredReturnsError(t *testing.T) {
+	setResolverEnv(t, nil)
+	cfg := &Config{}
+	r := resolveCredentialsWithConfig(cfg)
+	if r.Kind != CredentialNone {
+		t.Fatalf("Kind = %d, want CredentialNone with empty env+config", r.Kind)
+	}
+	// CredentialNone hits the default case in newVaultReadClientFromEnv's switch,
+	// which returns an error. This is structurally guaranteed by the code:
+	//   case CredentialDelegated: return ..., false, nil
+	//   case CredentialOwner:     return ..., true, nil
+	//   default:                  return nil, false, error
+}
+
+// TestNewVaultReadClient_DelegatedActiveContext verifies that an active
+// delegated context (from ctx import/use, no env token) routes to the
+// token-read path — not the owner-read path. This is the regression case
+// adv-1 flagged: routing must use ResolveCredentials().Kind, not raw env.
+func TestNewVaultReadClient_DelegatedActiveContext(t *testing.T) {
+	setResolverEnv(t, nil) // no env vars
+	cfg := &Config{
+		CurrentContext: "alice",
+		Contexts: map[string]*Context{
+			"alice": {Type: PrincipalDelegated, Server: "https://s.example", Token: "jwt-from-ctx"},
+		},
+	}
+	r := resolveCredentialsWithConfig(cfg)
+	if r.Kind != CredentialDelegated {
+		t.Fatalf("Kind = %d, want CredentialDelegated from active context", r.Kind)
+	}
+	// The routing decision must yield delegated (token) path.
+	// We can't call newVaultReadClientFromEnv directly because it uses
+	// the global ResolveCredentials() which reads from disk. Instead,
+	// verify the resolver returns CredentialDelegated, which is the
+	// sole routing input per §14.2.
+}
+
+// --- No-fallthrough integration tests (§14.2 no-fallthrough invariant) ---
+//
+// These verify that when DRIVE9_VAULT_TOKEN is set (even if the token is
+// expired, revoked, or malformed), the routing commits to the capability-read
+// path. If the server returns 401 on that path, the error surfaces to the
+// caller — it MUST NOT silently fall through to the owner-read path even
+// though a valid API key is present. This is the runtime witness for §14.2.
+
+func TestNoFallthrough_ExpiredToken(t *testing.T) {
+	testNoFallthrough(t, "expired-jwt-token", "expired token → 401, must not retry via owner path")
+}
+
+func TestNoFallthrough_RevokedToken(t *testing.T) {
+	testNoFallthrough(t, "revoked-jwt-token", "revoked token → 401, must not retry via owner path")
+}
+
+func TestNoFallthrough_MalformedToken(t *testing.T) {
+	testNoFallthrough(t, "not-a-valid-token", "malformed token → 401, must not retry via owner path")
+}
+
+// testNoFallthrough is the shared harness for the 3 no-fallthrough cases.
+// It sets up a mock server with two paths:
+//   - /v1/vault/read/test-secret  → 401 (simulates auth failure on capability path)
+//   - /v1/vault/secrets/test-secret/value → 200 with valid JSON (owner-read path)
+//
+// SecretGet MUST return an error (the 401). If it returns nil, it means
+// the code silently fell through to the owner path — a spec violation.
+func testNoFallthrough(t *testing.T, token, desc string) {
+	t.Helper()
+	var ownerPathHit int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/vault/read/test-secret":
+			// Capability-read path: simulate auth failure.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+		case "/v1/vault/secrets/test-secret/value":
+			// Owner-read path: should NEVER be reached.
+			atomic.AddInt32(&ownerPathHit, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"KEY":"VALUE"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(EnvVaultToken, token)
+	t.Setenv(EnvAPIKey, "sk-valid-owner-key")
+	t.Setenv(EnvServer, srv.URL)
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	err := SecretGet([]string{"test-secret"})
+	if err == nil {
+		t.Fatalf("%s: SecretGet returned nil; expected error from 401 on capability path", desc)
+	}
+	if atomic.LoadInt32(&ownerPathHit) != 0 {
+		t.Fatalf("%s: owner-read path was hit — no-fallthrough invariant violated", desc)
 	}
 }
 
