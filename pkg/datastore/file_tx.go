@@ -53,7 +53,8 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 			if preserveEmbedding {
 				// Auto-embedding mode: the database owns embedding via generated
 				// column, so we only need to keep the revision tracker in sync.
-				query += ` description_embedding_revision = revision,`
+				// Use revision + 1 because this same UPDATE also increments revision.
+				query += ` description_embedding_revision = revision + 1,`
 			} else {
 				query += ` description_embedding = NULL, description_embedding_revision = NULL,`
 			}
