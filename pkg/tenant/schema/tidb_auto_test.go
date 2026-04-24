@@ -598,8 +598,11 @@ func TestTiDBSchemaSpecForModeIncludesAlterTableIndexes(t *testing.T) {
 	// enforceable schema contract and must appear in the spec. TiDB Cloud
 	// (the only platform where auto mode runs) supports ADD_COLUMNAR_REPLICA_ON_DEMAND.
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "files")
-	if _, ok := spec.indexes["idx_fts_content_desc"]; !ok {
-		t.Fatal("files auto mode spec must include idx_fts_content_desc index")
+	if _, ok := spec.indexes["idx_fts_content"]; !ok {
+		t.Fatal("files missing idx_fts_content index spec from ALTER TABLE statement")
+	}
+	if _, ok := spec.indexes["idx_fts_description"]; !ok {
+		t.Fatal("files missing idx_fts_description index spec from ALTER TABLE statement")
 	}
 	if _, ok := spec.indexes["idx_files_cosine"]; !ok {
 		t.Fatal("files auto mode spec must include idx_files_cosine index")
@@ -614,8 +617,11 @@ func TestTiDBSchemaSpecForAppModeExcludesOptionalIndexes(t *testing.T) {
 	// is not supported on all TiDB versions. They must not appear in the app
 	// mode schema contract so that validation does not fail when they are skipped.
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeApp, "files")
-	if _, ok := spec.indexes["idx_fts_content_desc"]; ok {
-		t.Fatal("files app mode spec must not include optional idx_fts_content_desc index")
+	if _, ok := spec.indexes["idx_fts_content"]; ok {
+		t.Fatal("files app mode spec must not include optional idx_fts_content index")
+	}
+	if _, ok := spec.indexes["idx_fts_description"]; ok {
+		t.Fatal("files app mode spec must not include optional idx_fts_description index")
 	}
 	if _, ok := spec.indexes["idx_files_cosine"]; ok {
 		t.Fatal("files app mode spec must not include optional idx_files_cosine index")
@@ -631,8 +637,8 @@ func TestPlannedTiDBSchemaRepairsIncludesFulltextVectorIndexOnExistingTable(t *t
 		{
 			kind:      tidbSchemaDiffMissingIndex,
 			tableName: "files",
-			detail:    "files schema contract: missing idx_fts_content_desc index",
-			repairSQL: "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content_desc(content_text, description)",
+			detail:    "files schema contract: missing idx_fts_content index",
+			repairSQL: "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)",
 		},
 	}
 
@@ -640,7 +646,7 @@ func TestPlannedTiDBSchemaRepairsIncludesFulltextVectorIndexOnExistingTable(t *t
 	if len(got) != 1 {
 		t.Fatalf("expected fulltext index repair to be included for existing table, got %#v", got)
 	}
-	if got[0] != "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content_desc(content_text, description)" {
+	if got[0] != "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)" {
 		t.Fatalf("unexpected repair statement: %q", got[0])
 	}
 }
@@ -655,8 +661,8 @@ func TestPlannedTiDBSchemaRepairsAllowsHeavyAlterTableIndexRepairsWhenTableMissi
 		{
 			kind:      tidbSchemaDiffMissingIndex,
 			tableName: "files",
-			detail:    "files schema contract: missing idx_fts_content_desc index",
-			repairSQL: "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content_desc(content_text, description)",
+			detail:    "files schema contract: missing idx_fts_content index",
+			repairSQL: "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)",
 		},
 	}
 
@@ -664,7 +670,7 @@ func TestPlannedTiDBSchemaRepairsAllowsHeavyAlterTableIndexRepairsWhenTableMissi
 	if len(got) != 2 {
 		t.Fatalf("expected create table and heavy index repair, got %#v", got)
 	}
-	if got[1] != "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content_desc(content_text, description)" {
+	if got[1] != "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)" {
 		t.Fatalf("unexpected second repair statement: %q", got[1])
 	}
 }

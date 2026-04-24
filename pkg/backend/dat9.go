@@ -422,13 +422,18 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		if err := b.ensureStorageQuota(ctx, tx, path, int64(len(data))); err != nil {
 			return err
 		}
-		if err := b.store.InsertFileTx(tx, &datastore.File{
+		fileRev := int64(1)
+		insertFile := &datastore.File{
 			FileID: fileID, StorageType: storageType, StorageRef: storageRef,
 			ContentBlob: contentBlob,
 			ContentType: contentType, SizeBytes: int64(len(data)),
-			ChecksumSHA256: checksum, Revision: 1, Status: datastore.StatusConfirmed,
+			ChecksumSHA256: checksum, Revision: fileRev, Status: datastore.StatusConfirmed,
 			ContentText: contentText, Description: description, CreatedAt: now, ConfirmedAt: &now,
-		}); err != nil {
+		}
+		if b.UsesDatabaseAutoEmbedding() && description != "" {
+			insertFile.DescriptionEmbeddingRevision = &fileRev
+		}
+		if err := b.store.InsertFileTx(tx, insertFile); err != nil {
 			return err
 		}
 		if err := b.store.EnsureParentDirsTx(tx, path, b.genID); err != nil {

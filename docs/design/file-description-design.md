@@ -405,13 +405,25 @@ For auto-embedding mode, `VectorSearchDescriptionByText` is analogous, using `EM
 
 Currently `FTSSearch` only searches `content_text`. To include description in full-text search, there are two options:
 
-- **Option A (Recommended)**: Combine `content_text` and `description` in `FTSSearch`. TiDB's `fts_match_word` supports FULLTEXT INDEX on multiple columns, but the current schema only has `idx_fts_content(content_text)`. It can be changed to:
+- **Option A (Recommended)**: Combine `content_text` and `description` in `FTSSearch`. TiDB does **not** support multi-column FULLTEXT indexes, so separate indexes are required:
   ```sql
   ALTER TABLE files
-      DROP FULLTEXT INDEX idx_fts_content,
-      ADD FULLTEXT INDEX idx_fts_content_desc(content_text, description);
+      ADD FULLTEXT INDEX idx_fts_content(content_text)
+      WITH PARSER MULTILINGUAL ADD_COLUMNAR_REPLICA_ON_DEMAND;
+  ALTER TABLE files
+      ADD FULLTEXT INDEX idx_fts_description(description)
+      WITH PARSER MULTILINGUAL ADD_COLUMNAR_REPLICA_ON_DEMAND;
   ```
-  Then change the `fts_match_word` target in `FTSSearch` to `(content_text, description)`.
+  Then change `FTSSearch` to query both columns separately and merge results:
+  ```sql
+  SELECT file_id, MAX(score) AS score FROM (
+      SELECT file_id, fts_match_word('...', content_text) AS score
+      FROM files WHERE status = 'CONFIRMED' AND fts_match_word('...', content_text)
+      UNION ALL
+      SELECT file_id, fts_match_word('...', description) AS score
+      FROM files WHERE status = 'CONFIRMED' AND fts_match_word('...', description)
+  ) fts GROUP BY file_id ORDER BY score DESC LIMIT ?
+  ```
 - **Option B**: Keep the status quo; description only participates in vector recall, not FTS. Because descriptions are usually human-written summaries, vector semantic matching is often more suitable than keyword matching.
 
 **This design recommends Option A**, allowing description to participate in both FTS and vector recall to maximize recall. However, the schema change must be synchronized across all providers.
@@ -423,7 +435,7 @@ Currently `FTSSearch` only searches `content_text`. To include description in fu
 ### Schema
 - [ ] `pkg/tenant/schema/tidb_app.go` — add `description`, `description_embedding`, `description_embedding_revision` to `files`; add `description` to `uploads`.
 - [ ] `pkg/tenant/schema/tidb_auto.go` — same as above, but `description_embedding` is a generated column.
-- [ ] `pkg/tenant/schema/db9/schema.go` — same as above, plus `hnsw` index; extend FULLTEXT index to `(content_text, description)`.
+- [ ] `pkg/tenant/schema/db9/schema.go` — same as above, plus `hnsw` index; add separate FULLTEXT indexes on `content_text` and `description`.
 - [ ] Run `drive9-server schema dump-init-sql --provider tidb_cloud_starter` and update externally managed schema.
 
 ### Datastore
