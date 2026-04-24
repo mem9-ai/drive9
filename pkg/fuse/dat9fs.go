@@ -673,12 +673,12 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, remotePath stri
 	// that treat open/stat failures as terminal and never retry in user space.
 	// Absorb short-lived metadata probe interruptions here before returning to
 	// the kernel-facing path.
-	if trackLookupMetrics {
-		fs.lookupStatRetryTotal.Add(1)
-	}
 	retryCount := fs.lookupStatRetryCount()
 	if retryCount <= 0 {
 		return nil, err
+	}
+	if trackLookupMetrics {
+		fs.lookupStatRetryTotal.Add(1)
 	}
 
 	lastErr := err
