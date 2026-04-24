@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -604,6 +605,144 @@ func TestWriteStreamV2RePresignsExpiredPart(t *testing.T) {
 	}
 	if !completeCalled.Load() {
 		t.Fatal("complete was not called after re-presign retry")
+	}
+}
+
+type flakyPartUploadTransport struct {
+	base     http.RoundTripper
+	failPath string
+	failed   atomic.Bool
+}
+
+func (t *flakyPartUploadTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodPut && req.URL.Path == t.failPath && !t.failed.Swap(true) {
+		return nil, &net.OpError{Op: "write", Net: "tcp", Err: syscall.ENOBUFS}
+	}
+	return t.base.RoundTrip(req)
+}
+
+func TestWriteStreamV2RetriesTransientPartTransportError(t *testing.T) {
+	var partUploads atomic.Int32
+	var completeCalled atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(uploadPlanV2{
+				UploadID:   "v2-enobufs",
+				PartSize:   4,
+				TotalParts: 1,
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-enobufs/presign-batch":
+			_ = json.NewEncoder(w).Encode(struct {
+				Parts []presignedPart `json:"parts"`
+			}{
+				Parts: []presignedPart{{
+					Number:    1,
+					URL:       fmt.Sprintf("http://%s/v2parts/1", r.Host),
+					Size:      4,
+					ExpiresAt: time.Now().Add(time.Minute),
+				}},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/v2parts/1":
+			partUploads.Add(1)
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "data" {
+				http.Error(w, "bad body", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("ETag", `"etag-v2"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/v2-enobufs/complete":
+			completeCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	flaky := &flakyPartUploadTransport{base: c.httpClient.Transport, failPath: "/v2parts/1"}
+	c.httpClient.Transport = flaky
+
+	if err := c.WriteStream(context.Background(), "/retry-v2.bin", bytes.NewReader([]byte("data")), 4, nil); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if !flaky.failed.Load() {
+		t.Fatal("expected first part upload attempt to fail transiently")
+	}
+	if partUploads.Load() != 1 {
+		t.Fatalf("part uploads = %d, want 1 successful upload", partUploads.Load())
+	}
+	if !completeCalled.Load() {
+		t.Fatal("complete was not called after transient retry")
+	}
+}
+
+func TestWriteStreamV1RetriesTransientPartTransportError(t *testing.T) {
+	var partUploads atomic.Int32
+	var completeCalled atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			http.NotFound(w, r)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(UploadPlan{
+				UploadID: "v1-enobufs",
+				PartSize: 4,
+				Parts: []PartURL{{
+					Number: 1,
+					URL:    fmt.Sprintf("http://%s/parts/1", r.Host),
+					Size:   4,
+				}},
+			})
+
+		case r.Method == http.MethodPut && r.URL.Path == "/parts/1":
+			partUploads.Add(1)
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "data" {
+				http.Error(w, "bad body", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("ETag", `"etag-v1"`)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/v1-enobufs/complete":
+			completeCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 1
+	flaky := &flakyPartUploadTransport{base: c.httpClient.Transport, failPath: "/parts/1"}
+	c.httpClient.Transport = flaky
+
+	if err := c.WriteStream(context.Background(), "/retry-v1.bin", bytes.NewReader([]byte("data")), 4, nil); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if !flaky.failed.Load() {
+		t.Fatal("expected first part upload attempt to fail transiently")
+	}
+	if partUploads.Load() != 1 {
+		t.Fatalf("part uploads = %d, want 1 successful upload", partUploads.Load())
+	}
+	if !completeCalled.Load() {
+		t.Fatal("complete was not called after transient retry")
 	}
 }
 

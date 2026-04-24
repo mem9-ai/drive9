@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1942,6 +1943,150 @@ func TestLookupReusesLivePendingInode(t *testing.T) {
 	}
 
 	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+}
+
+func TestApplyAsyncCommittedRevisionClearsCleanLivePending(t *testing.T) {
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://127.0.0.1:1", ""), opts)
+
+	path := "/pending-clean.txt"
+	ino := fs.inodes.Lookup(path, false, 0, time.Now())
+	wb := NewWriteBuffer(path, maxPreloadSize, 0)
+	if _, err := wb.Write(0, []byte("base")); err != nil {
+		t.Fatal(err)
+	}
+	wb.ClearDirty()
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    path,
+		Dirty:   wb,
+		BaseRev: 2,
+		IsNew:   false,
+	}
+	fs.setLivePendingLocked(fh)
+
+	if _, ok := fs.getLivePending(path); !ok {
+		t.Fatal("expected live-pending snapshot before async commit callback")
+	}
+
+	fs.applyAsyncCommittedRevision(path, 3)
+
+	if _, ok := fs.getLivePending(path); ok {
+		t.Fatal("expected live-pending snapshot to clear after async commit for clean path")
+	}
+}
+
+func TestApplyAsyncCommittedRevisionRebasesDirtyLivePending(t *testing.T) {
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://127.0.0.1:1", ""), opts)
+
+	path := "/pending-dirty.txt"
+	ino := fs.inodes.Lookup(path, false, 0, time.Now())
+	wb := NewWriteBuffer(path, maxPreloadSize, 0)
+	if _, err := wb.Write(0, []byte("base")); err != nil {
+		t.Fatal(err)
+	}
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    path,
+		Dirty:   wb,
+		BaseRev: 2,
+		IsNew:   true,
+	}
+	fs.fileHandles.Allocate(fh)
+	fs.setLivePendingLocked(fh)
+
+	fs.applyAsyncCommittedRevision(path, 3)
+
+	snap, ok := fs.getLivePending(path)
+	if !ok {
+		t.Fatal("expected dirty live-pending snapshot to be retained")
+	}
+	if snap.BaseRev != 3 {
+		t.Fatalf("live-pending base_rev = %d, want 3", snap.BaseRev)
+	}
+	if snap.IsNew {
+		t.Fatal("live-pending snapshot should drop IsNew after async commit")
+	}
+	if fh.BaseRev != 2 {
+		t.Fatalf("dirty handle base_rev = %d, want 2 (unchanged while dirty)", fh.BaseRev)
+	}
+}
+
+func TestFlushRebuildsStaleShadowFromLivePendingData(t *testing.T) {
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://127.0.0.1:1", ""), opts)
+
+	shadowStore, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadowStore.Close()
+	pendingIdx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fs.shadowStore = shadowStore
+	fs.pendingIndex = pendingIdx
+	fs.SetWriteBack(cache, nil)
+
+	path := "/stale-shadow.txt"
+	base := []byte("overwrite-1776996224")
+	appendData := []byte("-append")
+
+	ino := fs.inodes.Lookup(path, false, int64(len(base)), time.Now())
+	wb := NewWriteBuffer(path, maxPreloadSize, 0)
+	if _, err := wb.Write(0, base); err != nil {
+		t.Fatal(err)
+	}
+	wb.ClearDirty()
+
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        path,
+		Dirty:       wb,
+		DirtySeq:    fs.markDirtySize(ino, wb.Size()),
+		OrigSize:    int64(len(base)),
+		BaseRev:     1,
+		IsNew:       false,
+		ShadowReady: true, // stale flag: shadow file has already been cleaned up.
+	}
+	fhID := fs.fileHandles.Allocate(fh)
+
+	if shadowStore.Has(path) {
+		t.Fatal("expected no shadow file before append")
+	}
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       fhID,
+		Offset:   uint64(len(base)),
+	}, appendData); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+
+	got, err := shadowStore.ReadAll(path)
+	if err != nil {
+		t.Fatalf("ReadAll shadow: %v", err)
+	}
+	want := append(append([]byte(nil), base...), appendData...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("shadow bytes = %q, want %q", string(got), string(want))
+	}
 }
 
 // TestOpenWritable_PreloadsFromWriteBackCache verifies that opening a file

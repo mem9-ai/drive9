@@ -210,6 +210,11 @@ func (fs *Dat9FS) setLivePendingLocked(fh *FileHandle) {
 	if fh == nil || fh.Dirty == nil || fh.Path == "" {
 		return
 	}
+	hasShadow := fs.shadowReadyForPath(fh.Path, fh.ShadowReady)
+	if fh.ShadowReady && !hasShadow && traceFusePath(fh.Path) {
+		logFuseTrace("live-pending shadow stale path=%s demoting has_shadow=false", fh.Path)
+	}
+	fh.ShadowReady = hasShadow
 	snap := livePendingSnapshot{
 		Path:      fh.Path,
 		Ino:       fh.Ino,
@@ -217,7 +222,7 @@ func (fs *Dat9FS) setLivePendingLocked(fh *FileHandle) {
 		Mtime:     time.Now().Unix(),
 		IsNew:     fh.IsNew,
 		BaseRev:   fh.BaseRev,
-		HasShadow: fh.ShadowReady,
+		HasShadow: hasShadow,
 	}
 	if fh.Dirty.CanMaterializeFull() {
 		snap.Data = append([]byte(nil), fh.Dirty.Bytes()...)
@@ -241,6 +246,13 @@ func (fs *Dat9FS) getLivePending(path string) (livePendingSnapshot, bool) {
 	defer fs.livePendingMu.RUnlock()
 	snap, ok := fs.livePending[path]
 	return snap, ok
+}
+
+func (fs *Dat9FS) shadowReadyForPath(path string, shadowReady bool) bool {
+	if !shadowReady || path == "" || fs.shadowStore == nil {
+		return false
+	}
+	return fs.shadowStore.Has(path)
 }
 
 func traceFusePath(path string) bool {
@@ -435,6 +447,8 @@ func (fs *Dat9FS) applyAsyncCommittedRevision(remotePath string, revision int64)
 		fs.inodes.UpdateRevision(ino, revision)
 	}
 
+	hasDirtyHandle := false
+
 	for _, fh := range fs.fileHandles.Snapshot() {
 		if fh == nil || fh.Path != remotePath || fh.Dirty == nil {
 			continue
@@ -444,6 +458,7 @@ func (fs *Dat9FS) applyAsyncCommittedRevision(remotePath string, revision int64)
 		// Do not advance a handle that still has dirty pages. That handle now
 		// represents a newer local snapshot than the async commit that just finished.
 		if fh.Dirty.HasDirtyParts() {
+			hasDirtyHandle = true
 			fh.Unlock()
 			continue
 		}
@@ -457,6 +472,20 @@ func (fs *Dat9FS) applyAsyncCommittedRevision(remotePath string, revision int64)
 		}
 		fh.Unlock()
 	}
+
+	fs.livePendingMu.Lock()
+	if snap, ok := fs.livePending[remotePath]; ok {
+		if hasDirtyHandle {
+			snap.IsNew = false
+			if snap.BaseRev < revision {
+				snap.BaseRev = revision
+			}
+			fs.livePending[remotePath] = snap
+		} else {
+			delete(fs.livePending, remotePath)
+		}
+	}
+	fs.livePendingMu.Unlock()
 }
 
 func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
@@ -589,6 +618,13 @@ func (fs *Dat9FS) canStageShadowFastLocked(fh *FileHandle) bool {
 func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 	if !fs.canStageShadowFastLocked(fh) {
 		return syscall.ENOTSUP
+	}
+
+	if fh.ShadowReady && !fs.shadowReadyForPath(fh.Path, true) {
+		if traceFusePath(fh.Path) {
+			logFuseTrace("stage shadow stale path=%s has_shadow=true but shadow missing; rebuilding full snapshot", fh.Path)
+		}
+		fh.ShadowReady = false
 	}
 
 	size := fh.Dirty.Size()
@@ -1634,18 +1670,22 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		logFuseTrace("open path=%s flags=%d", p, input.Flags)
 	}
 	if live, ok := fs.getLivePending(p); ok {
+		resolvedShadowReady := fs.shadowReadyForPath(p, live.HasShadow)
+		if live.HasShadow && !resolvedShadowReady && traceFusePath(p) {
+			logFuseTrace("open live-pending stale shadow path=%s has_shadow=true but shadow missing", p)
+		}
 		if traceFusePath(p) {
 			logFuseTrace("open live-pending path=%s size=%d is_new=%t has_shadow=%t data_len=%d", p, live.Size, live.IsNew, live.HasShadow, len(live.Data))
 		}
 		fh := &FileHandle{
-			Ino:        input.NodeId,
-			Path:       p,
-			Flags:      input.Flags,
-			OpenPID:    input.Pid,
-			OrigSize:   live.Size,
-			BaseRev:    live.BaseRev,
-			IsNew:      live.IsNew,
-			ShadowReady: live.HasShadow,
+			Ino:         input.NodeId,
+			Path:        p,
+			Flags:       input.Flags,
+			OpenPID:     input.Pid,
+			OrigSize:    live.Size,
+			BaseRev:     live.BaseRev,
+			IsNew:       live.IsNew,
+			ShadowReady: resolvedShadowReady,
 		}
 		if len(live.Data) > 0 || live.Size == 0 {
 			wb := NewWriteBuffer(p, maxPreloadSize, 0)
@@ -2094,6 +2134,12 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	n, err := fh.Dirty.Write(int64(input.Offset), data)
 	if err != nil {
 		return 0, gofuse.Status(syscall.EFBIG)
+	}
+	if fh.ShadowReady && !fs.shadowReadyForPath(fh.Path, true) {
+		if traceFusePath(fh.Path) {
+			logFuseTrace("write shadow stale path=%s has_shadow=true but shadow missing; disabling write-through", fh.Path)
+		}
+		fh.ShadowReady = false
 	}
 	if fh.ShadowReady && fs.shadowStore != nil {
 		if _, err := fs.shadowStore.WriteAt(fh.Path, int64(input.Offset), data, fh.BaseRev); err != nil {

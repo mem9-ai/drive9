@@ -10,12 +10,14 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/s3client"
@@ -86,9 +88,12 @@ const DefaultSmallFileThreshold = 50_000 // 50,000 bytes — matches embedding m
 //
 // This keeps total in-flight memory bounded regardless of part size.
 const (
-	uploadMaxConcurrency = 16
-	uploadMaxBufferBytes = 256 * 1024 * 1024 // 256 MB
+	uploadMaxConcurrency  = 16
+	uploadMaxBufferBytes  = 256 * 1024 * 1024 // 256 MB
+	uploadPartMaxAttempts = 3
 )
+
+const uploadPartRetryBaseDelay = 100 * time.Millisecond
 
 const (
 	downloadParallelThreshold = 8 << 20
@@ -623,31 +628,91 @@ func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (
 		checksum = computeCRC32C(data)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, part.URL, bytes.NewReader(data))
-	if err != nil {
-		return "", err
-	}
-	for k, v := range part.Headers {
-		if strings.EqualFold(k, "host") {
-			continue
+	for attempt := 1; attempt <= uploadPartMaxAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, part.URL, bytes.NewReader(data))
+		if err != nil {
+			return "", err
 		}
-		req.Header.Set(k, v)
-	}
-	req.ContentLength = int64(len(data))
-	req.Header.Set("x-amz-checksum-crc32c", checksum)
+		for k, v := range part.Headers {
+			if strings.EqualFold(k, "host") {
+				continue
+			}
+			req.Header.Set(k, v)
+		}
+		req.ContentLength = int64(len(data))
+		req.Header.Set("x-amz-checksum-crc32c", checksum)
 
-	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = resp.Body.Close() }()
+		resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
+		if err != nil {
+			if attempt < uploadPartMaxAttempts && shouldRetryPartUploadError(err) {
+				if waitErr := waitUploadPartRetry(ctx, attempt); waitErr != nil {
+					return "", waitErr
+				}
+				continue
+			}
+			return "", err
+		}
 
-	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		if resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			err = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+			if attempt < uploadPartMaxAttempts && shouldRetryPartUploadStatus(resp.StatusCode) {
+				if waitErr := waitUploadPartRetry(ctx, attempt); waitErr != nil {
+					return "", waitErr
+				}
+				continue
+			}
+			return "", err
+		}
+
+		_, _ = io.Copy(io.Discard, resp.Body)
+		etag := resp.Header.Get("ETag")
+		_ = resp.Body.Close()
+		return etag, nil
 	}
 
-	return resp.Header.Get("ETag"), nil
+	return "", fmt.Errorf("part upload exceeded retry attempts")
+}
+
+func shouldRetryPartUploadStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldRetryPartUploadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, syscall.ENOBUFS) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary())
+}
+
+func waitUploadPartRetry(ctx context.Context, attempt int) error {
+	delay := time.Duration(attempt) * uploadPartRetryBaseDelay
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // completeUpload notifies the server that all parts are uploaded.
@@ -911,33 +976,54 @@ var errPresignExpired = fmt.Errorf("presigned URL expired")
 // Phase 1: no per-part checksum header — checksum negotiation deferred to #113/#114.
 // Returns errPresignExpired on 403 so callers can re-presign and retry.
 func (c *Client) uploadOnePartV2(ctx context.Context, part presignedPart, data []byte) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, part.URL, bytes.NewReader(data))
-	if err != nil {
-		return "", err
-	}
-	for k, v := range part.Headers {
-		if strings.EqualFold(k, "host") {
-			continue
+	for attempt := 1; attempt <= uploadPartMaxAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, part.URL, bytes.NewReader(data))
+		if err != nil {
+			return "", err
 		}
-		req.Header.Set(k, v)
-	}
-	req.ContentLength = int64(len(data))
+		for k, v := range part.Headers {
+			if strings.EqualFold(k, "host") {
+				continue
+			}
+			req.Header.Set(k, v)
+		}
+		req.ContentLength = int64(len(data))
 
-	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = resp.Body.Close() }()
+		resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
+		if err != nil {
+			if attempt < uploadPartMaxAttempts && shouldRetryPartUploadError(err) {
+				if waitErr := waitUploadPartRetry(ctx, attempt); waitErr != nil {
+					return "", waitErr
+				}
+				continue
+			}
+			return "", err
+		}
 
-	if resp.StatusCode == http.StatusForbidden {
-		return "", errPresignExpired
-	}
-	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		if resp.StatusCode == http.StatusForbidden {
+			_ = resp.Body.Close()
+			return "", errPresignExpired
+		}
+		if resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			err = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+			if attempt < uploadPartMaxAttempts && shouldRetryPartUploadStatus(resp.StatusCode) {
+				if waitErr := waitUploadPartRetry(ctx, attempt); waitErr != nil {
+					return "", waitErr
+				}
+				continue
+			}
+			return "", err
+		}
+
+		_, _ = io.Copy(io.Discard, resp.Body)
+		etag := resp.Header.Get("ETag")
+		_ = resp.Body.Close()
+		return etag, nil
 	}
 
-	return resp.Header.Get("ETag"), nil
+	return "", fmt.Errorf("part upload exceeded retry attempts")
 }
 
 // presignOnePart fetches a fresh presigned URL for a single part via

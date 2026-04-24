@@ -528,3 +528,133 @@ Mitigation currently applied in code for next Linux verification:
 - Treat `pkg/fuse/mount_integration_test.go` as the primary diagnosis loop.
 - Keep the full smoke test as a confirmation layer, not the first debugger.
 - Preserve mount log artifacts per run under `FUSE_MOUNT_LOG_DIR` for ordering analysis.
+
+## Linux run #3 and append follow-up (2026-04-24)
+
+After applying the close-to-open mitigation in `a1d9275`, Linux integration loop
+`mount_it_v3.log` passed cleanly:
+
+```bash
+go test ./pkg/fuse -run 'TestMountCreateWriteReadPendingNew|TestMountNestedCreateWriteReadPendingNew' -v -count=20
+```
+
+Result:
+
+- `TestMountCreateWriteReadPendingNew`: 20/20 pass
+- `TestMountNestedCreateWriteReadPendingNew`: 20/20 pass
+
+This indicates the immediate reopen race seen in run #2 was materially reduced by
+holding live-pending mappings through `Forget`/release-notify windows.
+
+### New failure exposed by full smoke
+
+When returning to `e2e/fuse-smoke-test.sh`, the earlier create/read failure was no
+longer the blocker. A later append assertion failed with content like:
+
+```text
+want=overwrite-...-append
+got=\0\0\0...-append
+```
+
+Observed characteristics:
+
+- commit queue upload succeeds
+- final file size is consistent with expected append result
+- visible data shows zero-filled prefix before suffix append
+
+### Root-cause hypothesis for append corruption
+
+Likely stale shadow metadata in live-pending reopen paths:
+
+- `livePending.HasShadow` or `fh.ShadowReady` can remain true after shadow file
+  cleanup/removal
+- append write-through then proceeds as if a full base snapshot exists
+- offset write into missing shadow path can reconstruct as sparse/zero prefix
+
+### Current repair in workspace (not yet committed)
+
+`pkg/fuse/dat9fs.go` now re-validates shadow existence before using shadow-fast
+paths and demotes stale state when needed:
+
+1. `setLivePendingLocked`: re-checks `shadowStore.Has(path)` before snapshotting
+   `HasShadow`
+2. `Open` live-pending path: resolves `ShadowReady` from actual shadow existence
+3. `Write`: disables shadow write-through if `ShadowReady=true` but shadow missing
+4. `stageShadowLocked`: demotes stale shadow state and rebuilds full snapshot path
+
+New regression test in `pkg/fuse/writeback_test.go`:
+
+- `TestFlushRebuildsStaleShadowFromLivePendingData`
+
+This test reproduces stale `ShadowReady` on append and verifies Flush rebuilds a
+correct full shadow (`base + append`) without zero-prefix corruption.
+
+### Local validation for the append fix
+
+On Darwin, targeted tests pass:
+
+```bash
+go test ./pkg/fuse -run 'Test(FlushRebuildsStaleShadowFromLivePendingData|OpenWritablePrefersPendingShadowSnapshot|CreateWriteThroughShadow|OpenTruncateWriteThroughShadow|FlushSkipsAsyncShadowForPartialExistingSnapshot|LookupAndOpenReadUseLivePendingForNewFile|LookupReusesLivePendingInode|CreateEntryTracksLivePendingSizeAfterWrite)$'
+```
+
+Next required step remains Linux confirmation with full
+`e2e/fuse-smoke-test.sh`.
+
+## Local follow-up after append-fix implementation (2026-04-24)
+
+After the stale-shadow repair was in place, a local full smoke rerun exposed one
+more append-path issue on close-to-open sequencing:
+
+- `e2e/fuse-smoke-test.sh` progressed past create/read and stale-shadow checks
+- append step still failed because the second close committed with a stale base
+  revision and hit conflict
+
+Evidence from mount trace (`/tmp/drive9_fuse_test/fuse-mount-live-1776997924.log`):
+
+1. commit queue success to revision 3
+2. later lookup still served `livePending` with `base_rev=2`
+3. next append close attempted commit at base revision 2 and conflicted
+
+### Root cause
+
+`applyAsyncCommittedRevision(...)` refreshed inode/handle revision state but did
+not repair or clear `livePending` snapshots. That allowed stale `BaseRev` to
+survive across reopen and cause a CAS mismatch on the next append close.
+
+### Additional repair
+
+`pkg/fuse/dat9fs.go` now updates `livePending` during async-commit callback:
+
+1. if the path has no dirty open handle, clear `livePending[path]` (remote state
+   is now authoritative)
+2. if a dirty handle still exists, keep `livePending` but rebase `BaseRev` to the
+   committed revision and mark `IsNew=false`
+
+New regression tests in `pkg/fuse/writeback_test.go`:
+
+- `TestApplyAsyncCommittedRevisionClearsCleanLivePending`
+- `TestApplyAsyncCommittedRevisionRebasesDirtyLivePending`
+
+### Validation on this machine (Darwin)
+
+1. Focused FUSE regressions pass:
+
+```bash
+go test ./pkg/fuse -run 'Test(ApplyAsyncCommittedRevisionClearsCleanLivePending|ApplyAsyncCommittedRevisionRebasesDirtyLivePending|FlushRebuildsStaleShadowFromLivePendingData|OpenWritablePrefersPendingShadowSnapshot|CreateWriteThroughShadow|OpenTruncateWriteThroughShadow|FlushSkipsAsyncShadowForPartialExistingSnapshot|LookupAndOpenReadUseLivePendingForNewFile|LookupReusesLivePendingInode|CreateEntryTracksLivePendingSizeAfterWrite)$'
+```
+
+2. Full local FUSE smoke now passes:
+
+```bash
+bash e2e/fuse-smoke-test.sh
+```
+
+Result: `48/48 passed, 0 failed`.
+
+3. CLI smoke (including large multipart upload) also passes:
+
+```bash
+bash e2e/cli-smoke-test.sh
+```
+
+Result: `30 passed, 0 failed`.
