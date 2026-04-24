@@ -306,6 +306,17 @@ func TestValidateTiDBAutoEmbeddingFilesDiffsReportsGeneratedContractMismatch(t *
 	}
 }
 
+func TestValidateTiDBAutoEmbeddingFilesDiffsAllowsWritableDescriptionEmbeddingCompat(t *testing.T) {
+	meta := testFilesTableMeta(TiDBEmbeddingModeAuto)
+	meta.columns["description_embedding"] = tidbColumnMeta{columnType: "vector(1024)"}
+	diffs := validateTiDBAutoEmbeddingFilesDiffs(meta)
+	for _, diff := range diffs {
+		if diff.columnName == "description_embedding" {
+			t.Fatalf("expected writable description_embedding compat column to be accepted, got %#v", diffs)
+		}
+	}
+}
+
 func TestDiffTiDBTableMetaReportsMissingRequiredIndex(t *testing.T) {
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "uploads")
 	meta := testUploadsTableMeta(true)
@@ -609,6 +620,12 @@ func TestTiDBSchemaSpecForModeIncludesAlterTableIndexes(t *testing.T) {
 	}
 	if _, ok := spec.indexes["idx_files_desc_cosine"]; !ok {
 		t.Fatal("files auto mode spec must include idx_files_desc_cosine index")
+	}
+	if _, ok := spec.columns["description_embedding"]; !ok {
+		t.Fatal("files auto mode spec must include description_embedding column")
+	}
+	if got := spec.columns["description_embedding"].addSQL; got != "ALTER TABLE files ADD COLUMN description_embedding VECTOR(1024) DEFAULT NULL" {
+		t.Fatalf("description_embedding addSQL=%q, want writable VECTOR compat repair SQL", got)
 	}
 }
 

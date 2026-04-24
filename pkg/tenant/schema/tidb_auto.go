@@ -684,6 +684,15 @@ func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
 		if spec.tables[i].name != "files" {
 			continue
 		}
+		if mode == TiDBEmbeddingModeAuto {
+			if col, ok := spec.tables[i].columns["description_embedding"]; ok {
+				col.addSQL = fmt.Sprintf(
+					"ALTER TABLE files ADD COLUMN description_embedding VECTOR(%d) DEFAULT NULL",
+					TiDBAutoEmbeddingDimensions,
+				)
+				spec.tables[i].columns["description_embedding"] = col
+			}
+		}
 		spec.tables[i].validate = func(meta tidbTableMeta) []tidbSchemaDiff {
 			switch mode {
 			case TiDBEmbeddingModeAuto:
@@ -1539,24 +1548,33 @@ func isIgnorableTiDBSchemaError(err error) bool {
 func validateTiDBAutoEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
 	var diffs []tidbSchemaDiff
 	for _, spec := range []struct {
-		column string
-		source string
+		column        string
+		source        string
+		allowWritable bool
 	}{
-		{"embedding", "content_text"},
-		{"description_embedding", "description"},
+		{"embedding", "content_text", false},
+		{"description_embedding", "description", true},
 	} {
 		col, err := meta.requireColumn(spec.column)
 		if err != nil {
 			return nil
 		}
 		extra := normalizeSQLFragment(col.extra)
-		if !strings.Contains(extra, "generated") || !strings.Contains(extra, "stored") {
+		isStoredGenerated := strings.Contains(extra, "generated") && strings.Contains(extra, "stored")
+		if !isStoredGenerated {
+			if spec.allowWritable {
+				expr := normalizeSQLFragment(col.generationExpression)
+				if !strings.Contains(extra, "generated") && expr == "" {
+					continue
+				}
+			}
 			diffs = append(diffs, tidbSchemaDiff{
 				kind:       tidbSchemaDiffTableContract,
 				tableName:  "files",
 				columnName: spec.column,
 				detail:     fmt.Sprintf("files schema contract: %s column must be a stored generated column", spec.column),
 			})
+			continue
 		}
 		expr := normalizeSQLFragment(col.generationExpression)
 		checks := []struct {
