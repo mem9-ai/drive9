@@ -10,9 +10,23 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/vault"
 )
+
+// isVaultDuplicateEntryErr reports whether err is a TiDB/MySQL duplicate-key
+// error (case-insensitive match on "Duplicate entry") or a SQLite unique
+// violation. The previous lowercase-only check against "duplicate"/"unique"
+// missed TiDB's capitalized "Duplicate entry" message and surfaced a 500
+// instead of a 409.
+func isVaultDuplicateEntryErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicate entry") || strings.Contains(msg, "unique constraint failed")
+}
 
 // handleVault dispatches /v1/vault/* requests.
 func (s *Server) handleVault(w http.ResponseWriter, r *http.Request) {
@@ -135,10 +149,15 @@ func (s *Server) handleVaultSecretCreate(w http.ResponseWriter, r *http.Request,
 
 	sec, err := vs.CreateSecret(r.Context(), tenantID, req.Name, req.CreatedBy, secretType, fields)
 	if err != nil {
-		if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
+		if isVaultDuplicateEntryErr(err) {
 			errJSON(w, http.StatusConflict, "secret already exists")
 			return
 		}
+		logger.Error(r.Context(), "vault_secret_create_failed",
+			eventFields(r.Context(), "vault_secret_create_failed",
+				"tenant_id", tenantID,
+				"secret_name", req.Name,
+				"error", err.Error())...)
 		errJSON(w, http.StatusInternalServerError, "failed to create secret")
 		return
 	}
@@ -209,6 +228,11 @@ func (s *Server) handleVaultSecretUpdate(w http.ResponseWriter, r *http.Request,
 			errJSON(w, http.StatusNotFound, "secret not found")
 			return
 		}
+		logger.Error(r.Context(), "vault_secret_update_failed",
+			eventFields(r.Context(), "vault_secret_update_failed",
+				"tenant_id", tenantID,
+				"secret_name", name,
+				"error", err.Error())...)
 		errJSON(w, http.StatusInternalServerError, "failed to update secret")
 		return
 	}

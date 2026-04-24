@@ -13,7 +13,13 @@ import (
 	"time"
 )
 
-func TestSecretSetFallsBackToUpdateOnConflict(t *testing.T) {
+// TestSecretSetRefusesToOverwriteOnConflict pins the new behavior: when the
+// server returns 409 Conflict for POST /v1/vault/secrets, SecretSet must NOT
+// fall back to PUT (the old behavior silently wholesale-replaced the secret,
+// dropping any field the caller didn't pass this time — data loss). Instead
+// it surfaces a clear error naming the offending secret and pointing at the
+// explicit replace/delete paths.
+func TestSecretSetRefusesToOverwriteOnConflict(t *testing.T) {
 	var postCount, putCount int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -25,7 +31,7 @@ func TestSecretSetFallsBackToUpdateOnConflict(t *testing.T) {
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/vault/secrets/aws-prod":
 			atomic.AddInt32(&putCount, 1)
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"name":"aws-prod","secret_type":"generic","revision":2,"created_by":"drive9-cli","created_at":"2026-04-13T00:00:00Z","updated_at":"2026-04-13T00:00:00Z"}`))
+			_, _ = w.Write([]byte(`{"name":"aws-prod"}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -38,14 +44,22 @@ func TestSecretSetFallsBackToUpdateOnConflict(t *testing.T) {
 	resetCredentialCacheForTest()
 	t.Cleanup(resetCredentialCacheForTest)
 
-	if err := SecretSet([]string{"aws-prod", "access_key=AKIA", "secret_key=secret"}); err != nil {
-		t.Fatalf("SecretSet: %v", err)
+	err := SecretSet([]string{"aws-prod", "access_key=AKIA", "secret_key=secret"})
+	if err == nil {
+		t.Fatal("SecretSet should error on conflict, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, `"aws-prod"`) || !strings.Contains(msg, "already exists") {
+		t.Fatalf("error message should name the secret and say 'already exists', got: %q", msg)
+	}
+	if !strings.Contains(msg, "vault put") || !strings.Contains(msg, "vault rm") {
+		t.Fatalf("error message should point at the explicit replace/delete paths, got: %q", msg)
 	}
 	if atomic.LoadInt32(&postCount) != 1 {
 		t.Fatalf("POST count = %d, want 1", postCount)
 	}
-	if atomic.LoadInt32(&putCount) != 1 {
-		t.Fatalf("PUT count = %d, want 1", putCount)
+	if atomic.LoadInt32(&putCount) != 0 {
+		t.Fatalf("PUT count = %d, want 0 (must not silently update on conflict)", putCount)
 	}
 }
 
