@@ -67,8 +67,8 @@ func fsMountCmd(args []string) error {
 	attrTTL := fs.Duration("attr-ttl", 10*time.Second, "kernel attr cache TTL")
 	entryTTL := fs.Duration("entry-ttl", 10*time.Second, "kernel entry cache TTL")
 	flushDebounce := fs.Duration("flush-debounce", -1, "debounce window for small-file flush coalescing (default 2s, 0 disables)")
-	lookupRetryCount := fs.Int("lookup-retry-count", 2, "detached retries after transient Lookup/GetAttr stat failures (default 2)")
-	lookupRetryTimeout := fs.Duration("lookup-retry-timeout", 250*time.Millisecond, "timeout per detached Lookup/GetAttr stat retry (default 250ms)")
+	lookupRetryCount := fs.Int("lookup-retry-count", 2, "detached retries after transient Lookup/GetAttr stat failures (default 2, set 0 to disable)")
+	lookupRetryTimeout := fs.Duration("lookup-retry-timeout", 250*time.Millisecond, "timeout per detached Lookup/GetAttr stat retry (default 250ms, must be > 0)")
 	syncMode := fs.String("sync-mode", "auto", "sync mode: auto, interactive, or strict")
 	profile := fs.String("profile", "", "mount profile: interactive (empty for default)")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
@@ -93,6 +93,7 @@ func fsMountCmd(args []string) error {
 	if err := validateLookupRetryFlags(*lookupRetryCount, *lookupRetryTimeout); err != nil {
 		return err
 	}
+	normalizedLookupRetryCount := normalizeLookupRetryCount(*lookupRetryCount)
 
 	mountPoint := fs.Arg(0)
 
@@ -126,7 +127,7 @@ func fsMountCmd(args []string) error {
 		AttrTTL:            *attrTTL,
 		EntryTTL:           *entryTTL,
 		FlushDebounce:      *flushDebounce,
-		LookupRetryCount:   *lookupRetryCount,
+		LookupRetryCount:   normalizedLookupRetryCount,
 		LookupRetryTimeout: *lookupRetryTimeout,
 		SyncMode:           syncModeVal,
 		Profile:            *profile,
@@ -139,13 +140,22 @@ func fsMountCmd(args []string) error {
 }
 
 func validateLookupRetryFlags(count int, timeout time.Duration) error {
-	if count <= 0 {
-		return fmt.Errorf("drive9 mount: --lookup-retry-count must be > 0")
+	if count < 0 {
+		return fmt.Errorf("drive9 mount: --lookup-retry-count must be >= 0")
 	}
 	if timeout <= 0 {
 		return fmt.Errorf("drive9 mount: --lookup-retry-timeout must be > 0")
 	}
 	return nil
+}
+
+func normalizeLookupRetryCount(count int) int {
+	if count == 0 {
+		// Use negative sentinel so MountOptions.setDefaults can distinguish
+		// explicit CLI disable from plain zero-value "unset" options.
+		return -1
+	}
+	return count
 }
 
 // UmountCmd handles the "drive9 umount" command.

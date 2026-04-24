@@ -632,15 +632,22 @@ func isTransientLookupErr(err error) bool {
 }
 
 func (fs *Dat9FS) lookupStatRetryCount() int {
-	if fs != nil && fs.opts != nil && fs.opts.LookupRetryCount > 0 {
-		return fs.opts.LookupRetryCount
+	if fs != nil && fs.opts != nil {
+		if fs.opts.LookupRetryCount == 0 {
+			return 0
+		}
+		if fs.opts.LookupRetryCount > 0 {
+			return fs.opts.LookupRetryCount
+		}
 	}
 	return lookupTransientRetryCount
 }
 
 func (fs *Dat9FS) lookupStatRetryTimeout() time.Duration {
-	if fs != nil && fs.opts != nil && fs.opts.LookupRetryTimeout > 0 {
-		return fs.opts.LookupRetryTimeout
+	if fs != nil && fs.opts != nil {
+		if fs.opts.LookupRetryTimeout > 0 {
+			return fs.opts.LookupRetryTimeout
+		}
 	}
 	return lookupTransientRetryTimeout
 }
@@ -667,9 +674,13 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, remotePath stri
 	if trackLookupMetrics {
 		fs.lookupStatRetryTotal.Add(1)
 	}
+	retryCount := fs.lookupStatRetryCount()
+	if retryCount <= 0 {
+		return nil, err
+	}
 
 	lastErr := err
-	for range fs.lookupStatRetryCount() {
+	for range retryCount {
 		// Detached retries absorb interrupt races from probing callers that do not
 		// retry open/stat failures in user space.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
@@ -712,9 +723,13 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 	if err == nil || !isTransientLookupErr(err) {
 		return items, err
 	}
+	retryCount := fs.lookupStatRetryCount()
+	if retryCount <= 0 {
+		return nil, err
+	}
 
 	lastErr := err
-	for range fs.lookupStatRetryCount() {
+	for range retryCount {
 		// Keep list fallback bounded; this path only runs when HEAD/stat said
 		// "not found" and we need directory-list compatibility probing.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())

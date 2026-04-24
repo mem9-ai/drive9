@@ -70,10 +70,19 @@ func (o *MountOptions) setDefaults() {
 	if o.UploadConcurrency <= 0 {
 		o.UploadConcurrency = 4
 	}
-	if o.LookupRetryCount <= 0 {
-		o.LookupRetryCount = lookupTransientRetryCount
+	if o.LookupRetryCount < 0 {
+		// Negative values are CLI-internal sentinels meaning retries were
+		// explicitly disabled by the operator.
+		o.LookupRetryCount = 0
+	} else {
+		if o.LookupRetryCount == 0 {
+			o.LookupRetryCount = lookupTransientRetryCount
+		}
 	}
-	if o.LookupRetryTimeout <= 0 {
+	if o.LookupRetryTimeout == 0 {
+		o.LookupRetryTimeout = lookupTransientRetryTimeout
+	}
+	if o.LookupRetryTimeout < 0 {
 		o.LookupRetryTimeout = lookupTransientRetryTimeout
 	}
 	// Apply interactive profile if requested.

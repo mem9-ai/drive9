@@ -207,12 +207,32 @@ func TestValidateLookupRetryFlags(t *testing.T) {
 		t.Fatalf("validateLookupRetryFlags() unexpected error: %v", err)
 	}
 
-	if err := validateLookupRetryFlags(0, 250*time.Millisecond); err == nil || !strings.Contains(err.Error(), "--lookup-retry-count") {
-		t.Fatalf("count=0 error = %v, want count validation error", err)
+	if err := validateLookupRetryFlags(0, 250*time.Millisecond); err != nil {
+		t.Fatalf("count=0 should be allowed to disable retries: %v", err)
 	}
 
 	if err := validateLookupRetryFlags(2, 0); err == nil || !strings.Contains(err.Error(), "--lookup-retry-timeout") {
 		t.Fatalf("timeout=0 error = %v, want timeout validation error", err)
+	}
+
+	if err := validateLookupRetryFlags(-1, 250*time.Millisecond); err == nil || !strings.Contains(err.Error(), "--lookup-retry-count") {
+		t.Fatalf("count=-1 error = %v, want count validation error", err)
+	}
+
+	if err := validateLookupRetryFlags(2, -time.Millisecond); err == nil || !strings.Contains(err.Error(), "--lookup-retry-timeout") {
+		t.Fatalf("timeout<0 error = %v, want timeout validation error", err)
+	}
+}
+
+func TestNormalizeLookupRetryCount(t *testing.T) {
+	count := normalizeLookupRetryCount(2)
+	if count != 2 {
+		t.Fatalf("normalized positive count = %d, want 2", count)
+	}
+
+	count = normalizeLookupRetryCount(0)
+	if count != -1 {
+		t.Fatalf("count=0 normalization = %d, want -1", count)
 	}
 }
 

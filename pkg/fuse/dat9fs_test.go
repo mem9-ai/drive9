@@ -1016,6 +1016,26 @@ func TestDefaultTTLIs10Seconds(t *testing.T) {
 	}
 }
 
+func TestMountOptionsLookupRetryDefaultsAndDisableSentinel(t *testing.T) {
+	defaults := &MountOptions{}
+	defaults.setDefaults()
+	if defaults.LookupRetryCount != lookupTransientRetryCount {
+		t.Fatalf("default LookupRetryCount = %d, want %d", defaults.LookupRetryCount, lookupTransientRetryCount)
+	}
+	if defaults.LookupRetryTimeout != lookupTransientRetryTimeout {
+		t.Fatalf("default LookupRetryTimeout = %v, want %v", defaults.LookupRetryTimeout, lookupTransientRetryTimeout)
+	}
+
+	disabled := &MountOptions{LookupRetryCount: -1, LookupRetryTimeout: 250 * time.Millisecond}
+	disabled.setDefaults()
+	if disabled.LookupRetryCount != 0 {
+		t.Fatalf("disabled LookupRetryCount = %d, want 0", disabled.LookupRetryCount)
+	}
+	if disabled.LookupRetryTimeout != 250*time.Millisecond {
+		t.Fatalf("disabled LookupRetryTimeout = %v, want 250ms", disabled.LookupRetryTimeout)
+	}
+}
+
 func TestLookupReturnsTTLInEntryOut(t *testing.T) {
 	fs, _, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(make([]byte, 42))
