@@ -452,6 +452,77 @@ bash e2e/fuse-smoke-test.sh
    - Hypothesis B (`EIO`): `Read` hits `remoteSize == 0 && touchesEvicted` in the
      streaming path.
 
+### Integration harness issue found on Linux (fixed in test code)
+
+When first running `mount_integration_test.go` on Linux, both scenarios failed
+early with:
+
+```text
+MkdirAll: .../fuse-it: not a directory
+```
+
+Root cause was in the test mock server, not the filesystem-under-test:
+
+- the old mock replied `HEAD 200` with `X-Dat9-IsDir=false` for arbitrary paths,
+  so `Lookup("fuse-it")` looked like an existing regular file
+- `os.MkdirAll(...)` then failed with `ENOTDIR`
+
+The integration harness was updated to use a minimal in-memory metadata/data
+model (stateful `HEAD/GET(list)/POST(create,mkdir)/PUT/DELETE`) and to use a
+single robust stop path for unmount/cleanup.
+
+### Linux run #1 findings after harness fix
+
+After fixing the harness and running:
+
+```bash
+go test ./pkg/fuse -run 'TestMountCreateWriteReadPendingNew|TestMountNestedCreateWriteReadPendingNew' -v -count=20 > mount_it.log
+```
+
+we still observed flaky failures, mostly in the immediate read-after-write step:
+
+- `ReadFile: open .../pending.txt: input/output error`
+- occasional `ReadFile: open ...: no such file or directory`
+
+Important timing signal from logs:
+
+- the read/open error happens first
+- then commit queue logs `successfully uploaded ...` and `async commit success ...`
+
+This strongly suggests the failure window is before remote durability becomes
+visible, and the local pending view is not consistently used for `open/read`.
+
+Based on code+log correlation, a likely contributor is live-pending metadata
+becoming stale around flush/release (for example `IsNew`/revision interpretation),
+which can cause a temporary mismatch between path visibility and inode/base
+metadata during close-to-open transitions.
+
+### Linux run #2 (with fuse trace) and current hypothesis
+
+From `mount_it_v2.log` (20x loop with trace on `/fuse-it`):
+
+- failing runs consistently reached `Lookup` and returned a live-pending entry
+  (`lookup live-pending ... size=24 ... ino=3`)
+- but many failing runs had no subsequent `open path=/fuse-it/pending.txt` trace
+- failures surfaced at `os.ReadFile` open step as either:
+  - `input/output error`, or
+  - `no such file or directory`
+- in passing runs, we do see `open` + `read` traces and data is returned locally
+
+Current hypothesis:
+
+- there is a race between async close-path cache invalidation/forget and
+  immediate reopen after create/write/close
+- inode/path mapping can be dropped before `Open`, even though `Lookup`
+  just resolved the path from live-pending state
+
+Mitigation currently applied in code for next Linux verification:
+
+1. In `Forget`, skip dropping inode mappings while `livePending` exists for that path.
+2. In `Release` async-cache fast path, skip immediate kernel inode notify while
+   the file is still pending local commit (to avoid forcing an early `FORGET`
+   before immediate reopen).
+
 ### Notes for this Linux pass
 
 - Treat `pkg/fuse/mount_integration_test.go` as the primary diagnosis loop.

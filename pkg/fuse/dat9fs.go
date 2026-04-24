@@ -244,7 +244,13 @@ func (fs *Dat9FS) getLivePending(path string) (livePendingSnapshot, bool) {
 }
 
 func traceFusePath(path string) bool {
-	return strings.Contains(path, "/fuse-e2e-")
+	if strings.Contains(path, "/fuse-e2e-") {
+		return true
+	}
+	if path == "/fuse-it" || strings.HasPrefix(path, "/fuse-it/") {
+		return true
+	}
+	return false
 }
 
 func logFuseTrace(format string, args ...any) {
@@ -410,6 +416,7 @@ func (fs *Dat9FS) waitForPriorPathCommitLocked(fh *FileHandle) {
 
 	fh.BaseRev = entry.Revision
 	fh.IsNew = false
+	fs.setLivePendingLocked(fh)
 	if fh.Streamer != nil {
 		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
 	}
@@ -809,7 +816,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 
 	if live, ok := fs.getLivePending(childP); ok {
 		if traceFusePath(childP) {
-			logFuseTrace("lookup live-pending path=%s size=%d is_new=%t ino=%d", childP, live.Size, live.IsNew, live.Ino)
+			logFuseTrace("lookup live-pending path=%s size=%d is_new=%t base_rev=%d ino=%d", childP, live.Size, live.IsNew, live.BaseRev, live.Ino)
 		}
 		mtime := time.Unix(live.Mtime, 0)
 		ino := live.Ino
@@ -818,10 +825,10 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		}
 		fs.inodes.UpdateSize(ino, live.Size)
 		fs.inodes.UpdateMtime(ino, mtime)
-		if live.IsNew {
-			fs.inodes.UpdateRevision(ino, 0)
-		} else if live.BaseRev > 0 {
+		if live.BaseRev > 0 {
 			fs.inodes.UpdateRevision(ino, live.BaseRev)
+		} else if live.IsNew {
+			fs.inodes.UpdateRevision(ino, 0)
 		}
 		entry, ok := fs.inodes.GetEntry(ino)
 		if !ok {
@@ -894,6 +901,17 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 }
 
 func (fs *Dat9FS) Forget(nodeId uint64, nlookup uint64) {
+	if entry, ok := fs.inodes.GetEntry(nodeId); ok {
+		if _, pending := fs.getLivePending(entry.Path); pending {
+			if traceFusePath(entry.Path) {
+				logFuseTrace("forget skip live-pending path=%s node=%d nlookup=%d", entry.Path, nodeId, nlookup)
+			}
+			return
+		}
+		if traceFusePath(entry.Path) {
+			logFuseTrace("forget path=%s node=%d nlookup=%d", entry.Path, nodeId, nlookup)
+		}
+	}
 	fs.inodes.Forget(nodeId, nlookup)
 }
 
@@ -934,6 +952,9 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 
 	entry, st := fs.refreshRegularFileEntryBase(cancel, input.NodeId, entry)
 	if st != gofuse.OK {
+		if traceFusePath(entry.Path) {
+			logFuseTrace("getattr refresh-base failed path=%s status=%d", entry.Path, st)
+		}
 		return st
 	}
 
@@ -1348,6 +1369,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 func (fs *Dat9FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) gofuse.Status {
 	p, ok := fs.inodes.GetPath(input.NodeId)
 	if !ok {
+		logFuseTrace("open missing inode node=%d", input.NodeId)
 		return gofuse.ENOENT
 	}
 
@@ -2267,9 +2289,14 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				// Invalidate caches so subsequent reads see fresh data.
 				fs.readCache.Invalidate(fh.Path)
 				fs.dirCache.Invalidate(parentDir(fh.Path))
-				fs.notifyInode(fh.Ino)
-				parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
-				fs.notifyInode(parentIno)
+				// Do not invalidate kernel inode cache here: the file is still
+				// pending local commit (livePending), and invalidation can race
+				// with immediate reopen to trigger FORGET before OPEN.
+				// Keep the stable local view; remote visibility is repaired by
+				// async commit callbacks and normal lookup/getattr flows.
+				if traceFusePath(fh.Path) {
+					logFuseTrace("release async-cache path=%s skip inode notify while pending", fh.Path)
+				}
 
 				// Close prefetcher to cancel inflight goroutines.
 				if fh.Prefetch != nil {
