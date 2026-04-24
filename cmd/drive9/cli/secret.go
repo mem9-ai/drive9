@@ -59,7 +59,13 @@ func Secret(args []string) error {
 	}
 }
 
-// SecretSet creates or updates a secret.
+// SecretSet creates a new secret. It deliberately does NOT update in place on
+// conflict: the server-side UpdateSecret is a wholesale-replace (deletes all
+// existing fields before writing the new ones), so a silent fallback here
+// would drop any field the caller didn't pass on this invocation. Users who
+// actually want to replace must be explicit — either `drive9 vault rm <name>`
+// then re-set, or `drive9 vault put /n/vault/<name> --from <dir>` for the
+// atomic wholesale-replace path.
 func SecretSet(args []string) error {
 	if len(args) < 2 {
 		return fmt.Errorf("usage drive9 vault set <name> <field=value|field=@file|field=-> [more fields]")
@@ -78,13 +84,12 @@ func SecretSet(args []string) error {
 	}
 	ctx := context.Background()
 	if _, err := c.CreateVaultSecret(ctx, name, fields); err != nil {
-		if !errors.Is(err, client.ErrConflict) {
-			return err
+		if errors.Is(err, client.ErrConflict) {
+			return fmt.Errorf("secret %q already exists; `drive9 vault set` will not overwrite. "+
+				"To replace it wholesale use `drive9 vault put /n/vault/%s --from <dir>`, "+
+				"or delete first with `drive9 vault rm %s` and re-run.", name, name, name)
 		}
-		_, err = c.UpdateVaultSecret(ctx, name, fields)
-		if err != nil {
-			return err
-		}
+		return err
 	}
 	return nil
 }
