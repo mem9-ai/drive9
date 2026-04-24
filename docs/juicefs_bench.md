@@ -229,6 +229,102 @@ This is a fresh path lookup for a file that is not yet represented locally, so t
 failure is not evidence of a stale local inode after async commit. It is again a remote
 `HEAD` canceled during lookup and translated into `EIO`.
 
+## Follow-Up Attempt: `context canceled -> EAGAIN`
+
+A follow-up change modified `pkg/fuse/dat9fs.go` so that:
+
+1. `context.Canceled`
+2. `context.DeadlineExceeded`
+
+map to `EAGAIN` instead of the previous default `EIO`.
+
+Targeted unit tests were added to confirm the behavior:
+
+1. canceled lookup stat -> `EAGAIN`
+2. normal `404` lookup -> `ENOENT`
+
+That change worked as intended at the FUSE mapping layer, but the benchmark still did
+not pass.
+
+## Latest Benchmark Result After The Mapping Change
+
+`juicefs_bench.log` now shows:
+
+```text
+2026/04/24 04:00:52.825241 juicefs[25698] <FATAL>: Failed to open file /home/ubuntu/drive9_mount_test/__juicefs_benchmark_1777003170535282319__/smallfile.0.86: open /home/ubuntu/drive9_mount_test/__juicefs_benchmark_1777003170535282319__/smallfile.0.86: resource temporarily unavailable [writeFiles@bench.go:121]
+```
+
+And the matching FUSE trace is:
+
+```text
+2026/04/24 04:00:52 rx 21746: LOOKUP n2  "smallfile.0.86" p25698
+2026/04/24 04:00:52 rx 21747: INTERRUPT n0 {ix 21746} p0
+2026/04/24 04:00:52 fuse trace: lookup path=/__juicefs_benchmark_1777003170535282319__/smallfile.0.86
+2026/04/24 04:00:52 fuse trace: lookup remote-stat-error path=/__juicefs_benchmark_1777003170535282319__/smallfile.0.86 err=Head "http://127.0.0.1:9009/v1/fs/__juicefs_benchmark_1777003170535282319__/smallfile.0.86": context canceled fuse_status=11 has_live_pending=false inode_missing=true
+2026/04/24 04:00:52 tx 21746:     11=resource temporarily unavailable
+```
+
+This proves the errno mapping changed successfully:
+
+1. the operation no longer returns `EIO`
+2. it now returns `EAGAIN` / `resource temporarily unavailable`
+
+However, JuiceFS still treats that as a hard benchmark failure.
+
+## What JuiceFS Bench Expects
+
+Reading the JuiceFS source under `/home/ubuntu/juicefs/cmd/bench.go` shows that the
+benchmark does not retry transient open/stat failures.
+
+### `writeFiles`
+
+```go
+fp, err := os.OpenFile(fname, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+if err != nil {
+    logger.Fatalf("Failed to open file %s: %s", fname, err)
+}
+```
+
+### `statFiles`
+
+```go
+if _, err := os.Stat(fname); err != nil {
+    logger.Fatalf("Failed to stat file %s: %s", fname, err)
+}
+```
+
+This means `juicefs bench` only passes when:
+
+1. `open` succeeds without exposing `EIO`
+2. `open` also succeeds without exposing `EAGAIN`
+3. `stat` succeeds without exposing `EIO`
+4. `stat` also succeeds without exposing `EAGAIN`
+
+In other words:
+
+**For this benchmark, canceled or transient metadata lookups must be absorbed inside the
+FUSE layer rather than surfaced to user space as either `EIO` or `EAGAIN`.**
+
+## Updated Conclusion
+
+The latest evidence shifts the problem statement again:
+
+1. The original issue was `context canceled -> EIO`.
+2. That mapping was improved to `context canceled -> EAGAIN`.
+3. But `juicefs bench` still fails because it treats `EAGAIN` as fatal during `open` and
+   `stat`.
+
+So the real benchmark requirement is not just a better errno mapping. It is:
+
+**`Lookup` must avoid surfacing interrupted remote `StatCtx` calls as user-visible
+errors during benchmark file creation/stat flows.**
+
+The next likely fix direction is therefore:
+
+1. internal retry on canceled `Lookup -> StatCtx`
+2. or fallback logic that does not immediately return an error to the kernel
+3. rather than only remapping the error code
+
 ## What The New Tracing Says About `smallfile.0.3`
 
 The new logs did confirm that `smallfile.0.3` follows the expected async-success cleanup

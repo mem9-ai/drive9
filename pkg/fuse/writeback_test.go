@@ -2604,7 +2604,7 @@ func TestPreload_LazyLoad_SmallFile(t *testing.T) {
 	}
 }
 
-func TestLookupCanceledStatReturnsEIO(t *testing.T) {
+func TestLookupCanceledStatReturnsEAGAIN(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
 
@@ -2616,14 +2616,7 @@ func TestLookupCanceledStatReturnsEIO(t *testing.T) {
 			default:
 			}
 			<-release
-			if err := r.Context().Err(); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			w.Header().Set("Content-Length", "0")
-			w.Header().Set("X-Dat9-IsDir", "false")
-			w.Header().Set("X-Dat9-Revision", "1")
-			w.WriteHeader(http.StatusOK)
+			http.Error(w, "context canceled", http.StatusInternalServerError)
 		default:
 			w.WriteHeader(http.StatusOK)
 		}
@@ -2648,8 +2641,8 @@ func TestLookupCanceledStatReturnsEIO(t *testing.T) {
 	close(release)
 
 	st := <-resultCh
-	if st != gofuse.EIO {
-		t.Fatalf("Lookup status = %v, want EIO", st)
+	if st != gofuse.Status(syscall.EAGAIN) {
+		t.Fatalf("Lookup status = %v, want EAGAIN", st)
 	}
 }
 

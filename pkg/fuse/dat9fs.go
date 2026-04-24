@@ -772,6 +772,9 @@ func httpToFuseStatus(err error) gofuse.Status {
 	if err == nil {
 		return gofuse.OK
 	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return gofuse.Status(syscall.EAGAIN)
+	}
 
 	// Prefer typed StatusError so we map by status code even when the
 	// server returns a JSON error body that doesn't contain "HTTP NNN".
