@@ -627,19 +627,6 @@ func SecretAudit(args []string) error {
 	return nil
 }
 
-// currentCapabilityToken returns the active delegated/capability token for
-// call sites that explicitly need "is there a token in play" (e.g. SecretLs's
-// branch to avoid silently enumerating the whole tenant when a scoped token
-// was intentionally provided). It uses the unified resolver so env > config
-// priority + Unsetenv mitigation apply.
-func currentCapabilityToken() string {
-	r := ResolveCredentials()
-	if r.Kind == CredentialDelegated {
-		return r.Token
-	}
-	return ""
-}
-
 // optionalVaultManagementClientFromEnv returns a tenant-scoped (owner API key)
 // client when one can be resolved, or false when no owner credential is in
 // play. Used by SecretLs to distinguish "owner enumeration" from "delegated

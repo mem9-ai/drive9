@@ -390,13 +390,13 @@ func testNoFallthrough(t *testing.T, token, desc string) {
 	t.Helper()
 	var ownerPathHit int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/v1/vault/read/test-secret":
+		switch r.URL.Path {
+		case "/v1/vault/read/test-secret":
 			// Capability-read path: simulate auth failure.
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
-		case r.URL.Path == "/v1/vault/secrets/test-secret/value":
+		case "/v1/vault/secrets/test-secret/value":
 			// Owner-read path: should NEVER be reached.
 			atomic.AddInt32(&ownerPathHit, 1)
 			w.Header().Set("Content-Type", "application/json")
