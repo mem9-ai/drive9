@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/internal/schemaspec"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"go.uber.org/zap"
@@ -680,6 +681,21 @@ func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
 		if spec.tables[i].name != "files" {
 			continue
 		}
+		if mode == TiDBEmbeddingModeAuto {
+			// description_embedding is defined as STORED GENERATED in CREATE TABLE so new
+			// tenants get it automatically. However, TiDB does not support adding a STORED
+			// GENERATED column to an existing table via ALTER TABLE (error 3106). For
+			// pre-318 tenants we repair the column as a plain VECTOR column instead.
+			// The EMBED_TEXT auto-compute will not back-fill existing rows, but the column
+			// will be present so the server can start and new writes are not blocked.
+			if col, ok := spec.tables[i].columns["description_embedding"]; ok {
+				col.addSQL = fmt.Sprintf(
+					"ALTER TABLE files ADD COLUMN description_embedding VECTOR(%d) DEFAULT NULL",
+					TiDBAutoEmbeddingDimensions,
+				)
+				spec.tables[i].columns["description_embedding"] = col
+			}
+		}
 		spec.tables[i].validate = func(meta tidbTableMeta) []tidbSchemaDiff {
 			switch mode {
 			case TiDBEmbeddingModeAuto:
@@ -1334,20 +1350,6 @@ func isSafeTiDBRepairDiff(diff tidbSchemaDiff) bool {
 }
 
 func isSafeAddColumnRepairSQL(sqlText string) bool {
-	// STORED GENERATED VECTOR columns whose expression uses EMBED_TEXT are
-	// safe to add to existing tables via ALTER TABLE in the correctness sense:
-	// TiDB computes the values server-side rather than requiring the client to
-	// backfill. Note that this still materializes one EMBED_TEXT call per
-	// existing row at ALTER time, which can be slow and carry inference cost
-	// for large tables. This covers the description_embedding column introduced
-	// for auto-embedding mode.
-	normalized := normalizeSQLFragment(sqlText)
-	if strings.Contains(normalized, " generated ") &&
-		strings.Contains(normalized, " stored") &&
-		strings.Contains(normalized, " vector(") &&
-		strings.Contains(normalized, "embed_text(") {
-		return true
-	}
 	return schemaspec.IsSafeAddColumnRepairSQL(sqlText)
 }
 
@@ -1395,13 +1397,25 @@ func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string
 			if isIgnorableTiDBSchemaError(err) {
 				continue
 			}
-			// FULLTEXT and VECTOR index repairs may fail with optional-feature
-			// errors on TiDB versions or configurations that do not support
-			// them (e.g. 8200: FULLTEXT index must specify one column name,
-			// 1105: FULLTEXT index is not supported). Treat these the same as
-			// when the statement was skipped during initial provisioning.
-			if isFulltextOrVectorIndexRepairSQL(stmt) && isIgnorableOptionalSchemaError(err) {
+			// FULLTEXT and VECTOR index repairs may fail on TiDB versions or
+			// configurations that do not support them (e.g. 8200: FULLTEXT index
+			// must specify one column name, 1105: FULLTEXT index is not supported,
+			// 1054: Unknown column when a dependent column was not back-filled).
+			// Treat these the same as when the statement was skipped during
+			// initial provisioning.
+			if isFulltextOrVectorIndexRepairSQL(stmt) &&
+				(isIgnorableOptionalSchemaError(err) || isMySQLErrorCode(err, 1054)) {
 				logger.Warn(ctx, "tidb_schema_repair_optional_index_skipped",
+					zap.String("statement", schemaStatementSnippet(stmt)),
+					zap.Error(err))
+				continue
+			}
+			// STORED GENERATED columns cannot be added via ALTER TABLE (3106).
+			// This is a belt-and-suspenders guard: the schema contract already
+			// excludes these columns for old tenants, so this branch should not
+			// normally be reached.
+			if isStoredGeneratedColumnRepairSQL(stmt) && isMySQLErrorCode(err, 3106) {
+				logger.Warn(ctx, "tidb_schema_repair_generated_column_skipped",
 					zap.String("statement", schemaStatementSnippet(stmt)),
 					zap.Error(err))
 				continue
@@ -1425,6 +1439,18 @@ func isFulltextOrVectorIndexRepairSQL(sqlText string) bool {
 	normalized := normalizeSQLFragment(sqlText)
 	return strings.Contains(normalized, " add fulltext index ") ||
 		strings.Contains(normalized, " add vector index ")
+}
+
+func isStoredGeneratedColumnRepairSQL(sqlText string) bool {
+	normalized := normalizeSQLFragment(sqlText)
+	return strings.Contains(normalized, " add column ") &&
+		strings.Contains(normalized, " generated ") &&
+		strings.Contains(normalized, " stored")
+}
+
+func isMySQLErrorCode(err error, code uint16) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == code
 }
 
 func parseUniqueIndexRepairStatement(stmt string) (tidbUniqueIndexRepair, bool) {
@@ -1546,7 +1572,14 @@ func validateTiDBAutoEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
 			return nil
 		}
 		extra := normalizeSQLFragment(col.extra)
-		if !strings.Contains(extra, "generated") || !strings.Contains(extra, "stored") {
+		isGeneratedStored := strings.Contains(extra, "generated") && strings.Contains(extra, "stored")
+		if !isGeneratedStored {
+			if spec.column == "description_embedding" {
+				// Column was added as a plain VECTOR column via ALTER TABLE
+				// (TiDB 3106 prevents adding STORED GENERATED via ALTER TABLE).
+				// Accept it without enforcing the GENERATED EMBED_TEXT contract.
+				continue
+			}
 			diffs = append(diffs, tidbSchemaDiff{
 				kind:       tidbSchemaDiffTableContract,
 				tableName:  "files",

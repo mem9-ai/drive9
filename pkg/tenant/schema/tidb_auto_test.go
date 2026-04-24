@@ -595,8 +595,7 @@ func TestTiDBSchemaSpecForModeIncludesVaultIndexes(t *testing.T) {
 
 func TestTiDBSchemaSpecForModeIncludesAlterTableIndexes(t *testing.T) {
 	// In auto-embedding mode, FULLTEXT and VECTOR indexes are part of the
-	// enforceable schema contract and must appear in the spec. TiDB Cloud
-	// (the only platform where auto mode runs) supports ADD_COLUMNAR_REPLICA_ON_DEMAND.
+	// enforceable schema contract. TiDB Cloud supports ADD_COLUMNAR_REPLICA_ON_DEMAND.
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "files")
 	if _, ok := spec.indexes["idx_fts_content_desc"]; !ok {
 		t.Fatal("files auto mode spec must include idx_fts_content_desc index")
@@ -606,6 +605,11 @@ func TestTiDBSchemaSpecForModeIncludesAlterTableIndexes(t *testing.T) {
 	}
 	if _, ok := spec.indexes["idx_files_desc_cosine"]; !ok {
 		t.Fatal("files auto mode spec must include idx_files_desc_cosine index")
+	}
+	// description_embedding must be in the contract; its repair SQL uses a
+	// plain ADD COLUMN (no GENERATED) to work around TiDB error 3106.
+	if _, ok := spec.columns["description_embedding"]; !ok {
+		t.Fatal("files auto mode spec must include description_embedding column")
 	}
 }
 
@@ -682,13 +686,22 @@ func TestIsSafeAddColumnRepairSQLRejectsStoredAndVirtualGeneratedColumns(t *test
 	}
 }
 
-func TestIsSafeAddColumnRepairSQLAllowsStoredGeneratedVectorWithEmbedText(t *testing.T) {
-	// description_embedding is a STORED GENERATED VECTOR column backed by EMBED_TEXT.
-	// TiDB computes the value server-side so ALTER TABLE ADD COLUMN is safe on
-	// existing tables even when embedding rows are absent.
+func TestIsSafeAddColumnRepairSQLRejectsStoredGeneratedVectorWithEmbedText(t *testing.T) {
+	// The auto-generated repair SQL from parseColumnDefinition uses GENERATED ALWAYS AS.
+	// TiDB returns 3106 for this; isSafeAddColumnRepairSQL must reject it so the planner
+	// uses the custom plain-column addSQL override in tidbSchemaSpecForMode instead.
 	stmt := "ALTER TABLE files ADD COLUMN description_embedding VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT('amazon.titan-embed-text-v2:0', description, '{\"dimensions\":1024}')) STORED"
+	if isSafeAddColumnRepairSQL(stmt) {
+		t.Fatal("expected STORED GENERATED VECTOR with EMBED_TEXT to be unsafe (TiDB error 3106)")
+	}
+}
+
+func TestIsSafeAddColumnRepairSQLAcceptsPlainDescriptionEmbedding(t *testing.T) {
+	// The plan-time repair SQL for description_embedding is overridden to a plain
+	// ADD COLUMN (no GENERATED) so that ALTER TABLE succeeds on TiDB.
+	stmt := "ALTER TABLE files ADD COLUMN description_embedding VECTOR(1024) DEFAULT NULL"
 	if !isSafeAddColumnRepairSQL(stmt) {
-		t.Fatal("expected STORED GENERATED VECTOR with EMBED_TEXT to be safe to add")
+		t.Fatal("expected plain VECTOR ADD COLUMN to be safe")
 	}
 }
 
