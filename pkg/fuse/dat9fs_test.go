@@ -645,6 +645,64 @@ func TestGetAttrDirectoryDoesNotRequireRemoteStat(t *testing.T) {
 	}
 }
 
+func TestGetAttrRetriesTransientCanceledStat(t *testing.T) {
+	var headCalls atomic.Int32
+	firstHeadStarted := make(chan struct{}, 1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			if headCalls.Add(1) == 1 {
+				firstHeadStarted <- struct{}{}
+				<-r.Context().Done()
+				return
+			}
+			w.Header().Set("Content-Length", "99")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "3")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	ino := fs.inodes.Lookup("/retry-getattr.bin", false, 0, time.Now())
+
+	cancel := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	var out gofuse.AttrOut
+	go func() {
+		done <- fs.GetAttr(cancel, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out)
+	}()
+
+	select {
+	case <-firstHeadStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first HEAD request")
+	}
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("GetAttr status = %v, want OK", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetAttr timed out")
+	}
+
+	if got, want := out.Size, uint64(99); got != want {
+		t.Fatalf("GetAttr size = %d, want %d", got, want)
+	}
+	if headCalls.Load() < 2 {
+		t.Fatalf("HEAD calls = %d, want at least 2", headCalls.Load())
+	}
+}
+
 func TestLookupFallsBackToParentListWhenDirStatUnsupported(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -737,6 +795,9 @@ func TestLookupRetriesTransientCanceledStat(t *testing.T) {
 	if headCalls.Load() < 2 {
 		t.Fatalf("HEAD calls = %d, want at least 2", headCalls.Load())
 	}
+	if total, success, exhausted := fs.lookupRetryStats(); total != 1 || success != 1 || exhausted != 0 {
+		t.Fatalf("lookup retry stats = (%d,%d,%d), want (1,1,0)", total, success, exhausted)
+	}
 }
 
 func TestLookupReturnsENOENTAfterTransientCanceledStat(t *testing.T) {
@@ -794,6 +855,9 @@ func TestLookupReturnsENOENTAfterTransientCanceledStat(t *testing.T) {
 	if headCalls.Load() < 2 {
 		t.Fatalf("HEAD calls = %d, want at least 2", headCalls.Load())
 	}
+	if total, success, exhausted := fs.lookupRetryStats(); total != 1 || success != 0 || exhausted != 0 {
+		t.Fatalf("lookup retry stats = (%d,%d,%d), want (1,0,0)", total, success, exhausted)
+	}
 }
 
 func TestLookupTransientRetryExhaustedReturnsEAGAIN(t *testing.T) {
@@ -846,6 +910,9 @@ func TestLookupTransientRetryExhaustedReturnsEAGAIN(t *testing.T) {
 	wantCalls := int32(1 + lookupTransientRetryCount)
 	if got := headCalls.Load(); got != wantCalls {
 		t.Fatalf("HEAD calls = %d, want %d", got, wantCalls)
+	}
+	if total, success, exhausted := fs.lookupRetryStats(); total != 1 || success != 0 || exhausted != 1 {
+		t.Fatalf("lookup retry stats = (%d,%d,%d), want (1,0,1)", total, success, exhausted)
 	}
 }
 

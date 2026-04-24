@@ -12,6 +12,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -71,6 +72,12 @@ type Dat9FS struct {
 	// (EntryNotify, InodeNotify). FlushAll waits on this to ensure all
 	// notifications complete before shutdown.
 	notifyWg sync.WaitGroup
+
+	// lookupStatRetry* counters track transient Lookup stat retries so operators
+	// can distinguish absorbed interrupt noise from exhausted retries.
+	lookupStatRetryTotal     atomic.Uint64
+	lookupStatRetrySuccess   atomic.Uint64
+	lookupStatRetryExhausted atomic.Uint64
 }
 
 type dirtyInodeState struct {
@@ -617,27 +624,71 @@ func isTransientLookupErr(err error) bool {
 	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
-func (fs *Dat9FS) lookupStatWithRetry(cancel <-chan struct{}, childP string) (*client.StatResult, error) {
+func (fs *Dat9FS) lookupStatRetryCount() int {
+	if fs != nil && fs.opts != nil && fs.opts.LookupRetryCount > 0 {
+		return fs.opts.LookupRetryCount
+	}
+	return lookupTransientRetryCount
+}
+
+func (fs *Dat9FS) lookupStatRetryTimeout() time.Duration {
+	if fs != nil && fs.opts != nil && fs.opts.LookupRetryTimeout > 0 {
+		return fs.opts.LookupRetryTimeout
+	}
+	return lookupTransientRetryTimeout
+}
+
+func (fs *Dat9FS) lookupRetryStats() (total, success, exhausted uint64) {
+	if fs == nil {
+		return 0, 0, 0
+	}
+	return fs.lookupStatRetryTotal.Load(), fs.lookupStatRetrySuccess.Load(), fs.lookupStatRetryExhausted.Load()
+}
+
+func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, remotePath string, trackLookupMetrics bool) (*client.StatResult, error) {
 	ctx, cf := fuseCtx(cancel)
-	stat, err := fs.client.StatCtx(ctx, childP)
+	stat, err := fs.client.StatCtx(ctx, remotePath)
 	cf()
 	if err == nil || isNotFoundErr(err) || !isTransientLookupErr(err) {
 		return stat, err
 	}
 
+	if trackLookupMetrics {
+		fs.lookupStatRetryTotal.Add(1)
+	}
+
 	lastErr := err
-	for range lookupTransientRetryCount {
+	for range fs.lookupStatRetryCount() {
 		// Detached retries absorb interrupt races from probing callers that do not
 		// retry open/stat failures in user space.
-		retryCtx, retryCancel := context.WithTimeout(context.Background(), lookupTransientRetryTimeout)
-		stat, err = fs.client.StatCtx(retryCtx, childP)
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
+		stat, err = fs.client.StatCtx(retryCtx, remotePath)
 		retryCancel()
-		if err == nil || isNotFoundErr(err) || !isTransientLookupErr(err) {
-			return stat, err
+		if err == nil {
+			if trackLookupMetrics {
+				fs.lookupStatRetrySuccess.Add(1)
+			}
+			return stat, nil
+		}
+		if isNotFoundErr(err) || !isTransientLookupErr(err) {
+			return nil, err
 		}
 		lastErr = err
 	}
+
+	if trackLookupMetrics {
+		fs.lookupStatRetryExhausted.Add(1)
+		log.Printf("lookup stat retries exhausted for %s: %v", remotePath, lastErr)
+	}
 	return nil, lastErr
+}
+
+func (fs *Dat9FS) lookupStatWithRetry(cancel <-chan struct{}, childP string) (*client.StatResult, error) {
+	return fs.statWithTransientRetry(cancel, childP, true)
+}
+
+func (fs *Dat9FS) getAttrStatWithRetry(cancel <-chan struct{}, remotePath string) (*client.StatResult, error) {
+	return fs.statWithTransientRetry(cancel, remotePath, false)
 }
 
 func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string) ([]client.FileInfo, error) {
@@ -649,10 +700,10 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 	}
 
 	lastErr := err
-	for range lookupTransientRetryCount {
+	for range fs.lookupStatRetryCount() {
 		// Keep list fallback bounded; this path only runs when HEAD/stat said
 		// "not found" and we need directory-list compatibility probing.
-		retryCtx, retryCancel := context.WithTimeout(context.Background(), lookupTransientRetryTimeout)
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
 		items, err = fs.client.ListCtx(retryCtx, parentPath)
 		retryCancel()
 		if err == nil || !isTransientLookupErr(err) {
@@ -829,9 +880,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 			}
 		}
 		if !pendingFound && input.NodeId != 1 {
-			ctx, cf := fuseCtx(cancel)
-			defer cf()
-			stat, err := fs.client.StatCtx(ctx, entry.Path)
+			stat, err := fs.getAttrStatWithRetry(cancel, entry.Path)
 			if err != nil {
 				return httpToFuseStatus(err)
 			}
@@ -850,9 +899,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		// Some deployments do not support HEAD/stat on directories.
 		// Keep directory attrs from inode map and only refresh regular files.
 		if !entry.IsDir {
-			ctx, cf := fuseCtx(cancel)
-			defer cf()
-			stat, err := fs.client.StatCtx(ctx, entry.Path)
+			stat, err := fs.getAttrStatWithRetry(cancel, entry.Path)
 			if err != nil {
 				return httpToFuseStatus(err)
 			}

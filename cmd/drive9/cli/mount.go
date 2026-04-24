@@ -67,6 +67,8 @@ func fsMountCmd(args []string) error {
 	attrTTL := fs.Duration("attr-ttl", 10*time.Second, "kernel attr cache TTL")
 	entryTTL := fs.Duration("entry-ttl", 10*time.Second, "kernel entry cache TTL")
 	flushDebounce := fs.Duration("flush-debounce", -1, "debounce window for small-file flush coalescing (default 2s, 0 disables)")
+	lookupRetryCount := fs.Int("lookup-retry-count", 0, "detached retries after transient Lookup/GetAttr stat failures (0 uses default 2)")
+	lookupRetryTimeout := fs.Duration("lookup-retry-timeout", 0, "timeout per detached Lookup/GetAttr stat retry (0 uses default 250ms)")
 	syncMode := fs.String("sync-mode", "auto", "sync mode: auto, interactive, or strict")
 	profile := fs.String("profile", "", "mount profile: interactive (empty for default)")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
@@ -112,20 +114,22 @@ func fsMountCmd(args []string) error {
 	}
 
 	opts := &drive9fuse.MountOptions{
-		Server:        *server,
-		APIKey:        *apiKey,
-		Token:         token,
-		MountPoint:    mountPoint,
-		CacheSize:     int64(*cacheSize) << 20,
-		DirTTL:        *dirTTL,
-		AttrTTL:       *attrTTL,
-		EntryTTL:      *entryTTL,
-		FlushDebounce: *flushDebounce,
-		SyncMode:      syncModeVal,
-		Profile:       *profile,
-		AllowOther:    *allowOther,
-		ReadOnly:      *readOnly,
-		Debug:         *debug,
+		Server:             *server,
+		APIKey:             *apiKey,
+		Token:              token,
+		MountPoint:         mountPoint,
+		CacheSize:          int64(*cacheSize) << 20,
+		DirTTL:             *dirTTL,
+		AttrTTL:            *attrTTL,
+		EntryTTL:           *entryTTL,
+		FlushDebounce:      *flushDebounce,
+		LookupRetryCount:   *lookupRetryCount,
+		LookupRetryTimeout: *lookupRetryTimeout,
+		SyncMode:           syncModeVal,
+		Profile:            *profile,
+		AllowOther:         *allowOther,
+		ReadOnly:           *readOnly,
+		Debug:              *debug,
 	}
 
 	return drive9fuse.Mount(opts)
