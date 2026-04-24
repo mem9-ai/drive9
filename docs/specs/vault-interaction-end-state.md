@@ -109,6 +109,56 @@ If any value contains a control character (`\x00`–`\x1f` except `\t`) the same
 
 Consumers that need stable byte output today MUST use `@env` (or `--json` on a control-plane verb; see §20).
 
+## 4.2 Owner-Read — Reading Secrets with Owner Credentials
+
+An owner with a tenant API key (or an owner active context) can read secret values **without** issuing a delegated capability token to themselves. This closes the "capability amnesia" gap where the creator of a secret loses access to their own data until they `vault grant` to themselves.
+
+### CLI surface
+
+```bash
+# Single field
+drive9 vault get prod-db/DB_URL
+
+# Whole secret (all fields)
+drive9 vault get prod-db [--json|--env]
+
+# Inject into child process
+drive9 vault with /n/vault/prod-db -- ./myapp
+```
+
+When the credential resolver (§14.2) yields `CredentialOwner`, the CLI dispatches to the owner-read server endpoint (below). When it yields `CredentialDelegated`, the CLI dispatches to the existing capability-gated `/v1/vault/read/*` endpoint. The resolver result is the **sole routing decision**; the CLI MUST NOT inspect the credential value to guess its kind.
+
+### Server endpoint
+
+```
+GET /v1/vault/secrets/{name}/value[?format=json|env]     → all fields
+GET /v1/vault/secrets/{name}/value/{field}                → single field
+```
+
+These endpoints live under the existing `/v1/vault/secrets/` prefix and are authenticated by `tenantAuthMiddleware` (owner API key). They call `ReadSecretFields` / `ReadSecretField` — the same store methods used by the capability-gated read path.
+
+Owner-read is **unscoped**: the owner sees all fields of all secrets in their tenant. There is no scope filter; scope filtering is a delegated-path concern only.
+
+### Response Schema Parity Invariant (Normative MUST)
+
+The owner-read endpoints MUST return **byte-identical response shape** as the corresponding capability-read endpoints (`/v1/vault/read/{name}`, `/v1/vault/read/{name}/{field}`):
+
+| Endpoint pair | Content-Type | Body shape |
+|---|---|---|
+| `GET .../value?format=json` vs `GET /v1/vault/read/{name}?format=json` | `application/json` | `{"field": "value", ...}` (JSON object, string values) |
+| `GET .../value?format=env` vs `GET /v1/vault/read/{name}?format=env` | `text/plain` | `KEY=value\n` per field |
+| `GET .../value/{field}` vs `GET /v1/vault/read/{name}/{field}` | `text/plain` | raw plaintext bytes |
+
+Status codes: `200` success, `404` secret/field not found, `500` internal error. The dual-dispatch is purely a **routing** concern, not a **formatting** concern. Clients (CLI, FUSE, SDK) MUST be able to consume either endpoint's output with the same parser. This is locked as Invariant #9 (§18).
+
+### Audit
+
+Owner-read events use `token_id=owner:<api_key_id>` and `adapter=management-api` to distinguish them from delegated-read events (`token_id=<grant_id>`, `adapter=api`). The `agent_id` field is empty for owner-read events. `vault audit --agent <id>` filtering MUST return zero results (not crash) when querying owner-read events.
+
+### FUSE exclusion (deferred)
+
+Owner-read through `drive9 mount vault` is **not part of this increment**. Owner visibility = all secrets (unscoped); delegated visibility = scoped secrets. Mixing these in one mount would require two different `Lookup`/`ReadDir` contracts and would violate the existence-oracle invariant (§11). A future spec increment may introduce an owner-mode mount if needed.
+
 ## 5. Delete
 
 ```bash
@@ -241,6 +291,9 @@ cat /n/vault/prod-db/@grants/grt_7f2a
 | Key exists but current principal has no permission | `ENOENT` (existence-oracle defense) |
 | Current principal attempts an unauthorized **write** | `EACCES` |
 | Bound credential expired / revoked | `EACCES` + remount hint |
+| Owner-read: secret not found | `ENOENT` |
+| Owner-read: field not found | `ENOENT` |
+| Delegated token present but invalid + valid API key also present | `EACCES` (no fallthrough to owner path; §14.2) |
 | Infrastructure failure (FUSE daemon, backend) | `EIO` |
 
 Core rules:
@@ -403,6 +456,16 @@ Rules 2 vs 3 implement narrower-wins so that a scoped token never falls back to 
 
 A set-but-invalid `DRIVE9_VAULT_TOKEN` (malformed, expired, revoked, or signed by an unknown issuer) fails as `EACCES` via the standard stale-auth path in §11. It **MUST NOT** fall through to `DRIVE9_API_KEY` or to the active context — "first match wins" is token-presence, not token-validity. Users who want the broader owner authority must unset `DRIVE9_VAULT_TOKEN` explicitly.
 
+**Routing invariant (Normative MUST).** CLI verbs that read secret values (`vault get`, `vault with`) MUST route based on `ResolveCredentials().Kind`, not by inspecting raw environment variables:
+
+- `Kind == CredentialDelegated` → capability-read path (`/v1/vault/read/*`). This covers both `DRIVE9_VAULT_TOKEN` env and active delegated contexts from `ctx import`/`ctx use`.
+- `Kind == CredentialOwner` → owner-read path (`/v1/vault/secrets/{name}/value`). This covers both `DRIVE9_API_KEY` env and active owner contexts.
+- `Kind == CredentialNone` → error (no credential available).
+
+The unified credential resolver (`ResolveCredentials()`) is the **sole source-of-truth** for this routing decision. Bypassing it (e.g. checking `os.Getenv(DRIVE9_VAULT_TOKEN) != ""` directly) would miss delegated active contexts and break the credential-resolution contract.
+
+**No-fallthrough invariant (Normative MUST).** Once `ResolveCredentials()` yields `CredentialDelegated`, the CLI MUST commit to the token-read path. If the server returns 401 (expired, revoked, malformed token), the CLI MUST surface that error and terminate. It MUST NOT catch the 401 and silently retry via the owner-read path, even if a valid `DRIVE9_API_KEY` is also present in the environment. This prevents a stale delegated token from silently escalating to full owner visibility.
+
 Server URL resolution is **orthogonal** to credential resolution:
 
 1. Explicit `--server` flag
@@ -526,6 +589,7 @@ The three local short-circuits (`ctx import` / `ctx ls` / `ctx use`) are client-
 6. **One active context at a time**: `~/.drive9/config` MAY hold any number of contexts (owner and delegated, mixed); at most one is active. Switching contexts does not silently re-bind an already-mounted mount. To change a running mount's credential, `umount` and `mount` again; the new mount picks up the current active context (or env override) at startup. An in-process rebind (`vault reauth`) is **not** part of M1 (§17) — it MAY be added in a later spec increment without altering this invariant.
 7. **Client-side JWT decoding is UX-only**: local decode populates `ctx` metadata and enables offline `ctx ls`; it **MUST NOT** substitute for server-side validation. The server **MUST** re-check signature, TTL, and revocation on every request.
 8. **Issuer trust is TOFU (trust-on-first-use) in v0**: `ctx import` populates the context's `server` field from the JWT's `iss` claim with no network round-trip and no allow-list check. Invariant #7 does **not** protect against a malicious `iss` — the server being contacted is itself attacker-controlled and will validate its own signatures. Mitigation is delivery-channel-level (see §13.3 and §16); an issuer allow-list / `--expect-issuer` path is deferred (see §22). Implementations **MUST NOT** add a silent issuer check that only validates shape or reachability; such a check provides false assurance and is prohibited.
+9. **Response schema parity (owner-read ↔ capability-read)**: the owner-read endpoints (`/v1/vault/secrets/{name}/value[/{field}]`) MUST return byte-identical response shape (Content-Type, JSON structure, status codes) as the corresponding capability-read endpoints (`/v1/vault/read/{name}[/{field}]`). Dual-dispatch is a routing concern only; consumers MUST be able to parse either endpoint's output with the same code path. See §4.2 for the full contract.
 
 ## 19. Failure Model (Summary)
 
@@ -536,6 +600,7 @@ The three local short-circuits (`ctx import` / `ctx ls` / `ctx use`) are client-
 | FUSE daemon crash | kernel | `EIO` |
 | Malformed JWT at `ctx import` | client local decode | command error, no context written |
 | Import of wrong credential kind (owner JWT, random string) | client local decode | command error, directing user to `ctx add --api-key` |
+| Stale delegated token + valid owner API key | server (401 on token path) | `EACCES`; no silent fallthrough to owner-read (§14.2 no-fallthrough invariant) |
 | Concurrent `put` reads during transaction | server transaction | atomic — readers see old or new (Invariant #1) |
 
 ## 20. I/O Contracts (CLI Emit Surface, Normative)
@@ -616,7 +681,7 @@ Every verb that documents a pipe or composition pattern (`A | B`, `A | xargs B`)
 - No single unified credential variable that merges `DRIVE9_API_KEY` and `DRIVE9_VAULT_TOKEN` (the dual-principal separation is a contract, §14.1).
 - No wildcard scopes in v0 (`*` in key/scope is rejected at parse time).
 - No client-side authorization (Invariant #7).
-- No automatic token auto-mint on behalf of the owner; every delegated credential must come from an explicit `vault grant`.
+- No automatic token auto-mint on behalf of the owner; every delegated credential must come from an explicit `vault grant`. (Owner-read, §4.2, is not auto-mint — it uses the owner's existing API key directly, without creating a delegated token.)
 - No client-side issuer pinning or allow-list in v0. `ctx import` trusts the JWT `iss` on first use (§13.3 TOFU note). A follow-up spec may introduce `ctx add --trusted-issuer` and/or an `--expect-issuer` flag on `ctx import`; both are additive and do not change §13.1 or §16.
 
 ## 22. Open Questions (Spec-Level)
@@ -664,7 +729,8 @@ Appendix A — Command surface at a glance:
 | `drive9 vault put <path> --from <dir>` | Atomic wholesale-replace batch write (§2). |
 | `drive9 vault grant <scope>... --agent --perm --ttl` | Issue a scoped JWT. |
 | `drive9 vault revoke <grant-id>` | Revoke a grant. |
-| `drive9 vault with <path> -- <cmd>` | Exec child with `@env` injected. |
+| `drive9 vault get <name[/field]> [--json\|--env]` | Read secret value (owner or delegated; §4.2). |
+| `drive9 vault with <path> -- <cmd>` | Exec child with `@env` injected (owner or delegated; §4.2). |
 | `cat / ls / rm / printf >` on `/n/vault/**` | Data plane. |
 
 Deferred post-M1 (tracked as a follow-up increment, see §17): `drive9 vault reauth <mountpoint>` — rebind a running mount to the current context without `umount`.
