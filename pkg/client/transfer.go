@@ -244,32 +244,64 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 	return err
 }
 
+// WriteOption configures an upload written via WriteStreamWithSummary.
+type WriteOption func(*writeOptions)
+
+type writeOptions struct {
+	tags        map[string]string
+	description string
+}
+
+// WithTags sets file tags for the upload.
+func WithTags(tags map[string]string) WriteOption {
+	return func(o *writeOptions) {
+		o.tags = tags
+	}
+}
+
+// WithDescription sets a file description for the upload.
+func WithDescription(description string) WriteOption {
+	return func(o *writeOptions) {
+		o.description = description
+	}
+}
+
 // WriteStreamWithTags uploads data from a reader and applies tags to the
 // resulting file revision.
 func (c *Client) WriteStreamWithTags(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, tags map[string]string) error {
-	_, err := c.WriteStreamWithSummaryAndTags(ctx, path, r, size, progress, tags)
+	_, err := c.WriteStreamWithSummary(ctx, path, r, size, progress, WithTags(tags))
 	return err
 }
 
 // WriteStreamWithSummary uploads data from a reader and returns coarse-grained
 // phase timings for the completed upload.
-func (c *Client) WriteStreamWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc) (*UploadSummary, error) {
-	return c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, -1, nil)
+func (c *Client) WriteStreamWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, opts ...WriteOption) (*UploadSummary, error) {
+	o := &writeOptions{}
+	for _, opt := range opts {
+		opt(o)
+	}
+	return c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, -1, o.tags, o.description)
 }
 
 // WriteStreamWithSummaryAndTags uploads data from a reader, applies tags to
 // the resulting file revision, and returns coarse-grained phase timings.
 func (c *Client) WriteStreamWithSummaryAndTags(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, tags map[string]string) (*UploadSummary, error) {
-	return c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, -1, tags)
+	return c.WriteStreamWithSummary(ctx, path, r, size, progress, WithTags(tags))
+}
+
+// WriteStreamWithSummaryAndDescription is like WriteStreamWithSummary but also
+// sends a file description to the server.
+func (c *Client) WriteStreamWithSummaryAndDescription(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, description string) (*UploadSummary, error) {
+	return c.WriteStreamWithSummary(ctx, path, r, size, progress, WithDescription(description))
 }
 
 // WriteStreamConditional uploads data from a reader with optional CAS semantics.
 func (c *Client) WriteStreamConditional(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64) error {
-	_, err := c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, expectedRevision, nil)
+	_, err := c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, expectedRevision, nil, "")
 	return err
 }
 
-func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, tags map[string]string) (*UploadSummary, error) {
+func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, tags map[string]string, description string) (*UploadSummary, error) {
 	// Large uploads only send tags on complete, but validation must happen
 	// before any initiate/presign/upload work so invalid tags fail early.
 	if err := validateTags(tags); err != nil {
@@ -297,7 +329,7 @@ func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path str
 		if err != nil {
 			return nil, fmt.Errorf("read data: %w", err)
 		}
-		if err := c.WriteCtxConditionalWithTags(ctx, path, data, expectedRevision, tags); err != nil {
+		if err := c.writeCtxConditionalWithTagsAndDescription(ctx, path, data, expectedRevision, tags, description); err != nil {
 			return nil, err
 		}
 		summary.DirectWriteSeconds = time.Since(directWriteStart).Seconds()
@@ -309,10 +341,10 @@ func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path str
 	}
 
 	// Try v2 protocol first (on-demand presign, no checksum pre-computation).
-	err := c.writeStreamV2WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, tags)
+	err := c.writeStreamV2WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, tags, description)
 	if err == errV2NotAvailable {
 		// Server doesn't support v2 — fall back to v1.
-		if err := c.writeStreamV1WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, tags); err != nil {
+		if err := c.writeStreamV1WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, tags, description); err != nil {
 			return nil, err
 		}
 		return finishUploadSummary(summary), nil
@@ -336,7 +368,7 @@ func finishUploadSummary(summary *UploadSummary) *UploadSummary {
 	return summary
 }
 
-func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string) error {
+func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string, description string) error {
 	if err := validateTags(tags); err != nil {
 		return err
 	}
@@ -354,7 +386,7 @@ func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra i
 	}
 
 	initiateStart := time.Now()
-	plan, err := c.initiateUpload(ctx, path, size, checksums, expectedRevision)
+	plan, err := c.initiateUpload(ctx, path, size, checksums, expectedRevision, description)
 	if err != nil {
 		return err
 	}
@@ -391,12 +423,12 @@ func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra i
 	return nil
 }
 
-func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string) error {
+func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string, description string) error {
 	if err := validateTags(tags); err != nil {
 		return err
 	}
 	initiateStart := time.Now()
-	plan, err := c.initiateUploadV2(ctx, path, size, expectedRevision)
+	plan, err := c.initiateUploadV2(ctx, path, size, expectedRevision, description)
 	if err != nil {
 		return err
 	}
@@ -452,6 +484,7 @@ type uploadInitiateRequest struct {
 	TotalSize        int64    `json:"total_size"`
 	PartChecksums    []string `json:"part_checksums"`
 	ExpectedRevision *int64   `json:"expected_revision,omitempty"`
+	Description      string   `json:"description,omitempty"`
 }
 
 type uploadResumeRequest struct {
@@ -466,30 +499,31 @@ func expectedRevisionField(expectedRevision int64) *int64 {
 	return &rev
 }
 
-func (c *Client) initiateUpload(ctx context.Context, path string, size int64, checksums []string, expectedRevision int64) (UploadPlan, error) {
-	plan, resp, err := c.initiateUploadByBody(ctx, path, size, checksums, expectedRevision)
+func (c *Client) initiateUpload(ctx context.Context, path string, size int64, checksums []string, expectedRevision int64, description string) (UploadPlan, error) {
+	plan, resp, err := c.initiateUploadByBody(ctx, path, size, checksums, expectedRevision, description)
 	if err == nil {
 		return plan, nil
 	}
 	if resp != nil {
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
-			return c.initiateUploadLegacy(ctx, path, size, checksums, expectedRevision)
+			return c.initiateUploadLegacy(ctx, path, size, checksums, expectedRevision, description)
 		}
 		if resp.StatusCode == http.StatusBadRequest && strings.Contains(strings.ToLower(err.Error()), "unknown upload action") {
-			return c.initiateUploadLegacy(ctx, path, size, checksums, expectedRevision)
+			return c.initiateUploadLegacy(ctx, path, size, checksums, expectedRevision, description)
 		}
 		return UploadPlan{}, err
 	}
 	return UploadPlan{}, err
 }
 
-func (c *Client) initiateUploadByBody(ctx context.Context, path string, size int64, checksums []string, expectedRevision int64) (UploadPlan, *http.Response, error) {
+func (c *Client) initiateUploadByBody(ctx context.Context, path string, size int64, checksums []string, expectedRevision int64, description string) (UploadPlan, *http.Response, error) {
 	body, err := json.Marshal(uploadInitiateRequest{
 		Path:             path,
 		TotalSize:        size,
 		PartChecksums:    checksums,
 		ExpectedRevision: expectedRevisionField(expectedRevision),
+		Description:      description,
 	})
 	if err != nil {
 		return UploadPlan{}, nil, err
@@ -515,7 +549,7 @@ func (c *Client) initiateUploadByBody(ctx context.Context, path string, size int
 	return plan, nil, nil
 }
 
-func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int64, checksums []string, expectedRevision int64) (UploadPlan, error) {
+func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int64, checksums []string, expectedRevision int64, description string) (UploadPlan, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), http.NoBody)
 	if err != nil {
 		return UploadPlan{}, err
@@ -527,6 +561,9 @@ func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int
 	}
 	if expectedRevision >= 0 {
 		req.Header.Set("X-Dat9-Expected-Revision", fmt.Sprintf("%d", expectedRevision))
+	}
+	if description != "" {
+		req.Header.Set("X-Dat9-Description", description)
 	}
 
 	resp, err := c.do(req)
@@ -723,12 +760,13 @@ func (c *Client) completeUploadWithTags(ctx context.Context, uploadID string, ta
 
 // initiateUploadV2 calls POST /v2/uploads/initiate.
 // Returns errV2NotAvailable if the server responds with 404.
-func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64, expectedRevision int64) (*uploadPlanV2, error) {
+func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64, expectedRevision int64, description string) (*uploadPlanV2, error) {
 	body, err := json.Marshal(struct {
 		Path             string `json:"path"`
 		TotalSize        int64  `json:"total_size"`
 		ExpectedRevision *int64 `json:"expected_revision,omitempty"`
-	}{Path: path, TotalSize: size, ExpectedRevision: expectedRevisionField(expectedRevision)})
+		Description      string `json:"description,omitempty"`
+	}{Path: path, TotalSize: size, ExpectedRevision: expectedRevisionField(expectedRevision), Description: description})
 	if err != nil {
 		return nil, err
 	}
