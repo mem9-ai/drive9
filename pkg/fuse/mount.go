@@ -26,23 +26,25 @@ import (
 // its entire lifetime (Invariant #3). To change credentials, umount and
 // remount; there is no in-process rebind.
 type MountOptions struct {
-	Server            string        // dat9 server URL
-	APIKey            string        // owner API key (mutually exclusive with Token)
-	Token             string        // delegated capability JWT (mutually exclusive with APIKey)
-	MountPoint        string        // local mount point
-	CacheDir          string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
-	CacheSize         int64         // ReadCache max size in bytes (default 128MB)
-	DirTTL            time.Duration // DirCache TTL (default 5s)
-	AttrTTL           time.Duration // kernel attr cache TTL (default 1s)
-	EntryTTL          time.Duration // kernel entry cache TTL (default 1s)
-	NegativeEntryTTL  time.Duration // kernel negative entry cache TTL (default 1s)
-	FlushDebounce     time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
-	SyncMode          SyncMode      // interactive, strict, or auto (default auto)
-	Profile           string        // mount profile: "interactive", "" (default)
-	UploadConcurrency int           // number of background upload workers (default 4)
-	AllowOther        bool          // allow other users to access mount
-	ReadOnly          bool          // mount as read-only
-	Debug             bool          // enable FUSE debug logging
+	Server             string        // dat9 server URL
+	APIKey             string        // owner API key (mutually exclusive with Token)
+	Token              string        // delegated capability JWT (mutually exclusive with APIKey)
+	MountPoint         string        // local mount point
+	CacheDir           string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
+	CacheSize          int64         // ReadCache max size in bytes (default 128MB)
+	DirTTL             time.Duration // DirCache TTL (default 10s)
+	AttrTTL            time.Duration // kernel attr cache TTL (default 10s)
+	EntryTTL           time.Duration // kernel entry cache TTL (default 10s)
+	NegativeEntryTTL   time.Duration // kernel negative entry cache TTL (default 10s)
+	FlushDebounce      time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
+	SyncMode           SyncMode      // interactive, strict, or auto (default auto)
+	Profile            string        // mount profile: "interactive", "" (default)
+	UploadConcurrency  int           // number of background upload workers (default 4)
+	LookupRetryCount   int           // detached retries after transient Lookup/GetAttr stat failures (default 2)
+	LookupRetryTimeout time.Duration // timeout per detached stat retry after interrupt/transient errors (default 250ms)
+	AllowOther         bool          // allow other users to access mount
+	ReadOnly           bool          // mount as read-only
+	Debug              bool          // enable FUSE debug logging
 }
 
 func (o *MountOptions) setDefaults() {
@@ -67,6 +69,16 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.UploadConcurrency <= 0 {
 		o.UploadConcurrency = 4
+	}
+	if o.LookupRetryCount < 0 {
+		// Negative values are CLI-internal sentinels meaning retries were
+		// explicitly disabled by the operator.
+		o.LookupRetryCount = 0
+	} else if o.LookupRetryCount == 0 {
+		o.LookupRetryCount = lookupTransientRetryCount
+	}
+	if o.LookupRetryTimeout <= 0 {
+		o.LookupRetryTimeout = lookupTransientRetryTimeout
 	}
 	// Apply interactive profile if requested.
 	if o.Profile == "interactive" {
