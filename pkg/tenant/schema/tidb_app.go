@@ -127,7 +127,11 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 func tidbAppEmbeddingOptionalSchemaStatements() []string {
 	return []string{
 		`ALTER TABLE files
-			ADD FULLTEXT INDEX idx_fts_content_desc(content_text, description)
+			ADD FULLTEXT INDEX idx_fts_content(content_text)
+			WITH PARSER MULTILINGUAL
+			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
+		`ALTER TABLE files
+			ADD FULLTEXT INDEX idx_fts_description(description)
 			WITH PARSER MULTILINGUAL
 			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
 		`ALTER TABLE files
