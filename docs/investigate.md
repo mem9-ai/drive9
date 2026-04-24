@@ -386,3 +386,74 @@ At this point, the investigation indicates:
    - subsequent opens/lookups of the same path in real mount mode
 5. Only after the integration test is fully stable should we return to the full
    `e2e/fuse-smoke-test.sh` loop.
+
+## Post-cherry-pick status update (2026-04-23)
+
+After cherry-picking the investigation commits back onto
+`server-metadata-authority` (in order):
+
+- `d9f1baa0f30f757efdd648db8f18fb2475010145`
+- `91b937e8ebe5ec814e80f95e2b316a5f6a32739f`
+
+the branch now contains:
+
+- `livePending` state and related read/open/lookup/getattr hooks
+- mount-level trace logging guarded by `traceFusePath(...)`
+- focused live-pending regression tests
+- `pkg/fuse/mount_integration_test.go`
+- `FUSE_MOUNT_LOG_DIR` wiring in `e2e/fuse-smoke-test.sh`
+
+### What was validated locally before switching to Linux
+
+Environment used for this check: macOS (Darwin).
+
+1. Focused live-pending tests pass:
+
+```bash
+go test ./pkg/fuse -run 'TestLookupAndOpenReadUseLivePendingForNewFile|TestGetAttrUsesLivePendingForNewFile|TestUnlinkPendingNewFileSkipsRemoteDelete|TestCreateEntryTracksLivePendingSizeAfterWrite|TestLookupReusesLivePendingInode'
+```
+
+2. Mount integration tests are Linux-gated and skip on Darwin:
+
+```bash
+go test ./pkg/fuse -run 'TestMountCreateWriteReadPendingNew|TestMountNestedCreateWriteReadPendingNew' -v
+```
+
+So the real mounted create/write/read behavior is still pending Linux-side validation.
+
+### Linux-side execution plan (next loop)
+
+Use this order to reduce noise and keep diagnosis tight:
+
+1. **Stabilize the mount integration baseline first**
+   - Run the two mount integration tests repeatedly.
+   - Goal: no teardown/lifecycle flakes before touching full smoke.
+
+```bash
+go test ./pkg/fuse -run 'TestMountCreateWriteReadPendingNew|TestMountNestedCreateWriteReadPendingNew' -v -count=20
+```
+
+2. **Trace callback ordering on the minimal repro**
+   - Confirm whether failing cases do not enter `Read()` (kernel EOF path), or
+     do enter `Read()` and hit an explicit branch.
+   - Focus callbacks: `Lookup/Create/Write/Flush/Release/GetAttr/Open/Read`.
+
+3. **Run full FUSE smoke only after step 1 is stable**
+
+```bash
+export FUSE_MOUNT_LOG_DIR=/tmp/drive9-fuse-trace
+export DRIVE9_BASE=http://127.0.0.1:9009
+# export DRIVE9_API_KEY=...   # set when needed
+bash e2e/fuse-smoke-test.sh
+```
+
+4. **Evaluate two hypotheses separately**
+   - Hypothesis A (empty read): `Lookup`/entry visibility race for newly created files.
+   - Hypothesis B (`EIO`): `Read` hits `remoteSize == 0 && touchesEvicted` in the
+     streaming path.
+
+### Notes for this Linux pass
+
+- Treat `pkg/fuse/mount_integration_test.go` as the primary diagnosis loop.
+- Keep the full smoke test as a confirmation layer, not the first debugger.
+- Preserve mount log artifacts per run under `FUSE_MOUNT_LOG_DIR` for ordering analysis.
