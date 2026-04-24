@@ -199,6 +199,7 @@ func TestCommitQueueAutoResolveLWW(t *testing.T) {
 
 // Test axis 2: 409 → fetch → content matches → idempotent success.
 func TestCommitQueueAutoResolveIdempotent(t *testing.T) {
+	var uploadCalls int
 	sameContent := []byte("identical!")
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -211,6 +212,7 @@ func TestCommitQueueAutoResolveIdempotent(t *testing.T) {
 			_, _ = w.Write(sameContent)
 		default:
 			// First upload: 409.
+			uploadCalls++
 			http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
 		}
 	}))
@@ -244,6 +246,11 @@ func TestCommitQueueAutoResolveIdempotent(t *testing.T) {
 	}
 	cq.DrainAll()
 
+	// Only the initial upload should have been attempted (the 409 that triggered auto-resolve).
+	// No LWW re-upload because content matched.
+	if uploadCalls != 1 {
+		t.Fatalf("upload calls = %d, want 1 (initial 409 only, no LWW re-upload)", uploadCalls)
+	}
 	// Idempotent: should be cleaned up without a second upload.
 	if pending.HasPending("/idem.txt") {
 		t.Fatal("pending entry should be removed after idempotent resolve")
