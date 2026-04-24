@@ -10,11 +10,13 @@ import (
 func (s *Store) InsertFileTx(db execer, f *File) error {
 	_, err := db.Exec(`INSERT INTO files
 		(file_id, storage_type, storage_ref, content_blob, content_type, size_bytes, checksum_sha256,
-		 revision, status, source_id, content_text, description, created_at, confirmed_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 revision, status, source_id, content_text, description, description_embedding_revision,
+		 created_at, confirmed_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		f.FileID, f.StorageType, f.StorageRef, nilBytes(f.ContentBlob), nullStr(f.ContentType),
 		f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
 		nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
+		nullInt64Ptr(f.DescriptionEmbeddingRevision),
 		f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
 	return err
 }
@@ -48,7 +50,14 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 		query += ` description = ?,`
 		args = append(args, description)
 		if currentDesc.String != description {
-			query += ` description_embedding = NULL, description_embedding_revision = NULL,`
+			if preserveEmbedding {
+				// Auto-embedding mode: the database owns embedding via generated
+				// column, so we only need to keep the revision tracker in sync.
+				// Use revision + 1 because this same UPDATE also increments revision.
+				query += ` description_embedding_revision = revision + 1,`
+			} else {
+				query += ` description_embedding = NULL, description_embedding_revision = NULL,`
+			}
 		}
 	}
 	if preserveEmbedding {
@@ -109,7 +118,7 @@ func (s *Store) ConfirmPendingFileAutoEmbeddingTx(db execer, fileID string, stor
 		size_bytes = ?, checksum_sha256 = NULL, content_text = NULL`
 	args := []any{storageType, storageRef, nullStr(contentType), size}
 	if description != "" {
-		query += `, description = ?`
+		query += `, description = ?, description_embedding_revision = revision`
 		args = append(args, description)
 	}
 	query += `, status = 'CONFIRMED', confirmed_at = ? WHERE file_id = ? AND status = 'PENDING'`

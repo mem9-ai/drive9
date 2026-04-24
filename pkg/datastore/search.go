@@ -213,7 +213,9 @@ func buildVectorSearchDescriptionByTextQuery(queryText, pathPrefix string, limit
 	if strings.TrimSpace(queryText) == "" {
 		return "", nil, false
 	}
-	conds := []string{"f.status = 'CONFIRMED'", "f.description_embedding IS NOT NULL", "f.description_embedding_revision = f.revision"}
+	// Auto-embedding mode uses a generated column for description_embedding,
+	// so the vector is always current and no revision gate is needed.
+	conds := []string{"f.status = 'CONFIRMED'", "f.description_embedding IS NOT NULL"}
 	args := []any{queryText}
 
 	if pathPrefix != "" && pathPrefix != "/" {
@@ -243,19 +245,23 @@ func ftsSafe(s string) string {
 	return s
 }
 
-// FTSSearch runs a full-text search over files.content_text.
+// FTSSearch runs a full-text search over files.content_text and files.description.
 func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit int) ([]SearchResult, error) {
 	safe := ftsSafe(query)
-	ftsExpr := "fts_match_word('" + safe + "', content_text, description)"
 
 	var args []any
 	args = append(args, limit)
 
-	innerQ := `SELECT file_id, size_bytes, ` + ftsExpr + ` AS score
-		FROM files
-		WHERE status = 'CONFIRMED' AND ` + ftsExpr + `
-		ORDER BY ` + ftsExpr + ` DESC
-		LIMIT ?`
+	contentExpr := "fts_match_word('" + safe + "', content_text)"
+	descExpr := "fts_match_word('" + safe + "', description)"
+
+	innerQ := `SELECT file_id, MAX(score) AS score FROM (
+		SELECT file_id, ` + contentExpr + ` AS score
+		FROM files WHERE status = 'CONFIRMED' AND ` + contentExpr + `
+		UNION ALL
+		SELECT file_id, ` + descExpr + ` AS score
+		FROM files WHERE status = 'CONFIRMED' AND ` + descExpr + `
+	) fts GROUP BY file_id ORDER BY score DESC LIMIT ?`
 
 	var outerConds []string
 	var outerArgs []any
@@ -265,9 +271,10 @@ func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit i
 		outerArgs = append(outerArgs, pargs...)
 	}
 
-	q := `SELECT fn.path, fn.name, fts.size_bytes, fts.score
+	q := `SELECT fn.path, fn.name, f.size_bytes, fts.score
 		FROM (` + innerQ + `) fts
-		JOIN file_nodes fn ON fn.file_id = fts.file_id`
+		JOIN file_nodes fn ON fn.file_id = fts.file_id
+		JOIN files f ON f.file_id = fts.file_id`
 	if len(outerConds) > 0 {
 		q += ` WHERE ` + strings.Join(outerConds, " AND ")
 	}
