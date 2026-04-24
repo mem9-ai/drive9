@@ -23,6 +23,17 @@ const (
 	defaultMaxUploadBytes        = int64(10 * (1 << 30)) // 10 GiB
 	defaultMaxTenantStorageBytes = int64(50 * (1 << 30)) // 50 GiB
 	defaultMaxMediaLLMFiles      = int64(500)            // 500 media files per tenant
+	// defaultMaxMonthlyLLMCostMillicents is the per-tenant monthly LLM spend
+	// cap applied when no explicit budget is configured. $10.00 USD, expressed
+	// in millicents (0.001 cents; $10 = 1000 cents = 1_000_000 millicents).
+	// This is a defense-in-depth floor, not a product pricing tier: high
+	// enough for a reasonable trial workload (hundreds of images or a few
+	// hours of audio) and low enough that a runaway tenant is noticed before
+	// meaningful financial impact. Operators who need a higher baseline raise
+	// this constant; operators who want to disable it globally pass a
+	// negative MaxMonthlyMillicents in Options.LLMCostBudget. Per-tenant
+	// overrides via meta.QuotaConfig.MaxMonthlyCostMC continue to win.
+	defaultMaxMonthlyLLMCostMillicents = int64(1_000_000) // $10.00
 )
 
 // QuotaSource controls where quota checks read authoritative state from.
@@ -70,7 +81,17 @@ type Options struct {
 // LLMCostBudgetOptions configures the monthly LLM cost budget.
 type LLMCostBudgetOptions struct {
 	// MaxMonthlyMillicents is the monthly cost cap in millicents (0.001 cents).
-	// Zero or negative disables the monthly cost budget gate.
+	//
+	// Tri-state:
+	//   > 0  — explicit per-tenant cap in millicents.
+	//   == 0 — unset; the default defense-in-depth cap
+	//          (defaultMaxMonthlyLLMCostMillicents, currently $10) is applied.
+	//   < 0  — explicit opt-out; disables the monthly cost budget gate.
+	//
+	// The zero-value meaning changed intentionally: leaving this field
+	// unset no longer yields "unlimited". Operators that truly need no
+	// monthly cap must pass a negative value. Per-tenant overrides via
+	// meta.QuotaConfig.MaxMonthlyCostMC still win over this value.
 	MaxMonthlyMillicents int64
 	// VisionCostPerKTokenMillicents is the cost per 1K tokens for Vision API calls.
 	VisionCostPerKTokenMillicents int64
@@ -153,7 +174,14 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	}
 
 	cb := opts.LLMCostBudget
-	b.maxMonthlyLLMCostMillicents = cb.MaxMonthlyMillicents
+	switch {
+	case cb.MaxMonthlyMillicents > 0:
+		b.maxMonthlyLLMCostMillicents = cb.MaxMonthlyMillicents
+	case cb.MaxMonthlyMillicents < 0:
+		b.maxMonthlyLLMCostMillicents = 0 // explicit opt-out
+	default:
+		b.maxMonthlyLLMCostMillicents = defaultMaxMonthlyLLMCostMillicents
+	}
 	b.visionCostPerKTokenMillicents = cb.VisionCostPerKTokenMillicents
 	b.audioLLMCostPerKTokenMillicents = cb.AudioLLMCostPerKTokenMillicents
 	b.whisperCostPerMinuteMillicents = cb.WhisperCostPerMinuteMillicents
