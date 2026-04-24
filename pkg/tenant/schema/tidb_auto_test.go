@@ -594,12 +594,18 @@ func TestTiDBSchemaSpecForModeIncludesVaultIndexes(t *testing.T) {
 }
 
 func TestTiDBSchemaSpecForModeIncludesAlterTableIndexes(t *testing.T) {
+	// In auto-embedding mode, FULLTEXT and VECTOR indexes are part of the
+	// enforceable schema contract and must appear in the spec. TiDB Cloud
+	// (the only platform where auto mode runs) supports ADD_COLUMNAR_REPLICA_ON_DEMAND.
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "files")
 	if _, ok := spec.indexes["idx_fts_content_desc"]; !ok {
-		t.Fatal("files missing idx_fts_content_desc index spec from ALTER TABLE statement")
+		t.Fatal("files auto mode spec must include idx_fts_content_desc index")
 	}
 	if _, ok := spec.indexes["idx_files_cosine"]; !ok {
-		t.Fatal("files missing idx_files_cosine index spec from ALTER TABLE statement")
+		t.Fatal("files auto mode spec must include idx_files_cosine index")
+	}
+	if _, ok := spec.indexes["idx_files_desc_cosine"]; !ok {
+		t.Fatal("files auto mode spec must include idx_files_desc_cosine index")
 	}
 }
 
@@ -616,7 +622,11 @@ func TestTiDBSchemaSpecForAppModeExcludesOptionalIndexes(t *testing.T) {
 	}
 }
 
-func TestPlannedTiDBSchemaRepairsSkipsHeavyAlterTableIndexRepairsOnExistingTable(t *testing.T) {
+func TestPlannedTiDBSchemaRepairsIncludesFulltextVectorIndexOnExistingTable(t *testing.T) {
+	// FULLTEXT and VECTOR indexes must be repaired even when the table already
+	// exists: TiDB Cloud (the platform for auto mode) supports the syntax, and
+	// applyTiDBSchemaRepairs gracefully skips with a warning on unsupported
+	// versions.
 	diffs := []tidbSchemaDiff{
 		{
 			kind:      tidbSchemaDiffMissingIndex,
@@ -627,8 +637,11 @@ func TestPlannedTiDBSchemaRepairsSkipsHeavyAlterTableIndexRepairsOnExistingTable
 	}
 
 	got := plannedTiDBSchemaRepairs(diffs)
-	if len(got) != 0 {
-		t.Fatalf("expected heavy index repair to be skipped on existing table, got %#v", got)
+	if len(got) != 1 {
+		t.Fatalf("expected fulltext index repair to be included for existing table, got %#v", got)
+	}
+	if got[0] != "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content_desc(content_text, description)" {
+		t.Fatalf("unexpected repair statement: %q", got[0])
 	}
 }
 
@@ -666,6 +679,16 @@ func TestIsSafeAddColumnRepairSQLRejectsStoredAndVirtualGeneratedColumns(t *test
 		if isSafeAddColumnRepairSQL(stmt) {
 			t.Fatalf("expected generated column repair to be unsafe: %s", stmt)
 		}
+	}
+}
+
+func TestIsSafeAddColumnRepairSQLAllowsStoredGeneratedVectorWithEmbedText(t *testing.T) {
+	// description_embedding is a STORED GENERATED VECTOR column backed by EMBED_TEXT.
+	// TiDB computes the value server-side so ALTER TABLE ADD COLUMN is safe on
+	// existing tables even when embedding rows are absent.
+	stmt := "ALTER TABLE files ADD COLUMN description_embedding VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT('amazon.titan-embed-text-v2:0', description, '{\"dimensions\":1024}')) STORED"
+	if !isSafeAddColumnRepairSQL(stmt) {
+		t.Fatal("expected STORED GENERATED VECTOR with EMBED_TEXT to be safe to add")
 	}
 }
 
@@ -819,14 +842,14 @@ func testFilesTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
 	meta := tidbTableMeta{
 		tableName: "files",
 		columns: map[string]tidbColumnMeta{
-			"file_id":                         {columnType: "varchar(64)"},
-			"status":                          {columnType: "varchar(32)"},
-			"content_text":                    {columnType: "longtext"},
-			"embedding":                       {columnType: "vector(1024)"},
-			"embedding_revision":              {columnType: "bigint"},
-			"description":                     {columnType: "longtext"},
-			"description_embedding":           {columnType: "vector(1024)"},
-			"description_embedding_revision":  {columnType: "bigint"},
+			"file_id":                        {columnType: "varchar(64)"},
+			"status":                         {columnType: "varchar(32)"},
+			"content_text":                   {columnType: "longtext"},
+			"embedding":                      {columnType: "vector(1024)"},
+			"embedding_revision":             {columnType: "bigint"},
+			"description":                    {columnType: "longtext"},
+			"description_embedding":          {columnType: "vector(1024)"},
+			"description_embedding_revision": {columnType: "bigint"},
 		},
 	}
 	if mode == TiDBEmbeddingModeAuto {
