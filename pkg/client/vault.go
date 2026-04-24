@@ -386,3 +386,50 @@ func (c *Client) ReadVaultSecretField(ctx context.Context, name, field string) (
 	}
 	return string(data), nil
 }
+
+// ReadVaultSecretAsOwner reads all fields via the management API (owner-read path).
+// Response shape is identical to ReadVaultSecret (Invariant #9).
+func (c *Client) ReadVaultSecretAsOwner(ctx context.Context, name string) (map[string]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.vaultURL("/secrets/"+url.PathEscape(name)+"/value"), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var result map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode owner secret read response: %w", err)
+	}
+	if result == nil {
+		result = map[string]string{}
+	}
+	return result, nil
+}
+
+// ReadVaultSecretFieldAsOwner reads a single field via the management API (owner-read path).
+// Response shape is identical to ReadVaultSecretField (Invariant #9).
+func (c *Client) ReadVaultSecretFieldAsOwner(ctx context.Context, name, field string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.vaultURL("/secrets/"+url.PathEscape(name)+"/value/"+url.PathEscape(field)), nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return "", readError(resp)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read owner field response: %w", err)
+	}
+	return string(data), nil
+}

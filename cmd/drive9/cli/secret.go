@@ -120,13 +120,18 @@ func SecretGet(args []string) error {
 		return fmt.Errorf("--json and --env are mutually exclusive")
 	}
 
-	c, err := newVaultReadClientFromEnv()
+	c, ownerMode, err := newVaultReadClientFromEnv()
 	if err != nil {
 		return err
 	}
 	ctx := context.Background()
 	if field != "" {
-		value, err := c.ReadVaultSecretField(ctx, name, field)
+		var value string
+		if ownerMode {
+			value, err = c.ReadVaultSecretFieldAsOwner(ctx, name, field)
+		} else {
+			value, err = c.ReadVaultSecretField(ctx, name, field)
+		}
 		if err != nil {
 			return err
 		}
@@ -145,7 +150,12 @@ func SecretGet(args []string) error {
 		return nil
 	}
 
-	fields, err := c.ReadVaultSecret(ctx, name)
+	var fields map[string]string
+	if ownerMode {
+		fields, err = c.ReadVaultSecretAsOwner(ctx, name)
+	} else {
+		fields, err = c.ReadVaultSecret(ctx, name)
+	}
 	if err != nil {
 		return err
 	}
@@ -205,11 +215,16 @@ func SecretWith(args []string) error {
 		return fmt.Errorf("usage drive9 vault with /n/vault/<secret> -- <command...>")
 	}
 
-	c, err := newVaultReadClientFromEnv()
+	c, ownerMode, err := newVaultReadClientFromEnv()
 	if err != nil {
 		return err
 	}
-	fields, err := c.ReadVaultSecret(context.Background(), name)
+	var fields map[string]string
+	if ownerMode {
+		fields, err = c.ReadVaultSecretAsOwner(context.Background(), name)
+	} else {
+		fields, err = c.ReadVaultSecret(context.Background(), name)
+	}
 	if err != nil {
 		return err
 	}
@@ -351,34 +366,24 @@ func SecretLs(args []string) error {
 	}
 
 	var names []string
-	if currentCapabilityToken() != "" {
-		c, err := newVaultReadClientFromEnv()
-		if err != nil {
-			return err
-		}
-		var errList error
-		names, errList = c.ListReadableVaultSecrets(context.Background())
-		if errList != nil {
-			return errList
-		}
-	} else if c, ok := optionalVaultManagementClientFromEnv(); ok {
-		secrets, err := c.ListVaultSecrets(context.Background())
-		if err != nil {
-			return err
+	c, ownerMode, err := newVaultReadClientFromEnv()
+	if err != nil {
+		return err
+	}
+	if ownerMode {
+		secrets, listErr := c.ListVaultSecrets(context.Background())
+		if listErr != nil {
+			return listErr
 		}
 		names = make([]string, 0, len(secrets))
 		for _, sec := range secrets {
 			names = append(names, sec.Name)
 		}
 	} else {
-		c, err := newVaultReadClientFromEnv()
-		if err != nil {
-			return err
-		}
-		var errList error
-		names, errList = c.ListReadableVaultSecrets(context.Background())
-		if errList != nil {
-			return errList
+		var listErr error
+		names, listErr = c.ListReadableVaultSecrets(context.Background())
+		if listErr != nil {
+			return listErr
 		}
 	}
 	sort.Strings(names)
@@ -656,16 +661,22 @@ func newVaultManagementClientFromEnv() (*client.Client, error) {
 	return c, nil
 }
 
-// newVaultReadClientFromEnv requires a delegated capability token (server's
-// vault read path is token-gated — an owner API key alone will be rejected
-// server-side with EACCES). Resolution goes through the unified resolver so
-// env > config priority + Unsetenv mitigation apply uniformly.
-func newVaultReadClientFromEnv() (*client.Client, error) {
+// newVaultReadClientFromEnv returns a client suitable for reading secret values
+// and a flag indicating whether the client is in owner mode. Routing is based
+// solely on ResolveCredentials().Kind (§14.2 routing invariant):
+//   - CredentialDelegated → capability-read path (/v1/vault/read/*)
+//   - CredentialOwner     → owner-read path (/v1/vault/secrets/{name}/value)
+//   - CredentialNone      → error
+func newVaultReadClientFromEnv() (*client.Client, bool, error) {
 	r := ResolveCredentials()
-	if r.Kind != CredentialDelegated {
-		return nil, fmt.Errorf("missing capability token; set %s before using drive9 vault get/with", EnvVaultToken)
+	switch r.Kind {
+	case CredentialDelegated:
+		return client.New(r.Server, r.Token), false, nil
+	case CredentialOwner:
+		return client.New(r.Server, r.APIKey), true, nil
+	default:
+		return nil, false, fmt.Errorf("no credential available; set %s (delegated) or %s (owner)", EnvVaultToken, EnvAPIKey)
 	}
-	return client.New(r.Server, r.Token), nil
 }
 
 func validateSecretName(name string) error {
