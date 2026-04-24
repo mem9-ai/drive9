@@ -22,8 +22,10 @@ import (
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/server"
+	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
 
@@ -217,6 +219,39 @@ func main() {
 	defer b.Close()
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_local_backend")
 
+	// Wire central quota store when DRIVE9_LOCAL_META_DSN is set.
+	// This enables server-mode quota enforcement (DRIVE9_QUOTA_SOURCE=server)
+	// in the local single-tenant entrypoint for E2E validation.
+	metaDSN := strings.TrimSpace(os.Getenv("DRIVE9_LOCAL_META_DSN"))
+	if metaDSN != "" {
+		stepStart = time.Now()
+		metaStore, err := meta.Open(metaDSN)
+		if err != nil {
+			die(fmt.Errorf("open local meta store: %w", err))
+		}
+		defer func() { _ = metaStore.Close() }()
+
+		adapter := tenant.NewMetaQuotaAdapter(metaStore)
+		b.SetMetaQuotaStore("local-tenant", adapter)
+
+		if err := metaStore.EnsureQuotaUsageRow(context.Background(), "local-tenant"); err != nil {
+			logger.Warn(startupCtx, "ensure_quota_usage_row_failed",
+				zap.String("tenant_id", "local-tenant"), zap.Error(err))
+		}
+
+		replayWorker := backend.StartMutationReplayWorker(adapter)
+		if replayWorker != nil {
+			defer replayWorker.Stop()
+		}
+		expirySweepWorker := backend.StartExpirySweepWorker(metaStore)
+		if expirySweepWorker != nil {
+			defer expirySweepWorker.Stop()
+		}
+
+		logLocalStartupStep(startupCtx, startupStart, stepStart, "wire_central_quota",
+			zap.String("meta_dsn", redactDSN(metaDSN)))
+	}
+
 	if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
 		Backend:          b,
 		LocalS3:          localS3,
@@ -296,6 +331,7 @@ environment:
   DRIVE9_LOCAL_API_KEY fixed API key returned by local /v1/provision and accepted by /v1/status (default: local-dev-key)
   DRIVE9_LOCAL_INIT_SCHEMA initialize tenant schema on startup (default: false)
   DRIVE9_LOCAL_EMBEDDING_MODE auto|app|detect (default: auto when initing schema, detect otherwise)
+  DRIVE9_LOCAL_META_DSN  local control-plane MySQL DSN for central quota (optional; enables server-mode quota enforcement)
   DRIVE9_VAULT_MASTER_KEY 32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
 
