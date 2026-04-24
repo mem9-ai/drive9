@@ -73,8 +73,10 @@ type Dat9FS struct {
 	// notifications complete before shutdown.
 	notifyWg sync.WaitGroup
 
-	// lookupStatRetry* counters track transient Lookup stat retries so operators
-	// can distinguish absorbed interrupt noise from exhausted retries.
+	// lookupStatRetry* counters track only the Lookup->Stat retry path so
+	// operators can distinguish absorbed interrupt noise from exhausted retries
+	// on the primary probe route. GetAttr and list-fallback retries intentionally
+	// reuse the retry logic without contributing to these counters.
 	lookupStatRetryTotal     atomic.Uint64
 	lookupStatRetrySuccess   atomic.Uint64
 	lookupStatRetryExhausted atomic.Uint64
@@ -681,8 +683,12 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, remotePath stri
 
 	lastErr := err
 	for range retryCount {
-		// Detached retries absorb interrupt races from probing callers that do not
-		// retry open/stat failures in user space.
+		// Retry attempts intentionally use a detached context instead of
+		// fuseCtx(cancel): the initial probe already honored FUSE interrupt, and
+		// these retries exist to absorb interrupt races plus short backend jitter.
+		// Rebinding cancel here would cancel retries immediately and re-expose
+		// transient failures. Keep this detached+bounded behavior unless retry
+		// semantics are redesigned.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
 		stat, err = fs.client.StatCtx(retryCtx, remotePath)
 		retryCancel()
@@ -713,10 +719,14 @@ func (fs *Dat9FS) lookupStatWithRetry(cancel <-chan struct{}, childP string) (*c
 }
 
 func (fs *Dat9FS) getAttrStatWithRetry(cancel <-chan struct{}, remotePath string) (*client.StatResult, error) {
+	// Keep GetAttr retries out of lookupStatRetry* so that those counters retain
+	// a single meaning: Lookup path retry behavior.
 	return fs.statWithTransientRetry(cancel, remotePath, false)
 }
 
 func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string) ([]client.FileInfo, error) {
+	// list-fallback retries are intentionally not counted in lookupStatRetry*;
+	// those counters remain scoped to the primary Lookup->Stat path.
 	ctx, cf := fuseCtx(cancel)
 	items, err := fs.client.ListCtx(ctx, parentPath)
 	cf()
@@ -730,8 +740,10 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 
 	lastErr := err
 	for range retryCount {
-		// Keep list fallback bounded; this path only runs when HEAD/stat said
-		// "not found" and we need directory-list compatibility probing.
+		// Keep list fallback retries detached from FUSE cancel for the same reason
+		// as stat retries above: this path is a compatibility probe after HEAD
+		// said "not found", and cancel-coupled retries would collapse to the
+		// original transient failure immediately.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
 		items, err = fs.client.ListCtx(retryCtx, parentPath)
 		retryCancel()
