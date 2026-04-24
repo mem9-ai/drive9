@@ -8,7 +8,7 @@ This directory contains an end-to-end test suite for drive9's **server-mode quot
 ```
 ┌─────────────────────────────────────────┐
 │  Docker: meta-db (MySQL 8.0)            │
-│  Port 3306 / DB: drive9_meta            │
+│  Port 3306 (container) / DB: drive9_meta │
 │  Tables: tenant_quota_usage,            │
 │          quota_mutation_log, ...        │
 └─────────────────────────────────────────┘
@@ -16,7 +16,7 @@ This directory contains an end-to-end test suite for drive9's **server-mode quot
             ▼
 ┌─────────────────────────────────────────┐
 │  Docker: tenant-db (TiDB)               │
-│  Port 4000 / DB: drive9_local           │
+│  Port 4000 (container) / DB: drive9_local │
 │  Tables: files, file_nodes, uploads, ...│
 └─────────────────────────────────────────┘
             │
@@ -36,7 +36,7 @@ This directory contains an end-to-end test suite for drive9's **server-mode quot
 |------|---------|
 | `docker-compose.quota.yml` | Spins up meta-db (MySQL) and tenant-db (TiDB) |
 | `quota-server-e2e.sh` | Full E2E test script |
-| `QUOTA_E2E.md` | This document |
+| `TEST_REPORT.md` | Latest run summary |
 
 ## Prerequisites
 
@@ -94,8 +94,8 @@ the full server-mode quota stack without requiring the multi-tenant
 | Variable | Value in test | Meaning |
 |----------|---------------|---------|
 | `DRIVE9_QUOTA_SOURCE` | `server` | Read quota state from central DB |
-| `DRIVE9_LOCAL_META_DSN` | `root:root@tcp(127.0.0.1:3306)/drive9_meta?parseTime=true` | Control-plane DB |
-| `DRIVE9_LOCAL_DSN` | `root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true` | Tenant DB (TiDB) |
+| `DRIVE9_LOCAL_META_DSN` | `root:root@tcp(127.0.0.1:13306)/drive9_meta?parseTime=true` | Control-plane DB (host-published port) |
+| `DRIVE9_LOCAL_DSN` | `root@tcp(127.0.0.1:14000)/drive9_local?parseTime=true` | Tenant DB — TiDB (host-published port) |
 | `DRIVE9_MAX_TENANT_STORAGE_BYTES` | `1048576` (1 MiB) | Small limit for fast boundary testing |
 | `DRIVE9_MAX_UPLOAD_BYTES` | `10485760` (10 MiB) | Per-upload size limit |
 | `DRIVE9_MAX_MEDIA_LLM_FILES` | `2` | Media file soft-quota limit |
