@@ -926,6 +926,16 @@ func TestHTTPToFuseStatus_ContextErrorsMapToEAGAIN(t *testing.T) {
 	}
 }
 
+func TestHTTPToFuseStatus_MapsGatewayTimeoutToEAGAIN(t *testing.T) {
+	want := gofuse.Status(syscall.EAGAIN)
+	if got := httpToFuseStatus(&client.StatusError{StatusCode: http.StatusGatewayTimeout, Message: "gateway timeout"}); got != want {
+		t.Fatalf("status error 504 = %v, want %v", got, want)
+	}
+	if got := httpToFuseStatus(fmt.Errorf("HTTP 504: upstream timeout")); got != want {
+		t.Fatalf("string error 504 = %v, want %v", got, want)
+	}
+}
+
 func TestOpenReadOnlyLargeFileGetsPrefetcher(t *testing.T) {
 	size := int64(1024 * 1024) // 1MB — above smallFileThreshold
 	data := make([]byte, size)

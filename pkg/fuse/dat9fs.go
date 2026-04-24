@@ -566,7 +566,9 @@ func httpToFuseStatus(err error) gofuse.Status {
 			return gofuse.Status(syscall.ESTALE)
 		case http.StatusBadRequest:
 			return gofuse.Status(syscall.EINVAL)
-		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable:
+		// Keep status mapping aligned with isTransientLookupErr so retry-exhausted
+		// timeout paths remain retryable to callers instead of regressing to EIO.
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 			return gofuse.Status(syscall.EAGAIN)
 		default:
 			return gofuse.EIO
@@ -591,7 +593,8 @@ func httpToFuseStatus(err error) gofuse.Status {
 		return gofuse.Status(syscall.EINVAL)
 	case strings.Contains(msg, "HTTP 500") ||
 		strings.Contains(msg, "HTTP 502") ||
-		strings.Contains(msg, "HTTP 503"):
+		strings.Contains(msg, "HTTP 503") ||
+		strings.Contains(msg, "HTTP 504"):
 		return gofuse.Status(syscall.EAGAIN)
 	default:
 		return gofuse.EIO

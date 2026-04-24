@@ -32,10 +32,10 @@ type MountOptions struct {
 	MountPoint         string        // local mount point
 	CacheDir           string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
 	CacheSize          int64         // ReadCache max size in bytes (default 128MB)
-	DirTTL             time.Duration // DirCache TTL (default 5s)
-	AttrTTL            time.Duration // kernel attr cache TTL (default 1s)
-	EntryTTL           time.Duration // kernel entry cache TTL (default 1s)
-	NegativeEntryTTL   time.Duration // kernel negative entry cache TTL (default 1s)
+	DirTTL             time.Duration // DirCache TTL (default 10s)
+	AttrTTL            time.Duration // kernel attr cache TTL (default 10s)
+	EntryTTL           time.Duration // kernel entry cache TTL (default 10s)
+	NegativeEntryTTL   time.Duration // kernel negative entry cache TTL (default 10s)
 	FlushDebounce      time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
 	SyncMode           SyncMode      // interactive, strict, or auto (default auto)
 	Profile            string        // mount profile: "interactive", "" (default)
