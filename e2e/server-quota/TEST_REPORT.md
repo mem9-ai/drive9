@@ -77,8 +77,8 @@
 
 | Metric | Value |
 |--------|-------|
-| Total assertions | 17 |
-| Passed | 17 |
+| Total assertions | 19 |
+| Passed | 19 |
 | Failed | 0 |
 
 All server-mode quota enforcement features validated successfully:
@@ -89,3 +89,4 @@ All server-mode quota enforcement features validated successfully:
 - Multipart upload reservation saga (reserve / abort release)
 - Quota mutation log persistence
 - Backfill CLI consistency with tenant DB
+- Monthly LLM cost quota config (`max_monthly_cost_mc`) and central counter (`tenant_monthly_llm_cost`)
