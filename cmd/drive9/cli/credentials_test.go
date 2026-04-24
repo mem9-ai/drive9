@@ -2,7 +2,10 @@ package cli
 
 import (
 	"flag"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 )
 
@@ -354,6 +357,70 @@ func TestNewVaultReadClient_DelegatedActiveContext(t *testing.T) {
 	// the global ResolveCredentials() which reads from disk. Instead,
 	// verify the resolver returns CredentialDelegated, which is the
 	// sole routing input per §14.2.
+}
+
+// --- No-fallthrough integration tests (§14.2 no-fallthrough invariant) ---
+//
+// These verify that when DRIVE9_VAULT_TOKEN is set (even if the token is
+// expired, revoked, or malformed), the routing commits to the capability-read
+// path. If the server returns 401 on that path, the error surfaces to the
+// caller — it MUST NOT silently fall through to the owner-read path even
+// though a valid API key is present. This is the runtime witness for §14.2.
+
+func TestNoFallthrough_ExpiredToken(t *testing.T) {
+	testNoFallthrough(t, "expired-jwt-token", "expired token → 401, must not retry via owner path")
+}
+
+func TestNoFallthrough_RevokedToken(t *testing.T) {
+	testNoFallthrough(t, "revoked-jwt-token", "revoked token → 401, must not retry via owner path")
+}
+
+func TestNoFallthrough_MalformedToken(t *testing.T) {
+	testNoFallthrough(t, "not-a-valid-token", "malformed token → 401, must not retry via owner path")
+}
+
+// testNoFallthrough is the shared harness for the 3 no-fallthrough cases.
+// It sets up a mock server with two paths:
+//   - /v1/vault/read/test-secret  → 401 (simulates auth failure on capability path)
+//   - /v1/vault/secrets/test-secret/value → 200 with valid JSON (owner-read path)
+//
+// SecretGet MUST return an error (the 401). If it returns nil, it means
+// the code silently fell through to the owner path — a spec violation.
+func testNoFallthrough(t *testing.T, token, desc string) {
+	t.Helper()
+	var ownerPathHit int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/vault/read/test-secret":
+			// Capability-read path: simulate auth failure.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+		case r.URL.Path == "/v1/vault/secrets/test-secret/value":
+			// Owner-read path: should NEVER be reached.
+			atomic.AddInt32(&ownerPathHit, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"KEY":"VALUE"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(EnvVaultToken, token)
+	t.Setenv(EnvAPIKey, "sk-valid-owner-key")
+	t.Setenv(EnvServer, srv.URL)
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	err := SecretGet([]string{"test-secret"})
+	if err == nil {
+		t.Fatalf("%s: SecretGet returned nil; expected error from 401 on capability path", desc)
+	}
+	if atomic.LoadInt32(&ownerPathHit) != 0 {
+		t.Fatalf("%s: owner-read path was hit — no-fallthrough invariant violated", desc)
+	}
 }
 
 func TestResolveCredentials_CachedPerProcess(t *testing.T) {
