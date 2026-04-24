@@ -683,18 +683,14 @@ func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
 		}
 		if mode == TiDBEmbeddingModeAuto {
 			// description_embedding is defined as STORED GENERATED in CREATE TABLE so new
-			// tenants get it automatically. However, TiDB does not support adding a STORED
-			// GENERATED column to an existing table via ALTER TABLE (error 3106). For
-			// pre-318 tenants we repair the column as a plain VECTOR column instead.
-			// The EMBED_TEXT auto-compute will not back-fill existing rows, but the column
-			// will be present so the server can start and new writes are not blocked.
-			if col, ok := spec.tables[i].columns["description_embedding"]; ok {
-				col.addSQL = fmt.Sprintf(
-					"ALTER TABLE files ADD COLUMN description_embedding VECTOR(%d) DEFAULT NULL",
-					TiDBAutoEmbeddingDimensions,
-				)
-				spec.tables[i].columns["description_embedding"] = col
-			}
+			// tenants get it automatically. TiDB does not support adding STORED GENERATED
+			// columns via ALTER TABLE (error 3106) — this is a permanent TiDB limitation.
+			// Pre-318 tenants cannot have the column back-filled; exclude it and its
+			// dependent index from the enforceable schema contract so those tenants can
+			// start. Description auto-embedding simply will not be available for pre-318
+			// tenants; new tenants receive the full column at CREATE TABLE time.
+			delete(spec.tables[i].columns, "description_embedding")
+			delete(spec.tables[i].indexes, "idx_files_desc_cosine")
 		}
 		spec.tables[i].validate = func(meta tidbTableMeta) []tidbSchemaDiff {
 			switch mode {
@@ -1560,26 +1556,22 @@ func isIgnorableTiDBSchemaError(err error) bool {
 
 func validateTiDBAutoEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
 	var diffs []tidbSchemaDiff
+	// Only validate the content embedding column. description_embedding is
+	// excluded from the auto-mode contract because TiDB does not support adding
+	// STORED GENERATED columns via ALTER TABLE (error 3106); pre-318 tenants
+	// will simply not have description auto-embedding available.
 	for _, spec := range []struct {
 		column string
 		source string
 	}{
 		{"embedding", "content_text"},
-		{"description_embedding", "description"},
 	} {
 		col, err := meta.requireColumn(spec.column)
 		if err != nil {
 			return nil
 		}
 		extra := normalizeSQLFragment(col.extra)
-		isGeneratedStored := strings.Contains(extra, "generated") && strings.Contains(extra, "stored")
-		if !isGeneratedStored {
-			if spec.column == "description_embedding" {
-				// Column was added as a plain VECTOR column via ALTER TABLE
-				// (TiDB 3106 prevents adding STORED GENERATED via ALTER TABLE).
-				// Accept it without enforcing the GENERATED EMBED_TEXT contract.
-				continue
-			}
+		if !strings.Contains(extra, "generated") || !strings.Contains(extra, "stored") {
 			diffs = append(diffs, tidbSchemaDiff{
 				kind:       tidbSchemaDiffTableContract,
 				tableName:  "files",
