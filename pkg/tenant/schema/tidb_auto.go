@@ -1302,20 +1302,13 @@ func missingTableAndIndexDiffs(table tidbTableSpec) []tidbSchemaDiff {
 }
 
 func plannedTiDBSchemaRepairs(diffs []tidbSchemaDiff) []string {
-	tableMissing := make(map[string]bool)
-	for _, diff := range diffs {
-		if diff.kind == tidbSchemaDiffMissingTable {
-			tableMissing[diff.tableName] = true
-		}
-	}
-
 	seen := make(map[string]struct{})
 	plans := make([]string, 0, len(diffs))
 	for _, diff := range diffs {
 		if diff.repairSQL == "" {
 			continue
 		}
-		if !isSafeTiDBRepairDiff(diff, tableMissing) {
+		if !isSafeTiDBRepairDiff(diff) {
 			continue
 		}
 		if _, ok := seen[diff.repairSQL]; ok {
@@ -1327,14 +1320,14 @@ func plannedTiDBSchemaRepairs(diffs []tidbSchemaDiff) []string {
 	return plans
 }
 
-func isSafeTiDBRepairDiff(diff tidbSchemaDiff, tableMissing map[string]bool) bool {
+func isSafeTiDBRepairDiff(diff tidbSchemaDiff) bool {
 	switch diff.kind {
 	case tidbSchemaDiffMissingTable:
 		return true
 	case tidbSchemaDiffMissingColumn:
 		return isSafeAddColumnRepairSQL(diff.repairSQL)
 	case tidbSchemaDiffMissingIndex:
-		return isSafeAddIndexRepairSQL(diff.repairSQL, tableMissing[diff.tableName])
+		return isSafeAddIndexRepairSQL(diff.repairSQL)
 	default:
 		return false
 	}
@@ -1342,9 +1335,12 @@ func isSafeTiDBRepairDiff(diff tidbSchemaDiff, tableMissing map[string]bool) boo
 
 func isSafeAddColumnRepairSQL(sqlText string) bool {
 	// STORED GENERATED VECTOR columns whose expression uses EMBED_TEXT are
-	// safe to add to existing tables via ALTER TABLE: TiDB computes the value
-	// server-side without touching existing row data. This covers the
-	// description_embedding column introduced for auto-embedding mode.
+	// safe to add to existing tables via ALTER TABLE in the correctness sense:
+	// TiDB computes the values server-side rather than requiring the client to
+	// backfill. Note that this still materializes one EMBED_TEXT call per
+	// existing row at ALTER time, which can be slow and carry inference cost
+	// for large tables. This covers the description_embedding column introduced
+	// for auto-embedding mode.
 	normalized := normalizeSQLFragment(sqlText)
 	if strings.Contains(normalized, " generated ") &&
 		strings.Contains(normalized, " stored") &&
@@ -1355,7 +1351,7 @@ func isSafeAddColumnRepairSQL(sqlText string) bool {
 	return schemaspec.IsSafeAddColumnRepairSQL(sqlText)
 }
 
-func isSafeAddIndexRepairSQL(sqlText string, tableMissing bool) bool {
+func isSafeAddIndexRepairSQL(sqlText string) bool {
 	normalized := normalizeSQLFragment(sqlText)
 	if strings.HasPrefix(normalized, "create index ") {
 		return true
