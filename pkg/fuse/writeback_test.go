@@ -1745,7 +1745,7 @@ func TestGetAttrUsesLivePendingForNewFile(t *testing.T) {
 	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
 }
 
-func TestUnlinkPendingNewFileSkipsRemoteDelete(t *testing.T) {
+func TestUnlinkLivePendingMetadataCreatedFileUsesRemoteDelete(t *testing.T) {
 	var remoteDeleteCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if serveMetadataCreate(w, r) {
@@ -1802,8 +1802,8 @@ func TestUnlinkPendingNewFileSkipsRemoteDelete(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("Unlink: %v", st)
 	}
-	if remoteDeleteCalls.Load() != 0 {
-		t.Fatalf("remote delete calls = %d, want 0 for pending-new file", remoteDeleteCalls.Load())
+	if remoteDeleteCalls.Load() != 1 {
+		t.Fatalf("remote delete calls = %d, want 1 for metadata-created file", remoteDeleteCalls.Load())
 	}
 	if _, ok := fs.getLivePending("/unlink-live.txt"); ok {
 		t.Fatal("live pending entry should be removed after unlink")

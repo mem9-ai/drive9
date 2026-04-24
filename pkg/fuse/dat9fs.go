@@ -1598,6 +1598,10 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	wb.touched = true
 	wb.sequential = true
 	wb.uploadedParts = make(map[int]bool)
+	needsCreateIfAbsent := created.Revision <= 0
+	if strings.EqualFold(created.Status, "CONFIRMED") {
+		needsCreateIfAbsent = false
+	}
 	fh := &FileHandle{
 		Ino:         ino,
 		Path:        childP,
@@ -1606,7 +1610,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		Dirty:       wb,
 		OrigSize:    created.Size,
 		BaseRev:     created.Revision,
-		IsNew:       true,
+		IsNew:       needsCreateIfAbsent,
 		ShadowReady: false,
 	}
 
