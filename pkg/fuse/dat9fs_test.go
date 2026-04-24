@@ -645,6 +645,64 @@ func TestGetAttrDirectoryDoesNotRequireRemoteStat(t *testing.T) {
 	}
 }
 
+func TestGetAttrRetriesTransientCanceledStat(t *testing.T) {
+	var headCalls atomic.Int32
+	firstHeadStarted := make(chan struct{}, 1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			if headCalls.Add(1) == 1 {
+				firstHeadStarted <- struct{}{}
+				<-r.Context().Done()
+				return
+			}
+			w.Header().Set("Content-Length", "99")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "3")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	ino := fs.inodes.Lookup("/retry-getattr.bin", false, 0, time.Now())
+
+	cancel := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	var out gofuse.AttrOut
+	go func() {
+		done <- fs.GetAttr(cancel, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out)
+	}()
+
+	select {
+	case <-firstHeadStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first HEAD request")
+	}
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("GetAttr status = %v, want OK", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetAttr timed out")
+	}
+
+	if got, want := out.Size, uint64(99); got != want {
+		t.Fatalf("GetAttr size = %d, want %d", got, want)
+	}
+	if headCalls.Load() < 2 {
+		t.Fatalf("HEAD calls = %d, want at least 2", headCalls.Load())
+	}
+}
+
 func TestLookupFallsBackToParentListWhenDirStatUnsupported(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -679,6 +737,202 @@ func TestLookupFallsBackToParentListWhenDirStatUnsupported(t *testing.T) {
 	}
 	if out.Mode&syscall.S_IFDIR == 0 {
 		t.Fatalf("Lookup mode = %o, want directory mode", out.Mode)
+	}
+}
+
+func TestLookupRetriesTransientCanceledStat(t *testing.T) {
+	var headCalls atomic.Int32
+	firstHeadStarted := make(chan struct{}, 1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			if headCalls.Add(1) == 1 {
+				firstHeadStarted <- struct{}{}
+				<-r.Context().Done()
+				return
+			}
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	cancel := make(chan struct{})
+	var out gofuse.EntryOut
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Lookup(cancel, &gofuse.InHeader{NodeId: 1}, "file.bin", &out)
+	}()
+
+	select {
+	case <-firstHeadStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first HEAD request")
+	}
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("Lookup status = %v, want OK", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Lookup timed out")
+	}
+
+	if out.NodeId == 0 {
+		t.Fatal("Lookup returned zero NodeId")
+	}
+	if headCalls.Load() < 2 {
+		t.Fatalf("HEAD calls = %d, want at least 2", headCalls.Load())
+	}
+	if total, success, exhausted := fs.lookupRetryStats(); total != 1 || success != 1 || exhausted != 0 {
+		t.Fatalf("lookup retry stats = (%d,%d,%d), want (1,1,0)", total, success, exhausted)
+	}
+}
+
+func TestLookupReturnsENOENTAfterTransientCanceledStat(t *testing.T) {
+	var headCalls atomic.Int32
+	firstHeadStarted := make(chan struct{}, 1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			if headCalls.Add(1) == 1 {
+				firstHeadStarted <- struct{}{}
+				<-r.Context().Done()
+				return
+			}
+			http.Error(w, "not found", http.StatusNotFound)
+		case http.MethodGet:
+			if r.URL.Path == "/v1/fs/" && r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			http.NotFound(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	cancel := make(chan struct{})
+	var out gofuse.EntryOut
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Lookup(cancel, &gofuse.InHeader{NodeId: 1}, "missing.bin", &out)
+	}()
+
+	select {
+	case <-firstHeadStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first HEAD request")
+	}
+
+	select {
+	case st := <-done:
+		if st != gofuse.ENOENT {
+			t.Fatalf("Lookup status = %v, want ENOENT", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Lookup timed out")
+	}
+
+	if headCalls.Load() < 2 {
+		t.Fatalf("HEAD calls = %d, want at least 2", headCalls.Load())
+	}
+	if total, success, exhausted := fs.lookupRetryStats(); total != 1 || success != 0 || exhausted != 0 {
+		t.Fatalf("lookup retry stats = (%d,%d,%d), want (1,0,0)", total, success, exhausted)
+	}
+}
+
+func TestLookupTransientRetryExhaustedReturnsEAGAIN(t *testing.T) {
+	var headCalls atomic.Int32
+	firstHeadStarted := make(chan struct{}, 1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			if headCalls.Add(1) == 1 {
+				firstHeadStarted <- struct{}{}
+				<-r.Context().Done()
+				return
+			}
+			http.Error(w, "temporary unavailable", http.StatusServiceUnavailable)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	cancel := make(chan struct{})
+	var out gofuse.EntryOut
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Lookup(cancel, &gofuse.InHeader{NodeId: 1}, "retry.bin", &out)
+	}()
+
+	select {
+	case <-firstHeadStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first HEAD request")
+	}
+
+	select {
+	case st := <-done:
+		want := gofuse.Status(syscall.EAGAIN)
+		if st != want {
+			t.Fatalf("Lookup status = %v, want %v", st, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Lookup timed out")
+	}
+
+	wantCalls := int32(1 + lookupTransientRetryCount)
+	if got := headCalls.Load(); got != wantCalls {
+		t.Fatalf("HEAD calls = %d, want %d", got, wantCalls)
+	}
+	if total, success, exhausted := fs.lookupRetryStats(); total != 1 || success != 0 || exhausted != 1 {
+		t.Fatalf("lookup retry stats = (%d,%d,%d), want (1,0,1)", total, success, exhausted)
+	}
+}
+
+func TestHTTPToFuseStatus_ContextErrorsMapToEAGAIN(t *testing.T) {
+	want := gofuse.Status(syscall.EAGAIN)
+	if got := httpToFuseStatus(context.Canceled); got != want {
+		t.Fatalf("context canceled status = %v, want %v", got, want)
+	}
+	if got := httpToFuseStatus(context.DeadlineExceeded); got != want {
+		t.Fatalf("context deadline status = %v, want %v", got, want)
+	}
+}
+
+func TestHTTPToFuseStatus_MapsGatewayTimeoutToEAGAIN(t *testing.T) {
+	want := gofuse.Status(syscall.EAGAIN)
+	if got := httpToFuseStatus(&client.StatusError{StatusCode: http.StatusGatewayTimeout, Message: "gateway timeout"}); got != want {
+		t.Fatalf("status error 504 = %v, want %v", got, want)
+	}
+	if got := httpToFuseStatus(fmt.Errorf("HTTP 504: upstream timeout")); got != want {
+		t.Fatalf("string error 504 = %v, want %v", got, want)
 	}
 }
 
@@ -759,6 +1013,26 @@ func TestDefaultTTLIs10Seconds(t *testing.T) {
 	}
 	if opts.NegativeEntryTTL != 10*time.Second {
 		t.Fatalf("default NegativeEntryTTL = %v, want 10s", opts.NegativeEntryTTL)
+	}
+}
+
+func TestMountOptionsLookupRetryDefaultsAndDisableSentinel(t *testing.T) {
+	defaults := &MountOptions{}
+	defaults.setDefaults()
+	if defaults.LookupRetryCount != lookupTransientRetryCount {
+		t.Fatalf("default LookupRetryCount = %d, want %d", defaults.LookupRetryCount, lookupTransientRetryCount)
+	}
+	if defaults.LookupRetryTimeout != lookupTransientRetryTimeout {
+		t.Fatalf("default LookupRetryTimeout = %v, want %v", defaults.LookupRetryTimeout, lookupTransientRetryTimeout)
+	}
+
+	disabled := &MountOptions{LookupRetryCount: -1, LookupRetryTimeout: 250 * time.Millisecond}
+	disabled.setDefaults()
+	if disabled.LookupRetryCount != 0 {
+		t.Fatalf("disabled LookupRetryCount = %d, want 0", disabled.LookupRetryCount)
+	}
+	if disabled.LookupRetryTimeout != 250*time.Millisecond {
+		t.Fatalf("disabled LookupRetryTimeout = %v, want 250ms", disabled.LookupRetryTimeout)
 	}
 }
 

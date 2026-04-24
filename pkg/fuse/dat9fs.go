@@ -6,11 +6,13 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -70,6 +72,14 @@ type Dat9FS struct {
 	// (EntryNotify, InodeNotify). FlushAll waits on this to ensure all
 	// notifications complete before shutdown.
 	notifyWg sync.WaitGroup
+
+	// lookupStatRetry* counters track only the Lookup->Stat retry path so
+	// operators can distinguish absorbed interrupt noise from exhausted retries
+	// on the primary probe route. GetAttr and list-fallback retries intentionally
+	// reuse the retry logic without contributing to these counters.
+	lookupStatRetryTotal     atomic.Uint64
+	lookupStatRetrySuccess   atomic.Uint64
+	lookupStatRetryExhausted atomic.Uint64
 }
 
 type dirtyInodeState struct {
@@ -115,6 +125,20 @@ func (fs *Dat9FS) flushPendingWriteBack(ctx context.Context, remotePath string) 
 // fuseTimeout is the default timeout for FUSE operations that make HTTP calls.
 // This prevents slow/dead servers from blocking the FUSE event loop forever.
 const fuseTimeout = 30 * time.Second
+
+const (
+	// lookupTransientRetryCount is the number of detached retries after the
+	// initial Lookup StatCtx attempt fails with a transient error.
+	lookupTransientRetryCount = 2
+
+	// lookupTransientRetryTimeout keeps each detached retry short so interrupted
+	// lookups do not block the caller for long.
+	lookupTransientRetryTimeout = 250 * time.Millisecond
+
+	// lookupRetrySuccessLogEvery controls how often successful retry recovery is
+	// logged, to avoid noisy logs on hot lookup paths.
+	lookupRetrySuccessLogEvery uint64 = 200
+)
 
 // fuseCtx converts a FUSE cancel channel into a context.Context with a timeout.
 // The context is cancelled when either the FUSE operation is interrupted or the
@@ -516,6 +540,13 @@ func httpToFuseStatus(err error) gofuse.Status {
 	if err == nil {
 		return gofuse.OK
 	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return gofuse.Status(syscall.EAGAIN)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return gofuse.Status(syscall.EAGAIN)
+	}
 
 	// Prefer typed StatusError so we map by status code even when the
 	// server returns a JSON error body that doesn't contain "HTTP NNN".
@@ -537,7 +568,9 @@ func httpToFuseStatus(err error) gofuse.Status {
 			return gofuse.Status(syscall.ESTALE)
 		case http.StatusBadRequest:
 			return gofuse.Status(syscall.EINVAL)
-		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable:
+		// Keep status mapping aligned with isTransientLookupErr so retry-exhausted
+		// timeout paths remain retryable to callers instead of regressing to EIO.
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 			return gofuse.Status(syscall.EAGAIN)
 		default:
 			return gofuse.EIO
@@ -562,7 +595,8 @@ func httpToFuseStatus(err error) gofuse.Status {
 		return gofuse.Status(syscall.EINVAL)
 	case strings.Contains(msg, "HTTP 500") ||
 		strings.Contains(msg, "HTTP 502") ||
-		strings.Contains(msg, "HTTP 503"):
+		strings.Contains(msg, "HTTP 503") ||
+		strings.Contains(msg, "HTTP 504"):
 		return gofuse.Status(syscall.EAGAIN)
 	default:
 		return gofuse.EIO
@@ -573,8 +607,152 @@ func isNotFoundErr(err error) bool {
 	if err == nil {
 		return false
 	}
+	var se *client.StatusError
+	if errors.As(err, &se) && se.StatusCode == http.StatusNotFound {
+		return true
+	}
 	msg := err.Error()
 	return strings.Contains(msg, "not found") || strings.Contains(msg, "HTTP 404")
+}
+
+func isTransientLookupErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var se *client.StatusError
+	if errors.As(err, &se) {
+		switch se.StatusCode {
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		}
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func (fs *Dat9FS) lookupStatRetryCount() int {
+	if fs != nil && fs.opts != nil {
+		if fs.opts.LookupRetryCount == 0 {
+			return 0
+		}
+		if fs.opts.LookupRetryCount > 0 {
+			return fs.opts.LookupRetryCount
+		}
+	}
+	return lookupTransientRetryCount
+}
+
+func (fs *Dat9FS) lookupStatRetryTimeout() time.Duration {
+	if fs != nil && fs.opts != nil {
+		if fs.opts.LookupRetryTimeout > 0 {
+			return fs.opts.LookupRetryTimeout
+		}
+	}
+	return lookupTransientRetryTimeout
+}
+
+func (fs *Dat9FS) lookupRetryStats() (total, success, exhausted uint64) {
+	if fs == nil {
+		return 0, 0, 0
+	}
+	return fs.lookupStatRetryTotal.Load(), fs.lookupStatRetrySuccess.Load(), fs.lookupStatRetryExhausted.Load()
+}
+
+func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, remotePath string, trackLookupMetrics bool) (*client.StatResult, error) {
+	ctx, cf := fuseCtx(cancel)
+	stat, err := fs.client.StatCtx(ctx, remotePath)
+	cf()
+	if err == nil || isNotFoundErr(err) || !isTransientLookupErr(err) {
+		return stat, err
+	}
+
+	// Mapping interruption to a retryable errno alone is insufficient for callers
+	// that treat open/stat failures as terminal and never retry in user space.
+	// Absorb short-lived metadata probe interruptions here before returning to
+	// the kernel-facing path.
+	retryCount := fs.lookupStatRetryCount()
+	if retryCount <= 0 {
+		return nil, err
+	}
+	if trackLookupMetrics {
+		fs.lookupStatRetryTotal.Add(1)
+	}
+
+	lastErr := err
+	for range retryCount {
+		// Retry attempts intentionally use a detached context instead of
+		// fuseCtx(cancel): the initial probe already honored FUSE interrupt, and
+		// these retries exist to absorb interrupt races plus short backend jitter.
+		// Rebinding cancel here would cancel retries immediately and re-expose
+		// transient failures. Keep this detached+bounded behavior unless retry
+		// semantics are redesigned.
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
+		stat, err = fs.client.StatCtx(retryCtx, remotePath)
+		retryCancel()
+		if err == nil {
+			if trackLookupMetrics {
+				successCount := fs.lookupStatRetrySuccess.Add(1)
+				if successCount <= 3 || successCount%lookupRetrySuccessLogEvery == 0 {
+					log.Printf("lookup stat retry recovered for %s (success_count=%d)", remotePath, successCount)
+				}
+			}
+			return stat, nil
+		}
+		if isNotFoundErr(err) || !isTransientLookupErr(err) {
+			return nil, err
+		}
+		lastErr = err
+	}
+
+	if trackLookupMetrics {
+		fs.lookupStatRetryExhausted.Add(1)
+		log.Printf("lookup stat retries exhausted for %s: %v", remotePath, lastErr)
+	}
+	return nil, lastErr
+}
+
+func (fs *Dat9FS) lookupStatWithRetry(cancel <-chan struct{}, childP string) (*client.StatResult, error) {
+	return fs.statWithTransientRetry(cancel, childP, true)
+}
+
+func (fs *Dat9FS) getAttrStatWithRetry(cancel <-chan struct{}, remotePath string) (*client.StatResult, error) {
+	// Keep GetAttr retries out of lookupStatRetry* so that those counters retain
+	// a single meaning: Lookup path retry behavior.
+	return fs.statWithTransientRetry(cancel, remotePath, false)
+}
+
+func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string) ([]client.FileInfo, error) {
+	// list-fallback retries are intentionally not counted in lookupStatRetry*;
+	// those counters remain scoped to the primary Lookup->Stat path.
+	ctx, cf := fuseCtx(cancel)
+	items, err := fs.client.ListCtx(ctx, parentPath)
+	cf()
+	if err == nil || !isTransientLookupErr(err) {
+		return items, err
+	}
+	retryCount := fs.lookupStatRetryCount()
+	if retryCount <= 0 {
+		return nil, err
+	}
+
+	lastErr := err
+	for range retryCount {
+		// Keep list fallback retries detached from FUSE cancel for the same reason
+		// as stat retries above: this path is a compatibility probe after HEAD
+		// said "not found", and cancel-coupled retries would collapse to the
+		// original transient failure immediately.
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
+		items, err = fs.client.ListCtx(retryCtx, parentPath)
+		retryCancel()
+		if err == nil || !isTransientLookupErr(err) {
+			return items, err
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 // --- RawFileSystem methods ---------------------------------------------------
@@ -651,10 +829,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		}
 	}
 
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
-
-	stat, err := fs.client.StatCtx(ctx, childP)
+	stat, err := fs.lookupStatWithRetry(cancel, childP)
 	if err != nil {
 		if !isNotFoundErr(err) {
 			return httpToFuseStatus(err)
@@ -666,7 +841,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		if !ok {
 			return gofuse.ENOENT
 		}
-		items, listErr := fs.client.ListCtx(ctx, parentPath)
+		items, listErr := fs.lookupListWithRetry(cancel, parentPath)
 		if listErr != nil {
 			return httpToFuseStatus(listErr)
 		}
@@ -746,9 +921,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 			}
 		}
 		if !pendingFound && input.NodeId != 1 {
-			ctx, cf := fuseCtx(cancel)
-			defer cf()
-			stat, err := fs.client.StatCtx(ctx, entry.Path)
+			stat, err := fs.getAttrStatWithRetry(cancel, entry.Path)
 			if err != nil {
 				return httpToFuseStatus(err)
 			}
@@ -767,9 +940,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		// Some deployments do not support HEAD/stat on directories.
 		// Keep directory attrs from inode map and only refresh regular files.
 		if !entry.IsDir {
-			ctx, cf := fuseCtx(cancel)
-			defer cf()
-			stat, err := fs.client.StatCtx(ctx, entry.Path)
+			stat, err := fs.getAttrStatWithRetry(cancel, entry.Path)
 			if err != nil {
 				return httpToFuseStatus(err)
 			}
