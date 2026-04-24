@@ -30,7 +30,9 @@ func TestAppendStreamCreatesMissingFile(t *testing.T) {
 				return
 			}
 			putBody = append([]byte(nil), body...)
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 1})
 		default:
 			http.NotFound(w, r)
 		}
@@ -67,7 +69,9 @@ func TestAppendStreamZeroSizeCreatesMissingFile(t *testing.T) {
 				return
 			}
 			putBody = append([]byte(nil), body...)
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 1})
 		default:
 			http.NotFound(w, r)
 		}
@@ -115,7 +119,9 @@ func TestAppendStreamFallsBackToRewriteForSmallExistingFile(t *testing.T) {
 				return
 			}
 			putBody = append([]byte(nil), body...)
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 8})
 		default:
 			http.NotFound(w, r)
 		}
@@ -270,7 +276,9 @@ func TestAppendStreamFallsBackToRewriteWhenAppendActionUnsupported(t *testing.T)
 				return
 			}
 			putBody = append([]byte(nil), body...)
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 8})
 		default:
 			http.NotFound(w, r)
 		}
@@ -318,7 +326,9 @@ func TestAppendStreamFallsBackToRewriteWhenS3NotConfigured(t *testing.T) {
 				return
 			}
 			putBody = append([]byte(nil), body...)
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 12})
 		default:
 			http.NotFound(w, r)
 		}

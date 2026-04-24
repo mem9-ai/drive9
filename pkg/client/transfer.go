@@ -297,7 +297,7 @@ func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path str
 		if err != nil {
 			return nil, fmt.Errorf("read data: %w", err)
 		}
-		if err := c.WriteCtxConditionalWithTags(ctx, path, data, expectedRevision, tags); err != nil {
+		if _, err := c.WriteCtxConditionalWithTags(ctx, path, data, expectedRevision, tags); err != nil {
 			return nil, err
 		}
 		summary.DirectWriteSeconds = time.Since(directWriteStart).Seconds()

@@ -825,24 +825,29 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			if newSize == 0 {
 				ctx, cf := fuseCtx(cancel)
 				defer cf()
-				if err := fs.client.WriteCtx(ctx, entry.Path, nil); err != nil {
+				newRev, err := fs.client.WriteCtx(ctx, entry.Path, nil)
+				if err != nil {
 					return httpToFuseStatus(err)
 				}
 				// Refresh the inode revision after the server-side truncate so a
 				// subsequent writable open does not reuse the stale pre-truncate
 				// base revision and conflict with its own zero-byte write.
-				stat, statErr := fs.client.StatCtx(ctx, entry.Path)
-				if statErr != nil {
-					log.Printf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, input.NodeId, statErr)
-				} else if stat != nil {
-					if stat.Revision > 0 {
-						entry.Revision = stat.Revision
-						fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
-						fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, input.Pid)
-					}
-					if !stat.Mtime.IsZero() {
-						entry.Mtime = stat.Mtime
-						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+				if newRev > 0 {
+					fs.inodes.UpdateRevision(input.NodeId, newRev)
+				} else {
+					stat, statErr := fs.client.StatCtx(ctx, entry.Path)
+					if statErr != nil {
+						log.Printf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, input.NodeId, statErr)
+					} else if stat != nil {
+						if stat.Revision > 0 {
+							entry.Revision = stat.Revision
+							fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
+							fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, input.Pid)
+						}
+						if !stat.Mtime.IsZero() {
+							entry.Mtime = stat.Mtime
+							fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+						}
 					}
 				}
 				fs.readCache.Invalidate(entry.Path)
@@ -2082,7 +2087,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		}
 
 		dCtx, dCf := context.WithTimeout(context.Background(), fuseTimeout)
-		err := fs.client.WriteCtxConditional(dCtx, filePath, data, expectedRevision)
+		_, err := fs.client.WriteCtxConditional(dCtx, filePath, data, expectedRevision)
 		dCf()
 		if err != nil {
 			handle.Unlock()
@@ -2228,7 +2233,12 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 
 	if size < smallFileThreshold {
 		// Small file: direct PUT.
-		err = fs.client.WriteCtxConditional(ctx, fh.Path, data, expectedRevision)
+		var newRev int64
+		newRev, err = fs.client.WriteCtxConditional(ctx, fh.Path, data, expectedRevision)
+		if err == nil && newRev > 0 {
+			fh.BaseRev = newRev
+			fh.IsNew = false
+		}
 	} else if fh.OrigSize >= smallFileThreshold {
 		dirtyParts := fh.Dirty.DirtyPartNumbers()
 		if len(dirtyParts) > 0 {

@@ -67,7 +67,7 @@ func TestWriteAndRead(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()
 
-	if err := c.Write("/hello.txt", []byte("hello world")); err != nil {
+	if _, err := c.Write("/hello.txt", []byte("hello world")); err != nil {
 		t.Fatal(err)
 	}
 	data, err := c.Read("/hello.txt")
@@ -83,10 +83,10 @@ func TestListDir(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()
 
-	if err := c.Write("/data/a.txt", []byte("a")); err != nil {
+	if _, err := c.Write("/data/a.txt", []byte("a")); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Write("/data/b.txt", []byte("bb")); err != nil {
+	if _, err := c.Write("/data/b.txt", []byte("bb")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -103,7 +103,7 @@ func TestStat(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()
 
-	if err := c.Write("/test.txt", []byte("data")); err != nil {
+	if _, err := c.Write("/test.txt", []byte("data")); err != nil {
 		t.Fatal(err)
 	}
 	info, err := c.Stat("/test.txt")
@@ -119,7 +119,7 @@ func TestStatMetadataIncludesTagsAndSupportsTagReplace(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()
 
-	err := c.WriteCtxConditionalWithTags(context.Background(), "/meta.txt", []byte("hello"), -1, map[string]string{
+	_, err := c.WriteCtxConditionalWithTags(context.Background(), "/meta.txt", []byte("hello"), -1, map[string]string{
 		"owner": "alice",
 		"topic": "note",
 	})
@@ -147,7 +147,7 @@ func TestStatMetadataIncludesTagsAndSupportsTagReplace(t *testing.T) {
 		t.Fatalf("tags = %+v, want owner/topic", meta.Tags)
 	}
 
-	err = c.WriteCtxConditionalWithTags(context.Background(), "/meta.txt", []byte("hello v2"), -1, map[string]string{
+	_, err = c.WriteCtxConditionalWithTags(context.Background(), "/meta.txt", []byte("hello v2"), -1, map[string]string{
 		"owner": "bob",
 	})
 	if err != nil {
@@ -459,7 +459,7 @@ func TestWriteCtxConditionalWithTagsRejectsInvalidHeaderTags(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			requests = 0
 			c := New(ts.URL, "")
-			err := c.WriteCtxConditionalWithTags(context.Background(), "/bad-tags.txt", []byte("x"), -1, tc.tags)
+			_, err := c.WriteCtxConditionalWithTags(context.Background(), "/bad-tags.txt", []byte("x"), -1, tc.tags)
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("error = %v, want containing %q", err, tc.wantErr)
 			}
@@ -474,7 +474,7 @@ func TestDelete(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()
 
-	if err := c.Write("/del.txt", []byte("x")); err != nil {
+	if _, err := c.Write("/del.txt", []byte("x")); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Delete("/del.txt"); err != nil {
@@ -493,13 +493,13 @@ func TestRemoveAll(t *testing.T) {
 	if err := c.Mkdir("/data"); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Write("/data/a.txt", []byte("a")); err != nil {
+	if _, err := c.Write("/data/a.txt", []byte("a")); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Mkdir("/data/nested"); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Write("/data/nested/b.txt", []byte("b")); err != nil {
+	if _, err := c.Write("/data/nested/b.txt", []byte("b")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -530,7 +530,7 @@ func TestCopy(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()
 
-	if err := c.Write("/src.txt", []byte("shared")); err != nil {
+	if _, err := c.Write("/src.txt", []byte("shared")); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Copy("/src.txt", "/dst.txt"); err != nil {
@@ -546,7 +546,7 @@ func TestRename(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()
 
-	if err := c.Write("/old.txt", []byte("data")); err != nil {
+	if _, err := c.Write("/old.txt", []byte("data")); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Rename("/old.txt", "/new.txt"); err != nil {

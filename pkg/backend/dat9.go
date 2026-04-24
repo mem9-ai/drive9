@@ -332,6 +332,21 @@ func (b *Dat9Backend) WriteCtxIfRevision(ctx context.Context, path string, data 
 // - zero: path must not already exist
 // - positive: file must exist at exactly that revision
 func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string) (n int64, err error) {
+	n, _, err = b.writeCtxIfRevisionWithTagsRev(ctx, path, data, offset, flags, expectedRevision, tags)
+	return n, err
+}
+
+// WriteCtxIfRevisionWithTagsReturningRevision is like WriteCtxIfRevisionWithTags
+// but also returns the new file revision. It is used by the HTTP server to
+// avoid an extra Stat round-trip.
+func (b *Dat9Backend) WriteCtxIfRevisionWithTagsReturningRevision(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string) (n int64, newRev int64, err error) {
+	return b.writeCtxIfRevisionWithTagsRev(ctx, path, data, offset, flags, expectedRevision, tags)
+}
+
+// writeCtxIfRevisionWithTagsRev is the internal implementation that also
+// returns the new file revision. It is used by the HTTP server to avoid an
+// extra Stat round-trip.
+func (b *Dat9Backend) writeCtxIfRevisionWithTagsRev(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string) (n int64, newRev int64, err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, "write", err, start) }()
 
@@ -339,40 +354,40 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path strin
 
 	path, err = pathutil.Canonicalize(path)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	existing, err := b.store.Stat(ctx, path)
 	if err == datastore.ErrNotFound {
 		if expectedRevision > 0 {
-			return 0, datastore.ErrRevisionConflict
+			return 0, 0, datastore.ErrRevisionConflict
 		}
 		if flags&filesystem.WriteFlagCreate == 0 {
 			if expectedRevision == 0 {
-				return 0, datastore.ErrRevisionConflict
+				return 0, 0, datastore.ErrRevisionConflict
 			}
-			return 0, datastore.ErrNotFound
+			return 0, 0, datastore.ErrNotFound
 		}
-		n, err := b.createAndWriteCtx(ctx, path, data, tags)
+		n, newRev, err := b.createAndWriteCtx(ctx, path, data, tags)
 		if expectedRevision == 0 && errors.Is(err, datastore.ErrPathConflict) {
-			return 0, datastore.ErrRevisionConflict
+			return 0, 0, datastore.ErrRevisionConflict
 		}
-		return n, err
+		return n, newRev, err
 	}
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if expectedRevision == 0 {
-		return 0, datastore.ErrRevisionConflict
+		return 0, 0, datastore.ErrRevisionConflict
 	}
 	if existing.Node.IsDirectory {
-		return 0, fmt.Errorf("is a directory: %s", path)
+		return 0, 0, fmt.Errorf("is a directory: %s", path)
 	}
 	if flags&filesystem.WriteFlagExclusive != 0 {
-		return 0, fmt.Errorf("file already exists: %s", path)
+		return 0, 0, fmt.Errorf("file already exists: %s", path)
 	}
 	if expectedRevision > 0 && (existing.File == nil || existing.File.Revision != expectedRevision) {
-		return 0, datastore.ErrRevisionConflict
+		return 0, 0, datastore.ErrRevisionConflict
 	}
 	return b.overwriteFileCtx(ctx, existing, data, offset, flags, expectedRevision, tags)
 }
@@ -388,9 +403,9 @@ func cloneFileTags(tags map[string]string) map[string]string {
 	return out
 }
 
-func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte, tags map[string]string) (int64, error) {
+func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte, tags map[string]string) (int64, int64, error) {
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	fileID := b.genID()
 	now := time.Now()
@@ -406,13 +421,13 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		contentBlob = append([]byte(nil), data...)
 	} else {
 		if b.s3 == nil {
-			return 0, fmt.Errorf("s3 client not configured")
+			return 0, 0, fmt.Errorf("s3 client not configured")
 		}
 		storageType = datastore.StorageS3
 		storageRef = "blobs/" + fileID
 		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(data), int64(len(data))); err != nil {
 			logger.Error(ctx, "backend_create_and_write_put_object_failed", zap.String("path", path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(data)), zap.Error(err))
-			return 0, fmt.Errorf("put object: %w", err)
+			return 0, 0, fmt.Errorf("put object: %w", err)
 		}
 	}
 
@@ -454,30 +469,30 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		if storageType == datastore.StorageS3 {
 			b.deleteBlobCtx(ctx, storageRef)
 		}
-		return 0, err
+		return 0, 0, err
 	}
 	// Temporary compatibility: app embedding still relies on the legacy
 	// backend-owned image queue until its image task flow also moves to
 	// semantic_tasks.
 	if b.UsesDatabaseAutoEmbedding() {
 		b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
-		return int64(len(data)), nil
+		return int64(len(data)), 1, nil
 	}
 	b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
 	b.enqueueImageExtract(fileID, path, contentType, 1)
-	return int64(len(data)), nil
+	return int64(len(data)), 1, nil
 }
 
-func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string) (int64, error) {
+func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string) (int64, int64, error) {
 	if nf.File == nil {
-		return 0, fmt.Errorf("no file entity")
+		return 0, 0, fmt.Errorf("no file entity")
 	}
 
 	var finalData []byte
 	if flags&filesystem.WriteFlagAppend != 0 {
 		existing, err := b.readFileDataCtx(ctx, nf.File)
 		if err != nil {
-			return 0, fmt.Errorf("read existing data for append: %w", err)
+			return 0, 0, fmt.Errorf("read existing data for append: %w", err)
 		}
 		finalData = append(existing, data...)
 	} else if flags&filesystem.WriteFlagTruncate != 0 || offset <= 0 {
@@ -485,7 +500,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 	} else {
 		existing, err := b.readFileDataCtx(ctx, nf.File)
 		if err != nil {
-			return 0, fmt.Errorf("read existing data for offset write: %w", err)
+			return 0, 0, fmt.Errorf("read existing data for offset write: %w", err)
 		}
 		if offset > int64(len(existing)) {
 			existing = append(existing, make([]byte, offset-int64(len(existing)))...)
@@ -498,7 +513,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 	}
 
 	if err := b.ensureUploadSizeAllowed(int64(len(finalData))); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	contentType := detectContentType(nf.Node.Path, finalData)
 	checksum := sha256sum(finalData)
@@ -510,13 +525,13 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		contentBlob = append([]byte(nil), finalData...)
 	} else {
 		if b.s3 == nil {
-			return 0, fmt.Errorf("s3 client not configured")
+			return 0, 0, fmt.Errorf("s3 client not configured")
 		}
 		storageType = datastore.StorageS3
 		storageRef = "blobs/" + b.genID()
 		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(finalData), int64(len(finalData))); err != nil {
 			logger.Error(ctx, "backend_overwrite_put_object_failed", zap.String("path", nf.Node.Path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(finalData)), zap.Error(err))
-			return 0, fmt.Errorf("put object: %w", err)
+			return 0, 0, fmt.Errorf("put object: %w", err)
 		}
 	}
 
@@ -571,7 +586,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		if storageType == datastore.StorageS3 {
 			b.deleteBlobCtx(ctx, storageRef)
 		}
-		return 0, err
+		return 0, 0, err
 	}
 	b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
 	b.deleteBlobIfS3Ctx(ctx, nf.File.StorageType, nf.File.StorageRef, storageRef)
@@ -579,10 +594,10 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 	// backend-owned image queue until its image task flow also moves to
 	// semantic_tasks.
 	if b.UsesDatabaseAutoEmbedding() {
-		return int64(len(data)), nil
+		return int64(len(data)), newRev, nil
 	}
 	b.enqueueImageExtract(nf.File.FileID, nf.Node.Path, contentType, newRev)
-	return int64(len(data)), nil
+	return int64(len(data)), newRev, nil
 }
 
 func (b *Dat9Backend) ReadDir(path string) ([]filesystem.FileInfo, error) {

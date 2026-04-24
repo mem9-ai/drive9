@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 
 const (
 	sseHeartbeatInterval = 30 * time.Second
+	sseFlushBatchSize    = 10
+	sseFlushMaxDelay     = 5 * time.Millisecond
 )
 
 // eventBuses manages per-tenant EventBus instances. For single-tenant mode
@@ -99,6 +102,17 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// Wrap the response writer with a buffered writer to reduce syscalls
+	// when sending many small SSE events in rapid succession.
+	bw := newSSEBufferedWriter(w)
+
+	// flush sends any buffered data to the client. It flushes the bufio
+	// buffer first, then the HTTP flusher.
+	flush := func() {
+		_ = bw.Flush()
+		flusher.Flush()
+	}
+
 	// Phase 1: Replay or Reset.
 	// EventsSince returns headSeq from the same lock acquisition as the
 	// ring scan, so reset cursor and ring state are a consistent snapshot.
@@ -112,42 +126,71 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				reason = "server_restart"
 			}
 		}
-		sendSSEReset(w, headSeq, reason)
+		sendSSEReset(bw, headSeq, reason)
 		lastSeen = headSeq
 	} else {
 		for _, ev := range events {
-			sendSSEEvent(w, ev)
+			sendSSEEvent(bw, ev)
 			lastSeen = ev.Seq
 		}
 	}
-	flusher.Flush()
+	flush()
 
-	// Phase 2: Live stream.
+	// Phase 2: Live stream with micro-batching.
+	// Instead of flushing after every single notify, we accumulate events
+	// and flush at heartbeat boundaries or when the batch size is reached.
 	heartbeat := time.NewTicker(sseHeartbeatInterval)
 	defer heartbeat.Stop()
+
+	pending := 0
+	flushTimer := time.NewTimer(0)
+	flushTimer.Stop()
+	defer flushTimer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-heartbeat.C:
-			sendSSEHeartbeat(w, lastSeen)
-			flusher.Flush()
+			sendSSEHeartbeat(bw, lastSeen)
+			flush()
+			pending = 0
+		case <-flushTimer.C:
+			if pending > 0 {
+				flush()
+				pending = 0
+			}
 		case _, open := <-notify:
 			if !open {
 				return
 			}
 			liveEvents, liveHead, liveOK := bus.EventsSince(lastSeen)
 			if !liveOK {
-				sendSSEReset(w, liveHead, "seq_too_old")
+				sendSSEReset(bw, liveHead, "seq_too_old")
 				lastSeen = liveHead
 			} else {
 				for _, ev := range liveEvents {
-					sendSSEEvent(w, ev)
+					sendSSEEvent(bw, ev)
 					lastSeen = ev.Seq
+					pending++
 				}
 			}
-			flusher.Flush()
+			// Batch flush: either when we have enough events or after a
+			// short delay to allow more events to arrive.
+			if pending >= sseFlushBatchSize {
+				flush()
+				pending = 0
+				flushTimer.Stop()
+			} else {
+				// Restart the micro-delay timer.
+				if !flushTimer.Stop() {
+					select {
+					case <-flushTimer.C:
+					default:
+					}
+				}
+				flushTimer.Reset(sseFlushMaxDelay)
+			}
 		}
 	}
 }
@@ -191,4 +234,26 @@ func sendSSEHeartbeat(w http.ResponseWriter, seq uint64) {
 		"seq": seq,
 	})
 	_, _ = fmt.Fprintf(w, "event: heartbeat\ndata: %s\n\n", data)
+}
+
+// sseBufferedWriter wraps http.ResponseWriter with a bufio.Writer to reduce
+// syscalls when sending many small SSE events in rapid succession.
+type sseBufferedWriter struct {
+	http.ResponseWriter
+	buf *bufio.Writer
+}
+
+func newSSEBufferedWriter(w http.ResponseWriter) *sseBufferedWriter {
+	return &sseBufferedWriter{
+		ResponseWriter: w,
+		buf:            bufio.NewWriterSize(w, 4096),
+	}
+}
+
+func (bw *sseBufferedWriter) Write(p []byte) (int, error) {
+	return bw.buf.Write(p)
+}
+
+func (bw *sseBufferedWriter) Flush() error {
+	return bw.buf.Flush()
 }

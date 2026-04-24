@@ -141,7 +141,9 @@ func TestWriteStreamSmallFile(t *testing.T) {
 		if r.Method == http.MethodPut && r.URL.Path == "/v1/fs/small.txt" {
 			requestCount++
 			writtenData, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 1})
 		}
 	}))
 	defer srv.Close()
@@ -163,7 +165,9 @@ func TestWriteStreamSmallFile(t *testing.T) {
 func TestWriteStreamWithSummarySmallFile(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut && r.URL.Path == "/v1/fs/small-summary.txt" {
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 1})
 			return
 		}
 		http.NotFound(w, r)
@@ -212,7 +216,9 @@ func TestWriteStreamWithSummaryAndTagsSmallFileSetsTagHeaders(t *testing.T) {
 			return
 		}
 		gotBody = append([]byte(nil), body...)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 1})
 	}))
 	defer srv.Close()
 

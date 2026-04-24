@@ -223,28 +223,31 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 	return c.httpClient.Do(req)
 }
 
-// Write uploads data to a remote path.
-func (c *Client) Write(path string, data []byte) error {
+// Write uploads data to a remote path and returns the new file revision.
+func (c *Client) Write(path string, data []byte) (int64, error) {
 	return c.WriteCtx(context.Background(), path, data)
 }
 
-// WriteCtx uploads data to a remote path with context support.
-func (c *Client) WriteCtx(ctx context.Context, path string, data []byte) error {
+// WriteCtx uploads data to a remote path with context support and returns
+// the new file revision.
+func (c *Client) WriteCtx(ctx context.Context, path string, data []byte) (int64, error) {
 	return c.WriteCtxConditional(ctx, path, data, -1)
 }
 
 // WriteCtxConditional uploads data to a remote path and applies the write only
 // when expectedRevision matches the current server revision.
+// Returns the new file revision.
 // expectedRevision semantics:
 // - negative: unconditional write
 // - zero: path must not already exist
 // - positive: file must exist at exactly that revision
-func (c *Client) WriteCtxConditional(ctx context.Context, path string, data []byte, expectedRevision int64) error {
+func (c *Client) WriteCtxConditional(ctx context.Context, path string, data []byte, expectedRevision int64) (int64, error) {
 	return c.WriteCtxConditionalWithTags(ctx, path, data, expectedRevision, nil)
 }
 
 // WriteCtxConditionalWithTags uploads data to a remote path with optional
 // compare-and-set semantics and optional file tags.
+// Returns the new file revision.
 // This method issues a single PUT request and is therefore intended for direct
 // write paths. When tags are provided for a large file, the server rejects the
 // request because large-file uploads must send tags in the multipart complete
@@ -256,27 +259,37 @@ func (c *Client) WriteCtxConditional(ctx context.Context, path string, data []by
 // - negative: unconditional write
 // - zero: path must not already exist
 // - positive: file must exist at exactly that revision
-func (c *Client) WriteCtxConditionalWithTags(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string) error {
+func (c *Client) WriteCtxConditionalWithTags(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	if expectedRevision >= 0 {
 		req.Header.Set("X-Dat9-Expected-Revision", strconv.FormatInt(expectedRevision, 10))
 	}
 	if err := setTagHeaders(req, tags); err != nil {
-		return err
+		return 0, err
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
-		return readError(resp)
+		return 0, readError(resp)
 	}
-	return nil
+	var result struct {
+		Status   string `json:"status"`
+		Revision int64  `json:"revision"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		if err == io.EOF {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return result.Revision, nil
 }
 
 // Read downloads a file's content.
