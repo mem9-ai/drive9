@@ -134,7 +134,9 @@ func TestStoreSecretCRUD(t *testing.T) {
 		t.Fatalf("updated password mismatch: %q", pw2)
 	}
 
-	// Delete (soft)
+	// Delete (hard) — clears the row + its fields. Audit history survives in
+	// vault_audit_log (separate table), so the audit trail is preserved even
+	// though the secret row itself is gone.
 	if err := s.DeleteSecret(ctx, tenantID, "db-prod"); err != nil {
 		t.Fatalf("DeleteSecret: %v", err)
 	}
@@ -148,6 +150,14 @@ func TestStoreSecretCRUD(t *testing.T) {
 	// Delete non-existent should fail
 	if err := s.DeleteSecret(ctx, tenantID, "db-prod"); err != ErrNotFound {
 		t.Fatalf("expected ErrNotFound for double delete, got: %v", err)
+	}
+
+	// Regression guard: the unique slot (tenant_id, name) must be free after
+	// delete. Previously DeleteSecret only set deleted_at, leaving the row in
+	// place and blocking any subsequent CreateSecret with the same name.
+	if _, err := s.CreateSecret(ctx, tenantID, "db-prod", "agent-2", SecretTypeGeneric,
+		map[string][]byte{"host": []byte("db2.example.com")}); err != nil {
+		t.Fatalf("CreateSecret after delete should succeed, got: %v", err)
 	}
 }
 
