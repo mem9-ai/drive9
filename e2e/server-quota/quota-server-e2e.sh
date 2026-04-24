@@ -145,6 +145,13 @@ get_pending_mutations() {
     "SELECT COUNT(*) FROM quota_mutation_log WHERE tenant_id='local-tenant' AND status='pending';" 2>/dev/null
 }
 
+# Query central monthly LLM cost counter
+get_monthly_llm_cost() {
+  local month_start="$1"
+  mysql -h127.0.0.1 -P13306 -uroot -proot drive9_meta -N -s -e \
+    "SELECT COALESCE(total_mc, 0) FROM tenant_monthly_llm_cost WHERE tenant_id='local-tenant' AND month_start='${month_start}';" 2>/dev/null
+}
+
 # Wait until all mutations for local-tenant are applied (or timeout)
 wait_mutations_applied() {
   local timeout_sec="${1:-10}"
@@ -415,6 +422,37 @@ STORAGE_BYTES=$(echo "$QUOTA" | awk '{print $1}')
 MEDIA_COUNT=$(echo "$QUOTA" | awk '{print $3}')
 check_eq "backfilled storage_bytes matches tenant DB" "${STORAGE_BYTES:-0}" "${BACKFILL_STORAGE:-0}"
 check_eq "backfilled media_file_count matches tenant DB" "${MEDIA_COUNT:-0}" "${BACKFILL_MEDIA:-0}"
+
+# --- Test 11: monthly LLM cost quota (data-layer validation) ---------------
+step "Test 11: monthly LLM cost quota config and counter"
+MONTH_START=$(date -u +%Y-%m-01)
+
+# Set a low monthly cost limit in central config
+info "Setting max_monthly_cost_mc = 100 ..."
+mysql -h127.0.0.1 -P13306 -uroot -proot drive9_meta -e \
+  "UPDATE tenant_quota_config SET max_monthly_cost_mc = 100 WHERE tenant_id='local-tenant';" 2>/dev/null || true
+
+# Insert simulated LLM cost for the current month (simulates usage accumulation)
+info "Injecting simulated LLM cost of 150 millicents ..."
+mysql -h127.0.0.1 -P13306 -uroot -proot drive9_meta -e \
+  "INSERT INTO tenant_monthly_llm_cost (tenant_id, month_start, total_mc) VALUES ('local-tenant', '${MONTH_START}', 150) ON DUPLICATE KEY UPDATE total_mc = total_mc + 150;" 2>/dev/null || true
+
+# Verify config reads correctly
+CONFIG_MC=$(mysql -h127.0.0.1 -P13306 -uroot -proot drive9_meta -N -s -e \
+  "SELECT max_monthly_cost_mc FROM tenant_quota_config WHERE tenant_id='local-tenant';" 2>/dev/null)
+check_eq "max_monthly_cost_mc config should be 100" "${CONFIG_MC:-0}" "100"
+
+# Verify central counter reads correctly
+COST_MC=$(get_monthly_llm_cost "$MONTH_START")
+info "monthly LLM cost counter: ${COST_MC:-0} millicents"
+TOTAL=$((TOTAL+1))
+if [ "${COST_MC:-0}" -ge 150 ]; then
+  ok "monthly LLM cost counter >= 150 (got=${COST_MC})"
+  PASS=$((PASS+1))
+else
+  fail "monthly LLM cost counter should be >= 150 (got=${COST_MC:-0})"
+  FAIL=$((FAIL+1))
+fi
 
 # ---------------------------------------------------------------------------
 # Summary
