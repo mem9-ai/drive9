@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"strings"
+	"unicode/utf8"
 
+	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/tagutil"
@@ -29,6 +31,7 @@ func Cp(c *client.Client, args []string) error {
 	resume := false
 	appendMode := false
 	var tags map[string]string
+	var description string
 	filtered := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -53,14 +56,24 @@ func Cp(c *client.Client, args []string) error {
 			if err != nil {
 				return err
 			}
+		case a == "--description":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--description requires argument")
+			}
+			i++
+			description = args[i]
 		default:
-			filtered = append(filtered, a)
+			filtered = append(filtered, args[i])
 		}
 	}
 	args = filtered
 
+	if utf8.RuneCountInString(description) > backend.MaxDescriptionLen {
+		return fmt.Errorf("description exceeds %d characters", backend.MaxDescriptionLen)
+	}
+
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs cp [--resume] [--append] [--tag key=value]... <src> <dst>")
+		return fmt.Errorf("usage: drive9 fs cp [--resume] [--append] [--tag key=value]... [--description <text>] <src> <dst>")
 	}
 	if resume && appendMode {
 		return fmt.Errorf("--resume and --append cannot be used together")
@@ -68,10 +81,22 @@ func Cp(c *client.Client, args []string) error {
 	if appendMode && len(tags) > 0 {
 		return fmt.Errorf("--append and --tag cannot be used together")
 	}
+	if appendMode && description != "" {
+		return fmt.Errorf("--append and --description cannot be used together")
+	}
+	if resume && description != "" {
+		return fmt.Errorf("--resume and --description cannot be used together")
+	}
 	src, dst := args[0], args[1]
 
 	srcRP, srcIsRemote := ParseRemote(src)
 	dstRP, dstIsRemote := ParseRemote(dst)
+	if description != "" {
+		descriptionSupported := dstIsRemote && !appendMode && !resume && (src == "-" || !srcIsRemote)
+		if !descriptionSupported {
+			return fmt.Errorf("--description is only supported for local/stdin uploads to a remote path")
+		}
+	}
 	if appendMode && src == "-" {
 		return fmt.Errorf("--append does not support stdin source; use a local file")
 	}
@@ -95,7 +120,14 @@ func Cp(c *client.Client, args []string) error {
 		if appendMode {
 			return c.AppendStream(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress)
 		}
-		summary, err := c.WriteStreamWithSummaryAndTags(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress, tags)
+		var opts []client.WriteOption
+		if tags != nil {
+			opts = append(opts, client.WithTags(tags))
+		}
+		if description != "" {
+			opts = append(opts, client.WithDescription(description))
+		}
+		summary, err := c.WriteStreamWithSummary(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress, opts...)
 		if err != nil {
 			return err
 		}
@@ -112,7 +144,7 @@ func Cp(c *client.Client, args []string) error {
 		if resume {
 			return resumeUploadWithTags(ctx, c, src, dstRP.Path, tags)
 		}
-		return uploadFileWithTags(ctx, c, src, dstRP.Path, tags)
+		return uploadFileWithTagsAndDescription(ctx, c, src, dstRP.Path, tags, description)
 
 	case srcIsRemote && !dstIsRemote:
 		return downloadFile(ctx, c, srcRP.Path, dst)
@@ -123,6 +155,10 @@ func Cp(c *client.Client, args []string) error {
 	default:
 		return fmt.Errorf("at least one path must be remote (e.g. :/path or mydb:/path)")
 	}
+}
+
+func uploadFile(ctx context.Context, c *client.Client, localPath, remotePath string, description string) error {
+	return uploadFileWithTagsAndDescription(ctx, c, localPath, remotePath, nil, description)
 }
 
 func parseAndMergeTag(tags map[string]string, raw string) (map[string]string, error) {
@@ -146,18 +182,21 @@ func parseAndMergeTag(tags map[string]string, raw string) (map[string]string, er
 	return tags, nil
 }
 
-func uploadFile(ctx context.Context, c *client.Client, localPath, remotePath string) error {
-	return uploadFileWithTags(ctx, c, localPath, remotePath, nil)
-}
-
-func uploadFileWithTags(ctx context.Context, c *client.Client, localPath, remotePath string, tags map[string]string) error {
+func uploadFileWithTagsAndDescription(ctx context.Context, c *client.Client, localPath, remotePath string, tags map[string]string, description string) error {
 	f, size, err := openLocalFile(localPath)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = f.Close() }()
 
-	summary, err := c.WriteStreamWithSummaryAndTags(ctx, remotePath, f, size, printProgress, tags)
+	var opts []client.WriteOption
+	if tags != nil {
+		opts = append(opts, client.WithTags(tags))
+	}
+	if description != "" {
+		opts = append(opts, client.WithDescription(description))
+	}
+	summary, err := c.WriteStreamWithSummary(ctx, remotePath, f, size, printProgress, opts...)
 	if err != nil {
 		return err
 	}

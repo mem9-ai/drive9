@@ -217,7 +217,7 @@ func TestUploadFileEmitsUploadSummaryToCLILog(t *testing.T) {
 	}
 
 	c := client.New(srv.URL, "")
-	if err := uploadFile(context.Background(), c, localPath, "/upload.txt"); err != nil {
+	if err := uploadFile(context.Background(), c, localPath, "/upload.txt", ""); err != nil {
 		t.Fatalf("uploadFile: %v", err)
 	}
 	if got := uploaded.String(); got != "hello upload" {

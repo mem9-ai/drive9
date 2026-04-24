@@ -28,3 +28,24 @@ func (s *Store) UpdateFileEmbedding(ctx context.Context, fileID string, revision
 	}
 	return rowsAffected > 0, nil
 }
+
+// UpdateFileDescriptionEmbedding conditionally writes a description embedding for the current file revision.
+func (s *Store) UpdateFileDescriptionEmbedding(ctx context.Context, fileID string, revision int64, vector []float32) (updated bool, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "update_file_description_embedding", start, &err)
+
+	if len(vector) == 0 {
+		return false, fmt.Errorf("embedding vector is required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE files SET description_embedding = ?, description_embedding_revision = ?
+		WHERE file_id = ? AND revision = ? AND status = 'CONFIRMED'`,
+		embedding.FormatVector(vector), revision, fileID, revision)
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rowsAffected > 0, nil
+}

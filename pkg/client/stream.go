@@ -24,6 +24,7 @@ type StreamWriter struct {
 	path             string
 	totalSize        int64
 	expectedRevision int64
+	description      string
 
 	mu        sync.Mutex
 	plan      *uploadPlanV2        // lazily initialized on first WritePart
@@ -56,6 +57,14 @@ func (c *Client) NewStreamWriterConditional(ctx context.Context, path string, to
 	}
 }
 
+// NewStreamWriterWithDescription creates a StreamWriter that also sends a file
+// description during upload initiation.
+func (c *Client) NewStreamWriterWithDescription(ctx context.Context, path string, totalSize int64, description string) *StreamWriter {
+	sw := c.NewStreamWriterConditional(ctx, path, totalSize, -1)
+	sw.description = description
+	return sw
+}
+
 // Started reports whether the upload has been initiated.
 func (sw *StreamWriter) Started() bool {
 	sw.mu.Lock()
@@ -68,7 +77,7 @@ func (sw *StreamWriter) initLocked(ctx context.Context) error {
 	if sw.started {
 		return nil
 	}
-	plan, err := sw.client.initiateUploadV2(ctx, sw.path, sw.totalSize, sw.expectedRevision)
+	plan, err := sw.client.initiateUploadV2(ctx, sw.path, sw.totalSize, sw.expectedRevision, sw.description)
 	if err == errV2NotAvailable {
 		return fmt.Errorf("streaming upload requires v2 protocol: %w", err)
 	}

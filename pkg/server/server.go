@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/backend"
@@ -678,7 +679,12 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusBadRequest, "missing X-Dat9-Part-Checksums header")
 			return
 		}
-		plan, err := b.InitiateUploadWithChecksumsIfRevision(r.Context(), path, cl, partChecksums, expectedRevision)
+		description := r.Header.Get("X-Dat9-Description")
+		if utf8.RuneCountInString(description) > backend.MaxDescriptionLen {
+			errJSON(w, http.StatusBadRequest, fmt.Sprintf("description exceeds %d characters", backend.MaxDescriptionLen))
+			return
+		}
+		plan, err := b.InitiateUploadWithChecksumsIfRevision(r.Context(), path, cl, partChecksums, expectedRevision, description)
 		if err != nil {
 			if errors.Is(err, backend.ErrUploadTooLarge) {
 				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_upload_too_large", "path", path, "error", err)...)
@@ -737,7 +743,12 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		errJSON(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}
-	_, err = b.WriteCtxIfRevisionWithTags(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, expectedRevision, writeTags)
+	description := r.Header.Get("X-Dat9-Description")
+	if utf8.RuneCountInString(description) > backend.MaxDescriptionLen {
+		errJSON(w, http.StatusBadRequest, fmt.Sprintf("description exceeds %d characters", backend.MaxDescriptionLen))
+		return
+	}
+	_, err = b.WriteCtxIfRevisionWithTags(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, expectedRevision, writeTags, description)
 	if err != nil {
 		if errors.Is(err, backend.ErrUploadTooLarge) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_too_large_backend", "path", path, "error", err)...)
@@ -1155,6 +1166,7 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 		TotalSize        int64    `json:"total_size"`
 		PartChecksums    []string `json:"part_checksums"`
 		ExpectedRevision *int64   `json:"expected_revision,omitempty"`
+		Description      string   `json:"description,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		var maxErr *http.MaxBytesError
@@ -1203,7 +1215,11 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 	if req.ExpectedRevision != nil {
 		expectedRevision = *req.ExpectedRevision
 	}
-	plan, err := b.InitiateUploadWithChecksumsIfRevision(r.Context(), req.Path, req.TotalSize, partChecksums, expectedRevision)
+	if utf8.RuneCountInString(req.Description) > backend.MaxDescriptionLen {
+		errJSON(w, http.StatusBadRequest, fmt.Sprintf("description exceeds %d characters", backend.MaxDescriptionLen))
+		return
+	}
+	plan, err := b.InitiateUploadWithChecksumsIfRevision(r.Context(), req.Path, req.TotalSize, partChecksums, expectedRevision, req.Description)
 	if err != nil {
 		if errors.Is(err, backend.ErrUploadTooLarge) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_too_large_backend", "path", req.Path, "error", err)...)
@@ -1582,6 +1598,7 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 		Path             string `json:"path"`
 		TotalSize        int64  `json:"total_size"`
 		ExpectedRevision *int64 `json:"expected_revision,omitempty"`
+		Description      string `json:"description,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		var maxErr *http.MaxBytesError
@@ -1614,7 +1631,11 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 	if req.ExpectedRevision != nil {
 		expectedRevision = *req.ExpectedRevision
 	}
-	plan, err := b.InitiateUploadV2IfRevision(r.Context(), req.Path, req.TotalSize, expectedRevision)
+	if utf8.RuneCountInString(req.Description) > backend.MaxDescriptionLen {
+		errJSON(w, http.StatusBadRequest, fmt.Sprintf("description exceeds %d characters", backend.MaxDescriptionLen))
+		return
+	}
+	plan, err := b.InitiateUploadV2IfRevision(r.Context(), req.Path, req.TotalSize, expectedRevision, req.Description)
 	if err != nil {
 		if errors.Is(err, backend.ErrUploadTooLarge) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_too_large_backend", "path", req.Path, "error", err)...)

@@ -257,6 +257,16 @@ func (c *Client) WriteCtxConditional(ctx context.Context, path string, data []by
 // - zero: path must not already exist
 // - positive: file must exist at exactly that revision
 func (c *Client) WriteCtxConditionalWithTags(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string) error {
+	return c.writeCtxConditionalWithTagsAndDescription(ctx, path, data, expectedRevision, tags, "")
+}
+
+// WriteCtxConditionalWithDescription is like WriteCtxConditional but also sends
+// a description header for the file.
+func (c *Client) WriteCtxConditionalWithDescription(ctx context.Context, path string, data []byte, expectedRevision int64, description string) error {
+	return c.writeCtxConditionalWithTagsAndDescription(ctx, path, data, expectedRevision, nil, description)
+}
+
+func (c *Client) writeCtxConditionalWithTagsAndDescription(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -267,6 +277,9 @@ func (c *Client) WriteCtxConditionalWithTags(ctx context.Context, path string, d
 	}
 	if err := setTagHeaders(req, tags); err != nil {
 		return err
+	}
+	if description != "" {
+		req.Header.Set("X-Dat9-Description", description)
 	}
 	resp, err := c.do(req)
 	if err != nil {

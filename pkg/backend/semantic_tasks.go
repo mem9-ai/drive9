@@ -136,8 +136,11 @@ func newAudioExtractTask(taskID, fileID string, revision int64, path, contentTyp
 	}, nil
 }
 
-func (b *Dat9Backend) shouldEnqueueEmbedForRevision(path, contentType, contentText string) bool {
+func (b *Dat9Backend) shouldEnqueueEmbedForRevision(path, contentType, contentText, description string) bool {
 	if strings.TrimSpace(contentText) != "" {
+		return true
+	}
+	if strings.TrimSpace(description) != "" {
 		return true
 	}
 	return b.hasAsyncImageTextSource(path, contentType)
