@@ -67,8 +67,8 @@ func fsMountCmd(args []string) error {
 	attrTTL := fs.Duration("attr-ttl", 10*time.Second, "kernel attr cache TTL")
 	entryTTL := fs.Duration("entry-ttl", 10*time.Second, "kernel entry cache TTL")
 	flushDebounce := fs.Duration("flush-debounce", -1, "debounce window for small-file flush coalescing (default 2s, 0 disables)")
-	lookupRetryCount := fs.Int("lookup-retry-count", 0, "detached retries after transient Lookup/GetAttr stat failures (0 uses default 2)")
-	lookupRetryTimeout := fs.Duration("lookup-retry-timeout", 0, "timeout per detached Lookup/GetAttr stat retry (0 uses default 250ms)")
+	lookupRetryCount := fs.Int("lookup-retry-count", 2, "detached retries after transient Lookup/GetAttr stat failures (default 2)")
+	lookupRetryTimeout := fs.Duration("lookup-retry-timeout", 250*time.Millisecond, "timeout per detached Lookup/GetAttr stat retry (default 250ms)")
 	syncMode := fs.String("sync-mode", "auto", "sync mode: auto, interactive, or strict")
 	profile := fs.String("profile", "", "mount profile: interactive (empty for default)")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
@@ -89,6 +89,9 @@ func fsMountCmd(args []string) error {
 	}
 	if fs.NArg() != 1 {
 		return fmt.Errorf("drive9 mount: exactly one mountpoint required")
+	}
+	if err := validateLookupRetryFlags(*lookupRetryCount, *lookupRetryTimeout); err != nil {
+		return err
 	}
 
 	mountPoint := fs.Arg(0)
@@ -133,6 +136,16 @@ func fsMountCmd(args []string) error {
 	}
 
 	return drive9fuse.Mount(opts)
+}
+
+func validateLookupRetryFlags(count int, timeout time.Duration) error {
+	if count <= 0 {
+		return fmt.Errorf("drive9 mount: --lookup-retry-count must be > 0")
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("drive9 mount: --lookup-retry-timeout must be > 0")
+	}
+	return nil
 }
 
 // UmountCmd handles the "drive9 umount" command.

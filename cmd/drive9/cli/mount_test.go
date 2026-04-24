@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func fakeLookPath(binMap map[string]bool) func(string) (string, error) {
@@ -198,6 +199,20 @@ func TestResolveMountCredentials_MissingServer(t *testing.T) {
 	_, _, _, err := resolveMountCredentials(r, "", "")
 	if err == nil {
 		t.Fatal("expected error when no server URL is available")
+	}
+}
+
+func TestValidateLookupRetryFlags(t *testing.T) {
+	if err := validateLookupRetryFlags(2, 250*time.Millisecond); err != nil {
+		t.Fatalf("validateLookupRetryFlags() unexpected error: %v", err)
+	}
+
+	if err := validateLookupRetryFlags(0, 250*time.Millisecond); err == nil || !strings.Contains(err.Error(), "--lookup-retry-count") {
+		t.Fatalf("count=0 error = %v, want count validation error", err)
+	}
+
+	if err := validateLookupRetryFlags(2, 0); err == nil || !strings.Contains(err.Error(), "--lookup-retry-timeout") {
+		t.Fatalf("timeout=0 error = %v, want timeout validation error", err)
 	}
 }
 
