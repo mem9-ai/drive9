@@ -2350,6 +2350,14 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fs.readCache.Invalidate(fh.Path)
 		fs.dirCache.Invalidate(parentDir(fh.Path))
 		fs.inodes.UpdateSize(fh.Ino, size)
+		// Remove stale shadow so subsequent read-only opens don't serve
+		// the empty placeholder created at Create/Open time.
+		if fs.shadowStore != nil {
+			fs.shadowStore.Remove(fh.Path)
+		}
+		if fs.pendingIndex != nil {
+			fs.pendingIndex.Remove(fh.Path)
+		}
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		fs.notifyInode(fh.Ino)
 		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
@@ -2390,6 +2398,13 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fs.readCache.Invalidate(fh.Path)
 		fs.dirCache.Invalidate(parentDir(fh.Path))
 		fs.inodes.UpdateSize(fh.Ino, size)
+		// Remove stale shadow (same reason as Path 1a above).
+		if fs.shadowStore != nil {
+			fs.shadowStore.Remove(fh.Path)
+		}
+		if fs.pendingIndex != nil {
+			fs.pendingIndex.Remove(fh.Path)
+		}
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		fs.notifyInode(fh.Ino)
 		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
