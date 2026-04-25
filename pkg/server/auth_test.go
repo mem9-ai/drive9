@@ -239,12 +239,15 @@ func TestTenantStatusWithValidKey(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
-	var out map[string]string
+	var out TenantStatusResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if len(out) != 1 || out["status"] != string(meta.TenantActive) {
+	if out.Status != string(meta.TenantActive) {
 		t.Fatalf("unexpected tenant status response: %+v", out)
+	}
+	if out.MaxUploadBytes != srv.maxUploadBytes {
+		t.Fatalf("max_upload_bytes = %d, want %d", out.MaxUploadBytes, srv.maxUploadBytes)
 	}
 }
 
@@ -267,11 +270,11 @@ func TestTenantStatusReturnsProvisioningState(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
-	var out map[string]string
+	var out TenantStatusResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if len(out) != 1 || out["status"] != string(meta.TenantProvisioning) {
+	if out.Status != string(meta.TenantProvisioning) {
 		t.Fatalf("expected provisioning status, got %+v", out)
 	}
 }
