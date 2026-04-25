@@ -435,6 +435,13 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	// Read local shadow content.
 	localData, err := cq.shadows.ReadAll(entry.Path)
 	if err != nil {
+		// Shadow may have been removed by a concurrent CancelPath/CancelPrefix
+		// (Unlink/Rmdir). Treat as canceled rather than a true conflict.
+		if cq.isCanceled(entry.Path) {
+			cq.removeFromQueue(entry)
+			log.Printf("commit queue: auto-resolve skipped for %s (canceled mid-read)", entry.Path)
+			return
+		}
 		log.Printf("commit queue: auto-resolve failed for %s: read shadow: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
 		return
@@ -476,7 +483,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 		return
 	}
 	log.Printf("commit queue: auto-resolving conflict for %s via LWW (base rev %d → server rev %d)", entry.Path, entry.BaseRev, serverRev)
-	uploadCtx, uploadCancel := context.WithTimeout(context.Background(), uploadTimeout)
+	uploadCtx, uploadCancel := context.WithTimeout(context.Background(), releaseTimeout(int64(len(localData))))
 	err = uploadBufferedRemoteFile(uploadCtx, cq.client, entry.Path, localData, serverRev)
 	uploadCancel()
 	if err != nil {
