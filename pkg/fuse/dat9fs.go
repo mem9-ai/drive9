@@ -2214,8 +2214,8 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 
 		if st != gofuse.OK && streamer != nil {
 			// Flush failed — abort the streaming upload to avoid orphaned
-			// multipart uploads on S3. Called without fh.mu to avoid deadlock
-			// with inflight SubmitPart goroutines that need fh.Lock() in onDone.
+			// multipart uploads on S3. Called without fh.mu because Abort()
+			// may perform network I/O.
 			streamer.Abort()
 			log.Printf("flush failed for %s (status %d), aborted stream upload", fh.Path, st)
 		}
