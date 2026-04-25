@@ -2298,10 +2298,13 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 
 	var err error
 
-	// Path 1a: Streaming mode — some parts already uploaded during Write().
-	// This path is used for large sequential writes (cp, dd, ffmpeg).
-	// Only the final partial part and any dirty (back-written) parts need uploading.
-	if fh.Streamer != nil && fh.Streamer.HasStreamedParts() {
+	// Path 1a: Streaming mode — once the streaming uploader has initiated a
+	// multipart upload (Started), it owns the active server-side upload
+	// record. We must finalize via FinishStreaming even if no part has
+	// finished uploading yet; otherwise Path 1b would call NewStreamWriter
+	// again and the server would reject the second initiate with a
+	// uploads.idx_uploads_active duplicate-key error.
+	if fh.Streamer != nil && fh.Streamer.Started() {
 		expectedRevision := fh.Streamer.ExpectedRevision()
 		partSize := fh.Dirty.PartSize()
 		numParts := int((size + partSize - 1) / partSize)
