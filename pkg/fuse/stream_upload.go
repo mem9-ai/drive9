@@ -9,11 +9,12 @@ import (
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
-// streamingInitiateUpperBound is the totalSize declared to the server when a
-// streaming upload starts before the final file size is known. The server
-// validates this against DRIVE9_MAX_UPLOAD_BYTES, so the value must not exceed
-// the server's configured cap.
-const streamingInitiateUpperBound int64 = 20 << 30 // 20 GiB
+// streamingInitiateFallbackUpperBound is used when the client cannot discover
+// the tenant's max_upload_bytes via GET /v1/status (older server, network
+// hiccup, etc.). It must not exceed any server's configured cap, so we keep
+// it modest. Typical streaming workloads (juicefs bench bigfile = 1 GiB) sit
+// well below this.
+const streamingInitiateFallbackUpperBound int64 = 10 << 30 // 10 GiB
 
 // StreamUploader manages parallel part uploads both during Write() for
 // sequential streaming and at flush/close time for non-sequential files.
@@ -118,12 +119,15 @@ func (su *StreamUploader) SubmitPart(ctx context.Context, partNum int, data []by
 	}
 
 	// Lazy init — final size is unknown at this point, so we declare an upper
-	// bound. Server enforces this against DRIVE9_MAX_UPLOAD_BYTES at initiate
-	// time; declaring MaxInt64 trips that check unconditionally. 20 GiB is
-	// enough for typical streaming workloads (juicefs bench bigfile = 1 GiB)
-	// and matches the server-side default of 10 GiB × 2 headroom.
+	// bound. Server enforces this against the tenant's max_upload_bytes at
+	// initiate time; ask the server (cached after first call) and fall back
+	// to a conservative constant if discovery fails.
 	if !su.started {
-		su.writer = su.client.NewStreamWriterConditional(ctx, su.path, streamingInitiateUpperBound, su.expectedRevision)
+		upper := su.client.MaxUploadBytes(ctx)
+		if upper <= 0 {
+			upper = streamingInitiateFallbackUpperBound
+		}
+		su.writer = su.client.NewStreamWriterConditional(ctx, su.path, upper, su.expectedRevision)
 		su.started = true
 	}
 	sw := su.writer
