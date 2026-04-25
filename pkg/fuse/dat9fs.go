@@ -2137,12 +2137,11 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		// which will upload the latest buffer data.
 		if fs.writeBack != nil && fs.uploader != nil {
 			fh.Lock()
-			// If the streaming uploader has initiated a multipart upload, the
-			// server already holds an active upload row for this path. The
-			// write-back/commit-queue paths would call NewStreamWriter and
-			// initiate again, which the server rejects with
-			// uploads.idx_uploads_active. Force the synchronous path so
-			// FinishStreaming finalizes the existing multipart upload.
+			// If parts were submitted to the streaming uploader during Write,
+			// they've been evicted from the WriteBuffer. The write-back /
+			// commit-queue paths would miss those parts. Force the
+			// synchronous flush path so FinishStreaming uploads the
+			// buffered parts with the correct total size.
 			streamerActive := fh.Streamer != nil && fh.Streamer.Started()
 			canUseCache := !streamerActive && fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq
 			if canUseCache {
@@ -2305,12 +2304,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 
 	var err error
 
-	// Path 1a: Streaming mode — once the streaming uploader has initiated a
-	// multipart upload (Started), it owns the active server-side upload
-	// record. We must finalize via FinishStreaming even if no part has
-	// finished uploading yet; otherwise Path 1b would call NewStreamWriter
-	// again and the server would reject the second initiate with a
-	// uploads.idx_uploads_active duplicate-key error.
+	// Path 1a: Streaming mode — parts were submitted during Write() and are
+	// buffered in the StreamUploader. We must finalize via FinishStreaming
+	// (which initiates the server upload with the actual total size) because
+	// the submitted parts were already evicted from the WriteBuffer via onDone,
+	// so Path 1b (UploadAll) would find them missing.
 	if fh.Streamer != nil && fh.Streamer.Started() {
 		expectedRevision := fh.Streamer.ExpectedRevision()
 		partSize := fh.Dirty.PartSize()
