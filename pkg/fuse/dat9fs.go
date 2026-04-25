@@ -149,16 +149,16 @@ const (
 // gets ~205s, which is comfortably reachable on typical home broadband.
 func releaseTimeout(size int64) time.Duration {
 	const (
-		base      = 60 * time.Second
-		cap       = 15 * time.Minute
-		bandwidth = 5 << 20 // 5 MB/s
+		minTimeout = 60 * time.Second
+		maxTimeout = 15 * time.Minute
+		bandwidth  = 5 << 20 // 5 MB/s
 	)
 	t := time.Duration(size/bandwidth) * time.Second
-	if t < base {
-		t = base
+	if t < minTimeout {
+		t = minTimeout
 	}
-	if t > cap {
-		t = cap
+	if t > maxTimeout {
+		t = maxTimeout
 	}
 	return t
 }
