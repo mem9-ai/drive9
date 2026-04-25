@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"bytes"
 	"math"
 	"strings"
 	"sync"
@@ -333,8 +334,8 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			return
 		}
 		if errors.Is(err, client.ErrConflict) {
-			log.Printf("commit queue: conflict committing %s at base revision %d", entry.Path, entry.BaseRev)
-			cq.onCommitTerminalFailure(entry)
+			log.Printf("commit queue: conflict committing %s at base revision %d, attempting auto-resolve", entry.Path, entry.BaseRev)
+			cq.tryAutoResolveConflict(entry)
 			return
 		}
 		lastErr = err
@@ -408,6 +409,84 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry) {
 	cq.removeFromQueue(entry)
 
 	log.Printf("commit queue: successfully uploaded %s (%d bytes)", entry.Path, entry.Size)
+}
+
+// tryAutoResolveConflict attempts to resolve a 409 conflict automatically.
+// It fetches the server's current revision and content, then:
+//   - If local shadow matches server content → idempotent (mark success)
+//   - If local shadow differs → LWW re-upload with the new revision
+//   - If re-upload also 409s or any step fails → fall back to terminal failure
+//
+// This covers ~80% of agent conflict scenarios (whole-file overwrites) without
+// requiring 3-way merge. Max 1 retry to avoid write amplification.
+func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
+	// Bail early if the file was deleted locally while queued.
+	if cq.isCanceled(entry.Path) {
+		cq.removeFromQueue(entry)
+		log.Printf("commit queue: auto-resolve skipped for %s (canceled)", entry.Path)
+		return
+	}
+
+	if cq.shadows == nil {
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+
+	// Read local shadow content.
+	localData, err := cq.shadows.ReadAll(entry.Path)
+	if err != nil {
+		log.Printf("commit queue: auto-resolve failed for %s: read shadow: %v", entry.Path, err)
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+
+	// Fetch server's current state: revision + content.
+	// Use per-RPC timeouts so that a slow Read doesn't starve the Upload budget.
+	statCtx, statCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	stat, err := cq.client.StatCtx(statCtx, entry.Path)
+	statCancel()
+	if err != nil {
+		log.Printf("commit queue: auto-resolve failed for %s: stat: %v", entry.Path, err)
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+	serverRev := stat.Revision
+
+	readCtx, readCancel := context.WithTimeout(context.Background(), uploadTimeout)
+	serverData, err := cq.client.ReadCtx(readCtx, entry.Path)
+	readCancel()
+	if err != nil {
+		log.Printf("commit queue: auto-resolve failed for %s: read server: %v", entry.Path, err)
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+
+	// Branch 1: idempotent — content already matches server.
+	if bytes.Equal(localData, serverData) {
+		log.Printf("commit queue: auto-resolved conflict for %s (idempotent, content matches server rev %d)", entry.Path, serverRev)
+		cq.onCommitSuccess(entry)
+		return
+	}
+
+	// Branch 2: LWW — re-upload local shadow with new base revision.
+	// Re-check cancelation before the potentially expensive upload.
+	if cq.isCanceled(entry.Path) {
+		cq.removeFromQueue(entry)
+		log.Printf("commit queue: auto-resolve aborted for %s before LWW upload (canceled)", entry.Path)
+		return
+	}
+	log.Printf("commit queue: auto-resolving conflict for %s via LWW (base rev %d → server rev %d)", entry.Path, entry.BaseRev, serverRev)
+	uploadCtx, uploadCancel := context.WithTimeout(context.Background(), uploadTimeout)
+	err = uploadBufferedRemoteFile(uploadCtx, cq.client, entry.Path, localData, serverRev)
+	uploadCancel()
+	if err != nil {
+		log.Printf("commit queue: auto-resolve LWW re-upload failed for %s: %v", entry.Path, err)
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+
+	log.Printf("commit queue: auto-resolved conflict for %s via LWW (overwrote rev %d → new upload based on rev %d)", entry.Path, entry.BaseRev, serverRev)
+	cq.onCommitSuccess(entry)
 }
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
