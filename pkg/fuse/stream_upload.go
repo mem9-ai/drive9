@@ -36,8 +36,7 @@ type StreamUploader struct {
 	started       bool
 	streamedParts map[int]bool   // 1-based part numbers submitted during streaming
 	pendingParts  map[int][]byte // buffered part data awaiting server upload
-	inflightWg    sync.WaitGroup
-	streamErr     error // first error from streaming upload
+	streamErr     error          // first error from streaming upload
 }
 
 // NewStreamUploader creates a StreamUploader for the given path.
@@ -252,9 +251,6 @@ func (su *StreamUploader) UploadAll(ctx context.Context, totalSize int64, partDa
 
 // Abort cancels the upload and cleans up server-side state.
 func (su *StreamUploader) Abort() {
-	// Wait for inflight streaming parts before aborting
-	su.inflightWg.Wait()
-
 	su.mu.Lock()
 	sw := su.writer
 	su.pendingParts = make(map[int][]byte) // release buffered data

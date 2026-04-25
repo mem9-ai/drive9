@@ -2334,10 +2334,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 
 		streamer := fh.Streamer
 
-		// Release fh.mu before network calls. FinishStreaming calls
-		// inflightWg.Wait() which blocks until SubmitPart goroutines finish.
-		// Those goroutines call onDone → fh.Lock(), so holding fh.mu here
-		// would deadlock.
+		// Release fh.mu before network calls — FinishStreaming does
+		// synchronous uploads that may take minutes.
 		fh.Unlock()
 		err = streamer.FinishStreaming(ctx, size,
 			lastPartNum, lastCp, dirtyParts)
