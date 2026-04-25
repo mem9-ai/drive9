@@ -1595,13 +1595,13 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	streamer := fh.Streamer
 	wb.OnPartFull = func(partIdx int, data []byte) {
 		partNum := partIdx + 1
-		// SubmitPart copies data synchronously; evict the part from WriteBuffer
-		// immediately after. The caller (Write) already holds fh.Lock().
+		// SubmitPart copies data synchronously into pendingParts.
+		// Do NOT evict from WriteBuffer — the data must remain readable
+		// until the file is flushed/released (reads fall through to server
+		// for evicted ranges, but the server doesn't have the data yet).
 		if err := streamer.SubmitPart(context.Background(), partNum, data, nil); err != nil {
 			log.Printf("streaming submit part %d failed for %s: %v", partNum, childP, err)
-			return
 		}
-		fh.Dirty.EvictPart(partIdx)
 	}
 
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
@@ -1716,13 +1716,12 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			filePath := p
 			fh.Dirty.OnPartFull = func(partIdx int, data []byte) {
 				partNum := partIdx + 1
-				// SubmitPart copies data synchronously; evict the part from WriteBuffer
-				// immediately after. The caller (Write) already holds fh.Lock().
+				// SubmitPart copies data synchronously into pendingParts.
+				// Do NOT evict from WriteBuffer — the data must remain readable
+				// until the file is flushed/released.
 				if err := streamer.SubmitPart(context.Background(), partNum, data, nil); err != nil {
 					log.Printf("streaming submit part %d failed for %s: %v", partNum, filePath, err)
-					return
 				}
-				fh.Dirty.EvictPart(partIdx)
 			}
 		}
 	}
