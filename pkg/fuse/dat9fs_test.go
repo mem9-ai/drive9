@@ -2546,3 +2546,22 @@ func TestDebounce_ReleaseAfterFlush_NoDataLoss(t *testing.T) {
 		t.Fatal("data was never uploaded — data loss!")
 	}
 }
+
+func TestReleaseTimeoutScaling(t *testing.T) {
+	tests := []struct {
+		size    int64
+		wantMin time.Duration
+		wantMax time.Duration
+	}{
+		{0, 60 * time.Second, 60 * time.Second},                   // small file: floor
+		{10 << 20, 60 * time.Second, 60 * time.Second},            // 10 MB: still floor
+		{1 << 30, 200 * time.Second, 220 * time.Second},           // 1 GiB: ~205s
+		{100 << 30, 15 * time.Minute, 15 * time.Minute},           // 100 GiB: capped at 15min
+	}
+	for _, tt := range tests {
+		got := releaseTimeout(tt.size)
+		if got < tt.wantMin || got > tt.wantMax {
+			t.Errorf("releaseTimeout(%d) = %v, want [%v, %v]", tt.size, got, tt.wantMin, tt.wantMax)
+		}
+	}
+}
