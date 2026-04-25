@@ -2137,7 +2137,14 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		// which will upload the latest buffer data.
 		if fs.writeBack != nil && fs.uploader != nil {
 			fh.Lock()
-			canUseCache := fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq
+			// If the streaming uploader has initiated a multipart upload, the
+			// server already holds an active upload row for this path. The
+			// write-back/commit-queue paths would call NewStreamWriter and
+			// initiate again, which the server rejects with
+			// uploads.idx_uploads_active. Force the synchronous path so
+			// FinishStreaming finalizes the existing multipart upload.
+			streamerActive := fh.Streamer != nil && fh.Streamer.Started()
+			canUseCache := !streamerActive && fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq
 			if canUseCache {
 				fh.Dirty.ClearDirty()
 				fs.clearDirtySize(fh.Ino, fh.DirtySeq)
