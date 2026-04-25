@@ -2304,10 +2304,9 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	var err error
 
 	// Path 1a: Streaming mode — parts were submitted during Write() and are
-	// buffered in the StreamUploader. We must finalize via FinishStreaming
-	// (which initiates the server upload with the actual total size) because
-	// the submitted parts were already evicted from the WriteBuffer via onDone,
-	// so Path 1b (UploadAll) would find them missing.
+	// buffered in the StreamUploader's pendingParts. We must finalize via
+	// FinishStreaming (which initiates the server upload with the actual total
+	// size and uploads from pendingParts), not Path 1b's UploadAll.
 	if fh.Streamer != nil && fh.Streamer.Started() {
 		expectedRevision := fh.Streamer.ExpectedRevision()
 		partSize := fh.Dirty.PartSize()
@@ -2315,9 +2314,9 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		lastPartNum := numParts // 1-based
 
 		// Determine data for the last part.
-		// If the file size is an exact multiple of partSize, the last part was
-		// already fully streamed and evicted — pass nil so FinishStreaming
-		// does not re-upload it with empty/zero data.
+		// If the file size is an exact multiple of partSize, the last part
+		// was already submitted via SubmitPart — pass nil so FinishStreaming
+		// uses the buffered copy from pendingParts.
 		var lastCp []byte
 		if size%partSize != 0 {
 			// Last part is partial — it's still in the WriteBuffer
