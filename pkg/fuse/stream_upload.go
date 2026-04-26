@@ -159,10 +159,23 @@ func (su *StreamUploader) FinishStreaming(ctx context.Context, totalSize int64,
 	su.writer = su.client.NewStreamWriterConditional(ctx, su.path, totalSize, su.expectedRevision)
 	sw := su.writer
 
-	// Collect all buffered parts.
+	// Collect all buffered parts. We keep a reference so we can restore
+	// them on failure — making this method safe to retry.
 	pending := su.pendingParts
 	su.pendingParts = make(map[int][]byte)
 	su.mu.Unlock()
+
+	// restoreOnError puts pending parts back so a subsequent call can retry.
+	restoreOnError := func() {
+		su.mu.Lock()
+		defer su.mu.Unlock()
+		for pn, data := range pending {
+			if _, exists := su.pendingParts[pn]; !exists {
+				su.pendingParts[pn] = data
+			}
+		}
+		su.writer = nil // allow fresh initiate on retry
+	}
 
 	// Upload all buffered parts (from SubmitPart during Write).
 	for pn, data := range pending {
@@ -176,6 +189,7 @@ func (su *StreamUploader) FinishStreaming(ctx context.Context, totalSize int64,
 			abortCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			_ = sw.Abort(abortCtx)
 			cancel()
+			restoreOnError()
 			return err
 		}
 	}
@@ -186,6 +200,7 @@ func (su *StreamUploader) FinishStreaming(ctx context.Context, totalSize int64,
 			abortCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			_ = sw.Abort(abortCtx)
 			cancel()
+			restoreOnError()
 			return err
 		}
 	}
@@ -196,6 +211,7 @@ func (su *StreamUploader) FinishStreaming(ctx context.Context, totalSize int64,
 		abortCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		_ = sw.Abort(abortCtx)
 		cancel()
+		restoreOnError()
 		return err
 	}
 	return nil
