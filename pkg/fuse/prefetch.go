@@ -110,7 +110,9 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 	if end > len(block.data) {
 		end = len(block.data)
 	}
-	data := block.data[start:end]
+	// Copy to avoid aliasing the prefetch buffer across concurrent reads.
+	data := make([]byte, end-start)
+	copy(data, block.data[start:end])
 
 	// Evict the block once the read has consumed past its end.
 	// This keeps the block available for subsequent reads within it.
