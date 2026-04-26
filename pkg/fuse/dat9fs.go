@@ -1767,6 +1767,11 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		} else {
 			out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 		}
+	} else if fh.Prefetch != nil {
+		// Large read-only files with prefetcher: use DIRECT_IO so every
+		// read goes through our Read handler (no kernel page cache).
+		// The prefetcher provides its own caching layer.
+		out.OpenFlags = gofuse.FOPEN_DIRECT_IO
 	} else {
 		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 	}
