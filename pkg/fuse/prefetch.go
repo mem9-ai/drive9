@@ -14,7 +14,7 @@ const (
 	prefetchMaxBlocks = 4                // max cached prefetch blocks
 )
 
-// prefetchBlock holds prefetched data for a byte range.
+// prefetchBlock holds prefetched data for a byte range [offset, offset+len(data)).
 type prefetchBlock struct {
 	offset int64
 	data   []byte
@@ -66,6 +66,7 @@ func NewPrefetcher(c *client.Client, path string, fileSize int64) *Prefetcher {
 }
 
 // Get checks the prefetch cache for data at [offset, offset+size).
+// A block is a hit if it contains the requested range (not just exact offset match).
 // Returns the data and true on hit, or nil and false on miss.
 func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 	p.mu.Lock()
@@ -73,10 +74,10 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 		p.mu.Unlock()
 		return nil, false
 	}
-	block, ok := p.cache[offset]
+	block := p.findBlockLocked(offset)
 	p.mu.Unlock()
 
-	if !ok {
+	if block == nil {
 		return nil, false
 	}
 
@@ -88,29 +89,82 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 	}
 
 	if block.err != nil {
-		// Remove failed block — verify identity to avoid deleting a replacement
+		// Remove failed block
 		p.mu.Lock()
-		if p.cache[offset] == block {
-			delete(p.cache, offset)
+		if p.cache[block.offset] == block {
+			delete(p.cache, block.offset)
 		}
 		p.mu.Unlock()
 		return nil, false
 	}
 
-	// Trim to requested size
-	data := block.data
-	if len(data) > size {
-		data = data[:size]
+	// Calculate the sub-range within the block.
+	blockEnd := block.offset + int64(len(block.data))
+	if offset < block.offset || offset >= blockEnd {
+		// Shouldn't happen given findBlockLocked, but be defensive.
+		return nil, false
 	}
 
-	// Clean up used block — verify identity to avoid deleting a replacement
-	p.mu.Lock()
-	if p.cache[offset] == block {
-		delete(p.cache, offset)
+	start := int(offset - block.offset)
+	end := start + size
+	if end > len(block.data) {
+		end = len(block.data)
 	}
-	p.mu.Unlock()
+	data := block.data[start:end]
+
+	// Evict the block once the read has consumed past its end.
+	// This keeps the block available for subsequent reads within it.
+	readEnd := offset + int64(size)
+	if readEnd >= blockEnd {
+		p.mu.Lock()
+		if p.cache[block.offset] == block {
+			delete(p.cache, block.offset)
+		}
+		p.mu.Unlock()
+	}
 
 	return data, true
+}
+
+// findBlockLocked returns the cached block that contains the given offset,
+// or nil if no such block exists. Caller must hold p.mu.
+func (p *Prefetcher) findBlockLocked(offset int64) *prefetchBlock {
+	// Fast path: exact match (first read into a block).
+	if block, ok := p.cache[offset]; ok {
+		return block
+	}
+	// Slow path: scan for a block whose range covers the offset.
+	// With at most prefetchMaxBlocks (4) entries this is cheap.
+	for _, block := range p.cache {
+		blockEnd := block.offset + p.blockLen(block)
+		if offset >= block.offset && offset < blockEnd {
+			return block
+		}
+	}
+	return nil
+}
+
+// blockLen returns the expected length of a block. If the block is still
+// inflight (data not yet available), estimates from the prefetch window.
+// Caller must hold p.mu.
+func (p *Prefetcher) blockLen(block *prefetchBlock) int64 {
+	select {
+	case <-block.ready:
+		// Block is ready — use actual data length.
+		if block.err != nil {
+			return 0
+		}
+		return int64(len(block.data))
+	default:
+		// Block still inflight — estimate from window size.
+		// This allows findBlockLocked to find the block even before
+		// the data arrives, so Get can wait on it.
+		remaining := p.fileSize - block.offset
+		if remaining < p.window {
+			return remaining
+		}
+		return p.window
+	}
 }
 
 // OnRead should be called after each Read() to trigger prefetching.
@@ -130,9 +184,10 @@ func (p *Prefetcher) OnRead(offset int64, size int) {
 			p.window = prefetchMaxWindow
 		}
 
-		// Trigger prefetch for next region
+		// Trigger prefetch for the region after the current read.
+		// Check if a block already covers this range to avoid duplicates.
 		prefetchStart := offset + int64(size)
-		if prefetchStart < p.fileSize && !p.inflight[prefetchStart] {
+		if prefetchStart < p.fileSize && !p.inflight[prefetchStart] && p.findBlockLocked(prefetchStart) == nil {
 			p.startPrefetch(prefetchStart, p.window)
 		}
 	} else {

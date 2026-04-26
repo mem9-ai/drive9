@@ -917,6 +917,105 @@ func TestPrefetcher_CloseStopsAccepting(t *testing.T) {
 	p.Close()
 }
 
+// TestPrefetcher_SubBlockReads verifies that a prefetched block serves
+// multiple smaller reads without re-fetching. This is the key scenario
+// for sequential reads: kernel sends 128KB reads, prefetcher fetches
+// 256KB-16MB blocks, each block should serve many reads.
+func TestPrefetcher_SubBlockReads(t *testing.T) {
+	// Set up a server that tracks range-read calls.
+	var readCalls atomic.Int32
+	fileData := make([]byte, 1024*1024) // 1MB file
+	for i := range fileData {
+		fileData[i] = byte(i % 256)
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			// Simulate redirect-based read (direct S3 path).
+			readCalls.Add(1)
+			rangeHeader := r.Header.Get("Range")
+			if rangeHeader != "" {
+				// Parse "bytes=start-end"
+				var start, end int64
+				fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
+				if end >= int64(len(fileData)) {
+					end = int64(len(fileData)) - 1
+				}
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(fileData)))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(fileData[start : end+1])
+				return
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(fileData)
+		case http.MethodHead:
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(fileData)))
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	c := client.New(ts.URL, "")
+	p := NewPrefetcher(c, "/bigfile.bin", int64(len(fileData)))
+	defer p.Close()
+
+	readSize := 4096 // simulate 4KB FUSE reads
+	offset := int64(0)
+
+	// First read: cache miss, direct fetch
+	_, hit := p.Get(offset, readSize)
+	if hit {
+		t.Fatal("first read should be a cache miss")
+	}
+	// Simulate the read happening outside prefetcher
+	p.OnRead(offset, readSize)
+	offset += int64(readSize)
+
+	// Let the prefetch goroutine run
+	time.Sleep(50 * time.Millisecond)
+
+	// Now do sequential reads. The prefetched block should serve many reads
+	// without additional HTTP calls.
+	httpCallsBefore := readCalls.Load()
+	hits := 0
+	for i := 0; i < 60; i++ { // 60 × 4KB = 240KB, well within first 256KB prefetch
+		data, ok := p.Get(offset, readSize)
+		if ok {
+			hits++
+			// Verify data correctness
+			for j := 0; j < len(data) && j < readSize; j++ {
+				expected := byte((int64(j) + offset) % 256)
+				if data[j] != expected {
+					t.Fatalf("data mismatch at offset %d+%d: got %d, want %d", offset, j, data[j], expected)
+				}
+			}
+		}
+		p.OnRead(offset, readSize)
+		offset += int64(readSize)
+		// Small delay to let prefetch goroutines run
+		if i%10 == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	httpCallsAfter := readCalls.Load()
+	extraCalls := httpCallsAfter - httpCallsBefore
+
+	// The key assertion: with sub-block reads working, we should have
+	// many hits from the prefetched blocks and very few extra HTTP calls.
+	// Without the fix, every read would be a miss (0 hits, 60 HTTP calls).
+	if hits < 30 {
+		t.Fatalf("sub-block hits = %d, want >= 30 (out of 60 reads); extraCalls = %d", hits, extraCalls)
+	}
+	// Should need at most a handful of HTTP calls (initial prefetch + maybe 1-2 more)
+	if extraCalls > 10 {
+		t.Fatalf("extra HTTP calls = %d, want <= 10 (prefetch blocks should serve many reads)", extraCalls)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // StreamUploader tests
 // ---------------------------------------------------------------------------
