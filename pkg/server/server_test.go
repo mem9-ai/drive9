@@ -521,12 +521,12 @@ func TestLocalTenantShimProvisionAndStatus(t *testing.T) {
 	if statusResp.StatusCode != http.StatusOK {
 		t.Fatalf("status: %d", statusResp.StatusCode)
 	}
-	var statusBody map[string]string
+	var statusBody TenantStatusResponse
 	if err := json.NewDecoder(statusResp.Body).Decode(&statusBody); err != nil {
 		t.Fatal(err)
 	}
-	if got := statusBody["status"]; got != "active" {
-		t.Fatalf("status = %q, want active", got)
+	if statusBody.Status != "active" {
+		t.Fatalf("status = %q, want active", statusBody.Status)
 	}
 }
 

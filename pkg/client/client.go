@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/tagutil"
@@ -27,6 +28,17 @@ type Client struct {
 	actor              string // X-Dat9-Actor header value (per-mount ID)
 	httpClient         *http.Client
 	smallFileThreshold int64 // 0 means use DefaultSmallFileThreshold
+
+	statusOnce sync.Once
+	statusMax  int64 // tenant max_upload_bytes from /v1/status, 0 if unavailable
+}
+
+// tenantStatusResponse mirrors the server's TenantStatusResponse JSON shape.
+// We only consume max_upload_bytes today, but keep the full shape so the
+// decoder ignores forward-compatible additions cleanly.
+type tenantStatusResponse struct {
+	Status         string `json:"status"`
+	MaxUploadBytes int64  `json:"max_upload_bytes"`
 }
 
 // ErrConflict reports an HTTP 409 write conflict from the server.
@@ -211,6 +223,41 @@ func (c *Client) BaseURL() string {
 // APIKey returns the API key.
 func (c *Client) APIKey() string {
 	return c.apiKey
+}
+
+// MaxUploadBytes returns the tenant's effective single-upload size cap as
+// reported by GET /v1/status. The result is cached for the lifetime of the
+// client (one fetch per process). Returns 0 if the server is older and does
+// not include the field, or if the lookup fails — callers should treat 0 as
+// "unknown" and fall back to a conservative local default.
+func (c *Client) MaxUploadBytes(ctx context.Context) int64 {
+	c.statusOnce.Do(func() {
+		c.statusMax = c.fetchTenantMaxUploadBytes(ctx)
+	})
+	return c.statusMax
+}
+
+func (c *Client) fetchTenantMaxUploadBytes(ctx context.Context) int64 {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/status", nil)
+	if err != nil {
+		return 0
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return 0
+	}
+	var body tenantStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return 0
+	}
+	if body.MaxUploadBytes < 0 {
+		return 0
+	}
+	return body.MaxUploadBytes
 }
 
 func (c *Client) do(req *http.Request) (*http.Response, error) {
