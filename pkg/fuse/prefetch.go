@@ -81,18 +81,8 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 	if !ok {
 		// Slow path: scan for a ready block whose data range covers offset.
 		// Only check ready blocks — inflight blocks have unknown actual size.
-		for _, b := range p.cache {
-			select {
-			case <-b.ready:
-				if b.err == nil && offset >= b.offset && offset < b.offset+int64(len(b.data)) {
-					block = b
-					ok = true
-					break
-				}
-			default:
-				// Block still inflight — skip (don't block Get on it).
-			}
-		}
+		block = p.findReadyBlockLocked(offset)
+		ok = block != nil
 	}
 	p.mu.Unlock()
 
@@ -147,6 +137,23 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 	return data, true
 }
 
+// findReadyBlockLocked scans the cache for a ready (non-inflight) block
+// whose data range covers the given offset. Returns nil if none found.
+// Caller must hold p.mu.
+func (p *Prefetcher) findReadyBlockLocked(offset int64) *prefetchBlock {
+	for _, b := range p.cache {
+		select {
+		case <-b.ready:
+			if b.err == nil && offset >= b.offset && offset < b.offset+int64(len(b.data)) {
+				return b
+			}
+		default:
+			// Block still inflight — skip.
+		}
+	}
+	return nil
+}
+
 // OnRead should be called after each Read() to trigger prefetching.
 // offset is the read offset, size is the bytes read.
 func (p *Prefetcher) OnRead(offset int64, size int) {
@@ -166,21 +173,8 @@ func (p *Prefetcher) OnRead(offset int64, size int) {
 
 		// Trigger prefetch for the region after the current read.
 		prefetchStart := offset + int64(size)
-		if prefetchStart < p.fileSize && !p.inflight[prefetchStart] {
-			// Check if an existing ready block already covers this range.
-			covered := false
-			for _, b := range p.cache {
-				select {
-				case <-b.ready:
-					if b.err == nil && prefetchStart >= b.offset && prefetchStart < b.offset+int64(len(b.data)) {
-						covered = true
-					}
-				default:
-				}
-			}
-			if !covered {
-				p.startPrefetch(prefetchStart, p.window)
-			}
+		if prefetchStart < p.fileSize && !p.inflight[prefetchStart] && p.findReadyBlockLocked(prefetchStart) == nil {
+			p.startPrefetch(prefetchStart, p.window)
 		}
 	} else {
 		// Random read — reset
