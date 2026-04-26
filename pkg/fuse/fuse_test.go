@@ -937,7 +937,7 @@ func TestPrefetcher_SubBlockReads(t *testing.T) {
 			if rangeHeader != "" {
 				// Parse "bytes=start-end"
 				var start, end int64
-				fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
+				_, _ = fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
 				if end >= int64(len(fileData)) {
 					end = int64(len(fileData)) - 1
 				}
