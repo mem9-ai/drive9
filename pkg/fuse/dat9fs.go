@@ -140,6 +140,29 @@ const (
 	lookupRetrySuccessLogEvery uint64 = 200
 )
 
+// releaseTimeout computes a generous timeout for synchronous uploads in
+// Release / FlushAll based on file size. The formula is:
+//
+//	max(60s, size / 5 MB/s)   capped at 15 min
+//
+// 5 MB/s is a conservative floor for cross-region S3 uploads. A 1 GiB file
+// gets ~205s, which is comfortably reachable on typical home broadband.
+func releaseTimeout(size int64) time.Duration {
+	const (
+		minTimeout = 60 * time.Second
+		maxTimeout = 15 * time.Minute
+		bandwidth  = 5 << 20 // 5 MB/s
+	)
+	t := time.Duration(size/bandwidth) * time.Second
+	if t < minTimeout {
+		t = minTimeout
+	}
+	if t > maxTimeout {
+		t = maxTimeout
+	}
+	return t
+}
+
 // fuseCtx converts a FUSE cancel channel into a context.Context with a timeout.
 // The context is cancelled when either the FUSE operation is interrupted or the
 // timeout expires. This ensures HTTP calls never block indefinitely.
@@ -2200,12 +2223,15 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		}
 
 		// Normal path: synchronous upload in Release.
-		// Release uses a generous timeout since it must persist data.
-		ctx, cf := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cf()
-
+		// Timeout scales with file size so large uploads don't get killed.
 		fh.Lock()
+		var flushSize int64
+		if fh.Dirty != nil {
+			flushSize = fh.Dirty.Size()
+		}
+		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(flushSize))
 		st := fs.flushHandle(ctx, fh)
+		cf()
 		streamer := fh.Streamer
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
@@ -2496,10 +2522,13 @@ func (fs *Dat9FS) FlushAll() {
 		handles = append(handles, entry{fhID, fh})
 	})
 	for _, e := range handles {
-		// Per-handle timeout so each flush gets a full 60s regardless of
-		// how many handles precede it.
-		ctx, cf := context.WithTimeout(context.Background(), 60*time.Second)
+		// Per-handle timeout scaled by file size so large uploads complete.
 		e.fh.Lock()
+		var sz int64
+		if e.fh.Dirty != nil {
+			sz = e.fh.Dirty.Size()
+		}
+		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(sz))
 		fs.flushHandle(ctx, e.fh)
 		e.fh.Unlock()
 		cf()
