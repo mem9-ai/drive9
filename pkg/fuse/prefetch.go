@@ -11,7 +11,7 @@ import (
 const (
 	prefetchMinWindow = 256 * 1024       // 256KB
 	prefetchMaxWindow = 16 * 1024 * 1024 // 16MB
-	prefetchMaxBlocks = 4                // max cached prefetch blocks
+	prefetchMaxBlocks = 128              // max cached prefetch chunks
 )
 
 // prefetchBlock holds prefetched data for a byte range.
@@ -24,6 +24,10 @@ type prefetchBlock struct {
 
 // Prefetcher detects sequential read patterns and prefetches upcoming data
 // blocks in the background, reducing HTTP round-trips for large file reads.
+//
+// Design: a single HTTP request fetches a large window of data. The result
+// is split into read-aligned chunks, each stored at its own offset key.
+// Get() uses exact-offset matching — no sub-block scanning needed.
 //
 // Concurrency: Prefetcher is fully self-synchronized via p.mu.
 // Callers do NOT need to hold any external lock.
@@ -39,6 +43,7 @@ type Prefetcher struct {
 	mu         sync.Mutex
 	nextExpect int64 // next expected offset (for sequential detection)
 	window     int64 // current prefetch window (adaptive)
+	readSize   int   // observed FUSE read size (for chunk splitting)
 	cache      map[int64]*prefetchBlock
 	inflight   map[int64]bool
 	client     *client.Client
@@ -123,6 +128,11 @@ func (p *Prefetcher) OnRead(offset int64, size int) {
 		return
 	}
 
+	// Track observed read size for chunk splitting.
+	if size > 0 {
+		p.readSize = size
+	}
+
 	if offset == p.nextExpect {
 		// Sequential read detected — grow window
 		p.window *= 2
@@ -130,9 +140,9 @@ func (p *Prefetcher) OnRead(offset int64, size int) {
 			p.window = prefetchMaxWindow
 		}
 
-		// Trigger prefetch for next region
+		// Trigger prefetch for next region if not already cached or inflight.
 		prefetchStart := offset + int64(size)
-		if prefetchStart < p.fileSize && !p.inflight[prefetchStart] {
+		if prefetchStart < p.fileSize && !p.inflight[prefetchStart] && p.cache[prefetchStart] == nil {
 			p.startPrefetch(prefetchStart, p.window)
 		}
 	} else {
@@ -171,6 +181,8 @@ func (p *Prefetcher) Close() {
 }
 
 // startPrefetch launches a background fetch. Caller must hold p.mu.
+// It fetches [offset, offset+length) in one HTTP request, then splits
+// the result into read-aligned chunks stored at their own offset keys.
 func (p *Prefetcher) startPrefetch(offset, length int64) {
 	if p.client == nil {
 		return // no client available (e.g., in tests)
@@ -183,24 +195,43 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 		return
 	}
 
-	// Evict oldest blocks if at capacity
-	for len(p.cache) >= prefetchMaxBlocks {
-		// Find and remove the block with smallest offset
+	chunkSize := int64(p.readSize)
+	if chunkSize <= 0 {
+		chunkSize = 128 * 1024 // default 128KB if not yet observed
+	}
+
+	// Calculate how many chunks this window will produce.
+	nChunks := int((length + chunkSize - 1) / chunkSize)
+
+	// Evict oldest blocks if needed to make room.
+	for len(p.cache)+nChunks > prefetchMaxBlocks {
 		var minOff int64 = 1<<63 - 1
 		for k := range p.cache {
 			if k < minOff {
 				minOff = k
 			}
 		}
+		if minOff == 1<<63-1 {
+			break
+		}
 		delete(p.cache, minOff)
 		delete(p.inflight, minOff)
 	}
 
-	block := &prefetchBlock{
-		offset: offset,
-		ready:  make(chan struct{}),
+	// Create placeholder blocks for each chunk so Get() can find them.
+	// All chunks share a single ready channel — they become available together.
+	ready := make(chan struct{})
+	blocks := make([]*prefetchBlock, nChunks)
+	for i := range nChunks {
+		off := offset + int64(i)*chunkSize
+		b := &prefetchBlock{
+			offset: off,
+			ready:  ready,
+		}
+		blocks[i] = b
+		p.cache[off] = b
 	}
-	p.cache[offset] = block
+	// Mark the fetch start as inflight (not each chunk — OnRead checks start offset).
 	p.inflight[offset] = true
 
 	ctx := p.ctx
@@ -209,21 +240,41 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 			p.mu.Lock()
 			delete(p.inflight, offset)
 			p.mu.Unlock()
-			close(block.ready)
+			close(ready)
 		}()
 
 		rc, err := p.client.ReadStreamRange(ctx, p.path, offset, length)
 		if err != nil {
-			block.err = err
+			for _, b := range blocks {
+				b.err = err
+			}
 			return
 		}
 		defer func() { _ = rc.Close() }()
 
 		data, err := io.ReadAll(rc)
 		if err != nil {
-			block.err = err
+			for _, b := range blocks {
+				b.err = err
+			}
 			return
 		}
-		block.data = data
+
+		// Split data into chunks.
+		for i, b := range blocks {
+			start := int64(i) * chunkSize
+			end := start + chunkSize
+			if end > int64(len(data)) {
+				end = int64(len(data))
+			}
+			if start >= int64(len(data)) {
+				b.err = io.ErrUnexpectedEOF
+				continue
+			}
+			// Copy to give each chunk its own backing array.
+			chunk := make([]byte, end-start)
+			copy(chunk, data[start:end])
+			b.data = chunk
+		}
 	}()
 }
