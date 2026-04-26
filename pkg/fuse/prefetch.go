@@ -14,7 +14,7 @@ const (
 	prefetchMaxBlocks = 4                // max cached prefetch blocks
 )
 
-// prefetchBlock holds prefetched data for a byte range [offset, offset+len(data)).
+// prefetchBlock holds prefetched data for a byte range.
 type prefetchBlock struct {
 	offset int64
 	data   []byte
@@ -66,7 +66,6 @@ func NewPrefetcher(c *client.Client, path string, fileSize int64) *Prefetcher {
 }
 
 // Get checks the prefetch cache for data at [offset, offset+size).
-// A block is a hit if it contains the requested offset (sub-block reads).
 // Returns the data and true on hit, or nil and false on miss.
 func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 	p.mu.Lock()
@@ -74,24 +73,14 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 		p.mu.Unlock()
 		return nil, false
 	}
-
-	// Find a block that covers this offset.
-	// Fast path: exact offset match (first read into a block).
 	block, ok := p.cache[offset]
-	if !ok {
-		// Slow path: scan for a ready block whose data range covers offset.
-		// Only check ready blocks — inflight blocks have unknown actual size.
-		block = p.findReadyBlockLocked(offset)
-		ok = block != nil
-	}
 	p.mu.Unlock()
 
 	if !ok {
 		return nil, false
 	}
 
-	// Wait for the block to be ready (or context cancellation).
-	// For blocks found via exact match, they may still be inflight.
+	// Wait for the block to be ready (or context cancellation)
 	select {
 	case <-block.ready:
 	case <-p.ctx.Done():
@@ -99,59 +88,29 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 	}
 
 	if block.err != nil {
-		// Remove failed block
+		// Remove failed block — verify identity to avoid deleting a replacement
 		p.mu.Lock()
-		if p.cache[block.offset] == block {
-			delete(p.cache, block.offset)
+		if p.cache[offset] == block {
+			delete(p.cache, offset)
 		}
 		p.mu.Unlock()
 		return nil, false
 	}
 
-	// Calculate the sub-range within the block.
-	blockEnd := block.offset + int64(len(block.data))
-	if offset < block.offset || offset >= blockEnd {
-		// Shouldn't happen, but be defensive.
-		return nil, false
+	// Trim to requested size
+	data := block.data
+	if len(data) > size {
+		data = data[:size]
 	}
 
-	start := int(offset - block.offset)
-	end := start + size
-	if end > len(block.data) {
-		end = len(block.data)
+	// Clean up used block — verify identity to avoid deleting a replacement
+	p.mu.Lock()
+	if p.cache[offset] == block {
+		delete(p.cache, offset)
 	}
-	// Copy to decouple from the prefetch buffer.
-	data := make([]byte, end-start)
-	copy(data, block.data[start:end])
-
-	// Evict the block once the read has consumed past its end.
-	readEnd := offset + int64(size)
-	if readEnd >= blockEnd {
-		p.mu.Lock()
-		if p.cache[block.offset] == block {
-			delete(p.cache, block.offset)
-		}
-		p.mu.Unlock()
-	}
+	p.mu.Unlock()
 
 	return data, true
-}
-
-// findReadyBlockLocked scans the cache for a ready (non-inflight) block
-// whose data range covers the given offset. Returns nil if none found.
-// Caller must hold p.mu.
-func (p *Prefetcher) findReadyBlockLocked(offset int64) *prefetchBlock {
-	for _, b := range p.cache {
-		select {
-		case <-b.ready:
-			if b.err == nil && offset >= b.offset && offset < b.offset+int64(len(b.data)) {
-				return b
-			}
-		default:
-			// Block still inflight — skip.
-		}
-	}
-	return nil
 }
 
 // OnRead should be called after each Read() to trigger prefetching.
@@ -171,9 +130,9 @@ func (p *Prefetcher) OnRead(offset int64, size int) {
 			p.window = prefetchMaxWindow
 		}
 
-		// Trigger prefetch for the region after the current read.
+		// Trigger prefetch for next region
 		prefetchStart := offset + int64(size)
-		if prefetchStart < p.fileSize && !p.inflight[prefetchStart] && p.findReadyBlockLocked(prefetchStart) == nil {
+		if prefetchStart < p.fileSize && !p.inflight[prefetchStart] {
 			p.startPrefetch(prefetchStart, p.window)
 		}
 	} else {
