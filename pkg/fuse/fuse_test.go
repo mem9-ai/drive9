@@ -1173,17 +1173,17 @@ func TestStreamUploader_HasStreamedParts(t *testing.T) {
 func TestStreamUploader_FinishStreamingRestoresPendingOnFailure(t *testing.T) {
 	var initiateCalls int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/v2/uploads/initiate":
+		switch r.URL.Path {
+		case "/v2/uploads/initiate":
 			initiateCalls++
 			// Return a valid upload plan so initiation succeeds.
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"upload_id":"test-upload","total_parts":2}`))
-		case r.URL.Path == "/v2/uploads/test-upload/presign-batch":
+		case "/v2/uploads/test-upload/presign-batch":
 			// Fail presign to simulate S3 error during WritePart.
 			http.Error(w, `{"error":"simulated S3 failure"}`, http.StatusInternalServerError)
-		case r.URL.Path == "/v2/uploads/test-upload/abort":
+		case "/v2/uploads/test-upload/abort":
 			w.WriteHeader(http.StatusOK)
 		default:
 			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
