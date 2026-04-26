@@ -2080,13 +2080,53 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.St
 		}
 	}
 
-	// Large file uploads (streaming or non-sequential) can take minutes.
-	// The FUSE Flush context has a fixed 30s timeout which is too short.
-	// Defer the upload to Release, which uses releaseTimeout(size) — a
-	// size-proportional timeout that scales with the file.
-	// The data is safe in pendingParts + WriteBuffer until Release.
-	if fh.Dirty != nil && fh.Dirty.Size() >= writeBackThreshold {
-		return gofuse.OK
+	// Large file path. Returning OK here without persisting the file would
+	// break close→drop_caches→open: the kernel re-issues Lookup, which falls
+	// through to a remote stat that has not yet seen the upload, returning
+	// ENOENT (juicefs bench reproduces this).
+	//
+	// Two strategies, depending on sync mode:
+	//
+	//   • SyncInteractive: stage the buffer to the local shadow store + journal
+	//     (durable on the host) and register it in pendingIndex so subsequent
+	//     Lookups hit the in-memory overlay. Release will pick this up via
+	//     its write-back cache fast path and enqueue the actual server upload
+	//     into the CommitQueue. close(2) is fast; remote durability is async.
+	//
+	//   • SyncStrict (or interactive fall-through on stage failure): block in
+	//     Flush until the upload completes. Use a size-proportional timeout
+	//     (releaseTimeout) instead of the 30s fuseCtx — large uploads need it.
+	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() && fh.Dirty.Size() >= writeBackThreshold {
+		if fs.syncMode == SyncInteractive && fs.shadowStore != nil && fs.pendingIndex != nil {
+			if fs.canStageShadowFastLocked(fh) || fh.Dirty.CanMaterializeFull() {
+				if err := fs.stageShadowLocked(fh, true); err != nil {
+					log.Printf("flush: shadow stage failed for %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
+				} else {
+					if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
+						log.Printf("flush: writeback snapshot failed for %s: %v", fh.Path, err)
+					}
+					fh.WriteBackSeq = fh.DirtySeq
+					// If a streaming upload was already in flight, abandon it:
+					// the CommitQueue (driven by Release via the cache fast
+					// path) will read from the shadow file instead. Without
+					// this, Release sees streamerActive and falls through to
+					// a synchronous re-upload, defeating the whole point.
+					if fh.Streamer != nil && fh.Streamer.Started() {
+						fh.Streamer.Abort()
+						fh.Streamer = nil
+					}
+					return gofuse.OK
+				}
+			}
+		}
+
+		// Strict mode (or interactive fall-through): synchronous upload with
+		// a size-aware timeout. Must NOT debounce — debounce returns OK and
+		// uploads asynchronously, which would re-introduce the same bug.
+		size := fh.Dirty.Size()
+		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
+		defer cf()
+		return fs.flushHandle(ctx, fh)
 	}
 
 	ctx, cf := fuseCtx(cancel)
