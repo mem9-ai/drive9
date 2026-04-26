@@ -1,10 +1,15 @@
 package fuse
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/client"
 )
 
 // ---------------------------------------------------------------------------
@@ -1159,6 +1164,73 @@ func TestStreamUploader_HasStreamedParts(t *testing.T) {
 	su := NewStreamUploader(nil, "/test", -1)
 	if su.HasStreamedParts() {
 		t.Fatal("should have no streamed parts initially")
+	}
+}
+
+// TestStreamUploader_FinishStreamingRestoresPendingOnFailure verifies that
+// when FinishStreaming fails (e.g. S3 connection reset, timeout), the
+// pendingParts are restored so the operation can be retried.
+func TestStreamUploader_FinishStreamingRestoresPendingOnFailure(t *testing.T) {
+	var initiateCalls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/uploads/initiate":
+			initiateCalls++
+			// Return a valid upload plan so initiation succeeds.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"upload_id":"test-upload","total_parts":2}`))
+		case "/v2/uploads/test-upload/presign-batch":
+			// Fail presign to simulate S3 error during WritePart.
+			http.Error(w, `{"error":"simulated S3 failure"}`, http.StatusInternalServerError)
+		case "/v2/uploads/test-upload/abort":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	c := client.New(ts.URL, "")
+	su := NewStreamUploader(c, "/retry-test.bin", -1)
+
+	// Submit 2 parts.
+	part1 := []byte("part-1-data-here")
+	part2 := []byte("part-2-data-here")
+	if err := su.SubmitPart(context.Background(), 1, part1, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := su.SubmitPart(context.Background(), 2, part2, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// First FinishStreaming should fail (presign returns 500).
+	err := su.FinishStreaming(context.Background(), 32, 2, []byte("last"), nil)
+	if err == nil {
+		t.Fatal("expected FinishStreaming to fail")
+	}
+
+	// pendingParts should be restored — verify by checking the internal state.
+	su.mu.Lock()
+	restoredCount := len(su.pendingParts)
+	has1 := su.pendingParts[1] != nil
+	has2 := su.pendingParts[2] != nil
+	writerNil := su.writer == nil
+	su.mu.Unlock()
+
+	if restoredCount != 2 {
+		t.Fatalf("pendingParts count after failure = %d, want 2", restoredCount)
+	}
+	if !has1 || !has2 {
+		t.Fatalf("pendingParts missing parts: has1=%v has2=%v", has1, has2)
+	}
+	if !writerNil {
+		t.Fatal("writer should be nil after failure to allow fresh initiate on retry")
+	}
+
+	// Verify initiate was called (upload was attempted, not short-circuited).
+	if initiateCalls < 1 {
+		t.Fatalf("initiate calls = %d, want >= 1", initiateCalls)
 	}
 }
 
