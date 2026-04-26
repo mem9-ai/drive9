@@ -2080,6 +2080,14 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.St
 		}
 	}
 
+	// Streaming uploads of large files can take minutes. The FUSE Flush
+	// context has a fixed 30s timeout which is too short. Defer the upload
+	// to Release, which uses releaseTimeout(size) — a size-proportional
+	// timeout. The data is safe in pendingParts + WriteBuffer until then.
+	if fh.Streamer != nil && fh.Streamer.HasStreamedParts() {
+		return gofuse.OK
+	}
+
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
