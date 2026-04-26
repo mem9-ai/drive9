@@ -73,6 +73,16 @@ var (
 // Keep callers on this exported constant so the default stays consistent.
 const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
 
+// TenantStatusResponse is the JSON body of GET /v1/status. Fields are filled
+// per authenticated tenant so callers can discover their effective limits
+// before initiating uploads. MaxUploadBytes is currently process-wide but the
+// shape is per-tenant so future tenant-scoped quotas plug in without a
+// protocol change.
+type TenantStatusResponse struct {
+	Status         string `json:"status"`
+	MaxUploadBytes int64  `json:"max_upload_bytes"`
+}
+
 func New(b *backend.Dat9Backend) *Server {
 	return NewWithConfig(Config{Backend: b})
 }
@@ -381,7 +391,10 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": string(resolved.Tenant.Status)})
+	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
+		Status:         string(resolved.Tenant.Status),
+		MaxUploadBytes: s.maxUploadBytes,
+	})
 }
 
 func backendFromRequest(r *http.Request) *backend.Dat9Backend {
@@ -413,7 +426,10 @@ func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request)
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", "local", "status", "active")...)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "active"})
+	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
+		Status:         "active",
+		MaxUploadBytes: s.maxUploadBytes,
+	})
 }
 
 func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {

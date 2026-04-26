@@ -1618,11 +1618,11 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	streamer := fh.Streamer
 	wb.OnPartFull = func(partIdx int, data []byte) {
 		partNum := partIdx + 1
-		if err := streamer.SubmitPart(context.Background(), partNum, data, func(pn int) {
-			fh.Lock()
-			fh.Dirty.EvictPart(pn - 1) // 0-based
-			fh.Unlock()
-		}); err != nil {
+		// SubmitPart copies data synchronously into pendingParts.
+		// Do NOT evict from WriteBuffer — the data must remain readable
+		// until the file is flushed/released (reads fall through to server
+		// for evicted ranges, but the server doesn't have the data yet).
+		if err := streamer.SubmitPart(context.Background(), partNum, data, nil); err != nil {
 			log.Printf("streaming submit part %d failed for %s: %v", partNum, childP, err)
 		}
 	}
@@ -1739,11 +1739,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			filePath := p
 			fh.Dirty.OnPartFull = func(partIdx int, data []byte) {
 				partNum := partIdx + 1
-				if err := streamer.SubmitPart(context.Background(), partNum, data, func(pn int) {
-					fh.Lock()
-					fh.Dirty.EvictPart(pn - 1)
-					fh.Unlock()
-				}); err != nil {
+				// SubmitPart copies data synchronously into pendingParts.
+				// Do NOT evict from WriteBuffer — the data must remain readable
+				// until the file is flushed/released.
+				if err := streamer.SubmitPart(context.Background(), partNum, data, nil); err != nil {
 					log.Printf("streaming submit part %d failed for %s: %v", partNum, filePath, err)
 				}
 			}
@@ -2160,7 +2159,13 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		// which will upload the latest buffer data.
 		if fs.writeBack != nil && fs.uploader != nil {
 			fh.Lock()
-			canUseCache := fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq
+			// If parts were submitted to the streaming uploader during Write,
+			// they've been evicted from the WriteBuffer. The write-back /
+			// commit-queue paths would miss those parts. Force the
+			// synchronous flush path so FinishStreaming uploads the
+			// buffered parts with the correct total size.
+			streamerActive := fh.Streamer != nil && fh.Streamer.Started()
+			canUseCache := !streamerActive && fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq
 			if canUseCache {
 				fh.Dirty.ClearDirty()
 				fs.clearDirtySize(fh.Ino, fh.DirtySeq)
@@ -2234,8 +2239,8 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 
 		if st != gofuse.OK && streamer != nil {
 			// Flush failed — abort the streaming upload to avoid orphaned
-			// multipart uploads on S3. Called without fh.mu to avoid deadlock
-			// with inflight SubmitPart goroutines that need fh.Lock() in onDone.
+			// multipart uploads on S3. Called without fh.mu because Abort()
+			// may perform network I/O.
 			streamer.Abort()
 			log.Printf("flush failed for %s (status %d), aborted stream upload", fh.Path, st)
 		}
@@ -2324,19 +2329,20 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 
 	var err error
 
-	// Path 1a: Streaming mode — some parts already uploaded during Write().
-	// This path is used for large sequential writes (cp, dd, ffmpeg).
-	// Only the final partial part and any dirty (back-written) parts need uploading.
-	if fh.Streamer != nil && fh.Streamer.HasStreamedParts() {
+	// Path 1a: Streaming mode — parts were submitted during Write() and are
+	// buffered in the StreamUploader's pendingParts. We must finalize via
+	// FinishStreaming (which initiates the server upload with the actual total
+	// size and uploads from pendingParts), not Path 1b's UploadAll.
+	if fh.Streamer != nil && fh.Streamer.Started() {
 		expectedRevision := fh.Streamer.ExpectedRevision()
 		partSize := fh.Dirty.PartSize()
 		numParts := int((size + partSize - 1) / partSize)
 		lastPartNum := numParts // 1-based
 
 		// Determine data for the last part.
-		// If the file size is an exact multiple of partSize, the last part was
-		// already fully streamed and evicted — pass nil so FinishStreaming
-		// does not re-upload it with empty/zero data.
+		// If the file size is an exact multiple of partSize, the last part
+		// was already submitted via SubmitPart — pass nil so FinishStreaming
+		// uses the buffered copy from pendingParts.
 		var lastCp []byte
 		if size%partSize != 0 {
 			// Last part is partial — it's still in the WriteBuffer
@@ -2352,10 +2358,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 
 		streamer := fh.Streamer
 
-		// Release fh.mu before network calls. FinishStreaming calls
-		// inflightWg.Wait() which blocks until SubmitPart goroutines finish.
-		// Those goroutines call onDone → fh.Lock(), so holding fh.mu here
-		// would deadlock.
+		// Release fh.mu before network calls — FinishStreaming does
+		// synchronous uploads that may take minutes.
 		fh.Unlock()
 		err = streamer.FinishStreaming(ctx, size,
 			lastPartNum, lastCp, dirtyParts)
@@ -2372,6 +2376,14 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fs.readCache.Invalidate(fh.Path)
 		fs.dirCache.Invalidate(parentDir(fh.Path))
 		fs.inodes.UpdateSize(fh.Ino, size)
+		// Remove stale shadow so subsequent read-only opens don't serve
+		// the empty placeholder created at Create/Open time.
+		if fs.shadowStore != nil {
+			fs.shadowStore.Remove(fh.Path)
+		}
+		if fs.pendingIndex != nil {
+			fs.pendingIndex.Remove(fh.Path)
+		}
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		fs.notifyInode(fh.Ino)
 		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
@@ -2412,6 +2424,13 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 		fs.readCache.Invalidate(fh.Path)
 		fs.dirCache.Invalidate(parentDir(fh.Path))
 		fs.inodes.UpdateSize(fh.Ino, size)
+		// Remove stale shadow (same reason as Path 1a above).
+		if fs.shadowStore != nil {
+			fs.shadowStore.Remove(fh.Path)
+		}
+		if fs.pendingIndex != nil {
+			fs.pendingIndex.Remove(fh.Path)
+		}
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		fs.notifyInode(fh.Ino)
 		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
