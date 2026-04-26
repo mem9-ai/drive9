@@ -2565,3 +2565,270 @@ func TestReleaseTimeoutScaling(t *testing.T) {
 		}
 	}
 }
+
+// largeFlushStreamingMock returns an httptest server that accepts a full
+// streaming upload flow (initiate → presign-batch → PUT parts → complete) and
+// answers HEAD requests so subsequent Lookup/Stat calls can verify visibility.
+// completeCh fires once /complete is observed (one event per upload).
+func largeFlushStreamingMock(t *testing.T, fileSize int64, completeCh chan<- struct{}) *httptest.Server {
+	t.Helper()
+	var (
+		mu        sync.Mutex
+		uploaded  bool // set true after /complete
+		etagSeq   int
+	)
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead:
+			mu.Lock()
+			done := uploaded
+			mu.Unlock()
+			if !done {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "up-large",
+				"key":         "blobs/up-large",
+				"part_size":   8 << 20,
+				"total_parts": (fileSize + (8 << 20) - 1) / (8 << 20),
+				"expires_at":  time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+				"resumable":   false,
+				"checksum_contract": map[string]any{
+					"supported": []string{"SHA-256"},
+					"required":  false,
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/up-large/presign":
+			var req struct {
+				PartNumber int `json:"part_number"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number":     req.PartNumber,
+				"url":        "http://" + r.Host + "/upload/" + strconv.Itoa(req.PartNumber),
+				"size":       8 << 20,
+				"headers":    map[string]string{},
+				"expires_at": time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+			})
+		case r.Method == http.MethodPut:
+			_, _ = io.Copy(io.Discard, r.Body)
+			mu.Lock()
+			etagSeq++
+			etag := fmt.Sprintf(`"etag-%d"`, etagSeq)
+			mu.Unlock()
+			w.Header().Set("ETag", etag)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/up-large/complete":
+			_, _ = io.Copy(io.Discard, r.Body)
+			mu.Lock()
+			uploaded = true
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			select {
+			case completeCh <- struct{}{}:
+			default:
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+// TestFlushLargeFile_StrictUploadsBeforeReturning is the primary regression
+// guard for the juicefs bench failure (#337 follow-up).
+//
+// In strict mode, Flush MUST upload the file to the server before returning.
+// Otherwise, applications that close()→drop_caches→open() (juicefs bench, fio,
+// some sync tools) see ENOENT because the kernel re-issues Lookup, the dentry
+// cache is empty, and the remote stat has not yet observed the upload.
+//
+// Repro path that previously failed:
+//   1. Create + Write 10 MiB
+//   2. Flush (was: returned OK without uploading)
+//   3. Lookup the path → must succeed
+func TestFlushLargeFile_StrictUploadsBeforeReturning(t *testing.T) {
+	const fileSize = int64(writeBackThreshold) // 10 MiB — minimal trigger of the large-file path
+
+	completeCh := make(chan struct{}, 1)
+	ts := largeFlushStreamingMock(t, fileSize, completeCh)
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.syncMode = SyncStrict
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_RDWR),
+	}, "big.bin", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+
+	// Write the file in 1 MiB chunks (sequential writes drive the streaming uploader).
+	chunk := make([]byte, 1<<20)
+	for i := range chunk {
+		chunk[i] = byte(i)
+	}
+	for off := int64(0); off < fileSize; off += int64(len(chunk)) {
+		_, st = fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+			Fh:       createOut.Fh,
+			Offset:   uint64(off),
+		}, chunk)
+		if st != gofuse.OK {
+			t.Fatalf("Write @%d: %v", off, st)
+		}
+	}
+
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	if st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+
+	// Strict mode must have completed the upload by the time Flush returns.
+	select {
+	case <-completeCh:
+	default:
+		t.Fatal("Flush returned OK but /complete was never received — close→drop→open will see ENOENT")
+	}
+
+	// Lookup must now resolve via remote stat (no pendingIndex configured here).
+	var entryOut gofuse.EntryOut
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "big.bin", &entryOut)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup after Flush: %v, want OK", st)
+	}
+	if entryOut.Size != uint64(fileSize) {
+		t.Fatalf("Lookup size = %d, want %d", entryOut.Size, fileSize)
+	}
+}
+
+// TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex verifies that in
+// interactive mode the same close→drop→open sequence is served from the local
+// shadow + pendingIndex, without blocking Flush on a network upload. The
+// CommitQueue takes over the actual server write asynchronously.
+//
+// We assert two invariants:
+//   1. Flush returns quickly without contacting the upload endpoints.
+//   2. A subsequent Lookup hits pendingIndex (no remote stat needed).
+func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
+	const fileSize = int64(writeBackThreshold) // 10 MiB
+
+	var uploadAttempted atomic.Bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Any /v2/uploads/* hit during Flush would mean we accidentally went
+		// through the synchronous path. HEAD is allowed (Lookup may still
+		// fall through if pendingIndex misses, which is the bug we're guarding).
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusNotFound) // server has nothing yet
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate" {
+			uploadAttempted.Store(true)
+		}
+		// Keep the CommitQueue worker happy enough that it doesn't spam errors,
+		// but we don't actually care if the background upload "succeeds" here —
+		// the test asserts on the local overlay.
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	c := client.New(ts.URL, "")
+	fs := NewDat9FS(c, opts)
+	fs.syncMode = SyncInteractive
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	// Wire a CommitQueue so the Release path enqueues asynchronously instead
+	// of falling back to a synchronous uploader (which would defeat the test).
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 16)
+	defer cq.DrainAll()
+	fs.commitQueue = cq
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_RDWR),
+	}, "interactive.bin", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+
+	chunk := make([]byte, 1<<20)
+	for i := range chunk {
+		chunk[i] = byte(i)
+	}
+	for off := int64(0); off < fileSize; off += int64(len(chunk)) {
+		_, st = fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+			Fh:       createOut.Fh,
+			Offset:   uint64(off),
+		}, chunk)
+		if st != gofuse.OK {
+			t.Fatalf("Write @%d: %v", off, st)
+		}
+	}
+
+	flushStart := time.Now()
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	flushDur := time.Since(flushStart)
+	if st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+	// Interactive Flush should be local-only — no upload initiate during Flush.
+	if uploadAttempted.Load() {
+		t.Fatal("interactive Flush hit upload endpoints — expected stage-only fast path")
+	}
+	// Sanity: even on slow CI a 10 MiB shadow stage should be well under 5s.
+	if flushDur > 5*time.Second {
+		t.Fatalf("interactive Flush took %v — should be local fsync only", flushDur)
+	}
+
+	// pendingIndex must contain the file with the correct size.
+	meta, ok := pending.GetMeta("/interactive.bin")
+	if !ok {
+		t.Fatal("pendingIndex missing entry after interactive Flush — Lookup will ENOENT")
+	}
+	if meta.Size != fileSize {
+		t.Fatalf("pendingIndex size = %d, want %d", meta.Size, fileSize)
+	}
+
+	// Lookup must hit the in-memory overlay without remote stat.
+	var entryOut gofuse.EntryOut
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "interactive.bin", &entryOut)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup: %v, want OK", st)
+	}
+	if entryOut.Size != uint64(fileSize) {
+		t.Fatalf("Lookup size = %d, want %d", entryOut.Size, fileSize)
+	}
+}
