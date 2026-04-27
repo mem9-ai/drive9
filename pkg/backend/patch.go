@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/datastore"
@@ -237,7 +238,15 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 		PartSize: partSize,
 	}
 
-	// Process each part
+	// First, collect all parts that need server-side copy
+	type copyJob struct {
+		partNumber int
+		partStart  int64
+		partEnd    int64
+	}
+	var copyJobs []copyJob
+	var copyPartNumbers []int
+	
 	for _, p := range newParts {
 		if !dirtySet[p.Number] && p.Number <= origPartCount {
 			// Unchanged part within original file range → server-side copy
@@ -247,16 +256,75 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 			if partEnd >= origSize {
 				partEnd = origSize - 1
 			}
-
-			_, err := b.s3.UploadPartCopy(ctx, newS3Key, mpu.UploadID, p.Number, sourceKey, partStart, partEnd)
+			
+			copyJobs = append(copyJobs, copyJob{
+				partNumber: p.Number,
+				partStart:  partStart,
+				partEnd:    partEnd,
+			})
+			copyPartNumbers = append(copyPartNumbers, p.Number)
+		}
+	}
+	
+	// Execute UploadPartCopy calls in parallel
+	if len(copyJobs) > 0 {
+		const maxWorkers = 16
+		numWorkers := len(copyJobs)
+		if numWorkers > maxWorkers {
+			numWorkers = maxWorkers
+		}
+		
+		jobCh := make(chan copyJob, len(copyJobs))
+		resultCh := make(chan error, len(copyJobs))
+		
+		// Start workers
+		var wg sync.WaitGroup
+		for i := 0; i < numWorkers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for job := range jobCh {
+					_, err := b.s3.UploadPartCopy(ctx, newS3Key, mpu.UploadID, job.partNumber, sourceKey, job.partStart, job.partEnd)
+					resultCh <- err
+				}
+			}()
+		}
+		
+		// Send jobs to workers
+		for _, job := range copyJobs {
+			jobCh <- job
+		}
+		close(jobCh)
+		
+		// Wait for workers to finish
+		wg.Wait()
+		close(resultCh)
+		
+		// Collect results
+		var firstErr error
+		var errOnce sync.Once
+		for err := range resultCh {
 			if err != nil {
-				_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
-				logger.Error(ctx, "backend_patch_upload_copy_failed", zap.String("path", path), zap.Int("part", p.Number), zap.Error(err))
-				metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
-				return nil, fmt.Errorf("copy part %d: %w", p.Number, err)
+				errOnce.Do(func() {
+					firstErr = err
+				})
 			}
-			plan.CopiedParts = append(plan.CopiedParts, p.Number)
-		} else {
+		}
+		
+		if firstErr != nil {
+			_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
+			logger.Error(ctx, "backend_patch_upload_copy_failed", zap.String("path", path), zap.Error(firstErr))
+			metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+			return nil, fmt.Errorf("copy parts: %w", firstErr)
+		}
+		
+		// All copies succeeded, add to plan
+		plan.CopiedParts = append(plan.CopiedParts, copyPartNumbers...)
+	}
+	
+	// Process dirty/new parts (sequential, as they're just generating URLs)
+	for _, p := range newParts {
+		if dirtySet[p.Number] || p.Number > origPartCount {
 			// Dirty part or new part beyond original → client must upload
 			u, err := b.s3.PresignUploadPart(ctx, newS3Key, mpu.UploadID, p.Number, p.Size, s3client.ChecksumAlgoSHA256, "", s3client.UploadTTL)
 			if err != nil {

@@ -1297,6 +1297,8 @@ func (s *Server) handleUploadAction(w http.ResponseWriter, r *http.Request) {
 		s.handleUploadComplete(w, r, uploadID)
 	case (r.Method == http.MethodPost || r.Method == http.MethodGet) && strings.HasPrefix(action, "resume"):
 		s.handleUploadResume(w, r, uploadID)
+	case r.Method == http.MethodGet && strings.HasPrefix(action, "status"):
+		s.handleUploadStatus(w, r, uploadID)
 	case r.Method == http.MethodDelete && action == "":
 		s.handleUploadAbort(w, r, uploadID)
 	default:
