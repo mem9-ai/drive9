@@ -104,6 +104,16 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 
 	// Trim to requested size
 	data := block.data
+	if len(data) < size && offset+int64(len(data)) < p.fileSize {
+		// A prefetched chunk smaller than the caller's request is only valid at
+		// EOF. Returning it for an interior range exposes a short read to FUSE.
+		p.mu.Lock()
+		if p.cache[offset] == block {
+			delete(p.cache, offset)
+		}
+		p.mu.Unlock()
+		return nil, false
+	}
 	if len(data) > size {
 		data = data[:size]
 	}
@@ -136,6 +146,9 @@ func (p *Prefetcher) OnRead(offset int64, size int) {
 	if offset == p.nextExpect {
 		// Sequential read detected — grow window
 		p.window *= 2
+		if p.window < int64(size) {
+			p.window = int64(size)
+		}
 		if p.window > prefetchMaxWindow {
 			p.window = prefetchMaxWindow
 		}
@@ -198,6 +211,12 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 	chunkSize := int64(p.readSize)
 	if chunkSize <= 0 {
 		chunkSize = 128 * 1024 // default 128KB if not yet observed
+	}
+	if length < chunkSize && offset+length < p.fileSize {
+		length = chunkSize
+		if offset+length > p.fileSize {
+			length = p.fileSize - offset
+		}
 	}
 
 	// Calculate how many chunks this window will produce, capped to avoid

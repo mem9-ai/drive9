@@ -1016,6 +1016,54 @@ func TestPrefetcher_SubBlockReads(t *testing.T) {
 	}
 }
 
+func TestPrefetcher_LargeReadSizeDoesNotReturnShortPrefetch(t *testing.T) {
+	fileData := make([]byte, 4*1024*1024)
+	for i := range fileData {
+		fileData[i] = byte(i % 251)
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		rangeHeader := r.Header.Get("Range")
+		if rangeHeader == "" {
+			_, _ = w.Write(fileData)
+			return
+		}
+		var start, end int64
+		_, _ = fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
+		if end >= int64(len(fileData)) {
+			end = int64(len(fileData)) - 1
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(fileData)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(fileData[start : end+1])
+	}))
+	defer ts.Close()
+
+	c := client.New(ts.URL, "")
+	p := NewPrefetcher(c, "/bigfile.bin", int64(len(fileData)))
+	defer p.Close()
+
+	const readSize = 1024 * 1024
+	p.OnRead(0, readSize)
+
+	data, ok := p.Get(readSize, readSize)
+	if !ok {
+		t.Fatal("prefetch get = miss, want hit")
+	}
+	if len(data) != readSize {
+		t.Fatalf("prefetch data len = %d, want %d", len(data), readSize)
+	}
+	for i := 0; i < readSize; i++ {
+		want := byte((readSize + i) % 251)
+		if data[i] != want {
+			t.Fatalf("data[%d] = %d, want %d", i, data[i], want)
+		}
+	}
+}
+
 // TestPrefetcher_ChunkCapBound verifies that chunk count never exceeds
 // prefetchMaxBlocks, even with tiny readSize and large window.
 func TestPrefetcher_ChunkCapBound(t *testing.T) {
