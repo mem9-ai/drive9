@@ -2047,10 +2047,6 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	// EIO without touching Dirty — OnPartFull may evict the part, so writing
 	// Dirty first could lose data if shadow then fails.
 	if fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil {
-		if !fs.shadowStore.CheckDiskSpaceThrottled() {
-			log.Printf("shadow write rejected for %s: disk space below watermark", fh.Path)
-			return 0, gofuse.Status(syscall.ENOSPC)
-		}
 		if _, err := fs.shadowStore.WriteAt(fh.Path, int64(input.Offset), data, fh.BaseRev); err != nil {
 			log.Printf("shadow write failed for ShadowSpill %s: %v", fh.Path, err)
 			return 0, gofuse.EIO
