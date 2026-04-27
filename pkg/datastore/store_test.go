@@ -118,6 +118,141 @@ func TestStat(t *testing.T) {
 	requireEmbeddingRevision(t, nf.File.EmbeddingRevision, 11)
 }
 
+func TestStatLite(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	// Insert a file with content_blob and content_text populated.
+	if err := s.InsertFile(ctx, &File{
+		FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		ContentBlob: []byte("hello world"), ContentText: "hello world",
+		SizeBytes: 11, Revision: 3, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`UPDATE files SET description = 'test desc' WHERE file_id = 'f1'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/lite.txt", ParentPath: "/", Name: "lite.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	// StatLite should return metadata but NOT blob/text/description.
+	nf, err := s.StatLite(ctx, "/lite.txt")
+	if err != nil {
+		t.Fatalf("StatLite: %v", err)
+	}
+	if nf.Node.Path != "/lite.txt" {
+		t.Fatalf("path=%q, want /lite.txt", nf.Node.Path)
+	}
+	if nf.File == nil {
+		t.Fatal("StatLite: file is nil")
+	}
+	if nf.File.SizeBytes != 11 {
+		t.Fatalf("size=%d, want 11", nf.File.SizeBytes)
+	}
+	if nf.File.Revision != 3 {
+		t.Fatalf("revision=%d, want 3", nf.File.Revision)
+	}
+	if nf.File.ConfirmedAt == nil {
+		t.Fatal("confirmed_at is nil")
+	}
+	// These fields must be zero/empty — lite path does not fetch them.
+	if len(nf.File.ContentBlob) != 0 {
+		t.Fatalf("ContentBlob should be empty in lite path, got %d bytes", len(nf.File.ContentBlob))
+	}
+	if nf.File.ContentText != "" {
+		t.Fatalf("ContentText should be empty in lite path, got %q", nf.File.ContentText)
+	}
+	if nf.File.Description != "" {
+		t.Fatalf("Description should be empty in lite path, got %q", nf.File.Description)
+	}
+	if nf.File.StorageType != "" {
+		t.Fatalf("StorageType should be empty in lite path, got %q", nf.File.StorageType)
+	}
+}
+
+func TestStatPathFallbackLite(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.InsertFile(ctx, &File{
+		FileID: "f2", StorageType: StorageDB9, StorageRef: "/blobs/f2",
+		ContentBlob: []byte("data"), SizeBytes: 4, Revision: 7,
+		Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "n2", Path: "/fb.txt", ParentPath: "/", Name: "fb.txt", FileID: "f2", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Primary path match.
+	nf, err := s.StatPathFallbackLite(ctx, "/fb.txt", "/nonexist")
+	if err != nil {
+		t.Fatalf("StatPathFallbackLite: %v", err)
+	}
+	if nf.File == nil || nf.File.Revision != 7 {
+		t.Fatalf("unexpected file: %+v", nf.File)
+	}
+	if len(nf.File.ContentBlob) != 0 {
+		t.Fatal("lite fallback should not return ContentBlob")
+	}
+
+	// Fallback path match.
+	nf2, err := s.StatPathFallbackLite(ctx, "/nonexist", "/fb.txt")
+	if err != nil {
+		t.Fatalf("StatPathFallbackLite fallback: %v", err)
+	}
+	if nf2.File == nil || nf2.File.Revision != 7 {
+		t.Fatalf("fallback: unexpected file: %+v", nf2.File)
+	}
+}
+
+func TestStatForRead(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.InsertFile(ctx, &File{
+		FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		ContentBlob: []byte("inline data here"), SizeBytes: 16, Revision: 5,
+		Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/read.txt", ParentPath: "/", Name: "read.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	nf, err := s.StatForRead(ctx, "/read.txt")
+	if err != nil {
+		t.Fatalf("StatForRead: %v", err)
+	}
+	if nf.File == nil {
+		t.Fatal("file is nil")
+	}
+	// StatForRead MUST return storage_type + content_blob for inline reads.
+	if nf.File.StorageType != StorageDB9 {
+		t.Fatalf("storage_type=%q, want db9", nf.File.StorageType)
+	}
+	if string(nf.File.ContentBlob) != "inline data here" {
+		t.Fatalf("content_blob=%q, want 'inline data here'", nf.File.ContentBlob)
+	}
+	if nf.File.SizeBytes != 16 {
+		t.Fatalf("size=%d, want 16", nf.File.SizeBytes)
+	}
+	if nf.File.Revision != 5 {
+		t.Fatalf("revision=%d, want 5", nf.File.Revision)
+	}
+	// But it should NOT return text/description/embedding fields.
+	if nf.File.ContentText != "" {
+		t.Fatalf("ContentText should be empty, got %q", nf.File.ContentText)
+	}
+	if nf.File.Description != "" {
+		t.Fatalf("Description should be empty, got %q", nf.File.Description)
+	}
+}
+
 func TestListDir(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()

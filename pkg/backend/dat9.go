@@ -645,6 +645,76 @@ func (b *Dat9Backend) StatNodeCtx(ctx context.Context, path string) (*datastore.
 	return b.store.StatPathFallback(ctx, resolvedPath, dirPath)
 }
 
+// StatNodeLiteCtx returns lightweight metadata (no blob/text/description)
+// suitable for HEAD/stat operations.
+func (b *Dat9Backend) StatNodeLiteCtx(ctx context.Context, path string) (*datastore.NodeWithFile, error) {
+	resolvedPath := normalizePath(path)
+	if pathutil.IsDir(path) {
+		return b.store.StatLite(ctx, resolvedPath)
+	}
+
+	dirPath, dirErr := pathutil.CanonicalizeDir(path)
+	if dirErr != nil || dirPath == resolvedPath {
+		return b.store.StatLite(ctx, resolvedPath)
+	}
+	return b.store.StatPathFallbackLite(ctx, resolvedPath, dirPath)
+}
+
+// ReadPlan describes how to serve a GET request after a single metadata query.
+type ReadPlan struct {
+	// InlineData is non-nil for db9-stored files — the body to return directly.
+	InlineData []byte
+	// PresignURL is non-empty for S3-stored files — the 302 redirect target.
+	PresignURL string
+	// Size is the file size in bytes.
+	Size int64
+}
+
+// ReadPlanCtx resolves a file path into a ReadPlan with a single metadata query.
+// For db9 inline files: returns InlineData (no second stat needed).
+// For S3 files: uses the storage_ref from the same query to presign, returns PresignURL.
+// Only resolves file-form paths (no directory fallback) to maintain GET /dir → 404 behavior.
+func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (*ReadPlan, error) {
+	resolvedPath, err := pathutil.Canonicalize(path)
+	if err != nil {
+		return nil, err
+	}
+
+	nf, err := b.store.StatForRead(ctx, resolvedPath)
+	if err != nil {
+		return nil, err
+	}
+	if nf.Node.IsDirectory {
+		return nil, datastore.ErrNotFound
+	}
+	if nf.File == nil {
+		return nil, datastore.ErrNotFound
+	}
+
+	switch nf.File.StorageType {
+	case datastore.StorageDB9:
+		return &ReadPlan{
+			InlineData: nf.File.ContentBlob,
+			Size:       nf.File.SizeBytes,
+		}, nil
+	case datastore.StorageS3:
+		if b.s3 == nil {
+			return nil, ErrS3NotConfigured
+		}
+		url, err := b.s3.PresignGetObject(ctx, nf.File.StorageRef, s3client.DownloadTTL)
+		if err != nil {
+			logger.Error(ctx, "backend_read_plan_presign_failed", zap.String("path", resolvedPath), zap.Error(err))
+			return nil, err
+		}
+		return &ReadPlan{
+			PresignURL: url,
+			Size:       nf.File.SizeBytes,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported storage type for read plan: %s", nf.File.StorageType)
+	}
+}
+
 func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
 	ctx := backgroundWithTrace()
 	nf, err := b.StatNodeCtx(ctx, path)

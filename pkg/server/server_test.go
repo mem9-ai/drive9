@@ -106,6 +106,65 @@ func TestWriteAndRead(t *testing.T) {
 	}
 }
 
+func TestReadInlineNoRedirect(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Write a small file (db-inline, no S3).
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/inline.txt", strings.NewReader("tiny"))
+	resp, _ := http.DefaultClient.Do(req)
+	_ = resp.Body.Close()
+
+	// GET should return 200 with inline body, not a 302 redirect.
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse // don't follow redirects
+	}}
+	resp, err := client.Get(ts.URL + "/v1/fs/inline.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200 for db-inline GET, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "tiny" {
+		t.Errorf("body=%q, want 'tiny'", body)
+	}
+}
+
+func TestReadDirectoryReturns404(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Create a directory by writing a file inside it.
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/mydir/file.txt", strings.NewReader("x"))
+	resp, _ := http.DefaultClient.Do(req)
+	_ = resp.Body.Close()
+
+	// GET on the directory path should return 404, not 500.
+	resp, err := http.Get(ts.URL + "/v1/fs/mydir/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("GET directory: expected 404, got %d", resp.StatusCode)
+	}
+
+	// Also test without trailing slash.
+	resp, err = http.Get(ts.URL + "/v1/fs/mydir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("GET directory (no slash): expected 404, got %d", resp.StatusCode)
+	}
+}
+
 func TestListDir(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
