@@ -1,6 +1,8 @@
 package fuse
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -407,5 +409,199 @@ func TestCommitQueueRecoverPendingSkipsLegacyOverwriteWithoutBaseRev(t *testing.
 	}
 	if !shadow.Has("/legacy.txt") {
 		t.Fatal("legacy shadow should remain after skipped recovery")
+	}
+}
+
+// --- ShadowSpill tests ---
+
+// TestCommitQueueShadowSpillUpload verifies that ShadowSpill entries are
+// uploaded via streaming (uploadFromShadow) rather than ReadAll, and that
+// the server receives the correct data and expected revision.
+func TestCommitQueueShadowSpillUpload(t *testing.T) {
+	var gotExpected string
+	var gotBody []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write data to shadow file (simulates what Write() + ShadowSpill does).
+	data := bytes.Repeat([]byte("shadowspill-data-"), 100) // ~1700 bytes
+	if err := shadow.WriteFull("/big.bin", data, 12); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/big.bin", int64(len(data)), PendingOverwrite, 12); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	if err := cq.Enqueue(&CommitEntry{
+		Path:        "/big.bin",
+		BaseRev:     12,
+		Size:        int64(len(data)),
+		Kind:        PendingOverwrite,
+		ShadowSpill: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if gotExpected != "12" {
+		t.Fatalf("expected revision header = %q, want 12", gotExpected)
+	}
+	if !bytes.Equal(gotBody, data) {
+		t.Fatalf("server received %d bytes, want %d", len(gotBody), len(data))
+	}
+	if pending.HasPending("/big.bin") {
+		t.Fatal("pending entry should be removed after successful ShadowSpill commit")
+	}
+	if shadow.Has("/big.bin") {
+		t.Fatal("shadow should be removed after successful ShadowSpill commit")
+	}
+}
+
+// TestCommitQueueShadowSpillConflictTerminal verifies that ShadowSpill entries
+// skip auto-resolve (which would OOM) and go straight to terminal failure.
+func TestCommitQueueShadowSpillConflictTerminal(t *testing.T) {
+	var calls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := shadow.WriteFull("/big-conflict.bin", []byte("data"), 5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/big-conflict.bin", 4, PendingOverwrite, 5); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	if err := cq.Enqueue(&CommitEntry{
+		Path:        "/big-conflict.bin",
+		BaseRev:     5,
+		Size:        4,
+		Kind:        PendingOverwrite,
+		ShadowSpill: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	// ShadowSpill: 409 → skip auto-resolve → terminal failure immediately.
+	// Only 1 call: the initial upload (no Stat/Read for auto-resolve).
+	if calls != 1 {
+		t.Fatalf("expected 1 call (upload only, no auto-resolve), got %d", calls)
+	}
+	if !pending.HasPending("/big-conflict.bin") {
+		t.Fatal("pending entry should be preserved after ShadowSpill terminal conflict")
+	}
+	meta, ok := pending.GetMeta("/big-conflict.bin")
+	if !ok || meta.Kind != PendingConflict {
+		t.Fatalf("pending entry should be PendingConflict, got kind=%v ok=%v", meta.Kind, ok)
+	}
+	if !shadow.Has("/big-conflict.bin") {
+		t.Fatal("shadow should be preserved after ShadowSpill terminal conflict")
+	}
+}
+
+// TestCommitQueueRecoverPendingShadowSpill verifies that crash recovery
+// preserves the ShadowSpill flag so recovered entries use streaming upload
+// (not ReadAll which would OOM for large files).
+func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
+	var gotBody []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	shadowDir := t.TempDir()
+	pendingDir := t.TempDir()
+
+	// Phase 1: create pending entry with ShadowSpill=true, then "crash" (close everything).
+	shadow1, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending1, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte("recover-"), 200)
+	if err := shadow1.WriteFull("/recover.bin", data, 8); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending1.PutShadowSpill("/recover.bin", int64(len(data)), PendingOverwrite, 8); err != nil {
+		t.Fatal(err)
+	}
+	shadow1.Close()
+
+	// Phase 2: "restart" — reopen stores and recover.
+	shadow2, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow2.Close()
+	if err := shadow2.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	pending2, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pending2.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the recovered meta has ShadowSpill=true.
+	meta, ok := pending2.GetMeta("/recover.bin")
+	if !ok {
+		t.Fatal("pending entry should survive restart")
+	}
+	if !meta.ShadowSpill {
+		t.Fatal("ShadowSpill flag must be persisted and recovered from disk")
+	}
+
+	// RecoverPending should reconstruct CommitEntry with ShadowSpill=true,
+	// causing uploadEntry to use streaming (uploadFromShadow) not ReadAll.
+	cq := NewCommitQueue(client.New(ts.URL, ""), shadow2, pending2, nil, 1, 8)
+	cq.RecoverPending()
+	cq.DrainAll()
+
+	// Verify data arrived correctly at the server (streaming upload worked).
+	if !bytes.Equal(gotBody, data) {
+		t.Fatalf("server received %d bytes, want %d", len(gotBody), len(data))
+	}
+	if pending2.HasPending("/recover.bin") {
+		t.Fatal("pending entry should be removed after successful recovery upload")
+	}
+	if shadow2.Has("/recover.bin") {
+		t.Fatal("shadow should be removed after successful recovery upload")
 	}
 }

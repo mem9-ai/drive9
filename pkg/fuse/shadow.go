@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 // smallFileShadowThreshold is the maximum file size for cached I/O mode.
@@ -15,6 +17,9 @@ const smallFileShadowThreshold = 64 << 20 // 64MB
 // diskWatermarkBytes is the minimum free disk space before ShadowStore
 // refuses to stage new writes and logs a warning.
 const diskWatermarkBytes = 1 << 30 // 1GB
+
+// diskCheckInterval is the minimum time between disk space checks.
+const diskCheckInterval = 5 * time.Second
 
 // ShadowFile represents a per-path local shadow file with extent tracking.
 type ShadowFile struct {
@@ -37,6 +42,10 @@ type ShadowStore struct {
 	dir   string
 	mu    sync.RWMutex
 	files map[string]*ShadowFile // remote path → shadow file
+
+	// Throttled disk space check state (atomic for lock-free fast path).
+	lastDiskCheck atomic.Int64 // unix nano of last check
+	diskOK        atomic.Bool  // cached result of last check
 }
 
 // NewShadowStore creates a ShadowStore rooted at dir.
@@ -44,10 +53,12 @@ func NewShadowStore(dir string) (*ShadowStore, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("shadow store dir: %w", err)
 	}
-	return &ShadowStore{
+	ss := &ShadowStore{
 		dir:   dir,
 		files: make(map[string]*ShadowFile),
-	}, nil
+	}
+	ss.diskOK.Store(true)
+	return ss, nil
 }
 
 // shadowPath returns the filesystem path for a shadow file.
@@ -63,6 +74,23 @@ func (s *ShadowStore) CheckDiskSpace() bool {
 	}
 	avail := int64(stat.Bavail) * int64(stat.Bsize)
 	return avail >= diskWatermarkBytes
+}
+
+// CheckDiskSpaceThrottled returns the cached disk space result, refreshing at
+// most once per diskCheckInterval. Safe for hot-path use (lock-free fast path).
+func (s *ShadowStore) CheckDiskSpaceThrottled() bool {
+	now := time.Now().UnixNano()
+	last := s.lastDiskCheck.Load()
+	if now-last < int64(diskCheckInterval) {
+		return s.diskOK.Load()
+	}
+	// CAS to avoid concurrent syscalls.
+	if s.lastDiskCheck.CompareAndSwap(last, now) {
+		ok := s.CheckDiskSpace()
+		s.diskOK.Store(ok)
+		return ok
+	}
+	return s.diskOK.Load()
 }
 
 func (s *ShadowStore) ensureShadowFile(remotePath string, baseRev int64) (*ShadowFile, error) {

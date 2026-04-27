@@ -170,3 +170,26 @@ func TestShadowStoreCheckDiskSpace(t *testing.T) {
 	// Just verify the function doesn't panic.
 	_ = ss.CheckDiskSpace()
 }
+
+func TestShadowStoreCheckDiskSpaceThrottled(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// First call should run the real check and cache result.
+	r1 := ss.CheckDiskSpaceThrottled()
+
+	// Second call within the interval should return cached result without syscall.
+	r2 := ss.CheckDiskSpaceThrottled()
+	if r1 != r2 {
+		t.Fatalf("throttled results differ: %v vs %v", r1, r2)
+	}
+
+	// Verify initial diskOK state matches the real check.
+	if r1 != ss.CheckDiskSpace() {
+		t.Fatal("throttled result does not match real check")
+	}
+}
