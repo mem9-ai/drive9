@@ -2529,6 +2529,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		fs.inodes.UpdateSize(ino, int64(len(data)))
 		fs.notifyInode(ino)
 		parentIno, _ := fs.inodes.GetInode(parentDir(filePath))
+		fs.notifyEntry(parentIno, path.Base(filePath))
 		fs.notifyInode(parentIno)
 	})
 
@@ -2737,6 +2738,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	// Invalidate kernel attr/data cache for this inode and parent dir listing.
 	fs.notifyInode(fh.Ino)
 	parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
+	fs.notifyEntry(parentIno, path.Base(fh.Path))
 	fs.notifyInode(parentIno)
 	return gofuse.OK
 }
