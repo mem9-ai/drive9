@@ -62,6 +62,7 @@ func fsMountCmd(args []string) error {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
+	cacheDir := fs.String("cache-dir", "", "write-back cache directory (default ~/.cache/drive9)")
 	cacheSize := fs.Int("cache-size", 128, "read cache size in MB")
 	dirTTL := fs.Duration("dir-ttl", 10*time.Second, "directory cache TTL")
 	attrTTL := fs.Duration("attr-ttl", 10*time.Second, "kernel attr cache TTL")
@@ -122,6 +123,7 @@ func fsMountCmd(args []string) error {
 		APIKey:             *apiKey,
 		Token:              token,
 		MountPoint:         mountPoint,
+		CacheDir:           *cacheDir,
 		CacheSize:          int64(*cacheSize) << 20,
 		DirTTL:             *dirTTL,
 		AttrTTL:            *attrTTL,
