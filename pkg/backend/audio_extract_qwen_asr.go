@@ -14,6 +14,7 @@ import (
 
 // QwenASRAudioTextExtractorConfig configures Alibaba Cloud Model Studio
 // Qwen-ASR through DashScope's OpenAI-compatible chat/completions endpoint.
+// Reference: https://help.aliyun.com/zh/model-studio/qwen-asr-api-reference
 type QwenASRAudioTextExtractorConfig struct {
 	BaseURL string
 	APIKey  string
