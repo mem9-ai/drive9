@@ -1352,6 +1352,7 @@ func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
 			}
 			putCalls.Add(1)
 			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 8})
 		case http.MethodHead:
 			headCalls.Add(1)
 			http.Error(w, "unexpected post-flush HEAD", http.StatusInternalServerError)
@@ -1405,6 +1406,106 @@ func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
 	}
 	if entry.Revision != 8 {
 		t.Fatalf("inode revision = %d, want 8", entry.Revision)
+	}
+}
+
+func TestFlushHandle_SmallFile_SeedsReadCache(t *testing.T) {
+	var (
+		mu         sync.Mutex
+		handlerErr error
+		putCalls   atomic.Int32
+		getCalls   atomic.Int32
+		headCalls  atomic.Int32
+	)
+	recordHandlerErr := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+
+	content := []byte("hello freshness")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 2})
+		case http.MethodGet:
+			getCalls.Add(1)
+			recordHandlerErr(fmt.Errorf("unexpected GET after flush — should hit cache"))
+			w.Write(content)
+		case http.MethodHead:
+			headCalls.Add(1)
+			recordHandlerErr(fmt.Errorf("unexpected HEAD after flush — should hit cache"))
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	ino := fs.inodes.Lookup("/fresh.txt", false, int64(len(content)), time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	fs.inodes.UpdateSize(ino, int64(len(content)))
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/fresh.txt",
+		Dirty:   NewWriteBuffer("/fresh.txt", maxPreloadSize, 0),
+		BaseRev: 1,
+	}
+	if _, err := fh.Dirty.Write(0, content); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+
+	// Verify readCache was seeded with committed revision.
+	data, ok := fs.readCache.Get("/fresh.txt", 2)
+	if !ok {
+		t.Fatal("readCache miss after flush — freshness not seeded")
+	}
+	if string(data) != string(content) {
+		t.Fatalf("readCache content = %q, want %q", data, content)
+	}
+
+	// Verify no GET or HEAD was made (cache should serve reads).
+	mu.Lock()
+	err := handlerErr
+	mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := getCalls.Load(); got != 0 {
+		t.Fatalf("GET calls = %d, want 0", got)
+	}
+	if got := headCalls.Load(); got != 0 {
+		t.Fatalf("HEAD calls = %d, want 0", got)
+	}
+
+	// Verify inode revision updated to committed value.
+	if fh.BaseRev != 2 {
+		t.Fatalf("fh.BaseRev = %d, want 2", fh.BaseRev)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if entry.Revision != 2 {
+		t.Fatalf("inode revision = %d, want 2", entry.Revision)
 	}
 }
 
