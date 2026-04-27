@@ -344,6 +344,7 @@ environment:
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_QUOTA_SOURCE tenant|server quota enforcement source (default: tenant)
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
+
   S3 storage (set DRIVE9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DRIVE9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
   DRIVE9_S3_REGION   AWS region (default: us-east-1)
@@ -355,18 +356,21 @@ environment:
   DRIVE9_S3_SESSION_TOKEN static S3 session token (optional; requires DRIVE9_S3_ACCESS_KEY_ID and DRIVE9_S3_SECRET_ACCESS_KEY)
   DRIVE9_S3_ROLE_ARN IAM role ARN to assume via STS (optional)
   DRIVE9_S3_DIR      local s3 mock root directory (default: ./s3, only used without DRIVE9_S3_BUCKET)
+
   Query embedding (app-side semantic query embedding for grep):
   DRIVE9_QUERY_EMBED_API_BASE OpenAI-compatible base URL (optional)
   DRIVE9_QUERY_EMBED_API_KEY  API key for DRIVE9_QUERY_EMBED_API_BASE (optional)
   DRIVE9_QUERY_EMBED_MODEL    model name for query embedding (optional)
   DRIVE9_QUERY_EMBED_DIMENSIONS optional embedding dimensions override
   DRIVE9_QUERY_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
+
   Async semantic embedding worker:
   DRIVE9_EMBED_API_BASE OpenAI-compatible base URL for background embedding (optional)
   DRIVE9_EMBED_API_KEY  API key for DRIVE9_EMBED_API_BASE (optional)
   DRIVE9_EMBED_MODEL    model name for background embedding (optional)
   DRIVE9_EMBED_DIMENSIONS optional embedding dimensions override
   DRIVE9_EMBED_TIMEOUT_SECONDS embed request timeout seconds (default: 20)
+
   DRIVE9_SEMANTIC_WORKERS number of background workers (default: 1)
   DRIVE9_SEMANTIC_POLL_INTERVAL_MS worker poll interval in milliseconds (default: 200)
   DRIVE9_SEMANTIC_LEASE_SECONDS task lease duration in seconds (default: 30)
@@ -375,6 +379,7 @@ environment:
   DRIVE9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
   DRIVE9_SEMANTIC_TENANT_LIMIT active tenants scanned per round (default: 128)
   DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
+
   Image extraction (async image -> text for search):
   DRIVE9_IMAGE_EXTRACT_ENABLED true|false (default: false)
   DRIVE9_IMAGE_EXTRACT_QUEUE_SIZE buffered task queue size (default: 128)
@@ -387,11 +392,13 @@ environment:
   DRIVE9_IMAGE_EXTRACT_MODEL    model name for vision extraction (optional)
   DRIVE9_IMAGE_EXTRACT_PROMPT   custom extraction prompt (optional)
   DRIVE9_IMAGE_EXTRACT_MAX_TOKENS max model output tokens (default: 256)
+
   Audio extraction (async audio -> text for search; MVP durable path is TiDB auto-embedding only):
   Durable audio_extract_text tasks enqueue only for tenants with database auto-embedding
   (tidb_zero / tidb_cloud_starter). For db9-only or other app-managed tenants these vars do
   not enable that semantic_tasks pipeline. When enabled, explicit provider wiring is required:
   DRIVE9_AUDIO_EXTRACT_ENABLED true|false (default: false)
+  DRIVE9_AUDIO_EXTRACT_MODE     openai|qwen-asr (default: openai)
   DRIVE9_AUDIO_EXTRACT_MAX_BYTES max audio bytes processed per task (default: 33554432)
   DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS extractor timeout seconds (default: 120)
   DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES max transcript bytes stored in files.content_text (default: 8192)
@@ -536,6 +543,10 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	}
 
 	if envBool("DRIVE9_AUDIO_EXTRACT_ENABLED", false) {
+		audioMode := strings.ToLower(strings.TrimSpace(os.Getenv("DRIVE9_AUDIO_EXTRACT_MODE")))
+		if audioMode == "" {
+			audioMode = "openai"
+		}
 		audioBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_AUDIO_EXTRACT_API_BASE"))
 		audioAPIKey := strings.TrimSpace(os.Getenv("DRIVE9_AUDIO_EXTRACT_API_KEY"))
 		audioModel := strings.TrimSpace(os.Getenv("DRIVE9_AUDIO_EXTRACT_MODEL"))
@@ -544,17 +555,36 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 			return backend.Options{}, fmt.Errorf("DRIVE9_AUDIO_EXTRACT_API_BASE, DRIVE9_AUDIO_EXTRACT_API_KEY and DRIVE9_AUDIO_EXTRACT_MODEL must be set together when DRIVE9_AUDIO_EXTRACT_ENABLED=true")
 		}
 		audioTimeout := time.Duration(envInt("DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS", 120)) * time.Second
-		audioResponseFormat := strings.TrimSpace(os.Getenv("DRIVE9_AUDIO_EXTRACT_RESPONSE_FORMAT"))
-		audioExtractor, err := backend.NewOpenAIAudioTextExtractor(backend.OpenAIAudioTextExtractorConfig{
-			BaseURL:        audioBaseURL,
-			APIKey:         audioAPIKey,
-			Model:          audioModel,
-			Prompt:         audioPrompt,
-			ResponseFormat: audioResponseFormat,
-			Timeout:        audioTimeout,
-		})
-		if err != nil {
-			return backend.Options{}, fmt.Errorf("init audio extractor: %w", err)
+		var audioExtractor backend.AudioTextExtractor
+		switch audioMode {
+		case "openai":
+			audioResponseFormat := strings.TrimSpace(os.Getenv("DRIVE9_AUDIO_EXTRACT_RESPONSE_FORMAT"))
+			extractor, err := backend.NewOpenAIAudioTextExtractor(backend.OpenAIAudioTextExtractorConfig{
+				BaseURL:        audioBaseURL,
+				APIKey:         audioAPIKey,
+				Model:          audioModel,
+				Prompt:         audioPrompt,
+				ResponseFormat: audioResponseFormat,
+				Timeout:        audioTimeout,
+			})
+			if err != nil {
+				return backend.Options{}, fmt.Errorf("init openai audio extractor: %w", err)
+			}
+			audioExtractor = extractor
+		case "qwen-asr":
+			extractor, err := backend.NewQwenASRAudioTextExtractor(backend.QwenASRAudioTextExtractorConfig{
+				BaseURL: audioBaseURL,
+				APIKey:  audioAPIKey,
+				Model:   audioModel,
+				Prompt:  audioPrompt,
+				Timeout: audioTimeout,
+			})
+			if err != nil {
+				return backend.Options{}, fmt.Errorf("init qwen asr audio extractor: %w", err)
+			}
+			audioExtractor = extractor
+		default:
+			return backend.Options{}, fmt.Errorf("DRIVE9_AUDIO_EXTRACT_MODE must be %q or %q when DRIVE9_AUDIO_EXTRACT_ENABLED=true (got %q)", "openai", "qwen-asr", audioMode)
 		}
 		opts.AsyncAudioExtract = backend.AsyncAudioExtractOptions{
 			Enabled:             true,
@@ -563,8 +593,8 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 			MaxExtractTextBytes: envInt("DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES", 8<<10),
 			Extractor:           audioExtractor,
 		}
-		logger.Info(context.Background(), "audio_extract_mode_openai_compatible",
-			zap.String("model", audioModel), zap.String("base_url", audioBaseURL))
+		logger.Info(context.Background(), "audio_extract_mode_configured",
+			zap.String("mode", audioMode), zap.String("model", audioModel), zap.String("base_url", audioBaseURL))
 	}
 	return opts, nil
 }
