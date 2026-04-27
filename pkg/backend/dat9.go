@@ -334,6 +334,13 @@ func (b *Dat9Backend) WriteCtxIfRevision(ctx context.Context, path string, data 
 // - zero: path must not already exist
 // - positive: file must exist at exactly that revision
 func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (n int64, err error) {
+	n, _, err = b.WriteCtxIfRevisionWithTagsResult(ctx, path, data, offset, flags, expectedRevision, tags, description)
+	return n, err
+}
+
+// WriteCtxIfRevisionWithTagsResult is like WriteCtxIfRevisionWithTags but also
+// returns the committed revision of the file after a successful write.
+func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (n int64, committedRevision int64, err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, "write", err, start) }()
 
@@ -341,42 +348,46 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path strin
 
 	path, err = pathutil.Canonicalize(path)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	existing, err := b.store.Stat(ctx, path)
 	if err == datastore.ErrNotFound {
 		if expectedRevision > 0 {
-			return 0, datastore.ErrRevisionConflict
+			return 0, 0, datastore.ErrRevisionConflict
 		}
 		if flags&filesystem.WriteFlagCreate == 0 {
 			if expectedRevision == 0 {
-				return 0, datastore.ErrRevisionConflict
+				return 0, 0, datastore.ErrRevisionConflict
 			}
-			return 0, datastore.ErrNotFound
+			return 0, 0, datastore.ErrNotFound
 		}
 		n, err := b.createAndWriteCtx(ctx, path, data, tags, description)
 		if expectedRevision == 0 && errors.Is(err, datastore.ErrPathConflict) {
-			return 0, datastore.ErrRevisionConflict
+			return 0, 0, datastore.ErrRevisionConflict
 		}
-		return n, err
+		if err != nil {
+			return 0, 0, err
+		}
+		return n, 1, nil // create always produces revision 1
 	}
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if expectedRevision == 0 {
-		return 0, datastore.ErrRevisionConflict
+		return 0, 0, datastore.ErrRevisionConflict
 	}
 	if existing.Node.IsDirectory {
-		return 0, fmt.Errorf("is a directory: %s", path)
+		return 0, 0, fmt.Errorf("is a directory: %s", path)
 	}
 	if flags&filesystem.WriteFlagExclusive != 0 {
-		return 0, fmt.Errorf("file already exists: %s", path)
+		return 0, 0, fmt.Errorf("file already exists: %s", path)
 	}
 	if expectedRevision > 0 && (existing.File == nil || existing.File.Revision != expectedRevision) {
-		return 0, datastore.ErrRevisionConflict
+		return 0, 0, datastore.ErrRevisionConflict
 	}
-	return b.overwriteFileCtx(ctx, existing, data, offset, flags, expectedRevision, tags, description)
+	n, rev, err := b.overwriteFileCtxWithRev(ctx, existing, data, offset, flags, expectedRevision, tags, description)
+	return n, rev, err
 }
 
 func cloneFileTags(tags map[string]string) map[string]string {
@@ -475,16 +486,16 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	return int64(len(data)), nil
 }
 
-func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (int64, error) {
+func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (int64, int64, error) {
 	if nf.File == nil {
-		return 0, fmt.Errorf("no file entity")
+		return 0, 0, fmt.Errorf("no file entity")
 	}
 
 	var finalData []byte
 	if flags&filesystem.WriteFlagAppend != 0 {
 		existing, err := b.readFileDataCtx(ctx, nf.File)
 		if err != nil {
-			return 0, fmt.Errorf("read existing data for append: %w", err)
+			return 0, 0, fmt.Errorf("read existing data for append: %w", err)
 		}
 		finalData = append(existing, data...)
 	} else if flags&filesystem.WriteFlagTruncate != 0 || offset <= 0 {
@@ -492,7 +503,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 	} else {
 		existing, err := b.readFileDataCtx(ctx, nf.File)
 		if err != nil {
-			return 0, fmt.Errorf("read existing data for offset write: %w", err)
+			return 0, 0, fmt.Errorf("read existing data for offset write: %w", err)
 		}
 		if offset > int64(len(existing)) {
 			existing = append(existing, make([]byte, offset-int64(len(existing)))...)
@@ -505,7 +516,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 	}
 
 	if err := b.ensureUploadSizeAllowed(int64(len(finalData))); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	contentType := detectContentType(nf.Node.Path, finalData)
 	checksum := sha256sum(finalData)
@@ -517,13 +528,13 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		contentBlob = append([]byte(nil), finalData...)
 	} else {
 		if b.s3 == nil {
-			return 0, fmt.Errorf("s3 client not configured")
+			return 0, 0, fmt.Errorf("s3 client not configured")
 		}
 		storageType = datastore.StorageS3
 		storageRef = "blobs/" + b.genID()
 		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(finalData), int64(len(finalData))); err != nil {
 			logger.Error(ctx, "backend_overwrite_put_object_failed", zap.String("path", nf.Node.Path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(finalData)), zap.Error(err))
-			return 0, fmt.Errorf("put object: %w", err)
+			return 0, 0, fmt.Errorf("put object: %w", err)
 		}
 	}
 
@@ -578,7 +589,7 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 		if storageType == datastore.StorageS3 {
 			b.deleteBlobCtx(ctx, storageRef)
 		}
-		return 0, err
+		return 0, 0, err
 	}
 	b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
 	b.deleteBlobIfS3Ctx(ctx, nf.File.StorageType, nf.File.StorageRef, storageRef)
@@ -586,10 +597,10 @@ func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWi
 	// backend-owned image queue until its image task flow also moves to
 	// semantic_tasks.
 	if b.UsesDatabaseAutoEmbedding() {
-		return int64(len(data)), nil
+		return int64(len(data)), newRev, nil
 	}
 	b.enqueueImageExtract(nf.File.FileID, nf.Node.Path, contentType, newRev)
-	return int64(len(data)), nil
+	return int64(len(data)), newRev, nil
 }
 
 func (b *Dat9Backend) ReadDir(path string) ([]filesystem.FileInfo, error) {

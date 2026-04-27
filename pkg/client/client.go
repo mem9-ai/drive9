@@ -314,29 +314,48 @@ func (c *Client) WriteCtxConditionalWithDescription(ctx context.Context, path st
 }
 
 func (c *Client) writeCtxConditionalWithTagsAndDescription(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string) error {
+	_, err := c.writeCtxConditionalFull(ctx, path, data, expectedRevision, tags, description)
+	return err
+}
+
+// WriteCtxConditionalWithRevision is like WriteCtxConditional but also returns
+// the committed revision from the server response.
+func (c *Client) WriteCtxConditionalWithRevision(ctx context.Context, path string, data []byte, expectedRevision int64) (int64, error) {
+	return c.writeCtxConditionalFull(ctx, path, data, expectedRevision, nil, "")
+}
+
+func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	if expectedRevision >= 0 {
 		req.Header.Set("X-Dat9-Expected-Revision", strconv.FormatInt(expectedRevision, 10))
 	}
 	if err := setTagHeaders(req, tags); err != nil {
-		return err
+		return 0, err
 	}
 	if description != "" {
 		req.Header.Set("X-Dat9-Description", description)
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
-		return readError(resp)
+		return 0, readError(resp)
 	}
-	return nil
+	// Parse committed revision from response body.
+	var result struct {
+		Revision int64 `json:"revision"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		// If response doesn't contain revision (old server), return 0.
+		return 0, nil
+	}
+	return result.Revision, nil
 }
 
 // Read downloads a file's content.
