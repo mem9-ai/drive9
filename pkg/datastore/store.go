@@ -812,6 +812,40 @@ func (s *Store) StatLite(ctx context.Context, path string) (out *NodeWithFile, e
 	return out, err
 }
 
+// StatForRead fetches the minimal fields needed to serve a GET request in a
+// single pass: storage_type, storage_ref, content_blob (for db9), size_bytes,
+// revision, and confirmed_at. This avoids the two-stat pattern of
+// PresignGetObject-then-ReadCtx.
+func (s *Store) StatForRead(ctx context.Context, path string) (out *NodeWithFile, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "stat_for_read", start, &err)
+
+	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
+		f.file_id, f.storage_type, f.storage_ref, f.content_blob, f.size_bytes, f.revision, f.status, f.created_at, f.confirmed_at
+		FROM file_nodes fn
+		LEFT JOIN files f ON fn.file_id = f.file_id AND fn.is_directory = 0 AND f.status = 'CONFIRMED'
+		WHERE fn.path = ?
+		LIMIT 1`, path)
+	out, err = scanNodeWithFileForRead(row)
+	return out, err
+}
+
+// StatPathFallbackForRead is like StatForRead but with primary/fallback path resolution.
+func (s *Store) StatPathFallbackForRead(ctx context.Context, primaryPath, fallbackPath string) (out *NodeWithFile, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "stat_path_fallback_for_read", start, &err)
+
+	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
+		f.file_id, f.storage_type, f.storage_ref, f.content_blob, f.size_bytes, f.revision, f.status, f.created_at, f.confirmed_at
+		FROM file_nodes fn
+		LEFT JOIN files f ON fn.file_id = f.file_id AND fn.is_directory = 0 AND f.status = 'CONFIRMED'
+		WHERE fn.path = ? OR fn.path = ?
+		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
+		LIMIT 1`, primaryPath, fallbackPath, primaryPath)
+	out, err = scanNodeWithFileForRead(row)
+	return out, err
+}
+
 func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWithFile, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "list_dir", start, &err)
@@ -1326,6 +1360,57 @@ func scanNodeWithFileWithBlob(s scanner) (*NodeWithFile, error) {
 		if fExpiresAt.Valid {
 			t := fExpiresAt.Time.UTC()
 			nf.File.ExpiresAt = &t
+		}
+	}
+	return nf, nil
+}
+
+// scanNodeWithFileForRead scans the result set for ReadPlan: node fields +
+// file_id, storage_type, storage_ref, content_blob, size_bytes, revision,
+// status, created_at, confirmed_at. Includes blob for db9 inline reads but
+// excludes content_text, description, embedding columns.
+func scanNodeWithFileForRead(s scanner) (*NodeWithFile, error) {
+	var n FileNode
+	var isDir int
+	var nodeFileID sql.NullString
+	var nodeCreatedAt time.Time
+
+	var fFileID, fStorageType, fStorageRef sql.NullString
+	var fContentBlob []byte
+	var fSizeBytes, fRevision sql.NullInt64
+	var fStatus sql.NullString
+	var fCreatedAt, fConfirmedAt sql.NullTime
+
+	err := s.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
+		&fFileID, &fStorageType, &fStorageRef, &fContentBlob, &fSizeBytes, &fRevision, &fStatus, &fCreatedAt, &fConfirmedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+
+	n.IsDirectory = isDir != 0
+	n.FileID = nodeFileID.String
+	n.CreatedAt = nodeCreatedAt.UTC()
+
+	nf := &NodeWithFile{Node: n}
+	if fFileID.Valid {
+		nf.File = &File{
+			FileID:      fFileID.String,
+			StorageType: StorageType(fStorageType.String),
+			StorageRef:  fStorageRef.String,
+			ContentBlob: append([]byte(nil), fContentBlob...),
+			SizeBytes:   fSizeBytes.Int64,
+			Revision:    fRevision.Int64,
+			Status:      FileStatus(fStatus.String),
+		}
+		if fCreatedAt.Valid {
+			nf.File.CreatedAt = fCreatedAt.Time.UTC()
+		}
+		if fConfirmedAt.Valid {
+			t := fConfirmedAt.Time.UTC()
+			nf.File.ConfirmedAt = &t
 		}
 	}
 	return nf, nil

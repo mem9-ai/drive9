@@ -660,6 +660,68 @@ func (b *Dat9Backend) StatNodeLiteCtx(ctx context.Context, path string) (*datast
 	return b.store.StatPathFallbackLite(ctx, resolvedPath, dirPath)
 }
 
+// ReadPlan describes how to serve a GET request after a single metadata query.
+type ReadPlan struct {
+	// InlineData is non-nil for db9-stored files — the body to return directly.
+	InlineData []byte
+	// PresignURL is non-empty for S3-stored files — the 302 redirect target.
+	PresignURL string
+	// Size is the file size in bytes.
+	Size int64
+}
+
+// ReadPlanCtx resolves a file path into a ReadPlan with a single metadata query.
+// For db9 inline files: returns InlineData (no second stat needed).
+// For S3 files: uses the storage_ref from the same query to presign, returns PresignURL.
+func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (*ReadPlan, error) {
+	resolvedPath := normalizePath(path)
+	var nf *datastore.NodeWithFile
+	var err error
+
+	if pathutil.IsDir(path) {
+		nf, err = b.store.StatForRead(ctx, resolvedPath)
+	} else {
+		dirPath, dirErr := pathutil.CanonicalizeDir(path)
+		if dirErr != nil || dirPath == resolvedPath {
+			nf, err = b.store.StatForRead(ctx, resolvedPath)
+		} else {
+			nf, err = b.store.StatPathFallbackForRead(ctx, resolvedPath, dirPath)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if nf.Node.IsDirectory {
+		return nil, fmt.Errorf("is a directory: %s", resolvedPath)
+	}
+	if nf.File == nil {
+		return nil, fmt.Errorf("no file entity for path: %s", resolvedPath)
+	}
+
+	switch nf.File.StorageType {
+	case datastore.StorageDB9:
+		return &ReadPlan{
+			InlineData: nf.File.ContentBlob,
+			Size:       nf.File.SizeBytes,
+		}, nil
+	case datastore.StorageS3:
+		if b.s3 == nil {
+			return nil, ErrS3NotConfigured
+		}
+		url, err := b.s3.PresignGetObject(ctx, nf.File.StorageRef, s3client.DownloadTTL)
+		if err != nil {
+			logger.Error(ctx, "backend_read_plan_presign_failed", zap.String("path", resolvedPath), zap.Error(err))
+			return nil, err
+		}
+		return &ReadPlan{
+			PresignURL: url,
+			Size:       nf.File.SizeBytes,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported storage type for read plan: %s", nf.File.StorageType)
+	}
+}
+
 func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
 	ctx := backgroundWithTrace()
 	nf, err := b.StatNodeCtx(ctx, path)

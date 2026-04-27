@@ -209,6 +209,50 @@ func TestStatPathFallbackLite(t *testing.T) {
 	}
 }
 
+func TestStatForRead(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.InsertFile(ctx, &File{
+		FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		ContentBlob: []byte("inline data here"), SizeBytes: 16, Revision: 5,
+		Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/read.txt", ParentPath: "/", Name: "read.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	nf, err := s.StatForRead(ctx, "/read.txt")
+	if err != nil {
+		t.Fatalf("StatForRead: %v", err)
+	}
+	if nf.File == nil {
+		t.Fatal("file is nil")
+	}
+	// StatForRead MUST return storage_type + content_blob for inline reads.
+	if nf.File.StorageType != StorageDB9 {
+		t.Fatalf("storage_type=%q, want db9", nf.File.StorageType)
+	}
+	if string(nf.File.ContentBlob) != "inline data here" {
+		t.Fatalf("content_blob=%q, want 'inline data here'", nf.File.ContentBlob)
+	}
+	if nf.File.SizeBytes != 16 {
+		t.Fatalf("size=%d, want 16", nf.File.SizeBytes)
+	}
+	if nf.File.Revision != 5 {
+		t.Fatalf("revision=%d, want 5", nf.File.Revision)
+	}
+	// But it should NOT return text/description/embedding fields.
+	if nf.File.ContentText != "" {
+		t.Fatalf("ContentText should be empty, got %q", nf.File.ContentText)
+	}
+	if nf.File.Description != "" {
+		t.Fatalf("Description should be empty, got %q", nf.File.Description)
+	}
+}
+
 func TestListDir(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()

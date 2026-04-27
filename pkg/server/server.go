@@ -491,17 +491,10 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	if b.S3() != nil {
-		url, err := b.PresignGetObject(r.Context(), path)
-		if err == nil {
-			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_presigned_redirect", "path", path)...)
-			metricEvent(r.Context(), "fs_read", "result", "ok")
-			http.Redirect(w, r, url, http.StatusFound)
-			return
-		}
-	}
 
-	data, err := b.ReadCtx(r.Context(), path, 0, -1)
+	// Single-pass read plan: one metadata query routes to either inline
+	// response (db9) or presigned redirect (S3). No fallback double-stat.
+	plan, err := b.ReadPlanCtx(r.Context(), path)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "read_not_found", "path", path)...)
@@ -514,11 +507,19 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_ok", "path", path, "bytes", len(data))...)
+
+	if plan.PresignURL != "" {
+		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_presigned_redirect", "path", path)...)
+		metricEvent(r.Context(), "fs_read", "result", "ok")
+		http.Redirect(w, r, plan.PresignURL, http.StatusFound)
+		return
+	}
+
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_ok", "path", path, "bytes", len(plan.InlineData))...)
 	metricEvent(r.Context(), "fs_read", "result", "ok")
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	_, _ = w.Write(data)
+	w.Header().Set("Content-Length", strconv.Itoa(len(plan.InlineData)))
+	_, _ = w.Write(plan.InlineData)
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string) {
