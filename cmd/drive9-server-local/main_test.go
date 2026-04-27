@@ -481,6 +481,63 @@ func TestBuildBackendOptionsFromEnvAudioOpenAI(t *testing.T) {
 	}
 }
 
+func TestBuildBackendOptionsFromEnvAudioQwenASR(t *testing.T) {
+	keys := []string{
+		"DRIVE9_QUERY_EMBED_API_BASE",
+		"DRIVE9_QUERY_EMBED_API_KEY",
+		"DRIVE9_QUERY_EMBED_MODEL",
+		"DRIVE9_IMAGE_EXTRACT_ENABLED",
+		envAudioExtractEnabled,
+		envAudioExtractMode,
+		envAudioExtractAPIBase,
+		envAudioExtractAPIKey,
+		envAudioExtractModel,
+		envAudioExtractPrompt,
+		envAudioExtractTimeoutSeconds,
+		envAudioExtractMaxBytes,
+		envAudioExtractMaxTextBytes,
+	}
+	prev := make(map[string]string, len(keys))
+	for _, k := range keys {
+		prev[k] = os.Getenv(k)
+	}
+	t.Cleanup(func() {
+		for _, k := range keys {
+			if prev[k] == "" {
+				_ = os.Unsetenv(k)
+			} else {
+				_ = os.Setenv(k, prev[k])
+			}
+		}
+	})
+	for _, k := range keys {
+		_ = os.Unsetenv(k)
+	}
+
+	if err := os.Setenv(envAudioExtractEnabled, "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envAudioExtractMode, "qwen-asr"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envAudioExtractAPIBase, "https://dashscope.aliyuncs.com/compatible-mode/v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envAudioExtractAPIKey, "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv(envAudioExtractModel, "qwen3-asr-flash"); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := buildBackendOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildBackendOptionsFromEnv: %v", err)
+	}
+	if !backend.AsyncAudioExtractWillWireRuntime(opts.AsyncAudioExtract) {
+		t.Fatalf("expected async audio in backend options, got %+v", opts.AsyncAudioExtract)
+	}
+}
+
 func TestLocalStubAudioTextExtractorTranscript(t *testing.T) {
 	var ex localStubAudioTextExtractor
 	got, _, err := ex.ExtractAudioText(context.Background(), backend.AudioExtractRequest{Path: "/audio/clip.mp3"})

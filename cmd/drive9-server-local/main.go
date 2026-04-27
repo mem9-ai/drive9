@@ -384,14 +384,14 @@ environment:
 
   Async audio transcript extract (TiDB auto-embedding durable tasks):
   DRIVE9_AUDIO_EXTRACT_ENABLED true|false (default: false)
-  DRIVE9_AUDIO_EXTRACT_MODE stub|openai (required when enabled)
+  DRIVE9_AUDIO_EXTRACT_MODE stub|openai|qwen-asr (required when enabled)
   DRIVE9_AUDIO_EXTRACT_MAX_BYTES max audio bytes per task (optional; backend default when unset)
   DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS extractor timeout seconds (optional; backend default when unset)
   DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES max transcript bytes stored in files.content_text (optional; backend default when unset)
-  DRIVE9_AUDIO_EXTRACT_API_BASE OpenAI-compatible base URL (required for openai mode)
-  DRIVE9_AUDIO_EXTRACT_API_KEY  API key for DRIVE9_AUDIO_EXTRACT_API_BASE (required for openai mode)
-  DRIVE9_AUDIO_EXTRACT_MODEL    model name for audio transcription (required for openai mode)
-  DRIVE9_AUDIO_EXTRACT_PROMPT   optional provider prompt for transcription (openai mode)
+  DRIVE9_AUDIO_EXTRACT_API_BASE OpenAI-compatible base URL (required for openai/qwen-asr mode)
+  DRIVE9_AUDIO_EXTRACT_API_KEY  API key for DRIVE9_AUDIO_EXTRACT_API_BASE (required for openai/qwen-asr mode)
+  DRIVE9_AUDIO_EXTRACT_MODEL    model name for audio transcription (required for openai/qwen-asr mode)
+  DRIVE9_AUDIO_EXTRACT_PROMPT   optional provider prompt for transcription (openai/qwen-asr mode)
 `)
 	os.Exit(2)
 }
