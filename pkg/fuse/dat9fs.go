@@ -2497,7 +2497,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		}
 
 		dCtx, dCf := context.WithTimeout(context.Background(), fuseTimeout)
-		err := fs.client.WriteCtxConditional(dCtx, filePath, data, expectedRevision)
+		committedRev, err := fs.client.WriteCtxConditionalWithRevision(dCtx, filePath, data, expectedRevision)
 		dCf()
 		if err != nil {
 			handle.Unlock()
@@ -2506,16 +2506,30 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		}
 		// The handle stays locked across upload + finalize so concurrent writes
 		// cannot advance live state for data outside this committed snapshot.
-		fs.finalizeHandleFlushLocked(handle, expectedRevision)
+		if committedRev > 0 {
+			handle.IsNew = false
+			handle.BaseRev = committedRev
+			fs.inodes.UpdateRevision(ino, committedRev)
+			if handle.ZeroBase && handle.Dirty != nil && handle.Dirty.Size() > 0 {
+				handle.ZeroBase = false
+			}
+		} else {
+			fs.finalizeHandleFlushLocked(handle, expectedRevision)
+		}
 		if handle.Dirty != nil && handle.DirtySeq == snapshotSeq {
 			handle.Dirty.ClearDirty()
 		}
 		handle.Unlock()
-		fs.readCache.Invalidate(filePath)
+		if committedRev > 0 {
+			fs.readCache.Put(filePath, data, committedRev)
+		} else {
+			fs.readCache.Invalidate(filePath)
+		}
 		fs.dirCache.Invalidate(parentDir(filePath))
 		fs.inodes.UpdateSize(ino, int64(len(data)))
 		fs.notifyInode(ino)
 		parentIno, _ := fs.inodes.GetInode(parentDir(filePath))
+		fs.notifyEntry(parentIno, path.Base(filePath))
 		fs.notifyInode(parentIno)
 	})
 
@@ -2654,10 +2668,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	// Path 2: No streaming uploader or small file — materialize all data for upload.
 	data := fh.Dirty.Bytes()
 	expectedRevision := expectedRevisionForHandle(fh)
+	var committedRev int64
 
 	if size < smallFileThreshold {
-		// Small file: direct PUT.
-		err = fs.client.WriteCtxConditional(ctx, fh.Path, data, expectedRevision)
+		// Small file: direct PUT with revision return for freshness seeding.
+		committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fh.Path, data, expectedRevision)
 	} else if fh.OrigSize >= smallFileThreshold {
 		dirtyParts := fh.Dirty.DirtyPartNumbers()
 		if len(dirtyParts) > 0 {
@@ -2706,13 +2721,24 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	fh.Dirty.ClearDirty()
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 	fh.DirtySeq = 0
-	fs.readCache.Invalidate(fh.Path)
+	if committedRev > 0 {
+		fs.readCache.Put(fh.Path, data, committedRev)
+		fh.IsNew = false
+		fh.BaseRev = committedRev
+		fs.inodes.UpdateRevision(fh.Ino, committedRev)
+		if fh.ZeroBase && fh.Dirty != nil && fh.Dirty.Size() > 0 {
+			fh.ZeroBase = false
+		}
+	} else {
+		fs.readCache.Invalidate(fh.Path)
+		fs.finalizeHandleFlushLocked(fh, expectedRevision)
+	}
 	fs.dirCache.Invalidate(parentDir(fh.Path))
 	fs.inodes.UpdateSize(fh.Ino, size)
-	fs.finalizeHandleFlushLocked(fh, expectedRevision)
 	// Invalidate kernel attr/data cache for this inode and parent dir listing.
 	fs.notifyInode(fh.Ino)
 	parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
+	fs.notifyEntry(parentIno, path.Base(fh.Path))
 	fs.notifyInode(parentIno)
 	return gofuse.OK
 }

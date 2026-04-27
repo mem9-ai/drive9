@@ -106,6 +106,51 @@ func TestWriteAndRead(t *testing.T) {
 	}
 }
 
+func TestWriteReturnsCommittedRevision(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Create a new file — revision should be 1.
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/rev.txt", strings.NewReader("v1"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("create: status %d, body %s", resp.StatusCode, body)
+	}
+	var result struct {
+		Revision int64 `json:"revision"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("unmarshal create response: %v (body: %s)", err, body)
+	}
+	if result.Revision != 1 {
+		t.Fatalf("create revision = %d, want 1", result.Revision)
+	}
+
+	// Overwrite the file — revision should increment to 2.
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/rev.txt", strings.NewReader("v2"))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("overwrite: status %d, body %s", resp.StatusCode, body)
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("unmarshal overwrite response: %v (body: %s)", err, body)
+	}
+	if result.Revision != 2 {
+		t.Fatalf("overwrite revision = %d, want 2", result.Revision)
+	}
+}
+
 func TestReadInlineNoRedirect(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)

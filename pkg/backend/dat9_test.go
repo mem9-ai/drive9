@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -59,6 +60,35 @@ func TestCreateAndStat(t *testing.T) {
 	}
 	if info.Name != "hello.txt" || info.IsDir || info.Size != 0 {
 		t.Errorf("unexpected: %+v", info)
+	}
+}
+
+func TestWriteCtxIfRevisionWithTagsResult_ReturnsCommittedRevision(t *testing.T) {
+	b := newTestBackend(t)
+	ctx := context.Background()
+
+	// Create: committed revision should be 1.
+	n, rev, err := b.WriteCtxIfRevisionWithTagsResult(ctx, "/rev-test.txt", []byte("v1"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, -1, nil, "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("create bytes = %d, want 2", n)
+	}
+	if rev != 1 {
+		t.Fatalf("create revision = %d, want 1", rev)
+	}
+
+	// Overwrite with CAS revision 1: committed revision should be 2.
+	n, rev, err = b.WriteCtxIfRevisionWithTagsResult(ctx, "/rev-test.txt", []byte("v2"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, 1, nil, "")
+	if err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("overwrite bytes = %d, want 2", n)
+	}
+	if rev != 2 {
+		t.Fatalf("overwrite revision = %d, want 2", rev)
 	}
 }
 
