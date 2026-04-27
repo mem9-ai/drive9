@@ -1019,7 +1019,32 @@ func TestPrefetcher_SubBlockReads(t *testing.T) {
 // TestPrefetcher_ChunkCapBound verifies that chunk count never exceeds
 // prefetchMaxBlocks, even with tiny readSize and large window.
 func TestPrefetcher_ChunkCapBound(t *testing.T) {
-	p := NewPrefetcher(nil, "/test.bin", 100*1024*1024) // 100MB file, no client
+	fileSize := int64(100 * 1024 * 1024) // 100MB
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			rangeHeader := r.Header.Get("Range")
+			if rangeHeader != "" {
+				var start, end int64
+				_, _ = fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
+				if end >= fileSize {
+					end = fileSize - 1
+				}
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fileSize))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(make([]byte, end-start+1))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	c := client.New(ts.URL, "")
+	p := NewPrefetcher(c, "/test.bin", fileSize)
 	defer p.Close()
 
 	// Simulate small reads to set readSize = 4KB
@@ -1028,8 +1053,7 @@ func TestPrefetcher_ChunkCapBound(t *testing.T) {
 	p.window = prefetchMaxWindow // 16MB
 	p.mu.Unlock()
 
-	// Trigger OnRead to start a prefetch (will be a no-op since client is nil,
-	// but we can directly call startPrefetch to test the cap).
+	// startPrefetch with a real client — chunks are actually created.
 	p.mu.Lock()
 	p.startPrefetch(0, prefetchMaxWindow)
 	cacheSize := len(p.cache)
@@ -1037,6 +1061,9 @@ func TestPrefetcher_ChunkCapBound(t *testing.T) {
 
 	if cacheSize > prefetchMaxBlocks {
 		t.Fatalf("cache size = %d after startPrefetch, want <= %d (prefetchMaxBlocks)", cacheSize, prefetchMaxBlocks)
+	}
+	if cacheSize == 0 {
+		t.Fatal("cache size = 0, startPrefetch did not create any chunks (test is vacuous)")
 	}
 }
 
