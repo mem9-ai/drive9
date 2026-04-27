@@ -673,29 +673,22 @@ type ReadPlan struct {
 // ReadPlanCtx resolves a file path into a ReadPlan with a single metadata query.
 // For db9 inline files: returns InlineData (no second stat needed).
 // For S3 files: uses the storage_ref from the same query to presign, returns PresignURL.
+// Only resolves file-form paths (no directory fallback) to maintain GET /dir → 404 behavior.
 func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (*ReadPlan, error) {
-	resolvedPath := normalizePath(path)
-	var nf *datastore.NodeWithFile
-	var err error
-
-	if pathutil.IsDir(path) {
-		nf, err = b.store.StatForRead(ctx, resolvedPath)
-	} else {
-		dirPath, dirErr := pathutil.CanonicalizeDir(path)
-		if dirErr != nil || dirPath == resolvedPath {
-			nf, err = b.store.StatForRead(ctx, resolvedPath)
-		} else {
-			nf, err = b.store.StatPathFallbackForRead(ctx, resolvedPath, dirPath)
-		}
+	resolvedPath, err := pathutil.Canonicalize(path)
+	if err != nil {
+		return nil, err
 	}
+
+	nf, err := b.store.StatForRead(ctx, resolvedPath)
 	if err != nil {
 		return nil, err
 	}
 	if nf.Node.IsDirectory {
-		return nil, fmt.Errorf("is a directory: %s", resolvedPath)
+		return nil, datastore.ErrNotFound
 	}
 	if nf.File == nil {
-		return nil, fmt.Errorf("no file entity for path: %s", resolvedPath)
+		return nil, datastore.ErrNotFound
 	}
 
 	switch nf.File.StorageType {
