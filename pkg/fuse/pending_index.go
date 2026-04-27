@@ -79,15 +79,27 @@ func (idx *PendingIndex) Put(remotePath string, size int64, kind PendingKind) (u
 // PutWithBaseRev stores metadata for the given path together with the base
 // revision observed when the local edit session started.
 func (idx *PendingIndex) PutWithBaseRev(remotePath string, size int64, kind PendingKind, baseRev int64) (uint64, error) {
+	return idx.putInternal(remotePath, size, kind, baseRev, false)
+}
+
+// PutShadowSpill is like PutWithBaseRev but marks the entry as ShadowSpill
+// so that crash recovery (RecoverPending) reconstructs it with the correct
+// upload path (streaming from shadow, not full-memory ReadAll).
+func (idx *PendingIndex) PutShadowSpill(remotePath string, size int64, kind PendingKind, baseRev int64) (uint64, error) {
+	return idx.putInternal(remotePath, size, kind, baseRev, true)
+}
+
+func (idx *PendingIndex) putInternal(remotePath string, size int64, kind PendingKind, baseRev int64, shadowSpill bool) (uint64, error) {
 	gen := idx.nextGen.Add(1)
 	meta := &WriteBackMeta{
-		Path:       remotePath,
-		Size:       size,
-		Mtime:      time.Now(),
-		CreatedAt:  time.Now(),
-		Generation: gen,
-		Kind:       kind,
-		BaseRev:    baseRev,
+		Path:        remotePath,
+		Size:        size,
+		Mtime:       time.Now(),
+		CreatedAt:   time.Now(),
+		Generation:  gen,
+		Kind:        kind,
+		BaseRev:     baseRev,
+		ShadowSpill: shadowSpill,
 	}
 
 	// Write to disk first for durability.

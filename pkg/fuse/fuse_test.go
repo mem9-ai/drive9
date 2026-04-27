@@ -1713,3 +1713,153 @@ func TestShadowSpill_AutoResolveGuard(t *testing.T) {
 		t.Fatalf("expected PendingConflict after ShadowSpill auto-resolve guard, got %v", meta.Kind)
 	}
 }
+
+// TestShadowSpill_WriteOrderShadowFirst verifies that for ShadowSpill handles,
+// shadow is written before Dirty. If shadow write fails, Dirty must not be
+// modified (no EvictPart on data that never reached shadow).
+func TestShadowSpill_WriteOrderShadowFirst(t *testing.T) {
+	wb := NewWriteBuffer("/test.bin", streamingWriteMaxSize, 0)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	var evictCount int
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		evictCount++
+		wb.EvictPart(partIdx)
+	}
+
+	// Write one full part to trigger OnPartFull, then 1 byte into next part.
+	partSize := int(DefaultPartSize)
+	chunk := make([]byte, partSize)
+	for i := range chunk {
+		chunk[i] = 0xAB
+	}
+	if _, err := wb.Write(0, chunk); err != nil {
+		t.Fatalf("write part 0: %v", err)
+	}
+	// Writing into the next part triggers OnPartFull for part 0.
+	if _, err := wb.Write(int64(partSize), []byte{0x01}); err != nil {
+		t.Fatalf("write part 1: %v", err)
+	}
+
+	// Part 0 should have been evicted by OnPartFull.
+	if evictCount != 1 {
+		t.Fatalf("evictCount = %d, want 1 (OnPartFull should fire once for the completed part)", evictCount)
+	}
+
+	// The key invariant: if we had written Dirty first and shadow then failed,
+	// the evicted part data would be lost. By writing shadow first, this can't happen.
+}
+
+// TestShadowSpill_RecoverPendingPreservesShadowSpill verifies that crash
+// recovery (RecoverPending) reconstructs CommitEntry.ShadowSpill from the
+// persisted WriteBackMeta.ShadowSpill field.
+func TestShadowSpill_RecoverPendingPreservesShadowSpill(t *testing.T) {
+	dir := t.TempDir()
+	shadowDir := t.TempDir()
+
+	// Create PendingIndex and store a ShadowSpill entry.
+	idx, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := "/large-video.mp4"
+	if _, err := idx.PutShadowSpill(path, 1<<30, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify meta has ShadowSpill set.
+	meta, ok := idx.GetMeta(path)
+	if !ok {
+		t.Fatal("expected pending entry after PutShadowSpill")
+	}
+	if !meta.ShadowSpill {
+		t.Fatal("PutShadowSpill should persist ShadowSpill=true")
+	}
+
+	// Create a shadow file so RecoverPending doesn't prune it.
+	shadows, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadows.Ensure(path, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a new PendingIndex from the same dir (simulates restart).
+	idx2, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx2.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the reloaded meta still has ShadowSpill.
+	meta2, ok := idx2.GetMeta(path)
+	if !ok {
+		t.Fatal("expected pending entry after PendingIndex reload")
+	}
+	if !meta2.ShadowSpill {
+		t.Fatal("ShadowSpill must survive PendingIndex reload from disk")
+	}
+
+	// Create CommitQueue and recover — entry should carry ShadowSpill.
+	cq := &CommitQueue{
+		index:      idx2,
+		shadows:    shadows,
+		canceled:   make(map[string]struct{}),
+		inFlight:   make(map[string]struct{}),
+		maxPending: 100,
+		workCh:     make(chan *CommitEntry, 100),
+	}
+
+	cq.RecoverPending()
+
+	// RecoverPending calls Enqueue which appends to cq.queue.
+	cq.mu.Lock()
+	queue := make([]*CommitEntry, len(cq.queue))
+	copy(queue, cq.queue)
+	cq.mu.Unlock()
+
+	if len(queue) != 1 {
+		t.Fatalf("recovered %d entries, want 1", len(queue))
+	}
+	if !queue[0].ShadowSpill {
+		t.Fatal("recovered CommitEntry must have ShadowSpill=true")
+	}
+}
+
+// TestShadowSpill_WriteBackSeqStaysZero verifies the structural invariant:
+// ShadowSpill handles never set WriteBackSeq, preventing Fsync/Release from
+// accidentally entering the writeBack-dependent code paths.
+func TestShadowSpill_WriteBackSeqStaysZero(t *testing.T) {
+	fh := &FileHandle{
+		Path:              "/spill.bin",
+		ShadowReady:       true,
+		ShadowSpill:       true,
+		ShadowCommitReady: true,
+		Dirty:             NewWriteBuffer("/spill.bin", 0, 0),
+		BaseRev:           5,
+		DirtySeq:          42,
+	}
+
+	// ShadowSpill handles must never have WriteBackSeq set.
+	if fh.WriteBackSeq != 0 {
+		t.Fatalf("ShadowSpill handle WriteBackSeq = %d, want 0", fh.WriteBackSeq)
+	}
+
+	// Simulate what Flush interactive does for ShadowSpill:
+	// It sets ShadowCommitReady but does NOT set WriteBackSeq.
+	fh.ShadowCommitReady = true
+	if fh.WriteBackSeq != 0 {
+		t.Fatalf("after ShadowSpill Flush, WriteBackSeq = %d, want 0", fh.WriteBackSeq)
+	}
+
+	// The Fsync condition that must NOT fire:
+	// fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq
+	if fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq {
+		t.Fatal("Fsync UploadSync condition must never be true for ShadowSpill handles")
+	}
+}

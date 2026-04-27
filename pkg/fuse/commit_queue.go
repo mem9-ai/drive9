@@ -150,10 +150,11 @@ func (cq *CommitQueue) RecoverPending() {
 			continue
 		}
 		entry := &CommitEntry{
-			Path:    path,
-			BaseRev: meta.BaseRev,
-			Size:    meta.Size,
-			Kind:    meta.Kind,
+			Path:        path,
+			BaseRev:     meta.BaseRev,
+			Size:        meta.Size,
+			Kind:        meta.Kind,
+			ShadowSpill: meta.ShadowSpill,
 		}
 		if err := cq.Enqueue(entry); err != nil {
 			log.Printf("commit queue: recover enqueue failed for %s: %v", path, err)
@@ -325,7 +326,11 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			time.Sleep(delay)
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+		timeout := uploadTimeout
+		if entry.ShadowSpill {
+			timeout = releaseTimeout(entry.Size)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		err := cq.uploadEntry(ctx, entry)
 		cancel()
 
@@ -348,13 +353,8 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 }
 
 func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) error {
-	// Read data from shadow store.
 	if cq.shadows == nil {
 		return fmt.Errorf("no shadow store")
-	}
-	data, err := cq.shadows.ReadAll(entry.Path)
-	if err != nil {
-		return fmt.Errorf("read shadow: %w", err)
 	}
 
 	expectedRevision := entry.BaseRev
@@ -362,14 +362,22 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) erro
 		return fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
 	}
 
+	// ShadowSpill entries: stream directly from shadow file to avoid loading
+	// multi-GiB files into memory. Uses io.SectionReader over the shadow fd.
+	if entry.ShadowSpill {
+		return uploadFromShadow(ctx, cq.client, cq.shadows, entry.Path, expectedRevision)
+	}
+
+	// Non-ShadowSpill: read full content into memory (small files).
+	data, err := cq.shadows.ReadAll(entry.Path)
+	if err != nil {
+		return fmt.Errorf("read shadow: %w", err)
+	}
+
 	// Upload through the same small-file vs multipart client path used by
 	// foreground flushes so large write-back entries don't regress to the
 	// legacy direct PUT code path.
-	if err := uploadBufferedRemoteFile(ctx, cq.client, entry.Path, data, expectedRevision); err != nil {
-		return err
-	}
-
-	return nil
+	return uploadBufferedRemoteFile(ctx, cq.client, entry.Path, data, expectedRevision)
 }
 
 func (cq *CommitQueue) removeFromQueue(entry *CommitEntry) {

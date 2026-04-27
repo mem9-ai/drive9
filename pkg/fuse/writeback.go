@@ -40,13 +40,14 @@ const (
 // WriteBackMeta stores metadata alongside cached file data so that the
 // background uploader (and crash-recovery) knows the remote path and size.
 type WriteBackMeta struct {
-	Path       string      `json:"path"`
-	Size       int64       `json:"size"`
-	Mtime      time.Time   `json:"mtime"`
-	CreatedAt  time.Time   `json:"created_at"`
-	Generation uint64      `json:"generation,omitempty"`
-	Kind       PendingKind `json:"kind"`
-	BaseRev    int64       `json:"base_rev,omitempty"`
+	Path        string      `json:"path"`
+	Size        int64       `json:"size"`
+	Mtime       time.Time   `json:"mtime"`
+	CreatedAt   time.Time   `json:"created_at"`
+	Generation  uint64      `json:"generation,omitempty"`
+	Kind        PendingKind `json:"kind"`
+	BaseRev     int64       `json:"base_rev,omitempty"`
+	ShadowSpill bool        `json:"shadow_spill,omitempty"`
 }
 
 // WriteBackCache manages a local disk cache of pending (not-yet-uploaded)

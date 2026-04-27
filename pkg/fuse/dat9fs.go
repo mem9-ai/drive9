@@ -472,8 +472,14 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 			return err
 		}
 	}
-	if _, err := fs.pendingIndex.PutWithBaseRev(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev); err != nil {
-		log.Printf("pending index put failed for %s: %v", fh.Path, err)
+	if fh.ShadowSpill {
+		if _, err := fs.pendingIndex.PutShadowSpill(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev); err != nil {
+			log.Printf("pending index put failed for %s: %v", fh.Path, err)
+		}
+	} else {
+		if _, err := fs.pendingIndex.PutWithBaseRev(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev); err != nil {
+			log.Printf("pending index put failed for %s: %v", fh.Path, err)
+		}
 	}
 	return nil
 }
@@ -2037,17 +2043,29 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		fh.Dirty = NewWriteBuffer(fh.Path, 0, 0)
 	}
 
+	// ShadowSpill: write shadow FIRST, before Dirty. If shadow fails, return
+	// EIO without touching Dirty — OnPartFull may evict the part, so writing
+	// Dirty first could lose data if shadow then fails.
+	if fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil {
+		if !fs.shadowStore.CheckDiskSpaceThrottled() {
+			log.Printf("shadow write rejected for %s: disk space below watermark", fh.Path)
+			return 0, gofuse.Status(syscall.ENOSPC)
+		}
+		if _, err := fs.shadowStore.WriteAt(fh.Path, int64(input.Offset), data, fh.BaseRev); err != nil {
+			log.Printf("shadow write failed for ShadowSpill %s: %v", fh.Path, err)
+			return 0, gofuse.EIO
+		}
+	}
+
 	n, err := fh.Dirty.Write(int64(input.Offset), data)
 	if err != nil {
 		return 0, gofuse.Status(syscall.EFBIG)
 	}
-	if fh.ShadowReady && fs.shadowStore != nil {
+
+	// Non-ShadowSpill: write-through to shadow after Dirty (best-effort).
+	if !fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil {
 		if _, err := fs.shadowStore.WriteAt(fh.Path, int64(input.Offset), data, fh.BaseRev); err != nil {
 			log.Printf("shadow write-through failed for %s: %v", fh.Path, err)
-			if fh.ShadowSpill {
-				// ShadowSpill: shadow is the sole data source — cannot fallback.
-				return 0, gofuse.EIO
-			}
 			fs.shadowStore.Remove(fh.Path)
 			fh.ShadowReady = false
 		}
