@@ -16,11 +16,12 @@ import (
 
 // CommitEntry represents a pending remote commit.
 type CommitEntry struct {
-	Path    string
-	Inode   uint64
-	BaseRev int64 // revision when we started editing
-	Size    int64
-	Kind    PendingKind
+	Path        string
+	Inode       uint64
+	BaseRev     int64 // revision when we started editing
+	Size        int64
+	Kind        PendingKind
+	ShadowSpill bool // true when data is only in shadow file (auto-resolve would OOM)
 }
 
 // CommitQueue manages ordered background remote commits with baseRev tracking.
@@ -424,6 +425,14 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	if cq.isCanceled(entry.Path) {
 		cq.removeFromQueue(entry)
 		log.Printf("commit queue: auto-resolve skipped for %s (canceled)", entry.Path)
+		return
+	}
+
+	// ShadowSpill large files: auto-resolve requires full-memory ReadAll +
+	// bytes.Equal which would OOM for multi-GiB files. Terminal failure instead.
+	if entry.ShadowSpill {
+		log.Printf("commit queue: auto-resolve skipped for ShadowSpill %s (would OOM), terminal failure", entry.Path)
+		cq.onCommitTerminalFailure(entry)
 		return
 	}
 

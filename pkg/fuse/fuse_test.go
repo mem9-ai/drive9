@@ -1509,3 +1509,207 @@ func TestInodeToPath_UpdateMtime(t *testing.T) {
 		t.Fatalf("UpdateMtime: got %v, want %v", entry.Mtime, newTime)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ShadowSpill tests
+// ---------------------------------------------------------------------------
+
+// TestShadowSpill_OnPartFullEvicts verifies that ShadowSpill's OnPartFull
+// callback evicts completed parts, keeping Dirty memory bounded to ~1 part.
+func TestShadowSpill_OnPartFullEvicts(t *testing.T) {
+	wb := NewWriteBuffer("/spill.bin", streamingWriteMaxSize, 0)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	// Wire ShadowSpill-style OnPartFull: just evict.
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		wb.EvictPart(partIdx)
+	}
+
+	// Write 3 full parts + 1 byte into part 3 (so part 3 is active, not full).
+	partSize := int(DefaultPartSize)
+	chunk := make([]byte, partSize)
+	for i := range chunk {
+		chunk[i] = byte(i % 251)
+	}
+	for p := 0; p < 3; p++ {
+		if _, err := wb.Write(int64(p)*int64(partSize), chunk); err != nil {
+			t.Fatalf("write part %d: %v", p, err)
+		}
+	}
+	// Write 1 byte into part 3 so it becomes the active (incomplete) part.
+	if _, err := wb.Write(int64(3*partSize), []byte{0x42}); err != nil {
+		t.Fatalf("write partial part 3: %v", err)
+	}
+
+	// Parts 0, 1, 2 should have been evicted. Part 3 is active.
+	evicted := wb.StreamedPartIndices()
+	for p := 0; p < 3; p++ {
+		if !evicted[p] {
+			t.Fatalf("expected part %d evicted; got %v", p, evicted)
+		}
+	}
+	if evicted[3] {
+		t.Fatalf("part 3 should not be evicted (active/incomplete part)")
+	}
+
+	// Size should still track correctly.
+	expectedSize := int64(3*partSize) + 1
+	if wb.Size() != expectedSize {
+		t.Fatalf("size = %d, want %d", wb.Size(), expectedSize)
+	}
+}
+
+// TestShadowSpill_WriteReadThroughShadow verifies that ShadowSpill writes
+// go to shadow and reads come back correctly from shadow.
+func TestShadowSpill_WriteReadThroughShadow(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	path := "/spill/read-write.bin"
+	if err := ss.Ensure(path, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate ShadowSpill writes.
+	data1 := []byte("hello shadow spill world")
+	if _, err := ss.WriteAt(path, 0, data1, 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+	data2 := []byte("APPENDED")
+	if _, err := ss.WriteAt(path, int64(len(data1)), data2, 0); err != nil {
+		t.Fatalf("WriteAt append: %v", err)
+	}
+
+	// Read back via ReadAt (the ShadowSpill Read path).
+	totalLen := len(data1) + len(data2)
+	buf := make([]byte, totalLen)
+	n, err := ss.ReadAt(path, 0, buf)
+	if err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if n != totalLen {
+		t.Fatalf("ReadAt n = %d, want %d", n, totalLen)
+	}
+	expected := append(data1, data2...)
+	if string(buf) != string(expected) {
+		t.Fatalf("data = %q, want %q", buf, expected)
+	}
+}
+
+// TestShadowReaderAt verifies that shadowReaderAt correctly adapts
+// ShadowStore.ReadAt into an io.ReaderAt for streaming uploads.
+func TestShadowReaderAt(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	path := "/upload/test.bin"
+	if err := ss.Ensure(path, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write test data to shadow.
+	testData := make([]byte, 1024)
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+	if _, err := ss.WriteAt(path, 0, testData, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	ra := &shadowReaderAt{store: ss, path: path}
+
+	// Read full file.
+	buf := make([]byte, 1024)
+	n, err := ra.ReadAt(buf, 0)
+	if err != nil {
+		t.Fatalf("ReadAt(0): %v", err)
+	}
+	if n != 1024 {
+		t.Fatalf("ReadAt n = %d, want 1024", n)
+	}
+	for i, b := range buf {
+		if b != byte(i%256) {
+			t.Fatalf("data mismatch at %d: got %d, want %d", i, b, byte(i%256))
+		}
+	}
+
+	// Read partial range.
+	partial := make([]byte, 100)
+	n, err = ra.ReadAt(partial, 512)
+	if err != nil {
+		t.Fatalf("ReadAt(512): %v", err)
+	}
+	if n != 100 {
+		t.Fatalf("partial ReadAt n = %d, want 100", n)
+	}
+	for i, b := range partial {
+		if b != byte((512+i)%256) {
+			t.Fatalf("partial data mismatch at %d: got %d, want %d", i, b, byte((512+i)%256))
+		}
+	}
+}
+
+// TestShadowSpill_AutoResolveGuard verifies that tryAutoResolveConflict
+// short-circuits for ShadowSpill entries without reading shadow data
+// into memory (which would OOM for large files).
+func TestShadowSpill_AutoResolveGuard(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	idx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := "/conflict/large.bin"
+	if err := ss.Ensure(path, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ss.WriteAt(path, 0, []byte("data"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Register the entry in pending index so MarkConflict can find it.
+	if _, err := idx.PutWithBaseRev(path, 4, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := &CommitQueue{
+		shadows:  ss,
+		index:    idx,
+		canceled: make(map[string]struct{}),
+		inFlight: make(map[string]struct{}),
+	}
+
+	entry := &CommitEntry{
+		Path:        path,
+		Size:        10 * 1024 * 1024 * 1024, // 10 GiB
+		Kind:        PendingNew,
+		ShadowSpill: true,
+	}
+
+	// Should not panic, should not attempt ReadAll, should go to terminal failure.
+	cq.tryAutoResolveConflict(entry)
+
+	// Verify MarkConflict was called (terminal failure path).
+	meta, ok := idx.GetMeta(path)
+	if !ok {
+		t.Fatal("expected pending entry to exist after auto-resolve")
+	}
+	if meta.Kind != PendingConflict {
+		t.Fatalf("expected PendingConflict after ShadowSpill auto-resolve guard, got %v", meta.Kind)
+	}
+}

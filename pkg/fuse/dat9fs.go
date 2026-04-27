@@ -1604,26 +1604,25 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 			log.Printf("shadow ensure failed for create %s: %v", childP, err)
 		} else {
 			fh.ShadowReady = true
+			fh.ShadowSpill = true
 		}
 	}
 
-	// Attach a streaming uploader for sequential write streaming.
-	// For pure sequential writes (cp, dd, ffmpeg), parts are uploaded
-	// as they fill during Write() and memory is released immediately.
-	// For non-sequential writes, falls back to flush-time UploadAll.
-	fh.Streamer = NewStreamUploader(fs.client, childP, expectedRevisionForHandle(fh))
-
-	// Wire up the OnPartFull callback: when a sequential write fills
-	// a part, submit it for background upload and evict after completion.
-	streamer := fh.Streamer
-	wb.OnPartFull = func(partIdx int, data []byte) {
-		partNum := partIdx + 1
-		// SubmitPart copies data synchronously into pendingParts.
-		// Do NOT evict from WriteBuffer — the data must remain readable
-		// until the file is flushed/released (reads fall through to server
-		// for evicted ranges, but the server doesn't have the data yet).
-		if err := streamer.SubmitPart(context.Background(), partNum, data, nil); err != nil {
-			log.Printf("streaming submit part %d failed for %s: %v", partNum, childP, err)
+	if fh.ShadowSpill {
+		// ShadowSpill mode: shadow is the authoritative data source.
+		// OnPartFull evicts memory immediately — no StreamUploader needed.
+		wb.OnPartFull = func(partIdx int, data []byte) {
+			wb.EvictPart(partIdx)
+		}
+	} else {
+		// Normal mode: attach streaming uploader for sequential write streaming.
+		fh.Streamer = NewStreamUploader(fs.client, childP, expectedRevisionForHandle(fh))
+		streamer := fh.Streamer
+		wb.OnPartFull = func(partIdx int, data []byte) {
+			partNum := partIdx + 1
+			if err := streamer.SubmitPart(context.Background(), partNum, data, nil); err != nil {
+				log.Printf("streaming submit part %d failed for %s: %v", partNum, childP, err)
+			}
 		}
 	}
 
@@ -1730,20 +1729,26 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 					log.Printf("shadow ensure failed for truncate-open %s: %v", p, err)
 				} else {
 					fh.ShadowReady = true
+					fh.ShadowSpill = true
 				}
 			}
 
-			// Attach streaming uploader with OnPartFull wiring.
-			fh.Streamer = NewStreamUploader(fs.client, p, expectedRevisionForHandle(fh))
-			streamer := fh.Streamer
-			filePath := p
-			fh.Dirty.OnPartFull = func(partIdx int, data []byte) {
-				partNum := partIdx + 1
-				// SubmitPart copies data synchronously into pendingParts.
-				// Do NOT evict from WriteBuffer — the data must remain readable
-				// until the file is flushed/released.
-				if err := streamer.SubmitPart(context.Background(), partNum, data, nil); err != nil {
-					log.Printf("streaming submit part %d failed for %s: %v", partNum, filePath, err)
+			if fh.ShadowSpill {
+				// ShadowSpill mode: shadow is the authoritative data source.
+				wb := fh.Dirty
+				wb.OnPartFull = func(partIdx int, data []byte) {
+					wb.EvictPart(partIdx)
+				}
+			} else {
+				// Normal mode: attach streaming uploader with OnPartFull wiring.
+				fh.Streamer = NewStreamUploader(fs.client, p, expectedRevisionForHandle(fh))
+				streamer := fh.Streamer
+				filePath := p
+				fh.Dirty.OnPartFull = func(partIdx int, data []byte) {
+					partNum := partIdx + 1
+					if err := streamer.SubmitPart(context.Background(), partNum, data, nil); err != nil {
+						log.Printf("streaming submit part %d failed for %s: %v", partNum, filePath, err)
+					}
 				}
 			}
 		}
@@ -1785,6 +1790,29 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	fh.Lock()
+
+	// ShadowSpill: read from shadow file (the authoritative data source).
+	// Dirty has evicted parts so ReadAt would return incomplete data.
+	if fh.ShadowSpill && fs.shadowStore != nil {
+		offset := int64(input.Offset)
+		size := fh.Dirty.Size()
+		if offset >= size {
+			fh.Unlock()
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
+		end := offset + int64(input.Size)
+		if end > size {
+			end = size
+		}
+		fh.Unlock()
+		result := make([]byte, end-offset)
+		n, err := fs.shadowStore.ReadAt(fh.Path, offset, result)
+		if err != nil {
+			return nil, gofuse.EIO
+		}
+		return gofuse.ReadResultData(result[:n]), gofuse.OK
+	}
+
 	// If there's a dirty buffer (even empty — e.g. after Create or truncate-to-zero),
 	// read from it so we don't go back to the server and see stale/non-existent data.
 	// Uses ReadAt to avoid materializing the entire sparse buffer.
@@ -2016,6 +2044,10 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	if fh.ShadowReady && fs.shadowStore != nil {
 		if _, err := fs.shadowStore.WriteAt(fh.Path, int64(input.Offset), data, fh.BaseRev); err != nil {
 			log.Printf("shadow write-through failed for %s: %v", fh.Path, err)
+			if fh.ShadowSpill {
+				// ShadowSpill: shadow is the sole data source — cannot fallback.
+				return 0, gofuse.EIO
+			}
 			fs.shadowStore.Remove(fh.Path)
 			fh.ShadowReady = false
 		}
@@ -2102,6 +2134,36 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.St
 	//     Flush until the upload completes. Use a size-proportional timeout
 	//     (releaseTimeout) instead of the 30s fuseCtx — large uploads need it.
 	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() && fh.Dirty.Size() >= writeBackThreshold {
+		// ShadowSpill interactive path: stage shadow journal + set ShadowCommitReady.
+		// Does NOT use snapshotWriteBackLocked or WriteBackSeq — those assume
+		// writeBack cache holds complete file data, which ShadowSpill does not.
+		if fh.ShadowSpill && fs.syncMode == SyncInteractive && fs.shadowStore != nil && fs.pendingIndex != nil {
+			if err := fs.stageShadowLocked(fh, true); err != nil {
+				log.Printf("flush: shadow stage failed for ShadowSpill %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
+			} else {
+				fh.ShadowCommitReady = true
+				return gofuse.OK
+			}
+		}
+
+		// ShadowSpill strict path: synchronous streaming upload from shadow.
+		if fh.ShadowSpill {
+			size := fh.Dirty.Size()
+			ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
+			defer cf()
+			fh.Unlock()
+			err := uploadFromShadow(ctx, fs.client, fs.shadowStore, fh.Path, expectedRevisionForHandle(fh))
+			fh.Lock()
+			if err != nil {
+				log.Printf("flush: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
+				return gofuse.EIO
+			}
+			fh.Dirty.ClearDirty()
+			fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+			fh.DirtySeq = 0
+			return gofuse.OK
+		}
+
 		if fs.syncMode == SyncInteractive && fs.shadowStore != nil && fs.pendingIndex != nil {
 			if fs.canStageShadowFastLocked(fh) || fh.Dirty.CanMaterializeFull() {
 				if err := fs.stageShadowLocked(fh, true); err != nil {
@@ -2155,7 +2217,22 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.St
 		if fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
 			return gofuse.OK
 		}
-		if err := fs.stageShadowLocked(fh, true); err == nil {
+		if fh.ShadowSpill {
+			// ShadowSpill: stage shadow + journal, no writeBack snapshot.
+			if err := fs.stageShadowLocked(fh, true); err == nil {
+				fh.ShadowCommitReady = true
+				if fs.journal != nil {
+					entry := JournalEntry{
+						Op:      JournalFsync,
+						Path:    fh.Path,
+						BaseRev: fh.BaseRev,
+					}
+					_ = fs.journal.Append(entry)
+					_ = fs.journal.Fsync()
+				}
+				return gofuse.OK
+			}
+		} else if err := fs.stageShadowLocked(fh, true); err == nil {
 			if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
 				log.Printf("fsync writeback snapshot failed for %s: %v", fh.Path, err)
 			}
@@ -2172,6 +2249,26 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.St
 			}
 			return gofuse.OK
 		}
+	}
+
+	// ShadowSpill strict: synchronous streaming upload from shadow.
+	if fh.ShadowSpill && fs.shadowStore != nil {
+		size := fh.Dirty.Size()
+		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
+		defer cf()
+		fh.Unlock()
+		err := uploadFromShadow(ctx, fs.client, fs.shadowStore, fh.Path, expectedRevisionForHandle(fh))
+		fh.Lock()
+		if err != nil {
+			log.Printf("fsync: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
+			return gofuse.EIO
+		}
+		if fh.Dirty != nil {
+			fh.Dirty.ClearDirty()
+			fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+			fh.DirtySeq = 0
+		}
+		return gofuse.OK
 	}
 
 	// Strict mode: Fsync = remote durable. Upload to server before returning.
@@ -2206,6 +2303,50 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	if ok {
 		// Cancel any pending debounce for this path — Release always flushes immediately.
 		fs.debouncer.Cancel(fh.Path)
+
+		// ShadowSpill Release: CommitQueue streaming from shadow, no writeBack.
+		if fh.ShadowSpill && fh.ShadowCommitReady && fs.commitQueue != nil && fs.shadowStore != nil {
+			fh.Lock()
+			fh.Dirty.ClearDirty()
+			fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+			size := fh.Dirty.Size()
+			fh.DirtySeq = 0
+			fh.ShadowCommitReady = false
+			fh.Unlock()
+
+			entry := &CommitEntry{
+				Path:        fh.Path,
+				Inode:       fh.Ino,
+				BaseRev:     fh.BaseRev,
+				Size:        size,
+				Kind:        PendingOverwrite,
+				ShadowSpill: true,
+			}
+			if fh.IsNew {
+				entry.Kind = PendingNew
+			}
+			if err := fs.commitQueue.Enqueue(entry); err != nil {
+				// Fallback: synchronous streaming upload from shadow.
+				// Do NOT use uploader.Submit — it reads from writeBack cache.
+				log.Printf("release: ShadowSpill commitQueue enqueue failed for %s: %v, falling back to sync upload", fh.Path, err)
+				ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
+				if err := uploadFromShadow(ctx, fs.client, fs.shadowStore, fh.Path, expectedRevisionForHandle(fh)); err != nil {
+					log.Printf("release: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
+				}
+				cf()
+			}
+
+			fs.readCache.Invalidate(fh.Path)
+			fs.dirCache.Invalidate(parentDir(fh.Path))
+			fs.notifyInode(fh.Ino)
+			parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
+			fs.notifyInode(parentIno)
+			if fh.Prefetch != nil {
+				fh.Prefetch.Close()
+			}
+			fs.fileHandles.Delete(input.Fh)
+			return
+		}
 
 		// Check if Flush already wrote this file to the write-back cache
 		// AND no new writes have happened since. If the DirtySeq changed,
