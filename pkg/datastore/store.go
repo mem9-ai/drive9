@@ -779,6 +779,39 @@ func (s *Store) StatPathFallback(ctx context.Context, primaryPath, fallbackPath 
 	return out, err
 }
 
+// StatPathFallbackLite is like StatPathFallback but only fetches lightweight
+// metadata fields needed for FUSE stat/HEAD operations. It skips content_blob,
+// content_text, description, embedding columns, checksum, and source_id.
+func (s *Store) StatPathFallbackLite(ctx context.Context, primaryPath, fallbackPath string) (out *NodeWithFile, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "stat_path_fallback_lite", start, &err)
+
+	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
+		f.file_id, f.size_bytes, f.revision, f.status, f.created_at, f.confirmed_at
+		FROM file_nodes fn
+		LEFT JOIN files f ON fn.file_id = f.file_id AND fn.is_directory = 0 AND f.status = 'CONFIRMED'
+		WHERE fn.path = ? OR fn.path = ?
+		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
+		LIMIT 1`, primaryPath, fallbackPath, primaryPath)
+	out, err = scanNodeWithFileLite(row)
+	return out, err
+}
+
+// StatLite is like Stat but only fetches lightweight metadata fields.
+func (s *Store) StatLite(ctx context.Context, path string) (out *NodeWithFile, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "stat_lite", start, &err)
+
+	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
+		f.file_id, f.size_bytes, f.revision, f.status, f.created_at, f.confirmed_at
+		FROM file_nodes fn
+		LEFT JOIN files f ON fn.file_id = f.file_id AND fn.is_directory = 0 AND f.status = 'CONFIRMED'
+		WHERE fn.path = ?
+		LIMIT 1`, path)
+	out, err = scanNodeWithFileLite(row)
+	return out, err
+}
+
 func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWithFile, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "list_dir", start, &err)
@@ -1293,6 +1326,52 @@ func scanNodeWithFileWithBlob(s scanner) (*NodeWithFile, error) {
 		if fExpiresAt.Valid {
 			t := fExpiresAt.Time.UTC()
 			nf.File.ExpiresAt = &t
+		}
+	}
+	return nf, nil
+}
+
+// scanNodeWithFileLite scans a lite result set that only includes metadata
+// fields needed for stat/HEAD: node fields + file_id, size_bytes, revision,
+// status, created_at, confirmed_at. No blob/text/description/embedding columns.
+func scanNodeWithFileLite(s scanner) (*NodeWithFile, error) {
+	var n FileNode
+	var isDir int
+	var nodeFileID sql.NullString
+	var nodeCreatedAt time.Time
+
+	var fFileID sql.NullString
+	var fSizeBytes, fRevision sql.NullInt64
+	var fStatus sql.NullString
+	var fCreatedAt, fConfirmedAt sql.NullTime
+
+	err := s.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
+		&fFileID, &fSizeBytes, &fRevision, &fStatus, &fCreatedAt, &fConfirmedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+
+	n.IsDirectory = isDir != 0
+	n.FileID = nodeFileID.String
+	n.CreatedAt = nodeCreatedAt.UTC()
+
+	nf := &NodeWithFile{Node: n}
+	if fFileID.Valid {
+		nf.File = &File{
+			FileID:   fFileID.String,
+			SizeBytes: fSizeBytes.Int64,
+			Revision:  fRevision.Int64,
+			Status:    FileStatus(fStatus.String),
+		}
+		if fCreatedAt.Valid {
+			nf.File.CreatedAt = fCreatedAt.Time.UTC()
+		}
+		if fConfirmedAt.Valid {
+			t := fConfirmedAt.Time.UTC()
+			nf.File.ConfirmedAt = &t
 		}
 	}
 	return nf, nil

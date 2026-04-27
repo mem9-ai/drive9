@@ -645,6 +645,21 @@ func (b *Dat9Backend) StatNodeCtx(ctx context.Context, path string) (*datastore.
 	return b.store.StatPathFallback(ctx, resolvedPath, dirPath)
 }
 
+// StatNodeLiteCtx returns lightweight metadata (no blob/text/description)
+// suitable for HEAD/stat operations.
+func (b *Dat9Backend) StatNodeLiteCtx(ctx context.Context, path string) (*datastore.NodeWithFile, error) {
+	resolvedPath := normalizePath(path)
+	if pathutil.IsDir(path) {
+		return b.store.StatLite(ctx, resolvedPath)
+	}
+
+	dirPath, dirErr := pathutil.CanonicalizeDir(path)
+	if dirErr != nil || dirPath == resolvedPath {
+		return b.store.StatLite(ctx, resolvedPath)
+	}
+	return b.store.StatPathFallbackLite(ctx, resolvedPath, dirPath)
+}
+
 func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
 	ctx := backgroundWithTrace()
 	nf, err := b.StatNodeCtx(ctx, path)
