@@ -486,11 +486,6 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	return int64(len(data)), nil
 }
 
-func (b *Dat9Backend) overwriteFileCtx(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (int64, error) {
-	n, _, err := b.overwriteFileCtxWithRev(ctx, nf, data, offset, flags, expectedRevision, tags, description)
-	return n, err
-}
-
 func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (int64, int64, error) {
 	if nf.File == nil {
 		return 0, 0, fmt.Errorf("no file entity")

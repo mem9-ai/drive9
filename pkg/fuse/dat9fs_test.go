@@ -1436,7 +1436,7 @@ func TestFlushHandle_SmallFile_SeedsReadCache(t *testing.T) {
 		case http.MethodGet:
 			getCalls.Add(1)
 			recordHandlerErr(fmt.Errorf("unexpected GET after flush — should hit cache"))
-			w.Write(content)
+			_, _ = w.Write(content)
 		case http.MethodHead:
 			headCalls.Add(1)
 			recordHandlerErr(fmt.Errorf("unexpected HEAD after flush — should hit cache"))
