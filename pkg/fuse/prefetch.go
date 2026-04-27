@@ -200,8 +200,13 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 		chunkSize = 128 * 1024 // default 128KB if not yet observed
 	}
 
-	// Calculate how many chunks this window will produce.
+	// Calculate how many chunks this window will produce, capped to avoid
+	// unbounded map growth when readSize is small (e.g. 4KB reads with 16MB window).
 	nChunks := int((length + chunkSize - 1) / chunkSize)
+	if nChunks > prefetchMaxBlocks {
+		nChunks = prefetchMaxBlocks
+		length = int64(nChunks) * chunkSize
+	}
 
 	// Evict oldest blocks if needed to make room.
 	for len(p.cache)+nChunks > prefetchMaxBlocks {

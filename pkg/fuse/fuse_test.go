@@ -1016,6 +1016,30 @@ func TestPrefetcher_SubBlockReads(t *testing.T) {
 	}
 }
 
+// TestPrefetcher_ChunkCapBound verifies that chunk count never exceeds
+// prefetchMaxBlocks, even with tiny readSize and large window.
+func TestPrefetcher_ChunkCapBound(t *testing.T) {
+	p := NewPrefetcher(nil, "/test.bin", 100*1024*1024) // 100MB file, no client
+	defer p.Close()
+
+	// Simulate small reads to set readSize = 4KB
+	p.mu.Lock()
+	p.readSize = 4096
+	p.window = prefetchMaxWindow // 16MB
+	p.mu.Unlock()
+
+	// Trigger OnRead to start a prefetch (will be a no-op since client is nil,
+	// but we can directly call startPrefetch to test the cap).
+	p.mu.Lock()
+	p.startPrefetch(0, prefetchMaxWindow)
+	cacheSize := len(p.cache)
+	p.mu.Unlock()
+
+	if cacheSize > prefetchMaxBlocks {
+		t.Fatalf("cache size = %d after startPrefetch, want <= %d (prefetchMaxBlocks)", cacheSize, prefetchMaxBlocks)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // StreamUploader tests
 // ---------------------------------------------------------------------------
