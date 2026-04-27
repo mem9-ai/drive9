@@ -168,6 +168,69 @@ func TestBuildBackendOptionsFromEnvAudioQwenASR(t *testing.T) {
 	}
 }
 
+func TestBuildAudioExtractOptionsFromEnvOpenAIDefaultMaxBytes(t *testing.T) {
+	keys := []string{
+		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_MODE",
+		"DRIVE9_AUDIO_EXTRACT_API_BASE",
+		"DRIVE9_AUDIO_EXTRACT_API_KEY",
+		"DRIVE9_AUDIO_EXTRACT_MODEL",
+		"DRIVE9_AUDIO_EXTRACT_PROMPT",
+		"DRIVE9_AUDIO_EXTRACT_RESPONSE_FORMAT",
+		"DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS",
+		"DRIVE9_AUDIO_EXTRACT_MAX_BYTES",
+		"DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_ENABLED", "true")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_MODE", "openai")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_API_BASE", "https://example.com/v1")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_API_KEY", "secret")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_MODEL", "whisper-1")
+
+	opts, err := buildAudioExtractOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildAudioExtractOptionsFromEnv: %v", err)
+	}
+	if opts.MaxAudioBytes != 33554432 {
+		t.Fatalf("MaxAudioBytes=%d, want 33554432", opts.MaxAudioBytes)
+	}
+}
+
+func TestBuildAudioExtractOptionsFromEnvQwenASRDefaultMaxBytes(t *testing.T) {
+	keys := []string{
+		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_MODE",
+		"DRIVE9_AUDIO_EXTRACT_API_BASE",
+		"DRIVE9_AUDIO_EXTRACT_API_KEY",
+		"DRIVE9_AUDIO_EXTRACT_MODEL",
+		"DRIVE9_AUDIO_EXTRACT_PROMPT",
+		"DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS",
+		"DRIVE9_AUDIO_EXTRACT_MAX_BYTES",
+		"DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_ENABLED", "true")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_MODE", "qwen-asr")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_API_KEY", "secret")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_MODEL", "qwen3-asr-flash")
+
+	opts, err := buildAudioExtractOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildAudioExtractOptionsFromEnv: %v", err)
+	}
+	if opts.MaxAudioBytes != 10485760 {
+		t.Fatalf("MaxAudioBytes=%d, want 10485760", opts.MaxAudioBytes)
+	}
+}
+
 func TestS3ConfigFromEnv(t *testing.T) {
 	keys := []string{
 		"DRIVE9_S3_DIR",
