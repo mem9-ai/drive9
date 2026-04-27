@@ -22,6 +22,7 @@ func TestBuildBackendOptionsFromEnvAudioDisabled(t *testing.T) {
 		"DRIVE9_QUERY_EMBED_MODEL",
 		"DRIVE9_IMAGE_EXTRACT_ENABLED",
 		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_MODE",
 		"DRIVE9_AUDIO_EXTRACT_API_BASE",
 		"DRIVE9_AUDIO_EXTRACT_API_KEY",
 		"DRIVE9_AUDIO_EXTRACT_MODEL",
@@ -50,6 +51,7 @@ func TestBuildBackendOptionsFromEnvAudioMissingRequiredConfig(t *testing.T) {
 		"DRIVE9_QUERY_EMBED_MODEL",
 		"DRIVE9_IMAGE_EXTRACT_ENABLED",
 		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_MODE",
 		"DRIVE9_AUDIO_EXTRACT_API_BASE",
 		"DRIVE9_AUDIO_EXTRACT_API_KEY",
 		"DRIVE9_AUDIO_EXTRACT_MODEL",
@@ -79,6 +81,7 @@ func TestBuildBackendOptionsFromEnvAudioOpenAI(t *testing.T) {
 		"DRIVE9_QUERY_EMBED_MODEL",
 		"DRIVE9_IMAGE_EXTRACT_ENABLED",
 		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_MODE",
 		"DRIVE9_AUDIO_EXTRACT_API_BASE",
 		"DRIVE9_AUDIO_EXTRACT_API_KEY",
 		"DRIVE9_AUDIO_EXTRACT_MODEL",
@@ -115,6 +118,116 @@ func TestBuildBackendOptionsFromEnvAudioOpenAI(t *testing.T) {
 	}
 	if got := opts.AsyncAudioExtract.TaskTimeout.Seconds(); got != 45 {
 		t.Fatalf("TaskTimeout=%v, want 45s", opts.AsyncAudioExtract.TaskTimeout)
+	}
+}
+
+func TestBuildBackendOptionsFromEnvAudioQwenASR(t *testing.T) {
+	keys := []string{
+		"DRIVE9_QUERY_EMBED_API_BASE",
+		"DRIVE9_QUERY_EMBED_API_KEY",
+		"DRIVE9_QUERY_EMBED_MODEL",
+		"DRIVE9_IMAGE_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_MODE",
+		"DRIVE9_AUDIO_EXTRACT_API_BASE",
+		"DRIVE9_AUDIO_EXTRACT_API_KEY",
+		"DRIVE9_AUDIO_EXTRACT_MODEL",
+		"DRIVE9_AUDIO_EXTRACT_PROMPT",
+		"DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS",
+		"DRIVE9_AUDIO_EXTRACT_MAX_BYTES",
+		"DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_ENABLED", "true")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_MODE", "qwen-asr")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_API_KEY", "secret")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_MODEL", "qwen3-asr-flash")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS", "45")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_MAX_BYTES", "1234")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES", "5678")
+
+	opts, err := buildBackendOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildBackendOptionsFromEnv: %v", err)
+	}
+	if !backend.AsyncAudioExtractWillWireRuntime(opts.AsyncAudioExtract) {
+		t.Fatalf("expected audio runtime wired, got %+v", opts.AsyncAudioExtract)
+	}
+	if opts.AsyncAudioExtract.MaxAudioBytes != 1234 {
+		t.Fatalf("MaxAudioBytes=%d, want 1234", opts.AsyncAudioExtract.MaxAudioBytes)
+	}
+	if opts.AsyncAudioExtract.MaxExtractTextBytes != 5678 {
+		t.Fatalf("MaxExtractTextBytes=%d, want 5678", opts.AsyncAudioExtract.MaxExtractTextBytes)
+	}
+	if got := opts.AsyncAudioExtract.TaskTimeout.Seconds(); got != 45 {
+		t.Fatalf("TaskTimeout=%v, want 45s", opts.AsyncAudioExtract.TaskTimeout)
+	}
+}
+
+func TestBuildAudioExtractOptionsFromEnvOpenAIDefaultMaxBytes(t *testing.T) {
+	keys := []string{
+		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_MODE",
+		"DRIVE9_AUDIO_EXTRACT_API_BASE",
+		"DRIVE9_AUDIO_EXTRACT_API_KEY",
+		"DRIVE9_AUDIO_EXTRACT_MODEL",
+		"DRIVE9_AUDIO_EXTRACT_PROMPT",
+		"DRIVE9_AUDIO_EXTRACT_RESPONSE_FORMAT",
+		"DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS",
+		"DRIVE9_AUDIO_EXTRACT_MAX_BYTES",
+		"DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_ENABLED", "true")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_MODE", "openai")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_API_BASE", "https://example.com/v1")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_API_KEY", "secret")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_MODEL", "whisper-1")
+
+	opts, err := buildAudioExtractOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildAudioExtractOptionsFromEnv: %v", err)
+	}
+	if opts.MaxAudioBytes != 33554432 {
+		t.Fatalf("MaxAudioBytes=%d, want 33554432", opts.MaxAudioBytes)
+	}
+}
+
+func TestBuildAudioExtractOptionsFromEnvQwenASRDefaultMaxBytes(t *testing.T) {
+	keys := []string{
+		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_MODE",
+		"DRIVE9_AUDIO_EXTRACT_API_BASE",
+		"DRIVE9_AUDIO_EXTRACT_API_KEY",
+		"DRIVE9_AUDIO_EXTRACT_MODEL",
+		"DRIVE9_AUDIO_EXTRACT_PROMPT",
+		"DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS",
+		"DRIVE9_AUDIO_EXTRACT_MAX_BYTES",
+		"DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_ENABLED", "true")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_MODE", "qwen-asr")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_API_KEY", "secret")
+	setEnv(t, "DRIVE9_AUDIO_EXTRACT_MODEL", "qwen3-asr-flash")
+
+	opts, err := buildAudioExtractOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("buildAudioExtractOptionsFromEnv: %v", err)
+	}
+	if opts.MaxAudioBytes != 10485760 {
+		t.Fatalf("MaxAudioBytes=%d, want 10485760", opts.MaxAudioBytes)
 	}
 }
 
