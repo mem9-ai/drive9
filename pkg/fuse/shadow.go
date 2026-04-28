@@ -467,6 +467,15 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 		s.mu.Lock()
 		delete(s.files, newPath)
 		s.files[oldPath] = sf
+		// Rollback refs and pendingRemove state.
+		if r, ok := s.refs[newPath]; ok {
+			s.refs[oldPath] = r
+			delete(s.refs, newPath)
+		}
+		if s.pendingRemove[newPath] {
+			s.pendingRemove[oldPath] = true
+			delete(s.pendingRemove, newPath)
+		}
 		s.mu.Unlock()
 		return false
 	}

@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"bytes"
+	"os"
 	"testing"
 )
 
@@ -289,6 +290,43 @@ func TestShadowStoreRenamePinState(t *testing.T) {
 	ss.Unpin("/after.txt")
 	if ss.Has("/after.txt") {
 		t.Error("expected removal after unpin of renamed path")
+	}
+}
+
+func TestShadowStoreRenameFailureRollbackPinState(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := NewWriteBuffer("/rollback.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("data"))
+	_ = ss.WriteExtents("/rollback.txt", wb, 1)
+
+	ss.Pin("/rollback.txt")
+
+	// Delete the on-disk shadow file to force os.Rename failure.
+	sp := ss.shadowPath("/rollback.txt")
+	_ = os.Remove(sp)
+
+	ok := ss.Rename("/rollback.txt", "/target.txt")
+	if ok {
+		t.Fatal("expected rename to fail when disk file is missing")
+	}
+
+	// Pin state should be rolled back to old path.
+	// Unpin on old path should work, not panic or leak.
+	ss.Remove("/rollback.txt")
+	if !ss.Has("/rollback.txt") {
+		t.Fatal("expected shadow file to exist while pinned after rollback")
+	}
+
+	ss.Unpin("/rollback.txt")
+	// After unpin + pending remove, file entry should be gone.
+	if ss.Has("/rollback.txt") {
+		t.Error("expected removal after unpin of rolled-back path")
 	}
 }
 
