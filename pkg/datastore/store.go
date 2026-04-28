@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/mysqlutil"
@@ -125,23 +124,14 @@ func Open(dsn string) (*Store, error) {
 	if strings.Contains(lower, "multistatements=true") || strings.Contains(lower, "multistatements=1") {
 		return nil, fmt.Errorf("multiStatements is not allowed in production DSN")
 	}
-	db, err := sql.Open("mysql", dsn)
+	db, err := mysqlutil.OpenInstrumented(context.Background(), dsn, mysqlutil.RoleUser)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
-	}
-	applyMySQLPoolDefaults(db)
-	if err := db.Ping(); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("ping db: %w", err)
 	}
 	return &Store{db: db}, nil
 }
 
-func applyMySQLPoolDefaults(db *sql.DB) {
-	mysqlutil.ApplyPoolDefaults(db)
-}
-
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error { return mysqlutil.CloseInstrumented(s.db) }
 func (s *Store) DB() *sql.DB  { return s.db }
 
 // InTx runs fn inside a database transaction. If fn returns an error, the

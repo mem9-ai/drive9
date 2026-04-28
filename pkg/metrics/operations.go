@@ -98,6 +98,8 @@ func WritePrometheus(w http.ResponseWriter) {
 	for _, k := range gaugeKeys {
 		_, _ = fmt.Fprintf(w, "dat9_service_gauge{%s} %.6f\n", k, gauges[k])
 	}
+
+	writeDBPrometheus(w)
 }
 
 func labels(component, operation, result string) string {

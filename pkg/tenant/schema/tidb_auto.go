@@ -12,6 +12,7 @@ import (
 
 	"github.com/mem9-ai/dat9/internal/schemaspec"
 	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/mysqlutil"
 	"go.uber.org/zap"
 )
 
@@ -384,7 +385,7 @@ func initTiDBAutoEmbeddingSchema(dsn string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = db.Close() }()
+	defer func() { _ = closeTiDBSchemaDB(db) }()
 	if !IsTiDBCluster(context.Background(), db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
@@ -400,7 +401,7 @@ func ValidateTiDBSchemaForModeDSN(ctx context.Context, dsn string, mode TiDBEmbe
 	if err != nil {
 		return err
 	}
-	defer func() { _ = db.Close() }()
+	defer func() { _ = closeTiDBSchemaDB(db) }()
 	return ValidateTiDBSchemaForMode(ctx, db, mode)
 }
 
@@ -411,7 +412,7 @@ func EnsureTiDBSchemaForModeDSN(ctx context.Context, dsn string, mode TiDBEmbedd
 	if err != nil {
 		return err
 	}
-	defer func() { _ = db.Close() }()
+	defer func() { _ = closeTiDBSchemaDB(db) }()
 	return EnsureTiDBSchemaForMode(ctx, db, mode)
 }
 
@@ -419,15 +420,15 @@ func OpenTiDBSchemaDB(ctx context.Context, dsn string) (*sql.DB, error) {
 	if HasMultiStatements(dsn) {
 		return nil, fmt.Errorf("multiStatements is not allowed")
 	}
-	db, err := sql.Open("mysql", dsn)
+	db, err := mysqlutil.OpenInstrumented(ctx, dsn, mysqlutil.RoleUser)
 	if err != nil {
 		return nil, err
 	}
-	if err := db.PingContext(ctx); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
 	return db, nil
+}
+
+func closeTiDBSchemaDB(db *sql.DB) error {
+	return mysqlutil.CloseInstrumented(db)
 }
 
 func detectTiDBEmbeddingModeFromFilesMeta(meta tidbTableMeta) (TiDBEmbeddingMode, error) {
