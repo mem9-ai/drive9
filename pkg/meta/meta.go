@@ -101,10 +101,6 @@ func Open(dsn string) (*Store, error) {
 func (s *Store) Close() error { return mysqlutil.CloseInstrumented(s.db) }
 func (s *Store) DB() *sql.DB  { return s.db }
 
-func applyMySQLPoolDefaults(db *sql.DB) {
-	mysqlutil.ApplyPoolDefaults(db)
-}
-
 const metaSchemaMigrateLockNamePrefix = "dat9_meta_schema_migrate:"
 const metaSchemaMigrateLockTimeoutSeconds = 30
 

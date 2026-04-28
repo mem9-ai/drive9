@@ -85,15 +85,7 @@ func (c instrumentedConn) Close() error {
 }
 
 func (c instrumentedConn) Begin() (driver.Tx, error) {
-	start := time.Now()
-	tx, err := c.base.Begin()
-	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(c.role, "begin", start, err)
-	}
-	if err != nil {
-		return nil, err
-	}
-	return instrumentedTx{base: tx, role: c.role}, nil
+	return c.BeginTx(context.Background(), driver.TxOptions{})
 }
 
 func (c instrumentedConn) Ping(ctx context.Context) error {
@@ -140,33 +132,7 @@ func (c instrumentedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (d
 	if opts.Isolation != driver.IsolationLevel(0) || opts.ReadOnly {
 		return nil, fmt.Errorf("driver does not support non-default transaction options")
 	}
-	return c.Begin()
-}
-
-func (c instrumentedConn) Exec(query string, args []driver.Value) (driver.Result, error) {
-	execer, ok := c.base.(driver.Execer)
-	if !ok {
-		return nil, driver.ErrSkip
-	}
-	start := time.Now()
-	res, err := execer.Exec(query, args)
-	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(c.role, "exec", start, err)
-	}
-	return res, err
-}
-
-func (c instrumentedConn) Query(query string, args []driver.Value) (driver.Rows, error) {
-	queryer, ok := c.base.(driver.Queryer)
-	if !ok {
-		return nil, driver.ErrSkip
-	}
-	start := time.Now()
-	rows, err := queryer.Query(query, args)
-	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(c.role, "query", start, err)
-	}
-	return rows, err
+	return nil, driver.ErrSkip
 }
 
 func (c instrumentedConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -233,21 +199,11 @@ func (s instrumentedStmt) NumInput() int {
 }
 
 func (s instrumentedStmt) Exec(args []driver.Value) (driver.Result, error) {
-	start := time.Now()
-	res, err := s.base.Exec(args)
-	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(s.role, "exec", start, err)
-	}
-	return res, err
+	return s.ExecContext(context.Background(), toNamedValues(args))
 }
 
 func (s instrumentedStmt) Query(args []driver.Value) (driver.Rows, error) {
-	start := time.Now()
-	rows, err := s.base.Query(args)
-	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(s.role, "query", start, err)
-	}
-	return rows, err
+	return s.QueryContext(context.Background(), toNamedValues(args))
 }
 
 func (s instrumentedStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
@@ -274,14 +230,6 @@ func (s instrumentedStmt) QueryContext(ctx context.Context, args []driver.NamedV
 		observeDBOperation(s.role, "query", start, err)
 	}
 	return rows, err
-}
-
-func (s instrumentedStmt) ColumnConverter(idx int) driver.ValueConverter {
-	converter, ok := s.base.(driver.ColumnConverter)
-	if !ok {
-		return driver.DefaultParameterConverter
-	}
-	return converter.ColumnConverter(idx)
 }
 
 func (s instrumentedStmt) CheckNamedValue(nv *driver.NamedValue) error {
@@ -332,4 +280,18 @@ func dbResult(err error) string {
 	default:
 		return "error"
 	}
+}
+
+func toNamedValues(args []driver.Value) []driver.NamedValue {
+	if len(args) == 0 {
+		return nil
+	}
+	named := make([]driver.NamedValue, 0, len(args))
+	for idx, arg := range args {
+		named = append(named, driver.NamedValue{
+			Ordinal: idx + 1,
+			Value:   arg,
+		})
+	}
+	return named
 }

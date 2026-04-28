@@ -131,10 +131,6 @@ func Open(dsn string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-func applyMySQLPoolDefaults(db *sql.DB) {
-	mysqlutil.ApplyPoolDefaults(db)
-}
-
 func (s *Store) Close() error { return mysqlutil.CloseInstrumented(s.db) }
 func (s *Store) DB() *sql.DB  { return s.db }
 
