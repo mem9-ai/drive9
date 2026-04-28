@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+const qwenASRMaxDataURLBytes = 10_000_000
+
 // QwenASRAudioTextExtractorConfig configures Alibaba Cloud Model Studio
 // Qwen-ASR through DashScope's OpenAI-compatible chat/completions endpoint.
 // Reference: https://help.aliyun.com/zh/model-studio/qwen-asr-api-reference
@@ -79,9 +81,22 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 	if contentType == "" {
 		contentType = "audio/mpeg"
 	}
-	audioURL := "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(req.Data)
+	audioURLPrefix := "data:" + contentType + ";base64,"
+	encodedAudioBytes := base64.StdEncoding.EncodedLen(len(req.Data)) + len(audioURLPrefix)
+	if encodedAudioBytes > qwenASRMaxDataURLBytes {
+		return "", AudioExtractUsage{}, &AudioExtractAPIError{
+			Provider:   "qwen asr",
+			StatusCode: http.StatusBadRequest,
+			Message:    fmt.Sprintf("base64 data URL size %d exceeds qwen asr 10 MB limit", encodedAudioBytes),
+		}
+	}
+	audioURL := audioURLPrefix + base64.StdEncoding.EncodeToString(req.Data)
 	messages := make([]map[string]any, 0, 2)
 	if strings.TrimSpace(e.prompt) != "" {
+		// The Qwen-ASR API reference documents language and ITN tuning under
+		// asr_options, while the OpenAI-compatible request format also accepts
+		// optional system messages. Keep Prompt as a system message for backward
+		// compatibility with existing deployments.
 		messages = append(messages, map[string]any{
 			"role": "system",
 			"content": []map[string]any{
@@ -136,6 +151,9 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 				Content any `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		// Qwen-ASR OpenAI-compatible responses place audio duration at
+		// usage.seconds, not usage.completion_tokens_details.seconds.
+		// Reference: https://help.aliyun.com/zh/model-studio/qwen-asr-api-reference
 		Usage *struct {
 			PromptTokens     int     `json:"prompt_tokens"`
 			CompletionTokens int     `json:"completion_tokens"`
@@ -170,7 +188,7 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 		}
 	}
 	if len(parsed.Choices) == 0 {
-		return "", AudioExtractUsage{}, fmt.Errorf("qwen asr api returned no choices")
+		return "", AudioExtractUsage{}, fmt.Errorf("qwen asr api returned no choices (raw=%s)", truncateString(string(raw), 256))
 	}
 	text := extractOpenAIContentText(parsed.Choices[0].Message.Content)
 	if strings.TrimSpace(text) == "" {

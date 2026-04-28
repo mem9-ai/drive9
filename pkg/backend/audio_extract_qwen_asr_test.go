@@ -191,6 +191,75 @@ func TestQwenASRAudioTextExtractorErrorMessage(t *testing.T) {
 	}
 }
 
+func TestQwenASRAudioTextExtractorRejectsOversizedBase64Payload(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	extractor, err := NewQwenASRAudioTextExtractor(QwenASRAudioTextExtractorConfig{
+		BaseURL: server.URL,
+		APIKey:  "secret",
+		Model:   "qwen3-asr-flash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+		Path:        "/audio/too-large.mp3",
+		ContentType: "audio/mpeg",
+		Data:        make([]byte, 8<<20),
+	})
+	if err == nil {
+		t.Fatal("expected oversized payload error")
+	}
+	var apiErr *AudioExtractAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err=%T %[1]v, want AudioExtractAPIError", err)
+	}
+	if apiErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d, want %d", apiErr.StatusCode, http.StatusBadRequest)
+	}
+	if !strings.Contains(apiErr.Message, "10 MB limit") {
+		t.Fatalf("message=%q, want limit detail", apiErr.Message)
+	}
+	if !IsNonRetryableAudioExtractError(err) {
+		t.Fatalf("err=%v, want non-retryable", err)
+	}
+	if called {
+		t.Fatal("server should not be called for oversized payload")
+	}
+}
+
+func TestQwenASRAudioTextExtractorNoChoicesErrorIncludesRawResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[],"request_id":"abc"}`))
+	}))
+	defer server.Close()
+
+	extractor, err := NewQwenASRAudioTextExtractor(QwenASRAudioTextExtractorConfig{
+		BaseURL: server.URL,
+		APIKey:  "secret",
+		Model:   "qwen3-asr-flash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+		Path: "/audio/malformed.mp3",
+		Data: []byte("fake"),
+	})
+	if err == nil {
+		t.Fatal("expected no choices error")
+	}
+	if !strings.Contains(err.Error(), "qwen asr api returned no choices") || !strings.Contains(err.Error(), `"request_id":"abc"`) {
+		t.Fatalf("err=%v, want raw response detail", err)
+	}
+}
+
 func TestQwenASRAudioTextExtractorNonRetryableClientErrors(t *testing.T) {
 	tests := []struct {
 		name       string
