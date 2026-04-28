@@ -3114,6 +3114,7 @@ func TestIsTransientReadErr(t *testing.T) {
 		{"context.DeadlineExceeded", context.DeadlineExceeded, true},
 		{"HTTP 503", &client.StatusError{StatusCode: http.StatusServiceUnavailable, Message: "unavailable"}, true},
 		{"HTTP 504", &client.StatusError{StatusCode: http.StatusGatewayTimeout, Message: "timeout"}, true},
+		{"HTTP 502", &client.StatusError{StatusCode: http.StatusBadGateway, Message: "bad gateway"}, true},
 		{"HTTP 500", &client.StatusError{StatusCode: http.StatusInternalServerError, Message: "error"}, true},
 		{"HTTP 404", &client.StatusError{StatusCode: http.StatusNotFound, Message: "not found"}, false},
 		{"HTTP 403", &client.StatusError{StatusCode: http.StatusForbidden, Message: "forbidden"}, false},

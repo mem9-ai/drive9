@@ -677,6 +677,10 @@ func isTransientLookupErr(err error) bool {
 	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
+// errReadRetriesExhausted is a sentinel indicating all detached read retries
+// failed with transient errors. Callers should map this to EIO.
+var errReadRetriesExhausted = errors.New("read retries exhausted")
+
 // isTransientReadErr classifies errors for Read-path detached retry.
 // Same classification as isTransientLookupErr — kept as a separate function
 // so Read and Lookup retry policies can diverge independently if needed.
@@ -708,8 +712,7 @@ func (fs *Dat9FS) readSmallFileWithRetry(ctx context.Context, path string) ([]by
 		}
 		lastErr = err
 	}
-	// Map transient-exhausted to EIO so callers never see EAGAIN.
-	return nil, fmt.Errorf("read retries exhausted for %s: %w", path, lastErr)
+	return nil, fmt.Errorf("%w: %s: %v", errReadRetriesExhausted, path, lastErr)
 }
 
 // readStreamRangeWithRetry performs a range read with bounded detached retry
@@ -737,7 +740,7 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, off
 		}
 		lastErr = err
 	}
-	return nil, 0, fmt.Errorf("range read retries exhausted for %s: %w", path, lastErr)
+	return nil, 0, fmt.Errorf("%w: %s: %v", errReadRetriesExhausted, path, lastErr)
 }
 
 // doRangeRead performs a single range read attempt: open stream + read body.
@@ -2220,7 +2223,10 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		data, err := fs.readSmallFileWithRetry(ctx, p)
 		if err != nil {
 			source = "small-read-error"
-			return nil, gofuse.EIO
+			if errors.Is(err, errReadRetriesExhausted) {
+				return nil, gofuse.EIO
+			}
+			return nil, httpToFuseStatus(err)
 		}
 		// Store with the revision from the prior Stat/Lookup.
 		fs.readCache.Put(p, data, cacheRev)
@@ -2236,9 +2242,6 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		}
 		source = "small-read"
 		bytesRead = int(end - offset)
-		if fh.Prefetch != nil {
-			fh.Prefetch.OnRead(int64(input.Offset), bytesRead)
-		}
 		return gofuse.ReadResultData(data[offset:end]), gofuse.OK
 	}
 
@@ -2252,7 +2255,10 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	data, n, err := fs.readStreamRangeWithRetry(ctx, p, int64(input.Offset), int64(input.Size))
 	if err != nil {
 		fs.debugf("read range error path=%s off=%d req=%d got=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, n, source, time.Since(rangeStart), err)
-		return nil, gofuse.EIO
+		if errors.Is(err, errReadRetriesExhausted) {
+			return nil, gofuse.EIO
+		}
+		return nil, httpToFuseStatus(err)
 	}
 	if fs.debugEnabled() && time.Since(rangeStart) >= fuseDebugSlowReadThreshold {
 		fs.debugf("read range done path=%s off=%d req=%d got=%d source=%s dur=%s", p, input.Offset, input.Size, n, source, time.Since(rangeStart))
