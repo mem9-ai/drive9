@@ -185,8 +185,11 @@ func TestShadowStorePinUnpinRemove(t *testing.T) {
 	_, _ = wb.Write(0, []byte("pinned data"))
 	_ = ss.WriteExtents("/pinned.txt", wb, 1)
 
-	// Pin the path.
+	// Pin the path — get generation token.
 	gen := ss.Pin("/pinned.txt")
+	if gen == 0 {
+		t.Fatal("expected non-zero generation token from Pin")
+	}
 
 	// Remove while pinned — shadow is retired (removed from active files
 	// but fd stays alive for the pinned reader).
@@ -197,17 +200,33 @@ func TestShadowStorePinUnpinRemove(t *testing.T) {
 		t.Fatal("expected Has to return false after retire")
 	}
 
+	// ReadAtGen should work on the retired shadow.
+	buf := make([]byte, 11)
+	n, err := ss.ReadAtGen(gen, 0, buf)
+	if err != nil {
+		t.Fatalf("ReadAtGen on retired shadow: %v", err)
+	}
+	if n != 11 || !bytes.Equal(buf[:n], []byte("pinned data")) {
+		t.Errorf("ReadAtGen data = %q, want %q", buf[:n], "pinned data")
+	}
+
+	// SizeGen should return the retired size.
+	if sz := ss.SizeGen(gen); sz != 11 {
+		t.Errorf("SizeGen = %d, want 11", sz)
+	}
+
 	// Unpin — should trigger retired cleanup.
 	ss.Unpin(gen)
 
-	// New writers can create a fresh shadow at the same path.
-	wb2 := NewWriteBuffer("/pinned.txt", 0, 0)
-	_, _ = wb2.Write(0, []byte("new"))
-	if err := ss.WriteExtents("/pinned.txt", wb2, 2); err != nil {
-		t.Fatal(err)
+	// ReadAtGen should fail after Unpin.
+	_, err = ss.ReadAtGen(gen, 0, buf)
+	if err == nil {
+		t.Error("expected ReadAtGen to fail after Unpin")
 	}
-	if !ss.Has("/pinned.txt") {
-		t.Error("expected new shadow to exist")
+
+	// SizeGen should return -1 after Unpin.
+	if sz := ss.SizeGen(gen); sz != -1 {
+		t.Errorf("SizeGen after Unpin = %d, want -1", sz)
 	}
 }
 
@@ -429,6 +448,18 @@ func TestShadowStoreRetireAllowsNewWriter(t *testing.T) {
 	if !bytes.Equal(buf2[:n2], []byte("new data!!!")) {
 		t.Errorf("new shadow data after unpin = %q, want %q", buf2[:n2], "new data!!!")
 	}
+}
+
+func TestShadowStoreUnpinZeroNoop(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Unpin(0) should be a no-op and not panic.
+	ss.Unpin(0)
 }
 
 func TestShadowStoreCheckDiskSpaceThrottled(t *testing.T) {
