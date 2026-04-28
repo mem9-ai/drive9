@@ -484,6 +484,7 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string) {
+	start := time.Now()
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "read_missing_scope", "path", path)...)
@@ -494,8 +495,16 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 
 	// Single-pass read plan: one metadata query routes to either inline
 	// response (db9) or presigned redirect (S3). No fallback double-stat.
+	logger.InfoBenchTiming(r.Context(), "server_read_start", zap.String("path", path))
+	planStart := time.Now()
 	plan, err := b.ReadPlanCtx(r.Context(), path)
+	planDuration := time.Since(planStart)
 	if err != nil {
+		logger.InfoBenchTiming(r.Context(), "server_read_timing",
+			zap.String("path", path),
+			zap.Float64("plan_ms", float64(planDuration.Microseconds())/1000.0),
+			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0),
+			zap.Error(err))
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "read_not_found", "path", path)...)
 			metricEvent(r.Context(), "fs_read", "result", "error")
@@ -509,12 +518,25 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 	}
 
 	if plan.PresignURL != "" {
+		logger.InfoBenchTiming(r.Context(), "server_read_timing",
+			zap.String("path", path),
+			zap.String("mode", "redirect"),
+			zap.Int64("size", plan.Size),
+			zap.Float64("plan_ms", float64(planDuration.Microseconds())/1000.0),
+			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_presigned_redirect", "path", path)...)
 		metricEvent(r.Context(), "fs_read", "result", "ok")
 		http.Redirect(w, r, plan.PresignURL, http.StatusFound)
 		return
 	}
 
+	logger.InfoBenchTiming(r.Context(), "server_read_timing",
+		zap.String("path", path),
+		zap.String("mode", "inline"),
+		zap.Int64("size", plan.Size),
+		zap.Int("bytes", len(plan.InlineData)),
+		zap.Float64("plan_ms", float64(planDuration.Microseconds())/1000.0),
+		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_ok", "path", path, "bytes", len(plan.InlineData))...)
 	metricEvent(r.Context(), "fs_read", "result", "ok")
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -523,14 +545,23 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string) {
+	start := time.Now()
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "list_missing_scope", "path", path)...)
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
+	logger.InfoBenchTiming(r.Context(), "server_list_start", zap.String("path", path))
+	readDirStart := time.Now()
 	entries, err := b.ReadDirCtx(r.Context(), path)
+	readDirDuration := time.Since(readDirStart)
 	if err != nil {
+		logger.InfoBenchTiming(r.Context(), "server_list_timing",
+			zap.String("path", path),
+			zap.Float64("read_dir_ms", float64(readDirDuration.Microseconds())/1000.0),
+			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0),
+			zap.Error(err))
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "list_not_found", "path", path)...)
 			errJSON(w, http.StatusNotFound, err.Error())
@@ -542,6 +573,11 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		return
 	}
 	metricEvent(r.Context(), "userdb_query", "api", "list", "result", "ok")
+	logger.InfoBenchTiming(r.Context(), "server_list_timing",
+		zap.String("path", path),
+		zap.Int("entries", len(entries)),
+		zap.Float64("read_dir_ms", float64(readDirDuration.Microseconds())/1000.0),
+		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "list_ok", "path", path, "entries", len(entries))...)
 	type entry struct {
 		Name  string `json:"name"`
@@ -979,14 +1015,23 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 }
 
 func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string) {
+	start := time.Now()
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "stat_missing_scope", "path", path)...)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
+	logger.InfoBenchTiming(r.Context(), "server_stat_start", zap.String("path", path))
+	statStart := time.Now()
 	nf, err := b.StatNodeLiteCtx(r.Context(), path)
+	statDuration := time.Since(statStart)
 	if err != nil {
+		logger.InfoBenchTiming(r.Context(), "server_stat_timing",
+			zap.String("path", path),
+			zap.Float64("stat_ms", float64(statDuration.Microseconds())/1000.0),
+			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0),
+			zap.Error(err))
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "stat_not_found", "path", path)...)
 			w.WriteHeader(http.StatusNotFound)
@@ -1000,6 +1045,12 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	if nf.File != nil {
 		size = nf.File.SizeBytes
 	}
+	logger.InfoBenchTiming(r.Context(), "server_stat_timing",
+		zap.String("path", path),
+		zap.Bool("is_dir", nf.Node.IsDirectory),
+		zap.Int64("size", size),
+		zap.Float64("stat_ms", float64(statDuration.Microseconds())/1000.0),
+		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	w.Header().Set("X-Dat9-IsDir", fmt.Sprintf("%v", nf.Node.IsDirectory))
 	if nf.File != nil {

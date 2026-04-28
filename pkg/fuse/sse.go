@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -52,7 +53,7 @@ func (w *SSEWatcher) handleEvent(change *client.ChangeEvent, reset *client.Reset
 	}
 	if reset != nil && reset.Reason != "" {
 		// Only handle resets with an explicit reason (not heartbeats).
-		w.handleReset()
+		w.handleReset(reset)
 	}
 }
 
@@ -79,8 +80,16 @@ func (w *SSEWatcher) handleChange(ce *client.ChangeEvent) {
 	}
 }
 
-func (w *SSEWatcher) handleReset() {
+func (w *SSEWatcher) handleReset(resets ...*client.ResetEvent) {
+	start := time.Now()
+	var seq uint64
+	reason := "unknown"
+	if len(resets) > 0 && resets[0] != nil {
+		seq = resets[0].Seq
+		reason = resets[0].Reason
+	}
 	fmt.Fprintf(os.Stderr, "dat9: SSE reset — invalidating all caches\n")
+	w.fs.debugf("sse reset start seq=%d reason=%s", seq, reason)
 
 	// 1. Clear all user-space caches.
 	w.fs.readCache.InvalidateAll()
@@ -91,6 +100,7 @@ func (w *SSEWatcher) handleReset() {
 	//    potentially slow kernel notify calls.
 	//    InodeToPath is kept intact (stale but resolvable).
 	entries := w.fs.inodes.Snapshot()
+	w.fs.debugf("sse reset snapshot seq=%d reason=%s inodes=%d", seq, reason, len(entries))
 	for _, entry := range entries {
 		w.fs.notifyInode(entry.Ino)
 
@@ -101,4 +111,5 @@ func (w *SSEWatcher) handleReset() {
 			}
 		}
 	}
+	w.fs.debugf("sse reset done seq=%d reason=%s inodes=%d dur=%s", seq, reason, len(entries), time.Since(start))
 }
