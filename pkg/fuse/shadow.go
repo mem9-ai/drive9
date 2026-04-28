@@ -42,7 +42,6 @@ type retiredShadow struct {
 	fd       *os.File
 	diskPath string
 	size     int64
-	refs     int32
 }
 
 // ShadowStore manages per-path shadow files for local staging of writes.
