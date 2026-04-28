@@ -474,7 +474,6 @@ func (s *ShadowStore) PinIfExists(remotePath string) (uint64, bool) {
 		}
 		sf = &ShadowFile{fd: fd, size: fi.Size()}
 		s.files[remotePath] = sf
-		ok = true
 	}
 	gen := s.active[remotePath]
 	if gen == 0 {
