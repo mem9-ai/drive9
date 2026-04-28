@@ -604,7 +604,11 @@ func httpToFuseStatus(err error) gofuse.Status {
 			return gofuse.Status(syscall.EINVAL)
 		// Keep status mapping aligned with isTransientLookupErr so retry-exhausted
 		// timeout paths remain retryable to callers instead of regressing to EIO.
-		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		// 499 (Client Closed Request) is emitted by tenantAuthMiddleware when
+		// the request context is canceled before auth completes; treat it
+		// identically to context.Canceled so the FUSE caller sees a
+		// retryable EAGAIN rather than an opaque EIO.
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, statusClientClosedRequest:
 			return gofuse.Status(syscall.EAGAIN)
 		default:
 			return gofuse.EIO
@@ -627,7 +631,8 @@ func httpToFuseStatus(err error) gofuse.Status {
 		return gofuse.Status(syscall.ESTALE)
 	case strings.Contains(msg, "HTTP 400"):
 		return gofuse.Status(syscall.EINVAL)
-	case strings.Contains(msg, "HTTP 500") ||
+	case strings.Contains(msg, "HTTP 499") ||
+		strings.Contains(msg, "HTTP 500") ||
 		strings.Contains(msg, "HTTP 502") ||
 		strings.Contains(msg, "HTTP 503") ||
 		strings.Contains(msg, "HTTP 504"):
@@ -636,6 +641,12 @@ func httpToFuseStatus(err error) gofuse.Status {
 		return gofuse.EIO
 	}
 }
+
+// statusClientClosedRequest mirrors the non-standard 499 status emitted by the
+// server's auth middleware when the client cancels mid-auth. Tracked here so
+// httpToFuseStatus / isTransientLookupErr stay aligned with the server contract
+// without taking a server package dependency.
+const statusClientClosedRequest = 499
 
 func isNotFoundErr(err error) bool {
 	if err == nil {
@@ -659,7 +670,7 @@ func isTransientLookupErr(err error) bool {
 	var se *client.StatusError
 	if errors.As(err, &se) {
 		switch se.StatusCode {
-		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, statusClientClosedRequest:
 			return true
 		}
 	}
