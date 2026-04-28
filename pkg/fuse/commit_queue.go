@@ -14,6 +14,14 @@ import (
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
+// commitQueueDirectPutThreshold is the size limit below which commit queue
+// workers use direct PUT (WriteCtxConditionalWithRevision) instead of
+// multipart upload. This is a transport-path threshold only — it does NOT
+// affect backend storage location (DB inline vs S3), which is controlled by
+// smallFileThreshold (50KB). Files between 50KB and 256KiB are stored in S3
+// via s3.PutObject but skip the multipart initiate/presign/complete overhead.
+const commitQueueDirectPutThreshold = 256 * 1024 // 256 KiB
+
 // CommitEntry represents a pending remote commit.
 type CommitEntry struct {
 	Path        string
@@ -23,6 +31,11 @@ type CommitEntry struct {
 	Kind        PendingKind
 	ShadowSpill bool // true when data is only in shadow file (auto-resolve would OOM)
 }
+
+// CommitSuccessFunc is called after a commit queue entry is successfully
+// uploaded. committedRev is the server-returned revision (>0 for direct PUT,
+// 0 for multipart where the revision is not returned inline).
+type CommitSuccessFunc func(entry *CommitEntry, committedRev int64)
 
 // CommitQueue manages ordered background remote commits with baseRev tracking.
 // It provides backpressure when the queue exceeds maxPending items.
@@ -38,6 +51,10 @@ type CommitQueue struct {
 	journal    *Journal
 	wg         sync.WaitGroup
 	stopped    bool
+
+	// OnSuccess is called after successful upload with the committed
+	// revision. Used by dat9fs to seed readCache and update inode revision.
+	OnSuccess CommitSuccessFunc
 
 	// workCh dispatches entries to upload workers. The buffer is always
 	// larger than maxPending so Enqueue never blocks.
@@ -331,12 +348,12 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			timeout = releaseTimeout(entry.Size)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		err := cq.uploadEntry(ctx, entry)
+		committedRev, err := cq.uploadEntry(ctx, entry)
 		cancel()
 
 		if err == nil {
 			// Success — clean up.
-			cq.onCommitSuccess(entry)
+			cq.onCommitSuccess(entry, committedRev)
 			return
 		}
 		if errors.Is(err, client.ErrConflict) {
@@ -352,32 +369,41 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 	cq.onCommitTerminalFailure(entry)
 }
 
-func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) error {
+// uploadEntry uploads entry data to the server. Returns (committedRev, error).
+// committedRev > 0 when direct PUT is used (server returns revision inline);
+// committedRev == 0 for multipart uploads or ShadowSpill streams.
+func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int64, error) {
 	if cq.shadows == nil {
-		return fmt.Errorf("no shadow store")
+		return 0, fmt.Errorf("no shadow store")
 	}
 
 	expectedRevision := entry.BaseRev
 	if entry.Kind == PendingOverwrite && expectedRevision <= 0 {
-		return fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
+		return 0, fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
 	}
 
 	// ShadowSpill entries: stream directly from shadow file to avoid loading
 	// multi-GiB files into memory. Uses io.SectionReader over the shadow fd.
 	if entry.ShadowSpill {
-		return uploadFromShadow(ctx, cq.client, cq.shadows, entry.Path, expectedRevision)
+		return 0, uploadFromShadow(ctx, cq.client, cq.shadows, entry.Path, expectedRevision)
 	}
 
-	// Non-ShadowSpill: read full content into memory (small files).
+	// Non-ShadowSpill: read full content into memory.
 	data, err := cq.shadows.ReadAll(entry.Path)
 	if err != nil {
-		return fmt.Errorf("read shadow: %w", err)
+		return 0, fmt.Errorf("read shadow: %w", err)
 	}
 
-	// Upload through the same small-file vs multipart client path used by
-	// foreground flushes so large write-back entries don't regress to the
-	// legacy direct PUT code path.
-	return uploadBufferedRemoteFile(ctx, cq.client, entry.Path, data, expectedRevision)
+	// Route based on entry.Size (metadata at enqueue time), NOT len(data).
+	// Files under commitQueueDirectPutThreshold use direct PUT to skip the
+	// multipart initiate/presign/complete/finalize overhead (~440ms).
+	if entry.Size < commitQueueDirectPutThreshold {
+		committedRev, err := cq.client.WriteCtxConditionalWithRevision(ctx, entry.Path, data, expectedRevision)
+		return committedRev, err
+	}
+
+	// Larger non-ShadowSpill files: multipart upload.
+	return 0, uploadBufferedRemoteFile(ctx, cq.client, entry.Path, data, expectedRevision)
 }
 
 func (cq *CommitQueue) removeFromQueue(entry *CommitEntry) {
@@ -391,7 +417,7 @@ func (cq *CommitQueue) removeFromQueue(entry *CommitEntry) {
 	}
 }
 
-func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry) {
+func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) {
 	// Write durable commit record BEFORE cleaning up local state so that
 	// crash recovery never re-uploads an already committed entry.
 	if cq.journal != nil {
@@ -403,6 +429,12 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry) {
 			cq.removeFromQueue(entry)
 			return
 		}
+	}
+
+	// Notify dat9fs to seed readCache + update inode revision before
+	// cleaning up shadow (which is the data source for the cache seed).
+	if cq.OnSuccess != nil {
+		cq.OnSuccess(entry, committedRev)
 	}
 
 	// Clean up shadow and pending index.
@@ -417,7 +449,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry) {
 	// until bookkeeping is complete.
 	cq.removeFromQueue(entry)
 
-	log.Printf("commit queue: successfully uploaded %s (%d bytes)", entry.Path, entry.Size)
+	log.Printf("commit queue: successfully uploaded %s (%d bytes, rev=%d)", entry.Path, entry.Size, committedRev)
 }
 
 // tryAutoResolveConflict attempts to resolve a 409 conflict automatically.
@@ -488,7 +520,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	// Branch 1: idempotent — content already matches server.
 	if bytes.Equal(localData, serverData) {
 		log.Printf("commit queue: auto-resolved conflict for %s (idempotent, content matches server rev %d)", entry.Path, serverRev)
-		cq.onCommitSuccess(entry)
+		cq.onCommitSuccess(entry, 0)
 		return
 	}
 
@@ -510,7 +542,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	}
 
 	log.Printf("commit queue: auto-resolved conflict for %s via LWW (overwrote rev %d → new upload based on rev %d)", entry.Path, entry.BaseRev, serverRev)
-	cq.onCommitSuccess(entry)
+	cq.onCommitSuccess(entry, 0)
 }
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {

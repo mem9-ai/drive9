@@ -14,7 +14,9 @@ func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 	var gotExpected string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
-		w.WriteHeader(http.StatusOK)
+		// Return committed revision in JSON (direct PUT response format).
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
 	}))
 	defer ts.Close()
 
@@ -35,7 +37,14 @@ func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var successPath string
+	var successRev int64
+
 	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		successPath = entry.Path
+		successRev = committedRev
+	}
 	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/ok.txt",
 		BaseRev: 7,
@@ -48,6 +57,12 @@ func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 
 	if gotExpected != "7" {
 		t.Fatalf("expected revision header = %q, want 7", gotExpected)
+	}
+	if successPath != "/ok.txt" {
+		t.Fatalf("OnSuccess path = %q, want /ok.txt", successPath)
+	}
+	if successRev != 8 {
+		t.Fatalf("OnSuccess committedRev = %d, want 8", successRev)
 	}
 	if pending.HasPending("/ok.txt") {
 		t.Fatal("pending entry should be removed after successful commit")
@@ -114,6 +129,66 @@ func TestCommitQueueConflictKeepsPendingState(t *testing.T) {
 	if got := cq.Pending(); got != 0 {
 		t.Fatalf("queue pending count = %d, want 0 after terminal conflict", got)
 	}
+}
+
+// TestCommitQueueDirectPutRouting verifies that files under
+// commitQueueDirectPutThreshold use direct PUT (WriteCtxConditionalWithRevision)
+// which sends raw body, while files at or above the threshold use multipart
+// upload (uploadBufferedRemoteFile → WriteStreamConditional).
+func TestCommitQueueDirectPutRouting(t *testing.T) {
+	var usedDirectPut bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Direct PUT sends Content-Type: application/octet-stream with raw body.
+		// Multipart upload sends to /upload/initiate first.
+		if r.Method == http.MethodPut && r.Header.Get("Content-Type") == "application/octet-stream" {
+			usedDirectPut = true
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","revision":10}`))
+			return
+		}
+		// Fallback: accept anything else (multipart endpoints, etc.)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	t.Run("small file uses direct PUT", func(t *testing.T) {
+		usedDirectPut = false
+		shadow, err := NewShadowStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer shadow.Close()
+		pending, err := NewPendingIndex(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		data := make([]byte, 128*1024) // 128KiB — under 256KiB threshold
+		if err := shadow.WriteFull("/small.bin", data, 5); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pending.PutWithBaseRev("/small.bin", int64(len(data)), PendingOverwrite, 5); err != nil {
+			t.Fatal(err)
+		}
+
+		cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+		if err := cq.Enqueue(&CommitEntry{
+			Path:    "/small.bin",
+			BaseRev: 5,
+			Size:    int64(len(data)),
+			Kind:    PendingOverwrite,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		cq.DrainAll()
+
+		if !usedDirectPut {
+			t.Fatal("128KiB file should use direct PUT, not multipart")
+		}
+		if shadow.Has("/small.bin") {
+			t.Fatal("shadow should be removed after commit")
+		}
+	})
 }
 
 // --- Auto-resolve tests (LWW MVP) ---

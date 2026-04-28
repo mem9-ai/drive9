@@ -1775,6 +1775,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 				} else {
 					fh.ShadowReady = true
 					fh.ShadowSpill = true
+					// Pin shadow so commit queue cleanup doesn't delete it while
+					// this handle is reading.
+					fs.shadowStore.Pin(p)
+					fh.ShadowPinned = true
 				}
 			}
 
@@ -3185,6 +3189,31 @@ func (fs *Dat9FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, att
 
 func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string) gofuse.Status {
 	return gofuse.ENOATTR
+}
+
+// onCommitQueueSuccess is called by the commit queue after a successful upload.
+// It seeds readCache and updates inode revision when committedRev is available,
+// or invalidates the cache otherwise.
+func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
+	if committedRev > 0 && entry.Inode > 0 {
+		// Seed readCache from shadow data before the shadow file is removed.
+		// Only attempt for files under the readCache size limit.
+		if entry.Size < int64(smallFileThreshold) && fs.shadowStore != nil {
+			if data, err := fs.shadowStore.ReadAll(entry.Path); err == nil {
+				fs.readCache.Put(entry.Path, data, committedRev)
+			}
+		}
+		fs.inodes.UpdateRevision(entry.Inode, committedRev)
+		fs.inodes.UpdateSize(entry.Inode, entry.Size)
+		fs.dirCache.Invalidate(parentDir(entry.Path))
+		fs.notifyInode(entry.Inode)
+		parentIno, _ := fs.inodes.GetInode(parentDir(entry.Path))
+		fs.notifyEntry(parentIno, path.Base(entry.Path))
+		fs.notifyInode(parentIno)
+	} else {
+		fs.readCache.Invalidate(entry.Path)
+		fs.dirCache.Invalidate(parentDir(entry.Path))
+	}
 }
 
 func (fs *Dat9FS) String() string {
