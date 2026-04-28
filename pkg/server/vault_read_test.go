@@ -1,307 +1,332 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/dat9/internal/testmysql"
-	"github.com/mem9-ai/dat9/pkg/backend"
-	"github.com/mem9-ai/dat9/pkg/datastore"
-	"github.com/mem9-ai/dat9/pkg/s3client"
-	"github.com/mem9-ai/dat9/pkg/tenant/schema"
+	"github.com/go-sql-driver/mysql"
+	"github.com/mem9-ai/dat9/pkg/encrypt"
+	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/vault"
 )
 
-// newVaultReadTestServer creates a single-tenant server with vault enabled.
-// It returns the server, httptest server, vault store, and vault master key.
-func newVaultReadTestServer(t *testing.T) (*httptest.Server, *vault.Store, *vault.MasterKey) {
+type vaultGrantReadRuntime struct {
+	server   *Server
+	store    *vault.Store
+	tenantID string
+	otherID  string
+	issuer   string
+	cleanup  func()
+}
+
+func newVaultGrantReadRuntime(t *testing.T) *vaultGrantReadRuntime {
 	t.Helper()
+	if testDSN == "" {
+		t.Skip("no test database available")
+	}
 
-	s3Dir, err := os.MkdirTemp("", "dat9-vault-read-*")
+	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(s3Dir) })
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
 
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+
+	parsed, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port := "127.0.0.1", 3306
+	if parsed.Addr != "" {
+		h, p, _ := strings.Cut(parsed.Addr, ":")
+		if h != "" {
+			host = h
+		}
+		if p != "" {
+			_, _ = fmt.Sscanf(p, "%d", &port)
+		}
+	}
 	initServerTenantSchema(t, testDSN)
-	store, err := datastore.Open(testDSN)
+	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
 	if err != nil {
 		t.Fatal(err)
 	}
-	testmysql.ResetDB(t, store.DB())
-	// Init vault tables on the same DB.
-	if err := schema.ExecSchemaStatements(store.DB(), schema.VaultTiDBSchemaStatements()); err != nil {
-		t.Fatal(err)
+	now := time.Now().UTC()
+	tenantID := token.NewID()
+	otherID := token.NewID()
+	newTenantMeta := func(id string) *meta.Tenant {
+		return &meta.Tenant{
+			ID:               id,
+			Status:           meta.TenantActive,
+			DBHost:           host,
+			DBPort:           port,
+			DBUser:           parsed.User,
+			DBPasswordCipher: passCipher,
+			DBName:           parsed.DBName,
+			DBTLS:            false,
+			Provider:         tenant.ProviderTiDBZero,
+			SchemaVersion:    1,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
 	}
-	t.Cleanup(func() { _ = store.Close() })
-
-	s3c, err := s3client.NewLocal(s3Dir, "/s3")
+	tenantMeta := newTenantMeta(tenantID)
+	for _, tenantRecord := range []*meta.Tenant{tenantMeta, newTenantMeta(otherID)} {
+		if err := metaStore.InsertTenant(context.Background(), tenantRecord); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backend, release, err := pool.Acquire(context.Background(), tenantMeta)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := backend.NewWithS3(store, s3c)
-	if err != nil {
-		t.Fatal(err)
+	release()
+	if err := vault.InitSchema(backend.Store().DB()); err != nil {
+		t.Fatalf("init vault schema: %v", err)
+	}
+	for _, tbl := range []string{
+		"vault_audit_log",
+		"vault_grants",
+		"vault_tokens",
+		"vault_secret_fields",
+		"vault_secrets",
+		"vault_deks",
+		"vault_policies",
+	} {
+		if _, err := backend.Store().DB().Exec("DELETE FROM " + tbl); err != nil {
+			t.Fatalf("clean %s: %v", tbl, err)
+		}
 	}
 
 	vaultKey := make([]byte, 32)
 	if _, err := rand.Read(vaultKey); err != nil {
 		t.Fatal(err)
 	}
-	mk, err := vault.NewMasterKey(vaultKey)
+	issuer := "https://vault-test.invalid"
+	store := vault.NewStore(backend.Store().DB(), mustVaultMasterKey(t, vaultKey))
+	server := NewWithConfig(Config{
+		Meta:           metaStore,
+		Pool:           pool,
+		TokenSecret:    []byte("test-token-secret"),
+		VaultMasterKey: vaultKey,
+		VaultIssuerURL: issuer,
+	})
+
+	return &vaultGrantReadRuntime{
+		server:   server,
+		store:    store,
+		tenantID: tenantID,
+		otherID:  otherID,
+		issuer:   issuer,
+		cleanup: func() {
+			pool.Close()
+			_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+			_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+			_ = metaStore.Close()
+		},
+	}
+}
+
+func mustVaultMasterKey(t *testing.T, raw []byte) *vault.MasterKey {
+	t.Helper()
+	mk, err := vault.NewMasterKey(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	srv := NewWithConfig(Config{
-		Backend:        b,
-		VaultMasterKey: vaultKey,
-		VaultIssuerURL: "https://test.invalid",
-	})
-	ts := httptest.NewServer(srv)
-	t.Cleanup(ts.Close)
-
-	vs := vault.NewStore(store.DB(), mk)
-	return ts, vs, mk
+	return mk
 }
 
-func vaultReadReq(t *testing.T, ts *httptest.Server, path, token string) *http.Response {
+func (rt *vaultGrantReadRuntime) issueGrant(t *testing.T, scope []string, perm vault.GrantPerm) (string, *vault.VaultGrant) {
 	t.Helper()
-	req, _ := http.NewRequest(http.MethodGet, ts.URL+path, nil)
+	tok, grant, err := rt.store.IssueGrant(
+		context.Background(), rt.tenantID, rt.issuer,
+		vault.PrincipalDelegated, "agent-test", scope, perm, time.Hour, "",
+	)
+	if err != nil {
+		t.Fatalf("IssueGrant: %v", err)
+	}
+	return tok, grant
+}
+
+func (rt *vaultGrantReadRuntime) createSecret(t *testing.T) {
+	t.Helper()
+	_, err := rt.store.CreateSecret(context.Background(), rt.tenantID, "test3", "owner", vault.SecretTypeGeneric, map[string][]byte{
+		"k1": []byte("value1"),
+		"k2": []byte("value2"),
+	})
+	if err != nil {
+		t.Fatalf("CreateSecret: %v", err)
+	}
+}
+
+func doVaultGrantRead(t *testing.T, srv *Server, token, path string) (*http.Response, []byte) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	resp := rec.Result()
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
 	if err != nil {
-		t.Fatalf("request %s: %v", path, err)
+		t.Fatalf("read response body: %v", err)
 	}
-	return resp
+	return resp, body
 }
 
-// TestVaultReadGrantTokenSuccess proves the full /v1/vault/read/* path works
-// with a vt_ grant token: issue grant → store secret → read via HTTP.
-func TestVaultReadGrantTokenSuccess(t *testing.T) {
-	ts, vs, _ := newVaultReadTestServer(t)
-	tenantID := "local" // single-tenant fallback uses "local"
-
-	// Store a secret.
-	_, err := vs.CreateSecret(t.Context(), tenantID, "db-prod", "test", vault.SecretTypeGeneric, map[string][]byte{
-		"password": []byte("s3cret"),
-		"host":     []byte("db.example.com"),
-	})
-	if err != nil {
-		t.Fatalf("CreateSecret: %v", err)
+func tamperGrantTenantID(t *testing.T, raw, tenantID string) string {
+	t.Helper()
+	if !strings.HasPrefix(raw, "vt_") {
+		t.Fatal("grant token prefix is not vt_")
 	}
-
-	// Issue a read grant.
-	tok, _, err := vs.IssueGrant(
-		t.Context(), tenantID, "https://test.invalid",
-		vault.PrincipalDelegated, "agent-1", []string{"db-prod"},
-		vault.GrantPermRead, time.Hour, "",
-	)
-	if err != nil {
-		t.Fatalf("IssueGrant: %v", err)
+	body := strings.TrimPrefix(raw, "vt_")
+	parts := strings.Split(body, ".")
+	if len(parts) != 3 {
+		t.Fatalf("grant token parts = %d, want 3", len(parts))
 	}
+	payloadJSON, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	payload["tenant_id"] = tenantID
+	payloadJSON, err = json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	parts[1] = base64.RawURLEncoding.EncodeToString(payloadJSON)
+	return "vt_" + strings.Join(parts, ".")
+}
 
-	// Read whole secret.
-	resp := vaultReadReq(t, ts, "/v1/vault/read/db-prod", tok)
-	defer resp.Body.Close()
+func TestVaultGrantReadTokenSuccessResponseShape(t *testing.T) {
+	rt := newVaultGrantReadRuntime(t)
+	defer rt.cleanup()
+	rt.createSecret(t)
+	tok, _ := rt.issueGrant(t, []string{"test3"}, vault.GrantPermRead)
+
+	resp, body := doVaultGrantRead(t, rt.server, tok, "/v1/vault/read/test3?format=json")
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+		t.Fatalf("whole secret status=%d body=%s", resp.StatusCode, body)
 	}
-	var secretResp map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&secretResp); err != nil {
-		t.Fatalf("decode: %v", err)
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("whole secret content-type = %q, want application/json", ct)
 	}
-	fields, ok := secretResp["fields"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected fields map, got %T: %v", secretResp["fields"], secretResp)
+	var fields map[string]string
+	if err := json.Unmarshal(body, &fields); err != nil {
+		t.Fatalf("decode whole secret JSON: %v body=%s", err, body)
 	}
-	if fields["password"] != "s3cret" {
-		t.Fatalf("password: got %v", fields["password"])
+	if fields["k1"] != "value1" || fields["k2"] != "value2" {
+		t.Fatalf("fields = %#v", fields)
 	}
 
-	// Read single field.
-	resp2 := vaultReadReq(t, ts, "/v1/vault/read/db-prod/host", tok)
-	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp2.Body)
-		t.Fatalf("field read: expected 200, got %d: %s", resp2.StatusCode, body)
+	resp, body = doVaultGrantRead(t, rt.server, tok, "/v1/vault/read/test3/k1")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("field status=%d body=%s", resp.StatusCode, body)
 	}
-	fieldBody, _ := io.ReadAll(resp2.Body)
-	if string(fieldBody) != "db.example.com" {
-		t.Fatalf("field value: got %q", fieldBody)
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Fatalf("field content-type = %q, want text/plain", ct)
+	}
+	if string(body) != "value1" {
+		t.Fatalf("field body = %q, want value1", body)
 	}
 }
 
-// TestVaultReadGrantTokenScopeDenied proves that a grant token cannot read
-// secrets outside its scope.
-func TestVaultReadGrantTokenScopeDenied(t *testing.T) {
-	ts, vs, _ := newVaultReadTestServer(t)
-	tenantID := "local"
+func TestVaultGrantReadScopeDenied(t *testing.T) {
+	rt := newVaultGrantReadRuntime(t)
+	defer rt.cleanup()
+	rt.createSecret(t)
+	tok, _ := rt.issueGrant(t, []string{"test3/k2"}, vault.GrantPermRead)
 
-	_, err := vs.CreateSecret(t.Context(), tenantID, "aws-prod", "test", vault.SecretTypeGeneric, map[string][]byte{
-		"key": []byte("AKIA..."),
-	})
-	if err != nil {
-		t.Fatalf("CreateSecret: %v", err)
-	}
-
-	// Grant scoped to "db-prod" only.
-	tok, _, err := vs.IssueGrant(
-		t.Context(), tenantID, "https://test.invalid",
-		vault.PrincipalDelegated, "agent-1", []string{"db-prod"},
-		vault.GrantPermRead, time.Hour, "",
-	)
-	if err != nil {
-		t.Fatalf("IssueGrant: %v", err)
-	}
-
-	// Try reading "aws-prod" — should be denied.
-	resp := vaultReadReq(t, ts, "/v1/vault/read/aws-prod", tok)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 403, got %d: %s", resp.StatusCode, body)
+	resp, body := doVaultGrantRead(t, rt.server, tok, "/v1/vault/read/test3/k1")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s, want 404", resp.StatusCode, body)
 	}
 }
 
-// TestVaultReadGrantTokenRevoked proves that a revoked grant token is rejected
-// on the read path.
-func TestVaultReadGrantTokenRevoked(t *testing.T) {
-	ts, vs, _ := newVaultReadTestServer(t)
-	tenantID := "local"
-
-	_, err := vs.CreateSecret(t.Context(), tenantID, "db-prod", "test", vault.SecretTypeGeneric, map[string][]byte{
-		"password": []byte("s3cret"),
-	})
-	if err != nil {
-		t.Fatalf("CreateSecret: %v", err)
-	}
-
-	tok, grant, err := vs.IssueGrant(
-		t.Context(), tenantID, "https://test.invalid",
-		vault.PrincipalDelegated, "agent-1", []string{"db-prod"},
-		vault.GrantPermRead, time.Hour, "",
-	)
-	if err != nil {
-		t.Fatalf("IssueGrant: %v", err)
-	}
-
-	// Revoke the grant.
-	if err := vs.RevokeGrant(t.Context(), tenantID, grant.GrantID, "admin", "rotated"); err != nil {
+func TestVaultGrantReadRevoked(t *testing.T) {
+	rt := newVaultGrantReadRuntime(t)
+	defer rt.cleanup()
+	rt.createSecret(t)
+	tok, grant := rt.issueGrant(t, []string{"test3"}, vault.GrantPermRead)
+	if err := rt.store.RevokeGrant(context.Background(), rt.tenantID, grant.GrantID, "owner", "test"); err != nil {
 		t.Fatalf("RevokeGrant: %v", err)
 	}
 
-	resp := vaultReadReq(t, ts, "/v1/vault/read/db-prod", tok)
-	defer resp.Body.Close()
+	resp, body := doVaultGrantRead(t, rt.server, tok, "/v1/vault/read/test3/k1")
 	if resp.StatusCode != http.StatusUnauthorized {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 401, got %d: %s", resp.StatusCode, body)
+		t.Fatalf("status=%d body=%s, want 401", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte("token revoked")) {
+		t.Fatalf("body=%s, want token revoked", body)
 	}
 }
 
-// TestVaultReadGrantTokenPermNotRead proves that a write-perm grant token is
-// rejected by the server read path (verifyGrantReadToken enforces perm==read).
-func TestVaultReadGrantTokenPermNotRead(t *testing.T) {
-	ts, vs, _ := newVaultReadTestServer(t)
-	tenantID := "local"
-
-	_, err := vs.CreateSecret(t.Context(), tenantID, "db-prod", "test", vault.SecretTypeGeneric, map[string][]byte{
-		"password": []byte("s3cret"),
-	})
+func TestVaultGrantReadTamperedTenantIDFailsNoFallback(t *testing.T) {
+	rt := newVaultGrantReadRuntime(t)
+	defer rt.cleanup()
+	rt.createSecret(t)
+	tok, _ := rt.issueGrant(t, []string{"test3"}, vault.GrantPermRead)
+	tampered := tamperGrantTenantID(t, tok, rt.otherID)
+	peekedTenant, err := vault.PeekGrantTenantID(tampered)
 	if err != nil {
-		t.Fatalf("CreateSecret: %v", err)
+		t.Fatalf("PeekGrantTenantID: %v", err)
+	}
+	if peekedTenant != rt.otherID {
+		t.Fatalf("peeked tenant = %q, want forged route %q", peekedTenant, rt.otherID)
+	}
+	if _, err := rt.store.VerifyAndResolveGrant(context.Background(), rt.otherID, rt.issuer, tampered); err == nil {
+		t.Fatal("expected tampered tenant_id to fail HMAC verification under forged tenant")
 	}
 
-	// Issue a WRITE grant — should be rejected on the read path.
-	tok, _, err := vs.IssueGrant(
-		t.Context(), tenantID, "https://test.invalid",
-		vault.PrincipalDelegated, "agent-1", []string{"db-prod"},
-		vault.GrantPermWrite, time.Hour, "",
-	)
-	if err != nil {
-		t.Fatalf("IssueGrant: %v", err)
-	}
-
-	resp := vaultReadReq(t, ts, "/v1/vault/read/db-prod", tok)
-	defer resp.Body.Close()
+	resp, body := doVaultGrantRead(t, rt.server, tampered, "/v1/vault/read/test3/k1")
 	if resp.StatusCode != http.StatusUnauthorized {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 401 for write-perm grant on read path, got %d: %s", resp.StatusCode, body)
+		t.Fatalf("status=%d body=%s, want 401", resp.StatusCode, body)
+	}
+	if bytes.Contains(body, []byte("value1")) {
+		t.Fatalf("tampered tenant_id unexpectedly read secret: %s", body)
 	}
 }
 
-// TestVaultReadGrantTokenTamperedTenantID proves that a vt_ grant token with a
-// tampered tenant_id (peeked for routing) fails at HMAC verification because
-// the server derives a different CSK for the wrong tenant.
-//
-// In single-tenant fallback mode, tenant_id is always "local" from the
-// injected scope, so a token issued for a different tenant_id will fail because
-// VerifyAndResolveGrant derives CSK from "local" but the token was signed with
-// CSK derived from a different tenant.
-func TestVaultReadGrantTokenTamperedTenantID(t *testing.T) {
-	ts, vs, _ := newVaultReadTestServer(t)
-
-	// Issue a grant for tenant "evil-tenant" — this uses a different CSK.
-	tok, _, err := vs.IssueGrant(
-		t.Context(), "evil-tenant", "https://test.invalid",
-		vault.PrincipalDelegated, "agent-1", []string{"db-prod"},
-		vault.GrantPermRead, time.Hour, "",
-	)
+func TestVaultGrantReadRejectsWritePermAfterVerify(t *testing.T) {
+	rt := newVaultGrantReadRuntime(t)
+	defer rt.cleanup()
+	rt.createSecret(t)
+	tok, _ := rt.issueGrant(t, []string{"test3"}, vault.GrantPermWrite)
+	claims, err := rt.store.VerifyAndResolveGrant(context.Background(), rt.tenantID, rt.issuer, tok)
 	if err != nil {
-		t.Fatalf("IssueGrant: %v", err)
+		t.Fatalf("VerifyAndResolveGrant: %v", err)
+	}
+	if claims.Perm != vault.GrantPermWrite {
+		t.Fatalf("verified perm = %q, want write", claims.Perm)
 	}
 
-	// Send to the server — scope.TenantID is "local", but the token was signed
-	// for "evil-tenant". HMAC verification will fail (different CSK).
-	resp := vaultReadReq(t, ts, "/v1/vault/read/db-prod", tok)
-	defer resp.Body.Close()
+	resp, body := doVaultGrantRead(t, rt.server, tok, "/v1/vault/read/test3/k1")
 	if resp.StatusCode != http.StatusUnauthorized {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 401 for tampered tenant_id, got %d: %s", resp.StatusCode, body)
-	}
-}
-
-// TestVaultReadFieldContentType proves response-shape parity: single-field
-// reads return application/octet-stream (raw bytes), not JSON.
-func TestVaultReadFieldContentType(t *testing.T) {
-	ts, vs, _ := newVaultReadTestServer(t)
-	tenantID := "local"
-
-	_, err := vs.CreateSecret(t.Context(), tenantID, "db-prod", "test", vault.SecretTypeGeneric, map[string][]byte{
-		"password": []byte("s3cret"),
-	})
-	if err != nil {
-		t.Fatalf("CreateSecret: %v", err)
-	}
-
-	tok, _, err := vs.IssueGrant(
-		t.Context(), tenantID, "https://test.invalid",
-		vault.PrincipalDelegated, "agent-1", []string{"db-prod"},
-		vault.GrantPermRead, time.Hour, "",
-	)
-	if err != nil {
-		t.Fatalf("IssueGrant: %v", err)
-	}
-
-	resp := vaultReadReq(t, ts, "/v1/vault/read/db-prod/password", tok)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
-	}
-	ct := resp.Header.Get("Content-Type")
-	if ct != "application/octet-stream" {
-		t.Fatalf("Content-Type: got %q, want application/octet-stream", ct)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "s3cret" {
-		t.Fatalf("field value: got %q", body)
+		t.Fatalf("status=%d body=%s, want 401", resp.StatusCode, body)
 	}
 }
