@@ -60,6 +60,7 @@ func (s *Store) IssueGrant(
 	claims := &VaultGrantClaims{
 		Issuer:        issuer,
 		GrantID:       grantID,
+		TenantID:      tenantID,
 		PrincipalType: principal,
 		Agent:         agent,
 		Scope:         scope,

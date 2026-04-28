@@ -674,7 +674,18 @@ func (s *Server) handleVaultAudit(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---- Consumption API: /v1/vault/read ----
-// Authenticated by capability token (NOT tenant token).
+// Authenticated by capability token or grant token (NOT tenant token).
+
+// vaultReadPrincipal is the unified read-path identity extracted from either
+// a legacy cap token (vault_ prefix) or a grant token (vt_ prefix). The
+// handlers below operate on this struct, not on raw token types.
+type vaultReadPrincipal struct {
+	TenantID string
+	TokenID  string   // grant_id or cap token_id — used for audit
+	AgentID  string   // agent field from token
+	TaskID   string   // legacy cap tokens only; empty for grants
+	Scope    []string // secret scope
+}
 
 func (s *Server) handleVaultRead(w http.ResponseWriter, r *http.Request, sub string) {
 	if r.Method != http.MethodGet {
@@ -711,12 +722,12 @@ func (s *Server) handleVaultRead(w http.ResponseWriter, r *http.Request, sub str
 
 	vs := vault.NewStore(scope.Backend.Store().DB(), s.vaultMK)
 
-	// Full 4-step verification: HMAC signature → TTL → DB revocation → claims.
+	// Full verification: HMAC signature → TTL → DB revocation → claims.
 	// IMPORTANT: Do NOT write audit events before verification succeeds.
 	// The tenant_id comes from an unverified peek and could be forged;
 	// writing to tenant audit before proving token authenticity would let
 	// an attacker inject events into any tenant's audit log.
-	claims, err := vs.VerifyAndResolveCapToken(r.Context(), tenantID, raw)
+	principal, err := s.verifyVaultReadToken(r, vs, tenantID, raw)
 	if err != nil {
 		// Log to server-level observability only — not tenant audit.
 		if strings.Contains(err.Error(), "expired") {
@@ -733,7 +744,7 @@ func (s *Server) handleVaultRead(w http.ResponseWriter, r *http.Request, sub str
 	sub = strings.TrimPrefix(sub, "/")
 	if sub == "" {
 		// Enumerate: list secrets in scope.
-		s.handleVaultReadEnumerate(w, r, vs, claims)
+		s.handleVaultReadEnumerate(w, r, vs, principal)
 		return
 	}
 
@@ -745,29 +756,72 @@ func (s *Server) handleVaultRead(w http.ResponseWriter, r *http.Request, sub str
 	}
 
 	if fieldName != "" {
-		s.handleVaultReadField(w, r, vs, claims, secretName, fieldName)
+		s.handleVaultReadField(w, r, vs, principal, secretName, fieldName)
 	} else {
-		s.handleVaultReadSecret(w, r, vs, claims, secretName)
+		s.handleVaultReadSecret(w, r, vs, principal, secretName)
 	}
 }
 
-func (s *Server) handleVaultReadEnumerate(w http.ResponseWriter, r *http.Request, vs *vault.Store, claims *vault.CapTokenClaims) {
-	scopedNames := vault.ScopedSecretNames(claims.Scope)
+// verifyVaultReadToken verifies a capability or grant token and returns a
+// unified vaultReadPrincipal. Supports both legacy cap tokens (vault_ prefix)
+// and grant tokens (vt_ prefix).
+func (s *Server) verifyVaultReadToken(r *http.Request, vs *vault.Store, tenantID, raw string) (*vaultReadPrincipal, error) {
+	if strings.HasPrefix(raw, "vt_") {
+		return s.verifyGrantReadToken(r, vs, tenantID, raw)
+	}
+	return s.verifyCapReadToken(r, vs, tenantID, raw)
+}
+
+// verifyCapReadToken verifies a legacy cap token and maps to vaultReadPrincipal.
+func (s *Server) verifyCapReadToken(r *http.Request, vs *vault.Store, tenantID, raw string) (*vaultReadPrincipal, error) {
+	claims, err := vs.VerifyAndResolveCapToken(r.Context(), tenantID, raw)
+	if err != nil {
+		return nil, err
+	}
+	return &vaultReadPrincipal{
+		TenantID: claims.TenantID,
+		TokenID:  claims.TokenID,
+		AgentID:  claims.AgentID,
+		TaskID:   claims.TaskID,
+		Scope:    claims.Scope,
+	}, nil
+}
+
+// verifyGrantReadToken verifies a grant token and maps to vaultReadPrincipal.
+// Grant tokens must have perm == "read" for the read path.
+func (s *Server) verifyGrantReadToken(r *http.Request, vs *vault.Store, tenantID, raw string) (*vaultReadPrincipal, error) {
+	claims, err := vs.VerifyAndResolveGrant(r.Context(), tenantID, s.vaultIssuerURL, raw)
+	if err != nil {
+		return nil, err
+	}
+	if claims.Perm != vault.GrantPermRead {
+		return nil, fmt.Errorf("grant perm must be read")
+	}
+	return &vaultReadPrincipal{
+		TenantID: claims.TenantID,
+		TokenID:  claims.GrantID,
+		AgentID:  claims.Agent,
+		Scope:    claims.Scope,
+	}, nil
+}
+
+func (s *Server) handleVaultReadEnumerate(w http.ResponseWriter, r *http.Request, vs *vault.Store, p *vaultReadPrincipal) {
+	scopedNames := vault.ScopedSecretNames(p.Scope)
 	// Filter to secrets that actually exist.
 	var available []string
 	for _, name := range scopedNames {
-		_, err := vs.GetSecret(r.Context(), claims.TenantID, name)
+		_, err := vs.GetSecret(r.Context(), p.TenantID, name)
 		if err == nil {
 			available = append(available, name)
 		}
 	}
 
 	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
-		TenantID:  claims.TenantID,
+		TenantID:  p.TenantID,
 		EventType: "secret.list",
-		TokenID:   claims.TokenID,
-		AgentID:   claims.AgentID,
-		TaskID:    claims.TaskID,
+		TokenID:   p.TokenID,
+		AgentID:   p.AgentID,
+		TaskID:    p.TaskID,
 		Adapter:   "api",
 	})
 
@@ -778,15 +832,15 @@ func (s *Server) handleVaultReadEnumerate(w http.ResponseWriter, r *http.Request
 	_ = json.NewEncoder(w).Encode(map[string]any{"secrets": available})
 }
 
-func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, vs *vault.Store, claims *vault.CapTokenClaims, secretName string) {
+func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, vs *vault.Store, p *vaultReadPrincipal, secretName string) {
 	// Scope check.
-	allFields, allowedFields := vault.AllowedFields(claims.Scope, secretName)
+	allFields, allowedFields := vault.AllowedFields(p.Scope, secretName)
 	if !allFields && len(allowedFields) == 0 {
 		_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
-			TenantID:   claims.TenantID,
+			TenantID:   p.TenantID,
 			EventType:  "secret.denied",
-			TokenID:    claims.TokenID,
-			AgentID:    claims.AgentID,
+			TokenID:    p.TokenID,
+			AgentID:    p.AgentID,
 			SecretName: secretName,
 			Detail:     map[string]string{"reason": "out_of_scope"},
 		})
@@ -795,7 +849,7 @@ func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, v
 		return
 	}
 
-	fields, err := vs.ReadSecretFields(r.Context(), claims.TenantID, secretName)
+	fields, err := vs.ReadSecretFields(r.Context(), p.TenantID, secretName)
 	if err != nil {
 		if errors.Is(err, vault.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "not found")
@@ -819,11 +873,11 @@ func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, v
 	}
 
 	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
-		TenantID:   claims.TenantID,
+		TenantID:   p.TenantID,
 		EventType:  "secret.read",
-		TokenID:    claims.TokenID,
-		AgentID:    claims.AgentID,
-		TaskID:     claims.TaskID,
+		TokenID:    p.TokenID,
+		AgentID:    p.AgentID,
+		TaskID:     p.TaskID,
 		SecretName: secretName,
 		Adapter:    "api",
 	})
@@ -847,14 +901,14 @@ func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, v
 	}
 }
 
-func (s *Server) handleVaultReadField(w http.ResponseWriter, r *http.Request, vs *vault.Store, claims *vault.CapTokenClaims, secretName, fieldName string) {
+func (s *Server) handleVaultReadField(w http.ResponseWriter, r *http.Request, vs *vault.Store, p *vaultReadPrincipal, secretName, fieldName string) {
 	// Scope check.
-	if !vault.CheckScope(claims.Scope, secretName, fieldName) {
+	if !vault.CheckScope(p.Scope, secretName, fieldName) {
 		_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
-			TenantID:   claims.TenantID,
+			TenantID:   p.TenantID,
 			EventType:  "secret.denied",
-			TokenID:    claims.TokenID,
-			AgentID:    claims.AgentID,
+			TokenID:    p.TokenID,
+			AgentID:    p.AgentID,
 			SecretName: secretName,
 			FieldName:  fieldName,
 			Detail:     map[string]string{"reason": "out_of_scope"},
@@ -863,7 +917,7 @@ func (s *Server) handleVaultReadField(w http.ResponseWriter, r *http.Request, vs
 		return
 	}
 
-	plaintext, err := vs.ReadSecretField(r.Context(), claims.TenantID, secretName, fieldName)
+	plaintext, err := vs.ReadSecretField(r.Context(), p.TenantID, secretName, fieldName)
 	if err != nil {
 		if errors.Is(err, vault.ErrNotFound) || errors.Is(err, vault.ErrFieldNotFound) {
 			errJSON(w, http.StatusNotFound, "not found")
@@ -874,11 +928,11 @@ func (s *Server) handleVaultReadField(w http.ResponseWriter, r *http.Request, vs
 	}
 
 	_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
-		TenantID:   claims.TenantID,
+		TenantID:   p.TenantID,
 		EventType:  "secret.read",
-		TokenID:    claims.TokenID,
-		AgentID:    claims.AgentID,
-		TaskID:     claims.TaskID,
+		TokenID:    p.TokenID,
+		AgentID:    p.AgentID,
+		TaskID:     p.TaskID,
 		SecretName: secretName,
 		FieldName:  fieldName,
 		Adapter:    "api",
