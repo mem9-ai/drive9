@@ -989,6 +989,12 @@ func TestMetricsEndpoint(t *testing.T) {
 	if !strings.Contains(text, `dat9_service_operation_duration_seconds_bucket{component="backend",operation="exec_sql",result="ok",le="0.01"}`) {
 		t.Fatalf("expected service operation histogram bucket in response: %s", text)
 	}
+	if !strings.Contains(text, `dat9_db_operations_total{role="user"`) {
+		t.Fatalf("expected user db operation metric in response: %s", text)
+	}
+	if !strings.Contains(text, `dat9_db_pool_registered{role="user"}`) {
+		t.Fatalf("expected user db pool metric in response: %s", text)
+	}
 	if !strings.Contains(text, `dat9_tenant_events_total{event="fs_write",result="ok"}`) {
 		t.Fatalf("expected fs_write tenant event metric in response: %s", text)
 	}

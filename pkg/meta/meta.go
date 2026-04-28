@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
-
 	"github.com/mem9-ai/dat9/internal/schemaspec"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/metrics"
@@ -88,24 +86,19 @@ func Open(dsn string) (*Store, error) {
 	if strings.Contains(dsn, "multiStatements=true") {
 		return nil, fmt.Errorf("multiStatements=true is not allowed in production DSN")
 	}
-	db, err := sql.Open("mysql", dsn)
+	db, err := mysqlutil.OpenInstrumented(context.Background(), dsn, mysqlutil.RoleMeta)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
-	applyMySQLPoolDefaults(db)
-	if err := db.Ping(); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("ping db: %w", err)
-	}
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
-		_ = db.Close()
+		_ = mysqlutil.CloseInstrumented(db)
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	return s, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error { return mysqlutil.CloseInstrumented(s.db) }
 func (s *Store) DB() *sql.DB  { return s.db }
 
 func applyMySQLPoolDefaults(db *sql.DB) {
