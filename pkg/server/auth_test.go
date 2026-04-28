@@ -15,9 +15,12 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/pkg/encrypt"
+	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 type authTestRuntime struct {
@@ -201,6 +204,43 @@ func TestAuthKeepsBorrowedBackendValidDuringRequestAfterInvalidate(t *testing.T)
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status=%d", resp.StatusCode)
+	}
+}
+
+func TestAuthClientCanceledDoesNotLogBackendUnavailable(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+
+	core, recorded := observer.New(zap.InfoLevel)
+	restoreLogger := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(restoreLogger) })
+
+	calledNext := false
+	h := tenantAuthMiddleware(rt.meta, rt.pool, rt.tokenSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calledNext = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/v1/fs/canceled.txt", nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+rt.token)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if calledNext {
+		t.Fatal("next handler should not be called after canceled auth")
+	}
+	if rec.Code != statusClientClosedRequest {
+		t.Fatalf("status=%d, want %d", rec.Code, statusClientClosedRequest)
+	}
+	if entries := recorded.FilterField(zap.String("event", "auth_backend_unavailable")).AllUntimed(); len(entries) != 0 {
+		t.Fatalf("auth_backend_unavailable logs = %d, want 0", len(entries))
+	}
+	if entries := recorded.FilterField(zap.String("event", "auth_client_canceled")).AllUntimed(); len(entries) != 1 {
+		t.Fatalf("auth_client_canceled logs = %d, want 1", len(entries))
 	}
 }
 
