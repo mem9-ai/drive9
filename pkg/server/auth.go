@@ -29,6 +29,8 @@ type TenantScope struct {
 	Backend      *backend.Dat9Backend
 }
 
+const statusClientClosedRequest = 499
+
 func ScopeFromContext(ctx context.Context) *TenantScope {
 	s, _ := ctx.Value(tenantScopeKey).(*TenantScope)
 	return s
@@ -40,6 +42,19 @@ func withScope(ctx context.Context, scope *TenantScope) context.Context {
 
 func authPhaseMs(start time.Time) float64 {
 	return float64(time.Since(start).Microseconds()) / 1000.0
+}
+
+func isClientCanceled(ctx context.Context, err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
+}
+
+func logAuthClientCanceled(ctx context.Context, event string, kv ...any) {
+	logger.Info(ctx, "server_event", eventFields(ctx, event, kv...)...)
+	metricEvent(ctx, "auth", "result", "client_canceled")
+}
+
+func writeClientCanceled(w http.ResponseWriter) {
+	w.WriteHeader(statusClientClosedRequest)
 }
 
 func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret []byte, next http.Handler) http.Handler {
@@ -61,6 +76,11 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_key_not_found")...)
 				metricEvent(r.Context(), "auth", "result", "key_not_found")
 				errJSON(w, http.StatusUnauthorized, "invalid API key")
+				return
+			}
+			if isClientCanceled(r.Context(), err) {
+				logAuthClientCanceled(r.Context(), "auth_client_canceled")
+				writeClientCanceled(w)
 				return
 			}
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "auth_backend_unavailable", "error", err)...)
@@ -87,6 +107,11 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 		plain, err := poolDecryptToken(r.Context(), pool, resolved.APIKey.JWTCiphertext)
 		decryptDurationMs := authPhaseMs(decryptStart)
 		if err != nil {
+			if isClientCanceled(r.Context(), err) {
+				logAuthClientCanceled(r.Context(), "auth_decrypt_client_canceled", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID)
+				writeClientCanceled(w)
+				return
+			}
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "auth_decrypt_failed", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 			metricEvent(r.Context(), "auth", "result", "decrypt_failed")
 			errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
@@ -144,6 +169,11 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 		b, release, err := pool.Acquire(r.Context(), &resolved.Tenant)
 		acquireDurationMs := authPhaseMs(acquireStart)
 		if err != nil {
+			if isClientCanceled(r.Context(), err) {
+				logAuthClientCanceled(r.Context(), "backend_load_client_canceled", "tenant_id", resolved.Tenant.ID)
+				writeClientCanceled(w)
+				return
+			}
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "backend_load_failed", "tenant_id", resolved.Tenant.ID, "error", err)...)
 			metricEvent(r.Context(), "tenant_backend", "result", "load_failed")
 			errJSON(w, http.StatusInternalServerError, "backend unavailable")

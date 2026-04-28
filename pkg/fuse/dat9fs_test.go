@@ -937,6 +937,31 @@ func TestHTTPToFuseStatus_MapsGatewayTimeoutToEAGAIN(t *testing.T) {
 	}
 }
 
+// TestHTTPToFuseStatus_MapsClientClosedRequestToEAGAIN locks the contract
+// between the server's tenantAuthMiddleware (which writes 499 when a request
+// is canceled mid-auth) and the FUSE client. Without this mapping, a canceled
+// read/lookup would surface as EIO instead of going through the existing
+// retryable EAGAIN path that other transient/canceled errors use.
+func TestHTTPToFuseStatus_MapsClientClosedRequestToEAGAIN(t *testing.T) {
+	want := gofuse.Status(syscall.EAGAIN)
+	if got := httpToFuseStatus(&client.StatusError{StatusCode: 499, Message: ""}); got != want {
+		t.Fatalf("status error 499 = %v, want %v", got, want)
+	}
+	if got := httpToFuseStatus(fmt.Errorf("HTTP 499: client closed request")); got != want {
+		t.Fatalf("string error 499 = %v, want %v", got, want)
+	}
+}
+
+// TestIsTransientLookupErr_Treats499AsTransient ensures the retry path used by
+// Lookup/GetAttr classifies a 499 (Client Closed Request) the same way it
+// treats context.Canceled and 5xx, keeping retry-after-cancel semantics aligned
+// with the server's auth middleware.
+func TestIsTransientLookupErr_Treats499AsTransient(t *testing.T) {
+	if !isTransientLookupErr(&client.StatusError{StatusCode: 499, Message: ""}) {
+		t.Fatal("499 should be classified as transient")
+	}
+}
+
 func TestOpenReadOnlyLargeFileGetsPrefetcher(t *testing.T) {
 	size := int64(1024 * 1024) // 1MB — above smallFileThreshold
 	data := make([]byte, size)
