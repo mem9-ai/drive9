@@ -141,7 +141,7 @@ func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDe
 	readyCtx, readyCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	if err := waitForWebDAVReady(readyCtx, serverURL); err != nil {
 		readyCancel()
-		srv.Close()
+		_ = srv.Close()
 		select {
 		case serveErr := <-srvErr:
 			if serveErr != nil && serveErr != http.ErrServerClosed {
