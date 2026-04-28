@@ -497,6 +497,52 @@ func TestShadowStoreUnpinZeroNoop(t *testing.T) {
 	ss.Unpin(0)
 }
 
+// TestShadowStorePinIfExistsDiskOnly verifies that PinIfExists loads a shadow
+// file from disk when it is not in the in-memory files map (e.g. after
+// crash/restart recovery where pending shadows exist on disk only).
+func TestShadowStorePinIfExistsDiskOnly(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write shadow data and then remove from in-memory map only (simulate
+	// crash recovery: disk file exists, files map does not).
+	wb := NewWriteBuffer("/disk-only.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("disk data"))
+	_ = ss.WriteExtents("/disk-only.txt", wb, 1)
+
+	// Remove from in-memory map without deleting disk file.
+	ss.mu.Lock()
+	sf := ss.files["/disk-only.txt"]
+	_ = sf.fd.Close()
+	delete(ss.files, "/disk-only.txt")
+	ss.mu.Unlock()
+
+	// PinIfExists should load from disk and succeed.
+	gen, ok := ss.PinIfExists("/disk-only.txt")
+	if !ok {
+		t.Fatal("expected PinIfExists to load from disk and return true")
+	}
+	if gen == 0 {
+		t.Fatal("expected non-zero generation token")
+	}
+
+	// Read via generation should work.
+	buf := make([]byte, 9)
+	n, err := ss.ReadAtGen(gen, 0, buf)
+	if err != nil {
+		t.Fatalf("ReadAtGen after disk load: %v", err)
+	}
+	if n != 9 || !bytes.Equal(buf[:n], []byte("disk data")) {
+		t.Errorf("data = %q, want %q", buf[:n], "disk data")
+	}
+
+	ss.Unpin(gen)
+}
+
 func TestShadowStoreCheckDiskSpaceThrottled(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStore(dir)
