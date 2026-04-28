@@ -1,11 +1,11 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log"
-	"bytes"
 	"math"
 	"strings"
 	"sync"

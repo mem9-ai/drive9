@@ -56,9 +56,9 @@ func TestShadowStorePartialWrite(t *testing.T) {
 	defer ss.Close()
 
 	// Write buffer with data in two separate parts.
-	wb := NewWriteBuffer("/partial.txt", 0, 1024) // 1KB part size
+	wb := NewWriteBuffer("/partial.txt", 0, 1024)         // 1KB part size
 	_, _ = wb.Write(0, bytes.Repeat([]byte("A"), 1024))   // Part 0 — full
-	_, _ = wb.Write(1024, bytes.Repeat([]byte("B"), 500))  // Part 1 — partial
+	_, _ = wb.Write(1024, bytes.Repeat([]byte("B"), 500)) // Part 1 — partial
 
 	if err := ss.WriteExtents("/partial.txt", wb, 1); err != nil {
 		t.Fatal(err)

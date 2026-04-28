@@ -5,24 +5,24 @@ import "sync"
 // FileHandle represents an open file in the FUSE filesystem.
 // WriteBuffer is defined in write.go and supports offset-based writes.
 type FileHandle struct {
-	Ino          uint64
-	Path         string
-	Flags        uint32          // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
-	OpenPID      uint32          // PID that opened the handle, when supplied by the kernel
-	Dirty        *WriteBuffer    // write buffer, nil for read-only opens
-	DirtySeq     uint64          // monotonic sequence for authoritative dirty-size tracking
-	WriteBackSeq uint64          // DirtySeq at time of write-back cache snapshot (0 = no snapshot)
-	OrigSize     int64           // original file size at open time (for patch detection)
-	BaseRev      int64           // server revision at open time (for conflict detection)
-	ZeroBase     bool            // true when the handle has adopted an explicit empty-file baseline
-	IsNew        bool            // true if created via Create() (no prior remote existence)
+	Ino               uint64
+	Path              string
+	Flags             uint32          // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
+	OpenPID           uint32          // PID that opened the handle, when supplied by the kernel
+	Dirty             *WriteBuffer    // write buffer, nil for read-only opens
+	DirtySeq          uint64          // monotonic sequence for authoritative dirty-size tracking
+	WriteBackSeq      uint64          // DirtySeq at time of write-back cache snapshot (0 = no snapshot)
+	OrigSize          int64           // original file size at open time (for patch detection)
+	BaseRev           int64           // server revision at open time (for conflict detection)
+	ZeroBase          bool            // true when the handle has adopted an explicit empty-file baseline
+	IsNew             bool            // true if created via Create() (no prior remote existence)
 	ShadowReady       bool            // true when the local shadow file is a safe full snapshot
 	ShadowSpill       bool            // true when shadow is the authoritative data source (large IsNew/ZeroBase files)
 	ShadowCommitReady bool            // true when ShadowSpill Flush has staged shadow for async commit
 	ShadowPinned      bool            // true when this handle has pinned the shadow path (must Unpin on Release)
 	Streamer          *StreamUploader // nil for small files / read-only; manages background part uploads
-	Prefetch     *Prefetcher     // nil for writable handles; sequential read prefetcher
-	mu           sync.Mutex
+	Prefetch          *Prefetcher     // nil for writable handles; sequential read prefetcher
+	mu                sync.Mutex
 }
 
 // Lock acquires the file handle mutex.
