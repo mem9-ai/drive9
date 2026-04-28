@@ -29,7 +29,7 @@ func OpenInstrumented(ctx context.Context, dsn, role string) (*sql.DB, error) {
 	if err := db.PingContext(ctx); err != nil {
 		metrics.UnregisterDB(db)
 		_ = db.Close()
-		return nil, err
+		return nil, fmt.Errorf("ping mysql: %w", err)
 	}
 	return db, nil
 }
