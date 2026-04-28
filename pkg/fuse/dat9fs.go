@@ -744,8 +744,8 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, off
 }
 
 // doRangeRead performs a single range read attempt: open stream + read body.
-// Body read errors (other than EOF/ErrUnexpectedEOF) are returned as-is so
-// the caller can classify them for retry.
+// All body read errors (including truncation) are returned as-is so the
+// caller can classify them for retry.
 func (fs *Dat9FS) doRangeRead(ctx context.Context, path string, offset, size int64) ([]byte, int, error) {
 	rc, err := fs.client.ReadStreamRange(ctx, path, offset, size)
 	if err != nil {
