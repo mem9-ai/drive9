@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,7 +13,10 @@ import (
 	"time"
 )
 
-const qwenASRMaxDataURLBytes = 10_000_000
+const (
+	qwenASRMaxDataURLBytes  = 10_000_000
+	qwenASRMaxResponseBytes = 32 << 20
+)
 
 // QwenASRAudioTextExtractorConfig configures Alibaba Cloud Model Studio
 // Qwen-ASR through DashScope's OpenAI-compatible chat/completions endpoint.
@@ -138,9 +142,20 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, responseTooLarge, err := readQwenASRResponseBody(resp.Body)
 	if err != nil {
 		return "", AudioExtractUsage{}, fmt.Errorf("read qwen asr response for %q: %w", req.Path, err)
+	}
+	if responseTooLarge {
+		message := fmt.Sprintf("qwen asr response exceeds %d byte limit (raw=%s)", qwenASRMaxResponseBytes, truncateString(string(raw), 256))
+		if resp.StatusCode >= 300 {
+			return "", AudioExtractUsage{}, &AudioExtractAPIError{
+				Provider:   "qwen asr",
+				StatusCode: resp.StatusCode,
+				Message:    message,
+			}
+		}
+		return "", AudioExtractUsage{}, errors.New(message)
 	}
 	var parsed struct {
 		Error *struct {
@@ -169,7 +184,7 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 				Message:    truncateString(string(raw), 256),
 			}
 		}
-		return "", AudioExtractUsage{}, fmt.Errorf("decode qwen asr response: %w", err)
+		return "", AudioExtractUsage{}, fmt.Errorf("decode qwen asr response: %w (raw=%s)", err, truncateString(string(raw), 256))
 	}
 
 	// Reference: https://help.aliyun.com/zh/model-studio/error-code
@@ -201,4 +216,15 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 		usage.DurationSeconds = parsed.Usage.Seconds
 	}
 	return text, usage, nil
+}
+
+func readQwenASRResponseBody(r io.Reader) ([]byte, bool, error) {
+	raw, err := io.ReadAll(io.LimitReader(r, qwenASRMaxResponseBytes+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if len(raw) > qwenASRMaxResponseBytes {
+		return raw[:qwenASRMaxResponseBytes], true, nil
+	}
+	return raw, false, nil
 }

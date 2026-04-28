@@ -260,6 +260,63 @@ func TestQwenASRAudioTextExtractorNoChoicesErrorIncludesRawResponse(t *testing.T
 	}
 }
 
+func TestQwenASRAudioTextExtractorAllowsLargeSuccessfulResponse(t *testing.T) {
+	transcript := strings.Repeat("a", (1<<20)+1024)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{
+				{"message": map[string]any{"content": transcript}},
+			},
+		})
+	}))
+	defer server.Close()
+
+	extractor, err := NewQwenASRAudioTextExtractor(QwenASRAudioTextExtractorConfig{
+		BaseURL: server.URL,
+		APIKey:  "secret",
+		Model:   "qwen3-asr-flash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+		Path: "/audio/long.mp3",
+		Data: []byte("fake"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != transcript {
+		t.Fatalf("text length=%d, want %d", len(got), len(transcript))
+	}
+}
+
+func TestQwenASRAudioTextExtractorDecodeErrorIncludesRawResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[`))
+	}))
+	defer server.Close()
+
+	extractor, err := NewQwenASRAudioTextExtractor(QwenASRAudioTextExtractorConfig{
+		BaseURL: server.URL,
+		APIKey:  "secret",
+		Model:   "qwen3-asr-flash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+		Path: "/audio/bad-json.mp3",
+		Data: []byte("fake"),
+	})
+	if err == nil {
+		t.Fatal("expected decode error")
+	}
+	if !strings.Contains(err.Error(), "decode qwen asr response") || !strings.Contains(err.Error(), `raw={"choices":[`) {
+		t.Fatalf("err=%v, want raw response detail", err)
+	}
+}
+
 func TestQwenASRAudioTextExtractorNonRetryableClientErrors(t *testing.T) {
 	tests := []struct {
 		name       string
