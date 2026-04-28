@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -314,5 +315,225 @@ func TestSSEEndpointBadSince(t *testing.T) {
 	srv.handleEvents(w, r)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d, want 400", w.Code)
+	}
+}
+
+func TestSSEBufferedWriterBatchFlush(t *testing.T) {
+	rec := httptest.NewRecorder()
+	bw := newSSEBufferedWriter(rec, rec)
+
+	// Write 9 events (below batch size of 10).
+	for i := 0; i < 9; i++ {
+		sendSSEHeartbeat(bw, uint64(i))
+	}
+
+	// Before flush, response body should be empty (buffered).
+	if rec.Body.Len() != 0 {
+		t.Fatalf("expected empty body before flush, got %d bytes", rec.Body.Len())
+	}
+
+	// shouldFlush should return false since count < 10.
+	if bw.shouldFlush() {
+		t.Fatal("shouldFlush should be false below batch size")
+	}
+
+	// 10th event reaches batch size.
+	sendSSEHeartbeat(bw, 9)
+
+	// shouldFlush should now return true.
+	if !bw.shouldFlush() {
+		t.Fatal("shouldFlush should be true at batch size")
+	}
+
+	// Explicit flush simulates what handleEvents does when shouldFlush is true.
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	// After batch flush, all 10 events should be in the body.
+	body := rec.Body.String()
+	count := strings.Count(body, "event: heartbeat")
+	if count != 10 {
+		t.Fatalf("expected 10 heartbeat events after batch flush, got %d", count)
+	}
+}
+
+func TestSSEBufferedWriterMaxDelayFlush(t *testing.T) {
+	rec := httptest.NewRecorder()
+	bw := newSSEBufferedWriter(rec, rec)
+
+	// Write 1 event.
+	sendSSEHeartbeat(bw, 1)
+
+	// Before max delay expires, body should be empty and shouldFlush false.
+	if rec.Body.Len() != 0 {
+		t.Fatalf("expected empty body before max delay, got %d bytes", rec.Body.Len())
+	}
+	if bw.shouldFlush() {
+		t.Fatal("shouldFlush should be false before max delay")
+	}
+
+	// Wait for max delay (1ms) plus a small margin.
+	time.Sleep(sseFlushMaxDelay + 5*time.Millisecond)
+
+	// After max delay, shouldFlush should become true.
+	if !bw.shouldFlush() {
+		t.Fatal("shouldFlush should be true after max delay")
+	}
+
+	// Flush and verify.
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: heartbeat") {
+		t.Fatal("expected heartbeat event after max delay flush")
+	}
+}
+
+func TestSSEBufferedWriterExplicitFlush(t *testing.T) {
+	rec := httptest.NewRecorder()
+	bw := newSSEBufferedWriter(rec, rec)
+
+	sendSSEEvent(bw, ChangeEvent{Seq: 1, Path: "/a.txt", Op: "write"})
+
+	if rec.Body.Len() != 0 {
+		t.Fatalf("expected empty body before explicit flush, got %d bytes", rec.Body.Len())
+	}
+
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "file_changed") {
+		t.Fatal("expected file_changed event after explicit flush")
+	}
+	if !strings.Contains(body, "/a.txt") {
+		t.Fatal("expected event data to contain path")
+	}
+}
+
+// TestSSEBurstFlush verifies that a burst of 3 events arriving in a single
+// notify wakeup are flushed within sseFlushMaxDelay, not buffered until the
+// next heartbeat (30s).
+func TestSSEBurstFlush(t *testing.T) {
+	srv := &Server{events: newEventBuses()}
+	bus := srv.events.get("")
+
+	// Pre-publish one event so since=1 is valid.
+	bus.Publish("/existing.txt", "write", "")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+
+	// Publish a burst of 3 events concurrently.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		bus.Publish("/a.txt", "write", "actor1")
+		bus.Publish("/b.txt", "write", "actor2")
+		bus.Publish("/c.txt", "write", "actor3")
+	}()
+
+	// Read first event with a timeout well under heartbeat (30s).
+	done := make(chan struct{})
+	var ev sseEvent
+	var ok bool
+	go func() {
+		ev, ok = readSSEEvent(scanner)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if !ok {
+			t.Fatal("expected first event from burst")
+		}
+		if ev.Event != "file_changed" {
+			t.Fatalf("expected file_changed, got %q", ev.Event)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("burst events not flushed within 200ms (timer broken?)")
+	}
+
+	// Read remaining 2 events quickly.
+	for i := 0; i < 2; i++ {
+		ev, ok = readSSEEvent(scanner)
+		if !ok {
+			t.Fatalf("expected event %d from burst", i+2)
+		}
+		if ev.Event != "file_changed" {
+			t.Fatalf("expected file_changed for event %d, got %q", i+2, ev.Event)
+		}
+	}
+}
+
+// TestSSEResetFlushWhenSeqTooOld verifies that a reset caused by seq_too_old
+// is flushed immediately and not buffered until the next heartbeat.
+func TestSSEResetFlushWhenSeqTooOld(t *testing.T) {
+	srv := &Server{events: newEventBuses()}
+	bus := srv.events.get("")
+
+	// Publish one event so the ring has content.
+	bus.Publish("/a.txt", "write", "actor1")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Publish enough events to wrap the ring buffer (eventBusRingSize = 10000).
+	// We publish 10005 events, then request since=5. The ring will have wrapped
+	// and seq=5 is too old, triggering seq_too_old.
+	for i := 2; i <= 10005; i++ {
+		bus.Publish(fmt.Sprintf("/file%d.txt", i), "write", "actor1")
+	}
+
+	// Connect with since=4 (older than the oldest retained event).
+	// After publishing 10005 events, oldestSeq = 6, so since+1 = 5 < 6 triggers seq_too_old.
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=4", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+
+	// First event must be the reset (not buffered).
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected reset event immediately")
+	}
+	if ev.Event != "reset" {
+		t.Fatalf("expected reset, got %q", ev.Event)
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(ev.Data), &data); err != nil {
+		t.Fatalf("unmarshal reset: %v", err)
+	}
+	if data["reason"] != "seq_too_old" {
+		t.Fatalf("expected reason seq_too_old, got %v", data["reason"])
 	}
 }
