@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,7 +15,96 @@ import (
 
 const (
 	sseHeartbeatInterval = 30 * time.Second
+	sseFlushBatchSize    = 10
+	sseFlushMaxDelay     = 1 * time.Millisecond
 )
+
+// stopTimer drains a timer's channel after stopping it to prevent spurious
+// ticks. Returns true if the timer was stopped before it fired.
+func stopTimer(t *time.Timer) bool {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+		return false
+	}
+	return true
+}
+
+// sseBufferedWriter wraps http.ResponseWriter with a bufio.Writer to batch
+// small SSE writes and reduce syscalls. Flushing follows two rules:
+//  1. Batch size: flush after sseFlushBatchSize events.
+//  2. Max delay: flush at most sseFlushMaxDelay after the first buffered
+//     event.
+type sseBufferedWriter struct {
+	rw      http.ResponseWriter
+	w       *bufio.Writer
+	count   int
+	first   time.Time
+	flusher http.Flusher
+}
+
+// flusherWriter wraps an http.Flusher so that any write to the underlying
+// ResponseWriter also triggers Flush(), ensuring data reaches the client
+// immediately rather than being buffered by net/http or reverse proxies.
+type flusherWriter struct {
+	rw      http.ResponseWriter
+	flusher http.Flusher
+}
+
+func (fw *flusherWriter) Write(p []byte) (int, error) {
+	n, err := fw.rw.Write(p)
+	if err != nil {
+		return n, err
+	}
+	fw.flusher.Flush()
+	return n, nil
+}
+
+func newSSEBufferedWriter(rw http.ResponseWriter, flusher http.Flusher) *sseBufferedWriter {
+	// Use a 64 KiB buffer — large enough for a batch of 10 events while
+	// small enough to avoid excessive memory per connection.
+	fw := &flusherWriter{rw: rw, flusher: flusher}
+	return &sseBufferedWriter{
+		rw:      rw,
+		w:       bufio.NewWriterSize(fw, 64*1024),
+		flusher: flusher,
+	}
+}
+
+func (bw *sseBufferedWriter) Write(p []byte) (int, error) {
+	return bw.w.Write(p)
+}
+
+func (bw *sseBufferedWriter) Flush() error {
+	if err := bw.w.Flush(); err != nil {
+		return err
+	}
+	bw.count = 0
+	bw.first = time.Time{}
+	return nil
+}
+
+func (bw *sseBufferedWriter) shouldFlush() bool {
+	if bw.count == 0 {
+		return false
+	}
+	if bw.count >= sseFlushBatchSize {
+		return true
+	}
+	if !bw.first.IsZero() && time.Since(bw.first) >= sseFlushMaxDelay {
+		return true
+	}
+	return false
+}
+
+func (bw *sseBufferedWriter) recordWrite() {
+	if bw.count == 0 {
+		bw.first = time.Now()
+	}
+	bw.count++
+}
 
 // eventBuses manages per-tenant EventBus instances. For single-tenant mode
 // (fallback backend), the empty-string key is used.
@@ -104,6 +194,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// ring scan, so reset cursor and ring state are a consistent snapshot.
 	events, headSeq, ok := bus.EventsSince(since)
 	lastSeen := since
+
+	bw := newSSEBufferedWriter(w, flusher)
+
 	if !ok {
 		reason := "initial_sync"
 		if since > 0 {
@@ -112,42 +205,103 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				reason = "server_restart"
 			}
 		}
-		sendSSEReset(w, headSeq, reason)
+		sendSSEReset(bw, headSeq, reason)
 		lastSeen = headSeq
 	} else {
 		for _, ev := range events {
-			sendSSEEvent(w, ev)
+			sendSSEEvent(bw, ev)
 			lastSeen = ev.Seq
 		}
 	}
-	flusher.Flush()
+	// Flush initial replay/reset immediately so the client receives the
+	// cursor position without waiting for the first heartbeat.
+	if err := bw.Flush(); err != nil {
+		return
+	}
 
-	// Phase 2: Live stream.
+	// Phase 2: Live stream with micro-batching.
+	// Instead of flushing after every single event, we accumulate events
+	// and flush at heartbeat boundaries or when the batch size is reached.
 	heartbeat := time.NewTicker(sseHeartbeatInterval)
 	defer heartbeat.Stop()
 
+	// Use a nil timer that we allocate on first need. Starting with
+	// time.NewTimer(0) and immediately stopping can leave a stale tick
+	// in the channel that fires spuriously on later Reset calls.
+	var flushTimer *time.Timer
+	var flushC <-chan time.Time
+	defer func() {
+		if flushTimer != nil {
+			stopTimer(flushTimer)
+			flushC = nil
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-heartbeat.C:
-			sendSSEHeartbeat(w, lastSeen)
-			flusher.Flush()
+			sendSSEHeartbeat(bw, lastSeen)
+			if err := bw.Flush(); err != nil {
+				return
+			}
+			if flushTimer != nil {
+				stopTimer(flushTimer)
+				flushC = nil
+			}
+		case <-flushC:
+			if bw.count > 0 {
+				if err := bw.Flush(); err != nil {
+					return
+				}
+			}
+			flushC = nil
 		case _, open := <-notify:
 			if !open {
 				return
 			}
 			liveEvents, liveHead, liveOK := bus.EventsSince(lastSeen)
 			if !liveOK {
-				sendSSEReset(w, liveHead, "seq_too_old")
+				// Reset must be sent immediately; buffering it would stall
+				// the client until the next heartbeat or unrelated event.
+				sendSSEReset(bw, liveHead, "seq_too_old")
 				lastSeen = liveHead
+				if err := bw.Flush(); err != nil {
+					return
+				}
+				if flushTimer != nil {
+					stopTimer(flushTimer)
+					flushC = nil
+				}
 			} else {
 				for _, ev := range liveEvents {
-					sendSSEEvent(w, ev)
+					sendSSEEvent(bw, ev)
 					lastSeen = ev.Seq
 				}
+				if bw.count > 0 {
+					if bw.shouldFlush() {
+						if err := bw.Flush(); err != nil {
+							return
+						}
+						if flushTimer != nil {
+							stopTimer(flushTimer)
+							flushC = nil
+						}
+					} else if flushC == nil {
+						// Arm the max-delay timer for the first
+						// buffered event since the last flush. Use
+						// flushC (not bw.count) so coalesced bursts
+						// of N>1 still arm the timer.
+						if flushTimer == nil {
+							flushTimer = time.NewTimer(sseFlushMaxDelay)
+						} else {
+							stopTimer(flushTimer)
+							flushTimer.Reset(sseFlushMaxDelay)
+						}
+						flushC = flushTimer.C
+					}
+				}
 			}
-			flusher.Flush()
 		}
 	}
 }
@@ -164,7 +318,7 @@ func isStructuralOp(op string) bool {
 	return false
 }
 
-func sendSSEEvent(w http.ResponseWriter, ev ChangeEvent) {
+func sendSSEEvent(w *sseBufferedWriter, ev ChangeEvent) {
 	if isStructuralOp(ev.Op) {
 		// Structural ops are sent as reset events per the accepted design.
 		sendSSEReset(w, ev.Seq, "structural_change")
@@ -175,20 +329,26 @@ func sendSSEEvent(w http.ResponseWriter, ev ChangeEvent) {
 		logger.Error(context.TODO(), "sse_marshal_event_failed")
 		return
 	}
-	_, _ = fmt.Fprintf(w, "event: file_changed\ndata: %s\n\n", data)
+	if _, err := fmt.Fprintf(w, "event: file_changed\ndata: %s\n\n", data); err == nil {
+		w.recordWrite()
+	}
 }
 
-func sendSSEReset(w http.ResponseWriter, seq uint64, reason string) {
+func sendSSEReset(w *sseBufferedWriter, seq uint64, reason string) {
 	data, _ := json.Marshal(map[string]interface{}{
 		"seq":    seq,
 		"reason": reason,
 	})
-	_, _ = fmt.Fprintf(w, "event: reset\ndata: %s\n\n", data)
+	if _, err := fmt.Fprintf(w, "event: reset\ndata: %s\n\n", data); err == nil {
+		w.recordWrite()
+	}
 }
 
-func sendSSEHeartbeat(w http.ResponseWriter, seq uint64) {
+func sendSSEHeartbeat(w *sseBufferedWriter, seq uint64) {
 	data, _ := json.Marshal(map[string]interface{}{
 		"seq": seq,
 	})
-	_, _ = fmt.Fprintf(w, "event: heartbeat\ndata: %s\n\n", data)
+	if _, err := fmt.Fprintf(w, "event: heartbeat\ndata: %s\n\n", data); err == nil {
+		w.recordWrite()
+	}
 }
