@@ -128,6 +128,12 @@ func (s *Store) VerifyAndResolveGrant(
 		return nil, err
 	}
 
+	// Defense-in-depth: after HMAC verification succeeds, the verified
+	// tenant_id claim must match the routing tenant_id used to derive CSK.
+	if claims.TenantID != tenantID {
+		return nil, fmt.Errorf("tenant_id mismatch")
+	}
+
 	if expectedIssuer != "" && claims.Issuer != expectedIssuer {
 		return nil, fmt.Errorf("invalid issuer")
 	}
