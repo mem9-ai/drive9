@@ -139,11 +139,7 @@ func fsMountCmd(args []string) error {
 			return fmt.Errorf("cannot reach dat9 server: %w", err)
 		}
 
-		handler, err := newWebDAVHandler(c)
-		if err != nil {
-			return fmt.Errorf("webdav: %w", err)
-		}
-		return webdavMount(c, mountPoint, handler)
+		return webdavMount(c, mountPoint)
 	}
 
 	// FUSE path (existing behavior).
@@ -176,8 +172,8 @@ func fsMountCmd(args []string) error {
 }
 
 // newWebDAVHandler creates an http.Handler that serves drive9 content over WebDAV.
-func newWebDAVHandler(c *client.Client) (http.Handler, error) {
-	return drive9webdav.NewHandler(c, drive9webdav.Options{}), nil
+func newWebDAVHandler(c *client.Client, prefix string) (http.Handler, error) {
+	return drive9webdav.NewHandler(c, drive9webdav.Options{Prefix: prefix}), nil
 }
 
 func validateLookupRetryFlags(count int, timeout time.Duration) error {

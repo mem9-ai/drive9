@@ -1,7 +1,13 @@
 package webdav
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -158,11 +164,58 @@ func TestWriteFileBuffersAndStat(t *testing.T) {
 	}
 }
 
+func TestOpenFileWriteMissingParentReturnsNotExist(t *testing.T) {
+	c := newWriteOnlyTestClient(t, nil)
+	fs := &fileSystem{client: c}
+
+	_, err := fs.OpenFile(t.Context(), "/missing/file.txt", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o666)
+	if !os.IsNotExist(err) {
+		t.Fatalf("OpenFile missing parent error = %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestWriteFileCloseUsesFreshContext(t *testing.T) {
+	var wrote string
+	c := newWriteOnlyTestClient(t, func(body string) {
+		wrote = body
+	})
+	fs := &fileSystem{client: c}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	file, err := fs.OpenFile(ctx, "/dir/file.txt", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o666)
+	if err != nil {
+		t.Fatalf("OpenFile returned error: %v", err)
+	}
+	if _, err := file.Write([]byte("payload")); err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+	cancel()
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close returned error after OpenFile context cancellation: %v", err)
+	}
+	if wrote != "payload" {
+		t.Fatalf("server saw body %q, want payload", wrote)
+	}
+}
+
+func TestHandlerPutMissingParentReturnsConflict(t *testing.T) {
+	c := newWriteOnlyTestClient(t, nil)
+	handler := NewHandler(c, Options{})
+
+	req := httptest.NewRequest(http.MethodPut, "/missing/file.txt", strings.NewReader("payload"))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("PUT missing parent status = %d, want %d: %s", rr.Code, http.StatusConflict, rr.Body.String())
+	}
+}
+
 func TestReadFileSeekAndRead(t *testing.T) {
 	data := []byte("hello world")
 	rf := &readFile{
-		path:   "/foo.txt",
-		stat:   &client.StatResult{Size: int64(len(data))},
+		path: "/foo.txt",
+		stat: &client.StatResult{Size: int64(len(data))},
 	}
 	// bytes.Reader is embedded so we init it via the struct literal
 	// in OpenFile. For testing, create manually:
@@ -175,4 +228,35 @@ func TestReadFileSeekAndRead(t *testing.T) {
 	if fi.Name() != "foo.txt" {
 		t.Errorf("Name = %q", fi.Name())
 	}
+}
+
+func newWriteOnlyTestClient(t *testing.T, onWrite func(string)) *client.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/dir":
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/dir/file.txt":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll body: %v", err)
+			}
+			if onWrite != nil {
+				onWrite(string(body))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(struct {
+				Revision int64 `json:"revision"`
+			}{Revision: 1})
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(struct {
+				Error string `json:"error"`
+			}{Error: "not found"})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return client.New(srv.URL, "test-key")
 }

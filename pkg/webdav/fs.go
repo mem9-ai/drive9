@@ -24,7 +24,7 @@ type fileSystem struct {
 var _ webdav.FileSystem = (*fileSystem)(nil)
 
 func (f *fileSystem) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
-	return f.client.MkdirCtx(ctx, normPath(name))
+	return mapError(f.client.MkdirCtx(ctx, normPath(name)))
 }
 
 func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
@@ -32,7 +32,17 @@ func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm o
 
 	// For create/truncate: return a writable file handle.
 	if flag&(os.O_CREATE|os.O_TRUNC) != 0 {
-		return &writeFile{client: f.client, path: p, ctx: ctx}, nil
+		if p == "/" {
+			return nil, os.ErrInvalid
+		}
+		parent, err := f.client.StatCtx(ctx, path.Dir(p))
+		if err != nil {
+			return nil, mapError(err)
+		}
+		if !parent.IsDir {
+			return nil, os.ErrInvalid
+		}
+		return &writeFile{client: f.client, path: p}, nil
 	}
 
 	// Stat to determine if it's a directory or file.
@@ -64,11 +74,19 @@ func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm o
 }
 
 func (f *fileSystem) RemoveAll(ctx context.Context, name string) error {
-	return f.client.RemoveAllCtx(ctx, normPath(name))
+	p := normPath(name)
+	if p == "/" {
+		return os.ErrInvalid
+	}
+	return mapError(f.client.RemoveAllCtx(ctx, p))
 }
 
 func (f *fileSystem) Rename(ctx context.Context, oldName, newName string) error {
-	return f.client.RenameCtx(ctx, normPath(oldName), normPath(newName))
+	oldPath, newPath := normPath(oldName), normPath(newName)
+	if oldPath == "/" || newPath == "/" {
+		return os.ErrInvalid
+	}
+	return mapError(f.client.RenameCtx(ctx, oldPath, newPath))
 }
 
 func (f *fileSystem) Stat(ctx context.Context, name string) (os.FileInfo, error) {
@@ -103,9 +121,11 @@ func mapError(err error) error {
 		switch se.StatusCode {
 		case 404:
 			return os.ErrNotExist
+		case 400:
+			return os.ErrInvalid
 		case 409:
 			return os.ErrExist
-		case 403:
+		case 401, 403:
 			return os.ErrPermission
 		}
 	}
@@ -120,10 +140,10 @@ type fileInfo struct {
 
 var _ os.FileInfo = (*fileInfo)(nil)
 
-func (fi *fileInfo) Name() string      { return fi.name }
-func (fi *fileInfo) Size() int64       { return fi.stat.Size }
-func (fi *fileInfo) IsDir() bool       { return fi.stat.IsDir }
-func (fi *fileInfo) Sys() interface{}  { return nil }
+func (fi *fileInfo) Name() string       { return fi.name }
+func (fi *fileInfo) Size() int64        { return fi.stat.Size }
+func (fi *fileInfo) IsDir() bool        { return fi.stat.IsDir }
+func (fi *fileInfo) Sys() interface{}   { return nil }
 func (fi *fileInfo) ModTime() time.Time { return fi.stat.Mtime }
 func (fi *fileInfo) Mode() os.FileMode {
 	if fi.stat.IsDir {
@@ -142,10 +162,10 @@ type dirFile struct {
 
 var _ webdav.File = (*dirFile)(nil)
 
-func (d *dirFile) Close() error                             { return nil }
-func (d *dirFile) Read([]byte) (int, error)                 { return 0, fmt.Errorf("is a directory") }
-func (d *dirFile) Write([]byte) (int, error)                { return 0, fmt.Errorf("is a directory") }
-func (d *dirFile) Seek(int64, int) (int64, error)           { return 0, fmt.Errorf("is a directory") }
+func (d *dirFile) Close() error                   { return nil }
+func (d *dirFile) Read([]byte) (int, error)       { return 0, fmt.Errorf("is a directory") }
+func (d *dirFile) Write([]byte) (int, error)      { return 0, fmt.Errorf("is a directory") }
+func (d *dirFile) Seek(int64, int) (int64, error) { return 0, fmt.Errorf("is a directory") }
 
 func (d *dirFile) Stat() (os.FileInfo, error) {
 	return &fileInfo{name: path.Base(d.path), stat: d.stat}, nil
@@ -196,9 +216,9 @@ type readFile struct {
 
 var _ webdav.File = (*readFile)(nil)
 
-func (r *readFile) Close() error                             { return nil }
-func (r *readFile) Write([]byte) (int, error)                { return 0, fmt.Errorf("read-only") }
-func (r *readFile) Readdir(int) ([]fs.FileInfo, error)       { return nil, fmt.Errorf("not a directory") }
+func (r *readFile) Close() error                       { return nil }
+func (r *readFile) Write([]byte) (int, error)          { return 0, fmt.Errorf("read-only") }
+func (r *readFile) Readdir(int) ([]fs.FileInfo, error) { return nil, fmt.Errorf("not a directory") }
 func (r *readFile) Stat() (os.FileInfo, error) {
 	return &fileInfo{name: path.Base(r.path), stat: r.stat}, nil
 }
@@ -207,22 +227,26 @@ func (r *readFile) Stat() (os.FileInfo, error) {
 type writeFile struct {
 	client *client.Client
 	path   string
-	ctx    context.Context
 	buf    bytes.Buffer
 }
 
 var _ webdav.File = (*writeFile)(nil)
 
 func (w *writeFile) Read([]byte) (int, error)           { return 0, fmt.Errorf("write-only") }
-func (w *writeFile) Readdir(int) ([]fs.FileInfo, error)  { return nil, fmt.Errorf("not a directory") }
-func (w *writeFile) Seek(int64, int) (int64, error)      { return 0, fmt.Errorf("not seekable") }
+func (w *writeFile) Readdir(int) ([]fs.FileInfo, error) { return nil, fmt.Errorf("not a directory") }
+func (w *writeFile) Seek(int64, int) (int64, error)     { return 0, fmt.Errorf("not seekable") }
 
 func (w *writeFile) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
 func (w *writeFile) Close() error {
-	return w.client.WriteCtx(w.ctx, w.path, w.buf.Bytes())
+	// webdav.File.Close has no context parameter. Do not retain the
+	// OpenFile request context here: clients can finish sending a PUT body
+	// and close the connection before the server flushes the buffered bytes
+	// to Drive9. Close is the commit point for this lightweight WebDAV
+	// bridge, so it uses a fresh background context.
+	return mapError(w.client.WriteCtx(context.Background(), w.path, w.buf.Bytes()))
 }
 
 func (w *writeFile) Stat() (os.FileInfo, error) {
