@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 
 	"go.uber.org/zap"
@@ -12,7 +13,10 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-const envBenchTimingLogEnabled = "DRIVE9_BENCH_TIMING_LOG_ENABLED"
+const (
+	envBenchTimingLogEnabled = "DRIVE9_BENCH_TIMING_LOG_ENABLED"
+	envLogLevel              = "DRIVE9_LOG_LEVEL"
+)
 
 const (
 	benchTimingLogUnknown uint32 = iota
@@ -23,7 +27,19 @@ const (
 var benchTimingLogState atomic.Uint32
 
 func NewServerLogger() (*zap.Logger, error) {
-	return zap.NewProduction()
+	cfg := zap.NewProductionConfig()
+	rawLevel := strings.TrimSpace(os.Getenv(envLogLevel))
+	if rawLevel != "" {
+		var level zapcore.Level
+		if err := level.UnmarshalText([]byte(strings.ToLower(rawLevel))); err != nil {
+			return nil, fmt.Errorf("%s must be one of debug, info, warn, or error: %w", envLogLevel, err)
+		}
+		if level < zapcore.DebugLevel || level > zapcore.ErrorLevel {
+			return nil, fmt.Errorf("%s must be one of debug, info, warn, or error", envLogLevel)
+		}
+		cfg.Level.SetLevel(level)
+	}
+	return cfg.Build()
 }
 
 func BenchTimingLogEnabled() bool {

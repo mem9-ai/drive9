@@ -341,6 +341,7 @@ environment:
   DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
   DRIVE9_VAULT_MASTER_KEY   32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)
+  DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_QUOTA_SOURCE tenant|server quota enforcement source (default: tenant)
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)

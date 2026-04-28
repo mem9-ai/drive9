@@ -317,6 +317,42 @@ func TestQwenASRAudioTextExtractorDecodeErrorIncludesRawResponse(t *testing.T) {
 	}
 }
 
+func TestMaskQwenASRResponseBodyForLogMasksChoiceContent(t *testing.T) {
+	raw := []byte(`{"id":"resp-1","choices":[{"message":{"role":"assistant","content":"sensitive transcript"}},{"message":{"role":"assistant","content":[{"type":"text","text":"another secret"}]}}],"usage":{"seconds":3}}`)
+
+	masked := maskQwenASRResponseBodyForLog(raw)
+	if strings.Contains(masked, "sensitive transcript") || strings.Contains(masked, "another secret") {
+		t.Fatalf("masked response leaked transcript content: %s", masked)
+	}
+
+	var parsed struct {
+		ID      string `json:"id"`
+		Choices []struct {
+			Message struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage struct {
+			Seconds float64 `json:"seconds"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(masked), &parsed); err != nil {
+		t.Fatalf("unmarshal masked response: %v", err)
+	}
+	if parsed.ID != "resp-1" || parsed.Usage.Seconds != 3 {
+		t.Fatalf("masked response lost non-content fields: %+v", parsed)
+	}
+	for i, choice := range parsed.Choices {
+		if choice.Message.Role != "assistant" {
+			t.Fatalf("choice %d role=%q, want assistant", i, choice.Message.Role)
+		}
+		if choice.Message.Content != qwenASRMaskedContent {
+			t.Fatalf("choice %d content=%q, want mask", i, choice.Message.Content)
+		}
+	}
+}
+
 func TestQwenASRAudioTextExtractorNonRetryableClientErrors(t *testing.T) {
 	tests := []struct {
 		name       string

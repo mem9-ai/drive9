@@ -11,11 +11,16 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/mem9-ai/dat9/pkg/logger"
 )
 
 const (
 	qwenASRMaxDataURLBytes  = 10_000_000
 	qwenASRMaxResponseBytes = 32 << 20
+	qwenASRMaskedContent    = "[masked]"
 )
 
 // QwenASRAudioTextExtractorConfig configures Alibaba Cloud Model Studio
@@ -186,6 +191,11 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 		}
 		return "", AudioExtractUsage{}, fmt.Errorf("decode qwen asr response: %w (raw=%s)", err, truncateString(string(raw), 256))
 	}
+	logger.Debug(ctx, "qwen_asr_response_body",
+		zap.String("path", req.Path),
+		zap.Int("status_code", resp.StatusCode),
+		zap.Int("response_bytes", len(raw)),
+		zap.String("response_body", maskQwenASRResponseBodyForLog(raw)))
 
 	// Reference: https://help.aliyun.com/zh/model-studio/error-code
 	// If the status code indicates an error, return an API error with details if available.
@@ -227,4 +237,41 @@ func readQwenASRResponseBody(r io.Reader) ([]byte, bool, error) {
 		return raw[:qwenASRMaxResponseBytes], true, nil
 	}
 	return raw, false, nil
+}
+
+func maskQwenASRResponseBodyForLog(raw []byte) string {
+	var body any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return truncateString(string(raw), 4096)
+	}
+	maskQwenASRChoicesContent(body)
+	masked, err := json.Marshal(body)
+	if err != nil {
+		return truncateString(string(raw), 4096)
+	}
+	return truncateString(string(masked), 4096)
+}
+
+func maskQwenASRChoicesContent(body any) {
+	obj, ok := body.(map[string]any)
+	if !ok {
+		return
+	}
+	choices, ok := obj["choices"].([]any)
+	if !ok {
+		return
+	}
+	for _, choice := range choices {
+		choiceObj, ok := choice.(map[string]any)
+		if !ok {
+			continue
+		}
+		message, ok := choiceObj["message"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, ok := message["content"]; ok {
+			message["content"] = qwenASRMaskedContent
+		}
+	}
 }
