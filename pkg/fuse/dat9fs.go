@@ -1809,6 +1809,12 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		if entry != nil && entry.Size > smallFileThreshold {
 			fh.Prefetch = NewPrefetcher(fs.client, p, entry.Size, fs.debugEnabled())
 		}
+		// Pin shadow for read-only opens so commit queue cleanup doesn't
+		// delete the shadow file while this handle is reading from it.
+		if !fh.ShadowPinned && fs.shadowStore != nil && fs.shadowStore.Has(p) {
+			fs.shadowStore.Pin(p)
+			fh.ShadowPinned = true
+		}
 	}
 
 	out.Fh = fs.fileHandles.Allocate(fh)
@@ -2576,6 +2582,11 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
+		// Unpin shadow if this handle pinned it, so deferred removals can proceed.
+		if fh.ShadowPinned && fs.shadowStore != nil {
+			defer fs.shadowStore.Unpin(fh.Path)
+		}
+
 		start := time.Now()
 		phase := "start"
 		flushStatus := gofuse.OK

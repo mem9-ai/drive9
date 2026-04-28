@@ -19,6 +19,7 @@ type FileHandle struct {
 	ShadowReady       bool            // true when the local shadow file is a safe full snapshot
 	ShadowSpill       bool            // true when shadow is the authoritative data source (large IsNew/ZeroBase files)
 	ShadowCommitReady bool            // true when ShadowSpill Flush has staged shadow for async commit
+	ShadowPinned      bool            // true when this handle has pinned the shadow path (must Unpin on Release)
 	Streamer          *StreamUploader // nil for small files / read-only; manages background part uploads
 	Prefetch     *Prefetcher     // nil for writable handles; sequential read prefetcher
 	mu           sync.Mutex
