@@ -210,6 +210,7 @@ func Mount(opts *MountOptions) error {
 			// Initialize CommitQueue for background remote commits.
 			if shadowStore != nil && pendingIdx != nil {
 				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, maxCommitQueuePending)
+				cq.OnSuccess = dat9fs.onCommitQueueSuccess
 				cq.RecoverPending()
 				dat9fs.commitQueue = cq
 			}

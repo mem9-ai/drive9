@@ -35,13 +35,33 @@ type DirtyExtent struct {
 	Length int64
 }
 
+// retiredShadow holds a shadow file that has been logically removed from the
+// active path map but still has pinned readers. When the last reader Unpins,
+// the fd is closed and disk file deleted.
+type retiredShadow struct {
+	fd       *os.File
+	diskPath string
+	size     int64
+}
+
 // ShadowStore manages per-path shadow files for local staging of writes.
 // Shadow files live at <dir>/<hash>.shadow and support pread/pwrite for
 // efficient partial I/O without full-file materialization.
 type ShadowStore struct {
 	dir   string
 	mu    sync.RWMutex
-	files map[string]*ShadowFile // remote path → shadow file
+	files map[string]*ShadowFile // remote path → active shadow file
+
+	// Generation-based pin for safe concurrent reads during commit cleanup.
+	// Pin/PinIfExists return a generation token. Remove on a pinned path
+	// retires the shadow (removes from files, moves fd to retired map) so
+	// new writers get a fresh shadow. Old readers use their gen token to
+	// read/unpin the retired fd.
+	nextGen uint64                    // monotonic, 0 is reserved (no pin)
+	active  map[string]uint64         // path → generation of current active shadow
+	genFile map[uint64]*ShadowFile    // generation → active ShadowFile (for ReadAtGen on active gens)
+	refs    map[uint64]int32          // generation → active pin count
+	retired map[uint64]*retiredShadow // generation → retired shadow awaiting unpin
 
 	// Throttled disk space check state (atomic for lock-free fast path).
 	lastDiskCheck atomic.Int64 // unix nano of last check
@@ -54,8 +74,12 @@ func NewShadowStore(dir string) (*ShadowStore, error) {
 		return nil, fmt.Errorf("shadow store dir: %w", err)
 	}
 	ss := &ShadowStore{
-		dir:   dir,
-		files: make(map[string]*ShadowFile),
+		dir:     dir,
+		files:   make(map[string]*ShadowFile),
+		active:  make(map[string]uint64),
+		genFile: make(map[uint64]*ShadowFile),
+		refs:    make(map[uint64]int32),
+		retired: make(map[uint64]*retiredShadow),
 	}
 	ss.diskOK.Store(true)
 	return ss, nil
@@ -281,6 +305,41 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *WriteBuffer, baseRev i
 	return nil
 }
 
+// ReadAtGen reads from a shadow file identified by its generation token.
+// Works for both active generations (shadow still in files map) and retired
+// generations (shadow moved to retired map by Remove). Returns (0, error)
+// if the generation is unknown.
+func (s *ShadowStore) ReadAtGen(gen uint64, offset int64, buf []byte) (int, error) {
+	s.mu.RLock()
+	if sf, ok := s.genFile[gen]; ok {
+		s.mu.RUnlock()
+		return sf.fd.ReadAt(buf, offset)
+	}
+	rt, ok := s.retired[gen]
+	s.mu.RUnlock()
+	if !ok {
+		return 0, fmt.Errorf("shadow gen %d not found", gen)
+	}
+	return rt.fd.ReadAt(buf, offset)
+}
+
+// SizeGen returns the size of a shadow file by generation token. Works for
+// both active and retired generations. Returns -1 if the generation is unknown.
+func (s *ShadowStore) SizeGen(gen uint64) int64 {
+	s.mu.RLock()
+	if sf, ok := s.genFile[gen]; ok {
+		sz := sf.size
+		s.mu.RUnlock()
+		return sz
+	}
+	rt, ok := s.retired[gen]
+	s.mu.RUnlock()
+	if !ok {
+		return -1
+	}
+	return rt.size
+}
+
 // ReadAt reads from a shadow file at the given offset. Uses pread for
 // efficient partial reads without seeking.
 func (s *ShadowStore) ReadAt(remotePath string, offset int64, buf []byte) (int, error) {
@@ -373,9 +432,126 @@ func (s *ShadowStore) BaseRev(remotePath string) int64 {
 	return 0
 }
 
-// Remove removes a shadow file from memory and disk.
+// Pin increments the reference count for the active shadow at remotePath and
+// returns a generation token. The caller must pass this token to Unpin on
+// Release. Use after creating a new shadow (e.g. ShadowSpill O_TRUNC).
+func (s *ShadowStore) Pin(remotePath string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	gen := s.active[remotePath]
+	if gen == 0 {
+		s.nextGen++
+		gen = s.nextGen
+		s.active[remotePath] = gen
+		if sf, ok := s.files[remotePath]; ok {
+			s.genFile[gen] = sf
+		}
+	}
+	s.refs[gen]++
+	return gen
+}
+
+// PinIfExists atomically checks whether an active shadow file exists for
+// the given path (in memory or on disk) and, if so, increments its reference
+// count. Returns a generation token and true, or (0, false) if no shadow
+// exists. Loading from disk handles post-crash recovery where pending
+// shadows are on disk but not yet in the files map.
+func (s *ShadowStore) PinIfExists(remotePath string) (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sf, ok := s.files[remotePath]
+	if !ok {
+		// Try loading from disk (e.g. after crash/restart recovery).
+		sp := s.shadowPath(remotePath)
+		fd, err := os.OpenFile(sp, os.O_RDWR, 0o644)
+		if err != nil {
+			return 0, false
+		}
+		fi, err := fd.Stat()
+		if err != nil {
+			_ = fd.Close()
+			return 0, false
+		}
+		sf = &ShadowFile{fd: fd, size: fi.Size()}
+		s.files[remotePath] = sf
+	}
+	gen := s.active[remotePath]
+	if gen == 0 {
+		s.nextGen++
+		gen = s.nextGen
+		s.active[remotePath] = gen
+		s.genFile[gen] = sf
+	}
+	s.refs[gen]++
+	return gen, true
+}
+
+// Unpin decrements the reference count for the given generation. If the
+// generation was retired (Remove called while pinned) and the count reaches
+// zero, the retired fd is closed and the disk file deleted. Generation 0
+// is a no-op (handle was never pinned).
+func (s *ShadowStore) Unpin(gen uint64) {
+	if gen == 0 {
+		return
+	}
+	s.mu.Lock()
+	s.refs[gen]--
+	r := s.refs[gen]
+	if r <= 0 {
+		delete(s.refs, gen)
+		r = 0
+	}
+	rt, isRetired := s.retired[gen]
+	if isRetired && r == 0 {
+		delete(s.retired, gen)
+	}
+	s.mu.Unlock()
+
+	if isRetired && r == 0 && rt != nil {
+		_ = rt.fd.Close()
+		_ = os.Remove(rt.diskPath)
+	}
+}
+
+// Remove removes a shadow file from memory and disk. If the path has active
+// pins, the shadow is "retired" — removed from the active files map so new
+// writers get a fresh shadow, but kept alive for existing readers until the
+// last Unpin.
 func (s *ShadowStore) Remove(remotePath string) {
 	s.mu.Lock()
+	gen := s.active[remotePath]
+	if gen != 0 && s.refs[gen] > 0 {
+		// Retire: remove from active maps, keep fd alive for pinned readers.
+		sf := s.files[remotePath]
+		delete(s.files, remotePath)
+		delete(s.active, remotePath)
+		delete(s.genFile, gen)
+		diskPath := s.shadowPath(remotePath)
+		// Rename disk file so Has() / ensureShadowFile don't see stale data.
+		// If rename fails, delete the original to avoid new writers reusing
+		// stale content via O_CREATE|O_RDWR. The retired fd remains valid
+		// (unix: open fd survives unlink).
+		retiredPath := fmt.Sprintf("%s.retired.%d", diskPath, gen)
+		if err := os.Rename(diskPath, retiredPath); err != nil {
+			_ = os.Remove(diskPath)
+			retiredPath = diskPath // fd still valid, disk file gone
+		}
+		if sf != nil {
+			s.retired[gen] = &retiredShadow{
+				fd:       sf.fd,
+				diskPath: retiredPath,
+				size:     sf.size,
+			}
+		}
+		s.mu.Unlock()
+		return
+	}
+	// No active pins — remove immediately.
+	if gen != 0 {
+		delete(s.active, remotePath)
+		delete(s.genFile, gen)
+		delete(s.refs, gen)
+	}
 	sf, ok := s.files[remotePath]
 	if ok {
 		_ = sf.fd.Close()
@@ -383,6 +559,11 @@ func (s *ShadowStore) Remove(remotePath string) {
 	}
 	s.mu.Unlock()
 
+	// Always attempt disk cleanup — the shadow may exist only on disk
+	// (e.g. after crash/restart recovery where it was never loaded into
+	// the files map). Without this, a successfully committed shadow
+	// would remain on disk and be served as stale local data by
+	// Has()/ReadAt()/ReadAll() fallback paths.
 	sp := s.shadowPath(remotePath)
 	_ = os.Remove(sp)
 }
@@ -397,6 +578,12 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 	}
 	delete(s.files, oldPath)
 	s.files[newPath] = sf
+	// Transfer generation mapping to new path.
+	oldGen := s.active[oldPath]
+	if oldGen != 0 {
+		s.active[newPath] = oldGen
+		delete(s.active, oldPath)
+	}
 	s.mu.Unlock()
 
 	// Rename on disk.
@@ -407,6 +594,10 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 		s.mu.Lock()
 		delete(s.files, newPath)
 		s.files[oldPath] = sf
+		if oldGen != 0 {
+			s.active[oldPath] = oldGen
+			delete(s.active, newPath)
+		}
 		s.mu.Unlock()
 		return false
 	}
@@ -435,7 +626,14 @@ func (s *ShadowStore) Close() {
 	for _, sf := range s.files {
 		_ = sf.fd.Close()
 	}
+	for _, rt := range s.retired {
+		_ = rt.fd.Close()
+	}
 	s.files = make(map[string]*ShadowFile)
+	s.active = make(map[string]uint64)
+	s.genFile = make(map[uint64]*ShadowFile)
+	s.refs = make(map[uint64]int32)
+	s.retired = make(map[uint64]*retiredShadow)
 }
 
 // RecoverFromDisk scans the shadow directory and loads shadow files into memory.
