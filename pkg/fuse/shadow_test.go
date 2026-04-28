@@ -171,6 +171,127 @@ func TestShadowStoreCheckDiskSpace(t *testing.T) {
 	_ = ss.CheckDiskSpace()
 }
 
+func TestShadowStorePinUnpinRemove(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write some data.
+	wb := NewWriteBuffer("/pinned.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("pinned data"))
+	_ = ss.WriteExtents("/pinned.txt", wb, 1)
+
+	// Pin the path.
+	ss.Pin("/pinned.txt")
+
+	// Remove while pinned — should defer.
+	ss.Remove("/pinned.txt")
+
+	// File should still be readable.
+	if !ss.Has("/pinned.txt") {
+		t.Fatal("expected shadow file to still exist while pinned")
+	}
+	buf := make([]byte, 11)
+	n, err := ss.ReadAt("/pinned.txt", 0, buf)
+	if err != nil {
+		t.Fatalf("read after pinned remove: %v", err)
+	}
+	if n != 11 || !bytes.Equal(buf[:n], []byte("pinned data")) {
+		t.Errorf("data = %q, want %q", buf[:n], "pinned data")
+	}
+
+	// Unpin — should trigger deferred removal.
+	ss.Unpin("/pinned.txt")
+
+	if ss.Has("/pinned.txt") {
+		t.Error("expected shadow file to be removed after unpin")
+	}
+}
+
+func TestShadowStorePinMultipleReaders(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := NewWriteBuffer("/multi.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("multi"))
+	_ = ss.WriteExtents("/multi.txt", wb, 1)
+
+	// Two pins.
+	ss.Pin("/multi.txt")
+	ss.Pin("/multi.txt")
+
+	ss.Remove("/multi.txt")
+
+	// First unpin — still pinned.
+	ss.Unpin("/multi.txt")
+	if !ss.Has("/multi.txt") {
+		t.Fatal("expected shadow file to still exist with refs=1")
+	}
+
+	// Second unpin — now removed.
+	ss.Unpin("/multi.txt")
+	if ss.Has("/multi.txt") {
+		t.Error("expected shadow file to be removed after all unpins")
+	}
+}
+
+func TestShadowStoreRemoveWithoutPin(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := NewWriteBuffer("/nopins.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("data"))
+	_ = ss.WriteExtents("/nopins.txt", wb, 1)
+
+	// Remove without pin — should remove immediately.
+	ss.Remove("/nopins.txt")
+	if ss.Has("/nopins.txt") {
+		t.Error("expected immediate removal when not pinned")
+	}
+}
+
+func TestShadowStoreRenamePinState(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := NewWriteBuffer("/before.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("rename"))
+	_ = ss.WriteExtents("/before.txt", wb, 1)
+
+	ss.Pin("/before.txt")
+	ok := ss.Rename("/before.txt", "/after.txt")
+	if !ok {
+		t.Fatal("rename failed")
+	}
+
+	// Remove while pinned under new name.
+	ss.Remove("/after.txt")
+	if !ss.Has("/after.txt") {
+		t.Fatal("expected shadow file to exist under new name while pinned")
+	}
+
+	// Unpin under new name triggers removal.
+	ss.Unpin("/after.txt")
+	if ss.Has("/after.txt") {
+		t.Error("expected removal after unpin of renamed path")
+	}
+}
+
 func TestShadowStoreCheckDiskSpaceThrottled(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStore(dir)

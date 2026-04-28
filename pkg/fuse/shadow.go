@@ -43,6 +43,11 @@ type ShadowStore struct {
 	mu    sync.RWMutex
 	files map[string]*ShadowFile // remote path → shadow file
 
+	// Path-level refcount for safe concurrent reads.
+	// Pin increments, Unpin decrements. Remove defers deletion when refs > 0.
+	refs          map[string]int32
+	pendingRemove map[string]bool
+
 	// Throttled disk space check state (atomic for lock-free fast path).
 	lastDiskCheck atomic.Int64 // unix nano of last check
 	diskOK        atomic.Bool  // cached result of last check
@@ -54,8 +59,10 @@ func NewShadowStore(dir string) (*ShadowStore, error) {
 		return nil, fmt.Errorf("shadow store dir: %w", err)
 	}
 	ss := &ShadowStore{
-		dir:   dir,
-		files: make(map[string]*ShadowFile),
+		dir:           dir,
+		files:         make(map[string]*ShadowFile),
+		refs:          make(map[string]int32),
+		pendingRemove: make(map[string]bool),
 	}
 	ss.diskOK.Store(true)
 	return ss, nil
@@ -373,8 +380,52 @@ func (s *ShadowStore) BaseRev(remotePath string) int64 {
 	return 0
 }
 
-// Remove removes a shadow file from memory and disk.
+// Pin increments the reference count for a shadow path. While pinned,
+// Remove will defer deletion until the last Unpin call.
+func (s *ShadowStore) Pin(remotePath string) {
+	s.mu.Lock()
+	s.refs[remotePath]++
+	s.mu.Unlock()
+}
+
+// Unpin decrements the reference count for a shadow path. If the count
+// reaches zero and a removal is pending, the shadow file is deleted.
+func (s *ShadowStore) Unpin(remotePath string) {
+	s.mu.Lock()
+	r := s.refs[remotePath] - 1
+	if r <= 0 {
+		delete(s.refs, remotePath)
+		r = 0
+	} else {
+		s.refs[remotePath] = r
+	}
+	shouldRemove := r == 0 && s.pendingRemove[remotePath]
+	if shouldRemove {
+		delete(s.pendingRemove, remotePath)
+	}
+	s.mu.Unlock()
+
+	if shouldRemove {
+		s.doRemove(remotePath)
+	}
+}
+
+// Remove removes a shadow file from memory and disk. If the path is
+// currently pinned, the removal is deferred until the last Unpin.
 func (s *ShadowStore) Remove(remotePath string) {
+	s.mu.Lock()
+	if s.refs[remotePath] > 0 {
+		s.pendingRemove[remotePath] = true
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+
+	s.doRemove(remotePath)
+}
+
+// doRemove performs the actual shadow file close + disk removal.
+func (s *ShadowStore) doRemove(remotePath string) {
 	s.mu.Lock()
 	sf, ok := s.files[remotePath]
 	if ok {
@@ -397,6 +448,15 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 	}
 	delete(s.files, oldPath)
 	s.files[newPath] = sf
+	// Transfer refcount and pending-remove state to new path.
+	if r, ok := s.refs[oldPath]; ok {
+		s.refs[newPath] = r
+		delete(s.refs, oldPath)
+	}
+	if s.pendingRemove[oldPath] {
+		s.pendingRemove[newPath] = true
+		delete(s.pendingRemove, oldPath)
+	}
 	s.mu.Unlock()
 
 	// Rename on disk.
@@ -436,6 +496,8 @@ func (s *ShadowStore) Close() {
 		_ = sf.fd.Close()
 	}
 	s.files = make(map[string]*ShadowFile)
+	s.refs = make(map[string]int32)
+	s.pendingRemove = make(map[string]bool)
 }
 
 // RecoverFromDisk scans the shadow directory and loads shadow files into memory.
