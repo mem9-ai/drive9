@@ -330,6 +330,63 @@ func TestShadowStoreRenameFailureRollbackPinState(t *testing.T) {
 	}
 }
 
+func TestShadowStorePinIfExists(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// PinIfExists on a non-existent path should return false.
+	if ss.PinIfExists("/missing.txt") {
+		t.Fatal("expected PinIfExists to return false for missing path")
+	}
+
+	// Write some data.
+	wb := NewWriteBuffer("/exists.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("data"))
+	_ = ss.WriteExtents("/exists.txt", wb, 1)
+
+	// PinIfExists on an existing path should return true.
+	if !ss.PinIfExists("/exists.txt") {
+		t.Fatal("expected PinIfExists to return true for existing path")
+	}
+
+	// Remove while pinned — should defer.
+	ss.Remove("/exists.txt")
+	if !ss.Has("/exists.txt") {
+		t.Fatal("expected shadow file to still exist while pinned via PinIfExists")
+	}
+
+	// Unpin triggers removal.
+	ss.Unpin("/exists.txt")
+	if ss.Has("/exists.txt") {
+		t.Error("expected shadow file to be removed after unpin")
+	}
+}
+
+func TestShadowStoreRemovePreventsPin(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := NewWriteBuffer("/race.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("data"))
+	_ = ss.WriteExtents("/race.txt", wb, 1)
+
+	// Remove with no pins — should delete immediately.
+	ss.Remove("/race.txt")
+
+	// PinIfExists after removal must return false.
+	if ss.PinIfExists("/race.txt") {
+		t.Fatal("expected PinIfExists to return false after Remove")
+	}
+}
+
 func TestShadowStoreCheckDiskSpaceThrottled(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStore(dir)

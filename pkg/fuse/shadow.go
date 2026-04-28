@@ -388,6 +388,20 @@ func (s *ShadowStore) Pin(remotePath string) {
 	s.mu.Unlock()
 }
 
+// PinIfExists atomically checks whether a shadow file exists for the given
+// path and, if so, increments its reference count. Returns true if the pin
+// was acquired. This avoids the TOCTOU race between Has() and Pin() where
+// a concurrent Remove() could delete the shadow between the two calls.
+func (s *ShadowStore) PinIfExists(remotePath string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.files[remotePath]; !ok {
+		return false
+	}
+	s.refs[remotePath]++
+	return true
+}
+
 // Unpin decrements the reference count for a shadow path. If the count
 // reaches zero and a removal is pending, the shadow file is deleted.
 func (s *ShadowStore) Unpin(remotePath string) {
@@ -400,13 +414,24 @@ func (s *ShadowStore) Unpin(remotePath string) {
 		s.refs[remotePath] = r
 	}
 	shouldRemove := r == 0 && s.pendingRemove[remotePath]
+	var sf *ShadowFile
+	var haveSF bool
 	if shouldRemove {
 		delete(s.pendingRemove, remotePath)
+		// Atomically remove from files map while holding the lock,
+		// so a concurrent PinIfExists cannot acquire a pin on a file
+		// we are about to delete.
+		sf, haveSF = s.files[remotePath]
+		if haveSF {
+			_ = sf.fd.Close()
+			delete(s.files, remotePath)
+		}
 	}
 	s.mu.Unlock()
 
-	if shouldRemove {
-		s.doRemove(remotePath)
+	if shouldRemove && haveSF {
+		sp := s.shadowPath(remotePath)
+		_ = os.Remove(sp)
 	}
 }
 
@@ -419,14 +444,9 @@ func (s *ShadowStore) Remove(remotePath string) {
 		s.mu.Unlock()
 		return
 	}
-	s.mu.Unlock()
-
-	s.doRemove(remotePath)
-}
-
-// doRemove performs the actual shadow file close + disk removal.
-func (s *ShadowStore) doRemove(remotePath string) {
-	s.mu.Lock()
+	// Atomically remove from files map while still holding the lock,
+	// so a concurrent PinIfExists cannot acquire a pin on a file
+	// we are about to delete.
 	sf, ok := s.files[remotePath]
 	if ok {
 		_ = sf.fd.Close()
@@ -434,9 +454,12 @@ func (s *ShadowStore) doRemove(remotePath string) {
 	}
 	s.mu.Unlock()
 
-	sp := s.shadowPath(remotePath)
-	_ = os.Remove(sp)
+	if ok {
+		sp := s.shadowPath(remotePath)
+		_ = os.Remove(sp)
+	}
 }
+
 
 // Rename moves a shadow file from oldPath to newPath.
 func (s *ShadowStore) Rename(oldPath, newPath string) bool {

@@ -1809,10 +1809,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		if entry != nil && entry.Size > smallFileThreshold {
 			fh.Prefetch = NewPrefetcher(fs.client, p, entry.Size, fs.debugEnabled())
 		}
-		// Pin shadow for read-only opens so commit queue cleanup doesn't
-		// delete the shadow file while this handle is reading from it.
-		if !fh.ShadowPinned && fs.shadowStore != nil && fs.shadowStore.Has(p) {
-			fs.shadowStore.Pin(p)
+		// Atomically pin shadow for read-only opens so commit queue cleanup
+		// doesn't delete the shadow file while this handle is reading from it.
+		// PinIfExists avoids a TOCTOU race between Has() and Pin().
+		if !fh.ShadowPinned && fs.shadowStore != nil && fs.shadowStore.PinIfExists(p) {
 			fh.ShadowPinned = true
 		}
 	}
