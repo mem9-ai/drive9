@@ -3,6 +3,7 @@ package fuse
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -3099,6 +3100,117 @@ func TestReadSmallFileRetryExhaustedReturnsEIO(t *testing.T) {
 	wantCalls := int32(1 + readTransientRetryCount)
 	if got := getCalls.Load(); got != wantCalls {
 		t.Fatalf("GET calls = %d, want %d", got, wantCalls)
+	}
+}
+
+// TestDoRangeReadBodyErrorReturnsForRetry verifies that doRangeRead returns
+// body-stage errors (not EOF/UnexpectedEOF) so the retry helper can classify
+// and retry them. This tests the unit contract that enables body-stage retry.
+func TestDoRangeReadBodyErrorReturnsForRetry(t *testing.T) {
+	// Test that doRangeRead passes through body errors that are NOT
+	// io.EOF / io.ErrUnexpectedEOF, allowing the retry wrapper to
+	// classify and potentially retry them.
+	wantErr := context.DeadlineExceeded
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Send 200 with large Content-Length but write nothing.
+		// The client's context will be canceled, causing a body read error.
+		w.Header().Set("Content-Length", "1048576")
+		w.WriteHeader(http.StatusOK)
+		// Block until client gives up
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	// Use a very short timeout so the test runs fast
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, _, err := fs.doRangeRead(ctx, "/test.bin", 0, 4096)
+	if err == nil {
+		t.Fatal("expected error from doRangeRead with expired context")
+	}
+	// The error should be classifiable as transient (context deadline exceeded)
+	if !isTransientReadErr(err) {
+		t.Fatalf("body-stage error %v should be classified as transient", err)
+	}
+	// Verify it wraps the expected cause
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected DeadlineExceeded in error chain, got: %v", err)
+	}
+}
+
+// TestReadPrefetchNotTriggeredOnFailure verifies that Prefetch.OnRead is NOT
+// called when the remote read fails after a prefetch cache miss.
+func TestReadPrefetchNotTriggeredOnFailure(t *testing.T) {
+	fileSize := int64(1 << 20) // 1 MiB — gets a Prefetcher
+	var getCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			getCalls.Add(1)
+			// All GETs fail with 503 (transient)
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	cancel := make(chan struct{})
+	var entryOut2 gofuse.EntryOut
+	st := fs.Lookup(cancel, &gofuse.InHeader{NodeId: 1}, "prefetch-fail.bin", &entryOut2)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup: %v", st)
+	}
+
+	var openOut gofuse.OpenOut
+	st = fs.Open(cancel, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: entryOut2.NodeId}, Flags: syscall.O_RDONLY}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open: %v", st)
+	}
+
+	// Verify prefetcher is set
+	fh, ok := fs.fileHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.Prefetch == nil {
+		t.Fatal("expected Prefetcher for large read-only file")
+	}
+
+	// Read — all remote attempts fail
+	_, st = fs.Read(cancel, &gofuse.ReadIn{Fh: openOut.Fh, Offset: 0, Size: 4096}, nil)
+	if st != gofuse.EIO {
+		t.Fatalf("Read status = %v, want EIO", st)
+	}
+
+	// Verify OnRead was NOT called by checking prefetcher state.
+	// After OnRead, readSize would be set to a non-zero value. Since we
+	// have no direct accessor, we verify indirectly: the prefetcher's
+	// internal sequential tracker should not have advanced. A successful
+	// OnRead would schedule background fetches; with a failing server,
+	// those fetches would generate additional GET calls beyond the
+	// Read retry attempts.
+	//
+	// With 1 initial + 2 retries = 3 GET calls from Read itself.
+	// If OnRead fired, the prefetcher would issue additional GETs.
+	wantMaxCalls := int32(1 + readTransientRetryCount)
+	if got := getCalls.Load(); got > wantMaxCalls {
+		t.Fatalf("GET calls = %d, want <= %d (OnRead should not trigger prefetch on failure)", got, wantMaxCalls)
 	}
 }
 
