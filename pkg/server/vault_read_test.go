@@ -52,7 +52,7 @@ func newVaultGrantReadRuntime(t *testing.T) *vaultGrantReadRuntime {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost", SkipTiDBSchemaCheck: true}, enc)
 
 	parsed, err := mysql.ParseDSN(testDSN)
 	if err != nil {
@@ -86,7 +86,7 @@ func newVaultGrantReadRuntime(t *testing.T) *vaultGrantReadRuntime {
 			DBPasswordCipher: passCipher,
 			DBName:           parsed.DBName,
 			DBTLS:            false,
-			Provider:         tenant.ProviderDB9,
+			Provider:         tenant.ProviderTiDBZero,
 			SchemaVersion:    1,
 			CreatedAt:        now,
 			UpdatedAt:        now,
