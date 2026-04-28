@@ -183,8 +183,12 @@ func TestQwenASRAudioTextExtractorErrorMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{Path: "/audio/clip.mp3", Data: []byte("fake")})
-	if err == nil || !strings.Contains(err.Error(), "qwen asr api status 502: upstream unavailable") {
-		t.Fatalf("err=%v, want upstream unavailable status", err)
+	var apiErr *AudioExtractAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err=%T %[1]v, want AudioExtractAPIError", err)
+	}
+	if apiErr.StatusCode != http.StatusBadGateway || apiErr.Message != "upstream unavailable" {
+		t.Fatalf("apiErr=%+v, want 502 upstream unavailable", apiErr)
 	}
 	if IsNonRetryableAudioExtractError(err) {
 		t.Fatalf("err=%v, should be retryable", err)
@@ -234,9 +238,9 @@ func TestQwenASRAudioTextExtractorRejectsOversizedBase64Payload(t *testing.T) {
 	}
 }
 
-func TestQwenASRAudioTextExtractorNoChoicesErrorIncludesRawResponse(t *testing.T) {
+func TestQwenASRAudioTextExtractorNoChoicesErrorIncludesMaskedResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"choices":[],"request_id":"abc"}`))
+		_, _ = w.Write([]byte(`{"id":"resp-abc","choices":[]}`))
 	}))
 	defer server.Close()
 
@@ -255,8 +259,8 @@ func TestQwenASRAudioTextExtractorNoChoicesErrorIncludesRawResponse(t *testing.T
 	if err == nil {
 		t.Fatal("expected no choices error")
 	}
-	if !strings.Contains(err.Error(), "qwen asr api returned no choices") || !strings.Contains(err.Error(), `"request_id":"abc"`) {
-		t.Fatalf("err=%v, want raw response detail", err)
+	if !strings.Contains(err.Error(), "qwen asr api returned no choices") || !strings.Contains(err.Error(), `"id":"resp-abc"`) {
+		t.Fatalf("err=%v, want masked response detail", err)
 	}
 }
 
@@ -291,7 +295,7 @@ func TestQwenASRAudioTextExtractorAllowsLargeSuccessfulResponse(t *testing.T) {
 	}
 }
 
-func TestQwenASRAudioTextExtractorDecodeErrorIncludesRawResponse(t *testing.T) {
+func TestQwenASRAudioTextExtractorDecodeErrorExcludesRawResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"choices":[`))
 	}))
@@ -312,20 +316,27 @@ func TestQwenASRAudioTextExtractorDecodeErrorIncludesRawResponse(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected decode error")
 	}
-	if !strings.Contains(err.Error(), "decode qwen asr response") || !strings.Contains(err.Error(), `raw={"choices":[`) {
-		t.Fatalf("err=%v, want raw response detail", err)
+	if !strings.Contains(err.Error(), "decode qwen asr response") {
+		t.Fatalf("err=%v, want decode response error", err)
+	}
+	if strings.Contains(err.Error(), `{"choices":[`) || strings.Contains(err.Error(), "raw=") {
+		t.Fatalf("err leaked raw response: %v", err)
 	}
 }
 
-func TestMaskQwenASRResponseBodyForLogMasksChoiceContent(t *testing.T) {
-	raw := []byte(`{"id":"resp-1","choices":[{"message":{"role":"assistant","content":"sensitive transcript"}},{"message":{"role":"assistant","content":[{"type":"text","text":"another secret"}]}}],"usage":{"seconds":3}}`)
+func TestMaskQwenASRResponseBodyForLogMasksChoiceMessageContent(t *testing.T) {
+	raw := []byte(`{"id":"resp-1","content":"top-level secret","choices":[{"message":{"role":"assistant","content":"sensitive transcript"}},{"message":{"role":"assistant","content":[{"type":"text","text":"another secret"}]}}],"usage":{"seconds":3}}`)
 
 	masked := maskQwenASRResponseBodyForLog(raw)
 	if strings.Contains(masked, "sensitive transcript") || strings.Contains(masked, "another secret") {
-		t.Fatalf("masked response leaked transcript content: %s", masked)
+		t.Fatalf("masked response leaked choice message content: %s", masked)
+	}
+	if !strings.Contains(masked, "top-level secret") {
+		t.Fatalf("masked response unexpectedly removed non-choice content field: %s", masked)
 	}
 
 	var parsed struct {
+		Content string `json:"content"`
 		ID      string `json:"id"`
 		Choices []struct {
 			Message struct {
@@ -342,6 +353,9 @@ func TestMaskQwenASRResponseBodyForLogMasksChoiceContent(t *testing.T) {
 	}
 	if parsed.ID != "resp-1" || parsed.Usage.Seconds != 3 {
 		t.Fatalf("masked response lost non-content fields: %+v", parsed)
+	}
+	if parsed.Content != "top-level secret" {
+		t.Fatalf("top-level content=%q, want preserved", parsed.Content)
 	}
 	for i, choice := range parsed.Choices {
 		if choice.Message.Role != "assistant" {

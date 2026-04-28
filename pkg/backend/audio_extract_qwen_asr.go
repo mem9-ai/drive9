@@ -152,7 +152,7 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 		return "", AudioExtractUsage{}, fmt.Errorf("read qwen asr response for %q: %w", req.Path, err)
 	}
 	if responseTooLarge {
-		message := fmt.Sprintf("qwen asr response exceeds %d byte limit (raw=%s)", qwenASRMaxResponseBytes, truncateString(string(raw), 256))
+		message := fmt.Sprintf("qwen asr response exceeds %d byte limit (response_bytes>%d)", qwenASRMaxResponseBytes, qwenASRMaxResponseBytes)
 		if resp.StatusCode >= 300 {
 			return "", AudioExtractUsage{}, &AudioExtractAPIError{
 				Provider:   "qwen asr",
@@ -162,7 +162,9 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 		}
 		return "", AudioExtractUsage{}, errors.New(message)
 	}
+	maskedResponse := maskQwenASRResponseBodyForLog(raw)
 	var parsed struct {
+		ID    string `json:"id"`
 		Error *struct {
 			Message string `json:"message"`
 		} `json:"error"`
@@ -181,21 +183,21 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		// If we can't parse the response, include the raw body in the error for debugging.
 		if resp.StatusCode >= 300 {
 			return "", AudioExtractUsage{}, &AudioExtractAPIError{
 				Provider:   "qwen asr",
 				StatusCode: resp.StatusCode,
-				Message:    truncateString(string(raw), 256),
+				Message:    "invalid response body",
 			}
 		}
-		return "", AudioExtractUsage{}, fmt.Errorf("decode qwen asr response: %w (raw=%s)", err, truncateString(string(raw), 256))
+		return "", AudioExtractUsage{}, fmt.Errorf("decode qwen asr response: %w", err)
 	}
 	logger.Debug(ctx, "qwen_asr_response_body",
 		zap.String("path", req.Path),
 		zap.Int("status_code", resp.StatusCode),
+		zap.String("provider_request_id", parsed.ID),
 		zap.Int("response_bytes", len(raw)),
-		zap.String("response_body", maskQwenASRResponseBodyForLog(raw)))
+		zap.String("response_body", maskedResponse))
 
 	// Reference: https://help.aliyun.com/zh/model-studio/error-code
 	// If the status code indicates an error, return an API error with details if available.
@@ -213,7 +215,7 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 		}
 	}
 	if len(parsed.Choices) == 0 {
-		return "", AudioExtractUsage{}, fmt.Errorf("qwen asr api returned no choices (raw=%s)", truncateString(string(raw), 256))
+		return "", AudioExtractUsage{}, fmt.Errorf("qwen asr api returned no choices (response=%s)", maskedResponse)
 	}
 	text := extractOpenAIContentText(parsed.Choices[0].Message.Content)
 	if strings.TrimSpace(text) == "" {
@@ -242,12 +244,12 @@ func readQwenASRResponseBody(r io.Reader) ([]byte, bool, error) {
 func maskQwenASRResponseBodyForLog(raw []byte) string {
 	var body any
 	if err := json.Unmarshal(raw, &body); err != nil {
-		return truncateString(string(raw), 4096)
+		return "[unparseable response body]"
 	}
 	maskQwenASRChoicesContent(body)
 	masked, err := json.Marshal(body)
 	if err != nil {
-		return truncateString(string(raw), 4096)
+		return "[unparseable response body]"
 	}
 	return truncateString(string(masked), 4096)
 }
