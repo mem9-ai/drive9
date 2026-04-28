@@ -450,6 +450,41 @@ func TestShadowStoreRetireAllowsNewWriter(t *testing.T) {
 	}
 }
 
+// TestShadowStoreReadAtGenActive verifies that ReadAtGen and SizeGen work
+// for active (not yet retired) generations, covering the transition window
+// where Remove hasn't been called yet.
+func TestShadowStoreReadAtGenActive(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := NewWriteBuffer("/active.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("active data"))
+	_ = ss.WriteExtents("/active.txt", wb, 1)
+
+	gen := ss.Pin("/active.txt")
+
+	// SizeGen should work while shadow is still active (not retired).
+	if sz := ss.SizeGen(gen); sz != 11 {
+		t.Errorf("SizeGen on active gen = %d, want 11", sz)
+	}
+
+	// ReadAtGen should work while shadow is still active.
+	buf := make([]byte, 11)
+	n, err := ss.ReadAtGen(gen, 0, buf)
+	if err != nil {
+		t.Fatalf("ReadAtGen on active gen: %v", err)
+	}
+	if n != 11 || !bytes.Equal(buf, []byte("active data")) {
+		t.Errorf("ReadAtGen data = %q, want %q", buf[:n], "active data")
+	}
+
+	ss.Unpin(gen)
+}
+
 func TestShadowStoreUnpinZeroNoop(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStore(dir)
