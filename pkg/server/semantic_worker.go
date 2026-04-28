@@ -167,8 +167,9 @@ type semanticObservationSnapshot struct {
 type semanticTaskAction string
 
 const (
-	semanticTaskActionAck   semanticTaskAction = "ack"
-	semanticTaskActionRetry semanticTaskAction = "retry"
+	semanticTaskActionAck        semanticTaskAction = "ack"
+	semanticTaskActionRetry      semanticTaskAction = "retry"
+	semanticTaskActionDeadLetter semanticTaskAction = "dead_letter"
 )
 
 type semanticTaskOutcome struct {
@@ -404,6 +405,8 @@ func (m *semanticWorkerManager) processTask(ctx context.Context, target *semanti
 		m.ackTask(ctx, target.tenantID, target.store, task, outcome.message)
 	case semanticTaskActionRetry:
 		m.retryTask(ctx, target.tenantID, target.store, task, outcome.message)
+	case semanticTaskActionDeadLetter:
+		m.deadLetterTask(ctx, target.tenantID, target.store, task, outcome.message)
 	}
 }
 
@@ -454,6 +457,26 @@ func (m *semanticWorkerManager) retryTask(ctx context.Context, tenantID string, 
 		fields = append(fields, zap.Time("retry_at", retryAt))
 	}
 	logger.Warn(ctx, logMessage, fields...)
+}
+
+func (m *semanticWorkerManager) deadLetterTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task, message string) {
+	start := time.Now()
+	if err := store.DeadLetterSemanticTask(ctx, task.TaskID, task.Receipt, message); err != nil {
+		metrics.RecordOperation("semantic_worker", "dead_letter", "error", time.Since(start))
+		logger.Warn(ctx, "semantic_worker_dead_letter_failed",
+			append([]zap.Field{
+				zap.String("tenant_id", tenantID),
+				zap.String("result", "error"),
+			}, append(semanticTaskLogFields(task), zap.Error(err))...)...)
+		return
+	}
+	metrics.RecordOperation("semantic_worker", "dead_letter", "dead_lettered", time.Since(start))
+	logger.Warn(ctx, "semantic_worker_dead_lettered",
+		append([]zap.Field{
+			zap.String("tenant_id", tenantID),
+			zap.String("result", "dead_lettered"),
+			zap.String("message", message),
+		}, semanticTaskLogFields(task)...)...)
 }
 
 func (m *semanticWorkerManager) retryDelay(attemptCount int) time.Duration {
@@ -919,6 +942,9 @@ func (m *semanticWorkerManager) processImgExtractTask(ctx context.Context, b *ba
 func (m *semanticWorkerManager) processAudioExtractTask(ctx context.Context, b *backend.Dat9Backend, task *semantic.Task) semanticTaskOutcome {
 	result, err := b.ProcessAudioExtractTask(ctx, audioExtractTaskSpecFromSemanticTask(task))
 	if err != nil {
+		if backend.IsNonRetryableAudioExtractError(err) {
+			return semanticTaskOutcome{action: semanticTaskActionDeadLetter, result: string(result), message: err.Error()}
+		}
 		return semanticTaskOutcome{action: semanticTaskActionRetry, result: string(result), message: err.Error()}
 	}
 	if result == backend.AudioExtractResultBudgetExhausted {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -184,5 +185,65 @@ func TestQwenASRAudioTextExtractorErrorMessage(t *testing.T) {
 	_, _, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{Path: "/audio/clip.mp3", Data: []byte("fake")})
 	if err == nil || !strings.Contains(err.Error(), "qwen asr api status 502: upstream unavailable") {
 		t.Fatalf("err=%v, want upstream unavailable status", err)
+	}
+	if IsNonRetryableAudioExtractError(err) {
+		t.Fatalf("err=%v, should be retryable", err)
+	}
+}
+
+func TestQwenASRAudioTextExtractorNonRetryableClientErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		message    string
+	}{
+		{
+			name:       "free_tier_exhausted",
+			statusCode: http.StatusForbidden,
+			message:    "The free tier of the model has been exhausted.",
+		},
+		{
+			name:       "illegal_audio_format",
+			statusCode: http.StatusBadRequest,
+			message:    "<400> InternalError.Algo.InvalidParameter: The audio format is illegal and cannot be opened",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.statusCode)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error": map[string]string{"message": tc.message},
+				})
+			}))
+			defer server.Close()
+
+			extractor, err := NewQwenASRAudioTextExtractor(QwenASRAudioTextExtractorConfig{
+				BaseURL: server.URL,
+				APIKey:  "secret",
+				Model:   "qwen3-asr-flash",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+				Path: "/audio/clip.mp3",
+				Data: []byte("fake"),
+			})
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			var apiErr *AudioExtractAPIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("err=%T %[1]v, want AudioExtractAPIError", err)
+			}
+			if apiErr.StatusCode != tc.statusCode {
+				t.Fatalf("status=%d, want %d", apiErr.StatusCode, tc.statusCode)
+			}
+			if !IsNonRetryableAudioExtractError(err) {
+				t.Fatalf("err=%v, want non-retryable", err)
+			}
+		})
 	}
 }

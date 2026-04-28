@@ -143,16 +143,31 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
+		// If we can't parse the response, include the raw body in the error for debugging.
 		if resp.StatusCode >= 300 {
-			return "", AudioExtractUsage{}, fmt.Errorf("qwen asr api status %d: %s", resp.StatusCode, truncateString(string(raw), 256))
+			return "", AudioExtractUsage{}, &AudioExtractAPIError{
+				Provider:   "qwen asr",
+				StatusCode: resp.StatusCode,
+				Message:    truncateString(string(raw), 256),
+			}
 		}
 		return "", AudioExtractUsage{}, fmt.Errorf("decode qwen asr response: %w", err)
 	}
+
+	// Reference: https://help.aliyun.com/zh/model-studio/error-code
+	// If the status code indicates an error, return an API error with details if available.
 	if resp.StatusCode >= 300 {
 		if parsed.Error != nil && parsed.Error.Message != "" {
-			return "", AudioExtractUsage{}, fmt.Errorf("qwen asr api status %d: %s", resp.StatusCode, parsed.Error.Message)
+			return "", AudioExtractUsage{}, &AudioExtractAPIError{
+				Provider:   "qwen asr",
+				StatusCode: resp.StatusCode,
+				Message:    parsed.Error.Message,
+			}
 		}
-		return "", AudioExtractUsage{}, fmt.Errorf("qwen asr api status %d", resp.StatusCode)
+		return "", AudioExtractUsage{}, &AudioExtractAPIError{
+			Provider:   "qwen asr",
+			StatusCode: resp.StatusCode,
+		}
 	}
 	if len(parsed.Choices) == 0 {
 		return "", AudioExtractUsage{}, fmt.Errorf("qwen asr api returned no choices")
