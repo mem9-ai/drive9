@@ -3103,21 +3103,15 @@ func TestReadSmallFileRetryExhaustedReturnsEIO(t *testing.T) {
 	}
 }
 
-// TestDoRangeReadBodyErrorReturnsForRetry verifies that doRangeRead returns
-// body-stage errors (not EOF/UnexpectedEOF) so the retry helper can classify
-// and retry them. This tests the unit contract that enables body-stage retry.
-func TestDoRangeReadBodyErrorReturnsForRetry(t *testing.T) {
-	// Test that doRangeRead passes through body errors that are NOT
-	// io.EOF / io.ErrUnexpectedEOF, allowing the retry wrapper to
-	// classify and potentially retry them.
-	wantErr := context.DeadlineExceeded
-
+// TestDoRangeReadBodyTimeoutReturnsForRetry verifies that doRangeRead surfaces
+// context deadline errors during body read (not swallowed), allowing the retry
+// helper to classify and retry them.
+func TestDoRangeReadBodyTimeoutReturnsForRetry(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Send 200 with large Content-Length but write nothing.
 		// The client's context will be canceled, causing a body read error.
 		w.Header().Set("Content-Length", "1048576")
 		w.WriteHeader(http.StatusOK)
-		// Block until client gives up
 		<-r.Context().Done()
 	}))
 	defer ts.Close()
@@ -3126,7 +3120,6 @@ func TestDoRangeReadBodyErrorReturnsForRetry(t *testing.T) {
 	opts.setDefaults()
 	fs := NewDat9FS(client.New(ts.URL, ""), opts)
 
-	// Use a very short timeout so the test runs fast
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
@@ -3134,13 +3127,49 @@ func TestDoRangeReadBodyErrorReturnsForRetry(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from doRangeRead with expired context")
 	}
-	// The error should be classifiable as transient (context deadline exceeded)
 	if !isTransientReadErr(err) {
 		t.Fatalf("body-stage error %v should be classified as transient", err)
 	}
-	// Verify it wraps the expected cause
-	if !errors.Is(err, wantErr) {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected DeadlineExceeded in error chain, got: %v", err)
+	}
+}
+
+// TestDoRangeReadBodyTruncationReturnsError verifies that when a server sends
+// headers successfully but closes the connection mid-body (truncation),
+// doRangeRead surfaces an error instead of silently returning partial data.
+// This enables the retry helper to detect and retry body-stage truncation.
+func TestDoRangeReadBodyTruncationReturnsError(t *testing.T) {
+	var getCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		getCalls.Add(1)
+		// Hijack the connection: send valid HTTP headers with Content-Length
+		// promising 4096 bytes, write only 10 bytes, then close.
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Log("server does not support hijacking")
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		conn, buf, _ := hj.Hijack()
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n")
+		_, _ = buf.Write(make([]byte, 10)) // only 10 of 4096 bytes
+		_ = buf.Flush()
+		_ = conn.Close() // truncate
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	ctx := context.Background()
+	_, n, err := fs.doRangeRead(ctx, "/truncate.bin", 0, 4096)
+	// doRangeRead must return an error for truncated body, not silent success.
+	// The old code (io.ReadFull + ErrUnexpectedEOF filter) would return nil here.
+	if err == nil {
+		t.Fatalf("expected error from truncated body, got nil with n=%d", n)
 	}
 }
 

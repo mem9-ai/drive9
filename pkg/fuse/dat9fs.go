@@ -753,12 +753,17 @@ func (fs *Dat9FS) doRangeRead(ctx context.Context, path string, offset, size int
 	}
 	defer func() { _ = rc.Close() }()
 
-	data := make([]byte, size)
-	n, err := io.ReadFull(rc, data)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return nil, n, err
+	// Use LimitReader + ReadAll instead of ReadFull so that:
+	//   - Clean EOF (server sent full response) → (data, nil) — success
+	//   - Truncated body (connection drop) → (partial, err) — surfaces
+	//     to retry helper for transient classification
+	// io.ReadFull swallows io.ErrUnexpectedEOF, hiding truncation.
+	lr := io.LimitReader(rc, size)
+	data, err := io.ReadAll(lr)
+	if err != nil {
+		return nil, len(data), err
 	}
-	return data[:n], n, nil
+	return data, len(data), nil
 }
 
 func (fs *Dat9FS) lookupStatRetryCount() int {
