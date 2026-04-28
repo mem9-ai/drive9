@@ -559,10 +559,13 @@ func (s *ShadowStore) Remove(remotePath string) {
 	}
 	s.mu.Unlock()
 
-	if ok {
-		sp := s.shadowPath(remotePath)
-		_ = os.Remove(sp)
-	}
+	// Always attempt disk cleanup — the shadow may exist only on disk
+	// (e.g. after crash/restart recovery where it was never loaded into
+	// the files map). Without this, a successfully committed shadow
+	// would remain on disk and be served as stale local data by
+	// Has()/ReadAt()/ReadAll() fallback paths.
+	sp := s.shadowPath(remotePath)
+	_ = os.Remove(sp)
 }
 
 // Rename moves a shadow file from oldPath to newPath.

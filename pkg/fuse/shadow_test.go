@@ -543,6 +543,43 @@ func TestShadowStorePinIfExistsDiskOnly(t *testing.T) {
 	ss.Unpin(gen)
 }
 
+// TestShadowStoreRemoveDiskOnly verifies that Remove cleans up a shadow file
+// that exists only on disk (not in the files map). This covers the recovery
+// scenario where commit queue uploads a disk-only shadow and then calls Remove.
+func TestShadowStoreRemoveDiskOnly(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write a shadow and then remove it from in-memory map only.
+	wb := NewWriteBuffer("/disk-rm.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("stale"))
+	_ = ss.WriteExtents("/disk-rm.txt", wb, 1)
+
+	// Simulate disk-only state: close fd, remove from files map.
+	ss.mu.Lock()
+	sf := ss.files["/disk-rm.txt"]
+	_ = sf.fd.Close()
+	delete(ss.files, "/disk-rm.txt")
+	ss.mu.Unlock()
+
+	// Verify shadow is visible on disk via Has().
+	if !ss.Has("/disk-rm.txt") {
+		t.Fatal("expected disk-only shadow to be visible via Has")
+	}
+
+	// Remove should clean up the disk file even though files map is empty.
+	ss.Remove("/disk-rm.txt")
+
+	// Has() should no longer find it.
+	if ss.Has("/disk-rm.txt") {
+		t.Fatal("expected disk-only shadow to be cleaned up after Remove")
+	}
+}
+
 func TestShadowStoreCheckDiskSpaceThrottled(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStore(dir)
