@@ -76,7 +76,7 @@ func webdavMount(c *client.Client, mountPoint string, handler http.Handler) erro
 	if err != nil {
 		return fmt.Errorf("webdav: listen: %w", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	addr := ln.Addr().(*net.TCPAddr)
 	serverURL := fmt.Sprintf("http://127.0.0.1:%d", addr.Port)
@@ -94,20 +94,20 @@ func webdavMount(c *client.Client, mountPoint string, handler http.Handler) erro
 
 	// Ensure mount point exists.
 	if err := os.MkdirAll(mountPoint, 0o755); err != nil {
-		srv.Close()
+		_ = srv.Close()
 		return fmt.Errorf("webdav: create mount point: %w", err)
 	}
 
 	// Invoke mount_webdav.
 	mountCmd, err := webdavMountCmd(runtime.GOOS, serverURL, mountPoint)
 	if err != nil {
-		srv.Close()
+		_ = srv.Close()
 		return err
 	}
 	mountCmd.Stdout = os.Stderr
 	mountCmd.Stderr = os.Stderr
 	if err := mountCmd.Run(); err != nil {
-		srv.Close()
+		_ = srv.Close()
 		return fmt.Errorf("webdav: mount_webdav failed: %w", err)
 	}
 
@@ -132,7 +132,7 @@ func webdavMount(c *client.Client, mountPoint string, handler http.Handler) erro
 		webdavUnmount(runtime.GOOS, mountPoint)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		srv.Shutdown(ctx)
+		_ = srv.Shutdown(ctx)
 	}()
 
 	// Block until server exits (from signal handler shutdown or error).
