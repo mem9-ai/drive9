@@ -2,9 +2,12 @@ package meta
 
 import (
 	"context"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/metrics"
 )
 
 func newControlStore(t *testing.T) *Store {
@@ -18,6 +21,37 @@ func newControlStore(t *testing.T) *Store {
 	_, _ = s.DB().Exec("DELETE FROM tenants")
 	_, _ = s.DB().Exec("DELETE FROM llm_usage")
 	return s
+}
+
+func TestMetaDBMetrics(t *testing.T) {
+	s := newControlStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertTenant(context.Background(), &Tenant{
+		ID:               "metrics-meta-tenant",
+		Status:           TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: []byte("cipher"),
+		DBName:           "tenant_db_metrics",
+		DBTLS:            true,
+		Provider:         "tidb_zero",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `dat9_db_operations_total{role="meta"`) {
+		t.Fatalf("expected meta db operation metric in response: %s", text)
+	}
+	if !strings.Contains(text, `dat9_db_pool_registered{role="meta"}`) {
+		t.Fatalf("expected meta db pool metric in response: %s", text)
+	}
 }
 
 func TestInsertAndResolveByAPIKeyHash(t *testing.T) {

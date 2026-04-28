@@ -148,7 +148,7 @@ func initTiDBAppEmbeddingSchema(ctx context.Context, dsn string, opts InitTiDBTe
 	if err != nil {
 		return err
 	}
-	defer func() { _ = db.Close() }()
+	defer func() { _ = closeTiDBSchemaDB(db) }()
 	if !IsTiDBCluster(ctx, db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
