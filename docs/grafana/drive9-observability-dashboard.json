@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Organized around the main Drive9 triage questions: is the issue at HTTP ingress, service work, or database pressure?",
+  "description": "Performance-first dashboard for Drive9. It is organized around the four core signals: throughput, latency, saturation, and errors.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -32,10 +32,10 @@
       },
       "id": 100,
       "options": {
-        "content": "# Read This Dashboard\n\nThis view is laid out in the order you usually debug Drive9.\n\n1. Start with the overview cards to see whether the spike is at the HTTP edge, in service execution, or in database pressure.\n2. Use **HTTP Front Door** when p95 or 5xx climbs first.\n3. Use **Business And Backend Work** when requests look healthy but internal operations or lifecycle events turn noisy.\n4. Use **Database Pressure** when latency rises together with DB waits, pool saturation, or slower DB operations.\n\nUse the top filters to cut the dashboard down by route, component, operation, DB role, and event.",
+        "content": "# Drive9 Performance Control Room\n\nThis dashboard is optimized for performance triage, not for broad business observability.\n\n1. Start with the top cards to spot the dominant signal: throughput, latency, saturation, or errors.\n2. Use **Request Path** when users report slowness or API instability.\n3. Use **Application Workload** when HTTP looks normal but backend execution gets slower.\n4. Use **Database Pressure** when latency climbs together with waits, pool saturation, or slower DB operations.\n\nFilters let you narrow the view by route, component, operation, DB role, DB operation, and API event.",
         "mode": "markdown"
       },
-      "title": "Dashboard Guide",
+      "title": "Guide",
       "transparent": true,
       "type": "text"
     },
@@ -73,7 +73,7 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
+        "w": 3,
         "x": 0,
         "y": 4
       },
@@ -140,8 +140,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 4,
+        "w": 3,
+        "x": 3,
         "y": 4
       },
       "id": 2,
@@ -193,6 +193,140 @@
               },
               {
                 "color": "orange",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 6,
+        "y": 4
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval])))",
+          "legendFormat": "http_p99",
+          "refId": "A"
+        }
+      ],
+      "title": "HTTP P99",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 20
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 9,
+        "y": 4
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dat9_http_inflight_requests",
+          "legendFormat": "inflight",
+          "refId": "A"
+        }
+      ],
+      "title": "Inflight Requests",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
                 "value": 0.01
               },
               {
@@ -207,11 +341,11 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 8,
+        "w": 3,
+        "x": 12,
         "y": 4
       },
-      "id": 3,
+      "id": 5,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
@@ -260,25 +394,25 @@
               },
               {
                 "color": "orange",
-                "value": 1
+                "value": 0.1
               },
               {
                 "color": "red",
-                "value": 10
+                "value": 0.5
               }
             ]
           },
-          "unit": "ops"
+          "unit": "s"
         },
         "overrides": []
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 12,
+        "w": 3,
+        "x": 15,
         "y": 4
       },
-      "id": 4,
+      "id": 6,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
@@ -299,12 +433,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_service_operations_total{component=~\"$component\",operation=~\"$operation\",result!=\"ok\"}[$__rate_interval]))",
-          "legendFormat": "service_non_ok",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_service_operation_duration_seconds_bucket{component=~\"$component\",operation=~\"$operation\"}[$__rate_interval])))",
+          "legendFormat": "service_p95",
           "refId": "A"
         }
       ],
-      "title": "Service Non-OK /s",
+      "title": "Service P95",
       "type": "stat"
     },
     {
@@ -341,11 +475,11 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 16,
+        "w": 3,
+        "x": 18,
         "y": 4
       },
-      "id": 5,
+      "id": 7,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
@@ -408,11 +542,11 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 20,
+        "w": 3,
+        "x": 21,
         "y": 4
       },
-      "id": 6,
+      "id": 8,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
@@ -450,10 +584,10 @@
       },
       "id": 110,
       "options": {
-        "content": "## HTTP Front Door\nWhen users feel slowness first, answer three questions here: which route got busy, whether latency rose before errors, and whether errors concentrate on a small set of routes.",
+        "content": "## Request Path\nFocus here when interactive API calls feel slow. The main questions are: which routes are hot, which routes are slow, and whether latency is accompanied by queueing or errors.",
         "mode": "markdown"
       },
-      "title": "HTTP Front Door",
+      "title": "Request Path",
       "transparent": true,
       "type": "text"
     },
@@ -496,7 +630,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(8, sum by (route) (rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval])))",
+          "expr": "topk(10, sum by (route) (rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval])))",
           "legendFormat": "{{route}}",
           "refId": "A"
         }
@@ -543,7 +677,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(8, histogram_quantile(0.95, sum by (le, route) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval]))))",
+          "expr": "topk(10, histogram_quantile(0.95, sum by (le, route) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval]))))",
           "legendFormat": "{{route}} p95",
           "refId": "A"
         },
@@ -552,7 +686,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(8, histogram_quantile(0.99, sum by (le, route) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval]))))",
+          "expr": "topk(10, histogram_quantile(0.99, sum by (le, route) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval]))))",
           "legendFormat": "{{route}} p99",
           "refId": "B"
         }
@@ -646,7 +780,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(10, sum by (route, status) (rate(dat9_http_requests_total{route=~\"$route\",status!~\"2..|3..\"}[$__rate_interval])))",
+          "expr": "topk(12, sum by (route, status) (rate(dat9_http_requests_total{route=~\"$route\",status!~\"2..|3..\"}[$__rate_interval])))",
           "legendFormat": "{{route}} / {{status}}",
           "refId": "A"
         },
@@ -655,12 +789,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "dat9_http_inflight_requests",
-          "legendFormat": "inflight",
+          "expr": "sum by (event, result) (rate(dat9_tenant_events_total{event=~\"$event\"}[$__rate_interval]))",
+          "legendFormat": "{{event}} / {{result}}",
           "refId": "B"
         }
       ],
-      "title": "Error Routes And Inflight Load",
+      "title": "API Errors And Event Throughput",
       "type": "timeseries"
     },
     {
@@ -672,10 +806,10 @@
       },
       "id": 120,
       "options": {
-        "content": "## Business And Backend Work\nThis section tells you whether user-visible issues are coming from lifecycle events, backend operations, or background workers rather than from the HTTP layer itself.",
+        "content": "## Application Workload\nUse this section to see whether time is being burned inside backend/service work rather than at the HTTP edge. It is centered on operation throughput, tail latency, and background saturation.",
         "mode": "markdown"
       },
-      "title": "Business And Backend Work",
+      "title": "Application Workload",
       "transparent": true,
       "type": "text"
     },
@@ -701,53 +835,6 @@
         "y": 30
       },
       "id": 21,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "table",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (event, result) (rate(dat9_tenant_events_total{event=~\"$event\"}[$__rate_interval]))",
-          "legendFormat": "{{event}} / {{result}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Tenant And API Events",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 30
-      },
-      "id": 22,
       "options": {
         "legend": {
           "calcs": [],
@@ -791,10 +878,10 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
-        "y": 38
+        "x": 12,
+        "y": 30
       },
-      "id": 23,
+      "id": 22,
       "options": {
         "legend": {
           "calcs": [],
@@ -815,9 +902,18 @@
           "expr": "topk(12, histogram_quantile(0.95, sum by (le, component, operation) (rate(dat9_service_operation_duration_seconds_bucket{component=~\"$component\",operation=~\"$operation\"}[$__rate_interval]))))",
           "legendFormat": "{{component}} / {{operation}} p95",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "topk(12, histogram_quantile(0.99, sum by (le, component, operation) (rate(dat9_service_operation_duration_seconds_bucket{component=~\"$component\",operation=~\"$operation\"}[$__rate_interval]))))",
+          "legendFormat": "{{component}} / {{operation}} p99",
+          "refId": "B"
         }
       ],
-      "title": "Service Latency P95",
+      "title": "Service Latency P95 / P99",
       "type": "timeseries"
     },
     {
@@ -838,10 +934,10 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
+        "x": 0,
         "y": 38
       },
-      "id": 24,
+      "id": 23,
       "options": {
         "legend": {
           "calcs": [],
@@ -884,11 +980,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 46
+        "w": 12,
+        "x": 12,
+        "y": 38
       },
-      "id": 25,
+      "id": 24,
       "options": {
         "legend": {
           "calcs": [],
@@ -906,12 +1002,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "dat9_service_gauge{component=~\"$component\"}",
+          "expr": "dat9_service_gauge{component=~\"$component\",name=~\"queue_depth|queue_capacity|workers\"}",
           "legendFormat": "{{component}} / {{name}}",
           "refId": "A"
         }
       ],
-      "title": "Service Gauges",
+      "title": "Queues And Worker Capacity",
       "type": "timeseries"
     },
     {
@@ -919,11 +1015,11 @@
         "h": 3,
         "w": 24,
         "x": 0,
-        "y": 54
+        "y": 46
       },
       "id": 130,
       "options": {
-        "content": "## Database Pressure\nUse this section to separate query latency from connection-pool pressure. If DB p95 rises together with waits, utilization, or close churn, the bottleneck is likely lower than the HTTP layer.",
+        "content": "## Database Pressure\nThis section is for saturation and latency inside the storage layer. Watch latency together with wait pressure and utilization instead of looking at any single DB graph in isolation.",
         "mode": "markdown"
       },
       "title": "Database Pressure",
@@ -949,7 +1045,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 57
+        "y": 49
       },
       "id": 31,
       "options": {
@@ -996,7 +1092,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 57
+        "y": 49
       },
       "id": 32,
       "options": {
@@ -1019,9 +1115,18 @@
           "expr": "topk(12, histogram_quantile(0.95, sum by (le, role, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=~\"$db_role\",operation=~\"$db_operation\"}[$__rate_interval]))))",
           "legendFormat": "{{role}} / {{operation}} p95",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "topk(12, histogram_quantile(0.99, sum by (le, role, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=~\"$db_role\",operation=~\"$db_operation\"}[$__rate_interval]))))",
+          "legendFormat": "{{role}} / {{operation}} p99",
+          "refId": "B"
         }
       ],
-      "title": "DB Operation Latency P95",
+      "title": "DB Operation Latency P95 / P99",
       "type": "timeseries"
     },
     {
@@ -1043,7 +1148,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 65
+        "y": 57
       },
       "id": 33,
       "options": {
@@ -1115,7 +1220,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 65
+        "y": 57
       },
       "id": 34,
       "options": {
@@ -1188,7 +1293,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 73
+        "y": 65
       },
       "id": 35,
       "options": {
@@ -1235,7 +1340,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 73
+        "y": 65
       },
       "id": 36,
       "options": {
@@ -1268,6 +1373,7 @@
   "schemaVersion": 41,
   "tags": [
     "drive9",
+    "performance",
     "grafana",
     "observability",
     "prometheus"
@@ -1443,8 +1549,8 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Drive9 Observability Control Room",
+  "title": "Drive9 Performance Control Room",
   "uid": "drive9-observability",
-  "version": 2,
+  "version": 3,
   "weekStart": ""
 }
