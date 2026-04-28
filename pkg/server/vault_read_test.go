@@ -18,6 +18,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/vault"
 )
@@ -86,8 +87,8 @@ func newVaultGrantReadRuntime(t *testing.T) *vaultGrantReadRuntime {
 			DBPasswordCipher: passCipher,
 			DBName:           parsed.DBName,
 			DBTLS:            false,
-			Provider:         tenant.ProviderDB9,
-			SchemaVersion:    1,
+			Provider:         tenant.ProviderTiDBZero,
+			SchemaVersion:    schema.CurrentTiDBTenantSchemaVersion,
 			CreatedAt:        now,
 			UpdatedAt:        now,
 		}
