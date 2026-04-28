@@ -86,7 +86,7 @@ func newVaultGrantReadRuntime(t *testing.T) *vaultGrantReadRuntime {
 			DBPasswordCipher: passCipher,
 			DBName:           parsed.DBName,
 			DBTLS:            false,
-			Provider:         tenant.ProviderTiDBZero,
+			Provider:         tenant.ProviderDB9,
 			SchemaVersion:    1,
 			CreatedAt:        now,
 			UpdatedAt:        now,
