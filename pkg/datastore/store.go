@@ -1446,7 +1446,7 @@ func scanNodeWithFileLite(s scanner) (*NodeWithFile, error) {
 	nf := &NodeWithFile{Node: n}
 	if fFileID.Valid {
 		nf.File = &File{
-			FileID:   fFileID.String,
+			FileID:    fFileID.String,
 			SizeBytes: fSizeBytes.Int64,
 			Revision:  fRevision.Int64,
 			Status:    FileStatus(fStatus.String),
@@ -1560,6 +1560,7 @@ func datastorePhaseMs(start time.Time) float64 {
 }
 
 func observeStoreOp(ctx context.Context, op string, start time.Time, errp *error) {
+	elapsed := time.Since(start)
 	result := "ok"
 	if errp != nil && *errp != nil {
 		switch {
@@ -1572,7 +1573,11 @@ func observeStoreOp(ctx context.Context, op string, start time.Time, errp *error
 		}
 		logger.Error(ctx, "datastore_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
 	}
-	metrics.RecordOperation("datastore", op, result, time.Since(start))
+	logger.InfoBenchTiming(ctx, "datastore_op_timing",
+		zap.String("operation", op),
+		zap.String("result", result),
+		zap.Float64("duration_ms", float64(elapsed.Microseconds())/1000.0))
+	metrics.RecordOperation("datastore", op, result, elapsed)
 }
 
 func (s *Store) ExecSQL(ctx context.Context, query string) (out []map[string]interface{}, err error) {

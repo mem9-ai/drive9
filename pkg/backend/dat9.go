@@ -609,13 +609,34 @@ func (b *Dat9Backend) ReadDir(path string) ([]filesystem.FileInfo, error) {
 
 func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []filesystem.FileInfo, err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, "read_dir", err, start) }()
+	var canonicalPath string
+	var listDuration time.Duration
+	defer func() {
+		observeBackend(ctx, "read_dir", err, start)
+		fields := []zap.Field{
+			zap.String("path", path),
+			zap.String("canonical_path", canonicalPath),
+			zap.Int("entries", len(infos)),
+			zap.Float64("list_dir_ms", float64(listDuration.Microseconds())/1000.0),
+			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0),
+		}
+		if err != nil {
+			fields = append(fields, zap.Error(err))
+		}
+		logger.InfoBenchTiming(ctx, "backend_read_dir_timing", fields...)
+	}()
 
 	dirPath, err := pathutil.CanonicalizeDir(path)
 	if err != nil {
 		return nil, err
 	}
+	canonicalPath = dirPath
+	logger.InfoBenchTiming(ctx, "backend_read_dir_start",
+		zap.String("path", path),
+		zap.String("canonical_path", dirPath))
+	listStart := time.Now()
 	entries, err := b.store.ListDir(ctx, dirPath)
+	listDuration = time.Since(listStart)
 	if err != nil {
 		return nil, err
 	}
@@ -644,31 +665,83 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 }
 
 func (b *Dat9Backend) StatNodeCtx(ctx context.Context, path string) (*datastore.NodeWithFile, error) {
+	start := time.Now()
 	resolvedPath := normalizePath(path)
+	mode := "primary"
+	var fallbackPath string
+	logger.InfoBenchTiming(ctx, "backend_stat_node_start",
+		zap.String("path", path),
+		zap.String("resolved_path", resolvedPath))
+	var out *datastore.NodeWithFile
+	var err error
 	if pathutil.IsDir(path) {
-		return b.store.Stat(ctx, resolvedPath)
+		mode = "dir"
+		out, err = b.store.Stat(ctx, resolvedPath)
+	} else {
+		dirPath, dirErr := pathutil.CanonicalizeDir(path)
+		if dirErr != nil || dirPath == resolvedPath {
+			out, err = b.store.Stat(ctx, resolvedPath)
+		} else {
+			mode = "fallback"
+			fallbackPath = dirPath
+			out, err = b.store.StatPathFallback(ctx, resolvedPath, dirPath)
+		}
 	}
-
-	dirPath, dirErr := pathutil.CanonicalizeDir(path)
-	if dirErr != nil || dirPath == resolvedPath {
-		return b.store.Stat(ctx, resolvedPath)
-	}
-	return b.store.StatPathFallback(ctx, resolvedPath, dirPath)
+	logStatNodeTiming(ctx, "backend_stat_node_timing", path, resolvedPath, fallbackPath, mode, out, err, start)
+	return out, err
 }
 
 // StatNodeLiteCtx returns lightweight metadata (no blob/text/description)
 // suitable for HEAD/stat operations.
 func (b *Dat9Backend) StatNodeLiteCtx(ctx context.Context, path string) (*datastore.NodeWithFile, error) {
+	start := time.Now()
 	resolvedPath := normalizePath(path)
+	mode := "primary"
+	var fallbackPath string
+	logger.InfoBenchTiming(ctx, "backend_stat_lite_start",
+		zap.String("path", path),
+		zap.String("resolved_path", resolvedPath))
+	var out *datastore.NodeWithFile
+	var err error
 	if pathutil.IsDir(path) {
-		return b.store.StatLite(ctx, resolvedPath)
+		mode = "dir"
+		out, err = b.store.StatLite(ctx, resolvedPath)
+	} else {
+		dirPath, dirErr := pathutil.CanonicalizeDir(path)
+		if dirErr != nil || dirPath == resolvedPath {
+			out, err = b.store.StatLite(ctx, resolvedPath)
+		} else {
+			mode = "fallback"
+			fallbackPath = dirPath
+			out, err = b.store.StatPathFallbackLite(ctx, resolvedPath, dirPath)
+		}
 	}
+	logStatNodeTiming(ctx, "backend_stat_lite_timing", path, resolvedPath, fallbackPath, mode, out, err, start)
+	return out, err
+}
 
-	dirPath, dirErr := pathutil.CanonicalizeDir(path)
-	if dirErr != nil || dirPath == resolvedPath {
-		return b.store.StatLite(ctx, resolvedPath)
+func logStatNodeTiming(ctx context.Context, message, path, resolvedPath, fallbackPath, mode string, nf *datastore.NodeWithFile, err error, start time.Time) {
+	fields := []zap.Field{
+		zap.String("path", path),
+		zap.String("resolved_path", resolvedPath),
+		zap.String("mode", mode),
+		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0),
 	}
-	return b.store.StatPathFallbackLite(ctx, resolvedPath, dirPath)
+	if fallbackPath != "" {
+		fields = append(fields, zap.String("fallback_path", fallbackPath))
+	}
+	if nf != nil {
+		fields = append(fields, zap.Bool("is_dir", nf.Node.IsDirectory))
+	}
+	if nf != nil && nf.File != nil {
+		fields = append(fields,
+			zap.Int64("size", nf.File.SizeBytes),
+			zap.Int64("revision", nf.File.Revision))
+	}
+	if err != nil {
+		fields = append(fields, zap.Error(err))
+	}
+	logger.InfoBenchTiming(ctx, message, fields...)
 }
 
 // ReadPlan describes how to serve a GET request after a single metadata query.
@@ -685,25 +758,57 @@ type ReadPlan struct {
 // For db9 inline files: returns InlineData (no second stat needed).
 // For S3 files: uses the storage_ref from the same query to presign, returns PresignURL.
 // Only resolves file-form paths (no directory fallback) to maintain GET /dir → 404 behavior.
-func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (*ReadPlan, error) {
+func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (plan *ReadPlan, err error) {
+	start := time.Now()
+	var statDuration time.Duration
+	var presignDuration time.Duration
+	storageType := ""
+	var size int64
+	phase := "canonicalize"
+	defer func() {
+		observeBackend(ctx, "read_plan", err, start)
+		fields := []zap.Field{
+			zap.String("path", path),
+			zap.String("phase", phase),
+			zap.String("storage_type", storageType),
+			zap.Int64("size", size),
+			zap.Float64("stat_ms", float64(statDuration.Microseconds())/1000.0),
+			zap.Float64("presign_ms", float64(presignDuration.Microseconds())/1000.0),
+			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0),
+		}
+		if err != nil {
+			fields = append(fields, zap.Error(err))
+		}
+		logger.InfoBenchTiming(ctx, "backend_read_plan_timing", fields...)
+	}()
 	resolvedPath, err := pathutil.Canonicalize(path)
 	if err != nil {
 		return nil, err
 	}
+	phase = "stat_for_read"
+	logger.InfoBenchTiming(ctx, "backend_read_plan_start",
+		zap.String("path", path),
+		zap.String("resolved_path", resolvedPath))
 
+	statStart := time.Now()
 	nf, err := b.store.StatForRead(ctx, resolvedPath)
+	statDuration = time.Since(statStart)
 	if err != nil {
 		return nil, err
 	}
+	phase = "plan"
 	if nf.Node.IsDirectory {
 		return nil, datastore.ErrNotFound
 	}
 	if nf.File == nil {
 		return nil, datastore.ErrNotFound
 	}
+	storageType = string(nf.File.StorageType)
+	size = nf.File.SizeBytes
 
 	switch nf.File.StorageType {
 	case datastore.StorageDB9:
+		phase = "inline"
 		return &ReadPlan{
 			InlineData: nf.File.ContentBlob,
 			Size:       nf.File.SizeBytes,
@@ -712,11 +817,15 @@ func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (*ReadPlan, 
 		if b.s3 == nil {
 			return nil, ErrS3NotConfigured
 		}
+		phase = "presign_get_object"
+		presignStart := time.Now()
 		url, err := b.s3.PresignGetObject(ctx, nf.File.StorageRef, s3client.DownloadTTL)
+		presignDuration = time.Since(presignStart)
 		if err != nil {
 			logger.Error(ctx, "backend_read_plan_presign_failed", zap.String("path", resolvedPath), zap.Error(err))
 			return nil, err
 		}
+		phase = "redirect"
 		return &ReadPlan{
 			PresignURL: url,
 			Size:       nf.File.SizeBytes,
