@@ -242,10 +242,6 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 	})
 }
 
-func peekCapTokenTenantID(raw string) (string, error) {
-	return vault.PeekCapTokenTenantID(raw)
-}
-
 // peekTokenTenantID extracts tenant_id from either a legacy cap token (vault_
 // prefix) or a grant token (vt_ prefix). Used by capabilityAuthMiddleware for
 // pre-auth tenant routing.
