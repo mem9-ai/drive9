@@ -186,29 +186,28 @@ func TestShadowStorePinUnpinRemove(t *testing.T) {
 	_ = ss.WriteExtents("/pinned.txt", wb, 1)
 
 	// Pin the path.
-	ss.Pin("/pinned.txt")
+	gen := ss.Pin("/pinned.txt")
 
-	// Remove while pinned — should defer.
+	// Remove while pinned — shadow is retired (removed from active files
+	// but fd stays alive for the pinned reader).
 	ss.Remove("/pinned.txt")
 
-	// File should still be readable.
-	if !ss.Has("/pinned.txt") {
-		t.Fatal("expected shadow file to still exist while pinned")
-	}
-	buf := make([]byte, 11)
-	n, err := ss.ReadAt("/pinned.txt", 0, buf)
-	if err != nil {
-		t.Fatalf("read after pinned remove: %v", err)
-	}
-	if n != 11 || !bytes.Equal(buf[:n], []byte("pinned data")) {
-		t.Errorf("data = %q, want %q", buf[:n], "pinned data")
-	}
-
-	// Unpin — should trigger deferred removal.
-	ss.Unpin("/pinned.txt")
-
+	// Active Has returns false (retired shadows are not active).
 	if ss.Has("/pinned.txt") {
-		t.Error("expected shadow file to be removed after unpin")
+		t.Fatal("expected Has to return false after retire")
+	}
+
+	// Unpin — should trigger retired cleanup.
+	ss.Unpin(gen)
+
+	// New writers can create a fresh shadow at the same path.
+	wb2 := NewWriteBuffer("/pinned.txt", 0, 0)
+	_, _ = wb2.Write(0, []byte("new"))
+	if err := ss.WriteExtents("/pinned.txt", wb2, 2); err != nil {
+		t.Fatal(err)
+	}
+	if !ss.Has("/pinned.txt") {
+		t.Error("expected new shadow to exist")
 	}
 }
 
@@ -224,23 +223,24 @@ func TestShadowStorePinMultipleReaders(t *testing.T) {
 	_, _ = wb.Write(0, []byte("multi"))
 	_ = ss.WriteExtents("/multi.txt", wb, 1)
 
-	// Two pins.
-	ss.Pin("/multi.txt")
-	ss.Pin("/multi.txt")
+	// Two pins (same generation).
+	gen1 := ss.Pin("/multi.txt")
+	gen2 := ss.Pin("/multi.txt")
+	if gen1 != gen2 {
+		t.Fatalf("expected same generation, got %d vs %d", gen1, gen2)
+	}
 
 	ss.Remove("/multi.txt")
 
-	// First unpin — still pinned.
-	ss.Unpin("/multi.txt")
-	if !ss.Has("/multi.txt") {
-		t.Fatal("expected shadow file to still exist with refs=1")
+	// First unpin — still one ref on the retired entry.
+	ss.Unpin(gen1)
+	// Retired shadow exists but Has returns false (not active).
+	if ss.Has("/multi.txt") {
+		t.Fatal("expected Has to return false after retire")
 	}
 
-	// Second unpin — now removed.
-	ss.Unpin("/multi.txt")
-	if ss.Has("/multi.txt") {
-		t.Error("expected shadow file to be removed after all unpins")
-	}
+	// Second unpin — retired shadow cleaned up.
+	ss.Unpin(gen2)
 }
 
 func TestShadowStoreRemoveWithoutPin(t *testing.T) {
@@ -274,23 +274,20 @@ func TestShadowStoreRenamePinState(t *testing.T) {
 	_, _ = wb.Write(0, []byte("rename"))
 	_ = ss.WriteExtents("/before.txt", wb, 1)
 
-	ss.Pin("/before.txt")
+	gen := ss.Pin("/before.txt")
 	ok := ss.Rename("/before.txt", "/after.txt")
 	if !ok {
 		t.Fatal("rename failed")
 	}
 
-	// Remove while pinned under new name.
+	// Remove while pinned under new name — retires the shadow.
 	ss.Remove("/after.txt")
-	if !ss.Has("/after.txt") {
-		t.Fatal("expected shadow file to exist under new name while pinned")
+	if ss.Has("/after.txt") {
+		t.Fatal("expected Has to return false after retire")
 	}
 
-	// Unpin under new name triggers removal.
-	ss.Unpin("/after.txt")
-	if ss.Has("/after.txt") {
-		t.Error("expected removal after unpin of renamed path")
-	}
+	// Unpin triggers retired cleanup.
+	ss.Unpin(gen)
 }
 
 func TestShadowStoreRenameFailureRollbackPinState(t *testing.T) {
@@ -305,7 +302,7 @@ func TestShadowStoreRenameFailureRollbackPinState(t *testing.T) {
 	_, _ = wb.Write(0, []byte("data"))
 	_ = ss.WriteExtents("/rollback.txt", wb, 1)
 
-	ss.Pin("/rollback.txt")
+	gen := ss.Pin("/rollback.txt")
 
 	// Delete the on-disk shadow file to force os.Rename failure.
 	sp := ss.shadowPath("/rollback.txt")
@@ -316,18 +313,10 @@ func TestShadowStoreRenameFailureRollbackPinState(t *testing.T) {
 		t.Fatal("expected rename to fail when disk file is missing")
 	}
 
-	// Pin state should be rolled back to old path.
-	// Unpin on old path should work, not panic or leak.
+	// Generation should still be valid on old path.
+	// Remove retires, then Unpin cleans up.
 	ss.Remove("/rollback.txt")
-	if !ss.Has("/rollback.txt") {
-		t.Fatal("expected shadow file to exist while pinned after rollback")
-	}
-
-	ss.Unpin("/rollback.txt")
-	// After unpin + pending remove, file entry should be gone.
-	if ss.Has("/rollback.txt") {
-		t.Error("expected removal after unpin of rolled-back path")
-	}
+	ss.Unpin(gen)
 }
 
 func TestShadowStorePinIfExists(t *testing.T) {
@@ -339,7 +328,7 @@ func TestShadowStorePinIfExists(t *testing.T) {
 	defer ss.Close()
 
 	// PinIfExists on a non-existent path should return false.
-	if ss.PinIfExists("/missing.txt") {
+	if _, ok := ss.PinIfExists("/missing.txt"); ok {
 		t.Fatal("expected PinIfExists to return false for missing path")
 	}
 
@@ -349,21 +338,19 @@ func TestShadowStorePinIfExists(t *testing.T) {
 	_ = ss.WriteExtents("/exists.txt", wb, 1)
 
 	// PinIfExists on an existing path should return true.
-	if !ss.PinIfExists("/exists.txt") {
+	gen, ok := ss.PinIfExists("/exists.txt")
+	if !ok {
 		t.Fatal("expected PinIfExists to return true for existing path")
 	}
 
-	// Remove while pinned — should defer.
+	// Remove while pinned — retires shadow.
 	ss.Remove("/exists.txt")
-	if !ss.Has("/exists.txt") {
-		t.Fatal("expected shadow file to still exist while pinned via PinIfExists")
+	if ss.Has("/exists.txt") {
+		t.Fatal("expected Has to return false after retire")
 	}
 
-	// Unpin triggers removal.
-	ss.Unpin("/exists.txt")
-	if ss.Has("/exists.txt") {
-		t.Error("expected shadow file to be removed after unpin")
-	}
+	// Unpin triggers retired cleanup.
+	ss.Unpin(gen)
 }
 
 func TestShadowStoreRemovePreventsPin(t *testing.T) {
@@ -382,8 +369,65 @@ func TestShadowStoreRemovePreventsPin(t *testing.T) {
 	ss.Remove("/race.txt")
 
 	// PinIfExists after removal must return false.
-	if ss.PinIfExists("/race.txt") {
+	if _, ok := ss.PinIfExists("/race.txt"); ok {
 		t.Fatal("expected PinIfExists to return false after Remove")
+	}
+}
+
+// TestShadowStoreRetireAllowsNewWriter verifies that after Remove retires a
+// pinned shadow, a new writer can create a fresh shadow at the same path
+// without interfering with the retired reader, and the retired reader's Unpin
+// does not affect the new shadow.
+func TestShadowStoreRetireAllowsNewWriter(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Old writer creates shadow.
+	wb1 := NewWriteBuffer("/file.txt", 0, 0)
+	_, _ = wb1.Write(0, []byte("old data"))
+	_ = ss.WriteExtents("/file.txt", wb1, 1)
+
+	// Reader pins it.
+	gen := ss.Pin("/file.txt")
+
+	// Commit queue succeeds, retires the shadow.
+	ss.Remove("/file.txt")
+
+	// New writer creates fresh shadow at same path.
+	wb2 := NewWriteBuffer("/file.txt", 0, 0)
+	_, _ = wb2.Write(0, []byte("new data!!!"))
+	if err := ss.WriteExtents("/file.txt", wb2, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	// New shadow is readable.
+	buf := make([]byte, 11)
+	n, err := ss.ReadAt("/file.txt", 0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf[:n], []byte("new data!!!")) {
+		t.Errorf("new shadow data = %q, want %q", buf[:n], "new data!!!")
+	}
+
+	// Old reader unpins — should NOT delete the new shadow.
+	ss.Unpin(gen)
+
+	// New shadow must still exist.
+	if !ss.Has("/file.txt") {
+		t.Fatal("expected new shadow to survive old reader's Unpin")
+	}
+	buf2 := make([]byte, 11)
+	n2, err := ss.ReadAt("/file.txt", 0, buf2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf2[:n2], []byte("new data!!!")) {
+		t.Errorf("new shadow data after unpin = %q, want %q", buf2[:n2], "new data!!!")
 	}
 }
 

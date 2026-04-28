@@ -35,18 +35,33 @@ type DirtyExtent struct {
 	Length int64
 }
 
+// retiredShadow holds a shadow file that has been logically removed from the
+// active path map but still has pinned readers. When the last reader Unpins,
+// the fd is closed and disk file deleted.
+type retiredShadow struct {
+	fd       *os.File
+	diskPath string
+	size     int64
+	refs     int32
+}
+
 // ShadowStore manages per-path shadow files for local staging of writes.
 // Shadow files live at <dir>/<hash>.shadow and support pread/pwrite for
 // efficient partial I/O without full-file materialization.
 type ShadowStore struct {
 	dir   string
 	mu    sync.RWMutex
-	files map[string]*ShadowFile // remote path → shadow file
+	files map[string]*ShadowFile // remote path → active shadow file
 
-	// Path-level refcount for safe concurrent reads.
-	// Pin increments, Unpin decrements. Remove defers deletion when refs > 0.
-	refs          map[string]int32
-	pendingRemove map[string]bool
+	// Generation-based pin for safe concurrent reads during commit cleanup.
+	// Pin/PinIfExists return a generation token. Remove on a pinned path
+	// retires the shadow (removes from files, moves fd to retired map) so
+	// new writers get a fresh shadow. Old readers use their gen token to
+	// read/unpin the retired fd.
+	nextGen uint64                    // monotonic, 0 is reserved (no pin)
+	active  map[string]uint64         // path → generation of current active shadow
+	refs    map[uint64]int32          // generation → active pin count
+	retired map[uint64]*retiredShadow // generation → retired shadow awaiting unpin
 
 	// Throttled disk space check state (atomic for lock-free fast path).
 	lastDiskCheck atomic.Int64 // unix nano of last check
@@ -59,10 +74,11 @@ func NewShadowStore(dir string) (*ShadowStore, error) {
 		return nil, fmt.Errorf("shadow store dir: %w", err)
 	}
 	ss := &ShadowStore{
-		dir:           dir,
-		files:         make(map[string]*ShadowFile),
-		refs:          make(map[string]int32),
-		pendingRemove: make(map[string]bool),
+		dir:     dir,
+		files:   make(map[string]*ShadowFile),
+		active:  make(map[string]uint64),
+		refs:    make(map[uint64]int32),
+		retired: make(map[uint64]*retiredShadow),
 	}
 	ss.diskOK.Store(true)
 	return ss, nil
@@ -288,6 +304,30 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *WriteBuffer, baseRev i
 	return nil
 }
 
+// ReadAtGen reads from a retired shadow file identified by its generation
+// token. This is used by readers that pinned a shadow before it was retired
+// by Remove. Returns (0, error) if the generation is unknown.
+func (s *ShadowStore) ReadAtGen(gen uint64, offset int64, buf []byte) (int, error) {
+	s.mu.RLock()
+	rt, ok := s.retired[gen]
+	s.mu.RUnlock()
+	if !ok {
+		return 0, fmt.Errorf("shadow gen %d not found in retired map", gen)
+	}
+	return rt.fd.ReadAt(buf, offset)
+}
+
+// SizeGen returns the size of a retired shadow file, or -1 if unknown.
+func (s *ShadowStore) SizeGen(gen uint64) int64 {
+	s.mu.RLock()
+	rt, ok := s.retired[gen]
+	s.mu.RUnlock()
+	if !ok {
+		return -1
+	}
+	return rt.size
+}
+
 // ReadAt reads from a shadow file at the given offset. Uses pread for
 // efficient partial reads without seeking.
 func (s *ShadowStore) ReadAt(remotePath string, offset int64, buf []byte) (int, error) {
@@ -380,73 +420,99 @@ func (s *ShadowStore) BaseRev(remotePath string) int64 {
 	return 0
 }
 
-// Pin increments the reference count for a shadow path. While pinned,
-// Remove will defer deletion until the last Unpin call.
-func (s *ShadowStore) Pin(remotePath string) {
+// Pin increments the reference count for the active shadow at remotePath and
+// returns a generation token. The caller must pass this token to Unpin on
+// Release. Use after creating a new shadow (e.g. ShadowSpill O_TRUNC).
+func (s *ShadowStore) Pin(remotePath string) uint64 {
 	s.mu.Lock()
-	s.refs[remotePath]++
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	gen := s.active[remotePath]
+	if gen == 0 {
+		s.nextGen++
+		gen = s.nextGen
+		s.active[remotePath] = gen
+	}
+	s.refs[gen]++
+	return gen
 }
 
-// PinIfExists atomically checks whether a shadow file exists for the given
-// path and, if so, increments its reference count. Returns true if the pin
-// was acquired. This avoids the TOCTOU race between Has() and Pin() where
-// a concurrent Remove() could delete the shadow between the two calls.
-func (s *ShadowStore) PinIfExists(remotePath string) bool {
+// PinIfExists atomically checks whether an active shadow file exists for
+// the given path and, if so, increments its reference count. Returns a
+// generation token and true, or (0, false) if no active shadow exists.
+func (s *ShadowStore) PinIfExists(remotePath string) (uint64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.files[remotePath]; !ok {
-		return false
+		return 0, false
 	}
-	s.refs[remotePath]++
-	return true
+	gen := s.active[remotePath]
+	if gen == 0 {
+		s.nextGen++
+		gen = s.nextGen
+		s.active[remotePath] = gen
+	}
+	s.refs[gen]++
+	return gen, true
 }
 
-// Unpin decrements the reference count for a shadow path. If the count
-// reaches zero and a removal is pending, the shadow file is deleted.
-func (s *ShadowStore) Unpin(remotePath string) {
-	s.mu.Lock()
-	r := s.refs[remotePath] - 1
-	if r <= 0 {
-		delete(s.refs, remotePath)
-		r = 0
-	} else {
-		s.refs[remotePath] = r
+// Unpin decrements the reference count for the given generation. If the
+// generation was retired (Remove called while pinned) and the count reaches
+// zero, the retired fd is closed and the disk file deleted. Generation 0
+// is a no-op (handle was never pinned).
+func (s *ShadowStore) Unpin(gen uint64) {
+	if gen == 0 {
+		return
 	}
-	shouldRemove := r == 0 && s.pendingRemove[remotePath]
-	var sf *ShadowFile
-	var haveSF bool
-	if shouldRemove {
-		delete(s.pendingRemove, remotePath)
-		// Atomically remove from files map while holding the lock,
-		// so a concurrent PinIfExists cannot acquire a pin on a file
-		// we are about to delete.
-		sf, haveSF = s.files[remotePath]
-		if haveSF {
-			_ = sf.fd.Close()
-			delete(s.files, remotePath)
-		}
+	s.mu.Lock()
+	s.refs[gen]--
+	r := s.refs[gen]
+	if r <= 0 {
+		delete(s.refs, gen)
+		r = 0
+	}
+	rt, isRetired := s.retired[gen]
+	if isRetired && r == 0 {
+		delete(s.retired, gen)
 	}
 	s.mu.Unlock()
 
-	if shouldRemove && haveSF {
-		sp := s.shadowPath(remotePath)
-		_ = os.Remove(sp)
+	if isRetired && r == 0 && rt != nil {
+		_ = rt.fd.Close()
+		_ = os.Remove(rt.diskPath)
 	}
 }
 
-// Remove removes a shadow file from memory and disk. If the path is
-// currently pinned, the removal is deferred until the last Unpin.
+// Remove removes a shadow file from memory and disk. If the path has active
+// pins, the shadow is "retired" — removed from the active files map so new
+// writers get a fresh shadow, but kept alive for existing readers until the
+// last Unpin.
 func (s *ShadowStore) Remove(remotePath string) {
 	s.mu.Lock()
-	if s.refs[remotePath] > 0 {
-		s.pendingRemove[remotePath] = true
+	gen := s.active[remotePath]
+	if gen != 0 && s.refs[gen] > 0 {
+		// Retire: remove from active maps, keep fd alive for pinned readers.
+		sf := s.files[remotePath]
+		delete(s.files, remotePath)
+		delete(s.active, remotePath)
+		diskPath := s.shadowPath(remotePath)
+		// Rename disk file so Has() / ensureShadowFile don't see stale data.
+		retiredPath := fmt.Sprintf("%s.retired.%d", diskPath, gen)
+		_ = os.Rename(diskPath, retiredPath)
+		if sf != nil {
+			s.retired[gen] = &retiredShadow{
+				fd:       sf.fd,
+				diskPath: retiredPath,
+				size:     sf.size,
+			}
+		}
 		s.mu.Unlock()
 		return
 	}
-	// Atomically remove from files map while still holding the lock,
-	// so a concurrent PinIfExists cannot acquire a pin on a file
-	// we are about to delete.
+	// No active pins — remove immediately.
+	if gen != 0 {
+		delete(s.active, remotePath)
+		delete(s.refs, gen)
+	}
 	sf, ok := s.files[remotePath]
 	if ok {
 		_ = sf.fd.Close()
@@ -460,7 +526,6 @@ func (s *ShadowStore) Remove(remotePath string) {
 	}
 }
 
-
 // Rename moves a shadow file from oldPath to newPath.
 func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 	s.mu.Lock()
@@ -471,14 +536,11 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 	}
 	delete(s.files, oldPath)
 	s.files[newPath] = sf
-	// Transfer refcount and pending-remove state to new path.
-	if r, ok := s.refs[oldPath]; ok {
-		s.refs[newPath] = r
-		delete(s.refs, oldPath)
-	}
-	if s.pendingRemove[oldPath] {
-		s.pendingRemove[newPath] = true
-		delete(s.pendingRemove, oldPath)
+	// Transfer generation mapping to new path.
+	oldGen := s.active[oldPath]
+	if oldGen != 0 {
+		s.active[newPath] = oldGen
+		delete(s.active, oldPath)
 	}
 	s.mu.Unlock()
 
@@ -490,14 +552,9 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 		s.mu.Lock()
 		delete(s.files, newPath)
 		s.files[oldPath] = sf
-		// Rollback refs and pendingRemove state.
-		if r, ok := s.refs[newPath]; ok {
-			s.refs[oldPath] = r
-			delete(s.refs, newPath)
-		}
-		if s.pendingRemove[newPath] {
-			s.pendingRemove[oldPath] = true
-			delete(s.pendingRemove, newPath)
+		if oldGen != 0 {
+			s.active[oldPath] = oldGen
+			delete(s.active, newPath)
 		}
 		s.mu.Unlock()
 		return false
@@ -527,9 +584,13 @@ func (s *ShadowStore) Close() {
 	for _, sf := range s.files {
 		_ = sf.fd.Close()
 	}
+	for _, rt := range s.retired {
+		_ = rt.fd.Close()
+	}
 	s.files = make(map[string]*ShadowFile)
-	s.refs = make(map[string]int32)
-	s.pendingRemove = make(map[string]bool)
+	s.active = make(map[string]uint64)
+	s.refs = make(map[uint64]int32)
+	s.retired = make(map[uint64]*retiredShadow)
 }
 
 // RecoverFromDisk scans the shadow directory and loads shadow files into memory.

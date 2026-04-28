@@ -163,7 +163,7 @@ func TestCommitQueueDirectPutRouting(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		data := make([]byte, 128*1024) // 128KiB — under 256KiB threshold
+		data := make([]byte, 30000) // 30KB — under 50KB server threshold
 		if err := shadow.WriteFull("/small.bin", data, 5); err != nil {
 			t.Fatal(err)
 		}
@@ -183,7 +183,7 @@ func TestCommitQueueDirectPutRouting(t *testing.T) {
 		cq.DrainAll()
 
 		if !usedDirectPut {
-			t.Fatal("128KiB file should use direct PUT, not multipart")
+			t.Fatal("30KB file should use direct PUT, not multipart")
 		}
 		if shadow.Has("/small.bin") {
 			t.Fatal("shadow should be removed after commit")

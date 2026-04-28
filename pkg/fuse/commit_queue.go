@@ -16,11 +16,10 @@ import (
 
 // commitQueueDirectPutThreshold is the size limit below which commit queue
 // workers use direct PUT (WriteCtxConditionalWithRevision) instead of
-// multipart upload. This is a transport-path threshold only — it does NOT
-// affect backend storage location (DB inline vs S3), which is controlled by
-// smallFileThreshold (50KB). Files between 50KB and 256KiB are stored in S3
-// via s3.PutObject but skip the multipart initiate/presign/complete overhead.
-const commitQueueDirectPutThreshold = 256 * 1024 // 256 KiB
+// multipart upload. Must match the server's smallFileThreshold — the server
+// rejects simple PUTs for files >= 50KB on S3-configured backends by requiring
+// X-Dat9-Part-Checksums (multipart protocol).
+const commitQueueDirectPutThreshold = client.DefaultSmallFileThreshold
 
 // CommitEntry represents a pending remote commit.
 type CommitEntry struct {

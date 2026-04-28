@@ -1777,7 +1777,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 					fh.ShadowSpill = true
 					// Pin shadow so commit queue cleanup doesn't delete it while
 					// this handle is reading.
-					fs.shadowStore.Pin(p)
+					fh.ShadowGen = fs.shadowStore.Pin(p)
 					fh.ShadowPinned = true
 				}
 			}
@@ -1812,8 +1812,11 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		// Atomically pin shadow for read-only opens so commit queue cleanup
 		// doesn't delete the shadow file while this handle is reading from it.
 		// PinIfExists avoids a TOCTOU race between Has() and Pin().
-		if !fh.ShadowPinned && fs.shadowStore != nil && fs.shadowStore.PinIfExists(p) {
-			fh.ShadowPinned = true
+		if !fh.ShadowPinned && fs.shadowStore != nil {
+			if gen, ok := fs.shadowStore.PinIfExists(p); ok {
+				fh.ShadowGen = gen
+				fh.ShadowPinned = true
+			}
 		}
 	}
 
@@ -2008,12 +2011,26 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	// Read path priority for pending files:
-	// 1. ShadowStore.ReadAt (local SSD) — for files staged by Flush
+	// 1. ShadowStore (local SSD) — for files staged by Flush
 	// 2. WriteBackCache.Get (local disk, full file) — legacy path
-	if fh.Dirty == nil && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path) {
-		offset := int64(input.Offset)
-		sz := fs.shadowStore.Size(fh.Path)
+	//
+	// If the handle holds a generation token (ShadowGen != 0), try the
+	// generation-based read first — this works even after the shadow has
+	// been retired by commit queue cleanup. Otherwise use path-based ReadAt.
+	if fh.Dirty == nil && fs.shadowStore != nil {
+		var sz int64 = -1
+		var useGen bool
+		if fh.ShadowGen != 0 {
+			sz = fs.shadowStore.SizeGen(fh.ShadowGen)
+			useGen = sz >= 0
+		}
+		if !useGen {
+			if fs.shadowStore.Has(fh.Path) {
+				sz = fs.shadowStore.Size(fh.Path)
+			}
+		}
 		if sz >= 0 {
+			offset := int64(input.Offset)
 			if offset >= sz {
 				source = "shadow-store-eof"
 				bytesRead = 0
@@ -2024,14 +2041,20 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 				end = sz
 			}
 			buf := make([]byte, end-offset)
-			n, err := fs.shadowStore.ReadAt(fh.Path, offset, buf)
+			var n int
+			var err error
+			if useGen {
+				n, err = fs.shadowStore.ReadAtGen(fh.ShadowGen, offset, buf)
+			} else {
+				n, err = fs.shadowStore.ReadAt(fh.Path, offset, buf)
+			}
 			if err == nil && n > 0 {
 				source = "shadow-store"
 				bytesRead = n
 				return gofuse.ReadResultData(buf[:n]), gofuse.OK
 			}
 			if err != nil {
-				fs.debugf("read shadow-store miss path=%s off=%d req=%d err=%v", fh.Path, input.Offset, input.Size, err)
+				fs.debugf("read shadow-store miss path=%s off=%d req=%d gen=%d err=%v", fh.Path, input.Offset, input.Size, fh.ShadowGen, err)
 			}
 		}
 	}
@@ -2584,7 +2607,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	if ok {
 		// Unpin shadow if this handle pinned it, so deferred removals can proceed.
 		if fh.ShadowPinned && fs.shadowStore != nil {
-			defer fs.shadowStore.Unpin(fh.Path)
+			defer fs.shadowStore.Unpin(fh.ShadowGen)
 		}
 
 		start := time.Now()
