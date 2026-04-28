@@ -711,14 +711,15 @@ func (s *Server) handleVaultRead(w http.ResponseWriter, r *http.Request, sub str
 
 	vs := vault.NewStore(scope.Backend.Store().DB(), s.vaultMK)
 
-	// Full 4-step verification: HMAC signature → TTL → DB revocation → claims.
+	// Full verification: HMAC signature → TTL → DB revocation → claims.
 	// IMPORTANT: Do NOT write audit events before verification succeeds.
 	// The tenant_id comes from an unverified peek and could be forged;
 	// writing to tenant audit before proving token authenticity would let
 	// an attacker inject events into any tenant's audit log.
-	claims, err := vs.VerifyAndResolveCapToken(r.Context(), tenantID, raw)
+	//
+	// Try vt_ grant token first; fall back to legacy cap token.
+	claims, err := s.verifyVaultReadToken(r, vs, tenantID, raw)
 	if err != nil {
-		// Log to server-level observability only — not tenant audit.
 		if strings.Contains(err.Error(), "expired") {
 			errJSON(w, http.StatusUnauthorized, "token expired")
 		} else if strings.Contains(err.Error(), "revoked") {
@@ -749,6 +750,29 @@ func (s *Server) handleVaultRead(w http.ResponseWriter, r *http.Request, sub str
 	} else {
 		s.handleVaultReadSecret(w, r, vs, claims, secretName)
 	}
+}
+
+// verifyVaultReadToken tries vt_ grant token verification first, then falls
+// back to legacy cap token verification. Grant claims are mapped to
+// CapTokenClaims so the downstream read handlers work unchanged.
+func (s *Server) verifyVaultReadToken(r *http.Request, vs *vault.Store, tenantID, raw string) (*vault.CapTokenClaims, error) {
+	if strings.HasPrefix(raw, "vt_") {
+		grantClaims, err := vs.VerifyAndResolveGrant(r.Context(), tenantID, s.vaultIssuerURL, raw)
+		if err != nil {
+			return nil, err
+		}
+		if grantClaims.Perm != vault.GrantPermRead {
+			return nil, fmt.Errorf("grant perm is not read")
+		}
+		// Map grant claims to CapTokenClaims for downstream handler compatibility.
+		return &vault.CapTokenClaims{
+			TokenID:  grantClaims.GrantID,
+			TenantID: grantClaims.TenantID,
+			AgentID:  grantClaims.Agent,
+			Scope:    grantClaims.Scope,
+		}, nil
+	}
+	return vs.VerifyAndResolveCapToken(r.Context(), tenantID, raw)
 }
 
 func (s *Server) handleVaultReadEnumerate(w http.ResponseWriter, r *http.Request, vs *vault.Store, claims *vault.CapTokenClaims) {

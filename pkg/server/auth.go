@@ -242,6 +242,10 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 }
 
 func peekCapTokenTenantID(raw string) (string, error) {
+	// Try vt_ grant token first, then fall back to legacy cap token.
+	if tid, err := vault.PeekGrantTenantID(raw); err == nil {
+		return tid, nil
+	}
 	return vault.PeekCapTokenTenantID(raw)
 }
 

@@ -130,18 +130,20 @@ type VaultGrant struct {
 // VaultGrantClaims is the JWT payload signed into the grant token.
 //
 // Claim set is locked by spec §16:
-//   - iss, grant_id, principal_type, agent, scope, perm, exp are required
+//   - iss, grant_id, tenant_id, principal_type, agent, scope, perm, exp are required
 //   - label_hint is optional and UX-only (Invariant #7 — never authz)
 //
-// tenant_id is deliberately NOT in the payload: tenant is resolved by the
-// server from its own registry keyed on iss + the tenant-scoped CSK used for
-// HMAC verification. Putting tenant_id in the body would be forgeable prior to
-// HMAC check.
+// tenant_id is a routing claim only — it allows the server to resolve the
+// correct tenant backend before HMAC verification. It is NOT an authority
+// claim: authorization is enforced by HMAC verification with the tenant-scoped
+// CSK + DB grant row check. Tampering with tenant_id routes to the wrong
+// tenant, where HMAC verification fails.
 //
 // task_id is deliberately absent (legacy Phase-0 concept; removed per §20).
 type VaultGrantClaims struct {
 	Issuer        string        `json:"iss"`
 	GrantID       string        `json:"grant_id"`
+	TenantID      string        `json:"tenant_id"`
 	PrincipalType PrincipalType `json:"principal_type"`
 	Agent         string        `json:"agent"`
 	Scope         []string      `json:"scope"`
