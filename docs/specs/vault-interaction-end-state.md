@@ -435,7 +435,7 @@ Contract rules:
 
 - Input **MUST** be a delegated JWT. If the payload indicates `principal_type=owner` (or any non-delegated credential), `ctx import` **MUST** refuse and instruct the user to use `ctx add --api-key`. `ctx import` is not a universal credential importer.
 - If the JWT's `exp` is already in the past at import time, `ctx import` **MUST** refuse (local short-circuit #1 — see §17). The `exp` check uses the local wall clock with no skew tolerance in v0; delegatees with badly skewed clocks will see spurious refusals or admissions and are expected to fix their clocks (NTP).
-- The JWT **MUST** contain all required delegated-context claims: `iss`, `exp`, `principal_type=delegated`, `agent`, `grant_id`, `scope[]` (non-empty array), and `perm` ∈ `{read, write}`. Missing or malformed required claims refuse at import; the full per-claim error mapping is in §11.
+- The JWT **MUST** contain all required delegated-context claims: `iss`, `exp`, `tenant_id`, `principal_type=delegated`, `agent`, `grant_id`, `scope[]` (non-empty array), and `perm` ∈ `{read, write}`. Missing or malformed required claims refuse at import; the full per-claim error mapping is in §11.
 - When `--from-file <path>` is given, the file **MUST** be mode `0600` (no group or world permission bits). If `stat.Mode().Perm() & 0o077 != 0`, `ctx import` refuses **before reading the contents** with `EACCES` and points the user at `chmod 600`. Rationale: a bearer-token file that has leaked to other local users is already-exposed credential; silently consuming it makes the CLI complicit in the lifecycle breach. This matches the argv-removal posture: the tool does not ingest credentials that have already escaped their intended confidentiality boundary.
 - Default context name is the JWT's `label_hint`; on collision or absence, fall back to `<agent>-<scope-root>` with a numeric suffix as needed. `--name` overrides.
 
@@ -554,6 +554,7 @@ The JWT payload is self-describing and **MUST** contain the following claims:
 |---|---|
 | `iss` | Issuer server URL; used by `ctx import` to populate the context's `server` field with no network call. |
 | `grant_id` | Server-assigned grant identifier (e.g. `grt_7f2a`); appears in audit and is the argument to `vault revoke`. |
+| `tenant_id` | **Routing-only claim.** Used by the server to resolve the correct tenant backend before HMAC verification. NOT an authorization claim — tampering routes to the wrong tenant where HMAC verification fails. |
 | `principal_type` | `delegated` (see §13.3 for the refusal rule on other kinds). |
 | `agent` | Agent ID as named by the owner at `vault grant --agent`; appears in audit and is the default prefix for context `name`. |
 | `scope[]` | List of granted paths (whole-secret or single-key; §6). |

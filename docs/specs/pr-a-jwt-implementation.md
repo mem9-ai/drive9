@@ -36,12 +36,13 @@ Submitting a PR that grows beyond the table above = automatic block. Keep sub-PR
 
 ## 2. JWT payload — the **exact** claim set (§16)
 
-The payload MUST contain **all** of these claims and **only** these claims (no `task_id`, no `tenant_id`, no `iat` in the token body — `VerifyGrant` uses `DisallowUnknownFields` and `VaultGrantClaims` has exactly the 8 fields below):
+The payload MUST contain **all** of these claims and **only** these claims (no `task_id`, no `iat` in the token body — `VerifyGrant` uses `DisallowUnknownFields` and `VaultGrantClaims` has exactly the 9 fields below):
 
 | JSON key | Go field | Type | Required | Notes |
 |---|---|---|---|---|
 | `iss` | `Issuer` | `string` | ✅ | The server URL the grant was minted at. Delegatees trust this via TOFU on `ctx import` (§13.3). Treat as opaque; do not parse. |
 | `grant_id` | `GrantID` | `string` | ✅ | Server-unique grant id. Prefix `grt_` per quickstart example. |
+| `tenant_id` | `TenantID` | `string` | ✅ | **Routing-only claim.** Used by the server to resolve the correct tenant backend before HMAC verification. NOT an authorization claim — tampering routes to the wrong tenant where HMAC verification with the tenant-scoped CSK fails. Added in PR #354 to fix multi-tenant read routing. |
 | `principal_type` | `PrincipalType` | `string` enum | ✅ | Exactly one of: `"owner"` or `"delegated"`. No other values. |
 | `agent` | `Agent` | `string` | ✅ | Opaque label the owner supplies at issue time (`--agent alice`). Not validated against any identity system in v0. |
 | `scope` | `Scope` | `[]string` | ✅ | Non-empty. Path-style entries like `prod-db` (whole secret) or `prod-db/DB_URL` (single key). Validated by `vault.ValidateScope`. |
@@ -51,7 +52,7 @@ The payload MUST contain **all** of these claims and **only** these claims (no `
 
 **Removed vs current `CapTokenClaims`**:
 - `token_id` → renamed to `grant_id`
-- `tenant_id` → **removed from the token body**. Server derives tenant from the `iss` + its own registry, or from the auth middleware scope (for owner endpoints); tenant MUST NOT be trusted from the token body. (This closes a forgery class where an attacker sets `tenant_id` in an unsigned portion of the token.)
+- `tenant_id` → **re-added as a routing-only claim** (PR #354). Used by the server to resolve the correct tenant backend before HMAC verification. NOT an authorization claim — tampering routes to the wrong tenant where HMAC verification with the tenant-scoped CSK fails. The original concern (forgery of unsigned `tenant_id`) is moot because `tenant_id` is inside the HMAC-signed payload; the server cross-checks `claims.TenantID == routingTenantID` after verification as defense-in-depth.
 - `task_id` → removed entirely (§20 no-backward-compat; was a Phase-0 concept).
 - `agent_id` → renamed to `agent`.
 - `iat` → **removed entirely**. Not in `VaultGrantClaims`, not signed, and rejected at verify time by `DisallowUnknownFields`. Freshness is via `exp` only. (Earlier drafts left `iat` optional; the shipped code forbids it — this line is the source of truth.)
@@ -175,7 +176,7 @@ New tests live in `pkg/vault/grant_test.go` + `pkg/vault/grant_sign_test.go` (ne
 4. **Revoked**: issue → revoke → verify → EACCES "revoked". Double-revoke returns `ErrNotFound`.
 5. **Cross-tenant replay**: issue under tenant A, verify under tenant B → CSK mismatch → EACCES "invalid".
 6. **Missing required claim**: table-driven over all §16 required claims — hand-craft HMAC-valid token with one claim deleted → `VerifyGrant` rejects. (Lives in `grant_sign_test.go`.)
-7. **Unknown claim**: hand-craft HMAC-valid token with a smuggled field (e.g. `tenant_id`) → `VerifyGrant` rejects via `DisallowUnknownFields`.
+7. **Unknown claim**: hand-craft HMAC-valid token with a smuggled field (e.g. `bogus`) → `VerifyGrant` rejects via `DisallowUnknownFields`.
 8. **Bad `perm` value** at issue time (e.g. `"admin"`) → `IssueGrant` rejects. At sign time, `SignGrant` also rejects.
 9. **Bad `principal_type`** at issue time (e.g. `"root"`) → `IssueGrant` rejects. `SignGrant` also rejects.
 10. **Empty scope / empty agent / empty issuer / ttl≤0** at issue time → `IssueGrant` rejects. At HTTP boundary, ttl≤0 → HTTP 400 `"ttl_seconds is required and must be > 0"`.
