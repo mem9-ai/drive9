@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -138,6 +139,15 @@ const (
 	// lookupRetrySuccessLogEvery controls how often successful retry recovery is
 	// logged, to avoid noisy logs on hot lookup paths.
 	lookupRetrySuccessLogEvery uint64 = 200
+
+	// readTransientRetryCount is the number of detached retries after the
+	// initial remote Read attempt fails with a transient error (context
+	// canceled, deadline exceeded, network timeout, HTTP 5xx).
+	readTransientRetryCount = 2
+
+	// readTransientRetryTimeout keeps each detached read retry bounded.
+	// Each retry reads at most max_read (1 MiB), so 2s is generous.
+	readTransientRetryTimeout = 2 * time.Second
 )
 
 // releaseTimeout computes a generous timeout for synchronous uploads in
@@ -665,6 +675,95 @@ func isTransientLookupErr(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// errReadRetriesExhausted is a sentinel indicating all detached read retries
+// failed with transient errors. Callers should map this to EIO.
+var errReadRetriesExhausted = errors.New("read retries exhausted")
+
+// isTransientReadErr classifies errors for Read-path detached retry.
+// Same classification as isTransientLookupErr — kept as a separate function
+// so Read and Lookup retry policies can diverge independently if needed.
+func isTransientReadErr(err error) bool {
+	return isTransientLookupErr(err)
+}
+
+// readSmallFileWithRetry reads a small file via ReadCtx with bounded detached
+// retry on transient failures. The first attempt uses the caller-provided ctx
+// (which honors FUSE interrupt). On transient failure, up to
+// readTransientRetryCount detached retries are attempted with short timeouts.
+// Returns EIO (never EAGAIN) when all retries are exhausted.
+func (fs *Dat9FS) readSmallFileWithRetry(ctx context.Context, path string) ([]byte, error) {
+	data, err := fs.client.ReadCtx(ctx, path)
+	if err == nil || !isTransientReadErr(err) {
+		return data, err
+	}
+
+	lastErr := err
+	for range readTransientRetryCount {
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), readTransientRetryTimeout)
+		data, err = fs.client.ReadCtx(retryCtx, path)
+		retryCancel()
+		if err == nil {
+			return data, nil
+		}
+		if !isTransientReadErr(err) {
+			return nil, err
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("%w: %s: %v", errReadRetriesExhausted, path, lastErr)
+}
+
+// readStreamRangeWithRetry performs a range read with bounded detached retry
+// on transient failures. Wraps both the ReadStreamRange open and io.ReadFull
+// body read as a single retriable unit. On body-stage transient failure, the
+// stream is reopened from scratch on retry.
+// Returns (data, nil) on success. On exhausted retries, the returned error
+// is a wrapped sentinel so the caller can map it to EIO.
+func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, offset, size int64) ([]byte, int, error) {
+	data, n, err := fs.doRangeRead(ctx, path, offset, size)
+	if err == nil || !isTransientReadErr(err) {
+		return data, n, err
+	}
+
+	lastErr := err
+	for range readTransientRetryCount {
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), readTransientRetryTimeout)
+		data, n, err = fs.doRangeRead(retryCtx, path, offset, size)
+		retryCancel()
+		if err == nil {
+			return data, n, nil
+		}
+		if !isTransientReadErr(err) {
+			return nil, 0, err
+		}
+		lastErr = err
+	}
+	return nil, 0, fmt.Errorf("%w: %s: %v", errReadRetriesExhausted, path, lastErr)
+}
+
+// doRangeRead performs a single range read attempt: open stream + read body.
+// All body read errors (including truncation) are returned as-is so the
+// caller can classify them for retry.
+func (fs *Dat9FS) doRangeRead(ctx context.Context, path string, offset, size int64) ([]byte, int, error) {
+	rc, err := fs.client.ReadStreamRange(ctx, path, offset, size)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer func() { _ = rc.Close() }()
+
+	// Use LimitReader + ReadAll instead of ReadFull so that:
+	//   - Clean EOF (server sent full response) → (data, nil) — success
+	//   - Truncated body (connection drop) → (partial, err) — surfaces
+	//     to retry helper for transient classification
+	// io.ReadFull swallows io.ErrUnexpectedEOF, hiding truncation.
+	lr := io.LimitReader(rc, size)
+	data, err := io.ReadAll(lr)
+	if err != nil {
+		return nil, len(data), err
+	}
+	return data, len(data), nil
 }
 
 func (fs *Dat9FS) lookupStatRetryCount() int {
@@ -2095,11 +2194,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			bytesRead = len(data)
 			return gofuse.ReadResultData(data), gofuse.OK
 		}
-		// Cache miss — fall through to direct read, then trigger prefetch
+		// Cache miss — fall through to direct read. Prefetch is triggered
+		// only after a successful read (see below), not unconditionally.
 		source = "prefetch-miss-range"
-		defer func() {
-			fh.Prefetch.OnRead(offset, size)
-		}()
 	}
 
 	// Try read cache for small files. Use revision-aware cache: if the
@@ -2126,10 +2223,14 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		}
 
 		// Cache miss: read the file and store it. No separate Stat needed —
-		// ReadCtx fetches the data in one round-trip.
-		data, err := fs.client.ReadCtx(ctx, p)
+		// ReadCtx fetches the data in one round-trip. Uses detached retry
+		// so a single FUSE interrupt doesn't permanently return EAGAIN.
+		data, err := fs.readSmallFileWithRetry(ctx, p)
 		if err != nil {
 			source = "small-read-error"
+			if errors.Is(err, errReadRetriesExhausted) {
+				return nil, gofuse.EIO
+			}
 			return nil, httpToFuseStatus(err)
 		}
 		// Store with the revision from the prior Stat/Lookup.
@@ -2149,29 +2250,29 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		return gofuse.ReadResultData(data[offset:end]), gofuse.OK
 	}
 
-	// Large file or unknown size: range read (avoids O(offset) discard)
+	// Large file or unknown size: range read (avoids O(offset) discard).
+	// Uses detached retry so a single FUSE interrupt / transient error
+	// doesn't permanently return EAGAIN to the caller.
 	if source == "unknown" {
 		source = "range-read"
 	}
 	rangeStart := time.Now()
-	rc, err := fs.client.ReadStreamRange(ctx, p, int64(input.Offset), int64(input.Size))
+	data, n, err := fs.readStreamRangeWithRetry(ctx, p, int64(input.Offset), int64(input.Size))
 	if err != nil {
-		fs.debugf("read range open error path=%s off=%d req=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, source, time.Since(rangeStart), err)
+		fs.debugf("read range error path=%s off=%d req=%d got=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, n, source, time.Since(rangeStart), err)
+		if errors.Is(err, errReadRetriesExhausted) {
+			return nil, gofuse.EIO
+		}
 		return nil, httpToFuseStatus(err)
 	}
-	defer func() { _ = rc.Close() }()
-
-	data := make([]byte, input.Size)
-	n, err := io.ReadFull(rc, data)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		fs.debugf("read range body error path=%s off=%d req=%d got=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, n, source, time.Since(rangeStart), err)
-		return nil, gofuse.EIO
-	}
 	if fs.debugEnabled() && time.Since(rangeStart) >= fuseDebugSlowReadThreshold {
-		fs.debugf("read range done path=%s off=%d req=%d got=%d source=%s err=%v dur=%s", p, input.Offset, input.Size, n, source, err, time.Since(rangeStart))
+		fs.debugf("read range done path=%s off=%d req=%d got=%d source=%s dur=%s", p, input.Offset, input.Size, n, source, time.Since(rangeStart))
 	}
 	bytesRead = n
-	return gofuse.ReadResultData(data[:n]), gofuse.OK
+	if fh.Prefetch != nil {
+		fh.Prefetch.OnRead(int64(input.Offset), n)
+	}
+	return gofuse.ReadResultData(data), gofuse.OK
 }
 
 func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []byte) (written uint32, status gofuse.Status) {
