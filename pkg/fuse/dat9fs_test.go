@@ -3,6 +3,7 @@ package fuse
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -2931,5 +2932,340 @@ func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
 	}
 	if entryOut.Size != uint64(fileSize) {
 		t.Fatalf("Lookup size = %d, want %d", entryOut.Size, fileSize)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Read detached retry tests
+// ---------------------------------------------------------------------------
+
+// TestReadSmallFileRetryOnTransient verifies that a transient error on the
+// first ReadCtx attempt triggers a detached retry that succeeds, returning
+// data instead of EAGAIN.
+func TestReadSmallFileRetryOnTransient(t *testing.T) {
+	var getCalls atomic.Int32
+	fileData := []byte("hello retry")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(fileData)))
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			n := getCalls.Add(1)
+			if n == 1 {
+				// First GET: simulate transient failure
+				http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			// Retry succeeds
+			w.Header().Set("Content-Length", strconv.Itoa(len(fileData)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(fileData)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	// Register root inode and do a lookup to populate inode entry
+	cancel := make(chan struct{})
+	var entryOut2 gofuse.EntryOut
+	st := fs.Lookup(cancel, &gofuse.InHeader{NodeId: 1}, "small.txt", &entryOut2)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup: %v", st)
+	}
+
+	// Open the file
+	var openOut gofuse.OpenOut
+	st = fs.Open(cancel, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: entryOut2.NodeId}, Flags: syscall.O_RDONLY}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open: %v", st)
+	}
+
+	// Read — first GET fails 503, retry succeeds
+	result, st := fs.Read(cancel, &gofuse.ReadIn{Fh: openOut.Fh, Offset: 0, Size: uint32(len(fileData))}, nil)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK (must not return EAGAIN)", st)
+	}
+	if result == nil {
+		t.Fatal("Read returned nil result")
+	}
+	got := getCalls.Load()
+	if got < 2 {
+		t.Fatalf("GET calls = %d, want >= 2 (initial + retry)", got)
+	}
+}
+
+// TestReadRangeRetryExhaustedReturnsEIO verifies that when all read retries
+// are exhausted, the Read returns EIO instead of EAGAIN.
+func TestReadRangeRetryExhaustedReturnsEIO(t *testing.T) {
+	var getCalls atomic.Int32
+	fileSize := int64(1 << 20) // 1 MiB — above smallFileThreshold
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			getCalls.Add(1)
+			// All GETs fail with 503
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	cancel := make(chan struct{})
+	var entryOut2 gofuse.EntryOut
+	st := fs.Lookup(cancel, &gofuse.InHeader{NodeId: 1}, "large.bin", &entryOut2)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup: %v", st)
+	}
+
+	var openOut gofuse.OpenOut
+	st = fs.Open(cancel, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: entryOut2.NodeId}, Flags: syscall.O_RDONLY}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open: %v", st)
+	}
+
+	// Read — all attempts fail 503
+	_, st = fs.Read(cancel, &gofuse.ReadIn{Fh: openOut.Fh, Offset: 0, Size: 4096}, nil)
+	if st != gofuse.EIO {
+		t.Fatalf("Read status = %v, want EIO (must not return EAGAIN)", st)
+	}
+
+	// Verify retries happened: 1 initial + readTransientRetryCount retries
+	wantCalls := int32(1 + readTransientRetryCount)
+	if got := getCalls.Load(); got != wantCalls {
+		t.Fatalf("GET calls = %d, want %d", got, wantCalls)
+	}
+}
+
+// TestReadSmallFileRetryExhaustedReturnsEIO verifies that small file read
+// retries that are all exhausted return EIO, not EAGAIN.
+func TestReadSmallFileRetryExhaustedReturnsEIO(t *testing.T) {
+	var getCalls atomic.Int32
+	fileSize := 100 // small file
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(fileSize))
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			getCalls.Add(1)
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	cancel := make(chan struct{})
+	var entryOut2 gofuse.EntryOut
+	st := fs.Lookup(cancel, &gofuse.InHeader{NodeId: 1}, "tiny.txt", &entryOut2)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup: %v", st)
+	}
+
+	var openOut gofuse.OpenOut
+	st = fs.Open(cancel, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: entryOut2.NodeId}, Flags: syscall.O_RDONLY}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open: %v", st)
+	}
+
+	_, st = fs.Read(cancel, &gofuse.ReadIn{Fh: openOut.Fh, Offset: 0, Size: uint32(fileSize)}, nil)
+	if st != gofuse.EIO {
+		t.Fatalf("Read status = %v, want EIO", st)
+	}
+
+	wantCalls := int32(1 + readTransientRetryCount)
+	if got := getCalls.Load(); got != wantCalls {
+		t.Fatalf("GET calls = %d, want %d", got, wantCalls)
+	}
+}
+
+// TestDoRangeReadBodyTimeoutReturnsForRetry verifies that doRangeRead surfaces
+// context deadline errors during body read (not swallowed), allowing the retry
+// helper to classify and retry them.
+func TestDoRangeReadBodyTimeoutReturnsForRetry(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Send 200 with large Content-Length but write nothing.
+		// The client's context will be canceled, causing a body read error.
+		w.Header().Set("Content-Length", "1048576")
+		w.WriteHeader(http.StatusOK)
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, _, err := fs.doRangeRead(ctx, "/test.bin", 0, 4096)
+	if err == nil {
+		t.Fatal("expected error from doRangeRead with expired context")
+	}
+	if !isTransientReadErr(err) {
+		t.Fatalf("body-stage error %v should be classified as transient", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected DeadlineExceeded in error chain, got: %v", err)
+	}
+}
+
+// TestDoRangeReadBodyTruncationReturnsError verifies that when a server sends
+// headers successfully but closes the connection mid-body (truncation),
+// doRangeRead surfaces an error instead of silently returning partial data.
+// This enables the retry helper to detect and retry body-stage truncation.
+func TestDoRangeReadBodyTruncationReturnsError(t *testing.T) {
+	var getCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		getCalls.Add(1)
+		// Hijack the connection: send valid HTTP headers with Content-Length
+		// promising 4096 bytes, write only 10 bytes, then close.
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Log("server does not support hijacking")
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		conn, buf, _ := hj.Hijack()
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n")
+		_, _ = buf.Write(make([]byte, 10)) // only 10 of 4096 bytes
+		_ = buf.Flush()
+		_ = conn.Close() // truncate
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	ctx := context.Background()
+	_, n, err := fs.doRangeRead(ctx, "/truncate.bin", 0, 4096)
+	// doRangeRead must return an error for truncated body, not silent success.
+	// The old code (io.ReadFull + ErrUnexpectedEOF filter) would return nil here.
+	if err == nil {
+		t.Fatalf("expected error from truncated body, got nil with n=%d", n)
+	}
+}
+
+// TestReadPrefetchNotTriggeredOnFailure verifies that Prefetch.OnRead is NOT
+// called when the remote read fails after a prefetch cache miss.
+func TestReadPrefetchNotTriggeredOnFailure(t *testing.T) {
+	fileSize := int64(1 << 20) // 1 MiB — gets a Prefetcher
+	var getCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			getCalls.Add(1)
+			// All GETs fail with 503 (transient)
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	cancel := make(chan struct{})
+	var entryOut2 gofuse.EntryOut
+	st := fs.Lookup(cancel, &gofuse.InHeader{NodeId: 1}, "prefetch-fail.bin", &entryOut2)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup: %v", st)
+	}
+
+	var openOut gofuse.OpenOut
+	st = fs.Open(cancel, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: entryOut2.NodeId}, Flags: syscall.O_RDONLY}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open: %v", st)
+	}
+
+	// Verify prefetcher is set
+	fh, ok := fs.fileHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.Prefetch == nil {
+		t.Fatal("expected Prefetcher for large read-only file")
+	}
+
+	// Read — all remote attempts fail
+	_, st = fs.Read(cancel, &gofuse.ReadIn{Fh: openOut.Fh, Offset: 0, Size: 4096}, nil)
+	if st != gofuse.EIO {
+		t.Fatalf("Read status = %v, want EIO", st)
+	}
+
+	// Verify OnRead was NOT called by checking prefetcher state.
+	// After OnRead, readSize would be set to a non-zero value. Since we
+	// have no direct accessor, we verify indirectly: the prefetcher's
+	// internal sequential tracker should not have advanced. A successful
+	// OnRead would schedule background fetches; with a failing server,
+	// those fetches would generate additional GET calls beyond the
+	// Read retry attempts.
+	//
+	// With 1 initial + 2 retries = 3 GET calls from Read itself.
+	// If OnRead fired, the prefetcher would issue additional GETs.
+	wantMaxCalls := int32(1 + readTransientRetryCount)
+	if got := getCalls.Load(); got > wantMaxCalls {
+		t.Fatalf("GET calls = %d, want <= %d (OnRead should not trigger prefetch on failure)", got, wantMaxCalls)
+	}
+}
+
+// TestIsTransientReadErr verifies classification of transient read errors.
+func TestIsTransientReadErr(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"context.Canceled", context.Canceled, true},
+		{"context.DeadlineExceeded", context.DeadlineExceeded, true},
+		{"HTTP 503", &client.StatusError{StatusCode: http.StatusServiceUnavailable, Message: "unavailable"}, true},
+		{"HTTP 504", &client.StatusError{StatusCode: http.StatusGatewayTimeout, Message: "timeout"}, true},
+		{"HTTP 502", &client.StatusError{StatusCode: http.StatusBadGateway, Message: "bad gateway"}, true},
+		{"HTTP 500", &client.StatusError{StatusCode: http.StatusInternalServerError, Message: "error"}, true},
+		{"HTTP 404", &client.StatusError{StatusCode: http.StatusNotFound, Message: "not found"}, false},
+		{"HTTP 403", &client.StatusError{StatusCode: http.StatusForbidden, Message: "forbidden"}, false},
+		{"generic error", fmt.Errorf("something broke"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTransientReadErr(tt.err); got != tt.want {
+				t.Fatalf("isTransientReadErr(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
