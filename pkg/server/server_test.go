@@ -300,6 +300,7 @@ func TestStatMetadataIncludesTagsAndSemanticText(t *testing.T) {
 	var out struct {
 		Size         int64             `json:"size"`
 		IsDir        bool              `json:"isdir"`
+		ResourceID   string            `json:"resource_id"`
 		Revision     int64             `json:"revision"`
 		Mtime        *int64            `json:"mtime"`
 		ContentType  string            `json:"content_type"`
@@ -312,6 +313,9 @@ func TestStatMetadataIncludesTagsAndSemanticText(t *testing.T) {
 	if out.Size != int64(len("hello metadata")) || out.IsDir || out.Revision != 1 {
 		t.Fatalf("unexpected metadata shape: %+v", out)
 	}
+	if out.ResourceID == "" {
+		t.Fatalf("expected resource_id, got %+v", out)
+	}
 	if out.ContentType == "" || out.SemanticText == "" {
 		t.Fatalf("expected content_type and semantic_text, got %+v", out)
 	}
@@ -323,6 +327,35 @@ func TestStatMetadataIncludesTagsAndSemanticText(t *testing.T) {
 	}
 	if out.Tags["owner"] != "alice" || out.Tags["topic"] != "note" || len(out.Tags) != 2 {
 		t.Fatalf("unexpected tags: %+v", out.Tags)
+	}
+
+	mkdirReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/dir?mkdir", nil)
+	mkdirResp, err := http.DefaultClient.Do(mkdirReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = mkdirResp.Body.Close()
+	if mkdirResp.StatusCode != http.StatusOK {
+		t.Fatalf("mkdir: %d", mkdirResp.StatusCode)
+	}
+
+	dirResp, err := http.Get(ts.URL + "/v1/fs/dir?stat=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dirResp.Body.Close() }()
+	if dirResp.StatusCode != http.StatusOK {
+		t.Fatalf("dir stat metadata: %d", dirResp.StatusCode)
+	}
+	var dirOut struct {
+		IsDir      bool   `json:"isdir"`
+		ResourceID string `json:"resource_id"`
+	}
+	if err := json.NewDecoder(dirResp.Body).Decode(&dirOut); err != nil {
+		t.Fatalf("decode dir metadata: %v", err)
+	}
+	if !dirOut.IsDir || dirOut.ResourceID == "" {
+		t.Fatalf("expected directory resource_id, got %+v", dirOut)
 	}
 }
 

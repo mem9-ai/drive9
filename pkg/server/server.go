@@ -586,7 +586,9 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	var mtime *int64
 	var contentType string
 	var semanticText string
+	resourceID := nf.Node.NodeID
 	if nf.File != nil {
+		resourceID = nf.File.FileID
 		size = nf.File.SizeBytes
 		revision = nf.File.Revision
 		if nf.File.ConfirmedAt != nil {
@@ -616,6 +618,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	_ = json.NewEncoder(w).Encode(struct {
 		Size         int64             `json:"size"`
 		IsDir        bool              `json:"isdir"`
+		ResourceID   string            `json:"resource_id"`
 		Revision     int64             `json:"revision"`
 		Mtime        *int64            `json:"mtime,omitempty"`
 		ContentType  string            `json:"content_type"`
@@ -624,6 +627,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	}{
 		Size:         size,
 		IsDir:        nf.Node.IsDirectory,
+		ResourceID:   resourceID,
 		Revision:     revision,
 		Mtime:        mtime,
 		ContentType:  contentType,

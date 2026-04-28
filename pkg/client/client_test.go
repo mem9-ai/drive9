@@ -134,6 +134,9 @@ func TestStatMetadataIncludesTagsAndSupportsTagReplace(t *testing.T) {
 	if meta.Size != 5 || meta.IsDir || meta.Revision != 1 {
 		t.Fatalf("unexpected stat metadata: %+v", meta)
 	}
+	if meta.ResourceID == "" {
+		t.Fatalf("resource_id should not be empty: %+v", meta)
+	}
 	if meta.Mtime == nil || *meta.Mtime <= 0 {
 		t.Fatalf("mtime = %v, want > 0", meta.Mtime)
 	}
