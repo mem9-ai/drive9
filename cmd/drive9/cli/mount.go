@@ -116,6 +116,14 @@ func fsMountCmd(args []string) error {
 		return err
 	}
 
+	// Resolve auto mode to a concrete backend.
+	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
+	fmt.Fprintf(os.Stderr, "dat9: mount mode: %s\n", resolved)
+
+	if resolved == MountModeWebDAV && *readOnly {
+		return fmt.Errorf("drive9 mount: --read-only is not supported with WebDAV mode")
+	}
+
 	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
 	if err != nil {
 		return err
@@ -123,15 +131,8 @@ func fsMountCmd(args []string) error {
 	*server, *apiKey = serverVal, apiKeyVal
 	token := tokenVal
 
-	// Resolve auto mode to a concrete backend.
-	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
-	fmt.Fprintf(os.Stderr, "dat9: mount mode: %s\n", resolved)
-
 	// WebDAV path: create client, start local WebDAV server, invoke mount_webdav.
 	if resolved == MountModeWebDAV {
-		if *readOnly {
-			return fmt.Errorf("drive9 mount: --read-only is not supported with WebDAV mode")
-		}
 		var c *client.Client
 		if token != "" {
 			c = client.NewWithToken(*server, token)
