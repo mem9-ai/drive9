@@ -105,6 +105,35 @@ func VerifyGrant(csk []byte, raw string, now time.Time) (*VaultGrantClaims, erro
 	return &claims, nil
 }
 
+// PeekGrantTenantID extracts the tenant_id from a grant token's payload
+// WITHOUT verifying the HMAC signature. This is used only to resolve the tenant
+// backend so that full verification can proceed. The caller MUST still call
+// VerifyAndResolveGrant before trusting any claims.
+func PeekGrantTenantID(raw string) (string, error) {
+	if !strings.HasPrefix(raw, grantTokenPrefix) {
+		return "", fmt.Errorf("invalid grant token format")
+	}
+	body := raw[len(grantTokenPrefix):]
+	parts := strings.SplitN(body, ".", 3)
+	if len(parts) != 3 {
+		return "", fmt.Errorf("invalid grant token format")
+	}
+	payloadJSON, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", fmt.Errorf("decode payload: %w", err)
+	}
+	var peek struct {
+		TenantID string `json:"tenant_id"`
+	}
+	if err := json.Unmarshal(payloadJSON, &peek); err != nil {
+		return "", fmt.Errorf("unmarshal claims: %w", err)
+	}
+	if peek.TenantID == "" {
+		return "", fmt.Errorf("missing tenant_id in grant token")
+	}
+	return peek.TenantID, nil
+}
+
 // validateClaimsForSign enforces minimum structural invariants before the
 // server mints a token. These are redundant with validateClaimsForVerify but
 // they prevent writing a malformed token to the DB.
@@ -117,6 +146,9 @@ func validateClaimsForSign(c *VaultGrantClaims) error {
 	}
 	if c.GrantID == "" {
 		return fmt.Errorf("grant_id is required")
+	}
+	if c.TenantID == "" {
+		return fmt.Errorf("tenant_id is required")
 	}
 	if c.PrincipalType != PrincipalOwner && c.PrincipalType != PrincipalDelegated {
 		return fmt.Errorf("principal_type must be owner or delegated")
@@ -152,7 +184,7 @@ func validateClaimsForVerify(c *VaultGrantClaims, now time.Time) error {
 	if c.Perm != GrantPermRead && c.Perm != GrantPermWrite {
 		return fmt.Errorf("malformed grant: bad perm")
 	}
-	if c.GrantID == "" || c.Issuer == "" || c.Agent == "" {
+	if c.GrantID == "" || c.Issuer == "" || c.Agent == "" || c.TenantID == "" {
 		return fmt.Errorf("malformed grant: missing required claim")
 	}
 	if len(c.Scope) == 0 {

@@ -185,6 +185,107 @@ func TestIssueGrantRejectsNonPositiveTTL(t *testing.T) {
 	}
 }
 
+// TestVerifyGrantTenantIDRoundtrip proves tenant_id survives issue → verify
+// and that VerifyAndResolveGrant cross-checks the routing tenant_id against
+// the verified claim. This is the vault-layer regression for adv-1 gate #4
+// "tampered tenant_id".
+func TestVerifyGrantTenantIDRoundtrip(t *testing.T) {
+	s := newGrantTestStore(t)
+	ctx := context.Background()
+
+	tok, _, err := s.IssueGrant(
+		ctx, "tenant-a", "https://srv.invalid",
+		PrincipalDelegated, "agent-1", []string{"aws-prod"},
+		GrantPermRead, time.Hour, "",
+	)
+	if err != nil {
+		t.Fatalf("IssueGrant: %v", err)
+	}
+
+	// Verify with correct tenant — succeeds.
+	claims, err := s.VerifyAndResolveGrant(ctx, "tenant-a", "", tok)
+	if err != nil {
+		t.Fatalf("VerifyAndResolveGrant: %v", err)
+	}
+	if claims.TenantID != "tenant-a" {
+		t.Fatalf("tenant_id roundtrip: got %q, want tenant-a", claims.TenantID)
+	}
+
+	// Verify with wrong tenant — fails at HMAC (different CSK).
+	// This is the "tampered tenant_id" scenario: if an attacker modifies the
+	// routing tenant_id, the server routes to the wrong tenant backend where
+	// DeriveCSK produces a different key and HMAC verification fails.
+	if _, err := s.VerifyAndResolveGrant(ctx, "tenant-evil", "", tok); err == nil {
+		t.Fatal("expected tampered tenant_id to fail HMAC verification")
+	}
+}
+
+// TestVerifyGrantPermReadWrite proves both read and write grants verify
+// successfully. The perm check (read-only for /v1/vault/read) is enforced
+// at the server layer (verifyGrantReadToken), not here.
+func TestVerifyGrantPermReadWrite(t *testing.T) {
+	s := newGrantTestStore(t)
+	ctx := context.Background()
+
+	// Read grant.
+	readTok, _, err := s.IssueGrant(
+		ctx, "tenant-a", "https://srv.invalid",
+		PrincipalDelegated, "agent-1", []string{"aws-prod"},
+		GrantPermRead, time.Hour, "",
+	)
+	if err != nil {
+		t.Fatalf("IssueGrant read: %v", err)
+	}
+	readClaims, err := s.VerifyAndResolveGrant(ctx, "tenant-a", "", readTok)
+	if err != nil {
+		t.Fatalf("VerifyAndResolveGrant read: %v", err)
+	}
+	if readClaims.Perm != GrantPermRead {
+		t.Fatalf("perm: got %q, want read", readClaims.Perm)
+	}
+
+	// Write grant — verifies at vault layer but server read path rejects.
+	writeTok, _, err := s.IssueGrant(
+		ctx, "tenant-a", "https://srv.invalid",
+		PrincipalDelegated, "agent-1", []string{"aws-prod"},
+		GrantPermWrite, time.Hour, "",
+	)
+	if err != nil {
+		t.Fatalf("IssueGrant write: %v", err)
+	}
+	writeClaims, err := s.VerifyAndResolveGrant(ctx, "tenant-a", "", writeTok)
+	if err != nil {
+		t.Fatalf("VerifyAndResolveGrant write: %v", err)
+	}
+	if writeClaims.Perm != GrantPermWrite {
+		t.Fatalf("perm: got %q, want write", writeClaims.Perm)
+	}
+}
+
+// TestVerifyGrantScopePreserved proves scope round-trips through issue → verify
+// so the server read path can enforce scope checks accurately.
+func TestVerifyGrantScopePreserved(t *testing.T) {
+	s := newGrantTestStore(t)
+	ctx := context.Background()
+
+	scope := []string{"db-prod/password", "aws-prod"}
+	tok, _, err := s.IssueGrant(
+		ctx, "tenant-a", "https://srv.invalid",
+		PrincipalDelegated, "agent-1", scope,
+		GrantPermRead, time.Hour, "",
+	)
+	if err != nil {
+		t.Fatalf("IssueGrant: %v", err)
+	}
+	claims, err := s.VerifyAndResolveGrant(ctx, "tenant-a", "", tok)
+	if err != nil {
+		t.Fatalf("VerifyAndResolveGrant: %v", err)
+	}
+	if len(claims.Scope) != 2 || claims.Scope[0] != "db-prod/password" || claims.Scope[1] != "aws-prod" {
+		t.Fatalf("scope roundtrip: got %v", claims.Scope)
+	}
+}
+
 // TestAuditGrantIssuedDetailContract asserts the grant.issued audit event
 // carries the exact Detail map the impl spec §5 requires:
 // grant_id, agent, principal_type, perm, scope. Mirrors the AuditEvent the

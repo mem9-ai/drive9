@@ -24,6 +24,7 @@ func validClaims(exp time.Time) *VaultGrantClaims {
 	return &VaultGrantClaims{
 		Issuer:        "https://example.invalid",
 		GrantID:       "grt_test",
+		TenantID:      "tenant-test",
 		PrincipalType: PrincipalDelegated,
 		Agent:         "agent-a",
 		Scope:         []string{"aws-prod"},
@@ -181,13 +182,14 @@ func TestVerifyGrantAcceptsWithinSkew(t *testing.T) {
 
 // TestVerifyGrantRejectsUnknownClaims ensures the locked §16 claim set is
 // enforced on decode: extra JSON fields must make VerifyGrant fail, so a
-// signer that sneaks in (for example) `"tenant_id": "other"` can't smuggle
-// bonus authority into a verifier that ignores unknown keys.
+// signer that sneaks in bonus fields can't smuggle authority into a verifier
+// that ignores unknown keys.
 func TestVerifyGrantRejectsUnknownClaims(t *testing.T) {
 	csk := randomCSK(t)
 	tok := signHandCraftedClaims(t, csk, map[string]any{
 		"iss":            "https://example.invalid",
 		"grant_id":       "grt_test",
+		"tenant_id":      "tenant-test",
 		"principal_type": string(PrincipalDelegated),
 		"agent":          "agent-a",
 		"scope":          []string{"aws-prod"},
@@ -211,6 +213,7 @@ func TestVerifyGrantRejectsMissingRequiredClaim(t *testing.T) {
 		return map[string]any{
 			"iss":            "https://example.invalid",
 			"grant_id":       "grt_test",
+			"tenant_id":      "tenant-test",
 			"principal_type": string(PrincipalDelegated),
 			"agent":          "agent-a",
 			"scope":          []string{"aws-prod"},
@@ -218,7 +221,7 @@ func TestVerifyGrantRejectsMissingRequiredClaim(t *testing.T) {
 			"exp":            time.Now().Add(time.Hour).Unix(),
 		}
 	}
-	required := []string{"iss", "grant_id", "principal_type", "agent", "scope", "perm", "exp"}
+	required := []string{"iss", "grant_id", "tenant_id", "principal_type", "agent", "scope", "perm", "exp"}
 	for _, claim := range required {
 		t.Run("missing_"+claim, func(t *testing.T) {
 			payload := fullPayload()
@@ -240,5 +243,50 @@ func TestVerifyGrantRejectsMissingPrefix(t *testing.T) {
 	stripped := strings.TrimPrefix(tok, grantTokenPrefix)
 	if _, err := VerifyGrant(csk, stripped, time.Now()); err == nil {
 		t.Fatal("expected VerifyGrant to reject token without vt_ prefix")
+	}
+}
+
+func TestPeekGrantTenantID(t *testing.T) {
+	csk := randomCSK(t)
+	claims := validClaims(time.Now().Add(time.Hour))
+	claims.TenantID = "tenant-peek-42"
+	tok, err := SignGrant(csk, claims)
+	if err != nil {
+		t.Fatalf("SignGrant: %v", err)
+	}
+
+	tenantID, err := PeekGrantTenantID(tok)
+	if err != nil {
+		t.Fatalf("PeekGrantTenantID: %v", err)
+	}
+	if tenantID != "tenant-peek-42" {
+		t.Fatalf("expected tenant-peek-42, got %s", tenantID)
+	}
+
+	// Invalid token.
+	if _, err := PeekGrantTenantID("garbage"); err == nil {
+		t.Fatal("expected error for invalid token")
+	}
+
+	// Legacy cap token prefix should fail.
+	if _, err := PeekGrantTenantID("vault_something.sig"); err == nil {
+		t.Fatal("expected error for vault_ prefix token")
+	}
+}
+
+func TestPeekGrantTenantIDMissingTenantID(t *testing.T) {
+	// Hand-craft a grant token without tenant_id to ensure PeekGrantTenantID rejects it.
+	csk := randomCSK(t)
+	tok := signHandCraftedClaims(t, csk, map[string]any{
+		"iss":            "https://example.invalid",
+		"grant_id":       "grt_test",
+		"principal_type": string(PrincipalDelegated),
+		"agent":          "agent-a",
+		"scope":          []string{"aws-prod"},
+		"perm":           string(GrantPermRead),
+		"exp":            time.Now().Add(time.Hour).Unix(),
+	})
+	if _, err := PeekGrantTenantID(tok); err == nil {
+		t.Fatal("expected error for grant token missing tenant_id")
 	}
 }

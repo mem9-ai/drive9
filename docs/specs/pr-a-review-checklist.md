@@ -8,8 +8,8 @@ Reviewers: `@adversary-1`, `@adversary-2`. Walk every item. If any item fails, b
 
 ## A. Claim-set conformance (§16)
 
-- [ ] Payload contains exactly `iss, grant_id, principal_type, agent, scope, perm, exp, label_hint` — no more, no fewer.
-- [ ] `tenant_id` is NOT in the token payload. (If you find `TenantID` in `VaultGrantClaims`, block.)
+- [ ] Payload contains exactly `iss, grant_id, tenant_id, principal_type, agent, scope, perm, exp, label_hint` — no more, no fewer.
+- [ ] `tenant_id` IS in the token payload as a **routing-only claim** (NOT an authorization claim). Server cross-checks `claims.TenantID == routingTenantID` after HMAC verification.
 - [ ] `task_id` is NOT in the token payload. (Block if carried over from `CapTokenClaims`.)
 - [ ] `agent_id` renamed to `agent`.
 - [ ] `token_id` renamed to `grant_id`.
