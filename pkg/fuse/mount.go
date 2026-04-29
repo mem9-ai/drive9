@@ -240,6 +240,14 @@ func Mount(opts *MountOptions) error {
 	if runtime.GOOS == "linux" {
 		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively
 	}
+	if runtime.GOOS == "darwin" {
+		// macFUSE can reject open/readdir before requests reach the daemon if
+		// it performs local permission checks or treats the volume as a
+		// privacy-gated network volume. drive9 authorization is remote, so
+		// defer permission decisions to the filesystem handlers and present the
+		// mount as local to ordinary CLI tools.
+		fuseOpts.Options = append(fuseOpts.Options, "defer_permissions", "local")
+	}
 	if opts.ReadOnly {
 		fuseOpts.Options = append(fuseOpts.Options, "ro")
 	}
