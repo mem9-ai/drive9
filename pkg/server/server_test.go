@@ -992,6 +992,9 @@ func TestMetricsEndpoint(t *testing.T) {
 	if !strings.Contains(text, `dat9_db_operations_total{role="user"`) {
 		t.Fatalf("expected user db operation metric in response: %s", text)
 	}
+	if !strings.Contains(text, `tenant_id="local"`) {
+		t.Fatalf("expected tenant_id label on db operation metric in response: %s", text)
+	}
 	if !strings.Contains(text, `dat9_db_pool_registered{role="user"}`) {
 		t.Fatalf("expected user db pool metric in response: %s", text)
 	}
