@@ -12,8 +12,8 @@ import (
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
-	"github.com/mem9-ai/dat9/pkg/tenantctx"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
+	"github.com/mem9-ai/dat9/pkg/tenantctx"
 	"github.com/mem9-ai/dat9/pkg/vault"
 	"go.uber.org/zap"
 )
