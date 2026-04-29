@@ -16,13 +16,9 @@ func uploadBufferedRemoteFile(ctx context.Context, c *client.Client, remotePath 
 	return c.WriteStreamConditional(ctx, remotePath, bytes.NewReader(data), int64(len(data)), nil, expectedRevision)
 }
 
-// uploadFromShadow streams a shadow file to the server without loading the
-// entire file into memory. Uses io.SectionReader to wrap the shadow store's
-// ReadAt into an io.Reader for WriteStreamConditional.
-func uploadFromShadow(ctx context.Context, c *client.Client, shadows *ShadowStore, remotePath string, expectedRevision int64) error {
-	return uploadFromShadowRemote(ctx, c, shadows, remotePath, remotePath, expectedRevision)
-}
-
+// uploadFromShadowRemote streams a shadow file to the server without loading
+// the entire file into memory. localPath identifies the shadow entry;
+// remotePath is the API destination (may differ when using RemoteRoot).
 func uploadFromShadowRemote(ctx context.Context, c *client.Client, shadows *ShadowStore, localPath, remotePath string, expectedRevision int64) error {
 	// Sync shadow to disk before uploading to ensure all data is durable.
 	if err := shadows.Sync(localPath); err != nil {
