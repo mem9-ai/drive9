@@ -136,9 +136,12 @@ func Mount(opts *MountOptions) error {
 	} else {
 		stat, err := c.Stat(remoteRoot)
 		if err != nil {
-			return fmt.Errorf("remote root %q: %w", remoteRoot, err)
-		}
-		if !stat.IsDir {
+			// Stat may fail on backends where directory stat is unsupported.
+			// Fall back to List to verify the remote root exists and is listable.
+			if _, listErr := c.List(remoteRoot); listErr != nil {
+				return fmt.Errorf("remote root %q: %w", remoteRoot, err)
+			}
+		} else if !stat.IsDir {
 			return fmt.Errorf("remote root %q is not a directory", remoteRoot)
 		}
 	}

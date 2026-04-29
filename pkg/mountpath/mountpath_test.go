@@ -15,9 +15,10 @@ func TestNormalizeRoot(t *testing.T) {
 		{"/foo/bar", "/foo/bar", false},
 		{"/foo/bar/", "/foo/bar", false},
 		{"/foo//bar", "/foo/bar", false},
-		{"/foo/../bar", "/bar", false},
-		{"/foo/./bar", "/foo/bar", false},
-		{"foo", "", true}, // not absolute
+		{"/foo/../bar", "", true},  // ".." rejected (not silently normalized)
+		{"/foo/./bar", "", true},   // "." rejected
+		{"/../escape", "", true},   // ".." rejected
+		{"foo", "", true},          // not absolute
 	}
 	for _, tt := range tests {
 		got, err := NormalizeRoot(tt.in)
