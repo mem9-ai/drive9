@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Overview dashboard for Drive9 performance. Use this as the landing page, then drill into the specialized dashboards for HTTP, DB, FS, and upload paths.",
+  "description": "Filesystem operation dashboard for Drive9 request-path and backend work latency.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -25,14 +25,14 @@
   "panels": [
     {
       "gridPos": {
-        "h": 5,
+        "h": 4,
         "w": 24,
         "x": 0,
         "y": 0
       },
       "id": 100,
       "options": {
-        "content": "# Drive9 Performance Overview\n\nUse this dashboard as the front page, then open the companion dashboards for deeper analysis:\n\n- HTTP: large route-throughput and latency views\n- Meta DB: control-plane DB latency, waits, and pool behavior\n- User DB: tenant data-plane DB latency and pool behavior\n- FS operations: read/write/patch/append API flow\n- Upload and S3 path: presign, upload, resume, finalize, and abort path\n\nImportant limitation: current metrics do **not** include a tenant label, so User DB panels cannot be filtered by tenant yet.",
+        "content": "# FS Operations\n\nThis dashboard follows file-system request paths. It combines HTTP `/v1/fs/*` traffic with backend `fs_*` service operations to separate front-door symptoms from internal work.",
         "mode": "markdown"
       },
       "title": "Guide",
@@ -59,23 +59,23 @@
               },
               {
                 "color": "orange",
-                "value": 100
+                "value": 20
               },
               {
                 "color": "red",
-                "value": 300
+                "value": 100
               }
             ]
           },
-          "unit": "ops"
+          "unit": "reqps"
         },
         "overrides": []
       },
       "gridPos": {
         "h": 4,
-        "w": 3,
+        "w": 4,
         "x": 0,
-        "y": 5
+        "y": 4
       },
       "id": 1,
       "options": {
@@ -98,12 +98,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval]))",
-          "legendFormat": "http_rps",
+          "expr": "sum(rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
+          "legendFormat": "fs_rps",
           "refId": "A"
         }
       ],
-      "title": "HTTP RPS",
+      "title": "FS HTTP RPS",
       "type": "stat"
     },
     {
@@ -140,9 +140,9 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 3,
-        "x": 3,
-        "y": 5
+        "w": 4,
+        "x": 4,
+        "y": 4
       },
       "id": 2,
       "options": {
@@ -165,146 +165,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval])))",
           "legendFormat": "http_p95",
           "refId": "A"
         }
       ],
-      "title": "HTTP P95",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 20
-              },
-              {
-                "color": "red",
-                "value": 100
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 3,
-        "x": 6,
-        "y": 5
-      },
-      "id": 3,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "dat9_http_inflight_requests",
-          "legendFormat": "inflight",
-          "refId": "A"
-        }
-      ],
-      "title": "Inflight",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 0.01
-              },
-              {
-                "color": "red",
-                "value": 0.05
-              }
-            ]
-          },
-          "unit": "percentunit"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 3,
-        "x": 9,
-        "y": 5
-      },
-      "id": 4,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$route\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval])), 0.000001)",
-          "legendFormat": "http_5xx_ratio",
-          "refId": "A"
-        }
-      ],
-      "title": "HTTP 5xx Ratio",
+      "title": "FS HTTP P95",
       "type": "stat"
     },
     {
@@ -341,9 +207,143 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 3,
+        "w": 4,
+        "x": 8,
+        "y": 4
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval])))",
+          "legendFormat": "svc_p95",
+          "refId": "A"
+        }
+      ],
+      "title": "FS Service P95",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
         "x": 12,
-        "y": 5
+        "y": 4
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(dat9_http_requests_total{route=~\"$http_route\",status_code=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval])), 1)",
+          "legendFormat": "fs_5xx_ratio",
+          "refId": "A"
+        }
+      ],
+      "title": "FS 5xx Ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 20
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 4
       },
       "id": 5,
       "options": {
@@ -366,213 +366,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_service_operation_duration_seconds_bucket{component=~\"$component\",operation=~\"$operation\"}[$__rate_interval])))",
-          "legendFormat": "service_p95",
+          "expr": "sum(dat9_http_inflight_requests{route=~\"$http_route\"})",
+          "legendFormat": "fs_inflight",
           "refId": "A"
         }
       ],
-      "title": "Service P95",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 0.05
-              },
-              {
-                "color": "red",
-                "value": 0.25
-              }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 3,
-        "x": 15,
-        "y": 5
-      },
-      "id": 6,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\"}[$__rate_interval])))",
-          "legendFormat": "meta_db_p95",
-          "refId": "A"
-        }
-      ],
-      "title": "Meta DB P95",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 0.05
-              },
-              {
-                "color": "red",
-                "value": 0.25
-              }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 3,
-        "x": 18,
-        "y": 5
-      },
-      "id": 7,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\"}[$__rate_interval])))",
-          "legendFormat": "user_db_p95",
-          "refId": "A"
-        }
-      ],
-      "title": "User DB P95",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 1
-              },
-              {
-                "color": "red",
-                "value": 5
-              }
-            ]
-          },
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 3,
-        "x": 21,
-        "y": 5
-      },
-      "id": 8,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum(rate(dat9_db_pool_wait_count_total[$__rate_interval]))",
-          "legendFormat": "db_waits",
-          "refId": "A"
-        }
-      ],
-      "title": "DB Waits /s",
+      "title": "FS Inflight",
       "type": "stat"
     },
     {
@@ -586,7 +385,7 @@
             "mode": "palette-classic"
           },
           "mappings": [],
-          "unit": "ops"
+          "unit": "reqps"
         },
         "overrides": []
       },
@@ -594,101 +393,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 9
-      },
-      "id": 9,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "topk(8, sum by (route) (rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval])))",
-          "legendFormat": "{{route}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Top Routes By Throughput",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 9
-      },
-      "id": 10,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "topk(8, histogram_quantile(0.95, sum by (le, component, operation) (rate(dat9_service_operation_duration_seconds_bucket[$__rate_interval]))))",
-          "legendFormat": "{{component}} / {{operation}} p95",
-          "refId": "A"
-        }
-      ],
-      "title": "Slowest Service Operations",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 17
+        "y": 8
       },
       "id": 11,
       "options": {
@@ -708,21 +413,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, role) (rate(dat9_db_operation_duration_seconds_bucket[$__rate_interval])))",
-          "legendFormat": "{{role}} p95",
+          "expr": "sum by (route, method) (rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
+          "legendFormat": "{{method}} {{route}}",
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.99, sum by (le, role) (rate(dat9_db_operation_duration_seconds_bucket[$__rate_interval])))",
-          "legendFormat": "{{role}} p99",
-          "refId": "B"
         }
       ],
-      "title": "Meta DB Vs User DB Tail Latency",
+      "title": "FS Route Throughput",
       "type": "timeseries"
     },
     {
@@ -736,7 +432,7 @@
             "mode": "palette-classic"
           },
           "mappings": [],
-          "unit": "short"
+          "unit": "s"
         },
         "overrides": []
       },
@@ -744,7 +440,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 17
+        "y": 8
       },
       "id": 12,
       "options": {
@@ -764,12 +460,180 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (role, state) (dat9_db_pool_connections)",
-          "legendFormat": "{{role}} / {{state}}",
+          "expr": "topk(12, histogram_quantile(0.95, sum by (le, route, method) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval]))))",
+          "legendFormat": "{{method}} {{route}} p95",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "topk(12, histogram_quantile(0.99, sum by (le, route, method) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval]))))",
+          "legendFormat": "{{method}} {{route}} p99",
+          "refId": "B"
+        }
+      ],
+      "title": "FS Route Tail Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 13,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (operation, result) (rate(dat9_service_operations_total{operation=~\"$service_operation\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} / {{result}}",
           "refId": "A"
         }
       ],
-      "title": "DB Pool Connections",
+      "title": "FS Service Throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 14,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "topk(12, histogram_quantile(0.95, sum by (le, operation) (rate(dat9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval]))))",
+          "legendFormat": "{{operation}} p95",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "topk(12, histogram_quantile(0.99, sum by (le, operation) (rate(dat9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval]))))",
+          "legendFormat": "{{operation}} p99",
+          "refId": "B"
+        }
+      ],
+      "title": "FS Service Tail Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (status_code) (rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
+          "legendFormat": "{{status_code}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(dat9_http_inflight_requests{route=~\"$http_route\"})",
+          "legendFormat": "inflight",
+          "refId": "B"
+        }
+      ],
+      "title": "FS Status Mix And Inflight",
       "type": "timeseries"
     }
   ],
@@ -777,8 +641,8 @@
   "schemaVersion": 41,
   "tags": [
     "drive9",
+    "fs",
     "performance",
-    "overview",
     "grafana",
     "prometheus"
   ],
@@ -812,21 +676,21 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_http_requests_total, route)",
+        "definition": "label_values(dat9_http_requests_total{route=~\"/v1/fs.*\"}, route)",
         "hide": 0,
         "includeAll": true,
-        "label": "Route",
+        "label": "HTTP Route",
         "multi": true,
-        "name": "route",
+        "name": "http_route",
         "options": [],
-        "query": "label_values(dat9_http_requests_total, route)",
+        "query": "label_values(dat9_http_requests_total{route=~\"/v1/fs.*\"}, route)",
         "refresh": 2,
         "regex": "",
         "sort": 1,
         "type": "query"
       },
       {
-        "allValue": ".*",
+        "allValue": "fs_.*",
         "current": {
           "selected": true,
           "text": "All",
@@ -836,38 +700,14 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_service_operations_total, component)",
+        "definition": "label_values(dat9_service_operations_total{operation=~\"fs_.*\"}, operation)",
         "hide": 0,
         "includeAll": true,
-        "label": "Component",
+        "label": "Service Operation",
         "multi": true,
-        "name": "component",
+        "name": "service_operation",
         "options": [],
-        "query": "label_values(dat9_service_operations_total, component)",
-        "refresh": 2,
-        "regex": "",
-        "sort": 1,
-        "type": "query"
-      },
-      {
-        "allValue": ".*",
-        "current": {
-          "selected": true,
-          "text": "All",
-          "value": "$__all"
-        },
-        "datasource": {
-          "type": "prometheus",
-          "uid": "${datasource}"
-        },
-        "definition": "label_values(dat9_service_operations_total{component=~\"$component\"}, operation)",
-        "hide": 0,
-        "includeAll": true,
-        "label": "Operation",
-        "multi": true,
-        "name": "operation",
-        "options": [],
-        "query": "label_values(dat9_service_operations_total{component=~\"$component\"}, operation)",
+        "query": "label_values(dat9_service_operations_total{operation=~\"fs_.*\"}, operation)",
         "refresh": 2,
         "regex": "",
         "sort": 1,
@@ -881,8 +721,8 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Drive9 Performance Overview",
-  "uid": "drive9-performance-overview",
+  "title": "Drive9 FS Operations Performance",
+  "uid": "drive9-fs-operations-performance",
   "version": 1,
   "weekStart": ""
 }
