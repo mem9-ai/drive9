@@ -15,6 +15,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/mountpath"
 )
 
 // MountOptions configures the FUSE mount.
@@ -30,6 +31,7 @@ type MountOptions struct {
 	APIKey             string        // owner API key (mutually exclusive with Token)
 	Token              string        // delegated capability JWT (mutually exclusive with APIKey)
 	MountPoint         string        // local mount point
+	RemoteRoot         string        // remote subtree root (default "/"); set via "drive9 mount :/path /local"
 	CacheDir           string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
 	CacheSize          int64         // ReadCache max size in bytes (default 128MB)
 	DirTTL             time.Duration // DirCache TTL (default 10s)
@@ -120,8 +122,28 @@ func Mount(opts *MountOptions) error {
 		c = client.New(opts.Server, opts.APIKey)
 	}
 	c.SetActor(actorID)
-	if _, err := c.List("/"); err != nil {
-		return fmt.Errorf("cannot reach dat9 server: %w", err)
+
+	// Validate remote root (or server connectivity for root mounts).
+	remoteRoot, err := mountpath.NormalizeRoot(opts.RemoteRoot)
+	if err != nil {
+		return fmt.Errorf("mount: %w", err)
+	}
+	opts.RemoteRoot = remoteRoot
+	if remoteRoot == "/" {
+		if _, err := c.List("/"); err != nil {
+			return fmt.Errorf("cannot reach dat9 server: %w", err)
+		}
+	} else {
+		stat, err := c.Stat(remoteRoot)
+		if err != nil {
+			// Stat may fail on backends where directory stat is unsupported.
+			// Fall back to List to verify the remote root exists and is listable.
+			if _, listErr := c.List(remoteRoot); listErr != nil {
+				return fmt.Errorf("remote root %q: %w", remoteRoot, err)
+			}
+		} else if !stat.IsDir {
+			return fmt.Errorf("remote root %q is not a directory", remoteRoot)
+		}
 	}
 
 	// Build FUSE filesystem
@@ -142,7 +164,7 @@ func Mount(opts *MountOptions) error {
 			}
 		}
 		if cacheBase != "" {
-			mh := MountHash(opts.Server, opts.MountPoint)
+			mh := MountHash(opts.Server, opts.MountPoint, opts.RemoteRoot)
 			pendingDir := filepath.Join(cacheBase, mh, "pending")
 			shadowDir := filepath.Join(cacheBase, mh, "shadow")
 
@@ -209,14 +231,14 @@ func Mount(opts *MountOptions) error {
 
 			// Initialize CommitQueue for background remote commits.
 			if shadowStore != nil && pendingIdx != nil {
-				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, maxCommitQueuePending)
+				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, maxCommitQueuePending, opts.RemoteRoot)
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess
 				cq.RecoverPending()
 				dat9fs.commitQueue = cq
 			}
 
 			if wbCache != nil {
-				uploader := NewWriteBackUploader(c, wbCache, opts.UploadConcurrency)
+				uploader := NewWriteBackUploader(c, wbCache, opts.UploadConcurrency, opts.RemoteRoot)
 				dat9fs.SetWriteBack(wbCache, uploader)
 				// Recover pending uploads only when the newer commit queue is
 				// unavailable. Otherwise commitQueue owns shadow-backed recovery.

@@ -357,8 +357,24 @@ func fsyncDir(dir string) error {
 }
 
 // MountHash computes a short hash to distinguish cache directories for
-// different server+mountpoint combinations.
-func MountHash(serverURL, mountPoint string) string {
-	h := sha256.Sum256([]byte(serverURL + "\x00" + mountPoint))
+// different server+mountpoint+remoteRoot combinations.
+//
+// For backward compatibility, when remoteRoot is "/" (the default), the hash
+// is computed without the remoteRoot segment, matching the pre-subtree-mount
+// hash: sha256(server + "\x00" + mountPoint). This ensures existing caches
+// are not orphaned on upgrade.
+func MountHash(serverURL, mountPoint string, remoteRoot ...string) string {
+	root := "/"
+	if len(remoteRoot) > 0 && remoteRoot[0] != "" {
+		root = remoteRoot[0]
+	}
+	var input string
+	if root == "/" {
+		// Backward-compatible: same hash as pre-subtree-mount versions.
+		input = serverURL + "\x00" + mountPoint
+	} else {
+		input = serverURL + "\x00" + mountPoint + "\x00" + root
+	}
+	h := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(h[:8]) // 16 hex chars
 }

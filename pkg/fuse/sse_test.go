@@ -99,6 +99,62 @@ func TestSSEWatcherHandleChangeInvalidatesCache(t *testing.T) {
 	}
 }
 
+func TestSSEWatcherHandleChangeFiltersAndRebasesRemoteRoot(t *testing.T) {
+	opts := &MountOptions{
+		CacheSize:  1 << 20,
+		DirTTL:     5 * time.Second,
+		RemoteRoot: "/remote",
+	}
+	opts.setDefaults()
+	fs := &Dat9FS{
+		opts:      opts,
+		inodes:    NewInodeToPath(),
+		readCache: NewReadCache(opts.CacheSize, 0),
+		dirCache:  NewDirCache(opts.DirTTL),
+	}
+
+	fs.inodes.Lookup("/docs/readme.md", false, 50, time.Now())
+	fs.readCache.Put("/docs/readme.md", []byte("old content"), 1)
+	fs.dirCache.Put("/docs", []CachedFileInfo{{Name: "readme.md", Size: 50}})
+	fs.readCache.Put("/outside.txt", []byte("keep"), 1)
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "outside.txt", Size: 4}})
+
+	w := &SSEWatcher{fs: fs, actor: "my-actor"}
+
+	w.handleChange(&client.ChangeEvent{
+		Seq:   1,
+		Path:  "/outside.txt",
+		Op:    "write",
+		Actor: "other-actor",
+	})
+	if _, ok := fs.readCache.Get("/outside.txt", 1); !ok {
+		t.Fatal("event outside remote root should not invalidate local cache")
+	}
+
+	w.handleChange(&client.ChangeEvent{
+		Seq:   2,
+		Path:  "/remote2/docs/readme.md",
+		Op:    "write",
+		Actor: "other-actor",
+	})
+	if _, ok := fs.readCache.Get("/docs/readme.md", 1); !ok {
+		t.Fatal("prefix sibling outside remote root should not invalidate local cache")
+	}
+
+	w.handleChange(&client.ChangeEvent{
+		Seq:   3,
+		Path:  "/remote/docs/readme.md",
+		Op:    "write",
+		Actor: "other-actor",
+	})
+	if _, ok := fs.readCache.Get("/docs/readme.md", 1); ok {
+		t.Fatal("remote-root event should invalidate rebased local read cache")
+	}
+	if _, ok := fs.dirCache.Get("/docs"); ok {
+		t.Fatal("remote-root event should invalidate rebased local parent dir cache")
+	}
+}
+
 func TestSSEWatcherSelfFilterSkipsOwnEvents(t *testing.T) {
 	opts := &MountOptions{
 		CacheSize: 1 << 20,

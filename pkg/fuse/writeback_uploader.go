@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/mountpath"
 )
 
 // Exponential backoff constants for upload retries.
@@ -39,17 +40,18 @@ type pathState struct {
 // them to the server in the background. It runs a fixed number of worker
 // goroutines that read from a shared channel.
 //
-// Per-path serialization: at most one upload per remote path is in-flight at
+// Per-path serialization: at most one upload per local namespace path is in-flight at
 // any time. WaitPath() allows Rename/Unlink/Fsync to block until the current
 // upload for a path finishes.
 type WriteBackUploader struct {
-	client   *client.Client
-	cache    *WriteBackCache
-	uploadCh chan string // remote paths to upload
-	wg       sync.WaitGroup
-	stopOnce sync.Once
-	stopped  atomic.Bool
-	stopCh   chan struct{}
+	client     *client.Client
+	cache      *WriteBackCache
+	remoteRoot string
+	uploadCh   chan string // local namespace paths to upload
+	wg         sync.WaitGroup
+	stopOnce   sync.Once
+	stopped    atomic.Bool
+	stopCh     chan struct{}
 
 	// Per-path in-flight tracking.
 	inflightMu sync.Mutex
@@ -58,16 +60,21 @@ type WriteBackUploader struct {
 
 // NewWriteBackUploader creates and starts a background uploader with
 // numWorkers goroutines. Typical value: 4.
-func NewWriteBackUploader(c *client.Client, cache *WriteBackCache, numWorkers int) *WriteBackUploader {
+func NewWriteBackUploader(c *client.Client, cache *WriteBackCache, numWorkers int, remoteRoot ...string) *WriteBackUploader {
 	if numWorkers <= 0 {
 		numWorkers = 4
 	}
+	root := "/"
+	if len(remoteRoot) > 0 && remoteRoot[0] != "" {
+		root = remoteRoot[0]
+	}
 	u := &WriteBackUploader{
-		client:   c,
-		cache:    cache,
-		uploadCh: make(chan string, 256),
-		stopCh:   make(chan struct{}),
-		inflight: make(map[string]*pathState),
+		client:     c,
+		cache:      cache,
+		remoteRoot: root,
+		uploadCh:   make(chan string, 256),
+		stopCh:     make(chan struct{}),
+		inflight:   make(map[string]*pathState),
 	}
 	for i := 0; i < numWorkers; i++ {
 		u.wg.Add(1)
@@ -76,37 +83,45 @@ func NewWriteBackUploader(c *client.Client, cache *WriteBackCache, numWorkers in
 	return u
 }
 
-// Submit enqueues a remote path for background upload. Blocks up to 5s if the
+func (u *WriteBackUploader) remotePath(localPath string) string {
+	root := "/"
+	if u != nil && u.remoteRoot != "" {
+		root = u.remoteRoot
+	}
+	return mountpath.ToRemote(root, localPath)
+}
+
+// Submit enqueues a local namespace path for background upload. Blocks up to 5s if the
 // channel is full; on timeout, falls back to synchronous upload in the current
 // goroutine so data is never silently dropped.
-func (u *WriteBackUploader) Submit(remotePath string) {
+func (u *WriteBackUploader) Submit(localPath string) {
 	if u.stopped.Load() {
-		log.Printf("writeback uploader: already stopped, uploading synchronously for %s", remotePath)
-		u.uploadOne(remotePath)
+		log.Printf("writeback uploader: already stopped, uploading synchronously for %s", localPath)
+		u.uploadOne(localPath)
 		return
 	}
 	select {
-	case u.uploadCh <- remotePath:
+	case u.uploadCh <- localPath:
 	default:
 		// Channel full — block with timeout, then fallback to sync upload.
 		timer := time.NewTimer(submitTimeout)
 		defer timer.Stop()
 		select {
-		case u.uploadCh <- remotePath:
+		case u.uploadCh <- localPath:
 		case <-timer.C:
-			log.Printf("writeback uploader: channel full after %v, uploading synchronously for %s", submitTimeout, remotePath)
-			u.uploadOne(remotePath)
+			log.Printf("writeback uploader: channel full after %v, uploading synchronously for %s", submitTimeout, localPath)
+			u.uploadOne(localPath)
 		}
 	}
 }
 
-// WaitPath blocks until any in-flight upload for remotePath completes.
+// WaitPath blocks until any in-flight upload for localPath completes.
 // Returns immediately if no upload is in progress for this path.
-// This must be called by Rename/Unlink before operating on the remote path
+// This must be called by Rename/Unlink before operating on the local path
 // to prevent the background worker from re-creating a renamed/deleted file.
-func (u *WriteBackUploader) WaitPath(remotePath string) {
+func (u *WriteBackUploader) WaitPath(localPath string) {
 	u.inflightMu.Lock()
-	ps, ok := u.inflight[remotePath]
+	ps, ok := u.inflight[localPath]
 	u.inflightMu.Unlock()
 	if ok {
 		<-ps.done
@@ -157,29 +172,29 @@ func expectedRevisionForWriteBack(meta *WriteBackMeta) (int64, error) {
 
 func (u *WriteBackUploader) worker() {
 	defer u.wg.Done()
-	for remotePath := range u.uploadCh {
-		u.uploadOne(remotePath)
+	for localPath := range u.uploadCh {
+		u.uploadOne(localPath)
 	}
 }
 
-// acquirePath registers an in-flight upload for remotePath. If another upload
+// acquirePath registers an in-flight upload for localPath. If another upload
 // for the same path is already in progress, it waits for that to finish first,
 // ensuring per-path serialization. Returns a release function that the caller
 // must call when the upload is done.
-func (u *WriteBackUploader) acquirePath(remotePath string) func() {
+func (u *WriteBackUploader) acquirePath(localPath string) func() {
 	for {
 		u.inflightMu.Lock()
-		ps, ok := u.inflight[remotePath]
+		ps, ok := u.inflight[localPath]
 		if !ok {
 			// No in-flight upload — register ours.
 			ps = &pathState{done: make(chan struct{})}
-			u.inflight[remotePath] = ps
+			u.inflight[localPath] = ps
 			u.inflightMu.Unlock()
 			return func() {
 				u.inflightMu.Lock()
 				// Only delete if it's still our state (not replaced by a new upload).
-				if cur, ok := u.inflight[remotePath]; ok && cur == ps {
-					delete(u.inflight, remotePath)
+				if cur, ok := u.inflight[localPath]; ok && cur == ps {
+					delete(u.inflight, localPath)
 				}
 				u.inflightMu.Unlock()
 				close(ps.done)
@@ -191,18 +206,18 @@ func (u *WriteBackUploader) acquirePath(remotePath string) func() {
 	}
 }
 
-func (u *WriteBackUploader) uploadOne(remotePath string) {
-	release := u.acquirePath(remotePath)
+func (u *WriteBackUploader) uploadOne(localPath string) {
+	release := u.acquirePath(localPath)
 	defer release()
 
 	// Read data and remember the generation so we can detect concurrent overwrites.
-	meta, ok := u.cache.GetMeta(remotePath)
+	meta, ok := u.cache.GetMeta(localPath)
 	if !ok {
 		return // Already uploaded or removed.
 	}
 	gen := meta.Generation
 
-	data, ok := u.cache.Get(remotePath)
+	data, ok := u.cache.Get(localPath)
 	if !ok {
 		return
 	}
@@ -212,7 +227,7 @@ func (u *WriteBackUploader) uploadOne(remotePath string) {
 		// TODO: add a migration or cleanup path for legacy overwrite entries
 		// without base revisions so they do not remain pending forever when
 		// they only flow through Flush -> Release -> background uploadOne.
-		log.Printf("writeback upload skipped for %s: %v", remotePath, err)
+		log.Printf("writeback upload skipped for %s: %v", localPath, err)
 		return
 	}
 
@@ -228,7 +243,7 @@ func (u *WriteBackUploader) uploadOne(remotePath string) {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
-		lastErr = uploadBufferedRemoteFile(ctx, u.client, remotePath, data, expectedRevision)
+		lastErr = uploadBufferedRemoteFile(ctx, u.client, u.remotePath(localPath), data, expectedRevision)
 		cancel()
 
 		if lastErr == nil {
@@ -237,26 +252,26 @@ func (u *WriteBackUploader) uploadOne(remotePath string) {
 		if errors.Is(lastErr, client.ErrConflict) {
 			break
 		}
-		log.Printf("writeback upload attempt %d/%d failed for %s: %v", attempt+1, uploadMaxRetries+1, remotePath, lastErr)
+		log.Printf("writeback upload attempt %d/%d failed for %s: %v", attempt+1, uploadMaxRetries+1, localPath, lastErr)
 	}
 
 	if lastErr != nil {
 		if errors.Is(lastErr, client.ErrConflict) {
 			// TODO: persist a conflict marker or resolution flow so these
 			// entries do not remain pending forever across mounts.
-			log.Printf("writeback upload conflict for %s at base revision %d (will keep local pending data)", remotePath, meta.BaseRev)
+			log.Printf("writeback upload conflict for %s at base revision %d (will keep local pending data)", localPath, meta.BaseRev)
 			return
 		}
-		log.Printf("writeback upload failed for %s after %d attempts: %v (will retry on next mount)", remotePath, uploadMaxRetries+1, lastErr)
+		log.Printf("writeback upload failed for %s after %d attempts: %v (will retry on next mount)", localPath, uploadMaxRetries+1, lastErr)
 		return
 	}
 
 	// Only remove from cache if the generation hasn't changed. If a newer
 	// Put() happened while we were uploading, the cache now holds fresher
 	// data that must not be discarded.
-	curMeta, ok := u.cache.GetMeta(remotePath)
+	curMeta, ok := u.cache.GetMeta(localPath)
 	if ok && curMeta.Generation == gen {
-		u.cache.Remove(remotePath)
+		u.cache.Remove(localPath)
 	}
 }
 
@@ -264,17 +279,17 @@ func (u *WriteBackUploader) uploadOne(remotePath string) {
 // Waits for any in-flight background upload to finish first, then uploads with
 // generation protection. Used by Fsync/Rename which require the data to be
 // persisted remotely before returning.
-func (u *WriteBackUploader) UploadSync(ctx context.Context, remotePath string) error {
+func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) error {
 	// Wait for any in-flight background upload to complete first.
-	u.WaitPath(remotePath)
+	u.WaitPath(localPath)
 
-	meta, ok := u.cache.GetMeta(remotePath)
+	meta, ok := u.cache.GetMeta(localPath)
 	if !ok {
 		return nil // not in cache (may have been uploaded by the background worker we just waited for)
 	}
 	gen := meta.Generation
 
-	data, ok := u.cache.Get(remotePath)
+	data, ok := u.cache.Get(localPath)
 	if !ok {
 		return nil
 	}
@@ -285,21 +300,21 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, remotePath string) e
 			// Backward compatibility for pre-CAS writeback entries: preserve
 			// the historical UploadSync behaviour so fsync/rename do not fail
 			// with EIO on mounts that still have legacy pending overwrites.
-			log.Printf("writeback uploadsync: legacy overwrite without base revision for %s, falling back to unconditional write", remotePath)
+			log.Printf("writeback uploadsync: legacy overwrite without base revision for %s, falling back to unconditional write", localPath)
 			expectedRevision = -1
 		} else {
-			return fmt.Errorf("resolve expected revision for %s: %w", remotePath, err)
+			return fmt.Errorf("resolve expected revision for %s: %w", localPath, err)
 		}
 	}
 
-	if err := uploadBufferedRemoteFile(ctx, u.client, remotePath, data, expectedRevision); err != nil {
+	if err := uploadBufferedRemoteFile(ctx, u.client, u.remotePath(localPath), data, expectedRevision); err != nil {
 		return err
 	}
 
 	// Only remove if generation matches — a concurrent Put() may have written newer data.
-	curMeta, ok := u.cache.GetMeta(remotePath)
+	curMeta, ok := u.cache.GetMeta(localPath)
 	if ok && curMeta.Generation == gen {
-		u.cache.Remove(remotePath)
+		u.cache.Remove(localPath)
 	}
 	return nil
 }

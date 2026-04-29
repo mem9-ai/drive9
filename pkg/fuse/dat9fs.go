@@ -19,6 +19,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/mountpath"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
@@ -209,6 +210,21 @@ func parentDir(p string) string {
 	return d
 }
 
+func (fs *Dat9FS) remoteRoot() string {
+	if fs == nil || fs.opts == nil || fs.opts.RemoteRoot == "" {
+		return "/"
+	}
+	return fs.opts.RemoteRoot
+}
+
+func (fs *Dat9FS) remotePath(localPath string) string {
+	return mountpath.ToRemote(fs.remoteRoot(), localPath)
+}
+
+func (fs *Dat9FS) localPath(remotePath string) (string, bool) {
+	return mountpath.ToLocal(fs.remoteRoot(), remotePath)
+}
+
 func (fs *Dat9FS) dirtyHandleSize(ino uint64) (int64, bool) {
 	fs.dirtyMu.Lock()
 	defer fs.dirtyMu.Unlock()
@@ -334,7 +350,7 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 }
 
 func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
-	stat, err := fs.client.StatCtx(ctx, fh.Path)
+	stat, err := fs.client.StatCtx(ctx, fs.remotePath(fh.Path))
 	if err != nil {
 		return httpToFuseStatus(err)
 	}
@@ -366,6 +382,7 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 	// (and its held fh.mu) indefinitely.
 	c := fs.client
 	filePath := fh.Path
+	remoteFilePath := fs.remotePath(filePath)
 	fh.Dirty.LoadPart = func(partNum int) ([]byte, error) {
 		partIdx := partNum - 1
 		offset := int64(partIdx) * partSize
@@ -382,7 +399,7 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 
 		loadStart := time.Now()
 		fs.debugf("dirty load part start path=%s part=%d off=%d len=%d", filePath, partNum, offset, length)
-		rc, err := c.ReadStreamRange(lpCtx, filePath, offset, length)
+		rc, err := c.ReadStreamRange(lpCtx, remoteFilePath, offset, length)
 		if err != nil {
 			fs.debugDurationf(loadStart, 0, "dirty load part open failed path=%s part=%d off=%d len=%d err=%v", filePath, partNum, offset, length, err)
 			return nil, err
@@ -705,7 +722,8 @@ func isTransientReadErr(err error) bool {
 // readTransientRetryCount detached retries are attempted with short timeouts.
 // Returns EIO (never EAGAIN) when all retries are exhausted.
 func (fs *Dat9FS) readSmallFileWithRetry(ctx context.Context, path string) ([]byte, error) {
-	data, err := fs.client.ReadCtx(ctx, path)
+	remotePath := fs.remotePath(path)
+	data, err := fs.client.ReadCtx(ctx, remotePath)
 	if err == nil || !isTransientReadErr(err) {
 		return data, err
 	}
@@ -713,7 +731,7 @@ func (fs *Dat9FS) readSmallFileWithRetry(ctx context.Context, path string) ([]by
 	lastErr := err
 	for range readTransientRetryCount {
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), readTransientRetryTimeout)
-		data, err = fs.client.ReadCtx(retryCtx, path)
+		data, err = fs.client.ReadCtx(retryCtx, remotePath)
 		retryCancel()
 		if err == nil {
 			return data, nil
@@ -758,7 +776,7 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, off
 // All body read errors (including truncation) are returned as-is so the
 // caller can classify them for retry.
 func (fs *Dat9FS) doRangeRead(ctx context.Context, path string, offset, size int64) ([]byte, int, error) {
-	rc, err := fs.client.ReadStreamRange(ctx, path, offset, size)
+	rc, err := fs.client.ReadStreamRange(ctx, fs.remotePath(path), offset, size)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -805,9 +823,10 @@ func (fs *Dat9FS) lookupRetryStats() (total, success, exhausted uint64) {
 	return fs.lookupStatRetryTotal.Load(), fs.lookupStatRetrySuccess.Load(), fs.lookupStatRetryExhausted.Load()
 }
 
-func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, remotePath string, trackLookupMetrics bool) (*client.StatResult, error) {
+func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath string, trackLookupMetrics bool) (*client.StatResult, error) {
+	apiPath := fs.remotePath(localPath)
 	ctx, cf := fuseCtx(cancel)
-	stat, err := fs.client.StatCtx(ctx, remotePath)
+	stat, err := fs.client.StatCtx(ctx, apiPath)
 	cf()
 	if err == nil || isNotFoundErr(err) || !isTransientLookupErr(err) {
 		return stat, err
@@ -834,13 +853,13 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, remotePath stri
 		// transient failures. Keep this detached+bounded behavior unless retry
 		// semantics are redesigned.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
-		stat, err = fs.client.StatCtx(retryCtx, remotePath)
+		stat, err = fs.client.StatCtx(retryCtx, apiPath)
 		retryCancel()
 		if err == nil {
 			if trackLookupMetrics {
 				successCount := fs.lookupStatRetrySuccess.Add(1)
 				if successCount <= 3 || successCount%lookupRetrySuccessLogEvery == 0 {
-					log.Printf("lookup stat retry recovered for %s (success_count=%d)", remotePath, successCount)
+					log.Printf("lookup stat retry recovered for %s (success_count=%d)", localPath, successCount)
 				}
 			}
 			return stat, nil
@@ -853,7 +872,7 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, remotePath stri
 
 	if trackLookupMetrics {
 		fs.lookupStatRetryExhausted.Add(1)
-		log.Printf("lookup stat retries exhausted for %s: %v", remotePath, lastErr)
+		log.Printf("lookup stat retries exhausted for %s: %v", localPath, lastErr)
 	}
 	return nil, lastErr
 }
@@ -872,7 +891,8 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 	// list-fallback retries are intentionally not counted in lookupStatRetry*;
 	// those counters remain scoped to the primary Lookup->Stat path.
 	ctx, cf := fuseCtx(cancel)
-	items, err := fs.client.ListCtx(ctx, parentPath)
+	apiPath := fs.remotePath(parentPath)
+	items, err := fs.client.ListCtx(ctx, apiPath)
 	cf()
 	if err == nil || !isTransientLookupErr(err) {
 		return items, err
@@ -889,7 +909,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		// said "not found", and cancel-coupled retries would collapse to the
 		// original transient failure immediately.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
-		items, err = fs.client.ListCtx(retryCtx, parentPath)
+		items, err = fs.client.ListCtx(retryCtx, apiPath)
 		retryCancel()
 		if err == nil || !isTransientLookupErr(err) {
 			return items, err
@@ -1140,13 +1160,14 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			if newSize == 0 {
 				ctx, cf := fuseCtx(cancel)
 				defer cf()
-				if err := fs.client.WriteCtx(ctx, entry.Path, nil); err != nil {
+				apiPath := fs.remotePath(entry.Path)
+				if err := fs.client.WriteCtx(ctx, apiPath, nil); err != nil {
 					return httpToFuseStatus(err)
 				}
 				// Refresh the inode revision after the server-side truncate so a
 				// subsequent writable open does not reuse the stale pre-truncate
 				// base revision and conflict with its own zero-byte write.
-				stat, statErr := fs.client.StatCtx(ctx, entry.Path)
+				stat, statErr := fs.client.StatCtx(ctx, apiPath)
 				if statErr != nil {
 					log.Printf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, input.NodeId, statErr)
 				} else if stat != nil {
@@ -1190,7 +1211,7 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 		return st
 	}
 
-	if err := fs.client.MkdirCtx(ctx, childP); err != nil {
+	if err := fs.client.MkdirCtx(ctx, fs.remotePath(childP)); err != nil {
 		return httpToFuseStatus(err)
 	}
 
@@ -1269,7 +1290,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		// Tolerate 404 in case it was already deleted.
 		deleteStart := time.Now()
 		fs.debugf("unlink remote delete start path=%s", childP)
-		err := fs.client.DeleteCtx(ctx, childP)
+		err := fs.client.DeleteCtx(ctx, fs.remotePath(childP))
 		fs.debugDurationf(deleteStart, 0, "unlink remote delete done path=%s err=%v", childP, err)
 		if err != nil {
 			if !isNotFoundErr(err) {
@@ -1307,7 +1328,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 
 	deleteStart := time.Now()
 	fs.debugf("rmdir remote delete start path=%s", childP)
-	err := fs.client.DeleteCtx(ctx, childP)
+	err := fs.client.DeleteCtx(ctx, fs.remotePath(childP))
 	fs.debugDurationf(deleteStart, 0, "rmdir remote delete done path=%s err=%v", childP, err)
 	if err != nil {
 		status = httpToFuseStatus(err)
@@ -1443,7 +1464,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 	}
 
-	if err := fs.client.RenameCtx(ctx, oldP, newP); err != nil {
+	if err := fs.client.RenameCtx(ctx, fs.remotePath(oldP), fs.remotePath(newP)); err != nil {
 		return httpToFuseStatus(err)
 	}
 
@@ -1594,7 +1615,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 		return fs.mergePendingDirEntries(dirPath, entries), nil
 	}
 
-	items, err := fs.client.ListCtx(ctx, dirPath)
+	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
 	if err != nil {
 		return nil, err
 	}
@@ -1771,7 +1792,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		}
 	} else {
 		// Normal mode: attach streaming uploader for sequential write streaming.
-		fh.Streamer = NewStreamUploader(fs.client, childP, expectedRevisionForHandle(fh))
+		fh.Streamer = NewStreamUploader(fs.client, childP, expectedRevisionForHandle(fh), fs.remoteRoot())
 		streamer := fh.Streamer
 		wb.OnPartFull = func(partIdx int, data []byte) {
 			partNum := partIdx + 1
@@ -1828,7 +1849,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		// If BaseRev is 0 (e.g. inode came from readdir without revision),
 		// fetch the authoritative revision so CAS uploads work correctly.
 		if fh.BaseRev == 0 && !fh.IsNew {
-			if stat, err := fs.client.StatCtx(ctx, p); err == nil && stat != nil {
+			if stat, err := fs.client.StatCtx(ctx, fs.remotePath(p)); err == nil && stat != nil {
 				fh.BaseRev = stat.Revision
 				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
 			}
@@ -1900,7 +1921,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 				}
 			} else {
 				// Normal mode: attach streaming uploader with OnPartFull wiring.
-				fh.Streamer = NewStreamUploader(fs.client, p, expectedRevisionForHandle(fh))
+				fh.Streamer = NewStreamUploader(fs.client, p, expectedRevisionForHandle(fh), fs.remoteRoot())
 				streamer := fh.Streamer
 				filePath := p
 				fh.Dirty.OnPartFull = func(partIdx int, data []byte) {
@@ -1917,7 +1938,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	if fh.Dirty == nil {
 		entry, _ := fs.inodes.GetEntry(input.NodeId)
 		if entry != nil && entry.Size > smallFileThreshold {
-			fh.Prefetch = NewPrefetcher(fs.client, p, entry.Size, fs.debugEnabled())
+			fh.Prefetch = NewPrefetcher(fs.client, fs.remotePath(p), entry.Size, fs.debugEnabled())
 		}
 		// Atomically pin shadow for read-only opens so commit queue cleanup
 		// doesn't delete the shadow file while this handle is reading from it.
@@ -2512,7 +2533,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			uploadStart := time.Now()
 			fs.debugf("flush shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
 			fh.Unlock()
-			err := uploadFromShadow(ctx, fs.client, fs.shadowStore, fh.Path, expectedRevisionForHandle(fh))
+			err := uploadFromShadowRemote(ctx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
 			fh.Lock()
 			fs.debugDurationf(uploadStart, 0, "flush shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
 			if err != nil {
@@ -2665,7 +2686,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		uploadStart := time.Now()
 		fs.debugf("fsync shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
 		fh.Unlock()
-		err := uploadFromShadow(ctx, fs.client, fs.shadowStore, fh.Path, expectedRevisionForHandle(fh))
+		err := uploadFromShadowRemote(ctx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
 		fh.Lock()
 		fs.debugDurationf(uploadStart, 0, "fsync shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
 		if err != nil {
@@ -2784,7 +2805,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				phase = "shadowspill-sync-upload"
 				uploadStart := time.Now()
 				fs.debugf("release shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
-				uploadErr := uploadFromShadow(ctx, fs.client, fs.shadowStore, fh.Path, expectedRevisionForHandle(fh))
+				uploadErr := uploadFromShadowRemote(ctx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
 				fs.debugDurationf(uploadStart, 0, "release shadowspill upload done path=%s size=%d err=%v", fh.Path, size, uploadErr)
 				if uploadErr != nil {
 					flushStatus = gofuse.EIO
@@ -2959,7 +2980,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		}
 
 		dCtx, dCf := context.WithTimeout(context.Background(), fuseTimeout)
-		committedRev, err := fs.client.WriteCtxConditionalWithRevision(dCtx, filePath, data, expectedRevision)
+		committedRev, err := fs.client.WriteCtxConditionalWithRevision(dCtx, fs.remotePath(filePath), data, expectedRevision)
 		dCf()
 		if err != nil {
 			handle.Unlock()
@@ -3171,7 +3192,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		phase = "small-write"
 		writeStart := time.Now()
 		fs.debugf("flushHandle small write start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
-		committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fh.Path, data, expectedRevision)
+		committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
 		fs.debugDurationf(writeStart, 0, "flushHandle small write done path=%s size=%d committed_rev=%d err=%v", fh.Path, size, committedRev, err)
 	} else if fh.OrigSize >= smallFileThreshold {
 		phase = "patch-file"
@@ -3190,7 +3211,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			fs.debugf("flushHandle patch start path=%s size=%d dirty_parts=%d expected_rev=%d", fh.Path, size, len(dirtyParts), expectedRevision)
 			err = fs.client.PatchFile(
 				ctx,
-				fh.Path,
+				fs.remotePath(fh.Path),
 				size,
 				dirtyParts,
 				func(partNumber int, partSize int64, origData []byte) ([]byte, error) {
@@ -3213,7 +3234,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.debugf("flushHandle write stream start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
 		err = fs.client.WriteStreamConditional(
 			ctx,
-			fh.Path,
+			fs.remotePath(fh.Path),
 			bytes.NewReader(data),
 			size,
 			nil,

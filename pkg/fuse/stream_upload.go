@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/mountpath"
 )
 
 // StreamUploader manages parallel part uploads both during Write() for
@@ -29,6 +30,7 @@ import (
 type StreamUploader struct {
 	client           *client.Client
 	path             string
+	remotePath       string
 	expectedRevision int64
 
 	mu            sync.Mutex
@@ -41,10 +43,15 @@ type StreamUploader struct {
 
 // NewStreamUploader creates a StreamUploader for the given path.
 // No network calls are made until UploadAll or FinishStreaming is called.
-func NewStreamUploader(c *client.Client, path string, expectedRevision int64) *StreamUploader {
+func NewStreamUploader(c *client.Client, path string, expectedRevision int64, remoteRoot ...string) *StreamUploader {
+	root := "/"
+	if len(remoteRoot) > 0 && remoteRoot[0] != "" {
+		root = remoteRoot[0]
+	}
 	return &StreamUploader{
 		client:           c,
 		path:             path,
+		remotePath:       mountpath.ToRemote(root, path),
 		expectedRevision: expectedRevision,
 		streamedParts:    make(map[int]bool),
 		pendingParts:     make(map[int][]byte),
@@ -156,7 +163,7 @@ func (su *StreamUploader) FinishStreaming(ctx context.Context, totalSize int64,
 	}
 
 	// Initiate the server-side upload now that we know the exact total size.
-	su.writer = su.client.NewStreamWriterConditional(ctx, su.path, totalSize, su.expectedRevision)
+	su.writer = su.client.NewStreamWriterConditional(ctx, su.remotePath, totalSize, su.expectedRevision)
 	sw := su.writer
 
 	// Collect all buffered parts. We keep a reference so we can restore
@@ -227,7 +234,7 @@ func (su *StreamUploader) UploadAll(ctx context.Context, totalSize int64, partDa
 	}
 
 	su.mu.Lock()
-	su.writer = su.client.NewStreamWriterConditional(ctx, su.path, totalSize, su.expectedRevision)
+	su.writer = su.client.NewStreamWriterConditional(ctx, su.remotePath, totalSize, su.expectedRevision)
 	su.started = true
 	sw := su.writer
 	su.mu.Unlock()

@@ -1,10 +1,12 @@
 package fuse
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +21,7 @@ type multipartUploadRecorder struct {
 	server           *httptest.Server
 	wantPath         string
 	wantSize         int64
+	wantParts        int
 	wantExpected     *int64
 	initiateCalls    atomic.Int32
 	presignCalls     atomic.Int32
@@ -36,6 +39,7 @@ func newMultipartUploadRecorder(t *testing.T, wantPath string, wantSize int64, w
 		t:            t,
 		wantPath:     wantPath,
 		wantSize:     wantSize,
+		wantParts:    int((wantSize + int64(s3client.PartSize) - 1) / int64(s3client.PartSize)),
 		wantExpected: wantExpected,
 	}
 
@@ -77,7 +81,7 @@ func newMultipartUploadRecorder(t *testing.T, wantPath string, wantSize int64, w
 				"upload_id":   "upload-1",
 				"key":         "object-key",
 				"part_size":   int64(s3client.PartSize),
-				"total_parts": 1,
+				"total_parts": rec.wantParts,
 			})
 			return
 
@@ -94,7 +98,25 @@ func newMultipartUploadRecorder(t *testing.T, wantPath string, wantSize int64, w
 			})
 			return
 
-		case r.Method == http.MethodPut && r.URL.Path == "/s3/upload-1/1":
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/upload-1/presign":
+			rec.presignCalls.Add(1)
+			var req struct {
+				PartNumber int `json:"part_number"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode presign request: %v", err)
+			}
+			if req.PartNumber < 1 || req.PartNumber > rec.wantParts {
+				t.Fatalf("presign part = %d, want 1..%d", req.PartNumber, rec.wantParts)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": req.PartNumber,
+				"url":    rec.server.URL + "/s3/upload-1/" + strconv.Itoa(req.PartNumber),
+				"size":   int64(s3client.PartSize),
+			})
+			return
+
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/upload-1/"):
 			rec.s3PutCalls.Add(1)
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -118,8 +140,14 @@ func newMultipartUploadRecorder(t *testing.T, wantPath string, wantSize int64, w
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				t.Fatalf("decode complete request: %v", err)
 			}
-			if len(req.Parts) != 1 || req.Parts[0].Number != 1 || req.Parts[0].ETag != "etag-1" {
-				t.Fatalf("complete parts = %+v, want single part with etag-1", req.Parts)
+			if len(req.Parts) != rec.wantParts {
+				t.Fatalf("complete parts = %+v, want %d parts", req.Parts, rec.wantParts)
+			}
+			for i, part := range req.Parts {
+				wantNumber := i + 1
+				if part.Number != wantNumber || part.ETag != "etag-1" {
+					t.Fatalf("complete part[%d] = %+v, want number=%d etag=etag-1", i, part, wantNumber)
+				}
 			}
 			w.WriteHeader(http.StatusOK)
 			return
@@ -229,5 +257,93 @@ func TestWriteBackUploaderLargeNewFileUsesMultipartUpload(t *testing.T) {
 	defer rec.mu.Unlock()
 	if rec.gotUploadedBytes != int64(len(data)) {
 		t.Fatalf("uploaded bytes = %d, want %d", rec.gotUploadedBytes, len(data))
+	}
+}
+
+func TestWriteBackUploaderMapsRemoteRoot(t *testing.T) {
+	const localPath = "/large-new.bin"
+	data := make([]byte, s3client.PartSize)
+	expectedRevision := int64(0)
+	rec := newMultipartUploadRecorder(t, "/remote/large-new.bin", int64(len(data)), &expectedRevision)
+
+	cache, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Put(localPath, data, int64(len(data)), PendingNew); err != nil {
+		t.Fatal(err)
+	}
+
+	uploader := NewWriteBackUploader(rec.client(), cache, 1, "/remote")
+	uploader.Submit(localPath)
+	uploader.DrainAll()
+
+	if rec.initiateCalls.Load() != 1 {
+		t.Fatalf("initiate calls = %d, want 1", rec.initiateCalls.Load())
+	}
+	if _, ok := cache.Get(localPath); ok {
+		t.Fatal("cache entry should be removed after remote-root upload")
+	}
+}
+
+func TestCommitQueueMapsRemoteRoot(t *testing.T) {
+	const localPath = "/large-overwrite.bin"
+	data := make([]byte, s3client.PartSize)
+	expectedRevision := int64(7)
+	rec := newMultipartUploadRecorder(t, "/remote/large-overwrite.bin", int64(len(data)), &expectedRevision)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(localPath, data, expectedRevision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(localPath, int64(len(data)), PendingOverwrite, expectedRevision); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(rec.client(), shadow, pending, nil, 1, 8, "/remote")
+	if err := cq.Enqueue(&CommitEntry{
+		Path:    localPath,
+		BaseRev: expectedRevision,
+		Size:    int64(len(data)),
+		Kind:    PendingOverwrite,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if rec.initiateCalls.Load() != 1 {
+		t.Fatalf("initiate calls = %d, want 1", rec.initiateCalls.Load())
+	}
+	if pending.HasPending(localPath) {
+		t.Fatal("pending entry should be removed after remote-root commit")
+	}
+	if shadow.Has(localPath) {
+		t.Fatal("shadow entry should be removed after remote-root commit")
+	}
+}
+
+func TestStreamUploaderMapsRemoteRoot(t *testing.T) {
+	const localPath = "/stream.bin"
+	data := make([]byte, s3client.PartSize+123)
+	expectedRevision := int64(9)
+	rec := newMultipartUploadRecorder(t, "/remote/stream.bin", int64(len(data)), &expectedRevision)
+
+	uploader := NewStreamUploader(rec.client(), localPath, expectedRevision, "/remote")
+	if err := uploader.UploadAll(context.Background(), int64(len(data)), map[int][]byte{
+		1: data[:s3client.PartSize],
+		2: data[s3client.PartSize:],
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rec.initiateCalls.Load() != 1 || rec.completeCalls.Load() != 1 {
+		t.Fatalf("multipart calls = initiate:%d complete:%d, want 1 each", rec.initiateCalls.Load(), rec.completeCalls.Load())
 	}
 }

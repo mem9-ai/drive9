@@ -741,6 +741,73 @@ func TestLookupFallsBackToParentListWhenDirStatUnsupported(t *testing.T) {
 	}
 }
 
+func TestLookupUsesRemoteRootMapping(t *testing.T) {
+	var gotPath string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if r.Method != http.MethodHead {
+			t.Fatalf("method = %s, want HEAD", r.Method)
+		}
+		w.Header().Set("Content-Length", "12")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "5")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{RemoteRoot: "/remote"}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "file.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if gotPath != "/v1/fs/remote/file.txt" {
+		t.Fatalf("lookup API path = %q, want /v1/fs/remote/file.txt", gotPath)
+	}
+	if _, ok := fs.inodes.GetInode("/file.txt"); !ok {
+		t.Fatal("lookup should keep local inode path rebased to /file.txt")
+	}
+}
+
+func TestListDirUsesRemoteRootMapping(t *testing.T) {
+	var gotPath string
+	var gotQuery string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want GET", r.Method)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"entries": []map[string]any{{
+				"name":     "nested.txt",
+				"isDir":    false,
+				"size":     7,
+				"revision": 3,
+			}},
+		})
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{RemoteRoot: "/remote"}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	entries, err := fs.listDir(context.Background(), "/subdir")
+	if err != nil {
+		t.Fatalf("listDir error = %v, want nil", err)
+	}
+	if gotPath != "/v1/fs/remote/subdir" || gotQuery != "list=1" {
+		t.Fatalf("listDir request = %q?%s, want /v1/fs/remote/subdir?list=1", gotPath, gotQuery)
+	}
+	if len(entries) != 1 || entries[0].Name != "nested.txt" {
+		t.Fatalf("listDir entries = %+v, want nested.txt", entries)
+	}
+}
+
 func TestLookupRetriesTransientCanceledStat(t *testing.T) {
 	var headCalls atomic.Int32
 	firstHeadStarted := make(chan struct{}, 1)
@@ -2680,10 +2747,10 @@ func TestReleaseTimeoutScaling(t *testing.T) {
 		wantMin time.Duration
 		wantMax time.Duration
 	}{
-		{0, 60 * time.Second, 60 * time.Second},                   // small file: floor
-		{10 << 20, 60 * time.Second, 60 * time.Second},            // 10 MB: still floor
-		{1 << 30, 200 * time.Second, 220 * time.Second},           // 1 GiB: ~205s
-		{100 << 30, 15 * time.Minute, 15 * time.Minute},           // 100 GiB: capped at 15min
+		{0, 60 * time.Second, 60 * time.Second},         // small file: floor
+		{10 << 20, 60 * time.Second, 60 * time.Second},  // 10 MB: still floor
+		{1 << 30, 200 * time.Second, 220 * time.Second}, // 1 GiB: ~205s
+		{100 << 30, 15 * time.Minute, 15 * time.Minute}, // 100 GiB: capped at 15min
 	}
 	for _, tt := range tests {
 		got := releaseTimeout(tt.size)
@@ -2700,9 +2767,9 @@ func TestReleaseTimeoutScaling(t *testing.T) {
 func largeFlushStreamingMock(t *testing.T, fileSize int64, completeCh chan<- struct{}) *httptest.Server {
 	t.Helper()
 	var (
-		mu        sync.Mutex
-		uploaded  bool // set true after /complete
-		etagSeq   int
+		mu       sync.Mutex
+		uploaded bool // set true after /complete
+		etagSeq  int
 	)
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -2778,9 +2845,9 @@ func largeFlushStreamingMock(t *testing.T, fileSize int64, completeCh chan<- str
 // cache is empty, and the remote stat has not yet observed the upload.
 //
 // Repro path that previously failed:
-//   1. Create + Write 10 MiB
-//   2. Flush (was: returned OK without uploading)
-//   3. Lookup the path → must succeed
+//  1. Create + Write 10 MiB
+//  2. Flush (was: returned OK without uploading)
+//  3. Lookup the path → must succeed
 func TestFlushLargeFile_StrictUploadsBeforeReturning(t *testing.T) {
 	const fileSize = int64(writeBackThreshold) // 10 MiB — minimal trigger of the large-file path
 
@@ -2850,8 +2917,8 @@ func TestFlushLargeFile_StrictUploadsBeforeReturning(t *testing.T) {
 // CommitQueue takes over the actual server write asynchronously.
 //
 // We assert two invariants:
-//   1. Flush returns quickly without contacting the upload endpoints.
-//   2. A subsequent Lookup hits pendingIndex (no remote stat needed).
+//  1. Flush returns quickly without contacting the upload endpoints.
+//  2. A subsequent Lookup hits pendingIndex (no remote stat needed).
 func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
 	const fileSize = int64(writeBackThreshold) // 10 MiB
 

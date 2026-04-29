@@ -58,12 +58,16 @@ func (w *SSEWatcher) handleEvent(change *client.ChangeEvent, reset *client.Reset
 }
 
 func (w *SSEWatcher) handleChange(ce *client.ChangeEvent) {
-	p := ce.Path
-	if p == "" {
+	remotePath := ce.Path
+	if remotePath == "" {
+		return
+	}
+	p, ok := w.fs.localPath(remotePath)
+	if !ok {
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "dat9: SSE event op=%s path=%s actor=%s\n", ce.Op, p, ce.Actor)
+	fmt.Fprintf(os.Stderr, "dat9: SSE event op=%s path=%s local=%s actor=%s\n", ce.Op, remotePath, p, ce.Actor)
 
 	// Invalidate read cache for the changed file.
 	w.fs.readCache.Invalidate(p)
