@@ -60,6 +60,7 @@ func (s *Store) IssueGrant(
 	claims := &VaultGrantClaims{
 		Issuer:        issuer,
 		GrantID:       grantID,
+		TenantID:      tenantID,
 		PrincipalType: principal,
 		Agent:         agent,
 		Scope:         scope,
@@ -125,6 +126,12 @@ func (s *Store) VerifyAndResolveGrant(
 	claims, err := VerifyGrant(csk, raw, time.Now())
 	if err != nil {
 		return nil, err
+	}
+
+	// Defense-in-depth: after HMAC verification succeeds, the verified
+	// tenant_id claim must match the routing tenant_id used to derive CSK.
+	if claims.TenantID != tenantID {
+		return nil, fmt.Errorf("tenant_id mismatch")
 	}
 
 	if expectedIssuer != "" && claims.Issuer != expectedIssuer {

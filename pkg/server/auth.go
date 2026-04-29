@@ -213,7 +213,8 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 
 		// Peek at claims to get tenant_id. We only need the payload, not
 		// full HMAC verification (handleVaultRead does that).
-		tenantID, err := peekCapTokenTenantID(tok)
+		// Support both legacy cap tokens (vault_ prefix) and grant tokens (vt_ prefix).
+		tenantID, err := peekTokenTenantID(tok)
 		if err != nil {
 			errJSON(w, http.StatusUnauthorized, "invalid capability token")
 			return
@@ -241,7 +242,13 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 	})
 }
 
-func peekCapTokenTenantID(raw string) (string, error) {
+// peekTokenTenantID extracts tenant_id from either a legacy cap token (vault_
+// prefix) or a grant token (vt_ prefix). Used by capabilityAuthMiddleware for
+// pre-auth tenant routing.
+func peekTokenTenantID(raw string) (string, error) {
+	if strings.HasPrefix(raw, "vt_") {
+		return vault.PeekGrantTenantID(raw)
+	}
 	return vault.PeekCapTokenTenantID(raw)
 }
 
