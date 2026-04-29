@@ -129,6 +129,9 @@ func fsMountCmd(args []string) error {
 
 	// WebDAV path: create client, start local WebDAV server, invoke mount_webdav.
 	if resolved == MountModeWebDAV {
+		if *readOnly {
+			return fmt.Errorf("drive9 mount: --read-only is not supported with WebDAV mode")
+		}
 		var c *client.Client
 		if token != "" {
 			c = client.NewWithToken(*server, token)
