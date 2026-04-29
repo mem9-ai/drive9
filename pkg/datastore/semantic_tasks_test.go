@@ -117,6 +117,44 @@ func TestSemanticTaskAckWrongReceiptFails(t *testing.T) {
 	}
 }
 
+func TestSemanticTaskDeadLetterWithoutRetry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if _, err := s.EnqueueSemanticTask(ctx, newSemanticTask("task-1", "file-1", 1, now, now)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := s.ClaimSemanticTask(ctx, now.Add(time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected claim to find task")
+	}
+
+	if err := s.DeadLetterSemanticTask(ctx, claimed.TaskID, claimed.Receipt, "permanent audio extract error"); err != nil {
+		t.Fatal(err)
+	}
+
+	task := mustGetSemanticTask(t, s, claimed.TaskID)
+	if task.Status != semantic.TaskDeadLettered {
+		t.Fatalf("status=%q, want %q", task.Status, semantic.TaskDeadLettered)
+	}
+	if task.AttemptCount != 1 {
+		t.Fatalf("attempt_count=%d, want 1", task.AttemptCount)
+	}
+	if task.LastError != "permanent audio extract error" {
+		t.Fatalf("last_error=%q", task.LastError)
+	}
+	if task.CompletedAt == nil {
+		t.Fatal("expected completed_at after dead-letter")
+	}
+	if task.Receipt != "" || task.LeasedAt != nil || task.LeaseUntil != nil {
+		t.Fatalf("dead-letter should clear lease fields: %+v", task)
+	}
+}
+
 func TestSemanticTaskRenewExtendsLease(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

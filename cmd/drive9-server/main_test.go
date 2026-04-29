@@ -226,8 +226,8 @@ func TestBuildAudioExtractOptionsFromEnvQwenASRDefaultMaxBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildAudioExtractOptionsFromEnv: %v", err)
 	}
-	if opts.MaxAudioBytes != 10485760 {
-		t.Fatalf("MaxAudioBytes=%d, want 10485760", opts.MaxAudioBytes)
+	if opts.MaxAudioBytes != 7340032 {
+		t.Fatalf("MaxAudioBytes=%d, want 7340032", opts.MaxAudioBytes)
 	}
 }
 

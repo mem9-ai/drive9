@@ -40,6 +40,52 @@ func TestNewCLILoggerCreatesLogDirAndFile(t *testing.T) {
 	}
 }
 
+func TestNewServerLoggerHonorsLogLevel(t *testing.T) {
+	tests := []struct {
+		name         string
+		level        string
+		debugEnabled bool
+		infoEnabled  bool
+	}{
+		{name: "default_info", infoEnabled: true},
+		{name: "debug", level: "debug", debugEnabled: true, infoEnabled: true},
+		{name: "uppercase_warn", level: "WARN"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.level != "" {
+				t.Setenv(envLogLevel, tc.level)
+			} else {
+				t.Setenv(envLogLevel, "")
+			}
+			l, err := NewServerLogger()
+			if err != nil {
+				t.Fatalf("NewServerLogger: %v", err)
+			}
+			t.Cleanup(func() { _ = l.Sync() })
+			if got := l.Core().Enabled(zap.DebugLevel); got != tc.debugEnabled {
+				t.Fatalf("debug enabled=%v, want %v", got, tc.debugEnabled)
+			}
+			if got := l.Core().Enabled(zap.InfoLevel); got != tc.infoEnabled {
+				t.Fatalf("info enabled=%v, want %v", got, tc.infoEnabled)
+			}
+		})
+	}
+}
+
+func TestNewServerLoggerRejectsInvalidLogLevel(t *testing.T) {
+	tests := []string{"verbose", "dpanic", "panic", "fatal"}
+	for _, level := range tests {
+		t.Run(level, func(t *testing.T) {
+			t.Setenv(envLogLevel, level)
+			if _, err := NewServerLogger(); err == nil {
+				t.Fatal("expected invalid log level error")
+			}
+		})
+	}
+}
+
 func TestBenchTimingLogEnabledCachesUntilReset(t *testing.T) {
 	resetBenchTimingLogEnabledForTest()
 	t.Cleanup(resetBenchTimingLogEnabledForTest)

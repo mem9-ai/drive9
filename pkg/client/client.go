@@ -183,6 +183,7 @@ type StatResult struct {
 type StatMetadataResult struct {
 	Size         int64             `json:"size"`
 	IsDir        bool              `json:"isdir"`
+	ResourceID   string            `json:"resource_id,omitempty"`
 	Revision     int64             `json:"revision"`
 	Mtime        *int64            `json:"mtime,omitempty"` // Unix seconds when known
 	ContentType  string            `json:"content_type"`

@@ -296,6 +296,59 @@ func TestSemanticWorkerProcessesAudioExtractTaskWithoutEmbedder(t *testing.T) {
 	}
 }
 
+func TestSemanticWorkerDeadLettersNonRetryableAudioExtractError(t *testing.T) {
+	extractErr := &backend.AudioExtractAPIError{
+		Provider:   "qwen asr",
+		StatusCode: http.StatusBadRequest,
+		Message:    "<400> InternalError.Algo.InvalidParameter: The audio format is illegal and cannot be opened",
+	}
+	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: backend.AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: staticServerAudioExtractor{err: extractErr},
+		},
+	})
+	fileID := insertServerImageFileForExtractTest(t, b, "/rec/bad.mp3", "audio/mpeg", []byte{0xff, 0xf3})
+	payload, err := json.Marshal(semantic.AudioExtractTaskPayload{Path: "/rec/bad.mp3", ContentType: "audio/mpeg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := b.Store().EnqueueSemanticTask(context.Background(), &semantic.Task{
+		TaskID:          "audio-task-non-retryable",
+		TaskType:        semantic.TaskTypeAudioExtractText,
+		ResourceID:      fileID,
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     5,
+		AvailableAt:     now,
+		PayloadJSON:     payload,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewWithConfig(Config{Backend: b, SemanticWorkers: SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
+		RetryBaseDelay:  10 * time.Millisecond,
+	}})
+	t.Cleanup(func() { s.Close() })
+
+	waitForNamedTaskStatus(t, b, "audio-task-non-retryable", string(semantic.TaskDeadLettered), 3*time.Second)
+	task := mustGetServerSemanticTask(t, b, "audio-task-non-retryable")
+	if task.AttemptCount != 1 {
+		t.Fatalf("attempt_count=%d, want 1", task.AttemptCount)
+	}
+	if !strings.Contains(task.LastError, "audio format is illegal") {
+		t.Fatalf("last_error=%q, want audio format error", task.LastError)
+	}
+}
+
 func TestSemanticWorkerProcessesMP4AudioExtractTaskWithoutEmbedder(t *testing.T) {
 	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
 		DatabaseAutoEmbedding: true,
