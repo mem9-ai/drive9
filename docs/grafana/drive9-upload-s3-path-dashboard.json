@@ -772,7 +772,7 @@
         "type": "datasource"
       },
       {
-        "allValue": ".*",
+        "allValue": "/v1/uploads.*|/v2/uploads.*",
         "current": {
           "selected": true,
           "text": "All",
@@ -782,14 +782,14 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_http_requests_total{route=~\".*upload.*|.*presign.*\"}, route)",
+        "definition": "label_values(dat9_http_requests_total{route=~\"/v1/uploads.*|/v2/uploads.*\"}, route)",
         "hide": 0,
         "includeAll": true,
         "label": "HTTP Route",
         "multi": true,
         "name": "http_route",
         "options": [],
-        "query": "label_values(dat9_http_requests_total{route=~\".*upload.*|.*presign.*\"}, route)",
+        "query": "label_values(dat9_http_requests_total{route=~\"/v1/uploads.*|/v2/uploads.*\"}, route)",
         "refresh": 2,
         "regex": "",
         "sort": 1,

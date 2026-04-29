@@ -666,7 +666,7 @@
         "type": "datasource"
       },
       {
-        "allValue": ".*",
+        "allValue": "/v1/fs/.*",
         "current": {
           "selected": true,
           "text": "All",

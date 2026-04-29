@@ -677,7 +677,7 @@
         "type": "datasource"
       },
       {
-        "allValue": ".*",
+        "allValue": "/v1/.*|/v2/.*|/s3/.*",
         "current": {
           "selected": true,
           "text": "All",
@@ -687,14 +687,14 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_http_requests_total, route)",
+        "definition": "label_values(dat9_http_requests_total{route!~\"/healthz|/metrics|other\"}, route)",
         "hide": 0,
         "includeAll": true,
         "label": "Route",
         "multi": true,
         "name": "route",
         "options": [],
-        "query": "label_values(dat9_http_requests_total, route)",
+        "query": "label_values(dat9_http_requests_total{route!~\"/healthz|/metrics|other\"}, route)",
         "refresh": 2,
         "regex": "",
         "sort": 1,
