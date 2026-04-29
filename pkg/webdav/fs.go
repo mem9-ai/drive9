@@ -87,7 +87,7 @@ func (f *fileSystem) RemoveAll(ctx context.Context, name string) error {
 	if local == "/" {
 		return os.ErrInvalid
 	}
-	return mapError(f.client.RemoveAllCtx(ctx, f.remotePath(name)))
+	return mapError(f.client.RemoveAllCtx(ctx, mountpath.ToRemote(f.remoteRoot, local)))
 }
 
 func (f *fileSystem) Rename(ctx context.Context, oldName, newName string) error {
