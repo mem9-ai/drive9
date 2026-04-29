@@ -13,6 +13,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
+	"github.com/mem9-ai/dat9/pkg/tenantctx"
 	"github.com/mem9-ai/dat9/pkg/vault"
 	"go.uber.org/zap"
 )
@@ -37,7 +38,11 @@ func ScopeFromContext(ctx context.Context) *TenantScope {
 }
 
 func withScope(ctx context.Context, scope *TenantScope) context.Context {
-	return context.WithValue(ctx, tenantScopeKey, scope)
+	ctx = context.WithValue(ctx, tenantScopeKey, scope)
+	if scope == nil {
+		return ctx
+	}
+	return tenantctx.WithTenantID(ctx, scope.TenantID)
 }
 
 func authPhaseMs(start time.Time) float64 {
