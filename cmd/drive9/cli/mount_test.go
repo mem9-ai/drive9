@@ -238,21 +238,18 @@ func TestNormalizeLookupRetryCount(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // Row A — only the CURRENT backend keyword ("vault") is special. All other
-// first positionals flow into the legacy parser, which rejects extra
-// positionals instead of pre-reserving names for future backends.
+// bare-word first positionals (not :/path remote sources) are rejected when
+// two args are given, since the 2-arg form requires a remote source prefix.
 // ---------------------------------------------------------------------------
 
-func TestMountCmd_BareWordFirstArgFlowsToLegacyArityCheck(t *testing.T) {
+func TestMountCmd_BareWordFirstArgRejectsNonRemoteSource(t *testing.T) {
 	for _, s := range []string{"kv", "s3", "gcs", "nfs", "mnt", "tmp", "vaultdir", "data"} {
 		err := MountCmd([]string{s, "/mnt/x"})
 		if err == nil {
-			t.Fatalf("%q: expected positional-arity error", s)
+			t.Fatalf("%q: expected error for non-remote first arg", s)
 		}
-		if got := err.Error(); !strings.Contains(got, "exactly one mountpoint required") {
-			t.Fatalf("%q: error = %q, want positional-arity rejection", s, got)
-		}
-		if strings.Contains(err.Error(), "unsupported mount backend") {
-			t.Fatalf("%q: must not be rejected as reserved backend keyword", s)
+		if got := err.Error(); !strings.Contains(got, "must be a remote source") {
+			t.Fatalf("%q: error = %q, want remote-source rejection", s, got)
 		}
 	}
 }

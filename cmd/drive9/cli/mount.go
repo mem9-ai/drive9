@@ -11,6 +11,7 @@ import (
 
 	"github.com/mem9-ai/dat9/pkg/client"
 	drive9fuse "github.com/mem9-ai/dat9/pkg/fuse"
+	"github.com/mem9-ai/dat9/pkg/mountpath"
 	drive9webdav "github.com/mem9-ai/dat9/pkg/webdav"
 )
 
@@ -81,19 +82,39 @@ func fsMountCmd(args []string) error {
 	debug := fs.Bool("debug", false, "enable FUSE debug logging")
 
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: drive9 mount [flags] <mountpoint>\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "usage: drive9 mount [flags] [:/remote] <mountpoint>\n\nflags:\n")
 		fs.PrintDefaults()
 	}
 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() < 1 {
+
+	// Parse positional args: 1-arg = mountpoint; 2-arg = :/remote mountpoint.
+	var remoteRoot, mountPoint string
+	switch fs.NArg() {
+	case 1:
+		remoteRoot = "/"
+		mountPoint = fs.Arg(0)
+	case 2:
+		rp, ok := ParseRemote(fs.Arg(0))
+		if !ok {
+			return fmt.Errorf("drive9 mount: first positional argument must be a remote source (e.g. :/path), got %q", fs.Arg(0))
+		}
+		if rp.Context != "" {
+			return fmt.Errorf("drive9 mount: context-scoped remote sources (e.g. %s:/path) are not yet supported", rp.Context)
+		}
+		remoteRoot = rp.Path
+		mountPoint = fs.Arg(1)
+	default:
 		fs.Usage()
 		os.Exit(2)
 	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("drive9 mount: exactly one mountpoint required")
+
+	var err error
+	remoteRoot, err = mountpath.NormalizeRoot(remoteRoot)
+	if err != nil {
+		return fmt.Errorf("drive9 mount: %w", err)
 	}
 
 	mountMode, err := ParseMountMode(*mode)
@@ -105,8 +126,6 @@ func fsMountCmd(args []string) error {
 		return err
 	}
 	normalizedLookupRetryCount := normalizeLookupRetryCount(*lookupRetryCount)
-
-	mountPoint := fs.Arg(0)
 
 	serverGiven, apiKeyGiven := flagProvided(fs, "server"), flagProvided(fs, "api-key")
 	if err := rejectEmptyFlag("server", *server, serverGiven); err != nil {
@@ -139,11 +158,13 @@ func fsMountCmd(args []string) error {
 		} else {
 			c = client.New(*server, *apiKey)
 		}
-		if _, err := c.List("/"); err != nil {
-			return fmt.Errorf("cannot reach dat9 server: %w", err)
+
+		// Validate remote root exists and is a directory.
+		if err := validateRemoteRoot(c, remoteRoot); err != nil {
+			return err
 		}
 
-		return webdavMount(c, mountPoint)
+		return webdavMount(c, mountPoint, remoteRoot)
 	}
 
 	// FUSE path (existing behavior).
@@ -157,6 +178,7 @@ func fsMountCmd(args []string) error {
 		APIKey:             *apiKey,
 		Token:              token,
 		MountPoint:         mountPoint,
+		RemoteRoot:         remoteRoot,
 		CacheDir:           *cacheDir,
 		CacheSize:          int64(*cacheSize) << 20,
 		DirTTL:             *dirTTL,
@@ -176,8 +198,27 @@ func fsMountCmd(args []string) error {
 }
 
 // newWebDAVHandler creates an http.Handler that serves drive9 content over WebDAV.
-func newWebDAVHandler(c *client.Client, prefix string) (http.Handler, error) {
-	return drive9webdav.NewHandler(c, drive9webdav.Options{Prefix: prefix}), nil
+func newWebDAVHandler(c *client.Client, prefix string, remoteRoot string) (http.Handler, error) {
+	return drive9webdav.NewHandler(c, drive9webdav.Options{Prefix: prefix, RemoteRoot: remoteRoot}), nil
+}
+
+// validateRemoteRoot checks that the remote root path exists and is a directory.
+func validateRemoteRoot(c *client.Client, remoteRoot string) error {
+	if remoteRoot == "/" {
+		// Root always exists; verify server connectivity via List.
+		if _, err := c.List("/"); err != nil {
+			return fmt.Errorf("cannot reach dat9 server: %w", err)
+		}
+		return nil
+	}
+	stat, err := c.Stat(remoteRoot)
+	if err != nil {
+		return fmt.Errorf("remote root %q: %w", remoteRoot, err)
+	}
+	if !stat.IsDir {
+		return fmt.Errorf("remote root %q is not a directory", remoteRoot)
+	}
+	return nil
 }
 
 func validateLookupRetryFlags(count int, timeout time.Duration) error {

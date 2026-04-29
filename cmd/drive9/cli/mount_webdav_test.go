@@ -150,7 +150,7 @@ func TestMountCmd_WebDAVRejectsReadOnly(t *testing.T) {
 // TestNewWebDAVHandler verifies the handler constructor doesn't panic.
 func TestNewWebDAVHandler(t *testing.T) {
 	c := client.New("http://127.0.0.1:1", "test-key")
-	handler, err := newWebDAVHandler(c, "/_drive9_test")
+	handler, err := newWebDAVHandler(c, "/_drive9_test", "/")
 	if err != nil {
 		t.Fatalf("newWebDAVHandler returned error: %v", err)
 	}
@@ -319,6 +319,55 @@ func TestParseMountModeRoundTrip(t *testing.T) {
 // helper isn't available due to build tags, duplicate it here.
 func init() {
 	_ = errors.New // ensure import used
+}
+
+// ---------------------------------------------------------------------------
+// Remote root mount (:/remote /local) CLI parsing tests
+// ---------------------------------------------------------------------------
+
+func TestFsMountCmd_RemoteSourceParsing(t *testing.T) {
+	// 2-arg with valid remote source should parse (will fail at credential
+	// resolution, but that proves parsing succeeded).
+	err := fsMountCmd([]string{":/foo/bar", "/tmp/drive9-remote-test"})
+	if err == nil {
+		t.Fatal("expected credential error, not nil")
+	}
+	// Should NOT contain "must be a remote source" — that means parsing worked.
+	if strings.Contains(err.Error(), "must be a remote source") {
+		t.Fatalf("error = %v, should have parsed remote source successfully", err)
+	}
+}
+
+func TestFsMountCmd_RejectsNonRemoteFirstArg(t *testing.T) {
+	err := fsMountCmd([]string{"/foo/bar", "/tmp/drive9-test"})
+	if err == nil {
+		t.Fatal("expected error for non-remote first arg")
+	}
+	if !strings.Contains(err.Error(), "must be a remote source") {
+		t.Fatalf("error = %v, want remote-source rejection", err)
+	}
+}
+
+func TestFsMountCmd_RejectsContextScopedRemote(t *testing.T) {
+	err := fsMountCmd([]string{"prod:/foo/bar", "/tmp/drive9-test"})
+	if err == nil {
+		t.Fatal("expected error for context-scoped remote")
+	}
+	if !strings.Contains(err.Error(), "not yet supported") {
+		t.Fatalf("error = %v, want context-scoped rejection", err)
+	}
+}
+
+func TestFsMountCmd_SingleArgDefaultsToRootRemote(t *testing.T) {
+	// Single arg should work (fail at credentials, not at parsing).
+	err := fsMountCmd([]string{"/tmp/drive9-single-arg-test"})
+	if err == nil {
+		t.Fatal("expected credential error, not nil")
+	}
+	// Should NOT contain "remote source" error.
+	if strings.Contains(err.Error(), "remote source") {
+		t.Fatalf("single arg should not trigger remote-source error: %v", err)
+	}
 }
 
 func newWebDAVLifecycleClient(t *testing.T) *client.Client {

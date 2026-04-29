@@ -72,24 +72,26 @@ type WebDAVMountHandler interface {
 
 // webdavMount starts a local WebDAV server bound to 127.0.0.1, invokes
 // mount_webdav to attach it to mountPoint, and blocks until SIGINT/SIGTERM.
-func webdavMount(c *client.Client, mountPoint string) error {
+func webdavMount(c *client.Client, mountPoint string, remoteRoot string) error {
 	return webdavMountWithDeps(c, mountPoint, webdavMountDeps{
-		goos:      runtime.GOOS,
-		signals:   signalChannel(),
-		runMount:  runWebDAVMountCmd,
-		unmount:   webdavUnmount,
-		exit:      os.Exit,
-		newPrefix: newWebDAVNoncePrefix,
+		goos:       runtime.GOOS,
+		signals:    signalChannel(),
+		runMount:   runWebDAVMountCmd,
+		unmount:    webdavUnmount,
+		exit:       os.Exit,
+		newPrefix:  newWebDAVNoncePrefix,
+		remoteRoot: remoteRoot,
 	})
 }
 
 type webdavMountDeps struct {
-	goos      string
-	signals   <-chan os.Signal
-	runMount  func(goos, serverURL, mountPoint string) error
-	unmount   func(goos, mountPoint string)
-	exit      func(code int)
-	newPrefix func() (string, error)
+	goos       string
+	signals    <-chan os.Signal
+	runMount   func(goos, serverURL, mountPoint string) error
+	unmount    func(goos, mountPoint string)
+	exit       func(code int)
+	newPrefix  func() (string, error)
+	remoteRoot string
 }
 
 func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDeps) error {
@@ -123,7 +125,11 @@ func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDe
 	if err != nil {
 		return err
 	}
-	handler, err := newWebDAVHandler(c, prefix)
+	remoteRoot := deps.remoteRoot
+	if remoteRoot == "" {
+		remoteRoot = "/"
+	}
+	handler, err := newWebDAVHandler(c, prefix, remoteRoot)
 	if err != nil {
 		return fmt.Errorf("webdav: %w", err)
 	}

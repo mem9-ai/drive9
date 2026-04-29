@@ -357,8 +357,13 @@ func fsyncDir(dir string) error {
 }
 
 // MountHash computes a short hash to distinguish cache directories for
-// different server+mountpoint combinations.
-func MountHash(serverURL, mountPoint string) string {
-	h := sha256.Sum256([]byte(serverURL + "\x00" + mountPoint))
+// different server+mountpoint+remoteRoot combinations. RemoteRoot defaults
+// to "/" so existing caches (which implicitly used root) remain stable.
+func MountHash(serverURL, mountPoint string, remoteRoot ...string) string {
+	root := "/"
+	if len(remoteRoot) > 0 && remoteRoot[0] != "" {
+		root = remoteRoot[0]
+	}
+	h := sha256.Sum256([]byte(serverURL + "\x00" + mountPoint + "\x00" + root))
 	return hex.EncodeToString(h[:8]) // 16 hex chars
 }
