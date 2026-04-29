@@ -3,13 +3,16 @@ package webdav
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
@@ -21,6 +24,7 @@ import (
 type fileSystem struct {
 	client     *client.Client
 	remoteRoot string // normalized remote root path, default "/"
+	props      *deadPropStore
 }
 
 var _ webdav.FileSystem = (*fileSystem)(nil)
@@ -28,6 +32,13 @@ var _ webdav.FileSystem = (*fileSystem)(nil)
 // remotePath maps a local WebDAV path to the remote drive9 path.
 func (f *fileSystem) remotePath(localPath string) string {
 	return mountpath.ToRemote(f.remoteRoot, normPath(localPath))
+}
+
+func (f *fileSystem) deadProps() *deadPropStore {
+	if f.props == nil {
+		f.props = newDeadPropStore()
+	}
+	return f.props
 }
 
 func (f *fileSystem) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
@@ -51,7 +62,7 @@ func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm o
 		if !parent.IsDir {
 			return nil, os.ErrInvalid
 		}
-		return &writeFile{client: f.client, path: remote}, nil
+		return &writeFile{client: f.client, path: remote, props: f.deadProps()}, nil
 	}
 
 	// Stat to determine if it's a directory or file.
@@ -65,7 +76,7 @@ func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm o
 		if err != nil {
 			return nil, mapError(err)
 		}
-		return &dirFile{path: local, stat: stat, entries: entries}, nil
+		return &dirFile{path: local, propPath: remote, props: f.deadProps(), stat: stat, entries: entries}, nil
 	}
 
 	// Read entire file content. For the lightweight skills/config use case
@@ -76,9 +87,11 @@ func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm o
 	}
 
 	return &readFile{
-		path:   local,
-		stat:   stat,
-		Reader: bytes.NewReader(data),
+		path:     local,
+		propPath: remote,
+		props:    f.deadProps(),
+		stat:     stat,
+		Reader:   bytes.NewReader(data),
 	}, nil
 }
 
@@ -87,7 +100,12 @@ func (f *fileSystem) RemoveAll(ctx context.Context, name string) error {
 	if local == "/" {
 		return os.ErrInvalid
 	}
-	return mapError(f.client.RemoveAllCtx(ctx, mountpath.ToRemote(f.remoteRoot, local)))
+	remote := mountpath.ToRemote(f.remoteRoot, local)
+	if err := mapError(f.client.RemoveAllCtx(ctx, remote)); err != nil {
+		return err
+	}
+	f.deadProps().deleteTree(remote)
+	return nil
 }
 
 func (f *fileSystem) Rename(ctx context.Context, oldName, newName string) error {
@@ -97,7 +115,11 @@ func (f *fileSystem) Rename(ctx context.Context, oldName, newName string) error 
 	}
 	oldRemote := mountpath.ToRemote(f.remoteRoot, oldLocal)
 	newRemote := mountpath.ToRemote(f.remoteRoot, newLocal)
-	return mapError(f.client.RenameCtx(ctx, oldRemote, newRemote))
+	if err := mapError(f.client.RenameCtx(ctx, oldRemote, newRemote)); err != nil {
+		return err
+	}
+	f.deadProps().renameTree(oldRemote, newRemote)
+	return nil
 }
 
 func (f *fileSystem) Stat(ctx context.Context, name string) (os.FileInfo, error) {
@@ -164,15 +186,132 @@ func (fi *fileInfo) Mode() os.FileMode {
 	return 0o644
 }
 
+type deadPropStore struct {
+	mu    sync.Mutex
+	props map[string]map[xml.Name]webdav.Property
+}
+
+func newDeadPropStore() *deadPropStore {
+	return &deadPropStore{props: make(map[string]map[xml.Name]webdav.Property)}
+}
+
+func (s *deadPropStore) deadProps(name string) (map[xml.Name]webdav.Property, error) {
+	if s == nil {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current := s.props[name]
+	if len(current) == 0 {
+		return nil, nil
+	}
+	out := make(map[xml.Name]webdav.Property, len(current))
+	for k, v := range current {
+		out[k] = v
+	}
+	return out, nil
+}
+
+func (s *deadPropStore) patch(name string, patches []webdav.Proppatch) ([]webdav.Propstat, error) {
+	if s == nil {
+		pstat := webdav.Propstat{Status: http.StatusOK}
+		for _, patch := range patches {
+			for _, p := range patch.Props {
+				pstat.Props = append(pstat.Props, webdav.Property{XMLName: p.XMLName})
+			}
+		}
+		return []webdav.Propstat{pstat}, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current := s.props[name]
+	for _, patch := range patches {
+		for _, p := range patch.Props {
+			if current == nil && !patch.Remove {
+				current = make(map[xml.Name]webdav.Property)
+				s.props[name] = current
+			}
+			if patch.Remove {
+				delete(current, p.XMLName)
+				continue
+			}
+			current[p.XMLName] = p
+		}
+	}
+	if len(current) == 0 {
+		delete(s.props, name)
+	}
+
+	pstat := webdav.Propstat{Status: http.StatusOK}
+	for _, patch := range patches {
+		for _, p := range patch.Props {
+			pstat.Props = append(pstat.Props, webdav.Property{XMLName: p.XMLName})
+		}
+	}
+	return []webdav.Propstat{pstat}, nil
+}
+
+func (s *deadPropStore) deleteTree(name string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	prefix := treePrefix(name)
+	for p := range s.props {
+		if p == name || strings.HasPrefix(p, prefix) {
+			delete(s.props, p)
+		}
+	}
+}
+
+func (s *deadPropStore) renameTree(oldName, newName string) {
+	if s == nil || oldName == newName {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	oldPrefix := treePrefix(oldName)
+	updates := make(map[string]map[xml.Name]webdav.Property)
+	for p, props := range s.props {
+		switch {
+		case p == oldName:
+			updates[newName] = props
+			delete(s.props, p)
+		case strings.HasPrefix(p, oldPrefix):
+			updates[newName+strings.TrimPrefix(p, oldName)] = props
+			delete(s.props, p)
+		}
+	}
+	for p, props := range updates {
+		s.props[p] = props
+	}
+}
+
+func treePrefix(name string) string {
+	if strings.HasSuffix(name, "/") {
+		return name
+	}
+	return name + "/"
+}
+
 // dirFile is a webdav.File for directories.
 type dirFile struct {
-	path    string
-	stat    *client.StatResult
-	entries []client.FileInfo
-	pos     int
+	path     string
+	propPath string
+	props    *deadPropStore
+	stat     *client.StatResult
+	entries  []client.FileInfo
+	pos      int
 }
 
 var _ webdav.File = (*dirFile)(nil)
+var _ webdav.DeadPropsHolder = (*dirFile)(nil)
 
 func (d *dirFile) Close() error                   { return nil }
 func (d *dirFile) Read([]byte) (int, error)       { return 0, fmt.Errorf("is a directory") }
@@ -181,6 +320,14 @@ func (d *dirFile) Seek(int64, int) (int64, error) { return 0, fmt.Errorf("is a d
 
 func (d *dirFile) Stat() (os.FileInfo, error) {
 	return &fileInfo{name: path.Base(d.path), stat: d.stat}, nil
+}
+
+func (d *dirFile) DeadProps() (map[xml.Name]webdav.Property, error) {
+	return d.props.deadProps(d.propPath)
+}
+
+func (d *dirFile) Patch(patches []webdav.Proppatch) ([]webdav.Propstat, error) {
+	return d.props.patch(d.propPath, patches)
 }
 
 func (d *dirFile) Readdir(count int) ([]fs.FileInfo, error) {
@@ -217,12 +364,15 @@ func (d *dirFile) Readdir(count int) ([]fs.FileInfo, error) {
 
 // readFile is a webdav.File for reading file content.
 type readFile struct {
-	path string
-	stat *client.StatResult
+	path     string
+	propPath string
+	props    *deadPropStore
+	stat     *client.StatResult
 	*bytes.Reader
 }
 
 var _ webdav.File = (*readFile)(nil)
+var _ webdav.DeadPropsHolder = (*readFile)(nil)
 
 func (r *readFile) Close() error                       { return nil }
 func (r *readFile) Write([]byte) (int, error)          { return 0, fmt.Errorf("read-only") }
@@ -231,14 +381,24 @@ func (r *readFile) Stat() (os.FileInfo, error) {
 	return &fileInfo{name: path.Base(r.path), stat: r.stat}, nil
 }
 
+func (r *readFile) DeadProps() (map[xml.Name]webdav.Property, error) {
+	return r.props.deadProps(r.propPath)
+}
+
+func (r *readFile) Patch(patches []webdav.Proppatch) ([]webdav.Propstat, error) {
+	return r.props.patch(r.propPath, patches)
+}
+
 // writeFile is a webdav.File that buffers writes and flushes on Close.
 type writeFile struct {
 	client *client.Client
 	path   string
+	props  *deadPropStore
 	buf    bytes.Buffer
 }
 
 var _ webdav.File = (*writeFile)(nil)
+var _ webdav.DeadPropsHolder = (*writeFile)(nil)
 
 func (w *writeFile) Read([]byte) (int, error)           { return 0, fmt.Errorf("write-only") }
 func (w *writeFile) Readdir(int) ([]fs.FileInfo, error) { return nil, fmt.Errorf("not a directory") }
@@ -262,4 +422,12 @@ func (w *writeFile) Stat() (os.FileInfo, error) {
 		name: path.Base(w.path),
 		stat: &client.StatResult{Size: int64(w.buf.Len())},
 	}, nil
+}
+
+func (w *writeFile) DeadProps() (map[xml.Name]webdav.Property, error) {
+	return w.props.deadProps(w.path)
+}
+
+func (w *writeFile) Patch(patches []webdav.Proppatch) ([]webdav.Propstat, error) {
+	return w.props.patch(w.path, patches)
 }

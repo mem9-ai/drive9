@@ -212,6 +212,64 @@ func TestHandlerPutMissingParentReturnsConflict(t *testing.T) {
 	}
 }
 
+func TestHandlerProppatchDeadPropertySucceeds(t *testing.T) {
+	c := newDeadPropTestClient(t)
+	handler := NewHandler(c, Options{})
+
+	body := `<?xml version="1.0"?>` +
+		`<D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:">` +
+		`<D:set><D:prop><Z:Win32FileAttributes>00000020</Z:Win32FileAttributes></D:prop></D:set>` +
+		`</D:propertyupdate>`
+	req := httptest.NewRequest("PROPPATCH", "/dir/file.txt", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/xml")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != 207 {
+		t.Fatalf("PROPPATCH status = %d, want 207: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "HTTP/1.1 200 OK") {
+		t.Fatalf("PROPPATCH body = %q, want 200 propstat", rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "HTTP/1.1 403 Forbidden") {
+		t.Fatalf("PROPPATCH body = %q, must not reject dead property", rr.Body.String())
+	}
+}
+
+func TestHandlerPropfindReturnsPatchedDeadProperty(t *testing.T) {
+	c := newDeadPropTestClient(t)
+	handler := NewHandler(c, Options{})
+
+	patchBody := `<?xml version="1.0"?>` +
+		`<D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:">` +
+		`<D:set><D:prop><Z:Win32FileAttributes>00000020</Z:Win32FileAttributes></D:prop></D:set>` +
+		`</D:propertyupdate>`
+	patchReq := httptest.NewRequest("PROPPATCH", "/dir/file.txt", strings.NewReader(patchBody))
+	patchReq.Header.Set("Content-Type", "application/xml")
+	patchRR := httptest.NewRecorder()
+	handler.ServeHTTP(patchRR, patchReq)
+	if patchRR.Code != 207 {
+		t.Fatalf("PROPPATCH status = %d, want 207: %s", patchRR.Code, patchRR.Body.String())
+	}
+
+	findBody := `<?xml version="1.0"?>` +
+		`<D:propfind xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:">` +
+		`<D:prop><Z:Win32FileAttributes/></D:prop>` +
+		`</D:propfind>`
+	findReq := httptest.NewRequest("PROPFIND", "/dir/file.txt", strings.NewReader(findBody))
+	findReq.Header.Set("Depth", "0")
+	findReq.Header.Set("Content-Type", "application/xml")
+	findRR := httptest.NewRecorder()
+	handler.ServeHTTP(findRR, findReq)
+
+	if findRR.Code != 207 {
+		t.Fatalf("PROPFIND status = %d, want 207: %s", findRR.Code, findRR.Body.String())
+	}
+	if !strings.Contains(findRR.Body.String(), "00000020") {
+		t.Fatalf("PROPFIND body = %q, want patched property value", findRR.Body.String())
+	}
+}
+
 func TestReadFileSeekAndRead(t *testing.T) {
 	data := []byte("hello world")
 	rf := &readFile{
@@ -379,6 +437,46 @@ func newWriteOnlyTestClient(t *testing.T, onWrite func(string)) *client.Client {
 			_ = json.NewEncoder(w).Encode(struct {
 				Revision int64 `json:"revision"`
 			}{Revision: 1})
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(struct {
+				Error string `json:"error"`
+			}{Error: "not found"})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return client.New(srv.URL, "test-key")
+}
+
+func newDeadPropTestClient(t *testing.T) *client.Client {
+	t.Helper()
+	files := map[string][]byte{
+		"/v1/fs/dir/file.txt": []byte("payload"),
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/dir":
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/dir/file.txt":
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("Content-Length", "7")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/dir/file.txt":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(files[r.URL.Path])
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/dir/file.txt":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll body: %v", err)
+			}
+			files[r.URL.Path] = body
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(struct {
+				Revision int64 `json:"revision"`
+			}{Revision: 2})
 		default:
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
