@@ -15,6 +15,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/mountpath"
 )
 
 // MountOptions configures the FUSE mount.
@@ -123,10 +124,11 @@ func Mount(opts *MountOptions) error {
 	c.SetActor(actorID)
 
 	// Validate remote root (or server connectivity for root mounts).
-	remoteRoot := opts.RemoteRoot
-	if remoteRoot == "" {
-		remoteRoot = "/"
+	remoteRoot, err := mountpath.NormalizeRoot(opts.RemoteRoot)
+	if err != nil {
+		return fmt.Errorf("mount: %w", err)
 	}
+	opts.RemoteRoot = remoteRoot
 	if remoteRoot == "/" {
 		if _, err := c.List("/"); err != nil {
 			return fmt.Errorf("cannot reach dat9 server: %w", err)
@@ -226,14 +228,14 @@ func Mount(opts *MountOptions) error {
 
 			// Initialize CommitQueue for background remote commits.
 			if shadowStore != nil && pendingIdx != nil {
-				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, maxCommitQueuePending)
+				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, maxCommitQueuePending, opts.RemoteRoot)
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess
 				cq.RecoverPending()
 				dat9fs.commitQueue = cq
 			}
 
 			if wbCache != nil {
-				uploader := NewWriteBackUploader(c, wbCache, opts.UploadConcurrency)
+				uploader := NewWriteBackUploader(c, wbCache, opts.UploadConcurrency, opts.RemoteRoot)
 				dat9fs.SetWriteBack(wbCache, uploader)
 				// Recover pending uploads only when the newer commit queue is
 				// unavailable. Otherwise commitQueue owns shadow-backed recovery.

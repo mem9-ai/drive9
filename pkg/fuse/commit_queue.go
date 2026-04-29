@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/mountpath"
 )
 
 // commitQueueDirectPutThreshold is the size limit below which commit queue
@@ -45,6 +46,7 @@ type CommitQueue struct {
 	canceled   map[string]struct{} // paths canceled by Unlink/Rmdir (workers skip these)
 	maxPending int
 	client     *client.Client
+	remoteRoot string
 	shadows    *ShadowStore
 	index      *PendingIndex
 	journal    *Journal
@@ -61,12 +63,16 @@ type CommitQueue struct {
 }
 
 // NewCommitQueue creates a CommitQueue with background workers.
-func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex, journal *Journal, numWorkers int, maxPending int) *CommitQueue {
+func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex, journal *Journal, numWorkers int, maxPending int, remoteRoot ...string) *CommitQueue {
 	if numWorkers <= 0 {
 		numWorkers = 4
 	}
 	if maxPending <= 0 {
 		maxPending = maxCommitQueuePending
+	}
+	root := "/"
+	if len(remoteRoot) > 0 && remoteRoot[0] != "" {
+		root = remoteRoot[0]
 	}
 	// Buffer must be > maxPending so Enqueue's send never blocks.
 	bufSize := maxPending * 2
@@ -76,6 +82,7 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 	cq := &CommitQueue{
 		maxPending: maxPending,
 		client:     c,
+		remoteRoot: root,
 		shadows:    shadows,
 		index:      index,
 		journal:    journal,
@@ -88,6 +95,14 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 		go cq.worker()
 	}
 	return cq
+}
+
+func (cq *CommitQueue) remotePath(localPath string) string {
+	root := "/"
+	if cq != nil && cq.remoteRoot != "" {
+		root = cq.remoteRoot
+	}
+	return mountpath.ToRemote(root, localPath)
 }
 
 // Enqueue adds a commit entry to the queue. Returns an error if the queue
@@ -380,11 +395,12 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	if entry.Kind == PendingOverwrite && expectedRevision <= 0 {
 		return 0, fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
 	}
+	apiPath := cq.remotePath(entry.Path)
 
 	// ShadowSpill entries: stream directly from shadow file to avoid loading
 	// multi-GiB files into memory. Uses io.SectionReader over the shadow fd.
 	if entry.ShadowSpill {
-		return 0, uploadFromShadow(ctx, cq.client, cq.shadows, entry.Path, expectedRevision)
+		return 0, uploadFromShadowRemote(ctx, cq.client, cq.shadows, entry.Path, apiPath, expectedRevision)
 	}
 
 	// Non-ShadowSpill: read full content into memory.
@@ -397,12 +413,12 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	// Files under commitQueueDirectPutThreshold use direct PUT to skip the
 	// multipart initiate/presign/complete/finalize overhead (~440ms).
 	if entry.Size < commitQueueDirectPutThreshold {
-		committedRev, err := cq.client.WriteCtxConditionalWithRevision(ctx, entry.Path, data, expectedRevision)
+		committedRev, err := cq.client.WriteCtxConditionalWithRevision(ctx, apiPath, data, expectedRevision)
 		return committedRev, err
 	}
 
 	// Larger non-ShadowSpill files: multipart upload.
-	return 0, uploadBufferedRemoteFile(ctx, cq.client, entry.Path, data, expectedRevision)
+	return 0, uploadBufferedRemoteFile(ctx, cq.client, apiPath, data, expectedRevision)
 }
 
 func (cq *CommitQueue) removeFromQueue(entry *CommitEntry) {
@@ -494,11 +510,12 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 		cq.onCommitTerminalFailure(entry)
 		return
 	}
+	apiPath := cq.remotePath(entry.Path)
 
 	// Fetch server's current state: revision + content.
 	// Use per-RPC timeouts so that a slow Read doesn't starve the Upload budget.
 	statCtx, statCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	stat, err := cq.client.StatCtx(statCtx, entry.Path)
+	stat, err := cq.client.StatCtx(statCtx, apiPath)
 	statCancel()
 	if err != nil {
 		log.Printf("commit queue: auto-resolve failed for %s: stat: %v", entry.Path, err)
@@ -508,7 +525,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	serverRev := stat.Revision
 
 	readCtx, readCancel := context.WithTimeout(context.Background(), uploadTimeout)
-	serverData, err := cq.client.ReadCtx(readCtx, entry.Path)
+	serverData, err := cq.client.ReadCtx(readCtx, apiPath)
 	readCancel()
 	if err != nil {
 		log.Printf("commit queue: auto-resolve failed for %s: read server: %v", entry.Path, err)
@@ -532,7 +549,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	}
 	log.Printf("commit queue: auto-resolving conflict for %s via LWW (base rev %d → server rev %d)", entry.Path, entry.BaseRev, serverRev)
 	uploadCtx, uploadCancel := context.WithTimeout(context.Background(), releaseTimeout(int64(len(localData))))
-	err = uploadBufferedRemoteFile(uploadCtx, cq.client, entry.Path, localData, serverRev)
+	err = uploadBufferedRemoteFile(uploadCtx, cq.client, apiPath, localData, serverRev)
 	uploadCancel()
 	if err != nil {
 		log.Printf("commit queue: auto-resolve LWW re-upload failed for %s: %v", entry.Path, err)
