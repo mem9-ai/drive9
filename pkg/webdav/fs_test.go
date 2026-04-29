@@ -249,6 +249,117 @@ func TestReadFileSeekAndRead(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Remote root mount tests — verify path mapping in fileSystem
+// ---------------------------------------------------------------------------
+
+func TestRemoteRootStatMapsPath(t *testing.T) {
+	var statPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			statPath = r.URL.Path
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Size", "42")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "test-key")
+	fs := &fileSystem{client: c, remoteRoot: "/project/data"}
+
+	_, err := fs.Stat(t.Context(), "/readme.txt")
+	if err != nil {
+		t.Fatalf("Stat error: %v", err)
+	}
+	// The server should have received a stat for /project/data/readme.txt
+	if statPath != "/v1/fs/project/data/readme.txt" {
+		t.Fatalf("server saw stat path %q, want /v1/fs/project/data/readme.txt", statPath)
+	}
+}
+
+func TestRemoteRootMkdirMapsPath(t *testing.T) {
+	var mkdirPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Get("mkdir") != "" {
+			mkdirPath = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
+		// MkdirCtx also accepts this form
+		if r.Method == http.MethodPost && strings.Contains(r.URL.RawQuery, "mkdir") {
+			mkdirPath = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "test-key")
+	fs := &fileSystem{client: c, remoteRoot: "/project"}
+
+	_ = fs.Mkdir(t.Context(), "/newdir", 0o755)
+	if mkdirPath != "/v1/fs/project/newdir" {
+		t.Fatalf("server saw mkdir path %q, want /v1/fs/project/newdir", mkdirPath)
+	}
+}
+
+func TestRemoteRootRootStatMapsToRemoteRoot(t *testing.T) {
+	var statPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			statPath = r.URL.Path
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "test-key")
+	fs := &fileSystem{client: c, remoteRoot: "/project/data"}
+
+	_, err := fs.Stat(t.Context(), "/")
+	if err != nil {
+		t.Fatalf("Stat error: %v", err)
+	}
+	if statPath != "/v1/fs/project/data" {
+		t.Fatalf("root stat mapped to %q, want /v1/fs/project/data", statPath)
+	}
+}
+
+func TestRemoteRootDefaultIsRoot(t *testing.T) {
+	var statPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			statPath = r.URL.Path
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "test-key")
+	// remoteRoot "/" means no prefix mapping.
+	fs := &fileSystem{client: c, remoteRoot: "/"}
+
+	_, err := fs.Stat(t.Context(), "/foo")
+	if err != nil {
+		t.Fatalf("Stat error: %v", err)
+	}
+	if statPath != "/v1/fs/foo" {
+		t.Fatalf("stat mapped to %q, want /v1/fs/foo", statPath)
+	}
+}
+
 func newWriteOnlyTestClient(t *testing.T, onWrite func(string)) *client.Client {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

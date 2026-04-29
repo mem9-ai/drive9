@@ -16,13 +16,21 @@ type Options struct {
 	// Prefix is the URL path prefix stripped before mapping to drive9 paths.
 	// Empty means no prefix (root mount).
 	Prefix string
+
+	// RemoteRoot is the remote drive9 directory that becomes the mount root.
+	// Empty or "/" means the entire remote filesystem.
+	RemoteRoot string
 }
 
 // NewHandler returns an http.Handler that serves drive9 content over WebDAV.
 func NewHandler(c *client.Client, opts Options) http.Handler {
+	remoteRoot := opts.RemoteRoot
+	if remoteRoot == "" {
+		remoteRoot = "/"
+	}
 	return &webdav.Handler{
 		Prefix:     opts.Prefix,
-		FileSystem: &fileSystem{client: c},
+		FileSystem: &fileSystem{client: c, remoteRoot: remoteRoot},
 		LockSystem: webdav.NewMemLS(),
 	}
 }

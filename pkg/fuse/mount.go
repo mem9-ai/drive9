@@ -30,6 +30,7 @@ type MountOptions struct {
 	APIKey             string        // owner API key (mutually exclusive with Token)
 	Token              string        // delegated capability JWT (mutually exclusive with APIKey)
 	MountPoint         string        // local mount point
+	RemoteRoot         string        // remote subtree root (default "/"); set via "drive9 mount :/path /local"
 	CacheDir           string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
 	CacheSize          int64         // ReadCache max size in bytes (default 128MB)
 	DirTTL             time.Duration // DirCache TTL (default 10s)
@@ -120,8 +121,24 @@ func Mount(opts *MountOptions) error {
 		c = client.New(opts.Server, opts.APIKey)
 	}
 	c.SetActor(actorID)
-	if _, err := c.List("/"); err != nil {
-		return fmt.Errorf("cannot reach dat9 server: %w", err)
+
+	// Validate remote root (or server connectivity for root mounts).
+	remoteRoot := opts.RemoteRoot
+	if remoteRoot == "" {
+		remoteRoot = "/"
+	}
+	if remoteRoot == "/" {
+		if _, err := c.List("/"); err != nil {
+			return fmt.Errorf("cannot reach dat9 server: %w", err)
+		}
+	} else {
+		stat, err := c.Stat(remoteRoot)
+		if err != nil {
+			return fmt.Errorf("remote root %q: %w", remoteRoot, err)
+		}
+		if !stat.IsDir {
+			return fmt.Errorf("remote root %q is not a directory", remoteRoot)
+		}
 	}
 
 	// Build FUSE filesystem
@@ -142,7 +159,7 @@ func Mount(opts *MountOptions) error {
 			}
 		}
 		if cacheBase != "" {
-			mh := MountHash(opts.Server, opts.MountPoint)
+			mh := MountHash(opts.Server, opts.MountPoint, opts.RemoteRoot)
 			pendingDir := filepath.Join(cacheBase, mh, "pending")
 			shadowDir := filepath.Join(cacheBase, mh, "shadow")
 

@@ -13,89 +13,101 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/mountpath"
 	"golang.org/x/net/webdav"
 )
 
 // fileSystem implements webdav.FileSystem over a drive9 client.
 type fileSystem struct {
-	client *client.Client
+	client     *client.Client
+	remoteRoot string // normalized remote root path, default "/"
 }
 
 var _ webdav.FileSystem = (*fileSystem)(nil)
 
+// remotePath maps a local WebDAV path to the remote drive9 path.
+func (f *fileSystem) remotePath(localPath string) string {
+	return mountpath.ToRemote(f.remoteRoot, normPath(localPath))
+}
+
 func (f *fileSystem) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
-	return mapError(f.client.MkdirCtx(ctx, normPath(name)))
+	return mapError(f.client.MkdirCtx(ctx, f.remotePath(name)))
 }
 
 func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
-	p := normPath(name)
+	local := normPath(name)
+	remote := mountpath.ToRemote(f.remoteRoot, local)
 
 	// For create/truncate: return a writable file handle.
 	if flag&(os.O_CREATE|os.O_TRUNC) != 0 {
-		if p == "/" {
+		if local == "/" {
 			return nil, os.ErrInvalid
 		}
-		parent, err := f.client.StatCtx(ctx, path.Dir(p))
+		parentRemote := mountpath.ToRemote(f.remoteRoot, path.Dir(local))
+		parent, err := f.client.StatCtx(ctx, parentRemote)
 		if err != nil {
 			return nil, mapError(err)
 		}
 		if !parent.IsDir {
 			return nil, os.ErrInvalid
 		}
-		return &writeFile{client: f.client, path: p}, nil
+		return &writeFile{client: f.client, path: remote}, nil
 	}
 
 	// Stat to determine if it's a directory or file.
-	stat, err := f.client.StatCtx(ctx, p)
+	stat, err := f.client.StatCtx(ctx, remote)
 	if err != nil {
 		return nil, mapError(err)
 	}
 
 	if stat.IsDir {
-		entries, err := f.client.ListCtx(ctx, p)
+		entries, err := f.client.ListCtx(ctx, remote)
 		if err != nil {
 			return nil, mapError(err)
 		}
-		return &dirFile{path: p, stat: stat, entries: entries}, nil
+		return &dirFile{path: local, stat: stat, entries: entries}, nil
 	}
 
 	// Read entire file content. For the lightweight skills/config use case
 	// this is acceptable; large file streaming can be optimized later.
-	data, err := f.client.ReadCtx(ctx, p)
+	data, err := f.client.ReadCtx(ctx, remote)
 	if err != nil {
 		return nil, mapError(err)
 	}
 
 	return &readFile{
-		path:   p,
+		path:   local,
 		stat:   stat,
 		Reader: bytes.NewReader(data),
 	}, nil
 }
 
 func (f *fileSystem) RemoveAll(ctx context.Context, name string) error {
-	p := normPath(name)
-	if p == "/" {
+	local := normPath(name)
+	if local == "/" {
 		return os.ErrInvalid
 	}
-	return mapError(f.client.RemoveAllCtx(ctx, p))
+	return mapError(f.client.RemoveAllCtx(ctx, mountpath.ToRemote(f.remoteRoot, local)))
 }
 
 func (f *fileSystem) Rename(ctx context.Context, oldName, newName string) error {
-	oldPath, newPath := normPath(oldName), normPath(newName)
-	if oldPath == "/" || newPath == "/" {
+	oldLocal, newLocal := normPath(oldName), normPath(newName)
+	if oldLocal == "/" || newLocal == "/" {
 		return os.ErrInvalid
 	}
-	return mapError(f.client.RenameCtx(ctx, oldPath, newPath))
+	oldRemote := mountpath.ToRemote(f.remoteRoot, oldLocal)
+	newRemote := mountpath.ToRemote(f.remoteRoot, newLocal)
+	return mapError(f.client.RenameCtx(ctx, oldRemote, newRemote))
 }
 
 func (f *fileSystem) Stat(ctx context.Context, name string) (os.FileInfo, error) {
-	p := normPath(name)
-	stat, err := f.client.StatCtx(ctx, p)
+	local := normPath(name)
+	remote := mountpath.ToRemote(f.remoteRoot, local)
+	stat, err := f.client.StatCtx(ctx, remote)
 	if err != nil {
 		return nil, mapError(err)
 	}
-	return &fileInfo{name: path.Base(p), stat: stat}, nil
+	return &fileInfo{name: path.Base(local), stat: stat}, nil
 }
 
 // normPath normalizes a WebDAV path to a drive9 path.
