@@ -188,6 +188,7 @@ func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDe
 
 	// Block until server exits (from signal handler shutdown or error).
 	if err := <-srvErr; err != nil && err != http.ErrServerClosed {
+		deps.unmount(deps.goos, mountPoint)
 		return fmt.Errorf("webdav: server error: %w", err)
 	}
 	return nil

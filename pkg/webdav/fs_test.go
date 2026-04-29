@@ -1,6 +1,7 @@
 package webdav
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -214,12 +215,10 @@ func TestHandlerPutMissingParentReturnsConflict(t *testing.T) {
 func TestReadFileSeekAndRead(t *testing.T) {
 	data := []byte("hello world")
 	rf := &readFile{
-		path: "/foo.txt",
-		stat: &client.StatResult{Size: int64(len(data))},
+		path:   "/foo.txt",
+		stat:   &client.StatResult{Size: int64(len(data))},
+		Reader: bytes.NewReader(data),
 	}
-	// bytes.Reader is embedded so we init it via the struct literal
-	// in OpenFile. For testing, create manually:
-	rf.Reader = nil // would normally be set by OpenFile
 
 	fi, err := rf.Stat()
 	if err != nil {
@@ -227,6 +226,26 @@ func TestReadFileSeekAndRead(t *testing.T) {
 	}
 	if fi.Name() != "foo.txt" {
 		t.Errorf("Name = %q", fi.Name())
+	}
+
+	// Read first 5 bytes.
+	buf := make([]byte, 5)
+	n, err := rf.Read(buf)
+	if err != nil || n != 5 || string(buf) != "hello" {
+		t.Fatalf("Read: n=%d err=%v buf=%q", n, err, buf)
+	}
+
+	// Seek back to start.
+	off, err := rf.Seek(0, io.SeekStart)
+	if err != nil || off != 0 {
+		t.Fatalf("Seek: off=%d err=%v", off, err)
+	}
+
+	// Read all.
+	all := make([]byte, len(data))
+	n, err = rf.Read(all)
+	if err != nil || n != len(data) || string(all) != "hello world" {
+		t.Fatalf("Read after seek: n=%d err=%v buf=%q", n, err, all)
 	}
 }
 

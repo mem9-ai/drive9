@@ -200,10 +200,6 @@ func (d *dirFile) Readdir(count int) ([]fs.FileInfo, error) {
 		})
 	}
 	d.pos = end
-
-	if count > 0 && d.pos >= len(d.entries) {
-		return infos, io.EOF
-	}
 	return infos, nil
 }
 
