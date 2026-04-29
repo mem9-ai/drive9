@@ -32,7 +32,7 @@
       },
       "id": 100,
       "options": {
-        "content": "# Upload And S3 Path\n\nThis dashboard tracks the upload/presign/finalize path using existing HTTP, service, and tenant event metrics. It does not show raw S3 SDK timings because those metrics do not exist yet.",
+        "content": "# Upload And S3 Path\n\nThis dashboard is tuned for performance triage on the upload path. Start with HTTP throughput and tail latency, then compare service-operation latency, and finally check conflict/error/expired event pressure. It still does not show raw S3 SDK timings because those metrics do not exist yet.",
         "mode": "markdown"
       },
       "title": "Guide",
@@ -103,7 +103,7 @@
           "refId": "A"
         }
       ],
-      "title": "Upload Path RPS",
+      "title": "Upload HTTP RPS",
       "type": "stat"
     },
     {
@@ -193,6 +193,73 @@
               },
               {
                 "color": "orange",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 4
+      },
+      "id": 6,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval])))",
+          "legendFormat": "upload_http_p99",
+          "refId": "A"
+        }
+      ],
+      "title": "Upload HTTP P99",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
                 "value": 0.1
               },
               {
@@ -208,7 +275,7 @@
       "gridPos": {
         "h": 4,
         "w": 4,
-        "x": 8,
+        "x": 12,
         "y": 4
       },
       "id": 3,
@@ -275,7 +342,7 @@
       "gridPos": {
         "h": 4,
         "w": 4,
-        "x": 12,
+        "x": 16,
         "y": 4
       },
       "id": 4,
@@ -299,7 +366,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$http_route\",status_code=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval])), 1)",
+          "expr": "sum(rate(dat9_http_requests_total{route=~\"$http_route\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval])), 1)",
           "legendFormat": "upload_5xx_ratio",
           "refId": "A"
         }
@@ -342,7 +409,7 @@
       "gridPos": {
         "h": 4,
         "w": 4,
-        "x": 16,
+        "x": 20,
         "y": 4
       },
       "id": 5,
@@ -371,7 +438,7 @@
           "refId": "A"
         }
       ],
-      "title": "Upload Inflight",
+      "title": "Upload HTTP Inflight",
       "type": "stat"
     },
     {
@@ -418,7 +485,7 @@
           "refId": "A"
         }
       ],
-      "title": "Upload Route Throughput",
+      "title": "Hot Upload Routes By Throughput",
       "type": "timeseries"
     },
     {
@@ -474,7 +541,7 @@
           "refId": "B"
         }
       ],
-      "title": "Upload Route Tail Latency",
+      "title": "Upload HTTP Tail Latency",
       "type": "timeseries"
     },
     {
@@ -488,7 +555,7 @@
             "mode": "palette-classic"
           },
           "mappings": [],
-          "unit": "ops"
+          "unit": "reqps"
         },
         "overrides": []
       },
@@ -516,12 +583,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (operation, result) (rate(dat9_service_operations_total{operation=~\"$service_operation\"}[$__rate_interval]))",
-          "legendFormat": "{{operation}} / {{result}}",
+          "expr": "sum by (status) (rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
+          "legendFormat": "{{status}}",
           "refId": "A"
         }
       ],
-      "title": "Upload Service Throughput",
+      "title": "Upload HTTP Status Mix",
       "type": "timeseries"
     },
     {
@@ -535,7 +602,7 @@
             "mode": "palette-classic"
           },
           "mappings": [],
-          "unit": "short"
+          "unit": "ops"
         },
         "overrides": []
       },
@@ -563,12 +630,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (event, result) (rate(dat9_tenant_events_total{event=~\"$event\"}[$__rate_interval]))",
-          "legendFormat": "{{event}} / {{result}}",
+          "expr": "sum by (operation, result) (rate(dat9_service_operations_total{operation=~\"$service_operation\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} / {{result}}",
           "refId": "A"
         }
       ],
-      "title": "Upload Events",
+      "title": "Upload Service Throughput By Result",
       "type": "timeseries"
     },
     {
@@ -588,7 +655,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 24,
+        "w": 12,
         "x": 0,
         "y": 24
       },
@@ -625,6 +692,53 @@
         }
       ],
       "title": "Upload Service Tail Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (event, result) (rate(dat9_tenant_events_total{event=~\"$event\"}[$__rate_interval]))",
+          "legendFormat": "{{event}} / {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Upload Outcome Events",
       "type": "timeseries"
     }
   ],
