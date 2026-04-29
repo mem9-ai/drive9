@@ -20,6 +20,7 @@ func TestStatDefaultOutputIncludesMetadataFields(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"size":          12,
 			"isdir":         false,
+			"resource_id":   "file-meta",
 			"revision":      3,
 			"mtime":         1700000000,
 			"content_type":  "text/plain",
@@ -42,6 +43,9 @@ func TestStatDefaultOutputIncludesMetadataFields(t *testing.T) {
 	}
 	if !strings.Contains(out, "semantic_text: hello world\n") {
 		t.Fatalf("output missing semantic_text: %q", out)
+	}
+	if !strings.Contains(out, "resource_id: file-meta\n") {
+		t.Fatalf("output missing resource_id: %q", out)
 	}
 	if !strings.Contains(out, "mtime: 2023-11-14T22:13:20Z\n") {
 		t.Fatalf("output missing RFC3339 mtime: %q", out)
@@ -66,6 +70,7 @@ func TestStatJSONOutput(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"size":          5,
 			"isdir":         false,
+			"resource_id":   "file-doc",
 			"revision":      1,
 			"content_type":  "text/plain",
 			"semantic_text": "hello",
@@ -85,7 +90,7 @@ func TestStatJSONOutput(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
 		t.Fatalf("json.Unmarshal output: %v\noutput=%q", err, out)
 	}
-	if got.Size != 5 || got.Revision != 1 || got.Tags["k"] != "v" {
+	if got.Size != 5 || got.ResourceID != "file-doc" || got.Revision != 1 || got.Tags["k"] != "v" {
 		t.Fatalf("unexpected json output: %+v", got)
 	}
 }

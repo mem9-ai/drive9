@@ -60,6 +60,9 @@ func Stat(c *client.Client, args []string) error {
 
 	fmt.Printf("size: %d\n", m.Size)
 	fmt.Printf("isdir: %v\n", m.IsDir)
+	if m.ResourceID != "" {
+		fmt.Printf("resource_id: %s\n", m.ResourceID)
+	}
 	fmt.Printf("revision: %d\n", m.Revision)
 	if m.Mtime != nil {
 		fmt.Printf("mtime: %s\n", time.Unix(*m.Mtime, 0).UTC().Format(time.RFC3339))

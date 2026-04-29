@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 
 	"github.com/pingcap/failpoint"
@@ -25,6 +26,51 @@ type AudioExtractRequest struct {
 // AudioTextExtractor extracts searchable transcript text from audio bytes.
 type AudioTextExtractor interface {
 	ExtractAudioText(ctx context.Context, req AudioExtractRequest) (string, AudioExtractUsage, error)
+}
+
+// AudioExtractAPIError describes an HTTP/API failure returned by an audio
+// transcription provider.
+type AudioExtractAPIError struct {
+	Provider   string
+	StatusCode int
+	Message    string
+}
+
+func (e *AudioExtractAPIError) Error() string {
+	provider := strings.TrimSpace(e.Provider)
+	if provider == "" {
+		provider = "audio extract"
+	}
+	if e.Message != "" {
+		return fmt.Sprintf("%s api status %d: %s", provider, e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("%s api status %d", provider, e.StatusCode)
+}
+
+// NonRetryableAudioExtract reports whether retrying the same audio bytes cannot
+// reasonably succeed without changing the request, file, or provider account.
+func (e *AudioExtractAPIError) NonRetryableAudioExtract() bool {
+	switch e.StatusCode {
+	case http.StatusBadRequest,
+		http.StatusForbidden:
+		return true
+	default:
+		return false
+	}
+}
+
+type nonRetryableAudioExtractError interface {
+	NonRetryableAudioExtract() bool
+}
+
+// IsNonRetryableAudioExtractError reports whether err should bypass normal
+// semantic worker retry scheduling for an audio_extract_text task.
+func IsNonRetryableAudioExtractError(err error) bool {
+	var permanent nonRetryableAudioExtractError
+	if errors.As(err, &permanent) {
+		return permanent.NonRetryableAudioExtract()
+	}
+	return false
 }
 
 // AudioExtractTaskSpec carries the revision-scoped inputs needed to extract

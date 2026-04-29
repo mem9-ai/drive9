@@ -333,6 +333,7 @@ environment:
   DRIVE9_LOCAL_EMBEDDING_MODE auto|app|detect (default: auto when initing schema, detect otherwise)
   DRIVE9_LOCAL_META_DSN  local control-plane MySQL DSN for central quota (optional; enables server-mode quota enforcement)
   DRIVE9_VAULT_MASTER_KEY 32-byte hex key for vault DEK wrapping (omit to disable vault)
+  DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
 
   S3 storage:

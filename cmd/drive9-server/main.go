@@ -341,6 +341,7 @@ environment:
   DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
   DRIVE9_VAULT_MASTER_KEY   32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)
+  DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_QUOTA_SOURCE tenant|server quota enforcement source (default: tenant)
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
@@ -399,7 +400,7 @@ environment:
   not enable that semantic_tasks pipeline. When enabled, explicit provider wiring is required:
   DRIVE9_AUDIO_EXTRACT_ENABLED true|false (default: false)
   DRIVE9_AUDIO_EXTRACT_MODE     openai|qwen-asr (default: openai)
-  DRIVE9_AUDIO_EXTRACT_MAX_BYTES max audio bytes processed per task (default: 33554432 for openai, 10485760 for qwen-asr)
+  DRIVE9_AUDIO_EXTRACT_MAX_BYTES max audio bytes processed per task (default: 33554432 for openai, 7340032 for qwen-asr)
   DRIVE9_AUDIO_EXTRACT_TIMEOUT_SECONDS extractor timeout seconds (default: 120)
   DRIVE9_AUDIO_EXTRACT_MAX_TEXT_BYTES max transcript bytes stored in files.content_text (default: 8192)
   DRIVE9_AUDIO_EXTRACT_API_BASE OpenAI-compatible base URL (required when enabled)
@@ -596,7 +597,9 @@ func buildAudioExtractOptionsFromEnv() (backend.AsyncAudioExtractOptions, error)
 		}
 		audioExtractor = extractor
 	case "qwen-asr":
-		maxAudioBytesDefault = 10 << 20
+		// Qwen-ASR enforces a 10 MB cap on the base64-encoded data URL.
+		// 7 MiB raw audio encodes to about 9.8 MB, leaving room for the prefix.
+		maxAudioBytesDefault = 7 << 20
 		extractor, err := backend.NewQwenASRAudioTextExtractor(backend.QwenASRAudioTextExtractorConfig{
 			BaseURL: audioBaseURL,
 			APIKey:  audioAPIKey,

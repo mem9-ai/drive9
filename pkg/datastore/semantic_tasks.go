@@ -375,6 +375,30 @@ func (s *Store) AckSemanticTask(ctx context.Context, taskID, receipt string) (er
 	return s.semanticTaskLeaseError(ctx, taskID)
 }
 
+// DeadLetterSemanticTask marks a leased semantic task as permanently failed
+// without scheduling another retry.
+func (s *Store) DeadLetterSemanticTask(ctx context.Context, taskID, receipt, lastErr string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "dead_letter_semantic_task", start, &err)
+
+	now := semanticTaskLeaseNow()
+	res, err := s.db.ExecContext(ctx, `UPDATE semantic_tasks SET status = ?, receipt = NULL,
+		leased_at = NULL, lease_until = NULL, last_error = ?, completed_at = ?, updated_at = ?
+		WHERE task_id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`,
+		semantic.TaskDeadLettered, nullStr(lastErr), now, now, taskID, semantic.TaskProcessing, receipt, now)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected > 0 {
+		return nil
+	}
+	return s.semanticTaskLeaseError(ctx, taskID)
+}
+
 // RenewSemanticTask extends the lease for a currently owned processing task.
 // The renewal succeeds only when task ownership is still valid, meaning:
 // status is processing, receipt matches, and lease_until has not expired.

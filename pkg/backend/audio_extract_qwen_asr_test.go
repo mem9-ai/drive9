@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -182,7 +183,243 @@ func TestQwenASRAudioTextExtractorErrorMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{Path: "/audio/clip.mp3", Data: []byte("fake")})
-	if err == nil || !strings.Contains(err.Error(), "qwen asr api status 502: upstream unavailable") {
-		t.Fatalf("err=%v, want upstream unavailable status", err)
+	var apiErr *AudioExtractAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err=%T %[1]v, want AudioExtractAPIError", err)
+	}
+	if apiErr.StatusCode != http.StatusBadGateway || apiErr.Message != "upstream unavailable" {
+		t.Fatalf("apiErr=%+v, want 502 upstream unavailable", apiErr)
+	}
+	if IsNonRetryableAudioExtractError(err) {
+		t.Fatalf("err=%v, should be retryable", err)
+	}
+}
+
+func TestQwenASRAudioTextExtractorRejectsOversizedBase64Payload(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	extractor, err := NewQwenASRAudioTextExtractor(QwenASRAudioTextExtractorConfig{
+		BaseURL: server.URL,
+		APIKey:  "secret",
+		Model:   "qwen3-asr-flash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+		Path:        "/audio/too-large.mp3",
+		ContentType: "audio/mpeg",
+		Data:        make([]byte, 8<<20),
+	})
+	if err == nil {
+		t.Fatal("expected oversized payload error")
+	}
+	var apiErr *AudioExtractAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err=%T %[1]v, want AudioExtractAPIError", err)
+	}
+	if apiErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d, want %d", apiErr.StatusCode, http.StatusBadRequest)
+	}
+	if !strings.Contains(apiErr.Message, "10 MB limit") {
+		t.Fatalf("message=%q, want limit detail", apiErr.Message)
+	}
+	if !IsNonRetryableAudioExtractError(err) {
+		t.Fatalf("err=%v, want non-retryable", err)
+	}
+	if called {
+		t.Fatal("server should not be called for oversized payload")
+	}
+}
+
+func TestQwenASRAudioTextExtractorNoChoicesErrorIncludesMaskedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"resp-abc","choices":[]}`))
+	}))
+	defer server.Close()
+
+	extractor, err := NewQwenASRAudioTextExtractor(QwenASRAudioTextExtractorConfig{
+		BaseURL: server.URL,
+		APIKey:  "secret",
+		Model:   "qwen3-asr-flash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+		Path: "/audio/malformed.mp3",
+		Data: []byte("fake"),
+	})
+	if err == nil {
+		t.Fatal("expected no choices error")
+	}
+	if !strings.Contains(err.Error(), "qwen asr api returned no choices") || !strings.Contains(err.Error(), `"id":"resp-abc"`) {
+		t.Fatalf("err=%v, want masked response detail", err)
+	}
+}
+
+func TestQwenASRAudioTextExtractorAllowsLargeSuccessfulResponse(t *testing.T) {
+	transcript := strings.Repeat("a", (1<<20)+1024)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{
+				{"message": map[string]any{"content": transcript}},
+			},
+		})
+	}))
+	defer server.Close()
+
+	extractor, err := NewQwenASRAudioTextExtractor(QwenASRAudioTextExtractorConfig{
+		BaseURL: server.URL,
+		APIKey:  "secret",
+		Model:   "qwen3-asr-flash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+		Path: "/audio/long.mp3",
+		Data: []byte("fake"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != transcript {
+		t.Fatalf("text length=%d, want %d", len(got), len(transcript))
+	}
+}
+
+func TestQwenASRAudioTextExtractorDecodeErrorExcludesRawResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[`))
+	}))
+	defer server.Close()
+
+	extractor, err := NewQwenASRAudioTextExtractor(QwenASRAudioTextExtractorConfig{
+		BaseURL: server.URL,
+		APIKey:  "secret",
+		Model:   "qwen3-asr-flash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+		Path: "/audio/bad-json.mp3",
+		Data: []byte("fake"),
+	})
+	if err == nil {
+		t.Fatal("expected decode error")
+	}
+	if !strings.Contains(err.Error(), "decode qwen asr response") {
+		t.Fatalf("err=%v, want decode response error", err)
+	}
+	if strings.Contains(err.Error(), `{"choices":[`) || strings.Contains(err.Error(), "raw=") {
+		t.Fatalf("err leaked raw response: %v", err)
+	}
+}
+
+func TestMaskQwenASRResponseBodyForLogMasksChoiceMessageContent(t *testing.T) {
+	raw := []byte(`{"id":"resp-1","content":"top-level secret","choices":[{"message":{"role":"assistant","content":"sensitive transcript"}},{"message":{"role":"assistant","content":[{"type":"text","text":"another secret"}]}}],"usage":{"seconds":3}}`)
+
+	masked := maskQwenASRResponseBodyForLog(raw)
+	if strings.Contains(masked, "sensitive transcript") || strings.Contains(masked, "another secret") {
+		t.Fatalf("masked response leaked choice message content: %s", masked)
+	}
+	if !strings.Contains(masked, "top-level secret") {
+		t.Fatalf("masked response unexpectedly removed non-choice content field: %s", masked)
+	}
+
+	var parsed struct {
+		Content string `json:"content"`
+		ID      string `json:"id"`
+		Choices []struct {
+			Message struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage struct {
+			Seconds float64 `json:"seconds"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(masked), &parsed); err != nil {
+		t.Fatalf("unmarshal masked response: %v", err)
+	}
+	if parsed.ID != "resp-1" || parsed.Usage.Seconds != 3 {
+		t.Fatalf("masked response lost non-content fields: %+v", parsed)
+	}
+	if parsed.Content != "top-level secret" {
+		t.Fatalf("top-level content=%q, want preserved", parsed.Content)
+	}
+	for i, choice := range parsed.Choices {
+		if choice.Message.Role != "assistant" {
+			t.Fatalf("choice %d role=%q, want assistant", i, choice.Message.Role)
+		}
+		if choice.Message.Content != qwenASRMaskedContent {
+			t.Fatalf("choice %d content=%q, want mask", i, choice.Message.Content)
+		}
+	}
+}
+
+func TestQwenASRAudioTextExtractorNonRetryableClientErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		message    string
+	}{
+		{
+			name:       "free_tier_exhausted",
+			statusCode: http.StatusForbidden,
+			message:    "The free tier of the model has been exhausted.",
+		},
+		{
+			name:       "illegal_audio_format",
+			statusCode: http.StatusBadRequest,
+			message:    "<400> InternalError.Algo.InvalidParameter: The audio format is illegal and cannot be opened",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.statusCode)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error": map[string]string{"message": tc.message},
+				})
+			}))
+			defer server.Close()
+
+			extractor, err := NewQwenASRAudioTextExtractor(QwenASRAudioTextExtractorConfig{
+				BaseURL: server.URL,
+				APIKey:  "secret",
+				Model:   "qwen3-asr-flash",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = extractor.ExtractAudioText(context.Background(), AudioExtractRequest{
+				Path: "/audio/clip.mp3",
+				Data: []byte("fake"),
+			})
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			var apiErr *AudioExtractAPIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("err=%T %[1]v, want AudioExtractAPIError", err)
+			}
+			if apiErr.StatusCode != tc.statusCode {
+				t.Fatalf("status=%d, want %d", apiErr.StatusCode, tc.statusCode)
+			}
+			if !IsNonRetryableAudioExtractError(err) {
+				t.Fatalf("err=%v, want non-retryable", err)
+			}
+		})
 	}
 }

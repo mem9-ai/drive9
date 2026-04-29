@@ -5,11 +5,22 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/mem9-ai/dat9/pkg/logger"
+)
+
+const (
+	qwenASRMaxDataURLBytes  = 10_000_000
+	qwenASRMaxResponseBytes = 32 << 20
+	qwenASRMaskedContent    = "[masked]"
 )
 
 // QwenASRAudioTextExtractorConfig configures Alibaba Cloud Model Studio
@@ -79,9 +90,22 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 	if contentType == "" {
 		contentType = "audio/mpeg"
 	}
-	audioURL := "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(req.Data)
+	audioURLPrefix := "data:" + contentType + ";base64,"
+	encodedAudioBytes := base64.StdEncoding.EncodedLen(len(req.Data)) + len(audioURLPrefix)
+	if encodedAudioBytes > qwenASRMaxDataURLBytes {
+		return "", AudioExtractUsage{}, &AudioExtractAPIError{
+			Provider:   "qwen asr",
+			StatusCode: http.StatusBadRequest,
+			Message:    fmt.Sprintf("base64 data URL size %d exceeds qwen asr 10 MB limit", encodedAudioBytes),
+		}
+	}
+	audioURL := audioURLPrefix + base64.StdEncoding.EncodeToString(req.Data)
 	messages := make([]map[string]any, 0, 2)
 	if strings.TrimSpace(e.prompt) != "" {
+		// The Qwen-ASR API reference documents language and ITN tuning under
+		// asr_options, while the OpenAI-compatible request format also accepts
+		// optional system messages. Keep Prompt as a system message for backward
+		// compatibility with existing deployments.
 		messages = append(messages, map[string]any{
 			"role": "system",
 			"content": []map[string]any{
@@ -123,11 +147,24 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, responseTooLarge, err := readQwenASRResponseBody(resp.Body)
 	if err != nil {
 		return "", AudioExtractUsage{}, fmt.Errorf("read qwen asr response for %q: %w", req.Path, err)
 	}
+	if responseTooLarge {
+		message := fmt.Sprintf("qwen asr response exceeds %d byte limit (response_bytes>%d)", qwenASRMaxResponseBytes, qwenASRMaxResponseBytes)
+		if resp.StatusCode >= 300 {
+			return "", AudioExtractUsage{}, &AudioExtractAPIError{
+				Provider:   "qwen asr",
+				StatusCode: resp.StatusCode,
+				Message:    message,
+			}
+		}
+		return "", AudioExtractUsage{}, errors.New(message)
+	}
+	maskedResponse := maskQwenASRResponseBodyForLog(raw)
 	var parsed struct {
+		ID    string `json:"id"`
 		Error *struct {
 			Message string `json:"message"`
 		} `json:"error"`
@@ -136,6 +173,9 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 				Content any `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		// Qwen-ASR OpenAI-compatible responses place audio duration at
+		// usage.seconds, not usage.completion_tokens_details.seconds.
+		// Reference: https://help.aliyun.com/zh/model-studio/qwen-asr-api-reference
 		Usage *struct {
 			PromptTokens     int     `json:"prompt_tokens"`
 			CompletionTokens int     `json:"completion_tokens"`
@@ -144,18 +184,38 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		if resp.StatusCode >= 300 {
-			return "", AudioExtractUsage{}, fmt.Errorf("qwen asr api status %d: %s", resp.StatusCode, truncateString(string(raw), 256))
+			return "", AudioExtractUsage{}, &AudioExtractAPIError{
+				Provider:   "qwen asr",
+				StatusCode: resp.StatusCode,
+				Message:    "invalid response body",
+			}
 		}
 		return "", AudioExtractUsage{}, fmt.Errorf("decode qwen asr response: %w", err)
 	}
+	logger.Debug(ctx, "qwen_asr_response_body",
+		zap.String("path", req.Path),
+		zap.Int("status_code", resp.StatusCode),
+		zap.String("provider_request_id", parsed.ID),
+		zap.Int("response_bytes", len(raw)),
+		zap.String("response_body", maskedResponse))
+
+	// Reference: https://help.aliyun.com/zh/model-studio/error-code
+	// If the status code indicates an error, return an API error with details if available.
 	if resp.StatusCode >= 300 {
 		if parsed.Error != nil && parsed.Error.Message != "" {
-			return "", AudioExtractUsage{}, fmt.Errorf("qwen asr api status %d: %s", resp.StatusCode, parsed.Error.Message)
+			return "", AudioExtractUsage{}, &AudioExtractAPIError{
+				Provider:   "qwen asr",
+				StatusCode: resp.StatusCode,
+				Message:    parsed.Error.Message,
+			}
 		}
-		return "", AudioExtractUsage{}, fmt.Errorf("qwen asr api status %d", resp.StatusCode)
+		return "", AudioExtractUsage{}, &AudioExtractAPIError{
+			Provider:   "qwen asr",
+			StatusCode: resp.StatusCode,
+		}
 	}
 	if len(parsed.Choices) == 0 {
-		return "", AudioExtractUsage{}, fmt.Errorf("qwen asr api returned no choices")
+		return "", AudioExtractUsage{}, fmt.Errorf("qwen asr api returned no choices (response=%s)", maskedResponse)
 	}
 	text := extractOpenAIContentText(parsed.Choices[0].Message.Content)
 	if strings.TrimSpace(text) == "" {
@@ -168,4 +228,52 @@ func (e *QwenASRAudioTextExtractor) ExtractAudioText(ctx context.Context, req Au
 		usage.DurationSeconds = parsed.Usage.Seconds
 	}
 	return text, usage, nil
+}
+
+func readQwenASRResponseBody(r io.Reader) ([]byte, bool, error) {
+	raw, err := io.ReadAll(io.LimitReader(r, qwenASRMaxResponseBytes+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if len(raw) > qwenASRMaxResponseBytes {
+		return raw[:qwenASRMaxResponseBytes], true, nil
+	}
+	return raw, false, nil
+}
+
+func maskQwenASRResponseBodyForLog(raw []byte) string {
+	var body any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return "[unparseable response body]"
+	}
+	maskQwenASRChoicesContent(body)
+	masked, err := json.Marshal(body)
+	if err != nil {
+		return "[unparseable response body]"
+	}
+	return truncateString(string(masked), 4096)
+}
+
+func maskQwenASRChoicesContent(body any) {
+	obj, ok := body.(map[string]any)
+	if !ok {
+		return
+	}
+	choices, ok := obj["choices"].([]any)
+	if !ok {
+		return
+	}
+	for _, choice := range choices {
+		choiceObj, ok := choice.(map[string]any)
+		if !ok {
+			continue
+		}
+		message, ok := choiceObj["message"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, ok := message["content"]; ok {
+			message["content"] = qwenASRMaskedContent
+		}
+	}
 }
