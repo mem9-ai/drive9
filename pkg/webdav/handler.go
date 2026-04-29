@@ -30,7 +30,7 @@ func NewHandler(c *client.Client, opts Options) http.Handler {
 	}
 	return &webdav.Handler{
 		Prefix:     opts.Prefix,
-		FileSystem: &fileSystem{client: c, remoteRoot: remoteRoot},
+		FileSystem: &fileSystem{client: c, remoteRoot: remoteRoot, props: newDeadPropStore()},
 		LockSystem: webdav.NewMemLS(),
 	}
 }
