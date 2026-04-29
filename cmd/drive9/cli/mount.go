@@ -3,12 +3,15 @@ package cli
 import (
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
 	"time"
 
+	"github.com/mem9-ai/dat9/pkg/client"
 	drive9fuse "github.com/mem9-ai/dat9/pkg/fuse"
+	drive9webdav "github.com/mem9-ai/dat9/pkg/webdav"
 )
 
 // MountCmd handles the "drive9 mount" command.
@@ -62,6 +65,7 @@ func fsMountCmd(args []string) error {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
+	mode := fs.String("mode", "auto", "mount mode: auto, fuse, or webdav")
 	cacheDir := fs.String("cache-dir", "", "write-back cache directory (default ~/.cache/drive9)")
 	cacheSize := fs.Int("cache-size", 128, "read cache size in MB")
 	dirTTL := fs.Duration("dir-ttl", 10*time.Second, "directory cache TTL")
@@ -91,6 +95,12 @@ func fsMountCmd(args []string) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("drive9 mount: exactly one mountpoint required")
 	}
+
+	mountMode, err := ParseMountMode(*mode)
+	if err != nil {
+		return err
+	}
+
 	if err := validateLookupRetryFlags(*lookupRetryCount, *lookupRetryTimeout); err != nil {
 		return err
 	}
@@ -106,6 +116,14 @@ func fsMountCmd(args []string) error {
 		return err
 	}
 
+	// Resolve auto mode to a concrete backend.
+	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
+	fmt.Fprintf(os.Stderr, "dat9: mount mode: %s\n", resolved)
+
+	if resolved == MountModeWebDAV && *readOnly {
+		return fmt.Errorf("drive9 mount: --read-only is not supported with WebDAV mode")
+	}
+
 	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
 	if err != nil {
 		return err
@@ -113,6 +131,22 @@ func fsMountCmd(args []string) error {
 	*server, *apiKey = serverVal, apiKeyVal
 	token := tokenVal
 
+	// WebDAV path: create client, start local WebDAV server, invoke mount_webdav.
+	if resolved == MountModeWebDAV {
+		var c *client.Client
+		if token != "" {
+			c = client.NewWithToken(*server, token)
+		} else {
+			c = client.New(*server, *apiKey)
+		}
+		if _, err := c.List("/"); err != nil {
+			return fmt.Errorf("cannot reach dat9 server: %w", err)
+		}
+
+		return webdavMount(c, mountPoint)
+	}
+
+	// FUSE path (existing behavior).
 	syncModeVal, err := drive9fuse.ParseSyncMode(*syncMode)
 	if err != nil {
 		return err
@@ -139,6 +173,11 @@ func fsMountCmd(args []string) error {
 	}
 
 	return drive9fuse.Mount(opts)
+}
+
+// newWebDAVHandler creates an http.Handler that serves drive9 content over WebDAV.
+func newWebDAVHandler(c *client.Client, prefix string) (http.Handler, error) {
+	return drive9webdav.NewHandler(c, drive9webdav.Options{Prefix: prefix}), nil
 }
 
 func validateLookupRetryFlags(count int, timeout time.Duration) error {
