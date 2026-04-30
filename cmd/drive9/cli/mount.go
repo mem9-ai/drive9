@@ -215,8 +215,14 @@ func validateRemoteRoot(c *client.Client, remoteRoot string) error {
 	}
 	stat, err := c.Stat(remoteRoot)
 	if err != nil {
-		// Stat may fail on backends where directory stat is unsupported.
-		// Fall back to List to verify the remote root exists and is listable.
+		// If Stat explicitly says "not found", trust it — don't fall back
+		// to List which may return empty success for non-existent paths.
+		if client.IsNotFound(err) {
+			return remoteRootError(remoteRoot, err)
+		}
+		// Stat may fail on backends where directory stat is unsupported
+		// (non-404 error). Fall back to List to verify the remote root
+		// exists and is listable.
 		if _, listErr := c.List(remoteRoot); listErr != nil {
 			return remoteRootError(remoteRoot, listErr)
 		}

@@ -295,12 +295,11 @@ func TestRemoteRootError_Non404WrapsOriginal(t *testing.T) {
 }
 
 func TestValidateRemoteRoot_StatFailsListSucceeds(t *testing.T) {
-	// Backend where Stat on directories is unsupported but List works.
+	// Backend where Stat (HEAD) on directories is unsupported but List works.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Has("stat") {
-			// Stat unsupported for directories on this backend.
+		if r.Method == http.MethodHead {
+			// Stat unsupported for directories on this backend (non-404).
 			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte(`{"error":"stat unsupported"}`))
 			return
 		}
 		if r.URL.Query().Has("list") {
@@ -320,9 +319,9 @@ func TestValidateRemoteRoot_StatFailsListSucceeds(t *testing.T) {
 }
 
 func TestValidateRemoteRoot_BothFailWith404(t *testing.T) {
+	// Both Stat (HEAD) and List return 404.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"error":"not found"}`))
 	}))
 	defer srv.Close()
 
@@ -340,13 +339,41 @@ func TestValidateRemoteRoot_BothFailWith404(t *testing.T) {
 	}
 }
 
-func TestValidateRemoteRoot_StatNotFoundListTimeout(t *testing.T) {
-	// Stat returns 404, but List returns a different error (e.g. 500).
-	// Should NOT show 404 hint — List error takes precedence.
+func TestValidateRemoteRoot_Stat404TrustedOverList(t *testing.T) {
+	// Stat (HEAD) returns 404 — we trust it immediately and show the hint,
+	// even if List would succeed (server returns empty entries for
+	// non-existent paths).
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Has("stat") {
+		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error":"not found"}`))
+			return
+		}
+		// List would succeed with empty entries
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"entries":[]}`))
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	err := validateRemoteRoot(c, "/data")
+	if err == nil {
+		t.Fatal("expected error when Stat returns 404")
+	}
+	got := err.Error()
+	if !strings.Contains(got, "does not exist") {
+		t.Fatalf("error = %q, want 404 hint", got)
+	}
+	if !strings.Contains(got, "drive9 fs mkdir :/data") {
+		t.Fatalf("error = %q, want mkdir guidance", got)
+	}
+}
+
+func TestValidateRemoteRoot_StatNon404ListFails(t *testing.T) {
+	// Stat (HEAD) returns non-404 error (unsupported), List also fails with 500.
+	// Should show List error, not 404 hint.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusInternalServerError)
@@ -361,7 +388,7 @@ func TestValidateRemoteRoot_StatNotFoundListTimeout(t *testing.T) {
 	}
 	got := err.Error()
 	if strings.Contains(got, "does not exist") {
-		t.Fatalf("Stat 404 + List 500 should NOT show 404 hint: %q", got)
+		t.Fatalf("non-404 Stat + List 500 should NOT show 404 hint: %q", got)
 	}
 	if !strings.Contains(got, "timeout") {
 		t.Fatalf("error = %q, want List error message", got)
