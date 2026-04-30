@@ -2,10 +2,13 @@ package cli
 
 import (
 	"errors"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/client"
 )
 
 func fakeLookPath(binMap map[string]bool) func(string) (string, error) {
@@ -261,5 +264,31 @@ func TestMountCmd_VaultStillDispatchesSeparately(t *testing.T) {
 	}
 	if got := err.Error(); !strings.Contains(got, "drive9 mount vault: exactly one mountpoint required") {
 		t.Fatalf("error = %q, want vault-specific arity rejection", got)
+	}
+}
+
+func TestRemoteRootError_404ShowsHint(t *testing.T) {
+	err := remoteRootError("/data", &client.StatusError{StatusCode: http.StatusNotFound, Message: "not found"})
+	got := err.Error()
+	if !strings.Contains(got, "does not exist") {
+		t.Fatalf("error = %q, want 'does not exist'", got)
+	}
+	if !strings.Contains(got, "drive9 fs mkdir :/data") {
+		t.Fatalf("error = %q, want mkdir hint", got)
+	}
+	if !strings.Contains(got, "drive9 mount :/data") {
+		t.Fatalf("error = %q, want retry hint", got)
+	}
+}
+
+func TestRemoteRootError_Non404WrapsOriginal(t *testing.T) {
+	origErr := &client.StatusError{StatusCode: http.StatusInternalServerError, Message: "server error"}
+	err := remoteRootError("/data", origErr)
+	got := err.Error()
+	if strings.Contains(got, "does not exist") {
+		t.Fatalf("500 error should not show 404 hint: %q", got)
+	}
+	if !strings.Contains(got, "server error") {
+		t.Fatalf("error = %q, want original message wrapped", got)
 	}
 }

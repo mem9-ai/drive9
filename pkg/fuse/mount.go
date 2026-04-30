@@ -141,11 +141,12 @@ func Mount(opts *MountOptions) error {
 			// Stat may fail on backends where directory stat is unsupported.
 			// Fall back to List to verify the remote root exists and is listable.
 			if _, listErr := c.List(remoteRoot); listErr != nil {
+				// Both Stat and List failed — check either error for 404.
 				var se *client.StatusError
-				if errors.As(err, &se) && se.StatusCode == http.StatusNotFound {
+				if errors.As(listErr, &se) && se.StatusCode == http.StatusNotFound {
 					return fmt.Errorf("drive9 mount: remote source %q does not exist\n\n  To create it first:\n    drive9 fs mkdir :%s\n  Then retry:\n    drive9 mount :%s <mountpoint>", remoteRoot, remoteRoot, remoteRoot)
 				}
-				return fmt.Errorf("remote root %q: %w", remoteRoot, err)
+				return fmt.Errorf("remote root %q: %w", remoteRoot, listErr)
 			}
 		} else if !stat.IsDir {
 			return fmt.Errorf("remote root %q is not a directory", remoteRoot)
