@@ -136,8 +136,13 @@ func Mount(opts *MountOptions) error {
 	} else {
 		stat, err := c.Stat(remoteRoot)
 		if err != nil {
-			// Stat may fail on backends where directory stat is unsupported.
-			// Fall back to List to verify the remote root exists and is listable.
+			// If Stat explicitly says "not found", trust it — don't fall back
+			// to List which may return empty success for non-existent paths.
+			if client.IsNotFound(err) {
+				return fmt.Errorf("drive9 mount: remote source %q does not exist\n\n  To create it first:\n    drive9 fs mkdir :%s\n  Then retry:\n    drive9 mount :%s <mountpoint>", remoteRoot, remoteRoot, remoteRoot)
+			}
+			// Stat may fail on backends where directory stat is unsupported
+			// (non-404 error). Fall back to List to verify existence.
 			if _, listErr := c.List(remoteRoot); listErr != nil {
 				if client.IsNotFound(listErr) {
 					return fmt.Errorf("drive9 mount: remote source %q does not exist\n\n  To create it first:\n    drive9 fs mkdir :%s\n  Then retry:\n    drive9 mount :%s <mountpoint>", remoteRoot, remoteRoot, remoteRoot)
