@@ -126,6 +126,15 @@ func Sh(c *client.Client, _ []string) error {
 				fmt.Fprintf(os.Stderr, "stat: %v\n", err)
 			}
 
+		case "mkdir":
+			if len(args) != 1 {
+				fmt.Fprintln(os.Stderr, "usage: mkdir <path>")
+				continue
+			}
+			if err := Mkdir(c, []string{resolve(cwd, args[0])}); err != nil {
+				fmt.Fprintf(os.Stderr, "mkdir: %v\n", err)
+			}
+
 		default:
 			fmt.Fprintf(os.Stderr, "unknown command: %s (type help)\n", cmd)
 		}
@@ -185,6 +194,7 @@ func shHelp() {
   mv <old> <new>  rename/move
   rm [-r|--recursive] <path>  remove
   stat <path>     file metadata
+  mkdir <path>    create directory
   help            this help
   exit            quit shell`)
 }
