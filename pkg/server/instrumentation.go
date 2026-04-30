@@ -234,6 +234,8 @@ func requestRoute(path string) string {
 		return "/v1/status"
 	case path == "/v1/sql":
 		return "/v1/sql"
+	case path == "/v1/events":
+		return "/v1/events"
 	case strings.HasPrefix(path, "/v1/fs/"):
 		return "/v1/fs/*"
 	case path == "/v1/uploads":
@@ -242,6 +244,16 @@ func requestRoute(path string) string {
 		return "/v1/uploads/*"
 	case strings.HasPrefix(path, "/v2/uploads/"):
 		return "/v2/uploads/*"
+	case path == "/v1/vault/secrets" || strings.HasPrefix(path, "/v1/vault/secrets/"):
+		return "/v1/vault/secrets/*"
+	case path == "/v1/vault/tokens" || strings.HasPrefix(path, "/v1/vault/tokens/"):
+		return "/v1/vault/tokens/*"
+	case path == "/v1/vault/grants" || strings.HasPrefix(path, "/v1/vault/grants/"):
+		return "/v1/vault/grants/*"
+	case path == "/v1/vault/audit":
+		return "/v1/vault/audit"
+	case path == "/v1/vault/read" || strings.HasPrefix(path, "/v1/vault/read/"):
+		return "/v1/vault/read/*"
 	case strings.HasPrefix(path, "/s3/"):
 		return "/s3/*"
 	default:

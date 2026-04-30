@@ -11,6 +11,7 @@ import (
 	mysql "github.com/go-sql-driver/mysql"
 
 	"github.com/mem9-ai/dat9/pkg/metrics"
+	"github.com/mem9-ai/dat9/pkg/tenantctx"
 )
 
 const (
@@ -51,7 +52,7 @@ func (c instrumentedConnector) Connect(ctx context.Context) (driver.Conn, error)
 	start := time.Now()
 	conn, err := c.base.Connect(ctx)
 	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(c.role, "connect", start, err)
+		observeDBOperation(ctx, c.role, "connect", start, err)
 	}
 	if err != nil {
 		return nil, err
@@ -72,7 +73,7 @@ func (c instrumentedConn) Prepare(query string) (driver.Stmt, error) {
 	start := time.Now()
 	stmt, err := c.base.Prepare(query)
 	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(c.role, "prepare", start, err)
+		observeDBOperation(context.Background(), c.role, "prepare", start, err)
 	}
 	if err != nil {
 		return nil, err
@@ -96,7 +97,7 @@ func (c instrumentedConn) Ping(ctx context.Context) error {
 	start := time.Now()
 	err := pinger.Ping(ctx)
 	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(c.role, "ping", start, err)
+		observeDBOperation(ctx, c.role, "ping", start, err)
 	}
 	return err
 }
@@ -109,12 +110,12 @@ func (c instrumentedConn) PrepareContext(ctx context.Context, query string) (dri
 	start := time.Now()
 	stmt, err := prep.PrepareContext(ctx, query)
 	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(c.role, "prepare", start, err)
+		observeDBOperation(ctx, c.role, "prepare", start, err)
 	}
 	if err != nil {
 		return nil, err
 	}
-	return instrumentedStmt{base: stmt, role: c.role}, nil
+	return instrumentedStmt{base: stmt, role: c.role, tenantID: tenantctx.TenantIDFromContext(ctx)}, nil
 }
 
 func (c instrumentedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
@@ -122,12 +123,12 @@ func (c instrumentedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (d
 		start := time.Now()
 		tx, err := beginner.BeginTx(ctx, opts)
 		if !errors.Is(err, driver.ErrSkip) {
-			observeDBOperation(c.role, "begin", start, err)
+			observeDBOperation(ctx, c.role, "begin", start, err)
 		}
 		if err != nil {
 			return nil, err
 		}
-		return instrumentedTx{base: tx, role: c.role}, nil
+		return instrumentedTx{base: tx, role: c.role, tenantID: tenantctx.TenantIDFromContext(ctx)}, nil
 	}
 	if opts.Isolation != driver.IsolationLevel(0) || opts.ReadOnly {
 		return nil, fmt.Errorf("driver does not support non-default transaction options")
@@ -143,7 +144,7 @@ func (c instrumentedConn) ExecContext(ctx context.Context, query string, args []
 	start := time.Now()
 	res, err := execer.ExecContext(ctx, query, args)
 	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(c.role, "exec", start, err)
+		observeDBOperation(ctx, c.role, "exec", start, err)
 	}
 	return res, err
 }
@@ -156,7 +157,7 @@ func (c instrumentedConn) QueryContext(ctx context.Context, query string, args [
 	start := time.Now()
 	rows, err := queryer.QueryContext(ctx, query, args)
 	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(c.role, "query", start, err)
+		observeDBOperation(ctx, c.role, "query", start, err)
 	}
 	return rows, err
 }
@@ -188,6 +189,7 @@ func (c instrumentedConn) CheckNamedValue(nv *driver.NamedValue) error {
 type instrumentedStmt struct {
 	base driver.Stmt
 	role string
+	tenantID string
 }
 
 func (s instrumentedStmt) Close() error {
@@ -214,7 +216,7 @@ func (s instrumentedStmt) ExecContext(ctx context.Context, args []driver.NamedVa
 	start := time.Now()
 	res, err := execer.ExecContext(ctx, args)
 	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(s.role, "exec", start, err)
+		observeDBOperation(withTenantID(ctx, s.tenantID), s.role, "exec", start, err)
 	}
 	return res, err
 }
@@ -227,7 +229,7 @@ func (s instrumentedStmt) QueryContext(ctx context.Context, args []driver.NamedV
 	start := time.Now()
 	rows, err := queryer.QueryContext(ctx, args)
 	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(s.role, "query", start, err)
+		observeDBOperation(withTenantID(ctx, s.tenantID), s.role, "query", start, err)
 	}
 	return rows, err
 }
@@ -243,13 +245,14 @@ func (s instrumentedStmt) CheckNamedValue(nv *driver.NamedValue) error {
 type instrumentedTx struct {
 	base driver.Tx
 	role string
+	tenantID string
 }
 
 func (tx instrumentedTx) Commit() error {
 	start := time.Now()
 	err := tx.base.Commit()
 	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(tx.role, "commit", start, err)
+		observeDBOperation(withTenantID(context.Background(), tx.tenantID), tx.role, "commit", start, err)
 	}
 	return err
 }
@@ -258,13 +261,20 @@ func (tx instrumentedTx) Rollback() error {
 	start := time.Now()
 	err := tx.base.Rollback()
 	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(tx.role, "rollback", start, err)
+		observeDBOperation(withTenantID(context.Background(), tx.tenantID), tx.role, "rollback", start, err)
 	}
 	return err
 }
 
-func observeDBOperation(role, operation string, start time.Time, err error) {
-	metrics.RecordDBOperation(role, operation, dbResult(err), time.Since(start))
+func observeDBOperation(ctx context.Context, role, operation string, start time.Time, err error) {
+	metrics.RecordDBOperation(role, operation, dbResult(err), tenantctx.TenantIDFromContext(ctx), time.Since(start))
+}
+
+func withTenantID(ctx context.Context, tenantID string) context.Context {
+	if tenantctx.TenantIDFromContext(ctx) != "" {
+		return ctx
+	}
+	return tenantctx.WithTenantID(ctx, tenantID)
 }
 
 func dbResult(err error) string {

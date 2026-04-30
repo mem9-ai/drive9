@@ -40,8 +40,8 @@ var globalDB = &dbMetrics{
 	dbs:            map[*sql.DB]string{},
 }
 
-func RecordDBOperation(role, operation, result string, d time.Duration) {
-	key := dbLabels(role, operation, result)
+func RecordDBOperation(role, operation, result, tenantID string, d time.Duration) {
+	key := dbLabels(role, operation, result, tenantID)
 	globalDB.mu.Lock()
 	globalDB.counts[key]++
 	globalDB.durationCount[key]++
@@ -91,7 +91,7 @@ func writeDBPrometheus(w http.ResponseWriter) {
 	}
 	globalDB.mu.RUnlock()
 
-	_, _ = fmt.Fprintln(w, "# HELP dat9_db_operations_total Database operations by role/operation/result")
+	_, _ = fmt.Fprintln(w, "# HELP dat9_db_operations_total Database operations by role/operation/result/tenant_id")
 	_, _ = fmt.Fprintln(w, "# TYPE dat9_db_operations_total counter")
 	for _, k := range countKeys {
 		_, _ = fmt.Fprintf(w, "dat9_db_operations_total{%s} %d\n", k, counts[k])
@@ -177,6 +177,6 @@ func writeDBPrometheus(w http.ResponseWriter) {
 	}
 }
 
-func dbLabels(role, operation, result string) string {
-	return "role=\"" + EscapePromLabel(role) + "\",operation=\"" + EscapePromLabel(operation) + "\",result=\"" + EscapePromLabel(result) + "\""
+func dbLabels(role, operation, result, tenantID string) string {
+	return "role=\"" + EscapePromLabel(role) + "\",operation=\"" + EscapePromLabel(operation) + "\",result=\"" + EscapePromLabel(result) + "\",tenant_id=\"" + EscapePromLabel(tenantID) + "\""
 }
