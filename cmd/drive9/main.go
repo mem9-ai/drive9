@@ -192,6 +192,8 @@ func runFS(args []string) {
 		err = cli.Mv(c, rest)
 	case "rm":
 		err = cli.Rm(c, rest)
+	case "mkdir":
+		err = cli.Mkdir(c, rest)
 	case "sh":
 		err = cli.Sh(c, rest)
 	case "grep":
@@ -271,6 +273,7 @@ commands:
   stat [-o text|json] <path>
                        file metadata
   mv <old> <new>      rename/move
+  mkdir <path>        create directory (parents auto-created)
   rm [-r|--recursive] <path>
                        remove file or directory tree
   sh                  interactive shell
