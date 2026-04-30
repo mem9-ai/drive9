@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -290,5 +291,79 @@ func TestRemoteRootError_Non404WrapsOriginal(t *testing.T) {
 	}
 	if !strings.Contains(got, "server error") {
 		t.Fatalf("error = %q, want original message wrapped", got)
+	}
+}
+
+func TestValidateRemoteRoot_StatFailsListSucceeds(t *testing.T) {
+	// Backend where Stat on directories is unsupported but List works.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("stat") {
+			// Stat unsupported for directories on this backend.
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"stat unsupported"}`))
+			return
+		}
+		if r.URL.Query().Has("list") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"entries":[]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	err := validateRemoteRoot(c, "/data")
+	if err != nil {
+		t.Fatalf("expected success when Stat fails but List succeeds: %v", err)
+	}
+}
+
+func TestValidateRemoteRoot_BothFailWith404(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not found"}`))
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	err := validateRemoteRoot(c, "/data")
+	if err == nil {
+		t.Fatal("expected error when both Stat and List return 404")
+	}
+	got := err.Error()
+	if !strings.Contains(got, "does not exist") {
+		t.Fatalf("error = %q, want 404 hint", got)
+	}
+	if !strings.Contains(got, "drive9 fs mkdir :/data") {
+		t.Fatalf("error = %q, want mkdir guidance", got)
+	}
+}
+
+func TestValidateRemoteRoot_StatNotFoundListTimeout(t *testing.T) {
+	// Stat returns 404, but List returns a different error (e.g. 500).
+	// Should NOT show 404 hint — List error takes precedence.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("stat") {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"not found"}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"timeout"}`))
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	err := validateRemoteRoot(c, "/data")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	got := err.Error()
+	if strings.Contains(got, "does not exist") {
+		t.Fatalf("Stat 404 + List 500 should NOT show 404 hint: %q", got)
+	}
+	if !strings.Contains(got, "timeout") {
+		t.Fatalf("error = %q, want List error message", got)
 	}
 }
