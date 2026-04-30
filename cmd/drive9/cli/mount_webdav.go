@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -168,7 +169,7 @@ func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDe
 	// Invoke mount_webdav.
 	if err := deps.runMount(deps.goos, serverURL, mountPoint); err != nil {
 		_ = srv.Close()
-		return fmt.Errorf("webdav: mount_webdav failed: %w", err)
+		return explainMountError(deps.goos, mountPoint, err)
 	}
 
 	fmt.Fprintf(os.Stderr, "dat9: mounted on %s via WebDAV (%s)\n", mountPoint, serverURL)
@@ -214,6 +215,44 @@ func runWebDAVMountCmd(goos, serverURL, mountPoint string) error {
 	mountCmd.Stdout = os.Stderr
 	mountCmd.Stderr = os.Stderr
 	return mountCmd.Run()
+}
+
+// explainMountError turns the opaque "exit status N" from mount_webdav into
+// an actionable message. The underlying error is preserved via %w so callers
+// (and tests) can still match on it.
+func explainMountError(goos, mountPoint string, err error) error {
+	hint := mountErrorHint(goos, mountPoint, err)
+	if hint == "" {
+		return fmt.Errorf("webdav: mount_webdav failed: %w", err)
+	}
+	return fmt.Errorf("webdav: mount_webdav failed: %w\n  %s", err, hint)
+}
+
+// mountErrorHint returns a human-readable explanation for known mount_webdav
+// exit codes on macOS. Returns "" when no specific hint applies.
+//
+// Codes follow mount_webdav(8) DIAGNOSTICS: ENOENT (invalid node path),
+// ENODEV (server not WebDAV-enabled, missing, or inaccessible), ECANCELED
+// (auth canceled). EBUSY surfaces when a mount already covers the point.
+func mountErrorHint(goos, mountPoint string, err error) string {
+	if goos != "darwin" {
+		return ""
+	}
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return ""
+	}
+	switch ee.ExitCode() {
+	case 2: // ENOENT
+		return fmt.Sprintf("mount point %q does not exist or is not accessible.", mountPoint)
+	case 16: // EBUSY
+		return fmt.Sprintf("mount point %q is busy — a filesystem may already be mounted there. Run `mount | grep %q` and `drive9 umount %s` to clean up.", mountPoint, mountPoint, mountPoint)
+	case 19: // ENODEV
+		return fmt.Sprintf("the kernel rejected the WebDAV mount at %q (ENODEV). Common causes: a stale mount still attached at this path (try `mount | grep %q` then `drive9 umount %s`); the local WebDAV bridge was unreachable; or the mount point is on a filesystem that does not support WebDAV mounts (e.g. some network volumes). Try a fresh path under your home directory.", mountPoint, mountPoint, mountPoint)
+	case 77: // ECANCELED
+		return "authentication was canceled by mount_webdav. Re-run the command and ensure credentials are configured (`drive9 ctx`)."
+	}
+	return ""
 }
 
 // webdavMountCmd builds the OS command to mount a WebDAV URL at mountPoint.

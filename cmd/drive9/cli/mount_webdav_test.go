@@ -3,9 +3,11 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -300,6 +302,124 @@ func TestErrorPathWebdavUnmount(t *testing.T) {
 	// webdavUnmount with a non-existent mountpoint should not panic.
 	// It prints to stderr but returns no error (fire-and-forget).
 	webdavUnmount("darwin", "/nonexistent/path/drive9-test-unmount")
+}
+
+// TestMountErrorHint verifies that known macOS mount_webdav exit codes are
+// translated into actionable messages, while unknown errors fall through.
+func TestMountErrorHint(t *testing.T) {
+	mp := "/tmp/drive9-test-mp"
+
+	tests := []struct {
+		name     string
+		goos     string
+		err      error
+		wantSubs []string // all must appear in the hint
+		wantHint bool
+	}{
+		{
+			name:     "darwin ENODEV (19)",
+			goos:     "darwin",
+			err:      exitErrorWithCode(t, 19),
+			wantSubs: []string{"ENODEV", "stale mount", "drive9 umount"},
+			wantHint: true,
+		},
+		{
+			name:     "darwin ENOENT (2)",
+			goos:     "darwin",
+			err:      exitErrorWithCode(t, 2),
+			wantSubs: []string{"does not exist"},
+			wantHint: true,
+		},
+		{
+			name:     "darwin EBUSY (16)",
+			goos:     "darwin",
+			err:      exitErrorWithCode(t, 16),
+			wantSubs: []string{"busy", "drive9 umount"},
+			wantHint: true,
+		},
+		{
+			name:     "darwin ECANCELED (77)",
+			goos:     "darwin",
+			err:      exitErrorWithCode(t, 77),
+			wantSubs: []string{"authentication"},
+			wantHint: true,
+		},
+		{
+			name:     "darwin unknown exit code falls through",
+			goos:     "darwin",
+			err:      exitErrorWithCode(t, 42),
+			wantHint: false,
+		},
+		{
+			name:     "darwin non-ExitError falls through",
+			goos:     "darwin",
+			err:      errors.New("plain error"),
+			wantHint: false,
+		},
+		{
+			name:     "linux gets no hint",
+			goos:     "linux",
+			err:      exitErrorWithCode(t, 19),
+			wantHint: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hint := mountErrorHint(tt.goos, mp, tt.err)
+			if tt.wantHint && hint == "" {
+				t.Fatalf("expected hint, got empty string")
+			}
+			if !tt.wantHint && hint != "" {
+				t.Fatalf("expected no hint, got %q", hint)
+			}
+			for _, sub := range tt.wantSubs {
+				if !strings.Contains(hint, sub) {
+					t.Errorf("hint = %q, want substring %q", hint, sub)
+				}
+			}
+		})
+	}
+}
+
+// TestExplainMountError checks that explainMountError preserves the underlying
+// error (so errors.Is/As keep working) and appends the hint when applicable.
+func TestExplainMountError(t *testing.T) {
+	underlying := exitErrorWithCode(t, 19)
+	wrapped := explainMountError("darwin", "/tmp/mp", underlying)
+
+	if !errors.Is(wrapped, underlying) {
+		t.Fatalf("wrapped error must wrap the original; got %v", wrapped)
+	}
+	if !strings.Contains(wrapped.Error(), "mount_webdav failed") {
+		t.Errorf("missing prefix; got %q", wrapped.Error())
+	}
+	if !strings.Contains(wrapped.Error(), "ENODEV") {
+		t.Errorf("missing hint; got %q", wrapped.Error())
+	}
+
+	// Plain errors (non-ExitError) get the original wrapping with no hint.
+	plain := errors.New("plain")
+	wrapped2 := explainMountError("darwin", "/tmp/mp", plain)
+	if !strings.Contains(wrapped2.Error(), "plain") {
+		t.Errorf("plain error not preserved; got %q", wrapped2.Error())
+	}
+	if strings.Contains(wrapped2.Error(), "ENODEV") {
+		t.Errorf("plain error should not get an ENODEV hint; got %q", wrapped2.Error())
+	}
+}
+
+// exitErrorWithCode runs a tiny shell command that exits with the given code
+// and returns the resulting *exec.ExitError. This is the only portable way
+// to construct one — its internal fields are unexported.
+func exitErrorWithCode(t *testing.T, code int) error {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("exit %d", code))
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("expected non-zero exit, got nil")
+	}
+	return err
 }
 
 // TestParseMountModeRoundTrip ensures every MountMode constant is parseable.
