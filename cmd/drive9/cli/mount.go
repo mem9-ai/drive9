@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -213,12 +214,22 @@ func validateRemoteRoot(c *client.Client, remoteRoot string) error {
 	}
 	stat, err := c.Stat(remoteRoot)
 	if err != nil {
-		return fmt.Errorf("remote root %q: %w", remoteRoot, err)
+		return remoteRootError(remoteRoot, err)
 	}
 	if !stat.IsDir {
 		return fmt.Errorf("remote root %q is not a directory", remoteRoot)
 	}
 	return nil
+}
+
+// remoteRootError wraps a remote-root stat/list error with actionable guidance
+// when the path does not exist (HTTP 404).
+func remoteRootError(remoteRoot string, err error) error {
+	var se *client.StatusError
+	if errors.As(err, &se) && se.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("drive9 mount: remote source %q does not exist\n\n  To create it first:\n    drive9 fs mkdir :%s\n  Then retry:\n    drive9 mount :%s <mountpoint>", remoteRoot, remoteRoot, remoteRoot)
+	}
+	return fmt.Errorf("remote root %q: %w", remoteRoot, err)
 }
 
 func validateLookupRetryFlags(count int, timeout time.Duration) error {

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -139,6 +141,10 @@ func Mount(opts *MountOptions) error {
 			// Stat may fail on backends where directory stat is unsupported.
 			// Fall back to List to verify the remote root exists and is listable.
 			if _, listErr := c.List(remoteRoot); listErr != nil {
+				var se *client.StatusError
+				if errors.As(err, &se) && se.StatusCode == http.StatusNotFound {
+					return fmt.Errorf("drive9 mount: remote source %q does not exist\n\n  To create it first:\n    drive9 fs mkdir :%s\n  Then retry:\n    drive9 mount :%s <mountpoint>", remoteRoot, remoteRoot, remoteRoot)
+				}
 				return fmt.Errorf("remote root %q: %w", remoteRoot, err)
 			}
 		} else if !stat.IsDir {
