@@ -6,12 +6,12 @@
 //
 // Commands:
 //
-//	create  provision a new database
-//	ctx     switch or list contexts
+//	create  provision a new database and owner context
+//	ctx     manage contexts (add, import, ls, use, rm)
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, sh, grep, find)
 //	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
-//	mount   mount drive9 as a local FUSE filesystem
-//	umount  unmount a drive9 FUSE mount
+//	mount   mount drive9 as a local filesystem, or mount vault secrets
+//	umount  unmount a drive9 local mount
 package main
 
 import (
@@ -58,7 +58,7 @@ func main() {
 	defer cpuProfileStop()
 
 	if len(os.Args) < 2 {
-		usage()
+		usage(2)
 	}
 
 	dispatch(os.Args[1], os.Args[2:])
@@ -76,11 +76,11 @@ func dispatch(cmd string, args []string) {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "version"))
 		}
 		fmt.Print(versionString())
-	case "-h", "-help", "help":
+	case "-h", "-help", "--help", "help":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "help"))
 		}
-		usage()
+		usage(0)
 	case "create":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "create"))
@@ -138,7 +138,7 @@ func dispatch(cmd string, args []string) {
 			logger.Warn(context.Background(), "cli_unknown_command", zap.String("command", cmd))
 		}
 		fmt.Fprintf(os.Stderr, "drive9: unknown command %q\n", cmd)
-		usage()
+		usage(2)
 	}
 }
 
@@ -172,7 +172,7 @@ func startCPUProfileFromEnv() (func(), error) {
 
 func runFS(args []string) {
 	if len(args) < 1 {
-		fsUsage()
+		fsUsage(2)
 	}
 	sub := args[0]
 	rest := args[1:]
@@ -198,11 +198,11 @@ func runFS(args []string) {
 		err = cli.Grep(c, rest)
 	case "find":
 		err = cli.Find(c, rest)
-	case "-h", "-help", "help":
-		fsUsage()
+	case "-h", "-help", "--help", "help":
+		fsUsage(0)
 	default:
 		fmt.Fprintf(os.Stderr, "drive9 fs: unknown command %q\n", sub)
-		fsUsage()
+		fsUsage(2)
 	}
 	if err != nil {
 		fatal("fs "+sub, err)
@@ -221,39 +221,59 @@ func fatal(cmd string, err error) {
 	exitWithCode(1)
 }
 
-func usage() {
+func usage(code int) {
 	fmt.Fprintf(os.Stderr, `usage: drive9 <command> [arguments]
 
 commands:
-  create           provision a new database
-  ctx [name]       switch context (or show current)
-  ctx list         list all contexts
-  fs               filesystem operations
-  vault            vault operations
-  mount <dir>      mount drive9 as a local FUSE filesystem
-  umount <dir>     unmount a drive9 FUSE mount
+  create [--name NAME] [--server URL]
+                         provision a new database and owner context
+  ctx                    show current context
+  ctx add --api-key <key> [--name NAME] [--server URL]
+                         add owner context
+  ctx import [--from-file <path|->] [--name NAME]
+                         add delegated context
+  ctx ls [-l|--json]     list contexts
+  ctx use <name>         activate context
+  ctx rm <name>          delete context
+  fs <command>           filesystem operations
+  vault <set|get|put|with|ls|rm|grant|revoke|audit>
+                         vault operations
+  mount [flags] [:/remote] <mountpoint>
+                         mount drive9 filesystem
+  mount vault [flags] <mountpoint>
+                         mount vault secrets read-only
+  umount <mountpoint>    unmount a drive9 mount
+
+global:
+  -h, --help, help       show this help
+  -v, --version, version print version information
 `)
-	exitWithCode(2)
+	exitWithCode(code)
 }
 
-func fsUsage() {
+func fsUsage(code int) {
 	// Keep this usage block visually aligned. When editing wrapped help text,
 	// preserve the column layout so subcommand descriptions remain easy to scan.
 	fmt.Fprintf(os.Stderr, `usage: drive9 fs <command> [arguments]
 
 commands:
-  cp <src> <dst>       copy files (local↔remote)
-    --tag <key=value>  set file tag (repeatable, upload only; not with --append;
+  cp [flags] <src> <dst>
+                       copy files between local, remote, stdin, and stdout
+    --resume          resume an incomplete local-to-remote upload
+    --append          append a local file to a remote file
+    --tag <key=value> set file tag (repeatable, upload only; not with --append;
                        any --tag on re-upload replaces the existing tag set;
                        omit --tag to preserve existing tags)
-  cat <path>           read file to stdout
-  ls [path]            list directory
+    --description <text>
+                       set file description (local/stdin upload only)
+  cat <path>          read file to stdout
+  ls [-l] [path]      list directory
   stat [-o text|json] <path>
                        file metadata
-  mv <old> <new>       rename/move
+  mv <old> <new>      rename/move
   rm [-r|--recursive] <path>
                        remove file or directory tree
-  sh                   interactive shell
+  sh                  interactive shell
   grep <pattern> [dir] search file contents
   find [dir] [flags]   find files by attributes
     -name <glob>         match filename
@@ -262,8 +282,11 @@ commands:
     -newer <YYYY-MM-DD>  modified after date
     -older <YYYY-MM-DD>  modified before date
     -size <+N|-N>        size filter in bytes
+
+global:
+  -h, --help, help       show this help
 `)
-	exitWithCode(2)
+	exitWithCode(code)
 }
 
 func exitWithCode(code int) {

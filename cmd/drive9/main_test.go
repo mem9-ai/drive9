@@ -41,6 +41,56 @@ func TestStartCPUProfileFromEnv(t *testing.T) {
 	}
 }
 
+func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
+	origExit := exitFunc
+	origStderr := os.Stderr
+	origStop := cpuProfileStop
+	t.Cleanup(func() {
+		exitFunc = origExit
+		os.Stderr = origStderr
+		cpuProfileStop = origStop
+	})
+	cpuProfileStop = func() {}
+
+	var exitCodes []int
+	exitFunc = func(code int) { exitCodes = append(exitCodes, code) }
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+
+	dispatch("--help", nil)
+
+	_ = w.Close()
+	stderr := <-done
+
+	if len(exitCodes) != 1 || exitCodes[0] != 0 {
+		t.Fatalf("exit codes = %v, want [0] for explicit --help", exitCodes)
+	}
+	if strings.Contains(stderr, "unknown command") {
+		t.Fatalf("stderr = %q, want --help to show usage directly", stderr)
+	}
+	for _, want := range []string{
+		"usage: drive9 <command> [arguments]",
+		"ctx use <name>",
+		"mount [flags] [:/remote] <mountpoint>",
+		"mount vault [flags] <mountpoint>",
+		"-h, --help, help",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("stderr = %q, want it to contain %q", stderr, want)
+		}
+	}
+}
+
 // V2b: `drive9 vault <sub>` MUST route to the vault handler with args forwarded
 // verbatim (no shell parsing, no arg mangling). This is the positive half of
 // the hard-cut contract: the new verb name is live.
