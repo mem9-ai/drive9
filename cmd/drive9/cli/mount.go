@@ -203,6 +203,8 @@ func newWebDAVHandler(c *client.Client, prefix string, remoteRoot string) (http.
 }
 
 // validateRemoteRoot checks that the remote root path exists and is a directory.
+// Mirrors the FUSE path's Stat→List fallback so both mount modes behave
+// identically on backends where directory stat is unsupported.
 func validateRemoteRoot(c *client.Client, remoteRoot string) error {
 	if remoteRoot == "/" {
 		// Root always exists; verify server connectivity via List.
@@ -213,12 +215,26 @@ func validateRemoteRoot(c *client.Client, remoteRoot string) error {
 	}
 	stat, err := c.Stat(remoteRoot)
 	if err != nil {
-		return fmt.Errorf("remote root %q: %w", remoteRoot, err)
+		// Stat may fail on backends where directory stat is unsupported.
+		// Fall back to List to verify the remote root exists and is listable.
+		if _, listErr := c.List(remoteRoot); listErr != nil {
+			return remoteRootError(remoteRoot, listErr)
+		}
+		return nil
 	}
 	if !stat.IsDir {
 		return fmt.Errorf("remote root %q is not a directory", remoteRoot)
 	}
 	return nil
+}
+
+// remoteRootError wraps a remote-root stat/list error with actionable guidance
+// when the path does not exist (HTTP 404).
+func remoteRootError(remoteRoot string, err error) error {
+	if client.IsNotFound(err) {
+		return fmt.Errorf("drive9 mount: remote source %q does not exist\n\n  To create it first:\n    drive9 fs mkdir :%s\n  Then retry:\n    drive9 mount :%s <mountpoint>", remoteRoot, remoteRoot, remoteRoot)
+	}
+	return fmt.Errorf("remote root %q: %w", remoteRoot, err)
 }
 
 func validateLookupRetryFlags(count int, timeout time.Duration) error {

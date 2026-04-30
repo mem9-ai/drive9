@@ -61,6 +61,12 @@ func (e *StatusError) Is(target error) bool {
 	return target == ErrConflict && e.StatusCode == http.StatusConflict
 }
 
+// IsNotFound reports whether err is an HTTP 404 StatusError.
+func IsNotFound(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.StatusCode == http.StatusNotFound
+}
+
 // New creates a new dat9 client authenticated with an owner API key.
 //
 // Owner credentials reach the tenant management plane (CreateVaultSecret,
