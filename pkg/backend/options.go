@@ -16,13 +16,17 @@ const (
 	defaultImageExtractWorkers   = 1
 	defaultImageExtractMaxSize   = int64(8 << 20) // 8 MiB
 	defaultImageExtractTimeout   = 20 * time.Second
-	defaultMaxExtractedTextBytes = 8 << 10               // 8 KiB
-	defaultAudioExtractMaxSize   = int64(32 << 20)       // 32 MiB
-	defaultAudioExtractTimeout   = 2 * time.Minute
-	defaultMaxAudioExtractedTextBytes = 8 << 10          // 8 KiB
-	defaultMaxUploadBytes        = int64(10 * (1 << 30)) // 10 GiB
-	defaultMaxTenantStorageBytes = int64(50 * (1 << 30)) // 50 GiB
-	defaultMaxMediaLLMFiles      = int64(500)            // 500 media files per tenant
+	// DefaultImageExtractMaxTextBytes is the default stored semantic text cap
+	// for image extraction. The image writeback path also enforces an
+	// estimated-token cap before this byte cap is applied.
+	DefaultImageExtractMaxTextBytes   = 32 << 10 // 32 KiB
+	defaultMaxExtractedTextBytes      = DefaultImageExtractMaxTextBytes
+	defaultAudioExtractMaxSize        = int64(32 << 20) // 32 MiB
+	defaultAudioExtractTimeout        = 2 * time.Minute
+	defaultMaxAudioExtractedTextBytes = 8 << 10               // 8 KiB
+	defaultMaxUploadBytes             = int64(10 * (1 << 30)) // 10 GiB
+	defaultMaxTenantStorageBytes      = int64(50 * (1 << 30)) // 50 GiB
+	defaultMaxMediaLLMFiles           = int64(500)            // 500 media files per tenant
 	// defaultMaxMonthlyLLMCostMillicents is the per-tenant monthly LLM spend
 	// cap applied when no explicit budget is configured. $10.00 USD, expressed
 	// in millicents (0.001 cents; $10 = 1000 cents = 1_000_000 millicents).

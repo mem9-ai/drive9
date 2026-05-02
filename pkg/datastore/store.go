@@ -512,6 +512,46 @@ func (s *Store) ReplaceFileTagsTx(db execer, fileID string, tags map[string]stri
 	return nil
 }
 
+// ReplaceFileTagsByPrefixTx replaces only tags whose key starts with prefix
+// inside an existing transaction.
+//
+// This is intended for system-owned tag namespaces. Passing an empty map clears
+// that namespace while preserving all other file tags.
+func (s *Store) ReplaceFileTagsByPrefixTx(db execer, fileID string, prefix string, tags map[string]string) error {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return fmt.Errorf("tag prefix is required")
+	}
+	pattern := likeLiteralPrefixPattern(prefix)
+	if _, err := db.Exec(`DELETE FROM file_tags WHERE file_id = ? AND tag_key LIKE ? ESCAPE '\\'`, fileID, pattern); err != nil {
+		return err
+	}
+	if len(tags) == 0 {
+		return nil
+	}
+
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		if !strings.HasPrefix(k, prefix) {
+			return fmt.Errorf("tag key %q does not match prefix %q", k, prefix)
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		if _, err := db.Exec(`INSERT INTO file_tags (file_id, tag_key, tag_value) VALUES (?, ?, ?)`, fileID, k, tags[k]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func likeLiteralPrefixPattern(prefix string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return replacer.Replace(prefix) + "%"
+}
+
 // GetFileTags returns all tags for fileID.
 func (s *Store) GetFileTags(ctx context.Context, fileID string) (out map[string]string, err error) {
 	start := time.Now()

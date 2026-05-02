@@ -355,6 +355,117 @@ func TestProcessImageExtractTaskWritesContentTextAndQueuesEmbedTask(t *testing.T
 	}
 }
 
+func TestProcessImageExtractTaskStructuredJSONWritesCanonicalTextAndDrive9Tags(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: &staticImageExtractor{text: `{
+  "caption_zh": "秋季林荫道路",
+  "description_zh": "一条蜿蜒柏油路穿过金黄色树林。",
+  "caption_en": "Autumn tree-lined road",
+  "description_en": "A winding asphalt road runs through tall trees with golden leaves.",
+  "ocr_text": [],
+  "tags_zh": ["秋季", "林荫路"],
+  "tags_en": ["Autumn", "tree-lined road"],
+  "search_queries_zh": ["秋天金黄色树林道路"],
+  "search_queries_en": ["autumn golden tree road"]
+}`},
+		},
+	})
+
+	fileID := insertImageFileForExtractTest(t, b, "/img/structured.png", "image/png", []byte("fake-png"))
+	err := b.Store().InTx(context.Background(), func(tx *sql.Tx) error {
+		return b.Store().ReplaceFileTagsTx(tx, fileID, map[string]string{
+			"album":                  "Inbox",
+			"drive9.image.tag.en.0":  "old",
+			"drive9.thumbnail.ready": "true",
+		})
+	})
+	if err != nil {
+		t.Fatalf("seed tags: %v", err)
+	}
+
+	result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/img/structured.png",
+		ContentType: "image/png",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != ImageExtractResultWritten {
+		t.Fatalf("result=%q, want %q", result, ImageExtractResultWritten)
+	}
+
+	nf, err := b.Store().Stat(context.Background(), "/img/structured.png")
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat /img/structured.png: %v", err)
+	}
+	if strings.Contains(nf.File.ContentText, "caption_zh") || !strings.Contains(nf.File.ContentText, "中文摘要：秋季林荫道路") {
+		t.Fatalf("unexpected semantic text: %q", nf.File.ContentText)
+	}
+	tags, err := b.Store().GetFileTags(context.Background(), fileID)
+	if err != nil {
+		t.Fatalf("GetFileTags: %v", err)
+	}
+	if tags["album"] != "Inbox" || tags["drive9.thumbnail.ready"] != "true" {
+		t.Fatalf("application tags were not preserved: %+v", tags)
+	}
+	if tags["drive9.image.schema"] != imageExtractStructuredSchema {
+		t.Fatalf("drive9.image.schema=%q, want %q", tags["drive9.image.schema"], imageExtractStructuredSchema)
+	}
+	if tags["drive9.image.tag.en.0"] != "autumn" || tags["drive9.image.tag.zh.1"] != "林荫路" {
+		t.Fatalf("unexpected drive9 image tags: %+v", tags)
+	}
+}
+
+func TestProcessImageExtractTaskFallbackTextClearsDrive9ImageTagsOnly(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: &staticImageExtractor{text: "cat on sofa screenshot invoice"},
+		},
+	})
+
+	fileID := insertImageFileForExtractTest(t, b, "/img/fallback-tags.png", "image/png", []byte("fake-png"))
+	err := b.Store().InTx(context.Background(), func(tx *sql.Tx) error {
+		return b.Store().ReplaceFileTagsTx(tx, fileID, map[string]string{
+			"album":                 "Inbox",
+			"drive9.image.schema":   imageExtractStructuredSchema,
+			"drive9.image.tag.en.0": "old",
+		})
+	})
+	if err != nil {
+		t.Fatalf("seed tags: %v", err)
+	}
+
+	result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/img/fallback-tags.png",
+		ContentType: "image/png",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != ImageExtractResultWritten {
+		t.Fatalf("result=%q, want %q", result, ImageExtractResultWritten)
+	}
+
+	tags, err := b.Store().GetFileTags(context.Background(), fileID)
+	if err != nil {
+		t.Fatalf("GetFileTags: %v", err)
+	}
+	if tags["album"] != "Inbox" || len(tags) != 1 {
+		t.Fatalf("tags after fallback writeback = %+v, want only album=Inbox", tags)
+	}
+}
+
 func TestProcessImageExtractTaskAutoEmbeddingSkipsEmbedBridge(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
 		DatabaseAutoEmbedding: true,
