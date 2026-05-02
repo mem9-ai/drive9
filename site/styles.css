@@ -324,33 +324,14 @@ body {
 }
 
 /* ============================================
-   Section 3: Two-Layer Model
+   Section label bar (Core Product / Built on top)
    ============================================ */
-.two-layer-section {
-    padding: 80px 0;
-    background: linear-gradient(180deg, transparent, rgba(255, 255, 255, 0.02), transparent);
+.section-label-bar {
+    text-align: center;
+    margin-bottom: 16px;
 }
 
-.layer-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-    gap: 24px;
-}
-
-.layer-card {
-    background: var(--bg-card);
-    border: 1px solid var(--border-primary);
-    border-radius: var(--radius-xl);
-    padding: 36px;
-    transition: all 0.3s ease;
-}
-
-.layer-card:hover {
-    border-color: var(--accent-gray);
-    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1);
-}
-
-.layer-label {
+.section-label-badge {
     display: inline-block;
     font-size: 0.75rem;
     font-weight: 600;
@@ -358,53 +339,56 @@ body {
     letter-spacing: 0.08em;
     color: var(--accent-gray-light);
     background: rgba(255, 255, 255, 0.06);
-    padding: 4px 12px;
+    padding: 6px 16px;
     border-radius: 100px;
+}
+
+/* ============================================
+   For Agents section
+   ============================================ */
+.for-agents-section {
+    padding: 80px 0;
+    background: linear-gradient(180deg, transparent, rgba(255, 255, 255, 0.02), transparent);
+}
+
+.scenario-featured {
+    max-width: 760px;
+    margin: 0 auto 48px;
+}
+
+/* ============================================
+   Transition section
+   ============================================ */
+.transition-section {
+    padding: 80px 0;
+    text-align: center;
+}
+
+.transition-heading {
+    font-size: clamp(1.75rem, 4vw, 2.5rem);
+    font-weight: 700;
+    line-height: 1.2;
+    letter-spacing: -0.02em;
     margin-bottom: 16px;
 }
 
-.layer-card h3 {
-    font-size: 1.375rem;
-    font-weight: 700;
-    margin-bottom: 4px;
-    color: var(--text-primary);
-}
-
-.layer-subtitle {
-    font-size: 0.9375rem;
-    color: var(--text-muted);
-    margin-bottom: 20px;
-}
-
-.layer-features {
-    list-style: none;
-    padding: 0;
-}
-
-.layer-features li {
-    font-size: 0.9375rem;
+.transition-sub {
+    font-size: 1.125rem;
     color: var(--text-secondary);
-    padding: 8px 0;
-    padding-left: 20px;
-    position: relative;
-    line-height: 1.6;
+    max-width: 560px;
+    margin: 0 auto;
 }
 
-.layer-features li::before {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 16px;
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--accent-gray);
+/* ============================================
+   Built on top section
+   ============================================ */
+.built-on-top-section {
+    padding: 80px 0;
+    background: linear-gradient(180deg, transparent, rgba(255, 255, 255, 0.02), transparent);
 }
 
-.roadmap-note {
-    font-size: 0.8125rem;
-    color: var(--text-muted);
-    font-style: italic;
+.capabilities-human {
+    margin-top: 48px;
 }
 
 /* ============================================

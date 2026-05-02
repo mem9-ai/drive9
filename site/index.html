@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>drive9 — Shared filesystem for AI agents</title>
-    <meta name="description" content="Give every agent the same workspace. Mount a shared cloud workspace so Claude Code, Codex, and your own agents can read, write, share, and search the same files.">
+    <meta name="description" content="Give every agent the same workspace. Mount a shared remote filesystem so Claude Code, Codex, and your own agents can read, write, and share the same files.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -22,9 +22,9 @@
                 <span class="logo-text">drive9</span>
             </a>
             <div class="nav-links">
-                <a href="#two-layer">How it works</a>
-                <a href="#scenarios">Use cases</a>
-                <a href="#getting-started">Get started</a>
+                <a href="#for-agents">For Agents</a>
+                <a href="#built-on-top">For Teams</a>
+                <a href="#getting-started">Get Started</a>
                 <a href="#faq">FAQ</a>
                 <a href="https://github.com/mem9-ai/drive9" target="_blank" class="nav-github">
                     <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
@@ -35,7 +35,9 @@
         </div>
     </nav>
 
-    <!-- Section 1: Hero -->
+    <!-- ============================================
+         HERO — Agent-only
+         ============================================ -->
     <section class="hero">
         <div class="container">
             <div class="hero-eyebrow">Shared filesystem for AI agents</div>
@@ -44,8 +46,8 @@
                 <span class="gradient-text">the same workspace.</span>
             </h1>
             <p class="hero-subtitle">
-                Agents mount and share one remote filesystem. Teams search, organize,
-                and manage the files they produce.
+                Mount one remote filesystem into Claude Code, Codex, and your own agents.
+                They read, write, and share files through the same namespace.
             </p>
             <div class="hero-ctas">
                 <a href="#getting-started" class="cta-button primary">Get Started</a>
@@ -54,7 +56,9 @@
         </div>
     </section>
 
-    <!-- Section 2: Problem -->
+    <!-- ============================================
+         AGENT PROBLEM
+         ============================================ -->
     <section class="problem-section">
         <div class="container">
             <h2 class="section-title">Sound familiar?</h2>
@@ -68,81 +72,91 @@
                     <p>Syncing files between Claude Code, Codex, and custom agents means custom glue, environment variables, and manual copy.</p>
                 </div>
                 <div class="problem-card">
-                    <h3>Storage is split across too many systems.</h3>
-                    <p>S3 for blobs, a vector DB for search, local disk for working files, metadata in yet another store. Four systems for one job.</p>
+                    <h3>Working state is lost.</h3>
+                    <p>Skills, artifacts, and context disappear between sessions. Each run starts from scratch.</p>
                 </div>
             </div>
         </div>
     </section>
 
-    <!-- Section 3: Two-Layer Model -->
-    <section class="two-layer-section" id="two-layer">
+    <!-- ============================================
+         FOR AGENTS — Core product
+         ============================================ -->
+    <section class="for-agents-section" id="for-agents">
         <div class="container">
-            <h2 class="section-title">One product, two layers</h2>
-            <p class="section-subtitle">drive9 serves agents and humans through two distinct layers.</p>
-            <div class="layer-grid">
-                <div class="layer-card">
-                    <div class="layer-label">Layer 1</div>
-                    <h3>For your agents</h3>
-                    <p class="layer-subtitle">Filesystem</p>
-                    <ul class="layer-features">
-                        <li>Mount a shared remote workspace</li>
-                        <li>Read, write, and share files across Claude Code, Codex, and custom agents</li>
-                        <li>Persist skills, artifacts, and working state between sessions</li>
-                    </ul>
+            <div class="section-label-bar">
+                <span class="section-label-badge">Core Product</span>
+            </div>
+            <h2 class="section-title">For your agents</h2>
+            <p class="section-subtitle">Mount a shared remote workspace. Agents read, write, and share files through one namespace.</p>
+
+            <!-- Agent scenario -->
+            <div class="scenario-card scenario-featured">
+                <div class="scenario-header">
+                    <h3>Shared Agent Workspace</h3>
                 </div>
-                <div class="layer-card">
-                    <div class="layer-label">Layer 2</div>
-                    <h3>For you and your team</h3>
-                    <p class="layer-subtitle">Storage + Intelligence</p>
-                    <ul class="layer-features">
-                        <li>Search files by meaning, not just filename</li>
-                        <li>Extract searchable text from supported files</li>
-                        <li>Organize knowledge bases and asset libraries</li>
-                        <li>Team sharing <span class="roadmap-note">(scoped access on the roadmap)</span></li>
-                    </ul>
+                <div class="scenario-before">
+                    <div class="scenario-label">Before</div>
+                    <p>Claude Code writes skills to <code>~/.agents/skills/</code>. Codex can't see them. You copy files manually or build sync scripts.</p>
+                </div>
+                <div class="scenario-after">
+                    <div class="scenario-label">After</div>
+                    <p>Both agents mount <code>drive9 mount :/skills ~/drive9-skills</code>. One agent writes a skill, the other reads it immediately. Same namespace, zero sync.</p>
+                </div>
+            </div>
+
+            <!-- Agent capabilities -->
+            <div class="capabilities-grid">
+                <div class="capability-card">
+                    <h3>Mount as local filesystem</h3>
+                    <p>Mount drive9 at any local path. Use <code>ls</code>, <code>cat</code>, <code>vim</code>, <code>cp</code> &mdash; agents work without code changes.</p>
+                    <div class="capability-so-what">No new SDK or API needed. Agents just read and write files.</div>
+                </div>
+                <div class="capability-card">
+                    <h3>Shared namespace</h3>
+                    <p>Multiple agents mount the same remote directory. One writes, all see the change instantly.</p>
+                    <div class="capability-so-what">Cross-agent collaboration without sync infrastructure.</div>
+                </div>
+                <div class="capability-card">
+                    <h3>Large-file reliability</h3>
+                    <p>Streaming upload/download with automatic resume. Works for configs and datasets alike.</p>
+                    <div class="capability-so-what">No partial uploads, no manual retry scripts.</div>
+                </div>
+                <div class="capability-card">
+                    <h3>Zero-copy operations</h3>
+                    <p>Copy and rename without re-uploading data. Metadata-only, instant.</p>
+                    <div class="capability-so-what">Organize and deduplicate without storage cost or wait time.</div>
                 </div>
             </div>
         </div>
     </section>
 
-    <!-- Section 4: Scenarios -->
-    <section class="scenarios-section" id="scenarios">
+    <!-- ============================================
+         TRANSITION
+         ============================================ -->
+    <section class="transition-section">
         <div class="container">
-            <h2 class="section-title">Before &amp; after</h2>
-            <p class="section-subtitle">Concrete workflows, not feature lists.</p>
+            <h2 class="transition-heading">Your agents write files.<br><span class="gradient-text">Now what?</span></h2>
+            <p class="transition-sub">drive9 adds search, organization, and team access on top of the agent filesystem.</p>
+        </div>
+    </section>
+
+    <!-- ============================================
+         BUILT ON TOP — Human / team layer
+         ============================================ -->
+    <section class="built-on-top-section" id="built-on-top">
+        <div class="container">
+            <div class="section-label-bar">
+                <span class="section-label-badge">Built on top</span>
+            </div>
+            <h2 class="section-title">For you and your team</h2>
+            <p class="section-subtitle">Search, organize, and manage the files your agents produce.</p>
+
             <div class="scenarios-grid">
-                <!-- Scenario A: Shared Agent Workspace -->
-                <div class="scenario-card">
-                    <div class="scenario-header">
-                        <h3>Shared Agent Workspace</h3>
-                        <div class="scenario-layers">
-                            <span class="tag">Layer 1</span>
-                        </div>
-                    </div>
-                    <div class="scenario-before">
-                        <div class="scenario-label">Before</div>
-                        <p>Claude Code writes skills to <code>~/.agents/skills/</code>. Codex can't see them. You copy files manually or build sync scripts.</p>
-                    </div>
-                    <div class="scenario-after">
-                        <div class="scenario-label">After</div>
-                        <p>Both agents mount <code>drive9 mount :/skills ~/drive9-skills</code>. One agent writes a skill, the other reads it immediately. Same namespace, zero sync.</p>
-                    </div>
-                    <div class="scenario-tags">
-                        <span class="tag">mount</span>
-                        <span class="tag">multi-agent</span>
-                        <span class="tag">shared namespace</span>
-                    </div>
-                </div>
-
-                <!-- Scenario B: Team Knowledge Workspace -->
+                <!-- Team Knowledge -->
                 <div class="scenario-card">
                     <div class="scenario-header">
                         <h3>Team Knowledge Workspace</h3>
-                        <div class="scenario-layers">
-                            <span class="tag">Layer 1</span>
-                            <span class="tag">Layer 2</span>
-                        </div>
                     </div>
                     <div class="scenario-before">
                         <div class="scenario-label">Before</div>
@@ -159,13 +173,10 @@
                     </div>
                 </div>
 
-                <!-- Scenario C: Searchable Asset Library -->
+                <!-- Searchable Asset Library -->
                 <div class="scenario-card">
                     <div class="scenario-header">
                         <h3>Searchable Asset Library</h3>
-                        <div class="scenario-layers">
-                            <span class="tag">Layer 2</span>
-                        </div>
                     </div>
                     <div class="scenario-before">
                         <div class="scenario-label">Before</div>
@@ -182,44 +193,26 @@
                     </div>
                 </div>
             </div>
-        </div>
-    </section>
 
-    <!-- Section 5: Core Capabilities -->
-    <section class="capabilities-section">
-        <div class="container">
-            <h2 class="section-title">Core capabilities</h2>
-            <p class="section-subtitle">Prove the scenarios work.</p>
-            <div class="capabilities-grid">
+            <!-- Human capabilities -->
+            <div class="capabilities-grid capabilities-human">
                 <div class="capability-card">
-                    <div class="capability-layer">Layer 1</div>
-                    <h3>Mount as local filesystem</h3>
-                    <p>Mount drive9 at any local path. Use <code>ls</code>, <code>cat</code>, <code>vim</code>, <code>cp</code> &mdash; your tools and agents work without code changes.</p>
-                    <div class="capability-so-what">Agents don't need a new SDK or API; they just read and write files.</div>
-                </div>
-                <div class="capability-card">
-                    <div class="capability-layer">Layer 2</div>
                     <h3>Semantic search, built in</h3>
                     <p>Searchable text is extracted from supported files. Combine semantic, full-text, and keyword search to find files by meaning.</p>
-                    <div class="capability-so-what">Humans and agents find relevant files without knowing exact names or paths.</div>
+                    <div class="capability-so-what">Find relevant files without knowing exact names or paths.</div>
                 </div>
                 <div class="capability-card">
-                    <div class="capability-layer">Layer 1</div>
-                    <h3>Large-file reliability</h3>
-                    <p>Streaming upload/download with automatic resume. Works for configs and datasets alike.</p>
-                    <div class="capability-so-what">No partial uploads, no manual retry scripts.</div>
-                </div>
-                <div class="capability-card">
-                    <div class="capability-layer">Layer 1</div>
-                    <h3>Zero-copy operations</h3>
-                    <p>Copy and rename without re-uploading data. Metadata-only, instant.</p>
-                    <div class="capability-so-what">Organize and deduplicate without storage cost or wait time.</div>
+                    <h3>Tagging &amp; organization</h3>
+                    <p>Tag files with key-value metadata. Filter and find across directories. Build workflows around structured metadata.</p>
+                    <div class="capability-so-what">Organize agent output into manageable knowledge bases.</div>
                 </div>
             </div>
         </div>
     </section>
 
-    <!-- Section 6: Works With -->
+    <!-- ============================================
+         WORKS WITH — Trust strip
+         ============================================ -->
     <section class="works-with-section">
         <div class="container">
             <div class="works-with-strip">
@@ -239,7 +232,9 @@
         </div>
     </section>
 
-    <!-- Section 7: Getting Started -->
+    <!-- ============================================
+         GETTING STARTED — Agent FS path only
+         ============================================ -->
     <section class="getting-started-section" id="getting-started">
         <div class="container">
             <h2 class="section-title">Get started</h2>
@@ -300,7 +295,9 @@
         </div>
     </section>
 
-    <!-- Section 8: FAQ -->
+    <!-- ============================================
+         FAQ
+         ============================================ -->
     <section class="faq-section" id="faq">
         <div class="container">
             <h2 class="section-title">Frequently asked questions</h2>
@@ -341,7 +338,9 @@
         </div>
     </section>
 
-    <!-- Section 9: Footer -->
+    <!-- ============================================
+         FOOTER
+         ============================================ -->
     <footer class="footer">
         <div class="container">
             <div class="footer-grid">
@@ -398,7 +397,6 @@
         document.querySelectorAll('.faq-item summary').forEach(summary => {
             summary.addEventListener('click', function () {
                 const parent = this.parentElement;
-                // Close other open items
                 document.querySelectorAll('.faq-item[open]').forEach(item => {
                     if (item !== parent) item.removeAttribute('open');
                 });
