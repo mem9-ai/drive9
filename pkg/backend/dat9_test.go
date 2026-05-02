@@ -189,6 +189,26 @@ func TestDat9BackendAutoSemanticTaskTypes(t *testing.T) {
 	})
 }
 
+func TestExtractTextUsesEmbeddingSafeLimit(t *testing.T) {
+	if textExtractMaxBytes >= smallFileThreshold {
+		t.Fatalf("textExtractMaxBytes=%d must stay below smallFileThreshold=%d", textExtractMaxBytes, smallFileThreshold)
+	}
+	exact := make([]byte, textExtractMaxBytes)
+	for i := range exact {
+		exact[i] = 'a'
+	}
+	if got := extractText(exact, "application/json"); len(got) != textExtractMaxBytes {
+		t.Fatalf("exact limit extracted length=%d, want %d", len(got), textExtractMaxBytes)
+	}
+	oversized := append(exact, 'a')
+	if got := extractText(oversized, "application/json"); got != "" {
+		t.Fatalf("oversized text should not be extracted, got length %d", len(got))
+	}
+	if got := extractText([]byte("hello"), "text/plain"); got != "hello" {
+		t.Fatalf("small text extracted as %q, want hello", got)
+	}
+}
+
 func TestWriteAndRead(t *testing.T) {
 	b := newTestBackend(t)
 	n, err := b.Write("/data/file.txt", []byte("hello world"), 0, filesystem.WriteFlagCreate)

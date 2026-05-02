@@ -30,7 +30,13 @@ import (
 	"go.uber.org/zap"
 )
 
-const smallFileThreshold = 50_000 // 50,000 bytes — matches embedding model max input characters
+const (
+	smallFileThreshold = 50_000 // 50,000 bytes; controls DB-inline storage.
+	// TiDB auto embedding currently rejects inputs over 8192 tokens. Use a
+	// conservative byte cap for synchronous text extraction so text-heavy small
+	// files do not fail the whole write through the generated embedding column.
+	textExtractMaxBytes = 8_192
+)
 
 // Dat9Backend implements filesystem.FileSystem with the inode model.
 type Dat9Backend struct {
@@ -1100,7 +1106,7 @@ func extractText(data []byte, contentType string) string {
 		contentType != "application/yaml" {
 		return ""
 	}
-	if len(data) > smallFileThreshold {
+	if len(data) > textExtractMaxBytes {
 		return ""
 	}
 	return string(data)
