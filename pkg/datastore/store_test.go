@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -484,7 +485,7 @@ func TestReplaceFileTagsByPrefixTxPreservesOtherTags(t *testing.T) {
 		"drive9.image.tag.en.0":  "autumn road",
 		"drive9.thumbnail.ready": "true",
 	}
-	if fmt.Sprint(tags) != fmt.Sprint(want) {
+	if !reflect.DeepEqual(tags, want) {
 		t.Fatalf("tags after prefix replace = %+v, want %+v", tags, want)
 	}
 
@@ -502,7 +503,7 @@ func TestReplaceFileTagsByPrefixTxPreservesOtherTags(t *testing.T) {
 		"album":                  "Inbox",
 		"drive9.thumbnail.ready": "true",
 	}
-	if fmt.Sprint(tags) != fmt.Sprint(want) {
+	if !reflect.DeepEqual(tags, want) {
 		t.Fatalf("tags after prefix clear = %+v, want %+v", tags, want)
 	}
 }
