@@ -12,7 +12,30 @@ import (
 	"time"
 )
 
-const defaultImageExtractPrompt = "用中文描述这张图片，用于文件搜索。包括：主要物体、场景描述、图中可见文字（OCR）、简洁标签。最后一行用英文写5-10个关键词标签（English tags），用逗号分隔。"
+const (
+	defaultImageExtractPrompt = `请分析这张图片，输出用于 Drive9 文件搜索的结构化 JSON。只输出一个 JSON 对象，不要 Markdown，不要解释。字段固定为：
+{
+  "caption_zh": "中文一句话摘要，<=120字",
+  "description_zh": "中文详细描述，覆盖主体、场景、动作、颜色、构图、风格、时间/季节/地点线索，<=1200字",
+  "caption_en": "one concise English caption, <=30 words",
+  "description_en": "English description covering subjects, scene, action, colors, composition, style, time/season/location clues, <=260 words",
+  "ocr_text": ["图中可见文字；没有则空数组；最多100条，每条<=160字"],
+  "tags_zh": ["中文搜索标签，5-30个，短词，不要泛词"],
+  "tags_en": ["English search tags, 5-30, lowercase short phrases, no generic words like image/photo/picture/ocr/text"],
+  "search_queries_zh": ["中文自然搜索短语，3-12个"],
+  "search_queries_en": ["English natural search phrases, 3-12"]
+}
+要求：
+- 中英文都要覆盖可搜索信息，但不要逐字翻译造成重复堆砌。
+- 标签优先使用具体物体、场景、风格、颜色、季节、地点、动作、可见文字主题。
+- 若不确定不要编造；没有 OCR 就使用 []。
+- 整个 JSON 控制在 16000 字符以内。`
+
+	// DefaultOpenAIImageExtractMaxTokens leaves enough completion budget for
+	// structured bilingual extraction while the writeback path still enforces
+	// Drive9's embedding input safety limits.
+	DefaultOpenAIImageExtractMaxTokens = 4096
+)
 
 // OpenAIImageTextExtractorConfig configures an OpenAI-compatible vision endpoint.
 // This works with providers that expose the /v1/chat/completions API surface.
@@ -56,7 +79,7 @@ func NewOpenAIImageTextExtractor(cfg OpenAIImageTextExtractorConfig) (*OpenAIIma
 		cfg.Prompt = defaultImageExtractPrompt
 	}
 	if cfg.MaxTokens <= 0 {
-		cfg.MaxTokens = 256
+		cfg.MaxTokens = DefaultOpenAIImageExtractMaxTokens
 	}
 	client := cfg.Client
 	if client == nil {

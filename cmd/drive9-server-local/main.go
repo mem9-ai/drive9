@@ -376,12 +376,12 @@ environment:
   DRIVE9_IMAGE_EXTRACT_WORKERS number of workers (default: 1)
   DRIVE9_IMAGE_EXTRACT_MAX_BYTES max image bytes processed per task (default: 8388608)
   DRIVE9_IMAGE_EXTRACT_TIMEOUT_SECONDS extractor timeout seconds (default: 20)
-  DRIVE9_IMAGE_EXTRACT_MAX_TEXT_BYTES max extracted text stored in files.content_text (default: 8192)
+  DRIVE9_IMAGE_EXTRACT_MAX_TEXT_BYTES max extracted text stored in files.content_text (default: 32768)
   DRIVE9_IMAGE_EXTRACT_API_BASE OpenAI-compatible base URL (optional)
   DRIVE9_IMAGE_EXTRACT_API_KEY  API key for DRIVE9_IMAGE_EXTRACT_API_BASE (optional)
   DRIVE9_IMAGE_EXTRACT_MODEL    model name for vision extraction (optional)
   DRIVE9_IMAGE_EXTRACT_PROMPT   custom extraction prompt (optional)
-  DRIVE9_IMAGE_EXTRACT_MAX_TOKENS max model output tokens (default: 256)
+  DRIVE9_IMAGE_EXTRACT_MAX_TOKENS max model output tokens (default: 4096)
 
   Async audio transcript extract (TiDB auto-embedding durable tasks):
   DRIVE9_AUDIO_EXTRACT_ENABLED true|false (default: false)
@@ -592,14 +592,14 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 			Workers:             envInt("DRIVE9_IMAGE_EXTRACT_WORKERS", 1),
 			MaxImageBytes:       envInt64("DRIVE9_IMAGE_EXTRACT_MAX_BYTES", 8<<20),
 			TaskTimeout:         time.Duration(envInt("DRIVE9_IMAGE_EXTRACT_TIMEOUT_SECONDS", 20)) * time.Second,
-			MaxExtractTextBytes: envInt("DRIVE9_IMAGE_EXTRACT_MAX_TEXT_BYTES", 8<<10),
+			MaxExtractTextBytes: envInt("DRIVE9_IMAGE_EXTRACT_MAX_TEXT_BYTES", backend.DefaultImageExtractMaxTextBytes),
 		}
 
 		baseURL := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_API_BASE"))
 		apiKey := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_API_KEY"))
 		model := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_MODEL"))
 		prompt := strings.TrimSpace(os.Getenv("DRIVE9_IMAGE_EXTRACT_PROMPT"))
-		maxTokens := envInt("DRIVE9_IMAGE_EXTRACT_MAX_TOKENS", 256)
+		maxTokens := envInt("DRIVE9_IMAGE_EXTRACT_MAX_TOKENS", backend.DefaultOpenAIImageExtractMaxTokens)
 
 		configured := baseURL != "" || apiKey != "" || model != ""
 		if configured {

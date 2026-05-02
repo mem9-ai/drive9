@@ -438,6 +438,75 @@ func TestReplaceFileTagsTxAndGetFileTags(t *testing.T) {
 	}
 }
 
+func TestReplaceFileTagsByPrefixTxPreservesOtherTags(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID:      "f-prefix-tags",
+		StorageType: StorageDB9,
+		StorageRef:  "inline",
+		Revision:    1,
+		Status:      StatusConfirmed,
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.ReplaceFileTagsTx(tx, "f-prefix-tags", map[string]string{
+			"album":                  "Inbox",
+			"drive9.image.schema":    "old_schema",
+			"drive9.image.tag.en.0":  "old",
+			"drive9.thumbnail.ready": "true",
+		})
+	})
+	if err != nil {
+		t.Fatalf("ReplaceFileTagsTx(initial): %v", err)
+	}
+
+	err = s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.ReplaceFileTagsByPrefixTx(tx, "f-prefix-tags", "drive9.image.", map[string]string{
+			"drive9.image.schema":   "structured_v1",
+			"drive9.image.tag.en.0": "autumn road",
+		})
+	})
+	if err != nil {
+		t.Fatalf("ReplaceFileTagsByPrefixTx(replace): %v", err)
+	}
+	tags, err := s.GetFileTags(context.Background(), "f-prefix-tags")
+	if err != nil {
+		t.Fatalf("GetFileTags(replace): %v", err)
+	}
+	want := map[string]string{
+		"album":                  "Inbox",
+		"drive9.image.schema":    "structured_v1",
+		"drive9.image.tag.en.0":  "autumn road",
+		"drive9.thumbnail.ready": "true",
+	}
+	if fmt.Sprint(tags) != fmt.Sprint(want) {
+		t.Fatalf("tags after prefix replace = %+v, want %+v", tags, want)
+	}
+
+	err = s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.ReplaceFileTagsByPrefixTx(tx, "f-prefix-tags", "drive9.image.", nil)
+	})
+	if err != nil {
+		t.Fatalf("ReplaceFileTagsByPrefixTx(clear): %v", err)
+	}
+	tags, err = s.GetFileTags(context.Background(), "f-prefix-tags")
+	if err != nil {
+		t.Fatalf("GetFileTags(clear): %v", err)
+	}
+	want = map[string]string{
+		"album":                  "Inbox",
+		"drive9.thumbnail.ready": "true",
+	}
+	if fmt.Sprint(tags) != fmt.Sprint(want) {
+		t.Fatalf("tags after prefix clear = %+v, want %+v", tags, want)
+	}
+}
+
 func TestZeroCopyCp(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()

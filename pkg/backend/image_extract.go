@@ -282,8 +282,8 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 		return ImageExtractResultExtractError, fmt.Errorf("extract image text: %w", err)
 	}
 	b.recordImageExtractUsage(task.FileID, imageUsage)
-	text = sanitizeExtractedText(text, b.maxExtractTextBytes)
-	if text == "" {
+	writeback := prepareImageExtractWriteback(text, b.maxExtractTextBytes)
+	if writeback.text == "" {
 		return ImageExtractResultEmptyText, nil
 	}
 
@@ -293,11 +293,17 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 			return err
 		}
 		var txErr error
-		updated, txErr = b.store.UpdateFileSearchTextTx(tx, task.FileID, task.Revision, text)
+		updated, txErr = b.store.UpdateFileSearchTextTx(tx, task.FileID, task.Revision, writeback.text)
 		if txErr != nil {
 			return txErr
 		}
-		if !updated || b.UsesDatabaseAutoEmbedding() {
+		if !updated {
+			return nil
+		}
+		if txErr = b.store.ReplaceFileTagsByPrefixTx(tx, task.FileID, imageExtractTagPrefix, writeback.tags); txErr != nil {
+			return txErr
+		}
+		if b.UsesDatabaseAutoEmbedding() {
 			return nil
 		}
 		if err := injectedImageExtractWritebackError("imageExtractWritebackQueueEmbedTaskError"); err != nil {
@@ -388,6 +394,10 @@ func sanitizeExtractedText(in string, maxBytes int) string {
 	if maxBytes <= 0 || len(in) <= maxBytes {
 		return in
 	}
+	return truncateUTF8Bytes(in, maxBytes)
+}
+
+func truncateUTF8Bytes(in string, maxBytes int) string {
 	var (
 		total int
 		out   strings.Builder
