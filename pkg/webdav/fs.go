@@ -65,6 +65,17 @@ func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm o
 		return &writeFile{client: f.client, path: remote, props: f.deadProps()}, nil
 	}
 
+	// The drive9 API does not support stat on "/". For root, skip stat
+	// and list directly since we know it's a directory.
+	if remote == "/" {
+		entries, err := f.client.ListCtx(ctx, remote)
+		if err != nil {
+			return nil, mapError(err)
+		}
+		rootStat := &client.StatResult{IsDir: true}
+		return &dirFile{path: local, propPath: remote, props: f.deadProps(), stat: rootStat, entries: entries}, nil
+	}
+
 	// Stat to determine if it's a directory or file.
 	stat, err := f.client.StatCtx(ctx, remote)
 	if err != nil {
@@ -125,6 +136,13 @@ func (f *fileSystem) Rename(ctx context.Context, oldName, newName string) error 
 func (f *fileSystem) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 	local := normPath(name)
 	remote := mountpath.ToRemote(f.remoteRoot, local)
+
+	// The drive9 API does not support stat on the root path "/".
+	// Return a synthetic directory entry so WebDAV PROPFIND on "/" works.
+	if remote == "/" {
+		return &fileInfo{name: "/", stat: &client.StatResult{IsDir: true}}, nil
+	}
+
 	stat, err := f.client.StatCtx(ctx, remote)
 	if err != nil {
 		return nil, mapError(err)

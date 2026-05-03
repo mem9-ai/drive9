@@ -145,7 +145,7 @@ func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDe
 		srvErr <- srv.Serve(ln)
 	}()
 
-	readyCtx, readyCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := waitForWebDAVReady(readyCtx, serverURL); err != nil {
 		readyCancel()
 		_ = srv.Close()
@@ -281,7 +281,7 @@ func newWebDAVNoncePrefix() (string, error) {
 }
 
 func waitForWebDAVReady(ctx context.Context, serverURL string) error {
-	client := http.Client{Timeout: 200 * time.Millisecond}
+	client := http.Client{Timeout: 5 * time.Second}
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
