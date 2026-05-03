@@ -604,6 +604,29 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
+	// Root "/" is an implicit directory with no file_nodes row.
+	if path == "/" {
+		zero := int64(0)
+		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_ok", "path", path, "is_dir", true)...)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Dat9-Mtime", "0")
+		_ = json.NewEncoder(w).Encode(struct {
+			Size         int64             `json:"size"`
+			IsDir        bool              `json:"isdir"`
+			ResourceID   string            `json:"resource_id"`
+			Revision     int64             `json:"revision"`
+			Mtime        *int64            `json:"mtime,omitempty"`
+			ContentType  string            `json:"content_type"`
+			SemanticText string            `json:"semantic_text"`
+			Tags         map[string]string `json:"tags"`
+		}{
+			IsDir: true,
+			Mtime: &zero,
+			Tags:  make(map[string]string),
+		})
+		return
+	}
+
 	nf, err := b.StatNodeCtx(r.Context(), path)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {

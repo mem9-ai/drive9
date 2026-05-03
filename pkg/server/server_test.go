@@ -478,6 +478,36 @@ func TestStatRoot(t *testing.T) {
 	}
 }
 
+func TestStatMetadataRoot(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/fs/?stat=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("stat metadata root: expected 200, got %d", resp.StatusCode)
+	}
+	var body struct {
+		IsDir bool              `json:"isdir"`
+		Mtime *int64            `json:"mtime"`
+		Tags  map[string]string `json:"tags"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !body.IsDir {
+		t.Error("expected isdir true")
+	}
+	if body.Mtime == nil || *body.Mtime != 0 {
+		t.Errorf("expected mtime 0, got %v", body.Mtime)
+	}
+}
+
 func TestStatDirectoryWithoutTrailingSlash(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
