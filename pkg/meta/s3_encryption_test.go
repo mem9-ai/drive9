@@ -151,12 +151,84 @@ func TestResolveS3EncryptionPolicyTenantSSEKMSRequiresGlobalKey(t *testing.T) {
 	}
 }
 
+func TestResolveS3EncryptionPolicyInheritGlobalDSSEKMS(t *testing.T) {
+	resolved, err := ResolveS3EncryptionPolicy(
+		S3EncryptionPolicy{
+			Mode:             S3EncryptionModeDSSEKMS,
+			KMSKeyID:         "arn:aws:kms:ap-southeast-1:123456789012:key/test",
+			BucketKeyEnabled: false,
+		},
+		S3EncryptionPolicy{Mode: S3EncryptionModeInherit},
+	)
+	if err != nil {
+		t.Fatalf("ResolveS3EncryptionPolicy error = %v", err)
+	}
+	if resolved.Mode != s3client.EncryptionModeDSSEKMS {
+		t.Fatalf("mode = %q, want dsse-kms", resolved.Mode)
+	}
+	if resolved.KMSKeyID != "arn:aws:kms:ap-southeast-1:123456789012:key/test" {
+		t.Fatalf("kms key = %q", resolved.KMSKeyID)
+	}
+	if resolved.BucketKeyEnabled {
+		t.Fatal("bucket key enabled = true, want false for dsse-kms")
+	}
+
+	opts := resolved.EncryptionOpts(map[string]string{"tenant_id": "tenant-1"})
+	if opts.Mode != s3client.EncryptionModeDSSEKMS || opts.KMSKeyID != resolved.KMSKeyID {
+		t.Fatalf("unexpected opts: %+v", opts)
+	}
+	if opts.EncryptionContext["tenant_id"] != "tenant-1" {
+		t.Fatalf("context = %#v", opts.EncryptionContext)
+	}
+}
+
+func TestResolveS3EncryptionPolicyTenantDSSEKMSRejectsBucketKey(t *testing.T) {
+	_, err := ResolveS3EncryptionPolicy(
+		S3EncryptionPolicy{
+			Mode:             S3EncryptionModeNone,
+			KMSKeyID:         "arn:aws:kms:ap-southeast-1:123456789012:key/test",
+			BucketKeyEnabled: false,
+		},
+		S3EncryptionPolicy{Mode: S3EncryptionModeDSSEKMS, BucketKeyEnabled: true},
+	)
+	if err == nil {
+		t.Fatal("ResolveS3EncryptionPolicy error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "bucket key is not supported") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestValidateGlobalS3EncryptionPolicyRejectsMissingKMSKey(t *testing.T) {
 	err := ValidateGlobalS3EncryptionPolicy(S3EncryptionPolicy{Mode: S3EncryptionModeSSEKMS})
 	if err == nil {
 		t.Fatal("ValidateGlobalS3EncryptionPolicy error = nil, want error")
 	}
 	if !strings.Contains(err.Error(), "requires KMS key ID") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateGlobalS3EncryptionPolicyRejectsDSSEKMSBucketKey(t *testing.T) {
+	err := ValidateGlobalS3EncryptionPolicy(S3EncryptionPolicy{
+		Mode:             S3EncryptionModeDSSEKMS,
+		KMSKeyID:         "arn:aws:kms:ap-southeast-1:123456789012:key/test",
+		BucketKeyEnabled: true,
+	})
+	if err == nil {
+		t.Fatal("ValidateGlobalS3EncryptionPolicy error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "bucket key is not supported") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateGlobalS3EncryptionPolicyRejectsUnsupportedMode(t *testing.T) {
+	err := ValidateGlobalS3EncryptionPolicy(S3EncryptionPolicy{Mode: S3EncryptionMode("rot13")})
+	if err == nil {
+		t.Fatal("ValidateGlobalS3EncryptionPolicy error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "unsupported global") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -170,6 +242,16 @@ func TestValidateTenantS3EncryptionPolicyP1RejectsTenantKMSKey(t *testing.T) {
 		t.Fatal("ValidateTenantS3EncryptionPolicyP1 error = nil, want error")
 	}
 	if !strings.Contains(err.Error(), "tenant-specific") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateTenantS3EncryptionPolicyP1RejectsUnsupportedMode(t *testing.T) {
+	err := ValidateTenantS3EncryptionPolicyP1(S3EncryptionPolicy{Mode: S3EncryptionMode("rot13")})
+	if err == nil {
+		t.Fatal("ValidateTenantS3EncryptionPolicyP1 error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "unsupported tenant") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
