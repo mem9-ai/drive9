@@ -48,6 +48,8 @@ func InitSchemaStatements() []string {
 			embedding_revision BIGINT,
 			description_embedding vector(1024),
 			description_embedding_revision BIGINT,
+			storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'legacy',
+			storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT '',
 			created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			confirmed_at       TIMESTAMPTZ,
 			expires_at         TIMESTAMPTZ
@@ -78,6 +80,8 @@ func InitSchemaStatements() []string {
 			fingerprint_sha256 VARCHAR(128),
 			idempotency_key    VARCHAR(255),
 			description        TEXT,
+			storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'none',
+			storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT '',
 			created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			expires_at         TIMESTAMPTZ NOT NULL,

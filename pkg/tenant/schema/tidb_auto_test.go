@@ -903,6 +903,8 @@ func testFilesTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
 			"description":                    {columnType: "longtext"},
 			"description_embedding":          {columnType: "vector(1024)"},
 			"description_embedding_revision": {columnType: "bigint"},
+			"storage_encryption_mode":        {columnType: "varchar(16)"},
+			"storage_encryption_key_id":      {columnType: "varchar(256)"},
 		},
 	}
 	if mode == TiDBEmbeddingModeAuto {
@@ -924,9 +926,11 @@ func testUploadsTableMeta(includeExpectedRevision bool) tidbTableMeta {
 	meta := tidbTableMeta{
 		tableName: "uploads",
 		columns: map[string]tidbColumnMeta{
-			"upload_id":   {columnType: "varchar(64)"},
-			"target_path": {columnType: "varchar(512)"},
-			"status":      {columnType: "varchar(32)"},
+			"upload_id":                 {columnType: "varchar(64)"},
+			"target_path":               {columnType: "varchar(512)"},
+			"status":                    {columnType: "varchar(32)"},
+			"storage_encryption_mode":   {columnType: "varchar(16)"},
+			"storage_encryption_key_id": {columnType: "varchar(256)"},
 		},
 	}
 	if includeExpectedRevision {
