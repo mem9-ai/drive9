@@ -213,6 +213,24 @@ func TestApplyEncryptionSSES3(t *testing.T) {
 	}
 }
 
+func TestApplyEncryptionSSES3RejectsUnsupportedOptions(t *testing.T) {
+	tests := []struct {
+		name string
+		opts EncryptionOpts
+	}{
+		{name: "bucket key", opts: EncryptionOpts{Mode: EncryptionModeSSES3, BucketKeyEnabled: true}},
+		{name: "encryption context", opts: EncryptionOpts{Mode: EncryptionModeSSES3, EncryptionContext: map[string]string{"tenant_id": "tenant-1"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := applyEncryptionToPutObjectInput(&s3.PutObjectInput{}, tt.opts)
+			if err == nil {
+				t.Fatal("apply encryption error = nil, want error")
+			}
+		})
+	}
+}
+
 func TestApplyEncryptionSSEKMS(t *testing.T) {
 	contextMap := map[string]string{
 		"tenant_id":  "tenant-1",
@@ -236,6 +254,23 @@ func TestApplyEncryptionSSEKMS(t *testing.T) {
 		t.Fatalf("apply create encryption error = %v", err)
 	}
 	assertSSEKMSHeaders(t, createInput.ServerSideEncryption, createInput.SSEKMSKeyId, createInput.BucketKeyEnabled, createInput.SSEKMSEncryptionContext, opts.KMSKeyID, contextMap)
+}
+
+func TestApplyEncryptionSSEKMSBucketKeyFalseIsExplicit(t *testing.T) {
+	input := &s3.PutObjectInput{}
+	err := applyEncryptionToPutObjectInput(input, EncryptionOpts{
+		Mode:     EncryptionModeSSEKMS,
+		KMSKeyID: "arn:aws:kms:ap-southeast-1:123456789012:key/test",
+	})
+	if err != nil {
+		t.Fatalf("apply encryption error = %v", err)
+	}
+	if input.BucketKeyEnabled == nil {
+		t.Fatal("BucketKeyEnabled = nil, want explicit false")
+	}
+	if aws.ToBool(input.BucketKeyEnabled) {
+		t.Fatal("BucketKeyEnabled = true, want false")
+	}
 }
 
 func TestApplyEncryptionDSSEKMS(t *testing.T) {

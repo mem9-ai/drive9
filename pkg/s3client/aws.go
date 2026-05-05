@@ -410,6 +410,12 @@ func awsEncryptionFields(encOpts EncryptionOpts) (awsEncryptionFieldSet, error) 
 	case "", EncryptionModeLegacy, EncryptionModeNone:
 		return fields, nil
 	case EncryptionModeSSES3:
+		if encOpts.BucketKeyEnabled {
+			return fields, fmt.Errorf("bucket key is not supported for sse-s3 encryption")
+		}
+		if len(encOpts.EncryptionContext) != 0 {
+			return fields, fmt.Errorf("encryption context is not supported for sse-s3 encryption")
+		}
 		fields.serverSideEncryption = types.ServerSideEncryptionAes256
 		return fields, nil
 	case EncryptionModeSSEKMS:
@@ -418,9 +424,7 @@ func awsEncryptionFields(encOpts EncryptionOpts) (awsEncryptionFieldSet, error) 
 		}
 		fields.serverSideEncryption = types.ServerSideEncryptionAwsKms
 		fields.kmsKeyID = aws.String(encOpts.KMSKeyID)
-		if encOpts.BucketKeyEnabled {
-			fields.bucketKeyEnabled = aws.Bool(true)
-		}
+		fields.bucketKeyEnabled = aws.Bool(encOpts.BucketKeyEnabled)
 	case EncryptionModeDSSEKMS:
 		if encOpts.KMSKeyID == "" {
 			return fields, fmt.Errorf("dsse-kms encryption requires KMS key ID")
