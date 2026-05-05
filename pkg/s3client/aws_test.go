@@ -180,15 +180,36 @@ func TestApplyEncryptionLegacyAndNoneNoop(t *testing.T) {
 	for _, mode := range []EncryptionMode{EncryptionModeLegacy, EncryptionModeNone} {
 		t.Run(string(mode), func(t *testing.T) {
 			input := &s3.PutObjectInput{}
-			err := applyEncryptionToPutObjectInput(input, EncryptionOpts{
-				Mode:             mode,
-				KMSKeyID:         "ignored",
-				BucketKeyEnabled: true,
-			})
+			err := applyEncryptionToPutObjectInput(input, EncryptionOpts{Mode: mode})
 			if err != nil {
 				t.Fatalf("apply encryption error = %v", err)
 			}
 			assertNoEncryptionHeaders(t, input.ServerSideEncryption, input.SSEKMSKeyId, input.BucketKeyEnabled, input.SSEKMSEncryptionContext)
+		})
+	}
+}
+
+func TestApplyEncryptionNoEncryptionModesRejectUnusedFields(t *testing.T) {
+	tests := []struct {
+		name string
+		opts EncryptionOpts
+	}{
+		{name: "zero value with key", opts: EncryptionOpts{KMSKeyID: "key"}},
+		{name: "zero value with bucket key", opts: EncryptionOpts{BucketKeyEnabled: true}},
+		{name: "zero value with context", opts: EncryptionOpts{EncryptionContext: map[string]string{"tenant_id": "tenant-1"}}},
+		{name: "legacy with key", opts: EncryptionOpts{Mode: EncryptionModeLegacy, KMSKeyID: "key"}},
+		{name: "legacy with bucket key", opts: EncryptionOpts{Mode: EncryptionModeLegacy, BucketKeyEnabled: true}},
+		{name: "legacy with context", opts: EncryptionOpts{Mode: EncryptionModeLegacy, EncryptionContext: map[string]string{"tenant_id": "tenant-1"}}},
+		{name: "none with key", opts: EncryptionOpts{Mode: EncryptionModeNone, KMSKeyID: "key"}},
+		{name: "none with bucket key", opts: EncryptionOpts{Mode: EncryptionModeNone, BucketKeyEnabled: true}},
+		{name: "none with context", opts: EncryptionOpts{Mode: EncryptionModeNone, EncryptionContext: map[string]string{"tenant_id": "tenant-1"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := applyEncryptionToPutObjectInput(&s3.PutObjectInput{}, tt.opts)
+			if err == nil {
+				t.Fatal("apply encryption error = nil, want error")
+			}
 		})
 	}
 }
@@ -218,6 +239,7 @@ func TestApplyEncryptionSSES3RejectsUnsupportedOptions(t *testing.T) {
 		name string
 		opts EncryptionOpts
 	}{
+		{name: "kms key", opts: EncryptionOpts{Mode: EncryptionModeSSES3, KMSKeyID: "key"}},
 		{name: "bucket key", opts: EncryptionOpts{Mode: EncryptionModeSSES3, BucketKeyEnabled: true}},
 		{name: "encryption context", opts: EncryptionOpts{Mode: EncryptionModeSSES3, EncryptionContext: map[string]string{"tenant_id": "tenant-1"}}},
 	}

@@ -408,13 +408,13 @@ func awsEncryptionFields(encOpts EncryptionOpts) (awsEncryptionFieldSet, error) 
 	var fields awsEncryptionFieldSet
 	switch encOpts.Mode {
 	case "", EncryptionModeLegacy, EncryptionModeNone:
+		if err := rejectUnusedEncryptionFields(encOpts); err != nil {
+			return fields, err
+		}
 		return fields, nil
 	case EncryptionModeSSES3:
-		if encOpts.BucketKeyEnabled {
-			return fields, fmt.Errorf("bucket key is not supported for sse-s3 encryption")
-		}
-		if len(encOpts.EncryptionContext) != 0 {
-			return fields, fmt.Errorf("encryption context is not supported for sse-s3 encryption")
+		if err := rejectUnusedEncryptionFields(encOpts); err != nil {
+			return fields, err
 		}
 		fields.serverSideEncryption = types.ServerSideEncryptionAes256
 		return fields, nil
@@ -443,6 +443,26 @@ func awsEncryptionFields(encOpts EncryptionOpts) (awsEncryptionFieldSet, error) 
 	}
 	fields.encryptionContext = contextValue
 	return fields, nil
+}
+
+func rejectUnusedEncryptionFields(encOpts EncryptionOpts) error {
+	if encOpts.KMSKeyID != "" {
+		return fmt.Errorf("KMS key ID is not supported for %s encryption", noEncryptionModeLabel(encOpts.Mode))
+	}
+	if encOpts.BucketKeyEnabled {
+		return fmt.Errorf("bucket key is not supported for %s encryption", noEncryptionModeLabel(encOpts.Mode))
+	}
+	if len(encOpts.EncryptionContext) != 0 {
+		return fmt.Errorf("encryption context is not supported for %s encryption", noEncryptionModeLabel(encOpts.Mode))
+	}
+	return nil
+}
+
+func noEncryptionModeLabel(mode EncryptionMode) string {
+	if mode == "" {
+		return "zero-value"
+	}
+	return string(mode)
 }
 
 func encodeKMSEncryptionContext(contextMap map[string]string) (*string, error) {
