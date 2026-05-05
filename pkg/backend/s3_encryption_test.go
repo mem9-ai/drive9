@@ -116,6 +116,9 @@ func TestS3EncryptionPolicyDrivesPutObjectAndFileMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
+	if rec.lastPutEncryption.EncryptionContext["object_key"] != nf.File.StorageRef {
+		t.Fatalf("PutObject object_key context=%q, want %q", rec.lastPutEncryption.EncryptionContext["object_key"], nf.File.StorageRef)
+	}
 	if nf.File.StorageEncryptionMode != datastore.StorageEncryptionSSEKMS {
 		t.Fatalf("file encryption mode=%q, want %q", nf.File.StorageEncryptionMode, datastore.StorageEncryptionSSEKMS)
 	}
@@ -183,6 +186,9 @@ func TestS3EncryptionPolicyDrivesMultipartAndUploadMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get upload: %v", err)
 	}
+	if rec.lastMPUEncryption.EncryptionContext["object_key"] != upload.S3Key {
+		t.Fatalf("CreateMultipartUpload object_key context=%q, want %q", rec.lastMPUEncryption.EncryptionContext["object_key"], upload.S3Key)
+	}
 	if upload.StorageEncryptionMode != datastore.StorageEncryptionSSEKMS {
 		t.Fatalf("upload encryption mode=%q, want %q", upload.StorageEncryptionMode, datastore.StorageEncryptionSSEKMS)
 	}
@@ -245,8 +251,99 @@ func TestPatchUploadUsesResolvedEncryptionForNewTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get upload: %v", err)
 	}
+	if rec.lastMPUEncryption.EncryptionContext["object_key"] != upload.S3Key {
+		t.Fatalf("patch upload object_key context=%q, want %q", rec.lastMPUEncryption.EncryptionContext["object_key"], upload.S3Key)
+	}
 	if upload.StorageEncryptionMode != datastore.StorageEncryptionSSEKMS {
 		t.Fatalf("patch upload encryption mode=%q, want %q", upload.StorageEncryptionMode, datastore.StorageEncryptionSSEKMS)
+	}
+}
+
+func TestOverwriteLegacyS3FileRecordsResolvedEncryption(t *testing.T) {
+	b, rec := newTestBackendWithRecordingS3(t, false, Options{
+		TenantID:           "tenant-a",
+		S3EncryptionPolicy: resolvedSSEKMSTestPolicy(),
+	})
+	insertLegacyS3File(t, b, "/overwrite.bin", "legacy-file")
+
+	_, rev, err := b.WriteCtxIfRevisionWithTagsResult(
+		context.Background(),
+		"/overwrite.bin",
+		[]byte("encrypted overwrite"),
+		0,
+		filesystem.WriteFlagTruncate,
+		1,
+		nil,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+	if rev != 2 {
+		t.Fatalf("revision=%d, want 2", rev)
+	}
+	if rec.lastPutEncryption.Mode != s3client.EncryptionModeSSEKMS {
+		t.Fatalf("PutObject mode=%q, want %q", rec.lastPutEncryption.Mode, s3client.EncryptionModeSSEKMS)
+	}
+
+	nf, err := b.store.Stat(context.Background(), "/overwrite.bin")
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if rec.lastPutEncryption.EncryptionContext["object_key"] != nf.File.StorageRef {
+		t.Fatalf("PutObject object_key context=%q, want %q", rec.lastPutEncryption.EncryptionContext["object_key"], nf.File.StorageRef)
+	}
+	if nf.File.StorageEncryptionMode != datastore.StorageEncryptionSSEKMS {
+		t.Fatalf("file encryption mode=%q, want %q", nf.File.StorageEncryptionMode, datastore.StorageEncryptionSSEKMS)
+	}
+	if nf.File.StorageEncryptionKeyID != resolvedSSEKMSTestPolicy().KMSKeyID {
+		t.Fatalf("file encryption key=%q, want %q", nf.File.StorageEncryptionKeyID, resolvedSSEKMSTestPolicy().KMSKeyID)
+	}
+}
+
+func TestMultipartOverwriteLegacyS3FileRecordsResolvedEncryption(t *testing.T) {
+	b, rec := newTestBackendWithRecordingS3(t, true, Options{
+		TenantID:           "tenant-a",
+		S3EncryptionPolicy: resolvedSSEKMSTestPolicy(),
+	})
+	insertLegacyS3File(t, b, "/upload-overwrite.bin", "legacy-upload-file")
+
+	ctx := context.Background()
+	totalSize := int64(s3client.PartSize)
+	plan, err := b.InitiateUploadWithChecksumsIfRevision(ctx, "/upload-overwrite.bin", totalSize, nil, 1, "")
+	if err != nil {
+		t.Fatalf("initiate upload: %v", err)
+	}
+	upload, err := b.store.GetUpload(ctx, plan.UploadID)
+	if err != nil {
+		t.Fatalf("get upload: %v", err)
+	}
+	partData := bytes.Repeat([]byte("x"), int(totalSize))
+	if _, err := b.S3().(*recordingS3Client).S3Client.(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, 1, bytes.NewReader(partData)); err != nil {
+		t.Fatalf("upload part: %v", err)
+	}
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatalf("confirm upload: %v", err)
+	}
+
+	if rec.lastMPUEncryption.EncryptionContext["object_key"] != upload.S3Key {
+		t.Fatalf("CreateMultipartUpload object_key context=%q, want %q", rec.lastMPUEncryption.EncryptionContext["object_key"], upload.S3Key)
+	}
+	nf, err := b.store.Stat(ctx, "/upload-overwrite.bin")
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if nf.File.FileID != "legacy-upload-file" {
+		t.Fatalf("file_id=%q, want existing file id", nf.File.FileID)
+	}
+	if nf.File.Revision != 2 {
+		t.Fatalf("revision=%d, want 2", nf.File.Revision)
+	}
+	if nf.File.StorageEncryptionMode != datastore.StorageEncryptionSSEKMS {
+		t.Fatalf("file encryption mode=%q, want %q", nf.File.StorageEncryptionMode, datastore.StorageEncryptionSSEKMS)
+	}
+	if nf.File.StorageEncryptionKeyID != resolvedSSEKMSTestPolicy().KMSKeyID {
+		t.Fatalf("file encryption key=%q, want %q", nf.File.StorageEncryptionKeyID, resolvedSSEKMSTestPolicy().KMSKeyID)
 	}
 }
 
@@ -325,5 +422,33 @@ func TestReadPlanDoesNotUseEncryptionHeaders(t *testing.T) {
 	}
 	if rec.lastPutEncryption.Mode != "" {
 		t.Fatalf("read path mutated write encryption mode=%q", rec.lastPutEncryption.Mode)
+	}
+}
+
+func insertLegacyS3File(t *testing.T, b *Dat9Backend, path, fileID string) {
+	t.Helper()
+	now := time.Now().UTC()
+	if err := b.store.InsertFile(context.Background(), &datastore.File{
+		FileID:                fileID,
+		StorageType:           datastore.StorageS3,
+		StorageRef:            "blobs/" + fileID,
+		StorageEncryptionMode: datastore.StorageEncryptionLegacy,
+		SizeBytes:             1,
+		Revision:              1,
+		Status:                datastore.StatusConfirmed,
+		CreatedAt:             now,
+		ConfirmedAt:           &now,
+	}); err != nil {
+		t.Fatalf("insert legacy file: %v", err)
+	}
+	if err := b.store.InsertNode(context.Background(), &datastore.FileNode{
+		NodeID:     "node-" + fileID,
+		Path:       path,
+		ParentPath: pathutil.ParentPath(path),
+		Name:       pathutil.BaseName(path),
+		FileID:     fileID,
+		CreatedAt:  now,
+	}); err != nil {
+		t.Fatalf("insert legacy node: %v", err)
 	}
 }

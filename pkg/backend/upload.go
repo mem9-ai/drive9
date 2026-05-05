@@ -245,7 +245,7 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 
 	fileID := b.genID()
 	s3Key := "blobs/" + fileID
-	encOpts, encMode, encKeyID := b.s3WriteEncryption()
+	encOpts, encMode, encKeyID := b.s3WriteEncryption(s3Key)
 
 	// Create S3 multipart upload — v1 uses CRC32C
 	mpu, err := b.s3.CreateMultipartUpload(ctx, s3Key, s3client.ChecksumAlgoCRC32C, encOpts)
@@ -414,7 +414,7 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 
 	fileID := b.genID()
 	s3Key := "blobs/" + fileID
-	encOpts, encMode, encKeyID := b.s3WriteEncryption()
+	encOpts, encMode, encKeyID := b.s3WriteEncryption(s3Key)
 
 	// v2 does not declare a checksum algorithm at the S3 level because the
 	// client doesn't send per-part checksums yet (ChecksumContract.Required=false).

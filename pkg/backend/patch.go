@@ -212,7 +212,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	// Create new S3 multipart upload (new key — old object stays until confirm)
 	fileID := b.genID()
 	newS3Key := "blobs/" + fileID
-	encOpts, encMode, encKeyID := b.s3WriteEncryption()
+	encOpts, encMode, encKeyID := b.s3WriteEncryption(newS3Key)
 
 	mpu, err := b.s3.CreateMultipartUpload(ctx, newS3Key, s3client.ChecksumAlgoSHA256, encOpts)
 	if err != nil {
