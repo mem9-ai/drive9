@@ -2,6 +2,8 @@ package s3client
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -152,10 +154,13 @@ func (c *AWSS3Client) fullKey(key string) string {
 	return c.prefix + key
 }
 
-func (c *AWSS3Client) CreateMultipartUpload(ctx context.Context, key string, algo ChecksumAlgo) (*MultipartUpload, error) {
+func (c *AWSS3Client) CreateMultipartUpload(ctx context.Context, key string, algo ChecksumAlgo, encOpts EncryptionOpts) (*MultipartUpload, error) {
 	in := &s3.CreateMultipartUploadInput{
 		Bucket: &c.bucket,
 		Key:    aws.String(c.fullKey(key)),
+	}
+	if err := applyEncryptionToCreateMultipartUploadInput(in, encOpts); err != nil {
+		return nil, err
 	}
 	awsAlgo, ok, err := checksumAlgorithmForAWS(algo)
 	if err != nil {
@@ -345,17 +350,106 @@ func (c *AWSS3Client) PresignGetObject(ctx context.Context, key string, ttl time
 	return out.URL, nil
 }
 
-func (c *AWSS3Client) PutObject(ctx context.Context, key string, body io.Reader, size int64) error {
-	_, err := c.client.PutObject(ctx, &s3.PutObjectInput{
+func (c *AWSS3Client) PutObject(ctx context.Context, key string, body io.Reader, size int64, encOpts EncryptionOpts) error {
+	in := &s3.PutObjectInput{
 		Bucket:        &c.bucket,
 		Key:           aws.String(c.fullKey(key)),
 		Body:          body,
 		ContentLength: aws.Int64(size),
-	})
+	}
+	if err := applyEncryptionToPutObjectInput(in, encOpts); err != nil {
+		return err
+	}
+	_, err := c.client.PutObject(ctx, in)
 	if err != nil {
 		return fmt.Errorf("put object: %w", err)
 	}
 	return nil
+}
+
+func applyEncryptionToCreateMultipartUploadInput(in *s3.CreateMultipartUploadInput, encOpts EncryptionOpts) error {
+	fields, err := awsEncryptionFields(encOpts)
+	if err != nil {
+		return err
+	}
+	if fields.serverSideEncryption == "" {
+		return nil
+	}
+	in.ServerSideEncryption = fields.serverSideEncryption
+	in.SSEKMSKeyId = fields.kmsKeyID
+	in.BucketKeyEnabled = fields.bucketKeyEnabled
+	in.SSEKMSEncryptionContext = fields.encryptionContext
+	return nil
+}
+
+func applyEncryptionToPutObjectInput(in *s3.PutObjectInput, encOpts EncryptionOpts) error {
+	fields, err := awsEncryptionFields(encOpts)
+	if err != nil {
+		return err
+	}
+	if fields.serverSideEncryption == "" {
+		return nil
+	}
+	in.ServerSideEncryption = fields.serverSideEncryption
+	in.SSEKMSKeyId = fields.kmsKeyID
+	in.BucketKeyEnabled = fields.bucketKeyEnabled
+	in.SSEKMSEncryptionContext = fields.encryptionContext
+	return nil
+}
+
+type awsEncryptionFieldSet struct {
+	serverSideEncryption types.ServerSideEncryption
+	kmsKeyID             *string
+	bucketKeyEnabled     *bool
+	encryptionContext    *string
+}
+
+func awsEncryptionFields(encOpts EncryptionOpts) (awsEncryptionFieldSet, error) {
+	var fields awsEncryptionFieldSet
+	switch encOpts.Mode {
+	case "", EncryptionModeLegacy, EncryptionModeNone:
+		return fields, nil
+	case EncryptionModeSSES3:
+		fields.serverSideEncryption = types.ServerSideEncryptionAes256
+		return fields, nil
+	case EncryptionModeSSEKMS:
+		if encOpts.KMSKeyID == "" {
+			return fields, fmt.Errorf("sse-kms encryption requires KMS key ID")
+		}
+		fields.serverSideEncryption = types.ServerSideEncryptionAwsKms
+		fields.kmsKeyID = aws.String(encOpts.KMSKeyID)
+		if encOpts.BucketKeyEnabled {
+			fields.bucketKeyEnabled = aws.Bool(true)
+		}
+	case EncryptionModeDSSEKMS:
+		if encOpts.KMSKeyID == "" {
+			return fields, fmt.Errorf("dsse-kms encryption requires KMS key ID")
+		}
+		if encOpts.BucketKeyEnabled {
+			return fields, fmt.Errorf("bucket key is not supported for dsse-kms encryption")
+		}
+		fields.serverSideEncryption = types.ServerSideEncryptionAwsKmsDsse
+		fields.kmsKeyID = aws.String(encOpts.KMSKeyID)
+	default:
+		return fields, fmt.Errorf("unsupported encryption mode: %q", encOpts.Mode)
+	}
+	contextValue, err := encodeKMSEncryptionContext(encOpts.EncryptionContext)
+	if err != nil {
+		return fields, err
+	}
+	fields.encryptionContext = contextValue
+	return fields, nil
+}
+
+func encodeKMSEncryptionContext(contextMap map[string]string) (*string, error) {
+	if len(contextMap) == 0 {
+		return nil, nil
+	}
+	payload, err := json.Marshal(contextMap)
+	if err != nil {
+		return nil, fmt.Errorf("encode KMS encryption context: %w", err)
+	}
+	return aws.String(base64.StdEncoding.EncodeToString(payload)), nil
 }
 
 func (c *AWSS3Client) GetObject(ctx context.Context, key string) (io.ReadCloser, error) {

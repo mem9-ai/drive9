@@ -523,7 +523,7 @@ func TestWriteOverwriteDoesNotDeleteInlineMarkerObject(t *testing.T) {
 	if _, err := b.Write("/f", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.S3().PutObject(context.Background(), "inline", bytes.NewReader([]byte("marker")), int64(len("marker"))); err != nil {
+	if err := b.S3().PutObject(context.Background(), "inline", bytes.NewReader([]byte("marker")), int64(len("marker")), s3client.EncryptionOpts{}); err != nil {
 		t.Fatal(err)
 	}
 	large := bytes.Repeat([]byte("a"), 2<<20)

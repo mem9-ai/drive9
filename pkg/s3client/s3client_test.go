@@ -60,7 +60,7 @@ func TestPutAndGetObject(t *testing.T) {
 	ctx := context.Background()
 
 	data := []byte("hello world")
-	if err := c.PutObject(ctx, "blobs/test1", bytes.NewReader(data), int64(len(data))); err != nil {
+	if err := c.PutObject(ctx, "blobs/test1", bytes.NewReader(data), int64(len(data)), EncryptionOpts{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -79,7 +79,7 @@ func TestDeleteObject(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	if err := c.PutObject(ctx, "blobs/del", bytes.NewReader([]byte("x")), 1); err != nil {
+	if err := c.PutObject(ctx, "blobs/del", bytes.NewReader([]byte("x")), 1, EncryptionOpts{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.DeleteObject(ctx, "blobs/del"); err != nil {
@@ -96,7 +96,7 @@ func TestMultipartUploadComplete(t *testing.T) {
 	ctx := context.Background()
 
 	// Initiate
-	upload, err := c.CreateMultipartUpload(ctx, "blobs/big1", ChecksumAlgoSHA256)
+	upload, err := c.CreateMultipartUpload(ctx, "blobs/big1", ChecksumAlgoSHA256, EncryptionOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestMultipartUploadAbort(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	upload, err := c.CreateMultipartUpload(ctx, "blobs/aborted", ChecksumAlgoSHA256)
+	upload, err := c.CreateMultipartUpload(ctx, "blobs/aborted", ChecksumAlgoSHA256, EncryptionOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestPresignURLsGenerated(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	upload, _ := c.CreateMultipartUpload(ctx, "blobs/presign-test", ChecksumAlgoSHA256)
+	upload, _ := c.CreateMultipartUpload(ctx, "blobs/presign-test", ChecksumAlgoSHA256, EncryptionOpts{})
 
 	url, err := c.PresignUploadPart(ctx, "blobs/presign-test", upload.UploadID, 1, 8<<20, ChecksumAlgoSHA256, "abc", UploadTTL)
 	if err != nil {
@@ -194,7 +194,7 @@ func TestPartialUploadAndListParts(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	upload, _ := c.CreateMultipartUpload(ctx, "blobs/partial", ChecksumAlgoSHA256)
+	upload, _ := c.CreateMultipartUpload(ctx, "blobs/partial", ChecksumAlgoSHA256, EncryptionOpts{})
 
 	// Upload only parts 1 and 3 (skip 2 — simulates interrupted upload)
 	if _, err := c.UploadPart(ctx, upload.UploadID, 1, bytes.NewReader([]byte("PART1"))); err != nil {
@@ -222,7 +222,7 @@ func TestMultipartUploadNoChecksumAlgo(t *testing.T) {
 
 	// Initiate with ChecksumAlgoNone — simulates v2 uploads where
 	// the client doesn't send per-part checksums.
-	upload, err := c.CreateMultipartUpload(ctx, "blobs/no-checksum", ChecksumAlgoNone)
+	upload, err := c.CreateMultipartUpload(ctx, "blobs/no-checksum", ChecksumAlgoNone, EncryptionOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}

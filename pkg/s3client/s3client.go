@@ -9,11 +9,31 @@ import (
 	"time"
 )
 
+// EncryptionMode identifies the storage encryption mode used for an object.
+type EncryptionMode string
+
+const (
+	EncryptionModeLegacy  EncryptionMode = "legacy"
+	EncryptionModeNone    EncryptionMode = "none"
+	EncryptionModeSSES3   EncryptionMode = "sse-s3"
+	EncryptionModeSSEKMS  EncryptionMode = "sse-kms"
+	EncryptionModeDSSEKMS EncryptionMode = "dsse-kms"
+)
+
+// EncryptionOpts describes server-side encryption for a single S3 write.
+// The zero value is a no-op: no SSE headers are sent.
+type EncryptionOpts struct {
+	Mode              EncryptionMode
+	KMSKeyID          string
+	BucketKeyEnabled  bool
+	EncryptionContext map[string]string
+}
+
 // ChecksumAlgo identifies the checksum algorithm for a multipart upload.
 type ChecksumAlgo string
 
 const (
-	ChecksumAlgoNone   ChecksumAlgo = ""       // no checksum algorithm declared
+	ChecksumAlgoNone   ChecksumAlgo = "" // no checksum algorithm declared
 	ChecksumAlgoSHA256 ChecksumAlgo = "SHA256"
 	ChecksumAlgoCRC32C ChecksumAlgo = "CRC32C"
 )
@@ -48,7 +68,7 @@ type MultipartUpload struct {
 // Implementations: LocalS3Client (testing), AWSS3Client (production).
 type S3Client interface {
 	// CreateMultipartUpload initiates a new multipart upload with the given checksum algorithm.
-	CreateMultipartUpload(ctx context.Context, key string, algo ChecksumAlgo) (*MultipartUpload, error)
+	CreateMultipartUpload(ctx context.Context, key string, algo ChecksumAlgo, encOpts EncryptionOpts) (*MultipartUpload, error)
 
 	// PresignUploadPart returns a presigned URL for uploading a specific part.
 	// partSize is bound into the presigned URL as Content-Length per §11.2.
@@ -69,7 +89,7 @@ type S3Client interface {
 	PresignGetObject(ctx context.Context, key string, ttl time.Duration) (string, error)
 
 	// PutObject uploads a small object directly (used for testing/fallback).
-	PutObject(ctx context.Context, key string, body io.Reader, size int64) error
+	PutObject(ctx context.Context, key string, body io.Reader, size int64, encOpts EncryptionOpts) error
 
 	// GetObject reads an object's contents.
 	GetObject(ctx context.Context, key string) (io.ReadCloser, error)
