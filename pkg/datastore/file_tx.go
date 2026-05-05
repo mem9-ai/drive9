@@ -98,6 +98,23 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 	return rev, nil
 }
 
+// UpdateFileStorageEncryptionTx updates storage encryption metadata inside an existing transaction.
+func (s *Store) UpdateFileStorageEncryptionTx(db execer, fileID string, mode StorageEncryptionMode, keyID string) error {
+	res, err := db.Exec(`UPDATE files SET storage_encryption_mode = ?, storage_encryption_key_id = ? WHERE file_id = ?`,
+		fileStorageEncryptionModeForWrite(mode), keyID, fileID)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // UpdateFileContentAutoEmbeddingTx updates file bytes/metadata without touching
 // embedding columns. TiDB auto-embedding mode relies on the database to derive
 // vectors from content_text, so the write path must stop clearing vector state.

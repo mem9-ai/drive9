@@ -80,6 +80,41 @@ func TestUpdateFileContentTxClearsEmbeddingState(t *testing.T) {
 	}
 }
 
+func TestUpdateFileStorageEncryptionTx(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID:                "f1",
+		StorageType:           StorageS3,
+		StorageRef:            "/blobs/f1",
+		StorageEncryptionMode: StorageEncryptionLegacy,
+		SizeBytes:             10,
+		Revision:              1,
+		Status:                StatusConfirmed,
+		CreatedAt:             now,
+		ConfirmedAt:           &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.UpdateFileStorageEncryptionTx(tx, "f1", StorageEncryptionSSEKMS, "arn:aws:kms:ap-southeast-1:123456789012:key/test")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(context.Background(), "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StorageEncryptionMode != StorageEncryptionSSEKMS {
+		t.Fatalf("storage_encryption_mode=%q, want %q", got.StorageEncryptionMode, StorageEncryptionSSEKMS)
+	}
+	if got.StorageEncryptionKeyID != "arn:aws:kms:ap-southeast-1:123456789012:key/test" {
+		t.Fatalf("storage_encryption_key_id=%q", got.StorageEncryptionKeyID)
+	}
+}
+
 func TestClearFileEmbeddingStateTx(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now().UTC()

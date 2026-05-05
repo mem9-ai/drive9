@@ -245,9 +245,10 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 
 	fileID := b.genID()
 	s3Key := "blobs/" + fileID
+	encOpts, encMode, encKeyID := b.s3WriteEncryption()
 
 	// Create S3 multipart upload — v1 uses CRC32C
-	mpu, err := b.s3.CreateMultipartUpload(ctx, s3Key, s3client.ChecksumAlgoCRC32C, s3client.EncryptionOpts{})
+	mpu, err := b.s3.CreateMultipartUpload(ctx, s3Key, s3client.ChecksumAlgoCRC32C, encOpts)
 	if err != nil {
 		logger.Error(ctx, "backend_initiate_upload_create_multipart_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
@@ -299,31 +300,35 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 			}
 		}
 		if err := b.store.InsertFileTx(tx, &datastore.File{
-			FileID:      fileID,
-			StorageType: datastore.StorageS3,
-			StorageRef:  s3Key,
-			SizeBytes:   totalSize,
-			Revision:    1,
-			Status:      datastore.StatusPending,
-			CreatedAt:   now,
+			FileID:                 fileID,
+			StorageType:            datastore.StorageS3,
+			StorageRef:             s3Key,
+			StorageEncryptionMode:  encMode,
+			StorageEncryptionKeyID: encKeyID,
+			SizeBytes:              totalSize,
+			Revision:               1,
+			Status:                 datastore.StatusPending,
+			CreatedAt:              now,
 		}); err != nil {
 			return err
 		}
 		return b.store.InsertUploadTx(tx, &datastore.Upload{
-			UploadID:         uploadID,
-			FileID:           fileID,
-			TargetPath:       path,
-			S3UploadID:       mpu.UploadID,
-			S3Key:            s3Key,
-			TotalSize:        totalSize,
-			PartSize:         s3client.PartSize,
-			PartsTotal:       len(parts),
-			ExpectedRevision: expectedRevisionPtr(expectedRevision),
-			Status:           datastore.UploadUploading,
-			Description:      description,
-			CreatedAt:        now,
-			UpdatedAt:        now,
-			ExpiresAt:        now.Add(24 * time.Hour),
+			UploadID:               uploadID,
+			FileID:                 fileID,
+			TargetPath:             path,
+			S3UploadID:             mpu.UploadID,
+			S3Key:                  s3Key,
+			StorageEncryptionMode:  encMode,
+			StorageEncryptionKeyID: encKeyID,
+			TotalSize:              totalSize,
+			PartSize:               s3client.PartSize,
+			PartsTotal:             len(parts),
+			ExpectedRevision:       expectedRevisionPtr(expectedRevision),
+			Status:                 datastore.UploadUploading,
+			Description:            description,
+			CreatedAt:              now,
+			UpdatedAt:              now,
+			ExpiresAt:              now.Add(24 * time.Hour),
 		})
 	}); err != nil {
 		// Compensating abort: release server reservation on tenant DB failure.
@@ -409,12 +414,13 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 
 	fileID := b.genID()
 	s3Key := "blobs/" + fileID
+	encOpts, encMode, encKeyID := b.s3WriteEncryption()
 
 	// v2 does not declare a checksum algorithm at the S3 level because the
 	// client doesn't send per-part checksums yet (ChecksumContract.Required=false).
 	// When #114 adds inline checksums, switch back to a concrete algorithm.
 	createMultipartStart := time.Now()
-	mpu, err := b.s3.CreateMultipartUpload(ctx, s3Key, s3client.ChecksumAlgoNone, s3client.EncryptionOpts{})
+	mpu, err := b.s3.CreateMultipartUpload(ctx, s3Key, s3client.ChecksumAlgoNone, encOpts)
 	if err != nil {
 		logger.Error(ctx, "backend_initiate_upload_v2_create_multipart_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
@@ -451,33 +457,37 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		quotaDurationMs = uploadPhaseMs(stepStart)
 		stepStart = time.Now()
 		if err := b.store.InsertFileTx(tx, &datastore.File{
-			FileID:      fileID,
-			StorageType: datastore.StorageS3,
-			StorageRef:  s3Key,
-			SizeBytes:   totalSize,
-			Revision:    1,
-			Status:      datastore.StatusPending,
-			CreatedAt:   now,
+			FileID:                 fileID,
+			StorageType:            datastore.StorageS3,
+			StorageRef:             s3Key,
+			StorageEncryptionMode:  encMode,
+			StorageEncryptionKeyID: encKeyID,
+			SizeBytes:              totalSize,
+			Revision:               1,
+			Status:                 datastore.StatusPending,
+			CreatedAt:              now,
 		}); err != nil {
 			return err
 		}
 		insertFileDurationMs = uploadPhaseMs(stepStart)
 		stepStart = time.Now()
 		if err := b.store.InsertUploadTx(tx, &datastore.Upload{
-			UploadID:         uploadID,
-			FileID:           fileID,
-			TargetPath:       path,
-			S3UploadID:       mpu.UploadID,
-			S3Key:            s3Key,
-			TotalSize:        totalSize,
-			PartSize:         partSize,
-			PartsTotal:       len(parts),
-			ExpectedRevision: expectedRevisionPtr(expectedRevision),
-			Status:           datastore.UploadInitiated,
-			Description:      description,
-			CreatedAt:        now,
-			UpdatedAt:        now,
-			ExpiresAt:        expiresAt,
+			UploadID:               uploadID,
+			FileID:                 fileID,
+			TargetPath:             path,
+			S3UploadID:             mpu.UploadID,
+			S3Key:                  s3Key,
+			StorageEncryptionMode:  encMode,
+			StorageEncryptionKeyID: encKeyID,
+			TotalSize:              totalSize,
+			PartSize:               partSize,
+			PartsTotal:             len(parts),
+			ExpectedRevision:       expectedRevisionPtr(expectedRevision),
+			Status:                 datastore.UploadInitiated,
+			Description:            description,
+			CreatedAt:              now,
+			UpdatedAt:              now,
+			ExpiresAt:              expiresAt,
 		}); err != nil {
 			return err
 		}
@@ -976,6 +986,9 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 				)
 			}
 			if err != nil {
+				return err
+			}
+			if err := b.store.UpdateFileStorageEncryptionTx(tx, existingFileID.String, upload.StorageEncryptionMode, upload.StorageEncryptionKeyID); err != nil {
 				return err
 			}
 			updateFileContentDurationMs = uploadPhaseMs(stepStart)

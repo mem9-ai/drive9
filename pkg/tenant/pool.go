@@ -23,18 +23,19 @@ import (
 )
 
 type PoolConfig struct {
-	MaxTenants        int
-	S3Dir             string
-	PublicURL         string
-	S3Bucket          string
-	S3Region          string
-	S3Prefix          string
-	S3RoleARN         string
-	S3Endpoint        string
-	S3ForcePathStyle  bool
-	S3AccessKeyID     string
-	S3SecretAccessKey string
-	S3SessionToken    string
+	MaxTenants         int
+	S3Dir              string
+	PublicURL          string
+	S3Bucket           string
+	S3Region           string
+	S3Prefix           string
+	S3RoleARN          string
+	S3Endpoint         string
+	S3ForcePathStyle   bool
+	S3AccessKeyID      string
+	S3SecretAccessKey  string
+	S3SessionToken     string
+	S3EncryptionPolicy meta.S3EncryptionPolicy
 
 	BackendOptions backend.Options
 
@@ -323,6 +324,12 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	}
 	decryptDurationMs := float64(time.Since(decryptStart).Microseconds()) / 1000.0
 	opts := p.cfg.BackendOptions
+	resolvedEncryptionPolicy, err := meta.ResolveS3EncryptionPolicy(p.cfg.S3EncryptionPolicy, t.S3EncryptionPolicy())
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve s3 encryption policy: %w", err)
+	}
+	opts.TenantID = t.ID
+	opts.S3EncryptionPolicy = resolvedEncryptionPolicy
 	if UsesTiDBAutoEmbedding(t.Provider) {
 		opts.DatabaseAutoEmbedding = true
 	}

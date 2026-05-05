@@ -212,8 +212,9 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	// Create new S3 multipart upload (new key — old object stays until confirm)
 	fileID := b.genID()
 	newS3Key := "blobs/" + fileID
+	encOpts, encMode, encKeyID := b.s3WriteEncryption()
 
-	mpu, err := b.s3.CreateMultipartUpload(ctx, newS3Key, s3client.ChecksumAlgoSHA256, s3client.EncryptionOpts{})
+	mpu, err := b.s3.CreateMultipartUpload(ctx, newS3Key, s3client.ChecksumAlgoSHA256, encOpts)
 	if err != nil {
 		logger.Error(ctx, "backend_patch_upload_create_mpu_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
@@ -318,30 +319,34 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 			return err
 		}
 		if err := b.store.InsertFileTx(tx, &datastore.File{
-			FileID:      fileID,
-			StorageType: datastore.StorageS3,
-			StorageRef:  newS3Key,
-			SizeBytes:   newSize,
-			Revision:    1,
-			Status:      datastore.StatusPending,
-			CreatedAt:   now,
+			FileID:                 fileID,
+			StorageType:            datastore.StorageS3,
+			StorageRef:             newS3Key,
+			StorageEncryptionMode:  encMode,
+			StorageEncryptionKeyID: encKeyID,
+			SizeBytes:              newSize,
+			Revision:               1,
+			Status:                 datastore.StatusPending,
+			CreatedAt:              now,
 		}); err != nil {
 			return err
 		}
 		return b.store.InsertUploadTx(tx, &datastore.Upload{
-			UploadID:         uploadID,
-			FileID:           fileID,
-			TargetPath:       path,
-			S3UploadID:       mpu.UploadID,
-			S3Key:            newS3Key,
-			TotalSize:        newSize,
-			PartSize:         partSize,
-			PartsTotal:       len(newParts),
-			ExpectedRevision: expectedRevisionPtr(expectedRevision),
-			Status:           datastore.UploadUploading,
-			CreatedAt:        now,
-			UpdatedAt:        now,
-			ExpiresAt:        expiresAt,
+			UploadID:               uploadID,
+			FileID:                 fileID,
+			TargetPath:             path,
+			S3UploadID:             mpu.UploadID,
+			S3Key:                  newS3Key,
+			StorageEncryptionMode:  encMode,
+			StorageEncryptionKeyID: encKeyID,
+			TotalSize:              newSize,
+			PartSize:               partSize,
+			PartsTotal:             len(newParts),
+			ExpectedRevision:       expectedRevisionPtr(expectedRevision),
+			Status:                 datastore.UploadUploading,
+			CreatedAt:              now,
+			UpdatedAt:              now,
+			ExpiresAt:              expiresAt,
 		})
 	}); err != nil {
 		if reserved {
