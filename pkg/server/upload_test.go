@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -61,6 +62,50 @@ func newTestServerWithS3Config(t *testing.T, backendOpts backend.Options, worker
 		t.Fatal(err)
 	}
 	return NewWithConfig(Config{Backend: b, SemanticWorkers: workerOpts}), s3c
+}
+
+type failingCreateMultipartS3 struct {
+	*s3client.LocalS3Client
+	err error
+}
+
+func (s *failingCreateMultipartS3) CreateMultipartUpload(ctx context.Context, key string, algo s3client.ChecksumAlgo, encOpts s3client.EncryptionOpts) (*s3client.MultipartUpload, error) {
+	return nil, s.err
+}
+
+func newTestServerWithCreateMultipartError(t *testing.T, err error) *Server {
+	t.Helper()
+
+	blobDir, err2 := os.MkdirTemp("", "dat9-srv-blobs-*")
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(blobDir) })
+
+	s3Dir, err2 := os.MkdirTemp("", "dat9-srv-s3-*")
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(s3Dir) })
+
+	initServerTenantSchema(t, testDSN)
+	store, err2 := datastore.Open(testDSN)
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	testmysql.ResetDB(t, store.DB())
+	t.Cleanup(func() { _ = store.Close() })
+
+	localS3, err2 := s3client.NewLocal(s3Dir, "http://localhost:9091/s3")
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	failingS3 := &failingCreateMultipartS3{LocalS3Client: localS3, err: err}
+	b, err2 := backend.NewWithS3ModeAndOptions(store, failingS3, true, backend.Options{})
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	return NewWithConfig(Config{Backend: b})
 }
 
 func partChecksumHeader(data []byte) string {
@@ -251,6 +296,188 @@ func TestUploadInitiateByBody202(t *testing.T) {
 	if len(plan.Parts) == 0 {
 		t.Error("expected parts")
 	}
+}
+
+func TestUploadInitiateSanitizesCreateMultipartProviderError(t *testing.T) {
+	leakedErr := errors.New("operation error S3: CreateMultipartUpload, https response error StatusCode: 403, RequestID: QCRQPQAG0J880ZFK, HostID: KAjMF1T1LtFzMU/V7Tzp0rt14AqR7irO2HJtlHdXBCQioAv14tJsNkbUWvBZbSGYcFxqroX6fdo=, api error AccessDenied: User: arn:aws:sts::401696231252:assumed-role/prod-dat9-server-irsa/1777968029598718639 is not authorized to perform: kms:GenerateDataKey on resource: arn:aws:kms:ap-southeast-1:401696231252:key/fca526d7-bbff-44d4-9eee-7dd44053e85b")
+	s := newTestServerWithCreateMultipartError(t, leakedErr)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	body := make([]byte, 1<<20)
+	v1Body, _ := json.Marshal(map[string]any{
+		"path":           "/leak-v1.bin",
+		"total_size":     len(body),
+		"part_checksums": strings.Split(partChecksumHeader(body), ","),
+	})
+	v2Body, _ := json.Marshal(map[string]any{
+		"path":       "/leak-v2.bin",
+		"total_size": len(body),
+	})
+
+	tests := []struct {
+		name        string
+		req         *http.Request
+		contentType string
+	}{
+		{
+			name:        "large put",
+			req:         mustNewRequest(t, http.MethodPut, ts.URL+"/v1/fs/leak-put.bin", bytes.NewReader(body)),
+			contentType: "",
+		},
+		{
+			name:        "v1 initiate",
+			req:         mustNewRequest(t, http.MethodPost, ts.URL+"/v1/uploads/initiate", bytes.NewReader(v1Body)),
+			contentType: "application/json",
+		},
+		{
+			name:        "v2 initiate",
+			req:         mustNewRequest(t, http.MethodPost, ts.URL+"/v2/uploads/initiate", bytes.NewReader(v2Body)),
+			contentType: "application/json",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.contentType != "" {
+				tt.req.Header.Set("Content-Type", tt.contentType)
+			}
+			if tt.req.Method == http.MethodPut {
+				tt.req.ContentLength = int64(len(body))
+				tt.req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
+			}
+			resp, err := http.DefaultClient.Do(tt.req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusInternalServerError {
+				respBody, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 500: %s", resp.StatusCode, respBody)
+			}
+			respBody, _ := io.ReadAll(resp.Body)
+			text := string(respBody)
+			if !strings.Contains(text, internalStorageErrorMessage) {
+				t.Fatalf("response = %q, want sanitized storage error", text)
+			}
+			for _, leaked := range []string{
+				"arn:aws",
+				"RequestID",
+				"HostID",
+				"GenerateDataKey",
+				"prod-dat9-server-irsa",
+				"operation error S3",
+				"fca526d7-bbff-44d4-9eee-7dd44053e85b",
+			} {
+				if strings.Contains(text, leaked) {
+					t.Fatalf("response leaked %q: %s", leaked, text)
+				}
+			}
+		})
+	}
+}
+
+func TestV2PresignValidationErrorRemainsClientError(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	plan := mustInitiateV2Upload(t, ts, "/v2-presign-invalid.bin", 20<<20)
+
+	body, _ := json.Marshal(map[string]any{"part_number": plan.TotalParts + 1})
+	req := mustNewRequest(t, http.MethodPost, ts.URL+"/v2/uploads/"+plan.UploadID+"/presign", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, respBody)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	text := string(respBody)
+	if !strings.Contains(text, "invalid part number") {
+		t.Fatalf("response = %q, want invalid part number", text)
+	}
+	if strings.Contains(text, internalStorageErrorMessage) {
+		t.Fatalf("response = %q, want client error not internal storage error", text)
+	}
+}
+
+func TestV2CompleteValidationErrorRemainsClientError(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	plan := mustInitiateV2Upload(t, ts, "/v2-complete-invalid.bin", 20<<20)
+	presignBody, _ := json.Marshal(map[string]any{"part_number": 1})
+	req := mustNewRequest(t, http.MethodPost, ts.URL+"/v2/uploads/"+plan.UploadID+"/presign", bytes.NewReader(presignBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("presign status = %d, want 200", resp.StatusCode)
+	}
+
+	completeBody, _ := json.Marshal(map[string]any{
+		"parts": []map[string]any{{"number": 1, "etag": "etag-1"}},
+	})
+	req = mustNewRequest(t, http.MethodPost, ts.URL+"/v2/uploads/"+plan.UploadID+"/complete", bytes.NewReader(completeBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, respBody)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	text := string(respBody)
+	if !strings.Contains(text, "part count mismatch") {
+		t.Fatalf("response = %q, want part count mismatch", text)
+	}
+	if strings.Contains(text, internalStorageErrorMessage) {
+		t.Fatalf("response = %q, want client error not internal storage error", text)
+	}
+}
+
+func mustInitiateV2Upload(t *testing.T, ts *httptest.Server, path string, totalSize int64) backend.UploadPlanV2 {
+	t.Helper()
+	reqBody, _ := json.Marshal(map[string]any{
+		"path":       path,
+		"total_size": totalSize,
+	})
+	req := mustNewRequest(t, http.MethodPost, ts.URL+"/v2/uploads/initiate", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("initiate status = %d, want 202: %s", resp.StatusCode, body)
+	}
+	var plan backend.UploadPlanV2
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
+
+func mustNewRequest(t *testing.T, method, url string, body io.Reader) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return req
 }
 
 func TestV1UploadInitiateReturnsAllPresignedParts(t *testing.T) {

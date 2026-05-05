@@ -64,6 +64,22 @@ type PresignPartEntry struct {
 }
 
 var ErrPartChecksumCountMismatch = errors.New("part checksum count mismatch")
+var ErrUploadClientProtocol = errors.New("upload client protocol error")
+
+type uploadClientProtocolError struct {
+	msg string
+}
+
+func (e uploadClientProtocolError) Error() string { return e.msg }
+
+func (e uploadClientProtocolError) Is(target error) bool {
+	return target == ErrUploadClientProtocol
+}
+
+func uploadClientProtocolErrorf(format string, args ...any) error {
+	return uploadClientProtocolError{msg: fmt.Sprintf(format, args...)}
+}
+
 var lookupActiveUploadByPath = func(store *datastore.Store, ctx context.Context, path string) (*datastore.Upload, error) {
 	return store.GetUploadByPath(ctx, path)
 }
@@ -576,7 +592,7 @@ func (b *Dat9Backend) PresignPart(ctx context.Context, uploadID string, partNumb
 	}
 	if partNumber < 1 || partNumber > upload.PartsTotal {
 		metrics.RecordOperation("backend", "presign_part", "error", time.Since(start))
-		return nil, fmt.Errorf("invalid part number %d: must be between 1 and %d", partNumber, upload.PartsTotal)
+		return nil, uploadClientProtocolErrorf("invalid part number %d: must be between 1 and %d", partNumber, upload.PartsTotal)
 	}
 
 	parts := s3client.CalcParts(upload.TotalSize, upload.PartSize)
@@ -630,14 +646,14 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, entries
 	}
 	if len(entries) > MaxPresignBatch {
 		metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
-		return nil, fmt.Errorf("batch too large: %d parts exceeds limit of %d", len(entries), MaxPresignBatch)
+		return nil, uploadClientProtocolErrorf("batch too large: %d parts exceeds limit of %d", len(entries), MaxPresignBatch)
 	}
 	// Reject duplicate part numbers in the batch.
 	seen := make(map[int]bool, len(entries))
 	for _, e := range entries {
 		if seen[e.PartNumber] {
 			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
-			return nil, fmt.Errorf("duplicate part number %d in batch", e.PartNumber)
+			return nil, uploadClientProtocolErrorf("duplicate part number %d in batch", e.PartNumber)
 		}
 		seen[e.PartNumber] = true
 	}
@@ -655,7 +671,7 @@ func (b *Dat9Backend) PresignParts(ctx context.Context, uploadID string, entries
 		pn := e.PartNumber
 		if pn < 1 || pn > upload.PartsTotal {
 			metrics.RecordOperation("backend", "presign_parts", "error", time.Since(start))
-			return nil, fmt.Errorf("invalid part number %d: must be between 1 and %d", pn, upload.PartsTotal)
+			return nil, uploadClientProtocolErrorf("invalid part number %d: must be between 1 and %d", pn, upload.PartsTotal)
 		}
 		partSize := parts[pn-1].Size
 		resolveChecksumStart := time.Now()
@@ -745,7 +761,7 @@ func (b *Dat9Backend) ConfirmUploadV2WithTags(ctx context.Context, uploadID stri
 	clientValidationStart := time.Now()
 	if len(clientParts) != upload.PartsTotal {
 		metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
-		return fmt.Errorf("part count mismatch: client sent %d, expected %d", len(clientParts), upload.PartsTotal)
+		return uploadClientProtocolErrorf("part count mismatch: client sent %d, expected %d", len(clientParts), upload.PartsTotal)
 	}
 
 	// Reject duplicate part numbers and validate completeness (all 1..N present)
@@ -753,11 +769,11 @@ func (b *Dat9Backend) ConfirmUploadV2WithTags(ctx context.Context, uploadID stri
 	for _, cp := range clientParts {
 		if _, dup := clientPartMap[cp.Number]; dup {
 			metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
-			return fmt.Errorf("duplicate part number %d in complete request", cp.Number)
+			return uploadClientProtocolErrorf("duplicate part number %d in complete request", cp.Number)
 		}
 		if cp.Number < 1 || cp.Number > upload.PartsTotal {
 			metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
-			return fmt.Errorf("invalid part number %d: must be between 1 and %d", cp.Number, upload.PartsTotal)
+			return uploadClientProtocolErrorf("invalid part number %d: must be between 1 and %d", cp.Number, upload.PartsTotal)
 		}
 		clientPartMap[cp.Number] = cp.ETag
 	}
@@ -783,11 +799,11 @@ func (b *Dat9Backend) ConfirmUploadV2WithTags(ctx context.Context, uploadID stri
 		s3ETag, ok := s3PartMap[partNum]
 		if !ok {
 			metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
-			return fmt.Errorf("part %d not found in S3", partNum)
+			return uploadClientProtocolErrorf("part %d not found in S3", partNum)
 		}
 		if normalizeETag(clientETag) != normalizeETag(s3ETag) {
 			metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
-			return fmt.Errorf("part %d ETag mismatch: client=%q, S3=%q", partNum, clientETag, s3ETag)
+			return uploadClientProtocolErrorf("part %d ETag mismatch: client=%q, S3=%q", partNum, clientETag, s3ETag)
 		}
 	}
 	etagValidationDurationMs := uploadPhaseMs(etagValidationStart)
@@ -797,12 +813,12 @@ func (b *Dat9Backend) ConfirmUploadV2WithTags(ctx context.Context, uploadID stri
 	expectedParts := s3client.CalcParts(upload.TotalSize, upload.PartSize)
 	if len(s3Parts) != len(expectedParts) {
 		metrics.RecordOperation("backend", "confirm_upload_v2", "incomplete", time.Since(start))
-		return fmt.Errorf("incomplete upload: S3 has %d parts, expected %d", len(s3Parts), len(expectedParts))
+		return uploadClientProtocolErrorf("incomplete upload: S3 has %d parts, expected %d", len(s3Parts), len(expectedParts))
 	}
 	for i, p := range s3Parts {
 		if p.Size != expectedParts[i].Size {
 			metrics.RecordOperation("backend", "confirm_upload_v2", "error", time.Since(start))
-			return fmt.Errorf("part %d size mismatch: got %d, expected %d", p.Number, p.Size, expectedParts[i].Size)
+			return uploadClientProtocolErrorf("part %d size mismatch: got %d, expected %d", p.Number, p.Size, expectedParts[i].Size)
 		}
 	}
 	sizeValidationDurationMs := uploadPhaseMs(sizeValidationStart)
@@ -864,17 +880,17 @@ func (b *Dat9Backend) ConfirmUploadWithTags(ctx context.Context, uploadID string
 	// Verify all parts are present, correctly sized, and have ETags
 	if len(parts) != upload.PartsTotal {
 		metrics.RecordOperation("backend", "confirm_upload", "incomplete", time.Since(start))
-		return fmt.Errorf("incomplete upload: got %d parts, expected %d", len(parts), upload.PartsTotal)
+		return uploadClientProtocolErrorf("incomplete upload: got %d parts, expected %d", len(parts), upload.PartsTotal)
 	}
 	expectedParts := s3client.CalcParts(upload.TotalSize, upload.PartSize)
 	for i, p := range parts {
 		if p.Size != expectedParts[i].Size {
 			metrics.RecordOperation("backend", "confirm_upload", "error", time.Since(start))
-			return fmt.Errorf("part %d size mismatch: got %d, expected %d", p.Number, p.Size, expectedParts[i].Size)
+			return uploadClientProtocolErrorf("part %d size mismatch: got %d, expected %d", p.Number, p.Size, expectedParts[i].Size)
 		}
 		if p.ETag == "" {
 			metrics.RecordOperation("backend", "confirm_upload", "error", time.Since(start))
-			return fmt.Errorf("part %d missing ETag", p.Number)
+			return uploadClientProtocolErrorf("part %d missing ETag", p.Number)
 		}
 	}
 
