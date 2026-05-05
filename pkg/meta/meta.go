@@ -57,7 +57,7 @@ type Tenant struct {
 	SchemaVersion      int
 	S3EncryptionMode   S3EncryptionMode
 	S3KMSKeyID         string
-	S3BucketKeyEnabled bool
+	S3BucketKeyEnabled *bool
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 }
@@ -66,8 +66,15 @@ func (t Tenant) S3EncryptionPolicy() S3EncryptionPolicy {
 	return S3EncryptionPolicy{
 		Mode:             t.S3EncryptionMode,
 		KMSKeyID:         t.S3KMSKeyID,
-		BucketKeyEnabled: t.S3BucketKeyEnabled,
+		BucketKeyEnabled: t.S3BucketKeyEnabledValue(),
 	}
+}
+
+func (t Tenant) S3BucketKeyEnabledValue() bool {
+	if t.S3BucketKeyEnabled == nil {
+		return true
+	}
+	return *t.S3BucketKeyEnabled
 }
 
 type APIKey struct {
@@ -888,7 +895,7 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 		return nil, err
 	}
 	rec.Tenant.DBTLS = dbTLS == 1
-	rec.Tenant.S3BucketKeyEnabled = s3BucketKeyEnabled == 1
+	rec.Tenant.S3BucketKeyEnabled = boolPtr(s3BucketKeyEnabled == 1)
 	if clusterID.Valid {
 		rec.Tenant.ClusterID = clusterID.String
 	}
@@ -930,7 +937,7 @@ func (s *Store) GetTenant(ctx context.Context, id string) (out *Tenant, err erro
 		return nil, err
 	}
 	rec.DBTLS = dbTLS == 1
-	rec.S3BucketKeyEnabled = s3BucketKeyEnabled == 1
+	rec.S3BucketKeyEnabled = boolPtr(s3BucketKeyEnabled == 1)
 	if clusterID.Valid {
 		rec.ClusterID = clusterID.String
 	}
@@ -974,7 +981,7 @@ func (s *Store) ListTenantsByStatus(ctx context.Context, status TenantStatus, li
 			return nil, err
 		}
 		t.DBTLS = dbTLS == 1
-		t.S3BucketKeyEnabled = s3BucketKeyEnabled == 1
+		t.S3BucketKeyEnabled = boolPtr(s3BucketKeyEnabled == 1)
 		if clusterID.Valid {
 			t.ClusterID = clusterID.String
 		}
@@ -1057,10 +1064,14 @@ func tenantS3EncryptionModeForInsert(t *Tenant) S3EncryptionMode {
 }
 
 func tenantS3BucketKeyEnabledForInsert(t *Tenant) bool {
-	if t.S3EncryptionMode == "" && t.S3KMSKeyID == "" && !t.S3BucketKeyEnabled {
+	if t.S3BucketKeyEnabled == nil {
 		return true
 	}
-	return t.S3BucketKeyEnabled
+	return *t.S3BucketKeyEnabled
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }
 
 func nullStr(v string) any {

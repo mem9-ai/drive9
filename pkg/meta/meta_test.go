@@ -106,7 +106,7 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 	if got.Tenant.S3KMSKeyID != "" {
 		t.Fatalf("unexpected tenant kms key: %q", got.Tenant.S3KMSKeyID)
 	}
-	if !got.Tenant.S3BucketKeyEnabled {
+	if !got.Tenant.S3BucketKeyEnabledValue() {
 		t.Fatal("tenant bucket key enabled = false, want true")
 	}
 	if got.APIKey.Status != APIKeyActive {
@@ -129,7 +129,7 @@ func TestGetTenantReadsS3EncryptionPolicy(t *testing.T) {
 		Provider:           "tidb_zero",
 		SchemaVersion:      1,
 		S3EncryptionMode:   S3EncryptionModeSSEKMS,
-		S3BucketKeyEnabled: false,
+		S3BucketKeyEnabled: boolPtr(false),
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}); err != nil {
@@ -146,7 +146,40 @@ func TestGetTenantReadsS3EncryptionPolicy(t *testing.T) {
 	if got.S3KMSKeyID != "" {
 		t.Fatalf("S3KMSKeyID = %q, want empty", got.S3KMSKeyID)
 	}
-	if got.S3BucketKeyEnabled {
+	if got.S3BucketKeyEnabledValue() {
+		t.Fatal("S3BucketKeyEnabled = true, want false")
+	}
+}
+
+func TestInsertTenantPreservesExplicitBucketKeyFalseWithEmptyMode(t *testing.T) {
+	s := newControlStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertTenant(context.Background(), &Tenant{
+		ID:                 "tenant-explicit-bucket-key-false",
+		Status:             TenantActive,
+		DBHost:             "127.0.0.1",
+		DBPort:             4000,
+		DBUser:             "root",
+		DBPasswordCipher:   []byte("cipher"),
+		DBName:             "tenant_db_explicit_bucket_false",
+		DBTLS:              true,
+		Provider:           "tidb_zero",
+		SchemaVersion:      1,
+		S3BucketKeyEnabled: boolPtr(false),
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetTenant(context.Background(), "tenant-explicit-bucket-key-false")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.S3EncryptionMode != S3EncryptionModeInherit {
+		t.Fatalf("S3EncryptionMode = %q, want inherit", got.S3EncryptionMode)
+	}
+	if got.S3BucketKeyEnabledValue() {
 		t.Fatal("S3BucketKeyEnabled = true, want false")
 	}
 }
