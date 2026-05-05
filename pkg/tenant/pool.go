@@ -23,18 +23,19 @@ import (
 )
 
 type PoolConfig struct {
-	MaxTenants        int
-	S3Dir             string
-	PublicURL         string
-	S3Bucket          string
-	S3Region          string
-	S3Prefix          string
-	S3RoleARN         string
-	S3Endpoint        string
-	S3ForcePathStyle  bool
-	S3AccessKeyID     string
-	S3SecretAccessKey string
-	S3SessionToken    string
+	MaxTenants         int
+	S3Dir              string
+	PublicURL          string
+	S3Bucket           string
+	S3Region           string
+	S3Prefix           string
+	S3RoleARN          string
+	S3Endpoint         string
+	S3ForcePathStyle   bool
+	S3AccessKeyID      string
+	S3SecretAccessKey  string
+	S3SessionToken     string
+	S3EncryptionPolicy meta.S3EncryptionPolicy
 
 	BackendOptions backend.Options
 
@@ -65,12 +66,13 @@ var (
 )
 
 type entry struct {
-	tenantID string
-	backend  *backend.Dat9Backend
-	store    *datastore.Store
-	elem     *list.Element
-	refs     int
-	retired  bool
+	tenantID           string
+	s3EncryptionPolicy meta.S3EncryptionPolicy
+	backend            *backend.Dat9Backend
+	store              *datastore.Store
+	elem               *list.Element
+	refs               int
+	retired            bool
 }
 
 func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
@@ -101,14 +103,27 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 		return nil, fmt.Errorf("tenant status: %s", t.Status)
 	}
 
+	s3EncryptionPolicy := t.S3EncryptionPolicy()
+	var toClose []*entry
 	p.mu.Lock()
 	if e, ok := p.items[t.ID]; ok {
-		p.order.MoveToFront(e.elem)
-		b := e.backend
+		if e.s3EncryptionPolicy == s3EncryptionPolicy {
+			p.order.MoveToFront(e.elem)
+			b := e.backend
+			p.mu.Unlock()
+			return b, nil
+		}
+		if removed := p.removeLocked(e.elem); removed != nil {
+			toClose = append(toClose, removed)
+		}
 		p.mu.Unlock()
-		return b, nil
+		for _, retired := range toClose {
+			closeEntry(retired)
+		}
+		toClose = nil
+	} else {
+		p.mu.Unlock()
 	}
-	p.mu.Unlock()
 
 	b, st, err := p.createBackend(ctx, t)
 	if err != nil {
@@ -117,16 +132,20 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 
 	p.mu.Lock()
 	if e, ok := p.items[t.ID]; ok {
-		b.Close()
-		_ = st.Close()
-		p.order.MoveToFront(e.elem)
-		p.mu.Unlock()
-		return e.backend, nil
+		if e.s3EncryptionPolicy == s3EncryptionPolicy {
+			b.Close()
+			_ = st.Close()
+			p.order.MoveToFront(e.elem)
+			p.mu.Unlock()
+			return e.backend, nil
+		}
+		if removed := p.removeLocked(e.elem); removed != nil {
+			toClose = append(toClose, removed)
+		}
 	}
-	e := &entry{tenantID: t.ID, backend: b, store: st}
+	e := &entry{tenantID: t.ID, s3EncryptionPolicy: s3EncryptionPolicy, backend: b, store: st}
 	e.elem = p.order.PushFront(e)
 	p.items[t.ID] = e
-	toClose := make([]*entry, 0, 1)
 	for p.order.Len() > p.maxSize {
 		oldest := p.order.Back()
 		if oldest != nil {
@@ -157,18 +176,31 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		return nil, nil, fmt.Errorf("tenant status: %s", t.Status)
 	}
 
+	s3EncryptionPolicy := t.S3EncryptionPolicy()
+	var toClose []*entry
 	p.mu.Lock()
 	if e, ok := p.items[t.ID]; ok {
-		e.refs++
-		p.order.MoveToFront(e.elem)
+		if e.s3EncryptionPolicy == s3EncryptionPolicy {
+			e.refs++
+			p.order.MoveToFront(e.elem)
+			p.mu.Unlock()
+			logger.InfoBenchTiming(ctx, "tenant_pool_acquire_timing",
+				zap.String("tenant_id", t.ID),
+				zap.Bool("cache_hit", true),
+				zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
+			return e.backend, p.makeRelease(e), nil
+		}
+		if removed := p.removeLocked(e.elem); removed != nil {
+			toClose = append(toClose, removed)
+		}
 		p.mu.Unlock()
-		logger.InfoBenchTiming(ctx, "tenant_pool_acquire_timing",
-			zap.String("tenant_id", t.ID),
-			zap.Bool("cache_hit", true),
-			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
-		return e.backend, p.makeRelease(e), nil
+		for _, retired := range toClose {
+			closeEntry(retired)
+		}
+		toClose = nil
+	} else {
+		p.mu.Unlock()
 	}
-	p.mu.Unlock()
 
 	createBackendStart := time.Now()
 	b, st, err := p.createBackend(ctx, t)
@@ -179,22 +211,26 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 
 	p.mu.Lock()
 	if e, ok := p.items[t.ID]; ok {
-		e.refs++
-		p.order.MoveToFront(e.elem)
-		p.mu.Unlock()
-		b.Close()
-		_ = st.Close()
-		logger.InfoBenchTiming(ctx, "tenant_pool_acquire_timing",
-			zap.String("tenant_id", t.ID),
-			zap.Bool("cache_hit", true),
-			zap.Float64("create_backend_ms", createBackendDurationMs),
-			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
-		return e.backend, p.makeRelease(e), nil
+		if e.s3EncryptionPolicy == s3EncryptionPolicy {
+			e.refs++
+			p.order.MoveToFront(e.elem)
+			p.mu.Unlock()
+			b.Close()
+			_ = st.Close()
+			logger.InfoBenchTiming(ctx, "tenant_pool_acquire_timing",
+				zap.String("tenant_id", t.ID),
+				zap.Bool("cache_hit", true),
+				zap.Float64("create_backend_ms", createBackendDurationMs),
+				zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
+			return e.backend, p.makeRelease(e), nil
+		}
+		if removed := p.removeLocked(e.elem); removed != nil {
+			toClose = append(toClose, removed)
+		}
 	}
-	e := &entry{tenantID: t.ID, backend: b, store: st, refs: 1}
+	e := &entry{tenantID: t.ID, s3EncryptionPolicy: s3EncryptionPolicy, backend: b, store: st, refs: 1}
 	e.elem = p.order.PushFront(e)
 	p.items[t.ID] = e
-	toClose := make([]*entry, 0, 1)
 	for p.order.Len() > p.maxSize {
 		oldest := p.order.Back()
 		if oldest != nil {
@@ -323,6 +359,12 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	}
 	decryptDurationMs := float64(time.Since(decryptStart).Microseconds()) / 1000.0
 	opts := p.cfg.BackendOptions
+	resolvedEncryptionPolicy, err := meta.ResolveS3EncryptionPolicy(p.cfg.S3EncryptionPolicy, t.S3EncryptionPolicy())
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve s3 encryption policy: %w", err)
+	}
+	opts.TenantID = t.ID
+	opts.S3EncryptionPolicy = resolvedEncryptionPolicy
 	if UsesTiDBAutoEmbedding(t.Provider) {
 		opts.DatabaseAutoEmbedding = true
 	}

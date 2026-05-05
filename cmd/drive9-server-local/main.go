@@ -213,6 +213,15 @@ func main() {
 	}
 
 	stepStart = time.Now()
+	resolvedEncryptionPolicy, err := meta.ResolveS3EncryptionPolicy(
+		s3cfg.EncryptionPolicy,
+		meta.S3EncryptionPolicy{Mode: meta.S3EncryptionModeInherit},
+	)
+	if err != nil {
+		die(fmt.Errorf("resolve local s3 encryption policy: %w", err))
+	}
+	backendOpts.TenantID = "local-tenant"
+	backendOpts.S3EncryptionPolicy = resolvedEncryptionPolicy
 	b, err := backend.NewWithS3ModeAndOptions(store, s3c, true, backendOpts)
 	if err != nil {
 		die(fmt.Errorf("create local backend: %w", err))

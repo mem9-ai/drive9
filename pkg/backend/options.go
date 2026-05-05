@@ -7,6 +7,7 @@ import (
 
 	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"go.uber.org/zap"
 )
@@ -80,6 +81,11 @@ type Options struct {
 	// QuotaSource selects where quota enforcement reads authoritative state.
 	// "tenant" (default) uses per-tenant DB; "server" uses the central server DB.
 	QuotaSource QuotaSource
+	// TenantID is used for per-write S3 encryption context and audit metadata.
+	TenantID string
+	// S3EncryptionPolicy is the already-resolved policy for this backend.
+	// The zero value is normalized to the global default of explicit no encryption.
+	S3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
 }
 
 // LLMCostBudgetOptions configures the monthly LLM cost budget.
@@ -155,7 +161,17 @@ type QueryEmbeddingOptions struct {
 }
 
 func (b *Dat9Backend) configureOptions(opts Options) {
+	if opts.TenantID != "" {
+		b.tenantID = opts.TenantID
+	}
 	b.databaseAutoEmbedding = opts.DatabaseAutoEmbedding
+	b.s3EncryptionPolicy = opts.S3EncryptionPolicy
+	if b.s3EncryptionPolicy.Mode == "" {
+		resolved, err := meta.ResolveS3EncryptionPolicy(meta.DefaultS3EncryptionPolicy(), meta.S3EncryptionPolicy{Mode: meta.S3EncryptionModeInherit})
+		if err == nil {
+			b.s3EncryptionPolicy = resolved
+		}
+	}
 	if opts.QuotaSource == QuotaSourceServer {
 		b.quotaSource = QuotaSourceServer
 	} else {

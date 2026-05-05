@@ -8,14 +8,15 @@ import (
 
 // InsertFileTx inserts a file row inside an existing transaction.
 func (s *Store) InsertFileTx(db execer, f *File) error {
+	mode := fileStorageEncryptionModeForWrite(f.StorageEncryptionMode)
 	_, err := db.Exec(`INSERT INTO files
 		(file_id, storage_type, storage_ref, storage_encryption_mode, storage_encryption_key_id,
 		 content_blob, content_type, size_bytes, checksum_sha256,
 		 revision, status, source_id, content_text, description, description_embedding_revision,
 		 created_at, confirmed_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.FileID, f.StorageType, f.StorageRef, fileStorageEncryptionModeForWrite(f.StorageEncryptionMode),
-		f.StorageEncryptionKeyID, nilBytes(f.ContentBlob), nullStr(f.ContentType),
+		f.FileID, f.StorageType, f.StorageRef, mode,
+		storageEncryptionKeyIDForWrite(mode, f.StorageEncryptionKeyID), nilBytes(f.ContentBlob), nullStr(f.ContentType),
 		f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
 		nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
 		nullInt64Ptr(f.DescriptionEmbeddingRevision),
@@ -96,6 +97,30 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 		return 0, fmt.Errorf("read revision after update: %w", err)
 	}
 	return rev, nil
+}
+
+// UpdateFileStorageEncryptionTx updates storage encryption metadata inside an existing transaction.
+func (s *Store) UpdateFileStorageEncryptionTx(db execer, fileID string, mode StorageEncryptionMode, keyID string) error {
+	mode = fileStorageEncryptionModeForWrite(mode)
+	res, err := db.Exec(`UPDATE files SET storage_encryption_mode = ?, storage_encryption_key_id = ? WHERE file_id = ?`,
+		mode, storageEncryptionKeyIDForWrite(mode, keyID), fileID)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		var exists int
+		if err := db.QueryRow(`SELECT 1 FROM files WHERE file_id = ?`, fileID).Scan(&exists); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrNotFound
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 // UpdateFileContentAutoEmbeddingTx updates file bytes/metadata without touching

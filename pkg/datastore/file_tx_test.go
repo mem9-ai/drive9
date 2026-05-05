@@ -3,6 +3,7 @@ package datastore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -35,6 +36,70 @@ func TestInsertFileTx(t *testing.T) {
 	}
 	if got.StorageRef != "/blobs/f1" || got.Revision != 1 {
 		t.Fatalf("unexpected inserted file: %+v", got)
+	}
+}
+
+func TestInsertFileClearsKeyIDForNonKMSMode(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID:                 "f1",
+		StorageType:            StorageS3,
+		StorageRef:             "/blobs/f1",
+		StorageEncryptionMode:  StorageEncryptionSSES3,
+		StorageEncryptionKeyID: "stale-key",
+		SizeBytes:              10,
+		Revision:               1,
+		Status:                 StatusConfirmed,
+		CreatedAt:              now,
+		ConfirmedAt:            &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(context.Background(), "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StorageEncryptionMode != StorageEncryptionSSES3 {
+		t.Fatalf("storage_encryption_mode=%q, want %q", got.StorageEncryptionMode, StorageEncryptionSSES3)
+	}
+	if got.StorageEncryptionKeyID != "" {
+		t.Fatalf("storage_encryption_key_id=%q, want empty", got.StorageEncryptionKeyID)
+	}
+}
+
+func TestInsertUploadClearsKeyIDForNonKMSMode(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertUpload(context.Background(), &Upload{
+		UploadID:               "u1",
+		FileID:                 "f1",
+		TargetPath:             "/upload.bin",
+		S3UploadID:             "s3-upload",
+		S3Key:                  "blobs/f1",
+		StorageEncryptionMode:  StorageEncryptionNone,
+		StorageEncryptionKeyID: "stale-key",
+		TotalSize:              10,
+		PartSize:               10,
+		PartsTotal:             1,
+		Status:                 UploadUploading,
+		CreatedAt:              now,
+		UpdatedAt:              now,
+		ExpiresAt:              now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetUpload(context.Background(), "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StorageEncryptionMode != StorageEncryptionNone {
+		t.Fatalf("storage_encryption_mode=%q, want %q", got.StorageEncryptionMode, StorageEncryptionNone)
+	}
+	if got.StorageEncryptionKeyID != "" {
+		t.Fatalf("storage_encryption_key_id=%q, want empty", got.StorageEncryptionKeyID)
 	}
 }
 
@@ -77,6 +142,111 @@ func TestUpdateFileContentTxClearsEmbeddingState(t *testing.T) {
 	}
 	if got.EmbeddingRevision != nil {
 		t.Fatalf("embedding revision should be cleared, got %v", *got.EmbeddingRevision)
+	}
+}
+
+func TestUpdateFileStorageEncryptionTx(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID:                "f1",
+		StorageType:           StorageS3,
+		StorageRef:            "/blobs/f1",
+		StorageEncryptionMode: StorageEncryptionLegacy,
+		SizeBytes:             10,
+		Revision:              1,
+		Status:                StatusConfirmed,
+		CreatedAt:             now,
+		ConfirmedAt:           &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.UpdateFileStorageEncryptionTx(tx, "f1", StorageEncryptionSSEKMS, "arn:aws:kms:ap-southeast-1:123456789012:key/test")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(context.Background(), "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StorageEncryptionMode != StorageEncryptionSSEKMS {
+		t.Fatalf("storage_encryption_mode=%q, want %q", got.StorageEncryptionMode, StorageEncryptionSSEKMS)
+	}
+	if got.StorageEncryptionKeyID != "arn:aws:kms:ap-southeast-1:123456789012:key/test" {
+		t.Fatalf("storage_encryption_key_id=%q", got.StorageEncryptionKeyID)
+	}
+}
+
+func TestUpdateFileStorageEncryptionTxSameValues(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID:                "f1",
+		StorageType:           StorageDB9,
+		StorageRef:            "/blobs/f1",
+		StorageEncryptionMode: StorageEncryptionNone,
+		SizeBytes:             10,
+		Revision:              1,
+		Status:                StatusConfirmed,
+		CreatedAt:             now,
+		ConfirmedAt:           &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.UpdateFileStorageEncryptionTx(tx, "f1", StorageEncryptionNone, "")
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdateFileStorageEncryptionTxClearsKeyIDForNonKMSMode(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID:                 "f1",
+		StorageType:            StorageS3,
+		StorageRef:             "/blobs/f1",
+		StorageEncryptionMode:  StorageEncryptionSSEKMS,
+		StorageEncryptionKeyID: "arn:aws:kms:ap-southeast-1:123456789012:key/test",
+		SizeBytes:              10,
+		Revision:               1,
+		Status:                 StatusConfirmed,
+		CreatedAt:              now,
+		ConfirmedAt:            &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.UpdateFileStorageEncryptionTx(tx, "f1", StorageEncryptionNone, "stale-key")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(context.Background(), "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StorageEncryptionMode != StorageEncryptionNone {
+		t.Fatalf("storage_encryption_mode=%q, want %q", got.StorageEncryptionMode, StorageEncryptionNone)
+	}
+	if got.StorageEncryptionKeyID != "" {
+		t.Fatalf("storage_encryption_key_id=%q, want empty", got.StorageEncryptionKeyID)
+	}
+}
+
+func TestUpdateFileStorageEncryptionTxMissingFile(t *testing.T) {
+	s := newTestStore(t)
+	err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.UpdateFileStorageEncryptionTx(tx, "missing", StorageEncryptionNone, "")
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err=%v, want %v", err, ErrNotFound)
 	}
 }
 

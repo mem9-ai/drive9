@@ -405,13 +405,14 @@ func (s *Store) InsertFile(ctx context.Context, f *File) (err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "insert_file", start, &err)
 
+	mode := fileStorageEncryptionModeForWrite(f.StorageEncryptionMode)
 	_, err = s.db.ExecContext(ctx, `INSERT INTO files
 		(file_id, storage_type, storage_ref, storage_encryption_mode, storage_encryption_key_id,
 		 content_blob, content_type, size_bytes, checksum_sha256,
 		 revision, status, source_id, content_text, description, created_at, confirmed_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.FileID, f.StorageType, f.StorageRef, fileStorageEncryptionModeForWrite(f.StorageEncryptionMode),
-		f.StorageEncryptionKeyID, nilBytes(f.ContentBlob), nullStr(f.ContentType),
+		f.FileID, f.StorageType, f.StorageRef, mode,
+		storageEncryptionKeyIDForWrite(mode, f.StorageEncryptionKeyID), nilBytes(f.ContentBlob), nullStr(f.ContentType),
 		f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
 		nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
 		f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
@@ -1068,13 +1069,14 @@ func (s *Store) InsertUpload(ctx context.Context, u *Upload) (err error) {
 }
 
 func (s *Store) InsertUploadTx(db execer, u *Upload) error {
+	mode := uploadStorageEncryptionModeForWrite(u.StorageEncryptionMode)
 	_, err := db.Exec(`INSERT INTO uploads
 		(upload_id, file_id, target_path, s3_upload_id, s3_key, storage_encryption_mode,
 		 storage_encryption_key_id, total_size, part_size,
 		 parts_total, expected_revision, status, fingerprint_sha256, idempotency_key, description, created_at, updated_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		u.UploadID, u.FileID, u.TargetPath, u.S3UploadID, u.S3Key,
-		uploadStorageEncryptionModeForWrite(u.StorageEncryptionMode), u.StorageEncryptionKeyID,
+		mode, storageEncryptionKeyIDForWrite(mode, u.StorageEncryptionKeyID),
 		u.TotalSize, u.PartSize, u.PartsTotal, nullInt64Ptr(u.ExpectedRevision), u.Status,
 		nullStr(u.FingerprintSHA), nullStr(u.IdempotencyKey), nullStr(u.Description),
 		u.CreatedAt.UTC(), u.UpdatedAt.UTC(), u.ExpiresAt.UTC())
@@ -1542,6 +1544,15 @@ func uploadStorageEncryptionModeForWrite(mode StorageEncryptionMode) StorageEncr
 		return StorageEncryptionNone
 	}
 	return mode
+}
+
+func storageEncryptionKeyIDForWrite(mode StorageEncryptionMode, keyID string) string {
+	switch mode {
+	case StorageEncryptionSSEKMS, StorageEncryptionDSSEKMS:
+		return keyID
+	default:
+		return ""
+	}
 }
 
 func scanUpload(s scanner) (*Upload, error) {

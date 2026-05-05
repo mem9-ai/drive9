@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
@@ -77,7 +78,70 @@ func TestPoolAcquireEvictionRetiresPinnedEntry(t *testing.T) {
 	assertStoreOpen(t, bB.Store())
 }
 
+func TestPoolAcquireReloadsS3EncryptionPolicyForNextWrite(t *testing.T) {
+	globalKeyID := "arn:aws:kms:ap-southeast-1:123456789012:key/pool-test"
+	pool, tenant := newTestPoolAndTenantWithConfig(t, PoolConfig{
+		MaxTenants: 2,
+		S3Dir:      t.TempDir(),
+		PublicURL:  "http://localhost:9091",
+		S3EncryptionPolicy: meta.S3EncryptionPolicy{
+			Mode:             meta.S3EncryptionModeSSEKMS,
+			KMSKeyID:         globalKeyID,
+			BucketKeyEnabled: true,
+		},
+	}, "tenant-a")
+	disabledBucketKey := false
+	tenant.S3EncryptionMode = meta.S3EncryptionModeNone
+	tenant.S3BucketKeyEnabled = &disabledBucketKey
+	ctx := context.Background()
+
+	b1, release1, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release1()
+	if _, _, err := b1.WriteCtxIfRevisionWithTagsResult(ctx, "/before.bin", []byte("before"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, -1, nil, ""); err != nil {
+		t.Fatalf("write before policy change: %v", err)
+	}
+	before, err := b1.Store().Stat(ctx, "/before.bin")
+	if err != nil {
+		t.Fatalf("stat before: %v", err)
+	}
+	if before.File.StorageEncryptionMode != datastore.StorageEncryptionNone {
+		t.Fatalf("before encryption mode=%q, want %q", before.File.StorageEncryptionMode, datastore.StorageEncryptionNone)
+	}
+
+	changed := *tenant
+	changed.S3EncryptionMode = meta.S3EncryptionModeSSEKMS
+	b2, release2, err := pool.Acquire(ctx, &changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release2()
+	if b1 == b2 {
+		t.Fatal("expected tenant policy change to recreate cached backend")
+	}
+	if _, _, err := b2.WriteCtxIfRevisionWithTagsResult(ctx, "/after.bin", []byte("after"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, -1, nil, ""); err != nil {
+		t.Fatalf("write after policy change: %v", err)
+	}
+	after, err := b2.Store().Stat(ctx, "/after.bin")
+	if err != nil {
+		t.Fatalf("stat after: %v", err)
+	}
+	if after.File.StorageEncryptionMode != datastore.StorageEncryptionSSEKMS {
+		t.Fatalf("after encryption mode=%q, want %q", after.File.StorageEncryptionMode, datastore.StorageEncryptionSSEKMS)
+	}
+	if after.File.StorageEncryptionKeyID != globalKeyID {
+		t.Fatalf("after encryption key=%q, want %q", after.File.StorageEncryptionKeyID, globalKeyID)
+	}
+}
+
 func newTestPoolAndTenant(t *testing.T, maxTenants int, tenantID string) (*Pool, *meta.Tenant) {
+	t.Helper()
+	return newTestPoolAndTenantWithConfig(t, PoolConfig{MaxTenants: maxTenants}, tenantID)
+}
+
+func newTestPoolAndTenantWithConfig(t *testing.T, cfg PoolConfig, tenantID string) (*Pool, *meta.Tenant) {
 	t.Helper()
 	initTenantPoolSchema(t, testDSN)
 	resetStore, err := datastore.Open(testDSN)
@@ -97,7 +161,7 @@ func newTestPoolAndTenant(t *testing.T, maxTenants int, tenantID string) (*Pool,
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := NewPool(PoolConfig{MaxTenants: maxTenants}, enc)
+	pool := NewPool(cfg, enc)
 	t.Cleanup(func() { pool.Close() })
 	return pool, cloneTenantForID(t, pool, nil, tenantID)
 }
