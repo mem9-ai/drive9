@@ -38,17 +38,18 @@ const (
 )
 
 type localS3Config struct {
-	Mode            string
-	Dir             string
-	Bucket          string
-	Region          string
-	Prefix          string
-	RoleARN         string
-	Endpoint        string
-	ForcePathStyle  bool
-	AccessKeyID     string
-	SecretAccessKey string
-	SessionToken    string
+	Mode             string
+	Dir              string
+	Bucket           string
+	Region           string
+	Prefix           string
+	RoleARN          string
+	Endpoint         string
+	ForcePathStyle   bool
+	AccessKeyID      string
+	SecretAccessKey  string
+	SessionToken     string
+	EncryptionPolicy meta.S3EncryptionPolicy
 }
 
 func main() {
@@ -348,6 +349,9 @@ environment:
   DRIVE9_S3_SESSION_TOKEN static S3 session token (optional; requires DRIVE9_S3_ACCESS_KEY_ID and DRIVE9_S3_SECRET_ACCESS_KEY)
   DRIVE9_S3_ROLE_ARN IAM role ARN to assume via STS (optional)
   DRIVE9_S3_DIR      local S3 mock root directory (default: /tmp/drive9-local-s3, only used without DRIVE9_S3_BUCKET)
+  DRIVE9_S3_ENCRYPTION_MODE none|sse-s3|sse-kms|dsse-kms (default: none; recommend sse-kms for production)
+  DRIVE9_S3_KMS_KEY_ID KMS key ARN/id required for sse-kms/dsse-kms
+  DRIVE9_S3_BUCKET_KEY_ENABLED true|false for SSE-KMS bucket keys (default: true)
 
   Query embedding (app-side semantic query embedding for grep):
   DRIVE9_QUERY_EMBED_API_BASE OpenAI-compatible base URL (optional)
@@ -452,29 +456,40 @@ func localS3ConfigFromEnv() (localS3Config, error) {
 	bucket := strings.TrimSpace(os.Getenv("DRIVE9_S3_BUCKET"))
 	dirSet := normalizeLocalS3Dir(os.Getenv("DRIVE9_S3_DIR"))
 	defaultDir := defaultLocalS3Dir()
+	encryptionPolicy := meta.DefaultS3EncryptionPolicy()
+	if mode := strings.TrimSpace(os.Getenv("DRIVE9_S3_ENCRYPTION_MODE")); mode != "" {
+		encryptionPolicy.Mode = meta.S3EncryptionMode(mode)
+	}
+	encryptionPolicy.KMSKeyID = strings.TrimSpace(os.Getenv("DRIVE9_S3_KMS_KEY_ID"))
+	encryptionPolicy.BucketKeyEnabled = envBool("DRIVE9_S3_BUCKET_KEY_ENABLED", true)
+	if err := meta.ValidateGlobalS3EncryptionPolicy(encryptionPolicy); err != nil {
+		return localS3Config{}, err
+	}
 	if bucket != "" {
 		if dirSet != "" && dirSet != defaultDir {
 			return localS3Config{}, fmt.Errorf("DRIVE9_S3_BUCKET and DRIVE9_S3_DIR are mutually exclusive; unset DRIVE9_S3_DIR when using AWS S3 mode")
 		}
 		return localS3Config{
-			Mode:            "aws",
-			Bucket:          bucket,
-			Region:          envOr("DRIVE9_S3_REGION", defaultS3Region),
-			Prefix:          strings.TrimSpace(os.Getenv("DRIVE9_S3_PREFIX")),
-			RoleARN:         strings.TrimSpace(os.Getenv("DRIVE9_S3_ROLE_ARN")),
-			Endpoint:        strings.TrimSpace(os.Getenv("DRIVE9_S3_ENDPOINT")),
-			ForcePathStyle:  envBool("DRIVE9_S3_FORCE_PATH_STYLE", false),
-			AccessKeyID:     strings.TrimSpace(os.Getenv("DRIVE9_S3_ACCESS_KEY_ID")),
-			SecretAccessKey: strings.TrimSpace(os.Getenv("DRIVE9_S3_SECRET_ACCESS_KEY")),
-			SessionToken:    strings.TrimSpace(os.Getenv("DRIVE9_S3_SESSION_TOKEN")),
+			Mode:             "aws",
+			Bucket:           bucket,
+			Region:           envOr("DRIVE9_S3_REGION", defaultS3Region),
+			Prefix:           strings.TrimSpace(os.Getenv("DRIVE9_S3_PREFIX")),
+			RoleARN:          strings.TrimSpace(os.Getenv("DRIVE9_S3_ROLE_ARN")),
+			Endpoint:         strings.TrimSpace(os.Getenv("DRIVE9_S3_ENDPOINT")),
+			ForcePathStyle:   envBool("DRIVE9_S3_FORCE_PATH_STYLE", false),
+			AccessKeyID:      strings.TrimSpace(os.Getenv("DRIVE9_S3_ACCESS_KEY_ID")),
+			SecretAccessKey:  strings.TrimSpace(os.Getenv("DRIVE9_S3_SECRET_ACCESS_KEY")),
+			SessionToken:     strings.TrimSpace(os.Getenv("DRIVE9_S3_SESSION_TOKEN")),
+			EncryptionPolicy: encryptionPolicy,
 		}, nil
 	}
 	if dirSet == "" {
 		dirSet = defaultDir
 	}
 	return localS3Config{
-		Mode: "local",
-		Dir:  dirSet,
+		Mode:             "local",
+		Dir:              dirSet,
+		EncryptionPolicy: encryptionPolicy,
 	}, nil
 }
 

@@ -172,6 +172,8 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 			file_id            VARCHAR(64) PRIMARY KEY,
 			storage_type       VARCHAR(32) NOT NULL,
 			storage_ref        TEXT NOT NULL,
+			storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'legacy',
+			storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT '',
 			content_blob       LONGBLOB,
 			content_type       VARCHAR(255),
 			size_bytes         BIGINT NOT NULL DEFAULT 0,
@@ -225,6 +227,8 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 			target_path        VARCHAR(512) NOT NULL,
 			s3_upload_id       VARCHAR(255) NOT NULL,
 			s3_key             VARCHAR(2048) NOT NULL,
+			storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'none',
+			storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT '',
 			total_size         BIGINT NOT NULL,
 			part_size          BIGINT NOT NULL,
 			parts_total        INT NOT NULL,
@@ -477,6 +481,12 @@ func validateTiDBFilesTableBase(meta tidbTableMeta) error {
 	if err := meta.requireColumnType("status", "varchar(32)"); err != nil {
 		return err
 	}
+	if err := meta.requireColumnType("storage_encryption_mode", "varchar(16)"); err != nil {
+		return err
+	}
+	if err := meta.requireColumnType("storage_encryption_key_id", "varchar(256)"); err != nil {
+		return err
+	}
 	if err := meta.requireColumnType("content_text", "longtext"); err != nil {
 		return err
 	}
@@ -503,6 +513,12 @@ func validateTiDBUploadsTableBase(meta tidbTableMeta) error {
 		return err
 	}
 	if err := meta.requireColumnType("status", "varchar(32)"); err != nil {
+		return err
+	}
+	if err := meta.requireColumnType("storage_encryption_mode", "varchar(16)"); err != nil {
+		return err
+	}
+	if err := meta.requireColumnType("storage_encryption_key_id", "varchar(256)"); err != nil {
 		return err
 	}
 	return meta.requireColumnType("expected_revision", "bigint")
