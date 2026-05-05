@@ -169,7 +169,7 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		}
 		storageType = datastore.StorageS3
 		storageRef = "blobs/" + fileID
-		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(nil), 0); err != nil {
+		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(nil), 0, s3client.EncryptionOpts{}); err != nil {
 			logger.Error(ctx, "backend_create_put_object_failed", zap.String("path", path), zap.String("storage_ref", storageRef), zap.Error(err))
 			return fmt.Errorf("put object: %w", err)
 		}
@@ -429,7 +429,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}
 		storageType = datastore.StorageS3
 		storageRef = "blobs/" + fileID
-		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(data), int64(len(data))); err != nil {
+		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(data), int64(len(data)), s3client.EncryptionOpts{}); err != nil {
 			logger.Error(ctx, "backend_create_and_write_put_object_failed", zap.String("path", path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(data)), zap.Error(err))
 			return 0, fmt.Errorf("put object: %w", err)
 		}
@@ -538,7 +538,7 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		}
 		storageType = datastore.StorageS3
 		storageRef = "blobs/" + b.genID()
-		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(finalData), int64(len(finalData))); err != nil {
+		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(finalData), int64(len(finalData)), s3client.EncryptionOpts{}); err != nil {
 			logger.Error(ctx, "backend_overwrite_put_object_failed", zap.String("path", nf.Node.Path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(finalData)), zap.Error(err))
 			return 0, 0, fmt.Errorf("put object: %w", err)
 		}

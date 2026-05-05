@@ -53,7 +53,7 @@ func (c *LocalS3Client) partPath(key, uploadID string, partNumber int) string {
 	return filepath.Join(c.rootDir, "parts", uploadID, fmt.Sprintf("%05d", partNumber))
 }
 
-func (c *LocalS3Client) CreateMultipartUpload(ctx context.Context, key string, algo ChecksumAlgo) (*MultipartUpload, error) {
+func (c *LocalS3Client) CreateMultipartUpload(ctx context.Context, key string, algo ChecksumAlgo, encOpts EncryptionOpts) (*MultipartUpload, error) {
 	uploadID := fmt.Sprintf("upload-%x", sha256.Sum256([]byte(key+time.Now().String())))[:24]
 
 	partsDir := filepath.Join(c.rootDir, "parts", uploadID)
@@ -206,7 +206,7 @@ func (c *LocalS3Client) PresignGetObject(ctx context.Context, key string, ttl ti
 	return url, nil
 }
 
-func (c *LocalS3Client) PutObject(ctx context.Context, key string, body io.Reader, size int64) error {
+func (c *LocalS3Client) PutObject(ctx context.Context, key string, body io.Reader, size int64, encOpts EncryptionOpts) error {
 	objPath := c.objectPath(key)
 	if err := os.MkdirAll(filepath.Dir(objPath), 0o755); err != nil {
 		return err

@@ -213,7 +213,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	fileID := b.genID()
 	newS3Key := "blobs/" + fileID
 
-	mpu, err := b.s3.CreateMultipartUpload(ctx, newS3Key, s3client.ChecksumAlgoSHA256)
+	mpu, err := b.s3.CreateMultipartUpload(ctx, newS3Key, s3client.ChecksumAlgoSHA256, s3client.EncryptionOpts{})
 	if err != nil {
 		logger.Error(ctx, "backend_patch_upload_create_mpu_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
