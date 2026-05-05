@@ -9,11 +9,13 @@ import (
 // InsertFileTx inserts a file row inside an existing transaction.
 func (s *Store) InsertFileTx(db execer, f *File) error {
 	_, err := db.Exec(`INSERT INTO files
-		(file_id, storage_type, storage_ref, content_blob, content_type, size_bytes, checksum_sha256,
+		(file_id, storage_type, storage_ref, storage_encryption_mode, storage_encryption_key_id,
+		 content_blob, content_type, size_bytes, checksum_sha256,
 		 revision, status, source_id, content_text, description, description_embedding_revision,
 		 created_at, confirmed_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.FileID, f.StorageType, f.StorageRef, nilBytes(f.ContentBlob), nullStr(f.ContentType),
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.FileID, f.StorageType, f.StorageRef, fileStorageEncryptionModeForWrite(f.StorageEncryptionMode),
+		f.StorageEncryptionKeyID, nilBytes(f.ContentBlob), nullStr(f.ContentType),
 		f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
 		nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
 		nullInt64Ptr(f.DescriptionEmbeddingRevision),

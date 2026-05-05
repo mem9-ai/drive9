@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
+	"github.com/mem9-ai/dat9/pkg/meta"
 )
 
 func TestVersionTextUsesDrive9ServerComponent(t *testing.T) {
@@ -243,6 +244,9 @@ func TestS3ConfigFromEnv(t *testing.T) {
 		"DRIVE9_S3_ACCESS_KEY_ID",
 		"DRIVE9_S3_SECRET_ACCESS_KEY",
 		"DRIVE9_S3_SESSION_TOKEN",
+		"DRIVE9_S3_ENCRYPTION_MODE",
+		"DRIVE9_S3_KMS_KEY_ID",
+		"DRIVE9_S3_BUCKET_KEY_ENABLED",
 	}
 	restore := snapshotEnv(t, keys)
 	t.Cleanup(func() { restoreEnv(t, restore) })
@@ -255,6 +259,12 @@ func TestS3ConfigFromEnv(t *testing.T) {
 	if cfg.Bucket != "" {
 		t.Fatalf("default bucket = %q, want empty", cfg.Bucket)
 	}
+	if cfg.EncryptionPolicy.Mode != meta.S3EncryptionModeNone {
+		t.Fatalf("default encryption mode = %q, want none", cfg.EncryptionPolicy.Mode)
+	}
+	if !cfg.EncryptionPolicy.BucketKeyEnabled {
+		t.Fatal("default bucket key enabled = false, want true")
+	}
 
 	setEnv(t, "DRIVE9_S3_DIR", " custom-s3 ")
 	setEnv(t, "DRIVE9_S3_BUCKET", " bench-bucket ")
@@ -266,6 +276,9 @@ func TestS3ConfigFromEnv(t *testing.T) {
 	setEnv(t, "DRIVE9_S3_ACCESS_KEY_ID", " minioadmin ")
 	setEnv(t, "DRIVE9_S3_SECRET_ACCESS_KEY", " miniosecret ")
 	setEnv(t, "DRIVE9_S3_SESSION_TOKEN", " session-token ")
+	setEnv(t, "DRIVE9_S3_ENCRYPTION_MODE", " sse-kms ")
+	setEnv(t, "DRIVE9_S3_KMS_KEY_ID", " arn:aws:kms:us-west-2:123456789012:key/test ")
+	setEnv(t, "DRIVE9_S3_BUCKET_KEY_ENABLED", " false ")
 
 	cfg = s3ConfigFromEnv()
 	if cfg.Dir != "custom-s3" {
@@ -282,6 +295,11 @@ func TestS3ConfigFromEnv(t *testing.T) {
 	}
 	if cfg.AccessKeyID != "minioadmin" || cfg.SecretAccessKey != "miniosecret" || cfg.SessionToken != "session-token" {
 		t.Fatalf("unexpected static credential config: %+v", cfg)
+	}
+	if cfg.EncryptionPolicy.Mode != meta.S3EncryptionModeSSEKMS ||
+		cfg.EncryptionPolicy.KMSKeyID != "arn:aws:kms:us-west-2:123456789012:key/test" ||
+		cfg.EncryptionPolicy.BucketKeyEnabled {
+		t.Fatalf("unexpected encryption config: %+v", cfg.EncryptionPolicy)
 	}
 }
 
@@ -334,6 +352,24 @@ func TestS3ConfigValidateRejectsInvalidStaticCredentialCombinations(t *testing.T
 				AccessKeyID:     "ak",
 				SecretAccessKey: "sk",
 				SessionToken:    "token",
+			},
+			wantErr: false,
+		},
+		{
+			name: "sse kms missing key",
+			cfg: s3Config{
+				EncryptionPolicy: meta.S3EncryptionPolicy{Mode: meta.S3EncryptionModeSSEKMS},
+			},
+			wantErr: true,
+		},
+		{
+			name: "sse kms with key in local mode",
+			cfg: s3Config{
+				EncryptionPolicy: meta.S3EncryptionPolicy{
+					Mode:             meta.S3EncryptionModeSSEKMS,
+					KMSKeyID:         "key",
+					BucketKeyEnabled: true,
+				},
 			},
 			wantErr: false,
 		},
