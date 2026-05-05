@@ -48,6 +48,9 @@ func ResolveS3EncryptionPolicy(global S3EncryptionPolicy, tenant S3EncryptionPol
 	source := global
 	if tenant.Mode != S3EncryptionModeInherit {
 		source = tenant
+		// P1 uses one global CMK for all tenants. When P3 enables
+		// tenant-specific KMS keys, this must preserve tenant.KMSKeyID
+		// when present and fall back to global.KMSKeyID only when empty.
 		source.KMSKeyID = global.KMSKeyID
 	}
 
