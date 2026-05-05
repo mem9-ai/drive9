@@ -3,6 +3,7 @@ package datastore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -112,6 +113,40 @@ func TestUpdateFileStorageEncryptionTx(t *testing.T) {
 	}
 	if got.StorageEncryptionKeyID != "arn:aws:kms:ap-southeast-1:123456789012:key/test" {
 		t.Fatalf("storage_encryption_key_id=%q", got.StorageEncryptionKeyID)
+	}
+}
+
+func TestUpdateFileStorageEncryptionTxSameValues(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID:                "f1",
+		StorageType:           StorageDB9,
+		StorageRef:            "/blobs/f1",
+		StorageEncryptionMode: StorageEncryptionNone,
+		SizeBytes:             10,
+		Revision:              1,
+		Status:                StatusConfirmed,
+		CreatedAt:             now,
+		ConfirmedAt:           &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.UpdateFileStorageEncryptionTx(tx, "f1", StorageEncryptionNone, "")
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdateFileStorageEncryptionTxMissingFile(t *testing.T) {
+	s := newTestStore(t)
+	err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.UpdateFileStorageEncryptionTx(tx, "missing", StorageEncryptionNone, "")
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err=%v, want %v", err, ErrNotFound)
 	}
 }
 

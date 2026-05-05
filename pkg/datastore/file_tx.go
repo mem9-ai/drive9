@@ -110,7 +110,13 @@ func (s *Store) UpdateFileStorageEncryptionTx(db execer, fileID string, mode Sto
 		return err
 	}
 	if rowsAffected == 0 {
-		return ErrNotFound
+		var exists int
+		if err := db.QueryRow(`SELECT 1 FROM files WHERE file_id = ?`, fileID).Scan(&exists); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrNotFound
+			}
+			return err
+		}
 	}
 	return nil
 }
