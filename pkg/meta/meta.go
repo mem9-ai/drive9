@@ -42,21 +42,32 @@ const (
 )
 
 type Tenant struct {
-	ID               string
-	Status           TenantStatus
-	DBHost           string
-	DBPort           int
-	DBUser           string
-	DBPasswordCipher []byte
-	DBName           string
-	DBTLS            bool
-	Provider         string
-	ClusterID        string
-	ClaimURL         string
-	ClaimExpiresAt   *time.Time
-	SchemaVersion    int
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	ID                 string
+	Status             TenantStatus
+	DBHost             string
+	DBPort             int
+	DBUser             string
+	DBPasswordCipher   []byte
+	DBName             string
+	DBTLS              bool
+	Provider           string
+	ClusterID          string
+	ClaimURL           string
+	ClaimExpiresAt     *time.Time
+	SchemaVersion      int
+	S3EncryptionMode   S3EncryptionMode
+	S3KMSKeyID         string
+	S3BucketKeyEnabled bool
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+func (t Tenant) S3EncryptionPolicy() S3EncryptionPolicy {
+	return S3EncryptionPolicy{
+		Mode:             t.S3EncryptionMode,
+		KMSKeyID:         t.S3KMSKeyID,
+		BucketKeyEnabled: t.S3BucketKeyEnabled,
+	}
 }
 
 type APIKey struct {
@@ -262,6 +273,9 @@ func metaInitSchemaStatements() []string {
 			claim_url        TEXT NULL,
 			claim_expires_at DATETIME(3) NULL,
 			schema_version   INT UNSIGNED NOT NULL DEFAULT 1,
+			s3_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'inherit',
+			s3_kms_key_id VARCHAR(256) NOT NULL DEFAULT '',
+			s3_bucket_key_enabled TINYINT(1) NOT NULL DEFAULT 1,
 			created_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			deleted_at       DATETIME(3) NULL,
@@ -811,10 +825,13 @@ func (s *Store) InsertTenant(ctx context.Context, t *Tenant) (err error) {
 	defer observeMeta(ctx, "insert_tenant", start, &err)
 	_, err = s.db.ExecContext(ctx, `INSERT INTO tenants
 		(id, status, db_host, db_port, db_user, db_password, db_name, db_tls,
-		 provider, cluster_id, claim_url, claim_expires_at, schema_version, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 provider, cluster_id, claim_url, claim_expires_at, schema_version,
+		 s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.Status, t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
-		t.Provider, nullStr(t.ClusterID), nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion, t.CreatedAt.UTC(), t.UpdatedAt.UTC())
+		t.Provider, nullStr(t.ClusterID), nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion,
+		tenantS3EncryptionModeForInsert(t), t.S3KMSKeyID, boolToInt(tenantS3BucketKeyEnabledForInsert(t)),
+		t.CreatedAt.UTC(), t.UpdatedAt.UTC())
 	if isDuplicateEntry(err) {
 		return ErrDuplicate
 	}
@@ -840,7 +857,8 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 	defer observeMeta(ctx, "resolve_api_key_hash", start, &err)
 	row := s.db.QueryRowContext(ctx, `SELECT
 			t.id, t.status, t.db_host, t.db_port, t.db_user, t.db_password, t.db_name, t.db_tls,
-			t.provider, t.cluster_id, t.claim_url, t.claim_expires_at, t.schema_version, t.created_at, t.updated_at,
+			t.provider, t.cluster_id, t.claim_url, t.claim_expires_at, t.schema_version,
+			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
 			k.id, k.tenant_id, k.key_name, k.jwt_ciphertext, k.jwt_hash, k.token_version, k.status, k.issued_at,
 			k.revoked_at, k.created_at, k.updated_at
 		FROM tenant_api_keys k
@@ -853,10 +871,12 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 	var claimExp sql.NullTime
 	var clusterID sql.NullString
 	var revokedAt sql.NullTime
+	var s3BucketKeyEnabled int
 	if err = row.Scan(
 		&rec.Tenant.ID, &rec.Tenant.Status, &rec.Tenant.DBHost, &rec.Tenant.DBPort, &rec.Tenant.DBUser,
 		&rec.Tenant.DBPasswordCipher, &rec.Tenant.DBName, &dbTLS, &rec.Tenant.Provider, &clusterID,
-		&claimURL, &claimExp, &rec.Tenant.SchemaVersion, &rec.Tenant.CreatedAt, &rec.Tenant.UpdatedAt,
+		&claimURL, &claimExp, &rec.Tenant.SchemaVersion, &rec.Tenant.S3EncryptionMode,
+		&rec.Tenant.S3KMSKeyID, &s3BucketKeyEnabled, &rec.Tenant.CreatedAt, &rec.Tenant.UpdatedAt,
 		&rec.APIKey.ID, &rec.APIKey.TenantID, &rec.APIKey.KeyName, &rec.APIKey.JWTCiphertext,
 		&rec.APIKey.JWTHash, &rec.APIKey.TokenVersion, &rec.APIKey.Status, &rec.APIKey.IssuedAt,
 		&revokedAt, &rec.APIKey.CreatedAt, &rec.APIKey.UpdatedAt,
@@ -868,6 +888,7 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 		return nil, err
 	}
 	rec.Tenant.DBTLS = dbTLS == 1
+	rec.Tenant.S3BucketKeyEnabled = s3BucketKeyEnabled == 1
 	if clusterID.Valid {
 		rec.Tenant.ClusterID = clusterID.String
 	}
@@ -890,16 +911,18 @@ func (s *Store) GetTenant(ctx context.Context, id string) (out *Tenant, err erro
 	start := time.Now()
 	defer observeMeta(ctx, "get_tenant", start, &err)
 	row := s.db.QueryRowContext(ctx, `SELECT id, status, db_host, db_port, db_user, db_password, db_name,
-		db_tls, provider, cluster_id, claim_url, claim_expires_at, schema_version, created_at, updated_at
+		db_tls, provider, cluster_id, claim_url, claim_expires_at, schema_version,
+		s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at
 		FROM tenants WHERE id = ?`, id)
 	var dbTLS int
 	var clusterID sql.NullString
 	var claimURL sql.NullString
 	var claimExp sql.NullTime
+	var s3BucketKeyEnabled int
 	var rec Tenant
 	if err = row.Scan(&rec.ID, &rec.Status, &rec.DBHost, &rec.DBPort, &rec.DBUser, &rec.DBPasswordCipher,
 		&rec.DBName, &dbTLS, &rec.Provider, &clusterID, &claimURL, &claimExp, &rec.SchemaVersion,
-		&rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		&rec.S3EncryptionMode, &rec.S3KMSKeyID, &s3BucketKeyEnabled, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = ErrNotFound
 			return nil, err
@@ -907,6 +930,7 @@ func (s *Store) GetTenant(ctx context.Context, id string) (out *Tenant, err erro
 		return nil, err
 	}
 	rec.DBTLS = dbTLS == 1
+	rec.S3BucketKeyEnabled = s3BucketKeyEnabled == 1
 	if clusterID.Valid {
 		rec.ClusterID = clusterID.String
 	}
@@ -928,7 +952,8 @@ func (s *Store) ListTenantsByStatus(ctx context.Context, status TenantStatus, li
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id, status, db_host, db_port, db_user, db_password, db_name,
-		db_tls, provider, cluster_id, claim_url, claim_expires_at, schema_version, created_at, updated_at
+		db_tls, provider, cluster_id, claim_url, claim_expires_at, schema_version,
+		s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at
 		FROM tenants WHERE status = ? ORDER BY created_at ASC LIMIT ?`, status, limit)
 	if err != nil {
 		return nil, err
@@ -942,12 +967,14 @@ func (s *Store) ListTenantsByStatus(ctx context.Context, status TenantStatus, li
 		var clusterID sql.NullString
 		var claimURL sql.NullString
 		var claimExp sql.NullTime
+		var s3BucketKeyEnabled int
 		if err := rows.Scan(&t.ID, &t.Status, &t.DBHost, &t.DBPort, &t.DBUser, &t.DBPasswordCipher,
 			&t.DBName, &dbTLS, &t.Provider, &clusterID, &claimURL, &claimExp, &t.SchemaVersion,
-			&t.CreatedAt, &t.UpdatedAt); err != nil {
+			&t.S3EncryptionMode, &t.S3KMSKeyID, &s3BucketKeyEnabled, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err
 		}
 		t.DBTLS = dbTLS == 1
+		t.S3BucketKeyEnabled = s3BucketKeyEnabled == 1
 		if clusterID.Valid {
 			t.ClusterID = clusterID.String
 		}
@@ -1020,6 +1047,20 @@ func boolToInt(v bool) int {
 		return 1
 	}
 	return 0
+}
+
+func tenantS3EncryptionModeForInsert(t *Tenant) S3EncryptionMode {
+	if t.S3EncryptionMode == "" {
+		return S3EncryptionModeInherit
+	}
+	return t.S3EncryptionMode
+}
+
+func tenantS3BucketKeyEnabledForInsert(t *Tenant) bool {
+	if t.S3EncryptionMode == "" && t.S3KMSKeyID == "" && !t.S3BucketKeyEnabled {
+		return true
+	}
+	return t.S3BucketKeyEnabled
 }
 
 func nullStr(v string) any {

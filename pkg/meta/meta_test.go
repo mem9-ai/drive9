@@ -100,8 +100,54 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 	if got.Tenant.Status != TenantActive {
 		t.Fatalf("unexpected tenant status: %s", got.Tenant.Status)
 	}
+	if got.Tenant.S3EncryptionMode != S3EncryptionModeInherit {
+		t.Fatalf("unexpected tenant encryption mode: %s", got.Tenant.S3EncryptionMode)
+	}
+	if got.Tenant.S3KMSKeyID != "" {
+		t.Fatalf("unexpected tenant kms key: %q", got.Tenant.S3KMSKeyID)
+	}
+	if !got.Tenant.S3BucketKeyEnabled {
+		t.Fatal("tenant bucket key enabled = false, want true")
+	}
 	if got.APIKey.Status != APIKeyActive {
 		t.Fatalf("unexpected key status: %s", got.APIKey.Status)
+	}
+}
+
+func TestGetTenantReadsS3EncryptionPolicy(t *testing.T) {
+	s := newControlStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertTenant(context.Background(), &Tenant{
+		ID:                 "tenant-s3-policy",
+		Status:             TenantActive,
+		DBHost:             "127.0.0.1",
+		DBPort:             4000,
+		DBUser:             "root",
+		DBPasswordCipher:   []byte("cipher"),
+		DBName:             "tenant_db_s3_policy",
+		DBTLS:              true,
+		Provider:           "tidb_zero",
+		SchemaVersion:      1,
+		S3EncryptionMode:   S3EncryptionModeSSEKMS,
+		S3BucketKeyEnabled: false,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetTenant(context.Background(), "tenant-s3-policy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.S3EncryptionMode != S3EncryptionModeSSEKMS {
+		t.Fatalf("S3EncryptionMode = %q, want sse-kms", got.S3EncryptionMode)
+	}
+	if got.S3KMSKeyID != "" {
+		t.Fatalf("S3KMSKeyID = %q, want empty", got.S3KMSKeyID)
+	}
+	if got.S3BucketKeyEnabled {
+		t.Fatal("S3BucketKeyEnabled = true, want false")
 	}
 }
 
@@ -237,6 +283,24 @@ func TestMetaSchemaSpecTracksPrimaryKeyConstraint(t *testing.T) {
 	}
 	if !pk.isPrimary {
 		t.Fatal("expected primary constraint marker")
+	}
+}
+
+func TestMetaSchemaSpecIncludesTenantS3EncryptionColumns(t *testing.T) {
+	table := mustMetaTableSpec(t, mustMetaSpec(t), "tenants")
+	tests := map[string]string{
+		"s3_encryption_mode":    "ALTER TABLE tenants ADD COLUMN s3_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'inherit'",
+		"s3_kms_key_id":         "ALTER TABLE tenants ADD COLUMN s3_kms_key_id VARCHAR(256) NOT NULL DEFAULT ''",
+		"s3_bucket_key_enabled": "ALTER TABLE tenants ADD COLUMN s3_bucket_key_enabled TINYINT(1) NOT NULL DEFAULT 1",
+	}
+	for column, wantAddSQL := range tests {
+		spec, ok := table.columns[column]
+		if !ok {
+			t.Fatalf("missing %s in tenants schema spec", column)
+		}
+		if spec.addSQL != wantAddSQL {
+			t.Fatalf("%s addSQL = %q, want %q", column, spec.addSQL, wantAddSQL)
+		}
 	}
 }
 

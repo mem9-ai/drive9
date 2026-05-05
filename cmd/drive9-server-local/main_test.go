@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/backend"
+	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
 
@@ -170,6 +171,9 @@ func TestLocalS3ConfigFromEnv(t *testing.T) {
 		"DRIVE9_S3_ACCESS_KEY_ID",
 		"DRIVE9_S3_SECRET_ACCESS_KEY",
 		"DRIVE9_S3_SESSION_TOKEN",
+		"DRIVE9_S3_ENCRYPTION_MODE",
+		"DRIVE9_S3_KMS_KEY_ID",
+		"DRIVE9_S3_BUCKET_KEY_ENABLED",
 	}
 	prev := make(map[string]string, len(keys))
 	for _, k := range keys {
@@ -225,6 +229,15 @@ func TestLocalS3ConfigFromEnv(t *testing.T) {
 	if err := os.Setenv("DRIVE9_S3_SESSION_TOKEN", "  session-token  "); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Setenv("DRIVE9_S3_ENCRYPTION_MODE", "  sse-kms  "); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_S3_KMS_KEY_ID", "  arn:aws:kms:us-west-2:123456789012:key/test  "); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_S3_BUCKET_KEY_ENABLED", " false "); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := localS3ConfigFromEnv()
 	if err != nil {
 		t.Fatalf("aws config with default local dir should succeed: %v", err)
@@ -240,6 +253,11 @@ func TestLocalS3ConfigFromEnv(t *testing.T) {
 	}
 	if cfg.AccessKeyID != "minioadmin" || cfg.SecretAccessKey != "miniosecret" || cfg.SessionToken != "session-token" {
 		t.Fatalf("unexpected static credential config: %+v", cfg)
+	}
+	if cfg.EncryptionPolicy.Mode != meta.S3EncryptionModeSSEKMS ||
+		cfg.EncryptionPolicy.KMSKeyID != "arn:aws:kms:us-west-2:123456789012:key/test" ||
+		cfg.EncryptionPolicy.BucketKeyEnabled {
+		t.Fatalf("unexpected encryption config: %+v", cfg.EncryptionPolicy)
 	}
 
 	unsetAll()
@@ -266,6 +284,17 @@ func TestLocalS3ConfigFromEnv(t *testing.T) {
 	}
 	if cfg.Dir != "/tmp/local-s3/nested" {
 		t.Fatalf("dir = %q, want %q", cfg.Dir, "/tmp/local-s3/nested")
+	}
+	if cfg.EncryptionPolicy.Mode != meta.S3EncryptionModeNone || !cfg.EncryptionPolicy.BucketKeyEnabled {
+		t.Fatalf("unexpected default encryption config: %+v", cfg.EncryptionPolicy)
+	}
+
+	unsetAll()
+	if err := os.Setenv("DRIVE9_S3_ENCRYPTION_MODE", "sse-kms"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := localS3ConfigFromEnv(); err == nil {
+		t.Fatal("expected missing KMS key to fail")
 	}
 }
 

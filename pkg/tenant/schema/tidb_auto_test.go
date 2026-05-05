@@ -604,6 +604,36 @@ func TestTiDBSchemaSpecForModeIncludesVaultIndexes(t *testing.T) {
 	}
 }
 
+func TestTiDBSchemaSpecIncludesStorageEncryptionColumns(t *testing.T) {
+	files := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "files")
+	for column, wantAddSQL := range map[string]string{
+		"storage_encryption_mode":   "ALTER TABLE files ADD COLUMN storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'legacy'",
+		"storage_encryption_key_id": "ALTER TABLE files ADD COLUMN storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT ''",
+	} {
+		spec, ok := files.columns[column]
+		if !ok {
+			t.Fatalf("files missing %s column", column)
+		}
+		if spec.addSQL != wantAddSQL {
+			t.Fatalf("files %s addSQL = %q, want %q", column, spec.addSQL, wantAddSQL)
+		}
+	}
+
+	uploads := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "uploads")
+	for column, wantAddSQL := range map[string]string{
+		"storage_encryption_mode":   "ALTER TABLE uploads ADD COLUMN storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'none'",
+		"storage_encryption_key_id": "ALTER TABLE uploads ADD COLUMN storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT ''",
+	} {
+		spec, ok := uploads.columns[column]
+		if !ok {
+			t.Fatalf("uploads missing %s column", column)
+		}
+		if spec.addSQL != wantAddSQL {
+			t.Fatalf("uploads %s addSQL = %q, want %q", column, spec.addSQL, wantAddSQL)
+		}
+	}
+}
+
 func TestTiDBSchemaSpecForModeIncludesAlterTableIndexes(t *testing.T) {
 	// In auto-embedding mode, FULLTEXT and VECTOR indexes are part of the
 	// enforceable schema contract and must appear in the spec. TiDB Cloud
