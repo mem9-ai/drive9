@@ -1205,6 +1205,129 @@ func TestCreateFileGetsStreamUploader(t *testing.T) {
 	}
 }
 
+func TestLookupOpenCreatedFileAfterForgetSupportsGitChmodLock(t *testing.T) {
+	var remoteCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted for open-created file", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+	}, "config.lock", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	if _, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, []byte("[core]\n\tfilemode = false\n")); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	// The kernel may drop the lookup ref while the file handle is still open.
+	// A subsequent chmod(path), as used by git's lock-file code, must resolve
+	// the still-open local file rather than returning ENOENT before Flush has
+	// staged it into PendingIndex.
+	fs.Forget(createOut.NodeId, 1)
+
+	var lookupOut gofuse.EntryOut
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "config.lock", &lookupOut)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup after Forget status = %v, want OK", st)
+	}
+	if lookupOut.NodeId != createOut.NodeId {
+		t.Fatalf("Lookup NodeId = %d, want original inode %d", lookupOut.NodeId, createOut.NodeId)
+	}
+
+	var attrOut gofuse.AttrOut
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+			Valid:    gofuse.FATTR_MODE,
+			Mode:     0o644,
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("mode-only SetAttr after Lookup status = %v, want OK", st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0 for open-created lookup", got)
+	}
+}
+
+func TestCommitQueueCleanupRemovesForgottenPendingInode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const p = "/config.lock"
+	ino := fs.inodes.Lookup(p, false, 7, time.Now())
+	if err := shadow.WriteFull(p, []byte("config\n"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(p, 7, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	fs.Forget(ino, 1)
+	if _, ok := fs.inodes.GetPath(ino); !ok {
+		t.Fatal("Forget removed pending inode mapping; chmod/rename may see ENOENT")
+	}
+
+	pending.Remove(p)
+	shadow.Remove(p)
+	fs.onCommitQueueCleanup(&CommitEntry{Path: p, Inode: ino})
+	if _, ok := fs.inodes.GetPath(ino); ok {
+		t.Fatal("commit cleanup left forgotten inode mapping after local state was removed")
+	}
+}
+
+func TestForgetPreservesQueuedCommitInodeUntilCleanup(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	const p = "/config.lock"
+	ino := fs.inodes.Lookup(p, false, 7, time.Now())
+	fs.commitQueue = &CommitQueue{
+		queue:    []*CommitEntry{{Path: p, Inode: ino}},
+		inFlight: map[string]struct{}{},
+		canceled: make(map[string]struct{}),
+	}
+
+	fs.Forget(ino, 1)
+	if _, ok := fs.inodes.GetPath(ino); !ok {
+		t.Fatal("Forget removed queued commit inode mapping before commit cleanup")
+	}
+
+	fs.commitQueue.queue = nil
+	fs.onCommitQueueCleanup(&CommitEntry{Path: p, Inode: ino})
+	if _, ok := fs.inodes.GetPath(ino); ok {
+		t.Fatal("commit cleanup left queued inode mapping after queue/local state cleared")
+	}
+}
+
 func TestStatFs_ReportsVirtualCapacity(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()

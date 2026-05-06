@@ -37,6 +37,10 @@ type CommitEntry struct {
 // 0 for multipart where the revision is not returned inline).
 type CommitSuccessFunc func(entry *CommitEntry, committedRev int64)
 
+// CommitCleanupFunc is called after a successful commit's local shadow/index
+// state has been removed but before the queue entry is dequeued.
+type CommitCleanupFunc func(entry *CommitEntry)
+
 // CommitQueue manages ordered background remote commits with baseRev tracking.
 // It provides backpressure when the queue exceeds maxPending items.
 type CommitQueue struct {
@@ -56,6 +60,9 @@ type CommitQueue struct {
 	// OnSuccess is called after successful upload with the committed
 	// revision. Used by dat9fs to seed readCache and update inode revision.
 	OnSuccess CommitSuccessFunc
+
+	// OnCleanup is called after local commit state has been removed.
+	OnCleanup CommitCleanupFunc
 
 	// workCh dispatches entries to upload workers. The buffer is always
 	// larger than maxPending so Enqueue never blocks.
@@ -213,6 +220,24 @@ func (cq *CommitQueue) WaitPath(path string) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// HasPath reports whether a path is queued or currently in flight.
+func (cq *CommitQueue) HasPath(path string) bool {
+	if cq == nil {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if _, inflight := cq.inFlight[path]; inflight {
+		return true
+	}
+	for _, e := range cq.queue {
+		if e.Path == path {
+			return true
+		}
+	}
+	return false
 }
 
 // WaitPrefix blocks until all in-flight or queued commits under the given
@@ -458,6 +483,9 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) {
 	}
 	if cq.index != nil {
 		cq.index.Remove(entry.Path)
+	}
+	if cq.OnCleanup != nil {
+		cq.OnCleanup(entry)
 	}
 
 	// Remove from queue AFTER all cleanup so WaitPath sees the entry
