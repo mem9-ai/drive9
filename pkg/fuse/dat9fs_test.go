@@ -1150,6 +1150,64 @@ func TestLookupReturnsTTLInEntryOut(t *testing.T) {
 	}
 }
 
+func TestLockFileLookupDisablesEntryCache(t *testing.T) {
+	fs, _, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, 42))
+	})
+	defer cleanup()
+
+	var lockOut gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "config.lock", &lockOut)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup config.lock status = %v, want OK", st)
+	}
+	if got := lockOut.EntryTimeout(); got != 0 {
+		t.Fatalf("config.lock EntryTimeout = %v, want 0", got)
+	}
+	if got := lockOut.AttrTimeout(); got != fs.opts.AttrTTL {
+		t.Fatalf("config.lock AttrTimeout = %v, want %v", got, fs.opts.AttrTTL)
+	}
+
+	var regularOut gofuse.EntryOut
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "config", &regularOut)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup config status = %v, want OK", st)
+	}
+	if got := regularOut.EntryTimeout(); got != fs.opts.EntryTTL {
+		t.Fatalf("regular EntryTimeout = %v, want %v", got, fs.opts.EntryTTL)
+	}
+}
+
+func TestLockFileCreateDisablesEntryCache(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	var lockOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT | syscall.O_EXCL),
+	}, "config.lock", &lockOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create config.lock status = %v, want OK", st)
+	}
+	if got := lockOut.EntryTimeout(); got != 0 {
+		t.Fatalf("config.lock EntryTimeout = %v, want 0", got)
+	}
+
+	var regularOut gofuse.CreateOut
+	st = fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT | syscall.O_EXCL),
+	}, "regular.txt", &regularOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create regular.txt status = %v, want OK", st)
+	}
+	if got := regularOut.EntryTimeout(); got != fs.opts.EntryTTL {
+		t.Fatalf("regular EntryTimeout = %v, want %v", got, fs.opts.EntryTTL)
+	}
+}
+
 func TestInitStoresServer(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
@@ -2575,7 +2633,8 @@ func TestNotifyEntry_NonBlocking(t *testing.T) {
 
 // TestMutationHandlers_CompleteWithinTimeout verifies that all mutation
 // handlers (Create, Mkdir, Unlink, Rmdir, Rename) complete within a bounded
-// time. If kernel notifications were synchronous, these could deadlock.
+// time. Local mutation handlers should finish their own bookkeeping without
+// depending on kernel notify callbacks.
 func TestMutationHandlers_CompleteWithinTimeout(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -2664,7 +2723,7 @@ func TestMutationHandlers_CompleteWithinTimeout(t *testing.T) {
 					t.Fatalf("%s returned %v", tc.name, st)
 				}
 			case <-time.After(5 * time.Second):
-				t.Fatalf("%s timed out (possible deadlock from synchronous kernel notify)", tc.name)
+				t.Fatalf("%s timed out", tc.name)
 			}
 		})
 	}
@@ -3517,12 +3576,9 @@ func TestIsTransientReadErr(t *testing.T) {
 	}
 }
 
-// TestLocalMutations_NoKernelNotify verifies that local FUSE mutations
-// (Create, Mkdir, Unlink, Rmdir, Rename) do NOT produce kernel
-// notifyEntry/notifyInode calls. The kernel already knows the result
-// of its own syscalls via the FUSE reply — redundant notify floods
-// the FUSE channel and causes EAGAIN under load (git clone).
-func TestLocalMutations_NoKernelNotify(t *testing.T) {
+// TestLocalMutations_NotifyBudget verifies that high-volume local mutations
+// do not produce kernel notifyEntry/notifyInode calls.
+func TestLocalMutations_NotifyBudget(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodHead:
@@ -3551,7 +3607,8 @@ func TestLocalMutations_NoKernelNotify(t *testing.T) {
 
 	// Pre-populate inodes for mutation targets.
 	fs.inodes.Lookup("/existing.txt", false, 100, time.Now())
-	fs.inodes.Lookup("/oldname.txt", false, 100, time.Now())
+	fs.inodes.Lookup("/config.lock", false, 100, time.Now())
+	fs.inodes.Lookup("/config", false, 100, time.Now())
 	fs.inodes.Lookup("/existingdir", true, 0, time.Now())
 
 	tests := []struct {
@@ -3594,7 +3651,7 @@ func TestLocalMutations_NoKernelNotify(t *testing.T) {
 				return fs.Rename(nil, &gofuse.RenameIn{
 					InHeader: gofuse.InHeader{NodeId: 1},
 					Newdir:   1,
-				}, "oldname.txt", "renamed.txt")
+				}, "config.lock", "config")
 			},
 		},
 	}
@@ -3847,8 +3904,8 @@ func TestSetAttr_NoKernelNotify(t *testing.T) {
 		SetAttrInCommon: gofuse.SetAttrInCommon{
 			InHeader: gofuse.InHeader{NodeId: ino},
 			Valid:    gofuse.FATTR_SIZE | gofuse.FATTR_FH,
-			Fh:      fhID,
-			Size:    0,
+			Fh:       fhID,
+			Size:     0,
 		},
 	}, &out)
 	if st != gofuse.OK {
