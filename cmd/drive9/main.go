@@ -12,6 +12,7 @@
 //	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
 //	mount   mount drive9 as a local filesystem, or mount vault secrets
 //	umount  unmount a drive9 local mount
+//	doctor  diagnose local drive9 runtime prerequisites
 package main
 
 import (
@@ -37,6 +38,7 @@ var exitFunc = os.Exit
 // "handler not reached". Production callers see no change: the default value
 // is the real cli.Secret and nothing else reassigns it outside tests.
 var vaultHandler = cli.Secret
+var doctorHandler = cli.Doctor
 
 func main() {
 	if logger.CLIEnabled() {
@@ -132,6 +134,17 @@ func dispatch(cmd string, args []string) {
 		}
 		if err := cli.UmountCmd(args); err != nil {
 			fatal("umount", err)
+		}
+	case "doctor":
+		if cliLogger != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = args[0]
+			}
+			logger.Info(context.Background(), "cli_command", zap.String("command", "doctor"), zap.String("subcommand", sub))
+		}
+		if err := doctorHandler(args); err != nil {
+			fatal("doctor", err)
 		}
 	default:
 		if cliLogger != nil {
@@ -245,6 +258,7 @@ commands:
   mount vault [flags] <mountpoint>
                          mount vault secrets read-only
   umount <mountpoint>    unmount a drive9 mount
+  doctor fuse            diagnose local FUSE prerequisites
 
 global:
   -h, --help, help       show this help
