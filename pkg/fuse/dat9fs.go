@@ -1372,12 +1372,6 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		// Remove pending cache entry to prevent future background uploads.
 		fs.writeBack.Remove(childP)
 	}
-	// Also check pendingIndex for the pending-new flag before clearing.
-	if !pendingNew && fs.pendingIndex != nil {
-		if meta, ok := fs.pendingIndex.GetMeta(childP); ok && meta.Kind == PendingNew {
-			pendingNew = true
-		}
-	}
 	// Wait for any in-flight commitQueue upload and cancel it so the
 	// background commit cannot resurrect the deleted file.
 	if fs.commitQueue != nil {
@@ -1385,8 +1379,26 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		fs.debugf("unlink wait commit start path=%s", childP)
 		fs.commitQueue.WaitPath(childP)
 		fs.debugDurationf(waitStart, 0, "unlink wait commit done path=%s", childP)
+
+		// Re-check pendingIndex after WaitPath but before CancelPath. On a
+		// successful commit, commitQueue removes pendingIndex before taking the
+		// entry out of inFlight/queue, so after WaitPath this distinguishes:
+		// still PendingNew => never uploaded; missing => uploaded or remote file.
+		if fs.pendingIndex != nil {
+			if meta, ok := fs.pendingIndex.GetMeta(childP); ok {
+				pendingNew = meta.Kind == PendingNew
+			} else {
+				pendingNew = false
+			}
+		}
 		fs.commitQueue.CancelPath(childP)
 	} else {
+		// Also check pendingIndex for the pending-new flag before clearing.
+		if !pendingNew && fs.pendingIndex != nil {
+			if meta, ok := fs.pendingIndex.GetMeta(childP); ok && meta.Kind == PendingNew {
+				pendingNew = true
+			}
+		}
 		// Clean up shadow and pending index directly when no commit queue.
 		if fs.pendingIndex != nil {
 			fs.pendingIndex.Remove(childP)
@@ -1551,7 +1563,9 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		if isPendingNew {
 			fs.inodes.Rename(oldP, newP)
 			fs.readCache.Invalidate(oldP)
+			fs.readCache.Invalidate(newP)
 			fs.readCache.InvalidatePrefix(oldP + "/")
+			fs.readCache.InvalidatePrefix(newP + "/")
 
 			oldParent, _ := fs.inodes.GetPath(input.NodeId)
 			fs.dirCache.Invalidate(oldParent)
@@ -1613,7 +1627,9 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 
 	fs.inodes.Rename(oldP, newP)
 	fs.readCache.Invalidate(oldP)
+	fs.readCache.Invalidate(newP)
 	fs.readCache.InvalidatePrefix(oldP + "/")
+	fs.readCache.InvalidatePrefix(newP + "/")
 
 	oldParent, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Invalidate(oldParent)
