@@ -131,6 +131,88 @@ func TestCommitQueueConflictKeepsPendingState(t *testing.T) {
 	}
 }
 
+func TestCommitQueueCancelPathDoesNotPoisonFutureSamePath(t *testing.T) {
+	const path = "/repo/.git/config.lock"
+	newData := []byte("[remote \"origin\"]\n\turl = https://github.com/mem9-ai/drive9.git\n")
+
+	var puts [][]byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read PUT body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		puts = append(puts, body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":9}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldEntry := &CommitEntry{Path: path, Size: 3, Kind: PendingNew}
+	cq := &CommitQueue{
+		client:     client.New(ts.URL, ""),
+		shadows:    shadow,
+		index:      pending,
+		inFlight:   make(map[string]*CommitEntry),
+		maxPending: 8,
+		workCh:     make(chan *CommitEntry, 8),
+	}
+	cq.queue = append(cq.queue, oldEntry)
+	cq.workCh <- oldEntry
+
+	cq.CancelPath(path)
+	if !cq.isEntryCanceled(oldEntry) {
+		t.Fatal("old queued entry should be canceled")
+	}
+
+	if err := shadow.WriteFull(path, newData, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(path, int64(len(newData)), PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	newEntry := &CommitEntry{Path: path, Size: int64(len(newData)), Kind: PendingNew}
+	if cq.isEntryCanceled(newEntry) {
+		t.Fatal("new entry for same path must not inherit old cancellation")
+	}
+	if err := cq.Enqueue(newEntry); err != nil {
+		t.Fatal(err)
+	}
+
+	close(cq.workCh)
+	cq.wg.Add(1)
+	go cq.worker()
+	cq.wg.Wait()
+
+	if len(puts) != 1 {
+		t.Fatalf("PUT count = %d, want 1", len(puts))
+	}
+	if !bytes.Equal(puts[0], newData) {
+		t.Fatalf("PUT body = %q, want %q", puts[0], newData)
+	}
+	if pending.HasPending(path) {
+		t.Fatal("pending entry should be removed after new entry commits")
+	}
+	if shadow.Has(path) {
+		t.Fatal("shadow should be removed after new entry commits")
+	}
+}
+
 // TestCommitQueueDirectPutRouting verifies that files under
 // commitQueueDirectPutThreshold use direct PUT (WriteCtxConditionalWithRevision)
 // which sends raw body, while files at or above the threshold use multipart

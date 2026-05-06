@@ -1757,8 +1757,7 @@ func TestShadowSpill_AutoResolveGuard(t *testing.T) {
 	cq := &CommitQueue{
 		shadows:  ss,
 		index:    idx,
-		canceled: make(map[string]struct{}),
-		inFlight: make(map[string]struct{}),
+		inFlight: make(map[string]*CommitEntry),
 	}
 
 	entry := &CommitEntry{
@@ -1876,8 +1875,7 @@ func TestShadowSpill_RecoverPendingPreservesShadowSpill(t *testing.T) {
 	cq := &CommitQueue{
 		index:      idx2,
 		shadows:    shadows,
-		canceled:   make(map[string]struct{}),
-		inFlight:   make(map[string]struct{}),
+		inFlight:   make(map[string]*CommitEntry),
 		maxPending: 100,
 		workCh:     make(chan *CommitEntry, 100),
 	}

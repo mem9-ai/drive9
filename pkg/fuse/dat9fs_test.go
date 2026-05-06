@@ -1370,8 +1370,7 @@ func TestForgetPreservesQueuedCommitInodeUntilCleanup(t *testing.T) {
 	ino := fs.inodes.Lookup(p, false, 7, time.Now())
 	fs.commitQueue = &CommitQueue{
 		queue:    []*CommitEntry{{Path: p, Inode: ino}},
-		inFlight: map[string]struct{}{},
-		canceled: make(map[string]struct{}),
+		inFlight: map[string]*CommitEntry{},
 	}
 
 	fs.Forget(ino, 1)
