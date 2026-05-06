@@ -993,6 +993,16 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		}
 	}
 
+	// Open-created namespace overlay: a file may be open and dirty before
+	// Flush has staged it into PendingIndex. Git's lock-file path can chmod
+	// such a file by path while the kernel has already forgotten the original
+	// lookup ref; resolving from the open handle keeps POSIX create->chmod
+	// sequences from seeing a false ENOENT.
+	if entry, ok := fs.openHandleEntry(childP); ok {
+		fs.fillEntryOut(entry, out)
+		return gofuse.OK
+	}
+
 	stat, err := fs.lookupStatWithRetry(cancel, childP)
 	if err != nil {
 		if !isNotFoundErr(err) {
@@ -1050,7 +1060,96 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 }
 
 func (fs *Dat9FS) Forget(nodeId uint64, nlookup uint64) {
+	entry, ok := fs.inodes.GetEntry(nodeId)
+	if ok && !entry.IsDir && fs.shouldPreserveForgottenInode(entry) {
+		fs.inodes.ForgetKeepMapping(nodeId, nlookup)
+		return
+	}
 	fs.inodes.Forget(nodeId, nlookup)
+}
+
+func (fs *Dat9FS) shouldPreserveForgottenInode(entry *InodeEntry) bool {
+	if entry == nil {
+		return false
+	}
+	if fs.hasOpenHandle(entry.Ino, entry.Path) {
+		return true
+	}
+	return fs.hasPendingLocalState(entry.Path) || fs.hasQueuedCommit(entry.Path)
+}
+
+func (fs *Dat9FS) hasOpenHandle(ino uint64, p string) bool {
+	// TODO: if git/package-manager workloads keep many handles open, maintain
+	// path/inode indexes instead of scanning the whole handle table.
+	for _, fh := range fs.fileHandles.Snapshot() {
+		if fh == nil {
+			continue
+		}
+		if fh.Ino == ino || fh.Path == p {
+			return true
+		}
+	}
+	return false
+}
+
+func (fs *Dat9FS) hasPendingLocalState(p string) bool {
+	if fs.pendingIndex != nil {
+		if _, ok := fs.pendingIndex.GetMeta(p); ok {
+			return true
+		}
+	}
+	if fs.writeBack != nil {
+		if _, ok := fs.writeBack.GetMeta(p); ok {
+			return true
+		}
+	}
+	if fs.shadowStore != nil && fs.shadowStore.Has(p) {
+		return true
+	}
+	return false
+}
+
+func (fs *Dat9FS) hasQueuedCommit(p string) bool {
+	return fs.commitQueue != nil && fs.commitQueue.HasPath(p)
+}
+
+func (fs *Dat9FS) openHandleEntry(p string) (*InodeEntry, bool) {
+	for _, fh := range fs.fileHandles.Snapshot() {
+		if fh == nil || fh.Path != p || fh.Dirty == nil {
+			continue
+		}
+		fh.Lock()
+		size := fh.Dirty.Size()
+		fh.Unlock()
+		// This path reconstructs a dentry for an already-open writable file
+		// after the kernel dropped its lookup ref. Reuse the handle's inode
+		// instead of path Lookup so a stale/missing path map cannot allocate a
+		// second inode for the same open file.
+		if !fs.inodes.IncrementLookup(fh.Ino) {
+			return nil, false
+		}
+		fs.inodes.UpdateSize(fh.Ino, size)
+		fs.inodes.UpdateMtime(fh.Ino, time.Now())
+		return fs.inodes.GetEntry(fh.Ino)
+	}
+	return nil, false
+}
+
+func (fs *Dat9FS) cleanupReleasedInode(ino uint64, p string) {
+	if fs.hasOpenHandle(ino, p) || fs.hasPendingLocalState(p) || fs.hasQueuedCommit(p) {
+		return
+	}
+	// Concurrent Release/commit cleanup for the same path is safe here:
+	// RemoveFileIfUnreferenced holds the inode map lock and is idempotent when
+	// another goroutine already removed the forgotten regular-file mapping.
+	fs.inodes.RemoveFileIfUnreferenced(ino)
+}
+
+func (fs *Dat9FS) cleanupCommittedInode(ino uint64, p string) {
+	if fs.hasOpenHandle(ino, p) || fs.hasPendingLocalState(p) {
+		return
+	}
+	fs.inodes.RemoveFileIfUnreferenced(ino)
 }
 
 func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut) gofuse.Status {
@@ -2738,6 +2837,14 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
+		defer func() {
+			if fh.Prefetch != nil {
+				fh.Prefetch.Close()
+			}
+			fs.fileHandles.Delete(input.Fh)
+			fs.cleanupReleasedInode(fh.Ino, fh.Path)
+		}()
+
 		// Unpin shadow if this handle pinned it, so deferred removals can proceed.
 		if fh.ShadowPinned && fs.shadowStore != nil {
 			defer fs.shadowStore.Unpin(fh.ShadowGen)
@@ -2819,10 +2926,6 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			fs.notifyInode(fh.Ino)
 			parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
 			fs.notifyInode(parentIno)
-			if fh.Prefetch != nil {
-				fh.Prefetch.Close()
-			}
-			fs.fileHandles.Delete(input.Fh)
 			return
 		}
 
@@ -2892,12 +2995,6 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				fs.notifyInode(fh.Ino)
 				parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
 				fs.notifyInode(parentIno)
-
-				// Close prefetcher to cancel inflight goroutines.
-				if fh.Prefetch != nil {
-					fh.Prefetch.Close()
-				}
-				fs.fileHandles.Delete(input.Fh)
 				return
 			}
 			// Stale cache — remove it, fall through to sync upload.
@@ -2941,12 +3038,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			log.Printf("flush failed for %s (status %d), aborted stream upload", fh.Path, st)
 		}
 
-		// Close prefetcher to cancel inflight goroutines.
-		if fh.Prefetch != nil {
-			fh.Prefetch.Close()
-		}
 	}
-	fs.fileHandles.Delete(input.Fh)
 }
 
 // flushHandleDebounced wraps flushHandle with optional debouncing for small files.
@@ -3381,6 +3473,13 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		fs.readCache.Invalidate(entry.Path)
 		fs.dirCache.Invalidate(parentDir(entry.Path))
 	}
+}
+
+func (fs *Dat9FS) onCommitQueueCleanup(entry *CommitEntry) {
+	if entry == nil || entry.Inode == 0 {
+		return
+	}
+	fs.cleanupCommittedInode(entry.Inode, entry.Path)
 }
 
 func (fs *Dat9FS) String() string {

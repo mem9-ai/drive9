@@ -241,6 +241,7 @@ func Mount(opts *MountOptions) error {
 			if shadowStore != nil && pendingIdx != nil {
 				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, maxCommitQueuePending, opts.RemoteRoot)
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess
+				cq.OnCleanup = dat9fs.onCommitQueueCleanup
 				cq.RecoverPending()
 				dat9fs.commitQueue = cq
 			}
