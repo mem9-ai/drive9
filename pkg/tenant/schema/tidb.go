@@ -47,7 +47,7 @@ func InitTiDBTenantSchemaForModeWithOptions(dsn string, mode TiDBEmbeddingMode, 
 func InitTiDBTenantSchemaForModeWithOptionsContext(ctx context.Context, dsn string, mode TiDBEmbeddingMode, opts InitTiDBTenantSchemaOptions) error {
 	switch mode {
 	case TiDBEmbeddingModeAuto:
-		return initTiDBAutoEmbeddingSchema(dsn)
+		return initTiDBAutoEmbeddingSchema(ctx, dsn)
 	case TiDBEmbeddingModeApp:
 		return initTiDBAppEmbeddingSchema(ctx, dsn, opts)
 	default:

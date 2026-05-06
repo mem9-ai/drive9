@@ -156,7 +156,7 @@ func initTiDBAppEmbeddingSchema(ctx context.Context, dsn string, opts InitTiDBTe
 	if !IsTiDBCluster(ctx, db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
-	if err := ExecSchemaStatements(db, tidbAppEmbeddingBaseSchemaStatements()); err != nil {
+	if err := ExecSchemaStatementsContext(ctx, db, tidbAppEmbeddingBaseSchemaStatements()); err != nil {
 		return err
 	}
 	if opts.AllowUnsupportedOptionalIndexes {
@@ -171,7 +171,7 @@ func initTiDBAppEmbeddingSchema(ctx context.Context, dsn string, opts InitTiDBTe
 				zap.Int("skipped_count", skipped),
 				zap.String("reason", "allow_unsupported_optional_indexes"))
 		}
-	} else if err := ExecSchemaStatements(db, tidbAppEmbeddingOptionalSchemaStatements()); err != nil {
+	} else if err := ExecSchemaStatementsContext(ctx, db, tidbAppEmbeddingOptionalSchemaStatements()); err != nil {
 		return err
 	}
 	return ValidateTiDBSchemaForMode(ctx, db, TiDBEmbeddingModeApp)
