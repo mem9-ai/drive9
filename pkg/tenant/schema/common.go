@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/internal/schemaspec"
@@ -37,13 +38,37 @@ func FormatStatementsSQL(stmts []string) string {
 // ExecSchemaStatements executes a sequence of DDL statements, ignoring
 // duplicate-key / already-exists errors that arise from racing migrations.
 func ExecSchemaStatements(db *sql.DB, stmts []string) error {
-	for _, stmt := range stmts {
-		if _, err := db.Exec(stmt); err != nil {
+	return ExecSchemaStatementsContext(context.Background(), db, stmts)
+}
+
+// ExecSchemaStatementsContext executes a sequence of DDL statements with
+// contextual logging, ignoring duplicate-key / already-exists errors that
+// arise from racing migrations.
+func ExecSchemaStatementsContext(ctx context.Context, db *sql.DB, stmts []string) error {
+	for i, stmt := range stmts {
+		start := time.Now()
+		snippet := schemaStatementSnippet(stmt)
+		logger.Info(ctx, "schema_statement_exec_started",
+			zap.Int("statement_index", i+1),
+			zap.Int("statement_count", len(stmts)),
+			zap.String("statement", snippet))
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			if isIgnorableSchemaError(err) {
+				logger.Info(ctx, "schema_statement_exec_skipped_existing",
+					zap.Int("statement_index", i+1),
+					zap.Int("statement_count", len(stmts)),
+					zap.String("statement", snippet),
+					zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
+					zap.Error(err))
 				continue
 			}
 			return fmt.Errorf("exec %q: %w", schemaspec.SQLSnippet(stmt), err)
 		}
+		logger.Info(ctx, "schema_statement_exec_finished",
+			zap.Int("statement_index", i+1),
+			zap.Int("statement_count", len(stmts)),
+			zap.String("statement", snippet),
+			zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
 	}
 	return nil
 }
@@ -54,20 +79,40 @@ func ExecSchemaStatements(db *sql.DB, stmts []string) error {
 // statements skipped for those unsupported features.
 func ExecOptionalSchemaStatements(ctx context.Context, db *sql.DB, stmts []string) (int, error) {
 	skipped := 0
-	for _, stmt := range stmts {
-		if _, err := db.Exec(stmt); err != nil {
+	for i, stmt := range stmts {
+		start := time.Now()
+		snippet := schemaStatementSnippet(stmt)
+		logger.Info(ctx, "optional_schema_statement_exec_started",
+			zap.Int("statement_index", i+1),
+			zap.Int("statement_count", len(stmts)),
+			zap.String("statement", snippet))
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			if isIgnorableSchemaError(err) {
+				logger.Info(ctx, "optional_schema_statement_exec_skipped_existing",
+					zap.Int("statement_index", i+1),
+					zap.Int("statement_count", len(stmts)),
+					zap.String("statement", snippet),
+					zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
+					zap.Error(err))
 				continue
 			}
 			if isIgnorableOptionalSchemaError(err) {
 				skipped++
 				logger.Warn(ctx, "optional_schema_statement_skipped",
+					zap.Int("statement_index", i+1),
+					zap.Int("statement_count", len(stmts)),
 					zap.String("statement", schemaStatementSnippet(stmt)),
+					zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
 					zap.Error(err))
 				continue
 			}
 			return skipped, fmt.Errorf("exec optional %q: %w", schemaStatementSnippet(stmt), err)
 		}
+		logger.Info(ctx, "optional_schema_statement_exec_finished",
+			zap.Int("statement_index", i+1),
+			zap.Int("statement_count", len(stmts)),
+			zap.String("statement", snippet),
+			zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
 	}
 	return skipped, nil
 }
