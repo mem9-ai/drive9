@@ -3615,9 +3615,8 @@ func TestLocalMutations_NoKernelNotify(t *testing.T) {
 }
 
 // TestCreateWriteFlushRelease_NoKernelNotify verifies that the full
-// create→write→flush→release lifecycle produces zero kernel notify calls.
-// Previously each step (Create, Release, commit queue success) would send
-// redundant NOTIFY_INVAL_ENTRY/INODE calls that flooded the FUSE channel.
+// create→write→flush→release lifecycle produces zero kernel notify calls
+// AND that userspace visibility is preserved (inode size, dirCache).
 func TestCreateWriteFlushRelease_NoKernelNotify(t *testing.T) {
 	ts, uploadedCh := newTestServer(t)
 	defer ts.Close()
@@ -3637,11 +3636,13 @@ func TestCreateWriteFlushRelease_NoKernelNotify(t *testing.T) {
 		t.Fatalf("Create: %v", st)
 	}
 
+	wantData := []byte("#!/bin/sh\nexit 0\n")
+
 	// Write
 	_, st = fs.Write(nil, &gofuse.WriteIn{
 		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
 		Fh:       createOut.Fh,
-	}, []byte("#!/bin/sh\nexit 0\n"))
+	}, wantData)
 	if st != gofuse.OK {
 		t.Fatalf("Write: %v", st)
 	}
@@ -3675,12 +3676,93 @@ func TestCreateWriteFlushRelease_NoKernelNotify(t *testing.T) {
 	if delta := after - before; delta != 0 {
 		t.Fatalf("create→write→flush→release→commit produced %d kernel notify calls, want 0", delta)
 	}
+
+	// Verify userspace state is still correct despite no kernel notify.
+	// This is the key behavioral assertion: "no notify AND no visibility regression".
+
+	// 1. Inode size should reflect the written data.
+	wantSize := int64(len(wantData))
+	entry, ok := fs.inodes.GetEntry(createOut.NodeId)
+	if !ok {
+		t.Fatal("inode entry not found after commit")
+	}
+	if entry.Size != wantSize {
+		t.Fatalf("inode size = %d, want %d", entry.Size, wantSize)
+	}
+
+	// 2. dirCache for parent should have been invalidated (not stale).
+	if _, cached := fs.dirCache.Get("/"); cached {
+		t.Fatal("parent dirCache should have been invalidated after create+commit")
+	}
+}
+
+// TestOnCommitQueueSuccess_NoKernelNotify_SeedsReadCache verifies that
+// onCommitQueueSuccess updates userspace state (readCache, inode revision/size)
+// without producing kernel notify calls. This is the mechanism that ensures
+// same-mount read-after-close returns correct content.
+func TestOnCommitQueueSuccess_NoKernelNotify_SeedsReadCache(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	// Set up shadowStore with test data (simulates what Flush stages).
+	shadowDir := t.TempDir()
+	shadow, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+
+	wantData := []byte("#!/bin/sh\nexit 0\n")
+
+	// Pre-populate inode and write shadow data (mimics Flush staging).
+	ino := fs.inodes.Lookup("/hook.sample", false, 0, time.Now())
+	if err := shadow.WriteFull("/hook.sample", wantData, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	before := fs.notifyCount.Load()
+
+	// Simulate commit queue success callback.
+	fs.onCommitQueueSuccess(&CommitEntry{
+		Path:  "/hook.sample",
+		Inode: ino,
+		Size:  int64(len(wantData)),
+	}, 42) // committedRev=42
+
+	after := fs.notifyCount.Load()
+	if delta := after - before; delta != 0 {
+		t.Fatalf("onCommitQueueSuccess produced %d kernel notify calls, want 0", delta)
+	}
+
+	// Verify readCache was seeded with correct data.
+	cachedData, hit := fs.readCache.Get("/hook.sample", 0)
+	if !hit {
+		t.Fatal("readCache miss after onCommitQueueSuccess — read-after-close would hit remote")
+	}
+	if string(cachedData) != string(wantData) {
+		t.Fatalf("readCache content = %q, want %q", cachedData, wantData)
+	}
+
+	// Verify inode revision and size updated.
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Size != int64(len(wantData)) {
+		t.Fatalf("inode size = %d, want %d", entry.Size, len(wantData))
+	}
+
+	// Verify dirCache was invalidated.
+	if _, cached := fs.dirCache.Get("/"); cached {
+		t.Fatal("parent dirCache should have been invalidated")
+	}
 }
 
 // TestSSEForeignChange_StillNotifiesKernel verifies that SSE-driven
-// invalidation (from a foreign actor) still produces kernel notify calls.
-// Only local-initiated operations should skip notify; external changes
-// must still invalidate the kernel cache.
+// invalidation (from a foreign actor) still produces kernel notify calls
+// through the actual SSEWatcher.handleEvent code path. Only local-initiated
+// operations skip notify; external changes must invalidate the kernel cache.
 func TestSSEForeignChange_StillNotifiesKernel(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
@@ -3689,23 +3771,53 @@ func TestSSEForeignChange_StillNotifiesKernel(t *testing.T) {
 	// Pre-populate an inode so SSE invalidation has something to notify.
 	fs.inodes.Lookup("/remote-file.txt", false, 100, time.Now())
 
+	// Create an SSEWatcher with our own actor ID.
+	w := &SSEWatcher{fs: fs, actor: "mount-abc"}
+
+	// --- Foreign actor change event → should notify kernel ---
 	before := fs.notifyCount.Load()
-
-	// Simulate SSE-driven cache invalidation (same code path as sse.go handleChange).
-	ino, ok := fs.inodes.GetInode("/remote-file.txt")
-	if !ok {
-		t.Fatal("expected inode for /remote-file.txt")
+	w.handleEvent(&client.ChangeEvent{
+		Path:  "/remote-file.txt",
+		Op:    "write",
+		Actor: "other-mount-xyz",
+	}, nil)
+	afterChange := fs.notifyCount.Load()
+	if delta := afterChange - before; delta == 0 {
+		t.Fatal("SSE foreign ChangeEvent produced 0 kernel notify calls, want >0")
 	}
-	fs.readCache.Invalidate("/remote-file.txt")
-	fs.dirCache.Invalidate("/")
-	// These are the same calls SSE watcher makes for foreign changes.
-	fs.notifyInode(ino)
-	parentIno, _ := fs.inodes.GetInode("/")
-	fs.notifyEntry(parentIno, "remote-file.txt")
 
-	after := fs.notifyCount.Load()
-	if delta := after - before; delta != 2 {
-		t.Fatalf("SSE foreign change produced %d kernel notify calls, want 2", delta)
+	// --- Own actor change event → should NOT notify kernel ---
+	before2 := fs.notifyCount.Load()
+	w.handleEvent(&client.ChangeEvent{
+		Path:  "/remote-file.txt",
+		Op:    "write",
+		Actor: "mount-abc", // same as our actor
+	}, nil)
+	afterSelf := fs.notifyCount.Load()
+	if delta := afterSelf - before2; delta != 0 {
+		t.Fatalf("SSE own-actor ChangeEvent produced %d kernel notify calls, want 0", delta)
+	}
+
+	// --- Foreign structural reset → should notify kernel ---
+	before3 := fs.notifyCount.Load()
+	w.handleEvent(nil, &client.ResetEvent{
+		Reason: "structural_change",
+		Actor:  "other-mount-xyz",
+	})
+	afterReset := fs.notifyCount.Load()
+	if delta := afterReset - before3; delta == 0 {
+		t.Fatal("SSE foreign ResetEvent produced 0 kernel notify calls, want >0")
+	}
+
+	// --- Own actor structural reset → should NOT notify kernel ---
+	before4 := fs.notifyCount.Load()
+	w.handleEvent(nil, &client.ResetEvent{
+		Reason: "structural_change",
+		Actor:  "mount-abc",
+	})
+	afterSelfReset := fs.notifyCount.Load()
+	if delta := afterSelfReset - before4; delta != 0 {
+		t.Fatalf("SSE own-actor ResetEvent produced %d kernel notify calls, want 0", delta)
 	}
 }
 

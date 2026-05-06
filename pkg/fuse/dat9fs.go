@@ -67,7 +67,9 @@ type Dat9FS struct {
 
 	// server is the go-fuse server, set during Init(). Used to send
 	// kernel cache invalidation notifications (EntryNotify, InodeNotify)
-	// so that long TTLs don't serve stale data after local mutations.
+	// for external/SSE-driven changes that the kernel doesn't know about.
+	// Local FUSE mutations do NOT use server notify — the kernel updates
+	// its own cache from the FUSE reply.
 	server *gofuse.Server
 
 	// notifyWg tracks inflight asynchronous kernel notification goroutines
