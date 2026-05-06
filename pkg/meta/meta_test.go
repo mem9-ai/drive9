@@ -114,6 +114,138 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 	}
 }
 
+func TestRevokeAPIKeyByName(t *testing.T) {
+	s := newControlStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertTenant(context.Background(), &Tenant{
+		ID:               "tenant-revoke-key",
+		Status:           TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: []byte("cipher"),
+		DBName:           "tenant_revoke_key_db",
+		DBTLS:            true,
+		Provider:         "tidb_zero",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertAPIKey(context.Background(), &APIKey{
+		ID:            "k-revoke",
+		TenantID:      "tenant-revoke-key",
+		KeyName:       "worker",
+		JWTCiphertext: []byte("jwt-cipher"),
+		JWTHash:       "hash-revoke",
+		TokenVersion:  1,
+		Status:        APIKeyActive,
+		IssuedAt:      now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	revokedAt := now.Add(time.Minute)
+	if err := s.RevokeAPIKeyByName(context.Background(), "tenant-revoke-key", "worker", revokedAt); err != nil {
+		t.Fatalf("RevokeAPIKeyByName: %v", err)
+	}
+
+	got, err := s.ResolveByAPIKeyHash(context.Background(), "hash-revoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.APIKey.Status != APIKeyRevoked {
+		t.Fatalf("key status = %s, want %s", got.APIKey.Status, APIKeyRevoked)
+	}
+	if got.APIKey.RevokedAt == nil || !got.APIKey.RevokedAt.Equal(revokedAt.Truncate(time.Millisecond)) {
+		t.Fatalf("revoked_at = %v, want %v", got.APIKey.RevokedAt, revokedAt)
+	}
+
+	if err := s.RevokeAPIKeyByName(context.Background(), "tenant-revoke-key", "worker", revokedAt.Add(time.Minute)); err != ErrNotFound {
+		t.Fatalf("second revoke err = %v, want %v", err, ErrNotFound)
+	}
+	if err := s.RevokeAPIKeyByName(context.Background(), "tenant-revoke-key", "missing", revokedAt); err != ErrNotFound {
+		t.Fatalf("missing revoke err = %v, want %v", err, ErrNotFound)
+	}
+}
+
+func TestListAndGetAPIKeysByTenant(t *testing.T) {
+	s := newControlStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertTenant(context.Background(), &Tenant{
+		ID:               "tenant-list-keys",
+		Status:           TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: []byte("cipher"),
+		DBName:           "tenant_list_keys_db",
+		DBTLS:            true,
+		Provider:         "tidb_zero",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	keys := []*APIKey{
+		{
+			ID:            "k-default",
+			TenantID:      "tenant-list-keys",
+			KeyName:       "default",
+			JWTCiphertext: []byte("jwt-default"),
+			JWTHash:       "hash-default",
+			TokenVersion:  1,
+			Status:        APIKeyActive,
+			IssuedAt:      now,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+		{
+			ID:            "k-worker",
+			TenantID:      "tenant-list-keys",
+			KeyName:       "worker",
+			JWTCiphertext: []byte("jwt-worker"),
+			JWTHash:       "hash-worker",
+			TokenVersion:  2,
+			Status:        APIKeyActive,
+			IssuedAt:      now.Add(time.Second),
+			CreatedAt:     now.Add(time.Second),
+			UpdatedAt:     now.Add(time.Second),
+		},
+	}
+	for _, key := range keys {
+		if err := s.InsertAPIKey(context.Background(), key); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	gotKeys, err := s.ListAPIKeysByTenant(context.Background(), "tenant-list-keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotKeys) != 2 {
+		t.Fatalf("len(keys)=%d, want 2", len(gotKeys))
+	}
+	if gotKeys[0].KeyName != "default" || gotKeys[1].KeyName != "worker" {
+		t.Fatalf("unexpected key order: %q, %q", gotKeys[0].KeyName, gotKeys[1].KeyName)
+	}
+
+	gotKey, err := s.GetAPIKeyByName(context.Background(), "tenant-list-keys", "worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotKey.ID != "k-worker" || gotKey.KeyName != "worker" {
+		t.Fatalf("unexpected key: %#v", gotKey)
+	}
+	if _, err := s.GetAPIKeyByName(context.Background(), "tenant-list-keys", "missing"); err != ErrNotFound {
+		t.Fatalf("missing key err = %v, want %v", err, ErrNotFound)
+	}
+}
+
 func TestGetTenantReadsS3EncryptionPolicy(t *testing.T) {
 	s := newControlStore(t)
 	now := time.Now().UTC()

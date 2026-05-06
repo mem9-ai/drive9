@@ -232,6 +232,8 @@ func requestRoute(path string) string {
 		return "/v1/provision"
 	case path == "/v1/status":
 		return "/v1/status"
+	case path == tenantAPIKeysPath || strings.HasPrefix(path, tenantAPIKeysPath+"/"):
+		return tenantAPIKeysPath + "/*"
 	case path == "/v1/sql":
 		return "/v1/sql"
 	case path == "/v1/events":

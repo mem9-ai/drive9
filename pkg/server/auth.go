@@ -25,6 +25,7 @@ const tenantScopeKey scopeKey = iota
 type TenantScope struct {
 	TenantID     string
 	APIKeyID     string
+	APIKeyName   string
 	TokenVersion int
 	Provider     string
 	Backend      *backend.Dat9Backend
@@ -198,7 +199,7 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			zap.Float64("total_ms", authPhaseMs(authStart)),
 		)
 
-		scope := &TenantScope{TenantID: resolved.Tenant.ID, APIKeyID: resolved.APIKey.ID, TokenVersion: resolved.APIKey.TokenVersion, Provider: resolved.Tenant.Provider, Backend: b}
+		scope := &TenantScope{TenantID: resolved.Tenant.ID, APIKeyID: resolved.APIKey.ID, APIKeyName: resolved.APIKey.KeyName, TokenVersion: resolved.APIKey.TokenVersion, Provider: resolved.Tenant.Provider, Backend: b}
 		next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 	})
 }

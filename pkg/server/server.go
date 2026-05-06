@@ -130,6 +130,8 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
 	mux.Handle("/v2/uploads/", business)
+	mux.Handle(tenantAPIKeysPath, business)
+	mux.Handle(tenantAPIKeysPath+"/", business)
 	mux.Handle("/v1/sql", business)
 	mux.Handle("/v1/events", business)
 	// Vault management API goes through tenant auth.
@@ -277,7 +279,7 @@ func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled 
 
 func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		scope := &TenantScope{TenantID: "local", APIKeyID: "local", TokenVersion: 1, Backend: b}
+		scope := &TenantScope{TenantID: "local", APIKeyID: "local", APIKeyName: defaultTenantAPIKeyName, TokenVersion: 1, Backend: b}
 		next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 	})
 }
@@ -303,6 +305,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleUploadAction(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v2/uploads/"):
 		s.handleV2Uploads(w, r)
+	case r.URL.Path == tenantAPIKeysPath, strings.HasPrefix(r.URL.Path, tenantAPIKeysPath+"/"):
+		s.handleAPIKeys(w, r)
 	case r.URL.Path == "/v1/sql":
 		s.handleSQL(w, r)
 	case r.URL.Path == "/v1/events":

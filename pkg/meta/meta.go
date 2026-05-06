@@ -859,6 +859,70 @@ func (s *Store) InsertAPIKey(ctx context.Context, k *APIKey) (err error) {
 	return err
 }
 
+func (s *Store) RevokeAPIKeyByName(ctx context.Context, tenantID, keyName string, revokedAt time.Time) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "revoke_api_key_by_name", start, &err)
+	res, err := s.db.ExecContext(ctx, `UPDATE tenant_api_keys
+		SET status = ?, revoked_at = ?, updated_at = ?
+		WHERE tenant_id = ? AND key_name = ? AND status = ?`,
+		APIKeyRevoked, revokedAt.UTC(), revokedAt.UTC(), tenantID, keyName, APIKeyActive)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) GetAPIKeyByName(ctx context.Context, tenantID, keyName string) (out *APIKey, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "get_api_key_by_name", start, &err)
+	row := s.db.QueryRowContext(ctx, `SELECT id, tenant_id, key_name, jwt_ciphertext, jwt_hash, token_version, status, issued_at,
+		revoked_at, created_at, updated_at
+		FROM tenant_api_keys
+		WHERE tenant_id = ? AND key_name = ?`, tenantID, keyName)
+	rec, err := scanAPIKeyRow(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return rec, nil
+}
+
+func (s *Store) ListAPIKeysByTenant(ctx context.Context, tenantID string) (out []APIKey, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_api_keys_by_tenant", start, &err)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, tenant_id, key_name, jwt_ciphertext, jwt_hash, token_version, status, issued_at,
+		revoked_at, created_at, updated_at
+		FROM tenant_api_keys
+		WHERE tenant_id = ?
+		ORDER BY created_at ASC, key_name ASC`, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	out = make([]APIKey, 0)
+	for rows.Next() {
+		rec, err := scanAPIKeyRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *TenantWithAPIKey, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "resolve_api_key_hash", start, &err)
@@ -1079,6 +1143,39 @@ func nullStr(v string) any {
 		return nil
 	}
 	return v
+}
+
+type apiKeyRowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanAPIKeyRow(row apiKeyRowScanner) (*APIKey, error) {
+	return scanAPIKeyRows(row)
+}
+
+func scanAPIKeyRows(row apiKeyRowScanner) (*APIKey, error) {
+	var rec APIKey
+	var revokedAt sql.NullTime
+	if err := row.Scan(
+		&rec.ID,
+		&rec.TenantID,
+		&rec.KeyName,
+		&rec.JWTCiphertext,
+		&rec.JWTHash,
+		&rec.TokenVersion,
+		&rec.Status,
+		&rec.IssuedAt,
+		&revokedAt,
+		&rec.CreatedAt,
+		&rec.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	if revokedAt.Valid {
+		t := revokedAt.Time.UTC()
+		rec.RevokedAt = &t
+	}
+	return &rec, nil
 }
 
 func isDuplicateEntry(err error) bool {
