@@ -952,6 +952,20 @@ func (fs *Dat9FS) remoteDirExistsDetached(localPath string) bool {
 	return err == nil && stat.IsDir
 }
 
+func (fs *Dat9FS) remoteRenameCommittedDetached(oldP, newP string) bool {
+	targetCtx, targetCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+	_, targetErr := fs.client.StatCtx(targetCtx, fs.remotePath(newP))
+	targetCancel()
+	if targetErr != nil {
+		return false
+	}
+
+	sourceCtx, sourceCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+	_, sourceErr := fs.client.StatCtx(sourceCtx, fs.remotePath(oldP))
+	sourceCancel()
+	return isNotFoundErr(sourceErr)
+}
+
 func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string) error {
 	apiPath := fs.remotePath(localPath)
 	ctx, cf := fuseCtx(cancel)
@@ -988,6 +1002,49 @@ func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPat
 			return err
 		}
 		if fs.remoteDirExistsDetached(localPath) {
+			return nil
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+func (fs *Dat9FS) renameRemoteWithTransientRetry(ctx context.Context, oldP, newP string) error {
+	oldRemote := fs.remotePath(oldP)
+	newRemote := fs.remotePath(newP)
+	err := fs.client.RenameCtx(ctx, oldRemote, newRemote)
+	if err == nil || !isTransientLookupErr(err) {
+		return err
+	}
+
+	// If the caller interrupted after the server committed the rename but before
+	// the response reached us, the target is visible and the source is gone.
+	// Target visibility alone is not enough because server-side rename supports
+	// replacing an existing target such as .git/config.
+	if fs.remoteRenameCommittedDetached(oldP, newP) {
+		return nil
+	}
+
+	retryCount := fs.lookupStatRetryCount()
+	if retryCount <= 0 {
+		return err
+	}
+
+	lastErr := err
+	for range retryCount {
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+		err = fs.client.RenameCtx(retryCtx, oldRemote, newRemote)
+		retryCancel()
+		if err == nil {
+			return nil
+		}
+		if isNotFoundErr(err) && fs.remoteRenameCommittedDetached(oldP, newP) {
+			return nil
+		}
+		if !isTransientLookupErr(err) {
+			return err
+		}
+		if fs.remoteRenameCommittedDetached(oldP, newP) {
 			return nil
 		}
 		lastErr = err
@@ -1771,7 +1828,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 	}
 
-	if err := fs.client.RenameCtx(ctx, fs.remotePath(oldP), fs.remotePath(newP)); err != nil {
+	if err := fs.renameRemoteWithTransientRetry(ctx, oldP, newP); err != nil {
 		return httpToFuseStatus(err)
 	}
 

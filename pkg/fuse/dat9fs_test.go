@@ -3666,6 +3666,237 @@ func TestRenamePendingNewCommitSyncCommitsWhenQueueStopped(t *testing.T) {
 	}
 }
 
+func TestRenameRemoteWithTransientRetryRetriesAfterInterrupt(t *testing.T) {
+	oldP := "/repo/.git/objects/e6/tmp_obj_XyNuJc"
+	newP := "/repo/.git/objects/e6/d0788db28a1c0860d85a7f9181233b37665bce"
+
+	firstRenameStarted := make(chan struct{})
+	var firstRenameOnce sync.Once
+	var renameCalls atomic.Int32
+	var wrongSource atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+newP && r.URL.RawQuery == "rename":
+			if r.Header.Get("X-Dat9-Rename-Source") != oldP {
+				wrongSource.Store(true)
+			}
+			if renameCalls.Add(1) == 1 {
+				firstRenameOnce.Do(func() { close(firstRenameStarted) })
+				<-r.Context().Done()
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	dirIno := fs.inodes.Lookup("/repo/.git/objects/e6", true, 0, time.Now())
+	fs.inodes.Lookup(oldP, false, 849, time.Now())
+
+	cancel := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Rename(cancel, &gofuse.RenameIn{
+			InHeader: gofuse.InHeader{NodeId: dirIno},
+			Newdir:   dirIno,
+		}, "tmp_obj_XyNuJc", "d0788db28a1c0860d85a7f9181233b37665bce")
+	}()
+
+	select {
+	case <-firstRenameStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first rename request")
+	}
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("Rename status = %v, want OK", st)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Rename timed out")
+	}
+	if got := renameCalls.Load(); got != 2 {
+		t.Fatalf("rename calls = %d, want 2", got)
+	}
+	if wrongSource.Load() {
+		t.Fatalf("rename source header did not match %q", oldP)
+	}
+}
+
+func TestRenameRemoteWithTransientRetryAcceptsTargetVisibleAfterInterrupt(t *testing.T) {
+	oldP := "/repo/.git/objects/e6/tmp_obj_XyNuJc"
+	newP := "/repo/.git/objects/e6/d0788db28a1c0860d85a7f9181233b37665bce"
+
+	firstRenameStarted := make(chan struct{})
+	var firstRenameOnce sync.Once
+	var renameCalls atomic.Int32
+	var targetVisible atomic.Bool
+	var headTargetCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+newP && r.URL.RawQuery == "rename":
+			if renameCalls.Add(1) == 1 {
+				targetVisible.Store(true)
+				firstRenameOnce.Do(func() { close(firstRenameStarted) })
+				<-r.Context().Done()
+				return
+			}
+			http.Error(w, "old path no longer exists", http.StatusNotFound)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+newP:
+			headTargetCalls.Add(1)
+			if targetVisible.Load() {
+				w.Header().Set("Content-Length", "849")
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "2")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	dirIno := fs.inodes.Lookup("/repo/.git/objects/e6", true, 0, time.Now())
+	fs.inodes.Lookup(oldP, false, 849, time.Now())
+
+	cancel := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Rename(cancel, &gofuse.RenameIn{
+			InHeader: gofuse.InHeader{NodeId: dirIno},
+			Newdir:   dirIno,
+		}, "tmp_obj_XyNuJc", "d0788db28a1c0860d85a7f9181233b37665bce")
+	}()
+
+	select {
+	case <-firstRenameStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first rename request")
+	}
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("Rename status = %v, want OK", st)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Rename timed out")
+	}
+	if got := renameCalls.Load(); got != 1 {
+		t.Fatalf("rename calls = %d, want 1", got)
+	}
+	if got := headTargetCalls.Load(); got == 0 {
+		t.Fatal("target visibility was not probed after interrupted rename")
+	}
+}
+
+func TestRenameRemoteWithTransientRetryDoesNotAcceptPreexistingTarget(t *testing.T) {
+	oldP := "/repo/.git/config.lock"
+	newP := "/repo/.git/config"
+
+	firstRenameStarted := make(chan struct{})
+	var firstRenameOnce sync.Once
+	var renameCalls atomic.Int32
+	var sourceExists atomic.Bool
+	var headSourceCalls atomic.Int32
+	var headTargetCalls atomic.Int32
+	sourceExists.Store(true)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+newP && r.URL.RawQuery == "rename":
+			if renameCalls.Add(1) == 1 {
+				firstRenameOnce.Do(func() { close(firstRenameStarted) })
+				<-r.Context().Done()
+				return
+			}
+			sourceExists.Store(false)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+newP:
+			headTargetCalls.Add(1)
+			w.Header().Set("Content-Length", "36")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+oldP:
+			headSourceCalls.Add(1)
+			if sourceExists.Load() {
+				w.Header().Set("Content-Length", "54")
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "2")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	dirIno := fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
+	fs.inodes.Lookup(oldP, false, 54, time.Now())
+	fs.inodes.Lookup(newP, false, 36, time.Now())
+
+	cancel := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Rename(cancel, &gofuse.RenameIn{
+			InHeader: gofuse.InHeader{NodeId: dirIno},
+			Newdir:   dirIno,
+		}, "config.lock", "config")
+	}()
+
+	select {
+	case <-firstRenameStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first rename request")
+	}
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("Rename status = %v, want OK", st)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Rename timed out")
+	}
+	if got := renameCalls.Load(); got != 2 {
+		t.Fatalf("rename calls = %d, want 2", got)
+	}
+	if got := headTargetCalls.Load(); got == 0 {
+		t.Fatal("preexisting target was not checked after interrupted rename")
+	}
+	if got := headSourceCalls.Load(); got == 0 {
+		t.Fatal("source path was not checked after interrupted rename")
+	}
+	if sourceExists.Load() {
+		t.Fatal("retry did not commit the overwrite rename")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Read detached retry tests
 // ---------------------------------------------------------------------------
