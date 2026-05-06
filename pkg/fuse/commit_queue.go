@@ -30,6 +30,7 @@ type CommitEntry struct {
 	Size        int64
 	Kind        PendingKind
 	ShadowSpill bool // true when data is only in shadow file (auto-resolve would OOM)
+	canceled    bool
 }
 
 // CommitSuccessFunc is called after a commit queue entry is successfully
@@ -46,8 +47,7 @@ type CommitCleanupFunc func(entry *CommitEntry)
 type CommitQueue struct {
 	mu         sync.Mutex
 	queue      []*CommitEntry
-	inFlight   map[string]struct{} // paths currently being processed by workers
-	canceled   map[string]struct{} // paths canceled by Unlink/Rmdir (workers skip these)
+	inFlight   map[string]*CommitEntry // paths currently being processed by workers
 	maxPending int
 	client     *client.Client
 	remoteRoot string
@@ -93,8 +93,7 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 		shadows:    shadows,
 		index:      index,
 		journal:    journal,
-		inFlight:   make(map[string]struct{}),
-		canceled:   make(map[string]struct{}),
+		inFlight:   make(map[string]*CommitEntry),
 		workCh:     make(chan *CommitEntry, bufSize),
 	}
 	for i := 0; i < numWorkers; i++ {
@@ -268,18 +267,24 @@ func (cq *CommitQueue) WaitPrefix(prefix string) {
 	}
 }
 
-// CancelPath marks a path as canceled so workers skip it, removes it from
-// the queue, and cleans up its shadow/index state. Used by Unlink to
-// prevent background commits from resurrecting deleted files.
+// CancelPath marks currently queued or in-flight entries for path as canceled,
+// removes queued entries, and cleans up shadow/index state. Cancellation is
+// entry-scoped so future files that reuse the same path (for example git's
+// config.lock) are not poisoned by an old cancellation.
 func (cq *CommitQueue) CancelPath(path string) {
 	cq.mu.Lock()
-	cq.canceled[path] = struct{}{}
-	for i, e := range cq.queue {
-		if e.Path == path {
-			cq.queue = append(cq.queue[:i], cq.queue[i+1:]...)
-			break
-		}
+	if e, ok := cq.inFlight[path]; ok {
+		e.canceled = true
 	}
+	remaining := cq.queue[:0]
+	for _, e := range cq.queue {
+		if e.Path == path {
+			e.canceled = true
+			continue
+		}
+		remaining = append(remaining, e)
+	}
+	cq.queue = remaining
 	cq.mu.Unlock()
 
 	if cq.shadows != nil {
@@ -290,18 +295,23 @@ func (cq *CommitQueue) CancelPath(path string) {
 	}
 }
 
-// CancelPrefix marks all paths under prefix as canceled, removes them from
-// the queue, and cleans up their shadow/index state. Used by Rmdir.
-// Workers that have already dequeued entries will check the canceled set
-// before uploading.
+// CancelPrefix marks queued or in-flight entries under prefix as canceled,
+// removes queued entries, and cleans up their shadow/index state. Cancellation
+// is entry-scoped, so future entries under the same prefix are unaffected.
 func (cq *CommitQueue) CancelPrefix(prefix string) {
 	cq.mu.Lock()
 	var remaining []*CommitEntry
 	var cancelled []string
+	for p, e := range cq.inFlight {
+		if strings.HasPrefix(p, prefix) {
+			e.canceled = true
+			cancelled = append(cancelled, p)
+		}
+	}
 	for _, e := range cq.queue {
 		if strings.HasPrefix(e.Path, prefix) {
+			e.canceled = true
 			cancelled = append(cancelled, e.Path)
-			cq.canceled[e.Path] = struct{}{}
 		} else {
 			remaining = append(remaining, e)
 		}
@@ -319,27 +329,23 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	}
 }
 
-// isCanceled checks whether the path has been canceled by Unlink/Rmdir.
-func (cq *CommitQueue) isCanceled(path string) bool {
+// isEntryCanceled checks whether this specific entry was canceled by
+// Unlink/Rmdir. It intentionally does not key by path; git repeatedly reuses
+// config.lock, and an old cancellation must not affect a newer entry.
+func (cq *CommitQueue) isEntryCanceled(entry *CommitEntry) bool {
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
-	if _, ok := cq.canceled[path]; ok {
-		return true
+	if entry == nil {
+		return false
 	}
-	// Also check prefix cancellations.
-	for p := range cq.canceled {
-		if strings.HasSuffix(p, "/") && strings.HasPrefix(path, p) {
-			return true
-		}
-	}
-	return false
+	return entry.canceled
 }
 
 func (cq *CommitQueue) worker() {
 	defer cq.wg.Done()
 	for entry := range cq.workCh {
 		// Check if this entry was canceled while buffered in workCh.
-		if cq.isCanceled(entry.Path) {
+		if cq.isEntryCanceled(entry) {
 			cq.removeFromQueue(entry)
 			log.Printf("commit queue: skipping canceled entry for %s", entry.Path)
 			continue
@@ -347,14 +353,16 @@ func (cq *CommitQueue) worker() {
 
 		// Mark as in-flight so WaitPath blocks until cleanup finishes.
 		cq.mu.Lock()
-		cq.inFlight[entry.Path] = struct{}{}
+		cq.inFlight[entry.Path] = entry
 		cq.mu.Unlock()
 
 		cq.commitOne(entry)
 
 		// Clear in-flight after all cleanup is done.
 		cq.mu.Lock()
-		delete(cq.inFlight, entry.Path)
+		if cq.inFlight[entry.Path] == entry {
+			delete(cq.inFlight, entry.Path)
+		}
 		cq.mu.Unlock()
 	}
 }
@@ -368,7 +376,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		// Re-check cancelation between retries.
-		if cq.isCanceled(entry.Path) {
+		if cq.isEntryCanceled(entry) {
 			cq.removeFromQueue(entry)
 			log.Printf("commit queue: entry for %s was canceled during retry", entry.Path)
 			return
@@ -505,7 +513,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) {
 // requiring 3-way merge. Max 1 retry to avoid write amplification.
 func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	// Bail early if the file was deleted locally while queued.
-	if cq.isCanceled(entry.Path) {
+	if cq.isEntryCanceled(entry) {
 		cq.removeFromQueue(entry)
 		log.Printf("commit queue: auto-resolve skipped for %s (canceled)", entry.Path)
 		return
@@ -529,7 +537,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	if err != nil {
 		// Shadow may have been removed by a concurrent CancelPath/CancelPrefix
 		// (Unlink/Rmdir). Treat as canceled rather than a true conflict.
-		if cq.isCanceled(entry.Path) {
+		if cq.isEntryCanceled(entry) {
 			cq.removeFromQueue(entry)
 			log.Printf("commit queue: auto-resolve skipped for %s (canceled mid-read)", entry.Path)
 			return
@@ -570,7 +578,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 
 	// Branch 2: LWW — re-upload local shadow with new base revision.
 	// Re-check cancelation before the potentially expensive upload.
-	if cq.isCanceled(entry.Path) {
+	if cq.isEntryCanceled(entry) {
 		cq.removeFromQueue(entry)
 		log.Printf("commit queue: auto-resolve aborted for %s before LWW upload (canceled)", entry.Path)
 		return

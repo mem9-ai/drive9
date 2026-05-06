@@ -457,6 +457,7 @@ else
   check_cmd "curl is available" bash -c 'command -v curl >/dev/null'
 fi
 check_cmd "python3 is available" bash -c 'command -v python3 >/dev/null'
+check_cmd "git is available" bash -c 'command -v git >/dev/null'
 
 if [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
   skip "unsupported OS for this smoke script"
@@ -579,6 +580,9 @@ MOUNT_TO_CLI_MOUNT="$MOUNT_POINT/$MOUNT_TO_CLI_REL"
 LARGE_REL="${RW_ALPHA_RENAMED_REL}/large-8m.bin"
 LARGE_REMOTE="/${LARGE_REL}"
 LARGE_MOUNT="$MOUNT_POINT/$LARGE_REL"
+GIT_PROBE_REL="${ROOT_REL}/git-config-probe"
+GIT_PROBE_MOUNT="$MOUNT_POINT/$GIT_PROBE_REL"
+GIT_PROBE_ORIGIN="https://github.com/mem9-ai/drive9.git"
 RO_SEED_REL="${ROOT_REL}/ro-seed.txt"
 RO_SEED_REMOTE="/${RO_SEED_REL}"
 RO_SEED_MOUNT="$MOUNT_POINT/$RO_SEED_REL"
@@ -716,6 +720,38 @@ PY
       check_eq "rename directory source exists" "false" "true"
     fi
   fi
+
+  echo "[8.1] git config lockfile semantics"
+  mkdir -p "$GIT_PROBE_MOUNT"
+  git_config_ok=true
+  if ! git -C "$GIT_PROBE_MOUNT" init >/dev/null; then
+    git_config_ok=false
+  fi
+  if ! git -C "$GIT_PROBE_MOUNT" config core.repositoryformatversion 0; then
+    git_config_ok=false
+  fi
+  if ! git -C "$GIT_PROBE_MOUNT" config core.filemode false; then
+    git_config_ok=false
+  fi
+  if ! git -C "$GIT_PROBE_MOUNT" config core.bare false; then
+    git_config_ok=false
+  fi
+  if ! git -C "$GIT_PROBE_MOUNT" config core.logallrefupdates true; then
+    git_config_ok=false
+  fi
+  if ! git -C "$GIT_PROBE_MOUNT" config core.symlinks false; then
+    git_config_ok=false
+  fi
+  if ! git -C "$GIT_PROBE_MOUNT" remote add origin "$GIT_PROBE_ORIGIN"; then
+    git_config_ok=false
+  fi
+  check_eq "git config lockfile updates succeed" "$git_config_ok" "true"
+  set +e
+  git_origin=$(git -C "$GIT_PROBE_MOUNT" config --get remote.origin.url 2>/dev/null)
+  git_origin_rc=$?
+  set -e
+  check_eq "git config remote origin is readable" "$git_origin_rc" "0"
+  check_eq "git config remote origin survives lockfile reuse" "$git_origin" "$GIT_PROBE_ORIGIN"
 
   echo "[9] cross-channel consistency"
   if [ "$rename_dir_ready" = "true" ]; then
