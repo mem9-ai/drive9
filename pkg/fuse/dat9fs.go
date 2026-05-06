@@ -75,6 +75,10 @@ type Dat9FS struct {
 	// notifications complete before shutdown.
 	notifyWg sync.WaitGroup
 
+	// notifyCount tracks total kernel notify calls (EntryNotify + InodeNotify)
+	// for observability and testing. Incremented even when fs.server is nil.
+	notifyCount atomic.Int64
+
 	// lookupStatRetry* counters track only the Lookup->Stat retry path so
 	// operators can distinguish absorbed interrupt noise from exhausted retries
 	// on the primary probe route. GetAttr and list-fallback retries intentionally
@@ -928,6 +932,7 @@ func (fs *Dat9FS) Init(server *gofuse.Server) {
 // notifyEntry tells the kernel to invalidate a directory entry cache.
 // Safe to call even if the server is not yet initialized (e.g., during tests).
 func (fs *Dat9FS) notifyEntry(parentIno uint64, name string) {
+	fs.notifyCount.Add(1)
 	if fs.server == nil {
 		return
 	}
@@ -945,6 +950,7 @@ func (fs *Dat9FS) notifyEntry(parentIno uint64, name string) {
 // notifyInode tells the kernel to invalidate cached attributes and data
 // for an inode. off=0, sz=0 means invalidate all cached data.
 func (fs *Dat9FS) notifyInode(ino uint64) {
+	fs.notifyCount.Add(1)
 	if fs.server == nil {
 		return
 	}
@@ -1290,8 +1296,8 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		}
 		entry.Size = newSize
 		fs.inodes.UpdateSize(input.NodeId, newSize)
-		// Invalidate kernel attr cache for the truncated inode.
-		fs.notifyInode(input.NodeId)
+		// Kernel already receives updated attrs via the SetAttr reply —
+		// no need for an explicit notifyInode here.
 	}
 
 	fs.fillAttr(entry, &out.Attr)
@@ -1322,9 +1328,8 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Invalidate(parentPath)
-	fs.notifyEntry(input.NodeId, name)
-	// Invalidate kernel's cached directory listing for parent.
-	fs.notifyInode(input.NodeId)
+	// Kernel already receives the new entry via the Mkdir reply —
+	// no need for notifyEntry/notifyInode here.
 
 	fs.fillEntryOut(entry, out)
 	return gofuse.OK
@@ -1404,9 +1409,8 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.dirCache.Invalidate(parentPath)
-	// Tell kernel the entry no longer exists and parent dir changed.
-	fs.notifyEntry(header.NodeId, name)
-	fs.notifyInode(header.NodeId)
+	// Kernel initiated the unlink and receives OK — it already
+	// removes the dentry. No notifyEntry/notifyInode needed.
 	return gofuse.OK
 }
 
@@ -1475,9 +1479,8 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.dirCache.Invalidate(parentPath)
-	// Tell kernel the entry no longer exists and parent dir changed.
-	fs.notifyEntry(header.NodeId, name)
-	fs.notifyInode(header.NodeId)
+	// Kernel initiated the rmdir and receives OK — it already
+	// removes the dentry. No notifyEntry/notifyInode needed.
 	return gofuse.OK
 }
 
@@ -1539,14 +1542,12 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 
 			oldParent, _ := fs.inodes.GetPath(input.NodeId)
 			fs.dirCache.Invalidate(oldParent)
-			fs.notifyEntry(input.NodeId, oldName)
-			fs.notifyInode(input.NodeId)
 			if input.Newdir != input.NodeId {
 				newParent, _ := fs.inodes.GetPath(input.Newdir)
 				fs.dirCache.Invalidate(newParent)
-				fs.notifyEntry(input.Newdir, newName)
-				fs.notifyInode(input.Newdir)
 			}
+			// Kernel initiated the rename and receives OK — it already
+			// updates its dentry cache. No notifyEntry/notifyInode needed.
 			return gofuse.OK
 		}
 
@@ -1602,16 +1603,12 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 
 	oldParent, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Invalidate(oldParent)
-	// Tell kernel old entry is gone and old parent dir changed.
-	fs.notifyEntry(input.NodeId, oldName)
-	fs.notifyInode(input.NodeId)
 	if input.Newdir != input.NodeId {
 		newParent, _ := fs.inodes.GetPath(input.Newdir)
 		fs.dirCache.Invalidate(newParent)
-		// Tell kernel new parent dir changed too.
-		fs.notifyEntry(input.Newdir, newName)
-		fs.notifyInode(input.Newdir)
 	}
+	// Kernel initiated the rename and receives OK — it already
+	// updates its dentry cache. No notifyEntry/notifyInode needed.
 	return gofuse.OK
 }
 
@@ -1911,9 +1908,8 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Invalidate(parentPath)
-	fs.notifyEntry(input.NodeId, name)
-	// Invalidate kernel's cached directory listing for parent.
-	fs.notifyInode(input.NodeId)
+	// Kernel initiated the create and receives the new entry via reply —
+	// no need for notifyEntry/notifyInode here.
 	return gofuse.OK
 }
 
@@ -2923,9 +2919,8 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 
 			fs.readCache.Invalidate(fh.Path)
 			fs.dirCache.Invalidate(parentDir(fh.Path))
-			fs.notifyInode(fh.Ino)
-			parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
-			fs.notifyInode(parentIno)
+			// Local release — kernel already knows about this close.
+			// No notifyInode needed; userspace caches are invalidated above.
 			return
 		}
 
@@ -2992,9 +2987,8 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				// Invalidate caches so subsequent reads see fresh data.
 				fs.readCache.Invalidate(fh.Path)
 				fs.dirCache.Invalidate(parentDir(fh.Path))
-				fs.notifyInode(fh.Ino)
-				parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
-				fs.notifyInode(parentIno)
+				// Local release — kernel already knows about this close.
+				// No notifyInode needed; userspace caches are invalidated above.
 				return
 			}
 			// Stale cache — remove it, fall through to sync upload.
@@ -3102,10 +3096,9 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		}
 		fs.dirCache.Invalidate(parentDir(filePath))
 		fs.inodes.UpdateSize(ino, int64(len(data)))
-		fs.notifyInode(ino)
-		parentIno, _ := fs.inodes.GetInode(parentDir(filePath))
-		fs.notifyEntry(parentIno, path.Base(filePath))
-		fs.notifyInode(parentIno)
+		// Local debounced flush — kernel is not aware of this async
+		// operation and does not need notify. Userspace caches are
+		// updated above; kernel will pick up new attrs on next getattr.
 	})
 
 	// Do NOT ClearDirty here — the buffer stays dirty as a safety net.
@@ -3217,9 +3210,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			fs.pendingIndex.Remove(fh.Path)
 		}
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
-		fs.notifyInode(fh.Ino)
-		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
-		fs.notifyInode(parentIno)
+		// Local flush — kernel receives the Flush reply with status.
+		// No notifyInode needed; kernel will refresh attrs on next access.
 		return gofuse.OK
 	}
 
@@ -3268,9 +3260,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			fs.pendingIndex.Remove(fh.Path)
 		}
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
-		fs.notifyInode(fh.Ino)
-		parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
-		fs.notifyInode(parentIno)
+		// Local flush — kernel receives the Flush reply with status.
+		// No notifyInode needed; kernel will refresh attrs on next access.
 		return gofuse.OK
 	}
 
@@ -3356,11 +3347,9 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}
 	fs.dirCache.Invalidate(parentDir(fh.Path))
 	fs.inodes.UpdateSize(fh.Ino, size)
-	// Invalidate kernel attr/data cache for this inode and parent dir listing.
-	fs.notifyInode(fh.Ino)
-	parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
-	fs.notifyEntry(parentIno, path.Base(fh.Path))
-	fs.notifyInode(parentIno)
+	// Local flush — kernel receives the Flush reply with status.
+	// No notifyInode/notifyEntry needed; userspace caches are updated
+	// above and kernel will refresh attrs on next getattr/lookup.
 	return gofuse.OK
 }
 
@@ -3465,10 +3454,9 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		fs.inodes.UpdateRevision(entry.Inode, committedRev)
 		fs.inodes.UpdateSize(entry.Inode, entry.Size)
 		fs.dirCache.Invalidate(parentDir(entry.Path))
-		fs.notifyInode(entry.Inode)
-		parentIno, _ := fs.inodes.GetInode(parentDir(entry.Path))
-		fs.notifyEntry(parentIno, path.Base(entry.Path))
-		fs.notifyInode(parentIno)
+		// Local async commit completion — this is not an external change.
+		// Kernel does not need notify; userspace caches and inode state
+		// are updated above. Kernel will see new attrs on next access.
 	} else {
 		fs.readCache.Invalidate(entry.Path)
 		fs.dirCache.Invalidate(parentDir(entry.Path))

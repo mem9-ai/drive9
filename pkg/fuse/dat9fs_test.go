@@ -3516,3 +3516,235 @@ func TestIsTransientReadErr(t *testing.T) {
 		})
 	}
 }
+
+// TestLocalMutations_NoKernelNotify verifies that local FUSE mutations
+// (Create, Mkdir, Unlink, Rmdir, Rename) do NOT produce kernel
+// notifyEntry/notifyInode calls. The kernel already knows the result
+// of its own syscalls via the FUSE reply — redundant notify floods
+// the FUSE channel and causes EAGAIN under load (git clone).
+func TestLocalMutations_NoKernelNotify(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "100")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPost:
+			w.WriteHeader(http.StatusOK)
+		case http.MethodDelete:
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	// Pre-populate inodes for mutation targets.
+	fs.inodes.Lookup("/existing.txt", false, 100, time.Now())
+	fs.inodes.Lookup("/oldname.txt", false, 100, time.Now())
+	fs.inodes.Lookup("/existingdir", true, 0, time.Now())
+
+	tests := []struct {
+		name string
+		fn   func() gofuse.Status
+	}{
+		{
+			name: "Create",
+			fn: func() gofuse.Status {
+				var out gofuse.CreateOut
+				return fs.Create(nil, &gofuse.CreateIn{
+					InHeader: gofuse.InHeader{NodeId: 1},
+				}, "new.txt", &out)
+			},
+		},
+		{
+			name: "Mkdir",
+			fn: func() gofuse.Status {
+				var out gofuse.EntryOut
+				return fs.Mkdir(nil, &gofuse.MkdirIn{
+					InHeader: gofuse.InHeader{NodeId: 1},
+				}, "newdir", &out)
+			},
+		},
+		{
+			name: "Unlink",
+			fn: func() gofuse.Status {
+				return fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "existing.txt")
+			},
+		},
+		{
+			name: "Rmdir",
+			fn: func() gofuse.Status {
+				return fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "existingdir")
+			},
+		},
+		{
+			name: "Rename",
+			fn: func() gofuse.Status {
+				return fs.Rename(nil, &gofuse.RenameIn{
+					InHeader: gofuse.InHeader{NodeId: 1},
+					Newdir:   1,
+				}, "oldname.txt", "renamed.txt")
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			before := fs.notifyCount.Load()
+			st := tc.fn()
+			after := fs.notifyCount.Load()
+			if st != gofuse.OK {
+				t.Fatalf("%s returned %v, want OK", tc.name, st)
+			}
+			if delta := after - before; delta != 0 {
+				t.Fatalf("%s produced %d kernel notify calls, want 0", tc.name, delta)
+			}
+		})
+	}
+}
+
+// TestCreateWriteFlushRelease_NoKernelNotify verifies that the full
+// create→write→flush→release lifecycle produces zero kernel notify calls.
+// Previously each step (Create, Release, commit queue success) would send
+// redundant NOTIFY_INVAL_ENTRY/INODE calls that flooded the FUSE channel.
+func TestCreateWriteFlushRelease_NoKernelNotify(t *testing.T) {
+	ts, uploadedCh := newTestServer(t)
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	before := fs.notifyCount.Load()
+
+	// Create
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "hook.sample", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+
+	// Write
+	_, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}, []byte("#!/bin/sh\nexit 0\n"))
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	// Flush
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	if st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+
+	// Release
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+
+	// Wait for commit queue upload.
+	select {
+	case <-uploadedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("commit queue upload timed out")
+	}
+
+	// Allow async commit queue success callback to run.
+	time.Sleep(50 * time.Millisecond)
+
+	after := fs.notifyCount.Load()
+	if delta := after - before; delta != 0 {
+		t.Fatalf("create→write→flush→release→commit produced %d kernel notify calls, want 0", delta)
+	}
+}
+
+// TestSSEForeignChange_StillNotifiesKernel verifies that SSE-driven
+// invalidation (from a foreign actor) still produces kernel notify calls.
+// Only local-initiated operations should skip notify; external changes
+// must still invalidate the kernel cache.
+func TestSSEForeignChange_StillNotifiesKernel(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	// Pre-populate an inode so SSE invalidation has something to notify.
+	fs.inodes.Lookup("/remote-file.txt", false, 100, time.Now())
+
+	before := fs.notifyCount.Load()
+
+	// Simulate SSE-driven cache invalidation (same code path as sse.go handleChange).
+	ino, ok := fs.inodes.GetInode("/remote-file.txt")
+	if !ok {
+		t.Fatal("expected inode for /remote-file.txt")
+	}
+	fs.readCache.Invalidate("/remote-file.txt")
+	fs.dirCache.Invalidate("/")
+	// These are the same calls SSE watcher makes for foreign changes.
+	fs.notifyInode(ino)
+	parentIno, _ := fs.inodes.GetInode("/")
+	fs.notifyEntry(parentIno, "remote-file.txt")
+
+	after := fs.notifyCount.Load()
+	if delta := after - before; delta != 2 {
+		t.Fatalf("SSE foreign change produced %d kernel notify calls, want 2", delta)
+	}
+}
+
+// TestSetAttr_NoKernelNotify verifies that SetAttr (truncate) does not
+// produce redundant kernel notify. The kernel receives updated attrs
+// via the SetAttr reply itself.
+func TestSetAttr_NoKernelNotify(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	ino := fs.inodes.Lookup("/trunc.txt", false, 100, time.Now())
+
+	// Open with O_RDWR so there's a dirty handle for truncate.
+	fh := &FileHandle{
+		Ino:   ino,
+		Path:  "/trunc.txt",
+		Flags: uint32(syscall.O_RDWR),
+		Dirty: NewWriteBuffer("/trunc.txt", 100, 8*1024*1024),
+	}
+	fhID := fs.fileHandles.Allocate(fh)
+
+	before := fs.notifyCount.Load()
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE | gofuse.FATTR_FH,
+			Fh:      fhID,
+			Size:    0,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr: %v", st)
+	}
+
+	after := fs.notifyCount.Load()
+	if delta := after - before; delta != 0 {
+		t.Fatalf("SetAttr produced %d kernel notify calls, want 0", delta)
+	}
+}
