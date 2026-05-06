@@ -1205,6 +1205,11 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	if err := b.MkdirCtx(r.Context(), path, 0o755); err != nil {
+		if errors.Is(err, datastore.ErrPathConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "mkdir_conflict", "path", path, "error", err)...)
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "mkdir_failed", "path", path, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
