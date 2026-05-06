@@ -303,6 +303,105 @@ func (s *Store) UpdateNodePath(ctx context.Context, oldPath, newPath, newParentP
 	return nil
 }
 
+// RenameFileReplacingTarget atomically renames a file node. If newPath already
+// names a file, that target dentry is replaced and its file is marked deleted
+// when no other nodes reference it.
+func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath, newParentPath, newName string) (out *File, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "rename_file_replacing_target", start, &err)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	type nodeRef struct {
+		nodeID string
+		fileID sql.NullString
+		isDir  bool
+	}
+	var old nodeRef
+	err = tx.QueryRow(`SELECT node_id, file_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, oldPath).
+		Scan(&old.nodeID, &old.fileID, &old.isDir)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if old.isDir {
+		return nil, fmt.Errorf("source is a directory: %s", oldPath)
+	}
+	if oldPath == newPath {
+		return nil, tx.Commit()
+	}
+
+	var dst nodeRef
+	hasDst := false
+	err = tx.QueryRow(`SELECT node_id, file_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, newPath).
+		Scan(&dst.nodeID, &dst.fileID, &dst.isDir)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+	} else {
+		hasDst = true
+		if dst.isDir {
+			return nil, ErrPathConflict
+		}
+		if dst.nodeID == old.nodeID {
+			return nil, tx.Commit()
+		}
+		if _, err := tx.Exec(`DELETE FROM file_nodes WHERE node_id = ?`, dst.nodeID); err != nil {
+			return nil, err
+		}
+	}
+
+	res, err := tx.Exec(`UPDATE file_nodes SET path = ?, parent_path = ?, name = ? WHERE node_id = ?`,
+		newPath, newParentPath, newName, old.nodeID)
+	if isUniqueViolation(err) {
+		return nil, ErrPathConflict
+	}
+	if err != nil {
+		return nil, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return nil, ErrNotFound
+	}
+
+	if hasDst && dst.fileID.Valid && dst.fileID.String != "" {
+		var count int64
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE file_id = ? FOR UPDATE`, dst.fileID.String).Scan(&count); err != nil {
+			return nil, err
+		}
+		if count == 0 {
+			if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, dst.fileID.String); err != nil {
+				return nil, err
+			}
+			if _, err := tx.Exec(`DELETE FROM file_tags WHERE file_id = ?`, dst.fileID.String); err != nil {
+				return nil, err
+			}
+			row := tx.QueryRow(`SELECT file_id, storage_type, storage_ref, storage_encryption_mode,
+				storage_encryption_key_id, content_blob, content_type,
+				size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
+				description, description_embedding_revision, created_at, confirmed_at, expires_at
+				FROM files WHERE file_id = ?`, dst.fileID.String)
+			f, err := scanFileWithBlob(row)
+			if err != nil {
+				return nil, err
+			}
+			out = f
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (count int64, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "rename_dir", start, &err)

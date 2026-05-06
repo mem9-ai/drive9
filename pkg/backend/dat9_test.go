@@ -405,6 +405,29 @@ func TestRename(t *testing.T) {
 	}
 }
 
+func TestRenameReplacesExistingFile(t *testing.T) {
+	b := newTestBackend(t)
+	if _, err := b.Write("/config", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/config.lock", []byte("new config"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Rename("/config.lock", "/config"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Stat("/config.lock"); err != datastore.ErrNotFound {
+		t.Fatalf("old path err = %v, want ErrNotFound", err)
+	}
+	data, err := b.Read("/config", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new config" {
+		t.Fatalf("config = %q, want new config", data)
+	}
+}
+
 func TestZeroCopyCp(t *testing.T) {
 	b := newTestBackend(t)
 	if _, err := b.Write("/a.txt", []byte("shared"), 0, filesystem.WriteFlagCreate); err != nil {

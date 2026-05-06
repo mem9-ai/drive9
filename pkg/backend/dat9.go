@@ -904,6 +904,9 @@ func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (e
 		return err
 	}
 	newPath = canonicalizePathForKind(newPath, node.IsDirectory)
+	if oldPath == newPath {
+		return nil
+	}
 	if node.IsDirectory {
 		err = b.store.EnsureParentDirs(ctx, newPath, b.genID)
 		if err != nil {
@@ -916,8 +919,15 @@ func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (e
 	if err != nil {
 		return err
 	}
-	err = b.store.UpdateNodePath(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
-	return err
+	deleted, err := b.store.RenameFileReplacingTarget(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
+	if err != nil {
+		return err
+	}
+	if deleted != nil {
+		b.syncCentralFileDelete(ctx, deleted.FileID, deleted.SizeBytes, deleted.ContentType)
+		b.deleteBlobCtx(ctx, deleted.StorageRef)
+	}
+	return nil
 }
 
 func (b *Dat9Backend) Chmod(path string, mode uint32) error { return nil }

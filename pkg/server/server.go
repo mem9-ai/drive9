@@ -1183,6 +1183,11 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
+		if errors.Is(err, datastore.ErrPathConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "rename_conflict", "old_path", oldPath, "new_path", newPath)...)
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "rename_failed", "old_path", oldPath, "new_path", newPath, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return

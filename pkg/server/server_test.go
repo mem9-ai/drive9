@@ -800,6 +800,46 @@ func TestRename(t *testing.T) {
 	}
 }
 
+func TestRenameReplacesExistingFile(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/config", strings.NewReader("old"))
+	resp, _ := http.DefaultClient.Do(req)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("write config: %d", resp.StatusCode)
+	}
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/config.lock", strings.NewReader("new config"))
+	resp, _ = http.DefaultClient.Do(req)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("write config.lock: %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/config?rename", nil)
+	req.Header.Set("X-Dat9-Rename-Source", "/config.lock")
+	resp, _ = http.DefaultClient.Do(req)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rename replace: %d", resp.StatusCode)
+	}
+
+	resp, _ = http.Get(ts.URL + "/v1/fs/config")
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if string(body) != "new config" {
+		t.Fatalf("config = %q, want new config", body)
+	}
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/config.lock", nil)
+	resp, _ = http.DefaultClient.Do(req)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("config.lock status = %d, want 404", resp.StatusCode)
+	}
+}
+
 func TestPatchMissingPathReturnsNotFound(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)

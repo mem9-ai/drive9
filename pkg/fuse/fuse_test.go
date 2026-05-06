@@ -103,6 +103,25 @@ func TestInodeToPath_Rename(t *testing.T) {
 	}
 }
 
+func TestInodeToPath_RenameReplacesDestination(t *testing.T) {
+	m := NewInodeToPath()
+	srcIno := m.Lookup("/config.lock", false, 10, time.Now())
+	dstIno := m.Lookup("/config", false, 5, time.Now())
+
+	m.Rename("/config.lock", "/config")
+
+	gotIno, ok := m.GetInode("/config")
+	if !ok || gotIno != srcIno {
+		t.Fatalf("GetInode(/config) = %d, %v; want %d, true", gotIno, ok, srcIno)
+	}
+	if p, ok := m.GetPath(srcIno); !ok || p != "/config" {
+		t.Fatalf("source path = %q, %v; want /config, true", p, ok)
+	}
+	if p, ok := m.GetPath(dstIno); ok {
+		t.Fatalf("replaced destination inode still mapped to %q", p)
+	}
+}
+
 func TestInodeToPath_RenameDir(t *testing.T) {
 	m := NewInodeToPath()
 	m.Lookup("/dir", true, 0, time.Now())
