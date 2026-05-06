@@ -31,6 +31,7 @@ type CommitEntry struct {
 	Kind         PendingKind
 	ShadowSpill  bool // true when data is only in shadow file (auto-resolve would OOM)
 	canceled     bool
+	cancelCommit context.CancelFunc
 	cancelUpload context.CancelFunc
 }
 
@@ -296,6 +297,9 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 			return
 		}
 		seen[e] = struct{}{}
+		if e.cancelCommit != nil {
+			cancels = append(cancels, e.cancelCommit)
+		}
 		if e.cancelUpload != nil {
 			cancels = append(cancels, e.cancelUpload)
 		}
@@ -348,6 +352,9 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 			return
 		}
 		seen[e] = struct{}{}
+		if e.cancelCommit != nil {
+			cancels = append(cancels, e.cancelCommit)
+		}
 		if e.cancelUpload != nil {
 			cancels = append(cancels, e.cancelUpload)
 		}
@@ -426,6 +433,25 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 	const baseDelay = 200 * time.Millisecond
 	const maxDelay = 30 * time.Second
 
+	entryCtx, entryCancel := context.WithCancel(context.Background())
+	cq.mu.Lock()
+	if entry.canceled {
+		cq.mu.Unlock()
+		entryCancel()
+		cq.removeFromQueue(entry)
+		log.Printf("commit queue: entry for %s was canceled before retry loop", entry.Path)
+		return
+	}
+	entry.cancelCommit = entryCancel
+	cq.mu.Unlock()
+	defer func() {
+		cq.mu.Lock()
+		entry.cancelCommit = nil
+		entry.cancelUpload = nil
+		cq.mu.Unlock()
+		entryCancel()
+	}()
+
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		// Re-check cancelation between retries.
@@ -440,14 +466,18 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			if delay > maxDelay {
 				delay = maxDelay
 			}
-			time.Sleep(delay)
+			if !sleepWithCancel(entryCtx, delay) {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: entry for %s was canceled during retry backoff", entry.Path)
+				return
+			}
 		}
 
 		timeout := uploadTimeout
 		if entry.ShadowSpill {
 			timeout = releaseTimeout(entry.Size)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(entryCtx, timeout)
 		cq.mu.Lock()
 		if entry.canceled {
 			cq.mu.Unlock()
@@ -486,6 +516,29 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 
 	log.Printf("commit queue: giving up on %s after %d retries: %v", entry.Path, maxRetries, lastErr)
 	cq.onCommitTerminalFailure(entry)
+}
+
+func sleepWithCancel(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// CommitNow uploads an entry synchronously through the same commit path used
+// by workers. It is used as a fallback when the async queue rejects an entry
+// after local state has already moved to the final path.
+func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error {
+	committedRev, err := cq.uploadEntry(ctx, entry)
+	if err != nil {
+		return err
+	}
+	cq.onCommitSuccess(entry, committedRev)
+	return nil
 }
 
 // uploadEntry uploads entry data to the server. Returns (committedRev, error).

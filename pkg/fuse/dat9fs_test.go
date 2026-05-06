@@ -3469,6 +3469,203 @@ func TestRenamePendingNewCommitQueueCancelsTempUploadAndEnqueuesFinalPath(t *tes
 	}
 }
 
+func TestRenamePendingNewCommitFallsBackWhenFinalTargetExists(t *testing.T) {
+	oldP := "/repo/.git/config.lock"
+	newP := "/repo/.git/config"
+	data := []byte("[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = https://github.com/mem9-ai/drive9.git\n")
+
+	var oldPuts atomic.Int32
+	var finalPuts atomic.Int32
+	var renameCalls atomic.Int32
+	var renameSource string
+	var mu sync.Mutex
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+newP:
+			w.Header().Set("Content-Length", "36")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "4")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+oldP:
+			oldPuts.Add(1)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if string(body) != string(data) {
+				http.Error(w, "unexpected temp upload body", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 5})
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+newP:
+			finalPuts.Add(1)
+			http.Error(w, "final path should not be uploaded directly when target exists", http.StatusInternalServerError)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+newP && r.URL.RawQuery == "rename":
+			renameCalls.Add(1)
+			mu.Lock()
+			renameSource = r.Header.Get("X-Dat9-Rename-Source")
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	c := client.New(ts.URL, "")
+	fs := NewDat9FS(c, opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 16)
+	defer cq.DrainAll()
+	fs.commitQueue = cq
+
+	if err := shadow.WriteFull(oldP, data, 0); err != nil {
+		t.Fatalf("WriteFull old shadow: %v", err)
+	}
+	if _, err := pending.PutWithBaseRev(oldP, int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatalf("PutWithBaseRev old pending: %v", err)
+	}
+	oldIno := fs.inodes.Lookup(oldP, false, int64(len(data)), time.Now())
+	dirIno := fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
+	fs.inodes.Lookup(newP, false, 36, time.Now())
+
+	if err := cq.Enqueue(&CommitEntry{
+		Path:  oldP,
+		Inode: oldIno,
+		Size:  int64(len(data)),
+		Kind:  PendingNew,
+	}); err != nil {
+		t.Fatalf("enqueue old temp upload: %v", err)
+	}
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Newdir:   dirIno,
+	}, "config.lock", "config")
+	if st != gofuse.OK {
+		t.Fatalf("Rename: %v", st)
+	}
+
+	cq.DrainAll()
+	if got := oldPuts.Load(); got != 1 {
+		t.Fatalf("old temp PUTs = %d, want 1", got)
+	}
+	if got := finalPuts.Load(); got != 0 {
+		t.Fatalf("final path PUTs = %d, want 0", got)
+	}
+	if got := renameCalls.Load(); got != 1 {
+		t.Fatalf("remote rename calls = %d, want 1", got)
+	}
+	mu.Lock()
+	gotRenameSource := renameSource
+	mu.Unlock()
+	if gotRenameSource != oldP {
+		t.Fatalf("rename source = %q, want %q", gotRenameSource, oldP)
+	}
+	if pending.HasPending(oldP) {
+		t.Fatal("old temp path still pending")
+	}
+	if shadow.Has(oldP) {
+		t.Fatal("old temp shadow still exists")
+	}
+}
+
+func TestRenamePendingNewCommitSyncCommitsWhenQueueStopped(t *testing.T) {
+	oldP := "/repo/.git/objects/70/tmp_obj_sync"
+	newP := "/repo/.git/objects/70/24234d93f61104585962ac664bc5a7ed1d241d"
+	data := []byte("loose object")
+
+	var finalPuts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+newP:
+			finalPuts.Add(1)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if string(body) != string(data) {
+				http.Error(w, "unexpected final upload body", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 7})
+		case r.Method == http.MethodPost && r.URL.RawQuery == "rename":
+			http.Error(w, "server rename should not be used for absent final target", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	c := client.New(ts.URL, "")
+	fs := NewDat9FS(c, opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 16)
+	cq.DrainAll()
+	fs.commitQueue = cq
+
+	if err := shadow.WriteFull(oldP, data, 0); err != nil {
+		t.Fatalf("WriteFull old shadow: %v", err)
+	}
+	if _, err := pending.PutWithBaseRev(oldP, int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatalf("PutWithBaseRev old pending: %v", err)
+	}
+	oldIno := fs.inodes.Lookup(oldP, false, int64(len(data)), time.Now())
+	dirIno := fs.inodes.Lookup("/repo/.git/objects/70", true, 0, time.Now())
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Newdir:   dirIno,
+	}, "tmp_obj_sync", "24234d93f61104585962ac664bc5a7ed1d241d")
+	if st != gofuse.OK {
+		t.Fatalf("Rename: %v", st)
+	}
+	if got := finalPuts.Load(); got != 1 {
+		t.Fatalf("final path PUTs = %d, want 1", got)
+	}
+	if pending.HasPending(newP) {
+		t.Fatal("final path still pending after sync commit")
+	}
+	if shadow.Has(newP) {
+		t.Fatal("final shadow still exists after sync commit")
+	}
+	if _, ok := fs.inodes.GetInode(newP); !ok {
+		t.Fatal("final inode missing after local rename")
+	}
+	if _, ok := fs.inodes.GetEntry(oldIno); !ok {
+		t.Fatal("renamed inode should still exist")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Read detached retry tests
 // ---------------------------------------------------------------------------

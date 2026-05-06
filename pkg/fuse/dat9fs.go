@@ -1565,37 +1565,64 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	return gofuse.OK
 }
 
-func (fs *Dat9FS) renamePendingNewCommit(input *gofuse.RenameIn, oldP, newP string) bool {
+type pendingRenameResult int
+
+const (
+	pendingRenameNotApplicable pendingRenameResult = iota
+	pendingRenameRemoteFallback
+	pendingRenameHandled
+)
+
+func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.RenameIn, oldP, newP string) (pendingRenameResult, error) {
 	if fs.pendingIndex == nil {
-		return false
+		return pendingRenameNotApplicable, nil
 	}
 	meta, ok := fs.pendingIndex.GetMeta(oldP)
 	if !ok || meta.Kind != PendingNew {
-		return false
+		return pendingRenameNotApplicable, nil
+	}
+
+	// Only use the local fast path when the final path is truly absent.
+	// Git lockfile replacement (for example config.lock -> config) must keep
+	// the old server-side rename semantics so the existing target is replaced
+	// atomically after the temp file upload completes.
+	if fs.commitQueue != nil {
+		fs.commitQueue.WaitPath(newP)
+	}
+	targetExists, err := fs.pendingRenameTargetExists(ctx, newP)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return pendingRenameNotApplicable, err
+		}
+		log.Printf("rename: probe final pending-new target %s failed, using remote fallback: %v", newP, err)
+		return pendingRenameRemoteFallback, nil
+	}
+	if targetExists {
+		return pendingRenameRemoteFallback, nil
 	}
 
 	if fs.commitQueue != nil {
 		fs.commitQueue.CancelPathPreserveLocal(oldP)
 		fs.commitQueue.WaitPath(oldP)
-		fs.commitQueue.WaitPath(newP)
 
 		// The cancel may have raced with a successful upload. If so, the old
 		// path now exists remotely and the normal server-side rename is correct.
 		meta, ok = fs.pendingIndex.GetMeta(oldP)
 		if !ok || meta.Kind != PendingNew {
-			return false
+			return pendingRenameRemoteFallback, nil
 		}
 	}
 
 	if fs.shadowStore != nil {
 		if !fs.shadowStore.Rename(oldP, newP) {
-			log.Printf("rename: move pending shadow %s -> %s failed", oldP, newP)
-			return false
+			return pendingRenameHandled, fmt.Errorf("move pending shadow %s -> %s failed", oldP, newP)
 		}
 	}
 	if !fs.pendingIndex.RenamePending(oldP, newP) {
-		log.Printf("rename: move pending index %s -> %s failed", oldP, newP)
-		return false
+		if fs.shadowStore != nil {
+			_ = fs.shadowStore.Rename(newP, oldP)
+		}
+		return pendingRenameHandled, fmt.Errorf("move pending index %s -> %s failed", oldP, newP)
 	}
 
 	fs.finishLocalRename(input, oldP, newP)
@@ -1611,10 +1638,37 @@ func (fs *Dat9FS) renamePendingNewCommit(input *gofuse.RenameIn, oldP, newP stri
 			ShadowSpill: meta.ShadowSpill,
 		}
 		if err := fs.commitQueue.Enqueue(entry); err != nil {
-			log.Printf("rename: enqueue pending-new commit for %s: %v", newP, err)
+			log.Printf("rename: enqueue pending-new commit for %s failed, falling back to sync commit: %v", newP, err)
+			if commitErr := fs.commitQueue.CommitNow(ctx, entry); commitErr != nil {
+				return pendingRenameHandled, fmt.Errorf("sync commit pending-new rename %s: %w", newP, commitErr)
+			}
 		}
 	}
-	return true
+	return pendingRenameHandled, nil
+}
+
+func (fs *Dat9FS) pendingRenameTargetExists(ctx context.Context, p string) (bool, error) {
+	if fs.pendingIndex != nil {
+		if _, ok := fs.pendingIndex.GetMeta(p); ok {
+			return true, nil
+		}
+	}
+	if fs.writeBack != nil {
+		if _, ok := fs.writeBack.GetMeta(p); ok {
+			return true, nil
+		}
+	}
+	if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
+		return true, nil
+	}
+	_, err := fs.client.StatCtx(ctx, fs.remotePath(p))
+	if err == nil {
+		return true, nil
+	}
+	if isNotFoundErr(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
@@ -1648,7 +1702,12 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		return gofuse.OK
 	}
 
-	if fs.renamePendingNewCommit(input, oldP, newP) {
+	pendingRename, err := fs.renamePendingNewCommit(ctx, input, oldP, newP)
+	if err != nil {
+		log.Printf("rename: pending-new local rename %s -> %s failed: %v", oldP, newP, err)
+		return httpToFuseStatus(err)
+	}
+	if pendingRename == pendingRenameHandled {
 		return gofuse.OK
 	}
 
@@ -1681,8 +1740,15 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 			isPendingNew = true
 		}
 		// Also check pendingIndex for files handed to commitQueue after Release.
-		if !isPendingNew && fs.renamePendingNewCommit(input, oldP, newP) {
-			return gofuse.OK
+		if !isPendingNew {
+			pendingRename, err := fs.renamePendingNewCommit(ctx, input, oldP, newP)
+			if err != nil {
+				log.Printf("rename: pending-new local rename %s -> %s failed: %v", oldP, newP, err)
+				return httpToFuseStatus(err)
+			}
+			if pendingRename == pendingRenameHandled {
+				return gofuse.OK
+			}
 		}
 		if isPendingNew {
 			fs.finishLocalRename(input, oldP, newP)
