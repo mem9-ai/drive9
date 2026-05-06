@@ -1532,15 +1532,21 @@ func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string
 			// 1105: FULLTEXT index is not supported). Treat these the same as
 			// when the statement was skipped during initial provisioning.
 			if isFulltextOrVectorIndexRepairSQL(stmt) && isIgnorableOptionalSchemaError(err) {
-				logger.Warn(ctx, "tidb_schema_repair_optional_index_skipped",
+				logger.Warn(ctx, "tenant_tidb_schema_repair_optional_index_skipped",
 					zap.Int("statement_index", i+1),
 					zap.Int("statement_count", len(statements)),
-					zap.String("statement", schemaStatementSnippet(stmt)),
+					zap.String("statement", snippet),
 					zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
 					zap.Error(err))
 				continue
 			}
-			return fmt.Errorf("apply tidb schema repair %q: %w", schemaStatementSnippet(stmt), err)
+			logger.Error(ctx, "tenant_tidb_schema_repair_statement_failed",
+				zap.Int("statement_index", i+1),
+				zap.Int("statement_count", len(statements)),
+				zap.String("statement", snippet),
+				zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
+				zap.Error(err))
+			return fmt.Errorf("apply tidb schema repair %q: %w", snippet, err)
 		}
 		logger.Info(ctx, "tenant_tidb_schema_repair_statement_finished",
 			zap.Int("statement_index", i+1),

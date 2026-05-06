@@ -62,7 +62,13 @@ func ExecSchemaStatementsContext(ctx context.Context, db *sql.DB, stmts []string
 					zap.Error(err))
 				continue
 			}
-			return fmt.Errorf("exec %q: %w", schemaspec.SQLSnippet(stmt), err)
+			logger.Error(ctx, "schema_statement_exec_failed",
+				zap.Int("statement_index", i+1),
+				zap.Int("statement_count", len(stmts)),
+				zap.String("statement", snippet),
+				zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
+				zap.Error(err))
+			return fmt.Errorf("exec %q: %w", snippet, err)
 		}
 		logger.Info(ctx, "schema_statement_exec_finished",
 			zap.Int("statement_index", i+1),
@@ -101,12 +107,18 @@ func ExecOptionalSchemaStatements(ctx context.Context, db *sql.DB, stmts []strin
 				logger.Warn(ctx, "optional_schema_statement_skipped",
 					zap.Int("statement_index", i+1),
 					zap.Int("statement_count", len(stmts)),
-					zap.String("statement", schemaStatementSnippet(stmt)),
+					zap.String("statement", snippet),
 					zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
 					zap.Error(err))
 				continue
 			}
-			return skipped, fmt.Errorf("exec optional %q: %w", schemaStatementSnippet(stmt), err)
+			logger.Error(ctx, "optional_schema_statement_exec_failed",
+				zap.Int("statement_index", i+1),
+				zap.Int("statement_count", len(stmts)),
+				zap.String("statement", snippet),
+				zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
+				zap.Error(err))
+			return skipped, fmt.Errorf("exec optional %q: %w", snippet, err)
 		}
 		logger.Info(ctx, "optional_schema_statement_exec_finished",
 			zap.Int("statement_index", i+1),
