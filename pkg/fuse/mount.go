@@ -10,12 +10,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/mountpath"
+	"github.com/mem9-ai/dat9/pkg/mountstate"
 )
 
 // MountOptions configures the FUSE mount.
@@ -308,6 +310,20 @@ func Mount(opts *MountOptions) error {
 	if err := server.WaitMount(); err != nil {
 		return fmt.Errorf("fuse wait mount: %w", err)
 	}
+	pidFile, err := mountstate.WritePID(opts.MountPoint, os.Getpid())
+	if err != nil {
+		sseWatcher.Stop()
+		dat9fs.FlushAll()
+		_ = server.Unmount()
+		return fmt.Errorf("write mount pid file: %w", err)
+	}
+	defer func() {
+		if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "dat9: remove mount pid file %s: %v\n", pidFile, err)
+		}
+	}()
+
+	shutdown := newMountShutdown(sseWatcher.Stop, dat9fs.FlushAll)
 
 	// Signal handling for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
@@ -324,8 +340,7 @@ func Mount(opts *MountOptions) error {
 			os.Exit(1)
 		}()
 
-		sseWatcher.Stop()
-		dat9fs.FlushAll()
+		shutdown()
 
 		// Retry unmount up to 5 times — EBUSY is transient (Spotlight, Finder).
 		const maxRetries = 5
@@ -347,8 +362,18 @@ func Mount(opts *MountOptions) error {
 
 	fmt.Fprintf(os.Stderr, "dat9: mounted on %s (server: %s, actor: %s)\n", opts.MountPoint, opts.Server, actorID)
 	server.Wait()
-	sseWatcher.Stop()
+	shutdown()
 	return nil
+}
+
+func newMountShutdown(stopWatcher func(), flushAll func()) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			stopWatcher()
+			flushAll()
+		})
+	}
 }
 
 // forceUnmount shells out to OS-specific tools to force-unmount a FUSE mount.

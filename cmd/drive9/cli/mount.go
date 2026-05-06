@@ -1,17 +1,20 @@
 package cli
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 	drive9fuse "github.com/mem9-ai/dat9/pkg/fuse"
 	"github.com/mem9-ai/dat9/pkg/mountpath"
+	"github.com/mem9-ai/dat9/pkg/mountstate"
 	drive9webdav "github.com/mem9-ai/dat9/pkg/webdav"
 )
 
@@ -264,19 +267,115 @@ func normalizeLookupRetryCount(count int) int {
 
 // UmountCmd handles the "drive9 umount" command.
 func UmountCmd(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("usage: drive9 umount <mountpoint>")
-	}
-	mountPoint := args[0]
+	return runUmount(args, defaultUmountDeps())
+}
 
-	argv, err := umountArgv(runtime.GOOS, exec.LookPath, mountPoint)
+type umountDeps struct {
+	goos      string
+	lookPath  func(string) (string, error)
+	run       func([]string) error
+	readPID   func(string) (int, string, error)
+	pidAlive  func(int) bool
+	now       func() time.Time
+	sleep     func(time.Duration)
+	printErrf func(string, ...any)
+}
+
+func defaultUmountDeps() umountDeps {
+	return umountDeps{
+		goos:     runtime.GOOS,
+		lookPath: exec.LookPath,
+		run: func(argv []string) error {
+			cmd := exec.Command(argv[0], argv[1:]...)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			return cmd.Run()
+		},
+		readPID:   mountstate.ReadPID,
+		pidAlive:  processAlive,
+		now:       time.Now,
+		sleep:     time.Sleep,
+		printErrf: func(format string, args ...any) { fmt.Fprintf(os.Stderr, format, args...) },
+	}
+}
+
+func runUmount(args []string, deps umountDeps) error {
+	fs := flag.NewFlagSet("umount", flag.ContinueOnError)
+	waitTimeout := fs.Duration("timeout", 60*time.Second, "time to wait for the drive9 mount process to exit after unmount; 0 disables waiting")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: drive9 umount [--timeout duration] <mountpoint>\n\nflags:\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return fmt.Errorf("usage: drive9 umount [--timeout duration] <mountpoint>")
+	}
+	mountPoint := fs.Arg(0)
+
+	argv, err := umountArgv(deps.goos, deps.lookPath, mountPoint)
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := deps.run(argv); err != nil {
+		return err
+	}
+	if *waitTimeout == 0 {
+		return nil
+	}
+	pid, path, err := deps.readPID(mountPoint)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if err := waitForPIDExit(pid, *waitTimeout, deps); err != nil {
+		return fmt.Errorf("%w (pid file: %s)", err, path)
+	}
+	return nil
+}
+
+func waitForPIDExit(pid int, timeout time.Duration, deps umountDeps) error {
+	if pid <= 0 {
+		return fmt.Errorf("invalid mount process pid %d", pid)
+	}
+	deadline := deps.now().Add(timeout)
+	for {
+		if !deps.pidAlive(pid) {
+			return nil
+		}
+		if !deps.now().Before(deadline) {
+			if deps.printErrf != nil {
+				deps.printErrf("drive9 umount: mount process pid %d still running after %s\n", pid, timeout)
+			}
+			return fmt.Errorf("drive9 umount: mount process pid %d still running after %s", pid, timeout)
+		}
+		deps.sleep(100 * time.Millisecond)
+	}
+}
+
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = process.Signal(syscall.Signal(0))
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+		return false
+	}
+	if errors.Is(err, syscall.EPERM) {
+		return true
+	}
+	return false
 }
 
 // resolveMountCredentials selects the (server, apiKey, token) triple that a

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -77,6 +78,120 @@ func TestUmountArgvNoBinary(t *testing.T) {
 	_, err := umountArgv("linux", fakeLookPath(nil), "/mnt/drive9")
 	if err == nil {
 		t.Fatal("expected error when no unmount binaries are available")
+	}
+}
+
+func TestRunUmountWaitsForMountProcessExit(t *testing.T) {
+	now := time.Unix(100, 0)
+	runCalls := 0
+	aliveCalls := 0
+	deps := umountDeps{
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run: func(argv []string) error {
+			runCalls++
+			want := []string{"fusermount3", "-u", "/mnt/drive9"}
+			if !reflect.DeepEqual(argv, want) {
+				t.Fatalf("argv = %v, want %v", argv, want)
+			}
+			return nil
+		},
+		readPID: func(mountPoint string) (int, string, error) {
+			if mountPoint != "/mnt/drive9" {
+				t.Fatalf("mountPoint = %q", mountPoint)
+			}
+			return 1234, "/tmp/drive9.pid", nil
+		},
+		pidAlive: func(pid int) bool {
+			if pid != 1234 {
+				t.Fatalf("pid = %d", pid)
+			}
+			aliveCalls++
+			return aliveCalls < 3
+		},
+		now:       func() time.Time { return now },
+		sleep:     func(d time.Duration) { now = now.Add(d) },
+		printErrf: func(string, ...any) {},
+	}
+
+	if err := runUmount([]string{"/mnt/drive9"}, deps); err != nil {
+		t.Fatalf("runUmount: %v", err)
+	}
+	if runCalls != 1 {
+		t.Fatalf("runCalls = %d, want 1", runCalls)
+	}
+	if aliveCalls != 3 {
+		t.Fatalf("aliveCalls = %d, want 3", aliveCalls)
+	}
+}
+
+func TestRunUmountReturnsTimeoutWhenMountProcessStillAlive(t *testing.T) {
+	now := time.Unix(100, 0)
+	deps := umountDeps{
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run:      func([]string) error { return nil },
+		readPID:  func(string) (int, string, error) { return 1234, "/tmp/drive9.pid", nil },
+		pidAlive: func(int) bool { return true },
+		now:      func() time.Time { return now },
+		sleep:    func(d time.Duration) { now = now.Add(d) },
+		printErrf: func(format string, args ...any) {
+			if !strings.Contains(format, "still running") {
+				t.Fatalf("printErrf format = %q", format)
+			}
+		},
+	}
+
+	err := runUmount([]string{"--timeout", "250ms", "/mnt/drive9"}, deps)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "still running") {
+		t.Fatalf("error = %v, want still running", err)
+	}
+	if !strings.Contains(err.Error(), "/tmp/drive9.pid") {
+		t.Fatalf("error = %v, want pid file path", err)
+	}
+}
+
+func TestRunUmountDoesNotBlockOnStalePID(t *testing.T) {
+	aliveCalls := 0
+	deps := umountDeps{
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run:      func([]string) error { return nil },
+		readPID:  func(string) (int, string, error) { return 1234, "/tmp/drive9.pid", nil },
+		pidAlive: func(int) bool {
+			aliveCalls++
+			return false
+		},
+		now:       time.Now,
+		sleep:     func(time.Duration) { t.Fatal("sleep should not be called for stale pid") },
+		printErrf: func(string, ...any) {},
+	}
+
+	if err := runUmount([]string{"/mnt/drive9"}, deps); err != nil {
+		t.Fatalf("runUmount: %v", err)
+	}
+	if aliveCalls != 1 {
+		t.Fatalf("aliveCalls = %d, want 1", aliveCalls)
+	}
+}
+
+func TestRunUmountNoPIDFileReturnsSuccess(t *testing.T) {
+	deps := umountDeps{
+		goos:      "linux",
+		lookPath:  fakeLookPath(map[string]bool{"fusermount3": true}),
+		run:       func([]string) error { return nil },
+		readPID:   func(string) (int, string, error) { return 0, "/tmp/drive9.pid", os.ErrNotExist },
+		pidAlive:  func(int) bool { t.Fatal("pidAlive should not be called without pid file"); return false },
+		now:       time.Now,
+		sleep:     func(time.Duration) {},
+		printErrf: func(string, ...any) {},
+	}
+
+	if err := runUmount([]string{"/mnt/drive9"}, deps); err != nil {
+		t.Fatalf("runUmount: %v", err)
 	}
 }
 
