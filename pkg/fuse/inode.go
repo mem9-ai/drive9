@@ -180,6 +180,42 @@ func (m *InodeToPath) Forget(ino uint64, nlookup uint64) {
 	}
 }
 
+// ForgetKeepMapping decrements the kernel lookup count without removing the
+// inode/path mapping. Use this when a regular file is still represented by
+// local open or pending state even though the kernel dropped its lookup ref.
+func (m *InodeToPath) ForgetKeepMapping(ino uint64, nlookup uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return
+	}
+	entry.Nlookup -= int64(nlookup)
+	if entry.Nlookup < 0 {
+		entry.Nlookup = 0
+	}
+}
+
+// RemoveFileIfUnreferenced removes a regular-file mapping only when the kernel
+// no longer holds lookup refs. Directory and root mappings are intentionally
+// preserved because later directory operations may still reference them.
+func (m *InodeToPath) RemoveFileIfUnreferenced(ino uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return false
+	}
+	if ino == 1 || entry.IsDir || entry.Nlookup > 0 {
+		return false
+	}
+	delete(m.byPath, entry.Path)
+	delete(m.byInode, ino)
+	return true
+}
+
 // UpdateSize updates the size of the entry identified by the given inode.
 func (m *InodeToPath) UpdateSize(ino uint64, size int64) {
 	m.mu.Lock()
