@@ -84,6 +84,15 @@ func TestSSEEndpointSince0SendsReset(t *testing.T) {
 	if data["reason"] != "initial_sync" {
 		t.Errorf("reset reason=%v, want initial_sync", data["reason"])
 	}
+	if _, ok := data["actor"]; ok {
+		t.Errorf("initial_sync reset should not include actor: %+v", data)
+	}
+	if _, ok := data["path"]; ok {
+		t.Errorf("initial_sync reset should not include path: %+v", data)
+	}
+	if _, ok := data["op"]; ok {
+		t.Errorf("initial_sync reset should not include op: %+v", data)
+	}
 }
 
 func TestSSEEndpointReplay(t *testing.T) {
@@ -233,6 +242,15 @@ func TestSSEStructuralOpEmitsReset(t *testing.T) {
 	if reset1["reason"] != "structural_change" {
 		t.Errorf("rename reset reason=%v, want structural_change", reset1["reason"])
 	}
+	if reset1["actor"] != "actor1" {
+		t.Errorf("rename reset actor=%v, want actor1", reset1["actor"])
+	}
+	if reset1["path"] != "/old.txt" {
+		t.Errorf("rename reset path=%v, want /old.txt", reset1["path"])
+	}
+	if reset1["op"] != "rename" {
+		t.Errorf("rename reset op=%v, want rename", reset1["op"])
+	}
 
 	// Event 3: mkdir → also reset.
 	ev2, ok := readSSEEvent(scanner)
@@ -242,6 +260,22 @@ func TestSSEStructuralOpEmitsReset(t *testing.T) {
 	if ev2.Event != "reset" {
 		t.Fatalf("mkdir op: event=%q, want reset", ev2.Event)
 	}
+	var reset2 map[string]interface{}
+	if err := json.Unmarshal([]byte(ev2.Data), &reset2); err != nil {
+		t.Fatalf("unmarshal reset2: %v", err)
+	}
+	if reset2["reason"] != "structural_change" {
+		t.Errorf("mkdir reset reason=%v, want structural_change", reset2["reason"])
+	}
+	if reset2["actor"] != "actor1" {
+		t.Errorf("mkdir reset actor=%v, want actor1", reset2["actor"])
+	}
+	if reset2["path"] != "/dir" {
+		t.Errorf("mkdir reset path=%v, want /dir", reset2["path"])
+	}
+	if reset2["op"] != "mkdir" {
+		t.Errorf("mkdir reset op=%v, want mkdir", reset2["op"])
+	}
 
 	// Event 4: delete → also reset.
 	ev3, ok := readSSEEvent(scanner)
@@ -250,6 +284,22 @@ func TestSSEStructuralOpEmitsReset(t *testing.T) {
 	}
 	if ev3.Event != "reset" {
 		t.Fatalf("delete op: event=%q, want reset", ev3.Event)
+	}
+	var reset3 map[string]interface{}
+	if err := json.Unmarshal([]byte(ev3.Data), &reset3); err != nil {
+		t.Fatalf("unmarshal reset3: %v", err)
+	}
+	if reset3["reason"] != "structural_change" {
+		t.Errorf("delete reset reason=%v, want structural_change", reset3["reason"])
+	}
+	if reset3["actor"] != "actor1" {
+		t.Errorf("delete reset actor=%v, want actor1", reset3["actor"])
+	}
+	if reset3["path"] != "/gone.txt" {
+		t.Errorf("delete reset path=%v, want /gone.txt", reset3["path"])
+	}
+	if reset3["op"] != "delete" {
+		t.Errorf("delete reset op=%v, want delete", reset3["op"])
 	}
 }
 
@@ -295,6 +345,15 @@ func TestSSEStructuralOpLiveEmitsReset(t *testing.T) {
 	}
 	if data["reason"] != "structural_change" {
 		t.Errorf("live rename reason=%v, want structural_change", data["reason"])
+	}
+	if data["actor"] != "remote-actor" {
+		t.Errorf("live rename actor=%v, want remote-actor", data["actor"])
+	}
+	if data["path"] != "/old" {
+		t.Errorf("live rename path=%v, want /old", data["path"])
+	}
+	if data["op"] != "rename" {
+		t.Errorf("live rename op=%v, want rename", data["op"])
 	}
 }
 

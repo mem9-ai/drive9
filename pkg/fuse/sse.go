@@ -52,6 +52,9 @@ func (w *SSEWatcher) handleEvent(change *client.ChangeEvent, reset *client.Reset
 		return
 	}
 	if reset != nil && reset.Reason != "" {
+		if w.actor != "" && reset.Reason == "structural_change" && reset.Actor == w.actor {
+			return
+		}
 		// Only handle resets with an explicit reason (not heartbeats).
 		w.handleReset(reset)
 	}
