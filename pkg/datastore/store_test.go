@@ -649,6 +649,62 @@ func TestRenameFile(t *testing.T) {
 	}
 }
 
+func TestRenameFileReplacingTarget(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	for _, f := range []*File{
+		{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1", SizeBytes: 4, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now},
+		{FileID: "f2", StorageType: StorageDB9, StorageRef: "/blobs/f2", SizeBytes: 3, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now},
+	} {
+		if err := s.InsertFile(ctx, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/config.lock", ParentPath: "/", Name: "config.lock", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "n2", Path: "/config", ParentPath: "/", Name: "config", FileID: "f2", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO file_tags (file_id, tag_key, tag_value) VALUES (?, ?, ?)`, "f2", "old", "target"); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := s.RenameFileReplacingTarget(ctx, "/config.lock", "/config", "/", "config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted == nil || deleted.FileID != "f2" {
+		t.Fatalf("deleted = %+v, want f2", deleted)
+	}
+	if _, err := s.GetNode(ctx, "/config.lock"); err != ErrNotFound {
+		t.Fatalf("old path err = %v, want ErrNotFound", err)
+	}
+	got, err := s.GetNode(ctx, "/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NodeID != "n1" || got.FileID != "f1" || got.Name != "config" {
+		t.Fatalf("renamed target = %+v, want source node/file at /config", got)
+	}
+	replaced, err := s.GetFile(ctx, "f2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replaced.Status != StatusDeleted {
+		t.Fatalf("replaced file status = %s, want %s", replaced.Status, StatusDeleted)
+	}
+	var tags int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM file_tags WHERE file_id = ?`, "f2").Scan(&tags); err != nil {
+		t.Fatal(err)
+	}
+	if tags != 0 {
+		t.Fatalf("replaced file tags = %d, want 0", tags)
+	}
+}
+
 func TestRenameDir(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()

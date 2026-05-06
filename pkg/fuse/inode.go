@@ -262,6 +262,9 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 
 	// Update the entry itself.
 	delete(m.byPath, oldPath)
+	if replacedIno, ok := m.byPath[newPath]; ok && replacedIno != ino {
+		delete(m.byInode, replacedIno)
+	}
 	m.byPath[newPath] = ino
 	entry.Path = newPath
 
