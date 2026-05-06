@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # drive9 FUSE smoke test against a live deployment.
+# shellcheck disable=SC2317,SC2016
 
 set -euo pipefail
 
@@ -19,6 +20,14 @@ CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://drive9.ai/releases}"
 CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
 CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
+FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-0}"
+FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
+RUN_FUSE_GIT_CLONE="${RUN_FUSE_GIT_CLONE:-0}"
+RUN_FUSE_UMOUNT_DURABLE="${RUN_FUSE_UMOUNT_DURABLE:-0}"
+RUN_FUSE_LOG_AUDIT="${RUN_FUSE_LOG_AUDIT:-0}"
+FUSE_GIT_CLONE_URL="${FUSE_GIT_CLONE_URL:-https://github.com/octocat/Hello-World.git}"
+FUSE_GIT_CLONE_TIMEOUT_S="${FUSE_GIT_CLONE_TIMEOUT_S:-180}"
+FUSE_LOG_AUDIT_PATTERN="${FUSE_LOG_AUDIT_PATTERN:-panic|fatal error|Resource temporarily unavailable}"
 
 PASS=0
 FAIL=0
@@ -122,6 +131,14 @@ prepare_cli_binary() {
 skip() {
   echo "SKIP $*"
   exit 0
+}
+
+skip_or_fail() {
+  if [ "$FUSE_STRICT_PREREQS" = "1" ]; then
+    echo "FAIL $*" >&2
+    exit 1
+  fi
+  skip "$@"
 }
 
 is_mounted() {
@@ -414,11 +431,13 @@ PY
 
 start_mount() {
   local mode="$1"
-  : >"$MOUNT_LOG"
+  {
+    echo "=== drive9 mount start mode=$mode time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
+  } >>"$MOUNT_LOG"
   if [ "$mode" = "ro" ]; then
-    drive9 mount --read-only "$MOUNT_POINT" >"$MOUNT_LOG" 2>&1 &
+    drive9 mount --read-only "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
   else
-    drive9 mount "$MOUNT_POINT" >"$MOUNT_LOG" 2>&1 &
+    drive9 mount "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
   fi
   MOUNT_PID="$!"
 
@@ -435,7 +454,7 @@ start_mount() {
 stop_mount() {
   set +e
   if is_mounted "$MOUNT_POINT"; then
-    drive9 umount "$MOUNT_POINT" >/dev/null 2>&1 || true
+    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT" >/dev/null 2>&1 || true
     wait_mount_state unmounted >/dev/null 2>&1 || true
   fi
   if [ -n "${MOUNT_PID:-}" ] && kill -0 "$MOUNT_PID" >/dev/null 2>&1; then
@@ -446,9 +465,52 @@ stop_mount() {
   set -e
 }
 
+unmount_mount() {
+  if is_mounted "$MOUNT_POINT"; then
+    if ! drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT"; then
+      return 1
+    fi
+  fi
+  if ! wait_mount_state unmounted; then
+    return 1
+  fi
+  if [ -n "${MOUNT_PID:-}" ]; then
+    set +e
+    wait "$MOUNT_PID" >/dev/null 2>&1
+    MOUNT_PID=""
+    set -e
+  fi
+  return 0
+}
+
+dump_mount_log() {
+  if [ -n "${MOUNT_LOG:-}" ] && [ -f "$MOUNT_LOG" ]; then
+    echo "=== drive9 mount log: $MOUNT_LOG ==="
+    cat "$MOUNT_LOG"
+  fi
+}
+
+audit_mount_log() {
+  if [ ! -f "$MOUNT_LOG" ]; then
+    echo "mount log missing: $MOUNT_LOG" >&2
+    return 1
+  fi
+  if grep -Eina "$FUSE_LOG_AUDIT_PATTERN" "$MOUNT_LOG"; then
+    echo "mount log contains release-gate failure pattern" >&2
+    return 1
+  fi
+  return 0
+}
+
 echo "=== drive9 FUSE smoke test ==="
 echo "BASE=$BASE"
 echo "CLI_SOURCE=$CLI_SOURCE"
+echo "FUSE_STRICT_PREREQS=$FUSE_STRICT_PREREQS"
+echo "RUN_FUSE_GIT_CLONE=$RUN_FUSE_GIT_CLONE"
+echo "FUSE_GIT_CLONE_TIMEOUT_S=$FUSE_GIT_CLONE_TIMEOUT_S"
+echo "RUN_FUSE_UMOUNT_DURABLE=$RUN_FUSE_UMOUNT_DURABLE"
+echo "RUN_FUSE_LOG_AUDIT=$RUN_FUSE_LOG_AUDIT"
+echo "FUSE_LOG_AUDIT_PATTERN=$FUSE_LOG_AUDIT_PATTERN"
 
 check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
 if [ "$CLI_SOURCE" = "build" ]; then
@@ -458,17 +520,23 @@ else
 fi
 check_cmd "python3 is available" bash -c 'command -v python3 >/dev/null'
 check_cmd "git is available" bash -c 'command -v git >/dev/null'
+if [ "$FUSE_STRICT_PREREQS" = "1" ] && [ "$RUN_FUSE_GIT_CLONE" = "1" ]; then
+  if ! command -v timeout >/dev/null 2>&1; then
+    skip_or_fail "timeout is required for strict FUSE git clone timeout"
+  fi
+  check_eq "timeout is available" "true" "true"
+fi
 
 if [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
-  skip "unsupported OS for this smoke script"
+  skip_or_fail "unsupported OS for this smoke script"
 fi
 
 if [ "$(uname -s)" = "Linux" ]; then
   if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
-    skip "fusermount/fusermount3 is required for Linux FUSE unmount"
+    skip_or_fail "fusermount/fusermount3 is required for Linux FUSE unmount"
   fi
   if [ ! -e /dev/fuse ]; then
-    skip "/dev/fuse not available"
+    skip_or_fail "/dev/fuse not available"
   fi
 fi
 
@@ -583,21 +651,35 @@ LARGE_MOUNT="$MOUNT_POINT/$LARGE_REL"
 GIT_PROBE_REL="${ROOT_REL}/git-config-probe"
 GIT_PROBE_MOUNT="$MOUNT_POINT/$GIT_PROBE_REL"
 GIT_PROBE_ORIGIN="https://github.com/mem9-ai/drive9.git"
+GIT_CLONE_REL="${ROOT_REL}/hello-world"
+GIT_CLONE_MOUNT="$MOUNT_POINT/$GIT_CLONE_REL"
+DURABLE_REL="${ROOT_REL}/umount-durable.txt"
+DURABLE_REMOTE="/${DURABLE_REL}"
+DURABLE_MOUNT="$MOUNT_POINT/$DURABLE_REL"
 RO_SEED_REL="${ROOT_REL}/ro-seed.txt"
 RO_SEED_REMOTE="/${RO_SEED_REL}"
 RO_SEED_MOUNT="$MOUNT_POINT/$RO_SEED_REL"
 RO_WRITE_MOUNT="$MOUNT_POINT/${ROOT_REL}/ro-write.txt"
 
 mkdir -p "$MOUNT_POINT"
+: >"$MOUNT_LOG"
 printf "seed-%s" "$TS" > "$SEED_LOCAL"
 
 MOUNT_PID=""
 cleanup() {
   stop_mount
   rm -f "$SEED_LOCAL" "$LARGE_DOWNLOADED" "$CLI_BIN"
-  rm -rf "$MOUNT_POINT" || true
+  rm -rf "${MOUNT_POINT:?}" || true
 }
-trap cleanup EXIT
+on_exit() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] || [ "${FAIL:-0}" -ne 0 ]; then
+    dump_mount_log
+  fi
+  cleanup
+  exit "$rc"
+}
+trap on_exit EXIT
 
 echo "[4] mount rw"
 if start_mount rw; then
@@ -753,6 +835,29 @@ PY
   check_eq "git config remote origin is readable" "$git_origin_rc" "0"
   check_eq "git config remote origin survives lockfile reuse" "$git_origin" "$GIT_PROBE_ORIGIN"
 
+  if [ "$RUN_FUSE_GIT_CLONE" = "1" ]; then
+    echo "[8.2] git clone small repo"
+    rm -rf "$GIT_CLONE_MOUNT"
+    git_clone_ok=true
+    date -u '+git clone start: %Y-%m-%dT%H:%M:%SZ'
+    if command -v timeout >/dev/null 2>&1; then
+      if ! GIT_PROGRESS_DELAY=0 timeout "$FUSE_GIT_CLONE_TIMEOUT_S" git clone --progress --depth 1 "$FUSE_GIT_CLONE_URL" "$GIT_CLONE_MOUNT"; then
+        git_clone_ok=false
+      fi
+    elif ! GIT_PROGRESS_DELAY=0 git clone --progress --depth 1 "$FUSE_GIT_CLONE_URL" "$GIT_CLONE_MOUNT"; then
+      git_clone_ok=false
+    fi
+    date -u '+git clone done:  %Y-%m-%dT%H:%M:%SZ'
+    check_eq "git clone small repo succeeds" "$git_clone_ok" "true"
+    if [ "$git_clone_ok" = "true" ]; then
+      git_status=$(git -C "$GIT_CLONE_MOUNT" status --short)
+      check_eq "git status clean after clone" "$git_status" ""
+      check_cmd "git log reads latest commit" git -C "$GIT_CLONE_MOUNT" log --oneline -1
+      check_cmd "git clone directory visible via remote list" wait_remote_ls_has_name "$ROOT_REMOTE" "hello-world"
+      check_cmd "git config lockfile absent after clone" test ! -e "$GIT_CLONE_MOUNT/.git/config.lock"
+    fi
+  fi
+
   echo "[9] cross-channel consistency"
   if [ "$rename_dir_ready" = "true" ]; then
     drive9_retry fs cp "$SEED_LOCAL" ":$CLI_TO_MOUNT_REMOTE" >/dev/null
@@ -806,8 +911,39 @@ PY
 
   check_cmd_fail "rm missing file fails" rm "$MOUNT_POINT/${ROOT_REL}/missing.txt"
 
-  echo "[12] cleanup writable tree"
-  rm -rf "$MOUNT_POINT/$ROOT_REL"
+  if [ "$RUN_FUSE_UMOUNT_DURABLE" = "1" ]; then
+    echo "[12] umount durable remount"
+    printf "durable-%s" "$TS" > "$DURABLE_MOUNT"
+    if unmount_mount; then
+      check_eq "rw mount unmounted after durable write" "true" "true"
+    else
+      check_eq "rw mount unmounted after durable write" "false" "true"
+      stop_mount
+    fi
+    if start_mount rw; then
+      check_eq "rw mount remounted after durable write" "true" "true"
+    else
+      check_eq "rw mount remounted after durable write" "false" "true"
+    fi
+    if is_mounted "$MOUNT_POINT"; then
+      if wait_path_exists "$DURABLE_MOUNT"; then
+        check_eq "durable file visible after remount" "true" "true"
+        durable_mounted=$(cat "$DURABLE_MOUNT")
+        durable_remote=$(drive9_retry fs cat "$DURABLE_REMOTE")
+        check_eq "durable file content survives remount" "$durable_mounted" "durable-${TS}"
+        check_eq "durable file remote content survives umount" "$durable_remote" "durable-${TS}"
+      else
+        check_eq "durable file visible after remount" "false" "true"
+      fi
+      if [ "$RUN_FUSE_GIT_CLONE" = "1" ]; then
+        check_cmd "git clone directory survives remount" test -d "$GIT_CLONE_MOUNT/.git"
+        check_cmd "git log works after remount" git -C "$GIT_CLONE_MOUNT" log --oneline -1
+      fi
+    fi
+  fi
+
+  echo "[12.1] cleanup writable tree"
+  rm -rf "${MOUNT_POINT:?}/${ROOT_REL:?}"
   check_cmd "remote root removed from ls after mounted rm -rf" wait_remote_ls_missing_name "/" "$ROOT_REL"
 
   echo "[13] remount read-only semantics"
@@ -834,10 +970,20 @@ PY
     check_cmd_fail "delete fails on read-only mount" rm "$RO_SEED_MOUNT"
   fi
 
-    echo "[14] unmount"
+  echo "[14] unmount"
+  if unmount_mount; then
+    check_eq "final mount unmounted" "true" "true"
+  else
+    check_eq "final mount unmounted" "false" "true"
     stop_mount
-    check_cmd "final mount unmounted" wait_mount_state unmounted
   fi
+  # End of the writable-alpha branch opened after the nested mkdir checks.
+  fi
+fi # End of the mounted-rw branch.
+
+if [ "$RUN_FUSE_LOG_AUDIT" = "1" ]; then
+  echo "[15] mount log audit"
+  check_cmd "mount log has no release-gate failure patterns" audit_mount_log
 fi
 
 echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"
