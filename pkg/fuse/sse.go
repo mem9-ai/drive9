@@ -111,7 +111,13 @@ func (w *SSEWatcher) handleReset(resets ...*client.ResetEvent) {
 	for _, entry := range entries {
 		w.fs.notifyInode(entry.Ino)
 
-		if entry.Path != "/" {
+		// Do not invalidate a directory's own parent dentry during a broad reset.
+		// Linux getcwd(2) walks parent dentries; dropping the dentry for a
+		// process's current working directory can make git's remote helpers fail
+		// with ENOENT even though the directory still exists. The reset already
+		// clears userspace directory caches and notifies the directory inode, so
+		// future readdir/attr paths are refreshed without detaching cwd names.
+		if entry.Path != "/" && !entry.IsDir {
 			parent := parentDir(entry.Path)
 			if parentIno, ok := w.fs.inodes.GetInode(parent); ok {
 				w.fs.notifyEntry(parentIno, path.Base(entry.Path))

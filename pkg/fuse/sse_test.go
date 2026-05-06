@@ -60,6 +60,41 @@ func TestSSEWatcherResetPreservesInodes(t *testing.T) {
 	}
 }
 
+func TestSSEWatcherResetDoesNotNotifyDirectoryParentDentries(t *testing.T) {
+	opts := &MountOptions{
+		CacheSize: 1 << 20,
+		DirTTL:    5 * time.Second,
+		AttrTTL:   60 * time.Second,
+		EntryTTL:  60 * time.Second,
+	}
+	opts.setDefaults()
+	fs := &Dat9FS{
+		inodes:    NewInodeToPath(),
+		readCache: NewReadCache(opts.CacheSize, 0),
+		dirCache:  NewDirCache(opts.DirTTL),
+	}
+
+	fs.inodes.Lookup("/repo", true, 0, time.Now())
+	fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
+	fs.inodes.Lookup("/repo/.git/config", false, 100, time.Now())
+
+	w := &SSEWatcher{fs: fs, actor: "test-actor"}
+	w.handleEvent(nil, &client.ResetEvent{Seq: 5, Reason: "seq_too_old"})
+
+	// Reset should notify all four known inodes (root + 3 entries) plus the
+	// regular file dentry. Directory parent dentries are intentionally skipped
+	// so a process whose cwd is /repo does not lose its getcwd() path.
+	if got, want := fs.notifyCount.Load(), int64(5); got != want {
+		t.Fatalf("notify count = %d, want %d", got, want)
+	}
+	if _, ok := fs.inodes.GetInode("/repo"); !ok {
+		t.Fatal("directory inode mapping for cwd candidate was lost")
+	}
+	if _, ok := fs.inodes.GetInode("/repo/.git"); !ok {
+		t.Fatal("nested directory inode mapping was lost")
+	}
+}
+
 func TestSSEWatcherHandleChangeInvalidatesCache(t *testing.T) {
 	opts := &MountOptions{
 		CacheSize: 1 << 20,
