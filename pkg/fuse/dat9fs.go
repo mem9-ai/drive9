@@ -147,6 +147,10 @@ const (
 	// logged, to avoid noisy logs on hot lookup paths.
 	lookupRetrySuccessLogEvery uint64 = 200
 
+	// namespaceMutationRetryTimeout bounds detached retries for idempotent-ish
+	// namespace mutations after a FUSE interrupt or transient backend error.
+	namespaceMutationRetryTimeout = 2 * time.Second
+
 	// readTransientRetryCount is the number of detached retries after the
 	// initial remote Read attempt fails with a transient error (context
 	// canceled, deadline exceeded, network timeout, HTTP 5xx).
@@ -631,10 +635,10 @@ func httpToFuseStatus(err error) gofuse.Status {
 		case http.StatusNotFound:
 			return gofuse.ENOENT
 		case http.StatusConflict:
-			if strings.Contains(strings.ToLower(se.Message), "already exists") {
-				return gofuse.Status(syscall.EEXIST)
+			if strings.Contains(strings.ToLower(se.Message), "revision conflict") {
+				return gofuse.EIO
 			}
-			return gofuse.EIO
+			return gofuse.Status(syscall.EEXIST)
 		case http.StatusForbidden:
 			return gofuse.EACCES
 		case http.StatusRequestEntityTooLarge:
@@ -662,7 +666,7 @@ func httpToFuseStatus(err error) gofuse.Status {
 	switch {
 	case strings.Contains(lowerMsg, "not found") || strings.Contains(msg, "HTTP 404"):
 		return gofuse.ENOENT
-	case strings.Contains(lowerMsg, "already exists"):
+	case strings.Contains(lowerMsg, "already exists") || strings.Contains(msg, "HTTP 409"):
 		return gofuse.Status(syscall.EEXIST)
 	case strings.Contains(msg, "HTTP 403"):
 		return gofuse.EACCES
@@ -717,6 +721,14 @@ func isTransientLookupErr(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func isConflictErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se *client.StatusError
+	return errors.As(err, &se) && se.StatusCode == http.StatusConflict
 }
 
 // errReadRetriesExhausted is a sentinel indicating all detached read retries
@@ -931,6 +943,56 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		lastErr = err
 	}
 	return nil, lastErr
+}
+
+func (fs *Dat9FS) remoteDirExistsDetached(localPath string) bool {
+	retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+	defer retryCancel()
+	stat, err := fs.client.StatCtx(retryCtx, fs.remotePath(localPath))
+	return err == nil && stat.IsDir
+}
+
+func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string) error {
+	apiPath := fs.remotePath(localPath)
+	ctx, cf := fuseCtx(cancel)
+	err := fs.client.MkdirCtx(ctx, apiPath)
+	cf()
+	if err == nil || !isTransientLookupErr(err) {
+		return err
+	}
+
+	// The first request honored the FUSE interrupt. If it was canceled after the
+	// server committed the directory, a detached stat lets us return success
+	// instead of surfacing EAGAIN to checkout-like callers that will not retry.
+	if fs.remoteDirExistsDetached(localPath) {
+		return nil
+	}
+
+	retryCount := fs.lookupStatRetryCount()
+	if retryCount <= 0 {
+		return err
+	}
+
+	lastErr := err
+	for range retryCount {
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+		err = fs.client.MkdirCtx(retryCtx, apiPath)
+		retryCancel()
+		if err == nil {
+			return nil
+		}
+		if isConflictErr(err) && fs.remoteDirExistsDetached(localPath) {
+			return nil
+		}
+		if !isTransientLookupErr(err) {
+			return err
+		}
+		if fs.remoteDirExistsDetached(localPath) {
+			return nil
+		}
+		lastErr = err
+	}
+	return lastErr
 }
 
 // --- RawFileSystem methods ---------------------------------------------------
@@ -1318,15 +1380,12 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 // --- Directory operations ----------------------------------------------------
 
 func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, out *gofuse.EntryOut) gofuse.Status {
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
-
 	childP, st := fs.childPath(input.NodeId, name)
 	if st != gofuse.OK {
 		return st
 	}
 
-	if err := fs.client.MkdirCtx(ctx, fs.remotePath(childP)); err != nil {
+	if err := fs.mkdirRemoteWithTransientRetry(cancel, childP); err != nil {
 		return httpToFuseStatus(err)
 	}
 

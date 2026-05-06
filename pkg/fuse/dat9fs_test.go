@@ -1004,6 +1004,22 @@ func TestHTTPToFuseStatus_MapsGatewayTimeoutToEAGAIN(t *testing.T) {
 	}
 }
 
+func TestHTTPToFuseStatus_MapsConflictToEEXIST(t *testing.T) {
+	want := gofuse.Status(syscall.EEXIST)
+	if got := httpToFuseStatus(&client.StatusError{StatusCode: http.StatusConflict, Message: "path conflict"}); got != want {
+		t.Fatalf("status error 409 = %v, want %v", got, want)
+	}
+	if got := httpToFuseStatus(fmt.Errorf("HTTP 409: conflict")); got != want {
+		t.Fatalf("string error 409 = %v, want %v", got, want)
+	}
+}
+
+func TestHTTPToFuseStatus_PreservesRevisionConflictAsEIO(t *testing.T) {
+	if got := httpToFuseStatus(&client.StatusError{StatusCode: http.StatusConflict, Message: "revision conflict"}); got != gofuse.EIO {
+		t.Fatalf("revision conflict status = %v, want %v", got, gofuse.EIO)
+	}
+}
+
 // TestHTTPToFuseStatus_MapsClientClosedRequestToEAGAIN locks the contract
 // between the server's tenantAuthMiddleware (which writes 499 when a request
 // is canceled mid-auth) and the FUSE client. Without this mapping, a canceled
@@ -1260,6 +1276,94 @@ func TestCreateFileGetsStreamUploader(t *testing.T) {
 	}
 	if fh.Streamer == nil {
 		t.Fatal("expected StreamUploader to be set for new file")
+	}
+}
+
+func TestMkdirRetriesDetachedAfterTransientInterrupt(t *testing.T) {
+	var mkdirCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.RawQuery == "mkdir":
+			if r.URL.Path != "/v1/fs/dir" {
+				t.Fatalf("POST path = %q, want /v1/fs/dir", r.URL.Path)
+			}
+			if mkdirCalls.Add(1) == 1 {
+				w.WriteHeader(statusClientClosedRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Fatalf("unexpected request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "dir", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Mkdir status = %v, want OK", st)
+	}
+	if got := mkdirCalls.Load(); got != 2 {
+		t.Fatalf("mkdir calls = %d, want 2", got)
+	}
+	if out.NodeId == 0 {
+		t.Fatal("expected mkdir response to include a node id")
+	}
+}
+
+func TestMkdirRetryTreatsRemoteDirectoryAsSuccessAfterAmbiguousCreate(t *testing.T) {
+	var mkdirCalls atomic.Int64
+	var statCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.RawQuery == "mkdir":
+			switch mkdirCalls.Add(1) {
+			case 1:
+				w.WriteHeader(statusClientClosedRequest)
+			case 2:
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "path already exists"})
+			default:
+				t.Fatalf("unexpected extra mkdir call")
+			}
+		case r.Method == http.MethodHead:
+			if statCalls.Add(1) == 1 {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "dir", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Mkdir status = %v, want OK", st)
+	}
+	if got := mkdirCalls.Load(); got != 2 {
+		t.Fatalf("mkdir calls = %d, want 2", got)
+	}
+	if got := statCalls.Load(); got != 2 {
+		t.Fatalf("stat calls = %d, want 2", got)
 	}
 }
 
