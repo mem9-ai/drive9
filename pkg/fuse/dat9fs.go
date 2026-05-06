@@ -1121,8 +1121,16 @@ func (fs *Dat9FS) openHandleEntry(p string) (*InodeEntry, bool) {
 		fh.Lock()
 		size := fh.Dirty.Size()
 		fh.Unlock()
-		ino := fs.inodes.Lookup(p, false, size, time.Now())
-		return fs.inodes.GetEntry(ino)
+		// This path reconstructs a dentry for an already-open writable file
+		// after the kernel dropped its lookup ref. Reuse the handle's inode
+		// instead of path Lookup so a stale/missing path map cannot allocate a
+		// second inode for the same open file.
+		if !fs.inodes.IncrementLookup(fh.Ino) {
+			return nil, false
+		}
+		fs.inodes.UpdateSize(fh.Ino, size)
+		fs.inodes.UpdateMtime(fh.Ino, time.Now())
+		return fs.inodes.GetEntry(fh.Ino)
 	}
 	return nil, false
 }
@@ -1131,6 +1139,9 @@ func (fs *Dat9FS) cleanupReleasedInode(ino uint64, p string) {
 	if fs.hasOpenHandle(ino, p) || fs.hasPendingLocalState(p) || fs.hasQueuedCommit(p) {
 		return
 	}
+	// Concurrent Release/commit cleanup for the same path is safe here:
+	// RemoveFileIfUnreferenced holds the inode map lock and is idempotent when
+	// another goroutine already removed the forgotten regular-file mapping.
 	fs.inodes.RemoveFileIfUnreferenced(ino)
 }
 
