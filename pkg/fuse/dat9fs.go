@@ -1565,6 +1565,73 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	return gofuse.OK
 }
 
+func (fs *Dat9FS) renamePendingNewCommit(input *gofuse.RenameIn, oldP, newP string) bool {
+	if fs.pendingIndex == nil {
+		return false
+	}
+	meta, ok := fs.pendingIndex.GetMeta(oldP)
+	if !ok || meta.Kind != PendingNew {
+		return false
+	}
+
+	if fs.commitQueue != nil {
+		fs.commitQueue.CancelPathPreserveLocal(oldP)
+		fs.commitQueue.WaitPath(oldP)
+		fs.commitQueue.WaitPath(newP)
+
+		// The cancel may have raced with a successful upload. If so, the old
+		// path now exists remotely and the normal server-side rename is correct.
+		meta, ok = fs.pendingIndex.GetMeta(oldP)
+		if !ok || meta.Kind != PendingNew {
+			return false
+		}
+	}
+
+	if fs.shadowStore != nil {
+		if !fs.shadowStore.Rename(oldP, newP) {
+			log.Printf("rename: move pending shadow %s -> %s failed", oldP, newP)
+			return false
+		}
+	}
+	if !fs.pendingIndex.RenamePending(oldP, newP) {
+		log.Printf("rename: move pending index %s -> %s failed", oldP, newP)
+		return false
+	}
+
+	fs.finishLocalRename(input, oldP, newP)
+
+	if fs.commitQueue != nil {
+		ino, _ := fs.inodes.GetInode(newP)
+		entry := &CommitEntry{
+			Path:        newP,
+			Inode:       ino,
+			BaseRev:     meta.BaseRev,
+			Size:        meta.Size,
+			Kind:        meta.Kind,
+			ShadowSpill: meta.ShadowSpill,
+		}
+		if err := fs.commitQueue.Enqueue(entry); err != nil {
+			log.Printf("rename: enqueue pending-new commit for %s: %v", newP, err)
+		}
+	}
+	return true
+}
+
+func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
+	fs.inodes.Rename(oldP, newP)
+	fs.readCache.Invalidate(oldP)
+	fs.readCache.Invalidate(newP)
+	fs.readCache.InvalidatePrefix(oldP + "/")
+	fs.readCache.InvalidatePrefix(newP + "/")
+
+	oldParent, _ := fs.inodes.GetPath(input.NodeId)
+	fs.dirCache.Invalidate(oldParent)
+	if input.Newdir != input.NodeId {
+		newParent, _ := fs.inodes.GetPath(input.Newdir)
+		fs.dirCache.Invalidate(newParent)
+	}
+}
+
 func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName string, newName string) gofuse.Status {
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -1578,6 +1645,10 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		return st
 	}
 	if oldP == newP {
+		return gofuse.OK
+	}
+
+	if fs.renamePendingNewCommit(input, oldP, newP) {
 		return gofuse.OK
 	}
 
@@ -1610,28 +1681,11 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 			isPendingNew = true
 		}
 		// Also check pendingIndex for files handed to commitQueue after Release.
-		if !isPendingNew && fs.pendingIndex != nil {
-			if meta, ok := fs.pendingIndex.GetMeta(oldP); ok && meta.Kind == PendingNew {
-				if fs.shadowStore != nil {
-					fs.shadowStore.Rename(oldP, newP)
-				}
-				fs.pendingIndex.RenamePending(oldP, newP)
-				isPendingNew = true
-			}
+		if !isPendingNew && fs.renamePendingNewCommit(input, oldP, newP) {
+			return gofuse.OK
 		}
 		if isPendingNew {
-			fs.inodes.Rename(oldP, newP)
-			fs.readCache.Invalidate(oldP)
-			fs.readCache.Invalidate(newP)
-			fs.readCache.InvalidatePrefix(oldP + "/")
-			fs.readCache.InvalidatePrefix(newP + "/")
-
-			oldParent, _ := fs.inodes.GetPath(input.NodeId)
-			fs.dirCache.Invalidate(oldParent)
-			if input.Newdir != input.NodeId {
-				newParent, _ := fs.inodes.GetPath(input.Newdir)
-				fs.dirCache.Invalidate(newParent)
-			}
+			fs.finishLocalRename(input, oldP, newP)
 			// Kernel initiated the rename and receives OK. Lock files opt out
 			// of entry caching at create/lookup time, so the next O_CREAT|O_EXCL
 			// revalidates without a synchronous EntryNotify from this handler.
@@ -1684,18 +1738,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 	}
 
-	fs.inodes.Rename(oldP, newP)
-	fs.readCache.Invalidate(oldP)
-	fs.readCache.Invalidate(newP)
-	fs.readCache.InvalidatePrefix(oldP + "/")
-	fs.readCache.InvalidatePrefix(newP + "/")
-
-	oldParent, _ := fs.inodes.GetPath(input.NodeId)
-	fs.dirCache.Invalidate(oldParent)
-	if input.Newdir != input.NodeId {
-		newParent, _ := fs.inodes.GetPath(input.Newdir)
-		fs.dirCache.Invalidate(newParent)
-	}
+	fs.finishLocalRename(input, oldP, newP)
 	return gofuse.OK
 }
 
