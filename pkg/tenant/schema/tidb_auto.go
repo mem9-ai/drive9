@@ -429,8 +429,7 @@ func validateTiDBSchemaMode(mode TiDBEmbeddingMode) error {
 	return nil
 }
 
-func initTiDBAutoEmbeddingSchema(dsn string) error {
-	ctx := context.Background()
+func initTiDBAutoEmbeddingSchema(ctx context.Context, dsn string) error {
 	start := time.Now()
 	logger.Info(ctx, "tenant_tidb_schema_init_started",
 		zap.String("mode", string(TiDBEmbeddingModeAuto)))
