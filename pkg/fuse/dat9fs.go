@@ -231,6 +231,28 @@ func (fs *Dat9FS) remotePath(localPath string) string {
 	return mountpath.ToRemote(fs.remoteRoot(), localPath)
 }
 
+func isGitLooseObjectFinalPath(p string) bool {
+	const marker = "/.git/objects/"
+
+	idx := strings.LastIndex(p, marker)
+	if idx < 0 {
+		return false
+	}
+	rel := p[idx+len(marker):]
+	parts := strings.Split(rel, "/")
+	if len(parts) != 2 || len(parts[0]) != 2 || len(parts[1]) != 38 {
+		return false
+	}
+	for _, s := range parts {
+		for _, r := range s {
+			if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func (fs *Dat9FS) localPath(remotePath string) (string, bool) {
 	return mountpath.ToLocal(fs.remoteRoot(), remotePath)
 }
@@ -1717,7 +1739,14 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 			Kind:        meta.Kind,
 			ShadowSpill: meta.ShadowSpill,
 		}
-		if err := fs.commitQueue.Enqueue(entry); err != nil {
+		if isGitLooseObjectFinalPath(newP) {
+			// Git treats a successful tmp_obj_* -> <sha> rename as making the
+			// object database complete. Do not acknowledge that rename while the
+			// content-addressed object is only queued for best-effort upload.
+			if commitErr := fs.commitQueue.CommitNow(ctx, entry); commitErr != nil {
+				return pendingRenameHandled, fmt.Errorf("sync commit git loose object rename %s: %w", newP, commitErr)
+			}
+		} else if err := fs.commitQueue.Enqueue(entry); err != nil {
 			log.Printf("rename: enqueue pending-new commit for %s failed, falling back to sync commit: %v", newP, err)
 			if commitErr := fs.commitQueue.CommitNow(ctx, entry); commitErr != nil {
 				return pendingRenameHandled, fmt.Errorf("sync commit pending-new rename %s: %w", newP, commitErr)

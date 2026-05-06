@@ -3344,7 +3344,7 @@ func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
 	}
 }
 
-func TestRenamePendingNewCommitQueueCancelsTempUploadAndEnqueuesFinalPath(t *testing.T) {
+func TestRenamePendingNewCommitSyncCommitsGitLooseObjectFinalPath(t *testing.T) {
 	oldP := "/repo/.git/objects/70/tmp_obj_test"
 	newP := "/repo/.git/objects/70/24234d93f61104585962ac664bc5a7ed1d241d"
 	data := []byte("loose object data")
@@ -3466,6 +3466,131 @@ func TestRenamePendingNewCommitQueueCancelsTempUploadAndEnqueuesFinalPath(t *tes
 	}
 	if oldPuts.Load() == 0 {
 		t.Fatal("old temp upload was never exercised")
+	}
+}
+
+func TestRenamePendingNewCommitGitLooseObjectSyncFailureKeepsRecoverableShadow(t *testing.T) {
+	oldP := "/repo/.git/objects/7e/tmp_obj_test"
+	newP := "/repo/.git/objects/7e/b689963134a158b392aca0dc75f94d3cee15f6"
+	finalName := "b689963134a158b392aca0dc75f94d3cee15f6"
+	data := []byte("loose object data that must survive upload failure")
+
+	var finalPuts atomic.Int32
+	var renameCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+newP:
+			finalPuts.Add(1)
+			http.Error(w, "storage backend unavailable", http.StatusServiceUnavailable)
+		case r.Method == http.MethodPost && r.URL.RawQuery == "rename":
+			renameCalls.Add(1)
+			http.Error(w, "server rename should not be used for pending git objects", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	c := client.New(ts.URL, "")
+	fs := NewDat9FS(c, opts)
+
+	shadowDir := t.TempDir()
+	pendingDir := t.TempDir()
+	shadow, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 16)
+	fs.commitQueue = cq
+
+	if err := shadow.WriteFull(oldP, data, 0); err != nil {
+		t.Fatalf("WriteFull old shadow: %v", err)
+	}
+	if _, err := pending.PutWithBaseRev(oldP, int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatalf("PutWithBaseRev old pending: %v", err)
+	}
+	dirIno := fs.inodes.Lookup("/repo/.git/objects/7e", true, 0, time.Now())
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Newdir:   dirIno,
+	}, "tmp_obj_test", finalName)
+	if st != gofuse.Status(syscall.EAGAIN) {
+		t.Fatalf("Rename status = %v, want EAGAIN", st)
+	}
+	cq.DrainAll()
+	shadow.Close()
+
+	if got := finalPuts.Load(); got != 1 {
+		t.Fatalf("final path PUTs = %d, want 1", got)
+	}
+	if got := renameCalls.Load(); got != 0 {
+		t.Fatalf("remote rename calls = %d, want 0", got)
+	}
+	if pending.HasPending(oldP) {
+		t.Fatal("old temp path still pending")
+	}
+	if !pending.HasPending(newP) {
+		t.Fatal("final path should stay pending after sync upload failure")
+	}
+
+	// Simulate a remount against a server that still has no object. The local
+	// durable shadow/pending overlay must make the final object readable, so a
+	// transient backend outage cannot turn a Git object into a permanent ENOENT.
+	pending2, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pending2.RecoverFromDisk(); err != nil {
+		t.Fatalf("RecoverFromDisk: %v", err)
+	}
+	shadow2, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow2.Close()
+
+	fs2 := NewDat9FS(c, opts)
+	fs2.shadowStore = shadow2
+	fs2.pendingIndex = pending2
+	dirIno2 := fs2.inodes.Lookup("/repo/.git/objects/7e", true, 0, time.Now())
+	var entryOut gofuse.EntryOut
+	st = fs2.Lookup(nil, &gofuse.InHeader{NodeId: dirIno2}, finalName, &entryOut)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup recovered object: %v, want OK", st)
+	}
+	if entryOut.Size != uint64(len(data)) {
+		t.Fatalf("Lookup size = %d, want %d", entryOut.Size, len(data))
+	}
+
+	var openOut gofuse.OpenOut
+	st = fs2.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: entryOut.NodeId},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open recovered object: %v", st)
+	}
+	buf := make([]byte, len(data)+8)
+	result, st := fs2.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: entryOut.NodeId},
+		Fh:       openOut.Fh,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read recovered object: %v", st)
+	}
+	got, _ := result.Bytes(buf)
+	if string(got) != string(data) {
+		t.Fatalf("Read recovered object = %q, want %q", string(got), string(data))
 	}
 }
 
