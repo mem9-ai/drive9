@@ -183,6 +183,39 @@ func TestSSEWatcherSelfFilterSkipsOwnEvents(t *testing.T) {
 	}
 }
 
+func TestSSEWatcherSelfFilterSkipsOwnStructuralReset(t *testing.T) {
+	opts := &MountOptions{
+		CacheSize: 1 << 20,
+		DirTTL:    5 * time.Second,
+	}
+	opts.setDefaults()
+	fs := &Dat9FS{
+		inodes:    NewInodeToPath(),
+		readCache: NewReadCache(opts.CacheSize, 0),
+		dirCache:  NewDirCache(opts.DirTTL),
+	}
+
+	fs.readCache.Put("/test.txt", []byte("data"), 1)
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "test.txt", Size: 4}})
+
+	w := &SSEWatcher{fs: fs, actor: "my-actor"}
+
+	w.handleEvent(nil, &client.ResetEvent{
+		Seq:    5,
+		Reason: "structural_change",
+		Path:   "/test.txt",
+		Op:     "delete",
+		Actor:  "my-actor",
+	})
+
+	if _, ok := fs.readCache.Get("/test.txt", 1); !ok {
+		t.Error("readCache should NOT be cleared after own structural reset")
+	}
+	if _, ok := fs.dirCache.Get("/"); !ok {
+		t.Error("dirCache should NOT be cleared after own structural reset")
+	}
+}
+
 func TestSSEWatcherHandleEventReset(t *testing.T) {
 	opts := &MountOptions{
 		CacheSize: 1 << 20,
@@ -208,6 +241,70 @@ func TestSSEWatcherHandleEventReset(t *testing.T) {
 	}
 	if _, ok := fs.dirCache.Get("/"); ok {
 		t.Error("dirCache should be cleared after reset")
+	}
+}
+
+func TestSSEWatcherForeignStructuralResetClearsCache(t *testing.T) {
+	opts := &MountOptions{
+		CacheSize: 1 << 20,
+		DirTTL:    5 * time.Second,
+	}
+	opts.setDefaults()
+	fs := &Dat9FS{
+		inodes:    NewInodeToPath(),
+		readCache: NewReadCache(opts.CacheSize, 0),
+		dirCache:  NewDirCache(opts.DirTTL),
+	}
+
+	fs.readCache.Put("/test.txt", []byte("data"), 1)
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "test.txt", Size: 4}})
+
+	w := &SSEWatcher{fs: fs, actor: "my-actor"}
+
+	w.handleEvent(nil, &client.ResetEvent{
+		Seq:    6,
+		Reason: "structural_change",
+		Path:   "/test.txt",
+		Op:     "delete",
+		Actor:  "other-actor",
+	})
+
+	if _, ok := fs.readCache.Get("/test.txt", 1); ok {
+		t.Error("readCache should be cleared after foreign structural reset")
+	}
+	if _, ok := fs.dirCache.Get("/"); ok {
+		t.Error("dirCache should be cleared after foreign structural reset")
+	}
+}
+
+func TestSSEWatcherOwnActorNonStructuralResetClearsCache(t *testing.T) {
+	opts := &MountOptions{
+		CacheSize: 1 << 20,
+		DirTTL:    5 * time.Second,
+	}
+	opts.setDefaults()
+	fs := &Dat9FS{
+		inodes:    NewInodeToPath(),
+		readCache: NewReadCache(opts.CacheSize, 0),
+		dirCache:  NewDirCache(opts.DirTTL),
+	}
+
+	fs.readCache.Put("/test.txt", []byte("data"), 1)
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "test.txt", Size: 4}})
+
+	w := &SSEWatcher{fs: fs, actor: "my-actor"}
+
+	w.handleEvent(nil, &client.ResetEvent{
+		Seq:    7,
+		Reason: "seq_too_old",
+		Actor:  "my-actor",
+	})
+
+	if _, ok := fs.readCache.Get("/test.txt", 1); ok {
+		t.Error("readCache should be cleared after non-structural reset")
+	}
+	if _, ok := fs.dirCache.Get("/"); ok {
+		t.Error("dirCache should be cleared after non-structural reset")
 	}
 }
 

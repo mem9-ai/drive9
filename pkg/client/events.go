@@ -24,6 +24,9 @@ type ChangeEvent struct {
 type ResetEvent struct {
 	Seq    uint64 `json:"seq"`
 	Reason string `json:"reason"`
+	Path   string `json:"path,omitempty"`
+	Op     string `json:"op,omitempty"`
+	Actor  string `json:"actor,omitempty"`
 }
 
 // EventHandler receives SSE events. Exactly one of the pointer arguments is

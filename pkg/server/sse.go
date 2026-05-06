@@ -321,7 +321,7 @@ func isStructuralOp(op string) bool {
 func sendSSEEvent(w *sseBufferedWriter, ev ChangeEvent) {
 	if isStructuralOp(ev.Op) {
 		// Structural ops are sent as reset events per the accepted design.
-		sendSSEReset(w, ev.Seq, "structural_change")
+		sendSSEStructuralReset(w, ev)
 		return
 	}
 	data, err := json.Marshal(ev)
@@ -334,10 +334,31 @@ func sendSSEEvent(w *sseBufferedWriter, ev ChangeEvent) {
 	}
 }
 
+type sseResetPayload struct {
+	Seq    uint64 `json:"seq"`
+	Reason string `json:"reason"`
+	Path   string `json:"path,omitempty"`
+	Op     string `json:"op,omitempty"`
+	Actor  string `json:"actor,omitempty"`
+}
+
+func sendSSEStructuralReset(w *sseBufferedWriter, ev ChangeEvent) {
+	data, _ := json.Marshal(sseResetPayload{
+		Seq:    ev.Seq,
+		Reason: "structural_change",
+		Path:   ev.Path,
+		Op:     ev.Op,
+		Actor:  ev.Actor,
+	})
+	if _, err := fmt.Fprintf(w, "event: reset\ndata: %s\n\n", data); err == nil {
+		w.recordWrite()
+	}
+}
+
 func sendSSEReset(w *sseBufferedWriter, seq uint64, reason string) {
-	data, _ := json.Marshal(map[string]interface{}{
-		"seq":    seq,
-		"reason": reason,
+	data, _ := json.Marshal(sseResetPayload{
+		Seq:    seq,
+		Reason: reason,
 	})
 	if _, err := fmt.Fprintf(w, "event: reset\ndata: %s\n\n", data); err == nil {
 		w.recordWrite()
