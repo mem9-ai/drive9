@@ -68,8 +68,8 @@ type Dat9FS struct {
 	// server is the go-fuse server, set during Init(). Used to send
 	// kernel cache invalidation notifications (EntryNotify, InodeNotify)
 	// for external/SSE-driven changes that the kernel doesn't know about.
-	// Local FUSE mutations do NOT use server notify — the kernel updates
-	// its own cache from the FUSE reply.
+	// Local FUSE mutations avoid server notify because handlers can be running
+	// on the same worker pool that services notify-triggered revalidation.
 	server *gofuse.Server
 
 	// notifyWg tracks inflight asynchronous kernel notification goroutines
@@ -599,8 +599,16 @@ func (fs *Dat9FS) fillEntryOut(entry *InodeEntry, out *gofuse.EntryOut) {
 	out.NodeId = entry.Ino
 	out.Generation = 1
 	fs.fillAttr(entry, &out.Attr)
-	out.SetEntryTimeout(fs.opts.EntryTTL)
+	entryTTL := fs.opts.EntryTTL
+	if isLockFilePath(entry.Path) {
+		entryTTL = 0
+	}
+	out.SetEntryTimeout(entryTTL)
 	out.SetAttrTimeout(fs.opts.AttrTTL)
+}
+
+func isLockFilePath(p string) bool {
+	return strings.HasSuffix(path.Base(p), ".lock")
 }
 
 func httpToFuseStatus(err error) gofuse.Status {
@@ -1498,6 +1506,9 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	if st != gofuse.OK {
 		return st
 	}
+	if oldP == newP {
+		return gofuse.OK
+	}
 
 	// Wait for any in-flight commitQueue uploads for both paths (and
 	// descendants) so a background commit cannot PUT to stale paths.
@@ -1548,8 +1559,9 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 				newParent, _ := fs.inodes.GetPath(input.Newdir)
 				fs.dirCache.Invalidate(newParent)
 			}
-			// Kernel initiated the rename and receives OK — it already
-			// updates its dentry cache. No notifyEntry/notifyInode needed.
+			// Kernel initiated the rename and receives OK. Lock files opt out
+			// of entry caching at create/lookup time, so the next O_CREAT|O_EXCL
+			// revalidates without a synchronous EntryNotify from this handler.
 			return gofuse.OK
 		}
 
@@ -1609,8 +1621,6 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		newParent, _ := fs.inodes.GetPath(input.Newdir)
 		fs.dirCache.Invalidate(newParent)
 	}
-	// Kernel initiated the rename and receives OK — it already
-	// updates its dentry cache. No notifyEntry/notifyInode needed.
 	return gofuse.OK
 }
 
