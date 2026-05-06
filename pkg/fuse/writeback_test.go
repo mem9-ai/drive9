@@ -968,6 +968,36 @@ func TestRenameFlushesWriteBack(t *testing.T) {
 	}
 }
 
+func TestRenameInvalidatesDestinationReadCache(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.inodes.Lookup("/config.lock", false, 54, time.Now())
+	fs.inodes.Lookup("/config", false, 36, time.Now())
+	fs.readCache.Put("/config.lock", []byte("new config"), 1)
+	fs.readCache.Put("/config", []byte("old config"), 1)
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Newdir:   1,
+	}, "config.lock", "config")
+	if st != gofuse.OK {
+		t.Fatalf("Rename: %v", st)
+	}
+
+	if _, ok := fs.readCache.Get("/config.lock", 0); ok {
+		t.Fatal("source read cache should be invalidated after rename")
+	}
+	if _, ok := fs.readCache.Get("/config", 0); ok {
+		t.Fatal("destination read cache should be invalidated after overwrite rename")
+	}
+}
+
 // TestUnlinkClearsPendingWriteBack verifies that Unlink clears any pending
 // write-back cache entry. For PendingNew files, the remote DELETE is skipped
 // (the file never existed on the server). Cache must be cleaned regardless.
@@ -1665,6 +1695,160 @@ func TestUnlink_PendingNew_SkipsRemoteDelete(t *testing.T) {
 	// Cache must be cleaned.
 	if _, ok := cache.Get("/new-only.txt"); ok {
 		t.Fatal("cache entry should be removed after Unlink")
+	}
+}
+
+func TestUnlink_PendingNewCommitQueueUploadedDeletesRemote(t *testing.T) {
+	const p = "/config.lock"
+	data := []byte("lock")
+
+	putStarted := make(chan struct{})
+	allowPut := make(chan struct{})
+	var putStartedOnce sync.Once
+	var deleteCalled atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putStartedOnce.Do(func() { close(putStarted) })
+			<-allowPut
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+		case http.MethodDelete:
+			deleteCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(p, data, 0); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(p, int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	c := client.New(ts.URL, "")
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = cq
+	fs.inodes.Lookup(p, false, int64(len(data)), time.Now())
+
+	if err := cq.Enqueue(&CommitEntry{
+		Path:    p,
+		Inode:   2,
+		Size:    int64(len(data)),
+		Kind:    PendingNew,
+		BaseRev: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-putStarted:
+	case <-time.After(time.Second):
+		t.Fatal("commit queue PUT did not start")
+	}
+
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "config.lock")
+	}()
+
+	select {
+	case st := <-done:
+		t.Fatalf("Unlink returned before in-flight commit finished: %v", st)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(allowPut)
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("Unlink: %v", st)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Unlink did not finish after commit completed")
+	}
+	if !deleteCalled.Load() {
+		t.Fatal("Unlink should delete a PendingNew file after commitQueue uploaded it")
+	}
+}
+
+func TestUnlink_PendingNewCommitQueueNotEnqueuedSkipsRemoteDelete(t *testing.T) {
+	const p = "/config.lock"
+
+	var deleteCalled atomic.Bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodDelete:
+			deleteCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(p, []byte("local-only"), 0); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(p, int64(len("local-only")), PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	c := client.New(ts.URL, "")
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = cq
+	fs.inodes.Lookup(p, false, int64(len("local-only")), time.Now())
+
+	st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "config.lock")
+	if st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+	if deleteCalled.Load() {
+		t.Fatal("Unlink should not delete remote path for PendingNew that was never enqueued")
+	}
+	if _, ok := pending.GetMeta(p); ok {
+		t.Fatal("pending entry should be cleared after unlink")
+	}
+	if shadow.Has(p) {
+		t.Fatal("shadow should be removed after unlink")
 	}
 }
 
