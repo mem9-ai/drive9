@@ -3666,6 +3666,228 @@ func TestRenamePendingNewCommitSyncCommitsWhenQueueStopped(t *testing.T) {
 	}
 }
 
+func TestUnlinkRemoteDeleteDoesNotRetryRecreatedPathAfterInterrupt(t *testing.T) {
+	path := "/repo/.github/workflows/local-e2e.yml"
+
+	firstDeleteStarted := make(chan struct{})
+	var firstDeleteOnce sync.Once
+	var recreated atomic.Bool
+	var deleteCalls atomic.Int32
+	var headCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+path:
+			if deleteCalls.Add(1) == 1 {
+				recreated.Store(true)
+				firstDeleteOnce.Do(func() { close(firstDeleteStarted) })
+				<-r.Context().Done()
+				return
+			}
+			http.Error(w, "must not delete recreated path", http.StatusInternalServerError)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+path:
+			headCalls.Add(1)
+			w.Header().Set("Content-Length", "6172")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			if recreated.Load() {
+				w.Header().Set("X-Dat9-Revision", "2")
+			} else {
+				w.Header().Set("X-Dat9-Revision", "1")
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	parentIno := fs.inodes.Lookup("/repo/.github/workflows", true, 0, time.Now())
+	fs.inodes.Lookup(path, false, 6172, time.Now())
+
+	cancel := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Unlink(cancel, &gofuse.InHeader{NodeId: parentIno}, "local-e2e.yml")
+	}()
+
+	select {
+	case <-firstDeleteStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first delete request")
+	}
+
+	select {
+	case st := <-done:
+		if st != gofuse.EAGAIN {
+			t.Fatalf("Unlink status = %v, want EAGAIN", st)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Unlink timed out")
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Fatalf("delete calls = %d, want 1", got)
+	}
+	if got := headCalls.Load(); got == 0 {
+		t.Fatal("delete recovery did not stat the remote path after interruption")
+	}
+	if _, ok := fs.inodes.GetInode(path); !ok {
+		t.Fatal("failed unlink should keep the local inode")
+	}
+}
+
+func TestUnlinkRemoteDeleteAcceptsGoneAfterInterrupt(t *testing.T) {
+	path := "/repo/AGENTS.md"
+
+	firstDeleteStarted := make(chan struct{})
+	var firstDeleteOnce sync.Once
+	var deleted atomic.Bool
+	var deleteCalls atomic.Int32
+	var headCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+path:
+			if deleteCalls.Add(1) == 1 {
+				deleted.Store(true)
+				firstDeleteOnce.Do(func() { close(firstDeleteStarted) })
+				<-r.Context().Done()
+				return
+			}
+			http.Error(w, "already deleted", http.StatusNotFound)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+path:
+			headCalls.Add(1)
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", "10011")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	parentIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	fs.inodes.Lookup(path, false, 10011, time.Now())
+
+	cancel := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Unlink(cancel, &gofuse.InHeader{NodeId: parentIno}, "AGENTS.md")
+	}()
+
+	select {
+	case <-firstDeleteStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first delete request")
+	}
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("Unlink status = %v, want OK", st)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Unlink timed out")
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Fatalf("delete calls = %d, want 1", got)
+	}
+	if got := headCalls.Load(); got == 0 {
+		t.Fatal("delete retry did not confirm the remote path was gone")
+	}
+	if _, ok := fs.inodes.GetInode(path); ok {
+		t.Fatal("unlinked path still has an inode")
+	}
+}
+
+func TestRmdirRemoteDeleteDoesNotRetryRecreatedPathAfterInterrupt(t *testing.T) {
+	path := "/repo/emptydir"
+
+	firstDeleteStarted := make(chan struct{})
+	var firstDeleteOnce sync.Once
+	var recreated atomic.Bool
+	var deleteCalls atomic.Int32
+	var headCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+path:
+			if deleteCalls.Add(1) == 1 {
+				recreated.Store(true)
+				firstDeleteOnce.Do(func() { close(firstDeleteStarted) })
+				<-r.Context().Done()
+				return
+			}
+			http.Error(w, "must not delete recreated path", http.StatusInternalServerError)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+path:
+			headCalls.Add(1)
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "true")
+			if recreated.Load() {
+				w.Header().Set("X-Dat9-Revision", "2")
+			} else {
+				w.Header().Set("X-Dat9-Revision", "1")
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	parentIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	fs.inodes.Lookup(path, true, 0, time.Now())
+
+	cancel := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Rmdir(cancel, &gofuse.InHeader{NodeId: parentIno}, "emptydir")
+	}()
+
+	select {
+	case <-firstDeleteStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first delete request")
+	}
+
+	select {
+	case st := <-done:
+		if st != gofuse.EAGAIN {
+			t.Fatalf("Rmdir status = %v, want EAGAIN", st)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Rmdir timed out")
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Fatalf("delete calls = %d, want 1", got)
+	}
+	if got := headCalls.Load(); got == 0 {
+		t.Fatal("rmdir recovery did not stat the remote path after interruption")
+	}
+	if _, ok := fs.inodes.GetInode(path); !ok {
+		t.Fatal("failed rmdir should keep the local inode")
+	}
+}
+
 func TestRenameRemoteWithTransientRetryRetriesAfterInterrupt(t *testing.T) {
 	oldP := "/repo/.git/objects/e6/tmp_obj_XyNuJc"
 	newP := "/repo/.git/objects/e6/d0788db28a1c0860d85a7f9181233b37665bce"

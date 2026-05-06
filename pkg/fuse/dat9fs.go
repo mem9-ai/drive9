@@ -966,6 +966,13 @@ func (fs *Dat9FS) remoteRenameCommittedDetached(oldP, newP string) bool {
 	return isNotFoundErr(sourceErr)
 }
 
+func (fs *Dat9FS) remotePathGoneDetached(localPath string) bool {
+	retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+	defer retryCancel()
+	_, err := fs.client.StatCtx(retryCtx, fs.remotePath(localPath))
+	return isNotFoundErr(err)
+}
+
 func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string) error {
 	apiPath := fs.remotePath(localPath)
 	ctx, cf := fuseCtx(cancel)
@@ -1007,6 +1014,22 @@ func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPat
 		lastErr = err
 	}
 	return lastErr
+}
+
+func (fs *Dat9FS) deleteRemoteWithInterruptRecovery(ctx context.Context, localPath string) error {
+	err := fs.client.DeleteCtx(ctx, fs.remotePath(localPath))
+	if err == nil || !isTransientLookupErr(err) {
+		return err
+	}
+
+	// If the FUSE request was interrupted after the server committed the delete,
+	// the path is already gone. Confirm that detached from the canceled request.
+	// If the path still exists, do not retry a path-only DELETE: another actor
+	// may have recreated the same name after the ambiguous first delete.
+	if fs.remotePathGoneDetached(localPath) {
+		return nil
+	}
+	return err
 }
 
 func (fs *Dat9FS) renameRemoteWithTransientRetry(ctx context.Context, oldP, newP string) error {
@@ -1532,7 +1555,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		// Tolerate 404 in case it was already deleted.
 		deleteStart := time.Now()
 		fs.debugf("unlink remote delete start path=%s", childP)
-		err := fs.client.DeleteCtx(ctx, fs.remotePath(childP))
+		err := fs.deleteRemoteWithInterruptRecovery(ctx, childP)
 		fs.debugDurationf(deleteStart, 0, "unlink remote delete done path=%s err=%v", childP, err)
 		if err != nil {
 			if !isNotFoundErr(err) {
@@ -1569,7 +1592,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 
 	deleteStart := time.Now()
 	fs.debugf("rmdir remote delete start path=%s", childP)
-	err := fs.client.DeleteCtx(ctx, fs.remotePath(childP))
+	err := fs.deleteRemoteWithInterruptRecovery(ctx, childP)
 	fs.debugDurationf(deleteStart, 0, "rmdir remote delete done path=%s err=%v", childP, err)
 	if err != nil {
 		status = httpToFuseStatus(err)
