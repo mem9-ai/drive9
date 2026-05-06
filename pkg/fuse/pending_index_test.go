@@ -66,7 +66,7 @@ func TestPendingIndexRenamePending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = idx.PutWithBaseRev("/old/file.txt", 512, PendingOverwrite, 11)
+	_, err = idx.PutShadowSpill("/old/file.txt", 512, PendingOverwrite, 11)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,6 +88,9 @@ func TestPendingIndexRenamePending(t *testing.T) {
 	}
 	if meta.Size != 512 {
 		t.Errorf("size = %d, want 512", meta.Size)
+	}
+	if !meta.ShadowSpill {
+		t.Error("ShadowSpill = false, want true")
 	}
 	if meta.Kind != PendingOverwrite {
 		t.Errorf("kind = %d, want PendingOverwrite", meta.Kind)

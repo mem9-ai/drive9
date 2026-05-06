@@ -24,13 +24,15 @@ const commitQueueDirectPutThreshold = client.DefaultSmallFileThreshold
 
 // CommitEntry represents a pending remote commit.
 type CommitEntry struct {
-	Path        string
-	Inode       uint64
-	BaseRev     int64 // revision when we started editing
-	Size        int64
-	Kind        PendingKind
-	ShadowSpill bool // true when data is only in shadow file (auto-resolve would OOM)
-	canceled    bool
+	Path         string
+	Inode        uint64
+	BaseRev      int64 // revision when we started editing
+	Size         int64
+	Kind         PendingKind
+	ShadowSpill  bool // true when data is only in shadow file (auto-resolve would OOM)
+	canceled     bool
+	cancelCommit context.CancelFunc
+	cancelUpload context.CancelFunc
 }
 
 // CommitSuccessFunc is called after a commit queue entry is successfully
@@ -272,14 +274,45 @@ func (cq *CommitQueue) WaitPrefix(prefix string) {
 // entry-scoped so future files that reuse the same path (for example git's
 // config.lock) are not poisoned by an old cancellation.
 func (cq *CommitQueue) CancelPath(path string) {
+	cq.cancelPath(path, false)
+}
+
+// CancelPathPreserveLocal cancels queued or in-flight uploads for path without
+// removing the local shadow/index state. Rename uses this for Git's loose-object
+// temp files: the temp upload must stop, but the bytes must survive while the
+// pending entry moves to the content-addressed final path.
+func (cq *CommitQueue) CancelPathPreserveLocal(path string) {
+	cq.cancelPath(path, true)
+}
+
+func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
+	var cancels []context.CancelFunc
+	seen := make(map[*CommitEntry]struct{})
+	markCanceled := func(e *CommitEntry) {
+		if e == nil {
+			return
+		}
+		e.canceled = true
+		if _, ok := seen[e]; ok {
+			return
+		}
+		seen[e] = struct{}{}
+		if e.cancelCommit != nil {
+			cancels = append(cancels, e.cancelCommit)
+		}
+		if e.cancelUpload != nil {
+			cancels = append(cancels, e.cancelUpload)
+		}
+	}
+
 	cq.mu.Lock()
 	if e, ok := cq.inFlight[path]; ok {
-		e.canceled = true
+		markCanceled(e)
 	}
 	remaining := cq.queue[:0]
 	for _, e := range cq.queue {
 		if e.Path == path {
-			e.canceled = true
+			markCanceled(e)
 			continue
 		}
 		remaining = append(remaining, e)
@@ -287,6 +320,12 @@ func (cq *CommitQueue) CancelPath(path string) {
 	cq.queue = remaining
 	cq.mu.Unlock()
 
+	for _, cancel := range cancels {
+		cancel()
+	}
+	if preserveLocal {
+		return
+	}
 	if cq.shadows != nil {
 		cq.shadows.Remove(path)
 	}
@@ -302,15 +341,33 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	cq.mu.Lock()
 	var remaining []*CommitEntry
 	var cancelled []string
+	var cancels []context.CancelFunc
+	seen := make(map[*CommitEntry]struct{})
+	markCanceled := func(e *CommitEntry) {
+		if e == nil {
+			return
+		}
+		e.canceled = true
+		if _, ok := seen[e]; ok {
+			return
+		}
+		seen[e] = struct{}{}
+		if e.cancelCommit != nil {
+			cancels = append(cancels, e.cancelCommit)
+		}
+		if e.cancelUpload != nil {
+			cancels = append(cancels, e.cancelUpload)
+		}
+	}
 	for p, e := range cq.inFlight {
 		if strings.HasPrefix(p, prefix) {
-			e.canceled = true
+			markCanceled(e)
 			cancelled = append(cancelled, p)
 		}
 	}
 	for _, e := range cq.queue {
 		if strings.HasPrefix(e.Path, prefix) {
-			e.canceled = true
+			markCanceled(e)
 			cancelled = append(cancelled, e.Path)
 		} else {
 			remaining = append(remaining, e)
@@ -319,6 +376,9 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	cq.queue = remaining
 	cq.mu.Unlock()
 
+	for _, cancel := range cancels {
+		cancel()
+	}
 	for _, p := range cancelled {
 		if cq.shadows != nil {
 			cq.shadows.Remove(p)
@@ -373,6 +433,25 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 	const baseDelay = 200 * time.Millisecond
 	const maxDelay = 30 * time.Second
 
+	entryCtx, entryCancel := context.WithCancel(context.Background())
+	cq.mu.Lock()
+	if entry.canceled {
+		cq.mu.Unlock()
+		entryCancel()
+		cq.removeFromQueue(entry)
+		log.Printf("commit queue: entry for %s was canceled before retry loop", entry.Path)
+		return
+	}
+	entry.cancelCommit = entryCancel
+	cq.mu.Unlock()
+	defer func() {
+		cq.mu.Lock()
+		entry.cancelCommit = nil
+		entry.cancelUpload = nil
+		cq.mu.Unlock()
+		entryCancel()
+	}()
+
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		// Re-check cancelation between retries.
@@ -387,20 +466,43 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			if delay > maxDelay {
 				delay = maxDelay
 			}
-			time.Sleep(delay)
+			if !sleepWithCancel(entryCtx, delay) {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: entry for %s was canceled during retry backoff", entry.Path)
+				return
+			}
 		}
 
 		timeout := uploadTimeout
 		if entry.ShadowSpill {
 			timeout = releaseTimeout(entry.Size)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(entryCtx, timeout)
+		cq.mu.Lock()
+		if entry.canceled {
+			cq.mu.Unlock()
+			cancel()
+			cq.removeFromQueue(entry)
+			log.Printf("commit queue: entry for %s was canceled before upload", entry.Path)
+			return
+		}
+		entry.cancelUpload = cancel
+		cq.mu.Unlock()
+
 		committedRev, err := cq.uploadEntry(ctx, entry)
+		cq.mu.Lock()
+		entry.cancelUpload = nil
+		cq.mu.Unlock()
 		cancel()
 
 		if err == nil {
 			// Success — clean up.
 			cq.onCommitSuccess(entry, committedRev)
+			return
+		}
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			log.Printf("commit queue: entry for %s was canceled during upload", entry.Path)
 			return
 		}
 		if errors.Is(err, client.ErrConflict) {
@@ -414,6 +516,29 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 
 	log.Printf("commit queue: giving up on %s after %d retries: %v", entry.Path, maxRetries, lastErr)
 	cq.onCommitTerminalFailure(entry)
+}
+
+func sleepWithCancel(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// CommitNow uploads an entry synchronously through the same commit path used
+// by workers. It is used as a fallback when the async queue rejects an entry
+// after local state has already moved to the final path.
+func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error {
+	committedRev, err := cq.uploadEntry(ctx, entry)
+	if err != nil {
+		return err
+	}
+	cq.onCommitSuccess(entry, committedRev)
+	return nil
 }
 
 // uploadEntry uploads entry data to the server. Returns (committedRev, error).

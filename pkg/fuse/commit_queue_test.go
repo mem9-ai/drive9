@@ -5,7 +5,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -210,6 +212,70 @@ func TestCommitQueueCancelPathDoesNotPoisonFutureSamePath(t *testing.T) {
 	}
 	if shadow.Has(path) {
 		t.Fatal("shadow should be removed after new entry commits")
+	}
+}
+
+func TestCommitQueueCancelPathCancelsRetryBackoff(t *testing.T) {
+	const path = "/retry.txt"
+	var calls atomic.Int32
+	firstAttemptDone := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			call := calls.Add(1)
+			http.Error(w, `{"error":"temporary"}`, http.StatusServiceUnavailable)
+			if call == 1 {
+				close(firstAttemptDone)
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(path, []byte("data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(path, 4, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	if err := cq.Enqueue(&CommitEntry{Path: path, Size: 4, Kind: PendingNew}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-firstAttemptDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first upload attempt did not finish")
+	}
+
+	start := time.Now()
+	cq.CancelPath(path)
+	done := make(chan struct{})
+	go func() {
+		cq.WaitPath(path)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("WaitPath did not unblock during retry backoff cancellation")
+	}
+	if elapsed := time.Since(start); elapsed >= 150*time.Millisecond {
+		t.Fatalf("cancel during backoff took %s, want <150ms", elapsed)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("upload attempts after cancellation = %d, want 1", got)
 	}
 }
 

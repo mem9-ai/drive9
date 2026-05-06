@@ -173,13 +173,14 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 	// Copy fields under read lock.
 	gen := idx.nextGen.Add(1)
 	newMeta := &WriteBackMeta{
-		Path:       newPath,
-		Size:       meta.Size,
-		Mtime:      meta.Mtime,
-		CreatedAt:  meta.CreatedAt,
-		Generation: gen,
-		Kind:       meta.Kind,
-		BaseRev:    meta.BaseRev,
+		Path:        newPath,
+		Size:        meta.Size,
+		Mtime:       meta.Mtime,
+		CreatedAt:   meta.CreatedAt,
+		Generation:  gen,
+		Kind:        meta.Kind,
+		BaseRev:     meta.BaseRev,
+		ShadowSpill: meta.ShadowSpill,
 	}
 	idx.mu.RUnlock()
 
