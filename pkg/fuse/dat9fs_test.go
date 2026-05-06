@@ -3516,3 +3516,347 @@ func TestIsTransientReadErr(t *testing.T) {
 		})
 	}
 }
+
+// TestLocalMutations_NoKernelNotify verifies that local FUSE mutations
+// (Create, Mkdir, Unlink, Rmdir, Rename) do NOT produce kernel
+// notifyEntry/notifyInode calls. The kernel already knows the result
+// of its own syscalls via the FUSE reply — redundant notify floods
+// the FUSE channel and causes EAGAIN under load (git clone).
+func TestLocalMutations_NoKernelNotify(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "100")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPost:
+			w.WriteHeader(http.StatusOK)
+		case http.MethodDelete:
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	// Pre-populate inodes for mutation targets.
+	fs.inodes.Lookup("/existing.txt", false, 100, time.Now())
+	fs.inodes.Lookup("/oldname.txt", false, 100, time.Now())
+	fs.inodes.Lookup("/existingdir", true, 0, time.Now())
+
+	tests := []struct {
+		name string
+		fn   func() gofuse.Status
+	}{
+		{
+			name: "Create",
+			fn: func() gofuse.Status {
+				var out gofuse.CreateOut
+				return fs.Create(nil, &gofuse.CreateIn{
+					InHeader: gofuse.InHeader{NodeId: 1},
+				}, "new.txt", &out)
+			},
+		},
+		{
+			name: "Mkdir",
+			fn: func() gofuse.Status {
+				var out gofuse.EntryOut
+				return fs.Mkdir(nil, &gofuse.MkdirIn{
+					InHeader: gofuse.InHeader{NodeId: 1},
+				}, "newdir", &out)
+			},
+		},
+		{
+			name: "Unlink",
+			fn: func() gofuse.Status {
+				return fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "existing.txt")
+			},
+		},
+		{
+			name: "Rmdir",
+			fn: func() gofuse.Status {
+				return fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "existingdir")
+			},
+		},
+		{
+			name: "Rename",
+			fn: func() gofuse.Status {
+				return fs.Rename(nil, &gofuse.RenameIn{
+					InHeader: gofuse.InHeader{NodeId: 1},
+					Newdir:   1,
+				}, "oldname.txt", "renamed.txt")
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			before := fs.notifyCount.Load()
+			st := tc.fn()
+			after := fs.notifyCount.Load()
+			if st != gofuse.OK {
+				t.Fatalf("%s returned %v, want OK", tc.name, st)
+			}
+			if delta := after - before; delta != 0 {
+				t.Fatalf("%s produced %d kernel notify calls, want 0", tc.name, delta)
+			}
+		})
+	}
+}
+
+// TestCreateWriteFlushRelease_NoKernelNotify verifies that the full
+// create→write→flush→release lifecycle produces zero kernel notify calls
+// AND that userspace visibility is preserved (inode size, dirCache).
+func TestCreateWriteFlushRelease_NoKernelNotify(t *testing.T) {
+	ts, uploadedCh := newTestServer(t)
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	before := fs.notifyCount.Load()
+
+	// Create
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "hook.sample", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+
+	wantData := []byte("#!/bin/sh\nexit 0\n")
+
+	// Write
+	_, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}, wantData)
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	// Flush
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	if st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+
+	// Release
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+
+	// Wait for commit queue upload.
+	select {
+	case <-uploadedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("commit queue upload timed out")
+	}
+
+	// Allow async commit queue success callback to run.
+	time.Sleep(50 * time.Millisecond)
+
+	after := fs.notifyCount.Load()
+	if delta := after - before; delta != 0 {
+		t.Fatalf("create→write→flush→release→commit produced %d kernel notify calls, want 0", delta)
+	}
+
+	// Verify userspace state is still correct despite no kernel notify.
+	// This is the key behavioral assertion: "no notify AND no visibility regression".
+
+	// 1. Inode size should reflect the written data.
+	wantSize := int64(len(wantData))
+	entry, ok := fs.inodes.GetEntry(createOut.NodeId)
+	if !ok {
+		t.Fatal("inode entry not found after commit")
+	}
+	if entry.Size != wantSize {
+		t.Fatalf("inode size = %d, want %d", entry.Size, wantSize)
+	}
+
+	// 2. dirCache for parent should have been invalidated (not stale).
+	if _, cached := fs.dirCache.Get("/"); cached {
+		t.Fatal("parent dirCache should have been invalidated after create+commit")
+	}
+}
+
+// TestOnCommitQueueSuccess_NoKernelNotify_SeedsReadCache verifies that
+// onCommitQueueSuccess updates userspace state (readCache, inode revision/size)
+// without producing kernel notify calls. This is the mechanism that ensures
+// same-mount read-after-close returns correct content.
+func TestOnCommitQueueSuccess_NoKernelNotify_SeedsReadCache(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	// Set up shadowStore with test data (simulates what Flush stages).
+	shadowDir := t.TempDir()
+	shadow, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+
+	wantData := []byte("#!/bin/sh\nexit 0\n")
+
+	// Pre-populate inode and write shadow data (mimics Flush staging).
+	ino := fs.inodes.Lookup("/hook.sample", false, 0, time.Now())
+	if err := shadow.WriteFull("/hook.sample", wantData, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	before := fs.notifyCount.Load()
+
+	// Simulate commit queue success callback.
+	fs.onCommitQueueSuccess(&CommitEntry{
+		Path:  "/hook.sample",
+		Inode: ino,
+		Size:  int64(len(wantData)),
+	}, 42) // committedRev=42
+
+	after := fs.notifyCount.Load()
+	if delta := after - before; delta != 0 {
+		t.Fatalf("onCommitQueueSuccess produced %d kernel notify calls, want 0", delta)
+	}
+
+	// Verify readCache was seeded with correct data.
+	cachedData, hit := fs.readCache.Get("/hook.sample", 0)
+	if !hit {
+		t.Fatal("readCache miss after onCommitQueueSuccess — read-after-close would hit remote")
+	}
+	if string(cachedData) != string(wantData) {
+		t.Fatalf("readCache content = %q, want %q", cachedData, wantData)
+	}
+
+	// Verify inode revision and size updated.
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Size != int64(len(wantData)) {
+		t.Fatalf("inode size = %d, want %d", entry.Size, len(wantData))
+	}
+
+	// Verify dirCache was invalidated.
+	if _, cached := fs.dirCache.Get("/"); cached {
+		t.Fatal("parent dirCache should have been invalidated")
+	}
+}
+
+// TestSSEForeignChange_StillNotifiesKernel verifies that SSE-driven
+// invalidation (from a foreign actor) still produces kernel notify calls
+// through the actual SSEWatcher.handleEvent code path. Only local-initiated
+// operations skip notify; external changes must invalidate the kernel cache.
+func TestSSEForeignChange_StillNotifiesKernel(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	// Pre-populate an inode so SSE invalidation has something to notify.
+	fs.inodes.Lookup("/remote-file.txt", false, 100, time.Now())
+
+	// Create an SSEWatcher with our own actor ID.
+	w := &SSEWatcher{fs: fs, actor: "mount-abc"}
+
+	// --- Foreign actor change event → should notify kernel ---
+	before := fs.notifyCount.Load()
+	w.handleEvent(&client.ChangeEvent{
+		Path:  "/remote-file.txt",
+		Op:    "write",
+		Actor: "other-mount-xyz",
+	}, nil)
+	afterChange := fs.notifyCount.Load()
+	if delta := afterChange - before; delta == 0 {
+		t.Fatal("SSE foreign ChangeEvent produced 0 kernel notify calls, want >0")
+	}
+
+	// --- Own actor change event → should NOT notify kernel ---
+	before2 := fs.notifyCount.Load()
+	w.handleEvent(&client.ChangeEvent{
+		Path:  "/remote-file.txt",
+		Op:    "write",
+		Actor: "mount-abc", // same as our actor
+	}, nil)
+	afterSelf := fs.notifyCount.Load()
+	if delta := afterSelf - before2; delta != 0 {
+		t.Fatalf("SSE own-actor ChangeEvent produced %d kernel notify calls, want 0", delta)
+	}
+
+	// --- Foreign structural reset → should notify kernel ---
+	before3 := fs.notifyCount.Load()
+	w.handleEvent(nil, &client.ResetEvent{
+		Reason: "structural_change",
+		Actor:  "other-mount-xyz",
+	})
+	afterReset := fs.notifyCount.Load()
+	if delta := afterReset - before3; delta == 0 {
+		t.Fatal("SSE foreign ResetEvent produced 0 kernel notify calls, want >0")
+	}
+
+	// --- Own actor structural reset → should NOT notify kernel ---
+	before4 := fs.notifyCount.Load()
+	w.handleEvent(nil, &client.ResetEvent{
+		Reason: "structural_change",
+		Actor:  "mount-abc",
+	})
+	afterSelfReset := fs.notifyCount.Load()
+	if delta := afterSelfReset - before4; delta != 0 {
+		t.Fatalf("SSE own-actor ResetEvent produced %d kernel notify calls, want 0", delta)
+	}
+}
+
+// TestSetAttr_NoKernelNotify verifies that SetAttr (truncate) does not
+// produce redundant kernel notify. The kernel receives updated attrs
+// via the SetAttr reply itself.
+func TestSetAttr_NoKernelNotify(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	ino := fs.inodes.Lookup("/trunc.txt", false, 100, time.Now())
+
+	// Open with O_RDWR so there's a dirty handle for truncate.
+	fh := &FileHandle{
+		Ino:   ino,
+		Path:  "/trunc.txt",
+		Flags: uint32(syscall.O_RDWR),
+		Dirty: NewWriteBuffer("/trunc.txt", 100, 8*1024*1024),
+	}
+	fhID := fs.fileHandles.Allocate(fh)
+
+	before := fs.notifyCount.Load()
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE | gofuse.FATTR_FH,
+			Fh:      fhID,
+			Size:    0,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr: %v", st)
+	}
+
+	after := fs.notifyCount.Load()
+	if delta := after - before; delta != 0 {
+		t.Fatalf("SetAttr produced %d kernel notify calls, want 0", delta)
+	}
+}
