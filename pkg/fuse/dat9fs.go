@@ -1079,6 +1079,8 @@ func (fs *Dat9FS) shouldPreserveForgottenInode(entry *InodeEntry) bool {
 }
 
 func (fs *Dat9FS) hasOpenHandle(ino uint64, p string) bool {
+	// TODO: if git/package-manager workloads keep many handles open, maintain
+	// path/inode indexes instead of scanning the whole handle table.
 	for _, fh := range fs.fileHandles.Snapshot() {
 		if fh == nil {
 			continue
@@ -2825,6 +2827,9 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
 		defer func() {
+			if fh.Prefetch != nil {
+				fh.Prefetch.Close()
+			}
 			fs.fileHandles.Delete(input.Fh)
 			fs.cleanupReleasedInode(fh.Ino, fh.Path)
 		}()
@@ -2910,10 +2915,6 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			fs.notifyInode(fh.Ino)
 			parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
 			fs.notifyInode(parentIno)
-			if fh.Prefetch != nil {
-				fh.Prefetch.Close()
-			}
-			fs.fileHandles.Delete(input.Fh)
 			return
 		}
 
@@ -2983,12 +2984,6 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				fs.notifyInode(fh.Ino)
 				parentIno, _ := fs.inodes.GetInode(parentDir(fh.Path))
 				fs.notifyInode(parentIno)
-
-				// Close prefetcher to cancel inflight goroutines.
-				if fh.Prefetch != nil {
-					fh.Prefetch.Close()
-				}
-				fs.fileHandles.Delete(input.Fh)
 				return
 			}
 			// Stale cache — remove it, fall through to sync upload.
@@ -3032,12 +3027,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			log.Printf("flush failed for %s (status %d), aborted stream upload", fh.Path, st)
 		}
 
-		// Close prefetcher to cancel inflight goroutines.
-		if fh.Prefetch != nil {
-			fh.Prefetch.Close()
-		}
 	}
-	fs.fileHandles.Delete(input.Fh)
 }
 
 // flushHandleDebounced wraps flushHandle with optional debouncing for small files.

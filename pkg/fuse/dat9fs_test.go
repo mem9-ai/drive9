@@ -1328,6 +1328,38 @@ func TestForgetPreservesQueuedCommitInodeUntilCleanup(t *testing.T) {
 	}
 }
 
+func TestReleaseCleansForgottenInodeWithoutLocalState(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+
+	const p = "/config.lock"
+	ino := fs.inodes.Lookup(p, false, 7, time.Now())
+
+	var openOut gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	fs.Forget(ino, 1)
+	if _, ok := fs.inodes.GetPath(ino); !ok {
+		t.Fatal("Forget removed inode mapping while file handle was still open")
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+
+	if _, ok := fs.fileHandles.Get(openOut.Fh); ok {
+		t.Fatal("Release left closed file handle in handle table")
+	}
+	if _, ok := fs.inodes.GetPath(ino); ok {
+		t.Fatal("Release cleanup left forgotten inode mapping after local state was gone")
+	}
+}
+
 func TestStatFs_ReportsVirtualCapacity(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
