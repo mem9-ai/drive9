@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mem9-ai/dat9/pkg/buildinfo"
 	"github.com/mem9-ai/dat9/pkg/client"
 	drive9fuse "github.com/mem9-ai/dat9/pkg/fuse"
 	"github.com/mem9-ai/dat9/pkg/mountpath"
@@ -40,6 +41,7 @@ var mountFuse = drive9fuse.Mount
 // a positional-arity error rather than by pre-reserving backend-shaped
 // words that do not exist yet.
 func MountCmd(args []string) error {
+	fmt.Fprint(os.Stderr, buildinfo.String("drive9 mount"))
 	if len(args) > 0 {
 		if args[0] == "vault" {
 			return VaultMountCmd(args[1:])
@@ -152,7 +154,7 @@ func fsMountCmd(args []string) error {
 
 	// Resolve auto mode to a concrete backend.
 	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
-	fmt.Fprintf(os.Stderr, "dat9: mount mode: %s\n", resolved)
+	fmt.Fprintf(os.Stderr, "drive9: mount mode: %s\n", resolved)
 
 	if resolved == MountModeWebDAV && *readOnly {
 		return fmt.Errorf("drive9 mount: --read-only is not supported with WebDAV mode")
@@ -231,7 +233,7 @@ func validateRemoteRoot(c *client.Client, remoteRoot string) error {
 	if remoteRoot == "/" {
 		// Root always exists; verify server connectivity via List.
 		if _, err := c.List("/"); err != nil {
-			return fmt.Errorf("cannot reach dat9 server: %w", err)
+			return fmt.Errorf("cannot reach drive9 server: %w", err)
 		}
 		return nil
 	}

@@ -2049,6 +2049,10 @@ func TestRmdir_CleansPendingDescendants(t *testing.T) {
 // and that migrated descendants are actually uploaded to the new paths.
 func TestRename_Directory_MigratesPendingDescendants(t *testing.T) {
 	var uploadedPaths sync.Map
+	allowUploadResponses := make(chan struct{})
+	var allowUploadResponsesOnce sync.Once
+	defer allowUploadResponsesOnce.Do(func() { close(allowUploadResponses) })
+
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodHead:
@@ -2061,6 +2065,7 @@ func TestRename_Directory_MigratesPendingDescendants(t *testing.T) {
 		case http.MethodPut:
 			_, _ = io.ReadAll(r.Body)
 			uploadedPaths.Store(r.URL.Path, true)
+			<-allowUploadResponses
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusOK)
@@ -2121,6 +2126,7 @@ func TestRename_Directory_MigratesPendingDescendants(t *testing.T) {
 	}
 
 	// Drain uploader — migrated descendants should be uploaded to NEW paths.
+	allowUploadResponsesOnce.Do(func() { close(allowUploadResponses) })
 	uploader.DrainAll()
 
 	// Verify uploads happened at new paths, not old paths.

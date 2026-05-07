@@ -183,6 +183,7 @@ func TestF_ImportStoresDelegatedContext(t *testing.T) {
 	got := cfg.Contexts["alice-prod-db"]
 	if got == nil {
 		t.Fatalf("context %q missing", "alice-prod-db")
+		return
 	}
 	if got.Type != PrincipalDelegated {
 		t.Errorf("type = %q, want delegated", got.Type)

@@ -207,6 +207,23 @@ func TestExtractTextUsesEmbeddingSafeLimit(t *testing.T) {
 	if got := extractText([]byte("hello"), "text/plain"); got != "hello" {
 		t.Fatalf("small text extracted as %q, want hello", got)
 	}
+	if got := extractText([]byte{0x66, 0x6f, 0x80}, "text/plain"); got != "" {
+		t.Fatalf("invalid UTF-8 text should not be extracted, got %q", got)
+	}
+}
+
+func TestDetectContentTypeRequiresValidUTF8ForText(t *testing.T) {
+	data := []byte{0x78, 0x01, 0x95, 0x90, 0xbd, 0x6a}
+	if got := detectContentType("/objects/61/31ee8937c5f0aff1268064d5f2218d7d240056", data); got != "application/octet-stream" {
+		t.Fatalf("content type=%q, want application/octet-stream", got)
+	}
+	gbkCSV := []byte{0xb0, 0xa1, ',', 'x', '\n'}
+	if got := detectContentType("/data/gbk.csv", gbkCSV); got != "application/octet-stream" {
+		t.Fatalf("content type=%q, want application/octet-stream for invalid UTF-8 text extension", got)
+	}
+	if got := detectContentType("/config.json", gbkCSV); got != "application/octet-stream" {
+		t.Fatalf("content type=%q, want application/octet-stream for invalid UTF-8 JSON extension", got)
+	}
 }
 
 func TestWriteAndRead(t *testing.T) {

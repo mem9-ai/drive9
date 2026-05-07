@@ -432,6 +432,7 @@ func TestColumnTypeMismatchSchemaVersionPlansRepair(t *testing.T) {
 	}
 	if typeDiff == nil {
 		t.Fatal("expected a column_type_mismatch diff for schema_version, got none")
+		return
 	}
 	if typeDiff.repairSQL == "" {
 		t.Fatal("expected repairSQL to be set for schema_version type mismatch")
