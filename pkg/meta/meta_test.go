@@ -160,7 +160,7 @@ func TestRevokeAPIKeyByName(t *testing.T) {
 	if got.APIKey.Status != APIKeyRevoked {
 		t.Fatalf("key status = %s, want %s", got.APIKey.Status, APIKeyRevoked)
 	}
-	if got.APIKey.RevokedAt == nil || !got.APIKey.RevokedAt.Equal(revokedAt.Truncate(time.Millisecond)) {
+	if got.APIKey.RevokedAt == nil || !got.APIKey.RevokedAt.Equal(revokedAt.Round(time.Millisecond)) {
 		t.Fatalf("revoked_at = %v, want %v", got.APIKey.RevokedAt, revokedAt)
 	}
 
