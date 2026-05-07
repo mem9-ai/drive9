@@ -141,11 +141,16 @@ const fuseTimeout = 30 * time.Second
 const (
 	// lookupTransientRetryCount is the number of detached retries after the
 	// initial Lookup StatCtx attempt fails with a transient error.
-	lookupTransientRetryCount = 2
+	// Raised from 2 to 3 to tolerate E2B/high-latency environments where
+	// concurrent git checkout triggers kernel FUSE interrupts on Lookup.
+	lookupTransientRetryCount = 3
 
-	// lookupTransientRetryTimeout keeps each detached retry short so interrupted
-	// lookups do not block the caller for long.
-	lookupTransientRetryTimeout = 250 * time.Millisecond
+	// lookupTransientRetryTimeout is the timeout per detached retry. Set to
+	// 2s (up from 250ms) so that retries can complete a full HTTP round-trip
+	// in high-latency environments (E2B sandbox → drive9 server can be
+	// 100-200ms RTT). The previous 250ms was barely above one RTT, leaving
+	// almost no margin for server processing or network jitter.
+	lookupTransientRetryTimeout = 2 * time.Second
 
 	// lookupRetrySuccessLogEvery controls how often successful retry recovery is
 	// logged, to avoid noisy logs on hot lookup paths.
