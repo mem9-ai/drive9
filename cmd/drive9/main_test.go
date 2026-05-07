@@ -83,6 +83,7 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 		"ctx use <name>",
 		"mount [flags] [:/remote] <mountpoint>",
 		"mount vault [flags] <mountpoint>",
+		"doctor fuse",
 		"-h, --help, help",
 	} {
 		if !strings.Contains(stderr, want) {
@@ -117,6 +118,39 @@ func TestDispatchVaultVerbReachesHandler(t *testing.T) {
 		t.Fatal("vault handler was not invoked for `drive9 vault ...`")
 	}
 	want := []string{"ls", "--json"}
+	if len(gotArgs) != len(want) {
+		t.Fatalf("args = %v, want %v", gotArgs, want)
+	}
+	for i := range want {
+		if gotArgs[i] != want[i] {
+			t.Fatalf("args[%d] = %q, want %q", i, gotArgs[i], want[i])
+		}
+	}
+}
+
+func TestDispatchDoctorVerbReachesHandler(t *testing.T) {
+	origHandler := doctorHandler
+	origExit := exitFunc
+	t.Cleanup(func() {
+		doctorHandler = origHandler
+		exitFunc = origExit
+	})
+	exitFunc = func(int) {}
+
+	var gotArgs []string
+	called := false
+	doctorHandler = func(args []string) error {
+		called = true
+		gotArgs = args
+		return nil
+	}
+
+	dispatch("doctor", []string{"fuse", "--mountpoint", "/mnt/drive9"})
+
+	if !called {
+		t.Fatal("doctor handler was not invoked for `drive9 doctor ...`")
+	}
+	want := []string{"fuse", "--mountpoint", "/mnt/drive9"}
 	if len(gotArgs) != len(want) {
 		t.Fatalf("args = %v, want %v", gotArgs, want)
 	}
