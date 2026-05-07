@@ -11,10 +11,11 @@ const (
 
 // CachedFileInfo matches the client.FileInfo shape but avoids importing client.
 type CachedFileInfo struct {
-	Name  string
-	Size  int64
-	IsDir bool
-	Mtime time.Time
+	Name     string
+	Size     int64
+	IsDir    bool
+	Mtime    time.Time
+	Revision int64
 }
 
 type dirCacheEntry struct {

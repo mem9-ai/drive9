@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -96,6 +97,70 @@ func TestListDir(t *testing.T) {
 	}
 	if len(entries) != 2 {
 		t.Fatalf("expected 2, got %d", len(entries))
+	}
+}
+
+func TestBatchStatCtxPreservesPerPathErrors(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/fs:batch-stat" {
+			t.Fatalf("path = %q, want /v1/fs:batch-stat", r.URL.Path)
+		}
+		var req struct {
+			Paths []string `json:"paths"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if got, want := strings.Join(req.Paths, ","), "/ok.txt,/missing.txt,/ok.txt"; got != want {
+			t.Fatalf("paths = %q, want %q", got, want)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []map[string]any{
+				{"path": "/ok.txt", "status": 200, "size": 7, "isDir": false, "revision": 3, "mtime": 11},
+				{"path": "/missing.txt", "status": 404, "error": "not found"},
+				{"path": "/ok.txt", "status": 200, "size": 7, "isDir": false, "revision": 3, "mtime": 11},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	results, err := c.BatchStatCtx(context.Background(), []string{"/ok.txt", "/missing.txt", "/ok.txt"})
+	if err != nil {
+		t.Fatalf("BatchStatCtx error = %v, want nil", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("results len = %d, want 3", len(results))
+	}
+	if !results[0].OK() || results[0].Revision != 3 || results[0].Size != 7 || results[0].Mtime != 11 {
+		t.Fatalf("first result = %+v, want ok rev=3 size=7 mtime=11", results[0])
+	}
+	if results[1].OK() || results[1].Status != http.StatusNotFound {
+		t.Fatalf("second result = %+v, want per-path 404", results[1])
+	}
+	if !results[2].OK() || results[2].Path != "/ok.txt" {
+		t.Fatalf("third result = %+v, want duplicate ok path", results[2])
+	}
+}
+
+func TestBatchStatCtxRejectsTooManyPathsBeforeRequest(t *testing.T) {
+	var called bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+	defer ts.Close()
+
+	paths := make([]string, MaxBatchStatPaths+1)
+	c := New(ts.URL, "")
+	_, err := c.BatchStatCtx(context.Background(), paths)
+	if err == nil {
+		t.Fatal("BatchStatCtx error = nil, want too-large error")
+	}
+	if called {
+		t.Fatal("server was called despite client-side batch limit")
 	}
 }
 

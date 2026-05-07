@@ -20,6 +20,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/pathutil"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/tagutil"
 	"github.com/mem9-ai/dat9/pkg/tenant"
@@ -83,6 +84,8 @@ type TenantStatusResponse struct {
 	MaxUploadBytes int64  `json:"max_upload_bytes"`
 }
 
+const maxBatchStatPaths = 256
+
 func New(b *backend.Dat9Backend) *Server {
 	return NewWithConfig(Config{Backend: b})
 }
@@ -126,6 +129,7 @@ func NewWithConfig(cfg Config) *Server {
 	} else if cfg.Backend != nil {
 		business = injectFallbackBackend(cfg.Backend, business)
 	}
+	mux.Handle("/v1/fs:batch-stat", business)
 	mux.Handle("/v1/fs/", business)
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
@@ -293,6 +297,8 @@ func (s *Server) ListenAndServe(addr string) error {
 
 func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 	switch {
+	case r.URL.Path == "/v1/fs:batch-stat":
+		s.handleBatchStat(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/fs/"):
 		s.handleFS(w, r)
 	case r.URL.Path == "/v1/uploads/initiate":
@@ -1039,6 +1045,111 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(plan)
+}
+
+type batchStatRequest struct {
+	Paths []string `json:"paths"`
+}
+
+type batchStatResponse struct {
+	Results []batchStatResult `json:"results"`
+}
+
+type batchStatResult struct {
+	Path     string `json:"path"`
+	Status   int    `json:"status"`
+	Error    string `json:"error,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+	IsDir    bool   `json:"isDir"`
+	Revision int64  `json:"revision,omitempty"`
+	Mtime    int64  `json:"mtime,omitempty"`
+}
+
+func (s *Server) handleBatchStat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_stat_method_not_allowed", "method", r.Method)...)
+		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_stat_missing_scope")...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+
+	var req batchStatRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_stat_decode_failed", "error", err)...)
+		errJSON(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if len(req.Paths) > maxBatchStatPaths {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_stat_too_large", "count", len(req.Paths), "limit", maxBatchStatPaths)...)
+		errJSON(w, http.StatusBadRequest, fmt.Sprintf("too many paths: %d exceeds limit %d", len(req.Paths), maxBatchStatPaths))
+		return
+	}
+
+	results := make([]batchStatResult, len(req.Paths))
+	for i, path := range req.Paths {
+		results[i] = s.batchStatOne(r.Context(), b, path)
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "batch_stat_ok", "count", len(results))...)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(batchStatResponse{Results: results})
+}
+
+func (s *Server) batchStatOne(ctx context.Context, b *backend.Dat9Backend, rawPath string) batchStatResult {
+	result := batchStatResult{Path: rawPath}
+	path := rawPath
+	if path == "" {
+		path = "/"
+	}
+	if err := validateBatchStatPath(path); err != nil {
+		result.Status = http.StatusBadRequest
+		result.Error = err.Error()
+		return result
+	}
+	if path == "/" {
+		result.Status = http.StatusOK
+		result.IsDir = true
+		return result
+	}
+
+	nf, err := b.StatNodeLiteCtx(ctx, path)
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			result.Status = http.StatusNotFound
+			result.Error = err.Error()
+			return result
+		}
+		result.Status = http.StatusInternalServerError
+		result.Error = err.Error()
+		return result
+	}
+	result.Status = http.StatusOK
+	result.IsDir = nf.Node.IsDirectory
+	if nf.File != nil {
+		result.Size = nf.File.SizeBytes
+		result.Revision = nf.File.Revision
+		if nf.File.ConfirmedAt != nil {
+			result.Mtime = nf.File.ConfirmedAt.Unix()
+		} else {
+			result.Mtime = nf.File.CreatedAt.Unix()
+		}
+	} else {
+		result.Mtime = nf.Node.CreatedAt.Unix()
+	}
+	return result
+}
+
+func validateBatchStatPath(rawPath string) error {
+	if pathutil.IsDir(rawPath) {
+		_, err := pathutil.CanonicalizeDir(rawPath)
+		return err
+	}
+	_, err := pathutil.Canonicalize(rawPath)
+	return err
 }
 
 func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string) {

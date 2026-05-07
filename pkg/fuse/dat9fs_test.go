@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -773,22 +774,44 @@ func TestLookupUsesRemoteRootMapping(t *testing.T) {
 }
 
 func TestListDirUsesRemoteRootMapping(t *testing.T) {
-	var gotPath string
-	var gotQuery string
+	var gotListPath string
+	var gotListQuery string
+	var gotBatchPath string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotQuery = r.URL.RawQuery
-		if r.Method != http.MethodGet {
-			t.Fatalf("method = %s, want GET", r.Method)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
+			gotListPath = r.URL.Path
+			gotListQuery = r.URL.RawQuery
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []map[string]any{{
+					"name":  "nested.txt",
+					"isDir": false,
+					"size":  7,
+				}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
+			gotBatchPath = r.URL.Path
+			var req struct {
+				Paths []string `json:"paths"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode batch request: %v", err)
+			}
+			if got, want := strings.Join(req.Paths, ","), "/remote/subdir/nested.txt"; got != want {
+				t.Fatalf("batch stat paths = %q, want %q", got, want)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"results": []map[string]any{{
+					"path":     "/remote/subdir/nested.txt",
+					"status":   200,
+					"isDir":    false,
+					"size":     7,
+					"revision": 3,
+				}},
+			})
+		default:
+			t.Fatalf("unexpected request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"entries": []map[string]any{{
-				"name":     "nested.txt",
-				"isDir":    false,
-				"size":     7,
-				"revision": 3,
-			}},
-		})
 	}))
 	defer ts.Close()
 
@@ -800,11 +823,105 @@ func TestListDirUsesRemoteRootMapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listDir error = %v, want nil", err)
 	}
-	if gotPath != "/v1/fs/remote/subdir" || gotQuery != "list=1" {
-		t.Fatalf("listDir request = %q?%s, want /v1/fs/remote/subdir?list=1", gotPath, gotQuery)
+	if gotListPath != "/v1/fs/remote/subdir" || gotListQuery != "list=1" {
+		t.Fatalf("listDir request = %q?%s, want /v1/fs/remote/subdir?list=1", gotListPath, gotListQuery)
+	}
+	if gotBatchPath != "/v1/fs:batch-stat" {
+		t.Fatalf("batch stat path = %q, want /v1/fs:batch-stat", gotBatchPath)
 	}
 	if len(entries) != 1 || entries[0].Name != "nested.txt" {
 		t.Fatalf("listDir entries = %+v, want nested.txt", entries)
+	}
+	entry, ok := fs.inodes.GetEntry(entries[0].Ino)
+	if !ok {
+		t.Fatal("listDir entry inode not found")
+	}
+	if entry.Revision != 3 {
+		t.Fatalf("entry revision = %d, want 3 from batch stat", entry.Revision)
+	}
+}
+
+func TestListDirIgnoresBatchStatPerPathFailure(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []map[string]any{{
+					"name":  "listed.txt",
+					"isDir": false,
+					"size":  9,
+				}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"results": []map[string]any{{
+					"path":   "/listed.txt",
+					"status": 404,
+					"error":  "not found",
+				}},
+			})
+		default:
+			t.Fatalf("unexpected request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	entries, err := fs.listDir(context.Background(), "/")
+	if err != nil {
+		t.Fatalf("listDir error = %v, want nil", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "listed.txt" {
+		t.Fatalf("listDir entries = %+v, want listed.txt despite batch 404", entries)
+	}
+	entry, ok := fs.inodes.GetEntry(entries[0].Ino)
+	if !ok {
+		t.Fatal("listDir entry inode not found")
+	}
+	if entry.Size != 9 || entry.Revision != 0 {
+		t.Fatalf("entry = %+v, want list metadata preserved with no revision", entry)
+	}
+}
+
+func TestListDirIgnoresBatchStatTransportFailure(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []map[string]any{{
+					"name":  "listed.txt",
+					"isDir": false,
+					"size":  9,
+				}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
+			http.Error(w, "batch stat unavailable", http.StatusInternalServerError)
+		default:
+			t.Fatalf("unexpected request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	entries, err := fs.listDir(context.Background(), "/")
+	if err != nil {
+		t.Fatalf("listDir error = %v, want nil", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "listed.txt" {
+		t.Fatalf("listDir entries = %+v, want listed.txt despite batch transport failure", entries)
+	}
+	entry, ok := fs.inodes.GetEntry(entries[0].Ino)
+	if !ok {
+		t.Fatal("listDir entry inode not found")
+	}
+	if entry.Size != 9 || entry.Revision != 0 {
+		t.Fatalf("entry = %+v, want list metadata preserved with no revision", entry)
 	}
 }
 
