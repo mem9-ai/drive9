@@ -184,8 +184,9 @@ func Mount(opts *MountOptions) error {
 	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", resolved)
 
 	// Initialize write-back cache, shadow store, and pending index.
+	var cacheBase, shadowDir string
 	if !opts.ReadOnly {
-		cacheBase := opts.CacheDir
+		cacheBase = opts.CacheDir
 		if cacheBase == "" {
 			home, err := os.UserHomeDir()
 			if err == nil {
@@ -195,7 +196,7 @@ func Mount(opts *MountOptions) error {
 		if cacheBase != "" {
 			mh := MountHash(opts.Server, opts.MountPoint, opts.RemoteRoot)
 			pendingDir := filepath.Join(cacheBase, mh, "pending")
-			shadowDir := filepath.Join(cacheBase, mh, "shadow")
+			shadowDir = filepath.Join(cacheBase, mh, "shadow")
 
 			// Initialize PendingIndex (in-memory authoritative metadata).
 			pendingIdx, err := NewPendingIndex(pendingDir)
@@ -381,7 +382,12 @@ func Mount(opts *MountOptions) error {
 		forceUnmount(opts.MountPoint)
 	}()
 
-	fmt.Fprintf(os.Stderr, "drive9: mounted on %s (server: %s, actor: %s)\n", opts.MountPoint, opts.Server, actorID)
+	if shadowDir != "" {
+		fmt.Fprintf(os.Stderr, "drive9: mounted on %s (server: %s, actor: %s, cache: %s, shadow: %s)\n",
+			opts.MountPoint, opts.Server, actorID, cacheBase, shadowDir)
+	} else {
+		fmt.Fprintf(os.Stderr, "drive9: mounted on %s (server: %s, actor: %s)\n", opts.MountPoint, opts.Server, actorID)
+	}
 	server.Wait()
 	shutdown()
 	return nil
