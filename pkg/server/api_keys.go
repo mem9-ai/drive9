@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -109,6 +111,10 @@ func (s *Server) handleAPIKeyCreate(w http.ResponseWriter, r *http.Request, scop
 		errJSON(w, http.StatusBadRequest, "key_name default is reserved")
 		return
 	}
+	if strings.Contains(keyName, "/") {
+		errJSON(w, http.StatusBadRequest, "key_name must not contain /")
+		return
+	}
 
 	tokenVersion := managedAPITokenVersion()
 	apiToken, err := token.IssueToken(s.tokenSecret, scope.TenantID, tokenVersion)
@@ -137,13 +143,14 @@ func (s *Server) handleAPIKeyCreate(w http.ResponseWriter, r *http.Request, scop
 	})
 	if err != nil {
 		if errors.Is(err, meta.ErrDuplicate) {
-			errJSON(w, http.StatusConflict, "api key name already exists")
+			errJSON(w, http.StatusConflict, "api key conflict")
 			return
 		}
 		errJSON(w, http.StatusInternalServerError, "failed to persist api key")
 		return
 	}
 
+	setNoStoreHeaders(w)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -190,6 +197,7 @@ func (s *Server) handleAPIKeyGet(w http.ResponseWriter, r *http.Request, scope *
 		errJSON(w, http.StatusInternalServerError, "failed to decrypt api key")
 		return
 	}
+	setNoStoreHeaders(w)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"api_key":    string(plain),
@@ -201,10 +209,16 @@ func (s *Server) handleAPIKeyGet(w http.ResponseWriter, r *http.Request, scope *
 	})
 }
 
+func setNoStoreHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+}
+
 func managedAPITokenVersion() int {
-	version := int(time.Now().UnixNano() % 2147483647)
-	if version <= 1 {
-		return 2
+	var seed [4]byte
+	if _, err := rand.Read(seed[:]); err == nil {
+		const maxManagedTokenVersion = uint32(1<<31 - 2)
+		return int(binary.BigEndian.Uint32(seed[:])%maxManagedTokenVersion) + 2
 	}
-	return version
+	return int(time.Now().UnixNano()%2147483645) + 2
 }

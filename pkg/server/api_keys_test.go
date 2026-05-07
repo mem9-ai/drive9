@@ -159,11 +159,48 @@ func TestDefaultAPIKeyCanListAndGetKeys(t *testing.T) {
 	if getResp.StatusCode != http.StatusOK {
 		t.Fatalf("get status=%d, want %d", getResp.StatusCode, http.StatusOK)
 	}
+	if cacheControl := getResp.Header.Get("Cache-Control"); cacheControl != "no-store" {
+		t.Fatalf("Cache-Control=%q, want no-store", cacheControl)
+	}
+	if pragma := getResp.Header.Get("Pragma"); pragma != "no-cache" {
+		t.Fatalf("Pragma=%q, want no-cache", pragma)
+	}
 	if got := getBody["key_name"]; got != "worker" {
 		t.Fatalf("key_name=%v, want worker", got)
 	}
 	if got := getBody["api_key"]; got != workerToken {
 		t.Fatalf("api_key=%v, want worker token", got)
+	}
+}
+
+func TestCreateAPIKeyRejectsSlashAndDisablesCaching(t *testing.T) {
+	srv, ownerToken, cleanup := newAuthServer(t)
+	defer cleanup()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	body := bytes.NewReader([]byte(`{"key_name":"worker/blue"}`))
+	badResp, badBody := doJSONRequest(t, http.MethodPost, ts.URL+tenantAPIKeysPath, ownerToken, body)
+	if badResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad create status=%d, want %d", badResp.StatusCode, http.StatusBadRequest)
+	}
+	if got := badBody["error"]; got != "key_name must not contain /" {
+		t.Fatalf("error=%v, want key_name must not contain /", got)
+	}
+
+	goodBody := bytes.NewReader([]byte(`{"key_name":"worker-blue"}`))
+	goodResp, goodOut := doJSONRequest(t, http.MethodPost, ts.URL+tenantAPIKeysPath, ownerToken, goodBody)
+	if goodResp.StatusCode != http.StatusCreated {
+		t.Fatalf("good create status=%d, want %d", goodResp.StatusCode, http.StatusCreated)
+	}
+	if cacheControl := goodResp.Header.Get("Cache-Control"); cacheControl != "no-store" {
+		t.Fatalf("Cache-Control=%q, want no-store", cacheControl)
+	}
+	if pragma := goodResp.Header.Get("Pragma"); pragma != "no-cache" {
+		t.Fatalf("Pragma=%q, want no-cache", pragma)
+	}
+	if got := goodOut["key_name"]; got != "worker-blue" {
+		t.Fatalf("key_name=%v, want worker-blue", got)
 	}
 }
 

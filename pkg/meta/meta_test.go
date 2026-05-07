@@ -2,6 +2,7 @@ package meta
 
 import (
 	"context"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -164,10 +165,10 @@ func TestRevokeAPIKeyByName(t *testing.T) {
 		t.Fatalf("revoked_at = %v, want %v", got.APIKey.RevokedAt, revokedAt)
 	}
 
-	if err := s.RevokeAPIKeyByName(context.Background(), "tenant-revoke-key", "worker", revokedAt.Add(time.Minute)); err != ErrNotFound {
+	if err := s.RevokeAPIKeyByName(context.Background(), "tenant-revoke-key", "worker", revokedAt.Add(time.Minute)); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second revoke err = %v, want %v", err, ErrNotFound)
 	}
-	if err := s.RevokeAPIKeyByName(context.Background(), "tenant-revoke-key", "missing", revokedAt); err != ErrNotFound {
+	if err := s.RevokeAPIKeyByName(context.Background(), "tenant-revoke-key", "missing", revokedAt); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing revoke err = %v, want %v", err, ErrNotFound)
 	}
 }
@@ -233,6 +234,12 @@ func TestListAndGetAPIKeysByTenant(t *testing.T) {
 	if gotKeys[0].KeyName != "default" || gotKeys[1].KeyName != "worker" {
 		t.Fatalf("unexpected key order: %q, %q", gotKeys[0].KeyName, gotKeys[1].KeyName)
 	}
+	if len(gotKeys[0].JWTCiphertext) != 0 || gotKeys[0].JWTHash != "" {
+		t.Fatalf("list returned secret material for %q", gotKeys[0].KeyName)
+	}
+	if len(gotKeys[1].JWTCiphertext) != 0 || gotKeys[1].JWTHash != "" {
+		t.Fatalf("list returned secret material for %q", gotKeys[1].KeyName)
+	}
 
 	gotKey, err := s.GetAPIKeyByName(context.Background(), "tenant-list-keys", "worker")
 	if err != nil {
@@ -241,7 +248,10 @@ func TestListAndGetAPIKeysByTenant(t *testing.T) {
 	if gotKey.ID != "k-worker" || gotKey.KeyName != "worker" {
 		t.Fatalf("unexpected key: %#v", gotKey)
 	}
-	if _, err := s.GetAPIKeyByName(context.Background(), "tenant-list-keys", "missing"); err != ErrNotFound {
+	if len(gotKey.JWTCiphertext) == 0 || gotKey.JWTHash == "" {
+		t.Fatal("get did not return secret material")
+	}
+	if _, err := s.GetAPIKeyByName(context.Background(), "tenant-list-keys", "missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing key err = %v, want %v", err, ErrNotFound)
 	}
 }

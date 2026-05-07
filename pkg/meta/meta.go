@@ -899,7 +899,7 @@ func (s *Store) GetAPIKeyByName(ctx context.Context, tenantID, keyName string) (
 func (s *Store) ListAPIKeysByTenant(ctx context.Context, tenantID string) (out []APIKey, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "list_api_keys_by_tenant", start, &err)
-	rows, err := s.db.QueryContext(ctx, `SELECT id, tenant_id, key_name, jwt_ciphertext, jwt_hash, token_version, status, issued_at,
+	rows, err := s.db.QueryContext(ctx, `SELECT id, tenant_id, key_name, token_version, status, issued_at,
 		revoked_at, created_at, updated_at
 		FROM tenant_api_keys
 		WHERE tenant_id = ?
@@ -911,7 +911,7 @@ func (s *Store) ListAPIKeysByTenant(ctx context.Context, tenantID string) (out [
 
 	out = make([]APIKey, 0)
 	for rows.Next() {
-		rec, err := scanAPIKeyRows(rows)
+		rec, err := scanAPIKeyMetadataRow(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -1151,6 +1151,29 @@ type apiKeyRowScanner interface {
 
 func scanAPIKeyRow(row apiKeyRowScanner) (*APIKey, error) {
 	return scanAPIKeyRows(row)
+}
+
+func scanAPIKeyMetadataRow(row apiKeyRowScanner) (*APIKey, error) {
+	var rec APIKey
+	var revokedAt sql.NullTime
+	if err := row.Scan(
+		&rec.ID,
+		&rec.TenantID,
+		&rec.KeyName,
+		&rec.TokenVersion,
+		&rec.Status,
+		&rec.IssuedAt,
+		&revokedAt,
+		&rec.CreatedAt,
+		&rec.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	if revokedAt.Valid {
+		t := revokedAt.Time.UTC()
+		rec.RevokedAt = &t
+	}
+	return &rec, nil
 }
 
 func scanAPIKeyRows(row apiKeyRowScanner) (*APIKey, error) {
