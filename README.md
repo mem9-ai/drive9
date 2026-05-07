@@ -75,6 +75,18 @@ drive9 create --name dev --server https://api.drive9.ai
 drive9 ctx use dev
 ```
 
+### Tenant API Key Commands
+
+The provisioned `default` API key can manage additional tenant API keys:
+
+```bash
+drive9 api-key ls
+
+drive9 api-key create worker --json
+drive9 api-key get worker
+drive9 api-key rm worker
+```
+
 ### Filesystem Commands
 
 ```bash

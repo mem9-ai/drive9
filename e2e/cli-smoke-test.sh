@@ -244,6 +244,7 @@ PY
 }
 
 TS="$(date +%s)"
+MANAGED_KEY_NAME="cli-worker-${TS}"
 SMALL_LOCAL="/tmp/drive9-cli-small-${TS}.txt"
 SMALL_REMOTE="/cli-${TS}-small.txt"
 SMALL_RENAMED="/cli-${TS}-small-renamed.txt"
@@ -261,6 +262,43 @@ LARGE_REMOTE="/cli-${TS}-large-${CLI_LARGE_FILE_MB}m.bin"
 LARGE_DOWNLOADED="/tmp/drive9-cli-large-${TS}.download.bin"
 LARGE_BYTES=$((CLI_LARGE_FILE_MB * 1024 * 1024))
 CLI_IMAGE_UPLOADED=0
+
+echo "[3.1] tenant api key management via cli"
+api_key_ls_json="$(drive9_retry api-key ls --json)"
+default_key_present="$(jq -r '[.keys[]? | select(.key_name=="default")] | length' <<<"$api_key_ls_json")"
+check_eq "api-key ls includes default key" "$default_key_present" "1"
+
+created_key_json="$(drive9_retry api-key create "$MANAGED_KEY_NAME" --json)"
+MANAGED_API_KEY="$(jq -r '.api_key // empty' <<<"$created_key_json")"
+check_cmd "api-key create returns plaintext api_key" test -n "$MANAGED_API_KEY"
+
+created_key_name="$(jq -r '.key_name // empty' <<<"$created_key_json")"
+check_eq "api-key create returns requested key name" "$created_key_name" "$MANAGED_KEY_NAME"
+
+managed_key_present="$(jq -r --arg key "$MANAGED_KEY_NAME" '[.keys[]? | select(.key_name==$key)] | length' <<<"$(drive9_retry api-key ls --json)")"
+check_eq "api-key ls includes managed key" "$managed_key_present" "1"
+
+managed_get_json="$(drive9_retry api-key get "$MANAGED_KEY_NAME" --json)"
+managed_get_api_key="$(jq -r '.api_key // empty' <<<"$managed_get_json")"
+check_eq "api-key get returns created plaintext key" "$managed_get_api_key" "$MANAGED_API_KEY"
+
+worker_ls_out="$(DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$MANAGED_API_KEY" "$CLI_BIN" fs ls / 2>&1)"
+worker_ls_rc=$?
+check_eq "created managed key can access fs ls /" "$worker_ls_rc" "0"
+
+drive9_retry api-key rm "$MANAGED_KEY_NAME" >/dev/null
+revoked_get_json="$(drive9_retry api-key get "$MANAGED_KEY_NAME" --json)"
+revoked_status="$(jq -r '.status // empty' <<<"$revoked_get_json")"
+check_eq "api-key rm marks key revoked" "$revoked_status" "revoked"
+
+TOTAL=$((TOTAL+1))
+if DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$MANAGED_API_KEY" "$CLI_BIN" fs ls / >/dev/null 2>&1; then
+  echo "FAIL revoked managed key is rejected"
+  FAIL=$((FAIL+1))
+else
+  echo "PASS revoked managed key is rejected"
+  PASS=$((PASS+1))
+fi
 
 echo "[4] small file ops via cli"
 printf "cli-smoke-%s" "$TS" > "$SMALL_LOCAL"

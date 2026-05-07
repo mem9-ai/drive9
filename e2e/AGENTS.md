@@ -148,13 +148,14 @@ use the same value as `DRIVE9_API_KEY` here.
 
 1. Provision + readiness polling
 2. Prepare `drive9` CLI binary (build local or download official release)
-3. CLI small-file flow (`cp`, `ls`, `cat`, `mv`, `rm`)
-4. CLI batch small-file flow (`cp` many files + dir list count + stat + sample reads)
-5. CLI search flow (`fs grep`, `fs find`)
-6. CLI semantic and image-associated recall flow (`fs grep` paraphrase + image caption recall) with async polling
-7. CLI image flow (`fs cp` jpg + `fs find -name "*.jpg"`)
-8. CLI large-file flow (`cp` upload multipart + `cp` download + checksum verification)
-9. CLI upload-limit boundary (`10GiB` initiate accepted, `10GiB+1` rejected)
+3. CLI tenant API key flow (`api-key ls/create/get/rm` + revoked-key rejection)
+4. CLI small-file flow (`cp`, `ls`, `cat`, `mv`, `rm`)
+5. CLI batch small-file flow (`cp` many files + dir list count + stat + sample reads)
+6. CLI search flow (`fs grep`, `fs find`)
+7. CLI semantic and image-associated recall flow (`fs grep` paraphrase + image caption recall) with async polling
+8. CLI image flow (`fs cp` jpg + `fs find -name "*.jpg"`)
+9. CLI large-file flow (`cp` upload multipart + `cp` download + checksum verification)
+10. CLI upload-limit boundary (`10GiB` initiate accepted, `10GiB+1` rejected)
 
 ### `fuse-smoke-test.sh`
 
