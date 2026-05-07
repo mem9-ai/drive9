@@ -1851,6 +1851,7 @@ type pendingRenameResult int
 const (
 	pendingRenameNotApplicable pendingRenameResult = iota
 	pendingRenameRemoteFallback
+	pendingRenameRemoteFallbackCleanupOld
 	pendingRenameHandled
 )
 
@@ -1895,11 +1896,10 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 			return pendingRenameRemoteFallback, nil
 		}
 		if oldRemoteExists {
-			if fs.shadowStore != nil {
-				fs.shadowStore.Remove(oldP)
-			}
-			fs.pendingIndex.Remove(oldP)
-			return pendingRenameRemoteFallback, nil
+			// The caller still needs to execute the remote rename. Keep local
+			// state until that succeeds so a remote rename failure can be
+			// retried from the preserved shadow/pending entry.
+			return pendingRenameRemoteFallbackCleanupOld, nil
 		}
 		meta, ok = fs.pendingIndex.GetMeta(oldP)
 		if !ok || meta.Kind != PendingNew {
@@ -2106,6 +2106,14 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 
 	if err := fs.renameRemoteWithTransientRetry(ctx, oldP, newP); err != nil {
 		return httpToFuseStatus(err)
+	}
+	if pendingRename == pendingRenameRemoteFallbackCleanupOld {
+		if fs.shadowStore != nil {
+			fs.shadowStore.Remove(oldP)
+		}
+		if fs.pendingIndex != nil {
+			fs.pendingIndex.Remove(oldP)
+		}
 	}
 
 	// After server-side rename, migrate pending descendants.
