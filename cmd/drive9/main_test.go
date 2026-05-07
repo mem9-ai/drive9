@@ -80,6 +80,7 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 	}
 	for _, want := range []string{
 		"usage: drive9 <command> [arguments]",
+		"api-key <ls|create|get|rm>",
 		"ctx use <name>",
 		"mount [flags] [:/remote] <mountpoint>",
 		"mount vault [flags] <mountpoint>",
@@ -87,6 +88,39 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 	} {
 		if !strings.Contains(stderr, want) {
 			t.Fatalf("stderr = %q, want it to contain %q", stderr, want)
+		}
+	}
+}
+
+func TestDispatchAPIKeyVerbReachesHandler(t *testing.T) {
+	origHandler := apiKeyHandler
+	origExit := exitFunc
+	t.Cleanup(func() {
+		apiKeyHandler = origHandler
+		exitFunc = origExit
+	})
+	exitFunc = func(int) {}
+
+	var gotArgs []string
+	called := false
+	apiKeyHandler = func(args []string) error {
+		called = true
+		gotArgs = args
+		return nil
+	}
+
+	dispatch("api-key", []string{"ls", "--json"})
+
+	if !called {
+		t.Fatal("api-key handler was not invoked for `drive9 api-key ...`")
+	}
+	want := []string{"ls", "--json"}
+	if len(gotArgs) != len(want) {
+		t.Fatalf("args = %v, want %v", gotArgs, want)
+	}
+	for i := range want {
+		if gotArgs[i] != want[i] {
+			t.Fatalf("args[%d] = %q, want %q", i, gotArgs[i], want[i])
 		}
 	}
 }

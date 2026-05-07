@@ -7,6 +7,7 @@
 // Commands:
 //
 //	create  provision a new database and owner context
+//	api-key tenant API key operations (ls, create, get, rm)
 //	ctx     manage contexts (add, import, ls, use, rm)
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, sh, grep, find)
 //	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
@@ -37,6 +38,10 @@ var exitFunc = os.Exit
 // "handler not reached". Production callers see no change: the default value
 // is the real cli.Secret and nothing else reassigns it outside tests.
 var vaultHandler = cli.Secret
+
+// apiKeyHandler is the `drive9 api-key` command entry point, indirected so
+// dispatch tests can assert routing without invoking the concrete handler.
+var apiKeyHandler = cli.APIKeyCmd
 
 func main() {
 	if logger.CLIEnabled() {
@@ -87,6 +92,21 @@ func dispatch(cmd string, args []string) {
 		}
 		if err := cli.Create(args); err != nil {
 			fatal("create", err)
+		}
+	case "api-key":
+		if cliLogger != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = args[0]
+			}
+			logger.Info(context.Background(), "cli_command", zap.String("command", "api-key"), zap.String("subcommand", sub))
+		}
+		if err := apiKeyHandler(args); err != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = " " + args[0]
+			}
+			fatal("api-key"+sub, err)
 		}
 	case "ctx":
 		if cliLogger != nil {
@@ -229,6 +249,8 @@ func usage(code int) {
 commands:
   create [--name NAME] [--server URL]
                          provision a new database and owner context
+	api-key <ls|create|get|rm>
+												 manage tenant API keys
   ctx                    show current context
   ctx add --api-key <key> [--name NAME] [--server URL]
                          add owner context
