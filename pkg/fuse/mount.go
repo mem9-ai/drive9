@@ -181,7 +181,7 @@ func Mount(opts *MountOptions) error {
 	// Resolve sync mode (auto-detect RTT if needed).
 	resolved := ResolveMode(context.Background(), opts.SyncMode, opts.Server)
 	dat9fs.syncMode = resolved
-	fmt.Fprintf(os.Stderr, "dat9: sync mode: %s\n", resolved)
+	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", resolved)
 
 	// Initialize write-back cache, shadow store, and pending index.
 	if !opts.ReadOnly {
@@ -200,10 +200,10 @@ func Mount(opts *MountOptions) error {
 			// Initialize PendingIndex (in-memory authoritative metadata).
 			pendingIdx, err := NewPendingIndex(pendingDir)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "dat9: pending index init failed: %v (continuing without)\n", err)
+				fmt.Fprintf(os.Stderr, "drive9: pending index init failed: %v (continuing without)\n", err)
 			} else {
 				if err := pendingIdx.RecoverFromDisk(); err != nil {
-					fmt.Fprintf(os.Stderr, "dat9: pending index recovery: %v\n", err)
+					fmt.Fprintf(os.Stderr, "drive9: pending index recovery: %v\n", err)
 				}
 				dat9fs.pendingIndex = pendingIdx
 			}
@@ -211,7 +211,7 @@ func Mount(opts *MountOptions) error {
 			// Initialize ShadowStore.
 			shadowStore, err := NewShadowStore(shadowDir)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "dat9: shadow store init failed: %v (continuing without)\n", err)
+				fmt.Fprintf(os.Stderr, "drive9: shadow store init failed: %v (continuing without)\n", err)
 			} else {
 				dat9fs.shadowStore = shadowStore
 			}
@@ -220,7 +220,7 @@ func Mount(opts *MountOptions) error {
 			journalPath := filepath.Join(cacheBase, mh, "journal.wal")
 			journal, err := NewJournal(journalPath)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "dat9: journal init failed: %v (continuing without)\n", err)
+				fmt.Fprintf(os.Stderr, "drive9: journal init failed: %v (continuing without)\n", err)
 			} else {
 				dat9fs.journal = journal
 				// Replay journal for crash recovery. Preserve the original kind
@@ -243,7 +243,7 @@ func Mount(opts *MountOptions) error {
 			// RecoverPending would prune them as orphans (shadow missing).
 			wbCache, err := NewWriteBackCache(pendingDir)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "dat9: write-back cache init failed: %v (continuing without)\n", err)
+				fmt.Fprintf(os.Stderr, "drive9: write-back cache init failed: %v (continuing without)\n", err)
 			}
 
 			// Migrate legacy writeBack entries to shadow store so
@@ -252,7 +252,7 @@ func Mount(opts *MountOptions) error {
 				for _, pe := range wbCache.ListPending() {
 					if !shadowStore.Has(pe.Meta.Path) {
 						if err := shadowStore.WriteFull(pe.Meta.Path, pe.Data, pe.Meta.BaseRev); err != nil {
-							fmt.Fprintf(os.Stderr, "dat9: migrate legacy entry %s to shadow: %v\n", pe.Meta.Path, err)
+							fmt.Fprintf(os.Stderr, "drive9: migrate legacy entry %s to shadow: %v\n", pe.Meta.Path, err)
 						}
 					}
 				}
@@ -340,7 +340,7 @@ func Mount(opts *MountOptions) error {
 	}
 	defer func() {
 		if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "dat9: remove mount pid file %s: %v\n", pidFile, err)
+			fmt.Fprintf(os.Stderr, "drive9: remove mount pid file %s: %v\n", pidFile, err)
 		}
 	}()
 
@@ -352,12 +352,12 @@ func Mount(opts *MountOptions) error {
 
 	go func() {
 		<-sigCh
-		fmt.Fprintf(os.Stderr, "\ndat9: unmounting %s...\n", opts.MountPoint)
+		fmt.Fprintf(os.Stderr, "\ndrive9: unmounting %s...\n", opts.MountPoint)
 
 		// Second Ctrl+C during unmount exits immediately.
 		go func() {
 			<-sigCh
-			fmt.Fprintf(os.Stderr, "dat9: forced exit\n")
+			fmt.Fprintf(os.Stderr, "drive9: forced exit\n")
 			os.Exit(1)
 		}()
 
@@ -370,18 +370,18 @@ func Mount(opts *MountOptions) error {
 			if unmountErr = server.Unmount(); unmountErr == nil {
 				return
 			}
-			fmt.Fprintf(os.Stderr, "dat9: unmount attempt %d/%d failed: %v\n", i+1, maxRetries, unmountErr)
+			fmt.Fprintf(os.Stderr, "drive9: unmount attempt %d/%d failed: %v\n", i+1, maxRetries, unmountErr)
 			if i < maxRetries-1 {
 				time.Sleep(500 * time.Millisecond)
 			}
 		}
 
 		// All retries exhausted — force unmount via OS tool.
-		fmt.Fprintf(os.Stderr, "dat9: retries exhausted, force-unmounting %s\n", opts.MountPoint)
+		fmt.Fprintf(os.Stderr, "drive9: retries exhausted, force-unmounting %s\n", opts.MountPoint)
 		forceUnmount(opts.MountPoint)
 	}()
 
-	fmt.Fprintf(os.Stderr, "dat9: mounted on %s (server: %s, actor: %s)\n", opts.MountPoint, opts.Server, actorID)
+	fmt.Fprintf(os.Stderr, "drive9: mounted on %s (server: %s, actor: %s)\n", opts.MountPoint, opts.Server, actorID)
 	server.Wait()
 	shutdown()
 	return nil
@@ -413,7 +413,7 @@ func forceUnmount(mountpoint string) {
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "dat9: force unmount failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "drive9: force unmount failed: %v\n", err)
 	}
 }
 
