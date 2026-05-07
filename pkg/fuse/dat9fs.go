@@ -1888,9 +1888,7 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 
 		// The cancel may have raced with a successful upload. If so, the old
 		// path now exists remotely and the normal server-side rename is correct.
-		probeCtx, probeCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
-		oldRemoteExists, err := fs.remotePathExists(probeCtx, oldP)
-		probeCancel()
+		oldRemoteExists, err := fs.remotePathExistsDetached(oldP)
 		if err != nil {
 			log.Printf("rename: probe old pending-new source %s failed, using remote fallback: %v", oldP, err)
 			return pendingRenameRemoteFallback, nil

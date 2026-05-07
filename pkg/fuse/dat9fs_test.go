@@ -4992,6 +4992,121 @@ func TestRenamePendingNewCommitFallsBackWhenCanceledUploadReachedRemote(t *testi
 	}
 }
 
+func TestRenamePendingNewCommitOldVisibilityProbeIgnoresFuseCancel(t *testing.T) {
+	oldP := "/repo/.git/config.lock"
+	newP := "/repo/.git/config"
+
+	oldHeadStarted := make(chan struct{})
+	oldHeadCanceled := make(chan struct{})
+	allowOldHead := make(chan struct{})
+	var oldHeadOnce sync.Once
+	var oldHeadCanceledOnce sync.Once
+	var renameCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+newP:
+			http.NotFound(w, r)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+oldP:
+			oldHeadOnce.Do(func() { close(oldHeadStarted) })
+			select {
+			case <-allowOldHead:
+			case <-r.Context().Done():
+				oldHeadCanceledOnce.Do(func() { close(oldHeadCanceled) })
+				return
+			}
+			w.Header().Set("Content-Length", "36")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+newP && r.URL.RawQuery == "rename":
+			if r.Header.Get("X-Dat9-Rename-Source") != oldP {
+				t.Errorf("rename source = %q, want %q", r.Header.Get("X-Dat9-Rename-Source"), oldP)
+			}
+			renameCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	c := client.New(ts.URL, "")
+	fs := NewDat9FS(c, opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = NewCommitQueue(c, shadow, pending, nil, 1, 16)
+	defer fs.commitQueue.DrainAll()
+
+	data := []byte("[core]\n\tfilemode = false\n")
+	if err := shadow.WriteFull(oldP, data, 0); err != nil {
+		t.Fatalf("WriteFull old shadow: %v", err)
+	}
+	if _, err := pending.PutWithBaseRev(oldP, int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatalf("PutWithBaseRev old pending: %v", err)
+	}
+	dirIno := fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
+	fs.inodes.Lookup(oldP, false, int64(len(data)), time.Now())
+
+	cancel := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Rename(cancel, &gofuse.RenameIn{
+			InHeader: gofuse.InHeader{NodeId: dirIno},
+			Newdir:   dirIno,
+		}, "config.lock", "config")
+	}()
+
+	select {
+	case <-oldHeadStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for old-path visibility probe")
+	}
+	select {
+	case <-oldHeadCanceled:
+		t.Fatal("old-path visibility probe used the canceled FUSE request context")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(allowOldHead)
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("Rename status = %v, want OK", st)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Rename timed out")
+	}
+	if got := renameCalls.Load(); got != 1 {
+		t.Fatalf("remote rename calls = %d, want 1", got)
+	}
+	if pending.HasPending(oldP) {
+		t.Fatal("old lock path should not remain pending after remote fallback")
+	}
+	if shadow.Has(oldP) {
+		t.Fatal("old lock shadow should be removed after remote fallback")
+	}
+	if _, ok := fs.inodes.GetInode(oldP); ok {
+		t.Fatal("old lock inode should not remain mapped after rename")
+	}
+	if _, ok := fs.inodes.GetInode(newP); !ok {
+		t.Fatal("new config inode should be mapped after rename")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Read detached retry tests
 // ---------------------------------------------------------------------------
