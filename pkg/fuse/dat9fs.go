@@ -1888,6 +1888,21 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 
 		// The cancel may have raced with a successful upload. If so, the old
 		// path now exists remotely and the normal server-side rename is correct.
+		oldRemoteExists, err := fs.remotePathExists(ctx, oldP)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return pendingRenameNotApplicable, err
+			}
+			log.Printf("rename: probe old pending-new source %s failed, using remote fallback: %v", oldP, err)
+			return pendingRenameRemoteFallback, nil
+		}
+		if oldRemoteExists {
+			if fs.shadowStore != nil {
+				fs.shadowStore.Remove(oldP)
+			}
+			fs.pendingIndex.Remove(oldP)
+			return pendingRenameRemoteFallback, nil
+		}
 		meta, ok = fs.pendingIndex.GetMeta(oldP)
 		if !ok || meta.Kind != PendingNew {
 			return pendingRenameRemoteFallback, nil
@@ -1964,6 +1979,19 @@ func (fs *Dat9FS) pendingRenameTargetExists(ctx context.Context, p string) (bool
 	if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
 		return true, nil
 	}
+	statStart := fs.perfStart()
+	_, err := fs.client.StatCtx(ctx, fs.remotePath(p))
+	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
+	if err == nil {
+		return true, nil
+	}
+	if isNotFoundErr(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (fs *Dat9FS) remotePathExists(ctx context.Context, p string) (bool, error) {
 	statStart := fs.perfStart()
 	_, err := fs.client.StatCtx(ctx, fs.remotePath(p))
 	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
@@ -2610,10 +2638,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 		}
 	} else if fh.Prefetch != nil {
-		// Large read-only files with prefetcher: use DIRECT_IO so every
-		// read goes through our Read handler (no kernel page cache).
-		// The prefetcher provides its own caching layer.
-		out.OpenFlags = gofuse.FOPEN_DIRECT_IO
+		// Large read-only files still need kernel caching so mmap-based
+		// readers (notably git pack access) do not SIGBUS on macFUSE.
+		// Reads still populate the userspace prefetcher on cache misses.
+		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 	} else {
 		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 	}

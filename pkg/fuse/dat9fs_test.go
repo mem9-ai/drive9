@@ -1591,6 +1591,9 @@ func TestOpenReadOnlyLargeFileGetsPrefetcher(t *testing.T) {
 	if fh.Prefetch == nil {
 		t.Fatal("expected Prefetcher to be set for large read-only file")
 	}
+	if out.OpenFlags != gofuse.FOPEN_KEEP_CACHE {
+		t.Fatalf("open flags = %d, want FOPEN_KEEP_CACHE for mmap compatibility", out.OpenFlags)
+	}
 }
 
 func TestOpenWritableLargeFileGetsLazyPreload(t *testing.T) {
@@ -4905,6 +4908,87 @@ func TestRenameRemoteWithTransientRetryDoesNotAcceptPreexistingTarget(t *testing
 	}
 	if sourceExists.Load() {
 		t.Fatal("retry did not commit the overwrite rename")
+	}
+}
+
+func TestRenamePendingNewCommitFallsBackWhenCanceledUploadReachedRemote(t *testing.T) {
+	oldP := "/repo/.git/config.lock"
+	newP := "/repo/.git/config"
+
+	var renameCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+newP:
+			http.NotFound(w, r)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+oldP:
+			w.Header().Set("Content-Length", "36")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+newP && r.URL.RawQuery == "rename":
+			if r.Header.Get("X-Dat9-Rename-Source") != oldP {
+				t.Errorf("rename source = %q, want %q", r.Header.Get("X-Dat9-Rename-Source"), oldP)
+			}
+			renameCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	c := client.New(ts.URL, "")
+	fs := NewDat9FS(c, opts)
+
+	shadowDir := t.TempDir()
+	pendingDir := t.TempDir()
+	shadow, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = NewCommitQueue(c, shadow, pending, nil, 1, 16)
+	defer fs.commitQueue.DrainAll()
+
+	data := []byte("[core]\n\tfilemode = false\n")
+	if err := shadow.WriteFull(oldP, data, 0); err != nil {
+		t.Fatalf("WriteFull old shadow: %v", err)
+	}
+	if _, err := pending.PutWithBaseRev(oldP, int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatalf("PutWithBaseRev old pending: %v", err)
+	}
+	dirIno := fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
+	fs.inodes.Lookup(oldP, false, int64(len(data)), time.Now())
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Newdir:   dirIno,
+	}, "config.lock", "config")
+	if st != gofuse.OK {
+		t.Fatalf("Rename status = %v, want OK", st)
+	}
+	if got := renameCalls.Load(); got != 1 {
+		t.Fatalf("remote rename calls = %d, want 1", got)
+	}
+	if pending.HasPending(oldP) {
+		t.Fatal("old lock path should not remain pending after remote fallback")
+	}
+	if shadow.Has(oldP) {
+		t.Fatal("old lock shadow should be removed after remote fallback")
+	}
+	if _, ok := fs.inodes.GetInode(oldP); ok {
+		t.Fatal("old lock inode should not remain mapped after rename")
+	}
+	if _, ok := fs.inodes.GetInode(newP); !ok {
+		t.Fatal("new config inode should be mapped after rename")
 	}
 }
 
