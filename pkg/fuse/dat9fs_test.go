@@ -1328,7 +1328,7 @@ func TestLookupTransientRetryExhaustedReturnsEAGAIN(t *testing.T) {
 		if st != want {
 			t.Fatalf("Lookup status = %v, want %v", st, want)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(time.Duration(lookupTransientRetryCount+1) * lookupTransientRetryTimeout * 2):
 		t.Fatal("Lookup timed out")
 	}
 
