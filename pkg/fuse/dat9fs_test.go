@@ -705,13 +705,54 @@ func TestGetAttrRetriesTransientCanceledStat(t *testing.T) {
 	}
 }
 
-func TestLookupFallsBackToParentListWhenDirStatUnsupported(t *testing.T) {
+func TestLookupStatNotFoundReturnsENOENTWithoutParentListByDefault(t *testing.T) {
+	var headCalls atomic.Int32
+	var listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			headCalls.Add(1)
+			http.Error(w, "not found", http.StatusNotFound)
+		case http.MethodGet:
+			if r.URL.Query().Get("list") == "1" {
+				listCalls.Add(1)
+			}
+			http.Error(w, "unexpected list fallback", http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "missing", &out)
+	if st != gofuse.ENOENT {
+		t.Fatalf("Lookup status = %v, want ENOENT", st)
+	}
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+	if got := listCalls.Load(); got != 0 {
+		t.Fatalf("list calls = %d, want 0", got)
+	}
+	if out.NodeId != 0 {
+		t.Fatalf("negative lookup NodeId = %d, want 0", out.NodeId)
+	}
+}
+
+func TestLookupLegacyDirStatFallbackListsParentWhenEnabled(t *testing.T) {
+	var listCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodHead:
 			http.Error(w, "not found", http.StatusNotFound)
 		case http.MethodGet:
 			if r.URL.Path == "/v1/fs/" && r.URL.RawQuery == "list=1" {
+				listCalls.Add(1)
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"entries": []map[string]any{{
 						"name":  "dir",
@@ -728,7 +769,7 @@ func TestLookupFallsBackToParentListWhenDirStatUnsupported(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	opts := &MountOptions{LegacyDirStatFallback: true}
 	opts.setDefaults()
 	fs := NewDat9FS(client.New(ts.URL, ""), opts)
 
@@ -739,6 +780,9 @@ func TestLookupFallsBackToParentListWhenDirStatUnsupported(t *testing.T) {
 	}
 	if out.Mode&syscall.S_IFDIR == 0 {
 		t.Fatalf("Lookup mode = %o, want directory mode", out.Mode)
+	}
+	if got := listCalls.Load(); got != 1 {
+		t.Fatalf("list calls = %d, want 1", got)
 	}
 }
 
@@ -808,7 +852,7 @@ func TestLookupUsesDirCacheNegativeEntryWithoutRemoteStat(t *testing.T) {
 	}
 }
 
-func TestLookupListFallbackPopulatesDirCacheForLaterMisses(t *testing.T) {
+func TestLookupLegacyListFallbackPopulatesDirCacheForLaterMisses(t *testing.T) {
 	var headCalls atomic.Int32
 	var listCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -835,7 +879,7 @@ func TestLookupListFallbackPopulatesDirCacheForLaterMisses(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	opts := &MountOptions{LegacyDirStatFallback: true}
 	opts.setDefaults()
 	fs := NewDat9FS(client.New(ts.URL, ""), opts)
 

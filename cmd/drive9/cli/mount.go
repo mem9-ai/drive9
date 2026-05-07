@@ -18,6 +18,8 @@ import (
 	drive9webdav "github.com/mem9-ai/dat9/pkg/webdav"
 )
 
+var mountFuse = drive9fuse.Mount
+
 // MountCmd handles the "drive9 mount" command.
 //
 // Dispatch fork (Row A, V2e): the first positional argument selects the
@@ -78,6 +80,7 @@ func fsMountCmd(args []string) error {
 	flushDebounce := fs.Duration("flush-debounce", -1, "debounce window for small-file flush coalescing (default 2s, 0 disables)")
 	lookupRetryCount := fs.Int("lookup-retry-count", 2, "detached retries after transient Lookup/GetAttr stat failures (default 2, set 0 to disable)")
 	lookupRetryTimeout := fs.Duration("lookup-retry-timeout", 250*time.Millisecond, "timeout per detached Lookup/GetAttr stat retry (default 250ms, must be > 0)")
+	legacyDirStatFallback := fs.Bool("legacy-dir-stat-fallback", false, "on Lookup stat 404, list parent to support legacy servers without directory stat")
 	readDirPrefetch := fs.Bool("readdir-prefetch", false, "prefetch small files after directory reads into the read cache")
 	prefetchMaxFiles := fs.Int("readdir-prefetch-max-files", 32, "maximum small files prefetched per directory read")
 	prefetchMaxFileBytes := fs.Int64("readdir-prefetch-max-file-bytes", 50_000, "maximum individual file size prefetched by readdir prefetch")
@@ -186,33 +189,34 @@ func fsMountCmd(args []string) error {
 	}
 
 	opts := &drive9fuse.MountOptions{
-		Server:               *server,
-		APIKey:               *apiKey,
-		Token:                token,
-		MountPoint:           mountPoint,
-		RemoteRoot:           remoteRoot,
-		CacheDir:             *cacheDir,
-		CacheSize:            int64(*cacheSize) << 20,
-		DirTTL:               *dirTTL,
-		AttrTTL:              *attrTTL,
-		EntryTTL:             *entryTTL,
-		FlushDebounce:        *flushDebounce,
-		LookupRetryCount:     normalizedLookupRetryCount,
-		LookupRetryTimeout:   *lookupRetryTimeout,
-		ReadDirPrefetch:      *readDirPrefetch,
-		PrefetchMaxFiles:     *prefetchMaxFiles,
-		PrefetchMaxFileBytes: *prefetchMaxFileBytes,
-		PrefetchMaxBytes:     *prefetchMaxBytes,
-		PrefetchTimeout:      *prefetchTimeout,
-		SyncMode:             syncModeVal,
-		Profile:              *profile,
-		AllowOther:           *allowOther,
-		ReadOnly:             *readOnly,
-		Debug:                *debug,
-		PerfCounters:         *perfCounters,
+		Server:                *server,
+		APIKey:                *apiKey,
+		Token:                 token,
+		MountPoint:            mountPoint,
+		RemoteRoot:            remoteRoot,
+		CacheDir:              *cacheDir,
+		CacheSize:             int64(*cacheSize) << 20,
+		DirTTL:                *dirTTL,
+		AttrTTL:               *attrTTL,
+		EntryTTL:              *entryTTL,
+		FlushDebounce:         *flushDebounce,
+		LookupRetryCount:      normalizedLookupRetryCount,
+		LookupRetryTimeout:    *lookupRetryTimeout,
+		LegacyDirStatFallback: *legacyDirStatFallback,
+		ReadDirPrefetch:       *readDirPrefetch,
+		PrefetchMaxFiles:      *prefetchMaxFiles,
+		PrefetchMaxFileBytes:  *prefetchMaxFileBytes,
+		PrefetchMaxBytes:      *prefetchMaxBytes,
+		PrefetchTimeout:       *prefetchTimeout,
+		SyncMode:              syncModeVal,
+		Profile:               *profile,
+		AllowOther:            *allowOther,
+		ReadOnly:              *readOnly,
+		Debug:                 *debug,
+		PerfCounters:          *perfCounters,
 	}
 
-	return drive9fuse.Mount(opts)
+	return mountFuse(opts)
 }
 
 // newWebDAVHandler creates an http.Handler that serves drive9 content over WebDAV.

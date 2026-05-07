@@ -1350,27 +1350,29 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 			return httpToFuseStatus(err)
 		}
 
-		// Some deployments do not support stat/HEAD on directories.
-		// Fall back to listing the parent and matching by name.
-		items, listErr := fs.lookupListWithRetry(cancel, parentPath)
-		if listErr != nil {
-			return httpToFuseStatus(listErr)
-		}
-		for _, item := range items {
-			if item.Name != name {
-				continue
+		if fs.opts.LegacyDirStatFallback {
+			// Compatibility path for private legacy servers that do not support
+			// stat/HEAD on directories: list the parent and match by name.
+			items, listErr := fs.lookupListWithRetry(cancel, parentPath)
+			if listErr != nil {
+				return httpToFuseStatus(listErr)
 			}
-			mtime := time.Now()
-			if item.Mtime > 0 {
-				mtime = time.Unix(item.Mtime, 0)
+			for _, item := range items {
+				if item.Name != name {
+					continue
+				}
+				mtime := time.Now()
+				if item.Mtime > 0 {
+					mtime = time.Unix(item.Mtime, 0)
+				}
+				ino := fs.inodes.Lookup(childP, item.IsDir, item.Size, mtime)
+				entry, ok := fs.inodes.GetEntry(ino)
+				if !ok {
+					return gofuse.EIO
+				}
+				fs.fillEntryOut(entry, out)
+				return gofuse.OK
 			}
-			ino := fs.inodes.Lookup(childP, item.IsDir, item.Size, mtime)
-			entry, ok := fs.inodes.GetEntry(ino)
-			if !ok {
-				return gofuse.EIO
-			}
-			fs.fillEntryOut(entry, out)
-			return gofuse.OK
 		}
 		// Cache negative lookup: tell kernel this entry doesn't exist
 		// for NegativeEntryTTL so it doesn't re-ask immediately.
