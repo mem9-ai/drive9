@@ -981,6 +981,23 @@ func (fs *Dat9FS) getAttrStatWithRetry(cancel <-chan struct{}, remotePath string
 	return fs.statWithTransientRetry(cancel, remotePath, false)
 }
 
+func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
+	cached := make([]CachedFileInfo, len(items))
+	for i, item := range items {
+		var mtime time.Time
+		if item.Mtime > 0 {
+			mtime = time.Unix(item.Mtime, 0)
+		}
+		cached[i] = CachedFileInfo{
+			Name:  item.Name,
+			Size:  item.Size,
+			IsDir: item.IsDir,
+			Mtime: mtime,
+		}
+	}
+	return cached
+}
+
 func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string) ([]client.FileInfo, error) {
 	// list-fallback retries are intentionally not counted in lookupStatRetry*;
 	// those counters remain scoped to the primary Lookup->Stat path.
@@ -990,7 +1007,11 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 	items, err := fs.client.ListCtx(ctx, apiPath)
 	cf()
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
-	if err == nil || !isTransientLookupErr(err) {
+	if err == nil {
+		fs.dirCache.Put(parentPath, cachedFileInfos(items))
+		return items, nil
+	}
+	if !isTransientLookupErr(err) {
 		return items, err
 	}
 	retryCount := fs.lookupStatRetryCount()
@@ -1009,7 +1030,11 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		items, err = fs.client.ListCtx(retryCtx, apiPath)
 		retryCancel()
 		fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
-		if err == nil || !isTransientLookupErr(err) {
+		if err == nil {
+			fs.dirCache.Put(parentPath, cachedFileInfos(items))
+			return items, nil
+		}
+		if !isTransientLookupErr(err) {
 			return items, err
 		}
 		lastErr = err
@@ -1051,6 +1076,21 @@ func (fs *Dat9FS) remotePathGoneDetached(localPath string) bool {
 	_, err := fs.client.StatCtx(retryCtx, fs.remotePath(localPath))
 	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
 	return isNotFoundErr(err)
+}
+
+func (fs *Dat9FS) remotePathExistsDetached(localPath string) (bool, error) {
+	retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+	defer retryCancel()
+	statStart := fs.perfStart()
+	_, err := fs.client.StatCtx(retryCtx, fs.remotePath(localPath))
+	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
+	if err == nil {
+		return true, nil
+	}
+	if isNotFoundErr(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string) error {
@@ -1165,6 +1205,43 @@ func (fs *Dat9FS) renameRemoteWithTransientRetry(ctx context.Context, oldP, newP
 	return lastErr
 }
 
+func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofuse.EntryOut) (bool, gofuse.Status) {
+	cached, ok := fs.dirCache.Get(parentPath)
+	if !ok {
+		if fs.perf != nil {
+			fs.perf.dirCacheMiss.add(1)
+		}
+		return false, gofuse.OK
+	}
+	if fs.perf != nil {
+		fs.perf.dirCacheHit.add(1)
+	}
+
+	for _, item := range cached {
+		if item.Name != name {
+			continue
+		}
+		mtime := item.Mtime
+		if mtime.IsZero() {
+			mtime = time.Now()
+		}
+		ino := fs.inodes.Lookup(childP, item.IsDir, item.Size, mtime)
+		if item.Revision > 0 {
+			fs.inodes.UpdateRevision(ino, item.Revision)
+		}
+		entry, ok := fs.inodes.GetEntry(ino)
+		if !ok {
+			return true, gofuse.EIO
+		}
+		fs.fillEntryOut(entry, out)
+		return true, gofuse.OK
+	}
+
+	out.NodeId = 0
+	out.SetEntryTimeout(fs.opts.NegativeEntryTTL)
+	return true, gofuse.ENOENT
+}
+
 // --- RawFileSystem methods ---------------------------------------------------
 
 func (fs *Dat9FS) Init(server *gofuse.Server) {
@@ -1259,6 +1336,14 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		return gofuse.OK
 	}
 
+	parentPath, ok := fs.inodes.GetPath(header.NodeId)
+	if !ok {
+		return gofuse.ENOENT
+	}
+	if handled, cacheStatus := fs.lookupFromDirCache(parentPath, childP, name, out); handled {
+		return cacheStatus
+	}
+
 	stat, err := fs.lookupStatWithRetry(cancel, childP)
 	if err != nil {
 		if !isNotFoundErr(err) {
@@ -1267,10 +1352,6 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 
 		// Some deployments do not support stat/HEAD on directories.
 		// Fall back to listing the parent and matching by name.
-		parentPath, ok := fs.inodes.GetPath(header.NodeId)
-		if !ok {
-			return gofuse.ENOENT
-		}
 		items, listErr := fs.lookupListWithRetry(cancel, parentPath)
 		if listErr != nil {
 			return httpToFuseStatus(listErr)
@@ -1804,6 +1885,21 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 		if !ok || meta.Kind != PendingNew {
 			return pendingRenameRemoteFallback, nil
 		}
+		oldExistsRemote, oldExistsErr := fs.remotePathExistsDetached(oldP)
+		if oldExistsErr != nil {
+			return pendingRenameHandled, oldExistsErr
+		}
+		if oldExistsRemote {
+			if err := fs.renameRemoteWithTransientRetry(ctx, oldP, newP); err != nil {
+				return pendingRenameHandled, err
+			}
+			if fs.shadowStore != nil {
+				fs.shadowStore.Remove(oldP)
+			}
+			fs.pendingIndex.Remove(oldP)
+			fs.finishLocalRename(input, oldP, newP)
+			return pendingRenameHandled, nil
+		}
 	}
 
 	if fs.shadowStore != nil {
@@ -2131,19 +2227,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	}
 
 	// Store in dir cache
-	cached := make([]CachedFileInfo, len(items))
-	for i, item := range items {
-		var mtime time.Time
-		if item.Mtime > 0 {
-			mtime = time.Unix(item.Mtime, 0)
-		}
-		cached[i] = CachedFileInfo{
-			Name:  item.Name,
-			Size:  item.Size,
-			IsDir: item.IsDir,
-			Mtime: mtime,
-		}
-	}
+	cached := cachedFileInfos(items)
 	fs.applyBatchStats(ctx, dirPath, cached)
 	fs.dirCache.Put(dirPath, cached)
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached)
