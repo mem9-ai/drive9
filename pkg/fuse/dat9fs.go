@@ -2035,10 +2035,44 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 			Mtime: mtime,
 		}
 	}
+	fs.applyBatchStats(ctx, dirPath, cached)
 	fs.dirCache.Put(dirPath, cached)
 
 	entries := fs.cachedToDirEntries(dirPath, cached)
 	return fs.mergePendingDirEntries(dirPath, entries), nil
+}
+
+func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []CachedFileInfo) {
+	if len(items) == 0 {
+		return
+	}
+	for start := 0; start < len(items); start += client.MaxBatchStatPaths {
+		end := start + client.MaxBatchStatPaths
+		if end > len(items) {
+			end = len(items)
+		}
+		paths := make([]string, end-start)
+		for i := start; i < end; i++ {
+			paths[i-start] = fs.remotePath(dirEntryChildPath(dirPath, items[i].Name))
+		}
+		results, err := fs.client.BatchStatCtx(ctx, paths)
+		if err != nil {
+			log.Printf("batch stat failed for %s entries %d-%d: %v", dirPath, start, end, err)
+			return
+		}
+		for i, result := range results {
+			if !result.OK() {
+				continue
+			}
+			item := &items[start+i]
+			item.Size = result.Size
+			item.IsDir = result.IsDir
+			if result.Mtime > 0 {
+				item.Mtime = time.Unix(result.Mtime, 0)
+			}
+			item.Revision = result.Revision
+		}
+	}
 }
 
 // mergePendingDirEntries overlays pending write-back entries onto a directory
@@ -2117,18 +2151,16 @@ func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []D
 func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []DirEntry {
 	entries := make([]DirEntry, 0, len(items))
 	for _, item := range items {
-		var childP string
-		if dirPath == "/" {
-			childP = "/" + item.Name
-		} else {
-			childP = dirPath + "/" + item.Name
-		}
+		childP := dirEntryChildPath(dirPath, item.Name)
 
 		mtime := item.Mtime
 		if mtime.IsZero() {
 			mtime = time.Now()
 		}
 		ino := fs.inodes.EnsureInode(childP, item.IsDir, item.Size, mtime)
+		if item.Revision > 0 {
+			fs.inodes.UpdateRevision(ino, item.Revision)
+		}
 
 		var mode uint32
 		if item.IsDir {
@@ -2143,6 +2175,13 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		})
 	}
 	return entries
+}
+
+func dirEntryChildPath(dirPath, name string) string {
+	if dirPath == "/" {
+		return "/" + name
+	}
+	return dirPath + "/" + name
 }
 
 // --- File operations ---------------------------------------------------------

@@ -185,6 +185,28 @@ type StatResult struct {
 	Mtime    time.Time
 }
 
+// MaxBatchStatPaths is the maximum number of paths accepted by BatchStatCtx.
+const MaxBatchStatPaths = 256
+
+// BatchStatResult is one per-path result from BatchStatCtx.
+//
+// Status is the HTTP-like per-path status. A missing path returns Status 404
+// in its own result instead of failing the whole batch.
+type BatchStatResult struct {
+	Path     string `json:"path"`
+	Status   int    `json:"status"`
+	Error    string `json:"error,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+	IsDir    bool   `json:"isDir"`
+	Revision int64  `json:"revision,omitempty"`
+	Mtime    int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
+}
+
+// OK reports whether the per-path batch stat result is successful.
+func (r BatchStatResult) OK() bool {
+	return r.Status >= 200 && r.Status < 300 && r.Error == ""
+}
+
 // StatMetadataResult represents enriched metadata from GET /v1/fs/{path}?stat=1.
 type StatMetadataResult struct {
 	Size         int64             `json:"size"`
@@ -414,6 +436,49 @@ func (c *Client) ListCtx(ctx context.Context, path string) ([]FileInfo, error) {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
 	return result.Entries, nil
+}
+
+// BatchStatCtx returns lightweight metadata for up to MaxBatchStatPaths paths.
+//
+// Transport/request errors fail the method. Per-path stat errors are returned
+// inside the corresponding BatchStatResult so one missing path does not fail
+// the whole batch.
+func (c *Client) BatchStatCtx(ctx context.Context, paths []string) ([]BatchStatResult, error) {
+	if len(paths) == 0 {
+		return []BatchStatResult{}, nil
+	}
+	if len(paths) > MaxBatchStatPaths {
+		return nil, fmt.Errorf("batch stat: %d paths exceeds limit of %d", len(paths), MaxBatchStatPaths)
+	}
+	body, err := json.Marshal(struct {
+		Paths []string `json:"paths"`
+	}{Paths: paths})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/fs:batch-stat", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var out struct {
+		Results []BatchStatResult `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	if len(out.Results) != len(paths) {
+		return nil, fmt.Errorf("batch stat: got %d results for %d paths", len(out.Results), len(paths))
+	}
+	return out.Results, nil
 }
 
 // Stat returns metadata for a path.

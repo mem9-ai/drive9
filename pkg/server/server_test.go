@@ -271,6 +271,120 @@ func TestStat(t *testing.T) {
 	}
 }
 
+func TestBatchStatReturnsPerPathResults(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/a.txt", strings.NewReader("data"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("write: %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/data/dir?mkdir", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mkdir: %d", resp.StatusCode)
+	}
+
+	body := `{"paths":["/data/a.txt","/data/dir","/missing.txt","/data/a.txt","/bad\\path"]}`
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs:batch-stat", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		response, _ := io.ReadAll(resp.Body)
+		t.Fatalf("batch stat status = %d, body %s", resp.StatusCode, response)
+	}
+	var out struct {
+		Results []struct {
+			Path     string `json:"path"`
+			Status   int    `json:"status"`
+			Error    string `json:"error"`
+			Size     int64  `json:"size"`
+			IsDir    bool   `json:"isDir"`
+			Revision int64  `json:"revision"`
+			Mtime    int64  `json:"mtime"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) != 5 {
+		t.Fatalf("results len = %d, want 5", len(out.Results))
+	}
+	if out.Results[0].Status != http.StatusOK || out.Results[0].Size != 4 || out.Results[0].IsDir || out.Results[0].Revision != 1 || out.Results[0].Mtime == 0 {
+		t.Fatalf("file result = %+v, want ok file metadata", out.Results[0])
+	}
+	if out.Results[1].Status != http.StatusOK || !out.Results[1].IsDir {
+		t.Fatalf("dir result = %+v, want ok directory metadata", out.Results[1])
+	}
+	if out.Results[2].Status != http.StatusNotFound || out.Results[2].Error == "" {
+		t.Fatalf("missing result = %+v, want per-path 404", out.Results[2])
+	}
+	if out.Results[3].Status != http.StatusOK || out.Results[3].Path != "/data/a.txt" {
+		t.Fatalf("duplicate result = %+v, want duplicate preserved", out.Results[3])
+	}
+	if out.Results[4].Status != http.StatusBadRequest || out.Results[4].Error == "" {
+		t.Fatalf("invalid path result = %+v, want per-path 400", out.Results[4])
+	}
+}
+
+func TestBatchStatEmptyAndTooLargeInputs(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs:batch-stat", strings.NewReader(`{"paths":[]}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var empty struct {
+		Results []struct{} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&empty); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("empty status = %d, want 200", resp.StatusCode)
+	}
+	if len(empty.Results) != 0 {
+		t.Fatalf("empty results len = %d, want 0", len(empty.Results))
+	}
+
+	paths := make([]string, maxBatchStatPaths+1)
+	for i := range paths {
+		paths[i] = "/x.txt"
+	}
+	payload, err := json.Marshal(map[string][]string{"paths": paths})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs:batch-stat", strings.NewReader(string(payload)))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("too-large status = %d, want 400", resp.StatusCode)
+	}
+}
+
 func TestStatMetadataIncludesTagsAndSemanticText(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
