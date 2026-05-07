@@ -1870,11 +1870,10 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 	if fs.commitQueue != nil {
 		fs.commitQueue.WaitPath(newP)
 	}
-	targetExists, err := fs.pendingRenameTargetExists(ctx, newP)
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+	targetExists, err := fs.pendingRenameTargetExists(probeCtx, newP)
+	probeCancel()
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return pendingRenameNotApplicable, err
-		}
 		log.Printf("rename: probe final pending-new target %s failed, using remote fallback: %v", newP, err)
 		return pendingRenameRemoteFallback, nil
 	}
@@ -1888,11 +1887,10 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 
 		// The cancel may have raced with a successful upload. If so, the old
 		// path now exists remotely and the normal server-side rename is correct.
-		oldRemoteExists, err := fs.remotePathExists(ctx, oldP)
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+		oldRemoteExists, err := fs.remotePathExists(probeCtx, oldP)
+		probeCancel()
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return pendingRenameNotApplicable, err
-			}
 			log.Printf("rename: probe old pending-new source %s failed, using remote fallback: %v", oldP, err)
 			return pendingRenameRemoteFallback, nil
 		}
