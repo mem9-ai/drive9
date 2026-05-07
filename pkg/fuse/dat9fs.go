@@ -107,7 +107,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		fileHandles:   NewHandleTable[*FileHandle](),
 		dirHandles:    NewHandleTable[*DirHandle](),
 		readCache:     NewReadCache(opts.CacheSize, 0),
-		dirCache:      NewDirCache(opts.DirTTL),
+		dirCache:      NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
 		dirtyInodes:   make(map[uint64]dirtyInodeState),
 		uid:           uint32(os.Getuid()),
 		gid:           uint32(os.Getgid()),
@@ -1047,6 +1047,69 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 	return nil, lastErr
 }
 
+func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
+	if entry == nil {
+		return CachedFileInfo{Name: name}
+	}
+	mtime := entry.Mtime
+	if mtime.IsZero() {
+		mtime = time.Now()
+	}
+	return CachedFileInfo{
+		Name:     name,
+		Size:     entry.Size,
+		IsDir:    entry.IsDir,
+		Mtime:    mtime,
+		Revision: entry.Revision,
+	}
+}
+
+func cachedInfoFromStat(name string, stat *client.StatResult) CachedFileInfo {
+	mtime := time.Now()
+	if stat != nil && !stat.Mtime.IsZero() {
+		mtime = stat.Mtime
+	}
+	item := CachedFileInfo{Name: name, Mtime: mtime}
+	if stat != nil {
+		item.Size = stat.Size
+		item.IsDir = stat.IsDir
+		item.Revision = stat.Revision
+	}
+	return item
+}
+
+func (fs *Dat9FS) cacheFileForPath(p string, size int64, mtime time.Time, revision int64) {
+	if fs == nil || fs.dirCache == nil || p == "/" {
+		return
+	}
+	if mtime.IsZero() {
+		mtime = time.Now()
+	}
+	parentPath, name := cacheParentName(p)
+	fs.dirCache.Upsert(parentPath, CachedFileInfo{
+		Name:     name,
+		Size:     size,
+		IsDir:    false,
+		Mtime:    mtime,
+		Revision: revision,
+	})
+}
+
+func (fs *Dat9FS) cacheNegativePath(p string) {
+	if fs == nil || fs.dirCache == nil || p == "/" || isLockFilePath(p) {
+		return
+	}
+	parentPath, name := cacheParentName(p)
+	fs.dirCache.MarkNegative(parentPath, name)
+}
+
+func (fs *Dat9FS) negativeEntryTTL(p string) time.Duration {
+	if isLockFilePath(p) {
+		return 0
+	}
+	return fs.opts.NegativeEntryTTL
+}
+
 func (fs *Dat9FS) remoteDirExistsDetached(localPath string) bool {
 	retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
 	defer retryCancel()
@@ -1211,21 +1274,14 @@ func (fs *Dat9FS) renameRemoteWithTransientRetry(ctx context.Context, oldP, newP
 }
 
 func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofuse.EntryOut) (bool, gofuse.Status) {
-	cached, ok := fs.dirCache.Get(parentPath)
-	if !ok {
+	result := fs.dirCache.Lookup(parentPath, name)
+	switch result.kind {
+	case namespaceLookupPositive:
 		if fs.perf != nil {
-			fs.perf.dirCacheMiss.add(1)
+			fs.perf.dirCacheHit.add(1)
+			fs.perf.namespacePositiveHit.add(1)
 		}
-		return false, gofuse.OK
-	}
-	if fs.perf != nil {
-		fs.perf.dirCacheHit.add(1)
-	}
-
-	for _, item := range cached {
-		if item.Name != name {
-			continue
-		}
+		item := result.item
 		mtime := item.Mtime
 		if mtime.IsZero() {
 			mtime = time.Now()
@@ -1240,11 +1296,39 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 		}
 		fs.fillEntryOut(entry, out)
 		return true, gofuse.OK
+	case namespaceLookupNegative, namespaceLookupCompleteMiss, namespaceLookupSessionMiss:
+		if isLockFilePath(childP) {
+			if fs.perf != nil {
+				fs.perf.dirCacheMiss.add(1)
+			}
+			return false, gofuse.OK
+		}
+		if fs.perf != nil {
+			fs.perf.dirCacheHit.add(1)
+			switch result.kind {
+			case namespaceLookupNegative:
+				fs.perf.namespaceNegativeHit.add(1)
+			case namespaceLookupCompleteMiss:
+				fs.perf.namespaceCompleteMiss.add(1)
+			case namespaceLookupSessionMiss:
+				fs.perf.namespaceSessionMiss.add(1)
+			}
+		}
+		out.NodeId = 0
+		out.SetEntryTimeout(fs.negativeEntryTTL(childP))
+		return true, gofuse.ENOENT
+	case namespaceLookupPartialMiss:
+		if fs.perf != nil {
+			fs.perf.dirCacheMiss.add(1)
+			fs.perf.namespacePartialMiss.add(1)
+		}
+		return false, gofuse.OK
+	default:
+		if fs.perf != nil {
+			fs.perf.dirCacheMiss.add(1)
+		}
+		return false, gofuse.OK
 	}
-
-	out.NodeId = 0
-	out.SetEntryTimeout(fs.opts.NegativeEntryTTL)
-	return true, gofuse.ENOENT
 }
 
 // --- RawFileSystem methods ---------------------------------------------------
@@ -1381,8 +1465,9 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		}
 		// Cache negative lookup: tell kernel this entry doesn't exist
 		// for NegativeEntryTTL so it doesn't re-ask immediately.
+		fs.cacheNegativePath(childP)
 		out.NodeId = 0
-		out.SetEntryTimeout(fs.opts.NegativeEntryTTL)
+		out.SetEntryTimeout(fs.negativeEntryTTL(childP))
 		return gofuse.ENOENT
 	}
 
@@ -1395,6 +1480,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if stat.Revision > 0 {
 		fs.inodes.UpdateRevision(ino, stat.Revision)
 	}
+	fs.dirCache.Upsert(parentPath, cachedInfoFromStat(name, stat))
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
@@ -1617,6 +1703,8 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				// Refresh the inode revision after the server-side truncate so a
 				// subsequent writable open does not reuse the stale pre-truncate
 				// base revision and conflict with its own zero-byte write.
+				var refreshedRevision int64
+				var refreshedMtime time.Time
 				statStart := fs.perfStart()
 				stat, statErr := fs.client.StatCtx(ctx, apiPath)
 				fs.perfRecordRemote(perfRemoteStat, statStart, statErr, 0)
@@ -1624,17 +1712,19 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					log.Printf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, input.NodeId, statErr)
 				} else if stat != nil {
 					if stat.Revision > 0 {
+						refreshedRevision = stat.Revision
 						entry.Revision = stat.Revision
 						fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
 						fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, input.Pid)
 					}
 					if !stat.Mtime.IsZero() {
+						refreshedMtime = stat.Mtime
 						entry.Mtime = stat.Mtime
 						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
 					}
 				}
 				fs.readCache.Invalidate(entry.Path)
-				fs.dirCache.Invalidate(parentDir(entry.Path))
+				fs.cacheFileForPath(entry.Path, 0, refreshedMtime, refreshedRevision)
 			} else if newSize != entry.Size {
 				// Arbitrary truncate without an open handle is not
 				// supported — dat9 has no server-side truncate API.
@@ -1673,7 +1763,8 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 	}
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
-	fs.dirCache.Invalidate(parentPath)
+	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.dirCache.MarkSessionCreatedDir(childP)
 	// Kernel already receives the new entry via the Mkdir reply —
 	// no need for notifyEntry/notifyInode here.
 
@@ -1768,7 +1859,8 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	fs.readCache.Invalidate(childP)
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
-	fs.dirCache.Invalidate(parentPath)
+	fs.dirCache.Remove(parentPath, name)
+	fs.cacheNegativePath(childP)
 	// Kernel initiated the unlink and receives OK — it already
 	// removes the dentry. No notifyEntry/notifyInode needed.
 	return gofuse.OK
@@ -1836,11 +1928,12 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	}
 
 	fs.inodes.Remove(childP)
-	fs.dirCache.Invalidate(childP)
+	fs.dirCache.InvalidatePrefix(childP)
 	fs.readCache.InvalidatePrefix(childP + "/")
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
-	fs.dirCache.Invalidate(parentPath)
+	fs.dirCache.Remove(parentPath, name)
+	fs.cacheNegativePath(childP)
 	// Kernel initiated the rmdir and receives OK — it already
 	// removes the dentry. No notifyEntry/notifyInode needed.
 	return gofuse.OK
@@ -1988,6 +2081,11 @@ func (fs *Dat9FS) pendingRenameTargetExists(ctx context.Context, p string) (bool
 }
 
 func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
+	var oldEntry *InodeEntry
+	oldEntryOK := false
+	if oldIno, ok := fs.inodes.GetInode(oldP); ok {
+		oldEntry, oldEntryOK = fs.inodes.GetEntry(oldIno)
+	}
 	fs.inodes.Rename(oldP, newP)
 	fs.readCache.Invalidate(oldP)
 	fs.readCache.Invalidate(newP)
@@ -1995,10 +2093,16 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	fs.readCache.InvalidatePrefix(newP + "/")
 
 	oldParent, _ := fs.inodes.GetPath(input.NodeId)
-	fs.dirCache.Invalidate(oldParent)
+	fs.dirCache.Remove(oldParent, path.Base(oldP))
+	fs.cacheNegativePath(oldP)
+	fs.dirCache.InvalidatePrefix(oldP)
+	fs.dirCache.InvalidatePrefix(newP)
+	newParent := oldParent
 	if input.Newdir != input.NodeId {
-		newParent, _ := fs.inodes.GetPath(input.Newdir)
-		fs.dirCache.Invalidate(newParent)
+		newParent, _ = fs.inodes.GetPath(input.Newdir)
+	}
+	if oldEntryOK {
+		fs.dirCache.Upsert(newParent, cachedInfoFromEntry(path.Base(newP), oldEntry))
 	}
 }
 
@@ -2473,7 +2577,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	fs.fillEntryOut(entry, &out.EntryOut)
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
-	fs.dirCache.Invalidate(parentPath)
+	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
 	// Kernel initiated the create and receives the new entry via reply —
 	// no need for notifyEntry/notifyInode here.
 	return gofuse.OK
@@ -3529,7 +3633,11 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			}
 
 			fs.readCache.Invalidate(fh.Path)
-			fs.dirCache.Invalidate(parentDir(fh.Path))
+			if flushStatus == gofuse.OK {
+				fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
+			} else {
+				fs.dirCache.Invalidate(parentDir(fh.Path))
+			}
 			// Local release — kernel already knows about this close.
 			// No notifyInode needed; userspace caches are invalidated above.
 			return
@@ -3597,7 +3705,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 
 				// Invalidate caches so subsequent reads see fresh data.
 				fs.readCache.Invalidate(fh.Path)
-				fs.dirCache.Invalidate(parentDir(fh.Path))
+				fs.cacheFileForPath(fh.Path, fh.Dirty.Size(), time.Now(), 0)
 				// Local release — kernel already knows about this close.
 				// No notifyInode needed; userspace caches are invalidated above.
 				return
@@ -3707,8 +3815,8 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		} else {
 			fs.readCache.Invalidate(filePath)
 		}
-		fs.dirCache.Invalidate(parentDir(filePath))
 		fs.inodes.UpdateSize(ino, int64(len(data)))
+		fs.cacheFileForPath(filePath, int64(len(data)), time.Now(), committedRev)
 		// Local debounced flush — kernel is not aware of this async
 		// operation and does not need notify. Userspace caches are
 		// updated above; kernel will pick up new attrs on next getattr.
@@ -3818,8 +3926,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
 		fs.readCache.Invalidate(fh.Path)
-		fs.dirCache.Invalidate(parentDir(fh.Path))
 		fs.inodes.UpdateSize(fh.Ino, size)
+		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		// Remove stale shadow so subsequent read-only opens don't serve
 		// the empty placeholder created at Create/Open time.
 		if fs.shadowStore != nil {
@@ -3875,8 +3983,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
 		fs.readCache.Invalidate(fh.Path)
-		fs.dirCache.Invalidate(parentDir(fh.Path))
 		fs.inodes.UpdateSize(fh.Ino, size)
+		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		// Remove stale shadow (same reason as Path 1a above).
 		if fs.shadowStore != nil {
 			fs.shadowStore.Remove(fh.Path)
@@ -3977,8 +4085,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.readCache.Invalidate(fh.Path)
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 	}
-	fs.dirCache.Invalidate(parentDir(fh.Path))
 	fs.inodes.UpdateSize(fh.Ino, size)
+	fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
 	// Local flush — kernel receives the Flush reply with status.
 	// No notifyInode/notifyEntry needed; userspace caches are updated
 	// above and kernel will refresh attrs on next getattr/lookup.
@@ -4089,13 +4197,13 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		}
 		fs.inodes.UpdateRevision(entry.Inode, committedRev)
 		fs.inodes.UpdateSize(entry.Inode, entry.Size)
-		fs.dirCache.Invalidate(parentDir(entry.Path))
+		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), committedRev)
 		// Local async commit completion — this is not an external change.
 		// Kernel does not need notify; userspace caches and inode state
 		// are updated above. Kernel will see new attrs on next access.
 	} else {
 		fs.readCache.Invalidate(entry.Path)
-		fs.dirCache.Invalidate(parentDir(entry.Path))
+		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
 	}
 }
 

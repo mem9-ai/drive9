@@ -92,6 +92,12 @@ type fusePerfCounters struct {
 	prefetchHit   atomicUint64
 	prefetchMiss  atomicUint64
 
+	namespacePositiveHit  atomicUint64
+	namespaceNegativeHit  atomicUint64
+	namespaceCompleteMiss atomicUint64
+	namespaceSessionMiss  atomicUint64
+	namespacePartialMiss  atomicUint64
+
 	lookupRetryTotal     atomicUint64
 	lookupRetrySuccess   atomicUint64
 	lookupRetryExhausted atomicUint64
@@ -218,6 +224,11 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 	snap.Counters["dir_cache_miss"] = p.dirCacheMiss.load()
 	snap.Counters["prefetch_hit"] = p.prefetchHit.load()
 	snap.Counters["prefetch_miss"] = p.prefetchMiss.load()
+	snap.Counters["namespace_positive_hit"] = p.namespacePositiveHit.load()
+	snap.Counters["namespace_negative_hit"] = p.namespaceNegativeHit.load()
+	snap.Counters["namespace_complete_miss"] = p.namespaceCompleteMiss.load()
+	snap.Counters["namespace_session_miss"] = p.namespaceSessionMiss.load()
+	snap.Counters["namespace_partial_miss"] = p.namespacePartialMiss.load()
 	snap.Counters["lookup_retry_total"] = p.lookupRetryTotal.load()
 	snap.Counters["lookup_retry_success"] = p.lookupRetrySuccess.load()
 	snap.Counters["lookup_retry_exhausted"] = p.lookupRetryExhausted.load()
@@ -257,6 +268,10 @@ func (p *fusePerfCounters) printSummary(w io.Writer) {
 		snap.Counters["read_cache_hit"], snap.Counters["read_cache_miss"],
 		snap.Counters["dir_cache_hit"], snap.Counters["dir_cache_miss"],
 		snap.Counters["prefetch_hit"], snap.Counters["prefetch_miss"])
+	writePerfLine(w, "drive9: perf namespace positive_hit=%d negative_hit=%d complete_miss=%d session_miss=%d partial_miss=%d\n",
+		snap.Counters["namespace_positive_hit"], snap.Counters["namespace_negative_hit"],
+		snap.Counters["namespace_complete_miss"], snap.Counters["namespace_session_miss"],
+		snap.Counters["namespace_partial_miss"])
 	writePerfLine(w, "drive9: perf retries lookup_total=%d lookup_success=%d lookup_exhausted=%d read_total=%d read_success=%d read_exhausted=%d\n",
 		snap.Counters["lookup_retry_total"], snap.Counters["lookup_retry_success"], snap.Counters["lookup_retry_exhausted"],
 		snap.Counters["read_retry_total"], snap.Counters["read_retry_success"], snap.Counters["read_retry_exhausted"])

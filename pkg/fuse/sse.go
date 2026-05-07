@@ -89,6 +89,7 @@ func (w *SSEWatcher) handleChange(ce *client.ChangeEvent) {
 
 	// Invalidate directory cache for the parent directory.
 	w.fs.dirCache.Invalidate(parentDir(p))
+	w.fs.dirCache.InvalidatePrefix(p)
 
 	// Notify kernel about the change.
 	if ino, ok := w.fs.inodes.GetInode(p); ok {

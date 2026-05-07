@@ -134,6 +134,33 @@ func TestSSEWatcherHandleChangeInvalidatesCache(t *testing.T) {
 	}
 }
 
+func TestSSEWatcherHandleChangeInvalidatesChildDirNamespace(t *testing.T) {
+	opts := &MountOptions{
+		CacheSize: 1 << 20,
+		DirTTL:    5 * time.Second,
+	}
+	opts.setDefaults()
+	fs := &Dat9FS{
+		inodes:    NewInodeToPath(),
+		readCache: NewReadCache(opts.CacheSize, 0),
+		dirCache:  NewDirCache(opts.DirTTL),
+	}
+
+	fs.dirCache.Put("/docs/subdir", []CachedFileInfo{{Name: "stale.txt", Size: 50}})
+	w := &SSEWatcher{fs: fs, actor: "my-actor"}
+
+	w.handleChange(&client.ChangeEvent{
+		Seq:   1,
+		Path:  "/docs/subdir",
+		Op:    "delete",
+		Actor: "other-actor",
+	})
+
+	if _, ok := fs.dirCache.Get("/docs/subdir"); ok {
+		t.Error("child dir namespace should be invalidated after directory change")
+	}
+}
+
 func TestSSEWatcherHandleChangeFiltersAndRebasesRemoteRoot(t *testing.T) {
 	opts := &MountOptions{
 		CacheSize:  1 << 20,
