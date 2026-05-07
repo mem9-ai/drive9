@@ -682,11 +682,7 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 		}
 		if e.File != nil {
 			info.Size = e.File.SizeBytes
-			if e.File.ConfirmedAt != nil {
-				info.ModTime = *e.File.ConfirmedAt
-			} else {
-				info.ModTime = e.File.CreatedAt
-			}
+			info.ModTime = fileMtime(e.File)
 		} else {
 			info.ModTime = e.Node.CreatedAt
 		}
@@ -783,6 +779,10 @@ type ReadPlan struct {
 	PresignURL string
 	// Size is the file size in bytes.
 	Size int64
+	// Revision is the file revision observed by the same metadata query.
+	Revision int64
+	// Mtime is the confirmed timestamp when available, otherwise file creation time.
+	Mtime time.Time
 }
 
 // ReadPlanCtx resolves a file path into a ReadPlan with a single metadata query.
@@ -843,6 +843,8 @@ func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (plan *ReadP
 		return &ReadPlan{
 			InlineData: nf.File.ContentBlob,
 			Size:       nf.File.SizeBytes,
+			Revision:   nf.File.Revision,
+			Mtime:      fileMtime(nf.File),
 		}, nil
 	case datastore.StorageS3:
 		if b.s3 == nil {
@@ -860,10 +862,51 @@ func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (plan *ReadP
 		return &ReadPlan{
 			PresignURL: url,
 			Size:       nf.File.SizeBytes,
+			Revision:   nf.File.Revision,
+			Mtime:      fileMtime(nf.File),
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported storage type for read plan: %s", nf.File.StorageType)
 	}
+}
+
+// ReadInlinePlanCtx resolves a file path to inline db9 data without presigning
+// S3 objects. Batch read-small uses this to reject S3-backed files cheaply
+// without reading or presigning object storage data.
+func (b *Dat9Backend) ReadInlinePlanCtx(ctx context.Context, path string) (plan *ReadPlan, err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "read_inline_plan", err, start) }()
+
+	resolvedPath, err := pathutil.Canonicalize(path)
+	if err != nil {
+		return nil, err
+	}
+	nf, err := b.store.StatForRead(ctx, resolvedPath)
+	if err != nil {
+		return nil, err
+	}
+	if nf.Node.IsDirectory || nf.File == nil {
+		return nil, datastore.ErrNotFound
+	}
+	if nf.File.StorageType != datastore.StorageDB9 {
+		return nil, ErrNotInlineStorage
+	}
+	return &ReadPlan{
+		InlineData: nf.File.ContentBlob,
+		Size:       nf.File.SizeBytes,
+		Revision:   nf.File.Revision,
+		Mtime:      fileMtime(nf.File),
+	}, nil
+}
+
+func fileMtime(f *datastore.File) time.Time {
+	if f == nil {
+		return time.Time{}
+	}
+	if f.ConfirmedAt != nil {
+		return *f.ConfirmedAt
+	}
+	return f.CreatedAt
 }
 
 func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
@@ -880,11 +923,7 @@ func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
 	}
 	if nf.File != nil {
 		info.Size = nf.File.SizeBytes
-		if nf.File.ConfirmedAt != nil {
-			info.ModTime = *nf.File.ConfirmedAt
-		} else {
-			info.ModTime = nf.File.CreatedAt
-		}
+		info.ModTime = fileMtime(nf.File)
 	} else {
 		info.ModTime = nf.Node.CreatedAt
 	}

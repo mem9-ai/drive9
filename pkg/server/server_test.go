@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,11 +10,13 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/pathutil"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
@@ -45,6 +48,39 @@ func newTestServer(t *testing.T) *Server {
 		t.Fatal(err)
 	}
 	return New(b)
+}
+
+func insertTestS3File(t *testing.T, s *Server, p string, size int64) {
+	t.Helper()
+	now := time.Now().UTC()
+	fileID := "test-s3-" + strings.Trim(pathutil.BaseName(p), ".")
+	store := s.fallback.Store()
+	if err := store.InsertFile(context.Background(), &datastore.File{
+		FileID:                fileID,
+		StorageType:           datastore.StorageS3,
+		StorageRef:            "blobs/" + fileID,
+		StorageEncryptionMode: datastore.StorageEncryptionLegacy,
+		SizeBytes:             size,
+		Revision:              1,
+		Status:                datastore.StatusConfirmed,
+		CreatedAt:             now,
+		ConfirmedAt:           &now,
+	}); err != nil {
+		t.Fatalf("insert s3 file: %v", err)
+	}
+	if err := store.EnsureParentDirs(context.Background(), p, func() string { return "node-parent-" + fileID }); err != nil {
+		t.Fatalf("ensure parent dirs: %v", err)
+	}
+	if err := store.InsertNode(context.Background(), &datastore.FileNode{
+		NodeID:     "node-" + fileID,
+		Path:       p,
+		ParentPath: pathutil.ParentPath(p),
+		Name:       pathutil.BaseName(p),
+		FileID:     fileID,
+		CreatedAt:  now,
+	}); err != nil {
+		t.Fatalf("insert s3 node: %v", err)
+	}
 }
 
 func newLocalTenantShimServer(t *testing.T, apiKey string) *Server {
@@ -375,6 +411,176 @@ func TestBatchStatEmptyAndTooLargeInputs(t *testing.T) {
 		t.Fatal(err)
 	}
 	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs:batch-stat", strings.NewReader(string(payload)))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("too-large status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestBatchReadSmallReturnsPerPathResults(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/a.txt", strings.NewReader("hello"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("write: %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/data/dir?mkdir", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mkdir: %d", resp.StatusCode)
+	}
+
+	body := `{"paths":["/data/a.txt","/missing.txt","/bad\\path","/data/dir","/data/a.txt"],"max_bytes":16}`
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs:batch-read-small", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		response, _ := io.ReadAll(resp.Body)
+		t.Fatalf("batch read-small status = %d, body %s", resp.StatusCode, response)
+	}
+	var out struct {
+		Results []struct {
+			Path     string `json:"path"`
+			Status   int    `json:"status"`
+			Error    string `json:"error"`
+			Data     []byte `json:"data"`
+			Size     int64  `json:"size"`
+			Revision int64  `json:"revision"`
+			Mtime    int64  `json:"mtime"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) != 5 {
+		t.Fatalf("results len = %d, want 5", len(out.Results))
+	}
+	if out.Results[0].Status != http.StatusOK || string(out.Results[0].Data) != "hello" || out.Results[0].Size != 5 || out.Results[0].Revision != 1 || out.Results[0].Mtime == 0 {
+		t.Fatalf("file result = %+v, want ok file data", out.Results[0])
+	}
+	if out.Results[1].Status != http.StatusNotFound || out.Results[1].Error == "" {
+		t.Fatalf("missing result = %+v, want per-path 404", out.Results[1])
+	}
+	if out.Results[2].Status != http.StatusBadRequest || out.Results[2].Error == "" {
+		t.Fatalf("invalid path result = %+v, want per-path 400", out.Results[2])
+	}
+	if out.Results[3].Status != http.StatusNotFound || out.Results[3].Error == "" {
+		t.Fatalf("directory result = %+v, want per-path 404 matching GET semantics", out.Results[3])
+	}
+	if out.Results[4].Status != http.StatusOK || out.Results[4].Path != "/data/a.txt" || string(out.Results[4].Data) != "hello" {
+		t.Fatalf("duplicate result = %+v, want duplicate preserved", out.Results[4])
+	}
+}
+
+func TestBatchReadSmallEmptyTooLargeAndFileTooLarge(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs:batch-read-small", strings.NewReader(`{"paths":[]}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var empty struct {
+		Results []struct{} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&empty); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("empty status = %d, want 200", resp.StatusCode)
+	}
+	if len(empty.Results) != 0 {
+		t.Fatalf("empty results len = %d, want 0", len(empty.Results))
+	}
+
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/large.txt", strings.NewReader("hello"))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("write large candidate: %d", resp.StatusCode)
+	}
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs:batch-read-small", strings.NewReader(`{"paths":["/data/large.txt"],"max_bytes":4}`))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tooLargeFile struct {
+		Results []struct {
+			Status int    `json:"status"`
+			Error  string `json:"error"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tooLargeFile); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("file-too-large batch status = %d, want 200", resp.StatusCode)
+	}
+	if len(tooLargeFile.Results) != 1 || tooLargeFile.Results[0].Status != http.StatusRequestEntityTooLarge || tooLargeFile.Results[0].Error == "" {
+		t.Fatalf("file-too-large result = %+v, want per-path 413", tooLargeFile.Results)
+	}
+
+	insertTestS3File(t, s, "/data/s3.txt", 1)
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs:batch-read-small", strings.NewReader(`{"paths":["/data/s3.txt"],"max_bytes":50000}`))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nonInlineFile struct {
+		Results []struct {
+			Status int    `json:"status"`
+			Error  string `json:"error"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&nonInlineFile); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("non-inline batch status = %d, want 200", resp.StatusCode)
+	}
+	if len(nonInlineFile.Results) != 1 ||
+		nonInlineFile.Results[0].Status != http.StatusRequestEntityTooLarge ||
+		nonInlineFile.Results[0].Error != "file is not available for inline read" {
+		t.Fatalf("non-inline result = %+v, want per-path 413 inline-storage error", nonInlineFile.Results)
+	}
+
+	paths := make([]string, maxBatchReadSmallPaths+1)
+	for i := range paths {
+		paths[i] = "/x.txt"
+	}
+	payload, err := json.Marshal(map[string][]string{"paths": paths})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs:batch-read-small", strings.NewReader(string(payload)))
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

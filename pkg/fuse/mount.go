@@ -29,27 +29,32 @@ import (
 // its entire lifetime (Invariant #3). To change credentials, umount and
 // remount; there is no in-process rebind.
 type MountOptions struct {
-	Server             string        // dat9 server URL
-	APIKey             string        // owner API key (mutually exclusive with Token)
-	Token              string        // delegated capability JWT (mutually exclusive with APIKey)
-	MountPoint         string        // local mount point
-	RemoteRoot         string        // remote subtree root (default "/"); set via "drive9 mount :/path /local"
-	CacheDir           string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
-	CacheSize          int64         // ReadCache max size in bytes (default 128MB)
-	DirTTL             time.Duration // DirCache TTL (default 10s)
-	AttrTTL            time.Duration // kernel attr cache TTL (default 10s)
-	EntryTTL           time.Duration // kernel entry cache TTL (default 10s)
-	NegativeEntryTTL   time.Duration // kernel negative entry cache TTL (default 10s)
-	FlushDebounce      time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
-	SyncMode           SyncMode      // interactive, strict, or auto (default auto)
-	Profile            string        // mount profile: "interactive", "" (default)
-	UploadConcurrency  int           // number of background upload workers (default 4)
-	LookupRetryCount   int           // detached retries after transient Lookup/GetAttr stat failures (default 2)
-	LookupRetryTimeout time.Duration // timeout per detached stat retry after interrupt/transient errors (default 250ms)
-	AllowOther         bool          // allow other users to access mount
-	ReadOnly           bool          // mount as read-only
-	Debug              bool          // enable FUSE debug logging
-	PerfCounters       bool          // print low-overhead FUSE perf counter summary on shutdown
+	Server               string        // dat9 server URL
+	APIKey               string        // owner API key (mutually exclusive with Token)
+	Token                string        // delegated capability JWT (mutually exclusive with APIKey)
+	MountPoint           string        // local mount point
+	RemoteRoot           string        // remote subtree root (default "/"); set via "drive9 mount :/path /local"
+	CacheDir             string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
+	CacheSize            int64         // ReadCache max size in bytes (default 128MB)
+	DirTTL               time.Duration // DirCache TTL (default 10s)
+	AttrTTL              time.Duration // kernel attr cache TTL (default 10s)
+	EntryTTL             time.Duration // kernel entry cache TTL (default 10s)
+	NegativeEntryTTL     time.Duration // kernel negative entry cache TTL (default 10s)
+	FlushDebounce        time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
+	SyncMode             SyncMode      // interactive, strict, or auto (default auto)
+	Profile              string        // mount profile: "interactive", "" (default)
+	UploadConcurrency    int           // number of background upload workers (default 4)
+	LookupRetryCount     int           // detached retries after transient Lookup/GetAttr stat failures (default 2)
+	LookupRetryTimeout   time.Duration // timeout per detached stat retry after interrupt/transient errors (default 250ms)
+	ReadDirPrefetch      bool          // prefetch small files after readdir into ReadCache (default false)
+	PrefetchMaxFiles     int           // maximum files prefetched per directory read (default 32 when enabled)
+	PrefetchMaxFileBytes int64         // maximum individual file size prefetched (default 50KB)
+	PrefetchMaxBytes     int64         // maximum aggregate bytes prefetched per directory read (default 1MB)
+	PrefetchTimeout      time.Duration // timeout for one readdir prefetch batch (default 1s)
+	AllowOther           bool          // allow other users to access mount
+	ReadOnly             bool          // mount as read-only
+	Debug                bool          // enable FUSE debug logging
+	PerfCounters         bool          // print low-overhead FUSE perf counter summary on shutdown
 }
 
 func (o *MountOptions) setDefaults() {
@@ -84,6 +89,18 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.LookupRetryTimeout <= 0 {
 		o.LookupRetryTimeout = lookupTransientRetryTimeout
+	}
+	if o.PrefetchMaxFiles <= 0 {
+		o.PrefetchMaxFiles = defaultReadDirPrefetchMaxFiles
+	}
+	if o.PrefetchMaxFileBytes <= 0 || o.PrefetchMaxFileBytes > smallFileThreshold {
+		o.PrefetchMaxFileBytes = smallFileThreshold
+	}
+	if o.PrefetchMaxBytes <= 0 {
+		o.PrefetchMaxBytes = defaultReadDirPrefetchMaxBytes
+	}
+	if o.PrefetchTimeout <= 0 {
+		o.PrefetchTimeout = defaultReadDirPrefetchTimeout
 	}
 	// Apply interactive profile if requested.
 	if o.Profile == "interactive" {

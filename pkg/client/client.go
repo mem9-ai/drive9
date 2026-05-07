@@ -188,6 +188,9 @@ type StatResult struct {
 // MaxBatchStatPaths is the maximum number of paths accepted by BatchStatCtx.
 const MaxBatchStatPaths = 256
 
+// MaxBatchReadSmallPaths is the maximum number of paths accepted by BatchReadSmallCtx.
+const MaxBatchReadSmallPaths = 128
+
 // BatchStatResult is one per-path result from BatchStatCtx.
 //
 // Status is the HTTP-like per-path status. A missing path returns Status 404
@@ -204,6 +207,25 @@ type BatchStatResult struct {
 
 // OK reports whether the per-path batch stat result is successful.
 func (r BatchStatResult) OK() bool {
+	return r.Status >= 200 && r.Status < 300 && r.Error == ""
+}
+
+// BatchReadSmallResult is one per-path result from BatchReadSmallCtx.
+//
+// Data is JSON base64-encoded on the wire. Missing, invalid, directory, and
+// too-large paths are reported as per-path errors.
+type BatchReadSmallResult struct {
+	Path     string `json:"path"`
+	Status   int    `json:"status"`
+	Error    string `json:"error,omitempty"`
+	Data     []byte `json:"data,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+	Revision int64  `json:"revision,omitempty"`
+	Mtime    int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
+}
+
+// OK reports whether the per-path batch read-small result is successful.
+func (r BatchReadSmallResult) OK() bool {
 	return r.Status >= 200 && r.Status < 300 && r.Error == ""
 }
 
@@ -477,6 +499,55 @@ func (c *Client) BatchStatCtx(ctx context.Context, paths []string) ([]BatchStatR
 	}
 	if len(out.Results) != len(paths) {
 		return nil, fmt.Errorf("batch stat: got %d results for %d paths", len(out.Results), len(paths))
+	}
+	return out.Results, nil
+}
+
+// BatchReadSmallCtx reads up to MaxBatchReadSmallPaths small inline files.
+//
+// Transport/request errors fail the method. Per-path read errors are returned
+// inside the corresponding BatchReadSmallResult so one missing or too-large
+// path does not fail the whole batch.
+func (c *Client) BatchReadSmallCtx(ctx context.Context, paths []string, maxBytes int64) ([]BatchReadSmallResult, error) {
+	if len(paths) == 0 {
+		return []BatchReadSmallResult{}, nil
+	}
+	if len(paths) > MaxBatchReadSmallPaths {
+		return nil, fmt.Errorf("batch read-small: %d paths exceeds limit of %d", len(paths), MaxBatchReadSmallPaths)
+	}
+	body, err := json.Marshal(struct {
+		Paths    []string `json:"paths"`
+		MaxBytes int64    `json:"max_bytes,omitempty"`
+	}{Paths: paths, MaxBytes: maxBytes})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/fs:batch-read-small", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var out struct {
+		Results []BatchReadSmallResult `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	if len(out.Results) != len(paths) {
+		return nil, fmt.Errorf("batch read-small: got %d results for %d paths", len(out.Results), len(paths))
+	}
+	for i := range out.Results {
+		if out.Results[i].Path != paths[i] {
+			return nil, fmt.Errorf("batch read-small: result[%d] path = %q, want %q", i, out.Results[i].Path, paths[i])
+		}
 	}
 	return out.Results, nil
 }
