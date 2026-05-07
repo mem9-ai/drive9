@@ -742,6 +742,123 @@ func TestLookupFallsBackToParentListWhenDirStatUnsupported(t *testing.T) {
 	}
 }
 
+func TestLookupUsesDirCachePositiveEntryWithoutRemoteStat(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "unexpected remote call", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	mtime := time.Unix(123, 0)
+	fs.dirCache.Put("/", []CachedFileInfo{{
+		Name:     "cached.txt",
+		Size:     12,
+		IsDir:    false,
+		Mtime:    mtime,
+		Revision: 7,
+	}})
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "cached.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+	if got, want := out.Size, uint64(12); got != want {
+		t.Fatalf("Lookup size = %d, want %d", got, want)
+	}
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("lookup inode entry not found")
+	}
+	if entry.Revision != 7 {
+		t.Fatalf("inode revision = %d, want 7", entry.Revision)
+	}
+}
+
+func TestLookupUsesDirCacheNegativeEntryWithoutRemoteStat(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "unexpected remote call", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "other.txt", Size: 1}})
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "missing.txt", &out)
+	if st != gofuse.ENOENT {
+		t.Fatalf("Lookup status = %v, want ENOENT", st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+	if out.NodeId != 0 {
+		t.Fatalf("negative lookup NodeId = %d, want 0", out.NodeId)
+	}
+}
+
+func TestLookupListFallbackPopulatesDirCacheForLaterMisses(t *testing.T) {
+	var headCalls atomic.Int32
+	var listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			headCalls.Add(1)
+			http.Error(w, "not found", http.StatusNotFound)
+		case http.MethodGet:
+			if r.URL.Path == "/v1/fs/" && r.URL.Query().Get("list") == "1" {
+				listCalls.Add(1)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"entries": []map[string]any{{
+						"name":  "listed.txt",
+						"isDir": false,
+						"size":  3,
+					}},
+				})
+				return
+			}
+			http.NotFound(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var first gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "first-missing.txt", &first)
+	if st != gofuse.ENOENT {
+		t.Fatalf("first Lookup status = %v, want ENOENT", st)
+	}
+
+	var second gofuse.EntryOut
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "second-missing.txt", &second)
+	if st != gofuse.ENOENT {
+		t.Fatalf("second Lookup status = %v, want ENOENT", st)
+	}
+
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+	if got := listCalls.Load(); got != 1 {
+		t.Fatalf("list calls = %d, want 1", got)
+	}
+}
+
 func TestLookupUsesRemoteRootMapping(t *testing.T) {
 	var gotPath string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4064,6 +4181,152 @@ func TestRenamePendingNewCommitFallsBackWhenFinalTargetExists(t *testing.T) {
 	}
 	if shadow.Has(oldP) {
 		t.Fatal("old temp shadow still exists")
+	}
+}
+
+func TestRenamePendingNewCommitUsesRemoteRenameWhenCanceledUploadBecameVisible(t *testing.T) {
+	oldP := "/repo/.git/config.lock"
+	newP := "/repo/.git/config"
+	data := []byte("[core]\n\trepositoryformatversion = 0\n")
+
+	oldPutStarted := make(chan struct{})
+	var oldPutOnce sync.Once
+	var oldPuts atomic.Int32
+	var finalPuts atomic.Int32
+	var renameCalls atomic.Int32
+	var oldRemoteExists atomic.Bool
+	var newRemoteExists atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+newP:
+			if newRemoteExists.Load() {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "2")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			http.NotFound(w, r)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+oldP:
+			if oldRemoteExists.Load() {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.Header().Set("X-Dat9-IsDir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			http.NotFound(w, r)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+oldP:
+			oldPuts.Add(1)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if string(body) != string(data) {
+				http.Error(w, "unexpected temp upload body", http.StatusBadRequest)
+				return
+			}
+			oldRemoteExists.Store(true)
+			oldPutOnce.Do(func() { close(oldPutStarted) })
+			<-r.Context().Done()
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+newP:
+			finalPuts.Add(1)
+			http.Error(w, "final path should not be uploaded directly when old temp is already remote-visible", http.StatusInternalServerError)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+newP && r.URL.RawQuery == "rename":
+			if got := r.Header.Get("X-Dat9-Rename-Source"); got != oldP {
+				http.Error(w, "unexpected rename source "+got, http.StatusBadRequest)
+				return
+			}
+			renameCalls.Add(1)
+			oldRemoteExists.Store(false)
+			newRemoteExists.Store(true)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	c := client.New(ts.URL, "")
+	fs := NewDat9FS(c, opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 16)
+	defer cq.DrainAll()
+	fs.commitQueue = cq
+
+	if err := shadow.WriteFull(oldP, data, 0); err != nil {
+		t.Fatalf("WriteFull old shadow: %v", err)
+	}
+	if _, err := pending.PutWithBaseRev(oldP, int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatalf("PutWithBaseRev old pending: %v", err)
+	}
+	oldIno := fs.inodes.Lookup(oldP, false, int64(len(data)), time.Now())
+	dirIno := fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
+
+	if err := cq.Enqueue(&CommitEntry{
+		Path:  oldP,
+		Inode: oldIno,
+		Size:  int64(len(data)),
+		Kind:  PendingNew,
+	}); err != nil {
+		t.Fatalf("enqueue old temp upload: %v", err)
+	}
+
+	select {
+	case <-oldPutStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for old temp upload to start")
+	}
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Newdir:   dirIno,
+	}, "config.lock", "config")
+	if st != gofuse.OK {
+		t.Fatalf("Rename: %v", st)
+	}
+
+	if got := oldPuts.Load(); got != 1 {
+		t.Fatalf("old temp PUTs = %d, want 1", got)
+	}
+	if got := finalPuts.Load(); got != 0 {
+		t.Fatalf("final path PUTs = %d, want 0", got)
+	}
+	if got := renameCalls.Load(); got != 1 {
+		t.Fatalf("remote rename calls = %d, want 1", got)
+	}
+	if oldRemoteExists.Load() {
+		t.Fatal("old temp path still exists remotely")
+	}
+	if !newRemoteExists.Load() {
+		t.Fatal("final path was not made visible by remote rename")
+	}
+	if pending.HasPending(oldP) {
+		t.Fatal("old temp path still pending")
+	}
+	if shadow.Has(oldP) {
+		t.Fatal("old temp shadow still exists")
+	}
+	if _, ok := fs.inodes.GetInode(oldP); ok {
+		t.Fatal("old temp inode still exists after rename")
+	}
+	if _, ok := fs.inodes.GetInode(newP); !ok {
+		t.Fatal("final inode missing after rename")
 	}
 }
 
