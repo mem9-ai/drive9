@@ -1987,19 +1987,6 @@ func (fs *Dat9FS) pendingRenameTargetExists(ctx context.Context, p string) (bool
 	return false, err
 }
 
-func (fs *Dat9FS) remotePathExists(ctx context.Context, p string) (bool, error) {
-	statStart := fs.perfStart()
-	_, err := fs.client.StatCtx(ctx, fs.remotePath(p))
-	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
-	if err == nil {
-		return true, nil
-	}
-	if isNotFoundErr(err) {
-		return false, nil
-	}
-	return false, err
-}
-
 func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	fs.inodes.Rename(oldP, newP)
 	fs.readCache.Invalidate(oldP)
