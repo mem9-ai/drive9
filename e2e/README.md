@@ -17,6 +17,7 @@ including local single-tenant validation via `drive9-server-local`.
 | `api-smoke-test-existing-key.sh` | Existing API key status/list checks |
 | `cli-smoke-test.sh` | End-to-end CLI workflow including `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
 | `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/rename/stat semantics, cross-channel consistency, read-only and error-path checks |
+| `fuse-release-gate.sh` | Strict FUSE release/CI gate with hard prereq failures, small-repo git clone/status/log, durable umount/remount, and mount-log audit |
 | `smoke-all.sh` | Runs API + CLI + FUSE smoke scripts in sequence with aggregated pass/fail |
 
 ## Run
@@ -50,8 +51,12 @@ CLI_SOURCE=official bash e2e/cli-smoke-test.sh
 
 bash e2e/fuse-smoke-test.sh
 
+# Strict FUSE release gate used by CI
+bash e2e/fuse-release-gate.sh
+
 # Use official released drive9 CLI for FUSE smoke
 CLI_SOURCE=official bash e2e/fuse-smoke-test.sh
+CLI_SOURCE=official bash e2e/fuse-release-gate.sh
 
 bash e2e/smoke-all.sh
 ```
@@ -123,6 +128,9 @@ bash e2e/cli-smoke-test.sh
 # FUSE smoke using the repo build.
 bash e2e/fuse-smoke-test.sh
 
+# Strict FUSE release gate using the repo build.
+bash e2e/fuse-release-gate.sh
+
 # Run API + CLI + FUSE in sequence.
 bash e2e/smoke-all.sh
 ```
@@ -135,6 +143,7 @@ use the same value as `DRIVE9_API_KEY` here.
 ```bash
 CLI_SOURCE=official bash e2e/cli-smoke-test.sh
 CLI_SOURCE=official bash e2e/fuse-smoke-test.sh
+CLI_SOURCE=official bash e2e/fuse-release-gate.sh
 ```
 
 #### `drive9-server-local` notes
@@ -168,9 +177,11 @@ CLI_SOURCE=official bash e2e/fuse-smoke-test.sh
 - API retry knobs for throttling are `REQUEST_MAX_RETRIES` and `REQUEST_RETRY_SLEEP_S`.
 - CLI retry knobs for throttling are `CLI_MAX_RETRIES` and `CLI_RETRY_SLEEP_S`.
 - FUSE mount readiness knobs are `MOUNT_READY_TIMEOUT_S`, `MOUNT_READY_INTERVAL_S`, and `FUSE_MOUNT_ROOT`.
+- FUSE release-gate knobs are `FUSE_STRICT_PREREQS`, `RUN_FUSE_GIT_CLONE`, `FUSE_GIT_CLONE_URL`, `FUSE_GIT_CLONE_TIMEOUT_S`, `RUN_FUSE_UMOUNT_DURABLE`, `FUSE_UMOUNT_TIMEOUT`, and `RUN_FUSE_LOG_AUDIT`.
 - CLI source knobs are `CLI_SOURCE` (`build` or `official`), `CLI_RELEASE_BASE_URL`, and optional `CLI_RELEASE_VERSION`.
 - API upload-limit boundary check is enabled by default via `RUN_UPLOAD_LIMIT_BOUNDARY=1`.
 - `UPLOAD_LIMIT_BYTES` controls the boundary value checked by API e2e (default `10737418240`).
 - CLI upload-limit boundary check is enabled by default via `RUN_CLI_UPLOAD_LIMIT_BOUNDARY=1`.
 - `CLI_UPLOAD_LIMIT_BYTES` controls the boundary value checked by CLI e2e (default `10737418240`).
-- `fuse-smoke-test.sh` will `SKIP` when host prerequisites are missing (for example no `/dev/fuse`) or when the server does not support mount precheck `ls /`.
+- `fuse-smoke-test.sh` will `SKIP` when host prerequisites are missing (for example no `/dev/fuse`) unless `FUSE_STRICT_PREREQS=1`.
+- `fuse-release-gate.sh` is the strict CI/release entry point and enables git clone/status/log, durable `umount --timeout` remount checks, and mount-log audit.
