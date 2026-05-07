@@ -56,6 +56,8 @@ type WriteBackUploader struct {
 	// Per-path in-flight tracking.
 	inflightMu sync.Mutex
 	inflight   map[string]*pathState
+
+	perf *fusePerfCounters
 }
 
 // NewWriteBackUploader creates and starts a background uploader with
@@ -91,12 +93,22 @@ func (u *WriteBackUploader) remotePath(localPath string) string {
 	return mountpath.ToRemote(root, localPath)
 }
 
+func (u *WriteBackUploader) SetPerfCounters(perf *fusePerfCounters) {
+	u.perf = perf
+}
+
 // Submit enqueues a local namespace path for background upload. Blocks up to 5s if the
 // channel is full; on timeout, falls back to synchronous upload in the current
 // goroutine so data is never silently dropped.
 func (u *WriteBackUploader) Submit(localPath string) {
+	if u.perf != nil {
+		u.perf.uploaderSubmit.add(1)
+	}
 	if u.stopped.Load() {
 		log.Printf("writeback uploader: already stopped, uploading synchronously for %s", localPath)
+		if u.perf != nil {
+			u.perf.uploaderSyncFallback.add(1)
+		}
 		u.uploadOne(localPath)
 		return
 	}
@@ -110,6 +122,9 @@ func (u *WriteBackUploader) Submit(localPath string) {
 		case u.uploadCh <- localPath:
 		case <-timer.C:
 			log.Printf("writeback uploader: channel full after %v, uploading synchronously for %s", submitTimeout, localPath)
+			if u.perf != nil {
+				u.perf.uploaderSyncFallback.add(1)
+			}
 			u.uploadOne(localPath)
 		}
 	}
@@ -131,6 +146,13 @@ func (u *WriteBackUploader) WaitPath(localPath string) {
 // DrainAll closes the upload channel and waits for all inflight uploads to
 // complete. Called during graceful shutdown.
 func (u *WriteBackUploader) DrainAll() {
+	start := time.Now()
+	defer func() {
+		if u.perf != nil {
+			u.perf.uploaderDrainCount.add(1)
+			u.perf.uploaderDrainTotal.add(uint64(time.Since(start)))
+		}
+	}()
 	u.stopOnce.Do(func() {
 		u.stopped.Store(true)
 		close(u.uploadCh)
@@ -243,8 +265,12 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+		uploadStart := time.Now()
 		lastErr = uploadBufferedRemoteFile(ctx, u.client, u.remotePath(localPath), data, expectedRevision)
 		cancel()
+		if u.perf != nil {
+			u.perf.recordRemoteOp(perfRemoteWrite, lastErr, time.Since(uploadStart), uint64(len(data)))
+		}
 
 		if lastErr == nil {
 			break
@@ -256,6 +282,9 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	}
 
 	if lastErr != nil {
+		if u.perf != nil {
+			u.perf.uploaderFailure.add(1)
+		}
 		if errors.Is(lastErr, client.ErrConflict) {
 			// TODO: persist a conflict marker or resolution flow so these
 			// entries do not remain pending forever across mounts.
@@ -272,6 +301,9 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	curMeta, ok := u.cache.GetMeta(localPath)
 	if ok && curMeta.Generation == gen {
 		u.cache.Remove(localPath)
+	}
+	if u.perf != nil {
+		u.perf.uploaderSuccess.add(1)
 	}
 }
 
@@ -307,7 +339,15 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 		}
 	}
 
-	if err := uploadBufferedRemoteFile(ctx, u.client, u.remotePath(localPath), data, expectedRevision); err != nil {
+	uploadStart := time.Now()
+	err = uploadBufferedRemoteFile(ctx, u.client, u.remotePath(localPath), data, expectedRevision)
+	if u.perf != nil {
+		u.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(uploadStart), uint64(len(data)))
+	}
+	if err != nil {
+		if u.perf != nil {
+			u.perf.uploaderFailure.add(1)
+		}
 		return err
 	}
 
@@ -315,6 +355,9 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 	curMeta, ok := u.cache.GetMeta(localPath)
 	if ok && curMeta.Generation == gen {
 		u.cache.Remove(localPath)
+	}
+	if u.perf != nil {
+		u.perf.uploaderSuccess.add(1)
 	}
 	return nil
 }

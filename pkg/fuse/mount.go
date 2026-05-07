@@ -49,6 +49,7 @@ type MountOptions struct {
 	AllowOther         bool          // allow other users to access mount
 	ReadOnly           bool          // mount as read-only
 	Debug              bool          // enable FUSE debug logging
+	PerfCounters       bool          // print low-overhead FUSE perf counter summary on shutdown
 }
 
 func (o *MountOptions) setDefaults() {
@@ -242,6 +243,7 @@ func Mount(opts *MountOptions) error {
 			// Initialize CommitQueue for background remote commits.
 			if shadowStore != nil && pendingIdx != nil {
 				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, maxCommitQueuePending, opts.RemoteRoot)
+				cq.SetPerfCounters(dat9fs.perf)
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess
 				cq.OnCleanup = dat9fs.onCommitQueueCleanup
 				cq.RecoverPending()
@@ -250,6 +252,7 @@ func Mount(opts *MountOptions) error {
 
 			if wbCache != nil {
 				uploader := NewWriteBackUploader(c, wbCache, opts.UploadConcurrency, opts.RemoteRoot)
+				uploader.SetPerfCounters(dat9fs.perf)
 				dat9fs.SetWriteBack(wbCache, uploader)
 				// Recover pending uploads only when the newer commit queue is
 				// unavailable. Otherwise commitQueue owns shadow-backed recovery.

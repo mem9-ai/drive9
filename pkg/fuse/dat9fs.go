@@ -88,6 +88,9 @@ type Dat9FS struct {
 	lookupStatRetryTotal     atomic.Uint64
 	lookupStatRetrySuccess   atomic.Uint64
 	lookupStatRetryExhausted atomic.Uint64
+
+	// perf contains optional mount-level counters. Nil when disabled.
+	perf *fusePerfCounters
 }
 
 type dirtyInodeState struct {
@@ -110,6 +113,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		gid:           uint32(os.Getgid()),
 		opts:          opts,
 		debouncer:     newFlushDebouncer(opts.FlushDebounce),
+		perf:          newFusePerfCounters(opts.PerfCounters),
 	}
 }
 
@@ -382,7 +386,9 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 }
 
 func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
+	statStart := fs.perfStart()
 	stat, err := fs.client.StatCtx(ctx, fs.remotePath(fh.Path))
+	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
 	if err != nil {
 		return httpToFuseStatus(err)
 	}
@@ -433,12 +439,14 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 		fs.debugf("dirty load part start path=%s part=%d off=%d len=%d", filePath, partNum, offset, length)
 		rc, err := c.ReadStreamRange(lpCtx, remoteFilePath, offset, length)
 		if err != nil {
+			fs.perfRecordRemote(perfRemoteRead, loadStart, err, 0)
 			fs.debugDurationf(loadStart, 0, "dirty load part open failed path=%s part=%d off=%d len=%d err=%v", filePath, partNum, offset, length, err)
 			return nil, err
 		}
 		defer func() { _ = rc.Close() }()
 
 		data, err := io.ReadAll(rc)
+		fs.perfRecordRemote(perfRemoteRead, loadStart, err, uint64(len(data)))
 		if err != nil {
 			fs.debugDurationf(loadStart, 0, "dirty load part read failed path=%s part=%d off=%d len=%d got=%d err=%v", filePath, partNum, offset, length, len(data), err)
 			return nil, err
@@ -771,23 +779,36 @@ func isTransientReadErr(err error) bool {
 // Returns EIO (never EAGAIN) when all retries are exhausted.
 func (fs *Dat9FS) readSmallFileWithRetry(ctx context.Context, path string) ([]byte, error) {
 	remotePath := fs.remotePath(path)
+	readStart := fs.perfStart()
 	data, err := fs.client.ReadCtx(ctx, remotePath)
+	fs.perfRecordRemote(perfRemoteRead, readStart, err, uint64(len(data)))
 	if err == nil || !isTransientReadErr(err) {
 		return data, err
 	}
 
+	if fs.perf != nil {
+		fs.perf.readRetryTotal.add(1)
+	}
 	lastErr := err
 	for range readTransientRetryCount {
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), readTransientRetryTimeout)
+		readStart = fs.perfStart()
 		data, err = fs.client.ReadCtx(retryCtx, remotePath)
 		retryCancel()
+		fs.perfRecordRemote(perfRemoteRead, readStart, err, uint64(len(data)))
 		if err == nil {
+			if fs.perf != nil {
+				fs.perf.readRetrySuccess.add(1)
+			}
 			return data, nil
 		}
 		if !isTransientReadErr(err) {
 			return nil, err
 		}
 		lastErr = err
+	}
+	if fs.perf != nil {
+		fs.perf.readRetryExhausted.add(1)
 	}
 	return nil, fmt.Errorf("%w: %s: %v", errReadRetriesExhausted, path, lastErr)
 }
@@ -804,18 +825,27 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, off
 		return data, n, err
 	}
 
+	if fs.perf != nil {
+		fs.perf.readRetryTotal.add(1)
+	}
 	lastErr := err
 	for range readTransientRetryCount {
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), readTransientRetryTimeout)
 		data, n, err = fs.doRangeRead(retryCtx, path, offset, size)
 		retryCancel()
 		if err == nil {
+			if fs.perf != nil {
+				fs.perf.readRetrySuccess.add(1)
+			}
 			return data, n, nil
 		}
 		if !isTransientReadErr(err) {
 			return nil, 0, err
 		}
 		lastErr = err
+	}
+	if fs.perf != nil {
+		fs.perf.readRetryExhausted.add(1)
 	}
 	return nil, 0, fmt.Errorf("%w: %s: %v", errReadRetriesExhausted, path, lastErr)
 }
@@ -824,8 +854,10 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, off
 // All body read errors (including truncation) are returned as-is so the
 // caller can classify them for retry.
 func (fs *Dat9FS) doRangeRead(ctx context.Context, path string, offset, size int64) ([]byte, int, error) {
+	readStart := fs.perfStart()
 	rc, err := fs.client.ReadStreamRange(ctx, fs.remotePath(path), offset, size)
 	if err != nil {
+		fs.perfRecordRemote(perfRemoteRead, readStart, err, 0)
 		return nil, 0, err
 	}
 	defer func() { _ = rc.Close() }()
@@ -837,6 +869,7 @@ func (fs *Dat9FS) doRangeRead(ctx context.Context, path string, offset, size int
 	// io.ReadFull swallows io.ErrUnexpectedEOF, hiding truncation.
 	lr := io.LimitReader(rc, size)
 	data, err := io.ReadAll(lr)
+	fs.perfRecordRemote(perfRemoteRead, readStart, err, uint64(len(data)))
 	if err != nil {
 		return nil, len(data), err
 	}
@@ -874,8 +907,10 @@ func (fs *Dat9FS) lookupRetryStats() (total, success, exhausted uint64) {
 func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath string, trackLookupMetrics bool) (*client.StatResult, error) {
 	apiPath := fs.remotePath(localPath)
 	ctx, cf := fuseCtx(cancel)
+	statStart := fs.perfStart()
 	stat, err := fs.client.StatCtx(ctx, apiPath)
 	cf()
+	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
 	if err == nil || isNotFoundErr(err) || !isTransientLookupErr(err) {
 		return stat, err
 	}
@@ -890,6 +925,9 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath strin
 	}
 	if trackLookupMetrics {
 		fs.lookupStatRetryTotal.Add(1)
+		if fs.perf != nil {
+			fs.perf.lookupRetryTotal.add(1)
+		}
 	}
 
 	lastErr := err
@@ -901,11 +939,16 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath strin
 		// transient failures. Keep this detached+bounded behavior unless retry
 		// semantics are redesigned.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
+		statStart = fs.perfStart()
 		stat, err = fs.client.StatCtx(retryCtx, apiPath)
 		retryCancel()
+		fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
 		if err == nil {
 			if trackLookupMetrics {
 				successCount := fs.lookupStatRetrySuccess.Add(1)
+				if fs.perf != nil {
+					fs.perf.lookupRetrySuccess.add(1)
+				}
 				if successCount <= 3 || successCount%lookupRetrySuccessLogEvery == 0 {
 					log.Printf("lookup stat retry recovered for %s (success_count=%d)", localPath, successCount)
 				}
@@ -920,6 +963,9 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath strin
 
 	if trackLookupMetrics {
 		fs.lookupStatRetryExhausted.Add(1)
+		if fs.perf != nil {
+			fs.perf.lookupRetryExhausted.add(1)
+		}
 		log.Printf("lookup stat retries exhausted for %s: %v", localPath, lastErr)
 	}
 	return nil, lastErr
@@ -940,8 +986,10 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 	// those counters remain scoped to the primary Lookup->Stat path.
 	ctx, cf := fuseCtx(cancel)
 	apiPath := fs.remotePath(parentPath)
+	listStart := fs.perfStart()
 	items, err := fs.client.ListCtx(ctx, apiPath)
 	cf()
+	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err == nil || !isTransientLookupErr(err) {
 		return items, err
 	}
@@ -957,8 +1005,10 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		// said "not found", and cancel-coupled retries would collapse to the
 		// original transient failure immediately.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
+		listStart = fs.perfStart()
 		items, err = fs.client.ListCtx(retryCtx, apiPath)
 		retryCancel()
+		fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 		if err == nil || !isTransientLookupErr(err) {
 			return items, err
 		}
@@ -970,36 +1020,46 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 func (fs *Dat9FS) remoteDirExistsDetached(localPath string) bool {
 	retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
 	defer retryCancel()
+	statStart := fs.perfStart()
 	stat, err := fs.client.StatCtx(retryCtx, fs.remotePath(localPath))
+	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
 	return err == nil && stat.IsDir
 }
 
 func (fs *Dat9FS) remoteRenameCommittedDetached(oldP, newP string) bool {
 	targetCtx, targetCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+	statStart := fs.perfStart()
 	_, targetErr := fs.client.StatCtx(targetCtx, fs.remotePath(newP))
 	targetCancel()
+	fs.perfRecordRemote(perfRemoteStat, statStart, targetErr, 0)
 	if targetErr != nil {
 		return false
 	}
 
 	sourceCtx, sourceCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+	statStart = fs.perfStart()
 	_, sourceErr := fs.client.StatCtx(sourceCtx, fs.remotePath(oldP))
 	sourceCancel()
+	fs.perfRecordRemote(perfRemoteStat, statStart, sourceErr, 0)
 	return isNotFoundErr(sourceErr)
 }
 
 func (fs *Dat9FS) remotePathGoneDetached(localPath string) bool {
 	retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
 	defer retryCancel()
+	statStart := fs.perfStart()
 	_, err := fs.client.StatCtx(retryCtx, fs.remotePath(localPath))
+	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
 	return isNotFoundErr(err)
 }
 
 func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string) error {
 	apiPath := fs.remotePath(localPath)
 	ctx, cf := fuseCtx(cancel)
+	mutationStart := fs.perfStart()
 	err := fs.client.MkdirCtx(ctx, apiPath)
 	cf()
+	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err == nil || !isTransientLookupErr(err) {
 		return err
 	}
@@ -1019,8 +1079,10 @@ func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPat
 	lastErr := err
 	for range retryCount {
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+		mutationStart = fs.perfStart()
 		err = fs.client.MkdirCtx(retryCtx, apiPath)
 		retryCancel()
+		fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 		if err == nil {
 			return nil
 		}
@@ -1039,7 +1101,9 @@ func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPat
 }
 
 func (fs *Dat9FS) deleteRemoteWithInterruptRecovery(ctx context.Context, localPath string) error {
+	mutationStart := fs.perfStart()
 	err := fs.client.DeleteCtx(ctx, fs.remotePath(localPath))
+	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err == nil || !isTransientLookupErr(err) {
 		return err
 	}
@@ -1057,7 +1121,9 @@ func (fs *Dat9FS) deleteRemoteWithInterruptRecovery(ctx context.Context, localPa
 func (fs *Dat9FS) renameRemoteWithTransientRetry(ctx context.Context, oldP, newP string) error {
 	oldRemote := fs.remotePath(oldP)
 	newRemote := fs.remotePath(newP)
+	mutationStart := fs.perfStart()
 	err := fs.client.RenameCtx(ctx, oldRemote, newRemote)
+	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err == nil || !isTransientLookupErr(err) {
 		return err
 	}
@@ -1078,8 +1144,10 @@ func (fs *Dat9FS) renameRemoteWithTransientRetry(ctx context.Context, oldP, newP
 	lastErr := err
 	for range retryCount {
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+		mutationStart = fs.perfStart()
 		err = fs.client.RenameCtx(retryCtx, oldRemote, newRemote)
 		retryCancel()
+		fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 		if err == nil {
 			return nil
 		}
@@ -1107,6 +1175,9 @@ func (fs *Dat9FS) Init(server *gofuse.Server) {
 // Safe to call even if the server is not yet initialized (e.g., during tests).
 func (fs *Dat9FS) notifyEntry(parentIno uint64, name string) {
 	fs.notifyCount.Add(1)
+	if fs.perf != nil {
+		fs.perf.notifyEntry.add(1)
+	}
 	if fs.server == nil {
 		return
 	}
@@ -1125,6 +1196,9 @@ func (fs *Dat9FS) notifyEntry(parentIno uint64, name string) {
 // for an inode. off=0, sz=0 means invalidate all cached data.
 func (fs *Dat9FS) notifyInode(ino uint64) {
 	fs.notifyCount.Add(1)
+	if fs.perf != nil {
+		fs.perf.notifyInode.add(1)
+	}
 	if fs.server == nil {
 		return
 	}
@@ -1135,7 +1209,9 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 	}()
 }
 
-func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) gofuse.Status {
+func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseLookup, perfStart, status, 0) }()
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -1332,7 +1408,9 @@ func (fs *Dat9FS) cleanupCommittedInode(ino uint64, p string) {
 	fs.inodes.RemoveFileIfUnreferenced(ino)
 }
 
-func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut) gofuse.Status {
+func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseGetAttr, perfStart, status, 0) }()
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -1405,7 +1483,9 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	return gofuse.OK
 }
 
-func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) gofuse.Status {
+func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseSetAttr, perfStart, status, 0) }()
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -1440,13 +1520,18 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				ctx, cf := fuseCtx(cancel)
 				defer cf()
 				apiPath := fs.remotePath(entry.Path)
-				if err := fs.client.WriteCtx(ctx, apiPath, nil); err != nil {
+				writeStart := fs.perfStart()
+				err := fs.client.WriteCtx(ctx, apiPath, nil)
+				fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
+				if err != nil {
 					return httpToFuseStatus(err)
 				}
 				// Refresh the inode revision after the server-side truncate so a
 				// subsequent writable open does not reuse the stale pre-truncate
 				// base revision and conflict with its own zero-byte write.
+				statStart := fs.perfStart()
 				stat, statErr := fs.client.StatCtx(ctx, apiPath)
+				fs.perfRecordRemote(perfRemoteStat, statStart, statErr, 0)
 				if statErr != nil {
 					log.Printf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, input.NodeId, statErr)
 				} else if stat != nil {
@@ -1481,7 +1566,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 
 // --- Directory operations ----------------------------------------------------
 
-func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, out *gofuse.EntryOut) gofuse.Status {
+func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, out *gofuse.EntryOut) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseMkdir, perfStart, status, 0) }()
 	childP, st := fs.childPath(input.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -1506,13 +1593,15 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 	return gofuse.OK
 }
 
-func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string) gofuse.Status {
+func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseUnlink, perfStart, status, 0) }()
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
 	}
 	start := time.Now()
-	status := gofuse.OK
+	status = gofuse.OK
 	fs.debugf("unlink start path=%s parent_ino=%d name=%s", childP, header.NodeId, name)
 	defer func() {
 		fs.debugf("unlink done path=%s status=%d dur=%s", childP, status, time.Since(start))
@@ -1597,7 +1686,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	return gofuse.OK
 }
 
-func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string) gofuse.Status {
+func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseRmdir, perfStart, status, 0) }()
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
@@ -1606,7 +1697,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		return st
 	}
 	start := time.Now()
-	status := gofuse.OK
+	status = gofuse.OK
 	fs.debugf("rmdir start path=%s parent_ino=%d name=%s", childP, header.NodeId, name)
 	defer func() {
 		fs.debugf("rmdir done path=%s status=%d dur=%s", childP, status, time.Since(start))
@@ -1770,7 +1861,9 @@ func (fs *Dat9FS) pendingRenameTargetExists(ctx context.Context, p string) (bool
 	if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
 		return true, nil
 	}
+	statStart := fs.perfStart()
 	_, err := fs.client.StatCtx(ctx, fs.remotePath(p))
+	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
 	if err == nil {
 		return true, nil
 	}
@@ -1795,7 +1888,9 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	}
 }
 
-func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName string, newName string) gofuse.Status {
+func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName string, newName string) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseRename, perfStart, status, 0) }()
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
@@ -1917,7 +2012,9 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	return gofuse.OK
 }
 
-func (fs *Dat9FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) gofuse.Status {
+func (fs *Dat9FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseOpenDir, perfStart, status, 0) }()
 	p, ok := fs.inodes.GetPath(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -1932,7 +2029,9 @@ func (fs *Dat9FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gof
 	return gofuse.OK
 }
 
-func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) gofuse.Status {
+func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseReadDir, perfStart, status, 0) }()
 	dh, ok := fs.dirHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.ENOENT
@@ -1964,7 +2063,9 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 	return gofuse.OK
 }
 
-func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) gofuse.Status {
+func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseReadDirPlus, perfStart, status, 0) }()
 	dh, ok := fs.dirHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.ENOENT
@@ -2012,11 +2113,19 @@ func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
 func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, error) {
 	// Check dir cache first
 	if cached, ok := fs.dirCache.Get(dirPath); ok {
+		if fs.perf != nil {
+			fs.perf.dirCacheHit.add(1)
+		}
 		entries := fs.cachedToDirEntries(dirPath, cached)
 		return fs.mergePendingDirEntries(dirPath, entries), nil
 	}
+	if fs.perf != nil {
+		fs.perf.dirCacheMiss.add(1)
+	}
 
+	listStart := fs.perfStart()
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
+	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -2147,7 +2256,9 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 
 // --- File operations ---------------------------------------------------------
 
-func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string, out *gofuse.CreateOut) gofuse.Status {
+func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string, out *gofuse.CreateOut) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseCreate, perfStart, status, 0) }()
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
@@ -2218,7 +2329,9 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	return gofuse.OK
 }
 
-func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) gofuse.Status {
+func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseOpen, perfStart, status, 0) }()
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
@@ -2249,7 +2362,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		// If BaseRev is 0 (e.g. inode came from readdir without revision),
 		// fetch the authoritative revision so CAS uploads work correctly.
 		if fh.BaseRev == 0 && !fh.IsNew {
-			if stat, err := fs.client.StatCtx(ctx, fs.remotePath(p)); err == nil && stat != nil {
+			statStart := fs.perfStart()
+			stat, err := fs.client.StatCtx(ctx, fs.remotePath(p))
+			fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
+			if err == nil && stat != nil {
 				fh.BaseRev = stat.Revision
 				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
 			}
@@ -2339,6 +2455,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		entry, _ := fs.inodes.GetEntry(input.NodeId)
 		if entry != nil && entry.Size > smallFileThreshold {
 			fh.Prefetch = NewPrefetcher(fs.client, fs.remotePath(p), entry.Size, fs.debugEnabled())
+			fh.Prefetch.SetPerfCounters(fs.perf)
 		}
 		// Atomically pin shadow for read-only opens so commit queue cleanup
 		// doesn't delete the shadow file while this handle is reading from it.
@@ -2380,6 +2497,11 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	source := "unknown"
 	bytesRead := -1
 	defer func() {
+		var perfBytes uint64
+		if bytesRead > 0 {
+			perfBytes = uint64(bytesRead)
+		}
+		fs.perfRecordFuse(perfFuseRead, start, status, perfBytes)
 		if !fs.debugEnabled() {
 			return
 		}
@@ -2620,11 +2742,17 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		offset := int64(input.Offset)
 		size := int(input.Size)
 		if data, ok := fh.Prefetch.Get(offset, size); ok {
+			if fs.perf != nil {
+				fs.perf.prefetchHit.add(1)
+			}
 			// Trigger next prefetch
 			fh.Prefetch.OnRead(offset, len(data))
 			source = "prefetch-hit"
 			bytesRead = len(data)
 			return gofuse.ReadResultData(data), gofuse.OK
+		}
+		if fs.perf != nil {
+			fs.perf.prefetchMiss.add(1)
 		}
 		// Cache miss — fall through to direct read. Prefetch is triggered
 		// only after a successful read (see below), not unconditionally.
@@ -2639,6 +2767,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		cacheRev := entry.Revision // use revision from last Stat/Lookup
 		// Fast path: serve from cache without any HTTP call.
 		if data, ok := fs.readCache.Get(p, cacheRev); ok {
+			if fs.perf != nil {
+				fs.perf.readCacheHit.add(1)
+			}
 			offset := int64(input.Offset)
 			if offset >= int64(len(data)) {
 				source = "read-cache-eof"
@@ -2652,6 +2783,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			source = "read-cache-hit"
 			bytesRead = int(end - offset)
 			return gofuse.ReadResultData(data[offset:end]), gofuse.OK
+		}
+		if fs.perf != nil {
+			fs.perf.readCacheMiss.add(1)
 		}
 
 		// Cache miss: read the file and store it. No separate Stat needed —
@@ -2713,6 +2847,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	var logIno uint64
 	source := "start"
 	defer func() {
+		fs.perfRecordFuse(perfFuseWrite, start, status, uint64(written))
 		if !fs.debugEnabled() {
 			return
 		}
@@ -2799,6 +2934,8 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 }
 
 func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseFlush, perfStart, status, 0) }()
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.OK
@@ -2935,6 +3072,11 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			fh.Unlock()
 			err := uploadFromShadowRemote(ctx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
 			fh.Lock()
+			var uploadBytes uint64
+			if size > 0 {
+				uploadBytes = uint64(size)
+			}
+			fs.perfRecordRemote(perfRemoteWrite, uploadStart, err, uploadBytes)
 			fs.debugDurationf(uploadStart, 0, "flush shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
 			if err != nil {
 				log.Printf("flush: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
@@ -2995,6 +3137,8 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 }
 
 func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseFsync, perfStart, status, 0) }()
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.OK
@@ -3088,6 +3232,11 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		fh.Unlock()
 		err := uploadFromShadowRemote(ctx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
 		fh.Lock()
+		var uploadBytes uint64
+		if size > 0 {
+			uploadBytes = uint64(size)
+		}
+		fs.perfRecordRemote(perfRemoteWrite, uploadStart, err, uploadBytes)
 		fs.debugDurationf(uploadStart, 0, "fsync shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
 		if err != nil {
 			log.Printf("fsync: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
@@ -3136,6 +3285,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 }
 
 func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
+	perfStart := fs.perfStart()
+	releaseStatus := gofuse.OK
+	defer func() { fs.perfRecordFuse(perfFuseRelease, perfStart, releaseStatus, 0) }()
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
 		defer func() {
@@ -3154,6 +3306,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		start := time.Now()
 		phase := "start"
 		flushStatus := gofuse.OK
+		defer func() { releaseStatus = flushStatus }()
 		fs.debugf("release start path=%s fh=%d ino=%d", fh.Path, input.Fh, fh.Ino)
 		defer func() {
 			if !fs.debugEnabled() {
@@ -3214,6 +3367,11 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				uploadStart := time.Now()
 				fs.debugf("release shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
 				uploadErr := uploadFromShadowRemote(ctx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
+				var uploadBytes uint64
+				if size > 0 {
+					uploadBytes = uint64(size)
+				}
+				fs.perfRecordRemote(perfRemoteWrite, uploadStart, uploadErr, uploadBytes)
 				fs.debugDurationf(uploadStart, 0, "release shadowspill upload done path=%s size=%d err=%v", fh.Path, size, uploadErr)
 				if uploadErr != nil {
 					flushStatus = gofuse.EIO
@@ -3371,8 +3529,10 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		}
 
 		dCtx, dCf := context.WithTimeout(context.Background(), fuseTimeout)
+		writeStart := fs.perfStart()
 		committedRev, err := fs.client.WriteCtxConditionalWithRevision(dCtx, fs.remotePath(filePath), data, expectedRevision)
 		dCf()
+		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
 		if err != nil {
 			handle.Unlock()
 			log.Printf("debounced flush failed for %s: %v", filePath, err)
@@ -3490,9 +3650,15 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		uploadStart := time.Now()
 		fs.debugf("flushHandle finish streaming start path=%s size=%d part_size=%d parts=%d dirty_parts=%d expected_rev=%d", fh.Path, size, partSize, numParts, len(dirtyParts), expectedRevision)
 		fh.Unlock()
+		perfUploadStart := fs.perfStart()
 		err = streamer.FinishStreaming(ctx, size,
 			lastPartNum, lastCp, dirtyParts)
 		fh.Lock()
+		var perfUploadBytes uint64
+		if size > 0 {
+			perfUploadBytes = uint64(size)
+		}
+		fs.perfRecordRemote(perfRemoteWrite, perfUploadStart, err, perfUploadBytes)
 		fs.debugDurationf(uploadStart, 0, "flushHandle finish streaming done path=%s size=%d err=%v", fh.Path, size, err)
 
 		if err != nil {
@@ -3542,8 +3708,14 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		uploadStart := time.Now()
 		fs.debugf("flushHandle upload all start path=%s size=%d parts=%d expected_rev=%d", fh.Path, size, len(partSnapshots), expectedRevision)
 		fh.Unlock()
+		perfUploadStart := fs.perfStart()
 		err = streamer.UploadAll(ctx, size, partSnapshots)
 		fh.Lock()
+		var perfUploadBytes uint64
+		if size > 0 {
+			perfUploadBytes = uint64(size)
+		}
+		fs.perfRecordRemote(perfRemoteWrite, perfUploadStart, err, perfUploadBytes)
 		fs.debugDurationf(uploadStart, 0, "flushHandle upload all done path=%s size=%d parts=%d err=%v", fh.Path, size, len(partSnapshots), err)
 
 		if err != nil {
@@ -3581,6 +3753,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		writeStart := time.Now()
 		fs.debugf("flushHandle small write start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
 		committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
+		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
 		fs.debugDurationf(writeStart, 0, "flushHandle small write done path=%s size=%d committed_rev=%d err=%v", fh.Path, size, committedRev, err)
 	} else if fh.OrigSize >= smallFileThreshold {
 		phase = "patch-file"
@@ -3612,6 +3785,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 				client.WithPartSize(fh.Dirty.PartSize()),
 				client.WithExpectedRevision(expectedRevision),
 			)
+			var patchBytes uint64
+			if size > 0 {
+				patchBytes = uint64(size)
+			}
+			fs.perfRecordRemote(perfRemoteWrite, patchStart, err, patchBytes)
 			fs.debugDurationf(patchStart, 0, "flushHandle patch done path=%s size=%d dirty_parts=%d err=%v", fh.Path, size, len(dirtyParts), err)
 		}
 		// If no dirty parts, nothing changed — skip upload.
@@ -3628,6 +3806,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			nil,
 			expectedRevision,
 		)
+		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
 		fs.debugDurationf(writeStart, 0, "flushHandle write stream done path=%s size=%d err=%v", fh.Path, size, err)
 	}
 	if err != nil {
@@ -3710,6 +3889,10 @@ func (fs *Dat9FS) FlushAll() {
 
 	// Wait for any inflight async kernel notifications to complete.
 	fs.notifyWg.Wait()
+
+	if fs.perf != nil {
+		fs.perf.printSummary(os.Stderr)
+	}
 }
 
 // StatFs reports a generous virtual capacity so that apps (Obsidian, Finder)

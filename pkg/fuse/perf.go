@@ -1,0 +1,318 @@
+package fuse
+
+import (
+	"fmt"
+	"io"
+	"sync/atomic"
+	"time"
+
+	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+)
+
+type perfFuseOp int
+
+const (
+	perfFuseLookup perfFuseOp = iota
+	perfFuseGetAttr
+	perfFuseOpenDir
+	perfFuseReadDir
+	perfFuseReadDirPlus
+	perfFuseOpen
+	perfFuseRead
+	perfFuseWrite
+	perfFuseFlush
+	perfFuseFsync
+	perfFuseRelease
+	perfFuseCreate
+	perfFuseMkdir
+	perfFuseUnlink
+	perfFuseRmdir
+	perfFuseRename
+	perfFuseSetAttr
+	perfFuseOpCount
+)
+
+var perfFuseOpNames = [...]string{
+	perfFuseLookup:      "lookup",
+	perfFuseGetAttr:     "getattr",
+	perfFuseOpenDir:     "opendir",
+	perfFuseReadDir:     "readdir",
+	perfFuseReadDirPlus: "readdirplus",
+	perfFuseOpen:        "open",
+	perfFuseRead:        "read",
+	perfFuseWrite:       "write",
+	perfFuseFlush:       "flush",
+	perfFuseFsync:       "fsync",
+	perfFuseRelease:     "release",
+	perfFuseCreate:      "create",
+	perfFuseMkdir:       "mkdir",
+	perfFuseUnlink:      "unlink",
+	perfFuseRmdir:       "rmdir",
+	perfFuseRename:      "rename",
+	perfFuseSetAttr:     "setattr",
+}
+
+type perfRemoteOp int
+
+const (
+	perfRemoteStat perfRemoteOp = iota
+	perfRemoteList
+	perfRemoteRead
+	perfRemoteWrite
+	perfRemoteMutation
+	perfRemoteOpCount
+)
+
+var perfRemoteOpNames = [...]string{
+	perfRemoteStat:     "stat",
+	perfRemoteList:     "list",
+	perfRemoteRead:     "read",
+	perfRemoteWrite:    "write",
+	perfRemoteMutation: "mutation",
+}
+
+type perfOpStats struct {
+	count   uint64
+	errors  uint64
+	bytes   uint64
+	totalNS uint64
+}
+
+type fusePerfCounters struct {
+	enabled bool
+	start   time.Time
+
+	fuseOps   [perfFuseOpCount]perfAtomicStats
+	remoteOps [perfRemoteOpCount]perfAtomicStats
+
+	readCacheHit  atomicUint64
+	readCacheMiss atomicUint64
+	dirCacheHit   atomicUint64
+	dirCacheMiss  atomicUint64
+	prefetchHit   atomicUint64
+	prefetchMiss  atomicUint64
+
+	lookupRetryTotal     atomicUint64
+	lookupRetrySuccess   atomicUint64
+	lookupRetryExhausted atomicUint64
+	readRetryTotal       atomicUint64
+	readRetrySuccess     atomicUint64
+	readRetryExhausted   atomicUint64
+
+	commitEnqueue      atomicUint64
+	commitEnqueueError atomicUint64
+	commitRetry        atomicUint64
+	commitSuccess      atomicUint64
+	commitFailure      atomicUint64
+
+	uploaderSubmit       atomicUint64
+	uploaderSyncFallback atomicUint64
+	uploaderSuccess      atomicUint64
+	uploaderFailure      atomicUint64
+
+	commitDrainCount   atomicUint64
+	commitDrainTotalNS atomicUint64
+	uploaderDrainCount atomicUint64
+	uploaderDrainTotal atomicUint64
+
+	sseChange       atomicUint64
+	sseReset        atomicUint64
+	sseSelfFiltered atomicUint64
+
+	notifyEntry atomicUint64
+	notifyInode atomicUint64
+}
+
+// atomicUint64 is a small wrapper around sync/atomic.Uint64. Keeping it local
+// keeps tests compact and avoids map allocations on FUSE hot paths.
+type atomicUint64 struct {
+	v uint64
+}
+
+func (a *atomicUint64) add(n uint64) { atomic.AddUint64(&a.v, n) }
+func (a *atomicUint64) load() uint64 { return atomic.LoadUint64(&a.v) }
+
+type perfAtomicStats struct {
+	count   atomicUint64
+	errors  atomicUint64
+	bytes   atomicUint64
+	totalNS atomicUint64
+}
+
+func newFusePerfCounters(enabled bool) *fusePerfCounters {
+	if !enabled {
+		return nil
+	}
+	return &fusePerfCounters{
+		enabled: true,
+		start:   time.Now(),
+	}
+}
+
+func (p *fusePerfCounters) isEnabled() bool {
+	return p != nil && p.enabled
+}
+
+func (p *fusePerfCounters) recordFuseOp(op perfFuseOp, status gofuse.Status, dur time.Duration, bytes uint64) {
+	if !p.isEnabled() || op < 0 || op >= perfFuseOpCount {
+		return
+	}
+	p.fuseOps[op].record(status != gofuse.OK, dur, bytes)
+}
+
+func (p *fusePerfCounters) recordRemoteOp(op perfRemoteOp, err error, dur time.Duration, bytes uint64) {
+	if !p.isEnabled() || op < 0 || op >= perfRemoteOpCount {
+		return
+	}
+	p.remoteOps[op].record(err != nil, dur, bytes)
+}
+
+func (s *perfAtomicStats) record(failed bool, dur time.Duration, bytes uint64) {
+	s.count.add(1)
+	if failed {
+		s.errors.add(1)
+	}
+	if bytes > 0 {
+		s.bytes.add(bytes)
+	}
+	if dur > 0 {
+		s.totalNS.add(uint64(dur))
+	}
+}
+
+func (s *perfAtomicStats) snapshot() perfOpStats {
+	return perfOpStats{
+		count:   s.count.load(),
+		errors:  s.errors.load(),
+		bytes:   s.bytes.load(),
+		totalNS: s.totalNS.load(),
+	}
+}
+
+type fusePerfSnapshot struct {
+	Uptime    time.Duration
+	FuseOps   map[string]perfOpStats
+	RemoteOps map[string]perfOpStats
+	Counters  map[string]uint64
+}
+
+func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
+	if !p.isEnabled() {
+		return fusePerfSnapshot{}
+	}
+	snap := fusePerfSnapshot{
+		Uptime:    time.Since(p.start),
+		FuseOps:   make(map[string]perfOpStats, len(p.fuseOps)),
+		RemoteOps: make(map[string]perfOpStats, len(p.remoteOps)),
+		Counters:  make(map[string]uint64, 32),
+	}
+	for i, stats := range p.fuseOps {
+		snap.FuseOps[perfFuseOpNames[i]] = stats.snapshot()
+	}
+	for i, stats := range p.remoteOps {
+		snap.RemoteOps[perfRemoteOpNames[i]] = stats.snapshot()
+	}
+	snap.Counters["read_cache_hit"] = p.readCacheHit.load()
+	snap.Counters["read_cache_miss"] = p.readCacheMiss.load()
+	snap.Counters["dir_cache_hit"] = p.dirCacheHit.load()
+	snap.Counters["dir_cache_miss"] = p.dirCacheMiss.load()
+	snap.Counters["prefetch_hit"] = p.prefetchHit.load()
+	snap.Counters["prefetch_miss"] = p.prefetchMiss.load()
+	snap.Counters["lookup_retry_total"] = p.lookupRetryTotal.load()
+	snap.Counters["lookup_retry_success"] = p.lookupRetrySuccess.load()
+	snap.Counters["lookup_retry_exhausted"] = p.lookupRetryExhausted.load()
+	snap.Counters["read_retry_total"] = p.readRetryTotal.load()
+	snap.Counters["read_retry_success"] = p.readRetrySuccess.load()
+	snap.Counters["read_retry_exhausted"] = p.readRetryExhausted.load()
+	snap.Counters["commit_enqueue"] = p.commitEnqueue.load()
+	snap.Counters["commit_enqueue_error"] = p.commitEnqueueError.load()
+	snap.Counters["commit_retry"] = p.commitRetry.load()
+	snap.Counters["commit_success"] = p.commitSuccess.load()
+	snap.Counters["commit_failure"] = p.commitFailure.load()
+	snap.Counters["uploader_submit"] = p.uploaderSubmit.load()
+	snap.Counters["uploader_sync_fallback"] = p.uploaderSyncFallback.load()
+	snap.Counters["uploader_success"] = p.uploaderSuccess.load()
+	snap.Counters["uploader_failure"] = p.uploaderFailure.load()
+	snap.Counters["commit_drain_count"] = p.commitDrainCount.load()
+	snap.Counters["commit_drain_total_ns"] = p.commitDrainTotalNS.load()
+	snap.Counters["uploader_drain_count"] = p.uploaderDrainCount.load()
+	snap.Counters["uploader_drain_total_ns"] = p.uploaderDrainTotal.load()
+	snap.Counters["sse_change"] = p.sseChange.load()
+	snap.Counters["sse_reset"] = p.sseReset.load()
+	snap.Counters["sse_self_filtered"] = p.sseSelfFiltered.load()
+	snap.Counters["notify_entry"] = p.notifyEntry.load()
+	snap.Counters["notify_inode"] = p.notifyInode.load()
+	return snap
+}
+
+func (p *fusePerfCounters) printSummary(w io.Writer) {
+	if !p.isEnabled() || w == nil {
+		return
+	}
+	snap := p.snapshot()
+	writePerfLine(w, "dat9: FUSE perf summary uptime=%s\n", snap.Uptime.Truncate(time.Millisecond))
+	writePerfOps(w, "fuse", perfFuseOpNames[:], snap.FuseOps)
+	writePerfOps(w, "remote", perfRemoteOpNames[:], snap.RemoteOps)
+	writePerfLine(w, "dat9: perf cache read_hit=%d read_miss=%d dir_hit=%d dir_miss=%d prefetch_hit=%d prefetch_miss=%d\n",
+		snap.Counters["read_cache_hit"], snap.Counters["read_cache_miss"],
+		snap.Counters["dir_cache_hit"], snap.Counters["dir_cache_miss"],
+		snap.Counters["prefetch_hit"], snap.Counters["prefetch_miss"])
+	writePerfLine(w, "dat9: perf retries lookup_total=%d lookup_success=%d lookup_exhausted=%d read_total=%d read_success=%d read_exhausted=%d\n",
+		snap.Counters["lookup_retry_total"], snap.Counters["lookup_retry_success"], snap.Counters["lookup_retry_exhausted"],
+		snap.Counters["read_retry_total"], snap.Counters["read_retry_success"], snap.Counters["read_retry_exhausted"])
+	writePerfLine(w, "dat9: perf commit enqueue=%d enqueue_errors=%d retries=%d success=%d failure=%d drain_count=%d drain_total=%s\n",
+		snap.Counters["commit_enqueue"], snap.Counters["commit_enqueue_error"], snap.Counters["commit_retry"],
+		snap.Counters["commit_success"], snap.Counters["commit_failure"],
+		snap.Counters["commit_drain_count"], time.Duration(snap.Counters["commit_drain_total_ns"]).Truncate(time.Millisecond))
+	writePerfLine(w, "dat9: perf uploader submit=%d sync_fallback=%d success=%d failure=%d drain_count=%d drain_total=%s\n",
+		snap.Counters["uploader_submit"], snap.Counters["uploader_sync_fallback"],
+		snap.Counters["uploader_success"], snap.Counters["uploader_failure"],
+		snap.Counters["uploader_drain_count"], time.Duration(snap.Counters["uploader_drain_total_ns"]).Truncate(time.Millisecond))
+	writePerfLine(w, "dat9: perf sse change=%d reset=%d self_filtered=%d notify_entry=%d notify_inode=%d\n",
+		snap.Counters["sse_change"], snap.Counters["sse_reset"], snap.Counters["sse_self_filtered"],
+		snap.Counters["notify_entry"], snap.Counters["notify_inode"])
+}
+
+func writePerfOps(w io.Writer, group string, names []string, stats map[string]perfOpStats) {
+	for _, name := range names {
+		st := stats[name]
+		if st.count == 0 {
+			continue
+		}
+		avg := time.Duration(0)
+		if st.count > 0 && st.totalNS > 0 {
+			avg = time.Duration(st.totalNS / st.count)
+		}
+		writePerfLine(w, "dat9: perf %s %s count=%d errors=%d bytes=%d avg=%s\n",
+			group, name, st.count, st.errors, st.bytes, avg.Truncate(time.Microsecond))
+	}
+}
+
+func writePerfLine(w io.Writer, format string, args ...any) {
+	_, _ = fmt.Fprintf(w, format, args...)
+}
+
+func (fs *Dat9FS) perfEnabled() bool {
+	return fs != nil && fs.perf != nil && fs.perf.enabled
+}
+
+func (fs *Dat9FS) perfStart() time.Time {
+	if !fs.perfEnabled() {
+		return time.Time{}
+	}
+	return time.Now()
+}
+
+func (fs *Dat9FS) perfRecordFuse(op perfFuseOp, start time.Time, status gofuse.Status, bytes uint64) {
+	if !fs.perfEnabled() || start.IsZero() {
+		return
+	}
+	fs.perf.recordFuseOp(op, status, time.Since(start), bytes)
+}
+
+func (fs *Dat9FS) perfRecordRemote(op perfRemoteOp, start time.Time, err error, bytes uint64) {
+	if !fs.perfEnabled() || start.IsZero() {
+		return
+	}
+	fs.perf.recordRemoteOp(op, err, time.Since(start), bytes)
+}

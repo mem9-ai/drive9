@@ -355,6 +355,7 @@ drive9 mount [flags] [:/remote] <mountpoint>
   -allow-other                   allow other users to access mount
   -read-only                     mount read-only
   -debug                         enable FUSE debug logging
+  -perf-counters                 print FUSE perf counter summary on unmount
 ```
 
 ## Server Configuration
