@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -94,7 +93,12 @@ func (s *Server) handleAPIKeyCreate(w http.ResponseWriter, r *http.Request, scop
 	var req struct {
 		KeyName string `json:"key_name"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			errJSON(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		errJSON(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
@@ -143,6 +147,15 @@ func (s *Server) handleAPIKeyCreate(w http.ResponseWriter, r *http.Request, scop
 	})
 	if err != nil {
 		if errors.Is(err, meta.ErrDuplicate) {
+			existing, getErr := s.meta.GetAPIKeyByName(r.Context(), scope.TenantID, keyName)
+			if getErr == nil {
+				if existing.Status == meta.APIKeyRevoked {
+					errJSON(w, http.StatusConflict, "api key name has been revoked and cannot be reused")
+					return
+				}
+				errJSON(w, http.StatusConflict, "api key name already exists")
+				return
+			}
 			errJSON(w, http.StatusConflict, "api key conflict")
 			return
 		}

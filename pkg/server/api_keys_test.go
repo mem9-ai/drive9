@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/meta"
@@ -201,6 +202,48 @@ func TestCreateAPIKeyRejectsSlashAndDisablesCaching(t *testing.T) {
 	}
 	if got := goodOut["key_name"]; got != "worker-blue" {
 		t.Fatalf("key_name=%v, want worker-blue", got)
+	}
+}
+
+func TestCreateAPIKeyRejectsOversizeBody(t *testing.T) {
+	srv, ownerToken, cleanup := newAuthServer(t)
+	defer cleanup()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	largePadding := strings.Repeat("x", 1<<20)
+	body := bytes.NewReader([]byte(`{"key_name":"worker-big","padding":"` + largePadding + `"}`))
+	resp, out := doJSONRequest(t, http.MethodPost, ts.URL+tenantAPIKeysPath, ownerToken, body)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize create status=%d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+	if got := out["error"]; got != "request body too large" {
+		t.Fatalf("error=%v, want request body too large", got)
+	}
+}
+
+func TestRevokedAPIKeyNameCannotBeReused(t *testing.T) {
+	srv, ownerToken, cleanup := newAuthServer(t)
+	defer cleanup()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	createManagedAPIKey(t, ts.URL, ownerToken, "worker")
+	deleteResp, deleteBody := doJSONRequest(t, http.MethodDelete, ts.URL+tenantAPIKeysPath+"/worker", ownerToken, nil)
+	if deleteResp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status=%d, want %d", deleteResp.StatusCode, http.StatusOK)
+	}
+	if got := deleteBody["status"]; got != "ok" {
+		t.Fatalf("delete status body=%v, want ok", got)
+	}
+
+	recreateBody := bytes.NewReader([]byte(`{"key_name":"worker"}`))
+	recreateResp, recreateOut := doJSONRequest(t, http.MethodPost, ts.URL+tenantAPIKeysPath, ownerToken, recreateBody)
+	if recreateResp.StatusCode != http.StatusConflict {
+		t.Fatalf("recreate status=%d, want %d", recreateResp.StatusCode, http.StatusConflict)
+	}
+	if got := recreateOut["error"]; got != "api key name has been revoked and cannot be reused" {
+		t.Fatalf("error=%v, want revoked-name conflict", got)
 	}
 }
 
