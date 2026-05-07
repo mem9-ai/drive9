@@ -2643,12 +2643,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		} else {
 			out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 		}
-	} else if fh.Prefetch != nil {
-		// Large read-only files still need kernel caching so mmap-based
-		// readers (notably git pack access) do not SIGBUS on macFUSE.
-		// Reads still populate the userspace prefetcher on cache misses.
-		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 	} else {
+		// Read-only opens need kernel caching so mmap-based readers (notably
+		// git pack access) do not SIGBUS on macFUSE. Prefetch-backed reads
+		// still populate the userspace prefetcher on cache misses.
 		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 	}
 	fs.debugf("open path=%s fh=%d ino=%d flags=0x%x open_flags=%d dirty=%t prefetch=%t orig_size=%d base_rev=%d shadow_ready=%t shadow_spill=%t", p, out.Fh, fh.Ino, input.Flags, out.OpenFlags, fh.Dirty != nil, fh.Prefetch != nil, fh.OrigSize, fh.BaseRev, fh.ShadowReady, fh.ShadowSpill)

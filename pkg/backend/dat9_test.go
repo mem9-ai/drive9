@@ -221,6 +221,9 @@ func TestDetectContentTypeRequiresValidUTF8ForText(t *testing.T) {
 	if got := detectContentType("/data/gbk.csv", gbkCSV); got != "application/octet-stream" {
 		t.Fatalf("content type=%q, want application/octet-stream for invalid UTF-8 text extension", got)
 	}
+	if got := detectContentType("/config.json", gbkCSV); got != "application/octet-stream" {
+		t.Fatalf("content type=%q, want application/octet-stream for invalid UTF-8 JSON extension", got)
+	}
 }
 
 func TestWriteAndRead(t *testing.T) {
