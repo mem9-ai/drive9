@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	drive9fuse "github.com/mem9-ai/dat9/pkg/fuse"
 )
 
 func fakeLookPath(binMap map[string]bool) func(string) (string, error) {
@@ -318,6 +319,67 @@ func TestResolveMountCredentials_MissingServer(t *testing.T) {
 	_, _, _, err := resolveMountCredentials(r, "", "")
 	if err == nil {
 		t.Fatal("expected error when no server URL is available")
+	}
+}
+
+func TestMountCmdPassesLegacyDirStatFallbackOption(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *drive9fuse.MountOptions
+	mountFuse = func(opts *drive9fuse.MountOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--legacy-dir-stat-fallback",
+		":/repo",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if !got.LegacyDirStatFallback {
+		t.Fatal("LegacyDirStatFallback = false, want true")
+	}
+	if got.RemoteRoot != "/repo" {
+		t.Fatalf("RemoteRoot = %q, want /repo", got.RemoteRoot)
+	}
+}
+
+func TestMountCmdLeavesLegacyDirStatFallbackDisabledByDefault(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *drive9fuse.MountOptions
+	mountFuse = func(opts *drive9fuse.MountOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.LegacyDirStatFallback {
+		t.Fatal("LegacyDirStatFallback = true, want false")
 	}
 }
 
