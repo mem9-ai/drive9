@@ -83,6 +83,7 @@ func fsMountCmd(args []string) error {
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
 	debug := fs.Bool("debug", false, "enable FUSE debug logging")
+	perfCounters := fs.Bool("perf-counters", false, "print FUSE perf counter summary on unmount")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: drive9 mount [flags] [:/remote] <mountpoint>\n\nflags:\n")
@@ -195,6 +196,7 @@ func fsMountCmd(args []string) error {
 		AllowOther:         *allowOther,
 		ReadOnly:           *readOnly,
 		Debug:              *debug,
+		PerfCounters:       *perfCounters,
 	}
 
 	return drive9fuse.Mount(opts)

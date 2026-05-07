@@ -55,6 +55,7 @@ type Prefetcher struct {
 	ctx        context.Context    // parent context for prefetch goroutines
 	closed     bool
 	debug      bool
+	perf       *fusePerfCounters
 }
 
 // NewPrefetcher creates a Prefetcher for the given file.
@@ -76,6 +77,10 @@ func NewPrefetcher(c *client.Client, path string, fileSize int64, debug ...bool)
 		cancel:     cancel,
 		debug:      debugEnabled,
 	}
+}
+
+func (p *Prefetcher) SetPerfCounters(perf *fusePerfCounters) {
+	p.perf = perf
 }
 
 func (p *Prefetcher) debugf(format string, args ...any) {
@@ -300,6 +305,9 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 
 		rc, err := p.client.ReadStreamRange(ctx, p.path, offset, length)
 		if err != nil {
+			if p.perf != nil {
+				p.perf.recordRemoteOp(perfRemoteRead, err, time.Since(start), 0)
+			}
 			for _, b := range blocks {
 				b.err = err
 			}
@@ -309,6 +317,9 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 		defer func() { _ = rc.Close() }()
 
 		data, err := io.ReadAll(rc)
+		if p.perf != nil {
+			p.perf.recordRemoteOp(perfRemoteRead, err, time.Since(start), uint64(len(data)))
+		}
 		if err != nil {
 			for _, b := range blocks {
 				b.err = err

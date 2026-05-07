@@ -69,6 +69,8 @@ type CommitQueue struct {
 	// workCh dispatches entries to upload workers. The buffer is always
 	// larger than maxPending so Enqueue never blocks.
 	workCh chan *CommitEntry
+
+	perf *fusePerfCounters
 }
 
 // NewCommitQueue creates a CommitQueue with background workers.
@@ -105,6 +107,10 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 	return cq
 }
 
+func (cq *CommitQueue) SetPerfCounters(perf *fusePerfCounters) {
+	cq.perf = perf
+}
+
 func (cq *CommitQueue) remotePath(localPath string) string {
 	root := "/"
 	if cq != nil && cq.remoteRoot != "" {
@@ -119,12 +125,21 @@ func (cq *CommitQueue) Enqueue(entry *CommitEntry) error {
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
 	if cq.stopped {
+		if cq.perf != nil {
+			cq.perf.commitEnqueueError.add(1)
+		}
 		return fmt.Errorf("commit queue stopped")
 	}
 	if len(cq.queue) >= cq.maxPending {
+		if cq.perf != nil {
+			cq.perf.commitEnqueueError.add(1)
+		}
 		return fmt.Errorf("commit queue full (%d pending)", cq.maxPending)
 	}
 	cq.queue = append(cq.queue, entry)
+	if cq.perf != nil {
+		cq.perf.commitEnqueue.add(1)
+	}
 
 	// Send to workers while holding the lock. The channel buffer is always
 	// > maxPending, so this will not block as long as the backpressure
@@ -150,6 +165,13 @@ func (cq *CommitQueue) IsFull() bool {
 
 // DrainAll stops accepting new entries and waits for all workers to finish.
 func (cq *CommitQueue) DrainAll() {
+	start := time.Now()
+	defer func() {
+		if cq.perf != nil {
+			cq.perf.commitDrainCount.add(1)
+			cq.perf.commitDrainTotalNS.add(uint64(time.Since(start)))
+		}
+	}()
 	cq.mu.Lock()
 	if cq.stopped {
 		cq.mu.Unlock()
@@ -462,6 +484,9 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		}
 
 		if attempt > 0 {
+			if cq.perf != nil {
+				cq.perf.commitRetry.add(1)
+			}
 			delay := time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt-1)))
 			if delay > maxDelay {
 				delay = maxDelay
@@ -535,6 +560,9 @@ func sleepWithCancel(ctx context.Context, delay time.Duration) bool {
 func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error {
 	committedRev, err := cq.uploadEntry(ctx, entry)
 	if err != nil {
+		if cq.perf != nil {
+			cq.perf.commitFailure.add(1)
+		}
 		return err
 	}
 	cq.onCommitSuccess(entry, committedRev)
@@ -558,7 +586,16 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	// ShadowSpill entries: stream directly from shadow file to avoid loading
 	// multi-GiB files into memory. Uses io.SectionReader over the shadow fd.
 	if entry.ShadowSpill {
-		return 0, uploadFromShadowRemote(ctx, cq.client, cq.shadows, entry.Path, apiPath, expectedRevision)
+		start := time.Now()
+		err := uploadFromShadowRemote(ctx, cq.client, cq.shadows, entry.Path, apiPath, expectedRevision)
+		if cq.perf != nil {
+			var bytes uint64
+			if entry.Size > 0 {
+				bytes = uint64(entry.Size)
+			}
+			cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), bytes)
+		}
+		return 0, err
 	}
 
 	// Non-ShadowSpill: read full content into memory.
@@ -571,12 +608,21 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	// Files under commitQueueDirectPutThreshold use direct PUT to skip the
 	// multipart initiate/presign/complete/finalize overhead (~440ms).
 	if entry.Size < commitQueueDirectPutThreshold {
+		start := time.Now()
 		committedRev, err := cq.client.WriteCtxConditionalWithRevision(ctx, apiPath, data, expectedRevision)
+		if cq.perf != nil {
+			cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(len(data)))
+		}
 		return committedRev, err
 	}
 
 	// Larger non-ShadowSpill files: multipart upload.
-	return 0, uploadBufferedRemoteFile(ctx, cq.client, apiPath, data, expectedRevision)
+	start := time.Now()
+	err = uploadBufferedRemoteFile(ctx, cq.client, apiPath, data, expectedRevision)
+	if cq.perf != nil {
+		cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(len(data)))
+	}
+	return 0, err
 }
 
 func (cq *CommitQueue) removeFromQueue(entry *CommitEntry) {
@@ -625,6 +671,9 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) {
 	// until bookkeeping is complete.
 	cq.removeFromQueue(entry)
 
+	if cq.perf != nil {
+		cq.perf.commitSuccess.add(1)
+	}
 	log.Printf("commit queue: successfully uploaded %s (%d bytes, rev=%d)", entry.Path, entry.Size, committedRev)
 }
 
@@ -676,8 +725,12 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	// Fetch server's current state: revision + content.
 	// Use per-RPC timeouts so that a slow Read doesn't starve the Upload budget.
 	statCtx, statCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	statStart := time.Now()
 	stat, err := cq.client.StatCtx(statCtx, apiPath)
 	statCancel()
+	if cq.perf != nil {
+		cq.perf.recordRemoteOp(perfRemoteStat, err, time.Since(statStart), 0)
+	}
 	if err != nil {
 		log.Printf("commit queue: auto-resolve failed for %s: stat: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
@@ -686,8 +739,12 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	serverRev := stat.Revision
 
 	readCtx, readCancel := context.WithTimeout(context.Background(), uploadTimeout)
+	readStart := time.Now()
 	serverData, err := cq.client.ReadCtx(readCtx, apiPath)
 	readCancel()
+	if cq.perf != nil {
+		cq.perf.recordRemoteOp(perfRemoteRead, err, time.Since(readStart), uint64(len(serverData)))
+	}
 	if err != nil {
 		log.Printf("commit queue: auto-resolve failed for %s: read server: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
@@ -710,8 +767,12 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	}
 	log.Printf("commit queue: auto-resolving conflict for %s via LWW (base rev %d → server rev %d)", entry.Path, entry.BaseRev, serverRev)
 	uploadCtx, uploadCancel := context.WithTimeout(context.Background(), releaseTimeout(int64(len(localData))))
+	uploadStart := time.Now()
 	err = uploadBufferedRemoteFile(uploadCtx, cq.client, apiPath, localData, serverRev)
 	uploadCancel()
+	if cq.perf != nil {
+		cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(uploadStart), uint64(len(localData)))
+	}
 	if err != nil {
 		log.Printf("commit queue: auto-resolve LWW re-upload failed for %s: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
@@ -723,6 +784,9 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 }
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
+	if cq.perf != nil {
+		cq.perf.commitFailure.add(1)
+	}
 	// Mark the entry as conflicted in the pending index so that crash
 	// recovery (RecoverPending) skips it instead of retrying forever.
 	// Preserve both the shadow file and the pending metadata so the user

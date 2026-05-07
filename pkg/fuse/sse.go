@@ -46,14 +46,26 @@ func (w *SSEWatcher) handleEvent(change *client.ChangeEvent, reset *client.Reset
 	if change != nil {
 		// Skip events from our own mount.
 		if w.actor != "" && change.Actor == w.actor {
+			if w.fs != nil && w.fs.perf != nil {
+				w.fs.perf.sseSelfFiltered.add(1)
+			}
 			return
+		}
+		if w.fs != nil && w.fs.perf != nil {
+			w.fs.perf.sseChange.add(1)
 		}
 		w.handleChange(change)
 		return
 	}
 	if reset != nil && reset.Reason != "" {
 		if w.actor != "" && reset.Reason == "structural_change" && reset.Actor == w.actor {
+			if w.fs != nil && w.fs.perf != nil {
+				w.fs.perf.sseSelfFiltered.add(1)
+			}
 			return
+		}
+		if w.fs != nil && w.fs.perf != nil {
+			w.fs.perf.sseReset.add(1)
 		}
 		// Only handle resets with an explicit reason (not heartbeats).
 		w.handleReset(reset)
