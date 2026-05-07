@@ -29,7 +29,7 @@ import (
 // its entire lifetime (Invariant #3). To change credentials, umount and
 // remount; there is no in-process rebind.
 type MountOptions struct {
-	Server                string        // dat9 server URL
+	Server                string        // drive9 server URL
 	APIKey                string        // owner API key (mutually exclusive with Token)
 	Token                 string        // delegated capability JWT (mutually exclusive with APIKey)
 	MountPoint            string        // local mount point
@@ -152,7 +152,7 @@ func Mount(opts *MountOptions) error {
 	opts.RemoteRoot = remoteRoot
 	if remoteRoot == "/" {
 		if _, err := c.List("/"); err != nil {
-			return fmt.Errorf("cannot reach dat9 server: %w", err)
+			return fmt.Errorf("cannot reach drive9 server: %w", err)
 		}
 	} else {
 		stat, err := c.Stat(remoteRoot)
@@ -284,8 +284,8 @@ func Mount(opts *MountOptions) error {
 
 	// Configure FUSE mount options
 	fuseOpts := &gofuse.MountOptions{
-		FsName:        "dat9",
-		Name:          "dat9",
+		FsName:        "drive9",
+		Name:          "drive9",
 		MaxReadAhead:  8 * 1024 * 1024, // 8MB — larger readahead reduces FUSE kernel↔userspace switches
 		MaxWrite:      128 * 1024,      // 128KB per write request (default 64KB)
 		MaxBackground: 32,              // concurrent background FUSE requests (default 12)
@@ -382,12 +382,8 @@ func Mount(opts *MountOptions) error {
 		forceUnmount(opts.MountPoint)
 	}()
 
-	if shadowDir != "" {
-		fmt.Fprintf(os.Stderr, "drive9: mounted on %s (server: %s, actor: %s, cache: %s, shadow: %s)\n",
-			opts.MountPoint, opts.Server, actorID, cacheBase, shadowDir)
-	} else {
-		fmt.Fprintf(os.Stderr, "drive9: mounted on %s (server: %s, actor: %s)\n", opts.MountPoint, opts.Server, actorID)
-	}
+	fmt.Fprintf(os.Stderr, "drive9: mounted on %s (server: %s, actor: %s, readonly: %v, cache: %s, shadow: %s)\n",
+		opts.MountPoint, opts.Server, actorID, opts.ReadOnly, cacheBase, shadowDir)
 	server.Wait()
 	shutdown()
 	return nil

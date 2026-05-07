@@ -172,7 +172,7 @@ func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDe
 		return explainMountError(deps.goos, mountPoint, err)
 	}
 
-	fmt.Fprintf(os.Stderr, "drive9: mounted on %s via WebDAV (%s)\n", mountPoint, serverURL)
+	fmt.Fprintf(os.Stderr, "drive9: mounted on %s via WebDAV (server: %s)\n", mountPoint, serverURL)
 
 	// Signal handling for graceful shutdown.
 	go func() {
