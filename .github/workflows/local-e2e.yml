@@ -135,10 +135,9 @@ jobs:
         continue-on-error: true
         run: bash e2e/cli-smoke-test.sh
 
-      - name: Run FUSE smoke
+      - name: Run FUSE release gate
         id: fuse-smoke
-        continue-on-error: true
-        run: bash e2e/fuse-smoke-test.sh
+        run: bash e2e/fuse-release-gate.sh
 
       - name: Publish local e2e summary
         if: always()
@@ -151,7 +150,7 @@ jobs:
             echo "| API smoke | ${{ steps.api-smoke.outcome || 'skipped' }} |"
             echo "| Existing-key smoke | ${{ steps.existing-key-smoke.outcome || 'skipped' }} |"
             echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
-            echo "| FUSE smoke | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
+            echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Dump TiDB playground logs
@@ -201,6 +200,6 @@ jobs:
           check_required "API smoke" "${{ steps.api-smoke.outcome }}"
           check_required "Existing-key smoke" "${{ steps.existing-key-smoke.outcome }}"
           check_required "CLI smoke" "${{ steps.cli-smoke.outcome }}"
-          check_required "FUSE smoke" "${{ steps.fuse-smoke.outcome }}"
+          check_required "FUSE release gate" "${{ steps.fuse-smoke.outcome }}"
 
           exit "$failed"

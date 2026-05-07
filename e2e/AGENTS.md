@@ -174,6 +174,15 @@ use the same value as `DRIVE9_API_KEY` here.
 
 Notes:
 - The script prechecks root `ls /` reachability before mount behavior checks.
+- Optional release-gate knobs add small-repo git clone/status/log checks,
+  durable `drive9 umount --timeout` remount visibility checks, and mount-log audit.
+
+### `fuse-release-gate.sh`
+
+1. Runs `fuse-smoke-test.sh` with `FUSE_STRICT_PREREQS=1`
+2. Enables small-repo git clone/status/log coverage
+3. Enables durable `umount --timeout` followed by remount visibility checks
+4. Enables mount-log audit and dumps mount logs on failure
 
 ### `smoke-all.sh`
 
@@ -219,6 +228,13 @@ Notes:
 | `FUSE_MOUNT_ROOT` | `/tmp` | `fuse-smoke-test.sh` |
 | `CLI_MAX_RETRIES` | `8` | `fuse-smoke-test.sh` |
 | `CLI_RETRY_SLEEP_S` | `2` | `fuse-smoke-test.sh` |
+| `FUSE_STRICT_PREREQS` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
+| `FUSE_UMOUNT_TIMEOUT` | `60s` | `fuse-smoke-test.sh` |
+| `RUN_FUSE_GIT_CLONE` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
+| `FUSE_GIT_CLONE_URL` | `https://github.com/octocat/Hello-World.git` | `fuse-smoke-test.sh` |
+| `FUSE_GIT_CLONE_TIMEOUT_S` | `180` | `fuse-smoke-test.sh` |
+| `RUN_FUSE_UMOUNT_DURABLE` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
+| `RUN_FUSE_LOG_AUDIT` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 
 ## Conventions
 
