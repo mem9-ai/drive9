@@ -626,6 +626,116 @@ func TestDirCache_InvalidateAll(t *testing.T) {
 	}
 }
 
+func TestNamespaceCache_PositiveHit(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, 10)
+	dc.Upsert("/repo", CachedFileInfo{Name: "README.md", Size: 12, Revision: 7})
+
+	got := dc.Lookup("/repo", "README.md")
+	if got.kind != namespaceLookupPositive {
+		t.Fatalf("lookup kind = %v, want positive", got.kind)
+	}
+	if got.item.Size != 12 || got.item.Revision != 7 {
+		t.Fatalf("lookup item = %+v, want size=12 revision=7", got.item)
+	}
+}
+
+func TestNamespaceCache_CompleteMissIsSafeNegative(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, 10)
+	dc.Put("/repo", []CachedFileInfo{{Name: "README.md"}})
+
+	got := dc.Lookup("/repo", "missing.txt")
+	if got.kind != namespaceLookupCompleteMiss {
+		t.Fatalf("lookup kind = %v, want complete miss", got.kind)
+	}
+}
+
+func TestNamespaceCache_PartialMissFallsThrough(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, 10)
+	dc.Upsert("/repo", CachedFileInfo{Name: "known.txt"})
+
+	got := dc.Lookup("/repo", "missing.txt")
+	if got.kind != namespaceLookupPartialMiss {
+		t.Fatalf("lookup kind = %v, want partial miss", got.kind)
+	}
+}
+
+func TestNamespaceCache_SessionCreatedMissIsSafeNegative(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, 10)
+	dc.MarkSessionCreatedDir("/repo/.git/objects/ab")
+
+	got := dc.Lookup("/repo/.git/objects/ab", "missing")
+	if got.kind != namespaceLookupSessionMiss {
+		t.Fatalf("lookup kind = %v, want session miss", got.kind)
+	}
+	if gotItems, ok := dc.Get("/repo/.git/objects/ab"); !ok || len(gotItems) != 0 {
+		t.Fatalf("Get session-created dir = len %d ok %t, want empty complete hit", len(gotItems), ok)
+	}
+}
+
+func TestNamespaceCache_NegativeExpires(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, time.Millisecond, 10)
+	dc.MarkNegative("/repo", "missing.txt")
+	if got := dc.Lookup("/repo", "missing.txt"); got.kind != namespaceLookupNegative {
+		t.Fatalf("lookup kind before expiry = %v, want negative", got.kind)
+	}
+	time.Sleep(5 * time.Millisecond)
+	if got := dc.Lookup("/repo", "missing.txt"); got.kind != namespaceLookupNone {
+		t.Fatalf("lookup kind after expiry = %v, want none", got.kind)
+	}
+}
+
+func TestNamespaceCache_CompleteMissExpiresBeforePositiveList(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, time.Millisecond, 10)
+	dc.Put("/repo", []CachedFileInfo{{Name: "known.txt"}})
+	time.Sleep(5 * time.Millisecond)
+
+	if got := dc.Lookup("/repo", "missing.txt"); got.kind != namespaceLookupPartialMiss {
+		t.Fatalf("lookup kind after negative TTL = %v, want partial miss", got.kind)
+	}
+	items, ok := dc.Get("/repo")
+	if !ok || len(items) != 1 || items[0].Name != "known.txt" {
+		t.Fatalf("Get after negative TTL = %+v ok %t, want complete positive list", items, ok)
+	}
+}
+
+func TestNamespaceCache_LargeDirGuardDoesNotMarkComplete(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, 2)
+	dc.Put("/repo", []CachedFileInfo{
+		{Name: "a.txt"},
+		{Name: "b.txt"},
+		{Name: "c.txt"},
+	})
+
+	if _, ok := dc.Get("/repo"); ok {
+		t.Fatal("large dir should not be returned as a complete listing")
+	}
+	if got := dc.Lookup("/repo", "a.txt"); got.kind != namespaceLookupPositive {
+		t.Fatalf("lookup existing kind = %v, want positive", got.kind)
+	}
+	if got := dc.Lookup("/repo", "c.txt"); got.kind != namespaceLookupPartialMiss {
+		t.Fatalf("lookup overflow/missing kind = %v, want partial miss", got.kind)
+	}
+}
+
+func TestNamespaceCache_InvalidatePrefix(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, 10)
+	dc.Put("/repo", []CachedFileInfo{{Name: ".git", IsDir: true}})
+	dc.Put("/repo/.git", []CachedFileInfo{{Name: "config"}})
+	dc.Put("/repo2", []CachedFileInfo{{Name: "keep"}})
+
+	dc.InvalidatePrefix("/repo")
+
+	if _, ok := dc.Get("/repo"); ok {
+		t.Fatal("/repo should be invalidated")
+	}
+	if _, ok := dc.Get("/repo/.git"); ok {
+		t.Fatal("/repo/.git should be invalidated")
+	}
+	if _, ok := dc.Get("/repo2"); !ok {
+		t.Fatal("/repo2 should be preserved")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Sparse WriteBuffer with LoadPart (lazy loading) tests
 // ---------------------------------------------------------------------------

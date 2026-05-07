@@ -852,6 +852,269 @@ func TestLookupUsesDirCacheNegativeEntryWithoutRemoteStat(t *testing.T) {
 	}
 }
 
+func TestLookupPartialNamespaceMissFallsThroughToRemoteStat(t *testing.T) {
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Fatalf("method = %s, want HEAD", r.Method)
+		}
+		headCalls.Add(1)
+		w.Header().Set("Content-Length", "9")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.dirCache.Upsert("/", CachedFileInfo{Name: "known.txt", Size: 1})
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "remote.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+	if got, want := out.Size, uint64(9); got != want {
+		t.Fatalf("Lookup size = %d, want %d", got, want)
+	}
+}
+
+func TestLookupStatNotFoundSeedsShortNegativeNamespaceCache(t *testing.T) {
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Fatalf("method = %s, want HEAD", r.Method)
+		}
+		headCalls.Add(1)
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	for range 2 {
+		var out gofuse.EntryOut
+		st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "missing.txt", &out)
+		if st != gofuse.ENOENT {
+			t.Fatalf("Lookup status = %v, want ENOENT", st)
+		}
+	}
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+}
+
+func TestLookupLockFileStatNotFoundDoesNotSeedNamespaceNegative(t *testing.T) {
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Fatalf("method = %s, want HEAD", r.Method)
+		}
+		headCalls.Add(1)
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	for range 2 {
+		var out gofuse.EntryOut
+		st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "config.lock", &out)
+		if st != gofuse.ENOENT {
+			t.Fatalf("Lookup status = %v, want ENOENT", st)
+		}
+	}
+	if got := headCalls.Load(); got != 2 {
+		t.Fatalf("HEAD calls = %d, want 2", got)
+	}
+}
+
+func TestLookupLockFileIgnoresCompleteNamespaceMiss(t *testing.T) {
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Fatalf("method = %s, want HEAD", r.Method)
+		}
+		headCalls.Add(1)
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "config"}})
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "config.lock", &out)
+	if st != gofuse.ENOENT {
+		t.Fatalf("Lookup status = %v, want ENOENT", st)
+	}
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+}
+
+func TestLookupSessionCreatedDirMissAvoidsRemoteStat(t *testing.T) {
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.RawQuery == "mkdir":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			headCalls.Add(1)
+			http.Error(w, "unexpected remote stat", http.StatusInternalServerError)
+		default:
+			t.Fatalf("unexpected request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	var mkdirOut gofuse.EntryOut
+	st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "dir", &mkdirOut)
+	if st != gofuse.OK {
+		t.Fatalf("Mkdir status = %v, want OK", st)
+	}
+
+	var lookupOut gofuse.EntryOut
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: mkdirOut.NodeId}, "missing.txt", &lookupOut)
+	if st != gofuse.ENOENT {
+		t.Fatalf("Lookup status = %v, want ENOENT", st)
+	}
+	if got := headCalls.Load(); got != 0 {
+		t.Fatalf("HEAD calls = %d, want 0", got)
+	}
+}
+
+func TestLookupSSEForeignCreateInvalidatesSessionCreatedMiss(t *testing.T) {
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Fatalf("method = %s, want HEAD", r.Method)
+		}
+		headCalls.Add(1)
+		w.Header().Set("Content-Length", "4")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+	fs.dirCache.MarkSessionCreatedDir("/dir")
+
+	w := &SSEWatcher{fs: fs, actor: "mine"}
+	w.handleChange(&client.ChangeEvent{
+		Seq:   1,
+		Path:  "/dir/remote.txt",
+		Op:    "write",
+		Actor: "other",
+	})
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, "remote.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+}
+
+func TestLookupSSEForeignDeleteInvalidatesPositiveNamespaceHit(t *testing.T) {
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Fatalf("method = %s, want HEAD", r.Method)
+		}
+		headCalls.Add(1)
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.inodes.Lookup("/dir", true, 0, time.Now())
+	fs.dirCache.Upsert("/dir", CachedFileInfo{Name: "stale.txt", Size: 9})
+
+	w := &SSEWatcher{fs: fs, actor: "mine"}
+	w.handleChange(&client.ChangeEvent{
+		Seq:   1,
+		Path:  "/dir/stale.txt",
+		Op:    "delete",
+		Actor: "other",
+	})
+
+	dirIno, _ := fs.inodes.GetInode("/dir")
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, "stale.txt", &out)
+	if st != gofuse.ENOENT {
+		t.Fatalf("Lookup status = %v, want ENOENT", st)
+	}
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+}
+
+func TestNamespaceCacheCrossDirRenameUpdatesBothParents(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "unexpected remote call", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	srcIno := fs.inodes.Lookup("/src", true, 0, time.Now())
+	dstIno := fs.inodes.Lookup("/dst", true, 0, time.Now())
+	fs.inodes.Lookup("/src/file.txt", false, 5, time.Unix(10, 0))
+	fs.dirCache.Put("/src", []CachedFileInfo{{Name: "file.txt", Size: 5}})
+	fs.dirCache.Put("/dst", []CachedFileInfo{{Name: "other.txt", Size: 1}})
+
+	fs.finishLocalRename(&gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: srcIno},
+		Newdir:   dstIno,
+	}, "/src/file.txt", "/dst/file.txt")
+
+	var oldOut gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: srcIno}, "file.txt", &oldOut)
+	if st != gofuse.ENOENT {
+		t.Fatalf("old parent Lookup status = %v, want ENOENT", st)
+	}
+
+	var newOut gofuse.EntryOut
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: dstIno}, "file.txt", &newOut)
+	if st != gofuse.OK {
+		t.Fatalf("new parent Lookup status = %v, want OK", st)
+	}
+	if got, want := newOut.Size, uint64(5); got != want {
+		t.Fatalf("renamed entry size = %d, want %d", got, want)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+}
+
 func TestLookupLegacyListFallbackPopulatesDirCacheForLaterMisses(t *testing.T) {
 	var headCalls atomic.Int32
 	var listCalls atomic.Int32
