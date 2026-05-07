@@ -266,20 +266,37 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *WriteBuffer, baseRev i
 	// Write each dirty part at its correct offset.
 	var extents []DirtyExtent
 	partSize := wb.PartSize()
-	for idx, dirty := range wb.dirtyParts {
-		if !dirty {
-			continue
+
+	// Small-file fast path: if the buffer is using a contiguous allocation,
+	// write the entire content in one shot instead of iterating parts.
+	if wb.smallFileData != nil {
+		data := wb.smallFileData
+		if wb.totalSize < int64(len(data)) {
+			data = data[:wb.totalSize]
 		}
-		data := wb.PartData(idx + 1) // PartData is 1-based
-		if data == nil {
-			continue
+		if len(data) > 0 {
+			n, err := sf.fd.WriteAt(data, 0)
+			if err != nil {
+				return fmt.Errorf("shadow pwrite at 0: %w", err)
+			}
+			extents = append(extents, DirtyExtent{Offset: 0, Length: int64(n)})
 		}
-		offset := int64(idx) * partSize
-		n, err := sf.fd.WriteAt(data, offset)
-		if err != nil {
-			return fmt.Errorf("shadow pwrite at %d: %w", offset, err)
+	} else {
+		for idx, dirty := range wb.dirtyParts {
+			if !dirty {
+				continue
+			}
+			data := wb.PartData(idx + 1) // PartData is 1-based
+			if data == nil {
+				continue
+			}
+			offset := int64(idx) * partSize
+			n, err := sf.fd.WriteAt(data, offset)
+			if err != nil {
+				return fmt.Errorf("shadow pwrite at %d: %w", offset, err)
+			}
+			extents = append(extents, DirtyExtent{Offset: offset, Length: int64(n)})
 		}
-		extents = append(extents, DirtyExtent{Offset: offset, Length: int64(n)})
 	}
 
 	// Update shadow file metadata.

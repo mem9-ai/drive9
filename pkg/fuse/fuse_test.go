@@ -2038,3 +2038,59 @@ func TestShadowSpill_WriteBackSeqStaysZero(t *testing.T) {
 		t.Fatal("Fsync UploadSync condition must never be true for ShadowSpill handles")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Benchmarks
+// ---------------------------------------------------------------------------
+
+func BenchmarkWriteBuffer_SmallFile_WriteAndRead(b *testing.B) {
+	data := []byte("hello world, this is a small file content for testing!")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		wb := NewWriteBuffer("/test.txt", 0, 0)
+		_, _ = wb.Write(0, data)
+		_, _ = wb.Write(6, []byte("EARTH"))
+		_ = wb.Bytes()
+	}
+}
+
+func BenchmarkWriteBuffer_SmallFile_ReadAt(b *testing.B) {
+	data := make([]byte, 40*1024) // 40KB small file
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	wb := NewWriteBuffer("/test.txt", 0, 0)
+	_, _ = wb.Write(0, data)
+	buf := make([]byte, 4096)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = wb.ReadAt(int64(i%36)*1024, buf)
+	}
+}
+
+func BenchmarkWriteBuffer_SmallFile_Truncate(b *testing.B) {
+	data := make([]byte, 40*1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		wb := NewWriteBuffer("/test.txt", 0, 0)
+		_, _ = wb.Write(0, data)
+		_ = wb.Truncate(20 * 1024)
+		_ = wb.Truncate(40 * 1024)
+	}
+}
+
+func BenchmarkReadCache_GetPut(b *testing.B) {
+	rc := NewReadCache(128<<20, 30*time.Second)
+	data := make([]byte, 40*1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	rc.Put("/test.txt", data, 1)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = rc.Get("/test.txt", 1)
+	}
+}

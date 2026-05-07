@@ -21,6 +21,10 @@ type LoadPartFunc func(partNum int) ([]byte, error)
 // explicitly loaded are held in memory. This enables lazy preloading
 // (load parts on demand) and streaming uploads (notify when parts are full).
 //
+// For files that remain below smallFileThreshold, a fast path uses a single
+// contiguous allocation instead of the sparse part map, avoiding map lookups
+// and per-part allocations for the common case of editing small files.
+//
 // It tracks which parts have been modified so that on flush,
 // only dirty parts need to be uploaded (unchanged parts are copied
 // server-side via S3 UploadPartCopy).
@@ -56,6 +60,13 @@ type WriteBuffer struct {
 	// partIdx is 0-based, data is the full part data (partSize bytes).
 	// The callback should copy data if it needs to outlive the call.
 	OnPartFull func(partIdx int, data []byte)
+
+	// Small-file fast path: a single contiguous buffer used when the file
+	// remains below smallFileThreshold. Avoids map lookups and per-part
+	// allocations for the common case of editing small files (< 50KB).
+	// When a write would exceed the threshold, the data is migrated to the
+	// regular part map and this field is set to nil.
+	smallFileData []byte
 }
 
 // NewWriteBuffer creates a new WriteBuffer for the given path.
@@ -85,6 +96,15 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 	end := offset + int64(len(data))
 	if end > wb.maxSize {
 		return 0, syscall.EFBIG
+	}
+
+	// Small-file fast path: use a single contiguous allocation for files
+	// that remain below the small-file threshold. This avoids map lookups,
+	// per-part allocations, and fragmentation for the common case.
+	// Do NOT use the fast path when lazy loading is configured (LoadPart != nil)
+	// because we may need to load existing remote data.
+	if wb.smallFileData != nil || (len(wb.parts) == 0 && wb.LoadPart == nil && end <= smallFileThreshold) {
+		return wb.writeSmallFile(offset, data)
 	}
 
 	// Update totalSize
@@ -174,10 +194,82 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 	return uint32(len(data)), nil
 }
 
+// writeSmallFile is the fast-path Write for files that remain below
+// smallFileThreshold. It uses a single contiguous []byte instead of the
+// sparse part map.
+func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error) {
+	end := offset + int64(len(data))
+	if end > wb.maxSize {
+		return 0, syscall.EFBIG
+	}
+	if end > smallFileThreshold {
+		// Migrate to part mode and retry
+		wb.migrateToPartMode()
+		return wb.Write(offset, data)
+	}
+
+	// Ensure capacity (grow with headroom to reduce reallocations)
+	if int(end) > cap(wb.smallFileData) {
+		newCap := int(end)
+		if newCap < 1024 {
+			newCap = 1024
+		}
+		// Double the capacity to amortize reallocation cost
+		if newCap < 2*cap(wb.smallFileData) {
+			newCap = 2 * cap(wb.smallFileData)
+		}
+		if newCap > smallFileThreshold {
+			newCap = smallFileThreshold
+		}
+		grown := make([]byte, newCap)
+		copy(grown, wb.smallFileData)
+		wb.smallFileData = grown[:end]
+	} else if int(end) > len(wb.smallFileData) {
+		wb.smallFileData = wb.smallFileData[:end]
+	}
+
+	copy(wb.smallFileData[offset:], data)
+	if end > wb.totalSize {
+		wb.totalSize = end
+	}
+	wb.touched = true
+	wb.dirtyParts[0] = true // small files map to a single logical part
+
+	// Sequential write detection
+	if offset == wb.appendCursor {
+		wb.appendCursor = end
+	} else if offset > wb.appendCursor {
+		wb.appendCursor = end
+	} else {
+		wb.sequential = false
+	}
+
+	return uint32(len(data)), nil
+}
+
+// migrateToPartMode transfers smallFileData into the sparse part map and
+// clears smallFileData. Called when a write exceeds smallFileThreshold.
+func (wb *WriteBuffer) migrateToPartMode() {
+	if len(wb.smallFileData) == 0 {
+		wb.smallFileData = nil
+		return
+	}
+	// Transfer data to part 0
+	wb.parts[0] = make([]byte, len(wb.smallFileData))
+	copy(wb.parts[0], wb.smallFileData)
+	wb.curMemory = int64(len(wb.smallFileData))
+	wb.smallFileData = nil
+}
+
 // ensurePart makes sure a part exists in the map. If it doesn't exist
 // and LoadPart is set, tries to load from remote. Otherwise creates a
 // nil entry that will be grown as needed by Write.
 func (wb *WriteBuffer) ensurePart(partIdx int) error {
+	if wb.smallFileData != nil {
+		// Small-file mode: all data is in smallFileData, no parts needed
+		return nil
+	}
+
 	if _, ok := wb.parts[partIdx]; ok {
 		return nil
 	}
@@ -241,6 +333,14 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 	cur := wb.totalSize
 	switch {
 	case size < cur:
+		if wb.smallFileData != nil {
+			wb.smallFileData = wb.smallFileData[:size]
+			wb.totalSize = size
+			wb.touched = true
+			wb.dirtyParts[0] = true
+			return nil
+		}
+
 		// Mark affected parts as dirty
 		if size > 0 {
 			wb.markDirty(size, cur)
@@ -276,6 +376,32 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 		wb.totalSize = size
 
 	case size > cur:
+		if wb.smallFileData != nil {
+			if size <= smallFileThreshold {
+				if int(size) > cap(wb.smallFileData) {
+					newCap := int(size)
+					if newCap < 1024 {
+						newCap = 1024
+					}
+					grown := make([]byte, newCap)
+					copy(grown, wb.smallFileData)
+					wb.smallFileData = grown[:size]
+				} else {
+					oldLen := len(wb.smallFileData)
+					wb.smallFileData = wb.smallFileData[:size]
+					for i := oldLen; i < int(size); i++ {
+						wb.smallFileData[i] = 0
+					}
+				}
+				wb.totalSize = size
+				wb.touched = true
+				wb.dirtyParts[0] = true
+				return nil
+			}
+			// Migrate to part mode for larger size
+			wb.migrateToPartMode()
+			return wb.Truncate(size)
+		}
 		// Mark the extended region as dirty
 		wb.markDirty(cur, size)
 		// Ensure parts exist for the extended region (zero-filled on access)
@@ -313,6 +439,11 @@ func (wb *WriteBuffer) Bytes() []byte {
 	if wb.totalSize == 0 {
 		return nil
 	}
+	if wb.smallFileData != nil {
+		buf := make([]byte, wb.totalSize)
+		copy(buf, wb.smallFileData)
+		return buf
+	}
 	buf := make([]byte, wb.totalSize)
 	numParts := int((wb.totalSize + wb.partSize - 1) / wb.partSize)
 	for i := 0; i < numParts; i++ {
@@ -340,6 +471,11 @@ func (wb *WriteBuffer) DirtyPartNumbers() []int {
 // MarkAllDirty marks every part in the current buffer as dirty.
 // Used when the entire file content is loaded (e.g., new file or full rewrite).
 func (wb *WriteBuffer) MarkAllDirty() {
+	if wb.smallFileData != nil {
+		wb.dirtyParts = map[int]bool{0: true}
+		wb.touched = true
+		return
+	}
 	n := int((wb.totalSize + wb.partSize - 1) / wb.partSize)
 	wb.dirtyParts = make(map[int]bool, n)
 	for i := 0; i < n; i++ {
@@ -355,6 +491,25 @@ func (wb *WriteBuffer) PartData(partNum int) []byte {
 	start := int64(partIdx) * wb.partSize
 	if start >= wb.totalSize {
 		return nil
+	}
+
+	if wb.smallFileData != nil {
+		// Small-file mode: the entire file is logically part 1
+		if partNum != 1 {
+			return nil
+		}
+		end := wb.partSize
+		if end > wb.totalSize {
+			end = wb.totalSize
+		}
+		if int64(len(wb.smallFileData)) < end {
+			extended := make([]byte, end)
+			copy(extended, wb.smallFileData)
+			return extended
+		}
+		buf := make([]byte, end)
+		copy(buf, wb.smallFileData)
+		return buf
 	}
 
 	part, ok := wb.parts[partIdx]
@@ -397,6 +552,11 @@ func (wb *WriteBuffer) ReadAt(offset int64, buf []byte) int {
 	total := int(end - offset)
 	if total <= 0 {
 		return 0
+	}
+
+	if wb.smallFileData != nil {
+		n := copy(buf, wb.smallFileData[offset:])
+		return n
 	}
 
 	pos := offset
@@ -448,6 +608,9 @@ func (wb *WriteBuffer) ReadAt(offset int64, buf []byte) int {
 
 // IsPartLoaded reports whether the 0-based part index is in memory.
 func (wb *WriteBuffer) IsPartLoaded(partIdx int) bool {
+	if wb.smallFileData != nil {
+		return partIdx == 0
+	}
 	_, ok := wb.parts[partIdx]
 	return ok
 }
@@ -457,6 +620,9 @@ func (wb *WriteBuffer) IsPartLoaded(partIdx int) bool {
 // This is true for new files (remoteSize == 0) and for existing files whose
 // entire retained remote prefix has been loaded into memory.
 func (wb *WriteBuffer) CanMaterializeFull() bool {
+	if wb.smallFileData != nil {
+		return true
+	}
 	covered := wb.remoteSize
 	if wb.totalSize < covered {
 		covered = wb.totalSize
@@ -480,11 +646,15 @@ func (wb *WriteBuffer) Reset() {
 	wb.dirtyParts = make(map[int]bool)
 	wb.totalSize = 0
 	wb.curMemory = 0
+	wb.smallFileData = nil
 }
 
 func (wb *WriteBuffer) ClearDirty() {
 	wb.dirtyParts = make(map[int]bool)
 	wb.touched = false
+	// Note: we intentionally do NOT clear smallFileData here.
+	// ClearDirty is called after successful flush/upload; the data remains
+	// valid for reads until the handle is released or Reset is called.
 }
 
 // EnsureLoaded loads a part from the server if it's not already in memory.
@@ -520,6 +690,11 @@ func (wb *WriteBuffer) EvictPart(partIdx int) {
 		wb.uploadedParts = make(map[int]bool)
 	}
 	wb.uploadedParts[partIdx] = true
+
+	if wb.smallFileData != nil {
+		// Migrate to part mode before evicting
+		wb.migrateToPartMode()
+	}
 
 	if part, ok := wb.parts[partIdx]; ok {
 		wb.curMemory -= int64(len(part))
