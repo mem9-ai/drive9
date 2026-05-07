@@ -45,7 +45,7 @@ func TestFusePerfCountersSummary(t *testing.T) {
 	perf.printSummary(&out)
 	text := out.String()
 	for _, want := range []string{
-		"dat9: FUSE perf summary",
+		"drive9: FUSE perf summary",
 		"perf fuse lookup count=1",
 		"perf fuse read count=1 errors=1 bytes=128",
 		"perf remote read count=1",

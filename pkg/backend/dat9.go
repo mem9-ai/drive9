@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/datastore"
@@ -1155,6 +1156,9 @@ func detectContentType(path string, data []byte) string {
 	ext := pathutil.Ext(path)
 	if ext != "" {
 		if ct := mime.TypeByExtension(ext); ct != "" {
+			if isTextualContentType(ct) && !isTextContent(data) {
+				return "application/octet-stream"
+			}
 			return ct
 		}
 	}
@@ -1170,14 +1174,21 @@ func isTextContent(data []byte) bool {
 			return false
 		}
 	}
-	return true
+	return utf8.Valid(data)
+}
+
+func isTextualContentType(contentType string) bool {
+	return strings.HasPrefix(contentType, "text/") ||
+		contentType == "application/json" ||
+		contentType == "application/xml" ||
+		contentType == "application/yaml"
 }
 
 func extractText(data []byte, contentType string) string {
-	if !strings.HasPrefix(contentType, "text/") &&
-		contentType != "application/json" &&
-		contentType != "application/xml" &&
-		contentType != "application/yaml" {
+	if !isTextualContentType(contentType) {
+		return ""
+	}
+	if !isTextContent(data) {
 		return ""
 	}
 	if len(data) > textExtractMaxBytes {

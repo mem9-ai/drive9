@@ -172,17 +172,17 @@ func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDe
 		return explainMountError(deps.goos, mountPoint, err)
 	}
 
-	fmt.Fprintf(os.Stderr, "dat9: mounted on %s via WebDAV (%s)\n", mountPoint, serverURL)
+	fmt.Fprintf(os.Stderr, "drive9: mounted on %s via WebDAV (server: %s)\n", mountPoint, serverURL)
 
 	// Signal handling for graceful shutdown.
 	go func() {
 		<-deps.signals
-		fmt.Fprintf(os.Stderr, "\ndat9: unmounting %s...\n", mountPoint)
+		fmt.Fprintf(os.Stderr, "\ndrive9: unmounting %s...\n", mountPoint)
 
 		// Second signal forces exit.
 		go func() {
 			<-deps.signals
-			fmt.Fprintf(os.Stderr, "dat9: forced exit\n")
+			fmt.Fprintf(os.Stderr, "drive9: forced exit\n")
 			deps.exit(1)
 		}()
 
@@ -326,6 +326,6 @@ func webdavUnmount(goos, mountPoint string) {
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "dat9: webdav unmount failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "drive9: webdav unmount failed: %v\n", err)
 	}
 }

@@ -250,25 +250,25 @@ func (p *fusePerfCounters) printSummary(w io.Writer) {
 		return
 	}
 	snap := p.snapshot()
-	writePerfLine(w, "dat9: FUSE perf summary uptime=%s\n", snap.Uptime.Truncate(time.Millisecond))
+	writePerfLine(w, "drive9: FUSE perf summary uptime=%s\n", snap.Uptime.Truncate(time.Millisecond))
 	writePerfOps(w, "fuse", perfFuseOpNames[:], snap.FuseOps)
 	writePerfOps(w, "remote", perfRemoteOpNames[:], snap.RemoteOps)
-	writePerfLine(w, "dat9: perf cache read_hit=%d read_miss=%d dir_hit=%d dir_miss=%d prefetch_hit=%d prefetch_miss=%d\n",
+	writePerfLine(w, "drive9: perf cache read_hit=%d read_miss=%d dir_hit=%d dir_miss=%d prefetch_hit=%d prefetch_miss=%d\n",
 		snap.Counters["read_cache_hit"], snap.Counters["read_cache_miss"],
 		snap.Counters["dir_cache_hit"], snap.Counters["dir_cache_miss"],
 		snap.Counters["prefetch_hit"], snap.Counters["prefetch_miss"])
-	writePerfLine(w, "dat9: perf retries lookup_total=%d lookup_success=%d lookup_exhausted=%d read_total=%d read_success=%d read_exhausted=%d\n",
+	writePerfLine(w, "drive9: perf retries lookup_total=%d lookup_success=%d lookup_exhausted=%d read_total=%d read_success=%d read_exhausted=%d\n",
 		snap.Counters["lookup_retry_total"], snap.Counters["lookup_retry_success"], snap.Counters["lookup_retry_exhausted"],
 		snap.Counters["read_retry_total"], snap.Counters["read_retry_success"], snap.Counters["read_retry_exhausted"])
-	writePerfLine(w, "dat9: perf commit enqueue=%d enqueue_errors=%d retries=%d success=%d failure=%d drain_count=%d drain_total=%s\n",
+	writePerfLine(w, "drive9: perf commit enqueue=%d enqueue_errors=%d retries=%d success=%d failure=%d drain_count=%d drain_total=%s\n",
 		snap.Counters["commit_enqueue"], snap.Counters["commit_enqueue_error"], snap.Counters["commit_retry"],
 		snap.Counters["commit_success"], snap.Counters["commit_failure"],
 		snap.Counters["commit_drain_count"], time.Duration(snap.Counters["commit_drain_total_ns"]).Truncate(time.Millisecond))
-	writePerfLine(w, "dat9: perf uploader submit=%d sync_fallback=%d success=%d failure=%d drain_count=%d drain_total=%s\n",
+	writePerfLine(w, "drive9: perf uploader submit=%d sync_fallback=%d success=%d failure=%d drain_count=%d drain_total=%s\n",
 		snap.Counters["uploader_submit"], snap.Counters["uploader_sync_fallback"],
 		snap.Counters["uploader_success"], snap.Counters["uploader_failure"],
 		snap.Counters["uploader_drain_count"], time.Duration(snap.Counters["uploader_drain_total_ns"]).Truncate(time.Millisecond))
-	writePerfLine(w, "dat9: perf sse change=%d reset=%d self_filtered=%d notify_entry=%d notify_inode=%d\n",
+	writePerfLine(w, "drive9: perf sse change=%d reset=%d self_filtered=%d notify_entry=%d notify_inode=%d\n",
 		snap.Counters["sse_change"], snap.Counters["sse_reset"], snap.Counters["sse_self_filtered"],
 		snap.Counters["notify_entry"], snap.Counters["notify_inode"])
 }
@@ -283,7 +283,7 @@ func writePerfOps(w io.Writer, group string, names []string, stats map[string]pe
 		if st.count > 0 && st.totalNS > 0 {
 			avg = time.Duration(st.totalNS / st.count)
 		}
-		writePerfLine(w, "dat9: perf %s %s count=%d errors=%d bytes=%d avg=%s\n",
+		writePerfLine(w, "drive9: perf %s %s count=%d errors=%d bytes=%d avg=%s\n",
 			group, name, st.count, st.errors, st.bytes, avg.Truncate(time.Microsecond))
 	}
 }

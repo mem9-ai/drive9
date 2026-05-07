@@ -1851,6 +1851,7 @@ type pendingRenameResult int
 const (
 	pendingRenameNotApplicable pendingRenameResult = iota
 	pendingRenameRemoteFallback
+	pendingRenameRemoteFallbackCleanupOld
 	pendingRenameHandled
 )
 
@@ -1870,11 +1871,10 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 	if fs.commitQueue != nil {
 		fs.commitQueue.WaitPath(newP)
 	}
-	targetExists, err := fs.pendingRenameTargetExists(ctx, newP)
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+	targetExists, err := fs.pendingRenameTargetExists(probeCtx, newP)
+	probeCancel()
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return pendingRenameNotApplicable, err
-		}
 		log.Printf("rename: probe final pending-new target %s failed, using remote fallback: %v", newP, err)
 		return pendingRenameRemoteFallback, nil
 	}
@@ -1888,6 +1888,17 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 
 		// The cancel may have raced with a successful upload. If so, the old
 		// path now exists remotely and the normal server-side rename is correct.
+		oldRemoteExists, err := fs.remotePathExistsDetached(oldP)
+		if err != nil {
+			log.Printf("rename: probe old pending-new source %s failed, using remote fallback: %v", oldP, err)
+			return pendingRenameRemoteFallback, nil
+		}
+		if oldRemoteExists {
+			// The caller still needs to execute the remote rename. Keep local
+			// state until that succeeds so a remote rename failure can be
+			// retried from the preserved shadow/pending entry.
+			return pendingRenameRemoteFallbackCleanupOld, nil
+		}
 		meta, ok = fs.pendingIndex.GetMeta(oldP)
 		if !ok || meta.Kind != PendingNew {
 			return pendingRenameRemoteFallback, nil
@@ -2080,6 +2091,14 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 
 	if err := fs.renameRemoteWithTransientRetry(ctx, oldP, newP); err != nil {
 		return httpToFuseStatus(err)
+	}
+	if pendingRename == pendingRenameRemoteFallbackCleanupOld {
+		if fs.shadowStore != nil {
+			fs.shadowStore.Remove(oldP)
+		}
+		if fs.pendingIndex != nil {
+			fs.pendingIndex.Remove(oldP)
+		}
 	}
 
 	// After server-side rename, migrate pending descendants.
@@ -2609,12 +2628,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		} else {
 			out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 		}
-	} else if fh.Prefetch != nil {
-		// Large read-only files with prefetcher: use DIRECT_IO so every
-		// read goes through our Read handler (no kernel page cache).
-		// The prefetcher provides its own caching layer.
-		out.OpenFlags = gofuse.FOPEN_DIRECT_IO
 	} else {
+		// Read-only opens need kernel caching so mmap-based readers (notably
+		// git pack access) do not SIGBUS on macFUSE. Prefetch-backed reads
+		// still populate the userspace prefetcher on cache misses.
 		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 	}
 	fs.debugf("open path=%s fh=%d ino=%d flags=0x%x open_flags=%d dirty=%t prefetch=%t orig_size=%d base_rev=%d shadow_ready=%t shadow_spill=%t", p, out.Fh, fh.Ino, input.Flags, out.OpenFlags, fh.Dirty != nil, fh.Prefetch != nil, fh.OrigSize, fh.BaseRev, fh.ShadowReady, fh.ShadowSpill)

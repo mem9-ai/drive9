@@ -446,6 +446,7 @@ func init() {
 // ---------------------------------------------------------------------------
 
 func TestFsMountCmd_RemoteSourceParsing(t *testing.T) {
+	isolateMountCredentialsForTest(t)
 	// 2-arg with valid remote source should parse (will fail at credential
 	// resolution, but that proves parsing succeeded).
 	err := fsMountCmd([]string{":/foo/bar", "/tmp/drive9-remote-test"})
@@ -479,6 +480,7 @@ func TestFsMountCmd_RejectsContextScopedRemote(t *testing.T) {
 }
 
 func TestFsMountCmd_SingleArgDefaultsToRootRemote(t *testing.T) {
+	isolateMountCredentialsForTest(t)
 	// Single arg should work (fail at credentials, not at parsing).
 	err := fsMountCmd([]string{"/tmp/drive9-single-arg-test"})
 	if err == nil {
@@ -488,6 +490,20 @@ func TestFsMountCmd_SingleArgDefaultsToRootRemote(t *testing.T) {
 	if strings.Contains(err.Error(), "remote source") {
 		t.Fatalf("single arg should not trigger remote-source error: %v", err)
 	}
+}
+
+// isolateMountCredentialsForTest keeps parsing-only mount tests from reading
+// the developer machine's DRIVE9_* env vars or active drive9 context. Without
+// this, a test that expects credential resolution to fail can reach the real
+// WebDAV mount path and block waiting for an unmount signal.
+func isolateMountCredentialsForTest(t *testing.T) {
+	t.Helper()
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(EnvServer, "")
+	t.Setenv(EnvAPIKey, "")
+	t.Setenv(EnvVaultToken, "")
 }
 
 func newWebDAVLifecycleClient(t *testing.T) *client.Client {

@@ -82,7 +82,7 @@ func (w *SSEWatcher) handleChange(ce *client.ChangeEvent) {
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "dat9: SSE event op=%s path=%s local=%s actor=%s\n", ce.Op, remotePath, p, ce.Actor)
+	fmt.Fprintf(os.Stderr, "drive9: SSE event op=%s path=%s local=%s actor=%s\n", ce.Op, remotePath, p, ce.Actor)
 
 	// Invalidate read cache for the changed file.
 	w.fs.readCache.Invalidate(p)
@@ -107,7 +107,7 @@ func (w *SSEWatcher) handleReset(resets ...*client.ResetEvent) {
 		seq = resets[0].Seq
 		reason = resets[0].Reason
 	}
-	fmt.Fprintf(os.Stderr, "dat9: SSE reset — invalidating all caches\n")
+	fmt.Fprintf(os.Stderr, "drive9: SSE reset — invalidating all caches\n")
 	w.fs.debugf("sse reset start seq=%d reason=%s", seq, reason)
 
 	// 1. Clear all user-space caches.
