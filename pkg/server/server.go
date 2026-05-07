@@ -84,7 +84,12 @@ type TenantStatusResponse struct {
 	MaxUploadBytes int64  `json:"max_upload_bytes"`
 }
 
-const maxBatchStatPaths = 256
+const (
+	maxBatchStatPaths       = 256
+	maxBatchReadSmallPaths  = 128
+	maxBatchReadSmallBytes  = 50_000
+	defaultBatchReadMaxBody = 1 << 20
+)
 
 func New(b *backend.Dat9Backend) *Server {
 	return NewWithConfig(Config{Backend: b})
@@ -130,6 +135,7 @@ func NewWithConfig(cfg Config) *Server {
 		business = injectFallbackBackend(cfg.Backend, business)
 	}
 	mux.Handle("/v1/fs:batch-stat", business)
+	mux.Handle("/v1/fs:batch-read-small", business)
 	mux.Handle("/v1/fs/", business)
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
@@ -299,6 +305,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/v1/fs:batch-stat":
 		s.handleBatchStat(w, r)
+	case r.URL.Path == "/v1/fs:batch-read-small":
+		s.handleBatchReadSmall(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/fs/"):
 		s.handleFS(w, r)
 	case r.URL.Path == "/v1/uploads/initiate":
@@ -1065,6 +1073,25 @@ type batchStatResult struct {
 	Mtime    int64  `json:"mtime,omitempty"`
 }
 
+type batchReadSmallRequest struct {
+	Paths    []string `json:"paths"`
+	MaxBytes int64    `json:"max_bytes,omitempty"`
+}
+
+type batchReadSmallResponse struct {
+	Results []batchReadSmallResult `json:"results"`
+}
+
+type batchReadSmallResult struct {
+	Path     string `json:"path"`
+	Status   int    `json:"status"`
+	Error    string `json:"error,omitempty"`
+	Data     []byte `json:"data,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+	Revision int64  `json:"revision,omitempty"`
+	Mtime    int64  `json:"mtime,omitempty"`
+}
+
 func (s *Server) handleBatchStat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_stat_method_not_allowed", "method", r.Method)...)
@@ -1097,6 +1124,83 @@ func (s *Server) handleBatchStat(w http.ResponseWriter, r *http.Request) {
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "batch_stat_ok", "count", len(results))...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(batchStatResponse{Results: results})
+}
+
+func (s *Server) handleBatchReadSmall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_read_small_method_not_allowed", "method", r.Method)...)
+		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_read_small_missing_scope")...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+
+	var req batchReadSmallRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, defaultBatchReadMaxBody)).Decode(&req); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_read_small_decode_failed", "error", err)...)
+		errJSON(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if len(req.Paths) > maxBatchReadSmallPaths {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_read_small_too_large", "count", len(req.Paths), "limit", maxBatchReadSmallPaths)...)
+		errJSON(w, http.StatusBadRequest, fmt.Sprintf("too many paths: %d exceeds limit %d", len(req.Paths), maxBatchReadSmallPaths))
+		return
+	}
+
+	maxBytes := req.MaxBytes
+	if maxBytes <= 0 || maxBytes > maxBatchReadSmallBytes {
+		maxBytes = maxBatchReadSmallBytes
+	}
+	results := make([]batchReadSmallResult, len(req.Paths))
+	for i, path := range req.Paths {
+		results[i] = s.batchReadSmallOne(r.Context(), b, path, maxBytes)
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "batch_read_small_ok", "count", len(results), "max_bytes", maxBytes)...)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(batchReadSmallResponse{Results: results})
+}
+
+func (s *Server) batchReadSmallOne(ctx context.Context, b *backend.Dat9Backend, rawPath string, maxBytes int64) batchReadSmallResult {
+	result := batchReadSmallResult{Path: rawPath}
+	if err := validateBatchStatPath(rawPath); err != nil {
+		result.Status = http.StatusBadRequest
+		result.Error = err.Error()
+		return result
+	}
+
+	plan, err := b.ReadInlinePlanCtx(ctx, rawPath)
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			result.Status = http.StatusNotFound
+			result.Error = err.Error()
+			return result
+		}
+		if errors.Is(err, backend.ErrNotInlineStorage) {
+			result.Status = http.StatusRequestEntityTooLarge
+			result.Error = "file is not available for inline read"
+			return result
+		}
+		result.Status = http.StatusInternalServerError
+		result.Error = err.Error()
+		return result
+	}
+	if plan.Size > maxBytes || int64(len(plan.InlineData)) > maxBytes {
+		result.Status = http.StatusRequestEntityTooLarge
+		result.Error = fmt.Sprintf("file exceeds batch read-small limit %d bytes", maxBytes)
+		return result
+	}
+	result.Status = http.StatusOK
+	result.Data = plan.InlineData
+	result.Size = plan.Size
+	result.Revision = plan.Revision
+	if !plan.Mtime.IsZero() {
+		result.Mtime = plan.Mtime.Unix()
+	}
+	return result
 }
 
 func (s *Server) batchStatOne(ctx context.Context, b *backend.Dat9Backend, rawPath string) batchStatResult {

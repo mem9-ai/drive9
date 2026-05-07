@@ -78,6 +78,11 @@ func fsMountCmd(args []string) error {
 	flushDebounce := fs.Duration("flush-debounce", -1, "debounce window for small-file flush coalescing (default 2s, 0 disables)")
 	lookupRetryCount := fs.Int("lookup-retry-count", 2, "detached retries after transient Lookup/GetAttr stat failures (default 2, set 0 to disable)")
 	lookupRetryTimeout := fs.Duration("lookup-retry-timeout", 250*time.Millisecond, "timeout per detached Lookup/GetAttr stat retry (default 250ms, must be > 0)")
+	readDirPrefetch := fs.Bool("readdir-prefetch", false, "prefetch small files after directory reads into the read cache")
+	prefetchMaxFiles := fs.Int("readdir-prefetch-max-files", 32, "maximum small files prefetched per directory read")
+	prefetchMaxFileBytes := fs.Int64("readdir-prefetch-max-file-bytes", 50_000, "maximum individual file size prefetched by readdir prefetch")
+	prefetchMaxBytes := fs.Int64("readdir-prefetch-max-bytes", 1<<20, "maximum aggregate bytes prefetched per directory read")
+	prefetchTimeout := fs.Duration("readdir-prefetch-timeout", time.Second, "timeout for one readdir prefetch batch")
 	syncMode := fs.String("sync-mode", "auto", "sync mode: auto, interactive, or strict")
 	profile := fs.String("profile", "", "mount profile: interactive (empty for default)")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
@@ -129,6 +134,9 @@ func fsMountCmd(args []string) error {
 	if err := validateLookupRetryFlags(*lookupRetryCount, *lookupRetryTimeout); err != nil {
 		return err
 	}
+	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
+		return err
+	}
 	normalizedLookupRetryCount := normalizeLookupRetryCount(*lookupRetryCount)
 
 	serverGiven, apiKeyGiven := flagProvided(fs, "server"), flagProvided(fs, "api-key")
@@ -178,25 +186,30 @@ func fsMountCmd(args []string) error {
 	}
 
 	opts := &drive9fuse.MountOptions{
-		Server:             *server,
-		APIKey:             *apiKey,
-		Token:              token,
-		MountPoint:         mountPoint,
-		RemoteRoot:         remoteRoot,
-		CacheDir:           *cacheDir,
-		CacheSize:          int64(*cacheSize) << 20,
-		DirTTL:             *dirTTL,
-		AttrTTL:            *attrTTL,
-		EntryTTL:           *entryTTL,
-		FlushDebounce:      *flushDebounce,
-		LookupRetryCount:   normalizedLookupRetryCount,
-		LookupRetryTimeout: *lookupRetryTimeout,
-		SyncMode:           syncModeVal,
-		Profile:            *profile,
-		AllowOther:         *allowOther,
-		ReadOnly:           *readOnly,
-		Debug:              *debug,
-		PerfCounters:       *perfCounters,
+		Server:               *server,
+		APIKey:               *apiKey,
+		Token:                token,
+		MountPoint:           mountPoint,
+		RemoteRoot:           remoteRoot,
+		CacheDir:             *cacheDir,
+		CacheSize:            int64(*cacheSize) << 20,
+		DirTTL:               *dirTTL,
+		AttrTTL:              *attrTTL,
+		EntryTTL:             *entryTTL,
+		FlushDebounce:        *flushDebounce,
+		LookupRetryCount:     normalizedLookupRetryCount,
+		LookupRetryTimeout:   *lookupRetryTimeout,
+		ReadDirPrefetch:      *readDirPrefetch,
+		PrefetchMaxFiles:     *prefetchMaxFiles,
+		PrefetchMaxFileBytes: *prefetchMaxFileBytes,
+		PrefetchMaxBytes:     *prefetchMaxBytes,
+		PrefetchTimeout:      *prefetchTimeout,
+		SyncMode:             syncModeVal,
+		Profile:              *profile,
+		AllowOther:           *allowOther,
+		ReadOnly:             *readOnly,
+		Debug:                *debug,
+		PerfCounters:         *perfCounters,
 	}
 
 	return drive9fuse.Mount(opts)
@@ -254,6 +267,22 @@ func validateLookupRetryFlags(count int, timeout time.Duration) error {
 	}
 	if timeout <= 0 {
 		return fmt.Errorf("drive9 mount: --lookup-retry-timeout must be > 0")
+	}
+	return nil
+}
+
+func validateReadDirPrefetchFlags(maxFiles int, maxFileBytes int64, maxBytes int64, timeout time.Duration) error {
+	if maxFiles <= 0 {
+		return fmt.Errorf("drive9 mount: --readdir-prefetch-max-files must be > 0")
+	}
+	if maxFileBytes <= 0 {
+		return fmt.Errorf("drive9 mount: --readdir-prefetch-max-file-bytes must be > 0")
+	}
+	if maxBytes <= 0 {
+		return fmt.Errorf("drive9 mount: --readdir-prefetch-max-bytes must be > 0")
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("drive9 mount: --readdir-prefetch-timeout must be > 0")
 	}
 	return nil
 }

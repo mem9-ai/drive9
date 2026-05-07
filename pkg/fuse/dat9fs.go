@@ -2146,6 +2146,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	}
 	fs.applyBatchStats(ctx, dirPath, cached)
 	fs.dirCache.Put(dirPath, cached)
+	fs.prefetchReadCacheForDir(ctx, dirPath, cached)
 
 	entries := fs.cachedToDirEntries(dirPath, cached)
 	return fs.mergePendingDirEntries(dirPath, entries), nil

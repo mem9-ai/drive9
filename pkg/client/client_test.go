@@ -164,6 +164,94 @@ func TestBatchStatCtxRejectsTooManyPathsBeforeRequest(t *testing.T) {
 	}
 }
 
+func TestBatchReadSmallCtxPreservesPerPathErrors(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/fs:batch-read-small" {
+			t.Fatalf("path = %q, want /v1/fs:batch-read-small", r.URL.Path)
+		}
+		var req struct {
+			Paths    []string `json:"paths"`
+			MaxBytes int64    `json:"max_bytes"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if got, want := strings.Join(req.Paths, ","), "/ok.txt,/missing.txt,/ok.txt"; got != want {
+			t.Fatalf("paths = %q, want %q", got, want)
+		}
+		if req.MaxBytes != 16 {
+			t.Fatalf("max_bytes = %d, want 16", req.MaxBytes)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []map[string]any{
+				{"path": "/ok.txt", "status": 200, "data": []byte("hello"), "size": 5, "revision": 3, "mtime": 11},
+				{"path": "/missing.txt", "status": 404, "error": "not found"},
+				{"path": "/ok.txt", "status": 200, "data": []byte("hello"), "size": 5, "revision": 3, "mtime": 11},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	results, err := c.BatchReadSmallCtx(context.Background(), []string{"/ok.txt", "/missing.txt", "/ok.txt"}, 16)
+	if err != nil {
+		t.Fatalf("BatchReadSmallCtx error = %v, want nil", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("results len = %d, want 3", len(results))
+	}
+	if !results[0].OK() || string(results[0].Data) != "hello" || results[0].Revision != 3 || results[0].Size != 5 || results[0].Mtime != 11 {
+		t.Fatalf("first result = %+v, want ok data/rev/size/mtime", results[0])
+	}
+	if results[1].OK() || results[1].Status != http.StatusNotFound {
+		t.Fatalf("second result = %+v, want per-path 404", results[1])
+	}
+	if !results[2].OK() || results[2].Path != "/ok.txt" || string(results[2].Data) != "hello" {
+		t.Fatalf("third result = %+v, want duplicate ok path", results[2])
+	}
+}
+
+func TestBatchReadSmallCtxRejectsTooManyPathsBeforeRequest(t *testing.T) {
+	var called bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+	defer ts.Close()
+
+	paths := make([]string, MaxBatchReadSmallPaths+1)
+	c := New(ts.URL, "")
+	_, err := c.BatchReadSmallCtx(context.Background(), paths, 1024)
+	if err == nil {
+		t.Fatal("BatchReadSmallCtx error = nil, want too-large error")
+	}
+	if called {
+		t.Fatal("server was called despite client-side batch limit")
+	}
+}
+
+func TestBatchReadSmallCtxRejectsPathMismatch(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []map[string]any{
+				{"path": "/b.txt", "status": 200, "data": []byte("wrong")},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	_, err := c.BatchReadSmallCtx(context.Background(), []string{"/a.txt"}, 16)
+	if err == nil {
+		t.Fatal("BatchReadSmallCtx error = nil, want path mismatch error")
+	}
+	if !strings.Contains(err.Error(), `result[0] path = "/b.txt", want "/a.txt"`) {
+		t.Fatalf("BatchReadSmallCtx error = %v, want path mismatch", err)
+	}
+}
+
 func TestStat(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()

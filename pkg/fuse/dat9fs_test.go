@@ -925,6 +925,246 @@ func TestListDirIgnoresBatchStatTransportFailure(t *testing.T) {
 	}
 }
 
+func TestListDirPrefetchesSmallFilesIntoReadCache(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []map[string]any{{
+					"name":  "prefetch.txt",
+					"isDir": false,
+					"size":  5,
+				}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"results": []map[string]any{{
+					"path":     "/prefetch.txt",
+					"status":   200,
+					"isDir":    false,
+					"size":     5,
+					"revision": 7,
+				}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-read-small":
+			var req struct {
+				Paths    []string `json:"paths"`
+				MaxBytes int64    `json:"max_bytes"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode batch read-small request: %v", err)
+			}
+			if got, want := strings.Join(req.Paths, ","), "/prefetch.txt"; got != want {
+				t.Fatalf("batch read-small paths = %q, want %q", got, want)
+			}
+			if req.MaxBytes != 16 {
+				t.Fatalf("batch read-small max_bytes = %d, want 16", req.MaxBytes)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"results": []map[string]any{{
+					"path":     "/prefetch.txt",
+					"status":   200,
+					"data":     []byte("hello"),
+					"size":     5,
+					"revision": 7,
+				}},
+			})
+		default:
+			t.Fatalf("unexpected request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{
+		ReadDirPrefetch:      true,
+		PrefetchMaxFiles:     8,
+		PrefetchMaxFileBytes: 16,
+		PrefetchMaxBytes:     64,
+		PrefetchTimeout:      time.Second,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	entries, err := fs.listDir(context.Background(), "/")
+	if err != nil {
+		t.Fatalf("listDir error = %v, want nil", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "prefetch.txt" {
+		t.Fatalf("listDir entries = %+v, want prefetch.txt", entries)
+	}
+	data, ok := fs.readCache.Get("/prefetch.txt", 7)
+	if !ok {
+		t.Fatal("readCache miss after readdir prefetch")
+	}
+	if string(data) != "hello" {
+		t.Fatalf("readCache data = %q, want hello", data)
+	}
+}
+
+func TestListDirPrefetchIgnoresBatchReadTransportFailure(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []map[string]any{{
+					"name":  "listed.txt",
+					"isDir": false,
+					"size":  9,
+				}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"results": []map[string]any{{
+					"path":     "/listed.txt",
+					"status":   200,
+					"isDir":    false,
+					"size":     9,
+					"revision": 4,
+				}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-read-small":
+			http.Error(w, "batch read unavailable", http.StatusInternalServerError)
+		default:
+			t.Fatalf("unexpected request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{ReadDirPrefetch: true}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	entries, err := fs.listDir(context.Background(), "/")
+	if err != nil {
+		t.Fatalf("listDir error = %v, want nil", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "listed.txt" {
+		t.Fatalf("listDir entries = %+v, want listed.txt despite batch read transport failure", entries)
+	}
+	if _, ok := fs.readCache.Get("/listed.txt", 4); ok {
+		t.Fatal("readCache hit after failed batch read-small, want miss")
+	}
+}
+
+func TestListDirPrefetchSkipsPendingFile(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []map[string]any{{
+					"name":  "dirty.txt",
+					"isDir": false,
+					"size":  6,
+				}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"results": []map[string]any{{
+					"path":     "/dirty.txt",
+					"status":   200,
+					"isDir":    false,
+					"size":     6,
+					"revision": 5,
+				}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-read-small":
+			t.Fatalf("batch read-small should not be called for pending local file")
+		default:
+			t.Fatalf("unexpected request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{ReadDirPrefetch: true}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/dirty.txt", 6, PendingOverwrite, 4); err != nil {
+		t.Fatal(err)
+	}
+	fs.pendingIndex = pending
+
+	entries, err := fs.listDir(context.Background(), "/")
+	if err != nil {
+		t.Fatalf("listDir error = %v, want nil", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "dirty.txt" {
+		t.Fatalf("listDir entries = %+v, want dirty.txt", entries)
+	}
+	if _, ok := fs.readCache.Get("/dirty.txt", 5); ok {
+		t.Fatal("readCache hit for pending local file, want miss")
+	}
+}
+
+func TestListDirPrefetchRespectsBudgets(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []map[string]any{
+					{"name": "a.txt", "isDir": false, "size": 4},
+					{"name": "b.txt", "isDir": false, "size": 5},
+					{"name": "c.txt", "isDir": false, "size": 4},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"results": []map[string]any{
+					{"path": "/a.txt", "status": 200, "isDir": false, "size": 4, "revision": 1},
+					{"path": "/b.txt", "status": 200, "isDir": false, "size": 5, "revision": 2},
+					{"path": "/c.txt", "status": 200, "isDir": false, "size": 4, "revision": 3},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-read-small":
+			var req struct {
+				Paths []string `json:"paths"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode batch read-small request: %v", err)
+			}
+			if got, want := strings.Join(req.Paths, ","), "/a.txt,/b.txt"; got != want {
+				t.Fatalf("batch read-small paths = %q, want %q", got, want)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"results": []map[string]any{
+					{"path": "/a.txt", "status": 200, "data": []byte("aaaa"), "size": 4, "revision": 1},
+					{"path": "/b.txt", "status": 200, "data": []byte("bbbbb"), "size": 5, "revision": 2},
+				},
+			})
+		default:
+			t.Fatalf("unexpected request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{
+		ReadDirPrefetch:      true,
+		PrefetchMaxFiles:     2,
+		PrefetchMaxFileBytes: 16,
+		PrefetchMaxBytes:     9,
+		PrefetchTimeout:      time.Second,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	_, err := fs.listDir(context.Background(), "/")
+	if err != nil {
+		t.Fatalf("listDir error = %v, want nil", err)
+	}
+	if data, ok := fs.readCache.Get("/a.txt", 1); !ok || string(data) != "aaaa" {
+		t.Fatalf("readCache a.txt = %q, %v; want aaaa hit", data, ok)
+	}
+	if data, ok := fs.readCache.Get("/b.txt", 2); !ok || string(data) != "bbbbb" {
+		t.Fatalf("readCache b.txt = %q, %v; want bbbbb hit", data, ok)
+	}
+	if _, ok := fs.readCache.Get("/c.txt", 3); ok {
+		t.Fatal("readCache c.txt hit despite max-files budget, want miss")
+	}
+}
+
 func TestLookupRetriesTransientCanceledStat(t *testing.T) {
 	var headCalls atomic.Int32
 	firstHeadStarted := make(chan struct{}, 1)

@@ -343,6 +343,25 @@ func TestValidateLookupRetryFlags(t *testing.T) {
 	}
 }
 
+func TestValidateReadDirPrefetchFlags(t *testing.T) {
+	if err := validateReadDirPrefetchFlags(32, 50_000, 1<<20, time.Second); err != nil {
+		t.Fatalf("validateReadDirPrefetchFlags() unexpected error: %v", err)
+	}
+
+	if err := validateReadDirPrefetchFlags(0, 50_000, 1<<20, time.Second); err == nil || !strings.Contains(err.Error(), "--readdir-prefetch-max-files") {
+		t.Fatalf("max-files=0 error = %v, want max-files validation error", err)
+	}
+	if err := validateReadDirPrefetchFlags(32, 0, 1<<20, time.Second); err == nil || !strings.Contains(err.Error(), "--readdir-prefetch-max-file-bytes") {
+		t.Fatalf("max-file-bytes=0 error = %v, want max-file-bytes validation error", err)
+	}
+	if err := validateReadDirPrefetchFlags(32, 50_000, 0, time.Second); err == nil || !strings.Contains(err.Error(), "--readdir-prefetch-max-bytes") {
+		t.Fatalf("max-bytes=0 error = %v, want max-bytes validation error", err)
+	}
+	if err := validateReadDirPrefetchFlags(32, 50_000, 1<<20, 0); err == nil || !strings.Contains(err.Error(), "--readdir-prefetch-timeout") {
+		t.Fatalf("timeout=0 error = %v, want timeout validation error", err)
+	}
+}
+
 func TestNormalizeLookupRetryCount(t *testing.T) {
 	count := normalizeLookupRetryCount(2)
 	if count != 2 {
