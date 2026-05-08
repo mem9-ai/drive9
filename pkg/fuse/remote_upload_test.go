@@ -161,7 +161,7 @@ func newMultipartUploadRecorder(t *testing.T, wantPath string, wantSize int64, w
 }
 
 func (rec *multipartUploadRecorder) client() *client.Client {
-	return client.New(rec.server.URL, "")
+	return newTestClient(rec.server.URL)
 }
 
 func TestCommitQueueLargeOverwriteUsesMultipartUpload(t *testing.T) {

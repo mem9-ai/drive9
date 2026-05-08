@@ -77,10 +77,14 @@ type completePart struct {
 // partNumber is 1-based, totalParts is the total count.
 type ProgressFunc func(partNumber, totalParts int, bytesUploaded int64)
 
-// DefaultSmallFileThreshold is the conservative fallback used when the server
-// does not advertise an inline_threshold via /v1/status (e.g. older builds) or
-// the lookup fails. New code should consume the value via Client.uploadThreshold
-// so server-side overrides propagate without client redeploys.
+// DefaultSmallFileThreshold names the historical 50KB cutoff. It is kept
+// for tests and for callers that want to size buffers around the typical
+// small-file boundary. Do NOT use it as a fallback for the simple-PUT vs
+// V2-multipart upload decision: when the server is configured below 50KB
+// (DRIVE9_INLINE_THRESHOLD < 50000), a 50KB fallback would direct-PUT
+// files the server then rejects with `missing X-Dat9-Part-Checksums`.
+// Use Client.uploadThreshold which fails safe by forcing multipart when
+// no server value has been negotiated.
 const DefaultSmallFileThreshold = 50_000
 
 // uploadThreshold returns the cutoff between direct PUT and V2 multipart
@@ -90,8 +94,17 @@ const DefaultSmallFileThreshold = 50_000
 //     reached at construction.
 //  2. Server-advertised inline_threshold cached from a prior /v1/status
 //     fetch. Treated as the source of truth in production.
-//  3. DefaultSmallFileThreshold fallback: when neither override nor cached
-//     server value is available.
+//  3. Otherwise return 0, which forces every upload through V2 multipart.
+//
+// Returning 0 (rather than the historical 50KB fallback) is intentional:
+// multipart is always accepted by the server regardless of its configured
+// inline_threshold, while a fixed 50KB fallback breaks correctness when
+// operators lower the server threshold below 50KB (the server then rejects
+// the simple PUT with `missing X-Dat9-Part-Checksums`). The cost is that
+// uploads issued before /v1/status warmup is observable spend extra RTTs
+// going through initiate/presign/complete; once Warm or
+// SmallFileThreshold has populated the cache, hot paths return the
+// negotiated value and the optimization kicks in.
 //
 // This deliberately reads only the cached value rather than triggering a
 // fresh /v1/status fetch on the upload hot path: callers wanting the
@@ -101,10 +114,7 @@ const DefaultSmallFileThreshold = 50_000
 // blocking RTT to every first upload before warmup.
 func (c *Client) uploadThreshold(ctx context.Context) int64 {
 	_ = ctx
-	if t := c.CachedSmallFileThreshold(); t > 0 {
-		return t
-	}
-	return DefaultSmallFileThreshold
+	return c.CachedSmallFileThreshold()
 }
 
 // Upload concurrency limits, modeled after db9's memory-bounded approach:
@@ -341,7 +351,15 @@ func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path str
 		RemotePath: path,
 		TotalBytes: size,
 	}
-	if size < threshold {
+	// useDirectPUT picks the simple-PUT path. When threshold == 0 (no server
+	// value negotiated yet) we must NOT direct-PUT non-empty files, since
+	// the server may be configured below the historical 50KB default and
+	// would reject the simple PUT with `missing X-Dat9-Part-Checksums`.
+	// Multipart is always accepted, so we route any non-zero-size upload
+	// through it until /v1/status warmup populates the cache. Zero-byte
+	// files keep using simple PUT because V2 initiate rejects total_size=0.
+	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
+	if useDirectPUT {
 		summary.Mode = "direct_put"
 		summary.PartSizeBytes = size
 		summary.TotalParts = 1

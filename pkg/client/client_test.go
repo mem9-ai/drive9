@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -781,7 +782,10 @@ func TestSmallFileThresholdCachesFromServer(t *testing.T) {
 
 func TestSmallFileThresholdFallsBackWhenServerOmits(t *testing.T) {
 	// Older servers don't include inline_threshold. Client should leave
-	// statusInline = 0 and let callers fall back to DefaultSmallFileThreshold.
+	// statusInline = 0 so uploadThreshold returns 0 ("force multipart") —
+	// this is the safe choice when the operator may have configured the
+	// threshold below the historical 50KB. MaxUploadBytes still echoes
+	// the field that was present.
 	body := []byte(`{"status":"active","max_upload_bytes":1048576}`)
 	fake := newStatusFakeServer(t, body)
 	c := New(fake.srv.URL, "")
@@ -789,8 +793,8 @@ func TestSmallFileThresholdFallsBackWhenServerOmits(t *testing.T) {
 	if got := c.SmallFileThreshold(context.Background()); got != 0 {
 		t.Fatalf("SmallFileThreshold without server field = %d, want 0", got)
 	}
-	if got := c.uploadThreshold(context.Background()); got != DefaultSmallFileThreshold {
-		t.Fatalf("uploadThreshold fallback = %d, want %d", got, DefaultSmallFileThreshold)
+	if got := c.uploadThreshold(context.Background()); got != 0 {
+		t.Fatalf("uploadThreshold without server field = %d, want 0 (force multipart)", got)
 	}
 	if got := c.MaxUploadBytes(context.Background()); got != 1048576 {
 		t.Fatalf("MaxUploadBytes = %d", got)
@@ -822,8 +826,8 @@ func TestSmallFileThresholdLookupFailureCachesZero(t *testing.T) {
 	if got := c.SmallFileThreshold(context.Background()); got != 0 {
 		t.Fatalf("SmallFileThreshold on 500 = %d, want 0", got)
 	}
-	if got := c.uploadThreshold(context.Background()); got != DefaultSmallFileThreshold {
-		t.Fatalf("uploadThreshold during failure = %d, want %d", got, DefaultSmallFileThreshold)
+	if got := c.uploadThreshold(context.Background()); got != 0 {
+		t.Fatalf("uploadThreshold during failure = %d, want 0 (force multipart)", got)
 	}
 
 	// Server recovers; a subsequent call must retry, not stay cached at 0.
@@ -900,6 +904,110 @@ func TestSmallFileThresholdConcurrentReadersAreRaceFree(t *testing.T) {
 		_ = c.CachedSmallFileThreshold()
 	}
 	close(done)
+}
+
+func TestUploadThresholdReturnsZeroBeforeWarm(t *testing.T) {
+	// uploadThreshold must NOT fall back to DefaultSmallFileThreshold
+	// before /v1/status warmup. If the operator configured the server
+	// below 50KB, falling back to 50KB would direct-PUT files the server
+	// then rejects with `missing X-Dat9-Part-Checksums`. Returning 0 is
+	// the documented "force multipart" signal that callers honor.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"inline_threshold":30000}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := New(srv.URL, "")
+
+	if got := c.uploadThreshold(context.Background()); got != 0 {
+		t.Fatalf("pre-warm uploadThreshold = %d, want 0 (force multipart)", got)
+	}
+	// After warmup, returns the negotiated value.
+	c.Warm(context.Background())
+	if got := c.uploadThreshold(context.Background()); got != 30000 {
+		t.Fatalf("post-warm uploadThreshold = %d, want 30000", got)
+	}
+}
+
+func TestUploadThresholdHonoursLoweredServerThreshold(t *testing.T) {
+	// End-to-end: when the server is configured at 30KB and the client
+	// has warmed, a 40KB upload must NOT go direct PUT — the server's
+	// IsLargeFile gate would reject it. The fake server enforces this
+	// by failing any direct PUT that lands here.
+	const serverThreshold = int64(30000)
+	const fileSize = 40000
+	directPUTs := 0
+	multipartInits := 0
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"inline_threshold":30000}`))
+	})
+	mux.HandleFunc("/v1/fs/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		// Server-side: any PUT >= threshold without X-Dat9-Part-Checksums
+		// is rejected. Mirrors the production gate at server.go:776.
+		cl := r.ContentLength
+		if cl >= serverThreshold && r.Header.Get("X-Dat9-Part-Checksums") == "" {
+			directPUTs++
+			http.Error(w, "missing X-Dat9-Part-Checksums header", http.StatusBadRequest)
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"revision":1}`))
+	})
+	mux.HandleFunc("/v2/uploads/initiate", func(w http.ResponseWriter, r *http.Request) {
+		multipartInits++
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"upload_id":"u1","key":"k1","part_size":8388608,"total_parts":1}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.Warm(context.Background())
+
+	// Stream through writeStreamConditionalWithSummary; size > threshold
+	// must take the multipart path. We use the WriteStream entry point
+	// since direct PUT for small files is the path under test.
+	body := bytes.NewReader(make([]byte, fileSize))
+	_, err := c.writeStreamConditionalWithSummary(context.Background(), "/test.bin", body, fileSize, nil, -1, nil, "")
+	// Expected: initiate, then presign/parts/complete that aren't routed
+	// in this minimal fake — call returns error past initiate. We only
+	// assert routing went through initiate and not direct PUT.
+	if err == nil {
+		// fine — not all paths in the fake are wired, but we don't care
+	}
+	if directPUTs > 0 {
+		t.Fatalf("client issued %d direct PUTs for %dB above %dB threshold; multipart was required", directPUTs, fileSize, serverThreshold)
+	}
+	if multipartInits == 0 {
+		t.Fatalf("client never issued multipart initiate; routing missed the lowered threshold")
+	}
+}
+
+func TestUploadThresholdWarmFailureForcesMultipart(t *testing.T) {
+	// /v1/status fails (5xx); the client must fall back to "force
+	// multipart" rather than the historical 50KB. Otherwise an operator
+	// who lowered the server threshold below 50KB would see direct PUTs
+	// rejected after every transient warm failure.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := New(srv.URL, "")
+	c.Warm(context.Background())
+
+	if got := c.uploadThreshold(context.Background()); got != 0 {
+		t.Fatalf("uploadThreshold after warm failure = %d, want 0 (force multipart)", got)
+	}
 }
 
 func TestSmallFileThresholdOverrideShortCircuits(t *testing.T) {

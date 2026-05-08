@@ -67,7 +67,7 @@ func TestFusePerfDisabledByDefault(t *testing.T) {
 		DirTTL:    time.Second,
 	}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://127.0.0.1", ""), opts)
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
 	if fs.perf != nil {
 		t.Fatal("perf counters should be nil when disabled")
 	}
@@ -82,7 +82,7 @@ func TestFusePerfCountsNotifyAndSSE(t *testing.T) {
 		PerfCounters: true,
 	}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://127.0.0.1", ""), opts)
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
 	fs.inodes.Lookup("/file.txt", false, 4, time.Now())
 
 	watcher := &SSEWatcher{fs: fs, actor: "actor-a"}
@@ -130,7 +130,7 @@ func TestCommitQueuePerfCounters(t *testing.T) {
 	}
 
 	perf := newFusePerfCounters(true)
-	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	cq.SetPerfCounters(perf)
 	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/ok.txt",

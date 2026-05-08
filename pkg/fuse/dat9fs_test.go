@@ -39,7 +39,7 @@ func newTestDat9FS(tb testing.TB, size int64, get func(http.ResponseWriter, *htt
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	ino := fs.inodes.Lookup("/file.bin", false, size, time.Now())
 	return fs, ino, ts.Close
 }
@@ -106,6 +106,31 @@ func TestInitWarmTimeoutFallsBackToDefault(t *testing.T) {
 	}
 	if got := fs.inlineThreshold(); got != defaultSmallFileThreshold {
 		t.Fatalf("inlineThreshold after timeout = %d, want %d", got, defaultSmallFileThreshold)
+	}
+	// negotiatedInlineThreshold returns 0 since /v1/status never succeeded;
+	// hot-path callers must use this to force multipart for non-empty
+	// uploads instead of the heuristic-only inlineThreshold().
+	if got := fs.negotiatedInlineThreshold(); got != 0 {
+		t.Fatalf("negotiatedInlineThreshold after timeout = %d, want 0", got)
+	}
+}
+
+func TestNegotiatedInlineThresholdSeparatesProtocolFromHeuristic(t *testing.T) {
+	// inlineThreshold() is the heuristic value (falls back to 50KB) used
+	// for things like read prefetch sizing where 50KB is harmless.
+	// negotiatedInlineThreshold() returns 0 until /v1/status succeeds —
+	// flushHandle and commit_queue use the latter so a missing server
+	// value forces multipart instead of risking a server-side reject when
+	// the operator configured the inline threshold below 50KB.
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://127.0.0.1:1", ""), opts) // unreachable server
+
+	if got := fs.negotiatedInlineThreshold(); got != 0 {
+		t.Fatalf("pre-warm negotiatedInlineThreshold = %d, want 0", got)
+	}
+	if got := fs.inlineThreshold(); got != defaultSmallFileThreshold {
+		t.Fatalf("pre-warm inlineThreshold = %d, want %d (heuristic fallback)", got, defaultSmallFileThreshold)
 	}
 }
 
@@ -541,7 +566,7 @@ func TestCreateWriteThroughShadow(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
@@ -665,7 +690,7 @@ func TestFlushSkipsAsyncShadowForPartialExistingSnapshot(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	ino := fs.inodes.Lookup("/file.bin", false, size, time.Now())
 
 	writeBack, err := NewWriteBackCache(t.TempDir())
@@ -917,7 +942,7 @@ func TestFlushLargeOverwritePatchCarriesExpectedRevision(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	ino := fs.inodes.Lookup("/file.bin", false, fileSize, time.Now())
 	wb := NewWriteBuffer("/file.bin", 0, partSize)
@@ -1026,7 +1051,7 @@ func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	ino := fs.inodes.Lookup("/new.bin", false, 0, time.Now())
 	wb := NewWriteBuffer("/new.bin", 0, 0)
@@ -1161,7 +1186,7 @@ func TestGetAttrDirectoryDoesNotRequireRemoteStat(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
 
 	var out gofuse.AttrOut
@@ -1198,7 +1223,7 @@ func TestGetAttrRetriesTransientCanceledStat(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	ino := fs.inodes.Lookup("/retry-getattr.bin", false, 0, time.Now())
 
 	cancel := make(chan struct{})
@@ -1253,7 +1278,7 @@ func TestLookupStatNotFoundReturnsENOENTWithoutParentListByDefault(t *testing.T)
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	var out gofuse.EntryOut
 	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "missing", &out)
@@ -1298,7 +1323,7 @@ func TestLookupLegacyDirStatFallbackListsParentWhenEnabled(t *testing.T) {
 
 	opts := &MountOptions{LegacyDirStatFallback: true}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	var out gofuse.EntryOut
 	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "dir", &out)
@@ -1323,7 +1348,7 @@ func TestLookupUsesDirCachePositiveEntryWithoutRemoteStat(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	mtime := time.Unix(123, 0)
 	fs.dirCache.Put("/", []CachedFileInfo{{
 		Name:     "cached.txt",
@@ -1363,7 +1388,7 @@ func TestLookupUsesDirCacheNegativeEntryWithoutRemoteStat(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	fs.dirCache.Put("/", []CachedFileInfo{{Name: "other.txt", Size: 1}})
 
 	var out gofuse.EntryOut
@@ -1394,7 +1419,7 @@ func TestLookupPartialNamespaceMissFallsThroughToRemoteStat(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	fs.dirCache.Upsert("/", CachedFileInfo{Name: "known.txt", Size: 1})
 
 	var out gofuse.EntryOut
@@ -1423,7 +1448,7 @@ func TestLookupStatNotFoundSeedsShortNegativeNamespaceCache(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	for range 2 {
 		var out gofuse.EntryOut
@@ -1450,7 +1475,7 @@ func TestLookupLockFileStatNotFoundDoesNotSeedNamespaceNegative(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	for range 2 {
 		var out gofuse.EntryOut
@@ -1477,7 +1502,7 @@ func TestLookupLockFileIgnoresCompleteNamespaceMiss(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	fs.dirCache.Put("/", []CachedFileInfo{{Name: "config"}})
 
 	var out gofuse.EntryOut
@@ -1507,7 +1532,7 @@ func TestLookupSessionCreatedDirMissAvoidsRemoteStat(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	var mkdirOut gofuse.EntryOut
 	st := fs.Mkdir(nil, &gofuse.MkdirIn{
@@ -1542,7 +1567,7 @@ func TestLookupSSEForeignCreateInvalidatesSessionCreatedMiss(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
 	fs.dirCache.MarkSessionCreatedDir("/dir")
 
@@ -1577,7 +1602,7 @@ func TestLookupSSEForeignDeleteInvalidatesPositiveNamespaceHit(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	fs.inodes.Lookup("/dir", true, 0, time.Now())
 	fs.dirCache.Upsert("/dir", CachedFileInfo{Name: "stale.txt", Size: 9})
 
@@ -1610,7 +1635,7 @@ func TestNamespaceCacheCrossDirRenameUpdatesBothParents(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	srcIno := fs.inodes.Lookup("/src", true, 0, time.Now())
 	dstIno := fs.inodes.Lookup("/dst", true, 0, time.Now())
@@ -1671,7 +1696,7 @@ func TestLookupLegacyListFallbackPopulatesDirCacheForLaterMisses(t *testing.T) {
 
 	opts := &MountOptions{LegacyDirStatFallback: true}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	var first gofuse.EntryOut
 	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "first-missing.txt", &first)
@@ -1709,7 +1734,7 @@ func TestLookupUsesRemoteRootMapping(t *testing.T) {
 
 	opts := &MountOptions{RemoteRoot: "/remote"}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	var out gofuse.EntryOut
 	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "file.txt", &out)
@@ -1768,7 +1793,7 @@ func TestListDirUsesRemoteRootMapping(t *testing.T) {
 
 	opts := &MountOptions{RemoteRoot: "/remote"}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	entries, err := fs.listDir(context.Background(), "/subdir")
 	if err != nil {
@@ -1819,7 +1844,7 @@ func TestListDirIgnoresBatchStatPerPathFailure(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	entries, err := fs.listDir(context.Background(), "/")
 	if err != nil {
@@ -1858,7 +1883,7 @@ func TestListDirIgnoresBatchStatTransportFailure(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	entries, err := fs.listDir(context.Background(), "/")
 	if err != nil {
@@ -1934,7 +1959,7 @@ func TestListDirPrefetchesSmallFilesIntoReadCache(t *testing.T) {
 		PrefetchTimeout:      time.Second,
 	}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	entries, err := fs.listDir(context.Background(), "/")
 	if err != nil {
@@ -1983,7 +2008,7 @@ func TestListDirPrefetchIgnoresBatchReadTransportFailure(t *testing.T) {
 
 	opts := &MountOptions{ReadDirPrefetch: true}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	entries, err := fs.listDir(context.Background(), "/")
 	if err != nil {
@@ -2028,7 +2053,7 @@ func TestListDirPrefetchSkipsPendingFile(t *testing.T) {
 
 	opts := &MountOptions{ReadDirPrefetch: true}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	pending, err := NewPendingIndex(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -2099,7 +2124,7 @@ func TestListDirPrefetchRespectsBudgets(t *testing.T) {
 		PrefetchTimeout:      time.Second,
 	}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	_, err := fs.listDir(context.Background(), "/")
 	if err != nil {
@@ -2140,7 +2165,7 @@ func TestLookupRetriesTransientCanceledStat(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	cancel := make(chan struct{})
 	var out gofuse.EntryOut
@@ -2203,7 +2228,7 @@ func TestLookupReturnsENOENTAfterTransientCanceledStat(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	cancel := make(chan struct{})
 	var out gofuse.EntryOut
@@ -2257,7 +2282,7 @@ func TestLookupTransientRetryExhaustedReturnsEAGAIN(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	cancel := make(chan struct{})
 	var out gofuse.EntryOut
@@ -2508,7 +2533,7 @@ func TestLockFileLookupDisablesEntryCache(t *testing.T) {
 func TestLockFileCreateDisablesEntryCache(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 
 	var lockOut gofuse.CreateOut
 	st := fs.Create(nil, &gofuse.CreateIn{
@@ -2538,7 +2563,7 @@ func TestLockFileCreateDisablesEntryCache(t *testing.T) {
 func TestInitStoresServer(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 	if fs.server != nil {
 		t.Fatal("server should be nil before Init")
 	}
@@ -2568,7 +2593,7 @@ func TestCreateFileGetsStreamUploader(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	// First we need to list root so inodes are populated
 	_, _ = fs.client.List("/")
@@ -2613,7 +2638,7 @@ func TestMkdirRetriesDetachedAfterTransientInterrupt(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	var out gofuse.EntryOut
 	st := fs.Mkdir(nil, &gofuse.MkdirIn{
@@ -2661,7 +2686,7 @@ func TestMkdirRetryTreatsRemoteDirectoryAsSuccessAfterAmbiguousCreate(t *testing
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	var out gofuse.EntryOut
 	st := fs.Mkdir(nil, &gofuse.MkdirIn{
@@ -2688,7 +2713,7 @@ func TestLookupOpenCreatedFileAfterForgetSupportsGitChmodLock(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	var createOut gofuse.CreateOut
 	st := fs.Create(nil, &gofuse.CreateIn{
@@ -2740,7 +2765,7 @@ func TestLookupOpenCreatedFileAfterForgetSupportsGitChmodLock(t *testing.T) {
 func TestCommitQueueCleanupRemovesForgottenPendingInode(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
@@ -2779,7 +2804,7 @@ func TestCommitQueueCleanupRemovesForgottenPendingInode(t *testing.T) {
 func TestForgetPreservesQueuedCommitInodeUntilCleanup(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 
 	const p = "/config.lock"
 	ino := fs.inodes.Lookup(p, false, 7, time.Now())
@@ -2803,7 +2828,7 @@ func TestForgetPreservesQueuedCommitInodeUntilCleanup(t *testing.T) {
 func TestReleaseCleansForgottenInodeWithoutLocalState(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 
 	const p = "/config.lock"
 	ino := fs.inodes.Lookup(p, false, 7, time.Now())
@@ -2835,7 +2860,7 @@ func TestReleaseCleansForgottenInodeWithoutLocalState(t *testing.T) {
 func TestStatFs_ReportsVirtualCapacity(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 
 	var out gofuse.StatfsOut
 	st := fs.StatFs(nil, &gofuse.InHeader{NodeId: 1}, &out)
@@ -2864,7 +2889,7 @@ func TestStatFs_ReportsVirtualCapacity(t *testing.T) {
 func TestXAttr_GetReturnsENOATTR(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 
 	_, st := fs.GetXAttr(nil, &gofuse.InHeader{NodeId: 1}, "user.test", nil)
 	if st != gofuse.ENOATTR {
@@ -2875,7 +2900,7 @@ func TestXAttr_GetReturnsENOATTR(t *testing.T) {
 func TestXAttr_ListReturnsEmpty(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 
 	n, st := fs.ListXAttr(nil, &gofuse.InHeader{NodeId: 1}, nil)
 	if st != gofuse.OK {
@@ -2889,7 +2914,7 @@ func TestXAttr_ListReturnsEmpty(t *testing.T) {
 func TestXAttr_SetDiscardsSilently(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 
 	st := fs.SetXAttr(nil, &gofuse.SetXAttrIn{}, "user.test", []byte("val"))
 	if st != gofuse.OK {
@@ -2900,7 +2925,7 @@ func TestXAttr_SetDiscardsSilently(t *testing.T) {
 func TestXAttr_RemoveReturnsENOATTR(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 
 	st := fs.RemoveXAttr(nil, &gofuse.InHeader{NodeId: 1}, "user.test")
 	if st != gofuse.ENOATTR {
@@ -3005,7 +3030,7 @@ func TestSetAttr_TruncateWithoutHandleRefreshesRevision(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	ino := fs.inodes.Lookup("/file.bin", false, 42, time.Now())
 	fs.inodes.UpdateRevision(ino, 1)
 
@@ -3084,7 +3109,7 @@ func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	ino := fs.inodes.Lookup("/flush.bin", false, 4, time.Now())
 	fs.inodes.UpdateRevision(ino, 7)
 
@@ -3169,7 +3194,7 @@ func TestFlushHandle_SmallFile_SeedsReadCache(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	ino := fs.inodes.Lookup("/fresh.txt", false, int64(len(content)), time.Now())
 	fs.inodes.UpdateRevision(ino, 1)
@@ -3232,7 +3257,7 @@ func TestFlushHandle_SmallFile_SeedsReadCache(t *testing.T) {
 func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 	ino := fs.inodes.Lookup("/stream.bin", false, 0, time.Now())
 
 	fh := &FileHandle{
@@ -3321,7 +3346,7 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	ino := fs.inodes.Lookup("/file.bin", false, int64(len(content)), time.Now())
 	fs.inodes.UpdateRevision(ino, revision)
 	fs.inodes.UpdateSize(ino, int64(len(content)))
@@ -3454,7 +3479,7 @@ func TestSetAttr_PathTruncateSingleCallerWriterAdoptsZeroBase(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	ino := fs.inodes.Lookup("/file.bin", false, int64(len(content)), time.Now())
 	fs.inodes.UpdateRevision(ino, revision)
 	fs.inodes.UpdateSize(ino, int64(len(content)))
@@ -3589,7 +3614,7 @@ func TestSetAttr_PathTruncateDoesNotRefreshStaleWriterHandle(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	ino := fs.inodes.Lookup("/file.bin", false, int64(len(content)), time.Now())
 	fs.inodes.UpdateRevision(ino, revision)
 	fs.inodes.UpdateSize(ino, int64(len(content)))
@@ -3733,7 +3758,7 @@ func TestSetAttr_PathTruncateSingleStaleWriterHandleKeepsOriginalRevision(t *tes
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	ino := fs.inodes.Lookup("/file.bin", false, int64(len(content)), time.Now())
 	fs.inodes.UpdateRevision(ino, revision)
 	fs.inodes.UpdateSize(ino, int64(len(content)))
@@ -3814,7 +3839,7 @@ func TestLookup_UsesMtimeFromStat(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	var out gofuse.EntryOut
 	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "file.txt", &out)
@@ -3868,7 +3893,7 @@ func TestCreateWriteFlushRelease_SmallFile(t *testing.T) {
 
 	opts := &MountOptions{FlushDebounce: 0} // disable debounce for determinism
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	done := make(chan struct{})
 	go func() {
@@ -3960,7 +3985,7 @@ func TestConcurrentGetAttrDuringWrite(t *testing.T) {
 
 	opts := &MountOptions{FlushDebounce: 0}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	// Create a file
 	var createOut gofuse.CreateOut
@@ -4011,7 +4036,7 @@ func TestConcurrentGetAttrDuringWrite(t *testing.T) {
 func TestNotifyEntry_NonBlocking(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 
 	// Set a non-nil server so notifyEntry/notifyInode actually enter the
 	// async goroutine path (a zero-value Server returns ENOSYS immediately
@@ -4074,7 +4099,7 @@ func TestMutationHandlers_CompleteWithinTimeout(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	// Pre-populate some inodes for mutation tests
 	fs.inodes.Lookup("/existing.txt", false, 100, time.Now())
@@ -4168,7 +4193,7 @@ func TestParallelCreateAndGetAttr(t *testing.T) {
 
 	opts := &MountOptions{FlushDebounce: 0}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	const N = 20
 	var wg sync.WaitGroup
@@ -4256,7 +4281,7 @@ func TestFlushHandle_SmallFile_ServerUnreachable(t *testing.T) {
 
 	opts := &MountOptions{FlushDebounce: 0}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(serverURL, ""), opts)
+	fs := NewDat9FS(newTestClient(serverURL), opts)
 
 	// Manually create a file handle (server is dead, can't do real Create)
 	ino := fs.inodes.Lookup("/slow.txt", false, 0, time.Now())
@@ -4323,7 +4348,7 @@ func TestDebounce_ReleaseAfterFlush_NoDataLoss(t *testing.T) {
 
 	opts := &MountOptions{FlushDebounce: 10 * time.Second} // long debounce — won't fire naturally
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	// Create a file
 	var createOut gofuse.CreateOut
@@ -4485,7 +4510,7 @@ func TestFlushLargeFile_StrictUploadsBeforeReturning(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	fs.syncMode = SyncStrict
 
 	var createOut gofuse.CreateOut
@@ -4572,7 +4597,7 @@ func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	fs := NewDat9FS(c, opts)
 	fs.syncMode = SyncInteractive
 
@@ -4701,7 +4726,7 @@ func TestRenamePendingNewCommitSyncCommitsGitLooseObjectFinalPath(t *testing.T) 
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	fs := NewDat9FS(c, opts)
 
 	shadow, err := NewShadowStore(t.TempDir())
@@ -4804,7 +4829,7 @@ func TestRenamePendingNewCommitGitLooseObjectSyncFailureKeepsRecoverableShadow(t
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	fs := NewDat9FS(c, opts)
 
 	shadowDir := t.TempDir()
@@ -4952,7 +4977,7 @@ func TestRenamePendingNewCommitFallsBackWhenFinalTargetExists(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	fs := NewDat9FS(c, opts)
 
 	shadow, err := NewShadowStore(t.TempDir())
@@ -5088,7 +5113,7 @@ func TestRenamePendingNewCommitUsesRemoteRenameWhenCanceledUploadBecameVisible(t
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	fs := NewDat9FS(c, opts)
 
 	shadow, err := NewShadowStore(t.TempDir())
@@ -5197,7 +5222,7 @@ func TestRenamePendingNewCommitSyncCommitsWhenQueueStopped(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	fs := NewDat9FS(c, opts)
 
 	shadow, err := NewShadowStore(t.TempDir())
@@ -5285,7 +5310,7 @@ func TestUnlinkRemoteDeleteDoesNotRetryRecreatedPathAfterInterrupt(t *testing.T)
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	parentIno := fs.inodes.Lookup("/repo/.github/workflows", true, 0, time.Now())
 	fs.inodes.Lookup(path, false, 6172, time.Now())
@@ -5359,7 +5384,7 @@ func TestUnlinkRemoteDeleteAcceptsGoneAfterInterrupt(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	parentIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 	fs.inodes.Lookup(path, false, 10011, time.Now())
@@ -5433,7 +5458,7 @@ func TestRmdirRemoteDeleteDoesNotRetryRecreatedPathAfterInterrupt(t *testing.T) 
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	parentIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 	fs.inodes.Lookup(path, true, 0, time.Now())
@@ -5499,7 +5524,7 @@ func TestRenameRemoteWithTransientRetryRetriesAfterInterrupt(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	dirIno := fs.inodes.Lookup("/repo/.git/objects/e6", true, 0, time.Now())
 	fs.inodes.Lookup(oldP, false, 849, time.Now())
@@ -5574,7 +5599,7 @@ func TestRenameRemoteWithTransientRetryAcceptsTargetVisibleAfterInterrupt(t *tes
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	dirIno := fs.inodes.Lookup("/repo/.git/objects/e6", true, 0, time.Now())
 	fs.inodes.Lookup(oldP, false, 849, time.Now())
@@ -5657,7 +5682,7 @@ func TestRenameRemoteWithTransientRetryDoesNotAcceptPreexistingTarget(t *testing
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	dirIno := fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
 	fs.inodes.Lookup(oldP, false, 54, time.Now())
@@ -5729,7 +5754,7 @@ func TestRenamePendingNewCommitFallsBackWhenCanceledUploadReachedRemote(t *testi
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	fs := NewDat9FS(c, opts)
 
 	shadowDir := t.TempDir()
@@ -5823,7 +5848,7 @@ func TestRenamePendingNewCommitOldVisibilityProbeIgnoresFuseCancel(t *testing.T)
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	fs := NewDat9FS(c, opts)
 
 	shadow, err := NewShadowStore(t.TempDir())
@@ -5933,7 +5958,7 @@ func TestReadSmallFileRetryOnTransient(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	// Register root inode and do a lookup to populate inode entry
 	cancel := make(chan struct{})
@@ -5988,7 +6013,7 @@ func TestReadRangeRetryExhaustedReturnsEIO(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	cancel := make(chan struct{})
 	var entryOut2 gofuse.EntryOut
@@ -6039,7 +6064,7 @@ func TestReadSmallFileRetryExhaustedReturnsEIO(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	cancel := make(chan struct{})
 	var entryOut2 gofuse.EntryOut
@@ -6080,7 +6105,7 @@ func TestDoRangeReadBodyTimeoutReturnsForRetry(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -6124,7 +6149,7 @@ func TestDoRangeReadBodyTruncationReturnsError(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	ctx := context.Background()
 	_, n, err := fs.doRangeRead(ctx, "/truncate.bin", 0, 4096)
@@ -6159,7 +6184,7 @@ func TestReadPrefetchNotTriggeredOnFailure(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	cancel := make(chan struct{})
 	var entryOut2 gofuse.EntryOut
@@ -6259,7 +6284,7 @@ func TestLocalMutations_NotifyBudget(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	// Pre-populate inodes for mutation targets.
 	fs.inodes.Lookup("/existing.txt", false, 100, time.Now())
@@ -6336,7 +6361,7 @@ func TestCreateWriteFlushRelease_NoKernelNotify(t *testing.T) {
 
 	opts := &MountOptions{FlushDebounce: 0}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	before := fs.notifyCount.Load()
 
@@ -6416,7 +6441,7 @@ func TestCreateWriteFlushRelease_NoKernelNotify(t *testing.T) {
 func TestOnCommitQueueSuccess_NoKernelNotify_SeedsReadCache(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 
 	// Set up shadowStore with test data (simulates what Flush stages).
 	shadowDir := t.TempDir()
@@ -6479,7 +6504,7 @@ func TestOnCommitQueueSuccess_NoKernelNotify_SeedsReadCache(t *testing.T) {
 func TestSSEForeignChange_StillNotifiesKernel(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 
 	// Pre-populate an inode so SSE invalidation has something to notify.
 	fs.inodes.Lookup("/remote-file.txt", false, 100, time.Now())
@@ -6540,7 +6565,7 @@ func TestSSEForeignChange_StillNotifiesKernel(t *testing.T) {
 func TestSetAttr_NoKernelNotify(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
 
 	ino := fs.inodes.Lookup("/trunc.txt", false, 100, time.Now())
 

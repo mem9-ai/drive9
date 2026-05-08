@@ -38,6 +38,7 @@ func TestAppendStreamCreatesMissingFile(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "")
+	c.smallFileThreshold = DefaultSmallFileThreshold
 	if err := c.AppendStream(context.Background(), "/new.txt", strings.NewReader("hello"), 5, nil); err != nil {
 		t.Fatalf("AppendStream: %v", err)
 	}
@@ -123,6 +124,7 @@ func TestAppendStreamFallsBackToRewriteForSmallExistingFile(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "")
+	c.smallFileThreshold = DefaultSmallFileThreshold
 	if err := c.AppendStream(context.Background(), "/small.txt", strings.NewReader(" world"), 6, nil); err != nil {
 		t.Fatalf("AppendStream: %v", err)
 	}
@@ -278,6 +280,7 @@ func TestAppendStreamFallsBackToRewriteWhenAppendActionUnsupported(t *testing.T)
 	defer srv.Close()
 
 	c := New(srv.URL, "")
+	c.smallFileThreshold = DefaultSmallFileThreshold
 	if err := c.AppendStream(context.Background(), "/legacy.txt", strings.NewReader(" world"), 6, nil); err != nil {
 		t.Fatalf("AppendStream: %v", err)
 	}
@@ -326,6 +329,7 @@ func TestAppendStreamFallsBackToRewriteWhenS3NotConfigured(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "")
+	c.smallFileThreshold = DefaultSmallFileThreshold
 	if err := c.AppendStream(context.Background(), "/db-only.txt", strings.NewReader(" world"), 6, nil); err != nil {
 		t.Fatalf("AppendStream: %v", err)
 	}

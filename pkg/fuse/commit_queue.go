@@ -22,15 +22,18 @@ import (
 // by requiring X-Dat9-Part-Checksums (multipart protocol). Read from the
 // client's cached value to avoid surprise GET /v1/status calls in the hot
 // commit path; the FS layer is expected to have warmed the cache via the
-// startup inlineThreshold() call. Falls back to DefaultSmallFileThreshold
-// when no value has been negotiated.
+// startup inlineThreshold() call.
+//
+// Returns 0 when no server value has been negotiated yet. Callers that
+// route on the result must treat 0 as "force multipart": the server may
+// be configured below the historical 50KB default, and a fixed fallback
+// would direct-PUT files the server then rejects. Multipart is always
+// accepted.
 func (cq *CommitQueue) directPutThreshold() int64 {
 	if cq.client != nil {
-		if t := cq.client.CachedSmallFileThreshold(); t > 0 {
-			return t
-		}
+		return cq.client.CachedSmallFileThreshold()
 	}
-	return client.DefaultSmallFileThreshold
+	return 0
 }
 
 // CommitEntry represents a pending remote commit.
@@ -617,8 +620,14 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 
 	// Route based on entry.Size (metadata at enqueue time), NOT len(data).
 	// Files under directPutThreshold() use direct PUT to skip the multipart
-	// initiate/presign/complete/finalize overhead (~440ms).
-	if entry.Size < cq.directPutThreshold() {
+	// initiate/presign/complete/finalize overhead (~440ms). When threshold
+	// is 0 (no server value cached) we deliberately do not direct-PUT
+	// non-empty files: the server may be configured below 50KB and would
+	// reject the simple PUT. Zero-byte files keep direct PUT because V2
+	// initiate rejects total_size=0.
+	threshold := cq.directPutThreshold()
+	useDirectPUT := entry.Size == 0 || (threshold > 0 && entry.Size < threshold)
+	if useDirectPUT {
 		start := time.Now()
 		committedRev, err := cq.client.WriteCtxConditionalWithRevision(ctx, apiPath, data, expectedRevision)
 		if cq.perf != nil {

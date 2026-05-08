@@ -8,8 +8,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/mem9-ai/dat9/pkg/client"
 )
 
 var (
@@ -1226,7 +1224,7 @@ func TestPrefetcher_SubBlockReads(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	p := NewPrefetcher(c, "/bigfile.bin", int64(len(fileData)))
 	defer p.Close()
 
@@ -1310,7 +1308,7 @@ func TestPrefetcher_LargeReadSizeDoesNotReturnShortPrefetch(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	p := NewPrefetcher(c, "/bigfile.bin", int64(len(fileData)))
 	defer p.Close()
 
@@ -1359,7 +1357,7 @@ func TestPrefetcher_ChunkCapBound(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	p := NewPrefetcher(c, "/test.bin", fileSize)
 	defer p.Close()
 
@@ -1657,7 +1655,7 @@ func TestStreamUploader_FinishStreamingRestoresPendingOnFailure(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	su := NewStreamUploader(c, "/retry-test.bin", -1)
 
 	// Submit 2 parts.

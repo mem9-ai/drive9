@@ -15,7 +15,6 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/mem9-ai/dat9/pkg/client"
 )
 
 func TestWriteBackCache_PutGetRemove(t *testing.T) {
@@ -452,7 +451,7 @@ func TestWriteBackUploader_SubmitAndUpload(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 2)
 
 	// Put data in cache and submit for upload.
@@ -489,7 +488,7 @@ func TestWriteBackUploader_RecoverPending(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 
 	// Simulate entries from a previous session.
 	_ = cache.Put("/recover1.txt", []byte("data1"), 5, PendingNew)
@@ -516,7 +515,7 @@ func TestWriteBackUploader_UploadFailRetainsCache(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 1)
 
 	_ = cache.Put("/fail.txt", []byte("fail data"), 9, PendingNew)
@@ -543,7 +542,7 @@ func TestWriteBackUploader_PendingNewUsesCreateIfAbsent(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 1)
 
 	_ = cache.Put("/new.txt", []byte("new"), 3, PendingNew)
@@ -569,7 +568,7 @@ func TestWriteBackUploader_PendingOverwriteUsesBaseRevision(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 1)
 
 	_ = cache.PutWithBaseRev("/existing.txt", []byte("edit"), 4, PendingOverwrite, 23)
@@ -593,7 +592,7 @@ func TestWriteBackUploader_PendingOverwriteWithoutBaseRevRetainsCache(t *testing
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 1)
 
 	_ = cache.Put("/legacy-overwrite.txt", []byte("edit"), 4, PendingOverwrite)
@@ -633,7 +632,7 @@ func TestWriteBackUploader_UploadSyncLegacyOverwriteFallsBackToUnconditional(t *
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 1)
 
 	_ = cache.Put("/legacy-sync.txt", []byte("edit"), 4, PendingOverwrite)
@@ -694,7 +693,7 @@ func TestFlush_WriteBack_SmallFile(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 2)
 
 	opts := &MountOptions{FlushDebounce: 0}
@@ -793,7 +792,7 @@ func TestFlush_WriteBack_Lifecycle(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 2)
 
 	opts := &MountOptions{FlushDebounce: 0}
@@ -887,7 +886,7 @@ func TestFlush_WriteBack_MultipleFiles(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 4)
 
 	opts := &MountOptions{FlushDebounce: 0}
@@ -983,7 +982,7 @@ func TestFlush_WriteBack_WriteBetweenFlushAndRelease(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 2)
 
 	opts := &MountOptions{FlushDebounce: 0}
@@ -1083,7 +1082,7 @@ func TestFlush_WriteBack_NoWriteBack_LargeFile(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 2)
 
 	opts := &MountOptions{FlushDebounce: 0}
@@ -1173,7 +1172,7 @@ func TestRenameFlushesWriteBack(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 2)
 
 	opts := &MountOptions{FlushDebounce: 0}
@@ -1233,7 +1232,7 @@ func TestRenameInvalidatesDestinationReadCache(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	fs.inodes.Lookup("/config.lock", false, 54, time.Now())
 	fs.inodes.Lookup("/config", false, 36, time.Now())
 	fs.readCache.Put("/config.lock", []byte("new config"), 1)
@@ -1277,7 +1276,7 @@ func TestUnlinkClearsPendingWriteBack(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 2)
 
 	opts := &MountOptions{FlushDebounce: 0}
@@ -1338,7 +1337,7 @@ func TestReopenAfterClose_ReadsPendingCache(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	// Don't start workers so the upload stays pending.
 	uploader := NewWriteBackUploader(c, cache, 0)
 
@@ -1410,7 +1409,7 @@ func TestFsync_NoDuplicateUpload(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 2)
 
 	opts := &MountOptions{FlushDebounce: 0}
@@ -1493,7 +1492,7 @@ func TestSamePathConsecutiveSaves(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 2)
 
 	// Put "version1" — simulates first save.
@@ -1543,7 +1542,7 @@ func TestLookupFindsPendingWriteBack(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 
 	opts := &MountOptions{FlushDebounce: 0}
 	opts.setDefaults()
@@ -1597,7 +1596,7 @@ func TestOpenWritable_PreloadsFromWriteBackCache(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 0) // no workers — keep data pending
 
 	opts := &MountOptions{FlushDebounce: 0}
@@ -1750,7 +1749,7 @@ func TestUploader_WaitPath(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 1)
 
 	_ = cache.Put("/inflight.txt", []byte("data"), 4, PendingNew)
@@ -1929,7 +1928,7 @@ func TestRename_PendingOverwrite_UsesSlowPath(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 2)
 
 	opts := &MountOptions{FlushDebounce: 0}
@@ -2051,7 +2050,7 @@ func TestUnlink_PendingNew_SkipsRemoteDelete(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 2)
 
 	opts := &MountOptions{FlushDebounce: 0}
@@ -2123,7 +2122,7 @@ func TestUnlink_PendingNewCommitQueueUploadedDeletesRemote(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	defer cq.DrainAll()
 
@@ -2208,7 +2207,7 @@ func TestUnlink_PendingNewCommitQueueNotEnqueuedSkipsRemoteDelete(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	defer cq.DrainAll()
 
@@ -2252,7 +2251,7 @@ func TestUnlink_PendingOverwrite_DeletesRemote(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 2)
 
 	opts := &MountOptions{FlushDebounce: 0}
@@ -2310,7 +2309,7 @@ func TestPreload_LazyLoad_SmallFile(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 
 	opts := &MountOptions{FlushDebounce: 0}
 	opts.setDefaults()
@@ -2382,7 +2381,7 @@ func TestRmdir_CleansPendingDescendants(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 2)
 
 	opts := &MountOptions{FlushDebounce: 0}
@@ -2458,7 +2457,7 @@ func TestRename_Directory_MigratesPendingDescendants(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 2)
 
 	opts := &MountOptions{FlushDebounce: 0}
@@ -2549,7 +2548,7 @@ func TestFlush_SkipsRedundantCacheWrite(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	// No workers — uploads stay pending so we can inspect cache writes.
 	uploader := NewWriteBackUploader(c, cache, 0)
 

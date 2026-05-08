@@ -106,13 +106,34 @@ func (fs *Dat9FS) newWriteBuffer(path string, maxSize, partSize int64) *WriteBuf
 	return wb
 }
 
-// inlineThreshold returns the cutoff between simple PUT and V2 multipart
-// upload, mirroring the server-side IsLargeFile gate. It is read from the
-// FS's cached server-advertised value populated by warmInlineThreshold;
-// callers on hot paths (Read, Write, Flush, commit queue) must NOT trigger
-// network fetches here. Falls back to defaultSmallFileThreshold when no
-// value has been negotiated (e.g. unit tests that don't run Init).
+// inlineThreshold returns a small-file cutoff suitable for performance
+// heuristics (read-cache prefetch sizing, debounce flush timing, write-
+// buffer fast-path bounds). It mirrors the server's inline_threshold once
+// /v1/status is observed, and falls back to defaultSmallFileThreshold so
+// the heuristics still work in unit tests and pre-warm.
+//
+// Do NOT use this for the simple-PUT vs V2-multipart upload decision —
+// callers there must use negotiatedInlineThreshold() so a missing server
+// value forces multipart instead of guessing 50KB (which would break when
+// the server is configured below 50KB).
 func (fs *Dat9FS) inlineThreshold() int64 {
+	if v := fs.negotiatedInlineThreshold(); v > 0 {
+		return v
+	}
+	return defaultSmallFileThreshold
+}
+
+// negotiatedInlineThreshold returns the server-advertised inline_threshold
+// or 0 when no value has been observed yet. Hot-path readers must not
+// trigger network I/O; warmInlineThreshold is responsible for populating
+// the cache before first use.
+//
+// Returns 0 means "unknown — caller must fall back to a multipart-safe
+// behavior". The historical 50KB fallback is unsafe here: when the server
+// is configured with DRIVE9_INLINE_THRESHOLD < 50000, files in
+// [server_threshold, 50000) would be direct-PUT and rejected at the
+// server's IsLargeFile gate with `missing X-Dat9-Part-Checksums`.
+func (fs *Dat9FS) negotiatedInlineThreshold() int64 {
 	if v := fs.smallFileMax.Load(); v > 0 {
 		return v
 	}
@@ -122,7 +143,7 @@ func (fs *Dat9FS) inlineThreshold() int64 {
 			return t
 		}
 	}
-	return defaultSmallFileThreshold
+	return 0
 }
 
 // warmInlineThreshold triggers a one-shot /v1/status fetch via the client
@@ -4135,8 +4156,16 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	expectedRevision := expectedRevisionForHandle(fh)
 	var committedRev int64
 
-	threshold := fs.inlineThreshold()
-	if size < threshold {
+	// Use the negotiated server threshold (not the heuristic-only inline
+	// fallback): when /v1/status hasn't been observed we must force
+	// multipart for non-empty writes. The server's IsLargeFile gate would
+	// otherwise reject a direct PUT with `missing X-Dat9-Part-Checksums`
+	// whenever the server is configured below the historical 50KB
+	// default. Zero-byte files keep direct PUT because V2 initiate
+	// rejects total_size=0.
+	threshold := fs.negotiatedInlineThreshold()
+	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
+	if useDirectPUT {
 		// Small file: direct PUT with revision return for freshness seeding.
 		phase = "small-write"
 		writeStart := time.Now()
