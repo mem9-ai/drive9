@@ -352,6 +352,91 @@ func TestWriteBackCache_ListPending_CorruptMeta(t *testing.T) {
 	}
 }
 
+func TestNewWriteBackCache_PrunesMismatchedMetaPath(t *testing.T) {
+	dir := t.TempDir()
+
+	wrongPath := "/wrong.txt"
+	scannedPath := "/actual.txt"
+	scannedHash := hashPath(scannedPath)
+	meta := WriteBackMeta{
+		Path:       wrongPath,
+		Size:       4,
+		Mtime:      time.Now(),
+		CreatedAt:  time.Now(),
+		Generation: 3,
+		Kind:       PendingNew,
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, scannedHash+".meta"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, scannedHash+".dat"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths := cache.ListPendingPaths(); len(paths) != 0 {
+		t.Fatalf("ListPendingPaths len = %d, want 0", len(paths))
+	}
+	if _, err := os.Stat(filepath.Join(dir, scannedHash+".meta")); !os.IsNotExist(err) {
+		t.Fatal("mismatched .meta should be removed during cache load")
+	}
+	if _, err := os.Stat(filepath.Join(dir, scannedHash+".dat")); !os.IsNotExist(err) {
+		t.Fatal("mismatched .dat should be removed during cache load")
+	}
+}
+
+func TestWriteBackCache_ListPending_PrunesEmptyMetaPath(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hash := hashPath("/scanned.txt")
+	meta := WriteBackMeta{
+		Path:       "",
+		Size:       4,
+		Mtime:      time.Now(),
+		CreatedAt:  time.Now(),
+		Generation: 2,
+		Kind:       PendingNew,
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, hash+".meta"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, hash+".dat"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Put("/valid.txt", []byte("ok"), 2, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+
+	pending := cache.ListPending()
+	if len(pending) != 1 {
+		t.Fatalf("ListPending returned %d entries, want 1", len(pending))
+	}
+	if pending[0].Meta.Path != "/valid.txt" {
+		t.Fatalf("pending path = %q, want /valid.txt", pending[0].Meta.Path)
+	}
+	if _, err := os.Stat(filepath.Join(dir, hash+".meta")); !os.IsNotExist(err) {
+		t.Fatal("empty-path .meta should be removed during reconciliation")
+	}
+	if _, err := os.Stat(filepath.Join(dir, hash+".dat")); !os.IsNotExist(err) {
+		t.Fatal("empty-path .dat should be removed during reconciliation")
+	}
+}
+
 func TestWriteBackUploader_SubmitAndUpload(t *testing.T) {
 	var uploadedPaths sync.Map
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

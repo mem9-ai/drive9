@@ -86,6 +86,19 @@ type WriteBackCache struct {
 	dataMaxBytes int64
 }
 
+func (c *WriteBackCache) pruneScannedEntry(scannedMetaName string) {
+	base := strings.TrimSuffix(scannedMetaName, ".meta")
+	_ = os.Remove(filepath.Join(c.dir, scannedMetaName))
+	_ = os.Remove(filepath.Join(c.dir, base+".dat"))
+}
+
+func (c *WriteBackCache) validateScannedMeta(scannedMetaName string, meta *WriteBackMeta) bool {
+	if meta == nil || meta.Path == "" {
+		return false
+	}
+	return scannedMetaName == hashPath(meta.Path)+".meta"
+}
+
 // NewWriteBackCache creates (or opens) a write-back cache rooted at dir.
 // The directory is created if it does not exist. Existing entries on disk
 // are loaded into the in-memory pending index.
@@ -115,9 +128,11 @@ func NewWriteBackCache(dir string) (*WriteBackCache, error) {
 		}
 		var meta WriteBackMeta
 		if err := json.Unmarshal(raw, &meta); err != nil {
-			base := strings.TrimSuffix(name, ".meta")
-			_ = os.Remove(filepath.Join(dir, name))
-			_ = os.Remove(filepath.Join(dir, base+".dat"))
+			c.pruneScannedEntry(name)
+			continue
+		}
+		if !c.validateScannedMeta(name, &meta) {
+			c.pruneScannedEntry(name)
 			continue
 		}
 		cp := meta
@@ -417,9 +432,11 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 			}
 			var meta WriteBackMeta
 			if err := json.Unmarshal(raw, &meta); err != nil {
-				base := strings.TrimSuffix(name, ".meta")
-				_ = os.Remove(metaPath)
-				_ = os.Remove(filepath.Join(c.dir, base+".dat"))
+				c.pruneScannedEntry(name)
+				continue
+			}
+			if !c.validateScannedMeta(name, &meta) {
+				c.pruneScannedEntry(name)
 				continue
 			}
 			if _, ok := c.metas[meta.Path]; !ok {
