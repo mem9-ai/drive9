@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/tagutil"
@@ -29,16 +30,27 @@ type Client struct {
 	httpClient         *http.Client
 	smallFileThreshold int64 // 0 means use DefaultSmallFileThreshold
 
-	statusOnce sync.Once
-	statusMax  int64 // tenant max_upload_bytes from /v1/status, 0 if unavailable
+	// statusFetchMu serializes /v1/status fetches across concurrent callers
+	// so a transient warm failure can be retried but two callers never
+	// double-fetch. Set statusFetched only on a successful HTTP 200, so a
+	// timeout/5xx during warm never permanently caches "unknown" — the
+	// next caller will retry.
+	statusFetchMu sync.Mutex
+	statusFetched atomic.Bool
+	// statusMax / statusInline are atomic so warmup goroutines and hot-path
+	// readers (commit queue, FUSE write decisions) coordinate without a
+	// mutex. Race detector previously caught this when FUSE's async warm
+	// raced with concurrent uploads.
+	statusMax    atomic.Int64 // tenant max_upload_bytes from /v1/status; 0 if unavailable
+	statusInline atomic.Int64 // server inline_threshold from /v1/status; 0 if unavailable
 }
 
 // tenantStatusResponse mirrors the server's TenantStatusResponse JSON shape.
-// We only consume max_upload_bytes today, but keep the full shape so the
-// decoder ignores forward-compatible additions cleanly.
+// Forward-compatible: unknown fields decode-and-ignore cleanly.
 type tenantStatusResponse struct {
-	Status         string `json:"status"`
-	MaxUploadBytes int64  `json:"max_upload_bytes"`
+	Status          string `json:"status"`
+	MaxUploadBytes  int64  `json:"max_upload_bytes"`
+	InlineThreshold int64  `json:"inline_threshold,omitempty"`
 }
 
 // ErrConflict reports an HTTP 409 write conflict from the server.
@@ -282,33 +294,112 @@ func (c *Client) APIKey() string {
 // not include the field, or if the lookup fails — callers should treat 0 as
 // "unknown" and fall back to a conservative local default.
 func (c *Client) MaxUploadBytes(ctx context.Context) int64 {
-	c.statusOnce.Do(func() {
-		c.statusMax = c.fetchTenantMaxUploadBytes(ctx)
-	})
-	return c.statusMax
+	c.ensureTenantStatus(ctx)
+	return c.statusMax.Load()
 }
 
-func (c *Client) fetchTenantMaxUploadBytes(ctx context.Context) int64 {
+// Warm proactively populates the /v1/status cache so subsequent hot-path
+// reads (CachedSmallFileThreshold, uploadThreshold) see the server-
+// advertised values instead of falling back to compiled-in defaults.
+// Failures are silent — the cache simply stays at zero and callers fall
+// back. Idempotent; safe to call once at CLI/FUSE startup.
+func (c *Client) Warm(ctx context.Context) {
+	c.ensureTenantStatus(ctx)
+}
+
+// SetSmallFileThresholdForTests pins the client's small-file cutoff
+// without consulting the server. Hot paths (uploadThreshold,
+// CachedSmallFileThreshold) treat this override as authoritative and
+// skip the network fetch entirely.
+//
+// Production code must NOT call this — the server is the threshold
+// authority and clients are supposed to negotiate via /v1/status. The
+// helper exists for unit tests that build fake HTTP servers without a
+// /v1/status route and would otherwise force every upload through V2
+// multipart (the safe-default when no server value is observable).
+func (c *Client) SetSmallFileThresholdForTests(threshold int64) {
+	c.smallFileThreshold = threshold
+}
+
+// SmallFileThreshold returns the server's DB-inline vs S3 storage cutoff as
+// reported by GET /v1/status. The result is cached for the lifetime of the
+// client. Returns 0 when the server omits the field (older builds) or when
+// the lookup fails; callers should fall back to DefaultSmallFileThreshold.
+//
+// An explicit per-Client override set via testing or configuration takes
+// precedence: when c.smallFileThreshold > 0 it short-circuits the network
+// fetch and is returned as-is. This keeps unit tests deterministic and lets
+// operators pin a threshold when needed.
+func (c *Client) SmallFileThreshold(ctx context.Context) int64 {
+	if c.smallFileThreshold > 0 {
+		return c.smallFileThreshold
+	}
+	c.ensureTenantStatus(ctx)
+	return c.statusInline.Load()
+}
+
+// CachedSmallFileThreshold returns the server-advertised threshold without
+// triggering a network fetch. Returns 0 when no value has been negotiated
+// yet. Use this on hot paths (commit queue, FUSE write decisions) to avoid
+// surprising side-effect requests; defer the initial fetch to a single
+// SmallFileThreshold call from a startup or warmup site.
+func (c *Client) CachedSmallFileThreshold() int64 {
+	if c.smallFileThreshold > 0 {
+		return c.smallFileThreshold
+	}
+	return c.statusInline.Load()
+}
+
+// ensureTenantStatus fetches and caches /v1/status fields once per Client.
+// Failures cache as zero so callers fall back to local defaults instead of
+// retrying every request.
+func (c *Client) ensureTenantStatus(ctx context.Context) {
+	if c.statusFetched.Load() {
+		return
+	}
+	c.statusFetchMu.Lock()
+	defer c.statusFetchMu.Unlock()
+	if c.statusFetched.Load() {
+		return
+	}
+	body, ok := c.fetchTenantStatus(ctx)
+	if !ok {
+		// Transient failure (timeout, 5xx, network). Don't mark fetched —
+		// a future Warm/MaxUploadBytes/SmallFileThreshold call will retry.
+		// Hot-path reads continue to fall back to compiled defaults until
+		// then.
+		return
+	}
+	if body.MaxUploadBytes > 0 {
+		c.statusMax.Store(body.MaxUploadBytes)
+	}
+	if body.InlineThreshold > 0 {
+		c.statusInline.Store(body.InlineThreshold)
+	}
+	// Mark fetched even when the server omits inline_threshold (older
+	// build): that's an authoritative "no value", retrying won't help and
+	// hot paths should stop attempting status fetches every call.
+	c.statusFetched.Store(true)
+}
+
+func (c *Client) fetchTenantStatus(ctx context.Context) (tenantStatusResponse, bool) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/status", nil)
 	if err != nil {
-		return 0
+		return tenantStatusResponse{}, false
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return 0
+		return tenantStatusResponse{}, false
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return 0
+		return tenantStatusResponse{}, false
 	}
 	var body tenantStatusResponse
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return 0
+		return tenantStatusResponse{}, false
 	}
-	if body.MaxUploadBytes < 0 {
-		return 0
-	}
-	return body.MaxUploadBytes
+	return body, true
 }
 
 func (c *Client) do(req *http.Request) (*http.Response, error) {

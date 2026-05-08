@@ -33,11 +33,31 @@ import (
 )
 
 const (
-	smallFileThreshold = 50_000 // 50,000 bytes; controls DB-inline storage.
-	// TiDB auto embedding currently rejects inputs over 8192 tokens. Use a
-	// conservative byte cap for synchronous text extraction so text-heavy small
-	// files do not fail the whole write through the generated embedding column.
-	textExtractMaxBytes = 8_192
+	// DefaultInlineThreshold is the default cutoff between DB-inline and S3
+	// storage. Operators can override via Options.InlineThreshold; the value
+	// is also exposed to clients via /v1/status so they pick a matching
+	// upload strategy.
+	//
+	// This single threshold deliberately governs both decisions:
+	//   1. Server-side: store inline in TiDB content_blob vs spill to S3.
+	//   2. Client-side: simple PUT to /v1/fs/{path} vs V2 multipart presign.
+	//
+	// Splitting the two (e.g. "client direct PUT up to 1MB but only inline
+	// in TiDB up to 50KB") is tempting for performance but reintroduces the
+	// server as a data-plane proxy: the simple-PUT body would have to flow
+	// through the server process and PutObject to S3 itself, exactly what
+	// the V2 multipart protocol is designed to avoid. Until the simple-PUT
+	// path streams into S3 without buffering in server RAM, keep the two
+	// decisions tied so raising the threshold has predictable cost
+	// (TiDB blob column growth, not server bandwidth + memory).
+	DefaultInlineThreshold int64 = 50_000
+	// DefaultTextExtractMaxBytes is the default cap for synchronous text
+	// extraction. TiDB auto embedding currently rejects inputs over 8192
+	// tokens; this byte cap keeps text-heavy small files from failing the
+	// whole write through the generated embedding column. Independent of
+	// InlineThreshold: extraction can be tightened or relaxed without
+	// changing the storage-class boundary.
+	DefaultTextExtractMaxBytes int64 = 8_192
 )
 
 // Dat9Backend implements filesystem.FileSystem with the inode model.
@@ -53,6 +73,11 @@ type Dat9Backend struct {
 	maxUploadBytes        int64
 	maxTenantStorageBytes int64
 	maxMediaLLMFiles      int64
+	// inlineThreshold controls the DB-inline vs S3 storage cutoff and (when
+	// surfaced to clients) the simple-PUT vs multipart upload boundary.
+	inlineThreshold int64
+	// textExtractMaxBytes caps synchronous text extraction input size.
+	textExtractMaxBytes int64
 	mu                    sync.Mutex
 	entropy               io.Reader
 
@@ -93,10 +118,12 @@ type Dat9Backend struct {
 
 func newBaseBackend(store *datastore.Store) *Dat9Backend {
 	return &Dat9Backend{
-		store:         store,
-		smallInDB:     true,
-		queryEmbedder: embedding.NopClient{},
-		entropy:       ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0),
+		store:               store,
+		smallInDB:           true,
+		queryEmbedder:       embedding.NopClient{},
+		entropy:             ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0),
+		inlineThreshold:     DefaultInlineThreshold,
+		textExtractMaxBytes: DefaultTextExtractMaxBytes,
 	}
 }
 
@@ -415,7 +442,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 
 	contentType := detectContentType(path, data)
 	checksum := sha256sum(data)
-	contentText := extractText(data, contentType)
+	contentText := extractText(data, contentType, b.textExtractMaxBytes)
 
 	storageType := datastore.StorageDB9
 	storageRef := "inline"
@@ -532,7 +559,7 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	}
 	contentType := detectContentType(nf.Node.Path, finalData)
 	checksum := sha256sum(finalData)
-	contentText := extractText(finalData, contentType)
+	contentText := extractText(finalData, contentType, b.textExtractMaxBytes)
 	storageType := datastore.StorageDB9
 	storageRef := "inline"
 	storageEncryptionMode := datastore.StorageEncryptionNone
@@ -1054,8 +1081,19 @@ func (b *Dat9Backend) readFileDataCtx(ctx context.Context, f *datastore.File) ([
 	return nil, fmt.Errorf("unsupported storage type for direct read: %s", f.StorageType)
 }
 
+// InlineThreshold returns the configured DB-inline vs S3 storage cutoff.
+func (b *Dat9Backend) InlineThreshold() int64 {
+	return b.inlineThreshold
+}
+
+// TextExtractMaxBytes returns the configured cap for synchronous text
+// extraction inputs.
+func (b *Dat9Backend) TextExtractMaxBytes() int64 {
+	return b.textExtractMaxBytes
+}
+
 func (b *Dat9Backend) shouldStoreInDB(size int64) bool {
-	return b.smallInDB && size < smallFileThreshold
+	return b.smallInDB && size < b.inlineThreshold
 }
 
 // --- writeCloser ---
@@ -1167,14 +1205,17 @@ func isTextualContentType(contentType string) bool {
 		contentType == "application/yaml"
 }
 
-func extractText(data []byte, contentType string) string {
+func extractText(data []byte, contentType string, maxBytes int64) string {
 	if !isTextualContentType(contentType) {
 		return ""
 	}
 	if !isTextContent(data) {
 		return ""
 	}
-	if len(data) > textExtractMaxBytes {
+	if maxBytes <= 0 {
+		maxBytes = DefaultTextExtractMaxBytes
+	}
+	if int64(len(data)) > maxBytes {
 		return ""
 	}
 	return string(data)

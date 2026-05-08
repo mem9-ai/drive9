@@ -15,12 +15,23 @@ import (
 	"github.com/mem9-ai/dat9/pkg/mountpath"
 )
 
-// commitQueueDirectPutThreshold is the size limit below which commit queue
-// workers use direct PUT (WriteCtxConditionalWithRevision) instead of
-// multipart upload. Must match the server's smallFileThreshold — the server
-// rejects simple PUTs for files >= 50KB on S3-configured backends by requiring
-// X-Dat9-Part-Checksums (multipart protocol).
-const commitQueueDirectPutThreshold = client.DefaultSmallFileThreshold
+// directPutThreshold returns the size limit below which commit queue workers
+// use direct PUT (WriteCtxConditionalWithRevision) instead of multipart
+// upload. Must match the server's inline_threshold — the server rejects
+// simple PUTs for files at or above the threshold on S3-configured backends
+// by requiring X-Dat9-Part-Checksums (multipart protocol). Read from the
+// client's cached value to avoid surprise GET /v1/status calls in the hot
+// commit path; the FS layer is expected to have warmed the cache via the
+// startup inlineThreshold() call. Falls back to DefaultSmallFileThreshold
+// when no value has been negotiated.
+func (cq *CommitQueue) directPutThreshold() int64 {
+	if cq.client != nil {
+		if t := cq.client.CachedSmallFileThreshold(); t > 0 {
+			return t
+		}
+	}
+	return client.DefaultSmallFileThreshold
+}
 
 // CommitEntry represents a pending remote commit.
 type CommitEntry struct {
@@ -605,9 +616,9 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	}
 
 	// Route based on entry.Size (metadata at enqueue time), NOT len(data).
-	// Files under commitQueueDirectPutThreshold use direct PUT to skip the
-	// multipart initiate/presign/complete/finalize overhead (~440ms).
-	if entry.Size < commitQueueDirectPutThreshold {
+	// Files under directPutThreshold() use direct PUT to skip the multipart
+	// initiate/presign/complete/finalize overhead (~440ms).
+	if entry.Size < cq.directPutThreshold() {
 		start := time.Now()
 		committedRev, err := cq.client.WriteCtxConditionalWithRevision(ctx, apiPath, data, expectedRevision)
 		if cq.perf != nil {

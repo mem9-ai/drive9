@@ -26,6 +26,7 @@ import (
 
 	"github.com/mem9-ai/dat9/cmd/drive9/cli"
 	"github.com/mem9-ai/dat9/pkg/buildinfo"
+	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/logger"
 )
 
@@ -189,7 +190,19 @@ func runFS(args []string) {
 	}
 	sub := args[0]
 	rest := args[1:]
-	c := cli.NewFromEnv()
+
+	// Only commands that may upload pay the /v1/status warm RTT. Read-only
+	// commands (cat/ls/stat/rm/grep/find) and namespace-only writes (mv,
+	// mkdir) do not consult the upload threshold and can skip the warm —
+	// keeps cold-start latency unchanged for the common case and avoids
+	// hanging an `ls` behind a slow status endpoint.
+	var c *client.Client
+	switch sub {
+	case "cp", "sh":
+		c = cli.NewFromEnvWithWarm()
+	default:
+		c = cli.NewFromEnv()
+	}
 
 	var err error
 	switch sub {

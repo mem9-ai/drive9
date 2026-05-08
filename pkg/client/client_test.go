@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mem9-ai/dat9/internal/testmysql"
@@ -734,5 +735,192 @@ func TestMkdir(t *testing.T) {
 	}
 	if !info.IsDir {
 		t.Error("expected directory")
+	}
+}
+
+// statusFakeServer returns an httptest server that responds to GET /v1/status
+// with the given JSON body and counts the number of times it was called.
+type statusFakeServer struct {
+	srv  *httptest.Server
+	hits *int
+}
+
+func newStatusFakeServer(t *testing.T, body []byte) *statusFakeServer {
+	t.Helper()
+	hits := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &statusFakeServer{srv: srv, hits: &hits}
+}
+
+func TestSmallFileThresholdCachesFromServer(t *testing.T) {
+	body := []byte(`{"status":"active","max_upload_bytes":1048576,"inline_threshold":262144}`)
+	fake := newStatusFakeServer(t, body)
+	c := New(fake.srv.URL, "")
+
+	if got := c.SmallFileThreshold(context.Background()); got != 262144 {
+		t.Fatalf("SmallFileThreshold = %d, want 262144", got)
+	}
+	if got := c.MaxUploadBytes(context.Background()); got != 1048576 {
+		t.Fatalf("MaxUploadBytes = %d, want 1048576", got)
+	}
+	// Subsequent calls must hit the in-memory cache, not the server.
+	if got := c.SmallFileThreshold(context.Background()); got != 262144 {
+		t.Fatalf("second SmallFileThreshold = %d", got)
+	}
+	if *fake.hits != 1 {
+		t.Fatalf("expected 1 status fetch, got %d", *fake.hits)
+	}
+}
+
+func TestSmallFileThresholdFallsBackWhenServerOmits(t *testing.T) {
+	// Older servers don't include inline_threshold. Client should leave
+	// statusInline = 0 and let callers fall back to DefaultSmallFileThreshold.
+	body := []byte(`{"status":"active","max_upload_bytes":1048576}`)
+	fake := newStatusFakeServer(t, body)
+	c := New(fake.srv.URL, "")
+
+	if got := c.SmallFileThreshold(context.Background()); got != 0 {
+		t.Fatalf("SmallFileThreshold without server field = %d, want 0", got)
+	}
+	if got := c.uploadThreshold(context.Background()); got != DefaultSmallFileThreshold {
+		t.Fatalf("uploadThreshold fallback = %d, want %d", got, DefaultSmallFileThreshold)
+	}
+	if got := c.MaxUploadBytes(context.Background()); got != 1048576 {
+		t.Fatalf("MaxUploadBytes = %d", got)
+	}
+}
+
+func TestSmallFileThresholdLookupFailureCachesZero(t *testing.T) {
+	// Transient warm failure must NOT consume the once-style guard: a later
+	// successful Warm/SmallFileThreshold call should refetch and pick up
+	// the server-advertised value. This guards against the failure mode
+	// where FUSE Init's bounded warm misses (5s timeout, 5xx, network)
+	// and the client is then permanently stuck on the local fallback.
+	var failing atomic.Bool
+	failing.Store(true)
+	hits := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if failing.Load() {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte(`{"inline_threshold":262144}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := New(srv.URL, "")
+
+	if got := c.SmallFileThreshold(context.Background()); got != 0 {
+		t.Fatalf("SmallFileThreshold on 500 = %d, want 0", got)
+	}
+	if got := c.uploadThreshold(context.Background()); got != DefaultSmallFileThreshold {
+		t.Fatalf("uploadThreshold during failure = %d, want %d", got, DefaultSmallFileThreshold)
+	}
+
+	// Server recovers; a subsequent call must retry, not stay cached at 0.
+	failing.Store(false)
+	if got := c.SmallFileThreshold(context.Background()); got != 262144 {
+		t.Fatalf("SmallFileThreshold after recovery = %d, want 262144 (failures must not consume the once-guard)", got)
+	}
+	if hits < 2 {
+		t.Fatalf("expected refetch after transient failure; total hits=%d", hits)
+	}
+
+	// Once we have a successful response, we must not fetch again.
+	prev := hits
+	_ = c.SmallFileThreshold(context.Background())
+	_ = c.SmallFileThreshold(context.Background())
+	if hits != prev {
+		t.Fatalf("post-success calls fetched again: hits %d -> %d", prev, hits)
+	}
+}
+
+func TestCachedSmallFileThresholdDoesNotFetch(t *testing.T) {
+	mux := http.NewServeMux()
+	hits := 0
+	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Write([]byte(`{"inline_threshold":131072}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := New(srv.URL, "")
+
+	// CachedSmallFileThreshold must never trigger /v1/status.
+	if got := c.CachedSmallFileThreshold(); got != 0 {
+		t.Fatalf("cached pre-warm = %d, want 0", got)
+	}
+	if hits != 0 {
+		t.Fatalf("CachedSmallFileThreshold triggered %d fetches; must be 0", hits)
+	}
+	// After warm-up via SmallFileThreshold, cache returns server value.
+	_ = c.SmallFileThreshold(context.Background())
+	if got := c.CachedSmallFileThreshold(); got != 131072 {
+		t.Fatalf("cached post-warm = %d, want 131072", got)
+	}
+}
+
+func TestSmallFileThresholdConcurrentReadersAreRaceFree(t *testing.T) {
+	body := []byte(`{"status":"active","max_upload_bytes":1048576,"inline_threshold":262144}`)
+	fake := newStatusFakeServer(t, body)
+	c := New(fake.srv.URL, "")
+
+	// Mix one warmup goroutine (calls SmallFileThreshold which writes the
+	// atomic) with many CachedSmallFileThreshold readers. Run with -race;
+	// pre-fix this race tripped the detector.
+	const readers = 32
+	done := make(chan struct{})
+	for i := 0; i < readers; i++ {
+		go func() {
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					_ = c.CachedSmallFileThreshold()
+					_ = c.statusInline.Load()
+				}
+			}
+		}()
+	}
+	// Warmup goroutine.
+	go c.SmallFileThreshold(context.Background())
+
+	// Run for a brief period and stop.
+	for i := 0; i < 10000; i++ {
+		_ = c.CachedSmallFileThreshold()
+	}
+	close(done)
+}
+
+func TestSmallFileThresholdOverrideShortCircuits(t *testing.T) {
+	mux := http.NewServeMux()
+	hits := 0
+	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Write([]byte(`{"inline_threshold":999999}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := New(srv.URL, "")
+	c.smallFileThreshold = 7 // explicit per-Client override
+
+	if got := c.SmallFileThreshold(context.Background()); got != 7 {
+		t.Fatalf("override = %d, want 7", got)
+	}
+	if got := c.CachedSmallFileThreshold(); got != 7 {
+		t.Fatalf("override cached = %d, want 7", got)
+	}
+	if hits != 0 {
+		t.Fatalf("override should short-circuit network; saw %d hits", hits)
 	}
 }

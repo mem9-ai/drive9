@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -175,6 +176,9 @@ func fsMountCmd(args []string) error {
 		} else {
 			c = client.New(*server, *apiKey)
 		}
+		warmCtx, warmCancel := context.WithTimeout(context.Background(), fsClientWarmTimeout)
+		c.Warm(warmCtx)
+		warmCancel()
 
 		// Validate remote root exists and is a directory.
 		if err := validateRemoteRoot(c, remoteRoot); err != nil {

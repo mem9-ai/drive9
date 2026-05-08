@@ -190,26 +190,103 @@ func TestDat9BackendAutoSemanticTaskTypes(t *testing.T) {
 }
 
 func TestExtractTextUsesEmbeddingSafeLimit(t *testing.T) {
-	if textExtractMaxBytes >= smallFileThreshold {
-		t.Fatalf("textExtractMaxBytes=%d must stay below smallFileThreshold=%d", textExtractMaxBytes, smallFileThreshold)
+	if DefaultTextExtractMaxBytes >= DefaultInlineThreshold {
+		t.Fatalf("DefaultTextExtractMaxBytes=%d must stay below DefaultInlineThreshold=%d", DefaultTextExtractMaxBytes, DefaultInlineThreshold)
 	}
-	exact := make([]byte, textExtractMaxBytes)
+	exact := make([]byte, DefaultTextExtractMaxBytes)
 	for i := range exact {
 		exact[i] = 'a'
 	}
-	if got := extractText(exact, "application/json"); len(got) != textExtractMaxBytes {
-		t.Fatalf("exact limit extracted length=%d, want %d", len(got), textExtractMaxBytes)
+	if got := extractText(exact, "application/json", DefaultTextExtractMaxBytes); int64(len(got)) != DefaultTextExtractMaxBytes {
+		t.Fatalf("exact limit extracted length=%d, want %d", len(got), DefaultTextExtractMaxBytes)
 	}
 	oversized := append(exact, 'a')
-	if got := extractText(oversized, "application/json"); got != "" {
+	if got := extractText(oversized, "application/json", DefaultTextExtractMaxBytes); got != "" {
 		t.Fatalf("oversized text should not be extracted, got length %d", len(got))
 	}
-	if got := extractText([]byte("hello"), "text/plain"); got != "hello" {
+	if got := extractText([]byte("hello"), "text/plain", DefaultTextExtractMaxBytes); got != "hello" {
 		t.Fatalf("small text extracted as %q, want hello", got)
 	}
-	if got := extractText([]byte{0x66, 0x6f, 0x80}, "text/plain"); got != "" {
+	if got := extractText([]byte{0x66, 0x6f, 0x80}, "text/plain", DefaultTextExtractMaxBytes); got != "" {
 		t.Fatalf("invalid UTF-8 text should not be extracted, got %q", got)
 	}
+}
+
+func TestConfigurableInlineThreshold(t *testing.T) {
+	t.Run("defaults applied when options omit thresholds", func(t *testing.T) {
+		b := newTestBackend(t)
+		if got := b.InlineThreshold(); got != DefaultInlineThreshold {
+			t.Fatalf("InlineThreshold = %d, want %d", got, DefaultInlineThreshold)
+		}
+		if got := b.TextExtractMaxBytes(); got != DefaultTextExtractMaxBytes {
+			t.Fatalf("TextExtractMaxBytes = %d, want %d", got, DefaultTextExtractMaxBytes)
+		}
+		// shouldStoreInDB and IsLargeFile must agree on the default cutoff so
+		// a file at exactly the threshold flips storage class.
+		if !b.shouldStoreInDB(DefaultInlineThreshold - 1) {
+			t.Fatal("shouldStoreInDB should be true at threshold-1")
+		}
+		if b.shouldStoreInDB(DefaultInlineThreshold) {
+			t.Fatal("shouldStoreInDB should be false at threshold")
+		}
+		if b.IsLargeFile(DefaultInlineThreshold - 1) {
+			t.Fatal("IsLargeFile should be false at threshold-1")
+		}
+		if !b.IsLargeFile(DefaultInlineThreshold) {
+			t.Fatal("IsLargeFile should be true at threshold")
+		}
+	})
+
+	t.Run("custom inline threshold overrides default", func(t *testing.T) {
+		const custom = int64(256_000)
+		b := newTestBackendWithOptions(t, Options{InlineThreshold: custom})
+		if got := b.InlineThreshold(); got != custom {
+			t.Fatalf("InlineThreshold = %d, want %d", got, custom)
+		}
+		if !b.shouldStoreInDB(custom - 1) {
+			t.Fatal("file below custom threshold must store inline")
+		}
+		if b.shouldStoreInDB(custom) {
+			t.Fatal("file at custom threshold must spill to S3")
+		}
+		if b.IsLargeFile(custom - 1) {
+			t.Fatal("IsLargeFile must be false at custom-1")
+		}
+		if !b.IsLargeFile(custom) {
+			t.Fatal("IsLargeFile must be true at custom")
+		}
+	})
+
+	t.Run("custom text extract max overrides default", func(t *testing.T) {
+		const custom = int64(64_000)
+		b := newTestBackendWithOptions(t, Options{TextExtractMaxBytes: custom})
+		if got := b.TextExtractMaxBytes(); got != custom {
+			t.Fatalf("TextExtractMaxBytes = %d, want %d", got, custom)
+		}
+		// Right at the cap is still extractable.
+		atCap := make([]byte, custom)
+		for i := range atCap {
+			atCap[i] = 'a'
+		}
+		if got := extractText(atCap, "text/plain", b.TextExtractMaxBytes()); int64(len(got)) != custom {
+			t.Fatalf("extracted len = %d, want %d", len(got), custom)
+		}
+		// Just over the cap must drop the text entirely (not truncate).
+		over := append(atCap, 'a')
+		if got := extractText(over, "text/plain", b.TextExtractMaxBytes()); got != "" {
+			t.Fatalf("extracted len = %d, want 0 (dropped over cap)", len(got))
+		}
+	})
+
+	t.Run("zero or negative options fall back to defaults", func(t *testing.T) {
+		b := newTestBackendWithOptions(t, Options{InlineThreshold: 0, TextExtractMaxBytes: -1})
+		if got := b.InlineThreshold(); got != DefaultInlineThreshold {
+			t.Fatalf("zero InlineThreshold did not fall back: got %d", got)
+		}
+		if got := b.TextExtractMaxBytes(); got != DefaultTextExtractMaxBytes {
+			t.Fatalf("negative TextExtractMaxBytes did not fall back: got %d", got)
+		}
+	})
 }
 
 func TestDetectContentTypeRequiresValidUTF8ForText(t *testing.T) {

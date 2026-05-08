@@ -86,6 +86,13 @@ type Options struct {
 	// S3EncryptionPolicy is the already-resolved policy for this backend.
 	// The zero value is normalized to the global default of explicit no encryption.
 	S3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
+	// InlineThreshold overrides the DB-inline vs S3 storage cutoff. When 0,
+	// DefaultInlineThreshold is used. The same value is surfaced via
+	// /v1/status so clients can pick a matching upload strategy.
+	InlineThreshold int64
+	// TextExtractMaxBytes overrides the synchronous text extraction cap. When
+	// 0, DefaultTextExtractMaxBytes is used. Independent of InlineThreshold.
+	TextExtractMaxBytes int64
 }
 
 // LLMCostBudgetOptions configures the monthly LLM cost budget.
@@ -191,6 +198,16 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 		b.maxTenantStorageBytes = opts.MaxTenantStorageBytes
 	} else {
 		b.maxTenantStorageBytes = defaultMaxTenantStorageBytes
+	}
+	if opts.InlineThreshold > 0 {
+		b.inlineThreshold = opts.InlineThreshold
+	} else {
+		b.inlineThreshold = DefaultInlineThreshold
+	}
+	if opts.TextExtractMaxBytes > 0 {
+		b.textExtractMaxBytes = opts.TextExtractMaxBytes
+	} else {
+		b.textExtractMaxBytes = DefaultTextExtractMaxBytes
 	}
 
 	cb := opts.LLMCostBudget

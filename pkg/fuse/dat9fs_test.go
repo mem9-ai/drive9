@@ -44,6 +44,71 @@ func newTestDat9FS(tb testing.TB, size int64, get func(http.ResponseWriter, *htt
 	return fs, ino, ts.Close
 }
 
+func TestInitSynchronouslyWarmsInlineThreshold(t *testing.T) {
+	// Pre-fix this was a goroutine, so the very first FUSE Create/Flush
+	// after mount could see the 50KB fallback even when the server
+	// advertised something larger. Init must block on the warm fetch.
+	const advertised = int64(262144)
+	statusHits := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/status" {
+			statusHits++
+			_, _ = w.Write([]byte(`{"status":"active","inline_threshold":262144}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	// Use the raw client (no test pin) so Init's warm actually hits the
+	// fake /v1/status — newTestClient pins a static threshold and would
+	// short-circuit the fetch.
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.Init(nil)
+
+	if statusHits != 1 {
+		t.Fatalf("Init issued %d status fetches, want 1", statusHits)
+	}
+	if got := fs.inlineThreshold(); got != advertised {
+		t.Fatalf("inlineThreshold after Init = %d, want %d", got, advertised)
+	}
+}
+
+func TestInitWarmTimeoutFallsBackToDefault(t *testing.T) {
+	// Server is unreachable / hung; Init must not block longer than the
+	// warm timeout and must fall back to the local default so mount stays
+	// usable. The handler waits on the request context so the server can
+	// shut down cleanly when the client cancels.
+	prev := inlineThresholdWarmTimeout
+	inlineThresholdWarmTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { inlineThresholdWarmTimeout = prev })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	// Raw client so Init actually issues the warm fetch and we observe the
+	// timeout-fallback path; newTestClient would short-circuit via the
+	// pinned threshold.
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	start := time.Now()
+	fs.Init(nil)
+	elapsed := time.Since(start)
+	// Allow a generous slack for slow CI: ~5x the configured timeout.
+	if elapsed > 5*inlineThresholdWarmTimeout {
+		t.Fatalf("Init took %v, want <= %v", elapsed, 5*inlineThresholdWarmTimeout)
+	}
+	if got := fs.inlineThreshold(); got != defaultSmallFileThreshold {
+		t.Fatalf("inlineThreshold after timeout = %d, want %d", got, defaultSmallFileThreshold)
+	}
+}
+
 func BenchmarkDat9FS_SmallFileOpen(b *testing.B) {
 	const (
 		filePath = "/file.bin"
@@ -328,7 +393,7 @@ func TestOpenWritableSmallFileLazyPreload(t *testing.T) {
 func TestOpenWritableLargeFileLazyPreload(t *testing.T) {
 	// With lazy preload, Open() succeeds for large files even if the server
 	// would fail on GET — the actual data loading is deferred to Write time.
-	fs, ino, cleanup := newTestDat9FS(t, smallFileThreshold+1, func(w http.ResponseWriter, r *http.Request) {
+	fs, ino, cleanup := newTestDat9FS(t, defaultSmallFileThreshold+1, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	})
 	defer cleanup()
@@ -795,7 +860,7 @@ func TestOpenWritablePendingShadowSkipsRemoteStat(t *testing.T) {
 
 func TestFlushLargeOverwritePatchCarriesExpectedRevision(t *testing.T) {
 	const (
-		fileSize = smallFileThreshold + 1024
+		fileSize = defaultSmallFileThreshold + 1024
 		partSize = 5 << 20
 	)
 
@@ -889,7 +954,7 @@ func TestFlushLargeOverwritePatchCarriesExpectedRevision(t *testing.T) {
 }
 
 func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
-	const fileSize = smallFileThreshold + 2048
+	const fileSize = defaultSmallFileThreshold + 2048
 
 	var gotExpected atomic.Int64
 	gotExpected.Store(-1)
@@ -2289,7 +2354,7 @@ func TestIsTransientLookupErr_Treats499AsTransient(t *testing.T) {
 }
 
 func TestOpenReadOnlyLargeFileGetsPrefetcher(t *testing.T) {
-	size := int64(1024 * 1024) // 1MB — above smallFileThreshold
+	size := int64(1024 * 1024) // 1MB — above defaultSmallFileThreshold
 	data := make([]byte, size)
 	for i := range data {
 		data[i] = byte(i % 256)
@@ -2322,7 +2387,7 @@ func TestOpenReadOnlyLargeFileGetsPrefetcher(t *testing.T) {
 }
 
 func TestOpenWritableLargeFileGetsLazyPreload(t *testing.T) {
-	size := int64(1024 * 1024) // 1MB — above smallFileThreshold
+	size := int64(1024 * 1024) // 1MB — above defaultSmallFileThreshold
 	getCalled := false
 
 	fs, ino, cleanup := newTestDat9FS(t, size, func(w http.ResponseWriter, r *http.Request) {
@@ -4278,7 +4343,7 @@ func TestDebounce_ReleaseAfterFlush_NoDataLoss(t *testing.T) {
 		t.Fatalf("Write status = %v, want OK", st)
 	}
 
-	// Flush (will debounce since file < smallFileThreshold and debounce > 0)
+	// Flush (will debounce since file < defaultSmallFileThreshold and debounce > 0)
 	st = fs.Flush(nil, &gofuse.FlushIn{
 		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
 		Fh:       createOut.Fh,
@@ -5903,7 +5968,7 @@ func TestReadSmallFileRetryOnTransient(t *testing.T) {
 // are exhausted, the Read returns EIO instead of EAGAIN.
 func TestReadRangeRetryExhaustedReturnsEIO(t *testing.T) {
 	var getCalls atomic.Int32
-	fileSize := int64(1 << 20) // 1 MiB — above smallFileThreshold
+	fileSize := int64(1 << 20) // 1 MiB — above defaultSmallFileThreshold
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {

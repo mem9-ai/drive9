@@ -91,6 +91,51 @@ type Dat9FS struct {
 
 	// perf contains optional mount-level counters. Nil when disabled.
 	perf *fusePerfCounters
+
+	// smallFileMax mirrors the server's inline_threshold (fetched lazily via
+	// the dat9 client). When 0, defaultSmallFileThreshold is used. Use the
+	// inlineThreshold() accessor; do not read directly.
+	smallFileMax atomic.Int64
+}
+
+// newWriteBuffer constructs a WriteBuffer with the small-file fast-path
+// cutoff aligned to the negotiated server inline_threshold.
+func (fs *Dat9FS) newWriteBuffer(path string, maxSize, partSize int64) *WriteBuffer {
+	wb := NewWriteBuffer(path, maxSize, partSize)
+	wb.SetSmallFileMax(fs.inlineThreshold())
+	return wb
+}
+
+// inlineThreshold returns the cutoff between simple PUT and V2 multipart
+// upload, mirroring the server-side IsLargeFile gate. It is read from the
+// FS's cached server-advertised value populated by warmInlineThreshold;
+// callers on hot paths (Read, Write, Flush, commit queue) must NOT trigger
+// network fetches here. Falls back to defaultSmallFileThreshold when no
+// value has been negotiated (e.g. unit tests that don't run Init).
+func (fs *Dat9FS) inlineThreshold() int64 {
+	if v := fs.smallFileMax.Load(); v > 0 {
+		return v
+	}
+	if fs.client != nil {
+		if t := fs.client.CachedSmallFileThreshold(); t > 0 {
+			fs.smallFileMax.Store(t)
+			return t
+		}
+	}
+	return defaultSmallFileThreshold
+}
+
+// warmInlineThreshold triggers a one-shot /v1/status fetch via the client
+// to populate the cached server inline_threshold. Idempotent and safe to
+// call from FUSE startup; failures (e.g. older server) cache as zero so
+// subsequent reads fall back to defaultSmallFileThreshold without retrying.
+func (fs *Dat9FS) warmInlineThreshold(ctx context.Context) {
+	if fs.client == nil {
+		return
+	}
+	if t := fs.client.SmallFileThreshold(ctx); t > 0 {
+		fs.smallFileMax.Store(t)
+	}
 }
 
 type dirtyInodeState struct {
@@ -410,7 +455,7 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 	if bufMax < maxPreloadSize {
 		bufMax = maxPreloadSize
 	}
-	fh.Dirty = NewWriteBuffer(fh.Path, bufMax, partSize)
+	fh.Dirty = fs.newWriteBuffer(fh.Path, bufMax, partSize)
 
 	// Lazy preload for all sizes — only Stat() now, load parts on demand.
 	// Set totalSize so the buffer knows the file extent, but don't load data.
@@ -467,7 +512,7 @@ func (fs *Dat9FS) preloadWritableHandleFromReadCacheLocked(fh *FileHandle) bool 
 	if fs.readCache == nil || fh == nil || fh.Dirty == nil {
 		return false
 	}
-	if fh.OrigSize <= 0 || fh.OrigSize > smallFileThreshold || fh.BaseRev <= 0 {
+	if fh.OrigSize <= 0 || fh.OrigSize > defaultSmallFileThreshold || fh.BaseRev <= 0 {
 		return false
 	}
 
@@ -610,7 +655,7 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 		return err
 	}
 
-	wb := NewWriteBuffer(fh.Path, maxPreloadSize, 0)
+	wb := fs.newWriteBuffer(fh.Path, maxPreloadSize, 0)
 	if len(data) > 0 {
 		if _, err := wb.Write(0, data); err != nil {
 			return err
@@ -1384,7 +1429,21 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 
 func (fs *Dat9FS) Init(server *gofuse.Server) {
 	fs.server = server
+	// Synchronously warm the server-advertised inline_threshold so the very
+	// first Create/Write/Flush/commit-queue decision after mount sees the
+	// negotiated value. Bound by a short timeout so an unreachable server
+	// can't stall mount; on timeout/failure we fall back to
+	// defaultSmallFileThreshold (50KB), matching old-server behavior.
+	ctx, cancel := context.WithTimeout(context.Background(), inlineThresholdWarmTimeout)
+	defer cancel()
+	fs.warmInlineThreshold(ctx)
 }
+
+// inlineThresholdWarmTimeout caps the synchronous status fetch on Init.
+// 5s leaves margin for cold TLS handshake + cross-region RTT while staying
+// under typical mount-readiness expectations. Declared as a var so tests
+// can shrink it; production callers must not mutate.
+var inlineThresholdWarmTimeout = 5 * time.Second
 
 // notifyEntry tells the kernel to invalidate a directory entry cache.
 // Safe to call even if the server is not yet initialized (e.g., during tests).
@@ -2577,7 +2636,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		return gofuse.EIO
 	}
 
-	wb := NewWriteBuffer(childP, streamingWriteMaxSize, 0)
+	wb := fs.newWriteBuffer(childP, streamingWriteMaxSize, 0)
 	wb.touched = true
 	wb.sequential = true
 	wb.uploadedParts = make(map[int]bool)
@@ -2662,7 +2721,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			return gofuse.EROFS
 		}
 
-		fh.Dirty = NewWriteBuffer(p, maxPreloadSize, 0)
+		fh.Dirty = fs.newWriteBuffer(p, maxPreloadSize, 0)
 
 		// Preload existing content for non-truncating opens so that
 		// random writes don't discard the original file data.
@@ -2750,7 +2809,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	// Set up read prefetcher for read-only opens on large files.
 	if fh.Dirty == nil {
 		entry, _ := fs.inodes.GetEntry(input.NodeId)
-		if entry != nil && entry.Size > smallFileThreshold {
+		if entry != nil && entry.Size > fs.inlineThreshold() {
 			fh.Prefetch = NewPrefetcher(fs.client, fs.remotePath(p), entry.Size, fs.debugEnabled())
 			fh.Prefetch.SetPerfCounters(fs.perf)
 		}
@@ -3087,7 +3146,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// InodeEntry has a stored revision from the last Lookup/GetAttr, pass
 	// it to the cache for validation. Cache hit only if revision matches.
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
-	if entry != nil && entry.Size <= smallFileThreshold && entry.Size > 0 {
+	if entry != nil && entry.Size <= defaultSmallFileThreshold && entry.Size > 0 {
 		cacheRev := entry.Revision // use revision from last Stat/Lookup
 		// Fast path: serve from cache without any HTTP call.
 		if data, ok := fs.readCache.Get(p, cacheRev); ok {
@@ -3203,7 +3262,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 
 	if fh.Dirty == nil {
 		source = "new-dirty-buffer"
-		fh.Dirty = NewWriteBuffer(fh.Path, 0, 0)
+		fh.Dirty = fs.newWriteBuffer(fh.Path, 0, 0)
 	}
 
 	// ShadowSpill: write shadow FIRST, before Dirty. If shadow fails, return
@@ -3835,7 +3894,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	}
 
 	size := fh.Dirty.Size()
-	if size >= smallFileThreshold || fs.debouncer.delay <= 0 {
+	if size >= fs.inlineThreshold() || fs.debouncer.delay <= 0 {
 		return fs.flushHandle(ctx, fh)
 	}
 
@@ -4017,7 +4076,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 
 	// Path 1b: Large new file with streaming uploader but no streaming parts
 	// (non-sequential writes) — upload all parts in parallel at flush time.
-	if fh.Streamer != nil && size >= smallFileThreshold {
+	if fh.Streamer != nil && size >= fs.inlineThreshold() {
 		phase = "upload-all"
 		expectedRevision := fh.Streamer.ExpectedRevision()
 		numParts := int((size + fh.Dirty.PartSize() - 1) / fh.Dirty.PartSize())
@@ -4076,7 +4135,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	expectedRevision := expectedRevisionForHandle(fh)
 	var committedRev int64
 
-	if size < smallFileThreshold {
+	threshold := fs.inlineThreshold()
+	if size < threshold {
 		// Small file: direct PUT with revision return for freshness seeding.
 		phase = "small-write"
 		writeStart := time.Now()
@@ -4084,7 +4144,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
 		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
 		fs.debugDurationf(writeStart, 0, "flushHandle small write done path=%s size=%d committed_rev=%d err=%v", fh.Path, size, committedRev, err)
-	} else if fh.OrigSize >= smallFileThreshold {
+	} else if fh.OrigSize >= threshold {
 		phase = "patch-file"
 		dirtyParts := fh.Dirty.DirtyPartNumbers()
 		if len(dirtyParts) > 0 {
@@ -4263,7 +4323,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 	if committedRev > 0 && entry.Inode > 0 {
 		// Seed readCache from shadow data before the shadow file is removed.
 		// Only attempt for files under the readCache size limit.
-		if entry.Size < int64(smallFileThreshold) && fs.shadowStore != nil {
+		if entry.Size < int64(defaultSmallFileThreshold) && fs.shadowStore != nil {
 			if data, err := fs.shadowStore.ReadAll(entry.Path); err == nil {
 				fs.readCache.PutOwned(entry.Path, data, committedRev)
 			}

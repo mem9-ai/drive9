@@ -198,7 +198,7 @@ func (b *Dat9Backend) cleanupFailedFinalizeUpload(ctx context.Context, upload *d
 // IsLargeFile returns true if the given size exceeds the small file threshold
 // and S3 is configured.
 func (b *Dat9Backend) IsLargeFile(size int64) bool {
-	return b.s3 != nil && size >= smallFileThreshold
+	return b.s3 != nil && size >= b.inlineThreshold
 }
 
 // InitiateUpload creates a multipart upload for a large file.

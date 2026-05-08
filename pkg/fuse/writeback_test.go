@@ -1671,7 +1671,7 @@ func TestOpenWritable_OverwriteFromWriteBackCacheSkipsRemoteStat(t *testing.T) {
 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
-	c := client.New(ts.URL, "")
+	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 0)
 
 	opts := &MountOptions{FlushDebounce: 0}

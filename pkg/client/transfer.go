@@ -77,8 +77,35 @@ type completePart struct {
 // partNumber is 1-based, totalParts is the total count.
 type ProgressFunc func(partNumber, totalParts int, bytesUploaded int64)
 
-// DefaultSmallFileThreshold matches the server's threshold for direct PUT vs multipart.
-const DefaultSmallFileThreshold = 50_000 // 50,000 bytes — matches embedding model max input characters
+// DefaultSmallFileThreshold is the conservative fallback used when the server
+// does not advertise an inline_threshold via /v1/status (e.g. older builds) or
+// the lookup fails. New code should consume the value via Client.uploadThreshold
+// so server-side overrides propagate without client redeploys.
+const DefaultSmallFileThreshold = 50_000
+
+// uploadThreshold returns the cutoff between direct PUT and V2 multipart
+// upload. Resolution order:
+//  1. Per-Client override (c.smallFileThreshold > 0): used as-is. Tests pin
+//     this; operators can also force a value when the server cannot be
+//     reached at construction.
+//  2. Server-advertised inline_threshold cached from a prior /v1/status
+//     fetch. Treated as the source of truth in production.
+//  3. DefaultSmallFileThreshold fallback: when neither override nor cached
+//     server value is available.
+//
+// This deliberately reads only the cached value rather than triggering a
+// fresh /v1/status fetch on the upload hot path: callers wanting the
+// server-advertised threshold should warm the cache once at startup via
+// SmallFileThreshold or MaxUploadBytes. Hot-path fetches caused unrelated
+// test fakes to flag GET /v1/status as an unexpected request and added a
+// blocking RTT to every first upload before warmup.
+func (c *Client) uploadThreshold(ctx context.Context) int64 {
+	_ = ctx
+	if t := c.CachedSmallFileThreshold(); t > 0 {
+		return t
+	}
+	return DefaultSmallFileThreshold
+}
 
 // Upload concurrency limits, modeled after db9's memory-bounded approach:
 //
@@ -307,10 +334,7 @@ func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path str
 	if err := validateTags(tags); err != nil {
 		return nil, err
 	}
-	threshold := int64(DefaultSmallFileThreshold)
-	if c.smallFileThreshold > 0 {
-		threshold = c.smallFileThreshold
-	}
+	threshold := c.uploadThreshold(ctx)
 	summary := &UploadSummary{
 		Type:       "upload_summary",
 		StartedAt:  time.Now(),

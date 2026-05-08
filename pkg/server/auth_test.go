@@ -291,6 +291,38 @@ func TestTenantStatusWithValidKey(t *testing.T) {
 	}
 }
 
+func TestTenantStatusReturnsInlineThreshold(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+	const customThreshold = int64(256_000)
+	srv := NewWithConfig(Config{
+		Meta:            rt.meta,
+		Pool:            rt.pool,
+		TokenSecret:     rt.tokenSecret,
+		InlineThreshold: customThreshold,
+	})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)
+	req.Header.Set("Authorization", "Bearer "+rt.token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	var out TenantStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.InlineThreshold != customThreshold {
+		t.Fatalf("inline_threshold = %d, want %d", out.InlineThreshold, customThreshold)
+	}
+}
+
 func TestTenantStatusReturnsProvisioningState(t *testing.T) {
 	srv, tok, cleanup := newAuthServer(t)
 	defer cleanup()

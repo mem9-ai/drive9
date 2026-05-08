@@ -42,9 +42,13 @@ type Config struct {
 	LocalS3           *s3client.LocalS3Client
 	S3Dir             string
 	MaxUploadBytes    int64
-	Logger            *zap.Logger
-	SemanticEmbedder  embedding.Client
-	SemanticWorkers   SemanticWorkerOptions
+	// InlineThreshold is the server-wide DB-inline vs S3 cutoff surfaced to
+	// clients via /v1/status. When 0, the value is inferred from
+	// cfg.Backend.InlineThreshold() (or omitted in responses if no backend).
+	InlineThreshold  int64
+	Logger           *zap.Logger
+	SemanticEmbedder embedding.Client
+	SemanticWorkers  SemanticWorkerOptions
 }
 
 type Server struct {
@@ -57,6 +61,7 @@ type Server struct {
 	vaultMK           *vault.MasterKey
 	vaultIssuerURL    string
 	maxUploadBytes    int64
+	inlineThreshold   int64
 	metrics           *serverMetrics
 	logger            *zap.Logger
 	mux               *http.ServeMux
@@ -82,6 +87,11 @@ const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
 type TenantStatusResponse struct {
 	Status         string `json:"status"`
 	MaxUploadBytes int64  `json:"max_upload_bytes"`
+	// InlineThreshold is the server's DB-inline vs S3 storage cutoff. Clients
+	// use it to choose simple PUT vs V2 multipart upload so they stay
+	// consistent with server-side IsLargeFile gating. Omitted (zero) by old
+	// servers; clients fall back to their compiled-in default.
+	InlineThreshold int64 `json:"inline_threshold,omitempty"`
 }
 
 const (
@@ -112,6 +122,13 @@ func NewWithConfig(cfg Config) *Server {
 			logger.Warn("vault master key invalid, vault disabled", zap.Error(err))
 		}
 	}
+	inlineThreshold := cfg.InlineThreshold
+	if inlineThreshold <= 0 && cfg.Backend != nil {
+		inlineThreshold = cfg.Backend.InlineThreshold()
+	}
+	if inlineThreshold <= 0 {
+		inlineThreshold = backend.DefaultInlineThreshold
+	}
 	s := &Server{
 		fallback:          cfg.Backend,
 		meta:              cfg.Meta,
@@ -122,6 +139,7 @@ func NewWithConfig(cfg Config) *Server {
 		vaultIssuerURL:    strings.TrimSpace(cfg.VaultIssuerURL),
 		provisioner:       cfg.Provisioner,
 		maxUploadBytes:    maxUpload,
+		inlineThreshold:   inlineThreshold,
 		metrics:           newServerMetrics(),
 		logger:            logger,
 		events:            newEventBuses(),
@@ -406,8 +424,9 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
-		Status:         string(resolved.Tenant.Status),
-		MaxUploadBytes: s.maxUploadBytes,
+		Status:          string(resolved.Tenant.Status),
+		MaxUploadBytes:  s.maxUploadBytes,
+		InlineThreshold: s.inlineThreshold,
 	})
 }
 
@@ -441,8 +460,9 @@ func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request)
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", "local", "status", "active")...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
-		Status:         "active",
-		MaxUploadBytes: s.maxUploadBytes,
+		Status:          "active",
+		MaxUploadBytes:  s.maxUploadBytes,
+		InlineThreshold: s.inlineThreshold,
 	})
 }
 
