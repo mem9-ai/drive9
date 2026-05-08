@@ -99,11 +99,12 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 	}
 
 	// Small-file fast path: use a single contiguous allocation for files
-	// that remain below the small-file threshold. This avoids map lookups,
-	// per-part allocations, and fragmentation for the common case.
+	// that remain below the small-file threshold and still fit in a single
+	// logical part. This avoids map lookups, per-part allocations, and
+	// fragmentation for the common case.
 	// Do NOT use the fast path when lazy loading is configured (LoadPart != nil)
 	// because we may need to load existing remote data.
-	if wb.smallFileData != nil || (len(wb.parts) == 0 && wb.LoadPart == nil && end <= smallFileThreshold) {
+	if wb.smallFileData != nil || (wb.partSize >= smallFileThreshold && len(wb.parts) == 0 && wb.LoadPart == nil && end <= smallFileThreshold) {
 		return wb.writeSmallFile(offset, data)
 	}
 
@@ -208,6 +209,8 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 		return wb.Write(offset, data)
 	}
 
+	oldLen := len(wb.smallFileData)
+
 	// Ensure capacity (grow with headroom to reduce reallocations)
 	if int(end) > cap(wb.smallFileData) {
 		newCap := int(end)
@@ -226,6 +229,9 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 		wb.smallFileData = grown[:end]
 	} else if int(end) > len(wb.smallFileData) {
 		wb.smallFileData = wb.smallFileData[:end]
+	}
+	if oldLen < len(wb.smallFileData) {
+		clear(wb.smallFileData[oldLen:])
 	}
 
 	copy(wb.smallFileData[offset:], data)

@@ -23,7 +23,7 @@ type cacheEntry struct {
 }
 
 // ReadCache is a thread-safe LRU + TTL read cache for small files.
-// It only caches files whose size does not exceed smallFileThreshold (1MB).
+// It only caches files whose size does not exceed smallFileThreshold (50KB).
 // Entries are evicted when the total cached size exceeds maxSize or when
 // their TTL expires.
 type ReadCache struct {

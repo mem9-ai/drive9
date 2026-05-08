@@ -375,6 +375,34 @@ func TestWriteBuffer_Truncate(t *testing.T) {
 	}
 }
 
+func TestWriteBuffer_TruncateSmallFileSparseWriteZeroFillsGap(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 0)
+	_, _ = wb.Write(0, []byte("hello world"))
+
+	if err := wb.Truncate(5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wb.Write(10, []byte("X")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := wb.Bytes()
+	if len(got) != 11 {
+		t.Fatalf("Bytes() len = %d, want 11", len(got))
+	}
+	if string(got[:5]) != "hello" {
+		t.Fatalf("prefix = %q, want %q", got[:5], "hello")
+	}
+	for i := 5; i < 10; i++ {
+		if got[i] != 0 {
+			t.Fatalf("gap byte %d = %d, want 0", i, got[i])
+		}
+	}
+	if got[10] != 'X' {
+		t.Fatalf("tail byte = %q, want %q", got[10], byte('X'))
+	}
+}
+
 func TestWriteBuffer_EFBIG(t *testing.T) {
 	wb := NewWriteBuffer("/test", 100, 0)
 	_, err := wb.Write(0, make([]byte, 101))
@@ -986,6 +1014,28 @@ func TestWriteBuffer_ReadAt_Basic(t *testing.T) {
 	}
 	if string(buf[20:30]) != "CCCCCCCCCC" {
 		t.Fatalf("part 3: got %q", buf[20:30])
+	}
+}
+
+func TestWriteBuffer_SmallFileFastPathRequiresSinglePart(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 10)
+	data := []byte("0123456789012345678901234")
+	if _, err := wb.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+
+	dirty := wb.DirtyPartNumbers()
+	if len(dirty) != 3 {
+		t.Fatalf("dirty parts = %v, want 3 parts", dirty)
+	}
+	if got := string(wb.PartData(1)); got != "0123456789" {
+		t.Fatalf("part 1 = %q, want %q", got, "0123456789")
+	}
+	if got := string(wb.PartData(2)); got != "0123456789" {
+		t.Fatalf("part 2 = %q, want %q", got, "0123456789")
+	}
+	if got := string(wb.PartData(3)); got != "01234" {
+		t.Fatalf("part 3 = %q, want %q", got, "01234")
 	}
 }
 
