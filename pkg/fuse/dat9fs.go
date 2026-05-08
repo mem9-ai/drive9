@@ -463,6 +463,26 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 	return gofuse.OK
 }
 
+func (fs *Dat9FS) preloadWritableHandleFromReadCacheLocked(fh *FileHandle) bool {
+	if fs.readCache == nil || fh == nil || fh.Dirty == nil {
+		return false
+	}
+	if fh.OrigSize <= 0 || fh.OrigSize > smallFileThreshold || fh.BaseRev <= 0 {
+		return false
+	}
+
+	data, ok := fs.readCache.Get(fh.Path, fh.BaseRev)
+	if !ok {
+		return false
+	}
+	if _, err := fh.Dirty.Write(0, data); err != nil {
+		log.Printf("read-cache writable preload failed for %s: %v", fh.Path, err)
+		return false
+	}
+	fh.Dirty.ClearDirty()
+	return true
+}
+
 func (fs *Dat9FS) pendingKindForHandle(fh *FileHandle) PendingKind {
 	if fh.IsNew {
 		return PendingNew
@@ -538,7 +558,7 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 			return err
 		}
 	} else {
-		if err := fs.shadowStore.WriteFull(fh.Path, fh.Dirty.Bytes(), fh.BaseRev); err != nil {
+		if err := fs.shadowStore.WriteFull(fh.Path, fh.Dirty.bytesView(), fh.BaseRev); err != nil {
 			return err
 		}
 		fh.ShadowReady = true
@@ -573,7 +593,7 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 	}
 	return fs.writeBack.PutWithBaseRev(
 		fh.Path,
-		fh.Dirty.Bytes(),
+		fh.Dirty.bytesView(),
 		fh.Dirty.Size(),
 		fs.pendingKindForHandle(fh),
 		fh.BaseRev,
@@ -610,6 +630,34 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 		fh.BaseRev = rev
 	}
 	return nil
+}
+
+func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
+	if fs.writeBack == nil || fh == nil || fh.Dirty == nil {
+		return false
+	}
+
+	meta, ok := fs.writeBack.GetMeta(fh.Path)
+	if !ok {
+		return false
+	}
+	data, ok := fs.writeBack.getView(fh.Path)
+	if !ok {
+		return false
+	}
+	if _, err := fh.Dirty.Write(0, data); err != nil {
+		log.Printf("writeback preload failed for %s: %v", fh.Path, err)
+		return false
+	}
+
+	fh.IsNew = meta.Kind == PendingNew
+	fh.OrigSize = int64(len(data))
+	if meta.BaseRev > 0 {
+		fh.BaseRev = meta.BaseRev
+		fs.inodes.UpdateRevision(fh.Ino, meta.BaseRev)
+	}
+	fh.DirtySeq = fs.markDirtySize(fh.Ino, int64(len(data)))
+	return true
 }
 
 func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
@@ -2613,18 +2661,6 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			return gofuse.EROFS
 		}
 
-		// If BaseRev is 0 (e.g. inode came from readdir without revision),
-		// fetch the authoritative revision so CAS uploads work correctly.
-		if fh.BaseRev == 0 && !fh.IsNew {
-			statStart := fs.perfStart()
-			stat, err := fs.client.StatCtx(ctx, fs.remotePath(p))
-			fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
-			if err == nil && stat != nil {
-				fh.BaseRev = stat.Revision
-				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
-			}
-		}
-
 		fh.Dirty = NewWriteBuffer(p, maxPreloadSize, 0)
 
 		// Preload existing content for non-truncating opens so that
@@ -2642,18 +2678,24 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			}
 			// Prefer write-back cache over remote — handles the case where
 			// a previous close is still uploading asynchronously.
-			if !preloaded && fs.writeBack != nil {
-				if wbData, ok := fs.writeBack.Get(p); ok {
-					if _, err := fh.Dirty.Write(0, wbData); err != nil {
-						return gofuse.Status(syscall.EFBIG)
-					}
-					// Keep dirty parts so Read sees the data. The content hasn't
-					// been persisted to the server yet (pending upload), so
-					// marking it dirty is semantically correct.
-					fh.OrigSize = int64(len(wbData))
-					fh.DirtySeq = fs.markDirtySize(fh.Ino, int64(len(wbData)))
-					preloaded = true
+			if !preloaded && fs.loadWritableHandleFromWriteBackLocked(fh) {
+				preloaded = true
+			}
+
+			// If BaseRev is still 0 (e.g. inode came from readdir without
+			// revision, or a legacy pending overwrite lacks baseRev), fetch the
+			// authoritative revision so CAS uploads work correctly.
+			if fh.BaseRev == 0 && !fh.IsNew {
+				statStart := fs.perfStart()
+				stat, err := fs.client.StatCtx(ctx, fs.remotePath(p))
+				fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
+				if err == nil && stat != nil {
+					fh.BaseRev = stat.Revision
+					fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
 				}
+			}
+			if !preloaded && fs.preloadWritableHandleFromReadCacheLocked(fh) {
+				preloaded = true
 			}
 			if !preloaded {
 				if st := fs.preloadWritableHandle(ctx, fh); st != gofuse.OK {
@@ -2899,7 +2941,8 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		return gofuse.ReadResultData(result), gofuse.OK
 	} else if fh.Dirty != nil && fh.Dirty.Size() > 0 && !fh.Dirty.HasDirtyParts() {
 		// Writable handle with lazy-loaded buffer (no dirty parts yet) —
-		// read directly from the server for unloaded parts.
+		// serve already-loaded ranges from memory and fall back to the server
+		// only when the requested range still has unloaded parts.
 		offset := int64(input.Offset)
 		size := fh.Dirty.Size()
 		if offset >= size {
@@ -2907,6 +2950,28 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			source = "dirty-clean-eof"
 			bytesRead = 0
 			return gofuse.ReadResultData(nil), gofuse.OK
+		}
+		end := offset + int64(input.Size)
+		if end > size {
+			end = size
+		}
+		ps := fh.Dirty.PartSize()
+		firstPart := int(offset / ps)
+		lastPart := int((end - 1) / ps)
+		fullyLoaded := true
+		for p := firstPart; p <= lastPart; p++ {
+			if !fh.Dirty.IsPartLoaded(p) {
+				fullyLoaded = false
+				break
+			}
+		}
+		if fullyLoaded {
+			result := make([]byte, end-offset)
+			fh.Dirty.ReadAt(offset, result)
+			fh.Unlock()
+			source = "dirty-clean-buffer"
+			bytesRead = len(result)
+			return gofuse.ReadResultData(result), gofuse.OK
 		}
 		source = "dirty-clean-remote"
 		fh.Unlock()
@@ -2967,7 +3032,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// write-back cache (async upload still in progress), serve reads from
 	// that cached data instead of going to the server (which has stale data).
 	if fh.Dirty == nil && fs.writeBack != nil {
-		if wbData, ok := fs.writeBack.Get(fh.Path); ok {
+		if wbData, ok := fs.writeBack.getView(fh.Path); ok {
 			offset := int64(input.Offset)
 			if offset >= int64(len(wbData)) {
 				source = "writeback-cache-eof"
@@ -3052,7 +3117,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			return nil, httpToFuseStatus(err)
 		}
 		// Store with the revision from the prior Stat/Lookup.
-		fs.readCache.Put(p, data, cacheRev)
+		fs.readCache.PutOwned(p, data, cacheRev)
 		offset := int64(input.Offset)
 		if offset >= int64(len(data)) {
 			source = "small-read-eof"
@@ -3769,8 +3834,9 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 
 	// Small file: schedule a deferred upload.
 	// Snapshot the data so the deferred upload sees a consistent copy.
-	data := make([]byte, len(fh.Dirty.Bytes()))
-	copy(data, fh.Dirty.Bytes())
+	snapshot := fh.Dirty.bytesView()
+	data := make([]byte, len(snapshot))
+	copy(data, snapshot)
 	filePath := fh.Path
 	ino := fh.Ino
 	handle := fh               // capture for goroutine
@@ -3811,7 +3877,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		}
 		handle.Unlock()
 		if committedRev > 0 {
-			fs.readCache.Put(filePath, data, committedRev)
+			fs.readCache.PutOwned(filePath, data, committedRev)
 		} else {
 			fs.readCache.Invalidate(filePath)
 		}
@@ -3999,7 +4065,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}
 
 	// Path 2: No streaming uploader or small file — materialize all data for upload.
-	data := fh.Dirty.Bytes()
+	data := fh.Dirty.bytesView()
 	expectedRevision := expectedRevisionForHandle(fh)
 	var committedRev int64
 
@@ -4192,7 +4258,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		// Only attempt for files under the readCache size limit.
 		if entry.Size < int64(smallFileThreshold) && fs.shadowStore != nil {
 			if data, err := fs.shadowStore.ReadAll(entry.Path); err == nil {
-				fs.readCache.Put(entry.Path, data, committedRev)
+				fs.readCache.PutOwned(entry.Path, data, committedRev)
 			}
 		}
 		fs.inodes.UpdateRevision(entry.Inode, committedRev)

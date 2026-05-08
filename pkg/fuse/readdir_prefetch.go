@@ -67,7 +67,7 @@ func (fs *Dat9FS) prefetchReadCacheForDir(ctx context.Context, dirPath string, i
 			if result.Revision > 0 {
 				revision = result.Revision
 			}
-			fs.readCache.Put(candidate.localPath, result.Data, revision)
+			fs.readCache.PutOwned(candidate.localPath, result.Data, revision)
 			if revision > 0 {
 				if ino, ok := fs.inodes.GetInode(candidate.localPath); ok {
 					fs.inodes.UpdateRevision(ino, revision)

@@ -20,8 +20,8 @@ import (
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
-func newTestDat9FS(t *testing.T, size int64, get func(http.ResponseWriter, *http.Request)) (*Dat9FS, uint64, func()) {
-	t.Helper()
+func newTestDat9FS(tb testing.TB, size int64, get func(http.ResponseWriter, *http.Request)) (*Dat9FS, uint64, func()) {
+	tb.Helper()
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -42,6 +42,268 @@ func newTestDat9FS(t *testing.T, size int64, get func(http.ResponseWriter, *http
 	fs := NewDat9FS(client.New(ts.URL, ""), opts)
 	ino := fs.inodes.Lookup("/file.bin", false, size, time.Now())
 	return fs, ino, ts.Close
+}
+
+func BenchmarkDat9FS_SmallFileOpen(b *testing.B) {
+	const (
+		filePath = "/file.bin"
+		fileRev  = 7
+	)
+	data := []byte("fresh-data")
+
+	b.Run("read-cache-hit", func(b *testing.B) {
+		fs, ino, cleanup := newTestDat9FS(b, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("stale-data"))
+		})
+		defer cleanup()
+
+		fs.inodes.UpdateRevision(ino, fileRev)
+		fs.readCache.Put(filePath, data, fileRev)
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			var out gofuse.OpenOut
+			st := fs.Open(nil, &gofuse.OpenIn{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Flags:    uint32(syscall.O_RDWR),
+			}, &out)
+			if st != gofuse.OK {
+				b.Fatalf("Open status = %v, want OK", st)
+			}
+			if fh, ok := fs.fileHandles.Get(out.Fh); ok {
+				benchmarkIntSink += int(fh.BaseRev)
+				fs.clearDirtySize(ino, fh.DirtySeq)
+			}
+			fs.fileHandles.Delete(out.Fh)
+		}
+	})
+
+	b.Run("pending-shadow", func(b *testing.B) {
+		fs, ino, cleanup := newTestDat9FS(b, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("stale-data"))
+		})
+		defer cleanup()
+
+		shadow, err := NewShadowStore(b.TempDir())
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer shadow.Close()
+		pending, err := NewPendingIndex(b.TempDir())
+		if err != nil {
+			b.Fatal(err)
+		}
+		fs.shadowStore = shadow
+		fs.pendingIndex = pending
+
+		if err := shadow.WriteFull(filePath, data, 9); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := pending.PutWithBaseRev(filePath, int64(len(data)), PendingOverwrite, 9); err != nil {
+			b.Fatal(err)
+		}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			var out gofuse.OpenOut
+			st := fs.Open(nil, &gofuse.OpenIn{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Flags:    uint32(syscall.O_RDWR),
+			}, &out)
+			if st != gofuse.OK {
+				b.Fatalf("Open status = %v, want OK", st)
+			}
+			if fh, ok := fs.fileHandles.Get(out.Fh); ok {
+				benchmarkIntSink += int(fh.BaseRev)
+				fs.clearDirtySize(ino, fh.DirtySeq)
+			}
+			fs.fileHandles.Delete(out.Fh)
+		}
+	})
+
+	b.Run("pending-writeback-overwrite", func(b *testing.B) {
+		fs, ino, cleanup := newTestDat9FS(b, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("stale-data"))
+		})
+		defer cleanup()
+
+		cache, err := NewWriteBackCache(b.TempDir())
+		if err != nil {
+			b.Fatal(err)
+		}
+		fs.SetWriteBack(cache, nil)
+		if err := cache.PutWithBaseRev(filePath, data, int64(len(data)), PendingOverwrite, 11); err != nil {
+			b.Fatal(err)
+		}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			var out gofuse.OpenOut
+			st := fs.Open(nil, &gofuse.OpenIn{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Flags:    uint32(syscall.O_RDWR),
+			}, &out)
+			if st != gofuse.OK {
+				b.Fatalf("Open status = %v, want OK", st)
+			}
+			if fh, ok := fs.fileHandles.Get(out.Fh); ok {
+				benchmarkIntSink += int(fh.BaseRev)
+				fs.clearDirtySize(ino, fh.DirtySeq)
+			}
+			fs.fileHandles.Delete(out.Fh)
+		}
+	})
+}
+
+func BenchmarkDat9FS_SmallFileRead(b *testing.B) {
+	const filePath = "/file.bin"
+	data := make([]byte, 32*1024)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	const readSize = 4096
+
+	b.Run("read-cache-hit", func(b *testing.B) {
+		fs, ino, cleanup := newTestDat9FS(b, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write(data)
+		})
+		defer cleanup()
+
+		fs.inodes.UpdateRevision(ino, 3)
+		fs.readCache.Put(filePath, data, 3)
+
+		var out gofuse.OpenOut
+		st := fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Flags:    uint32(syscall.O_RDONLY),
+		}, &out)
+		if st != gofuse.OK {
+			b.Fatalf("Open status = %v, want OK", st)
+		}
+		defer fs.fileHandles.Delete(out.Fh)
+
+		buf := make([]byte, readSize)
+		b.ReportAllocs()
+		b.SetBytes(readSize)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			offset := uint64((i % 8) * readSize)
+			result, st := fs.Read(nil, &gofuse.ReadIn{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Fh:       out.Fh,
+				Offset:   offset,
+				Size:     uint32(readSize),
+			}, buf)
+			if st != gofuse.OK {
+				b.Fatalf("Read status = %v, want OK", st)
+			}
+			data, _ := result.Bytes(buf)
+			benchmarkByteSink ^= data[0]
+		}
+	})
+
+	b.Run("writable-clean-buffer", func(b *testing.B) {
+		fs, ino, cleanup := newTestDat9FS(b, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("stale-data"))
+		})
+		defer cleanup()
+
+		fs.inodes.UpdateRevision(ino, 5)
+		fs.readCache.Put(filePath, data, 5)
+
+		var out gofuse.OpenOut
+		st := fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Flags:    uint32(syscall.O_RDWR),
+		}, &out)
+		if st != gofuse.OK {
+			b.Fatalf("Open status = %v, want OK", st)
+		}
+		defer func() {
+			if fh, ok := fs.fileHandles.Get(out.Fh); ok {
+				fs.clearDirtySize(ino, fh.DirtySeq)
+			}
+			fs.fileHandles.Delete(out.Fh)
+		}()
+
+		buf := make([]byte, readSize)
+		b.ReportAllocs()
+		b.SetBytes(readSize)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			offset := uint64((i % 8) * readSize)
+			result, st := fs.Read(nil, &gofuse.ReadIn{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Fh:       out.Fh,
+				Offset:   offset,
+				Size:     uint32(readSize),
+			}, buf)
+			if st != gofuse.OK {
+				b.Fatalf("Read status = %v, want OK", st)
+			}
+			data, _ := result.Bytes(buf)
+			benchmarkByteSink ^= data[0]
+		}
+	})
+}
+
+func BenchmarkDat9FS_SmallFileFlush(b *testing.B) {
+	const filePath = "/flush.txt"
+	data := make([]byte, 16*1024)
+	for i := range data {
+		data[i] = byte(i % 253)
+	}
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://localhost", ""), opts)
+	cache, err := NewWriteBackCache(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	fs.SetWriteBack(cache, nil)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Time{})
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var out gofuse.OpenOut
+		st := fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Flags:    uint32(syscall.O_RDWR | syscall.O_TRUNC),
+		}, &out)
+		if st != gofuse.OK {
+			b.Fatalf("Open status = %v, want OK", st)
+		}
+
+		if _, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       out.Fh,
+			Offset:   0,
+		}, data); st != gofuse.OK {
+			b.Fatalf("Write status = %v, want OK", st)
+		}
+
+		st = fs.Flush(nil, &gofuse.FlushIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       out.Fh,
+		})
+		if st != gofuse.OK {
+			b.Fatalf("Flush status = %v, want OK", st)
+		}
+
+		if fh, ok := fs.fileHandles.Get(out.Fh); ok {
+			benchmarkIntSink += int(fh.Dirty.Size())
+			fs.clearDirtySize(ino, fh.DirtySeq)
+		}
+		fs.fileHandles.Delete(out.Fh)
+		cache.Remove(filePath)
+		fs.readCache.Invalidate(filePath)
+	}
 }
 
 func TestOpenWritableSmallFileLazyPreload(t *testing.T) {
@@ -78,6 +340,69 @@ func TestOpenWritableLargeFileLazyPreload(t *testing.T) {
 	}, &out)
 	if st != gofuse.OK {
 		t.Fatalf("Open status = %v, want OK (lazy preload defers loading)", st)
+	}
+}
+
+func TestOpenWritableSmallFileUsesReadCacheFastPath(t *testing.T) {
+	var headCalls atomic.Int32
+	var getCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			headCalls.Add(1)
+			w.Header().Set("Content-Length", "10")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			getCalls.Add(1)
+			_, _ = w.Write([]byte("stale-data"))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	const cachedRev = 7
+	cached := []byte("fresh-data")
+	ino := fs.inodes.Lookup("/file.txt", false, int64(len(cached)), time.Now())
+	fs.inodes.UpdateRevision(ino, cachedRev)
+	fs.readCache.Put("/file.txt", cached, cachedRev)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDWR),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	buf := make([]byte, 32)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+
+	data, _ := result.Bytes(buf)
+	if string(data) != string(cached) {
+		t.Fatalf("Read data = %q, want %q", string(data), string(cached))
+	}
+	if got := headCalls.Load(); got != 0 {
+		t.Fatalf("HEAD calls = %d, want 0", got)
+	}
+	if got := getCalls.Load(); got != 0 {
+		t.Fatalf("GET calls = %d, want 0", got)
 	}
 }
 
@@ -328,6 +653,81 @@ func TestOpenWritablePrefersPendingShadowSnapshot(t *testing.T) {
 	data, _ := result.Bytes(buf)
 	if string(data) != "fresh" {
 		t.Fatalf("Read = %q, want fresh", data)
+	}
+}
+
+func TestOpenWritablePendingShadowSkipsRemoteStat(t *testing.T) {
+	var headCalls atomic.Int32
+	var getCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			headCalls.Add(1)
+			w.Header().Set("Content-Length", "5")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			getCalls.Add(1)
+			_, _ = io.WriteString(w, "stale")
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, 5, time.Now())
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	if err := shadow.WriteFull("/file.bin", []byte("fresh"), 9); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/file.bin", 5, PendingOverwrite, 9); err != nil {
+		t.Fatal(err)
+	}
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDWR),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if got := headCalls.Load(); got != 0 {
+		t.Fatalf("HEAD calls = %d, want 0", got)
+	}
+
+	buf := make([]byte, 16)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	data, _ := result.Bytes(buf)
+	if string(data) != "fresh" {
+		t.Fatalf("Read = %q, want fresh", data)
+	}
+	if got := getCalls.Load(); got != 0 {
+		t.Fatalf("GET calls = %d, want 0", got)
 	}
 }
 

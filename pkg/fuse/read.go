@@ -95,6 +95,16 @@ func (rc *ReadCache) Get(path string, currentRevision int64) ([]byte, bool) {
 // the path already exists it is updated in place. After insertion, LRU
 // eviction runs until the total cached size is within maxSize.
 func (rc *ReadCache) Put(path string, data []byte, revision int64) {
+	rc.put(path, data, revision, true)
+}
+
+// PutOwned stores data in the cache without cloning it.
+// Callers must pass a fresh slice that will not be mutated after this call.
+func (rc *ReadCache) PutOwned(path string, data []byte, revision int64) {
+	rc.put(path, data, revision, false)
+}
+
+func (rc *ReadCache) put(path string, data []byte, revision int64, clone bool) {
 	if len(data) > smallFileThreshold {
 		return
 	}
@@ -103,10 +113,11 @@ func (rc *ReadCache) Put(path string, data []byte, revision int64) {
 	defer rc.mu.Unlock()
 
 	dataLen := int64(len(data))
-
-	// Make a defensive copy of the data.
-	stored := make([]byte, dataLen)
-	copy(stored, data)
+	stored := data
+	if clone {
+		stored = make([]byte, dataLen)
+		copy(stored, data)
+	}
 
 	now := time.Now()
 

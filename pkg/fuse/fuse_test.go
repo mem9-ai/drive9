@@ -240,6 +240,38 @@ func TestReadCache_PutAndGet(t *testing.T) {
 	}
 }
 
+func TestReadCache_PutDefensivelyCopies(t *testing.T) {
+	rc := NewReadCache(1<<20, 10*time.Second)
+	data := []byte("hello world")
+	rc.Put("/test.txt", data, 1)
+	data[0] = 'j'
+
+	got, ok := rc.Get("/test.txt", 1)
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	if string(got) != "hello world" {
+		t.Fatalf("got %q, want %q", got, "hello world")
+	}
+}
+
+func TestReadCache_PutOwnedReusesSlice(t *testing.T) {
+	rc := NewReadCache(1<<20, 10*time.Second)
+	data := []byte("hello world")
+	rc.PutOwned("/test.txt", data, 1)
+
+	got, ok := rc.Get("/test.txt", 1)
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	if len(got) == 0 || len(data) == 0 {
+		t.Fatal("expected non-empty cached data")
+	}
+	if &got[0] != &data[0] {
+		t.Fatal("PutOwned should reuse the caller slice")
+	}
+}
+
 func TestReadCache_RevisionMismatch(t *testing.T) {
 	rc := NewReadCache(1<<20, 10*time.Second)
 	rc.Put("/f", []byte("x"), 1)

@@ -239,7 +239,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	}
 	gen := meta.Generation
 
-	data, ok := u.cache.Get(localPath)
+	data, ok := u.cache.getView(localPath)
 	if !ok {
 		return
 	}
@@ -321,7 +321,7 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 	}
 	gen := meta.Generation
 
-	data, ok := u.cache.Get(localPath)
+	data, ok := u.cache.getView(localPath)
 	if !ok {
 		return nil
 	}

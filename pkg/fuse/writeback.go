@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +18,16 @@ import (
 // local write-back cache during Flush. Files larger than this are uploaded
 // directly (streaming or multipart) to avoid filling local disk.
 const writeBackThreshold = 10 << 20 // 10MB
+
+// writeBackInMemoryDataThreshold is the maximum cached write-back payload size
+// retained in memory for hot reopen/read paths. Larger entries stay on disk
+// only to avoid turning write-back into a large in-memory file store.
+const writeBackInMemoryDataThreshold = smallFileThreshold
+
+// defaultWriteBackDataCacheMaxSize bounds the aggregate in-memory footprint of
+// small write-back payloads retained for hot reopen/read/uploader paths.
+// Entries are evicted with an LRU policy once this budget is exceeded.
+const defaultWriteBackDataCacheMaxSize = 32 << 20 // 32MB
 
 // PendingKind distinguishes newly created files from overwrites of existing
 // remote files. This affects Rename behaviour: a pending-new file can be
@@ -59,10 +70,19 @@ type WriteBackCache struct {
 	dir     string // e.g. ~/.cache/drive9/{mount-hash}/pending
 	mu      sync.Mutex
 	nextGen atomic.Uint64
-	// pending is an in-memory index of remote paths with cache entries.
-	// Kept in sync with disk by Put/Remove/RenamePending so that
-	// ListPendingPaths avoids scanning the directory each time.
-	pending map[string]struct{}
+	// metas is the authoritative in-memory metadata index.
+	// Kept in sync with disk by Put/Remove/RenamePending so that GetMeta and
+	// ListPendingPaths avoid local disk I/O and JSON parsing on hot paths.
+	metas map[string]*WriteBackMeta
+	// data keeps small cached payloads in memory so writable reopen/read paths
+	// can avoid re-reading the .dat file from disk.
+	data map[string][]byte
+	// dataOrder tracks recency for the in-memory payload cache.
+	dataOrder *list.List
+	dataElems map[string]*list.Element
+	dataBytes int64
+	// dataMaxBytes is the aggregate memory budget for data.
+	dataMaxBytes int64
 }
 
 // NewWriteBackCache creates (or opens) a write-back cache rooted at dir.
@@ -72,9 +92,17 @@ func NewWriteBackCache(dir string) (*WriteBackCache, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("writeback cache dir: %w", err)
 	}
-	c := &WriteBackCache{dir: dir, pending: make(map[string]struct{})}
+	c := &WriteBackCache{
+		dir:          dir,
+		metas:        make(map[string]*WriteBackMeta),
+		data:         make(map[string][]byte),
+		dataOrder:    list.New(),
+		dataElems:    make(map[string]*list.Element),
+		dataMaxBytes: defaultWriteBackDataCacheMaxSize,
+	}
 	// Populate in-memory index from disk (crash recovery).
 	entries, _ := os.ReadDir(dir)
+	var maxGen uint64
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".meta") {
@@ -86,10 +114,18 @@ func NewWriteBackCache(dir string) (*WriteBackCache, error) {
 		}
 		var meta WriteBackMeta
 		if err := json.Unmarshal(raw, &meta); err != nil {
+			base := strings.TrimSuffix(name, ".meta")
+			_ = os.Remove(filepath.Join(dir, name))
+			_ = os.Remove(filepath.Join(dir, base+".dat"))
 			continue
 		}
-		c.pending[meta.Path] = struct{}{}
+		cp := meta
+		c.metas[meta.Path] = &cp
+		if meta.Generation > maxGen {
+			maxGen = meta.Generation
+		}
 	}
+	c.nextGen.Store(maxGen)
 	return c, nil
 }
 
@@ -149,7 +185,9 @@ func (c *WriteBackCache) PutWithBaseRev(remotePath string, data []byte, size int
 		_ = os.Remove(datPath)
 		return fmt.Errorf("writeback put meta: %w", err)
 	}
-	c.pending[remotePath] = struct{}{}
+	cp := meta
+	c.metas[remotePath] = &cp
+	c.cacheDataLocked(remotePath, data, size)
 	return nil
 }
 
@@ -158,11 +196,86 @@ func (c *WriteBackCache) Get(remotePath string) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	data, ok := c.getViewLocked(remotePath)
+	if !ok {
+		return nil, false
+	}
+	copyData := make([]byte, len(data))
+	copy(copyData, data)
+	return copyData, true
+}
+
+// getViewLocked returns a read-only payload view for remotePath.
+// The caller must hold c.mu and must not mutate the returned slice.
+func (c *WriteBackCache) getViewLocked(remotePath string) ([]byte, bool) {
+	if data, ok := c.data[remotePath]; ok {
+		c.touchDataLocked(remotePath)
+		return data, true
+	}
+	meta, ok := c.metas[remotePath]
+	if !ok {
+		return nil, false
+	}
 	data, err := os.ReadFile(c.datFile(remotePath))
 	if err != nil {
 		return nil, false
 	}
+	c.cacheDataLocked(remotePath, data, meta.Size)
+	if cached, ok := c.data[remotePath]; ok {
+		return cached, true
+	}
 	return data, true
+}
+
+// getView returns a read-only payload view for remotePath.
+// Callers must not mutate the returned slice.
+func (c *WriteBackCache) getView(remotePath string) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.getViewLocked(remotePath)
+}
+
+func (c *WriteBackCache) cacheDataLocked(remotePath string, data []byte, size int64) {
+	if size > writeBackInMemoryDataThreshold || len(data) > writeBackInMemoryDataThreshold || c.dataMaxBytes <= 0 {
+		c.deleteDataLocked(remotePath)
+		return
+	}
+	if existing, ok := c.data[remotePath]; ok {
+		c.dataBytes -= int64(len(existing))
+	} else {
+		c.dataElems[remotePath] = c.dataOrder.PushFront(remotePath)
+	}
+	stored := make([]byte, len(data))
+	copy(stored, data)
+	c.data[remotePath] = stored
+	c.dataBytes += int64(len(stored))
+	c.touchDataLocked(remotePath)
+	for c.dataBytes > c.dataMaxBytes && c.dataOrder.Len() > 0 {
+		tail := c.dataOrder.Back()
+		if tail == nil {
+			break
+		}
+		path, _ := tail.Value.(string)
+		c.deleteDataLocked(path)
+	}
+}
+
+func (c *WriteBackCache) touchDataLocked(remotePath string) {
+	if elem, ok := c.dataElems[remotePath]; ok {
+		c.dataOrder.MoveToFront(elem)
+	}
+}
+
+func (c *WriteBackCache) deleteDataLocked(remotePath string) {
+	if data, ok := c.data[remotePath]; ok {
+		c.dataBytes -= int64(len(data))
+		delete(c.data, remotePath)
+	}
+	if elem, ok := c.dataElems[remotePath]; ok {
+		c.dataOrder.Remove(elem)
+		delete(c.dataElems, remotePath)
+	}
 }
 
 // GetMeta reads the metadata for remotePath. Returns nil, false if not cached.
@@ -170,15 +283,12 @@ func (c *WriteBackCache) GetMeta(remotePath string) (*WriteBackMeta, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	raw, err := os.ReadFile(c.metaFile(remotePath))
-	if err != nil {
+	meta, ok := c.metas[remotePath]
+	if !ok {
 		return nil, false
 	}
-	var meta WriteBackMeta
-	if err := json.Unmarshal(raw, &meta); err != nil {
-		return nil, false
-	}
-	return &meta, true
+	cp := *meta
+	return &cp, true
 }
 
 // Remove deletes the cached data and metadata for remotePath.
@@ -188,7 +298,8 @@ func (c *WriteBackCache) Remove(remotePath string) {
 
 	_ = os.Remove(c.datFile(remotePath))
 	_ = os.Remove(c.metaFile(remotePath))
-	delete(c.pending, remotePath)
+	delete(c.metas, remotePath)
+	c.deleteDataLocked(remotePath)
 }
 
 // RenamePending atomically moves a pending cache entry from oldPath to newPath.
@@ -202,15 +313,11 @@ func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
 	oldDat := c.datFile(oldPath)
 	oldMeta := c.metaFile(oldPath)
 
-	// Read existing meta.
-	raw, err := os.ReadFile(oldMeta)
-	if err != nil {
+	meta, ok := c.metas[oldPath]
+	if !ok {
 		return false
 	}
-	var meta WriteBackMeta
-	if err := json.Unmarshal(raw, &meta); err != nil {
-		return false
-	}
+	updated := *meta
 
 	// Rename .dat file directly — same directory, no data copy needed.
 	newDat := c.datFile(newPath)
@@ -219,9 +326,9 @@ func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
 	}
 
 	// Write new .meta with updated path and fresh generation.
-	meta.Path = newPath
-	meta.Generation = c.nextGen.Add(1)
-	metaBytes, err := json.Marshal(meta)
+	updated.Path = newPath
+	updated.Generation = c.nextGen.Add(1)
+	metaBytes, err := json.Marshal(updated)
 	if err != nil {
 		_ = os.Rename(newDat, oldDat)
 		return false
@@ -235,8 +342,24 @@ func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
 
 	// Remove old meta and update index.
 	_ = os.Remove(oldMeta)
-	delete(c.pending, oldPath)
-	c.pending[newPath] = struct{}{}
+	delete(c.metas, oldPath)
+	cp := updated
+	c.metas[newPath] = &cp
+	if data, ok := c.data[oldPath]; ok {
+		c.deleteDataLocked(oldPath)
+		c.deleteDataLocked(newPath)
+		c.data[newPath] = data
+		c.dataBytes += int64(len(data))
+		c.dataElems[newPath] = c.dataOrder.PushFront(newPath)
+		for c.dataBytes > c.dataMaxBytes && c.dataOrder.Len() > 0 {
+			tail := c.dataOrder.Back()
+			if tail == nil {
+				break
+			}
+			path, _ := tail.Value.(string)
+			c.deleteDataLocked(path)
+		}
+	}
 	return true
 }
 
@@ -246,12 +369,12 @@ func (c *WriteBackCache) ListPendingPaths() map[string]struct{} {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if len(c.pending) == 0 {
+	if len(c.metas) == 0 {
 		return nil
 	}
 	// Return a copy so callers can iterate without holding the lock.
-	result := make(map[string]struct{}, len(c.pending))
-	for k := range c.pending {
+	result := make(map[string]struct{}, len(c.metas))
+	for k := range c.metas {
 		result[k] = struct{}{}
 	}
 	return result
@@ -263,46 +386,60 @@ type PendingEntry struct {
 	Data []byte
 }
 
-// ListPending scans the cache directory and returns all pending entries.
-// Entries with missing or corrupt metadata are skipped (and cleaned up).
+// ListPending returns all pending entries using the in-memory metadata index.
+// It also reconciles any on-disk .meta files not yet in memory so crash
+// recovery and corruption cleanup keep the legacy behavior on this cold path.
 func (c *WriteBackCache) ListPending() []PendingEntry {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	entries, err := os.ReadDir(c.dir)
-	if err != nil {
+	if err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasSuffix(name, ".meta") {
+				continue
+			}
+			metaPath := filepath.Join(c.dir, name)
+			raw, err := os.ReadFile(metaPath)
+			if err != nil {
+				continue
+			}
+			var meta WriteBackMeta
+			if err := json.Unmarshal(raw, &meta); err != nil {
+				base := strings.TrimSuffix(name, ".meta")
+				_ = os.Remove(metaPath)
+				_ = os.Remove(filepath.Join(c.dir, base+".dat"))
+				continue
+			}
+			if _, ok := c.metas[meta.Path]; !ok {
+				cp := meta
+				c.metas[meta.Path] = &cp
+				if meta.Generation > c.nextGen.Load() {
+					c.nextGen.Store(meta.Generation)
+				}
+			}
+		}
+	}
+
+	if len(c.metas) == 0 {
 		return nil
 	}
 
-	var result []PendingEntry
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasSuffix(name, ".meta") {
-			continue
-		}
-		metaPath := filepath.Join(c.dir, name)
-		raw, err := os.ReadFile(metaPath)
-		if err != nil {
-			continue
-		}
-		var meta WriteBackMeta
-		if err := json.Unmarshal(raw, &meta); err != nil {
-			// Corrupt meta — remove both files.
-			base := strings.TrimSuffix(name, ".meta")
-			_ = os.Remove(metaPath)
-			_ = os.Remove(filepath.Join(c.dir, base+".dat"))
-			continue
-		}
-
-		datPath := filepath.Join(c.dir, strings.TrimSuffix(name, ".meta")+".dat")
+	result := make([]PendingEntry, 0, len(c.metas))
+	for path, meta := range c.metas {
+		datPath := c.datFile(path)
 		data, err := os.ReadFile(datPath)
 		if err != nil {
-			// Data file missing — remove orphaned meta.
-			_ = os.Remove(metaPath)
+			// Data file missing — remove orphaned metadata.
+			_ = os.Remove(c.metaFile(path))
+			delete(c.metas, path)
+			c.deleteDataLocked(path)
 			continue
 		}
 
-		result = append(result, PendingEntry{Meta: meta, Data: data})
+		c.cacheDataLocked(path, data, meta.Size)
+		result = append(result, PendingEntry{Meta: *meta, Data: data})
 	}
 	return result
 }
