@@ -104,7 +104,7 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 	// fragmentation for the common case.
 	// Do NOT use the fast path when lazy loading is configured (LoadPart != nil)
 	// because we may need to load existing remote data.
-	if wb.smallFileData != nil || (wb.partSize >= smallFileThreshold && len(wb.parts) == 0 && wb.LoadPart == nil && end <= smallFileThreshold) {
+	if wb.smallFileData != nil || (wb.partSize >= smallFileThreshold && len(wb.parts) == 0 && wb.LoadPart == nil && end <= smallFileThreshold && wb.totalSize <= smallFileThreshold) {
 		return wb.writeSmallFile(offset, data)
 	}
 
@@ -210,10 +210,14 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 	}
 
 	oldLen := len(wb.smallFileData)
+	needLen := end
+	if wb.totalSize > needLen {
+		needLen = wb.totalSize
+	}
 
 	// Ensure capacity (grow with headroom to reduce reallocations)
-	if int(end) > cap(wb.smallFileData) {
-		newCap := int(end)
+	if int(needLen) > cap(wb.smallFileData) {
+		newCap := int(needLen)
 		if newCap < 1024 {
 			newCap = 1024
 		}
@@ -226,9 +230,9 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 		}
 		grown := make([]byte, newCap)
 		copy(grown, wb.smallFileData)
-		wb.smallFileData = grown[:end]
-	} else if int(end) > len(wb.smallFileData) {
-		wb.smallFileData = wb.smallFileData[:end]
+		wb.smallFileData = grown[:needLen]
+	} else if int(needLen) > len(wb.smallFileData) {
+		wb.smallFileData = wb.smallFileData[:needLen]
 	}
 	if oldLen < len(wb.smallFileData) {
 		clear(wb.smallFileData[oldLen:])
@@ -395,9 +399,7 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 				} else {
 					oldLen := len(wb.smallFileData)
 					wb.smallFileData = wb.smallFileData[:size]
-					for i := oldLen; i < int(size); i++ {
-						wb.smallFileData[i] = 0
-					}
+					clear(wb.smallFileData[oldLen:])
 				}
 				wb.totalSize = size
 				wb.touched = true

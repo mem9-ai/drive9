@@ -409,6 +409,38 @@ func TestWriteBuffer_TruncateSmallFileSparseWriteZeroFillsGap(t *testing.T) {
 	}
 }
 
+func TestWriteBuffer_TruncateExtendThenSmallWritePreservesLogicalSize(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 8<<20)
+
+	if err := wb.Truncate(100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wb.Write(0, []byte("X")); err != nil {
+		t.Fatal(err)
+	}
+	if wb.Size() != 100 {
+		t.Fatalf("Size() = %d, want 100", wb.Size())
+	}
+
+	buf := make([]byte, 10)
+	n := wb.ReadAt(50, buf)
+	if n != 10 {
+		t.Fatalf("ReadAt returned %d, want 10", n)
+	}
+	for i, b := range buf {
+		if b != 0 {
+			t.Fatalf("buf[%d] = %d, want 0", i, b)
+		}
+	}
+
+	if err := wb.Truncate(50); err != nil {
+		t.Fatal(err)
+	}
+	if wb.Size() != 50 {
+		t.Fatalf("Size() after shrink = %d, want 50", wb.Size())
+	}
+}
+
 func TestWriteBuffer_EFBIG(t *testing.T) {
 	wb := NewWriteBuffer("/test", 100, 0)
 	_, err := wb.Write(0, make([]byte, 101))
