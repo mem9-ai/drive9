@@ -8,8 +8,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/mem9-ai/dat9/pkg/client"
 )
 
 func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
@@ -42,7 +40,7 @@ func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 	var successPath string
 	var successRev int64
 
-	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
 		successPath = entry.Path
 		successRev = committedRev
@@ -99,7 +97,7 @@ func TestCommitQueueConflictKeepsPendingState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/conflict.txt",
 		BaseRev: 3,
@@ -167,7 +165,7 @@ func TestCommitQueueCancelPathDoesNotPoisonFutureSamePath(t *testing.T) {
 
 	oldEntry := &CommitEntry{Path: path, Size: 3, Kind: PendingNew}
 	cq := &CommitQueue{
-		client:     client.New(ts.URL, ""),
+		client:     newTestClient(ts.URL),
 		shadows:    shadow,
 		index:      pending,
 		inFlight:   make(map[string]*CommitEntry),
@@ -248,7 +246,7 @@ func TestCommitQueueCancelPathCancelsRetryBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	defer cq.DrainAll()
 	if err := cq.Enqueue(&CommitEntry{Path: path, Size: 4, Kind: PendingNew}); err != nil {
 		t.Fatal(err)
@@ -319,7 +317,7 @@ func TestCommitQueueDirectPutRouting(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+		cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 		if err := cq.Enqueue(&CommitEntry{
 			Path:    "/small.bin",
 			BaseRev: 5,
@@ -393,7 +391,7 @@ func TestCommitQueueAutoResolveLWW(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/lww.txt",
 		BaseRev: 5,
@@ -460,7 +458,7 @@ func TestCommitQueueAutoResolveIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/idem.txt",
 		BaseRev: 5,
@@ -520,7 +518,7 @@ func TestCommitQueueAutoResolveLWWSecond409Fallback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/double409.txt",
 		BaseRev: 5,
@@ -570,7 +568,7 @@ func TestCommitQueueNonConflictErrorUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/500.txt",
 		BaseRev: 5,
@@ -620,7 +618,7 @@ func TestCommitQueueRecoverPendingSkipsLegacyOverwriteWithoutBaseRev(t *testing.
 		t.Fatal(err)
 	}
 
-	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	cq.RecoverPending()
 	cq.DrainAll()
 
@@ -670,7 +668,7 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	if err := cq.Enqueue(&CommitEntry{
 		Path:        "/big.bin",
 		BaseRev:     12,
@@ -723,7 +721,7 @@ func TestCommitQueueShadowSpillConflictTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	if err := cq.Enqueue(&CommitEntry{
 		Path:        "/big-conflict.bin",
 		BaseRev:     5,
@@ -813,7 +811,7 @@ func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
 
 	// RecoverPending should reconstruct CommitEntry with ShadowSpill=true,
 	// causing uploadEntry to use streaming (uploadFromShadow) not ReadAll.
-	cq := NewCommitQueue(client.New(ts.URL, ""), shadow2, pending2, nil, 1, 8)
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow2, pending2, nil, 1, 8)
 	cq.RecoverPending()
 	cq.DrainAll()
 

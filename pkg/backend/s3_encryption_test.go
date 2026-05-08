@@ -402,7 +402,7 @@ func TestReadPlanDoesNotUseEncryptionHeaders(t *testing.T) {
 	if _, _, err := b.WriteCtxIfRevisionWithTagsResult(
 		context.Background(),
 		"/read.bin",
-		bytes.Repeat([]byte("x"), smallFileThreshold),
+		bytes.Repeat([]byte("x"), int(DefaultInlineThreshold)),
 		0,
 		filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate,
 		-1,

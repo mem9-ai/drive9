@@ -108,6 +108,7 @@ func TestDownloadFileEmitsDownloadSummaryToCLILogForLargeFile(t *testing.T) {
 
 	localPath := filepath.Join(t.TempDir(), "large.bin")
 	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
 
 	if err := downloadFile(context.Background(), c, "/large.bin", localPath); err != nil {
 		t.Fatalf("downloadFile: %v", err)
@@ -159,6 +160,7 @@ func TestDownloadFileSkipsDownloadSummaryWhenCLILogDisabled(t *testing.T) {
 
 	localPath := filepath.Join(t.TempDir(), "small.txt")
 	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
 
 	if err := downloadFile(context.Background(), c, "/small.txt", localPath); err != nil {
 		t.Fatalf("downloadFile: %v", err)
@@ -217,6 +219,7 @@ func TestUploadFileEmitsUploadSummaryToCLILog(t *testing.T) {
 	}
 
 	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
 	if err := uploadFile(context.Background(), c, localPath, "/upload.txt", ""); err != nil {
 		t.Fatalf("uploadFile: %v", err)
 	}
@@ -328,6 +331,7 @@ func TestCpAppendUploadsToRemote(t *testing.T) {
 	defer srv.Close()
 
 	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
 	if err := Cp(c, []string{"--append", localPath, ":/dest.txt"}); err != nil {
 		t.Fatalf("Cp(--append): %v", err)
 	}
@@ -347,6 +351,7 @@ func TestCpAppendRejectsRemoteToLocal(t *testing.T) {
 	defer srv.Close()
 
 	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
 	err := Cp(c, []string{"--append", ":/src.txt", localPath})
 	if err == nil {
 		t.Fatal("expected error for remote -> local append")
@@ -363,6 +368,7 @@ func TestCpAppendRejectsRemoteToRemote(t *testing.T) {
 	defer srv.Close()
 
 	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
 	err := Cp(c, []string{"--append", ":/src.txt", ":/dst.txt"})
 	if err == nil {
 		t.Fatal("expected error for remote -> remote append")
@@ -379,6 +385,7 @@ func TestCpAppendRejectsStdinSource(t *testing.T) {
 	defer srv.Close()
 
 	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
 	err := Cp(c, []string{"--append", "-", ":/dst.txt"})
 	if err == nil {
 		t.Fatal("expected error for stdin append")
@@ -400,6 +407,7 @@ func TestCpAppendRejectsTags(t *testing.T) {
 	defer srv.Close()
 
 	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
 	err := Cp(c, []string{"--append", "--tag", "owner=alice", localPath, ":/dst.txt"})
 	if err == nil {
 		t.Fatal("expected error for append with tags")
@@ -435,6 +443,7 @@ func TestCpUploadWithTagsSendsHeaders(t *testing.T) {
 	defer srv.Close()
 
 	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
 	err := Cp(c, []string{"--tag", "topic=cat", "--tag=owner=alice", localPath, ":/tagged.txt"})
 	if err != nil {
 		t.Fatalf("Cp(upload with tags): %v", err)
@@ -459,6 +468,7 @@ func TestCpRejectsTagForDownloadDirection(t *testing.T) {
 	defer srv.Close()
 
 	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
 	err := Cp(c, []string{"--tag", "owner=alice", ":/src.txt", localPath})
 	if err == nil {
 		t.Fatal("expected direction validation error")

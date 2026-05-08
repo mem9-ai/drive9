@@ -21,9 +21,10 @@ type LoadPartFunc func(partNum int) ([]byte, error)
 // explicitly loaded are held in memory. This enables lazy preloading
 // (load parts on demand) and streaming uploads (notify when parts are full).
 //
-// For files that remain below smallFileThreshold, a fast path uses a single
-// contiguous allocation instead of the sparse part map, avoiding map lookups
-// and per-part allocations for the common case of editing small files.
+// For files that remain below the per-buffer smallFileMax, a fast path uses
+// a single contiguous allocation instead of the sparse part map, avoiding
+// map lookups and per-part allocations for the common case of editing small
+// files.
 //
 // It tracks which parts have been modified so that on flush,
 // only dirty parts need to be uploaded (unchanged parts are copied
@@ -34,9 +35,14 @@ type WriteBuffer struct {
 	totalSize  int64 // current logical file size
 	maxSize    int64
 	partSize   int64
-	parts      map[int][]byte // 0-based part index → part data
-	dirtyParts map[int]bool   // 0-based part index → dirty flag
-	touched    bool
+	// smallFileMax is the cutoff for the single-buffer fast path; equals the
+	// server-advertised inline_threshold when known, otherwise the local
+	// default. Stored per-buffer so per-mount values (server overrides,
+	// tests) work without a global.
+	smallFileMax int64
+	parts        map[int][]byte // 0-based part index → part data
+	dirtyParts   map[int]bool   // 0-based part index → dirty flag
+	touched      bool
 
 	// Callback (optional)
 	LoadPart LoadPartFunc // called to lazily load part data
@@ -72,6 +78,9 @@ type WriteBuffer struct {
 // NewWriteBuffer creates a new WriteBuffer for the given path.
 // If maxSize <= 0, defaultWriteBufferMaxSize (64MB) is used.
 // If partSize <= 0, DefaultPartSize (8MB) is used.
+// The small-file fast path uses defaultSmallFileThreshold; production callers
+// should immediately call SetSmallFileMax to track the server-advertised
+// inline_threshold. Tests rely on the default and need not call it.
 func NewWriteBuffer(path string, maxSize int64, partSize int64) *WriteBuffer {
 	if maxSize <= 0 {
 		maxSize = defaultWriteBufferMaxSize
@@ -80,12 +89,22 @@ func NewWriteBuffer(path string, maxSize int64, partSize int64) *WriteBuffer {
 		partSize = DefaultPartSize
 	}
 	return &WriteBuffer{
-		path:       path,
-		maxSize:    maxSize,
-		partSize:   partSize,
-		parts:      make(map[int][]byte),
-		dirtyParts: make(map[int]bool),
+		path:         path,
+		maxSize:      maxSize,
+		partSize:     partSize,
+		smallFileMax: defaultSmallFileThreshold,
+		parts:        make(map[int][]byte),
+		dirtyParts:   make(map[int]bool),
 	}
+}
+
+// SetSmallFileMax overrides the small-file fast-path cutoff. Must be called
+// before any Write/Truncate; ignored when threshold <= 0.
+func (wb *WriteBuffer) SetSmallFileMax(threshold int64) {
+	if threshold <= 0 {
+		return
+	}
+	wb.smallFileMax = threshold
 }
 
 // Write writes data at the given offset into the buffer.
@@ -104,7 +123,7 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 	// fragmentation for the common case.
 	// Do NOT use the fast path when lazy loading is configured (LoadPart != nil)
 	// because we may need to load existing remote data.
-	if wb.smallFileData != nil || (wb.partSize >= smallFileThreshold && len(wb.parts) == 0 && wb.LoadPart == nil && end <= smallFileThreshold && wb.totalSize <= smallFileThreshold) {
+	if wb.smallFileData != nil || (wb.partSize >= wb.smallFileMax && len(wb.parts) == 0 && wb.LoadPart == nil && end <= wb.smallFileMax && wb.totalSize <= wb.smallFileMax) {
 		return wb.writeSmallFile(offset, data)
 	}
 
@@ -203,7 +222,7 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 	if end > wb.maxSize {
 		return 0, syscall.EFBIG
 	}
-	if end > smallFileThreshold {
+	if end > wb.smallFileMax {
 		// Migrate to part mode and retry
 		wb.migrateToPartMode()
 		return wb.Write(offset, data)
@@ -225,8 +244,8 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 		if newCap < 2*cap(wb.smallFileData) {
 			newCap = 2 * cap(wb.smallFileData)
 		}
-		if newCap > smallFileThreshold {
-			newCap = smallFileThreshold
+		if int64(newCap) > wb.smallFileMax {
+			newCap = int(wb.smallFileMax)
 		}
 		grown := make([]byte, newCap)
 		copy(grown, wb.smallFileData)
@@ -387,7 +406,7 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 
 	case size > cur:
 		if wb.smallFileData != nil {
-			if size <= smallFileThreshold {
+			if size <= wb.smallFileMax {
 				if int(size) > cap(wb.smallFileData) {
 					newCap := int(size)
 					if newCap < 1024 {

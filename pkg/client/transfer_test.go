@@ -147,6 +147,7 @@ func TestWriteStreamSmallFile(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "")
+	c.smallFileThreshold = DefaultSmallFileThreshold
 	data := []byte("hello small")
 	err := c.WriteStream(context.Background(), "/small.txt", bytes.NewReader(data), int64(len(data)), nil)
 	if err != nil {
@@ -171,6 +172,7 @@ func TestWriteStreamWithSummarySmallFile(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "")
+	c.smallFileThreshold = DefaultSmallFileThreshold
 	data := []byte("summary me")
 	summary, err := c.WriteStreamWithSummary(context.Background(), "/small-summary.txt", bytes.NewReader(data), int64(len(data)), nil)
 	if err != nil {
@@ -218,6 +220,7 @@ func TestWriteStreamWithSummaryAndTagsSmallFileSetsTagHeaders(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "")
+	c.smallFileThreshold = DefaultSmallFileThreshold
 	data := []byte("hello")
 	_, err := c.WriteStreamWithSummaryAndTags(context.Background(), "/tagged-small.txt", bytes.NewReader(data), int64(len(data)), nil, map[string]string{
 		"topic": "cat",

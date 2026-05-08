@@ -22,8 +22,11 @@ const writeBackThreshold = 10 << 20 // 10MB
 
 // writeBackInMemoryDataThreshold is the maximum cached write-back payload size
 // retained in memory for hot reopen/read paths. Larger entries stay on disk
-// only to avoid turning write-back into a large in-memory file store.
-const writeBackInMemoryDataThreshold = smallFileThreshold
+// only to avoid turning write-back into a large in-memory file store. Tied
+// to the static defaultSmallFileThreshold rather than the server-advertised
+// inline_threshold so raising the latter doesn't silently expand FUSE's
+// per-mount RAM footprint.
+const writeBackInMemoryDataThreshold = defaultSmallFileThreshold
 
 // defaultWriteBackDataCacheMaxSize bounds the aggregate in-memory footprint of
 // small write-back payloads retained for hot reopen/read/uploader paths.

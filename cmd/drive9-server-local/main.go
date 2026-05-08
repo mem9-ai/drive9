@@ -578,6 +578,15 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 		return backend.Options{}, fmt.Errorf("DRIVE9_MAX_TENANT_STORAGE_BYTES must be a positive integer")
 	}
 
+	opts.InlineThreshold = envInt64("DRIVE9_INLINE_THRESHOLD", backend.DefaultInlineThreshold)
+	if opts.InlineThreshold <= 0 {
+		return backend.Options{}, fmt.Errorf("DRIVE9_INLINE_THRESHOLD must be a positive integer")
+	}
+	opts.TextExtractMaxBytes = envInt64("DRIVE9_TEXT_EXTRACT_MAX_BYTES", backend.DefaultTextExtractMaxBytes)
+	if opts.TextExtractMaxBytes <= 0 {
+		return backend.Options{}, fmt.Errorf("DRIVE9_TEXT_EXTRACT_MAX_BYTES must be a positive integer")
+	}
+
 	// Quota enforcement source: "tenant" (default) or "server" (central server DB).
 	switch qs := strings.ToLower(strings.TrimSpace(os.Getenv("DRIVE9_QUOTA_SOURCE"))); qs {
 	case "", "tenant":

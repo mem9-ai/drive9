@@ -94,8 +94,8 @@ func (o *MountOptions) setDefaults() {
 	if o.PrefetchMaxFiles <= 0 {
 		o.PrefetchMaxFiles = defaultReadDirPrefetchMaxFiles
 	}
-	if o.PrefetchMaxFileBytes <= 0 || o.PrefetchMaxFileBytes > smallFileThreshold {
-		o.PrefetchMaxFileBytes = smallFileThreshold
+	if o.PrefetchMaxFileBytes <= 0 || o.PrefetchMaxFileBytes > defaultSmallFileThreshold {
+		o.PrefetchMaxFileBytes = defaultSmallFileThreshold
 	}
 	if o.PrefetchMaxBytes <= 0 {
 		o.PrefetchMaxBytes = defaultReadDirPrefetchMaxBytes

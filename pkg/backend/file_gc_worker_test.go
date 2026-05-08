@@ -132,7 +132,7 @@ func TestFileGCTaskReleasesCentralQuotaBeforeBlobRetry(t *testing.T) {
 	b.s3 = &failingDeleteS3Client{S3Client: b.s3, err: deleteErr}
 
 	ctx := context.Background()
-	payload := bytes.Repeat([]byte("x"), smallFileThreshold)
+	payload := bytes.Repeat([]byte("x"), int(DefaultInlineThreshold))
 	if _, err := b.Write("/img.png", payload, 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatalf("create image: %v", err)
 	}

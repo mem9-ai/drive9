@@ -249,6 +249,7 @@ func main() {
 			VaultMasterKey:   vaultMasterKey,
 			S3Dir:            s3cfg.Dir,
 			MaxUploadBytes:   maxUploadBytes,
+			InlineThreshold:  backendOptions.InlineThreshold,
 			Logger:           srvLogger,
 			SemanticEmbedder: semanticEmbedder,
 			SemanticWorkers:  semanticWorkerOpts,
@@ -266,6 +267,7 @@ func main() {
 		VaultIssuerURL:   vaultIssuerURL(addr),
 		S3Dir:            s3cfg.Dir,
 		MaxUploadBytes:   maxUploadBytes,
+		InlineThreshold:  backendOptions.InlineThreshold,
 		Logger:           srvLogger,
 		SemanticEmbedder: semanticEmbedder,
 		SemanticWorkers:  semanticWorkerOpts,
@@ -477,6 +479,15 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	opts.MaxTenantStorageBytes = envInt64("DRIVE9_MAX_TENANT_STORAGE_BYTES", 50*(1<<30))
 	if opts.MaxTenantStorageBytes <= 0 {
 		return backend.Options{}, fmt.Errorf("DRIVE9_MAX_TENANT_STORAGE_BYTES must be a positive integer")
+	}
+
+	opts.InlineThreshold = envInt64("DRIVE9_INLINE_THRESHOLD", backend.DefaultInlineThreshold)
+	if opts.InlineThreshold <= 0 {
+		return backend.Options{}, fmt.Errorf("DRIVE9_INLINE_THRESHOLD must be a positive integer")
+	}
+	opts.TextExtractMaxBytes = envInt64("DRIVE9_TEXT_EXTRACT_MAX_BYTES", backend.DefaultTextExtractMaxBytes)
+	if opts.TextExtractMaxBytes <= 0 {
+		return backend.Options{}, fmt.Errorf("DRIVE9_TEXT_EXTRACT_MAX_BYTES must be a positive integer")
 	}
 
 	// Quota enforcement source: "tenant" (default, per-tenant DB) or "server" (central server DB).
