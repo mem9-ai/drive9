@@ -12,6 +12,12 @@ import (
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
+var (
+	benchmarkBytesSink []byte
+	benchmarkByteSink  byte
+	benchmarkIntSink   int
+)
+
 // ---------------------------------------------------------------------------
 // InodeToPath tests
 // ---------------------------------------------------------------------------
@@ -372,6 +378,66 @@ func TestWriteBuffer_Truncate(t *testing.T) {
 	}
 	if wb.Size() != 8 {
 		t.Fatalf("after extend: Size=%d", wb.Size())
+	}
+}
+
+func TestWriteBuffer_TruncateSmallFileSparseWriteZeroFillsGap(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 0)
+	_, _ = wb.Write(0, []byte("hello world"))
+
+	if err := wb.Truncate(5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wb.Write(10, []byte("X")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := wb.Bytes()
+	if len(got) != 11 {
+		t.Fatalf("Bytes() len = %d, want 11", len(got))
+	}
+	if string(got[:5]) != "hello" {
+		t.Fatalf("prefix = %q, want %q", got[:5], "hello")
+	}
+	for i := 5; i < 10; i++ {
+		if got[i] != 0 {
+			t.Fatalf("gap byte %d = %d, want 0", i, got[i])
+		}
+	}
+	if got[10] != 'X' {
+		t.Fatalf("tail byte = %q, want %q", got[10], byte('X'))
+	}
+}
+
+func TestWriteBuffer_TruncateExtendThenSmallWritePreservesLogicalSize(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 8<<20)
+
+	if err := wb.Truncate(100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wb.Write(0, []byte("X")); err != nil {
+		t.Fatal(err)
+	}
+	if wb.Size() != 100 {
+		t.Fatalf("Size() = %d, want 100", wb.Size())
+	}
+
+	buf := make([]byte, 10)
+	n := wb.ReadAt(50, buf)
+	if n != 10 {
+		t.Fatalf("ReadAt returned %d, want 10", n)
+	}
+	for i, b := range buf {
+		if b != 0 {
+			t.Fatalf("buf[%d] = %d, want 0", i, b)
+		}
+	}
+
+	if err := wb.Truncate(50); err != nil {
+		t.Fatal(err)
+	}
+	if wb.Size() != 50 {
+		t.Fatalf("Size() after shrink = %d, want 50", wb.Size())
 	}
 }
 
@@ -989,6 +1055,28 @@ func TestWriteBuffer_ReadAt_Basic(t *testing.T) {
 	}
 }
 
+func TestWriteBuffer_SmallFileFastPathRequiresSinglePart(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 10)
+	data := []byte("0123456789012345678901234")
+	if _, err := wb.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+
+	dirty := wb.DirtyPartNumbers()
+	if len(dirty) != 3 {
+		t.Fatalf("dirty parts = %v, want 3 parts", dirty)
+	}
+	if got := string(wb.PartData(1)); got != "0123456789" {
+		t.Fatalf("part 1 = %q, want %q", got, "0123456789")
+	}
+	if got := string(wb.PartData(2)); got != "0123456789" {
+		t.Fatalf("part 2 = %q, want %q", got, "0123456789")
+	}
+	if got := string(wb.PartData(3)); got != "01234" {
+		t.Fatalf("part 3 = %q, want %q", got, "01234")
+	}
+}
+
 func TestWriteBuffer_ReadAt_PartialRead(t *testing.T) {
 	wb := NewWriteBuffer("/test", 0, 10)
 	_, _ = wb.Write(0, []byte("hello world!padding!"))
@@ -1012,6 +1100,25 @@ func TestWriteBuffer_ReadAt_BeyondEnd(t *testing.T) {
 	n := wb.ReadAt(100, buf)
 	if n != 0 {
 		t.Fatalf("ReadAt beyond end returned %d, want 0", n)
+	}
+}
+
+func TestWriteBuffer_ReadAt_SmallFileClampsToLogicalSize(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 0)
+	if _, err := wb.Write(0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := []byte{'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x'}
+	n := wb.ReadAt(3, buf)
+	if n != 2 {
+		t.Fatalf("ReadAt returned %d, want 2", n)
+	}
+	if string(buf[:2]) != "lo" {
+		t.Fatalf("ReadAt data = %q, want %q", buf[:2], "lo")
+	}
+	if string(buf[2:]) != "xxxxxx" {
+		t.Fatalf("ReadAt wrote past logical end: got %q", buf[2:])
 	}
 }
 
@@ -2036,5 +2143,62 @@ func TestShadowSpill_WriteBackSeqStaysZero(t *testing.T) {
 	// fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq
 	if fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq {
 		t.Fatal("Fsync UploadSync condition must never be true for ShadowSpill handles")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Benchmarks
+// ---------------------------------------------------------------------------
+
+func BenchmarkWriteBuffer_SmallFile_WriteAndRead(b *testing.B) {
+	data := []byte("hello world, this is a small file content for testing!")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		wb := NewWriteBuffer("/test.txt", 0, 0)
+		_, _ = wb.Write(0, data)
+		_, _ = wb.Write(6, []byte("EARTH"))
+		benchmarkBytesSink = wb.Bytes()
+	}
+}
+
+func BenchmarkWriteBuffer_SmallFile_ReadAt(b *testing.B) {
+	data := make([]byte, 40*1024) // 40KB small file
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	wb := NewWriteBuffer("/test.txt", 0, 0)
+	_, _ = wb.Write(0, data)
+	buf := make([]byte, 4096)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		benchmarkIntSink = wb.ReadAt(int64(i%36)*1024, buf)
+		benchmarkByteSink ^= buf[0]
+	}
+}
+
+func BenchmarkWriteBuffer_SmallFile_Truncate(b *testing.B) {
+	data := make([]byte, 40*1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		wb := NewWriteBuffer("/test.txt", 0, 0)
+		_, _ = wb.Write(0, data)
+		_ = wb.Truncate(20 * 1024)
+		_ = wb.Truncate(40 * 1024)
+	}
+}
+
+func BenchmarkReadCache_GetPut(b *testing.B) {
+	rc := NewReadCache(128<<20, 30*time.Second)
+	data := make([]byte, 40*1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	rc.Put("/test.txt", data, 1)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		benchmarkBytesSink, _ = rc.Get("/test.txt", 1)
 	}
 }

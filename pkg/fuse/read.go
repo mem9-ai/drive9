@@ -8,22 +8,22 @@ import (
 )
 
 const (
-	defaultReadCacheMaxSize = 128 << 20          // 128MB
-	defaultReadCacheTTL     = 30 * time.Second   // 30s
-	smallFileThreshold      = 50_000             // 50,000 bytes — matches embedding model max input characters
+	defaultReadCacheMaxSize = 128 << 20        // 128MB
+	defaultReadCacheTTL     = 30 * time.Second // 30s
+	smallFileThreshold      = 50_000           // 50,000 bytes — matches embedding model max input characters
 )
 
 // cacheEntry holds a single cached file's data and metadata.
 type cacheEntry struct {
 	path     string
 	data     []byte
-	revision int64         // dat9 file revision for invalidation
+	revision int64 // dat9 file revision for invalidation
 	expires  time.Time
 	elem     *list.Element // position in LRU list
 }
 
 // ReadCache is a thread-safe LRU + TTL read cache for small files.
-// It only caches files whose size does not exceed smallFileThreshold (1MB).
+// It only caches files whose size does not exceed smallFileThreshold (50KB).
 // Entries are evicted when the total cached size exceeds maxSize or when
 // their TTL expires.
 type ReadCache struct {
@@ -82,10 +82,12 @@ func (rc *ReadCache) Get(path string, currentRevision int64) ([]byte, bool) {
 	// Cache hit — promote to front of LRU.
 	rc.order.MoveToFront(entry.elem)
 
-	// Return a copy so the caller cannot mutate cached data.
-	out := make([]byte, len(entry.data))
-	copy(out, entry.data)
-	return out, true
+	// Return the cached data directly. The caller (FUSE Read) treats this
+	// as read-only and copies it into the kernel response buffer via
+	// gofuse.ReadResultData, so the cached data is never mutated. If the
+	// entry is evicted after this returns, the slice remains valid because
+	// the returned slice still keeps the backing array reachable for the GC.
+	return entry.data, true
 }
 
 // Put stores data in the cache for the given path and revision. Only files
