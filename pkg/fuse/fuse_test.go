@@ -12,6 +12,12 @@ import (
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
+var (
+	benchmarkBytesSink []byte
+	benchmarkByteSink  byte
+	benchmarkIntSink   int
+)
+
 // ---------------------------------------------------------------------------
 // InodeToPath tests
 // ---------------------------------------------------------------------------
@@ -2100,7 +2106,7 @@ func BenchmarkWriteBuffer_SmallFile_WriteAndRead(b *testing.B) {
 		wb := NewWriteBuffer("/test.txt", 0, 0)
 		_, _ = wb.Write(0, data)
 		_, _ = wb.Write(6, []byte("EARTH"))
-		_ = wb.Bytes()
+		benchmarkBytesSink = wb.Bytes()
 	}
 }
 
@@ -2114,7 +2120,8 @@ func BenchmarkWriteBuffer_SmallFile_ReadAt(b *testing.B) {
 	buf := make([]byte, 4096)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = wb.ReadAt(int64(i%36)*1024, buf)
+		benchmarkIntSink = wb.ReadAt(int64(i%36)*1024, buf)
+		benchmarkByteSink ^= buf[0]
 	}
 }
 
@@ -2141,6 +2148,6 @@ func BenchmarkReadCache_GetPut(b *testing.B) {
 	rc.Put("/test.txt", data, 1)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = rc.Get("/test.txt", 1)
+		benchmarkBytesSink, _ = rc.Get("/test.txt", 1)
 	}
 }
