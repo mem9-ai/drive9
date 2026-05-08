@@ -39,23 +39,23 @@ Stored in the **`file_nodes`** table (directories only have `file_nodes` records
 ```sql
 ALTER TABLE file_nodes ADD COLUMN uid  INT  NOT NULL DEFAULT 0;
 ALTER TABLE file_nodes ADD COLUMN gid  INT  NOT NULL DEFAULT 0;
-ALTER TABLE file_nodes ADD COLUMN mode INT UNSIGNED NOT NULL DEFAULT 0644;
+ALTER TABLE file_nodes ADD COLUMN mode INT UNSIGNED NOT NULL DEFAULT 420;
 ```
 
 - `uid`: file owner (numeric ID)
 - `gid`: file group (numeric ID)
-- `mode`: file-type bits + permission bits (e.g. `0100644` for a regular file, `0040755` for a directory)
+- `mode`: **permission bits only** (low 12 bits: setuid/setgid/sticky + `rwxrwxrwx`). File-type bits (`S_IFREG`, `S_IFDIR`, etc.) are **not** stored here; instead, the code combines the stored permission bits with `S_IFREG` or `S_IFDIR` at read time based on the existing `is_directory` column.
 
-> Directories default to `0755`, files to `0644`. During migration of existing data, `mode` preserves the current hard-coded behavior.
+> `420` is the decimal value of octal `0644`. Directories default to `0755` (decimal `493`), files to `0644` (decimal `420`). During migration of existing data, `mode` preserves the current hard-coded behavior.
 
 ### 3.2 Default-Value Strategy (Backward Compatible)
 
-| Scenario | uid | gid | mode |
-|----------|-----|-----|------|
-| Existing data (post-migration) | `0` (root) or mount user | `0` | `0644` for files, `0755` for directories |
+| Scenario | uid | gid | mode (permission bits only) |
+|----------|-----|-----|-----------------------------|
+| Existing data (post-migration) | `0` (root) or mount user | `0` | `0644` (decimal `420`) for files, `0755` (decimal `493`) for directories |
 | New files (FUSE Create) | `fs.uid` (mount user) | `fs.gid` | `0666 & ~umask` (standard FUSE behavior) |
 | New directories (FUSE Mkdir) | `fs.uid` | `fs.gid` | `0777 & ~umask` |
-| New files (HTTP API/CLI) | `0` unless request carries `X-Dat9-Uid` header | `0` | `0644` |
+| New files (HTTP API/CLI) | `0` unless request carries `X-Dat9-Uid` header | `0` | `0644` (decimal `420`) |
 
 ## 4. Cross-Layer Changes
 
@@ -74,7 +74,7 @@ type FileNode struct {
     CreatedAt   time.Time
     UID         int64   // new
     GID         int64   // new
-    Mode        uint32  // new (includes S_IFMT + permission bits)
+    Mode        uint32  // new (permission bits only; S_IFMT is applied at read time via is_directory)
 }
 ```
 
@@ -99,7 +99,12 @@ func (b *Dat9Backend) Chown(path string, uid, gid uint32) error {
 }
 
 func (b *Dat9Backend) Stat(...) {
-    info.Mode = uint32(node.Mode)  // no longer hard-coded
+    // Combine stored permission bits with file-type bit from is_directory
+    if node.IsDirectory {
+        info.Mode = syscall.S_IFDIR | uint32(node.Mode)
+    } else {
+        info.Mode = syscall.S_IFREG | uint32(node.Mode)
+    }
     info.Uid = uint32(node.UID)    // FileInfo may need extension
     info.Gid = uint32(node.GID)
 }
@@ -117,7 +122,7 @@ func (b *Dat9Backend) Stat(...) {
 
 **New endpoints** (or reuse existing `POST /v1/fs/{path}` with an action query parameter):
 
-```
+```http
 POST /v1/fs/{path}?action=chmod
   Header: X-Dat9-Mode: <octal>
 
@@ -163,7 +168,12 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
     out.Size = uint64(entry.Size)
     out.Uid = uint32(entry.UID)
     out.Gid = uint32(entry.GID)
-    out.Mode = entry.Mode  // includes S_IFREG / S_IFDIR
+    // entry.Mode stores permission bits only; combine with file-type bit
+    if entry.IsDir {
+        out.Mode = syscall.S_IFDIR | entry.Mode
+    } else {
+        out.Mode = syscall.S_IFREG | entry.Mode
+    }
     // ...
 }
 ```
@@ -213,7 +223,7 @@ CREATE TABLE IF NOT EXISTS file_nodes (
     file_id      VARCHAR(64),
     uid          INT NOT NULL DEFAULT 0,
     gid          INT NOT NULL DEFAULT 0,
-    mode         INT UNSIGNED NOT NULL DEFAULT 0644,
+    mode         INT UNSIGNED NOT NULL DEFAULT 420,
     created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 );
 ```
