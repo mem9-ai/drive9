@@ -33,6 +33,7 @@ type MetaQuotaStore interface {
 	DeleteFileMeta(ctx context.Context, tenantID, fileID string) error
 	UpsertFileMetaTx(tx *sql.Tx, fm *FileMetaView) error
 	DeleteFileMetaTx(tx *sql.Tx, tenantID, fileID string) error
+	DeleteFileMetaIfExistsTx(tx *sql.Tx, tenantID, fileID string) (bool, error)
 
 	// Upload reservations
 	InsertUploadReservation(ctx context.Context, r *UploadReservationView) error
@@ -51,6 +52,7 @@ type MetaQuotaStore interface {
 	// Mutation log
 	InsertMutationLog(ctx context.Context, entry *MutationLogView) (int64, error)
 	ListPendingMutations(ctx context.Context, minAge time.Duration, limit int) ([]MutationLogView, error)
+	HasPendingFileMutation(ctx context.Context, tenantID, fileID string) (bool, error)
 	MarkMutationAppliedTx(tx *sql.Tx, id int64) error
 	IncrMutationRetry(ctx context.Context, id int64, maxRetries int) error
 

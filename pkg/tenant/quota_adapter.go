@@ -147,6 +147,10 @@ func (a *metaQuotaAdapter) DeleteFileMetaTx(tx *sql.Tx, tenantID, fileID string)
 	return a.s.DeleteFileMetaTx(tx, tenantID, fileID)
 }
 
+func (a *metaQuotaAdapter) DeleteFileMetaIfExistsTx(tx *sql.Tx, tenantID, fileID string) (bool, error) {
+	return a.s.DeleteFileMetaIfExistsTx(tx, tenantID, fileID)
+}
+
 func (a *metaQuotaAdapter) InsertUploadReservation(ctx context.Context, r *backend.UploadReservationView) error {
 	return a.s.InsertUploadReservation(ctx, &meta.UploadReservation{
 		TenantID:      r.TenantID,
@@ -246,6 +250,10 @@ func (a *metaQuotaAdapter) ListPendingMutations(ctx context.Context, minAge time
 		}
 	}
 	return views, nil
+}
+
+func (a *metaQuotaAdapter) HasPendingFileMutation(ctx context.Context, tenantID, fileID string) (bool, error) {
+	return a.s.HasPendingFileMutation(ctx, tenantID, fileID)
 }
 
 func (a *metaQuotaAdapter) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {

@@ -20,13 +20,14 @@ import (
 )
 
 var (
-	ErrNotFound            = errors.New("not found")
-	ErrUploadNotActive     = errors.New("upload is not in UPLOADING state")
-	ErrUploadExpired       = errors.New("upload has expired")
-	ErrPathConflict        = errors.New("path already exists")
-	ErrUploadConflict      = errors.New("active upload already exists for this path")
-	ErrIdempotencyConflict = errors.New("duplicate idempotency key")
-	ErrRevisionConflict    = errors.New("revision conflict")
+	ErrNotFound                = errors.New("not found")
+	ErrUploadNotActive         = errors.New("upload is not in UPLOADING state")
+	ErrUploadExpired           = errors.New("upload has expired")
+	ErrPathConflict            = errors.New("path already exists")
+	ErrUploadConflict          = errors.New("active upload already exists for this path")
+	ErrIdempotencyConflict     = errors.New("duplicate idempotency key")
+	ErrRevisionConflict        = errors.New("revision conflict")
+	ErrFileGCTaskLeaseMismatch = errors.New("file gc task lease mismatch")
 )
 
 type StorageType string
@@ -384,12 +385,18 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 				return nil, err
 			}
 			row := tx.QueryRow(`SELECT file_id, storage_type, storage_ref, storage_encryption_mode,
-				storage_encryption_key_id, content_blob, content_type,
-				size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
-				description, description_embedding_revision, created_at, confirmed_at, expires_at
+				storage_encryption_key_id, content_type, size_bytes, checksum_sha256,
+				revision, embedding_revision, status, source_id, created_at, confirmed_at, expires_at
 				FROM files WHERE file_id = ?`, dst.fileID.String)
-			f, err := scanFileWithBlob(row)
+			f, err := scanFileForGC(row)
 			if err != nil {
+				return nil, err
+			}
+			task, err := NewFileGCTaskFromFile(f, time.Now().UTC())
+			if err != nil {
+				return nil, err
+			}
+			if _, err := s.EnqueueFileGCTaskTx(tx, task); err != nil {
 				return nil, err
 			}
 			out = f
@@ -1076,12 +1083,18 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	}
 
 	row := tx.QueryRow(`SELECT file_id, storage_type, storage_ref, storage_encryption_mode,
-		storage_encryption_key_id, content_blob, content_type,
-		size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
-		description, description_embedding_revision, created_at, confirmed_at, expires_at
+		storage_encryption_key_id, content_type, size_bytes, checksum_sha256,
+		revision, embedding_revision, status, source_id, created_at, confirmed_at, expires_at
 		FROM files WHERE file_id = ?`, fileID.String)
-	f, err := scanFileWithBlob(row)
+	f, err := scanFileForGC(row)
 	if err != nil {
+		return nil, err
+	}
+	task, err := NewFileGCTaskFromFile(f, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.EnqueueFileGCTaskTx(tx, task); err != nil {
 		return nil, err
 	}
 
@@ -1139,12 +1152,18 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 			return nil, err
 		}
 		row := tx.QueryRow(`SELECT file_id, storage_type, storage_ref, storage_encryption_mode,
-			storage_encryption_key_id, content_blob, content_type,
-			size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
-			description, description_embedding_revision, created_at, confirmed_at, expires_at
+			storage_encryption_key_id, content_type, size_bytes, checksum_sha256,
+			revision, embedding_revision, status, source_id, created_at, confirmed_at, expires_at
 			FROM files WHERE file_id = ?`, fid)
-		f, err := scanFileWithBlob(row)
+		f, err := scanFileForGC(row)
 		if err != nil {
+			return nil, err
+		}
+		task, err := NewFileGCTaskFromFile(f, time.Now().UTC())
+		if err != nil {
+			return nil, err
+		}
+		if _, err := s.EnqueueFileGCTaskTx(tx, task); err != nil {
 			return nil, err
 		}
 		orphaned = append(orphaned, f)
@@ -1444,6 +1463,40 @@ func scanFileWithBlob(s scanner) (*File, error) {
 	if descriptionEmbeddingRevision.Valid {
 		rev := descriptionEmbeddingRevision.Int64
 		f.DescriptionEmbeddingRevision = &rev
+	}
+	f.CreatedAt = createdAt.UTC()
+	if confirmedAt.Valid {
+		t := confirmedAt.Time.UTC()
+		f.ConfirmedAt = &t
+	}
+	if expiresAt.Valid {
+		t := expiresAt.Time.UTC()
+		f.ExpiresAt = &t
+	}
+	return &f, nil
+}
+
+func scanFileForGC(s scanner) (*File, error) {
+	var f File
+	var contentType, checksum, sourceID sql.NullString
+	var embeddingRevision sql.NullInt64
+	var confirmedAt, expiresAt sql.NullTime
+	var createdAt time.Time
+	err := s.Scan(&f.FileID, &f.StorageType, &f.StorageRef, &f.StorageEncryptionMode,
+		&f.StorageEncryptionKeyID, &contentType, &f.SizeBytes, &checksum,
+		&f.Revision, &embeddingRevision, &f.Status, &sourceID, &createdAt, &confirmedAt, &expiresAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	f.ContentType = contentType.String
+	f.ChecksumSHA256 = checksum.String
+	f.SourceID = sourceID.String
+	if embeddingRevision.Valid {
+		rev := embeddingRevision.Int64
+		f.EmbeddingRevision = &rev
 	}
 	f.CreatedAt = createdAt.UTC()
 	if confirmedAt.Valid {

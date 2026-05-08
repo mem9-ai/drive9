@@ -26,6 +26,8 @@ type fileOverwriteMutationData struct {
 	NewIsMedia   bool   `json:"new_is_media"`
 }
 
+// fileDeleteMutationData is retained for replaying historical file_delete
+// mutation log entries. New file deletes are cleaned up through file_gc_tasks.
 type fileDeleteMutationData struct {
 	FileID    string `json:"file_id"`
 	SizeBytes int64  `json:"size_bytes"`
@@ -148,30 +150,6 @@ func (b *Dat9Backend) syncCentralFileOverwrite(ctx context.Context, fileID strin
 		}
 		if mediaDelta != 0 {
 			if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, mediaDelta); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
-func (b *Dat9Backend) syncCentralFileDelete(ctx context.Context, fileID string, sizeBytes int64, contentType string) {
-	isMedia := isQuotaMediaContentType(contentType)
-	b.applyLoggedQuotaMutation(ctx, "file_delete", fileDeleteMutationData{
-		FileID:    fileID,
-		SizeBytes: sizeBytes,
-		IsMedia:   isMedia,
-	}, func(tx *sql.Tx) error {
-		if err := b.metaStore.DeleteFileMetaTx(tx, b.tenantID, fileID); err != nil {
-			return err
-		}
-		if sizeBytes != 0 {
-			if err := b.metaStore.IncrStorageBytesTx(tx, b.tenantID, -sizeBytes); err != nil {
-				return err
-			}
-		}
-		if isMedia {
-			if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, -1); err != nil {
 				return err
 			}
 		}

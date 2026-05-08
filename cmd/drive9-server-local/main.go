@@ -261,6 +261,7 @@ func main() {
 		logLocalStartupStep(startupCtx, startupStart, stepStart, "wire_central_quota",
 			zap.String("meta_dsn", redactDSN(metaDSN)))
 	}
+	b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 
 	if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
 		Backend:          b,
