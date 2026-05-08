@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/meta"
 )
 
 type fakeMutationRecord struct {
@@ -178,7 +181,7 @@ func (f *fakeMetaQuotaStore) GetFileMeta(ctx context.Context, tenantID, fileID s
 	defer f.mu.Unlock()
 	fm, ok := f.fileMeta[metaKey(tenantID, fileID)]
 	if !ok {
-		return nil, errors.New("not found")
+		return nil, meta.ErrNotFound
 	}
 	cp := *fm
 	return &cp, nil
@@ -193,6 +196,17 @@ func (f *fakeMetaQuotaStore) DeleteFileMeta(ctx context.Context, tenantID, fileI
 
 func (f *fakeMetaQuotaStore) DeleteFileMetaTx(tx *sql.Tx, tenantID, fileID string) error {
 	return f.DeleteFileMeta(context.Background(), tenantID, fileID)
+}
+
+func (f *fakeMetaQuotaStore) DeleteFileMetaIfExistsTx(tx *sql.Tx, tenantID, fileID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := metaKey(tenantID, fileID)
+	if _, ok := f.fileMeta[key]; !ok {
+		return false, nil
+	}
+	delete(f.fileMeta, key)
+	return true, nil
 }
 
 func (f *fakeMetaQuotaStore) InsertUploadReservation(ctx context.Context, r *UploadReservationView) error {
@@ -321,6 +335,29 @@ func (f *fakeMetaQuotaStore) ListPendingMutations(ctx context.Context, minAge ti
 	return out, nil
 }
 
+func (f *fakeMetaQuotaStore) HasPendingFileMutation(ctx context.Context, tenantID, fileID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, m := range f.mutations {
+		if m.tenantID != tenantID || m.status != "pending" {
+			continue
+		}
+		if m.typ != "file_create" && m.typ != "file_overwrite" {
+			continue
+		}
+		var data struct {
+			FileID string `json:"file_id"`
+		}
+		if err := json.Unmarshal(m.data, &data); err != nil {
+			return false, err
+		}
+		if data.FileID == fileID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (f *fakeMetaQuotaStore) MarkMutationAppliedTx(tx *sql.Tx, id int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -440,18 +477,40 @@ func TestCentralQuotaFileMutationLifecycle(t *testing.T) {
 	if usage.StorageBytes != int64(len("much-longer-png-data")) || usage.MediaFileCount != 1 {
 		t.Fatalf("usage after overwrite = %+v", usage)
 	}
+	current, err := b.Store().Stat(context.Background(), "/img.png")
+	if err != nil {
+		t.Fatalf("stat overwrite: %v", err)
+	}
 
 	if err := b.Remove("/img.png"); err != nil {
 		t.Fatalf("remove image: %v", err)
 	}
 	usage, _ = fake.GetQuotaUsage(context.Background(), "tenant-a")
-	if usage.StorageBytes != 0 || usage.MediaFileCount != 0 {
-		t.Fatalf("usage after delete = %+v", usage)
+	if usage.StorageBytes != int64(len("much-longer-png-data")) || usage.MediaFileCount != 1 {
+		t.Fatalf("usage before gc = %+v", usage)
 	}
-	if _, err := fake.GetFileMeta(context.Background(), "tenant-a", nf.File.FileID); err == nil {
+	task, err := b.Store().GetFileGCTaskByFileID(context.Background(), current.File.FileID)
+	if err != nil {
+		t.Fatalf("get file gc task: %v", err)
+	}
+	if task.Status != datastore.FileGCTaskQueued {
+		t.Fatalf("gc task status = %s, want queued", task.Status)
+	}
+	processed, err := b.ProcessOneFileGCTask(context.Background())
+	if err != nil {
+		t.Fatalf("process file gc task: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected one file gc task to be processed")
+	}
+	usage, _ = fake.GetQuotaUsage(context.Background(), "tenant-a")
+	if usage.StorageBytes != 0 || usage.MediaFileCount != 0 {
+		t.Fatalf("usage after gc = %+v", usage)
+	}
+	if _, err := fake.GetFileMeta(context.Background(), "tenant-a", current.File.FileID); err == nil {
 		t.Fatal("file meta should be deleted")
 	}
-	if got := []string{fake.mutations[0].typ, fake.mutations[1].typ, fake.mutations[2].typ}; got[0] != "file_create" || got[1] != "file_overwrite" || got[2] != "file_delete" {
+	if got := []string{fake.mutations[0].typ, fake.mutations[1].typ}; got[0] != "file_create" || got[1] != "file_overwrite" {
 		t.Fatalf("mutation types = %v", got)
 	}
 	for _, m := range fake.mutations {

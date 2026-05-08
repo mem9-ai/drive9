@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -393,6 +394,23 @@ func (s *Store) DeleteFileMetaTx(tx *sql.Tx, tenantID, fileID string) error {
 	return err
 }
 
+// DeleteFileMetaIfExistsTx removes a file's metadata inside a transaction and
+// reports whether a row existed. Callers use the boolean to make delete-side
+// quota counter updates idempotent across task retries.
+func (s *Store) DeleteFileMetaIfExistsTx(tx *sql.Tx, tenantID, fileID string) (bool, error) {
+	res, err := tx.Exec(
+		`DELETE FROM tenant_file_meta WHERE tenant_id = ? AND file_id = ?`,
+		tenantID, fileID)
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rowsAffected > 0, nil
+}
+
 // --- Upload reservation operations ---
 
 // InsertUploadReservation creates a new active upload reservation.
@@ -643,6 +661,32 @@ func (s *Store) ListPendingMutations(ctx context.Context, minAge time.Duration, 
 		entries = append(entries, e)
 	}
 	return entries, rows.Err()
+}
+
+// HasPendingFileMutation reports whether an unapplied create/overwrite
+// mutation still exists for fileID. GC uses this to avoid acking central cleanup
+// before fail-open quota mutations have converged.
+func (s *Store) HasPendingFileMutation(ctx context.Context, tenantID, fileID string) (bool, error) {
+	start := time.Now()
+	var err error
+	defer observeMeta(ctx, "has_pending_file_mutation", start, &err)
+
+	var one int
+	err = s.db.QueryRowContext(ctx,
+		`SELECT 1
+		 FROM quota_mutation_log
+		 WHERE tenant_id = ?
+		   AND status = 'pending'
+		   AND mutation_type IN ('file_create', 'file_overwrite')
+		   AND JSON_UNQUOTE(JSON_EXTRACT(mutation_data, '$.file_id')) = ?
+		 LIMIT 1`, tenantID, fileID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // MarkMutationApplied marks a mutation log entry as applied within a transaction.

@@ -286,6 +286,7 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 
 // Close stops background workers owned by this backend instance.
 func (b *Dat9Backend) Close() {
+	b.stopFileGCWorker()
 	if b.imageExtractCancel == nil {
 		return
 	}

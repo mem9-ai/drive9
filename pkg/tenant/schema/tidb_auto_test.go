@@ -87,7 +87,7 @@ func TestTiDBSchemaSpecForModeIncludesCreateStatements(t *testing.T) {
 		createByTable[table.name] = table.createStatement
 	}
 
-	for _, tableName := range []string{"file_nodes", "file_tags", "files", "uploads", "semantic_tasks", "vault_deks", "vault_audit_log"} {
+	for _, tableName := range []string{"file_nodes", "file_tags", "files", "uploads", "semantic_tasks", "file_gc_tasks", "vault_deks", "vault_audit_log"} {
 		stmt := createByTable[tableName]
 		if stmt == "" {
 			t.Fatalf("missing create statement for %s", tableName)

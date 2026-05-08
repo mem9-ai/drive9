@@ -452,6 +452,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		p.wireQuotaStore(b, t.ID)
+		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 		return b, store, nil
 	}
 	if p.cfg.S3Dir != "" {
@@ -483,6 +484,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		p.wireQuotaStore(b, t.ID)
+		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 		return b, store, nil
 	}
 	backendCreateStart := time.Now()
@@ -503,6 +505,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		zap.Float64("create_backend_ms", backendCreateDurationMs),
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	p.wireQuotaStore(b, t.ID)
+	b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 	return b, store, nil
 }
 

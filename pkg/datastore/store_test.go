@@ -554,6 +554,9 @@ func TestDeleteWithRefCount(t *testing.T) {
 	if deleted != nil {
 		t.Error("expected nil (file should survive, refcount > 0)")
 	}
+	if _, err := s.GetFileGCTaskByFileID(context.Background(), "f1"); err != ErrNotFound {
+		t.Fatalf("expected no gc task while f1 still has refs, got %v", err)
+	}
 
 	deleted, err = s.DeleteFileWithRefCheck(context.Background(), "/b.txt")
 	if err != nil {
@@ -563,6 +566,13 @@ func TestDeleteWithRefCount(t *testing.T) {
 		t.Errorf("expected DELETED file record, got %+v", deleted)
 	}
 	requireEmbeddingRevision(t, deleted.EmbeddingRevision, 17)
+	task, err := s.GetFileGCTaskByFileID(context.Background(), "f1")
+	if err != nil {
+		t.Fatalf("get gc task: %v", err)
+	}
+	if task.Status != FileGCTaskQueued || task.StorageRef != "/blobs/f1" {
+		t.Fatalf("unexpected gc task: %+v", task)
+	}
 }
 
 func TestDeleteDirRecursive(t *testing.T) {
@@ -599,6 +609,16 @@ func TestDeleteDirRecursive(t *testing.T) {
 		t.Fatalf("expected 1 orphaned (f2), got %d", len(orphaned))
 	}
 	requireEmbeddingRevision(t, orphaned[0].EmbeddingRevision, 23)
+	if _, err := s.GetFileGCTaskByFileID(context.Background(), "f1"); err != ErrNotFound {
+		t.Fatalf("expected no gc task for shared f1, got %v", err)
+	}
+	task, err := s.GetFileGCTaskByFileID(context.Background(), "f2")
+	if err != nil {
+		t.Fatalf("get gc task: %v", err)
+	}
+	if task.Status != FileGCTaskQueued || task.StorageRef != "/blobs/f2" {
+		t.Fatalf("unexpected gc task: %+v", task)
+	}
 
 	_, err = s.GetNode(context.Background(), "/data/")
 	if err != ErrNotFound {
@@ -607,6 +627,139 @@ func TestDeleteDirRecursive(t *testing.T) {
 	_, err = s.GetNode(context.Background(), "/shared.txt")
 	if err != nil {
 		t.Error("expected /shared.txt to survive")
+	}
+}
+
+func TestFileGCTaskClaimAck(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	task := &FileGCTask{
+		TaskID:      "f1",
+		FileID:      "f1",
+		StorageType: StorageS3,
+		StorageRef:  "blobs/f1",
+		Status:      FileGCTaskQueued,
+		AvailableAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	inserted, err := s.EnqueueFileGCTaskTx(s.DB(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("expected first enqueue to insert")
+	}
+	inserted, err = s.EnqueueFileGCTaskTx(s.DB(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted {
+		t.Fatal("expected duplicate enqueue to be a no-op")
+	}
+
+	claimed, found, err := s.ClaimFileGCTask(ctx, now.Add(time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected queued task to be claimed")
+	}
+	if claimed.Status != FileGCTaskProcessing || claimed.AttemptCount != 1 || claimed.Receipt == "" {
+		t.Fatalf("claimed task = %+v", claimed)
+	}
+	if err := s.AckFileGCTask(ctx, claimed.TaskID, claimed.Receipt); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetFileGCTaskByFileID(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != FileGCTaskSucceeded || got.CompletedAt == nil {
+		t.Fatalf("acked task = %+v", got)
+	}
+	if err := s.AckFileGCTask(ctx, claimed.TaskID, claimed.Receipt); err != ErrFileGCTaskLeaseMismatch {
+		t.Fatalf("second ack err = %v, want %v", err, ErrFileGCTaskLeaseMismatch)
+	}
+}
+
+func TestFileGCTaskRetryDeadLettersAtMaxAttempts(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	task := &FileGCTask{
+		TaskID:      "f1",
+		FileID:      "f1",
+		StorageType: StorageS3,
+		StorageRef:  "blobs/f1",
+		Status:      FileGCTaskQueued,
+		MaxAttempts: 1,
+		AvailableAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if _, err := s.EnqueueFileGCTaskTx(s.DB(), task); err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := s.ClaimFileGCTask(ctx, now.Add(time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected queued task to be claimed")
+	}
+	if err := s.RetryFileGCTask(ctx, claimed.TaskID, claimed.Receipt, now.Add(time.Second), "delete failed"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetFileGCTaskByFileID(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != FileGCTaskDeadLettered || got.LastError != "delete failed" || got.CompletedAt == nil {
+		t.Fatalf("retried task = %+v", got)
+	}
+}
+
+func TestFileGCTaskDefaultRetriesWithoutDeadLetter(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	task := &FileGCTask{
+		TaskID:      "f1",
+		FileID:      "f1",
+		StorageType: StorageS3,
+		StorageRef:  "blobs/f1",
+		Status:      FileGCTaskQueued,
+		AvailableAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if _, err := s.EnqueueFileGCTaskTx(s.DB(), task); err != nil {
+		t.Fatal(err)
+	}
+
+	claimAt := now.Add(time.Second)
+	for i := 0; i < 3; i++ {
+		claimed, found, err := s.ClaimFileGCTask(ctx, claimAt, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !found {
+			t.Fatalf("attempt %d: expected task to be claimed", i+1)
+		}
+		retryAt := claimAt.Add(time.Second)
+		if err := s.RetryFileGCTask(ctx, claimed.TaskID, claimed.Receipt, retryAt, "still failing"); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.GetFileGCTaskByFileID(ctx, "f1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != FileGCTaskQueued || got.MaxAttempts != 0 || got.CompletedAt != nil {
+			t.Fatalf("attempt %d retry task = %+v", i+1, got)
+		}
+		claimAt = retryAt.Add(time.Second)
 	}
 }
 
@@ -703,6 +856,13 @@ func TestRenameFileReplacingTarget(t *testing.T) {
 	}
 	if tags != 0 {
 		t.Fatalf("replaced file tags = %d, want 0", tags)
+	}
+	task, err := s.GetFileGCTaskByFileID(ctx, "f2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != FileGCTaskQueued || task.StorageRef != "/blobs/f2" {
+		t.Fatalf("unexpected gc task for replaced file: %+v", task)
 	}
 }
 

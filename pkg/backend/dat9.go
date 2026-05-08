@@ -80,6 +80,8 @@ type Dat9Backend struct {
 	audioExtractMaxSize      int64
 	maxAudioExtractTextBytes int
 
+	fileGCWorker *FileGCWorker
+
 	// Monthly LLM cost budget (P1).
 	maxMonthlyLLMCostMillicents     int64
 	visionCostPerKTokenMillicents   int64
@@ -247,15 +249,8 @@ func (b *Dat9Backend) RemoveCtx(ctx context.Context, path string) (err error) {
 	if node.IsDirectory {
 		return b.store.DeleteEmptyDir(ctx, path)
 	}
-	deleted, err := b.store.DeleteFileWithRefCheck(ctx, path)
-	if err != nil {
-		return err
-	}
-	if deleted != nil {
-		b.syncCentralFileDelete(ctx, deleted.FileID, deleted.SizeBytes, deleted.ContentType)
-		b.deleteBlobCtx(ctx, deleted.StorageRef)
-	}
-	return nil
+	_, err = b.store.DeleteFileWithRefCheck(ctx, path)
+	return err
 }
 
 func (b *Dat9Backend) RemoveAll(path string) error {
@@ -273,15 +268,8 @@ func (b *Dat9Backend) RemoveAllCtx(ctx context.Context, path string) (err error)
 	if !node.IsDirectory {
 		return b.RemoveCtx(ctx, path)
 	}
-	orphaned, err := b.store.DeleteDirRecursive(ctx, path)
-	if err != nil {
-		return err
-	}
-	for _, f := range orphaned {
-		b.syncCentralFileDelete(ctx, f.FileID, f.SizeBytes, f.ContentType)
-		b.deleteBlobCtx(ctx, f.StorageRef)
-	}
-	return nil
+	_, err = b.store.DeleteDirRecursive(ctx, path)
+	return err
 }
 
 func (b *Dat9Backend) Read(path string, offset int64, size int64) ([]byte, error) {
@@ -959,15 +947,8 @@ func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (e
 	if err != nil {
 		return err
 	}
-	deleted, err := b.store.RenameFileReplacingTarget(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
-	if err != nil {
-		return err
-	}
-	if deleted != nil {
-		b.syncCentralFileDelete(ctx, deleted.FileID, deleted.SizeBytes, deleted.ContentType)
-		b.deleteBlobCtx(ctx, deleted.StorageRef)
-	}
-	return nil
+	_, err = b.store.RenameFileReplacingTarget(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
+	return err
 }
 
 func (b *Dat9Backend) Chmod(path string, mode uint32) error { return nil }
