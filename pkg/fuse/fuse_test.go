@@ -1103,6 +1103,25 @@ func TestWriteBuffer_ReadAt_BeyondEnd(t *testing.T) {
 	}
 }
 
+func TestWriteBuffer_ReadAt_SmallFileClampsToLogicalSize(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 0)
+	if _, err := wb.Write(0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := []byte{'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x'}
+	n := wb.ReadAt(3, buf)
+	if n != 2 {
+		t.Fatalf("ReadAt returned %d, want 2", n)
+	}
+	if string(buf[:2]) != "lo" {
+		t.Fatalf("ReadAt data = %q, want %q", buf[:2], "lo")
+	}
+	if string(buf[2:]) != "xxxxxx" {
+		t.Fatalf("ReadAt wrote past logical end: got %q", buf[2:])
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Prefetcher Close test
 // ---------------------------------------------------------------------------

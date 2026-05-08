@@ -84,7 +84,9 @@ func (rc *ReadCache) Get(path string, currentRevision int64) ([]byte, bool) {
 
 	// Return the cached data directly. The caller (FUSE Read) treats this
 	// as read-only and copies it into the kernel response buffer via
-	// gofuse.ReadResultData, so the cached data is never mutated.
+	// gofuse.ReadResultData, so the cached data is never mutated. If the
+	// entry is evicted after this returns, the slice remains valid because
+	// the returned slice still keeps the backing array reachable for the GC.
 	return entry.data, true
 }
 

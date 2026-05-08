@@ -269,11 +269,7 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *WriteBuffer, baseRev i
 
 	// Small-file fast path: if the buffer is using a contiguous allocation,
 	// write the entire content in one shot instead of iterating parts.
-	if wb.smallFileData != nil {
-		data := wb.smallFileData
-		if wb.totalSize < int64(len(data)) {
-			data = data[:wb.totalSize]
-		}
+	if data, ok := wb.smallFileBytes(); ok {
 		if len(data) > 0 {
 			n, err := sf.fd.WriteAt(data, 0)
 			if err != nil {

@@ -428,6 +428,19 @@ func (wb *WriteBuffer) PartSize() int64 {
 	return wb.partSize
 }
 
+// smallFileBytes returns a read-only view of the contiguous small-file buffer.
+// The returned slice is clamped to totalSize so callers do not depend on the
+// internal len(smallFileData) == totalSize invariant.
+func (wb *WriteBuffer) smallFileBytes() ([]byte, bool) {
+	if wb.smallFileData == nil {
+		return nil, false
+	}
+	if wb.totalSize < int64(len(wb.smallFileData)) {
+		return wb.smallFileData[:wb.totalSize], true
+	}
+	return wb.smallFileData, true
+}
+
 func (wb *WriteBuffer) HasDirtyParts() bool {
 	if wb.touched {
 		return true
@@ -447,9 +460,9 @@ func (wb *WriteBuffer) Bytes() []byte {
 	if wb.totalSize == 0 {
 		return nil
 	}
-	if wb.smallFileData != nil {
+	if data, ok := wb.smallFileBytes(); ok {
 		buf := make([]byte, wb.totalSize)
-		copy(buf, wb.smallFileData)
+		copy(buf, data)
 		return buf
 	}
 	buf := make([]byte, wb.totalSize)
@@ -501,7 +514,7 @@ func (wb *WriteBuffer) PartData(partNum int) []byte {
 		return nil
 	}
 
-	if wb.smallFileData != nil {
+	if data, ok := wb.smallFileBytes(); ok {
 		// Small-file mode: the entire file is logically part 1
 		if partNum != 1 {
 			return nil
@@ -510,13 +523,13 @@ func (wb *WriteBuffer) PartData(partNum int) []byte {
 		if end > wb.totalSize {
 			end = wb.totalSize
 		}
-		if int64(len(wb.smallFileData)) < end {
+		if int64(len(data)) < end {
 			extended := make([]byte, end)
-			copy(extended, wb.smallFileData)
+			copy(extended, data)
 			return extended
 		}
 		buf := make([]byte, end)
-		copy(buf, wb.smallFileData)
+		copy(buf, data)
 		return buf
 	}
 
@@ -562,8 +575,10 @@ func (wb *WriteBuffer) ReadAt(offset int64, buf []byte) int {
 		return 0
 	}
 
-	if wb.smallFileData != nil {
-		n := copy(buf, wb.smallFileData[offset:])
+	if data, ok := wb.smallFileBytes(); ok {
+		start := int(offset)
+		limit := start + total
+		n := copy(buf[:total], data[start:limit])
 		return n
 	}
 
