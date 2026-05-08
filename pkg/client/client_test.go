@@ -813,7 +813,7 @@ func TestSmallFileThresholdLookupFailureCachesZero(t *testing.T) {
 			http.Error(w, "boom", http.StatusInternalServerError)
 			return
 		}
-		w.Write([]byte(`{"inline_threshold":262144}`))
+		_, _ = w.Write([]byte(`{"inline_threshold":262144}`))
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -849,7 +849,7 @@ func TestCachedSmallFileThresholdDoesNotFetch(t *testing.T) {
 	hits := 0
 	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
 		hits++
-		w.Write([]byte(`{"inline_threshold":131072}`))
+		_, _ = w.Write([]byte(`{"inline_threshold":131072}`))
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -907,7 +907,7 @@ func TestSmallFileThresholdOverrideShortCircuits(t *testing.T) {
 	hits := 0
 	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
 		hits++
-		w.Write([]byte(`{"inline_threshold":999999}`))
+		_, _ = w.Write([]byte(`{"inline_threshold":999999}`))
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
