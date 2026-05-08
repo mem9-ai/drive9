@@ -201,8 +201,12 @@ func (w *MutationReplayWorker) applyMutation(tx *sql.Tx, entry MutationLogView) 
 		if err := json.Unmarshal(entry.MutationData, &data); err != nil {
 			return err
 		}
-		if err := w.store.DeleteFileMetaTx(tx, entry.TenantID, data.FileID); err != nil {
+		deleted, err := w.store.DeleteFileMetaIfExistsTx(tx, entry.TenantID, data.FileID)
+		if err != nil {
 			return err
+		}
+		if !deleted {
+			return nil
 		}
 		if data.SizeBytes != 0 {
 			if err := w.store.IncrStorageBytesTx(tx, entry.TenantID, -data.SizeBytes); err != nil {

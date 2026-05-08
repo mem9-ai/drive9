@@ -27,7 +27,9 @@ const (
 
 // FileGCTask records durable cleanup for an orphaned file identity. The task is
 // intentionally keyed by file_id/storage_ref rather than path so retries cannot
-// delete another actor's later recreate at the same path.
+// delete another actor's later recreate at the same path. It does not track old
+// blob refs produced by overwriting a still-live file_id; those need a separate
+// blob-ref GC path.
 type FileGCTask struct {
 	TaskID       string
 	FileID       string

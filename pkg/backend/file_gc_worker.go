@@ -34,14 +34,6 @@ type FileGCWorkerOptions struct {
 	RetryMax      time.Duration
 }
 
-type fileMetaConditionalDeleter interface {
-	DeleteFileMetaIfExistsTx(tx *sql.Tx, tenantID, fileID string) (bool, error)
-}
-
-type pendingFileMutationChecker interface {
-	HasPendingFileMutation(ctx context.Context, tenantID, fileID string) (bool, error)
-}
-
 // FileGCWorker processes file_gc_tasks for one tenant backend.
 type FileGCWorker struct {
 	backend *Dat9Backend
@@ -195,28 +187,6 @@ func (b *Dat9Backend) deleteCentralFileMetaForGCTask(ctx context.Context, task *
 	if err := b.checkNoPendingCentralFileMutation(ctx, task.FileID); err != nil {
 		return err
 	}
-	if deleter, ok := b.metaStore.(fileMetaConditionalDeleter); ok {
-		fm, err := b.metaStore.GetFileMeta(ctx, b.tenantID, task.FileID)
-		if err != nil {
-			if errors.Is(err, meta.ErrNotFound) || errors.Is(err, datastore.ErrNotFound) {
-				return nil
-			}
-			return err
-		}
-		return b.metaStore.InTx(ctx, func(tx *sql.Tx) error {
-			deleted, err := deleter.DeleteFileMetaIfExistsTx(tx, b.tenantID, task.FileID)
-			if err != nil {
-				return err
-			}
-			if !deleted {
-				return nil
-			}
-			return b.applyCentralFileDeleteCountersTx(tx, fm.SizeBytes, fm.IsMedia)
-		})
-	}
-
-	// Compatibility fallback for tests or older adapters. Production adapters
-	// implement DeleteFileMetaIfExistsTx so retries are identity-idempotent.
 	fm, err := b.metaStore.GetFileMeta(ctx, b.tenantID, task.FileID)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) || errors.Is(err, datastore.ErrNotFound) {
@@ -225,19 +195,19 @@ func (b *Dat9Backend) deleteCentralFileMetaForGCTask(ctx context.Context, task *
 		return err
 	}
 	return b.metaStore.InTx(ctx, func(tx *sql.Tx) error {
-		if err := b.metaStore.DeleteFileMetaTx(tx, b.tenantID, task.FileID); err != nil {
+		deleted, err := b.metaStore.DeleteFileMetaIfExistsTx(tx, b.tenantID, task.FileID)
+		if err != nil {
 			return err
+		}
+		if !deleted {
+			return nil
 		}
 		return b.applyCentralFileDeleteCountersTx(tx, fm.SizeBytes, fm.IsMedia)
 	})
 }
 
 func (b *Dat9Backend) checkNoPendingCentralFileMutation(ctx context.Context, fileID string) error {
-	checker, ok := b.metaStore.(pendingFileMutationChecker)
-	if !ok {
-		return nil
-	}
-	pending, err := checker.HasPendingFileMutation(ctx, b.tenantID, fileID)
+	pending, err := b.metaStore.HasPendingFileMutation(ctx, b.tenantID, fileID)
 	if err != nil {
 		return err
 	}
