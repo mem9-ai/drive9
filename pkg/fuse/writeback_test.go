@@ -169,6 +169,36 @@ func TestWriteBackCache_LargeDataNotCachedInMemory(t *testing.T) {
 	}
 }
 
+func TestWriteBackCache_GetViewPrunesMissingLargeData(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := "/large.bin"
+	data := make([]byte, writeBackInMemoryDataThreshold+1)
+	if err := cache.Put(path, data, int64(len(data)), PendingOverwrite); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(cache.datFile(path)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := cache.getView(path); ok {
+		t.Fatal("expected getView miss after data file removal")
+	}
+	if _, ok := cache.GetMeta(path); ok {
+		t.Fatal("expected missing data to prune in-memory meta")
+	}
+	if _, err := os.Stat(cache.metaFile(path)); !os.IsNotExist(err) {
+		t.Fatal("expected missing data to prune on-disk meta")
+	}
+	if paths := cache.ListPendingPaths(); len(paths) != 0 {
+		t.Fatalf("ListPendingPaths len = %d, want 0", len(paths))
+	}
+}
+
 func TestWriteBackCache_SmallDataCacheBudgetEvictsLRU(t *testing.T) {
 	dir := t.TempDir()
 	cache, err := NewWriteBackCache(dir)
@@ -264,6 +294,29 @@ func TestWriteBackCache_ListPending(t *testing.T) {
 	}
 	if string(byPath["/b.txt"].Data) != "bbb" {
 		t.Fatalf("b.txt data = %q, want %q", byPath["/b.txt"].Data, "bbb")
+	}
+}
+
+func TestWriteBackCache_ListPending_SkipsConflictEntries(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cache.Put("/ok.txt", []byte("ok"), 2, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.PutWithBaseRev("/conflict.txt", []byte("conflict"), 8, PendingConflict, 9); err != nil {
+		t.Fatal(err)
+	}
+
+	pending := cache.ListPending()
+	if len(pending) != 1 {
+		t.Fatalf("ListPending returned %d entries, want 1", len(pending))
+	}
+	if pending[0].Meta.Path != "/ok.txt" {
+		t.Fatalf("pending path = %q, want /ok.txt", pending[0].Meta.Path)
 	}
 }
 
@@ -1562,6 +1615,24 @@ func TestOpenWritable_OverwriteFromWriteBackCacheSkipsRemoteStat(t *testing.T) {
 	}
 	if fh.BaseRev != 11 {
 		t.Fatalf("BaseRev = %d, want 11", fh.BaseRev)
+	}
+	if fh.WriteBackSeq == 0 || fh.WriteBackSeq != fh.DirtySeq {
+		t.Fatalf("WriteBackSeq = %d, DirtySeq = %d, want matching non-zero snapshot seq", fh.WriteBackSeq, fh.DirtySeq)
+	}
+
+	buf := make([]byte, 32)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       openOut.Fh,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read: %v", st)
+	}
+	got, _ := result.Bytes(buf)
+	if string(got) != "fresh data" {
+		t.Fatalf("Read = %q, want %q", string(got), "fresh data")
 	}
 	if got := headCalls.Load(); got != 0 {
 		t.Fatalf("HEAD calls = %d, want 0", got)

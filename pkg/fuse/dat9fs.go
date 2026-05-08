@@ -657,6 +657,7 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 		fs.inodes.UpdateRevision(fh.Ino, meta.BaseRev)
 	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, int64(len(data)))
+	fh.WriteBackSeq = fh.DirtySeq
 	return true
 }
 
@@ -2954,6 +2955,12 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		end := offset + int64(input.Size)
 		if end > size {
 			end = size
+		}
+		if end <= offset {
+			fh.Unlock()
+			source = "dirty-clean-empty"
+			bytesRead = 0
+			return gofuse.ReadResultData(nil), gofuse.OK
 		}
 		ps := fh.Dirty.PartSize()
 		firstPart := int(offset / ps)

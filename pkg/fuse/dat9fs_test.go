@@ -406,6 +406,68 @@ func TestOpenWritableSmallFileUsesReadCacheFastPath(t *testing.T) {
 	}
 }
 
+func TestReadZeroLengthFromWritableCleanBuffer(t *testing.T) {
+	var headCalls atomic.Int32
+	var getCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			headCalls.Add(1)
+			w.Header().Set("Content-Length", "10")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			getCalls.Add(1)
+			_, _ = w.Write([]byte("stale-data"))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	const cachedRev = 7
+	cached := []byte("fresh-data")
+	ino := fs.inodes.Lookup("/file.txt", false, int64(len(cached)), time.Now())
+	fs.inodes.UpdateRevision(ino, cachedRev)
+	fs.readCache.Put("/file.txt", cached, cachedRev)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDWR),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	buf := make([]byte, 8)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Offset:   4,
+		Size:     0,
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	data, _ := result.Bytes(buf)
+	if len(data) != 0 {
+		t.Fatalf("Read len = %d, want 0", len(data))
+	}
+	if got := headCalls.Load(); got != 0 {
+		t.Fatalf("HEAD calls = %d, want 0", got)
+	}
+	if got := getCalls.Load(); got != 0 {
+		t.Fatalf("GET calls = %d, want 0", got)
+	}
+}
+
 func TestCreateWriteThroughShadow(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)

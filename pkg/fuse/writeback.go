@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -205,6 +206,15 @@ func (c *WriteBackCache) Get(remotePath string) ([]byte, bool) {
 	return copyData, true
 }
 
+func (c *WriteBackCache) pruneEntryLocked(remotePath string, removeDataFile bool) {
+	if removeDataFile {
+		_ = os.Remove(c.datFile(remotePath))
+	}
+	_ = os.Remove(c.metaFile(remotePath))
+	delete(c.metas, remotePath)
+	c.deleteDataLocked(remotePath)
+}
+
 // getViewLocked returns a read-only payload view for remotePath.
 // The caller must hold c.mu and must not mutate the returned slice.
 func (c *WriteBackCache) getViewLocked(remotePath string) ([]byte, bool) {
@@ -218,6 +228,9 @@ func (c *WriteBackCache) getViewLocked(remotePath string) ([]byte, bool) {
 	}
 	data, err := os.ReadFile(c.datFile(remotePath))
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			c.pruneEntryLocked(remotePath, false)
+		}
 		return nil, false
 	}
 	c.cacheDataLocked(remotePath, data, meta.Size)
@@ -296,10 +309,7 @@ func (c *WriteBackCache) Remove(remotePath string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	_ = os.Remove(c.datFile(remotePath))
-	_ = os.Remove(c.metaFile(remotePath))
-	delete(c.metas, remotePath)
-	c.deleteDataLocked(remotePath)
+	c.pruneEntryLocked(remotePath, true)
 }
 
 // RenamePending atomically moves a pending cache entry from oldPath to newPath.
@@ -428,13 +438,14 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 
 	result := make([]PendingEntry, 0, len(c.metas))
 	for path, meta := range c.metas {
+		if meta.Kind == PendingConflict {
+			continue
+		}
 		datPath := c.datFile(path)
 		data, err := os.ReadFile(datPath)
 		if err != nil {
 			// Data file missing — remove orphaned metadata.
-			_ = os.Remove(c.metaFile(path))
-			delete(c.metas, path)
-			c.deleteDataLocked(path)
+			c.pruneEntryLocked(path, false)
 			continue
 		}
 
