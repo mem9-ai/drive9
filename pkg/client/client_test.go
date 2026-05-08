@@ -976,13 +976,12 @@ func TestUploadThresholdHonoursLoweredServerThreshold(t *testing.T) {
 	// must take the multipart path. We use the WriteStream entry point
 	// since direct PUT for small files is the path under test.
 	body := bytes.NewReader(make([]byte, fileSize))
-	_, err := c.writeStreamConditionalWithSummary(context.Background(), "/test.bin", body, fileSize, nil, -1, nil, "")
-	// Expected: initiate, then presign/parts/complete that aren't routed
-	// in this minimal fake — call returns error past initiate. We only
-	// assert routing went through initiate and not direct PUT.
-	if err == nil {
-		// fine — not all paths in the fake are wired, but we don't care
-	}
+	// The fake server only wires initiate and direct PUT — presign /
+	// parts / complete intentionally aren't implemented because we only
+	// need to observe routing. The call is therefore expected to fail
+	// past initiate; what matters is which endpoint the client hit
+	// before failing. The unused-error discard is deliberate.
+	_, _ = c.writeStreamConditionalWithSummary(context.Background(), "/test.bin", body, fileSize, nil, -1, nil, "")
 	if directPUTs > 0 {
 		t.Fatalf("client issued %d direct PUTs for %dB above %dB threshold; multipart was required", directPUTs, fileSize, serverThreshold)
 	}
