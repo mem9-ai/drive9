@@ -87,6 +87,155 @@ func TestWriteBackCache_PutWithBaseRevPersistsRevision(t *testing.T) {
 	}
 }
 
+func TestWriteBackCache_GetMetaUsesInMemoryIndex(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := "/existing.txt"
+	if err := cache.PutWithBaseRev(path, []byte("hello"), 5, PendingOverwrite, 17); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Remove(cache.metaFile(path)); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, ok := cache.GetMeta(path)
+	if !ok {
+		t.Fatal("expected GetMeta to return true from memory index")
+	}
+	if meta.BaseRev != 17 {
+		t.Fatalf("meta.BaseRev = %d, want 17", meta.BaseRev)
+	}
+	if meta.Kind != PendingOverwrite {
+		t.Fatalf("meta.Kind = %v, want %v", meta.Kind, PendingOverwrite)
+	}
+}
+
+func TestWriteBackCache_GetUsesInMemorySmallDataCache(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := "/small.txt"
+	data := []byte("hello")
+	if err := cache.Put(path, data, int64(len(data)), PendingNew); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Remove(cache.datFile(path)); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok := cache.Get(path)
+	if !ok {
+		t.Fatal("expected Get to return true from small data cache")
+	}
+	if string(got) != string(data) {
+		t.Fatalf("Get = %q, want %q", got, data)
+	}
+	view, ok := cache.getView(path)
+	if !ok {
+		t.Fatal("expected getView to return true from small data cache")
+	}
+	if string(view) != string(data) {
+		t.Fatalf("getView = %q, want %q", view, data)
+	}
+}
+
+func TestWriteBackCache_LargeDataNotCachedInMemory(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := "/large.bin"
+	data := make([]byte, writeBackInMemoryDataThreshold+1)
+	if err := cache.Put(path, data, int64(len(data)), PendingNew); err != nil {
+		t.Fatal(err)
+	}
+
+	cache.mu.Lock()
+	_, ok := cache.data[path]
+	cache.mu.Unlock()
+	if ok {
+		t.Fatal("large payload should not be retained in memory cache")
+	}
+}
+
+func TestWriteBackCache_GetViewPrunesMissingLargeData(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := "/large.bin"
+	data := make([]byte, writeBackInMemoryDataThreshold+1)
+	if err := cache.Put(path, data, int64(len(data)), PendingOverwrite); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(cache.datFile(path)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := cache.getView(path); ok {
+		t.Fatal("expected getView miss after data file removal")
+	}
+	if _, ok := cache.GetMeta(path); ok {
+		t.Fatal("expected missing data to prune in-memory meta")
+	}
+	if _, err := os.Stat(cache.metaFile(path)); !os.IsNotExist(err) {
+		t.Fatal("expected missing data to prune on-disk meta")
+	}
+	if paths := cache.ListPendingPaths(); len(paths) != 0 {
+		t.Fatalf("ListPendingPaths len = %d, want 0", len(paths))
+	}
+}
+
+func TestWriteBackCache_SmallDataCacheBudgetEvictsLRU(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.dataMaxBytes = 10
+
+	if err := cache.Put("/a.txt", []byte("aaaaa"), 5, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Put("/b.txt", []byte("bbbbb"), 5, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cache.getView("/a.txt"); !ok {
+		t.Fatal("expected /a.txt to be cached")
+	}
+	if err := cache.Put("/c.txt", []byte("ccccc"), 5, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if cache.dataBytes > cache.dataMaxBytes {
+		t.Fatalf("dataBytes = %d, want <= %d", cache.dataBytes, cache.dataMaxBytes)
+	}
+	if _, ok := cache.data["/a.txt"]; !ok {
+		t.Fatal("expected /a.txt to remain cached as most-recent entry")
+	}
+	if _, ok := cache.data["/c.txt"]; !ok {
+		t.Fatal("expected /c.txt to remain cached as newest entry")
+	}
+	if _, ok := cache.data["/b.txt"]; ok {
+		t.Fatal("expected /b.txt to be evicted by LRU budget")
+	}
+}
+
 func TestWriteBackCache_AtomicWrite(t *testing.T) {
 	dir := t.TempDir()
 	cache, err := NewWriteBackCache(dir)
@@ -148,6 +297,29 @@ func TestWriteBackCache_ListPending(t *testing.T) {
 	}
 }
 
+func TestWriteBackCache_ListPending_SkipsConflictEntries(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cache.Put("/ok.txt", []byte("ok"), 2, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.PutWithBaseRev("/conflict.txt", []byte("conflict"), 8, PendingConflict, 9); err != nil {
+		t.Fatal(err)
+	}
+
+	pending := cache.ListPending()
+	if len(pending) != 1 {
+		t.Fatalf("ListPending returned %d entries, want 1", len(pending))
+	}
+	if pending[0].Meta.Path != "/ok.txt" {
+		t.Fatalf("pending path = %q, want /ok.txt", pending[0].Meta.Path)
+	}
+}
+
 func TestWriteBackCache_ListPending_CorruptMeta(t *testing.T) {
 	dir := t.TempDir()
 	cache, err := NewWriteBackCache(dir)
@@ -177,6 +349,91 @@ func TestWriteBackCache_ListPending_CorruptMeta(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, hash+".dat")); !os.IsNotExist(err) {
 		t.Fatal("corrupt .dat should be removed")
+	}
+}
+
+func TestNewWriteBackCache_PrunesMismatchedMetaPath(t *testing.T) {
+	dir := t.TempDir()
+
+	wrongPath := "/wrong.txt"
+	scannedPath := "/actual.txt"
+	scannedHash := hashPath(scannedPath)
+	meta := WriteBackMeta{
+		Path:       wrongPath,
+		Size:       4,
+		Mtime:      time.Now(),
+		CreatedAt:  time.Now(),
+		Generation: 3,
+		Kind:       PendingNew,
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, scannedHash+".meta"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, scannedHash+".dat"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths := cache.ListPendingPaths(); len(paths) != 0 {
+		t.Fatalf("ListPendingPaths len = %d, want 0", len(paths))
+	}
+	if _, err := os.Stat(filepath.Join(dir, scannedHash+".meta")); !os.IsNotExist(err) {
+		t.Fatal("mismatched .meta should be removed during cache load")
+	}
+	if _, err := os.Stat(filepath.Join(dir, scannedHash+".dat")); !os.IsNotExist(err) {
+		t.Fatal("mismatched .dat should be removed during cache load")
+	}
+}
+
+func TestWriteBackCache_ListPending_PrunesEmptyMetaPath(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hash := hashPath("/scanned.txt")
+	meta := WriteBackMeta{
+		Path:       "",
+		Size:       4,
+		Mtime:      time.Now(),
+		CreatedAt:  time.Now(),
+		Generation: 2,
+		Kind:       PendingNew,
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, hash+".meta"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, hash+".dat"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Put("/valid.txt", []byte("ok"), 2, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+
+	pending := cache.ListPending()
+	if len(pending) != 1 {
+		t.Fatalf("ListPending returned %d entries, want 1", len(pending))
+	}
+	if pending[0].Meta.Path != "/valid.txt" {
+		t.Fatalf("pending path = %q, want /valid.txt", pending[0].Meta.Path)
+	}
+	if _, err := os.Stat(filepath.Join(dir, hash+".meta")); !os.IsNotExist(err) {
+		t.Fatal("empty-path .meta should be removed during reconciliation")
+	}
+	if _, err := os.Stat(filepath.Join(dir, hash+".dat")); !os.IsNotExist(err) {
+		t.Fatal("empty-path .dat should be removed during reconciliation")
 	}
 }
 
@@ -1309,15 +1566,20 @@ func TestLookupFindsPendingWriteBack(t *testing.T) {
 // TestOpenWritable_PreloadsFromWriteBackCache verifies that opening a file
 // for writing preloads data from the write-back cache instead of the remote.
 func TestOpenWritable_PreloadsFromWriteBackCache(t *testing.T) {
+	var headCalls atomic.Int32
+	var getCalls atomic.Int32
+
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodHead:
+			headCalls.Add(1)
 			// Return stale data size from "server"
 			w.Header().Set("Content-Length", "5")
 			w.Header().Set("X-Dat9-IsDir", "false")
 			w.Header().Set("X-Dat9-Revision", "1")
 			w.WriteHeader(http.StatusOK)
 		case http.MethodGet:
+			getCalls.Add(1)
 			if r.URL.RawQuery == "list=1" {
 				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
 				return
@@ -1372,6 +1634,96 @@ func TestOpenWritable_PreloadsFromWriteBackCache(t *testing.T) {
 	data, _ := result.Bytes(buf)
 	if string(data) != "fresh data" {
 		t.Fatalf("Read = %q, want %q (writable preload used stale data)", string(data), "fresh data")
+	}
+	if got := headCalls.Load(); got != 0 {
+		t.Fatalf("HEAD calls = %d, want 0", got)
+	}
+	if got := getCalls.Load(); got != 0 {
+		t.Fatalf("GET calls = %d, want 0", got)
+	}
+
+	uploader.DrainAll()
+}
+
+func TestOpenWritable_OverwriteFromWriteBackCacheSkipsRemoteStat(t *testing.T) {
+	var headCalls atomic.Int32
+	var getCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			headCalls.Add(1)
+			w.Header().Set("Content-Length", "5")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			getCalls.Add(1)
+			_, _ = w.Write([]byte("stale"))
+		case http.MethodPut:
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := client.New(ts.URL, "")
+	uploader := NewWriteBackUploader(c, cache, 0)
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.SetWriteBack(cache, uploader)
+
+	if err := cache.PutWithBaseRev("/file.txt", []byte("fresh data"), 10, PendingOverwrite, 11); err != nil {
+		t.Fatal(err)
+	}
+
+	ino := fs.inodes.Lookup("/file.txt", false, 10, time.Time{})
+
+	var openOut gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(os.O_RDWR),
+	}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open: %v", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("expected file handle to exist")
+	}
+	if fh.BaseRev != 11 {
+		t.Fatalf("BaseRev = %d, want 11", fh.BaseRev)
+	}
+	if fh.WriteBackSeq == 0 || fh.WriteBackSeq != fh.DirtySeq {
+		t.Fatalf("WriteBackSeq = %d, DirtySeq = %d, want matching non-zero snapshot seq", fh.WriteBackSeq, fh.DirtySeq)
+	}
+
+	buf := make([]byte, 32)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       openOut.Fh,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read: %v", st)
+	}
+	got, _ := result.Bytes(buf)
+	if string(got) != "fresh data" {
+		t.Fatalf("Read = %q, want %q", string(got), "fresh data")
+	}
+	if got := headCalls.Load(); got != 0 {
+		t.Fatalf("HEAD calls = %d, want 0", got)
+	}
+	if got := getCalls.Load(); got != 0 {
+		t.Fatalf("GET calls = %d, want 0", got)
 	}
 
 	uploader.DrainAll()
@@ -1501,6 +1853,37 @@ func TestWriteBackCache_Generation(t *testing.T) {
 
 	if meta2.Generation <= meta1.Generation {
 		t.Fatalf("generation did not increase: %d <= %d", meta2.Generation, meta1.Generation)
+	}
+}
+
+func TestWriteBackCache_ReopenPreservesGenerationCounter(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cache.Put("/gen.txt", []byte("v1"), 2, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	meta1, ok := cache.GetMeta("/gen.txt")
+	if !ok {
+		t.Fatal("expected meta after first Put")
+	}
+
+	cache2, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache2.Put("/gen.txt", []byte("v2"), 2, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	meta2, ok := cache2.GetMeta("/gen.txt")
+	if !ok {
+		t.Fatal("expected meta after reopened Put")
+	}
+	if meta2.Generation <= meta1.Generation {
+		t.Fatalf("generation did not increase after reopen: %d <= %d", meta2.Generation, meta1.Generation)
 	}
 }
 

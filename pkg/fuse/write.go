@@ -441,6 +441,20 @@ func (wb *WriteBuffer) smallFileBytes() ([]byte, bool) {
 	return wb.smallFileData, true
 }
 
+// bytesView returns a read-only view of the current buffer contents.
+// For small-file mode this avoids materializing a second full copy.
+// Callers must treat the returned slice as immutable and hold the file-handle
+// lock while using it.
+func (wb *WriteBuffer) bytesView() []byte {
+	if wb.totalSize == 0 {
+		return nil
+	}
+	if data, ok := wb.smallFileBytes(); ok {
+		return data
+	}
+	return wb.Bytes()
+}
+
 func (wb *WriteBuffer) HasDirtyParts() bool {
 	if wb.touched {
 		return true
@@ -604,23 +618,17 @@ func (wb *WriteBuffer) ReadAt(offset int64, buf []byte) int {
 				if partOff < int64(len(part)) {
 					n := copy(buf[copied:], part[partOff:])
 					// Zero-fill the rest
-					for i := copied + n; i < copied+int(canRead); i++ {
-						buf[i] = 0
-					}
+					clear(buf[copied+n : copied+int(canRead)])
 				} else {
 					// Entirely beyond the part — zero-fill
-					for i := copied; i < copied+int(canRead); i++ {
-						buf[i] = 0
-					}
+					clear(buf[copied : copied+int(canRead)])
 				}
 			} else {
 				copy(buf[copied:], part[partOff:partEnd])
 			}
 		} else {
 			// Part not loaded — zero-fill
-			for i := copied; i < copied+int(canRead); i++ {
-				buf[i] = 0
-			}
+			clear(buf[copied : copied+int(canRead)])
 		}
 
 		pos += canRead
