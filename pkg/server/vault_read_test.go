@@ -202,7 +202,7 @@ func readServerMetrics(t *testing.T, srv *Server) string {
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	resp := rec.Result()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("metrics status=%d body=%s", resp.StatusCode, body)
