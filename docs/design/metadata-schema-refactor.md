@@ -445,10 +445,16 @@ FROM files WHERE status != 'DELETED';
 -- INSERT INTO semantic (...) SELECT ... FROM files WHERE status != 'DELETED'
 --   ON CONFLICT (inode_id) DO NOTHING;
 
--- 3. Create directory inode records
-INSERT INTO inodes (inode_id, size_bytes, revision, mode, status, created_at, confirmed_at)
+-- 3. Create directory inode records (idempotent)
+-- TiDB / MySQL:
+INSERT IGNORE INTO inodes (inode_id, size_bytes, revision, mode, status, created_at, confirmed_at)
 SELECT node_id, 0, 1, 493, 'CONFIRMED', created_at, created_at
 FROM file_nodes WHERE is_directory = 1;
+-- db9 / PostgreSQL:
+-- INSERT INTO inodes (inode_id, size_bytes, revision, mode, status, created_at, confirmed_at)
+-- SELECT node_id, 0, 1, 493, 'CONFIRMED', created_at, created_at
+-- FROM file_nodes WHERE is_directory = 1
+-- ON CONFLICT (inode_id) DO NOTHING;
 
 UPDATE file_nodes SET inode_id = node_id WHERE is_directory = 1 AND inode_id IS NULL;
 
