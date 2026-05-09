@@ -170,6 +170,42 @@ func (cq *CommitQueue) Pending() int {
 	return len(cq.queue)
 }
 
+// PendingStats returns the number of unique pending entries and the sum
+// of their sizes. Used by unmount to display drain progress.
+//
+// Subtleties:
+//  1. In-flight entries remain in cq.queue until the worker calls
+//     removeFromQueue() *after* cleanup (see line 692). The same
+//     *CommitEntry pointer is stored in both cq.queue and cq.inFlight
+//     during that window.
+//  2. Enqueue does NOT dedupe by Path (line 153 just appends). A path
+//     written + closed twice yields two distinct entries with the same
+//     Path string but different pointers.
+//
+// We dedupe by entry pointer: collapses (1) without collapsing (2).
+func (cq *CommitQueue) PendingStats() (count int, bytes int64) {
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	seen := make(map[*CommitEntry]struct{}, len(cq.queue))
+	for _, e := range cq.queue {
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		count++
+		bytes += e.Size
+	}
+	for _, e := range cq.inFlight {
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		count++
+		bytes += e.Size
+	}
+	return
+}
+
 // IsFull reports whether the queue has reached its backpressure limit.
 func (cq *CommitQueue) IsFull() bool {
 	cq.mu.Lock()
