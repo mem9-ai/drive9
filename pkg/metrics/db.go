@@ -9,12 +9,8 @@ import (
 )
 
 type dbMetrics struct {
-	mu             sync.RWMutex
-	counts         map[string]int64
-	durationCount  map[string]int64
-	durationSum    map[string]float64
-	durationBucket map[string][]int64
-	dbs            map[*sql.DB]string
+	mu  sync.RWMutex
+	dbs map[*sql.DB]string
 }
 
 type dbPoolTotals struct {
@@ -33,37 +29,30 @@ type dbPoolTotals struct {
 var dbOperationDurationBounds = []float64{0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
 
 var globalDB = &dbMetrics{
-	counts:         map[string]int64{},
-	durationCount:  map[string]int64{},
-	durationSum:    map[string]float64{},
-	durationBucket: map[string][]int64{},
-	dbs:            map[*sql.DB]string{},
+	dbs: map[*sql.DB]string{},
 }
 
+var dbMeter = globalMeterProvider.Meter("db")
+var dbOperationsTotal = dbMeter.Int64Counter("dat9_db_operations_total", "Database operations by role/operation/result/tenant_id")
+var dbOperationDuration = dbMeter.Float64Histogram("dat9_db_operation_duration_seconds", "Database operation duration histogram", dbOperationDurationBounds)
+
 func RecordDBOperation(role, operation, result, tenantID string, d time.Duration) {
-	key := dbLabels(role, operation, result, tenantID)
-	globalDB.mu.Lock()
-	globalDB.counts[key]++
-	globalDB.durationCount[key]++
-	globalDB.durationSum[key] += d.Seconds()
-	buckets := globalDB.durationBucket[key]
-	if buckets == nil {
-		buckets = make([]int64, len(dbOperationDurationBounds))
-		globalDB.durationBucket[key] = buckets
+	RegisterModule("db")
+	attrs := []Attribute{
+		Attr("role", cleanMetricValue(role, "unknown")),
+		Attr("operation", cleanMetricValue(operation, "unknown")),
+		Attr("result", cleanMetricValue(result, "unknown")),
+		Attr("tenant_id", tenantID),
 	}
-	seconds := d.Seconds()
-	for i, bound := range dbOperationDurationBounds {
-		if seconds <= bound {
-			buckets[i]++
-		}
-	}
-	globalDB.mu.Unlock()
+	dbOperationsTotal.Add(1, attrs...)
+	dbOperationDuration.Observe(d.Seconds(), attrs...)
 }
 
 func RegisterDB(role string, db *sql.DB) {
 	if db == nil {
 		return
 	}
+	RegisterModule("db")
 	globalDB.mu.Lock()
 	globalDB.dbs[db] = role
 	globalDB.mu.Unlock()
@@ -80,44 +69,11 @@ func UnregisterDB(db *sql.DB) {
 
 func writeDBPrometheus(w http.ResponseWriter) {
 	globalDB.mu.RLock()
-	countKeys := SortedKeys(globalDB.counts)
-	counts := CloneIntMap(globalDB.counts)
-	durationCount := CloneIntMap(globalDB.durationCount)
-	durationSum := CloneFloatMap(globalDB.durationSum)
-	durationBucket := CloneBucketMap(globalDB.durationBucket)
 	dbByRole := make(map[*sql.DB]string, len(globalDB.dbs))
 	for db, role := range globalDB.dbs {
 		dbByRole[db] = role
 	}
 	globalDB.mu.RUnlock()
-
-	_, _ = fmt.Fprintln(w, "# HELP dat9_db_operations_total Database operations by role/operation/result/tenant_id")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_db_operations_total counter")
-	for _, k := range countKeys {
-		_, _ = fmt.Fprintf(w, "dat9_db_operations_total{%s} %d\n", k, counts[k])
-	}
-
-	_, _ = fmt.Fprintln(w, "# HELP dat9_db_operation_duration_seconds Database operation duration histogram")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_db_operation_duration_seconds histogram")
-	for _, k := range countKeys {
-		buckets := durationBucket[k]
-		for i, bound := range dbOperationDurationBounds {
-			_, _ = fmt.Fprintf(w, "dat9_db_operation_duration_seconds_bucket{%s,le=\"%s\"} %d\n", k, FormatPromBound(bound), buckets[i])
-		}
-		_, _ = fmt.Fprintf(w, "dat9_db_operation_duration_seconds_bucket{%s,le=\"+Inf\"} %d\n", k, durationCount[k])
-	}
-
-	_, _ = fmt.Fprintln(w, "# HELP dat9_db_operation_duration_seconds_count Database operation duration count")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_db_operation_duration_seconds_count counter")
-	for _, k := range countKeys {
-		_, _ = fmt.Fprintf(w, "dat9_db_operation_duration_seconds_count{%s} %d\n", k, durationCount[k])
-	}
-
-	_, _ = fmt.Fprintln(w, "# HELP dat9_db_operation_duration_seconds_sum Database operation duration sum in seconds")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_db_operation_duration_seconds_sum counter")
-	for _, k := range countKeys {
-		_, _ = fmt.Fprintf(w, "dat9_db_operation_duration_seconds_sum{%s} %.6f\n", k, durationSum[k])
-	}
 
 	poolTotals := make(map[string]dbPoolTotals)
 	for db, role := range dbByRole {
@@ -175,8 +131,4 @@ func writeDBPrometheus(w http.ResponseWriter) {
 		_, _ = fmt.Fprintf(w, "dat9_db_pool_closes_total{role=\"%s\",reason=\"max_idle_time\"} %d\n", escapedRole, totals.maxIdleTimeClosed)
 		_, _ = fmt.Fprintf(w, "dat9_db_pool_closes_total{role=\"%s\",reason=\"max_lifetime\"} %d\n", escapedRole, totals.maxLifetimeClosed)
 	}
-}
-
-func dbLabels(role, operation, result, tenantID string) string {
-	return "role=\"" + EscapePromLabel(role) + "\",operation=\"" + EscapePromLabel(operation) + "\",result=\"" + EscapePromLabel(result) + "\",tenant_id=\"" + EscapePromLabel(tenantID) + "\""
 }

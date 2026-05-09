@@ -6,8 +6,12 @@ package webdav
 
 import (
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 	"golang.org/x/net/webdav"
 )
 
@@ -28,9 +32,69 @@ func NewHandler(c *client.Client, opts Options) http.Handler {
 	if remoteRoot == "" {
 		remoteRoot = "/"
 	}
-	return &webdav.Handler{
+	metrics.SetModuleAvailability("webdav", true)
+	next := &webdav.Handler{
 		Prefix:     opts.Prefix,
 		FileSystem: &fileSystem{client: c, remoteRoot: remoteRoot, props: newDeadPropStore()},
 		LockSystem: webdav.NewMemLS(),
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		recorder := &statusCapturingResponseWriter{ResponseWriter: w}
+		next.ServeHTTP(recorder, r)
+		metrics.RecordOperation("webdav", webdavMetricOperation(r.Method), webdavMetricResult(recorder.statusCode()), time.Since(start))
+	})
+}
+
+type statusCapturingResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusCapturingResponseWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusCapturingResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *statusCapturingResponseWriter) statusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+func webdavMetricOperation(method string) string {
+	method = strings.TrimSpace(strings.ToUpper(method))
+	if method == "" {
+		return "unknown"
+	}
+	return strings.ToLower(method)
+}
+
+func webdavMetricResult(status int) string {
+	switch {
+	case status == http.StatusMultiStatus:
+		return "multi_status"
+	case status >= 200 && status < 300:
+		return "ok"
+	case status == http.StatusConflict:
+		return "conflict"
+	case status == http.StatusNotFound:
+		return "not_found"
+	case status == http.StatusMethodNotAllowed:
+		return "method_not_allowed"
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return "permission_denied"
+	case status >= 500:
+		return "error"
+	default:
+		return strconv.Itoa(status)
 	}
 }

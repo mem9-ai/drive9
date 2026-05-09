@@ -13,7 +13,14 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 )
+
+func readWebDAVMetrics() string {
+	recorder := httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	return recorder.Body.String()
+}
 
 func TestNormPath(t *testing.T) {
 	tests := []struct {
@@ -209,6 +216,29 @@ func TestHandlerPutMissingParentReturnsConflict(t *testing.T) {
 
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("PUT missing parent status = %d, want %d: %s", rr.Code, http.StatusConflict, rr.Body.String())
+	}
+}
+
+func TestHandlerMetricsExposed(t *testing.T) {
+	c := newWriteOnlyTestClient(t, nil)
+	handler := NewHandler(c, Options{})
+
+	req := httptest.NewRequest(http.MethodPut, "/missing/file.txt", strings.NewReader("payload"))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("PUT missing parent status = %d, want %d: %s", rr.Code, http.StatusConflict, rr.Body.String())
+	}
+
+	metricsText := readWebDAVMetrics()
+	if !strings.Contains(metricsText, "dat9_module_up{module=\"webdav\"} 1") {
+		t.Fatalf("metrics missing webdav module availability: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, "dat9_service_operations_total{component=\"webdav\",operation=\"put\",result=\"conflict\"}") {
+		t.Fatalf("metrics missing webdav service counter: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, "dat9_service_operation_duration_seconds_count{component=\"webdav\",operation=\"put\",result=\"conflict\"}") {
+		t.Fatalf("metrics missing webdav duration histogram: %s", metricsText)
 	}
 }
 

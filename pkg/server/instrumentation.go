@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -60,137 +58,24 @@ func metricEvent(ctx context.Context, event string, labels ...string) {
 
 type serverMetrics struct {
 	inFlight atomic.Int64
-
-	mu             sync.RWMutex
-	requests       map[string]int64
-	durationCount  map[string]int64
-	durationSecond map[string]float64
-	durationBucket map[string][]int64
-	events         map[string]int64
 }
 
-var httpDurationBounds = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
-
 func newServerMetrics() *serverMetrics {
-	return &serverMetrics{
-		requests:       make(map[string]int64),
-		durationCount:  make(map[string]int64),
-		durationSecond: make(map[string]float64),
-		durationBucket: make(map[string][]int64),
-		events:         make(map[string]int64),
-	}
+	metrics.SetModuleAvailability("server", true)
+	metrics.RecordHTTPInFlight(0)
+	return &serverMetrics{}
 }
 
 func (m *serverMetrics) record(method, route string, status int, d time.Duration) {
-	statusKey := metricLabels(method, route, strconv.Itoa(status))
-	durationKey := metricLabels(method, route)
-
-	m.mu.Lock()
-	m.requests[statusKey]++
-	m.durationCount[durationKey]++
-	m.durationSecond[durationKey] += d.Seconds()
-	buckets := m.durationBucket[durationKey]
-	if buckets == nil {
-		buckets = make([]int64, len(httpDurationBounds))
-		m.durationBucket[durationKey] = buckets
-	}
-	seconds := d.Seconds()
-	for i, bound := range httpDurationBounds {
-		if seconds <= bound {
-			buckets[i]++
-		}
-	}
-	m.mu.Unlock()
+	metrics.RecordHTTPRequest(method, route, status, d)
 }
 
 func (m *serverMetrics) recordEvent(event string, labels ...string) {
-	key := metricEventLabels(event, labels...)
-	m.mu.Lock()
-	m.events[key]++
-	m.mu.Unlock()
+	metrics.RecordEvent(event, labels...)
 }
 
 func (m *serverMetrics) writePrometheus(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-
-	_, _ = fmt.Fprintln(w, "# HELP dat9_http_inflight_requests Current in-flight HTTP requests")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_http_inflight_requests gauge")
-	_, _ = fmt.Fprintf(w, "dat9_http_inflight_requests %d\n", m.inFlight.Load())
-
-	m.mu.RLock()
-	requestKeys := metrics.SortedKeys(m.requests)
-	durationKeys := metrics.SortedKeys(m.durationCount)
-	eventKeys := metrics.SortedKeys(m.events)
-	requests := metrics.CloneIntMap(m.requests)
-	durationCount := metrics.CloneIntMap(m.durationCount)
-	durationSecond := metrics.CloneFloatMap(m.durationSecond)
-	durationBucket := metrics.CloneBucketMap(m.durationBucket)
-	events := metrics.CloneIntMap(m.events)
-	m.mu.RUnlock()
-
-	_, _ = fmt.Fprintln(w, "# HELP dat9_http_requests_total Total HTTP requests by method/route/status")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_http_requests_total counter")
-	for _, k := range requestKeys {
-		_, _ = fmt.Fprintf(w, "dat9_http_requests_total{%s} %d\n", k, requests[k])
-	}
-
-	_, _ = fmt.Fprintln(w, "# HELP dat9_http_request_duration_seconds HTTP request duration histogram by method/route")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_http_request_duration_seconds histogram")
-	for _, k := range durationKeys {
-		buckets := durationBucket[k]
-		for i, bound := range httpDurationBounds {
-			_, _ = fmt.Fprintf(w, "dat9_http_request_duration_seconds_bucket{%s,le=\"%s\"} %d\n", k, metrics.FormatPromBound(bound), buckets[i])
-		}
-		_, _ = fmt.Fprintf(w, "dat9_http_request_duration_seconds_bucket{%s,le=\"+Inf\"} %d\n", k, durationCount[k])
-	}
-
-	_, _ = fmt.Fprintln(w, "# HELP dat9_http_request_duration_seconds_count HTTP request duration count by method/route")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_http_request_duration_seconds_count counter")
-	for _, k := range durationKeys {
-		_, _ = fmt.Fprintf(w, "dat9_http_request_duration_seconds_count{%s} %d\n", k, durationCount[k])
-	}
-
-	_, _ = fmt.Fprintln(w, "# HELP dat9_http_request_duration_seconds_sum HTTP request duration sum in seconds by method/route")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_http_request_duration_seconds_sum counter")
-	for _, k := range durationKeys {
-		_, _ = fmt.Fprintf(w, "dat9_http_request_duration_seconds_sum{%s} %.6f\n", k, durationSecond[k])
-	}
-
-	_, _ = fmt.Fprintln(w, "# HELP dat9_tenant_events_total Tenant/business lifecycle events")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_tenant_events_total counter")
-	for _, k := range eventKeys {
-		_, _ = fmt.Fprintf(w, "dat9_tenant_events_total{%s} %d\n", k, events[k])
-	}
-}
-
-func metricLabels(method, route string, status ...string) string {
-	b := strings.Builder{}
-	b.WriteString(`method="`)
-	b.WriteString(metrics.EscapePromLabel(method))
-	b.WriteString(`",route="`)
-	b.WriteString(metrics.EscapePromLabel(route))
-	b.WriteString(`"`)
-	if len(status) > 0 {
-		b.WriteString(`,status="`)
-		b.WriteString(metrics.EscapePromLabel(status[0]))
-		b.WriteString(`"`)
-	}
-	return b.String()
-}
-
-func metricEventLabels(event string, labels ...string) string {
-	b := strings.Builder{}
-	b.WriteString(`event="`)
-	b.WriteString(metrics.EscapePromLabel(event))
-	b.WriteString(`"`)
-	for i := 0; i+1 < len(labels); i += 2 {
-		b.WriteString(",")
-		b.WriteString(metrics.EscapePromLabel(labels[i]))
-		b.WriteString(`="`)
-		b.WriteString(metrics.EscapePromLabel(labels[i+1]))
-		b.WriteString(`"`)
-	}
-	return b.String()
+	metrics.WritePrometheus(w)
 }
 
 type observedResponseWriter struct {
@@ -280,8 +165,10 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 	if f, ok := w.(http.Flusher); ok {
 		rw = &flusherResponseWriter{observedResponseWriter: ow, flusher: f}
 	}
-	s.metrics.inFlight.Add(1)
-	defer s.metrics.inFlight.Add(-1)
+	metrics.RecordHTTPInFlight(float64(s.metrics.inFlight.Add(1)))
+	defer func() {
+		metrics.RecordHTTPInFlight(float64(s.metrics.inFlight.Add(-1)))
+	}()
 
 	next.ServeHTTP(rw, r)
 	if ow.status == 0 {
@@ -327,5 +214,4 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.metrics.writePrometheus(w)
-	metrics.WritePrometheus(w)
 }

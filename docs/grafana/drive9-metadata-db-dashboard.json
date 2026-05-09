@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Data-store drill-down dashboard that owns database role=user, focused on Drive9 tenant-serving query behavior.",
+  "description": "Data-store drill-down dashboard that owns database role=meta, focused on Drive9 control-plane and metadata query behavior.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -44,7 +44,7 @@
       },
       "id": 100,
       "options": {
-        "content": "# Tenant Data DB Performance\n\nCategory: data-store drill-down.\n\nUse this when overview dashboards suggest DB pressure on tenant-serving queries rather than control-plane metadata traffic. This dashboard owns database role=`user` and should be preferred whenever the bottleneck looks data-path rather than control-plane. Operation latency and throughput panels can be filtered by `tenant_id`. Pool panels remain shared because they come from the process-wide `sql.DB` pool rather than tenant-scoped accounting.",
+        "content": "# Metadata DB Performance\n\nCategory: data-store drill-down.\n\nUse this when overview dashboards suggest DB pressure and the problem appears to sit in metadata or control-plane queries. This dashboard owns database role=`meta` and should be preferred whenever the bottleneck looks control-plane rather than tenant-serving. Operation latency and throughput panels can be filtered by `tenant_id` to spot hot tenants in control-plane traffic. Pool panels remain global because they come from the shared process-wide `sql.DB` pool.",
         "mode": "markdown"
       },
       "title": "Guide",
@@ -110,12 +110,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval])))",
-          "legendFormat": "user_p95",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval])))",
+          "legendFormat": "meta_p95",
           "refId": "A"
         }
       ],
-      "title": "User DB P95",
+      "title": "Meta DB P95",
       "type": "stat"
     },
     {
@@ -177,12 +177,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval])))",
-          "legendFormat": "user_p99",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval])))",
+          "legendFormat": "meta_p99",
           "refId": "A"
         }
       ],
-      "title": "User DB P99",
+      "title": "Meta DB P99",
       "type": "stat"
     },
     {
@@ -244,12 +244,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_db_pool_wait_count_total{role=\"user\"}[$__rate_interval]))",
-          "legendFormat": "user_waits",
+          "expr": "sum(rate(dat9_db_pool_wait_count_total{role=\"meta\"}[$__rate_interval]))",
+          "legendFormat": "meta_waits",
           "refId": "A"
         }
       ],
-      "title": "User Waits /s",
+      "title": "Meta Waits /s",
       "type": "stat"
     },
     {
@@ -311,12 +311,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(dat9_db_pool_connections{role=\"user\",state=\"in_use\"}) / clamp_min(sum(dat9_db_pool_connections{role=\"user\",state=\"max_open\"}), 1)",
-          "legendFormat": "user_utilization",
+          "expr": "sum(dat9_db_pool_connections{role=\"meta\",state=\"in_use\"}) / clamp_min(sum(dat9_db_pool_connections{role=\"meta\",state=\"max_open\"}), 1)",
+          "legendFormat": "meta_utilization",
           "refId": "A"
         }
       ],
-      "title": "User Utilization",
+      "title": "Meta Utilization",
       "type": "stat"
     },
     {
@@ -378,8 +378,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(dat9_db_pool_connections{role=\"user\",state=\"open\"})",
-          "legendFormat": "user_open",
+          "expr": "sum(dat9_db_pool_connections{role=\"meta\",state=\"open\"})",
+          "legendFormat": "meta_open",
           "refId": "A"
         }
       ],
@@ -425,12 +425,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (operation, result) (rate(dat9_db_operations_total{role=\"user\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval]))",
+          "expr": "sum by (operation, result) (rate(dat9_db_operations_total{role=\"meta\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval]))",
           "legendFormat": "{{operation}} / {{result}}",
           "refId": "A"
         }
       ],
-      "title": "User DB Operation Throughput",
+      "title": "Meta DB Operation Throughput",
       "type": "timeseries"
     },
     {
@@ -472,7 +472,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.95, sum by (le, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval]))))",
+          "expr": "topk(12, histogram_quantile(0.95, sum by (le, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval]))))",
           "legendFormat": "{{operation}} p95",
           "refId": "A"
         },
@@ -481,12 +481,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.99, sum by (le, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval]))))",
+          "expr": "topk(12, histogram_quantile(0.99, sum by (le, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval]))))",
           "legendFormat": "{{operation}} p99",
           "refId": "B"
         }
       ],
-      "title": "User DB Tail Latency",
+      "title": "Meta DB Tail Latency",
       "type": "timeseries"
     },
     {
@@ -528,12 +528,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (state) (dat9_db_pool_connections{role=\"user\"})",
+          "expr": "sum by (state) (dat9_db_pool_connections{role=\"meta\"})",
           "legendFormat": "{{state}}",
           "refId": "A"
         }
       ],
-      "title": "User DB Pool Connections",
+      "title": "Meta DB Pool Connections",
       "type": "timeseries"
     },
     {
@@ -600,7 +600,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "rate(dat9_db_pool_wait_duration_seconds_total{role=\"user\"}[$__rate_interval])",
+          "expr": "rate(dat9_db_pool_wait_duration_seconds_total{role=\"meta\"}[$__rate_interval])",
           "legendFormat": "wait_seconds_rate",
           "refId": "A"
         },
@@ -609,12 +609,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "rate(dat9_db_pool_wait_count_total{role=\"user\"}[$__rate_interval])",
+          "expr": "rate(dat9_db_pool_wait_count_total{role=\"meta\"}[$__rate_interval])",
           "legendFormat": "wait_count_rate",
           "refId": "B"
         }
       ],
-      "title": "User DB Wait Pressure",
+      "title": "Meta DB Wait Pressure",
       "type": "timeseries"
     },
     {
@@ -656,12 +656,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (reason) (rate(dat9_db_pool_closes_total{role=\"user\"}[$__rate_interval]))",
+          "expr": "sum by (reason) (rate(dat9_db_pool_closes_total{role=\"meta\"}[$__rate_interval]))",
           "legendFormat": "{{reason}}",
           "refId": "A"
         }
       ],
-      "title": "User DB Pool Close Reasons",
+      "title": "Meta DB Pool Close Reasons",
       "type": "timeseries"
     },
     {
@@ -703,12 +703,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(10, sum by (tenant_id) (rate(dat9_db_operations_total{role=\"user\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\",tenant_id!=\"\"}[$__rate_interval])))",
+          "expr": "topk(10, sum by (tenant_id) (rate(dat9_db_operations_total{role=\"meta\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\",tenant_id!=\"\"}[$__rate_interval])))",
           "legendFormat": "{{tenant_id}} qps",
           "refId": "A"
         }
       ],
-      "title": "Top Tenants By User DB QPS",
+      "title": "Top Tenants By Meta DB QPS",
       "type": "timeseries"
     },
     {
@@ -750,12 +750,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(10, histogram_quantile(0.95, sum by (le, tenant_id) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\",tenant_id!=\"\"}[$__rate_interval]))))",
+          "expr": "topk(10, histogram_quantile(0.95, sum by (le, tenant_id) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\",tenant_id!=\"\"}[$__rate_interval]))))",
           "legendFormat": "{{tenant_id}} p95",
           "refId": "A"
         }
       ],
-      "title": "Top Tenants By User DB P95",
+      "title": "Top Tenants By Meta DB P95",
       "type": "timeseries"
     }
   ],
@@ -764,7 +764,7 @@
   "tags": [
     "drive9",
     "data-store",
-    "user-db",
+    "meta-db",
     "performance",
     "grafana",
     "prometheus"
@@ -799,14 +799,14 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_db_operations_total{role=\"user\"}, operation)",
+        "definition": "label_values(dat9_db_operations_total{role=\"meta\"}, operation)",
         "hide": 0,
         "includeAll": true,
         "label": "DB Operation",
         "multi": true,
         "name": "db_operation",
         "options": [],
-        "query": "label_values(dat9_db_operations_total{role=\"user\"}, operation)",
+        "query": "label_values(dat9_db_operations_total{role=\"meta\"}, operation)",
         "refresh": 2,
         "regex": "",
         "sort": 1,
@@ -823,14 +823,14 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_db_operations_total{role=\"user\",tenant_id!=\"\"}, tenant_id)",
+        "definition": "label_values(dat9_db_operations_total{role=\"meta\",tenant_id!=\"\"}, tenant_id)",
         "hide": 0,
         "includeAll": true,
         "label": "Tenant ID",
         "multi": true,
         "name": "tenant_id",
         "options": [],
-        "query": "label_values(dat9_db_operations_total{role=\"user\",tenant_id!=\"\"}, tenant_id)",
+        "query": "label_values(dat9_db_operations_total{role=\"meta\",tenant_id!=\"\"}, tenant_id)",
         "refresh": 2,
         "regex": "",
         "sort": 1,
@@ -844,8 +844,8 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Drive9 Tenant Data DB Performance",
-  "uid": "drive9-user-db-performance",
+  "title": "Drive9 Metadata DB Performance",
+  "uid": "drive9-metadata-db",
   "version": 1,
   "weekStart": ""
 }

@@ -15,12 +15,24 @@
       }
     ]
   },
-  "description": "Meta DB performance dashboard for Drive9 control-plane queries and pool pressure.",
+  "description": "Data-store drill-down dashboard that owns database role=meta, focused on Drive9 control-plane and metadata query behavior.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
   "id": null,
-  "links": [],
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Service Health Overview",
+      "type": "link",
+      "url": "/d/drive9-service-health"
+    }
+  ],
   "liveNow": false,
   "panels": [
     {
@@ -32,7 +44,7 @@
       },
       "id": 100,
       "options": {
-        "content": "# Meta DB Performance\n\nThis dashboard is scoped to role=`meta`. Operation latency and throughput panels can be filtered by `tenant_id` to spot hot tenants in control-plane traffic. Pool panels remain global because they come from the shared process-wide `sql.DB` pool.",
+        "content": "# Metadata DB Performance\n\nCategory: data-store drill-down.\n\nUse this when overview dashboards suggest DB pressure and the problem appears to sit in metadata or control-plane queries. This dashboard owns database role=`meta` and should be preferred whenever the bottleneck looks control-plane rather than tenant-serving. Operation latency and throughput panels can be filtered by `tenant_id` to spot hot tenants in control-plane traffic. Pool panels remain global because they come from the shared process-wide `sql.DB` pool.",
         "mode": "markdown"
       },
       "title": "Guide",
@@ -751,6 +763,7 @@
   "schemaVersion": 41,
   "tags": [
     "drive9",
+    "data-store",
     "meta-db",
     "performance",
     "grafana",
@@ -831,7 +844,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Drive9 Meta DB Performance",
+  "title": "Drive9 Metadata DB Performance",
   "uid": "drive9-meta-db-performance",
   "version": 1,
   "weekStart": ""

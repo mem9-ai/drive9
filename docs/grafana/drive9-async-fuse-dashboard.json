@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Data-store drill-down dashboard that owns database role=user, focused on Drive9 tenant-serving query behavior.",
+  "description": "Overview dashboard: first stop for Drive9 delayed-work and mount-path incidents, with an alarm-biased first screen for backlog, dead letters, remote errors, and remote latency.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -31,6 +31,28 @@
       "title": "Service Health Overview",
       "type": "link",
       "url": "/d/drive9-service-health"
+    },
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Upload Path Drill-Down",
+      "type": "link",
+      "url": "/d/drive9-upload-path"
+    },
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Filesystem Path Drill-Down",
+      "type": "link",
+      "url": "/d/drive9-filesystem-path"
     }
   ],
   "liveNow": false,
@@ -44,7 +66,7 @@
       },
       "id": 100,
       "options": {
-        "content": "# Tenant Data DB Performance\n\nCategory: data-store drill-down.\n\nUse this when overview dashboards suggest DB pressure on tenant-serving queries rather than control-plane metadata traffic. This dashboard owns database role=`user` and should be preferred whenever the bottleneck looks data-path rather than control-plane. Operation latency and throughput panels can be filtered by `tenant_id`. Pool panels remain shared because they come from the process-wide `sql.DB` pool rather than tenant-scoped accounting.",
+        "content": "# Drive9 Async And FUSE\n\nCategory: overview.\n\nUse this when the incident is not on the front-door HTTP path but in delayed work or the mount path. The first row is intentionally alarm-biased: semantic backlog, dead letters, FUSE remote error ratio, and FUSE remote latency. The second row is organized as two narrowing paths: worker state on the left and per-operation FUSE latency on the right. The bottom row is for media extraction: image runtime capacity first, then audio extract process results and tail latency. If the issue reduces to a specific FUSE or upload path, continue into the request-path drill-down dashboards.",
         "mode": "markdown"
       },
       "title": "Guide",
@@ -71,11 +93,11 @@
               },
               {
                 "color": "orange",
-                "value": 0.05
+                "value": 60
               },
               {
                 "color": "red",
-                "value": 0.25
+                "value": 300
               }
             ]
           },
@@ -85,7 +107,7 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
+        "w": 6,
         "x": 0,
         "y": 4
       },
@@ -110,12 +132,146 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval])))",
-          "legendFormat": "user_p95",
+          "expr": "dat9_service_gauge{component=\"semantic_worker\",name=\"queue_lag_seconds\"}",
+          "legendFormat": "queue_lag_seconds",
           "refId": "A"
         }
       ],
-      "title": "User DB P95",
+      "title": "Semantic Queue Lag",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 4
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dat9_service_gauge{component=\"semantic_worker\",name=\"dead_lettered\"}",
+          "legendFormat": "dead_lettered",
+          "refId": "A"
+        }
+      ],
+      "title": "Semantic Dead Lettered",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 4
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(dat9_fuse_remote_operations_total{result=\"error\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_fuse_remote_operations_total[$__rate_interval])), 0.000001)",
+          "legendFormat": "fuse_remote_error_ratio",
+          "refId": "A"
+        }
+      ],
+      "title": "FUSE Remote Error Ratio",
       "type": "stat"
     },
     {
@@ -152,142 +308,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 4,
-        "y": 4
-      },
-      "id": 2,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval])))",
-          "legendFormat": "user_p99",
-          "refId": "A"
-        }
-      ],
-      "title": "User DB P99",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 1
-              },
-              {
-                "color": "red",
-                "value": 5
-              }
-            ]
-          },
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 8,
-        "y": 4
-      },
-      "id": 3,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum(rate(dat9_db_pool_wait_count_total{role=\"user\"}[$__rate_interval]))",
-          "legendFormat": "user_waits",
-          "refId": "A"
-        }
-      ],
-      "title": "User Waits /s",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 0.7
-              },
-              {
-                "color": "red",
-                "value": 0.9
-              }
-            ]
-          },
-          "unit": "percentunit"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 12,
+        "w": 6,
+        "x": 18,
         "y": 4
       },
       "id": 4,
@@ -311,12 +333,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(dat9_db_pool_connections{role=\"user\",state=\"in_use\"}) / clamp_min(sum(dat9_db_pool_connections{role=\"user\",state=\"max_open\"}), 1)",
-          "legendFormat": "user_utilization",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_fuse_remote_operation_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "fuse_remote_p95",
           "refId": "A"
         }
       ],
-      "title": "User Utilization",
+      "title": "FUSE Remote P95",
       "type": "stat"
     },
     {
@@ -327,50 +349,30 @@
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "thresholds"
+            "mode": "palette-classic"
           },
           "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 1
-              },
-              {
-                "color": "red",
-                "value": 5
-              }
-            ]
-          },
           "unit": "short"
         },
         "overrides": []
       },
       "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 16,
-        "y": 4
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
       },
       "id": 5,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
         },
-        "textMode": "auto"
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
@@ -378,13 +380,78 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(dat9_db_pool_connections{role=\"user\",state=\"open\"})",
-          "legendFormat": "user_open",
+          "expr": "dat9_service_gauge{component=\"semantic_worker\",name=~\"inflight|queued|processing|dead_lettered\"}",
+          "legendFormat": "semantic_worker {{name}}",
           "refId": "A"
         }
       ],
-      "title": "Open Connections",
-      "type": "stat"
+      "title": "Semantic Worker State",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dat9_service_gauge{component=\"semantic_worker\",name=\"queue_lag_seconds\"}",
+          "legendFormat": "semantic_worker queue_lag_seconds",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dat9_service_gauge{component=\"image_extract\",name=~\"workers|queue_capacity|queue_depth\"}",
+          "legendFormat": "image_extract {{name}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dat9_service_gauge{component=\"audio_extract\",name=~\"task_timeout_seconds|max_audio_bytes|max_extract_text_bytes\"}",
+          "legendFormat": "audio_extract {{name}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Media Extract Runtime",
+      "type": "timeseries"
     },
     {
       "datasource": {
@@ -405,9 +472,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 16
       },
-      "id": 11,
+      "id": 7,
       "options": {
         "legend": {
           "calcs": [],
@@ -425,12 +492,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (operation, result) (rate(dat9_db_operations_total{role=\"user\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval]))",
-          "legendFormat": "{{operation}} / {{result}}",
+          "expr": "sum by (operation, result) (rate(dat9_fuse_remote_operations_total[$__rate_interval]))",
+          "legendFormat": "{{operation}} {{result}}",
           "refId": "A"
         }
       ],
-      "title": "User DB Operation Throughput",
+      "title": "FUSE Remote Operations",
       "type": "timeseries"
     },
     {
@@ -454,7 +521,7 @@
         "x": 12,
         "y": 8
       },
-      "id": 12,
+      "id": 8,
       "options": {
         "legend": {
           "calcs": [],
@@ -472,149 +539,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.95, sum by (le, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval]))))",
-          "legendFormat": "{{operation}} p95",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "topk(12, histogram_quantile(0.99, sum by (le, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval]))))",
-          "legendFormat": "{{operation}} p99",
-          "refId": "B"
-        }
-      ],
-      "title": "User DB Tail Latency",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 16
-      },
-      "id": 13,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (state) (dat9_db_pool_connections{role=\"user\"})",
-          "legendFormat": "{{state}}",
+          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(dat9_fuse_remote_operation_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{operation}} remote_p95",
           "refId": "A"
         }
       ],
-      "title": "User DB Pool Connections",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "unit": "short"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "wait_seconds_rate"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "s"
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "wait_count_rate"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "ops"
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 16
-      },
-      "id": 14,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "rate(dat9_db_pool_wait_duration_seconds_total{role=\"user\"}[$__rate_interval])",
-          "legendFormat": "wait_seconds_rate",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "rate(dat9_db_pool_wait_count_total{role=\"user\"}[$__rate_interval])",
-          "legendFormat": "wait_count_rate",
-          "refId": "B"
-        }
-      ],
-      "title": "User DB Wait Pressure",
+      "title": "FUSE Remote P95 By Operation",
       "type": "timeseries"
     },
     {
@@ -634,11 +564,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 24,
+        "w": 12,
         "x": 0,
         "y": 24
       },
-      "id": 15,
+      "id": 9,
       "options": {
         "legend": {
           "calcs": [],
@@ -656,59 +586,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (reason) (rate(dat9_db_pool_closes_total{role=\"user\"}[$__rate_interval]))",
-          "legendFormat": "{{reason}}",
+          "expr": "sum by (result) (rate(dat9_service_operations_total{component=\"audio_extract\",operation=\"process\"}[$__rate_interval]))",
+          "legendFormat": "audio_extract {{result}}",
           "refId": "A"
         }
       ],
-      "title": "User DB Pool Close Reasons",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 32
-      },
-      "id": 16,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "topk(10, sum by (tenant_id) (rate(dat9_db_operations_total{role=\"user\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\",tenant_id!=\"\"}[$__rate_interval])))",
-          "legendFormat": "{{tenant_id}} qps",
-          "refId": "A"
-        }
-      ],
-      "title": "Top Tenants By User DB QPS",
+      "title": "Audio Extract Process Results",
       "type": "timeseries"
     },
     {
@@ -730,9 +613,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 24
       },
-      "id": 17,
+      "id": 10,
       "options": {
         "legend": {
           "calcs": [],
@@ -750,12 +633,21 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(10, histogram_quantile(0.95, sum by (le, tenant_id) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\",tenant_id!=\"\"}[$__rate_interval]))))",
-          "legendFormat": "{{tenant_id}} p95",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_service_operation_duration_seconds_bucket{component=\"audio_extract\",operation=\"process\"}[$__rate_interval])))",
+          "legendFormat": "audio_extract p95",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_service_operation_duration_seconds_bucket{component=\"audio_extract\",operation=\"process\"}[$__rate_interval])))",
+          "legendFormat": "audio_extract p99",
+          "refId": "B"
         }
       ],
-      "title": "Top Tenants By User DB P95",
+      "title": "Audio Extract Tail Latency",
       "type": "timeseries"
     }
   ],
@@ -763,9 +655,9 @@
   "schemaVersion": 41,
   "tags": [
     "drive9",
-    "data-store",
-    "user-db",
-    "performance",
+    "async",
+    "fuse",
+    "observability",
     "grafana",
     "prometheus"
   ],
@@ -787,54 +679,6 @@
         "refresh": 1,
         "regex": "",
         "type": "datasource"
-      },
-      {
-        "allValue": ".*",
-        "current": {
-          "selected": true,
-          "text": "All",
-          "value": "$__all"
-        },
-        "datasource": {
-          "type": "prometheus",
-          "uid": "${datasource}"
-        },
-        "definition": "label_values(dat9_db_operations_total{role=\"user\"}, operation)",
-        "hide": 0,
-        "includeAll": true,
-        "label": "DB Operation",
-        "multi": true,
-        "name": "db_operation",
-        "options": [],
-        "query": "label_values(dat9_db_operations_total{role=\"user\"}, operation)",
-        "refresh": 2,
-        "regex": "",
-        "sort": 1,
-        "type": "query"
-      },
-      {
-        "allValue": ".*",
-        "current": {
-          "selected": true,
-          "text": "All",
-          "value": "$__all"
-        },
-        "datasource": {
-          "type": "prometheus",
-          "uid": "${datasource}"
-        },
-        "definition": "label_values(dat9_db_operations_total{role=\"user\",tenant_id!=\"\"}, tenant_id)",
-        "hide": 0,
-        "includeAll": true,
-        "label": "Tenant ID",
-        "multi": true,
-        "name": "tenant_id",
-        "options": [],
-        "query": "label_values(dat9_db_operations_total{role=\"user\",tenant_id!=\"\"}, tenant_id)",
-        "refresh": 2,
-        "regex": "",
-        "sort": 1,
-        "type": "query"
       }
     ]
   },
@@ -844,8 +688,8 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Drive9 Tenant Data DB Performance",
-  "uid": "drive9-user-db-performance",
+  "title": "Drive9 Async And FUSE",
+  "uid": "drive9-async-fuse",
   "version": 1,
   "weekStart": ""
 }

@@ -15,12 +15,35 @@
       }
     ]
   },
-  "description": "Detailed HTTP performance dashboard for Drive9. Use this when route throughput, request latency, or API error mix is the main problem.",
+  "description": "Request-path drill-down dashboard for non-FS and non-upload Drive9 APIs, focused on control, vault, SQL, events, and auxiliary HTTP surfaces.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
   "id": null,
-  "links": [],
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Service Health Overview",
+      "type": "link",
+      "url": "/d/drive9-service-health"
+    },
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Async And FUSE Overview",
+      "type": "link",
+      "url": "/d/drive9-async-fuse"
+    }
+  ],
   "liveNow": false,
   "panels": [
     {
@@ -32,7 +55,7 @@
       },
       "id": 100,
       "options": {
-        "content": "# HTTP Performance\n\nThis dashboard is intentionally large-format for request-path analysis. It answers: which routes are hot, which are slow, and whether latency coincides with inflight buildup or error spikes.",
+        "content": "# API Surface Performance\n\nCategory: request-path drill-down.\n\nUse this after an overview dashboard shows an HTTP-facing problem outside the FS and upload paths. This dashboard is intentionally scoped to control, vault, SQL, events, and auxiliary HTTP routes so it does not duplicate the dedicated FS and upload dashboards. It answers which routes are hot, which are slow, and whether latency coincides with inflight buildup or error spikes.",
         "mode": "markdown"
       },
       "title": "Guide",
@@ -652,7 +675,8 @@
   "schemaVersion": 41,
   "tags": [
     "drive9",
-    "http",
+    "api",
+    "control-plane",
     "performance",
     "grafana",
     "prometheus"
@@ -677,7 +701,7 @@
         "type": "datasource"
       },
       {
-        "allValue": "/v1/.*|/v2/.*|/s3/.*",
+        "allValue": "/v1/provision|/v1/status|/v1/sql|/v1/events|/v1/vault/.*|/s3/.*",
         "current": {
           "selected": true,
           "text": "All",
@@ -687,14 +711,14 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_http_requests_total{route!~\"/healthz|/metrics|other\"}, route)",
+        "definition": "label_values(dat9_http_requests_total{route=~\"/v1/provision|/v1/status|/v1/sql|/v1/events|/v1/vault/.*|/s3/.*\"}, route)",
         "hide": 0,
         "includeAll": true,
-        "label": "Route",
+        "label": "API Route",
         "multi": true,
         "name": "route",
         "options": [],
-        "query": "label_values(dat9_http_requests_total{route!~\"/healthz|/metrics|other\"}, route)",
+        "query": "label_values(dat9_http_requests_total{route=~\"/v1/provision|/v1/status|/v1/sql|/v1/events|/v1/vault/.*|/s3/.*\"}, route)",
         "refresh": 2,
         "regex": "",
         "sort": 1,
@@ -708,7 +732,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Drive9 HTTP Performance",
+  "title": "Drive9 API Surface Performance",
   "uid": "drive9-http-performance",
   "version": 1,
   "weekStart": ""

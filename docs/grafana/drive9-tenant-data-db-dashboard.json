@@ -845,7 +845,7 @@
   "timepicker": {},
   "timezone": "",
   "title": "Drive9 Tenant Data DB Performance",
-  "uid": "drive9-user-db-performance",
+  "uid": "drive9-tenant-data-db",
   "version": 1,
   "weekStart": ""
 }

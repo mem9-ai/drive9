@@ -128,6 +128,7 @@ func NewAWS(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 	}
 
 	client := s3.NewFromConfig(awsCfg, applyS3Options(cfg))
+	markS3ClientAvailable()
 	return &AWSS3Client{
 		client:  client,
 		presign: s3.NewPresignClient(client),
@@ -155,15 +156,21 @@ func (c *AWSS3Client) fullKey(key string) string {
 }
 
 func (c *AWSS3Client) CreateMultipartUpload(ctx context.Context, key string, algo ChecksumAlgo, encOpts EncryptionOpts) (*MultipartUpload, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("create_multipart_upload", result, start) }()
+
 	in := &s3.CreateMultipartUploadInput{
 		Bucket: &c.bucket,
 		Key:    aws.String(c.fullKey(key)),
 	}
 	if err := applyEncryptionToCreateMultipartUploadInput(in, encOpts); err != nil {
+		result = "error"
 		return nil, err
 	}
 	awsAlgo, ok, err := checksumAlgorithmForAWS(algo)
 	if err != nil {
+		result = "error"
 		return nil, err
 	}
 	if ok {
@@ -171,6 +178,7 @@ func (c *AWSS3Client) CreateMultipartUpload(ctx context.Context, key string, alg
 	}
 	out, err := c.client.CreateMultipartUpload(ctx, in)
 	if err != nil {
+		result = "error"
 		return nil, fmt.Errorf("create multipart upload: %w", err)
 	}
 	return &MultipartUpload{
@@ -193,6 +201,10 @@ func checksumAlgorithmForAWS(algo ChecksumAlgo) (types.ChecksumAlgorithm, bool, 
 }
 
 func (c *AWSS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, algo ChecksumAlgo, checksumValue string, ttl time.Duration) (*UploadPartURL, error) {
+	start := time.Now()
+	metricResult := "ok"
+	defer func() { recordS3Operation("presign_upload_part", metricResult, start) }()
+
 	if ttl > UploadTTL {
 		ttl = UploadTTL
 	}
@@ -223,13 +235,14 @@ func (c *AWSS3Client) PresignUploadPart(ctx context.Context, key, uploadID strin
 		func(o *s3.PresignOptions) { o.Presigner = partPresigner },
 	)
 	if err != nil {
+		metricResult = "error"
 		return nil, fmt.Errorf("presign upload part: %w", err)
 	}
 	headers := flattenSignedHeaders(out.SignedHeader)
 	if checksumValue != "" {
 		headers[headerKey] = checksumValue
 	}
-	result := &UploadPartURL{
+	urlResult := &UploadPartURL{
 		Number:    partNumber,
 		URL:       out.URL,
 		Size:      partSize,
@@ -238,11 +251,11 @@ func (c *AWSS3Client) PresignUploadPart(ctx context.Context, key, uploadID strin
 	}
 	switch algo {
 	case ChecksumAlgoCRC32C:
-		result.ChecksumCRC32C = checksumValue
+		urlResult.ChecksumCRC32C = checksumValue
 	default:
-		result.ChecksumSHA256 = checksumValue
+		urlResult.ChecksumSHA256 = checksumValue
 	}
-	return result, nil
+	return urlResult, nil
 }
 
 func flattenSignedHeaders(h http.Header) map[string]string {
@@ -266,6 +279,10 @@ func flattenSignedHeaders(h http.Header) map[string]string {
 }
 
 func (c *AWSS3Client) CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []Part) error {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("complete_multipart_upload", result, start) }()
+
 	completed := make([]types.CompletedPart, len(parts))
 	for i, p := range parts {
 		cp := types.CompletedPart{
@@ -288,24 +305,34 @@ func (c *AWSS3Client) CompleteMultipartUpload(ctx context.Context, key, uploadID
 		},
 	})
 	if err != nil {
+		result = "error"
 		return fmt.Errorf("complete multipart upload: %w", err)
 	}
 	return nil
 }
 
 func (c *AWSS3Client) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("abort_multipart_upload", result, start) }()
+
 	_, err := c.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 		Bucket:   &c.bucket,
 		Key:      aws.String(c.fullKey(key)),
 		UploadId: &uploadID,
 	})
 	if err != nil {
+		result = "error"
 		return fmt.Errorf("abort multipart upload: %w", err)
 	}
 	return nil
 }
 
 func (c *AWSS3Client) ListParts(ctx context.Context, key, uploadID string) ([]Part, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("list_parts", result, start) }()
+
 	var parts []Part
 	var partMarker *string
 
@@ -317,6 +344,7 @@ func (c *AWSS3Client) ListParts(ctx context.Context, key, uploadID string) ([]Pa
 			PartNumberMarker: partMarker,
 		})
 		if err != nil {
+			result = "error"
 			return nil, fmt.Errorf("list parts: %w", err)
 		}
 		for _, p := range out.Parts {
@@ -337,6 +365,10 @@ func (c *AWSS3Client) ListParts(ctx context.Context, key, uploadID string) ([]Pa
 }
 
 func (c *AWSS3Client) PresignGetObject(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("presign_get_object", result, start) }()
+
 	if ttl > DownloadTTL {
 		ttl = DownloadTTL
 	}
@@ -345,12 +377,17 @@ func (c *AWSS3Client) PresignGetObject(ctx context.Context, key string, ttl time
 		Key:    aws.String(c.fullKey(key)),
 	}, s3.WithPresignExpires(ttl))
 	if err != nil {
+		result = "error"
 		return "", fmt.Errorf("presign get object: %w", err)
 	}
 	return out.URL, nil
 }
 
 func (c *AWSS3Client) PutObject(ctx context.Context, key string, body io.Reader, size int64, encOpts EncryptionOpts) error {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("put_object", result, start) }()
+
 	in := &s3.PutObjectInput{
 		Bucket:        &c.bucket,
 		Key:           aws.String(c.fullKey(key)),
@@ -358,10 +395,12 @@ func (c *AWSS3Client) PutObject(ctx context.Context, key string, body io.Reader,
 		ContentLength: aws.Int64(size),
 	}
 	if err := applyEncryptionToPutObjectInput(in, encOpts); err != nil {
+		result = "error"
 		return err
 	}
 	_, err := c.client.PutObject(ctx, in)
 	if err != nil {
+		result = "error"
 		return fmt.Errorf("put object: %w", err)
 	}
 	return nil
@@ -477,28 +516,42 @@ func encodeKMSEncryptionContext(contextMap map[string]string) (*string, error) {
 }
 
 func (c *AWSS3Client) GetObject(ctx context.Context, key string) (io.ReadCloser, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("get_object", result, start) }()
+
 	out, err := c.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &c.bucket,
 		Key:    aws.String(c.fullKey(key)),
 	})
 	if err != nil {
+		result = "error"
 		return nil, fmt.Errorf("get object: %w", err)
 	}
 	return out.Body, nil
 }
 
 func (c *AWSS3Client) DeleteObject(ctx context.Context, key string) error {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("delete_object", result, start) }()
+
 	_, err := c.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: &c.bucket,
 		Key:    aws.String(c.fullKey(key)),
 	})
 	if err != nil {
+		result = "error"
 		return fmt.Errorf("delete object: %w", err)
 	}
 	return nil
 }
 
 func (c *AWSS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID string, partNumber int, sourceKey string, startByte, endByte int64) (string, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("upload_part_copy", result, start) }()
+
 	copySource := fmt.Sprintf("%s/%s", c.bucket, c.fullKey(sourceKey))
 	copyRange := fmt.Sprintf("bytes=%d-%d", startByte, endByte)
 
@@ -511,12 +564,17 @@ func (c *AWSS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID stri
 		CopySourceRange: aws.String(copyRange),
 	})
 	if err != nil {
+		result = "error"
 		return "", fmt.Errorf("upload part copy: %w", err)
 	}
 	return aws.ToString(out.CopyPartResult.ETag), nil
 }
 
 func (c *AWSS3Client) PresignGetObjectRange(ctx context.Context, key string, startByte, endByte int64, ttl time.Duration) (string, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("presign_get_object_range", result, start) }()
+
 	if ttl > DownloadTTL {
 		ttl = DownloadTTL
 	}
@@ -527,6 +585,7 @@ func (c *AWSS3Client) PresignGetObjectRange(ctx context.Context, key string, sta
 		Range:  aws.String(rangeHeader),
 	}, s3.WithPresignExpires(ttl))
 	if err != nil {
+		result = "error"
 		return "", fmt.Errorf("presign get object range: %w", err)
 	}
 	return out.URL, nil

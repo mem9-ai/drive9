@@ -251,6 +251,7 @@ func (m *semanticWorkerManager) Start(ctx context.Context) {
 	}
 	workerCtx, cancel := context.WithCancel(backgroundWithTrace(ctx))
 	m.cancel = cancel
+	metrics.SetModuleAvailability("semantic_worker", true)
 	metrics.RecordGauge("semantic_worker", "workers", float64(m.opts.Workers))
 	metrics.RecordGauge("semantic_worker", "inflight", 0)
 	metrics.RecordGauge("semantic_worker", "queued", 0)
@@ -280,6 +281,7 @@ func (m *semanticWorkerManager) Stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.processing = 0
+	metrics.SetModuleAvailability("semantic_worker", false)
 	metrics.RecordGauge("semantic_worker", "workers", 0)
 	metrics.RecordGauge("semantic_worker", "inflight", 0)
 }

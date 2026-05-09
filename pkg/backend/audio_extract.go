@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/pingcap/failpoint"
 
@@ -280,30 +281,43 @@ func resolvedAudioExtractContentType(storedContentType, payloadContentType, reso
 // audio_extract_text task. Terminal business outcomes return a nil error; runtime
 // misconfiguration and transient failures return a retryable error.
 func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExtractTaskSpec) (AudioExtractResult, error) {
+	start := time.Now()
+	var result AudioExtractResult
+	defer func() {
+		metrics.RecordOperation("audio_extract", "process", legacyAudioExtractMetricResult(result), time.Since(start))
+	}()
+
 	if !b.SupportsAsyncAudioExtract() {
-		return AudioExtractResultRuntimeNotConfigured, fmt.Errorf("async audio extract runtime not configured")
+		result = AudioExtractResultRuntimeNotConfigured
+		return result, fmt.Errorf("async audio extract runtime not configured")
 	}
 	if b.monthlyLLMCostExceededCheck(ctx) {
 		metrics.RecordOperation("llm_cost_budget", "process_skip", "budget_exhausted", 0)
-		return AudioExtractResultBudgetExhausted, nil
+		result = AudioExtractResultBudgetExhausted
+		return result, nil
 	}
 
 	f, err := b.store.GetFile(ctx, task.FileID)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
-			return AudioExtractResultFileNotFound, nil
+			result = AudioExtractResultFileNotFound
+			return result, nil
 		}
-		return AudioExtractResultGetFileError, fmt.Errorf("get file: %w", err)
+		result = AudioExtractResultGetFileError
+		return result, fmt.Errorf("get file: %w", err)
 	}
 	if f.Status != datastore.StatusConfirmed {
-		return AudioExtractResultNotConfirmed, nil
+		result = AudioExtractResultNotConfirmed
+		return result, nil
 	}
 	if task.Revision > 0 && f.Revision != task.Revision {
-		return AudioExtractResultStale, nil
+		result = AudioExtractResultStale
+		return result, nil
 	}
 	resolvedMIME := resolvedAudioMIMEForHandler(task.Path, f.ContentType, task.ContentType)
 	if resolvedMIME == "" {
-		return AudioExtractResultNotAudio, nil
+		result = AudioExtractResultNotAudio
+		return result, nil
 	}
 	extractorContentType := resolvedAudioExtractContentType(f.ContentType, task.ContentType, resolvedMIME)
 	if extractorContentType == "" {
@@ -313,9 +327,11 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 	data, err := b.loadAudioBytesForExtract(ctx, f)
 	if err != nil {
 		if errors.Is(err, errAudioExtractSourceTooLarge) {
-			return AudioExtractResultTooLarge, nil
+			result = AudioExtractResultTooLarge
+			return result, nil
 		}
-		return AudioExtractResultLoadError, fmt.Errorf("load audio bytes: %w", err)
+		result = AudioExtractResultLoadError
+		return result, fmt.Errorf("load audio bytes: %w", err)
 	}
 
 	taskCtx, cancel := context.WithTimeout(ctx, b.audioExtractTimeout)
@@ -327,12 +343,14 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 	})
 	cancel()
 	if err != nil {
-		return AudioExtractResultExtractError, fmt.Errorf("extract audio text: %w", err)
+		result = AudioExtractResultExtractError
+		return result, fmt.Errorf("extract audio text: %w", err)
 	}
 	b.recordAudioExtractUsage(task.FileID, audioUsage)
 	text = sanitizeExtractedText(text, b.maxAudioExtractTextBytes)
 	if text == "" {
-		return AudioExtractResultEmptyText, nil
+		result = AudioExtractResultEmptyText
+		return result, nil
 	}
 
 	// Always revision-gate writeback: UpdateFileSearchTextTx treats expectedRevision<=0
@@ -352,12 +370,28 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 		return txErr
 	})
 	if err != nil {
-		return AudioExtractResultUpdateError, fmt.Errorf("update file search text: %w", err)
+		result = AudioExtractResultUpdateError
+		return result, fmt.Errorf("update file search text: %w", err)
 	}
 	if !updated {
-		return AudioExtractResultStale, nil
+		result = AudioExtractResultStale
+		return result, nil
 	}
-	return AudioExtractResultWritten, nil
+	result = AudioExtractResultWritten
+	return result, nil
+}
+
+func legacyAudioExtractMetricResult(result AudioExtractResult) string {
+	switch result {
+	case AudioExtractResultFileNotFound, AudioExtractResultGetFileError:
+		return "get_file_error"
+	case AudioExtractResultTooLarge:
+		return "skip_too_large"
+	case AudioExtractResultWritten:
+		return "ok"
+	default:
+		return string(result)
+	}
 }
 
 func injectedAudioExtractWritebackError(name string) error {

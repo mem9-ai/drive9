@@ -20,6 +20,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/tagutil"
@@ -120,6 +121,8 @@ func NewWithConfig(cfg Config) *Server {
 		vaultMK, err = vault.NewMasterKey(cfg.VaultMasterKey)
 		if err != nil {
 			logger.Warn("vault master key invalid, vault disabled", zap.Error(err))
+		} else {
+			metrics.SetModuleAvailability("vault", true)
 		}
 	}
 	inlineThreshold := cfg.InlineThreshold
