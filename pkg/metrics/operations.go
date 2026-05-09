@@ -84,6 +84,11 @@ func RecordHTTPInFlight(value float64) {
 	httpInflight.Set(value)
 }
 
+func RecordHTTPInFlightRoute(route string, value float64) {
+	RegisterModule("server")
+	httpInflight.Set(value, Attr("route", cleanMetricValue(route, "other")))
+}
+
 func RecordEvent(event string, labels ...string) {
 	RegisterModule("server")
 	attrs := make([]Attribute, 0, len(labels)/2+1)

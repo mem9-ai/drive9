@@ -115,6 +115,7 @@ func NewWithConfig(cfg Config) *Server {
 	if logger == nil {
 		logger, _ = zap.NewProduction()
 	}
+	metrics.SetModuleAvailability("vault", false)
 	var vaultMK *vault.MasterKey
 	if len(cfg.VaultMasterKey) > 0 {
 		var err error

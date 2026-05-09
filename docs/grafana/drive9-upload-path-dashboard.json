@@ -55,7 +55,7 @@
       },
       "id": 100,
       "options": {
-        "content": "# Upload Path Performance\n\nCategory: request-path drill-down.\n\nUse this when the issue is clearly on initiate, presign, confirm, finalize, resume, or abort upload flows. This dashboard owns the upload path and should be preferred over the generic API surface dashboard for upload symptoms. Start with HTTP throughput and tail latency, then compare service-operation latency, and finally check conflict, expired, and error event pressure. It does not show raw S3 SDK timings because those metrics do not exist yet, so the scope is the upload path rather than raw S3 internals.",
+        "content": "# Upload Path Performance\n\nCategory: request-path drill-down.\n\nUse this when the issue is clearly on initiate, presign, confirm, finalize, resume, or abort upload flows. This dashboard owns the upload path and should be preferred over the generic API surface dashboard for upload symptoms. Start with HTTP throughput and tail latency, then compare service-operation latency, and finally check conflict, expired, and error event pressure. If the symptom narrows past the upload control path into raw object-store behavior, continue into the upload plus S3 drill-down dashboard for s3client throughput and latency.",
         "mode": "markdown"
       },
       "title": "Guide",

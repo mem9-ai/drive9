@@ -1425,6 +1425,9 @@ func TestMetricsEndpoint(t *testing.T) {
 	if !strings.Contains(text, "dat9_http_inflight_requests") {
 		t.Fatalf("expected inflight metric in response: %s", text)
 	}
+	if !strings.Contains(text, `dat9_http_inflight_requests{route="/v1/fs/*"} 0.000000`) {
+		t.Fatalf("expected route-scoped inflight metric in response: %s", text)
+	}
 	if !strings.Contains(text, `dat9_service_operations_total{component="backend",operation="exec_sql",result="ok"}`) {
 		t.Fatalf("expected backend service metric in response: %s", text)
 	}
@@ -1434,7 +1437,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	if !strings.Contains(text, `dat9_service_operation_duration_seconds_bucket{component="backend",operation="exec_sql",result="ok",le="0.01"}`) {
 		t.Fatalf("expected service operation histogram bucket in response: %s", text)
 	}
-	if !strings.Contains(text, `dat9_db_operations_total{role="user"`) {
+	if !strings.Contains(text, `dat9_db_operations_total{operation="`) || !strings.Contains(text, `role="user"`) {
 		t.Fatalf("expected user db operation metric in response: %s", text)
 	}
 	if !strings.Contains(text, `tenant_id="local"`) {

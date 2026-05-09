@@ -57,6 +57,25 @@ type histogramInstrument struct {
 	boundsS []string
 }
 
+type counterSnapshot struct {
+	desc   descriptor
+	labels []string
+	values map[string]int64
+}
+
+type gaugeSnapshot struct {
+	desc   descriptor
+	labels []string
+	values map[string]float64
+}
+
+type histogramSnapshot struct {
+	desc    descriptor
+	labels  []string
+	samples map[string]histogramSample
+	boundsS []string
+}
+
 type moduleState struct {
 	registeredAt time.Time
 	up           float64
@@ -328,17 +347,23 @@ func (r *Registry) writeCounters(w io.Writer) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	snapshots := make([]counterSnapshot, 0, len(names))
 	for _, name := range names {
 		inst := r.counters[name]
-		labels := SortedKeys(inst.values)
-		values := CloneIntMap(inst.values)
-		_, _ = fmt.Fprintf(w, "# HELP %s %s\n", inst.desc.name, inst.desc.help)
-		_, _ = fmt.Fprintf(w, "# TYPE %s counter\n", inst.desc.name)
-		for _, labelSet := range labels {
-			writeMetricLine(w, inst.desc.name, labelSet, fmt.Sprintf("%d", values[labelSet]))
-		}
+		snapshots = append(snapshots, counterSnapshot{
+			desc:   inst.desc,
+			labels: SortedKeys(inst.values),
+			values: CloneIntMap(inst.values),
+		})
 	}
 	r.mu.RUnlock()
+	for _, snapshot := range snapshots {
+		_, _ = fmt.Fprintf(w, "# HELP %s %s\n", snapshot.desc.name, snapshot.desc.help)
+		_, _ = fmt.Fprintf(w, "# TYPE %s counter\n", snapshot.desc.name)
+		for _, labelSet := range snapshot.labels {
+			writeMetricLine(w, snapshot.desc.name, labelSet, fmt.Sprintf("%d", snapshot.values[labelSet]))
+		}
+	}
 }
 
 func (r *Registry) writeHistograms(w io.Writer) {
@@ -348,6 +373,7 @@ func (r *Registry) writeHistograms(w io.Writer) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	snapshots := make([]histogramSnapshot, 0, len(names))
 	for _, name := range names {
 		inst := r.histograms[name]
 		labels := make([]string, 0, len(inst.values))
@@ -359,19 +385,27 @@ func (r *Registry) writeHistograms(w io.Writer) {
 			samples[labelSet] = copied
 		}
 		sort.Strings(labels)
-		_, _ = fmt.Fprintf(w, "# HELP %s %s\n", inst.desc.name, inst.desc.help)
-		_, _ = fmt.Fprintf(w, "# TYPE %s histogram\n", inst.desc.name)
-		for _, labelSet := range labels {
-			sample := samples[labelSet]
-			for i, bound := range inst.boundsS {
-				writeMetricLine(w, inst.desc.name+"_bucket", appendBound(labelSet, bound), fmt.Sprintf("%d", sample.buckets[i]))
-			}
-			writeMetricLine(w, inst.desc.name+"_bucket", appendBound(labelSet, "+Inf"), fmt.Sprintf("%d", sample.count))
-			writeMetricLine(w, inst.desc.name+"_count", labelSet, fmt.Sprintf("%d", sample.count))
-			writeMetricLine(w, inst.desc.name+"_sum", labelSet, formatFloat(sample.sum))
-		}
+		snapshots = append(snapshots, histogramSnapshot{
+			desc:    inst.desc,
+			labels:  labels,
+			samples: samples,
+			boundsS: append([]string(nil), inst.boundsS...),
+		})
 	}
 	r.mu.RUnlock()
+	for _, snapshot := range snapshots {
+		_, _ = fmt.Fprintf(w, "# HELP %s %s\n", snapshot.desc.name, snapshot.desc.help)
+		_, _ = fmt.Fprintf(w, "# TYPE %s histogram\n", snapshot.desc.name)
+		for _, labelSet := range snapshot.labels {
+			sample := snapshot.samples[labelSet]
+			for i, bound := range snapshot.boundsS {
+				writeMetricLine(w, snapshot.desc.name+"_bucket", appendBound(labelSet, bound), fmt.Sprintf("%d", sample.buckets[i]))
+			}
+			writeMetricLine(w, snapshot.desc.name+"_bucket", appendBound(labelSet, "+Inf"), fmt.Sprintf("%d", sample.count))
+			writeMetricLine(w, snapshot.desc.name+"_count", labelSet, fmt.Sprintf("%d", sample.count))
+			writeMetricLine(w, snapshot.desc.name+"_sum", labelSet, formatFloat(sample.sum))
+		}
+	}
 }
 
 func (r *Registry) writeGauges(w io.Writer) {
@@ -381,17 +415,23 @@ func (r *Registry) writeGauges(w io.Writer) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	snapshots := make([]gaugeSnapshot, 0, len(names))
 	for _, name := range names {
 		inst := r.gauges[name]
-		labels := SortedKeys(inst.values)
-		values := CloneFloatMap(inst.values)
-		_, _ = fmt.Fprintf(w, "# HELP %s %s\n", inst.desc.name, inst.desc.help)
-		_, _ = fmt.Fprintf(w, "# TYPE %s gauge\n", inst.desc.name)
-		for _, labelSet := range labels {
-			writeMetricLine(w, inst.desc.name, labelSet, formatFloat(values[labelSet]))
-		}
+		snapshots = append(snapshots, gaugeSnapshot{
+			desc:   inst.desc,
+			labels: SortedKeys(inst.values),
+			values: CloneFloatMap(inst.values),
+		})
 	}
 	r.mu.RUnlock()
+	for _, snapshot := range snapshots {
+		_, _ = fmt.Fprintf(w, "# HELP %s %s\n", snapshot.desc.name, snapshot.desc.help)
+		_, _ = fmt.Fprintf(w, "# TYPE %s gauge\n", snapshot.desc.name)
+		for _, labelSet := range snapshot.labels {
+			writeMetricLine(w, snapshot.desc.name, labelSet, formatFloat(snapshot.values[labelSet]))
+		}
+	}
 }
 
 func labelsKey(attrs []Attribute) string {
@@ -415,6 +455,7 @@ func labelsKey(attrs []Attribute) string {
 	if len(labels) == 0 {
 		return ""
 	}
+	sort.Strings(keys)
 	var b strings.Builder
 	for i, key := range keys {
 		if i > 0 {

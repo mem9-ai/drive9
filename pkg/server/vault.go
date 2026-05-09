@@ -283,12 +283,12 @@ func (s *Server) handleVaultSecretReadValue(w http.ResponseWriter, r *http.Reque
 			_, _ = fmt.Fprintf(w, "%s=%s\n", strings.ToUpper(k), string(v))
 		}
 	case "json", "":
-		result := make(map[string]string, len(fields))
+		payload := make(map[string]string, len(fields))
 		for k, v := range fields {
-			result[k] = string(v)
+			payload[k] = string(v)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(result)
+		_ = json.NewEncoder(w).Encode(payload)
 	default:
 		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, "unsupported format")
@@ -991,12 +991,12 @@ func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, v
 			_, _ = fmt.Fprintf(w, "%s=%s\n", strings.ToUpper(k), string(v))
 		}
 	case "json", "":
-		result := make(map[string]string, len(fields))
+		payload := make(map[string]string, len(fields))
 		for k, v := range fields {
-			result[k] = string(v)
+			payload[k] = string(v)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(result)
+		_ = json.NewEncoder(w).Encode(payload)
 	default:
 		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, "unsupported format")

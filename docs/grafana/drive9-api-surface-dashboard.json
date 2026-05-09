@@ -322,7 +322,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "dat9_http_inflight_requests",
+          "expr": "sum(dat9_http_inflight_requests{route=~\"$route\"})",
           "legendFormat": "inflight",
           "refId": "A"
         }
@@ -662,7 +662,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "dat9_http_inflight_requests",
+          "expr": "sum(dat9_http_inflight_requests{route=~\"$route\"})",
           "legendFormat": "inflight",
           "refId": "B"
         }

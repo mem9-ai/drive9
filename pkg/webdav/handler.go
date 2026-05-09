@@ -63,6 +63,16 @@ func (w *statusCapturingResponseWriter) Write(p []byte) (int, error) {
 	return w.ResponseWriter.Write(p)
 }
 
+func (w *statusCapturingResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *statusCapturingResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 func (w *statusCapturingResponseWriter) statusCode() int {
 	if w.status == 0 {
 		return http.StatusOK

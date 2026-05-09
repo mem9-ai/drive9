@@ -322,7 +322,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$http_route\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval])), 1)",
+          "expr": "sum(rate(dat9_http_requests_total{route=~\"$http_route\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval])), 0.000001)",
           "legendFormat": "fs_5xx_ratio",
           "refId": "A"
         }

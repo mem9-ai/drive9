@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -58,12 +59,14 @@ func metricEvent(ctx context.Context, event string, labels ...string) {
 
 type serverMetrics struct {
 	inFlight atomic.Int64
+	routeMu  sync.Mutex
+	routes   map[string]int64
 }
 
 func newServerMetrics() *serverMetrics {
 	metrics.SetModuleAvailability("server", true)
 	metrics.RecordHTTPInFlight(0)
-	return &serverMetrics{}
+	return &serverMetrics{routes: map[string]int64{}}
 }
 
 func (m *serverMetrics) record(method, route string, status int, d time.Duration) {
@@ -76,6 +79,22 @@ func (m *serverMetrics) recordEvent(event string, labels ...string) {
 
 func (m *serverMetrics) writePrometheus(w http.ResponseWriter) {
 	metrics.WritePrometheus(w)
+}
+
+func (m *serverMetrics) adjustRouteInFlight(route string, delta int64) int64 {
+	route = strings.TrimSpace(route)
+	if route == "" {
+		route = "other"
+	}
+	m.routeMu.Lock()
+	defer m.routeMu.Unlock()
+	next := m.routes[route] + delta
+	if next <= 0 {
+		delete(m.routes, route)
+		return 0
+	}
+	m.routes[route] = next
+	return next
 }
 
 type observedResponseWriter struct {
@@ -160,14 +179,17 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 	w.Header().Set("X-Trace-ID", traceID)
 
 	start := time.Now()
+	route := requestRoute(r.URL.Path)
 	ow := &observedResponseWriter{ResponseWriter: w}
 	rw := http.ResponseWriter(ow)
 	if f, ok := w.(http.Flusher); ok {
 		rw = &flusherResponseWriter{observedResponseWriter: ow, flusher: f}
 	}
 	metrics.RecordHTTPInFlight(float64(s.metrics.inFlight.Add(1)))
+	metrics.RecordHTTPInFlightRoute(route, float64(s.metrics.adjustRouteInFlight(route, 1)))
 	defer func() {
 		metrics.RecordHTTPInFlight(float64(s.metrics.inFlight.Add(-1)))
+		metrics.RecordHTTPInFlightRoute(route, float64(s.metrics.adjustRouteInFlight(route, -1)))
 	}()
 
 	next.ServeHTTP(rw, r)
@@ -176,7 +198,6 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 	}
 
 	dur := time.Since(start)
-	route := requestRoute(r.URL.Path)
 	s.metrics.record(r.Method, route, ow.status, dur)
 
 	tenantID := ""
