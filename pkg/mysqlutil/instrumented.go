@@ -11,7 +11,6 @@ import (
 	mysql "github.com/go-sql-driver/mysql"
 
 	"github.com/mem9-ai/dat9/pkg/metrics"
-	"github.com/mem9-ai/dat9/pkg/tenantctx"
 )
 
 const (
@@ -115,7 +114,7 @@ func (c instrumentedConn) PrepareContext(ctx context.Context, query string) (dri
 	if err != nil {
 		return nil, err
 	}
-	return instrumentedStmt{base: stmt, role: c.role, tenantID: tenantctx.TenantIDFromContext(ctx)}, nil
+	return instrumentedStmt{base: stmt, role: c.role}, nil
 }
 
 func (c instrumentedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
@@ -128,7 +127,7 @@ func (c instrumentedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (d
 		if err != nil {
 			return nil, err
 		}
-		return instrumentedTx{base: tx, role: c.role, tenantID: tenantctx.TenantIDFromContext(ctx)}, nil
+		return instrumentedTx{base: tx, role: c.role}, nil
 	}
 	if opts.Isolation != driver.IsolationLevel(0) || opts.ReadOnly {
 		return nil, fmt.Errorf("driver does not support non-default transaction options")
@@ -189,7 +188,6 @@ func (c instrumentedConn) CheckNamedValue(nv *driver.NamedValue) error {
 type instrumentedStmt struct {
 	base driver.Stmt
 	role string
-	tenantID string
 }
 
 func (s instrumentedStmt) Close() error {
@@ -216,7 +214,7 @@ func (s instrumentedStmt) ExecContext(ctx context.Context, args []driver.NamedVa
 	start := time.Now()
 	res, err := execer.ExecContext(ctx, args)
 	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(withTenantID(ctx, s.tenantID), s.role, "exec", start, err)
+		observeDBOperation(ctx, s.role, "exec", start, err)
 	}
 	return res, err
 }
@@ -229,7 +227,7 @@ func (s instrumentedStmt) QueryContext(ctx context.Context, args []driver.NamedV
 	start := time.Now()
 	rows, err := queryer.QueryContext(ctx, args)
 	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(withTenantID(ctx, s.tenantID), s.role, "query", start, err)
+		observeDBOperation(ctx, s.role, "query", start, err)
 	}
 	return rows, err
 }
@@ -245,14 +243,13 @@ func (s instrumentedStmt) CheckNamedValue(nv *driver.NamedValue) error {
 type instrumentedTx struct {
 	base driver.Tx
 	role string
-	tenantID string
 }
 
 func (tx instrumentedTx) Commit() error {
 	start := time.Now()
 	err := tx.base.Commit()
 	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(withTenantID(context.Background(), tx.tenantID), tx.role, "commit", start, err)
+		observeDBOperation(context.Background(), tx.role, "commit", start, err)
 	}
 	return err
 }
@@ -261,20 +258,13 @@ func (tx instrumentedTx) Rollback() error {
 	start := time.Now()
 	err := tx.base.Rollback()
 	if !errors.Is(err, driver.ErrSkip) {
-		observeDBOperation(withTenantID(context.Background(), tx.tenantID), tx.role, "rollback", start, err)
+		observeDBOperation(context.Background(), tx.role, "rollback", start, err)
 	}
 	return err
 }
 
 func observeDBOperation(ctx context.Context, role, operation string, start time.Time, err error) {
-	metrics.RecordDBOperation(role, operation, dbResult(err), tenantctx.TenantIDFromContext(ctx), time.Since(start))
-}
-
-func withTenantID(ctx context.Context, tenantID string) context.Context {
-	if tenantctx.TenantIDFromContext(ctx) != "" {
-		return ctx
-	}
-	return tenantctx.WithTenantID(ctx, tenantID)
+	metrics.RecordDBOperation(role, operation, dbResult(err), time.Since(start))
 }
 
 func dbResult(err error) string {

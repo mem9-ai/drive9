@@ -8,7 +8,6 @@ import (
 	"github.com/mem9-ai/dat9/pkg/embedding"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
-	"github.com/mem9-ai/dat9/pkg/metrics"
 	"go.uber.org/zap"
 )
 
@@ -258,10 +257,7 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 		b.imageExtractMaxSize = cfg.MaxImageBytes
 		b.maxExtractTextBytes = cfg.MaxExtractTextBytes
 		b.imageExtractQueue = make(chan ImageExtractTaskSpec, cfg.QueueSize)
-		metrics.SetModuleAvailability("image_extract", true)
-		metrics.RecordGauge("image_extract", "queue_capacity", float64(cfg.QueueSize))
-		metrics.RecordGauge("image_extract", "workers", float64(cfg.Workers))
-		metrics.RecordGauge("image_extract", "queue_depth", 0)
+		globalBackendRuntimeMetrics.activateImage(b.runtimeMetricsID, cfg.QueueSize, cfg.Workers)
 
 		ctx, cancel := context.WithCancel(backgroundWithTrace())
 		b.imageExtractCancel = cancel
@@ -294,10 +290,7 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 		b.audioExtractTimeout = a.TaskTimeout
 		b.audioExtractMaxSize = a.MaxAudioBytes
 		b.maxAudioExtractTextBytes = a.MaxExtractTextBytes
-		metrics.SetModuleAvailability("audio_extract", true)
-		metrics.RecordGauge("audio_extract", "max_audio_bytes", float64(a.MaxAudioBytes))
-		metrics.RecordGauge("audio_extract", "max_extract_text_bytes", float64(a.MaxExtractTextBytes))
-		metrics.RecordGauge("audio_extract", "task_timeout_seconds", a.TaskTimeout.Seconds())
+		globalBackendRuntimeMetrics.activateAudio(b.runtimeMetricsID, a.MaxAudioBytes, a.MaxExtractTextBytes, a.TaskTimeout)
 		logger.Info(backgroundWithTrace(), "backend_audio_extract_runtime_configured",
 			zap.Duration("task_timeout", a.TaskTimeout),
 			zap.Int64("max_audio_bytes", a.MaxAudioBytes),
@@ -313,17 +306,14 @@ func (b *Dat9Backend) Close() {
 		b.imageExtractCancel()
 		b.imageExtractWG.Wait()
 		b.imageExtractCancel = nil
-		metrics.SetModuleAvailability("image_extract", false)
-		metrics.RecordGauge("image_extract", "workers", 0)
-		metrics.RecordGauge("image_extract", "queue_depth", 0)
+		globalBackendRuntimeMetrics.deactivateImage(b.runtimeMetricsID)
+		b.imageExtractEnabled = false
 		logger.Info(backgroundWithTrace(), "backend_image_extract_workers_stopped",
 			zap.Int("queue_depth", len(b.imageExtractQueue)),
 			zap.Int("queue_size", cap(b.imageExtractQueue)))
 	}
 	if b.audioExtractEnabled {
-		metrics.SetModuleAvailability("audio_extract", false)
-		metrics.RecordGauge("audio_extract", "max_audio_bytes", 0)
-		metrics.RecordGauge("audio_extract", "max_extract_text_bytes", 0)
-		metrics.RecordGauge("audio_extract", "task_timeout_seconds", 0)
+		globalBackendRuntimeMetrics.deactivateAudio(b.runtimeMetricsID)
+		b.audioExtractEnabled = false
 	}
 }

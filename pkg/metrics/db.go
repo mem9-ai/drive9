@@ -33,16 +33,15 @@ var globalDB = &dbMetrics{
 }
 
 var dbMeter = globalMeterProvider.Meter("db")
-var dbOperationsTotal = dbMeter.Int64Counter("dat9_db_operations_total", "Database operations by role/operation/result/tenant_id")
+var dbOperationsTotal = dbMeter.Int64Counter("dat9_db_operations_total", "Database operations by role/operation/result")
 var dbOperationDuration = dbMeter.Float64Histogram("dat9_db_operation_duration_seconds", "Database operation duration histogram", dbOperationDurationBounds)
 
-func RecordDBOperation(role, operation, result, tenantID string, d time.Duration) {
+func RecordDBOperation(role, operation, result string, d time.Duration) {
 	RegisterModule("db")
 	attrs := []Attribute{
 		Attr("role", cleanMetricValue(role, "unknown")),
 		Attr("operation", cleanMetricValue(operation, "unknown")),
 		Attr("result", cleanMetricValue(result, "unknown")),
-		Attr("tenant_id", tenantID),
 	}
 	dbOperationsTotal.Add(1, attrs...)
 	dbOperationDuration.Observe(d.Seconds(), attrs...)
