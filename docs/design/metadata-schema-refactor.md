@@ -313,6 +313,7 @@ BEGIN;
   SET storage_type = ?, storage_ref = ?, content_blob = ?, content_type = ?,
       checksum_sha256 = ?
   WHERE inode_id = ?;
+  -- (verify affected rows >= 1; if 0, the contents row is missing — abort and investigate)
 
   -- 3. Update semantic search data
   UPDATE semantic
@@ -422,7 +423,7 @@ CREATE TABLE inodes (...);
 CREATE TABLE contents (...);
 CREATE TABLE semantic (...);
 
--- 2. Migrate existing files
+-- 2. Migrate existing files (TiDB / MySQL)
 INSERT INTO inodes (inode_id, size_bytes, revision, mode, status, created_at, confirmed_at, expires_at)
 SELECT file_id, size_bytes, revision, 420, status, created_at, confirmed_at, expires_at
 FROM files WHERE status != 'DELETED';
@@ -436,6 +437,14 @@ INSERT INTO semantic (inode_id, content_text, description, embedding, embedding_
 SELECT file_id, content_text, description, embedding, embedding_revision, description_embedding, description_embedding_revision
 FROM files WHERE status != 'DELETED';
 
+-- db9 / PostgreSQL variant (idempotent, safe to re-run):
+-- INSERT INTO inodes (...) SELECT ... FROM files WHERE status != 'DELETED'
+--   ON CONFLICT (inode_id) DO NOTHING;
+-- INSERT INTO contents (...) SELECT ... FROM files WHERE status != 'DELETED'
+--   ON CONFLICT (inode_id) DO NOTHING;
+-- INSERT INTO semantic (...) SELECT ... FROM files WHERE status != 'DELETED'
+--   ON CONFLICT (inode_id) DO NOTHING;
+
 -- 3. Create directory inode records
 INSERT INTO inodes (inode_id, size_bytes, revision, mode, status, created_at, confirmed_at)
 SELECT node_id, 0, 1, 493, 'CONFIRMED', created_at, created_at
@@ -443,10 +452,19 @@ FROM file_nodes WHERE is_directory = 1;
 
 UPDATE file_nodes SET inode_id = node_id WHERE is_directory = 1 AND inode_id IS NULL;
 
--- 4. Rename FK columns
+-- 4. Rename columns
+-- TiDB / MySQL:
+ALTER TABLE file_nodes CHANGE file_id inode_id VARCHAR(64);
+ALTER TABLE file_nodes RENAME INDEX idx_file_id TO idx_inode_id;
 ALTER TABLE file_tags CHANGE file_id inode_id VARCHAR(64) NOT NULL;
 ALTER TABLE uploads CHANGE file_id inode_id VARCHAR(64) NOT NULL;
 ALTER TABLE file_gc_tasks CHANGE file_id inode_id VARCHAR(64) NOT NULL;
+-- db9 / PostgreSQL:
+-- ALTER TABLE file_nodes RENAME COLUMN file_id TO inode_id;
+-- ALTER INDEX idx_file_id RENAME TO idx_inode_id;
+-- ALTER TABLE file_tags RENAME COLUMN file_id TO inode_id;
+-- ALTER TABLE uploads RENAME COLUMN file_id TO inode_id;
+-- ALTER TABLE file_gc_tasks RENAME COLUMN file_id TO inode_id;
 
 -- 5. Verify: run a full integration test suite against the new schema
 -- 6. Switch application code to use new tables
