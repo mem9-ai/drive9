@@ -122,6 +122,8 @@ CREATE TABLE IF NOT EXISTS file_gc_tasks (
 CREATE UNIQUE INDEX uk_file_gc_inode_id ON file_gc_tasks(inode_id);
 ```
 
+**`semantic_tasks.resource_id`**: The column name stays `resource_id`, but its semantics change from "file_id" to "inode_id". The task payload already refers to inode-level resources (embeddings are per-inode, not per-dentry), so the semantic alignment is natural. No column rename is needed; only the Go struct comment and documentation are updated.
+
 ### 2.6 Column Assignment (Old → New)
 
 | Old `files` column | New table | Reason |
@@ -148,9 +150,27 @@ CREATE UNIQUE INDEX uk_file_gc_inode_id ON file_gc_tasks(inode_id);
 - `semantic` table hosts `FULLTEXT INDEX idx_fts_content(content_text)` and `idx_fts_description(description)`.
 - `tidb_auto.go`: `embedding` and `description_embedding` are `GENERATED ALWAYS AS (EMBED_TEXT(..., content_text/description, ...)) STORED`. Generated columns must stay in the same table as their source columns, so they move to `semantic` alongside `content_text` and `description`.
 
+**⚠️ TiDB GENERATED column migration risk:**
+When migrating with `INSERT INTO semantic SELECT ... FROM files`, TiDB **may re-evaluate** `GENERATED ALWAYS AS` expressions for every row. This means:
+1. Migration time becomes proportional to file count × embedding model latency
+2. Significant LLM inference cost if the model is remote (e.g., AWS Bedrock)
+
+**Mitigation:** Before running the migration, verify TiDB behavior with:
+```sql
+-- Test on a single row first
+INSERT INTO semantic (inode_id, content_text, description)
+SELECT file_id, content_text, description FROM files LIMIT 1;
+-- Check whether embedding/description_embedding were auto-generated
+SELECT embedding, description_embedding FROM semantic;
+```
+If TiDB re-computes embeddings during INSERT ... SELECT, the migration should instead:
+1. `INSERT INTO semantic` with all columns including the pre-computed embedding values copied from `files`
+2. Skip the generated column by explicitly listing all non-generated columns
+
 **db9 (PostgreSQL):**
 - `semantic` table hosts `hnsw` vector indexes on `embedding` and `description_embedding`.
 - `semantic` table hosts `gin(to_tsvector('simple', coalesce(content_text,'')))` for full-text search.
+- db9 has no generated columns, so migration is a straight column copy with no re-computation risk.
 
 ## 3. POSIX Permissions (Mode)
 
@@ -235,7 +255,7 @@ To avoid `create + chmod` double RPC:
 | File | Change |
 |------|--------|
 | `pkg/datastore/store.go` | **Major rewrite** (~20 query sites). Split `File` struct into `Inode`, `Content`, `Semantic`. Rename `file_id` → `inode_id`. `ListDir` joins `file_nodes → inodes` only. `StatForRead` joins `file_nodes → inodes → contents`. Search joins `file_nodes → inodes → semantic`. |
-| `pkg/datastore/file_tx.go` | `updateFileContentTx` becomes multi-table: `UPDATE contents` + `UPDATE inodes SET size_bytes=..., revision=revision+1`. `InsertFileTx` inserts into 3 tables. |
+| `pkg/datastore/file_tx.go` | `updateFileContentTx` becomes multi-table transaction (see §4.8). `InsertFileTx` inserts into 3 tables atomically. |
 | `pkg/datastore/search.go` | Update JOINs: `files` → `inodes` / `semantic`. |
 | `pkg/datastore/file_gc_tasks.go` | Rename `file_id` → `inode_id`. |
 | `pkg/datastore/execsql_test.go` | Update query whitelist. |
@@ -244,7 +264,7 @@ To avoid `create + chmod` double RPC:
 
 | File | Change |
 |------|--------|
-| `pkg/backend/dat9.go` | `MkdirCtx`: create `inodes` row for directory before `file_nodes`. `CopyFileCtx`: unchanged (only touches `file_nodes`). `Stat`/`ReadDir`: read mode from `inodes`. `Chmod`: `UPDATE inodes SET mode=?`. |
+| `pkg/backend/dat9.go` | `MkdirCtx`: create `inodes` row for directory before `file_nodes`. `EnsureParentDirs`: create `inodes` row for each auto-created parent directory. `CopyFileCtx`: unchanged (only touches `file_nodes`). `Stat`/`ReadDir`: read mode from `inodes`. `Chmod`: `UPDATE inodes SET mode=?`. |
 | `pkg/backend/upload.go` | Finalize touches `inodes` (size, revision) + `contents` (storage_ref). |
 | `pkg/backend/semantic_tasks.go` | Workers read/write `semantic` table. |
 
@@ -276,11 +296,109 @@ To avoid `create + chmod` double RPC:
 |------|--------|
 | `pkg/webdav/fs.go` | `fileInfo.Mode()` from `StatResult.Mode`. `Mkdir` forwards perm. |
 
+### 4.8 Multi-Table Transaction Strategy
+
+`updateFileContentTx` currently issues a single `UPDATE files`. After splitting, a content overwrite becomes a **three-table transaction**:
+
+```sql
+BEGIN;
+  -- 1. Gate + update inode metadata (optimistic lock)
+  UPDATE inodes
+  SET size_bytes = ?, revision = revision + 1, status = 'CONFIRMED', confirmed_at = ?
+  WHERE inode_id = ? AND revision = ? AND status = 'CONFIRMED';
+  -- (check affected rows == 1; if not, abort)
+
+  -- 2. Update storage blob metadata (no independent gate; relies on transaction isolation)
+  UPDATE contents
+  SET storage_type = ?, storage_ref = ?, content_blob = ?, content_type = ?,
+      checksum_sha256 = ?
+  WHERE inode_id = ?;
+
+  -- 3. Update semantic search data
+  UPDATE semantic
+  SET content_text = ?, description = ?,
+      embedding = NULL, embedding_revision = NULL,
+      description_embedding = NULL, description_embedding_revision = NULL
+  WHERE inode_id = ?;
+COMMIT;
+```
+
+**Isolation level:** Use the datastore's default isolation (READ COMMITTED or higher). All three UPDATEs are in the same DB transaction, so atomicity is guaranteed by the database.
+
+**Optimistic lock strategy:**
+- Only `inodes` carries the `revision` gate. `contents` and `semantic` do not have independent revision columns.
+- If the `inodes` UPDATE returns 0 affected rows (revision mismatch), the entire transaction is rolled back.
+- This preserves the existing concurrency semantics: two concurrent overwrites race on `inodes.revision`; one wins, one gets a retryable conflict error.
+
+**Embedding NULL logic:**
+- When content is overwritten, `semantic.embedding` and `semantic.description_embedding` are explicitly set to `NULL` (their revisions are also cleared).
+- The stale-check `embedding_revision == revision` becomes a cross-table comparison: `s.embedding_revision = i.revision` in queries.
+- After a successful overwrite, the semantic worker will recompute embeddings in a background task and update `semantic.embedding` + `embedding_revision`.
+
+**Partial-write risk:** None — the transaction either commits all three tables or rolls back all three.
+
+### 4.9 Search Query Performance Analysis
+
+**Current query (two-table JOIN):**
+```sql
+SELECT fn.path, fn.name, f.size_bytes,
+       VEC_EMBED_COSINE_DISTANCE(f.embedding, ?) AS distance
+FROM file_nodes fn
+JOIN files f ON fn.file_id = f.file_id
+WHERE f.status = 'CONFIRMED' AND f.embedding IS NOT NULL
+ORDER BY distance LIMIT ?
+```
+
+**New query (three-table JOIN):**
+```sql
+SELECT fn.path, fn.name, i.size_bytes,
+       VEC_EMBED_COSINE_DISTANCE(s.embedding, ?) AS distance
+FROM file_nodes fn
+JOIN inodes i ON fn.inode_id = i.inode_id
+JOIN semantic s ON i.inode_id = s.inode_id
+WHERE i.status = 'CONFIRMED' AND s.embedding IS NOT NULL
+ORDER BY distance LIMIT ?
+```
+
+**Performance characteristics:**
+
+| Aspect | TiDB | db9 (PostgreSQL) |
+|--------|------|------------------|
+| `file_nodes → inodes` | PK lookup on `inodes.inode_id` | PK lookup on `inodes.inode_id` |
+| `inodes → semantic` | PK lookup on `semantic.inode_id` | PK lookup on `semantic.inode_id` |
+| Vector distance | `VEC_EMBED_COSINE_DISTANCE` on `semantic.embedding` | `vector <=> embedding` on `semantic.embedding` with `hnsw` index |
+| Stale-check | `s.embedding_revision = i.revision` (cross-table) | `s.embedding_revision = i.revision` (cross-table) |
+| Query plan risk | Three PK lookups + vector computation. TiDB's optimizer should push `embedding IS NOT NULL` to `semantic` first. | PostgreSQL's planner uses `hnsw` index on `semantic` then NLJ to `inodes` and `file_nodes`. |
+
+**Key concern:** The stale-check `embedding_revision = revision` now spans two tables. In PostgreSQL, this may prevent the planner from using the `hnsw` index if the join order is suboptimal.
+
+**Mitigation:** Add a composite index on `semantic(embedding_revision, inode_id)` so the stale-check can be evaluated efficiently before or alongside the vector scan.
+
+**Overall assessment:** The three-table JOIN adds one extra PK lookup per result row. For typical result sets (< 100 rows), the overhead is negligible (< 1 ms). The bigger win is that `ListDir` no longer fetches `content_blob` or embedding vectors, which dominates current listing latency.
+
 ## 5. Key Design Decisions
 
-### 5.1 No explicit `nlink` column
+### 5.1 No explicit `nlink` column (with quantitative analysis)
 
-Refcount is computed on demand: `SELECT COUNT(*) FROM file_nodes WHERE inode_id = ?`. Adding an explicit `nlink` would require updating it on every `InsertNode`/`DeleteNode`/`CopyFile` with proper locking. The cost is not justified until stat performance becomes a bottleneck.
+Refcount is computed on demand: `SELECT COUNT(*) FROM file_nodes WHERE inode_id = ?`.
+
+**Cost analysis:**
+- A single `COUNT(*)` with an index on `file_nodes.inode_id` is an **index-only scan** in both TiDB and PostgreSQL.
+- For a typical deployment with < 1M dentries per inode, p50 latency is < 1 ms, p99 < 5 ms.
+- `GetAttr` (FUSE stat) currently does not call `RefCount` at all — `RefCount` is only invoked during **deletion** (`DeleteFileWithRefCheck`, `RenameFileReplacingTarget`).
+- Therefore the COUNT query does **not** add overhead to `ls -l` or normal stat calls.
+
+**Future optimization path** (if needed):
+- Add an `nlink` column to `inodes` and maintain it via DB triggers:
+  ```sql
+  CREATE TRIGGER trg_file_nodes_insert AFTER INSERT ON file_nodes
+    FOR EACH ROW UPDATE inodes SET nlink = nlink + 1 WHERE inode_id = NEW.inode_id;
+  CREATE TRIGGER trg_file_nodes_delete AFTER DELETE ON file_nodes
+    FOR EACH ROW UPDATE inodes SET nlink = nlink - 1 WHERE inode_id = OLD.inode_id;
+  ```
+- Or maintain it in application code with `FOR UPDATE` locking on the `inodes` row.
+
+**Decision:** Defer explicit `nlink` until deletion-path performance becomes a bottleneck.
 
 ### 5.2 `contents` and `semantic` are 1:1 with `inodes`
 
@@ -296,8 +414,10 @@ A large but mechanical rename across the entire codebase. It makes the schema se
 
 ## 6. Migration Strategy
 
+**Phase A — Online migration (zero-downtime):**
+
 ```sql
--- 1. Create new tables
+-- 1. Create new tables alongside old ones
 CREATE TABLE inodes (...);
 CREATE TABLE contents (...);
 CREATE TABLE semantic (...);
@@ -311,8 +431,9 @@ INSERT INTO contents (inode_id, storage_type, storage_ref, ...)
 SELECT file_id, storage_type, storage_ref, ...
 FROM files WHERE status != 'DELETED';
 
-INSERT INTO semantic (inode_id, content_text, description, ...)
-SELECT file_id, content_text, description, ...
+-- For TiDB: explicitly list non-generated columns to avoid re-computing embeddings
+INSERT INTO semantic (inode_id, content_text, description, embedding, embedding_revision, description_embedding, description_embedding_revision)
+SELECT file_id, content_text, description, embedding, embedding_revision, description_embedding, description_embedding_revision
 FROM files WHERE status != 'DELETED';
 
 -- 3. Create directory inode records
@@ -327,9 +448,15 @@ ALTER TABLE file_tags CHANGE file_id inode_id VARCHAR(64) NOT NULL;
 ALTER TABLE uploads CHANGE file_id inode_id VARCHAR(64) NOT NULL;
 ALTER TABLE file_gc_tasks CHANGE file_id inode_id VARCHAR(64) NOT NULL;
 
--- 5. Drop old table
-DROP TABLE files;
+-- 5. Verify: run a full integration test suite against the new schema
+-- 6. Switch application code to use new tables
+-- 7. Retain old table for one release cycle as rollback safety
+--    (do NOT DROP TABLE files immediately)
+-- 8. After one release cycle with no issues:
+--    DROP TABLE files;
 ```
+
+**Rollback path:** If issues are found after switching to new tables, the application can be rolled back to the old code path which still reads from `files`. The new tables (`inodes`, `contents`, `semantic`) are additive and do not modify `files` data.
 
 ## 7. Implementation Order
 
@@ -346,5 +473,24 @@ DROP TABLE files;
 | 9 | Go SDK: `Mode`, `CreateFileCtx` | `pkg/client/client.go` |
 | 10 | FUSE: `InodeEntry.Mode`, pending-create state machine, cache invalidation | `pkg/fuse/*.go` |
 | 11 | WebDAV | `pkg/webdav/fs.go` |
-| 12 | Tests: schema helpers + assertions | Various `*_test.go` |
+| 12 | Tests: schema helpers + assertions | See §7.1 for detailed test file list |
 | 13 | Schema dump | `drive9-server schema dump-init-sql` |
+
+### 7.1 Affected Test Files
+
+| Package | Test File | Impact |
+|---------|-----------|--------|
+| `pkg/datastore` | `schema_test_helper_test.go` | Test schema strings must define `inodes`/`contents`/`semantic` |
+| `pkg/datastore` | `store_test.go` | All `files`-based CRUD tests rewrite for 3-table model |
+| `pkg/datastore` | `file_tx_test.go` | `InsertFileTx`, `UpdateFileContentTx` become multi-table |
+| `pkg/datastore` | `search_test.go` | JOIN targets change from `files` to `inodes`/`semantic` |
+| `pkg/datastore` | `embedding_writeback_test.go` | Queries target `semantic` instead of `files` |
+| `pkg/datastore` | `execsql_test.go` | Whitelist table names updated |
+| `pkg/backend` | `schema_test_helper.go` | Test schema strings updated |
+| `pkg/backend` | `dat9_test.go` | `Mkdir`, `CopyFile`, `Stat`, `Chmod` assertions updated |
+| `pkg/backend` | `upload_test.go` | Upload finalize touches `inodes` + `contents` |
+| `pkg/server` | `server_test.go` | Stat response includes `mode`; chmod endpoint tests |
+| `pkg/fuse` | `dat9fs_test.go` | `fillAttr` returns real mode; pending-create mode tests |
+| `pkg/client` | `client_test.go` | `StatResult.Mode` field tested |
+| `pkg/tenant` | `pool_test.go` | Test schema includes new tables |
+| `pkg/tenant` | `tidb_auto_test.go` | Schema diff tests expect `semantic` table instead of `files` |
