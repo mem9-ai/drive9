@@ -347,22 +347,100 @@ func Mount(opts *MountOptions) error {
 
 	shutdown := newMountShutdown(sseWatcher.Stop, dat9fs.FlushAll)
 
-	// Signal handling for graceful shutdown
-	sigCh := make(chan os.Signal, 1)
+	// Signal handling for graceful shutdown.
+	//
+	// First SIGINT/SIGTERM:
+	//   1. Start a progress reporter goroutine that prints commit-queue
+	//      depth every 2s so the user knows we're not hung.
+	//   2. Call shutdown() — flushes open fds, drains commit queue.
+	//   3. Retry server.Unmount() up to 5 times (EBUSY is transient).
+	//   4. Fall back to forceUnmount on retry exhaustion.
+	//
+	// Second SIGINT/SIGTERM during step 1-3:
+	//   - Tell the user how much work is being abandoned (count + bytes).
+	//   - Surface where local state is preserved so they can recover or
+	//     inspect it. Do NOT promise automatic resume — recovery is
+	//     best-effort: ShadowSpill (large) files take the terminal-failure
+	//     branch on conflict (commit_queue.go:716-722) to avoid OOMing
+	//     during full-file byte comparison.
+	//   - forceUnmount the mountpoint so re-mount doesn't fail with
+	//     "Permission denied" (the FUSE endpoint must be released).
+	//   - Exit with code 1.
+	//
+	// Buffer size 2: outer goroutine consumes the first signal, inner
+	// goroutine the second. Buffer ≥ 2 ensures signals delivered between
+	// the outer's <-sigCh return and the inner goroutine being scheduled
+	// don't get dropped by signal.Notify.
+	//
+	// Headless/daemon limitation: if shutdown() blocks indefinitely on a
+	// stuck commit-queue worker (no context cancellation), an interactive
+	// user can press Ctrl+C twice; daemon operators must send a second
+	// SIGTERM (e.g. via systemd's TimeoutStopSec) to trigger force-quit.
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
 		<-sigCh
 		fmt.Fprintf(os.Stderr, "\ndrive9: unmounting %s...\n", opts.MountPoint)
 
-		// Second Ctrl+C during unmount exits immediately.
+		// Periodic progress reporter — stops when progressDone is closed.
+		// Distinguishes commit-queue uploads (where we have stats) from
+		// other drain phases (debouncer flush, per-fd flush, write-back
+		// drain) so users don't see "still uploading 0 files" and assume
+		// the process is hung.
+		progressDone := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-progressDone:
+					return
+				case <-ticker.C:
+					var n int
+					var b int64
+					if dat9fs.commitQueue != nil {
+						n, b = dat9fs.commitQueue.PendingStats()
+					}
+					if n > 0 {
+						fmt.Fprintf(os.Stderr,
+							"drive9: still uploading %d files (%s) — Ctrl+C again to force-quit\n",
+							n, humanizeBytes(b))
+					} else {
+						fmt.Fprintf(os.Stderr,
+							"drive9: still draining — Ctrl+C again to force-quit\n")
+					}
+				}
+			}
+		}()
+
+		// Forced-exit handler for the second signal.
 		go func() {
 			<-sigCh
-			fmt.Fprintf(os.Stderr, "drive9: forced exit\n")
+			n, b := 0, int64(0)
+			if dat9fs.commitQueue != nil {
+				n, b = dat9fs.commitQueue.PendingStats()
+			}
+			if n > 0 {
+				stateLoc := cacheBase
+				if stateLoc == "" {
+					stateLoc = "<cache disabled>"
+				}
+				fmt.Fprintf(os.Stderr,
+					"drive9: force-quit — abandoning %d files (%s); local state preserved in %s, but recovery is best-effort\n",
+					n, humanizeBytes(b), stateLoc)
+			} else {
+				fmt.Fprintf(os.Stderr, "drive9: force-quit\n")
+			}
+			forceUnmount(opts.MountPoint)
+			if pidFile != "" {
+				_ = os.Remove(pidFile)
+			}
 			os.Exit(1)
 		}()
 
 		shutdown()
+		close(progressDone)
 
 		// Retry unmount up to 5 times — EBUSY is transient (Spotlight, Finder).
 		const maxRetries = 5
@@ -400,23 +478,53 @@ func newMountShutdown(stopWatcher func(), flushAll func()) func() {
 }
 
 // forceUnmount shells out to OS-specific tools to force-unmount a FUSE mount.
+// Uses a 5-second timeout so that the forced-exit path can't itself hang
+// on a wedged FUSE endpoint.
 func forceUnmount(mountpoint string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	var cmd *exec.Cmd
 	if runtime.GOOS == "darwin" {
-		cmd = exec.Command("diskutil", "unmount", "force", mountpoint)
+		cmd = exec.CommandContext(ctx, "diskutil", "unmount", "force", mountpoint)
 	} else {
-		// Linux: try fusermount first, fall back to umount -l.
-		if _, err := exec.LookPath("fusermount"); err == nil {
-			cmd = exec.Command("fusermount", "-u", mountpoint)
+		// Linux: prefer fusermount3 (fuse3, default on Ubuntu 22.04+ /
+		// Debian 12+), then fusermount, then umount -l.
+		if _, err := exec.LookPath("fusermount3"); err == nil {
+			cmd = exec.CommandContext(ctx, "fusermount3", "-u", mountpoint)
+		} else if _, err := exec.LookPath("fusermount"); err == nil {
+			cmd = exec.CommandContext(ctx, "fusermount", "-u", mountpoint)
 		} else {
-			cmd = exec.Command("umount", "-l", mountpoint)
+			cmd = exec.CommandContext(ctx, "umount", "-l", mountpoint)
 		}
 	}
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "drive9: force unmount failed: %v\n", err)
+		if ctx.Err() == context.DeadlineExceeded {
+			fmt.Fprintf(os.Stderr, "drive9: force unmount timed out after 5s\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "drive9: force unmount failed: %v\n", err)
+		}
 	}
+}
+
+// humanizeBytes formats a byte count as a human-readable string (e.g. "1.5 MB").
+// Uses 1024-base (matches du -h, df -h, kernel reporting).
+func humanizeBytes(b int64) string {
+	if b < 0 {
+		b = 0
+	}
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 // generateMountID creates a random 16-byte hex ID for this mount instance.
