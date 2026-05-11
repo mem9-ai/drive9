@@ -96,7 +96,10 @@ func terminateMountProcess(state mountstate.ProcessState, waitTimeout time.Durat
 
 	handle, err := windows.OpenProcess(windows.SYNCHRONIZE|windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(state.PID))
 	if err != nil {
-		return fmt.Errorf("%w: mount process pid %d is no longer running", errMountProcessStateStale, state.PID)
+		if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+			return fmt.Errorf("%w: mount process pid %d is no longer running", errMountProcessStateStale, state.PID)
+		}
+		return fmt.Errorf("drive9 umount: inspect mount process pid %d: %w", state.PID, err)
 	}
 	defer func() { _ = windows.CloseHandle(handle) }()
 

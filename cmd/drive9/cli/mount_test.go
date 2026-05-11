@@ -477,6 +477,63 @@ func TestRunUmountWindowsStalePIDFileDoesNotTerminateProcess(t *testing.T) {
 	}
 }
 
+func TestRunUmountWindowsPermissionErrorKeepsPIDFile(t *testing.T) {
+	runCalls := 0
+	removeCalls := 0
+	inspectErr := errors.New("access is denied")
+	deps := umountDeps{
+		goos:     "windows",
+		lookPath: fakeLookPath(nil),
+		run: func(argv []string) error {
+			runCalls++
+			want := []string{"net", "use", "X:", "/delete", "/y"}
+			if !reflect.DeepEqual(argv, want) {
+				t.Fatalf("argv = %v, want %v", argv, want)
+			}
+			return nil
+		},
+		readProcessState: func(mountPoint string) (mountstate.ProcessState, string, error) {
+			if mountPoint != "X:\\" {
+				t.Fatalf("mountPoint = %q, want %q", mountPoint, "X:\\")
+			}
+			return mountstate.ProcessState{PID: 4321, CreationTime: 99}, "C:/tmp/drive9-webdav.pid", nil
+		},
+		terminateState: func(state mountstate.ProcessState, waitTimeout time.Duration) error {
+			if state.PID != 4321 {
+				t.Fatalf("pid = %d, want 4321", state.PID)
+			}
+			if state.CreationTime != 99 {
+				t.Fatalf("creationTime = %d, want 99", state.CreationTime)
+			}
+			return inspectErr
+		},
+		remove: func(path string) error {
+			removeCalls++
+			if path != "C:/tmp/drive9-webdav.pid" {
+				t.Fatalf("path = %q, want %q", path, "C:/tmp/drive9-webdav.pid")
+			}
+			return nil
+		},
+		now:       time.Now,
+		sleep:     func(time.Duration) {},
+		printErrf: func(string, ...any) {},
+	}
+
+	err := runUmount([]string{"x:\\"}, deps)
+	if err == nil {
+		t.Fatal("expected permission error")
+	}
+	if !errors.Is(err, inspectErr) {
+		t.Fatalf("err = %v, want wrapped %v", err, inspectErr)
+	}
+	if runCalls != 1 {
+		t.Fatalf("runCalls = %d, want 1", runCalls)
+	}
+	if removeCalls != 0 {
+		t.Fatalf("removeCalls = %d, want 0", removeCalls)
+	}
+}
+
 // TestResolveMountCredentials_OwnerFromResolver binds a mount to an owner
 // API key sourced from the resolver (no --api-key flag). Asserts that
 // apiKey routes through MountOptions.APIKey and token stays empty, which
