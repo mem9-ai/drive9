@@ -389,11 +389,18 @@ ORDER BY distance LIMIT ?
 
 ### 5.1 No explicit `nlink` column (with quantitative analysis)
 
-Refcount is computed on demand with locking:
+Refcount is computed on demand. Because `CopyFile` inserts a **new** `file_nodes` row, a plain `COUNT(*) ... FOR UPDATE` on existing rows does **not** block concurrent hardlink creation. The correct locking sequence is:
+
 ```sql
-SELECT COUNT(*) FROM file_nodes WHERE inode_id = ? FOR UPDATE;
+-- Step 1: Lock the inode row first. This blocks concurrent CopyFile/delete/replace
+--         on the same inode because they also lock the inode row.
+SELECT * FROM inodes WHERE inode_id = ? FOR UPDATE;
+
+-- Step 2: Count dentries (under the inode lock)
+SELECT COUNT(*) FROM file_nodes WHERE inode_id = ?;
 ```
-The `FOR UPDATE` lock on matching `file_nodes` rows prevents concurrent `CopyFile` (hardlink creation) from racing with deletion.
+
+`CopyFile`, `DeleteFileWithRefCheck`, and `ReplaceFile` must all acquire the `inodes` row lock (`SELECT ... FOR UPDATE`) before reading or mutating `file_nodes` rows for that inode. This serializes hardlink creation against deletion.
 
 **Cost analysis:**
 - A single `COUNT(*)` with an index on `file_nodes.inode_id` is an **index-only scan** in both TiDB and PostgreSQL.
@@ -427,7 +434,7 @@ A large but mechanical rename across the entire codebase. It makes the schema se
 
 ## 6. Migration Strategy
 
-**Phase A — Online migration (zero-downtime):**
+**Phase A — Online migration (expand, rollback-safe):**
 
 ```sql
 -- 1. Create new tables alongside old ones
@@ -436,17 +443,26 @@ CREATE TABLE contents (...);
 CREATE TABLE semantic (...);
 
 -- 2. Migrate existing files (TiDB / MySQL)
+--    Use COALESCE(confirmed_at, created_at) for mtime so pending uploads
+--    (confirmed_at IS NULL) do not violate the NOT NULL constraint.
 INSERT INTO inodes (inode_id, size_bytes, revision, mode, status, created_at, mtime, confirmed_at, expires_at)
-SELECT file_id, size_bytes, revision, 420, status, created_at, confirmed_at, confirmed_at, expires_at
+SELECT file_id, size_bytes, revision, 420, status, created_at, COALESCE(confirmed_at, created_at), confirmed_at, expires_at
 FROM files WHERE status != 'DELETED';
 
 INSERT INTO contents (inode_id, storage_type, storage_ref, ...)
 SELECT file_id, storage_type, storage_ref, ...
 FROM files WHERE status != 'DELETED';
 
--- For TiDB: explicitly list non-generated columns to avoid re-computing embeddings
+-- For tidb_app.go (app-managed embeddings): full column copy
 INSERT INTO semantic (inode_id, content_text, description, embedding, embedding_revision, description_embedding, description_embedding_revision)
 SELECT file_id, content_text, description, embedding, embedding_revision, description_embedding, description_embedding_revision
+FROM files WHERE status != 'DELETED';
+
+-- For tidb_auto.go (TiDB GENERATED embeddings): do NOT list generated columns.
+-- TiDB will recompute embedding/description_embedding from content_text/description.
+-- If file count is large, run during off-peak or in batches.
+INSERT INTO semantic (inode_id, content_text, description)
+SELECT file_id, content_text, description
 FROM files WHERE status != 'DELETED';
 
 -- db9 / PostgreSQL variant (idempotent, safe to re-run):
@@ -473,7 +489,22 @@ FROM file_nodes WHERE is_directory = 1;
 
 UPDATE file_nodes SET file_id = node_id WHERE is_directory = 1 AND file_id IS NULL;
 
--- 4. Rename columns
+-- 4. Verify: run a full integration test suite against the new schema
+-- 5. Switch application code to use new tables
+--    NOTE: At this point old binaries still reference `file_id` in shared
+--    tables. The rename in step 6 must happen ONLY after ALL instances
+--    have been upgraded.
+-- 6. Retain old `files` table for one release cycle as rollback safety
+--    (do NOT DROP TABLE files immediately)
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Phase B — Schema contraction (NEXT release cycle, AFTER all instances
+--            are confirmed to be running new code):
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- 7. Rename shared-table columns from `file_id` to `inode_id`.
+--    This step is NOT rollback-safe — old binaries will fail once executed.
+--    It MUST only run when zero old-code instances remain.
 -- TiDB / MySQL:
 ALTER TABLE file_nodes CHANGE file_id inode_id VARCHAR(64);
 ALTER TABLE file_nodes RENAME INDEX idx_file_id TO idx_inode_id;
@@ -487,40 +518,41 @@ ALTER TABLE file_gc_tasks CHANGE file_id inode_id VARCHAR(64) NOT NULL;
 -- ALTER TABLE uploads RENAME COLUMN file_id TO inode_id;
 -- ALTER TABLE file_gc_tasks RENAME COLUMN file_id TO inode_id;
 
--- 5. Verify: run a full integration test suite against the new schema
--- 6. Switch application code to use new tables
--- 7. Retain old table for one release cycle as rollback safety
---    (do NOT DROP TABLE files immediately)
--- 8. After one release cycle with no issues:
+-- 8. After one more release cycle with no issues:
 --    DROP TABLE files;
 ```
 
 **Incremental migration (recommended for large deployments):**
 
-For environments with millions of files, a single atomic migration may take too long. A safer sequence:
+For environments with millions of files, a single atomic migration may take too long. A safer two-phase sequence:
 
+**Phase A — Expand (additive, rollback-safe):**
 1. **Dual-write**: New code writes to both `files` and `inodes`/`contents`/`semantic` on every mutation
 2. **Backfill**: Run migration script in batches to populate new tables from old data
 3. **Switch reads**: Route read traffic to new tables; keep `files` writes active
 4. **Verify**: Run consistency checks (see below)
 5. **Stop old writes**: Remove `files` writes from code
-6. **Cleanup**: After one release cycle, `DROP TABLE files`
 
-Each step is independently reversible.
+**Phase B — Contract (destructive, NOT rollback-safe):**
+6. **Rename columns**: After ALL instances are confirmed on new code, rename `file_id` → `inode_id` in shared tables
+7. **Drop old table**: After one more release cycle, `DROP TABLE files`
 
-**Rollback path:** If issues are found after switching to new tables, the application can be rolled back to the old code path which still reads from `files`. The new tables (`inodes`, `contents`, `semantic`) are additive and do not modify `files` data.
+Steps 1–5 are independently reversible. Step 6 is a point of no return.
+
+**Rollback path:** If issues are found during Phase A (steps 1–5), the application can be rolled back to the old code path which still reads from `files`. The new tables are purely additive and shared-table columns have not yet been renamed. Once Phase B (column rename) begins, rollback to old binaries is impossible.
 
 **Data consistency verification (post-migration, pre-switch):**
 ```sql
 -- Verify every file_node has a matching inode
+-- NOTE: Use fn.file_id during Phase A (before column rename), fn.inode_id after Phase B.
 SELECT COUNT(*) FROM file_nodes fn
-LEFT JOIN inodes i ON fn.inode_id = i.inode_id
+LEFT JOIN inodes i ON fn.file_id = i.inode_id
 WHERE i.inode_id IS NULL;
 -- Expected: 0
 
 -- Verify every file has a matching contents row
 SELECT COUNT(*) FROM file_nodes fn
-JOIN inodes i ON fn.inode_id = i.inode_id
+JOIN inodes i ON fn.file_id = i.inode_id
 LEFT JOIN contents c ON i.inode_id = c.inode_id
 WHERE c.inode_id IS NULL AND fn.is_directory = 0;
 -- Expected: 0
