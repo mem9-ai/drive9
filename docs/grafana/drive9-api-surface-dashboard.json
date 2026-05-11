@@ -55,7 +55,7 @@
       },
       "id": 100,
       "options": {
-        "content": "# API Surface Performance\n\nCategory: request-path drill-down.\n\nUse this after an overview dashboard shows an HTTP-facing problem outside the FS and upload paths. This dashboard is intentionally scoped to control, vault, SQL, events, and auxiliary HTTP routes so it does not duplicate the dedicated FS and upload dashboards. It answers which routes are hot, which are slow, and whether latency coincides with inflight buildup or error spikes.",
+        "content": "# API Surface Performance\n\nCategory: request-path drill-down.\n\nUse this after an overview dashboard shows an HTTP-facing problem outside the FS and upload paths. This dashboard is intentionally scoped to control, vault, SQL, events, and auxiliary HTTP routes so it does not duplicate the dedicated FS and upload dashboards. It answers which routes are hot, which are slow, whether latency coincides with inflight buildup or error spikes, and whether tenant lifecycle control-plane events are failing.",
         "mode": "markdown"
       },
       "title": "Guide",
@@ -668,6 +668,100 @@
         }
       ],
       "title": "Error Routes And Inflight",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 0,
+        "y": 28
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (event, result) (rate(dat9_tenant_events_total{event=~\"tenant_provision|tenant_schema_init\"}[$__rate_interval]))",
+          "legendFormat": "{{event}} {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Tenant Lifecycle Event Mix",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (event, result) (rate(dat9_tenant_events_total{event=~\"tenant_provision|tenant_schema_init\",result!~\"ok|accepted\"}[$__rate_interval]))",
+          "legendFormat": "{{event}} {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Tenant Lifecycle Failures",
       "type": "timeseries"
     }
   ],
