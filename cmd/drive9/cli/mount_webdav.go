@@ -192,7 +192,16 @@ func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDe
 			_ = srv.Shutdown(ctx)
 			return err
 		}
-		pidFile, err := mountstate.WritePID(stateMountPoint, os.Getpid())
+		processState := mountstate.ProcessState{PID: os.Getpid()}
+		processState.CreationTime, err = processCreationTimeByPID(processState.PID)
+		if err != nil {
+			deps.unmount(deps.goos, mountPoint)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(ctx)
+			return fmt.Errorf("webdav: inspect mount process state: %w", err)
+		}
+		pidFile, err := mountstate.WriteProcessState(stateMountPoint, processState)
 		if err != nil {
 			deps.unmount(deps.goos, mountPoint)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

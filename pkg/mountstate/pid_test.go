@@ -1,6 +1,7 @@
 package mountstate
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -72,5 +73,68 @@ func TestReadPIDRejectsInvalidFile(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), strconv.Itoa(os.Getpid())) {
 		t.Fatalf("ReadPID error = %v, unexpectedly used current pid", err)
+	}
+}
+
+func TestWriteReadProcessState(t *testing.T) {
+	mountPoint := filepath.Join(t.TempDir(), "mnt")
+	want := ProcessState{PID: 12345, CreationTime: 67890}
+
+	path, err := WriteProcessState(mountPoint, want)
+	if err != nil {
+		t.Fatalf("WriteProcessState: %v", err)
+	}
+	defer func() { _ = os.Remove(path) }()
+
+	got, gotPath, err := ReadProcessState(mountPoint)
+	if err != nil {
+		t.Fatalf("ReadProcessState: %v", err)
+	}
+	if got != want {
+		t.Fatalf("ReadProcessState = %#v, want %#v", got, want)
+	}
+	if gotPath != path {
+		t.Fatalf("ReadProcessState path = %q, want %q", gotPath, path)
+	}
+}
+
+func TestReadProcessStateSupportsLegacyPIDFile(t *testing.T) {
+	mountPoint := filepath.Join(t.TempDir(), "mnt")
+	path := PIDFilePath(mountPoint)
+	if err := os.WriteFile(path, []byte("12345\n"), 0o644); err != nil {
+		t.Fatalf("write pid file: %v", err)
+	}
+	defer func() { _ = os.Remove(path) }()
+
+	got, gotPath, err := ReadProcessState(mountPoint)
+	if err != nil {
+		t.Fatalf("ReadProcessState: %v", err)
+	}
+	if got.PID != 12345 {
+		t.Fatalf("ReadProcessState pid = %d, want 12345", got.PID)
+	}
+	if got.CreationTime != 0 {
+		t.Fatalf("ReadProcessState creation time = %d, want 0", got.CreationTime)
+	}
+	if gotPath != path {
+		t.Fatalf("ReadProcessState path = %q, want %q", gotPath, path)
+	}
+}
+
+func TestReadProcessStateRejectsInvalidJSON(t *testing.T) {
+	mountPoint := filepath.Join(t.TempDir(), "mnt")
+	path := PIDFilePath(mountPoint)
+	data, err := json.Marshal(map[string]string{"pid": "oops"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		t.Fatalf("write pid file: %v", err)
+	}
+	defer func() { _ = os.Remove(path) }()
+
+	_, _, err = ReadProcessState(mountPoint)
+	if err == nil {
+		t.Fatal("expected error for invalid process state file")
 	}
 }

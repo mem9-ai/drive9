@@ -2,6 +2,7 @@ package cli
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/mountstate"
 )
 
 func fakeLookPath(binMap map[string]bool) func(string) (string, error) {
@@ -183,7 +185,10 @@ func TestRunUmountDoesNotBlockOnStalePID(t *testing.T) {
 		goos:     "linux",
 		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
 		run:      func([]string) error { return nil },
-		readPID:  func(string) (int, string, error) { return 1234, "/tmp/drive9.pid", nil },
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{}, "", errors.New("readProcessState should not be called on non-Windows")
+		},
+		readPID: func(string) (int, string, error) { return 1234, "/tmp/drive9.pid", nil },
 		pidAlive: func(int) bool {
 			aliveCalls++
 			return false
@@ -203,9 +208,12 @@ func TestRunUmountDoesNotBlockOnStalePID(t *testing.T) {
 
 func TestRunUmountNoPIDFileReturnsSuccess(t *testing.T) {
 	deps := umountDeps{
-		goos:      "linux",
-		lookPath:  fakeLookPath(map[string]bool{"fusermount3": true}),
-		run:       func([]string) error { return nil },
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run:      func([]string) error { return nil },
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{}, "", errors.New("readProcessState should not be called on non-Windows")
+		},
 		readPID:   func(string) (int, string, error) { return 0, "/tmp/drive9.pid", os.ErrNotExist },
 		terminate: func(int, time.Duration) error { t.Fatal("terminate should not be called without pid file"); return nil },
 		remove:    func(string) error { t.Fatal("remove should not be called without pid file"); return nil },
@@ -225,6 +233,9 @@ func TestRunUmountNonWindowsTimeoutZeroSkipsPIDRead(t *testing.T) {
 		goos:     "linux",
 		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
 		run:      func([]string) error { return nil },
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{}, "", errors.New("readProcessState should not be called on non-Windows")
+		},
 		readPID: func(string) (int, string, error) {
 			t.Fatal("readPID should not be called when timeout is zero on non-Windows")
 			return 0, "", nil
@@ -267,16 +278,19 @@ func TestRunUmountWindowsTerminatesMountProcess(t *testing.T) {
 			}
 			return nil
 		},
-		readPID: func(mountPoint string) (int, string, error) {
+		readProcessState: func(mountPoint string) (mountstate.ProcessState, string, error) {
 			if mountPoint != "X:\\" {
 				t.Fatalf("mountPoint = %q, want %q", mountPoint, "X:\\")
 			}
-			return 4321, "C:/tmp/drive9-webdav.pid", nil
+			return mountstate.ProcessState{PID: 4321, CreationTime: 99}, "C:/tmp/drive9-webdav.pid", nil
 		},
-		terminate: func(pid int, waitTimeout time.Duration) error {
+		terminateState: func(state mountstate.ProcessState, waitTimeout time.Duration) error {
 			terminateCalls++
-			if pid != 4321 {
-				t.Fatalf("pid = %d, want 4321", pid)
+			if state.PID != 4321 {
+				t.Fatalf("pid = %d, want 4321", state.PID)
+			}
+			if state.CreationTime != 99 {
+				t.Fatalf("creationTime = %d, want 99", state.CreationTime)
 			}
 			if waitTimeout != 60*time.Second {
 				t.Fatalf("waitTimeout = %s, want %s", waitTimeout, 60*time.Second)
@@ -330,16 +344,19 @@ func TestRunUmountWindowsStillCleansUpAfterUnmountFailure(t *testing.T) {
 			}
 			return runErr
 		},
-		readPID: func(mountPoint string) (int, string, error) {
+		readProcessState: func(mountPoint string) (mountstate.ProcessState, string, error) {
 			if mountPoint != "X:\\" {
 				t.Fatalf("mountPoint = %q, want %q", mountPoint, "X:\\")
 			}
-			return 4321, "C:/tmp/drive9-webdav.pid", nil
+			return mountstate.ProcessState{PID: 4321, CreationTime: 99}, "C:/tmp/drive9-webdav.pid", nil
 		},
-		terminate: func(pid int, waitTimeout time.Duration) error {
+		terminateState: func(state mountstate.ProcessState, waitTimeout time.Duration) error {
 			terminateCalls++
-			if pid != 4321 {
-				t.Fatalf("pid = %d, want 4321", pid)
+			if state.PID != 4321 {
+				t.Fatalf("pid = %d, want 4321", state.PID)
+			}
+			if state.CreationTime != 99 {
+				t.Fatalf("creationTime = %d, want 99", state.CreationTime)
 			}
 			if waitTimeout != 60*time.Second {
 				t.Fatalf("waitTimeout = %s, want %s", waitTimeout, 60*time.Second)
@@ -409,6 +426,55 @@ func TestTerminateProcessWaitsAfterSuccessfulKill(t *testing.T) {
 		t.Fatal("waitForProcessExit was not called after successful kill")
 	}
 	_, _ = cmd.Process.Wait()
+}
+
+func TestRunUmountWindowsStalePIDFileDoesNotTerminateProcess(t *testing.T) {
+	runCalls := 0
+	removeCalls := 0
+	deps := umountDeps{
+		goos:     "windows",
+		lookPath: fakeLookPath(nil),
+		run: func(argv []string) error {
+			runCalls++
+			want := []string{"net", "use", "X:", "/delete", "/y"}
+			if !reflect.DeepEqual(argv, want) {
+				t.Fatalf("argv = %v, want %v", argv, want)
+			}
+			return nil
+		},
+		readProcessState: func(mountPoint string) (mountstate.ProcessState, string, error) {
+			if mountPoint != "X:\\" {
+				t.Fatalf("mountPoint = %q, want %q", mountPoint, "X:\\")
+			}
+			return mountstate.ProcessState{PID: 9999, CreationTime: 123}, "C:/tmp/drive9-webdav.pid", nil
+		},
+		terminateState: func(state mountstate.ProcessState, waitTimeout time.Duration) error {
+			if state.PID != 9999 {
+				t.Fatalf("pid = %d, want 9999", state.PID)
+			}
+			return fmt.Errorf("%w: pid reused", errMountProcessStateStale)
+		},
+		remove: func(path string) error {
+			removeCalls++
+			if path != "C:/tmp/drive9-webdav.pid" {
+				t.Fatalf("path = %q, want %q", path, "C:/tmp/drive9-webdav.pid")
+			}
+			return nil
+		},
+		now:       time.Now,
+		sleep:     func(time.Duration) {},
+		printErrf: func(string, ...any) {},
+	}
+
+	if err := runUmount([]string{"x:\\"}, deps); err != nil {
+		t.Fatalf("runUmount: %v", err)
+	}
+	if runCalls != 1 {
+		t.Fatalf("runCalls = %d, want 1", runCalls)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("removeCalls = %d, want 1", removeCalls)
+	}
 }
 
 // TestResolveMountCredentials_OwnerFromResolver binds a mount to an owner

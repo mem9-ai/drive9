@@ -19,6 +19,11 @@ import (
 	drive9webdav "github.com/mem9-ai/dat9/pkg/webdav"
 )
 
+var (
+	errMountProcessStateStale  = errors.New("drive9 umount: stale mount process state")
+	errMountProcessStateUnsafe = errors.New("drive9 umount: unsafe mount process state")
+)
+
 // MountCmd handles the "drive9 mount" command.
 //
 // Dispatch fork (Row A, V2e): the first positional argument selects the
@@ -309,16 +314,18 @@ func UmountCmd(args []string) error {
 }
 
 type umountDeps struct {
-	goos      string
-	lookPath  func(string) (string, error)
-	run       func([]string) error
-	readPID   func(string) (int, string, error)
-	terminate func(int, time.Duration) error
-	remove    func(string) error
-	pidAlive  func(int) bool
-	now       func() time.Time
-	sleep     func(time.Duration)
-	printErrf func(string, ...any)
+	goos             string
+	lookPath         func(string) (string, error)
+	run              func([]string) error
+	readPID          func(string) (int, string, error)
+	readProcessState func(string) (mountstate.ProcessState, string, error)
+	terminate        func(int, time.Duration) error
+	terminateState   func(mountstate.ProcessState, time.Duration) error
+	remove           func(string) error
+	pidAlive         func(int) bool
+	now              func() time.Time
+	sleep            func(time.Duration)
+	printErrf        func(string, ...any)
 }
 
 func defaultUmountDeps() umountDeps {
@@ -331,13 +338,15 @@ func defaultUmountDeps() umountDeps {
 			cmd.Stderr = os.Stderr
 			return cmd.Run()
 		},
-		readPID:   mountstate.ReadPID,
-		terminate: terminateProcess,
-		remove:    os.Remove,
-		pidAlive:  processAlive,
-		now:       time.Now,
-		sleep:     time.Sleep,
-		printErrf: func(format string, args ...any) { fmt.Fprintf(os.Stderr, format, args...) },
+		readPID:          mountstate.ReadPID,
+		readProcessState: mountstate.ReadProcessState,
+		terminate:        terminateProcess,
+		terminateState:   terminateMountProcess,
+		remove:           os.Remove,
+		pidAlive:         processAlive,
+		now:              time.Now,
+		sleep:            time.Sleep,
+		printErrf:        func(format string, args ...any) { fmt.Fprintf(os.Stderr, format, args...) },
 	}
 }
 
@@ -376,27 +385,54 @@ func runUmount(args []string, deps umountDeps) error {
 	if deps.goos != "windows" && *waitTimeout == 0 {
 		return nil
 	}
-	// Windows WebDAV mounts run a local bridge in the mount process. Even when
-	// the caller opts out of waiting, still request process shutdown before
-	// returning.
-	pid, path, err := deps.readPID(stateMountPoint)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return runErr
-		}
-		if runErr != nil {
-			return runErr
-		}
-		return err
-	}
 	if deps.goos == "windows" {
-		if deps.terminate == nil {
+		var (
+			state mountstate.ProcessState
+			path  string
+		)
+		if deps.readProcessState != nil {
+			state, path, err = deps.readProcessState(stateMountPoint)
+		} else {
+			var pid int
+			pid, path, err = deps.readPID(stateMountPoint)
+			state = mountstate.ProcessState{PID: pid}
+		}
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return runErr
+			}
+			if runErr != nil {
+				return runErr
+			}
+			return err
+		}
+
+		if deps.terminateState == nil && deps.terminate == nil {
 			if runErr != nil {
 				return runErr
 			}
 			return fmt.Errorf("drive9 umount: no process terminator configured for Windows WebDAV mount")
 		}
-		if err := deps.terminate(pid, *waitTimeout); err != nil {
+
+		if deps.terminateState != nil {
+			err = deps.terminateState(state, *waitTimeout)
+		} else {
+			err = deps.terminate(state.PID, *waitTimeout)
+		}
+		if err != nil {
+			if errors.Is(err, errMountProcessStateStale) || errors.Is(err, errMountProcessStateUnsafe) {
+				if path != "" && deps.remove != nil {
+					if removeErr := deps.remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) && runErr == nil {
+						return fmt.Errorf("drive9 umount: remove mount pid file %s: %w", path, removeErr)
+					}
+				}
+				if errors.Is(err, errMountProcessStateStale) {
+					if deps.printErrf != nil {
+						deps.printErrf("drive9 umount: removed stale mount pid file %s without terminating any process\n", path)
+					}
+					return runErr
+				}
+			}
 			if runErr != nil {
 				return runErr
 			}
@@ -411,6 +447,17 @@ func runUmount(args []string, deps umountDeps) error {
 			}
 		}
 		return runErr
+	}
+
+	pid, path, err := deps.readPID(stateMountPoint)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return runErr
+		}
+		if runErr != nil {
+			return runErr
+		}
+		return err
 	}
 	if *waitTimeout == 0 {
 		return nil

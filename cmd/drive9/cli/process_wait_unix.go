@@ -8,6 +8,8 @@ import (
 	"os"
 	"syscall"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/mountstate"
 )
 
 func processAliveImpl(pid int) bool {
@@ -42,4 +44,13 @@ func waitForProcessExitByPID(pid int, timeout time.Duration) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+func processCreationTimeByPID(pid int) (uint64, error) {
+	_ = pid
+	return 0, nil
+}
+
+func terminateMountProcess(state mountstate.ProcessState, waitTimeout time.Duration) error {
+	return terminateProcess(state.PID, waitTimeout)
 }

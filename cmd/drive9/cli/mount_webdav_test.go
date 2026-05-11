@@ -367,12 +367,12 @@ func TestWebDAVMountLifecycleWindowsNormalizesDriveLetter(t *testing.T) {
 	}
 
 	var (
-		pid     int
+		state   mountstate.ProcessState
 		pidFile string
 	)
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		pid, pidFile, err = mountstate.ReadPID(stateMountPoint)
+		state, pidFile, err = mountstate.ReadProcessState(stateMountPoint)
 		if err == nil {
 			break
 		}
@@ -384,8 +384,8 @@ func TestWebDAVMountLifecycleWindowsNormalizesDriveLetter(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if pid != os.Getpid() {
-		t.Fatalf("pid = %d, want %d", pid, os.Getpid())
+	if state.PID != os.Getpid() {
+		t.Fatalf("pid = %d, want %d", state.PID, os.Getpid())
 	}
 
 	signals <- os.Interrupt
