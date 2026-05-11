@@ -294,6 +294,13 @@ func TestWebDAVMountLifecycle(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("mount command was not invoked")
 	}
+	_, _, err := mountstate.ReadPID(mountPoint)
+	if !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			t.Fatalf("expected no pid file for non-Windows WebDAV mount at %q", mountPoint)
+		}
+		t.Fatalf("ReadPID(%q): %v", mountPoint, err)
+	}
 
 	signals <- os.Interrupt
 

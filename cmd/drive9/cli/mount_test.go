@@ -205,7 +205,7 @@ func TestRunUmountNoPIDFileReturnsSuccess(t *testing.T) {
 		lookPath:  fakeLookPath(map[string]bool{"fusermount3": true}),
 		run:       func([]string) error { return nil },
 		readPID:   func(string) (int, string, error) { return 0, "/tmp/drive9.pid", os.ErrNotExist },
-		terminate: func(int) error { t.Fatal("terminate should not be called without pid file"); return nil },
+		terminate: func(int, time.Duration) error { t.Fatal("terminate should not be called without pid file"); return nil },
 		pidAlive:  func(int) bool { t.Fatal("pidAlive should not be called without pid file"); return false },
 		now:       time.Now,
 		sleep:     func(time.Duration) {},
@@ -221,7 +221,6 @@ func TestRunUmountWindowsTerminatesMountProcess(t *testing.T) {
 	now := time.Unix(100, 0)
 	runCalls := 0
 	terminateCalls := 0
-	aliveCalls := 0
 	deps := umountDeps{
 		goos:     "windows",
 		lookPath: fakeLookPath(nil),
@@ -239,19 +238,19 @@ func TestRunUmountWindowsTerminatesMountProcess(t *testing.T) {
 			}
 			return 4321, "C:/tmp/drive9-webdav.pid", nil
 		},
-		terminate: func(pid int) error {
+		terminate: func(pid int, waitTimeout time.Duration) error {
 			terminateCalls++
 			if pid != 4321 {
 				t.Fatalf("pid = %d, want 4321", pid)
 			}
+			if waitTimeout != 60*time.Second {
+				t.Fatalf("waitTimeout = %s, want %s", waitTimeout, 60*time.Second)
+			}
 			return nil
 		},
 		pidAlive: func(pid int) bool {
-			aliveCalls++
-			if pid != 4321 {
-				t.Fatalf("pid = %d, want 4321", pid)
-			}
-			return aliveCalls < 2
+			t.Fatalf("pidAlive should not be called on Windows; terminate handles the wait path")
+			return false
 		},
 		now:       func() time.Time { return now },
 		sleep:     func(d time.Duration) { now = now.Add(d) },
@@ -266,9 +265,6 @@ func TestRunUmountWindowsTerminatesMountProcess(t *testing.T) {
 	}
 	if terminateCalls != 1 {
 		t.Fatalf("terminateCalls = %d, want 1", terminateCalls)
-	}
-	if aliveCalls != 2 {
-		t.Fatalf("aliveCalls = %d, want 2", aliveCalls)
 	}
 }
 

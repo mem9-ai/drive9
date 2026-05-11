@@ -183,27 +183,29 @@ func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDe
 		return explainMountError(deps.goos, mountPoint, err)
 	}
 
-	stateMountPoint, err := webdavMountStatePoint(deps.goos, mountPoint)
-	if err != nil {
-		deps.unmount(deps.goos, mountPoint)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(ctx)
-		return err
-	}
-	pidFile, err := mountstate.WritePID(stateMountPoint, os.Getpid())
-	if err != nil {
-		deps.unmount(deps.goos, mountPoint)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(ctx)
-		return fmt.Errorf("webdav: write mount pid file: %w", err)
-	}
-	defer func() {
-		if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "drive9: remove mount pid file %s: %v\n", pidFile, err)
+	if deps.goos == "windows" {
+		stateMountPoint, err := webdavMountStatePoint(deps.goos, mountPoint)
+		if err != nil {
+			deps.unmount(deps.goos, mountPoint)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(ctx)
+			return err
 		}
-	}()
+		pidFile, err := mountstate.WritePID(stateMountPoint, os.Getpid())
+		if err != nil {
+			deps.unmount(deps.goos, mountPoint)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(ctx)
+			return fmt.Errorf("webdav: write mount pid file: %w", err)
+		}
+		defer func() {
+			if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "drive9: remove mount pid file %s: %v\n", pidFile, err)
+			}
+		}()
+	}
 
 	fmt.Fprintf(os.Stderr, "drive9: mounted on %s via WebDAV (server: %s)\n", mountPoint, serverURL)
 

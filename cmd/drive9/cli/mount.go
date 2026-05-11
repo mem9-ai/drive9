@@ -313,7 +313,7 @@ type umountDeps struct {
 	lookPath  func(string) (string, error)
 	run       func([]string) error
 	readPID   func(string) (int, string, error)
-	terminate func(int) error
+	terminate func(int, time.Duration) error
 	pidAlive  func(int) bool
 	now       func() time.Time
 	sleep     func(time.Duration)
@@ -384,9 +384,10 @@ func runUmount(args []string, deps umountDeps) error {
 		if deps.terminate == nil {
 			return fmt.Errorf("drive9 umount: no process terminator configured for Windows WebDAV mount")
 		}
-		if err := deps.terminate(pid); err != nil {
-			return fmt.Errorf("drive9 umount: terminate mount process pid %d: %w", pid, err)
+		if err := deps.terminate(pid, *waitTimeout); err != nil {
+			return fmt.Errorf("%w (pid file: %s)", err, path)
 		}
+		return nil
 	}
 	if *waitTimeout == 0 {
 		return nil
@@ -417,27 +418,10 @@ func waitForPIDExit(pid int, timeout time.Duration, deps umountDeps) error {
 }
 
 func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	err = process.Signal(syscall.Signal(0))
-	if err == nil {
-		return true
-	}
-	if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
-		return false
-	}
-	if errors.Is(err, syscall.EPERM) {
-		return true
-	}
-	return false
+	return processAliveImpl(pid)
 }
 
-func terminateProcess(pid int) error {
+func terminateProcess(pid int, waitTimeout time.Duration) error {
 	if pid <= 0 {
 		return fmt.Errorf("invalid mount process pid %d", pid)
 	}
@@ -452,7 +436,13 @@ func terminateProcess(pid int) error {
 	if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
 		return nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if waitTimeout > 0 {
+		return waitForProcessExitByPID(pid, waitTimeout)
+	}
+	return nil
 }
 
 // resolveMountCredentials selects the (server, apiKey, token) triple that a
