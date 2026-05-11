@@ -66,7 +66,7 @@
       },
       "id": 100,
       "options": {
-        "content": "# Drive9 Async And FUSE\n\nCategory: overview.\n\nUse this when the incident is not on the front-door HTTP path but in delayed work or the mount path. The first row is intentionally alarm-biased: semantic backlog, dead letters, FUSE remote error ratio, and FUSE remote latency. The second row is organized as two narrowing paths: worker state on the left and per-operation FUSE latency on the right. The media rows are for extraction runtime and outcomes: image runtime capacity, image failure and saturation, then audio extract process results and tail latency. If the issue reduces to a specific FUSE or upload path, continue into the request-path drill-down dashboards.",
+        "content": "# Drive9 Async And FUSE\n\nCategory: overview.\n\nUse this when the incident is not on the front-door HTTP path but in delayed work or the mount path. The first row is intentionally alarm-biased: semantic backlog, dead letters, FUSE remote error ratio, and FUSE remote latency. The second row is organized as two narrowing paths: worker state on the left and per-operation FUSE latency on the right. The media rows are for extraction runtime and outcomes: image runtime capacity first, then audio extract process results and tail latency, followed by image failure and saturation. If the issue reduces to a specific FUSE or upload path, continue into the request-path drill-down dashboards.",
         "mode": "markdown"
       },
       "title": "Guide",
