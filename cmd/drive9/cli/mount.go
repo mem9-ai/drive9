@@ -370,10 +370,9 @@ func runUmount(args []string, deps umountDeps) error {
 	if err := deps.run(argv); err != nil {
 		return err
 	}
-	if *waitTimeout == 0 {
-		// Windows WebDAV mounts run a local bridge in the mount process. Even
-		// when the caller opts out of waiting, still request process shutdown.
-	}
+	// Windows WebDAV mounts run a local bridge in the mount process. Even when
+	// the caller opts out of waiting, still request process shutdown before
+	// returning.
 	pid, path, err := deps.readPID(stateMountPoint)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
