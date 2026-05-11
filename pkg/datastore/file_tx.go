@@ -21,7 +21,11 @@ func (s *Store) InsertFileTx(db execer, f *File) error {
 		nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
 		nullInt64Ptr(f.DescriptionEmbeddingRevision),
 		f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
-	return err
+	if err != nil {
+		return err
+	}
+	// Dual-write to split tables
+	return s.insertSplitTablesTx(db, f)
 }
 
 // UpdateFileContentTx updates file bytes/metadata inside an existing transaction.
@@ -96,6 +100,28 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 	if err := db.QueryRow(`SELECT revision FROM files WHERE file_id = ?`, fileID).Scan(&rev); err != nil {
 		return 0, fmt.Errorf("read revision after update: %w", err)
 	}
+
+	// Dual-write to split tables
+	if err := s.UpdateInodeContentTx(db, fileID, size, rev, StatusConfirmed, now); err != nil {
+		return 0, fmt.Errorf("update inode: %w", err)
+	}
+	var encryptionMode StorageEncryptionMode
+	if err := db.QueryRow(`SELECT storage_encryption_mode FROM files WHERE file_id = ?`, fileID).Scan(&encryptionMode); err != nil {
+		return 0, fmt.Errorf("read encryption mode: %w", err)
+	}
+	if err := s.UpdateContentTx(db, fileID, storageType, storageRef, contentType, checksum, contentBlob, encryptionMode); err != nil {
+		return 0, fmt.Errorf("update content: %w", err)
+	}
+	if preserveEmbedding {
+		if err := s.updateSemanticNoEmbedTx(db, fileID, contentText, description); err != nil {
+			return 0, fmt.Errorf("update semantic: %w", err)
+		}
+	} else {
+		if err := s.UpdateSemanticTx(db, fileID, contentText, description); err != nil {
+			return 0, fmt.Errorf("update semantic: %w", err)
+		}
+	}
+
 	return rev, nil
 }
 

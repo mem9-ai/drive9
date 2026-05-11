@@ -511,8 +511,14 @@ func (s *Store) InsertFile(ctx context.Context, f *File) (err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "insert_file", start, &err)
 
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	mode := fileStorageEncryptionModeForWrite(f.StorageEncryptionMode)
-	_, err = s.db.ExecContext(ctx, `INSERT INTO files
+	_, err = tx.Exec(`INSERT INTO files
 		(file_id, storage_type, storage_ref, storage_encryption_mode, storage_encryption_key_id,
 		 content_blob, content_type, size_bytes, checksum_sha256,
 		 revision, status, source_id, content_text, description, created_at, confirmed_at, expires_at)
@@ -522,7 +528,59 @@ func (s *Store) InsertFile(ctx context.Context, f *File) (err error) {
 		f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
 		nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
 		f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Dual-write to split tables
+	if err := s.insertSplitTablesTx(tx, f); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// insertSplitTablesTx inserts corresponding rows into inodes, contents, and semantic.
+func (s *Store) insertSplitTablesTx(tx execer, f *File) error {
+	now := time.Now().UTC()
+	inode := &Inode{
+		InodeID:     f.FileID,
+		SizeBytes:   f.SizeBytes,
+		Revision:    f.Revision,
+		Status:      f.Status,
+		CreatedAt:   f.CreatedAt,
+		Mtime:       now,
+		ConfirmedAt: f.ConfirmedAt,
+		ExpiresAt:   f.ExpiresAt,
+	}
+	if err := s.InsertInodeTx(tx, inode); err != nil {
+		return fmt.Errorf("insert inode: %w", err)
+	}
+	content := &Content{
+		InodeID:                f.FileID,
+		StorageType:            f.StorageType,
+		StorageRef:             f.StorageRef,
+		StorageEncryptionMode:  f.StorageEncryptionMode,
+		StorageEncryptionKeyID: f.StorageEncryptionKeyID,
+		ContentBlob:            f.ContentBlob,
+		ContentType:            f.ContentType,
+		ChecksumSHA256:         f.ChecksumSHA256,
+		SourceID:               f.SourceID,
+	}
+	if err := s.InsertContentTx(tx, content); err != nil {
+		return fmt.Errorf("insert content: %w", err)
+	}
+	semantic := &Semantic{
+		InodeID:                      f.FileID,
+		ContentText:                  f.ContentText,
+		Description:                  f.Description,
+		EmbeddingRevision:            f.EmbeddingRevision,
+		DescriptionEmbeddingRevision: f.DescriptionEmbeddingRevision,
+	}
+	if err := s.InsertSemanticTx(tx, semantic); err != nil {
+		return fmt.Errorf("insert semantic: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) GetFile(ctx context.Context, fileID string) (out *File, err error) {
@@ -542,6 +600,12 @@ func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageTyp
 	start := time.Now()
 	defer observeStoreOp(ctx, "update_file_content", start, &err)
 
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	query := `UPDATE files SET storage_type = ?, storage_ref = ?,
 		content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?`
 	args := []any{storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
@@ -555,9 +619,10 @@ func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageTyp
 			ELSE description_embedding_revision
 			END`
 	}
+	now := time.Now().UTC()
 	query += `, revision = revision + 1, status = 'CONFIRMED', confirmed_at = ? WHERE file_id = ?`
-	args = append(args, time.Now().UTC(), fileID)
-	res, err := s.db.ExecContext(ctx, query, args...)
+	args = append(args, now, fileID)
+	res, err := tx.Exec(query, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -566,10 +631,26 @@ func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageTyp
 		return 0, ErrNotFound
 	}
 	var rev int64
-	if err := s.db.QueryRowContext(ctx, `SELECT revision FROM files WHERE file_id = ?`, fileID).Scan(&rev); err != nil {
+	if err := tx.QueryRow(`SELECT revision FROM files WHERE file_id = ?`, fileID).Scan(&rev); err != nil {
 		return 0, fmt.Errorf("read revision after update: %w", err)
 	}
-	return rev, nil
+
+	// Dual-write to split tables
+	if err := s.UpdateInodeContentTx(tx, fileID, size, rev, StatusConfirmed, now); err != nil {
+		return 0, fmt.Errorf("update inode: %w", err)
+	}
+	var encryptionMode StorageEncryptionMode
+	if err := tx.QueryRow(`SELECT storage_encryption_mode FROM files WHERE file_id = ?`, fileID).Scan(&encryptionMode); err != nil {
+		return 0, fmt.Errorf("read encryption mode: %w", err)
+	}
+	if err := s.UpdateContentTx(tx, fileID, storageType, storageRef, contentType, checksum, contentBlob, encryptionMode); err != nil {
+		return 0, fmt.Errorf("update content: %w", err)
+	}
+	if err := s.UpdateSemanticTx(tx, fileID, contentText, description); err != nil {
+		return 0, fmt.Errorf("update semantic: %w", err)
+	}
+
+	return rev, tx.Commit()
 }
 
 // UpdateFileSearchText updates files.content_text for search enrichment.
@@ -1076,6 +1157,9 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	}
 
 	if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fileID.String); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`UPDATE inodes SET status = 'DELETED' WHERE inode_id = ?`, fileID.String); err != nil {
 		return nil, err
 	}
 	if _, err := tx.Exec(`DELETE FROM file_tags WHERE file_id = ?`, fileID.String); err != nil {

@@ -67,6 +67,9 @@ func ResetDB(t *testing.T, db *sql.DB) {
 		"DELETE FROM file_tags",
 		"DELETE FROM uploads",
 		"DELETE FROM files",
+		"DELETE FROM inodes",
+		"DELETE FROM contents",
+		"DELETE FROM semantic",
 	}
 	for _, q := range queries {
 		if _, err := db.Exec(q); err != nil {

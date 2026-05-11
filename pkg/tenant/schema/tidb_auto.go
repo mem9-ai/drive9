@@ -163,11 +163,13 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 			name         VARCHAR(255) NOT NULL,
 			is_directory BOOLEAN NOT NULL DEFAULT FALSE,
 			file_id      VARCHAR(64),
+			inode_id     VARCHAR(64),
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 		)`,
 		`CREATE UNIQUE INDEX idx_path ON file_nodes(path)`,
 		`CREATE INDEX idx_parent ON file_nodes(parent_path)`,
 		`CREATE INDEX idx_file_id ON file_nodes(file_id)`,
+		`CREATE INDEX idx_inode_id ON file_nodes(inode_id)`,
 		`CREATE TABLE IF NOT EXISTS files (
 			file_id            VARCHAR(64) PRIMARY KEY,
 			storage_type       VARCHAR(32) NOT NULL,
@@ -200,6 +202,49 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 			expires_at         DATETIME(3)
 		)`,
 		`CREATE INDEX idx_status ON files(status, created_at)`,
+		`CREATE TABLE IF NOT EXISTS inodes (
+			inode_id     VARCHAR(64) PRIMARY KEY,
+			size_bytes   BIGINT NOT NULL DEFAULT 0,
+			revision     BIGINT NOT NULL DEFAULT 1,
+			status       VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			mtime        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			confirmed_at DATETIME(3),
+			expires_at   DATETIME(3)
+		)`,
+		`CREATE INDEX idx_inodes_status ON inodes(status, created_at)`,
+		`CREATE TABLE IF NOT EXISTS contents (
+			inode_id                   VARCHAR(64) PRIMARY KEY,
+			storage_type               VARCHAR(32) NOT NULL,
+			storage_ref                TEXT NOT NULL,
+			storage_encryption_mode    VARCHAR(16) NOT NULL DEFAULT 'legacy',
+			storage_encryption_key_id  VARCHAR(256) NOT NULL DEFAULT '',
+			content_blob               LONGBLOB,
+			content_type               VARCHAR(255),
+			checksum_sha256            VARCHAR(128),
+			source_id                  VARCHAR(255)
+		)`,
+		`CREATE TABLE IF NOT EXISTS semantic (
+			inode_id                           VARCHAR(64) PRIMARY KEY,
+			content_text                       LONGTEXT,
+			description                        LONGTEXT,
+			embedding                          VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `) GENERATED ALWAYS AS (EMBED_TEXT(
+				'` + tidbAutoEmbeddingModel + `',
+				content_text,
+				'` + tidbAutoEmbeddingOptionsJSON + `'
+			)) STORED,
+			embedding_revision                 BIGINT,
+			description_embedding              VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `) GENERATED ALWAYS AS (EMBED_TEXT(
+				'` + tidbAutoEmbeddingModel + `',
+				description,
+				'` + tidbAutoEmbeddingOptionsJSON + `'
+			)) STORED,
+			description_embedding_revision     BIGINT
+		)`,
+		`CREATE FULLTEXT INDEX idx_semantic_fts_content ON semantic(content_text) WITH PARSER MULTILINGUAL`,
+		`CREATE FULLTEXT INDEX idx_semantic_fts_description ON semantic(description) WITH PARSER MULTILINGUAL`,
+		`CREATE VECTOR INDEX idx_semantic_cosine ON semantic((VEC_COSINE_DISTANCE(embedding)))`,
+		`CREATE VECTOR INDEX idx_semantic_desc_cosine ON semantic((VEC_COSINE_DISTANCE(description_embedding)))`,
 		`ALTER TABLE files
 			ADD FULLTEXT INDEX idx_fts_content(content_text)
 			WITH PARSER MULTILINGUAL
@@ -216,6 +261,7 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
 		`CREATE TABLE IF NOT EXISTS file_tags (
 			file_id   VARCHAR(64) NOT NULL,
+			inode_id  VARCHAR(64),
 			tag_key   VARCHAR(255) NOT NULL,
 			tag_value VARCHAR(255) NOT NULL DEFAULT '',
 			PRIMARY KEY (file_id, tag_key)
@@ -224,6 +270,7 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 		`CREATE TABLE IF NOT EXISTS uploads (
 			upload_id          VARCHAR(64) PRIMARY KEY,
 			file_id            VARCHAR(64) NOT NULL,
+			inode_id           VARCHAR(64),
 			target_path        VARCHAR(512) NOT NULL,
 			s3_upload_id       VARCHAR(255) NOT NULL,
 			s3_key             VARCHAR(2048) NOT NULL,
@@ -270,6 +317,7 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 		`CREATE TABLE IF NOT EXISTS file_gc_tasks (
 			task_id       VARCHAR(64) PRIMARY KEY,
 			file_id       VARCHAR(64) NOT NULL,
+			inode_id      VARCHAR(64),
 			storage_type  VARCHAR(32) NOT NULL,
 			storage_ref   TEXT NOT NULL,
 			size_bytes    BIGINT NOT NULL DEFAULT 0,
@@ -287,6 +335,7 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 			completed_at  DATETIME(3) NULL
 		)`,
 		`CREATE UNIQUE INDEX uk_file_gc_file_id ON file_gc_tasks(file_id)`,
+		`CREATE UNIQUE INDEX uk_file_gc_inode_id ON file_gc_tasks(inode_id)`,
 		`CREATE INDEX idx_file_gc_claim ON file_gc_tasks(status, available_at, lease_until, created_at)`,
 		`CREATE TABLE IF NOT EXISTS llm_usage (
 			id              BIGINT AUTO_INCREMENT PRIMARY KEY,
