@@ -436,8 +436,8 @@ CREATE TABLE contents (...);
 CREATE TABLE semantic (...);
 
 -- 2. Migrate existing files (TiDB / MySQL)
-INSERT INTO inodes (inode_id, size_bytes, revision, mode, status, created_at, confirmed_at, expires_at)
-SELECT file_id, size_bytes, revision, 420, status, created_at, confirmed_at, expires_at
+INSERT INTO inodes (inode_id, size_bytes, revision, mode, status, created_at, mtime, confirmed_at, expires_at)
+SELECT file_id, size_bytes, revision, 420, status, created_at, confirmed_at, confirmed_at, expires_at
 FROM files WHERE status != 'DELETED';
 
 INSERT INTO contents (inode_id, storage_type, storage_ref, ...)
