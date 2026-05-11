@@ -24,13 +24,13 @@ import (
 // Dispatch fork (Row A, V2e): the first positional argument selects the
 // mount flavour.
 //
-//   - `drive9 mount vault <path>`   → read-only vault FUSE filesystem
-//   - `drive9 mount [flags] <path>` → legacy writable fs mount (no
+//   - `drive9 mount vault <path>`   鈫?read-only vault FUSE filesystem
+//   - `drive9 mount [flags] <path>` 鈫?legacy writable fs mount (no
 //     subcommand keyword; first positional is the mount point)
 //
 // We MUST peek at the first arg before flag.Parse because the vault flag
 // set is smaller (no cache-size / write-path knobs), and a single flag
-// set would quietly accept write-path flags for a vault mount — that
+// set would quietly accept write-path flags for a vault mount 鈥?that
 // would violate Row C (read-only) in a subtle, mount-time-visible way.
 //
 // Only the CURRENT supported backend keyword ("vault") is reserved here.
@@ -50,7 +50,7 @@ func MountCmd(args []string) error {
 
 // fsMountCmd is the pre-V2e writable fs mount entry point.
 //
-// Credential precedence matches spec §14.2: explicit --server / --api-key flag
+// Credential precedence matches spec 搂14.2: explicit --server / --api-key flag
 // > DRIVE9_SERVER / DRIVE9_API_KEY / DRIVE9_VAULT_TOKEN env > active config
 // context. The flag defaults are empty strings so we can distinguish "unset"
 // from "explicit empty"; the latter is rejected (see rejectEmptyFlag).
@@ -59,10 +59,10 @@ func MountCmd(args []string) error {
 // If the resolver returns a delegated credential (owner JWT / `ctx use <alice>`),
 // Mount is created via client.NewWithToken and bound to that capability for
 // the mount's lifetime. If the active principal changes later (`ctx use` to
-// another context), the running mount keeps its original binding — changing
+// another context), the running mount keeps its original binding 鈥?changing
 // a running mount's credential requires umount + remount (Invariant #6).
 // `vault reauth` is not part of M1; see docs/specs/vault-interaction-end-state.md
-// §17.
+// 搂17.
 //
 // drive9fuse.Mount runs in-process (no fork/exec); credentials flow through
 // MountOptions{Server, APIKey, Token}, not through the child's environment.
@@ -228,7 +228,7 @@ func newWebDAVHandler(c *client.Client, prefix string, remoteRoot string) (http.
 }
 
 // validateRemoteRoot checks that the remote root path exists and is a directory.
-// Mirrors the FUSE path's Stat→List fallback so both mount modes behave
+// Mirrors the FUSE path's Stat鈫扡ist fallback so both mount modes behave
 // identically on backends where directory stat is unsupported.
 func validateRemoteRoot(c *client.Client, remoteRoot string) error {
 	if remoteRoot == "/" {
@@ -240,7 +240,7 @@ func validateRemoteRoot(c *client.Client, remoteRoot string) error {
 	}
 	stat, err := c.Stat(remoteRoot)
 	if err != nil {
-		// If Stat explicitly says "not found", trust it — don't fall back
+		// If Stat explicitly says "not found", trust it 鈥?don't fall back
 		// to List which may return empty success for non-existent paths.
 		if client.IsNotFound(err) {
 			return remoteRootError(remoteRoot, err)
@@ -457,7 +457,7 @@ func terminateProcess(pid int) error {
 
 // resolveMountCredentials selects the (server, apiKey, token) triple that a
 // fresh mount will be bound to. It locks the principal kind at mount time
-// per Invariant #3 — once this function returns, the chosen credential is
+// per Invariant #3 鈥?once this function returns, the chosen credential is
 // fixed for the mount's lifetime. An explicit --api-key flag always means
 // owner; delegated JWTs only reach this layer through the active context
 // or DRIVE9_VAULT_TOKEN (resolver output).
