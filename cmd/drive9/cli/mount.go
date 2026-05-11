@@ -314,6 +314,7 @@ type umountDeps struct {
 	run       func([]string) error
 	readPID   func(string) (int, string, error)
 	terminate func(int, time.Duration) error
+	remove    func(string) error
 	pidAlive  func(int) bool
 	now       func() time.Time
 	sleep     func(time.Duration)
@@ -332,6 +333,7 @@ func defaultUmountDeps() umountDeps {
 		},
 		readPID:   mountstate.ReadPID,
 		terminate: terminateProcess,
+		remove:    os.Remove,
 		pidAlive:  processAlive,
 		now:       time.Now,
 		sleep:     time.Sleep,
@@ -387,6 +389,11 @@ func runUmount(args []string, deps umountDeps) error {
 		if err := deps.terminate(pid, *waitTimeout); err != nil {
 			return fmt.Errorf("%w (pid file: %s)", err, path)
 		}
+		if path != "" && deps.remove != nil {
+			if err := deps.remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("drive9 umount: remove mount pid file %s: %w", path, err)
+			}
+		}
 		return nil
 	}
 	if *waitTimeout == 0 {
@@ -421,6 +428,8 @@ func processAlive(pid int) bool {
 	return processAliveImpl(pid)
 }
 
+var waitForProcessExit = waitForProcessExitByPID
+
 func terminateProcess(pid int, waitTimeout time.Duration) error {
 	if pid <= 0 {
 		return fmt.Errorf("invalid mount process pid %d", pid)
@@ -430,17 +439,18 @@ func terminateProcess(pid int, waitTimeout time.Duration) error {
 		return err
 	}
 	err = process.Kill()
-	if err == nil {
-		return nil
+	if err != nil {
+		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+			err = nil
+		} else {
+			return err
+		}
 	}
-	if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
-		return nil
+	if waitTimeout > 0 {
+		return waitForProcessExit(pid, waitTimeout)
 	}
 	if err != nil {
 		return err
-	}
-	if waitTimeout > 0 {
-		return waitForProcessExitByPID(pid, waitTimeout)
 	}
 	return nil
 }
