@@ -283,7 +283,7 @@ func TestResolveMountCredentials_Invariant6Snapshot(t *testing.T) {
 
 	// Simulate `ctx use other-context` happening between two mount
 	// attempts. Since the helper is pure, the second call cannot affect
-	// the first's result — the first mount's binding is already frozen
+	// the first's result - the first mount's binding is already frozen
 	// into its returned triple.
 	second := ResolvedCredentials{Kind: CredentialOwner, Server: "https://s.example", APIKey: "sk-rotated"}
 	_, api2, tok2, err := resolveMountCredentials(second, "", "")
@@ -457,7 +457,7 @@ func TestNormalizeLookupRetryCount(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Row A — only the CURRENT backend keyword ("vault") is special. All other
+// Row A - only the CURRENT backend keyword ("vault") is special. All other
 // bare-word first positionals (not :/path remote sources) are rejected when
 // two args are given, since the 2-arg form requires a remote source prefix.
 // ---------------------------------------------------------------------------
@@ -556,7 +556,7 @@ func TestValidateRemoteRoot_BothFailWith404(t *testing.T) {
 }
 
 func TestValidateRemoteRoot_Stat404TrustedOverList(t *testing.T) {
-	// Stat (HEAD) returns 404 — we trust it immediately and show the hint,
+	// Stat (HEAD) returns 404 - we trust it immediately and show the hint,
 	// even if List would succeed (server returns empty entries for
 	// non-existent paths).
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

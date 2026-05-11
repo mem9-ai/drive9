@@ -269,7 +269,7 @@ func mountErrorHint(goos, mountPoint string, err error) string {
 	case 2: // ENOENT
 		return fmt.Sprintf("mount point %q does not exist or is not accessible.", mountPoint)
 	case 16: // EBUSY
-		return fmt.Sprintf("mount point %q is busy — a filesystem may already be mounted there. Run `mount | grep %q` and `drive9 umount %s` to clean up.", mountPoint, mountPoint, mountPoint)
+		return fmt.Sprintf("mount point %q is busy - a filesystem may already be mounted there. Run `mount | grep %q` and `drive9 umount %s` to clean up.", mountPoint, mountPoint, mountPoint)
 	case 19: // ENODEV
 		return fmt.Sprintf("the kernel rejected the WebDAV mount at %q (ENODEV). Common causes: a stale mount still attached at this path (try `mount | grep %q` then `drive9 umount %s`); the local WebDAV bridge was unreachable; or the mount point is on a filesystem that does not support WebDAV mounts (e.g. some network volumes). Try a fresh path under your home directory.", mountPoint, mountPoint, mountPoint)
 	case 77: // ECANCELED
