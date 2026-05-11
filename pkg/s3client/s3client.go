@@ -7,7 +7,19 @@ import (
 	"context"
 	"io"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/metrics"
 )
+
+const metricsComponent = "s3client"
+
+func markS3ClientAvailable() {
+	metrics.SetModuleAvailability(metricsComponent, true)
+}
+
+func recordS3Operation(operation, result string, start time.Time) {
+	metrics.RecordOperation(metricsComponent, operation, result, time.Since(start))
+}
 
 // EncryptionMode identifies the storage encryption mode used for an object.
 type EncryptionMode string

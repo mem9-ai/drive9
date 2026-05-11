@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/mem9-ai/dat9/pkg/metrics"
 )
 
 func newTestClient(t *testing.T) *LocalS3Client {
@@ -22,6 +25,12 @@ func newTestClient(t *testing.T) *LocalS3Client {
 		t.Fatal(err)
 	}
 	return c
+}
+
+func readS3Metrics() string {
+	recorder := httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	return recorder.Body.String()
 }
 
 func TestCalcParts(t *testing.T) {
@@ -88,6 +97,38 @@ func TestDeleteObject(t *testing.T) {
 	_, err := c.GetObject(ctx, "blobs/del")
 	if err == nil {
 		t.Error("expected error after delete")
+	}
+}
+
+func TestS3MetricsExposed(t *testing.T) {
+	c := newTestClient(t)
+	ctx := context.Background()
+
+	data := []byte("hello metrics")
+	if err := c.PutObject(ctx, "blobs/metrics", bytes.NewReader(data), int64(len(data)), EncryptionOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	rc, err := c.GetObject(ctx, "blobs/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rc.Close() }()
+	if _, err := io.ReadAll(rc); err != nil {
+		t.Fatal(err)
+	}
+
+	metricsText := readS3Metrics()
+	if !strings.Contains(metricsText, "dat9_module_up{module=\"s3client\"} 1") {
+		t.Fatalf("metrics missing s3client module availability: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, "dat9_service_operations_total{component=\"s3client\",operation=\"put_object\",result=\"ok\"}") {
+		t.Fatalf("metrics missing s3client put_object counter: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, "dat9_service_operations_total{component=\"s3client\",operation=\"get_object\",result=\"ok\"}") {
+		t.Fatalf("metrics missing s3client get_object counter: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, "dat9_service_operation_duration_seconds_count{component=\"s3client\",operation=\"get_object\",result=\"ok\"}") {
+		t.Fatalf("metrics missing s3client duration histogram: %s", metricsText)
 	}
 }
 

@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Request-path drill-down dashboard for non-FS and non-upload Drive9 APIs, focused on control, vault, SQL, events, and auxiliary HTTP surfaces.",
+  "description": "Request-path drill-down dashboard for the Drive9 upload path, correlating upload HTTP traffic, backend upload operations, and upload-related events.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -55,7 +55,7 @@
       },
       "id": 100,
       "options": {
-        "content": "# API Surface Performance\n\nCategory: request-path drill-down.\n\nUse this after an overview dashboard shows an HTTP-facing problem outside the FS and upload paths. This dashboard is intentionally scoped to control, vault, SQL, events, and auxiliary HTTP routes so it does not duplicate the dedicated FS and upload dashboards. It answers which routes are hot, which are slow, and whether latency coincides with inflight buildup or error spikes.",
+        "content": "# Upload Path Performance\n\nCategory: request-path drill-down.\n\nUse this when the issue is clearly on initiate, presign, confirm, finalize, resume, or abort upload flows. This dashboard owns the upload path and should be preferred over the generic API surface dashboard for upload symptoms. Start with HTTP throughput and tail latency, then compare service-operation latency, and finally check conflict, expired, and error event pressure. If the symptom narrows past the upload control path into raw object-store behavior, continue into the upload plus S3 drill-down dashboard for s3client throughput and latency.",
         "mode": "markdown"
       },
       "title": "Guide",
@@ -82,15 +82,15 @@
               },
               {
                 "color": "orange",
-                "value": 100
+                "value": 10
               },
               {
                 "color": "red",
-                "value": 300
+                "value": 50
               }
             ]
           },
-          "unit": "ops"
+          "unit": "reqps"
         },
         "overrides": []
       },
@@ -121,12 +121,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval]))",
-          "legendFormat": "http_rps",
+          "expr": "sum(rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
+          "legendFormat": "upload_rps",
           "refId": "A"
         }
       ],
-      "title": "HTTP RPS",
+      "title": "Upload HTTP RPS",
       "type": "stat"
     },
     {
@@ -188,12 +188,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval])))",
-          "legendFormat": "http_p95",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval])))",
+          "legendFormat": "upload_http_p95",
           "refId": "A"
         }
       ],
-      "title": "HTTP P95",
+      "title": "Upload HTTP P95",
       "type": "stat"
     },
     {
@@ -234,7 +234,7 @@
         "x": 8,
         "y": 4
       },
-      "id": 3,
+      "id": 6,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
@@ -255,12 +255,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval])))",
-          "legendFormat": "http_p99",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval])))",
+          "legendFormat": "upload_http_p99",
           "refId": "A"
         }
       ],
-      "title": "HTTP P99",
+      "title": "Upload HTTP P99",
       "type": "stat"
     },
     {
@@ -283,15 +283,15 @@
               },
               {
                 "color": "orange",
-                "value": 20
+                "value": 0.1
               },
               {
                 "color": "red",
-                "value": 100
+                "value": 0.5
               }
             ]
           },
-          "unit": "short"
+          "unit": "s"
         },
         "overrides": []
       },
@@ -301,7 +301,7 @@
         "x": 12,
         "y": 4
       },
-      "id": 4,
+      "id": 3,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
@@ -322,12 +322,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(dat9_http_inflight_requests{route=~\"$route\"})",
-          "legendFormat": "inflight",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval])))",
+          "legendFormat": "upload_service_p95",
           "refId": "A"
         }
       ],
-      "title": "Inflight Requests",
+      "title": "Upload Service P95",
       "type": "stat"
     },
     {
@@ -368,7 +368,7 @@
         "x": 16,
         "y": 4
       },
-      "id": 5,
+      "id": 4,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
@@ -389,12 +389,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$route\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval])), 0.000001)",
-          "legendFormat": "http_5xx_ratio",
+          "expr": "sum(rate(dat9_http_requests_total{route=~\"$http_route\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval])), 1)",
+          "legendFormat": "upload_5xx_ratio",
           "refId": "A"
         }
       ],
-      "title": "HTTP 5xx Ratio",
+      "title": "Upload 5xx Ratio",
       "type": "stat"
     },
     {
@@ -417,15 +417,15 @@
               },
               {
                 "color": "orange",
-                "value": 0.05
+                "value": 5
               },
               {
                 "color": "red",
-                "value": 0.2
+                "value": 20
               }
             ]
           },
-          "unit": "percentunit"
+          "unit": "short"
         },
         "overrides": []
       },
@@ -435,7 +435,7 @@
         "x": 20,
         "y": 4
       },
-      "id": 6,
+      "id": 5,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
@@ -456,12 +456,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$route\",status=~\"4..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval])), 0.000001)",
-          "legendFormat": "http_4xx_ratio",
+          "expr": "sum(dat9_http_inflight_requests{route=~\"$http_route\"})",
+          "legendFormat": "upload_inflight",
           "refId": "A"
         }
       ],
-      "title": "HTTP 4xx Ratio",
+      "title": "Upload HTTP Inflight",
       "type": "stat"
     },
     {
@@ -475,12 +475,12 @@
             "mode": "palette-classic"
           },
           "mappings": [],
-          "unit": "ops"
+          "unit": "reqps"
         },
         "overrides": []
       },
       "gridPos": {
-        "h": 10,
+        "h": 8,
         "w": 12,
         "x": 0,
         "y": 8
@@ -503,12 +503,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, sum by (route) (rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval])))",
-          "legendFormat": "{{route}}",
+          "expr": "sum by (route, method) (rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
+          "legendFormat": "{{method}} {{route}}",
           "refId": "A"
         }
       ],
-      "title": "Top Routes By Throughput",
+      "title": "Hot Upload Routes By Throughput",
       "type": "timeseries"
     },
     {
@@ -527,7 +527,7 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 10,
+        "h": 8,
         "w": 12,
         "x": 12,
         "y": 8
@@ -550,8 +550,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.95, sum by (le, route) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval]))))",
-          "legendFormat": "{{route}} p95",
+          "expr": "topk(12, histogram_quantile(0.95, sum by (le, route, method) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval]))))",
+          "legendFormat": "{{method}} {{route}} p95",
           "refId": "A"
         },
         {
@@ -559,12 +559,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.99, sum by (le, route) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval]))))",
-          "legendFormat": "{{route}} p99",
+          "expr": "topk(12, histogram_quantile(0.99, sum by (le, route, method) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval]))))",
+          "legendFormat": "{{method}} {{route}} p99",
           "refId": "B"
         }
       ],
-      "title": "Route Latency P95 / P99",
+      "title": "Upload HTTP Tail Latency",
       "type": "timeseries"
     },
     {
@@ -578,21 +578,21 @@
             "mode": "palette-classic"
           },
           "mappings": [],
-          "unit": "ops"
+          "unit": "reqps"
         },
         "overrides": []
       },
       "gridPos": {
-        "h": 10,
+        "h": 8,
         "w": 12,
         "x": 0,
-        "y": 18
+        "y": 16
       },
       "id": 13,
       "options": {
         "legend": {
           "calcs": [],
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -606,12 +606,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (status) (rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval]))",
-          "legendFormat": "status={{status}}",
+          "expr": "sum by (status) (rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
+          "legendFormat": "{{status}}",
           "refId": "A"
         }
       ],
-      "title": "HTTP Status Mix",
+      "title": "Upload HTTP Status Mix",
       "type": "timeseries"
     },
     {
@@ -630,10 +630,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 10,
+        "h": 8,
         "w": 12,
         "x": 12,
-        "y": 18
+        "y": 16
       },
       "id": 14,
       "options": {
@@ -653,8 +653,55 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, sum by (route, status) (rate(dat9_http_requests_total{route=~\"$route\",status!~\"2..|3..\"}[$__rate_interval])))",
-          "legendFormat": "{{route}} / {{status}}",
+          "expr": "sum by (operation, result) (rate(dat9_service_operations_total{operation=~\"$service_operation\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} / {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Upload Service Throughput By Result",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "topk(12, histogram_quantile(0.95, sum by (le, operation) (rate(dat9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval]))))",
+          "legendFormat": "{{operation}} p95",
           "refId": "A"
         },
         {
@@ -662,12 +709,59 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(dat9_http_inflight_requests{route=~\"$route\"})",
-          "legendFormat": "inflight",
+          "expr": "topk(12, histogram_quantile(0.99, sum by (le, operation) (rate(dat9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval]))))",
+          "legendFormat": "{{operation}} p99",
           "refId": "B"
         }
       ],
-      "title": "Error Routes And Inflight",
+      "title": "Upload Service Tail Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (event, result) (rate(dat9_tenant_events_total{event=~\"$event\"}[$__rate_interval]))",
+          "legendFormat": "{{event}} / {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Upload Outcome Events",
       "type": "timeseries"
     }
   ],
@@ -675,8 +769,8 @@
   "schemaVersion": 41,
   "tags": [
     "drive9",
-    "api",
-    "control-plane",
+    "upload",
+    "request-path",
     "performance",
     "grafana",
     "prometheus"
@@ -701,7 +795,7 @@
         "type": "datasource"
       },
       {
-        "allValue": "/v1/provision|/v1/status|/v1/sql|/v1/events|/v1/vault/.*|/s3/.*",
+        "allValue": "/v1/uploads.*|/v2/uploads.*",
         "current": {
           "selected": true,
           "text": "All",
@@ -711,14 +805,62 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_http_requests_total{route=~\"/v1/provision|/v1/status|/v1/sql|/v1/events|/v1/vault/.*|/s3/.*\"}, route)",
+        "definition": "label_values(dat9_http_requests_total{route=~\"/v1/uploads.*|/v2/uploads.*\"}, route)",
         "hide": 0,
         "includeAll": true,
-        "label": "API Route",
+        "label": "HTTP Route",
         "multi": true,
-        "name": "route",
+        "name": "http_route",
         "options": [],
-        "query": "label_values(dat9_http_requests_total{route=~\"/v1/provision|/v1/status|/v1/sql|/v1/events|/v1/vault/.*|/s3/.*\"}, route)",
+        "query": "label_values(dat9_http_requests_total{route=~\"/v1/uploads.*|/v2/uploads.*\"}, route)",
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(dat9_service_operations_total{operation=~\"upload_.*|v2_upload_.*|v2_presign_.*|complete_upload|resume_upload|abort_upload\"}, operation)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Service Operation",
+        "multi": true,
+        "name": "service_operation",
+        "options": [],
+        "query": "label_values(dat9_service_operations_total{operation=~\"upload_.*|v2_upload_.*|v2_presign_.*|complete_upload|resume_upload|abort_upload\"}, operation)",
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(dat9_tenant_events_total{event=~\"upload_.*|v2_upload_.*|v2_presign_.*\"}, event)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Tenant Event",
+        "multi": true,
+        "name": "event",
+        "options": [],
+        "query": "label_values(dat9_tenant_events_total{event=~\"upload_.*|v2_upload_.*|v2_presign_.*\"}, event)",
         "refresh": 2,
         "regex": "",
         "sort": 1,
@@ -732,8 +874,8 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Drive9 API Surface (HTTP) Performance",
-  "uid": "drive9-http-performance",
+  "title": "Drive9 Upload Path Performance",
+  "uid": "drive9-upload-path",
   "version": 1,
   "weekStart": ""
 }

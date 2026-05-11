@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/vault"
 )
@@ -56,6 +57,10 @@ func (s *Server) handleVault(w http.ResponseWriter, r *http.Request) {
 }
 
 var errVaultUnsupported = errors.New("vault is not supported for this provider")
+
+func recordVaultOperation(op string, start time.Time, result string) {
+	metrics.RecordOperation("vault", op, result, time.Since(start))
+}
 
 // vaultStore returns the vault store for the current tenant.
 // Vault is only supported on TiDB providers; db9 tenants get a clear error.
@@ -138,6 +143,10 @@ func (s *Server) handleVaultSecrets(w http.ResponseWriter, r *http.Request, sub 
 }
 
 func (s *Server) handleVaultSecretCreate(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID string) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("secret_create", start, result) }()
+
 	var req struct {
 		Name       string            `json:"name"`
 		SecretType string            `json:"secret_type"`
@@ -145,14 +154,17 @@ func (s *Server) handleVaultSecretCreate(w http.ResponseWriter, r *http.Request,
 		CreatedBy  string            `json:"created_by"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
 	if req.Name == "" {
+		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, "name is required")
 		return
 	}
 	if len(req.Fields) == 0 {
+		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, "fields are required")
 		return
 	}
@@ -172,9 +184,11 @@ func (s *Server) handleVaultSecretCreate(w http.ResponseWriter, r *http.Request,
 	sec, err := vs.CreateSecret(r.Context(), tenantID, req.Name, req.CreatedBy, secretType, fields)
 	if err != nil {
 		if isVaultDuplicateEntryErr(err) {
+			result = "already_exists"
 			errJSON(w, http.StatusConflict, "secret already exists")
 			return
 		}
+		result = "error"
 		logger.Error(r.Context(), "vault_secret_create_failed",
 			eventFields(r.Context(), "vault_secret_create_failed",
 				"tenant_id", tenantID,
@@ -196,8 +210,13 @@ func (s *Server) handleVaultSecretCreate(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *Server) handleVaultSecretList(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID string) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("secret_list", start, result) }()
+
 	secrets, err := vs.ListSecrets(r.Context(), tenantID)
 	if err != nil {
+		result = "error"
 		errJSON(w, http.StatusInternalServerError, "failed to list secrets")
 		return
 	}
@@ -209,12 +228,18 @@ func (s *Server) handleVaultSecretList(w http.ResponseWriter, r *http.Request, v
 }
 
 func (s *Server) handleVaultSecretGet(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, name string) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("secret_get", start, result) }()
+
 	sec, err := vs.GetSecret(r.Context(), tenantID, name)
 	if err != nil {
 		if errors.Is(err, vault.ErrNotFound) {
+			result = "not_found"
 			errJSON(w, http.StatusNotFound, "secret not found")
 			return
 		}
+		result = "error"
 		errJSON(w, http.StatusInternalServerError, "failed to get secret")
 		return
 	}
@@ -225,12 +250,18 @@ func (s *Server) handleVaultSecretGet(w http.ResponseWriter, r *http.Request, vs
 // handleVaultSecretReadValue returns all decrypted fields for a secret (owner-read path).
 // Response shape matches handleVaultReadSecret (Invariant #9: response schema parity).
 func (s *Server) handleVaultSecretReadValue(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, secretName string) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("secret_read_value", start, result) }()
+
 	fields, err := vs.ReadSecretFields(r.Context(), tenantID, secretName)
 	if err != nil {
 		if errors.Is(err, vault.ErrNotFound) {
+			result = "not_found"
 			errJSON(w, http.StatusNotFound, "not found")
 			return
 		}
+		result = "error"
 		errJSON(w, http.StatusInternalServerError, "failed to read secret")
 		return
 	}
@@ -252,13 +283,14 @@ func (s *Server) handleVaultSecretReadValue(w http.ResponseWriter, r *http.Reque
 			_, _ = fmt.Fprintf(w, "%s=%s\n", strings.ToUpper(k), string(v))
 		}
 	case "json", "":
-		result := make(map[string]string, len(fields))
+		payload := make(map[string]string, len(fields))
 		for k, v := range fields {
-			result[k] = string(v)
+			payload[k] = string(v)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(result)
+		_ = json.NewEncoder(w).Encode(payload)
 	default:
+		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, "unsupported format")
 	}
 }
@@ -266,12 +298,18 @@ func (s *Server) handleVaultSecretReadValue(w http.ResponseWriter, r *http.Reque
 // handleVaultSecretReadField returns a single decrypted field (owner-read path).
 // Response shape matches handleVaultReadField (Invariant #9: response schema parity).
 func (s *Server) handleVaultSecretReadField(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, secretName, fieldName string) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("secret_read_field", start, result) }()
+
 	plaintext, err := vs.ReadSecretField(r.Context(), tenantID, secretName, fieldName)
 	if err != nil {
 		if errors.Is(err, vault.ErrNotFound) || errors.Is(err, vault.ErrFieldNotFound) {
+			result = "not_found"
 			errJSON(w, http.StatusNotFound, "not found")
 			return
 		}
+		result = "error"
 		errJSON(w, http.StatusInternalServerError, "failed to read field")
 		return
 	}
@@ -291,15 +329,21 @@ func (s *Server) handleVaultSecretReadField(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) handleVaultSecretUpdate(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, name string) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("secret_update", start, result) }()
+
 	var req struct {
 		Fields    map[string]string `json:"fields"`
 		UpdatedBy string            `json:"updated_by"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
 	if len(req.Fields) == 0 {
+		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, "fields are required")
 		return
 	}
@@ -315,9 +359,11 @@ func (s *Server) handleVaultSecretUpdate(w http.ResponseWriter, r *http.Request,
 	sec, err := vs.UpdateSecret(r.Context(), tenantID, name, req.UpdatedBy, fields)
 	if err != nil {
 		if errors.Is(err, vault.ErrNotFound) {
+			result = "not_found"
 			errJSON(w, http.StatusNotFound, "secret not found")
 			return
 		}
+		result = "error"
 		logger.Error(r.Context(), "vault_secret_update_failed",
 			eventFields(r.Context(), "vault_secret_update_failed",
 				"tenant_id", tenantID,
@@ -338,12 +384,18 @@ func (s *Server) handleVaultSecretUpdate(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *Server) handleVaultSecretDelete(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, name string) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("secret_delete", start, result) }()
+
 	err := vs.DeleteSecret(r.Context(), tenantID, name)
 	if err != nil {
 		if errors.Is(err, vault.ErrNotFound) {
+			result = "not_found"
 			errJSON(w, http.StatusNotFound, "secret not found")
 			return
 		}
+		result = "error"
 		errJSON(w, http.StatusInternalServerError, "failed to delete secret")
 		return
 	}
@@ -392,6 +444,10 @@ func (s *Server) handleVaultTokens(w http.ResponseWriter, r *http.Request, sub s
 }
 
 func (s *Server) handleVaultTokenIssue(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID string) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("token_issue", start, result) }()
+
 	var req struct {
 		AgentID string   `json:"agent_id"`
 		TaskID  string   `json:"task_id"`
@@ -399,18 +455,22 @@ func (s *Server) handleVaultTokenIssue(w http.ResponseWriter, r *http.Request, v
 		TTLSecs int      `json:"ttl_seconds"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
 	if req.AgentID == "" {
+		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, "agent_id is required")
 		return
 	}
 	if len(req.Scope) == 0 {
+		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, "scope is required")
 		return
 	}
 	if err := vault.ValidateScope(req.Scope); err != nil {
+		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -421,6 +481,7 @@ func (s *Server) handleVaultTokenIssue(w http.ResponseWriter, r *http.Request, v
 
 	tokenStr, capToken, err := vs.IssueCapToken(r.Context(), tenantID, req.AgentID, req.TaskID, req.Scope, ttl)
 	if err != nil {
+		result = "error"
 		errJSON(w, http.StatusInternalServerError, "failed to issue token")
 		return
 	}
@@ -443,6 +504,10 @@ func (s *Server) handleVaultTokenIssue(w http.ResponseWriter, r *http.Request, v
 }
 
 func (s *Server) handleVaultTokenRevoke(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, tokenID string) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("token_revoke", start, result) }()
+
 	var req struct {
 		RevokedBy string `json:"revoked_by"`
 		Reason    string `json:"reason"`
@@ -456,9 +521,11 @@ func (s *Server) handleVaultTokenRevoke(w http.ResponseWriter, r *http.Request, 
 	err := vs.RevokeCapToken(r.Context(), tenantID, tokenID, req.RevokedBy, req.Reason)
 	if err != nil {
 		if errors.Is(err, vault.ErrNotFound) {
+			result = "not_found"
 			errJSON(w, http.StatusNotFound, "token not found or already revoked")
 			return
 		}
+		result = "error"
 		errJSON(w, http.StatusInternalServerError, "failed to revoke token")
 		return
 	}
@@ -517,10 +584,15 @@ func (s *Server) handleVaultGrants(w http.ResponseWriter, r *http.Request, sub s
 }
 
 func (s *Server) handleVaultGrantIssue(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID string) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("grant_issue", start, result) }()
+
 	// Grants require a canonical server URL for the `iss` claim. If the
 	// operator hasn't configured one, we cannot mint non-forgeable tokens:
 	// fail closed rather than emit a grant without issuer binding.
 	if s.vaultIssuerURL == "" {
+		result = "unavailable"
 		errJSON(w, http.StatusServiceUnavailable, "vault issuer URL not configured")
 		return
 	}
@@ -532,6 +604,7 @@ func (s *Server) handleVaultGrantIssue(w http.ResponseWriter, r *http.Request, v
 		LabelHint string   `json:"label_hint"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
@@ -544,6 +617,7 @@ func (s *Server) handleVaultGrantIssue(w http.ResponseWriter, r *http.Request, v
 	principal := vault.PrincipalDelegated
 	perm := vault.GrantPerm(req.Perm)
 	if req.TTLSecs <= 0 {
+		result = "invalid_argument"
 		// Spec §6 "--ttl is required". Silent defaulting at the handler
 		// would emit a grant the caller didn't ask for — audit/debug trap
 		// (adv-1 Block 4, adv-2 Block B context).
@@ -561,9 +635,11 @@ func (s *Server) handleVaultGrantIssue(w http.ResponseWriter, r *http.Request, v
 		// enum / agent / issuer); map them to 400. Internal DB errors
 		// surface the same way but prefixed "insert grant:" — map to 500.
 		if strings.HasPrefix(err.Error(), "insert grant") {
+			result = "error"
 			errJSON(w, http.StatusInternalServerError, "failed to issue grant")
 			return
 		}
+		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -597,6 +673,10 @@ func (s *Server) handleVaultGrantIssue(w http.ResponseWriter, r *http.Request, v
 }
 
 func (s *Server) handleVaultGrantRevoke(w http.ResponseWriter, r *http.Request, vs *vault.Store, tenantID, grantID string) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("grant_revoke", start, result) }()
+
 	var req struct {
 		RevokedBy string `json:"revoked_by"`
 		Reason    string `json:"reason"`
@@ -609,9 +689,11 @@ func (s *Server) handleVaultGrantRevoke(w http.ResponseWriter, r *http.Request, 
 	err := vs.RevokeGrant(r.Context(), tenantID, grantID, req.RevokedBy, req.Reason)
 	if err != nil {
 		if errors.Is(err, vault.ErrNotFound) {
+			result = "not_found"
 			errJSON(w, http.StatusNotFound, "grant not found or already revoked")
 			return
 		}
+		result = "error"
 		errJSON(w, http.StatusInternalServerError, "failed to revoke grant")
 		return
 	}
@@ -638,16 +720,23 @@ func (s *Server) handleVaultGrantRevoke(w http.ResponseWriter, r *http.Request, 
 // ---- Management API: /v1/vault/audit ----
 
 func (s *Server) handleVaultAudit(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("audit_query", start, result) }()
+
 	if r.Method != http.MethodGet {
+		result = "invalid_argument"
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	vs, err := s.vaultStore(r)
 	if err != nil {
 		if errors.Is(err, errVaultUnsupported) {
+			result = "unsupported"
 			errJSON(w, http.StatusNotImplemented, err.Error())
 			return
 		}
+		result = "error"
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -663,6 +752,7 @@ func (s *Server) handleVaultAudit(w http.ResponseWriter, r *http.Request) {
 
 	events, err := vs.QueryAuditLog(r.Context(), scope.TenantID, secretName, limit)
 	if err != nil {
+		result = "error"
 		errJSON(w, http.StatusInternalServerError, "failed to query audit log")
 		return
 	}
@@ -806,6 +896,10 @@ func (s *Server) verifyGrantReadToken(r *http.Request, vs *vault.Store, tenantID
 }
 
 func (s *Server) handleVaultReadEnumerate(w http.ResponseWriter, r *http.Request, vs *vault.Store, p *vaultReadPrincipal) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("read_enumerate", start, result) }()
+
 	scopedNames := vault.ScopedSecretNames(p.Scope)
 	// Filter to secrets that actually exist.
 	var available []string
@@ -833,9 +927,14 @@ func (s *Server) handleVaultReadEnumerate(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, vs *vault.Store, p *vaultReadPrincipal, secretName string) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("read_secret", start, result) }()
+
 	// Scope check.
 	allFields, allowedFields := vault.AllowedFields(p.Scope, secretName)
 	if !allFields && len(allowedFields) == 0 {
+		result = "out_of_scope"
 		_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
 			TenantID:   p.TenantID,
 			EventType:  "secret.denied",
@@ -852,9 +951,11 @@ func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, v
 	fields, err := vs.ReadSecretFields(r.Context(), p.TenantID, secretName)
 	if err != nil {
 		if errors.Is(err, vault.ErrNotFound) {
+			result = "not_found"
 			errJSON(w, http.StatusNotFound, "not found")
 			return
 		}
+		result = "error"
 		errJSON(w, http.StatusInternalServerError, "failed to read secret")
 		return
 	}
@@ -890,20 +991,26 @@ func (s *Server) handleVaultReadSecret(w http.ResponseWriter, r *http.Request, v
 			_, _ = fmt.Fprintf(w, "%s=%s\n", strings.ToUpper(k), string(v))
 		}
 	case "json", "":
-		result := make(map[string]string, len(fields))
+		payload := make(map[string]string, len(fields))
 		for k, v := range fields {
-			result[k] = string(v)
+			payload[k] = string(v)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(result)
+		_ = json.NewEncoder(w).Encode(payload)
 	default:
+		result = "invalid_argument"
 		errJSON(w, http.StatusBadRequest, "unsupported format")
 	}
 }
 
 func (s *Server) handleVaultReadField(w http.ResponseWriter, r *http.Request, vs *vault.Store, p *vaultReadPrincipal, secretName, fieldName string) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordVaultOperation("read_field", start, result) }()
+
 	// Scope check.
 	if !vault.CheckScope(p.Scope, secretName, fieldName) {
+		result = "out_of_scope"
 		_ = vs.WriteAuditEvent(r.Context(), &vault.AuditEvent{
 			TenantID:   p.TenantID,
 			EventType:  "secret.denied",
@@ -920,9 +1027,11 @@ func (s *Server) handleVaultReadField(w http.ResponseWriter, r *http.Request, vs
 	plaintext, err := vs.ReadSecretField(r.Context(), p.TenantID, secretName, fieldName)
 	if err != nil {
 		if errors.Is(err, vault.ErrNotFound) || errors.Is(err, vault.ErrFieldNotFound) {
+			result = "not_found"
 			errJSON(w, http.StatusNotFound, "not found")
 			return
 		}
+		result = "error"
 		errJSON(w, http.StatusInternalServerError, "failed to read field")
 		return
 	}

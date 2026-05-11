@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Request-path drill-down dashboard for non-FS and non-upload Drive9 APIs, focused on control, vault, SQL, events, and auxiliary HTTP surfaces.",
+  "description": "Data-store drill-down dashboard that owns database role=user, focused on Drive9 tenant-serving query behavior.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -31,17 +31,6 @@
       "title": "Service Health Overview",
       "type": "link",
       "url": "/d/drive9-service-health"
-    },
-    {
-      "asDropdown": false,
-      "icon": "external link",
-      "includeVars": true,
-      "keepTime": true,
-      "tags": [],
-      "targetBlank": false,
-      "title": "Async And FUSE Overview",
-      "type": "link",
-      "url": "/d/drive9-async-fuse"
     }
   ],
   "liveNow": false,
@@ -55,7 +44,7 @@
       },
       "id": 100,
       "options": {
-        "content": "# API Surface Performance\n\nCategory: request-path drill-down.\n\nUse this after an overview dashboard shows an HTTP-facing problem outside the FS and upload paths. This dashboard is intentionally scoped to control, vault, SQL, events, and auxiliary HTTP routes so it does not duplicate the dedicated FS and upload dashboards. It answers which routes are hot, which are slow, and whether latency coincides with inflight buildup or error spikes.",
+        "content": "# Tenant Data DB Performance\n\nCategory: data-store drill-down.\n\nUse this when overview dashboards suggest DB pressure on tenant-serving queries rather than control-plane metadata traffic. This dashboard owns database role=`user` and should be preferred whenever the bottleneck looks data-path rather than control-plane. Operation panels stay grouped by operation and result only because exported DB metrics intentionally avoid tenant-scoped labels. Pool panels remain shared because they come from the process-wide `sql.DB` pool rather than tenant-scoped accounting.",
         "mode": "markdown"
       },
       "title": "Guide",
@@ -82,15 +71,15 @@
               },
               {
                 "color": "orange",
-                "value": 100
+                "value": 0.05
               },
               {
                 "color": "red",
-                "value": 300
+                "value": 0.25
               }
             ]
           },
-          "unit": "ops"
+          "unit": "s"
         },
         "overrides": []
       },
@@ -121,12 +110,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval]))",
-          "legendFormat": "http_rps",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\"}[$__rate_interval])))",
+          "legendFormat": "user_p95",
           "refId": "A"
         }
       ],
-      "title": "HTTP RPS",
+      "title": "User DB P95",
       "type": "stat"
     },
     {
@@ -188,12 +177,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval])))",
-          "legendFormat": "http_p95",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\"}[$__rate_interval])))",
+          "legendFormat": "user_p99",
           "refId": "A"
         }
       ],
-      "title": "HTTP P95",
+      "title": "User DB P99",
       "type": "stat"
     },
     {
@@ -216,15 +205,15 @@
               },
               {
                 "color": "orange",
-                "value": 0.5
+                "value": 1
               },
               {
                 "color": "red",
-                "value": 2
+                "value": 5
               }
             ]
           },
-          "unit": "s"
+          "unit": "ops"
         },
         "overrides": []
       },
@@ -255,12 +244,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval])))",
-          "legendFormat": "http_p99",
+          "expr": "sum(rate(dat9_db_pool_wait_count_total{role=\"user\"}[$__rate_interval]))",
+          "legendFormat": "user_waits",
           "refId": "A"
         }
       ],
-      "title": "HTTP P99",
+      "title": "User Waits /s",
       "type": "stat"
     },
     {
@@ -283,15 +272,15 @@
               },
               {
                 "color": "orange",
-                "value": 20
+                "value": 0.7
               },
               {
                 "color": "red",
-                "value": 100
+                "value": 0.9
               }
             ]
           },
-          "unit": "short"
+          "unit": "percentunit"
         },
         "overrides": []
       },
@@ -322,12 +311,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(dat9_http_inflight_requests{route=~\"$route\"})",
-          "legendFormat": "inflight",
+          "expr": "sum(dat9_db_pool_connections{role=\"user\",state=\"in_use\"}) / clamp_min(sum(dat9_db_pool_connections{role=\"user\",state=\"max_open\"}), 1)",
+          "legendFormat": "user_utilization",
           "refId": "A"
         }
       ],
-      "title": "Inflight Requests",
+      "title": "User Utilization",
       "type": "stat"
     },
     {
@@ -350,15 +339,15 @@
               },
               {
                 "color": "orange",
-                "value": 0.01
+                "value": 1
               },
               {
                 "color": "red",
-                "value": 0.05
+                "value": 5
               }
             ]
           },
-          "unit": "percentunit"
+          "unit": "short"
         },
         "overrides": []
       },
@@ -389,79 +378,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$route\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval])), 0.000001)",
-          "legendFormat": "http_5xx_ratio",
+          "expr": "sum(dat9_db_pool_connections{role=\"user\",state=\"open\"})",
+          "legendFormat": "user_open",
           "refId": "A"
         }
       ],
-      "title": "HTTP 5xx Ratio",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 0.05
-              },
-              {
-                "color": "red",
-                "value": 0.2
-              }
-            ]
-          },
-          "unit": "percentunit"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 20,
-        "y": 4
-      },
-      "id": 6,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$route\",status=~\"4..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval])), 0.000001)",
-          "legendFormat": "http_4xx_ratio",
-          "refId": "A"
-        }
-      ],
-      "title": "HTTP 4xx Ratio",
+      "title": "Open Connections",
       "type": "stat"
     },
     {
@@ -480,7 +402,7 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 10,
+        "h": 8,
         "w": 12,
         "x": 0,
         "y": 8
@@ -503,12 +425,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, sum by (route) (rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval])))",
-          "legendFormat": "{{route}}",
+          "expr": "sum by (operation, result) (rate(dat9_db_operations_total{role=\"user\",operation=~\"$db_operation\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} / {{result}}",
           "refId": "A"
         }
       ],
-      "title": "Top Routes By Throughput",
+      "title": "User DB Operation Throughput",
       "type": "timeseries"
     },
     {
@@ -527,7 +449,7 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 10,
+        "h": 8,
         "w": 12,
         "x": 12,
         "y": 8
@@ -550,8 +472,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.95, sum by (le, route) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval]))))",
-          "legendFormat": "{{route}} p95",
+          "expr": "topk(12, histogram_quantile(0.95, sum by (le, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\"}[$__rate_interval]))))",
+          "legendFormat": "{{operation}} p95",
           "refId": "A"
         },
         {
@@ -559,12 +481,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.99, sum by (le, route) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval]))))",
-          "legendFormat": "{{route}} p99",
+          "expr": "topk(12, histogram_quantile(0.99, sum by (le, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\"}[$__rate_interval]))))",
+          "legendFormat": "{{operation}} p99",
           "refId": "B"
         }
       ],
-      "title": "Route Latency P95 / P99",
+      "title": "User DB Tail Latency",
       "type": "timeseries"
     },
     {
@@ -578,21 +500,21 @@
             "mode": "palette-classic"
           },
           "mappings": [],
-          "unit": "ops"
+          "unit": "short"
         },
         "overrides": []
       },
       "gridPos": {
-        "h": 10,
+        "h": 8,
         "w": 12,
         "x": 0,
-        "y": 18
+        "y": 16
       },
       "id": 13,
       "options": {
         "legend": {
           "calcs": [],
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -606,12 +528,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (status) (rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval]))",
-          "legendFormat": "status={{status}}",
+          "expr": "sum by (state) (dat9_db_pool_connections{role=\"user\"})",
+          "legendFormat": "{{state}}",
           "refId": "A"
         }
       ],
-      "title": "HTTP Status Mix",
+      "title": "User DB Pool Connections",
       "type": "timeseries"
     },
     {
@@ -625,15 +547,40 @@
             "mode": "palette-classic"
           },
           "mappings": [],
-          "unit": "ops"
+          "unit": "short"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "wait_seconds_rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "wait_count_rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ops"
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
-        "h": 10,
+        "h": 8,
         "w": 12,
         "x": 12,
-        "y": 18
+        "y": 16
       },
       "id": 14,
       "options": {
@@ -653,8 +600,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, sum by (route, status) (rate(dat9_http_requests_total{route=~\"$route\",status!~\"2..|3..\"}[$__rate_interval])))",
-          "legendFormat": "{{route}} / {{status}}",
+          "expr": "rate(dat9_db_pool_wait_duration_seconds_total{role=\"user\"}[$__rate_interval])",
+          "legendFormat": "wait_seconds_rate",
           "refId": "A"
         },
         {
@@ -662,12 +609,153 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(dat9_http_inflight_requests{route=~\"$route\"})",
-          "legendFormat": "inflight",
+          "expr": "rate(dat9_db_pool_wait_count_total{role=\"user\"}[$__rate_interval])",
+          "legendFormat": "wait_count_rate",
           "refId": "B"
         }
       ],
-      "title": "Error Routes And Inflight",
+      "title": "User DB Wait Pressure",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (reason) (rate(dat9_db_pool_closes_total{role=\"user\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "title": "User DB Pool Close Reasons",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "topk(10, sum by (operation) (rate(dat9_db_operations_total{role=\"user\",operation=~\"$db_operation\"}[$__rate_interval])))",
+          "legendFormat": "{{operation}} qps",
+          "refId": "A"
+        }
+      ],
+      "title": "Top User DB Operations By QPS",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "topk(10, histogram_quantile(0.95, sum by (le, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=\"user\",operation=~\"$db_operation\"}[$__rate_interval]))))",
+          "legendFormat": "{{operation}} p95",
+          "refId": "A"
+        }
+      ],
+      "title": "Slowest User DB Operations By P95",
       "type": "timeseries"
     }
   ],
@@ -675,8 +763,8 @@
   "schemaVersion": 41,
   "tags": [
     "drive9",
-    "api",
-    "control-plane",
+    "data-store",
+    "user-db",
     "performance",
     "grafana",
     "prometheus"
@@ -701,7 +789,7 @@
         "type": "datasource"
       },
       {
-        "allValue": "/v1/provision|/v1/status|/v1/sql|/v1/events|/v1/vault/.*|/s3/.*",
+        "allValue": ".*",
         "current": {
           "selected": true,
           "text": "All",
@@ -711,19 +799,20 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_http_requests_total{route=~\"/v1/provision|/v1/status|/v1/sql|/v1/events|/v1/vault/.*|/s3/.*\"}, route)",
+        "definition": "label_values(dat9_db_operations_total{role=\"user\"}, operation)",
         "hide": 0,
         "includeAll": true,
-        "label": "API Route",
+        "label": "DB Operation",
         "multi": true,
-        "name": "route",
+        "name": "db_operation",
         "options": [],
-        "query": "label_values(dat9_http_requests_total{route=~\"/v1/provision|/v1/status|/v1/sql|/v1/events|/v1/vault/.*|/s3/.*\"}, route)",
+        "query": "label_values(dat9_db_operations_total{role=\"user\"}, operation)",
         "refresh": 2,
         "regex": "",
         "sort": 1,
         "type": "query"
-      }
+      },
+
     ]
   },
   "time": {
@@ -732,8 +821,8 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Drive9 API Surface (HTTP) Performance",
-  "uid": "drive9-http-performance",
+  "title": "Drive9 Tenant Data DB Performance",
+  "uid": "drive9-tenant-data-db",
   "version": 1,
   "weekStart": ""
 }

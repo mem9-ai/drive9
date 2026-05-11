@@ -15,12 +15,35 @@
       }
     ]
   },
-  "description": "Filesystem operation dashboard for Drive9 request-path and backend work latency.",
+  "description": "Request-path drill-down dashboard for the Drive9 filesystem path, correlating /v1/fs HTTP requests with backend fs_* work.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
   "id": null,
-  "links": [],
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Service Health Overview",
+      "type": "link",
+      "url": "/d/drive9-service-health"
+    },
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Async And FUSE Overview",
+      "type": "link",
+      "url": "/d/drive9-async-fuse"
+    }
+  ],
   "liveNow": false,
   "panels": [
     {
@@ -32,7 +55,7 @@
       },
       "id": 100,
       "options": {
-        "content": "# FS Operations\n\nThis dashboard follows file-system request paths. It combines HTTP `/v1/fs/*` traffic with backend `fs_*` service operations to separate front-door symptoms from internal work.",
+        "content": "# Filesystem Path Performance\n\nCategory: request-path drill-down.\n\nUse this when the incident is clearly on the filesystem path. This dashboard owns the `/v1/fs/*` path and should be preferred over the generic API surface dashboard for filesystem symptoms. It combines HTTP `/v1/fs/*` traffic with backend `fs_*` service operations so you can separate front-door symptoms from internal work. The bottom row adds explicit WebDAV behavior, which is useful when filesystem symptoms only reproduce through DAV mounts or clients.",
         "mode": "markdown"
       },
       "title": "Guide",
@@ -729,13 +752,117 @@
       ],
       "title": "FS Conflict And Error Events",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "id": 18,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (operation, result) (rate(dat9_service_operations_total{component=\"webdav\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}} / {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "WebDAV Operations By Result",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "id": 19,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_service_operation_duration_seconds_bucket{component=\"webdav\"}[$__rate_interval])))",
+          "legendFormat": "webdav p95",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_service_operation_duration_seconds_bucket{component=\"webdav\"}[$__rate_interval])))",
+          "legendFormat": "webdav p99",
+          "refId": "B"
+        }
+      ],
+      "title": "WebDAV Tail Latency",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",
   "schemaVersion": 41,
   "tags": [
     "drive9",
-    "fs",
+    "filesystem",
+    "request-path",
     "performance",
     "grafana",
     "prometheus"
@@ -815,7 +942,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Drive9 FS Operations Performance",
+  "title": "Drive9 Filesystem Path Performance",
   "uid": "drive9-fs-operations-performance",
   "version": 1,
   "weekStart": ""

@@ -196,6 +196,24 @@ func doVaultGrantRead(t *testing.T, srv *Server, token, path string) (*http.Resp
 	return resp, body
 }
 
+func readServerMetrics(t *testing.T, srv *Server) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	resp := rec.Result()
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("metrics status=%d body=%s", resp.StatusCode, body)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read metrics body: %v", err)
+	}
+	return string(body)
+}
+
 func tamperGrantTenantID(t *testing.T, raw, tenantID string) string {
 	t.Helper()
 	if !strings.HasPrefix(raw, "vt_") {
@@ -328,5 +346,28 @@ func TestVaultGrantReadRejectsWritePermAfterVerify(t *testing.T) {
 	resp, body := doVaultGrantRead(t, rt.server, tok, "/v1/vault/read/test3/k1")
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status=%d body=%s, want 401", resp.StatusCode, body)
+	}
+}
+
+func TestVaultMetricsExposed(t *testing.T) {
+	rt := newVaultGrantReadRuntime(t)
+	defer rt.cleanup()
+	rt.createSecret(t)
+	tok, _ := rt.issueGrant(t, []string{"test3"}, vault.GrantPermRead)
+
+	resp, body := doVaultGrantRead(t, rt.server, tok, "/v1/vault/read/test3?format=json")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", resp.StatusCode, body)
+	}
+
+	metricsText := readServerMetrics(t, rt.server)
+	if !strings.Contains(metricsText, "dat9_module_up{module=\"vault\"} 1") {
+		t.Fatalf("metrics missing vault module availability: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, "dat9_service_operations_total{component=\"vault\",operation=\"read_secret\",result=\"ok\"}") {
+		t.Fatalf("metrics missing vault service operation counter: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, "dat9_service_operation_duration_seconds_count{component=\"vault\",operation=\"read_secret\",result=\"ok\"}") {
+		t.Fatalf("metrics missing vault service duration histogram: %s", metricsText)
 	}
 }

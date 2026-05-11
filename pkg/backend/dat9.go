@@ -106,6 +106,7 @@ type Dat9Backend struct {
 	maxAudioExtractTextBytes int
 
 	fileGCWorker *FileGCWorker
+	runtimeMetricsID uint64
 
 	// Monthly LLM cost budget (P1).
 	maxMonthlyLLMCostMillicents     int64
@@ -124,6 +125,7 @@ func newBaseBackend(store *datastore.Store) *Dat9Backend {
 		entropy:             ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0),
 		inlineThreshold:     DefaultInlineThreshold,
 		textExtractMaxBytes: DefaultTextExtractMaxBytes,
+		runtimeMetricsID:    globalBackendRuntimeMetrics.allocateID(),
 	}
 }
 

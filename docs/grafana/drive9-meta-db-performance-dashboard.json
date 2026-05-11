@@ -15,12 +15,24 @@
       }
     ]
   },
-  "description": "Meta DB performance dashboard for Drive9 control-plane queries and pool pressure.",
+  "description": "Data-store drill-down dashboard that owns database role=meta, focused on Drive9 control-plane and metadata query behavior.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
   "id": null,
-  "links": [],
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Service Health Overview",
+      "type": "link",
+      "url": "/d/drive9-service-health"
+    }
+  ],
   "liveNow": false,
   "panels": [
     {
@@ -32,7 +44,7 @@
       },
       "id": 100,
       "options": {
-        "content": "# Meta DB Performance\n\nThis dashboard is scoped to role=`meta`. Operation latency and throughput panels can be filtered by `tenant_id` to spot hot tenants in control-plane traffic. Pool panels remain global because they come from the shared process-wide `sql.DB` pool.",
+        "content": "# Metadata DB Performance\n\nCategory: data-store drill-down.\n\nUse this when overview dashboards suggest DB pressure and the problem appears to sit in metadata or control-plane queries. This dashboard owns database role=`meta` and should be preferred whenever the bottleneck looks control-plane rather than tenant-serving. Operation panels stay grouped by operation and result only because exported DB metrics intentionally avoid tenant-scoped labels. Pool panels remain global because they come from the shared process-wide `sql.DB` pool.",
         "mode": "markdown"
       },
       "title": "Guide",
@@ -98,7 +110,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\"}[$__rate_interval])))",
           "legendFormat": "meta_p95",
           "refId": "A"
         }
@@ -165,7 +177,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\"}[$__rate_interval])))",
           "legendFormat": "meta_p99",
           "refId": "A"
         }
@@ -413,7 +425,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (operation, result) (rate(dat9_db_operations_total{role=\"meta\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval]))",
+          "expr": "sum by (operation, result) (rate(dat9_db_operations_total{role=\"meta\",operation=~\"$db_operation\"}[$__rate_interval]))",
           "legendFormat": "{{operation}} / {{result}}",
           "refId": "A"
         }
@@ -460,7 +472,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.95, sum by (le, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval]))))",
+          "expr": "topk(12, histogram_quantile(0.95, sum by (le, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\"}[$__rate_interval]))))",
           "legendFormat": "{{operation}} p95",
           "refId": "A"
         },
@@ -469,7 +481,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.99, sum by (le, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\"}[$__rate_interval]))))",
+          "expr": "topk(12, histogram_quantile(0.99, sum by (le, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\"}[$__rate_interval]))))",
           "legendFormat": "{{operation}} p99",
           "refId": "B"
         }
@@ -691,12 +703,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(10, sum by (tenant_id) (rate(dat9_db_operations_total{role=\"meta\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\",tenant_id!=\"\"}[$__rate_interval])))",
-          "legendFormat": "{{tenant_id}} qps",
+          "expr": "topk(10, sum by (operation) (rate(dat9_db_operations_total{role=\"meta\",operation=~\"$db_operation\"}[$__rate_interval])))",
+          "legendFormat": "{{operation}} qps",
           "refId": "A"
         }
       ],
-      "title": "Top Tenants By Meta DB QPS",
+      "title": "Top Meta DB Operations By QPS",
       "type": "timeseries"
     },
     {
@@ -738,12 +750,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(10, histogram_quantile(0.95, sum by (le, tenant_id) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\",tenant_id=~\"$tenant_id\",tenant_id!=\"\"}[$__rate_interval]))))",
-          "legendFormat": "{{tenant_id}} p95",
+          "expr": "topk(10, histogram_quantile(0.95, sum by (le, operation) (rate(dat9_db_operation_duration_seconds_bucket{role=\"meta\",operation=~\"$db_operation\"}[$__rate_interval]))))",
+          "legendFormat": "{{operation}} p95",
           "refId": "A"
         }
       ],
-      "title": "Top Tenants By Meta DB P95",
+      "title": "Slowest Meta DB Operations By P95",
       "type": "timeseries"
     }
   ],
@@ -751,6 +763,7 @@
   "schemaVersion": 41,
   "tags": [
     "drive9",
+    "data-store",
     "meta-db",
     "performance",
     "grafana",
@@ -799,30 +812,7 @@
         "sort": 1,
         "type": "query"
       },
-      {
-        "allValue": ".*",
-        "current": {
-          "selected": true,
-          "text": "All",
-          "value": "$__all"
-        },
-        "datasource": {
-          "type": "prometheus",
-          "uid": "${datasource}"
-        },
-        "definition": "label_values(dat9_db_operations_total{role=\"meta\",tenant_id!=\"\"}, tenant_id)",
-        "hide": 0,
-        "includeAll": true,
-        "label": "Tenant ID",
-        "multi": true,
-        "name": "tenant_id",
-        "options": [],
-        "query": "label_values(dat9_db_operations_total{role=\"meta\",tenant_id!=\"\"}, tenant_id)",
-        "refresh": 2,
-        "regex": "",
-        "sort": 1,
-        "type": "query"
-      }
+
     ]
   },
   "time": {
@@ -831,7 +821,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Drive9 Meta DB Performance",
+  "title": "Drive9 Metadata DB Performance",
   "uid": "drive9-meta-db-performance",
   "version": 1,
   "weekStart": ""

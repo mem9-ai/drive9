@@ -2,11 +2,13 @@ package backend
 
 import (
 	"context"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 )
 
 type staticAudioExtractor struct {
@@ -35,6 +37,12 @@ func (e *recordingAudioExtractor) ExtractAudioText(ctx context.Context, req Audi
 	return e.text, AudioExtractUsage{}, nil
 }
 
+func readBackendMetrics() string {
+	recorder := httptest.NewRecorder()
+	metrics.WritePrometheus(recorder)
+	return recorder.Body.String()
+}
+
 func TestProcessAudioExtractTaskWritesContentText(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
 		DatabaseAutoEmbedding: true,
@@ -59,6 +67,46 @@ func TestProcessAudioExtractTaskWritesContentText(t *testing.T) {
 	got := waitForContentText(t, b, "/rec/clip.mp3", time.Second)
 	if !strings.Contains(got, "keyword") {
 		t.Fatalf("unexpected content_text: %q", got)
+	}
+}
+
+func TestAsyncAudioExtractMetricsExposed(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:             true,
+			MaxAudioBytes:       4096,
+			TaskTimeout:         3 * time.Second,
+			MaxExtractTextBytes: 777,
+			Extractor:           &staticAudioExtractor{text: "spoken keyword in transcript"},
+		},
+	})
+	fileID := insertImageFileForExtractTest(t, b, "/rec/metrics.mp3", "audio/mpeg", []byte{0xff, 0xf3, 0x80})
+	result, err := b.ProcessAudioExtractTask(context.Background(), AudioExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/rec/metrics.mp3",
+		ContentType: "audio/mpeg",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != AudioExtractResultWritten {
+		t.Fatalf("result=%q, want %q", result, AudioExtractResultWritten)
+	}
+
+	metricsText := readBackendMetrics()
+	if !strings.Contains(metricsText, "dat9_module_up{module=\"audio_extract\"} 1") {
+		t.Fatalf("metrics missing audio_extract module availability: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, "dat9_service_gauge{component=\"audio_extract\",name=\"max_audio_bytes\"} 4096") {
+		t.Fatalf("metrics missing audio_extract runtime gauge: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, "dat9_service_operations_total{component=\"audio_extract\",operation=\"process\",result=\"ok\"}") {
+		t.Fatalf("metrics missing audio_extract process counter: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, "dat9_service_operation_duration_seconds_count{component=\"audio_extract\",operation=\"process\",result=\"ok\"}") {
+		t.Fatalf("metrics missing audio_extract duration histogram: %s", metricsText)
 	}
 }
 
