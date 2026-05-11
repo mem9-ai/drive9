@@ -267,7 +267,7 @@ To avoid `create + chmod` double RPC:
 
 | File | Change |
 |------|--------|
-| `pkg/backend/dat9.go` | `MkdirCtx`: create `inodes` row for directory before `file_nodes`. `EnsureParentDirs`: create `inodes` row for each auto-created parent directory. `CopyFileCtx`: unchanged (only touches `file_nodes`). `Stat`/`ReadDir`: read mode from `inodes`. `Chmod`: `UPDATE inodes SET mode=?`. |
+| `pkg/backend/dat9.go` | `MkdirCtx`: create `inodes` row for directory before `file_nodes`. `EnsureParentDirs`: create `inodes` row for each auto-created parent directory. `CopyFileCtx`: lock `inodes` row (`SELECT ... FOR UPDATE`) before inserting new `file_nodes` dentry, to prevent delete-vs-hardlink race (see §5.1). `Stat`/`ReadDir`: read mode from `inodes`. `Chmod`: `UPDATE inodes SET mode=?`. |
 | `pkg/backend/upload.go` | Finalize touches `inodes` (size, revision) + `contents` (storage_ref). |
 | `pkg/backend/semantic_tasks.go` | Workers read/write `semantic` table. |
 
@@ -460,9 +460,10 @@ FROM files WHERE status != 'DELETED';
 
 -- For tidb_auto.go (TiDB GENERATED embeddings): do NOT list generated columns.
 -- TiDB will recompute embedding/description_embedding from content_text/description.
--- If file count is large, run during off-peak or in batches.
-INSERT INTO semantic (inode_id, content_text, description)
-SELECT file_id, content_text, description
+-- Include embedding_revision and description_embedding_revision so search
+-- freshness checks (embedding_revision = revision) work immediately.
+INSERT INTO semantic (inode_id, content_text, description, embedding_revision, description_embedding_revision)
+SELECT file_id, content_text, description, embedding_revision, description_embedding_revision
 FROM files WHERE status != 'DELETED';
 
 -- db9 / PostgreSQL variant (idempotent, safe to re-run):
