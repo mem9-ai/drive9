@@ -116,6 +116,18 @@ The mount command accepts an optional remote root:
 drive9 mount :/projects/my-agent ./work
 ```
 
+Windows note: `drive9 mount` uses the built-in WebDAV redirector and maps to a
+drive letter, not a directory mountpoint:
+
+```powershell
+drive9 mount :/ X:
+drive9 umount X:
+```
+
+This requires the Windows WebClient service. `drive9 mount vault` still requires
+Linux or macOS because the vault mount is FUSE-only. On Windows, use the
+`drive9 vault ...` commands or the vault API instead of `drive9 mount vault`.
+
 ### Tag Filter Semantics
 
 `drive9 fs find -tag` uses exact matching:
@@ -125,6 +137,8 @@ drive9 mount :/projects/my-agent ./work
 - Prefix, contains, and regex matching are not supported for `-tag`.
 
 ## FUSE Prerequisites
+
+Windows is not supported for drive9 FUSE mounts.
 
 **macOS**: install macFUSE.
 

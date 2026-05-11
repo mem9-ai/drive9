@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
-	drive9fuse "github.com/mem9-ai/dat9/pkg/fuse"
 )
 
 func fakeLookPath(binMap map[string]bool) func(string) (string, error) {
@@ -79,6 +78,27 @@ func TestUmountArgvNoBinary(t *testing.T) {
 	_, err := umountArgv("linux", fakeLookPath(nil), "/mnt/drive9")
 	if err == nil {
 		t.Fatal("expected error when no unmount binaries are available")
+	}
+}
+
+func TestUmountArgvWindows(t *testing.T) {
+	got, err := umountArgv("windows", fakeLookPath(nil), "x:\\")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"net", "use", "X:", "/delete", "/y"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("argv = %v, want %v", got, want)
+	}
+}
+
+func TestUmountArgvWindowsRejectsNonDriveLetter(t *testing.T) {
+	_, err := umountArgv("windows", fakeLookPath(nil), "C:\\temp\\drive9")
+	if err == nil {
+		t.Fatal("expected invalid Windows mountpoint to fail")
+	}
+	if !strings.Contains(err.Error(), "drive letter like X:") {
+		t.Fatalf("error = %v, want drive-letter guidance", err)
 	}
 }
 
@@ -326,8 +346,8 @@ func TestMountCmdPassesLegacyDirStatFallbackOption(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
-	var got *drive9fuse.MountOptions
-	mountFuse = func(opts *drive9fuse.MountOptions) error {
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
 		copied := *opts
 		got = &copied
 		return nil
@@ -359,8 +379,8 @@ func TestMountCmdLeavesLegacyDirStatFallbackDisabledByDefault(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
-	var got *drive9fuse.MountOptions
-	mountFuse = func(opts *drive9fuse.MountOptions) error {
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
 		copied := *opts
 		got = &copied
 		return nil

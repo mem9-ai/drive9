@@ -14,7 +14,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -75,7 +74,7 @@ func defaultDoctorDeps() doctorDeps {
 		mkdirAll:    os.MkdirAll,
 		writeFile:   os.WriteFile,
 		remove:      os.Remove,
-		access:      syscall.Access,
+		access:      doctorAccess,
 		currentUser: user.Current,
 		getgroups:   os.Getgroups,
 		commandOutput: func(ctx context.Context, name string, args ...string) ([]byte, error) {
@@ -137,6 +136,27 @@ func runDoctorFuse(args []string, deps doctorDeps) error {
 	}
 	if *timeout <= 0 {
 		return fmt.Errorf("doctor fuse: --timeout must be > 0")
+	}
+
+	if deps.goos == "windows" {
+		checks := []doctorCheck{
+			doctorOSKernelCheck(context.Background(), deps),
+			{
+				name:   "fuse support",
+				status: doctorFail,
+				detail: "drive9 FUSE mounts are not supported on windows",
+				fix:    "use `drive9 mount` without `--mode=fuse` on Windows (the default path uses WebDAV), or use Linux/macOS for FUSE mounts",
+			},
+		}
+
+		_, _ = fmt.Fprintln(deps.stdout, "drive9 doctor fuse")
+		for _, check := range checks {
+			_, _ = fmt.Fprintf(deps.stdout, "%s %s: %s\n", check.status, check.name, check.detail)
+			if strings.TrimSpace(check.fix) != "" {
+				_, _ = fmt.Fprintf(deps.stdout, "  fix: %s\n", check.fix)
+			}
+		}
+		return doctorFailure{failed: 1}
 	}
 
 	creds := deps.resolveCredentials()
@@ -404,29 +424,4 @@ func appendIfMissing(items []string, item string) []string {
 		}
 	}
 	return append(items, item)
-}
-
-func isMountpoint(path string) (bool, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return false, err
-	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return false, err
-	}
-	parent := filepath.Dir(abs)
-	parentInfo, err := os.Stat(parent)
-	if err != nil {
-		return false, err
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false, nil
-	}
-	parentStat, ok := parentInfo.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false, nil
-	}
-	return stat.Dev != parentStat.Dev || stat.Ino == parentStat.Ino, nil
 }

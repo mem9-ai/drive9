@@ -158,6 +158,11 @@ use the same value as `DRIVE9_API_KEY` here.
 
 ### `fuse-smoke-test.sh`
 
+Host support: Linux and macOS only. Windows is currently limited to non-mount
+CLI workflows for FUSE validation; Windows mounts use the built-in WebDAV
+redirector with drive letters instead of the FUSE path, so the FUSE smoke
+script is not a supported Windows validation path.
+
 1. Provision + readiness polling
 2. Prepare `drive9` CLI binary (build local or download official release)
 3. Mount compatibility precheck for root `ls /`

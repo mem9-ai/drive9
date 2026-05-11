@@ -14,13 +14,10 @@ import (
 
 	"github.com/mem9-ai/dat9/pkg/buildinfo"
 	"github.com/mem9-ai/dat9/pkg/client"
-	drive9fuse "github.com/mem9-ai/dat9/pkg/fuse"
 	"github.com/mem9-ai/dat9/pkg/mountpath"
 	"github.com/mem9-ai/dat9/pkg/mountstate"
 	drive9webdav "github.com/mem9-ai/dat9/pkg/webdav"
 )
-
-var mountFuse = drive9fuse.Mount
 
 // MountCmd handles the "drive9 mount" command.
 //
@@ -189,12 +186,12 @@ func fsMountCmd(args []string) error {
 	}
 
 	// FUSE path (existing behavior).
-	syncModeVal, err := drive9fuse.ParseSyncMode(*syncMode)
+	syncModeVal, err := parseFuseSyncMode(*syncMode)
 	if err != nil {
 		return err
 	}
 
-	opts := &drive9fuse.MountOptions{
+	opts := &mountFuseOptions{
 		Server:                *server,
 		APIKey:                *apiKey,
 		Token:                 token,
@@ -455,6 +452,13 @@ func resolveMountCredentials(r ResolvedCredentials, flagServer, flagAPIKey strin
 }
 
 func umountArgv(goos string, lookPath func(string) (string, error), mountPoint string) ([]string, error) {
+	if goos == "windows" {
+		normalizedMountPoint, err := normalizeWebDAVMountPoint(goos, mountPoint)
+		if err != nil {
+			return nil, err
+		}
+		return []string{"net", "use", normalizedMountPoint, "/delete", "/y"}, nil
+	}
 	if goos == "darwin" {
 		return []string{"umount", mountPoint}, nil
 	}
