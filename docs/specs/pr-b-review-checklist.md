@@ -12,7 +12,7 @@ Per `feedback_review_gate_axis_enumeration.md`: before sign-off, walk every numb
 
 ## A. Spec conformance (§13.1 / §13.2 / §13.3 / §14 / §15)
 
-- [ ] **[spec+code]** Verb set is exactly `{add, import, ls, use, rm}` plus the bare `ctx` (no-verb) carry-over whose contract is "print the current context name, or 'no current context'; no side effects; not listed in §13.2". No `create`, no `sh`, no `login`, no other aliases beyond the `ls` / `list` synonym already in merged §13.2. The bare form is a documented non-spec compat (impl §4.5), not a silent sixth verb.
+- [ ] **[spec+code]** User-facing ctx verb set is exactly `{show, add, import, ls, use, rm}`. If bare `drive9 ctx` is accepted, it is only as shorthand for `drive9 ctx show` and MUST produce the same default text output; there is no separate name-only contract. No `create`, no `sh`, no `login`, no other aliases beyond the `ls` / `list` synonym already in merged §13.2.
 - [ ] **[spec]** §13.2 verb table in `vault-interaction-end-state.md` has positional-JWT row removed; `ctx import` rows show `--from-file <path>` and `--from-file -` only.
 - [ ] **[spec]** §13.3 "Input modes" bullet list contains exactly three bullets: `--from-file <path>`, `--from-file -`, and no-arg (pipe default).
 - [ ] **[spec]** §13.3 includes the literal TTY-detection error string:
