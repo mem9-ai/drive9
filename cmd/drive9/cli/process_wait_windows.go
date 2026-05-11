@@ -13,17 +13,15 @@ import (
 	"github.com/mem9-ai/dat9/pkg/mountstate"
 )
 
-const processQueryLimitedInformation = 0x1000
-
 func processAliveImpl(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	handle, err := windows.OpenProcess(windows.SYNCHRONIZE|processQueryLimitedInformation, false, uint32(pid))
+	handle, err := windows.OpenProcess(windows.SYNCHRONIZE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {
-		return false
+		return !errors.Is(err, windows.ERROR_INVALID_PARAMETER)
 	}
-	defer windows.CloseHandle(handle)
+	defer func() { _ = windows.CloseHandle(handle) }()
 	status, err := windows.WaitForSingleObject(handle, 0)
 	if err != nil {
 		return false
@@ -35,11 +33,14 @@ func waitForProcessExitByPID(pid int, timeout time.Duration) error {
 	if pid <= 0 {
 		return fmt.Errorf("invalid mount process pid %d", pid)
 	}
-	handle, err := windows.OpenProcess(windows.SYNCHRONIZE|processQueryLimitedInformation, false, uint32(pid))
+	handle, err := windows.OpenProcess(windows.SYNCHRONIZE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {
-		return nil
+		if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+			return nil
+		}
+		return fmt.Errorf("drive9 umount: inspect mount process pid %d: %w", pid, err)
 	}
-	defer windows.CloseHandle(handle)
+	defer func() { _ = windows.CloseHandle(handle) }()
 
 	waitMillis := uint32(windows.INFINITE)
 	if timeout > 0 {
@@ -72,11 +73,11 @@ func processCreationTimeByPID(pid int) (uint64, error) {
 	if pid <= 0 {
 		return 0, fmt.Errorf("invalid mount process pid %d", pid)
 	}
-	handle, err := windows.OpenProcess(processQueryLimitedInformation, false, uint32(pid))
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {
 		return 0, err
 	}
-	defer windows.CloseHandle(handle)
+	defer func() { _ = windows.CloseHandle(handle) }()
 
 	var creationTime, exitTime, kernelTime, userTime windows.Filetime
 	if err := windows.GetProcessTimes(handle, &creationTime, &exitTime, &kernelTime, &userTime); err != nil {
@@ -93,11 +94,11 @@ func terminateMountProcess(state mountstate.ProcessState, waitTimeout time.Durat
 		return fmt.Errorf("%w: mount pid file for pid %d is missing ownership metadata", errMountProcessStateUnsafe, state.PID)
 	}
 
-	handle, err := windows.OpenProcess(windows.SYNCHRONIZE|windows.PROCESS_TERMINATE|processQueryLimitedInformation, false, uint32(state.PID))
+	handle, err := windows.OpenProcess(windows.SYNCHRONIZE|windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(state.PID))
 	if err != nil {
 		return fmt.Errorf("%w: mount process pid %d is no longer running", errMountProcessStateStale, state.PID)
 	}
-	defer windows.CloseHandle(handle)
+	defer func() { _ = windows.CloseHandle(handle) }()
 
 	var creationTime, exitTime, kernelTime, userTime windows.Filetime
 	if err := windows.GetProcessTimes(handle, &creationTime, &exitTime, &kernelTime, &userTime); err != nil {

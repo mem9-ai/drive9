@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"time"
 )
 
@@ -53,6 +54,14 @@ func VaultMountCmd(args []string) error {
 	}
 	if err := rejectEmptyFlag("api-key", *apiKey, apiKeyGiven); err != nil {
 		return err
+	}
+	if runtime.GOOS == "windows" {
+		return mountVault(&vaultMountOptions{
+			MountPoint: mountPoint,
+			DirTTL:     *dirTTL,
+			AllowOther: *allowOther,
+			Debug:      *debug,
+		})
 	}
 
 	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)

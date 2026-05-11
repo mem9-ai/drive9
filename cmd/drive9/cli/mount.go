@@ -162,6 +162,14 @@ func fsMountCmd(args []string) error {
 	if resolved == MountModeWebDAV && *readOnly {
 		return fmt.Errorf("drive9 mount: --read-only is not supported with WebDAV mode")
 	}
+	if runtime.GOOS == "windows" && resolved == MountModeFUSE {
+		return mountFuse(&mountFuseOptions{
+			MountPoint: mountPoint,
+			RemoteRoot: remoteRoot,
+			ReadOnly:   *readOnly,
+			Debug:      *debug,
+		})
+	}
 
 	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
 	if err != nil {
