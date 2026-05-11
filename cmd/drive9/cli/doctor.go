@@ -144,7 +144,7 @@ func runDoctorFuse(args []string, deps doctorDeps) error {
 			{
 				name:   "fuse support",
 				status: doctorFail,
-				detail: "drive9 FUSE mounts are not supported on windows",
+				detail: "drive9 FUSE mounts are not supported on Windows",
 				fix:    "use `drive9 mount` without `--mode=fuse` on Windows (the default path uses WebDAV), or use Linux/macOS for FUSE mounts",
 			},
 		}
