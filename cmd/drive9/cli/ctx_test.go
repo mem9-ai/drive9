@@ -403,6 +403,17 @@ func TestCtxShowJSONNoCurrentContext(t *testing.T) {
 	}
 }
 
+func TestCtxShowRejectsUnexpectedPositionalArgument(t *testing.T) {
+	_ = withIsolatedHome(t)
+	err := Ctx([]string{"show", "prod"})
+	if err == nil {
+		t.Fatal("expected error for unexpected positional argument")
+	}
+	if !strings.Contains(err.Error(), "unexpected argument \"prod\"") {
+		t.Fatalf("error = %q, want unexpected argument message", err)
+	}
+}
+
 func TestCtxBareMatchesShowText(t *testing.T) {
 	_ = withIsolatedHome(t)
 	cfg := loadConfig()

@@ -82,7 +82,10 @@ func ctxShowCmd(args []string) error {
 		case "--reveal":
 			reveal = true
 		default:
-			return fmt.Errorf("unknown flag %q\nusage: drive9 ctx show [--json] [--reveal]", arg)
+			if strings.HasPrefix(arg, "-") {
+				return fmt.Errorf("unknown flag %q\nusage: drive9 ctx show [--json] [--reveal]", arg)
+			}
+			return fmt.Errorf("unexpected argument %q\nusage: drive9 ctx show [--json] [--reveal]", arg)
 		}
 	}
 
