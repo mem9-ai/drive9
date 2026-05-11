@@ -227,23 +227,26 @@ func runWebDAVMountCmd(goos, serverURL, mountPoint string) error {
 	return mountCmd.Run()
 }
 
-// explainMountError turns the opaque "exit status N" from mount_webdav into
-// an actionable message. The underlying error is preserved via %w so callers
+// explainMountError turns the opaque mount helper exit status into an
+// actionable message. The underlying error is preserved via %w so callers
 // (and tests) can still match on it.
 func explainMountError(goos, mountPoint string, err error) error {
+	helper := webdavMountHelperName(goos)
 	hint := mountErrorHint(goos, mountPoint, err)
 	if hint == "" {
-		return fmt.Errorf("webdav: mount_webdav failed: %w", err)
+		return fmt.Errorf("webdav: %s failed: %w", helper, err)
 	}
-	return fmt.Errorf("webdav: mount_webdav failed: %w\n  %s", err, hint)
+	return fmt.Errorf("webdav: %s failed: %w\n  %s", helper, err, hint)
 }
 
-// mountErrorHint returns a human-readable explanation for known mount_webdav
-// exit codes on macOS. Returns "" when no specific hint applies.
+// mountErrorHint returns a human-readable explanation for known WebDAV mount
+// helper exit codes on macOS and Windows. Returns "" when no specific hint
+// applies.
 //
-// Codes follow mount_webdav(8) DIAGNOSTICS: ENOENT (invalid node path),
-// ENODEV (server not WebDAV-enabled, missing, or inaccessible), ECANCELED
-// (auth canceled). EBUSY surfaces when a mount already covers the point.
+// On macOS, codes follow mount_webdav(8) DIAGNOSTICS: ENOENT (invalid node
+// path), ENODEV (server not WebDAV-enabled, missing, or inaccessible),
+// ECANCELED (auth canceled). EBUSY surfaces when a mount already covers the
+// point.
 func mountErrorHint(goos, mountPoint string, err error) string {
 	var ee *exec.ExitError
 	if !errors.As(err, &ee) {
@@ -276,6 +279,17 @@ func mountErrorHint(goos, mountPoint string, err error) string {
 		return "authentication was canceled by mount_webdav. Re-run the command and ensure credentials are configured (`drive9 ctx`)."
 	}
 	return ""
+}
+
+func webdavMountHelperName(goos string) string {
+	switch goos {
+	case "windows":
+		return "net use"
+	case "linux":
+		return "mount.davfs"
+	default:
+		return "mount_webdav"
+	}
 }
 
 // webdavMountCmd builds the OS command to mount a WebDAV URL at mountPoint.
