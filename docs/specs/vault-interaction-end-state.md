@@ -379,6 +379,7 @@ The delegated fields are populated by locally decoding the JWT payload (see §16
 
 ```bash
 drive9 ctx add --api-key <key> [--name <n>] [--server <url>]      # add owner context
+drive9 ctx show [--json] [--reveal]                               # show the active context (masked by default)
 drive9 ctx import --from-file <path>                              # add delegated context from a file
 drive9 ctx import [--from-file -]                                 # add delegated context from stdin (default when stdin is a pipe)
 drive9 ctx ls [-l|--json]                                         # list contexts (offline — reads only local config)
@@ -387,6 +388,8 @@ drive9 ctx rm <name>                                              # delete a con
 ```
 
 Both `ctx import` forms are equivalent in effect. Stdin is read by default when stdin is a pipe (`isatty(0) == false`); the explicit `--from-file -` form is accepted for scripts that want the intent to be unambiguous. When stdin is a TTY and no `--from-file` is supplied, `ctx import` exits with `EINVAL` and prints a one-line help pointing at the two canonical forms (see §13.3).
+
+`ctx show` renders the active context only. Human output is masked by default; `--reveal` disables masking for the credential field. `ctx show --json` emits a single JSON value: the active-context object when one exists, or JSON `null` when no context is active. Bare `drive9 ctx` is shorthand for the default text form of `drive9 ctx show`.
 
 **Canonical pipe handoff.** The default human output of `drive9 vault grant` (see §6) is *not* pipe-safe — it prints `grant_id` and `expires_at` lines in addition to the JWT. To pipe grant output directly into `ctx import`, use `drive9 vault grant ... --token-only`, which prints only the bare JWT. The end-to-end canonical pipeline is:
 
@@ -718,7 +721,7 @@ Legend:
 | `drive9 umount <path>` | implemented | pre-M1 |
 | `drive9 ctx add --api-key` | implemented | #284 (PR-B) |
 | `drive9 ctx import --from-file` | implemented | #284 (PR-B) |
-| `drive9 ctx ls` / `use` / `rm` | implemented | #284 (PR-B) |
+| `drive9 ctx show` / `ls` / `use` / `rm` | implemented | #284 (PR-B) |
 | `drive9 vault put <path> --from <dir>` | implemented | V2d (#307) |
 | `drive9 vault grant <scope>... --agent --perm --ttl` | implemented | Appendix-A alignment PR track |
 | `drive9 vault revoke <grant-id>` | implemented | Appendix-A alignment PR track |
@@ -738,7 +741,7 @@ Appendix A — Command surface at a glance:
 | `drive9 ctx add --api-key <k>` | Register an owner context. |
 | `drive9 ctx import --from-file <path>` | Register a delegated context from a grant JWT file (primary UX). |
 | `drive9 ctx import [--from-file -]` | Same, reading the JWT from stdin (default when stdin is a pipe). |
-| `drive9 ctx ls / use / rm` | Manage contexts (offline). |
+| `drive9 ctx show / ls / use / rm` | Inspect and manage contexts (offline). |
 | `drive9 vault put <path> --from <dir>` | Atomic wholesale-replace batch write (§2). |
 | `drive9 vault grant <scope>... --agent --perm --ttl` | Issue a scoped JWT. |
 | `drive9 vault revoke <grant-id>` | Revoke a grant. |

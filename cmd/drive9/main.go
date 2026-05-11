@@ -250,33 +250,33 @@ func fatal(cmd string, err error) {
 }
 
 func usage(code int) {
-	fmt.Fprintf(os.Stderr, `usage: drive9 <command> [arguments]
-
-commands:
-  create [--name NAME] [--server URL]
-                         provision a new database and owner context
-  ctx                    show current context
-  ctx add --api-key <key> [--name NAME] [--server URL]
-                         add owner context
-  ctx import [--from-file <path|->] [--name NAME]
-                         add delegated context
-  ctx ls [-l|--json]     list contexts
-  ctx use <name>         activate context
-  ctx rm <name>          delete context
-  fs <command>           filesystem operations
-  vault <set|get|put|with|ls|rm|grant|revoke|audit>
-                         vault operations
-  mount [flags] [:/remote] <mountpoint>
-                         mount drive9 filesystem
-  mount vault [flags] <mountpoint>
-                         mount vault secrets read-only
-  umount <mountpoint>    unmount a drive9 mount
-  doctor fuse            diagnose local FUSE prerequisites
-
-global:
-  -h, --help, help       show this help
-  -v, --version, version print version information
-`)
+	fmt.Fprint(os.Stderr,
+		"usage: drive9 <command> [arguments]\n\n"+
+			"commands:\n"+
+			"  create [--name NAME] [--server URL]\n"+
+			"                         provision a new database and owner context\n"+
+			"  ctx show [--json] [--reveal]\n"+
+			"                         show current context\n"+
+			"  ctx add --api-key <key> [--name NAME] [--server URL]\n"+
+			"                         add owner context\n"+
+			"  ctx import [--from-file <path|->] [--name NAME]\n"+
+			"                         add delegated context\n"+
+			"  ctx ls [-l|--json]     list contexts\n"+
+			"  ctx use <name>         activate context\n"+
+			"  ctx rm <name>          delete context\n"+
+			"  fs <command>           filesystem operations\n"+
+			"  vault <set|get|put|with|ls|rm|grant|revoke|audit>\n"+
+			"                         vault operations\n"+
+			"  mount [flags] [:/remote] <mountpoint>\n"+
+			"                         mount drive9 filesystem\n"+
+			"  mount vault [flags] <mountpoint>\n"+
+			"                         mount vault secrets read-only\n"+
+			"  umount <mountpoint>    unmount a drive9 mount\n"+
+			"  doctor fuse            diagnose local FUSE prerequisites\n\n"+
+			"global:\n"+
+			"  -h, --help, help       show this help\n"+
+			"  -v, --version, version print version information\n",
+	)
 	exitWithCode(code)
 }
 

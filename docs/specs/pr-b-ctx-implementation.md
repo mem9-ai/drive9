@@ -30,7 +30,7 @@ PR-B is the **CLI side** of the grant → context flow: the verbs that take a JW
 ### Non-goals
 
 - No change to any server endpoint, DB schema, or audit event written by PR-A.
-- No new CLI verb outside the five locked in §13.2. The `drive9 ctx` bare form (no verb) remains a non-spec compatibility convenience that prints the current context name; it is not load-bearing.
+- The user-facing ctx verb set is `show / add / import / ls / use / rm`. Bare `drive9 ctx` is accepted as shorthand for `drive9 ctx show` and carries the same default text output contract.
 - No auto-mint, auto-refresh, auto-rotate, or auto-anything at `ctx` layer. A context that expires is refused on `ctx use`; the user must re-import.
 
 ---
@@ -407,7 +407,7 @@ Wordlist sizing:
 
 ### 4.5 `drive9 ctx` bare form (compatibility)
 
-Current pre-PR-B implementation: `drive9 ctx` (no verb) prints the current context name. This is a non-spec convenience not listed in §13.2. Keep it as-is for backwards compat; the dispatcher routes `args == []` to `ctxShow()`. **Flag this in PR-B body as a known non-spec carry-over**; removal would be a separate UX-cleanup PR, not a bundle into PR-B.
+Current implementation converges both entry points onto one contract: `drive9 ctx show` renders the current context details (text or JSON, masked by default, `--reveal` to unmask; `--json` emits the active-context object or `null` when none is active), and bare `drive9 ctx` is a shorthand alias for the default text form of `ctx show`.
 
 ---
 

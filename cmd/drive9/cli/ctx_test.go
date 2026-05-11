@@ -199,6 +199,249 @@ func TestF_ImportStoresDelegatedContext(t *testing.T) {
 	}
 }
 
+func TestCtxShowOwnerMaskedText(t *testing.T) {
+	home := withIsolatedHome(t)
+	cfg := loadConfig()
+	_, err := ctxAdd(cfg, "prod", &Context{
+		Type:   PrincipalOwner,
+		APIKey: "drive9_abcdxxxxxxxxwxyz",
+		Server: "https://api.drive9.ai",
+	})
+	if err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+
+	out, err := captureStdoutE(t, func() error { return Ctx([]string{"show"}) })
+	if err != nil {
+		t.Fatalf("ctx show: %v", err)
+	}
+	for _, want := range []string{
+		"name:",
+		"prod",
+		"type:",
+		"owner",
+		"server:",
+		"https://api.drive9.ai",
+		"api_key:",
+		"drive9_abcd...wxyz",
+		filepath.Join(home, ".drive9", "config"),
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("ctx show output = %q, want substring %q", out, want)
+		}
+	}
+	if strings.Contains(out, "drive9_abcdxxxxxxxxwxyz") {
+		t.Fatalf("ctx show should mask api key by default: %q", out)
+	}
+}
+
+func TestCtxShowOwnerRevealJSON(t *testing.T) {
+	home := withIsolatedHome(t)
+	cfg := loadConfig()
+	cfg.Server = "https://api.drive9.ai"
+	_, err := ctxAdd(cfg, "prod", &Context{
+		Type:   PrincipalOwner,
+		APIKey: "drive9_abcdxxxxxxxxwxyz",
+	})
+	if err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+
+	out, err := captureStdoutE(t, func() error {
+		return Ctx([]string{"show", "--json", "--reveal"})
+	})
+	if err != nil {
+		t.Fatalf("ctx show --json --reveal: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v\nout=%q", err, out)
+	}
+	if got["name"] != "prod" {
+		t.Fatalf("name = %v, want prod", got["name"])
+	}
+	if got["type"] != "owner" {
+		t.Fatalf("type = %v, want owner", got["type"])
+	}
+	if got["server"] != "https://api.drive9.ai" {
+		t.Fatalf("server = %v, want https://api.drive9.ai", got["server"])
+	}
+	if got["api_key"] != "drive9_abcdxxxxxxxxwxyz" {
+		t.Fatalf("api_key = %v, want full key", got["api_key"])
+	}
+	if got["source"] != filepath.Join(home, ".drive9", "config") {
+		t.Fatalf("source = %v, want config path", got["source"])
+	}
+}
+
+func TestCtxShowDelegatedJSON(t *testing.T) {
+	_ = withIsolatedHome(t)
+	expiresAt := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	cfg := loadConfig()
+	_, err := ctxAdd(cfg, "alice-prod-db", &Context{
+		Type:      PrincipalDelegated,
+		Server:    "https://api.drive9.ai",
+		Token:     "eyJhbGciOiJIUzI1NiJ9.eyJncmFudF9pZCI6ImdydF8xIn0.signature",
+		Agent:     "alice",
+		Scope:     []string{"/n/vault/prod-db/DB_URL", "/n/vault/prod-db/PASSWORD"},
+		Perm:      PermRead,
+		ExpiresAt: expiresAt,
+		GrantID:   "grt_1",
+		LabelHint: "alice-prod-db",
+	})
+	if err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+
+	out, err := captureStdoutE(t, func() error { return Ctx([]string{"show", "--json"}) })
+	if err != nil {
+		t.Fatalf("ctx show --json: %v", err)
+	}
+
+	var got struct {
+		Name      string    `json:"name"`
+		Type      string    `json:"type"`
+		Server    string    `json:"server"`
+		Token     string    `json:"token"`
+		Agent     string    `json:"agent"`
+		Scope     []string  `json:"scope"`
+		Perm      string    `json:"perm"`
+		ExpiresAt time.Time `json:"expires_at"`
+		Status    string    `json:"status"`
+		GrantID   string    `json:"grant_id"`
+		LabelHint string    `json:"label_hint"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v\nout=%q", err, out)
+	}
+	if got.Name != "alice-prod-db" || got.Type != "delegated" {
+		t.Fatalf("unexpected identity fields: %+v", got)
+	}
+	if got.Token == "eyJhbGciOiJIUzI1NiJ9.eyJncmFudF9pZCI6ImdydF8xIn0.signature" {
+		t.Fatalf("token should be masked by default: %+v", got)
+	}
+	if got.Agent != "alice" {
+		t.Fatalf("agent = %q, want alice", got.Agent)
+	}
+	if len(got.Scope) != 2 {
+		t.Fatalf("scope = %v, want 2 entries", got.Scope)
+	}
+	if got.Perm != "read" {
+		t.Fatalf("perm = %q, want read", got.Perm)
+	}
+	if !got.ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("expires_at = %s, want %s", got.ExpiresAt, expiresAt)
+	}
+	if got.Status != "active" {
+		t.Fatalf("status = %q, want active", got.Status)
+	}
+	if got.GrantID != "grt_1" {
+		t.Fatalf("grant_id = %q, want grt_1", got.GrantID)
+	}
+	if got.LabelHint != "alice-prod-db" {
+		t.Fatalf("label_hint = %q, want alice-prod-db", got.LabelHint)
+	}
+}
+
+func TestCtxShowDelegatedRevealJSON(t *testing.T) {
+	_ = withIsolatedHome(t)
+	expiresAt := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	fullToken := "eyJhbGciOiJIUzI1NiJ9.eyJncmFudF9pZCI6ImdydF8xIn0.signature"
+	cfg := loadConfig()
+	_, err := ctxAdd(cfg, "alice-prod-db", &Context{
+		Type:      PrincipalDelegated,
+		Server:    "https://api.drive9.ai",
+		Token:     fullToken,
+		Agent:     "alice",
+		Scope:     []string{"/n/vault/prod-db/DB_URL"},
+		Perm:      PermRead,
+		ExpiresAt: expiresAt,
+		GrantID:   "grt_1",
+		LabelHint: "alice-prod-db",
+	})
+	if err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+
+	out, err := captureStdoutE(t, func() error { return Ctx([]string{"show", "--json", "--reveal"}) })
+	if err != nil {
+		t.Fatalf("ctx show --json --reveal: %v", err)
+	}
+
+	var got struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v\nout=%q", err, out)
+	}
+	if got.Token != fullToken {
+		t.Fatalf("token = %q, want full token", got.Token)
+	}
+}
+
+func TestCtxShowJSONNoCurrentContext(t *testing.T) {
+	_ = withIsolatedHome(t)
+	out, err := captureStdoutE(t, func() error { return Ctx([]string{"show", "--json"}) })
+	if err != nil {
+		t.Fatalf("ctx show --json: %v", err)
+	}
+	if strings.TrimSpace(out) != "null" {
+		t.Fatalf("ctx show --json without current context = %q, want null", out)
+	}
+}
+
+func TestCtxBareMatchesShowText(t *testing.T) {
+	_ = withIsolatedHome(t)
+	cfg := loadConfig()
+	_, err := ctxAdd(cfg, "prod", &Context{Type: PrincipalOwner, APIKey: "k", Server: "https://api.drive9.ai"})
+	if err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+
+	bareOut, err := captureStdoutE(t, func() error { return Ctx(nil) })
+	if err != nil {
+		t.Fatalf("bare ctx: %v", err)
+	}
+	showOut, err := captureStdoutE(t, func() error { return Ctx([]string{"show"}) })
+	if err != nil {
+		t.Fatalf("ctx show: %v", err)
+	}
+	if bareOut != showOut {
+		t.Fatalf("bare ctx output = %q, want same as ctx show %q", bareOut, showOut)
+	}
+}
+
+func TestCtxBareNoCurrentContextMatchesShow(t *testing.T) {
+	_ = withIsolatedHome(t)
+	bareOut, err := captureStdoutE(t, func() error { return Ctx(nil) })
+	if err != nil {
+		t.Fatalf("bare ctx: %v", err)
+	}
+	showOut, err := captureStdoutE(t, func() error { return Ctx([]string{"show"}) })
+	if err != nil {
+		t.Fatalf("ctx show: %v", err)
+	}
+	if bareOut != showOut {
+		t.Fatalf("bare ctx output = %q, want same as ctx show %q", bareOut, showOut)
+	}
+}
+
 // TestF15_CtxUseIsExplicitVerb — spec §13.2 / F15: `ctx use` must be an
 // explicit verb. The positional-switch form `drive9 ctx <name>` is retired.
 func TestF15_CtxUseIsExplicitVerb(t *testing.T) {

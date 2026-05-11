@@ -80,6 +80,7 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 	}
 	for _, want := range []string{
 		"usage: drive9 <command> [arguments]",
+		"ctx show [--json] [--reveal]",
 		"ctx use <name>",
 		"mount [flags] [:/remote] <mountpoint>",
 		"mount vault [flags] <mountpoint>",

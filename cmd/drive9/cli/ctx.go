@@ -13,16 +13,16 @@ import (
 
 // Ctx dispatches drive9 ctx subcommands per spec §13.2.
 //
-// The 5 normative verbs are: add / import / ls / use / rm.
+// The user-facing verbs are: show / add / import / ls / use / rm.
 //
-// Bare `drive9 ctx` (no verb) is retained as a non-spec compatibility
-// convenience that prints the current context name. See migration call-out
-// #7 in the impl PR body.
+// Bare `drive9 ctx` is the shorthand form of `drive9 ctx show`.
 func Ctx(args []string) error {
 	if len(args) == 0 {
-		return ctxShow()
+		return ctxShowCmd(nil)
 	}
 	switch args[0] {
+	case "show":
+		return ctxShowCmd(args[1:])
 	case "add":
 		return ctxAddCmd(args[1:])
 	case "import":
@@ -41,7 +41,8 @@ func Ctx(args []string) error {
 }
 
 func ctxUsage() string {
-	return `usage: drive9 ctx <add|import|ls|use|rm>
+	return `usage: drive9 ctx <show|add|import|ls|use|rm>
+  show [--json] [--reveal]                            show current context
   add --api-key <key> [--name <n>] [--server <url>]   add owner context
   import --from-file <path>                           add delegated context from file (must be mode 0600)
   import --from-file -                                add delegated context from stdin explicitly
@@ -55,14 +56,179 @@ func ctxUsageErr() error {
 	return fmt.Errorf("%s", ctxUsage())
 }
 
-func ctxShow() error {
-	cfg := loadConfig()
-	if cfg.CurrentContext == "" {
+type ctxShowEntry struct {
+	Name      string    `json:"name"`
+	Type      string    `json:"type"`
+	Server    string    `json:"server,omitempty"`
+	APIKey    string    `json:"api_key,omitempty"`
+	Token     string    `json:"token,omitempty"`
+	Agent     string    `json:"agent,omitempty"`
+	Scope     []string  `json:"scope,omitempty"`
+	Perm      string    `json:"perm,omitempty"`
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	Status    string    `json:"status,omitempty"`
+	GrantID   string    `json:"grant_id,omitempty"`
+	LabelHint string    `json:"label_hint,omitempty"`
+	Source    string    `json:"source,omitempty"`
+}
+
+func ctxShowCmd(args []string) error {
+	asJSON := false
+	reveal := false
+	for _, arg := range args {
+		switch arg {
+		case "--json":
+			asJSON = true
+		case "--reveal":
+			reveal = true
+		default:
+			return fmt.Errorf("unknown flag %q\nusage: drive9 ctx show [--json] [--reveal]", arg)
+		}
+	}
+
+	entry := buildCtxShowEntry(loadConfig(), reveal)
+	if asJSON {
+		return writeCtxShowJSON(entry)
+	}
+	return writeCtxShowText(entry)
+}
+
+func buildCtxShowEntry(cfg *Config, reveal bool) *ctxShowEntry {
+	current := cfg.currentContextEntry()
+	if current == nil || cfg.CurrentContext == "" {
+		return nil
+	}
+
+	entry := &ctxShowEntry{
+		Name:   cfg.CurrentContext,
+		Type:   string(current.Type),
+		Server: cfg.ResolveServer(),
+		Source: configPath(),
+	}
+
+	switch current.Type {
+	case PrincipalOwner:
+		entry.APIKey = formatSecretForDisplay(current.APIKey, reveal)
+	case PrincipalDelegated:
+		entry.Token = formatSecretForDisplay(current.Token, reveal)
+		entry.Agent = current.Agent
+		entry.Scope = append([]string(nil), current.Scope...)
+		entry.Perm = string(current.Perm)
+		entry.ExpiresAt = current.ExpiresAt
+		entry.Status = ctxStatus(current, time.Now())
+		entry.GrantID = current.GrantID
+		entry.LabelHint = current.LabelHint
+	}
+
+	return entry
+}
+
+func writeCtxShowJSON(entry *ctxShowEntry) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	// Keep the zero-current-context JSON contract explicit for scripts.
+	// A missing active context serializes as JSON null rather than an error.
+	return enc.Encode(entry)
+}
+
+func writeCtxShowText(entry *ctxShowEntry) error {
+	if entry == nil {
 		fmt.Println("no current context")
 		return nil
 	}
-	fmt.Println(cfg.CurrentContext)
-	return nil
+
+	fields := []struct {
+		label string
+		value string
+	}{
+		{label: "name", value: entry.Name},
+		{label: "type", value: entry.Type},
+		{label: "server", value: entry.Server},
+	}
+	if entry.APIKey != "" {
+		fields = append(fields, struct {
+			label string
+			value string
+		}{label: "api_key", value: entry.APIKey})
+	}
+	if entry.Token != "" {
+		fields = append(fields, struct {
+			label string
+			value string
+		}{label: "token", value: entry.Token})
+	}
+	if entry.Agent != "" {
+		fields = append(fields, struct {
+			label string
+			value string
+		}{label: "agent", value: entry.Agent})
+	}
+	if len(entry.Scope) > 0 {
+		fields = append(fields, struct {
+			label string
+			value string
+		}{label: "scope", value: strings.Join(entry.Scope, ", ")})
+	}
+	if entry.Perm != "" {
+		fields = append(fields, struct {
+			label string
+			value string
+		}{label: "perm", value: entry.Perm})
+	}
+	if !entry.ExpiresAt.IsZero() {
+		fields = append(fields, struct {
+			label string
+			value string
+		}{label: "expires_at", value: formatExpiresAt(entry.ExpiresAt)})
+	}
+	if entry.Status != "" {
+		fields = append(fields, struct {
+			label string
+			value string
+		}{label: "status", value: entry.Status})
+	}
+	if entry.GrantID != "" {
+		fields = append(fields, struct {
+			label string
+			value string
+		}{label: "grant_id", value: entry.GrantID})
+	}
+	if entry.LabelHint != "" {
+		fields = append(fields, struct {
+			label string
+			value string
+		}{label: "label_hint", value: entry.LabelHint})
+	}
+	if entry.Source != "" {
+		fields = append(fields, struct {
+			label string
+			value string
+		}{label: "source", value: entry.Source})
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	for _, field := range fields {
+		_, _ = fmt.Fprintf(w, "%s:\t%s\n", field.label, field.value)
+	}
+	return w.Flush()
+}
+
+func formatSecretForDisplay(secret string, reveal bool) string {
+	if reveal || secret == "" {
+		return secret
+	}
+
+	if strings.HasPrefix(secret, "drive9_") && len(secret) > len("drive9_")+8 {
+		return secret[:len("drive9_")+4] + "..." + secret[len(secret)-4:]
+	}
+
+	if len(secret) <= 8 {
+		return strings.Repeat("x", len(secret))
+	}
+	if len(secret) <= 12 {
+		return secret[:2] + "..." + secret[len(secret)-2:]
+	}
+	return secret[:8] + "..." + secret[len(secret)-4:]
 }
 
 // ctxAddCmd is the user-facing `drive9 ctx add` verb. Internally it delegates
@@ -157,9 +323,10 @@ func ctxAdd(cfg *Config, name string, ctx *Context) (*Context, error) {
 
 // ctxImportCmd implements `drive9 ctx import` per spec §13.2/§13.3. Input
 // modes:
-//   --from-file <path>   read JWT from file (file MUST be mode 0600)
-//   --from-file -        read JWT from stdin explicitly
-//   (no args, stdin piped) read JWT from stdin (auto-detected when !isatty)
+//
+//	--from-file <path>   read JWT from file (file MUST be mode 0600)
+//	--from-file -        read JWT from stdin explicitly
+//	(no args, stdin piped) read JWT from stdin (auto-detected when !isatty)
 //
 // Per §13.3, the JWT MUST NOT be passed as a positional argument — the
 // positional form was removed because a runtime warning cannot unexpose a
@@ -331,6 +498,7 @@ func checkImportFilePerm(path string) error {
 // defaultImportName derives the default context name from (in order):
 //  1. JWT label_hint (if set and not already taken),
 //  2. agent-<first-scope-root>,
+//
 // with a numeric suffix appended on collision.
 func defaultImportName(cfg *Config, claims *jwtClaims) string {
 	base := claims.LabelHint
