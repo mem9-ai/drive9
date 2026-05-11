@@ -275,7 +275,7 @@ To avoid `create + chmod` double RPC:
 
 | File | Change |
 |------|--------|
-| `pkg/server/server.go` | Stat returns `X-Dat9-Mode`. Upload accepts `X-Dat9-Mode`. `?action=chmod` endpoint. No `chown`. |
+| `pkg/server/server.go` | Stat returns `X-Dat9-Mode`. Upload accepts `X-Dat9-Mode`. `POST /v1/fs/{path}?action=chmod` endpoint (same `/v1/` versioning as existing endpoints). No `chown`. |
 
 ### 4.5 Go SDK
 
@@ -382,6 +382,8 @@ ORDER BY distance LIMIT ?
 **Alternative (future):** Add `embedding_stale BOOLEAN DEFAULT TRUE` to `semantic`. Set `TRUE` on content overwrite, `FALSE` when the embedding worker completes. The stale-check becomes a single-table predicate: `WHERE s.embedding IS NOT NULL AND NOT s.embedding_stale`. This eliminates the cross-table comparison entirely. Deferred to Phase 2 because it adds a new column and requires updating the semantic worker.
 
 **Overall assessment:** The three-table JOIN adds one extra PK lookup per result row. For typical result sets (< 100 rows), the overhead is negligible (< 1 ms). The bigger win is that `ListDir` no longer fetches `content_blob` or embedding vectors, which dominates current listing latency.
+
+**Why wasn't ListDir already column-pruned today?** `StatForRead` (`store.go:931`) already demonstrates column-pruned SELECTs. `ListDir` was not pruned because the Go `File` struct required all columns to be scanned into a single struct — there was no lightweight metadata-only struct. The `Inode`/`Content`/`Semantic` split is the forcing function that finally enables a lightweight `Inode` struct for listings.
 
 ## 5. Key Design Decisions
 
@@ -492,6 +494,19 @@ ALTER TABLE file_gc_tasks CHANGE file_id inode_id VARCHAR(64) NOT NULL;
 -- 8. After one release cycle with no issues:
 --    DROP TABLE files;
 ```
+
+**Incremental migration (recommended for large deployments):**
+
+For environments with millions of files, a single atomic migration may take too long. A safer sequence:
+
+1. **Dual-write**: New code writes to both `files` and `inodes`/`contents`/`semantic` on every mutation
+2. **Backfill**: Run migration script in batches to populate new tables from old data
+3. **Switch reads**: Route read traffic to new tables; keep `files` writes active
+4. **Verify**: Run consistency checks (see below)
+5. **Stop old writes**: Remove `files` writes from code
+6. **Cleanup**: After one release cycle, `DROP TABLE files`
+
+Each step is independently reversible.
 
 **Rollback path:** If issues are found after switching to new tables, the application can be rolled back to the old code path which still reads from `files`. The new tables (`inodes`, `contents`, `semantic`) are additive and do not modify `files` data.
 
