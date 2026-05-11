@@ -57,19 +57,19 @@ func ctxUsageErr() error {
 }
 
 type ctxShowEntry struct {
-	Name      string    `json:"name"`
-	Type      string    `json:"type"`
-	Server    string    `json:"server,omitempty"`
-	APIKey    string    `json:"api_key,omitempty"`
-	Token     string    `json:"token,omitempty"`
-	Agent     string    `json:"agent,omitempty"`
-	Scope     []string  `json:"scope,omitempty"`
-	Perm      string    `json:"perm,omitempty"`
-	ExpiresAt time.Time `json:"expires_at,omitempty"`
-	Status    string    `json:"status,omitempty"`
-	GrantID   string    `json:"grant_id,omitempty"`
-	LabelHint string    `json:"label_hint,omitempty"`
-	Source    string    `json:"source,omitempty"`
+	Name      string     `json:"name"`
+	Type      string     `json:"type"`
+	Server    string     `json:"server,omitempty"`
+	APIKey    string     `json:"api_key,omitempty"`
+	Token     string     `json:"token,omitempty"`
+	Agent     string     `json:"agent,omitempty"`
+	Scope     []string   `json:"scope,omitempty"`
+	Perm      string     `json:"perm,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	Status    string     `json:"status,omitempty"`
+	GrantID   string     `json:"grant_id,omitempty"`
+	LabelHint string     `json:"label_hint,omitempty"`
+	Source    string     `json:"source,omitempty"`
 }
 
 func ctxShowCmd(args []string) error {
@@ -117,7 +117,10 @@ func buildCtxShowEntry(cfg *Config, reveal bool) *ctxShowEntry {
 		entry.Agent = current.Agent
 		entry.Scope = append([]string(nil), current.Scope...)
 		entry.Perm = string(current.Perm)
-		entry.ExpiresAt = current.ExpiresAt
+		if !current.ExpiresAt.IsZero() {
+			expiresAt := current.ExpiresAt
+			entry.ExpiresAt = &expiresAt
+		}
 		entry.Status = ctxStatus(current, time.Now())
 		entry.GrantID = current.GrantID
 		entry.LabelHint = current.LabelHint
@@ -178,11 +181,11 @@ func writeCtxShowText(entry *ctxShowEntry) error {
 			value string
 		}{label: "perm", value: entry.Perm})
 	}
-	if !entry.ExpiresAt.IsZero() {
+	if entry.ExpiresAt != nil {
 		fields = append(fields, struct {
 			label string
 			value string
-		}{label: "expires_at", value: formatExpiresAt(entry.ExpiresAt)})
+		}{label: "expires_at", value: formatExpiresAt(*entry.ExpiresAt)})
 	}
 	if entry.Status != "" {
 		fields = append(fields, struct {

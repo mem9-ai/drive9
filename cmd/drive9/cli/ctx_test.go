@@ -276,6 +276,9 @@ func TestCtxShowOwnerRevealJSON(t *testing.T) {
 	if got["api_key"] != "drive9_abcdxxxxxxxxwxyz" {
 		t.Fatalf("api_key = %v, want full key", got["api_key"])
 	}
+	if _, ok := got["expires_at"]; ok {
+		t.Fatalf("expires_at should be omitted for owner contexts: %+v", got)
+	}
 	if got["source"] != filepath.Join(home, ".drive9", "config") {
 		t.Fatalf("source = %v, want config path", got["source"])
 	}
