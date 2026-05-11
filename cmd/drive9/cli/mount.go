@@ -369,8 +369,9 @@ func runUmount(args []string, deps umountDeps) error {
 	if err != nil {
 		return err
 	}
-	if err := deps.run(argv); err != nil {
-		return err
+	runErr := deps.run(argv)
+	if deps.goos != "windows" && runErr != nil {
+		return runErr
 	}
 	// Windows WebDAV mounts run a local bridge in the mount process. Even when
 	// the caller opts out of waiting, still request process shutdown before
@@ -378,23 +379,35 @@ func runUmount(args []string, deps umountDeps) error {
 	pid, path, err := deps.readPID(stateMountPoint)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return runErr
+		}
+		if runErr != nil {
+			return runErr
 		}
 		return err
 	}
 	if deps.goos == "windows" {
 		if deps.terminate == nil {
+			if runErr != nil {
+				return runErr
+			}
 			return fmt.Errorf("drive9 umount: no process terminator configured for Windows WebDAV mount")
 		}
 		if err := deps.terminate(pid, *waitTimeout); err != nil {
+			if runErr != nil {
+				return runErr
+			}
 			return fmt.Errorf("%w (pid file: %s)", err, path)
 		}
 		if path != "" && deps.remove != nil {
 			if err := deps.remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				if runErr != nil {
+					return runErr
+				}
 				return fmt.Errorf("drive9 umount: remove mount pid file %s: %w", path, err)
 			}
 		}
-		return nil
+		return runErr
 	}
 	if *waitTimeout == 0 {
 		return nil
