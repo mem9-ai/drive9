@@ -166,9 +166,12 @@ SELECT file_id, content_text, description FROM files LIMIT 1;
 -- Check whether embedding/description_embedding were auto-generated
 SELECT embedding, description_embedding FROM semantic;
 ```
-If TiDB re-computes embeddings during INSERT ... SELECT, the migration should instead:
-1. `INSERT INTO semantic` with all columns including the pre-computed embedding values copied from `files`
-2. Skip the generated column by explicitly listing all non-generated columns
+If TiDB re-computes embeddings during INSERT ... SELECT, the migration must omit
+the `GENERATED ALWAYS` vector columns (`embedding`, `description_embedding`) and
+copy only the non-generated columns (`inode_id`, `content_text`, `description`,
+`embedding_revision`, `description_embedding_revision`). TiDB will regenerate the
+vectors from `content_text`/`description` on insert. Run a single-row test first
+to confirm behavior and estimate cost.
 
 **db9 (PostgreSQL):**
 - `semantic` table hosts `hnsw` vector indexes on `embedding` and `description_embedding`.
@@ -569,7 +572,7 @@ LIMIT 10;
 
 | Step | Content | Files |
 |------|---------|-------|
-| 1 | Schema: `inodes`/`contents`/`semantic`; `file_id`→`inode_id` rename | `pkg/tenant/schema/*.go` |
+| 1 | Schema: `inodes`/`contents`/`semantic`; keep shared-table `file_id` during Phase A | `pkg/tenant/schema/*.go` |
 | 2 | Datastore: `Inode`/`Content`/`Semantic` structs; rewrite all JOINs | `pkg/datastore/store.go` |
 | 3 | Datastore: multi-table transactions | `pkg/datastore/file_tx.go` |
 | 4 | Datastore: search JOINs | `pkg/datastore/search.go` |
@@ -582,6 +585,7 @@ LIMIT 10;
 | 11 | WebDAV | `pkg/webdav/fs.go` |
 | 12 | Tests: schema helpers + assertions | See §7.1 for detailed test file list |
 | 13 | Schema dump | `drive9-server schema dump-init-sql` |
+| 14 | Schema contraction: rename `file_id`→`inode_id` in shared tables, drop old `files` | Migration scripts (§6 Phase B) |
 
 ### 7.1 Affected Test Files
 
