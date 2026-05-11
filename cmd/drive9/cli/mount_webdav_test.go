@@ -137,7 +137,7 @@ func TestWebdavMountCmd_WindowsRejectsNonDriveLetter(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected invalid Windows mountpoint to fail")
 	}
-	if !strings.Contains(err.Error(), "drive letter like X:") {
+	if !strings.Contains(err.Error(), "drive letter like \"X:\"") {
 		t.Fatalf("error = %v, want drive-letter guidance", err)
 	}
 }
@@ -524,7 +524,7 @@ func TestWebdavUnmountCmdWindows(t *testing.T) {
 
 // exitErrorWithCode runs a tiny shell command that exits with the given code
 // and returns the resulting *exec.ExitError. This is the only portable way
-// to construct one — its internal fields are unexported.
+// to construct one - its internal fields are unexported.
 func exitErrorWithCode(t *testing.T, code int) error {
 	t.Helper()
 	var cmd *exec.Cmd
@@ -571,7 +571,7 @@ func TestFsMountCmd_RemoteSourceParsing(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected credential error, not nil")
 	}
-	// Should NOT contain "must be a remote source" — that means parsing worked.
+	// Should NOT contain "must be a remote source" - that means parsing worked.
 	if strings.Contains(err.Error(), "must be a remote source") {
 		t.Fatalf("error = %v, should have parsed remote source successfully", err)
 	}
