@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -206,6 +208,7 @@ func TestRunUmountNoPIDFileReturnsSuccess(t *testing.T) {
 		run:       func([]string) error { return nil },
 		readPID:   func(string) (int, string, error) { return 0, "/tmp/drive9.pid", os.ErrNotExist },
 		terminate: func(int, time.Duration) error { t.Fatal("terminate should not be called without pid file"); return nil },
+		remove:    func(string) error { t.Fatal("remove should not be called without pid file"); return nil },
 		pidAlive:  func(int) bool { t.Fatal("pidAlive should not be called without pid file"); return false },
 		now:       time.Now,
 		sleep:     func(time.Duration) {},
@@ -221,6 +224,7 @@ func TestRunUmountWindowsTerminatesMountProcess(t *testing.T) {
 	now := time.Unix(100, 0)
 	runCalls := 0
 	terminateCalls := 0
+	removeCalls := 0
 	deps := umountDeps{
 		goos:     "windows",
 		lookPath: fakeLookPath(nil),
@@ -248,6 +252,13 @@ func TestRunUmountWindowsTerminatesMountProcess(t *testing.T) {
 			}
 			return nil
 		},
+		remove: func(path string) error {
+			removeCalls++
+			if path != "C:/tmp/drive9-webdav.pid" {
+				t.Fatalf("path = %q, want %q", path, "C:/tmp/drive9-webdav.pid")
+			}
+			return nil
+		},
 		pidAlive: func(pid int) bool {
 			t.Fatalf("pidAlive should not be called on Windows; terminate handles the wait path")
 			return false
@@ -266,6 +277,46 @@ func TestRunUmountWindowsTerminatesMountProcess(t *testing.T) {
 	if terminateCalls != 1 {
 		t.Fatalf("terminateCalls = %d, want 1", terminateCalls)
 	}
+	if removeCalls != 1 {
+		t.Fatalf("removeCalls = %d, want 1", removeCalls)
+	}
+}
+
+func TestTerminateProcessWaitsAfterSuccessfulKill(t *testing.T) {
+	oldWaitForProcessExit := waitForProcessExit
+	t.Cleanup(func() { waitForProcessExit = oldWaitForProcessExit })
+
+	called := false
+	waitForProcessExit = func(pid int, timeout time.Duration) error {
+		called = true
+		if pid <= 0 {
+			t.Fatalf("pid = %d, want > 0", pid)
+		}
+		if timeout != 50*time.Millisecond {
+			t.Fatalf("timeout = %s, want %s", timeout, 50*time.Millisecond)
+		}
+		return nil
+	}
+
+	cmd := exec.Command("cmd", "/c", "pause")
+	if runtime.GOOS != "windows" {
+		cmd = exec.Command("sh", "-c", "sleep 30")
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start helper process: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+
+	if err := terminateProcess(cmd.Process.Pid, 50*time.Millisecond); err != nil {
+		t.Fatalf("terminateProcess: %v", err)
+	}
+	if !called {
+		t.Fatal("waitForProcessExit was not called after successful kill")
+	}
+	_, _ = cmd.Process.Wait()
 }
 
 // TestResolveMountCredentials_OwnerFromResolver binds a mount to an owner
