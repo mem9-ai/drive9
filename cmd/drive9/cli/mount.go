@@ -313,6 +313,7 @@ type umountDeps struct {
 	lookPath  func(string) (string, error)
 	run       func([]string) error
 	readPID   func(string) (int, string, error)
+	terminate func(int) error
 	pidAlive  func(int) bool
 	now       func() time.Time
 	sleep     func(time.Duration)
@@ -330,6 +331,7 @@ func defaultUmountDeps() umountDeps {
 			return cmd.Run()
 		},
 		readPID:   mountstate.ReadPID,
+		terminate: terminateProcess,
 		pidAlive:  processAlive,
 		now:       time.Now,
 		sleep:     time.Sleep,
@@ -352,6 +354,14 @@ func runUmount(args []string, deps umountDeps) error {
 		return fmt.Errorf("usage: drive9 umount [--timeout duration] <mountpoint>")
 	}
 	mountPoint := fs.Arg(0)
+	stateMountPoint := mountPoint
+	var err error
+	if deps.goos == "windows" {
+		stateMountPoint, err = webdavMountStatePoint(deps.goos, mountPoint)
+		if err != nil {
+			return err
+		}
+	}
 
 	argv, err := umountArgv(deps.goos, deps.lookPath, mountPoint)
 	if err != nil {
@@ -361,14 +371,26 @@ func runUmount(args []string, deps umountDeps) error {
 		return err
 	}
 	if *waitTimeout == 0 {
-		return nil
+		// Windows WebDAV mounts run a local bridge in the mount process. Even
+		// when the caller opts out of waiting, still request process shutdown.
 	}
-	pid, path, err := deps.readPID(mountPoint)
+	pid, path, err := deps.readPID(stateMountPoint)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
 		return err
+	}
+	if deps.goos == "windows" {
+		if deps.terminate == nil {
+			return fmt.Errorf("drive9 umount: no process terminator configured for Windows WebDAV mount")
+		}
+		if err := deps.terminate(pid); err != nil {
+			return fmt.Errorf("drive9 umount: terminate mount process pid %d: %w", pid, err)
+		}
+	}
+	if *waitTimeout == 0 {
+		return nil
 	}
 	if err := waitForPIDExit(pid, *waitTimeout, deps); err != nil {
 		return fmt.Errorf("%w (pid file: %s)", err, path)
@@ -414,6 +436,24 @@ func processAlive(pid int) bool {
 		return true
 	}
 	return false
+}
+
+func terminateProcess(pid int) error {
+	if pid <= 0 {
+		return fmt.Errorf("invalid mount process pid %d", pid)
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	err = process.Kill()
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	return err
 }
 
 // resolveMountCredentials selects the (server, apiKey, token) triple that a

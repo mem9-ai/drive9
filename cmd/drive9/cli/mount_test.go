@@ -205,6 +205,7 @@ func TestRunUmountNoPIDFileReturnsSuccess(t *testing.T) {
 		lookPath:  fakeLookPath(map[string]bool{"fusermount3": true}),
 		run:       func([]string) error { return nil },
 		readPID:   func(string) (int, string, error) { return 0, "/tmp/drive9.pid", os.ErrNotExist },
+		terminate: func(int) error { t.Fatal("terminate should not be called without pid file"); return nil },
 		pidAlive:  func(int) bool { t.Fatal("pidAlive should not be called without pid file"); return false },
 		now:       time.Now,
 		sleep:     func(time.Duration) {},
@@ -213,6 +214,61 @@ func TestRunUmountNoPIDFileReturnsSuccess(t *testing.T) {
 
 	if err := runUmount([]string{"/mnt/drive9"}, deps); err != nil {
 		t.Fatalf("runUmount: %v", err)
+	}
+}
+
+func TestRunUmountWindowsTerminatesMountProcess(t *testing.T) {
+	now := time.Unix(100, 0)
+	runCalls := 0
+	terminateCalls := 0
+	aliveCalls := 0
+	deps := umountDeps{
+		goos:     "windows",
+		lookPath: fakeLookPath(nil),
+		run: func(argv []string) error {
+			runCalls++
+			want := []string{"net", "use", "X:", "/delete", "/y"}
+			if !reflect.DeepEqual(argv, want) {
+				t.Fatalf("argv = %v, want %v", argv, want)
+			}
+			return nil
+		},
+		readPID: func(mountPoint string) (int, string, error) {
+			if mountPoint != "X:\\" {
+				t.Fatalf("mountPoint = %q, want %q", mountPoint, "X:\\")
+			}
+			return 4321, "C:/tmp/drive9-webdav.pid", nil
+		},
+		terminate: func(pid int) error {
+			terminateCalls++
+			if pid != 4321 {
+				t.Fatalf("pid = %d, want 4321", pid)
+			}
+			return nil
+		},
+		pidAlive: func(pid int) bool {
+			aliveCalls++
+			if pid != 4321 {
+				t.Fatalf("pid = %d, want 4321", pid)
+			}
+			return aliveCalls < 2
+		},
+		now:       func() time.Time { return now },
+		sleep:     func(d time.Duration) { now = now.Add(d) },
+		printErrf: func(string, ...any) {},
+	}
+
+	if err := runUmount([]string{"x:\\"}, deps); err != nil {
+		t.Fatalf("runUmount: %v", err)
+	}
+	if runCalls != 1 {
+		t.Fatalf("runCalls = %d, want 1", runCalls)
+	}
+	if terminateCalls != 1 {
+		t.Fatalf("terminateCalls = %d, want 1", terminateCalls)
+	}
+	if aliveCalls != 2 {
+		t.Fatalf("aliveCalls = %d, want 2", aliveCalls)
 	}
 }
 

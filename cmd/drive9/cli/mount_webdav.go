@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/mountstate"
 )
 
 // MountMode selects the filesystem mount backend.
@@ -40,8 +41,8 @@ func ParseMountMode(s string) (MountMode, error) {
 }
 
 // ResolveMountMode picks the concrete mode from "auto".
-// On macOS auto always uses WebDAV for zero-install onboarding; FUSE is only
-// selected there when explicitly requested with --mode=fuse.
+// On macOS and Windows, auto always uses WebDAV for zero-install onboarding.
+// Linux and other platforms still default to FUSE.
 func ResolveMountMode(mode MountMode, goos string, lookPath func(string) (string, error)) MountMode {
 	_ = lookPath
 	if mode != MountModeAuto {
@@ -176,11 +177,33 @@ func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDe
 		}
 	}
 
-	// Invoke mount_webdav.
+	// Invoke the OS-specific WebDAV mount helper.
 	if err := deps.runMount(deps.goos, serverURL, mountPoint); err != nil {
 		_ = srv.Close()
 		return explainMountError(deps.goos, mountPoint, err)
 	}
+
+	stateMountPoint, err := webdavMountStatePoint(deps.goos, mountPoint)
+	if err != nil {
+		deps.unmount(deps.goos, mountPoint)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		return err
+	}
+	pidFile, err := mountstate.WritePID(stateMountPoint, os.Getpid())
+	if err != nil {
+		deps.unmount(deps.goos, mountPoint)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		return fmt.Errorf("webdav: write mount pid file: %w", err)
+	}
+	defer func() {
+		if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "drive9: remove mount pid file %s: %v\n", pidFile, err)
+		}
+	}()
 
 	fmt.Fprintf(os.Stderr, "drive9: mounted on %s via WebDAV (server: %s)\n", mountPoint, serverURL)
 
@@ -335,6 +358,17 @@ func normalizeWebDAVMountPoint(goos, mountPoint string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("webdav: Windows mount point must be a drive letter like \"X:\"")
+}
+
+func webdavMountStatePoint(goos, mountPoint string) (string, error) {
+	normalizedMountPoint, err := normalizeWebDAVMountPoint(goos, mountPoint)
+	if err != nil {
+		return "", err
+	}
+	if goos == "windows" {
+		return normalizedMountPoint + `\`, nil
+	}
+	return normalizedMountPoint, nil
 }
 
 func newWebDAVNoncePrefix() (string, error) {

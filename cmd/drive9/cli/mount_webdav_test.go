@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/mountstate"
 )
 
 func TestParseMountMode(t *testing.T) {
@@ -315,6 +316,10 @@ func TestWebDAVMountLifecycleWindowsNormalizesDriveLetter(t *testing.T) {
 	mounted := make(chan string, 1)
 	done := make(chan error, 1)
 	var unmounted atomic.Bool
+	stateMountPoint, err := webdavMountStatePoint("windows", "x:\\")
+	if err != nil {
+		t.Fatalf("webdavMountStatePoint: %v", err)
+	}
 
 	go func() {
 		done <- webdavMountWithDeps(c, "x:\\", webdavMountDeps{
@@ -354,6 +359,28 @@ func TestWebDAVMountLifecycleWindowsNormalizesDriveLetter(t *testing.T) {
 		t.Fatal("mount command was not invoked")
 	}
 
+	var (
+		pid     int
+		pidFile string
+	)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		pid, pidFile, err = mountstate.ReadPID(stateMountPoint)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("ReadPID(%q): %v", stateMountPoint, err)
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("ReadPID(%q): timed out waiting for pid file", stateMountPoint)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pid != os.Getpid() {
+		t.Fatalf("pid = %d, want %d", pid, os.Getpid())
+	}
+
 	signals <- os.Interrupt
 
 	select {
@@ -366,6 +393,13 @@ func TestWebDAVMountLifecycleWindowsNormalizesDriveLetter(t *testing.T) {
 	}
 	if !unmounted.Load() {
 		t.Fatal("unmount callback was not called")
+	}
+	_, _, err = mountstate.ReadPID(stateMountPoint)
+	if !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			t.Fatalf("expected pid file %q to be removed", pidFile)
+		}
+		t.Fatalf("pid file %q not removed cleanly: %v", pidFile, err)
 	}
 }
 
