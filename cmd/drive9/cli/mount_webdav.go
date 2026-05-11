@@ -320,7 +320,7 @@ func normalizeWebDAVMountPoint(goos, mountPoint string) (string, error) {
 			}
 		}
 	}
-	return "", fmt.Errorf("webdav: Windows mount point must be a drive letter like X:")
+	return "", fmt.Errorf("webdav: Windows mount point must be a drive letter like \"X:\"")
 }
 
 func newWebDAVNoncePrefix() (string, error) {

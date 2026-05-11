@@ -97,7 +97,7 @@ func TestUmountArgvWindowsRejectsNonDriveLetter(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected invalid Windows mountpoint to fail")
 	}
-	if !strings.Contains(err.Error(), "drive letter like X:") {
+	if !strings.Contains(err.Error(), "drive letter like \"X:\"") {
 		t.Fatalf("error = %v, want drive-letter guidance", err)
 	}
 }
