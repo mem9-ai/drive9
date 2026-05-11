@@ -38,6 +38,7 @@ func NewLocal(rootDir, baseURL string) (*LocalS3Client, error) {
 	if err := os.MkdirAll(rootDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create s3 root: %w", err)
 	}
+	markS3ClientAvailable()
 	return &LocalS3Client{
 		rootDir: rootDir,
 		baseURL: baseURL,
@@ -54,10 +55,15 @@ func (c *LocalS3Client) partPath(key, uploadID string, partNumber int) string {
 }
 
 func (c *LocalS3Client) CreateMultipartUpload(ctx context.Context, key string, algo ChecksumAlgo, encOpts EncryptionOpts) (*MultipartUpload, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("create_multipart_upload", result, start) }()
+
 	uploadID := fmt.Sprintf("upload-%x", sha256.Sum256([]byte(key+time.Now().String())))[:24]
 
 	partsDir := filepath.Join(c.rootDir, "parts", uploadID)
 	if err := os.MkdirAll(partsDir, 0o755); err != nil {
+		result = "error"
 		return nil, fmt.Errorf("create parts dir: %w", err)
 	}
 
@@ -69,6 +75,10 @@ func (c *LocalS3Client) CreateMultipartUpload(ctx context.Context, key string, a
 }
 
 func (c *LocalS3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, partSize int64, algo ChecksumAlgo, checksumValue string, ttl time.Duration) (*UploadPartURL, error) {
+	start := time.Now()
+	metricResult := "ok"
+	defer func() { recordS3Operation("presign_upload_part", metricResult, start) }()
+
 	url := fmt.Sprintf("%s/upload/%s/%d", c.baseURL, uploadID, partNumber)
 	var headers map[string]string
 	if checksumValue != "" {
@@ -79,7 +89,7 @@ func (c *LocalS3Client) PresignUploadPart(ctx context.Context, key, uploadID str
 			headers = map[string]string{"x-amz-checksum-sha256": checksumValue}
 		}
 	}
-	result := &UploadPartURL{
+	urlResult := &UploadPartURL{
 		Number:    partNumber,
 		URL:       url,
 		Size:      partSize,
@@ -88,32 +98,40 @@ func (c *LocalS3Client) PresignUploadPart(ctx context.Context, key, uploadID str
 	}
 	switch algo {
 	case ChecksumAlgoCRC32C:
-		result.ChecksumCRC32C = checksumValue
+		urlResult.ChecksumCRC32C = checksumValue
 	default:
-		result.ChecksumSHA256 = checksumValue
+		urlResult.ChecksumSHA256 = checksumValue
 	}
-	return result, nil
+	return urlResult, nil
 }
 
 // UploadPart directly writes a part (used by the local presigned URL handler).
 func (c *LocalS3Client) UploadPart(ctx context.Context, uploadID string, partNumber int, body io.Reader) (string, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("upload_part", result, start) }()
+
 	c.mu.Lock()
 	upload, ok := c.uploads[uploadID]
 	c.mu.Unlock()
 	if !ok {
+		result = "not_found"
 		return "", fmt.Errorf("upload not found: %s", uploadID)
 	}
 
 	data, err := io.ReadAll(body)
 	if err != nil {
+		result = "error"
 		return "", fmt.Errorf("read part body: %w", err)
 	}
 
 	path := c.partPath(upload.key, uploadID, partNumber)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		result = "error"
 		return "", err
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
+		result = "error"
 		return "", err
 	}
 
@@ -128,10 +146,15 @@ func (c *LocalS3Client) UploadPart(ctx context.Context, uploadID string, partNum
 }
 
 func (c *LocalS3Client) CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []Part) error {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("complete_multipart_upload", result, start) }()
+
 	c.mu.Lock()
 	upload, ok := c.uploads[uploadID]
 	c.mu.Unlock()
 	if !ok {
+		result = "not_found"
 		return fmt.Errorf("upload not found: %s", uploadID)
 	}
 
@@ -143,10 +166,12 @@ func (c *LocalS3Client) CompleteMultipartUpload(ctx context.Context, key, upload
 	// Assemble final object from parts
 	objPath := c.objectPath(key)
 	if err := os.MkdirAll(filepath.Dir(objPath), 0o755); err != nil {
+		result = "error"
 		return err
 	}
 	f, err := os.Create(objPath)
 	if err != nil {
+		result = "error"
 		return err
 	}
 	defer func() { _ = f.Close() }()
@@ -155,9 +180,11 @@ func (c *LocalS3Client) CompleteMultipartUpload(ctx context.Context, key, upload
 		partFile := c.partPath(upload.key, uploadID, p.Number)
 		data, err := os.ReadFile(partFile)
 		if err != nil {
+			result = "error"
 			return fmt.Errorf("read part %d: %w", p.Number, err)
 		}
 		if _, err := f.Write(data); err != nil {
+			result = "error"
 			return err
 		}
 	}
@@ -174,6 +201,9 @@ func (c *LocalS3Client) CompleteMultipartUpload(ctx context.Context, key, upload
 }
 
 func (c *LocalS3Client) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
+	start := time.Now()
+	defer func() { recordS3Operation("abort_multipart_upload", "ok", start) }()
+
 	partsDir := filepath.Join(c.rootDir, "parts", uploadID)
 	_ = os.RemoveAll(partsDir)
 
@@ -185,11 +215,16 @@ func (c *LocalS3Client) AbortMultipartUpload(ctx context.Context, key, uploadID 
 }
 
 func (c *LocalS3Client) ListParts(ctx context.Context, key, uploadID string) ([]Part, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("list_parts", result, start) }()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	upload, ok := c.uploads[uploadID]
 	if !ok {
+		result = "not_found"
 		return nil, fmt.Errorf("upload not found: %s", uploadID)
 	}
 
@@ -202,35 +237,79 @@ func (c *LocalS3Client) ListParts(ctx context.Context, key, uploadID string) ([]
 }
 
 func (c *LocalS3Client) PresignGetObject(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	start := time.Now()
+	defer func() { recordS3Operation("presign_get_object", "ok", start) }()
+
 	url := fmt.Sprintf("%s/objects/%s", c.baseURL, key)
 	return url, nil
 }
 
 func (c *LocalS3Client) PutObject(ctx context.Context, key string, body io.Reader, size int64, encOpts EncryptionOpts) error {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("put_object", result, start) }()
+
 	objPath := c.objectPath(key)
 	if err := os.MkdirAll(filepath.Dir(objPath), 0o755); err != nil {
+		result = "error"
 		return err
 	}
 	data, err := io.ReadAll(body)
 	if err != nil {
+		result = "error"
 		return err
 	}
-	return os.WriteFile(objPath, data, 0o644)
+	if err := os.WriteFile(objPath, data, 0o644); err != nil {
+		result = "error"
+		return err
+	}
+	return nil
 }
 
 func (c *LocalS3Client) GetObject(ctx context.Context, key string) (io.ReadCloser, error) {
-	return os.Open(c.objectPath(key))
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("get_object", result, start) }()
+
+	rc, err := os.Open(c.objectPath(key))
+	if err != nil {
+		if os.IsNotExist(err) {
+			result = "not_found"
+		} else {
+			result = "error"
+		}
+		return nil, err
+	}
+	return rc, nil
 }
 
 func (c *LocalS3Client) DeleteObject(ctx context.Context, key string) error {
-	return os.Remove(c.objectPath(key))
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("delete_object", result, start) }()
+
+	err := os.Remove(c.objectPath(key))
+	if err != nil {
+		if os.IsNotExist(err) {
+			result = "not_found"
+		} else {
+			result = "error"
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *LocalS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID string, partNumber int, sourceKey string, startByte, endByte int64) (string, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("upload_part_copy", result, start) }()
+
 	c.mu.Lock()
 	upload, ok := c.uploads[uploadID]
 	c.mu.Unlock()
 	if !ok {
+		result = "not_found"
 		return "", fmt.Errorf("upload not found: %s", uploadID)
 	}
 
@@ -238,6 +317,11 @@ func (c *LocalS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID st
 	srcPath := c.objectPath(sourceKey)
 	f, err := os.Open(srcPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			result = "not_found"
+		} else {
+			result = "error"
+		}
 		return "", fmt.Errorf("open source object: %w", err)
 	}
 	defer func() { _ = f.Close() }()
@@ -246,6 +330,7 @@ func (c *LocalS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID st
 	data := make([]byte, size)
 	n, err := f.ReadAt(data, startByte)
 	if err != nil && err != io.EOF {
+		result = "error"
 		return "", fmt.Errorf("read source range: %w", err)
 	}
 	data = data[:n]
@@ -253,9 +338,11 @@ func (c *LocalS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID st
 	// Write as a part file
 	path := c.partPath(upload.key, uploadID, partNumber)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		result = "error"
 		return "", err
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
+		result = "error"
 		return "", err
 	}
 
@@ -270,6 +357,9 @@ func (c *LocalS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID st
 }
 
 func (c *LocalS3Client) PresignGetObjectRange(ctx context.Context, key string, startByte, endByte int64, ttl time.Duration) (string, error) {
+	start := time.Now()
+	defer func() { recordS3Operation("presign_get_object_range", "ok", start) }()
+
 	url := fmt.Sprintf("%s/objects/%s?range=%d-%d", c.baseURL, key, startByte, endByte)
 	return url, nil
 }

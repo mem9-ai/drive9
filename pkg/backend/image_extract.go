@@ -110,10 +110,10 @@ func (b *Dat9Backend) enqueueImageExtract(fileID, path, contentType string, revi
 	select {
 	case b.imageExtractQueue <- task:
 		metrics.RecordOperation("image_extract", "enqueue", "ok", 0)
-		metrics.RecordGauge("image_extract", "queue_depth", float64(len(b.imageExtractQueue)))
+		globalBackendRuntimeMetrics.setImageQueueDepth(b.runtimeMetricsID, len(b.imageExtractQueue))
 	default:
 		metrics.RecordOperation("image_extract", "enqueue", "queue_full", 0)
-		metrics.RecordGauge("image_extract", "queue_depth", float64(len(b.imageExtractQueue)))
+		globalBackendRuntimeMetrics.setImageQueueDepth(b.runtimeMetricsID, len(b.imageExtractQueue))
 		logger.Warn(backgroundWithTrace(), "backend_image_extract_queue_full_drop",
 			zap.String("file_id", fileID),
 			zap.String("path", path),
@@ -170,7 +170,7 @@ func (b *Dat9Backend) runImageExtractWorker(ctx context.Context, workerID int) {
 			logger.Info(ctx, "backend_image_extract_worker_stopped", zap.Int("worker_id", workerID), zap.String("reason", "context_canceled"))
 			return
 		case task := <-b.imageExtractQueue:
-			metrics.RecordGauge("image_extract", "queue_depth", float64(len(b.imageExtractQueue)))
+			globalBackendRuntimeMetrics.setImageQueueDepth(b.runtimeMetricsID, len(b.imageExtractQueue))
 			b.processQueuedImageExtractTask(ctx, task)
 		}
 	}

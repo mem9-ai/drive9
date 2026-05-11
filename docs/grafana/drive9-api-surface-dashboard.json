@@ -732,8 +732,8 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Drive9 API Surface (HTTP) Performance",
-  "uid": "drive9-http-performance",
+  "title": "Drive9 API Surface Performance",
+  "uid": "drive9-api-surface",
   "version": 1,
   "weekStart": ""
 }

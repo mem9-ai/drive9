@@ -7,6 +7,8 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/mem9-ai/dat9/pkg/metrics"
 )
 
 type perfFuseOp int
@@ -149,6 +151,7 @@ func newFusePerfCounters(enabled bool) *fusePerfCounters {
 	if !enabled {
 		return nil
 	}
+	metrics.SetModuleAvailability("fuse", true)
 	return &fusePerfCounters{
 		enabled: true,
 		start:   time.Now(),
@@ -322,12 +325,28 @@ func (fs *Dat9FS) perfRecordFuse(op perfFuseOp, start time.Time, status gofuse.S
 	if !fs.perfEnabled() || start.IsZero() {
 		return
 	}
-	fs.perf.recordFuseOp(op, status, time.Since(start), bytes)
+	dur := time.Since(start)
+	fs.perf.recordFuseOp(op, status, dur, bytes)
+	result := "ok"
+	if status != gofuse.OK {
+		result = "error"
+	}
+	if op >= 0 && op < perfFuseOpCount {
+		metrics.RecordFuseOperation(perfFuseOpNames[op], result, dur, bytes)
+	}
 }
 
 func (fs *Dat9FS) perfRecordRemote(op perfRemoteOp, start time.Time, err error, bytes uint64) {
 	if !fs.perfEnabled() || start.IsZero() {
 		return
 	}
-	fs.perf.recordRemoteOp(op, err, time.Since(start), bytes)
+	dur := time.Since(start)
+	fs.perf.recordRemoteOp(op, err, dur, bytes)
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	if op >= 0 && op < perfRemoteOpCount {
+		metrics.RecordFuseRemoteOperation(perfRemoteOpNames[op], result, dur, bytes)
+	}
 }
