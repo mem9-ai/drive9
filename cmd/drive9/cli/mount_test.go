@@ -282,6 +282,67 @@ func TestRunUmountWindowsTerminatesMountProcess(t *testing.T) {
 	}
 }
 
+func TestRunUmountWindowsStillCleansUpAfterUnmountFailure(t *testing.T) {
+	now := time.Unix(100, 0)
+	runErr := errors.New("net use failed")
+	runCalls := 0
+	terminateCalls := 0
+	removeCalls := 0
+	deps := umountDeps{
+		goos:     "windows",
+		lookPath: fakeLookPath(nil),
+		run: func(argv []string) error {
+			runCalls++
+			want := []string{"net", "use", "X:", "/delete", "/y"}
+			if !reflect.DeepEqual(argv, want) {
+				t.Fatalf("argv = %v, want %v", argv, want)
+			}
+			return runErr
+		},
+		readPID: func(mountPoint string) (int, string, error) {
+			if mountPoint != "X:\\" {
+				t.Fatalf("mountPoint = %q, want %q", mountPoint, "X:\\")
+			}
+			return 4321, "C:/tmp/drive9-webdav.pid", nil
+		},
+		terminate: func(pid int, waitTimeout time.Duration) error {
+			terminateCalls++
+			if pid != 4321 {
+				t.Fatalf("pid = %d, want 4321", pid)
+			}
+			if waitTimeout != 60*time.Second {
+				t.Fatalf("waitTimeout = %s, want %s", waitTimeout, 60*time.Second)
+			}
+			return nil
+		},
+		remove: func(path string) error {
+			removeCalls++
+			if path != "C:/tmp/drive9-webdav.pid" {
+				t.Fatalf("path = %q, want %q", path, "C:/tmp/drive9-webdav.pid")
+			}
+			return nil
+		},
+		pidAlive:  func(int) bool { t.Fatal("pidAlive should not be called on Windows"); return false },
+		now:       func() time.Time { return now },
+		sleep:     func(d time.Duration) { now = now.Add(d) },
+		printErrf: func(string, ...any) {},
+	}
+
+	err := runUmount([]string{"x:\\"}, deps)
+	if !errors.Is(err, runErr) {
+		t.Fatalf("err = %v, want %v", err, runErr)
+	}
+	if runCalls != 1 {
+		t.Fatalf("runCalls = %d, want 1", runCalls)
+	}
+	if terminateCalls != 1 {
+		t.Fatalf("terminateCalls = %d, want 1", terminateCalls)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("removeCalls = %d, want 1", removeCalls)
+	}
+}
+
 func TestTerminateProcessWaitsAfterSuccessfulKill(t *testing.T) {
 	oldWaitForProcessExit := waitForProcessExit
 	t.Cleanup(func() { waitForProcessExit = oldWaitForProcessExit })
