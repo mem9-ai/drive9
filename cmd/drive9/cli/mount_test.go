@@ -220,6 +220,37 @@ func TestRunUmountNoPIDFileReturnsSuccess(t *testing.T) {
 	}
 }
 
+func TestRunUmountNonWindowsTimeoutZeroSkipsPIDRead(t *testing.T) {
+	deps := umountDeps{
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run:      func([]string) error { return nil },
+		readPID: func(string) (int, string, error) {
+			t.Fatal("readPID should not be called when timeout is zero on non-Windows")
+			return 0, "", nil
+		},
+		terminate: func(int, time.Duration) error {
+			t.Fatal("terminate should not be called on non-Windows timeout-zero path")
+			return nil
+		},
+		remove: func(string) error {
+			t.Fatal("remove should not be called on non-Windows timeout-zero path")
+			return nil
+		},
+		pidAlive: func(int) bool {
+			t.Fatal("pidAlive should not be called on non-Windows timeout-zero path")
+			return false
+		},
+		now:       time.Now,
+		sleep:     func(time.Duration) {},
+		printErrf: func(string, ...any) {},
+	}
+
+	if err := runUmount([]string{"--timeout", "0", "/mnt/drive9"}, deps); err != nil {
+		t.Fatalf("runUmount: %v", err)
+	}
+}
+
 func TestRunUmountWindowsTerminatesMountProcess(t *testing.T) {
 	now := time.Unix(100, 0)
 	runCalls := 0
