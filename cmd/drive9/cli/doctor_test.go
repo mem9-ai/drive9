@@ -214,7 +214,7 @@ func TestRunDoctorFuseWindowsReportsUnsupported(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected windows doctor fuse to fail")
 	}
-	if !strings.Contains(out.String(), "FAIL fuse support: drive9 FUSE mounts are not supported on windows") {
+	if !strings.Contains(out.String(), "FAIL fuse support: drive9 FUSE mounts are not supported on Windows") {
 		t.Fatalf("output missing windows unsupported message:\n%s", out.String())
 	}
 	if !strings.Contains(out.String(), "use `drive9 mount` without `--mode=fuse` on Windows") {
