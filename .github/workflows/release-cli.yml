@@ -42,7 +42,12 @@ jobs:
 
       - name: Build CLI for all platforms
         run: |
-          make build-cli-release DIST_DIR=dist VERSION="${{ env.VERSION }}"
+          make build-cli-release DIST_DIR=dist VERSION="${{ env.VERSION }}" CLI_TARGETS="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64"
+
+      - name: Verify Windows artifacts
+        run: |
+          test -f dist/drive9-windows-amd64.exe
+          test -f dist/drive9-windows-arm64.exe
 
       - name: Ensure version file
         run: |

@@ -9,12 +9,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/mountstate"
 )
 
 func TestParseMountMode(t *testing.T) {
@@ -68,6 +70,14 @@ func TestResolveMountMode_Linux(t *testing.T) {
 	}
 }
 
+func TestResolveMountMode_Windows(t *testing.T) {
+	lp := fakeLookPath(nil)
+	got := ResolveMountMode(MountModeAuto, "windows", lp)
+	if got != MountModeWebDAV {
+		t.Fatalf("windows auto: got %q, want webdav", got)
+	}
+}
+
 func TestResolveMountMode_ExplicitOverridesAuto(t *testing.T) {
 	lp := fakeLookPath(nil)
 	got := ResolveMountMode(MountModeFUSE, "darwin", lp)
@@ -109,6 +119,27 @@ func TestWebdavMountCmd_UnsupportedOS(t *testing.T) {
 	_, err := webdavMountCmd("freebsd", "http://127.0.0.1:8080", "/mnt/drive9")
 	if err == nil {
 		t.Fatal("expected error for unsupported OS")
+	}
+}
+
+func TestWebdavMountCmd_Windows(t *testing.T) {
+	cmd, err := webdavMountCmd("windows", "http://127.0.0.1:8080/_drive9_test/", "x:\\")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	args := cmd.Args
+	if len(args) != 5 || args[0] != "net" || args[1] != "use" || args[2] != "X:" || args[3] != "http://127.0.0.1:8080/_drive9_test" || args[4] != "/persistent:no" {
+		t.Fatalf("windows mount cmd args = %v", args)
+	}
+}
+
+func TestWebdavMountCmd_WindowsRejectsNonDriveLetter(t *testing.T) {
+	_, err := webdavMountCmd("windows", "http://127.0.0.1:8080", "C:\\temp\\drive9")
+	if err == nil {
+		t.Fatal("expected invalid Windows mountpoint to fail")
+	}
+	if !strings.Contains(err.Error(), "drive letter like \"X:\"") {
+		t.Fatalf("error = %v, want drive-letter guidance", err)
 	}
 }
 
@@ -263,6 +294,13 @@ func TestWebDAVMountLifecycle(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("mount command was not invoked")
 	}
+	_, _, err := mountstate.ReadPID(mountPoint)
+	if !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			t.Fatalf("expected no pid file for non-Windows WebDAV mount at %q", mountPoint)
+		}
+		t.Fatalf("ReadPID(%q): %v", mountPoint, err)
+	}
 
 	signals <- os.Interrupt
 
@@ -276,6 +314,99 @@ func TestWebDAVMountLifecycle(t *testing.T) {
 	}
 	if !unmounted.Load() {
 		t.Fatal("unmount callback was not called")
+	}
+}
+
+func TestWebDAVMountLifecycleWindowsNormalizesDriveLetter(t *testing.T) {
+	c := newWebDAVLifecycleClient(t)
+	signals := make(chan os.Signal, 2)
+	mounted := make(chan string, 1)
+	done := make(chan error, 1)
+	var unmounted atomic.Bool
+	stateMountPoint, err := webdavMountStatePoint("windows", "x:\\")
+	if err != nil {
+		t.Fatalf("webdavMountStatePoint: %v", err)
+	}
+
+	go func() {
+		done <- webdavMountWithDeps(c, "x:\\", webdavMountDeps{
+			goos:    "windows",
+			signals: signals,
+			runMount: func(goos, serverURL, gotMountPoint string) error {
+				if goos != "windows" {
+					t.Errorf("goos = %q, want windows", goos)
+				}
+				if gotMountPoint != "X:" {
+					t.Errorf("mountPoint = %q, want X:", gotMountPoint)
+				}
+				mounted <- serverURL
+				return nil
+			},
+			unmount: func(goos, gotMountPoint string) {
+				if goos != "windows" {
+					t.Errorf("unmount goos = %q, want windows", goos)
+				}
+				if gotMountPoint != "X:" {
+					t.Errorf("unmount mountPoint = %q, want X:", gotMountPoint)
+				}
+				unmounted.Store(true)
+			},
+			exit: func(code int) {
+				t.Errorf("unexpected forced exit code %d", code)
+			},
+			newPrefix: func() (string, error) {
+				return "/_drive9_test", nil
+			},
+		})
+	}()
+
+	select {
+	case <-mounted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("mount command was not invoked")
+	}
+
+	var (
+		state   mountstate.ProcessState
+		pidFile string
+	)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		state, pidFile, err = mountstate.ReadProcessState(stateMountPoint)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("ReadPID(%q): %v", stateMountPoint, err)
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("ReadPID(%q): timed out waiting for pid file", stateMountPoint)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if state.PID != os.Getpid() {
+		t.Fatalf("pid = %d, want %d", state.PID, os.Getpid())
+	}
+
+	signals <- os.Interrupt
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("webdavMountWithDeps returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webdavMountWithDeps did not shut down after signal")
+	}
+	if !unmounted.Load() {
+		t.Fatal("unmount callback was not called")
+	}
+	_, _, err = mountstate.ReadPID(stateMountPoint)
+	if !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			t.Fatalf("expected pid file %q to be removed", pidFile)
+		}
+		t.Fatalf("pid file %q not removed cleanly: %v", pidFile, err)
 	}
 }
 
@@ -362,6 +493,13 @@ func TestMountErrorHint(t *testing.T) {
 			err:      exitErrorWithCode(t, 19),
 			wantHint: false,
 		},
+		{
+			name:     "windows system error 67",
+			goos:     "windows",
+			err:      exitErrorWithCode(t, 67),
+			wantSubs: []string{"WebDAV redirector", "WebClient service"},
+			wantHint: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -407,14 +545,35 @@ func TestExplainMountError(t *testing.T) {
 	if strings.Contains(wrapped2.Error(), "ENODEV") {
 		t.Errorf("plain error should not get an ENODEV hint; got %q", wrapped2.Error())
 	}
+
+	wrapped3 := explainMountError("windows", "X:", exitErrorWithCode(t, 67))
+	if !strings.Contains(wrapped3.Error(), "WebClient service") {
+		t.Errorf("windows hint missing; got %q", wrapped3.Error())
+	}
+}
+
+func TestWebdavUnmountCmdWindows(t *testing.T) {
+	cmd, err := webdavUnmountCmd("windows", "x:\\")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	args := cmd.Args
+	if len(args) != 5 || args[0] != "net" || args[1] != "use" || args[2] != "X:" || args[3] != "/delete" || args[4] != "/y" {
+		t.Fatalf("windows unmount cmd args = %v", args)
+	}
 }
 
 // exitErrorWithCode runs a tiny shell command that exits with the given code
 // and returns the resulting *exec.ExitError. This is the only portable way
-// to construct one — its internal fields are unexported.
+// to construct one - its internal fields are unexported.
 func exitErrorWithCode(t *testing.T, code int) error {
 	t.Helper()
-	cmd := exec.Command("sh", "-c", fmt.Sprintf("exit %d", code))
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/c", fmt.Sprintf("exit %d", code))
+	} else {
+		cmd = exec.Command("sh", "-c", fmt.Sprintf("exit %d", code))
+	}
 	err := cmd.Run()
 	if err == nil {
 		t.Fatalf("expected non-zero exit, got nil")
@@ -453,7 +612,7 @@ func TestFsMountCmd_RemoteSourceParsing(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected credential error, not nil")
 	}
-	// Should NOT contain "must be a remote source" — that means parsing worked.
+	// Should NOT contain "must be a remote source" - that means parsing worked.
 	if strings.Contains(err.Error(), "must be a remote source") {
 		t.Fatalf("error = %v, should have parsed remote source successfully", err)
 	}

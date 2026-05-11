@@ -3,12 +3,18 @@ package mountstate
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
+
+type ProcessState struct {
+	PID          int    `json:"pid"`
+	CreationTime uint64 `json:"creation_time,omitempty"`
+}
 
 func PIDFilePath(mountPoint string) string {
 	canonical := canonicalMountPoint(mountPoint)
@@ -38,18 +44,55 @@ func WritePID(mountPoint string, pid int) (string, error) {
 	return path, nil
 }
 
-func ReadPID(mountPoint string) (int, string, error) {
+func WriteProcessState(mountPoint string, state ProcessState) (string, error) {
+	if state.PID <= 0 {
+		return "", fmt.Errorf("invalid pid %d", state.PID)
+	}
 	path := PIDFilePath(mountPoint)
-	data, err := os.ReadFile(path)
+	data, err := json.Marshal(state)
+	if err != nil {
+		return "", fmt.Errorf("marshal process state: %w", err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func ReadPID(mountPoint string) (int, string, error) {
+	state, path, err := ReadProcessState(mountPoint)
 	if err != nil {
 		return 0, path, err
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	return state.PID, path, nil
+}
+
+func ReadProcessState(mountPoint string) (ProcessState, string, error) {
+	path := PIDFilePath(mountPoint)
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return 0, path, fmt.Errorf("read pid file %s: %w", path, err)
+		return ProcessState{}, path, err
+	}
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" {
+		return ProcessState{}, path, fmt.Errorf("read pid file %s: empty file", path)
+	}
+	if strings.HasPrefix(trimmed, "{") {
+		var state ProcessState
+		if err := json.Unmarshal([]byte(trimmed), &state); err != nil {
+			return ProcessState{}, path, fmt.Errorf("read pid file %s: %w", path, err)
+		}
+		if state.PID <= 0 {
+			return ProcessState{}, path, fmt.Errorf("read pid file %s: invalid pid %d", path, state.PID)
+		}
+		return state, path, nil
+	}
+	pid, err := strconv.Atoi(trimmed)
+	if err != nil {
+		return ProcessState{}, path, fmt.Errorf("read pid file %s: %w", path, err)
 	}
 	if pid <= 0 {
-		return 0, path, fmt.Errorf("read pid file %s: invalid pid %d", path, pid)
+		return ProcessState{}, path, fmt.Errorf("read pid file %s: invalid pid %d", path, pid)
 	}
-	return pid, path, nil
+	return ProcessState{PID: pid}, path, nil
 }

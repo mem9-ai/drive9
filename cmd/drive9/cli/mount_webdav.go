@@ -13,10 +13,12 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/mountstate"
 )
 
 // MountMode selects the filesystem mount backend.
@@ -39,14 +41,14 @@ func ParseMountMode(s string) (MountMode, error) {
 }
 
 // ResolveMountMode picks the concrete mode from "auto".
-// On macOS auto always uses WebDAV for zero-install onboarding; FUSE is only
-// selected there when explicitly requested with --mode=fuse.
+// On macOS and Windows, auto always uses WebDAV for zero-install onboarding.
+// Linux and other platforms still default to FUSE.
 func ResolveMountMode(mode MountMode, goos string, lookPath func(string) (string, error)) MountMode {
 	_ = lookPath
 	if mode != MountModeAuto {
 		return mode
 	}
-	if goos == "darwin" {
+	if goos == "darwin" || goos == "windows" {
 		return MountModeWebDAV
 	}
 	// Linux and others: FUSE is the default.
@@ -71,8 +73,9 @@ type WebDAVMountHandler interface {
 	http.Handler
 }
 
-// webdavMount starts a local WebDAV server bound to 127.0.0.1, invokes
-// mount_webdav to attach it to mountPoint, and blocks until SIGINT/SIGTERM.
+// webdavMount starts a local WebDAV server bound to 127.0.0.1, invokes the
+// OS-specific WebDAV mount helper to attach it to mountPoint, and blocks until
+// SIGINT/SIGTERM. On Windows, mountPoint must be a drive letter like X:.
 func webdavMount(c *client.Client, mountPoint string, remoteRoot string) error {
 	return webdavMountWithDeps(c, mountPoint, webdavMountDeps{
 		goos:       runtime.GOOS,
@@ -114,6 +117,12 @@ func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDe
 	if deps.newPrefix == nil {
 		deps.newPrefix = newWebDAVNoncePrefix
 	}
+
+	normalizedMountPoint, err := normalizeWebDAVMountPoint(deps.goos, mountPoint)
+	if err != nil {
+		return err
+	}
+	mountPoint = normalizedMountPoint
 
 	// Bind to a random available port on loopback.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -160,16 +169,51 @@ func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDe
 	}
 	readyCancel()
 
-	// Ensure mount point exists.
-	if err := os.MkdirAll(mountPoint, 0o755); err != nil {
-		_ = srv.Close()
-		return fmt.Errorf("webdav: create mount point: %w", err)
+	// Ensure mount point exists where the platform expects a directory mount.
+	if deps.goos != "windows" {
+		if err := os.MkdirAll(mountPoint, 0o755); err != nil {
+			_ = srv.Close()
+			return fmt.Errorf("webdav: create mount point: %w", err)
+		}
 	}
 
-	// Invoke mount_webdav.
+	// Invoke the OS-specific WebDAV mount helper.
 	if err := deps.runMount(deps.goos, serverURL, mountPoint); err != nil {
 		_ = srv.Close()
 		return explainMountError(deps.goos, mountPoint, err)
+	}
+
+	if deps.goos == "windows" {
+		stateMountPoint, err := webdavMountStatePoint(deps.goos, mountPoint)
+		if err != nil {
+			deps.unmount(deps.goos, mountPoint)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(ctx)
+			return err
+		}
+		processState := mountstate.ProcessState{PID: os.Getpid()}
+		processState.CreationTime, err = processCreationTimeByPID(processState.PID)
+		if err != nil {
+			deps.unmount(deps.goos, mountPoint)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(ctx)
+			return fmt.Errorf("webdav: inspect mount process state: %w", err)
+		}
+		pidFile, err := mountstate.WriteProcessState(stateMountPoint, processState)
+		if err != nil {
+			deps.unmount(deps.goos, mountPoint)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(ctx)
+			return fmt.Errorf("webdav: write mount pid file: %w", err)
+		}
+		defer func() {
+			if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "drive9: remove mount pid file %s: %v\n", pidFile, err)
+			}
+		}()
 	}
 
 	fmt.Fprintf(os.Stderr, "drive9: mounted on %s via WebDAV (server: %s)\n", mountPoint, serverURL)
@@ -217,36 +261,52 @@ func runWebDAVMountCmd(goos, serverURL, mountPoint string) error {
 	return mountCmd.Run()
 }
 
-// explainMountError turns the opaque "exit status N" from mount_webdav into
-// an actionable message. The underlying error is preserved via %w so callers
+// explainMountError turns the opaque mount helper exit status into an
+// actionable message. The underlying error is preserved via %w so callers
 // (and tests) can still match on it.
 func explainMountError(goos, mountPoint string, err error) error {
+	helper := webdavMountHelperName(goos)
 	hint := mountErrorHint(goos, mountPoint, err)
 	if hint == "" {
-		return fmt.Errorf("webdav: mount_webdav failed: %w", err)
+		return fmt.Errorf("webdav: %s failed: %w", helper, err)
 	}
-	return fmt.Errorf("webdav: mount_webdav failed: %w\n  %s", err, hint)
+	return fmt.Errorf("webdav: %s failed: %w\n  %s", helper, err, hint)
 }
 
-// mountErrorHint returns a human-readable explanation for known mount_webdav
-// exit codes on macOS. Returns "" when no specific hint applies.
+// mountErrorHint returns a human-readable explanation for known WebDAV mount
+// helper exit codes on macOS and Windows. Returns "" when no specific hint
+// applies.
 //
-// Codes follow mount_webdav(8) DIAGNOSTICS: ENOENT (invalid node path),
-// ENODEV (server not WebDAV-enabled, missing, or inaccessible), ECANCELED
-// (auth canceled). EBUSY surfaces when a mount already covers the point.
+// On macOS, codes follow mount_webdav(8) DIAGNOSTICS: ENOENT (invalid node
+// path), ENODEV (server not WebDAV-enabled, missing, or inaccessible),
+// ECANCELED (auth canceled). EBUSY surfaces when a mount already covers the
+// point.
 func mountErrorHint(goos, mountPoint string, err error) string {
-	if goos != "darwin" {
-		return ""
-	}
 	var ee *exec.ExitError
 	if !errors.As(err, &ee) {
+		return ""
+	}
+	if goos == "windows" {
+		switch ee.ExitCode() {
+		case 5:
+			return fmt.Sprintf("Windows denied access while mounting %q. If this drive letter is already in use, unmap it first. Otherwise ensure the WebClient service is running and the current user can create network drives.", mountPoint)
+		case 67:
+			return "Windows WebDAV redirector could not find the WebDAV endpoint. Ensure the WebClient service is running and the local drive9 WebDAV bridge is reachable."
+		case 1244:
+			return "Windows WebDAV redirector could not authenticate to the WebDAV endpoint. Re-run the command after ensuring the WebClient service is running and no stale credentials are cached."
+		case 224:
+			return "Windows WebDAV redirector blocked the site as untrusted. Add the drive9 WebDAV URL to Trusted Sites or use a host the WebClient service trusts."
+		}
+		return ""
+	}
+	if goos != "darwin" {
 		return ""
 	}
 	switch ee.ExitCode() {
 	case 2: // ENOENT
 		return fmt.Sprintf("mount point %q does not exist or is not accessible.", mountPoint)
 	case 16: // EBUSY
-		return fmt.Sprintf("mount point %q is busy — a filesystem may already be mounted there. Run `mount | grep %q` and `drive9 umount %s` to clean up.", mountPoint, mountPoint, mountPoint)
+		return fmt.Sprintf("mount point %q is busy - a filesystem may already be mounted there. Run `mount | grep %q` and `drive9 umount %s` to clean up.", mountPoint, mountPoint, mountPoint)
 	case 19: // ENODEV
 		return fmt.Sprintf("the kernel rejected the WebDAV mount at %q (ENODEV). Common causes: a stale mount still attached at this path (try `mount | grep %q` then `drive9 umount %s`); the local WebDAV bridge was unreachable; or the mount point is on a filesystem that does not support WebDAV mounts (e.g. some network volumes). Try a fresh path under your home directory.", mountPoint, mountPoint, mountPoint)
 	case 77: // ECANCELED
@@ -255,8 +315,25 @@ func mountErrorHint(goos, mountPoint string, err error) string {
 	return ""
 }
 
+func webdavMountHelperName(goos string) string {
+	switch goos {
+	case "windows":
+		return "net use"
+	case "linux":
+		return "mount.davfs"
+	default:
+		return "mount_webdav"
+	}
+}
+
 // webdavMountCmd builds the OS command to mount a WebDAV URL at mountPoint.
 func webdavMountCmd(goos, serverURL, mountPoint string) (*exec.Cmd, error) {
+	normalizedMountPoint, err := normalizeWebDAVMountPoint(goos, mountPoint)
+	if err != nil {
+		return nil, err
+	}
+	mountPoint = normalizedMountPoint
+
 	switch goos {
 	case "darwin":
 		// -S suppresses auth UI dialogs and auto-unmounts on disconnect.
@@ -267,9 +344,42 @@ func webdavMountCmd(goos, serverURL, mountPoint string) (*exec.Cmd, error) {
 			return exec.Command("mount.davfs", serverURL, mountPoint), nil
 		}
 		return nil, fmt.Errorf("webdav: no WebDAV mount utility found on Linux (install davfs2)")
+	case "windows":
+		return exec.Command("net", "use", mountPoint, strings.TrimRight(serverURL, "/"), "/persistent:no"), nil
 	default:
 		return nil, fmt.Errorf("webdav: unsupported OS %q", goos)
 	}
+}
+
+func normalizeWebDAVMountPoint(goos, mountPoint string) (string, error) {
+	mountPoint = strings.TrimSpace(mountPoint)
+	if mountPoint == "" {
+		return "", fmt.Errorf("webdav: mount point is required")
+	}
+	if goos != "windows" {
+		return mountPoint, nil
+	}
+	if len(mountPoint) >= 2 {
+		drive := mountPoint[0]
+		rest := mountPoint[2:]
+		if ((drive >= 'a' && drive <= 'z') || (drive >= 'A' && drive <= 'Z')) && mountPoint[1] == ':' {
+			if rest == "" || rest == "\\" || rest == "/" {
+				return strings.ToUpper(mountPoint[:1]) + ":", nil
+			}
+		}
+	}
+	return "", fmt.Errorf("webdav: Windows mount point must be a drive letter like \"X:\"")
+}
+
+func webdavMountStatePoint(goos, mountPoint string) (string, error) {
+	normalizedMountPoint, err := normalizeWebDAVMountPoint(goos, mountPoint)
+	if err != nil {
+		return "", err
+	}
+	if goos == "windows" {
+		return normalizedMountPoint + `\`, nil
+	}
+	return normalizedMountPoint, nil
 }
 
 func newWebDAVNoncePrefix() (string, error) {
@@ -314,14 +424,29 @@ func waitForWebDAVReady(ctx context.Context, serverURL string) error {
 	}
 }
 
-// webdavUnmount detaches the WebDAV mount.
-func webdavUnmount(goos, mountPoint string) {
-	var cmd *exec.Cmd
+func webdavUnmountCmd(goos, mountPoint string) (*exec.Cmd, error) {
+	normalizedMountPoint, err := normalizeWebDAVMountPoint(goos, mountPoint)
+	if err != nil {
+		return nil, err
+	}
+	mountPoint = normalizedMountPoint
+
 	switch goos {
 	case "darwin":
-		cmd = exec.Command("umount", mountPoint)
+		return exec.Command("umount", mountPoint), nil
+	case "windows":
+		return exec.Command("net", "use", mountPoint, "/delete", "/y"), nil
 	default:
-		cmd = exec.Command("umount", mountPoint)
+		return exec.Command("umount", mountPoint), nil
+	}
+}
+
+// webdavUnmount detaches the WebDAV mount.
+func webdavUnmount(goos, mountPoint string) {
+	cmd, err := webdavUnmountCmd(goos, mountPoint)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "drive9: webdav unmount failed: %v\n", err)
+		return
 	}
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
