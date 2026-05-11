@@ -54,13 +54,16 @@ CREATE TABLE IF NOT EXISTS inodes (
     mode         INT UNSIGNED NOT NULL DEFAULT 420,  -- decimal 420 = octal 0644
     status       VARCHAR(32) NOT NULL DEFAULT 'PENDING',
     created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    confirmed_at DATETIME(3),
+    mtime        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),  -- last modification time
+    confirmed_at DATETIME(3),  -- first confirmation time (may differ from mtime)
     expires_at   DATETIME(3)
 );
 CREATE INDEX idx_status ON inodes(status, created_at);
 ```
 
 **`mode` stores permission bits only** (low 12 bits: setuid/setgid/sticky + `rwxrwxrwx`). File-type bits (`S_IFREG`, `S_IFDIR`) are **not** stored; they are derived from `file_nodes.is_directory` at read time.
+
+**`mtime` semantics:** `mtime` is updated on every content overwrite (alongside `size_bytes` and `revision` in the `UPDATE inodes` transaction). It is the POSIX "last modification time". `confirmed_at` retains its original meaning: "when the file was first confirmed." For directories, `mtime` is updated on `Mkdir` and `chmod`.
 
 ### 2.3 `contents` (Storage Blob Metadata)
 
@@ -133,7 +136,7 @@ CREATE UNIQUE INDEX uk_file_gc_inode_id ON file_gc_tasks(inode_id);
 | `revision` | `inodes` | Optimistic locking |
 | `mode` | `inodes` | POSIX permissions |
 | `status` | `inodes` | Lifecycle |
-| `created_at`, `confirmed_at`, `expires_at` | `inodes` | Timestamps |
+| `created_at`, `mtime`, `confirmed_at`, `expires_at` | `inodes` | Timestamps |
 | `storage_type`, `storage_ref` | `contents` | Blob reference |
 | `storage_encryption_mode`, `storage_encryption_key_id` | `contents` | Encryption |
 | `content_blob` | `contents` | Inline payload |
@@ -304,7 +307,8 @@ To avoid `create + chmod` double RPC:
 BEGIN;
   -- 1. Gate + update inode metadata (optimistic lock)
   UPDATE inodes
-  SET size_bytes = ?, revision = revision + 1, status = 'CONFIRMED', confirmed_at = ?
+  SET size_bytes = ?, revision = revision + 1, status = 'CONFIRMED',
+      mtime = ?, confirmed_at = COALESCE(confirmed_at, ?)
   WHERE inode_id = ? AND revision = ? AND status = 'CONFIRMED';
   -- (check affected rows == 1; if not, abort)
 
@@ -373,7 +377,9 @@ ORDER BY distance LIMIT ?
 
 **Key concern:** The stale-check `embedding_revision = revision` now spans two tables. In PostgreSQL, this may prevent the planner from using the `hnsw` index if the join order is suboptimal.
 
-**Mitigation:** Add a composite index on `semantic(embedding_revision, inode_id)` so the stale-check can be evaluated efficiently before or alongside the vector scan.
+**Mitigation (current):** Add an index on `semantic(embedding_revision)` so the stale-check filter can be evaluated alongside the vector index scan without forcing a full PK lookup per candidate row.
+
+**Alternative (future):** Add `embedding_stale BOOLEAN DEFAULT TRUE` to `semantic`. Set `TRUE` on content overwrite, `FALSE` when the embedding worker completes. The stale-check becomes a single-table predicate: `WHERE s.embedding IS NOT NULL AND NOT s.embedding_stale`. This eliminates the cross-table comparison entirely. Deferred to Phase 2 because it adds a new column and requires updating the semantic worker.
 
 **Overall assessment:** The three-table JOIN adds one extra PK lookup per result row. For typical result sets (< 100 rows), the overhead is negligible (< 1 ms). The bigger win is that `ListDir` no longer fetches `content_blob` or embedding vectors, which dominates current listing latency.
 
@@ -381,7 +387,11 @@ ORDER BY distance LIMIT ?
 
 ### 5.1 No explicit `nlink` column (with quantitative analysis)
 
-Refcount is computed on demand: `SELECT COUNT(*) FROM file_nodes WHERE inode_id = ?`.
+Refcount is computed on demand with locking:
+```sql
+SELECT COUNT(*) FROM file_nodes WHERE inode_id = ? FOR UPDATE;
+```
+The `FOR UPDATE` lock on matching `file_nodes` rows prevents concurrent `CopyFile` (hardlink creation) from racing with deletion.
 
 **Cost analysis:**
 - A single `COUNT(*)` with an index on `file_nodes.inode_id` is an **index-only scan** in both TiDB and PostgreSQL.
@@ -446,17 +456,20 @@ FROM files WHERE status != 'DELETED';
 --   ON CONFLICT (inode_id) DO NOTHING;
 
 -- 3. Create directory inode records (idempotent)
--- TiDB / MySQL:
-INSERT IGNORE INTO inodes (inode_id, size_bytes, revision, mode, status, created_at, confirmed_at)
-SELECT node_id, 0, 1, 493, 'CONFIRMED', created_at, created_at
+-- Pre-migration validation: confirm how many directories have NULL file_id
+--   SELECT COUNT(*) FROM file_nodes WHERE is_directory = 1 AND file_id IS NULL;
+--
+-- TiDB / MySQL (use current column name file_id):
+INSERT IGNORE INTO inodes (inode_id, size_bytes, revision, mode, status, created_at, mtime, confirmed_at)
+SELECT node_id, 0, 1, 493, 'CONFIRMED', created_at, created_at, created_at
 FROM file_nodes WHERE is_directory = 1;
 -- db9 / PostgreSQL:
--- INSERT INTO inodes (inode_id, size_bytes, revision, mode, status, created_at, confirmed_at)
--- SELECT node_id, 0, 1, 493, 'CONFIRMED', created_at, created_at
+-- INSERT INTO inodes (inode_id, size_bytes, revision, mode, status, created_at, mtime, confirmed_at)
+-- SELECT node_id, 0, 1, 493, 'CONFIRMED', created_at, created_at, created_at
 -- FROM file_nodes WHERE is_directory = 1
 -- ON CONFLICT (inode_id) DO NOTHING;
 
-UPDATE file_nodes SET inode_id = node_id WHERE is_directory = 1 AND inode_id IS NULL;
+UPDATE file_nodes SET file_id = node_id WHERE is_directory = 1 AND file_id IS NULL;
 
 -- 4. Rename columns
 -- TiDB / MySQL:
@@ -481,6 +494,28 @@ ALTER TABLE file_gc_tasks CHANGE file_id inode_id VARCHAR(64) NOT NULL;
 ```
 
 **Rollback path:** If issues are found after switching to new tables, the application can be rolled back to the old code path which still reads from `files`. The new tables (`inodes`, `contents`, `semantic`) are additive and do not modify `files` data.
+
+**Data consistency verification (post-migration, pre-switch):**
+```sql
+-- Verify every file_node has a matching inode
+SELECT COUNT(*) FROM file_nodes fn
+LEFT JOIN inodes i ON fn.inode_id = i.inode_id
+WHERE i.inode_id IS NULL;
+-- Expected: 0
+
+-- Verify every file has a matching contents row
+SELECT COUNT(*) FROM file_nodes fn
+JOIN inodes i ON fn.inode_id = i.inode_id
+LEFT JOIN contents c ON i.inode_id = c.inode_id
+WHERE c.inode_id IS NULL AND fn.is_directory = 0;
+-- Expected: 0
+
+-- Spot-check: compare old vs new mode/size values
+SELECT f.file_id, f.size_bytes, f.status, i.size_bytes, i.status, i.mode
+FROM files f JOIN inodes i ON f.file_id = i.inode_id
+WHERE f.size_bytes != i.size_bytes OR f.status != i.status
+LIMIT 10;
+```
 
 ## 7. Implementation Order
 
