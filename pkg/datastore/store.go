@@ -522,6 +522,17 @@ func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() 
 		dirPath := ancestors[i]
 		pp := parentPath(dirPath)
 		name := baseName(dirPath)
+
+		// Check if the directory already exists to avoid leaking orphan inodes.
+		var existingNodeID string
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT node_id FROM file_nodes WHERE path = ? AND is_directory = 1`,
+			dirPath).Scan(&existingNodeID); err == nil {
+			continue
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check parent dir %s: %w", dirPath, err)
+		}
+
 		nodeID := genID()
 		_, err := s.db.ExecContext(ctx, `INSERT IGNORE INTO inodes
 			(inode_id, size_bytes, revision, mode, status, created_at, mtime)
@@ -971,6 +982,17 @@ func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) 
 		dirPath := ancestors[i]
 		pp := parentPath(dirPath)
 		name := baseName(dirPath)
+
+		// Check if the directory already exists to avoid leaking orphan inodes.
+		var existingNodeID string
+		if err := db.QueryRow(
+			`SELECT node_id FROM file_nodes WHERE path = ? AND is_directory = 1`,
+			dirPath).Scan(&existingNodeID); err == nil {
+			continue
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check parent dir %s: %w", dirPath, err)
+		}
+
 		nodeID := genID()
 		_, err := db.Exec(`INSERT IGNORE INTO inodes
 			(inode_id, size_bytes, revision, mode, status, created_at, mtime)

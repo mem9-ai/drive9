@@ -817,9 +817,42 @@ func TestEnsureParentDirs(t *testing.T) {
 			t.Errorf("expected %s to be directory", p)
 		}
 	}
-	// Idempotent
+
+	// Count directory inodes before the idempotent re-call.
+	var before int64
+	if err := s.DB().QueryRow(`
+		SELECT COUNT(*) FROM inodes i
+		JOIN file_nodes fn ON i.inode_id = fn.inode_id
+		WHERE fn.is_directory = 1`).Scan(&before); err != nil {
+		t.Fatalf("count dir inodes before: %v", err)
+	}
+
+	// Idempotent: second call must not create orphan inodes.
 	if err := s.EnsureParentDirs(context.Background(), "/a/b/c/file.txt", genID); err != nil {
 		t.Fatal(err)
+	}
+
+	var after int64
+	if err := s.DB().QueryRow(`
+		SELECT COUNT(*) FROM inodes i
+		JOIN file_nodes fn ON i.inode_id = fn.inode_id
+		WHERE fn.is_directory = 1`).Scan(&after); err != nil {
+		t.Fatalf("count dir inodes after: %v", err)
+	}
+	if after != before {
+		t.Errorf("orphan inodes leaked: dir inode count before=%d after=%d", before, after)
+	}
+
+	// Verify there are no orphan inodes at all.
+	var orphanCount int64
+	if err := s.DB().QueryRow(`
+		SELECT COUNT(*) FROM inodes i
+		LEFT JOIN file_nodes fn ON i.inode_id = fn.inode_id
+		WHERE fn.inode_id IS NULL`).Scan(&orphanCount); err != nil {
+		t.Fatalf("count orphan inodes: %v", err)
+	}
+	if orphanCount != 0 {
+		t.Errorf("found %d orphan inodes (inodes with no file_nodes reference)", orphanCount)
 	}
 }
 

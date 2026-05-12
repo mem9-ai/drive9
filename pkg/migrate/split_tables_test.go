@@ -182,6 +182,74 @@ func TestSplitTablesMigratorPartialMigrationRerun(t *testing.T) {
 	}
 }
 
+func TestSplitTablesMigratorAlreadyComplete(t *testing.T) {
+	s, err := datastore.Open(testDSN)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	ctx := context.Background()
+	testmysql.ResetDB(t, s.DB())
+
+	// Insert a file via the old path (this also dual-writes to split tables)
+	f := &datastore.File{
+		FileID:      "file1",
+		StorageType: datastore.StorageDB9,
+		StorageRef:  "ref1",
+		SizeBytes:   100,
+		Revision:    1,
+		Status:      datastore.StatusConfirmed,
+		CreatedAt:   time.Now(),
+	}
+	if err := s.InsertFile(ctx, f); err != nil {
+		t.Fatalf("insert file: %v", err)
+	}
+
+	// Clear split tables so the first Run has actual work to do.
+	db := s.DB()
+	if _, err := db.Exec("DELETE FROM inodes"); err != nil {
+		t.Fatalf("clear inodes: %v", err)
+	}
+	if _, err := db.Exec("DELETE FROM contents"); err != nil {
+		t.Fatalf("clear contents: %v", err)
+	}
+	if _, err := db.Exec("DELETE FROM semantic"); err != nil {
+		t.Fatalf("clear semantic: %v", err)
+	}
+
+	m := NewSplitTablesMigrator(db)
+
+	// First run: migrates data
+	res1, err := m.Run(ctx)
+	if err != nil {
+		t.Fatalf("first migration failed: %v", err)
+	}
+	if res1.InodesMigrated != 1 {
+		t.Errorf("first run inodes = %d, want 1", res1.InodesMigrated)
+	}
+
+	// Second run: should detect completion and skip all work
+	res2, err := m.Run(ctx)
+	if err != nil {
+		t.Fatalf("second migration failed: %v", err)
+	}
+	if res2.InodesMigrated != 0 {
+		t.Errorf("second run inodes = %d, want 0 (already complete)", res2.InodesMigrated)
+	}
+	if res2.ContentsMigrated != 0 {
+		t.Errorf("second run contents = %d, want 0 (already complete)", res2.ContentsMigrated)
+	}
+	if res2.SemanticMigrated != 0 {
+		t.Errorf("second run semantic = %d, want 0 (already complete)", res2.SemanticMigrated)
+	}
+	if res2.DirInodesCreated != 0 {
+		t.Errorf("second run dir inodes = %d, want 0 (already complete)", res2.DirInodesCreated)
+	}
+	if res2.SharedColsUpdated != 0 {
+		t.Errorf("second run shared cols = %d, want 0 (already complete)", res2.SharedColsUpdated)
+	}
+}
+
 func TestSplitTablesMigratorMissingTables(t *testing.T) {
 	s, err := datastore.Open(testDSN)
 	if err != nil {

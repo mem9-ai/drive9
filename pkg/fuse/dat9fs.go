@@ -1828,10 +1828,18 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		mode := input.Mode & 0777
 		// If the file has an open dirty handle, update mode locally without
 		// consulting the remote server. The mode will be synced on Flush.
+		// Use a single ForEach pass to avoid a TOCTOU race between the check
+		// and the mutation.
 		hasDirtyHandle := false
 		fs.fileHandles.ForEach(func(_ uint64, h *FileHandle) {
 			if h.Ino == input.NodeId && h.Dirty != nil {
 				hasDirtyHandle = true
+				h.PendingMode = mode
+				h.HasPendingMode = true
+				if !h.HasPreviousMode {
+					h.PreviousMode = entry.Mode
+					h.HasPreviousMode = true
+				}
 			}
 		})
 		if !hasDirtyHandle {
@@ -1840,18 +1848,6 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			if err := fs.client.ChmodCtx(ctx, fs.remotePath(entry.Path), mode); err != nil {
 				return httpToFuseStatus(err)
 			}
-		} else {
-			// Defer chmod until Release flushes the dirty handle.
-			fs.fileHandles.ForEach(func(_ uint64, h *FileHandle) {
-				if h.Ino == input.NodeId && h.Dirty != nil {
-					h.PendingMode = mode
-					h.HasPendingMode = true
-					if !h.HasPreviousMode {
-						h.PreviousMode = entry.Mode
-						h.HasPreviousMode = true
-					}
-				}
-			})
 		}
 		entry.Mode = mode
 		fs.inodes.UpdateMode(input.NodeId, mode)

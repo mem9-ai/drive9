@@ -73,6 +73,60 @@ func (m *SplitTablesMigrator) requiredTablesExist(ctx context.Context) (bool, er
 	return true, nil
 }
 
+// isMigrationComplete checks whether all legacy data has already been migrated
+// to the split tables and all directory inodes are linked. When true, Run
+// returns immediately without doing any work.
+func (m *SplitTablesMigrator) isMigrationComplete(ctx context.Context) (bool, error) {
+	// Check 1: any legacy files not yet migrated to inodes.
+	var fileCount int64
+	err := m.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM files f
+		WHERE f.status != 'DELETED'
+		  AND f.file_id NOT IN (SELECT inode_id FROM inodes)`).Scan(&fileCount)
+	if err != nil {
+		return false, fmt.Errorf("check unmigrated inodes: %w", err)
+	}
+	if fileCount > 0 {
+		return false, nil
+	}
+
+	// Check 2: any legacy files not yet migrated to contents.
+	var contentCount int64
+	err = m.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM files f
+		WHERE f.status != 'DELETED'
+		  AND f.file_id NOT IN (SELECT inode_id FROM contents)`).Scan(&contentCount)
+	if err != nil {
+		return false, fmt.Errorf("check unmigrated contents: %w", err)
+	}
+	if contentCount > 0 {
+		return false, nil
+	}
+
+	// Check 3: any legacy files not yet migrated to semantic.
+	var semanticCount int64
+	err = m.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM files f
+		WHERE f.status != 'DELETED'
+		  AND f.file_id NOT IN (SELECT inode_id FROM semantic)`).Scan(&semanticCount)
+	if err != nil {
+		return false, fmt.Errorf("check unmigrated semantic: %w", err)
+	}
+	if semanticCount > 0 {
+		return false, nil
+	}
+
+	// Check 4: any directories without a linked inode_id.
+	var dirCount int64
+	err = m.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM file_nodes
+		WHERE is_directory = 1 AND inode_id IS NULL`).Scan(&dirCount)
+	if err != nil {
+		return false, fmt.Errorf("check orphan directories: %w", err)
+	}
+	return dirCount == 0, nil
+}
+
 // Run executes the migration. It is idempotent — re-running is safe.
 func (m *SplitTablesMigrator) Run(ctx context.Context) (*Result, error) {
 	start := time.Now()
@@ -86,6 +140,16 @@ func (m *SplitTablesMigrator) Run(ctx context.Context) (*Result, error) {
 	}
 	if !ok {
 		return nil, fmt.Errorf("required split tables (inodes, contents, semantic) do not exist; run schema initialization first")
+	}
+
+	// Fast path: if all legacy data is already migrated, skip the heavy work.
+	complete, err := m.isMigrationComplete(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("check migration completeness: %w", err)
+	}
+	if complete {
+		logger.Info(ctx, "migrate_split_tables_already_complete")
+		return res, nil
 	}
 
 	logger.Info(ctx, "migrate_split_tables_started")
