@@ -1055,7 +1055,7 @@ func TestChmod(t *testing.T) {
 	}
 }
 
-func TestMkdirWithPerm(t *testing.T) {
+func TestMkdirDirectory(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()
 	ctx := context.Background()

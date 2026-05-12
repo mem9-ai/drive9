@@ -258,22 +258,31 @@ func (b *Dat9Backend) MkdirCtx(ctx context.Context, path string, perm uint32) (e
 	}
 	now := time.Now()
 	nodeID := b.genID()
-	if err := b.store.InsertInode(ctx, &datastore.Inode{
-		InodeID:   nodeID,
-		SizeBytes: 0,
-		Revision:  1,
-		Mode:      perm,
-		Status:    datastore.StatusConfirmed,
-		CreatedAt: now,
-		Mtime:     now,
+	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.store.InsertInodeTx(tx, &datastore.Inode{
+			InodeID:   nodeID,
+			SizeBytes: 0,
+			Revision:  1,
+			Mode:      perm,
+			Status:    datastore.StatusConfirmed,
+			CreatedAt: now,
+			Mtime:     now,
+		}); err != nil {
+			return err
+		}
+		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+			NodeID:      b.genID(),
+			Path:        dirPath,
+			ParentPath:  pathutil.ParentPath(dirPath),
+			Name:        pathutil.BaseName(dirPath),
+			IsDirectory: true,
+			InodeID:     nodeID,
+			CreatedAt:   now,
+		})
 	}); err != nil {
 		return err
 	}
-	err = b.store.InsertNode(ctx, &datastore.FileNode{
-		NodeID: b.genID(), Path: dirPath, ParentPath: pathutil.ParentPath(dirPath),
-		Name: pathutil.BaseName(dirPath), IsDirectory: true, InodeID: nodeID, CreatedAt: now,
-	})
-	return err
+	return nil
 }
 
 func (b *Dat9Backend) Chmod(path string, mode uint32) error {
@@ -284,11 +293,11 @@ func (b *Dat9Backend) ChmodCtx(ctx context.Context, path string, mode uint32) (e
 	start := time.Now()
 	defer func() { observeBackend(ctx, "chmod", err, start) }()
 
-	path, err = pathutil.Canonicalize(path)
+	resolvedPath, _, err := b.resolveNodePath(ctx, path)
 	if err != nil {
 		return err
 	}
-	return b.store.Chmod(ctx, path, mode)
+	return b.store.Chmod(ctx, resolvedPath, mode)
 }
 
 func (b *Dat9Backend) Remove(path string) error {

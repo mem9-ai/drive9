@@ -3,6 +3,7 @@ package datastore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -70,6 +71,9 @@ func scanSemantic(row *sql.Row) (*Semantic, error) {
 	var embRev, descEmbRev sql.NullInt64
 	err := row.Scan(&sem.InodeID, &contentText, &description, &embRev, &descEmbRev)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
 		return nil, fmt.Errorf("scan semantic: %w", err)
 	}
 	sem.ContentText = contentText.String

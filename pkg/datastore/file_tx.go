@@ -162,7 +162,7 @@ func (s *Store) UpdateFileStorageEncryptionTx(db execer, fileID string, mode Sto
 		if rowsAffected == 0 {
 			var exists int
 			if err := db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ?`, fileID).Scan(&exists); err != nil {
-				if err == sql.ErrNoRows {
+				if errors.Is(err, sql.ErrNoRows) {
 					return ErrNotFound
 				}
 				return err
@@ -171,7 +171,7 @@ func (s *Store) UpdateFileStorageEncryptionTx(db execer, fileID string, mode Sto
 	} else {
 		var exists int
 		if err := db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ?`, fileID).Scan(&exists); err != nil {
-			if err == sql.ErrNoRows {
+			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
 			return err
@@ -241,7 +241,14 @@ func (s *Store) ConfirmPendingFileTx(db execer, fileID string, storageType Stora
 	if err := s.UpdateInodeContentTx(db, fileID, size, 1, StatusConfirmed, now); err != nil {
 		return fmt.Errorf("update inode: %w", err)
 	}
-	if err := s.UpdateContentTx(db, fileID, storageType, storageRef, contentType, "", nil, StorageEncryptionLegacy); err != nil {
+	var encMode StorageEncryptionMode
+	if err := db.QueryRow(`SELECT storage_encryption_mode FROM contents WHERE inode_id = ?`, fileID).Scan(&encMode); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("read content encryption: %w", err)
+		}
+		encMode = StorageEncryptionLegacy
+	}
+	if err := s.UpdateContentTx(db, fileID, storageType, storageRef, contentType, "", nil, encMode); err != nil {
 		return fmt.Errorf("update content: %w", err)
 	}
 	if err := s.UpdateSemanticTx(db, fileID, "", description); err != nil {
@@ -292,7 +299,14 @@ func (s *Store) ConfirmPendingFileAutoEmbeddingTx(db execer, fileID string, stor
 	if err := s.UpdateInodeContentTx(db, fileID, size, 1, StatusConfirmed, now); err != nil {
 		return fmt.Errorf("update inode: %w", err)
 	}
-	if err := s.UpdateContentTx(db, fileID, storageType, storageRef, contentType, "", nil, StorageEncryptionLegacy); err != nil {
+	var encMode StorageEncryptionMode
+	if err := db.QueryRow(`SELECT storage_encryption_mode FROM contents WHERE inode_id = ?`, fileID).Scan(&encMode); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("read content encryption: %w", err)
+		}
+		encMode = StorageEncryptionLegacy
+	}
+	if err := s.UpdateContentTx(db, fileID, storageType, storageRef, contentType, "", nil, encMode); err != nil {
 		return fmt.Errorf("update content: %w", err)
 	}
 	if description != "" {
@@ -309,12 +323,20 @@ func (s *Store) ConfirmPendingFileAutoEmbeddingTx(db execer, fileID string, stor
 func (s *Store) DeletePendingFileTx(db execer, fileID string) error {
 	now := time.Now().UTC()
 	if s.useLegacyFiles {
-		if _, err := db.Exec(`UPDATE files SET status = 'DELETED', storage_ref = '' WHERE file_id = ?`, fileID); err != nil {
+		res, err := db.Exec(`UPDATE files SET status = 'DELETED', storage_ref = '' WHERE file_id = ? AND status = 'PENDING'`, fileID)
+		if err != nil {
 			return err
 		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrNotFound
+		}
 	}
-	if _, err := db.Exec(`UPDATE inodes SET status = 'DELETED', mtime = ? WHERE inode_id = ?`, now, fileID); err != nil {
+	res, err := db.Exec(`UPDATE inodes SET status = 'DELETED', mtime = ? WHERE inode_id = ? AND status = 'PENDING'`, now, fileID)
+	if err != nil {
 		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
 	}
 	if _, err := db.Exec(`UPDATE contents SET storage_ref = '' WHERE inode_id = ?`, fileID); err != nil {
 		return err
@@ -339,7 +361,7 @@ func (s *Store) ClearFileEmbeddingStateTx(db execer, fileID string) error {
 	} else {
 		var exists int
 		if err := db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ?`, fileID).Scan(&exists); err != nil {
-			if err == sql.ErrNoRows {
+			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
 			return err

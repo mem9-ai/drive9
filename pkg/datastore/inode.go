@@ -3,6 +3,7 @@ package datastore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -82,6 +83,9 @@ func scanInode(row *sql.Row) (*Inode, error) {
 	err := row.Scan(&inode.InodeID, &inode.SizeBytes, &inode.Revision, &inode.Mode, &inode.Status,
 		&inode.CreatedAt, &inode.Mtime, &confirmedAt, &expiresAt)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
 		return nil, fmt.Errorf("scan inode: %w", err)
 	}
 	inode.ConfirmedAt = nullTimeValue(confirmedAt)

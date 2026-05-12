@@ -105,7 +105,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 		`CREATE TABLE IF NOT EXISTS uploads (
 			upload_id          VARCHAR(64) PRIMARY KEY,
 			file_id            VARCHAR(64) NOT NULL,
-			inode_id           VARCHAR(64),,
+			inode_id           VARCHAR(64),
 			target_path        VARCHAR(512) NOT NULL,
 			s3_upload_id       VARCHAR(255) NOT NULL,
 			s3_key             VARCHAR(2048) NOT NULL,
@@ -152,7 +152,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 		`CREATE TABLE IF NOT EXISTS file_gc_tasks (
 			task_id       VARCHAR(64) PRIMARY KEY,
 			file_id       VARCHAR(64) NOT NULL,
-			inode_id      VARCHAR(64),,
+			inode_id      VARCHAR(64),
 			storage_type  VARCHAR(32) NOT NULL,
 			storage_ref   TEXT NOT NULL,
 			size_bytes    BIGINT NOT NULL DEFAULT 0,

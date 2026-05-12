@@ -3,6 +3,7 @@ package datastore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -76,6 +77,9 @@ func scanContent(row *sql.Row) (*Content, error) {
 		&encryptionMode, &c.StorageEncryptionKeyID,
 		&c.ContentBlob, &contentType, &checksum, &sourceID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
 		return nil, fmt.Errorf("scan content: %w", err)
 	}
 	c.StorageEncryptionMode = StorageEncryptionMode(encryptionMode)

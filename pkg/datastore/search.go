@@ -271,6 +271,7 @@ func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit i
 		outerArgs = append(outerArgs, pargs...)
 	}
 
+	outerConds = append([]string{"i.status = 'CONFIRMED'"}, outerConds...)
 	q := `SELECT fn.path, fn.name, i.size_bytes, fts.score
 		FROM (` + innerQ + `) fts
 		JOIN file_nodes fn ON COALESCE(fn.inode_id, fn.file_id) = fts.inode_id

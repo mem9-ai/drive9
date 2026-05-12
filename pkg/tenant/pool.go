@@ -413,11 +413,14 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			ensureSchemaDurationMs = float64(time.Since(validateSchemaStart).Microseconds()) / 1000.0
 		}
 	}
-	// Run split-tables migration if needed. Idempotent — safe to re-run.
+	// Run split-tables migration if needed. Only for tenants that have the
+	// legacy files table; new tenants skip it entirely.
 	migrateStart := time.Now()
-	if err := p.migrateSplitTables(ctx, store.DB(), t.Provider); err != nil {
-		_ = store.Close()
-		return nil, nil, fmt.Errorf("migrate split tables: %w", err)
+	if store.HasLegacyFiles() {
+		if err := p.migrateSplitTables(ctx, store.DB(), t.Provider); err != nil {
+			_ = store.Close()
+			return nil, nil, fmt.Errorf("migrate split tables: %w", err)
+		}
 	}
 	migrateDurationMs = float64(time.Since(migrateStart).Microseconds()) / 1000.0
 	if p.cfg.S3Bucket != "" {

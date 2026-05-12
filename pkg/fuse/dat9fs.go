@@ -742,14 +742,14 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 
 	if entry.IsDir {
 		mode := entry.Mode
-		if mode == 0 {
+		if !entry.HasMode {
 			mode = 0755
 		}
 		out.Mode = syscall.S_IFDIR | mode
 		out.Nlink = 2
 	} else {
 		mode := entry.Mode
-		if mode == 0 {
+		if !entry.HasMode {
 			mode = 0644
 		}
 		out.Mode = syscall.S_IFREG | mode
@@ -1828,6 +1828,14 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			if err := fs.client.ChmodCtx(ctx, fs.remotePath(entry.Path), mode); err != nil {
 				return httpToFuseStatus(err)
 			}
+		} else {
+			// Defer chmod until Release flushes the dirty handle.
+			fs.fileHandles.ForEach(func(_ uint64, h *FileHandle) {
+				if h.Ino == input.NodeId && h.Dirty != nil {
+					h.PendingMode = mode
+					h.HasPendingMode = true
+				}
+			})
 		}
 		entry.Mode = mode
 		fs.inodes.UpdateMode(input.NodeId, mode)
@@ -3727,6 +3735,18 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	defer func() { fs.perfRecordFuse(perfFuseRelease, perfStart, releaseStatus, 0) }()
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
+		flushStatus := gofuse.OK
+		// Apply any deferred chmod after flush completes but before cleanup.
+		defer func() {
+			if fh.HasPendingMode && flushStatus == gofuse.OK {
+				ctx, cf := context.WithTimeout(context.Background(), 30*time.Second)
+				if err := fs.client.ChmodCtx(ctx, fs.remotePath(fh.Path), fh.PendingMode); err != nil {
+					log.Printf("release: pending chmod failed for %s: %v", fh.Path, err)
+				}
+				cf()
+				fh.HasPendingMode = false
+			}
+		}()
 		defer func() {
 			if fh.Prefetch != nil {
 				fh.Prefetch.Close()
@@ -3742,7 +3762,6 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 
 		start := time.Now()
 		phase := "start"
-		flushStatus := gofuse.OK
 		defer func() { releaseStatus = flushStatus }()
 		fs.debugf("release start path=%s fh=%d ino=%d", fh.Path, input.Fh, fh.Ino)
 		defer func() {

@@ -14,7 +14,8 @@ type InodeEntry struct {
 	Nlookup  int64 // kernel lookup reference count
 	Size     int64
 	Mtime    time.Time
-	Mode     uint32 // permission bits (0 means use default)
+	Mode     uint32 // permission bits
+	HasMode  bool   // true when mode is explicitly known (including 0)
 	Revision int64  // server-side revision for cache validation
 }
 
@@ -254,6 +255,7 @@ func (m *InodeToPath) UpdateMode(ino uint64, mode uint32) {
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Mode = mode
+		entry.HasMode = true
 	}
 }
 

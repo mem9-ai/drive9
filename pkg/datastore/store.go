@@ -147,7 +147,12 @@ func Open(dsn string) (*Store, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	s := &Store{db: db}
-	s.useLegacyFiles = s.detectLegacyFiles()
+	hasLegacy, err := s.detectLegacyFiles(context.Background())
+	if err != nil {
+		_ = mysqlutil.CloseInstrumented(db)
+		return nil, fmt.Errorf("detect legacy files table: %w", err)
+	}
+	s.useLegacyFiles = hasLegacy
 	return s, nil
 }
 
@@ -159,9 +164,15 @@ func (s *Store) DB() *sql.DB  { return s.db }
 // and only target the split tables (inodes / contents / semantic).
 func (s *Store) HasLegacyFiles() bool { return s.useLegacyFiles }
 
-func (s *Store) detectLegacyFiles() bool {
-	_, err := s.db.Exec(`SELECT 1 FROM files LIMIT 0`)
-	return err == nil
+func (s *Store) detectLegacyFiles(ctx context.Context) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM information_schema.tables
+		 WHERE table_schema = DATABASE() AND table_name = 'files'`).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // InTx runs fn inside a database transaction. If fn returns an error, the
@@ -627,11 +638,11 @@ func (s *Store) GetFile(ctx context.Context, fileID string) (out *File, err erro
 	}
 	content, contentErr := s.GetContent(ctx, fileID)
 	if contentErr != nil && !errors.Is(contentErr, sql.ErrNoRows) {
-		logger.Warn(ctx, "get content failed", zap.String("inode_id", fileID), zap.Error(contentErr))
+		return nil, fmt.Errorf("get content: %w", contentErr)
 	}
 	semantic, semanticErr := s.GetSemantic(ctx, fileID)
 	if semanticErr != nil && !errors.Is(semanticErr, sql.ErrNoRows) {
-		logger.Warn(ctx, "get semantic failed", zap.String("inode_id", fileID), zap.Error(semanticErr))
+		return nil, fmt.Errorf("get semantic: %w", semanticErr)
 	}
 	out = assembleFile(inode, content, semantic)
 	return out, nil
@@ -931,8 +942,15 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 		return ErrNotFound
 	}
 
-	_, err = s.db.ExecContext(ctx, `UPDATE inodes SET mode = ? WHERE inode_id = ?`, mode, inodeID)
-	return err
+	mode = mode & 0o777
+	res, err := s.db.ExecContext(ctx, `UPDATE inodes SET mode = ? WHERE inode_id = ? AND status = 'CONFIRMED'`, mode, inodeID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) error {
