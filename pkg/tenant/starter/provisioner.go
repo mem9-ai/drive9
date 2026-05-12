@@ -143,33 +143,34 @@ func (p *Provisioner) ProvisionBranch(ctx context.Context, forkTenantID string, 
 	if branch.BranchID == "" {
 		return nil, fmt.Errorf("starter branch response missing branch id")
 	}
-	if branch.State != "" && branch.State != "ACTIVE" {
-		branch, err = p.waitForBranchActive(ctx, source.ClusterID, branch.BranchID)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if branch.Endpoints.Public.Host == "" || branch.Endpoints.Public.Port == 0 {
-		return nil, fmt.Errorf("starter branch response missing endpoint")
-	}
-	if branch.UserPrefix == "" {
-		return nil, fmt.Errorf("starter branch response missing user prefix")
-	}
 	dbName := source.DBName
 	if dbName == "" {
 		dbName = "test"
 	}
-	return &tenant.ClusterInfo{
+	out := &tenant.ClusterInfo{
 		TenantID:  forkTenantID,
 		ClusterID: source.ClusterID,
 		BranchID:  branch.BranchID,
-		Host:      branch.Endpoints.Public.Host,
-		Port:      branch.Endpoints.Public.Port,
-		Username:  branch.UserPrefix + ".root",
 		Password:  password,
 		DBName:    dbName,
 		Provider:  tenant.ProviderTiDBCloudStarter,
-	}, nil
+	}
+	if branch.State != "" && branch.State != "ACTIVE" {
+		branch, err = p.waitForBranchActive(ctx, source.ClusterID, branch.BranchID)
+		if err != nil {
+			return out, err
+		}
+	}
+	if branch.Endpoints.Public.Host == "" || branch.Endpoints.Public.Port == 0 {
+		return out, fmt.Errorf("starter branch response missing endpoint")
+	}
+	if branch.UserPrefix == "" {
+		return out, fmt.Errorf("starter branch response missing user prefix")
+	}
+	out.Host = branch.Endpoints.Public.Host
+	out.Port = branch.Endpoints.Public.Port
+	out.Username = branch.UserPrefix + ".root"
+	return out, nil
 }
 
 func (p *Provisioner) DeleteBranch(ctx context.Context, clusterID, branchID string) error {

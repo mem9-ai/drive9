@@ -17,8 +17,9 @@ import (
 )
 
 type fakeBranchProvisioner struct {
-	cluster   *tenant.ClusterInfo
-	deleteErr error
+	cluster      *tenant.ClusterInfo
+	provisionErr error
+	deleteErr    error
 
 	mu      sync.Mutex
 	deleted []string
@@ -38,7 +39,7 @@ func (f *fakeBranchProvisioner) ProvisionBranch(_ context.Context, forkTenantID 
 	}
 	out := *f.cluster
 	out.TenantID = forkTenantID
-	return &out, nil
+	return &out, f.provisionErr
 }
 
 func (f *fakeBranchProvisioner) DeleteBranch(_ context.Context, clusterID, branchID string) error {
@@ -52,6 +53,16 @@ func (f *fakeBranchProvisioner) deletedBranches() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.deleted...)
+}
+
+type nonBranchOnlyProvisioner struct{}
+
+func (nonBranchOnlyProvisioner) ProviderType() string { return tenant.ProviderTiDBCloudStarter }
+
+func (nonBranchOnlyProvisioner) InitSchema(context.Context, string) error { return nil }
+
+func (nonBranchOnlyProvisioner) Provision(context.Context, string) (*tenant.ClusterInfo, error) {
+	return nil, fmt.Errorf("not implemented")
 }
 
 type forkCleanupTestRuntime struct {
@@ -129,6 +140,16 @@ func cleanupForkTestTables(t *testing.T, s *meta.Store) {
 
 func (rt *forkCleanupTestRuntime) insertForkTenant(t *testing.T, id string, status meta.TenantStatus, branchID string) {
 	t.Helper()
+	rt.insertTenant(t, id, status, meta.TenantKindFork, "parent", "ns-parent", branchID)
+}
+
+func (rt *forkCleanupTestRuntime) insertLiveTenant(t *testing.T, id string) {
+	t.Helper()
+	rt.insertTenant(t, id, meta.TenantActive, meta.TenantKindLive, "", "ns-parent", "source-branch")
+}
+
+func (rt *forkCleanupTestRuntime) insertTenant(t *testing.T, id string, status meta.TenantStatus, kind meta.TenantKind, parentID, namespaceID, branchID string) {
+	t.Helper()
 	ctx := context.Background()
 	passCipher, err := rt.pool.Encrypt(ctx, []byte(rt.dbPass))
 	if err != nil {
@@ -141,9 +162,9 @@ func (rt *forkCleanupTestRuntime) insertForkTenant(t *testing.T, id string, stat
 	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:                 id,
 		Status:             status,
-		Kind:               meta.TenantKindFork,
-		ParentTenantID:     "parent",
-		StorageNamespaceID: "ns-parent",
+		Kind:               kind,
+		ParentTenantID:     parentID,
+		StorageNamespaceID: namespaceID,
 		DBHost:             rt.dbHost,
 		DBPort:             rt.dbPort,
 		DBUser:             rt.dbUser,
@@ -158,6 +179,48 @@ func (rt *forkCleanupTestRuntime) insertForkTenant(t *testing.T, id string, stat
 		UpdatedAt:          now,
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func waitForCondition(t *testing.T, fn func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition did not become true")
+}
+
+func TestCreateForkPartialBranchProvisionErrorPersistsBranchAndKeepsRoot(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.insertLiveTenant(t, "source")
+	rt.prov.cluster = &tenant.ClusterInfo{ClusterID: "cluster-a", BranchID: "branch-created"}
+	rt.prov.provisionErr = errors.New("starter branch not active before timeout")
+	rt.prov.deleteErr = errors.New("delete branch failed")
+
+	_, err := rt.server.createForkTenant(context.Background(), "source", "fork")
+	if err == nil {
+		t.Fatal("expected createForkTenant error")
+	}
+	waitForCondition(t, func() bool {
+		return len(rt.prov.deletedBranches()) == 1
+	})
+
+	failed, err := rt.meta.ListTenantsByStatus(context.Background(), meta.TenantFailed, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failed) != 1 {
+		t.Fatalf("failed tenants = %+v, want exactly one fork root", failed)
+	}
+	if failed[0].BranchID != "branch-created" || failed[0].ClusterID != "cluster-a" {
+		t.Fatalf("failed fork branch metadata = cluster:%q branch:%q", failed[0].ClusterID, failed[0].BranchID)
+	}
+	if deleted := rt.prov.deletedBranches(); deleted[0] != "cluster-a/branch-created" {
+		t.Fatalf("deleted branches = %#v", deleted)
 	}
 }
 
@@ -237,5 +300,21 @@ func TestCleanupForkWithoutBranchIDDoesNotMarkDeleted(t *testing.T) {
 	}
 	if deleted := rt.prov.deletedBranches(); len(deleted) != 0 {
 		t.Fatalf("deleted branches = %#v, want none", deleted)
+	}
+}
+
+func TestCleanupBranchBackedForkWithoutProvisionerDoesNotMarkDeleted(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.server.provisioner = nonBranchOnlyProvisioner{}
+	rt.insertForkTenant(t, "fork-no-provisioner", meta.TenantDeleting, "branch-a")
+
+	rt.server.cleanupForkTenant(context.Background(), "fork-no-provisioner")
+
+	got, err := rt.meta.GetTenant(context.Background(), "fork-no-provisioner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantDeleting {
+		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantDeleting)
 	}
 }

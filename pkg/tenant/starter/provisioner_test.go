@@ -70,3 +70,31 @@ func TestProvisionBranchCreatesBranchFromSourceBranch(t *testing.T) {
 		t.Fatalf("unexpected cluster info: %#v", out)
 	}
 }
+
+func TestProvisionBranchReturnsBranchIDOnPostCreateValidationError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1beta1/clusters/c1/branches" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"branchId": "b-created",
+			"state":    "ACTIVE",
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+	out, err := p.ProvisionBranch(context.Background(), "fork-tenant", &tenant.ClusterInfo{
+		ClusterID: "c1",
+		DBName:    "test",
+	})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if out == nil {
+		t.Fatal("expected partial cluster info")
+	}
+	if out.ClusterID != "c1" || out.BranchID != "b-created" {
+		t.Fatalf("partial cluster info = %#v", out)
+	}
+}

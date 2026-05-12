@@ -132,11 +132,13 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	}
 
 	cluster, err := branchProvisioner.ProvisionBranch(ctx, forkID, clusterInfoFromTenant(source))
+	if cluster != nil {
+		cluster.Provider = source.Provider
+	}
 	if err != nil {
-		s.markForkDeletedNoBranch(ctx, forkID)
+		s.handleForkBranchProvisionError(ctx, forkID, branchProvisioner, cluster)
 		return nil, err
 	}
-	cluster.Provider = source.Provider
 	if err := s.meta.UpdateTenantBranch(ctx, forkID, &meta.Tenant{
 		Provider:       cluster.Provider,
 		ClusterID:      cluster.ClusterID,
@@ -248,15 +250,27 @@ func (s *Server) markForkFailed(ctx context.Context, forkID string) {
 	}
 }
 
-func (s *Server) markForkDeletedNoBranch(ctx context.Context, forkID string) {
-	if err := s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantDeleted); err != nil {
-		logger.Error(ctx, "fork_mark_deleted_no_branch_failed", zap.String("tenant_id", forkID), zap.Error(err))
-	}
-}
-
 func (s *Server) markForkFailedAndCleanup(ctx context.Context, forkID string) {
 	s.markForkFailed(ctx, forkID)
 	go s.cleanupForkTenant(backgroundWithTrace(ctx), forkID)
+}
+
+func (s *Server) handleForkBranchProvisionError(ctx context.Context, forkID string, branchProvisioner tenant.BranchProvisioner, cluster *tenant.ClusterInfo) {
+	if cluster != nil && cluster.ClusterID != "" && cluster.BranchID != "" {
+		if err := s.meta.UpdateTenantBranch(ctx, forkID, &meta.Tenant{
+			Provider:       cluster.Provider,
+			ClusterID:      cluster.ClusterID,
+			BranchID:       cluster.BranchID,
+			ClaimURL:       cluster.ClaimURL,
+			ClaimExpiresAt: cluster.ClaimExpiresAt,
+		}); err != nil {
+			s.deleteUnpersistedForkBranch(ctx, forkID, branchProvisioner, cluster)
+			return
+		}
+		s.markForkFailedAndCleanup(ctx, forkID)
+		return
+	}
+	s.markForkFailed(ctx, forkID)
 }
 
 func (s *Server) deleteUnpersistedForkBranch(ctx context.Context, forkID string, branchProvisioner tenant.BranchProvisioner, cluster *tenant.ClusterInfo) {
@@ -285,6 +299,10 @@ func (s *Server) deleteUnpersistedForkBranch(ctx context.Context, forkID string,
 			s.markForkFailedAndCleanup(ctx, forkID)
 			return
 		}
+	}
+	if cluster == nil || cluster.ClusterID == "" || cluster.BranchID == "" {
+		s.markForkFailed(ctx, forkID)
+		return
 	}
 	if err := s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantDeleted); err != nil {
 		logger.Error(ctx, "fork_mark_deleted_after_unpersisted_branch_failed", zap.String("tenant_id", forkID), zap.Error(err))
@@ -440,11 +458,14 @@ func (s *Server) cleanupForkTenant(ctx context.Context, tenantID string) {
 		logger.Error(ctx, "fork_cleanup_sanitize_failed", zap.String("tenant_id", tenantID), zap.Error(err))
 		return
 	}
-	if branchProvisioner, ok := s.provisioner.(tenant.BranchProvisioner); ok && t.BranchID != "" {
-		if err := branchProvisioner.DeleteBranch(ctx, t.ClusterID, t.BranchID); err != nil {
-			logger.Error(ctx, "fork_cleanup_delete_branch_failed", zap.String("tenant_id", tenantID), zap.Error(err))
-			return
-		}
+	branchProvisioner, ok := s.provisioner.(tenant.BranchProvisioner)
+	if !ok {
+		logger.Error(ctx, "fork_cleanup_branch_provisioner_missing", zap.String("tenant_id", tenantID))
+		return
+	}
+	if err := branchProvisioner.DeleteBranch(ctx, t.ClusterID, t.BranchID); err != nil {
+		logger.Error(ctx, "fork_cleanup_delete_branch_failed", zap.String("tenant_id", tenantID), zap.Error(err))
+		return
 	}
 	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantDeleted); err != nil {
 		logger.Error(ctx, "fork_cleanup_mark_deleted_failed", zap.String("tenant_id", tenantID), zap.Error(err))
@@ -453,11 +474,14 @@ func (s *Server) cleanupForkTenant(ctx context.Context, tenantID string) {
 }
 
 func (s *Server) cleanupFailedForkBranch(ctx context.Context, t *meta.Tenant) {
-	if branchProvisioner, ok := s.provisioner.(tenant.BranchProvisioner); ok && t.BranchID != "" {
-		if err := branchProvisioner.DeleteBranch(ctx, t.ClusterID, t.BranchID); err != nil {
-			logger.Error(ctx, "fork_cleanup_failed_delete_branch_failed", zap.String("tenant_id", t.ID), zap.Error(err))
-			return
-		}
+	branchProvisioner, ok := s.provisioner.(tenant.BranchProvisioner)
+	if !ok {
+		logger.Error(ctx, "fork_cleanup_failed_branch_provisioner_missing", zap.String("tenant_id", t.ID))
+		return
+	}
+	if err := branchProvisioner.DeleteBranch(ctx, t.ClusterID, t.BranchID); err != nil {
+		logger.Error(ctx, "fork_cleanup_failed_delete_branch_failed", zap.String("tenant_id", t.ID), zap.Error(err))
+		return
 	}
 	if err := s.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted); err != nil {
 		logger.Error(ctx, "fork_cleanup_failed_mark_deleted_failed", zap.String("tenant_id", t.ID), zap.Error(err))
