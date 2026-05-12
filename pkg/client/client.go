@@ -466,6 +466,35 @@ func (c *Client) WriteCtxConditionalWithRevision(ctx context.Context, path strin
 	return c.writeCtxConditionalFull(ctx, path, data, expectedRevision, nil, "")
 }
 
+// CreateFile creates an empty file.
+func (c *Client) CreateFile(path string) (int64, error) {
+	return c.CreateFileCtx(context.Background(), path)
+}
+
+// CreateFileCtx creates an empty file with context support and returns the
+// committed file revision when the server reports it.
+func (c *Client) CreateFileCtx(ctx context.Context, path string) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?create", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return 0, readError(resp)
+	}
+	var result struct {
+		Revision int64 `json:"revision"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, nil
+	}
+	return result.Revision, nil
+}
+
 func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
 	if err != nil {

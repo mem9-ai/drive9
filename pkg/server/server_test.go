@@ -1048,6 +1048,48 @@ func TestDeleteKindHint(t *testing.T) {
 	}
 }
 
+func TestCreateFileActionCreatesEmptyFileAndConflicts(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/empty.txt?create", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create status = %d, want 200", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/empty.txt", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Header.Get("Content-Length") != "0" {
+		t.Fatalf("Content-Length = %q, want 0", resp.Header.Get("Content-Length"))
+	}
+	if resp.Header.Get("X-Dat9-Revision") != "1" {
+		t.Fatalf("X-Dat9-Revision = %q, want 1", resp.Header.Get("X-Dat9-Revision"))
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stat status = %d, want 200", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/empty.txt?create", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate create status = %d, want 409", resp.StatusCode)
+	}
+}
+
 func TestLocalTenantShimProvisionAndStatus(t *testing.T) {
 	s := newLocalTenantShimServer(t, "local-dev-key")
 	ts := httptest.NewServer(s)

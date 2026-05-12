@@ -569,6 +569,31 @@ func TestStatCtxPreservesStatusErrorOnNotFound(t *testing.T) {
 	}
 }
 
+func TestCreateFileCtxPostsCreateActionAndReturnsRevision(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/fs/empty.txt" {
+			t.Errorf("path = %s, want /v1/fs/empty.txt", r.URL.Path)
+		}
+		if !r.URL.Query().Has("create") {
+			t.Errorf("query = %q, want create action", r.URL.RawQuery)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	rev, err := c.CreateFileCtx(context.Background(), "/empty.txt")
+	if err != nil {
+		t.Fatalf("CreateFileCtx error = %v", err)
+	}
+	if rev != 1 {
+		t.Fatalf("revision = %d, want 1", rev)
+	}
+}
+
 func TestWriteCtxConditionalWithTagsRejectsInvalidHeaderTags(t *testing.T) {
 	requests := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

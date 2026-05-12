@@ -511,6 +511,8 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 			s.handleRename(w, r, path)
 		} else if r.URL.Query().Has("mkdir") {
 			s.handleMkdir(w, r, path)
+		} else if r.URL.Query().Has("create") {
+			s.handleCreate(w, r, path)
 		} else {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_unknown_post_action", "path", path)...)
 			errJSON(w, http.StatusBadRequest, "unknown POST action")
@@ -1467,6 +1469,28 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "mkdir_ok", "path", path)...)
 	s.publishEvent(r, path, "mkdir")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_missing_scope", "path", path)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	if err := b.CreateCtx(r.Context(), path); err != nil {
+		if errors.Is(err, datastore.ErrPathConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_conflict", "path", path, "error", err)...)
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "create_failed", "path", path, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "create_ok", "path", path)...)
+	s.publishEvent(r, path, "create")
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
 }
 
 func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {

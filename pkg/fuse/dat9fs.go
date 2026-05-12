@@ -894,6 +894,18 @@ func isConflictErr(err error) bool {
 	return errors.As(err, &se) && se.StatusCode == http.StatusConflict
 }
 
+func isCreateActionUnsupportedErr(err error) bool {
+	var se *client.StatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	if se.StatusCode != http.StatusBadRequest && se.StatusCode != http.StatusMethodNotAllowed && se.StatusCode != http.StatusNotFound {
+		return false
+	}
+	msg := strings.ToLower(se.Message)
+	return strings.Contains(msg, "unknown post action") || strings.Contains(msg, "method not allowed")
+}
+
 // errReadRetriesExhausted is a sentinel indicating all detached read retries
 // failed with transient errors. Callers should map this to EIO.
 var errReadRetriesExhausted = errors.New("read retries exhausted")
@@ -4207,13 +4219,26 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	threshold := fs.negotiatedInlineThreshold()
 	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
 	if useDirectPUT {
-		// Small file: direct PUT with revision return for freshness seeding.
-		phase = "small-write"
-		writeStart := time.Now()
-		fs.debugf("flushHandle small write start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
-		committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
-		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
-		fs.debugDurationf(writeStart, 0, "flushHandle small write done path=%s size=%d committed_rev=%d err=%v", fh.Path, size, committedRev, err)
+		if size == 0 && fh.IsNew {
+			phase = "empty-create"
+			writeStart := time.Now()
+			fs.debugf("flushHandle empty create start path=%s expected_rev=%d", fh.Path, expectedRevision)
+			committedRev, err = fs.client.CreateFileCtx(ctx, fs.remotePath(fh.Path))
+			if isCreateActionUnsupportedErr(err) {
+				fs.debugf("flushHandle empty create unsupported path=%s fallback=small-write err=%v", fh.Path, err)
+				committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
+			}
+			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
+			fs.debugDurationf(writeStart, 0, "flushHandle empty create done path=%s committed_rev=%d err=%v", fh.Path, committedRev, err)
+		} else {
+			// Small file: direct PUT with revision return for freshness seeding.
+			phase = "small-write"
+			writeStart := time.Now()
+			fs.debugf("flushHandle small write start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
+			committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
+			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
+			fs.debugDurationf(writeStart, 0, "flushHandle small write done path=%s size=%d committed_rev=%d err=%v", fh.Path, size, committedRev, err)
+		}
 	} else if fh.OrigSize >= threshold {
 		phase = "patch-file"
 		dirtyParts := fh.Dirty.DirtyPartNumbers()

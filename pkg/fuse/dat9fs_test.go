@@ -2420,6 +2420,15 @@ func TestHTTPToFuseStatus_PreservesRevisionConflictAsEIO(t *testing.T) {
 	}
 }
 
+func TestIsCreateActionUnsupportedErr(t *testing.T) {
+	if !isCreateActionUnsupportedErr(&client.StatusError{StatusCode: http.StatusBadRequest, Message: "unknown POST action"}) {
+		t.Fatal("unknown POST action should be treated as unsupported create action")
+	}
+	if isCreateActionUnsupportedErr(&client.StatusError{StatusCode: http.StatusBadRequest, Message: "invalid path"}) {
+		t.Fatal("plain bad request should not be treated as unsupported create action")
+	}
+}
+
 // TestHTTPToFuseStatus_MapsClientClosedRequestToEAGAIN locks the contract
 // between the server's tenantAuthMiddleware (which writes 499 when a request
 // is canceled mid-auth) and the FUSE client. Without this mapping, a canceled
@@ -3297,6 +3306,83 @@ func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
 	}
 	if entry.Revision != 8 {
 		t.Fatalf("inode revision = %d, want 8", entry.Revision)
+	}
+}
+
+func TestReleaseNewEmptyFileUsesCreateAction(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		handlerErr  error
+		createCalls atomic.Int32
+		putCalls    atomic.Int32
+	)
+	recordHandlerErr := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			if r.URL.Path != "/v1/fs/empty.txt" {
+				recordHandlerErr(fmt.Errorf("path = %s, want /v1/fs/empty.txt", r.URL.Path))
+				http.Error(w, "bad path", http.StatusBadRequest)
+				return
+			}
+			if !r.URL.Query().Has("create") {
+				recordHandlerErr(fmt.Errorf("query = %q, want create action", r.URL.RawQuery))
+				http.Error(w, "bad query", http.StatusBadRequest)
+				return
+			}
+			createCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
+		case http.MethodPut:
+			putCalls.Add(1)
+			http.Error(w, "unexpected PUT", http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "empty.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: out.Fh})
+
+	mu.Lock()
+	err := handlerErr
+	mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := createCalls.Load(); got != 1 {
+		t.Fatalf("create calls = %d, want 1", got)
+	}
+	if got := putCalls.Load(); got != 0 {
+		t.Fatalf("PUT calls = %d, want 0", got)
+	}
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("created inode entry not found")
+	}
+	if entry.Size != 0 {
+		t.Fatalf("entry size = %d, want 0", entry.Size)
+	}
+	if entry.Revision != 1 {
+		t.Fatalf("entry revision = %d, want 1", entry.Revision)
 	}
 }
 
