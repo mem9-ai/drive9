@@ -19,6 +19,11 @@ import (
 	drive9webdav "github.com/mem9-ai/dat9/pkg/webdav"
 )
 
+const (
+	defaultFuseLookupRetryCount   = 3
+	defaultFuseLookupRetryTimeout = 2 * time.Second
+)
+
 var (
 	errMountProcessStateStale  = errors.New("drive9 umount: stale mount process state")
 	errMountProcessStateUnsafe = errors.New("drive9 umount: unsafe mount process state")
@@ -83,8 +88,8 @@ func fsMountCmd(args []string) error {
 	attrTTL := fs.Duration("attr-ttl", 10*time.Second, "kernel attr cache TTL")
 	entryTTL := fs.Duration("entry-ttl", 10*time.Second, "kernel entry cache TTL")
 	flushDebounce := fs.Duration("flush-debounce", -1, "debounce window for small-file flush coalescing (default 2s, 0 disables)")
-	lookupRetryCount := fs.Int("lookup-retry-count", 2, "detached retries after transient Lookup/GetAttr stat failures (default 2, set 0 to disable)")
-	lookupRetryTimeout := fs.Duration("lookup-retry-timeout", 250*time.Millisecond, "timeout per detached Lookup/GetAttr stat retry (default 250ms, must be > 0)")
+	lookupRetryCount := fs.Int("lookup-retry-count", defaultFuseLookupRetryCount, "detached retries after transient Lookup/GetAttr stat failures (set 0 to disable)")
+	lookupRetryTimeout := fs.Duration("lookup-retry-timeout", defaultFuseLookupRetryTimeout, "timeout per detached Lookup/GetAttr stat retry (must be > 0 when set)")
 	legacyDirStatFallback := fs.Bool("legacy-dir-stat-fallback", false, "on Lookup stat 404, list parent to support legacy servers without directory stat")
 	readDirPrefetch := fs.Bool("readdir-prefetch", false, "prefetch small files after directory reads into the read cache")
 	prefetchMaxFiles := fs.Int("readdir-prefetch-max-files", 32, "maximum small files prefetched per directory read")
@@ -139,13 +144,19 @@ func fsMountCmd(args []string) error {
 		return err
 	}
 
-	if err := validateLookupRetryFlags(*lookupRetryCount, *lookupRetryTimeout); err != nil {
+	lookupRetryCountGiven := flagProvided(fs, "lookup-retry-count")
+	lookupRetryTimeoutGiven := flagProvided(fs, "lookup-retry-timeout")
+	if err := validateLookupRetryFlags(*lookupRetryCount, *lookupRetryTimeout, lookupRetryCountGiven, lookupRetryTimeoutGiven); err != nil {
 		return err
 	}
 	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
 		return err
 	}
-	normalizedLookupRetryCount := normalizeLookupRetryCount(*lookupRetryCount)
+	normalizedLookupRetryCount := lookupRetryCountFlagValue(lookupRetryCountGiven, *lookupRetryCount)
+	normalizedLookupRetryTimeout := durationFlagValue(fs, "lookup-retry-timeout", *lookupRetryTimeout)
+	normalizedDirTTL := durationFlagValue(fs, "dir-ttl", *dirTTL)
+	normalizedAttrTTL := durationFlagValue(fs, "attr-ttl", *attrTTL)
+	normalizedEntryTTL := durationFlagValue(fs, "entry-ttl", *entryTTL)
 
 	serverGiven, apiKeyGiven := flagProvided(fs, "server"), flagProvided(fs, "api-key")
 	if err := rejectEmptyFlag("server", *server, serverGiven); err != nil {
@@ -212,12 +223,12 @@ func fsMountCmd(args []string) error {
 		RemoteRoot:            remoteRoot,
 		CacheDir:              *cacheDir,
 		CacheSize:             int64(*cacheSize) << 20,
-		DirTTL:                *dirTTL,
-		AttrTTL:               *attrTTL,
-		EntryTTL:              *entryTTL,
+		DirTTL:                normalizedDirTTL,
+		AttrTTL:               normalizedAttrTTL,
+		EntryTTL:              normalizedEntryTTL,
 		FlushDebounce:         *flushDebounce,
 		LookupRetryCount:      normalizedLookupRetryCount,
-		LookupRetryTimeout:    *lookupRetryTimeout,
+		LookupRetryTimeout:    normalizedLookupRetryTimeout,
 		LegacyDirStatFallback: *legacyDirStatFallback,
 		ReadDirPrefetch:       *readDirPrefetch,
 		PrefetchMaxFiles:      *prefetchMaxFiles,
@@ -281,11 +292,11 @@ func remoteRootError(remoteRoot string, err error) error {
 	return fmt.Errorf("remote root %q: %w", remoteRoot, err)
 }
 
-func validateLookupRetryFlags(count int, timeout time.Duration) error {
-	if count < 0 {
+func validateLookupRetryFlags(count int, timeout time.Duration, countGiven bool, timeoutGiven bool) error {
+	if countGiven && count < 0 {
 		return fmt.Errorf("drive9 mount: --lookup-retry-count must be >= 0")
 	}
-	if timeout <= 0 {
+	if timeoutGiven && timeout <= 0 {
 		return fmt.Errorf("drive9 mount: --lookup-retry-timeout must be > 0")
 	}
 	return nil
@@ -305,6 +316,20 @@ func validateReadDirPrefetchFlags(maxFiles int, maxFileBytes int64, maxBytes int
 		return fmt.Errorf("drive9 mount: --readdir-prefetch-timeout must be > 0")
 	}
 	return nil
+}
+
+func durationFlagValue(fs *flag.FlagSet, name string, value time.Duration) time.Duration {
+	if flagProvided(fs, name) {
+		return value
+	}
+	return 0
+}
+
+func lookupRetryCountFlagValue(given bool, count int) int {
+	if !given {
+		return 0
+	}
+	return normalizeLookupRetryCount(count)
 }
 
 func normalizeLookupRetryCount(count int) int {

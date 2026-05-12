@@ -2447,6 +2447,51 @@ func TestOpenWritableLargeFileGetsLazyPreload(t *testing.T) {
 	}
 }
 
+func TestLazyWritablePreloadUsesRenamedPath(t *testing.T) {
+	const size = int64(1024 * 1024)
+	var getPath string
+
+	fs, ino, cleanup := newTestDat9FS(t, size, func(w http.ResponseWriter, r *http.Request) {
+		getPath = r.URL.Path
+		if !strings.HasSuffix(r.URL.Path, "/new.bin") {
+			http.Error(w, "unexpected read path "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte("renamed-data"))
+	})
+	defer cleanup()
+
+	oldPath := "/file.bin"
+	newPath := "/new.bin"
+	fh := &FileHandle{Ino: ino, Path: oldPath}
+	if st := fs.preloadWritableHandle(context.Background(), fh); st != gofuse.OK {
+		t.Fatalf("preloadWritableHandle status = %v, want OK", st)
+	}
+	if fh.Dirty == nil || fh.Dirty.LoadPart == nil {
+		t.Fatal("expected lazy dirty buffer")
+	}
+	fhID := fs.allocateFileHandle(fh)
+	defer fs.deleteFileHandle(fhID, fh)
+
+	fs.finishLocalRename(&gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Newdir:   1,
+	}, oldPath, newPath)
+	if fh.Path != newPath {
+		t.Fatalf("file handle path after rename = %q, want %q", fh.Path, newPath)
+	}
+
+	fh.Lock()
+	err := fh.Dirty.EnsureLoaded(0)
+	fh.Unlock()
+	if err != nil {
+		t.Fatalf("EnsureLoaded after rename: %v", err)
+	}
+	if !strings.HasSuffix(getPath, newPath) {
+		t.Fatalf("lazy load GET path = %q, want suffix %q", getPath, newPath)
+	}
+}
+
 func TestDefaultTTLIs10Seconds(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
@@ -2458,6 +2503,39 @@ func TestDefaultTTLIs10Seconds(t *testing.T) {
 	}
 	if opts.NegativeEntryTTL != 10*time.Second {
 		t.Fatalf("default NegativeEntryTTL = %v, want 10s", opts.NegativeEntryTTL)
+	}
+}
+
+func TestInteractiveProfileAppliesTTLDefaults(t *testing.T) {
+	opts := &MountOptions{Profile: "interactive"}
+	opts.setDefaults()
+	if opts.AttrTTL != time.Second {
+		t.Fatalf("interactive AttrTTL = %v, want 1s", opts.AttrTTL)
+	}
+	if opts.EntryTTL != time.Second {
+		t.Fatalf("interactive EntryTTL = %v, want 1s", opts.EntryTTL)
+	}
+	if opts.DirTTL != 2*time.Second {
+		t.Fatalf("interactive DirTTL = %v, want 2s", opts.DirTTL)
+	}
+}
+
+func TestInteractiveProfileKeepsExplicitTTLs(t *testing.T) {
+	opts := &MountOptions{
+		Profile:  "interactive",
+		AttrTTL:  5 * time.Second,
+		EntryTTL: 6 * time.Second,
+		DirTTL:   7 * time.Second,
+	}
+	opts.setDefaults()
+	if opts.AttrTTL != 5*time.Second {
+		t.Fatalf("explicit AttrTTL = %v, want 5s", opts.AttrTTL)
+	}
+	if opts.EntryTTL != 6*time.Second {
+		t.Fatalf("explicit EntryTTL = %v, want 6s", opts.EntryTTL)
+	}
+	if opts.DirTTL != 7*time.Second {
+		t.Fatalf("explicit DirTTL = %v, want 7s", opts.DirTTL)
 	}
 }
 

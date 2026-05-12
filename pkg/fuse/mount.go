@@ -59,6 +59,11 @@ type MountOptions struct {
 }
 
 func (o *MountOptions) setDefaults() {
+	// Apply profile defaults before generic defaults so profile-specific
+	// zero-value options can take effect while explicit non-zero values win.
+	if o.Profile == "interactive" {
+		ApplyInteractiveProfile(o)
+	}
 	if o.CacheSize <= 0 {
 		o.CacheSize = defaultReadCacheMaxSize
 	}
@@ -102,10 +107,6 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.PrefetchTimeout <= 0 {
 		o.PrefetchTimeout = defaultReadDirPrefetchTimeout
-	}
-	// Apply interactive profile if requested.
-	if o.Profile == "interactive" {
-		ApplyInteractiveProfile(o)
 	}
 }
 

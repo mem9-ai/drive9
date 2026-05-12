@@ -127,8 +127,14 @@ func (fs *Dat9FS) hasLocalWriteState(p string) bool {
 			return true
 		}
 	}
-	for _, fh := range fs.fileHandles.Snapshot() {
-		if fh != nil && fh.Path == p && fh.Dirty != nil {
+	for _, fh := range fs.openHandles.SnapshotPath(p) {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		dirty := fh.Dirty != nil
+		fh.Unlock()
+		if dirty {
 			return true
 		}
 	}

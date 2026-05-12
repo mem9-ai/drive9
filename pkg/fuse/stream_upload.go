@@ -89,6 +89,19 @@ func (su *StreamUploader) ExpectedRevision() int64 {
 	return su.expectedRevision
 }
 
+// SetPath retargets future uploads for an open handle that was renamed before
+// its buffered data was committed.
+func (su *StreamUploader) SetPath(path string, remoteRoot ...string) {
+	root := "/"
+	if len(remoteRoot) > 0 && remoteRoot[0] != "" {
+		root = remoteRoot[0]
+	}
+	su.mu.Lock()
+	defer su.mu.Unlock()
+	su.path = path
+	su.remotePath = mountpath.ToRemote(root, path)
+}
+
 // ResetForNextWrite prepares the uploader for another flush cycle after a
 // successful commit on the same open handle.
 func (su *StreamUploader) ResetForNextWrite(revision int64) {
@@ -276,12 +289,13 @@ func (su *StreamUploader) UploadAll(ctx context.Context, totalSize int64, partDa
 func (su *StreamUploader) Abort() {
 	su.mu.Lock()
 	sw := su.writer
+	path := su.path
 	su.pendingParts = make(map[int][]byte) // release buffered data
 	su.mu.Unlock()
 
 	if sw != nil {
 		if err := sw.Abort(context.Background()); err != nil {
-			log.Printf("stream upload abort failed for %s: %v", su.path, err)
+			log.Printf("stream upload abort failed for %s: %v", path, err)
 		}
 	}
 }
