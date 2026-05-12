@@ -1015,7 +1015,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 				}
 			}
 
-			if _, err = tx.Exec(`UPDATE files SET status = 'DELETED', storage_ref = '' WHERE file_id = ?`, upload.FileID); err != nil {
+			if _, err = tx.Exec(`UPDATE files SET status = 'DELETED', storage_ref = '', storage_ref_hash = '' WHERE file_id = ?`, upload.FileID); err != nil {
 				return err
 			}
 			if _, err = tx.Exec(`UPDATE uploads SET file_id = ? WHERE upload_id = ?`,
@@ -1054,10 +1054,10 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		} else {
 			now := time.Now().UTC()
 			stepStart = time.Now()
-			query := `UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
+			query := `UPDATE files SET storage_type = ?, storage_ref = ?, storage_ref_hash = ?, content_type = ?,
 				size_bytes = ?, checksum_sha256 = NULL, content_text = NULL,
 				embedding = NULL, embedding_revision = NULL`
-			args := []any{datastore.StorageS3, upload.S3Key, contentType, upload.TotalSize}
+			args := []any{datastore.StorageS3, upload.S3Key, datastore.StorageRefHash(upload.S3Key), contentType, upload.TotalSize}
 			if upload.Description != "" {
 				query += `, description = ?`
 				args = append(args, upload.Description)

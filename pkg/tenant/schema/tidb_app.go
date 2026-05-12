@@ -40,6 +40,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			file_id            VARCHAR(64) PRIMARY KEY,
 			storage_type       VARCHAR(32) NOT NULL,
 			storage_ref        TEXT NOT NULL,
+			storage_ref_hash   VARCHAR(64) NOT NULL DEFAULT '',
 			storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'legacy',
 			storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT '',
 			content_blob       LONGBLOB,
@@ -60,6 +61,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			expires_at         DATETIME(3)
 		)`,
 		`CREATE INDEX idx_status ON files(status, created_at)`,
+		`CREATE INDEX idx_files_storage_ref_hash ON files(storage_ref_hash)`,
 		`CREATE TABLE IF NOT EXISTS file_tags (
 			file_id   VARCHAR(64) NOT NULL,
 			tag_key   VARCHAR(255) NOT NULL,

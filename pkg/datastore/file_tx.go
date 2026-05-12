@@ -10,12 +10,12 @@ import (
 func (s *Store) InsertFileTx(db execer, f *File) error {
 	mode := fileStorageEncryptionModeForWrite(f.StorageEncryptionMode)
 	_, err := db.Exec(`INSERT INTO files
-		(file_id, storage_type, storage_ref, storage_encryption_mode, storage_encryption_key_id,
+		(file_id, storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
 		 content_blob, content_type, size_bytes, checksum_sha256,
 		 revision, status, source_id, content_text, description, description_embedding_revision,
 		 created_at, confirmed_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.FileID, f.StorageType, f.StorageRef, mode,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.FileID, f.StorageType, f.StorageRef, StorageRefHash(f.StorageRef), mode,
 		storageEncryptionKeyIDForWrite(mode, f.StorageEncryptionKeyID), nilBytes(f.ContentBlob), nullStr(f.ContentType),
 		f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
 		nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
@@ -39,10 +39,10 @@ func (s *Store) UpdateFileContentIfRevisionTx(db execer, fileID string, expected
 
 func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision int64, preserveEmbedding bool, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64, description string) (int64, error) {
 	now := time.Now().UTC()
-	query := `UPDATE files SET storage_type = ?, storage_ref = ?,
+	query := `UPDATE files SET storage_type = ?, storage_ref = ?, storage_ref_hash = ?,
 		content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,`
 	args := []any{
-		storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
+		storageType, storageRef, StorageRefHash(storageRef), nilBytes(contentBlob), nullStr(contentType), size,
 		nullStr(checksum), nullStr(contentText),
 	}
 	if description != "" {
@@ -141,9 +141,9 @@ func (s *Store) UpdateFileContentAutoEmbeddingIfRevisionTx(db execer, fileID str
 // derived vector state after content_text becomes available.
 func (s *Store) ConfirmPendingFileAutoEmbeddingTx(db execer, fileID string, storageType StorageType, storageRef, contentType string, size int64, description string) error {
 	now := time.Now().UTC()
-	query := `UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
+	query := `UPDATE files SET storage_type = ?, storage_ref = ?, storage_ref_hash = ?, content_type = ?,
 		size_bytes = ?, checksum_sha256 = NULL, content_text = NULL`
-	args := []any{storageType, storageRef, nullStr(contentType), size}
+	args := []any{storageType, storageRef, StorageRefHash(storageRef), nullStr(contentType), size}
 	if description != "" {
 		query += `, description = ?, description_embedding_revision = revision`
 		args = append(args, description)

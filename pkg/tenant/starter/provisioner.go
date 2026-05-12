@@ -105,6 +105,141 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 	}, nil
 }
 
+func (p *Provisioner) ProvisionBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+	if source == nil {
+		return nil, fmt.Errorf("source cluster info is required")
+	}
+	parentID := source.BranchID
+	if parentID == "" {
+		parentID = source.ClusterID
+	}
+	if source.ClusterID == "" || parentID == "" {
+		return nil, fmt.Errorf("source cluster id is required")
+	}
+	password, err := generateRandomPassword(24)
+	if err != nil {
+		return nil, err
+	}
+	body, _ := json.Marshal(map[string]string{
+		"displayName":  forkTenantID,
+		"parentId":     parentID,
+		"rootPassword": password,
+	})
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches", p.apiURL, source.ClusterID)
+	resp, err := p.doDigestAuthRequest(ctx, http.MethodPost, endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("starter branch provision status %d: %s", resp.StatusCode, string(raw))
+	}
+
+	branch, err := parseStarterBranchInfo(raw)
+	if err != nil {
+		return nil, err
+	}
+	if branch.BranchID == "" {
+		return nil, fmt.Errorf("starter branch response missing branch id")
+	}
+	if branch.State != "" && branch.State != "ACTIVE" {
+		branch, err = p.waitForBranchActive(ctx, source.ClusterID, branch.BranchID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if branch.Endpoints.Public.Host == "" || branch.Endpoints.Public.Port == 0 {
+		return nil, fmt.Errorf("starter branch response missing endpoint")
+	}
+	if branch.UserPrefix == "" {
+		return nil, fmt.Errorf("starter branch response missing user prefix")
+	}
+	dbName := source.DBName
+	if dbName == "" {
+		dbName = "test"
+	}
+	return &tenant.ClusterInfo{
+		TenantID:  forkTenantID,
+		ClusterID: source.ClusterID,
+		BranchID:  branch.BranchID,
+		Host:      branch.Endpoints.Public.Host,
+		Port:      branch.Endpoints.Public.Port,
+		Username:  branch.UserPrefix + ".root",
+		Password:  password,
+		DBName:    dbName,
+		Provider:  tenant.ProviderTiDBCloudStarter,
+	}, nil
+}
+
+func (p *Provisioner) DeleteBranch(ctx context.Context, clusterID, branchID string) error {
+	if clusterID == "" || branchID == "" {
+		return fmt.Errorf("cluster id and branch id are required")
+	}
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches/%s", p.apiURL, clusterID, branchID)
+	resp, err := p.doDigestAuthRequest(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("starter branch delete status %d: %s", resp.StatusCode, string(raw))
+	}
+	return nil
+}
+
+type starterBranchInfo struct {
+	BranchID  string `json:"branchId"`
+	State     string `json:"state"`
+	Endpoints struct {
+		Public struct {
+			Host string `json:"host"`
+			Port int    `json:"port"`
+		} `json:"public"`
+	} `json:"endpoints"`
+	UserPrefix string `json:"userPrefix"`
+}
+
+func parseStarterBranchInfo(raw []byte) (*starterBranchInfo, error) {
+	var out starterBranchInfo
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (p *Provisioner) waitForBranchActive(ctx context.Context, clusterID, branchID string) (*starterBranchInfo, error) {
+	deadline := time.Now().Add(10 * time.Minute)
+	for {
+		endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches/%s?view=BASIC", p.apiURL, clusterID, branchID)
+		resp, err := p.doDigestAuthRequest(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("starter branch get status %d: %s", resp.StatusCode, string(raw))
+		}
+		branch, err := parseStarterBranchInfo(raw)
+		if err != nil {
+			return nil, err
+		}
+		if branch.State == "ACTIVE" {
+			return branch, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("starter branch %s not active before timeout: %s", branchID, branch.State)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
 func (p *Provisioner) doDigestAuthRequest(ctx context.Context, method, uri string, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, uri, bytes.NewReader(body))
 	if err != nil {

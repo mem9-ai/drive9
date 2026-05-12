@@ -10,6 +10,7 @@ import (
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
@@ -123,6 +124,126 @@ func TestFileGCTaskDeletesOriginalStorageRefAfterPathRecreate(t *testing.T) {
 	}
 	if task.Status != datastore.FileGCTaskSucceeded {
 		t.Fatalf("task status = %s, want succeeded", task.Status)
+	}
+}
+
+func TestFileGCTaskEnqueuesObjectCandidateWhenNamespaceWired(t *testing.T) {
+	b := newTestBackend(t)
+	rec := &deleteRecordingS3Client{S3Client: b.s3}
+	b.s3 = rec
+	fake := newFakeMetaQuotaStore()
+	b.SetMetaQuotaStore("tenant-a", fake)
+	b.storageNamespaceID = "ns-a"
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := b.Store().InsertFile(ctx, &datastore.File{
+		FileID:      "old-file",
+		StorageType: datastore.StorageS3,
+		StorageRef:  "blobs/old-file",
+		ContentType: "text/plain",
+		SizeBytes:   11,
+		Revision:    1,
+		Status:      datastore.StatusConfirmed,
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Store().InsertNode(ctx, &datastore.FileNode{
+		NodeID:     "node-old-file",
+		Path:       "/x.txt",
+		ParentPath: "/",
+		Name:       "x.txt",
+		FileID:     "old-file",
+		CreatedAt:  now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.RemoveCtx(ctx, "/x.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	processed, err := b.ProcessOneFileGCTask(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !processed {
+		t.Fatal("expected one file gc task to be processed")
+	}
+	if keys := rec.deletedKeys(); len(keys) != 0 {
+		t.Fatalf("deleted keys = %#v, want none", keys)
+	}
+	if len(fake.objectGCCandidates) != 1 {
+		t.Fatalf("object gc candidates = %d, want 1", len(fake.objectGCCandidates))
+	}
+	got := fake.objectGCCandidates[0]
+	if got.NamespaceID != "ns-a" || got.StorageRef != "blobs/old-file" || got.Reason != meta.ObjectGCReasonFileDelete {
+		t.Fatalf("candidate = %+v", got)
+	}
+	if got.StorageRefHash != datastore.StorageRefHash("blobs/old-file") {
+		t.Fatalf("candidate hash = %q", got.StorageRefHash)
+	}
+}
+
+func TestFileGCTaskRetriesWhenObjectCandidateEnqueueFails(t *testing.T) {
+	b := newTestBackend(t)
+	rec := &deleteRecordingS3Client{S3Client: b.s3}
+	b.s3 = rec
+	fake := newFakeMetaQuotaStore()
+	enqueueErr := errors.New("meta unavailable")
+	fake.objectGCCandidateErr = enqueueErr
+	b.SetMetaQuotaStore("tenant-a", fake)
+	b.storageNamespaceID = "ns-a"
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := b.Store().InsertFile(ctx, &datastore.File{
+		FileID:      "old-file",
+		StorageType: datastore.StorageS3,
+		StorageRef:  "blobs/old-file",
+		ContentType: "text/plain",
+		SizeBytes:   11,
+		Revision:    1,
+		Status:      datastore.StatusConfirmed,
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Store().InsertNode(ctx, &datastore.FileNode{
+		NodeID:     "node-old-file",
+		Path:       "/x.txt",
+		ParentPath: "/",
+		Name:       "x.txt",
+		FileID:     "old-file",
+		CreatedAt:  now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.RemoveCtx(ctx, "/x.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	processed, err := b.ProcessOneFileGCTask(ctx)
+	if !processed {
+		t.Fatal("expected one file gc task to be processed")
+	}
+	if !errors.Is(err, enqueueErr) {
+		t.Fatalf("process err = %v, want %v", err, enqueueErr)
+	}
+	if keys := rec.deletedKeys(); len(keys) != 0 {
+		t.Fatalf("deleted keys = %#v, want none", keys)
+	}
+	if len(fake.objectGCCandidates) != 0 {
+		t.Fatalf("object gc candidates = %d, want 0", len(fake.objectGCCandidates))
+	}
+	task, err := b.Store().GetFileGCTaskByFileID(ctx, "old-file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != datastore.FileGCTaskQueued {
+		t.Fatalf("task status = %s, want queued", task.Status)
 	}
 }
 

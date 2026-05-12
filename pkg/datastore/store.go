@@ -513,11 +513,11 @@ func (s *Store) InsertFile(ctx context.Context, f *File) (err error) {
 
 	mode := fileStorageEncryptionModeForWrite(f.StorageEncryptionMode)
 	_, err = s.db.ExecContext(ctx, `INSERT INTO files
-		(file_id, storage_type, storage_ref, storage_encryption_mode, storage_encryption_key_id,
+		(file_id, storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
 		 content_blob, content_type, size_bytes, checksum_sha256,
 		 revision, status, source_id, content_text, description, created_at, confirmed_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.FileID, f.StorageType, f.StorageRef, mode,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.FileID, f.StorageType, f.StorageRef, StorageRefHash(f.StorageRef), mode,
 		storageEncryptionKeyIDForWrite(mode, f.StorageEncryptionKeyID), nilBytes(f.ContentBlob), nullStr(f.ContentType),
 		f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
 		nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
@@ -538,13 +538,36 @@ func (s *Store) GetFile(ctx context.Context, fileID string) (out *File, err erro
 	return out, err
 }
 
+// HasConfirmedS3StorageRef reports whether a confirmed S3 file still points at
+// the exact storage ref. Callers pass the hash so the query can use
+// idx_files_storage_ref_hash and then compare the full ref to avoid trusting
+// the hash as the identity.
+func (s *Store) HasConfirmedS3StorageRef(ctx context.Context, storageRefHash, storageRef string) (out bool, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "has_confirmed_s3_storage_ref", start, &err)
+	if storageRefHash == "" || storageRef == "" {
+		return false, nil
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT 1 FROM files
+		WHERE storage_type = ? AND status = ? AND storage_ref_hash = ? AND storage_ref = ?
+		LIMIT 1`, StorageS3, StatusConfirmed, storageRefHash, storageRef)
+	var one int
+	if err := row.Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64, description string) (newRevision int64, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "update_file_content", start, &err)
 
-	query := `UPDATE files SET storage_type = ?, storage_ref = ?,
+	query := `UPDATE files SET storage_type = ?, storage_ref = ?, storage_ref_hash = ?,
 		content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?`
-	args := []any{storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
+	args := []any{storageType, storageRef, StorageRefHash(storageRef), nilBytes(contentBlob), nullStr(contentType), size,
 		nullStr(checksum), nullStr(contentText)}
 	if description != "" {
 		query += `, description = ?, description_embedding = NULL, description_embedding_revision = NULL`
@@ -892,6 +915,100 @@ func (s *Store) ListConfirmedFileSummaries(ctx context.Context, cursor string, l
 		nextCursor = out[len(out)-1].FileID
 	}
 	return out, nextCursor, nil
+}
+
+type ConfirmedS3Ref struct {
+	StorageRef     string
+	StorageRefHash string
+}
+
+func (s *Store) ListConfirmedS3Refs(ctx context.Context, cursor string, limit int) ([]ConfirmedS3Ref, string, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	var rows *sql.Rows
+	var err error
+	if cursor == "" {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT storage_ref, storage_ref_hash
+			 FROM files
+			 WHERE status = 'CONFIRMED' AND storage_type = 's3' AND storage_ref <> ''
+			 ORDER BY storage_ref ASC LIMIT ?`, limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT storage_ref, storage_ref_hash
+			 FROM files
+			 WHERE status = 'CONFIRMED' AND storage_type = 's3' AND storage_ref <> '' AND storage_ref > ?
+			 ORDER BY storage_ref ASC LIMIT ?`, cursor, limit)
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("query confirmed s3 refs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]ConfirmedS3Ref, 0)
+	for rows.Next() {
+		var ref ConfirmedS3Ref
+		if err := rows.Scan(&ref.StorageRef, &ref.StorageRefHash); err != nil {
+			return nil, "", fmt.Errorf("scan confirmed s3 ref: %w", err)
+		}
+		if ref.StorageRefHash == "" {
+			ref.StorageRefHash = StorageRefHash(ref.StorageRef)
+		}
+		out = append(out, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	nextCursor := ""
+	if len(out) == limit {
+		nextCursor = out[len(out)-1].StorageRef
+	}
+	return out, nextCursor, nil
+}
+
+func (s *Store) HasActiveUploads(ctx context.Context) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM uploads
+		 WHERE status IN ('INITIATED', 'UPLOADING') AND expires_at > ?
+		 LIMIT 1`, time.Now().UTC()).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) SanitizeForkRuntimeState(ctx context.Context) error {
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE fn FROM file_nodes fn JOIN files f ON f.file_id = fn.file_id WHERE f.status <> 'CONFIRMED'`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE files SET status = 'DELETED', storage_ref = '', storage_ref_hash = '', content_blob = NULL, updated_at = ? WHERE status <> 'CONFIRMED'`, time.Now().UTC()); err != nil {
+			return err
+		}
+		for _, stmt := range []string{
+			`DELETE FROM uploads`,
+			`DELETE FROM file_gc_tasks`,
+			`DELETE FROM semantic_tasks`,
+			`DELETE FROM llm_usage`,
+			`DELETE FROM vault_audit_log`,
+			`DELETE FROM vault_grants`,
+			`DELETE FROM vault_tokens`,
+			`DELETE FROM vault_secret_fields`,
+			`DELETE FROM vault_secrets`,
+			`DELETE FROM vault_policies`,
+			`DELETE FROM vault_deks`,
+		} {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // --- composite operations ---

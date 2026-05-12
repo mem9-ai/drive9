@@ -82,6 +82,8 @@ type Options struct {
 	QuotaSource QuotaSource
 	// TenantID is used for per-write S3 encryption context and audit metadata.
 	TenantID string
+	// StorageNamespaceID is the control-plane namespace for S3 object lifecycle.
+	StorageNamespaceID string
 	// S3EncryptionPolicy is the already-resolved policy for this backend.
 	// The zero value is normalized to the global default of explicit no encryption.
 	S3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
@@ -169,6 +171,9 @@ type QueryEmbeddingOptions struct {
 func (b *Dat9Backend) configureOptions(opts Options) {
 	if opts.TenantID != "" {
 		b.tenantID = opts.TenantID
+	}
+	if opts.StorageNamespaceID != "" {
+		b.storageNamespaceID = opts.StorageNamespaceID
 	}
 	b.databaseAutoEmbedding = opts.DatabaseAutoEmbedding
 	b.s3EncryptionPolicy = opts.S3EncryptionPolicy

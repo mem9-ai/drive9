@@ -157,11 +157,11 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			metricEvent(r.Context(), "tenant_status", "status", string(meta.TenantFailed))
 			errJSON(w, http.StatusServiceUnavailable, "tenant provisioning failed")
 			return
-		case meta.TenantSuspended, meta.TenantDeleted:
+		case meta.TenantSuspended, meta.TenantDeleting, meta.TenantDeleted:
 			pool.Invalidate(resolved.Tenant.ID)
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_blocked", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
 			metricEvent(r.Context(), "tenant_status", "status", string(resolved.Tenant.Status))
-			errJSON(w, http.StatusForbidden, "tenant is suspended")
+			errJSON(w, http.StatusForbidden, "tenant is unavailable")
 			return
 		default:
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_unavailable", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)

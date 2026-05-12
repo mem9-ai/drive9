@@ -32,13 +32,29 @@ type fakeMetaQuotaStore struct {
 	reservations         map[string]*UploadReservationView
 	monthly              map[string]int64
 	llmUsage             []LLMUsageView
+	objectGCCandidates   []meta.ObjectGCCandidateInput
 	mutations            []fakeMutationRecord
 	nextID               int64
 	markAppliedCalls     int // Finding B invariant: count MarkMutationAppliedTx calls (pre-guard, on-entry)
 	monthlyCostErr       error
 	insertMutationErr    error
+	objectGCCandidateErr error
 	insertReservationErr error // injected into AtomicReserveAndInsertUpload to simulate INSERT failure inside the tx
 	getReservationErr    error // injected into GetUploadReservation to simulate transient DB error
+}
+
+func (f *fakeMetaQuotaStore) EnqueueObjectGCCandidate(_ context.Context, c *meta.ObjectGCCandidateInput) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.objectGCCandidateErr != nil {
+		return f.objectGCCandidateErr
+	}
+	if c == nil {
+		return errors.New("nil object gc candidate")
+	}
+	cp := *c
+	f.objectGCCandidates = append(f.objectGCCandidates, cp)
+	return nil
 }
 
 func newFakeMetaQuotaStore() *fakeMetaQuotaStore {

@@ -120,6 +120,19 @@ func (s *Store) SetQuotaConfig(ctx context.Context, cfg *QuotaConfig) error {
 	return err
 }
 
+func (s *Store) CopyQuotaConfig(ctx context.Context, sourceTenantID, destTenantID string) error {
+	start := time.Now()
+	var err error
+	defer observeMeta(ctx, "copy_quota_config", start, &err)
+
+	cfg, err := s.GetQuotaConfig(ctx, sourceTenantID)
+	if err != nil {
+		return err
+	}
+	cfg.TenantID = destTenantID
+	return s.SetQuotaConfig(ctx, cfg)
+}
+
 // --- QuotaUsage operations ---
 
 // GetQuotaUsage returns the pre-aggregated quota counters for a tenant.
@@ -497,6 +510,58 @@ func (s *Store) GetUploadReservation(ctx context.Context, tenantID, uploadID str
 		return nil, err
 	}
 	return r, nil
+}
+
+func (s *Store) HasActiveUploadReservations(ctx context.Context, tenantID string) (bool, error) {
+	start := time.Now()
+	var err error
+	defer observeMeta(ctx, "has_active_upload_reservations", start, &err)
+
+	var one int
+	err = s.db.QueryRowContext(ctx,
+		`SELECT 1
+		 FROM tenant_upload_reservations
+		 WHERE tenant_id = ? AND status = 'active' AND expires_at > ?
+		 LIMIT 1`, tenantID, time.Now().UTC()).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) AbortActiveUploadReservations(ctx context.Context, tenantID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "abort_active_upload_reservations", start, &err)
+
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		var total sql.NullInt64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COALESCE(SUM(reserved_bytes), 0)
+			 FROM tenant_upload_reservations
+			 WHERE tenant_id = ? AND status = 'active'`, tenantID).Scan(&total); err != nil {
+			return err
+		}
+		if total.Int64 != 0 {
+			res, err := tx.ExecContext(ctx,
+				`UPDATE tenant_quota_usage
+				 SET reserved_bytes = GREATEST(reserved_bytes - ?, 0)
+				 WHERE tenant_id = ?`, total.Int64, tenantID)
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return fmt.Errorf("tenant_quota_usage row missing for tenant %s", tenantID)
+			}
+		}
+		_, err := tx.ExecContext(ctx,
+			`UPDATE tenant_upload_reservations SET status = 'aborted'
+			 WHERE tenant_id = ? AND status = 'active'`, tenantID)
+		return err
+	})
+	return err
 }
 
 // ExpireActiveReservations marks expired active reservations as aborted and

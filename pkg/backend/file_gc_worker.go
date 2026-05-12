@@ -167,6 +167,13 @@ func (b *Dat9Backend) processFileGCTask(ctx context.Context, task *datastore.Fil
 		return err
 	}
 	if task.StorageType == datastore.StorageS3 && task.StorageRef != "" {
+		handled, err := b.enqueueObjectGCCandidateCtx(ctx, task.StorageRef, meta.ObjectGCReasonFileDelete, task.FileID)
+		if err != nil {
+			return err
+		}
+		if handled {
+			return nil
+		}
 		if b.s3 == nil {
 			return fmt.Errorf("s3 client not configured for file gc task %s", task.FileID)
 		}
