@@ -779,7 +779,17 @@ func (c *Client) Delete(path string) error {
 
 // DeleteCtx removes a file or directory with context support.
 func (c *Client) DeleteCtx(ctx context.Context, path string) error {
-	return c.deleteCtx(ctx, path, false)
+	return c.deleteCtx(ctx, path, false, "")
+}
+
+// DeleteFileCtx removes a file with a server-side type hint.
+func (c *Client) DeleteFileCtx(ctx context.Context, path string) error {
+	return c.deleteCtx(ctx, path, false, "file")
+}
+
+// DeleteDirCtx removes an empty directory with a server-side type hint.
+func (c *Client) DeleteDirCtx(ctx context.Context, path string) error {
+	return c.deleteCtx(ctx, path, false, "dir")
 }
 
 // RemoveAll removes a file or directory tree recursively.
@@ -794,14 +804,16 @@ func (c *Client) RemoveAll(path string) error {
 // It forwards to deleteCtx with recursive=true, so regular files use Delete
 // semantics and missing paths return the same 404 *StatusError as RemoveAll.
 func (c *Client) RemoveAllCtx(ctx context.Context, path string) error {
-	return c.deleteCtx(ctx, path, true)
+	return c.deleteCtx(ctx, path, true, "")
 }
 
-func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool) error {
+func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool, kind string) error {
 	requestURL := c.url(path)
 	if recursive {
 		// Use an explicit value to avoid intermediaries dropping bare "?recursive".
 		requestURL += "?recursive=1"
+	} else if kind != "" {
+		requestURL += "?kind=" + url.QueryEscape(kind)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL, nil)

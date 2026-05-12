@@ -5499,6 +5499,45 @@ func TestUnlinkRemoteDeleteAcceptsGoneAfterInterrupt(t *testing.T) {
 	}
 }
 
+func TestUnlinkAndRmdirUseDeleteKindHints(t *testing.T) {
+	var fileQuery atomic.Value
+	var dirQuery atomic.Value
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/file.txt":
+			fileQuery.Store(r.URL.RawQuery)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/dir":
+			dirQuery.Store(r.URL.RawQuery)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.inodes.Lookup("/file.txt", false, 4, time.Now())
+	fs.inodes.Lookup("/dir", true, 0, time.Now())
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "file.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+	if st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir"); st != gofuse.OK {
+		t.Fatalf("Rmdir: %v", st)
+	}
+
+	if got, _ := fileQuery.Load().(string); got != "kind=file" {
+		t.Fatalf("file delete query = %q, want kind=file", got)
+	}
+	if got, _ := dirQuery.Load().(string); got != "kind=dir" {
+		t.Fatalf("dir delete query = %q, want kind=dir", got)
+	}
+}
+
 func TestRmdirRemoteDeleteDoesNotRetryRecreatedPathAfterInterrupt(t *testing.T) {
 	path := "/repo/emptydir"
 

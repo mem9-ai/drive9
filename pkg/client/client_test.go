@@ -644,6 +644,33 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+func TestDeleteKindHints(t *testing.T) {
+	var got []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.RawQuery)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	if err := c.DeleteFileCtx(context.Background(), "/file.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeleteDirCtx(context.Background(), "/dir/"); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("requests = %d, want 2", len(got))
+	}
+	if got[0] != "kind=file" {
+		t.Fatalf("file delete query = %q, want kind=file", got[0])
+	}
+	if got[1] != "kind=dir" {
+		t.Fatalf("dir delete query = %q, want kind=dir", got[1])
+	}
+}
+
 func TestRemoveAll(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()

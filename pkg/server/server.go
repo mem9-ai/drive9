@@ -1354,23 +1354,34 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 		return
 	}
 	recursive := r.URL.Query().Has("recursive")
+	kind := r.URL.Query().Get("kind")
 	var err error
 	if recursive {
 		err = b.RemoveAllCtx(r.Context(), path)
 	} else {
-		err = b.RemoveCtx(r.Context(), path)
+		switch kind {
+		case "":
+			err = b.RemoveCtx(r.Context(), path)
+		case "file":
+			err = b.RemoveFileCtx(r.Context(), path)
+		case "dir":
+			err = b.RemoveDirCtx(r.Context(), path)
+		default:
+			errJSON(w, http.StatusBadRequest, "invalid delete kind")
+			return
+		}
 	}
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "delete_not_found", "path", path, "recursive", recursive)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "delete_not_found", "path", path, "recursive", recursive, "kind", kind)...)
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "delete_failed", "path", path, "recursive", recursive, "error", err)...)
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "delete_failed", "path", path, "recursive", recursive, "kind", kind, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "delete_ok", "path", path, "recursive", recursive)...)
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "delete_ok", "path", path, "recursive", recursive, "kind", kind)...)
 	s.publishEvent(r, path, "delete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }

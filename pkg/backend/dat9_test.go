@@ -419,6 +419,37 @@ func TestRemove(t *testing.T) {
 	}
 }
 
+func TestRemoveFileAndDirCtxUseTypedPaths(t *testing.T) {
+	b := newTestBackend(t)
+	ctx := context.Background()
+
+	if _, err := b.Write("/f.txt", []byte("data"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Mkdir("/empty", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Mkdir("/dir", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write("/g.txt", []byte("data"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.RemoveFileCtx(ctx, "/dir/"); err != datastore.ErrNotFound {
+		t.Fatalf("RemoveFileCtx dir error = %v, want ErrNotFound", err)
+	}
+	if err := b.RemoveDirCtx(ctx, "/g.txt"); err != datastore.ErrNotFound {
+		t.Fatalf("RemoveDirCtx file error = %v, want ErrNotFound", err)
+	}
+	if err := b.RemoveFileCtx(ctx, "/f.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.RemoveDirCtx(ctx, "/empty"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRemoveAll(t *testing.T) {
 	b := newTestBackend(t)
 	if err := b.Mkdir("/data", 0o755); err != nil {

@@ -1336,9 +1336,26 @@ func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPat
 	return lastErr
 }
 
-func (fs *Dat9FS) deleteRemoteWithInterruptRecovery(ctx context.Context, localPath string) error {
+func (fs *Dat9FS) deleteRemoteFileWithInterruptRecovery(ctx context.Context, localPath string) error {
+	return fs.deleteRemotePathWithInterruptRecovery(ctx, localPath, "file")
+}
+
+func (fs *Dat9FS) deleteRemoteDirWithInterruptRecovery(ctx context.Context, localPath string) error {
+	return fs.deleteRemotePathWithInterruptRecovery(ctx, localPath, "dir")
+}
+
+func (fs *Dat9FS) deleteRemotePathWithInterruptRecovery(ctx context.Context, localPath, kind string) error {
 	mutationStart := fs.perfStart()
-	err := fs.client.DeleteCtx(ctx, fs.remotePath(localPath))
+	remotePath := fs.remotePath(localPath)
+	var err error
+	switch kind {
+	case "file":
+		err = fs.client.DeleteFileCtx(ctx, remotePath)
+	case "dir":
+		err = fs.client.DeleteDirCtx(ctx, remotePath)
+	default:
+		err = fs.client.DeleteCtx(ctx, remotePath)
+	}
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err == nil || !isTransientLookupErr(err) {
 		return err
@@ -1981,7 +1998,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		// Tolerate 404 in case it was already deleted.
 		deleteStart := time.Now()
 		fs.debugf("unlink remote delete start path=%s", childP)
-		err := fs.deleteRemoteWithInterruptRecovery(ctx, childP)
+		err := fs.deleteRemoteFileWithInterruptRecovery(ctx, childP)
 		fs.debugDurationf(deleteStart, 0, "unlink remote delete done path=%s err=%v", childP, err)
 		if err != nil {
 			if !isNotFoundErr(err) {
@@ -2021,7 +2038,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 
 	deleteStart := time.Now()
 	fs.debugf("rmdir remote delete start path=%s", childP)
-	err := fs.deleteRemoteWithInterruptRecovery(ctx, childP)
+	err := fs.deleteRemoteDirWithInterruptRecovery(ctx, childP)
 	fs.debugDurationf(deleteStart, 0, "rmdir remote delete done path=%s err=%v", childP, err)
 	if err != nil {
 		status = httpToFuseStatus(err)
@@ -2032,16 +2049,14 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	// Without this, the uploader would try to PUT to paths under a deleted dir.
 	prefix := childP + "/"
 	if fs.writeBack != nil {
-		for p := range fs.writeBack.ListPendingPaths() {
-			if strings.HasPrefix(p, prefix) {
-				if fs.uploader != nil {
-					waitStart := time.Now()
-					fs.debugf("rmdir wait writeback start path=%s child=%s", childP, p)
-					fs.uploader.WaitPath(p)
-					fs.debugDurationf(waitStart, 0, "rmdir wait writeback done path=%s child=%s", childP, p)
-				}
-				fs.writeBack.Remove(p)
+		for _, meta := range fs.writeBack.ListByPrefix(prefix) {
+			if fs.uploader != nil {
+				waitStart := time.Now()
+				fs.debugf("rmdir wait writeback start path=%s child=%s", childP, meta.Path)
+				fs.uploader.WaitPath(meta.Path)
+				fs.debugDurationf(waitStart, 0, "rmdir wait writeback done path=%s child=%s", childP, meta.Path)
 			}
+			fs.writeBack.Remove(meta.Path)
 		}
 	}
 	// Cancel commitQueue entries for the subtree so background commits
@@ -2367,16 +2382,14 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	// re-keyed to newP+"/". Without this the uploader would PUT to stale paths.
 	prefix := oldP + "/"
 	if fs.writeBack != nil {
-		for p := range fs.writeBack.ListPendingPaths() {
-			if strings.HasPrefix(p, prefix) {
-				newChild := newP + p[len(oldP):]
-				if fs.uploader != nil {
-					fs.uploader.WaitPath(p)
-				}
-				fs.writeBack.RenamePending(p, newChild)
-				if fs.uploader != nil {
-					fs.uploader.Submit(newChild)
-				}
+		for _, meta := range fs.writeBack.ListByPrefix(prefix) {
+			newChild := newP + meta.Path[len(oldP):]
+			if fs.uploader != nil {
+				fs.uploader.WaitPath(meta.Path)
+			}
+			fs.writeBack.RenamePending(meta.Path, newChild)
+			if fs.uploader != nil {
+				fs.uploader.Submit(newChild)
 			}
 		}
 	}
@@ -2569,23 +2582,23 @@ func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []D
 
 	// Overlay write-back cache entries.
 	if fs.writeBack != nil {
-		for p := range fs.writeBack.ListPendingPaths() {
-			if parentDir(p) != dirPath {
+		prefix := dirPath
+		if prefix != "/" {
+			prefix += "/"
+		}
+		for _, meta := range fs.writeBack.ListByPrefix(prefix) {
+			if parentDir(meta.Path) != dirPath {
 				continue
 			}
-			name := path.Base(p)
+			name := path.Base(meta.Path)
 			if _, ok := existing[name]; ok {
-				continue
-			}
-			meta, ok := fs.writeBack.GetMeta(p)
-			if !ok {
 				continue
 			}
 			mtime := meta.Mtime
 			if mtime.IsZero() {
 				mtime = time.Now()
 			}
-			ino := fs.inodes.EnsureInode(p, false, meta.Size, mtime)
+			ino := fs.inodes.EnsureInode(meta.Path, false, meta.Size, mtime)
 			entries = append(entries, DirEntry{
 				Name: name,
 				Ino:  ino,

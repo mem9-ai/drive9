@@ -78,8 +78,8 @@ type Dat9Backend struct {
 	inlineThreshold int64
 	// textExtractMaxBytes caps synchronous text extraction input size.
 	textExtractMaxBytes int64
-	mu                    sync.Mutex
-	entropy               io.Reader
+	mu                  sync.Mutex
+	entropy             io.Reader
 
 	// Central quota enforcement (Rev 4 migration).
 	tenantID    string
@@ -105,7 +105,7 @@ type Dat9Backend struct {
 	audioExtractMaxSize      int64
 	maxAudioExtractTextBytes int
 
-	fileGCWorker *FileGCWorker
+	fileGCWorker     *FileGCWorker
 	runtimeMetricsID uint64
 
 	// Monthly LLM cost budget (P1).
@@ -282,6 +282,29 @@ func (b *Dat9Backend) RemoveCtx(ctx context.Context, path string) (err error) {
 	return err
 }
 
+func (b *Dat9Backend) RemoveFileCtx(ctx context.Context, path string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "remove_file", err, start) }()
+
+	path, err = pathutil.Canonicalize(path)
+	if err != nil {
+		return err
+	}
+	_, err = b.store.DeleteFileWithRefCheck(ctx, path)
+	return err
+}
+
+func (b *Dat9Backend) RemoveDirCtx(ctx context.Context, path string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "remove_dir", err, start) }()
+
+	path, err = pathutil.CanonicalizeDir(path)
+	if err != nil {
+		return err
+	}
+	return b.store.DeleteEmptyDir(ctx, path)
+}
+
 func (b *Dat9Backend) RemoveAll(path string) error {
 	return b.RemoveAllCtx(backgroundWithTrace(), path)
 }
@@ -295,7 +318,8 @@ func (b *Dat9Backend) RemoveAllCtx(ctx context.Context, path string) (err error)
 		return err
 	}
 	if !node.IsDirectory {
-		return b.RemoveCtx(ctx, path)
+		_, err = b.store.DeleteFileWithRefCheck(ctx, path)
+		return err
 	}
 	_, err = b.store.DeleteDirRecursive(ctx, path)
 	return err
