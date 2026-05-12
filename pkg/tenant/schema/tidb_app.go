@@ -94,10 +94,6 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			description_embedding              VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `),
 			description_embedding_revision     BIGINT
 		)`,
-		`CREATE FULLTEXT INDEX idx_semantic_fts_content ON semantic(content_text) WITH PARSER MULTILINGUAL`,
-		`CREATE FULLTEXT INDEX idx_semantic_fts_description ON semantic(description) WITH PARSER MULTILINGUAL`,
-		`CREATE VECTOR INDEX idx_semantic_cosine ON semantic((VEC_COSINE_DISTANCE(embedding)))`,
-		`CREATE VECTOR INDEX idx_semantic_desc_cosine ON semantic((VEC_COSINE_DISTANCE(description_embedding)))`,
 		`CREATE TABLE IF NOT EXISTS file_tags (
 			file_id   VARCHAR(64) NOT NULL,
 			inode_id  VARCHAR(64),
@@ -207,6 +203,10 @@ func tidbAppEmbeddingOptionalSchemaStatements() []string {
 		`ALTER TABLE files
 			ADD VECTOR INDEX idx_files_desc_cosine((VEC_COSINE_DISTANCE(description_embedding)))
 			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
+		`CREATE FULLTEXT INDEX idx_semantic_fts_content ON semantic(content_text) WITH PARSER MULTILINGUAL`,
+		`CREATE FULLTEXT INDEX idx_semantic_fts_description ON semantic(description) WITH PARSER MULTILINGUAL`,
+		`CREATE VECTOR INDEX idx_semantic_cosine ON semantic((VEC_COSINE_DISTANCE(embedding)))`,
+		`CREATE VECTOR INDEX idx_semantic_desc_cosine ON semantic((VEC_COSINE_DISTANCE(description_embedding)))`,
 	}
 }
 
