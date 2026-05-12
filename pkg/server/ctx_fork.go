@@ -25,6 +25,7 @@ type forkContextRequest struct {
 
 type forkContextResponse struct {
 	TenantID       string `json:"tenant_id"`
+	Name           string `json:"name"`
 	APIKey         string `json:"api_key"`
 	Status         string `json:"status"`
 	ParentTenantID string `json:"parent_tenant_id"`
@@ -85,7 +86,9 @@ func forkErr(code int, msg string) error {
 }
 
 func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayName string) (*forkContextResponse, error) {
-	_ = displayName // The CLI stores the user-facing ctx name locally; MetaDB tenants currently have no display-name column.
+	// The CLI stores the user-facing ctx name locally; MetaDB tenants currently
+	// have no display-name column. We echo the name back in the response so the
+	// CLI can confirm the server received it.
 	source, err := s.meta.GetTenant(ctx, sourceTenantID)
 	if err != nil {
 		return nil, err
@@ -237,6 +240,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	}
 	return &forkContextResponse{
 		TenantID:       forkID,
+		Name:           displayName,
 		APIKey:         apiToken,
 		Status:         string(meta.TenantActive),
 		ParentTenantID: source.ID,

@@ -2,16 +2,12 @@ package server
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
-	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 )
@@ -79,46 +75,12 @@ type forkCleanupTestRuntime struct {
 
 func newForkCleanupTestRuntime(t *testing.T) *forkCleanupTestRuntime {
 	t.Helper()
-	if testDSN == "" {
-		t.Skip("no test database available")
-	}
-	initServerTenantSchema(t, testDSN)
-	metaStore, err := meta.Open(testDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = metaStore.Close() })
-	cleanupForkTestTables(t, metaStore)
-
-	parsed, err := mysql.ParseDSN(testDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	host, port := "127.0.0.1", 3306
-	if parsed.Addr != "" {
-		h, p, _ := strings.Cut(parsed.Addr, ":")
-		if h != "" {
-			host = h
-		}
-		if p != "" {
-			_, _ = fmt.Sscanf(p, "%d", &port)
-		}
-	}
-	master := make([]byte, 32)
-	if _, err := rand.Read(master); err != nil {
-		t.Fatal(err)
-	}
-	enc, err := encrypt.NewLocalAESEncryptor(master)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost", SkipTiDBSchemaCheck: true}, enc)
-	pool.SetMetaStore(metaStore)
-	t.Cleanup(pool.Close)
+	db := newTestDBInfo(t)
+	cleanupForkTestTables(t, db.Meta)
 	prov := &fakeBranchProvisioner{}
-	server := NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov, TokenSecret: []byte("ctx-fork-test-secret")})
+	server := NewWithConfig(Config{Meta: db.Meta, Pool: db.Pool, Provisioner: prov, TokenSecret: []byte("ctx-fork-test-secret")})
 	t.Cleanup(server.Close)
-	return &forkCleanupTestRuntime{server: server, meta: metaStore, pool: pool, prov: prov, dbHost: host, dbPort: port, dbUser: parsed.User, dbPass: parsed.Passwd, dbName: parsed.DBName}
+	return &forkCleanupTestRuntime{server: server, meta: db.Meta, pool: db.Pool, prov: prov, dbHost: db.DBHost, dbPort: db.DBPort, dbUser: db.DBUser, dbPass: db.DBPass, dbName: db.DBName}
 }
 
 func cleanupForkTestTables(t *testing.T, s *meta.Store) {
@@ -134,7 +96,9 @@ func cleanupForkTestTables(t *testing.T, s *meta.Store) {
 		`DELETE FROM uploads`,
 		`DELETE FROM semantic_tasks`,
 	} {
-		_, _ = s.DB().Exec(stmt)
+		if _, err := s.DB().Exec(stmt); err != nil {
+			t.Fatalf("cleanupForkTestTables: %s: %v", stmt, err)
+		}
 	}
 }
 

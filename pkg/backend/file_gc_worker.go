@@ -167,13 +167,20 @@ func (b *Dat9Backend) processFileGCTask(ctx context.Context, task *datastore.Fil
 	}
 	if task.StorageType == datastore.StorageS3 && task.StorageRef != "" {
 		handled, err := b.enqueueObjectGCCandidateCtx(ctx, task.StorageRef, meta.ObjectGCReasonFileDelete, task.FileID)
-		if err != nil {
-			return err
-		}
-		if handled {
+		if handled && err == nil {
 			return nil
 		}
-		return fmt.Errorf("object gc candidate enqueue not configured for file gc task %s", task.FileID)
+		if err != nil {
+			logger.Warn(ctx, "file_gc_object_gc_candidate_failed_fallback_delete",
+				zap.String("file_id", task.FileID),
+				zap.String("storage_ref", task.StorageRef),
+				zap.Error(err))
+			// Fallback: GC enqueue failed, delete the blob directly to avoid leaking storage.
+			b.deleteBlobCtx(ctx, task.StorageRef)
+			return nil
+		}
+		// GC enqueue not configured — fall back to direct delete.
+		b.deleteBlobCtx(ctx, task.StorageRef)
 	}
 	return nil
 }
