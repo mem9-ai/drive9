@@ -594,6 +594,22 @@ func TestCreateFileCtxPostsCreateActionAndReturnsRevision(t *testing.T) {
 	}
 }
 
+func TestCreateFileCtxReturnsMalformedJSONError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("{"))
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	_, err := c.CreateFileCtx(context.Background(), "/empty.txt")
+	if err == nil {
+		t.Fatal("CreateFileCtx error = nil, want decode error")
+	}
+	if !strings.Contains(err.Error(), "decode create file response:") {
+		t.Fatalf("error = %v, want decode create file response error", err)
+	}
+}
+
 func TestWriteCtxConditionalWithTagsRejectsInvalidHeaderTags(t *testing.T) {
 	requests := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

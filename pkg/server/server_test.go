@@ -1088,6 +1088,24 @@ func TestCreateFileActionCreatesEmptyFileAndConflicts(t *testing.T) {
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("duplicate create status = %d, want 409", resp.StatusCode)
 	}
+
+	var fileRows int
+	if err := s.fallback.Store().DB().QueryRow(`SELECT COUNT(*) FROM files`).Scan(&fileRows); err != nil {
+		t.Fatal(err)
+	}
+	if fileRows != 1 {
+		t.Fatalf("files rows after duplicate create = %d, want 1", fileRows)
+	}
+	var orphanRows int
+	if err := s.fallback.Store().DB().QueryRow(`SELECT COUNT(*)
+		FROM files f
+		LEFT JOIN file_nodes fn ON fn.file_id = f.file_id
+		WHERE fn.file_id IS NULL`).Scan(&orphanRows); err != nil {
+		t.Fatal(err)
+	}
+	if orphanRows != 0 {
+		t.Fatalf("orphan files after duplicate create = %d, want 0", orphanRows)
+	}
 }
 
 func TestLocalTenantShimProvisionAndStatus(t *testing.T) {

@@ -490,7 +490,10 @@ func (c *Client) CreateFileCtx(ctx context.Context, path string) (int64, error) 
 		Revision int64 `json:"revision"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return 0, nil
+		if errors.Is(err, io.EOF) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("decode create file response: %w", err)
 	}
 	return result.Revision, nil
 }

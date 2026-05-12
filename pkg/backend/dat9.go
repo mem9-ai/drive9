@@ -215,29 +215,33 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		}
 	}
 
-	err = b.store.InsertFile(ctx, &datastore.File{
-		FileID: fileID, StorageType: storageType, StorageRef: storageRef,
-		StorageEncryptionMode:  storageEncryptionMode,
-		StorageEncryptionKeyID: storageEncryptionKeyID,
-		ContentBlob:            contentBlob,
-		SizeBytes:              0, Revision: 1, Status: datastore.StatusConfirmed,
-		CreatedAt: now, ConfirmedAt: &now,
+	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.store.InsertFileTx(tx, &datastore.File{
+			FileID: fileID, StorageType: storageType, StorageRef: storageRef,
+			StorageEncryptionMode:  storageEncryptionMode,
+			StorageEncryptionKeyID: storageEncryptionKeyID,
+			ContentBlob:            contentBlob,
+			SizeBytes:              0, Revision: 1, Status: datastore.StatusConfirmed,
+			CreatedAt: now, ConfirmedAt: &now,
+		}); err != nil {
+			return err
+		}
+		if err := b.store.EnsureParentDirsTx(tx, path, b.genID); err != nil {
+			return err
+		}
+		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+			NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
+			Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
+		})
 	})
 	if err != nil {
+		if storageType == datastore.StorageS3 {
+			b.deleteBlobCtx(ctx, storageRef)
+		}
 		return err
 	}
-	err = b.store.EnsureParentDirs(ctx, path, b.genID)
-	if err != nil {
-		return err
-	}
-	err = b.store.InsertNode(ctx, &datastore.FileNode{
-		NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
-		Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
-	})
-	if err == nil {
-		b.syncCentralFileCreate(ctx, fileID, 0, "")
-	}
-	return err
+	b.syncCentralFileCreate(ctx, fileID, 0, "")
+	return nil
 }
 
 func (b *Dat9Backend) Mkdir(path string, perm uint32) error {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
@@ -60,6 +61,76 @@ func TestCreateAndStat(t *testing.T) {
 	}
 	if info.Name != "hello.txt" || info.IsDir || info.Size != 0 {
 		t.Errorf("unexpected: %+v", info)
+	}
+}
+
+func TestCreateDuplicateDoesNotLeaveOrphanFileOrObject(t *testing.T) {
+	ctx := context.Background()
+	s3Dir, err := os.MkdirTemp("", "dat9-s3-create-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(s3Dir) })
+
+	initBackendSchema(t, testDSN)
+	store, err := datastore.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testmysql.ResetDB(t, store.DB())
+	t.Cleanup(func() { _ = store.Close() })
+
+	s3c, err := s3client.NewLocal(s3Dir, "/s3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewWithS3Mode(store, s3c, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+
+	if err := b.CreateCtx(ctx, "/empty.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CreateCtx(ctx, "/empty.txt"); !errors.Is(err, datastore.ErrPathConflict) {
+		t.Fatalf("duplicate CreateCtx error = %v, want ErrPathConflict", err)
+	}
+
+	var files int
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM files`).Scan(&files); err != nil {
+		t.Fatal(err)
+	}
+	if files != 1 {
+		t.Fatalf("files rows = %d, want 1", files)
+	}
+	var orphans int
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM files f
+		LEFT JOIN file_nodes fn ON fn.file_id = f.file_id
+		WHERE fn.file_id IS NULL`).Scan(&orphans); err != nil {
+		t.Fatal(err)
+	}
+	if orphans != 0 {
+		t.Fatalf("orphan files = %d, want 0", orphans)
+	}
+
+	objectCount := 0
+	objectsRoot := filepath.Join(s3Dir, "objects")
+	err = filepath.WalkDir(objectsRoot, func(_ string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.Type().IsRegular() {
+			objectCount++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if objectCount != 1 {
+		t.Fatalf("s3 object count = %d, want 1", objectCount)
 	}
 }
 

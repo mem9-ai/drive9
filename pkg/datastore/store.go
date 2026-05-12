@@ -1275,25 +1275,7 @@ func fileIDInQuery(prefix string, firstArg any, files []*File) (string, []any) {
 }
 
 func pathPrefixPredicate(column, prefix string) (string, []any) {
-	upper, ok := nextPathPrefix(prefix)
-	if !ok {
-		return column + " = ? OR " + column + " >= ?", []any{prefix, prefix}
-	}
-	return column + " = ? OR (" + column + " >= ? AND " + column + " < ?)", []any{prefix, prefix, upper}
-}
-
-func nextPathPrefix(prefix string) (string, bool) {
-	if prefix == "" {
-		return "", false
-	}
-	b := []byte(prefix)
-	for i := len(b) - 1; i >= 0; i-- {
-		if b[i] != 0xff {
-			b[i]++
-			return string(b[:i+1]), true
-		}
-	}
-	return "", false
+	return "BINARY " + column + " LIKE BINARY ? ESCAPE '\\\\'", []any{likeLiteralPrefixPattern(prefix)}
 }
 
 // --- uploads operations ---
