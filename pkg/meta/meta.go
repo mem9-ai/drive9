@@ -1164,6 +1164,27 @@ func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *
 	return nil
 }
 
+func (s *Store) UpdateTenantBranch(ctx context.Context, id string, cluster *Tenant) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tenant_branch", start, &err)
+	if cluster == nil {
+		return fmt.Errorf("tenant branch is required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants
+		SET provider = ?, cluster_id = ?, branch_id = ?, claim_url = ?, claim_expires_at = ?, updated_at = ?
+		WHERE id = ?`,
+		cluster.Provider, nullStr(cluster.ClusterID), cluster.BranchID, nullStr(cluster.ClaimURL), cluster.ClaimExpiresAt,
+		time.Now().UTC(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) RevokeTenantAPIKeys(ctx context.Context, tenantID string) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "revoke_tenant_api_keys", start, &err)

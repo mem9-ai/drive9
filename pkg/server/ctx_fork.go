@@ -133,13 +133,23 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 
 	cluster, err := branchProvisioner.ProvisionBranch(ctx, forkID, clusterInfoFromTenant(source))
 	if err != nil {
-		s.markForkFailedAndCleanup(ctx, forkID)
+		s.markForkDeletedNoBranch(ctx, forkID)
 		return nil, err
 	}
 	cluster.Provider = source.Provider
+	if err := s.meta.UpdateTenantBranch(ctx, forkID, &meta.Tenant{
+		Provider:       cluster.Provider,
+		ClusterID:      cluster.ClusterID,
+		BranchID:       cluster.BranchID,
+		ClaimURL:       cluster.ClaimURL,
+		ClaimExpiresAt: cluster.ClaimExpiresAt,
+	}); err != nil {
+		s.deleteUnpersistedForkBranch(ctx, forkID, branchProvisioner, cluster)
+		return nil, err
+	}
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
 	if err != nil {
-		s.deleteUnpersistedForkBranch(ctx, forkID, branchProvisioner, cluster)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 	if err := s.meta.UpdateTenantConnection(ctx, forkID, &meta.Tenant{
@@ -155,7 +165,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		ClaimURL:         cluster.ClaimURL,
 		ClaimExpiresAt:   cluster.ClaimExpiresAt,
 	}); err != nil {
-		s.deleteUnpersistedForkBranch(ctx, forkID, branchProvisioner, cluster)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 
@@ -238,6 +248,12 @@ func (s *Server) markForkFailed(ctx context.Context, forkID string) {
 	}
 }
 
+func (s *Server) markForkDeletedNoBranch(ctx context.Context, forkID string) {
+	if err := s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantDeleted); err != nil {
+		logger.Error(ctx, "fork_mark_deleted_no_branch_failed", zap.String("tenant_id", forkID), zap.Error(err))
+	}
+}
+
 func (s *Server) markForkFailedAndCleanup(ctx context.Context, forkID string) {
 	s.markForkFailed(ctx, forkID)
 	go s.cleanupForkTenant(backgroundWithTrace(ctx), forkID)
@@ -251,7 +267,22 @@ func (s *Server) deleteUnpersistedForkBranch(ctx context.Context, forkID string,
 				zap.String("cluster_id", cluster.ClusterID),
 				zap.String("branch_id", cluster.BranchID),
 				zap.Error(err))
-			s.markForkFailed(ctx, forkID)
+			if perr := s.meta.UpdateTenantBranch(ctx, forkID, &meta.Tenant{
+				Provider:       cluster.Provider,
+				ClusterID:      cluster.ClusterID,
+				BranchID:       cluster.BranchID,
+				ClaimURL:       cluster.ClaimURL,
+				ClaimExpiresAt: cluster.ClaimExpiresAt,
+			}); perr != nil {
+				logger.Error(ctx, "fork_persist_branch_after_delete_failure_failed",
+					zap.String("tenant_id", forkID),
+					zap.String("cluster_id", cluster.ClusterID),
+					zap.String("branch_id", cluster.BranchID),
+					zap.Error(perr))
+				s.markForkFailed(ctx, forkID)
+				return
+			}
+			s.markForkFailedAndCleanup(ctx, forkID)
 			return
 		}
 	}
@@ -384,9 +415,11 @@ func (s *Server) cleanupForkTenant(ctx context.Context, tenantID string) {
 	}
 	_ = s.meta.AbortActiveUploadReservations(ctx, tenantID)
 	if t.BranchID == "" {
-		if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantDeleted); err != nil {
-			logger.Error(ctx, "fork_cleanup_mark_deleted_without_branch_failed", zap.String("tenant_id", tenantID), zap.Error(err))
-		}
+		logger.Error(ctx, "fork_cleanup_missing_branch_id", zap.String("tenant_id", tenantID), zap.String("status", string(t.Status)))
+		return
+	}
+	if t.Status != meta.TenantDeleting {
+		s.cleanupFailedForkBranch(ctx, t)
 		return
 	}
 	store, err := s.openTenantStore(ctx, t)
@@ -395,12 +428,16 @@ func (s *Server) cleanupForkTenant(ctx context.Context, tenantID string) {
 		return
 	}
 	defer func() { _ = store.Close() }()
-	if err := store.SanitizeForkRuntimeState(ctx); err != nil {
-		logger.Error(ctx, "fork_cleanup_sanitize_failed", zap.String("tenant_id", tenantID), zap.Error(err))
-		return
-	}
 	if err := s.enqueueForkConfirmedRefs(ctx, t, store); err != nil {
 		logger.Error(ctx, "fork_cleanup_enqueue_refs_failed", zap.String("tenant_id", tenantID), zap.Error(err))
+		return
+	}
+	if err := s.enqueueForkFileGCTaskRefs(ctx, t, store); err != nil {
+		logger.Error(ctx, "fork_cleanup_enqueue_file_gc_refs_failed", zap.String("tenant_id", tenantID), zap.Error(err))
+		return
+	}
+	if err := store.SanitizeForkRuntimeState(ctx); err != nil {
+		logger.Error(ctx, "fork_cleanup_sanitize_failed", zap.String("tenant_id", tenantID), zap.Error(err))
 		return
 	}
 	if branchProvisioner, ok := s.provisioner.(tenant.BranchProvisioner); ok && t.BranchID != "" {
@@ -415,12 +452,49 @@ func (s *Server) cleanupForkTenant(ctx context.Context, tenantID string) {
 	}
 }
 
+func (s *Server) cleanupFailedForkBranch(ctx context.Context, t *meta.Tenant) {
+	if branchProvisioner, ok := s.provisioner.(tenant.BranchProvisioner); ok && t.BranchID != "" {
+		if err := branchProvisioner.DeleteBranch(ctx, t.ClusterID, t.BranchID); err != nil {
+			logger.Error(ctx, "fork_cleanup_failed_delete_branch_failed", zap.String("tenant_id", t.ID), zap.Error(err))
+			return
+		}
+	}
+	if err := s.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted); err != nil {
+		logger.Error(ctx, "fork_cleanup_failed_mark_deleted_failed", zap.String("tenant_id", t.ID), zap.Error(err))
+	}
+}
+
 func (s *Server) openTenantStore(ctx context.Context, t *meta.Tenant) (*datastore.Store, error) {
 	plain, err := s.pool.Decrypt(ctx, t.DBPasswordCipher)
 	if err != nil {
 		return nil, err
 	}
 	return datastore.Open(tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS))
+}
+
+func (s *Server) enqueueForkFileGCTaskRefs(ctx context.Context, t *meta.Tenant, store *datastore.Store) error {
+	cursor := ""
+	for {
+		refs, next, err := store.ListFileGCTaskS3Refs(ctx, cursor, 500)
+		if err != nil {
+			return err
+		}
+		for _, ref := range refs {
+			if err := s.meta.EnqueueObjectGCCandidate(ctx, &meta.ObjectGCCandidateInput{
+				NamespaceID:    t.StorageNamespaceID,
+				StorageRef:     ref.StorageRef,
+				StorageRefHash: ref.StorageRefHash,
+				Reason:         meta.ObjectGCReasonFileDelete,
+				SourceTenantID: t.ID,
+			}); err != nil {
+				return err
+			}
+		}
+		if next == "" {
+			return nil
+		}
+		cursor = next
+	}
 }
 
 func (s *Server) enqueueForkConfirmedRefs(ctx context.Context, t *meta.Tenant, store *datastore.Store) error {

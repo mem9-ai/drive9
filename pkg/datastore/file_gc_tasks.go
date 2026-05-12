@@ -69,6 +69,49 @@ func (s *Store) GetFileGCTaskByFileID(ctx context.Context, fileID string) (out *
 	return scanFileGCTask(row)
 }
 
+func (s *Store) ListFileGCTaskS3Refs(ctx context.Context, cursor string, limit int) ([]ConfirmedS3Ref, string, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	var rows *sql.Rows
+	var err error
+	if cursor == "" {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT DISTINCT storage_ref
+			 FROM file_gc_tasks
+			 WHERE storage_type = 's3' AND storage_ref <> ''
+			 ORDER BY storage_ref ASC LIMIT ?`, limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT DISTINCT storage_ref
+			 FROM file_gc_tasks
+			 WHERE storage_type = 's3' AND storage_ref <> '' AND storage_ref > ?
+			 ORDER BY storage_ref ASC LIMIT ?`, cursor, limit)
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("query file gc s3 refs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]ConfirmedS3Ref, 0)
+	for rows.Next() {
+		var ref ConfirmedS3Ref
+		if err := rows.Scan(&ref.StorageRef); err != nil {
+			return nil, "", fmt.Errorf("scan file gc s3 ref: %w", err)
+		}
+		ref.StorageRefHash = StorageRefHash(ref.StorageRef)
+		out = append(out, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	nextCursor := ""
+	if len(out) == limit {
+		nextCursor = out[len(out)-1].StorageRef
+	}
+	return out, nextCursor, nil
+}
+
 // ClaimFileGCTask claims one queued file GC task and leases it to the caller.
 func (s *Store) ClaimFileGCTask(ctx context.Context, now time.Time, leaseDuration time.Duration) (out *FileGCTask, found bool, err error) {
 	start := time.Now()
