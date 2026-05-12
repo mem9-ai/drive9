@@ -567,7 +567,7 @@ func (s *Store) insertSplitTablesTx(tx execer, f *File) error {
 		Mode:        mode,
 		Status:      f.Status,
 		CreatedAt:   f.CreatedAt,
-		Mtime:       now,
+		Mtime:       coalesceTime(f.ConfirmedAt, now),
 		ConfirmedAt: f.ConfirmedAt,
 		ExpiresAt:   f.ExpiresAt,
 	}
@@ -612,8 +612,14 @@ func (s *Store) GetFile(ctx context.Context, fileID string) (out *File, err erro
 		}
 		return nil, err
 	}
-	content, _ := s.GetContent(ctx, fileID)
-	semantic, _ := s.GetSemantic(ctx, fileID)
+	content, contentErr := s.GetContent(ctx, fileID)
+	if contentErr != nil && !errors.Is(contentErr, sql.ErrNoRows) {
+		logger.Warn(ctx, "get content failed", zap.String("inode_id", fileID), zap.Error(contentErr))
+	}
+	semantic, semanticErr := s.GetSemantic(ctx, fileID)
+	if semanticErr != nil && !errors.Is(semanticErr, sql.ErrNoRows) {
+		logger.Warn(ctx, "get semantic failed", zap.String("inode_id", fileID), zap.Error(semanticErr))
+	}
 	out = assembleFile(inode, content, semantic)
 	return out, nil
 }
@@ -869,8 +875,10 @@ func (s *Store) CompleteUploadTx(db execer, uploadID string) error {
 	return err
 }
 
-// Chmod updates the permission bits (mode) of the file at path.
-// It returns ErrNotFound if the path does not exist or is a directory.
+// Chmod updates the permission bits (mode) of the file or directory at path.
+// It returns ErrNotFound if the path does not exist or the node has no
+// associated inode record (e.g. an old directory created before the
+// split-table migration).
 func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "chmod", start, &err)
@@ -1002,7 +1010,7 @@ func (s *Store) ConfirmedFileSizeByPathTx(db execer, path string) (int64, error)
 	var size sql.NullInt64
 	err := db.QueryRow(`SELECT i.size_bytes
 		FROM file_nodes fn
-		JOIN inodes i ON i.inode_id = fn.file_id
+		JOIN inodes i ON i.inode_id = COALESCE(fn.inode_id, fn.file_id)
 		WHERE fn.path = ? AND fn.is_directory = 0 AND i.status = 'CONFIRMED'
 		LIMIT 1`, path).Scan(&size)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1964,6 +1972,13 @@ func nilTime(t *time.Time) interface{} {
 		return nil
 	}
 	return t.UTC()
+}
+
+func coalesceTime(t *time.Time, fallback time.Time) time.Time {
+	if t != nil {
+		return *t
+	}
+	return fallback
 }
 
 func parentPath(p string) string {

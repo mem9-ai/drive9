@@ -221,6 +221,12 @@ func (m *SplitTablesMigrator) createDirInodes(ctx context.Context) (int64, error
 	if err != nil {
 		return 0, err
 	}
+	// Link migrated directory inodes back to file_nodes.
+	if _, err := m.db.ExecContext(ctx, `
+		UPDATE file_nodes SET inode_id = node_id WHERE is_directory = 1 AND inode_id IS NULL
+	`); err != nil {
+		return 0, fmt.Errorf("backfill directory inode_id: %w", err)
+	}
 	return res.RowsAffected()
 }
 

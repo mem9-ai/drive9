@@ -136,7 +136,7 @@ func buildVectorSearchQuery(queryEmbedding []float32, pathPrefix string, limit i
 
 	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.embedding, ?) AS distance
-		FROM file_nodes fn JOIN inodes i ON fn.file_id = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + strings.Join(conds, " AND ") + `
 		ORDER BY VEC_EMBED_COSINE_DISTANCE(s.embedding, ?)
 	LIMIT ?`
@@ -159,7 +159,7 @@ func buildVectorSearchByTextQuery(queryText, pathPrefix string, limit int) (stri
 
 	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.embedding, ?) AS distance
-		FROM file_nodes fn JOIN inodes i ON fn.file_id = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + strings.Join(conds, " AND ") + `
 		ORDER BY distance
 		LIMIT ?`
@@ -202,7 +202,7 @@ func buildVectorSearchDescriptionQuery(queryEmbedding []float32, pathPrefix stri
 
 	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?) AS distance
-		FROM file_nodes fn JOIN inodes i ON fn.file_id = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + strings.Join(conds, " AND ") + `
 		ORDER BY VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?)
 	LIMIT ?`
@@ -227,7 +227,7 @@ func buildVectorSearchDescriptionByTextQuery(queryText, pathPrefix string, limit
 
 	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?) AS distance
-		FROM file_nodes fn JOIN inodes i ON fn.file_id = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + strings.Join(conds, " AND ") + `
 		ORDER BY distance
 	LIMIT ?`
@@ -273,7 +273,7 @@ func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit i
 
 	q := `SELECT fn.path, fn.name, i.size_bytes, fts.score
 		FROM (` + innerQ + `) fts
-		JOIN file_nodes fn ON fn.file_id = fts.inode_id
+		JOIN file_nodes fn ON COALESCE(fn.inode_id, fn.file_id) = fts.inode_id
 		JOIN inodes i ON i.inode_id = fts.inode_id`
 	if len(outerConds) > 0 {
 		q += ` WHERE ` + strings.Join(outerConds, " AND ")
@@ -315,7 +315,7 @@ func (s *Store) KeywordSearch(ctx context.Context, query, pathPrefix string, lim
 	args = append(args, limit)
 
 	q := `SELECT fn.path, fn.name, i.size_bytes
-		FROM file_nodes fn JOIN inodes i ON fn.file_id = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + strings.Join(conds, " AND ") + `
 		ORDER BY i.confirmed_at DESC LIMIT ?`
 
@@ -382,7 +382,7 @@ func (s *Store) Find(ctx context.Context, f *FindFilter) ([]SearchResult, error)
 	args = append(args, f.Limit)
 
 	q := `SELECT fn.path, fn.name, i.size_bytes
-		FROM file_nodes fn JOIN inodes i ON fn.file_id = i.inode_id
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id
 		WHERE ` + strings.Join(conds, " AND ") + `
 		ORDER BY fn.path LIMIT ?`
 
