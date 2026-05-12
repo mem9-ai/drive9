@@ -754,10 +754,18 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 	out.SetTimes(&mtime, &mtime, &mtime)
 
 	if entry.IsDir {
-		out.Mode = syscall.S_IFDIR | 0755
+		mode := entry.Mode
+		if !entry.HasMode {
+			mode = 0755
+		}
+		out.Mode = syscall.S_IFDIR | mode
 		out.Nlink = 2
 	} else {
-		out.Mode = syscall.S_IFREG | 0644
+		mode := entry.Mode
+		if !entry.HasMode {
+			mode = 0644
+		}
+		out.Mode = syscall.S_IFREG | mode
 		out.Nlink = 1
 	}
 }
@@ -1137,10 +1145,12 @@ func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
 			mtime = time.Unix(item.Mtime, 0)
 		}
 		cached[i] = CachedFileInfo{
-			Name:  item.Name,
-			Size:  item.Size,
-			IsDir: item.IsDir,
-			Mtime: mtime,
+			Name:    item.Name,
+			Size:    item.Size,
+			IsDir:   item.IsDir,
+			Mtime:   mtime,
+			Mode:    item.Mode,
+			HasMode: item.HasMode,
 		}
 	}
 	return cached
@@ -1204,6 +1214,8 @@ func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
 		IsDir:    entry.IsDir,
 		Mtime:    mtime,
 		Revision: entry.Revision,
+		Mode:     entry.Mode,
+		HasMode:  entry.HasMode,
 	}
 }
 
@@ -1217,6 +1229,8 @@ func cachedInfoFromStat(name string, stat *client.StatResult) CachedFileInfo {
 		item.Size = stat.Size
 		item.IsDir = stat.IsDir
 		item.Revision = stat.Revision
+		item.HasMode = stat.HasMode
+		item.Mode = stat.Mode
 	}
 	return item
 }
@@ -1304,11 +1318,11 @@ func (fs *Dat9FS) remotePathExistsDetached(localPath string) (bool, error) {
 	return false, err
 }
 
-func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string) error {
+func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string, mode uint32) error {
 	apiPath := fs.remotePath(localPath)
 	ctx, cf := fuseCtx(cancel)
 	mutationStart := fs.perfStart()
-	err := fs.client.MkdirCtx(ctx, apiPath)
+	err := fs.client.MkdirCtx(ctx, apiPath, mode)
 	cf()
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err == nil || !isTransientLookupErr(err) {
@@ -1331,7 +1345,7 @@ func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPat
 	for range retryCount {
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
 		mutationStart = fs.perfStart()
-		err = fs.client.MkdirCtx(retryCtx, apiPath)
+		err = fs.client.MkdirCtx(retryCtx, apiPath, mode)
 		retryCancel()
 		fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 		if err == nil {
@@ -1456,6 +1470,9 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 		ino := fs.inodes.Lookup(childP, item.IsDir, item.Size, mtime)
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
+		}
+		if item.HasMode {
+			fs.inodes.UpdateMode(ino, item.Mode)
 		}
 		entry, ok := fs.inodes.GetEntry(ino)
 		if !ok {
@@ -1636,6 +1653,9 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 					mtime = time.Unix(item.Mtime, 0)
 				}
 				ino := fs.inodes.Lookup(childP, item.IsDir, item.Size, mtime)
+				if item.HasMode {
+					fs.inodes.UpdateMode(ino, item.Mode)
+				}
 				entry, ok := fs.inodes.GetEntry(ino)
 				if !ok {
 					return gofuse.EIO
@@ -1660,6 +1680,9 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// Store server revision for cache validation.
 	if stat.Revision > 0 {
 		fs.inodes.UpdateRevision(ino, stat.Revision)
+	}
+	if stat.HasMode {
+		fs.inodes.UpdateMode(ino, stat.Mode)
 	}
 	fs.dirCache.Upsert(parentPath, cachedInfoFromStat(name, stat))
 	entry, ok := fs.inodes.GetEntry(ino)
@@ -1846,6 +1869,36 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		fs.inodes.UpdateMtime(input.NodeId, mtime)
 	}
 
+	// Handle mode (chmod)
+	if input.Valid&gofuse.FATTR_MODE != 0 {
+		mode := input.Mode & 0777
+		// If the file has an open dirty handle, update mode locally without
+		// consulting the remote server. The mode will be synced on Flush.
+		// Use a single ForEach pass to avoid a TOCTOU race between the check
+		// and the mutation.
+		hasDirtyHandle := false
+		fs.fileHandles.ForEach(func(_ uint64, h *FileHandle) {
+			if h.Ino == input.NodeId && h.Dirty != nil {
+				hasDirtyHandle = true
+				h.PendingMode = mode
+				h.HasPendingMode = true
+				if !h.HasPreviousMode {
+					h.PreviousMode = entry.Mode
+					h.HasPreviousMode = true
+				}
+			}
+		})
+		if !hasDirtyHandle {
+			ctx, cf := fuseCtx(cancel)
+			defer cf()
+			if err := fs.client.ChmodCtx(ctx, fs.remotePath(entry.Path), mode); err != nil {
+				return httpToFuseStatus(err)
+			}
+		}
+		entry.Mode = mode
+		fs.inodes.UpdateMode(input.NodeId, mode)
+	}
+
 	// Handle truncate
 	if input.Valid&gofuse.FATTR_SIZE != 0 {
 		newSize := int64(input.Size)
@@ -1927,11 +1980,13 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 		return st
 	}
 
-	if err := fs.mkdirRemoteWithTransientRetry(cancel, childP); err != nil {
+	mode := input.Mode & 0o777
+	if err := fs.mkdirRemoteWithTransientRetry(cancel, childP, mode); err != nil {
 		return httpToFuseStatus(err)
 	}
 
 	ino := fs.inodes.Lookup(childP, true, 0, time.Now())
+	fs.inodes.UpdateMode(ino, mode)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
@@ -2587,6 +2642,8 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 				item.Mtime = time.Unix(result.Mtime, 0)
 			}
 			item.Revision = result.Revision
+			item.HasMode = result.HasMode
+			item.Mode = result.Mode
 		}
 	}
 }
@@ -2677,12 +2734,18 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
 		}
+		if item.HasMode {
+			fs.inodes.UpdateMode(ino, item.Mode)
+		}
 
 		var mode uint32
 		if item.IsDir {
 			mode = syscall.S_IFDIR
 		} else {
 			mode = syscall.S_IFREG
+		}
+		if item.HasMode {
+			mode |= item.Mode & 0o777
 		}
 		entries = append(entries, DirEntry{
 			Name: item.Name,
@@ -3757,6 +3820,36 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	defer func() { fs.perfRecordFuse(perfFuseRelease, perfStart, releaseStatus, 0) }()
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
+		flushStatus := gofuse.OK
+		// Apply any deferred chmod after flush completes but before cleanup.
+		defer func() {
+			if fh.HasPendingMode {
+				if flushStatus == gofuse.OK {
+					ctx, cf := context.WithTimeout(context.Background(), 30*time.Second)
+					if err := fs.client.ChmodCtx(ctx, fs.remotePath(fh.Path), fh.PendingMode); err != nil {
+						log.Printf("release: pending chmod failed for %s: %v", fh.Path, err)
+						// Revert in-memory mode so local GetAttr doesn't lie.
+						if fh.HasPreviousMode {
+							fs.inodes.UpdateMode(fh.Ino, fh.PreviousMode)
+						}
+					}
+					cf()
+				} else {
+					// Flush failed — revert the in-memory mode so local GetAttr doesn't lie.
+					if fh.HasPreviousMode {
+						fs.inodes.UpdateMode(fh.Ino, fh.PreviousMode)
+					}
+				}
+				// Clear pending mode on all sibling handles so they don't re-apply
+				// or revert after this handle already decided the outcome.
+				fs.fileHandles.ForEach(func(_ uint64, h *FileHandle) {
+					if h.Ino == fh.Ino {
+						h.HasPendingMode = false
+						h.HasPreviousMode = false
+					}
+				})
+			}
+		}()
 		defer func() {
 			if fh.Prefetch != nil {
 				fh.Prefetch.Close()
@@ -3772,7 +3865,6 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 
 		start := time.Now()
 		phase := "start"
-		flushStatus := gofuse.OK
 		defer func() { releaseStatus = flushStatus }()
 		fs.debugf("release start path=%s fh=%d ino=%d", fh.Path, input.Fh, fh.Ino)
 		defer func() {

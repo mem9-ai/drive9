@@ -659,6 +659,42 @@ func TestTiDBSchemaSpecForModeIncludesAlterTableIndexes(t *testing.T) {
 	}
 }
 
+func TestTiDBSchemaSpecForModeIncludesSemanticIndexes(t *testing.T) {
+	// In auto-embedding mode, semantic table FULLTEXT and VECTOR indexes are
+	 // part of the enforceable schema contract and must appear in the spec.
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "semantic")
+	if _, ok := spec.indexes["idx_semantic_fts_content"]; !ok {
+		t.Fatal("semantic missing idx_semantic_fts_content index spec from ALTER TABLE statement")
+	}
+	if _, ok := spec.indexes["idx_semantic_fts_description"]; !ok {
+		t.Fatal("semantic missing idx_semantic_fts_description index spec from ALTER TABLE statement")
+	}
+	if _, ok := spec.indexes["idx_semantic_cosine"]; !ok {
+		t.Fatal("semantic auto mode spec must include idx_semantic_cosine index")
+	}
+	if _, ok := spec.indexes["idx_semantic_desc_cosine"]; !ok {
+		t.Fatal("semantic auto mode spec must include idx_semantic_desc_cosine index")
+	}
+}
+
+func TestTiDBSchemaSpecForAppModeExcludesSemanticIndexes(t *testing.T) {
+	// Optional semantic indexes use ADD_COLUMNAR_REPLICA_ON_DEMAND and must not
+	// appear in the app mode schema contract so validation does not fail.
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeApp, "semantic")
+	if _, ok := spec.indexes["idx_semantic_fts_content"]; ok {
+		t.Fatal("semantic app mode spec must not include optional idx_semantic_fts_content index")
+	}
+	if _, ok := spec.indexes["idx_semantic_fts_description"]; ok {
+		t.Fatal("semantic app mode spec must not include optional idx_semantic_fts_description index")
+	}
+	if _, ok := spec.indexes["idx_semantic_cosine"]; ok {
+		t.Fatal("semantic app mode spec must not include optional idx_semantic_cosine index")
+	}
+	if _, ok := spec.indexes["idx_semantic_desc_cosine"]; ok {
+		t.Fatal("semantic app mode spec must not include optional idx_semantic_desc_cosine index")
+	}
+}
+
 func TestTiDBSchemaSpecForAppModeExcludesOptionalIndexes(t *testing.T) {
 	// Optional FULLTEXT/VECTOR indexes use ADD_COLUMNAR_REPLICA_ON_DEMAND which
 	// is not supported on all TiDB versions. They must not appear in the app

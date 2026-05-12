@@ -1586,7 +1586,7 @@ func TestLookupSessionCreatedDirMissAvoidsRemoteStat(t *testing.T) {
 	var headCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.RawQuery == "mkdir":
+		case r.Method == http.MethodPost && (r.URL.RawQuery == "mkdir" || r.URL.RawQuery == "mkdir&mode=0"):
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodHead:
 			headCalls.Add(1)
@@ -2790,7 +2790,7 @@ func TestMkdirRetriesDetachedAfterTransientInterrupt(t *testing.T) {
 	var mkdirCalls atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.RawQuery == "mkdir":
+		case r.Method == http.MethodPost && (r.URL.RawQuery == "mkdir" || r.URL.RawQuery == "mkdir&mode=0"):
 			if r.URL.Path != "/v1/fs/dir" {
 				t.Fatalf("POST path = %q, want /v1/fs/dir", r.URL.Path)
 			}
@@ -2831,7 +2831,7 @@ func TestMkdirRetryTreatsRemoteDirectoryAsSuccessAfterAmbiguousCreate(t *testing
 	var statCalls atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.RawQuery == "mkdir":
+		case r.Method == http.MethodPost && (r.URL.RawQuery == "mkdir" || r.URL.RawQuery == "mkdir&mode=0"):
 			switch mkdirCalls.Add(1) {
 			case 1:
 				w.WriteHeader(statusClientClosedRequest)
@@ -6883,5 +6883,81 @@ func TestSetAttr_NoKernelNotify(t *testing.T) {
 	after := fs.notifyCount.Load()
 	if delta := after - before; delta != 0 {
 		t.Fatalf("SetAttr produced %d kernel notify calls, want 0", delta)
+	}
+}
+
+
+// TestLookupParsesModeHeader verifies that Lookup reads the X-Dat9-Mode header
+// from the remote stat response and stores it in the inode entry.
+func TestLookupParsesModeHeader(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Fatalf("method = %s, want HEAD", r.Method)
+		}
+		w.Header().Set("Content-Length", "9")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Mode", "384") // 0o600 in decimal
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "secure.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+
+	// Verify the EntryOut attr reflects the mode.
+	if out.Mode != syscall.S_IFREG|0o600 {
+		t.Errorf("EntryOut mode = %o, want %o", out.Mode, syscall.S_IFREG|0o600)
+	}
+
+	// Verify the inode table also stores the mode.
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Mode != 0o600 {
+		t.Errorf("inode mode = %o, want 0o600", entry.Mode)
+	}
+}
+
+// TestLookupParsesModeHeaderDir verifies that Lookup reads X-Dat9-Mode for directories.
+func TestLookupParsesModeHeaderDir(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Fatalf("method = %s, want HEAD", r.Method)
+		}
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("X-Dat9-IsDir", "true")
+		w.Header().Set("X-Dat9-Mode", "448") // 0o700 in decimal
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "privatedir", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+
+	if out.Mode != syscall.S_IFDIR|0o700 {
+		t.Errorf("EntryOut mode = %o, want %o", out.Mode, syscall.S_IFDIR|0o700)
+	}
+
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Mode != 0o700 {
+		t.Errorf("inode mode = %o, want 0o700", entry.Mode)
 	}
 }

@@ -11,10 +11,10 @@ func TestBuildVectorSearchQueryIncludesCurrentRevisionFilter(t *testing.T) {
 	if !ok {
 		t.Fatal("expected non-empty query embedding to build vector search SQL")
 	}
-	if !strings.Contains(q, "f.embedding_revision = f.revision") {
+	if !strings.Contains(q, "s.embedding_revision = i.revision") {
 		t.Fatalf("vector search SQL missing current-revision filter: %s", q)
 	}
-	if !strings.Contains(q, "VEC_EMBED_COSINE_DISTANCE(f.embedding, ?)") {
+	if !strings.Contains(q, "VEC_EMBED_COSINE_DISTANCE(s.embedding, ?)") {
 		t.Fatalf("vector search SQL missing vector-distance placeholder: %s", q)
 	}
 	wantArgs := []any{"[0.1,0.2,0.3]", "/docs", "/docs/%", "[0.1,0.2,0.3]", 7}
@@ -49,10 +49,10 @@ func TestBuildVectorSearchByTextQueryOmitsRevisionFilter(t *testing.T) {
 	if !ok {
 		t.Fatal("expected non-empty query text to build vector search SQL")
 	}
-	if strings.Contains(q, "f.embedding_revision = f.revision") {
+	if strings.Contains(q, "s.embedding_revision = i.revision") {
 		t.Fatalf("text-query vector SQL should not depend on embedding_revision: %s", q)
 	}
-	if !strings.Contains(q, "VEC_EMBED_COSINE_DISTANCE(f.embedding, ?)") {
+	if !strings.Contains(q, "VEC_EMBED_COSINE_DISTANCE(s.embedding, ?)") {
 		t.Fatalf("text-query vector SQL missing distance expression: %s", q)
 	}
 	if !strings.Contains(q, "ORDER BY distance") {

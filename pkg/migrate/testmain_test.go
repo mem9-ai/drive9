@@ -1,23 +1,42 @@
-package datastore
+package migrate
 
 import (
+	"context"
 	"database/sql"
+	"log"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/mem9-ai/dat9/internal/testmysql"
 	_ "github.com/go-sql-driver/mysql"
 )
 
-func initDatastoreSchema(t *testing.T, dsn string) {
-	t.Helper()
+var testDSN string
+
+func TestMain(m *testing.M) {
+	inst, err := testmysql.Start(context.Background())
+	if err != nil {
+		log.Fatalf("setup mysql test instance: %v", err)
+	}
+	testDSN = inst.DSN
+
+	initMigrateSchema(testDSN)
+
+	code := m.Run()
+	if err := inst.Close(context.Background()); err != nil {
+		log.Printf("teardown mysql test instance: %v", err)
+	}
+	os.Exit(code)
+}
+
+func initMigrateSchema(dsn string) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		t.Fatal(err)
+		log.Fatalf("open db for schema init: %v", err)
 	}
 	defer func() { _ = db.Close() }()
 
-	// The test MySQL fixture does not guarantee VECTOR support, so helper schemas
-	// store embeddings as LONGTEXT even though production tenant schemas use VECTOR.
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (node_id VARCHAR(64) PRIMARY KEY, path VARCHAR(512) NOT NULL, parent_path VARCHAR(512) NOT NULL, name VARCHAR(255) NOT NULL, is_directory BOOLEAN NOT NULL DEFAULT FALSE, file_id VARCHAR(64), inode_id VARCHAR(64), created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3))`,
 		`CREATE UNIQUE INDEX idx_path ON file_nodes(path)`,
@@ -32,7 +51,7 @@ func initDatastoreSchema(t *testing.T, dsn string) {
 		`CREATE TABLE IF NOT EXISTS semantic (inode_id VARCHAR(64) PRIMARY KEY, content_text LONGTEXT, description LONGTEXT, embedding LONGTEXT, embedding_revision BIGINT, description_embedding LONGTEXT, description_embedding_revision BIGINT)`,
 		`CREATE TABLE IF NOT EXISTS file_tags (file_id VARCHAR(64) NOT NULL, inode_id VARCHAR(64), tag_key VARCHAR(255) NOT NULL, tag_value VARCHAR(255) NOT NULL DEFAULT '', PRIMARY KEY (file_id, tag_key))`,
 		`CREATE INDEX idx_kv ON file_tags(tag_key, tag_value)`,
-		`CREATE TABLE IF NOT EXISTS uploads (upload_id VARCHAR(64) PRIMARY KEY, file_id VARCHAR(64) NOT NULL, inode_id VARCHAR(64), target_path VARCHAR(512) NOT NULL, s3_upload_id VARCHAR(255) NOT NULL, s3_key VARCHAR(2048) NOT NULL, storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'none', storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT '', total_size BIGINT NOT NULL, part_size BIGINT NOT NULL, parts_total INT NOT NULL, expected_revision BIGINT, status VARCHAR(32) NOT NULL DEFAULT 'UPLOADING', fingerprint_sha256 VARCHAR(128), idempotency_key VARCHAR(255), description LONGTEXT, created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3), expires_at DATETIME(3) NOT NULL, active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED)`,
+		`CREATE TABLE IF NOT EXISTS uploads (upload_id VARCHAR(64) PRIMARY KEY, file_id VARCHAR(64) NOT NULL, inode_id VARCHAR(64), target_path VARCHAR(512) NOT NULL, s3_upload_id VARCHAR(255) NOT NULL, s3_key VARCHAR(2048) NOT NULL, total_size BIGINT NOT NULL, part_size BIGINT NOT NULL, parts_total INT NOT NULL, expected_revision BIGINT, status VARCHAR(32) NOT NULL DEFAULT 'UPLOADING', fingerprint_sha256 VARCHAR(128), idempotency_key VARCHAR(255), description LONGTEXT, storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'none', storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT '', created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3), expires_at DATETIME(3) NOT NULL, active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED)`,
 		`CREATE INDEX idx_upload_path ON uploads(target_path, status)`,
 		`CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)`,
 		`CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path)`,
@@ -53,7 +72,7 @@ func initDatastoreSchema(t *testing.T, dsn string) {
 			if strings.Contains(msg, "Duplicate key name") || strings.Contains(msg, "already exists") {
 				continue
 			}
-			t.Fatal(err)
+			log.Fatalf("init schema: %v", err)
 		}
 	}
 }

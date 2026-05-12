@@ -42,7 +42,7 @@ func (f *fileSystem) deadProps() *deadPropStore {
 }
 
 func (f *fileSystem) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
-	return mapError(f.client.MkdirCtx(ctx, f.remotePath(name)))
+	return mapError(f.client.MkdirCtx(ctx, f.remotePath(name), uint32(perm)&0o777))
 }
 
 func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {

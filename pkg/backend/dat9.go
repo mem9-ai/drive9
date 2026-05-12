@@ -260,11 +260,48 @@ func (b *Dat9Backend) MkdirCtx(ctx context.Context, path string, perm uint32) (e
 	if err != nil {
 		return err
 	}
-	err = b.store.InsertNode(ctx, &datastore.FileNode{
-		NodeID: b.genID(), Path: dirPath, ParentPath: pathutil.ParentPath(dirPath),
-		Name: pathutil.BaseName(dirPath), IsDirectory: true, CreatedAt: time.Now(),
-	})
-	return err
+	now := time.Now()
+	nodeID := b.genID()
+	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.store.InsertInodeTx(tx, &datastore.Inode{
+			InodeID:   nodeID,
+			SizeBytes: 0,
+			Revision:  1,
+			Mode:      perm,
+			Status:    datastore.StatusConfirmed,
+			CreatedAt: now,
+			Mtime:     now,
+		}); err != nil {
+			return err
+		}
+		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+			NodeID:      b.genID(),
+			Path:        dirPath,
+			ParentPath:  pathutil.ParentPath(dirPath),
+			Name:        pathutil.BaseName(dirPath),
+			IsDirectory: true,
+			InodeID:     nodeID,
+			CreatedAt:   now,
+		})
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (b *Dat9Backend) Chmod(path string, mode uint32) error {
+	return b.ChmodCtx(backgroundWithTrace(), path, mode)
+}
+
+func (b *Dat9Backend) ChmodCtx(ctx context.Context, path string, mode uint32) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "chmod", err, start) }()
+
+	resolvedPath, _, err := b.resolveNodePath(ctx, path)
+	if err != nil {
+		return err
+	}
+	return b.store.Chmod(ctx, resolvedPath, mode)
 }
 
 func (b *Dat9Backend) Remove(path string) error {
@@ -728,6 +765,10 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 		if e.Node.IsDirectory {
 			info.Mode = 0o755
 		}
+		if e.HasMode {
+			info.Mode = e.Mode
+			info.Meta = filesystem.MetaData{Content: map[string]string{"hasMode": "true"}}
+		}
 		if e.File != nil {
 			info.Size = e.File.SizeBytes
 			info.ModTime = fileMtime(e.File)
@@ -964,16 +1005,27 @@ func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
 		return nil, err
 	}
 	info := &filesystem.FileInfo{
-		Name: nf.Node.Name, IsDir: nf.Node.IsDirectory, Mode: 0o644,
-	}
-	if nf.Node.IsDirectory {
-		info.Mode = 0o755
+		Name: nf.Node.Name, IsDir: nf.Node.IsDirectory,
 	}
 	if nf.File != nil {
 		info.Size = nf.File.SizeBytes
 		info.ModTime = fileMtime(nf.File)
+		if nf.HasMode {
+			info.Mode = nf.Mode
+		} else if nf.Node.IsDirectory {
+			info.Mode = 0o755
+		} else {
+			info.Mode = 0o644
+		}
 	} else {
 		info.ModTime = nf.Node.CreatedAt
+		if nf.HasMode {
+			info.Mode = nf.Mode
+		} else if nf.Node.IsDirectory {
+			info.Mode = 0o755
+		} else {
+			info.Mode = 0o644
+		}
 	}
 	return info, nil
 }
@@ -1009,8 +1061,6 @@ func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (e
 	_, err = b.store.RenameFileReplacingTarget(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
 	return err
 }
-
-func (b *Dat9Backend) Chmod(path string, mode uint32) error { return nil }
 
 func (b *Dat9Backend) Open(path string) (io.ReadCloser, error) {
 	data, err := b.Read(path, 0, -1)

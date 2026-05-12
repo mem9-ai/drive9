@@ -511,6 +511,8 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 			s.handleRename(w, r, path)
 		} else if r.URL.Query().Has("mkdir") {
 			s.handleMkdir(w, r, path)
+		} else if r.URL.Query().Has("chmod") {
+			s.handleChmod(w, r, path)
 		} else if r.URL.Query().Has("create") {
 			s.handleCreate(w, r, path)
 		} else {
@@ -620,10 +622,12 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "list_ok", "path", path, "entries", len(entries))...)
 	type entry struct {
-		Name  string `json:"name"`
-		Size  int64  `json:"size"`
-		IsDir bool   `json:"isDir"`
-		Mtime int64  `json:"mtime,omitempty"`
+		Name    string `json:"name"`
+		Size    int64  `json:"size"`
+		IsDir   bool   `json:"isDir"`
+		Mtime   int64  `json:"mtime,omitempty"`
+		Mode    uint32 `json:"mode,omitempty"`
+		HasMode bool   `json:"hasMode"`
 	}
 	out := make([]entry, 0, len(entries))
 	for _, e := range entries {
@@ -631,7 +635,8 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		if !e.ModTime.IsZero() {
 			mtime = e.ModTime.Unix()
 		}
-		out = append(out, entry{Name: e.Name, Size: e.Size, IsDir: e.IsDir, Mtime: mtime})
+		hasMode := e.Meta.Content["hasMode"] == "true"
+		out = append(out, entry{Name: e.Name, Size: e.Size, IsDir: e.IsDir, Mtime: mtime, Mode: e.Mode, HasMode: hasMode})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"entries": out})
@@ -1097,6 +1102,8 @@ type batchStatResult struct {
 	IsDir    bool   `json:"isDir"`
 	Revision int64  `json:"revision,omitempty"`
 	Mtime    int64  `json:"mtime,omitempty"`
+	Mode     uint32 `json:"mode,omitempty"`
+	HasMode  bool   `json:"hasMode"`
 }
 
 type batchReadSmallRequest struct {
@@ -1259,6 +1266,8 @@ func (s *Server) batchStatOne(ctx context.Context, b *backend.Dat9Backend, rawPa
 	}
 	result.Status = http.StatusOK
 	result.IsDir = nf.Node.IsDirectory
+	result.HasMode = nf.HasMode
+	result.Mode = nf.Mode
 	if nf.File != nil {
 		result.Size = nf.File.SizeBytes
 		result.Revision = nf.File.Revision
@@ -1343,6 +1352,9 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 		}
 	} else {
 		w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(nf.Node.CreatedAt.Unix(), 10))
+	}
+	if nf.HasMode {
+		w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(nf.Mode), 10))
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_ok", "path", path, "is_dir", nf.Node.IsDirectory)...)
 	w.WriteHeader(http.StatusOK)
@@ -1456,7 +1468,13 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	if err := b.MkdirCtx(r.Context(), path, 0o755); err != nil {
+	mode := uint32(0o755)
+	if mStr := r.URL.Query().Get("mode"); mStr != "" {
+		if m, err := strconv.ParseUint(mStr, 10, 32); err == nil {
+			mode = uint32(m)
+		}
+	}
+	if err := b.MkdirCtx(r.Context(), path, mode); err != nil {
 		if errors.Is(err, datastore.ErrPathConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "mkdir_conflict", "path", path, "error", err)...)
 			errJSON(w, http.StatusConflict, err.Error())
@@ -1468,6 +1486,36 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "mkdir_ok", "path", path)...)
 	s.publishEvent(r, path, "mkdir")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "chmod_missing_scope", "path", path)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+
+	var req struct {
+		Mode uint32 `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "chmod_bad_body", "path", path, "error", err)...)
+		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	if err := b.ChmodCtx(r.Context(), path, req.Mode); err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "not found")
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "chmod_failed", "path", path, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "chmod_ok", "path", path)...)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
