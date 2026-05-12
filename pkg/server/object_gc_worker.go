@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/logger"
@@ -25,6 +26,8 @@ type objectGCWorker struct {
 	pool         *tenant.Pool
 	batchSize    int
 	pollInterval time.Duration
+	mu           sync.Mutex
+	wg           sync.WaitGroup
 	stop         context.CancelFunc
 }
 
@@ -41,20 +44,37 @@ func newObjectGCWorker(ms *meta.Store, pool *tenant.Pool) *objectGCWorker {
 }
 
 func (w *objectGCWorker) Start(ctx context.Context) {
-	if w == nil || w.stop != nil {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	if w.stop != nil {
+		w.mu.Unlock()
 		return
 	}
 	workerCtx, cancel := context.WithCancel(backgroundWithTrace(ctx))
 	w.stop = cancel
-	go w.loop(workerCtx)
+	w.wg.Add(1)
+	w.mu.Unlock()
+	go func() {
+		defer w.wg.Done()
+		w.loop(workerCtx)
+	}()
 }
 
 func (w *objectGCWorker) Stop() {
-	if w == nil || w.stop == nil {
+	if w == nil {
 		return
 	}
-	w.stop()
+	w.mu.Lock()
+	cancel := w.stop
 	w.stop = nil
+	w.mu.Unlock()
+	if cancel == nil {
+		return
+	}
+	cancel()
+	w.wg.Wait()
 }
 
 func (w *objectGCWorker) loop(ctx context.Context) {

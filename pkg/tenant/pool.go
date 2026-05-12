@@ -63,6 +63,7 @@ var (
 	// periodically thereafter to catch out-of-band schema drift without putting a
 	// full schema diff on every tenant open.
 	periodicTiDBSchemaValidationEvery uint64 = 32
+	defaultTenantPoolDrainTimeout            = 30 * time.Second
 )
 
 type entry struct {
@@ -265,11 +266,17 @@ func (p *Pool) Invalidate(tenantID string) {
 }
 
 func (p *Pool) WaitTenantIdle(ctx context.Context, tenantID string) error {
+	ctx, cancel := withTenantPoolDrainTimeout(ctx)
+	defer cancel()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		p.mu.Lock()
 		e, ok := p.items[tenantID]
+		refs := 0
+		if ok {
+			refs = e.refs
+		}
 		idle := !ok || e.refs == 0
 		p.mu.Unlock()
 		if idle {
@@ -277,6 +284,10 @@ func (p *Pool) WaitTenantIdle(ctx context.Context, tenantID string) error {
 		}
 		select {
 		case <-ctx.Done():
+			logger.Warn(ctx, "tenant_pool_wait_idle_timeout",
+				zap.String("tenant_id", tenantID),
+				zap.Int("refs", refs),
+				zap.Error(ctx.Err()))
 			return ctx.Err()
 		case <-ticker.C:
 		}
@@ -284,6 +295,8 @@ func (p *Pool) WaitTenantIdle(ctx context.Context, tenantID string) error {
 }
 
 func (p *Pool) InvalidateAndWait(ctx context.Context, tenantID string) error {
+	ctx, cancel := withTenantPoolDrainTimeout(ctx)
+	defer cancel()
 	var retired *entry
 	var toClose *entry
 	p.mu.Lock()
@@ -301,16 +314,28 @@ func (p *Pool) InvalidateAndWait(ctx context.Context, tenantID string) error {
 	for {
 		p.mu.Lock()
 		idle := retired.refs == 0
+		refs := retired.refs
 		p.mu.Unlock()
 		if idle {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
+			logger.Warn(ctx, "tenant_pool_invalidate_wait_timeout",
+				zap.String("tenant_id", tenantID),
+				zap.Int("refs", refs),
+				zap.Error(ctx.Err()))
 			return ctx.Err()
 		case <-ticker.C:
 		}
 	}
+}
+
+func withTenantPoolDrainTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, defaultTenantPoolDrainTimeout)
 }
 
 func (p *Pool) Close() {
@@ -605,6 +630,9 @@ func (p *Pool) resolveStorageNamespace(ctx context.Context, t *meta.Tenant, back
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage namespace: %w", err)
 	}
+	// Keep the tenant value in sync with the namespace persisted by
+	// EnsureTenantStorageNamespace. Get/Acquire use this resolved ID to key the
+	// cache entry created after backend construction.
 	t.StorageNamespaceID = ns.ID
 	return ns, nil
 }

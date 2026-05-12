@@ -642,7 +642,7 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		return 0, 0, err
 	}
 	b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
-	// Overwrite cleanup remains best-effort: file_gc_tasks track deleted file
+	// Overwrite cleanup is object-level: file_gc_tasks track deleted file
 	// identities, not old blob refs for a still-live file_id.
 	b.deleteBlobIfS3Ctx(ctx, nf.File.StorageType, nf.File.StorageRef, storageRef)
 	// Temporary compatibility: app embedding still relies on the legacy
@@ -1059,11 +1059,18 @@ func (b *Dat9Backend) deleteBlobIfS3Ctx(ctx context.Context, storageType datasto
 	if storageType != datastore.StorageS3 || storageRef == "" || storageRef == keepRef {
 		return
 	}
-	handled, _ := b.enqueueObjectGCCandidateCtx(ctx, storageRef, meta.ObjectGCReasonOverwrite, "")
-	if handled {
+	handled, err := b.enqueueObjectGCCandidateCtx(ctx, storageRef, meta.ObjectGCReasonOverwrite, "")
+	if handled && err == nil {
 		return
 	}
-	b.deleteBlobCtx(ctx, storageRef)
+	if err != nil {
+		logger.Warn(ctx, "backend_object_gc_candidate_required_but_failed",
+			zap.String("storage_ref", storageRef),
+			zap.Error(err))
+		return
+	}
+	logger.Warn(ctx, "backend_object_gc_candidate_not_configured",
+		zap.String("storage_ref", storageRef))
 }
 
 type objectGCCandidateEnqueuer interface {

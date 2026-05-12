@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/datastore"
@@ -61,6 +62,8 @@ func (s *Server) handleCtxFork(w http.ResponseWriter, r *http.Request) {
 		var statusErr *forkStatusError
 		if errors.As(err, &statusErr) {
 			code = statusErr.code
+		} else if errors.Is(err, meta.ErrNotFound) {
+			code = http.StatusNotFound
 		}
 		errJSON(w, code, err.Error())
 		return
@@ -82,7 +85,7 @@ func forkErr(code int, msg string) error {
 }
 
 func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayName string) (*forkContextResponse, error) {
-	_ = displayName
+	_ = displayName // The CLI stores the user-facing ctx name locally; MetaDB tenants currently have no display-name column.
 	source, err := s.meta.GetTenant(ctx, sourceTenantID)
 	if err != nil {
 		return nil, err
@@ -115,6 +118,11 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	forkRoot.ParentTenantID = source.ID
 	forkRoot.StorageNamespaceID = source.StorageNamespaceID
 	forkRoot.BranchID = ""
+	forkRoot.DBPasswordCipher = append([]byte(nil), source.DBPasswordCipher...)
+	if source.S3BucketKeyEnabled != nil {
+		v := *source.S3BucketKeyEnabled
+		forkRoot.S3BucketKeyEnabled = &v
+	}
 	forkRoot.ClaimURL = ""
 	forkRoot.ClaimExpiresAt = nil
 	forkRoot.CreatedAt = now
@@ -125,13 +133,13 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 
 	cluster, err := branchProvisioner.ProvisionBranch(ctx, forkID, clusterInfoFromTenant(source))
 	if err != nil {
-		_ = s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 	cluster.Provider = source.Provider
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
 	if err != nil {
-		_ = s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed)
+		s.deleteUnpersistedForkBranch(ctx, forkID, branchProvisioner, cluster)
 		return nil, err
 	}
 	if err := s.meta.UpdateTenantConnection(ctx, forkID, &meta.Tenant{
@@ -147,56 +155,57 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		ClaimURL:         cluster.ClaimURL,
 		ClaimExpiresAt:   cluster.ClaimExpiresAt,
 	}); err != nil {
-		_ = s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed)
+		s.deleteUnpersistedForkBranch(ctx, forkID, branchProvisioner, cluster)
 		return nil, err
 	}
 
 	dsn := tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true)
 	if err := s.provisioner.InitSchema(ctx, dsn); err != nil {
-		_ = s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 	store, err := datastore.Open(dsn)
 	if err != nil {
-		_ = s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 	defer func() { _ = store.Close() }()
 
 	if active, err := store.HasActiveUploads(ctx); err != nil {
-		_ = s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	} else if active {
-		_ = s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, forkErr(http.StatusConflict, "source snapshot contains active uploads")
 	}
 	if err := store.SanitizeForkRuntimeState(ctx); err != nil {
-		_ = s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 	if err := s.meta.CopyQuotaConfig(ctx, source.ID, forkID); err != nil {
-		_ = s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 	if err := s.backfillForkQuota(ctx, forkID, store); err != nil {
-		_ = s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 	if err := s.meta.UpdateTenantSchemaVersion(ctx, forkID, schema.CurrentTiDBTenantSchemaVersion); err != nil {
-		_ = s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 	if err := s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantActive); err != nil {
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 	apiToken, err := token.IssueToken(s.tokenSecret, forkID, 1)
 	if err != nil {
-		_ = s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 	cipherToken, err := s.pool.Encrypt(ctx, []byte(apiToken))
 	if err != nil {
-		_ = s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 	if err := s.meta.InsertAPIKey(ctx, &meta.APIKey{
@@ -211,7 +220,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		CreatedAt:     time.Now().UTC(),
 		UpdatedAt:     time.Now().UTC(),
 	}); err != nil {
-		_ = s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 	return &forkContextResponse{
@@ -221,6 +230,34 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		ParentTenantID: source.ID,
 		Storage:        "shared",
 	}, nil
+}
+
+func (s *Server) markForkFailed(ctx context.Context, forkID string) {
+	if err := s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed); err != nil {
+		logger.Error(ctx, "fork_mark_failed_failed", zap.String("tenant_id", forkID), zap.Error(err))
+	}
+}
+
+func (s *Server) markForkFailedAndCleanup(ctx context.Context, forkID string) {
+	s.markForkFailed(ctx, forkID)
+	go s.cleanupForkTenant(backgroundWithTrace(ctx), forkID)
+}
+
+func (s *Server) deleteUnpersistedForkBranch(ctx context.Context, forkID string, branchProvisioner tenant.BranchProvisioner, cluster *tenant.ClusterInfo) {
+	if cluster != nil && cluster.ClusterID != "" && cluster.BranchID != "" {
+		if err := branchProvisioner.DeleteBranch(ctx, cluster.ClusterID, cluster.BranchID); err != nil {
+			logger.Error(ctx, "fork_delete_unpersisted_branch_failed",
+				zap.String("tenant_id", forkID),
+				zap.String("cluster_id", cluster.ClusterID),
+				zap.String("branch_id", cluster.BranchID),
+				zap.Error(err))
+			s.markForkFailed(ctx, forkID)
+			return
+		}
+	}
+	if err := s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantDeleted); err != nil {
+		logger.Error(ctx, "fork_mark_deleted_after_unpersisted_branch_failed", zap.String("tenant_id", forkID), zap.Error(err))
+	}
 }
 
 func clusterInfoFromTenant(t *meta.Tenant) *tenant.ClusterInfo {
@@ -295,6 +332,10 @@ func (s *Server) handleCtxDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	t, err := s.meta.GetTenant(r.Context(), scope.TenantID)
 	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "tenant not found")
+			return
+		}
 		errJSON(w, http.StatusInternalServerError, "tenant lookup failed")
 		return
 	}
@@ -302,8 +343,23 @@ func (s *Server) handleCtxDelete(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusConflict, "only fork tenants can be deleted through ctx delete")
 		return
 	}
-	if err := s.meta.UpdateTenantStatus(r.Context(), t.ID, meta.TenantDeleting); err != nil {
+	if t.Status == meta.TenantDeleted {
+		errJSON(w, http.StatusNotFound, "tenant not found")
+		return
+	}
+	if t.Status == meta.TenantDeleting {
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": string(meta.TenantDeleting)})
+		return
+	}
+	updated, err := s.meta.UpdateTenantStatusIf(r.Context(), t.ID, t.Status, meta.TenantDeleting)
+	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "failed to mark tenant deleting")
+		return
+	}
+	if !updated {
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": string(meta.TenantDeleting)})
 		return
 	}
 	_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
@@ -327,6 +383,12 @@ func (s *Server) cleanupForkTenant(ctx context.Context, tenantID string) {
 		return
 	}
 	_ = s.meta.AbortActiveUploadReservations(ctx, tenantID)
+	if t.BranchID == "" {
+		if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantDeleted); err != nil {
+			logger.Error(ctx, "fork_cleanup_mark_deleted_without_branch_failed", zap.String("tenant_id", tenantID), zap.Error(err))
+		}
+		return
+	}
 	store, err := s.openTenantStore(ctx, t)
 	if err != nil {
 		logger.Error(ctx, "fork_cleanup_open_store_failed", zap.String("tenant_id", tenantID), zap.Error(err))
@@ -388,16 +450,32 @@ func (s *Server) enqueueForkConfirmedRefs(ctx context.Context, t *meta.Tenant, s
 
 func (s *Server) resumeDeletingForkTenants() {
 	ctx := backgroundWithTrace(context.Background())
-	tenants, err := s.meta.ListTenantsByStatus(ctx, meta.TenantDeleting, 1000)
-	if err != nil {
-		logger.Error(ctx, "resume_deleting_forks_list_failed", zap.Error(err))
-		return
+	for _, status := range []meta.TenantStatus{meta.TenantDeleting, meta.TenantFailed, meta.TenantProvisioning} {
+		tenants, err := s.meta.ListTenantsByStatus(ctx, status, 1000)
+		if err != nil {
+			logger.Error(ctx, "resume_fork_cleanup_list_failed", zap.String("status", string(status)), zap.Error(err))
+			continue
+		}
+		s.resumeForkCleanup(ctx, tenants)
 	}
+}
+
+func (s *Server) resumeForkCleanup(ctx context.Context, tenants []meta.Tenant) {
+	const maxConcurrentForkCleanup = 4
+	sem := make(chan struct{}, maxConcurrentForkCleanup)
+	var wg sync.WaitGroup
 	for i := range tenants {
 		t := tenants[i]
 		if t.Kind != meta.TenantKindFork {
 			continue
 		}
-		go s.cleanupForkTenant(backgroundWithTrace(context.Background()), t.ID)
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(tenantID string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			s.cleanupForkTenant(backgroundWithTrace(ctx), tenantID)
+		}(t.ID)
 	}
+	wg.Wait()
 }

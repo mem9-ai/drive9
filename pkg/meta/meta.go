@@ -919,7 +919,7 @@ func (s *Store) InsertTenant(ctx context.Context, t *Tenant) (err error) {
 		 provider, cluster_id, branch_id, claim_url, claim_expires_at, schema_version,
 		 s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Status, tenantKindForInsert(t), nullStr(t.ParentTenantID), nullStr(t.StorageNamespaceID),
+		t.ID, t.Status, tenantKindForInsert(t), t.ParentTenantID, t.StorageNamespaceID,
 		t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
 		t.Provider, nullStr(t.ClusterID), t.BranchID, nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion,
 		tenantS3EncryptionModeForInsert(t), t.S3KMSKeyID, boolToInt(tenantS3BucketKeyEnabledForInsert(t)),
@@ -1127,6 +1127,18 @@ func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status Tenant
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (s *Store) UpdateTenantStatusIf(ctx context.Context, id string, from, to TenantStatus) (updated bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tenant_status_if", start, &err)
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		to, time.Now().UTC(), id, from)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *Tenant) (err error) {

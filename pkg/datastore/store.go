@@ -987,7 +987,7 @@ func (s *Store) SanitizeForkRuntimeState(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, `DELETE fn FROM file_nodes fn JOIN files f ON f.file_id = fn.file_id WHERE f.status <> 'CONFIRMED'`); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE files SET status = 'DELETED', storage_ref = '', storage_ref_hash = '', content_blob = NULL, updated_at = ? WHERE status <> 'CONFIRMED'`, time.Now().UTC()); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE files SET status = 'DELETED', storage_ref = '', storage_ref_hash = '', content_blob = NULL, expires_at = ? WHERE status <> 'CONFIRMED'`, time.Now().UTC()); err != nil {
 			return err
 		}
 		for _, stmt := range []string{

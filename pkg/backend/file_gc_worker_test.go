@@ -33,19 +33,13 @@ func (c *deleteRecordingS3Client) deletedKeys() []string {
 	return append([]string(nil), c.deletes...)
 }
 
-type failingDeleteS3Client struct {
-	s3client.S3Client
-	err error
-}
-
-func (c *failingDeleteS3Client) DeleteObject(context.Context, string) error {
-	return c.err
-}
-
-func TestFileGCTaskDeletesOriginalStorageRefAfterPathRecreate(t *testing.T) {
+func TestFileGCTaskEnqueuesOriginalStorageRefAfterPathRecreate(t *testing.T) {
 	b := newTestBackend(t)
 	rec := &deleteRecordingS3Client{S3Client: b.s3}
 	b.s3 = rec
+	fake := newFakeMetaQuotaStore()
+	b.SetMetaQuotaStore("tenant-a", fake)
+	b.storageNamespaceID = "ns-a"
 
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -108,8 +102,14 @@ func TestFileGCTaskDeletesOriginalStorageRefAfterPathRecreate(t *testing.T) {
 		t.Fatal("expected one file gc task to be processed")
 	}
 	keys := rec.deletedKeys()
-	if len(keys) != 1 || keys[0] != "blobs/old-file" {
-		t.Fatalf("deleted keys = %#v, want [blobs/old-file]", keys)
+	if len(keys) != 0 {
+		t.Fatalf("deleted keys = %#v, want none", keys)
+	}
+	if len(fake.objectGCCandidates) != 1 {
+		t.Fatalf("object gc candidates = %d, want 1", len(fake.objectGCCandidates))
+	}
+	if got := fake.objectGCCandidates[0]; got.StorageRef != "blobs/old-file" || got.Reason != meta.ObjectGCReasonFileDelete {
+		t.Fatalf("candidate = %+v", got)
 	}
 	nf, err := b.Store().Stat(ctx, "/x.txt")
 	if err != nil {
@@ -186,6 +186,59 @@ func TestFileGCTaskEnqueuesObjectCandidateWhenNamespaceWired(t *testing.T) {
 	}
 }
 
+func TestFileGCTaskDoesNotDirectDeleteWhenObjectGCUnavailable(t *testing.T) {
+	b := newTestBackend(t)
+	rec := &deleteRecordingS3Client{S3Client: b.s3}
+	b.s3 = rec
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := b.Store().InsertFile(ctx, &datastore.File{
+		FileID:      "old-file",
+		StorageType: datastore.StorageS3,
+		StorageRef:  "blobs/old-file",
+		ContentType: "text/plain",
+		SizeBytes:   11,
+		Revision:    1,
+		Status:      datastore.StatusConfirmed,
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Store().InsertNode(ctx, &datastore.FileNode{
+		NodeID:     "node-old-file",
+		Path:       "/x.txt",
+		ParentPath: "/",
+		Name:       "x.txt",
+		FileID:     "old-file",
+		CreatedAt:  now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.RemoveCtx(ctx, "/x.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	processed, err := b.ProcessOneFileGCTask(ctx)
+	if !processed {
+		t.Fatal("expected one file gc task to be processed")
+	}
+	if err == nil {
+		t.Fatal("expected missing object gc enqueue to keep gc task queued")
+	}
+	if keys := rec.deletedKeys(); len(keys) != 0 {
+		t.Fatalf("deleted keys = %#v, want none", keys)
+	}
+	task, err := b.Store().GetFileGCTaskByFileID(ctx, "old-file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != datastore.FileGCTaskQueued {
+		t.Fatalf("task status = %s, want queued", task.Status)
+	}
+}
+
 func TestFileGCTaskRetriesWhenObjectCandidateEnqueueFails(t *testing.T) {
 	b := newTestBackend(t)
 	rec := &deleteRecordingS3Client{S3Client: b.s3}
@@ -249,8 +302,9 @@ func TestFileGCTaskRetriesWhenObjectCandidateEnqueueFails(t *testing.T) {
 
 func TestFileGCTaskReleasesCentralQuotaBeforeBlobRetry(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
-	deleteErr := errors.New("s3 temporarily unavailable")
-	b.s3 = &failingDeleteS3Client{S3Client: b.s3, err: deleteErr}
+	enqueueErr := errors.New("meta temporarily unavailable")
+	fake.objectGCCandidateErr = enqueueErr
+	b.storageNamespaceID = "ns-a"
 
 	ctx := context.Background()
 	payload := bytes.Repeat([]byte("x"), int(DefaultInlineThreshold))
@@ -279,15 +333,15 @@ func TestFileGCTaskReleasesCentralQuotaBeforeBlobRetry(t *testing.T) {
 	if !processed {
 		t.Fatal("expected one file gc task to be processed")
 	}
-	if !errors.Is(err, deleteErr) {
-		t.Fatalf("process err = %v, want %v", err, deleteErr)
+	if !errors.Is(err, enqueueErr) {
+		t.Fatalf("process err = %v, want %v", err, enqueueErr)
 	}
 	usage, err = fake.GetQuotaUsage(ctx, "tenant-a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if usage.StorageBytes != 0 || usage.MediaFileCount != 0 {
-		t.Fatalf("usage after failed blob delete = %+v", usage)
+		t.Fatalf("usage after failed candidate enqueue = %+v", usage)
 	}
 	if _, err := fake.GetFileMeta(ctx, "tenant-a", nf.File.FileID); err == nil {
 		t.Fatal("central file meta should be deleted before blob retry")
@@ -303,6 +357,7 @@ func TestFileGCTaskReleasesCentralQuotaBeforeBlobRetry(t *testing.T) {
 
 func TestFileGCTaskWaitsForPendingCentralCreateMutation(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
+	b.storageNamespaceID = "ns-a"
 	rec := &deleteRecordingS3Client{S3Client: b.s3}
 	b.s3 = rec
 
@@ -390,8 +445,14 @@ func TestFileGCTaskWaitsForPendingCentralCreateMutation(t *testing.T) {
 	if !processed {
 		t.Fatal("expected gc task after central replay")
 	}
-	if keys := rec.deletedKeys(); len(keys) != 1 || keys[0] != "blobs/pending-central-file" {
-		t.Fatalf("deleted keys after central replay = %#v", keys)
+	if keys := rec.deletedKeys(); len(keys) != 0 {
+		t.Fatalf("deleted keys after central replay = %#v, want none", keys)
+	}
+	if len(fake.objectGCCandidates) != 1 {
+		t.Fatalf("object gc candidates after central replay = %d, want 1", len(fake.objectGCCandidates))
+	}
+	if got := fake.objectGCCandidates[0]; got.StorageRef != "blobs/pending-central-file" || got.Reason != meta.ObjectGCReasonFileDelete {
+		t.Fatalf("candidate after central replay = %+v", got)
 	}
 	if _, err := fake.GetFileMeta(ctx, "tenant-a", fileID); err == nil {
 		t.Fatal("central file meta should be deleted")
@@ -407,6 +468,7 @@ func TestFileGCTaskWaitsForPendingCentralCreateMutation(t *testing.T) {
 
 func TestFileGCTaskWaitsForPendingCentralOverwriteMutation(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
+	b.storageNamespaceID = "ns-a"
 	rec := &deleteRecordingS3Client{S3Client: b.s3}
 	b.s3 = rec
 
@@ -505,8 +567,14 @@ func TestFileGCTaskWaitsForPendingCentralOverwriteMutation(t *testing.T) {
 	if !processed {
 		t.Fatal("expected gc task after central overwrite replay")
 	}
-	if keys := rec.deletedKeys(); len(keys) != 1 || keys[0] != "blobs/pending-overwrite-file" {
-		t.Fatalf("deleted keys after central overwrite replay = %#v", keys)
+	if keys := rec.deletedKeys(); len(keys) != 0 {
+		t.Fatalf("deleted keys after central overwrite replay = %#v, want none", keys)
+	}
+	if len(fake.objectGCCandidates) != 1 {
+		t.Fatalf("object gc candidates after central overwrite replay = %d, want 1", len(fake.objectGCCandidates))
+	}
+	if got := fake.objectGCCandidates[0]; got.StorageRef != "blobs/pending-overwrite-file" || got.Reason != meta.ObjectGCReasonFileDelete {
+		t.Fatalf("candidate after central overwrite replay = %+v", got)
 	}
 	if _, err := fake.GetFileMeta(ctx, "tenant-a", fileID); err == nil {
 		t.Fatal("central file meta should be deleted")
