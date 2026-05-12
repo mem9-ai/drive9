@@ -256,14 +256,14 @@ func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	hasChildren, err := dirHasChildrenTx(tx, path)
+	hasChildren, err := dirHasChildrenTx(ctx, tx, path)
 	if err != nil {
 		return err
 	}
 	if hasChildren {
 		return fmt.Errorf("directory not empty: %s", path)
 	}
-	res, err := tx.Exec(`DELETE FROM file_nodes WHERE path = ? AND is_directory = 1`, path)
+	res, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ? AND is_directory = 1`, path)
 	if err != nil {
 		return err
 	}
@@ -1047,28 +1047,23 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var fileID sql.NullString
-	var isDir bool
-	err = tx.QueryRow(`SELECT file_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, path).Scan(&fileID, &isDir)
+	row := tx.QueryRowContext(ctx, `SELECT f.file_id, f.storage_type, f.storage_ref, f.storage_encryption_mode,
+		f.storage_encryption_key_id, f.content_type, f.size_bytes, f.checksum_sha256,
+		f.revision, f.embedding_revision, f.status, f.source_id, f.created_at, f.confirmed_at, f.expires_at
+		FROM file_nodes fn
+		JOIN files f ON f.file_id = fn.file_id
+		WHERE fn.path = ? AND fn.is_directory = 0
+		FOR UPDATE`, path)
+	f, err := scanFileForGC(row)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, err
-	}
-	if isDir {
-		return nil, ErrNotFound
-	}
-
-	if _, err := tx.Exec(`DELETE FROM file_nodes WHERE path = ?`, path); err != nil {
 		return nil, err
 	}
 
-	if !fileID.Valid || fileID.String == "" {
-		return nil, tx.Commit()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ?`, path); err != nil {
+		return nil, err
 	}
 
-	stillReferenced, err := fileIDExistsTx(tx, fileID.String)
+	stillReferenced, err := fileIDExistsTx(ctx, tx, f.FileID)
 	if err != nil {
 		return nil, err
 	}
@@ -1076,26 +1071,14 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 		return nil, tx.Commit()
 	}
 
-	if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fileID.String); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE files SET status = 'DELETED' WHERE file_id = ?`, f.FileID); err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(`DELETE FROM file_tags WHERE file_id = ?`, fileID.String); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_tags WHERE file_id = ?`, f.FileID); err != nil {
 		return nil, err
 	}
-
-	row := tx.QueryRow(`SELECT file_id, storage_type, storage_ref, storage_encryption_mode,
-		storage_encryption_key_id, content_type, size_bytes, checksum_sha256,
-		revision, embedding_revision, status, source_id, created_at, confirmed_at, expires_at
-		FROM files WHERE file_id = ?`, fileID.String)
-	f, err := scanFileForGC(row)
-	if err != nil {
-		return nil, err
-	}
-	task, err := NewFileGCTaskFromFile(f, time.Now().UTC())
-	if err != nil {
-		return nil, err
-	}
-	if _, err := s.EnqueueFileGCTaskTx(tx, task); err != nil {
+	f.Status = StatusDeleted
+	if err := enqueueFileGCTasksTx(ctx, tx, []*File{f}, time.Now().UTC()); err != nil {
 		return nil, err
 	}
 
@@ -1116,24 +1099,24 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	orphaned, err := orphanedFilesByPathPrefixTx(tx, dirPath)
+	orphaned, err := orphanedFilesByPathPrefixTx(ctx, tx, dirPath)
 	if err != nil {
 		return nil, err
 	}
 
 	deleteWhere, deleteArgs := pathPrefixPredicate("path", dirPath)
-	if _, err := tx.Exec(`DELETE FROM file_nodes WHERE `+deleteWhere, deleteArgs...); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+deleteWhere, deleteArgs...); err != nil {
 		return nil, err
 	}
 
 	if len(orphaned) > 0 {
-		if err := markFilesDeletedTx(tx, orphaned); err != nil {
+		if err := markFilesDeletedTx(ctx, tx, orphaned); err != nil {
 			return nil, err
 		}
-		if err := deleteFileTagsTx(tx, orphaned); err != nil {
+		if err := deleteFileTagsTx(ctx, tx, orphaned); err != nil {
 			return nil, err
 		}
-		if err := enqueueFileGCTasksTx(tx, orphaned, time.Now().UTC()); err != nil {
+		if err := enqueueFileGCTasksTx(ctx, tx, orphaned, time.Now().UTC()); err != nil {
 			return nil, err
 		}
 	}
@@ -1147,9 +1130,9 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 
 const deleteBatchSize = 500
 
-func fileIDExistsTx(tx *sql.Tx, fileID string) (bool, error) {
+func fileIDExistsTx(ctx context.Context, tx *sql.Tx, fileID string) (bool, error) {
 	var one int
-	err := tx.QueryRow(`SELECT 1 FROM file_nodes WHERE file_id = ? LIMIT 1 FOR UPDATE`, fileID).Scan(&one)
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE file_id = ? LIMIT 1 FOR UPDATE`, fileID).Scan(&one)
 	if err == nil {
 		return true, nil
 	}
@@ -1159,9 +1142,9 @@ func fileIDExistsTx(tx *sql.Tx, fileID string) (bool, error) {
 	return false, err
 }
 
-func dirHasChildrenTx(tx *sql.Tx, path string) (bool, error) {
+func dirHasChildrenTx(ctx context.Context, tx *sql.Tx, path string) (bool, error) {
 	var one int
-	err := tx.QueryRow(`SELECT 1 FROM file_nodes WHERE parent_path = ? LIMIT 1 FOR UPDATE`, path).Scan(&one)
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE parent_path = ? LIMIT 1 FOR UPDATE`, path).Scan(&one)
 	if err == nil {
 		return true, nil
 	}
@@ -1171,14 +1154,14 @@ func dirHasChildrenTx(tx *sql.Tx, path string) (bool, error) {
 	return false, err
 }
 
-func orphanedFilesByPathPrefixTx(tx *sql.Tx, dirPath string) ([]*File, error) {
+func orphanedFilesByPathPrefixTx(ctx context.Context, tx *sql.Tx, dirPath string) ([]*File, error) {
 	subtreeWhere, subtreeArgs := pathPrefixPredicate("fn.path", dirPath)
 	outsideWhere, outsideArgs := pathPrefixPredicate("live.path", dirPath)
 	args := make([]any, 0, len(subtreeArgs)+len(outsideArgs))
 	args = append(args, subtreeArgs...)
 	args = append(args, outsideArgs...)
 
-	rows, err := tx.Query(`SELECT DISTINCT f.file_id, f.storage_type, f.storage_ref, f.storage_encryption_mode,
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT f.file_id, f.storage_type, f.storage_ref, f.storage_encryption_mode,
 			f.storage_encryption_key_id, f.content_type, f.size_bytes, f.checksum_sha256,
 			f.revision, f.embedding_revision, f.status, f.source_id, f.created_at, f.confirmed_at, f.expires_at
 		FROM file_nodes fn
@@ -1212,23 +1195,23 @@ func orphanedFilesByPathPrefixTx(tx *sql.Tx, dirPath string) ([]*File, error) {
 	return out, nil
 }
 
-func markFilesDeletedTx(tx *sql.Tx, files []*File) error {
+func markFilesDeletedTx(ctx context.Context, tx *sql.Tx, files []*File) error {
 	return forEachFileBatch(files, func(batch []*File) error {
 		query, args := fileIDInQuery(`UPDATE files SET status = ? WHERE file_id IN `, StatusDeleted, batch)
-		_, err := tx.Exec(query, args...)
+		_, err := tx.ExecContext(ctx, query, args...)
 		return err
 	})
 }
 
-func deleteFileTagsTx(tx *sql.Tx, files []*File) error {
+func deleteFileTagsTx(ctx context.Context, tx *sql.Tx, files []*File) error {
 	return forEachFileBatch(files, func(batch []*File) error {
 		query, args := fileIDInQuery(`DELETE FROM file_tags WHERE file_id IN `, nil, batch)
-		_, err := tx.Exec(query, args...)
+		_, err := tx.ExecContext(ctx, query, args...)
 		return err
 	})
 }
 
-func enqueueFileGCTasksTx(tx *sql.Tx, files []*File, now time.Time) error {
+func enqueueFileGCTasksTx(ctx context.Context, tx *sql.Tx, files []*File, now time.Time) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -1236,7 +1219,7 @@ func enqueueFileGCTasksTx(tx *sql.Tx, files []*File, now time.Time) error {
 	}
 	return forEachFileBatch(files, func(batch []*File) error {
 		var b strings.Builder
-		b.WriteString(`INSERT IGNORE INTO file_gc_tasks
+		b.WriteString(`INSERT INTO file_gc_tasks
 			(task_id, file_id, storage_type, storage_ref, size_bytes, content_type,
 			 status, attempt_count, max_attempts, receipt, leased_at, lease_until,
 			 available_at, last_error, created_at, updated_at, completed_at)
@@ -1253,7 +1236,8 @@ func enqueueFileGCTasksTx(tx *sql.Tx, files []*File, now time.Time) error {
 				now, nil, now, now, nil,
 			)
 		}
-		_, err := tx.Exec(b.String(), args...)
+		b.WriteString(` ON DUPLICATE KEY UPDATE task_id = task_id`)
+		_, err := tx.ExecContext(ctx, b.String(), args...)
 		return err
 	})
 }

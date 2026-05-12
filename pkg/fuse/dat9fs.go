@@ -1348,22 +1348,29 @@ func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPat
 	return lastErr
 }
 
+type deleteKind string
+
+const (
+	deleteKindFile deleteKind = "file"
+	deleteKindDir  deleteKind = "dir"
+)
+
 func (fs *Dat9FS) deleteRemoteFileWithInterruptRecovery(ctx context.Context, localPath string) error {
-	return fs.deleteRemotePathWithInterruptRecovery(ctx, localPath, "file")
+	return fs.deleteRemotePathWithInterruptRecovery(ctx, localPath, deleteKindFile)
 }
 
 func (fs *Dat9FS) deleteRemoteDirWithInterruptRecovery(ctx context.Context, localPath string) error {
-	return fs.deleteRemotePathWithInterruptRecovery(ctx, localPath, "dir")
+	return fs.deleteRemotePathWithInterruptRecovery(ctx, localPath, deleteKindDir)
 }
 
-func (fs *Dat9FS) deleteRemotePathWithInterruptRecovery(ctx context.Context, localPath, kind string) error {
+func (fs *Dat9FS) deleteRemotePathWithInterruptRecovery(ctx context.Context, localPath string, kind deleteKind) error {
 	mutationStart := fs.perfStart()
 	remotePath := fs.remotePath(localPath)
 	var err error
 	switch kind {
-	case "file":
+	case deleteKindFile:
 		err = fs.client.DeleteFileCtx(ctx, remotePath)
-	case "dir":
+	case deleteKindDir:
 		err = fs.client.DeleteDirCtx(ctx, remotePath)
 	default:
 		err = fs.client.DeleteCtx(ctx, remotePath)
