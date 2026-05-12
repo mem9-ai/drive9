@@ -77,3 +77,24 @@ func ResetDB(t *testing.T, db *sql.DB) {
 		}
 	}
 }
+
+// ResetDBWithoutFiles is like ResetDB but for tests that intentionally drop
+// the legacy files table to exercise the no-legacy-table code path.
+func ResetDBWithoutFiles(t *testing.T, db *sql.DB) {
+	t.Helper()
+	queries := []string{
+		"DELETE FROM file_gc_tasks",
+		"DELETE FROM semantic_tasks",
+		"DELETE FROM file_nodes",
+		"DELETE FROM file_tags",
+		"DELETE FROM uploads",
+		"DELETE FROM inodes",
+		"DELETE FROM contents",
+		"DELETE FROM semantic",
+	}
+	for _, q := range queries {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("reset test db: %v", err)
+		}
+	}
+}

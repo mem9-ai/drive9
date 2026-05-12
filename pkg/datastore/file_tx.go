@@ -2,27 +2,30 @@ package datastore
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
 
 // InsertFileTx inserts a file row inside an existing transaction.
 func (s *Store) InsertFileTx(db execer, f *File) error {
-	mode := fileStorageEncryptionModeForWrite(f.StorageEncryptionMode)
-	_, err := db.Exec(`INSERT INTO files
-		(file_id, storage_type, storage_ref, storage_encryption_mode, storage_encryption_key_id,
-		 content_blob, content_type, size_bytes, checksum_sha256,
-		 revision, status, source_id, content_text, description, description_embedding_revision,
-		 created_at, confirmed_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.FileID, f.StorageType, f.StorageRef, mode,
-		storageEncryptionKeyIDForWrite(mode, f.StorageEncryptionKeyID), nilBytes(f.ContentBlob), nullStr(f.ContentType),
-		f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
-		nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
-		nullInt64Ptr(f.DescriptionEmbeddingRevision),
-		f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
-	if err != nil {
-		return err
+	if s.useLegacyFiles {
+		mode := fileStorageEncryptionModeForWrite(f.StorageEncryptionMode)
+		_, err := db.Exec(`INSERT INTO files
+			(file_id, storage_type, storage_ref, storage_encryption_mode, storage_encryption_key_id,
+			 content_blob, content_type, size_bytes, checksum_sha256,
+			 revision, status, source_id, content_text, description, description_embedding_revision,
+			 created_at, confirmed_at, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			f.FileID, f.StorageType, f.StorageRef, mode,
+			storageEncryptionKeyIDForWrite(mode, f.StorageEncryptionKeyID), nilBytes(f.ContentBlob), nullStr(f.ContentType),
+			f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
+			nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
+			nullInt64Ptr(f.DescriptionEmbeddingRevision),
+			f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
+		if err != nil {
+			return err
+		}
 	}
 	// Dual-write to split tables
 	return s.insertSplitTablesTx(db, f)
@@ -43,66 +46,80 @@ func (s *Store) UpdateFileContentIfRevisionTx(db execer, fileID string, expected
 
 func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision int64, preserveEmbedding bool, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64, description string) (int64, error) {
 	now := time.Now().UTC()
-	query := `UPDATE files SET storage_type = ?, storage_ref = ?,
-		content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,`
-	args := []any{
-		storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
-		nullStr(checksum), nullStr(contentText),
-	}
-	if description != "" {
-		var currentDesc sql.NullString
-		if err := db.QueryRow(`SELECT description FROM semantic WHERE inode_id = ?`, fileID).Scan(&currentDesc); err != nil {
-			return 0, fmt.Errorf("read current description: %w", err)
+	var rev int64
+	if s.useLegacyFiles {
+		query := `UPDATE files SET storage_type = ?, storage_ref = ?,
+			content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,`
+		args := []any{
+			storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
+			nullStr(checksum), nullStr(contentText),
 		}
-		query += ` description = ?,`
-		args = append(args, description)
-		if currentDesc.String != description {
-			if preserveEmbedding {
-				// Auto-embedding mode: the database owns embedding via generated
-				// column, so we only need to keep the revision tracker in sync.
-				// Use revision + 1 because this same UPDATE also increments revision.
-				query += ` description_embedding_revision = revision + 1,`
-			} else {
-				query += ` description_embedding = NULL, description_embedding_revision = NULL,`
+		if description != "" {
+			var currentDesc sql.NullString
+			if err := db.QueryRow(`SELECT description FROM semantic WHERE inode_id = ?`, fileID).Scan(&currentDesc); err != nil {
+				return 0, fmt.Errorf("read current description: %w", err)
+			}
+			query += ` description = ?,`
+			args = append(args, description)
+			if currentDesc.String != description {
+				if preserveEmbedding {
+					query += ` description_embedding_revision = revision + 1,`
+				} else {
+					query += ` description_embedding = NULL, description_embedding_revision = NULL,`
+				}
 			}
 		}
-	}
-	if preserveEmbedding {
-		query += `
-		revision = revision + 1, status = 'CONFIRMED', confirmed_at = ?
-		WHERE file_id = ?`
-	} else {
-		query += `
-		embedding = NULL, embedding_revision = NULL,
-		revision = revision + 1, status = 'CONFIRMED', confirmed_at = ?
-		WHERE file_id = ?`
-	}
-	args = append(args, now, fileID)
-	if expectedRevision > 0 {
-		query += ` AND revision = ? AND status = 'CONFIRMED'`
-		args = append(args, expectedRevision)
-	}
-	res, err := db.Exec(query, args...)
-	if err != nil {
-		return 0, err
-	}
-	rowsAffected, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	if rowsAffected == 0 {
+		if preserveEmbedding {
+			query += `
+			revision = revision + 1, status = 'CONFIRMED', confirmed_at = ?
+			WHERE file_id = ?`
+		} else {
+			query += `
+			embedding = NULL, embedding_revision = NULL,
+			revision = revision + 1, status = 'CONFIRMED', confirmed_at = ?
+			WHERE file_id = ?`
+		}
+		args = append(args, now, fileID)
 		if expectedRevision > 0 {
+			query += ` AND revision = ? AND status = 'CONFIRMED'`
+			args = append(args, expectedRevision)
+		}
+		res, err := db.Exec(query, args...)
+		if err != nil {
+			return 0, err
+		}
+		rowsAffected, err := res.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		if rowsAffected == 0 {
+			if expectedRevision > 0 {
+				return 0, ErrRevisionConflict
+			}
+			return 0, ErrNotFound
+		}
+		if expectedRevision > 0 {
+			rev = expectedRevision + 1
+		} else {
+			if err := db.QueryRow(`SELECT revision FROM files WHERE file_id = ?`, fileID).Scan(&rev); err != nil {
+				return 0, fmt.Errorf("read revision after update: %w", err)
+			}
+		}
+	} else {
+		var currentRev int64
+		if err := db.QueryRow(`SELECT revision FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' FOR UPDATE`, fileID).Scan(&currentRev); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				if expectedRevision > 0 {
+					return 0, ErrRevisionConflict
+				}
+				return 0, ErrNotFound
+			}
+			return 0, fmt.Errorf("read current revision: %w", err)
+		}
+		if expectedRevision > 0 && currentRev != expectedRevision {
 			return 0, ErrRevisionConflict
 		}
-		return 0, ErrNotFound
-	}
-	var rev int64
-	if expectedRevision > 0 {
-		rev = expectedRevision + 1
-	} else {
-		if err := db.QueryRow(`SELECT revision FROM files WHERE file_id = ?`, fileID).Scan(&rev); err != nil {
-			return 0, fmt.Errorf("read revision after update: %w", err)
-		}
+		rev = currentRev + 1
 	}
 
 	// Dual-write to split tables
@@ -132,16 +149,26 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 // UpdateFileStorageEncryptionTx updates storage encryption metadata inside an existing transaction.
 func (s *Store) UpdateFileStorageEncryptionTx(db execer, fileID string, mode StorageEncryptionMode, keyID string) error {
 	mode = fileStorageEncryptionModeForWrite(mode)
-	res, err := db.Exec(`UPDATE files SET storage_encryption_mode = ?, storage_encryption_key_id = ? WHERE file_id = ?`,
-		mode, storageEncryptionKeyIDForWrite(mode, keyID), fileID)
-	if err != nil {
-		return err
-	}
-	rowsAffected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rowsAffected == 0 {
+	if s.useLegacyFiles {
+		res, err := db.Exec(`UPDATE files SET storage_encryption_mode = ?, storage_encryption_key_id = ? WHERE file_id = ?`,
+			mode, storageEncryptionKeyIDForWrite(mode, keyID), fileID)
+		if err != nil {
+			return err
+		}
+		rowsAffected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rowsAffected == 0 {
+			var exists int
+			if err := db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ?`, fileID).Scan(&exists); err != nil {
+				if err == sql.ErrNoRows {
+					return ErrNotFound
+				}
+				return err
+			}
+		}
+	} else {
 		var exists int
 		if err := db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ?`, fileID).Scan(&exists); err != nil {
 			if err == sql.ErrNoRows {
@@ -176,26 +203,39 @@ func (s *Store) UpdateFileContentAutoEmbeddingIfRevisionTx(db execer, fileID str
 // embedding state so later semantic processing recomputes vectors.
 func (s *Store) ConfirmPendingFileTx(db execer, fileID string, storageType StorageType, storageRef, contentType string, size int64, description string) error {
 	now := time.Now().UTC()
-	query := `UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
-		size_bytes = ?, checksum_sha256 = NULL, content_text = NULL,
-		embedding = NULL, embedding_revision = NULL`
-	args := []any{storageType, storageRef, nullStr(contentType), size}
-	if description != "" {
-		query += `, description = ?`
-		args = append(args, description)
-	}
-	query += `, status = 'CONFIRMED', confirmed_at = ? WHERE file_id = ? AND status = 'PENDING'`
-	args = append(args, now, fileID)
-	res, err := db.Exec(query, args...)
-	if err != nil {
-		return err
-	}
-	rowsAffected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rowsAffected == 0 {
-		return ErrNotFound
+	if s.useLegacyFiles {
+		query := `UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
+			size_bytes = ?, checksum_sha256 = NULL, content_text = NULL,
+			embedding = NULL, embedding_revision = NULL`
+		args := []any{storageType, storageRef, nullStr(contentType), size}
+		if description != "" {
+			query += `, description = ?`
+			args = append(args, description)
+		}
+		query += `, status = 'CONFIRMED', confirmed_at = ? WHERE file_id = ? AND status = 'PENDING'`
+		args = append(args, now, fileID)
+		res, err := db.Exec(query, args...)
+		if err != nil {
+			return err
+		}
+		rowsAffected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rowsAffected == 0 {
+			return ErrNotFound
+		}
+	} else {
+		var status string
+		if err := db.QueryRow(`SELECT status FROM inodes WHERE inode_id = ? FOR UPDATE`, fileID).Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if status != string(StatusPending) {
+			return ErrNotFound
+		}
 	}
 	// Dual-write to split tables
 	if err := s.UpdateInodeContentTx(db, fileID, size, 1, StatusConfirmed, now); err != nil {
@@ -215,25 +255,38 @@ func (s *Store) ConfirmPendingFileTx(db execer, fileID string, storageType Stora
 // derived vector state after content_text becomes available.
 func (s *Store) ConfirmPendingFileAutoEmbeddingTx(db execer, fileID string, storageType StorageType, storageRef, contentType string, size int64, description string) error {
 	now := time.Now().UTC()
-	query := `UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
-		size_bytes = ?, checksum_sha256 = NULL, content_text = NULL`
-	args := []any{storageType, storageRef, nullStr(contentType), size}
-	if description != "" {
-		query += `, description = ?, description_embedding_revision = revision`
-		args = append(args, description)
-	}
-	query += `, status = 'CONFIRMED', confirmed_at = ? WHERE file_id = ? AND status = 'PENDING'`
-	args = append(args, now, fileID)
-	res, err := db.Exec(query, args...)
-	if err != nil {
-		return err
-	}
-	rowsAffected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rowsAffected == 0 {
-		return ErrNotFound
+	if s.useLegacyFiles {
+		query := `UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
+			size_bytes = ?, checksum_sha256 = NULL, content_text = NULL`
+		args := []any{storageType, storageRef, nullStr(contentType), size}
+		if description != "" {
+			query += `, description = ?, description_embedding_revision = revision`
+			args = append(args, description)
+		}
+		query += `, status = 'CONFIRMED', confirmed_at = ? WHERE file_id = ? AND status = 'PENDING'`
+		args = append(args, now, fileID)
+		res, err := db.Exec(query, args...)
+		if err != nil {
+			return err
+		}
+		rowsAffected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rowsAffected == 0 {
+			return ErrNotFound
+		}
+	} else {
+		var status string
+		if err := db.QueryRow(`SELECT status FROM inodes WHERE inode_id = ? FOR UPDATE`, fileID).Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if status != string(StatusPending) {
+			return ErrNotFound
+		}
 	}
 	// Dual-write to split tables
 	if err := s.UpdateInodeContentTx(db, fileID, size, 1, StatusConfirmed, now); err != nil {
@@ -255,8 +308,10 @@ func (s *Store) ConfirmPendingFileAutoEmbeddingTx(db execer, fileID string, stor
 // new upload targets an existing path.
 func (s *Store) DeletePendingFileTx(db execer, fileID string) error {
 	now := time.Now().UTC()
-	if _, err := db.Exec(`UPDATE files SET status = 'DELETED', storage_ref = '' WHERE file_id = ?`, fileID); err != nil {
-		return err
+	if s.useLegacyFiles {
+		if _, err := db.Exec(`UPDATE files SET status = 'DELETED', storage_ref = '' WHERE file_id = ?`, fileID); err != nil {
+			return err
+		}
 	}
 	if _, err := db.Exec(`UPDATE inodes SET status = 'DELETED', mtime = ? WHERE inode_id = ?`, now, fileID); err != nil {
 		return err
@@ -269,16 +324,26 @@ func (s *Store) DeletePendingFileTx(db execer, fileID string) error {
 
 // ClearFileEmbeddingStateTx clears embedding columns inside an existing transaction.
 func (s *Store) ClearFileEmbeddingStateTx(db execer, fileID string) error {
-	res, err := db.Exec(`UPDATE files SET embedding = NULL, embedding_revision = NULL WHERE file_id = ?`, fileID)
-	if err != nil {
-		return err
-	}
-	rowsAffected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rowsAffected == 0 {
-		return ErrNotFound
+	if s.useLegacyFiles {
+		res, err := db.Exec(`UPDATE files SET embedding = NULL, embedding_revision = NULL WHERE file_id = ?`, fileID)
+		if err != nil {
+			return err
+		}
+		rowsAffected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rowsAffected == 0 {
+			return ErrNotFound
+		}
+	} else {
+		var exists int
+		if err := db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ?`, fileID).Scan(&exists); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrNotFound
+			}
+			return err
+		}
 	}
 	// Dual-write to split tables
 	if _, err := db.Exec(`UPDATE semantic SET embedding = NULL, embedding_revision = NULL WHERE inode_id = ?`, fileID); err != nil {

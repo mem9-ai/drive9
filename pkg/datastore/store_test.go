@@ -14,11 +14,11 @@ import (
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
+	initDatastoreSchema(t, testDSN)
 	s, err := Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
-	initDatastoreSchema(t, testDSN)
 	testmysql.ResetDB(t, s.DB())
 	t.Cleanup(func() { _ = s.Close() })
 	return s
@@ -1205,5 +1205,67 @@ func TestModeRoundTrip(t *testing.T) {
 	}
 	if got.Mode != 0o755 {
 		t.Errorf("mode=%o, want 0o755", got.Mode)
+	}
+}
+
+// TestInsertFileWithoutLegacyTable verifies that a store without the legacy
+// `files` table writes only to split tables and can read data back correctly.
+func TestInsertFileWithoutLegacyTable(t *testing.T) {
+	// Open a store without creating the files table.
+	initDatastoreSchema(t, testDSN)
+	db, err := sql.Open("mysql", testDSN)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`DROP TABLE IF EXISTS files`); err != nil {
+		t.Fatalf("drop files: %v", err)
+	}
+	testmysql.ResetDBWithoutFiles(t, db)
+	_ = db.Close()
+
+	s, err := Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if s.HasLegacyFiles() {
+		t.Fatal("expected HasLegacyFiles() = false without files table")
+	}
+
+	ctx := context.Background()
+	now := time.Now()
+	f := &File{
+		FileID:      "f1",
+		StorageType: StorageDB9,
+		StorageRef:  "/blobs/f1",
+		SizeBytes:   42,
+		Revision:    1,
+		Status:      StatusConfirmed,
+		Mode:        0o600,
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}
+	if err := s.InsertFile(ctx, f); err != nil {
+		t.Fatalf("insert file: %v", err)
+	}
+
+	// Verify read from split tables.
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatalf("get file: %v", err)
+	}
+	if got.SizeBytes != 42 {
+		t.Errorf("size=%d, want 42", got.SizeBytes)
+	}
+	if got.Mode != 0o600 {
+		t.Errorf("mode=%o, want 0o600", got.Mode)
+	}
+
+	// Verify files table was NOT written.
+	var count int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM files`).Scan(&count); err == nil {
+		t.Error("expected error querying files table (should not exist), got nil")
 	}
 }

@@ -133,7 +133,8 @@ type Upload struct {
 
 // Store is the metadata store backed by TiDB/MySQL (stand-in for db9).
 type Store struct {
-	db *sql.DB
+	db             *sql.DB
+	useLegacyFiles bool // true when the legacy `files` table exists and needs dual-write
 }
 
 func Open(dsn string) (*Store, error) {
@@ -145,11 +146,23 @@ func Open(dsn string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
-	return &Store{db: db}, nil
+	s := &Store{db: db}
+	s.useLegacyFiles = s.detectLegacyFiles()
+	return s, nil
 }
 
 func (s *Store) Close() error { return mysqlutil.CloseInstrumented(s.db) }
 func (s *Store) DB() *sql.DB  { return s.db }
+
+// HasLegacyFiles reports whether the legacy `files` table exists in this
+// tenant database. When false, all writes skip the `files` table entirely
+// and only target the split tables (inodes / contents / semantic).
+func (s *Store) HasLegacyFiles() bool { return s.useLegacyFiles }
+
+func (s *Store) detectLegacyFiles() bool {
+	_, err := s.db.Exec(`SELECT 1 FROM files LIMIT 0`)
+	return err == nil
+}
 
 // InTx runs fn inside a database transaction. If fn returns an error, the
 // transaction is rolled back; otherwise it is committed.
@@ -380,8 +393,10 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 			return nil, err
 		}
 		if count == 0 {
-			if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, dst.fileID.String); err != nil {
-				return nil, err
+			if s.useLegacyFiles {
+				if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, dst.fileID.String); err != nil {
+					return nil, err
+				}
 			}
 			if _, err := tx.Exec(`UPDATE inodes SET status = 'DELETED' WHERE inode_id = ?`, dst.fileID.String); err != nil {
 				return nil, err
@@ -389,11 +404,7 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 			if _, err := tx.Exec(`DELETE FROM file_tags WHERE file_id = ?`, dst.fileID.String); err != nil {
 				return nil, err
 			}
-			row := tx.QueryRow(`SELECT file_id, storage_type, storage_ref, storage_encryption_mode,
-				storage_encryption_key_id, content_type, size_bytes, checksum_sha256,
-				revision, embedding_revision, status, source_id, created_at, confirmed_at, expires_at
-				FROM files WHERE file_id = ?`, dst.fileID.String)
-			f, err := scanFileForGC(row)
+			f, err := s.scanFileForGCTx(tx, dst.fileID.String)
 			if err != nil {
 				return nil, err
 			}
@@ -530,19 +541,21 @@ func (s *Store) InsertFile(ctx context.Context, f *File) (err error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	mode := fileStorageEncryptionModeForWrite(f.StorageEncryptionMode)
-	_, err = tx.Exec(`INSERT INTO files
-		(file_id, storage_type, storage_ref, storage_encryption_mode, storage_encryption_key_id,
-		 content_blob, content_type, size_bytes, checksum_sha256,
-		 revision, status, source_id, content_text, description, created_at, confirmed_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.FileID, f.StorageType, f.StorageRef, mode,
-		storageEncryptionKeyIDForWrite(mode, f.StorageEncryptionKeyID), nilBytes(f.ContentBlob), nullStr(f.ContentType),
-		f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
-		nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
-		f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
-	if err != nil {
-		return err
+	if s.useLegacyFiles {
+		mode := fileStorageEncryptionModeForWrite(f.StorageEncryptionMode)
+		_, err = tx.Exec(`INSERT INTO files
+			(file_id, storage_type, storage_ref, storage_encryption_mode, storage_encryption_key_id,
+			 content_blob, content_type, size_bytes, checksum_sha256,
+			 revision, status, source_id, content_text, description, created_at, confirmed_at, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			f.FileID, f.StorageType, f.StorageRef, mode,
+			storageEncryptionKeyIDForWrite(mode, f.StorageEncryptionKeyID), nilBytes(f.ContentBlob), nullStr(f.ContentType),
+			f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
+			nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
+			f.CreatedAt.UTC(), nilTime(f.ConfirmedAt), nilTime(f.ExpiresAt))
+		if err != nil {
+			return err
+		}
 	}
 
 	// Dual-write to split tables
@@ -634,33 +647,44 @@ func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageTyp
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	query := `UPDATE files SET storage_type = ?, storage_ref = ?,
-		content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?`
-	args := []any{storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
-		nullStr(checksum), nullStr(contentText)}
-	if description != "" {
-		query += `, description = ?, description_embedding = NULL, description_embedding_revision = NULL`
-		args = append(args, description)
-	} else {
-		query += `, description_embedding_revision = CASE
-			WHEN description_embedding IS NOT NULL THEN revision + 1
-			ELSE description_embedding_revision
-			END`
-	}
 	now := time.Now().UTC()
-	query += `, revision = revision + 1, status = 'CONFIRMED', confirmed_at = ? WHERE file_id = ?`
-	args = append(args, now, fileID)
-	res, err := tx.Exec(query, args...)
-	if err != nil {
-		return 0, err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return 0, ErrNotFound
-	}
 	var rev int64
-	if err := tx.QueryRow(`SELECT revision FROM files WHERE file_id = ?`, fileID).Scan(&rev); err != nil {
-		return 0, fmt.Errorf("read revision after update: %w", err)
+	if s.useLegacyFiles {
+		query := `UPDATE files SET storage_type = ?, storage_ref = ?,
+			content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?`
+		args := []any{storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
+			nullStr(checksum), nullStr(contentText)}
+		if description != "" {
+			query += `, description = ?, description_embedding = NULL, description_embedding_revision = NULL`
+			args = append(args, description)
+		} else {
+			query += `, description_embedding_revision = CASE
+				WHEN description_embedding IS NOT NULL THEN revision + 1
+				ELSE description_embedding_revision
+				END`
+		}
+		query += `, revision = revision + 1, status = 'CONFIRMED', confirmed_at = ? WHERE file_id = ?`
+		args = append(args, now, fileID)
+		res, err := tx.Exec(query, args...)
+		if err != nil {
+			return 0, err
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return 0, ErrNotFound
+		}
+		if err := tx.QueryRow(`SELECT revision FROM files WHERE file_id = ?`, fileID).Scan(&rev); err != nil {
+			return 0, fmt.Errorf("read revision after update: %w", err)
+		}
+	} else {
+		var currentRev int64
+		if err := tx.QueryRow(`SELECT revision FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' FOR UPDATE`, fileID).Scan(&currentRev); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return 0, ErrNotFound
+			}
+			return 0, fmt.Errorf("read current revision: %w", err)
+		}
+		rev = currentRev + 1
 	}
 
 	// Dual-write to split tables
@@ -708,34 +732,46 @@ func (s *Store) UpdateFileSearchTextTx(db execer, fileID string, expectedRevisio
 }
 
 func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevision int64, contentText string) (sql.Result, error) {
-	if expectedRevision > 0 {
-		res, err := db.Exec(`UPDATE files SET content_text = ?
-			WHERE file_id = ? AND status = 'CONFIRMED' AND revision = ?`,
-			nullStr(contentText), fileID, expectedRevision)
+	if s.useLegacyFiles {
+		var res sql.Result
+		var err error
+		if expectedRevision > 0 {
+			res, err = db.Exec(`UPDATE files SET content_text = ?
+				WHERE file_id = ? AND status = 'CONFIRMED' AND revision = ?`,
+				nullStr(contentText), fileID, expectedRevision)
+		} else {
+			res, err = db.Exec(`UPDATE files SET content_text = ?
+				WHERE file_id = ? AND status = 'CONFIRMED'`,
+				nullStr(contentText), fileID)
+		}
 		if err != nil {
 			return nil, err
 		}
 		// Dual-write to split tables
+		if expectedRevision > 0 {
+			if _, err := db.Exec(`UPDATE semantic SET content_text = ?
+				WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`,
+				nullStr(contentText), fileID, fileID, expectedRevision); err != nil {
+				return nil, fmt.Errorf("update semantic content_text: %w", err)
+			}
+			return res, nil
+		}
 		if _, err := db.Exec(`UPDATE semantic SET content_text = ?
-			WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`,
-			nullStr(contentText), fileID, fileID, expectedRevision); err != nil {
+			WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED')`,
+			nullStr(contentText), fileID, fileID); err != nil {
 			return nil, fmt.Errorf("update semantic content_text: %w", err)
 		}
 		return res, nil
 	}
-	res, err := db.Exec(`UPDATE files SET content_text = ?
-		WHERE file_id = ? AND status = 'CONFIRMED'`,
-		nullStr(contentText), fileID)
-	if err != nil {
-		return nil, err
+	// New tenant without legacy files: write directly to semantic.
+	if expectedRevision > 0 {
+		return db.Exec(`UPDATE semantic SET content_text = ?
+			WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`,
+			nullStr(contentText), fileID, fileID, expectedRevision)
 	}
-	// Dual-write to split tables
-	if _, err := db.Exec(`UPDATE semantic SET content_text = ?
+	return db.Exec(`UPDATE semantic SET content_text = ?
 		WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED')`,
-		nullStr(contentText), fileID, fileID); err != nil {
-		return nil, fmt.Errorf("update semantic content_text: %w", err)
-	}
-	return res, nil
+		nullStr(contentText), fileID, fileID)
 }
 
 // ReplaceFileTagsTx replaces all tags for fileID inside an existing transaction.
@@ -949,11 +985,12 @@ func (s *Store) MarkFileDeleted(ctx context.Context, fileID string) (err error) 
 	start := time.Now()
 	defer observeStoreOp(ctx, "mark_file_deleted", start, &err)
 
-	_, err = s.db.ExecContext(ctx, `UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fileID)
-	if err != nil {
-		return err
+	if s.useLegacyFiles {
+		_, err = s.db.ExecContext(ctx, `UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fileID)
+		if err != nil {
+			return err
+		}
 	}
-	// Dual-write to split tables
 	_, err = s.db.ExecContext(ctx, `UPDATE inodes SET status = 'DELETED' WHERE inode_id = ?`, fileID)
 	return err
 }
@@ -1292,8 +1329,10 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 		return nil, tx.Commit()
 	}
 
-	if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fileID.String); err != nil {
-		return nil, err
+	if s.useLegacyFiles {
+		if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fileID.String); err != nil {
+			return nil, err
+		}
 	}
 	if _, err := tx.Exec(`UPDATE inodes SET status = 'DELETED' WHERE inode_id = ?`, fileID.String); err != nil {
 		return nil, err
@@ -1302,11 +1341,7 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 		return nil, err
 	}
 
-	row := tx.QueryRow(`SELECT file_id, storage_type, storage_ref, storage_encryption_mode,
-		storage_encryption_key_id, content_type, size_bytes, checksum_sha256,
-		revision, embedding_revision, status, source_id, created_at, confirmed_at, expires_at
-		FROM files WHERE file_id = ?`, fileID.String)
-	f, err := scanFileForGC(row)
+	f, err := s.scanFileForGCTx(tx, fileID.String)
 	if err != nil {
 		return nil, err
 	}
@@ -1365,8 +1400,10 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		if count > 0 {
 			continue
 		}
-		if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fid); err != nil {
-			return nil, err
+		if s.useLegacyFiles {
+			if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fid); err != nil {
+				return nil, err
+			}
 		}
 		if _, err := tx.Exec(`UPDATE inodes SET status = 'DELETED' WHERE inode_id = ?`, fid); err != nil {
 			return nil, err
@@ -1374,11 +1411,7 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		if _, err := tx.Exec(`DELETE FROM file_tags WHERE file_id = ?`, fid); err != nil {
 			return nil, err
 		}
-		row := tx.QueryRow(`SELECT file_id, storage_type, storage_ref, storage_encryption_mode,
-			storage_encryption_key_id, content_type, size_bytes, checksum_sha256,
-			revision, embedding_revision, status, source_id, created_at, confirmed_at, expires_at
-			FROM files WHERE file_id = ?`, fid)
-		f, err := scanFileForGC(row)
+		f, err := s.scanFileForGCTx(tx, fid)
 		if err != nil {
 			return nil, err
 		}
@@ -1717,6 +1750,42 @@ func scanFileForGC(s scanner) (*File, error) {
 	if expiresAt.Valid {
 		t := expiresAt.Time.UTC()
 		f.ExpiresAt = &t
+	}
+	return &f, nil
+}
+
+// scanFileForGCTx reads the minimal file fields needed for GC task creation.
+// For legacy tenants it queries the files table; for new tenants it queries
+// the split tables (inodes/contents/semantic).
+func (s *Store) scanFileForGCTx(db execer, fileID string) (*File, error) {
+	if s.useLegacyFiles {
+		row := db.QueryRow(`SELECT file_id, storage_type, storage_ref, storage_encryption_mode,
+			storage_encryption_key_id, content_type, size_bytes, checksum_sha256,
+			revision, embedding_revision, status, source_id, created_at, confirmed_at, expires_at
+			FROM files WHERE file_id = ?`, fileID)
+		return scanFileForGC(row)
+	}
+	var f File
+	f.FileID = fileID
+	f.Status = StatusDeleted
+	var contentType sql.NullString
+	var embRev sql.NullInt64
+	err := db.QueryRow(`SELECT c.storage_type, c.storage_ref, i.size_bytes, COALESCE(c.content_type, ''),
+		s.embedding_revision
+		FROM inodes i
+		JOIN contents c ON i.inode_id = c.inode_id
+		LEFT JOIN semantic s ON i.inode_id = s.inode_id
+		WHERE i.inode_id = ?`, fileID).Scan(
+		&f.StorageType, &f.StorageRef, &f.SizeBytes, &contentType, &embRev)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	f.ContentType = contentType.String
+	if embRev.Valid {
+		f.EmbeddingRevision = &embRev.Int64
 	}
 	return &f, nil
 }
