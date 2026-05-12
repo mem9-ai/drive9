@@ -203,10 +203,20 @@ func tidbAppEmbeddingOptionalSchemaStatements() []string {
 		`ALTER TABLE files
 			ADD VECTOR INDEX idx_files_desc_cosine((VEC_COSINE_DISTANCE(description_embedding)))
 			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-		`CREATE FULLTEXT INDEX idx_semantic_fts_content ON semantic(content_text) WITH PARSER MULTILINGUAL`,
-		`CREATE FULLTEXT INDEX idx_semantic_fts_description ON semantic(description) WITH PARSER MULTILINGUAL`,
-		`CREATE VECTOR INDEX idx_semantic_cosine ON semantic((VEC_COSINE_DISTANCE(embedding)))`,
-		`CREATE VECTOR INDEX idx_semantic_desc_cosine ON semantic((VEC_COSINE_DISTANCE(description_embedding)))`,
+		`ALTER TABLE semantic
+			ADD FULLTEXT INDEX idx_semantic_fts_content(content_text)
+			WITH PARSER MULTILINGUAL
+			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
+		`ALTER TABLE semantic
+			ADD FULLTEXT INDEX idx_semantic_fts_description(description)
+			WITH PARSER MULTILINGUAL
+			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
+		`ALTER TABLE semantic
+			ADD VECTOR INDEX idx_semantic_cosine((VEC_COSINE_DISTANCE(embedding)))
+			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
+		`ALTER TABLE semantic
+			ADD VECTOR INDEX idx_semantic_desc_cosine((VEC_COSINE_DISTANCE(description_embedding)))
+			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
 	}
 }
 

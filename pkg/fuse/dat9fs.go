@@ -1117,10 +1117,12 @@ func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
 			mtime = time.Unix(item.Mtime, 0)
 		}
 		cached[i] = CachedFileInfo{
-			Name:  item.Name,
-			Size:  item.Size,
-			IsDir: item.IsDir,
-			Mtime: mtime,
+			Name:    item.Name,
+			Size:    item.Size,
+			IsDir:   item.IsDir,
+			Mtime:   mtime,
+			Mode:    item.Mode,
+			HasMode: item.HasMode,
 		}
 	}
 	return cached
@@ -1596,6 +1598,9 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 					mtime = time.Unix(item.Mtime, 0)
 				}
 				ino := fs.inodes.Lookup(childP, item.IsDir, item.Size, mtime)
+				if item.HasMode {
+					fs.inodes.UpdateMode(ino, item.Mode)
+				}
 				entry, ok := fs.inodes.GetEntry(ino)
 				if !ok {
 					return gofuse.EIO

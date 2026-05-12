@@ -982,8 +982,8 @@ func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
 	if nf.File != nil {
 		info.Size = nf.File.SizeBytes
 		info.ModTime = fileMtime(nf.File)
-		if nf.File.Mode != 0 {
-			info.Mode = nf.File.Mode
+		if nf.HasMode {
+			info.Mode = nf.Mode
 		} else if nf.Node.IsDirectory {
 			info.Mode = 0o755
 		} else {
@@ -991,7 +991,9 @@ func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
 		}
 	} else {
 		info.ModTime = nf.Node.CreatedAt
-		if nf.Node.IsDirectory {
+		if nf.HasMode {
+			info.Mode = nf.Mode
+		} else if nf.Node.IsDirectory {
 			info.Mode = 0o755
 		} else {
 			info.Mode = 0o644
