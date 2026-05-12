@@ -2447,6 +2447,51 @@ func TestOpenWritableLargeFileGetsLazyPreload(t *testing.T) {
 	}
 }
 
+func TestLazyWritablePreloadUsesRenamedPath(t *testing.T) {
+	const size = int64(1024 * 1024)
+	var getPath string
+
+	fs, ino, cleanup := newTestDat9FS(t, size, func(w http.ResponseWriter, r *http.Request) {
+		getPath = r.URL.Path
+		if !strings.HasSuffix(r.URL.Path, "/new.bin") {
+			http.Error(w, "unexpected read path "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte("renamed-data"))
+	})
+	defer cleanup()
+
+	oldPath := "/file.bin"
+	newPath := "/new.bin"
+	fh := &FileHandle{Ino: ino, Path: oldPath}
+	if st := fs.preloadWritableHandle(context.Background(), fh); st != gofuse.OK {
+		t.Fatalf("preloadWritableHandle status = %v, want OK", st)
+	}
+	if fh.Dirty == nil || fh.Dirty.LoadPart == nil {
+		t.Fatal("expected lazy dirty buffer")
+	}
+	fhID := fs.allocateFileHandle(fh)
+	defer fs.deleteFileHandle(fhID, fh)
+
+	fs.finishLocalRename(&gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Newdir:   1,
+	}, oldPath, newPath)
+	if fh.Path != newPath {
+		t.Fatalf("file handle path after rename = %q, want %q", fh.Path, newPath)
+	}
+
+	fh.Lock()
+	err := fh.Dirty.EnsureLoaded(0)
+	fh.Unlock()
+	if err != nil {
+		t.Fatalf("EnsureLoaded after rename: %v", err)
+	}
+	if !strings.HasSuffix(getPath, newPath) {
+		t.Fatalf("lazy load GET path = %q, want suffix %q", getPath, newPath)
+	}
+}
+
 func TestDefaultTTLIs10Seconds(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()

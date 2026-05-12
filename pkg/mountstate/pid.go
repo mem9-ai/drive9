@@ -38,7 +38,7 @@ func WritePID(mountPoint string, pid int) (string, error) {
 		return "", fmt.Errorf("invalid pid %d", pid)
 	}
 	path := PIDFilePath(mountPoint)
-	if err := os.WriteFile(path, []byte(strconv.Itoa(pid)+"\n"), 0o644); err != nil {
+	if err := writeFileAtomic(path, []byte(strconv.Itoa(pid)+"\n"), 0o644); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -53,10 +53,43 @@ func WriteProcessState(mountPoint string, state ProcessState) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal process state: %w", err)
 	}
-	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+	if err := writeFileAtomic(path, append(data, '\n'), 0o644); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	tmp, err := os.CreateTemp(dir, "."+base+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
 }
 
 func ReadPID(mountPoint string) (int, string, error) {

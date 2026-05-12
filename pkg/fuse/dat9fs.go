@@ -501,9 +501,11 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 	// Uses a bounded timeout so a stalled server cannot block the FUSE handler
 	// (and its held fh.mu) indefinitely.
 	c := fs.client
-	filePath := fh.Path
-	remoteFilePath := fs.remotePath(filePath)
 	fh.Dirty.LoadPart = func(partNum int) ([]byte, error) {
+		// WriteBuffer callers hold fh.mu. Resolve the path at load time so an
+		// open handle renamed before lazy loading reads from the new remote path.
+		filePath := fh.Path
+		remoteFilePath := fs.remotePath(filePath)
 		partIdx := partNum - 1
 		offset := int64(partIdx) * partSize
 		length := partSize

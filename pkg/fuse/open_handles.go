@@ -51,6 +51,9 @@ func (idx *OpenHandleIndex) Remove(fh *FileHandle) {
 	}
 }
 
+// Has reports whether any open handle matches ino or p.
+// When both are supplied this intentionally uses OR semantics to preserve the
+// old conservative inode/path checks from the pre-index table scan.
 func (idx *OpenHandleIndex) Has(ino uint64, p string) bool {
 	if idx == nil {
 		return false

@@ -98,6 +98,37 @@ func TestWriteReadProcessState(t *testing.T) {
 	}
 }
 
+func TestWriteProcessStateReplacesExistingFile(t *testing.T) {
+	mountPoint := filepath.Join(t.TempDir(), "mnt")
+
+	path, err := WriteProcessState(mountPoint, ProcessState{PID: 111, CreationTime: 1})
+	if err != nil {
+		t.Fatalf("initial WriteProcessState: %v", err)
+	}
+	defer func() { _ = os.Remove(path) }()
+
+	if _, err := WriteProcessState(mountPoint, ProcessState{PID: 222, CreationTime: 2}); err != nil {
+		t.Fatalf("replacement WriteProcessState: %v", err)
+	}
+	got, gotPath, err := ReadProcessState(mountPoint)
+	if err != nil {
+		t.Fatalf("ReadProcessState: %v", err)
+	}
+	if got != (ProcessState{PID: 222, CreationTime: 2}) {
+		t.Fatalf("ReadProcessState = %#v, want replacement state", got)
+	}
+	if gotPath != path {
+		t.Fatalf("ReadProcessState path = %q, want %q", gotPath, path)
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*"))
+	if err != nil {
+		t.Fatalf("glob temp pid files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("left temporary pid files: %v", matches)
+	}
+}
+
 func TestReadProcessStateSupportsLegacyPIDFile(t *testing.T) {
 	mountPoint := filepath.Join(t.TempDir(), "mnt")
 	path := PIDFilePath(mountPoint)

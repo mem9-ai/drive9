@@ -39,6 +39,22 @@ func TestOpenHandleIndexTracksByInodeAndPath(t *testing.T) {
 	}
 }
 
+func TestOpenHandleIndexHasUsesConservativeOR(t *testing.T) {
+	idx := NewOpenHandleIndex()
+	idx.Add(&FileHandle{Ino: 10, Path: "/a.txt"})
+	idx.Add(&FileHandle{Ino: 11, Path: "/b.txt"})
+
+	if !idx.Has(10, "/b.txt") {
+		t.Fatal("Has should match an open inode or an open path")
+	}
+	if !idx.Has(11, "/a.txt") {
+		t.Fatal("Has should preserve OR semantics when both keys are supplied")
+	}
+	if idx.Has(99, "/missing.txt") {
+		t.Fatal("Has matched unrelated inode and path")
+	}
+}
+
 func TestOpenHandleIndexRenamePathPrefix(t *testing.T) {
 	idx := NewOpenHandleIndex()
 	file := &FileHandle{Ino: 10, Path: "/dir/a.txt"}
