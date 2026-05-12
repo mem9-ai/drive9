@@ -5,7 +5,9 @@ package datastore
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
@@ -507,10 +509,10 @@ func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() 
 	var err error
 	defer observeStoreOp(ctx, "ensure_parent_dirs", start, &err)
 
-	// Run inside a transaction with SELECT FOR UPDATE so concurrent callers
-	// creating the same missing parent cannot race past each other and leak
-	// orphan inodes. Deadlocks can happen when many goroutines contend for the
-	// same gap lock; retry a bounded number of times.
+	// Run inside a transaction so the sequence of per-parent inserts is
+	// atomic. Deadlocks can still happen when many goroutines contend for
+	// the same unique-key lock on file_nodes.path; retry a bounded number
+	// of times.
 	const maxAttempts = 3
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		var tx *sql.Tx
@@ -958,11 +960,21 @@ func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) 
 	return ensureParentDirsWithExecer(context.Background(), db, path, genID)
 }
 
+// deterministicNodeID returns a stable 64-char hex ID derived from the path.
+// Using a deterministic ID means concurrent creators for the same missing
+// parent path will collide on the same inode_id; INSERT IGNORE swallows the
+// duplicate, so no orphan inode is ever created. This works on TiDB as well
+// as MySQL because it does not rely on gap locking.
+func deterministicNodeID(path string) string {
+	h := sha256.Sum256([]byte(path))
+	return hex.EncodeToString(h[:])
+}
+
 // ensureParentDirsWithExecer is the shared implementation used by both
-// EnsureParentDirs (inside its own transaction) and EnsureParentDirsTx
-// (inside the caller's transaction). It uses SELECT ... FOR UPDATE to
-// serialize concurrent attempts to create the same missing parent,
-// preventing orphan inode leaks.
+// EnsureParentDirs and EnsureParentDirsTx. It uses a deterministic inode_id
+// derived from the path so concurrent attempts to create the same missing
+// parent cannot leak orphan inodes, even on TiDB which does not support gap
+// locking for SELECT ... FOR UPDATE on non-existing rows.
 func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, genID func() string) error {
 	var ancestors []string
 	cur := path
@@ -980,17 +992,24 @@ func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, gen
 		pp := parentPath(dirPath)
 		name := baseName(dirPath)
 
-		// Lock the row (or the gap) so concurrent creators serialize.
-		var existingNodeID string
-		if err := db.QueryRowContext(ctx,
-			`SELECT node_id FROM file_nodes WHERE path = ? AND is_directory = 1 FOR UPDATE`,
-			dirPath).Scan(&existingNodeID); err == nil {
+		// Check if the directory already exists and has an inode_id.
+		var existingInodeID sql.NullString
+		selectErr := db.QueryRowContext(ctx,
+			`SELECT inode_id FROM file_nodes WHERE path = ? AND is_directory = 1`,
+			dirPath).Scan(&existingInodeID)
+		if selectErr == nil && existingInodeID.Valid {
+			// Already exists and has an inode_id — nothing to do.
 			continue
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("check parent dir %s: %w", dirPath, err)
+		}
+		if selectErr != nil && !errors.Is(selectErr, sql.ErrNoRows) {
+			return fmt.Errorf("check parent dir %s: %w", dirPath, selectErr)
 		}
 
-		nodeID := genID()
+		// Use a deterministic ID so concurrent creators for the same missing
+		// parent path collide on the same inode_id. INSERT IGNORE swallows the
+		// duplicate, so no orphan inode is ever created. This works on TiDB
+		// as well as MySQL because it does not rely on gap locking.
+		nodeID := deterministicNodeID(dirPath)
 		_, err := db.ExecContext(ctx, `INSERT IGNORE INTO inodes
 			(inode_id, size_bytes, revision, mode, status, created_at, mtime)
 			VALUES (?, 0, 1, ?, 'CONFIRMED', ?, ?)`,
@@ -998,6 +1017,20 @@ func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, gen
 		if err != nil {
 			return fmt.Errorf("ensure parent inode %s: %w", dirPath, err)
 		}
+
+		if selectErr == nil && !existingInodeID.Valid {
+			// Directory row exists from pre-migration (inode_id was NULL).
+			// Backfill the inode_id.
+			_, err = db.ExecContext(ctx,
+				`UPDATE file_nodes SET inode_id = ? WHERE path = ? AND is_directory = 1`,
+				nodeID, dirPath)
+			if err != nil {
+				return fmt.Errorf("backfill parent inode_id %s: %w", dirPath, err)
+			}
+			continue
+		}
+
+		// Directory does not exist — insert the dentry.
 		_, err = db.ExecContext(ctx, `INSERT INTO file_nodes
 			(node_id, path, parent_path, name, is_directory, inode_id, created_at)
 			VALUES (?, ?, ?, ?, 1, ?, ?)
