@@ -57,7 +57,7 @@ type DirEntry struct {
 // HandleTable is a thread-safe, generic handle allocator and lookup table.
 // Handle IDs start at 1 and are never reused within the lifetime of the table.
 type HandleTable[T any] struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	table  map[uint64]T
 	nextFh uint64 // starts at 1
 }
@@ -85,8 +85,8 @@ func (ht *HandleTable[T]) Allocate(val T) uint64 {
 // Get looks up a value by handle ID. It returns the value and true if found,
 // or the zero value of T and false otherwise.
 func (ht *HandleTable[T]) Get(fh uint64) (T, bool) {
-	ht.mu.Lock()
-	defer ht.mu.Unlock()
+	ht.mu.RLock()
+	defer ht.mu.RUnlock()
 
 	val, ok := ht.table[fh]
 	return val, ok
@@ -116,8 +116,8 @@ func (ht *HandleTable[T]) ForEach(fn func(fh uint64, val T)) {
 // Snapshot returns a copy of the handle values present at the time of call.
 // The returned slice can be iterated without holding the table lock.
 func (ht *HandleTable[T]) Snapshot() []T {
-	ht.mu.Lock()
-	defer ht.mu.Unlock()
+	ht.mu.RLock()
+	defer ht.mu.RUnlock()
 
 	vals := make([]T, 0, len(ht.table))
 	for _, val := range ht.table {

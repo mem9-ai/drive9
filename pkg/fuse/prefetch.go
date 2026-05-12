@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
@@ -49,7 +50,7 @@ type Prefetcher struct {
 	cache      map[int64]*prefetchBlock
 	inflight   map[int64]bool
 	client     *client.Client
-	path       string
+	path       atomic.Value
 	fileSize   int64
 	cancel     context.CancelFunc // cancels all inflight prefetch goroutines
 	ctx        context.Context    // parent context for prefetch goroutines
@@ -65,22 +66,42 @@ func NewPrefetcher(c *client.Client, path string, fileSize int64, debug ...bool)
 	if len(debug) > 0 {
 		debugEnabled = debug[0]
 	}
-	return &Prefetcher{
+	p := &Prefetcher{
 		nextExpect: 0,
 		window:     prefetchMinWindow,
 		cache:      make(map[int64]*prefetchBlock),
 		inflight:   make(map[int64]bool),
 		client:     c,
-		path:       path,
 		fileSize:   fileSize,
 		ctx:        ctx,
 		cancel:     cancel,
 		debug:      debugEnabled,
 	}
+	p.path.Store(path)
+	return p
 }
 
 func (p *Prefetcher) SetPerfCounters(perf *fusePerfCounters) {
 	p.perf = perf
+}
+
+func (p *Prefetcher) SetPath(path string) {
+	if p == nil {
+		return
+	}
+	p.path.Store(path)
+}
+
+func (p *Prefetcher) pathString() string {
+	if p == nil {
+		return ""
+	}
+	if v := p.path.Load(); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
 }
 
 func (p *Prefetcher) debugf(format string, args ...any) {
@@ -96,14 +117,14 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
-		p.debugf("get closed path=%s offset=%d size=%d", p.path, offset, size)
+		p.debugf("get closed path=%s offset=%d size=%d", p.pathString(), offset, size)
 		return nil, false
 	}
 	block, ok := p.cache[offset]
 	p.mu.Unlock()
 
 	if !ok {
-		p.debugf("miss path=%s offset=%d size=%d", p.path, offset, size)
+		p.debugf("miss path=%s offset=%d size=%d", p.pathString(), offset, size)
 		return nil, false
 	}
 
@@ -112,7 +133,7 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 	select {
 	case <-block.ready:
 	case <-p.ctx.Done():
-		p.debugf("wait canceled path=%s offset=%d size=%d wait=%s", p.path, offset, size, time.Since(waitStart))
+		p.debugf("wait canceled path=%s offset=%d size=%d wait=%s", p.pathString(), offset, size, time.Since(waitStart))
 		return nil, false
 	}
 	wait := time.Since(waitStart)
@@ -124,7 +145,7 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 			delete(p.cache, offset)
 		}
 		p.mu.Unlock()
-		p.debugf("block error path=%s offset=%d size=%d wait=%s err=%v", p.path, offset, size, wait, block.err)
+		p.debugf("block error path=%s offset=%d size=%d wait=%s err=%v", p.pathString(), offset, size, wait, block.err)
 		return nil, false
 	}
 
@@ -138,7 +159,7 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 			delete(p.cache, offset)
 		}
 		p.mu.Unlock()
-		p.debugf("short block path=%s offset=%d req=%d got=%d file_size=%d wait=%s", p.path, offset, size, len(data), p.fileSize, wait)
+		p.debugf("short block path=%s offset=%d req=%d got=%d file_size=%d wait=%s", p.pathString(), offset, size, len(data), p.fileSize, wait)
 		return nil, false
 	}
 	if len(data) > size {
@@ -152,7 +173,7 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 	}
 	p.mu.Unlock()
 
-	p.debugf("hit path=%s offset=%d req=%d got=%d wait=%s", p.path, offset, size, len(data), wait)
+	p.debugf("hit path=%s offset=%d req=%d got=%d wait=%s", p.pathString(), offset, size, len(data), wait)
 	return data, true
 }
 
@@ -189,7 +210,7 @@ func (p *Prefetcher) OnRead(offset int64, size int) {
 	} else {
 		// Random read — reset
 		if p.nextExpect != 0 || len(p.cache) > 0 || len(p.inflight) > 0 {
-			p.debugf("random reset path=%s offset=%d size=%d next_expect=%d cache=%d inflight=%d", p.path, offset, size, p.nextExpect, len(p.cache), len(p.inflight))
+			p.debugf("random reset path=%s offset=%d size=%d next_expect=%d cache=%d inflight=%d", p.pathString(), offset, size, p.nextExpect, len(p.cache), len(p.inflight))
 		}
 		p.window = prefetchMinWindow
 		// Clear stale cache
@@ -224,7 +245,7 @@ func (p *Prefetcher) Close() {
 	for k := range p.inflight {
 		delete(p.inflight, k)
 	}
-	p.debugf("close path=%s cache=%d inflight=%d", p.path, cacheLen, inflightLen)
+	p.debugf("close path=%s cache=%d inflight=%d", p.pathString(), cacheLen, inflightLen)
 }
 
 // startPrefetch launches a background fetch. Caller must hold p.mu.
@@ -291,7 +312,8 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 	}
 	// Mark the fetch start as inflight (not each chunk — OnRead checks start offset).
 	p.inflight[offset] = true
-	p.debugf("start path=%s offset=%d length=%d chunk_size=%d chunks=%d window=%d", p.path, offset, length, chunkSize, nChunks, p.window)
+	fetchPath := p.pathString()
+	p.debugf("start path=%s offset=%d length=%d chunk_size=%d chunks=%d window=%d", fetchPath, offset, length, chunkSize, nChunks, p.window)
 
 	ctx := p.ctx
 	go func() {
@@ -303,7 +325,7 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 			close(ready)
 		}()
 
-		rc, err := p.client.ReadStreamRange(ctx, p.path, offset, length)
+		rc, err := p.client.ReadStreamRange(ctx, fetchPath, offset, length)
 		if err != nil {
 			if p.perf != nil {
 				p.perf.recordRemoteOp(perfRemoteRead, err, time.Since(start), 0)
@@ -311,7 +333,7 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 			for _, b := range blocks {
 				b.err = err
 			}
-			p.debugf("fetch open error path=%s offset=%d length=%d dur=%s err=%v", p.path, offset, length, time.Since(start), err)
+			p.debugf("fetch open error path=%s offset=%d length=%d dur=%s err=%v", fetchPath, offset, length, time.Since(start), err)
 			return
 		}
 		defer func() { _ = rc.Close() }()
@@ -324,7 +346,7 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 			for _, b := range blocks {
 				b.err = err
 			}
-			p.debugf("fetch read error path=%s offset=%d length=%d got=%d dur=%s err=%v", p.path, offset, length, len(data), time.Since(start), err)
+			p.debugf("fetch read error path=%s offset=%d length=%d got=%d dur=%s err=%v", fetchPath, offset, length, len(data), time.Since(start), err)
 			return
 		}
 
@@ -344,6 +366,6 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 			copy(chunk, data[start:end])
 			b.data = chunk
 		}
-		p.debugf("fetch done path=%s offset=%d length=%d got=%d chunks=%d dur=%s", p.path, offset, length, len(data), nChunks, time.Since(start))
+		p.debugf("fetch done path=%s offset=%d length=%d got=%d chunks=%d dur=%s", fetchPath, offset, length, len(data), nChunks, time.Since(start))
 	}()
 }

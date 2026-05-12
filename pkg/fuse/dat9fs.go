@@ -31,6 +31,7 @@ type Dat9FS struct {
 	client      *client.Client
 	inodes      *InodeToPath
 	fileHandles *HandleTable[*FileHandle]
+	openHandles *OpenHandleIndex
 	dirHandles  *HandleTable[*DirHandle]
 	readCache   *ReadCache
 	dirCache    *DirCache
@@ -171,6 +172,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		client:        c,
 		inodes:        NewInodeToPath(),
 		fileHandles:   NewHandleTable[*FileHandle](),
+		openHandles:   NewOpenHandleIndex(),
 		dirHandles:    NewHandleTable[*DirHandle](),
 		readCache:     NewReadCache(opts.CacheSize, 0),
 		dirCache:      NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
@@ -264,6 +266,9 @@ func releaseTimeout(size int64) time.Duration {
 // timeout expires. This ensures HTTP calls never block indefinitely.
 func fuseCtx(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
 	ctx, cf := context.WithTimeout(context.Background(), fuseTimeout)
+	if cancel == nil {
+		return ctx, cf
+	}
 	go func() {
 		select {
 		case <-cancel:
@@ -420,8 +425,14 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 	}
 
 	var matching []*FileHandle
-	for _, fh := range fs.fileHandles.Snapshot() {
-		if fh != nil && fh.Path == remotePath && fh.Dirty != nil {
+	for _, fh := range fs.openHandles.SnapshotPath(remotePath) {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		dirty := fh.Dirty != nil
+		fh.Unlock()
+		if dirty {
 			matching = append(matching, fh)
 		}
 	}
@@ -1638,17 +1649,7 @@ func (fs *Dat9FS) shouldPreserveForgottenInode(entry *InodeEntry) bool {
 }
 
 func (fs *Dat9FS) hasOpenHandle(ino uint64, p string) bool {
-	// TODO: if git/package-manager workloads keep many handles open, maintain
-	// path/inode indexes instead of scanning the whole handle table.
-	for _, fh := range fs.fileHandles.Snapshot() {
-		if fh == nil {
-			continue
-		}
-		if fh.Ino == ino || fh.Path == p {
-			return true
-		}
-	}
-	return false
+	return fs.openHandles.Has(ino, p)
 }
 
 func (fs *Dat9FS) hasPendingLocalState(p string) bool {
@@ -1673,11 +1674,15 @@ func (fs *Dat9FS) hasQueuedCommit(p string) bool {
 }
 
 func (fs *Dat9FS) openHandleEntry(p string) (*InodeEntry, bool) {
-	for _, fh := range fs.fileHandles.Snapshot() {
-		if fh == nil || fh.Path != p || fh.Dirty == nil {
+	for _, fh := range fs.openHandles.SnapshotPath(p) {
+		if fh == nil {
 			continue
 		}
 		fh.Lock()
+		if fh.Dirty == nil {
+			fh.Unlock()
+			continue
+		}
 		size := fh.Dirty.Size()
 		fh.Unlock()
 		// This path reconstructs a dentry for an already-open writable file
@@ -2233,6 +2238,27 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	if oldEntryOK {
 		fs.dirCache.Upsert(newParent, cachedInfoFromEntry(path.Base(newP), oldEntry))
 	}
+	fs.retargetOpenHandlesForRename(oldP, newP)
+}
+
+func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
+	for fh, currentPath := range fs.openHandles.RenamePathPrefix(oldP, newP) {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		fh.Path = currentPath
+		if fh.Dirty != nil {
+			fh.Dirty.path = currentPath
+		}
+		if fh.Streamer != nil {
+			fh.Streamer.SetPath(currentPath, fs.remoteRoot())
+		}
+		if fh.Prefetch != nil {
+			fh.Prefetch.SetPath(fs.remotePath(currentPath))
+		}
+		fh.Unlock()
+	}
 }
 
 func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName string, newName string) (status gofuse.Status) {
@@ -2698,7 +2724,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	}
 
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
-	out.Fh = fs.fileHandles.Allocate(fh)
+	out.Fh = fs.allocateFileHandle(fh)
 	// Use cached I/O for small/interactive files. Kernel coalesces writes
 	// and serves reads from page cache after first access.
 	// Keep DIRECT_IO for O_TRUNC streaming files.
@@ -2845,7 +2871,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		}
 	}
 
-	out.Fh = fs.fileHandles.Allocate(fh)
+	out.Fh = fs.allocateFileHandle(fh)
 	if fh.Dirty != nil {
 		// Use cached I/O for small/interactive files (< 64MB, no O_TRUNC).
 		// Kernel coalesces writes and serves reads from page cache.
@@ -3698,7 +3724,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			if fh.Prefetch != nil {
 				fh.Prefetch.Close()
 			}
-			fs.fileHandles.Delete(input.Fh)
+			fs.deleteFileHandle(input.Fh, fh)
 			fs.cleanupReleasedInode(fh.Ino, fh.Path)
 		}()
 

@@ -2461,6 +2461,39 @@ func TestDefaultTTLIs10Seconds(t *testing.T) {
 	}
 }
 
+func TestInteractiveProfileAppliesTTLDefaults(t *testing.T) {
+	opts := &MountOptions{Profile: "interactive"}
+	opts.setDefaults()
+	if opts.AttrTTL != time.Second {
+		t.Fatalf("interactive AttrTTL = %v, want 1s", opts.AttrTTL)
+	}
+	if opts.EntryTTL != time.Second {
+		t.Fatalf("interactive EntryTTL = %v, want 1s", opts.EntryTTL)
+	}
+	if opts.DirTTL != 2*time.Second {
+		t.Fatalf("interactive DirTTL = %v, want 2s", opts.DirTTL)
+	}
+}
+
+func TestInteractiveProfileKeepsExplicitTTLs(t *testing.T) {
+	opts := &MountOptions{
+		Profile:  "interactive",
+		AttrTTL:  5 * time.Second,
+		EntryTTL: 6 * time.Second,
+		DirTTL:   7 * time.Second,
+	}
+	opts.setDefaults()
+	if opts.AttrTTL != 5*time.Second {
+		t.Fatalf("explicit AttrTTL = %v, want 5s", opts.AttrTTL)
+	}
+	if opts.EntryTTL != 6*time.Second {
+		t.Fatalf("explicit EntryTTL = %v, want 6s", opts.EntryTTL)
+	}
+	if opts.DirTTL != 7*time.Second {
+		t.Fatalf("explicit DirTTL = %v, want 7s", opts.DirTTL)
+	}
+}
+
 func TestMountOptionsLookupRetryDefaultsAndDisableSentinel(t *testing.T) {
 	defaults := &MountOptions{}
 	defaults.setDefaults()
