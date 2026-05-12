@@ -1004,11 +1004,23 @@ func (s *Store) SanitizeForkRuntimeState(ctx context.Context) error {
 			`DELETE FROM vault_deks`,
 		} {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				if isMissingTableError(err) {
+					continue
+				}
 				return err
 			}
 		}
 		return nil
 	})
+}
+
+func isMissingTableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "error 1146") ||
+		strings.Contains(msg, "table") && strings.Contains(msg, "doesn't exist")
 }
 
 // --- composite operations ---
