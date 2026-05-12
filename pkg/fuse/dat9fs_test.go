@@ -2424,8 +2424,24 @@ func TestIsCreateActionUnsupportedErr(t *testing.T) {
 	if !isCreateActionUnsupportedErr(&client.StatusError{StatusCode: http.StatusBadRequest, Message: "unknown POST action"}) {
 		t.Fatal("unknown POST action should be treated as unsupported create action")
 	}
+	if !isCreateActionUnsupportedErr(&client.StatusError{StatusCode: http.StatusNotFound, Message: ""}) {
+		t.Fatal("plain 404 should be treated as unsupported create action")
+	}
 	if isCreateActionUnsupportedErr(&client.StatusError{StatusCode: http.StatusBadRequest, Message: "invalid path"}) {
 		t.Fatal("plain bad request should not be treated as unsupported create action")
+	}
+}
+
+func TestDeleteRemotePathRejectsInvalidKind(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	err := fs.deleteRemotePathWithInterruptRecovery(context.Background(), "/file.txt", deleteKind(""))
+	if err == nil {
+		t.Fatal("deleteRemotePathWithInterruptRecovery error = nil, want invalid kind error")
+	}
+	if !strings.Contains(err.Error(), "unsupported delete kind") {
+		t.Fatalf("error = %v, want unsupported delete kind", err)
 	}
 }
 

@@ -1062,6 +1062,9 @@ func TestCreateFileActionCreatesEmptyFileAndConflicts(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("create status = %d, want 200", resp.StatusCode)
 	}
+	if got := resp.Header.Get("Content-Type"); !strings.Contains(got, "application/json") {
+		t.Fatalf("create Content-Type = %q, want application/json", got)
+	}
 
 	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/empty.txt", nil)
 	resp, err = http.DefaultClient.Do(req)

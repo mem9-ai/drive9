@@ -1490,6 +1490,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "create_ok", "path", path)...)
 	s.publishEvent(r, path, "create")
+	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
 }
 

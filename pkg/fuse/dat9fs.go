@@ -899,7 +899,10 @@ func isCreateActionUnsupportedErr(err error) bool {
 	if !errors.As(err, &se) {
 		return false
 	}
-	if se.StatusCode != http.StatusBadRequest && se.StatusCode != http.StatusMethodNotAllowed && se.StatusCode != http.StatusNotFound {
+	if se.StatusCode == http.StatusNotFound {
+		return true
+	}
+	if se.StatusCode != http.StatusBadRequest && se.StatusCode != http.StatusMethodNotAllowed {
 		return false
 	}
 	msg := strings.ToLower(se.Message)
@@ -1373,7 +1376,7 @@ func (fs *Dat9FS) deleteRemotePathWithInterruptRecovery(ctx context.Context, loc
 	case deleteKindDir:
 		err = fs.client.DeleteDirCtx(ctx, remotePath)
 	default:
-		err = fs.client.DeleteCtx(ctx, remotePath)
+		err = fmt.Errorf("unsupported delete kind %q", kind)
 	}
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err == nil || !isTransientLookupErr(err) {

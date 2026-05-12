@@ -577,8 +577,8 @@ func TestCreateFileCtxPostsCreateActionAndReturnsRevision(t *testing.T) {
 		if r.URL.Path != "/v1/fs/empty.txt" {
 			t.Errorf("path = %s, want /v1/fs/empty.txt", r.URL.Path)
 		}
-		if !r.URL.Query().Has("create") {
-			t.Errorf("query = %q, want create action", r.URL.RawQuery)
+		if got := r.URL.Query().Get("create"); got != "1" {
+			t.Errorf("create query = %q, want 1", got)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
 	}))

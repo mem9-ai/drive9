@@ -474,7 +474,7 @@ func (c *Client) CreateFile(path string) (int64, error) {
 // CreateFileCtx creates an empty file with context support and returns the
 // committed file revision when the server reports it.
 func (c *Client) CreateFileCtx(ctx context.Context, path string) (int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?create", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?create=1", nil)
 	if err != nil {
 		return 0, err
 	}
