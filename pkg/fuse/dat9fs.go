@@ -546,7 +546,7 @@ func (fs *Dat9FS) preloadWritableHandleFromReadCacheLocked(fh *FileHandle) bool 
 	if fs.readCache == nil || fh == nil || fh.Dirty == nil {
 		return false
 	}
-	if fh.OrigSize <= 0 || fh.OrigSize > defaultSmallFileThreshold || fh.BaseRev <= 0 {
+	if fh.OrigSize <= 0 || fh.OrigSize > defaultReadCacheMaxFileSize || fh.BaseRev <= 0 {
 		return false
 	}
 
@@ -3208,7 +3208,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// InodeEntry has a stored revision from the last Lookup/GetAttr, pass
 	// it to the cache for validation. Cache hit only if revision matches.
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
-	if entry != nil && entry.Size <= defaultSmallFileThreshold && entry.Size > 0 {
+	if entry != nil && entry.Size <= defaultReadCacheMaxFileSize && entry.Size > 0 {
 		cacheRev := entry.Revision // use revision from last Stat/Lookup
 		// Fast path: serve from cache without any HTTP call.
 		if data, ok := fs.readCache.Get(p, cacheRev); ok {
@@ -4393,7 +4393,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 	if committedRev > 0 && entry.Inode > 0 {
 		// Seed readCache from shadow data before the shadow file is removed.
 		// Only attempt for files under the readCache size limit.
-		if entry.Size < int64(defaultSmallFileThreshold) && fs.shadowStore != nil {
+		if entry.Size <= int64(defaultReadCacheMaxFileSize) && fs.shadowStore != nil {
 			if data, err := fs.shadowStore.ReadAll(entry.Path); err == nil {
 				fs.readCache.PutOwned(entry.Path, data, committedRev)
 			}

@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -555,6 +556,72 @@ func TestReadZeroLengthFromWritableCleanBuffer(t *testing.T) {
 	}
 	if got := getCalls.Load(); got != 0 {
 		t.Fatalf("GET calls = %d, want 0", got)
+	}
+}
+
+func TestReadCacheCachesMediumSmallFileAfterFirstRead(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), defaultSmallFileThreshold+1024)
+	var getCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			getCalls.Add(1)
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			_, _ = w.Write(data)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	const rev = 11
+	ino := fs.inodes.Lookup("/medium.bin", false, int64(len(data)), time.Now())
+	fs.inodes.UpdateRevision(ino, rev)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("first Read status = %v, want OK", st)
+	}
+	first, _ := result.Bytes(buf)
+	if string(first) != string(data[:len(buf)]) {
+		t.Fatalf("first Read = %q, want prefix", string(first))
+	}
+
+	result, st = fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Offset:   128,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("second Read status = %v, want OK", st)
+	}
+	second, _ := result.Bytes(buf)
+	if string(second) != string(data[128:128+len(buf)]) {
+		t.Fatalf("second Read = %q, want prefix", string(second))
+	}
+	if got := getCalls.Load(); got != 1 {
+		t.Fatalf("GET calls = %d, want 1", got)
 	}
 }
 
@@ -2492,14 +2559,14 @@ func TestLazyWritablePreloadUsesRenamedPath(t *testing.T) {
 	}
 }
 
-func TestDefaultTTLIs10Seconds(t *testing.T) {
+func TestDefaultTTLIs60Seconds(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	if opts.AttrTTL != 10*time.Second {
-		t.Fatalf("default AttrTTL = %v, want 10s", opts.AttrTTL)
+	if opts.AttrTTL != defaultPositiveKernelCacheTTL {
+		t.Fatalf("default AttrTTL = %v, want %v", opts.AttrTTL, defaultPositiveKernelCacheTTL)
 	}
-	if opts.EntryTTL != 10*time.Second {
-		t.Fatalf("default EntryTTL = %v, want 10s", opts.EntryTTL)
+	if opts.EntryTTL != defaultPositiveKernelCacheTTL {
+		t.Fatalf("default EntryTTL = %v, want %v", opts.EntryTTL, defaultPositiveKernelCacheTTL)
 	}
 	if opts.NegativeEntryTTL != 10*time.Second {
 		t.Fatalf("default NegativeEntryTTL = %v, want 10s", opts.NegativeEntryTTL)
@@ -2570,13 +2637,14 @@ func TestLookupReturnsTTLInEntryOut(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("Lookup status = %v, want OK", st)
 	}
-	// The entry timeout should match the configured TTL (10s default).
+	// The entry timeout should match the configured default TTL.
 	// go-fuse stores timeouts in seconds + nanoseconds.
-	if out.EntryValid < 10 || out.EntryValid > 11 {
-		t.Fatalf("EntryValid = %d, want ~10 (10s TTL)", out.EntryValid)
+	wantSeconds := uint64(defaultPositiveKernelCacheTTL / time.Second)
+	if out.EntryValid < wantSeconds || out.EntryValid > wantSeconds+1 {
+		t.Fatalf("EntryValid = %d, want ~%d", out.EntryValid, wantSeconds)
 	}
-	if out.AttrValid < 10 || out.AttrValid > 11 {
-		t.Fatalf("AttrValid = %d, want ~10 (10s TTL)", out.AttrValid)
+	if out.AttrValid < wantSeconds || out.AttrValid > wantSeconds+1 {
+		t.Fatalf("AttrValid = %d, want ~%d", out.AttrValid, wantSeconds)
 	}
 }
 

@@ -10,10 +10,18 @@ import (
 const (
 	defaultReadCacheMaxSize = 128 << 20        // 128MB
 	defaultReadCacheTTL     = 30 * time.Second // 30s
+	// defaultPositiveKernelCacheTTL keeps positive path metadata hot across
+	// repeated scans while SSE/self-invalidation still handles namespace changes.
+	defaultPositiveKernelCacheTTL = 60 * time.Second
 	// defaultSmallFileThreshold is the local fallback used when no server
 	// value has been negotiated yet. The authoritative value is fetched from
 	// /v1/status on the dat9 client and propagated through FS.smallFileMax.
 	defaultSmallFileThreshold = 50_000
+	// defaultReadCacheMaxFileSize is deliberately larger than the inline
+	// fallback so medium-small files do not miss userspace cache solely because
+	// their server inline threshold is higher. The aggregate cache cap still
+	// bounds memory use.
+	defaultReadCacheMaxFileSize = 256 << 10
 )
 
 // cacheEntry holds a single cached file's data and metadata.
@@ -94,7 +102,7 @@ func (rc *ReadCache) Get(path string, currentRevision int64) ([]byte, bool) {
 }
 
 // Put stores data in the cache for the given path and revision. Only files
-// whose size does not exceed defaultSmallFileThreshold are cached. The cache
+// whose size does not exceed defaultReadCacheMaxFileSize are cached. The cache
 // limit is intentionally a static memory-pressure cap rather than a mirror
 // of the server's inline_threshold; raising the latter should not silently
 // expand FUSE's per-mount RAM footprint. If an entry for the path already
@@ -111,7 +119,7 @@ func (rc *ReadCache) PutOwned(path string, data []byte, revision int64) {
 }
 
 func (rc *ReadCache) put(path string, data []byte, revision int64, clone bool) {
-	if len(data) > defaultSmallFileThreshold {
+	if len(data) > defaultReadCacheMaxFileSize {
 		return
 	}
 
