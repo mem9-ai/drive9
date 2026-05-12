@@ -48,34 +48,28 @@ type Result struct {
 	Duration          time.Duration
 }
 
-// isComplete checks whether the split-tables migration has already finished.
-// It uses three cheap heuristics:
-//   1. If file_nodes has rows with inode_id IS NULL, directories still need
-//      inode creation / backfill.
-//   2. If files has active rows but inodes is empty, file migration is needed.
-//   3. Otherwise migration is complete (or nothing needs migrating).
-// Re-running is safe (idempotent), so this check only needs to avoid the
-// common case of repeated full-table scans on every backend open.
-func (m *SplitTablesMigrator) isComplete(ctx context.Context) (bool, error) {
-	var pendingFileNodes int
-	if err := m.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_nodes WHERE inode_id IS NULL LIMIT 1`).Scan(&pendingFileNodes); err != nil {
-		return false, err
+// requiredTablesExist checks that the target tables for split-table migration
+// are present. Missing tables mean the tenant schema has not been initialized
+// for the split-table layout and migration cannot proceed.
+func (m *SplitTablesMigrator) requiredTablesExist(ctx context.Context) (bool, error) {
+	tables := []string{"file_nodes", "inodes", "contents", "semantic"}
+	for _, table := range tables {
+		var exists bool
+		var q string
+		switch m.dialect {
+		case DialectPostgres:
+			q = `SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = $1)`
+		default:
+			q = `SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?)`
+		}
+		if err := m.db.QueryRowContext(ctx, q, table).Scan(&exists); err != nil {
+			return false, fmt.Errorf("check table %s: %w", table, err)
+		}
+		if !exists {
+			return false, nil
+		}
 	}
-	if pendingFileNodes > 0 {
-		return false, nil
-	}
-	var hasFiles bool
-	if err := m.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM files WHERE status != 'DELETED' LIMIT 1)`).Scan(&hasFiles); err != nil {
-		return false, err
-	}
-	if !hasFiles {
-		return true, nil
-	}
-	var hasInodes bool
-	if err := m.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM inodes LIMIT 1)`).Scan(&hasInodes); err != nil {
-		return false, err
-	}
-	return hasInodes, nil
+	return true, nil
 }
 
 // Run executes the migration. It is idempotent — re-running is safe.
@@ -83,13 +77,14 @@ func (m *SplitTablesMigrator) Run(ctx context.Context) (*Result, error) {
 	start := time.Now()
 	res := &Result{}
 
-	complete, err := m.isComplete(ctx)
+	// Guard: migration assumes split tables exist. If they don't, the caller
+	// needs to run schema initialization first.
+	ok, err := m.requiredTablesExist(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("check migration completeness: %w", err)
+		return nil, fmt.Errorf("check required tables: %w", err)
 	}
-	if complete {
-		logger.Info(ctx, "migrate_split_tables_already_complete")
-		return res, nil
+	if !ok {
+		return nil, fmt.Errorf("required split tables (inodes, contents, semantic) do not exist; run schema initialization first")
 	}
 
 	logger.Info(ctx, "migrate_split_tables_started")

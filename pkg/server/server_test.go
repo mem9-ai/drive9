@@ -860,6 +860,44 @@ func TestStatDirectoryWithoutTrailingSlash(t *testing.T) {
 	}
 }
 
+func TestStatDirectoryReturnsMode(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Create a directory with a specific mode (0o700 = 448 decimal)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/modeddir?mkdir&mode=448", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mkdir: %d", resp.StatusCode)
+	}
+
+	// Stat the directory
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/modeddir/", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stat dir: %d", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Dat9-IsDir") != "true" {
+		t.Errorf("expected X-Dat9-IsDir true, got %s", resp.Header.Get("X-Dat9-IsDir"))
+	}
+	modeHdr := resp.Header.Get("X-Dat9-Mode")
+	if modeHdr == "" {
+		t.Error("expected X-Dat9-Mode header for directory, got empty")
+	}
+	if modeHdr != "448" { // 0o700 = 448 decimal
+		t.Errorf("expected X-Dat9-Mode 448, got %s", modeHdr)
+	}
+}
+
 func TestStatDirectoryWithoutTrailingSlashDoesNotLogDatastoreError(t *testing.T) {
 	core, recorded := observer.New(zap.ErrorLevel)
 	restoreLogger := logger.L()

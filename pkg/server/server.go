@@ -1343,7 +1343,6 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	w.Header().Set("X-Dat9-IsDir", fmt.Sprintf("%v", nf.Node.IsDirectory))
 	if nf.File != nil {
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(nf.File.Revision, 10))
-		w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(nf.File.Mode), 10))
 		if nf.File.ConfirmedAt != nil {
 			w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(nf.File.ConfirmedAt.Unix(), 10))
 		} else {
@@ -1351,6 +1350,9 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 		}
 	} else {
 		w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(nf.Node.CreatedAt.Unix(), 10))
+	}
+	if nf.HasMode {
+		w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(nf.Mode), 10))
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_ok", "path", path, "is_dir", nf.Node.IsDirectory)...)
 	w.WriteHeader(http.StatusOK)
