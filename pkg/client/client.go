@@ -183,11 +183,12 @@ func newClient(baseURL, credential string) *Client {
 
 // FileInfo represents a file entry from a directory listing.
 type FileInfo struct {
-	Name  string `json:"name"`
-	Size  int64  `json:"size"`
-	IsDir bool   `json:"isDir"`
-	Mtime int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
-	Mode  uint32 `json:"mode,omitempty"`
+	Name    string `json:"name"`
+	Size    int64  `json:"size"`
+	IsDir   bool   `json:"isDir"`
+	Mtime   int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
+	Mode    uint32 `json:"mode,omitempty"`
+	HasMode bool   `json:"hasMode"`
 }
 
 // StatResult represents file metadata from HEAD.
@@ -219,6 +220,7 @@ type BatchStatResult struct {
 	Revision int64  `json:"revision,omitempty"`
 	Mtime    int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
 	Mode     uint32 `json:"mode,omitempty"`
+	HasMode  bool   `json:"hasMode"`
 }
 
 // OK reports whether the per-path batch stat result is successful.

@@ -1185,6 +1185,7 @@ func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
 		Mtime:    mtime,
 		Revision: entry.Revision,
 		Mode:     entry.Mode,
+		HasMode:  entry.HasMode,
 	}
 }
 
@@ -1198,9 +1199,8 @@ func cachedInfoFromStat(name string, stat *client.StatResult) CachedFileInfo {
 		item.Size = stat.Size
 		item.IsDir = stat.IsDir
 		item.Revision = stat.Revision
-		if stat.HasMode {
-			item.Mode = stat.Mode
-		}
+		item.HasMode = stat.HasMode
+		item.Mode = stat.Mode
 	}
 	return item
 }
@@ -1838,6 +1838,10 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				if h.Ino == input.NodeId && h.Dirty != nil {
 					h.PendingMode = mode
 					h.HasPendingMode = true
+					if !h.HasPreviousMode {
+						h.PreviousMode = entry.Mode
+						h.HasPreviousMode = true
+					}
 				}
 			})
 		}
@@ -2573,9 +2577,8 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 				item.Mtime = time.Unix(result.Mtime, 0)
 			}
 			item.Revision = result.Revision
-			if result.Mode != 0 {
-				item.Mode = result.Mode
-			}
+			item.HasMode = result.HasMode
+			item.Mode = result.Mode
 		}
 	}
 }
@@ -2673,7 +2676,7 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		} else {
 			mode = syscall.S_IFREG
 		}
-		if item.Mode != 0 {
+		if item.HasMode {
 			mode |= item.Mode & 0o777
 		}
 		entries = append(entries, DirEntry{
@@ -3752,13 +3755,25 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		flushStatus := gofuse.OK
 		// Apply any deferred chmod after flush completes but before cleanup.
 		defer func() {
-			if fh.HasPendingMode && flushStatus == gofuse.OK {
-				ctx, cf := context.WithTimeout(context.Background(), 30*time.Second)
-				if err := fs.client.ChmodCtx(ctx, fs.remotePath(fh.Path), fh.PendingMode); err != nil {
-					log.Printf("release: pending chmod failed for %s: %v", fh.Path, err)
+			if fh.HasPendingMode {
+				if flushStatus == gofuse.OK {
+					ctx, cf := context.WithTimeout(context.Background(), 30*time.Second)
+					if err := fs.client.ChmodCtx(ctx, fs.remotePath(fh.Path), fh.PendingMode); err != nil {
+						log.Printf("release: pending chmod failed for %s: %v", fh.Path, err)
+						// Revert in-memory mode so local GetAttr doesn't lie.
+						if fh.HasPreviousMode {
+							fs.inodes.UpdateMode(fh.Ino, fh.PreviousMode)
+						}
+					}
+					cf()
+				} else {
+					// Flush failed — revert the in-memory mode so local GetAttr doesn't lie.
+					if fh.HasPreviousMode {
+						fs.inodes.UpdateMode(fh.Ino, fh.PreviousMode)
+					}
 				}
-				cf()
 				fh.HasPendingMode = false
+				fh.HasPreviousMode = false
 			}
 		}()
 		defer func() {

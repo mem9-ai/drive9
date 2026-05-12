@@ -737,12 +737,13 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 		if e.Node.IsDirectory {
 			info.Mode = 0o755
 		}
+		if e.HasMode {
+			info.Mode = e.Mode
+			info.Meta = filesystem.MetaData{Content: map[string]string{"hasMode": "true"}}
+		}
 		if e.File != nil {
 			info.Size = e.File.SizeBytes
 			info.ModTime = fileMtime(e.File)
-			if e.File.Mode != 0 {
-				info.Mode = e.File.Mode
-			}
 		} else {
 			info.ModTime = e.Node.CreatedAt
 		}

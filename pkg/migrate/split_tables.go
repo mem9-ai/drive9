@@ -48,10 +48,49 @@ type Result struct {
 	Duration          time.Duration
 }
 
+// isComplete checks whether the split-tables migration has already finished.
+// It uses three cheap heuristics:
+//   1. If file_nodes has rows with inode_id IS NULL, directories still need
+//      inode creation / backfill.
+//   2. If files has active rows but inodes is empty, file migration is needed.
+//   3. Otherwise migration is complete (or nothing needs migrating).
+// Re-running is safe (idempotent), so this check only needs to avoid the
+// common case of repeated full-table scans on every backend open.
+func (m *SplitTablesMigrator) isComplete(ctx context.Context) (bool, error) {
+	var pendingFileNodes int
+	if err := m.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_nodes WHERE inode_id IS NULL LIMIT 1`).Scan(&pendingFileNodes); err != nil {
+		return false, err
+	}
+	if pendingFileNodes > 0 {
+		return false, nil
+	}
+	var hasFiles bool
+	if err := m.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM files WHERE status != 'DELETED' LIMIT 1)`).Scan(&hasFiles); err != nil {
+		return false, err
+	}
+	if !hasFiles {
+		return true, nil
+	}
+	var hasInodes bool
+	if err := m.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM inodes LIMIT 1)`).Scan(&hasInodes); err != nil {
+		return false, err
+	}
+	return hasInodes, nil
+}
+
 // Run executes the migration. It is idempotent — re-running is safe.
 func (m *SplitTablesMigrator) Run(ctx context.Context) (*Result, error) {
 	start := time.Now()
 	res := &Result{}
+
+	complete, err := m.isComplete(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("check migration completeness: %w", err)
+	}
+	if complete {
+		logger.Info(ctx, "migrate_split_tables_already_complete")
+		return res, nil
+	}
 
 	logger.Info(ctx, "migrate_split_tables_started")
 

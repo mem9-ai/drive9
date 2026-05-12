@@ -105,8 +105,10 @@ type File struct {
 
 // NodeWithFile joins file_nodes and files for stat/read operations.
 type NodeWithFile struct {
-	Node FileNode
-	File *File // nil for directories
+	Node    FileNode
+	File    *File // nil for directories
+	Mode    uint32
+	HasMode bool
 }
 
 // Upload represents a row in the uploads table.
@@ -1300,6 +1302,10 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 				nf.File.EmbeddingRevision = &rev
 			}
 		}
+		if fMode.Valid {
+			nf.Mode = uint32(fMode.Int64)
+			nf.HasMode = true
+		}
 		result = append(result, nf)
 	}
 	if err := rows.Err(); err != nil {
@@ -1876,6 +1882,10 @@ func scanNodeWithFileWithBlob(s scanner) (*NodeWithFile, error) {
 			nf.File.ExpiresAt = &t
 		}
 	}
+	if fMode.Valid {
+		nf.Mode = uint32(fMode.Int64)
+		nf.HasMode = true
+	}
 	return nf, nil
 }
 
@@ -1928,6 +1938,10 @@ func scanNodeWithFileForRead(s scanner) (*NodeWithFile, error) {
 			nf.File.ConfirmedAt = &t
 		}
 	}
+	if fMode.Valid {
+		nf.Mode = uint32(fMode.Int64)
+		nf.HasMode = true
+	}
 	return nf, nil
 }
 
@@ -1975,6 +1989,10 @@ func scanNodeWithFileLite(s scanner) (*NodeWithFile, error) {
 			t := fConfirmedAt.Time.UTC()
 			nf.File.ConfirmedAt = &t
 		}
+	}
+	if fMode.Valid {
+		nf.Mode = uint32(fMode.Int64)
+		nf.HasMode = true
 	}
 	return nf, nil
 }

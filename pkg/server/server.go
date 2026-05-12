@@ -620,11 +620,12 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "list_ok", "path", path, "entries", len(entries))...)
 	type entry struct {
-		Name  string `json:"name"`
-		Size  int64  `json:"size"`
-		IsDir bool   `json:"isDir"`
-		Mtime int64  `json:"mtime,omitempty"`
-		Mode  uint32 `json:"mode,omitempty"`
+		Name    string `json:"name"`
+		Size    int64  `json:"size"`
+		IsDir   bool   `json:"isDir"`
+		Mtime   int64  `json:"mtime,omitempty"`
+		Mode    uint32 `json:"mode,omitempty"`
+		HasMode bool   `json:"hasMode"`
 	}
 	out := make([]entry, 0, len(entries))
 	for _, e := range entries {
@@ -632,7 +633,8 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		if !e.ModTime.IsZero() {
 			mtime = e.ModTime.Unix()
 		}
-		out = append(out, entry{Name: e.Name, Size: e.Size, IsDir: e.IsDir, Mtime: mtime, Mode: e.Mode})
+		hasMode := e.Meta.Content["hasMode"] == "true"
+		out = append(out, entry{Name: e.Name, Size: e.Size, IsDir: e.IsDir, Mtime: mtime, Mode: e.Mode, HasMode: hasMode})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"entries": out})
@@ -1099,6 +1101,7 @@ type batchStatResult struct {
 	Revision int64  `json:"revision,omitempty"`
 	Mtime    int64  `json:"mtime,omitempty"`
 	Mode     uint32 `json:"mode,omitempty"`
+	HasMode  bool   `json:"hasMode"`
 }
 
 type batchReadSmallRequest struct {
@@ -1261,10 +1264,11 @@ func (s *Server) batchStatOne(ctx context.Context, b *backend.Dat9Backend, rawPa
 	}
 	result.Status = http.StatusOK
 	result.IsDir = nf.Node.IsDirectory
+	result.HasMode = nf.HasMode
+	result.Mode = nf.Mode
 	if nf.File != nil {
 		result.Size = nf.File.SizeBytes
 		result.Revision = nf.File.Revision
-		result.Mode = nf.File.Mode
 		if nf.File.ConfirmedAt != nil {
 			result.Mtime = nf.File.ConfirmedAt.Unix()
 		} else {
