@@ -124,7 +124,33 @@ func (m *SplitTablesMigrator) isMigrationComplete(ctx context.Context) (bool, er
 	if err != nil {
 		return false, fmt.Errorf("check orphan directories: %w", err)
 	}
-	return dirCount == 0, nil
+	if dirCount > 0 {
+		return false, nil
+	}
+
+	// Check 5: any shared-table rows still missing inode_id backfill
+	// (step 5: backfillSharedInodeID covers file_nodes, file_tags, uploads,
+	// file_gc_tasks). If a prior run completed steps 1-4 and then failed
+	// during step 5, we must detect that and rerun.
+	var sharedCount int64
+	err = m.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM (
+			SELECT file_id FROM file_nodes
+			WHERE is_directory = 0 AND inode_id IS NULL AND file_id IS NOT NULL
+			UNION ALL
+			SELECT file_id FROM file_tags
+			WHERE inode_id IS NULL AND file_id IS NOT NULL
+			UNION ALL
+			SELECT file_id FROM uploads
+			WHERE inode_id IS NULL AND file_id IS NOT NULL
+			UNION ALL
+			SELECT file_id FROM file_gc_tasks
+			WHERE inode_id IS NULL AND file_id IS NOT NULL
+		) t`).Scan(&sharedCount)
+	if err != nil {
+		return false, fmt.Errorf("check shared backfill: %w", err)
+	}
+	return sharedCount == 0, nil
 }
 
 // Run executes the migration. It is idempotent — re-running is safe.

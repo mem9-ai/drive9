@@ -502,55 +502,41 @@ func (s *Store) RefCount(ctx context.Context, fileID string) (count int64, err e
 	return count, err
 }
 
-func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() string) (err error) {
+func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() string) error {
 	start := time.Now()
+	var err error
 	defer observeStoreOp(ctx, "ensure_parent_dirs", start, &err)
 
-	var ancestors []string
-	cur := path
-	for {
-		parent := parentPath(cur)
-		if parent == cur || parent == "/" {
-			break
-		}
-		ancestors = append(ancestors, parent)
-		cur = parent
-	}
-
-	now := time.Now().UTC()
-	for i := len(ancestors) - 1; i >= 0; i-- {
-		dirPath := ancestors[i]
-		pp := parentPath(dirPath)
-		name := baseName(dirPath)
-
-		// Check if the directory already exists to avoid leaking orphan inodes.
-		var existingNodeID string
-		if err := s.db.QueryRowContext(ctx,
-			`SELECT node_id FROM file_nodes WHERE path = ? AND is_directory = 1`,
-			dirPath).Scan(&existingNodeID); err == nil {
-			continue
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("check parent dir %s: %w", dirPath, err)
-		}
-
-		nodeID := genID()
-		_, err := s.db.ExecContext(ctx, `INSERT IGNORE INTO inodes
-			(inode_id, size_bytes, revision, mode, status, created_at, mtime)
-			VALUES (?, 0, 1, 493, 'CONFIRMED', ?, ?)`,
-			nodeID, now, now)
+	// Run inside a transaction with SELECT FOR UPDATE so concurrent callers
+	// creating the same missing parent cannot race past each other and leak
+	// orphan inodes. Deadlocks can happen when many goroutines contend for the
+	// same gap lock; retry a bounded number of times.
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		var tx *sql.Tx
+		tx, err = s.db.BeginTx(ctx, nil)
 		if err != nil {
-			return fmt.Errorf("ensure parent inode %s: %w", dirPath, err)
+			return err
 		}
-		_, err = s.db.ExecContext(ctx, `INSERT INTO file_nodes
-			(node_id, path, parent_path, name, is_directory, inode_id, created_at)
-			VALUES (?, ?, ?, ?, 1, ?, ?)
-			ON DUPLICATE KEY UPDATE node_id = node_id`,
-			nodeID, dirPath, pp, name, nodeID, now)
-		if err != nil && !isUniqueViolation(err) {
-			return fmt.Errorf("ensure parent %s: %w", dirPath, err)
+		err = ensureParentDirsWithExecer(ctx, tx, path, genID)
+		if err != nil {
+			_ = tx.Rollback()
+			if isDeadlock(err) && attempt < maxAttempts-1 {
+				continue
+			}
+			return err
 		}
+		err = tx.Commit()
+		if err != nil {
+			_ = tx.Rollback()
+			if isDeadlock(err) && attempt < maxAttempts-1 {
+				continue
+			}
+			return err
+		}
+		return nil
 	}
-	return nil
+	return err
 }
 
 // --- files operations ---
@@ -897,6 +883,8 @@ type execer interface {
 	Exec(query string, args ...interface{}) (sql.Result, error)
 	QueryRow(query string, args ...interface{}) *sql.Row
 	Query(query string, args ...interface{}) (*sql.Rows, error)
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
 }
 
 // FileStorageMeta holds the lightweight storage metadata needed by upload
@@ -967,6 +955,15 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 }
 
 func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) error {
+	return ensureParentDirsWithExecer(context.Background(), db, path, genID)
+}
+
+// ensureParentDirsWithExecer is the shared implementation used by both
+// EnsureParentDirs (inside its own transaction) and EnsureParentDirsTx
+// (inside the caller's transaction). It uses SELECT ... FOR UPDATE to
+// serialize concurrent attempts to create the same missing parent,
+// preventing orphan inode leaks.
+func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, genID func() string) error {
 	var ancestors []string
 	cur := path
 	for {
@@ -983,10 +980,10 @@ func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) 
 		pp := parentPath(dirPath)
 		name := baseName(dirPath)
 
-		// Check if the directory already exists to avoid leaking orphan inodes.
+		// Lock the row (or the gap) so concurrent creators serialize.
 		var existingNodeID string
-		if err := db.QueryRow(
-			`SELECT node_id FROM file_nodes WHERE path = ? AND is_directory = 1`,
+		if err := db.QueryRowContext(ctx,
+			`SELECT node_id FROM file_nodes WHERE path = ? AND is_directory = 1 FOR UPDATE`,
 			dirPath).Scan(&existingNodeID); err == nil {
 			continue
 		} else if !errors.Is(err, sql.ErrNoRows) {
@@ -994,14 +991,14 @@ func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) 
 		}
 
 		nodeID := genID()
-		_, err := db.Exec(`INSERT IGNORE INTO inodes
+		_, err := db.ExecContext(ctx, `INSERT IGNORE INTO inodes
 			(inode_id, size_bytes, revision, mode, status, created_at, mtime)
-			VALUES (?, 0, 1, 493, 'CONFIRMED', ?, ?)`,
-			nodeID, now, now)
+			VALUES (?, 0, 1, ?, 'CONFIRMED', ?, ?)`,
+			nodeID, 0o755, now, now)
 		if err != nil {
 			return fmt.Errorf("ensure parent inode %s: %w", dirPath, err)
 		}
-		_, err = db.Exec(`INSERT INTO file_nodes
+		_, err = db.ExecContext(ctx, `INSERT INTO file_nodes
 			(node_id, path, parent_path, name, is_directory, inode_id, created_at)
 			VALUES (?, ?, ?, ?, 1, ?, ?)
 			ON DUPLICATE KEY UPDATE node_id = node_id`,
@@ -2135,6 +2132,14 @@ func isUniqueViolation(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "Duplicate entry") || strings.Contains(msg, "UNIQUE constraint failed")
+}
+
+func isDeadlock(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Deadlock found") || strings.Contains(msg, "deadlock")
 }
 
 var wsNorm = regexp.MustCompile(`\s+`)

@@ -250,6 +250,81 @@ func TestSplitTablesMigratorAlreadyComplete(t *testing.T) {
 	}
 }
 
+func TestSplitTablesMigratorPartialStep5(t *testing.T) {
+	s, err := datastore.Open(testDSN)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	ctx := context.Background()
+	testmysql.ResetDB(t, s.DB())
+
+	// Insert a file via the old path (this creates files + inodes + contents + semantic)
+	f := &datastore.File{
+		FileID:      "file1",
+		StorageType: datastore.StorageDB9,
+		StorageRef:  "ref1",
+		SizeBytes:   100,
+		Revision:    1,
+		Status:      datastore.StatusConfirmed,
+		CreatedAt:   time.Now(),
+	}
+	if err := s.InsertFile(ctx, f); err != nil {
+		t.Fatalf("insert file: %v", err)
+	}
+
+	// Insert a file_nodes row with inode_id NULL to simulate pre-migration state
+	// where shared backfill has not run.
+	if err := s.InsertNode(ctx, &datastore.FileNode{
+		NodeID:      f.FileID,
+		Path:        "/test.txt",
+		ParentPath:  "/",
+		Name:        "test.txt",
+		IsDirectory: false,
+		FileID:      f.FileID,
+		InodeID:     "", // explicitly empty
+		CreatedAt:   time.Now(),
+	}); err != nil {
+		t.Fatalf("insert file node: %v", err)
+	}
+
+	db := s.DB()
+	m := NewSplitTablesMigrator(db)
+
+	// Run steps 1-4 manually, skipping step 5
+	if _, err := m.migrateInodes(ctx); err != nil {
+		t.Fatalf("migrate inodes: %v", err)
+	}
+	if _, err := m.migrateContents(ctx); err != nil {
+		t.Fatalf("migrate contents: %v", err)
+	}
+	if _, err := m.migrateSemantic(ctx); err != nil {
+		t.Fatalf("migrate semantic: %v", err)
+	}
+	if _, err := m.createDirInodes(ctx); err != nil {
+		t.Fatalf("create dir inodes: %v", err)
+	}
+	// Deliberately skip backfillSharedInodeID to simulate a crash after step 4.
+
+	// isMigrationComplete should detect the missing shared backfill
+	complete, err := m.isMigrationComplete(ctx)
+	if err != nil {
+		t.Fatalf("check completion: %v", err)
+	}
+	if complete {
+		t.Fatal("expected incomplete due to missing shared backfill")
+	}
+
+	// Full Run should now repair step 5
+	res, err := m.Run(ctx)
+	if err != nil {
+		t.Fatalf("migration failed: %v", err)
+	}
+	if res.SharedColsUpdated == 0 {
+		t.Errorf("shared cols updated = %d, want > 0", res.SharedColsUpdated)
+	}
+}
+
 func TestSplitTablesMigratorMissingTables(t *testing.T) {
 	s, err := datastore.Open(testDSN)
 	if err != nil {

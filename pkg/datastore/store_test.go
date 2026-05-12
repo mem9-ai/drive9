@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -853,6 +854,47 @@ func TestEnsureParentDirs(t *testing.T) {
 	}
 	if orphanCount != 0 {
 		t.Errorf("found %d orphan inodes (inodes with no file_nodes reference)", orphanCount)
+	}
+}
+
+func TestEnsureParentDirsConcurrent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.EnsureParentDirs(ctx, "/a/b/c/file.txt", genID); err != nil {
+				t.Errorf("ensure parent dirs: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Exactly three directory inodes should exist.
+	var dirInodeCount int64
+	if err := s.DB().QueryRow(`
+		SELECT COUNT(*) FROM inodes i
+		JOIN file_nodes fn ON i.inode_id = fn.inode_id
+		WHERE fn.is_directory = 1`).Scan(&dirInodeCount); err != nil {
+		t.Fatalf("count dir inodes: %v", err)
+	}
+	if dirInodeCount != 3 {
+		t.Errorf("dir inode count = %d, want 3", dirInodeCount)
+	}
+
+	// No orphan inodes should remain.
+	var orphanCount int64
+	if err := s.DB().QueryRow(`
+		SELECT COUNT(*) FROM inodes i
+		LEFT JOIN file_nodes fn ON i.inode_id = fn.inode_id
+		WHERE fn.inode_id IS NULL`).Scan(&orphanCount); err != nil {
+		t.Fatalf("count orphan inodes: %v", err)
+	}
+	if orphanCount != 0 {
+		t.Errorf("found %d orphan inodes after concurrent creation", orphanCount)
 	}
 }
 
