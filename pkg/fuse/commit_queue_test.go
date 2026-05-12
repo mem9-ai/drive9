@@ -277,6 +277,41 @@ func TestCommitQueueCancelPathCancelsRetryBackoff(t *testing.T) {
 	}
 }
 
+func TestCommitQueueQueuedPathIndexTracksCancelAndRemove(t *testing.T) {
+	path := "/repo/file.txt"
+	otherPath := "/repo/other.txt"
+	e1 := &CommitEntry{Path: path}
+	e2 := &CommitEntry{Path: path}
+	other := &CommitEntry{Path: otherPath}
+	cq := &CommitQueue{
+		queue:        []*CommitEntry{e1, other, e2},
+		queuedByPath: make(map[string]map[*CommitEntry]struct{}),
+		inFlight:     make(map[string]*CommitEntry),
+	}
+	cq.addQueuedLocked(e1)
+	cq.addQueuedLocked(other)
+	cq.addQueuedLocked(e2)
+
+	if !cq.HasPath(path) {
+		t.Fatal("HasPath should find queued entries through index")
+	}
+	cq.CancelPath(path)
+	if cq.HasPath(path) {
+		t.Fatal("CancelPath should remove all queued entries for path from index")
+	}
+	if !cq.isEntryCanceled(e1) || !cq.isEntryCanceled(e2) {
+		t.Fatal("CancelPath should cancel all queued entries for path")
+	}
+	if !cq.HasPath(otherPath) {
+		t.Fatal("CancelPath should preserve unrelated queued paths")
+	}
+
+	cq.removeFromQueue(other)
+	if cq.HasPath(otherPath) {
+		t.Fatal("removeFromQueue should remove queued path index entry")
+	}
+}
+
 // TestCommitQueueDirectPutRouting verifies that files under
 // commitQueueDirectPutThreshold use direct PUT (WriteCtxConditionalWithRevision)
 // which sends raw body, while files at or above the threshold use multipart

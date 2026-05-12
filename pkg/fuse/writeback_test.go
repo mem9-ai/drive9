@@ -2033,6 +2033,36 @@ func TestWriteBackCache_PendingIndex(t *testing.T) {
 	}
 }
 
+func TestWriteBackCacheListByPrefix(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = cache.Put("/dir/a.txt", []byte("a"), 1, PendingNew)
+	_ = cache.Put("/dir/sub/b.txt", []byte("b"), 1, PendingNew)
+	_ = cache.Put("/dir-other/c.txt", []byte("c"), 1, PendingNew)
+
+	entries := cache.ListByPrefix("/dir/")
+	if len(entries) != 2 {
+		t.Fatalf("ListByPrefix len = %d, want 2", len(entries))
+	}
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		seen[entry.Path] = struct{}{}
+	}
+	if _, ok := seen["/dir/a.txt"]; !ok {
+		t.Fatal("missing /dir/a.txt")
+	}
+	if _, ok := seen["/dir/sub/b.txt"]; !ok {
+		t.Fatal("missing /dir/sub/b.txt")
+	}
+	if _, ok := seen["/dir-other/c.txt"]; ok {
+		t.Fatal("/dir-other/c.txt should not match /dir/")
+	}
+}
+
 // TestUnlink_PendingNew_SkipsRemoteDelete verifies that Unlink skips the
 // remote DELETE for PendingNew files (never uploaded), avoiding a wasted RTT.
 func TestUnlink_PendingNew_SkipsRemoteDelete(t *testing.T) {

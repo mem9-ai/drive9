@@ -256,14 +256,14 @@ func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var count int64
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE parent_path = ?`, path).Scan(&count); err != nil {
+	hasChildren, err := dirHasChildrenTx(ctx, tx, path)
+	if err != nil {
 		return err
 	}
-	if count > 0 {
+	if hasChildren {
 		return fmt.Errorf("directory not empty: %s", path)
 	}
-	res, err := tx.Exec(`DELETE FROM file_nodes WHERE path = ? AND is_directory = 1`, path)
+	res, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ? AND is_directory = 1`, path)
 	if err != nil {
 		return err
 	}
@@ -279,8 +279,8 @@ func (s *Store) DeleteNodesByPrefix(ctx context.Context, prefix string) (n int64
 	start := time.Now()
 	defer observeStoreOp(ctx, "delete_nodes_by_prefix", start, &err)
 
-	res, err := s.db.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ? OR path LIKE ?`,
-		prefix, prefix+"%")
+	where, args := pathPrefixPredicate("path", prefix)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+where, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -1047,54 +1047,38 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var fileID sql.NullString
-	var isDir bool
-	err = tx.QueryRow(`SELECT file_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, path).Scan(&fileID, &isDir)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, err
-	}
-
-	if _, err := tx.Exec(`DELETE FROM file_nodes WHERE path = ?`, path); err != nil {
-		return nil, err
-	}
-
-	if isDir || !fileID.Valid || fileID.String == "" {
-		return nil, tx.Commit()
-	}
-
-	var count int64
-	err = tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE file_id = ? FOR UPDATE`, fileID.String).Scan(&count)
-	if err != nil {
-		return nil, err
-	}
-
-	if count > 0 {
-		return nil, tx.Commit()
-	}
-
-	if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fileID.String); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(`DELETE FROM file_tags WHERE file_id = ?`, fileID.String); err != nil {
-		return nil, err
-	}
-
-	row := tx.QueryRow(`SELECT file_id, storage_type, storage_ref, storage_encryption_mode,
-		storage_encryption_key_id, content_type, size_bytes, checksum_sha256,
-		revision, embedding_revision, status, source_id, created_at, confirmed_at, expires_at
-		FROM files WHERE file_id = ?`, fileID.String)
+	row := tx.QueryRowContext(ctx, `SELECT f.file_id, f.storage_type, f.storage_ref, f.storage_encryption_mode,
+		f.storage_encryption_key_id, f.content_type, f.size_bytes, f.checksum_sha256,
+		f.revision, f.embedding_revision, f.status, f.source_id, f.created_at, f.confirmed_at, f.expires_at
+		FROM file_nodes fn
+		JOIN files f ON f.file_id = fn.file_id
+		WHERE fn.path = ? AND fn.is_directory = 0
+		FOR UPDATE`, path)
 	f, err := scanFileForGC(row)
 	if err != nil {
 		return nil, err
 	}
-	task, err := NewFileGCTaskFromFile(f, time.Now().UTC())
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ?`, path); err != nil {
+		return nil, err
+	}
+
+	stillReferenced, err := fileIDExistsTx(ctx, tx, f.FileID)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.EnqueueFileGCTaskTx(tx, task); err != nil {
+	if stillReferenced {
+		return nil, tx.Commit()
+	}
+
+	if _, err := tx.ExecContext(ctx, `UPDATE files SET status = 'DELETED' WHERE file_id = ?`, f.FileID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_tags WHERE file_id = ?`, f.FileID); err != nil {
+		return nil, err
+	}
+	f.Status = StatusDeleted
+	if err := enqueueFileGCTasksTx(ctx, tx, []*File{f}, time.Now().UTC()); err != nil {
 		return nil, err
 	}
 
@@ -1115,58 +1099,26 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	rows, err := tx.Query(`SELECT DISTINCT file_id FROM file_nodes
-		WHERE (path = ? OR path LIKE ?) AND file_id IS NOT NULL`, dirPath, dirPath+"%")
+	orphaned, err := orphanedFilesByPathPrefixTx(ctx, tx, dirPath)
 	if err != nil {
 		return nil, err
 	}
-	var fileIDs []string
-	for rows.Next() {
-		var fid string
-		if err := rows.Scan(&fid); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		fileIDs = append(fileIDs, fid)
-	}
-	_ = rows.Close()
 
-	if _, err := tx.Exec(`DELETE FROM file_nodes WHERE path = ? OR path LIKE ?`,
-		dirPath, dirPath+"%"); err != nil {
+	deleteWhere, deleteArgs := pathPrefixPredicate("path", dirPath)
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+deleteWhere, deleteArgs...); err != nil {
 		return nil, err
 	}
 
-	var orphaned []*File
-	for _, fid := range fileIDs {
-		var count int64
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE file_id = ?`, fid).Scan(&count); err != nil {
+	if len(orphaned) > 0 {
+		if err := markFilesDeletedTx(ctx, tx, orphaned); err != nil {
 			return nil, err
 		}
-		if count > 0 {
-			continue
-		}
-		if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fid); err != nil {
+		if err := deleteFileTagsTx(ctx, tx, orphaned); err != nil {
 			return nil, err
 		}
-		if _, err := tx.Exec(`DELETE FROM file_tags WHERE file_id = ?`, fid); err != nil {
+		if err := enqueueFileGCTasksTx(ctx, tx, orphaned, time.Now().UTC()); err != nil {
 			return nil, err
 		}
-		row := tx.QueryRow(`SELECT file_id, storage_type, storage_ref, storage_encryption_mode,
-			storage_encryption_key_id, content_type, size_bytes, checksum_sha256,
-			revision, embedding_revision, status, source_id, created_at, confirmed_at, expires_at
-			FROM files WHERE file_id = ?`, fid)
-		f, err := scanFileForGC(row)
-		if err != nil {
-			return nil, err
-		}
-		task, err := NewFileGCTaskFromFile(f, time.Now().UTC())
-		if err != nil {
-			return nil, err
-		}
-		if _, err := s.EnqueueFileGCTaskTx(tx, task); err != nil {
-			return nil, err
-		}
-		orphaned = append(orphaned, f)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -1174,6 +1126,156 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 	}
 	out = orphaned
 	return out, nil
+}
+
+const deleteBatchSize = 500
+
+func fileIDExistsTx(ctx context.Context, tx *sql.Tx, fileID string) (bool, error) {
+	var one int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE file_id = ? LIMIT 1 FOR UPDATE`, fileID).Scan(&one)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, err
+}
+
+func dirHasChildrenTx(ctx context.Context, tx *sql.Tx, path string) (bool, error) {
+	var one int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE parent_path = ? LIMIT 1 FOR UPDATE`, path).Scan(&one)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, err
+}
+
+func orphanedFilesByPathPrefixTx(ctx context.Context, tx *sql.Tx, dirPath string) ([]*File, error) {
+	subtreeWhere, subtreeArgs := pathPrefixPredicate("fn.path", dirPath)
+	outsideWhere, outsideArgs := pathPrefixPredicate("live.path", dirPath)
+	args := make([]any, 0, len(subtreeArgs)+len(outsideArgs))
+	args = append(args, subtreeArgs...)
+	args = append(args, outsideArgs...)
+
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT f.file_id, f.storage_type, f.storage_ref, f.storage_encryption_mode,
+			f.storage_encryption_key_id, f.content_type, f.size_bytes, f.checksum_sha256,
+			f.revision, f.embedding_revision, f.status, f.source_id, f.created_at, f.confirmed_at, f.expires_at
+		FROM file_nodes fn
+		JOIN files f ON f.file_id = fn.file_id
+		WHERE (`+subtreeWhere+`)
+			AND fn.file_id IS NOT NULL
+			AND NOT EXISTS (
+				SELECT 1 FROM file_nodes live
+				WHERE live.file_id = fn.file_id
+					AND NOT (`+outsideWhere+`)
+				LIMIT 1
+			)
+		FOR UPDATE`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []*File
+	for rows.Next() {
+		f, err := scanFileForGC(rows)
+		if err != nil {
+			return nil, err
+		}
+		f.Status = StatusDeleted
+		out = append(out, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func markFilesDeletedTx(ctx context.Context, tx *sql.Tx, files []*File) error {
+	return forEachFileBatch(files, func(batch []*File) error {
+		query, args := fileIDInQuery(`UPDATE files SET status = ? WHERE file_id IN `, StatusDeleted, batch)
+		_, err := tx.ExecContext(ctx, query, args...)
+		return err
+	})
+}
+
+func deleteFileTagsTx(ctx context.Context, tx *sql.Tx, files []*File) error {
+	return forEachFileBatch(files, func(batch []*File) error {
+		query, args := fileIDInQuery(`DELETE FROM file_tags WHERE file_id IN `, nil, batch)
+		_, err := tx.ExecContext(ctx, query, args...)
+		return err
+	})
+}
+
+func enqueueFileGCTasksTx(ctx context.Context, tx *sql.Tx, files []*File, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	return forEachFileBatch(files, func(batch []*File) error {
+		var b strings.Builder
+		b.WriteString(`INSERT INTO file_gc_tasks
+			(task_id, file_id, storage_type, storage_ref, size_bytes, content_type,
+			 status, attempt_count, max_attempts, receipt, leased_at, lease_until,
+			 available_at, last_error, created_at, updated_at, completed_at)
+			VALUES `)
+		args := make([]any, 0, len(batch)*17)
+		for i, f := range batch {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+			args = append(args,
+				f.FileID, f.FileID, f.StorageType, f.StorageRef, f.SizeBytes, nullStr(f.ContentType),
+				FileGCTaskQueued, 0, defaultFileGCMaxAttempts, nil, nil, nil,
+				now, nil, now, now, nil,
+			)
+		}
+		b.WriteString(` ON DUPLICATE KEY UPDATE task_id = task_id`)
+		_, err := tx.ExecContext(ctx, b.String(), args...)
+		return err
+	})
+}
+
+func forEachFileBatch(files []*File, fn func([]*File) error) error {
+	for start := 0; start < len(files); start += deleteBatchSize {
+		end := start + deleteBatchSize
+		if end > len(files) {
+			end = len(files)
+		}
+		if err := fn(files[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func fileIDInQuery(prefix string, firstArg any, files []*File) (string, []any) {
+	var b strings.Builder
+	b.WriteString(prefix)
+	b.WriteString("(")
+	args := make([]any, 0, len(files)+1)
+	if firstArg != nil {
+		args = append(args, firstArg)
+	}
+	for i, f := range files {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("?")
+		args = append(args, f.FileID)
+	}
+	b.WriteString(")")
+	return b.String(), args
+}
+
+func pathPrefixPredicate(column, prefix string) (string, []any) {
+	return "BINARY " + column + " LIKE BINARY ? ESCAPE '\\\\'", []any{likeLiteralPrefixPattern(prefix)}
 }
 
 // --- uploads operations ---
