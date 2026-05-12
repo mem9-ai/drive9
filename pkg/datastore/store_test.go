@@ -615,6 +615,22 @@ func TestDeleteWithRefCount(t *testing.T) {
 	}
 }
 
+func TestDeleteFileWithRefCheckRejectsDirectory(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "dir", Path: "/dir/", ParentPath: "/", Name: "dir", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteFileWithRefCheck(ctx, "/dir/"); err != ErrNotFound {
+		t.Fatalf("DeleteFileWithRefCheck dir error = %v, want ErrNotFound", err)
+	}
+	if _, err := s.GetNode(ctx, "/dir/"); err != nil {
+		t.Fatalf("directory should remain after rejected file delete: %v", err)
+	}
+}
+
 func TestDeleteDirRecursive(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
@@ -667,6 +683,48 @@ func TestDeleteDirRecursive(t *testing.T) {
 	_, err = s.GetNode(context.Background(), "/shared.txt")
 	if err != nil {
 		t.Error("expected /shared.txt to survive")
+	}
+}
+
+func TestDeleteDirRecursiveDoesNotDeleteSiblingPrefix(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "d1", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "d2", Path: "/data-other/", ParentPath: "/", Name: "data-other", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertFile(context.Background(), &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertFile(context.Background(), &File{FileID: "f2", StorageType: StorageDB9, StorageRef: "/blobs/f2",
+		SizeBytes: 20, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n2", Path: "/data-other/b.txt", ParentPath: "/data-other/", Name: "b.txt", FileID: "f2", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	orphaned, err := s.DeleteDirRecursive(context.Background(), "/data/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orphaned) != 1 || orphaned[0].FileID != "f1" {
+		t.Fatalf("orphaned = %+v, want only f1", orphaned)
+	}
+	if _, err := s.GetNode(context.Background(), "/data-other/"); err != nil {
+		t.Fatalf("sibling directory should survive: %v", err)
+	}
+	if _, err := s.GetNode(context.Background(), "/data-other/b.txt"); err != nil {
+		t.Fatalf("sibling file should survive: %v", err)
+	}
+	if _, err := s.GetFileGCTaskByFileID(context.Background(), "f2"); err != ErrNotFound {
+		t.Fatalf("expected no gc task for sibling f2, got %v", err)
 	}
 }
 

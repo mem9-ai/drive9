@@ -28,7 +28,7 @@ GIT_HASH ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-CLI_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
+CLI_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 
 GOLANGCI_LINT_VERSION ?= v2.5.0
 GOLANGCI_LINT_BIN ?= $(BIN_DIR)/golangci-lint
@@ -126,7 +126,11 @@ build-cli-release:
 	for target in $(CLI_TARGETS); do \
 		os="$${target%/*}"; \
 		arch="$${target#*/}"; \
-		out="$(DIST_DIR)/$(CLI_NAME)-$${os}-$${arch}"; \
+		ext=""; \
+		if [ "$$os" = "windows" ]; then \
+			ext=".exe"; \
+		fi; \
+		out="$(DIST_DIR)/$(CLI_NAME)-$${os}-$${arch}$$ext"; \
 		echo "Building $$(basename "$$out")..."; \
 		$(MAKE) --no-print-directory build-cli GOOS="$$os" GOARCH="$$arch" CLI_BIN="$$out" VERSION="$(VERSION)"; \
 	done; \

@@ -206,6 +206,22 @@ func TestRunDoctorFuseDarwinDoesNotRequireLinuxFuseConf(t *testing.T) {
 	}
 }
 
+func TestRunDoctorFuseWindowsReportsUnsupported(t *testing.T) {
+	var out bytes.Buffer
+	deps := doctorTestDeps(&out)
+	deps.goos = "windows"
+	err := runDoctor([]string{"fuse"}, deps)
+	if err == nil {
+		t.Fatal("expected windows doctor fuse to fail")
+	}
+	if !strings.Contains(out.String(), "FAIL fuse support: drive9 FUSE mounts are not supported on Windows") {
+		t.Fatalf("output missing windows unsupported message:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "use `drive9 mount` without `--mode=fuse` on Windows") {
+		t.Fatalf("output missing windows fix guidance:\n%s", out.String())
+	}
+}
+
 func TestRunDoctorUsageErrors(t *testing.T) {
 	for _, args := range [][]string{
 		nil,

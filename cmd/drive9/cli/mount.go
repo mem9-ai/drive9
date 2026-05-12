@@ -14,26 +14,33 @@ import (
 
 	"github.com/mem9-ai/dat9/pkg/buildinfo"
 	"github.com/mem9-ai/dat9/pkg/client"
-	drive9fuse "github.com/mem9-ai/dat9/pkg/fuse"
 	"github.com/mem9-ai/dat9/pkg/mountpath"
 	"github.com/mem9-ai/dat9/pkg/mountstate"
 	drive9webdav "github.com/mem9-ai/dat9/pkg/webdav"
 )
 
-var mountFuse = drive9fuse.Mount
+const (
+	defaultFuseLookupRetryCount   = 3
+	defaultFuseLookupRetryTimeout = 2 * time.Second
+)
+
+var (
+	errMountProcessStateStale  = errors.New("drive9 umount: stale mount process state")
+	errMountProcessStateUnsafe = errors.New("drive9 umount: unsafe mount process state")
+)
 
 // MountCmd handles the "drive9 mount" command.
 //
 // Dispatch fork (Row A, V2e): the first positional argument selects the
 // mount flavour.
 //
-//   - `drive9 mount vault <path>`   → read-only vault FUSE filesystem
-//   - `drive9 mount [flags] <path>` → legacy writable fs mount (no
+//   - `drive9 mount vault <path>`   -> read-only vault FUSE filesystem
+//   - `drive9 mount [flags] <path>` -> legacy writable fs mount (no
 //     subcommand keyword; first positional is the mount point)
 //
 // We MUST peek at the first arg before flag.Parse because the vault flag
 // set is smaller (no cache-size / write-path knobs), and a single flag
-// set would quietly accept write-path flags for a vault mount — that
+// set would quietly accept write-path flags for a vault mount - that
 // would violate Row C (read-only) in a subtle, mount-time-visible way.
 //
 // Only the CURRENT supported backend keyword ("vault") is reserved here.
@@ -53,7 +60,7 @@ func MountCmd(args []string) error {
 
 // fsMountCmd is the pre-V2e writable fs mount entry point.
 //
-// Credential precedence matches spec §14.2: explicit --server / --api-key flag
+// Credential precedence matches spec section 14.2: explicit --server / --api-key flag
 // > DRIVE9_SERVER / DRIVE9_API_KEY / DRIVE9_VAULT_TOKEN env > active config
 // context. The flag defaults are empty strings so we can distinguish "unset"
 // from "explicit empty"; the latter is rejected (see rejectEmptyFlag).
@@ -62,10 +69,10 @@ func MountCmd(args []string) error {
 // If the resolver returns a delegated credential (owner JWT / `ctx use <alice>`),
 // Mount is created via client.NewWithToken and bound to that capability for
 // the mount's lifetime. If the active principal changes later (`ctx use` to
-// another context), the running mount keeps its original binding — changing
+// another context), the running mount keeps its original binding - changing
 // a running mount's credential requires umount + remount (Invariant #6).
 // `vault reauth` is not part of M1; see docs/specs/vault-interaction-end-state.md
-// §17.
+// section 17.
 //
 // drive9fuse.Mount runs in-process (no fork/exec); credentials flow through
 // MountOptions{Server, APIKey, Token}, not through the child's environment.
@@ -81,8 +88,8 @@ func fsMountCmd(args []string) error {
 	attrTTL := fs.Duration("attr-ttl", 10*time.Second, "kernel attr cache TTL")
 	entryTTL := fs.Duration("entry-ttl", 10*time.Second, "kernel entry cache TTL")
 	flushDebounce := fs.Duration("flush-debounce", -1, "debounce window for small-file flush coalescing (default 2s, 0 disables)")
-	lookupRetryCount := fs.Int("lookup-retry-count", 2, "detached retries after transient Lookup/GetAttr stat failures (default 2, set 0 to disable)")
-	lookupRetryTimeout := fs.Duration("lookup-retry-timeout", 250*time.Millisecond, "timeout per detached Lookup/GetAttr stat retry (default 250ms, must be > 0)")
+	lookupRetryCount := fs.Int("lookup-retry-count", defaultFuseLookupRetryCount, "detached retries after transient Lookup/GetAttr stat failures (set 0 to disable)")
+	lookupRetryTimeout := fs.Duration("lookup-retry-timeout", defaultFuseLookupRetryTimeout, "timeout per detached Lookup/GetAttr stat retry (must be > 0 when set)")
 	legacyDirStatFallback := fs.Bool("legacy-dir-stat-fallback", false, "on Lookup stat 404, list parent to support legacy servers without directory stat")
 	readDirPrefetch := fs.Bool("readdir-prefetch", false, "prefetch small files after directory reads into the read cache")
 	prefetchMaxFiles := fs.Int("readdir-prefetch-max-files", 32, "maximum small files prefetched per directory read")
@@ -137,13 +144,19 @@ func fsMountCmd(args []string) error {
 		return err
 	}
 
-	if err := validateLookupRetryFlags(*lookupRetryCount, *lookupRetryTimeout); err != nil {
+	lookupRetryCountGiven := flagProvided(fs, "lookup-retry-count")
+	lookupRetryTimeoutGiven := flagProvided(fs, "lookup-retry-timeout")
+	if err := validateLookupRetryFlags(*lookupRetryCount, *lookupRetryTimeout, lookupRetryCountGiven, lookupRetryTimeoutGiven); err != nil {
 		return err
 	}
 	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
 		return err
 	}
-	normalizedLookupRetryCount := normalizeLookupRetryCount(*lookupRetryCount)
+	normalizedLookupRetryCount := lookupRetryCountFlagValue(lookupRetryCountGiven, *lookupRetryCount)
+	normalizedLookupRetryTimeout := durationFlagValue(fs, "lookup-retry-timeout", *lookupRetryTimeout)
+	normalizedDirTTL := durationFlagValue(fs, "dir-ttl", *dirTTL)
+	normalizedAttrTTL := durationFlagValue(fs, "attr-ttl", *attrTTL)
+	normalizedEntryTTL := durationFlagValue(fs, "entry-ttl", *entryTTL)
 
 	serverGiven, apiKeyGiven := flagProvided(fs, "server"), flagProvided(fs, "api-key")
 	if err := rejectEmptyFlag("server", *server, serverGiven); err != nil {
@@ -159,6 +172,14 @@ func fsMountCmd(args []string) error {
 
 	if resolved == MountModeWebDAV && *readOnly {
 		return fmt.Errorf("drive9 mount: --read-only is not supported with WebDAV mode")
+	}
+	if runtime.GOOS == "windows" && resolved == MountModeFUSE {
+		return mountFuse(&mountFuseOptions{
+			MountPoint: mountPoint,
+			RemoteRoot: remoteRoot,
+			ReadOnly:   *readOnly,
+			Debug:      *debug,
+		})
 	}
 
 	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
@@ -189,12 +210,12 @@ func fsMountCmd(args []string) error {
 	}
 
 	// FUSE path (existing behavior).
-	syncModeVal, err := drive9fuse.ParseSyncMode(*syncMode)
+	syncModeVal, err := parseFuseSyncMode(*syncMode)
 	if err != nil {
 		return err
 	}
 
-	opts := &drive9fuse.MountOptions{
+	opts := &mountFuseOptions{
 		Server:                *server,
 		APIKey:                *apiKey,
 		Token:                 token,
@@ -202,12 +223,12 @@ func fsMountCmd(args []string) error {
 		RemoteRoot:            remoteRoot,
 		CacheDir:              *cacheDir,
 		CacheSize:             int64(*cacheSize) << 20,
-		DirTTL:                *dirTTL,
-		AttrTTL:               *attrTTL,
-		EntryTTL:              *entryTTL,
+		DirTTL:                normalizedDirTTL,
+		AttrTTL:               normalizedAttrTTL,
+		EntryTTL:              normalizedEntryTTL,
 		FlushDebounce:         *flushDebounce,
 		LookupRetryCount:      normalizedLookupRetryCount,
-		LookupRetryTimeout:    *lookupRetryTimeout,
+		LookupRetryTimeout:    normalizedLookupRetryTimeout,
 		LegacyDirStatFallback: *legacyDirStatFallback,
 		ReadDirPrefetch:       *readDirPrefetch,
 		PrefetchMaxFiles:      *prefetchMaxFiles,
@@ -231,7 +252,7 @@ func newWebDAVHandler(c *client.Client, prefix string, remoteRoot string) (http.
 }
 
 // validateRemoteRoot checks that the remote root path exists and is a directory.
-// Mirrors the FUSE path's Stat→List fallback so both mount modes behave
+// Mirrors the FUSE path's Stat->List fallback so both mount modes behave
 // identically on backends where directory stat is unsupported.
 func validateRemoteRoot(c *client.Client, remoteRoot string) error {
 	if remoteRoot == "/" {
@@ -243,7 +264,7 @@ func validateRemoteRoot(c *client.Client, remoteRoot string) error {
 	}
 	stat, err := c.Stat(remoteRoot)
 	if err != nil {
-		// If Stat explicitly says "not found", trust it — don't fall back
+		// If Stat explicitly says "not found", trust it - don't fall back
 		// to List which may return empty success for non-existent paths.
 		if client.IsNotFound(err) {
 			return remoteRootError(remoteRoot, err)
@@ -271,11 +292,11 @@ func remoteRootError(remoteRoot string, err error) error {
 	return fmt.Errorf("remote root %q: %w", remoteRoot, err)
 }
 
-func validateLookupRetryFlags(count int, timeout time.Duration) error {
-	if count < 0 {
+func validateLookupRetryFlags(count int, timeout time.Duration, countGiven bool, timeoutGiven bool) error {
+	if countGiven && count < 0 {
 		return fmt.Errorf("drive9 mount: --lookup-retry-count must be >= 0")
 	}
-	if timeout <= 0 {
+	if timeoutGiven && timeout <= 0 {
 		return fmt.Errorf("drive9 mount: --lookup-retry-timeout must be > 0")
 	}
 	return nil
@@ -297,6 +318,20 @@ func validateReadDirPrefetchFlags(maxFiles int, maxFileBytes int64, maxBytes int
 	return nil
 }
 
+func durationFlagValue(fs *flag.FlagSet, name string, value time.Duration) time.Duration {
+	if flagProvided(fs, name) {
+		return value
+	}
+	return 0
+}
+
+func lookupRetryCountFlagValue(given bool, count int) int {
+	if !given {
+		return 0
+	}
+	return normalizeLookupRetryCount(count)
+}
+
 func normalizeLookupRetryCount(count int) int {
 	if count == 0 {
 		// Use negative sentinel so MountOptions.setDefaults can distinguish
@@ -312,14 +347,18 @@ func UmountCmd(args []string) error {
 }
 
 type umountDeps struct {
-	goos      string
-	lookPath  func(string) (string, error)
-	run       func([]string) error
-	readPID   func(string) (int, string, error)
-	pidAlive  func(int) bool
-	now       func() time.Time
-	sleep     func(time.Duration)
-	printErrf func(string, ...any)
+	goos             string
+	lookPath         func(string) (string, error)
+	run              func([]string) error
+	readPID          func(string) (int, string, error)
+	readProcessState func(string) (mountstate.ProcessState, string, error)
+	terminate        func(int, time.Duration) error
+	terminateState   func(mountstate.ProcessState, time.Duration) error
+	remove           func(string) error
+	pidAlive         func(int) bool
+	now              func() time.Time
+	sleep            func(time.Duration)
+	printErrf        func(string, ...any)
 }
 
 func defaultUmountDeps() umountDeps {
@@ -332,11 +371,15 @@ func defaultUmountDeps() umountDeps {
 			cmd.Stderr = os.Stderr
 			return cmd.Run()
 		},
-		readPID:   mountstate.ReadPID,
-		pidAlive:  processAlive,
-		now:       time.Now,
-		sleep:     time.Sleep,
-		printErrf: func(format string, args ...any) { fmt.Fprintf(os.Stderr, format, args...) },
+		readPID:          mountstate.ReadPID,
+		readProcessState: mountstate.ReadProcessState,
+		terminate:        terminateProcess,
+		terminateState:   terminateMountProcess,
+		remove:           os.Remove,
+		pidAlive:         processAlive,
+		now:              time.Now,
+		sleep:            time.Sleep,
+		printErrf:        func(format string, args ...any) { fmt.Fprintf(os.Stderr, format, args...) },
 	}
 }
 
@@ -355,23 +398,102 @@ func runUmount(args []string, deps umountDeps) error {
 		return fmt.Errorf("usage: drive9 umount [--timeout duration] <mountpoint>")
 	}
 	mountPoint := fs.Arg(0)
+	stateMountPoint := mountPoint
+	var err error
+	if deps.goos == "windows" {
+		stateMountPoint, err = webdavMountStatePoint(deps.goos, mountPoint)
+		if err != nil {
+			return err
+		}
+	}
 
 	argv, err := umountArgv(deps.goos, deps.lookPath, mountPoint)
 	if err != nil {
 		return err
 	}
-	if err := deps.run(argv); err != nil {
+	runErr := deps.run(argv)
+	if deps.goos != "windows" && runErr != nil {
+		return runErr
+	}
+	if deps.goos != "windows" && *waitTimeout == 0 {
+		return nil
+	}
+	if deps.goos == "windows" {
+		var (
+			state mountstate.ProcessState
+			path  string
+		)
+		if deps.readProcessState != nil {
+			state, path, err = deps.readProcessState(stateMountPoint)
+		} else {
+			var pid int
+			pid, path, err = deps.readPID(stateMountPoint)
+			state = mountstate.ProcessState{PID: pid}
+		}
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return runErr
+			}
+			if runErr != nil {
+				return runErr
+			}
+			return err
+		}
+
+		if deps.terminateState == nil && deps.terminate == nil {
+			if runErr != nil {
+				return runErr
+			}
+			return fmt.Errorf("drive9 umount: no process terminator configured for Windows WebDAV mount")
+		}
+
+		if deps.terminateState != nil {
+			err = deps.terminateState(state, *waitTimeout)
+		} else {
+			err = deps.terminate(state.PID, *waitTimeout)
+		}
+		if err != nil {
+			if errors.Is(err, errMountProcessStateStale) || errors.Is(err, errMountProcessStateUnsafe) {
+				if path != "" && deps.remove != nil {
+					if removeErr := deps.remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) && runErr == nil {
+						return fmt.Errorf("drive9 umount: remove mount pid file %s: %w", path, removeErr)
+					}
+				}
+				if errors.Is(err, errMountProcessStateStale) {
+					if deps.printErrf != nil {
+						deps.printErrf("drive9 umount: removed stale mount pid file %s without terminating any process\n", path)
+					}
+					return runErr
+				}
+			}
+			if runErr != nil {
+				return runErr
+			}
+			return fmt.Errorf("%w (pid file: %s)", err, path)
+		}
+		if path != "" && deps.remove != nil {
+			if err := deps.remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				if runErr != nil {
+					return runErr
+				}
+				return fmt.Errorf("drive9 umount: remove mount pid file %s: %w", path, err)
+			}
+		}
+		return runErr
+	}
+
+	pid, path, err := deps.readPID(stateMountPoint)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return runErr
+		}
+		if runErr != nil {
+			return runErr
+		}
 		return err
 	}
 	if *waitTimeout == 0 {
 		return nil
-	}
-	pid, path, err := deps.readPID(mountPoint)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
 	}
 	if err := waitForPIDExit(pid, *waitTimeout, deps); err != nil {
 		return fmt.Errorf("%w (pid file: %s)", err, path)
@@ -399,29 +521,39 @@ func waitForPIDExit(pid int, timeout time.Duration, deps umountDeps) error {
 }
 
 func processAlive(pid int) bool {
+	return processAliveImpl(pid)
+}
+
+var waitForProcessExit = waitForProcessExitByPID
+
+func terminateProcess(pid int, waitTimeout time.Duration) error {
 	if pid <= 0 {
-		return false
+		return fmt.Errorf("invalid mount process pid %d", pid)
 	}
 	process, err := os.FindProcess(pid)
 	if err != nil {
-		return false
+		return err
 	}
-	err = process.Signal(syscall.Signal(0))
-	if err == nil {
-		return true
+	err = process.Kill()
+	if err != nil {
+		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+			err = nil
+		} else {
+			return err
+		}
 	}
-	if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
-		return false
+	if waitTimeout > 0 {
+		return waitForProcessExit(pid, waitTimeout)
 	}
-	if errors.Is(err, syscall.EPERM) {
-		return true
+	if err != nil {
+		return err
 	}
-	return false
+	return nil
 }
 
 // resolveMountCredentials selects the (server, apiKey, token) triple that a
 // fresh mount will be bound to. It locks the principal kind at mount time
-// per Invariant #3 — once this function returns, the chosen credential is
+// per Invariant #3 - once this function returns, the chosen credential is
 // fixed for the mount's lifetime. An explicit --api-key flag always means
 // owner; delegated JWTs only reach this layer through the active context
 // or DRIVE9_VAULT_TOKEN (resolver output).
@@ -455,6 +587,13 @@ func resolveMountCredentials(r ResolvedCredentials, flagServer, flagAPIKey strin
 }
 
 func umountArgv(goos string, lookPath func(string) (string, error), mountPoint string) ([]string, error) {
+	if goos == "windows" {
+		normalizedMountPoint, err := normalizeWebDAVMountPoint(goos, mountPoint)
+		if err != nil {
+			return nil, err
+		}
+		return []string{"net", "use", normalizedMountPoint, "/delete", "/y"}, nil
+	}
 	if goos == "darwin" {
 		return []string{"umount", mountPoint}, nil
 	}

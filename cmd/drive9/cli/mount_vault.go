@@ -4,9 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"time"
-
-	drive9fuse "github.com/mem9-ai/dat9/pkg/fuse"
 )
 
 // VaultMountCmd handles `drive9 mount vault [flags] <mountpoint>`.
@@ -56,13 +55,21 @@ func VaultMountCmd(args []string) error {
 	if err := rejectEmptyFlag("api-key", *apiKey, apiKeyGiven); err != nil {
 		return err
 	}
+	if runtime.GOOS == "windows" {
+		return mountVault(&vaultMountOptions{
+			MountPoint: mountPoint,
+			DirTTL:     *dirTTL,
+			AllowOther: *allowOther,
+			Debug:      *debug,
+		})
+	}
 
 	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
 	if err != nil {
 		return err
 	}
 
-	opts := &drive9fuse.VaultMountOptions{
+	opts := &vaultMountOptions{
 		Server:     serverVal,
 		APIKey:     apiKeyVal,
 		Token:      tokenVal,
@@ -71,5 +78,5 @@ func VaultMountCmd(args []string) error {
 		AllowOther: *allowOther,
 		Debug:      *debug,
 	}
-	return drive9fuse.MountVault(opts)
+	return mountVault(opts)
 }

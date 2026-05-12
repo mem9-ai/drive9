@@ -472,6 +472,38 @@ func (c *Client) WriteCtxConditionalWithRevision(ctx context.Context, path strin
 	return c.writeCtxConditionalFull(ctx, path, data, expectedRevision, nil, "")
 }
 
+// CreateFile creates an empty file.
+func (c *Client) CreateFile(path string) (int64, error) {
+	return c.CreateFileCtx(context.Background(), path)
+}
+
+// CreateFileCtx creates an empty file with context support and returns the
+// committed file revision when the server reports it.
+func (c *Client) CreateFileCtx(ctx context.Context, path string) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?create=1", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return 0, readError(resp)
+	}
+	var result struct {
+		Revision int64 `json:"revision"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("decode create file response: %w", err)
+	}
+	return result.Revision, nil
+}
+
 func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
 	if err != nil {
@@ -791,7 +823,17 @@ func (c *Client) Delete(path string) error {
 
 // DeleteCtx removes a file or directory with context support.
 func (c *Client) DeleteCtx(ctx context.Context, path string) error {
-	return c.deleteCtx(ctx, path, false)
+	return c.deleteCtx(ctx, path, false, "")
+}
+
+// DeleteFileCtx removes a file with a server-side type hint.
+func (c *Client) DeleteFileCtx(ctx context.Context, path string) error {
+	return c.deleteCtx(ctx, path, false, "file")
+}
+
+// DeleteDirCtx removes an empty directory with a server-side type hint.
+func (c *Client) DeleteDirCtx(ctx context.Context, path string) error {
+	return c.deleteCtx(ctx, path, false, "dir")
 }
 
 // RemoveAll removes a file or directory tree recursively.
@@ -806,14 +848,16 @@ func (c *Client) RemoveAll(path string) error {
 // It forwards to deleteCtx with recursive=true, so regular files use Delete
 // semantics and missing paths return the same 404 *StatusError as RemoveAll.
 func (c *Client) RemoveAllCtx(ctx context.Context, path string) error {
-	return c.deleteCtx(ctx, path, true)
+	return c.deleteCtx(ctx, path, true, "")
 }
 
-func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool) error {
+func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool, kind string) error {
 	requestURL := c.url(path)
 	if recursive {
 		// Use an explicit value to avoid intermediaries dropping bare "?recursive".
 		requestURL += "?recursive=1"
+	} else if kind != "" {
+		requestURL += "?kind=" + url.QueryEscape(kind)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL, nil)

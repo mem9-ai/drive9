@@ -513,6 +513,8 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 			s.handleMkdir(w, r, path)
 		} else if r.URL.Query().Has("chmod") {
 			s.handleChmod(w, r, path)
+		} else if r.URL.Query().Has("create") {
+			s.handleCreate(w, r, path)
 		} else {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_unknown_post_action", "path", path)...)
 			errJSON(w, http.StatusBadRequest, "unknown POST action")
@@ -1366,23 +1368,34 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 		return
 	}
 	recursive := r.URL.Query().Has("recursive")
+	kind := r.URL.Query().Get("kind")
 	var err error
 	if recursive {
 		err = b.RemoveAllCtx(r.Context(), path)
 	} else {
-		err = b.RemoveCtx(r.Context(), path)
+		switch kind {
+		case "":
+			err = b.RemoveCtx(r.Context(), path)
+		case "file":
+			err = b.RemoveFileCtx(r.Context(), path)
+		case "dir":
+			err = b.RemoveDirCtx(r.Context(), path)
+		default:
+			errJSON(w, http.StatusBadRequest, "invalid delete kind")
+			return
+		}
 	}
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "delete_not_found", "path", path, "recursive", recursive)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "delete_not_found", "path", path, "recursive", recursive, "kind", kind)...)
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "delete_failed", "path", path, "recursive", recursive, "error", err)...)
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "delete_failed", "path", path, "recursive", recursive, "kind", kind, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "delete_ok", "path", path, "recursive", recursive)...)
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "delete_ok", "path", path, "recursive", recursive, "kind", kind)...)
 	s.publishEvent(r, path, "delete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
@@ -1504,6 +1517,29 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "chmod_ok", "path", path)...)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_missing_scope", "path", path)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	if err := b.CreateCtx(r.Context(), path); err != nil {
+		if errors.Is(err, datastore.ErrPathConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_conflict", "path", path, "error", err)...)
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "create_failed", "path", path, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "create_ok", "path", path)...)
+	s.publishEvent(r, path, "create")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
 }
 
 func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {

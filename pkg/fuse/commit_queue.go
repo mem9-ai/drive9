@@ -61,17 +61,18 @@ type CommitCleanupFunc func(entry *CommitEntry)
 // CommitQueue manages ordered background remote commits with baseRev tracking.
 // It provides backpressure when the queue exceeds maxPending items.
 type CommitQueue struct {
-	mu         sync.Mutex
-	queue      []*CommitEntry
-	inFlight   map[string]*CommitEntry // paths currently being processed by workers
-	maxPending int
-	client     *client.Client
-	remoteRoot string
-	shadows    *ShadowStore
-	index      *PendingIndex
-	journal    *Journal
-	wg         sync.WaitGroup
-	stopped    bool
+	mu           sync.Mutex
+	queue        []*CommitEntry
+	queuedByPath map[string]map[*CommitEntry]struct{}
+	inFlight     map[string]*CommitEntry // paths currently being processed by workers
+	maxPending   int
+	client       *client.Client
+	remoteRoot   string
+	shadows      *ShadowStore
+	index        *PendingIndex
+	journal      *Journal
+	wg           sync.WaitGroup
+	stopped      bool
 
 	// OnSuccess is called after successful upload with the committed
 	// revision. Used by dat9fs to seed readCache and update inode revision.
@@ -105,14 +106,15 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 		bufSize = 256
 	}
 	cq := &CommitQueue{
-		maxPending: maxPending,
-		client:     c,
-		remoteRoot: root,
-		shadows:    shadows,
-		index:      index,
-		journal:    journal,
-		inFlight:   make(map[string]*CommitEntry),
-		workCh:     make(chan *CommitEntry, bufSize),
+		maxPending:   maxPending,
+		client:       c,
+		remoteRoot:   root,
+		shadows:      shadows,
+		index:        index,
+		journal:      journal,
+		inFlight:     make(map[string]*CommitEntry),
+		queuedByPath: make(map[string]map[*CommitEntry]struct{}),
+		workCh:       make(chan *CommitEntry, bufSize),
 	}
 	for i := 0; i < numWorkers; i++ {
 		cq.wg.Add(1)
@@ -151,6 +153,7 @@ func (cq *CommitQueue) Enqueue(entry *CommitEntry) error {
 		return fmt.Errorf("commit queue full (%d pending)", cq.maxPending)
 	}
 	cq.queue = append(cq.queue, entry)
+	cq.addQueuedLocked(entry)
 	if cq.perf != nil {
 		cq.perf.commitEnqueue.add(1)
 	}
@@ -280,13 +283,7 @@ func (cq *CommitQueue) WaitPath(path string) {
 	for {
 		cq.mu.Lock()
 		_, inflight := cq.inFlight[path]
-		queued := false
-		for _, e := range cq.queue {
-			if e.Path == path {
-				queued = true
-				break
-			}
-		}
+		queued := cq.hasQueuedPathLocked(path)
 		cq.mu.Unlock()
 		if !inflight && !queued {
 			return
@@ -305,12 +302,7 @@ func (cq *CommitQueue) HasPath(path string) bool {
 	if _, inflight := cq.inFlight[path]; inflight {
 		return true
 	}
-	for _, e := range cq.queue {
-		if e.Path == path {
-			return true
-		}
-	}
-	return false
+	return cq.hasQueuedPathLocked(path)
 }
 
 // WaitPrefix blocks until all in-flight or queued commits under the given
@@ -381,15 +373,31 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	if e, ok := cq.inFlight[path]; ok {
 		markCanceled(e)
 	}
-	remaining := cq.queue[:0]
-	for _, e := range cq.queue {
-		if e.Path == path {
+	if cq.queuedByPath != nil {
+		for e := range cq.queuedByPath[path] {
 			markCanceled(e)
-			continue
 		}
-		remaining = append(remaining, e)
 	}
-	cq.queue = remaining
+	if cq.queuedByPath == nil {
+		remaining := cq.queue[:0]
+		for _, e := range cq.queue {
+			if e.Path == path {
+				markCanceled(e)
+				continue
+			}
+			remaining = append(remaining, e)
+		}
+		cq.queue = remaining
+	} else if len(cq.queuedByPath[path]) > 0 {
+		remaining := cq.queue[:0]
+		for _, e := range cq.queue {
+			if e.Path != path {
+				remaining = append(remaining, e)
+			}
+		}
+		cq.queue = remaining
+		delete(cq.queuedByPath, path)
+	}
 	cq.mu.Unlock()
 
 	for _, cancel := range cancels {
@@ -446,6 +454,9 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 		}
 	}
 	cq.queue = remaining
+	if cq.queuedByPath != nil {
+		cq.rebuildQueuedIndexLocked()
+	}
 	cq.mu.Unlock()
 
 	for _, cancel := range cancels {
@@ -687,8 +698,57 @@ func (cq *CommitQueue) removeFromQueue(entry *CommitEntry) {
 	for i, e := range cq.queue {
 		if e == entry {
 			cq.queue = append(cq.queue[:i], cq.queue[i+1:]...)
+			cq.removeQueuedLocked(entry)
 			return
 		}
+	}
+}
+
+func (cq *CommitQueue) addQueuedLocked(entry *CommitEntry) {
+	if cq.queuedByPath == nil || entry == nil {
+		return
+	}
+	entries := cq.queuedByPath[entry.Path]
+	if entries == nil {
+		entries = make(map[*CommitEntry]struct{})
+		cq.queuedByPath[entry.Path] = entries
+	}
+	entries[entry] = struct{}{}
+}
+
+func (cq *CommitQueue) removeQueuedLocked(entry *CommitEntry) {
+	if cq.queuedByPath == nil || entry == nil {
+		return
+	}
+	entries := cq.queuedByPath[entry.Path]
+	if entries == nil {
+		return
+	}
+	delete(entries, entry)
+	if len(entries) == 0 {
+		delete(cq.queuedByPath, entry.Path)
+	}
+}
+
+func (cq *CommitQueue) hasQueuedPathLocked(path string) bool {
+	if cq.queuedByPath != nil {
+		return len(cq.queuedByPath[path]) > 0
+	}
+	for _, e := range cq.queue {
+		if e.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+func (cq *CommitQueue) rebuildQueuedIndexLocked() {
+	if cq.queuedByPath == nil {
+		return
+	}
+	cq.queuedByPath = make(map[string]map[*CommitEntry]struct{}, len(cq.queue))
+	for _, e := range cq.queue {
+		cq.addQueuedLocked(e)
 	}
 }
 

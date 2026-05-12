@@ -286,14 +286,14 @@ func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var count int64
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE parent_path = ?`, path).Scan(&count); err != nil {
+	hasChildren, err := dirHasChildrenTx(ctx, tx, path)
+	if err != nil {
 		return err
 	}
-	if count > 0 {
+	if hasChildren {
 		return fmt.Errorf("directory not empty: %s", path)
 	}
-	res, err := tx.Exec(`DELETE FROM file_nodes WHERE path = ? AND is_directory = 1`, path)
+	res, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ? AND is_directory = 1`, path)
 	if err != nil {
 		return err
 	}
@@ -309,8 +309,8 @@ func (s *Store) DeleteNodesByPrefix(ctx context.Context, prefix string) (n int64
 	start := time.Now()
 	defer observeStoreOp(ctx, "delete_nodes_by_prefix", start, &err)
 
-	res, err := s.db.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ? OR path LIKE ?`,
-		prefix, prefix+"%")
+	where, args := pathPrefixPredicate("path", prefix)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+where, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -1387,11 +1387,15 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 		return nil, err
 	}
 
+	if isDir {
+		return nil, ErrNotFound
+	}
+
 	if _, err := tx.Exec(`DELETE FROM file_nodes WHERE path = ?`, path); err != nil {
 		return nil, err
 	}
 
-	if isDir || !fileID.Valid || fileID.String == "" {
+	if !fileID.Valid || fileID.String == "" {
 		return nil, tx.Commit()
 	}
 
@@ -1506,6 +1510,22 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 	}
 	out = orphaned
 	return out, nil
+}
+
+func dirHasChildrenTx(ctx context.Context, tx *sql.Tx, path string) (bool, error) {
+	var one int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE parent_path = ? LIMIT 1 FOR UPDATE`, path).Scan(&one)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, err
+}
+
+func pathPrefixPredicate(column, prefix string) (string, []any) {
+	return "BINARY " + column + " LIKE BINARY ? ESCAPE '\\\\'", []any{likeLiteralPrefixPattern(prefix)}
 }
 
 // --- uploads operations ---

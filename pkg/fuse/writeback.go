@@ -408,6 +408,21 @@ func (c *WriteBackCache) ListPendingPaths() map[string]struct{} {
 	return result
 }
 
+// ListByPrefix returns metadata for pending entries under prefix.
+func (c *WriteBackCache) ListByPrefix(prefix string) []*WriteBackMeta {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var result []*WriteBackMeta
+	for p, meta := range c.metas {
+		if strings.HasPrefix(p, prefix) {
+			cp := *meta
+			result = append(result, &cp)
+		}
+	}
+	return result
+}
+
 // PendingEntry represents one file waiting to be uploaded.
 type PendingEntry struct {
 	Meta WriteBackMeta

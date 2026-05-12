@@ -78,8 +78,8 @@ type Dat9Backend struct {
 	inlineThreshold int64
 	// textExtractMaxBytes caps synchronous text extraction input size.
 	textExtractMaxBytes int64
-	mu                    sync.Mutex
-	entropy               io.Reader
+	mu                  sync.Mutex
+	entropy             io.Reader
 
 	// Central quota enforcement (Rev 4 migration).
 	tenantID    string
@@ -105,7 +105,7 @@ type Dat9Backend struct {
 	audioExtractMaxSize      int64
 	maxAudioExtractTextBytes int
 
-	fileGCWorker *FileGCWorker
+	fileGCWorker     *FileGCWorker
 	runtimeMetricsID uint64
 
 	// Monthly LLM cost budget (P1).
@@ -215,29 +215,33 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		}
 	}
 
-	err = b.store.InsertFile(ctx, &datastore.File{
-		FileID: fileID, StorageType: storageType, StorageRef: storageRef,
-		StorageEncryptionMode:  storageEncryptionMode,
-		StorageEncryptionKeyID: storageEncryptionKeyID,
-		ContentBlob:            contentBlob,
-		SizeBytes:              0, Revision: 1, Status: datastore.StatusConfirmed,
-		CreatedAt: now, ConfirmedAt: &now,
+	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.store.InsertFileTx(tx, &datastore.File{
+			FileID: fileID, StorageType: storageType, StorageRef: storageRef,
+			StorageEncryptionMode:  storageEncryptionMode,
+			StorageEncryptionKeyID: storageEncryptionKeyID,
+			ContentBlob:            contentBlob,
+			SizeBytes:              0, Revision: 1, Status: datastore.StatusConfirmed,
+			CreatedAt: now, ConfirmedAt: &now,
+		}); err != nil {
+			return err
+		}
+		if err := b.store.EnsureParentDirsTx(tx, path, b.genID); err != nil {
+			return err
+		}
+		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+			NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
+			Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
+		})
 	})
 	if err != nil {
+		if storageType == datastore.StorageS3 {
+			b.deleteBlobCtx(ctx, storageRef)
+		}
 		return err
 	}
-	err = b.store.EnsureParentDirs(ctx, path, b.genID)
-	if err != nil {
-		return err
-	}
-	err = b.store.InsertNode(ctx, &datastore.FileNode{
-		NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
-		Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
-	})
-	if err == nil {
-		b.syncCentralFileCreate(ctx, fileID, 0, "")
-	}
-	return err
+	b.syncCentralFileCreate(ctx, fileID, 0, "")
+	return nil
 }
 
 func (b *Dat9Backend) Mkdir(path string, perm uint32) error {
@@ -319,6 +323,29 @@ func (b *Dat9Backend) RemoveCtx(ctx context.Context, path string) (err error) {
 	return err
 }
 
+func (b *Dat9Backend) RemoveFileCtx(ctx context.Context, path string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "remove_file", err, start) }()
+
+	path, err = pathutil.Canonicalize(path)
+	if err != nil {
+		return err
+	}
+	_, err = b.store.DeleteFileWithRefCheck(ctx, path)
+	return err
+}
+
+func (b *Dat9Backend) RemoveDirCtx(ctx context.Context, path string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "remove_dir", err, start) }()
+
+	path, err = pathutil.CanonicalizeDir(path)
+	if err != nil {
+		return err
+	}
+	return b.store.DeleteEmptyDir(ctx, path)
+}
+
 func (b *Dat9Backend) RemoveAll(path string) error {
 	return b.RemoveAllCtx(backgroundWithTrace(), path)
 }
@@ -332,7 +359,8 @@ func (b *Dat9Backend) RemoveAllCtx(ctx context.Context, path string) (err error)
 		return err
 	}
 	if !node.IsDirectory {
-		return b.RemoveCtx(ctx, path)
+		_, err = b.store.DeleteFileWithRefCheck(ctx, path)
+		return err
 	}
 	_, err = b.store.DeleteDirRecursive(ctx, path)
 	return err
