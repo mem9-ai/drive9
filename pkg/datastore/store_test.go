@@ -296,6 +296,38 @@ func TestListDir(t *testing.T) {
 	requireEmbeddingRevision(t, entries[0].File.EmbeddingRevision, 13)
 }
 
+func TestListNodes(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertInode(context.Background(), &Inode{InodeID: "i1", SizeBytes: 0, Revision: 1, Mode: 0o755, Status: StatusConfirmed, CreatedAt: now, Mtime: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "d1", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, InodeID: "i1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertFile(context.Background(), &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", InodeID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	nodes, err := s.ListNodes(context.Background(), "/data/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+	if nodes[0].Name != "a.txt" {
+		t.Errorf("name=%q, want a.txt", nodes[0].Name)
+	}
+	if nodes[0].InodeID != "f1" {
+		t.Errorf("inode_id=%q, want f1", nodes[0].InodeID)
+	}
+}
+
 func TestUpdateFileSearchText(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()

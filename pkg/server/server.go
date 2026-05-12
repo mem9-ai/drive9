@@ -624,6 +624,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		Size  int64  `json:"size"`
 		IsDir bool   `json:"isDir"`
 		Mtime int64  `json:"mtime,omitempty"`
+		Mode  uint32 `json:"mode,omitempty"`
 	}
 	out := make([]entry, 0, len(entries))
 	for _, e := range entries {
@@ -631,7 +632,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		if !e.ModTime.IsZero() {
 			mtime = e.ModTime.Unix()
 		}
-		out = append(out, entry{Name: e.Name, Size: e.Size, IsDir: e.IsDir, Mtime: mtime})
+		out = append(out, entry{Name: e.Name, Size: e.Size, IsDir: e.IsDir, Mtime: mtime, Mode: e.Mode})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"entries": out})
@@ -1097,6 +1098,7 @@ type batchStatResult struct {
 	IsDir    bool   `json:"isDir"`
 	Revision int64  `json:"revision,omitempty"`
 	Mtime    int64  `json:"mtime,omitempty"`
+	Mode     uint32 `json:"mode,omitempty"`
 }
 
 type batchReadSmallRequest struct {
@@ -1262,6 +1264,7 @@ func (s *Server) batchStatOne(ctx context.Context, b *backend.Dat9Backend, rawPa
 	if nf.File != nil {
 		result.Size = nf.File.SizeBytes
 		result.Revision = nf.File.Revision
+		result.Mode = nf.File.Mode
 		if nf.File.ConfirmedAt != nil {
 			result.Mtime = nf.File.ConfirmedAt.Unix()
 		} else {
@@ -1446,7 +1449,13 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	if err := b.MkdirCtx(r.Context(), path, 0o755); err != nil {
+	mode := uint32(0o755)
+	if mStr := r.URL.Query().Get("mode"); mStr != "" {
+		if m, err := strconv.ParseUint(mStr, 10, 32); err == nil {
+			mode = uint32(m)
+		}
+	}
+	if err := b.MkdirCtx(r.Context(), path, mode); err != nil {
 		if errors.Is(err, datastore.ErrPathConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "mkdir_conflict", "path", path, "error", err)...)
 			errJSON(w, http.StatusConflict, err.Error())

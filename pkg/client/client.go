@@ -187,6 +187,7 @@ type FileInfo struct {
 	Size  int64  `json:"size"`
 	IsDir bool   `json:"isDir"`
 	Mtime int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
+	Mode  uint32 `json:"mode,omitempty"`
 }
 
 // StatResult represents file metadata from HEAD.
@@ -196,6 +197,7 @@ type StatResult struct {
 	Revision int64
 	Mtime    time.Time
 	Mode     uint32
+	HasMode  bool // true when the server returned a mode header (including 0)
 }
 
 // MaxBatchStatPaths is the maximum number of paths accepted by BatchStatCtx.
@@ -216,6 +218,7 @@ type BatchStatResult struct {
 	IsDir    bool   `json:"isDir"`
 	Revision int64  `json:"revision,omitempty"`
 	Mtime    int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
+	Mode     uint32 `json:"mode,omitempty"`
 }
 
 // OK reports whether the per-path batch stat result is successful.
@@ -680,6 +683,7 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 		s.Revision, _ = strconv.ParseInt(rev, 10, 64)
 	}
 	if mode := resp.Header.Get("X-Dat9-Mode"); mode != "" {
+		s.HasMode = true
 		if m, err := strconv.ParseUint(mode, 10, 32); err == nil {
 			s.Mode = uint32(m)
 		}
@@ -868,12 +872,16 @@ func (c *Client) RenameCtx(ctx context.Context, oldPath, newPath string) error {
 
 // Mkdir creates a directory.
 func (c *Client) Mkdir(path string) error {
-	return c.MkdirCtx(context.Background(), path)
+	return c.MkdirCtx(context.Background(), path, 0o755)
 }
 
 // MkdirCtx creates a directory with context support.
-func (c *Client) MkdirCtx(ctx context.Context, path string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?mkdir", nil)
+func (c *Client) MkdirCtx(ctx context.Context, path string, mode uint32) error {
+	urlStr := c.url(path) + "?mkdir"
+	if mode != 0o755 {
+		urlStr += "&mode=" + strconv.FormatUint(uint64(mode), 10)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlStr, nil)
 	if err != nil {
 		return err
 	}

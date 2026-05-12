@@ -235,7 +235,7 @@ func (s *Store) ListNodes(ctx context.Context, parentPath string) (out []*FileNo
 	start := time.Now()
 	defer observeStoreOp(ctx, "list_nodes", start, &err)
 
-	rows, err := s.db.QueryContext(ctx, `SELECT node_id, path, parent_path, name, is_directory, file_id, created_at
+	rows, err := s.db.QueryContext(ctx, `SELECT node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at
 		FROM file_nodes WHERE parent_path = ? ORDER BY name`, parentPath)
 	if err != nil {
 		return nil, err

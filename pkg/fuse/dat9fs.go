@@ -1184,6 +1184,7 @@ func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
 		IsDir:    entry.IsDir,
 		Mtime:    mtime,
 		Revision: entry.Revision,
+		Mode:     entry.Mode,
 	}
 }
 
@@ -1197,6 +1198,9 @@ func cachedInfoFromStat(name string, stat *client.StatResult) CachedFileInfo {
 		item.Size = stat.Size
 		item.IsDir = stat.IsDir
 		item.Revision = stat.Revision
+		if stat.HasMode {
+			item.Mode = stat.Mode
+		}
 	}
 	return item
 }
@@ -1284,11 +1288,11 @@ func (fs *Dat9FS) remotePathExistsDetached(localPath string) (bool, error) {
 	return false, err
 }
 
-func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string) error {
+func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string, mode uint32) error {
 	apiPath := fs.remotePath(localPath)
 	ctx, cf := fuseCtx(cancel)
 	mutationStart := fs.perfStart()
-	err := fs.client.MkdirCtx(ctx, apiPath)
+	err := fs.client.MkdirCtx(ctx, apiPath, mode)
 	cf()
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err == nil || !isTransientLookupErr(err) {
@@ -1311,7 +1315,7 @@ func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPat
 	for range retryCount {
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
 		mutationStart = fs.perfStart()
-		err = fs.client.MkdirCtx(retryCtx, apiPath)
+		err = fs.client.MkdirCtx(retryCtx, apiPath, mode)
 		retryCancel()
 		fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 		if err == nil {
@@ -1617,7 +1621,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if stat.Revision > 0 {
 		fs.inodes.UpdateRevision(ino, stat.Revision)
 	}
-	if stat.Mode != 0 {
+	if stat.HasMode {
 		fs.inodes.UpdateMode(ino, stat.Mode)
 	}
 	fs.dirCache.Upsert(parentPath, cachedInfoFromStat(name, stat))
@@ -1922,7 +1926,11 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 		return st
 	}
 
-	if err := fs.mkdirRemoteWithTransientRetry(cancel, childP); err != nil {
+	mode := input.Mode & 0o777
+	if mode == 0 {
+		mode = 0o755
+	}
+	if err := fs.mkdirRemoteWithTransientRetry(cancel, childP, mode); err != nil {
 		return httpToFuseStatus(err)
 	}
 
@@ -2565,6 +2573,9 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 				item.Mtime = time.Unix(result.Mtime, 0)
 			}
 			item.Revision = result.Revision
+			if result.Mode != 0 {
+				item.Mode = result.Mode
+			}
 		}
 	}
 }
@@ -2661,6 +2672,9 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 			mode = syscall.S_IFDIR
 		} else {
 			mode = syscall.S_IFREG
+		}
+		if item.Mode != 0 {
+			mode |= item.Mode & 0o777
 		}
 		entries = append(entries, DirEntry{
 			Name: item.Name,

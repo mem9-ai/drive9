@@ -19,6 +19,7 @@ type CachedFileInfo struct {
 	IsDir    bool
 	Mtime    time.Time
 	Revision int64
+	Mode     uint32 // permission bits (0 means unknown/unset)
 }
 
 type namespaceLookupKind uint8

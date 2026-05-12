@@ -1060,7 +1060,7 @@ func TestMkdirDirectory(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	if err := c.MkdirCtx(ctx, "/d"); err != nil {
+	if err := c.MkdirCtx(ctx, "/d", 0o755); err != nil {
 		t.Fatal(err)
 	}
 
