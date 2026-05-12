@@ -1419,6 +1419,9 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
 		}
+		if item.HasMode {
+			fs.inodes.UpdateMode(ino, item.Mode)
+		}
 		entry, ok := fs.inodes.GetEntry(ino)
 		if !ok {
 			return true, gofuse.EIO
@@ -1936,14 +1939,12 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 	}
 
 	mode := input.Mode & 0o777
-	if mode == 0 {
-		mode = 0o755
-	}
 	if err := fs.mkdirRemoteWithTransientRetry(cancel, childP, mode); err != nil {
 		return httpToFuseStatus(err)
 	}
 
 	ino := fs.inodes.Lookup(childP, true, 0, time.Now())
+	fs.inodes.UpdateMode(ino, mode)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
@@ -2673,6 +2674,9 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		ino := fs.inodes.EnsureInode(childP, item.IsDir, item.Size, mtime)
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
+		}
+		if item.HasMode {
+			fs.inodes.UpdateMode(ino, item.Mode)
 		}
 
 		var mode uint32
@@ -3777,8 +3781,14 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 						fs.inodes.UpdateMode(fh.Ino, fh.PreviousMode)
 					}
 				}
-				fh.HasPendingMode = false
-				fh.HasPreviousMode = false
+				// Clear pending mode on all sibling handles so they don't re-apply
+				// or revert after this handle already decided the outcome.
+				fs.fileHandles.ForEach(func(_ uint64, h *FileHandle) {
+					if h.Ino == fh.Ino {
+						h.HasPendingMode = false
+						h.HasPreviousMode = false
+					}
+				})
 			}
 		}()
 		defer func() {

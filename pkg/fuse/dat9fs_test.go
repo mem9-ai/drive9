@@ -1519,7 +1519,7 @@ func TestLookupSessionCreatedDirMissAvoidsRemoteStat(t *testing.T) {
 	var headCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.RawQuery == "mkdir":
+		case r.Method == http.MethodPost && (r.URL.RawQuery == "mkdir" || r.URL.RawQuery == "mkdir&mode=0"):
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodHead:
 			headCalls.Add(1)
@@ -2619,7 +2619,7 @@ func TestMkdirRetriesDetachedAfterTransientInterrupt(t *testing.T) {
 	var mkdirCalls atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.RawQuery == "mkdir":
+		case r.Method == http.MethodPost && (r.URL.RawQuery == "mkdir" || r.URL.RawQuery == "mkdir&mode=0"):
 			if r.URL.Path != "/v1/fs/dir" {
 				t.Fatalf("POST path = %q, want /v1/fs/dir", r.URL.Path)
 			}
@@ -2660,7 +2660,7 @@ func TestMkdirRetryTreatsRemoteDirectoryAsSuccessAfterAmbiguousCreate(t *testing
 	var statCalls atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.RawQuery == "mkdir":
+		case r.Method == http.MethodPost && (r.URL.RawQuery == "mkdir" || r.URL.RawQuery == "mkdir&mode=0"):
 			switch mkdirCalls.Add(1) {
 			case 1:
 				w.WriteHeader(statusClientClosedRequest)

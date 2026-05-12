@@ -8,8 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/logger"
 	"go.uber.org/zap"
+
+	"github.com/mem9-ai/dat9/pkg/logger"
 )
 
 // Dialect controls SQL syntax variations for different databases.
@@ -152,11 +153,11 @@ func (m *SplitTablesMigrator) insertIgnore(table string, columns string, selectS
 func (m *SplitTablesMigrator) migrateInodes(ctx context.Context) (int64, error) {
 	sql := m.insertIgnore("inodes",
 		"inode_id, size_bytes, revision, mode, status, created_at, mtime, confirmed_at, expires_at",
-		`SELECT
-			file_id, size_bytes, revision, 420, status, created_at,
+		fmt.Sprintf(`SELECT
+			file_id, size_bytes, revision, %d, status, created_at,
 			COALESCE(confirmed_at, created_at), confirmed_at, expires_at
 		FROM files
-		WHERE status != 'DELETED'`)
+		WHERE status != 'DELETED'`, 0o644))
 	res, err := m.db.ExecContext(ctx, sql)
 	if err != nil {
 		return 0, err
@@ -216,7 +217,6 @@ func (m *SplitTablesMigrator) migrateSemantic(ctx context.Context) (int64, error
 // triggering expensive re-computation during INSERT ... SELECT.
 func (m *SplitTablesMigrator) semanticHasGeneratedColumns(ctx context.Context) (bool, error) {
 	var q string
-	var arg []any
 	switch m.dialect {
 	case DialectPostgres:
 		q = `
@@ -233,7 +233,7 @@ func (m *SplitTablesMigrator) semanticHasGeneratedColumns(ctx context.Context) (
 	}
 
 	var extra string
-	if err := m.db.QueryRowContext(ctx, q, arg...).Scan(&extra); err != nil {
+	if err := m.db.QueryRowContext(ctx, q).Scan(&extra); err != nil {
 		if err == sql.ErrNoRows {
 			// Table or column does not exist yet — no generated columns.
 			return false, nil
@@ -247,10 +247,10 @@ func (m *SplitTablesMigrator) semanticHasGeneratedColumns(ctx context.Context) (
 func (m *SplitTablesMigrator) createDirInodes(ctx context.Context) (int64, error) {
 	sql := m.insertIgnore("inodes",
 		"inode_id, size_bytes, revision, mode, status, created_at, mtime, confirmed_at",
-		`SELECT
-			node_id, 0, 1, 493, 'CONFIRMED', created_at, created_at, created_at
+		fmt.Sprintf(`SELECT
+			node_id, 0, 1, %d, 'CONFIRMED', created_at, created_at, created_at
 		FROM file_nodes
-		WHERE is_directory = 1`)
+		WHERE is_directory = 1`, 0o755))
 	res, err := m.db.ExecContext(ctx, sql)
 	if err != nil {
 		return 0, err
@@ -285,7 +285,10 @@ func (m *SplitTablesMigrator) backfillSharedInodeID(ctx context.Context) (int64,
 		if err != nil {
 			return total, fmt.Errorf("backfill %s: %w", tbl.name, err)
 		}
-		n, _ := res.RowsAffected()
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("rows affected for %s: %w", tbl.name, err)
+		}
 		total += n
 	}
 	return total, nil
