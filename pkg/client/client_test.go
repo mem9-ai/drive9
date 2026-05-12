@@ -1031,3 +1031,44 @@ func TestSmallFileThresholdOverrideShortCircuits(t *testing.T) {
 		t.Fatalf("override should short-circuit network; saw %d hits", hits)
 	}
 }
+
+
+func TestChmod(t *testing.T) {
+	c, cleanup := newTestClient(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := c.WriteCtx(ctx, "/chmod.txt", []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.ChmodCtx(ctx, "/chmod.txt", 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stat, err := c.StatCtx(ctx, "/chmod.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stat.Mode != 0o600 {
+		t.Errorf("mode=%o, want 0o600", stat.Mode)
+	}
+}
+
+func TestMkdirWithPerm(t *testing.T) {
+	c, cleanup := newTestClient(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := c.MkdirCtx(ctx, "/d"); err != nil {
+		t.Fatal(err)
+	}
+
+	stat, err := c.StatCtx(ctx, "/d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stat.IsDir {
+		t.Fatalf("expected directory")
+	}
+}

@@ -195,6 +195,7 @@ type StatResult struct {
 	IsDir    bool
 	Revision int64
 	Mtime    time.Time
+	Mode     uint32
 }
 
 // MaxBatchStatPaths is the maximum number of paths accepted by BatchStatCtx.
@@ -678,6 +679,11 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 	if rev := resp.Header.Get("X-Dat9-Revision"); rev != "" {
 		s.Revision, _ = strconv.ParseInt(rev, 10, 64)
 	}
+	if mode := resp.Header.Get("X-Dat9-Mode"); mode != "" {
+		if m, err := strconv.ParseUint(mode, 10, 32); err == nil {
+			s.Mode = uint32(m)
+		}
+	}
 	if mt := resp.Header.Get("X-Dat9-Mtime"); mt != "" {
 		if sec, err := strconv.ParseInt(mt, 10, 64); err == nil {
 			s.Mtime = time.Unix(sec, 0)
@@ -871,6 +877,33 @@ func (c *Client) MkdirCtx(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return readError(resp)
+	}
+	return nil
+}
+
+// Chmod updates the permission bits of a file.
+func (c *Client) Chmod(path string, mode uint32) error {
+	return c.ChmodCtx(context.Background(), path, mode)
+}
+
+// ChmodCtx updates the permission bits of a file with context support.
+func (c *Client) ChmodCtx(ctx context.Context, path string, mode uint32) error {
+	body, err := json.Marshal(map[string]uint32{"mode": mode})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?chmod", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.do(req)
 	if err != nil {
 		return err

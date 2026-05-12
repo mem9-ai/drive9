@@ -713,3 +713,41 @@ func TestOpenAndOpenWrite(t *testing.T) {
 		t.Errorf("got %q", readData)
 	}
 }
+
+
+func TestChmod(t *testing.T) {
+	b := newTestBackend(t)
+	if _, err := b.Write("/f.txt", []byte("content"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.ChmodCtx(context.Background(), "/f.txt", 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := b.Stat("/f.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode != 0o600 {
+		t.Errorf("mode=%o, want 0o600", info.Mode)
+	}
+}
+
+func TestMkdirWithPerm(t *testing.T) {
+	b := newTestBackend(t)
+	if err := b.MkdirCtx(context.Background(), "/d", 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := b.Stat("/d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir {
+		t.Fatalf("expected directory")
+	}
+	if info.Mode != 0o700 {
+		t.Errorf("mode=%o, want 0o700", info.Mode)
+	}
+}

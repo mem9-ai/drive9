@@ -26,6 +26,14 @@ func (s *Store) UpdateFileEmbedding(ctx context.Context, fileID string, revision
 	if err != nil {
 		return false, err
 	}
+	// Dual-write to split tables
+	if rowsAffected > 0 {
+		if _, err := s.db.ExecContext(ctx, `UPDATE semantic SET embedding = ?, embedding_revision = ?
+			WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND revision = ? AND status = 'CONFIRMED')`,
+			embedding.FormatVector(vector), revision, fileID, fileID, revision); err != nil {
+			return false, fmt.Errorf("update semantic embedding: %w", err)
+		}
+	}
 	return rowsAffected > 0, nil
 }
 
@@ -46,6 +54,14 @@ func (s *Store) UpdateFileDescriptionEmbedding(ctx context.Context, fileID strin
 	rowsAffected, err := res.RowsAffected()
 	if err != nil {
 		return false, err
+	}
+	// Dual-write to split tables
+	if rowsAffected > 0 {
+		if _, err := s.db.ExecContext(ctx, `UPDATE semantic SET description_embedding = ?, description_embedding_revision = ?
+			WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND revision = ? AND status = 'CONFIRMED')`,
+			embedding.FormatVector(vector), revision, fileID, fileID, revision); err != nil {
+			return false, fmt.Errorf("update semantic description_embedding: %w", err)
+		}
 	}
 	return rowsAffected > 0, nil
 }

@@ -182,6 +182,9 @@ func TestProcessAudioExtractTaskStaleRevision(t *testing.T) {
 	if _, err := b.Store().DB().Exec(`UPDATE files SET revision = 2 WHERE file_id = ?`, fileID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := b.Store().DB().Exec(`UPDATE inodes SET revision = 2 WHERE inode_id = ?`, fileID); err != nil {
+		t.Fatal(err)
+	}
 	result, err := b.ProcessAudioExtractTask(context.Background(), AudioExtractTaskSpec{
 		FileID:      fileID,
 		Path:        "/rec/stale.mp3",
@@ -206,6 +209,12 @@ func TestProcessAudioExtractTaskStaleBeforeNotAudioWhenTypeChanged(t *testing.T)
 	})
 	fileID := insertImageFileForExtractTest(t, b, "/rec/type-changed.mp3", "audio/mpeg", []byte{1, 2, 3})
 	if _, err := b.Store().DB().Exec(`UPDATE files SET revision = 2, content_type = ? WHERE file_id = ?`, "text/plain", fileID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Store().DB().Exec(`UPDATE inodes SET revision = 2 WHERE inode_id = ?`, fileID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Store().DB().Exec(`UPDATE contents SET content_type = ? WHERE inode_id = ?`, "text/plain", fileID); err != nil {
 		t.Fatal(err)
 	}
 	result, err := b.ProcessAudioExtractTask(context.Background(), AudioExtractTaskSpec{

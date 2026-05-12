@@ -51,7 +51,7 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 	}
 	if description != "" {
 		var currentDesc sql.NullString
-		if err := db.QueryRow(`SELECT description FROM files WHERE file_id = ?`, fileID).Scan(&currentDesc); err != nil {
+		if err := db.QueryRow(`SELECT description FROM semantic WHERE inode_id = ?`, fileID).Scan(&currentDesc); err != nil {
 			return 0, fmt.Errorf("read current description: %w", err)
 		}
 		query += ` description = ?,`
@@ -97,8 +97,12 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 		return 0, ErrNotFound
 	}
 	var rev int64
-	if err := db.QueryRow(`SELECT revision FROM files WHERE file_id = ?`, fileID).Scan(&rev); err != nil {
-		return 0, fmt.Errorf("read revision after update: %w", err)
+	if expectedRevision > 0 {
+		rev = expectedRevision + 1
+	} else {
+		if err := db.QueryRow(`SELECT revision FROM files WHERE file_id = ?`, fileID).Scan(&rev); err != nil {
+			return 0, fmt.Errorf("read revision after update: %w", err)
+		}
 	}
 
 	// Dual-write to split tables
@@ -106,7 +110,7 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 		return 0, fmt.Errorf("update inode: %w", err)
 	}
 	var encryptionMode StorageEncryptionMode
-	if err := db.QueryRow(`SELECT storage_encryption_mode FROM files WHERE file_id = ?`, fileID).Scan(&encryptionMode); err != nil {
+	if err := db.QueryRow(`SELECT storage_encryption_mode FROM contents WHERE inode_id = ?`, fileID).Scan(&encryptionMode); err != nil {
 		return 0, fmt.Errorf("read encryption mode: %w", err)
 	}
 	if err := s.UpdateContentTx(db, fileID, storageType, storageRef, contentType, checksum, contentBlob, encryptionMode); err != nil {
@@ -139,12 +143,17 @@ func (s *Store) UpdateFileStorageEncryptionTx(db execer, fileID string, mode Sto
 	}
 	if rowsAffected == 0 {
 		var exists int
-		if err := db.QueryRow(`SELECT 1 FROM files WHERE file_id = ?`, fileID).Scan(&exists); err != nil {
+		if err := db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ?`, fileID).Scan(&exists); err != nil {
 			if err == sql.ErrNoRows {
 				return ErrNotFound
 			}
 			return err
 		}
+	}
+	// Dual-write to split tables
+	if _, err := db.Exec(`UPDATE contents SET storage_encryption_mode = ?, storage_encryption_key_id = ? WHERE inode_id = ?`,
+		mode, storageEncryptionKeyIDForWrite(mode, keyID), fileID); err != nil {
+		return fmt.Errorf("update contents encryption: %w", err)
 	}
 	return nil
 }
@@ -160,6 +169,45 @@ func (s *Store) UpdateFileContentAutoEmbeddingTx(db execer, fileID string, stora
 // without touching embedding columns and only if expectedRevision matches.
 func (s *Store) UpdateFileContentAutoEmbeddingIfRevisionTx(db execer, fileID string, expectedRevision int64, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64, description string) (int64, error) {
 	return s.updateFileContentTx(db, fileID, expectedRevision, true, storageType, storageRef, contentType, checksum, contentText, contentBlob, size, description)
+}
+
+// ConfirmPendingFileTx marks a pending uploaded file as confirmed inside an
+// existing transaction. This is the non-auto-embedding variant: it clears
+// embedding state so later semantic processing recomputes vectors.
+func (s *Store) ConfirmPendingFileTx(db execer, fileID string, storageType StorageType, storageRef, contentType string, size int64, description string) error {
+	now := time.Now().UTC()
+	query := `UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
+		size_bytes = ?, checksum_sha256 = NULL, content_text = NULL,
+		embedding = NULL, embedding_revision = NULL`
+	args := []any{storageType, storageRef, nullStr(contentType), size}
+	if description != "" {
+		query += `, description = ?`
+		args = append(args, description)
+	}
+	query += `, status = 'CONFIRMED', confirmed_at = ? WHERE file_id = ? AND status = 'PENDING'`
+	args = append(args, now, fileID)
+	res, err := db.Exec(query, args...)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrNotFound
+	}
+	// Dual-write to split tables
+	if err := s.UpdateInodeContentTx(db, fileID, size, 1, StatusConfirmed, now); err != nil {
+		return fmt.Errorf("update inode: %w", err)
+	}
+	if err := s.UpdateContentTx(db, fileID, storageType, storageRef, contentType, "", nil, StorageEncryptionLegacy); err != nil {
+		return fmt.Errorf("update content: %w", err)
+	}
+	if err := s.UpdateSemanticTx(db, fileID, "", description); err != nil {
+		return fmt.Errorf("update semantic: %w", err)
+	}
+	return nil
 }
 
 // ConfirmPendingFileAutoEmbeddingTx marks a pending uploaded file as confirmed
@@ -187,6 +235,35 @@ func (s *Store) ConfirmPendingFileAutoEmbeddingTx(db execer, fileID string, stor
 	if rowsAffected == 0 {
 		return ErrNotFound
 	}
+	// Dual-write to split tables
+	if err := s.UpdateInodeContentTx(db, fileID, size, 1, StatusConfirmed, now); err != nil {
+		return fmt.Errorf("update inode: %w", err)
+	}
+	if err := s.UpdateContentTx(db, fileID, storageType, storageRef, contentType, "", nil, StorageEncryptionLegacy); err != nil {
+		return fmt.Errorf("update content: %w", err)
+	}
+	if description != "" {
+		if err := s.updateSemanticNoEmbedTx(db, fileID, "", description); err != nil {
+			return fmt.Errorf("update semantic: %w", err)
+		}
+	}
+	return nil
+}
+
+// DeletePendingFileTx marks a pending upload file as DELETED and clears its
+// storage ref inside an existing transaction. Used during overwrite when the
+// new upload targets an existing path.
+func (s *Store) DeletePendingFileTx(db execer, fileID string) error {
+	now := time.Now().UTC()
+	if _, err := db.Exec(`UPDATE files SET status = 'DELETED', storage_ref = '' WHERE file_id = ?`, fileID); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`UPDATE inodes SET status = 'DELETED', mtime = ? WHERE inode_id = ?`, now, fileID); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`UPDATE contents SET storage_ref = '' WHERE inode_id = ?`, fileID); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -202,6 +279,10 @@ func (s *Store) ClearFileEmbeddingStateTx(db execer, fileID string) error {
 	}
 	if rowsAffected == 0 {
 		return ErrNotFound
+	}
+	// Dual-write to split tables
+	if _, err := db.Exec(`UPDATE semantic SET embedding = NULL, embedding_revision = NULL WHERE inode_id = ?`, fileID); err != nil {
+		return fmt.Errorf("update semantic embedding: %w", err)
 	}
 	return nil
 }

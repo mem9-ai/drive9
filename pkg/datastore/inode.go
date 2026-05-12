@@ -12,6 +12,7 @@ type Inode struct {
 	InodeID     string
 	SizeBytes   int64
 	Revision    int64
+	Mode        uint32
 	Status      FileStatus
 	CreatedAt   time.Time
 	Mtime       time.Time
@@ -22,9 +23,9 @@ type Inode struct {
 // InsertInode inserts an inode row.
 func (s *Store) InsertInode(ctx context.Context, inode *Inode) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO inodes
-		(inode_id, size_bytes, revision, status, created_at, mtime, confirmed_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		inode.InodeID, inode.SizeBytes, inode.Revision, inode.Status,
+		(inode_id, size_bytes, revision, mode, status, created_at, mtime, confirmed_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		inode.InodeID, inode.SizeBytes, inode.Revision, inode.Mode, inode.Status,
 		inode.CreatedAt.UTC(), inode.Mtime.UTC(), nilTime(inode.ConfirmedAt), nilTime(inode.ExpiresAt))
 	return err
 }
@@ -32,16 +33,16 @@ func (s *Store) InsertInode(ctx context.Context, inode *Inode) error {
 // InsertInodeTx inserts an inode row inside an existing transaction.
 func (s *Store) InsertInodeTx(db execer, inode *Inode) error {
 	_, err := db.Exec(`INSERT INTO inodes
-		(inode_id, size_bytes, revision, status, created_at, mtime, confirmed_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		inode.InodeID, inode.SizeBytes, inode.Revision, inode.Status,
+		(inode_id, size_bytes, revision, mode, status, created_at, mtime, confirmed_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		inode.InodeID, inode.SizeBytes, inode.Revision, inode.Mode, inode.Status,
 		inode.CreatedAt.UTC(), inode.Mtime.UTC(), nilTime(inode.ConfirmedAt), nilTime(inode.ExpiresAt))
 	return err
 }
 
 // GetInode retrieves an inode by ID.
 func (s *Store) GetInode(ctx context.Context, inodeID string) (*Inode, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT inode_id, size_bytes, revision, status,
+	row := s.db.QueryRowContext(ctx, `SELECT inode_id, size_bytes, revision, mode, status,
 		created_at, mtime, confirmed_at, expires_at
 		FROM inodes WHERE inode_id = ?`, inodeID)
 	return scanInode(row)
@@ -52,6 +53,12 @@ func (s *Store) UpdateInodeContentTx(db execer, inodeID string, sizeBytes, revis
 	_, err := db.Exec(`UPDATE inodes SET size_bytes = ?, revision = ?, status = ?, mtime = ?, confirmed_at = ?
 		WHERE inode_id = ?`,
 		sizeBytes, revision, status, confirmedAt.UTC(), confirmedAt.UTC(), inodeID)
+	return err
+}
+
+// UpdateInodeModeTx updates the mode (permission bits) of an inode.
+func (s *Store) UpdateInodeModeTx(db execer, inodeID string, mode uint32) error {
+	_, err := db.Exec(`UPDATE inodes SET mode = ? WHERE inode_id = ?`, mode, inodeID)
 	return err
 }
 
@@ -72,7 +79,7 @@ func nullTimeValue(v sql.NullTime) *time.Time {
 func scanInode(row *sql.Row) (*Inode, error) {
 	var inode Inode
 	var confirmedAt, expiresAt sql.NullTime
-	err := row.Scan(&inode.InodeID, &inode.SizeBytes, &inode.Revision, &inode.Status,
+	err := row.Scan(&inode.InodeID, &inode.SizeBytes, &inode.Revision, &inode.Mode, &inode.Status,
 		&inode.CreatedAt, &inode.Mtime, &confirmedAt, &expiresAt)
 	if err != nil {
 		return nil, fmt.Errorf("scan inode: %w", err)

@@ -65,6 +65,7 @@ func InitSchemaStatements() []string {
 			inode_id     VARCHAR(64) PRIMARY KEY,
 			size_bytes   BIGINT NOT NULL DEFAULT 0,
 			revision     BIGINT NOT NULL DEFAULT 1,
+			mode         INT NOT NULL DEFAULT 420,
 			status       VARCHAR(32) NOT NULL DEFAULT 'PENDING',
 			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			mtime        TIMESTAMPTZ NOT NULL DEFAULT NOW(),

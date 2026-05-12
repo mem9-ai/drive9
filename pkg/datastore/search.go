@@ -123,7 +123,7 @@ func buildVectorSearchQuery(queryEmbedding []float32, pathPrefix string, limit i
 	if len(queryEmbedding) == 0 {
 		return "", nil, false
 	}
-	conds := []string{"f.status = 'CONFIRMED'", "f.embedding IS NOT NULL", "f.embedding_revision = f.revision"}
+	conds := []string{"i.status = 'CONFIRMED'", "s.embedding IS NOT NULL", "s.embedding_revision = i.revision"}
 	vecParam := embedding.FormatVector(queryEmbedding)
 	args := []any{vecParam}
 
@@ -134,11 +134,11 @@ func buildVectorSearchQuery(queryEmbedding []float32, pathPrefix string, limit i
 	}
 	args = append(args, vecParam, limit)
 
-	q := `SELECT fn.path, fn.name, f.size_bytes,
-		VEC_EMBED_COSINE_DISTANCE(f.embedding, ?) AS distance
-		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
+	q := `SELECT fn.path, fn.name, i.size_bytes,
+		VEC_EMBED_COSINE_DISTANCE(s.embedding, ?) AS distance
+		FROM file_nodes fn JOIN inodes i ON fn.file_id = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + strings.Join(conds, " AND ") + `
-		ORDER BY VEC_EMBED_COSINE_DISTANCE(f.embedding, ?)
+		ORDER BY VEC_EMBED_COSINE_DISTANCE(s.embedding, ?)
 	LIMIT ?`
 	return q, args, true
 }
@@ -147,7 +147,7 @@ func buildVectorSearchByTextQuery(queryText, pathPrefix string, limit int) (stri
 	if strings.TrimSpace(queryText) == "" {
 		return "", nil, false
 	}
-	conds := []string{"f.status = 'CONFIRMED'", "f.embedding IS NOT NULL"}
+	conds := []string{"i.status = 'CONFIRMED'", "s.embedding IS NOT NULL"}
 	args := []any{queryText}
 
 	if pathPrefix != "" && pathPrefix != "/" {
@@ -157,9 +157,9 @@ func buildVectorSearchByTextQuery(queryText, pathPrefix string, limit int) (stri
 	}
 	args = append(args, limit)
 
-	q := `SELECT fn.path, fn.name, f.size_bytes,
-		VEC_EMBED_COSINE_DISTANCE(f.embedding, ?) AS distance
-		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
+	q := `SELECT fn.path, fn.name, i.size_bytes,
+		VEC_EMBED_COSINE_DISTANCE(s.embedding, ?) AS distance
+		FROM file_nodes fn JOIN inodes i ON fn.file_id = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + strings.Join(conds, " AND ") + `
 		ORDER BY distance
 		LIMIT ?`
@@ -189,7 +189,7 @@ func buildVectorSearchDescriptionQuery(queryEmbedding []float32, pathPrefix stri
 	if len(queryEmbedding) == 0 {
 		return "", nil, false
 	}
-	conds := []string{"f.status = 'CONFIRMED'", "f.description_embedding IS NOT NULL", "f.description_embedding_revision = f.revision"}
+	conds := []string{"i.status = 'CONFIRMED'", "s.description_embedding IS NOT NULL", "s.description_embedding_revision = i.revision"}
 	vecParam := embedding.FormatVector(queryEmbedding)
 	args := []any{vecParam}
 
@@ -200,11 +200,11 @@ func buildVectorSearchDescriptionQuery(queryEmbedding []float32, pathPrefix stri
 	}
 	args = append(args, vecParam, limit)
 
-	q := `SELECT fn.path, fn.name, f.size_bytes,
-		VEC_EMBED_COSINE_DISTANCE(f.description_embedding, ?) AS distance
-		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
+	q := `SELECT fn.path, fn.name, i.size_bytes,
+		VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?) AS distance
+		FROM file_nodes fn JOIN inodes i ON fn.file_id = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + strings.Join(conds, " AND ") + `
-		ORDER BY VEC_EMBED_COSINE_DISTANCE(f.description_embedding, ?)
+		ORDER BY VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?)
 	LIMIT ?`
 	return q, args, true
 }
@@ -215,7 +215,7 @@ func buildVectorSearchDescriptionByTextQuery(queryText, pathPrefix string, limit
 	}
 	// Auto-embedding mode uses a generated column for description_embedding,
 	// so the vector is always current and no revision gate is needed.
-	conds := []string{"f.status = 'CONFIRMED'", "f.description_embedding IS NOT NULL"}
+	conds := []string{"i.status = 'CONFIRMED'", "s.description_embedding IS NOT NULL"}
 	args := []any{queryText}
 
 	if pathPrefix != "" && pathPrefix != "/" {
@@ -225,9 +225,9 @@ func buildVectorSearchDescriptionByTextQuery(queryText, pathPrefix string, limit
 	}
 	args = append(args, limit)
 
-	q := `SELECT fn.path, fn.name, f.size_bytes,
-		VEC_EMBED_COSINE_DISTANCE(f.description_embedding, ?) AS distance
-		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
+	q := `SELECT fn.path, fn.name, i.size_bytes,
+		VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?) AS distance
+		FROM file_nodes fn JOIN inodes i ON fn.file_id = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + strings.Join(conds, " AND ") + `
 		ORDER BY distance
 	LIMIT ?`
@@ -255,13 +255,13 @@ func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit i
 	contentExpr := "fts_match_word('" + safe + "', content_text)"
 	descExpr := "fts_match_word('" + safe + "', description)"
 
-	innerQ := `SELECT file_id, MAX(score) AS score FROM (
-		SELECT file_id, ` + contentExpr + ` AS score
-		FROM files WHERE status = 'CONFIRMED' AND ` + contentExpr + `
+	innerQ := `SELECT inode_id, MAX(score) AS score FROM (
+		SELECT inode_id, ` + contentExpr + ` AS score
+		FROM semantic WHERE ` + contentExpr + `
 		UNION ALL
-		SELECT file_id, ` + descExpr + ` AS score
-		FROM files WHERE status = 'CONFIRMED' AND ` + descExpr + `
-	) fts GROUP BY file_id ORDER BY score DESC LIMIT ?`
+		SELECT inode_id, ` + descExpr + ` AS score
+		FROM semantic WHERE ` + descExpr + `
+	) fts GROUP BY inode_id ORDER BY score DESC LIMIT ?`
 
 	var outerConds []string
 	var outerArgs []any
@@ -271,10 +271,10 @@ func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit i
 		outerArgs = append(outerArgs, pargs...)
 	}
 
-	q := `SELECT fn.path, fn.name, f.size_bytes, fts.score
+	q := `SELECT fn.path, fn.name, i.size_bytes, fts.score
 		FROM (` + innerQ + `) fts
-		JOIN file_nodes fn ON fn.file_id = fts.file_id
-		JOIN files f ON f.file_id = fts.file_id`
+		JOIN file_nodes fn ON fn.file_id = fts.inode_id
+		JOIN inodes i ON i.inode_id = fts.inode_id`
 	if len(outerConds) > 0 {
 		q += ` WHERE ` + strings.Join(outerConds, " AND ")
 	}
@@ -304,7 +304,7 @@ func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit i
 
 // KeywordSearch runs a LIKE-based fallback search when semantic ranking is unavailable.
 func (s *Store) KeywordSearch(ctx context.Context, query, pathPrefix string, limit int) ([]SearchResult, error) {
-	conds := []string{"f.status = 'CONFIRMED'", "f.content_text LIKE CONCAT('%', ?, '%')"}
+	conds := []string{"i.status = 'CONFIRMED'", "s.content_text LIKE CONCAT('%', ?, '%')"}
 	args := []any{query}
 
 	if pathPrefix != "" && pathPrefix != "/" {
@@ -314,10 +314,10 @@ func (s *Store) KeywordSearch(ctx context.Context, query, pathPrefix string, lim
 	}
 	args = append(args, limit)
 
-	q := `SELECT fn.path, fn.name, f.size_bytes
-		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
+	q := `SELECT fn.path, fn.name, i.size_bytes
+		FROM file_nodes fn JOIN inodes i ON fn.file_id = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + strings.Join(conds, " AND ") + `
-		ORDER BY f.confirmed_at DESC LIMIT ?`
+		ORDER BY i.confirmed_at DESC LIMIT ?`
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -341,7 +341,7 @@ func (s *Store) Find(ctx context.Context, f *FindFilter) ([]SearchResult, error)
 		f.Limit = 100
 	}
 
-	conds := []string{"f.status = 'CONFIRMED'", "fn.is_directory = 0"}
+	conds := []string{"i.status = 'CONFIRMED'", "fn.is_directory = 0"}
 	var args []any
 
 	if f.PathPrefix != "" && f.PathPrefix != "/" {
@@ -356,33 +356,33 @@ func (s *Store) Find(ctx context.Context, f *FindFilter) ([]SearchResult, error)
 	}
 	if f.TagKey != "" {
 		if f.TagValue != "" {
-			conds = append(conds, `EXISTS (SELECT 1 FROM file_tags t WHERE t.file_id = f.file_id AND t.tag_key = ? AND t.tag_value = ?)`)
+			conds = append(conds, `EXISTS (SELECT 1 FROM file_tags t WHERE t.file_id = i.inode_id AND t.tag_key = ? AND t.tag_value = ?)`)
 			args = append(args, f.TagKey, f.TagValue)
 		} else {
-			conds = append(conds, `EXISTS (SELECT 1 FROM file_tags t WHERE t.file_id = f.file_id AND t.tag_key = ?)`)
+			conds = append(conds, `EXISTS (SELECT 1 FROM file_tags t WHERE t.file_id = i.inode_id AND t.tag_key = ?)`)
 			args = append(args, f.TagKey)
 		}
 	}
 	if f.After != nil {
-		conds = append(conds, "f.confirmed_at > ?")
+		conds = append(conds, "i.confirmed_at > ?")
 		args = append(args, f.After.UTC())
 	}
 	if f.Before != nil {
-		conds = append(conds, "f.confirmed_at < ?")
+		conds = append(conds, "i.confirmed_at < ?")
 		args = append(args, f.Before.UTC())
 	}
 	if f.MinSize > 0 {
-		conds = append(conds, "f.size_bytes >= ?")
+		conds = append(conds, "i.size_bytes >= ?")
 		args = append(args, f.MinSize)
 	}
 	if f.MaxSize > 0 {
-		conds = append(conds, "f.size_bytes <= ?")
+		conds = append(conds, "i.size_bytes <= ?")
 		args = append(args, f.MaxSize)
 	}
 	args = append(args, f.Limit)
 
-	q := `SELECT fn.path, fn.name, f.size_bytes
-		FROM file_nodes fn JOIN files f ON fn.file_id = f.file_id
+	q := `SELECT fn.path, fn.name, i.size_bytes
+		FROM file_nodes fn JOIN inodes i ON fn.file_id = i.inode_id
 		WHERE ` + strings.Join(conds, " AND ") + `
 		ORDER BY fn.path LIMIT ?`
 

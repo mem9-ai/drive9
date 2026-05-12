@@ -73,6 +73,7 @@ type FileNode struct {
 	Name        string
 	IsDirectory bool
 	FileID      string // empty for directories
+	InodeID     string // links to inodes.inode_id; for directories, this is the directory's inode
 	CreatedAt   time.Time
 }
 
@@ -88,6 +89,7 @@ type File struct {
 	SizeBytes              int64
 	ChecksumSHA256         string
 	Revision               int64
+	Mode                   uint32
 	// EmbeddingRevision tracks which file revision produced the stored embedding.
 	EmbeddingRevision *int64
 	Status            FileStatus
@@ -182,9 +184,9 @@ func (s *Store) InsertNode(ctx context.Context, n *FileNode) error {
 	var opErr error
 	defer observeStoreOp(ctx, "insert_node", start, &opErr)
 
-	_, err := s.db.ExecContext(ctx, `INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), n.CreatedAt.UTC())
+	_, err := s.db.ExecContext(ctx, `INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), n.CreatedAt.UTC())
 	if isUniqueViolation(err) {
 		opErr = ErrPathConflict
 		return ErrPathConflict
@@ -198,7 +200,7 @@ func (s *Store) GetNode(ctx context.Context, path string) (*FileNode, error) {
 	var opErr error
 	defer observeStoreOp(ctx, "get_node", start, &opErr)
 
-	row := s.db.QueryRowContext(ctx, `SELECT node_id, path, parent_path, name, is_directory, file_id, created_at
+	row := s.db.QueryRowContext(ctx, `SELECT node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at
 		FROM file_nodes WHERE path = ?`, path)
 	n, err := scanNode(row)
 	opErr = err
@@ -381,6 +383,9 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 			if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, dst.fileID.String); err != nil {
 				return nil, err
 			}
+			if _, err := tx.Exec(`UPDATE inodes SET status = 'DELETED' WHERE inode_id = ?`, dst.fileID.String); err != nil {
+				return nil, err
+			}
 			if _, err := tx.Exec(`DELETE FROM file_tags WHERE file_id = ?`, dst.fileID.String); err != nil {
 				return nil, err
 			}
@@ -493,11 +498,19 @@ func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() 
 		dirPath := ancestors[i]
 		pp := parentPath(dirPath)
 		name := baseName(dirPath)
-		_, err := s.db.ExecContext(ctx, `INSERT INTO file_nodes
-			(node_id, path, parent_path, name, is_directory, created_at)
-			VALUES (?, ?, ?, ?, 1, ?)
+		nodeID := genID()
+		_, err := s.db.ExecContext(ctx, `INSERT IGNORE INTO inodes
+			(inode_id, size_bytes, revision, mode, status, created_at, mtime)
+			VALUES (?, 0, 1, 493, 'CONFIRMED', ?, ?)`,
+			nodeID, now, now)
+		if err != nil {
+			return fmt.Errorf("ensure parent inode %s: %w", dirPath, err)
+		}
+		_, err = s.db.ExecContext(ctx, `INSERT INTO file_nodes
+			(node_id, path, parent_path, name, is_directory, inode_id, created_at)
+			VALUES (?, ?, ?, ?, 1, ?, ?)
 			ON DUPLICATE KEY UPDATE node_id = node_id`,
-			genID(), dirPath, pp, name, now)
+			nodeID, dirPath, pp, name, nodeID, now)
 		if err != nil && !isUniqueViolation(err) {
 			return fmt.Errorf("ensure parent %s: %w", dirPath, err)
 		}
@@ -543,10 +556,15 @@ func (s *Store) InsertFile(ctx context.Context, f *File) (err error) {
 // insertSplitTablesTx inserts corresponding rows into inodes, contents, and semantic.
 func (s *Store) insertSplitTablesTx(tx execer, f *File) error {
 	now := time.Now().UTC()
+	mode := f.Mode
+	if mode == 0 {
+		mode = 0o644
+	}
 	inode := &Inode{
 		InodeID:     f.FileID,
 		SizeBytes:   f.SizeBytes,
 		Revision:    f.Revision,
+		Mode:        mode,
 		Status:      f.Status,
 		CreatedAt:   f.CreatedAt,
 		Mtime:       now,
@@ -587,13 +605,17 @@ func (s *Store) GetFile(ctx context.Context, fileID string) (out *File, err erro
 	start := time.Now()
 	defer observeStoreOp(ctx, "get_file", start, &err)
 
-	row := s.db.QueryRowContext(ctx, `SELECT file_id, storage_type, storage_ref, storage_encryption_mode,
-		storage_encryption_key_id, content_blob, content_type,
-		size_bytes, checksum_sha256, revision, embedding_revision, status, source_id, content_text,
-		description, description_embedding_revision, created_at, confirmed_at, expires_at
-		FROM files WHERE file_id = ?`, fileID)
-	out, err = scanFileWithBlob(row)
-	return out, err
+	inode, err := s.GetInode(ctx, fileID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	content, _ := s.GetContent(ctx, fileID)
+	semantic, _ := s.GetSemantic(ctx, fileID)
+	out = assembleFile(inode, content, semantic)
+	return out, nil
 }
 
 func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64, description string) (newRevision int64, err error) {
@@ -640,7 +662,7 @@ func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageTyp
 		return 0, fmt.Errorf("update inode: %w", err)
 	}
 	var encryptionMode StorageEncryptionMode
-	if err := tx.QueryRow(`SELECT storage_encryption_mode FROM files WHERE file_id = ?`, fileID).Scan(&encryptionMode); err != nil {
+	if err := tx.QueryRow(`SELECT storage_encryption_mode FROM contents WHERE inode_id = ?`, fileID).Scan(&encryptionMode); err != nil {
 		return 0, fmt.Errorf("read encryption mode: %w", err)
 	}
 	if err := s.UpdateContentTx(tx, fileID, storageType, storageRef, contentType, checksum, contentBlob, encryptionMode); err != nil {
@@ -681,13 +703,33 @@ func (s *Store) UpdateFileSearchTextTx(db execer, fileID string, expectedRevisio
 
 func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevision int64, contentText string) (sql.Result, error) {
 	if expectedRevision > 0 {
-		return db.Exec(`UPDATE files SET content_text = ?
+		res, err := db.Exec(`UPDATE files SET content_text = ?
 			WHERE file_id = ? AND status = 'CONFIRMED' AND revision = ?`,
 			nullStr(contentText), fileID, expectedRevision)
+		if err != nil {
+			return nil, err
+		}
+		// Dual-write to split tables
+		if _, err := db.Exec(`UPDATE semantic SET content_text = ?
+			WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`,
+			nullStr(contentText), fileID, fileID, expectedRevision); err != nil {
+			return nil, fmt.Errorf("update semantic content_text: %w", err)
+		}
+		return res, nil
 	}
-	return db.Exec(`UPDATE files SET content_text = ?
+	res, err := db.Exec(`UPDATE files SET content_text = ?
 		WHERE file_id = ? AND status = 'CONFIRMED'`,
 		nullStr(contentText), fileID)
+	if err != nil {
+		return nil, err
+	}
+	// Dual-write to split tables
+	if _, err := db.Exec(`UPDATE semantic SET content_text = ?
+		WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED')`,
+		nullStr(contentText), fileID, fileID); err != nil {
+		return nil, fmt.Errorf("update semantic content_text: %w", err)
+	}
+	return res, nil
 }
 
 // ReplaceFileTagsTx replaces all tags for fileID inside an existing transaction.
@@ -784,16 +826,6 @@ func (s *Store) GetFileTags(ctx context.Context, fileID string) (out map[string]
 	return out, nil
 }
 
-func (s *Store) ConfirmFile(ctx context.Context, fileID string) (err error) {
-	start := time.Now()
-	defer observeStoreOp(ctx, "confirm_file", start, &err)
-
-	_, err = s.db.ExecContext(ctx, `UPDATE files SET status = 'CONFIRMED',
-		confirmed_at = ?
-		WHERE file_id = ? AND status = 'PENDING'`, time.Now().UTC(), fileID)
-	return err
-}
-
 // execer abstracts *sql.DB and *sql.Tx for shared query execution.
 type execer interface {
 	Exec(query string, args ...interface{}) (sql.Result, error)
@@ -801,17 +833,61 @@ type execer interface {
 	Query(query string, args ...interface{}) (*sql.Rows, error)
 }
 
-func (s *Store) ConfirmFileTx(db execer, fileID string) error {
-	_, err := db.Exec(`UPDATE files SET status = 'CONFIRMED',
-		confirmed_at = ?
-		WHERE file_id = ? AND status = 'PENDING'`, time.Now().UTC(), fileID)
-	return err
+// FileStorageMeta holds the lightweight storage metadata needed by upload
+// overwrite logic, fetched with FOR UPDATE row locking.
+type FileStorageMeta struct {
+	StorageType StorageType
+	StorageRef  string
+	Revision    int64
+	SizeBytes   int64
+	ContentType string
+}
+
+// GetFileStorageMetaForUpdateTx returns confirmed file storage metadata with
+// row-level locking inside an existing transaction.
+func (s *Store) GetFileStorageMetaForUpdateTx(db execer, fileID string) (*FileStorageMeta, error) {
+	var m FileStorageMeta
+	var contentType sql.NullString
+	err := db.QueryRow(`SELECT c.storage_type, c.storage_ref, i.revision, i.size_bytes, COALESCE(c.content_type, '')
+		FROM inodes i JOIN contents c ON i.inode_id = c.inode_id
+		WHERE i.inode_id = ? AND i.status = 'CONFIRMED' FOR UPDATE`, fileID).Scan(
+		&m.StorageType, &m.StorageRef, &m.Revision, &m.SizeBytes, &contentType)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	m.ContentType = contentType.String
+	return &m, nil
 }
 
 func (s *Store) CompleteUploadTx(db execer, uploadID string) error {
 	_, err := db.Exec(`UPDATE uploads SET status = 'COMPLETED',
 		updated_at = ?
 		WHERE upload_id = ? AND status = 'UPLOADING'`, time.Now().UTC(), uploadID)
+	return err
+}
+
+// Chmod updates the permission bits (mode) of the file at path.
+// It returns ErrNotFound if the path does not exist or is a directory.
+func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "chmod", start, &err)
+
+	node, err := s.GetNode(ctx, path)
+	if err != nil {
+		return err
+	}
+	inodeID := node.InodeID
+	if inodeID == "" && !node.IsDirectory {
+		inodeID = node.FileID
+	}
+	if inodeID == "" {
+		return ErrNotFound
+	}
+
+	_, err = s.db.ExecContext(ctx, `UPDATE inodes SET mode = ? WHERE inode_id = ?`, mode, inodeID)
 	return err
 }
 
@@ -826,16 +902,24 @@ func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) 
 		ancestors = append(ancestors, parent)
 		cur = parent
 	}
-	now := time.Now()
+	now := time.Now().UTC()
 	for i := len(ancestors) - 1; i >= 0; i-- {
 		dirPath := ancestors[i]
 		pp := parentPath(dirPath)
 		name := baseName(dirPath)
-		_, err := db.Exec(`INSERT INTO file_nodes
-			(node_id, path, parent_path, name, is_directory, created_at)
-			VALUES (?, ?, ?, ?, 1, ?)
+		nodeID := genID()
+		_, err := db.Exec(`INSERT IGNORE INTO inodes
+			(inode_id, size_bytes, revision, mode, status, created_at, mtime)
+			VALUES (?, 0, 1, 493, 'CONFIRMED', ?, ?)`,
+			nodeID, now, now)
+		if err != nil {
+			return fmt.Errorf("ensure parent inode %s: %w", dirPath, err)
+		}
+		_, err = db.Exec(`INSERT INTO file_nodes
+			(node_id, path, parent_path, name, is_directory, inode_id, created_at)
+			VALUES (?, ?, ?, ?, 1, ?, ?)
 			ON DUPLICATE KEY UPDATE node_id = node_id`,
-			genID(), dirPath, pp, name, now.UTC())
+			nodeID, dirPath, pp, name, nodeID, now)
 		if err != nil && !isUniqueViolation(err) {
 			return fmt.Errorf("ensure parent %s: %w", dirPath, err)
 		}
@@ -844,9 +928,9 @@ func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) 
 }
 
 func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
-	_, err := db.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), n.CreatedAt.UTC())
+	_, err := db.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), n.CreatedAt.UTC())
 	if isUniqueViolation(err) {
 		return ErrPathConflict
 	}
@@ -858,6 +942,11 @@ func (s *Store) MarkFileDeleted(ctx context.Context, fileID string) (err error) 
 	defer observeStoreOp(ctx, "mark_file_deleted", start, &err)
 
 	_, err = s.db.ExecContext(ctx, `UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fileID)
+	if err != nil {
+		return err
+	}
+	// Dual-write to split tables
+	_, err = s.db.ExecContext(ctx, `UPDATE inodes SET status = 'DELETED' WHERE inode_id = ?`, fileID)
 	return err
 }
 
@@ -865,7 +954,7 @@ func (s *Store) MarkFileDeleted(ctx context.Context, fileID string) (err error) 
 // entities in the current tenant database.
 func (s *Store) ConfirmedStorageBytesTx(db execer) (int64, error) {
 	var total sql.NullInt64
-	if err := db.QueryRow(`SELECT COALESCE(SUM(size_bytes), 0) FROM files WHERE status = 'CONFIRMED'`).Scan(&total); err != nil {
+	if err := db.QueryRow(`SELECT COALESCE(SUM(size_bytes), 0) FROM inodes WHERE status = 'CONFIRMED'`).Scan(&total); err != nil {
 		return 0, err
 	}
 	return total.Int64, nil
@@ -878,7 +967,7 @@ func (s *Store) ConfirmedStorageBytesTx(db execer) (int64, error) {
 // are not enqueued.
 func (s *Store) ConfirmedMediaFileCountTx(db execer) (int64, error) {
 	var count sql.NullInt64
-	if err := db.QueryRow(`SELECT COUNT(*) FROM files WHERE status = 'CONFIRMED' AND (content_type LIKE 'image/%' OR content_type LIKE 'audio/%')`).Scan(&count); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM inodes i JOIN contents c ON i.inode_id = c.inode_id WHERE i.status = 'CONFIRMED' AND (c.content_type LIKE 'image/%' OR c.content_type LIKE 'audio/%')`).Scan(&count); err != nil {
 		return 0, err
 	}
 	return count.Int64, nil
@@ -893,13 +982,13 @@ func (s *Store) ActiveUploadReservedBytesTx(db execer) (int64, error) {
 	// more targeted uploads status/index strategy or a pre-aggregated quota state.
 	err := db.QueryRow(`SELECT COALESCE(SUM(
 		CASE
-			WHEN u.total_size > COALESCE(f.size_bytes, 0) THEN u.total_size - COALESCE(f.size_bytes, 0)
+			WHEN u.total_size > COALESCE(i.size_bytes, 0) THEN u.total_size - COALESCE(i.size_bytes, 0)
 			ELSE 0
 		END
 	), 0)
 		FROM uploads u
 		LEFT JOIN file_nodes fn ON fn.path = u.target_path
-		LEFT JOIN files f ON f.file_id = fn.file_id AND f.status = 'CONFIRMED'
+		LEFT JOIN inodes i ON i.inode_id = COALESCE(fn.inode_id, fn.file_id) AND i.status = 'CONFIRMED'
 		WHERE u.status IN ('INITIATED', 'UPLOADING') AND u.expires_at > ?`, time.Now().UTC()).Scan(&total)
 	if err != nil {
 		return 0, err
@@ -911,10 +1000,10 @@ func (s *Store) ActiveUploadReservedBytesTx(db execer) (int64, error) {
 // Missing paths and directories report zero bytes.
 func (s *Store) ConfirmedFileSizeByPathTx(db execer, path string) (int64, error) {
 	var size sql.NullInt64
-	err := db.QueryRow(`SELECT f.size_bytes
+	err := db.QueryRow(`SELECT i.size_bytes
 		FROM file_nodes fn
-		JOIN files f ON f.file_id = fn.file_id
-		WHERE fn.path = ? AND fn.is_directory = 0 AND f.status = 'CONFIRMED'
+		JOIN inodes i ON i.inode_id = fn.file_id
+		WHERE fn.path = ? AND fn.is_directory = 0 AND i.status = 'CONFIRMED'
 		LIMIT 1`, path).Scan(&size)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
@@ -943,14 +1032,16 @@ func (s *Store) ListConfirmedFileSummaries(ctx context.Context, cursor string, l
 	var err error
 	if cursor == "" {
 		rows, err = s.db.QueryContext(ctx,
-			`SELECT file_id, size_bytes, COALESCE(content_type, '')
-			 FROM files WHERE status = 'CONFIRMED'
-			 ORDER BY file_id ASC LIMIT ?`, limit)
+			`SELECT i.inode_id, i.size_bytes, COALESCE(c.content_type, '')
+			 FROM inodes i JOIN contents c ON i.inode_id = c.inode_id
+			 WHERE i.status = 'CONFIRMED'
+			 ORDER BY i.inode_id ASC LIMIT ?`, limit)
 	} else {
 		rows, err = s.db.QueryContext(ctx,
-			`SELECT file_id, size_bytes, COALESCE(content_type, '')
-			 FROM files WHERE status = 'CONFIRMED' AND file_id > ?
-			 ORDER BY file_id ASC LIMIT ?`, cursor, limit)
+			`SELECT i.inode_id, i.size_bytes, COALESCE(c.content_type, '')
+			 FROM inodes i JOIN contents c ON i.inode_id = c.inode_id
+			 WHERE i.status = 'CONFIRMED' AND i.inode_id > ?
+			 ORDER BY i.inode_id ASC LIMIT ?`, cursor, limit)
 	}
 	if err != nil {
 		return nil, "", fmt.Errorf("query confirmed files: %w", err)
@@ -1002,12 +1093,14 @@ func (s *Store) StatPathFallback(ctx context.Context, primaryPath, fallbackPath 
 	defer observeStoreOp(ctx, "stat_path_fallback", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
-		f.file_id, f.storage_type, f.storage_ref, f.storage_encryption_mode, f.storage_encryption_key_id,
-		f.content_blob, f.content_type, f.size_bytes,
-		f.checksum_sha256, f.revision, f.embedding_revision, f.status, f.source_id, f.content_text,
-		f.description, f.description_embedding_revision, f.created_at, f.confirmed_at, f.expires_at
+		i.inode_id, c.storage_type, c.storage_ref, c.storage_encryption_mode, c.storage_encryption_key_id,
+		c.content_blob, c.content_type, i.size_bytes,
+		c.checksum_sha256, i.revision, i.mode, s.embedding_revision, i.status, c.source_id, s.content_text,
+		s.description, s.description_embedding_revision, i.created_at, i.confirmed_at, i.expires_at
 		FROM file_nodes fn
-		LEFT JOIN files f ON fn.file_id = f.file_id AND fn.is_directory = 0 AND f.status = 'CONFIRMED'
+		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
+		LEFT JOIN contents c ON i.inode_id = c.inode_id
+		LEFT JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE fn.path = ? OR fn.path = ?
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
 		LIMIT 1`, primaryPath, fallbackPath, primaryPath)
@@ -1023,9 +1116,9 @@ func (s *Store) StatPathFallbackLite(ctx context.Context, primaryPath, fallbackP
 	defer observeStoreOp(ctx, "stat_path_fallback_lite", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
-		f.file_id, f.size_bytes, f.revision, f.status, f.created_at, f.confirmed_at
+		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
 		FROM file_nodes fn
-		LEFT JOIN files f ON fn.file_id = f.file_id AND fn.is_directory = 0 AND f.status = 'CONFIRMED'
+		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
 		WHERE fn.path = ? OR fn.path = ?
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
 		LIMIT 1`, primaryPath, fallbackPath, primaryPath)
@@ -1039,9 +1132,9 @@ func (s *Store) StatLite(ctx context.Context, path string) (out *NodeWithFile, e
 	defer observeStoreOp(ctx, "stat_lite", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
-		f.file_id, f.size_bytes, f.revision, f.status, f.created_at, f.confirmed_at
+		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
 		FROM file_nodes fn
-		LEFT JOIN files f ON fn.file_id = f.file_id AND fn.is_directory = 0 AND f.status = 'CONFIRMED'
+		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
 		WHERE fn.path = ?
 		LIMIT 1`, path)
 	out, err = scanNodeWithFileLite(row)
@@ -1057,9 +1150,10 @@ func (s *Store) StatForRead(ctx context.Context, path string) (out *NodeWithFile
 	defer observeStoreOp(ctx, "stat_for_read", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
-		f.file_id, f.storage_type, f.storage_ref, f.content_blob, f.size_bytes, f.revision, f.status, f.created_at, f.confirmed_at
+		i.inode_id, c.storage_type, c.storage_ref, c.content_blob, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
 		FROM file_nodes fn
-		LEFT JOIN files f ON fn.file_id = f.file_id AND fn.is_directory = 0 AND f.status = 'CONFIRMED'
+		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
+		LEFT JOIN contents c ON i.inode_id = c.inode_id
 		WHERE fn.path = ?
 		LIMIT 1`, path)
 	out, err = scanNodeWithFileForRead(row)
@@ -1072,9 +1166,10 @@ func (s *Store) StatPathFallbackForRead(ctx context.Context, primaryPath, fallba
 	defer observeStoreOp(ctx, "stat_path_fallback_for_read", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
-		f.file_id, f.storage_type, f.storage_ref, f.content_blob, f.size_bytes, f.revision, f.status, f.created_at, f.confirmed_at
+		i.inode_id, c.storage_type, c.storage_ref, c.content_blob, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
 		FROM file_nodes fn
-		LEFT JOIN files f ON fn.file_id = f.file_id AND fn.is_directory = 0 AND f.status = 'CONFIRMED'
+		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
+		LEFT JOIN contents c ON i.inode_id = c.inode_id
 		WHERE fn.path = ? OR fn.path = ?
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
 		LIMIT 1`, primaryPath, fallbackPath, primaryPath)
@@ -1089,12 +1184,11 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 	// TODO(#110): ReadDir only needs lightweight file metadata. Split this into a
 	// metadata-only listing path so directory scans do not fetch or copy content_blob.
 	q := `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
-		f.file_id, f.storage_type, f.storage_ref, f.storage_encryption_mode, f.storage_encryption_key_id,
-		f.content_blob, f.content_type, f.size_bytes,
-		f.checksum_sha256, f.revision, f.embedding_revision, f.status, f.source_id, f.content_text,
-		f.description, f.description_embedding_revision, f.created_at, f.confirmed_at, f.expires_at
+		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at,
+		s.embedding_revision
 		FROM file_nodes fn
-		LEFT JOIN files f ON fn.file_id = f.file_id AND f.status = 'CONFIRMED'
+		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
+		LEFT JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE fn.parent_path = ?
 		ORDER BY fn.name`
 	rows, err := s.db.QueryContext(ctx, q, parentPath)
@@ -1105,9 +1199,43 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 
 	result := make([]*NodeWithFile, 0)
 	for rows.Next() {
-		nf, err := scanNodeWithFileWithBlob(rows)
-		if err != nil {
+		var n FileNode
+		var isDir int
+		var nodeFileID sql.NullString
+		var nodeCreatedAt time.Time
+		var fFileID sql.NullString
+		var fSizeBytes, fRevision sql.NullInt64
+		var fMode sql.NullInt64
+		var fStatus sql.NullString
+		var fCreatedAt, fConfirmedAt sql.NullTime
+		var fEmbeddingRevision sql.NullInt64
+		if err := rows.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
+			&fFileID, &fSizeBytes, &fRevision, &fMode, &fStatus, &fCreatedAt, &fConfirmedAt, &fEmbeddingRevision); err != nil {
 			return nil, err
+		}
+		n.IsDirectory = isDir != 0
+		n.FileID = nodeFileID.String
+		n.CreatedAt = nodeCreatedAt.UTC()
+		nf := &NodeWithFile{Node: n}
+		if fFileID.Valid {
+			nf.File = &File{
+				FileID:    fFileID.String,
+				SizeBytes: fSizeBytes.Int64,
+				Revision:  fRevision.Int64,
+				Mode:      uint32(fMode.Int64),
+				Status:    FileStatus(fStatus.String),
+			}
+			if fCreatedAt.Valid {
+				nf.File.CreatedAt = fCreatedAt.Time.UTC()
+			}
+			if fConfirmedAt.Valid {
+				t := fConfirmedAt.Time.UTC()
+				nf.File.ConfirmedAt = &t
+			}
+			if fEmbeddingRevision.Valid {
+				rev := fEmbeddingRevision.Int64
+				nf.File.EmbeddingRevision = &rev
+			}
 		}
 		result = append(result, nf)
 	}
@@ -1230,6 +1358,9 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 			continue
 		}
 		if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fid); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(`UPDATE inodes SET status = 'DELETED' WHERE inode_id = ?`, fid); err != nil {
 			return nil, err
 		}
 		if _, err := tx.Exec(`DELETE FROM file_tags WHERE file_id = ?`, fid); err != nil {
@@ -1502,9 +1633,9 @@ type scanner interface {
 func scanNode(s scanner) (*FileNode, error) {
 	var n FileNode
 	var isDir int
-	var fileID sql.NullString
+	var fileID, inodeID sql.NullString
 	var createdAt time.Time
-	err := s.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &fileID, &createdAt)
+	err := s.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &fileID, &inodeID, &createdAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -1513,51 +1644,39 @@ func scanNode(s scanner) (*FileNode, error) {
 	}
 	n.IsDirectory = isDir != 0
 	n.FileID = fileID.String
+	n.InodeID = inodeID.String
 	n.CreatedAt = createdAt.UTC()
 	return &n, nil
 }
 
-func scanFileWithBlob(s scanner) (*File, error) {
-	var f File
-	var contentBlob []byte
-	var contentType, checksum, sourceID, contentText, description sql.NullString
-	var embeddingRevision, descriptionEmbeddingRevision sql.NullInt64
-	var confirmedAt, expiresAt sql.NullTime
-	var createdAt time.Time
-	err := s.Scan(&f.FileID, &f.StorageType, &f.StorageRef, &f.StorageEncryptionMode,
-		&f.StorageEncryptionKeyID, &contentBlob, &contentType,
-		&f.SizeBytes, &checksum, &f.Revision, &embeddingRevision, &f.Status, &sourceID, &contentText,
-		&description, &descriptionEmbeddingRevision, &createdAt, &confirmedAt, &expiresAt)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, err
+func assembleFile(inode *Inode, content *Content, semantic *Semantic) *File {
+	f := &File{
+		FileID:      inode.InodeID,
+		SizeBytes:   inode.SizeBytes,
+		Revision:    inode.Revision,
+		Mode:        inode.Mode,
+		Status:      inode.Status,
+		CreatedAt:   inode.CreatedAt,
+		ConfirmedAt: inode.ConfirmedAt,
+		ExpiresAt:   inode.ExpiresAt,
 	}
-	f.ContentType = contentType.String
-	f.ContentBlob = append([]byte(nil), contentBlob...)
-	f.ChecksumSHA256 = checksum.String
-	f.SourceID = sourceID.String
-	f.ContentText = contentText.String
-	f.Description = description.String
-	if embeddingRevision.Valid {
-		rev := embeddingRevision.Int64
-		f.EmbeddingRevision = &rev
+	if content != nil {
+		f.StorageType = content.StorageType
+		f.StorageRef = content.StorageRef
+		f.StorageEncryptionMode = content.StorageEncryptionMode
+		f.StorageEncryptionKeyID = content.StorageEncryptionKeyID
+		f.ContentBlob = append([]byte(nil), content.ContentBlob...)
+		f.ContentType = content.ContentType
+		f.ChecksumSHA256 = content.ChecksumSHA256
+		f.SourceID = content.SourceID
 	}
-	if descriptionEmbeddingRevision.Valid {
-		rev := descriptionEmbeddingRevision.Int64
-		f.DescriptionEmbeddingRevision = &rev
+	if semantic != nil {
+		f.ContentText = semantic.ContentText
+		f.Description = semantic.Description
+		f.EmbeddingRevision = semantic.EmbeddingRevision
+		f.DescriptionEmbeddingRevision = semantic.DescriptionEmbeddingRevision
 	}
-	f.CreatedAt = createdAt.UTC()
-	if confirmedAt.Valid {
-		t := confirmedAt.Time.UTC()
-		f.ConfirmedAt = &t
-	}
-	if expiresAt.Valid {
-		t := expiresAt.Time.UTC()
-		f.ExpiresAt = &t
-	}
-	return &f, nil
+	return f
 }
 
 func scanFileForGC(s scanner) (*File, error) {
@@ -1603,14 +1722,14 @@ func scanNodeWithFileWithBlob(s scanner) (*NodeWithFile, error) {
 	var fFileID, fStorageType, fStorageRef, fStorageEncryptionMode, fStorageEncryptionKeyID sql.NullString
 	var fContentBlob []byte
 	var fContentType, fChecksum, fSourceID, fContentText, fDescription sql.NullString
-	var fSizeBytes, fRevision, fEmbeddingRevision, fDescriptionEmbeddingRevision sql.NullInt64
+	var fSizeBytes, fRevision, fMode, fEmbeddingRevision, fDescriptionEmbeddingRevision sql.NullInt64
 	var fStatus sql.NullString
 	var fCreatedAt, fConfirmedAt, fExpiresAt sql.NullTime
 
 	err := s.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
 		&fFileID, &fStorageType, &fStorageRef, &fStorageEncryptionMode, &fStorageEncryptionKeyID,
 		&fContentBlob, &fContentType, &fSizeBytes,
-		&fChecksum, &fRevision, &fEmbeddingRevision, &fStatus, &fSourceID, &fContentText,
+		&fChecksum, &fRevision, &fMode, &fEmbeddingRevision, &fStatus, &fSourceID, &fContentText,
 		&fDescription, &fDescriptionEmbeddingRevision, &fCreatedAt, &fConfirmedAt, &fExpiresAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1636,6 +1755,7 @@ func scanNodeWithFileWithBlob(s scanner) (*NodeWithFile, error) {
 			SizeBytes:              fSizeBytes.Int64,
 			ChecksumSHA256:         fChecksum.String,
 			Revision:               fRevision.Int64,
+			Mode:                   uint32(fMode.Int64),
 			Status:                 FileStatus(fStatus.String),
 			SourceID:               fSourceID.String,
 			ContentText:            fContentText.String,
@@ -1677,11 +1797,12 @@ func scanNodeWithFileForRead(s scanner) (*NodeWithFile, error) {
 	var fFileID, fStorageType, fStorageRef sql.NullString
 	var fContentBlob []byte
 	var fSizeBytes, fRevision sql.NullInt64
+	var fMode sql.NullInt64
 	var fStatus sql.NullString
 	var fCreatedAt, fConfirmedAt sql.NullTime
 
 	err := s.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
-		&fFileID, &fStorageType, &fStorageRef, &fContentBlob, &fSizeBytes, &fRevision, &fStatus, &fCreatedAt, &fConfirmedAt)
+		&fFileID, &fStorageType, &fStorageRef, &fContentBlob, &fSizeBytes, &fRevision, &fMode, &fStatus, &fCreatedAt, &fConfirmedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -1726,11 +1847,12 @@ func scanNodeWithFileLite(s scanner) (*NodeWithFile, error) {
 
 	var fFileID sql.NullString
 	var fSizeBytes, fRevision sql.NullInt64
+	var fMode sql.NullInt64
 	var fStatus sql.NullString
 	var fCreatedAt, fConfirmedAt sql.NullTime
 
 	err := s.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
-		&fFileID, &fSizeBytes, &fRevision, &fStatus, &fCreatedAt, &fConfirmedAt)
+		&fFileID, &fSizeBytes, &fRevision, &fMode, &fStatus, &fCreatedAt, &fConfirmedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -1748,6 +1870,7 @@ func scanNodeWithFileLite(s scanner) (*NodeWithFile, error) {
 			FileID:    fFileID.String,
 			SizeBytes: fSizeBytes.Int64,
 			Revision:  fRevision.Int64,
+			Mode:      uint32(fMode.Int64),
 			Status:    FileStatus(fStatus.String),
 		}
 		if fCreatedAt.Valid {

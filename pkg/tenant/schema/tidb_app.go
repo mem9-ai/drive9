@@ -66,6 +66,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			inode_id     VARCHAR(64) PRIMARY KEY,
 			size_bytes   BIGINT NOT NULL DEFAULT 0,
 			revision     BIGINT NOT NULL DEFAULT 1,
+			mode         INT UNSIGNED NOT NULL DEFAULT 420,
 			status       VARCHAR(32) NOT NULL DEFAULT 'PENDING',
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			mtime        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),

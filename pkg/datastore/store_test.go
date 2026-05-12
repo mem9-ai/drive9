@@ -3,6 +3,7 @@ package datastore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -34,6 +35,9 @@ func setEmbeddingRevision(t *testing.T, s *Store, fileID string, revision int64)
 	t.Helper()
 	if _, err := s.DB().Exec(`UPDATE files SET embedding_revision = ? WHERE file_id = ?`, revision, fileID); err != nil {
 		t.Fatalf("set embedding_revision for %s: %v", fileID, err)
+	}
+	if _, err := s.DB().Exec(`UPDATE semantic SET embedding_revision = ? WHERE inode_id = ?`, revision, fileID); err != nil {
+		t.Fatalf("set semantic embedding_revision for %s: %v", fileID, err)
 	}
 }
 
@@ -133,6 +137,9 @@ func TestStatLite(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.DB().Exec(`UPDATE files SET description = 'test desc' WHERE file_id = 'f1'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`UPDATE semantic SET description = 'test desc' WHERE inode_id = 'f1'`); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/lite.txt", ParentPath: "/", Name: "lite.txt", FileID: "f1", CreatedAt: now}); err != nil {
@@ -941,5 +948,262 @@ func TestUpdateFileContentWithDescription(t *testing.T) {
 	}
 	if got.DescriptionEmbeddingRevision != nil {
 		t.Errorf("expected description_embedding_revision to be nil after content update, got %v", got.DescriptionEmbeddingRevision)
+	}
+}
+
+func TestChmod(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 42, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Chmod(ctx, "/a.txt", 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != 0o600 {
+		t.Errorf("mode=%o, want 0o600", got.Mode)
+	}
+}
+
+func TestChmodNotFound(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	err := s.Chmod(ctx, "/nonexistent.txt", 0o600)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestChmodDirectory(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/dir/", ParentPath: "/", Name: "dir", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.Chmod(ctx, "/dir/", 0o700)
+	if err == nil {
+		t.Fatal("expected error for chmod on directory")
+	}
+}
+
+func TestConfirmPendingFileTx(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusPending, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s.ConfirmPendingFileTx(tx, "f1", StorageS3, "/s3/f1", "text/plain", 42, "desc"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusConfirmed {
+		t.Errorf("status=%s, want CONFIRMED", got.Status)
+	}
+	if got.SizeBytes != 42 {
+		t.Errorf("size=%d, want 42", got.SizeBytes)
+	}
+	if got.StorageType != StorageS3 {
+		t.Errorf("storage_type=%s, want s3", got.StorageType)
+	}
+	if got.Description != "desc" {
+		t.Errorf("description=%q, want desc", got.Description)
+	}
+}
+
+func TestConfirmPendingFileAutoEmbeddingTx(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusPending, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s.ConfirmPendingFileAutoEmbeddingTx(tx, "f1", StorageS3, "/s3/f1", "text/plain", 42, "auto-desc"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusConfirmed {
+		t.Errorf("status=%s, want CONFIRMED", got.Status)
+	}
+	if got.SizeBytes != 42 {
+		t.Errorf("size=%d, want 42", got.SizeBytes)
+	}
+	if got.Description != "auto-desc" {
+		t.Errorf("description=%q, want auto-desc", got.Description)
+	}
+}
+
+func TestDeletePendingFileTx(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusPending, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s.DeletePendingFileTx(tx, "f1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusDeleted {
+		t.Errorf("status=%s, want DELETED", got.Status)
+	}
+	if got.StorageRef != "" {
+		t.Errorf("storage_ref=%q, want empty", got.StorageRef)
+	}
+}
+
+func TestGetFileStorageMetaForUpdateTx(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageS3, StorageRef: "/s3/f1",
+		ContentType: "text/plain", SizeBytes: 42, Revision: 3, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	meta, err := s.GetFileStorageMetaForUpdateTx(tx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.StorageType != StorageS3 {
+		t.Errorf("storage_type=%s, want s3", meta.StorageType)
+	}
+	if meta.StorageRef != "/s3/f1" {
+		t.Errorf("storage_ref=%q, want /s3/f1", meta.StorageRef)
+	}
+	if meta.Revision != 3 {
+		t.Errorf("revision=%d, want 3", meta.Revision)
+	}
+	if meta.SizeBytes != 42 {
+		t.Errorf("size=%d, want 42", meta.SizeBytes)
+	}
+	if meta.ContentType != "text/plain" {
+		t.Errorf("content_type=%q, want text/plain", meta.ContentType)
+	}
+}
+
+func TestGetFileStorageMetaForUpdateTxNotFound(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = s.GetFileStorageMetaForUpdateTx(tx, "missing")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestModeDefault(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// Insert without Mode set (defaults to 0).
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 42, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != 0o644 {
+		t.Errorf("mode=%o, want 0o644", got.Mode)
+	}
+}
+
+func TestModeRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 42, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now, Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != 0o755 {
+		t.Errorf("mode=%o, want 0o755", got.Mode)
 	}
 }

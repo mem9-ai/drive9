@@ -741,10 +741,18 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 	out.SetTimes(&mtime, &mtime, &mtime)
 
 	if entry.IsDir {
-		out.Mode = syscall.S_IFDIR | 0755
+		mode := entry.Mode
+		if mode == 0 {
+			mode = 0755
+		}
+		out.Mode = syscall.S_IFDIR | mode
 		out.Nlink = 2
 	} else {
-		out.Mode = syscall.S_IFREG | 0644
+		mode := entry.Mode
+		if mode == 0 {
+			mode = 0644
+		}
+		out.Mode = syscall.S_IFREG | mode
 		out.Nlink = 1
 	}
 }
@@ -1609,6 +1617,9 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if stat.Revision > 0 {
 		fs.inodes.UpdateRevision(ino, stat.Revision)
 	}
+	if stat.Mode != 0 {
+		fs.inodes.UpdateMode(ino, stat.Mode)
+	}
 	fs.dirCache.Upsert(parentPath, cachedInfoFromStat(name, stat))
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
@@ -1798,6 +1809,28 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	if mtime, ok := input.GetMTime(); ok {
 		entry.Mtime = mtime
 		fs.inodes.UpdateMtime(input.NodeId, mtime)
+	}
+
+	// Handle mode (chmod)
+	if input.Valid&gofuse.FATTR_MODE != 0 {
+		mode := input.Mode & 0777
+		// If the file has an open dirty handle, update mode locally without
+		// consulting the remote server. The mode will be synced on Flush.
+		hasDirtyHandle := false
+		fs.fileHandles.ForEach(func(_ uint64, h *FileHandle) {
+			if h.Ino == input.NodeId && h.Dirty != nil {
+				hasDirtyHandle = true
+			}
+		})
+		if !hasDirtyHandle {
+			ctx, cf := fuseCtx(cancel)
+			defer cf()
+			if err := fs.client.ChmodCtx(ctx, fs.remotePath(entry.Path), mode); err != nil {
+				return httpToFuseStatus(err)
+			}
+		}
+		entry.Mode = mode
+		fs.inodes.UpdateMode(input.NodeId, mode)
 	}
 
 	// Handle truncate
