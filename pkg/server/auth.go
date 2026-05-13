@@ -23,18 +23,89 @@ type scopeKey int
 const tenantScopeKey scopeKey = iota
 
 type TenantScope struct {
-	TenantID     string
-	APIKeyID     string
-	TokenVersion int
-	Provider     string
-	Backend      *backend.Dat9Backend
+	TenantID           string
+	APIKeyID           string
+	TokenVersion       int
+	Provider           string
+	Backend            *backend.Dat9Backend
+	JournalPermissions map[string]bool
 }
+
+const (
+	JournalPermissionCreate        = "journal:create"
+	JournalPermissionAppend        = "journal:append"
+	JournalPermissionRead          = "journal:read"
+	JournalPermissionFind          = "journal:find"
+	JournalPermissionVerify        = "journal:verify"
+	JournalPermissionSeal          = "journal:seal"
+	JournalPermissionArtifactWrite = "journal:artifact:write"
+	JournalPermissionAdmin         = "journal:admin"
+	JournalPermissionSourceGateway = "journal:source:gateway_observed"
+	JournalPermissionSourceServer  = "journal:source:server_observed"
+	JournalPermissionSourceImport  = "journal:source:imported"
+)
 
 const statusClientClosedRequest = 499
 
 func ScopeFromContext(ctx context.Context) *TenantScope {
 	s, _ := ctx.Value(tenantScopeKey).(*TenantScope)
 	return s
+}
+
+func (s *TenantScope) HasJournalPermission(permission string) bool {
+	return s != nil && (s.JournalPermissions[permission] || s.JournalPermissions[JournalPermissionAdmin])
+}
+
+func ownerJournalPermissions() map[string]bool {
+	perms := make(map[string]bool, len(ownerJournalPermissionList()))
+	for _, permission := range ownerJournalPermissionList() {
+		perms[permission] = true
+	}
+	return perms
+}
+
+func ownerJournalPermissionList() []string {
+	return []string{
+		JournalPermissionCreate,
+		JournalPermissionAppend,
+		JournalPermissionRead,
+		JournalPermissionFind,
+		JournalPermissionVerify,
+		JournalPermissionSeal,
+		JournalPermissionArtifactWrite,
+		JournalPermissionAdmin,
+		JournalPermissionSourceGateway,
+		JournalPermissionSourceServer,
+		JournalPermissionSourceImport,
+	}
+}
+
+func journalPermissionsFromClaims(claims *token.Claims) map[string]bool {
+	if claims == nil || len(claims.JournalPermissions) == 0 {
+		return ownerJournalPermissions()
+	}
+	perms := make(map[string]bool, len(claims.JournalPermissions))
+	for _, permission := range claims.JournalPermissions {
+		permission = strings.TrimSpace(permission)
+		if permission == "" {
+			continue
+		}
+		perms[permission] = true
+	}
+	return perms
+}
+
+func journalSourcePermission(source string) string {
+	switch source {
+	case "gateway_observed":
+		return JournalPermissionSourceGateway
+	case "server_observed":
+		return JournalPermissionSourceServer
+	case "imported":
+		return JournalPermissionSourceImport
+	default:
+		return ""
+	}
 }
 
 func withScope(ctx context.Context, scope *TenantScope) context.Context {
@@ -198,7 +269,14 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			zap.Float64("total_ms", authPhaseMs(authStart)),
 		)
 
-		scope := &TenantScope{TenantID: resolved.Tenant.ID, APIKeyID: resolved.APIKey.ID, TokenVersion: resolved.APIKey.TokenVersion, Provider: resolved.Tenant.Provider, Backend: b}
+		scope := &TenantScope{
+			TenantID:           resolved.Tenant.ID,
+			APIKeyID:           resolved.APIKey.ID,
+			TokenVersion:       resolved.APIKey.TokenVersion,
+			Provider:           resolved.Tenant.Provider,
+			Backend:            b,
+			JournalPermissions: journalPermissionsFromClaims(claims),
+		}
 		next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 	})
 }

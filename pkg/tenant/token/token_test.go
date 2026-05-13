@@ -53,6 +53,27 @@ func TestIssueTokenWithExpiryAddsExpClaim(t *testing.T) {
 	}
 }
 
+func TestIssueTokenWithJournalPermissionsRoundTrip(t *testing.T) {
+	secret := testTokenSecret(t)
+	perms := []string{"journal:append", "journal:find"}
+	tok, err := IssueTokenWithJournalPermissions(secret, "tenant-1", 1, time.Time{}, perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := ParseAndVerifyToken(secret, tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims.JournalPermissions) != len(perms) {
+		t.Fatalf("journal permissions = %#v, want %#v", claims.JournalPermissions, perms)
+	}
+	for i := range perms {
+		if claims.JournalPermissions[i] != perms[i] {
+			t.Fatalf("journal_permissions[%d] = %q, want %q", i, claims.JournalPermissions[i], perms[i])
+		}
+	}
+}
+
 func TestParseAndVerifyTokenRejectsExpiredExpClaim(t *testing.T) {
 	secret := testTokenSecret(t)
 	tok, err := IssueTokenWithExpiry(secret, "tenant-1", 1, time.Now().Add(2*time.Second))

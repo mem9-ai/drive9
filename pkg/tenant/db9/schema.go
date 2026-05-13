@@ -150,6 +150,7 @@ func InitSchemaStatements() []string {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_llm_usage_created ON llm_usage(created_at)`,
 	}
+	core = append(core, schema.JournalDB9SchemaStatements()...)
 	// Vault tables are TiDB/MySQL-only and are not created via the db9
 	// PostgreSQL schema init path. They are initialized through the TiDB
 	// tenant schema init (see pkg/tenant/schema/vault.go).

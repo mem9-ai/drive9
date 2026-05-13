@@ -53,21 +53,22 @@ type Config struct {
 }
 
 type Server struct {
-	fallback          *backend.Dat9Backend
-	meta              *meta.Store
-	pool              *tenant.Pool
-	provisioner       tenant.Provisioner
-	tokenSecret       []byte
-	localTenantAPIKey string
-	vaultMK           *vault.MasterKey
-	vaultIssuerURL    string
-	maxUploadBytes    int64
-	inlineThreshold   int64
-	metrics           *serverMetrics
-	logger            *zap.Logger
-	mux               *http.ServeMux
-	events            *eventBuses
-	semanticWorker    *semanticWorkerManager
+	fallback            *backend.Dat9Backend
+	meta                *meta.Store
+	pool                *tenant.Pool
+	provisioner         tenant.Provisioner
+	tokenSecret         []byte
+	localTenantAPIKey   string
+	vaultMK             *vault.MasterKey
+	vaultIssuerURL      string
+	maxUploadBytes      int64
+	inlineThreshold     int64
+	metrics             *serverMetrics
+	logger              *zap.Logger
+	mux                 *http.ServeMux
+	events              *eventBuses
+	semanticWorker      *semanticWorkerManager
+	journalCursorSecret []byte
 }
 
 var (
@@ -134,19 +135,20 @@ func NewWithConfig(cfg Config) *Server {
 		inlineThreshold = backend.DefaultInlineThreshold
 	}
 	s := &Server{
-		fallback:          cfg.Backend,
-		meta:              cfg.Meta,
-		pool:              cfg.Pool,
-		tokenSecret:       cfg.TokenSecret,
-		localTenantAPIKey: strings.TrimSpace(cfg.LocalTenantAPIKey),
-		vaultMK:           vaultMK,
-		vaultIssuerURL:    strings.TrimSpace(cfg.VaultIssuerURL),
-		provisioner:       cfg.Provisioner,
-		maxUploadBytes:    maxUpload,
-		inlineThreshold:   inlineThreshold,
-		metrics:           newServerMetrics(),
-		logger:            logger,
-		events:            newEventBuses(),
+		fallback:            cfg.Backend,
+		meta:                cfg.Meta,
+		pool:                cfg.Pool,
+		tokenSecret:         cfg.TokenSecret,
+		localTenantAPIKey:   strings.TrimSpace(cfg.LocalTenantAPIKey),
+		vaultMK:             vaultMK,
+		vaultIssuerURL:      strings.TrimSpace(cfg.VaultIssuerURL),
+		provisioner:         cfg.Provisioner,
+		maxUploadBytes:      maxUpload,
+		inlineThreshold:     inlineThreshold,
+		metrics:             newServerMetrics(),
+		logger:              logger,
+		events:              newEventBuses(),
+		journalCursorSecret: newJournalCursorSecret(cfg.TokenSecret),
 	}
 	mux := http.NewServeMux()
 
@@ -164,6 +166,9 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v2/uploads/", business)
 	mux.Handle("/v1/sql", business)
 	mux.Handle("/v1/events", business)
+	mux.Handle("/v1/journals", business)
+	mux.Handle("/v1/journals/", business)
+	mux.Handle("/v1/journal-entries", business)
 	// Vault management API goes through tenant auth.
 	mux.Handle("/v1/vault/secrets", business)
 	mux.Handle("/v1/vault/secrets/", business)
@@ -309,7 +314,13 @@ func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled 
 
 func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		scope := &TenantScope{TenantID: "local", APIKeyID: "local", TokenVersion: 1, Backend: b}
+		scope := &TenantScope{
+			TenantID:           "local",
+			APIKeyID:           "local",
+			TokenVersion:       1,
+			Backend:            b,
+			JournalPermissions: ownerJournalPermissions(),
+		}
 		next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 	})
 }
@@ -343,6 +354,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleSQL(w, r)
 	case r.URL.Path == "/v1/events":
 		s.handleEvents(w, r)
+	case r.URL.Path == "/v1/journals" || strings.HasPrefix(r.URL.Path, "/v1/journals/") || r.URL.Path == "/v1/journal-entries":
+		s.handleJournal(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/grants"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
 		s.handleVault(w, r)
 	default:
@@ -2277,7 +2290,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_requested", "tenant_id", tenantID, "provider", provider)...)
 	keyName := "default"
 
-	apiToken, err := token.IssueToken(s.tokenSecret, tenantID, 1)
+	apiToken, err := token.IssueTokenWithJournalPermissions(s.tokenSecret, tenantID, 1, time.Time{}, ownerJournalPermissionList())
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_issue_token_failed", "tenant_id", tenantID, "error", err)...)
 		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
