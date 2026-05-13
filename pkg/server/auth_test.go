@@ -452,7 +452,7 @@ func TestTenantStatusReturnsProvisioningState(t *testing.T) {
 	}
 }
 
-func TestTenantStatusReturnsForkProvisioningMessage(t *testing.T) {
+func TestTenantStatusForkProvisioningWithoutReadyBranchOmitsMessage(t *testing.T) {
 	rt, cleanup := newAuthRuntime(t)
 	defer cleanup()
 	srv := NewWithConfig(Config{Meta: rt.meta, Pool: rt.pool, TokenSecret: rt.tokenSecret})
@@ -480,7 +480,42 @@ func TestTenantStatusReturnsForkProvisioningMessage(t *testing.T) {
 	if out.Status != string(meta.TenantProvisioning) {
 		t.Fatalf("status = %q, want provisioning", out.Status)
 	}
-	if !strings.Contains(out.Message, "Creating the database branch") {
+	if out.Message != "" {
+		t.Fatalf("message = %q, want empty", out.Message)
+	}
+}
+
+func TestTenantStatusForkProvisioningBranchShowsMigrationMessage(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+	srv := NewWithConfig(Config{Meta: rt.meta, Pool: rt.pool, TokenSecret: rt.tokenSecret})
+	if _, err := srv.meta.DB().Exec(`UPDATE tenants
+		SET status = ?, kind = ?, parent_tenant_id = ?, branch_id = ?, db_host = ?, db_port = ?, db_user = ?
+		WHERE id = ?`,
+		string(meta.TenantProvisioning), string(meta.TenantKindFork), "source", "branch-a", "", 0, "", rt.tenantID); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)
+	req.Header.Set("Authorization", "Bearer "+rt.token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	var out TenantStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != string(meta.TenantProvisioning) {
+		t.Fatalf("status = %q, want provisioning", out.Status)
+	}
+	if !strings.Contains(out.Message, "Migrating fork data") {
 		t.Fatalf("message = %q", out.Message)
 	}
 }

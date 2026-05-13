@@ -110,6 +110,9 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
+	if out["tenant_id"] == "" {
+		t.Fatalf("unexpected provision response: %+v", out)
+	}
 	apiKey := out["api_key"]
 	if apiKey == "" {
 		t.Fatal("empty api_key")
@@ -211,7 +214,7 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if out["api_key"] == "" {
+	if out["tenant_id"] == "" || out["api_key"] == "" {
 		t.Fatalf("unexpected provision response: %+v", out)
 	}
 	claims, err := token.ParseAndVerifyToken(tokenSecret, out["api_key"])

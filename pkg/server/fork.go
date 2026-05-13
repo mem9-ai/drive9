@@ -136,12 +136,9 @@ func forkErr(code int, msg string) error {
 
 func forkProvisioningMessage(t *meta.Tenant) string {
 	if t == nil || t.BranchID == "" {
-		return "Creating the database branch. This usually takes 30 seconds to a few minutes."
+		return ""
 	}
-	if t.DBHost == "" || t.DBPort == 0 || t.DBUser == "" {
-		return "Waiting for the database branch to become ready. This usually takes 30 seconds to a few minutes."
-	}
-	return "Preparing fork metadata and quota counters. Large tenants may take a few minutes."
+	return "Migrating fork data. Large tenants may take a few minutes."
 }
 
 type forkFatalProvisionError struct {

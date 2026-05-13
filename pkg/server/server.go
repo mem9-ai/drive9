@@ -2525,8 +2525,9 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"api_key": apiToken,
-		"status":  string(meta.TenantProvisioning),
+		"tenant_id": tenantID,
+		"api_key":   apiToken,
+		"status":    string(meta.TenantProvisioning),
 	})
 }
 
@@ -2539,8 +2540,9 @@ func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"api_key": s.localTenantAPIKey,
-		"status":  "provisioning",
+		"tenant_id": "local",
+		"api_key":   s.localTenantAPIKey,
+		"status":    "provisioning",
 	})
 }
 

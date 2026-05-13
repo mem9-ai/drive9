@@ -151,13 +151,15 @@ use the same value as `DRIVE9_API_KEY` here.
 
 1. Provision + readiness polling
 2. Prepare `drive9` CLI binary (build local or download official release)
-3. CLI small-file flow (`cp`, `ls`, `cat`, `mv`, `rm`)
-4. CLI batch small-file flow (`cp` many files + dir list count + stat + sample reads)
-5. CLI search flow (`fs grep`, `fs find`)
-6. CLI semantic and image-associated recall flow (`fs grep` paraphrase + image caption recall) with async polling
-7. CLI image flow (`fs cp` jpg + `fs find -name "*.jpg"`)
-8. CLI large-file flow (`cp` upload multipart + `cp` download + checksum verification)
-9. CLI upload-limit boundary (`10GiB` initiate accepted, `10GiB+1` rejected)
+3. CLI fork flow (`ctx add`, `ctx fork`, fork readiness polling, fork-context file read/write, fork delete)
+4. CLI small-file flow (`cp`, `ls`, `cat`, `mv`, `rm`)
+5. CLI `cp` directory-target semantics (local->remote dir, remote->local dir, remote->remote dir all preserve source basename)
+6. CLI batch small-file flow (`cp` many files + dir list count + stat + sample reads)
+7. CLI search flow (`fs grep`, `fs find`)
+8. CLI semantic and image-associated recall flow (`fs grep` paraphrase + image caption recall) with async polling
+9. CLI image flow (`fs cp` jpg + `fs find -name "*.jpg"`)
+10. CLI large-file flow (`cp` upload multipart + `cp` download + checksum verification)
+11. CLI upload-limit boundary (`10GiB` initiate accepted, `10GiB+1` rejected)
 
 ### `journal-smoke-test.sh`
 
@@ -238,6 +240,7 @@ Notes:
 | `RUN_CLI_UPLOAD_LIMIT_BOUNDARY` | `1` | `cli-smoke-test.sh` |
 | `CLI_UPLOAD_LIMIT_BYTES` | `10737418240` | `cli-smoke-test.sh` |
 | `RUN_CLI_SEMANTIC_CHECKS` | `1` | `cli-smoke-test.sh` |
+| `RUN_CLI_FORK_CHECKS` | `1` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_TIMEOUT_S` | `90` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_INTERVAL_S` | `3` | `cli-smoke-test.sh` |
 | `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh` |

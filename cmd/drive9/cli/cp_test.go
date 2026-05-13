@@ -460,6 +460,108 @@ func TestCpUploadWithTagsSendsHeaders(t *testing.T) {
 	}
 }
 
+func TestCpUploadToRemoteDirectoryKeepsSourceName(t *testing.T) {
+	localPath := filepath.Join(t.TempDir(), "upload.txt")
+	if err := os.WriteFile(localPath, []byte("hello dir"), 0o644); err != nil {
+		t.Fatalf("WriteFile(local): %v", err)
+	}
+
+	var gotPath string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "HEAD /v1/fs/dir":
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.WriteHeader(http.StatusOK)
+		case "PUT /v1/fs/dir/upload.txt":
+			gotPath = r.URL.Path
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			gotBody = append([]byte(nil), body...)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
+	if err := Cp(c, []string{localPath, ":/dir"}); err != nil {
+		t.Fatalf("Cp(upload to dir): %v", err)
+	}
+	if gotPath != "/v1/fs/dir/upload.txt" {
+		t.Fatalf("PUT path = %q, want %q", gotPath, "/v1/fs/dir/upload.txt")
+	}
+	if got := string(gotBody); got != "hello dir" {
+		t.Fatalf("uploaded body = %q, want %q", got, "hello dir")
+	}
+}
+
+func TestCpDownloadToLocalDirectoryKeepsSourceName(t *testing.T) {
+	dstDir := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "HEAD /v1/fs/src.txt":
+			w.Header().Set("Content-Length", "11")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.WriteHeader(http.StatusOK)
+		case "GET /v1/fs/src.txt":
+			_, _ = io.WriteString(w, "hello local")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
+	if err := Cp(c, []string{":/src.txt", dstDir}); err != nil {
+		t.Fatalf("Cp(download to dir): %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dstDir, "src.txt"))
+	if err != nil {
+		t.Fatalf("ReadFile(downloaded): %v", err)
+	}
+	if string(got) != "hello local" {
+		t.Fatalf("downloaded body = %q, want %q", string(got), "hello local")
+	}
+}
+
+func TestCpRemoteToRemoteDirectoryKeepsSourceName(t *testing.T) {
+	var gotPath string
+	var gotSource string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "HEAD /v1/fs/dstdir":
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.WriteHeader(http.StatusOK)
+		case "POST /v1/fs/dstdir/src.txt":
+			if !r.URL.Query().Has("copy") {
+				t.Fatalf("expected ?copy on %s", r.URL.String())
+			}
+			gotPath = r.URL.Path
+			gotSource = r.Header.Get("X-Dat9-Copy-Source")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
+	if err := Cp(c, []string{":/src.txt", ":/dstdir"}); err != nil {
+		t.Fatalf("Cp(remote to remote dir): %v", err)
+	}
+	if gotPath != "/v1/fs/dstdir/src.txt" || gotSource != "/src.txt" {
+		t.Fatalf("copy request path=%q source=%q, want path=%q source=%q", gotPath, gotSource, "/v1/fs/dstdir/src.txt", "/src.txt")
+	}
+}
+
 func TestCpRejectsTagForDownloadDirection(t *testing.T) {
 	localPath := filepath.Join(t.TempDir(), "out.txt")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

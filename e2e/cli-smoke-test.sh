@@ -20,6 +20,7 @@ CLI_UPLOAD_LIMIT_BYTES="${CLI_UPLOAD_LIMIT_BYTES:-10737418240}"
 CLI_SEMANTIC_TIMEOUT_S="${CLI_SEMANTIC_TIMEOUT_S:-90}"
 CLI_SEMANTIC_INTERVAL_S="${CLI_SEMANTIC_INTERVAL_S:-3}"
 RUN_CLI_SEMANTIC_CHECKS="${RUN_CLI_SEMANTIC_CHECKS:-1}"
+RUN_CLI_FORK_CHECKS="${RUN_CLI_FORK_CHECKS:-1}"
 
 PASS=0
 FAIL=0
@@ -162,6 +163,10 @@ drive9() {
   DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
 }
 
+drive9_ctx() {
+  env -u DRIVE9_SERVER -u DRIVE9_API_KEY -u DRIVE9_VAULT_TOKEN HOME="$CLI_CTX_HOME" "$CLI_BIN" "$@"
+}
+
 drive9_retry() {
   local attempt=1
   local out rc
@@ -176,6 +181,29 @@ drive9_retry() {
     fi
     if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* ]]; then
       echo "retry $attempt/$CLI_MAX_RETRIES for drive9 $* (throttled)" >&2
+      attempt=$((attempt + 1))
+      sleep "$CLI_RETRY_SLEEP_S"
+      continue
+    fi
+    printf '%s\n' "$out" >&2
+    return "$rc"
+  done
+}
+
+drive9_ctx_retry() {
+  local attempt=1
+  local out rc
+  while :; do
+    set +e
+    out=$(drive9_ctx "$@" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      printf '%s' "$out"
+      return 0
+    fi
+    if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"not found"* ]]; then
+      echo "retry $attempt/$CLI_MAX_RETRIES for drive9(ctx) $* " >&2
       attempt=$((attempt + 1))
       sleep "$CLI_RETRY_SLEEP_S"
       continue
@@ -244,9 +272,13 @@ PY
 }
 
 TS="$(date +%s)"
+CLI_CTX_HOME="$(mktemp -d)"
 SMALL_LOCAL="/tmp/drive9-cli-small-${TS}.txt"
 SMALL_REMOTE="/cli-${TS}-small.txt"
 SMALL_RENAMED="/cli-${TS}-small-renamed.txt"
+CP_DIR_REMOTE="/cli-${TS}-cpdir"
+CP_DIR_REMOTE_COPY="/cli-${TS}-cpdir-copy"
+CP_DIR_LOCAL="/tmp/drive9-cli-cpdir-${TS}"
 TAG_LOCAL="/tmp/drive9-cli-tag-${TS}.txt"
 TAG_REMOTE="/cli-${TS}-tagged.txt"
 IMAGE_LOCAL="/tmp/drive9-cli-image-${TS}.jpg"
@@ -261,6 +293,57 @@ LARGE_REMOTE="/cli-${TS}-large-${CLI_LARGE_FILE_MB}m.bin"
 LARGE_DOWNLOADED="/tmp/drive9-cli-large-${TS}.download.bin"
 LARGE_BYTES=$((CLI_LARGE_FILE_MB * 1024 * 1024))
 CLI_IMAGE_UPLOADED=0
+FORK_CTX_NAME="fork-${TS}"
+FORK_REMOTE="/cli-${TS}-fork-smoke.txt"
+FORK_LOCAL="/tmp/drive9-cli-fork-${TS}.txt"
+
+echo "[3.1] ctx fork smoke"
+if [ "$RUN_CLI_FORK_CHECKS" = "1" ]; then
+  drive9_ctx ctx add --name owner --server "$BASE" --api-key "$API_KEY" >/dev/null
+  fork_json="$(drive9_ctx ctx fork "$FORK_CTX_NAME" --from owner --json)"
+  fork_api_key="$(jq -r '.api_key // empty' <<<"$fork_json")"
+  fork_tenant_id="$(jq -r '.tenant_id // empty' <<<"$fork_json")"
+  fork_status="$(jq -r '.status // empty' <<<"$fork_json")"
+  check_cmd "ctx fork returns api_key" test -n "$fork_api_key"
+  check_cmd "ctx fork returns tenant_id" test -n "$fork_tenant_id"
+  check_eq "ctx fork initial status is provisioning" "$fork_status" "provisioning"
+
+  fork_deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))
+  fork_state=""
+  while :; do
+    fork_status_file="$(mktemp)"
+    fork_status_code=$(curl -sS -o "$fork_status_file" -w "%{http_code}" -H "Authorization: Bearer $fork_api_key" "$BASE/v1/status")
+    fork_state=$(jq -r '.status // empty' "$fork_status_file")
+    rm -f "$fork_status_file"
+    echo "fork-status=${fork_status_code}:${fork_state}"
+    if [ "$fork_status_code" = "200" ] && [ "$fork_state" = "active" ]; then
+      break
+    fi
+    if [ "$(date +%s)" -ge "$fork_deadline" ]; then
+      break
+    fi
+    sleep "$POLL_INTERVAL_S"
+  done
+  check_eq "fork tenant becomes active" "$fork_state" "active"
+
+  printf "fork-smoke-%s" "$TS" > "$FORK_LOCAL"
+  drive9_ctx ctx use "$FORK_CTX_NAME" >/dev/null
+  drive9_ctx_retry fs cp "$FORK_LOCAL" ":$FORK_REMOTE" >/dev/null
+  fork_cat="$(drive9_ctx_retry fs cat "$FORK_REMOTE")"
+  check_eq "fork context can read written file" "$fork_cat" "fork-smoke-${TS}"
+
+  fork_delete_body="$(mktemp)"
+  fork_delete_code=$(curl -sS -o "$fork_delete_body" -w "%{http_code}" -X DELETE -H "Authorization: Bearer $fork_api_key" "$BASE/v1/fork")
+  check_eq "DELETE /v1/fork returns 202" "$fork_delete_code" "202"
+  rm -f "$fork_delete_body"
+else
+  skip_check "ctx fork returns api_key"
+  skip_check "ctx fork returns tenant_id"
+  skip_check "ctx fork initial status is provisioning"
+  skip_check "fork tenant becomes active"
+  skip_check "fork context can read written file"
+  skip_check "DELETE /v1/fork returns 202"
+fi
 
 echo "[4] small file ops via cli"
 printf "cli-smoke-%s" "$TS" > "$SMALL_LOCAL"
@@ -278,6 +361,27 @@ check_eq "uploaded small file appears in ls /" "$small_present" "true"
 
 cat_out="$(drive9_retry_read fs cat "$SMALL_REMOTE")"
 check_eq "cat returns expected small file content" "$cat_out" "cli-smoke-${TS}"
+
+echo "[4.0] cp directory target semantics"
+mkdir -p "$CP_DIR_LOCAL"
+drive9_retry fs mkdir "$CP_DIR_REMOTE" >/dev/null
+drive9_retry fs mkdir "$CP_DIR_REMOTE_COPY" >/dev/null
+
+cp_dir_base="$(basename "$SMALL_LOCAL")"
+cp_dir_remote_path="$CP_DIR_REMOTE/$cp_dir_base"
+cp_dir_remote_copy_path="$CP_DIR_REMOTE_COPY/$cp_dir_base"
+
+drive9_retry fs cp "$SMALL_LOCAL" ":$CP_DIR_REMOTE" >/dev/null
+cp_dir_remote_body="$(drive9_retry_read fs cat "$cp_dir_remote_path")"
+check_eq "cp local->remote dir keeps source name" "$cp_dir_remote_body" "cli-smoke-${TS}"
+
+drive9_retry fs cp ":$cp_dir_remote_path" "$CP_DIR_LOCAL" >/dev/null
+cp_dir_local_body="$(cat "$CP_DIR_LOCAL/$cp_dir_base")"
+check_eq "cp remote->local dir keeps source name" "$cp_dir_local_body" "cli-smoke-${TS}"
+
+drive9_retry fs cp ":$cp_dir_remote_path" ":$CP_DIR_REMOTE_COPY" >/dev/null
+cp_dir_remote_copy_body="$(drive9_retry_read fs cat "$cp_dir_remote_copy_path")"
+check_eq "cp remote->remote dir keeps source name" "$cp_dir_remote_copy_body" "cli-smoke-${TS}"
 
 drive9_retry fs mv "$SMALL_REMOTE" "$SMALL_RENAMED" >/dev/null
 renamed_out="$(drive9_retry fs ls /)"
@@ -446,6 +550,10 @@ if [ "$CLI_IMAGE_UPLOADED" = "1" ]; then
   drive9_retry fs rm "$IMAGE_REMOTE" >/dev/null
 fi
 drive9_retry fs rm "$LARGE_REMOTE" >/dev/null
+drive9_retry fs rm "$cp_dir_remote_path" >/dev/null
+drive9_retry fs rm "$cp_dir_remote_copy_path" >/dev/null
+drive9_retry fs rm -r "$CP_DIR_REMOTE" >/dev/null
+drive9_retry fs rm -r "$CP_DIR_REMOTE_COPY" >/dev/null
 for i in $(seq 1 "$CLI_BATCH_SMALL_FILE_COUNT"); do
   drive9_retry fs rm "$BATCH_REMOTE_DIR/file-${i}.txt" >/dev/null
 done
@@ -585,8 +693,9 @@ fi
 
 rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$IMAGE_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
 rm -f "$TAG_LOCAL"
+rm -f "$FORK_LOCAL"
 rm -f "/tmp/drive9-cli-sem-target-${TS}.txt" "/tmp/drive9-cli-sem-other-${TS}.txt" "/tmp/drive9-cli-image-caption-${TS}.txt"
-rm -rf "$BATCH_LOCAL_DIR"
+rm -rf "$BATCH_LOCAL_DIR" "$CP_DIR_LOCAL" "$CLI_CTX_HOME"
 
 echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"
 exit "$FAIL"
