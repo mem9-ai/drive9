@@ -182,7 +182,7 @@ func resolveRemoteCopyTarget(ctx context.Context, c *client.Client, remotePath, 
 		}
 		return pathpkg.Join(remotePath, sourceBase), nil
 	}
-	info, err := c.Stat(remotePath)
+	info, err := c.StatCtx(ctx, remotePath)
 	if err == nil && info.IsDir {
 		if sourceBase == "" {
 			return "", fmt.Errorf("destination %q requires a file name", remotePath)
@@ -196,7 +196,7 @@ func resolveRemoteCopyTarget(ctx context.Context, c *client.Client, remotePath, 
 }
 
 func resolveLocalCopyTarget(localPath, sourceBase string) (string, error) {
-	if strings.HasSuffix(localPath, string(os.PathSeparator)) {
+	if strings.HasSuffix(localPath, string(os.PathSeparator)) || strings.HasSuffix(localPath, "/") {
 		if sourceBase == "" {
 			return "", fmt.Errorf("destination %q requires a file name", localPath)
 		}

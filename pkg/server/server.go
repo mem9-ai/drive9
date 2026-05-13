@@ -2523,6 +2523,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_accepted", "tenant_id", tenantID, "provider", provider)...)
 	metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "accepted")
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"tenant_id": tenantID,

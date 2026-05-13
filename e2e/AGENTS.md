@@ -240,7 +240,7 @@ Notes:
 | `RUN_CLI_UPLOAD_LIMIT_BOUNDARY` | `1` | `cli-smoke-test.sh` |
 | `CLI_UPLOAD_LIMIT_BYTES` | `10737418240` | `cli-smoke-test.sh` |
 | `RUN_CLI_SEMANTIC_CHECKS` | `1` | `cli-smoke-test.sh` |
-| `RUN_CLI_FORK_CHECKS` | `1` | `cli-smoke-test.sh` |
+| `RUN_CLI_FORK_CHECKS` | `1` (auto-skip when `/v1/fork` is unavailable) | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_TIMEOUT_S` | `90` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_INTERVAL_S` | `3` | `cli-smoke-test.sh` |
 | `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh` |

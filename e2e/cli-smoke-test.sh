@@ -213,6 +213,24 @@ drive9_ctx_retry() {
   done
 }
 
+fork_checks_enabled() {
+  if [ "$RUN_CLI_FORK_CHECKS" != "1" ]; then
+    return 1
+  fi
+  local probe_code
+  probe_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+    -X POST \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "Content-Type: application/json" \
+    --data '{' \
+    "$BASE/v1/fork" || true)
+  if [ "$probe_code" = "404" ]; then
+    echo "fork checks skipped: server does not expose /v1/fork" >&2
+    return 1
+  fi
+  return 0
+}
+
 # Some read-after-write paths can be eventually consistent right after upload.
 drive9_retry_read() {
   local attempt=1
@@ -298,7 +316,7 @@ FORK_REMOTE="/cli-${TS}-fork-smoke.txt"
 FORK_LOCAL="/tmp/drive9-cli-fork-${TS}.txt"
 
 echo "[3.1] ctx fork smoke"
-if [ "$RUN_CLI_FORK_CHECKS" = "1" ]; then
+if fork_checks_enabled; then
   drive9_ctx ctx add --name owner --server "$BASE" --api-key "$API_KEY" >/dev/null
   fork_json="$(drive9_ctx ctx fork "$FORK_CTX_NAME" --from owner --json)"
   fork_api_key="$(jq -r '.api_key // empty' <<<"$fork_json")"

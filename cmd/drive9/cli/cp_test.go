@@ -531,6 +531,17 @@ func TestCpDownloadToLocalDirectoryKeepsSourceName(t *testing.T) {
 	}
 }
 
+func TestResolveLocalCopyTargetTreatsSlashSuffixAsDirectoryHint(t *testing.T) {
+	got, err := resolveLocalCopyTarget("C:/tmp/dir/", "file.txt")
+	if err != nil {
+		t.Fatalf("resolveLocalCopyTarget: %v", err)
+	}
+	want := filepath.Join("C:/tmp/dir/", "file.txt")
+	if got != want {
+		t.Fatalf("resolved path = %q, want %q", got, want)
+	}
+}
+
 func TestCpRemoteToRemoteDirectoryKeepsSourceName(t *testing.T) {
 	var gotPath string
 	var gotSource string
