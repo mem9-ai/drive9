@@ -32,6 +32,12 @@ type BranchProvisioner interface {
 	DeleteBranch(ctx context.Context, clusterID, branchID string) error
 }
 
+type AsyncBranchProvisioner interface {
+	BranchProvisioner
+	CreateBranch(ctx context.Context, forkTenantID string, source *ClusterInfo) (*ClusterInfo, error)
+	WaitForBranchActive(ctx context.Context, branch *ClusterInfo) (*ClusterInfo, error)
+}
+
 func RequireProvisioner(provider string, provisioners map[string]Provisioner) (Provisioner, error) {
 	p, ok := provisioners[provider]
 	if !ok || p == nil {

@@ -451,3 +451,35 @@ func TestTenantStatusReturnsProvisioningState(t *testing.T) {
 		t.Fatalf("expected provisioning status, got %+v", out)
 	}
 }
+
+func TestTenantStatusReturnsForkProvisioningMessage(t *testing.T) {
+	srv, tok, cleanup := newAuthServer(t)
+	defer cleanup()
+	if _, err := srv.meta.DB().Exec("UPDATE tenants SET status = ?, kind = ?, parent_tenant_id = ?, branch_id = ?",
+		string(meta.TenantProvisioning), string(meta.TenantKindFork), "source", ""); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	var out TenantStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != string(meta.TenantProvisioning) {
+		t.Fatalf("status = %q, want provisioning", out.Status)
+	}
+	if !strings.Contains(out.Message, "Creating the database branch") {
+		t.Fatalf("message = %q", out.Message)
+	}
+}

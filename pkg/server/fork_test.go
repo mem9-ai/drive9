@@ -30,12 +30,35 @@ func (f *fakeBranchProvisioner) Provision(context.Context, string) (*tenant.Clus
 }
 
 func (f *fakeBranchProvisioner) ProvisionBranch(_ context.Context, forkTenantID string, _ *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+	return f.CreateBranch(context.Background(), forkTenantID, nil)
+}
+
+func (f *fakeBranchProvisioner) CreateBranch(_ context.Context, forkTenantID string, _ *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
 	if f.cluster == nil {
 		return nil, errors.New("missing cluster")
 	}
 	out := *f.cluster
 	out.TenantID = forkTenantID
-	return &out, f.provisionErr
+	out.Host = ""
+	out.Port = 0
+	out.Username = ""
+	return &out, nil
+}
+
+func (f *fakeBranchProvisioner) WaitForBranchActive(_ context.Context, branch *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+	if f.provisionErr != nil {
+		return branch, f.provisionErr
+	}
+	if f.cluster == nil {
+		return nil, errors.New("missing cluster")
+	}
+	out := *f.cluster
+	out.TenantID = branch.TenantID
+	out.Password = branch.Password
+	if out.DBName == "" {
+		out.DBName = branch.DBName
+	}
+	return &out, nil
 }
 
 func (f *fakeBranchProvisioner) DeleteBranch(_ context.Context, clusterID, branchID string) error {
@@ -163,18 +186,35 @@ func waitForCondition(t *testing.T, fn func() bool) {
 }
 
 func TestCreateForkPartialBranchProvisionErrorPersistsBranchAndKeepsRoot(t *testing.T) {
+	origWindow, origInitialBackoff, origMaxBackoff := forkProvisionRetryWindow, forkProvisionInitialBackoff, forkProvisionMaxBackoff
+	forkProvisionRetryWindow = 50 * time.Millisecond
+	forkProvisionInitialBackoff = 5 * time.Millisecond
+	forkProvisionMaxBackoff = 5 * time.Millisecond
+	t.Cleanup(func() {
+		forkProvisionRetryWindow = origWindow
+		forkProvisionInitialBackoff = origInitialBackoff
+		forkProvisionMaxBackoff = origMaxBackoff
+	})
+
 	rt := newForkCleanupTestRuntime(t)
 	rt.insertLiveTenant(t, "source")
 	rt.prov.cluster = &tenant.ClusterInfo{ClusterID: "cluster-a", BranchID: "branch-created"}
 	rt.prov.provisionErr = errors.New("starter branch not active before timeout")
 	rt.prov.deleteErr = errors.New("delete branch failed")
 
-	_, err := rt.server.createForkTenant(context.Background(), "source", "fork")
-	if err == nil {
-		t.Fatal("expected createForkTenant error")
+	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork")
+	if err != nil {
+		t.Fatalf("createForkTenant: %v", err)
+	}
+	if resp.Status != string(meta.TenantProvisioning) || resp.APIKey == "" {
+		t.Fatalf("unexpected fork response: %+v", resp)
 	}
 	waitForCondition(t, func() bool {
-		return len(rt.prov.deletedBranches()) == 1
+		return len(rt.prov.deletedBranches()) >= 1
+	})
+	waitForCondition(t, func() bool {
+		failed, err := rt.meta.ListTenantsByStatus(context.Background(), meta.TenantFailed, 10)
+		return err == nil && len(failed) == 1
 	})
 
 	failed, err := rt.meta.ListTenantsByStatus(context.Background(), meta.TenantFailed, 10)
@@ -187,7 +227,7 @@ func TestCreateForkPartialBranchProvisionErrorPersistsBranchAndKeepsRoot(t *test
 	if failed[0].BranchID != "branch-created" || failed[0].ClusterID != "cluster-a" {
 		t.Fatalf("failed fork branch metadata = cluster:%q branch:%q", failed[0].ClusterID, failed[0].BranchID)
 	}
-	if deleted := rt.prov.deletedBranches(); deleted[0] != "cluster-a/branch-created" {
+	if deleted := rt.prov.deletedBranches(); len(deleted) == 0 || deleted[0] != "cluster-a/branch-created" {
 		t.Fatalf("deleted branches = %#v", deleted)
 	}
 }
@@ -209,6 +249,27 @@ func TestCleanupFailedForkDoesNotMarkDeletedWhenBranchDeleteFails(t *testing.T) 
 	if deleted := rt.prov.deletedBranches(); len(deleted) != 1 || deleted[0] != "cluster-a/branch-a" {
 		t.Fatalf("deleted branches = %#v", deleted)
 	}
+}
+
+func TestResumeProvisioningForkActivatesBranchBackedTenant(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-a",
+		Host:      rt.dbHost,
+		Port:      rt.dbPort,
+		Username:  rt.dbUser,
+		DBName:    rt.dbName,
+	}
+	rt.insertLiveTenant(t, "parent")
+	rt.insertForkTenant(t, "fork-provisioning", meta.TenantProvisioning, "branch-a")
+
+	rt.server.resumeProvisioningTenants()
+
+	waitForCondition(t, func() bool {
+		got, err := rt.meta.GetTenant(context.Background(), "fork-provisioning")
+		return err == nil && got.Status == meta.TenantActive
+	})
 }
 
 func TestCleanupDeletingForkEnqueuesFileGCTaskRefsBeforeSanitize(t *testing.T) {

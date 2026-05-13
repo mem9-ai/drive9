@@ -52,7 +52,7 @@ func ctxUsage() string {
   import --from-file <path>                           add delegated context from file (must be mode 0600)
   import --from-file -                                add delegated context from stdin explicitly
   import                                              add delegated context from stdin (default when stdin is a pipe)
-  fork <new> [--from <ctx>] [--use] [--json]          create a copy-on-write fork context
+  fork [<new>] [--from <ctx>] [--use] [--json]        create a copy-on-write fork context
   ls [-l|--json]                                      list contexts
   use <name>                                          activate a context
   rm <name>                                           delete a context`
@@ -334,9 +334,6 @@ func ctxAdd(cfg *Config, name string, ctx *Context) (*Context, error) {
 }
 
 func ctxForkCmd(args []string) error {
-	if len(args) == 0 {
-		return fmt.Errorf("usage: drive9 ctx fork <new> [--from <ctx>] [--use] [--json]")
-	}
 	newName := ""
 	fromName := ""
 	useNew := false
@@ -355,20 +352,20 @@ func ctxForkCmd(args []string) error {
 			jsonOut = true
 		default:
 			if strings.HasPrefix(args[i], "-") {
-				return fmt.Errorf("unknown flag %q\nusage: drive9 ctx fork <new> [--from <ctx>] [--use] [--json]", args[i])
+				return fmt.Errorf("unknown flag %q\nusage: drive9 ctx fork [<new>] [--from <ctx>] [--use] [--json]", args[i])
 			}
 			if newName != "" {
-				return fmt.Errorf("unexpected argument %q\nusage: drive9 ctx fork <new> [--from <ctx>] [--use] [--json]", args[i])
+				return fmt.Errorf("unexpected argument %q\nusage: drive9 ctx fork [<new>] [--from <ctx>] [--use] [--json]", args[i])
 			}
 			newName = args[i]
 		}
 	}
-	if newName == "" {
-		return fmt.Errorf("usage: drive9 ctx fork <new> [--from <ctx>] [--use] [--json]")
-	}
 	cfg := loadConfig()
 	if cfg.Contexts == nil {
 		cfg.Contexts = map[string]*Context{}
+	}
+	if newName == "" {
+		newName = randomName()
 	}
 	if _, exists := cfg.Contexts[newName]; exists {
 		return fmt.Errorf("context %q already exists; use a different name", newName)
@@ -396,13 +393,13 @@ func ctxForkCmd(args []string) error {
 
 	body, _ := json.Marshal(map[string]string{"name": newName})
 	c := client.New(server, source.APIKey)
-	resp, err := c.RawPost("/v1/ctx/fork", strings.NewReader(string(body)))
+	resp, err := c.RawPost("/v1/fork", strings.NewReader(string(body)))
 	if err != nil {
 		return fmt.Errorf("ctx fork failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	var result forkCtxResult
-	if resp.StatusCode != http.StatusCreated {
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
 		var errResp struct {
 			Error string `json:"error"`
 		}
@@ -443,6 +440,7 @@ type forkCtxResult struct {
 	TenantID       string `json:"tenant_id"`
 	APIKey         string `json:"api_key"`
 	Status         string `json:"status"`
+	Message        string `json:"message,omitempty"`
 	ParentTenantID string `json:"parent_tenant_id"`
 	Storage        string `json:"storage"`
 }

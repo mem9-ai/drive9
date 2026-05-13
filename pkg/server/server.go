@@ -88,8 +88,10 @@ const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
 // shape is per-tenant so future tenant-scoped quotas plug in without a
 // protocol change.
 type TenantStatusResponse struct {
-	Status         string `json:"status"`
-	MaxUploadBytes int64  `json:"max_upload_bytes"`
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+
+	MaxUploadBytes int64 `json:"max_upload_bytes"`
 	// InlineThreshold is the server's DB-inline vs S3 storage cutoff. Clients
 	// use it to choose simple PUT vs V2 multipart upload so they stay
 	// consistent with server-side IsLargeFile gating. Omitted (zero) by old
@@ -165,8 +167,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
 	mux.Handle("/v2/uploads/", business)
-	mux.Handle("/v1/ctx/fork", business)
-	mux.Handle("/v1/ctx", business)
+	mux.Handle("/v1/fork", business)
 	mux.Handle("/v1/sql", business)
 	mux.Handle("/v1/events", business)
 	mux.Handle("/v1/journals", business)
@@ -296,9 +297,10 @@ func (s *Server) resumeProvisioningTenants() {
 	for i := range tenants {
 		t := tenants[i]
 		if t.Kind == meta.TenantKindFork {
-			logger.Warn(ctx, "resume_provisioning_fork_skipped",
+			logger.Info(ctx, "resume_provisioning_fork",
 				zap.String("tenant_id", t.ID),
 				zap.String("parent_tenant_id", t.ParentTenantID))
+			go s.provisionForkTenantAsync(ctx, t.ID)
 			continue
 		}
 		go s.resumeTenantSchemaInit(t)
@@ -370,10 +372,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleUploadAction(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v2/uploads/"):
 		s.handleV2Uploads(w, r)
-	case r.URL.Path == "/v1/ctx/fork":
-		s.handleCtxFork(w, r)
-	case r.URL.Path == "/v1/ctx":
-		s.handleCtxDelete(w, r)
+	case r.URL.Path == "/v1/fork":
+		s.handleFork(w, r)
 	case r.URL.Path == "/v1/sql":
 		s.handleSQL(w, r)
 	case r.URL.Path == "/v1/events":
@@ -466,9 +466,20 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
 		Status:          string(resolved.Tenant.Status),
+		Message:         tenantStatusMessage(&resolved.Tenant),
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
 	})
+}
+
+func tenantStatusMessage(t *meta.Tenant) string {
+	if t == nil {
+		return ""
+	}
+	if t.Kind == meta.TenantKindFork && t.Status == meta.TenantProvisioning {
+		return forkProvisioningMessage(t)
+	}
+	return ""
 }
 
 func backendFromRequest(r *http.Request) *backend.Dat9Backend {
