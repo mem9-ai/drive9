@@ -72,7 +72,10 @@ func TestCtxForkCreatesOwnerContextAndSwitchesWhenRequested(t *testing.T) {
 	if sawName != "exp" {
 		t.Fatalf("request name = %q, want exp", sawName)
 	}
-	if !strings.Contains(out, "Forked prod -> exp") || !strings.Contains(out, "Now using ctx exp") {
+	if !strings.Contains(out, "Forked prod -> exp") ||
+		!strings.Contains(out, "Status: provisioning") ||
+		!strings.Contains(out, "Now using ctx exp") ||
+		!strings.Contains(out, "Wait for `drive9 status` to report `active` before running `fs` commands.") {
 		t.Fatalf("unexpected output: %q", out)
 	}
 	got := loadConfig()
@@ -124,7 +127,10 @@ func TestCtxForkGeneratesNameWhenOmitted(t *testing.T) {
 	if sawName == "" || sawName == "prod" {
 		t.Errorf("generated request name = %q", sawName)
 	}
-	if !strings.Contains(out, "Forked prod -> "+sawName) || !strings.Contains(out, "Now using ctx "+sawName) {
+	if !strings.Contains(out, "Forked prod -> "+sawName) ||
+		!strings.Contains(out, "Status: provisioning") ||
+		!strings.Contains(out, "Now using ctx "+sawName) ||
+		!strings.Contains(out, "Wait for `drive9 status` to report `active` before running `fs` commands.") {
 		t.Errorf("unexpected output: %q", out)
 	}
 	got := loadConfig()

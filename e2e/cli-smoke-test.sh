@@ -202,6 +202,11 @@ drive9_ctx_retry() {
       printf '%s' "$out"
       return 0
     fi
+    # Fork-context smoke can race eventual consistency while the saved context
+    # becomes usable. Treat "not found" as retryable here only, with bounded
+    # retries/sleeps via CLI_MAX_RETRIES and CLI_RETRY_SLEEP_S. The match is
+    # intentionally broad and should be revisited if stricter ctx semantics are
+    # needed for other callers.
     if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"not found"* ]]; then
       echo "retry $attempt/$CLI_MAX_RETRIES for drive9(ctx) $* " >&2
       attempt=$((attempt + 1))
@@ -380,7 +385,7 @@ check_eq "uploaded small file appears in ls /" "$small_present" "true"
 cat_out="$(drive9_retry_read fs cat "$SMALL_REMOTE")"
 check_eq "cat returns expected small file content" "$cat_out" "cli-smoke-${TS}"
 
-echo "[4.0] cp directory target semantics"
+echo "[4.1] cp directory target semantics"
 mkdir -p "$CP_DIR_LOCAL"
 drive9_retry fs mkdir "$CP_DIR_REMOTE" >/dev/null
 drive9_retry fs mkdir "$CP_DIR_REMOTE_COPY" >/dev/null

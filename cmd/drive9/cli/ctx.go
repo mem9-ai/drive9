@@ -430,8 +430,17 @@ func ctxForkCmd(args []string) error {
 	}
 	fmt.Printf("Forked %s -> %s\n", fromName, newName)
 	fmt.Println("Mode: copy-on-write")
+	if result.Status != "" {
+		fmt.Printf("Status: %s\n", result.Status)
+	}
+	if result.Message != "" {
+		fmt.Printf("Message: %s\n", result.Message)
+	}
 	if useNew || cfg.CurrentContext == newName {
 		fmt.Printf("Now using ctx %s\n", newName)
+	}
+	if result.Status == "provisioning" {
+		fmt.Println("The fork is still provisioning. Wait for `drive9 status` to report `active` before running `fs` commands.")
 	}
 	return nil
 }

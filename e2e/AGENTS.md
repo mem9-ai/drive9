@@ -124,7 +124,7 @@ use the same value as `DRIVE9_API_KEY` here.
 
 ### `api-smoke-test.sh`
 
-1. `POST /v1/provision` returns `202` with only `api_key` + `status`
+1. `POST /v1/provision` returns `202` with `tenant_id`, `api_key`, and `status`
 2. `GET /v1/status` polled until `active`
 3. `GET /v1/fs/?list` returns `entries[]`
 4. Nested `mkdir` (`/team/...`) across multi-level paths

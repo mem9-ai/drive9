@@ -161,7 +161,7 @@ CLI_SOURCE=official bash e2e/fuse-release-gate.sh
 
 ## Notes
 
-- `api-smoke-test.sh` expects `POST /v1/provision` to return only `api_key` and `status`.
+- `api-smoke-test.sh` expects `POST /v1/provision` to return `tenant_id`, `api_key`, and `status`.
 - Tenant readiness is checked through `GET /v1/status`.
 - File operations use `/v1/fs/*` and include nested directory coverage.
 - Semantic recall polling knobs for API smoke are `SEMANTIC_TIMEOUT_S` and `SEMANTIC_INTERVAL_S`.
