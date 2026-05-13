@@ -7,7 +7,7 @@
 // Commands:
 //
 //	create  provision a new database and owner context
-//	ctx     manage contexts (add, import, ls, use, rm)
+//	ctx     manage contexts (show, add, import, fork, ls, use, rm)
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, sh, grep, find)
 //	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
 //	journal append-only agent/workflow journal operations
@@ -280,7 +280,7 @@ func usage(code int) {
 			"                         add owner context\n"+
 			"  ctx import [--from-file <path|->] [--name NAME]\n"+
 			"                         add delegated context\n"+
-			"  ctx fork [<new>] [--from <ctx>] [--use] [--json]\n"+
+			"  ctx fork [<new>] [--from <ctx>] [--json]\n"+
 			"                         create a copy-on-write fork context\n"+
 			"  ctx ls [-l|--json]     list contexts\n"+
 			"  ctx use <name>         activate context\n"+

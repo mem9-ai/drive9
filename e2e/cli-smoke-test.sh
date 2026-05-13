@@ -225,9 +225,6 @@ fork_checks_enabled() {
   local probe_code
   probe_code=$(curl -sS -o /dev/null -w "%{http_code}" \
     -X POST \
-    -H "Authorization: Bearer $API_KEY" \
-    -H "Content-Type: application/json" \
-    --data '{' \
     "$BASE/v1/fork" || true)
   if [ "$probe_code" = "404" ]; then
     echo "fork checks skipped: server does not expose /v1/fork" >&2

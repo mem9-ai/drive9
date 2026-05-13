@@ -221,6 +221,8 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		s.markForkFailed(ctx, forkID)
 		return nil, forkErr(http.StatusBadGateway, "starter branch response missing required metadata")
 	}
+	forkRoot.ClusterID = cluster.ClusterID
+	forkRoot.BranchID = cluster.BranchID
 	if err := s.meta.UpdateTenantConnection(ctx, forkID, &meta.Tenant{
 		DBHost:           cluster.Host,
 		DBPort:           cluster.Port,
