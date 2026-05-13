@@ -440,7 +440,7 @@ func ctxForkCmd(args []string) error {
 		fmt.Printf("Now using ctx %s\n", newName)
 	}
 	if result.Status == "provisioning" {
-		fmt.Println("The fork is still provisioning. Wait for `drive9 status` to report `active` before running `fs` commands.")
+		fmt.Println("The fork is still provisioning. Wait a moment, then retry a command like `drive9 fs ls /`; `fs` commands may fail until the tenant becomes active.")
 	}
 	return nil
 }

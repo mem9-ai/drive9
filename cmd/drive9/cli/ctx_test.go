@@ -75,7 +75,7 @@ func TestCtxForkCreatesOwnerContextAndSwitchesWhenRequested(t *testing.T) {
 	if !strings.Contains(out, "Forked prod -> exp") ||
 		!strings.Contains(out, "Status: provisioning") ||
 		!strings.Contains(out, "Now using ctx exp") ||
-		!strings.Contains(out, "Wait for `drive9 status` to report `active` before running `fs` commands.") {
+		!strings.Contains(out, "Wait a moment, then retry a command like `drive9 fs ls /`; `fs` commands may fail until the tenant becomes active.") {
 		t.Fatalf("unexpected output: %q", out)
 	}
 	got := loadConfig()
@@ -130,7 +130,7 @@ func TestCtxForkGeneratesNameWhenOmitted(t *testing.T) {
 	if !strings.Contains(out, "Forked prod -> "+sawName) ||
 		!strings.Contains(out, "Status: provisioning") ||
 		!strings.Contains(out, "Now using ctx "+sawName) ||
-		!strings.Contains(out, "Wait for `drive9 status` to report `active` before running `fs` commands.") {
+		!strings.Contains(out, "Wait a moment, then retry a command like `drive9 fs ls /`; `fs` commands may fail until the tenant becomes active.") {
 		t.Errorf("unexpected output: %q", out)
 	}
 	got := loadConfig()
