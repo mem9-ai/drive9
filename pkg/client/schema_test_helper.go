@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
 
 func initClientTenantSchema(t *testing.T, dsn string) {
@@ -49,6 +50,7 @@ func initClientTenantSchema(t *testing.T, dsn string) {
 		`CREATE TABLE IF NOT EXISTS llm_usage (id BIGINT AUTO_INCREMENT PRIMARY KEY, task_type VARCHAR(32) NOT NULL, task_id VARCHAR(64) NOT NULL, cost_millicents BIGINT NOT NULL DEFAULT 0, raw_units BIGINT NOT NULL DEFAULT 0, raw_unit_type VARCHAR(16) NOT NULL, created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3))`,
 		`CREATE INDEX idx_llm_usage_created ON llm_usage(created_at)`,
 	}
+	stmts = append(stmts, schema.JournalTiDBSchemaStatements()...)
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
 			msg := err.Error()

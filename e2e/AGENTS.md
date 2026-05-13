@@ -40,6 +40,9 @@ DRIVE9_API_KEY=drive9_xxx bash e2e/api-smoke-test-existing-key.sh
 # CLI smoke (provision + drive9 fs workflows + large file cp)
 bash e2e/cli-smoke-test.sh
 
+# Journal smoke (provision + journal create/append/find/verify)
+bash e2e/journal-smoke-test.sh
+
 # FUSE smoke (mount + bidirectional filesystem checks)
 bash e2e/fuse-smoke-test.sh
 
@@ -156,6 +159,17 @@ use the same value as `DRIVE9_API_KEY` here.
 8. CLI large-file flow (`cp` upload multipart + `cp` download + checksum verification)
 9. CLI upload-limit boundary (`10GiB` initiate accepted, `10GiB+1` rejected)
 
+### `journal-smoke-test.sh`
+
+1. Provision tenant unless `DRIVE9_API_KEY` is already set
+2. Create journal with repeated-key labels
+3. Append an entry and retry with the same `Idempotency-Key`
+4. Read entries with `GET /v1/journals/{id}/entries`
+5. Search by repeated label filters
+6. Validate malformed metadata search returns `400`
+7. Validate missing journal entry read returns `404`
+8. Verify hash chain and subject projection, and confirm unchecked scopes are omitted
+
 ### `fuse-smoke-test.sh`
 
 Host support: Linux and macOS only. Windows is currently limited to non-mount
@@ -193,8 +207,9 @@ Notes:
 
 1. Runs `api-smoke-test.sh`
 2. Runs `cli-smoke-test.sh`
-3. Runs `fuse-smoke-test.sh`
-4. Aggregates pass/fail at script level for quick regression checks
+3. Runs `journal-smoke-test.sh`
+4. Runs `fuse-smoke-test.sh`
+5. Aggregates pass/fail at script level for quick regression checks
 
 ## Environment variables
 

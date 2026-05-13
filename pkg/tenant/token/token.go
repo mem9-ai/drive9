@@ -14,10 +14,11 @@ import (
 )
 
 type Claims struct {
-	TenantID     string `json:"tenant_id"`
-	TokenVersion int    `json:"token_version"`
-	IssuedAt     int64  `json:"iat"`
-	ExpiresAt    int64  `json:"exp,omitempty"`
+	TenantID           string   `json:"tenant_id"`
+	TokenVersion       int      `json:"token_version"`
+	IssuedAt           int64    `json:"iat"`
+	ExpiresAt          int64    `json:"exp,omitempty"`
+	JournalPermissions []string `json:"journal_permissions,omitempty"`
 }
 
 const tokenPrefix = "dat9_"
@@ -34,10 +35,17 @@ func IssueToken(secret []byte, tenantID string, tokenVersion int) (string, error
 }
 
 func IssueTokenWithExpiry(secret []byte, tenantID string, tokenVersion int, expiresAt time.Time) (string, error) {
+	return IssueTokenWithJournalPermissions(secret, tenantID, tokenVersion, expiresAt, nil)
+}
+
+func IssueTokenWithJournalPermissions(secret []byte, tenantID string, tokenVersion int, expiresAt time.Time, journalPermissions []string) (string, error) {
 	header := map[string]string{"alg": "HS256", "typ": "JWT"}
 	payload := Claims{TenantID: tenantID, TokenVersion: tokenVersion, IssuedAt: time.Now().Unix()}
 	if !expiresAt.IsZero() {
 		payload.ExpiresAt = expiresAt.Unix()
+	}
+	if len(journalPermissions) > 0 {
+		payload.JournalPermissions = append([]string(nil), journalPermissions...)
 	}
 
 	h, err := json.Marshal(header)

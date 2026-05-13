@@ -214,6 +214,20 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	if out["api_key"] == "" {
 		t.Fatalf("unexpected provision response: %+v", out)
 	}
+	claims, err := token.ParseAndVerifyToken(tokenSecret, out["api_key"])
+	if err != nil {
+		t.Fatalf("ParseAndVerifyToken provision api key: %v", err)
+	}
+	hasAdmin := false
+	for _, permission := range claims.JournalPermissions {
+		if permission == JournalPermissionAdmin {
+			hasAdmin = true
+			break
+		}
+	}
+	if !hasAdmin {
+		t.Fatalf("provision api key journal_permissions = %#v, want %s", claims.JournalPermissions, JournalPermissionAdmin)
+	}
 	resolved, err := metaStore.ResolveByAPIKeyHash(context.Background(), token.HashToken(out["api_key"]))
 	if err != nil {
 		t.Fatal(err)

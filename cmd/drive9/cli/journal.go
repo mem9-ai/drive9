@@ -1,0 +1,374 @@
+package cli
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/mem9-ai/dat9/pkg/journal"
+)
+
+type repeatStrings []string
+
+func (r *repeatStrings) String() string {
+	return strings.Join(*r, ",")
+}
+
+func (r *repeatStrings) Set(value string) error {
+	*r = append(*r, value)
+	return nil
+}
+
+func Journal(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: drive9 journal <new|append|cat|find|verify>")
+	}
+	switch args[0] {
+	case "new":
+		return JournalNew(args[1:])
+	case "append":
+		return JournalAppend(args[1:])
+	case "cat":
+		return JournalCat(args[1:])
+	case "find":
+		return JournalFind(args[1:])
+	case "verify":
+		return JournalVerify(args[1:])
+	case "seal":
+		return fmt.Errorf("journal seal is not implemented in the Phase 1 journal backend")
+	case "-h", "--help", "help":
+		return fmt.Errorf("usage: drive9 journal <new|append|cat|find|verify>")
+	default:
+		return fmt.Errorf("unknown journal command %q", args[0])
+	}
+}
+
+func JournalNew(args []string) error {
+	fs := flag.NewFlagSet("journal new", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var meta repeatStrings
+	journalID := fs.String("id", "", "journal id")
+	kind := fs.String("kind", journal.DefaultKind, "journal kind")
+	kindShort := fs.String("k", journal.DefaultKind, "journal kind")
+	title := fs.String("title", "", "journal title")
+	asJSON := fs.Bool("json", false, "print JSON")
+	fs.Var(&meta, "meta", "metadata key=value")
+	fs.Var(&meta, "m", "metadata key=value")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: drive9 journal new [flags]")
+	}
+	resolvedKind := *kind
+	if *kindShort != journal.DefaultKind {
+		resolvedKind = *kindShort
+	}
+	if *journalID == "" {
+		*journalID = journal.NewID("jrn")
+	}
+	req := journal.CreateRequest{
+		JournalID: *journalID,
+		Kind:      resolvedKind,
+		Title:     *title,
+	}
+	parsedMeta, err := parseJournalAssignments(meta)
+	if err != nil {
+		return err
+	}
+	req.Labels = parsedMeta
+	c := NewFromEnv()
+	created, err := c.CreateJournal(context.Background(), req)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		return enc.Encode(created)
+	}
+	_, _ = fmt.Fprintln(os.Stdout, created.JournalID)
+	return nil
+}
+
+func JournalAppend(args []string) error {
+	fs := flag.NewFlagSet("journal append", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var subjects repeatStrings
+	defaultType := fs.String("type", "", "default entry type")
+	defaultTypeShort := fs.String("t", "", "default entry type")
+	source := fs.String("source", "", "entry source")
+	appendID := fs.String("idempotency-key", "", "append id")
+	jsonArray := fs.Bool("json-array", false, "read JSON array")
+	fs.Var(&subjects, "subject", "subject")
+	fs.Var(&subjects, "s", "subject")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: drive9 journal append <journal> [flags]")
+	}
+	resolvedType := *defaultType
+	if *defaultTypeShort != "" {
+		resolvedType = *defaultTypeShort
+	}
+	entries, err := readJournalEntriesFromStdin(os.Stdin, *jsonArray)
+	if err != nil {
+		return err
+	}
+	for i := range entries {
+		if entries[i].Type == "" {
+			entries[i].Type = resolvedType
+		}
+		if *source != "" {
+			entries[i].Source = *source
+		}
+		entries[i].Subjects = append(append([]string{}, subjects...), entries[i].Subjects...)
+	}
+	if *appendID == "" {
+		*appendID = journal.NewID("app")
+	}
+	c := NewFromEnv()
+	resp, err := c.AppendJournalEntries(context.Background(), fs.Arg(0), *appendID, entries)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	return enc.Encode(resp)
+}
+
+func readJournalEntriesFromStdin(r io.Reader, jsonArray bool) ([]journal.EntryInput, error) {
+	if jsonArray {
+		var entries []journal.EntryInput
+		if err := json.NewDecoder(r).Decode(&entries); err != nil {
+			return nil, err
+		}
+		return entries, nil
+	}
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 4<<20)
+	var entries []journal.EntryInput
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var entry journal.EntryInput
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			return nil, fmt.Errorf("decode JSONL: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("no journal entries on stdin")
+	}
+	return entries, nil
+}
+
+func JournalCat(args []string) error {
+	fs := flag.NewFlagSet("journal cat", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	after := fs.Int64("after", 0, "start after sequence")
+	limit := fs.Int("limit", journal.DefaultLimit, "limit")
+	follow := fs.Bool("f", false, "follow")
+	fs.BoolVar(follow, "follow", false, "follow")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: drive9 journal cat <journal> [flags]")
+	}
+	c := NewFromEnv()
+	journalID := fs.Arg(0)
+	enc := json.NewEncoder(os.Stdout)
+	for {
+		entries, err := c.ReadJournalEntries(context.Background(), journalID, *after, *limit)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if err := enc.Encode(entry); err != nil {
+				return err
+			}
+			*after = entry.Seq
+		}
+		if !*follow {
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func JournalFind(args []string) error {
+	fs := flag.NewFlagSet("journal find", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var subjects repeatStrings
+	var meta repeatStrings
+	entryType := fs.String("type", "", "entry type")
+	entryTypeShort := fs.String("t", "", "entry type")
+	kind := fs.String("kind", "", "journal kind")
+	actor := fs.String("actor", "", "actor type:id")
+	status := fs.String("status", "", "status")
+	since := fs.String("since", "", "since duration or RFC3339 time")
+	until := fs.String("until", "", "until RFC3339 time")
+	limit := fs.Int("limit", journal.DefaultLimit, "limit")
+	cursor := fs.String("cursor", "", "cursor; repeat original filters")
+	entries := fs.Bool("entries", false, "emit full entries")
+	asJSON := fs.Bool("json", false, "emit JSONL")
+	fs.Var(&subjects, "subject", "subject")
+	fs.Var(&subjects, "s", "subject")
+	fs.Var(&meta, "meta", "metadata key=value")
+	fs.Var(&meta, "m", "metadata key=value")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: drive9 journal find [flags]")
+	}
+	resolvedType := *entryType
+	if *entryTypeShort != "" {
+		resolvedType = *entryTypeShort
+	}
+	req := journal.SearchRequest{
+		Type:     resolvedType,
+		Kind:     *kind,
+		Status:   *status,
+		Subjects: subjects,
+		Limit:    *limit,
+		Cursor:   *cursor,
+		Entries:  *entries,
+	}
+	parsedMeta, err := parseJournalAssignments(meta)
+	if err != nil {
+		return err
+	}
+	req.Labels = parsedMeta
+	if *actor != "" {
+		actorType, actorID, err := journal.SplitActor(*actor)
+		if err != nil {
+			return err
+		}
+		req.ActorType, req.ActorID = actorType, actorID
+	}
+	if *since != "" {
+		t, err := parseJournalCLITimeOrDuration(*since)
+		if err != nil {
+			return err
+		}
+		req.Since = &t
+		req.SinceRaw = *since
+	}
+	if *until != "" {
+		t, err := time.Parse(time.RFC3339Nano, *until)
+		if err != nil {
+			return err
+		}
+		t = journal.NormalizeTime(t)
+		req.Until = &t
+		req.UntilRaw = *until
+	}
+	c := NewFromEnv()
+	matches, err := c.SearchJournal(context.Background(), req)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	for _, match := range matches {
+		if *entries {
+			if match.Entry == nil {
+				continue
+			}
+			if err := enc.Encode(match.Entry); err != nil {
+				return err
+			}
+			continue
+		}
+		if *asJSON {
+			if err := enc.Encode(match); err != nil {
+				return err
+			}
+			continue
+		}
+		if match.Seq > 0 {
+			_, _ = fmt.Fprintf(os.Stdout, "%s\t%d\t%s\t%s\n", match.JournalID, match.Seq, match.Type, journal.FormatTime(match.ObservedAt))
+		} else {
+			_, _ = fmt.Fprintf(os.Stdout, "%s\t%s\t%s\n", match.JournalID, match.Kind, journal.FormatTime(match.CreatedAt))
+		}
+	}
+	return nil
+}
+
+func JournalVerify(args []string) error {
+	fs := flag.NewFlagSet("journal verify", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	asJSON := fs.Bool("json", false, "print JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: drive9 journal verify <journal> [--json]")
+	}
+	c := NewFromEnv()
+	result, err := c.VerifyJournal(context.Background(), fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		return enc.Encode(result)
+	}
+	status := "failed"
+	if result.OK {
+		status = "ok"
+	}
+	_, _ = fmt.Fprintf(os.Stdout, "%s journal=%s entries=%d head=%s\n", status, result.JournalID, result.Entries, result.HeadHash)
+	if result.OK {
+		return nil
+	}
+	return fmt.Errorf("journal verification failed")
+}
+
+func parseJournalAssignments(values []string) ([]journal.Label, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	out := make([]journal.Label, 0, len(values))
+	for _, raw := range values {
+		key, value, ok := strings.Cut(raw, "=")
+		if !ok {
+			return nil, fmt.Errorf("invalid metadata %q (expected key=value)", raw)
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return nil, fmt.Errorf("invalid metadata %q (empty key)", raw)
+		}
+		out = append(out, journal.Label{Key: key, Value: strings.TrimSpace(value)})
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return journal.NormalizeLabels(out), nil
+}
+
+func parseJournalCLITimeOrDuration(raw string) (time.Time, error) {
+	if d, err := time.ParseDuration(raw); err == nil {
+		return journal.NormalizeTime(time.Now().Add(-d)), nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		if unix, convErr := strconv.ParseInt(raw, 10, 64); convErr == nil {
+			return journal.NormalizeTime(time.Unix(unix, 0)), nil
+		}
+		return time.Time{}, err
+	}
+	return journal.NormalizeTime(t), nil
+}
