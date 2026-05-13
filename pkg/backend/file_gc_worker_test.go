@@ -186,6 +186,72 @@ func TestFileGCTaskEnqueuesObjectCandidateWhenNamespaceWired(t *testing.T) {
 	}
 }
 
+func TestOverwriteDoesNotDirectDeleteWhenObjectGCUnavailable(t *testing.T) {
+	b := newTestBackend(t)
+	rec := &deleteRecordingS3Client{S3Client: b.s3}
+	b.s3 = rec
+
+	ctx := context.Background()
+	payload := bytes.Repeat([]byte("a"), int(DefaultInlineThreshold))
+	if _, err := b.Write("/x.bin", payload, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatalf("create s3 file: %v", err)
+	}
+	old, err := b.Store().Stat(ctx, "/x.bin")
+	if err != nil {
+		t.Fatalf("stat old file: %v", err)
+	}
+	if old.File.StorageType != datastore.StorageS3 || old.File.StorageRef == "" {
+		t.Fatalf("old storage = %s %q, want s3 ref", old.File.StorageType, old.File.StorageRef)
+	}
+
+	replacement := bytes.Repeat([]byte("b"), int(DefaultInlineThreshold))
+	if _, err := b.Write("/x.bin", replacement, 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("overwrite s3 file: %v", err)
+	}
+	current, err := b.Store().Stat(ctx, "/x.bin")
+	if err != nil {
+		t.Fatalf("stat current file: %v", err)
+	}
+	if current.File.StorageRef == old.File.StorageRef {
+		t.Fatalf("storage ref did not change: %q", current.File.StorageRef)
+	}
+	if keys := rec.deletedKeys(); len(keys) != 0 {
+		t.Fatalf("deleted keys = %#v, want none", keys)
+	}
+}
+
+func TestOverwriteDoesNotDirectDeleteWhenObjectGCCandidateEnqueueFails(t *testing.T) {
+	b, fake := newCentralQuotaBackend(t)
+	rec := &deleteRecordingS3Client{S3Client: b.s3}
+	b.s3 = rec
+	b.storageNamespaceID = "ns-a"
+	fake.objectGCCandidateErr = errors.New("meta unavailable")
+
+	ctx := context.Background()
+	payload := bytes.Repeat([]byte("a"), int(DefaultInlineThreshold))
+	if _, err := b.Write("/x.bin", payload, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatalf("create s3 file: %v", err)
+	}
+	old, err := b.Store().Stat(ctx, "/x.bin")
+	if err != nil {
+		t.Fatalf("stat old file: %v", err)
+	}
+	if old.File.StorageType != datastore.StorageS3 || old.File.StorageRef == "" {
+		t.Fatalf("old storage = %s %q, want s3 ref", old.File.StorageType, old.File.StorageRef)
+	}
+
+	replacement := bytes.Repeat([]byte("b"), int(DefaultInlineThreshold))
+	if _, err := b.Write("/x.bin", replacement, 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("overwrite s3 file: %v", err)
+	}
+	if keys := rec.deletedKeys(); len(keys) != 0 {
+		t.Fatalf("deleted keys = %#v, want none", keys)
+	}
+	if len(fake.objectGCCandidates) != 0 {
+		t.Fatalf("object gc candidates = %d, want 0", len(fake.objectGCCandidates))
+	}
+}
+
 func TestFileGCTaskDoesNotDirectDeleteWhenObjectGCUnavailable(t *testing.T) {
 	b := newTestBackend(t)
 	rec := &deleteRecordingS3Client{S3Client: b.s3}

@@ -1145,8 +1145,6 @@ func (b *Dat9Backend) deleteBlobIfS3Ctx(ctx context.Context, storageType datasto
 		logger.Warn(ctx, "backend_object_gc_candidate_required_but_failed",
 			zap.String("storage_ref", storageRef),
 			zap.Error(err))
-		// Fallback: GC enqueue failed, delete the blob directly to avoid leaking storage.
-		b.deleteBlobCtx(ctx, storageRef)
 		return
 	}
 	logger.Warn(ctx, "backend_object_gc_candidate_not_configured",
