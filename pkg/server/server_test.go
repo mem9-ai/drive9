@@ -1130,12 +1130,12 @@ func TestCreateFileActionCreatesEmptyFileAndConflicts(t *testing.T) {
 		t.Fatalf("duplicate create status = %d, want 409", resp.StatusCode)
 	}
 
-	var fileRows int
-	if err := s.fallback.Store().DB().QueryRow(`SELECT COUNT(*) FROM inodes`).Scan(&fileRows); err != nil {
+	var inodeRows int
+	if err := s.fallback.Store().DB().QueryRow(`SELECT COUNT(*) FROM inodes`).Scan(&inodeRows); err != nil {
 		t.Fatal(err)
 	}
-	if fileRows != 1 {
-		t.Fatalf("inode rows after duplicate create = %d, want 1", fileRows)
+	if inodeRows != 1 {
+		t.Fatalf("inode rows after duplicate create = %d, want 1", inodeRows)
 	}
 	var orphanRows int
 	if err := s.fallback.Store().DB().QueryRow(`SELECT COUNT(*)

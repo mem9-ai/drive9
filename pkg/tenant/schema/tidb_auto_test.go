@@ -36,7 +36,7 @@ func TestDetectTiDBEmbeddingModeFromFilesMeta(t *testing.T) {
 
 func TestValidateTiDBAutoEmbeddingSemanticTableAcceptsRealTiDBMetadata(t *testing.T) {
 	if err := validateTiDBAutoEmbeddingSemanticTable(testSemanticTableMeta(TiDBEmbeddingModeAuto)); err != nil {
-		t.Fatalf("expected auto files table to validate: %v", err)
+		t.Fatalf("expected auto semantic table to validate: %v", err)
 	}
 }
 

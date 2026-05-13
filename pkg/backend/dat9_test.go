@@ -97,12 +97,12 @@ func TestCreateDuplicateDoesNotLeaveOrphanFileOrObject(t *testing.T) {
 		t.Fatalf("duplicate CreateCtx error = %v, want ErrPathConflict", err)
 	}
 
-	var files int
-	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM inodes`).Scan(&files); err != nil {
+	var inodes int
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM inodes`).Scan(&inodes); err != nil {
 		t.Fatal(err)
 	}
-	if files != 1 {
-		t.Fatalf("inode rows = %d, want 1", files)
+	if inodes != 1 {
+		t.Fatalf("inode rows = %d, want 1", inodes)
 	}
 	var orphans int
 	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*)

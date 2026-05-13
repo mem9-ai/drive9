@@ -339,7 +339,16 @@ func DetectTiDBEmbeddingMode(db *sql.DB) (TiDBEmbeddingMode, error) {
 	tableName := "files"
 	meta, err := loadTiDBTableMeta(ctx, db, tableName)
 	if err != nil {
-		// New tenants without the legacy files table: try the semantic table.
+		// Only fall back to semantic when files table is genuinely absent
+		// (new tenants without legacy dual-write).  Do not mask transient
+		// errors such as connection failures.
+		if !isMissingTableError(err) {
+			logger.Warn(ctx, "tenant_detect_tidb_embedding_mode_load_files_failed",
+				zap.Duration("elapsed", time.Since(loadStart)),
+				zap.Duration("total_elapsed", time.Since(start)),
+				zap.Error(err))
+			return TiDBEmbeddingModeUnknown, fmt.Errorf("load files table metadata: %w", err)
+		}
 		semanticMeta, semErr := loadTiDBTableMeta(ctx, db, "semantic")
 		if semErr != nil {
 			logger.Warn(ctx, "tenant_detect_tidb_embedding_mode_load_both_failed",
@@ -865,8 +874,8 @@ func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
 		if mode == TiDBEmbeddingModeAuto {
 			if col, ok := spec.tables[i].columns["description_embedding"]; ok {
 				col.addSQL = fmt.Sprintf(
-					"ALTER TABLE semantic ADD COLUMN description_embedding VECTOR(%d) DEFAULT NULL",
-					TiDBAutoEmbeddingDimensions,
+				"ALTER TABLE semantic ADD COLUMN description_embedding VECTOR(%d) GENERATED ALWAYS AS (EMBED_TEXT('%s', description, '%s')) STORED",
+				TiDBAutoEmbeddingDimensions, tidbAutoEmbeddingModel, tidbAutoEmbeddingOptionsJSON,
 				)
 				spec.tables[i].columns["description_embedding"] = col
 			}

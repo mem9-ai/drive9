@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
+
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 )
@@ -294,6 +296,10 @@ func TestCleanupBranchBackedForkWithoutProvisionerDoesNotMarkDeleted(t *testing.
 func isTableNotFoundForCleanup(err error) bool {
 	if err == nil {
 		return false
+	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		return mysqlErr.Number == 1146
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "error 1146") ||
