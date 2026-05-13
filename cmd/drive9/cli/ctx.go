@@ -52,7 +52,7 @@ func ctxUsage() string {
   import --from-file <path>                           add delegated context from file (must be mode 0600)
   import --from-file -                                add delegated context from stdin explicitly
   import                                              add delegated context from stdin (default when stdin is a pipe)
-  fork [<new>] [--from <ctx>] [--use] [--json]        create a copy-on-write fork context
+  fork [<new>] [--from <ctx>] [--json]                create a copy-on-write fork context
   ls [-l|--json]                                      list contexts
   use <name>                                          activate a context
   rm <name>                                           delete a context`
@@ -336,7 +336,6 @@ func ctxAdd(cfg *Config, name string, ctx *Context) (*Context, error) {
 func ctxForkCmd(args []string) error {
 	newName := ""
 	fromName := ""
-	useNew := false
 	jsonOut := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -346,16 +345,14 @@ func ctxForkCmd(args []string) error {
 			}
 			i++
 			fromName = args[i]
-		case "--use":
-			useNew = true
 		case "--json":
 			jsonOut = true
 		default:
 			if strings.HasPrefix(args[i], "-") {
-				return fmt.Errorf("unknown flag %q\nusage: drive9 ctx fork [<new>] [--from <ctx>] [--use] [--json]", args[i])
+				return fmt.Errorf("unknown flag %q\nusage: drive9 ctx fork [<new>] [--from <ctx>] [--json]", args[i])
 			}
 			if newName != "" {
-				return fmt.Errorf("unexpected argument %q\nusage: drive9 ctx fork [<new>] [--from <ctx>] [--use] [--json]", args[i])
+				return fmt.Errorf("unexpected argument %q\nusage: drive9 ctx fork [<new>] [--from <ctx>] [--json]", args[i])
 			}
 			newName = args[i]
 		}
@@ -419,9 +416,6 @@ func ctxForkCmd(args []string) error {
 	}); err != nil {
 		return err
 	}
-	if useNew {
-		cfg.CurrentContext = newName
-	}
 	if err := saveConfig(cfg); err != nil {
 		return fmt.Errorf("save config: %w", err)
 	}
@@ -436,9 +430,7 @@ func ctxForkCmd(args []string) error {
 	if result.Message != "" {
 		fmt.Printf("Message: %s\n", result.Message)
 	}
-	if useNew || cfg.CurrentContext == newName {
-		fmt.Printf("Now using ctx %s\n", newName)
-	}
+	fmt.Printf("Use `drive9 ctx use %s` to switch when you're ready.\n", newName)
 	if result.Status == "provisioning" {
 		fmt.Println("The fork is still provisioning. Wait a moment, then retry a command like `drive9 fs ls /`; `fs` commands may fail until the tenant becomes active.")
 	}
