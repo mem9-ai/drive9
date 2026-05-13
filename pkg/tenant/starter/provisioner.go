@@ -127,10 +127,14 @@ func (p *Provisioner) CreateBranch(ctx context.Context, forkTenantID string, sou
 	if source.ClusterID == "" || parentID == "" {
 		return nil, fmt.Errorf("source cluster id is required")
 	}
-	body, _ := json.Marshal(map[string]string{
+	reqBody := map[string]string{
 		"displayName": forkTenantID,
 		"parentId":    parentID,
-	})
+	}
+	if source.Password != "" {
+		reqBody["rootPassword"] = source.Password
+	}
+	body, _ := json.Marshal(reqBody)
 	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches", p.apiURL, source.ClusterID)
 	resp, err := p.doDigestAuthRequest(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
