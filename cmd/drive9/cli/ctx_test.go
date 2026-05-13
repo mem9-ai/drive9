@@ -29,7 +29,7 @@ func makeJWT(t *testing.T, claims map[string]any) string {
 	return header + "." + payload + "." + sig
 }
 
-func TestCtxForkCreatesOwnerContextAndSwitchesWhenRequested(t *testing.T) {
+func TestCtxForkCreatesOwnerContextWithoutSwitching(t *testing.T) {
 	withIsolatedHome(t)
 	var sawName string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -65,19 +65,22 @@ func TestCtxForkCreatesOwnerContextAndSwitchesWhenRequested(t *testing.T) {
 		t.Fatalf("save config: %v", err)
 	}
 
-	out, err := captureStdoutE(t, func() error { return Ctx([]string{"fork", "exp", "--use"}) })
+	out, err := captureStdoutE(t, func() error { return Ctx([]string{"fork", "exp"}) })
 	if err != nil {
 		t.Fatalf("ctx fork: %v", err)
 	}
 	if sawName != "exp" {
 		t.Fatalf("request name = %q, want exp", sawName)
 	}
-	if !strings.Contains(out, "Forked prod -> exp") || !strings.Contains(out, "Now using ctx exp") {
+	if !strings.Contains(out, "Forked prod -> exp") ||
+		!strings.Contains(out, "Status: provisioning") ||
+		!strings.Contains(out, "Use `drive9 ctx use exp` to switch when you're ready.") ||
+		!strings.Contains(out, "Wait a moment, then retry a command like `drive9 fs ls /`; `fs` commands may fail until the tenant becomes active.") {
 		t.Fatalf("unexpected output: %q", out)
 	}
 	got := loadConfig()
-	if got.CurrentContext != "exp" {
-		t.Fatalf("current context = %q, want exp", got.CurrentContext)
+	if got.CurrentContext != "prod" {
+		t.Fatalf("current context = %q, want prod", got.CurrentContext)
 	}
 	if got.Contexts["exp"] == nil || got.Contexts["exp"].APIKey != "fork-key" || got.Contexts["exp"].Server != ts.URL {
 		t.Fatalf("fork context not persisted correctly: %#v", got.Contexts["exp"])
@@ -117,19 +120,22 @@ func TestCtxForkGeneratesNameWhenOmitted(t *testing.T) {
 		t.Fatalf("save config: %v", err)
 	}
 
-	out, err := captureStdoutE(t, func() error { return Ctx([]string{"fork", "--use"}) })
+	out, err := captureStdoutE(t, func() error { return Ctx([]string{"fork"}) })
 	if err != nil {
 		t.Fatalf("ctx fork: %v", err)
 	}
 	if sawName == "" || sawName == "prod" {
 		t.Errorf("generated request name = %q", sawName)
 	}
-	if !strings.Contains(out, "Forked prod -> "+sawName) || !strings.Contains(out, "Now using ctx "+sawName) {
+	if !strings.Contains(out, "Forked prod -> "+sawName) ||
+		!strings.Contains(out, "Status: provisioning") ||
+		!strings.Contains(out, "Use `drive9 ctx use "+sawName+"` to switch when you're ready.") ||
+		!strings.Contains(out, "Wait a moment, then retry a command like `drive9 fs ls /`; `fs` commands may fail until the tenant becomes active.") {
 		t.Errorf("unexpected output: %q", out)
 	}
 	got := loadConfig()
-	if got.CurrentContext != sawName {
-		t.Errorf("current context = %q, want %q", got.CurrentContext, sawName)
+	if got.CurrentContext != "prod" {
+		t.Errorf("current context = %q, want %q", got.CurrentContext, "prod")
 	}
 	if got.Contexts[sawName] == nil || got.Contexts[sawName].APIKey != "fork-key" || got.Contexts[sawName].Server != ts.URL {
 		t.Errorf("generated fork context not persisted correctly: %#v", got.Contexts[sawName])

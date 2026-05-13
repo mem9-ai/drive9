@@ -1170,11 +1170,14 @@ func TestLocalTenantShimProvisionAndStatus(t *testing.T) {
 	if got := provisionBody["api_key"]; got != "local-dev-key" {
 		t.Fatalf("api_key = %q, want local-dev-key", got)
 	}
+	if got := provisionBody["tenant_id"]; got != "local" {
+		t.Fatalf("tenant_id = %q, want local", got)
+	}
 	if got := provisionBody["status"]; got != "provisioning" {
 		t.Fatalf("status = %q, want provisioning", got)
 	}
-	if len(provisionBody) != 2 {
-		t.Fatalf("provision body keys = %v, want only api_key/status", provisionBody)
+	if len(provisionBody) != 3 {
+		t.Fatalf("provision body keys = %v, want only tenant_id/api_key/status", provisionBody)
 	}
 
 	statusReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)

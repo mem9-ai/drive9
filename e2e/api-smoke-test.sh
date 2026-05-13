@@ -2,7 +2,7 @@
 # drive9 API smoke test against a live drive9-server deployment.
 #
 # Coverage:
-#  1) Provision tenant (expect 202, api_key + status only)
+#  1) Provision tenant (expect 202, tenant_id + api_key + status)
 #  2) Poll tenant status via GET /v1/status until active
 #  3) Root list
 #  4) Nested mkdir (multi-level directories)
@@ -233,11 +233,13 @@ body=$(json_body "$resp")
 check_eq "POST /v1/provision returns 202" "$code" "202"
 
 API_KEY=$(printf '%s' "$body" | jq -r '.api_key // empty')
+TENANT_ID=$(printf '%s' "$body" | jq -r '.tenant_id // empty')
 INIT_STATUS=$(printf '%s' "$body" | jq -r '.status // empty')
+check_cmd "response contains tenant_id" test -n "$TENANT_ID"
 check_cmd "response contains api_key" test -n "$API_KEY"
 check_eq "provision response status is provisioning" "$INIT_STATUS" "provisioning"
 keys=$(printf '%s' "$body" | jq -r 'keys_unsorted | sort | join(",")')
-check_eq "provision response only has api_key+status" "$keys" "api_key,status"
+check_eq "provision response only has api_key+status+tenant_id" "$keys" "api_key,status,tenant_id"
 
 step "2" "Poll tenant status via /v1/status"
 deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))

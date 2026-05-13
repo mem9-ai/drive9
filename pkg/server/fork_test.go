@@ -238,6 +238,9 @@ func TestCreateForkPartialBranchProvisionErrorPersistsBranchAndKeepsRoot(t *test
 	if resp.Status != string(meta.TenantProvisioning) || resp.APIKey == "" {
 		t.Fatalf("unexpected fork response: %+v", resp)
 	}
+	if resp.Message != "Migrating fork data. Large tenants may take a few minutes." {
+		t.Fatalf("message = %q", resp.Message)
+	}
 	waitForCondition(t, func() bool {
 		return len(rt.prov.deletedBranches()) >= 1
 	})
@@ -270,6 +273,9 @@ func TestCreateForkTenantPersistsGeneratedBranchPassword(t *testing.T) {
 	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork")
 	if err != nil {
 		t.Fatalf("createForkTenant: %v", err)
+	}
+	if resp.Message != "Migrating fork data. Large tenants may take a few minutes." {
+		t.Fatalf("message = %q", resp.Message)
 	}
 
 	forkTenant, err := rt.meta.GetTenant(context.Background(), resp.TenantID)
