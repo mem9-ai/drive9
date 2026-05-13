@@ -670,11 +670,71 @@ func CanonicalJSONRaw(raw json.RawMessage) (json.RawMessage, error) {
 	if dec.More() {
 		return nil, fmt.Errorf("multiple JSON values")
 	}
-	b, err := json.Marshal(v)
-	if err != nil {
+	var out bytes.Buffer
+	if err := writeCanonicalJSON(&out, v); err != nil {
 		return nil, err
 	}
-	return b, nil
+	return out.Bytes(), nil
+}
+
+func writeCanonicalJSON(out *bytes.Buffer, v any) error {
+	switch x := v.(type) {
+	case nil:
+		out.WriteString("null")
+	case bool:
+		if x {
+			out.WriteString("true")
+		} else {
+			out.WriteString("false")
+		}
+	case string:
+		b, err := json.Marshal(x)
+		if err != nil {
+			return err
+		}
+		out.Write(b)
+	case json.Number:
+		if !json.Valid([]byte(x.String())) {
+			return fmt.Errorf("invalid JSON number %q", x.String())
+		}
+		out.WriteString(x.String())
+	case []any:
+		out.WriteByte('[')
+		for i, item := range x {
+			if i > 0 {
+				out.WriteByte(',')
+			}
+			if err := writeCanonicalJSON(out, item); err != nil {
+				return err
+			}
+		}
+		out.WriteByte(']')
+	case map[string]any:
+		keys := make([]string, 0, len(x))
+		for key := range x {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		out.WriteByte('{')
+		for i, key := range keys {
+			if i > 0 {
+				out.WriteByte(',')
+			}
+			keyRaw, err := json.Marshal(key)
+			if err != nil {
+				return err
+			}
+			out.Write(keyRaw)
+			out.WriteByte(':')
+			if err := writeCanonicalJSON(out, x[key]); err != nil {
+				return err
+			}
+		}
+		out.WriteByte('}')
+	default:
+		return fmt.Errorf("unsupported canonical JSON type %T", v)
+	}
+	return nil
 }
 
 func FormatTime(t time.Time) string {

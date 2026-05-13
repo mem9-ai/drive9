@@ -69,6 +69,7 @@ type Server struct {
 	events              *eventBuses
 	semanticWorker      *semanticWorkerManager
 	journalCursorSecret []byte
+	objectGCWorker      *objectGCWorker
 }
 
 var (
@@ -164,6 +165,8 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
 	mux.Handle("/v2/uploads/", business)
+	mux.Handle("/v1/ctx/fork", business)
+	mux.Handle("/v1/ctx", business)
 	mux.Handle("/v1/sql", business)
 	mux.Handle("/v1/events", business)
 	mux.Handle("/v1/journals", business)
@@ -229,6 +232,7 @@ func NewWithConfig(cfg Config) *Server {
 	s.mux = mux
 	if s.meta != nil && s.pool != nil && s.provisioner != nil {
 		s.resumeProvisioningTenants()
+		s.resumeDeletingForkTenants()
 	}
 	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
 	appManagedTaskTypes := semanticWorkerLogTaskTypesFromTypes(appManagedSemanticTaskTypes(cfg.SemanticEmbedder))
@@ -263,12 +267,22 @@ func NewWithConfig(cfg Config) *Server {
 			zap.Bool("pool_present", cfg.Pool != nil),
 			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()))
 	}
+	s.objectGCWorker = newObjectGCWorker(cfg.Meta, cfg.Pool)
+	if s.objectGCWorker != nil {
+		logger.Info("server_object_gc_worker_enabled")
+		s.objectGCWorker.Start(backgroundWithTrace(context.Background()))
+	} else {
+		logger.Info("server_object_gc_worker_disabled")
+	}
 	return s
 }
 
 func (s *Server) Close() {
 	if s.semanticWorker != nil {
 		s.semanticWorker.Stop()
+	}
+	if s.objectGCWorker != nil {
+		s.objectGCWorker.Stop()
 	}
 }
 
@@ -281,6 +295,12 @@ func (s *Server) resumeProvisioningTenants() {
 	}
 	for i := range tenants {
 		t := tenants[i]
+		if t.Kind == meta.TenantKindFork {
+			logger.Warn(ctx, "resume_provisioning_fork_skipped",
+				zap.String("tenant_id", t.ID),
+				zap.String("parent_tenant_id", t.ParentTenantID))
+			continue
+		}
 		go s.resumeTenantSchemaInit(t)
 	}
 }
@@ -350,6 +370,10 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleUploadAction(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v2/uploads/"):
 		s.handleV2Uploads(w, r)
+	case r.URL.Path == "/v1/ctx/fork":
+		s.handleCtxFork(w, r)
+	case r.URL.Path == "/v1/ctx":
+		s.handleCtxDelete(w, r)
 	case r.URL.Path == "/v1/sql":
 		s.handleSQL(w, r)
 	case r.URL.Path == "/v1/events":
@@ -524,6 +548,10 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 			s.handleRename(w, r, path)
 		} else if r.URL.Query().Has("mkdir") {
 			s.handleMkdir(w, r, path)
+		} else if r.URL.Query().Has("chmod") {
+			s.handleChmod(w, r, path)
+		} else if r.URL.Query().Has("create") {
+			s.handleCreate(w, r, path)
 		} else {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_unknown_post_action", "path", path)...)
 			errJSON(w, http.StatusBadRequest, "unknown POST action")
@@ -631,10 +659,12 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "list_ok", "path", path, "entries", len(entries))...)
 	type entry struct {
-		Name  string `json:"name"`
-		Size  int64  `json:"size"`
-		IsDir bool   `json:"isDir"`
-		Mtime int64  `json:"mtime,omitempty"`
+		Name    string `json:"name"`
+		Size    int64  `json:"size"`
+		IsDir   bool   `json:"isDir"`
+		Mtime   int64  `json:"mtime,omitempty"`
+		Mode    uint32 `json:"mode,omitempty"`
+		HasMode bool   `json:"hasMode"`
 	}
 	out := make([]entry, 0, len(entries))
 	for _, e := range entries {
@@ -642,7 +672,8 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		if !e.ModTime.IsZero() {
 			mtime = e.ModTime.Unix()
 		}
-		out = append(out, entry{Name: e.Name, Size: e.Size, IsDir: e.IsDir, Mtime: mtime})
+		hasMode := e.Meta.Content["hasMode"] == "true"
+		out = append(out, entry{Name: e.Name, Size: e.Size, IsDir: e.IsDir, Mtime: mtime, Mode: e.Mode, HasMode: hasMode})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"entries": out})
@@ -1108,6 +1139,8 @@ type batchStatResult struct {
 	IsDir    bool   `json:"isDir"`
 	Revision int64  `json:"revision,omitempty"`
 	Mtime    int64  `json:"mtime,omitempty"`
+	Mode     uint32 `json:"mode,omitempty"`
+	HasMode  bool   `json:"hasMode"`
 }
 
 type batchReadSmallRequest struct {
@@ -1270,6 +1303,8 @@ func (s *Server) batchStatOne(ctx context.Context, b *backend.Dat9Backend, rawPa
 	}
 	result.Status = http.StatusOK
 	result.IsDir = nf.Node.IsDirectory
+	result.HasMode = nf.HasMode
+	result.Mode = nf.Mode
 	if nf.File != nil {
 		result.Size = nf.File.SizeBytes
 		result.Revision = nf.File.Revision
@@ -1355,6 +1390,9 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	} else {
 		w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(nf.Node.CreatedAt.Unix(), 10))
 	}
+	if nf.HasMode {
+		w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(nf.Mode), 10))
+	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_ok", "path", path, "is_dir", nf.Node.IsDirectory)...)
 	w.WriteHeader(http.StatusOK)
 }
@@ -1367,23 +1405,34 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 		return
 	}
 	recursive := r.URL.Query().Has("recursive")
+	kind := r.URL.Query().Get("kind")
 	var err error
 	if recursive {
 		err = b.RemoveAllCtx(r.Context(), path)
 	} else {
-		err = b.RemoveCtx(r.Context(), path)
+		switch kind {
+		case "":
+			err = b.RemoveCtx(r.Context(), path)
+		case "file":
+			err = b.RemoveFileCtx(r.Context(), path)
+		case "dir":
+			err = b.RemoveDirCtx(r.Context(), path)
+		default:
+			errJSON(w, http.StatusBadRequest, "invalid delete kind")
+			return
+		}
 	}
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "delete_not_found", "path", path, "recursive", recursive)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "delete_not_found", "path", path, "recursive", recursive, "kind", kind)...)
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "delete_failed", "path", path, "recursive", recursive, "error", err)...)
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "delete_failed", "path", path, "recursive", recursive, "kind", kind, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "delete_ok", "path", path, "recursive", recursive)...)
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "delete_ok", "path", path, "recursive", recursive, "kind", kind)...)
 	s.publishEvent(r, path, "delete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
@@ -1456,7 +1505,13 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	if err := b.MkdirCtx(r.Context(), path, 0o755); err != nil {
+	mode := uint32(0o755)
+	if mStr := r.URL.Query().Get("mode"); mStr != "" {
+		if m, err := strconv.ParseUint(mStr, 10, 32); err == nil {
+			mode = uint32(m)
+		}
+	}
+	if err := b.MkdirCtx(r.Context(), path, mode); err != nil {
 		if errors.Is(err, datastore.ErrPathConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "mkdir_conflict", "path", path, "error", err)...)
 			errJSON(w, http.StatusConflict, err.Error())
@@ -1469,6 +1524,59 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "mkdir_ok", "path", path)...)
 	s.publishEvent(r, path, "mkdir")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "chmod_missing_scope", "path", path)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+
+	var req struct {
+		Mode uint32 `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "chmod_bad_body", "path", path, "error", err)...)
+		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	if err := b.ChmodCtx(r.Context(), path, req.Mode); err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "not found")
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "chmod_failed", "path", path, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "chmod_ok", "path", path)...)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path string) {
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_missing_scope", "path", path)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	if err := b.CreateCtx(r.Context(), path); err != nil {
+		if errors.Is(err, datastore.ErrPathConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_conflict", "path", path, "error", err)...)
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "create_failed", "path", path, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "create_ok", "path", path)...)
+	s.publishEvent(r, path, "create")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
 }
 
 func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {

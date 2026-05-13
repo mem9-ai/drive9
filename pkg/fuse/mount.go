@@ -37,8 +37,8 @@ type MountOptions struct {
 	CacheDir              string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
 	CacheSize             int64         // ReadCache max size in bytes (default 128MB)
 	DirTTL                time.Duration // DirCache TTL (default 10s)
-	AttrTTL               time.Duration // kernel attr cache TTL (default 10s)
-	EntryTTL              time.Duration // kernel entry cache TTL (default 10s)
+	AttrTTL               time.Duration // kernel attr cache TTL (default 60s)
+	EntryTTL              time.Duration // kernel entry cache TTL (default 60s)
 	NegativeEntryTTL      time.Duration // kernel negative entry cache TTL (default 10s)
 	FlushDebounce         time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
 	SyncMode              SyncMode      // interactive, strict, or auto (default auto)
@@ -59,6 +59,11 @@ type MountOptions struct {
 }
 
 func (o *MountOptions) setDefaults() {
+	// Apply profile defaults before generic defaults so profile-specific
+	// zero-value options can take effect while explicit non-zero values win.
+	if o.Profile == "interactive" {
+		ApplyInteractiveProfile(o)
+	}
 	if o.CacheSize <= 0 {
 		o.CacheSize = defaultReadCacheMaxSize
 	}
@@ -66,10 +71,10 @@ func (o *MountOptions) setDefaults() {
 		o.DirTTL = defaultDirCacheTTL
 	}
 	if o.AttrTTL <= 0 {
-		o.AttrTTL = 10 * time.Second
+		o.AttrTTL = defaultPositiveKernelCacheTTL
 	}
 	if o.EntryTTL <= 0 {
-		o.EntryTTL = 10 * time.Second
+		o.EntryTTL = defaultPositiveKernelCacheTTL
 	}
 	if o.NegativeEntryTTL <= 0 {
 		o.NegativeEntryTTL = 10 * time.Second
@@ -102,10 +107,6 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.PrefetchTimeout <= 0 {
 		o.PrefetchTimeout = defaultReadDirPrefetchTimeout
-	}
-	// Apply interactive profile if requested.
-	if o.Profile == "interactive" {
-		ApplyInteractiveProfile(o)
 	}
 }
 

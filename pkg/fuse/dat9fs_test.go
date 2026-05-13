@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -555,6 +556,72 @@ func TestReadZeroLengthFromWritableCleanBuffer(t *testing.T) {
 	}
 	if got := getCalls.Load(); got != 0 {
 		t.Fatalf("GET calls = %d, want 0", got)
+	}
+}
+
+func TestReadCacheCachesMediumSmallFileAfterFirstRead(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), defaultSmallFileThreshold+1024)
+	var getCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			getCalls.Add(1)
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			_, _ = w.Write(data)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	const rev = 11
+	ino := fs.inodes.Lookup("/medium.bin", false, int64(len(data)), time.Now())
+	fs.inodes.UpdateRevision(ino, rev)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("first Read status = %v, want OK", st)
+	}
+	first, _ := result.Bytes(buf)
+	if string(first) != string(data[:len(buf)]) {
+		t.Fatalf("first Read = %q, want prefix", string(first))
+	}
+
+	result, st = fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Offset:   128,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("second Read status = %v, want OK", st)
+	}
+	second, _ := result.Bytes(buf)
+	if string(second) != string(data[128:128+len(buf)]) {
+		t.Fatalf("second Read = %q, want prefix", string(second))
+	}
+	if got := getCalls.Load(); got != 1 {
+		t.Fatalf("GET calls = %d, want 1", got)
 	}
 }
 
@@ -1519,7 +1586,7 @@ func TestLookupSessionCreatedDirMissAvoidsRemoteStat(t *testing.T) {
 	var headCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.RawQuery == "mkdir":
+		case r.Method == http.MethodPost && (r.URL.RawQuery == "mkdir" || r.URL.RawQuery == "mkdir&mode=0"):
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodHead:
 			headCalls.Add(1)
@@ -2353,6 +2420,31 @@ func TestHTTPToFuseStatus_PreservesRevisionConflictAsEIO(t *testing.T) {
 	}
 }
 
+func TestIsCreateActionUnsupportedErr(t *testing.T) {
+	if !isCreateActionUnsupportedErr(&client.StatusError{StatusCode: http.StatusBadRequest, Message: "unknown POST action"}) {
+		t.Fatal("unknown POST action should be treated as unsupported create action")
+	}
+	if !isCreateActionUnsupportedErr(&client.StatusError{StatusCode: http.StatusNotFound, Message: ""}) {
+		t.Fatal("plain 404 should be treated as unsupported create action")
+	}
+	if isCreateActionUnsupportedErr(&client.StatusError{StatusCode: http.StatusBadRequest, Message: "invalid path"}) {
+		t.Fatal("plain bad request should not be treated as unsupported create action")
+	}
+}
+
+func TestDeleteRemotePathRejectsInvalidKind(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	err := fs.deleteRemotePathWithInterruptRecovery(context.Background(), "/file.txt", deleteKind(""))
+	if err == nil {
+		t.Fatal("deleteRemotePathWithInterruptRecovery error = nil, want invalid kind error")
+	}
+	if !strings.Contains(err.Error(), "unsupported delete kind") {
+		t.Fatalf("error = %v, want unsupported delete kind", err)
+	}
+}
+
 // TestHTTPToFuseStatus_MapsClientClosedRequestToEAGAIN locks the contract
 // between the server's tenantAuthMiddleware (which writes 499 when a request
 // is canceled mid-auth) and the FUSE client. Without this mapping, a canceled
@@ -2447,17 +2539,95 @@ func TestOpenWritableLargeFileGetsLazyPreload(t *testing.T) {
 	}
 }
 
-func TestDefaultTTLIs10Seconds(t *testing.T) {
+func TestLazyWritablePreloadUsesRenamedPath(t *testing.T) {
+	const size = int64(1024 * 1024)
+	var getPath string
+
+	fs, ino, cleanup := newTestDat9FS(t, size, func(w http.ResponseWriter, r *http.Request) {
+		getPath = r.URL.Path
+		if !strings.HasSuffix(r.URL.Path, "/new.bin") {
+			http.Error(w, "unexpected read path "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte("renamed-data"))
+	})
+	defer cleanup()
+
+	oldPath := "/file.bin"
+	newPath := "/new.bin"
+	fh := &FileHandle{Ino: ino, Path: oldPath}
+	if st := fs.preloadWritableHandle(context.Background(), fh); st != gofuse.OK {
+		t.Fatalf("preloadWritableHandle status = %v, want OK", st)
+	}
+	if fh.Dirty == nil || fh.Dirty.LoadPart == nil {
+		t.Fatal("expected lazy dirty buffer")
+	}
+	fhID := fs.allocateFileHandle(fh)
+	defer fs.deleteFileHandle(fhID, fh)
+
+	fs.finishLocalRename(&gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Newdir:   1,
+	}, oldPath, newPath)
+	if fh.Path != newPath {
+		t.Fatalf("file handle path after rename = %q, want %q", fh.Path, newPath)
+	}
+
+	fh.Lock()
+	err := fh.Dirty.EnsureLoaded(0)
+	fh.Unlock()
+	if err != nil {
+		t.Fatalf("EnsureLoaded after rename: %v", err)
+	}
+	if !strings.HasSuffix(getPath, newPath) {
+		t.Fatalf("lazy load GET path = %q, want suffix %q", getPath, newPath)
+	}
+}
+
+func TestDefaultTTLIs60Seconds(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
-	if opts.AttrTTL != 10*time.Second {
-		t.Fatalf("default AttrTTL = %v, want 10s", opts.AttrTTL)
+	if opts.AttrTTL != defaultPositiveKernelCacheTTL {
+		t.Fatalf("default AttrTTL = %v, want %v", opts.AttrTTL, defaultPositiveKernelCacheTTL)
 	}
-	if opts.EntryTTL != 10*time.Second {
-		t.Fatalf("default EntryTTL = %v, want 10s", opts.EntryTTL)
+	if opts.EntryTTL != defaultPositiveKernelCacheTTL {
+		t.Fatalf("default EntryTTL = %v, want %v", opts.EntryTTL, defaultPositiveKernelCacheTTL)
 	}
 	if opts.NegativeEntryTTL != 10*time.Second {
 		t.Fatalf("default NegativeEntryTTL = %v, want 10s", opts.NegativeEntryTTL)
+	}
+}
+
+func TestInteractiveProfileAppliesTTLDefaults(t *testing.T) {
+	opts := &MountOptions{Profile: "interactive"}
+	opts.setDefaults()
+	if opts.AttrTTL != time.Second {
+		t.Fatalf("interactive AttrTTL = %v, want 1s", opts.AttrTTL)
+	}
+	if opts.EntryTTL != time.Second {
+		t.Fatalf("interactive EntryTTL = %v, want 1s", opts.EntryTTL)
+	}
+	if opts.DirTTL != 2*time.Second {
+		t.Fatalf("interactive DirTTL = %v, want 2s", opts.DirTTL)
+	}
+}
+
+func TestInteractiveProfileKeepsExplicitTTLs(t *testing.T) {
+	opts := &MountOptions{
+		Profile:  "interactive",
+		AttrTTL:  5 * time.Second,
+		EntryTTL: 6 * time.Second,
+		DirTTL:   7 * time.Second,
+	}
+	opts.setDefaults()
+	if opts.AttrTTL != 5*time.Second {
+		t.Fatalf("explicit AttrTTL = %v, want 5s", opts.AttrTTL)
+	}
+	if opts.EntryTTL != 6*time.Second {
+		t.Fatalf("explicit EntryTTL = %v, want 6s", opts.EntryTTL)
+	}
+	if opts.DirTTL != 7*time.Second {
+		t.Fatalf("explicit DirTTL = %v, want 7s", opts.DirTTL)
 	}
 }
 
@@ -2492,13 +2662,14 @@ func TestLookupReturnsTTLInEntryOut(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("Lookup status = %v, want OK", st)
 	}
-	// The entry timeout should match the configured TTL (10s default).
+	// The entry timeout should match the configured default TTL.
 	// go-fuse stores timeouts in seconds + nanoseconds.
-	if out.EntryValid < 10 || out.EntryValid > 11 {
-		t.Fatalf("EntryValid = %d, want ~10 (10s TTL)", out.EntryValid)
+	wantSeconds := uint64(defaultPositiveKernelCacheTTL / time.Second)
+	if out.EntryValid < wantSeconds || out.EntryValid > wantSeconds+1 {
+		t.Fatalf("EntryValid = %d, want ~%d", out.EntryValid, wantSeconds)
 	}
-	if out.AttrValid < 10 || out.AttrValid > 11 {
-		t.Fatalf("AttrValid = %d, want ~10 (10s TTL)", out.AttrValid)
+	if out.AttrValid < wantSeconds || out.AttrValid > wantSeconds+1 {
+		t.Fatalf("AttrValid = %d, want ~%d", out.AttrValid, wantSeconds)
 	}
 }
 
@@ -2619,7 +2790,7 @@ func TestMkdirRetriesDetachedAfterTransientInterrupt(t *testing.T) {
 	var mkdirCalls atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.RawQuery == "mkdir":
+		case r.Method == http.MethodPost && (r.URL.RawQuery == "mkdir" || r.URL.RawQuery == "mkdir&mode=0"):
 			if r.URL.Path != "/v1/fs/dir" {
 				t.Fatalf("POST path = %q, want /v1/fs/dir", r.URL.Path)
 			}
@@ -2660,7 +2831,7 @@ func TestMkdirRetryTreatsRemoteDirectoryAsSuccessAfterAmbiguousCreate(t *testing
 	var statCalls atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.RawQuery == "mkdir":
+		case r.Method == http.MethodPost && (r.URL.RawQuery == "mkdir" || r.URL.RawQuery == "mkdir&mode=0"):
 			switch mkdirCalls.Add(1) {
 			case 1:
 				w.WriteHeader(statusClientClosedRequest)
@@ -3151,6 +3322,83 @@ func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
 	}
 	if entry.Revision != 8 {
 		t.Fatalf("inode revision = %d, want 8", entry.Revision)
+	}
+}
+
+func TestReleaseNewEmptyFileUsesCreateAction(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		handlerErr  error
+		createCalls atomic.Int32
+		putCalls    atomic.Int32
+	)
+	recordHandlerErr := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			if r.URL.Path != "/v1/fs/empty.txt" {
+				recordHandlerErr(fmt.Errorf("path = %s, want /v1/fs/empty.txt", r.URL.Path))
+				http.Error(w, "bad path", http.StatusBadRequest)
+				return
+			}
+			if !r.URL.Query().Has("create") {
+				recordHandlerErr(fmt.Errorf("query = %q, want create action", r.URL.RawQuery))
+				http.Error(w, "bad query", http.StatusBadRequest)
+				return
+			}
+			createCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
+		case http.MethodPut:
+			putCalls.Add(1)
+			http.Error(w, "unexpected PUT", http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "empty.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: out.Fh})
+
+	mu.Lock()
+	err := handlerErr
+	mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := createCalls.Load(); got != 1 {
+		t.Fatalf("create calls = %d, want 1", got)
+	}
+	if got := putCalls.Load(); got != 0 {
+		t.Fatalf("PUT calls = %d, want 0", got)
+	}
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("created inode entry not found")
+	}
+	if entry.Size != 0 {
+		t.Fatalf("entry size = %d, want 0", entry.Size)
+	}
+	if entry.Revision != 1 {
+		t.Fatalf("entry revision = %d, want 1", entry.Revision)
 	}
 }
 
@@ -5421,6 +5669,45 @@ func TestUnlinkRemoteDeleteAcceptsGoneAfterInterrupt(t *testing.T) {
 	}
 }
 
+func TestUnlinkAndRmdirUseDeleteKindHints(t *testing.T) {
+	var fileQuery atomic.Value
+	var dirQuery atomic.Value
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/file.txt":
+			fileQuery.Store(r.URL.RawQuery)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/dir":
+			dirQuery.Store(r.URL.RawQuery)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.inodes.Lookup("/file.txt", false, 4, time.Now())
+	fs.inodes.Lookup("/dir", true, 0, time.Now())
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "file.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+	if st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir"); st != gofuse.OK {
+		t.Fatalf("Rmdir: %v", st)
+	}
+
+	if got, _ := fileQuery.Load().(string); got != "kind=file" {
+		t.Fatalf("file delete query = %q, want kind=file", got)
+	}
+	if got, _ := dirQuery.Load().(string); got != "kind=dir" {
+		t.Fatalf("dir delete query = %q, want kind=dir", got)
+	}
+}
+
 func TestRmdirRemoteDeleteDoesNotRetryRecreatedPathAfterInterrupt(t *testing.T) {
 	path := "/repo/emptydir"
 
@@ -6596,5 +6883,81 @@ func TestSetAttr_NoKernelNotify(t *testing.T) {
 	after := fs.notifyCount.Load()
 	if delta := after - before; delta != 0 {
 		t.Fatalf("SetAttr produced %d kernel notify calls, want 0", delta)
+	}
+}
+
+
+// TestLookupParsesModeHeader verifies that Lookup reads the X-Dat9-Mode header
+// from the remote stat response and stores it in the inode entry.
+func TestLookupParsesModeHeader(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Fatalf("method = %s, want HEAD", r.Method)
+		}
+		w.Header().Set("Content-Length", "9")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Mode", "384") // 0o600 in decimal
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "secure.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+
+	// Verify the EntryOut attr reflects the mode.
+	if out.Mode != syscall.S_IFREG|0o600 {
+		t.Errorf("EntryOut mode = %o, want %o", out.Mode, syscall.S_IFREG|0o600)
+	}
+
+	// Verify the inode table also stores the mode.
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Mode != 0o600 {
+		t.Errorf("inode mode = %o, want 0o600", entry.Mode)
+	}
+}
+
+// TestLookupParsesModeHeaderDir verifies that Lookup reads X-Dat9-Mode for directories.
+func TestLookupParsesModeHeaderDir(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Fatalf("method = %s, want HEAD", r.Method)
+		}
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("X-Dat9-IsDir", "true")
+		w.Header().Set("X-Dat9-Mode", "448") // 0o700 in decimal
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "privatedir", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+
+	if out.Mode != syscall.S_IFDIR|0o700 {
+		t.Errorf("EntryOut mode = %o, want %o", out.Mode, syscall.S_IFDIR|0o700)
+	}
+
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Mode != 0o700 {
+		t.Errorf("inode mode = %o, want 0o700", entry.Mode)
 	}
 }

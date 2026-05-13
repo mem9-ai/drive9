@@ -31,6 +31,7 @@ type Dat9FS struct {
 	client      *client.Client
 	inodes      *InodeToPath
 	fileHandles *HandleTable[*FileHandle]
+	openHandles *OpenHandleIndex
 	dirHandles  *HandleTable[*DirHandle]
 	readCache   *ReadCache
 	dirCache    *DirCache
@@ -171,6 +172,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		client:        c,
 		inodes:        NewInodeToPath(),
 		fileHandles:   NewHandleTable[*FileHandle](),
+		openHandles:   NewOpenHandleIndex(),
 		dirHandles:    NewHandleTable[*DirHandle](),
 		readCache:     NewReadCache(opts.CacheSize, 0),
 		dirCache:      NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
@@ -264,6 +266,9 @@ func releaseTimeout(size int64) time.Duration {
 // timeout expires. This ensures HTTP calls never block indefinitely.
 func fuseCtx(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
 	ctx, cf := context.WithTimeout(context.Background(), fuseTimeout)
+	if cancel == nil {
+		return ctx, cf
+	}
 	go func() {
 		select {
 		case <-cancel:
@@ -420,8 +425,14 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 	}
 
 	var matching []*FileHandle
-	for _, fh := range fs.fileHandles.Snapshot() {
-		if fh != nil && fh.Path == remotePath && fh.Dirty != nil {
+	for _, fh := range fs.openHandles.SnapshotPath(remotePath) {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		dirty := fh.Dirty != nil
+		fh.Unlock()
+		if dirty {
 			matching = append(matching, fh)
 		}
 	}
@@ -490,9 +501,11 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 	// Uses a bounded timeout so a stalled server cannot block the FUSE handler
 	// (and its held fh.mu) indefinitely.
 	c := fs.client
-	filePath := fh.Path
-	remoteFilePath := fs.remotePath(filePath)
 	fh.Dirty.LoadPart = func(partNum int) ([]byte, error) {
+		// WriteBuffer callers hold fh.mu. Resolve the path at load time so an
+		// open handle renamed before lazy loading reads from the new remote path.
+		filePath := fh.Path
+		remoteFilePath := fs.remotePath(filePath)
 		partIdx := partNum - 1
 		offset := int64(partIdx) * partSize
 		length := partSize
@@ -533,7 +546,7 @@ func (fs *Dat9FS) preloadWritableHandleFromReadCacheLocked(fh *FileHandle) bool 
 	if fs.readCache == nil || fh == nil || fh.Dirty == nil {
 		return false
 	}
-	if fh.OrigSize <= 0 || fh.OrigSize > defaultSmallFileThreshold || fh.BaseRev <= 0 {
+	if fh.OrigSize <= 0 || fh.OrigSize > defaultReadCacheMaxFileSize || fh.BaseRev <= 0 {
 		return false
 	}
 
@@ -741,10 +754,18 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 	out.SetTimes(&mtime, &mtime, &mtime)
 
 	if entry.IsDir {
-		out.Mode = syscall.S_IFDIR | 0755
+		mode := entry.Mode
+		if !entry.HasMode {
+			mode = 0755
+		}
+		out.Mode = syscall.S_IFDIR | mode
 		out.Nlink = 2
 	} else {
-		out.Mode = syscall.S_IFREG | 0644
+		mode := entry.Mode
+		if !entry.HasMode {
+			mode = 0644
+		}
+		out.Mode = syscall.S_IFREG | mode
 		out.Nlink = 1
 	}
 }
@@ -879,6 +900,21 @@ func isConflictErr(err error) bool {
 	}
 	var se *client.StatusError
 	return errors.As(err, &se) && se.StatusCode == http.StatusConflict
+}
+
+func isCreateActionUnsupportedErr(err error) bool {
+	var se *client.StatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	if se.StatusCode == http.StatusNotFound {
+		return true
+	}
+	if se.StatusCode != http.StatusBadRequest && se.StatusCode != http.StatusMethodNotAllowed {
+		return false
+	}
+	msg := strings.ToLower(se.Message)
+	return strings.Contains(msg, "unknown post action") || strings.Contains(msg, "method not allowed")
 }
 
 // errReadRetriesExhausted is a sentinel indicating all detached read retries
@@ -1109,10 +1145,12 @@ func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
 			mtime = time.Unix(item.Mtime, 0)
 		}
 		cached[i] = CachedFileInfo{
-			Name:  item.Name,
-			Size:  item.Size,
-			IsDir: item.IsDir,
-			Mtime: mtime,
+			Name:    item.Name,
+			Size:    item.Size,
+			IsDir:   item.IsDir,
+			Mtime:   mtime,
+			Mode:    item.Mode,
+			HasMode: item.HasMode,
 		}
 	}
 	return cached
@@ -1176,6 +1214,8 @@ func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
 		IsDir:    entry.IsDir,
 		Mtime:    mtime,
 		Revision: entry.Revision,
+		Mode:     entry.Mode,
+		HasMode:  entry.HasMode,
 	}
 }
 
@@ -1189,6 +1229,8 @@ func cachedInfoFromStat(name string, stat *client.StatResult) CachedFileInfo {
 		item.Size = stat.Size
 		item.IsDir = stat.IsDir
 		item.Revision = stat.Revision
+		item.HasMode = stat.HasMode
+		item.Mode = stat.Mode
 	}
 	return item
 }
@@ -1276,11 +1318,11 @@ func (fs *Dat9FS) remotePathExistsDetached(localPath string) (bool, error) {
 	return false, err
 }
 
-func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string) error {
+func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string, mode uint32) error {
 	apiPath := fs.remotePath(localPath)
 	ctx, cf := fuseCtx(cancel)
 	mutationStart := fs.perfStart()
-	err := fs.client.MkdirCtx(ctx, apiPath)
+	err := fs.client.MkdirCtx(ctx, apiPath, mode)
 	cf()
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err == nil || !isTransientLookupErr(err) {
@@ -1303,7 +1345,7 @@ func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPat
 	for range retryCount {
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
 		mutationStart = fs.perfStart()
-		err = fs.client.MkdirCtx(retryCtx, apiPath)
+		err = fs.client.MkdirCtx(retryCtx, apiPath, mode)
 		retryCancel()
 		fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 		if err == nil {
@@ -1323,9 +1365,33 @@ func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPat
 	return lastErr
 }
 
-func (fs *Dat9FS) deleteRemoteWithInterruptRecovery(ctx context.Context, localPath string) error {
+type deleteKind string
+
+const (
+	deleteKindFile deleteKind = "file"
+	deleteKindDir  deleteKind = "dir"
+)
+
+func (fs *Dat9FS) deleteRemoteFileWithInterruptRecovery(ctx context.Context, localPath string) error {
+	return fs.deleteRemotePathWithInterruptRecovery(ctx, localPath, deleteKindFile)
+}
+
+func (fs *Dat9FS) deleteRemoteDirWithInterruptRecovery(ctx context.Context, localPath string) error {
+	return fs.deleteRemotePathWithInterruptRecovery(ctx, localPath, deleteKindDir)
+}
+
+func (fs *Dat9FS) deleteRemotePathWithInterruptRecovery(ctx context.Context, localPath string, kind deleteKind) error {
 	mutationStart := fs.perfStart()
-	err := fs.client.DeleteCtx(ctx, fs.remotePath(localPath))
+	remotePath := fs.remotePath(localPath)
+	var err error
+	switch kind {
+	case deleteKindFile:
+		err = fs.client.DeleteFileCtx(ctx, remotePath)
+	case deleteKindDir:
+		err = fs.client.DeleteDirCtx(ctx, remotePath)
+	default:
+		err = fmt.Errorf("unsupported delete kind %q", kind)
+	}
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err == nil || !isTransientLookupErr(err) {
 		return err
@@ -1404,6 +1470,9 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 		ino := fs.inodes.Lookup(childP, item.IsDir, item.Size, mtime)
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
+		}
+		if item.HasMode {
+			fs.inodes.UpdateMode(ino, item.Mode)
 		}
 		entry, ok := fs.inodes.GetEntry(ino)
 		if !ok {
@@ -1584,6 +1653,9 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 					mtime = time.Unix(item.Mtime, 0)
 				}
 				ino := fs.inodes.Lookup(childP, item.IsDir, item.Size, mtime)
+				if item.HasMode {
+					fs.inodes.UpdateMode(ino, item.Mode)
+				}
 				entry, ok := fs.inodes.GetEntry(ino)
 				if !ok {
 					return gofuse.EIO
@@ -1608,6 +1680,9 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// Store server revision for cache validation.
 	if stat.Revision > 0 {
 		fs.inodes.UpdateRevision(ino, stat.Revision)
+	}
+	if stat.HasMode {
+		fs.inodes.UpdateMode(ino, stat.Mode)
 	}
 	fs.dirCache.Upsert(parentPath, cachedInfoFromStat(name, stat))
 	entry, ok := fs.inodes.GetEntry(ino)
@@ -1638,17 +1713,7 @@ func (fs *Dat9FS) shouldPreserveForgottenInode(entry *InodeEntry) bool {
 }
 
 func (fs *Dat9FS) hasOpenHandle(ino uint64, p string) bool {
-	// TODO: if git/package-manager workloads keep many handles open, maintain
-	// path/inode indexes instead of scanning the whole handle table.
-	for _, fh := range fs.fileHandles.Snapshot() {
-		if fh == nil {
-			continue
-		}
-		if fh.Ino == ino || fh.Path == p {
-			return true
-		}
-	}
-	return false
+	return fs.openHandles.Has(ino, p)
 }
 
 func (fs *Dat9FS) hasPendingLocalState(p string) bool {
@@ -1673,11 +1738,15 @@ func (fs *Dat9FS) hasQueuedCommit(p string) bool {
 }
 
 func (fs *Dat9FS) openHandleEntry(p string) (*InodeEntry, bool) {
-	for _, fh := range fs.fileHandles.Snapshot() {
-		if fh == nil || fh.Path != p || fh.Dirty == nil {
+	for _, fh := range fs.openHandles.SnapshotPath(p) {
+		if fh == nil {
 			continue
 		}
 		fh.Lock()
+		if fh.Dirty == nil {
+			fh.Unlock()
+			continue
+		}
 		size := fh.Dirty.Size()
 		fh.Unlock()
 		// This path reconstructs a dentry for an already-open writable file
@@ -1800,6 +1869,36 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		fs.inodes.UpdateMtime(input.NodeId, mtime)
 	}
 
+	// Handle mode (chmod)
+	if input.Valid&gofuse.FATTR_MODE != 0 {
+		mode := input.Mode & 0777
+		// If the file has an open dirty handle, update mode locally without
+		// consulting the remote server. The mode will be synced on Flush.
+		// Use a single ForEach pass to avoid a TOCTOU race between the check
+		// and the mutation.
+		hasDirtyHandle := false
+		fs.fileHandles.ForEach(func(_ uint64, h *FileHandle) {
+			if h.Ino == input.NodeId && h.Dirty != nil {
+				hasDirtyHandle = true
+				h.PendingMode = mode
+				h.HasPendingMode = true
+				if !h.HasPreviousMode {
+					h.PreviousMode = entry.Mode
+					h.HasPreviousMode = true
+				}
+			}
+		})
+		if !hasDirtyHandle {
+			ctx, cf := fuseCtx(cancel)
+			defer cf()
+			if err := fs.client.ChmodCtx(ctx, fs.remotePath(entry.Path), mode); err != nil {
+				return httpToFuseStatus(err)
+			}
+		}
+		entry.Mode = mode
+		fs.inodes.UpdateMode(input.NodeId, mode)
+	}
+
 	// Handle truncate
 	if input.Valid&gofuse.FATTR_SIZE != 0 {
 		newSize := int64(input.Size)
@@ -1881,11 +1980,13 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 		return st
 	}
 
-	if err := fs.mkdirRemoteWithTransientRetry(cancel, childP); err != nil {
+	mode := input.Mode & 0o777
+	if err := fs.mkdirRemoteWithTransientRetry(cancel, childP, mode); err != nil {
 		return httpToFuseStatus(err)
 	}
 
 	ino := fs.inodes.Lookup(childP, true, 0, time.Now())
+	fs.inodes.UpdateMode(ino, mode)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
@@ -1974,7 +2075,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		// Tolerate 404 in case it was already deleted.
 		deleteStart := time.Now()
 		fs.debugf("unlink remote delete start path=%s", childP)
-		err := fs.deleteRemoteWithInterruptRecovery(ctx, childP)
+		err := fs.deleteRemoteFileWithInterruptRecovery(ctx, childP)
 		fs.debugDurationf(deleteStart, 0, "unlink remote delete done path=%s err=%v", childP, err)
 		if err != nil {
 			if !isNotFoundErr(err) {
@@ -2014,7 +2115,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 
 	deleteStart := time.Now()
 	fs.debugf("rmdir remote delete start path=%s", childP)
-	err := fs.deleteRemoteWithInterruptRecovery(ctx, childP)
+	err := fs.deleteRemoteDirWithInterruptRecovery(ctx, childP)
 	fs.debugDurationf(deleteStart, 0, "rmdir remote delete done path=%s err=%v", childP, err)
 	if err != nil {
 		status = httpToFuseStatus(err)
@@ -2025,16 +2126,14 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	// Without this, the uploader would try to PUT to paths under a deleted dir.
 	prefix := childP + "/"
 	if fs.writeBack != nil {
-		for p := range fs.writeBack.ListPendingPaths() {
-			if strings.HasPrefix(p, prefix) {
-				if fs.uploader != nil {
-					waitStart := time.Now()
-					fs.debugf("rmdir wait writeback start path=%s child=%s", childP, p)
-					fs.uploader.WaitPath(p)
-					fs.debugDurationf(waitStart, 0, "rmdir wait writeback done path=%s child=%s", childP, p)
-				}
-				fs.writeBack.Remove(p)
+		for _, meta := range fs.writeBack.ListByPrefix(prefix) {
+			if fs.uploader != nil {
+				waitStart := time.Now()
+				fs.debugf("rmdir wait writeback start path=%s child=%s", childP, meta.Path)
+				fs.uploader.WaitPath(meta.Path)
+				fs.debugDurationf(waitStart, 0, "rmdir wait writeback done path=%s child=%s", childP, meta.Path)
 			}
+			fs.writeBack.Remove(meta.Path)
 		}
 	}
 	// Cancel commitQueue entries for the subtree so background commits
@@ -2233,6 +2332,27 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	if oldEntryOK {
 		fs.dirCache.Upsert(newParent, cachedInfoFromEntry(path.Base(newP), oldEntry))
 	}
+	fs.retargetOpenHandlesForRename(oldP, newP)
+}
+
+func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
+	for fh, currentPath := range fs.openHandles.RenamePathPrefix(oldP, newP) {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		fh.Path = currentPath
+		if fh.Dirty != nil {
+			fh.Dirty.path = currentPath
+		}
+		if fh.Streamer != nil {
+			fh.Streamer.SetPath(currentPath, fs.remoteRoot())
+		}
+		if fh.Prefetch != nil {
+			fh.Prefetch.SetPath(fs.remotePath(currentPath))
+		}
+		fh.Unlock()
+	}
 }
 
 func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName string, newName string) (status gofuse.Status) {
@@ -2339,16 +2459,14 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	// re-keyed to newP+"/". Without this the uploader would PUT to stale paths.
 	prefix := oldP + "/"
 	if fs.writeBack != nil {
-		for p := range fs.writeBack.ListPendingPaths() {
-			if strings.HasPrefix(p, prefix) {
-				newChild := newP + p[len(oldP):]
-				if fs.uploader != nil {
-					fs.uploader.WaitPath(p)
-				}
-				fs.writeBack.RenamePending(p, newChild)
-				if fs.uploader != nil {
-					fs.uploader.Submit(newChild)
-				}
+		for _, meta := range fs.writeBack.ListByPrefix(prefix) {
+			newChild := newP + meta.Path[len(oldP):]
+			if fs.uploader != nil {
+				fs.uploader.WaitPath(meta.Path)
+			}
+			fs.writeBack.RenamePending(meta.Path, newChild)
+			if fs.uploader != nil {
+				fs.uploader.Submit(newChild)
 			}
 		}
 	}
@@ -2524,6 +2642,8 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 				item.Mtime = time.Unix(result.Mtime, 0)
 			}
 			item.Revision = result.Revision
+			item.HasMode = result.HasMode
+			item.Mode = result.Mode
 		}
 	}
 }
@@ -2541,23 +2661,23 @@ func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []D
 
 	// Overlay write-back cache entries.
 	if fs.writeBack != nil {
-		for p := range fs.writeBack.ListPendingPaths() {
-			if parentDir(p) != dirPath {
+		prefix := dirPath
+		if prefix != "/" {
+			prefix += "/"
+		}
+		for _, meta := range fs.writeBack.ListByPrefix(prefix) {
+			if parentDir(meta.Path) != dirPath {
 				continue
 			}
-			name := path.Base(p)
+			name := path.Base(meta.Path)
 			if _, ok := existing[name]; ok {
-				continue
-			}
-			meta, ok := fs.writeBack.GetMeta(p)
-			if !ok {
 				continue
 			}
 			mtime := meta.Mtime
 			if mtime.IsZero() {
 				mtime = time.Now()
 			}
-			ino := fs.inodes.EnsureInode(p, false, meta.Size, mtime)
+			ino := fs.inodes.EnsureInode(meta.Path, false, meta.Size, mtime)
 			entries = append(entries, DirEntry{
 				Name: name,
 				Ino:  ino,
@@ -2614,12 +2734,18 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
 		}
+		if item.HasMode {
+			fs.inodes.UpdateMode(ino, item.Mode)
+		}
 
 		var mode uint32
 		if item.IsDir {
 			mode = syscall.S_IFDIR
 		} else {
 			mode = syscall.S_IFREG
+		}
+		if item.HasMode {
+			mode |= item.Mode & 0o777
 		}
 		entries = append(entries, DirEntry{
 			Name: item.Name,
@@ -2698,7 +2824,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	}
 
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
-	out.Fh = fs.fileHandles.Allocate(fh)
+	out.Fh = fs.allocateFileHandle(fh)
 	// Use cached I/O for small/interactive files. Kernel coalesces writes
 	// and serves reads from page cache after first access.
 	// Keep DIRECT_IO for O_TRUNC streaming files.
@@ -2845,7 +2971,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		}
 	}
 
-	out.Fh = fs.fileHandles.Allocate(fh)
+	out.Fh = fs.allocateFileHandle(fh)
 	if fh.Dirty != nil {
 		// Use cached I/O for small/interactive files (< 64MB, no O_TRUNC).
 		// Kernel coalesces writes and serves reads from page cache.
@@ -3167,7 +3293,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// InodeEntry has a stored revision from the last Lookup/GetAttr, pass
 	// it to the cache for validation. Cache hit only if revision matches.
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
-	if entry != nil && entry.Size <= defaultSmallFileThreshold && entry.Size > 0 {
+	if entry != nil && entry.Size <= defaultReadCacheMaxFileSize && entry.Size > 0 {
 		cacheRev := entry.Revision // use revision from last Stat/Lookup
 		// Fast path: serve from cache without any HTTP call.
 		if data, ok := fs.readCache.Get(p, cacheRev); ok {
@@ -3694,11 +3820,41 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	defer func() { fs.perfRecordFuse(perfFuseRelease, perfStart, releaseStatus, 0) }()
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
+		flushStatus := gofuse.OK
+		// Apply any deferred chmod after flush completes but before cleanup.
+		defer func() {
+			if fh.HasPendingMode {
+				if flushStatus == gofuse.OK {
+					ctx, cf := context.WithTimeout(context.Background(), 30*time.Second)
+					if err := fs.client.ChmodCtx(ctx, fs.remotePath(fh.Path), fh.PendingMode); err != nil {
+						log.Printf("release: pending chmod failed for %s: %v", fh.Path, err)
+						// Revert in-memory mode so local GetAttr doesn't lie.
+						if fh.HasPreviousMode {
+							fs.inodes.UpdateMode(fh.Ino, fh.PreviousMode)
+						}
+					}
+					cf()
+				} else {
+					// Flush failed — revert the in-memory mode so local GetAttr doesn't lie.
+					if fh.HasPreviousMode {
+						fs.inodes.UpdateMode(fh.Ino, fh.PreviousMode)
+					}
+				}
+				// Clear pending mode on all sibling handles so they don't re-apply
+				// or revert after this handle already decided the outcome.
+				fs.fileHandles.ForEach(func(_ uint64, h *FileHandle) {
+					if h.Ino == fh.Ino {
+						h.HasPendingMode = false
+						h.HasPreviousMode = false
+					}
+				})
+			}
+		}()
 		defer func() {
 			if fh.Prefetch != nil {
 				fh.Prefetch.Close()
 			}
-			fs.fileHandles.Delete(input.Fh)
+			fs.deleteFileHandle(input.Fh, fh)
 			fs.cleanupReleasedInode(fh.Ino, fh.Path)
 		}()
 
@@ -3709,7 +3865,6 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 
 		start := time.Now()
 		phase := "start"
-		flushStatus := gofuse.OK
 		defer func() { releaseStatus = flushStatus }()
 		fs.debugf("release start path=%s fh=%d ino=%d", fh.Path, input.Fh, fh.Ino)
 		defer func() {
@@ -4166,13 +4321,26 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	threshold := fs.negotiatedInlineThreshold()
 	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
 	if useDirectPUT {
-		// Small file: direct PUT with revision return for freshness seeding.
-		phase = "small-write"
-		writeStart := time.Now()
-		fs.debugf("flushHandle small write start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
-		committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
-		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
-		fs.debugDurationf(writeStart, 0, "flushHandle small write done path=%s size=%d committed_rev=%d err=%v", fh.Path, size, committedRev, err)
+		if size == 0 && fh.IsNew {
+			phase = "empty-create"
+			writeStart := time.Now()
+			fs.debugf("flushHandle empty create start path=%s expected_rev=%d", fh.Path, expectedRevision)
+			committedRev, err = fs.client.CreateFileCtx(ctx, fs.remotePath(fh.Path))
+			if isCreateActionUnsupportedErr(err) {
+				fs.debugf("flushHandle empty create unsupported path=%s fallback=small-write err=%v", fh.Path, err)
+				committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
+			}
+			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
+			fs.debugDurationf(writeStart, 0, "flushHandle empty create done path=%s committed_rev=%d err=%v", fh.Path, committedRev, err)
+		} else {
+			// Small file: direct PUT with revision return for freshness seeding.
+			phase = "small-write"
+			writeStart := time.Now()
+			fs.debugf("flushHandle small write start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
+			committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
+			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
+			fs.debugDurationf(writeStart, 0, "flushHandle small write done path=%s size=%d committed_rev=%d err=%v", fh.Path, size, committedRev, err)
+		}
 	} else if fh.OrigSize >= threshold {
 		phase = "patch-file"
 		dirtyParts := fh.Dirty.DirtyPartNumbers()
@@ -4352,7 +4520,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 	if committedRev > 0 && entry.Inode > 0 {
 		// Seed readCache from shadow data before the shadow file is removed.
 		// Only attempt for files under the readCache size limit.
-		if entry.Size < int64(defaultSmallFileThreshold) && fs.shadowStore != nil {
+		if entry.Size <= int64(defaultReadCacheMaxFileSize) && fs.shadowStore != nil {
 			if data, err := fs.shadowStore.ReadAll(entry.Path); err == nil {
 				fs.readCache.PutOwned(entry.Path, data, committedRev)
 			}

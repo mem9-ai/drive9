@@ -860,6 +860,44 @@ func TestStatDirectoryWithoutTrailingSlash(t *testing.T) {
 	}
 }
 
+func TestStatDirectoryReturnsMode(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Create a directory with a specific mode (0o700 = 448 decimal)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/modeddir?mkdir&mode=448", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mkdir: %d", resp.StatusCode)
+	}
+
+	// Stat the directory
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/modeddir/", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stat dir: %d", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Dat9-IsDir") != "true" {
+		t.Errorf("expected X-Dat9-IsDir true, got %s", resp.Header.Get("X-Dat9-IsDir"))
+	}
+	modeHdr := resp.Header.Get("X-Dat9-Mode")
+	if modeHdr == "" {
+		t.Error("expected X-Dat9-Mode header for directory, got empty")
+	}
+	if modeHdr != "448" { // 0o700 = 448 decimal
+		t.Errorf("expected X-Dat9-Mode 448, got %s", modeHdr)
+	}
+}
+
 func TestStatDirectoryWithoutTrailingSlashDoesNotLogDatastoreError(t *testing.T) {
 	core, recorded := observer.New(zap.ErrorLevel)
 	restoreLogger := logger.L()
@@ -989,6 +1027,125 @@ func TestDelete(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != 404 {
 		t.Errorf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestDeleteKindHint(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/typed.txt", strings.NewReader("data"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("write status = %d, want 200", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/typed-dir?mkdir", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mkdir status = %d, want 200", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodDelete, ts.URL+"/v1/fs/typed.txt?kind=file", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("file delete status = %d, want 200", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodDelete, ts.URL+"/v1/fs/typed-dir?kind=dir", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("dir delete status = %d, want 200", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodDelete, ts.URL+"/v1/fs/missing?kind=bogus", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid kind status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestCreateFileActionCreatesEmptyFileAndConflicts(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/empty.txt?create", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.Contains(got, "application/json") {
+		t.Fatalf("create Content-Type = %q, want application/json", got)
+	}
+
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/empty.txt", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Header.Get("Content-Length") != "0" {
+		t.Fatalf("Content-Length = %q, want 0", resp.Header.Get("Content-Length"))
+	}
+	if resp.Header.Get("X-Dat9-Revision") != "1" {
+		t.Fatalf("X-Dat9-Revision = %q, want 1", resp.Header.Get("X-Dat9-Revision"))
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stat status = %d, want 200", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/empty.txt?create", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate create status = %d, want 409", resp.StatusCode)
+	}
+
+	var fileRows int
+	if err := s.fallback.Store().DB().QueryRow(`SELECT COUNT(*) FROM files`).Scan(&fileRows); err != nil {
+		t.Fatal(err)
+	}
+	if fileRows != 1 {
+		t.Fatalf("files rows after duplicate create = %d, want 1", fileRows)
+	}
+	var orphanRows int
+	if err := s.fallback.Store().DB().QueryRow(`SELECT COUNT(*)
+		FROM files f
+		LEFT JOIN file_nodes fn ON fn.file_id = f.file_id
+		WHERE fn.file_id IS NULL`).Scan(&orphanRows); err != nil {
+		t.Fatal(err)
+	}
+	if orphanRows != 0 {
+		t.Fatalf("orphan files after duplicate create = %d, want 0", orphanRows)
 	}
 }
 

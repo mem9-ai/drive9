@@ -3,8 +3,10 @@ package datastore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,11 +15,11 @@ import (
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
+	initDatastoreSchema(t, testDSN)
 	s, err := Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
-	initDatastoreSchema(t, testDSN)
 	testmysql.ResetDB(t, s.DB())
 	t.Cleanup(func() { _ = s.Close() })
 	return s
@@ -34,6 +36,9 @@ func setEmbeddingRevision(t *testing.T, s *Store, fileID string, revision int64)
 	t.Helper()
 	if _, err := s.DB().Exec(`UPDATE files SET embedding_revision = ? WHERE file_id = ?`, revision, fileID); err != nil {
 		t.Fatalf("set embedding_revision for %s: %v", fileID, err)
+	}
+	if _, err := s.DB().Exec(`UPDATE semantic SET embedding_revision = ? WHERE inode_id = ?`, revision, fileID); err != nil {
+		t.Fatalf("set semantic embedding_revision for %s: %v", fileID, err)
 	}
 }
 
@@ -133,6 +138,9 @@ func TestStatLite(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.DB().Exec(`UPDATE files SET description = 'test desc' WHERE file_id = 'f1'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`UPDATE semantic SET description = 'test desc' WHERE inode_id = 'f1'`); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/lite.txt", ParentPath: "/", Name: "lite.txt", FileID: "f1", CreatedAt: now}); err != nil {
@@ -287,6 +295,38 @@ func TestListDir(t *testing.T) {
 		t.Fatal("expected file entry for a.txt")
 	}
 	requireEmbeddingRevision(t, entries[0].File.EmbeddingRevision, 13)
+}
+
+func TestListNodes(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertInode(context.Background(), &Inode{InodeID: "i1", SizeBytes: 0, Revision: 1, Mode: 0o755, Status: StatusConfirmed, CreatedAt: now, Mtime: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "d1", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, InodeID: "i1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertFile(context.Background(), &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", InodeID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	nodes, err := s.ListNodes(context.Background(), "/data/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+	if nodes[0].Name != "a.txt" {
+		t.Errorf("name=%q, want a.txt", nodes[0].Name)
+	}
+	if nodes[0].InodeID != "f1" {
+		t.Errorf("inode_id=%q, want f1", nodes[0].InodeID)
+	}
 }
 
 func TestUpdateFileSearchText(t *testing.T) {
@@ -575,6 +615,22 @@ func TestDeleteWithRefCount(t *testing.T) {
 	}
 }
 
+func TestDeleteFileWithRefCheckRejectsDirectory(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "dir", Path: "/dir/", ParentPath: "/", Name: "dir", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteFileWithRefCheck(ctx, "/dir/"); err != ErrNotFound {
+		t.Fatalf("DeleteFileWithRefCheck dir error = %v, want ErrNotFound", err)
+	}
+	if _, err := s.GetNode(ctx, "/dir/"); err != nil {
+		t.Fatalf("directory should remain after rejected file delete: %v", err)
+	}
+}
+
 func TestDeleteDirRecursive(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
@@ -627,6 +683,48 @@ func TestDeleteDirRecursive(t *testing.T) {
 	_, err = s.GetNode(context.Background(), "/shared.txt")
 	if err != nil {
 		t.Error("expected /shared.txt to survive")
+	}
+}
+
+func TestDeleteDirRecursiveDoesNotDeleteSiblingPrefix(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "d1", Path: "/data/", ParentPath: "/", Name: "data", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "d2", Path: "/data-other/", ParentPath: "/", Name: "data-other", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertFile(context.Background(), &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertFile(context.Background(), &File{FileID: "f2", StorageType: StorageDB9, StorageRef: "/blobs/f2",
+		SizeBytes: 20, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n1", Path: "/data/a.txt", ParentPath: "/data/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "n2", Path: "/data-other/b.txt", ParentPath: "/data-other/", Name: "b.txt", FileID: "f2", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	orphaned, err := s.DeleteDirRecursive(context.Background(), "/data/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orphaned) != 1 || orphaned[0].FileID != "f1" {
+		t.Fatalf("orphaned = %+v, want only f1", orphaned)
+	}
+	if _, err := s.GetNode(context.Background(), "/data-other/"); err != nil {
+		t.Fatalf("sibling directory should survive: %v", err)
+	}
+	if _, err := s.GetNode(context.Background(), "/data-other/b.txt"); err != nil {
+		t.Fatalf("sibling file should survive: %v", err)
+	}
+	if _, err := s.GetFileGCTaskByFileID(context.Background(), "f2"); err != ErrNotFound {
+		t.Fatalf("expected no gc task for sibling f2, got %v", err)
 	}
 }
 
@@ -778,9 +876,83 @@ func TestEnsureParentDirs(t *testing.T) {
 			t.Errorf("expected %s to be directory", p)
 		}
 	}
-	// Idempotent
+
+	// Count directory inodes before the idempotent re-call.
+	var before int64
+	if err := s.DB().QueryRow(`
+		SELECT COUNT(*) FROM inodes i
+		JOIN file_nodes fn ON i.inode_id = fn.inode_id
+		WHERE fn.is_directory = 1`).Scan(&before); err != nil {
+		t.Fatalf("count dir inodes before: %v", err)
+	}
+
+	// Idempotent: second call must not create orphan inodes.
 	if err := s.EnsureParentDirs(context.Background(), "/a/b/c/file.txt", genID); err != nil {
 		t.Fatal(err)
+	}
+
+	var after int64
+	if err := s.DB().QueryRow(`
+		SELECT COUNT(*) FROM inodes i
+		JOIN file_nodes fn ON i.inode_id = fn.inode_id
+		WHERE fn.is_directory = 1`).Scan(&after); err != nil {
+		t.Fatalf("count dir inodes after: %v", err)
+	}
+	if after != before {
+		t.Errorf("orphan inodes leaked: dir inode count before=%d after=%d", before, after)
+	}
+
+	// Verify there are no orphan inodes at all.
+	var orphanCount int64
+	if err := s.DB().QueryRow(`
+		SELECT COUNT(*) FROM inodes i
+		LEFT JOIN file_nodes fn ON i.inode_id = fn.inode_id
+		WHERE fn.inode_id IS NULL`).Scan(&orphanCount); err != nil {
+		t.Fatalf("count orphan inodes: %v", err)
+	}
+	if orphanCount != 0 {
+		t.Errorf("found %d orphan inodes (inodes with no file_nodes reference)", orphanCount)
+	}
+}
+
+func TestEnsureParentDirsConcurrent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.EnsureParentDirs(ctx, "/a/b/c/file.txt", genID); err != nil {
+				t.Errorf("ensure parent dirs: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Exactly three directory inodes should exist.
+	var dirInodeCount int64
+	if err := s.DB().QueryRow(`
+		SELECT COUNT(*) FROM inodes i
+		JOIN file_nodes fn ON i.inode_id = fn.inode_id
+		WHERE fn.is_directory = 1`).Scan(&dirInodeCount); err != nil {
+		t.Fatalf("count dir inodes: %v", err)
+	}
+	if dirInodeCount != 3 {
+		t.Errorf("dir inode count = %d, want 3", dirInodeCount)
+	}
+
+	// No orphan inodes should remain.
+	var orphanCount int64
+	if err := s.DB().QueryRow(`
+		SELECT COUNT(*) FROM inodes i
+		LEFT JOIN file_nodes fn ON i.inode_id = fn.inode_id
+		WHERE fn.inode_id IS NULL`).Scan(&orphanCount); err != nil {
+		t.Fatalf("count orphan inodes: %v", err)
+	}
+	if orphanCount != 0 {
+		t.Errorf("found %d orphan inodes after concurrent creation", orphanCount)
 	}
 }
 
@@ -941,5 +1113,324 @@ func TestUpdateFileContentWithDescription(t *testing.T) {
 	}
 	if got.DescriptionEmbeddingRevision != nil {
 		t.Errorf("expected description_embedding_revision to be nil after content update, got %v", got.DescriptionEmbeddingRevision)
+	}
+}
+
+func TestChmod(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 42, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Chmod(ctx, "/a.txt", 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != 0o600 {
+		t.Errorf("mode=%o, want 0o600", got.Mode)
+	}
+}
+
+func TestChmodNotFound(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	err := s.Chmod(ctx, "/nonexistent.txt", 0o600)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestChmodDirectory(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/dir/", ParentPath: "/", Name: "dir", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.Chmod(ctx, "/dir/", 0o700)
+	if err == nil {
+		t.Fatal("expected error for chmod on directory")
+	}
+}
+
+func TestConfirmPendingFileTx(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusPending, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s.ConfirmPendingFileTx(tx, "f1", StorageS3, "/s3/f1", "text/plain", 42, "desc"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusConfirmed {
+		t.Errorf("status=%s, want CONFIRMED", got.Status)
+	}
+	if got.SizeBytes != 42 {
+		t.Errorf("size=%d, want 42", got.SizeBytes)
+	}
+	if got.StorageType != StorageS3 {
+		t.Errorf("storage_type=%s, want s3", got.StorageType)
+	}
+	if got.Description != "desc" {
+		t.Errorf("description=%q, want desc", got.Description)
+	}
+}
+
+func TestConfirmPendingFileAutoEmbeddingTx(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusPending, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s.ConfirmPendingFileAutoEmbeddingTx(tx, "f1", StorageS3, "/s3/f1", "text/plain", 42, "auto-desc"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusConfirmed {
+		t.Errorf("status=%s, want CONFIRMED", got.Status)
+	}
+	if got.SizeBytes != 42 {
+		t.Errorf("size=%d, want 42", got.SizeBytes)
+	}
+	if got.Description != "auto-desc" {
+		t.Errorf("description=%q, want auto-desc", got.Description)
+	}
+}
+
+func TestDeletePendingFileTx(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 10, Revision: 1, Status: StatusPending, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s.DeletePendingFileTx(tx, "f1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusDeleted {
+		t.Errorf("status=%s, want DELETED", got.Status)
+	}
+	if got.StorageRef != "" {
+		t.Errorf("storage_ref=%q, want empty", got.StorageRef)
+	}
+}
+
+func TestGetFileStorageMetaForUpdateTx(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageS3, StorageRef: "/s3/f1",
+		ContentType: "text/plain", SizeBytes: 42, Revision: 3, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	meta, err := s.GetFileStorageMetaForUpdateTx(tx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.StorageType != StorageS3 {
+		t.Errorf("storage_type=%s, want s3", meta.StorageType)
+	}
+	if meta.StorageRef != "/s3/f1" {
+		t.Errorf("storage_ref=%q, want /s3/f1", meta.StorageRef)
+	}
+	if meta.Revision != 3 {
+		t.Errorf("revision=%d, want 3", meta.Revision)
+	}
+	if meta.SizeBytes != 42 {
+		t.Errorf("size=%d, want 42", meta.SizeBytes)
+	}
+	if meta.ContentType != "text/plain" {
+		t.Errorf("content_type=%q, want text/plain", meta.ContentType)
+	}
+}
+
+func TestGetFileStorageMetaForUpdateTxNotFound(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = s.GetFileStorageMetaForUpdateTx(tx, "missing")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestModeDefault(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// Insert without Mode set (defaults to 0).
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 42, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != 0o644 {
+		t.Errorf("mode=%o, want 0o644", got.Mode)
+	}
+}
+
+func TestModeRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 42, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now, Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != 0o755 {
+		t.Errorf("mode=%o, want 0o755", got.Mode)
+	}
+}
+
+// TestInsertFileWithoutLegacyTable verifies that a store without the legacy
+// `files` table writes only to split tables and can read data back correctly.
+func TestInsertFileWithoutLegacyTable(t *testing.T) {
+	// Open a store without creating the files table.
+	initDatastoreSchema(t, testDSN)
+	db, err := sql.Open("mysql", testDSN)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`DROP TABLE IF EXISTS files`); err != nil {
+		t.Fatalf("drop files: %v", err)
+	}
+	testmysql.ResetDBWithoutFiles(t, db)
+	_ = db.Close()
+
+	s, err := Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if s.HasLegacyFiles() {
+		t.Fatal("expected HasLegacyFiles() = false without files table")
+	}
+
+	ctx := context.Background()
+	now := time.Now()
+	f := &File{
+		FileID:      "f1",
+		StorageType: StorageDB9,
+		StorageRef:  "/blobs/f1",
+		SizeBytes:   42,
+		Revision:    1,
+		Status:      StatusConfirmed,
+		Mode:        0o600,
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}
+	if err := s.InsertFile(ctx, f); err != nil {
+		t.Fatalf("insert file: %v", err)
+	}
+
+	// Verify read from split tables.
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatalf("get file: %v", err)
+	}
+	if got.SizeBytes != 42 {
+		t.Errorf("size=%d, want 42", got.SizeBytes)
+	}
+	if got.Mode != 0o600 {
+		t.Errorf("mode=%o, want 0o600", got.Mode)
+	}
+
+	// Verify files table was NOT written.
+	var count int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM files`).Scan(&count); err == nil {
+		t.Error("expected error querying files table (should not exist), got nil")
 	}
 }

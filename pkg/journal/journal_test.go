@@ -1,6 +1,7 @@
 package journal
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -35,6 +36,40 @@ func TestNormalizeCreateRequestPreservesMetaAndRepeatedLabels(t *testing.T) {
 	}
 	if len(labels) != len(req.Labels) {
 		t.Fatalf("genesis labels = %#v, want %#v", labels, req.Labels)
+	}
+}
+
+func TestCanonicalJSONRawIsDeterministicForNestedObjects(t *testing.T) {
+	rawA := json.RawMessage(`{
+		"z": [{"b":2,"a":1}, true],
+		"a": {"nested":{"d":4,"c":3}, "list":[{"y":null,"x":"ok"}]},
+		"n": 1.0
+	}`)
+	rawB := json.RawMessage(`{"n":1.0,"a":{"list":[{"x":"ok","y":null}],"nested":{"c":3,"d":4}},"z":[{"a":1,"b":2},true]}`)
+	want := `{"a":{"list":[{"x":"ok","y":null}],"nested":{"c":3,"d":4}},"n":1.0,"z":[{"a":1,"b":2},true]}`
+
+	gotA, err := CanonicalJSONRaw(rawA)
+	if err != nil {
+		t.Fatalf("CanonicalJSONRaw A: %v", err)
+	}
+	gotB, err := CanonicalJSONRaw(rawB)
+	if err != nil {
+		t.Fatalf("CanonicalJSONRaw B: %v", err)
+	}
+	if string(gotA) != want {
+		t.Fatalf("canonical A = %s, want %s", gotA, want)
+	}
+	if string(gotB) != want {
+		t.Fatalf("canonical B = %s, want %s", gotB, want)
+	}
+	for i := 0; i < 20; i++ {
+		got, err := CanonicalJSONRaw(rawA)
+		if err != nil {
+			t.Fatalf("CanonicalJSONRaw repeat %d: %v", i, err)
+		}
+		if string(got) != want {
+			t.Fatalf("canonical repeat %d = %s, want %s", i, got, want)
+		}
 	}
 }
 

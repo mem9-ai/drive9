@@ -113,6 +113,9 @@ func TestJournalCreateAppendVerifyAndIdempotency(t *testing.T) {
 	if resp.FirstSeq != 1 || resp.LastSeq != 1 || resp.Count != 1 || resp.HeadHash == "" {
 		t.Fatalf("append response = %#v", resp)
 	}
+	if resp.Idempotent {
+		t.Fatalf("fresh append marked idempotent: %#v", resp)
+	}
 	respAgain, err := store.AppendJournalEntries(ctx, tenantID, "jrn_test", "app_test", JournalWriter{Type: "api_key", ID: "key-1"}, []journal.EntryInput{{
 		Type:       "tool.call.completed",
 		Status:     "ok",
@@ -123,8 +126,10 @@ func TestJournalCreateAppendVerifyAndIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AppendJournalEntries retry: %v", err)
 	}
-	if *respAgain != *resp {
-		t.Fatalf("idempotent append = %#v, want %#v", respAgain, resp)
+	wantReplay := *resp
+	wantReplay.Idempotent = true
+	if *respAgain != wantReplay {
+		t.Fatalf("idempotent append = %#v, want %#v", respAgain, wantReplay)
 	}
 	if _, err := store.AppendJournalEntries(ctx, tenantID, "jrn_test", "app_test", JournalWriter{Type: "api_key", ID: "key-1"}, []journal.EntryInput{{
 		Type:     "tool.call.completed",
@@ -182,6 +187,32 @@ func TestJournalCreateAppendVerifyAndIdempotency(t *testing.T) {
 	}
 	if verify.SealOK != nil || verify.ArtifactBytesAvailable != nil {
 		t.Fatalf("verify unchecked fields = seal:%#v artifact:%#v, want omitted", verify.SealOK, verify.ArtifactBytesAvailable)
+	}
+}
+
+func TestAppendJournalRejectsClosedJournal(t *testing.T) {
+	store := newJournalStore(t)
+	ctx := context.Background()
+	tenantID := "tenant-journal-closed"
+
+	if _, err := store.CreateJournal(ctx, tenantID, journal.CreateRequest{
+		JournalID: "jrn_closed",
+		Kind:      "agent",
+		Title:     "closed run",
+	}); err != nil {
+		t.Fatalf("CreateJournal: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := store.DB().ExecContext(ctx, `UPDATE journals
+		SET closed_at = ?
+		WHERE tenant_id = ? AND journal_id = ?`, now, tenantID, "jrn_closed"); err != nil {
+		t.Fatalf("close journal: %v", err)
+	}
+	if _, err := store.AppendJournalEntries(ctx, tenantID, "jrn_closed", "app_closed", JournalWriter{Type: "api_key", ID: "key-1"}, []journal.EntryInput{{
+		Type:   "tool.call.completed",
+		Status: "ok",
+	}}); !errors.Is(err, ErrJournalClosed) {
+		t.Fatalf("AppendJournalEntries closed err = %v, want ErrJournalClosed", err)
 	}
 }
 

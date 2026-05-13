@@ -721,24 +721,97 @@ func TestMountCmdLeavesLegacyDirStatFallbackDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestMountCmdLeavesDefaultTTLsUnsetForFuseDefaults(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.DirTTL != 0 || got.AttrTTL != 0 || got.EntryTTL != 0 {
+		t.Fatalf("default TTLs = dir %v attr %v entry %v, want all unset", got.DirTTL, got.AttrTTL, got.EntryTTL)
+	}
+	if got.LookupRetryCount != 0 || got.LookupRetryTimeout != 0 {
+		t.Fatalf("default lookup retry = count %d timeout %v, want all unset", got.LookupRetryCount, got.LookupRetryTimeout)
+	}
+}
+
+func TestMountCmdPreservesExplicitTTLs(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile", "interactive",
+		"--dir-ttl", "5s",
+		"--attr-ttl", "6s",
+		"--entry-ttl", "7s",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.DirTTL != 5*time.Second {
+		t.Fatalf("DirTTL = %v, want 5s", got.DirTTL)
+	}
+	if got.AttrTTL != 6*time.Second {
+		t.Fatalf("AttrTTL = %v, want 6s", got.AttrTTL)
+	}
+	if got.EntryTTL != 7*time.Second {
+		t.Fatalf("EntryTTL = %v, want 7s", got.EntryTTL)
+	}
+}
+
 func TestValidateLookupRetryFlags(t *testing.T) {
-	if err := validateLookupRetryFlags(2, 250*time.Millisecond); err != nil {
+	if err := validateLookupRetryFlags(0, 0, false, false); err != nil {
+		t.Fatalf("omitted lookup retry flags should be allowed: %v", err)
+	}
+
+	if err := validateLookupRetryFlags(2, 250*time.Millisecond, true, true); err != nil {
 		t.Fatalf("validateLookupRetryFlags() unexpected error: %v", err)
 	}
 
-	if err := validateLookupRetryFlags(0, 250*time.Millisecond); err != nil {
+	if err := validateLookupRetryFlags(0, 0, true, false); err != nil {
 		t.Fatalf("count=0 should be allowed to disable retries: %v", err)
 	}
 
-	if err := validateLookupRetryFlags(2, 0); err == nil || !strings.Contains(err.Error(), "--lookup-retry-timeout") {
+	if err := validateLookupRetryFlags(2, 0, true, true); err == nil || !strings.Contains(err.Error(), "--lookup-retry-timeout") {
 		t.Fatalf("timeout=0 error = %v, want timeout validation error", err)
 	}
 
-	if err := validateLookupRetryFlags(-1, 250*time.Millisecond); err == nil || !strings.Contains(err.Error(), "--lookup-retry-count") {
+	if err := validateLookupRetryFlags(-1, 250*time.Millisecond, true, true); err == nil || !strings.Contains(err.Error(), "--lookup-retry-count") {
 		t.Fatalf("count=-1 error = %v, want count validation error", err)
 	}
 
-	if err := validateLookupRetryFlags(2, -time.Millisecond); err == nil || !strings.Contains(err.Error(), "--lookup-retry-timeout") {
+	if err := validateLookupRetryFlags(2, -time.Millisecond, true, true); err == nil || !strings.Contains(err.Error(), "--lookup-retry-timeout") {
 		t.Fatalf("timeout<0 error = %v, want timeout validation error", err)
 	}
 }
@@ -763,7 +836,12 @@ func TestValidateReadDirPrefetchFlags(t *testing.T) {
 }
 
 func TestNormalizeLookupRetryCount(t *testing.T) {
-	count := normalizeLookupRetryCount(2)
+	count := lookupRetryCountFlagValue(false, 0)
+	if count != 0 {
+		t.Fatalf("omitted count = %d, want 0 for FUSE default", count)
+	}
+
+	count = normalizeLookupRetryCount(2)
 	if count != 2 {
 		t.Fatalf("normalized positive count = %d, want 2", count)
 	}

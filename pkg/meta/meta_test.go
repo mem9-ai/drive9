@@ -337,6 +337,32 @@ func TestMetaSchemaSpecIncludesTenantS3EncryptionColumns(t *testing.T) {
 	}
 }
 
+func TestMetaSchemaSpecIncludesForkStorageNamespaceColumns(t *testing.T) {
+	table := mustMetaTableSpec(t, mustMetaSpec(t), "tenants")
+	tests := map[string]string{
+		"kind":                 "ALTER TABLE tenants ADD COLUMN kind VARCHAR(16) NOT NULL DEFAULT 'live'",
+		"parent_tenant_id":     "ALTER TABLE tenants ADD COLUMN parent_tenant_id VARCHAR(64) NOT NULL DEFAULT ''",
+		"storage_namespace_id": "ALTER TABLE tenants ADD COLUMN storage_namespace_id VARCHAR(64) NOT NULL DEFAULT ''",
+	}
+	for column, wantAddSQL := range tests {
+		spec, ok := table.columns[column]
+		if !ok {
+			t.Fatalf("missing %s in tenants schema spec", column)
+		}
+		if spec.addSQL != wantAddSQL {
+			t.Fatalf("%s addSQL = %q, want %q", column, spec.addSQL, wantAddSQL)
+		}
+	}
+	if _, ok := table.indexes["idx_tenant_namespace"]; !ok {
+		t.Fatal("tenants schema missing idx_tenant_namespace")
+	}
+	if _, ok := table.indexes["idx_tenant_parent"]; !ok {
+		t.Fatal("tenants schema missing idx_tenant_parent")
+	}
+	_ = mustMetaTableSpec(t, mustMetaSpec(t), "storage_namespaces")
+	_ = mustMetaTableSpec(t, mustMetaSpec(t), "object_gc_candidates")
+}
+
 func TestDiffMetaTableMetaReportsMissingPrimaryKeyConstraint(t *testing.T) {
 	spec := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_quota_config")
 	meta := metaTableMeta{

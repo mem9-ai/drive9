@@ -569,6 +569,47 @@ func TestStatCtxPreservesStatusErrorOnNotFound(t *testing.T) {
 	}
 }
 
+func TestCreateFileCtxPostsCreateActionAndReturnsRevision(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/fs/empty.txt" {
+			t.Errorf("path = %s, want /v1/fs/empty.txt", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("create"); got != "1" {
+			t.Errorf("create query = %q, want 1", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	rev, err := c.CreateFileCtx(context.Background(), "/empty.txt")
+	if err != nil {
+		t.Fatalf("CreateFileCtx error = %v", err)
+	}
+	if rev != 1 {
+		t.Fatalf("revision = %d, want 1", rev)
+	}
+}
+
+func TestCreateFileCtxReturnsMalformedJSONError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("{"))
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	_, err := c.CreateFileCtx(context.Background(), "/empty.txt")
+	if err == nil {
+		t.Fatal("CreateFileCtx error = nil, want decode error")
+	}
+	if !strings.Contains(err.Error(), "decode create file response:") {
+		t.Fatalf("error = %v, want decode create file response error", err)
+	}
+}
+
 func TestWriteCtxConditionalWithTagsRejectsInvalidHeaderTags(t *testing.T) {
 	requests := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -641,6 +682,33 @@ func TestDelete(t *testing.T) {
 	_, err := c.Read("/del.txt")
 	if err == nil {
 		t.Error("expected error after delete")
+	}
+}
+
+func TestDeleteKindHints(t *testing.T) {
+	var got []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.RawQuery)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	if err := c.DeleteFileCtx(context.Background(), "/file.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeleteDirCtx(context.Background(), "/dir/"); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("requests = %d, want 2", len(got))
+	}
+	if got[0] != "kind=file" {
+		t.Fatalf("file delete query = %q, want kind=file", got[0])
+	}
+	if got[1] != "kind=dir" {
+		t.Fatalf("dir delete query = %q, want kind=dir", got[1])
 	}
 }
 
@@ -1029,5 +1097,46 @@ func TestSmallFileThresholdOverrideShortCircuits(t *testing.T) {
 	}
 	if hits != 0 {
 		t.Fatalf("override should short-circuit network; saw %d hits", hits)
+	}
+}
+
+
+func TestChmod(t *testing.T) {
+	c, cleanup := newTestClient(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := c.WriteCtx(ctx, "/chmod.txt", []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.ChmodCtx(ctx, "/chmod.txt", 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stat, err := c.StatCtx(ctx, "/chmod.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stat.Mode != 0o600 {
+		t.Errorf("mode=%o, want 0o600", stat.Mode)
+	}
+}
+
+func TestMkdirDirectory(t *testing.T) {
+	c, cleanup := newTestClient(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := c.MkdirCtx(ctx, "/d", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	stat, err := c.StatCtx(ctx, "/d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stat.IsDir {
+		t.Fatalf("expected directory")
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/datastore"
@@ -167,12 +166,18 @@ func (b *Dat9Backend) processFileGCTask(ctx context.Context, task *datastore.Fil
 		return err
 	}
 	if task.StorageType == datastore.StorageS3 && task.StorageRef != "" {
-		if b.s3 == nil {
-			return fmt.Errorf("s3 client not configured for file gc task %s", task.FileID)
+		handled, err := b.enqueueObjectGCCandidateCtx(ctx, task.StorageRef, meta.ObjectGCReasonFileDelete, task.FileID)
+		if handled && err == nil {
+			return nil
 		}
-		if err := b.s3.DeleteObject(ctx, task.StorageRef); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("delete blob %s: %w", task.StorageRef, err)
+		if err != nil {
+			logger.Warn(ctx, "file_gc_object_gc_candidate_failed",
+				zap.String("file_id", task.FileID),
+				zap.String("storage_ref", task.StorageRef),
+				zap.Error(err))
+			return err
 		}
+		return fmt.Errorf("object gc candidate enqueue is not configured for storage ref %s", task.StorageRef)
 	}
 	return nil
 }

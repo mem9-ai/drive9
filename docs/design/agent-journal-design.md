@@ -343,6 +343,9 @@ the create request. `--id` is mainly for supervisors that need to retry
 `journal new` across process boundaries. Reusing the same ID with the same
 normalized create envelope is idempotent; reusing it with different create
 metadata is a conflict.
+Journal creation records are genesis/self-reported metadata in Phase 1.
+Stronger evidence sources such as `gateway_observed` and `server_observed`
+belong on entries appended by trusted writers, not on the create request.
 
 Default output:
 
@@ -407,7 +410,7 @@ the caller should have to opt in explicitly and the response must set
 Output should be compact and scriptable:
 
 ```json
-{"journal_id":"jrn_01J...","append_id":"app_01J...","first_seq":1,"last_seq":3,"count":3,"head_hash":"sha256:...","idempotent":true}
+{"journal_id":"jrn_01J...","append_id":"app_01J...","first_seq":1,"last_seq":3,"count":3,"head_hash":"sha256:...","idempotent":false}
 ```
 
 Important behavior:
@@ -417,6 +420,8 @@ Important behavior:
 - The server computes `prev_hash` and `entry_hash`.
 - The client or gateway sends one append id per batch so retries are
   idempotent.
+- Fresh appends return `"idempotent": false`; duplicate retries that return a
+  previously committed sequence range return `"idempotent": true`.
 - The server validates or overrides `source` based on caller identity. Ordinary
   CLI appends are `self_reported` unless they come from a trusted runner.
 - Append is atomic per request: all entries in a batch are committed, or none
@@ -1058,9 +1063,12 @@ entry_hash = "sha256:" + hex(sha256(canonical(
 )))
 ```
 
-Subject order should be canonicalized. The canonical form should define sorted
-object keys, normalized timestamps, UTF-8 NFC strings, and no insignificant
-whitespace so verification is stable across Go, shell, and other clients.
+Subject order should be canonicalized. The Phase 1 canonical JSON form is
+server-defined and deliberately small: recursively sort object keys
+lexicographically, preserve array order, emit strings with standard JSON
+escaping, preserve valid JSON number tokens, and emit no insignificant
+whitespace. Timestamps and string fields are normalized before canonicalization.
+Clients may submit ordinary JSON; server-computed hashes are authoritative.
 All stored hash strings should be algorithm-prefixed lowercase hex, such as
 `sha256:<64 lowercase hex chars>`, so future algorithms can coexist without
 schema changes.
@@ -1437,31 +1445,29 @@ Transaction flow:
 3. Require an append ID / `Idempotency-Key` for the audit-safe path. Keyless
    compatibility mode, if present, must branch explicitly before this protocol
    and mark the response non-idempotent.
-4. If the same append request already exists with the same request hash, writer
-   identity, and effective source, return the recorded sequence range.
-5. If the same `Idempotency-Key` exists with different content, writer identity,
-   or effective source, reject the append as a conflict.
-6. Lock or conditionally update the `journals` row for
+4. Lock or conditionally update the `journals` row for
    `(tenant_id, journal_id)`.
-7. Re-check `journal_append_requests` for the same `Idempotency-Key` inside the
-   journal lock. This closes the race where two retries started before either
-   transaction committed.
-8. Check `closed_at` and the current seal policy while holding the journal
+5. Check `journal_append_requests` for the same `Idempotency-Key` inside the
+   journal lock. If it exists with the same request hash, writer identity, and
+   effective source, return the recorded sequence range. If it exists with
+   different content, writer identity, or effective source, reject the append as
+   a conflict.
+6. Check `closed_at` and the current seal policy while holding the journal
    serialization point. Reject appends to a hard-sealed or closed journal unless
    an explicit segment policy permits the append.
-9. Read `next_seq` and `head_hash`.
-10. Assign sequence numbers.
-11. Validate referenced artifact byte objects and attachment sizes.
-12. Compute each entry hash in order.
-13. Insert `journal_append_requests`. This insert is in the same transaction as
+7. Read `next_seq` and `head_hash`.
+8. Assign sequence numbers.
+9. Validate referenced artifact byte objects and attachment sizes.
+10. Compute each entry hash in order.
+11. Insert `journal_append_requests`. This insert is in the same transaction as
     the entries and uses the final sequence range, authenticated writer
     identity, and effective source.
-14. Insert `journal_entries`.
-15. Insert `journal_entry_subjects`.
-16. Insert artifact references.
-17. Update `journals.next_seq`, `journals.head_hash`, and
+12. Insert `journal_entries`.
+13. Insert `journal_entry_subjects`.
+14. Insert artifact references.
+15. Update `journals.next_seq`, `journals.head_hash`, and
     `journals.updated_at`.
-18. Commit.
+16. Commit.
 
 The implementation can use row locking or optimistic conditional update.
 If optimistic update is used, the idempotency re-check must happen after a

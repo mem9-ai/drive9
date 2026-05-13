@@ -210,17 +210,6 @@ func (s *Store) AppendJournalEntries(ctx context.Context, tenantID, journalID, a
 	}
 	var out *journal.AppendResponse
 	err = s.InTx(ctx, func(tx *sql.Tx) error {
-		if existing, err := selectAppendRequestTx(ctx, tx, tenantID, journalID, appendID); err == nil {
-			if existing.requestHash != requestHash || existing.writerType != writer.Type ||
-				existing.writerID != writer.ID || existing.effectiveSource != effectiveSource {
-				return ErrIdempotencyConflict
-			}
-			out = existing.response(journalID, appendID)
-			return nil
-		} else if !errors.Is(err, ErrNotFound) {
-			return err
-		}
-
 		current, _, err := selectJournalTx(ctx, tx, tenantID, journalID, true)
 		if err != nil {
 			return err
@@ -314,7 +303,7 @@ func (s *Store) AppendJournalEntries(ctx context.Context, tenantID, journalID, a
 			LastSeq:    lastSeq,
 			Count:      len(inserted),
 			HeadHash:   headHash,
-			Idempotent: true,
+			Idempotent: false,
 		}
 		return nil
 	})

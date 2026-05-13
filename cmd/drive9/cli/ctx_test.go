@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +27,76 @@ func makeJWT(t *testing.T, claims map[string]any) string {
 	payload := base64.RawURLEncoding.EncodeToString(payloadJSON)
 	sig := base64.RawURLEncoding.EncodeToString([]byte("placeholder-signature"))
 	return header + "." + payload + "." + sig
+}
+
+func TestCtxForkCreatesOwnerContextAndSwitchesWhenRequested(t *testing.T) {
+	withIsolatedHome(t)
+	var sawName string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/ctx/fork" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer source-key" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		var body struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		sawName = body.Name
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"tenant_id":        "fork-tenant",
+			"api_key":          "fork-key",
+			"status":           "active",
+			"parent_tenant_id": "source-tenant",
+			"storage":          "shared",
+		})
+	}))
+	defer ts.Close()
+
+	cfg := loadConfig()
+	if _, err := ctxAdd(cfg, "prod", &Context{Type: PrincipalOwner, APIKey: "source-key", Server: ts.URL}); err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	out, err := captureStdoutE(t, func() error { return Ctx([]string{"fork", "exp", "--use"}) })
+	if err != nil {
+		t.Fatalf("ctx fork: %v", err)
+	}
+	if sawName != "exp" {
+		t.Fatalf("request name = %q, want exp", sawName)
+	}
+	if !strings.Contains(out, "Forked prod -> exp") || !strings.Contains(out, "Now using ctx exp") {
+		t.Fatalf("unexpected output: %q", out)
+	}
+	got := loadConfig()
+	if got.CurrentContext != "exp" {
+		t.Fatalf("current context = %q, want exp", got.CurrentContext)
+	}
+	if got.Contexts["exp"] == nil || got.Contexts["exp"].APIKey != "fork-key" || got.Contexts["exp"].Server != ts.URL {
+		t.Fatalf("fork context not persisted correctly: %#v", got.Contexts["exp"])
+	}
+}
+
+func TestCtxForkRejectsDelegatedSource(t *testing.T) {
+	withIsolatedHome(t)
+	cfg := loadConfig()
+	if _, err := ctxAdd(cfg, "delegated", &Context{Type: PrincipalDelegated, Token: "tok", Server: "https://drive9.example"}); err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	_, err := captureStdoutE(t, func() error { return Ctx([]string{"fork", "exp", "--from", "delegated"}) })
+	if err == nil || !strings.Contains(err.Error(), "requires an owner context") {
+		t.Fatalf("expected owner-context error, got %v", err)
+	}
 }
 
 // withIsolatedHome redirects ~/.drive9/config to a test-local tmp dir for the

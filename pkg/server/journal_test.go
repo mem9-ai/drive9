@@ -66,7 +66,7 @@ func TestJournalHTTPCreateAppendSearchVerify(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&appendResp); err != nil {
 		t.Fatalf("decode append: %v", err)
 	}
-	if appendResp.FirstSeq != 1 || appendResp.LastSeq != 1 || !appendResp.Idempotent {
+	if appendResp.FirstSeq != 1 || appendResp.LastSeq != 1 || appendResp.Idempotent {
 		t.Fatalf("append response = %#v", appendResp)
 	}
 

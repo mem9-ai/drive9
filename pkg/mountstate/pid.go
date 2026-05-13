@@ -1,6 +1,7 @@
 package mountstate
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -38,7 +39,7 @@ func WritePID(mountPoint string, pid int) (string, error) {
 		return "", fmt.Errorf("invalid pid %d", pid)
 	}
 	path := PIDFilePath(mountPoint)
-	if err := os.WriteFile(path, []byte(strconv.Itoa(pid)+"\n"), 0o644); err != nil {
+	if err := writeFileAtomic(path, []byte(strconv.Itoa(pid)+"\n"), 0o644); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -53,10 +54,59 @@ func WriteProcessState(mountPoint string, state ProcessState) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal process state: %w", err)
 	}
-	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+	if err := writeFileAtomic(path, append(data, '\n'), 0o644); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	tmp, err := createTempFile(dir, "."+base+".tmp-", perm)
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := replaceFile(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func createTempFile(dir, prefix string, perm os.FileMode) (*os.File, error) {
+	var lastErr error
+	for range 100 {
+		var suffix [8]byte
+		if _, err := rand.Read(suffix[:]); err != nil {
+			return nil, err
+		}
+		name := filepath.Join(dir, prefix+hex.EncodeToString(suffix[:]))
+		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, perm)
+		if err == nil {
+			return f, nil
+		}
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("create temporary pid file: %w", lastErr)
 }
 
 func ReadPID(mountPoint string) (int, string, error) {

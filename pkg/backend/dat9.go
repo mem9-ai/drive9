@@ -78,13 +78,14 @@ type Dat9Backend struct {
 	inlineThreshold int64
 	// textExtractMaxBytes caps synchronous text extraction input size.
 	textExtractMaxBytes int64
-	mu                    sync.Mutex
-	entropy               io.Reader
+	mu                  sync.Mutex
+	entropy             io.Reader
 
 	// Central quota enforcement (Rev 4 migration).
-	tenantID    string
-	metaStore   MetaQuotaStore // nil when central quota is not wired (tests, fallback)
-	quotaSource QuotaSource    // "tenant" (default) or "server"
+	tenantID           string
+	storageNamespaceID string
+	metaStore          MetaQuotaStore // nil when central quota is not wired (tests, fallback)
+	quotaSource        QuotaSource    // "tenant" (default) or "server"
 
 	s3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
 
@@ -105,7 +106,7 @@ type Dat9Backend struct {
 	audioExtractMaxSize      int64
 	maxAudioExtractTextBytes int
 
-	fileGCWorker *FileGCWorker
+	fileGCWorker     *FileGCWorker
 	runtimeMetricsID uint64
 
 	// Monthly LLM cost budget (P1).
@@ -215,29 +216,33 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		}
 	}
 
-	err = b.store.InsertFile(ctx, &datastore.File{
-		FileID: fileID, StorageType: storageType, StorageRef: storageRef,
-		StorageEncryptionMode:  storageEncryptionMode,
-		StorageEncryptionKeyID: storageEncryptionKeyID,
-		ContentBlob:            contentBlob,
-		SizeBytes:              0, Revision: 1, Status: datastore.StatusConfirmed,
-		CreatedAt: now, ConfirmedAt: &now,
+	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.store.InsertFileTx(tx, &datastore.File{
+			FileID: fileID, StorageType: storageType, StorageRef: storageRef,
+			StorageEncryptionMode:  storageEncryptionMode,
+			StorageEncryptionKeyID: storageEncryptionKeyID,
+			ContentBlob:            contentBlob,
+			SizeBytes:              0, Revision: 1, Status: datastore.StatusConfirmed,
+			CreatedAt: now, ConfirmedAt: &now,
+		}); err != nil {
+			return err
+		}
+		if err := b.store.EnsureParentDirsTx(tx, path, b.genID); err != nil {
+			return err
+		}
+		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+			NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
+			Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
+		})
 	})
 	if err != nil {
+		if storageType == datastore.StorageS3 {
+			b.deleteBlobCtx(ctx, storageRef)
+		}
 		return err
 	}
-	err = b.store.EnsureParentDirs(ctx, path, b.genID)
-	if err != nil {
-		return err
-	}
-	err = b.store.InsertNode(ctx, &datastore.FileNode{
-		NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
-		Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
-	})
-	if err == nil {
-		b.syncCentralFileCreate(ctx, fileID, 0, "")
-	}
-	return err
+	b.syncCentralFileCreate(ctx, fileID, 0, "")
+	return nil
 }
 
 func (b *Dat9Backend) Mkdir(path string, perm uint32) error {
@@ -256,11 +261,48 @@ func (b *Dat9Backend) MkdirCtx(ctx context.Context, path string, perm uint32) (e
 	if err != nil {
 		return err
 	}
-	err = b.store.InsertNode(ctx, &datastore.FileNode{
-		NodeID: b.genID(), Path: dirPath, ParentPath: pathutil.ParentPath(dirPath),
-		Name: pathutil.BaseName(dirPath), IsDirectory: true, CreatedAt: time.Now(),
-	})
-	return err
+	now := time.Now()
+	nodeID := b.genID()
+	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.store.InsertInodeTx(tx, &datastore.Inode{
+			InodeID:   nodeID,
+			SizeBytes: 0,
+			Revision:  1,
+			Mode:      perm,
+			Status:    datastore.StatusConfirmed,
+			CreatedAt: now,
+			Mtime:     now,
+		}); err != nil {
+			return err
+		}
+		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+			NodeID:      b.genID(),
+			Path:        dirPath,
+			ParentPath:  pathutil.ParentPath(dirPath),
+			Name:        pathutil.BaseName(dirPath),
+			IsDirectory: true,
+			InodeID:     nodeID,
+			CreatedAt:   now,
+		})
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (b *Dat9Backend) Chmod(path string, mode uint32) error {
+	return b.ChmodCtx(backgroundWithTrace(), path, mode)
+}
+
+func (b *Dat9Backend) ChmodCtx(ctx context.Context, path string, mode uint32) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "chmod", err, start) }()
+
+	resolvedPath, _, err := b.resolveNodePath(ctx, path)
+	if err != nil {
+		return err
+	}
+	return b.store.Chmod(ctx, resolvedPath, mode)
 }
 
 func (b *Dat9Backend) Remove(path string) error {
@@ -282,6 +324,29 @@ func (b *Dat9Backend) RemoveCtx(ctx context.Context, path string) (err error) {
 	return err
 }
 
+func (b *Dat9Backend) RemoveFileCtx(ctx context.Context, path string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "remove_file", err, start) }()
+
+	path, err = pathutil.Canonicalize(path)
+	if err != nil {
+		return err
+	}
+	_, err = b.store.DeleteFileWithRefCheck(ctx, path)
+	return err
+}
+
+func (b *Dat9Backend) RemoveDirCtx(ctx context.Context, path string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "remove_dir", err, start) }()
+
+	path, err = pathutil.CanonicalizeDir(path)
+	if err != nil {
+		return err
+	}
+	return b.store.DeleteEmptyDir(ctx, path)
+}
+
 func (b *Dat9Backend) RemoveAll(path string) error {
 	return b.RemoveAllCtx(backgroundWithTrace(), path)
 }
@@ -295,7 +360,8 @@ func (b *Dat9Backend) RemoveAllCtx(ctx context.Context, path string) (err error)
 		return err
 	}
 	if !node.IsDirectory {
-		return b.RemoveCtx(ctx, path)
+		_, err = b.store.DeleteFileWithRefCheck(ctx, path)
+		return err
 	}
 	_, err = b.store.DeleteDirRecursive(ctx, path)
 	return err
@@ -641,7 +707,7 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		return 0, 0, err
 	}
 	b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
-	// Overwrite cleanup remains best-effort: file_gc_tasks track deleted file
+	// Overwrite cleanup is object-level: file_gc_tasks track deleted file
 	// identities, not old blob refs for a still-live file_id.
 	b.deleteBlobIfS3Ctx(ctx, nf.File.StorageType, nf.File.StorageRef, storageRef)
 	// Temporary compatibility: app embedding still relies on the legacy
@@ -699,6 +765,10 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 		}
 		if e.Node.IsDirectory {
 			info.Mode = 0o755
+		}
+		if e.HasMode {
+			info.Mode = e.Mode
+			info.Meta = filesystem.MetaData{Content: map[string]string{"hasMode": "true"}}
 		}
 		if e.File != nil {
 			info.Size = e.File.SizeBytes
@@ -936,16 +1006,27 @@ func (b *Dat9Backend) Stat(path string) (*filesystem.FileInfo, error) {
 		return nil, err
 	}
 	info := &filesystem.FileInfo{
-		Name: nf.Node.Name, IsDir: nf.Node.IsDirectory, Mode: 0o644,
-	}
-	if nf.Node.IsDirectory {
-		info.Mode = 0o755
+		Name: nf.Node.Name, IsDir: nf.Node.IsDirectory,
 	}
 	if nf.File != nil {
 		info.Size = nf.File.SizeBytes
 		info.ModTime = fileMtime(nf.File)
+		if nf.HasMode {
+			info.Mode = nf.Mode
+		} else if nf.Node.IsDirectory {
+			info.Mode = 0o755
+		} else {
+			info.Mode = 0o644
+		}
 	} else {
 		info.ModTime = nf.Node.CreatedAt
+		if nf.HasMode {
+			info.Mode = nf.Mode
+		} else if nf.Node.IsDirectory {
+			info.Mode = 0o755
+		} else {
+			info.Mode = 0o644
+		}
 	}
 	return info, nil
 }
@@ -981,8 +1062,6 @@ func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (e
 	_, err = b.store.RenameFileReplacingTarget(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
 	return err
 }
-
-func (b *Dat9Backend) Chmod(path string, mode uint32) error { return nil }
 
 func (b *Dat9Backend) Open(path string) (io.ReadCloser, error) {
 	data, err := b.Read(path, 0, -1)
@@ -1058,7 +1137,50 @@ func (b *Dat9Backend) deleteBlobIfS3Ctx(ctx context.Context, storageType datasto
 	if storageType != datastore.StorageS3 || storageRef == "" || storageRef == keepRef {
 		return
 	}
-	b.deleteBlobCtx(ctx, storageRef)
+	handled, err := b.enqueueObjectGCCandidateCtx(ctx, storageRef, meta.ObjectGCReasonOverwrite, "")
+	if handled && err == nil {
+		return
+	}
+	if err != nil {
+		logger.Warn(ctx, "backend_object_gc_candidate_required_but_failed",
+			zap.String("storage_ref", storageRef),
+			zap.Error(err))
+		return
+	}
+	logger.Warn(ctx, "backend_object_gc_candidate_not_configured",
+		zap.String("storage_ref", storageRef))
+}
+
+type objectGCCandidateEnqueuer interface {
+	EnqueueObjectGCCandidate(ctx context.Context, c *meta.ObjectGCCandidateInput) error
+}
+
+func (b *Dat9Backend) enqueueObjectGCCandidateCtx(ctx context.Context, storageRef string, reason meta.ObjectGCCandidateReason, sourceFileID string) (bool, error) {
+	if b.metaStore == nil || b.storageNamespaceID == "" || storageRef == "" {
+		return false, nil
+	}
+	enqueuer, ok := b.metaStore.(objectGCCandidateEnqueuer)
+	if !ok {
+		return false, nil
+	}
+	err := enqueuer.EnqueueObjectGCCandidate(ctx, &meta.ObjectGCCandidateInput{
+		NamespaceID:    b.storageNamespaceID,
+		StorageRef:     storageRef,
+		StorageRefHash: datastore.StorageRefHash(storageRef),
+		Reason:         reason,
+		SourceTenantID: b.tenantID,
+		SourceFileID:   sourceFileID,
+		NotBefore:      time.Now().UTC().Add(7 * 24 * time.Hour),
+	})
+	if err != nil {
+		logger.Warn(ctx, "backend_enqueue_object_gc_candidate_failed",
+			zap.String("storage_namespace_id", b.storageNamespaceID),
+			zap.String("storage_ref", storageRef),
+			zap.String("reason", string(reason)),
+			zap.Error(err))
+		return true, err
+	}
+	return true, nil
 }
 
 func (b *Dat9Backend) readFileDataCtx(ctx context.Context, f *datastore.File) ([]byte, error) {

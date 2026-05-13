@@ -237,6 +237,8 @@ func runFS(args []string) {
 		err = cli.Rm(c, rest)
 	case "mkdir":
 		err = cli.Mkdir(c, rest)
+	case "chmod":
+		err = cli.Chmod(c, rest)
 	case "sh":
 		err = cli.Sh(c, rest)
 	case "grep":
@@ -278,6 +280,8 @@ func usage(code int) {
 			"                         add owner context\n"+
 			"  ctx import [--from-file <path|->] [--name NAME]\n"+
 			"                         add delegated context\n"+
+			"  ctx fork <new> [--from <ctx>] [--use] [--json]\n"+
+			"                         create a copy-on-write fork context\n"+
 			"  ctx ls [-l|--json]     list contexts\n"+
 			"  ctx use <name>         activate context\n"+
 			"  ctx rm <name>          delete context\n"+
@@ -320,6 +324,7 @@ commands:
                        file metadata
   mv <old> <new>      rename/move
   mkdir <path>        create directory (parents auto-created)
+  chmod <mode> <path>  change file permissions (octal, e.g. 644)
   rm [-r|--recursive] <path>
                        remove file or directory tree
   sh                  interactive shell
