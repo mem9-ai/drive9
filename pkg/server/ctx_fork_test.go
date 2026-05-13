@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -96,12 +97,15 @@ func cleanupForkTestTables(t *testing.T, s *meta.Store) {
 		`DELETE FROM semantic`,
 		`DELETE FROM contents`,
 		`DELETE FROM inodes`,
+		// files may not exist for new-tenant-only deployments.
 		`DELETE FROM files`,
 		`DELETE FROM uploads`,
 		`DELETE FROM semantic_tasks`,
 	} {
 		if _, err := s.DB().Exec(stmt); err != nil {
-			t.Fatalf("cleanupForkTestTables: %s: %v", stmt, err)
+			if !isTableNotFoundForCleanup(err) {
+				t.Fatalf("cleanupForkTestTables: %s: %v", stmt, err)
+			}
 		}
 	}
 }
@@ -285,4 +289,13 @@ func TestCleanupBranchBackedForkWithoutProvisionerDoesNotMarkDeleted(t *testing.
 	if got.Status != meta.TenantDeleting {
 		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantDeleting)
 	}
+}
+
+func isTableNotFoundForCleanup(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "error 1146") ||
+		strings.Contains(msg, "table") && strings.Contains(msg, "doesn't exist")
 }

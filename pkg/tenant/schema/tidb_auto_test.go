@@ -15,7 +15,7 @@ import (
 )
 
 func TestDetectTiDBEmbeddingModeFromFilesMeta(t *testing.T) {
-	autoMeta := testFilesTableMeta(TiDBEmbeddingModeAuto)
+	autoMeta := testSemanticTableMeta(TiDBEmbeddingModeAuto)
 	mode, err := detectTiDBEmbeddingModeFromFilesMeta(autoMeta)
 	if err != nil {
 		t.Fatalf("detect auto mode: %v", err)
@@ -24,7 +24,7 @@ func TestDetectTiDBEmbeddingModeFromFilesMeta(t *testing.T) {
 		t.Fatalf("mode=%q, want %q", mode, TiDBEmbeddingModeAuto)
 	}
 
-	appMeta := testFilesTableMeta(TiDBEmbeddingModeApp)
+	appMeta := testSemanticTableMeta(TiDBEmbeddingModeApp)
 	mode, err = detectTiDBEmbeddingModeFromFilesMeta(appMeta)
 	if err != nil {
 		t.Fatalf("detect app mode: %v", err)
@@ -34,14 +34,14 @@ func TestDetectTiDBEmbeddingModeFromFilesMeta(t *testing.T) {
 	}
 }
 
-func TestValidateTiDBAutoEmbeddingFilesTableAcceptsRealTiDBMetadata(t *testing.T) {
-	if err := validateTiDBAutoEmbeddingFilesTable(testFilesTableMeta(TiDBEmbeddingModeAuto)); err != nil {
+func TestValidateTiDBAutoEmbeddingSemanticTableAcceptsRealTiDBMetadata(t *testing.T) {
+	if err := validateTiDBAutoEmbeddingSemanticTable(testSemanticTableMeta(TiDBEmbeddingModeAuto)); err != nil {
 		t.Fatalf("expected auto files table to validate: %v", err)
 	}
 }
 
-func TestValidateTiDBAutoEmbeddingFilesTableRejectsWritableEmbedding(t *testing.T) {
-	err := validateTiDBAutoEmbeddingFilesTable(testFilesTableMeta(TiDBEmbeddingModeApp))
+func TestValidateTiDBAutoEmbeddingSemanticTableRejectsWritableEmbedding(t *testing.T) {
+	err := validateTiDBAutoEmbeddingSemanticTable(testSemanticTableMeta(TiDBEmbeddingModeApp))
 	if err == nil {
 		t.Fatal("expected writable embedding column to be rejected")
 	}
@@ -50,8 +50,8 @@ func TestValidateTiDBAutoEmbeddingFilesTableRejectsWritableEmbedding(t *testing.
 	}
 }
 
-func TestValidateTiDBAppEmbeddingFilesTableRejectsGeneratedEmbedding(t *testing.T) {
-	err := validateTiDBAppEmbeddingFilesTable(testFilesTableMeta(TiDBEmbeddingModeAuto))
+func TestValidateTiDBAppEmbeddingSemanticTableRejectsGeneratedEmbedding(t *testing.T) {
+	err := validateTiDBAppEmbeddingSemanticTable(testSemanticTableMeta(TiDBEmbeddingModeAuto))
 	if err == nil {
 		t.Fatal("expected generated embedding column to be rejected in app mode")
 	}
@@ -87,7 +87,7 @@ func TestTiDBSchemaSpecForModeIncludesCreateStatements(t *testing.T) {
 		createByTable[table.name] = table.createStatement
 	}
 
-	for _, tableName := range []string{"file_nodes", "file_tags", "files", "uploads", "semantic_tasks", "file_gc_tasks", "vault_deks", "vault_audit_log"} {
+	for _, tableName := range []string{"file_nodes", "file_tags", "uploads", "semantic", "semantic_tasks", "file_gc_tasks", "vault_deks", "vault_audit_log"} {
 		stmt := createByTable[tableName]
 		if stmt == "" {
 			t.Fatalf("missing create statement for %s", tableName)
@@ -192,7 +192,7 @@ func TestPlannedTiDBSchemaRepairsIncludesSafeStatementsOnly(t *testing.T) {
 		{kind: tidbSchemaDiffMissingColumn, tableName: "uploads", columnName: "expected_revision", repairSQL: "ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL"},
 		{kind: tidbSchemaDiffMissingIndex, tableName: "uploads", detail: "uploads schema contract: missing idx_upload_path index", repairSQL: "CREATE INDEX idx_upload_path ON uploads(target_path, status)"},
 		{kind: tidbSchemaDiffMissingColumn, tableName: "uploads", columnName: "expected_revision", repairSQL: "ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL"},
-		{kind: tidbSchemaDiffColumnType, tableName: "files", columnName: "embedding_revision", detail: "files schema contract: embedding_revision column type = \"int\", want bigint"},
+		{kind: tidbSchemaDiffColumnType, tableName: "semantic", columnName: "embedding_revision", detail: "semantic schema contract: embedding_revision column type = \"int\", want bigint"},
 	}
 
 	got := plannedTiDBSchemaRepairs(diffs)
@@ -296,8 +296,8 @@ func TestApplyTiDBSchemaRepairsPreflightsUniqueIndexNoDuplicatesExecutesRepair(t
 }
 
 func TestValidateTiDBAutoEmbeddingFilesDiffsReportsGeneratedContractMismatch(t *testing.T) {
-	meta := testFilesTableMeta(TiDBEmbeddingModeApp)
-	diffs := validateTiDBAutoEmbeddingFilesDiffs(meta)
+	meta := testSemanticTableMeta(TiDBEmbeddingModeApp)
+	diffs := validateTiDBAutoEmbeddingDiffs(meta)
 	if len(diffs) == 0 {
 		t.Fatal("expected auto embedding diffs for writable embedding column")
 	}
@@ -307,9 +307,9 @@ func TestValidateTiDBAutoEmbeddingFilesDiffsReportsGeneratedContractMismatch(t *
 }
 
 func TestValidateTiDBAutoEmbeddingFilesDiffsAllowsWritableDescriptionEmbeddingCompat(t *testing.T) {
-	meta := testFilesTableMeta(TiDBEmbeddingModeAuto)
+	meta := testSemanticTableMeta(TiDBEmbeddingModeAuto)
 	meta.columns["description_embedding"] = tidbColumnMeta{columnType: "vector(1024)"}
-	diffs := validateTiDBAutoEmbeddingFilesDiffs(meta)
+	diffs := validateTiDBAutoEmbeddingDiffs(meta)
 	for _, diff := range diffs {
 		if diff.columnName == "description_embedding" {
 			t.Fatalf("expected writable description_embedding compat column to be accepted, got %#v", diffs)
@@ -605,17 +605,17 @@ func TestTiDBSchemaSpecForModeIncludesVaultIndexes(t *testing.T) {
 }
 
 func TestTiDBSchemaSpecIncludesStorageEncryptionColumns(t *testing.T) {
-	files := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "files")
+	contents := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "contents")
 	for column, wantAddSQL := range map[string]string{
-		"storage_encryption_mode":   "ALTER TABLE files ADD COLUMN storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'legacy'",
-		"storage_encryption_key_id": "ALTER TABLE files ADD COLUMN storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT ''",
+		"storage_encryption_mode":   "ALTER TABLE contents ADD COLUMN storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'legacy'",
+		"storage_encryption_key_id": "ALTER TABLE contents ADD COLUMN storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT ''",
 	} {
-		spec, ok := files.columns[column]
+		spec, ok := contents.columns[column]
 		if !ok {
-			t.Fatalf("files missing %s column", column)
+			t.Fatalf("contents missing %s column", column)
 		}
 		if spec.addSQL != wantAddSQL {
-			t.Fatalf("files %s addSQL = %q, want %q", column, spec.addSQL, wantAddSQL)
+			t.Fatalf("contents %s addSQL = %q, want %q", column, spec.addSQL, wantAddSQL)
 		}
 	}
 
@@ -634,30 +634,6 @@ func TestTiDBSchemaSpecIncludesStorageEncryptionColumns(t *testing.T) {
 	}
 }
 
-func TestTiDBSchemaSpecForModeIncludesAlterTableIndexes(t *testing.T) {
-	// In auto-embedding mode, FULLTEXT and VECTOR indexes are part of the
-	// enforceable schema contract and must appear in the spec. TiDB Cloud
-	// (the only platform where auto mode runs) supports ADD_COLUMNAR_REPLICA_ON_DEMAND.
-	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "files")
-	if _, ok := spec.indexes["idx_fts_content"]; !ok {
-		t.Fatal("files missing idx_fts_content index spec from ALTER TABLE statement")
-	}
-	if _, ok := spec.indexes["idx_fts_description"]; !ok {
-		t.Fatal("files missing idx_fts_description index spec from ALTER TABLE statement")
-	}
-	if _, ok := spec.indexes["idx_files_cosine"]; !ok {
-		t.Fatal("files auto mode spec must include idx_files_cosine index")
-	}
-	if _, ok := spec.indexes["idx_files_desc_cosine"]; !ok {
-		t.Fatal("files auto mode spec must include idx_files_desc_cosine index")
-	}
-	if _, ok := spec.columns["description_embedding"]; !ok {
-		t.Fatal("files auto mode spec must include description_embedding column")
-	}
-	if got := spec.columns["description_embedding"].addSQL; got != "ALTER TABLE files ADD COLUMN description_embedding VECTOR(1024) DEFAULT NULL" {
-		t.Fatalf("description_embedding addSQL=%q, want writable VECTOR compat repair SQL", got)
-	}
-}
 
 func TestTiDBSchemaSpecForModeIncludesSemanticIndexes(t *testing.T) {
 	// In auto-embedding mode, semantic table FULLTEXT and VECTOR indexes are
@@ -695,21 +671,6 @@ func TestTiDBSchemaSpecForAppModeExcludesSemanticIndexes(t *testing.T) {
 	}
 }
 
-func TestTiDBSchemaSpecForAppModeExcludesOptionalIndexes(t *testing.T) {
-	// Optional FULLTEXT/VECTOR indexes use ADD_COLUMNAR_REPLICA_ON_DEMAND which
-	// is not supported on all TiDB versions. They must not appear in the app
-	// mode schema contract so that validation does not fail when they are skipped.
-	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeApp, "files")
-	if _, ok := spec.indexes["idx_fts_content"]; ok {
-		t.Fatal("files app mode spec must not include optional idx_fts_content index")
-	}
-	if _, ok := spec.indexes["idx_fts_description"]; ok {
-		t.Fatal("files app mode spec must not include optional idx_fts_description index")
-	}
-	if _, ok := spec.indexes["idx_files_cosine"]; ok {
-		t.Fatal("files app mode spec must not include optional idx_files_cosine index")
-	}
-}
 
 func TestPlannedTiDBSchemaRepairsIncludesFulltextVectorIndexOnExistingTable(t *testing.T) {
 	// FULLTEXT and VECTOR indexes must be repaired even when the table already
@@ -719,9 +680,9 @@ func TestPlannedTiDBSchemaRepairsIncludesFulltextVectorIndexOnExistingTable(t *t
 	diffs := []tidbSchemaDiff{
 		{
 			kind:      tidbSchemaDiffMissingIndex,
-			tableName: "files",
-			detail:    "files schema contract: missing idx_fts_content index",
-			repairSQL: "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)",
+			tableName: "semantic",
+			detail:    "semantic schema contract: missing idx_semantic_fts_content index",
+			repairSQL: "ALTER TABLE semantic ADD FULLTEXT INDEX idx_semantic_fts_content(content_text)",
 		},
 	}
 
@@ -729,7 +690,7 @@ func TestPlannedTiDBSchemaRepairsIncludesFulltextVectorIndexOnExistingTable(t *t
 	if len(got) != 1 {
 		t.Fatalf("expected fulltext index repair to be included for existing table, got %#v", got)
 	}
-	if got[0] != "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)" {
+	if got[0] != "ALTER TABLE semantic ADD FULLTEXT INDEX idx_semantic_fts_content(content_text)" {
 		t.Fatalf("unexpected repair statement: %q", got[0])
 	}
 }
@@ -743,9 +704,9 @@ func TestPlannedTiDBSchemaRepairsAllowsHeavyAlterTableIndexRepairsWhenTableMissi
 		},
 		{
 			kind:      tidbSchemaDiffMissingIndex,
-			tableName: "files",
-			detail:    "files schema contract: missing idx_fts_content index",
-			repairSQL: "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)",
+			tableName: "semantic",
+			detail:    "semantic schema contract: missing idx_semantic_fts_content index",
+			repairSQL: "ALTER TABLE semantic ADD FULLTEXT INDEX idx_semantic_fts_content(content_text)",
 		},
 	}
 
@@ -753,7 +714,7 @@ func TestPlannedTiDBSchemaRepairsAllowsHeavyAlterTableIndexRepairsWhenTableMissi
 	if len(got) != 2 {
 		t.Fatalf("expected create table and heavy index repair, got %#v", got)
 	}
-	if got[1] != "ALTER TABLE files ADD FULLTEXT INDEX idx_fts_content(content_text)" {
+	if got[1] != "ALTER TABLE semantic ADD FULLTEXT INDEX idx_semantic_fts_content(content_text)" {
 		t.Fatalf("unexpected second repair statement: %q", got[1])
 	}
 }
@@ -761,7 +722,7 @@ func TestPlannedTiDBSchemaRepairsAllowsHeavyAlterTableIndexRepairsWhenTableMissi
 func TestIsSafeAddColumnRepairSQLRejectsStoredAndVirtualGeneratedColumns(t *testing.T) {
 	tests := []string{
 		"ALTER TABLE uploads ADD COLUMN active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED",
-		"ALTER TABLE files ADD COLUMN embedding VECTOR(1024) AS (EMBED_TEXT('m', content_text, '{\"dimensions\":1024}')) VIRTUAL",
+		"ALTER TABLE semantic ADD COLUMN embedding VECTOR(1024) AS (EMBED_TEXT('m', content_text, '{\"dimensions\":1024}')) VIRTUAL",
 	}
 
 	for _, stmt := range tests {
@@ -927,9 +888,9 @@ func TestParseAlterTableAddIndexStatementAcceptsUniqueKey(t *testing.T) {
 	}
 }
 
-func testFilesTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
+func testSemanticTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
 	meta := tidbTableMeta{
-		tableName: "files",
+		tableName: "semantic",
 		columns: map[string]tidbColumnMeta{
 			"file_id":                        {columnType: "varchar(64)"},
 			"status":                         {columnType: "varchar(32)"},

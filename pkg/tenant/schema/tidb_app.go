@@ -38,32 +38,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 		`CREATE INDEX idx_parent ON file_nodes(parent_path)`,
 		`CREATE INDEX idx_file_id ON file_nodes(file_id)`,
 		`CREATE INDEX idx_inode_id ON file_nodes(inode_id)`,
-		`CREATE TABLE IF NOT EXISTS files (
-			file_id            VARCHAR(64) PRIMARY KEY,
-			storage_type       VARCHAR(32) NOT NULL,
-			storage_ref        TEXT NOT NULL,
-			storage_ref_hash   VARCHAR(64) NOT NULL DEFAULT '',
-			storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'legacy',
-			storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT '',
-			content_blob       LONGBLOB,
-			content_type       VARCHAR(255),
-			size_bytes         BIGINT NOT NULL DEFAULT 0,
-			checksum_sha256    VARCHAR(128),
-			revision           BIGINT NOT NULL DEFAULT 1,
-			status             VARCHAR(32) NOT NULL DEFAULT 'PENDING',
-			source_id          VARCHAR(255),
-			content_text       LONGTEXT,
-			description        LONGTEXT,
-			embedding          VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `),
-			embedding_revision BIGINT,
-			description_embedding VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `),
-			description_embedding_revision BIGINT,
-			created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			confirmed_at       DATETIME(3),
-			expires_at         DATETIME(3)
-		)`,
-		`CREATE INDEX idx_status ON files(status, created_at)`,
-		`CREATE INDEX idx_files_storage_ref_hash ON files(storage_ref_hash)`,
+
 		`CREATE TABLE IF NOT EXISTS inodes (
 			inode_id     VARCHAR(64) PRIMARY KEY,
 			size_bytes   BIGINT NOT NULL DEFAULT 0,
@@ -193,20 +168,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 
 func tidbAppEmbeddingOptionalSchemaStatements() []string {
 	return []string{
-		`ALTER TABLE files
-			ADD FULLTEXT INDEX idx_fts_content(content_text)
-			WITH PARSER MULTILINGUAL
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-		`ALTER TABLE files
-			ADD FULLTEXT INDEX idx_fts_description(description)
-			WITH PARSER MULTILINGUAL
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-		`ALTER TABLE files
-			ADD VECTOR INDEX idx_files_cosine((VEC_COSINE_DISTANCE(embedding)))
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-		`ALTER TABLE files
-			ADD VECTOR INDEX idx_files_desc_cosine((VEC_COSINE_DISTANCE(description_embedding)))
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
+
 		`ALTER TABLE semantic
 			ADD FULLTEXT INDEX idx_semantic_fts_content(content_text)
 			WITH PARSER MULTILINGUAL

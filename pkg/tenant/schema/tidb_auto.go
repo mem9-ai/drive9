@@ -170,40 +170,7 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 		`CREATE INDEX idx_parent ON file_nodes(parent_path)`,
 		`CREATE INDEX idx_file_id ON file_nodes(file_id)`,
 		`CREATE INDEX idx_inode_id ON file_nodes(inode_id)`,
-		`CREATE TABLE IF NOT EXISTS files (
-			file_id            VARCHAR(64) PRIMARY KEY,
-			storage_type       VARCHAR(32) NOT NULL,
-			storage_ref        TEXT NOT NULL,
-			storage_ref_hash   VARCHAR(64) NOT NULL DEFAULT '',
-			storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'legacy',
-			storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT '',
-			content_blob       LONGBLOB,
-			content_type       VARCHAR(255),
-			size_bytes         BIGINT NOT NULL DEFAULT 0,
-			checksum_sha256    VARCHAR(128),
-			revision           BIGINT NOT NULL DEFAULT 1,
-			status             VARCHAR(32) NOT NULL DEFAULT 'PENDING',
-			source_id          VARCHAR(255),
-			content_text       LONGTEXT,
-			description        LONGTEXT,
-			embedding          VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `) GENERATED ALWAYS AS (EMBED_TEXT(
-				'` + tidbAutoEmbeddingModel + `',
-				content_text,
-				'` + tidbAutoEmbeddingOptionsJSON + `'
-			)) STORED,
-			embedding_revision BIGINT,
-			description_embedding VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `) GENERATED ALWAYS AS (EMBED_TEXT(
-				'` + tidbAutoEmbeddingModel + `',
-				description,
-				'` + tidbAutoEmbeddingOptionsJSON + `'
-			)) STORED,
-			description_embedding_revision BIGINT,
-			created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			confirmed_at       DATETIME(3),
-			expires_at         DATETIME(3)
-		)`,
-		`CREATE INDEX idx_status ON files(status, created_at)`,
-		`CREATE INDEX idx_files_storage_ref_hash ON files(storage_ref_hash)`,
+
 		`CREATE TABLE IF NOT EXISTS inodes (
 			inode_id     VARCHAR(64) PRIMARY KEY,
 			size_bytes   BIGINT NOT NULL DEFAULT 0,
@@ -259,20 +226,6 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
 		`ALTER TABLE semantic
 			ADD VECTOR INDEX idx_semantic_desc_cosine((VEC_COSINE_DISTANCE(description_embedding)))
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-		`ALTER TABLE files
-			ADD FULLTEXT INDEX idx_fts_content(content_text)
-			WITH PARSER MULTILINGUAL
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-		`ALTER TABLE files
-			ADD FULLTEXT INDEX idx_fts_description(description)
-			WITH PARSER MULTILINGUAL
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-		`ALTER TABLE files
-			ADD VECTOR INDEX idx_files_cosine((VEC_COSINE_DISTANCE(embedding)))
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-		`ALTER TABLE files
-			ADD VECTOR INDEX idx_files_desc_cosine((VEC_COSINE_DISTANCE(description_embedding)))
 			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
 		`CREATE TABLE IF NOT EXISTS file_tags (
 			file_id   VARCHAR(64) NOT NULL,
@@ -367,8 +320,11 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 	return stmts
 }
 
-// DetectTiDBEmbeddingMode inspects the TiDB files-table embedding contract and
-// reports whether the schema is in database-managed auto mode or app-managed mode.
+// DetectTiDBEmbeddingMode inspects the TiDB embedding contract and reports
+// whether the schema is in database-managed auto mode or app-managed mode.
+// It checks the files table first (legacy tenants); when the files table does
+// not exist, it falls back to the semantic table (new tenants without legacy
+// dual-write).
 func DetectTiDBEmbeddingMode(db *sql.DB) (TiDBEmbeddingMode, error) {
 	ctx := context.Background()
 	start := time.Now()
@@ -380,25 +336,34 @@ func DetectTiDBEmbeddingMode(db *sql.DB) (TiDBEmbeddingMode, error) {
 		return TiDBEmbeddingModeUnknown, fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
 	loadStart := time.Now()
-	filesMeta, err := loadTiDBTableMeta(ctx, db, "files")
+	tableName := "files"
+	meta, err := loadTiDBTableMeta(ctx, db, tableName)
 	if err != nil {
-		logger.Warn(ctx, "tenant_detect_tidb_embedding_mode_load_files_failed",
-			zap.Duration("elapsed", time.Since(loadStart)),
-			zap.Duration("total_elapsed", time.Since(start)),
-			zap.Error(err))
-		return TiDBEmbeddingModeUnknown, fmt.Errorf("load files table metadata: %w", err)
+		// New tenants without the legacy files table: try the semantic table.
+		semanticMeta, semErr := loadTiDBTableMeta(ctx, db, "semantic")
+		if semErr != nil {
+			logger.Warn(ctx, "tenant_detect_tidb_embedding_mode_load_both_failed",
+				zap.Duration("elapsed", time.Since(loadStart)),
+				zap.Duration("total_elapsed", time.Since(start)),
+				zap.Error(err),
+				zap.NamedError("semantic_err", semErr))
+			return TiDBEmbeddingModeUnknown, fmt.Errorf("load table metadata: files: %w; semantic: %w", err, semErr)
+		}
+		meta = semanticMeta
+		tableName = "semantic"
 	}
-	logger.Info(ctx, "tenant_detect_tidb_embedding_mode_loaded_files",
+	logger.Info(ctx, "tenant_detect_tidb_embedding_mode_loaded_table",
+		zap.String("table", tableName),
 		zap.Duration("elapsed", time.Since(loadStart)),
 		zap.Duration("total_elapsed", time.Since(start)))
 	detectStart := time.Now()
-	mode, err := detectTiDBEmbeddingModeFromFilesMeta(filesMeta)
+	mode, err := detectTiDBEmbeddingModeFromFilesMeta(meta)
 	if err != nil {
 		logger.Warn(ctx, "tenant_detect_tidb_embedding_mode_failed",
 			zap.Duration("elapsed", time.Since(detectStart)),
 			zap.Duration("total_elapsed", time.Since(start)),
 			zap.Error(err))
-		return TiDBEmbeddingModeUnknown, fmt.Errorf("files schema contract: %w", err)
+		return TiDBEmbeddingModeUnknown, fmt.Errorf("embedding schema contract: %w", err)
 	}
 	logger.Info(ctx, "tenant_detect_tidb_embedding_mode_finished",
 		zap.String("mode", string(mode)),
@@ -522,10 +487,13 @@ func validateTiDBSchemaMode(mode TiDBEmbeddingMode) error {
 
 // BackfillStorageRefHashes populates storage_ref_hash for pre-existing storage rows.
 func BackfillStorageRefHashes(ctx context.Context, db *sql.DB) error {
+	// Legacy tenants: backfill the files table if it exists.
 	if _, err := db.ExecContext(ctx, `UPDATE files
 		SET storage_ref_hash = LOWER(SHA2(storage_ref, 256))
 		WHERE storage_ref_hash = '' AND storage_ref <> ''`); err != nil {
-		return err
+		if !isMissingTableError(err) {
+			return err
+		}
 	}
 	_, err := db.ExecContext(ctx, `UPDATE contents
 		SET storage_ref_hash = LOWER(SHA2(storage_ref, 256))
@@ -618,21 +586,21 @@ func detectTiDBEmbeddingModeFromFilesMeta(meta tidbTableMeta) (TiDBEmbeddingMode
 	return TiDBEmbeddingModeApp, nil
 }
 
-func validateTiDBAutoEmbeddingFilesTable(meta tidbTableMeta) error {
-	if err := validateTiDBFilesTableBase(meta); err != nil {
+func validateTiDBAutoEmbeddingSemanticTable(meta tidbTableMeta) error {
+	if err := validateTiDBSemanticTableBase(meta); err != nil {
 		return err
 	}
-	return schemaDiffsToError(validateTiDBAutoEmbeddingFilesDiffs(meta))
+	return schemaDiffsToError(validateTiDBAutoEmbeddingDiffs(meta))
 }
 
-func validateTiDBAppEmbeddingFilesTable(meta tidbTableMeta) error {
-	if err := validateTiDBFilesTableBase(meta); err != nil {
+func validateTiDBAppEmbeddingSemanticTable(meta tidbTableMeta) error {
+	if err := validateTiDBSemanticTableBase(meta); err != nil {
 		return err
 	}
-	return schemaDiffsToError(validateTiDBAppEmbeddingFilesDiffs(meta))
+	return schemaDiffsToError(validateTiDBAppEmbeddingDiffs(meta))
 }
 
-func validateTiDBFilesTableBase(meta tidbTableMeta) error {
+func validateTiDBSemanticTableBase(meta tidbTableMeta) error {
 	if err := meta.requireColumnType("file_id", "varchar(64)"); err != nil {
 		return err
 	}
@@ -891,13 +859,13 @@ func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
 		return tidbSchemaSpec{}, err
 	}
 	for i := range spec.tables {
-		if spec.tables[i].name != "files" {
+		if spec.tables[i].name != "semantic" {
 			continue
 		}
 		if mode == TiDBEmbeddingModeAuto {
 			if col, ok := spec.tables[i].columns["description_embedding"]; ok {
 				col.addSQL = fmt.Sprintf(
-					"ALTER TABLE files ADD COLUMN description_embedding VECTOR(%d) DEFAULT NULL",
+					"ALTER TABLE semantic ADD COLUMN description_embedding VECTOR(%d) DEFAULT NULL",
 					TiDBAutoEmbeddingDimensions,
 				)
 				spec.tables[i].columns["description_embedding"] = col
@@ -906,11 +874,11 @@ func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
 		spec.tables[i].validate = func(meta tidbTableMeta) []tidbSchemaDiff {
 			switch mode {
 			case TiDBEmbeddingModeAuto:
-				return validateTiDBAutoEmbeddingFilesDiffs(meta)
+				return validateTiDBAutoEmbeddingDiffs(meta)
 			case TiDBEmbeddingModeApp:
-				return validateTiDBAppEmbeddingFilesDiffs(meta)
+				return validateTiDBAppEmbeddingDiffs(meta)
 			default:
-				return []tidbSchemaDiff{{kind: tidbSchemaDiffTableContract, tableName: "files", detail: fmt.Sprintf("files schema contract: unsupported TiDB embedding mode %q", mode)}}
+				return []tidbSchemaDiff{{kind: tidbSchemaDiffTableContract, tableName: "semantic", detail: fmt.Sprintf("semantic schema contract: unsupported TiDB embedding mode %q", mode)}}
 			}
 		}
 		break
@@ -1822,7 +1790,7 @@ func isIgnorableTiDBSchemaError(err error) bool {
 	return schemaspec.IsIgnorableMySQLError(err)
 }
 
-func validateTiDBAutoEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
+func validateTiDBAutoEmbeddingDiffs(meta tidbTableMeta) []tidbSchemaDiff {
 	var diffs []tidbSchemaDiff
 	for _, spec := range []struct {
 		column        string
@@ -1847,9 +1815,9 @@ func validateTiDBAutoEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
 			}
 			diffs = append(diffs, tidbSchemaDiff{
 				kind:       tidbSchemaDiffTableContract,
-				tableName:  "files",
+				tableName:  "semantic",
 				columnName: spec.column,
-				detail:     fmt.Sprintf("files schema contract: %s column must be a stored generated column", spec.column),
+				detail:     fmt.Sprintf("semantic schema contract: %s column must be a stored generated column", spec.column),
 			})
 			continue
 		}
@@ -1858,16 +1826,16 @@ func validateTiDBAutoEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
 			pattern string
 			errMsg  string
 		}{
-			{"embed_text(", fmt.Sprintf("files schema contract: %s generated expression must use EMBED_TEXT", spec.column)},
-			{tidbAutoEmbeddingModel, fmt.Sprintf("files schema contract: %s model contract mismatch", spec.column)},
-			{spec.source, fmt.Sprintf("files schema contract: generated expression must derive from %s", spec.source)},
-			{tidbAutoEmbeddingOptionsJSON, fmt.Sprintf("files schema contract: %s dimensions option mismatch", spec.column)},
+			{"embed_text(", fmt.Sprintf("semantic schema contract: %s generated expression must use EMBED_TEXT", spec.column)},
+			{tidbAutoEmbeddingModel, fmt.Sprintf("semantic schema contract: %s model contract mismatch", spec.column)},
+			{spec.source, fmt.Sprintf("semantic schema contract: generated expression must derive from %s", spec.source)},
+			{tidbAutoEmbeddingOptionsJSON, fmt.Sprintf("semantic schema contract: %s dimensions option mismatch", spec.column)},
 		}
 		for _, check := range checks {
 			if !strings.Contains(expr, check.pattern) {
 				diffs = append(diffs, tidbSchemaDiff{
 					kind:       tidbSchemaDiffTableContract,
-					tableName:  "files",
+					tableName:  "semantic",
 					columnName: spec.column,
 					detail:     check.errMsg,
 				})
@@ -1877,7 +1845,7 @@ func validateTiDBAutoEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
 	return diffs
 }
 
-func validateTiDBAppEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
+func validateTiDBAppEmbeddingDiffs(meta tidbTableMeta) []tidbSchemaDiff {
 	var diffs []tidbSchemaDiff
 	for _, colName := range []string{"embedding", "description_embedding"} {
 		col, err := meta.requireColumn(colName)
@@ -1888,17 +1856,17 @@ func validateTiDBAppEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
 		if strings.Contains(extra, "generated") {
 			diffs = append(diffs, tidbSchemaDiff{
 				kind:       tidbSchemaDiffTableContract,
-				tableName:  "files",
+				tableName:  "semantic",
 				columnName: colName,
-				detail:     fmt.Sprintf("files schema contract: %s column must be writable in app mode", colName),
+				detail:     fmt.Sprintf("semantic schema contract: %s column must be writable in app mode", colName),
 			})
 		}
 		if expr := normalizeSQLFragment(col.generationExpression); expr != "" {
 			diffs = append(diffs, tidbSchemaDiff{
 				kind:       tidbSchemaDiffTableContract,
-				tableName:  "files",
+				tableName:  "semantic",
 				columnName: colName,
-				detail:     fmt.Sprintf("files schema contract: %s column must not define a generation expression in app mode", colName),
+				detail:     fmt.Sprintf("semantic schema contract: %s column must not define a generation expression in app mode", colName),
 			})
 		}
 	}
@@ -1928,4 +1896,14 @@ func sortedIndexNames(indexes map[string]tidbIndexSpec) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func isMissingTableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "error 1146") ||
+		strings.Contains(msg, "table") && strings.Contains(msg, "doesn't exist") ||
+		strings.Contains(msg, "relation") && strings.Contains(msg, "does not exist")
 }

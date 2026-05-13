@@ -98,21 +98,21 @@ func TestCreateDuplicateDoesNotLeaveOrphanFileOrObject(t *testing.T) {
 	}
 
 	var files int
-	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM files`).Scan(&files); err != nil {
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM inodes`).Scan(&files); err != nil {
 		t.Fatal(err)
 	}
 	if files != 1 {
-		t.Fatalf("files rows = %d, want 1", files)
+		t.Fatalf("inode rows = %d, want 1", files)
 	}
 	var orphans int
 	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*)
-		FROM files f
-		LEFT JOIN file_nodes fn ON fn.file_id = f.file_id
+		FROM inodes i
+		LEFT JOIN file_nodes fn ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id
 		WHERE fn.file_id IS NULL`).Scan(&orphans); err != nil {
 		t.Fatal(err)
 	}
 	if orphans != 0 {
-		t.Fatalf("orphan files = %d, want 0", orphans)
+		t.Fatalf("orphan inodes = %d, want 0", orphans)
 	}
 
 	objectCount := 0
