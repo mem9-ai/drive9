@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"io"
+	"math/big"
 	"net/http"
 	"strings"
 	"sync"
@@ -176,7 +178,11 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	} else if hasReservations {
 		return nil, forkErr(http.StatusConflict, "source tenant has active upload reservations")
 	}
-	sourcePassword, err := s.pool.Decrypt(ctx, source.DBPasswordCipher)
+	forkPassword, err := generateForkDBPassword(24)
+	if err != nil {
+		return nil, err
+	}
+	forkPasswordCipher, err := s.pool.Encrypt(ctx, []byte(forkPassword))
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +196,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	forkRoot.ParentTenantID = source.ID
 	forkRoot.StorageNamespaceID = source.StorageNamespaceID
 	forkRoot.BranchID = ""
-	forkRoot.DBPasswordCipher = append([]byte(nil), source.DBPasswordCipher...)
+	forkRoot.DBPasswordCipher = forkPasswordCipher
 	if source.S3BucketKeyEnabled != nil {
 		v := *source.S3BucketKeyEnabled
 		forkRoot.S3BucketKeyEnabled = &v
@@ -204,7 +210,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	}
 
 	sourceCluster := clusterInfoFromTenant(source)
-	sourceCluster.Password = string(sourcePassword)
+	sourceCluster.Password = forkPassword
 	cluster, err := branchProvisioner.CreateBranch(ctx, forkID, sourceCluster)
 	if cluster != nil {
 		cluster.Provider = source.Provider
@@ -445,12 +451,12 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 		return tenantDSN(cluster.Username, string(plain), cluster.Host, cluster.Port, cluster.DBName, true), nil
 	}
 
-	sourcePassword, err := s.pool.Decrypt(ctx, source.DBPasswordCipher)
+	branchPassword, err := s.pool.Decrypt(ctx, forkTenant.DBPasswordCipher)
 	if err != nil {
 		return "", err
 	}
 	sourceCluster := clusterInfoFromTenant(source)
-	sourceCluster.Password = string(sourcePassword)
+	sourceCluster.Password = string(branchPassword)
 	cluster, err := branchProvisioner.CreateBranch(ctx, forkTenant.ID, sourceCluster)
 	if cluster != nil {
 		cluster.Provider = source.Provider
@@ -466,7 +472,7 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 		DBHost:           cluster.Host,
 		DBPort:           cluster.Port,
 		DBUser:           cluster.Username,
-		DBPasswordCipher: source.DBPasswordCipher,
+		DBPasswordCipher: forkTenant.DBPasswordCipher,
 		DBName:           cluster.DBName,
 		DBTLS:            true,
 		Provider:         cluster.Provider,
@@ -481,7 +487,21 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 	if cluster.Host == "" || cluster.Port == 0 || cluster.Username == "" {
 		return "", forkErr(http.StatusServiceUnavailable, "database branch is not active yet")
 	}
-	return tenantDSN(cluster.Username, string(sourcePassword), cluster.Host, cluster.Port, cluster.DBName, true), nil
+	return tenantDSN(cluster.Username, string(branchPassword), cluster.Host, cluster.Port, cluster.DBName, true), nil
+}
+
+func generateForkDBPassword(length int) (string, error) {
+	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, length)
+	max := big.NewInt(int64(len(chars)))
+	for i := range b {
+		n, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			return "", err
+		}
+		b[i] = chars[n.Int64()]
+	}
+	return string(b), nil
 }
 
 func (s *Server) deleteForkBranchOrPersist(ctx context.Context, forkID string, branchProvisioner tenant.BranchProvisioner, cluster *tenant.ClusterInfo) {

@@ -29,14 +29,18 @@ func TestProvisionBranchCreatesBranchFromSourceBranch(t *testing.T) {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 		var body struct {
-			DisplayName string `json:"displayName"`
-			ParentID    string `json:"parentId"`
+			DisplayName  string `json:"displayName"`
+			ParentID     string `json:"parentId"`
+			RootPassword string `json:"rootPassword"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
 		if body.DisplayName != "fork-tenant" {
 			t.Fatalf("displayName = %q", body.DisplayName)
+		}
+		if body.RootPassword != "branch-pass" {
+			t.Fatalf("rootPassword = %q, want branch-pass", body.RootPassword)
 		}
 		gotParentID = body.ParentID
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -54,7 +58,7 @@ func TestProvisionBranchCreatesBranchFromSourceBranch(t *testing.T) {
 	out, err := p.ProvisionBranch(context.Background(), "fork-tenant", &tenant.ClusterInfo{
 		ClusterID: "c1",
 		BranchID:  "b1",
-		Password:  "source-pass",
+		Password:  "branch-pass",
 		DBName:    "test",
 	})
 	if err != nil {
@@ -66,16 +70,24 @@ func TestProvisionBranchCreatesBranchFromSourceBranch(t *testing.T) {
 	if out.ClusterID != "c1" || out.BranchID != "b2" || out.Username != "u2.root" || out.Host != "db.example" || out.Port != 4000 {
 		t.Fatalf("unexpected cluster info: %#v", out)
 	}
-	if out.Password != "source-pass" {
-		t.Fatalf("password = %q, want source-pass", out.Password)
+	if out.Password != "branch-pass" {
+		t.Fatalf("password = %q, want branch-pass", out.Password)
 	}
 }
 
 func TestCreateBranchDoesNotWaitForActive(t *testing.T) {
 	var gotGet bool
+	var gotRootPassword string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1beta1/clusters/c1/branches":
+			var body struct {
+				RootPassword string `json:"rootPassword"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			gotRootPassword = body.RootPassword
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"branchId": "b-pending",
 				"state":    "CREATING",
@@ -93,7 +105,7 @@ func TestCreateBranchDoesNotWaitForActive(t *testing.T) {
 	out, err := p.CreateBranch(context.Background(), "fork-tenant", &tenant.ClusterInfo{
 		ClusterID: "c1",
 		BranchID:  "b1",
-		Password:  "source-pass",
+		Password:  "branch-pass",
 		DBName:    "test",
 	})
 	if err != nil {
@@ -102,7 +114,10 @@ func TestCreateBranchDoesNotWaitForActive(t *testing.T) {
 	if gotGet {
 		t.Fatal("CreateBranch polled branch status")
 	}
-	if out.ClusterID != "c1" || out.BranchID != "b-pending" || out.Host != "" || out.Username != "" || out.Password != "source-pass" {
+	if gotRootPassword != "branch-pass" {
+		t.Fatalf("rootPassword = %q, want branch-pass", gotRootPassword)
+	}
+	if out.ClusterID != "c1" || out.BranchID != "b-pending" || out.Host != "" || out.Username != "" || out.Password != "branch-pass" {
 		t.Fatalf("unexpected cluster info: %#v", out)
 	}
 }
