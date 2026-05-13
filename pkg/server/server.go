@@ -68,6 +68,7 @@ type Server struct {
 	mux               *http.ServeMux
 	events            *eventBuses
 	semanticWorker    *semanticWorkerManager
+	objectGCWorker    *objectGCWorker
 }
 
 var (
@@ -162,6 +163,8 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
 	mux.Handle("/v2/uploads/", business)
+	mux.Handle("/v1/ctx/fork", business)
+	mux.Handle("/v1/ctx", business)
 	mux.Handle("/v1/sql", business)
 	mux.Handle("/v1/events", business)
 	// Vault management API goes through tenant auth.
@@ -224,6 +227,7 @@ func NewWithConfig(cfg Config) *Server {
 	s.mux = mux
 	if s.meta != nil && s.pool != nil && s.provisioner != nil {
 		s.resumeProvisioningTenants()
+		s.resumeDeletingForkTenants()
 	}
 	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
 	appManagedTaskTypes := semanticWorkerLogTaskTypesFromTypes(appManagedSemanticTaskTypes(cfg.SemanticEmbedder))
@@ -258,12 +262,22 @@ func NewWithConfig(cfg Config) *Server {
 			zap.Bool("pool_present", cfg.Pool != nil),
 			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()))
 	}
+	s.objectGCWorker = newObjectGCWorker(cfg.Meta, cfg.Pool)
+	if s.objectGCWorker != nil {
+		logger.Info("server_object_gc_worker_enabled")
+		s.objectGCWorker.Start(backgroundWithTrace(context.Background()))
+	} else {
+		logger.Info("server_object_gc_worker_disabled")
+	}
 	return s
 }
 
 func (s *Server) Close() {
 	if s.semanticWorker != nil {
 		s.semanticWorker.Stop()
+	}
+	if s.objectGCWorker != nil {
+		s.objectGCWorker.Stop()
 	}
 }
 
@@ -276,6 +290,12 @@ func (s *Server) resumeProvisioningTenants() {
 	}
 	for i := range tenants {
 		t := tenants[i]
+		if t.Kind == meta.TenantKindFork {
+			logger.Warn(ctx, "resume_provisioning_fork_skipped",
+				zap.String("tenant_id", t.ID),
+				zap.String("parent_tenant_id", t.ParentTenantID))
+			continue
+		}
 		go s.resumeTenantSchemaInit(t)
 	}
 }
@@ -339,6 +359,10 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleUploadAction(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v2/uploads/"):
 		s.handleV2Uploads(w, r)
+	case r.URL.Path == "/v1/ctx/fork":
+		s.handleCtxFork(w, r)
+	case r.URL.Path == "/v1/ctx":
+		s.handleCtxDelete(w, r)
 	case r.URL.Path == "/v1/sql":
 		s.handleSQL(w, r)
 	case r.URL.Path == "/v1/events":

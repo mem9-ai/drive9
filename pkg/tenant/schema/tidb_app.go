@@ -42,6 +42,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			file_id            VARCHAR(64) PRIMARY KEY,
 			storage_type       VARCHAR(32) NOT NULL,
 			storage_ref        TEXT NOT NULL,
+			storage_ref_hash   VARCHAR(64) NOT NULL DEFAULT '',
 			storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'legacy',
 			storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT '',
 			content_blob       LONGBLOB,
@@ -62,6 +63,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			expires_at         DATETIME(3)
 		)`,
 		`CREATE INDEX idx_status ON files(status, created_at)`,
+		`CREATE INDEX idx_files_storage_ref_hash ON files(storage_ref_hash)`,
 		`CREATE TABLE IF NOT EXISTS inodes (
 			inode_id     VARCHAR(64) PRIMARY KEY,
 			size_bytes   BIGINT NOT NULL DEFAULT 0,
@@ -78,6 +80,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			inode_id                   VARCHAR(64) PRIMARY KEY,
 			storage_type               VARCHAR(32) NOT NULL,
 			storage_ref                TEXT NOT NULL,
+			storage_ref_hash           VARCHAR(64) NOT NULL DEFAULT '',
 			storage_encryption_mode    VARCHAR(16) NOT NULL DEFAULT 'legacy',
 			storage_encryption_key_id  VARCHAR(256) NOT NULL DEFAULT '',
 			content_blob               LONGBLOB,
@@ -85,6 +88,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			checksum_sha256            VARCHAR(128),
 			source_id                  VARCHAR(255)
 		)`,
+		`CREATE INDEX idx_contents_storage_ref_hash ON contents(storage_ref_hash)`,
 		`CREATE TABLE IF NOT EXISTS semantic (
 			inode_id                           VARCHAR(64) PRIMARY KEY,
 			content_text                       LONGTEXT,

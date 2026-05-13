@@ -37,6 +37,7 @@ func InitSchemaStatements() []string {
 			file_id            VARCHAR(64) PRIMARY KEY,
 			storage_type       VARCHAR(32) NOT NULL,
 			storage_ref        TEXT NOT NULL,
+			storage_ref_hash   VARCHAR(64) NOT NULL DEFAULT '',
 			content_blob       BYTEA,
 			content_type       VARCHAR(255),
 			size_bytes         BIGINT NOT NULL DEFAULT 0,
@@ -57,6 +58,7 @@ func InitSchemaStatements() []string {
 			expires_at         TIMESTAMPTZ
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_status ON files(status, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_files_storage_ref_hash ON files(storage_ref_hash)`,
 		`CREATE INDEX IF NOT EXISTS idx_files_cosine ON files USING hnsw (embedding vector_cosine_ops)`,
 		`CREATE INDEX IF NOT EXISTS idx_files_desc_cosine ON files USING hnsw (description_embedding vector_cosine_ops)`,
 		`CREATE INDEX IF NOT EXISTS idx_fts_content ON files USING gin (to_tsvector('simple', coalesce(content_text,'')))`,
@@ -77,6 +79,7 @@ func InitSchemaStatements() []string {
 			inode_id                   VARCHAR(64) PRIMARY KEY,
 			storage_type               VARCHAR(32) NOT NULL,
 			storage_ref                TEXT NOT NULL,
+			storage_ref_hash           VARCHAR(64) NOT NULL DEFAULT '',
 			storage_encryption_mode    VARCHAR(16) NOT NULL DEFAULT 'legacy',
 			storage_encryption_key_id  VARCHAR(256) NOT NULL DEFAULT '',
 			content_blob               BYTEA,
@@ -84,6 +87,7 @@ func InitSchemaStatements() []string {
 			checksum_sha256            VARCHAR(128),
 			source_id                  VARCHAR(255)
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_contents_storage_ref_hash ON contents(storage_ref_hash)`,
 		`CREATE TABLE IF NOT EXISTS semantic (
 			inode_id                           VARCHAR(64) PRIMARY KEY,
 			content_text                       TEXT,

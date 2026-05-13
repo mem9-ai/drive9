@@ -82,9 +82,10 @@ type Dat9Backend struct {
 	entropy             io.Reader
 
 	// Central quota enforcement (Rev 4 migration).
-	tenantID    string
-	metaStore   MetaQuotaStore // nil when central quota is not wired (tests, fallback)
-	quotaSource QuotaSource    // "tenant" (default) or "server"
+	tenantID           string
+	storageNamespaceID string
+	metaStore          MetaQuotaStore // nil when central quota is not wired (tests, fallback)
+	quotaSource        QuotaSource    // "tenant" (default) or "server"
 
 	s3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
 
@@ -706,7 +707,7 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		return 0, 0, err
 	}
 	b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
-	// Overwrite cleanup remains best-effort: file_gc_tasks track deleted file
+	// Overwrite cleanup is object-level: file_gc_tasks track deleted file
 	// identities, not old blob refs for a still-live file_id.
 	b.deleteBlobIfS3Ctx(ctx, nf.File.StorageType, nf.File.StorageRef, storageRef)
 	// Temporary compatibility: app embedding still relies on the legacy
@@ -1136,7 +1137,50 @@ func (b *Dat9Backend) deleteBlobIfS3Ctx(ctx context.Context, storageType datasto
 	if storageType != datastore.StorageS3 || storageRef == "" || storageRef == keepRef {
 		return
 	}
-	b.deleteBlobCtx(ctx, storageRef)
+	handled, err := b.enqueueObjectGCCandidateCtx(ctx, storageRef, meta.ObjectGCReasonOverwrite, "")
+	if handled && err == nil {
+		return
+	}
+	if err != nil {
+		logger.Warn(ctx, "backend_object_gc_candidate_required_but_failed",
+			zap.String("storage_ref", storageRef),
+			zap.Error(err))
+		return
+	}
+	logger.Warn(ctx, "backend_object_gc_candidate_not_configured",
+		zap.String("storage_ref", storageRef))
+}
+
+type objectGCCandidateEnqueuer interface {
+	EnqueueObjectGCCandidate(ctx context.Context, c *meta.ObjectGCCandidateInput) error
+}
+
+func (b *Dat9Backend) enqueueObjectGCCandidateCtx(ctx context.Context, storageRef string, reason meta.ObjectGCCandidateReason, sourceFileID string) (bool, error) {
+	if b.metaStore == nil || b.storageNamespaceID == "" || storageRef == "" {
+		return false, nil
+	}
+	enqueuer, ok := b.metaStore.(objectGCCandidateEnqueuer)
+	if !ok {
+		return false, nil
+	}
+	err := enqueuer.EnqueueObjectGCCandidate(ctx, &meta.ObjectGCCandidateInput{
+		NamespaceID:    b.storageNamespaceID,
+		StorageRef:     storageRef,
+		StorageRefHash: datastore.StorageRefHash(storageRef),
+		Reason:         reason,
+		SourceTenantID: b.tenantID,
+		SourceFileID:   sourceFileID,
+		NotBefore:      time.Now().UTC().Add(7 * 24 * time.Hour),
+	})
+	if err != nil {
+		logger.Warn(ctx, "backend_enqueue_object_gc_candidate_failed",
+			zap.String("storage_namespace_id", b.storageNamespaceID),
+			zap.String("storage_ref", storageRef),
+			zap.String("reason", string(reason)),
+			zap.Error(err))
+		return true, err
+	}
+	return true, nil
 }
 
 func (b *Dat9Backend) readFileDataCtx(ctx context.Context, f *datastore.File) ([]byte, error) {

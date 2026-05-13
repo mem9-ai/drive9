@@ -31,7 +31,15 @@ const (
 	TenantActive       TenantStatus = "active"
 	TenantFailed       TenantStatus = "failed"
 	TenantSuspended    TenantStatus = "suspended"
+	TenantDeleting     TenantStatus = "deleting"
 	TenantDeleted      TenantStatus = "deleted"
+)
+
+type TenantKind string
+
+const (
+	TenantKindLive TenantKind = "live"
+	TenantKindFork TenantKind = "fork"
 )
 
 type APIKeyStatus string
@@ -44,6 +52,9 @@ const (
 type Tenant struct {
 	ID                 string
 	Status             TenantStatus
+	Kind               TenantKind
+	ParentTenantID     string
+	StorageNamespaceID string
 	DBHost             string
 	DBPort             int
 	DBUser             string
@@ -52,6 +63,7 @@ type Tenant struct {
 	DBTLS              bool
 	Provider           string
 	ClusterID          string
+	BranchID           string
 	ClaimURL           string
 	ClaimExpiresAt     *time.Time
 	SchemaVersion      int
@@ -61,6 +73,42 @@ type Tenant struct {
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 }
+
+type StorageNamespaceState string
+
+const (
+	StorageNamespaceActive  StorageNamespaceState = "active"
+	StorageNamespaceDeleted StorageNamespaceState = "deleted"
+)
+
+type StorageNamespace struct {
+	ID            string
+	OwnerTenantID string
+	Backend       string
+	Bucket        string
+	Prefix        string
+	State         StorageNamespaceState
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+type ObjectGCCandidateState string
+
+const (
+	ObjectGCCandidatePending  ObjectGCCandidateState = "pending"
+	ObjectGCCandidateDeleting ObjectGCCandidateState = "deleting"
+	ObjectGCCandidateDeleted  ObjectGCCandidateState = "deleted"
+	ObjectGCCandidateFailed   ObjectGCCandidateState = "failed"
+)
+
+type ObjectGCCandidateReason string
+
+const (
+	ObjectGCReasonOverwrite   ObjectGCCandidateReason = "overwrite"
+	ObjectGCReasonFileDelete  ObjectGCCandidateReason = "file_delete"
+	ObjectGCReasonFailedWrite ObjectGCCandidateReason = "failed_write"
+	ObjectGCReasonForkDelete  ObjectGCCandidateReason = "fork_delete"
+)
 
 func (t Tenant) S3EncryptionPolicy() S3EncryptionPolicy {
 	return S3EncryptionPolicy{
@@ -269,6 +317,9 @@ func metaInitSchemaStatements() []string {
 		`CREATE TABLE IF NOT EXISTS tenants (
 			id               VARCHAR(64) PRIMARY KEY,
 			status           VARCHAR(20) NOT NULL DEFAULT 'provisioning',
+			kind             VARCHAR(16) NOT NULL DEFAULT 'live',
+			parent_tenant_id VARCHAR(64) NOT NULL DEFAULT '',
+			storage_namespace_id VARCHAR(64) NOT NULL DEFAULT '',
 			db_host          VARCHAR(255) NOT NULL,
 			db_port          INT NOT NULL,
 			db_user          VARCHAR(255) NOT NULL,
@@ -277,6 +328,7 @@ func metaInitSchemaStatements() []string {
 			db_tls           TINYINT(1) NOT NULL DEFAULT 1,
 			provider         VARCHAR(50) NOT NULL,
 			cluster_id       VARCHAR(255) NULL,
+			branch_id        VARCHAR(255) NOT NULL DEFAULT '',
 			claim_url        TEXT NULL,
 			claim_expires_at DATETIME(3) NULL,
 			schema_version   INT UNSIGNED NOT NULL DEFAULT 1,
@@ -287,7 +339,39 @@ func metaInitSchemaStatements() []string {
 			updated_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			deleted_at       DATETIME(3) NULL,
 			INDEX idx_tenant_status (status),
-			INDEX idx_tenant_provider (provider)
+			INDEX idx_tenant_provider (provider),
+			INDEX idx_tenant_namespace (storage_namespace_id, kind, status),
+			INDEX idx_tenant_parent (parent_tenant_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS storage_namespaces (
+			namespace_id    VARCHAR(64) PRIMARY KEY,
+			owner_tenant_id VARCHAR(64) NOT NULL,
+			backend         VARCHAR(16) NOT NULL,
+			bucket          VARCHAR(255) NOT NULL DEFAULT '',
+			prefix          VARCHAR(2048) NOT NULL,
+			state           VARCHAR(20) NOT NULL DEFAULT 'active',
+			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			INDEX idx_storage_namespace_owner (owner_tenant_id),
+			INDEX idx_storage_namespace_state (state)
+		)`,
+		`CREATE TABLE IF NOT EXISTS object_gc_candidates (
+			namespace_id     VARCHAR(64) NOT NULL,
+			storage_ref      TEXT NOT NULL,
+			storage_ref_hash VARCHAR(64) NOT NULL,
+			reason           VARCHAR(32) NOT NULL,
+			source_tenant_id VARCHAR(64) NOT NULL DEFAULT '',
+			source_file_id   VARCHAR(64) NOT NULL DEFAULT '',
+			not_before       DATETIME(3) NOT NULL,
+			state            VARCHAR(20) NOT NULL DEFAULT 'pending',
+			attempts         INT NOT NULL DEFAULT 0,
+			last_error       TEXT NULL,
+			created_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			deleted_at       DATETIME(3) NULL,
+			PRIMARY KEY (namespace_id, storage_ref_hash),
+			INDEX idx_object_gc_due (state, not_before),
+			INDEX idx_object_gc_namespace_due (namespace_id, state, not_before)
 		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_api_keys (
 			id             VARCHAR(64) PRIMARY KEY,
@@ -831,12 +915,13 @@ func (s *Store) InsertTenant(ctx context.Context, t *Tenant) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "insert_tenant", start, &err)
 	_, err = s.db.ExecContext(ctx, `INSERT INTO tenants
-		(id, status, db_host, db_port, db_user, db_password, db_name, db_tls,
-		 provider, cluster_id, claim_url, claim_expires_at, schema_version,
+		(id, status, kind, parent_tenant_id, storage_namespace_id, db_host, db_port, db_user, db_password, db_name, db_tls,
+		 provider, cluster_id, branch_id, claim_url, claim_expires_at, schema_version,
 		 s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Status, t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
-		t.Provider, nullStr(t.ClusterID), nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Status, tenantKindForInsert(t), t.ParentTenantID, t.StorageNamespaceID,
+		t.DBHost, t.DBPort, t.DBUser, t.DBPasswordCipher, t.DBName, boolToInt(t.DBTLS),
+		t.Provider, nullStr(t.ClusterID), t.BranchID, nullStr(t.ClaimURL), t.ClaimExpiresAt, t.SchemaVersion,
 		tenantS3EncryptionModeForInsert(t), t.S3KMSKeyID, boolToInt(tenantS3BucketKeyEnabledForInsert(t)),
 		t.CreatedAt.UTC(), t.UpdatedAt.UTC())
 	if isDuplicateEntry(err) {
@@ -863,8 +948,9 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 	start := time.Now()
 	defer observeMeta(ctx, "resolve_api_key_hash", start, &err)
 	row := s.db.QueryRowContext(ctx, `SELECT
-			t.id, t.status, t.db_host, t.db_port, t.db_user, t.db_password, t.db_name, t.db_tls,
-			t.provider, t.cluster_id, t.claim_url, t.claim_expires_at, t.schema_version,
+			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
+			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name, t.db_tls,
+			t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
 			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
 			k.id, k.tenant_id, k.key_name, k.jwt_ciphertext, k.jwt_hash, k.token_version, k.status, k.issued_at,
 			k.revoked_at, k.created_at, k.updated_at
@@ -877,12 +963,15 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 	var claimURL sql.NullString
 	var claimExp sql.NullTime
 	var clusterID sql.NullString
+	var parentTenantID sql.NullString
+	var storageNamespaceID sql.NullString
 	var revokedAt sql.NullTime
 	var s3BucketKeyEnabled int
 	if err = row.Scan(
-		&rec.Tenant.ID, &rec.Tenant.Status, &rec.Tenant.DBHost, &rec.Tenant.DBPort, &rec.Tenant.DBUser,
+		&rec.Tenant.ID, &rec.Tenant.Status, &rec.Tenant.Kind, &parentTenantID, &storageNamespaceID,
+		&rec.Tenant.DBHost, &rec.Tenant.DBPort, &rec.Tenant.DBUser,
 		&rec.Tenant.DBPasswordCipher, &rec.Tenant.DBName, &dbTLS, &rec.Tenant.Provider, &clusterID,
-		&claimURL, &claimExp, &rec.Tenant.SchemaVersion, &rec.Tenant.S3EncryptionMode,
+		&rec.Tenant.BranchID, &claimURL, &claimExp, &rec.Tenant.SchemaVersion, &rec.Tenant.S3EncryptionMode,
 		&rec.Tenant.S3KMSKeyID, &s3BucketKeyEnabled, &rec.Tenant.CreatedAt, &rec.Tenant.UpdatedAt,
 		&rec.APIKey.ID, &rec.APIKey.TenantID, &rec.APIKey.KeyName, &rec.APIKey.JWTCiphertext,
 		&rec.APIKey.JWTHash, &rec.APIKey.TokenVersion, &rec.APIKey.Status, &rec.APIKey.IssuedAt,
@@ -898,6 +987,12 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 	rec.Tenant.S3BucketKeyEnabled = boolPtr(s3BucketKeyEnabled == 1)
 	if clusterID.Valid {
 		rec.Tenant.ClusterID = clusterID.String
+	}
+	if parentTenantID.Valid {
+		rec.Tenant.ParentTenantID = parentTenantID.String
+	}
+	if storageNamespaceID.Valid {
+		rec.Tenant.StorageNamespaceID = storageNamespaceID.String
 	}
 	if claimURL.Valid {
 		rec.Tenant.ClaimURL = claimURL.String
@@ -917,18 +1012,22 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 func (s *Store) GetTenant(ctx context.Context, id string) (out *Tenant, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "get_tenant", start, &err)
-	row := s.db.QueryRowContext(ctx, `SELECT id, status, db_host, db_port, db_user, db_password, db_name,
-		db_tls, provider, cluster_id, claim_url, claim_expires_at, schema_version,
+	row := s.db.QueryRowContext(ctx, `SELECT id, status, kind, parent_tenant_id, storage_namespace_id,
+		db_host, db_port, db_user, db_password, db_name,
+		db_tls, provider, cluster_id, branch_id, claim_url, claim_expires_at, schema_version,
 		s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at
 		FROM tenants WHERE id = ?`, id)
 	var dbTLS int
 	var clusterID sql.NullString
+	var parentTenantID sql.NullString
+	var storageNamespaceID sql.NullString
 	var claimURL sql.NullString
 	var claimExp sql.NullTime
 	var s3BucketKeyEnabled int
 	var rec Tenant
-	if err = row.Scan(&rec.ID, &rec.Status, &rec.DBHost, &rec.DBPort, &rec.DBUser, &rec.DBPasswordCipher,
-		&rec.DBName, &dbTLS, &rec.Provider, &clusterID, &claimURL, &claimExp, &rec.SchemaVersion,
+	if err = row.Scan(&rec.ID, &rec.Status, &rec.Kind, &parentTenantID, &storageNamespaceID,
+		&rec.DBHost, &rec.DBPort, &rec.DBUser, &rec.DBPasswordCipher,
+		&rec.DBName, &dbTLS, &rec.Provider, &clusterID, &rec.BranchID, &claimURL, &claimExp, &rec.SchemaVersion,
 		&rec.S3EncryptionMode, &rec.S3KMSKeyID, &s3BucketKeyEnabled, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = ErrNotFound
@@ -940,6 +1039,12 @@ func (s *Store) GetTenant(ctx context.Context, id string) (out *Tenant, err erro
 	rec.S3BucketKeyEnabled = boolPtr(s3BucketKeyEnabled == 1)
 	if clusterID.Valid {
 		rec.ClusterID = clusterID.String
+	}
+	if parentTenantID.Valid {
+		rec.ParentTenantID = parentTenantID.String
+	}
+	if storageNamespaceID.Valid {
+		rec.StorageNamespaceID = storageNamespaceID.String
 	}
 	if claimURL.Valid {
 		rec.ClaimURL = claimURL.String
@@ -958,8 +1063,9 @@ func (s *Store) ListTenantsByStatus(ctx context.Context, status TenantStatus, li
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, status, db_host, db_port, db_user, db_password, db_name,
-		db_tls, provider, cluster_id, claim_url, claim_expires_at, schema_version,
+	rows, err := s.db.QueryContext(ctx, `SELECT id, status, kind, parent_tenant_id, storage_namespace_id,
+		db_host, db_port, db_user, db_password, db_name,
+		db_tls, provider, cluster_id, branch_id, claim_url, claim_expires_at, schema_version,
 		s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at
 		FROM tenants WHERE status = ? ORDER BY created_at ASC LIMIT ?`, status, limit)
 	if err != nil {
@@ -972,11 +1078,14 @@ func (s *Store) ListTenantsByStatus(ctx context.Context, status TenantStatus, li
 		var t Tenant
 		var dbTLS int
 		var clusterID sql.NullString
+		var parentTenantID sql.NullString
+		var storageNamespaceID sql.NullString
 		var claimURL sql.NullString
 		var claimExp sql.NullTime
 		var s3BucketKeyEnabled int
-		if err := rows.Scan(&t.ID, &t.Status, &t.DBHost, &t.DBPort, &t.DBUser, &t.DBPasswordCipher,
-			&t.DBName, &dbTLS, &t.Provider, &clusterID, &claimURL, &claimExp, &t.SchemaVersion,
+		if err := rows.Scan(&t.ID, &t.Status, &t.Kind, &parentTenantID, &storageNamespaceID,
+			&t.DBHost, &t.DBPort, &t.DBUser, &t.DBPasswordCipher,
+			&t.DBName, &dbTLS, &t.Provider, &clusterID, &t.BranchID, &claimURL, &claimExp, &t.SchemaVersion,
 			&t.S3EncryptionMode, &t.S3KMSKeyID, &s3BucketKeyEnabled, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -984,6 +1093,12 @@ func (s *Store) ListTenantsByStatus(ctx context.Context, status TenantStatus, li
 		t.S3BucketKeyEnabled = boolPtr(s3BucketKeyEnabled == 1)
 		if clusterID.Valid {
 			t.ClusterID = clusterID.String
+		}
+		if parentTenantID.Valid {
+			t.ParentTenantID = parentTenantID.String
+		}
+		if storageNamespaceID.Valid {
+			t.StorageNamespaceID = storageNamespaceID.String
 		}
 		if claimURL.Valid {
 			t.ClaimURL = claimURL.String
@@ -1012,6 +1127,332 @@ func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status Tenant
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (s *Store) UpdateTenantStatusIf(ctx context.Context, id string, from, to TenantStatus) (updated bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tenant_status_if", start, &err)
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		to, time.Now().UTC(), id, from)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *Tenant) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tenant_connection", start, &err)
+	if cluster == nil {
+		return fmt.Errorf("tenant connection is required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants
+		SET db_host = ?, db_port = ?, db_user = ?, db_password = ?, db_name = ?, db_tls = ?,
+			provider = ?, cluster_id = ?, branch_id = ?, claim_url = ?, claim_expires_at = ?, updated_at = ?
+		WHERE id = ?`,
+		cluster.DBHost, cluster.DBPort, cluster.DBUser, cluster.DBPasswordCipher, cluster.DBName, boolToInt(cluster.DBTLS),
+		cluster.Provider, nullStr(cluster.ClusterID), cluster.BranchID, nullStr(cluster.ClaimURL), cluster.ClaimExpiresAt,
+		time.Now().UTC(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) UpdateTenantBranch(ctx context.Context, id string, cluster *Tenant) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tenant_branch", start, &err)
+	if cluster == nil {
+		return fmt.Errorf("tenant branch is required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants
+		SET provider = ?, cluster_id = ?, branch_id = ?, claim_url = ?, claim_expires_at = ?, updated_at = ?
+		WHERE id = ?`,
+		cluster.Provider, nullStr(cluster.ClusterID), cluster.BranchID, nullStr(cluster.ClaimURL), cluster.ClaimExpiresAt,
+		time.Now().UTC(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) RevokeTenantAPIKeys(ctx context.Context, tenantID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "revoke_tenant_api_keys", start, &err)
+	now := time.Now().UTC()
+	_, err = s.db.ExecContext(ctx, `UPDATE tenant_api_keys
+		SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+		WHERE tenant_id = ? AND status = ?`,
+		APIKeyRevoked, now, now, tenantID, APIKeyActive)
+	return err
+}
+
+func (s *Store) UpsertStorageNamespace(ctx context.Context, ns *StorageNamespace) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "upsert_storage_namespace", start, &err)
+	if ns == nil {
+		return fmt.Errorf("storage namespace is required")
+	}
+	state := ns.State
+	if state == "" {
+		state = StorageNamespaceActive
+	}
+	now := time.Now().UTC()
+	_, err = s.db.ExecContext(ctx, `INSERT INTO storage_namespaces
+		(namespace_id, owner_tenant_id, backend, bucket, prefix, state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			owner_tenant_id = VALUES(owner_tenant_id),
+			backend = VALUES(backend),
+			bucket = VALUES(bucket),
+			prefix = VALUES(prefix),
+			state = VALUES(state),
+			updated_at = VALUES(updated_at)`,
+		ns.ID, ns.OwnerTenantID, ns.Backend, ns.Bucket, ns.Prefix, state, now, now)
+	return err
+}
+
+func (s *Store) GetStorageNamespace(ctx context.Context, id string) (out *StorageNamespace, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "get_storage_namespace", start, &err)
+	row := s.db.QueryRowContext(ctx, `SELECT namespace_id, owner_tenant_id, backend, bucket, prefix, state, created_at, updated_at
+		FROM storage_namespaces WHERE namespace_id = ?`, id)
+	var ns StorageNamespace
+	if err = row.Scan(&ns.ID, &ns.OwnerTenantID, &ns.Backend, &ns.Bucket, &ns.Prefix, &ns.State, &ns.CreatedAt, &ns.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = ErrNotFound
+			return nil, err
+		}
+		return nil, err
+	}
+	return &ns, nil
+}
+
+func (s *Store) EnsureTenantStorageNamespace(ctx context.Context, tenantID, backendName, bucket, prefix string) (out *StorageNamespace, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "ensure_tenant_storage_namespace", start, &err)
+	if tenantID == "" {
+		return nil, fmt.Errorf("tenant id is required")
+	}
+	if backendName == "" {
+		return nil, fmt.Errorf("storage backend is required")
+	}
+	if prefix == "" {
+		return nil, fmt.Errorf("storage prefix is required")
+	}
+	ns := &StorageNamespace{
+		ID:            tenantID,
+		OwnerTenantID: tenantID,
+		Backend:       backendName,
+		Bucket:        bucket,
+		Prefix:        prefix,
+		State:         StorageNamespaceActive,
+	}
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		row := tx.QueryRowContext(ctx, `SELECT storage_namespace_id FROM tenants WHERE id = ? FOR UPDATE`, tenantID)
+		var existing sql.NullString
+		if err := row.Scan(&existing); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if existing.Valid && existing.String != "" {
+			existingNS, err := getStorageNamespaceTx(ctx, tx, existing.String)
+			if err != nil {
+				return err
+			}
+			ns = existingNS
+			return nil
+		}
+		now := time.Now().UTC()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO storage_namespaces
+			(namespace_id, owner_tenant_id, backend, bucket, prefix, state, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON DUPLICATE KEY UPDATE updated_at = updated_at`,
+			ns.ID, ns.OwnerTenantID, ns.Backend, ns.Bucket, ns.Prefix, ns.State, now, now); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE tenants SET storage_namespace_id = ?, updated_at = ? WHERE id = ?`,
+			ns.ID, now, tenantID); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ns, nil
+}
+
+func getStorageNamespaceTx(ctx context.Context, tx *sql.Tx, id string) (*StorageNamespace, error) {
+	row := tx.QueryRowContext(ctx, `SELECT namespace_id, owner_tenant_id, backend, bucket, prefix, state, created_at, updated_at
+		FROM storage_namespaces WHERE namespace_id = ?`, id)
+	var ns StorageNamespace
+	if err := row.Scan(&ns.ID, &ns.OwnerTenantID, &ns.Backend, &ns.Bucket, &ns.Prefix, &ns.State, &ns.CreatedAt, &ns.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &ns, nil
+}
+
+type ObjectGCCandidateInput struct {
+	NamespaceID    string
+	StorageRef     string
+	StorageRefHash string
+	Reason         ObjectGCCandidateReason
+	SourceTenantID string
+	SourceFileID   string
+	NotBefore      time.Time
+}
+
+type ObjectGCCandidate struct {
+	NamespaceID    string
+	StorageRef     string
+	StorageRefHash string
+	Reason         ObjectGCCandidateReason
+	SourceTenantID string
+	SourceFileID   string
+	NotBefore      time.Time
+	State          ObjectGCCandidateState
+	Attempts       int
+	LastError      string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+func (s *Store) EnqueueObjectGCCandidate(ctx context.Context, c *ObjectGCCandidateInput) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "enqueue_object_gc_candidate", start, &err)
+	if c == nil {
+		return fmt.Errorf("object gc candidate is required")
+	}
+	if c.NamespaceID == "" {
+		return fmt.Errorf("namespace id is required")
+	}
+	if c.StorageRef == "" {
+		return fmt.Errorf("storage ref is required")
+	}
+	if c.StorageRefHash == "" {
+		return fmt.Errorf("storage ref hash is required")
+	}
+	if c.Reason == "" {
+		return fmt.Errorf("object gc reason is required")
+	}
+	notBefore := c.NotBefore.UTC()
+	if notBefore.IsZero() {
+		notBefore = time.Now().UTC()
+	}
+	now := time.Now().UTC()
+	_, err = s.db.ExecContext(ctx, `INSERT INTO object_gc_candidates
+		(namespace_id, storage_ref, storage_ref_hash, reason, source_tenant_id, source_file_id, not_before, state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			storage_ref = VALUES(storage_ref),
+			reason = VALUES(reason),
+			source_tenant_id = VALUES(source_tenant_id),
+			source_file_id = VALUES(source_file_id),
+			not_before = LEAST(not_before, VALUES(not_before)),
+			state = CASE WHEN state = 'deleted' THEN state ELSE 'pending' END,
+			updated_at = VALUES(updated_at)`,
+		c.NamespaceID, c.StorageRef, c.StorageRefHash, c.Reason, c.SourceTenantID, c.SourceFileID,
+		notBefore, ObjectGCCandidatePending, now, now)
+	return err
+}
+
+func (s *Store) ListDueObjectGCCandidates(ctx context.Context, now time.Time, limit int) (out []ObjectGCCandidate, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_due_object_gc_candidates", start, &err)
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT namespace_id, storage_ref, storage_ref_hash, reason,
+			source_tenant_id, source_file_id, not_before, state, attempts, COALESCE(last_error, ''),
+			created_at, updated_at
+		FROM object_gc_candidates
+		WHERE state = ? AND not_before <= ?
+		ORDER BY not_before ASC
+		LIMIT ?`, ObjectGCCandidatePending, now.UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var c ObjectGCCandidate
+		if err := rows.Scan(&c.NamespaceID, &c.StorageRef, &c.StorageRefHash, &c.Reason,
+			&c.SourceTenantID, &c.SourceFileID, &c.NotBefore, &c.State, &c.Attempts, &c.LastError,
+			&c.CreatedAt, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) NamespaceHasNonDeletedFork(ctx context.Context, namespaceID string) (out bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "namespace_has_non_deleted_fork", start, &err)
+	if namespaceID == "" {
+		return false, fmt.Errorf("namespace id is required")
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT 1 FROM tenants
+		WHERE storage_namespace_id = ? AND kind = ? AND status <> ?
+		LIMIT 1`, namespaceID, TenantKindFork, TenantDeleted)
+	var one int
+	if err := row.Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) PostponeObjectGCCandidate(ctx context.Context, c ObjectGCCandidate, notBefore time.Time, lastError string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "postpone_object_gc_candidate", start, &err)
+	_, err = s.db.ExecContext(ctx, `UPDATE object_gc_candidates
+		SET not_before = ?, last_error = ?, updated_at = ?
+		WHERE namespace_id = ? AND storage_ref_hash = ? AND storage_ref = ? AND state = ?`,
+		notBefore.UTC(), nullStr(lastError), time.Now().UTC(),
+		c.NamespaceID, c.StorageRefHash, c.StorageRef, ObjectGCCandidatePending)
+	return err
+}
+
+func (s *Store) RetryObjectGCCandidate(ctx context.Context, c ObjectGCCandidate, notBefore time.Time, lastError string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "retry_object_gc_candidate", start, &err)
+	_, err = s.db.ExecContext(ctx, `UPDATE object_gc_candidates
+		SET not_before = ?, last_error = ?, attempts = attempts + 1, updated_at = ?
+		WHERE namespace_id = ? AND storage_ref_hash = ? AND storage_ref = ? AND state = ?`,
+		notBefore.UTC(), nullStr(lastError), time.Now().UTC(),
+		c.NamespaceID, c.StorageRefHash, c.StorageRef, ObjectGCCandidatePending)
+	return err
+}
+
+func (s *Store) MarkObjectGCCandidateDeleted(ctx context.Context, c ObjectGCCandidate) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "mark_object_gc_candidate_deleted", start, &err)
+	now := time.Now().UTC()
+	_, err = s.db.ExecContext(ctx, `UPDATE object_gc_candidates
+		SET state = ?, deleted_at = ?, updated_at = ?, last_error = NULL
+		WHERE namespace_id = ? AND storage_ref_hash = ? AND storage_ref = ?`,
+		ObjectGCCandidateDeleted, now, now, c.NamespaceID, c.StorageRefHash, c.StorageRef)
+	return err
 }
 
 // UpdateTenantSchemaVersion records the tenant DB schema version after a
@@ -1054,6 +1495,13 @@ func boolToInt(v bool) int {
 		return 1
 	}
 	return 0
+}
+
+func tenantKindForInsert(t *Tenant) TenantKind {
+	if t.Kind == "" {
+		return TenantKindLive
+	}
+	return t.Kind
 }
 
 func tenantS3EncryptionModeForInsert(t *Tenant) S3EncryptionMode {

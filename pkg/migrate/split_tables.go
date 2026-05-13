@@ -256,13 +256,17 @@ func (m *SplitTablesMigrator) migrateInodes(ctx context.Context) (int64, error) 
 }
 
 func (m *SplitTablesMigrator) migrateContents(ctx context.Context) (int64, error) {
+	storageRefHashExpr := "COALESCE(NULLIF(storage_ref_hash, ''), LOWER(SHA2(storage_ref, 256)))"
+	if m.dialect == DialectPostgres {
+		storageRefHashExpr = "storage_ref_hash"
+	}
 	sql := m.insertIgnore("contents",
-		"inode_id, storage_type, storage_ref, storage_encryption_mode, storage_encryption_key_id, content_blob, content_type, checksum_sha256, source_id",
-		`SELECT
-			file_id, storage_type, storage_ref, storage_encryption_mode, storage_encryption_key_id,
+		"inode_id, storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id, content_blob, content_type, checksum_sha256, source_id",
+		fmt.Sprintf(`SELECT
+			file_id, storage_type, storage_ref, %s, storage_encryption_mode, storage_encryption_key_id,
 			content_blob, content_type, checksum_sha256, source_id
 		FROM files
-		WHERE status != 'DELETED'`)
+		WHERE status != 'DELETED'`, storageRefHashExpr))
 	res, err := m.db.ExecContext(ctx, sql)
 	if err != nil {
 		return 0, err

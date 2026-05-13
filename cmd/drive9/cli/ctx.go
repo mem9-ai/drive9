@@ -4,16 +4,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/client"
 )
 
 // Ctx dispatches drive9 ctx subcommands per spec §13.2.
 //
-// The user-facing verbs are: show / add / import / ls / use / rm.
+// The user-facing verbs are: show / add / import / fork / ls / use / rm.
 //
 // Bare `drive9 ctx` is the shorthand form of `drive9 ctx show`.
 func Ctx(args []string) error {
@@ -27,6 +30,8 @@ func Ctx(args []string) error {
 		return ctxAddCmd(args[1:])
 	case "import":
 		return ctxImportCmd(args[1:])
+	case "fork":
+		return ctxForkCmd(args[1:])
 	case "ls", "list":
 		return ctxListCmd(args[1:])
 	case "use":
@@ -41,12 +46,13 @@ func Ctx(args []string) error {
 }
 
 func ctxUsage() string {
-	return `usage: drive9 ctx <show|add|import|ls|use|rm>
+	return `usage: drive9 ctx <show|add|import|fork|ls|use|rm>
   show [--json] [--reveal]                            show current context
   add --api-key <key> [--name <n>] [--server <url>]   add owner context
   import --from-file <path>                           add delegated context from file (must be mode 0600)
   import --from-file -                                add delegated context from stdin explicitly
   import                                              add delegated context from stdin (default when stdin is a pipe)
+  fork <new> [--from <ctx>] [--use] [--json]          create a copy-on-write fork context
   ls [-l|--json]                                      list contexts
   use <name>                                          activate a context
   rm <name>                                           delete a context`
@@ -325,6 +331,120 @@ func ctxAdd(cfg *Config, name string, ctx *Context) (*Context, error) {
 		cfg.Server = ctx.Server
 	}
 	return ctx, nil
+}
+
+func ctxForkCmd(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: drive9 ctx fork <new> [--from <ctx>] [--use] [--json]")
+	}
+	newName := ""
+	fromName := ""
+	useNew := false
+	jsonOut := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--from":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--from requires an argument")
+			}
+			i++
+			fromName = args[i]
+		case "--use":
+			useNew = true
+		case "--json":
+			jsonOut = true
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return fmt.Errorf("unknown flag %q\nusage: drive9 ctx fork <new> [--from <ctx>] [--use] [--json]", args[i])
+			}
+			if newName != "" {
+				return fmt.Errorf("unexpected argument %q\nusage: drive9 ctx fork <new> [--from <ctx>] [--use] [--json]", args[i])
+			}
+			newName = args[i]
+		}
+	}
+	if newName == "" {
+		return fmt.Errorf("usage: drive9 ctx fork <new> [--from <ctx>] [--use] [--json]")
+	}
+	cfg := loadConfig()
+	if cfg.Contexts == nil {
+		cfg.Contexts = map[string]*Context{}
+	}
+	if _, exists := cfg.Contexts[newName]; exists {
+		return fmt.Errorf("context %q already exists; use a different name", newName)
+	}
+	if fromName == "" {
+		fromName = cfg.CurrentContext
+	}
+	if fromName == "" {
+		return fmt.Errorf("no source context selected; use --from <ctx> or run `drive9 ctx use <ctx>`")
+	}
+	source := cfg.Contexts[fromName]
+	if source == nil {
+		return fmt.Errorf("source context %q not found; run: drive9 ctx ls", fromName)
+	}
+	if source.Type != PrincipalOwner || source.APIKey == "" {
+		return fmt.Errorf("ctx fork requires an owner context; %q is %q", fromName, source.Type)
+	}
+	server := source.Server
+	if server == "" {
+		server = cfg.Server
+	}
+	if server == "" {
+		return fmt.Errorf("source context %q has no server URL", fromName)
+	}
+
+	body, _ := json.Marshal(map[string]string{"name": newName})
+	c := client.New(server, source.APIKey)
+	resp, err := c.RawPost("/v1/ctx/fork", strings.NewReader(string(body)))
+	if err != nil {
+		return fmt.Errorf("ctx fork failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var result forkCtxResult
+	if resp.StatusCode != http.StatusCreated {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		return fmt.Errorf("ctx fork failed (HTTP %d): %s", resp.StatusCode, errResp.Error)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode fork response: %w", err)
+	}
+	if result.APIKey == "" {
+		return fmt.Errorf("ctx fork response missing api_key")
+	}
+	if _, err := ctxAdd(cfg, newName, &Context{
+		Type:   PrincipalOwner,
+		Server: server,
+		APIKey: result.APIKey,
+	}); err != nil {
+		return err
+	}
+	if useNew {
+		cfg.CurrentContext = newName
+	}
+	if err := saveConfig(cfg); err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+	if jsonOut {
+		return json.NewEncoder(os.Stdout).Encode(result)
+	}
+	fmt.Printf("Forked %s -> %s\n", fromName, newName)
+	fmt.Println("Mode: copy-on-write")
+	if useNew || cfg.CurrentContext == newName {
+		fmt.Printf("Now using ctx %s\n", newName)
+	}
+	return nil
+}
+
+type forkCtxResult struct {
+	TenantID       string `json:"tenant_id"`
+	APIKey         string `json:"api_key"`
+	Status         string `json:"status"`
+	ParentTenantID string `json:"parent_tenant_id"`
+	Storage        string `json:"storage"`
 }
 
 // ctxImportCmd implements `drive9 ctx import` per spec §13.2/§13.3. Input

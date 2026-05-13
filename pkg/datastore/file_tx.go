@@ -12,12 +12,12 @@ func (s *Store) InsertFileTx(db execer, f *File) error {
 	if s.useLegacyFiles {
 		mode := fileStorageEncryptionModeForWrite(f.StorageEncryptionMode)
 		_, err := db.Exec(`INSERT INTO files
-			(file_id, storage_type, storage_ref, storage_encryption_mode, storage_encryption_key_id,
+			(file_id, storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
 			 content_blob, content_type, size_bytes, checksum_sha256,
 			 revision, status, source_id, content_text, description, description_embedding_revision,
 			 created_at, confirmed_at, expires_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			f.FileID, f.StorageType, f.StorageRef, mode,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			f.FileID, f.StorageType, f.StorageRef, StorageRefHash(f.StorageRef), mode,
 			storageEncryptionKeyIDForWrite(mode, f.StorageEncryptionKeyID), nilBytes(f.ContentBlob), nullStr(f.ContentType),
 			f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
 			nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
@@ -48,10 +48,10 @@ func (s *Store) updateFileContentTx(db execer, fileID string, expectedRevision i
 	now := time.Now().UTC()
 	var rev int64
 	if s.useLegacyFiles {
-		query := `UPDATE files SET storage_type = ?, storage_ref = ?,
+		query := `UPDATE files SET storage_type = ?, storage_ref = ?, storage_ref_hash = ?,
 			content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?,`
 		args := []any{
-			storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
+			storageType, storageRef, StorageRefHash(storageRef), nilBytes(contentBlob), nullStr(contentType), size,
 			nullStr(checksum), nullStr(contentText),
 		}
 		if description != "" {
@@ -204,10 +204,10 @@ func (s *Store) UpdateFileContentAutoEmbeddingIfRevisionTx(db execer, fileID str
 func (s *Store) ConfirmPendingFileTx(db execer, fileID string, storageType StorageType, storageRef, contentType string, size int64, description string) error {
 	now := time.Now().UTC()
 	if s.useLegacyFiles {
-		query := `UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
+		query := `UPDATE files SET storage_type = ?, storage_ref = ?, storage_ref_hash = ?, content_type = ?,
 			size_bytes = ?, checksum_sha256 = NULL, content_text = NULL,
 			embedding = NULL, embedding_revision = NULL`
-		args := []any{storageType, storageRef, nullStr(contentType), size}
+		args := []any{storageType, storageRef, StorageRefHash(storageRef), nullStr(contentType), size}
 		if description != "" {
 			query += `, description = ?`
 			args = append(args, description)
@@ -263,9 +263,9 @@ func (s *Store) ConfirmPendingFileTx(db execer, fileID string, storageType Stora
 func (s *Store) ConfirmPendingFileAutoEmbeddingTx(db execer, fileID string, storageType StorageType, storageRef, contentType string, size int64, description string) error {
 	now := time.Now().UTC()
 	if s.useLegacyFiles {
-		query := `UPDATE files SET storage_type = ?, storage_ref = ?, content_type = ?,
+		query := `UPDATE files SET storage_type = ?, storage_ref = ?, storage_ref_hash = ?, content_type = ?,
 			size_bytes = ?, checksum_sha256 = NULL, content_text = NULL`
-		args := []any{storageType, storageRef, nullStr(contentType), size}
+		args := []any{storageType, storageRef, StorageRefHash(storageRef), nullStr(contentType), size}
 		if description != "" {
 			query += `, description = ?, description_embedding_revision = revision`
 			args = append(args, description)
@@ -323,7 +323,7 @@ func (s *Store) ConfirmPendingFileAutoEmbeddingTx(db execer, fileID string, stor
 func (s *Store) DeletePendingFileTx(db execer, fileID string) error {
 	now := time.Now().UTC()
 	if s.useLegacyFiles {
-		res, err := db.Exec(`UPDATE files SET status = 'DELETED', storage_ref = '' WHERE file_id = ? AND status = 'PENDING'`, fileID)
+		res, err := db.Exec(`UPDATE files SET status = 'DELETED', storage_ref = '', storage_ref_hash = '' WHERE file_id = ? AND status = 'PENDING'`, fileID)
 		if err != nil {
 			return err
 		}
@@ -338,7 +338,7 @@ func (s *Store) DeletePendingFileTx(db execer, fileID string) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
-	if _, err := db.Exec(`UPDATE contents SET storage_ref = '' WHERE inode_id = ?`, fileID); err != nil {
+	if _, err := db.Exec(`UPDATE contents SET storage_ref = '', storage_ref_hash = '' WHERE inode_id = ?`, fileID); err != nil {
 		return err
 	}
 	return nil

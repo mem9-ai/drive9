@@ -65,10 +65,12 @@ var (
 	// periodically thereafter to catch out-of-band schema drift without putting a
 	// full schema diff on every tenant open.
 	periodicTiDBSchemaValidationEvery uint64 = 32
+	defaultTenantPoolDrainTimeout            = 30 * time.Second
 )
 
 type entry struct {
 	tenantID           string
+	storageNamespaceID string
 	s3EncryptionPolicy meta.S3EncryptionPolicy
 	backend            *backend.Dat9Backend
 	store              *datastore.Store
@@ -106,10 +108,11 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 	}
 
 	s3EncryptionPolicy := t.S3EncryptionPolicy()
+	storageNamespaceID := t.StorageNamespaceID
 	var toClose []*entry
 	p.mu.Lock()
 	if e, ok := p.items[t.ID]; ok {
-		if e.s3EncryptionPolicy == s3EncryptionPolicy {
+		if e.s3EncryptionPolicy == s3EncryptionPolicy && (storageNamespaceID == "" || e.storageNamespaceID == storageNamespaceID) {
 			p.order.MoveToFront(e.elem)
 			b := e.backend
 			p.mu.Unlock()
@@ -134,7 +137,7 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 
 	p.mu.Lock()
 	if e, ok := p.items[t.ID]; ok {
-		if e.s3EncryptionPolicy == s3EncryptionPolicy {
+		if e.s3EncryptionPolicy == s3EncryptionPolicy && (t.StorageNamespaceID == "" || e.storageNamespaceID == t.StorageNamespaceID) {
 			b.Close()
 			_ = st.Close()
 			p.order.MoveToFront(e.elem)
@@ -145,7 +148,7 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 			toClose = append(toClose, removed)
 		}
 	}
-	e := &entry{tenantID: t.ID, s3EncryptionPolicy: s3EncryptionPolicy, backend: b, store: st}
+	e := &entry{tenantID: t.ID, storageNamespaceID: t.StorageNamespaceID, s3EncryptionPolicy: s3EncryptionPolicy, backend: b, store: st}
 	e.elem = p.order.PushFront(e)
 	p.items[t.ID] = e
 	for p.order.Len() > p.maxSize {
@@ -179,10 +182,11 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	}
 
 	s3EncryptionPolicy := t.S3EncryptionPolicy()
+	storageNamespaceID := t.StorageNamespaceID
 	var toClose []*entry
 	p.mu.Lock()
 	if e, ok := p.items[t.ID]; ok {
-		if e.s3EncryptionPolicy == s3EncryptionPolicy {
+		if e.s3EncryptionPolicy == s3EncryptionPolicy && (storageNamespaceID == "" || e.storageNamespaceID == storageNamespaceID) {
 			e.refs++
 			p.order.MoveToFront(e.elem)
 			p.mu.Unlock()
@@ -213,7 +217,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 
 	p.mu.Lock()
 	if e, ok := p.items[t.ID]; ok {
-		if e.s3EncryptionPolicy == s3EncryptionPolicy {
+		if e.s3EncryptionPolicy == s3EncryptionPolicy && (t.StorageNamespaceID == "" || e.storageNamespaceID == t.StorageNamespaceID) {
 			e.refs++
 			p.order.MoveToFront(e.elem)
 			p.mu.Unlock()
@@ -230,7 +234,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			toClose = append(toClose, removed)
 		}
 	}
-	e := &entry{tenantID: t.ID, s3EncryptionPolicy: s3EncryptionPolicy, backend: b, store: st, refs: 1}
+	e := &entry{tenantID: t.ID, storageNamespaceID: t.StorageNamespaceID, s3EncryptionPolicy: s3EncryptionPolicy, backend: b, store: st, refs: 1}
 	e.elem = p.order.PushFront(e)
 	p.items[t.ID] = e
 	for p.order.Len() > p.maxSize {
@@ -261,6 +265,79 @@ func (p *Pool) Invalidate(tenantID string) {
 	}
 	p.mu.Unlock()
 	closeEntry(toClose)
+}
+
+func (p *Pool) WaitTenantIdle(ctx context.Context, tenantID string) error {
+	ctx, cancel := withTenantPoolDrainTimeout(ctx)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		p.mu.Lock()
+		e, ok := p.items[tenantID]
+		refs := 0
+		if ok {
+			refs = e.refs
+		}
+		idle := !ok || e.refs == 0
+		p.mu.Unlock()
+		if idle {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			logger.Warn(ctx, "tenant_pool_wait_idle_timeout",
+				zap.String("tenant_id", tenantID),
+				zap.Int("refs", refs),
+				zap.Error(ctx.Err()))
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (p *Pool) InvalidateAndWait(ctx context.Context, tenantID string) error {
+	ctx, cancel := withTenantPoolDrainTimeout(ctx)
+	defer cancel()
+	var retired *entry
+	var toClose *entry
+	p.mu.Lock()
+	if e, ok := p.items[tenantID]; ok {
+		retired = e
+		toClose = p.removeLocked(e.elem)
+	}
+	p.mu.Unlock()
+	closeEntry(toClose)
+	if retired == nil || toClose != nil {
+		return nil
+	}
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		p.mu.Lock()
+		idle := retired.refs == 0
+		refs := retired.refs
+		p.mu.Unlock()
+		if idle {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			logger.Warn(ctx, "tenant_pool_invalidate_wait_timeout",
+				zap.String("tenant_id", tenantID),
+				zap.Int("refs", refs),
+				zap.Error(ctx.Err()))
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func withTenantPoolDrainTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, defaultTenantPoolDrainTimeout)
 }
 
 func (p *Pool) Close() {
@@ -424,11 +501,13 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	}
 	migrateDurationMs = float64(time.Since(migrateStart).Microseconds()) / 1000.0
 	if p.cfg.S3Bucket != "" {
-		prefix := strings.Trim(p.cfg.S3Prefix, "/")
-		if prefix != "" {
-			prefix += "/"
+		ns, err := p.resolveStorageNamespace(ctx, t, "s3", p.cfg.S3Bucket)
+		if err != nil {
+			_ = store.Close()
+			return nil, nil, err
 		}
-		prefix += t.ID + "/"
+		opts.StorageNamespaceID = ns.ID
+		prefix := ns.Prefix
 		s3ClientStart := time.Now()
 		s3c, err := s3client.NewAWS(ctx, s3client.AWSConfig{
 			Region:          p.cfg.S3Region,
@@ -470,8 +549,15 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		return b, store, nil
 	}
 	if p.cfg.S3Dir != "" {
-		s3Dir := p.cfg.S3Dir + "/" + t.ID
-		s3BaseURL := p.cfg.PublicURL + "/s3/" + t.ID
+		ns, err := p.resolveStorageNamespace(ctx, t, "local", "")
+		if err != nil {
+			_ = store.Close()
+			return nil, nil, err
+		}
+		opts.StorageNamespaceID = ns.ID
+		localPrefix := strings.Trim(ns.Prefix, "/")
+		s3Dir := strings.TrimRight(p.cfg.S3Dir, "/") + "/" + localPrefix
+		s3BaseURL := strings.TrimRight(p.cfg.PublicURL, "/") + "/s3/" + localPrefix
 		s3ClientStart := time.Now()
 		s3c, err := s3client.NewLocal(s3Dir, s3BaseURL)
 		if err != nil {
@@ -552,6 +638,39 @@ func recordTenantSchemaVersionUpdateFailure(ctx context.Context, tenantID string
 		zap.Int("version", version),
 		zap.Error(err))
 	metrics.RecordOperation("tenant_pool", "update_schema_version_failed", "error", d)
+}
+
+func (p *Pool) resolveStorageNamespace(ctx context.Context, t *meta.Tenant, backendName, bucket string) (*meta.StorageNamespace, error) {
+	if p.metaStore == nil {
+		return &meta.StorageNamespace{
+			ID:            t.ID,
+			OwnerTenantID: t.ID,
+			Backend:       backendName,
+			Bucket:        bucket,
+			Prefix:        p.defaultStorageNamespacePrefix(t.ID, backendName),
+			State:         meta.StorageNamespaceActive,
+		}, nil
+	}
+	ns, err := p.metaStore.EnsureTenantStorageNamespace(ctx, t.ID, backendName, bucket, p.defaultStorageNamespacePrefix(t.ID, backendName))
+	if err != nil {
+		return nil, fmt.Errorf("resolve storage namespace: %w", err)
+	}
+	// Keep the tenant value in sync with the namespace persisted by
+	// EnsureTenantStorageNamespace. Get/Acquire use this resolved ID to key the
+	// cache entry created after backend construction.
+	t.StorageNamespaceID = ns.ID
+	return ns, nil
+}
+
+func (p *Pool) defaultStorageNamespacePrefix(tenantID, backendName string) string {
+	if backendName == "s3" {
+		prefix := strings.Trim(p.cfg.S3Prefix, "/")
+		if prefix != "" {
+			prefix += "/"
+		}
+		return prefix + tenantID + "/"
+	}
+	return tenantID + "/"
 }
 
 // wireQuotaStore sets the central quota store on a newly created backend.

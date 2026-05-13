@@ -556,11 +556,11 @@ func (s *Store) InsertFile(ctx context.Context, f *File) (err error) {
 	if s.useLegacyFiles {
 		mode := fileStorageEncryptionModeForWrite(f.StorageEncryptionMode)
 		_, err = tx.Exec(`INSERT INTO files
-			(file_id, storage_type, storage_ref, storage_encryption_mode, storage_encryption_key_id,
+			(file_id, storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
 			 content_blob, content_type, size_bytes, checksum_sha256,
 			 revision, status, source_id, content_text, description, created_at, confirmed_at, expires_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			f.FileID, f.StorageType, f.StorageRef, mode,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			f.FileID, f.StorageType, f.StorageRef, StorageRefHash(f.StorageRef), mode,
 			storageEncryptionKeyIDForWrite(mode, f.StorageEncryptionKeyID), nilBytes(f.ContentBlob), nullStr(f.ContentType),
 			f.SizeBytes, nullStr(f.ChecksumSHA256), f.Revision, f.Status,
 			nullStr(f.SourceID), nullStr(f.ContentText), nullStr(f.Description),
@@ -649,6 +649,30 @@ func (s *Store) GetFile(ctx context.Context, fileID string) (out *File, err erro
 	return out, nil
 }
 
+// HasConfirmedS3StorageRef reports whether a confirmed S3 file still points at
+// the exact storage ref. Callers pass the hash so the query can use
+// idx_contents_storage_ref_hash and then compare the full ref to avoid trusting
+// the hash as the identity.
+func (s *Store) HasConfirmedS3StorageRef(ctx context.Context, storageRefHash, storageRef string) (out bool, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "has_confirmed_s3_storage_ref", start, &err)
+	if storageRefHash == "" || storageRef == "" {
+		return false, nil
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT 1
+		FROM contents c JOIN inodes i ON i.inode_id = c.inode_id
+		WHERE c.storage_type = ? AND i.status = ? AND c.storage_ref_hash = ? AND c.storage_ref = ?
+		LIMIT 1`, StorageS3, StatusConfirmed, storageRefHash, storageRef)
+	var one int
+	if err := row.Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64, description string) (newRevision int64, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "update_file_content", start, &err)
@@ -662,9 +686,9 @@ func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageTyp
 	now := time.Now().UTC()
 	var rev int64
 	if s.useLegacyFiles {
-		query := `UPDATE files SET storage_type = ?, storage_ref = ?,
+		query := `UPDATE files SET storage_type = ?, storage_ref = ?, storage_ref_hash = ?,
 			content_blob = ?, content_type = ?, size_bytes = ?, checksum_sha256 = ?, content_text = ?`
-		args := []any{storageType, storageRef, nilBytes(contentBlob), nullStr(contentType), size,
+		args := []any{storageType, storageRef, StorageRefHash(storageRef), nilBytes(contentBlob), nullStr(contentType), size,
 			nullStr(checksum), nullStr(contentText)}
 		if description != "" {
 			query += `, description = ?, description_embedding = NULL, description_embedding_revision = NULL`
@@ -1181,6 +1205,121 @@ func (s *Store) ListConfirmedFileSummaries(ctx context.Context, cursor string, l
 		nextCursor = out[len(out)-1].FileID
 	}
 	return out, nextCursor, nil
+}
+
+type ConfirmedS3Ref struct {
+	StorageRef     string
+	StorageRefHash string
+}
+
+func (s *Store) ListConfirmedS3Refs(ctx context.Context, cursor string, limit int) ([]ConfirmedS3Ref, string, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	var rows *sql.Rows
+	var err error
+	if cursor == "" {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT c.storage_ref, c.storage_ref_hash
+			 FROM contents c JOIN inodes i ON i.inode_id = c.inode_id
+			 WHERE i.status = 'CONFIRMED' AND c.storage_type = 's3' AND c.storage_ref <> ''
+			 ORDER BY c.storage_ref ASC LIMIT ?`, limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT c.storage_ref, c.storage_ref_hash
+			 FROM contents c JOIN inodes i ON i.inode_id = c.inode_id
+			 WHERE i.status = 'CONFIRMED' AND c.storage_type = 's3' AND c.storage_ref <> '' AND c.storage_ref > ?
+			 ORDER BY c.storage_ref ASC LIMIT ?`, cursor, limit)
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("query confirmed s3 refs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]ConfirmedS3Ref, 0)
+	for rows.Next() {
+		var ref ConfirmedS3Ref
+		if err := rows.Scan(&ref.StorageRef, &ref.StorageRefHash); err != nil {
+			return nil, "", fmt.Errorf("scan confirmed s3 ref: %w", err)
+		}
+		if ref.StorageRefHash == "" {
+			ref.StorageRefHash = StorageRefHash(ref.StorageRef)
+		}
+		out = append(out, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	nextCursor := ""
+	if len(out) == limit {
+		nextCursor = out[len(out)-1].StorageRef
+	}
+	return out, nextCursor, nil
+}
+
+func (s *Store) HasActiveUploads(ctx context.Context) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM uploads
+		 WHERE status IN ('INITIATED', 'UPLOADING') AND expires_at > ?
+		 LIMIT 1`, time.Now().UTC()).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) SanitizeForkRuntimeState(ctx context.Context) error {
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE fn FROM file_nodes fn JOIN inodes i ON i.inode_id = COALESCE(fn.inode_id, fn.file_id) WHERE i.status <> 'CONFIRMED'`); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		if _, err := tx.ExecContext(ctx, `UPDATE contents c JOIN inodes i ON i.inode_id = c.inode_id SET c.storage_ref = '', c.storage_ref_hash = '', c.content_blob = NULL WHERE i.status <> 'CONFIRMED'`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE inodes SET status = 'DELETED', expires_at = ? WHERE status <> 'CONFIRMED'`, now); err != nil {
+			return err
+		}
+		if s.useLegacyFiles {
+			if _, err := tx.ExecContext(ctx, `UPDATE files SET status = 'DELETED', storage_ref = '', storage_ref_hash = '', content_blob = NULL, expires_at = ? WHERE status <> 'CONFIRMED'`, now); err != nil {
+				return err
+			}
+		}
+		for _, stmt := range []string{
+			`DELETE FROM uploads`,
+			`DELETE FROM file_gc_tasks`,
+			`DELETE FROM semantic_tasks`,
+			`DELETE FROM llm_usage`,
+			`DELETE FROM vault_audit_log`,
+			`DELETE FROM vault_grants`,
+			`DELETE FROM vault_tokens`,
+			`DELETE FROM vault_secret_fields`,
+			`DELETE FROM vault_secrets`,
+			`DELETE FROM vault_policies`,
+			`DELETE FROM vault_deks`,
+		} {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				if isMissingTableError(err) {
+					continue
+				}
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func isMissingTableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "error 1146") ||
+		strings.Contains(msg, "table") && strings.Contains(msg, "doesn't exist")
 }
 
 // --- composite operations ---

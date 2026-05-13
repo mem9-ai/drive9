@@ -267,3 +267,7 @@ func (a *metaQuotaAdapter) IncrMutationRetry(ctx context.Context, id int64, maxR
 func (a *metaQuotaAdapter) InTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	return a.s.InTx(ctx, fn)
 }
+
+func (a *metaQuotaAdapter) EnqueueObjectGCCandidate(ctx context.Context, c *meta.ObjectGCCandidateInput) error {
+	return a.s.EnqueueObjectGCCandidate(ctx, c)
+}

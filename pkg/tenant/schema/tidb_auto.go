@@ -174,6 +174,7 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 			file_id            VARCHAR(64) PRIMARY KEY,
 			storage_type       VARCHAR(32) NOT NULL,
 			storage_ref        TEXT NOT NULL,
+			storage_ref_hash   VARCHAR(64) NOT NULL DEFAULT '',
 			storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'legacy',
 			storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT '',
 			content_blob       LONGBLOB,
@@ -202,6 +203,7 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 			expires_at         DATETIME(3)
 		)`,
 		`CREATE INDEX idx_status ON files(status, created_at)`,
+		`CREATE INDEX idx_files_storage_ref_hash ON files(storage_ref_hash)`,
 		`CREATE TABLE IF NOT EXISTS inodes (
 			inode_id     VARCHAR(64) PRIMARY KEY,
 			size_bytes   BIGINT NOT NULL DEFAULT 0,
@@ -218,6 +220,7 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 			inode_id                   VARCHAR(64) PRIMARY KEY,
 			storage_type               VARCHAR(32) NOT NULL,
 			storage_ref                TEXT NOT NULL,
+			storage_ref_hash           VARCHAR(64) NOT NULL DEFAULT '',
 			storage_encryption_mode    VARCHAR(16) NOT NULL DEFAULT 'legacy',
 			storage_encryption_key_id  VARCHAR(256) NOT NULL DEFAULT '',
 			content_blob               LONGBLOB,
@@ -225,6 +228,7 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 			checksum_sha256            VARCHAR(128),
 			source_id                  VARCHAR(255)
 		)`,
+		`CREATE INDEX idx_contents_storage_ref_hash ON contents(storage_ref_hash)`,
 		`CREATE TABLE IF NOT EXISTS semantic (
 			inode_id                           VARCHAR(64) PRIMARY KEY,
 			content_text                       LONGTEXT,
@@ -469,6 +473,9 @@ func EnsureTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbedding
 			zap.Strings("diffs", summarizeTiDBSchemaDiffs(diffs)),
 			zap.Float64("duration_ms", float64(time.Since(passStart).Microseconds())/1000.0))
 		if len(diffs) == 0 {
+			if err := BackfillStorageRefHashes(ctx, db); err != nil {
+				return fmt.Errorf("backfill storage_ref_hash: %w", err)
+			}
 			logger.Info(ctx, "tenant_tidb_schema_ensure_finished",
 				zap.String("mode", string(mode)),
 				zap.Int("repair_passes", attemptedPasses),
@@ -496,6 +503,9 @@ func EnsureTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbedding
 	if err := ValidateTiDBSchemaForMode(ctx, db, mode); err != nil {
 		return err
 	}
+	if err := BackfillStorageRefHashes(ctx, db); err != nil {
+		return fmt.Errorf("backfill storage_ref_hash: %w", err)
+	}
 	logger.Info(ctx, "tenant_tidb_schema_ensure_finished",
 		zap.String("mode", string(mode)),
 		zap.Int("repair_passes", attemptedPasses),
@@ -508,6 +518,19 @@ func validateTiDBSchemaMode(mode TiDBEmbeddingMode) error {
 		return fmt.Errorf("unsupported TiDB embedding mode %q", mode)
 	}
 	return nil
+}
+
+// BackfillStorageRefHashes populates storage_ref_hash for pre-existing storage rows.
+func BackfillStorageRefHashes(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `UPDATE files
+		SET storage_ref_hash = LOWER(SHA2(storage_ref, 256))
+		WHERE storage_ref_hash = '' AND storage_ref <> ''`); err != nil {
+		return err
+	}
+	_, err := db.ExecContext(ctx, `UPDATE contents
+		SET storage_ref_hash = LOWER(SHA2(storage_ref, 256))
+		WHERE storage_ref_hash = '' AND storage_ref <> ''`)
+	return err
 }
 
 func initTiDBAutoEmbeddingSchema(ctx context.Context, dsn string) error {
