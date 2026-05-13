@@ -34,6 +34,7 @@ echo "BASE=$BASE"
 run_case "api" "e2e/api-smoke-test.sh"
 run_case "cli" "e2e/cli-smoke-test.sh"
 run_case "fuse" "e2e/fuse-smoke-test.sh"
+run_case "posix-permission" "e2e/posix-permission-smoke-test.sh"
 
 echo
 echo "=== smoke-all result ==="

@@ -43,6 +43,9 @@ bash e2e/cli-smoke-test.sh
 # FUSE smoke (mount + bidirectional filesystem checks)
 bash e2e/fuse-smoke-test.sh
 
+# POSIX permission smoke (API/CLI/FUSE chmod and mkdir mode)
+bash e2e/posix-permission-smoke-test.sh
+
 # Run all smoke scripts in sequence
 bash e2e/smoke-all.sh
 ```
@@ -182,6 +185,17 @@ Notes:
 - Optional release-gate knobs add small-repo git clone/status/log checks,
   durable `drive9 umount --timeout` remount visibility checks, and mount-log audit.
 
+### `posix-permission-smoke-test.sh`
+
+1. Provision + readiness polling
+2. API permission semantics (`mkdir` default/explicit mode, `chmod` on file/directory, 404 on missing path, `?list` mode/hasMode fields)
+3. Prepare `drive9` CLI binary (build local or download official release)
+4. CLI `drive9 fs chmod` on file and directory with remote HEAD verification
+5. FUSE mount + shell `chmod` on file and directory with remote/local stat parity
+6. FUSE `mkdir -m` with remote/local stat parity
+7. Platform-aware `stat` for macOS (`stat -f %Lp`) and Linux (`stat -c %a`)
+8. Cleanup of remote permission test trees
+
 ### `fuse-release-gate.sh`
 
 1. Runs `fuse-smoke-test.sh` with `FUSE_STRICT_PREREQS=1`
@@ -204,6 +218,7 @@ Notes:
 | `DRIVE9_IMAGE_FIXTURE_PATH` | `e2e/fixtures/cat03.jpg` | `api-smoke-test.sh`, `cli-smoke-test.sh` |
 | `DRIVE9_API_KEY` | - | `api-smoke-test-existing-key.sh` |
 | `DRIVE9_API_KEY` | - | `fuse-smoke-test.sh` (optional; skip provision when set) |
+| `DRIVE9_API_KEY` | - | `posix-permission-smoke-test.sh` (optional; skip provision when set) |
 | `POLL_TIMEOUT_S` | `120` (smoke), `60` (existing-key) | polling scripts |
 | `POLL_INTERVAL_S` | `5` | polling scripts |
 | `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
