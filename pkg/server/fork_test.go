@@ -17,8 +17,9 @@ type fakeBranchProvisioner struct {
 	provisionErr error
 	deleteErr    error
 
-	mu      sync.Mutex
-	deleted []string
+	mu                 sync.Mutex
+	deleted            []string
+	createBranchInputs []*tenant.ClusterInfo
 }
 
 func (f *fakeBranchProvisioner) ProviderType() string { return tenant.ProviderTiDBCloudStarter }
@@ -33,12 +34,20 @@ func (f *fakeBranchProvisioner) ProvisionBranch(ctx context.Context, forkTenantI
 	return f.CreateBranch(ctx, forkTenantID, nil)
 }
 
-func (f *fakeBranchProvisioner) CreateBranch(ctx context.Context, forkTenantID string, _ *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+func (f *fakeBranchProvisioner) CreateBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
+	f.mu.Lock()
+	if source != nil {
+		copySource := *source
+		f.createBranchInputs = append(f.createBranchInputs, &copySource)
+	} else {
+		f.createBranchInputs = append(f.createBranchInputs, nil)
+	}
+	f.mu.Unlock()
 	if f.cluster == nil {
 		return nil, errors.New("missing cluster")
 	}
@@ -82,6 +91,16 @@ func (f *fakeBranchProvisioner) deletedBranches() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.deleted...)
+}
+
+func (f *fakeBranchProvisioner) createBranchInput(i int) *tenant.ClusterInfo {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if i < 0 || i >= len(f.createBranchInputs) || f.createBranchInputs[i] == nil {
+		return nil
+	}
+	out := *f.createBranchInputs[i]
+	return &out
 }
 
 type nonBranchOnlyProvisioner struct{}
@@ -239,6 +258,41 @@ func TestCreateForkPartialBranchProvisionErrorPersistsBranchAndKeepsRoot(t *test
 	}
 	if deleted := rt.prov.deletedBranches(); len(deleted) == 0 || deleted[0] != "cluster-a/branch-created" {
 		t.Fatalf("deleted branches = %#v", deleted)
+	}
+}
+
+func TestCreateForkTenantPersistsGeneratedBranchPassword(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.insertLiveTenant(t, "source")
+	rt.prov.cluster = &tenant.ClusterInfo{ClusterID: "cluster-a", BranchID: "branch-created"}
+	rt.prov.provisionErr = context.Canceled
+
+	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork")
+	if err != nil {
+		t.Fatalf("createForkTenant: %v", err)
+	}
+
+	forkTenant, err := rt.meta.GetTenant(context.Background(), resp.TenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forkTenant.DBPasswordCipher == nil {
+		t.Fatal("fork DB password cipher is nil")
+	}
+	gotPassword, err := rt.pool.Decrypt(context.Background(), forkTenant.DBPasswordCipher)
+	if err != nil {
+		t.Fatalf("decrypt fork password: %v", err)
+	}
+	if string(gotPassword) == rt.dbPass {
+		t.Fatal("fork password unexpectedly matches source password")
+	}
+
+	createInput := rt.prov.createBranchInput(0)
+	if createInput == nil {
+		t.Fatal("CreateBranch was not called with source cluster info")
+	}
+	if createInput.Password != string(gotPassword) {
+		t.Fatalf("CreateBranch password = %q, want persisted fork password", createInput.Password)
 	}
 }
 

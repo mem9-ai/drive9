@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -64,7 +65,10 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 	if err != nil {
 		return nil, err
 	}
-	body, _ := json.Marshal(map[string]string{"pool_id": p.poolID, "root_password": password})
+	body, err := json.Marshal(map[string]string{"pool_id": p.poolID, "root_password": password})
+	if err != nil {
+		return nil, err
+	}
 	endpoint := p.apiURL + "/v1beta1/clusters:takeoverFromPool"
 	resp, err := p.doDigestAuthRequest(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
@@ -134,7 +138,10 @@ func (p *Provisioner) CreateBranch(ctx context.Context, forkTenantID string, sou
 	if source.Password != "" {
 		reqBody["rootPassword"] = source.Password
 	}
-	body, _ := json.Marshal(reqBody)
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
 	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches", p.apiURL, source.ClusterID)
 	resp, err := p.doDigestAuthRequest(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
@@ -360,11 +367,13 @@ func generateNonce() (string, error) {
 func generateRandomPassword(length int) (string, error) {
 	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, length)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
+	max := big.NewInt(int64(len(chars)))
 	for i := range b {
-		b[i] = chars[int(b[i])%len(chars)]
+		n, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			return "", err
+		}
+		b[i] = chars[n.Int64()]
 	}
 	return string(b), nil
 }

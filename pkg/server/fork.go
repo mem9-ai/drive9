@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math/big"
 	"net/http"
 	"strings"
 	"sync"
@@ -492,11 +493,13 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 func generateForkDBPassword(length int) (string, error) {
 	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, length)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
+	max := big.NewInt(int64(len(chars)))
 	for i := range b {
-		b[i] = chars[int(b[i])%len(chars)]
+		n, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			return "", err
+		}
+		b[i] = chars[n.Int64()]
 	}
 	return string(b), nil
 }
