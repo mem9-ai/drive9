@@ -432,10 +432,7 @@ func (s *Store) VerifyJournal(ctx context.Context, tenantID, journalID string) (
 	hashChainOK := genesisHash == storedGenesisHash
 	projectionOK := labelsOK && equalLabels(expectedLabels, storedLabels)
 	var count int64
-	for {
-		if len(entries) == 0 {
-			break
-		}
+	for len(entries) > 0 {
 		subjectsBySeq, subjectsOK, err := s.loadJournalEntrySubjects(ctx, tenantID, journalID, entries[0].Seq, entries[len(entries)-1].Seq)
 		if err != nil {
 			opErr = err
