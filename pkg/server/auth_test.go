@@ -453,17 +453,18 @@ func TestTenantStatusReturnsProvisioningState(t *testing.T) {
 }
 
 func TestTenantStatusReturnsForkProvisioningMessage(t *testing.T) {
-	srv, tok, cleanup := newAuthServer(t)
+	rt, cleanup := newAuthRuntime(t)
 	defer cleanup()
-	if _, err := srv.meta.DB().Exec("UPDATE tenants SET status = ?, kind = ?, parent_tenant_id = ?, branch_id = ?",
-		string(meta.TenantProvisioning), string(meta.TenantKindFork), "source", ""); err != nil {
+	srv := NewWithConfig(Config{Meta: rt.meta, Pool: rt.pool, TokenSecret: rt.tokenSecret})
+	if _, err := srv.meta.DB().Exec("UPDATE tenants SET status = ?, kind = ?, parent_tenant_id = ?, branch_id = ? WHERE id = ?",
+		string(meta.TenantProvisioning), string(meta.TenantKindFork), "source", "", rt.tenantID); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Authorization", "Bearer "+rt.token)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

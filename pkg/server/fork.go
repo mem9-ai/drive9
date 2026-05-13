@@ -103,7 +103,10 @@ func forkProvisioningMessage(t *meta.Tenant) string {
 	if t == nil || t.BranchID == "" {
 		return "Creating the database branch. This usually takes 30 seconds to a few minutes."
 	}
-	return "Database branch is ready; preparing fork metadata and quota counters. Large tenants may take a few minutes."
+	if t.DBHost == "" || t.DBPort == 0 || t.DBUser == "" {
+		return "Waiting for the database branch to become ready. This usually takes 30 seconds to a few minutes."
+	}
+	return "Preparing fork metadata and quota counters. Large tenants may take a few minutes."
 }
 
 type forkFatalProvisionError struct {
@@ -174,6 +177,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		cluster.Provider = source.Provider
 	}
 	if err != nil {
+		s.deleteForkBranchOrPersist(ctx, forkID, branchProvisioner, cluster)
 		s.markForkFailed(ctx, forkID)
 		return nil, err
 	}
@@ -194,19 +198,19 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		ClaimURL:         cluster.ClaimURL,
 		ClaimExpiresAt:   cluster.ClaimExpiresAt,
 	}); err != nil {
-		_ = branchProvisioner.DeleteBranch(ctx, cluster.ClusterID, cluster.BranchID)
+		s.deleteForkBranchOrPersist(ctx, forkID, branchProvisioner, cluster)
 		s.markForkFailed(ctx, forkID)
 		return nil, err
 	}
 
 	apiToken, err := token.IssueToken(s.tokenSecret, forkID, 1)
 	if err != nil {
-		s.markForkFailed(ctx, forkID)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 	cipherToken, err := s.pool.Encrypt(ctx, []byte(apiToken))
 	if err != nil {
-		s.markForkFailed(ctx, forkID)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 	if err := s.meta.InsertAPIKey(ctx, &meta.APIKey{
@@ -221,7 +225,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		CreatedAt:     time.Now().UTC(),
 		UpdatedAt:     time.Now().UTC(),
 	}); err != nil {
-		s.markForkFailed(ctx, forkID)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 
@@ -331,7 +335,7 @@ func (s *Server) provisionForkTenantOnce(ctx context.Context, forkID string) err
 	if active, err := store.HasActiveUploads(ctx); err != nil {
 		return err
 	} else if active {
-		return forkErr(http.StatusConflict, "source snapshot contains active uploads")
+		return &forkFatalProvisionError{err: forkErr(http.StatusConflict, "source snapshot contains active uploads")}
 	}
 	if err := store.SanitizeForkRuntimeState(ctx); err != nil {
 		return err
@@ -386,41 +390,28 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 		return tenantDSN(cluster.Username, string(plain), cluster.Host, cluster.Port, cluster.DBName, true), nil
 	}
 
-	cluster, err := branchProvisioner.CreateBranch(ctx, forkTenant.ID, clusterInfoFromTenant(source))
+	sourcePassword, err := s.pool.Decrypt(ctx, source.DBPasswordCipher)
+	if err != nil {
+		return "", err
+	}
+	sourceCluster := clusterInfoFromTenant(source)
+	sourceCluster.Password = string(sourcePassword)
+	cluster, err := branchProvisioner.CreateBranch(ctx, forkTenant.ID, sourceCluster)
 	if cluster != nil {
 		cluster.Provider = source.Provider
 	}
 	if err != nil {
-		if cluster != nil && cluster.ClusterID != "" && cluster.BranchID != "" {
-			if derr := branchProvisioner.DeleteBranch(ctx, cluster.ClusterID, cluster.BranchID); derr != nil {
-				if perr := s.meta.UpdateTenantBranch(ctx, forkTenant.ID, &meta.Tenant{
-					Provider:       cluster.Provider,
-					ClusterID:      cluster.ClusterID,
-					BranchID:       cluster.BranchID,
-					ClaimURL:       cluster.ClaimURL,
-					ClaimExpiresAt: cluster.ClaimExpiresAt,
-				}); perr != nil {
-					logger.Error(ctx, "fork_persist_branch_after_delete_failure_failed",
-						zap.String("tenant_id", forkTenant.ID),
-						zap.String("cluster_id", cluster.ClusterID),
-						zap.String("branch_id", cluster.BranchID),
-						zap.Error(perr))
-				}
-				return "", &forkFatalProvisionError{err: derr}
-			}
-		}
+		s.deleteForkBranchOrPersist(ctx, forkTenant.ID, branchProvisioner, cluster)
 		return "", err
 	}
-	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
-	if err != nil {
-		_ = branchProvisioner.DeleteBranch(ctx, cluster.ClusterID, cluster.BranchID)
-		return "", err
+	if cluster == nil || cluster.ClusterID == "" || cluster.BranchID == "" {
+		return "", forkErr(http.StatusBadGateway, "starter branch response missing required metadata")
 	}
 	if err := s.meta.UpdateTenantConnection(ctx, forkTenant.ID, &meta.Tenant{
 		DBHost:           cluster.Host,
 		DBPort:           cluster.Port,
 		DBUser:           cluster.Username,
-		DBPasswordCipher: cipherPass,
+		DBPasswordCipher: source.DBPasswordCipher,
 		DBName:           cluster.DBName,
 		DBTLS:            true,
 		Provider:         cluster.Provider,
@@ -429,13 +420,35 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 		ClaimURL:         cluster.ClaimURL,
 		ClaimExpiresAt:   cluster.ClaimExpiresAt,
 	}); err != nil {
-		_ = branchProvisioner.DeleteBranch(ctx, cluster.ClusterID, cluster.BranchID)
+		s.deleteForkBranchOrPersist(ctx, forkTenant.ID, branchProvisioner, cluster)
 		return "", err
 	}
 	if cluster.Host == "" || cluster.Port == 0 || cluster.Username == "" {
 		return "", forkErr(http.StatusServiceUnavailable, "database branch is not active yet")
 	}
-	return tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true), nil
+	return tenantDSN(cluster.Username, string(sourcePassword), cluster.Host, cluster.Port, cluster.DBName, true), nil
+}
+
+func (s *Server) deleteForkBranchOrPersist(ctx context.Context, forkID string, branchProvisioner tenant.BranchProvisioner, cluster *tenant.ClusterInfo) {
+	if cluster == nil || cluster.ClusterID == "" || cluster.BranchID == "" {
+		return
+	}
+	if err := branchProvisioner.DeleteBranch(ctx, cluster.ClusterID, cluster.BranchID); err == nil {
+		return
+	}
+	if perr := s.meta.UpdateTenantBranch(ctx, forkID, &meta.Tenant{
+		Provider:       cluster.Provider,
+		ClusterID:      cluster.ClusterID,
+		BranchID:       cluster.BranchID,
+		ClaimURL:       cluster.ClaimURL,
+		ClaimExpiresAt: cluster.ClaimExpiresAt,
+	}); perr != nil {
+		logger.Error(ctx, "fork_persist_branch_after_delete_failure_failed",
+			zap.String("tenant_id", forkID),
+			zap.String("cluster_id", cluster.ClusterID),
+			zap.String("branch_id", cluster.BranchID),
+			zap.Error(perr))
+	}
 }
 
 func (s *Server) markForkFailed(ctx context.Context, forkID string) {

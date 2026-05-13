@@ -122,17 +122,17 @@ func TestCtxForkGeneratesNameWhenOmitted(t *testing.T) {
 		t.Fatalf("ctx fork: %v", err)
 	}
 	if sawName == "" || sawName == "prod" {
-		t.Fatalf("generated request name = %q", sawName)
+		t.Errorf("generated request name = %q", sawName)
 	}
 	if !strings.Contains(out, "Forked prod -> "+sawName) || !strings.Contains(out, "Now using ctx "+sawName) {
-		t.Fatalf("unexpected output: %q", out)
+		t.Errorf("unexpected output: %q", out)
 	}
 	got := loadConfig()
 	if got.CurrentContext != sawName {
-		t.Fatalf("current context = %q, want %q", got.CurrentContext, sawName)
+		t.Errorf("current context = %q, want %q", got.CurrentContext, sawName)
 	}
 	if got.Contexts[sawName] == nil || got.Contexts[sawName].APIKey != "fork-key" || got.Contexts[sawName].Server != ts.URL {
-		t.Fatalf("generated fork context not persisted correctly: %#v", got.Contexts[sawName])
+		t.Errorf("generated fork context not persisted correctly: %#v", got.Contexts[sawName])
 	}
 }
 
