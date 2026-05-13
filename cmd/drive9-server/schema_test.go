@@ -17,8 +17,8 @@ func TestSchemaDumpInitSQLByProvider(t *testing.T) {
 				}
 			})
 
-			if !strings.Contains(out, "CREATE TABLE IF NOT EXISTS files") {
-				t.Fatalf("dump missing files table: %q", out)
+			if !strings.Contains(out, "CREATE TABLE IF NOT EXISTS inodes") {
+				t.Fatalf("dump missing inodes table: %q", out)
 			}
 			if !strings.Contains(out, "GENERATED ALWAYS AS (EMBED_TEXT") {
 				t.Fatalf("dump missing auto-embedding expression: %q", out)
