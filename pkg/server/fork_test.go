@@ -29,11 +29,16 @@ func (f *fakeBranchProvisioner) Provision(context.Context, string) (*tenant.Clus
 	return nil, fmt.Errorf("not implemented")
 }
 
-func (f *fakeBranchProvisioner) ProvisionBranch(_ context.Context, forkTenantID string, _ *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
-	return f.CreateBranch(context.Background(), forkTenantID, nil)
+func (f *fakeBranchProvisioner) ProvisionBranch(ctx context.Context, forkTenantID string, _ *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+	return f.CreateBranch(ctx, forkTenantID, nil)
 }
 
-func (f *fakeBranchProvisioner) CreateBranch(_ context.Context, forkTenantID string, _ *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+func (f *fakeBranchProvisioner) CreateBranch(ctx context.Context, forkTenantID string, _ *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
 	if f.cluster == nil {
 		return nil, errors.New("missing cluster")
 	}
@@ -45,7 +50,12 @@ func (f *fakeBranchProvisioner) CreateBranch(_ context.Context, forkTenantID str
 	return &out, nil
 }
 
-func (f *fakeBranchProvisioner) WaitForBranchActive(_ context.Context, branch *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+func (f *fakeBranchProvisioner) WaitForBranchActive(ctx context.Context, branch *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
 	if f.provisionErr != nil {
 		return branch, f.provisionErr
 	}
@@ -187,7 +197,7 @@ func waitForCondition(t *testing.T, fn func() bool) {
 
 func TestCreateForkPartialBranchProvisionErrorPersistsBranchAndKeepsRoot(t *testing.T) {
 	origWindow, origInitialBackoff, origMaxBackoff := forkProvisionRetryWindow, forkProvisionInitialBackoff, forkProvisionMaxBackoff
-	forkProvisionRetryWindow = 50 * time.Millisecond
+	forkProvisionRetryWindow = 500 * time.Millisecond
 	forkProvisionInitialBackoff = 5 * time.Millisecond
 	forkProvisionMaxBackoff = 5 * time.Millisecond
 	t.Cleanup(func() {

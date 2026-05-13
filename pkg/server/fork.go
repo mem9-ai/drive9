@@ -39,6 +39,39 @@ var (
 	forkProvisionMaxBackoff     = 30 * time.Second
 )
 
+func (s *Server) startForkProvision(ctx context.Context, forkID string) {
+	s.startForkWorker(ctx, func(workerCtx context.Context) {
+		s.provisionForkTenantAsync(workerCtx, forkID)
+	})
+}
+
+func (s *Server) startForkCleanup(ctx context.Context, forkID string) {
+	s.startForkWorker(ctx, func(workerCtx context.Context) {
+		s.cleanupForkTenant(workerCtx, forkID)
+	})
+}
+
+func (s *Server) startForkWorker(ctx context.Context, fn func(context.Context)) {
+	workerCtx := backgroundWithTrace(ctx)
+	if s.forkWorkerCtx != nil {
+		workerCtx = contextWithTrace(s.forkWorkerCtx, ctx)
+	}
+
+	s.forkWorkerMu.Lock()
+	if s.forkWorkerClosed {
+		s.forkWorkerMu.Unlock()
+		logger.Warn(workerCtx, "fork_worker_start_after_close")
+		return
+	}
+	s.forkWorkerWG.Add(1)
+	s.forkWorkerMu.Unlock()
+
+	go func() {
+		defer s.forkWorkerWG.Done()
+		fn(workerCtx)
+	}()
+}
+
 func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
@@ -229,7 +262,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, err
 	}
 
-	go s.provisionForkTenantAsync(backgroundWithTrace(ctx), forkID)
+	s.startForkProvision(ctx, forkID)
 
 	return &forkResponse{
 		TenantID:       forkID,
@@ -243,16 +276,26 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 }
 
 func (s *Server) provisionForkTenantAsync(ctx context.Context, forkID string) {
-	ctx = backgroundWithTrace(ctx)
+	ctx = ensureTrace(ctx)
 	logger.Info(ctx, "fork_provision_started", zap.String("tenant_id", forkID))
 	deadline := time.Now().Add(forkProvisionRetryWindow)
 	backoff := forkProvisionInitialBackoff
 	attempt := 1
 	for {
+		select {
+		case <-ctx.Done():
+			logger.Info(ctx, "fork_provision_stopped", zap.String("tenant_id", forkID), zap.Error(ctx.Err()))
+			return
+		default:
+		}
 		if err := s.provisionForkTenantOnce(ctx, forkID); err == nil {
 			logger.Info(ctx, "fork_provision_ok", zap.String("tenant_id", forkID), zap.Int("attempt", attempt))
 			return
 		} else {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				logger.Info(ctx, "fork_provision_stopped", zap.String("tenant_id", forkID), zap.Int("attempt", attempt), zap.Error(err))
+				return
+			}
 			var fatal *forkFatalProvisionError
 			if errors.As(err, &fatal) || time.Now().After(deadline) {
 				logger.Error(ctx, "fork_provision_failed",
@@ -276,7 +319,19 @@ func (s *Server) provisionForkTenantAsync(ctx context.Context, forkID string) {
 			sleepFor = time.Until(deadline)
 		}
 		if sleepFor > 0 {
-			time.Sleep(sleepFor)
+			timer := time.NewTimer(sleepFor)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				logger.Info(ctx, "fork_provision_stopped", zap.String("tenant_id", forkID), zap.Error(ctx.Err()))
+				return
+			case <-timer.C:
+			}
 		}
 		backoff *= 2
 		attempt++
@@ -459,7 +514,7 @@ func (s *Server) markForkFailed(ctx context.Context, forkID string) {
 
 func (s *Server) markForkFailedAndCleanup(ctx context.Context, forkID string) {
 	s.markForkFailed(ctx, forkID)
-	go s.cleanupForkTenant(backgroundWithTrace(ctx), forkID)
+	s.startForkCleanup(ctx, forkID)
 }
 
 func clusterInfoFromTenant(t *meta.Tenant) *tenant.ClusterInfo {
@@ -561,13 +616,13 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
-	go s.cleanupForkTenant(backgroundWithTrace(r.Context()), t.ID)
+	s.startForkCleanup(r.Context(), t.ID)
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": string(meta.TenantDeleting)})
 }
 
 func (s *Server) cleanupForkTenant(ctx context.Context, tenantID string) {
-	ctx = backgroundWithTrace(ctx)
+	ctx = ensureTrace(ctx)
 	t, err := s.meta.GetTenant(ctx, tenantID)
 	if err != nil {
 		logger.Error(ctx, "fork_cleanup_get_tenant_failed", zap.String("tenant_id", tenantID), zap.Error(err))

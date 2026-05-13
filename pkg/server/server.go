@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -70,6 +71,11 @@ type Server struct {
 	semanticWorker      *semanticWorkerManager
 	journalCursorSecret []byte
 	objectGCWorker      *objectGCWorker
+	forkWorkerCtx       context.Context
+	forkWorkerCancel    context.CancelFunc
+	forkWorkerWG        sync.WaitGroup
+	forkWorkerMu        sync.Mutex
+	forkWorkerClosed    bool
 }
 
 var (
@@ -137,6 +143,7 @@ func NewWithConfig(cfg Config) *Server {
 	if inlineThreshold <= 0 {
 		inlineThreshold = backend.DefaultInlineThreshold
 	}
+	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
 		fallback:            cfg.Backend,
 		meta:                cfg.Meta,
@@ -152,6 +159,8 @@ func NewWithConfig(cfg Config) *Server {
 		logger:              logger,
 		events:              newEventBuses(),
 		journalCursorSecret: newJournalCursorSecret(cfg.TokenSecret),
+		forkWorkerCtx:       forkWorkerCtx,
+		forkWorkerCancel:    forkWorkerCancel,
 	}
 	mux := http.NewServeMux()
 
@@ -279,6 +288,15 @@ func NewWithConfig(cfg Config) *Server {
 }
 
 func (s *Server) Close() {
+	s.forkWorkerMu.Lock()
+	if !s.forkWorkerClosed {
+		s.forkWorkerClosed = true
+		if s.forkWorkerCancel != nil {
+			s.forkWorkerCancel()
+		}
+	}
+	s.forkWorkerMu.Unlock()
+	s.forkWorkerWG.Wait()
 	if s.semanticWorker != nil {
 		s.semanticWorker.Stop()
 	}
@@ -300,7 +318,7 @@ func (s *Server) resumeProvisioningTenants() {
 			logger.Info(ctx, "resume_provisioning_fork",
 				zap.String("tenant_id", t.ID),
 				zap.String("parent_tenant_id", t.ParentTenantID))
-			go s.provisionForkTenantAsync(ctx, t.ID)
+			s.startForkProvision(ctx, t.ID)
 			continue
 		}
 		go s.resumeTenantSchemaInit(t)
@@ -319,11 +337,22 @@ func (s *Server) resumeTenantSchemaInit(t meta.Tenant) {
 }
 
 func backgroundWithTrace(ctx context.Context) context.Context {
-	traceID := traceid.FromContext(ctx)
+	return contextWithTrace(context.Background(), ctx)
+}
+
+func ensureTrace(ctx context.Context) context.Context {
+	if traceid.FromContext(ctx) != "" {
+		return ctx
+	}
+	return traceid.With(ctx, traceid.Generate())
+}
+
+func contextWithTrace(parent, traceSource context.Context) context.Context {
+	traceID := traceid.FromContext(traceSource)
 	if traceID == "" {
 		traceID = traceid.Generate()
 	}
-	return traceid.With(context.Background(), traceID)
+	return traceid.With(parent, traceID)
 }
 
 func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled bool) string {
