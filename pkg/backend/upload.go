@@ -919,6 +919,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 
 	var oldStorageRef string
 	var oldStorageType datastore.StorageType
+	var oldContentType string
 	var isOverwrite bool
 	var oldSizeBytes int64
 	var oldIsMedia bool
@@ -961,17 +962,18 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			branch = "overwrite"
 			confirmedFileID = existingFileID.String
 
-			var oldRef string
-			var currentRevision int64
-			var oldContentType string
 			stepStart = time.Now()
-			if err := tx.QueryRow(`SELECT storage_type, storage_ref, revision, size_bytes, COALESCE(content_type, '') FROM files WHERE file_id = ? AND status = 'CONFIRMED' FOR UPDATE`, existingFileID.String).Scan(&oldStorageType, &oldRef, &currentRevision, &oldSizeBytes, &oldContentType); err == nil {
-				oldStorageRef = oldRef
+			meta, err := b.store.GetFileStorageMetaForUpdateTx(tx, existingFileID.String)
+			if err == nil {
+				oldStorageType = meta.StorageType
+				oldStorageRef = meta.StorageRef
+				oldSizeBytes = meta.SizeBytes
+				oldContentType = meta.ContentType
 				oldIsMedia = isQuotaMediaContentType(oldContentType)
-				if expectedRevision > 0 && currentRevision != expectedRevision {
+				if expectedRevision > 0 && meta.Revision != expectedRevision {
 					return datastore.ErrRevisionConflict
 				}
-			} else if errors.Is(err, sql.ErrNoRows) {
+			} else if errors.Is(err, datastore.ErrNotFound) {
 				return datastore.ErrRevisionConflict
 			} else {
 				return err
@@ -1015,7 +1017,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 				}
 			}
 
-			if _, err = tx.Exec(`UPDATE files SET status = 'DELETED', storage_ref = '', storage_ref_hash = '' WHERE file_id = ?`, upload.FileID); err != nil {
+			if err := b.store.DeletePendingFileTx(tx, upload.FileID); err != nil {
 				return err
 			}
 			if _, err = tx.Exec(`UPDATE uploads SET file_id = ? WHERE upload_id = ?`,
@@ -1052,28 +1054,11 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			}
 			confirmPendingFileDurationMs = uploadPhaseMs(stepStart)
 		} else {
-			now := time.Now().UTC()
 			stepStart = time.Now()
-			query := `UPDATE files SET storage_type = ?, storage_ref = ?, storage_ref_hash = ?, content_type = ?,
-				size_bytes = ?, checksum_sha256 = NULL, content_text = NULL,
-				embedding = NULL, embedding_revision = NULL`
-			args := []any{datastore.StorageS3, upload.S3Key, datastore.StorageRefHash(upload.S3Key), contentType, upload.TotalSize}
-			if upload.Description != "" {
-				query += `, description = ?`
-				args = append(args, upload.Description)
-			}
-			query += `, status = 'CONFIRMED', confirmed_at = ? WHERE file_id = ? AND status = 'PENDING'`
-			args = append(args, now, upload.FileID)
-			res, err := tx.Exec(query, args...)
-			if err != nil {
+			if err := b.store.ConfirmPendingFileTx(tx,
+				upload.FileID, datastore.StorageS3, upload.S3Key, contentType, upload.TotalSize, upload.Description,
+			); err != nil {
 				return err
-			}
-			rowsAffected, err := res.RowsAffected()
-			if err != nil {
-				return err
-			}
-			if rowsAffected == 0 {
-				return datastore.ErrNotFound
 			}
 			confirmPendingFileDurationMs = uploadPhaseMs(stepStart)
 		}

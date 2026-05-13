@@ -291,11 +291,20 @@ func TestReadCache_TTLExpiry(t *testing.T) {
 
 func TestReadCache_SkipLargeFiles(t *testing.T) {
 	rc := NewReadCache(1<<20, 10*time.Second)
-	bigData := make([]byte, defaultSmallFileThreshold+1)
+	bigData := make([]byte, defaultReadCacheMaxFileSize+1)
 	rc.Put("/big", bigData, 1)
 	_, ok := rc.Get("/big", 1)
 	if ok {
 		t.Fatal("large file should not be cached")
+	}
+}
+
+func TestReadCache_CachesMediumSmallFiles(t *testing.T) {
+	rc := NewReadCache(1<<20, 10*time.Second)
+	data := make([]byte, defaultSmallFileThreshold+1)
+	rc.Put("/medium", data, 1)
+	if _, ok := rc.Get("/medium", 1); !ok {
+		t.Fatal("medium-small file should be cached")
 	}
 }
 

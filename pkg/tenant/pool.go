@@ -3,6 +3,7 @@ package tenant
 import (
 	"container/list"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/metrics"
+	"github.com/mem9-ai/dat9/pkg/migrate"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/semantic"
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
@@ -457,6 +459,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	}
 	openStoreDurationMs := float64(time.Since(openStoreStart).Microseconds()) / 1000.0
 	ensureSchemaDurationMs := 0.0
+	migrateDurationMs := 0.0
 	if !p.cfg.SkipTiDBSchemaCheck && opts.DatabaseAutoEmbedding && (t.Provider == ProviderTiDBZero || t.Provider == ProviderTiDBCloudStarter) {
 		if t.SchemaVersion != schema.CurrentTiDBTenantSchemaVersion {
 			ensureSchemaStart := time.Now()
@@ -487,6 +490,16 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			ensureSchemaDurationMs = float64(time.Since(validateSchemaStart).Microseconds()) / 1000.0
 		}
 	}
+	// Run split-tables migration if needed. Only for tenants that have the
+	// legacy files table; new tenants skip it entirely.
+	migrateStart := time.Now()
+	if store.HasLegacyFiles() {
+		if err := p.migrateSplitTables(ctx, store.DB(), t.Provider); err != nil {
+			_ = store.Close()
+			return nil, nil, fmt.Errorf("migrate split tables: %w", err)
+		}
+	}
+	migrateDurationMs = float64(time.Since(migrateStart).Microseconds()) / 1000.0
 	if p.cfg.S3Bucket != "" {
 		ns, err := p.resolveStorageNamespace(ctx, t, "s3", p.cfg.S3Bucket)
 		if err != nil {
@@ -527,6 +540,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("decrypt_db_password_ms", decryptDurationMs),
 			zap.Float64("open_datastore_ms", openStoreDurationMs),
 			zap.Float64("ensure_schema_ms", ensureSchemaDurationMs),
+			zap.Float64("migrate_duration_ms", migrateDurationMs),
 			zap.Float64("create_s3_client_ms", s3ClientDurationMs),
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
@@ -566,6 +580,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("decrypt_db_password_ms", decryptDurationMs),
 			zap.Float64("open_datastore_ms", openStoreDurationMs),
 			zap.Float64("ensure_schema_ms", ensureSchemaDurationMs),
+			zap.Float64("migrate_duration_ms", migrateDurationMs),
 			zap.Float64("create_s3_client_ms", s3ClientDurationMs),
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
@@ -587,12 +602,22 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		zap.Float64("decrypt_db_password_ms", decryptDurationMs),
 		zap.Float64("open_datastore_ms", openStoreDurationMs),
 		zap.Float64("ensure_schema_ms", ensureSchemaDurationMs),
+		zap.Float64("migrate_duration_ms", migrateDurationMs),
 		zap.Float64("create_s3_client_ms", 0),
 		zap.Float64("create_backend_ms", backendCreateDurationMs),
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	p.wireQuotaStore(b, t.ID)
 	b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 	return b, store, nil
+}
+
+func (p *Pool) migrateSplitTables(ctx context.Context, db *sql.DB, provider string) error {
+	// All current providers use MySQL/TiDB as the metadata store,
+	// so we default to MySQL dialect.
+	dialect := migrate.DialectMySQL
+	m := migrate.NewSplitTablesMigratorWithDialect(db, dialect)
+	_, err := m.Run(ctx)
+	return err
 }
 
 func (p *Pool) shouldPeriodicValidateTiDBSchemaOnOpen() bool {

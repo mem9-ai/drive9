@@ -183,10 +183,12 @@ func newClient(baseURL, credential string) *Client {
 
 // FileInfo represents a file entry from a directory listing.
 type FileInfo struct {
-	Name  string `json:"name"`
-	Size  int64  `json:"size"`
-	IsDir bool   `json:"isDir"`
-	Mtime int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
+	Name    string `json:"name"`
+	Size    int64  `json:"size"`
+	IsDir   bool   `json:"isDir"`
+	Mtime   int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
+	Mode    uint32 `json:"mode,omitempty"`
+	HasMode bool   `json:"hasMode"`
 }
 
 // StatResult represents file metadata from HEAD.
@@ -195,6 +197,8 @@ type StatResult struct {
 	IsDir    bool
 	Revision int64
 	Mtime    time.Time
+	Mode     uint32
+	HasMode  bool // true when the server returned a mode header (including 0)
 }
 
 // MaxBatchStatPaths is the maximum number of paths accepted by BatchStatCtx.
@@ -215,6 +219,8 @@ type BatchStatResult struct {
 	IsDir    bool   `json:"isDir"`
 	Revision int64  `json:"revision,omitempty"`
 	Mtime    int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
+	Mode     uint32 `json:"mode,omitempty"`
+	HasMode  bool   `json:"hasMode"`
 }
 
 // OK reports whether the per-path batch stat result is successful.
@@ -466,6 +472,38 @@ func (c *Client) WriteCtxConditionalWithRevision(ctx context.Context, path strin
 	return c.writeCtxConditionalFull(ctx, path, data, expectedRevision, nil, "")
 }
 
+// CreateFile creates an empty file.
+func (c *Client) CreateFile(path string) (int64, error) {
+	return c.CreateFileCtx(context.Background(), path)
+}
+
+// CreateFileCtx creates an empty file with context support and returns the
+// committed file revision when the server reports it.
+func (c *Client) CreateFileCtx(ctx context.Context, path string) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?create=1", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return 0, readError(resp)
+	}
+	var result struct {
+		Revision int64 `json:"revision"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("decode create file response: %w", err)
+	}
+	return result.Revision, nil
+}
+
 func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
 	if err != nil {
@@ -678,6 +716,12 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 	if rev := resp.Header.Get("X-Dat9-Revision"); rev != "" {
 		s.Revision, _ = strconv.ParseInt(rev, 10, 64)
 	}
+	if mode := resp.Header.Get("X-Dat9-Mode"); mode != "" {
+		s.HasMode = true
+		if m, err := strconv.ParseUint(mode, 10, 32); err == nil {
+			s.Mode = uint32(m)
+		}
+	}
 	if mt := resp.Header.Get("X-Dat9-Mtime"); mt != "" {
 		if sec, err := strconv.ParseInt(mt, 10, 64); err == nil {
 			s.Mtime = time.Unix(sec, 0)
@@ -779,7 +823,17 @@ func (c *Client) Delete(path string) error {
 
 // DeleteCtx removes a file or directory with context support.
 func (c *Client) DeleteCtx(ctx context.Context, path string) error {
-	return c.deleteCtx(ctx, path, false)
+	return c.deleteCtx(ctx, path, false, "")
+}
+
+// DeleteFileCtx removes a file with a server-side type hint.
+func (c *Client) DeleteFileCtx(ctx context.Context, path string) error {
+	return c.deleteCtx(ctx, path, false, "file")
+}
+
+// DeleteDirCtx removes an empty directory with a server-side type hint.
+func (c *Client) DeleteDirCtx(ctx context.Context, path string) error {
+	return c.deleteCtx(ctx, path, false, "dir")
 }
 
 // RemoveAll removes a file or directory tree recursively.
@@ -794,14 +848,16 @@ func (c *Client) RemoveAll(path string) error {
 // It forwards to deleteCtx with recursive=true, so regular files use Delete
 // semantics and missing paths return the same 404 *StatusError as RemoveAll.
 func (c *Client) RemoveAllCtx(ctx context.Context, path string) error {
-	return c.deleteCtx(ctx, path, true)
+	return c.deleteCtx(ctx, path, true, "")
 }
 
-func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool) error {
+func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool, kind string) error {
 	requestURL := c.url(path)
 	if recursive {
 		// Use an explicit value to avoid intermediaries dropping bare "?recursive".
 		requestURL += "?recursive=1"
+	} else if kind != "" {
+		requestURL += "?kind=" + url.QueryEscape(kind)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL, nil)
@@ -862,15 +918,46 @@ func (c *Client) RenameCtx(ctx context.Context, oldPath, newPath string) error {
 
 // Mkdir creates a directory.
 func (c *Client) Mkdir(path string) error {
-	return c.MkdirCtx(context.Background(), path)
+	return c.MkdirCtx(context.Background(), path, 0o755)
 }
 
 // MkdirCtx creates a directory with context support.
-func (c *Client) MkdirCtx(ctx context.Context, path string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?mkdir", nil)
+func (c *Client) MkdirCtx(ctx context.Context, path string, mode uint32) error {
+	urlStr := c.url(path) + "?mkdir"
+	if mode != 0o755 {
+		urlStr += "&mode=" + strconv.FormatUint(uint64(mode), 10)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlStr, nil)
 	if err != nil {
 		return err
 	}
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return readError(resp)
+	}
+	return nil
+}
+
+// Chmod updates the permission bits of a file.
+func (c *Client) Chmod(path string, mode uint32) error {
+	return c.ChmodCtx(context.Background(), path, mode)
+}
+
+// ChmodCtx updates the permission bits of a file with context support.
+func (c *Client) ChmodCtx(ctx context.Context, path string, mode uint32) error {
+	body, err := json.Marshal(map[string]uint32{"mode": mode})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?chmod", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.do(req)
 	if err != nil {
 		return err

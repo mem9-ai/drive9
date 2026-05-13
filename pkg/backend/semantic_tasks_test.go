@@ -48,6 +48,9 @@ func setStoredEmbeddingState(t *testing.T, b *Dat9Backend, fileID string, revisi
 	if _, err := b.Store().DB().Exec(`UPDATE files SET embedding = ?, embedding_revision = ? WHERE file_id = ?`, "old-vector", revision, fileID); err != nil {
 		t.Fatalf("set embedding state for %s: %v", fileID, err)
 	}
+	if _, err := b.Store().DB().Exec(`UPDATE semantic SET embedding = ?, embedding_revision = ? WHERE inode_id = ?`, "old-vector", revision, fileID); err != nil {
+		t.Fatalf("set semantic embedding state for %s: %v", fileID, err)
+	}
 }
 
 func uploadAllPartsForPlan(t *testing.T, b *Dat9Backend, plan *UploadPlan, uploadID string, totalSize int64) {
