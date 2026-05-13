@@ -14,7 +14,6 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
@@ -55,19 +54,6 @@ check_cmd() {
   else
     echo "FAIL $desc"
     FAIL=$((FAIL+1))
-  fi
-}
-
-check_cmd_fail() {
-  local desc="$1"
-  shift
-  TOTAL=$((TOTAL+1))
-  if "$@"; then
-    echo "FAIL $desc (expected failure)"
-    FAIL=$((FAIL+1))
-  else
-    echo "PASS $desc"
-    PASS=$((PASS+1))
   fi
 }
 
@@ -209,7 +195,7 @@ drive9_retry() {
       printf '%s' "$out"
       return 0
     fi
-    if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"HTTP 403"* || "$out" == *"403 Forbidden"* ]]; then
+    if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* ]]; then
       attempt=$((attempt + 1))
       sleep "$CLI_RETRY_SLEEP_S"
       continue
