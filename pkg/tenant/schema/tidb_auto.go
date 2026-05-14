@@ -611,16 +611,7 @@ func validateTiDBAppEmbeddingSemanticTable(meta tidbTableMeta) error {
 }
 
 func validateTiDBSemanticTableBase(meta tidbTableMeta) error {
-	if err := meta.requireColumnType("file_id", "varchar(64)"); err != nil {
-		return err
-	}
-	if err := meta.requireColumnType("status", "varchar(32)"); err != nil {
-		return err
-	}
-	if err := meta.requireColumnType("storage_encryption_mode", "varchar(16)"); err != nil {
-		return err
-	}
-	if err := meta.requireColumnType("storage_encryption_key_id", "varchar(256)"); err != nil {
+	if err := meta.requireColumnType("inode_id", "varchar(64)"); err != nil {
 		return err
 	}
 	if err := meta.requireColumnType("content_text", "longtext"); err != nil {
