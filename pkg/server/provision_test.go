@@ -110,6 +110,9 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
+	if out["tenant_id"] == "" {
+		t.Fatalf("unexpected provision response: %+v", out)
+	}
 	apiKey := out["api_key"]
 	if apiKey == "" {
 		t.Fatal("empty api_key")
@@ -211,8 +214,22 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if out["api_key"] == "" {
+	if out["tenant_id"] == "" || out["api_key"] == "" {
 		t.Fatalf("unexpected provision response: %+v", out)
+	}
+	claims, err := token.ParseAndVerifyToken(tokenSecret, out["api_key"])
+	if err != nil {
+		t.Fatalf("ParseAndVerifyToken provision api key: %v", err)
+	}
+	hasAdmin := false
+	for _, permission := range claims.JournalPermissions {
+		if permission == JournalPermissionAdmin {
+			hasAdmin = true
+			break
+		}
+	}
+	if !hasAdmin {
+		t.Fatalf("provision api key journal_permissions = %#v, want %s", claims.JournalPermissions, JournalPermissionAdmin)
 	}
 	resolved, err := metaStore.ResolveByAPIKeyHash(context.Background(), token.HashToken(out["api_key"]))
 	if err != nil {

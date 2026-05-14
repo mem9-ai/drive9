@@ -977,6 +977,15 @@ func readError(resp *http.Response) error {
 	if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
 		return &StatusError{StatusCode: resp.StatusCode, Message: errResp.Error}
 	}
+	var nestedErr struct {
+		Error struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &nestedErr) == nil && nestedErr.Error.Message != "" {
+		return &StatusError{StatusCode: resp.StatusCode, Message: nestedErr.Error.Message}
+	}
 	return &StatusError{StatusCode: resp.StatusCode, Message: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body))}
 }
 

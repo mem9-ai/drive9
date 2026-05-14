@@ -31,12 +31,23 @@ func TestInitSchemaRequiredColumns(t *testing.T) {
 	if !s1.columnExists("file_gc_tasks", "task_id") {
 		t.Fatal("missing file_gc_tasks table")
 	}
+	if !s1.columnExists("journals", "journal_id") {
+		t.Fatal("missing journals table")
+	}
+	if !s1.columnExists("journal_entries", "entry_id") {
+		t.Fatal("missing journal_entries table")
+	}
 }
 
 func dropDataPlaneTables(t *testing.T, s *Store) {
 	t.Helper()
 	stmts := []string{
 		"DROP TABLE IF EXISTS file_gc_tasks",
+		"DROP TABLE IF EXISTS journal_entry_subjects",
+		"DROP TABLE IF EXISTS journal_entries",
+		"DROP TABLE IF EXISTS journal_append_requests",
+		"DROP TABLE IF EXISTS journal_labels",
+		"DROP TABLE IF EXISTS journals",
 		"DROP TABLE IF EXISTS semantic_tasks",
 		"DROP TABLE IF EXISTS uploads",
 		"DROP TABLE IF EXISTS file_tags",

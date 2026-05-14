@@ -28,6 +28,7 @@ type authTestRuntime struct {
 	pool        *tenant.Pool
 	tokenSecret []byte
 	token       string
+	tenantID    string
 }
 
 func newAuthRuntime(t *testing.T) (*authTestRuntime, func()) {
@@ -124,7 +125,7 @@ func newAuthRuntime(t *testing.T) (*authTestRuntime, func()) {
 		_, _ = metaStore.DB().Exec("DELETE FROM tenants")
 		_ = metaStore.Close()
 	}
-	return &authTestRuntime{meta: metaStore, pool: pool, tokenSecret: tokenSecret, token: tok}, cleanup
+	return &authTestRuntime{meta: metaStore, pool: pool, tokenSecret: tokenSecret, token: tok, tenantID: tenantID}, cleanup
 }
 
 func newAuthServer(t *testing.T) (*Server, string, func()) {
@@ -132,6 +133,28 @@ func newAuthServer(t *testing.T) (*Server, string, func()) {
 	rt, cleanup := newAuthRuntime(t)
 	srv := NewWithConfig(Config{Meta: rt.meta, Pool: rt.pool, TokenSecret: rt.tokenSecret})
 	return srv, rt.token, cleanup
+}
+
+func replaceAuthRuntimeToken(t *testing.T, rt *authTestRuntime, tok string) {
+	t.Helper()
+	ctx := context.Background()
+	tokCipher, err := rt.pool.Encrypt(ctx, []byte(tok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := rt.meta.DB().ExecContext(ctx, `UPDATE tenant_api_keys
+		SET jwt_ciphertext = ?, jwt_hash = ?, updated_at = ?
+		WHERE tenant_id = ?`, tokCipher, token.HashToken(tok), time.Now().UTC(), rt.tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("updated %d api keys, want 1", n)
+	}
 }
 
 func mustTempDir(t *testing.T) string {
@@ -204,6 +227,84 @@ func TestAuthKeepsBorrowedBackendValidDuringRequestAfterInvalidate(t *testing.T)
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status=%d", resp.StatusCode)
+	}
+}
+
+func TestAuthLegacyTokenKeepsOwnerJournalPermissions(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+
+	h := tenantAuthMiddleware(rt.meta, rt.pool, rt.tokenSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scope := ScopeFromContext(r.Context())
+		for _, permission := range []string{
+			JournalPermissionCreate,
+			JournalPermissionAppend,
+			JournalPermissionRead,
+			JournalPermissionFind,
+			JournalPermissionVerify,
+			JournalPermissionSourceGateway,
+			JournalPermissionSourceImport,
+		} {
+			if !scope.HasJournalPermission(permission) {
+				http.Error(w, "missing "+permission, http.StatusInternalServerError)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/journal-permissions", nil)
+	req.Header.Set("Authorization", "Bearer "+rt.token)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAuthUsesJournalPermissionsFromTokenClaims(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+
+	scoped, err := token.IssueTokenWithJournalPermissions(rt.tokenSecret, rt.tenantID, 1, time.Time{}, []string{
+		JournalPermissionAppend,
+		JournalPermissionFind,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaceAuthRuntimeToken(t, rt, scoped)
+
+	h := tenantAuthMiddleware(rt.meta, rt.pool, rt.tokenSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scope := ScopeFromContext(r.Context())
+		if !scope.HasJournalPermission(JournalPermissionAppend) || !scope.HasJournalPermission(JournalPermissionFind) {
+			http.Error(w, "missing scoped permission", http.StatusInternalServerError)
+			return
+		}
+		for _, denied := range []string{JournalPermissionRead, JournalPermissionCreate, JournalPermissionSourceGateway, JournalPermissionAdmin} {
+			if scope.HasJournalPermission(denied) {
+				http.Error(w, "unexpected "+denied, http.StatusInternalServerError)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/journal-permissions", nil)
+	req.Header.Set("Authorization", "Bearer "+scoped)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestJournalAdminPermissionIsWildcard(t *testing.T) {
+	scope := &TenantScope{JournalPermissions: map[string]bool{JournalPermissionAdmin: true}}
+	for _, permission := range []string{JournalPermissionRead, JournalPermissionAppend, JournalPermissionSourceGateway} {
+		if !scope.HasJournalPermission(permission) {
+			t.Fatalf("admin scope missing %s", permission)
+		}
 	}
 }
 
@@ -348,5 +449,73 @@ func TestTenantStatusReturnsProvisioningState(t *testing.T) {
 	}
 	if out.Status != string(meta.TenantProvisioning) {
 		t.Fatalf("expected provisioning status, got %+v", out)
+	}
+}
+
+func TestTenantStatusForkProvisioningWithoutReadyBranchOmitsMessage(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+	srv := NewWithConfig(Config{Meta: rt.meta, Pool: rt.pool, TokenSecret: rt.tokenSecret})
+	if _, err := srv.meta.DB().Exec("UPDATE tenants SET status = ?, kind = ?, parent_tenant_id = ?, branch_id = ? WHERE id = ?",
+		string(meta.TenantProvisioning), string(meta.TenantKindFork), "source", "", rt.tenantID); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)
+	req.Header.Set("Authorization", "Bearer "+rt.token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	var out TenantStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != string(meta.TenantProvisioning) {
+		t.Fatalf("status = %q, want provisioning", out.Status)
+	}
+	if out.Message != "" {
+		t.Fatalf("message = %q, want empty", out.Message)
+	}
+}
+
+func TestTenantStatusForkProvisioningBranchShowsMigrationMessage(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+	srv := NewWithConfig(Config{Meta: rt.meta, Pool: rt.pool, TokenSecret: rt.tokenSecret})
+	if _, err := srv.meta.DB().Exec(`UPDATE tenants
+		SET status = ?, kind = ?, parent_tenant_id = ?, branch_id = ?, db_host = ?, db_port = ?, db_user = ?
+		WHERE id = ?`,
+		string(meta.TenantProvisioning), string(meta.TenantKindFork), "source", "branch-a", "", 0, "", rt.tenantID); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/status", nil)
+	req.Header.Set("Authorization", "Bearer "+rt.token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	var out TenantStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != string(meta.TenantProvisioning) {
+		t.Fatalf("status = %q, want provisioning", out.Status)
+	}
+	if !strings.Contains(out.Message, "Migrating fork data") {
+		t.Fatalf("message = %q", out.Message)
 	}
 }

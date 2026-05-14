@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -64,7 +65,10 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 	if err != nil {
 		return nil, err
 	}
-	body, _ := json.Marshal(map[string]string{"pool_id": p.poolID, "root_password": password})
+	body, err := json.Marshal(map[string]string{"pool_id": p.poolID, "root_password": password})
+	if err != nil {
+		return nil, err
+	}
 	endpoint := p.apiURL + "/v1beta1/clusters:takeoverFromPool"
 	resp, err := p.doDigestAuthRequest(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
@@ -106,6 +110,17 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 }
 
 func (p *Provisioner) ProvisionBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+	out, err := p.CreateBranch(ctx, forkTenantID, source)
+	if err != nil {
+		return out, err
+	}
+	if out.Host != "" && out.Port != 0 && out.Username != "" {
+		return out, nil
+	}
+	return p.WaitForBranchActive(ctx, out)
+}
+
+func (p *Provisioner) CreateBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
 	if source == nil {
 		return nil, fmt.Errorf("source cluster info is required")
 	}
@@ -116,15 +131,17 @@ func (p *Provisioner) ProvisionBranch(ctx context.Context, forkTenantID string, 
 	if source.ClusterID == "" || parentID == "" {
 		return nil, fmt.Errorf("source cluster id is required")
 	}
-	password, err := generateRandomPassword(24)
+	reqBody := map[string]string{
+		"displayName": forkTenantID,
+		"parentId":    parentID,
+	}
+	if source.Password != "" {
+		reqBody["rootPassword"] = source.Password
+	}
+	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
 	}
-	body, _ := json.Marshal(map[string]string{
-		"displayName":  forkTenantID,
-		"parentId":     parentID,
-		"rootPassword": password,
-	})
 	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches", p.apiURL, source.ClusterID)
 	resp, err := p.doDigestAuthRequest(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
@@ -151,26 +168,50 @@ func (p *Provisioner) ProvisionBranch(ctx context.Context, forkTenantID string, 
 		TenantID:  forkTenantID,
 		ClusterID: source.ClusterID,
 		BranchID:  branch.BranchID,
-		Password:  password,
+		Password:  source.Password,
 		DBName:    dbName,
 		Provider:  tenant.ProviderTiDBCloudStarter,
 	}
 	if branch.State != "" && branch.State != "ACTIVE" {
-		branch, err = p.waitForBranchActive(ctx, source.ClusterID, branch.BranchID)
-		if err != nil {
+		return out, nil
+	}
+	if branch.State == "ACTIVE" || branch.Endpoints.Public.Host != "" || branch.UserPrefix != "" {
+		if err := fillBranchEndpoint(out, branch); err != nil {
 			return out, err
 		}
 	}
+	return out, nil
+}
+
+func (p *Provisioner) WaitForBranchActive(ctx context.Context, branch *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+	if branch == nil {
+		return nil, fmt.Errorf("branch cluster info is required")
+	}
+	if branch.ClusterID == "" || branch.BranchID == "" {
+		return nil, fmt.Errorf("cluster id and branch id are required")
+	}
+	out := *branch
+	info, err := p.waitForBranchActive(ctx, branch.ClusterID, branch.BranchID)
+	if err != nil {
+		return &out, err
+	}
+	if err := fillBranchEndpoint(&out, info); err != nil {
+		return &out, err
+	}
+	return &out, nil
+}
+
+func fillBranchEndpoint(out *tenant.ClusterInfo, branch *starterBranchInfo) error {
 	if branch.Endpoints.Public.Host == "" || branch.Endpoints.Public.Port == 0 {
-		return out, fmt.Errorf("starter branch response missing endpoint")
+		return fmt.Errorf("starter branch response missing endpoint")
 	}
 	if branch.UserPrefix == "" {
-		return out, fmt.Errorf("starter branch response missing user prefix")
+		return fmt.Errorf("starter branch response missing user prefix")
 	}
 	out.Host = branch.Endpoints.Public.Host
 	out.Port = branch.Endpoints.Public.Port
 	out.Username = branch.UserPrefix + ".root"
-	return out, nil
+	return nil
 }
 
 func (p *Provisioner) DeleteBranch(ctx context.Context, clusterID, branchID string) error {
@@ -326,11 +367,13 @@ func generateNonce() (string, error) {
 func generateRandomPassword(length int) (string, error) {
 	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, length)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
+	max := big.NewInt(int64(len(chars)))
 	for i := range b {
-		b[i] = chars[int(b[i])%len(chars)]
+		n, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			return "", err
+		}
+		b[i] = chars[n.Int64()]
 	}
 	return string(b), nil
 }

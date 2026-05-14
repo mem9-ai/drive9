@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	pathpkg "path"
+	"path/filepath"
 	"strings"
 	"unicode/utf8"
 
@@ -113,12 +115,16 @@ func Cp(c *client.Client, args []string) error {
 
 	switch {
 	case src == "-" && dstIsRemote:
+		resolvedDst, err := resolveRemoteCopyTarget(ctx, c, dstRP.Path, "")
+		if err != nil {
+			return err
+		}
 		data, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return fmt.Errorf("read stdin: %w", err)
 		}
 		if appendMode {
-			return c.AppendStream(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress)
+			return c.AppendStream(ctx, resolvedDst, bytes.NewReader(data), int64(len(data)), printProgress)
 		}
 		var opts []client.WriteOption
 		if tags != nil {
@@ -127,7 +133,7 @@ func Cp(c *client.Client, args []string) error {
 		if description != "" {
 			opts = append(opts, client.WithDescription(description))
 		}
-		summary, err := c.WriteStreamWithSummary(ctx, dstRP.Path, bytes.NewReader(data), int64(len(data)), printProgress, opts...)
+		summary, err := c.WriteStreamWithSummary(ctx, resolvedDst, bytes.NewReader(data), int64(len(data)), printProgress, opts...)
 		if err != nil {
 			return err
 		}
@@ -138,23 +144,75 @@ func Cp(c *client.Client, args []string) error {
 		return streamToStdout(ctx, c, srcRP.Path)
 
 	case !srcIsRemote && dstIsRemote:
+		resolvedDst, err := resolveRemoteCopyTarget(ctx, c, dstRP.Path, filepath.Base(src))
+		if err != nil {
+			return err
+		}
 		if appendMode {
-			return appendFile(ctx, c, src, dstRP.Path)
+			return appendFile(ctx, c, src, resolvedDst)
 		}
 		if resume {
-			return resumeUploadWithTags(ctx, c, src, dstRP.Path, tags)
+			return resumeUploadWithTags(ctx, c, src, resolvedDst, tags)
 		}
-		return uploadFileWithTagsAndDescription(ctx, c, src, dstRP.Path, tags, description)
+		return uploadFileWithTagsAndDescription(ctx, c, src, resolvedDst, tags, description)
 
 	case srcIsRemote && !dstIsRemote:
-		return downloadFile(ctx, c, srcRP.Path, dst)
+		resolvedDst, err := resolveLocalCopyTarget(dst, pathpkg.Base(srcRP.Path))
+		if err != nil {
+			return err
+		}
+		return downloadFile(ctx, c, srcRP.Path, resolvedDst)
 
 	case srcIsRemote && dstIsRemote:
-		return c.Copy(srcRP.Path, dstRP.Path)
+		resolvedDst, err := resolveRemoteCopyTarget(ctx, c, dstRP.Path, pathpkg.Base(srcRP.Path))
+		if err != nil {
+			return err
+		}
+		return c.Copy(srcRP.Path, resolvedDst)
 
 	default:
 		return fmt.Errorf("at least one path must be remote (e.g. :/path or mydb:/path)")
 	}
+}
+
+func resolveRemoteCopyTarget(ctx context.Context, c *client.Client, remotePath, sourceBase string) (string, error) {
+	if strings.HasSuffix(remotePath, "/") {
+		if sourceBase == "" {
+			return "", fmt.Errorf("destination %q requires a file name", remotePath)
+		}
+		return pathpkg.Join(remotePath, sourceBase), nil
+	}
+	info, err := c.StatCtx(ctx, remotePath)
+	if err == nil && info.IsDir {
+		if sourceBase == "" {
+			return "", fmt.Errorf("destination %q requires a file name", remotePath)
+		}
+		return pathpkg.Join(remotePath, sourceBase), nil
+	}
+	if err != nil && !client.IsNotFound(err) {
+		return "", err
+	}
+	return remotePath, nil
+}
+
+func resolveLocalCopyTarget(localPath, sourceBase string) (string, error) {
+	if strings.HasSuffix(localPath, string(os.PathSeparator)) || strings.HasSuffix(localPath, "/") {
+		if sourceBase == "" {
+			return "", fmt.Errorf("destination %q requires a file name", localPath)
+		}
+		return filepath.Join(localPath, sourceBase), nil
+	}
+	info, err := os.Stat(localPath)
+	if err == nil && info.IsDir() {
+		if sourceBase == "" {
+			return "", fmt.Errorf("destination %q requires a file name", localPath)
+		}
+		return filepath.Join(localPath, sourceBase), nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("stat %s: %w", localPath, err)
+	}
+	return localPath, nil
 }
 
 func uploadFile(ctx context.Context, c *client.Client, localPath, remotePath string, description string) error {

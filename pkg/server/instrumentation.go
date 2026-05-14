@@ -140,8 +140,8 @@ func requestRoute(path string) string {
 		return "/v1/sql"
 	case path == "/v1/events":
 		return "/v1/events"
-	case path == "/v1/ctx" || path == "/v1/ctx/fork":
-		return "/v1/ctx/*"
+	case path == "/v1/fork":
+		return "/v1/fork"
 	case strings.HasPrefix(path, "/v1/fs/"):
 		return "/v1/fs/*"
 	case path == "/v1/uploads":

@@ -20,8 +20,9 @@ type fakeBranchProvisioner struct {
 	provisionErr error
 	deleteErr    error
 
-	mu      sync.Mutex
-	deleted []string
+	mu                 sync.Mutex
+	deleted            []string
+	createBranchInputs []*tenant.ClusterInfo
 }
 
 func (f *fakeBranchProvisioner) ProviderType() string { return tenant.ProviderTiDBCloudStarter }
@@ -32,13 +33,54 @@ func (f *fakeBranchProvisioner) Provision(context.Context, string) (*tenant.Clus
 	return nil, fmt.Errorf("not implemented")
 }
 
-func (f *fakeBranchProvisioner) ProvisionBranch(_ context.Context, forkTenantID string, _ *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+func (f *fakeBranchProvisioner) ProvisionBranch(ctx context.Context, forkTenantID string, _ *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+	return f.CreateBranch(ctx, forkTenantID, nil)
+}
+
+func (f *fakeBranchProvisioner) CreateBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	f.mu.Lock()
+	if source != nil {
+		copySource := *source
+		f.createBranchInputs = append(f.createBranchInputs, &copySource)
+	} else {
+		f.createBranchInputs = append(f.createBranchInputs, nil)
+	}
+	f.mu.Unlock()
 	if f.cluster == nil {
 		return nil, errors.New("missing cluster")
 	}
 	out := *f.cluster
 	out.TenantID = forkTenantID
-	return &out, f.provisionErr
+	out.Host = ""
+	out.Port = 0
+	out.Username = ""
+	return &out, nil
+}
+
+func (f *fakeBranchProvisioner) WaitForBranchActive(ctx context.Context, branch *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	if f.provisionErr != nil {
+		return branch, f.provisionErr
+	}
+	if f.cluster == nil {
+		return nil, errors.New("missing cluster")
+	}
+	out := *f.cluster
+	out.TenantID = branch.TenantID
+	out.Password = branch.Password
+	if out.DBName == "" {
+		out.DBName = branch.DBName
+	}
+	return &out, nil
 }
 
 func (f *fakeBranchProvisioner) DeleteBranch(_ context.Context, clusterID, branchID string) error {
@@ -52,6 +94,16 @@ func (f *fakeBranchProvisioner) deletedBranches() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.deleted...)
+}
+
+func (f *fakeBranchProvisioner) createBranchInput(i int) *tenant.ClusterInfo {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if i < 0 || i >= len(f.createBranchInputs) || f.createBranchInputs[i] == nil {
+		return nil
+	}
+	out := *f.createBranchInputs[i]
+	return &out
 }
 
 type nonBranchOnlyProvisioner struct{}
@@ -169,18 +221,38 @@ func waitForCondition(t *testing.T, fn func() bool) {
 }
 
 func TestCreateForkPartialBranchProvisionErrorPersistsBranchAndKeepsRoot(t *testing.T) {
+	origWindow, origInitialBackoff, origMaxBackoff := forkProvisionRetryWindow, forkProvisionInitialBackoff, forkProvisionMaxBackoff
+	forkProvisionRetryWindow = 500 * time.Millisecond
+	forkProvisionInitialBackoff = 5 * time.Millisecond
+	forkProvisionMaxBackoff = 5 * time.Millisecond
+	t.Cleanup(func() {
+		forkProvisionRetryWindow = origWindow
+		forkProvisionInitialBackoff = origInitialBackoff
+		forkProvisionMaxBackoff = origMaxBackoff
+	})
+
 	rt := newForkCleanupTestRuntime(t)
 	rt.insertLiveTenant(t, "source")
 	rt.prov.cluster = &tenant.ClusterInfo{ClusterID: "cluster-a", BranchID: "branch-created"}
 	rt.prov.provisionErr = errors.New("starter branch not active before timeout")
 	rt.prov.deleteErr = errors.New("delete branch failed")
 
-	_, err := rt.server.createForkTenant(context.Background(), "source", "fork")
-	if err == nil {
-		t.Fatal("expected createForkTenant error")
+	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork")
+	if err != nil {
+		t.Fatalf("createForkTenant: %v", err)
+	}
+	if resp.Status != string(meta.TenantProvisioning) || resp.APIKey == "" {
+		t.Fatalf("unexpected fork response: %+v", resp)
+	}
+	if resp.Message != "Migrating fork data. Large tenants may take a few minutes." {
+		t.Fatalf("message = %q", resp.Message)
 	}
 	waitForCondition(t, func() bool {
-		return len(rt.prov.deletedBranches()) == 1
+		return len(rt.prov.deletedBranches()) >= 1
+	})
+	waitForCondition(t, func() bool {
+		failed, err := rt.meta.ListTenantsByStatus(context.Background(), meta.TenantFailed, 10)
+		return err == nil && len(failed) == 1
 	})
 
 	failed, err := rt.meta.ListTenantsByStatus(context.Background(), meta.TenantFailed, 10)
@@ -193,8 +265,46 @@ func TestCreateForkPartialBranchProvisionErrorPersistsBranchAndKeepsRoot(t *test
 	if failed[0].BranchID != "branch-created" || failed[0].ClusterID != "cluster-a" {
 		t.Fatalf("failed fork branch metadata = cluster:%q branch:%q", failed[0].ClusterID, failed[0].BranchID)
 	}
-	if deleted := rt.prov.deletedBranches(); deleted[0] != "cluster-a/branch-created" {
+	if deleted := rt.prov.deletedBranches(); len(deleted) == 0 || deleted[0] != "cluster-a/branch-created" {
 		t.Fatalf("deleted branches = %#v", deleted)
+	}
+}
+
+func TestCreateForkTenantPersistsGeneratedBranchPassword(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.insertLiveTenant(t, "source")
+	rt.prov.cluster = &tenant.ClusterInfo{ClusterID: "cluster-a", BranchID: "branch-created"}
+	rt.prov.provisionErr = context.Canceled
+
+	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork")
+	if err != nil {
+		t.Fatalf("createForkTenant: %v", err)
+	}
+	if resp.Message != "Migrating fork data. Large tenants may take a few minutes." {
+		t.Fatalf("message = %q", resp.Message)
+	}
+
+	forkTenant, err := rt.meta.GetTenant(context.Background(), resp.TenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forkTenant.DBPasswordCipher == nil {
+		t.Fatal("fork DB password cipher is nil")
+	}
+	gotPassword, err := rt.pool.Decrypt(context.Background(), forkTenant.DBPasswordCipher)
+	if err != nil {
+		t.Fatalf("decrypt fork password: %v", err)
+	}
+	if string(gotPassword) == rt.dbPass {
+		t.Fatal("fork password unexpectedly matches source password")
+	}
+
+	createInput := rt.prov.createBranchInput(0)
+	if createInput == nil {
+		t.Fatal("CreateBranch was not called with source cluster info")
+	}
+	if createInput.Password != string(gotPassword) {
+		t.Fatalf("CreateBranch password = %q, want persisted fork password", createInput.Password)
 	}
 }
 
@@ -215,6 +325,27 @@ func TestCleanupFailedForkDoesNotMarkDeletedWhenBranchDeleteFails(t *testing.T) 
 	if deleted := rt.prov.deletedBranches(); len(deleted) != 1 || deleted[0] != "cluster-a/branch-a" {
 		t.Fatalf("deleted branches = %#v", deleted)
 	}
+}
+
+func TestResumeProvisioningForkActivatesBranchBackedTenant(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-a",
+		Host:      rt.dbHost,
+		Port:      rt.dbPort,
+		Username:  rt.dbUser,
+		DBName:    rt.dbName,
+	}
+	rt.insertLiveTenant(t, "parent")
+	rt.insertForkTenant(t, "fork-provisioning", meta.TenantProvisioning, "branch-a")
+
+	rt.server.resumeProvisioningTenants()
+
+	waitForCondition(t, func() bool {
+		got, err := rt.meta.GetTenant(context.Background(), "fork-provisioning")
+		return err == nil && got.Status == meta.TenantActive
+	})
 }
 
 func TestCleanupDeletingForkEnqueuesFileGCTaskRefsBeforeSanitize(t *testing.T) {

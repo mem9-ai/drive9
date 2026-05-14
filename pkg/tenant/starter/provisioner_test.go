@@ -39,8 +39,8 @@ func TestProvisionBranchCreatesBranchFromSourceBranch(t *testing.T) {
 		if body.DisplayName != "fork-tenant" {
 			t.Fatalf("displayName = %q", body.DisplayName)
 		}
-		if body.RootPassword == "" {
-			t.Fatal("rootPassword is empty")
+		if body.RootPassword != "branch-pass" {
+			t.Fatalf("rootPassword = %q, want branch-pass", body.RootPassword)
 		}
 		gotParentID = body.ParentID
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -58,6 +58,7 @@ func TestProvisionBranchCreatesBranchFromSourceBranch(t *testing.T) {
 	out, err := p.ProvisionBranch(context.Background(), "fork-tenant", &tenant.ClusterInfo{
 		ClusterID: "c1",
 		BranchID:  "b1",
+		Password:  "branch-pass",
 		DBName:    "test",
 	})
 	if err != nil {
@@ -67,6 +68,56 @@ func TestProvisionBranchCreatesBranchFromSourceBranch(t *testing.T) {
 		t.Fatalf("parentId = %q, want b1", gotParentID)
 	}
 	if out.ClusterID != "c1" || out.BranchID != "b2" || out.Username != "u2.root" || out.Host != "db.example" || out.Port != 4000 {
+		t.Fatalf("unexpected cluster info: %#v", out)
+	}
+	if out.Password != "branch-pass" {
+		t.Fatalf("password = %q, want branch-pass", out.Password)
+	}
+}
+
+func TestCreateBranchDoesNotWaitForActive(t *testing.T) {
+	var gotGet bool
+	var gotRootPassword string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1beta1/clusters/c1/branches":
+			var body struct {
+				RootPassword string `json:"rootPassword"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			gotRootPassword = body.RootPassword
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"branchId": "b-pending",
+				"state":    "CREATING",
+			})
+		case r.Method == http.MethodGet:
+			gotGet = true
+			t.Fatalf("CreateBranch must not poll branch status")
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{apiURL: ts.URL, client: ts.Client()}
+	out, err := p.CreateBranch(context.Background(), "fork-tenant", &tenant.ClusterInfo{
+		ClusterID: "c1",
+		BranchID:  "b1",
+		Password:  "branch-pass",
+		DBName:    "test",
+	})
+	if err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if gotGet {
+		t.Fatal("CreateBranch polled branch status")
+	}
+	if gotRootPassword != "branch-pass" {
+		t.Fatalf("rootPassword = %q, want branch-pass", gotRootPassword)
+	}
+	if out.ClusterID != "c1" || out.BranchID != "b-pending" || out.Host != "" || out.Username != "" || out.Password != "branch-pass" {
 		t.Fatalf("unexpected cluster info: %#v", out)
 	}
 }

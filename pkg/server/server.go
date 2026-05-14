@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -53,22 +54,28 @@ type Config struct {
 }
 
 type Server struct {
-	fallback          *backend.Dat9Backend
-	meta              *meta.Store
-	pool              *tenant.Pool
-	provisioner       tenant.Provisioner
-	tokenSecret       []byte
-	localTenantAPIKey string
-	vaultMK           *vault.MasterKey
-	vaultIssuerURL    string
-	maxUploadBytes    int64
-	inlineThreshold   int64
-	metrics           *serverMetrics
-	logger            *zap.Logger
-	mux               *http.ServeMux
-	events            *eventBuses
-	semanticWorker    *semanticWorkerManager
-	objectGCWorker    *objectGCWorker
+	fallback            *backend.Dat9Backend
+	meta                *meta.Store
+	pool                *tenant.Pool
+	provisioner         tenant.Provisioner
+	tokenSecret         []byte
+	localTenantAPIKey   string
+	vaultMK             *vault.MasterKey
+	vaultIssuerURL      string
+	maxUploadBytes      int64
+	inlineThreshold     int64
+	metrics             *serverMetrics
+	logger              *zap.Logger
+	mux                 *http.ServeMux
+	events              *eventBuses
+	semanticWorker      *semanticWorkerManager
+	journalCursorSecret []byte
+	objectGCWorker      *objectGCWorker
+	forkWorkerCtx       context.Context
+	forkWorkerCancel    context.CancelFunc
+	forkWorkerWG        sync.WaitGroup
+	forkWorkerMu        sync.Mutex
+	forkWorkerClosed    bool
 }
 
 var (
@@ -87,8 +94,10 @@ const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
 // shape is per-tenant so future tenant-scoped quotas plug in without a
 // protocol change.
 type TenantStatusResponse struct {
-	Status         string `json:"status"`
-	MaxUploadBytes int64  `json:"max_upload_bytes"`
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+
+	MaxUploadBytes int64 `json:"max_upload_bytes"`
 	// InlineThreshold is the server's DB-inline vs S3 storage cutoff. Clients
 	// use it to choose simple PUT vs V2 multipart upload so they stay
 	// consistent with server-side IsLargeFile gating. Omitted (zero) by old
@@ -134,20 +143,24 @@ func NewWithConfig(cfg Config) *Server {
 	if inlineThreshold <= 0 {
 		inlineThreshold = backend.DefaultInlineThreshold
 	}
+	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
-		fallback:          cfg.Backend,
-		meta:              cfg.Meta,
-		pool:              cfg.Pool,
-		tokenSecret:       cfg.TokenSecret,
-		localTenantAPIKey: strings.TrimSpace(cfg.LocalTenantAPIKey),
-		vaultMK:           vaultMK,
-		vaultIssuerURL:    strings.TrimSpace(cfg.VaultIssuerURL),
-		provisioner:       cfg.Provisioner,
-		maxUploadBytes:    maxUpload,
-		inlineThreshold:   inlineThreshold,
-		metrics:           newServerMetrics(),
-		logger:            logger,
-		events:            newEventBuses(),
+		fallback:            cfg.Backend,
+		meta:                cfg.Meta,
+		pool:                cfg.Pool,
+		tokenSecret:         cfg.TokenSecret,
+		localTenantAPIKey:   strings.TrimSpace(cfg.LocalTenantAPIKey),
+		vaultMK:             vaultMK,
+		vaultIssuerURL:      strings.TrimSpace(cfg.VaultIssuerURL),
+		provisioner:         cfg.Provisioner,
+		maxUploadBytes:      maxUpload,
+		inlineThreshold:     inlineThreshold,
+		metrics:             newServerMetrics(),
+		logger:              logger,
+		events:              newEventBuses(),
+		journalCursorSecret: newJournalCursorSecret(cfg.TokenSecret),
+		forkWorkerCtx:       forkWorkerCtx,
+		forkWorkerCancel:    forkWorkerCancel,
 	}
 	mux := http.NewServeMux()
 
@@ -163,10 +176,12 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
 	mux.Handle("/v2/uploads/", business)
-	mux.Handle("/v1/ctx/fork", business)
-	mux.Handle("/v1/ctx", business)
+	mux.Handle("/v1/fork", business)
 	mux.Handle("/v1/sql", business)
 	mux.Handle("/v1/events", business)
+	mux.Handle("/v1/journals", business)
+	mux.Handle("/v1/journals/", business)
+	mux.Handle("/v1/journal-entries", business)
 	// Vault management API goes through tenant auth.
 	mux.Handle("/v1/vault/secrets", business)
 	mux.Handle("/v1/vault/secrets/", business)
@@ -273,6 +288,15 @@ func NewWithConfig(cfg Config) *Server {
 }
 
 func (s *Server) Close() {
+	s.forkWorkerMu.Lock()
+	if !s.forkWorkerClosed {
+		s.forkWorkerClosed = true
+		if s.forkWorkerCancel != nil {
+			s.forkWorkerCancel()
+		}
+	}
+	s.forkWorkerMu.Unlock()
+	s.forkWorkerWG.Wait()
 	if s.semanticWorker != nil {
 		s.semanticWorker.Stop()
 	}
@@ -291,9 +315,10 @@ func (s *Server) resumeProvisioningTenants() {
 	for i := range tenants {
 		t := tenants[i]
 		if t.Kind == meta.TenantKindFork {
-			logger.Warn(ctx, "resume_provisioning_fork_skipped",
+			logger.Info(ctx, "resume_provisioning_fork",
 				zap.String("tenant_id", t.ID),
 				zap.String("parent_tenant_id", t.ParentTenantID))
+			s.startForkProvision(ctx, t.ID)
 			continue
 		}
 		go s.resumeTenantSchemaInit(t)
@@ -312,11 +337,22 @@ func (s *Server) resumeTenantSchemaInit(t meta.Tenant) {
 }
 
 func backgroundWithTrace(ctx context.Context) context.Context {
-	traceID := traceid.FromContext(ctx)
+	return contextWithTrace(context.Background(), ctx)
+}
+
+func ensureTrace(ctx context.Context) context.Context {
+	if traceid.FromContext(ctx) != "" {
+		return ctx
+	}
+	return traceid.With(ctx, traceid.Generate())
+}
+
+func contextWithTrace(parent, traceSource context.Context) context.Context {
+	traceID := traceid.FromContext(traceSource)
 	if traceID == "" {
 		traceID = traceid.Generate()
 	}
-	return traceid.With(context.Background(), traceID)
+	return traceid.With(parent, traceID)
 }
 
 func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled bool) string {
@@ -329,7 +365,13 @@ func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled 
 
 func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		scope := &TenantScope{TenantID: "local", APIKeyID: "local", TokenVersion: 1, Backend: b}
+		scope := &TenantScope{
+			TenantID:           "local",
+			APIKeyID:           "local",
+			TokenVersion:       1,
+			Backend:            b,
+			JournalPermissions: ownerJournalPermissions(),
+		}
 		next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 	})
 }
@@ -359,14 +401,14 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleUploadAction(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v2/uploads/"):
 		s.handleV2Uploads(w, r)
-	case r.URL.Path == "/v1/ctx/fork":
-		s.handleCtxFork(w, r)
-	case r.URL.Path == "/v1/ctx":
-		s.handleCtxDelete(w, r)
+	case r.URL.Path == "/v1/fork":
+		s.handleFork(w, r)
 	case r.URL.Path == "/v1/sql":
 		s.handleSQL(w, r)
 	case r.URL.Path == "/v1/events":
 		s.handleEvents(w, r)
+	case r.URL.Path == "/v1/journals" || strings.HasPrefix(r.URL.Path, "/v1/journals/") || r.URL.Path == "/v1/journal-entries":
+		s.handleJournal(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/grants"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
 		s.handleVault(w, r)
 	default:
@@ -453,9 +495,20 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
 		Status:          string(resolved.Tenant.Status),
+		Message:         tenantStatusMessage(&resolved.Tenant),
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
 	})
+}
+
+func tenantStatusMessage(t *meta.Tenant) string {
+	if t == nil {
+		return ""
+	}
+	if t.Kind == meta.TenantKindFork && t.Status == meta.TenantProvisioning {
+		return forkProvisioningMessage(t)
+	}
+	return ""
 }
 
 func backendFromRequest(r *http.Request) *backend.Dat9Backend {
@@ -2385,7 +2438,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_requested", "tenant_id", tenantID, "provider", provider)...)
 	keyName := "default"
 
-	apiToken, err := token.IssueToken(s.tokenSecret, tenantID, 1)
+	apiToken, err := token.IssueTokenWithJournalPermissions(s.tokenSecret, tenantID, 1, time.Time{}, ownerJournalPermissionList())
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_issue_token_failed", "tenant_id", tenantID, "error", err)...)
 		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
@@ -2470,10 +2523,12 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_accepted", "tenant_id", tenantID, "provider", provider)...)
 	metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "accepted")
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"api_key": apiToken,
-		"status":  string(meta.TenantProvisioning),
+		"tenant_id": tenantID,
+		"api_key":   apiToken,
+		"status":    string(meta.TenantProvisioning),
 	})
 }
 
@@ -2486,8 +2541,9 @@ func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"api_key": s.localTenantAPIKey,
-		"status":  "provisioning",
+		"tenant_id": "local",
+		"api_key":   s.localTenantAPIKey,
+		"status":    "provisioning",
 	})
 }
 

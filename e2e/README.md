@@ -18,7 +18,8 @@ including local single-tenant validation via `drive9-server-local`.
 | `cli-smoke-test.sh` | End-to-end CLI workflow including `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
 | `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/rename/stat semantics, cross-channel consistency, read-only and error-path checks |
 | `fuse-release-gate.sh` | Strict FUSE release/CI gate with hard prereq failures, small-repo git clone/status/log, durable umount/remount, and mount-log audit |
-| `smoke-all.sh` | Runs API + CLI + FUSE smoke scripts in sequence with aggregated pass/fail |
+| `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
+| `smoke-all.sh` | Runs API + CLI + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail |
 
 ## Run
 
@@ -57,6 +58,9 @@ bash e2e/fuse-release-gate.sh
 # Use official released drive9 CLI for FUSE smoke
 CLI_SOURCE=official bash e2e/fuse-smoke-test.sh
 CLI_SOURCE=official bash e2e/fuse-release-gate.sh
+CLI_SOURCE=official bash e2e/posix-permission-smoke-test.sh
+
+bash e2e/posix-permission-smoke-test.sh
 
 bash e2e/smoke-all.sh
 ```
@@ -131,7 +135,10 @@ bash e2e/fuse-smoke-test.sh
 # Strict FUSE release gate using the repo build.
 bash e2e/fuse-release-gate.sh
 
-# Run API + CLI + FUSE in sequence.
+# POSIX permission smoke (API + CLI + FUSE).
+bash e2e/posix-permission-smoke-test.sh
+
+# Run API + CLI + FUSE + POSIX permission in sequence.
 bash e2e/smoke-all.sh
 ```
 
@@ -161,7 +168,7 @@ CLI_SOURCE=official bash e2e/fuse-release-gate.sh
 
 ## Notes
 
-- `api-smoke-test.sh` expects `POST /v1/provision` to return only `api_key` and `status`.
+- `api-smoke-test.sh` expects `POST /v1/provision` to return `tenant_id`, `api_key`, and `status`.
 - Tenant readiness is checked through `GET /v1/status`.
 - File operations use `/v1/fs/*` and include nested directory coverage.
 - Semantic recall polling knobs for API smoke are `SEMANTIC_TIMEOUT_S` and `SEMANTIC_INTERVAL_S`.

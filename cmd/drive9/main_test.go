@@ -82,6 +82,7 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 		"usage: drive9 <command> [arguments]",
 		"ctx show [--json] [--reveal]",
 		"ctx use <name>",
+		"journal <new|append|cat|find|verify>",
 		"mount [flags] [:/remote] <mountpoint>",
 		"mount vault [flags] <mountpoint>",
 		"doctor fuse",
@@ -152,6 +153,39 @@ func TestDispatchDoctorVerbReachesHandler(t *testing.T) {
 		t.Fatal("doctor handler was not invoked for `drive9 doctor ...`")
 	}
 	want := []string{"fuse", "--mountpoint", "/mnt/drive9"}
+	if len(gotArgs) != len(want) {
+		t.Fatalf("args = %v, want %v", gotArgs, want)
+	}
+	for i := range want {
+		if gotArgs[i] != want[i] {
+			t.Fatalf("args[%d] = %q, want %q", i, gotArgs[i], want[i])
+		}
+	}
+}
+
+func TestDispatchJournalVerbReachesHandler(t *testing.T) {
+	origHandler := journalHandler
+	origExit := exitFunc
+	t.Cleanup(func() {
+		journalHandler = origHandler
+		exitFunc = origExit
+	})
+	exitFunc = func(int) {}
+
+	var gotArgs []string
+	called := false
+	journalHandler = func(args []string) error {
+		called = true
+		gotArgs = args
+		return nil
+	}
+
+	dispatch("journal", []string{"find", "-t", "tool.call.completed"})
+
+	if !called {
+		t.Fatal("journal handler was not invoked for `drive9 journal ...`")
+	}
+	want := []string{"find", "-t", "tool.call.completed"}
 	if len(gotArgs) != len(want) {
 		t.Fatalf("args = %v, want %v", gotArgs, want)
 	}
