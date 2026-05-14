@@ -108,7 +108,7 @@ func TestCreateDuplicateDoesNotLeaveOrphanFileOrObject(t *testing.T) {
 	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*)
 		FROM inodes i
 		LEFT JOIN file_nodes fn ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id
-		WHERE fn.file_id IS NULL`).Scan(&orphans); err != nil {
+		WHERE fn.node_id IS NULL`).Scan(&orphans); err != nil {
 		t.Fatal(err)
 	}
 	if orphans != 0 {

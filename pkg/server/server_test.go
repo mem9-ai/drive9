@@ -1141,7 +1141,7 @@ func TestCreateFileActionCreatesEmptyFileAndConflicts(t *testing.T) {
 	if err := s.fallback.Store().DB().QueryRow(`SELECT COUNT(*)
 		FROM inodes i
 		LEFT JOIN file_nodes fn ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id
-		WHERE fn.file_id IS NULL`).Scan(&orphanRows); err != nil {
+		WHERE fn.node_id IS NULL`).Scan(&orphanRows); err != nil {
 		t.Fatal(err)
 	}
 	if orphanRows != 0 {
