@@ -892,16 +892,13 @@ func testSemanticTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
 	meta := tidbTableMeta{
 		tableName: "semantic",
 		columns: map[string]tidbColumnMeta{
-			"file_id":                        {columnType: "varchar(64)"},
-			"status":                         {columnType: "varchar(32)"},
-			"content_text":                   {columnType: "longtext"},
-			"embedding":                      {columnType: "vector(1024)"},
-			"embedding_revision":             {columnType: "bigint"},
-			"description":                    {columnType: "longtext"},
-			"description_embedding":          {columnType: "vector(1024)"},
+			"inode_id":                      {columnType: "varchar(64)"},
+			"content_text":                  {columnType: "longtext"},
+			"embedding":                     {columnType: "vector(1024)"},
+			"embedding_revision":            {columnType: "bigint"},
+			"description":                   {columnType: "longtext"},
+			"description_embedding":         {columnType: "vector(1024)"},
 			"description_embedding_revision": {columnType: "bigint"},
-			"storage_encryption_mode":        {columnType: "varchar(16)"},
-			"storage_encryption_key_id":      {columnType: "varchar(256)"},
 		},
 	}
 	if mode == TiDBEmbeddingModeAuto {
