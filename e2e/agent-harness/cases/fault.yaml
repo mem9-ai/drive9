@@ -1,0 +1,38 @@
+defaults:
+  timeout: 5m
+  cleanup: retain_on_failure
+  mount_ready_timeout: 20s
+  remote_visibility_timeout: 30s
+  command_retry_count: 8
+  command_retry_sleep: 2s
+  requires_fresh_tenant: false
+cases:
+  - id: open-fd-unmount-strict
+    suite: fault
+    sync_mode: strict
+    expected_outcome: baseline_pass
+    remote_root_suffix: open-fd-unmount-strict
+    mountpoint_suffix: open-fd-unmount-strict
+    workload:
+      type: open_fd_unmount
+      hold_open_duration: 1s
+      remount: false
+    oracles:
+      - type: unmount_busy_then_clean
+    severity:
+      failure: P2
+  - id: kill-during-write-strict
+    suite: fault
+    sync_mode: strict
+    expected_outcome: baseline_pass
+    remote_root_suffix: kill-during-write-strict
+    mountpoint_suffix: kill-during-write-strict
+    workload:
+      type: kill_during_write
+      writer_bytes: 67108864
+      kill_after: 500ms
+      remount: false
+    oracles:
+      - type: recovery_classified
+    severity:
+      failure: P2
