@@ -14,9 +14,9 @@ import (
 	mysql "github.com/go-sql-driver/mysql"
 )
 
-func TestDetectTiDBEmbeddingModeFromFilesMeta(t *testing.T) {
+func TestDetectTiDBEmbeddingModeFromMeta(t *testing.T) {
 	autoMeta := testSemanticTableMeta(TiDBEmbeddingModeAuto)
-	mode, err := detectTiDBEmbeddingModeFromFilesMeta(autoMeta)
+	mode, err := detectTiDBEmbeddingModeFromMeta(autoMeta)
 	if err != nil {
 		t.Fatalf("detect auto mode: %v", err)
 	}
@@ -25,7 +25,7 @@ func TestDetectTiDBEmbeddingModeFromFilesMeta(t *testing.T) {
 	}
 
 	appMeta := testSemanticTableMeta(TiDBEmbeddingModeApp)
-	mode, err = detectTiDBEmbeddingModeFromFilesMeta(appMeta)
+	mode, err = detectTiDBEmbeddingModeFromMeta(appMeta)
 	if err != nil {
 		t.Fatalf("detect app mode: %v", err)
 	}
@@ -295,7 +295,7 @@ func TestApplyTiDBSchemaRepairsPreflightsUniqueIndexNoDuplicatesExecutesRepair(t
 	}
 }
 
-func TestValidateTiDBAutoEmbeddingFilesDiffsReportsGeneratedContractMismatch(t *testing.T) {
+func TestValidateTiDBAutoEmbeddingDiffsReportsGeneratedContractMismatch(t *testing.T) {
 	meta := testSemanticTableMeta(TiDBEmbeddingModeApp)
 	diffs := validateTiDBAutoEmbeddingDiffs(meta)
 	if len(diffs) == 0 {
@@ -306,7 +306,7 @@ func TestValidateTiDBAutoEmbeddingFilesDiffsReportsGeneratedContractMismatch(t *
 	}
 }
 
-func TestValidateTiDBAutoEmbeddingFilesDiffsAllowsWritableDescriptionEmbeddingCompat(t *testing.T) {
+func TestValidateTiDBAutoEmbeddingDiffsAllowsWritableDescriptionEmbeddingCompat(t *testing.T) {
 	meta := testSemanticTableMeta(TiDBEmbeddingModeAuto)
 	meta.columns["description_embedding"] = tidbColumnMeta{columnType: "vector(1024)"}
 	diffs := validateTiDBAutoEmbeddingDiffs(meta)

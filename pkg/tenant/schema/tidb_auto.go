@@ -367,7 +367,7 @@ func DetectTiDBEmbeddingMode(db *sql.DB) (TiDBEmbeddingMode, error) {
 		zap.Duration("elapsed", time.Since(loadStart)),
 		zap.Duration("total_elapsed", time.Since(start)))
 	detectStart := time.Now()
-	mode, err := detectTiDBEmbeddingModeFromFilesMeta(meta)
+	mode, err := detectTiDBEmbeddingModeFromMeta(meta)
 	if err != nil {
 		logger.Warn(ctx, "tenant_detect_tidb_embedding_mode_failed",
 			zap.Duration("elapsed", time.Since(detectStart)),
@@ -571,7 +571,7 @@ func closeTiDBSchemaDB(db *sql.DB) error {
 	return mysqlutil.CloseInstrumented(db)
 }
 
-func detectTiDBEmbeddingModeFromFilesMeta(meta tidbTableMeta) (TiDBEmbeddingMode, error) {
+func detectTiDBEmbeddingModeFromMeta(meta tidbTableMeta) (TiDBEmbeddingMode, error) {
 	col, err := meta.requireColumn("embedding")
 	if err != nil {
 		return TiDBEmbeddingModeUnknown, err
