@@ -1,0 +1,133 @@
+defaults:
+  timeout: 2m
+  cleanup: retain_on_failure
+  mount_ready_timeout: 20s
+  remote_visibility_timeout: 5s
+  command_retry_count: 8
+  command_retry_sleep: 2s
+  requires_fresh_tenant: false
+cases:
+  - id: path-edge-strict
+    suite: regression
+    sync_mode: strict
+    expected_outcome: bug_reproduced
+    remote_root_suffix: path-edge-strict
+    mountpoint_suffix: path-edge-strict
+    workload:
+      type: path_matrix
+      paths:
+        - "space name unicode-测试 punct_!@%.txt"
+    oracles:
+      - type: fuse_write_success
+      - type: cli_read_equals
+      - type: remount_hash_equal
+    severity:
+      failure: P1
+  - id: path-edge-interactive
+    suite: regression
+    sync_mode: interactive
+    expected_outcome: bug_reproduced
+    remote_root_suffix: path-edge-interactive
+    mountpoint_suffix: path-edge-interactive
+    workload:
+      type: path_matrix
+      paths:
+        - "space name unicode-测试 punct_!@%.txt"
+    oracles:
+      - type: fuse_write_success
+      - type: cli_read_equals
+      - type: remount_hash_equal
+    severity:
+      failure: P1
+  - id: git-lock-strict
+    suite: regression
+    sync_mode: strict
+    expected_outcome: bug_reproduced
+    remote_root_suffix: git-lock-strict
+    mountpoint_suffix: git-lock-strict
+    timeout: 3m
+    workload:
+      type: git_workflow
+      clone_url: fixture://basic
+      clone_dir: repo
+      mutation:
+        path: README.md
+        mode: append
+        content: |
+
+          strict git workflow mutation
+      commit_message: drive9 harness mutation
+      expected_locks: []
+      expected_status: ""
+      expected_commit_delta: 1
+      remount_verify_paths:
+        - path: README.md
+    oracles:
+      - type: no_git_locks
+      - type: git_status_equals
+      - type: git_commit_count
+      - type: remount_hash_equal
+    severity:
+      failure: P1
+  - id: git-lock-interactive
+    suite: regression
+    sync_mode: interactive
+    expected_outcome: bug_reproduced
+    remote_root_suffix: git-lock-interactive
+    mountpoint_suffix: git-lock-interactive
+    timeout: 3m
+    workload:
+      type: git_workflow
+      clone_url: fixture://basic
+      clone_dir: repo
+      mutation:
+        path: README.md
+        mode: append
+        content: |
+
+          interactive git workflow mutation
+      commit_message: drive9 harness mutation
+      expected_locks: []
+      expected_status: ""
+      expected_commit_delta: 1
+      remount_verify_paths:
+        - path: README.md
+    oracles:
+      - type: no_git_locks
+      - type: git_status_equals
+      - type: git_commit_count
+      - type: remount_hash_equal
+    severity:
+      failure: P1
+  - id: doctor-no-allow-other
+    suite: regression
+    expected_outcome: bug_reproduced
+    remote_root_suffix: doctor-no-allow-other
+    mountpoint_suffix: doctor-no-allow-other
+    workload:
+      type: doctor_fuse
+      expect_exit: 0
+      allow_nonzero_when_no_allow_other: false
+    oracles:
+      - type: command_exit
+    severity:
+      failure: P2
+  - id: dual-mount-visibility
+    suite: regression
+    sync_mode: interactive
+    expected_outcome: baseline_pass
+    remote_root_suffix: dual-mount-visibility
+    mountpoint_suffix: dual-mount-visibility
+    workload:
+      type: dual_mount_visibility
+      remount: true
+      files:
+        - relative_path: a-to-b.txt
+          content: dual mount a to b
+        - relative_path: b-to-a.txt
+          content: dual mount b to a
+    oracles:
+      - type: dual_mount_visibility
+      - type: remount_hash_equal
+    severity:
+      failure: P1

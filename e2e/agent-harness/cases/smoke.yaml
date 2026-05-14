@@ -1,0 +1,49 @@
+defaults:
+  timeout: 2m
+  cleanup: always
+  mount_ready_timeout: 20s
+  remote_visibility_timeout: 5s
+  command_retry_count: 8
+  command_retry_sleep: 2s
+  requires_fresh_tenant: false
+cases:
+  - id: smoke-strict
+    suite: smoke
+    sync_mode: strict
+    expected_outcome: baseline_pass
+    remote_root_suffix: smoke-strict
+    mountpoint_suffix: smoke-strict
+    workload:
+      type: mount_smoke
+      remount: true
+      files:
+        - relative_path: cli-to-fuse.txt
+          content: smoke cli to fuse
+        - relative_path: fuse-to-cli.txt
+          content: smoke fuse to cli
+    oracles:
+      - type: cli_read_equals
+      - type: fuse_write_success
+      - type: remount_hash_equal
+    severity:
+      failure: P1
+  - id: smoke-interactive
+    suite: smoke
+    sync_mode: interactive
+    expected_outcome: baseline_pass
+    remote_root_suffix: smoke-interactive
+    mountpoint_suffix: smoke-interactive
+    workload:
+      type: mount_smoke
+      remount: true
+      files:
+        - relative_path: cli-to-fuse.txt
+          content: smoke interactive cli to fuse
+        - relative_path: fuse-to-cli.txt
+          content: smoke interactive fuse to cli
+    oracles:
+      - type: cli_read_equals
+      - type: fuse_write_success
+      - type: remount_hash_equal
+    severity:
+      failure: P1
