@@ -631,6 +631,26 @@ func TestDeleteFileWithRefCheckRejectsDirectory(t *testing.T) {
 	}
 }
 
+func TestInsertNodeTxRejectsDeletedFile(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 1, Revision: 1, Status: StatusDeleted, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	err := s.InTx(ctx, func(tx *sql.Tx) error {
+		return s.InsertNodeTx(tx, &FileNode{
+			NodeID: "n1", Path: "/deleted.txt", ParentPath: "/", Name: "deleted.txt",
+			FileID: "f1", CreatedAt: now,
+		})
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("InsertNodeTx error = %v, want %v", err, ErrNotFound)
+	}
+}
+
 func TestDeleteDirRecursive(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/mem9-ai/dat9/pkg/client"
 )
 
 func TestOpenHandleIndexTracksByInodeAndPath(t *testing.T) {
@@ -115,6 +116,8 @@ func TestDat9FSFinishLocalRenameUpdatesOpenHandleIndex(t *testing.T) {
 	fh := &FileHandle{Ino: ino, Path: "/old.txt", Dirty: NewWriteBuffer("/old.txt", 0, 0)}
 	fh.Streamer = NewStreamUploader(fs.client, "/old.txt", -1, fs.remoteRoot())
 	fh.Prefetch = NewPrefetcher(fs.client, fs.remotePath("/old.txt"), 4)
+	fh.ReadTarget = &client.ReadTarget{ObjectURL: "http://old.example/object"}
+	fh.Prefetch.SetReadTarget(fh.ReadTarget)
 	fhID := fs.allocateFileHandle(fh)
 	defer fs.deleteFileHandle(fhID, fh)
 
@@ -143,5 +146,14 @@ func TestDat9FSFinishLocalRenameUpdatesOpenHandleIndex(t *testing.T) {
 	}
 	if got := fh.Prefetch.pathString(); got != "/new.txt" {
 		t.Fatalf("prefetch path = %q, want /new.txt", got)
+	}
+	if fh.ReadTarget != nil {
+		t.Fatal("file handle read target was not cleared")
+	}
+	fh.Prefetch.mu.Lock()
+	prefetchTarget := fh.Prefetch.target
+	fh.Prefetch.mu.Unlock()
+	if prefetchTarget != nil {
+		t.Fatal("prefetch read target was not cleared")
 	}
 }

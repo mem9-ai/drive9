@@ -87,7 +87,7 @@ func (p *Prefetcher) SetPerfCounters(perf *fusePerfCounters) {
 }
 
 func (p *Prefetcher) SetReadTarget(target *client.ReadTarget) {
-	if p == nil || target == nil {
+	if p == nil {
 		return
 	}
 	p.mu.Lock()

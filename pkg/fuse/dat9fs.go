@@ -2379,6 +2379,7 @@ func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
 		}
 		fh.Lock()
 		fh.Path = currentPath
+		fh.ReadTarget = nil
 		if fh.Dirty != nil {
 			fh.Dirty.path = currentPath
 		}
@@ -2387,6 +2388,7 @@ func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
 		}
 		if fh.Prefetch != nil {
 			fh.Prefetch.SetPath(fs.remotePath(currentPath))
+			fh.Prefetch.SetReadTarget(nil)
 		}
 		fh.Unlock()
 	}

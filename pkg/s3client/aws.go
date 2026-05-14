@@ -103,6 +103,10 @@ func NewAWS(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 	} else {
 		transport = &http.Transport{}
 	}
+	// S3 data-plane calls fan out more than control-plane API calls:
+	// multipart uploads use uploadMaxConcurrency workers and FUSE reads can
+	// issue direct range/prefetch requests concurrently. Keep this pool 2x
+	// the dat9 client pool so hot S3 paths avoid repeated TLS handshakes.
 	transport.MaxIdleConns = 512
 	transport.MaxIdleConnsPerHost = 128
 
