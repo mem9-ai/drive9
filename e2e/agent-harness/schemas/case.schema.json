@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Drive9 Agent Harness Case Suite",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "defaults": {
+      "type": "object"
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "suite",
+          "expected_outcome",
+          "remote_root_suffix",
+          "mountpoint_suffix",
+          "workload",
+          "oracles",
+          "severity"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "suite": {
+            "enum": [
+              "smoke",
+              "regression",
+              "stress",
+              "fault"
+            ]
+          },
+          "sync_mode": {
+            "enum": [
+              "strict",
+              "interactive",
+              "auto"
+            ]
+          },
+          "expected_outcome": {
+            "enum": [
+              "baseline_pass",
+              "bug_reproduced",
+              "fix_verified"
+            ]
+          },
+          "remote_root_suffix": {
+            "type": "string",
+            "pattern": "^[^/\\\\.][^/\\\\]*$"
+          },
+          "mountpoint_suffix": {
+            "type": "string",
+            "pattern": "^[^/\\\\.][^/\\\\]*$"
+          },
+          "timeout": {
+            "type": "string"
+          },
+          "cleanup": {
+            "enum": [
+              "always",
+              "retain_on_failure",
+              "never"
+            ]
+          },
+          "workload": {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "enum": [
+                  "mount_smoke",
+                  "path_matrix",
+                  "dual_mount_visibility",
+                  "fio",
+                  "small_file_storm",
+                  "parallel_writes",
+                  "git_workflow",
+                  "doctor_fuse",
+                  "open_fd_unmount",
+                  "kill_during_write"
+                ]
+              }
+            }
+          },
+          "oracles": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "fuse_write_success",
+                    "cli_read_equals",
+                    "remount_hash_equal",
+                    "no_git_locks",
+                    "git_status_equals",
+                    "git_commit_count",
+                    "command_exit",
+                    "dual_mount_visibility",
+                    "throughput_min",
+                    "file_count_equals",
+                    "unmount_busy_then_clean",
+                    "recovery_classified"
+                  ]
+                }
+              }
+            }
+          },
+          "severity": {
+            "type": "object",
+            "required": [
+              "failure"
+            ],
+            "properties": {
+              "failure": {
+                "enum": [
+                  "P0",
+                  "P1",
+                  "P2",
+                  "P3"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "required": [
+    "cases"
+  ]
+}

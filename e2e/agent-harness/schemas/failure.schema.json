@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Drive9 Agent Harness Failure",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "case_id",
+    "ts",
+    "severity",
+    "class",
+    "oracle",
+    "expected_outcome",
+    "message",
+    "observed",
+    "expected",
+    "repro_path",
+    "artifact_refs"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "agent-harness.v1"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "case_id": {
+      "type": "string"
+    },
+    "ts": {
+      "type": "string"
+    },
+    "severity": {
+      "enum": [
+        "P0",
+        "P1",
+        "P2",
+        "P3"
+      ]
+    },
+    "class": {
+      "enum": [
+        "product",
+        "harness",
+        "environment",
+        "infrastructure",
+        "inconclusive"
+      ]
+    },
+    "oracle": {
+      "type": "string"
+    },
+    "expected_outcome": {
+      "enum": [
+        "baseline_pass",
+        "bug_reproduced",
+        "fix_verified"
+      ]
+    },
+    "message": {
+      "type": "string"
+    },
+    "observed": {},
+    "expected": {},
+    "repro_path": {
+      "type": "string"
+    },
+    "artifact_refs": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
