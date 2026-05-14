@@ -84,8 +84,8 @@ func (w *SSEWatcher) handleChange(ce *client.ChangeEvent) {
 
 	fmt.Fprintf(os.Stderr, "drive9: SSE event op=%s path=%s local=%s actor=%s\n", ce.Op, remotePath, p, ce.Actor)
 
-	// Invalidate read cache for the changed file.
-	w.fs.readCache.Invalidate(p)
+	// Invalidate read cache and resolved read targets for the changed file.
+	w.fs.invalidateReadCacheAndTargets(p)
 
 	// Invalidate directory cache for the parent directory.
 	w.fs.dirCache.Invalidate(parentDir(p))
@@ -113,6 +113,7 @@ func (w *SSEWatcher) handleReset(resets ...*client.ResetEvent) {
 
 	// 1. Clear all user-space caches.
 	w.fs.readCache.InvalidateAll()
+	w.fs.clearAllReadTargets()
 	w.fs.dirCache.InvalidateAll()
 
 	// 2. Best-effort kernel cache invalidation for all known inodes.

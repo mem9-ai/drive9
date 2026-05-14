@@ -174,7 +174,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		fileHandles:   NewHandleTable[*FileHandle](),
 		openHandles:   NewOpenHandleIndex(),
 		dirHandles:    NewHandleTable[*DirHandle](),
-		readCache:     NewReadCache(opts.CacheSize, 0),
+		readCache:     NewReadCacheWithMaxFileSize(opts.CacheSize, 0, opts.ReadCacheMaxFileBytes),
 		dirCache:      NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
 		dirtyInodes:   make(map[uint64]dirtyInodeState),
 		uid:           uint32(os.Getuid()),
@@ -546,7 +546,7 @@ func (fs *Dat9FS) preloadWritableHandleFromReadCacheLocked(fh *FileHandle) bool 
 	if fs.readCache == nil || fh == nil || fh.Dirty == nil {
 		return false
 	}
-	if fh.OrigSize <= 0 || fh.OrigSize > defaultReadCacheMaxFileSize || fh.BaseRev <= 0 {
+	if fh.OrigSize <= 0 || fh.OrigSize > fs.readCache.MaxFileSize() || fh.BaseRev <= 0 {
 		return false
 	}
 
@@ -969,14 +969,118 @@ func (fs *Dat9FS) readSmallFileWithRetry(ctx context.Context, path string) ([]by
 	return nil, fmt.Errorf("%w: %s: %v", errReadRetriesExhausted, path, lastErr)
 }
 
+func (fs *Dat9FS) readTargetForHandle(ctx context.Context, fh *FileHandle) *client.ReadTarget {
+	if fs == nil || fs.client == nil || fh == nil || fh.Dirty != nil {
+		return nil
+	}
+	fh.Lock()
+	target := fh.ReadTarget
+	handlePath := fh.Path
+	remotePath := fs.remotePath(handlePath)
+	fh.Unlock()
+	if target != nil {
+		return target
+	}
+
+	resolved, err := fs.client.ResolveReadTarget(ctx, remotePath)
+	if err != nil {
+		// Fall back to the ordinary read path. This preserves inline-file and
+		// transient-error behavior while still optimizing the common S3 case.
+		return nil
+	}
+
+	fh.Lock()
+	if fh.Path == handlePath && fh.Dirty == nil && fh.ReadTarget == nil {
+		fh.ReadTarget = resolved
+		if fh.Prefetch != nil {
+			fh.Prefetch.SetReadTarget(resolved)
+		}
+	}
+	target = fh.ReadTarget
+	fh.Unlock()
+	return target
+}
+
+func clearReadTargetForHandle(fh *FileHandle) {
+	if fh == nil {
+		return
+	}
+	fh.Lock()
+	fh.ReadTarget = nil
+	if fh.Prefetch != nil {
+		fh.Prefetch.SetReadTarget(nil)
+	}
+	fh.Unlock()
+}
+
+func (fs *Dat9FS) clearReadTargetsForPath(p string) {
+	fs.clearReadTargetsForPathExcept(p, nil)
+}
+
+func (fs *Dat9FS) clearReadTargetsForPathExcept(p string, skip *FileHandle) {
+	if fs == nil || fs.openHandles == nil || p == "" {
+		return
+	}
+	for _, fh := range fs.openHandles.SnapshotPath(p) {
+		if fh == skip {
+			continue
+		}
+		clearReadTargetForHandle(fh)
+	}
+}
+
+func clearReadTargetForLockedHandle(fh *FileHandle) {
+	if fh == nil {
+		return
+	}
+	fh.ReadTarget = nil
+	if fh.Prefetch != nil {
+		fh.Prefetch.SetReadTarget(nil)
+	}
+}
+
+func (fs *Dat9FS) clearAllReadTargets() {
+	if fs == nil || fs.fileHandles == nil {
+		return
+	}
+	fs.fileHandles.ForEach(func(_ uint64, fh *FileHandle) {
+		clearReadTargetForHandle(fh)
+	})
+}
+
+func (fs *Dat9FS) invalidateReadCacheAndTargets(p string) {
+	fs.invalidateReadCacheAndTargetsExcept(p, nil)
+}
+
+func (fs *Dat9FS) invalidateReadCacheAndTargetsExcept(p string, skip *FileHandle) {
+	if fs == nil {
+		return
+	}
+	if fs.readCache != nil {
+		fs.readCache.Invalidate(p)
+	}
+	fs.clearReadTargetsForPathExcept(p, skip)
+}
+
 // readStreamRangeWithRetry performs a range read with bounded detached retry
 // on transient failures. Wraps both the ReadStreamRange open and io.ReadFull
 // body read as a single retriable unit. On body-stage transient failure, the
 // stream is reopened from scratch on retry.
 // Returns (data, nil) on success. On exhausted retries, the returned error
 // is a wrapped sentinel so the caller can map it to EIO.
-func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, offset, size int64) ([]byte, int, error) {
-	data, n, err := fs.doRangeRead(ctx, path, offset, size)
+func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, fh *FileHandle, offset, size int64) ([]byte, int, error) {
+	target := fs.readTargetForHandle(ctx, fh)
+	data, n, err := fs.doRangeRead(ctx, path, target, offset, size)
+	if client.IsPresignExpired(err) {
+		clearReadTargetForHandle(fh)
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), readTransientRetryTimeout)
+		target = fs.readTargetForHandle(retryCtx, fh)
+		data, n, err = fs.doRangeRead(retryCtx, path, target, offset, size)
+		retryCancel()
+		if err == nil && fs.perf != nil {
+			fs.perf.readRetrySuccess.add(1)
+		}
+	}
 	if err == nil || !isTransientReadErr(err) {
 		return data, n, err
 	}
@@ -987,7 +1091,12 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, off
 	lastErr := err
 	for range readTransientRetryCount {
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), readTransientRetryTimeout)
-		data, n, err = fs.doRangeRead(retryCtx, path, offset, size)
+		data, n, err = fs.doRangeRead(retryCtx, path, target, offset, size)
+		if client.IsPresignExpired(err) {
+			clearReadTargetForHandle(fh)
+			target = fs.readTargetForHandle(retryCtx, fh)
+			data, n, err = fs.doRangeRead(retryCtx, path, target, offset, size)
+		}
 		retryCancel()
 		if err == nil {
 			if fs.perf != nil {
@@ -1009,9 +1118,15 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, off
 // doRangeRead performs a single range read attempt: open stream + read body.
 // All body read errors (including truncation) are returned as-is so the
 // caller can classify them for retry.
-func (fs *Dat9FS) doRangeRead(ctx context.Context, path string, offset, size int64) ([]byte, int, error) {
+func (fs *Dat9FS) doRangeRead(ctx context.Context, path string, target *client.ReadTarget, offset, size int64) ([]byte, int, error) {
 	readStart := fs.perfStart()
-	rc, err := fs.client.ReadStreamRange(ctx, fs.remotePath(path), offset, size)
+	var rc io.ReadCloser
+	var err error
+	if target != nil {
+		rc, err = fs.client.ReadObjectRange(ctx, target, offset, size)
+	} else {
+		rc, err = fs.client.ReadStreamRange(ctx, fs.remotePath(path), offset, size)
+	}
 	if err != nil {
 		fs.perfRecordRemote(perfRemoteRead, readStart, err, 0)
 		return nil, 0, err
@@ -1951,7 +2066,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
 					}
 				}
-				fs.readCache.Invalidate(entry.Path)
+				fs.invalidateReadCacheAndTargets(entry.Path)
 				fs.cacheFileForPath(entry.Path, 0, refreshedMtime, refreshedRevision)
 			} else if newSize != entry.Size {
 				// Arbitrary truncate without an open handle is not
@@ -2086,7 +2201,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}
 
 	fs.inodes.Remove(childP)
-	fs.readCache.Invalidate(childP)
+	fs.invalidateReadCacheAndTargets(childP)
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.dirCache.Remove(parentPath, name)
@@ -2315,8 +2430,8 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 		oldEntry, oldEntryOK = fs.inodes.GetEntry(oldIno)
 	}
 	fs.inodes.Rename(oldP, newP)
-	fs.readCache.Invalidate(oldP)
-	fs.readCache.Invalidate(newP)
+	fs.invalidateReadCacheAndTargets(oldP)
+	fs.invalidateReadCacheAndTargets(newP)
 	fs.readCache.InvalidatePrefix(oldP + "/")
 	fs.readCache.InvalidatePrefix(newP + "/")
 
@@ -2342,6 +2457,7 @@ func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
 		}
 		fh.Lock()
 		fh.Path = currentPath
+		fh.ReadTarget = nil
 		if fh.Dirty != nil {
 			fh.Dirty.path = currentPath
 		}
@@ -2350,6 +2466,7 @@ func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
 		}
 		if fh.Prefetch != nil {
 			fh.Prefetch.SetPath(fs.remotePath(currentPath))
+			fh.Prefetch.SetReadTarget(nil)
 		}
 		fh.Unlock()
 	}
@@ -2956,7 +3073,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	// Set up read prefetcher for read-only opens on large files.
 	if fh.Dirty == nil {
 		entry, _ := fs.inodes.GetEntry(input.NodeId)
-		if entry != nil && entry.Size > fs.inlineThreshold() {
+		if entry != nil && entry.Size > fs.readCache.MaxFileSize() {
 			fh.Prefetch = NewPrefetcher(fs.client, fs.remotePath(p), entry.Size, fs.debugEnabled())
 			fh.Prefetch.SetPerfCounters(fs.perf)
 		}
@@ -3293,7 +3410,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// InodeEntry has a stored revision from the last Lookup/GetAttr, pass
 	// it to the cache for validation. Cache hit only if revision matches.
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
-	if entry != nil && entry.Size <= defaultReadCacheMaxFileSize && entry.Size > 0 {
+	if entry != nil && entry.Size <= fs.readCache.MaxFileSize() && entry.Size > 0 {
 		cacheRev := entry.Revision // use revision from last Stat/Lookup
 		// Fast path: serve from cache without any HTTP call.
 		if data, ok := fs.readCache.Get(p, cacheRev); ok {
@@ -3353,7 +3470,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		source = "range-read"
 	}
 	rangeStart := time.Now()
-	data, n, err := fs.readStreamRangeWithRetry(ctx, p, int64(input.Offset), int64(input.Size))
+	data, n, err := fs.readStreamRangeWithRetry(ctx, p, fh, int64(input.Offset), int64(input.Size))
 	if err != nil {
 		fs.debugf("read range error path=%s off=%d req=%d got=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, n, source, time.Since(rangeStart), err)
 		if errors.Is(err, errReadRetriesExhausted) {
@@ -3939,7 +4056,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				cf()
 			}
 
-			fs.readCache.Invalidate(fh.Path)
+			fs.invalidateReadCacheAndTargets(fh.Path)
 			if flushStatus == gofuse.OK {
 				fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 			} else {
@@ -4011,7 +4128,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				}
 
 				// Invalidate caches so subsequent reads see fresh data.
-				fs.readCache.Invalidate(fh.Path)
+				fs.invalidateReadCacheAndTargets(fh.Path)
 				fs.cacheFileForPath(fh.Path, fh.Dirty.Size(), time.Now(), 0)
 				// Local release — kernel already knows about this close.
 				// No notifyInode needed; userspace caches are invalidated above.
@@ -4119,9 +4236,10 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		}
 		handle.Unlock()
 		if committedRev > 0 {
+			fs.clearReadTargetsForPath(filePath)
 			fs.readCache.PutOwned(filePath, data, committedRev)
 		} else {
-			fs.readCache.Invalidate(filePath)
+			fs.invalidateReadCacheAndTargets(filePath)
 		}
 		fs.inodes.UpdateSize(ino, int64(len(data)))
 		fs.cacheFileForPath(filePath, int64(len(data)), time.Now(), committedRev)
@@ -4233,7 +4351,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fh.Dirty.ClearDirty()
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
-		fs.readCache.Invalidate(fh.Path)
+		clearReadTargetForLockedHandle(fh)
+		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
 		fs.inodes.UpdateSize(fh.Ino, size)
 		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		// Remove stale shadow so subsequent read-only opens don't serve
@@ -4290,7 +4409,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fh.Dirty.ClearDirty()
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
-		fs.readCache.Invalidate(fh.Path)
+		clearReadTargetForLockedHandle(fh)
+		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
 		fs.inodes.UpdateSize(fh.Ino, size)
 		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		// Remove stale shadow (same reason as Path 1a above).
@@ -4404,6 +4524,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 	fh.DirtySeq = 0
 	if committedRev > 0 {
+		clearReadTargetForLockedHandle(fh)
+		fs.clearReadTargetsForPathExcept(fh.Path, fh)
 		fs.readCache.Put(fh.Path, data, committedRev)
 		fh.IsNew = false
 		fh.BaseRev = committedRev
@@ -4412,7 +4534,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			fh.ZeroBase = false
 		}
 	} else {
-		fs.readCache.Invalidate(fh.Path)
+		clearReadTargetForLockedHandle(fh)
+		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 	}
 	fs.inodes.UpdateSize(fh.Ino, size)
@@ -4518,9 +4641,10 @@ func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, a
 // or invalidates the cache otherwise.
 func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 	if committedRev > 0 && entry.Inode > 0 {
+		fs.clearReadTargetsForPath(entry.Path)
 		// Seed readCache from shadow data before the shadow file is removed.
 		// Only attempt for files under the readCache size limit.
-		if entry.Size <= int64(defaultReadCacheMaxFileSize) && fs.shadowStore != nil {
+		if entry.Size <= fs.readCache.MaxFileSize() && fs.shadowStore != nil {
 			if data, err := fs.shadowStore.ReadAll(entry.Path); err == nil {
 				fs.readCache.PutOwned(entry.Path, data, committedRev)
 			}
@@ -4532,7 +4656,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		// Kernel does not need notify; userspace caches and inode state
 		// are updated above. Kernel will see new attrs on next access.
 	} else {
-		fs.readCache.Invalidate(entry.Path)
+		fs.invalidateReadCacheAndTargets(entry.Path)
 		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
 	}
 }

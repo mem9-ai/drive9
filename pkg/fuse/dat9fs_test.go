@@ -2471,7 +2471,7 @@ func TestIsTransientLookupErr_Treats499AsTransient(t *testing.T) {
 }
 
 func TestOpenReadOnlyLargeFileGetsPrefetcher(t *testing.T) {
-	size := int64(1024 * 1024) // 1MB — above defaultSmallFileThreshold
+	size := int64(2 * 1024 * 1024) // above default read-cache admission limit
 	data := make([]byte, size)
 	for i := range data {
 		data[i] = byte(i % 256)
@@ -2500,6 +2500,30 @@ func TestOpenReadOnlyLargeFileGetsPrefetcher(t *testing.T) {
 	}
 	if out.OpenFlags != gofuse.FOPEN_KEEP_CACHE {
 		t.Fatalf("open flags = %d, want FOPEN_KEEP_CACHE for mmap compatibility", out.OpenFlags)
+	}
+}
+
+func TestOpenReadOnlyCacheableFileSkipsPrefetcher(t *testing.T) {
+	size := int64(defaultReadCacheMaxFileSize)
+	fs, ino, cleanup := newTestDat9FS(t, size, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, int(size)))
+	})
+	defer cleanup()
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.Prefetch != nil {
+		t.Fatal("cacheable read-only file should use read cache without prefetcher")
 	}
 }
 
@@ -6397,7 +6421,7 @@ func TestDoRangeReadBodyTimeoutReturnsForRetry(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	_, _, err := fs.doRangeRead(ctx, "/test.bin", 0, 4096)
+	_, _, err := fs.doRangeRead(ctx, "/test.bin", nil, 0, 4096)
 	if err == nil {
 		t.Fatal("expected error from doRangeRead with expired context")
 	}
@@ -6406,6 +6430,112 @@ func TestDoRangeReadBodyTimeoutReturnsForRetry(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected DeadlineExceeded in error chain, got: %v", err)
+	}
+}
+
+func TestReadStreamRangeWithRetryRefreshesExpiredReadTarget(t *testing.T) {
+	var resolveCalls atomic.Int32
+	var expiredCalls atomic.Int32
+	var freshCalls atomic.Int32
+	data := []byte("0123456789")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/large.bin":
+			call := resolveCalls.Add(1)
+			token := "expired"
+			if call > 1 {
+				token = "fresh"
+			}
+			w.Header().Set("Location", fmt.Sprintf("http://%s/s3/%s", r.Host, token))
+			w.WriteHeader(http.StatusFound)
+		case "/s3/expired":
+			expiredCalls.Add(1)
+			w.WriteHeader(http.StatusForbidden)
+		case "/s3/fresh":
+			freshCalls.Add(1)
+			if got := r.Header.Get("Range"); got != "bytes=2-5" {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[2:6])
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fh := &FileHandle{Path: "/large.bin"}
+
+	got, n, err := fs.readStreamRangeWithRetry(context.Background(), "/large.bin", fh, 2, 4)
+	if err != nil {
+		t.Fatalf("readStreamRangeWithRetry: %v", err)
+	}
+	if n != 4 || string(got) != "2345" {
+		t.Fatalf("range read = %q, %d; want 2345, 4", got, n)
+	}
+	if resolveCalls.Load() != 2 {
+		t.Fatalf("resolve calls = %d, want 2", resolveCalls.Load())
+	}
+	if expiredCalls.Load() != 1 || freshCalls.Load() != 1 {
+		t.Fatalf("expired/fresh calls = %d/%d, want 1/1", expiredCalls.Load(), freshCalls.Load())
+	}
+	if fh.ReadTarget == nil || !strings.Contains(fh.ReadTarget.ObjectURL, "/s3/fresh") {
+		t.Fatalf("read target = %+v, want fresh target", fh.ReadTarget)
+	}
+}
+
+func TestReadTargetForHandleDropsResolvedTargetAfterPathChange(t *testing.T) {
+	resolveStarted := make(chan struct{})
+	allowResolve := make(chan struct{})
+	var once sync.Once
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/fs/old.bin" {
+			http.NotFound(w, r)
+			return
+		}
+		once.Do(func() { close(resolveStarted) })
+		<-allowResolve
+		w.Header().Set("Location", fmt.Sprintf("http://%s/s3/old", r.Host))
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fh := &FileHandle{Path: "/old.bin"}
+
+	done := make(chan *client.ReadTarget, 1)
+	go func() {
+		done <- fs.readTargetForHandle(context.Background(), fh)
+	}()
+
+	select {
+	case <-resolveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("resolve did not start")
+	}
+	fh.Lock()
+	fh.Path = "/new.bin"
+	fh.Unlock()
+	close(allowResolve)
+
+	select {
+	case target := <-done:
+		if target != nil {
+			t.Fatalf("target = %+v, want nil after path change", target)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("readTargetForHandle timed out")
+	}
+	if fh.ReadTarget != nil {
+		t.Fatalf("handle cached target = %+v, want nil", fh.ReadTarget)
 	}
 }
 
@@ -6439,7 +6569,7 @@ func TestDoRangeReadBodyTruncationReturnsError(t *testing.T) {
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	ctx := context.Background()
-	_, n, err := fs.doRangeRead(ctx, "/truncate.bin", 0, 4096)
+	_, n, err := fs.doRangeRead(ctx, "/truncate.bin", nil, 0, 4096)
 	// doRangeRead must return an error for truncated body, not silent success.
 	// The old code (io.ReadFull + ErrUnexpectedEOF filter) would return nil here.
 	if err == nil {
@@ -6450,7 +6580,7 @@ func TestDoRangeReadBodyTruncationReturnsError(t *testing.T) {
 // TestReadPrefetchNotTriggeredOnFailure verifies that Prefetch.OnRead is NOT
 // called when the remote read fails after a prefetch cache miss.
 func TestReadPrefetchNotTriggeredOnFailure(t *testing.T) {
-	fileSize := int64(1 << 20) // 1 MiB — gets a Prefetcher
+	fileSize := int64(2 << 20) // above default read-cache admission limit
 	var getCalls atomic.Int32
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -6509,9 +6639,10 @@ func TestReadPrefetchNotTriggeredOnFailure(t *testing.T) {
 	// those fetches would generate additional GET calls beyond the
 	// Read retry attempts.
 	//
-	// With 1 initial + 2 retries = 3 GET calls from Read itself.
+	// With 1 target resolution attempt plus 1 initial range read and
+	// 2 retries = 4 GET calls from Read itself.
 	// If OnRead fired, the prefetcher would issue additional GETs.
-	wantMaxCalls := int32(1 + readTransientRetryCount)
+	wantMaxCalls := int32(2 + readTransientRetryCount)
 	if got := getCalls.Load(); got > wantMaxCalls {
 		t.Fatalf("GET calls = %d, want <= %d (OnRead should not trigger prefetch on failure)", got, wantMaxCalls)
 	}
@@ -6885,7 +7016,6 @@ func TestSetAttr_NoKernelNotify(t *testing.T) {
 		t.Fatalf("SetAttr produced %d kernel notify calls, want 0", delta)
 	}
 }
-
 
 // TestLookupParsesModeHeader verifies that Lookup reads the X-Dat9-Mode header
 // from the remote stat response and stores it in the inode entry.

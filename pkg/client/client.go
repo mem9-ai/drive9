@@ -110,18 +110,20 @@ func NewWithToken(baseURL, token string) *Client {
 // decisions server-side.
 func newClient(baseURL, credential string) *Client {
 	// Clone DefaultTransport to preserve Proxy, HTTP/2, dialer, and TLS defaults,
-	// then tune connection pooling for concurrent multipart uploads to S3.
+	// then tune connection pooling for concurrent multipart uploads, prefetch,
+	// and repeated range reads against both drive9 and presigned S3 URLs.
 	// Default MaxIdleConnsPerHost=2 forces new TLS handshakes for every
-	// part beyond 2 in-flight, adding ~50-100ms per part. Setting it to
-	// 16 lets the connection pool cover typical upload parallelism.
+	// request beyond 2 in-flight, adding ~50-100ms per connection in WAN
+	// deployments. Keep headroom above uploadMaxConcurrency so reads and
+	// metadata calls do not evict upload connections.
 	var transport *http.Transport
 	if t, ok := http.DefaultTransport.(*http.Transport); ok {
 		transport = t.Clone()
 	} else {
 		transport = &http.Transport{}
 	}
-	transport.MaxIdleConns = 100
-	transport.MaxIdleConnsPerHost = 16
+	transport.MaxIdleConns = 256
+	transport.MaxIdleConnsPerHost = 64
 
 	// Custom DialContext: fall back to public DNS (8.8.8.8, 1.1.1.1) when the
 	// system resolver fails. Fixes DNS on Termux and minimal containers that

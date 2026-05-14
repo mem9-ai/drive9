@@ -135,6 +135,13 @@ const (
 
 var errReadTargetNoRedirect = errors.New("parallel download unavailable without redirect")
 
+// IsReadTargetNoRedirect reports whether err indicates that a read target could
+// not be resolved because the server returned an inline file body instead of a
+// redirect to object storage.
+func IsReadTargetNoRedirect(err error) bool {
+	return errors.Is(err, errReadTargetNoRedirect)
+}
+
 // DownloadSummary exposes the coarse-grained large-file download metrics that
 // the CLI emits as a structured log event when CLI logging is enabled.
 type DownloadSummary struct {
@@ -179,13 +186,12 @@ type downloadRange struct {
 	length int64
 }
 
-// readTarget captures the presigned object URL resolved from the control
-// plane for one large-file download. The current parallel downloader assumes
-// this URL remains valid for the lifetime of the download; if it expires mid-
-// transfer we fail the download instead of refreshing and retrying in place.
-// Follow-up: #138.
-type readTarget struct {
-	objectURL string
+// ReadTarget captures a resolved object URL for S3-backed reads. Callers that
+// read multiple ranges from the same open file can resolve this once and reuse
+// it. If the presigned URL expires, ReadObjectRange returns an error matched by
+// IsPresignExpired so callers can resolve a fresh target and retry.
+type ReadTarget struct {
+	ObjectURL string
 }
 
 type uploadBufferPool struct {
@@ -1035,6 +1041,12 @@ func (c *Client) uploadPartsV2(ctx context.Context, plan *uploadPlanV2, ra io.Re
 // errPresignExpired indicates S3 returned 403, likely due to an expired presigned URL.
 var errPresignExpired = fmt.Errorf("presigned URL expired")
 
+// IsPresignExpired reports whether err indicates a direct S3 presigned URL
+// expired and the caller should resolve a fresh URL before retrying.
+func IsPresignExpired(err error) bool {
+	return errors.Is(err, errPresignExpired)
+}
+
 // uploadOnePartV2 PUTs data to a presigned URL and returns the ETag.
 // Phase 1: no per-part checksum header — checksum negotiation deferred to #113/#114.
 // Returns errPresignExpired on 403 so callers can re-presign and retry.
@@ -1207,7 +1219,14 @@ func (c *Client) readWithoutRedirect(ctx context.Context, path string) (*http.Re
 	return noRedirectClient.Do(req)
 }
 
-func (c *Client) resolveReadTarget(ctx context.Context, path string) (*readTarget, error) {
+// ResolveReadTarget resolves a large S3-backed file path to a reusable object
+// URL. Inline files return an error matched by IsReadTargetNoRedirect because
+// there is no object URL to reuse.
+func (c *Client) ResolveReadTarget(ctx context.Context, path string) (*ReadTarget, error) {
+	return c.resolveReadTarget(ctx, path)
+}
+
+func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarget, error) {
 	resp, err := c.readWithoutRedirect(ctx, path)
 	if err != nil {
 		return nil, err
@@ -1220,7 +1239,7 @@ func (c *Client) resolveReadTarget(ctx context.Context, path string) (*readTarge
 		if location == "" {
 			return nil, fmt.Errorf("302 without Location header")
 		}
-		return &readTarget{objectURL: location}, nil
+		return &ReadTarget{ObjectURL: location}, nil
 
 	case resp.StatusCode >= 300:
 		return nil, readError(resp)
@@ -1228,6 +1247,16 @@ func (c *Client) resolveReadTarget(ctx context.Context, path string) (*readTarge
 	default:
 		return nil, errReadTargetNoRedirect
 	}
+}
+
+// ReadObjectRange reads a byte range from a previously resolved read target.
+// If the target's presigned object URL expired, the returned error matches
+// IsPresignExpired so callers can resolve a fresh target and retry.
+func (c *Client) ReadObjectRange(ctx context.Context, target *ReadTarget, offset, length int64) (io.ReadCloser, error) {
+	if target == nil || target.ObjectURL == "" {
+		return nil, fmt.Errorf("read target is required")
+	}
+	return c.readObjectRangeStrict(ctx, target.ObjectURL, offset, length)
 }
 
 func (c *Client) downloadToFileSequential(ctx context.Context, remotePath string, out *os.File) (*DownloadSummary, error) {
@@ -1318,6 +1347,9 @@ func (c *Client) readObjectRangeStrict(ctx context.Context, objectURL string, of
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
 		return resp.Body, nil
+	case http.StatusForbidden:
+		defer func() { _ = resp.Body.Close() }()
+		return nil, errPresignExpired
 	case http.StatusRequestedRangeNotSatisfiable:
 		defer func() { _ = resp.Body.Close() }()
 		return io.NopCloser(bytes.NewReader(nil)), nil
@@ -1378,7 +1410,7 @@ func (c *Client) DownloadToFileWithSummary(ctx context.Context, remotePath, loca
 
 	target, err := c.resolveReadTarget(ctx, remotePath)
 	if err != nil {
-		if errors.Is(err, errReadTargetNoRedirect) {
+		if IsReadTargetNoRedirect(err) {
 			// Keep large-file downloads working when the control plane serves the
 			// object inline instead of redirecting to object storage. In that case
 			// the parallel range path is unavailable, so fall back to ReadStream.
@@ -1402,7 +1434,7 @@ func (c *Client) DownloadToFileWithSummary(ctx context.Context, remotePath, loca
 	return summary, nil
 }
 
-func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, localPath string, out *os.File, size int64, target *readTarget) (*DownloadSummary, error) {
+func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, localPath string, out *os.File, size int64, target *ReadTarget) (*DownloadSummary, error) {
 	// Resolve the presigned object URL once, then reuse it for all range GETs in
 	// this download. This avoids paying one redirect / presign round-trip per
 	// chunk while keeping the existing server contract unchanged.
@@ -1422,6 +1454,7 @@ func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, loca
 	tasks := make(chan downloadRange, concurrency)
 	errCh := make(chan error, 1)
 	var wg sync.WaitGroup
+	var targetMu sync.RWMutex
 
 	reportErr := func(err error) {
 		select {
@@ -1429,6 +1462,23 @@ func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, loca
 			cancel()
 		default:
 		}
+	}
+
+	objectURL := func() string {
+		targetMu.RLock()
+		defer targetMu.RUnlock()
+		return target.ObjectURL
+	}
+
+	refreshTarget := func(ctx context.Context) error {
+		resolved, err := c.resolveReadTarget(ctx, remotePath)
+		if err != nil {
+			return err
+		}
+		targetMu.Lock()
+		target.ObjectURL = resolved.ObjectURL
+		targetMu.Unlock()
+		return nil
 	}
 
 	for i := 0; i < concurrency; i++ {
@@ -1440,7 +1490,14 @@ func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, loca
 					return
 				}
 
-				rc, err := c.readObjectRangeStrict(ctx, target.objectURL, task.offset, task.length)
+				rc, err := c.readObjectRangeStrict(ctx, objectURL(), task.offset, task.length)
+				if IsPresignExpired(err) {
+					if refreshErr := refreshTarget(ctx); refreshErr != nil {
+						reportErr(fmt.Errorf("refresh read target for %s: %w", remotePath, refreshErr))
+						return
+					}
+					rc, err = c.readObjectRangeStrict(ctx, objectURL(), task.offset, task.length)
+				}
 				if err != nil {
 					reportErr(err)
 					return

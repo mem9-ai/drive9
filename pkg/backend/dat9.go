@@ -1119,9 +1119,14 @@ func (b *Dat9Backend) CopyFileCtx(ctx context.Context, srcPath, dstPath string) 
 	if err := b.store.EnsureParentDirs(ctx, dstPath, b.genID); err != nil {
 		return err
 	}
-	return b.store.InsertNode(ctx, &datastore.FileNode{
-		NodeID: b.genID(), Path: dstPath, ParentPath: pathutil.ParentPath(dstPath),
-		Name: pathutil.BaseName(dstPath), FileID: srcNode.FileID, CreatedAt: time.Now(),
+	return b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
+			NodeID: b.genID(), Path: dstPath, ParentPath: pathutil.ParentPath(dstPath),
+			Name: pathutil.BaseName(dstPath), FileID: srcNode.FileID, CreatedAt: time.Now(),
+		}); err != nil {
+			return fmt.Errorf("insert copied node %q: %w", dstPath, err)
+		}
+		return nil
 	})
 }
 

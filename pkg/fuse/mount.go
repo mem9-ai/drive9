@@ -36,6 +36,7 @@ type MountOptions struct {
 	RemoteRoot            string        // remote subtree root (default "/"); set via "drive9 mount :/path /local"
 	CacheDir              string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
 	CacheSize             int64         // ReadCache max size in bytes (default 128MB)
+	ReadCacheMaxFileBytes int64         // largest single file admitted to ReadCache (default 1MiB)
 	DirTTL                time.Duration // DirCache TTL (default 10s)
 	AttrTTL               time.Duration // kernel attr cache TTL (default 60s)
 	EntryTTL              time.Duration // kernel entry cache TTL (default 60s)
@@ -66,6 +67,9 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.CacheSize <= 0 {
 		o.CacheSize = defaultReadCacheMaxSize
+	}
+	if o.ReadCacheMaxFileBytes <= 0 {
+		o.ReadCacheMaxFileBytes = defaultReadCacheMaxFileSize
 	}
 	if o.DirTTL <= 0 {
 		o.DirTTL = defaultDirCacheTTL

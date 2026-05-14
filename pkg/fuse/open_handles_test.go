@@ -5,6 +5,8 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/mem9-ai/dat9/pkg/client"
 )
 
 func TestOpenHandleIndexTracksByInodeAndPath(t *testing.T) {
@@ -115,6 +117,8 @@ func TestDat9FSFinishLocalRenameUpdatesOpenHandleIndex(t *testing.T) {
 	fh := &FileHandle{Ino: ino, Path: "/old.txt", Dirty: NewWriteBuffer("/old.txt", 0, 0)}
 	fh.Streamer = NewStreamUploader(fs.client, "/old.txt", -1, fs.remoteRoot())
 	fh.Prefetch = NewPrefetcher(fs.client, fs.remotePath("/old.txt"), 4)
+	fh.ReadTarget = &client.ReadTarget{ObjectURL: "http://old.example/object"}
+	fh.Prefetch.SetReadTarget(fh.ReadTarget)
 	fhID := fs.allocateFileHandle(fh)
 	defer fs.deleteFileHandle(fhID, fh)
 
@@ -143,5 +147,51 @@ func TestDat9FSFinishLocalRenameUpdatesOpenHandleIndex(t *testing.T) {
 	}
 	if got := fh.Prefetch.pathString(); got != "/new.txt" {
 		t.Fatalf("prefetch path = %q, want /new.txt", got)
+	}
+	if fh.ReadTarget != nil {
+		t.Fatal("file handle read target was not cleared")
+	}
+	fh.Prefetch.mu.Lock()
+	prefetchTarget := fh.Prefetch.target
+	fh.Prefetch.mu.Unlock()
+	if prefetchTarget != nil {
+		t.Fatal("prefetch read target was not cleared")
+	}
+}
+
+func TestDat9FSClearReadTargetsForPath(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	target := &client.ReadTarget{ObjectURL: "http://old.example/object"}
+	fh1 := &FileHandle{Ino: 10, Path: "/file.txt", ReadTarget: target}
+	fh1.Prefetch = NewPrefetcher(fs.client, fs.remotePath("/file.txt"), 4)
+	fh1.Prefetch.SetReadTarget(target)
+	fh2 := &FileHandle{Ino: 11, Path: "/other.txt", ReadTarget: target}
+	fh2.Prefetch = NewPrefetcher(fs.client, fs.remotePath("/other.txt"), 4)
+	fh2.Prefetch.SetReadTarget(target)
+	fs.allocateFileHandle(fh1)
+	fs.allocateFileHandle(fh2)
+
+	fs.clearReadTargetsForPath("/file.txt")
+
+	if fh1.ReadTarget != nil {
+		t.Fatal("matching handle read target was not cleared")
+	}
+	fh1.Prefetch.mu.Lock()
+	prefetchTarget := fh1.Prefetch.target
+	fh1.Prefetch.mu.Unlock()
+	if prefetchTarget != nil {
+		t.Fatal("matching prefetch read target was not cleared")
+	}
+	if fh2.ReadTarget == nil {
+		t.Fatal("non-matching handle read target was cleared")
+	}
+	fh2.Prefetch.mu.Lock()
+	prefetchTarget2 := fh2.Prefetch.target
+	fh2.Prefetch.mu.Unlock()
+	if prefetchTarget2 == nil {
+		t.Fatal("non-matching prefetch read target was cleared")
 	}
 }
