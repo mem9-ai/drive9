@@ -157,3 +157,32 @@ func TestDat9FSFinishLocalRenameUpdatesOpenHandleIndex(t *testing.T) {
 		t.Fatal("prefetch read target was not cleared")
 	}
 }
+
+func TestDat9FSClearReadTargetsForPath(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	target := &client.ReadTarget{ObjectURL: "http://old.example/object"}
+	fh1 := &FileHandle{Ino: 10, Path: "/file.txt", ReadTarget: target}
+	fh1.Prefetch = NewPrefetcher(fs.client, fs.remotePath("/file.txt"), 4)
+	fh1.Prefetch.SetReadTarget(target)
+	fh2 := &FileHandle{Ino: 11, Path: "/other.txt", ReadTarget: target}
+	fs.allocateFileHandle(fh1)
+	fs.allocateFileHandle(fh2)
+
+	fs.clearReadTargetsForPath("/file.txt")
+
+	if fh1.ReadTarget != nil {
+		t.Fatal("matching handle read target was not cleared")
+	}
+	fh1.Prefetch.mu.Lock()
+	prefetchTarget := fh1.Prefetch.target
+	fh1.Prefetch.mu.Unlock()
+	if prefetchTarget != nil {
+		t.Fatal("matching prefetch read target was not cleared")
+	}
+	if fh2.ReadTarget == nil {
+		t.Fatal("non-matching handle read target was cleared")
+	}
+}

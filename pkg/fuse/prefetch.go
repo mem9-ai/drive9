@@ -340,6 +340,10 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 		var err error
 		if target != nil {
 			rc, err = p.client.ReadObjectRange(ctx, target, offset, length)
+			if client.IsPresignExpired(err) {
+				p.SetReadTarget(nil)
+				rc, err = p.client.ReadStreamRange(ctx, fetchPath, offset, length)
+			}
 		} else {
 			rc, err = p.client.ReadStreamRange(ctx, fetchPath, offset, length)
 		}

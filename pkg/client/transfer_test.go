@@ -1499,6 +1499,20 @@ func TestResolveReadTargetAndReadObjectRange(t *testing.T) {
 	}
 }
 
+func TestReadObjectRangePresignExpired(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("expired"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	_, err := c.ReadObjectRange(context.Background(), &ReadTarget{ObjectURL: srv.URL}, 0, 4)
+	if !IsPresignExpired(err) {
+		t.Fatalf("ReadObjectRange error = %v, want presign expired", err)
+	}
+}
+
 func TestDownloadToFileWithSummaryReusesPresignedURL(t *testing.T) {
 	data := bytes.Repeat([]byte("ab"), downloadChunkSize/2)
 	data = append(data, []byte("tail")...)

@@ -6433,6 +6433,62 @@ func TestDoRangeReadBodyTimeoutReturnsForRetry(t *testing.T) {
 	}
 }
 
+func TestReadStreamRangeWithRetryRefreshesExpiredReadTarget(t *testing.T) {
+	var resolveCalls atomic.Int32
+	var expiredCalls atomic.Int32
+	var freshCalls atomic.Int32
+	data := []byte("0123456789")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/large.bin":
+			call := resolveCalls.Add(1)
+			token := "expired"
+			if call > 1 {
+				token = "fresh"
+			}
+			w.Header().Set("Location", fmt.Sprintf("http://%s/s3/%s", r.Host, token))
+			w.WriteHeader(http.StatusFound)
+		case "/s3/expired":
+			expiredCalls.Add(1)
+			w.WriteHeader(http.StatusForbidden)
+		case "/s3/fresh":
+			freshCalls.Add(1)
+			if got := r.Header.Get("Range"); got != "bytes=2-5" {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[2:6])
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fh := &FileHandle{Path: "/large.bin"}
+
+	got, n, err := fs.readStreamRangeWithRetry(context.Background(), "/large.bin", fh, 2, 4)
+	if err != nil {
+		t.Fatalf("readStreamRangeWithRetry: %v", err)
+	}
+	if n != 4 || string(got) != "2345" {
+		t.Fatalf("range read = %q, %d; want 2345, 4", got, n)
+	}
+	if resolveCalls.Load() != 2 {
+		t.Fatalf("resolve calls = %d, want 2", resolveCalls.Load())
+	}
+	if expiredCalls.Load() != 1 || freshCalls.Load() != 1 {
+		t.Fatalf("expired/fresh calls = %d/%d, want 1/1", expiredCalls.Load(), freshCalls.Load())
+	}
+	if fh.ReadTarget == nil || !strings.Contains(fh.ReadTarget.ObjectURL, "/s3/fresh") {
+		t.Fatalf("read target = %+v, want fresh target", fh.ReadTarget)
+	}
+}
+
 // TestDoRangeReadBodyTruncationReturnsError verifies that when a server sends
 // headers successfully but closes the connection mid-body (truncation),
 // doRangeRead surfaces an error instead of silently returning partial data.

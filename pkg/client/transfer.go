@@ -181,9 +181,8 @@ type downloadRange struct {
 
 // ReadTarget captures a resolved object URL for S3-backed reads. Callers that
 // read multiple ranges from the same open file can resolve this once and reuse
-// it until the handle is closed. The current readers assume this URL remains
-// valid for the lifetime of the operation; if it expires mid-transfer, the
-// range read fails instead of refreshing and retrying in place.
+// it. If the presigned URL expires, ReadObjectRange returns an error matched by
+// IsPresignExpired so callers can resolve a fresh target and retry.
 type ReadTarget struct {
 	ObjectURL string
 }
@@ -1035,6 +1034,12 @@ func (c *Client) uploadPartsV2(ctx context.Context, plan *uploadPlanV2, ra io.Re
 // errPresignExpired indicates S3 returned 403, likely due to an expired presigned URL.
 var errPresignExpired = fmt.Errorf("presigned URL expired")
 
+// IsPresignExpired reports whether err indicates a direct S3 presigned URL
+// expired and the caller should resolve a fresh URL before retrying.
+func IsPresignExpired(err error) bool {
+	return errors.Is(err, errPresignExpired)
+}
+
 // uploadOnePartV2 PUTs data to a presigned URL and returns the ETag.
 // Phase 1: no per-part checksum header — checksum negotiation deferred to #113/#114.
 // Returns errPresignExpired on 403 so callers can re-presign and retry.
@@ -1238,6 +1243,8 @@ func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarge
 }
 
 // ReadObjectRange reads a byte range from a previously resolved read target.
+// If the target's presigned object URL expired, the returned error matches
+// IsPresignExpired so callers can resolve a fresh target and retry.
 func (c *Client) ReadObjectRange(ctx context.Context, target *ReadTarget, offset, length int64) (io.ReadCloser, error) {
 	if target == nil || target.ObjectURL == "" {
 		return nil, fmt.Errorf("read target is required")
@@ -1333,6 +1340,9 @@ func (c *Client) readObjectRangeStrict(ctx context.Context, objectURL string, of
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
 		return resp.Body, nil
+	case http.StatusForbidden:
+		defer func() { _ = resp.Body.Close() }()
+		return nil, errPresignExpired
 	case http.StatusRequestedRangeNotSatisfiable:
 		defer func() { _ = resp.Body.Close() }()
 		return io.NopCloser(bytes.NewReader(nil)), nil
