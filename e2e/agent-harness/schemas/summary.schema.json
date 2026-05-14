@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Drive9 Agent Harness Summary",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "status",
+    "started_at",
+    "ended_at",
+    "duration_ms",
+    "cases",
+    "counts",
+    "artifacts",
+    "cleanup"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "agent-harness.v1"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "passed",
+        "failed",
+        "known_bugs_reproduced",
+        "inconclusive",
+        "harness_failed"
+      ]
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "ended_at": {
+      "type": "string"
+    },
+    "duration_ms": {
+      "type": "integer"
+    },
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "suite",
+          "expected_outcome",
+          "status"
+        ]
+      }
+    },
+    "counts": {
+      "type": "object"
+    },
+    "artifacts": {
+      "type": "object"
+    },
+    "cleanup": {
+      "type": "object"
+    }
+  }
+}
