@@ -1513,6 +1513,19 @@ func TestReadObjectRangePresignExpired(t *testing.T) {
 	}
 }
 
+func TestResolveReadTargetInlineFileErrorIsDetectable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("inline"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	_, err := c.ResolveReadTarget(context.Background(), "/small.txt")
+	if !IsReadTargetNoRedirect(err) {
+		t.Fatalf("ResolveReadTarget error = %v, want no-redirect sentinel", err)
+	}
+}
+
 func TestDownloadToFileWithSummaryReusesPresignedURL(t *testing.T) {
 	data := bytes.Repeat([]byte("ab"), downloadChunkSize/2)
 	data = append(data, []byte("tail")...)
@@ -1587,6 +1600,71 @@ func TestDownloadToFileWithSummaryReusesPresignedURL(t *testing.T) {
 		t.Fatalf("summary concurrency = %d, want 2", summary.Concurrency)
 	}
 
+	downloaded, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(downloaded, data) {
+		t.Fatal("downloaded file content mismatch")
+	}
+}
+
+func TestDownloadToFileWithSummaryRefreshesExpiredPresignedURL(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), downloadChunkSize)
+
+	var readRequests atomic.Int32
+	var expiredObjectRequests atomic.Int32
+	var freshObjectRequests atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/large.bin":
+			req := readRequests.Add(1)
+			token := "expired"
+			if req > 1 {
+				token = "fresh"
+			}
+			w.Header().Set("Location", fmt.Sprintf("http://%s/s3/presigned?token=%s", r.Host, token))
+			w.WriteHeader(http.StatusFound)
+		case "/s3/presigned":
+			switch r.URL.Query().Get("token") {
+			case "expired":
+				expiredObjectRequests.Add(1)
+				w.WriteHeader(http.StatusForbidden)
+			case "fresh":
+				freshObjectRequests.Add(1)
+				if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=0-%d", len(data)-1) {
+					http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+					return
+				}
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data)))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(data)
+			default:
+				http.Error(w, "missing token", http.StatusBadRequest)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	localPath := filepath.Join(t.TempDir(), "large.bin")
+	c := New(srv.URL, "")
+
+	_, err := c.DownloadToFileWithSummary(context.Background(), "/large.bin", localPath, int64(len(data)))
+	if err != nil {
+		t.Fatalf("DownloadToFileWithSummary: %v", err)
+	}
+	if got := readRequests.Load(); got != 2 {
+		t.Fatalf("expected initial resolve plus refresh, got %d /v1/fs requests", got)
+	}
+	if got := expiredObjectRequests.Load(); got != 1 {
+		t.Fatalf("expected one expired object request, got %d", got)
+	}
+	if got := freshObjectRequests.Load(); got != 1 {
+		t.Fatalf("expected one fresh object request, got %d", got)
+	}
 	downloaded, err := os.ReadFile(localPath)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)

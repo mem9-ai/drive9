@@ -5,6 +5,7 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
@@ -168,6 +169,8 @@ func TestDat9FSClearReadTargetsForPath(t *testing.T) {
 	fh1.Prefetch = NewPrefetcher(fs.client, fs.remotePath("/file.txt"), 4)
 	fh1.Prefetch.SetReadTarget(target)
 	fh2 := &FileHandle{Ino: 11, Path: "/other.txt", ReadTarget: target}
+	fh2.Prefetch = NewPrefetcher(fs.client, fs.remotePath("/other.txt"), 4)
+	fh2.Prefetch.SetReadTarget(target)
 	fs.allocateFileHandle(fh1)
 	fs.allocateFileHandle(fh2)
 
@@ -184,5 +187,11 @@ func TestDat9FSClearReadTargetsForPath(t *testing.T) {
 	}
 	if fh2.ReadTarget == nil {
 		t.Fatal("non-matching handle read target was cleared")
+	}
+	fh2.Prefetch.mu.Lock()
+	prefetchTarget2 := fh2.Prefetch.target
+	fh2.Prefetch.mu.Unlock()
+	if prefetchTarget2 == nil {
+		t.Fatal("non-matching prefetch read target was cleared")
 	}
 }

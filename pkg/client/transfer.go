@@ -135,6 +135,13 @@ const (
 
 var errReadTargetNoRedirect = errors.New("parallel download unavailable without redirect")
 
+// IsReadTargetNoRedirect reports whether err indicates that a read target could
+// not be resolved because the server returned an inline file body instead of a
+// redirect to object storage.
+func IsReadTargetNoRedirect(err error) bool {
+	return errors.Is(err, errReadTargetNoRedirect)
+}
+
 // DownloadSummary exposes the coarse-grained large-file download metrics that
 // the CLI emits as a structured log event when CLI logging is enabled.
 type DownloadSummary struct {
@@ -1213,8 +1220,8 @@ func (c *Client) readWithoutRedirect(ctx context.Context, path string) (*http.Re
 }
 
 // ResolveReadTarget resolves a large S3-backed file path to a reusable object
-// URL. Inline files return errReadTargetNoRedirect because there is no object
-// URL to reuse.
+// URL. Inline files return an error matched by IsReadTargetNoRedirect because
+// there is no object URL to reuse.
 func (c *Client) ResolveReadTarget(ctx context.Context, path string) (*ReadTarget, error) {
 	return c.resolveReadTarget(ctx, path)
 }
@@ -1403,7 +1410,7 @@ func (c *Client) DownloadToFileWithSummary(ctx context.Context, remotePath, loca
 
 	target, err := c.resolveReadTarget(ctx, remotePath)
 	if err != nil {
-		if errors.Is(err, errReadTargetNoRedirect) {
+		if IsReadTargetNoRedirect(err) {
 			// Keep large-file downloads working when the control plane serves the
 			// object inline instead of redirecting to object storage. In that case
 			// the parallel range path is unavailable, so fall back to ReadStream.
@@ -1447,6 +1454,7 @@ func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, loca
 	tasks := make(chan downloadRange, concurrency)
 	errCh := make(chan error, 1)
 	var wg sync.WaitGroup
+	var targetMu sync.RWMutex
 
 	reportErr := func(err error) {
 		select {
@@ -1454,6 +1462,23 @@ func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, loca
 			cancel()
 		default:
 		}
+	}
+
+	objectURL := func() string {
+		targetMu.RLock()
+		defer targetMu.RUnlock()
+		return target.ObjectURL
+	}
+
+	refreshTarget := func(ctx context.Context) error {
+		resolved, err := c.resolveReadTarget(ctx, remotePath)
+		if err != nil {
+			return err
+		}
+		targetMu.Lock()
+		target.ObjectURL = resolved.ObjectURL
+		targetMu.Unlock()
+		return nil
 	}
 
 	for i := 0; i < concurrency; i++ {
@@ -1465,7 +1490,14 @@ func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, loca
 					return
 				}
 
-				rc, err := c.readObjectRangeStrict(ctx, target.ObjectURL, task.offset, task.length)
+				rc, err := c.readObjectRangeStrict(ctx, objectURL(), task.offset, task.length)
+				if IsPresignExpired(err) {
+					if refreshErr := refreshTarget(ctx); refreshErr != nil {
+						reportErr(fmt.Errorf("refresh read target for %s: %w", remotePath, refreshErr))
+						return
+					}
+					rc, err = c.readObjectRangeStrict(ctx, objectURL(), task.offset, task.length)
+				}
 				if err != nil {
 					reportErr(err)
 					return
