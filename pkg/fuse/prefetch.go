@@ -50,6 +50,7 @@ type Prefetcher struct {
 	cache      map[int64]*prefetchBlock
 	inflight   map[int64]bool
 	client     *client.Client
+	target     *client.ReadTarget
 	path       atomic.Value
 	fileSize   int64
 	cancel     context.CancelFunc // cancels all inflight prefetch goroutines
@@ -83,6 +84,15 @@ func NewPrefetcher(c *client.Client, path string, fileSize int64, debug ...bool)
 
 func (p *Prefetcher) SetPerfCounters(perf *fusePerfCounters) {
 	p.perf = perf
+}
+
+func (p *Prefetcher) SetReadTarget(target *client.ReadTarget) {
+	if p == nil || target == nil {
+		return
+	}
+	p.mu.Lock()
+	p.target = target
+	p.mu.Unlock()
 }
 
 func (p *Prefetcher) SetPath(path string) {
@@ -313,6 +323,7 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 	// Mark the fetch start as inflight (not each chunk — OnRead checks start offset).
 	p.inflight[offset] = true
 	fetchPath := p.pathString()
+	target := p.target
 	p.debugf("start path=%s offset=%d length=%d chunk_size=%d chunks=%d window=%d", fetchPath, offset, length, chunkSize, nChunks, p.window)
 
 	ctx := p.ctx
@@ -325,7 +336,13 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 			close(ready)
 		}()
 
-		rc, err := p.client.ReadStreamRange(ctx, fetchPath, offset, length)
+		var rc io.ReadCloser
+		var err error
+		if target != nil {
+			rc, err = p.client.ReadObjectRange(ctx, target, offset, length)
+		} else {
+			rc, err = p.client.ReadStreamRange(ctx, fetchPath, offset, length)
+		}
 		if err != nil {
 			if p.perf != nil {
 				p.perf.recordRemoteOp(perfRemoteRead, err, time.Since(start), 0)

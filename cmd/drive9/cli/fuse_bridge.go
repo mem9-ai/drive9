@@ -18,6 +18,7 @@ type mountFuseOptions struct {
 	RemoteRoot            string
 	CacheDir              string
 	CacheSize             int64
+	ReadCacheMaxFileBytes int64
 	DirTTL                time.Duration
 	AttrTTL               time.Duration
 	EntryTTL              time.Duration

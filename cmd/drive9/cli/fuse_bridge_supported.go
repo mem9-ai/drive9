@@ -30,6 +30,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		RemoteRoot:            opts.RemoteRoot,
 		CacheDir:              opts.CacheDir,
 		CacheSize:             opts.CacheSize,
+		ReadCacheMaxFileBytes: opts.ReadCacheMaxFileBytes,
 		DirTTL:                opts.DirTTL,
 		AttrTTL:               opts.AttrTTL,
 		EntryTTL:              opts.EntryTTL,

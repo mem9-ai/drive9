@@ -18,10 +18,11 @@ const (
 	// /v1/status on the dat9 client and propagated through FS.smallFileMax.
 	defaultSmallFileThreshold = 50_000
 	// defaultReadCacheMaxFileSize is deliberately larger than the inline
-	// fallback so medium-small files do not miss userspace cache solely because
-	// their server inline threshold is higher. The aggregate cache cap still
-	// bounds memory use.
-	defaultReadCacheMaxFileSize = 256 << 10
+	// fallback so medium files do not miss userspace cache solely because
+	// their server inline threshold is lower. The aggregate cache cap still
+	// bounds memory use. Keeping this at 1MiB covers common benchmark and
+	// editor workloads without turning the cache into an unbounded object store.
+	defaultReadCacheMaxFileSize = 1 << 20
 )
 
 // cacheEntry holds a single cached file's data and metadata.
@@ -33,8 +34,8 @@ type cacheEntry struct {
 	elem     *list.Element // position in LRU list
 }
 
-// ReadCache is a thread-safe LRU + TTL read cache for small files.
-// It only caches files whose size does not exceed smallFileThreshold (50KB).
+// ReadCache is a thread-safe LRU + TTL read cache for small and medium files.
+// It only caches files whose size does not exceed the per-cache maxFile limit.
 // Entries are evicted when the total cached size exceeds maxSize or when
 // their TTL expires.
 type ReadCache struct {
@@ -43,6 +44,7 @@ type ReadCache struct {
 	order   *list.List // front = most recently used
 	size    int64      // current total bytes cached
 	maxSize int64
+	maxFile int64
 	ttl     time.Duration
 }
 
@@ -50,18 +52,36 @@ type ReadCache struct {
 // If maxSize <= 0, defaultReadCacheMaxSize (128MB) is used.
 // If ttl <= 0, defaultReadCacheTTL (30s) is used.
 func NewReadCache(maxSize int64, ttl time.Duration) *ReadCache {
+	return NewReadCacheWithMaxFileSize(maxSize, ttl, 0)
+}
+
+// NewReadCacheWithMaxFileSize creates a ReadCache with an explicit per-file
+// admission limit. If maxFileSize <= 0, defaultReadCacheMaxFileSize is used.
+func NewReadCacheWithMaxFileSize(maxSize int64, ttl time.Duration, maxFileSize int64) *ReadCache {
 	if maxSize <= 0 {
 		maxSize = defaultReadCacheMaxSize
 	}
 	if ttl <= 0 {
 		ttl = defaultReadCacheTTL
 	}
+	if maxFileSize <= 0 {
+		maxFileSize = defaultReadCacheMaxFileSize
+	}
 	return &ReadCache{
 		items:   make(map[string]*cacheEntry),
 		order:   list.New(),
 		maxSize: maxSize,
+		maxFile: maxFileSize,
 		ttl:     ttl,
 	}
+}
+
+// MaxFileSize returns the largest payload admitted into this cache.
+func (rc *ReadCache) MaxFileSize() int64 {
+	if rc == nil || rc.maxFile <= 0 {
+		return defaultReadCacheMaxFileSize
+	}
+	return rc.maxFile
 }
 
 // Get returns cached data for the given path if the entry exists, has not
@@ -102,7 +122,7 @@ func (rc *ReadCache) Get(path string, currentRevision int64) ([]byte, bool) {
 }
 
 // Put stores data in the cache for the given path and revision. Only files
-// whose size does not exceed defaultReadCacheMaxFileSize are cached. The cache
+// whose size does not exceed the cache's per-file limit are cached. The cache
 // limit is intentionally a static memory-pressure cap rather than a mirror
 // of the server's inline_threshold; raising the latter should not silently
 // expand FUSE's per-mount RAM footprint. If an entry for the path already
@@ -119,7 +139,7 @@ func (rc *ReadCache) PutOwned(path string, data []byte, revision int64) {
 }
 
 func (rc *ReadCache) put(path string, data []byte, revision int64, clone bool) {
-	if len(data) > defaultReadCacheMaxFileSize {
+	if int64(len(data)) > rc.MaxFileSize() {
 		return
 	}
 

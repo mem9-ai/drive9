@@ -174,7 +174,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		fileHandles:   NewHandleTable[*FileHandle](),
 		openHandles:   NewOpenHandleIndex(),
 		dirHandles:    NewHandleTable[*DirHandle](),
-		readCache:     NewReadCache(opts.CacheSize, 0),
+		readCache:     NewReadCacheWithMaxFileSize(opts.CacheSize, 0, opts.ReadCacheMaxFileBytes),
 		dirCache:      NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
 		dirtyInodes:   make(map[uint64]dirtyInodeState),
 		uid:           uint32(os.Getuid()),
@@ -546,7 +546,7 @@ func (fs *Dat9FS) preloadWritableHandleFromReadCacheLocked(fh *FileHandle) bool 
 	if fs.readCache == nil || fh == nil || fh.Dirty == nil {
 		return false
 	}
-	if fh.OrigSize <= 0 || fh.OrigSize > defaultReadCacheMaxFileSize || fh.BaseRev <= 0 {
+	if fh.OrigSize <= 0 || fh.OrigSize > fs.readCache.MaxFileSize() || fh.BaseRev <= 0 {
 		return false
 	}
 
@@ -969,14 +969,45 @@ func (fs *Dat9FS) readSmallFileWithRetry(ctx context.Context, path string) ([]by
 	return nil, fmt.Errorf("%w: %s: %v", errReadRetriesExhausted, path, lastErr)
 }
 
+func (fs *Dat9FS) readTargetForHandle(ctx context.Context, fh *FileHandle) *client.ReadTarget {
+	if fs == nil || fs.client == nil || fh == nil || fh.Dirty != nil {
+		return nil
+	}
+	fh.Lock()
+	target := fh.ReadTarget
+	remotePath := fs.remotePath(fh.Path)
+	fh.Unlock()
+	if target != nil {
+		return target
+	}
+
+	resolved, err := fs.client.ResolveReadTarget(ctx, remotePath)
+	if err != nil {
+		// Fall back to the ordinary read path. This preserves inline-file and
+		// transient-error behavior while still optimizing the common S3 case.
+		return nil
+	}
+
+	fh.Lock()
+	if fh.ReadTarget == nil {
+		fh.ReadTarget = resolved
+		if fh.Prefetch != nil {
+			fh.Prefetch.SetReadTarget(resolved)
+		}
+	}
+	target = fh.ReadTarget
+	fh.Unlock()
+	return target
+}
+
 // readStreamRangeWithRetry performs a range read with bounded detached retry
 // on transient failures. Wraps both the ReadStreamRange open and io.ReadFull
 // body read as a single retriable unit. On body-stage transient failure, the
 // stream is reopened from scratch on retry.
 // Returns (data, nil) on success. On exhausted retries, the returned error
 // is a wrapped sentinel so the caller can map it to EIO.
-func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, offset, size int64) ([]byte, int, error) {
-	data, n, err := fs.doRangeRead(ctx, path, offset, size)
+func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, target *client.ReadTarget, offset, size int64) ([]byte, int, error) {
+	data, n, err := fs.doRangeRead(ctx, path, target, offset, size)
 	if err == nil || !isTransientReadErr(err) {
 		return data, n, err
 	}
@@ -987,7 +1018,7 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, off
 	lastErr := err
 	for range readTransientRetryCount {
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), readTransientRetryTimeout)
-		data, n, err = fs.doRangeRead(retryCtx, path, offset, size)
+		data, n, err = fs.doRangeRead(retryCtx, path, target, offset, size)
 		retryCancel()
 		if err == nil {
 			if fs.perf != nil {
@@ -1009,9 +1040,15 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, off
 // doRangeRead performs a single range read attempt: open stream + read body.
 // All body read errors (including truncation) are returned as-is so the
 // caller can classify them for retry.
-func (fs *Dat9FS) doRangeRead(ctx context.Context, path string, offset, size int64) ([]byte, int, error) {
+func (fs *Dat9FS) doRangeRead(ctx context.Context, path string, target *client.ReadTarget, offset, size int64) ([]byte, int, error) {
 	readStart := fs.perfStart()
-	rc, err := fs.client.ReadStreamRange(ctx, fs.remotePath(path), offset, size)
+	var rc io.ReadCloser
+	var err error
+	if target != nil {
+		rc, err = fs.client.ReadObjectRange(ctx, target, offset, size)
+	} else {
+		rc, err = fs.client.ReadStreamRange(ctx, fs.remotePath(path), offset, size)
+	}
 	if err != nil {
 		fs.perfRecordRemote(perfRemoteRead, readStart, err, 0)
 		return nil, 0, err
@@ -2956,7 +2993,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	// Set up read prefetcher for read-only opens on large files.
 	if fh.Dirty == nil {
 		entry, _ := fs.inodes.GetEntry(input.NodeId)
-		if entry != nil && entry.Size > fs.inlineThreshold() {
+		if entry != nil && entry.Size > fs.readCache.MaxFileSize() {
 			fh.Prefetch = NewPrefetcher(fs.client, fs.remotePath(p), entry.Size, fs.debugEnabled())
 			fh.Prefetch.SetPerfCounters(fs.perf)
 		}
@@ -3293,7 +3330,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// InodeEntry has a stored revision from the last Lookup/GetAttr, pass
 	// it to the cache for validation. Cache hit only if revision matches.
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
-	if entry != nil && entry.Size <= defaultReadCacheMaxFileSize && entry.Size > 0 {
+	if entry != nil && entry.Size <= fs.readCache.MaxFileSize() && entry.Size > 0 {
 		cacheRev := entry.Revision // use revision from last Stat/Lookup
 		// Fast path: serve from cache without any HTTP call.
 		if data, ok := fs.readCache.Get(p, cacheRev); ok {
@@ -3353,7 +3390,8 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		source = "range-read"
 	}
 	rangeStart := time.Now()
-	data, n, err := fs.readStreamRangeWithRetry(ctx, p, int64(input.Offset), int64(input.Size))
+	target := fs.readTargetForHandle(ctx, fh)
+	data, n, err := fs.readStreamRangeWithRetry(ctx, p, target, int64(input.Offset), int64(input.Size))
 	if err != nil {
 		fs.debugf("read range error path=%s off=%d req=%d got=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, n, source, time.Since(rangeStart), err)
 		if errors.Is(err, errReadRetriesExhausted) {
@@ -4520,7 +4558,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 	if committedRev > 0 && entry.Inode > 0 {
 		// Seed readCache from shadow data before the shadow file is removed.
 		// Only attempt for files under the readCache size limit.
-		if entry.Size <= int64(defaultReadCacheMaxFileSize) && fs.shadowStore != nil {
+		if entry.Size <= fs.readCache.MaxFileSize() && fs.shadowStore != nil {
 			if data, err := fs.shadowStore.ReadAll(entry.Path); err == nil {
 				fs.readCache.PutOwned(entry.Path, data, committedRev)
 			}

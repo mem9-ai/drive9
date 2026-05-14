@@ -179,13 +179,13 @@ type downloadRange struct {
 	length int64
 }
 
-// readTarget captures the presigned object URL resolved from the control
-// plane for one large-file download. The current parallel downloader assumes
-// this URL remains valid for the lifetime of the download; if it expires mid-
-// transfer we fail the download instead of refreshing and retrying in place.
-// Follow-up: #138.
-type readTarget struct {
-	objectURL string
+// ReadTarget captures a resolved object URL for S3-backed reads. Callers that
+// read multiple ranges from the same open file can resolve this once and reuse
+// it until the handle is closed. The current readers assume this URL remains
+// valid for the lifetime of the operation; if it expires mid-transfer, the
+// range read fails instead of refreshing and retrying in place.
+type ReadTarget struct {
+	ObjectURL string
 }
 
 type uploadBufferPool struct {
@@ -1207,7 +1207,14 @@ func (c *Client) readWithoutRedirect(ctx context.Context, path string) (*http.Re
 	return noRedirectClient.Do(req)
 }
 
-func (c *Client) resolveReadTarget(ctx context.Context, path string) (*readTarget, error) {
+// ResolveReadTarget resolves a large S3-backed file path to a reusable object
+// URL. Inline files return errReadTargetNoRedirect because there is no object
+// URL to reuse.
+func (c *Client) ResolveReadTarget(ctx context.Context, path string) (*ReadTarget, error) {
+	return c.resolveReadTarget(ctx, path)
+}
+
+func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarget, error) {
 	resp, err := c.readWithoutRedirect(ctx, path)
 	if err != nil {
 		return nil, err
@@ -1220,7 +1227,7 @@ func (c *Client) resolveReadTarget(ctx context.Context, path string) (*readTarge
 		if location == "" {
 			return nil, fmt.Errorf("302 without Location header")
 		}
-		return &readTarget{objectURL: location}, nil
+		return &ReadTarget{ObjectURL: location}, nil
 
 	case resp.StatusCode >= 300:
 		return nil, readError(resp)
@@ -1228,6 +1235,14 @@ func (c *Client) resolveReadTarget(ctx context.Context, path string) (*readTarge
 	default:
 		return nil, errReadTargetNoRedirect
 	}
+}
+
+// ReadObjectRange reads a byte range from a previously resolved read target.
+func (c *Client) ReadObjectRange(ctx context.Context, target *ReadTarget, offset, length int64) (io.ReadCloser, error) {
+	if target == nil || target.ObjectURL == "" {
+		return nil, fmt.Errorf("read target is required")
+	}
+	return c.readObjectRangeStrict(ctx, target.ObjectURL, offset, length)
 }
 
 func (c *Client) downloadToFileSequential(ctx context.Context, remotePath string, out *os.File) (*DownloadSummary, error) {
@@ -1402,7 +1417,7 @@ func (c *Client) DownloadToFileWithSummary(ctx context.Context, remotePath, loca
 	return summary, nil
 }
 
-func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, localPath string, out *os.File, size int64, target *readTarget) (*DownloadSummary, error) {
+func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, localPath string, out *os.File, size int64, target *ReadTarget) (*DownloadSummary, error) {
 	// Resolve the presigned object URL once, then reuse it for all range GETs in
 	// this download. This avoids paying one redirect / presign round-trip per
 	// chunk while keeping the existing server contract unchanged.
@@ -1440,7 +1455,7 @@ func (c *Client) downloadLargeFileParallel(ctx context.Context, remotePath, loca
 					return
 				}
 
-				rc, err := c.readObjectRangeStrict(ctx, target.objectURL, task.offset, task.length)
+				rc, err := c.readObjectRangeStrict(ctx, target.ObjectURL, task.offset, task.length)
 				if err != nil {
 					reportErr(err)
 					return

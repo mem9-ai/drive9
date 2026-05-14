@@ -1520,17 +1520,12 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var fileID sql.NullString
-	var isDir bool
-	err = tx.QueryRow(`SELECT file_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, path).Scan(&fileID, &isDir)
+	candidate, err := s.scanDeleteCandidateTx(tx, path)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
 		return nil, err
 	}
 
-	if isDir {
+	if candidate.isDir {
 		return nil, ErrNotFound
 	}
 
@@ -1538,12 +1533,12 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 		return nil, err
 	}
 
-	if !fileID.Valid || fileID.String == "" {
+	if candidate.fileID == "" {
 		return nil, tx.Commit()
 	}
 
 	var count int64
-	err = tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE file_id = ? FOR UPDATE`, fileID.String).Scan(&count)
+	err = tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE file_id = ? FOR UPDATE`, candidate.fileID).Scan(&count)
 	if err != nil {
 		return nil, err
 	}
@@ -1552,23 +1547,19 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 		return nil, tx.Commit()
 	}
 
-	if s.useLegacyFiles {
-		if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fileID.String); err != nil {
-			return nil, err
-		}
+	if candidate.file == nil {
+		return nil, ErrNotFound
 	}
-	if _, err := tx.Exec(`UPDATE inodes SET status = 'DELETED' WHERE inode_id = ?`, fileID.String); err != nil {
+
+	if err := s.markFilesDeletedTx(tx, []string{candidate.fileID}); err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(`DELETE FROM file_tags WHERE file_id = ?`, fileID.String); err != nil {
+	if err := deleteFileTagsByIDsTx(tx, []string{candidate.fileID}); err != nil {
 		return nil, err
 	}
 
-	f, err := s.scanFileForGCTx(tx, fileID.String)
-	if err != nil {
-		return nil, err
-	}
-	task, err := NewFileGCTaskFromFile(f, time.Now().UTC())
+	candidate.file.Status = StatusDeleted
+	task, err := NewFileGCTaskFromFile(candidate.file, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -1579,7 +1570,7 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	out = f
+	out = candidate.file
 	return out, nil
 }
 
@@ -1614,30 +1605,22 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		return nil, err
 	}
 
-	var orphaned []*File
-	for _, fid := range fileIDs {
-		var count int64
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE file_id = ?`, fid).Scan(&count); err != nil {
-			return nil, err
-		}
-		if count > 0 {
-			continue
-		}
-		if s.useLegacyFiles {
-			if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id = ?`, fid); err != nil {
-				return nil, err
-			}
-		}
-		if _, err := tx.Exec(`UPDATE inodes SET status = 'DELETED' WHERE inode_id = ?`, fid); err != nil {
-			return nil, err
-		}
-		if _, err := tx.Exec(`DELETE FROM file_tags WHERE file_id = ?`, fid); err != nil {
-			return nil, err
-		}
-		f, err := s.scanFileForGCTx(tx, fid)
-		if err != nil {
-			return nil, err
-		}
+	orphaned, err := s.scanOrphanedFilesByIDTx(tx, fileIDs)
+	if err != nil {
+		return nil, err
+	}
+	orphanIDs := make([]string, 0, len(orphaned))
+	for _, f := range orphaned {
+		orphanIDs = append(orphanIDs, f.FileID)
+	}
+	if err := s.markFilesDeletedTx(tx, orphanIDs); err != nil {
+		return nil, err
+	}
+	if err := deleteFileTagsByIDsTx(tx, orphanIDs); err != nil {
+		return nil, err
+	}
+
+	for _, f := range orphaned {
 		task, err := NewFileGCTaskFromFile(f, time.Now().UTC())
 		if err != nil {
 			return nil, err
@@ -1645,7 +1628,6 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		if _, err := s.EnqueueFileGCTaskTx(tx, task); err != nil {
 			return nil, err
 		}
-		orphaned = append(orphaned, f)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -1653,6 +1635,230 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 	}
 	out = orphaned
 	return out, nil
+}
+
+type deleteCandidate struct {
+	fileID string
+	isDir  bool
+	file   *File
+}
+
+func (s *Store) scanDeleteCandidateTx(tx *sql.Tx, path string) (*deleteCandidate, error) {
+	if s.useLegacyFiles {
+		row := tx.QueryRow(`SELECT fn.file_id, fn.is_directory,
+			f.file_id, f.storage_type, f.storage_ref, f.storage_encryption_mode,
+			f.storage_encryption_key_id, f.content_type, f.size_bytes, f.checksum_sha256,
+			f.revision, f.embedding_revision, f.status, f.source_id, f.created_at, f.confirmed_at, f.expires_at
+			FROM file_nodes fn
+			LEFT JOIN files f ON f.file_id = fn.file_id
+			WHERE fn.path = ?
+			FOR UPDATE`, path)
+		return scanLegacyDeleteCandidate(row)
+	}
+	row := tx.QueryRow(`SELECT fn.file_id, fn.is_directory,
+		c.storage_type, c.storage_ref, i.size_bytes, COALESCE(c.content_type, ''),
+		s.embedding_revision
+		FROM file_nodes fn
+		LEFT JOIN inodes i ON i.inode_id = fn.file_id
+		LEFT JOIN contents c ON c.inode_id = fn.file_id
+		LEFT JOIN semantic s ON s.inode_id = fn.file_id
+		WHERE fn.path = ?
+		FOR UPDATE`, path)
+	return scanSplitDeleteCandidate(row)
+}
+
+func scanLegacyDeleteCandidate(row *sql.Row) (*deleteCandidate, error) {
+	var nodeFileID sql.NullString
+	var isDir bool
+	var fFileID, storageType, storageRef, encMode, encKeyID sql.NullString
+	var contentType, checksum, status, sourceID sql.NullString
+	var sizeBytes, revision, embeddingRevision sql.NullInt64
+	var createdAt, confirmedAt, expiresAt sql.NullTime
+	err := row.Scan(&nodeFileID, &isDir,
+		&fFileID, &storageType, &storageRef, &encMode, &encKeyID,
+		&contentType, &sizeBytes, &checksum, &revision, &embeddingRevision,
+		&status, &sourceID, &createdAt, &confirmedAt, &expiresAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	c := &deleteCandidate{fileID: nodeFileID.String, isDir: isDir}
+	if fFileID.Valid {
+		c.file = fileFromLegacyGCScan(fFileID.String, storageType, storageRef, encMode, encKeyID,
+			contentType, sizeBytes, checksum, revision, embeddingRevision, status,
+			sourceID, createdAt, confirmedAt, expiresAt)
+	}
+	return c, nil
+}
+
+func scanSplitDeleteCandidate(row *sql.Row) (*deleteCandidate, error) {
+	var nodeFileID sql.NullString
+	var isDir bool
+	var storageType, storageRef, contentType sql.NullString
+	var sizeBytes, embeddingRevision sql.NullInt64
+	err := row.Scan(&nodeFileID, &isDir, &storageType, &storageRef, &sizeBytes, &contentType, &embeddingRevision)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	c := &deleteCandidate{fileID: nodeFileID.String, isDir: isDir}
+	if nodeFileID.Valid && storageType.Valid {
+		f := &File{
+			FileID:      nodeFileID.String,
+			StorageType: StorageType(storageType.String),
+			StorageRef:  storageRef.String,
+			ContentType: contentType.String,
+			SizeBytes:   sizeBytes.Int64,
+			Status:      StatusDeleted,
+		}
+		if embeddingRevision.Valid {
+			rev := embeddingRevision.Int64
+			f.EmbeddingRevision = &rev
+		}
+		c.file = f
+	}
+	return c, nil
+}
+
+func (s *Store) scanOrphanedFilesByIDTx(tx *sql.Tx, fileIDs []string) ([]*File, error) {
+	if len(fileIDs) == 0 {
+		return nil, nil
+	}
+	args := stringsToAny(fileIDs)
+	placeholders := questionPlaceholders(len(fileIDs))
+	var query string
+	if s.useLegacyFiles {
+		query = `SELECT f.file_id, f.storage_type, f.storage_ref, f.storage_encryption_mode,
+			f.storage_encryption_key_id, f.content_type, f.size_bytes, f.checksum_sha256,
+			f.revision, f.embedding_revision, f.status, f.source_id, f.created_at, f.confirmed_at, f.expires_at
+			FROM files f
+			WHERE f.file_id IN (` + placeholders + `)
+			  AND NOT EXISTS (SELECT 1 FROM file_nodes fn WHERE fn.file_id = f.file_id)`
+	} else {
+		query = `SELECT i.inode_id, c.storage_type, c.storage_ref, i.size_bytes,
+			COALESCE(c.content_type, ''), s.embedding_revision
+			FROM inodes i
+			JOIN contents c ON c.inode_id = i.inode_id
+			LEFT JOIN semantic s ON s.inode_id = i.inode_id
+			WHERE i.inode_id IN (` + placeholders + `)
+			  AND NOT EXISTS (SELECT 1 FROM file_nodes fn WHERE fn.file_id = i.inode_id)`
+	}
+	rows, err := tx.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []*File
+	for rows.Next() {
+		var f *File
+		if s.useLegacyFiles {
+			var fileID, storageType, storageRef, encMode, encKeyID sql.NullString
+			var contentType, checksum, status, sourceID sql.NullString
+			var sizeBytes, revision, embeddingRevision sql.NullInt64
+			var createdAt, confirmedAt, expiresAt sql.NullTime
+			if err := rows.Scan(&fileID, &storageType, &storageRef, &encMode, &encKeyID,
+				&contentType, &sizeBytes, &checksum, &revision, &embeddingRevision,
+				&status, &sourceID, &createdAt, &confirmedAt, &expiresAt); err != nil {
+				return nil, err
+			}
+			f = fileFromLegacyGCScan(fileID.String, storageType, storageRef, encMode, encKeyID,
+				contentType, sizeBytes, checksum, revision, embeddingRevision, status,
+				sourceID, createdAt, confirmedAt, expiresAt)
+			f.Status = StatusDeleted
+		} else {
+			var fileID, storageType, storageRef, contentType sql.NullString
+			var sizeBytes, embeddingRevision sql.NullInt64
+			if err := rows.Scan(&fileID, &storageType, &storageRef, &sizeBytes, &contentType, &embeddingRevision); err != nil {
+				return nil, err
+			}
+			f = &File{
+				FileID:      fileID.String,
+				StorageType: StorageType(storageType.String),
+				StorageRef:  storageRef.String,
+				ContentType: contentType.String,
+				SizeBytes:   sizeBytes.Int64,
+				Status:      StatusDeleted,
+			}
+			if embeddingRevision.Valid {
+				rev := embeddingRevision.Int64
+				f.EmbeddingRevision = &rev
+			}
+		}
+		out = append(out, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func fileFromLegacyGCScan(fileID string, storageType, storageRef, encMode, encKeyID, contentType sql.NullString, sizeBytes sql.NullInt64, checksum sql.NullString, revision, embeddingRevision sql.NullInt64, status, sourceID sql.NullString, createdAt, confirmedAt, expiresAt sql.NullTime) *File {
+	f := &File{
+		FileID:                 fileID,
+		StorageType:            StorageType(storageType.String),
+		StorageRef:             storageRef.String,
+		StorageEncryptionMode:  StorageEncryptionMode(encMode.String),
+		StorageEncryptionKeyID: encKeyID.String,
+		ContentType:            contentType.String,
+		SizeBytes:              sizeBytes.Int64,
+		ChecksumSHA256:         checksum.String,
+		Revision:               revision.Int64,
+		Status:                 FileStatus(status.String),
+		SourceID:               sourceID.String,
+	}
+	if embeddingRevision.Valid {
+		rev := embeddingRevision.Int64
+		f.EmbeddingRevision = &rev
+	}
+	if createdAt.Valid {
+		f.CreatedAt = createdAt.Time.UTC()
+	}
+	if confirmedAt.Valid {
+		t := confirmedAt.Time.UTC()
+		f.ConfirmedAt = &t
+	}
+	if expiresAt.Valid {
+		t := expiresAt.Time.UTC()
+		f.ExpiresAt = &t
+	}
+	return f
+}
+
+func (s *Store) markFilesDeletedTx(tx *sql.Tx, fileIDs []string) error {
+	if len(fileIDs) == 0 {
+		return nil
+	}
+	args := stringsToAny(fileIDs)
+	placeholders := questionPlaceholders(len(fileIDs))
+	if s.useLegacyFiles {
+		if _, err := tx.Exec(`UPDATE files SET status = 'DELETED' WHERE file_id IN (`+placeholders+`)`, args...); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`UPDATE inodes SET status = 'DELETED' WHERE inode_id IN (`+placeholders+`)`, args...); err != nil {
+		return err
+	}
+	return nil
+}
+
+func deleteFileTagsByIDsTx(tx *sql.Tx, fileIDs []string) error {
+	if len(fileIDs) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(`DELETE FROM file_tags WHERE file_id IN (`+questionPlaceholders(len(fileIDs))+`)`, stringsToAny(fileIDs)...)
+	return err
+}
+
+func stringsToAny(values []string) []any {
+	args := make([]any, len(values))
+	for i, value := range values {
+		args[i] = value
+	}
+	return args
 }
 
 func dirHasChildrenTx(ctx context.Context, tx *sql.Tx, path string) (bool, error) {

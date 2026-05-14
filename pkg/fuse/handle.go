@@ -1,6 +1,10 @@
 package fuse
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/mem9-ai/dat9/pkg/client"
+)
 
 // FileHandle represents an open file in the FUSE filesystem.
 // WriteBuffer is defined in write.go and supports offset-based writes.
@@ -23,10 +27,11 @@ type FileHandle struct {
 	ShadowGen         uint64          // generation token from Pin/PinIfExists (passed to Unpin)
 	Streamer          *StreamUploader // nil for small files / read-only; manages background part uploads
 	Prefetch          *Prefetcher     // nil for writable handles; sequential read prefetcher
-	PendingMode       uint32          // mode change deferred because a dirty handle was open
-	HasPendingMode    bool            // true when PendingMode should be applied on Release
-	PreviousMode      uint32          // mode before PendingMode was set (for rollback on flush failure)
-	HasPreviousMode   bool            // true when PreviousMode is valid
+	ReadTarget        *client.ReadTarget
+	PendingMode       uint32 // mode change deferred because a dirty handle was open
+	HasPendingMode    bool   // true when PendingMode should be applied on Release
+	PreviousMode      uint32 // mode before PendingMode was set (for rollback on flush failure)
+	HasPreviousMode   bool   // true when PreviousMode is valid
 	mu                sync.Mutex
 }
 

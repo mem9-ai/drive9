@@ -1445,6 +1445,60 @@ func TestReadStreamRangeLargeFileTreats416AsEOF(t *testing.T) {
 	}
 }
 
+func TestResolveReadTargetAndReadObjectRange(t *testing.T) {
+	var readRequests atomic.Int32
+	var objectRequests atomic.Int32
+	data := []byte("0123456789")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/large.bin":
+			readRequests.Add(1)
+			w.Header().Set("Location", fmt.Sprintf("http://%s/s3/presigned?token=fixed", r.Host))
+			w.WriteHeader(http.StatusFound)
+		case "/s3/presigned":
+			objectRequests.Add(1)
+			if got := r.URL.RawQuery; got != "token=fixed" {
+				http.Error(w, "wrong query: "+got, http.StatusBadRequest)
+				return
+			}
+			if got := r.Header.Get("Range"); got != "bytes=2-5" {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[2:6])
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	target, err := c.ResolveReadTarget(context.Background(), "/large.bin")
+	if err != nil {
+		t.Fatalf("ResolveReadTarget: %v", err)
+	}
+	rc, err := c.ReadObjectRange(context.Background(), target, 2, 4)
+	if err != nil {
+		t.Fatalf("ReadObjectRange: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(got) != "2345" {
+		t.Fatalf("got %q, want 2345", got)
+	}
+	if got := readRequests.Load(); got != 1 {
+		t.Fatalf("read requests = %d, want 1", got)
+	}
+	if got := objectRequests.Load(); got != 1 {
+		t.Fatalf("object requests = %d, want 1", got)
+	}
+}
+
 func TestDownloadToFileWithSummaryReusesPresignedURL(t *testing.T) {
 	data := bytes.Repeat([]byte("ab"), downloadChunkSize/2)
 	data = append(data, []byte("tail")...)

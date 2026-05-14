@@ -721,6 +721,35 @@ func TestMountCmdLeavesLegacyDirStatFallbackDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestMountCmdPassesReadCacheMaxFileOption(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--read-cache-max-file-mb", "4",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.ReadCacheMaxFileBytes != 4<<20 {
+		t.Fatalf("ReadCacheMaxFileBytes = %d, want %d", got.ReadCacheMaxFileBytes, int64(4<<20))
+	}
+}
+
 func TestMountCmdLeavesDefaultTTLsUnsetForFuseDefaults(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })

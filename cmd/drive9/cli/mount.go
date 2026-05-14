@@ -84,6 +84,7 @@ func fsMountCmd(args []string) error {
 	mode := fs.String("mode", "auto", "mount mode: auto, fuse, or webdav")
 	cacheDir := fs.String("cache-dir", "", "write-back cache directory (default ~/.cache/drive9)")
 	cacheSize := fs.Int("cache-size", 128, "read cache size in MB")
+	readCacheMaxFile := fs.Int64("read-cache-max-file-mb", 1, "maximum single file size admitted to read cache in MB")
 	dirTTL := fs.Duration("dir-ttl", 10*time.Second, "directory cache TTL")
 	attrTTL := fs.Duration("attr-ttl", 10*time.Second, "kernel attr cache TTL")
 	entryTTL := fs.Duration("entry-ttl", 10*time.Second, "kernel entry cache TTL")
@@ -151,6 +152,9 @@ func fsMountCmd(args []string) error {
 	}
 	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
 		return err
+	}
+	if *readCacheMaxFile <= 0 {
+		return fmt.Errorf("drive9 mount: --read-cache-max-file-mb must be > 0")
 	}
 	normalizedLookupRetryCount := lookupRetryCountFlagValue(lookupRetryCountGiven, *lookupRetryCount)
 	normalizedLookupRetryTimeout := durationFlagValue(fs, "lookup-retry-timeout", *lookupRetryTimeout)
@@ -223,6 +227,7 @@ func fsMountCmd(args []string) error {
 		RemoteRoot:            remoteRoot,
 		CacheDir:              *cacheDir,
 		CacheSize:             int64(*cacheSize) << 20,
+		ReadCacheMaxFileBytes: *readCacheMaxFile << 20,
 		DirTTL:                normalizedDirTTL,
 		AttrTTL:               normalizedAttrTTL,
 		EntryTTL:              normalizedEntryTTL,

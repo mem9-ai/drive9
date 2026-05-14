@@ -299,6 +299,18 @@ func TestReadCache_SkipLargeFiles(t *testing.T) {
 	}
 }
 
+func TestReadCache_CustomMaxFileSize(t *testing.T) {
+	rc := NewReadCacheWithMaxFileSize(1<<20, 10*time.Second, 64<<10)
+	rc.Put("/small", make([]byte, 64<<10), 1)
+	if _, ok := rc.Get("/small", 1); !ok {
+		t.Fatal("file at custom max size should be cached")
+	}
+	rc.Put("/large", make([]byte, (64<<10)+1), 1)
+	if _, ok := rc.Get("/large", 1); ok {
+		t.Fatal("file over custom max size should not be cached")
+	}
+}
+
 func TestReadCache_CachesMediumSmallFiles(t *testing.T) {
 	rc := NewReadCache(1<<20, 10*time.Second)
 	data := make([]byte, defaultSmallFileThreshold+1)

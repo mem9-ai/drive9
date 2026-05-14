@@ -97,10 +97,19 @@ func NewAWS(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	var transport *http.Transport
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = t.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
+	transport.MaxIdleConns = 512
+	transport.MaxIdleConnsPerHost = 128
 
 	loadOptions := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(cfg.Region),
 		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
+		awsconfig.WithHTTPClient(&http.Client{Transport: transport}),
 	}
 
 	provider, ok, err := staticCredentialsProvider(cfg)
