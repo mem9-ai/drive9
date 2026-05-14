@@ -975,7 +975,8 @@ func (fs *Dat9FS) readTargetForHandle(ctx context.Context, fh *FileHandle) *clie
 	}
 	fh.Lock()
 	target := fh.ReadTarget
-	remotePath := fs.remotePath(fh.Path)
+	handlePath := fh.Path
+	remotePath := fs.remotePath(handlePath)
 	fh.Unlock()
 	if target != nil {
 		return target
@@ -989,7 +990,7 @@ func (fs *Dat9FS) readTargetForHandle(ctx context.Context, fh *FileHandle) *clie
 	}
 
 	fh.Lock()
-	if fh.ReadTarget == nil {
+	if fh.Path == handlePath && fh.Dirty == nil && fh.ReadTarget == nil {
 		fh.ReadTarget = resolved
 		if fh.Prefetch != nil {
 			fh.Prefetch.SetReadTarget(resolved)

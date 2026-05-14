@@ -6489,6 +6489,56 @@ func TestReadStreamRangeWithRetryRefreshesExpiredReadTarget(t *testing.T) {
 	}
 }
 
+func TestReadTargetForHandleDropsResolvedTargetAfterPathChange(t *testing.T) {
+	resolveStarted := make(chan struct{})
+	allowResolve := make(chan struct{})
+	var once sync.Once
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/fs/old.bin" {
+			http.NotFound(w, r)
+			return
+		}
+		once.Do(func() { close(resolveStarted) })
+		<-allowResolve
+		w.Header().Set("Location", fmt.Sprintf("http://%s/s3/old", r.Host))
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fh := &FileHandle{Path: "/old.bin"}
+
+	done := make(chan *client.ReadTarget, 1)
+	go func() {
+		done <- fs.readTargetForHandle(context.Background(), fh)
+	}()
+
+	select {
+	case <-resolveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("resolve did not start")
+	}
+	fh.Lock()
+	fh.Path = "/new.bin"
+	fh.Unlock()
+	close(allowResolve)
+
+	select {
+	case target := <-done:
+		if target != nil {
+			t.Fatalf("target = %+v, want nil after path change", target)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("readTargetForHandle timed out")
+	}
+	if fh.ReadTarget != nil {
+		t.Fatalf("handle cached target = %+v, want nil", fh.ReadTarget)
+	}
+}
+
 // TestDoRangeReadBodyTruncationReturnsError verifies that when a server sends
 // headers successfully but closes the connection mid-body (truncation),
 // doRangeRead surfaces an error instead of silently returning partial data.
