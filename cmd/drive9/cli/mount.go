@@ -98,6 +98,7 @@ func fsMountCmd(args []string) error {
 	prefetchMaxBytes := fs.Int64("readdir-prefetch-max-bytes", 1<<20, "maximum aggregate bytes prefetched per directory read")
 	prefetchTimeout := fs.Duration("readdir-prefetch-timeout", time.Second, "timeout for one readdir prefetch batch")
 	syncMode := fs.String("sync-mode", "auto", "sync mode: auto, interactive, or strict")
+	writePolicy := fs.String("write-policy", "writeback", "write durability policy: writeback, close-sync, or write-sync")
 	profile := fs.String("profile", "", "mount profile: interactive (empty for default)")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
@@ -218,6 +219,10 @@ func fsMountCmd(args []string) error {
 	if err != nil {
 		return err
 	}
+	writePolicyVal, err := parseFuseWritePolicy(*writePolicy)
+	if err != nil {
+		return err
+	}
 
 	opts := &mountFuseOptions{
 		Server:                *server,
@@ -241,6 +246,7 @@ func fsMountCmd(args []string) error {
 		PrefetchMaxBytes:      *prefetchMaxBytes,
 		PrefetchTimeout:       *prefetchTimeout,
 		SyncMode:              syncModeVal,
+		WritePolicy:           writePolicyVal,
 		Profile:               *profile,
 		AllowOther:            *allowOther,
 		ReadOnly:              *readOnly,

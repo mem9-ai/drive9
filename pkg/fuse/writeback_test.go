@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -760,6 +761,178 @@ func TestFlush_WriteBack_SmallFile(t *testing.T) {
 	// Cache should be cleaned up after successful upload.
 	if _, ok := cache.Get("/wb_test.txt"); ok {
 		t.Fatal("cache entry should be removed after successful upload")
+	}
+}
+
+func TestFlush_CloseSyncUploadsBeforeReturning(t *testing.T) {
+	var putCalls atomic.Int32
+	var uploaded []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putCalls.Add(1)
+			body, _ := io.ReadAll(r.Body)
+			uploaded = append(uploaded[:0], body...)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"revision":1}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	cache, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploader := NewWriteBackUploader(newTestClient(ts.URL), cache, 2)
+	opts := &MountOptions{FlushDebounce: 0, WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.SetWriteBack(cache, uploader)
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "close_sync.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	_, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}, []byte("close-sync data"))
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	if st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+	if putCalls.Load() != 1 {
+		t.Fatalf("PUT calls after Flush = %d, want 1", putCalls.Load())
+	}
+	if string(uploaded) != "close-sync data" {
+		t.Fatalf("uploaded = %q, want %q", uploaded, "close-sync data")
+	}
+	if _, ok := cache.Get("/close_sync.txt"); ok {
+		t.Fatal("close-sync Flush should not leave a write-back cache entry")
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	uploader.DrainAll()
+	if putCalls.Load() != 1 {
+		t.Fatalf("PUT calls after Release = %d, want still 1", putCalls.Load())
+	}
+}
+
+func TestWriteSyncUploadsBeforeWriteReturns(t *testing.T) {
+	var putCalls atomic.Int32
+	var uploaded []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putCalls.Add(1)
+			body, _ := io.ReadAll(r.Body)
+			uploaded = append(uploaded[:0], body...)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"revision":1}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0, WritePolicy: WritePolicyWriteSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "write_sync.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	written, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}, []byte("write-sync data"))
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	if written != uint32(len("write-sync data")) {
+		t.Fatalf("written = %d, want %d", written, len("write-sync data"))
+	}
+	if putCalls.Load() != 1 {
+		t.Fatalf("PUT calls after Write = %d, want 1", putCalls.Load())
+	}
+	if string(uploaded) != "write-sync data" {
+		t.Fatalf("uploaded = %q, want %q", uploaded, "write-sync data")
+	}
+
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	if st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+	if putCalls.Load() != 1 {
+		t.Fatalf("PUT calls after clean Flush = %d, want still 1", putCalls.Load())
+	}
+}
+
+func TestOSyncOpenPromotesWriteBackToWriteSync(t *testing.T) {
+	var putCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putCalls.Add(1)
+			_, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"revision":1}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_SYNC),
+	}, "osync.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created handle not found")
+	}
+	if fh.WritePolicy != WritePolicyWriteSync {
+		t.Fatalf("handle write policy = %v, want write-sync", fh.WritePolicy)
+	}
+	_, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}, []byte("osync data"))
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	if putCalls.Load() != 1 {
+		t.Fatalf("PUT calls after O_SYNC Write = %d, want 1", putCalls.Load())
 	}
 }
 

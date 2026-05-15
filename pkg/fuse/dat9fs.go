@@ -311,6 +311,17 @@ func (fs *Dat9FS) remotePath(localPath string) string {
 	return mountpath.ToRemote(fs.remoteRoot(), localPath)
 }
 
+func (fs *Dat9FS) writePolicyForOpen(flags uint32) WritePolicy {
+	policy := WritePolicyWriteBack
+	if fs != nil && fs.opts != nil {
+		policy = fs.opts.WritePolicy
+	}
+	if policy == WritePolicyWriteBack && flags&uint32(syscall.O_SYNC) != 0 {
+		return WritePolicyWriteSync
+	}
+	return policy
+}
+
 func isGitLooseObjectFinalPath(p string) bool {
 	const marker = "/.git/objects/"
 
@@ -2911,6 +2922,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		Dirty:       wb,
 		IsNew:       true,
 		ShadowReady: false,
+		WritePolicy: fs.writePolicyForOpen(input.Flags),
 	}
 
 	if fs.shadowStore != nil && fs.pendingIndex != nil {
@@ -2967,10 +2979,11 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	}
 
 	fh := &FileHandle{
-		Ino:     input.NodeId,
-		Path:    p,
-		Flags:   input.Flags,
-		OpenPID: input.Pid,
+		Ino:         input.NodeId,
+		Path:        p,
+		Flags:       input.Flags,
+		OpenPID:     input.Pid,
+		WritePolicy: fs.writePolicyForOpen(input.Flags),
 	}
 	entry, _ := fs.inodes.GetEntry(input.NodeId)
 	if entry != nil {
@@ -3104,7 +3117,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		// still populate the userspace prefetcher on cache misses.
 		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 	}
-	fs.debugf("open path=%s fh=%d ino=%d flags=0x%x open_flags=%d dirty=%t prefetch=%t orig_size=%d base_rev=%d shadow_ready=%t shadow_spill=%t", p, out.Fh, fh.Ino, input.Flags, out.OpenFlags, fh.Dirty != nil, fh.Prefetch != nil, fh.OrigSize, fh.BaseRev, fh.ShadowReady, fh.ShadowSpill)
+	fs.debugf("open path=%s fh=%d ino=%d flags=0x%x open_flags=%d dirty=%t prefetch=%t orig_size=%d base_rev=%d shadow_ready=%t shadow_spill=%t write_policy=%s", p, out.Fh, fh.Ino, input.Flags, out.OpenFlags, fh.Dirty != nil, fh.Prefetch != nil, fh.OrigSize, fh.BaseRev, fh.ShadowReady, fh.ShadowSpill, fh.WritePolicy)
 	return gofuse.OK
 }
 
@@ -3577,7 +3590,61 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
 	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
+	if fh.WritePolicy == WritePolicyWriteSync {
+		size := fh.Dirty.Size()
+		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
+		defer cf()
+		source = "write-sync"
+		st := fs.syncHandleToRemoteLocked(ctx, fh)
+		if st != gofuse.OK {
+			return 0, st
+		}
+	}
 	return n, gofuse.OK
+}
+
+// syncHandleToRemoteLocked makes the current dirty handle remote-durable.
+// Caller must hold fh.mu. The method may temporarily release fh.mu around
+// network I/O, matching flushHandle's locking contract.
+func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
+	if fh == nil || fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
+		return gofuse.OK
+	}
+
+	size := fh.Dirty.Size()
+	if fh.ShadowSpill && fs.shadowStore != nil {
+		expectedRevision := expectedRevisionForHandle(fh)
+		uploadStart := time.Now()
+		fs.debugf("sync handle shadowspill upload start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
+		fh.Unlock()
+		err := uploadFromShadowRemote(ctx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevision)
+		fh.Lock()
+		var uploadBytes uint64
+		if size > 0 {
+			uploadBytes = uint64(size)
+		}
+		fs.perfRecordRemote(perfRemoteWrite, uploadStart, err, uploadBytes)
+		fs.debugDurationf(uploadStart, 0, "sync handle shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
+		if err != nil {
+			log.Printf("sync handle shadowspill upload failed for %s: %v", fh.Path, err)
+			return httpToFuseStatus(err)
+		}
+		fh.Dirty.ClearDirty()
+		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+		fh.DirtySeq = 0
+		fh.ShadowCommitReady = false
+		clearReadTargetForLockedHandle(fh)
+		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+		fs.inodes.UpdateSize(fh.Ino, size)
+		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
+		fs.finalizeHandleFlushLocked(fh, expectedRevision)
+		if fs.pendingIndex != nil {
+			fs.pendingIndex.Remove(fh.Path)
+		}
+		return gofuse.OK
+	}
+
+	return fs.flushHandle(ctx, fh)
 }
 
 func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status gofuse.Status) {
@@ -3613,6 +3680,15 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		}
 		fs.debugf("flush done path=%s fh=%d ino=%d phase=%s size=%d dirty=%t shadow_ready=%t shadow_spill=%t status=%d dur=%s", fh.Path, input.Fh, fh.Ino, phase, size, dirty, fh.ShadowReady, fh.ShadowSpill, status, d)
 	}()
+
+	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() &&
+		(fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync) {
+		size := fh.Dirty.Size()
+		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
+		defer cf()
+		phase = fh.WritePolicy.String()
+		return fs.syncHandleToRemoteLocked(ctx, fh)
+	}
 
 	// Write-back path: small dirty files are persisted to local disk
 	// and return immediately. The actual HTTP upload happens in Release
@@ -4003,6 +4079,31 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		// Cancel any pending debounce for this path — Release always flushes immediately.
 		phase = "cancel-debounce"
 		fs.debouncer.Cancel(fh.Path)
+
+		// close-sync is primarily enforced in Flush so close(2) can receive
+		// remote upload errors. Keep Release as a best-effort fallback for
+		// unusual flows where dirty staged state reaches Release directly.
+		if fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync {
+			phase = "release-write-policy-sync"
+			lockStart := time.Now()
+			fh.Lock()
+			if lockWait := time.Since(lockStart); fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
+				fs.debugf("release lock wait path=%s fh=%d ino=%d phase=%s wait=%s", fh.Path, input.Fh, fh.Ino, phase, lockWait)
+			}
+			if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
+				size := fh.Dirty.Size()
+				ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
+				flushStart := time.Now()
+				fs.debugf("release write policy sync start path=%s size=%d policy=%s timeout=%s", fh.Path, size, fh.WritePolicy, releaseTimeout(size))
+				flushStatus = fs.syncHandleToRemoteLocked(ctx, fh)
+				fs.debugDurationf(flushStart, 0, "release write policy sync done path=%s size=%d status=%d", fh.Path, size, flushStatus)
+				cf()
+			}
+			fh.Unlock()
+			if flushStatus != gofuse.OK {
+				return
+			}
+		}
 
 		// ShadowSpill Release: CommitQueue streaming from shadow, no writeBack.
 		if fh.ShadowSpill && fh.ShadowCommitReady && fs.commitQueue != nil && fs.shadowStore != nil {
