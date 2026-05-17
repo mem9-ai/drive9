@@ -1134,6 +1134,68 @@ func TestWriteSyncDisablesStreamingUploaderForLargeSequentialWrites(t *testing.T
 	}
 }
 
+func TestWriteSyncCreateWithShadowStoreUploadsWrittenBytes(t *testing.T) {
+	rec := newWriteSyncMultipartRecorder(t, "/shadow_sync.bin")
+	rec.captureParts = true
+
+	opts := &MountOptions{FlushDebounce: 0, WritePolicy: WritePolicyWriteSync}
+	opts.setDefaults()
+	fs := NewDat9FS(rec.client(), opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "shadow_sync.bin", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created handle not found")
+	}
+	if fh.ShadowSpill {
+		t.Fatal("write-sync create should not enable ShadowSpill")
+	}
+
+	data := bytesOf('x', int(s3client.PartSize))
+	written, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, data)
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	if written != uint32(len(data)) {
+		t.Fatalf("written = %d, want %d", written, len(data))
+	}
+
+	bodies := rec.capturedPartBodies()
+	if len(bodies) != 1 {
+		t.Fatalf("captured S3 part bodies = %d, want 1", len(bodies))
+	}
+	if len(bodies[0]) != len(data) {
+		t.Fatalf("captured body len = %d, want %d", len(bodies[0]), len(data))
+	}
+	for i, b := range bodies[0] {
+		if b != 'x' {
+			t.Fatalf("captured body byte %d = %q, want 'x'", i, b)
+		}
+	}
+}
+
 type writeSyncMultipartRecorder struct {
 	t            *testing.T
 	server       *httptest.Server
@@ -1142,6 +1204,8 @@ type writeSyncMultipartRecorder struct {
 	initiateByID map[string]int64
 	sizes        []int64
 	completes    []int
+	captureParts bool
+	partBodies   [][]byte
 }
 
 func newWriteSyncMultipartRecorder(t *testing.T, wantPath string) *writeSyncMultipartRecorder {
@@ -1213,8 +1277,18 @@ func newWriteSyncMultipartRecorder(t *testing.T, wantPath string) *writeSyncMult
 			})
 			return
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/"):
-			if _, err := io.Copy(io.Discard, r.Body); err != nil {
-				t.Fatalf("read s3 body: %v", err)
+			if rec.captureParts {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatalf("read s3 body: %v", err)
+				}
+				rec.mu.Lock()
+				rec.partBodies = append(rec.partBodies, body)
+				rec.mu.Unlock()
+			} else {
+				if _, err := io.Copy(io.Discard, r.Body); err != nil {
+					t.Fatalf("read s3 body: %v", err)
+				}
 			}
 			w.Header().Set("ETag", "etag-1")
 			w.WriteHeader(http.StatusOK)
@@ -1255,6 +1329,16 @@ func (rec *writeSyncMultipartRecorder) completePartCounts() []int {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	return append([]int(nil), rec.completes...)
+}
+
+func (rec *writeSyncMultipartRecorder) capturedPartBodies() [][]byte {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	out := make([][]byte, len(rec.partBodies))
+	for i, body := range rec.partBodies {
+		out[i] = append([]byte(nil), body...)
+	}
+	return out
 }
 
 func bytesOf(b byte, n int) []byte {

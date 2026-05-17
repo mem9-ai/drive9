@@ -2925,7 +2925,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		WritePolicy: fs.writePolicyForOpen(input.Flags),
 	}
 
-	if fs.shadowStore != nil && fs.pendingIndex != nil {
+	if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
 		if err := fs.shadowStore.Ensure(childP, 0, 0); err != nil {
 			log.Printf("shadow ensure failed for create %s: %v", childP, err)
 		} else {
