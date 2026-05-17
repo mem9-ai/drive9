@@ -513,7 +513,7 @@ HEAD   /v1/fs/{path}          Stat  (standard HTTP semantics)
 GET    /v1/fs/{path}?list     List directory
 
 POST   /v1/fs/{path}?copy     Server-side link (zero-copy, same file_id)
-  Header: X-Drive9-Copy-Source: /source/path
+  Header: X-Dat9-Copy-Source: /source/path
 
 POST   /v1/search             Semantic search (vector + FTS + hybrid)
 POST   /v1/query              Metadata query (tags, status, source_id)
