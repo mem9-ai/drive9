@@ -307,6 +307,10 @@ notify storms.
 
 ## HTTP API
 
+Authenticate HTTP API calls with `Authorization: Bearer $DRIVE9_API_KEY`.
+`X-API-Key: $DRIVE9_API_KEY` is accepted for compatibility. Query modifiers are
+presence-based, so `?list` and `?list=1` are equivalent.
+
 Core filesystem endpoints:
 
 ```text
@@ -321,8 +325,8 @@ PATCH  /v1/fs/{path}              patch large file parts
 DELETE /v1/fs/{path}              delete
 DELETE /v1/fs/{path}?recursive    recursive delete
 POST   /v1/fs/{path}?append       append
-POST   /v1/fs/{path}?copy         copy (X-Drive9-Copy-Source)
-POST   /v1/fs/{path}?rename       rename (X-Drive9-Rename-Source)
+POST   /v1/fs/{path}?copy         copy (X-Dat9-Copy-Source)
+POST   /v1/fs/{path}?rename       rename (X-Dat9-Rename-Source)
 POST   /v1/fs/{path}?mkdir        mkdir
 ```
 
