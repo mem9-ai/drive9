@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -31,6 +32,41 @@ func TestDetectTiDBEmbeddingModeFromMeta(t *testing.T) {
 	}
 	if mode != TiDBEmbeddingModeApp {
 		t.Fatalf("mode=%q, want %q", mode, TiDBEmbeddingModeApp)
+	}
+}
+
+func TestDetectTiDBEmbeddingModeFallsBackToSemanticWhenFilesMetadataHasNoRows(t *testing.T) {
+	db := newTestRepairDBWithArgs(t, func(query string, args []driver.NamedValue) testRepairQueryResult {
+		normalized := normalizeSQLFragment(query)
+		if strings.Contains(normalized, "select version()") {
+			return testRepairQueryResult{columns: []string{"VERSION()"}, rows: [][]driver.Value{{"8.0.11-TiDB-v7.5.0"}}}
+		}
+		if strings.Contains(normalized, "from information_schema.columns") {
+			tableName := queryArgString(args, 0)
+			if tableName == "files" {
+				return testRepairQueryResult{}
+			}
+			if tableName == "semantic" {
+				return testRepairQueryResult{
+					columns: []string{"column_name", "column_type", "extra", "generation_expression"},
+					rows: [][]driver.Value{{
+						"embedding",
+						"vector(1024)",
+						"STORED GENERATED",
+						"embed_text(_utf8mb4'tidbcloud_free/amazon/titan-embed-text-v2', `content_text`, _utf8mb4'{\"dimensions\":1024}')",
+					}},
+				}
+			}
+		}
+		return testRepairQueryResult{}
+	}, nil)
+
+	mode, err := DetectTiDBEmbeddingMode(db)
+	if err != nil {
+		t.Fatalf("DetectTiDBEmbeddingMode: %v", err)
+	}
+	if mode != TiDBEmbeddingModeAuto {
+		t.Fatalf("mode=%q, want %q", mode, TiDBEmbeddingModeAuto)
 	}
 }
 
@@ -95,6 +131,49 @@ func TestTiDBSchemaSpecForModeIncludesCreateStatements(t *testing.T) {
 		if !strings.Contains(strings.ToLower(stmt), "create table if not exists "+tableName) {
 			t.Fatalf("unexpected create statement for %s: %q", tableName, stmt)
 		}
+	}
+	if _, ok := createByTable["files"]; ok {
+		t.Fatal("new tenant schema spec must not create legacy files table")
+	}
+}
+
+func TestLegacyTiDBFilesTableSpecRepairsExistingFilesColumnsAndIndexes(t *testing.T) {
+	spec, err := legacyTiDBFilesTableSpecForMode(TiDBEmbeddingModeAuto)
+	if err != nil {
+		t.Fatalf("legacy files spec: %v", err)
+	}
+	meta := testLegacyFilesTableMeta(TiDBEmbeddingModeAuto)
+	delete(meta.columns, "storage_ref_hash")
+
+	diffs := diffTiDBTableMetaWithObservedIndexes(spec, meta, spec.createStatement, map[string]struct{}{}, true)
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingColumn, "storage_ref_hash") {
+		t.Fatalf("expected missing storage_ref_hash legacy files repair, got %#v", diffs)
+	}
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "idx_files_storage_ref_hash") {
+		t.Fatalf("expected missing idx_files_storage_ref_hash legacy files repair, got %#v", diffs)
+	}
+	for _, diff := range diffs {
+		if diff.kind == tidbSchemaDiffMissingTable {
+			t.Fatalf("legacy compatibility diff must not recreate files table, got %#v", diffs)
+		}
+	}
+}
+
+func TestDiffLegacyTiDBFilesTableSkipsMissingFilesTable(t *testing.T) {
+	db := newTestRepairDBWithArgs(t, func(query string, args []driver.NamedValue) testRepairQueryResult {
+		if strings.Contains(normalizeSQLFragment(query), "from information_schema.columns") &&
+			queryArgString(args, 0) == "files" {
+			return testRepairQueryResult{}
+		}
+		return testRepairQueryResult{}
+	}, nil)
+
+	diffs, err := diffLegacyTiDBFilesTableIfExists(context.Background(), db, TiDBEmbeddingModeAuto)
+	if err != nil {
+		t.Fatalf("diff legacy files: %v", err)
+	}
+	if len(diffs) != 0 {
+		t.Fatalf("expected missing legacy files table to be skipped, got %#v", diffs)
 	}
 }
 
@@ -634,10 +713,9 @@ func TestTiDBSchemaSpecIncludesStorageEncryptionColumns(t *testing.T) {
 	}
 }
 
-
 func TestTiDBSchemaSpecForModeIncludesSemanticIndexes(t *testing.T) {
 	// In auto-embedding mode, semantic table FULLTEXT and VECTOR indexes are
-	 // part of the enforceable schema contract and must appear in the spec.
+	// part of the enforceable schema contract and must appear in the spec.
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "semantic")
 	if _, ok := spec.indexes["idx_semantic_fts_content"]; !ok {
 		t.Fatal("semantic missing idx_semantic_fts_content index spec from ALTER TABLE statement")
@@ -670,7 +748,6 @@ func TestTiDBSchemaSpecForAppModeExcludesSemanticIndexes(t *testing.T) {
 		t.Fatal("semantic app mode spec must not include optional idx_semantic_desc_cosine index")
 	}
 }
-
 
 func TestPlannedTiDBSchemaRepairsIncludesFulltextVectorIndexOnExistingTable(t *testing.T) {
 	// FULLTEXT and VECTOR indexes must be repaired even when the table already
@@ -736,7 +813,7 @@ func TestIsSafeAddColumnRepairSQLAllowsStoredGeneratedVectorWithEmbedText(t *tes
 	// description_embedding is a STORED GENERATED VECTOR column backed by EMBED_TEXT.
 	// TiDB computes the value server-side so ALTER TABLE ADD COLUMN is safe on
 	// existing tables even when embedding rows are absent.
-	stmt := "ALTER TABLE files ADD COLUMN description_embedding VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT('amazon.titan-embed-text-v2:0', description, '{\"dimensions\":1024}')) STORED"
+	stmt := "ALTER TABLE semantic ADD COLUMN description_embedding VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT('amazon.titan-embed-text-v2:0', description, '{\"dimensions\":1024}')) STORED"
 	if !isSafeAddColumnRepairSQL(stmt) {
 		t.Fatal("expected STORED GENERATED VECTOR with EMBED_TEXT to be safe to add")
 	}
@@ -818,6 +895,29 @@ func TestIsIgnorableOptionalSchemaError(t *testing.T) {
 	}
 }
 
+func TestIsMissingTableError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "wrapped no rows", err: errors.New("plain"), want: false},
+		{name: "sql no rows", err: fmt.Errorf("load columns: %w", sql.ErrNoRows), want: true},
+		{name: "mysql table missing", err: fmt.Errorf("wrapped: %w", &mysql.MySQLError{Number: 1146, Message: "Table 'files' doesn't exist"}), want: true},
+		{name: "mysql syntax", err: &mysql.MySQLError{Number: 1064, Message: "syntax error"}, want: false},
+		{name: "postgres relation missing", err: errors.New(`ERROR: relation "files" does not exist`), want: true},
+		{name: "plain table missing", err: errors.New("Table 'files' doesn't exist"), want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isMissingTableError(tt.err); got != tt.want {
+				t.Fatalf("isMissingTableError()=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsIgnorableTiDBSchemaError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -892,12 +992,12 @@ func testSemanticTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
 	meta := tidbTableMeta{
 		tableName: "semantic",
 		columns: map[string]tidbColumnMeta{
-			"inode_id":                      {columnType: "varchar(64)"},
-			"content_text":                  {columnType: "longtext"},
-			"embedding":                     {columnType: "vector(1024)"},
-			"embedding_revision":            {columnType: "bigint"},
-			"description":                   {columnType: "longtext"},
-			"description_embedding":         {columnType: "vector(1024)"},
+			"inode_id":                       {columnType: "varchar(64)"},
+			"content_text":                   {columnType: "longtext"},
+			"embedding":                      {columnType: "vector(1024)"},
+			"embedding_revision":             {columnType: "bigint"},
+			"description":                    {columnType: "longtext"},
+			"description_embedding":          {columnType: "vector(1024)"},
 			"description_embedding_revision": {columnType: "bigint"},
 		},
 	}
@@ -916,6 +1016,58 @@ func testSemanticTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
 	}
 	return meta
 }
+
+func testLegacyFilesTableMeta(mode TiDBEmbeddingMode) tidbTableMeta {
+	meta := tidbTableMeta{
+		tableName: "files",
+		columns: map[string]tidbColumnMeta{
+			"file_id":                        {columnType: "varchar(64)"},
+			"storage_type":                   {columnType: "varchar(32)"},
+			"storage_ref":                    {columnType: "text"},
+			"storage_ref_hash":               {columnType: "varchar(64)"},
+			"storage_encryption_mode":        {columnType: "varchar(16)"},
+			"storage_encryption_key_id":      {columnType: "varchar(256)"},
+			"content_blob":                   {columnType: "longblob"},
+			"content_type":                   {columnType: "varchar(255)"},
+			"size_bytes":                     {columnType: "bigint"},
+			"checksum_sha256":                {columnType: "varchar(128)"},
+			"revision":                       {columnType: "bigint"},
+			"status":                         {columnType: "varchar(32)"},
+			"source_id":                      {columnType: "varchar(255)"},
+			"content_text":                   {columnType: "longtext"},
+			"description":                    {columnType: "longtext"},
+			"embedding":                      {columnType: "vector(1024)"},
+			"embedding_revision":             {columnType: "bigint"},
+			"description_embedding":          {columnType: "vector(1024)"},
+			"description_embedding_revision": {columnType: "bigint"},
+			"created_at":                     {columnType: "datetime(3)"},
+			"confirmed_at":                   {columnType: "datetime(3)"},
+			"expires_at":                     {columnType: "datetime(3)"},
+		},
+	}
+	if mode == TiDBEmbeddingModeAuto {
+		meta.columns["embedding"] = tidbColumnMeta{
+			columnType:           "vector(1024)",
+			extra:                "STORED GENERATED",
+			generationExpression: "embed_text(_utf8mb4'tidbcloud_free/amazon/titan-embed-text-v2', `content_text`, _utf8mb4'{\"dimensions\":1024}')",
+		}
+		meta.columns["description_embedding"] = tidbColumnMeta{
+			columnType:           "vector(1024)",
+			extra:                "STORED GENERATED",
+			generationExpression: "embed_text(_utf8mb4'tidbcloud_free/amazon/titan-embed-text-v2', `description`, _utf8mb4'{\"dimensions\":1024}')",
+		}
+	}
+	return meta
+}
+
+func queryArgString(args []driver.NamedValue, idx int) string {
+	if idx < 0 || idx >= len(args) {
+		return ""
+	}
+	value, _ := args[idx].Value.(string)
+	return value
+}
+
 func testUploadsTableMeta(includeExpectedRevision bool) tidbTableMeta {
 	meta := tidbTableMeta{
 		tableName: "uploads",
@@ -990,12 +1142,12 @@ type testRepairQueryResult struct {
 }
 
 type testRepairDriver struct {
-	queryFn func(string) testRepairQueryResult
+	queryFn func(string, []driver.NamedValue) testRepairQueryResult
 	execFn  func(string) error
 }
 
 type testRepairConn struct {
-	queryFn func(string) testRepairQueryResult
+	queryFn func(string, []driver.NamedValue) testRepairQueryResult
 	execFn  func(string) error
 }
 
@@ -1008,6 +1160,13 @@ type testRepairRows struct {
 var testRepairDriverCounter uint64
 
 func newTestRepairDB(t *testing.T, queryFn func(string) testRepairQueryResult, execFn func(string) error) *sql.DB {
+	t.Helper()
+	return newTestRepairDBWithArgs(t, func(query string, _ []driver.NamedValue) testRepairQueryResult {
+		return queryFn(query)
+	}, execFn)
+}
+
+func newTestRepairDBWithArgs(t *testing.T, queryFn func(string, []driver.NamedValue) testRepairQueryResult, execFn func(string) error) *sql.DB {
 	t.Helper()
 	name := "test-repair-driver-" + strconv.FormatUint(atomic.AddUint64(&testRepairDriverCounter, 1), 10)
 	sql.Register(name, testRepairDriver{queryFn: queryFn, execFn: execFn})
@@ -1029,8 +1188,8 @@ func (c testRepairConn) Prepare(string) (driver.Stmt, error) {
 func (c testRepairConn) Close() error              { return nil }
 func (c testRepairConn) Begin() (driver.Tx, error) { return nil, errors.New("not implemented") }
 
-func (c testRepairConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
-	result := c.queryFn(query)
+func (c testRepairConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	result := c.queryFn(query, args)
 	if result.err != nil {
 		return nil, result.err
 	}

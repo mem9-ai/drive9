@@ -1,6 +1,7 @@
 // Package datastore provides the tenant data-plane metadata store for dat9.
-// P0 uses TiDB (via MySQL protocol) as a local stand-in for db9. Two core tables:
-// file_nodes (dentry/path tree) and files (inode/file entity).
+// Core metadata is split across file_nodes (dentry/path tree), inodes,
+// contents, and semantic. The legacy files table is still supported for
+// existing tenants during the split-table transition.
 package datastore
 
 import (
