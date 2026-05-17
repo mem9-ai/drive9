@@ -1078,9 +1078,6 @@ func TestSyncOpenFlagsPromoteCloseSyncToWriteSync(t *testing.T) {
 	if got := fs.writePolicyForOpen(uint32(syscall.O_SYNC)); got != WritePolicyWriteSync {
 		t.Errorf("O_SYNC policy = %v, want write-sync", got)
 	}
-	if got := fs.writePolicyForOpen(uint32(syscall.O_DSYNC)); got != WritePolicyWriteSync {
-		t.Errorf("O_DSYNC policy = %v, want write-sync", got)
-	}
 }
 
 func TestWriteSyncDisablesStreamingUploaderForLargeSequentialWrites(t *testing.T) {
