@@ -634,54 +634,6 @@ func validateTiDBSemanticTableBase(meta tidbTableMeta) error {
 	return meta.requireColumnType("description_embedding_revision", "bigint")
 }
 
-func validateTiDBAutoEmbeddingFilesTable(meta tidbTableMeta) error {
-	if err := validateTiDBFilesTableBase(meta); err != nil {
-		return err
-	}
-	return schemaDiffsToError(validateTiDBAutoEmbeddingFilesDiffs(meta))
-}
-
-func validateTiDBAppEmbeddingFilesTable(meta tidbTableMeta) error {
-	if err := validateTiDBFilesTableBase(meta); err != nil {
-		return err
-	}
-	return schemaDiffsToError(validateTiDBAppEmbeddingFilesDiffs(meta))
-}
-
-func validateTiDBFilesTableBase(meta tidbTableMeta) error {
-	if err := meta.requireColumnType("file_id", "varchar(64)"); err != nil {
-		return err
-	}
-	if err := meta.requireColumnType("status", "varchar(32)"); err != nil {
-		return err
-	}
-	if err := meta.requireColumnType("storage_ref_hash", "varchar(64)"); err != nil {
-		return err
-	}
-	if err := meta.requireColumnType("storage_encryption_mode", "varchar(16)"); err != nil {
-		return err
-	}
-	if err := meta.requireColumnType("storage_encryption_key_id", "varchar(256)"); err != nil {
-		return err
-	}
-	if err := meta.requireColumnType("content_text", "longtext"); err != nil {
-		return err
-	}
-	if err := meta.requireColumnType("embedding", fmt.Sprintf("vector(%d)", TiDBAutoEmbeddingDimensions)); err != nil {
-		return err
-	}
-	if err := meta.requireColumnType("embedding_revision", "bigint"); err != nil {
-		return err
-	}
-	if err := meta.requireColumnType("description", "longtext"); err != nil {
-		return err
-	}
-	if err := meta.requireColumnType("description_embedding", fmt.Sprintf("vector(%d)", TiDBAutoEmbeddingDimensions)); err != nil {
-		return err
-	}
-	return meta.requireColumnType("description_embedding_revision", "bigint")
-}
-
 func validateTiDBUploadsTableBase(meta tidbTableMeta) error {
 	if err := meta.requireColumnType("upload_id", "varchar(64)"); err != nil {
 		return err
