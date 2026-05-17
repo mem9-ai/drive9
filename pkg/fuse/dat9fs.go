@@ -316,7 +316,7 @@ func (fs *Dat9FS) writePolicyForOpen(flags uint32) WritePolicy {
 	if fs != nil && fs.opts != nil {
 		policy = fs.opts.WritePolicy
 	}
-	if policy == WritePolicyWriteBack && flags&uint32(syscall.O_SYNC) != 0 {
+	if hasSyncOpenFlag(flags) {
 		return WritePolicyWriteSync
 	}
 	return policy
@@ -410,7 +410,7 @@ func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) er
 	if err := fh.Dirty.Truncate(newSize); err != nil {
 		return err
 	}
-	if fs.shadowStore != nil && fs.pendingIndex != nil {
+	if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
 		if fh.ShadowReady || fh.IsNew || newSize == 0 {
 			if err := fs.shadowStore.Truncate(fh.Path, newSize, fh.BaseRev); err != nil {
 				log.Printf("shadow truncate failed for %s: %v", fh.Path, err)
@@ -2940,7 +2940,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		wb.OnPartFull = func(partIdx int, data []byte) {
 			wb.EvictPart(partIdx)
 		}
-	} else {
+	} else if fh.WritePolicy != WritePolicyWriteSync {
 		// Normal mode: attach streaming uploader for sequential write streaming.
 		fh.Streamer = NewStreamUploader(fs.client, childP, expectedRevisionForHandle(fh), fs.remoteRoot())
 		streamer := fh.Streamer
@@ -3049,7 +3049,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.ZeroBase = true
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 			fs.inodes.UpdateSize(fh.Ino, 0)
-			if fs.shadowStore != nil && fs.pendingIndex != nil {
+			if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
 				if err := fs.shadowStore.Ensure(p, 0, fh.BaseRev); err != nil {
 					log.Printf("shadow ensure failed for truncate-open %s: %v", p, err)
 				} else {
@@ -3068,7 +3068,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 				wb.OnPartFull = func(partIdx int, data []byte) {
 					wb.EvictPart(partIdx)
 				}
-			} else {
+			} else if fh.WritePolicy != WritePolicyWriteSync {
 				// Normal mode: attach streaming uploader with OnPartFull wiring.
 				fh.Streamer = NewStreamUploader(fs.client, p, expectedRevisionForHandle(fh), fs.remoteRoot())
 				streamer := fh.Streamer
@@ -3541,6 +3541,10 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		source = "new-dirty-buffer"
 		fh.Dirty = fs.newWriteBuffer(fh.Path, 0, 0)
 	}
+	writeSyncSnapshot := (*writeBufferSnapshot)(nil)
+	if fh.WritePolicy == WritePolicyWriteSync {
+		writeSyncSnapshot = fh.Dirty.snapshot()
+	}
 
 	// ShadowSpill: write shadow FIRST, before Dirty. If shadow fails, return
 	// EIO without touching Dirty — OnPartFull may evict the part, so writing
@@ -3595,12 +3599,168 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
 		defer cf()
 		source = "write-sync"
-		st := fs.syncHandleToRemoteLocked(ctx, fh)
+		st := fs.syncWriteHandleToRemoteLocked(ctx, fh)
 		if st != gofuse.OK {
+			fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot)
 			return 0, st
 		}
 	}
 	return n, gofuse.OK
+}
+
+func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBufferSnapshot) {
+	if fh == nil {
+		return
+	}
+	if fh.DirtySeq != 0 {
+		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+		fh.DirtySeq = 0
+	}
+	if snapshot == nil {
+		fh.Dirty = nil
+	} else {
+		if fh.Dirty == nil {
+			fh.Dirty = fs.newWriteBuffer(fh.Path, snapshot.maxSize, snapshot.partSize)
+		}
+		fh.Dirty.restore(snapshot)
+		if fh.Dirty.HasDirtyParts() {
+			fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+		}
+		fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
+	}
+	fh.WriteBackSeq = 0
+	clearReadTargetForLockedHandle(fh)
+	if fs.shadowStore != nil && fh.ShadowReady {
+		fs.shadowStore.Remove(fh.Path)
+		fh.ShadowReady = false
+		fh.ShadowSpill = false
+		fh.ShadowCommitReady = false
+	}
+}
+
+// syncWriteHandleToRemoteLocked makes the current handle contents
+// remote-durable for a write-sync Write call. Caller must hold fh.mu and this
+// method keeps it held for the whole upload so no same-handle write can mutate
+// the dirty buffer before the syscall returns.
+func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
+	if fh == nil || fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
+		return gofuse.OK
+	}
+
+	size := fh.Dirty.Size()
+	expectedRevision := expectedRevisionForHandle(fh)
+	var (
+		data         []byte
+		committedRev int64
+		err          error
+	)
+
+	threshold := fs.negotiatedInlineThreshold()
+	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
+	if useDirectPUT || fh.OrigSize < threshold {
+		data = fh.Dirty.bytesView()
+	}
+
+	if useDirectPUT {
+		writeStart := time.Now()
+		if size == 0 && fh.IsNew {
+			fs.debugf("write-sync empty create start path=%s expected_rev=%d", fh.Path, expectedRevision)
+			committedRev, err = fs.client.CreateFileCtx(ctx, fs.remotePath(fh.Path))
+			if isCreateActionUnsupportedErr(err) {
+				fs.debugf("write-sync empty create unsupported path=%s fallback=small-write err=%v", fh.Path, err)
+				committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
+			}
+			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
+			fs.debugDurationf(writeStart, 0, "write-sync empty create done path=%s committed_rev=%d err=%v", fh.Path, committedRev, err)
+		} else {
+			fs.debugf("write-sync small write start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
+			committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
+			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
+			fs.debugDurationf(writeStart, 0, "write-sync small write done path=%s size=%d committed_rev=%d err=%v", fh.Path, size, committedRev, err)
+		}
+	} else if fh.OrigSize >= threshold {
+		dirtyParts := fh.Dirty.DirtyPartNumbers()
+		if len(dirtyParts) > 0 {
+			partSnapshots := make(map[int][]byte, len(dirtyParts))
+			for _, pn := range dirtyParts {
+				src := fh.Dirty.PartData(pn)
+				if src != nil {
+					cp := make([]byte, len(src))
+					copy(cp, src)
+					partSnapshots[pn] = cp
+				}
+			}
+			patchStart := time.Now()
+			fs.debugf("write-sync patch start path=%s size=%d dirty_parts=%d expected_rev=%d", fh.Path, size, len(dirtyParts), expectedRevision)
+			err = fs.client.PatchFile(
+				ctx,
+				fs.remotePath(fh.Path),
+				size,
+				dirtyParts,
+				func(partNumber int, partSize int64, origData []byte) ([]byte, error) {
+					if d, ok := partSnapshots[partNumber]; ok {
+						return d, nil
+					}
+					return origData, nil
+				},
+				nil,
+				client.WithPartSize(fh.Dirty.PartSize()),
+				client.WithExpectedRevision(expectedRevision),
+			)
+			var patchBytes uint64
+			if size > 0 {
+				patchBytes = uint64(size)
+			}
+			fs.perfRecordRemote(perfRemoteWrite, patchStart, err, patchBytes)
+			fs.debugDurationf(patchStart, 0, "write-sync patch done path=%s size=%d dirty_parts=%d err=%v", fh.Path, size, len(dirtyParts), err)
+		}
+	} else {
+		if data == nil && !fh.Dirty.CanMaterializeFull() {
+			log.Printf("write-sync cannot materialize full file for %s", fh.Path)
+			return gofuse.EIO
+		}
+		if data == nil {
+			data = fh.Dirty.bytesView()
+		}
+		writeStart := time.Now()
+		fs.debugf("write-sync stream start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
+		err = fs.client.WriteStreamConditional(
+			ctx,
+			fs.remotePath(fh.Path),
+			bytes.NewReader(data),
+			size,
+			nil,
+			expectedRevision,
+		)
+		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
+		fs.debugDurationf(writeStart, 0, "write-sync stream done path=%s size=%d err=%v", fh.Path, size, err)
+	}
+	if err != nil {
+		log.Printf("write-sync upload failed for %s: %v", fh.Path, err)
+		return httpToFuseStatus(err)
+	}
+
+	fh.Dirty.ClearDirty()
+	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+	fh.DirtySeq = 0
+	if committedRev > 0 {
+		clearReadTargetForLockedHandle(fh)
+		fs.clearReadTargetsForPathExcept(fh.Path, fh)
+		fs.readCache.Put(fh.Path, data, committedRev)
+		fh.IsNew = false
+		fh.BaseRev = committedRev
+		fs.inodes.UpdateRevision(fh.Ino, committedRev)
+		if fh.ZeroBase && fh.Dirty != nil && fh.Dirty.Size() > 0 {
+			fh.ZeroBase = false
+		}
+	} else {
+		clearReadTargetForLockedHandle(fh)
+		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+		fs.finalizeHandleFlushLocked(fh, expectedRevision)
+	}
+	fs.inodes.UpdateSize(fh.Ino, size)
+	fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
+	return gofuse.OK
 }
 
 // syncHandleToRemoteLocked makes the current dirty handle remote-durable.
@@ -3638,6 +3798,12 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 		fs.inodes.UpdateSize(fh.Ino, size)
 		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
+		if fs.shadowStore != nil {
+			fs.shadowStore.Remove(fh.Path)
+			fh.ShadowReady = false
+			fh.ShadowSpill = false
+			fh.ShadowCommitReady = false
+		}
 		if fs.pendingIndex != nil {
 			fs.pendingIndex.Remove(fh.Path)
 		}

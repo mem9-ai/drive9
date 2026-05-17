@@ -194,8 +194,16 @@ func fsMountCmd(args []string) error {
 	*server, *apiKey = serverVal, apiKeyVal
 	token := tokenVal
 
+	writePolicyVal, err := parseFuseWritePolicy(*writePolicy)
+	if err != nil {
+		return err
+	}
+
 	// WebDAV path: create client, start local WebDAV server, invoke mount_webdav.
 	if resolved == MountModeWebDAV {
+		if writePolicyVal != fuseWritePolicyWriteBack {
+			return fmt.Errorf("--write-policy is only supported with --mode=fuse; WebDAV mounts always use their native write behavior")
+		}
 		var c *client.Client
 		if token != "" {
 			c = client.NewWithToken(*server, token)
@@ -216,10 +224,6 @@ func fsMountCmd(args []string) error {
 
 	// FUSE path (existing behavior).
 	syncModeVal, err := parseFuseSyncMode(*syncMode)
-	if err != nil {
-		return err
-	}
-	writePolicyVal, err := parseFuseWritePolicy(*writePolicy)
 	if err != nil {
 		return err
 	}

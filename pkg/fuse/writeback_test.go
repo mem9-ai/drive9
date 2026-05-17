@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -16,6 +18,8 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
 func TestWriteBackCache_PutGetRemove(t *testing.T) {
@@ -811,16 +815,16 @@ func TestFlush_CloseSyncUploadsBeforeReturning(t *testing.T) {
 		Fh:       createOut.Fh,
 	})
 	if st != gofuse.OK {
-		t.Fatalf("Flush: %v", st)
+		t.Errorf("Flush: %v", st)
 	}
 	if putCalls.Load() != 1 {
-		t.Fatalf("PUT calls after Flush = %d, want 1", putCalls.Load())
+		t.Errorf("PUT calls after Flush = %d, want 1", putCalls.Load())
 	}
 	if string(uploaded) != "close-sync data" {
-		t.Fatalf("uploaded = %q, want %q", uploaded, "close-sync data")
+		t.Errorf("uploaded = %q, want %q", uploaded, "close-sync data")
 	}
 	if _, ok := cache.Get("/close_sync.txt"); ok {
-		t.Fatal("close-sync Flush should not leave a write-back cache entry")
+		t.Error("close-sync Flush should not leave a write-back cache entry")
 	}
 
 	fs.Release(nil, &gofuse.ReleaseIn{
@@ -829,7 +833,7 @@ func TestFlush_CloseSyncUploadsBeforeReturning(t *testing.T) {
 	})
 	uploader.DrainAll()
 	if putCalls.Load() != 1 {
-		t.Fatalf("PUT calls after Release = %d, want still 1", putCalls.Load())
+		t.Errorf("PUT calls after Release = %d, want still 1", putCalls.Load())
 	}
 }
 
@@ -866,16 +870,16 @@ func TestWriteSyncUploadsBeforeWriteReturns(t *testing.T) {
 		Fh:       createOut.Fh,
 	}, []byte("write-sync data"))
 	if st != gofuse.OK {
-		t.Fatalf("Write: %v", st)
+		t.Errorf("Write: %v", st)
 	}
 	if written != uint32(len("write-sync data")) {
-		t.Fatalf("written = %d, want %d", written, len("write-sync data"))
+		t.Errorf("written = %d, want %d", written, len("write-sync data"))
 	}
 	if putCalls.Load() != 1 {
-		t.Fatalf("PUT calls after Write = %d, want 1", putCalls.Load())
+		t.Errorf("PUT calls after Write = %d, want 1", putCalls.Load())
 	}
 	if string(uploaded) != "write-sync data" {
-		t.Fatalf("uploaded = %q, want %q", uploaded, "write-sync data")
+		t.Errorf("uploaded = %q, want %q", uploaded, "write-sync data")
 	}
 
 	st = fs.Flush(nil, &gofuse.FlushIn{
@@ -883,10 +887,140 @@ func TestWriteSyncUploadsBeforeWriteReturns(t *testing.T) {
 		Fh:       createOut.Fh,
 	})
 	if st != gofuse.OK {
-		t.Fatalf("Flush: %v", st)
+		t.Errorf("Flush: %v", st)
 	}
 	if putCalls.Load() != 1 {
-		t.Fatalf("PUT calls after clean Flush = %d, want still 1", putCalls.Load())
+		t.Errorf("PUT calls after clean Flush = %d, want still 1", putCalls.Load())
+	}
+}
+
+func TestWriteSyncFailureRollsBackDirtyState(t *testing.T) {
+	var putCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putCalls.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0, WritePolicy: WritePolicyWriteSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "write_sync_fail.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	written, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}, []byte("failed data"))
+	if st == gofuse.OK {
+		t.Fatal("Write status = OK, want remote failure")
+	}
+	if written != 0 {
+		t.Errorf("written = %d, want 0 on write-sync failure", written)
+	}
+
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created handle not found")
+	}
+	fh.Lock()
+	size := int64(0)
+	if fh.Dirty != nil {
+		size = fh.Dirty.Size()
+	}
+	fh.Unlock()
+	if size != 0 {
+		t.Errorf("dirty buffer size after failed write-sync = %d, want 0", size)
+	}
+
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	if st != gofuse.OK {
+		t.Errorf("Flush after failed write-sync: %v", st)
+	}
+	if putCalls.Load() != 1 {
+		t.Errorf("PUT calls after failed Write + Flush = %d, want 1", putCalls.Load())
+	}
+}
+
+func TestFlushCloseSyncRemoteFailureKeepsDirtyForRetry(t *testing.T) {
+	var putCalls atomic.Int32
+	var fail atomic.Bool
+	fail.Store(true)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putCalls.Add(1)
+			if fail.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"revision":2}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0, WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "close_sync_retry.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if _, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}, []byte("retry data")); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	if st == gofuse.OK {
+		t.Fatal("first Flush status = OK, want remote failure")
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created handle not found")
+	}
+	fh.Lock()
+	dirty := fh.Dirty != nil && fh.Dirty.HasDirtyParts()
+	fh.Unlock()
+	if !dirty {
+		t.Fatal("failed close-sync Flush cleared dirty data; want retryable dirty state")
+	}
+
+	fail.Store(false)
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	if st != gofuse.OK {
+		t.Fatalf("second Flush: %v", st)
+	}
+	if putCalls.Load() != 2 {
+		t.Errorf("PUT calls = %d, want 2", putCalls.Load())
 	}
 }
 
@@ -922,7 +1056,7 @@ func TestOSyncOpenPromotesWriteBackToWriteSync(t *testing.T) {
 		t.Fatal("created handle not found")
 	}
 	if fh.WritePolicy != WritePolicyWriteSync {
-		t.Fatalf("handle write policy = %v, want write-sync", fh.WritePolicy)
+		t.Errorf("handle write policy = %v, want write-sync", fh.WritePolicy)
 	}
 	_, st = fs.Write(nil, &gofuse.WriteIn{
 		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
@@ -932,8 +1066,206 @@ func TestOSyncOpenPromotesWriteBackToWriteSync(t *testing.T) {
 		t.Fatalf("Write: %v", st)
 	}
 	if putCalls.Load() != 1 {
-		t.Fatalf("PUT calls after O_SYNC Write = %d, want 1", putCalls.Load())
+		t.Errorf("PUT calls after O_SYNC Write = %d, want 1", putCalls.Load())
 	}
+}
+
+func TestSyncOpenFlagsPromoteCloseSyncToWriteSync(t *testing.T) {
+	opts := &MountOptions{WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	if got := fs.writePolicyForOpen(uint32(syscall.O_SYNC)); got != WritePolicyWriteSync {
+		t.Errorf("O_SYNC policy = %v, want write-sync", got)
+	}
+	if got := fs.writePolicyForOpen(uint32(syscall.O_DSYNC)); got != WritePolicyWriteSync {
+		t.Errorf("O_DSYNC policy = %v, want write-sync", got)
+	}
+}
+
+func TestWriteSyncDisablesStreamingUploaderForLargeSequentialWrites(t *testing.T) {
+	rec := newWriteSyncMultipartRecorder(t, "/stream_sync.bin")
+	opts := &MountOptions{FlushDebounce: 0, WritePolicy: WritePolicyWriteSync}
+	opts.setDefaults()
+	fs := NewDat9FS(rec.client(), opts)
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, "stream_sync.bin", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created handle not found")
+	}
+	if fh.Streamer != nil {
+		t.Fatal("write-sync handle should not attach StreamUploader")
+	}
+
+	chunk := bytesOf('a', int(s3client.PartSize))
+	written, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, chunk)
+	if st != gofuse.OK {
+		t.Fatalf("first Write: %v", st)
+	}
+	if written != uint32(len(chunk)) {
+		t.Fatalf("first written = %d, want %d", written, len(chunk))
+	}
+	chunk = bytesOf('b', int(s3client.PartSize))
+	written, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   uint64(s3client.PartSize),
+	}, chunk)
+	if st != gofuse.OK {
+		t.Fatalf("second Write: %v", st)
+	}
+	if written != uint32(len(chunk)) {
+		t.Fatalf("second written = %d, want %d", written, len(chunk))
+	}
+
+	if got := rec.initiateSizes(); len(got) != 2 || got[0] != int64(s3client.PartSize) || got[1] != 2*int64(s3client.PartSize) {
+		t.Fatalf("initiate sizes = %v, want [%d %d]", got, s3client.PartSize, 2*s3client.PartSize)
+	}
+	if got := rec.completePartCounts(); len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("complete part counts = %v, want [1 2]", got)
+	}
+}
+
+type writeSyncMultipartRecorder struct {
+	t            *testing.T
+	server       *httptest.Server
+	wantPath     string
+	mu           sync.Mutex
+	initiateByID map[string]int64
+	sizes        []int64
+	completes    []int
+}
+
+func newWriteSyncMultipartRecorder(t *testing.T, wantPath string) *writeSyncMultipartRecorder {
+	t.Helper()
+	rec := &writeSyncMultipartRecorder{
+		t:            t,
+		wantPath:     wantPath,
+		initiateByID: make(map[string]int64),
+	}
+	rec.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path      string `json:"path"`
+				TotalSize int64  `json:"total_size"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode initiate request: %v", err)
+			}
+			if req.Path != rec.wantPath {
+				t.Fatalf("initiate path = %q, want %q", req.Path, rec.wantPath)
+			}
+			rec.mu.Lock()
+			id := "upload-" + strconv.Itoa(len(rec.sizes)+1)
+			rec.sizes = append(rec.sizes, req.TotalSize)
+			rec.initiateByID[id] = req.TotalSize
+			rec.mu.Unlock()
+			totalParts := int((req.TotalSize + int64(s3client.PartSize) - 1) / int64(s3client.PartSize))
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   id,
+				"key":         "object-key",
+				"part_size":   int64(s3client.PartSize),
+				"total_parts": totalParts,
+			})
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/presign-batch"):
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/presign-batch")
+			rec.mu.Lock()
+			size := rec.initiateByID[id]
+			rec.mu.Unlock()
+			totalParts := int((size + int64(s3client.PartSize) - 1) / int64(s3client.PartSize))
+			parts := make([]map[string]any, 0, totalParts)
+			for pn := 1; pn <= totalParts; pn++ {
+				partSize := int64(s3client.PartSize)
+				if pn == totalParts && size%int64(s3client.PartSize) != 0 {
+					partSize = size % int64(s3client.PartSize)
+				}
+				parts = append(parts, map[string]any{
+					"number": pn,
+					"url":    rec.server.URL + "/s3/" + id + "/" + strconv.Itoa(pn),
+					"size":   partSize,
+				})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"parts": parts})
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/presign"):
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/presign")
+			var req struct {
+				PartNumber int `json:"part_number"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode presign request: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": req.PartNumber,
+				"url":    rec.server.URL + "/s3/" + id + "/" + strconv.Itoa(req.PartNumber),
+				"size":   int64(s3client.PartSize),
+			})
+			return
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/"):
+			if _, err := io.Copy(io.Discard, r.Body); err != nil {
+				t.Fatalf("read s3 body: %v", err)
+			}
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/complete"):
+			var req struct {
+				Parts []struct {
+					Number int    `json:"number"`
+					ETag   string `json:"etag"`
+				} `json:"parts"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode complete request: %v", err)
+			}
+			rec.mu.Lock()
+			rec.completes = append(rec.completes, len(req.Parts))
+			rec.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+	}))
+	t.Cleanup(rec.server.Close)
+	return rec
+}
+
+func (rec *writeSyncMultipartRecorder) client() *client.Client {
+	return newTestClient(rec.server.URL)
+}
+
+func (rec *writeSyncMultipartRecorder) initiateSizes() []int64 {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return append([]int64(nil), rec.sizes...)
+}
+
+func (rec *writeSyncMultipartRecorder) completePartCounts() []int {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return append([]int(nil), rec.completes...)
+}
+
+func bytesOf(b byte, n int) []byte {
+	data := make([]byte, n)
+	for i := range data {
+		data[i] = b
+	}
+	return data
 }
 
 // TestFlush_WriteBack_Lifecycle tests the full echo "xxx" > file lifecycle

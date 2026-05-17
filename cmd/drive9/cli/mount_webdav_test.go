@@ -651,6 +651,22 @@ func TestFsMountCmd_SingleArgDefaultsToRootRemote(t *testing.T) {
 	}
 }
 
+func TestFsMountCmdRejectsWritePolicyForWebDAV(t *testing.T) {
+	err := fsMountCmd([]string{
+		"--mode=webdav",
+		"--server=https://drive9.example",
+		"--api-key=sk-test",
+		"--write-policy=close-sync",
+		t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("expected WebDAV write-policy rejection")
+	}
+	if !strings.Contains(err.Error(), "--write-policy is only supported with --mode=fuse") {
+		t.Fatalf("error = %v, want write-policy WebDAV rejection", err)
+	}
+}
+
 // isolateMountCredentialsForTest keeps parsing-only mount tests from reading
 // the developer machine's DRIVE9_* env vars or active drive9 context. Without
 // this, a test that expects credential resolution to fail can reach the real

@@ -20,18 +20,18 @@ const (
 )
 
 // WritePolicy controls when ordinary writes become remote-durable.
-type WritePolicy int
+type WritePolicy string
 
 const (
 	// WritePolicyWriteBack preserves the existing behavior: writes are staged
 	// locally and remote upload may happen asynchronously after close.
-	WritePolicyWriteBack WritePolicy = iota
+	WritePolicyWriteBack WritePolicy = "writeback"
 	// WritePolicyCloseSync makes close remote-durable by forcing cloud upload
 	// from Flush, the FUSE operation whose status propagates to close(2).
-	WritePolicyCloseSync
+	WritePolicyCloseSync WritePolicy = "close-sync"
 	// WritePolicyWriteSync makes each Write operation remote-durable before
 	// returning success. This is intentionally expensive.
-	WritePolicyWriteSync
+	WritePolicyWriteSync WritePolicy = "write-sync"
 )
 
 // String returns the write policy name for CLI/logging.
@@ -44,7 +44,7 @@ func (p WritePolicy) String() string {
 	case WritePolicyWriteSync:
 		return "write-sync"
 	default:
-		return "unknown"
+		return fmt.Sprintf("unknown(%s)", string(p))
 	}
 }
 

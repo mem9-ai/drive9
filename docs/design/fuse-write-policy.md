@@ -36,6 +36,10 @@ Valid values:
 
 Default is `writeback` to preserve existing behavior.
 
+The flag applies only to FUSE mounts. WebDAV mounts use their native write
+behavior; passing a non-default `--write-policy` with a WebDAV-resolved mount is
+rejected instead of silently ignored.
+
 ## Relationship To Existing Sync Mode
 
 `--sync-mode=auto|interactive|strict` already exists and controls explicit
@@ -55,9 +59,11 @@ Precedence:
 The mount-level policy is copied into `FileHandle.WritePolicy` at `Create` or
 `Open` time. The policy does not change for that handle.
 
-When the mount default is `writeback`, a writable open with `O_SYNC` is
-promoted to `write-sync`. This mirrors the operating system model where sync
-behavior is chosen when the descriptor is opened.
+When a writable handle is opened with `O_SYNC` or `O_DSYNC`, it is promoted to
+`write-sync` regardless of the mount default. This includes `close-sync` mounts:
+the per-descriptor sync request is stronger than close-time durability. This
+mirrors the operating system model where sync behavior is chosen when the
+descriptor is opened.
 
 ## FUSE Placement
 
@@ -79,14 +85,22 @@ Therefore:
 
 Remote synchronization reuses the existing upload machinery:
 
-- Shadow-spill handles stream from `ShadowStore` with `uploadFromShadowRemote`.
-- Non-shadow handles use `flushHandle`, preserving the existing direct PUT,
-  patch, stream upload, and multipart decisions.
+- `close-sync` handles reuse the flush-time direct PUT, patch, stream upload,
+  multipart, and shadow-spill paths. After a successful shadow-spill upload, the
+  local shadow is retired so later read-only opens do not pin stale local data.
+- `write-sync` handles do not use the streaming uploader. Each write is treated
+  as a serialized write-and-commit transaction for that file handle. This avoids
+  reusing flush-time multipart state across multiple per-write commits.
+- `write-sync` direct/small writes upload the current full handle contents.
+  Existing large-file edits use the patch path when possible.
 - Timeouts use `releaseTimeout(size)` so large files are not limited by the
   generic FUSE operation timeout.
 - On success, dirty state is cleared and inode/read cache metadata is updated.
-- On failure, local shadow/pending state is preserved where possible so data is
-  not silently discarded.
+- On `write-sync` failure, the write reports failure and the handle rolls back to
+  its pre-write dirty-buffer snapshot so data the kernel believes was not
+  written is not uploaded later by close or flush.
+- On `close-sync` failure, dirty state remains retryable because the write
+  syscall already succeeded and `Flush` is the failing operation.
 
 ## Expected Tradeoffs
 
@@ -96,3 +110,8 @@ latency include network, server, database, and S3/db9 latency.
 `write-sync` can be dramatically slower for normal buffered writers because a
 single logical file copy may be split into many FUSE write requests. It is
 intended for explicit durability-sensitive workloads, not as the default.
+
+For append-heavy workloads, `write-sync` may repeatedly upload or validate an
+ever-growing file snapshot. A sequence of many small writes to a large file can
+therefore have O(n²) byte-transfer amplification. Use `close-sync` when the
+required durability boundary is file close rather than every individual write.
