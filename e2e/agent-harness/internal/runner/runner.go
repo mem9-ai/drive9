@@ -4,6 +4,7 @@ package runner
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -1576,7 +1577,12 @@ func host() string {
 }
 
 func runID() string {
-	return time.Now().UTC().Format("20060102T150405Z")
+	ts := time.Now().UTC().Format("20060102T150405Z")
+	var suffix [4]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return time.Now().UTC().Format("20060102T150405.000000000Z")
+	}
+	return ts + "-" + hex.EncodeToString(suffix[:])
 }
 
 func now() string {
