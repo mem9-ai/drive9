@@ -61,6 +61,14 @@ type EvidenceConfig struct {
 	ApproveExternal bool
 }
 
+var (
+	ErrConfirmDeleteRequired = errors.New("gc requires --confirm-delete")
+	ErrGateFailed            = errors.New("harness gate failed")
+	ErrUnsafeMountpoint      = errors.New("unsafe mountpoint")
+
+	harnessHTTPClient = &http.Client{Timeout: 30 * time.Second}
+)
+
 func DefaultConfig() Config {
 	return Config{
 		ArtifactRoot:     "/tmp",
@@ -91,7 +99,7 @@ func Preflight(ctx context.Context, cfg Config) error {
 	if cfg.APIKey == "" && !cfg.Provision {
 		return errors.New("preflight: --api-key or --provision is required")
 	}
-	if cfg.APIKey != "" {
+	if cfg.APIKey != "" && !cfg.Provision {
 		if err := checkStatus(ctx, cfg.Server, cfg.APIKey); err != nil {
 			return err
 		}
@@ -193,8 +201,6 @@ func Regenerate(runDir string) error {
 	_, _, err := report.Generate(runDir)
 	return err
 }
-
-var ErrGateFailed = errors.New("harness gate failed")
 
 func gateError(runDir string, gating report.Gating) error {
 	if gating.GateStatus != "fail" && gating.GateStatus != "harness_failed" {
@@ -690,7 +696,7 @@ func runGitWorkflow(ctx context.Context, rec *report.Recorder, mountpoint string
 		return nil
 	}
 	checkNoGitLocks(rec, c, repoPath, "after clone")
-	before := gitCommitCount(ctx, git, repoPath)
+	before := gitCommitCount(gitCtx, git, repoPath)
 	userName := c.Workload.GitUserName
 	if userName == "" {
 		userName = "Drive9 Harness"
@@ -699,14 +705,14 @@ func runGitWorkflow(ctx context.Context, rec *report.Recorder, mountpoint string
 	if userEmail == "" {
 		userEmail = "drive9-harness@example.invalid"
 	}
-	if result := mountproc.Run(ctx, "git-config-name", mountproc.Env{}, repoPath, git, "config", "user.name", userName); result.ExitCode != 0 {
+	if result := mountproc.Run(gitCtx, "git-config-name", mountproc.Env{}, repoPath, git, "config", "user.name", userName); result.ExitCode != 0 {
 		recordResult(rec, c.ID, result)
 		recordOracleFailure(rec, c, "git_config", result.Stderr, "exit 0")
 		return nil
 	} else {
 		recordResult(rec, c.ID, result)
 	}
-	if result := mountproc.Run(ctx, "git-config-email", mountproc.Env{}, repoPath, git, "config", "user.email", userEmail); result.ExitCode != 0 {
+	if result := mountproc.Run(gitCtx, "git-config-email", mountproc.Env{}, repoPath, git, "config", "user.email", userEmail); result.ExitCode != 0 {
 		recordResult(rec, c.ID, result)
 		recordOracleFailure(rec, c, "git_config", result.Stderr, "exit 0")
 		return nil
@@ -731,27 +737,34 @@ func runGitWorkflow(ctx context.Context, rec *report.Recorder, mountpoint string
 		recordOracleFailure(rec, c, "git_mutation", err.Error(), "write success")
 		return nil
 	}
-	_, _ = f.WriteString(c.Workload.Mutation.Content)
-	_ = f.Close()
-	if result := mountproc.Run(ctx, "git-add", mountproc.Env{}, repoPath, git, "add", c.Workload.Mutation.Path); result.ExitCode != 0 {
+	if _, err := f.WriteString(c.Workload.Mutation.Content); err != nil {
+		_ = f.Close()
+		recordOracleFailure(rec, c, "git_mutation", err.Error(), "write success")
+		return nil
+	}
+	if err := f.Close(); err != nil {
+		recordOracleFailure(rec, c, "git_mutation", err.Error(), "close success")
+		return nil
+	}
+	if result := mountproc.Run(gitCtx, "git-add", mountproc.Env{}, repoPath, git, "add", c.Workload.Mutation.Path); result.ExitCode != 0 {
 		recordResult(rec, c.ID, result)
 		recordOracleFailure(rec, c, "git_add", result.Stderr, "exit 0")
 		return nil
 	} else {
 		recordResult(rec, c.ID, result)
 	}
-	if result := mountproc.Run(ctx, "git-commit", mountproc.Env{}, repoPath, git, "commit", "-m", c.Workload.CommitMessage); result.ExitCode != 0 {
+	if result := mountproc.Run(gitCtx, "git-commit", mountproc.Env{}, repoPath, git, "commit", "-m", c.Workload.CommitMessage); result.ExitCode != 0 {
 		recordResult(rec, c.ID, result)
 		recordOracleFailure(rec, c, "git_commit", result.Stderr, "exit 0")
 		return nil
 	} else {
 		recordResult(rec, c.ID, result)
 	}
-	after := gitCommitCount(ctx, git, repoPath)
+	after := gitCommitCount(gitCtx, git, repoPath)
 	if after-before != c.Workload.ExpectedCommitDelta {
 		recordOracleFailure(rec, c, "git_commit_count", after-before, c.Workload.ExpectedCommitDelta)
 	}
-	status := mountproc.Run(ctx, "git-status", mountproc.Env{}, repoPath, git, "status", "--porcelain")
+	status := mountproc.Run(gitCtx, "git-status", mountproc.Env{}, repoPath, git, "status", "--porcelain")
 	recordResult(rec, c.ID, status)
 	if strings.TrimSpace(status.Stdout) != strings.TrimSpace(c.Workload.ExpectedStatus) {
 		recordOracleFailure(rec, c, "git_status_equals", status.Stdout, c.Workload.ExpectedStatus)
@@ -767,9 +780,28 @@ func runDoctor(ctx context.Context, rec *report.Recorder, env mountproc.Env, dri
 		want = *c.Workload.ExpectExit
 	}
 	if result.ExitCode != want {
+		if c.Workload.AllowNonzeroWhenNoAllowOther && doctorOnlyNoAllowOtherFailed(result.Stdout+result.Stderr) {
+			return nil
+		}
 		recordOracleFailure(rec, c, "command_exit", result.ExitCode, want)
 	}
 	return nil
+}
+
+func doctorOnlyNoAllowOtherFailed(output string) bool {
+	failures := 0
+	noAllowOther := false
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "FAIL ") {
+			continue
+		}
+		failures++
+		if strings.Contains(line, "/etc/fuse.conf user_allow_other:") {
+			noAllowOther = true
+		}
+	}
+	return failures == 1 && noAllowOther
 }
 
 func runOpenFDUnmount(ctx context.Context, rec *report.Recorder, env mountproc.Env, drive9Bin, mountpoint string, c casefile.Case, mount **mountproc.Mount) error {
@@ -819,33 +851,43 @@ func runKillDuringWrite(ctx context.Context, rec *report.Recorder, manifest *rep
 		writerDone <- writeSizedFile(ctx, target, c.Workload.WriterBytes, 'K')
 	}()
 	timer := time.NewTimer(c.Workload.KillAfter.Duration)
+	var writerErr error
+	writerFinished := false
+	killed := false
 	select {
 	case <-ctx.Done():
 		timer.Stop()
 		return ctx.Err()
-	case writerErr := <-writerDone:
-		timer.Stop()
-		if writerErr != nil {
-			recordFailure(rec, c, "recovery_classified", "inconclusive", writerErr.Error(), "writer starts")
+	case writerErr = <-writerDone:
+		writerFinished = true
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
 		}
 	case <-timer.C:
+		killed = true
 		if mount != nil && *mount != nil {
 			_ = mountproc.KillMount(*mount)
 			*mount = nil
 			_ = rec.Event(report.Event{CaseID: c.ID, Type: "mount_end", Message: "mount process group killed during active write"})
 		}
 	}
-	var writerErr error
-	select {
-	case writerErr = <-writerDone:
-	default:
-		writerErr = errors.New("writer interrupted before acknowledged completion")
+	if killed && !writerFinished {
+		select {
+		case writerErr = <-writerDone:
+		default:
+			writerErr = errors.New("writer interrupted before acknowledged completion")
+		}
 	}
-	nextMount, err := startCaseMount(ctx, rec, manifest, env, drive9Bin, caseRemote, mountpoint, c)
-	if err != nil {
-		return err
+	if killed {
+		nextMount, err := startCaseMount(ctx, rec, manifest, env, drive9Bin, caseRemote, mountpoint, c)
+		if err != nil {
+			return err
+		}
+		*mount = nextMount
 	}
-	*mount = nextMount
 	info, statErr := os.Stat(target)
 	if writerErr != nil {
 		observed := map[string]any{"writer_error": writerErr.Error()}
@@ -1295,7 +1337,7 @@ func captureDebug(ctx context.Context, rec *report.Recorder, label string) error
 
 func GC(ctx context.Context, cfg GCConfig) error {
 	if !cfg.ConfirmDelete {
-		return errors.New("gc requires --confirm-delete")
+		return ErrConfirmDeleteRequired
 	}
 	manifest := report.Manifest{}
 	if err := readJSON(filepath.Join(cfg.RunDir, "manifest.json"), &manifest); err != nil {
@@ -1322,10 +1364,13 @@ func GC(ctx context.Context, cfg GCConfig) error {
 		cleanMP := filepath.Clean(mp)
 		cleanRoot := filepath.Clean(manifest.MountRoot)
 		if cleanMP == cleanRoot || !strings.HasPrefix(cleanMP, cleanRoot+string(os.PathSeparator)) {
-			return fmt.Errorf("refusing to delete unsafe mountpoint for %s: %q", id, mp)
+			return fmt.Errorf("%w for %s: %q", ErrUnsafeMountpoint, id, mp)
 		}
 		mounted, err := safety.IsMounted(mp)
-		if err == nil && mounted {
+		if err != nil {
+			return fmt.Errorf("check mountpoint %s: %w", mp, err)
+		}
+		if mounted {
 			result := mountproc.Stop(ctx, env, drive9Bin, mp)
 			if result.ExitCode != 0 {
 				return fmt.Errorf("unmount %s (%s): %s", id, mp, result.Stderr)
@@ -1414,7 +1459,7 @@ func provision(ctx context.Context, server string, timeout time.Duration) (strin
 	if err != nil {
 		return "", err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := harnessHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -1446,7 +1491,7 @@ func checkStatus(ctx context.Context, server, apiKey string) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := harnessHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -1464,7 +1509,7 @@ func pollStatus(ctx context.Context, server, apiKey string) error {
 			return err
 		}
 		req.Header.Set("Authorization", "Bearer "+apiKey)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := harnessHTTPClient.Do(req)
 		if err != nil {
 			return err
 		}

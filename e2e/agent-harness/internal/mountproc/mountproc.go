@@ -97,13 +97,20 @@ func StartMount(ctx context.Context, id string, env Env, drive9Bin, remoteRoot, 
 func WaitMounted(ctx context.Context, mountpoint string, check func(string) (bool, error)) error {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
+	var lastErr error
 	for {
 		mounted, err := check(mountpoint)
 		if err == nil && mounted {
 			return nil
 		}
+		if err != nil {
+			lastErr = err
+		}
 		select {
 		case <-ctx.Done():
+			if lastErr != nil {
+				return fmt.Errorf("%w: %s: %v", ErrMountTimeout, mountpoint, lastErr)
+			}
 			return fmt.Errorf("%w: %s", ErrMountTimeout, mountpoint)
 		case <-ticker.C:
 		}
