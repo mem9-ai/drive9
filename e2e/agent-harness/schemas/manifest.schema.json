@@ -64,12 +64,11 @@
         "required": [
           "id",
           "suite",
-          "expected_outcome",
-          "status"
+          "expected_outcome"
         ],
         "properties": {
           "id": {
-            "type": "string",
+
             "minLength": 1
           },
           "suite": {
