@@ -12,6 +12,7 @@
     "server",
     "suites",
     "selected_cases",
+    "cases",
     "artifact_root",
     "mount_root",
     "remote_root_base",
@@ -56,7 +57,47 @@
       }
     },
     "cases": {
-      "type": "array"
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "suite",
+          "expected_outcome",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "suite": {
+            "enum": [
+              "smoke",
+              "regression",
+              "stress",
+              "fault"
+            ]
+          },
+          "expected_outcome": {
+            "enum": [
+              "baseline_pass",
+              "bug_reproduced",
+              "fix_verified"
+            ]
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "failed",
+              "inconclusive",
+              "known_bug_reproduced",
+              "known_bug_fixed_candidate"
+            ]
+          }
+        }
+      }
     },
     "artifact_root": {
       "type": "string"

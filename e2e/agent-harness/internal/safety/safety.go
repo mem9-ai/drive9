@@ -64,7 +64,9 @@ func Mountpoint(root, runID, suffix string) (string, error) {
 }
 
 func ValidateMountpointAvailable(mp string) error {
-	if mounted, err := IsMounted(mp); err == nil && mounted {
+	if mounted, err := IsMounted(mp); err != nil {
+		return fmt.Errorf("%w: mount status check failed for %s: %v", ErrExistingMountpoint, mp, err)
+	} else if mounted {
 		return fmt.Errorf("%w: %s is already mounted", ErrExistingMountpoint, mp)
 	}
 	info, err := os.Lstat(mp)

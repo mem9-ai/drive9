@@ -7,12 +7,39 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/mem9-ai/dat9/e2e/agent-harness/internal/casefile"
+	"github.com/mem9-ai/dat9/e2e/agent-harness/internal/mountproc"
+	"github.com/mem9-ai/dat9/e2e/agent-harness/internal/report"
 )
 
 func TestGCRequiresConfirmDelete(t *testing.T) {
 	err := GC(context.Background(), GCConfig{RunDir: t.TempDir()})
-	if err == nil || err.Error() != "gc requires --confirm-delete" {
-		t.Fatalf("err = %v, want confirm-delete error", err)
+	if !errors.Is(err, ErrConfirmDeleteRequired) {
+		t.Fatalf("err = %v, want ErrConfirmDeleteRequired", err)
+	}
+}
+
+func TestPreflightSkipsStatusWhenProvisioning(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX fake drive9 script")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "drive9")
+	if err := os.WriteFile(bin, []byte("#!/usr/bin/env sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := Preflight(context.Background(), Config{
+		ArtifactRoot:   dir,
+		MountRoot:      dir,
+		RemoteRootBase: "/agent-test",
+		Drive9Bin:      bin,
+		Server:         "http://127.0.0.1:1",
+		APIKey:         "stale-key",
+		Provision:      true,
+	})
+	if err != nil {
+		t.Fatalf("Preflight returned %v, want nil", err)
 	}
 }
 
@@ -103,7 +130,39 @@ func TestGCRejectsUnsafeMountpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := GC(context.Background(), GCConfig{RunDir: runDir, ConfirmDelete: true, SuccessfulOnly: true})
-	if err == nil {
-		t.Fatal("expected unsafe mountpoint rejection")
+	if !errors.Is(err, ErrUnsafeMountpoint) {
+		t.Fatalf("err = %v, want ErrUnsafeMountpoint", err)
+	}
+}
+
+func TestRunDoctorAllowsNoAllowOtherOnlyFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX fake drive9 script")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "drive9")
+	script := "#!/usr/bin/env sh\nprintf '%s\\n' 'drive9 doctor fuse' 'FAIL /etc/fuse.conf user_allow_other: user_allow_other is not enabled'\nexit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := report.NewRecorder(dir, "run1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	c := casefile.Case{
+		ID:              "doctor",
+		ExpectedOutcome: "bug_reproduced",
+		Severity:        casefile.SeveritySpec{Failure: "P2"},
+		Workload: casefile.Workload{
+			ExpectExit:                   &zero,
+			AllowNonzeroWhenNoAllowOther: true,
+		},
+	}
+	if err := runDoctor(context.Background(), rec, mountproc.Env{}, bin, dir, c); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "failures.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("failures.jsonl err = %v, want not exist", err)
 	}
 }
