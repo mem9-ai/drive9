@@ -29,19 +29,24 @@
       ]
     },
     "pass": {
-      "type": "integer"
+      "type": "integer",
+      "minimum": 0
     },
     "fail": {
-      "type": "integer"
+      "type": "integer",
+      "minimum": 0
     },
     "known_bug_reproduced": {
-      "type": "integer"
+      "type": "integer",
+      "minimum": 0
     },
     "known_bug_fixed_candidate": {
-      "type": "integer"
+      "type": "integer",
+      "minimum": 0
     },
     "non_gating": {
-      "type": "integer"
+      "type": "integer",
+      "minimum": 0
     },
     "blocking_failures": {
       "type": "array"

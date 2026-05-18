@@ -11,7 +11,11 @@ import (
 	"time"
 )
 
-const SchemaVersion = "agent-harness.v1"
+const (
+	SchemaVersion      = "agent-harness.v1"
+	jsonlInitialBuffer = 64 * 1024
+	jsonlMaxTokenSize  = 4 * 1024 * 1024
+)
 
 type Manifest struct {
 	SchemaVersion        string            `json:"schema_version"`
@@ -171,6 +175,11 @@ func Generate(runDir string) (Summary, Gating, error) {
 		return Summary{}, Gating{}, err
 	}
 	ended := now()
+	if runEnd, err := readRunEnd(filepath.Join(runDir, "events.jsonl")); err != nil {
+		return Summary{}, Gating{}, err
+	} else if runEnd != "" {
+		ended = runEnd
+	}
 	var durationMS int64
 	if manifest.StartedAt != "" {
 		if startedAt, err := time.Parse(time.RFC3339Nano, manifest.StartedAt); err == nil {
@@ -300,6 +309,7 @@ func readFailures(path string) ([]Failure, error) {
 	defer func() { _ = f.Close() }()
 	var out []Failure
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, jsonlInitialBuffer), jsonlMaxTokenSize)
 	for scanner.Scan() {
 		var failure Failure
 		if err := json.Unmarshal(scanner.Bytes(), &failure); err != nil {
@@ -308,6 +318,30 @@ func readFailures(path string) ([]Failure, error) {
 		out = append(out, failure)
 	}
 	return out, scanner.Err()
+}
+
+func readRunEnd(path string) (string, error) {
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	var ended string
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, jsonlInitialBuffer), jsonlMaxTokenSize)
+	for scanner.Scan() {
+		var event Event
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+			return "", err
+		}
+		if event.Type == "run_end" && event.TS != "" {
+			ended = event.TS
+		}
+	}
+	return ended, scanner.Err()
 }
 
 func appendJSONL(path string, v any) error {

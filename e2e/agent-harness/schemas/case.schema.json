@@ -12,6 +12,7 @@
       "minItems": 1,
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "required": [
           "id",
           "suite",
@@ -67,8 +68,12 @@
               "never"
             ]
           },
+          "requires_fresh_tenant": {
+            "type": "boolean"
+          },
           "workload": {
             "type": "object",
+            "additionalProperties": false,
             "required": [
               "type"
             ],
@@ -86,6 +91,157 @@
                   "open_fd_unmount",
                   "kill_during_write"
                 ]
+              },
+              "files": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "relative_path",
+                    "content"
+                  ],
+                  "properties": {
+                    "relative_path": {
+                      "type": "string"
+                    },
+                    "content": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "content_template": {
+                "type": "string"
+              },
+              "read_after_write_timeout": {
+                "type": "string"
+              },
+              "remount": {
+                "type": "boolean"
+              },
+              "size_bytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "block_bytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "file_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "parallel_writers": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "writer_bytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "read_sample_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "min_bytes_per_second": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "fio_binary": {
+                "type": "string"
+              },
+              "hold_open_duration": {
+                "type": "string"
+              },
+              "kill_after": {
+                "type": "string"
+              },
+              "clone_url": {
+                "type": "string"
+              },
+              "git_binary": {
+                "type": "string"
+              },
+              "git_timeout": {
+                "type": "string"
+              },
+              "git_user_name": {
+                "type": "string"
+              },
+              "git_user_email": {
+                "type": "string"
+              },
+              "clone_dir": {
+                "type": "string"
+              },
+              "mutation": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "path",
+                  "mode",
+                  "content"
+                ],
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "enum": [
+                      "append",
+                      "overwrite"
+                    ]
+                  },
+                  "content": {
+                    "type": "string"
+                  }
+                }
+              },
+              "commit_message": {
+                "type": "string"
+              },
+              "expected_locks": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "expected_status": {
+                "type": "string"
+              },
+              "expected_commit_delta": {
+                "type": "integer"
+              },
+              "remount_verify_paths": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "path"
+                  ],
+                  "properties": {
+                    "path": {
+                      "type": "string"
+                    },
+                    "sha256": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "expect_exit": {
+                "type": "integer"
+              },
+              "allow_nonzero_when_no_allow_other": {
+                "type": "boolean"
               }
             }
           },
@@ -94,6 +250,7 @@
             "minItems": 1,
             "items": {
               "type": "object",
+              "additionalProperties": false,
               "required": [
                 "type"
               ],
@@ -113,12 +270,59 @@
                     "unmount_busy_then_clean",
                     "recovery_classified"
                   ]
+                },
+                "path": {
+                  "type": "string"
+                },
+                "expected_bytes": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "command_id": {
+                  "type": "string"
+                },
+                "remote_path": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "paths": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "expected_hashes": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                },
+                "globs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "expected_status": {
+                  "type": "string"
+                },
+                "repo_path": {
+                  "type": "string"
+                },
+                "expected_delta": {
+                  "type": "integer"
+                },
+                "expected_exit": {
+                  "type": "integer"
                 }
               }
             }
           },
           "severity": {
             "type": "object",
+            "additionalProperties": false,
             "required": [
               "failure"
             ],
