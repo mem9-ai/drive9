@@ -73,8 +73,11 @@ func StartMount(ctx context.Context, id string, env Env, drive9Bin, remoteRoot, 
 		return nil, err
 	}
 	args := []string{"mount", "--mode", "fuse", "--perf-counters"}
-	if syncMode != "" {
-		args = append(args, "--sync-mode", syncMode)
+	if syncModeArgs, err := mountSyncArgs(ctx, drive9Bin, syncMode); err != nil {
+		_ = logFile.Close()
+		return nil, err
+	} else {
+		args = append(args, syncModeArgs...)
 	}
 	args = append(args, ":"+remoteRoot, mountpoint)
 	cmd := exec.CommandContext(ctx, drive9Bin, args...)
@@ -92,6 +95,49 @@ func StartMount(ctx context.Context, id string, env Env, drive9Bin, remoteRoot, 
 		_ = logFile.Close()
 	}()
 	return &Mount{ID: id, Cmd: cmd, Mountpoint: mountpoint, LogPath: logPath, ProcessGroup: pgid}, nil
+}
+
+func mountSyncArgs(ctx context.Context, drive9Bin, syncMode string) ([]string, error) {
+	if syncMode == "" {
+		return nil, nil
+	}
+	flag := detectMountSyncFlag(ctx, drive9Bin)
+	value := syncMode
+	if flag == "--durability" {
+		mapped, err := syncModeToDurability(syncMode)
+		if err != nil {
+			return nil, err
+		}
+		value = mapped
+	}
+	return []string{flag, value}, nil
+}
+
+func detectMountSyncFlag(ctx context.Context, drive9Bin string) string {
+	helpCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(helpCtx, drive9Bin, "mount", "--help").CombinedOutput()
+	switch {
+	case bytes.Contains(out, []byte("--durability")):
+		return "--durability"
+	case bytes.Contains(out, []byte("--sync-mode")):
+		return "--sync-mode"
+	default:
+		return "--durability"
+	}
+}
+
+func syncModeToDurability(syncMode string) (string, error) {
+	switch syncMode {
+	case "auto":
+		return "auto", nil
+	case "interactive":
+		return "interactive", nil
+	case "strict":
+		return "fsync", nil
+	default:
+		return "", fmt.Errorf("unknown sync mode %q", syncMode)
+	}
 }
 
 func WaitMounted(ctx context.Context, mountpoint string, check func(string) (bool, error)) error {

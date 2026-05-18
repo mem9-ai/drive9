@@ -178,11 +178,17 @@ func Run(ctx context.Context, cfg Config) (string, error) {
 		APIKeyRedacted:       redact(apiKey),
 		ApprovalMode:         "phase1-local",
 	}
+	if err := rec.WriteManifest(manifest); err != nil {
+		return runDir, err
+	}
 	_ = rec.Event(report.Event{Type: "run_start"})
 	env := mountproc.Env{Server: cfg.Server, APIKey: apiKey}
 	for _, c := range cases {
 		if err := runCase(ctx, rec, &manifest, env, drive9Bin, remoteRootBase, mountRoot, id, c); err != nil {
 			_ = rec.Failure(report.Failure{CaseID: c.ID, Severity: c.Severity.Failure, Class: "harness", Oracle: "runner", ExpectedOutcome: c.ExpectedOutcome, Message: err.Error()})
+		}
+		if err := rec.WriteManifest(manifest); err != nil {
+			return runDir, err
 		}
 	}
 	_ = captureDebug(ctx, rec, "run-end")
@@ -875,9 +881,14 @@ func runKillDuringWrite(ctx context.Context, rec *report.Recorder, manifest *rep
 		}
 	}
 	if killed && !writerFinished {
+		drainTimer := time.NewTimer(2 * time.Second)
 		select {
 		case writerErr = <-writerDone:
-		default:
+			drainTimer.Stop()
+		case <-ctx.Done():
+			drainTimer.Stop()
+			return ctx.Err()
+		case <-drainTimer.C:
 			writerErr = errors.New("writer interrupted before acknowledged completion")
 		}
 	}
