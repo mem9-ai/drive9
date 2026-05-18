@@ -750,6 +750,77 @@ func TestMountCmdPassesReadCacheMaxFileOption(t *testing.T) {
 	}
 }
 
+func TestMountCmdMapsDurabilityOption(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	tests := []struct {
+		name       string
+		args       []string
+		wantSync   fuseSyncMode
+		wantPolicy fuseWritePolicy
+	}{
+		{
+			name:       "default",
+			wantSync:   fuseSyncModeAuto,
+			wantPolicy: fuseWritePolicyWriteBack,
+		},
+		{
+			name:       "interactive",
+			args:       []string{"--durability", "interactive"},
+			wantSync:   fuseSyncModeInteractive,
+			wantPolicy: fuseWritePolicyWriteBack,
+		},
+		{
+			name:       "fsync",
+			args:       []string{"--durability", "fsync"},
+			wantSync:   fuseSyncModeStrict,
+			wantPolicy: fuseWritePolicyWriteBack,
+		},
+		{
+			name:       "close-sync",
+			args:       []string{"--durability", "close-sync"},
+			wantSync:   fuseSyncModeStrict,
+			wantPolicy: fuseWritePolicyCloseSync,
+		},
+		{
+			name:       "write-sync",
+			args:       []string{"--durability", "write-sync"},
+			wantSync:   fuseSyncModeStrict,
+			wantPolicy: fuseWritePolicyWriteSync,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got *mountFuseOptions
+			mountFuse = func(opts *mountFuseOptions) error {
+				copied := *opts
+				got = &copied
+				return nil
+			}
+
+			args := []string{
+				"--mode", "fuse",
+				"--server", "https://drive9.example",
+				"--api-key", "sk-test",
+			}
+			args = append(args, tt.args...)
+			args = append(args, t.TempDir())
+
+			if err := MountCmd(args); err != nil {
+				t.Fatalf("MountCmd: %v", err)
+			}
+			if got == nil {
+				t.Fatal("mountFuse was not called")
+			}
+			if got.SyncMode != tt.wantSync || got.WritePolicy != tt.wantPolicy {
+				t.Fatalf("durability mapped to sync=%q policy=%q, want sync=%q policy=%q", got.SyncMode, got.WritePolicy, tt.wantSync, tt.wantPolicy)
+			}
+		})
+	}
+}
+
 func TestMountCmdLeavesDefaultTTLsUnsetForFuseDefaults(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })

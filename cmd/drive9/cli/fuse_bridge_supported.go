@@ -8,22 +8,6 @@ import (
 	drive9fuse "github.com/mem9-ai/dat9/pkg/fuse"
 )
 
-func parseFuseSyncModeImpl(s string) (fuseSyncMode, error) {
-	mode, err := drive9fuse.ParseSyncMode(s)
-	if err != nil {
-		return "", err
-	}
-	return fromDrive9FuseSyncMode(mode), nil
-}
-
-func parseFuseWritePolicyImpl(s string) (fuseWritePolicy, error) {
-	policy, err := drive9fuse.ParseWritePolicy(s)
-	if err != nil {
-		return "", err
-	}
-	return fromDrive9FuseWritePolicy(policy), nil
-}
-
 func mountFuseImpl(opts *mountFuseOptions) error {
 	mode, err := toDrive9FuseSyncMode(opts.SyncMode)
 	if err != nil {
@@ -75,28 +59,6 @@ func mountVaultImpl(opts *vaultMountOptions) error {
 		AllowOther: opts.AllowOther,
 		Debug:      opts.Debug,
 	})
-}
-
-func fromDrive9FuseSyncMode(mode drive9fuse.SyncMode) fuseSyncMode {
-	switch mode {
-	case drive9fuse.SyncInteractive:
-		return fuseSyncModeInteractive
-	case drive9fuse.SyncStrict:
-		return fuseSyncModeStrict
-	default:
-		return fuseSyncModeAuto
-	}
-}
-
-func fromDrive9FuseWritePolicy(policy drive9fuse.WritePolicy) fuseWritePolicy {
-	switch policy {
-	case drive9fuse.WritePolicyCloseSync:
-		return fuseWritePolicyCloseSync
-	case drive9fuse.WritePolicyWriteSync:
-		return fuseWritePolicyWriteSync
-	default:
-		return fuseWritePolicyWriteBack
-	}
 }
 
 func toDrive9FuseSyncMode(mode fuseSyncMode) (drive9fuse.SyncMode, error) {

@@ -360,7 +360,7 @@ drive9 mount [flags] [:/remote] <mountpoint>
   -server string                 server URL
   -api-key string                owner API key
   -mode auto|fuse|webdav          mount mode (default: auto)
-  -sync-mode auto|interactive|strict
+  -durability auto|interactive|fsync|close-sync|write-sync (default: auto)
   -profile string                mount profile
   -cache-dir string              write-back cache dir (default: ~/.cache/drive9)
   -cache-size int                read cache size in MB (default: 128)

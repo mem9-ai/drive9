@@ -1,9 +1,13 @@
 package cli
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 type fuseSyncMode string
 type fuseWritePolicy string
+type fuseDurability string
 
 const (
 	fuseSyncModeAuto        fuseSyncMode = "auto"
@@ -13,6 +17,12 @@ const (
 	fuseWritePolicyWriteBack fuseWritePolicy = "writeback"
 	fuseWritePolicyCloseSync fuseWritePolicy = "close-sync"
 	fuseWritePolicyWriteSync fuseWritePolicy = "write-sync"
+
+	fuseDurabilityAuto        fuseDurability = "auto"
+	fuseDurabilityInteractive fuseDurability = "interactive"
+	fuseDurabilityFsync       fuseDurability = "fsync"
+	fuseDurabilityCloseSync   fuseDurability = "close-sync"
+	fuseDurabilityWriteSync   fuseDurability = "write-sync"
 )
 
 type mountFuseOptions struct {
@@ -59,10 +69,19 @@ var mountFuse = mountFuseImpl
 
 var mountVault = mountVaultImpl
 
-func parseFuseSyncMode(s string) (fuseSyncMode, error) {
-	return parseFuseSyncModeImpl(s)
-}
-
-func parseFuseWritePolicy(s string) (fuseWritePolicy, error) {
-	return parseFuseWritePolicyImpl(s)
+func parseFuseDurability(s string) (fuseSyncMode, fuseWritePolicy, error) {
+	switch fuseDurability(s) {
+	case fuseDurabilityAuto:
+		return fuseSyncModeAuto, fuseWritePolicyWriteBack, nil
+	case fuseDurabilityInteractive:
+		return fuseSyncModeInteractive, fuseWritePolicyWriteBack, nil
+	case fuseDurabilityFsync:
+		return fuseSyncModeStrict, fuseWritePolicyWriteBack, nil
+	case fuseDurabilityCloseSync:
+		return fuseSyncModeStrict, fuseWritePolicyCloseSync, nil
+	case fuseDurabilityWriteSync:
+		return fuseSyncModeStrict, fuseWritePolicyWriteSync, nil
+	default:
+		return "", "", fmt.Errorf("unknown durability %q (valid: auto, interactive, fsync, close-sync, write-sync)", s)
+	}
 }
