@@ -98,6 +98,7 @@ func fsMountCmd(args []string) error {
 	prefetchMaxBytes := fs.Int64("readdir-prefetch-max-bytes", 1<<20, "maximum aggregate bytes prefetched per directory read")
 	prefetchTimeout := fs.Duration("readdir-prefetch-timeout", time.Second, "timeout for one readdir prefetch batch")
 	syncMode := fs.String("sync-mode", "auto", "sync mode: auto, interactive, or strict")
+	writePolicy := fs.String("write-policy", "writeback", "write durability policy: writeback, close-sync, or write-sync")
 	profile := fs.String("profile", "", "mount profile: interactive (empty for default)")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
@@ -193,8 +194,16 @@ func fsMountCmd(args []string) error {
 	*server, *apiKey = serverVal, apiKeyVal
 	token := tokenVal
 
+	writePolicyVal, err := parseFuseWritePolicy(*writePolicy)
+	if err != nil {
+		return err
+	}
+
 	// WebDAV path: create client, start local WebDAV server, invoke mount_webdav.
 	if resolved == MountModeWebDAV {
+		if writePolicyVal != fuseWritePolicyWriteBack {
+			return fmt.Errorf("--write-policy is only supported with --mode=fuse; WebDAV mounts always use their native write behavior")
+		}
 		var c *client.Client
 		if token != "" {
 			c = client.NewWithToken(*server, token)
@@ -241,6 +250,7 @@ func fsMountCmd(args []string) error {
 		PrefetchMaxBytes:      *prefetchMaxBytes,
 		PrefetchTimeout:       *prefetchTimeout,
 		SyncMode:              syncModeVal,
+		WritePolicy:           writePolicyVal,
 		Profile:               *profile,
 		AllowOther:            *allowOther,
 		ReadOnly:              *readOnly,

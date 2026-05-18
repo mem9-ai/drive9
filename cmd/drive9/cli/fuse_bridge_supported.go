@@ -16,8 +16,20 @@ func parseFuseSyncModeImpl(s string) (fuseSyncMode, error) {
 	return fromDrive9FuseSyncMode(mode), nil
 }
 
+func parseFuseWritePolicyImpl(s string) (fuseWritePolicy, error) {
+	policy, err := drive9fuse.ParseWritePolicy(s)
+	if err != nil {
+		return "", err
+	}
+	return fromDrive9FuseWritePolicy(policy), nil
+}
+
 func mountFuseImpl(opts *mountFuseOptions) error {
 	mode, err := toDrive9FuseSyncMode(opts.SyncMode)
+	if err != nil {
+		return err
+	}
+	writePolicy, err := toDrive9FuseWritePolicy(opts.WritePolicy)
 	if err != nil {
 		return err
 	}
@@ -44,6 +56,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		PrefetchMaxBytes:      opts.PrefetchMaxBytes,
 		PrefetchTimeout:       opts.PrefetchTimeout,
 		SyncMode:              mode,
+		WritePolicy:           writePolicy,
 		Profile:               opts.Profile,
 		AllowOther:            opts.AllowOther,
 		ReadOnly:              opts.ReadOnly,
@@ -75,6 +88,17 @@ func fromDrive9FuseSyncMode(mode drive9fuse.SyncMode) fuseSyncMode {
 	}
 }
 
+func fromDrive9FuseWritePolicy(policy drive9fuse.WritePolicy) fuseWritePolicy {
+	switch policy {
+	case drive9fuse.WritePolicyCloseSync:
+		return fuseWritePolicyCloseSync
+	case drive9fuse.WritePolicyWriteSync:
+		return fuseWritePolicyWriteSync
+	default:
+		return fuseWritePolicyWriteBack
+	}
+}
+
 func toDrive9FuseSyncMode(mode fuseSyncMode) (drive9fuse.SyncMode, error) {
 	switch mode {
 	case fuseSyncModeAuto:
@@ -85,5 +109,18 @@ func toDrive9FuseSyncMode(mode fuseSyncMode) (drive9fuse.SyncMode, error) {
 		return drive9fuse.SyncStrict, nil
 	default:
 		return drive9fuse.SyncAuto, fmt.Errorf("unknown sync mode %q", mode)
+	}
+}
+
+func toDrive9FuseWritePolicy(policy fuseWritePolicy) (drive9fuse.WritePolicy, error) {
+	switch policy {
+	case fuseWritePolicyWriteBack:
+		return drive9fuse.WritePolicyWriteBack, nil
+	case fuseWritePolicyCloseSync:
+		return drive9fuse.WritePolicyCloseSync, nil
+	case fuseWritePolicyWriteSync:
+		return drive9fuse.WritePolicyWriteSync, nil
+	default:
+		return drive9fuse.WritePolicyWriteBack, fmt.Errorf("unknown write policy %q", policy)
 	}
 }

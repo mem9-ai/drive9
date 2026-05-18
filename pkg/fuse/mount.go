@@ -43,6 +43,7 @@ type MountOptions struct {
 	NegativeEntryTTL      time.Duration // kernel negative entry cache TTL (default 10s)
 	FlushDebounce         time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
 	SyncMode              SyncMode      // interactive, strict, or auto (default auto)
+	WritePolicy           WritePolicy   // writeback, close-sync, or write-sync (default writeback)
 	Profile               string        // mount profile: "interactive", "" (default)
 	UploadConcurrency     int           // number of background upload workers (default 4)
 	LookupRetryCount      int           // detached retries after transient Lookup/GetAttr stat failures (default 2)
@@ -465,8 +466,8 @@ func Mount(opts *MountOptions) error {
 		forceUnmount(opts.MountPoint)
 	}()
 
-	fmt.Fprintf(os.Stderr, "drive9: mounted on %s (server: %s, actor: %s, readonly: %v, cache: %s, shadow: %s)\n",
-		opts.MountPoint, opts.Server, actorID, opts.ReadOnly, cacheBase, shadowDir)
+	fmt.Fprintf(os.Stderr, "drive9: mounted on %s (server: %s, actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
+		opts.MountPoint, opts.Server, actorID, opts.ReadOnly, opts.WritePolicy, cacheBase, shadowDir)
 	server.Wait()
 	shutdown()
 	return nil
