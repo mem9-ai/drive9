@@ -97,39 +97,30 @@ checksums_object() {
   ' <"$checksums_file"
 }
 
-expected_checksum_paths() {
-  local target goos goarch ext
-  printf '%s\n' "source.tar.gz"
-  for target in $cli_targets; do
-    goos="${target%/*}"
-    goarch="${target#*/}"
-    if [ "$goos" = "$target" ] || [ -z "$goos" ] || [ -z "$goarch" ]; then
-      die "invalid DRIVE9_ARCHIVE_CLI_TARGETS entry: ${target}"
-    fi
-    ext=""
-    if [ "$goos" = "windows" ]; then
-      ext=".exe"
-    fi
-    printf 'bin/drive9-%s-%s%s\n' "$goos" "$goarch" "$ext"
-  done
-}
-
-expected_checksum_paths_json() {
-  expected_checksum_paths | jq -R -s 'split("\n")[:-1]'
-}
-
 validate_remote_commit_manifest() {
   local sha=$1
   local manifest=$2
-  local expected_paths_json
-  expected_paths_json="$(expected_checksum_paths_json)"
 
-  if ! jq -e --arg sha "$sha" --argjson expected "$expected_paths_json" '
+  if ! jq -e --arg sha "$sha" '
+    def checksum: type == "string" and test("^[0-9a-f]{64}$");
+    def target_component: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$");
+    def binary_entry:
+      (.goos | target_component)
+      and (.goarch | target_component)
+      and (.path == ("bin/drive9-" + .goos + "-" + .goarch + (if .goos == "windows" then ".exe" else "" end)));
+
     .commit_sha == $sha
+    and .source_archive == "source.tar.gz"
     and (.checksums | type == "object")
     and ((.checksums | length) > 0)
-    and (.checksums as $checksums
-      | all($expected[]; ($checksums[.] | type == "string" and test("^[0-9a-f]{64}$"))))
+    and (.binaries | type == "array")
+    and ((.binaries | length) > 0)
+    and all(.binaries[]; binary_entry)
+    and (([.binaries[].path] | unique | length) == (.binaries | length))
+    and (. as $manifest
+      | (["source.tar.gz"] + [.binaries[].path]) as $allowed
+      | all($allowed[]; ($manifest.checksums[.] | checksum))
+      and (($manifest.checksums | keys | sort) == ($allowed | sort)))
   ' "$manifest" >/dev/null; then
     die "remote manifest exists for ${sha} but is malformed"
   fi
