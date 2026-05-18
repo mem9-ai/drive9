@@ -270,7 +270,7 @@ Required typed fields:
 1. `id`: stable case id.
 2. `suite`: `smoke`, `regression`, `stress`, or `fault`.
 3. `expected_outcome`: `baseline_pass`, `bug_reproduced`, or `fix_verified`.
-4. `sync_mode`: `strict`, `interactive`, `auto`, or omitted for CLI-only cases. `auto` passes Drive9's automatic sync-mode selection through to `drive9 mount`.
+4. `sync_mode`: `strict`, `interactive`, `auto`, or omitted for CLI-only cases. The harness maps these to the current `drive9 mount --durability` values (`strict` -> `fsync`, `interactive` -> `interactive`, `auto` -> `auto`) while retaining compatibility with older `--sync-mode` binaries.
 5. `remote_root_suffix`: not reused as sync mode or label.
 6. `mountpoint_suffix`: not reused as sync mode or label.
 7. `timeout`: total case timeout, inherited from defaults when omitted.
