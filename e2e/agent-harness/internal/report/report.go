@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -122,6 +123,7 @@ type Gating struct {
 type Recorder struct {
 	RunDir string
 	RunID  string
+	mu     sync.Mutex
 }
 
 func NewRecorder(runDir, runID string) (*Recorder, error) {
@@ -134,11 +136,17 @@ func NewRecorder(runDir, runID string) (*Recorder, error) {
 }
 
 func (r *Recorder) WriteManifest(m Manifest) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	m.SchemaVersion = SchemaVersion
 	return writeJSON(filepath.Join(r.RunDir, "manifest.json"), m)
 }
 
 func (r *Recorder) Event(e Event) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	e.SchemaVersion = SchemaVersion
 	e.RunID = r.RunID
 	if e.TS == "" {
@@ -148,6 +156,9 @@ func (r *Recorder) Event(e Event) error {
 }
 
 func (r *Recorder) Failure(f Failure) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	f.SchemaVersion = SchemaVersion
 	f.RunID = r.RunID
 	if f.TS == "" {
@@ -157,6 +168,9 @@ func (r *Recorder) Failure(f Failure) error {
 }
 
 func (r *Recorder) Metric(m Metric) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	m.SchemaVersion = SchemaVersion
 	m.RunID = r.RunID
 	if m.TS == "" {
