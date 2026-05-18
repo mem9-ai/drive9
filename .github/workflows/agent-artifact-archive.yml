@@ -10,17 +10,8 @@ on:
         description: Commit SHA to backfill or repair. Empty publishes current main.
         required: false
         type: string
-      recent_commits:
-        description: Number of recent main commits to reconcile when commit_sha is empty.
-        required: false
-        default: "20"
-        type: string
   schedule:
     - cron: "17 3 * * *"
-
-concurrency:
-  group: agent-artifact-archive
-  cancel-in-progress: false
 
 jobs:
   publish:
@@ -37,7 +28,7 @@ jobs:
       DRIVE9_PUBLISHER_SHA256: ${{ vars.DRIVE9_PUBLISHER_SHA256 }}
       DRIVE9_ARCHIVE_ROOT: ${{ vars.DRIVE9_ARCHIVE_ROOT || '/drive9' }}
       DRIVE9_ARCHIVE_COMMIT_SHA: ${{ github.event.inputs.commit_sha || '' }}
-      DRIVE9_ARCHIVE_RECENT_COMMITS: ${{ github.event.inputs.recent_commits || vars.DRIVE9_ARCHIVE_RECENT_COMMITS || '20' }}
+      DRIVE9_ARCHIVE_RECENT_COMMITS: ${{ vars.DRIVE9_ARCHIVE_RECENT_COMMITS || '20' }}
       DRIVE9_ARCHIVE_CLI_TARGETS: ${{ vars.DRIVE9_ARCHIVE_CLI_TARGETS }}
 
     steps:

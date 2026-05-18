@@ -15,6 +15,7 @@ require_cmd() {
 }
 
 require_cmd git
+require_cmd go
 require_cmd jq
 require_cmd sha256sum
 
@@ -23,11 +24,15 @@ archive_root="${DRIVE9_ARCHIVE_ROOT:-/drive9}"
 archive_root="${archive_root%/}"
 recent_commits="${DRIVE9_ARCHIVE_RECENT_COMMITS:-20}"
 cli_targets="${DRIVE9_ARCHIVE_CLI_TARGETS:-linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64}"
+legacy_agfs_module="github.com/c4pt0r/agfs/agfs-server"
+legacy_agfs_version="${DRIVE9_ARCHIVE_LEGACY_AGFS_VERSION:-v0.0.0-20260410081414-678f51854d2a}"
 work_root="${RUNNER_TEMP:-$(pwd)/.tmp}/drive9-agent-archive"
 artifact_root="${work_root}/artifacts"
 worktree_root="${work_root}/worktrees"
 repository="${GITHUB_REPOSITORY:-mem9-ai/drive9}"
 branch="main"
+remote_missing_status=42
+active_worktree=""
 
 if [ -z "${DRIVE9_SERVER:-}" ]; then
   die "DRIVE9_SERVER is required"
@@ -47,7 +52,18 @@ remote_ref() {
 remote_cat() {
   local path=$1
   local out=$2
-  remote fs cat "$(remote_ref "$path")" >"$out" 2>/dev/null
+  local err="${out}.stderr"
+  if remote fs cat "$(remote_ref "$path")" >"$out" 2>"$err"; then
+    rm -f "$err"
+    return 0
+  fi
+  if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
+    rm -f "$out" "$err"
+    return "$remote_missing_status"
+  fi
+  cat "$err" >&2
+  rm -f "$out" "$err"
+  return 1
 }
 
 remote_cp_to_local() {
@@ -79,6 +95,44 @@ checksums_object() {
       end
     )
   ' <"$checksums_file"
+}
+
+expected_checksum_paths() {
+  local target goos goarch ext
+  printf '%s\n' "source.tar.gz"
+  for target in $cli_targets; do
+    goos="${target%/*}"
+    goarch="${target#*/}"
+    if [ "$goos" = "$target" ] || [ -z "$goos" ] || [ -z "$goarch" ]; then
+      die "invalid DRIVE9_ARCHIVE_CLI_TARGETS entry: ${target}"
+    fi
+    ext=""
+    if [ "$goos" = "windows" ]; then
+      ext=".exe"
+    fi
+    printf 'bin/drive9-%s-%s%s\n' "$goos" "$goarch" "$ext"
+  done
+}
+
+expected_checksum_paths_json() {
+  expected_checksum_paths | jq -R -s 'split("\n")[:-1]'
+}
+
+validate_remote_commit_manifest() {
+  local sha=$1
+  local manifest=$2
+  local expected_paths_json
+  expected_paths_json="$(expected_checksum_paths_json)"
+
+  if ! jq -e --arg sha "$sha" --argjson expected "$expected_paths_json" '
+    .commit_sha == $sha
+    and (.checksums | type == "object")
+    and ((.checksums | length) > 0)
+    and (.checksums as $checksums
+      | all($expected[]; ($checksums[.] | type == "string" and test("^[0-9a-f]{64}$"))))
+  ' "$manifest" >/dev/null; then
+    die "remote manifest exists for ${sha} but is malformed"
+  fi
 }
 
 binary_metadata() {
@@ -163,7 +217,9 @@ write_latest_manifest_from_remote_commit() {
   local remote_manifest="${work_root}/latest-source-${sha}.json"
   local published_at checksums_json
 
-  remote_cat "${archive_root}/commits/${sha}/manifest.json" "$remote_manifest"
+  if ! remote_cat "${archive_root}/commits/${sha}/manifest.json" "$remote_manifest"; then
+    die "failed to read complete remote manifest for ${sha}"
+  fi
   published_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   checksums_json="$(jq '.checksums' "$remote_manifest")"
 
@@ -187,16 +243,39 @@ write_latest_manifest_from_remote_commit() {
 
 prepare_agfs_dependency() {
   local worktree=$1
-  local parent
+  local parent target marker module_dir
   parent="$(dirname "$worktree")"
+  target="${parent}/agfs/agfs-server"
+  marker="${target}/.drive9-agfs-version"
   if ! grep -q '../agfs' "${worktree}/go.mod"; then
     return
   fi
-  if [ -d "${parent}/agfs/.git" ]; then
+  if [ -f "$marker" ] && [ "$(cat "$marker")" = "$legacy_agfs_version" ]; then
     return
   fi
-  info "checkout agfs dependency for legacy local replace"
-  git clone --depth 1 https://github.com/c4pt0r/agfs "${parent}/agfs"
+  info "checkout pinned agfs dependency ${legacy_agfs_version} for legacy local replace"
+  rm -rf "${parent}/agfs"
+  module_dir="$(go mod download -json "${legacy_agfs_module}@${legacy_agfs_version}" | jq -r '.Dir')"
+  if [ -z "$module_dir" ] || [ "$module_dir" = "null" ]; then
+    die "failed to resolve ${legacy_agfs_module}@${legacy_agfs_version}"
+  fi
+  mkdir -p "$target"
+  cp -R "${module_dir}/." "$target/"
+  chmod -R u+w "$target"
+  printf '%s\n' "$legacy_agfs_version" >"$marker"
+}
+
+cleanup_worktree() {
+  local worktree=$1
+  git worktree remove --force "$worktree" >/dev/null 2>&1 || true
+  rm -rf "$worktree"
+  git worktree prune >/dev/null 2>&1 || true
+}
+
+cleanup_active_worktree() {
+  if [ -n "${active_worktree:-}" ]; then
+    cleanup_worktree "$active_worktree"
+  fi
 }
 
 build_artifacts() {
@@ -206,13 +285,15 @@ build_artifacts() {
   local build_dist="${artifact_dir}/dist-build"
   local short_sha="${sha:0:7}"
 
-  rm -rf "$artifact_dir" "$worktree"
+  rm -rf "$artifact_dir"
+  cleanup_worktree "$worktree"
   mkdir -p "$artifact_dir" "$worktree_root"
 
   info "create source archive for ${sha}"
   git archive --format=tar.gz --prefix="drive9-${sha}/" -o "${artifact_dir}/source.tar.gz" "$sha"
 
   info "create worktree for ${sha}"
+  active_worktree="$worktree"
   git worktree add --detach "$worktree" "$sha" >/dev/null
 
   prepare_agfs_dependency "$worktree"
@@ -231,13 +312,17 @@ build_artifacts() {
   write_commit_manifest "$sha" "$artifact_dir"
   write_latest_manifest "$sha" "$artifact_dir"
 
-  git worktree remove --force "$worktree" >/dev/null
+  cleanup_worktree "$worktree"
+  active_worktree=""
 }
 
 verify_remote_artifacts() {
   local commit_path=$1
   local checksums_file=$2
   local verify_dir="${work_root}/verify"
+  if [ ! -s "$checksums_file" ]; then
+    die "empty checksum list for ${commit_path}"
+  fi
   rm -rf "$verify_dir"
   mkdir -p "$verify_dir"
 
@@ -258,11 +343,17 @@ remote_commit_state() {
   local artifact_dir=$2
   local commit_path="${archive_root}/commits/${sha}"
   local remote_manifest="${work_root}/remote-manifest-${sha}.json"
-  local checksums_json
+  local checksums_json cat_status
 
-  if ! remote_cat "${commit_path}/manifest.json" "$remote_manifest"; then
-    echo "absent"
-    return
+  if remote_cat "${commit_path}/manifest.json" "$remote_manifest"; then
+    :
+  else
+    cat_status=$?
+    if [ "$cat_status" -eq "$remote_missing_status" ]; then
+      echo "absent"
+      return
+    fi
+    die "failed to read remote manifest for ${sha}"
   fi
 
   checksums_json="$(checksums_object "${artifact_dir}/checksums.txt")"
@@ -280,17 +371,20 @@ remote_commit_self_state() {
   local commit_path="${archive_root}/commits/${sha}"
   local remote_manifest="${work_root}/remote-manifest-${sha}.json"
   local remote_checksums="${work_root}/remote-checksums-${sha}.txt"
+  local cat_status
 
-  if ! remote_cat "${commit_path}/manifest.json" "$remote_manifest"; then
-    echo "absent"
-    return
+  if remote_cat "${commit_path}/manifest.json" "$remote_manifest"; then
+    :
+  else
+    cat_status=$?
+    if [ "$cat_status" -eq "$remote_missing_status" ]; then
+      echo "absent"
+      return
+    fi
+    die "failed to read remote manifest for ${sha}"
   fi
 
-  if ! jq -e --arg sha "$sha" \
-    '.commit_sha == $sha and (.checksums | type == "object")' "$remote_manifest" >/dev/null; then
-    die "remote manifest exists for ${sha} but is malformed"
-  fi
-
+  validate_remote_commit_manifest "$sha" "$remote_manifest"
   jq -r '.checksums | to_entries[] | [.value, .key] | @tsv' "$remote_manifest" >"$remote_checksums"
   verify_remote_artifacts "$commit_path" "$remote_checksums"
   echo "complete"
@@ -333,6 +427,7 @@ update_latest_if_head() {
   local artifact_dir="${artifact_root}/${sha}"
   local latest_manifest="${artifact_dir}/latest-manifest.json"
   local newest
+  git fetch --quiet origin main
   newest="$(git rev-parse origin/main)"
   if [ "$sha" != "$newest" ]; then
     info "skip latest for ${sha}; origin/main is ${newest}"
@@ -365,8 +460,11 @@ resolve_commits() {
   fi
 
   case "${GITHUB_EVENT_NAME:-}" in
-  schedule | workflow_dispatch)
-    git rev-list --reverse --max-count="$recent_commits" origin/main
+  schedule)
+    git rev-list --first-parent --reverse --max-count="$recent_commits" origin/main
+    ;;
+  workflow_dispatch)
+    git rev-parse origin/main
     ;;
   *)
     git rev-parse HEAD
@@ -389,5 +487,7 @@ main() {
     update_latest_if_head "$sha"
   done
 }
+
+trap cleanup_active_worktree EXIT
 
 main "$@"
