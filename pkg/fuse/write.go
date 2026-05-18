@@ -31,10 +31,10 @@ type LoadPartFunc func(partNum int) ([]byte, error)
 // server-side via S3 UploadPartCopy).
 // It is NOT thread-safe; callers must hold the FileHandle mutex.
 type WriteBuffer struct {
-	path       string
-	totalSize  int64 // current logical file size
-	maxSize    int64
-	partSize   int64
+	path      string
+	totalSize int64 // current logical file size
+	maxSize   int64
+	partSize  int64
 	// smallFileMax is the cutoff for the single-buffer fast path; equals the
 	// server-advertised inline_threshold when known, otherwise the local
 	// default. Stored per-buffer so per-mount values (server overrides,
@@ -73,6 +73,102 @@ type WriteBuffer struct {
 	// When a write would exceed the threshold, the data is migrated to the
 	// regular part map and this field is set to nil.
 	smallFileData []byte
+}
+
+type writeBufferSnapshot struct {
+	path          string
+	totalSize     int64
+	maxSize       int64
+	partSize      int64
+	smallFileMax  int64
+	parts         map[int][]byte
+	dirtyParts    map[int]bool
+	touched       bool
+	LoadPart      LoadPartFunc
+	remoteSize    int64
+	curMemory     int64
+	appendCursor  int64
+	sequential    bool
+	uploadedParts map[int]bool
+	OnPartFull    func(partIdx int, data []byte)
+	smallFileData []byte
+}
+
+func (wb *WriteBuffer) snapshot() *writeBufferSnapshot {
+	if wb == nil {
+		return nil
+	}
+	return &writeBufferSnapshot{
+		path:          wb.path,
+		totalSize:     wb.totalSize,
+		maxSize:       wb.maxSize,
+		partSize:      wb.partSize,
+		smallFileMax:  wb.smallFileMax,
+		parts:         cloneByteMap(wb.parts),
+		dirtyParts:    cloneBoolMap(wb.dirtyParts),
+		touched:       wb.touched,
+		LoadPart:      wb.LoadPart,
+		remoteSize:    wb.remoteSize,
+		curMemory:     wb.curMemory,
+		appendCursor:  wb.appendCursor,
+		sequential:    wb.sequential,
+		uploadedParts: cloneBoolMap(wb.uploadedParts),
+		OnPartFull:    wb.OnPartFull,
+		smallFileData: cloneBytes(wb.smallFileData),
+	}
+}
+
+func (wb *WriteBuffer) restore(snapshot *writeBufferSnapshot) {
+	if wb == nil || snapshot == nil {
+		return
+	}
+	wb.path = snapshot.path
+	wb.totalSize = snapshot.totalSize
+	wb.maxSize = snapshot.maxSize
+	wb.partSize = snapshot.partSize
+	wb.smallFileMax = snapshot.smallFileMax
+	wb.parts = cloneByteMap(snapshot.parts)
+	wb.dirtyParts = cloneBoolMap(snapshot.dirtyParts)
+	wb.touched = snapshot.touched
+	wb.LoadPart = snapshot.LoadPart
+	wb.remoteSize = snapshot.remoteSize
+	wb.curMemory = snapshot.curMemory
+	wb.appendCursor = snapshot.appendCursor
+	wb.sequential = snapshot.sequential
+	wb.uploadedParts = cloneBoolMap(snapshot.uploadedParts)
+	wb.OnPartFull = snapshot.OnPartFull
+	wb.smallFileData = cloneBytes(snapshot.smallFileData)
+}
+
+func cloneByteMap(src map[int][]byte) map[int][]byte {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[int][]byte, len(src))
+	for k, v := range src {
+		dst[k] = cloneBytes(v)
+	}
+	return dst
+}
+
+func cloneBoolMap(src map[int]bool) map[int]bool {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[int]bool, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func cloneBytes(src []byte) []byte {
+	if src == nil {
+		return nil
+	}
+	dst := make([]byte, len(src))
+	copy(dst, src)
+	return dst
 }
 
 // NewWriteBuffer creates a new WriteBuffer for the given path.

@@ -19,6 +19,49 @@ const (
 	SyncStrict
 )
 
+// WritePolicy controls when ordinary writes become remote-durable.
+type WritePolicy string
+
+const (
+	// WritePolicyWriteBack preserves the existing behavior: writes are staged
+	// locally and remote upload may happen asynchronously after close.
+	WritePolicyWriteBack WritePolicy = "writeback"
+	// WritePolicyCloseSync makes close remote-durable by forcing cloud upload
+	// from Flush, the FUSE operation whose status propagates to close(2).
+	WritePolicyCloseSync WritePolicy = "close-sync"
+	// WritePolicyWriteSync makes each Write operation remote-durable before
+	// returning success. This is intentionally expensive.
+	WritePolicyWriteSync WritePolicy = "write-sync"
+)
+
+// String returns the write policy name for CLI/logging.
+func (p WritePolicy) String() string {
+	switch p {
+	case WritePolicyWriteBack:
+		return "writeback"
+	case WritePolicyCloseSync:
+		return "close-sync"
+	case WritePolicyWriteSync:
+		return "write-sync"
+	default:
+		return fmt.Sprintf("unknown(%s)", string(p))
+	}
+}
+
+// ParseWritePolicy converts a CLI string to a WritePolicy.
+func ParseWritePolicy(s string) (WritePolicy, error) {
+	switch s {
+	case "", "writeback":
+		return WritePolicyWriteBack, nil
+	case "close-sync":
+		return WritePolicyCloseSync, nil
+	case "write-sync":
+		return WritePolicyWriteSync, nil
+	default:
+		return WritePolicyWriteBack, fmt.Errorf("unknown write policy %q (valid: writeback, close-sync, write-sync)", s)
+	}
+}
+
 // String returns the sync mode name for CLI/logging.
 func (m SyncMode) String() string {
 	switch m {

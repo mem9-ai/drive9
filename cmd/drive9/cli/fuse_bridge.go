@@ -3,11 +3,16 @@ package cli
 import "time"
 
 type fuseSyncMode string
+type fuseWritePolicy string
 
 const (
 	fuseSyncModeAuto        fuseSyncMode = "auto"
 	fuseSyncModeInteractive fuseSyncMode = "interactive"
 	fuseSyncModeStrict      fuseSyncMode = "strict"
+
+	fuseWritePolicyWriteBack fuseWritePolicy = "writeback"
+	fuseWritePolicyCloseSync fuseWritePolicy = "close-sync"
+	fuseWritePolicyWriteSync fuseWritePolicy = "write-sync"
 )
 
 type mountFuseOptions struct {
@@ -32,6 +37,7 @@ type mountFuseOptions struct {
 	PrefetchMaxBytes      int64
 	PrefetchTimeout       time.Duration
 	SyncMode              fuseSyncMode
+	WritePolicy           fuseWritePolicy
 	Profile               string
 	AllowOther            bool
 	ReadOnly              bool
@@ -55,4 +61,8 @@ var mountVault = mountVaultImpl
 
 func parseFuseSyncMode(s string) (fuseSyncMode, error) {
 	return parseFuseSyncModeImpl(s)
+}
+
+func parseFuseWritePolicy(s string) (fuseWritePolicy, error) {
+	return parseFuseWritePolicyImpl(s)
 }
