@@ -91,6 +91,40 @@ func TestResolveMountMode_ExplicitOverridesAuto(t *testing.T) {
 	}
 }
 
+func TestParseFuseDurability(t *testing.T) {
+	tests := []struct {
+		in         string
+		wantSync   fuseSyncMode
+		wantPolicy fuseWritePolicy
+		wantErr    bool
+	}{
+		{in: "auto", wantSync: fuseSyncModeAuto, wantPolicy: fuseWritePolicyWriteBack},
+		{in: "interactive", wantSync: fuseSyncModeInteractive, wantPolicy: fuseWritePolicyWriteBack},
+		{in: "fsync", wantSync: fuseSyncModeStrict, wantPolicy: fuseWritePolicyWriteBack},
+		{in: "close-sync", wantSync: fuseSyncModeStrict, wantPolicy: fuseWritePolicyCloseSync},
+		{in: "write-sync", wantSync: fuseSyncModeStrict, wantPolicy: fuseWritePolicyWriteSync},
+		{in: "strict", wantErr: true},
+		{in: "writeback", wantErr: true},
+		{in: "", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		gotSync, gotPolicy, err := parseFuseDurability(tt.in)
+		if tt.wantErr {
+			if err == nil {
+				t.Fatalf("parseFuseDurability(%q) succeeded, want error", tt.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("parseFuseDurability(%q): %v", tt.in, err)
+		}
+		if gotSync != tt.wantSync || gotPolicy != tt.wantPolicy {
+			t.Fatalf("parseFuseDurability(%q) = (%q, %q), want (%q, %q)", tt.in, gotSync, gotPolicy, tt.wantSync, tt.wantPolicy)
+		}
+	}
+}
+
 func TestHasFUSE(t *testing.T) {
 	if hasFUSE(fakeLookPath(nil)) {
 		t.Fatal("hasFUSE should be false with no binaries")
@@ -651,19 +685,19 @@ func TestFsMountCmd_SingleArgDefaultsToRootRemote(t *testing.T) {
 	}
 }
 
-func TestFsMountCmdRejectsWritePolicyForWebDAV(t *testing.T) {
+func TestFsMountCmdRejectsDurabilityForWebDAV(t *testing.T) {
 	err := fsMountCmd([]string{
 		"--mode=webdav",
 		"--server=https://drive9.example",
 		"--api-key=sk-test",
-		"--write-policy=close-sync",
+		"--durability=close-sync",
 		t.TempDir(),
 	})
 	if err == nil {
-		t.Fatal("expected WebDAV write-policy rejection")
+		t.Fatal("expected WebDAV durability rejection")
 	}
-	if !strings.Contains(err.Error(), "--write-policy is only supported with --mode=fuse") {
-		t.Fatalf("error = %v, want write-policy WebDAV rejection", err)
+	if !strings.Contains(err.Error(), "--durability is only supported with --mode=fuse") {
+		t.Fatalf("error = %v, want durability WebDAV rejection", err)
 	}
 }
 
