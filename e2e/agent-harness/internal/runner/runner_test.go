@@ -2,10 +2,12 @@ package runner
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/mem9-ai/dat9/e2e/agent-harness/internal/casefile"
@@ -17,6 +19,23 @@ func TestGCRequiresConfirmDelete(t *testing.T) {
 	err := GC(context.Background(), GCConfig{RunDir: t.TempDir()})
 	if !errors.Is(err, ErrConfirmDeleteRequired) {
 		t.Fatalf("err = %v, want ErrConfirmDeleteRequired", err)
+	}
+}
+
+func TestRunIDIncludesRandomSuffix(t *testing.T) {
+	got := runID()
+	parts := strings.Split(got, "-")
+	if len(parts) != 2 {
+		t.Fatalf("runID = %q, want timestamp-random", got)
+	}
+	if len(parts[0]) != len("20060102T150405Z") {
+		t.Fatalf("runID timestamp = %q, want compact UTC timestamp", parts[0])
+	}
+	if len(parts[1]) != 8 {
+		t.Fatalf("runID suffix = %q, want 8 hex chars", parts[1])
+	}
+	if _, err := hex.DecodeString(parts[1]); err != nil {
+		t.Fatalf("runID suffix = %q, want hex: %v", parts[1], err)
 	}
 }
 
