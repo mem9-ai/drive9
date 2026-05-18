@@ -45,7 +45,7 @@ cases:
 	if len(cases) != 1 {
 		t.Fatalf("case count = %d, want 1", len(cases))
 	}
-	if got := cases[0].Timeout.Duration.String(); got != "2m0s" {
+	if got := cases[0].Timeout.String(); got != "2m0s" {
 		t.Fatalf("timeout = %s", got)
 	}
 	if got := cases[0].Cleanup; got != "retain_on_failure" {
