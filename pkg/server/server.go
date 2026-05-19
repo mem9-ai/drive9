@@ -423,19 +423,27 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 }
 
 // isScopedBusinessRequestAllowed is the dispatcher-level gate for scoped
-// tokens. It mirrors handleFS's actual dispatch table so the gate stays in
-// sync with what each handler actually wires — release-order safety per
-// @adversary-1 / @dev-1 review (PR C1 thread msg b6f53023, 4619c945, 005e8b0b):
-// only allow a route through when the handler in this PR is known to call
-// AuthorizeFS itself.
+// tokens. It mirrors the actual downstream dispatch tables (handleFS,
+// handleUploads / handleUploadAction, handleV2Uploads) so the gate stays
+// in sync with what each handler wires — release-order safety per
+// @adversary-1 / @dev-1 reviews (msgs b6f53023, 4619c945, 005e8b0b for
+// the C1 read-side; 6e17765f for the POST action priority on C2a write-
+// side; 09266f14 for the action-aware upload allowlist on C2b).
 //
-// PR C1 opened read-side. PR C2 extends the whitelist to write-side
-// (PUT/PATCH/DELETE/POST on /v1/fs/* except chmod) now that each write
-// handler authorizes its target path. Uploads are still default-deny —
-// they will be wired in a follow-up PR with session re-authorize semantics.
+// Workspace zones coverage as of C2b:
+//   - GET/HEAD /v1/fs/* (read-side, action-arm allowlist)
+//   - POST /v1/fs:batch-stat / batch-read-small (per-path authorize)
+//   - PUT/PATCH/DELETE/POST /v1/fs/* (write-side, action-arm allowlist;
+//     chmod stays owner-only)
+//   - /v1/uploads* + /v2/uploads/* (action-aware, mirrors actual upload
+//     dispatch table; see isScopedV{1,2}UploadRouteAllowed)
 //
 // chmod (POST /v1/fs/<path>?chmod=1) is explicitly NOT and never will be in
 // the scoped allowlist — chmod escalates ACLs and is owner-token-only.
+//
+// SQL, fork, events, journals, vault are permanently out of scope for
+// workspace zones (they don't take a path argument, so the prefix model
+// doesn't apply); these stay default-deny here.
 //
 // The GET branch uses an **action-specific** accept-list (per @adversary-1
 // msg 00efe734 / @adversary-2 msg cbedd30a): the chosen action selector
@@ -446,6 +454,11 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 // msg 6e17765f): mixed selectors like `?append=1&copy=1` deny as ambiguous
 // rather than silently first-wins. Each action arm allows only the keys
 // the corresponding handler reads.
+//
+// Both upload prefixes route through isScopedV1UploadRouteAllowed /
+// isScopedV2UploadRouteAllowed, which enumerate (method, path, action)
+// tuples exactly matching the corresponding handler dispatch (no
+// prefix-family pass-through — see @adversary-1 msg 09266f14).
 func isScopedBusinessRequestAllowed(r *http.Request) bool {
 	path := r.URL.Path
 
@@ -454,7 +467,8 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 		return r.Method == http.MethodPost
 	}
 
-	// /v1/fs/* — read + write methods admitted in C2; uploads still deny.
+	// /v1/fs/* — read + write methods admitted (C1 + C2a). Uploads are
+	// handled separately below via isScopedV{1,2}UploadRouteAllowed.
 	if strings.HasPrefix(path, "/v1/fs/") {
 		switch r.Method {
 		case http.MethodHead:
@@ -478,9 +492,97 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 		}
 	}
 
-	// Uploads, SQL, fork, events, journals, vault, status: still default-
-	// deny for scoped tokens. Uploads will be wired in a follow-up PR.
+	// Uploads (V1 + V2): admitted in PR C2b now that every upload handler
+	// authorizes its target path on initiate AND re-authorizes session
+	// target path on continuation. Per @adversary-1 review msg 09266f14:
+	// the whitelist must be **action-aware**, mirroring the actual
+	// downstream dispatch table (handleUploads / handleUploadAction /
+	// handleV2Uploads) — release-order safety, same shape as the C1 GET
+	// allowlist. Method+path mismatches and unknown actions must be
+	// denied here so future routes don't silently inherit the family
+	// prefix.
+	if strings.HasPrefix(path, "/v1/uploads") {
+		return isScopedV1UploadRouteAllowed(r.Method, path)
+	}
+	if strings.HasPrefix(path, "/v2/uploads/") {
+		return isScopedV2UploadRouteAllowed(r.Method, path)
+	}
+
+	// SQL, fork, events, journals, vault, status, etc.: still default-deny.
 	return false
+}
+
+// isScopedV1UploadRouteAllowed mirrors handleUploads (server.go ~1872) and
+// handleUploadAction (server.go ~2034) exactly: each row below corresponds
+// to one wired handler with its own re-authorize-session-target-path call.
+// Any method/path/action combination not in this list is denied.
+func isScopedV1UploadRouteAllowed(method, path string) bool {
+	// Family root and explicit initiate endpoint.
+	if path == "/v1/uploads" {
+		// POST → handleUploadInitiate (body.path authorized)
+		// GET  → handleUploads list (path query arg authorized as list)
+		return method == http.MethodPost || method == http.MethodGet
+	}
+	if path == "/v1/uploads/initiate" {
+		// Same handler as POST /v1/uploads.
+		return method == http.MethodPost
+	}
+	// Per-upload action endpoints: /v1/uploads/<id>[/action]
+	rest := strings.TrimPrefix(path, "/v1/uploads/")
+	if rest == "" {
+		return false
+	}
+	parts := strings.SplitN(rest, "/", 2)
+	uploadID := parts[0]
+	if uploadID == "" {
+		return false
+	}
+	action := ""
+	if len(parts) > 1 {
+		action = strings.Trim(parts[1], "/")
+	}
+	switch {
+	case method == http.MethodPost && strings.HasPrefix(action, "complete"):
+		return true
+	case (method == http.MethodPost || method == http.MethodGet) && strings.HasPrefix(action, "resume"):
+		return true
+	case method == http.MethodDelete && action == "":
+		return true
+	default:
+		return false
+	}
+}
+
+// isScopedV2UploadRouteAllowed mirrors handleV2Uploads (server.go ~2338)
+// exactly: only the 5 known V2 POST actions are admitted.
+func isScopedV2UploadRouteAllowed(method, path string) bool {
+	if method != http.MethodPost {
+		return false
+	}
+	rest := strings.TrimPrefix(path, "/v2/uploads/")
+	if rest == "" {
+		return false
+	}
+	parts := strings.SplitN(rest, "/", 2)
+	seg0 := parts[0]
+	action := ""
+	if len(parts) > 1 {
+		action = strings.Trim(parts[1], "/")
+	}
+	if seg0 == "" {
+		return false
+	}
+	// /v2/uploads/initiate (no upload_id segment) is its own route.
+	if seg0 == "initiate" && action == "" {
+		return true
+	}
+	// Per-upload action: seg0 = upload_id, action = one of the known V2 actions.
+	switch action {
+	case "presign", "presign-batch", "complete", "abort":
+		return true
+	default:
+		return false
+	}
 }
 
 // isScopedFSPostQueryAllowed mirrors handleFS's POST dispatcher (server.go
@@ -1891,6 +1993,12 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "missing path parameter")
 		return
 	}
+	// Listing uploads at a path leaks "an upload is in progress here"
+	// metadata. Gate behind `list` op on the target path so scoped tokens
+	// can't probe arbitrary paths for upload state.
+	if !authorizeFS(w, r, FSOpList, path) {
+		return
+	}
 	status := r.URL.Query().Get("status")
 	if status == "" {
 		status = string(datastore.UploadUploading)
@@ -1950,6 +2058,13 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 	}
 	if strings.TrimSpace(req.Path) == "" {
 		errJSON(w, http.StatusBadRequest, "missing path")
+		return
+	}
+	// Authorize the target path BEFORE running any of the size / checksum /
+	// revision / description validation that would mutate state (and BEFORE
+	// the InitiateUploadWithChecksumsIfRevision backend call that creates
+	// the session). For scoped tokens this is a "write" op on the target.
+	if !authorizeFS(w, r, FSOpWrite, req.Path) {
 		return
 	}
 	if req.TotalSize <= 0 {
@@ -2065,19 +2180,39 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	// Fetch upload before confirming so we can publish the target path in the event.
-	upload, err := b.Store().GetUpload(r.Context(), uploadID)
+	// Re-authorize the upload's TargetPath against the CURRENT request
+	// scope (NOT the scope that initiated the upload). Banked invariant
+	// from C2 review: a scoped token's policy can change between initiate
+	// and complete (revoke+reissue with narrower zones is the supported
+	// policy-change mechanism). Trusting the initiator would let a
+	// since-narrowed token finish a write outside its current scope.
+	//
+	// authorizeUploadSession also handles ErrNotFound→404 and
+	// ErrUploadExpired→410 to preserve the existing client-facing error
+	// shape.
+	upload, err := authorizeUploadSession(r.Context(), w, ScopeFromContext(r.Context()), b, uploadID, FSOpWrite)
 	if err != nil {
-		if errors.Is(err, datastore.ErrNotFound) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_not_found", "upload_id", uploadID)...)
+		metricEvent(r.Context(), "upload_complete", "result", "error")
+		return
+	}
+	// Owner short-circuit returns (nil, nil) from authorizeUploadSession
+	// to preserve the exact pre-C2b error shape (no extra GetUpload on
+	// owner hot path). For the post-confirm publishEvent below we need
+	// the target path either way — fetch here if the helper didn't.
+	if upload == nil {
+		upload, err = b.Store().GetUpload(r.Context(), uploadID)
+		if err != nil {
+			if errors.Is(err, datastore.ErrNotFound) {
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_not_found", "upload_id", uploadID)...)
+				metricEvent(r.Context(), "upload_complete", "result", "error")
+				errJSON(w, http.StatusNotFound, err.Error())
+				return
+			}
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_failed", "upload_id", uploadID, "error", err)...)
 			metricEvent(r.Context(), "upload_complete", "result", "error")
-			errJSON(w, http.StatusNotFound, err.Error())
+			errJSONInternalStorage(w)
 			return
 		}
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_failed", "upload_id", uploadID, "error", err)...)
-		metricEvent(r.Context(), "upload_complete", "result", "error")
-		errJSONInternalStorage(w)
-		return
 	}
 	tags, err := parseUploadCompleteTags(w, r)
 	if err != nil {
@@ -2127,6 +2262,13 @@ func (s *Server) handleUploadResume(w http.ResponseWriter, r *http.Request, uplo
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_resume_missing_scope", "upload_id", uploadID)...)
 		metricEvent(r.Context(), "upload_resume", "result", "error")
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	// Re-authorize the session's TargetPath against the CURRENT scope
+	// before mutating/returning a resume plan. See banked invariant on
+	// handleUploadComplete.
+	if _, err := authorizeUploadSession(r.Context(), w, ScopeFromContext(r.Context()), b, uploadID, FSOpWrite); err != nil {
+		metricEvent(r.Context(), "upload_resume", "result", "error")
 		return
 	}
 	partChecksums, err := s.parseResumePartChecksums(w, r, uploadID)
@@ -2316,6 +2458,14 @@ func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploa
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
+	// Re-authorize before AbortUpload mutates session state. Abort uses
+	// the `delete` op semantically (the in-progress upload is being torn
+	// down — its target path effectively becomes a no-op delete on the
+	// session, not a write).
+	if _, err := authorizeUploadSession(r.Context(), w, ScopeFromContext(r.Context()), b, uploadID, FSOpDelete); err != nil {
+		metricEvent(r.Context(), "upload_abort", "result", "error")
+		return
+	}
 	if err := b.AbortUpload(r.Context(), uploadID); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_abort_not_found", "upload_id", uploadID)...)
@@ -2388,6 +2538,12 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 		errJSON(w, http.StatusBadRequest, "missing path")
 		return
 	}
+	// Authorize the target path BEFORE size/revision checks and BEFORE the
+	// backend InitiateUploadV2IfRevision creates session state. Same
+	// invariant as V1 handleUploadInitiate.
+	if !authorizeFS(w, r, FSOpWrite, req.Path) {
+		return
+	}
 	if req.TotalSize <= 0 {
 		errJSON(w, http.StatusBadRequest, "total_size must be positive")
 		return
@@ -2454,6 +2610,14 @@ func (s *Server) handleV2PresignPart(w http.ResponseWriter, r *http.Request, upl
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
+	// Re-authorize session against current scope before issuing a presigned
+	// URL — presign IS the write enablement (gives client direct S3 PUT
+	// access), so a since-revoked scoped token cannot be allowed to
+	// continue here.
+	if _, err := authorizeUploadSession(r.Context(), w, ScopeFromContext(r.Context()), b, uploadID, FSOpWrite); err != nil {
+		metricEvent(r.Context(), "v2_presign_part", "result", "error")
+		return
+	}
 	var req struct {
 		PartNumber int                      `json:"part_number"`
 		Checksum   *backend.PresignChecksum `json:"checksum,omitempty"`
@@ -2506,6 +2670,11 @@ func (s *Server) handleV2PresignBatch(w http.ResponseWriter, r *http.Request, up
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
+	// Same session re-authorize gate as presign-part.
+	if _, err := authorizeUploadSession(r.Context(), w, ScopeFromContext(r.Context()), b, uploadID, FSOpWrite); err != nil {
+		metricEvent(r.Context(), "v2_presign_batch", "result", "error")
+		return
+	}
 	var req struct {
 		Parts []backend.PresignPartEntry `json:"parts"`
 	}
@@ -2555,6 +2724,14 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_missing_scope", "upload_id", uploadID)...)
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	// Re-authorize session against current scope before confirming the
+	// upload — same invariant as V1 complete: a since-narrowed scoped
+	// token must not be able to finish writing outside its current zone,
+	// even if it initiated the upload while it still had access.
+	if _, err := authorizeUploadSession(r.Context(), w, ScopeFromContext(r.Context()), b, uploadID, FSOpWrite); err != nil {
+		metricEvent(r.Context(), "v2_upload_complete", "result", "error")
 		return
 	}
 	// Tags keys must be unique. Official CLI/SDK callers always satisfy this
@@ -2640,6 +2817,12 @@ func (s *Server) handleV2UploadAbort(w http.ResponseWriter, r *http.Request, upl
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_abort_missing_scope", "upload_id", uploadID)...)
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	// Re-authorize before tearing down. Same `delete` op semantics as
+	// V1 handleUploadAbort.
+	if _, err := authorizeUploadSession(r.Context(), w, ScopeFromContext(r.Context()), b, uploadID, FSOpDelete); err != nil {
+		metricEvent(r.Context(), "v2_upload_abort", "result", "error")
 		return
 	}
 	if err := b.AbortUploadV2(r.Context(), uploadID); err != nil {

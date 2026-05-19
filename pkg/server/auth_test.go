@@ -379,14 +379,13 @@ func TestAuthScopedKeyLoadsFSScopes(t *testing.T) {
 	}
 }
 
-// TestScopedBusinessEndpointGuardDeniesEndpointsOutOfC1C2aScope checks
-// that scoped tokens are still 403'd at the dispatcher for every endpoint
-// NOT opened by PR C1 (read-side) or PR C2a (write-side except chmod).
-// Uploads remain dispatcher-denied until C2b wires their handlers +
-// session re-authorize. SQL/fork/events/journals/vault are permanently
-// out of scope. chmod stays owner-only forever. A bare POST /v1/fs/*
-// without an action selector also denies (ambiguous request).
-func TestScopedBusinessEndpointGuardDeniesEndpointsOutOfC1C2aScope(t *testing.T) {
+// TestScopedBusinessEndpointGuardDeniesEndpointsOutOfWorkspaceZonesScope
+// checks that scoped tokens are still 403'd at the dispatcher for every
+// endpoint NOT opened by PR C1 (read-side) / C2a (write-side) / C2b
+// (uploads). SQL/fork/events/journals/vault are permanently out of scope.
+// chmod stays owner-only forever. A bare POST /v1/fs/* without an action
+// selector also denies (ambiguous request).
+func TestScopedBusinessEndpointGuardDeniesEndpointsOutOfWorkspaceZonesScope(t *testing.T) {
 	type endpoint struct {
 		method string
 		path   string
@@ -394,8 +393,6 @@ func TestScopedBusinessEndpointGuardDeniesEndpointsOutOfC1C2aScope(t *testing.T)
 	deniedC1 := []endpoint{
 		{http.MethodPost, "/v1/sql"},
 		{http.MethodPost, "/v1/fs/file.txt"}, // no action selector → ambiguous → deny
-		{http.MethodPost, "/v1/uploads/initiate"},
-		{http.MethodPost, "/v1/uploads"},
 		{http.MethodPost, "/v1/fork"},
 		{http.MethodGet, "/v1/events"},
 		{http.MethodGet, "/v1/journals"},

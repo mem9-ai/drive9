@@ -1,11 +1,14 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
+	"github.com/mem9-ai/dat9/pkg/backend"
+	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
 )
@@ -198,6 +201,67 @@ func authorizeFSPair(w http.ResponseWriter, r *http.Request, srcOp FSOp, srcPath
 		return false
 	}
 	return true
+}
+
+// authorizeUploadSession is the upload-continuation gate for resume /
+// complete / abort handlers (V1 and V2). It looks up the session by
+// upload_id, then re-authorizes the session's TargetPath against the
+// CURRENT request scope (NOT the scope of whoever initiated the upload).
+//
+// This is the banked invariant from C2 review (msgs `efb1e56c` /
+// `08848b1a` / `6e17765f`): a scoped token's policy can change between
+// initiate and complete (revoke + reissue with narrower zones is the
+// supported policy-change mechanism). Trusting the original initiator
+// would let a since-narrowed token finish a write outside its current
+// scope.
+//
+// Error handling preserves the existing upload error shapes so client
+// code (FUSE, SDK, CLI) keeps working unchanged for owner tokens:
+//   - session missing (datastore.ErrNotFound)        → 404 "upload not found"
+//   - session expired (datastore.ErrUploadExpired)   → 410 "upload expired"
+//   - any other lookup error                          → 500 (storage)
+//   - authorize denied                                → 403 (fs access denied)
+//   - authorize invalid path (server-stored garbage) → 400
+//
+// Returns the session on allow so callers don't have to look it up twice.
+// On any non-nil error, the response has been written and the caller should
+// return.
+func authorizeUploadSession(ctx context.Context, w http.ResponseWriter, scope *TenantScope, b *backend.Dat9Backend, uploadID string, op FSOp) (*datastore.Upload, error) {
+	if scope == nil {
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return nil, errors.New("missing tenant scope")
+	}
+	// Owner short-circuit: legacy / owner tokens (IsScoped=false) skip
+	// the session lookup AND the authorize check entirely so this helper
+	// preserves exact pre-C2b behavior for owner callers — the upload
+	// handler will do its own GetUpload (or call b.ConfirmUploadWithTags
+	// etc.) and surface the same error shape it always did. This matches
+	// the @qiffang owner-perf invariant: no new SQL on the owner path.
+	//
+	// For scoped tokens we MUST look up the session here to authorize
+	// against its TargetPath, even at the cost of an extra GetUpload —
+	// this is exactly the re-authz-against-current-scope invariant.
+	if !scope.IsScoped {
+		return nil, nil
+	}
+	upload, err := b.Store().GetUpload(ctx, uploadID)
+	if err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "upload not found")
+			return nil, err
+		}
+		if errors.Is(err, datastore.ErrUploadExpired) {
+			errJSON(w, http.StatusGone, "upload expired")
+			return nil, err
+		}
+		errJSON(w, http.StatusInternalServerError, "upload session lookup failed")
+		return nil, err
+	}
+	if authErr := scope.AuthorizeFS(op, upload.TargetPath); authErr != nil {
+		writeFSAuthzError(w, authErr)
+		return nil, authErr
+	}
+	return upload, nil
 }
 
 // authorizeFSPathForBatch is the per-path variant for batch endpoints
