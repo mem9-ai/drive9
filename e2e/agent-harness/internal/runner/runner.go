@@ -195,7 +195,7 @@ func Run(ctx context.Context, cfg Config) (string, error) {
 	_ = captureDebug(ctx, rec, "run-end")
 	_ = rec.Event(report.Event{Type: "run_end"})
 	if err := rec.WriteManifest(manifest); err != nil {
-		return "", err
+		return runDir, err
 	}
 	_, gating, err := report.Generate(runDir)
 	if err != nil {
@@ -821,7 +821,11 @@ func runOpenFDUnmount(ctx context.Context, rec *report.Recorder, env mountproc.E
 		recordOracleFailure(rec, c, "unmount_busy_then_clean", err.Error(), "open file")
 		return nil
 	}
-	_, _ = f.WriteString("held open by harness\n")
+	if _, err := f.WriteString("held open by harness\n"); err != nil {
+		_ = f.Close()
+		recordOracleFailure(rec, c, "unmount_busy_then_clean", err.Error(), "write held-open file")
+		return nil
+	}
 	if c.Workload.HoldOpenDuration.Duration > 0 {
 		timer := time.NewTimer(c.Workload.HoldOpenDuration.Duration)
 		select {
