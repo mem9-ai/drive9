@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/meta"
@@ -179,32 +180,27 @@ func TestIsScopedBusinessRequestAllowed(t *testing.T) {
 		}
 	})
 
-	t.Run("write-side endpoints denied (left for C2)", func(t *testing.T) {
+	t.Run("non-FS endpoints still denied after C2a (uploads/sql/fork/events/journals/vault)", func(t *testing.T) {
+		// PR C2a admits write-side on /v1/fs/* but uploads remain denied
+		// until C2b wires their handlers + session re-authorize. chmod
+		// stays owner-only forever.
 		cases := []struct {
 			method string
 			path   string
 			query  string
 		}{
-			{http.MethodPut, "/v1/fs/main.txt", ""},
-			{http.MethodPatch, "/v1/fs/main.txt", ""},
-			{http.MethodDelete, "/v1/fs/main.txt", ""},
-			{http.MethodPost, "/v1/fs/main.txt", "append=1"},
-			{http.MethodPost, "/v1/fs/main.txt", "copy=1"},
-			{http.MethodPost, "/v1/fs/main.txt", "rename=1"},
-			{http.MethodPost, "/v1/fs/main.txt", "mkdir=1"},
-			{http.MethodPost, "/v1/fs/main.txt", "chmod=1"},
-			{http.MethodPost, "/v1/fs/main.txt", "create=1"},
-			{http.MethodGet, "/v1/fs:batch-stat", ""},          // wrong method for this endpoint
-			{http.MethodGet, "/v1/fs:batch-read-small", ""},    // wrong method
-			{http.MethodPost, "/v1/uploads", ""},
-			{http.MethodPost, "/v1/uploads/initiate", ""},
-			{http.MethodPost, "/v1/uploads/upload-1/complete", ""},
-			{http.MethodPost, "/v2/uploads/upload-1/parts", ""},
-			{http.MethodPost, "/v1/sql", ""},
-			{http.MethodPost, "/v1/fork", ""},
-			{http.MethodGet, "/v1/events", ""},
-			{http.MethodGet, "/v1/journals", ""},
-			{http.MethodGet, "/v1/vault/secrets", ""},
+			{http.MethodPost, "/v1/fs/main.txt", "chmod=1"},           // owner-only forever
+			{http.MethodGet, "/v1/fs:batch-stat", ""},                 // wrong method for this endpoint
+			{http.MethodGet, "/v1/fs:batch-read-small", ""},           // wrong method
+			{http.MethodPost, "/v1/uploads", ""},                      // C2b
+			{http.MethodPost, "/v1/uploads/initiate", ""},             // C2b
+			{http.MethodPost, "/v1/uploads/upload-1/complete", ""},    // C2b
+			{http.MethodPost, "/v2/uploads/upload-1/parts", ""},       // C2b
+			{http.MethodPost, "/v1/sql", ""},                          // out of scope
+			{http.MethodPost, "/v1/fork", ""},                         // out of scope
+			{http.MethodGet, "/v1/events", ""},                        // out of scope
+			{http.MethodGet, "/v1/journals", ""},                      // out of scope
+			{http.MethodGet, "/v1/vault/secrets", ""},                 // out of scope
 		}
 		for _, tc := range cases {
 			r := newScopedRequest(t, tc.method, tc.path, tc.query)
@@ -372,6 +368,339 @@ func TestAuthorizeFSPathForBatchOwnerAllows(t *testing.T) {
 		status, msg, allowed := authorizeFSPathForBatch(scope, FSOpRead, p)
 		if !allowed {
 			t.Errorf("owner batch path %q: allowed=false, want true (status=%d msg=%q)", p, status, msg)
+		}
+	}
+}
+
+// TestC2aWriteHandlersRejectScopedRequestBeforeBackend mirrors the C1
+// ordering proof for the new write-side handlers wired in C2a. Same
+// zero-value `&Server{}` trick: handler MUST call authorizeFS / authorizeFSPair
+// before touching backendFromRequest, otherwise the response would be
+// 401 "missing tenant scope" instead of 403 "fs access denied".
+func TestC2aWriteHandlersRejectScopedRequestBeforeBackend(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{
+			Prefix: "/scratch/run-1",
+			Ops:    map[FSOp]bool{FSOpRead: true, FSOpList: true, FSOpWrite: true, FSOpDelete: true},
+		}},
+	}
+
+	cases := []struct {
+		name   string
+		invoke func(s *Server, w http.ResponseWriter, r *http.Request)
+	}{
+		{"handleWrite", func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.handleWrite(w, r, "/main/secrets.env")
+		}},
+		{"handlePatch", func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.handlePatch(w, r, "/main/secrets.env")
+		}},
+		{"handleAppend", func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.handleAppend(w, r, "/main/secrets.env")
+		}},
+		{"handleCreate", func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.handleCreate(w, r, "/main/secrets.env")
+		}},
+		{"handleMkdir", func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.handleMkdir(w, r, "/main/newdir")
+		}},
+		{"handleDelete", func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.handleDelete(w, r, "/main/secrets.env")
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newScopedRequest(t, http.MethodPost, "/v1/fs/main/secrets.env", "")
+			r = r.WithContext(withScope(r.Context(), scope))
+			w := httptest.NewRecorder()
+			tc.invoke(&Server{}, w, r)
+			if got := w.Result().StatusCode; got != http.StatusForbidden {
+				t.Errorf("%s out-of-zone status = %d, want %d (must authorize before backend). body=%s",
+					tc.name, got, http.StatusForbidden, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestC2aHandleAppendAuthorizesBeforePlan asserts the banked
+// plan-timing invariant: handleAppend authorizes BEFORE generating the
+// upload plan. Otherwise the plan response would leak "this prefix is
+// writable" even if the subsequent PUT is denied.
+//
+// Method: a scoped token out-of-zone calling append should get 403 with
+// the canonical "fs access denied" JSON body, NOT a plan response.
+func TestC2aHandleAppendAuthorizesBeforePlan(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{
+			Prefix: "/scratch",
+			Ops:    map[FSOp]bool{FSOpWrite: true},
+		}},
+	}
+	r := newScopedRequest(t, http.MethodPost, "/v1/fs/main/log.txt", "append=1")
+	r = r.WithContext(withScope(r.Context(), scope))
+	w := httptest.NewRecorder()
+	(&Server{}).handleAppend(w, r, "/main/log.txt")
+
+	if got := w.Result().StatusCode; got != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", got, http.StatusForbidden)
+	}
+	// The 403 body must NOT look like an upload plan (which has fields like
+	// upload_id, part_size, max_parts). Look for the canonical authz error.
+	if !strings.Contains(w.Body.String(), "fs access denied") {
+		t.Errorf("body = %q, want canonical 'fs access denied' (not a plan response)", w.Body.String())
+	}
+}
+
+// TestC2aHandleChmodRejectsScopedToken pins the chmod-is-owner-only
+// invariant at the handler level (defense in depth — dispatcher already
+// rejects scoped tokens on ?chmod=1, but the handler MUST also reject
+// in case the dispatcher gate ever drifts).
+func TestC2aHandleChmodRejectsScopedToken(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		// Give the scoped token write+delete on EVERY zone — it still
+		// must not be able to chmod, because chmod isn't in the op set.
+		FSScopes: []FSScope{{
+			Prefix: "/",
+			Ops: map[FSOp]bool{
+				FSOpRead: true, FSOpList: true, FSOpSearch: true,
+				FSOpWrite: true, FSOpDelete: true,
+			},
+		}},
+	}
+	r := newScopedRequest(t, http.MethodPost, "/v1/fs/main/file.txt", "chmod=1")
+	r = r.WithContext(withScope(r.Context(), scope))
+	w := httptest.NewRecorder()
+	(&Server{}).handleChmod(w, r, "/main/file.txt")
+
+	if got := w.Result().StatusCode; got != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (chmod is owner-only)", got, http.StatusForbidden)
+	}
+}
+
+// TestC2aHandleCopyAuthorizesSrcViaHeader is the critical regression for
+// the copy dual-path invariant (banked from cp -r PR #434 work): copy's
+// source path comes from X-Dat9-Copy-Source HEADER, not the URL. A scoped
+// token allowed write on dst but NOT read on src must STILL get 403,
+// not 200 just because the URL path looks fine to a careless dispatcher.
+func TestC2aHandleCopyAuthorizesSrcViaHeader(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{
+			// Allow read+write on /scratch but NOT on /secrets.
+			Prefix: "/scratch",
+			Ops:    map[FSOp]bool{FSOpRead: true, FSOpWrite: true},
+		}},
+	}
+	// URL = dst = /scratch/exfil.env (in zone, write allowed).
+	// Header = src = /secrets/api-key.env (out of zone, read denied).
+	r := newScopedRequest(t, http.MethodPost, "/v1/fs/scratch/exfil.env", "copy=1")
+	r.Header.Set("X-Dat9-Copy-Source", "/secrets/api-key.env")
+	r = r.WithContext(withScope(r.Context(), scope))
+	w := httptest.NewRecorder()
+	(&Server{}).handleCopy(w, r, "/scratch/exfil.env")
+
+	if got := w.Result().StatusCode; got != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (src in header must be authorized, not just URL dst). body=%s",
+			got, http.StatusForbidden, w.Body.String())
+	}
+}
+
+// TestC2aHandleCopyAllowsBothInZone confirms the happy path: scoped token
+// with read on src zone AND write on dst zone allows copy. Negative tests
+// verify each missing capability denies.
+func TestC2aHandleCopyAllowsBothInZone(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{
+			{Prefix: "/source", Ops: map[FSOp]bool{FSOpRead: true}},
+			{Prefix: "/dest", Ops: map[FSOp]bool{FSOpWrite: true}},
+		},
+	}
+	r := newScopedRequest(t, http.MethodPost, "/v1/fs/dest/a.txt", "copy=1")
+	r.Header.Set("X-Dat9-Copy-Source", "/source/a.txt")
+	r = r.WithContext(withScope(r.Context(), scope))
+	w := httptest.NewRecorder()
+	(&Server{}).handleCopy(w, r, "/dest/a.txt")
+
+	// Authorize-pass path reaches backendFromRequest (nil here) → 401.
+	// We're proving the pair authorize PASSED for both endpoints; the
+	// nil-backend 401 is the post-authorize signal.
+	if got := w.Result().StatusCode; got != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d (authorize passed; backend missing). body=%s",
+			got, http.StatusUnauthorized, w.Body.String())
+	}
+}
+
+// TestC2aHandleRenameSrcRequiresDeleteNotWrite pins the banked rename
+// invariant: rename's src op is DELETE (the file disappears), not WRITE.
+// A token with read+write on the source zone but NO delete cannot rename
+// — even though they could copy + (try to) delete original.
+func TestC2aHandleRenameSrcRequiresDeleteNotWrite(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{
+			// Read+Write on /scratch but NO delete.
+			Prefix: "/scratch",
+			Ops:    map[FSOp]bool{FSOpRead: true, FSOpWrite: true},
+		}},
+	}
+	r := newScopedRequest(t, http.MethodPost, "/v1/fs/scratch/new.txt", "rename=1")
+	r.Header.Set("X-Dat9-Rename-Source", "/scratch/old.txt")
+	r = r.WithContext(withScope(r.Context(), scope))
+	w := httptest.NewRecorder()
+	(&Server{}).handleRename(w, r, "/scratch/new.txt")
+
+	if got := w.Result().StatusCode; got != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (rename src requires delete, not write)",
+			got, http.StatusForbidden)
+	}
+}
+
+// TestC2aHandleRenameAllowsDeletePlusWrite confirms rename works with
+// the correct ops: delete on src + write on dst.
+func TestC2aHandleRenameAllowsDeletePlusWrite(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{
+			// Single zone with full ops.
+			Prefix: "/scratch",
+			Ops: map[FSOp]bool{
+				FSOpRead: true, FSOpWrite: true, FSOpDelete: true,
+			},
+		}},
+	}
+	r := newScopedRequest(t, http.MethodPost, "/v1/fs/scratch/new.txt", "rename=1")
+	r.Header.Set("X-Dat9-Rename-Source", "/scratch/old.txt")
+	r = r.WithContext(withScope(r.Context(), scope))
+	w := httptest.NewRecorder()
+	(&Server{}).handleRename(w, r, "/scratch/new.txt")
+
+	// Pair authorize passes; missing backend → 401.
+	if got := w.Result().StatusCode; got != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d (authorize passed; backend missing). body=%s",
+			got, http.StatusUnauthorized, w.Body.String())
+	}
+}
+
+// TestC2aDispatcherWriteSideAllowed verifies the dispatcher whitelist
+// extension for write-side methods admits the right requests and denies
+// chmod, mixed selectors, and unknown query keys per @adversary-1's
+// "no silent first-wins" invariant.
+func TestC2aDispatcherWriteSideAllowed(t *testing.T) {
+	t.Run("write-side allowed", func(t *testing.T) {
+		cases := []struct {
+			method string
+			query  string
+		}{
+			{http.MethodPut, ""},
+			{http.MethodPatch, ""},
+			{http.MethodDelete, ""},
+			{http.MethodDelete, "recursive=1"},
+			{http.MethodDelete, "kind=dir"},
+			{http.MethodDelete, "recursive=1&kind=dir"},
+			{http.MethodPost, "append=1"},
+			{http.MethodPost, "copy=1"},
+			{http.MethodPost, "rename=1"},
+			{http.MethodPost, "mkdir=1"},
+			{http.MethodPost, "mkdir=1&mode=755"},
+			{http.MethodPost, "create=1"},
+		}
+		for _, tc := range cases {
+			r := newScopedRequest(t, tc.method, "/v1/fs/main.txt", tc.query)
+			if !isScopedBusinessRequestAllowed(r) {
+				t.Errorf("isScopedBusinessRequestAllowed(%s /v1/fs/main.txt?%s) = false, want true",
+					tc.method, tc.query)
+			}
+		}
+	})
+
+	t.Run("chmod always denied for scoped", func(t *testing.T) {
+		r := newScopedRequest(t, http.MethodPost, "/v1/fs/main.txt", "chmod=1")
+		if isScopedBusinessRequestAllowed(r) {
+			t.Errorf("chmod must be denied for scoped tokens at dispatcher")
+		}
+	})
+
+	t.Run("mixed POST selectors denied as ambiguous", func(t *testing.T) {
+		cases := []string{
+			"append=1&copy=1",
+			"copy=1&rename=1",
+			"mkdir=1&create=1",
+			"copy=1&chmod=1", // chmod combined with anything → deny
+			"append=1&mkdir=1&create=1",
+		}
+		for _, q := range cases {
+			r := newScopedRequest(t, http.MethodPost, "/v1/fs/main.txt", q)
+			if isScopedBusinessRequestAllowed(r) {
+				t.Errorf("isScopedBusinessRequestAllowed(POST /v1/fs/main.txt?%s) = true, want false (ambiguous mixed selectors must deny)", q)
+			}
+		}
+	})
+
+	t.Run("POST without selector denied", func(t *testing.T) {
+		r := newScopedRequest(t, http.MethodPost, "/v1/fs/main.txt", "")
+		if isScopedBusinessRequestAllowed(r) {
+			t.Errorf("POST without action selector must deny (no handler matches)")
+		}
+	})
+
+	t.Run("PUT/PATCH reject unknown query keys", func(t *testing.T) {
+		// handleWrite and handlePatch don't consume any query params; any
+		// extra key would be a sign of caller confusion or future drift.
+		for _, m := range []string{http.MethodPut, http.MethodPatch} {
+			r := newScopedRequest(t, m, "/v1/fs/main.txt", "extra=1")
+			if isScopedBusinessRequestAllowed(r) {
+				t.Errorf("%s with unknown query key must deny", m)
+			}
+		}
+	})
+
+	t.Run("POST action arms reject cross-arm filter keys", func(t *testing.T) {
+		// `mkdir` allows ?mode; `mkdir&mode` is fine.
+		// But `copy&mode` is cross-arm: mode is a mkdir filter, not copy.
+		cases := []struct {
+			query string
+			why   string
+		}{
+			{"copy=1&mode=755", "mode is a mkdir-arm key, not copy-arm"},
+			{"create=1&mode=755", "mode is a mkdir-arm key, not create-arm"},
+			{"append=1&extra=x", "append doesn't consume any filter param"},
+		}
+		for _, tc := range cases {
+			r := newScopedRequest(t, http.MethodPost, "/v1/fs/main.txt", tc.query)
+			if isScopedBusinessRequestAllowed(r) {
+				t.Errorf("POST /v1/fs/main.txt?%s = true, want false (%s)", tc.query, tc.why)
+			}
+		}
+	})
+}
+
+// TestC2aUploadsStillDeniedForScopedTokens pins the C2b boundary:
+// uploads are still dispatcher-denied for scoped tokens after C2a. This
+// regression catches the case where C2b's whitelist extension might
+// accidentally land before its handlers are wired.
+func TestC2aUploadsStillDeniedForScopedTokens(t *testing.T) {
+	cases := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/v1/uploads"},
+		{http.MethodPost, "/v1/uploads/initiate"},
+		{http.MethodPost, "/v1/uploads/upload-1/complete"},
+		{http.MethodPost, "/v1/uploads/upload-1/resume"},
+		{http.MethodPost, "/v1/uploads/upload-1/abort"},
+		{http.MethodPost, "/v2/uploads/upload-1/parts"},
+		{http.MethodPost, "/v2/uploads/upload-1/complete"},
+		{http.MethodPost, "/v2/uploads/upload-1/abort"},
+	}
+	for _, tc := range cases {
+		r := newScopedRequest(t, tc.method, tc.path, "")
+		if isScopedBusinessRequestAllowed(r) {
+			t.Errorf("%s %s = allowed; uploads must remain dispatcher-denied until C2b", tc.method, tc.path)
 		}
 	}
 }

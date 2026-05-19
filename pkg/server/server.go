@@ -429,20 +429,23 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 // only allow a route through when the handler in this PR is known to call
 // AuthorizeFS itself.
 //
-// PR C1 opens read-side only. PR C2 will extend this whitelist to write-side
-// (PUT/PATCH/DELETE/POST on /v1/fs/* + uploads) once each write handler
-// authorizes its target path.
+// PR C1 opened read-side. PR C2 extends the whitelist to write-side
+// (PUT/PATCH/DELETE/POST on /v1/fs/* except chmod) now that each write
+// handler authorizes its target path. Uploads are still default-deny —
+// they will be wired in a follow-up PR with session re-authorize semantics.
 //
 // chmod (POST /v1/fs/<path>?chmod=1) is explicitly NOT and never will be in
 // the scoped allowlist — chmod escalates ACLs and is owner-token-only.
 //
 // The GET branch uses an **action-specific** accept-list (per @adversary-1
 // msg 00efe734 / @adversary-2 msg cbedd30a): the chosen action selector
-// (stat / grep / find / list / none) determines which filter keys handler
-// actually consumes, and only those keys plus the selector itself are
-// admitted. Earlier revisions admitted only the selector keys themselves,
-// which rejected normal scoped grep/find calls like `?grep=hello&limit=20`
-// before AuthorizeFS could even run — a regression vs current behavior.
+// determines which filter keys the handler actually consumes, and only
+// those keys plus the selector itself are admitted.
+//
+// The POST branch also uses an action-specific accept-list (per @adversary-1
+// msg 6e17765f): mixed selectors like `?append=1&copy=1` deny as ambiguous
+// rather than silently first-wins. Each action arm allows only the keys
+// the corresponding handler reads.
 func isScopedBusinessRequestAllowed(r *http.Request) bool {
 	path := r.URL.Path
 
@@ -451,7 +454,7 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 		return r.Method == http.MethodPost
 	}
 
-	// /v1/fs/* — read-side methods/queries only in C1.
+	// /v1/fs/* — read + write methods admitted in C2; uploads still deny.
 	if strings.HasPrefix(path, "/v1/fs/") {
 		switch r.Method {
 		case http.MethodHead:
@@ -459,17 +462,77 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 			return true
 		case http.MethodGet:
 			return isScopedFSGetQueryAllowed(r.URL.Query())
+		case http.MethodPut:
+			// handleWrite — write. No query params consumed.
+			return len(r.URL.Query()) == 0
+		case http.MethodPatch:
+			// handlePatch — write. No query params consumed.
+			return len(r.URL.Query()) == 0
+		case http.MethodDelete:
+			// handleDelete — delete. Consumes ?recursive and ?kind.
+			return queryKeysSubsetOf(r.URL.Query(), []string{"recursive", "kind"})
+		case http.MethodPost:
+			return isScopedFSPostQueryAllowed(r.URL.Query())
 		default:
-			// PUT/PATCH/DELETE/POST on /v1/fs/* are write-side and chmod;
-			// rejected in C1, write-side will be wired in C2 (chmod stays
-			// owner-only forever).
 			return false
 		}
 	}
 
-	// Uploads, SQL, fork, events, journals, vault, status, etc.: not in C1
-	// scope. C2 may open uploads.
+	// Uploads, SQL, fork, events, journals, vault, status: still default-
+	// deny for scoped tokens. Uploads will be wired in a follow-up PR.
 	return false
+}
+
+// isScopedFSPostQueryAllowed mirrors handleFS's POST dispatcher (server.go
+// :691 onward), but rejects mixed selectors as ambiguous (per @adversary-1
+// msg 6e17765f) rather than silently first-wins. Each action arm allows
+// only the keys the corresponding handler reads. chmod is never allowed
+// for scoped tokens.
+func isScopedFSPostQueryAllowed(q url.Values) bool {
+	// Count how many action selectors are set. Multiple selectors = deny;
+	// no selector = deny (no handler matches the dispatcher's else branch
+	// for scoped tokens — that's "unknown POST action" which is a 400 for
+	// owner today, and we don't want to silently widen for scoped).
+	selectors := []string{"append", "copy", "rename", "mkdir", "chmod", "create"}
+	selectorCount := 0
+	var selectorKey string
+	for _, k := range selectors {
+		if q.Has(k) {
+			selectorCount++
+			selectorKey = k
+		}
+	}
+	if selectorCount != 1 {
+		return false
+	}
+
+	switch selectorKey {
+	case "append":
+		// handleAppend reads only ?append.
+		return queryKeysSubsetOf(q, []string{"append"})
+	case "copy":
+		// handleCopy reads only ?copy (source path is in
+		// X-Dat9-Copy-Source header, not query).
+		return queryKeysSubsetOf(q, []string{"copy"})
+	case "rename":
+		// handleRename reads only ?rename (source path is in
+		// X-Dat9-Rename-Source header, not query).
+		return queryKeysSubsetOf(q, []string{"rename"})
+	case "mkdir":
+		// handleMkdir reads ?mkdir and ?mode.
+		return queryKeysSubsetOf(q, []string{"mkdir", "mode"})
+	case "chmod":
+		// chmod is owner-only; scoped tokens MUST NEVER reach this arm.
+		// Defense in depth — the handler also rejects scoped tokens, but
+		// the dispatcher gate makes the policy decision explicit at the
+		// allowlist boundary.
+		return false
+	case "create":
+		// handleCreate reads only ?create.
+		return queryKeysSubsetOf(q, []string{"create"})
+	default:
+		return false
+	}
 }
 
 // isScopedFSGetQueryAllowed mirrors handleFS's GET dispatcher (server.go:618
@@ -936,6 +999,9 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 }
 
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string) {
+	if !authorizeFS(w, r, FSOpWrite, path) {
+		return
+	}
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_missing_scope", "path", path)...)
@@ -1100,6 +1166,9 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 }
 
 func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string) {
+	if !authorizeFS(w, r, FSOpWrite, path) {
+		return
+	}
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_missing_scope", "path", path)...)
@@ -1196,6 +1265,14 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 }
 
 func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path string) {
+	// Authorize BEFORE generating the upload plan (per @adversary-1 review
+	// banked invariant): a plan response leaks "this prefix is writable" to
+	// any caller who can hit the endpoint, even if the subsequent PUT is
+	// later denied. Putting authorize first ensures denied scoped tokens
+	// receive a 403 with no plan-shaped JSON body.
+	if !authorizeFS(w, r, FSOpWrite, path) {
+		return
+	}
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_missing_scope", "path", path)...)
@@ -1578,6 +1655,9 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path string) {
+	if !authorizeFS(w, r, FSOpDelete, path) {
+		return
+	}
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "delete_missing_scope", "path", path)...)
@@ -1618,16 +1698,25 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 }
 
 func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath string) {
-	b := backendFromRequest(r)
-	if b == nil {
-		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "copy_missing_scope", "dst_path", dstPath)...)
-		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
-		return
-	}
+	// Copy semantics: src needs read, dst needs write. The source path is
+	// in the X-Dat9-Copy-Source HEADER (not the URL) — banked invariant
+	// from the cp -r work (PR #434): missing this means the dispatcher
+	// could authorize ONLY the dst from the URL and let a scoped token
+	// exfiltrate from any zone it doesn't have read on, as long as its dst
+	// zone is writable. Both ends MUST authorize.
 	srcPath := r.Header.Get("X-Dat9-Copy-Source")
 	if srcPath == "" {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "copy_missing_source_header", "dst_path", dstPath)...)
 		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Copy-Source header")
+		return
+	}
+	if !authorizeFSPair(w, r, FSOpRead, srcPath, FSOpWrite, dstPath) {
+		return
+	}
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "copy_missing_scope", "dst_path", dstPath)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
 	if err := b.CopyFileCtx(r.Context(), srcPath, dstPath); err != nil {
@@ -1646,16 +1735,23 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 }
 
 func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath string) {
-	b := backendFromRequest(r)
-	if b == nil {
-		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "rename_missing_scope", "new_path", newPath)...)
-		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
-		return
-	}
+	// Rename semantics: src disappears (= delete), dst is the new location
+	// (= write). Subtle but important — a scoped token with read+write on
+	// the source zone but no delete CAN read & copy the file but must NOT
+	// rename it away. See banked invariant.
 	oldPath := r.Header.Get("X-Dat9-Rename-Source")
 	if oldPath == "" {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "rename_missing_source_header", "new_path", newPath)...)
 		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Rename-Source header")
+		return
+	}
+	if !authorizeFSPair(w, r, FSOpDelete, oldPath, FSOpWrite, newPath) {
+		return
+	}
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "rename_missing_scope", "new_path", newPath)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
 	if err := b.RenameCtx(r.Context(), oldPath, newPath); err != nil {
@@ -1679,6 +1775,9 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 }
 
 func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string) {
+	if !authorizeFS(w, r, FSOpWrite, path) {
+		return
+	}
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "mkdir_missing_scope", "path", path)...)
@@ -1707,6 +1806,14 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 }
 
 func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string) {
+	// chmod escalates ACLs; scoped tokens MUST NEVER be allowed to chmod,
+	// regardless of zone. The dispatcher already denies scoped tokens on
+	// POST /v1/fs/*?chmod, so reaching this handler with a scoped token
+	// indicates a defense-in-depth gap somewhere upstream — fail closed.
+	if scope := ScopeFromContext(r.Context()); scope != nil && scope.IsScoped {
+		errJSON(w, http.StatusForbidden, "chmod is owner-only")
+		return
+	}
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "chmod_missing_scope", "path", path)...)
@@ -1737,6 +1844,9 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 }
 
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path string) {
+	if !authorizeFS(w, r, FSOpWrite, path) {
+		return
+	}
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_missing_scope", "path", path)...)
