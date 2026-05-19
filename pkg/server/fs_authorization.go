@@ -179,6 +179,27 @@ func authorizeFS(w http.ResponseWriter, r *http.Request, op FSOp, rawPath string
 	return true
 }
 
+// authorizeFSPair is the dual-path variant for copy / rename handlers,
+// where one operation needs different op semantics on src vs dst.
+//
+//	copy:   src=read,   dst=write   (read the source, write the dest)
+//	rename: src=delete, dst=write   (the source disappears = delete; dest = write)
+//
+// Owner short-circuit (IsScoped=false) inside AuthorizeFS still applies for
+// both sides — same per-arm fast-path as single-path authorize.
+func authorizeFSPair(w http.ResponseWriter, r *http.Request, srcOp FSOp, srcPath string, dstOp FSOp, dstPath string) bool {
+	scope := ScopeFromContext(r.Context())
+	if scope == nil {
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return false
+	}
+	if err := scope.AuthorizeFSPair(srcOp, srcPath, dstOp, dstPath); err != nil {
+		writeFSAuthzError(w, err)
+		return false
+	}
+	return true
+}
+
 // authorizeFSPathForBatch is the per-path variant for batch endpoints
 // (batch-stat / batch-read-small). It returns the HTTP status + error string
 // to embed in the per-path result so callers can short-circuit a single

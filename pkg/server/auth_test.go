@@ -379,23 +379,21 @@ func TestAuthScopedKeyLoadsFSScopes(t *testing.T) {
 	}
 }
 
-// TestScopedBusinessEndpointGuardDeniesNonC1Endpoints checks that scoped
-// tokens are still 403'd at the dispatcher for every endpoint NOT opened
-// by PR C1's read-side wiring. PR C1 admits POST batch-stat / batch-read-
-// small and GET/HEAD on /v1/fs/* — those have their own
-// AuthorizeFS-on-each-handler tests. Every other business endpoint
-// (write methods on /v1/fs, all uploads, sql, fork, events, journals,
-// vault) must continue to fail-closed at handleBusiness.
-func TestScopedBusinessEndpointGuardDeniesNonC1Endpoints(t *testing.T) {
+// TestScopedBusinessEndpointGuardDeniesEndpointsOutOfC1C2aScope checks
+// that scoped tokens are still 403'd at the dispatcher for every endpoint
+// NOT opened by PR C1 (read-side) or PR C2a (write-side except chmod).
+// Uploads remain dispatcher-denied until C2b wires their handlers +
+// session re-authorize. SQL/fork/events/journals/vault are permanently
+// out of scope. chmod stays owner-only forever. A bare POST /v1/fs/*
+// without an action selector also denies (ambiguous request).
+func TestScopedBusinessEndpointGuardDeniesEndpointsOutOfC1C2aScope(t *testing.T) {
 	type endpoint struct {
 		method string
 		path   string
 	}
 	deniedC1 := []endpoint{
 		{http.MethodPost, "/v1/sql"},
-		{http.MethodPut, "/v1/fs/file.txt"},    // write-side, still C2-only
-		{http.MethodDelete, "/v1/fs/file.txt"}, // write-side
-		{http.MethodPost, "/v1/fs/file.txt"},   // mkdir/copy/rename/append, C2-only
+		{http.MethodPost, "/v1/fs/file.txt"}, // no action selector → ambiguous → deny
 		{http.MethodPost, "/v1/uploads/initiate"},
 		{http.MethodPost, "/v1/uploads"},
 		{http.MethodPost, "/v1/fork"},
