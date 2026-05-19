@@ -47,6 +47,7 @@ type MountOptions struct {
 	Profile               string        // mount profile: "interactive", "" (default)
 	UploadConcurrency     int           // number of background upload workers (default 4)
 	ReadConcurrency       int           // maximum concurrent backend reads issued by FUSE (default 24)
+	SyncRead              bool          // disable kernel async read dispatch; at most one read in flight per file handle
 	LookupRetryCount      int           // detached retries after transient Lookup/GetAttr stat failures (default 2)
 	LookupRetryTimeout    time.Duration // timeout per detached stat retry after interrupt/transient errors (default 250ms)
 	LegacyDirStatFallback bool          // on Lookup stat 404, list parent to support legacy servers without directory stat
@@ -293,29 +294,7 @@ func Mount(opts *MountOptions) error {
 	}
 
 	// Configure FUSE mount options
-	fuseOpts := &gofuse.MountOptions{
-		FsName:        "drive9",
-		Name:          "drive9",
-		MaxReadAhead:  8 * 1024 * 1024, // 8MB — larger readahead reduces FUSE kernel↔userspace switches
-		MaxWrite:      128 * 1024,      // 128KB per write request (default 64KB)
-		MaxBackground: 32,              // concurrent background FUSE requests (default 12)
-		Debug:         opts.Debug,
-		AllowOther:    opts.AllowOther,
-	}
-	if runtime.GOOS == "linux" {
-		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively
-	}
-	if runtime.GOOS == "darwin" {
-		// macFUSE can reject open/readdir before requests reach the daemon if
-		// it performs local permission checks or treats the volume as a
-		// privacy-gated network volume. drive9 authorization is remote, so
-		// defer permission decisions to the filesystem handlers and present the
-		// mount as local to ordinary CLI tools.
-		fuseOpts.Options = append(fuseOpts.Options, "defer_permissions", "local")
-	}
-	if opts.ReadOnly {
-		fuseOpts.Options = append(fuseOpts.Options, "ro")
-	}
+	fuseOpts := newGoFuseMountOptions(opts)
 
 	// Create FUSE server
 	server, err := gofuse.NewServer(dat9fs, opts.MountPoint, fuseOpts)
@@ -475,6 +454,34 @@ func Mount(opts *MountOptions) error {
 	server.Wait()
 	shutdown()
 	return nil
+}
+
+func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
+	fuseOpts := &gofuse.MountOptions{
+		FsName:        "drive9",
+		Name:          "drive9",
+		MaxReadAhead:  8 * 1024 * 1024, // 8MB — larger readahead reduces FUSE kernel↔userspace switches
+		MaxWrite:      128 * 1024,      // 128KB per write request (default 64KB)
+		MaxBackground: 32,              // concurrent background FUSE requests (default 12)
+		SyncRead:      opts.SyncRead,   // disables FUSE_CAP_ASYNC_READ; one read in flight per file handle
+		Debug:         opts.Debug,
+		AllowOther:    opts.AllowOther,
+	}
+	if runtime.GOOS == "linux" {
+		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively
+	}
+	if runtime.GOOS == "darwin" {
+		// macFUSE can reject open/readdir before requests reach the daemon if
+		// it performs local permission checks or treats the volume as a
+		// privacy-gated network volume. drive9 authorization is remote, so
+		// defer permission decisions to the filesystem handlers and present the
+		// mount as local to ordinary CLI tools.
+		fuseOpts.Options = append(fuseOpts.Options, "defer_permissions", "local")
+	}
+	if opts.ReadOnly {
+		fuseOpts.Options = append(fuseOpts.Options, "ro")
+	}
+	return fuseOpts
 }
 
 func newMountShutdown(stopWatcher func(), flushAll func()) func() {

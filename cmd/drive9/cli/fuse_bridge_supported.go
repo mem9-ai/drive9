@@ -43,6 +43,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		WritePolicy:           writePolicy,
 		Profile:               opts.Profile,
 		ReadConcurrency:       opts.ReadConcurrency,
+		SyncRead:              opts.SyncRead,
 		AllowOther:            opts.AllowOther,
 		ReadOnly:              opts.ReadOnly,
 		Debug:                 opts.Debug,

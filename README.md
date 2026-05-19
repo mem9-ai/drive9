@@ -370,6 +370,8 @@ drive9 mount [flags] [:/remote] <mountpoint>
   -flush-debounce duration       small-file flush debounce (default: 2s)
   -lookup-retry-count int        detached stat retries after transient lookup errors
   -lookup-retry-timeout duration timeout per detached lookup retry
+  -read-concurrency int          concurrent backend reads issued by FUSE (default: 24)
+  -fuse-sync-read                disable kernel async read dispatch per file handle
   -allow-other                   allow other users to access mount
   -read-only                     mount read-only
   -debug                         enable FUSE debug logging

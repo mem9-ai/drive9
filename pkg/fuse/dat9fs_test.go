@@ -2689,6 +2689,35 @@ func TestMountOptionsReadConcurrencyDefaults(t *testing.T) {
 	}
 }
 
+func TestMountOptionsSyncReadDefaultsToAsyncReads(t *testing.T) {
+	defaults := &MountOptions{}
+	defaults.setDefaults()
+	if defaults.SyncRead {
+		t.Fatal("default SyncRead = true, want false")
+	}
+
+	explicit := &MountOptions{SyncRead: true}
+	explicit.setDefaults()
+	if !explicit.SyncRead {
+		t.Fatal("explicit SyncRead = false, want true")
+	}
+}
+
+func TestGoFuseMountOptionsMapsSyncRead(t *testing.T) {
+	defaults := newGoFuseMountOptions(&MountOptions{})
+	if defaults.SyncRead {
+		t.Fatal("default go-fuse SyncRead = true, want false")
+	}
+
+	explicit := newGoFuseMountOptions(&MountOptions{SyncRead: true})
+	if !explicit.SyncRead {
+		t.Fatal("explicit go-fuse SyncRead = false, want true")
+	}
+	if explicit.MaxBackground != 32 {
+		t.Fatalf("MaxBackground = %d, want 32", explicit.MaxBackground)
+	}
+}
+
 func TestLookupReturnsTTLInEntryOut(t *testing.T) {
 	fs, _, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(make([]byte, 42))

@@ -50,6 +50,7 @@ type mountFuseOptions struct {
 	WritePolicy           fuseWritePolicy
 	Profile               string
 	ReadConcurrency       int
+	SyncRead              bool
 	AllowOther            bool
 	ReadOnly              bool
 	Debug                 bool
