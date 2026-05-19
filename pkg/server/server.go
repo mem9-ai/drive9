@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -386,7 +387,7 @@ func (s *Server) ListenAndServe(addr string) error {
 }
 
 func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
-	if scope := ScopeFromContext(r.Context()); scope != nil && scope.IsScoped && !isScopedBusinessPathAllowed(r.URL.Path) {
+	if scope := ScopeFromContext(r.Context()); scope != nil && scope.IsScoped && !isScopedBusinessRequestAllowed(r) {
 		errJSON(w, http.StatusForbidden, "scoped token cannot access endpoint")
 		return
 	}
@@ -421,10 +422,108 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func isScopedBusinessPathAllowed(_ string) bool {
-	// PR A only introduces the scoped-token foundation. FS/upload routes opt in
-	// in PR C1/C2 once each handler authorizes its request path before work.
+// isScopedBusinessRequestAllowed is the dispatcher-level gate for scoped
+// tokens. It mirrors handleFS's actual dispatch table so the gate stays in
+// sync with what each handler actually wires — release-order safety per
+// @adversary-1 / @dev-1 review (PR C1 thread msg b6f53023, 4619c945, 005e8b0b):
+// only allow a route through when the handler in this PR is known to call
+// AuthorizeFS itself.
+//
+// PR C1 opens read-side only. PR C2 will extend this whitelist to write-side
+// (PUT/PATCH/DELETE/POST on /v1/fs/* + uploads) once each write handler
+// authorizes its target path.
+//
+// chmod (POST /v1/fs/<path>?chmod=1) is explicitly NOT and never will be in
+// the scoped allowlist — chmod escalates ACLs and is owner-token-only.
+//
+// The GET branch uses an **action-specific** accept-list (per @adversary-1
+// msg 00efe734 / @adversary-2 msg cbedd30a): the chosen action selector
+// (stat / grep / find / list / none) determines which filter keys handler
+// actually consumes, and only those keys plus the selector itself are
+// admitted. Earlier revisions admitted only the selector keys themselves,
+// which rejected normal scoped grep/find calls like `?grep=hello&limit=20`
+// before AuthorizeFS could even run — a regression vs current behavior.
+func isScopedBusinessRequestAllowed(r *http.Request) bool {
+	path := r.URL.Path
+
+	// Batch FS endpoints (always POST). Handlers do per-path AuthorizeFS internally.
+	if path == "/v1/fs:batch-stat" || path == "/v1/fs:batch-read-small" {
+		return r.Method == http.MethodPost
+	}
+
+	// /v1/fs/* — read-side methods/queries only in C1.
+	if strings.HasPrefix(path, "/v1/fs/") {
+		switch r.Method {
+		case http.MethodHead:
+			// handleStat — read.
+			return true
+		case http.MethodGet:
+			return isScopedFSGetQueryAllowed(r.URL.Query())
+		default:
+			// PUT/PATCH/DELETE/POST on /v1/fs/* are write-side and chmod;
+			// rejected in C1, write-side will be wired in C2 (chmod stays
+			// owner-only forever).
+			return false
+		}
+	}
+
+	// Uploads, SQL, fork, events, journals, vault, status, etc.: not in C1
+	// scope. C2 may open uploads.
 	return false
+}
+
+// isScopedFSGetQueryAllowed mirrors handleFS's GET dispatcher (server.go:618
+// onward): the action is decided by which selector key is present, in
+// priority order: stat → grep → find → list → (no selector = handleRead).
+// Each branch accepts only the keys its handler actually reads; unknown
+// keys for the selected branch deny so a future action key on the same
+// path can't silently inherit the C1 allowlist.
+func isScopedFSGetQueryAllowed(q url.Values) bool {
+	// Note: handleFS GET dispatch order (stat > grep > find > list > read)
+	// must match here, otherwise a request like `?stat=1&grep=hello` would
+	// allow under one arm and be dispatched to another — pick the action
+	// the dispatcher will pick.
+	switch {
+	case q.Has("stat"):
+		// handleStatMetadata reads only ?stat.
+		return queryKeysSubsetOf(q, []string{"stat"})
+	case q.Has("grep"):
+		// handleGrep reads ?grep and ?limit.
+		return queryKeysSubsetOf(q, []string{"grep", "limit"})
+	case q.Has("find"):
+		// handleFind reads ?find, ?name, ?tag, ?newer, ?older,
+		// ?minsize, ?maxsize, ?limit.
+		return queryKeysSubsetOf(q, []string{
+			"find", "name", "tag", "newer", "older",
+			"minsize", "maxsize", "limit",
+		})
+	case q.Has("list"):
+		// handleList reads only ?list. (No filter params today.)
+		return queryKeysSubsetOf(q, []string{"list"})
+	default:
+		// No action selector → handleRead, which does not consume query
+		// params. Any unknown key on a read request is rejected to prevent
+		// future GET-side actions from silently inheriting the allowlist.
+		return len(q) == 0
+	}
+}
+
+// queryKeysSubsetOf returns true iff every key in q is present in allowed.
+// allowed is small (<10 strings) so linear scan is fine.
+func queryKeysSubsetOf(q url.Values, allowed []string) bool {
+	for k := range q {
+		ok := false
+		for _, a := range allowed {
+			if k == a {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -613,6 +712,9 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string) {
+	if !authorizeFS(w, r, FSOpRead, path) {
+		return
+	}
 	start := time.Now()
 	b := backendFromRequest(r)
 	if b == nil {
@@ -674,6 +776,9 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string) {
+	if !authorizeFS(w, r, FSOpList, path) {
+		return
+	}
 	start := time.Now()
 	b := backendFromRequest(r)
 	if b == nil {
@@ -730,6 +835,9 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 }
 
 func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path string) {
+	if !authorizeFS(w, r, FSOpRead, path) {
+		return
+	}
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_missing_scope", "path", path)...)
@@ -1237,8 +1345,17 @@ func (s *Server) handleBatchStat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	scope := ScopeFromContext(r.Context())
 	results := make([]batchStatResult, len(req.Paths))
 	for i, path := range req.Paths {
+		// Per-path authorize: a denied path becomes a per-element 403 in
+		// the response, but allowed siblings still resolve. This preserves
+		// the cp -r preflight contract (PR #434) — one out-of-zone path
+		// must not 403 the entire batch.
+		if status, msg, allowed := authorizeFSPathForBatch(scope, FSOpRead, path); !allowed {
+			results[i] = batchStatResult{Path: path, Status: status, Error: msg}
+			continue
+		}
 		results[i] = s.batchStatOne(r.Context(), b, path)
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "batch_stat_ok", "count", len(results))...)
@@ -1275,8 +1392,14 @@ func (s *Server) handleBatchReadSmall(w http.ResponseWriter, r *http.Request) {
 	if maxBytes <= 0 || maxBytes > maxBatchReadSmallBytes {
 		maxBytes = maxBatchReadSmallBytes
 	}
+	scope := ScopeFromContext(r.Context())
 	results := make([]batchReadSmallResult, len(req.Paths))
 	for i, path := range req.Paths {
+		// Per-path authorize, same shape as batch-stat above.
+		if status, msg, allowed := authorizeFSPathForBatch(scope, FSOpRead, path); !allowed {
+			results[i] = batchReadSmallResult{Path: path, Status: status, Error: msg}
+			continue
+		}
 		results[i] = s.batchReadSmallOne(r.Context(), b, path, maxBytes)
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "batch_read_small_ok", "count", len(results), "max_bytes", maxBytes)...)
@@ -1379,6 +1502,13 @@ func validateBatchStatPath(rawPath string) error {
 }
 
 func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string) {
+	// HEAD must not write a body; for scoped-token deny the status code is
+	// still informative (403/400). Go's net/http strips body bytes from HEAD
+	// responses, so reusing authorizeFS (which calls errJSON) is safe — the
+	// JSON body will not reach the client.
+	if !authorizeFS(w, r, FSOpRead, path) {
+		return
+	}
 	start := time.Now()
 	b := backendFromRequest(r)
 	if b == nil {
@@ -2664,6 +2794,9 @@ func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string) {
+	if !authorizeFS(w, r, FSOpSearch, path) {
+		return
+	}
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "grep_missing_scope", "path", path)...)
@@ -2700,6 +2833,9 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 }
 
 func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string) {
+	if !authorizeFS(w, r, FSOpSearch, path) {
+		return
+	}
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "find_missing_scope", "path", path)...)
