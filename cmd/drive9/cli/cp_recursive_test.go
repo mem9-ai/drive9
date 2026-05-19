@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -122,12 +123,27 @@ func (m *mockTreeServer) httpServer(t *testing.T) *httptest.Server {
 			_ = json.NewEncoder(w).Encode(map[string]any{"entries": out})
 		case r.Method == http.MethodHead && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
 			path := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+			// Prefer the explicit statResults override (used for dst-
+			// exists-as-file and remote-source tests). Fall back to
+			// m.existing so dst-root preflight HEADs see the same
+			// state as BatchStat preflights — without this the dst
+			// root's "exists as dir" flag in m.existing was invisible
+			// to remotePathStatus, which uses StatCtx (HEAD).
 			if s, ok := m.statResults[path]; ok && s.exists {
 				if s.isDir {
 					w.Header().Set("X-Dat9-IsDir", "true")
 				} else {
 					w.Header().Set("X-Dat9-IsDir", "false")
 					w.Header().Set("Content-Length", fmt.Sprintf("%d", s.size))
+				}
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if isDir, exists := m.existing[path]; exists {
+				if isDir {
+					w.Header().Set("X-Dat9-IsDir", "true")
+				} else {
+					w.Header().Set("X-Dat9-IsDir", "false")
 				}
 				w.WriteHeader(http.StatusOK)
 				return
@@ -196,17 +212,76 @@ func TestCpRecursiveLocalToRemote_DstDoesNotExist(t *testing.T) {
 	}
 }
 
-// TestCpRecursiveLocalToRemote_DstExistsAsDir confirms the same
-// locked rule: when dst already exists as a directory, source
-// CONTENTS land at dst/<rel>, NOT at dst/<basename(src)>/<rel>.
+// TestCpRecursiveLocalToRemote_DstExistsAsDir confirms the locked
+// rule from #drive9:72bf030c thread (msgs 72d6eb06 + 5f25d0a0):
+// when dst already exists as a directory, source CONTENTS land at
+// dst/<rel>, NOT at dst/<basename(src)>/<rel>, and the existing
+// dst directory is ACCEPTED (no preflight rejection).
+//
+// Regression note: round-1 of this PR incorrectly rejected dst-
+// exists-as-dir, treating any preexisting destination as a
+// conflict. @adversary-2 caught this in PR review.
 func TestCpRecursiveLocalToRemote_DstExistsAsDir(t *testing.T) {
+	srcDir := t.TempDir()
+	writeTreeFiles(t, srcDir, map[string]string{
+		"a.txt":   "alpha",
+		"b/c.txt": "charlie",
+	})
+
+	mock := newMockTreeServer()
+	// dst pre-exists as a directory. Common case: agent-B already
+	// has its workspace dir; agent-A wants to drop a scratch tree
+	// into it.
+	mock.existing["/dst"] = true
+	srv := mock.httpServer(t)
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
+	if err := Cp(c, []string{"-r", srcDir, ":/dst"}); err != nil {
+		t.Fatalf("Cp(-r) with dst-exists-as-dir must accept, got: %v", err)
+	}
+
+	// Contents landed under dst/, not under dst/<basename(srcDir)>/.
+	wantPuts := map[string]string{
+		"/dst/a.txt":   "alpha",
+		"/dst/b/c.txt": "charlie",
+	}
+	for path, body := range wantPuts {
+		got, ok := mock.recordedPuts[path]
+		if !ok {
+			t.Errorf("expected PUT %q, missing (recorded: %v)", path, sortedKeys(mock.recordedPuts))
+			continue
+		}
+		if string(got) != body {
+			t.Errorf("PUT %q body = %q, want %q", path, got, body)
+		}
+	}
+
+	// The dst root itself MUST NOT be re-mkdir'd (it already exists).
+	// Only descendant dirs (/dst/b) should be created.
+	wantDirs := []string{"/dst/b"}
+	if !equalAsSets(mock.recordedMkdirs, wantDirs) {
+		t.Errorf("MKDIR set = %v, want %v (must not re-mkdir existing dst root)", mock.recordedMkdirs, wantDirs)
+	}
+}
+
+// TestCpRecursiveLocalToRemote_DstExistsAsFileRejects confirms that
+// dst-exists-as-FILE (not dir) is rejected with a clear message —
+// we refuse to overwrite a regular file with a directory tree, since
+// that would be a destructive surprise the user almost certainly
+// didn't intend.
+func TestCpRecursiveLocalToRemote_DstExistsAsFileRejects(t *testing.T) {
 	srcDir := t.TempDir()
 	writeTreeFiles(t, srcDir, map[string]string{"a.txt": "alpha"})
 
 	mock := newMockTreeServer()
-	// dst pre-exists as a directory → preflight must catch this and
-	// abort (we refuse to overwrite per design lock #3).
-	mock.existing["/dst"] = true
+	// dst pre-exists, but it's a FILE (not a dir).
+	mock.statResults["/dst"] = struct {
+		exists bool
+		isDir  bool
+		size   int64
+	}{exists: true, isDir: false, size: 5}
 	srv := mock.httpServer(t)
 	defer srv.Close()
 
@@ -214,18 +289,50 @@ func TestCpRecursiveLocalToRemote_DstExistsAsDir(t *testing.T) {
 	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
 	err := Cp(c, []string{"-r", srcDir, ":/dst"})
 	if err == nil {
-		t.Fatalf("expected preflight error when dst exists, got nil; puts=%v mkdirs=%v",
+		t.Fatalf("expected reject when dst exists as file, got nil; puts=%v mkdirs=%v",
 			sortedKeys(mock.recordedPuts), mock.recordedMkdirs)
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("error = %v, want 'not a directory' message", err)
+	}
+	if len(mock.recordedPuts) > 0 {
+		t.Errorf("file-conflict must abort before any PUT, got %v", sortedKeys(mock.recordedPuts))
+	}
+	if len(mock.recordedMkdirs) > 0 {
+		t.Errorf("file-conflict must abort before any MKDIR, got %v", mock.recordedMkdirs)
+	}
+}
+
+// TestCpRecursiveLocalToRemote_DescendantConflictAbortsPreflight
+// confirms preflight rejects when a DESCENDANT path (not dst root)
+// already exists. Even when dst-exists-as-dir is accepted, descendant
+// conflicts still abort before any transfer — locked by @adversary-1
+// design rule #3.
+func TestCpRecursiveLocalToRemote_DescendantConflictAbortsPreflight(t *testing.T) {
+	srcDir := t.TempDir()
+	writeTreeFiles(t, srcDir, map[string]string{
+		"a.txt": "alpha",
+		"b.txt": "bravo",
+	})
+
+	mock := newMockTreeServer()
+	// dst is accepted-as-dir, but one descendant file already exists.
+	mock.existing["/dst"] = true
+	mock.existing["/dst/a.txt"] = false
+	srv := mock.httpServer(t)
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
+	err := Cp(c, []string{"-r", srcDir, ":/dst"})
+	if err == nil {
+		t.Fatalf("expected descendant-conflict preflight error, got nil")
 	}
 	if !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("error = %v, want 'already exists' message", err)
 	}
-	// Critical: NO PUT/MKDIR happened before the preflight failure.
 	if len(mock.recordedPuts) > 0 {
-		t.Errorf("preflight should have prevented any PUT, but got %v", sortedKeys(mock.recordedPuts))
-	}
-	if len(mock.recordedMkdirs) > 0 {
-		t.Errorf("preflight should have prevented any MKDIR, but got %v", mock.recordedMkdirs)
+		t.Errorf("descendant preflight conflict must abort before any PUT, got %v", sortedKeys(mock.recordedPuts))
 	}
 }
 
@@ -526,6 +633,418 @@ func TestCpRecursiveRemoteToRemote_UsesServerSideCopyPerLeaf(t *testing.T) {
 	if !equalAsSets(mock.recordedMkdirs, wantDirs) {
 		t.Errorf("recorded MKDIR = %v, want %v", mock.recordedMkdirs, wantDirs)
 	}
+}
+
+// ───────────────────────── Remote→Local (B3 + B4) ─────────────────────────
+
+// TestCpRecursiveRemoteToLocal_HappyPath asserts the basic remote→local
+// flow works: a directory tree on the remote lands as a matching local
+// tree under dstLocal. Verifies all leaf files arrive byte-identical.
+//
+// Closes B3 coverage gap from @adversary-1 secondary review msg c7eb6852.
+func TestCpRecursiveRemoteToLocal_HappyPath(t *testing.T) {
+	mock := newMockTreeServer()
+	// Remote tree: /src is a dir; /src/a.txt and /src/sub/b.txt are
+	// files; /src/sub is a subdirectory.
+	mock.statResults["/src"] = struct {
+		exists bool
+		isDir  bool
+		size   int64
+	}{exists: true, isDir: true}
+	mock.statResults["/src/a.txt"] = struct {
+		exists bool
+		isDir  bool
+		size   int64
+	}{exists: true, isDir: false, size: 5}
+	mock.statResults["/src/sub/b.txt"] = struct {
+		exists bool
+		isDir  bool
+		size   int64
+	}{exists: true, isDir: false, size: 7}
+	mock.listEntries["/src"] = []client.FileInfo{
+		{Name: "a.txt", Size: 5, IsDir: false},
+		{Name: "sub", Size: 0, IsDir: true},
+	}
+	mock.listEntries["/src/sub"] = []client.FileInfo{
+		{Name: "b.txt", Size: 7, IsDir: false},
+	}
+	mock.fileBodies["/src/a.txt"] = []byte("alpha")
+	mock.fileBodies["/src/sub/b.txt"] = []byte("bravooo")
+
+	srv := mock.httpServer(t)
+	defer srv.Close()
+
+	dstLocal := t.TempDir()
+	// Empty dstLocal — must be accepted, and contents land directly
+	// inside it (not inside dstLocal/src/).
+	c := client.New(srv.URL, "")
+	if err := Cp(c, []string{"-r", ":/src", dstLocal}); err != nil {
+		t.Fatalf("Cp(-r remote→local): %v", err)
+	}
+
+	// Verify each leaf landed at the expected local path with the
+	// expected bytes.
+	wantFiles := map[string]string{
+		"a.txt":     "alpha",
+		"sub/b.txt": "bravooo",
+	}
+	for rel, body := range wantFiles {
+		got, err := os.ReadFile(filepath.Join(dstLocal, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Errorf("read %s: %v", rel, err)
+			continue
+		}
+		if string(got) != body {
+			t.Errorf("%s = %q, want %q", rel, got, body)
+		}
+	}
+	// Verify the descendant subdir exists.
+	if info, err := os.Stat(filepath.Join(dstLocal, "sub")); err != nil || !info.IsDir() {
+		t.Errorf("expected dst/sub to exist as dir: err=%v info=%v", err, info)
+	}
+}
+
+// TestCpRecursiveRemoteToLocal_DstExistsAsFileRejects mirrors the
+// local→remote dst-as-file rejection for the remote→local direction.
+func TestCpRecursiveRemoteToLocal_DstExistsAsFileRejects(t *testing.T) {
+	mock := newMockTreeServer()
+	mock.statResults["/src"] = struct {
+		exists bool
+		isDir  bool
+		size   int64
+	}{exists: true, isDir: true}
+	mock.listEntries["/src"] = []client.FileInfo{
+		{Name: "a.txt", Size: 5, IsDir: false},
+	}
+	mock.fileBodies["/src/a.txt"] = []byte("alpha")
+
+	srv := mock.httpServer(t)
+	defer srv.Close()
+
+	// Pre-create dst as a regular file so it should be rejected.
+	tmp := t.TempDir()
+	dstLocal := filepath.Join(tmp, "dst-as-file")
+	if err := os.WriteFile(dstLocal, []byte("preexisting"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	c := client.New(srv.URL, "")
+	err := Cp(c, []string{"-r", ":/src", dstLocal})
+	if err == nil {
+		t.Fatalf("expected reject when local dst exists as file, got nil")
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("error = %v, want 'not a directory' message", err)
+	}
+	// The original file must NOT have been overwritten.
+	body, _ := os.ReadFile(dstLocal)
+	if string(body) != "preexisting" {
+		t.Errorf("preexisting file content was modified: %q", body)
+	}
+}
+
+// TestCpRecursiveRemoteToLocal_DescendantLeafConflictRejects asserts
+// the remote→local direction also preflights DESCENDANT paths and
+// rejects before any download starts. Without this, DownloadToFile-
+// WithSummary's os.Create would silently truncate a pre-existing
+// local leaf, violating the locked "no overwrite in P0" rule.
+func TestCpRecursiveRemoteToLocal_DescendantLeafConflictRejects(t *testing.T) {
+	mock := newMockTreeServer()
+	mock.statResults["/src"] = struct {
+		exists bool
+		isDir  bool
+		size   int64
+	}{exists: true, isDir: true}
+	mock.statResults["/src/a.txt"] = struct {
+		exists bool
+		isDir  bool
+		size   int64
+	}{exists: true, isDir: false, size: 5}
+	mock.statResults["/src/b.txt"] = struct {
+		exists bool
+		isDir  bool
+		size   int64
+	}{exists: true, isDir: false, size: 5}
+	mock.listEntries["/src"] = []client.FileInfo{
+		{Name: "a.txt", Size: 5, IsDir: false},
+		{Name: "b.txt", Size: 5, IsDir: false},
+	}
+	mock.fileBodies["/src/a.txt"] = []byte("alpha")
+	mock.fileBodies["/src/b.txt"] = []byte("bravo")
+
+	srv := mock.httpServer(t)
+	defer srv.Close()
+
+	dstLocal := t.TempDir()
+	// dst-as-dir is accepted (mirrors remote semantics), but a
+	// pre-existing descendant leaf MUST cause preflight to abort.
+	preexisting := filepath.Join(dstLocal, "a.txt")
+	if err := os.WriteFile(preexisting, []byte("DO NOT OVERWRITE"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	c := client.New(srv.URL, "")
+	err := Cp(c, []string{"-r", ":/src", dstLocal})
+	if err == nil {
+		t.Fatalf("expected descendant-conflict reject, got nil")
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("error = %v, want 'already exists' message", err)
+	}
+	// The pre-existing file MUST NOT have been truncated/overwritten.
+	body, _ := os.ReadFile(preexisting)
+	if string(body) != "DO NOT OVERWRITE" {
+		t.Errorf("preexisting descendant was overwritten: %q", body)
+	}
+	// b.txt must NOT have been downloaded either — preflight aborts
+	// the whole batch.
+	if _, err := os.Stat(filepath.Join(dstLocal, "b.txt")); err == nil {
+		t.Errorf("/dst/b.txt was downloaded despite preflight conflict on sibling")
+	}
+}
+
+// TestCpRecursiveRemoteToLocal_EmptyDirPreserved asserts an empty
+// directory in the remote tree results in a corresponding local
+// directory — matches local→remote empty-dir behavior.
+func TestCpRecursiveRemoteToLocal_EmptyDirPreserved(t *testing.T) {
+	mock := newMockTreeServer()
+	mock.statResults["/src"] = struct {
+		exists bool
+		isDir  bool
+		size   int64
+	}{exists: true, isDir: true}
+	mock.listEntries["/src"] = []client.FileInfo{
+		{Name: "empty", Size: 0, IsDir: true},
+		{Name: "a.txt", Size: 5, IsDir: false},
+	}
+	mock.listEntries["/src/empty"] = nil // empty subdir
+	mock.statResults["/src/a.txt"] = struct {
+		exists bool
+		isDir  bool
+		size   int64
+	}{exists: true, isDir: false, size: 5}
+	mock.fileBodies["/src/a.txt"] = []byte("alpha")
+
+	srv := mock.httpServer(t)
+	defer srv.Close()
+
+	dstLocal := t.TempDir()
+	c := client.New(srv.URL, "")
+	if err := Cp(c, []string{"-r", ":/src", dstLocal}); err != nil {
+		t.Fatalf("Cp(-r): %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(dstLocal, "empty"))
+	if err != nil {
+		t.Fatalf("expected dst/empty to exist: %v", err)
+	}
+	if !info.IsDir() {
+		t.Errorf("dst/empty should be a directory")
+	}
+}
+
+// TestCpRecursiveRemoteToLocal_RejectsPathEscape asserts that a
+// malformed remote list entry (e.g. "../escape.txt") is rejected
+// before any local file is written. Closes B4 coverage gap from
+// @adversary-1 secondary review msg c7eb6852.
+func TestCpRecursiveRemoteToLocal_RejectsPathEscape(t *testing.T) {
+	mock := newMockTreeServer()
+	mock.statResults["/src"] = struct {
+		exists bool
+		isDir  bool
+		size   int64
+	}{exists: true, isDir: true}
+	// Malicious list response: name starts with ".." which would
+	// escape dstLocal if naively joined.
+	mock.listEntries["/src"] = []client.FileInfo{
+		{Name: "..", Size: 0, IsDir: true},
+	}
+	mock.listEntries["/src/.."] = []client.FileInfo{
+		{Name: "escape.txt", Size: 5, IsDir: false},
+	}
+
+	srv := mock.httpServer(t)
+	defer srv.Close()
+
+	tmpRoot := t.TempDir()
+	// Sentinel file in the PARENT of dstLocal that, if path-escape
+	// worked, would get overwritten by an "escape.txt" leaf.
+	sentinelDir := filepath.Join(tmpRoot, "sibling")
+	if err := os.MkdirAll(sentinelDir, 0o755); err != nil {
+		t.Fatalf("mkdir sentinel: %v", err)
+	}
+	dstLocal := filepath.Join(tmpRoot, "dst")
+	if err := os.MkdirAll(dstLocal, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+
+	c := client.New(srv.URL, "")
+	err := Cp(c, []string{"-r", ":/src", dstLocal})
+	if err == nil {
+		t.Fatalf("expected path-escape reject, got nil")
+	}
+	if !strings.Contains(err.Error(), "..") {
+		t.Fatalf("error = %v, want '..' rejection", err)
+	}
+	// Most important: nothing was written outside dstLocal.
+	if _, statErr := os.Stat(filepath.Join(tmpRoot, "escape.txt")); statErr == nil {
+		t.Errorf("path escape wrote outside dstLocal: %s", filepath.Join(tmpRoot, "escape.txt"))
+	}
+}
+
+// TestJoinLocalSafe_RejectsTraversal asserts the local path-safety
+// helper rejects `..` traversal segments just like joinRemoteSafe.
+func TestJoinLocalSafe_RejectsTraversal(t *testing.T) {
+	tmp := t.TempDir()
+	cases := []struct {
+		name string
+		rel  string
+	}{
+		{"parent traversal", "../escape.txt"},
+		{"nested traversal", "child/../../escape.txt"},
+		{"deep traversal", "a/b/c/../../../../escape.txt"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := joinLocalSafe(tmp, tc.rel)
+			if err == nil {
+				t.Fatalf("expected error for traversal %q (got %q)", tc.rel, got)
+			}
+			if !strings.Contains(err.Error(), "..") {
+				t.Errorf("error = %v, want '..' rejection", err)
+			}
+		})
+	}
+}
+
+// TestJoinLocalSafe_RejectsAbsoluteRel asserts an absolute `rel` is
+// rejected even without `..` segments — a remote-supplied "/etc/passwd"
+// must not be treated as relative to dstLocal and then silently
+// absolute-resolved.
+func TestJoinLocalSafe_RejectsAbsoluteRel(t *testing.T) {
+	tmp := t.TempDir()
+	if _, err := joinLocalSafe(tmp, "/etc/passwd"); err == nil {
+		t.Fatalf("expected reject for absolute rel, got nil")
+	}
+}
+
+// TestJoinLocalSafe_HappyPath asserts the trivial case still resolves
+// to base/rel.
+func TestJoinLocalSafe_HappyPath(t *testing.T) {
+	tmp := t.TempDir()
+	got, err := joinLocalSafe(tmp, "sub/leaf.txt")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	want := filepath.Join(tmp, "sub", "leaf.txt")
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// ───────────────────────── B5: cancellation regressions ─────────────────────────
+
+// TestParallelTransfer_AlreadyCancelledCtxStopsLoop is the "ctx
+// cancelled BEFORE the loop even starts" regression. Verifies the
+// labeled break exits the for loop and no transfer ops are launched.
+func TestParallelTransfer_AlreadyCancelledCtxStopsLoop(t *testing.T) {
+	ctx, cancel := contextWithCancel()
+	cancel() // cancel BEFORE parallelTransfer runs
+
+	var ops atomicCounter
+	items := []int{1, 2, 3, 4, 5}
+	err := parallelTransfer(ctx, items, func(_ context.Context, _ int) error {
+		ops.inc()
+		return nil
+	})
+	if err == nil {
+		t.Fatalf("expected ctx.Err(), got nil")
+	}
+	if ops.get() != 0 {
+		t.Errorf("expected 0 ops when ctx pre-cancelled, got %d", ops.get())
+	}
+}
+
+// TestParallelTransfer_CancelDuringSemaphoreAcquireStopsLoop is the
+// "ctx cancelled while waiting for a semaphore slot" regression. It
+// saturates the worker pool with blocking ops, then cancels, and
+// asserts the launcher stops promptly rather than waiting for a
+// worker to finish.
+//
+// This is the case @adversary-1 flagged in B5: a top-of-loop ctx
+// check alone is not enough — the `sem <- struct{}{}` send must also
+// be ctx-aware.
+func TestParallelTransfer_CancelDuringSemaphoreAcquireStopsLoop(t *testing.T) {
+	// More items than worker slots so the launcher hits the
+	// semaphore-full case for items beyond recursiveCopyConcurrency.
+	const nItems = recursiveCopyConcurrency * 3
+	items := make([]int, nItems)
+	for i := range items {
+		items[i] = i
+	}
+
+	ctx, cancel := contextWithCancel()
+	// release blocks ops in the workers so the pool stays saturated
+	// until we cancel.
+	release := make(chan struct{})
+	var (
+		started atomicCounter
+		opCalls atomicCounter
+	)
+	go func() {
+		// Wait until the worker pool is fully saturated, then cancel.
+		// This forces the launcher to be blocked on `sem <- struct{}{}`
+		// for the (nItems - recursiveCopyConcurrency) remaining items
+		// at the moment ctx is cancelled.
+		for {
+			if started.get() >= recursiveCopyConcurrency {
+				break
+			}
+		}
+		cancel()
+		close(release)
+	}()
+
+	err := parallelTransfer(ctx, items, func(_ context.Context, _ int) error {
+		opCalls.inc()
+		started.inc()
+		<-release // block until cancellation is signalled
+		return nil
+	})
+	if err == nil {
+		t.Fatalf("expected ctx.Err(), got nil")
+	}
+	// At most `recursiveCopyConcurrency` ops should ever start —
+	// the launcher must NOT slip another transfer in after cancel.
+	if got := opCalls.get(); got > recursiveCopyConcurrency {
+		t.Errorf("expected ≤ %d ops to start, got %d (launcher slipped past sem cancel)",
+			recursiveCopyConcurrency, got)
+	}
+}
+
+// contextWithCancel is a tiny shim so test code reads naturally. We
+// keep it local to avoid an import in production code paths.
+func contextWithCancel() (context.Context, context.CancelFunc) {
+	return context.WithCancel(context.Background())
+}
+
+// atomicCounter is a minimal sync.Mutex-protected int used only by
+// the cancellation regression tests above.
+type atomicCounter struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (a *atomicCounter) inc() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.n++
+}
+
+func (a *atomicCounter) get() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.n
 }
 
 // ───────────────────────── Test helpers ─────────────────────────

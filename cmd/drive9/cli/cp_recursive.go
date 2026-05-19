@@ -99,11 +99,30 @@ func copyTreeLocalToRemote(ctx context.Context, c *client.Client, srcLocal, dstR
 		return walkErr
 	}
 
-	// Preflight: batch-stat every destination path (dirs AND files).
-	// If any destination exists, abort before any transfer (per #3
-	// refined by @adversary-1 msg 72d6eb06).
-	allDests := make([]string, 0, len(dirs)+len(files)+1)
-	allDests = append(allDests, dstRemote)
+	// Destination root semantics (locked in #drive9:72bf030c thread
+	// review msgs 72d6eb06 + 5f25d0a0):
+	//   - dst doesn't exist        → create it, copy contents into dst/
+	//   - dst exists as directory  → accept, copy contents into dst/
+	//   - dst exists as a file     → reject (refuse to overwrite a file
+	//                                with a directory tree)
+	// Only DESCENDANT paths participate in the conflict-preflight; the
+	// dst root itself is handled separately above so the common case
+	// ("agent A wants to drop its scratch tree into an already-created
+	// agent-B workspace dir") works.
+	dstExists, dstIsDir, err := remotePathStatus(ctx, c, dstRemote)
+	if err != nil {
+		return err
+	}
+	if dstExists && !dstIsDir {
+		return fmt.Errorf("remote destination %q exists and is not a directory", dstRemote)
+	}
+
+	// Preflight DESCENDANT destinations only. If dst-exists-as-dir, the
+	// dst root is not in the conflict set (we explicitly allow merging
+	// the source tree into the existing dst dir). Any descendant
+	// conflict still aborts before any transfer, matching @adversary-1
+	// #3 preflight rule.
+	allDests := make([]string, 0, len(dirs)+len(files))
 	allDests = append(allDests, dirs...)
 	for _, f := range files {
 		allDests = append(allDests, f.remotePath)
@@ -112,10 +131,15 @@ func copyTreeLocalToRemote(ctx context.Context, c *client.Client, srcLocal, dstR
 		return err
 	}
 
-	// Create dst root + intermediate dirs in path-length ASC order
-	// (parent before child). Empty dirs are preserved via this
-	// explicit Mkdir, per design lock #5.
-	if err := mkdirRemoteTree(ctx, c, dstRemote, dirs); err != nil {
+	// Create intermediate dirs in path-length ASC order (parent before
+	// child). Empty dirs are preserved via explicit Mkdir per design
+	// lock #5. Skip mkdir on dst root if it already exists; we only
+	// need to ensure descendant dirs are present.
+	mkdirRoots := dirs
+	if !dstExists {
+		mkdirRoots = append([]string{dstRemote}, dirs...)
+	}
+	if err := mkdirRemoteTree(ctx, c, mkdirRoots); err != nil {
 		return err
 	}
 
@@ -130,6 +154,18 @@ func copyTreeLocalToRemote(ctx context.Context, c *client.Client, srcLocal, dstR
 // copyTreeRemoteToLocal downloads a remote directory tree to a local
 // destination. Mirrors copyTreeLocalToRemote: dst is the directory
 // that will hold src's CONTENTS.
+//
+// Destination semantics (locked, identical to local→remote and
+// remote→remote, per @adversary-1 secondary review msg c7eb6852):
+//   - dst doesn't exist       → create it, copy contents into dst/
+//   - dst exists as directory → accept, copy contents into dst/
+//   - dst exists as a file    → reject
+//
+// Descendant preflight: any pre-existing path inside dst/ is a
+// conflict and aborts BEFORE any os.MkdirAll or download (no
+// `-f`/overwrite in P0). This protects against the
+// `os.Create(localPath)` truncation surface that
+// DownloadToFileWithSummary opens up.
 func copyTreeRemoteToLocal(ctx context.Context, c *client.Client, srcRemote, dstLocal string) error {
 	// Source must exist and be a directory.
 	srcInfo, err := c.StatCtx(ctx, srcRemote)
@@ -140,25 +176,9 @@ func copyTreeRemoteToLocal(ctx context.Context, c *client.Client, srcRemote, dst
 		return fmt.Errorf("-r/--recursive requires a directory source; %q is a file (use `drive9 fs cp` without -r)", srcRemote)
 	}
 
-	// Destination preflight (local side): dst exists as dir → ok;
-	// dst doesn't exist → create; dst exists as file → reject.
-	dstInfo, err := os.Stat(dstLocal)
-	switch {
-	case err == nil && !dstInfo.IsDir():
-		return fmt.Errorf("local destination %q exists and is not a directory", dstLocal)
-	case err == nil && dstInfo.IsDir():
-		// Existing local dir is fine; we'll create children inside.
-		// (Local recursive copy is less strict than remote because
-		// local already-existing dirs are normal Unix behavior.)
-	case errors.Is(err, os.ErrNotExist):
-		if mkErr := os.MkdirAll(dstLocal, 0o755); mkErr != nil {
-			return fmt.Errorf("create local destination %q: %w", dstLocal, mkErr)
-		}
-	default:
-		return fmt.Errorf("stat local destination %q: %w", dstLocal, err)
-	}
-
-	// Walk remote tree via ListCtx BFS, collecting dirs + files.
+	// Walk remote tree via ListCtx BFS, collecting dirs + files. The
+	// walk runs BEFORE we touch the local filesystem so a malformed
+	// list response or transport error can't leave a partial dst dir.
 	var (
 		dirs  []remoteDirEntry  // relative paths to mkdir locally
 		files []remoteFileEntry // relative paths to download
@@ -179,20 +199,73 @@ func copyTreeRemoteToLocal(ctx context.Context, c *client.Client, srcRemote, dst
 		return walkErr
 	}
 
-	// Create local dirs in parent-before-child order.
-	sort.Slice(dirs, func(i, j int) bool {
-		return len(dirs[i].rel) < len(dirs[j].rel)
-	})
+	// Pre-resolve every local destination path using joinLocalSafe so
+	// a malicious/malformed remote name (e.g. "../escape.txt") cannot
+	// escape dstLocal. Done as a separate pass so we fail fast before
+	// any filesystem mutation.
+	dstFiles := make([]localDownloadEntry, len(files))
+	for i, f := range files {
+		localPath, joinErr := joinLocalSafe(dstLocal, f.rel)
+		if joinErr != nil {
+			return joinErr
+		}
+		dstFiles[i] = localDownloadEntry{
+			remotePath: f.remotePath,
+			localPath:  localPath,
+			size:       f.size,
+		}
+	}
+	dstDirs := make([]string, 0, len(dirs))
 	for _, d := range dirs {
-		localDir := filepath.Join(dstLocal, filepath.FromSlash(d.rel))
-		if err := os.MkdirAll(localDir, 0o755); err != nil {
-			return fmt.Errorf("mkdir local %q: %w", localDir, err)
+		localDir, joinErr := joinLocalSafe(dstLocal, d.rel)
+		if joinErr != nil {
+			return joinErr
+		}
+		dstDirs = append(dstDirs, localDir)
+	}
+
+	// Destination root preflight (local side).
+	dstInfo, statErr := os.Stat(dstLocal)
+	dstExists := statErr == nil
+	switch {
+	case dstExists && !dstInfo.IsDir():
+		return fmt.Errorf("local destination %q exists and is not a directory", dstLocal)
+	case dstExists && dstInfo.IsDir():
+		// Accept-as-dir; do NOT recreate. Descendant preflight below
+		// catches per-leaf conflicts.
+	case errors.Is(statErr, os.ErrNotExist):
+		// Will create after descendant preflight passes.
+	default:
+		return fmt.Errorf("stat local destination %q: %w", dstLocal, statErr)
+	}
+
+	// Descendant preflight: any pre-existing dir/file under dstLocal
+	// is a conflict. Mirrors remote-dst preflight; descendants of an
+	// accepted dst-as-dir still must not collide.
+	if err := preflightLocalDestinations(append(append([]string{}, dstDirs...), localDownloadPaths(dstFiles)...)); err != nil {
+		return err
+	}
+
+	// Now that preflight passed, create dst root if needed.
+	if !dstExists {
+		if mkErr := os.MkdirAll(dstLocal, 0o755); mkErr != nil {
+			return fmt.Errorf("create local destination %q: %w", dstLocal, mkErr)
 		}
 	}
 
-	return parallelTransfer(ctx, files, func(ctx context.Context, e remoteFileEntry) error {
-		localPath := filepath.Join(dstLocal, filepath.FromSlash(e.rel))
-		return downloadOneFile(ctx, c, e.remotePath, localPath, e.size)
+	// Create descendant dirs in parent-before-child order. Empty dirs
+	// are preserved.
+	sort.Slice(dstDirs, func(i, j int) bool {
+		return len(dstDirs[i]) < len(dstDirs[j])
+	})
+	for _, d := range dstDirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return fmt.Errorf("mkdir local %q: %w", d, err)
+		}
+	}
+
+	return parallelTransfer(ctx, dstFiles, func(ctx context.Context, e localDownloadEntry) error {
+		return downloadOneFile(ctx, c, e.remotePath, e.localPath, e.size)
 	})
 }
 
@@ -233,9 +306,21 @@ func copyTreeRemoteToRemote(ctx context.Context, c *client.Client, srcRemote, ds
 		return walkErr
 	}
 
-	// Preflight: dst root + every dir + every file must NOT exist.
-	allDests := make([]string, 0, len(dirs)+len(files)+1)
-	allDests = append(allDests, dstRemote)
+	// Destination root semantics (same as local→remote path):
+	//   - dst doesn't exist        → create it, copy contents into dst/
+	//   - dst exists as directory  → accept, copy contents into dst/
+	//   - dst exists as a file     → reject
+	dstExists, dstIsDir, err := remotePathStatus(ctx, c, dstRemote)
+	if err != nil {
+		return err
+	}
+	if dstExists && !dstIsDir {
+		return fmt.Errorf("remote destination %q exists and is not a directory", dstRemote)
+	}
+
+	// Preflight descendants only; dst root is allowed to pre-exist
+	// as a directory.
+	allDests := make([]string, 0, len(dirs)+len(files))
 	allDests = append(allDests, dirs...)
 	for _, f := range files {
 		allDests = append(allDests, f.dstPath)
@@ -244,24 +329,29 @@ func copyTreeRemoteToRemote(ctx context.Context, c *client.Client, srcRemote, ds
 		return err
 	}
 
-	if err := mkdirRemoteTree(ctx, c, dstRemote, dirs); err != nil {
+	mkdirRoots := dirs
+	if !dstExists {
+		mkdirRoots = append([]string{dstRemote}, dirs...)
+	}
+	if err := mkdirRemoteTree(ctx, c, mkdirRoots); err != nil {
 		return err
 	}
 
 	return parallelTransfer(ctx, files, func(ctx context.Context, item remoteCopyPlanItem) error {
-		// Client.Copy is metadata-only server-side zero-copy; no
-		// content round-trip. We don't need to pass ctx because the
-		// non-Ctx variant is what's exposed today; if cancellation
-		// support is added later this is the seam.
-		return c.Copy(item.srcPath, item.dstPath)
+		// Client.CopyCtx is metadata-only server-side zero-copy with
+		// context support added in this PR (see pkg/client/client.go),
+		// so r→r honors Ctrl+C just like the local↔remote paths.
+		return c.CopyCtx(ctx, item.srcPath, item.dstPath)
 	})
 }
 
 // joinRemoteSafe joins a remote base with a slash-or-platform-relative
 // segment, rejecting anything that would escape the base (`..`,
-// absolute segments, duplicate slashes that would let `:/foo` match
-// `:/foobar`-style boundary leaks). Returns a forward-slash remote
-// path suitable for the drive9 server API.
+// absolute segments). Duplicate / redundant slashes inside `rel` are
+// normalized by path.Clean rather than rejected — that is intentional;
+// the contract is "result must be inside base", not "rel must be
+// canonical". Returns a forward-slash remote path suitable for the
+// drive9 server API.
 func joinRemoteSafe(base, rel string) (string, error) {
 	relSlash := filepath.ToSlash(rel)
 	if relSlash == "" || relSlash == "." {
@@ -290,6 +380,77 @@ func joinRemoteSafe(base, rel string) (string, error) {
 		return "", fmt.Errorf("computed path %q escapes base %q", joined, base)
 	}
 	return joined, nil
+}
+
+// joinLocalSafe is the local-filesystem counterpart of joinRemoteSafe.
+// It accepts a slash-separated relative path (as produced by the
+// remote BFS) and returns the corresponding absolute local path, but
+// only if that path stays under `base`. Absolute rels, "..", and
+// post-Clean escapes are all rejected.
+//
+// The remote→local copy direction needs this because `rel` originates
+// from server-supplied directory listings: a misbehaving or compromised
+// server could return entry names like "../etc/passwd" and naively
+// `filepath.Join(dstLocal, ...)` would write outside dstLocal.
+func joinLocalSafe(base, rel string) (string, error) {
+	relSlash := filepath.ToSlash(rel)
+	if relSlash == "" || relSlash == "." {
+		return base, nil
+	}
+	if strings.HasPrefix(relSlash, "/") {
+		return "", fmt.Errorf("relative segment must not start with /: %q", relSlash)
+	}
+	for _, seg := range strings.Split(relSlash, "/") {
+		if seg == ".." {
+			return "", fmt.Errorf("relative segment must not contain ..: %q", relSlash)
+		}
+	}
+	// Build the local path using filepath semantics. Resolve to a
+	// canonical form and then verify it still has `base` as a prefix.
+	joined := filepath.Join(base, filepath.FromSlash(relSlash))
+	// Re-canonicalize base the same way Join would so the prefix
+	// comparison is apples-to-apples on platforms that normalize
+	// (e.g. trailing-slash on POSIX is dropped by Clean).
+	cleanBase := filepath.Clean(base)
+	if cleanBase != "" && !strings.HasPrefix(joined, cleanBase+string(filepath.Separator)) && joined != cleanBase {
+		return "", fmt.Errorf("computed path %q escapes base %q", joined, base)
+	}
+	return joined, nil
+}
+
+// preflightLocalDestinations checks every local destination path with
+// os.Lstat (Lstat not Stat, so a pre-existing symlink also counts as
+// a conflict — we don't want to follow a symlink into someone else's
+// directory). Any path that exists aborts the copy before any
+// MkdirAll/download.
+func preflightLocalDestinations(paths []string) error {
+	seen := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		_, err := os.Lstat(p)
+		switch {
+		case err == nil:
+			return fmt.Errorf("local destination %q already exists; recursive copy refuses to overwrite", p)
+		case errors.Is(err, os.ErrNotExist):
+			continue
+		default:
+			return fmt.Errorf("preflight stat local %q: %w", p, err)
+		}
+	}
+	return nil
+}
+
+// localDownloadPaths extracts just the local destination paths from a
+// slice of localDownloadEntry. Convenience for preflight calls.
+func localDownloadPaths(entries []localDownloadEntry) []string {
+	out := make([]string, len(entries))
+	for i, e := range entries {
+		out[i] = e.localPath
+	}
+	return out
 }
 
 // preflightDestinations stats every destination path in batches of
@@ -336,16 +497,14 @@ func preflightDestinations(ctx context.Context, c *client.Client, paths []string
 	return nil
 }
 
-// mkdirRemoteTree creates the destination root and all intermediate
-// dirs in path-length ASC order so parents land before children. Per
-// design lock #5.
-func mkdirRemoteTree(ctx context.Context, c *client.Client, root string, dirs []string) error {
-	// Build full list including root, dedupe, sort by path length so
-	// parents precede children.
-	all := append([]string{root}, dirs...)
-	seen := make(map[string]struct{}, len(all))
-	unique := make([]string, 0, len(all))
-	for _, d := range all {
+// mkdirRemoteTree creates the supplied dirs in path-length ASC order
+// so parents land before children. Per design lock #5. Callers
+// pre-include the dst root if it needs creating; mkdirRemoteTree
+// itself just sorts + dedupes + issues MkdirCtx per entry.
+func mkdirRemoteTree(ctx context.Context, c *client.Client, dirs []string) error {
+	seen := make(map[string]struct{}, len(dirs))
+	unique := make([]string, 0, len(dirs))
+	for _, d := range dirs {
 		if _, ok := seen[d]; ok {
 			continue
 		}
@@ -361,6 +520,21 @@ func mkdirRemoteTree(ctx context.Context, c *client.Client, root string, dirs []
 		}
 	}
 	return nil
+}
+
+// remotePathStatus returns (exists, isDir, error) for a remote path
+// via StatCtx. A 404 maps to (false, false, nil) so callers can
+// distinguish "missing" from "exists" without parsing the StatusError
+// at the call site. Any other transport/auth error is surfaced.
+func remotePathStatus(ctx context.Context, c *client.Client, path string) (bool, bool, error) {
+	info, err := c.StatCtx(ctx, path)
+	if err == nil {
+		return true, info.IsDir, nil
+	}
+	if client.IsNotFound(err) {
+		return false, false, nil
+	}
+	return false, false, fmt.Errorf("stat %q: %w", path, err)
 }
 
 // walkRemoteTreeBFS walks a remote directory tree breadth-first via
@@ -431,6 +605,14 @@ func downloadOneFile(ctx context.Context, c *client.Client, remotePath, localPat
 // sibling transfers are NOT cancelled when a single leaf fails — this
 // matches the @adversary-1 #3 runtime rule (siblings continue after
 // per-leaf runtime failure).
+//
+// Cancellation correctness (per @adversary-1 secondary review B5):
+//   - There are TWO blocking points where ctx must be honored: the
+//     top-of-loop "have we already been cancelled?" check, AND the
+//     semaphore acquire (which can block arbitrarily long if all
+//     workers are busy). Both use ctx-aware selects.
+//   - `break` inside `select` only exits the select, not the for, so
+//     a labeled break exits the whole loop. (Bug from round-1 PR review.)
 func parallelTransfer[T any](ctx context.Context, items []T, op func(context.Context, T) error) error {
 	if len(items) == 0 {
 		return nil
@@ -441,18 +623,30 @@ func parallelTransfer[T any](ctx context.Context, items []T, op func(context.Con
 		failuresMu sync.Mutex
 		failures   []error
 	)
+	recordCancel := func(err error) {
+		failuresMu.Lock()
+		failures = append(failures, err)
+		failuresMu.Unlock()
+	}
+launch:
 	for _, item := range items {
-		// Honor cancellation: stop launching new transfers if ctx
-		// has been cancelled.
+		// (1) Already-cancelled check. Cheap; lets us bail out before
+		// even waiting for a semaphore slot if ctx is already done.
 		select {
 		case <-ctx.Done():
-			failuresMu.Lock()
-			failures = append(failures, ctx.Err())
-			failuresMu.Unlock()
-			break
+			recordCancel(ctx.Err())
+			break launch
 		default:
 		}
-		sem <- struct{}{}
+		// (2) Semaphore acquire. This can block when the worker pool
+		// is saturated; without the ctx case the launcher would still
+		// wait for a worker to finish even after ctx is cancelled.
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			recordCancel(ctx.Err())
+			break launch
+		}
 		wg.Add(1)
 		go func(item T) {
 			defer wg.Done()
@@ -485,6 +679,15 @@ type localFileEntry struct {
 type remoteFileEntry struct {
 	remotePath string // absolute remote path of the source file
 	rel        string // path relative to source root, slash-separated
+	size       int64
+}
+
+// localDownloadEntry is the resolved (post-joinLocalSafe) form of a
+// remoteFileEntry: the absolute local path has been validated as
+// staying inside the dst root.
+type localDownloadEntry struct {
+	remotePath string
+	localPath  string
 	size       int64
 }
 
