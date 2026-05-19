@@ -6541,7 +6541,7 @@ func TestRemoteReadLimiterAcquireHonorsCancellationAndReleases(t *testing.T) {
 	releaseAgain()
 }
 
-func TestRemoteReadLimiterDoesNotGateWrite(t *testing.T) {
+func TestRemoteReadLimiterDoesNotGateWriteHandler(t *testing.T) {
 	opts := &MountOptions{ReadConcurrency: 1}
 	opts.setDefaults()
 	fs := NewDat9FS(client.New("http://127.0.0.1", ""), opts)
@@ -6570,7 +6570,7 @@ func TestRemoteReadLimiterDoesNotGateWrite(t *testing.T) {
 			t.Fatalf("Write status = %v, want OK", st)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("Write blocked behind the remote read limiter")
+		t.Fatal("Write handler blocked behind the remote read limiter")
 	}
 }
 

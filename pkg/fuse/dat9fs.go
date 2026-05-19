@@ -239,8 +239,9 @@ const (
 	// Each retry reads at most max_read (1 MiB), so 2s is generous.
 	readTransientRetryTimeout = 2 * time.Second
 
-	// defaultRemoteReadConcurrency leaves headroom under MountOptions'
-	// MaxBackground=32 for writes/flushes while heavy read workloads are active.
+	// defaultRemoteReadConcurrency bounds backend read fan-out from one FUSE
+	// mount. This protects Drive9/S3/TiDB from read floods; it does not reserve
+	// kernel FUSE MaxBackground slots before go-fuse dispatches a request.
 	defaultRemoteReadConcurrency = 24
 )
 
