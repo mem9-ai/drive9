@@ -996,10 +996,7 @@ func TestParallelTransfer_CancelDuringSemaphoreAcquireStopsLoop(t *testing.T) {
 		// This forces the launcher to be blocked on `sem <- struct{}{}`
 		// for the (nItems - recursiveCopyConcurrency) remaining items
 		// at the moment ctx is cancelled.
-		for {
-			if started.get() >= recursiveCopyConcurrency {
-				break
-			}
+		for started.get() < recursiveCopyConcurrency {
 		}
 		cancel()
 		close(release)
