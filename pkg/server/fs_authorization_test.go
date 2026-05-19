@@ -156,7 +156,16 @@ func TestIsScopedBusinessRequestAllowed(t *testing.T) {
 			{http.MethodGet, "/v1/fs/dir/", "list=1"},
 			{http.MethodGet, "/v1/fs/dir/file.txt", "stat=1"},
 			{http.MethodGet, "/v1/fs/dir/", "grep=hello"},
+			// Regression for @adversary-1 msg 00efe734: grep + limit must
+			// pass dispatcher (handleGrep reads ?limit).
+			{http.MethodGet, "/v1/fs/dir/", "grep=hello&limit=20"},
 			{http.MethodGet, "/v1/fs/dir/", "find=name:foo"},
+			// Regression for @adversary-1 msg 00efe734: find + filter params
+			// must pass dispatcher (handleFind reads name/tag/newer/older/
+			// minsize/maxsize/limit).
+			{http.MethodGet, "/v1/fs/dir/", "find=&name=*.yaml&newer=2026-03-01"},
+			{http.MethodGet, "/v1/fs/dir/", "find=&tag=k=v&minsize=10&maxsize=100&limit=50"},
+			{http.MethodGet, "/v1/fs/dir/", "find=&older=2026-01-01"},
 			{http.MethodHead, "/v1/fs/main.txt", ""},
 			{http.MethodPost, "/v1/fs:batch-stat", ""},
 			{http.MethodPost, "/v1/fs:batch-read-small", ""},
@@ -209,9 +218,24 @@ func TestIsScopedBusinessRequestAllowed(t *testing.T) {
 	t.Run("unknown GET query keys are denied (no silent inheritance)", func(t *testing.T) {
 		// release-order safety per @dev-1 msg 005e8b0b: future GET-side
 		// query actions must not silently inherit the C1 whitelist.
-		r := newScopedRequest(t, http.MethodGet, "/v1/fs/dir/", "newaction=1")
-		if isScopedBusinessRequestAllowed(r) {
-			t.Errorf("isScopedBusinessRequestAllowed(GET /v1/fs/dir/?newaction=1) = true, want false (unknown query key must default-deny)")
+		cases := []struct {
+			query string
+			why   string
+		}{
+			{"newaction=1", "unknown action selector → no arm matches → deny"},
+			{"name=foo", "find filter param without ?find selector → handleRead arm rejects"},
+			{"limit=20", "limit param without ?grep or ?find selector → handleRead arm rejects"},
+			{"grep=hello&newer=2026-01-01", "newer is a find-arm key, not a grep-arm key → grep arm rejects"},
+			{"find=&secret=value", "unknown filter param on find arm → deny"},
+			{"stat=1&extra=x", "stat arm only accepts ?stat → deny"},
+			{"list=1&filter=foo", "list arm only accepts ?list (no filters today) → deny"},
+		}
+		for _, tc := range cases {
+			r := newScopedRequest(t, http.MethodGet, "/v1/fs/dir/", tc.query)
+			if isScopedBusinessRequestAllowed(r) {
+				t.Errorf("isScopedBusinessRequestAllowed(GET /v1/fs/dir/?%s) = true, want false (%s)",
+					tc.query, tc.why)
+			}
 		}
 	})
 }

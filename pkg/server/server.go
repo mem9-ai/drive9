@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -434,6 +435,14 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 //
 // chmod (POST /v1/fs/<path>?chmod=1) is explicitly NOT and never will be in
 // the scoped allowlist — chmod escalates ACLs and is owner-token-only.
+//
+// The GET branch uses an **action-specific** accept-list (per @adversary-1
+// msg 00efe734 / @adversary-2 msg cbedd30a): the chosen action selector
+// (stat / grep / find / list / none) determines which filter keys handler
+// actually consumes, and only those keys plus the selector itself are
+// admitted. Earlier revisions admitted only the selector keys themselves,
+// which rejected normal scoped grep/find calls like `?grep=hello&limit=20`
+// before AuthorizeFS could even run — a regression vs current behavior.
 func isScopedBusinessRequestAllowed(r *http.Request) bool {
 	path := r.URL.Path
 
@@ -449,23 +458,7 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 			// handleStat — read.
 			return true
 		case http.MethodGet:
-			// handleFS GET dispatches by query param to read-side handlers:
-			// ?stat (handleStatMetadata), ?grep (handleGrep), ?find (handleFind),
-			// ?list (handleList), else handleRead. All read-side.
-			//
-			// Reject unknown future query keys explicitly so adding a new GET
-			// action doesn't silently inherit the scoped allowlist — release-
-			// order safety (@dev-1 msg 005e8b0b).
-			q := r.URL.Query()
-			for key := range q {
-				switch key {
-				case "stat", "grep", "find", "list":
-					// known read-side
-				default:
-					return false
-				}
-			}
-			return true
+			return isScopedFSGetQueryAllowed(r.URL.Query())
 		default:
 			// PUT/PATCH/DELETE/POST on /v1/fs/* are write-side and chmod;
 			// rejected in C1, write-side will be wired in C2 (chmod stays
@@ -477,6 +470,60 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 	// Uploads, SQL, fork, events, journals, vault, status, etc.: not in C1
 	// scope. C2 may open uploads.
 	return false
+}
+
+// isScopedFSGetQueryAllowed mirrors handleFS's GET dispatcher (server.go:618
+// onward): the action is decided by which selector key is present, in
+// priority order: stat → grep → find → list → (no selector = handleRead).
+// Each branch accepts only the keys its handler actually reads; unknown
+// keys for the selected branch deny so a future action key on the same
+// path can't silently inherit the C1 allowlist.
+func isScopedFSGetQueryAllowed(q url.Values) bool {
+	// Note: handleFS GET dispatch order (stat > grep > find > list > read)
+	// must match here, otherwise a request like `?stat=1&grep=hello` would
+	// allow under one arm and be dispatched to another — pick the action
+	// the dispatcher will pick.
+	switch {
+	case q.Has("stat"):
+		// handleStatMetadata reads only ?stat.
+		return queryKeysSubsetOf(q, []string{"stat"})
+	case q.Has("grep"):
+		// handleGrep reads ?grep and ?limit.
+		return queryKeysSubsetOf(q, []string{"grep", "limit"})
+	case q.Has("find"):
+		// handleFind reads ?find, ?name, ?tag, ?newer, ?older,
+		// ?minsize, ?maxsize, ?limit.
+		return queryKeysSubsetOf(q, []string{
+			"find", "name", "tag", "newer", "older",
+			"minsize", "maxsize", "limit",
+		})
+	case q.Has("list"):
+		// handleList reads only ?list. (No filter params today.)
+		return queryKeysSubsetOf(q, []string{"list"})
+	default:
+		// No action selector → handleRead, which does not consume query
+		// params. Any unknown key on a read request is rejected to prevent
+		// future GET-side actions from silently inheriting the allowlist.
+		return len(q) == 0
+	}
+}
+
+// queryKeysSubsetOf returns true iff every key in q is present in allowed.
+// allowed is small (<10 strings) so linear scan is fine.
+func queryKeysSubsetOf(q url.Values, allowed []string) bool {
+	for k := range q {
+		ok := false
+		for _, a := range allowed {
+			if k == a {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
