@@ -110,6 +110,11 @@ func (s *Server) handleScopedTokenIssue(w http.ResponseWriter, r *http.Request, 
 		errJSON(w, http.StatusBadRequest, "scopes are required")
 		return
 	}
+	validatedScopes, err := validateScopedTokenScopes(req.Scopes)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	tokenVersion, err := newScopedTokenVersion()
 	if err != nil {
@@ -151,18 +156,12 @@ func (s *Server) handleScopedTokenIssue(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	for _, scopeReq := range req.Scopes {
-		ops, err := canonicalScopeOps(scopeReq.Ops)
-		if err != nil {
-			_ = s.meta.RevokeAPIKey(context.Background(), scope.TenantID, apiKeyID)
-			errJSON(w, http.StatusBadRequest, err.Error())
-			return
-		}
+	for _, scopeReq := range validatedScopes {
 		if err := s.meta.InsertAPIKeyFSScope(r.Context(), &meta.APIKeyFSScope{
 			TenantID:  scope.TenantID,
 			APIKeyID:  apiKeyID,
 			Prefix:    scopeReq.Prefix,
-			Ops:       ops,
+			Ops:       scopeReq.Ops,
 			CreatedAt: now,
 			UpdatedAt: now,
 		}); err != nil {
@@ -205,6 +204,41 @@ func (s *Server) handleScopedTokenRevoke(w http.ResponseWriter, r *http.Request,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func validateScopedTokenScopes(reqScopes []fsTokenScopeRequest) ([]meta.APIKeyFSScope, error) {
+	validated := make([]meta.APIKeyFSScope, 0, len(reqScopes))
+	seenPrefix := make(map[string]bool, len(reqScopes))
+	for _, scopeReq := range reqScopes {
+		prefix, err := canonicalScopePrefix(scopeReq.Prefix)
+		if err != nil {
+			return nil, err
+		}
+		if seenPrefix[prefix] {
+			return nil, fmt.Errorf("duplicate fs scope prefix %q", prefix)
+		}
+		seenPrefix[prefix] = true
+		ops, err := canonicalScopeOps(scopeReq.Ops)
+		if err != nil {
+			return nil, err
+		}
+		validated = append(validated, meta.APIKeyFSScope{Prefix: prefix, Ops: ops})
+	}
+	return validated, nil
+}
+
+func canonicalScopePrefix(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return "", fmt.Errorf("fs scope prefix is required")
+	}
+	if strings.TrimSpace(raw) == ":" {
+		return "", fmt.Errorf("fs scope prefix is required")
+	}
+	prefix, err := normalizeFSAuthorizationPath(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid fs scope prefix: %w", err)
+	}
+	return prefix, nil
 }
 
 func canonicalScopeOps(raw []string) (string, error) {

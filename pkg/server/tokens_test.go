@@ -167,6 +167,91 @@ func TestScopedTokenIssueRejectsInvalidPolicy(t *testing.T) {
 	}
 }
 
+func TestScopedTokenIssuePrevalidatesAllScopesBeforeInsert(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+	srv := NewWithConfig(Config{Meta: rt.meta, Pool: rt.pool, TokenSecret: rt.tokenSecret})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	badBody := `{"subject":"retry-subject","ttl_seconds":3600,"scopes":[{"prefix":"/scratch/ok","ops":["read"]},{"prefix":"/scratch/bad","ops":["search"]}]}`
+	badReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/tokens", strings.NewReader(badBody))
+	badReq.Header.Set("Authorization", "Bearer "+rt.token)
+	badReq.Header.Set("Content-Type", "application/json")
+	badResp, err := http.DefaultClient.Do(badReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = badResp.Body.Close()
+	if badResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad issue status=%d, want 400", badResp.StatusCode)
+	}
+
+	var count int
+	if err := rt.meta.DB().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM tenant_api_keys WHERE tenant_id = ? AND key_name = ?`,
+		rt.tenantID, "retry-subject").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("api key rows after invalid request = %d, want 0", count)
+	}
+
+	goodBody := `{"subject":"retry-subject","ttl_seconds":3600,"scopes":[{"prefix":"/scratch/ok","ops":["read","write"]}]}`
+	goodReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/tokens", strings.NewReader(goodBody))
+	goodReq.Header.Set("Authorization", "Bearer "+rt.token)
+	goodReq.Header.Set("Content-Type", "application/json")
+	goodResp, err := http.DefaultClient.Do(goodReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = goodResp.Body.Close() }()
+	if goodResp.StatusCode != http.StatusCreated {
+		t.Fatalf("good issue status=%d, want 201", goodResp.StatusCode)
+	}
+	var issued scopedTokenResponse
+	if err := json.NewDecoder(goodResp.Body).Decode(&issued); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := rt.meta.ListAPIKeyFSScopes(context.Background(), rt.tenantID, issued.TokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Prefix != "/scratch/ok" || rows[0].Ops != "read,write" {
+		t.Fatalf("scope rows = %+v, want one intended row", rows)
+	}
+}
+
+func TestScopedTokenIssueRejectsDuplicateNormalizedPrefixesBeforeInsert(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+	srv := NewWithConfig(Config{Meta: rt.meta, Pool: rt.pool, TokenSecret: rt.tokenSecret})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	body := `{"subject":"dup-prefix","ttl_seconds":3600,"scopes":[{"prefix":"/scratch","ops":["read"]},{"prefix":"/scratch/","ops":["write"]}]}`
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/tokens", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+rt.token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400", resp.StatusCode)
+	}
+	var count int
+	if err := rt.meta.DB().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM tenant_api_keys WHERE tenant_id = ? AND key_name = ?`,
+		rt.tenantID, "dup-prefix").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("api key rows after duplicate normalized prefix = %d, want 0", count)
+	}
+}
+
 func TestScopedTokenRevokeInvalidatesToken(t *testing.T) {
 	rt, cleanup := newAuthRuntime(t)
 	defer cleanup()
