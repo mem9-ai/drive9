@@ -423,19 +423,27 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 }
 
 // isScopedBusinessRequestAllowed is the dispatcher-level gate for scoped
-// tokens. It mirrors handleFS's actual dispatch table so the gate stays in
-// sync with what each handler actually wires — release-order safety per
-// @adversary-1 / @dev-1 review (PR C1 thread msg b6f53023, 4619c945, 005e8b0b):
-// only allow a route through when the handler in this PR is known to call
-// AuthorizeFS itself.
+// tokens. It mirrors the actual downstream dispatch tables (handleFS,
+// handleUploads / handleUploadAction, handleV2Uploads) so the gate stays
+// in sync with what each handler wires — release-order safety per
+// @adversary-1 / @dev-1 reviews (msgs b6f53023, 4619c945, 005e8b0b for
+// the C1 read-side; 6e17765f for the POST action priority on C2a write-
+// side; 09266f14 for the action-aware upload allowlist on C2b).
 //
-// PR C1 opened read-side. PR C2 extends the whitelist to write-side
-// (PUT/PATCH/DELETE/POST on /v1/fs/* except chmod) now that each write
-// handler authorizes its target path. Uploads are still default-deny —
-// they will be wired in a follow-up PR with session re-authorize semantics.
+// Workspace zones coverage as of C2b:
+//   - GET/HEAD /v1/fs/* (read-side, action-arm allowlist)
+//   - POST /v1/fs:batch-stat / batch-read-small (per-path authorize)
+//   - PUT/PATCH/DELETE/POST /v1/fs/* (write-side, action-arm allowlist;
+//     chmod stays owner-only)
+//   - /v1/uploads* + /v2/uploads/* (action-aware, mirrors actual upload
+//     dispatch table; see isScopedV{1,2}UploadRouteAllowed)
 //
 // chmod (POST /v1/fs/<path>?chmod=1) is explicitly NOT and never will be in
 // the scoped allowlist — chmod escalates ACLs and is owner-token-only.
+//
+// SQL, fork, events, journals, vault are permanently out of scope for
+// workspace zones (they don't take a path argument, so the prefix model
+// doesn't apply); these stay default-deny here.
 //
 // The GET branch uses an **action-specific** accept-list (per @adversary-1
 // msg 00efe734 / @adversary-2 msg cbedd30a): the chosen action selector
@@ -446,6 +454,11 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 // msg 6e17765f): mixed selectors like `?append=1&copy=1` deny as ambiguous
 // rather than silently first-wins. Each action arm allows only the keys
 // the corresponding handler reads.
+//
+// Both upload prefixes route through isScopedV1UploadRouteAllowed /
+// isScopedV2UploadRouteAllowed, which enumerate (method, path, action)
+// tuples exactly matching the corresponding handler dispatch (no
+// prefix-family pass-through — see @adversary-1 msg 09266f14).
 func isScopedBusinessRequestAllowed(r *http.Request) bool {
 	path := r.URL.Path
 
@@ -454,7 +467,8 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 		return r.Method == http.MethodPost
 	}
 
-	// /v1/fs/* — read + write methods admitted in C2; uploads still deny.
+	// /v1/fs/* — read + write methods admitted (C1 + C2a). Uploads are
+	// handled separately below via isScopedV{1,2}UploadRouteAllowed.
 	if strings.HasPrefix(path, "/v1/fs/") {
 		switch r.Method {
 		case http.MethodHead:
