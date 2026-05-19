@@ -1285,6 +1285,9 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 	if length <= 0 {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
+	if offset > (int64(^uint64(0)>>1) - length + 1) {
+		return nil, fmt.Errorf("offset + length overflows int64")
+	}
 
 	resp, err := c.readWithoutRedirect(ctx, path)
 	if err != nil {
@@ -1344,6 +1347,9 @@ func (c *Client) readObjectRangeStrict(ctx context.Context, objectURL string, of
 	}
 	if length <= 0 {
 		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	if offset > (int64(^uint64(0)>>1) - length + 1) {
+		return nil, fmt.Errorf("offset + length overflows int64")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, objectURL, nil)

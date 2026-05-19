@@ -1548,6 +1548,17 @@ func TestReadStreamRangeRejectsNegativeInputs(t *testing.T) {
 	}
 }
 
+func TestReadStreamRangeRejectsOverflow(t *testing.T) {
+	c := New("http://127.0.0.1", "")
+	maxInt64 := int64(^uint64(0) >> 1)
+	if _, err := c.ReadStreamRange(context.Background(), "/file.txt", maxInt64, 2); err == nil || !strings.Contains(err.Error(), "overflows") {
+		t.Fatalf("overflow err = %v, want overflow error", err)
+	}
+	if _, err := c.ReadObjectRange(context.Background(), &ReadTarget{ObjectURL: "http://127.0.0.1/object"}, maxInt64, 2); err == nil || !strings.Contains(err.Error(), "overflows") {
+		t.Fatalf("object overflow err = %v, want overflow error", err)
+	}
+}
+
 func TestResolveReadTargetAndReadObjectRange(t *testing.T) {
 	var readRequests atomic.Int32
 	var objectRequests atomic.Int32
