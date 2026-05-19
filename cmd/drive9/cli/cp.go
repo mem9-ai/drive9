@@ -18,6 +18,12 @@ import (
 	"go.uber.org/zap"
 )
 
+// recursiveCopyConcurrency caps the per-leaf transfer parallelism for
+// `drive9 fs cp -r`. Mirrors the existing `pkg/client/transfer/`
+// 16-worker convention so we don't introduce a new tuning knob in
+// this PR.
+const recursiveCopyConcurrency = 16
+
 // Cp copies files between local and remote.
 //
 // Remote paths use ":" or "<name>:" prefix:
@@ -32,6 +38,7 @@ import (
 func Cp(c *client.Client, args []string) error {
 	resume := false
 	appendMode := false
+	recursive := false
 	var tags map[string]string
 	var description string
 	filtered := make([]string, 0, len(args))
@@ -42,6 +49,8 @@ func Cp(c *client.Client, args []string) error {
 			resume = true
 		case a == "--append":
 			appendMode = true
+		case a == "-r" || a == "--recursive":
+			recursive = true
 		case a == "--tag":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--tag requires key=value argument")
@@ -75,7 +84,7 @@ func Cp(c *client.Client, args []string) error {
 	}
 
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs cp [--resume] [--append] [--tag key=value]... [--description <text>] <src> <dst>")
+		return fmt.Errorf("usage: drive9 fs cp [-r|--recursive] [--resume] [--append] [--tag key=value]... [--description <text>] <src> <dst>")
 	}
 	if resume && appendMode {
 		return fmt.Errorf("--resume and --append cannot be used together")
@@ -88,6 +97,15 @@ func Cp(c *client.Client, args []string) error {
 	}
 	if resume && description != "" {
 		return fmt.Errorf("--resume and --description cannot be used together")
+	}
+	// -r is intentionally orthogonal to the single-file ergonomics
+	// flags. Tree copy doesn't compose with --append (per-file
+	// append semantics ambiguous), --resume (resume is single-file
+	// multipart upload state, not tree-level), or single-file
+	// description/tags (those apply to one upload only). Reject up
+	// front instead of silently picking which file gets the metadata.
+	if recursive && (appendMode || resume || description != "" || len(tags) > 0) {
+		return fmt.Errorf("-r/--recursive cannot be combined with --append, --resume, --tag, or --description")
 	}
 	src, dst := args[0], args[1]
 
@@ -112,6 +130,25 @@ func Cp(c *client.Client, args []string) error {
 	}
 
 	ctx := context.Background()
+
+	// Recursive tree copy. Stdin/stdout sources have no meaningful
+	// recursive semantics; reject up front rather than silently fall
+	// back to the single-file paths below.
+	if recursive {
+		if src == "-" || dst == "-" {
+			return fmt.Errorf("-r/--recursive does not support stdin/stdout endpoints")
+		}
+		switch {
+		case !srcIsRemote && dstIsRemote:
+			return copyTreeLocalToRemote(ctx, c, src, dstRP.Path)
+		case srcIsRemote && !dstIsRemote:
+			return copyTreeRemoteToLocal(ctx, c, srcRP.Path, dst)
+		case srcIsRemote && dstIsRemote:
+			return copyTreeRemoteToRemote(ctx, c, srcRP.Path, dstRP.Path)
+		default:
+			return fmt.Errorf("-r/--recursive requires at least one remote path")
+		}
+	}
 
 	switch {
 	case src == "-" && dstIsRemote:

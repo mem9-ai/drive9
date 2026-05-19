@@ -879,7 +879,15 @@ func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool, kin
 
 // Copy performs a server-side zero-copy (same file_id, new path).
 func (c *Client) Copy(srcPath, dstPath string) error {
-	req, err := http.NewRequest(http.MethodPost, c.url(dstPath)+"?copy", nil)
+	return c.CopyCtx(context.Background(), srcPath, dstPath)
+}
+
+// CopyCtx performs a server-side zero-copy with context support so
+// callers can cancel mid-flight (e.g., Ctrl+C during a recursive
+// tree copy). The non-Ctx Copy delegates here so both paths share
+// the same request shape.
+func (c *Client) CopyCtx(ctx context.Context, srcPath, dstPath string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(dstPath)+"?copy", nil)
 	if err != nil {
 		return err
 	}
