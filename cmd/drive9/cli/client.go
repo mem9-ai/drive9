@@ -13,17 +13,17 @@ import (
 // extra multipart RTT is preferable to hanging the CLI.
 const fsClientWarmTimeout = 3 * time.Second
 
-// NewFromEnv returns an owner-scoped client for the drive9 fs plane
-// (drive9 fs cp/cat/ls/mv/rm/sh/grep/find/stat). It is the single entry
-// point for runFS in cmd/drive9/main.go.
+// NewFromEnv returns a tenant API-key client for the drive9 fs plane
+// (drive9 fs cp/cat/ls/mv/rm/sh/grep/find/stat). Tenant API keys include
+// legacy owner keys and workspace-zone fs_scoped keys; both travel through
+// DRIVE9_API_KEY / owner contexts and are distinguished server-side.
 //
-// Invariant: the fs plane is owner-only by construction — delegated JWTs
-// are not accepted on fs endpoints server-side. If a delegated credential
-// is the only one resolvable, this returns a client whose API key is
-// empty, and the request will fail with EACCES at the server (Invariant #7).
-// Callers that need to report a clearer error should check Kind themselves
-// before dispatch; retaining the lenient shape keeps parity with the pre-
-// resolver behaviour (which also returned an empty key).
+// Delegated vault capability tokens (DRIVE9_VAULT_TOKEN) are not accepted on
+// fs endpoints. If a vault token is the only resolvable credential, this
+// returns a client whose API key is empty and the request fails server-side.
+// Callers that need a clearer error should check Kind themselves before
+// dispatch; retaining the lenient shape keeps parity with the pre-resolver
+// behaviour (which also returned an empty key).
 //
 // Credential resolution goes through the unified resolver per §14.2
 // (env > config, Unsetenv-after-read).

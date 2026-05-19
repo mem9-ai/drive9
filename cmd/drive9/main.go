@@ -9,6 +9,7 @@
 //	create  provision a new database and owner context
 //	ctx     manage contexts (show, add, import, fork, ls, use, rm)
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, sh, grep, find)
+//	token  issue and revoke workspace-zone scoped filesystem tokens
 //	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
 //	journal append-only agent/workflow journal operations
 //	mount   mount drive9 as a local filesystem, or mount vault secrets
@@ -40,6 +41,7 @@ var exitFunc = os.Exit
 // "handler not reached". Production callers see no change: the default value
 // is the real cli.Secret and nothing else reassigns it outside tests.
 var vaultHandler = cli.Secret
+var tokenHandler = cli.Token
 var doctorHandler = cli.Doctor
 var journalHandler = cli.Journal
 
@@ -123,6 +125,21 @@ func dispatch(cmd string, args []string) {
 				sub = " " + args[0]
 			}
 			fatal("vault"+sub, err)
+		}
+	case "token":
+		if cliLogger != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = args[0]
+			}
+			logger.Info(context.Background(), "cli_command", zap.String("command", "token"), zap.String("subcommand", sub))
+		}
+		if err := tokenHandler(args); err != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = " " + args[0]
+			}
+			fatal("token"+sub, err)
 		}
 	case "journal":
 		if cliLogger != nil {
@@ -286,6 +303,7 @@ func usage(code int) {
 			"  ctx use <name>         activate context\n"+
 			"  ctx rm <name>          delete context\n"+
 			"  fs <command>           filesystem operations\n"+
+			"  token <issue|revoke>   issue and revoke workspace-zone scoped tokens\n"+
 			"  vault <set|get|put|with|ls|rm|grant|revoke|audit>\n"+
 			"                         vault operations\n"+
 			"  journal <new|append|cat|find|verify>\n"+

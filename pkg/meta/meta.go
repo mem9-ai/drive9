@@ -1356,6 +1356,24 @@ func (s *Store) RevokeTenantAPIKeys(ctx context.Context, tenantID string) (err e
 	return err
 }
 
+func (s *Store) RevokeAPIKey(ctx context.Context, tenantID, apiKeyID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "revoke_api_key", start, &err)
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `UPDATE tenant_api_keys
+		SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+		WHERE tenant_id = ? AND id = ? AND status = ?`,
+		APIKeyRevoked, now, now, tenantID, apiKeyID, APIKeyActive)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) UpsertStorageNamespace(ctx context.Context, ns *StorageNamespace) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "upsert_storage_namespace", start, &err)

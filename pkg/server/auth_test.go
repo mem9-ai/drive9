@@ -394,6 +394,7 @@ func TestScopedBusinessEndpointGuardDeniesEndpointsOutOfWorkspaceZonesScope(t *t
 		{http.MethodPost, "/v1/sql"},
 		{http.MethodPost, "/v1/fs/file.txt"}, // no action selector → ambiguous → deny
 		{http.MethodPost, "/v1/fork"},
+		{http.MethodPost, "/v1/tokens"},
 		{http.MethodGet, "/v1/events"},
 		{http.MethodGet, "/v1/journals"},
 		{http.MethodGet, "/v1/vault/secrets"},

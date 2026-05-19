@@ -125,6 +125,23 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 	if err := s.InsertAPIKey(context.Background(), &badKey); err == nil {
 		t.Fatal("InsertAPIKey with unknown scope kind error = nil, want error")
 	}
+
+	if err := s.RevokeAPIKey(context.Background(), tenant.ID, key.ID); err != nil {
+		t.Fatalf("RevokeAPIKey active key error = %v, want nil", err)
+	}
+	revoked, err := s.ResolveByAPIKeyHash(context.Background(), "hash1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revoked.APIKey.Status != APIKeyRevoked || revoked.APIKey.RevokedAt == nil {
+		t.Fatalf("revoked API key = status %s revoked_at %v, want revoked timestamp", revoked.APIKey.Status, revoked.APIKey.RevokedAt)
+	}
+	if err := s.RevokeAPIKey(context.Background(), tenant.ID, key.ID); err != ErrNotFound {
+		t.Fatalf("RevokeAPIKey already revoked error = %v, want ErrNotFound", err)
+	}
+	if err := s.RevokeAPIKey(context.Background(), "wrong-tenant", key.ID); err != ErrNotFound {
+		t.Fatalf("RevokeAPIKey wrong tenant error = %v, want ErrNotFound", err)
+	}
 }
 
 func TestInsertAndListAPIKeyFSScopes(t *testing.T) {
