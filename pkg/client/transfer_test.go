@@ -1445,6 +1445,120 @@ func TestReadStreamRangeLargeFileTreats416AsEOF(t *testing.T) {
 	}
 }
 
+func TestReadAtCtxUsesRangeAndReturnsBytes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/large.bin":
+			w.Header().Set("Location", fmt.Sprintf("http://%s/s3/presigned", r.Host))
+			w.WriteHeader(http.StatusFound)
+		case "/s3/presigned":
+			if got := r.Header.Get("Range"); got != "bytes=2-5" {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("2345"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	got, err := c.ReadAtCtx(context.Background(), "/large.bin", 2, 4)
+	if err != nil {
+		t.Fatalf("ReadAtCtx: %v", err)
+	}
+	if string(got) != "2345" {
+		t.Fatalf("ReadAtCtx = %q, want 2345", got)
+	}
+}
+
+func TestReadAtCtxInlineFileReturnsRequestedSlice(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/fs/small.txt" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte("0123456789"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	got, err := c.ReadAtCtx(context.Background(), "/small.txt", 3, 4)
+	if err != nil {
+		t.Fatalf("ReadAtCtx inline: %v", err)
+	}
+	if string(got) != "3456" {
+		t.Fatalf("ReadAtCtx inline = %q, want 3456", got)
+	}
+}
+
+func TestReadAtCtxOffsetPastEOFReturnsEmpty(t *testing.T) {
+	t.Run("inline", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/fs/small.txt" {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write([]byte("small"))
+		}))
+		defer srv.Close()
+
+		got, err := New(srv.URL, "").ReadAtCtx(context.Background(), "/small.txt", 99, 4)
+		if err != nil {
+			t.Fatalf("ReadAtCtx inline EOF: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("ReadAtCtx inline EOF = %q, want empty", got)
+		}
+	})
+
+	t.Run("large", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/v1/fs/large.bin":
+				w.Header().Set("Location", fmt.Sprintf("http://%s/s3/presigned", r.Host))
+				w.WriteHeader(http.StatusFound)
+			case "/s3/presigned":
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+
+		got, err := New(srv.URL, "").ReadAtCtx(context.Background(), "/large.bin", 99, 4)
+		if err != nil {
+			t.Fatalf("ReadAtCtx large EOF: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("ReadAtCtx large EOF = %q, want empty", got)
+		}
+	})
+}
+
+func TestReadStreamRangeRejectsNegativeInputs(t *testing.T) {
+	c := New("http://127.0.0.1", "")
+	if _, err := c.ReadStreamRange(context.Background(), "/file.txt", -1, 4); err == nil || !strings.Contains(err.Error(), "offset") {
+		t.Fatalf("negative offset err = %v, want offset error", err)
+	}
+	if _, err := c.ReadStreamRange(context.Background(), "/file.txt", 0, -1); err == nil || !strings.Contains(err.Error(), "length") {
+		t.Fatalf("negative length err = %v, want length error", err)
+	}
+}
+
+func TestReadStreamRangeRejectsOverflow(t *testing.T) {
+	c := New("http://127.0.0.1", "")
+	maxInt64 := int64(^uint64(0) >> 1)
+	if _, err := c.ReadStreamRange(context.Background(), "/file.txt", maxInt64, 2); err == nil || !strings.Contains(err.Error(), "overflows") {
+		t.Fatalf("overflow err = %v, want overflow error", err)
+	}
+	if _, err := c.ReadObjectRange(context.Background(), &ReadTarget{ObjectURL: "http://127.0.0.1/object"}, maxInt64, 2); err == nil || !strings.Contains(err.Error(), "overflows") {
+		t.Fatalf("object overflow err = %v, want overflow error", err)
+	}
+}
+
 func TestResolveReadTargetAndReadObjectRange(t *testing.T) {
 	var readRequests atomic.Int32
 	var objectRequests atomic.Int32

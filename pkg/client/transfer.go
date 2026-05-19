@@ -1269,14 +1269,24 @@ func (c *Client) downloadToFileSequential(ctx context.Context, remotePath string
 	return nil, err
 }
 
-// ReadStreamRange reads a byte range from a remote file. For large files the
-// server returns a 302 redirect to a presigned S3 URL; this method resolves
-// that redirect and issues an HTTP Range request so only the requested bytes
-// are transferred. For small files (no redirect) the full body is returned
-// and the caller should read only what it needs.
+// ReadStreamRange reads at most length bytes from a remote file starting at
+// offset. For large files the server returns a 302 redirect to a presigned S3
+// URL; this method resolves that redirect and issues an HTTP Range request so
+// only the requested bytes are transferred. For inline small files, the server
+// sends the full body and this method returns a reader limited to the requested
+// slice.
 func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	if offset < 0 {
+		return nil, fmt.Errorf("offset must be >= 0")
+	}
+	if length < 0 {
+		return nil, fmt.Errorf("length must be >= 0")
+	}
 	if length <= 0 {
 		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	if offset > (int64(^uint64(0)>>1) - length + 1) {
+		return nil, fmt.Errorf("offset + length overflows int64")
 	}
 
 	resp, err := c.readWithoutRedirect(ctx, path)
@@ -1329,8 +1339,17 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 }
 
 func (c *Client) readObjectRangeStrict(ctx context.Context, objectURL string, offset, length int64) (io.ReadCloser, error) {
+	if offset < 0 {
+		return nil, fmt.Errorf("offset must be >= 0")
+	}
+	if length < 0 {
+		return nil, fmt.Errorf("length must be >= 0")
+	}
 	if length <= 0 {
 		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	if offset > (int64(^uint64(0)>>1) - length + 1) {
+		return nil, fmt.Errorf("offset + length overflows int64")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, objectURL, nil)

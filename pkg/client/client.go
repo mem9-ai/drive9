@@ -562,6 +562,21 @@ func (c *Client) ReadCtx(ctx context.Context, path string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
+// ReadAt downloads at most length bytes starting at offset.
+func (c *Client) ReadAt(path string, offset, length int64) ([]byte, error) {
+	return c.ReadAtCtx(context.Background(), path, offset, length)
+}
+
+// ReadAtCtx downloads at most length bytes starting at offset with context support.
+func (c *Client) ReadAtCtx(ctx context.Context, path string, offset, length int64) ([]byte, error) {
+	rc, err := c.ReadStreamRange(ctx, path, offset, length)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }()
+	return io.ReadAll(rc)
+}
+
 // List returns the entries in a directory.
 func (c *Client) List(path string) ([]FileInfo, error) {
 	return c.ListCtx(context.Background(), path)
