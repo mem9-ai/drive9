@@ -386,6 +386,10 @@ func (s *Server) ListenAndServe(addr string) error {
 }
 
 func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
+	if scope := ScopeFromContext(r.Context()); scope != nil && scope.IsScoped && !isScopedBusinessPathAllowed(r.URL.Path) {
+		errJSON(w, http.StatusForbidden, "scoped token cannot access endpoint")
+		return
+	}
 	switch {
 	case r.URL.Path == "/v1/fs:batch-stat":
 		s.handleBatchStat(w, r)
@@ -415,6 +419,12 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "business_route_not_found", "path", r.URL.Path, "method", r.Method)...)
 		errJSON(w, http.StatusNotFound, "not found")
 	}
+}
+
+func isScopedBusinessPathAllowed(_ string) bool {
+	// PR A only introduces the scoped-token foundation. FS/upload routes opt in
+	// in PR C1/C2 once each handler authorizes its request path before work.
+	return false
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {

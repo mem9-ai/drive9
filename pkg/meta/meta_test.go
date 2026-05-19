@@ -17,6 +17,7 @@ func newControlStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
+	_, _ = s.DB().Exec("DELETE FROM tenant_api_key_fs_scopes")
 	_, _ = s.DB().Exec("DELETE FROM tenant_api_keys")
 	_, _ = s.DB().Exec("DELETE FROM tenants")
 	_, _ = s.DB().Exec("DELETE FROM llm_usage")
@@ -111,6 +112,176 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 	}
 	if got.APIKey.Status != APIKeyActive {
 		t.Fatalf("unexpected key status: %s", got.APIKey.Status)
+	}
+	if got.APIKey.ScopeKind != APIKeyScopeKindOwner {
+		t.Fatalf("unexpected key scope kind: %s", got.APIKey.ScopeKind)
+	}
+
+	badKey := *key
+	badKey.ID = "bad-scope-kind"
+	badKey.KeyName = "bad-scope-kind"
+	badKey.JWTHash = "bad-scope-kind-hash"
+	badKey.ScopeKind = APIKeyScopeKind("unknown")
+	if err := s.InsertAPIKey(context.Background(), &badKey); err == nil {
+		t.Fatal("InsertAPIKey with unknown scope kind error = nil, want error")
+	}
+}
+
+func TestInsertAndListAPIKeyFSScopes(t *testing.T) {
+	s := newControlStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertTenant(context.Background(), &Tenant{
+		ID:               "scope-tenant",
+		Status:           TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: []byte("cipher"),
+		DBName:           "tenant_db_scopes",
+		DBTLS:            true,
+		Provider:         "tidb_zero",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertTenant(context.Background(), &Tenant{
+		ID:               "other-tenant",
+		Status:           TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: []byte("cipher"),
+		DBName:           "tenant_db_other_scopes",
+		DBTLS:            true,
+		Provider:         "tidb_zero",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertAPIKey(context.Background(), &APIKey{
+		ID:            "scope-key",
+		TenantID:      "scope-tenant",
+		KeyName:       "scoped",
+		JWTCiphertext: []byte("jwt-cipher"),
+		JWTHash:       "scope-hash",
+		TokenVersion:  1,
+		Status:        APIKeyActive,
+		ScopeKind:     APIKeyScopeKindFS,
+		IssuedAt:      now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := s.ResolveByAPIKeyHash(context.Background(), "scope-hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.APIKey.ScopeKind != APIKeyScopeKindFS {
+		t.Fatalf("resolved scope kind = %s, want %s", resolved.APIKey.ScopeKind, APIKeyScopeKindFS)
+	}
+	if err := s.InsertAPIKey(context.Background(), &APIKey{
+		ID:            "other-key",
+		TenantID:      "scope-tenant",
+		KeyName:       "other-scoped",
+		JWTCiphertext: []byte("jwt-cipher"),
+		JWTHash:       "other-scope-hash",
+		TokenVersion:  1,
+		Status:        APIKeyActive,
+		ScopeKind:     APIKeyScopeKindFS,
+		IssuedAt:      now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertAPIKey(context.Background(), &APIKey{
+		ID:            "other-tenant-key",
+		TenantID:      "other-tenant",
+		KeyName:       "scoped",
+		JWTCiphertext: []byte("jwt-cipher"),
+		JWTHash:       "other-tenant-scope-hash",
+		TokenVersion:  1,
+		Status:        APIKeyActive,
+		ScopeKind:     APIKeyScopeKindFS,
+		IssuedAt:      now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.InsertAPIKeyFSScope(context.Background(), &APIKeyFSScope{
+		TenantID: "scope-tenant",
+		APIKeyID: "scope-key",
+		Prefix:   "/scratch/run-1",
+		Ops:      "read,list",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertAPIKeyFSScope(context.Background(), &APIKeyFSScope{
+		TenantID: "scope-tenant",
+		APIKeyID: "other-key",
+		Prefix:   "/wrong-key",
+		Ops:      "read",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertAPIKeyFSScope(context.Background(), &APIKeyFSScope{
+		TenantID: "other-tenant",
+		APIKeyID: "scope-key",
+		Prefix:   "/wrong-tenant",
+		Ops:      "read",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.ListAPIKeyFSScopes(context.Background(), "scope-tenant", "scope-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("scope count = %d, want 1: %#v", len(got), got)
+	}
+	if got[0].TenantID != "scope-tenant" || got[0].APIKeyID != "scope-key" || got[0].Prefix != "/scratch/run-1" || got[0].Ops != "read,list" {
+		t.Fatalf("unexpected scope row: %#v", got[0])
+	}
+
+	if err := s.InsertAPIKeyFSScope(context.Background(), &APIKeyFSScope{
+		TenantID: "scope-tenant",
+		APIKeyID: "scope-key",
+		Prefix:   "",
+		Ops:      "read",
+	}); err == nil {
+		t.Fatal("InsertAPIKeyFSScope with empty prefix error = nil, want error")
+	}
+	if err := s.InsertAPIKeyFSScope(context.Background(), &APIKeyFSScope{
+		TenantID: "scope-tenant",
+		APIKeyID: "scope-key",
+		Prefix:   ":",
+		Ops:      "read",
+	}); err == nil {
+		t.Fatal("InsertAPIKeyFSScope with bare colon prefix error = nil, want error")
+	}
+	if err := s.InsertAPIKeyFSScope(context.Background(), &APIKeyFSScope{
+		TenantID: "scope-tenant",
+		APIKeyID: "scope-key",
+		Prefix:   ":/",
+		Ops:      "read",
+	}); err != nil {
+		t.Fatalf("InsertAPIKeyFSScope with explicit root prefix error = %v, want nil", err)
+	}
+	if err := s.InsertAPIKeyFSScope(context.Background(), &APIKeyFSScope{
+		TenantID: "scope-tenant",
+		APIKeyID: "scope-key",
+		Prefix:   "/bad-search",
+		Ops:      "search",
+	}); err == nil {
+		t.Fatal("InsertAPIKeyFSScope with search-only ops error = nil, want error")
 	}
 }
 
@@ -361,6 +532,30 @@ func TestMetaSchemaSpecIncludesForkStorageNamespaceColumns(t *testing.T) {
 	}
 	_ = mustMetaTableSpec(t, mustMetaSpec(t), "storage_namespaces")
 	_ = mustMetaTableSpec(t, mustMetaSpec(t), "object_gc_candidates")
+}
+
+func TestMetaSchemaSpecIncludesAPIKeyScopeTables(t *testing.T) {
+	spec := mustMetaSpec(t)
+	apiKeys := mustMetaTableSpec(t, spec, "tenant_api_keys")
+	scopeKind, ok := apiKeys.columns["scope_kind"]
+	if !ok {
+		t.Fatal("tenant_api_keys schema missing scope_kind")
+	}
+	if scopeKind.addSQL != "ALTER TABLE tenant_api_keys ADD COLUMN scope_kind VARCHAR(32) NOT NULL DEFAULT 'owner'" {
+		t.Fatalf("scope_kind addSQL = %q", scopeKind.addSQL)
+	}
+
+	scopes := mustMetaTableSpec(t, spec, "tenant_api_key_fs_scopes")
+	for _, column := range []string{"tenant_id", "api_key_id", "prefix", "prefix_hash", "ops"} {
+		if _, ok := scopes.columns[column]; !ok {
+			t.Fatalf("tenant_api_key_fs_scopes schema missing %s", column)
+		}
+	}
+	for _, index := range []string{"primary", "idx_fs_scopes_api_key", "idx_fs_scopes_tenant_key"} {
+		if _, ok := scopes.indexes[index]; !ok {
+			t.Fatalf("tenant_api_key_fs_scopes schema missing index %s", index)
+		}
+	}
 }
 
 func TestDiffMetaTableMetaReportsMissingPrimaryKeyConstraint(t *testing.T) {
