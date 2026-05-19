@@ -1275,6 +1275,12 @@ func (c *Client) downloadToFileSequential(ctx context.Context, remotePath string
 // are transferred. For small files (no redirect) the full body is returned
 // and the caller should read only what it needs.
 func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	if offset < 0 {
+		return nil, fmt.Errorf("offset must be >= 0")
+	}
+	if length < 0 {
+		return nil, fmt.Errorf("length must be >= 0")
+	}
 	if length <= 0 {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
@@ -1329,6 +1335,12 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 }
 
 func (c *Client) readObjectRangeStrict(ctx context.Context, objectURL string, offset, length int64) (io.ReadCloser, error) {
+	if offset < 0 {
+		return nil, fmt.Errorf("offset must be >= 0")
+	}
+	if length < 0 {
+		return nil, fmt.Errorf("length must be >= 0")
+	}
 	if length <= 0 {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}

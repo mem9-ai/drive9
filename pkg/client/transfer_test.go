@@ -1445,6 +1445,45 @@ func TestReadStreamRangeLargeFileTreats416AsEOF(t *testing.T) {
 	}
 }
 
+func TestReadAtCtxUsesRangeAndReturnsBytes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/large.bin":
+			w.Header().Set("Location", fmt.Sprintf("http://%s/s3/presigned", r.Host))
+			w.WriteHeader(http.StatusFound)
+		case "/s3/presigned":
+			if got := r.Header.Get("Range"); got != "bytes=2-5" {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("2345"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	got, err := c.ReadAtCtx(context.Background(), "/large.bin", 2, 4)
+	if err != nil {
+		t.Fatalf("ReadAtCtx: %v", err)
+	}
+	if string(got) != "2345" {
+		t.Fatalf("ReadAtCtx = %q, want 2345", got)
+	}
+}
+
+func TestReadStreamRangeRejectsNegativeInputs(t *testing.T) {
+	c := New("http://127.0.0.1", "")
+	if _, err := c.ReadStreamRange(context.Background(), "/file.txt", -1, 4); err == nil || !strings.Contains(err.Error(), "offset") {
+		t.Fatalf("negative offset err = %v, want offset error", err)
+	}
+	if _, err := c.ReadStreamRange(context.Background(), "/file.txt", 0, -1); err == nil || !strings.Contains(err.Error(), "length") {
+		t.Fatalf("negative length err = %v, want length error", err)
+	}
+}
+
 func TestResolveReadTargetAndReadObjectRange(t *testing.T) {
 	var readRequests atomic.Int32
 	var objectRequests atomic.Int32
