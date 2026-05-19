@@ -82,6 +82,7 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 		"usage: drive9 <command> [arguments]",
 		"ctx show [--json] [--reveal]",
 		"ctx use <name>",
+		"token <issue|revoke>",
 		"journal <new|append|cat|find|verify>",
 		"mount [flags] [:/remote] <mountpoint>",
 		"mount vault [flags] <mountpoint>",
@@ -120,6 +121,39 @@ func TestDispatchVaultVerbReachesHandler(t *testing.T) {
 		t.Fatal("vault handler was not invoked for `drive9 vault ...`")
 	}
 	want := []string{"ls", "--json"}
+	if len(gotArgs) != len(want) {
+		t.Fatalf("args = %v, want %v", gotArgs, want)
+	}
+	for i := range want {
+		if gotArgs[i] != want[i] {
+			t.Fatalf("args[%d] = %q, want %q", i, gotArgs[i], want[i])
+		}
+	}
+}
+
+func TestDispatchTokenVerbReachesHandler(t *testing.T) {
+	origHandler := tokenHandler
+	origExit := exitFunc
+	t.Cleanup(func() {
+		tokenHandler = origHandler
+		exitFunc = origExit
+	})
+	exitFunc = func(int) {}
+
+	var gotArgs []string
+	called := false
+	tokenHandler = func(args []string) error {
+		called = true
+		gotArgs = args
+		return nil
+	}
+
+	dispatch("token", []string{"issue", "--subject", "vm0"})
+
+	if !called {
+		t.Fatal("token handler was not invoked for `drive9 token ...`")
+	}
+	want := []string{"issue", "--subject", "vm0"}
 	if len(gotArgs) != len(want) {
 		t.Fatalf("args = %v, want %v", gotArgs, want)
 	}

@@ -16,6 +16,8 @@ func TestRequestRoute(t *testing.T) {
 		{path: "/metrics", want: "/metrics"},
 		{path: "/v1/provision", want: "/v1/provision"},
 		{path: "/v1/status", want: "/v1/status"},
+		{path: "/v1/tokens", want: "/v1/tokens/*"},
+		{path: "/v1/tokens/key1", want: "/v1/tokens/*"},
 		{path: "/v1/sql", want: "/v1/sql"},
 		{path: "/v1/events", want: "/v1/events"},
 		{path: "/v1/fs/doc.txt", want: "/v1/fs/*"},

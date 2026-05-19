@@ -177,6 +177,8 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
 	mux.Handle("/v2/uploads/", business)
+	mux.Handle("/v1/tokens", business)
+	mux.Handle("/v1/tokens/", business)
 	mux.Handle("/v1/fork", business)
 	mux.Handle("/v1/sql", business)
 	mux.Handle("/v1/events", business)
@@ -406,6 +408,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleUploadAction(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v2/uploads/"):
 		s.handleV2Uploads(w, r)
+	case r.URL.Path == "/v1/tokens" || strings.HasPrefix(r.URL.Path, "/v1/tokens/"):
+		s.handleTokens(w, r)
 	case r.URL.Path == "/v1/fork":
 		s.handleFork(w, r)
 	case r.URL.Path == "/v1/sql":
