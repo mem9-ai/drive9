@@ -1474,6 +1474,70 @@ func TestReadAtCtxUsesRangeAndReturnsBytes(t *testing.T) {
 	}
 }
 
+func TestReadAtCtxInlineFileReturnsRequestedSlice(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/fs/small.txt" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte("0123456789"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	got, err := c.ReadAtCtx(context.Background(), "/small.txt", 3, 4)
+	if err != nil {
+		t.Fatalf("ReadAtCtx inline: %v", err)
+	}
+	if string(got) != "3456" {
+		t.Fatalf("ReadAtCtx inline = %q, want 3456", got)
+	}
+}
+
+func TestReadAtCtxOffsetPastEOFReturnsEmpty(t *testing.T) {
+	t.Run("inline", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/fs/small.txt" {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write([]byte("small"))
+		}))
+		defer srv.Close()
+
+		got, err := New(srv.URL, "").ReadAtCtx(context.Background(), "/small.txt", 99, 4)
+		if err != nil {
+			t.Fatalf("ReadAtCtx inline EOF: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("ReadAtCtx inline EOF = %q, want empty", got)
+		}
+	})
+
+	t.Run("large", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/v1/fs/large.bin":
+				w.Header().Set("Location", fmt.Sprintf("http://%s/s3/presigned", r.Host))
+				w.WriteHeader(http.StatusFound)
+			case "/s3/presigned":
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+
+		got, err := New(srv.URL, "").ReadAtCtx(context.Background(), "/large.bin", 99, 4)
+		if err != nil {
+			t.Fatalf("ReadAtCtx large EOF: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("ReadAtCtx large EOF = %q, want empty", got)
+		}
+	})
+}
+
 func TestReadStreamRangeRejectsNegativeInputs(t *testing.T) {
 	c := New("http://127.0.0.1", "")
 	if _, err := c.ReadStreamRange(context.Background(), "/file.txt", -1, 4); err == nil || !strings.Contains(err.Error(), "offset") {

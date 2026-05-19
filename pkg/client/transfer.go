@@ -1269,11 +1269,12 @@ func (c *Client) downloadToFileSequential(ctx context.Context, remotePath string
 	return nil, err
 }
 
-// ReadStreamRange reads a byte range from a remote file. For large files the
-// server returns a 302 redirect to a presigned S3 URL; this method resolves
-// that redirect and issues an HTTP Range request so only the requested bytes
-// are transferred. For small files (no redirect) the full body is returned
-// and the caller should read only what it needs.
+// ReadStreamRange reads at most length bytes from a remote file starting at
+// offset. For large files the server returns a 302 redirect to a presigned S3
+// URL; this method resolves that redirect and issues an HTTP Range request so
+// only the requested bytes are transferred. For inline small files, the server
+// sends the full body and this method returns a reader limited to the requested
+// slice.
 func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
 	if offset < 0 {
 		return nil, fmt.Errorf("offset must be >= 0")

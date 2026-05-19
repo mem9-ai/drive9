@@ -78,3 +78,24 @@ func TestCatRangeRejectsNegativeInputs(t *testing.T) {
 		t.Fatalf("negative length error = %v, want length error", err)
 	}
 }
+
+func TestCatRangeAllowsZeroLength(t *testing.T) {
+	var hitServer bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitServer = true
+		http.Error(w, "zero-length range should not fetch", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	var out bytes.Buffer
+	err := catWithWriter(client.New(srv.URL, ""), []string{"--offset", "10", "--length", "0", ":/large.bin"}, &out)
+	if err != nil {
+		t.Fatalf("Cat zero-length range: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("Cat zero-length output = %q, want empty", out.String())
+	}
+	if hitServer {
+		t.Fatal("zero-length range should not issue a read request")
+	}
+}
