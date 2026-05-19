@@ -379,16 +379,40 @@ func TestAuthScopedKeyLoadsFSScopes(t *testing.T) {
 	}
 }
 
-func TestScopedBusinessEndpointGuardDeniesUntilHandlersAuthorizePaths(t *testing.T) {
-	for _, path := range []string{"/v1/sql", "/v1/fs/file.txt", "/v1/fs:batch-stat", "/v1/uploads/initiate"} {
-		req := httptest.NewRequest(http.MethodPost, path, nil)
+// TestScopedBusinessEndpointGuardDeniesNonC1Endpoints checks that scoped
+// tokens are still 403'd at the dispatcher for every endpoint NOT opened
+// by PR C1's read-side wiring. PR C1 admits POST batch-stat / batch-read-
+// small and GET/HEAD on /v1/fs/* — those have their own
+// AuthorizeFS-on-each-handler tests. Every other business endpoint
+// (write methods on /v1/fs, all uploads, sql, fork, events, journals,
+// vault) must continue to fail-closed at handleBusiness.
+func TestScopedBusinessEndpointGuardDeniesNonC1Endpoints(t *testing.T) {
+	type endpoint struct {
+		method string
+		path   string
+	}
+	deniedC1 := []endpoint{
+		{http.MethodPost, "/v1/sql"},
+		{http.MethodPut, "/v1/fs/file.txt"},    // write-side, still C2-only
+		{http.MethodDelete, "/v1/fs/file.txt"}, // write-side
+		{http.MethodPost, "/v1/fs/file.txt"},   // mkdir/copy/rename/append, C2-only
+		{http.MethodPost, "/v1/uploads/initiate"},
+		{http.MethodPost, "/v1/uploads"},
+		{http.MethodPost, "/v1/fork"},
+		{http.MethodGet, "/v1/events"},
+		{http.MethodGet, "/v1/journals"},
+		{http.MethodGet, "/v1/vault/secrets"},
+	}
+	for _, ep := range deniedC1 {
+		req := httptest.NewRequest(ep.method, ep.path, nil)
 		req = req.WithContext(withScope(req.Context(), &TenantScope{IsScoped: true}))
 		rr := httptest.NewRecorder()
 
 		(&Server{}).handleBusiness(rr, req)
 
 		if rr.Code != http.StatusForbidden {
-			t.Fatalf("path=%s status=%d body=%s, want 403", path, rr.Code, rr.Body.String())
+			t.Errorf("%s %s status=%d body=%s, want 403 (scoped token must not enter handler)",
+				ep.method, ep.path, rr.Code, rr.Body.String())
 		}
 	}
 }

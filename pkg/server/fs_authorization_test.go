@@ -2,10 +2,25 @@ package server
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/meta"
 )
+
+// newScopedRequest constructs a synthetic *http.Request suitable for unit-
+// testing isScopedBusinessRequestAllowed. Body is empty; we only inspect
+// method, URL.Path, and URL.Query() in the gate.
+func newScopedRequest(t *testing.T, method, path, rawQuery string) *http.Request {
+	t.Helper()
+	url := path
+	if rawQuery != "" {
+		url = path + "?" + rawQuery
+	}
+	r := httptest.NewRequest(method, url, nil)
+	return r
+}
 
 func TestAuthorizeFSOwnerAllowsAll(t *testing.T) {
 	scope := &TenantScope{}
@@ -124,25 +139,276 @@ func TestFSScopeFromMetaRejectsEmptyPrefix(t *testing.T) {
 	}
 }
 
-func TestIsScopedBusinessPathAllowed(t *testing.T) {
-	denied := []string{
-		"/v1/fs:batch-stat",
-		"/v1/fs:batch-read-small",
-		"/v1/fs/main.txt",
-		"/v1/uploads/initiate",
-		"/v1/uploads",
-		"/v1/uploads/upload-1/complete",
-		"/v2/uploads/upload-1/parts",
-		"/v1/sql",
-		"/v1/fork",
-		"/v1/events",
-		"/v1/journals",
-		"/v1/vault/secrets",
-	}
-	for _, p := range denied {
-		if isScopedBusinessPathAllowed(p) {
-			t.Fatalf("isScopedBusinessPathAllowed(%q) = true, want false", p)
+// TestIsScopedBusinessRequestAllowed verifies the dispatcher-level guard
+// admits the read-side endpoints PR C1 wires (so the handlers can run their
+// own AuthorizeFS) and continues to deny every write-side / non-FS endpoint.
+// The intent matches the @adversary-1 / @dev-1 review on the C1 thread
+// (msg b6f53023 / 4619c945 / 005e8b0b): release-order safety — never open
+// a route before a handler in this PR is known to authorize its target path.
+func TestIsScopedBusinessRequestAllowed(t *testing.T) {
+	t.Run("read-side endpoints allowed", func(t *testing.T) {
+		cases := []struct {
+			method string
+			path   string
+			query  string
+		}{
+			{http.MethodGet, "/v1/fs/main.txt", ""},
+			{http.MethodGet, "/v1/fs/dir/", "list=1"},
+			{http.MethodGet, "/v1/fs/dir/file.txt", "stat=1"},
+			{http.MethodGet, "/v1/fs/dir/", "grep=hello"},
+			{http.MethodGet, "/v1/fs/dir/", "find=name:foo"},
+			{http.MethodHead, "/v1/fs/main.txt", ""},
+			{http.MethodPost, "/v1/fs:batch-stat", ""},
+			{http.MethodPost, "/v1/fs:batch-read-small", ""},
 		}
+		for _, tc := range cases {
+			r := newScopedRequest(t, tc.method, tc.path, tc.query)
+			if !isScopedBusinessRequestAllowed(r) {
+				t.Errorf("isScopedBusinessRequestAllowed(%s %s?%s) = false, want true",
+					tc.method, tc.path, tc.query)
+			}
+		}
+	})
+
+	t.Run("write-side endpoints denied (left for C2)", func(t *testing.T) {
+		cases := []struct {
+			method string
+			path   string
+			query  string
+		}{
+			{http.MethodPut, "/v1/fs/main.txt", ""},
+			{http.MethodPatch, "/v1/fs/main.txt", ""},
+			{http.MethodDelete, "/v1/fs/main.txt", ""},
+			{http.MethodPost, "/v1/fs/main.txt", "append=1"},
+			{http.MethodPost, "/v1/fs/main.txt", "copy=1"},
+			{http.MethodPost, "/v1/fs/main.txt", "rename=1"},
+			{http.MethodPost, "/v1/fs/main.txt", "mkdir=1"},
+			{http.MethodPost, "/v1/fs/main.txt", "chmod=1"},
+			{http.MethodPost, "/v1/fs/main.txt", "create=1"},
+			{http.MethodGet, "/v1/fs:batch-stat", ""},          // wrong method for this endpoint
+			{http.MethodGet, "/v1/fs:batch-read-small", ""},    // wrong method
+			{http.MethodPost, "/v1/uploads", ""},
+			{http.MethodPost, "/v1/uploads/initiate", ""},
+			{http.MethodPost, "/v1/uploads/upload-1/complete", ""},
+			{http.MethodPost, "/v2/uploads/upload-1/parts", ""},
+			{http.MethodPost, "/v1/sql", ""},
+			{http.MethodPost, "/v1/fork", ""},
+			{http.MethodGet, "/v1/events", ""},
+			{http.MethodGet, "/v1/journals", ""},
+			{http.MethodGet, "/v1/vault/secrets", ""},
+		}
+		for _, tc := range cases {
+			r := newScopedRequest(t, tc.method, tc.path, tc.query)
+			if isScopedBusinessRequestAllowed(r) {
+				t.Errorf("isScopedBusinessRequestAllowed(%s %s?%s) = true, want false",
+					tc.method, tc.path, tc.query)
+			}
+		}
+	})
+
+	t.Run("unknown GET query keys are denied (no silent inheritance)", func(t *testing.T) {
+		// release-order safety per @dev-1 msg 005e8b0b: future GET-side
+		// query actions must not silently inherit the C1 whitelist.
+		r := newScopedRequest(t, http.MethodGet, "/v1/fs/dir/", "newaction=1")
+		if isScopedBusinessRequestAllowed(r) {
+			t.Errorf("isScopedBusinessRequestAllowed(GET /v1/fs/dir/?newaction=1) = true, want false (unknown query key must default-deny)")
+		}
+	})
+}
+
+// TestAuthorizeFSHTTPHelperOwnerAllows verifies the authorizeFS HTTP helper
+// short-circuits to true for owner tokens (no FSScopes), so wired handlers
+// have zero behavioral change for legacy/owner callers. This is the per-
+// request flip side of the AuthorizeFS owner fast-path.
+func TestAuthorizeFSHTTPHelperOwnerAllows(t *testing.T) {
+	r := newScopedRequest(t, http.MethodGet, "/v1/fs/main.txt", "")
+	r = r.WithContext(withScope(r.Context(), &TenantScope{ /* IsScoped: false */ }))
+	w := httptest.NewRecorder()
+	if ok := authorizeFS(w, r, FSOpRead, "/main.txt"); !ok {
+		t.Fatalf("authorizeFS owner = false, want true")
+	}
+	if got := w.Result().StatusCode; got != http.StatusOK {
+		t.Errorf("response status = %d, want %d (no body written for allow)", got, http.StatusOK)
+	}
+}
+
+// TestAuthorizeFSHTTPHelperScopedAllowsInZone confirms a scoped token whose
+// FSScopes match the requested op+path passes through with no body written.
+func TestAuthorizeFSHTTPHelperScopedAllowsInZone(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{
+			Prefix: "/scratch/run-1",
+			Ops:    map[FSOp]bool{FSOpRead: true},
+		}},
+	}
+	r := newScopedRequest(t, http.MethodGet, "/v1/fs/scratch/run-1/input.txt", "")
+	r = r.WithContext(withScope(r.Context(), scope))
+	w := httptest.NewRecorder()
+	if ok := authorizeFS(w, r, FSOpRead, "/scratch/run-1/input.txt"); !ok {
+		t.Fatalf("authorizeFS scoped in-zone = false, want true")
+	}
+	if got := w.Result().StatusCode; got != http.StatusOK {
+		t.Errorf("response status = %d, want %d", got, http.StatusOK)
+	}
+}
+
+// TestAuthorizeFSHTTPHelperScopedDeniesOutOfZone confirms a scoped token
+// outside its FSScopes returns 403 and writes a JSON error body.
+func TestAuthorizeFSHTTPHelperScopedDeniesOutOfZone(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{
+			Prefix: "/scratch/run-1",
+			Ops:    map[FSOp]bool{FSOpRead: true},
+		}},
+	}
+	r := newScopedRequest(t, http.MethodGet, "/v1/fs/main/secrets.env", "")
+	r = r.WithContext(withScope(r.Context(), scope))
+	w := httptest.NewRecorder()
+	if ok := authorizeFS(w, r, FSOpRead, "/main/secrets.env"); ok {
+		t.Fatalf("authorizeFS scoped out-of-zone = true, want false")
+	}
+	if got := w.Result().StatusCode; got != http.StatusForbidden {
+		t.Errorf("response status = %d, want %d (403)", got, http.StatusForbidden)
+	}
+}
+
+// TestAuthorizeFSHTTPHelperRejectsEscape confirms a path that escapes its
+// canonical form via "../" gets mapped to 400 (invalid fs path), not 403.
+// The distinction matters: 400 says "your input is broken", 403 says "your
+// token can't do this on a valid path".
+func TestAuthorizeFSHTTPHelperRejectsEscape(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{
+			Prefix: "/scratch/run-1",
+			Ops:    map[FSOp]bool{FSOpRead: true},
+		}},
+	}
+	r := newScopedRequest(t, http.MethodGet, "/v1/fs/scratch/run-1/../main/secrets.env", "")
+	r = r.WithContext(withScope(r.Context(), scope))
+	w := httptest.NewRecorder()
+	if ok := authorizeFS(w, r, FSOpRead, "/scratch/run-1/../main/secrets.env"); ok {
+		t.Fatalf("authorizeFS path-escape = true, want false")
+	}
+	if got := w.Result().StatusCode; got != http.StatusBadRequest {
+		t.Errorf("response status = %d, want %d (400)", got, http.StatusBadRequest)
+	}
+}
+
+// TestAuthorizeFSPathForBatchReturnsPerPathStatus is the batch-endpoint
+// invariant: a single denied path becomes one 403 in the result array; the
+// rest of the batch is NOT short-circuited. This preserves the cp -r
+// preflight contract (PR #434) where ONE out-of-zone file in a 256-path
+// batch must not bulk-reject the entire preflight.
+func TestAuthorizeFSPathForBatchReturnsPerPathStatus(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{
+			Prefix: "/scratch",
+			Ops:    map[FSOp]bool{FSOpRead: true},
+		}},
+	}
+
+	// In zone → allowed.
+	status, msg, allowed := authorizeFSPathForBatch(scope, FSOpRead, "/scratch/file.txt")
+	if !allowed {
+		t.Errorf("in-zone batch path: allowed=false, want true (status=%d msg=%q)", status, msg)
+	}
+
+	// Out of zone → 403, no batch-wide reject.
+	status, msg, allowed = authorizeFSPathForBatch(scope, FSOpRead, "/main/secrets.env")
+	if allowed {
+		t.Errorf("out-of-zone batch path: allowed=true, want false")
+	}
+	if status != http.StatusForbidden {
+		t.Errorf("out-of-zone batch path: status=%d, want %d", status, http.StatusForbidden)
+	}
+	if msg == "" {
+		t.Errorf("out-of-zone batch path: msg empty, want non-empty")
+	}
+
+	// Escape path → 400.
+	status, _, allowed = authorizeFSPathForBatch(scope, FSOpRead, "/scratch/../main/x")
+	if allowed {
+		t.Errorf("escape batch path: allowed=true, want false")
+	}
+	if status != http.StatusBadRequest {
+		t.Errorf("escape batch path: status=%d, want %d", status, http.StatusBadRequest)
+	}
+}
+
+// TestAuthorizeFSPathForBatchOwnerAllows confirms the owner fast-path
+// applies to the batch helper too — a nil-IsScoped owner gets allowed=true
+// for every path with zero per-path overhead.
+func TestAuthorizeFSPathForBatchOwnerAllows(t *testing.T) {
+	scope := &TenantScope{ /* IsScoped: false */ }
+	for _, p := range []string{"/main.txt", "/scratch/x.txt", "/secrets/key.env"} {
+		status, msg, allowed := authorizeFSPathForBatch(scope, FSOpRead, p)
+		if !allowed {
+			t.Errorf("owner batch path %q: allowed=false, want true (status=%d msg=%q)", p, status, msg)
+		}
+	}
+}
+
+// TestHandlersRejectScopedRequestBeforeBackend is a smoke test for the C1
+// wiring chain: when a scoped token whose FSScopes don't cover the request
+// path enters one of the 7 read-side handlers, the handler must call
+// authorizeFS first and return 403 BEFORE touching the backend. We exercise
+// this by injecting a TenantScope into the request context with NO backend
+// — if any handler tries backendFromRequest before authorize it'll return
+// 401 ("missing tenant scope") instead of the expected 403. So this test
+// also asserts ordering, not just outcome.
+func TestHandlersRejectScopedRequestBeforeBackend(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{
+			Prefix: "/scratch/run-1",
+			Ops:    map[FSOp]bool{FSOpRead: true, FSOpList: true, FSOpSearch: true},
+		}},
+	}
+
+	cases := []struct {
+		name string
+		op   FSOp
+		invoke func(s *Server, w http.ResponseWriter, r *http.Request)
+	}{
+		{"handleRead", FSOpRead, func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.handleRead(w, r, "/main/secrets.env")
+		}},
+		{"handleList", FSOpList, func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.handleList(w, r, "/main/")
+		}},
+		{"handleStat", FSOpRead, func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.handleStat(w, r, "/main/secrets.env")
+		}},
+		{"handleStatMetadata", FSOpRead, func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.handleStatMetadata(w, r, "/main/secrets.env")
+		}},
+		{"handleGrep", FSOpSearch, func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.handleGrep(w, r, "/main/")
+		}},
+		{"handleFind", FSOpSearch, func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.handleFind(w, r, "/main/")
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newScopedRequest(t, http.MethodGet, "/v1/fs/main/secrets.env", "")
+			r = r.WithContext(withScope(r.Context(), scope))
+			w := httptest.NewRecorder()
+			tc.invoke(&Server{}, w, r)
+
+			// Out-of-zone scoped request: handler MUST short-circuit at
+			// authorizeFS with 403 — not reach backendFromRequest (would
+			// give 401) or run actual backend work.
+			if got := w.Result().StatusCode; got != http.StatusForbidden {
+				t.Errorf("%s out-of-zone status = %d, want %d (403). Got body: %s",
+					tc.name, got, http.StatusForbidden, w.Body.String())
+			}
+		})
 	}
 }
 

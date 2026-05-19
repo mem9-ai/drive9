@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/mem9-ai/dat9/pkg/meta"
@@ -137,5 +138,70 @@ func isKnownFSOp(op FSOp) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// writeFSAuthzError maps a workspace-zone authorization error to the canonical
+// HTTP error response shape used elsewhere in pkg/server. ErrFSAccessDenied
+// becomes 403; ErrFSInvalidPath becomes 400 because the path itself is the
+// problem (escapes the workspace, contains forbidden characters, etc.) and the
+// caller cannot recover by changing credentials. Any other error is wrapped
+// generically as 500 — that path is only hit when scope state itself is
+// malformed, which is server-side state, not a client mistake.
+func writeFSAuthzError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrFSAccessDenied):
+		errJSON(w, http.StatusForbidden, "fs access denied")
+	case errors.Is(err, ErrFSInvalidPath):
+		errJSON(w, http.StatusBadRequest, "invalid fs path")
+	default:
+		errJSON(w, http.StatusInternalServerError, "fs authorization failed")
+	}
+}
+
+// authorizeFS is a thin wrapper that lets handlers do
+//
+//	if !authorizeFS(w, r, FSOpRead, path) { return }
+//
+// instead of repeating the scope-extract + writeFSAuthzError boilerplate at
+// every call site. Returns true iff the request may proceed; on false the
+// response has already been written.
+func authorizeFS(w http.ResponseWriter, r *http.Request, op FSOp, rawPath string) bool {
+	scope := ScopeFromContext(r.Context())
+	if scope == nil {
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return false
+	}
+	if err := scope.AuthorizeFS(op, rawPath); err != nil {
+		writeFSAuthzError(w, err)
+		return false
+	}
+	return true
+}
+
+// authorizeFSPathForBatch is the per-path variant for batch endpoints
+// (batch-stat / batch-read-small). It returns the HTTP status + error string
+// to embed in the per-path result so callers can short-circuit a single
+// element without rejecting the entire batch. Returns (0, "", true) on
+// allow; otherwise the returned status/message describes the denial.
+//
+// Per-path is critical here: a 256-path batch with one out-of-zone entry
+// must NOT 403 the whole call — that would break preflight workflows
+// (recursive cp, FUSE readdir prefetch) where one denied path is normal.
+func authorizeFSPathForBatch(scope *TenantScope, op FSOp, rawPath string) (status int, message string, allowed bool) {
+	if scope == nil {
+		return http.StatusUnauthorized, "missing tenant scope", false
+	}
+	err := scope.AuthorizeFS(op, rawPath)
+	if err == nil {
+		return 0, "", true
+	}
+	switch {
+	case errors.Is(err, ErrFSAccessDenied):
+		return http.StatusForbidden, "fs access denied", false
+	case errors.Is(err, ErrFSInvalidPath):
+		return http.StatusBadRequest, "invalid fs path", false
+	default:
+		return http.StatusInternalServerError, "fs authorization failed", false
 	}
 }
