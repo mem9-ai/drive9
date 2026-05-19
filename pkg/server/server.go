@@ -480,30 +480,95 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 
 	// Uploads (V1 + V2): admitted in PR C2b now that every upload handler
 	// authorizes its target path on initiate AND re-authorizes session
-	// target path on continuation (resume/complete/abort/presign).
-	if path == "/v1/uploads" || path == "/v1/uploads/initiate" {
-		// V1: POST creates a session (handleUploadInitiate body has path,
-		// authorized there); GET lists uploads at a path (authorized via
-		// list op on the path arg).
-		return r.Method == http.MethodPost || r.Method == http.MethodGet
-	}
-	if strings.HasPrefix(path, "/v1/uploads/") {
-		// V1 session actions: POST .../complete, GET|POST .../resume,
-		// DELETE .../{uploadID}. Each handler re-reads session target path
-		// and re-authorizes against current scope.
-		return r.Method == http.MethodPost ||
-			r.Method == http.MethodGet ||
-			r.Method == http.MethodDelete
+	// target path on continuation. Per @adversary-1 review msg 09266f14:
+	// the whitelist must be **action-aware**, mirroring the actual
+	// downstream dispatch table (handleUploads / handleUploadAction /
+	// handleV2Uploads) — release-order safety, same shape as the C1 GET
+	// allowlist. Method+path mismatches and unknown actions must be
+	// denied here so future routes don't silently inherit the family
+	// prefix.
+	if strings.HasPrefix(path, "/v1/uploads") {
+		return isScopedV1UploadRouteAllowed(r.Method, path)
 	}
 	if strings.HasPrefix(path, "/v2/uploads/") {
-		// V2 session actions: POST /v2/uploads/initiate,
-		// POST .../presign, POST .../presign-batch, POST .../complete,
-		// POST .../abort. All POST.
-		return r.Method == http.MethodPost
+		return isScopedV2UploadRouteAllowed(r.Method, path)
 	}
 
 	// SQL, fork, events, journals, vault, status, etc.: still default-deny.
 	return false
+}
+
+// isScopedV1UploadRouteAllowed mirrors handleUploads (server.go ~1872) and
+// handleUploadAction (server.go ~2034) exactly: each row below corresponds
+// to one wired handler with its own re-authorize-session-target-path call.
+// Any method/path/action combination not in this list is denied.
+func isScopedV1UploadRouteAllowed(method, path string) bool {
+	// Family root and explicit initiate endpoint.
+	if path == "/v1/uploads" {
+		// POST → handleUploadInitiate (body.path authorized)
+		// GET  → handleUploads list (path query arg authorized as list)
+		return method == http.MethodPost || method == http.MethodGet
+	}
+	if path == "/v1/uploads/initiate" {
+		// Same handler as POST /v1/uploads.
+		return method == http.MethodPost
+	}
+	// Per-upload action endpoints: /v1/uploads/<id>[/action]
+	rest := strings.TrimPrefix(path, "/v1/uploads/")
+	if rest == "" {
+		return false
+	}
+	parts := strings.SplitN(rest, "/", 2)
+	uploadID := parts[0]
+	if uploadID == "" {
+		return false
+	}
+	action := ""
+	if len(parts) > 1 {
+		action = strings.Trim(parts[1], "/")
+	}
+	switch {
+	case method == http.MethodPost && strings.HasPrefix(action, "complete"):
+		return true
+	case (method == http.MethodPost || method == http.MethodGet) && strings.HasPrefix(action, "resume"):
+		return true
+	case method == http.MethodDelete && action == "":
+		return true
+	default:
+		return false
+	}
+}
+
+// isScopedV2UploadRouteAllowed mirrors handleV2Uploads (server.go ~2338)
+// exactly: only the 5 known V2 POST actions are admitted.
+func isScopedV2UploadRouteAllowed(method, path string) bool {
+	if method != http.MethodPost {
+		return false
+	}
+	rest := strings.TrimPrefix(path, "/v2/uploads/")
+	if rest == "" {
+		return false
+	}
+	parts := strings.SplitN(rest, "/", 2)
+	seg0 := parts[0]
+	action := ""
+	if len(parts) > 1 {
+		action = strings.Trim(parts[1], "/")
+	}
+	if seg0 == "" {
+		return false
+	}
+	// /v2/uploads/initiate (no upload_id segment) is its own route.
+	if seg0 == "initiate" && action == "" {
+		return true
+	}
+	// Per-upload action: seg0 = upload_id, action = one of the known V2 actions.
+	switch action {
+	case "presign", "presign-batch", "complete", "abort":
+		return true
+	default:
+		return false
+	}
 }
 
 // isScopedFSPostQueryAllowed mirrors handleFS's POST dispatcher (server.go

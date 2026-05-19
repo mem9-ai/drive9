@@ -743,10 +743,12 @@ func TestC2bHandleV2UploadInitiateAuthorizesTargetPath(t *testing.T) {
 	}
 }
 
-// TestC2bUploadsAdmittedAtDispatcher pins the C2b boundary: uploads are
-// now allowed at the dispatcher for scoped tokens (after C2b wired
-// handlers + session re-authorize). The handlers themselves authorize
-// initiate target paths and re-authorize continuation session paths.
+// TestC2bUploadsAdmittedAtDispatcher pins the C2b allowlist: scoped tokens
+// can reach the exact set of upload routes that are wired with handler-
+// side authorization. Anything outside this list (wrong method, unknown
+// action, future routes) is denied at the dispatcher — release-order
+// safety per @adversary-1 msg 09266f14, same pattern as the C1 GET
+// action-arm allowlist.
 func TestC2bUploadsAdmittedAtDispatcher(t *testing.T) {
 	allowed := []struct {
 		method string
@@ -769,6 +771,54 @@ func TestC2bUploadsAdmittedAtDispatcher(t *testing.T) {
 		r := newScopedRequest(t, tc.method, tc.path, "")
 		if !isScopedBusinessRequestAllowed(r) {
 			t.Errorf("%s %s = denied at dispatcher; should be allowed (handler authorizes per-request)", tc.method, tc.path)
+		}
+	}
+}
+
+// TestC2bUploadsDeniedRouteMethodMismatches verifies release-order safety
+// per @adversary-1 msg 09266f14: scoped tokens must not enter upload
+// routes that are NOT in the wired-handler set. This includes method/
+// path mismatches (e.g. GET /v1/uploads/initiate which downstream
+// handleUploads doesn't route), unknown V1 actions (`/foo`), unknown V2
+// actions (`/upload-1/garbage`), and any wrong-method combination.
+func TestC2bUploadsDeniedRouteMethodMismatches(t *testing.T) {
+	cases := []struct {
+		method string
+		path   string
+		why    string
+	}{
+		// V1 wrong methods on family roots.
+		{http.MethodPut, "/v1/uploads", "PUT on /v1/uploads — no handler routes this"},
+		{http.MethodDelete, "/v1/uploads", "DELETE on /v1/uploads — no handler"},
+		{http.MethodPatch, "/v1/uploads", "PATCH on /v1/uploads — no handler"},
+		// V1 initiate-action wrong methods.
+		{http.MethodGet, "/v1/uploads/initiate", "GET on initiate — handleUploads only does GET on /v1/uploads (list), not /initiate"},
+		{http.MethodDelete, "/v1/uploads/initiate", "DELETE on initiate — no handler"},
+		// V1 per-upload unknown actions.
+		{http.MethodPost, "/v1/uploads/upload-1/garbage", "unknown action /garbage — handleUploadAction routes only complete/resume"},
+		{http.MethodPost, "/v1/uploads/upload-1/cancel", "unknown action /cancel"},
+		{http.MethodGet, "/v1/uploads/upload-1/complete", "GET on /complete — handleUploadAction routes POST only"},
+		{http.MethodPut, "/v1/uploads/upload-1", "PUT on /uploads/<id> — handleUploadAction routes DELETE only"},
+		{http.MethodPost, "/v1/uploads/upload-1", "bare POST on /uploads/<id> with no action — handleUploadAction routes DELETE only (POST needs an action suffix)"},
+		// V1 missing upload_id.
+		{http.MethodDelete, "/v1/uploads/", "no upload_id in path"},
+		// V2 wrong methods.
+		{http.MethodGet, "/v2/uploads/initiate", "GET on V2 initiate — no handler"},
+		{http.MethodDelete, "/v2/uploads/upload-1/abort", "DELETE on V2 abort — handleV2Uploads routes POST only"},
+		// V2 unknown actions.
+		{http.MethodPost, "/v2/uploads/upload-1/garbage", "unknown V2 action — handleV2Uploads routes 5 known actions"},
+		{http.MethodPost, "/v2/uploads/upload-1/resume", "V2 has no resume action — only V1 does"},
+		{http.MethodPost, "/v2/uploads/upload-1", "bare /<id> with no action — V2 always requires an action"},
+		// V2 missing upload_id.
+		{http.MethodPost, "/v2/uploads/", "no upload_id in V2 path"},
+		// Future routes (no handler yet).
+		{http.MethodPost, "/v1/uploads/extras", "unknown family-root sibling"},
+		{http.MethodPost, "/v3/uploads/something", "future V3 family"},
+	}
+	for _, tc := range cases {
+		r := newScopedRequest(t, tc.method, tc.path, "")
+		if isScopedBusinessRequestAllowed(r) {
+			t.Errorf("%s %s = allowed at dispatcher; want denied (%s)", tc.method, tc.path, tc.why)
 		}
 	}
 }
