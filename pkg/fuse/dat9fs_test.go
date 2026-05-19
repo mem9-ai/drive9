@@ -2675,6 +2675,20 @@ func TestMountOptionsLookupRetryDefaultsAndDisableSentinel(t *testing.T) {
 	}
 }
 
+func TestMountOptionsReadConcurrencyDefaults(t *testing.T) {
+	defaults := &MountOptions{}
+	defaults.setDefaults()
+	if defaults.ReadConcurrency != defaultRemoteReadConcurrency {
+		t.Fatalf("default ReadConcurrency = %d, want %d", defaults.ReadConcurrency, defaultRemoteReadConcurrency)
+	}
+
+	explicit := &MountOptions{ReadConcurrency: 7}
+	explicit.setDefaults()
+	if explicit.ReadConcurrency != 7 {
+		t.Fatalf("explicit ReadConcurrency = %d, want 7", explicit.ReadConcurrency)
+	}
+}
+
 func TestLookupReturnsTTLInEntryOut(t *testing.T) {
 	fs, _, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(make([]byte, 42))
@@ -6398,6 +6412,165 @@ func TestReadSmallFileRetryExhaustedReturnsEIO(t *testing.T) {
 	wantCalls := int32(1 + readTransientRetryCount)
 	if got := getCalls.Load(); got != wantCalls {
 		t.Fatalf("GET calls = %d, want %d", got, wantCalls)
+	}
+}
+
+func TestRemoteReadLimiterCapsConcurrentRangeReads(t *testing.T) {
+	const (
+		readLimit = 2
+		totalRead = 5
+		chunkSize = 4096
+	)
+	var inflight atomic.Int32
+	var maxInflight atomic.Int32
+	started := make(chan struct{}, totalRead)
+	ready := make(chan struct{}, totalRead)
+	startReads := make(chan struct{})
+	releaseServerReads := make(chan struct{})
+	var releaseServerReadsOnce sync.Once
+	releaseAllServerReads := func() {
+		releaseServerReadsOnce.Do(func() { close(releaseServerReads) })
+	}
+	t.Cleanup(releaseAllServerReads)
+	response := bytes.Repeat([]byte("x"), chunkSize)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs/large.bin" {
+			http.NotFound(w, r)
+			return
+		}
+		cur := inflight.Add(1)
+		defer inflight.Add(-1)
+		for {
+			max := maxInflight.Load()
+			if cur <= max || maxInflight.CompareAndSwap(max, cur) {
+				break
+			}
+		}
+		started <- struct{}{}
+		<-releaseServerReads
+		w.Header().Set("Content-Length", strconv.Itoa(len(response)))
+		_, _ = w.Write(response)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{ReadConcurrency: readLimit}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	wb := fs.newWriteBuffer("/large.bin", streamingWriteMaxSize, chunkSize)
+	wb.totalSize = int64(totalRead * chunkSize)
+	wb.remoteSize = wb.totalSize
+	fhID := fs.fileHandles.Allocate(&FileHandle{
+		Path:  "/large.bin",
+		Dirty: wb, // skip read-target resolution; exercise the remote range read path only.
+	})
+
+	var wg sync.WaitGroup
+	errs := make(chan string, totalRead)
+	for i := range totalRead {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ready <- struct{}{}
+			<-startReads
+			_, st := fs.Read(nil, &gofuse.ReadIn{
+				Fh:     fhID,
+				Offset: uint64(i * chunkSize),
+				Size:   chunkSize,
+			}, nil)
+			if st != gofuse.OK {
+				errs <- fmt.Sprintf("read %d status = %v, want OK", i, st)
+			}
+		}(i)
+	}
+
+	for i := 0; i < totalRead; i++ {
+		select {
+		case <-ready:
+		case <-time.After(time.Second):
+			t.Fatalf("only %d read goroutines started, want %d", i, totalRead)
+		}
+	}
+	close(startReads)
+
+	for i := 0; i < readLimit; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("only %d remote reads reached server, want %d", i, readLimit)
+		}
+	}
+	select {
+	case <-started:
+		t.Fatal("third remote read reached server before a read slot was released")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseAllServerReads()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if got := maxInflight.Load(); got > readLimit {
+		t.Fatalf("max remote reads in flight = %d, want <= %d", got, readLimit)
+	}
+}
+
+func TestRemoteReadLimiterAcquireHonorsCancellationAndReleases(t *testing.T) {
+	opts := &MountOptions{ReadConcurrency: 1}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://127.0.0.1", ""), opts)
+
+	release, err := fs.acquireRemoteReadSlot(context.Background())
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := fs.acquireRemoteReadSlot(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled acquire err = %v, want context.Canceled", err)
+	}
+
+	release()
+	releaseAgain, err := fs.acquireRemoteReadSlot(context.Background())
+	if err != nil {
+		t.Fatalf("acquire after release: %v", err)
+	}
+	releaseAgain()
+}
+
+func TestRemoteReadLimiterDoesNotGateWrite(t *testing.T) {
+	opts := &MountOptions{ReadConcurrency: 1}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New("http://127.0.0.1", ""), opts)
+
+	release, err := fs.acquireRemoteReadSlot(context.Background())
+	if err != nil {
+		t.Fatalf("acquire read slot: %v", err)
+	}
+	defer release()
+
+	ino := fs.inodes.Lookup("/out.txt", false, 0, time.Now())
+	fhID := fs.fileHandles.Allocate(&FileHandle{
+		Ino:   ino,
+		Path:  "/out.txt",
+		Dirty: fs.newWriteBuffer("/out.txt", maxPreloadSize, 0),
+	})
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{Fh: fhID, Offset: 0}, []byte("ok"))
+		done <- st
+	}()
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write blocked behind the remote read limiter")
 	}
 }
 

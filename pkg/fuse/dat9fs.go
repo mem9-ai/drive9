@@ -35,6 +35,7 @@ type Dat9FS struct {
 	dirHandles  *HandleTable[*DirHandle]
 	readCache   *ReadCache
 	dirCache    *DirCache
+	readSlots   chan struct{}
 	dirtyMu     sync.Mutex
 	dirtyInodes map[uint64]dirtyInodeState
 	dirtySeq    uint64
@@ -176,6 +177,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		dirHandles:    NewHandleTable[*DirHandle](),
 		readCache:     NewReadCacheWithMaxFileSize(opts.CacheSize, 0, opts.ReadCacheMaxFileBytes),
 		dirCache:      NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
+		readSlots:     make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
 		dirtyInodes:   make(map[uint64]dirtyInodeState),
 		uid:           uint32(os.Getuid()),
 		gid:           uint32(os.Getgid()),
@@ -236,7 +238,33 @@ const (
 	// readTransientRetryTimeout keeps each detached read retry bounded.
 	// Each retry reads at most max_read (1 MiB), so 2s is generous.
 	readTransientRetryTimeout = 2 * time.Second
+
+	// defaultRemoteReadConcurrency leaves headroom under MountOptions'
+	// MaxBackground=32 for writes/flushes while heavy read workloads are active.
+	defaultRemoteReadConcurrency = 24
 )
+
+func readConcurrencyOrDefault(n int) int {
+	if n <= 0 {
+		return defaultRemoteReadConcurrency
+	}
+	return n
+}
+
+func (fs *Dat9FS) acquireRemoteReadSlot(ctx context.Context) (func(), error) {
+	if fs == nil || fs.readSlots == nil {
+		return func() {}, nil
+	}
+	select {
+	case fs.readSlots <- struct{}{}:
+		var once sync.Once
+		return func() {
+			once.Do(func() { <-fs.readSlots })
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 // releaseTimeout computes a generous timeout for synchronous uploads in
 // Release / FlushAll based on file size. The formula is:
@@ -529,6 +557,11 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 
 		lpCtx, lpCf := context.WithTimeout(context.Background(), fuseTimeout)
 		defer lpCf()
+		releaseReadSlot, err := fs.acquireRemoteReadSlot(lpCtx)
+		if err != nil {
+			return nil, err
+		}
+		defer releaseReadSlot()
 
 		loadStart := time.Now()
 		fs.debugf("dirty load part start path=%s part=%d off=%d len=%d", filePath, partNum, offset, length)
@@ -3451,7 +3484,14 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		// Cache miss: read the file and store it. No separate Stat needed —
 		// ReadCtx fetches the data in one round-trip. Uses detached retry
 		// so a single FUSE interrupt doesn't permanently return EAGAIN.
-		data, err := fs.readSmallFileWithRetry(ctx, p)
+		data, err := func() ([]byte, error) {
+			releaseReadSlot, err := fs.acquireRemoteReadSlot(ctx)
+			if err != nil {
+				return nil, err
+			}
+			defer releaseReadSlot()
+			return fs.readSmallFileWithRetry(ctx, p)
+		}()
 		if err != nil {
 			source = "small-read-error"
 			if errors.Is(err, errReadRetriesExhausted) {
@@ -3483,7 +3523,14 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		source = "range-read"
 	}
 	rangeStart := time.Now()
-	data, n, err := fs.readStreamRangeWithRetry(ctx, p, fh, int64(input.Offset), int64(input.Size))
+	data, n, err := func() ([]byte, int, error) {
+		releaseReadSlot, err := fs.acquireRemoteReadSlot(ctx)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer releaseReadSlot()
+		return fs.readStreamRangeWithRetry(ctx, p, fh, int64(input.Offset), int64(input.Size))
+	}()
 	if err != nil {
 		fs.debugf("read range error path=%s off=%d req=%d got=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, n, source, time.Since(rangeStart), err)
 		if errors.Is(err, errReadRetriesExhausted) {

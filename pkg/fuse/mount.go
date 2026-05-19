@@ -46,6 +46,7 @@ type MountOptions struct {
 	WritePolicy           WritePolicy   // writeback, close-sync, or write-sync (default writeback)
 	Profile               string        // mount profile: "interactive", "" (default)
 	UploadConcurrency     int           // number of background upload workers (default 4)
+	ReadConcurrency       int           // maximum concurrent remote reads (default 24)
 	LookupRetryCount      int           // detached retries after transient Lookup/GetAttr stat failures (default 2)
 	LookupRetryTimeout    time.Duration // timeout per detached stat retry after interrupt/transient errors (default 250ms)
 	LegacyDirStatFallback bool          // on Lookup stat 404, list parent to support legacy servers without directory stat
@@ -90,6 +91,9 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.UploadConcurrency <= 0 {
 		o.UploadConcurrency = 4
+	}
+	if o.ReadConcurrency <= 0 {
+		o.ReadConcurrency = defaultRemoteReadConcurrency
 	}
 	if o.LookupRetryCount < 0 {
 		// Negative values are CLI-internal sentinels meaning retries were

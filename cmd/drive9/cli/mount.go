@@ -22,6 +22,7 @@ import (
 const (
 	defaultFuseLookupRetryCount   = 3
 	defaultFuseLookupRetryTimeout = 2 * time.Second
+	defaultFuseReadConcurrency    = 24
 )
 
 var (
@@ -91,6 +92,7 @@ func fsMountCmd(args []string) error {
 	flushDebounce := fs.Duration("flush-debounce", -1, "debounce window for small-file flush coalescing (default 2s, 0 disables)")
 	lookupRetryCount := fs.Int("lookup-retry-count", defaultFuseLookupRetryCount, "detached retries after transient Lookup/GetAttr stat failures (set 0 to disable)")
 	lookupRetryTimeout := fs.Duration("lookup-retry-timeout", defaultFuseLookupRetryTimeout, "timeout per detached Lookup/GetAttr stat retry (must be > 0 when set)")
+	readConcurrency := fs.Int("read-concurrency", defaultFuseReadConcurrency, "maximum concurrent remote FUSE reads")
 	legacyDirStatFallback := fs.Bool("legacy-dir-stat-fallback", false, "on Lookup stat 404, list parent to support legacy servers without directory stat")
 	readDirPrefetch := fs.Bool("readdir-prefetch", false, "prefetch small files after directory reads into the read cache")
 	prefetchMaxFiles := fs.Int("readdir-prefetch-max-files", 32, "maximum small files prefetched per directory read")
@@ -149,6 +151,9 @@ func fsMountCmd(args []string) error {
 	lookupRetryTimeoutGiven := flagProvided(fs, "lookup-retry-timeout")
 	if err := validateLookupRetryFlags(*lookupRetryCount, *lookupRetryTimeout, lookupRetryCountGiven, lookupRetryTimeoutGiven); err != nil {
 		return err
+	}
+	if *readConcurrency <= 0 {
+		return fmt.Errorf("drive9 mount: --read-concurrency must be > 0")
 	}
 	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
 		return err
@@ -245,6 +250,7 @@ func fsMountCmd(args []string) error {
 		SyncMode:              syncModeVal,
 		WritePolicy:           writePolicyVal,
 		Profile:               *profile,
+		ReadConcurrency:       *readConcurrency,
 		AllowOther:            *allowOther,
 		ReadOnly:              *readOnly,
 		Debug:                 *debug,
