@@ -3,7 +3,9 @@ package meta
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -14,6 +16,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/mysqlutil"
+	"github.com/mem9-ai/dat9/pkg/pathutil"
 	"go.uber.org/zap"
 )
 
@@ -47,6 +50,13 @@ type APIKeyStatus string
 const (
 	APIKeyActive  APIKeyStatus = "active"
 	APIKeyRevoked APIKeyStatus = "revoked"
+)
+
+type APIKeyScopeKind string
+
+const (
+	APIKeyScopeKindOwner APIKeyScopeKind = "owner"
+	APIKeyScopeKindFS    APIKeyScopeKind = "fs_scoped"
 )
 
 type Tenant struct {
@@ -133,10 +143,21 @@ type APIKey struct {
 	JWTHash       string
 	TokenVersion  int
 	Status        APIKeyStatus
+	ScopeKind     APIKeyScopeKind
 	IssuedAt      time.Time
 	RevokedAt     *time.Time
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+}
+
+type APIKeyFSScope struct {
+	TenantID   string
+	APIKeyID   string
+	Prefix     string
+	PrefixHash string
+	Ops        string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 type TenantWithAPIKey struct {
@@ -381,6 +402,7 @@ func metaInitSchemaStatements() []string {
 			jwt_hash       VARCHAR(128) NOT NULL,
 			token_version  INT NOT NULL DEFAULT 1,
 			status         VARCHAR(20) NOT NULL DEFAULT 'active',
+			scope_kind     VARCHAR(32) NOT NULL DEFAULT 'owner',
 			issued_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			revoked_at     DATETIME(3) NULL,
 			created_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -388,6 +410,18 @@ func metaInitSchemaStatements() []string {
 			UNIQUE INDEX idx_api_keys_hash (jwt_hash),
 			INDEX idx_api_keys_tenant (tenant_id, status),
 			UNIQUE INDEX idx_api_keys_tenant_name (tenant_id, key_name)
+		)`,
+		`CREATE TABLE IF NOT EXISTS tenant_api_key_fs_scopes (
+			tenant_id   VARCHAR(64) NOT NULL,
+			api_key_id  VARCHAR(64) NOT NULL,
+			prefix      TEXT NOT NULL,
+			prefix_hash VARCHAR(64) NOT NULL,
+			ops         VARCHAR(255) NOT NULL,
+			created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (tenant_id, api_key_id, prefix_hash),
+			INDEX idx_fs_scopes_api_key (api_key_id),
+			INDEX idx_fs_scopes_tenant_key (tenant_id, api_key_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS llm_usage (
 			id              BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -933,10 +967,14 @@ func (s *Store) InsertTenant(ctx context.Context, t *Tenant) (err error) {
 func (s *Store) InsertAPIKey(ctx context.Context, k *APIKey) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "insert_api_key", start, &err)
+	scopeKind, err := apiKeyScopeKindForInsert(k)
+	if err != nil {
+		return err
+	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_api_keys
-		(id, tenant_id, key_name, jwt_ciphertext, jwt_hash, token_version, status, issued_at, revoked_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		k.ID, k.TenantID, k.KeyName, k.JWTCiphertext, k.JWTHash, k.TokenVersion, k.Status,
+		(id, tenant_id, key_name, jwt_ciphertext, jwt_hash, token_version, status, scope_kind, issued_at, revoked_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		k.ID, k.TenantID, k.KeyName, k.JWTCiphertext, k.JWTHash, k.TokenVersion, k.Status, scopeKind,
 		k.IssuedAt.UTC(), k.RevokedAt, k.CreatedAt.UTC(), k.UpdatedAt.UTC())
 	if isDuplicateEntry(err) {
 		return ErrDuplicate
@@ -952,7 +990,7 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name, t.db_tls,
 			t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
 			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
-			k.id, k.tenant_id, k.key_name, k.jwt_ciphertext, k.jwt_hash, k.token_version, k.status, k.issued_at,
+			k.id, k.tenant_id, k.key_name, k.jwt_ciphertext, k.jwt_hash, k.token_version, k.status, k.scope_kind, k.issued_at,
 			k.revoked_at, k.created_at, k.updated_at
 		FROM tenant_api_keys k
 		JOIN tenants t ON t.id = k.tenant_id
@@ -974,7 +1012,7 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 		&rec.Tenant.BranchID, &claimURL, &claimExp, &rec.Tenant.SchemaVersion, &rec.Tenant.S3EncryptionMode,
 		&rec.Tenant.S3KMSKeyID, &s3BucketKeyEnabled, &rec.Tenant.CreatedAt, &rec.Tenant.UpdatedAt,
 		&rec.APIKey.ID, &rec.APIKey.TenantID, &rec.APIKey.KeyName, &rec.APIKey.JWTCiphertext,
-		&rec.APIKey.JWTHash, &rec.APIKey.TokenVersion, &rec.APIKey.Status, &rec.APIKey.IssuedAt,
+		&rec.APIKey.JWTHash, &rec.APIKey.TokenVersion, &rec.APIKey.Status, &rec.APIKey.ScopeKind, &rec.APIKey.IssuedAt,
 		&revokedAt, &rec.APIKey.CreatedAt, &rec.APIKey.UpdatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1007,6 +1045,128 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 	}
 	out = &rec
 	return out, nil
+}
+
+func (s *Store) InsertAPIKeyFSScope(ctx context.Context, scope *APIKeyFSScope) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "insert_api_key_fs_scope", start, &err)
+	if scope == nil {
+		return fmt.Errorf("fs scope is required")
+	}
+	prefix, err := canonicalFSScopePrefix(scope.Prefix)
+	if err != nil {
+		return err
+	}
+	if err := validateFSScopeOps(scope.Ops); err != nil {
+		return err
+	}
+	if strings.TrimSpace(prefix) == "" {
+		return fmt.Errorf("fs scope prefix is required")
+	}
+	prefixHash := fsScopePrefixHash(prefix)
+	createdAt := scope.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	updatedAt := scope.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = createdAt
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_api_key_fs_scopes
+		(tenant_id, api_key_id, prefix, prefix_hash, ops, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		scope.TenantID, scope.APIKeyID, prefix, prefixHash, scope.Ops,
+		createdAt.UTC(), updatedAt.UTC())
+	if isDuplicateEntry(err) {
+		return ErrDuplicate
+	}
+	return err
+}
+
+func (s *Store) ListAPIKeyFSScopes(ctx context.Context, tenantID, apiKeyID string) (out []APIKeyFSScope, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_api_key_fs_scopes", start, &err)
+	rows, err := s.db.QueryContext(ctx, `SELECT tenant_id, api_key_id, prefix, prefix_hash, ops, created_at, updated_at
+		FROM tenant_api_key_fs_scopes
+		WHERE tenant_id = ? AND api_key_id = ?
+		ORDER BY prefix`, tenantID, apiKeyID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var scope APIKeyFSScope
+		if err := rows.Scan(&scope.TenantID, &scope.APIKeyID, &scope.Prefix, &scope.PrefixHash, &scope.Ops, &scope.CreatedAt, &scope.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, scope)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func apiKeyScopeKindForInsert(k *APIKey) (APIKeyScopeKind, error) {
+	if k == nil || k.ScopeKind == "" {
+		return APIKeyScopeKindOwner, nil
+	}
+	if !isValidAPIKeyScopeKind(k.ScopeKind) {
+		return "", fmt.Errorf("unsupported api key scope kind %q", k.ScopeKind)
+	}
+	return k.ScopeKind, nil
+}
+
+func isValidAPIKeyScopeKind(kind APIKeyScopeKind) bool {
+	switch kind {
+	case APIKeyScopeKindOwner, APIKeyScopeKindFS:
+		return true
+	default:
+		return false
+	}
+}
+
+func canonicalFSScopePrefix(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return "", fmt.Errorf("fs scope prefix is required")
+	}
+	if strings.TrimSpace(raw) == ":" {
+		return "", fmt.Errorf("fs scope prefix is required")
+	}
+	raw = strings.TrimPrefix(raw, ":")
+	prefix, err := pathutil.Canonicalize(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid fs scope prefix: %w", err)
+	}
+	return prefix, nil
+}
+
+func validateFSScopeOps(raw string) error {
+	ops := make(map[string]bool)
+	for _, part := range strings.Split(raw, ",") {
+		op := strings.TrimSpace(part)
+		if op == "" {
+			continue
+		}
+		switch op {
+		case "read", "list", "search", "write", "delete":
+			ops[op] = true
+		default:
+			return fmt.Errorf("unknown fs scope op %q", op)
+		}
+	}
+	if len(ops) == 0 {
+		return fmt.Errorf("empty fs scope ops")
+	}
+	if ops["search"] && !ops["read"] {
+		return fmt.Errorf("search fs scope requires read")
+	}
+	return nil
+}
+
+func fsScopePrefixHash(prefix string) string {
+	sum := sha256.Sum256([]byte(prefix))
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Store) GetTenant(ctx context.Context, id string) (out *Tenant, err error) {

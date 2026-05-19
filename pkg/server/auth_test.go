@@ -41,6 +41,7 @@ func newAuthRuntime(t *testing.T) (*authTestRuntime, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_key_fs_scopes")
 	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
 	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
 
@@ -121,6 +122,7 @@ func newAuthRuntime(t *testing.T) (*authTestRuntime, func()) {
 	}
 	cleanup := func() {
 		pool.Close()
+		_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_key_fs_scopes")
 		_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
 		_, _ = metaStore.DB().Exec("DELETE FROM tenants")
 		_ = metaStore.Close()
@@ -155,6 +157,44 @@ func replaceAuthRuntimeToken(t *testing.T, rt *authTestRuntime, tok string) {
 	if n != 1 {
 		t.Fatalf("updated %d api keys, want 1", n)
 	}
+}
+
+func setAuthRuntimeScopeKind(t *testing.T, rt *authTestRuntime, kind meta.APIKeyScopeKind) meta.APIKey {
+	t.Helper()
+	ctx := context.Background()
+	res, err := rt.meta.DB().ExecContext(ctx, `UPDATE tenant_api_keys
+		SET scope_kind = ?, updated_at = ?
+		WHERE tenant_id = ?`, kind, time.Now().UTC(), rt.tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("updated %d api keys, want 1", n)
+	}
+	resolved, err := rt.meta.ResolveByAPIKeyHash(ctx, token.HashToken(rt.token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved.APIKey
+}
+
+type recordingFSScopeLoader struct {
+	calls    int
+	tenantID string
+	apiKeyID string
+	rows     []meta.APIKeyFSScope
+	err      error
+}
+
+func (l *recordingFSScopeLoader) ListAPIKeyFSScopes(ctx context.Context, tenantID, apiKeyID string) ([]meta.APIKeyFSScope, error) {
+	l.calls++
+	l.tenantID = tenantID
+	l.apiKeyID = apiKeyID
+	return l.rows, l.err
 }
 
 func mustTempDir(t *testing.T) string {
@@ -259,6 +299,97 @@ func TestAuthLegacyTokenKeepsOwnerJournalPermissions(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAuthOwnerKeyDoesNotLoadFSScopes(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+	loader := &recordingFSScopeLoader{}
+
+	h := tenantAuthMiddlewareWithFSScopeLoader(rt.meta, rt.pool, rt.tokenSecret, loader, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scope := ScopeFromContext(r.Context())
+		if scope == nil {
+			http.Error(w, "missing scope", http.StatusInternalServerError)
+			return
+		}
+		if scope.IsScoped {
+			http.Error(w, "owner key should not be scoped", http.StatusInternalServerError)
+			return
+		}
+		if len(scope.FSScopes) != 0 {
+			http.Error(w, "owner key should not carry fs scopes", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/owner", nil)
+	req.Header.Set("Authorization", "Bearer "+rt.token)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if loader.calls != 0 {
+		t.Fatalf("FS scope loader calls = %d, want 0", loader.calls)
+	}
+}
+
+func TestAuthScopedKeyLoadsFSScopes(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+	key := setAuthRuntimeScopeKind(t, rt, meta.APIKeyScopeKindFS)
+	loader := &recordingFSScopeLoader{rows: []meta.APIKeyFSScope{{
+		TenantID: rt.tenantID,
+		APIKeyID: key.ID,
+		Prefix:   "/scratch/run-1/",
+		Ops:      "read,list",
+	}}}
+
+	h := tenantAuthMiddlewareWithFSScopeLoader(rt.meta, rt.pool, rt.tokenSecret, loader, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scope := ScopeFromContext(r.Context())
+		if scope == nil {
+			http.Error(w, "missing scope", http.StatusInternalServerError)
+			return
+		}
+		if !scope.IsScoped {
+			http.Error(w, "scoped key was not marked scoped", http.StatusInternalServerError)
+			return
+		}
+		if len(scope.FSScopes) != 1 || scope.FSScopes[0].Prefix != "/scratch/run-1" || !scope.FSScopes[0].Ops[FSOpRead] || !scope.FSScopes[0].Ops[FSOpList] {
+			http.Error(w, fmt.Sprintf("unexpected fs scopes: %#v", scope.FSScopes), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/scoped", nil)
+	req.Header.Set("Authorization", "Bearer "+rt.token)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if loader.calls != 1 {
+		t.Fatalf("FS scope loader calls = %d, want 1", loader.calls)
+	}
+	if loader.tenantID != rt.tenantID || loader.apiKeyID != key.ID {
+		t.Fatalf("loader args tenant=%q key=%q, want tenant=%q key=%q", loader.tenantID, loader.apiKeyID, rt.tenantID, key.ID)
+	}
+}
+
+func TestScopedBusinessEndpointGuardDeniesUntilHandlersAuthorizePaths(t *testing.T) {
+	for _, path := range []string{"/v1/sql", "/v1/fs/file.txt", "/v1/fs:batch-stat", "/v1/uploads/initiate"} {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		req = req.WithContext(withScope(req.Context(), &TenantScope{IsScoped: true}))
+		rr := httptest.NewRecorder()
+
+		(&Server{}).handleBusiness(rr, req)
+
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("path=%s status=%d body=%s, want 403", path, rr.Code, rr.Body.String())
+		}
 	}
 }
 

@@ -29,6 +29,9 @@ type TenantScope struct {
 	Provider           string
 	Backend            *backend.Dat9Backend
 	JournalPermissions map[string]bool
+	ScopeKind          meta.APIKeyScopeKind
+	IsScoped           bool
+	FSScopes           []FSScope
 }
 
 const (
@@ -134,6 +137,14 @@ func writeClientCanceled(w http.ResponseWriter) {
 }
 
 func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret []byte, next http.Handler) http.Handler {
+	return tenantAuthMiddlewareWithFSScopeLoader(metaStore, pool, tokenSecret, metaStore, next)
+}
+
+type tenantFSScopeLoader interface {
+	ListAPIKeyFSScopes(ctx context.Context, tenantID, apiKeyID string) ([]meta.APIKeyFSScope, error)
+}
+
+func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.Pool, tokenSecret []byte, fsScopeLoader tenantFSScopeLoader, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authStart := time.Now()
 		tok := bearerToken(r)
@@ -241,6 +252,42 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			return
 		}
 
+		scopeKind := resolved.APIKey.ScopeKind
+		if scopeKind == "" {
+			scopeKind = meta.APIKeyScopeKindOwner
+		}
+		isScoped := false
+		var fsScopes []FSScope
+		switch scopeKind {
+		case meta.APIKeyScopeKindOwner:
+		case meta.APIKeyScopeKindFS:
+			isScoped = true
+			rows, err := fsScopeLoader.ListAPIKeyFSScopes(r.Context(), resolved.Tenant.ID, resolved.APIKey.ID)
+			if err != nil {
+				if isClientCanceled(r.Context(), err) {
+					logAuthClientCanceled(r.Context(), "auth_fs_scope_load_client_canceled", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID)
+					writeClientCanceled(w)
+					return
+				}
+				logger.Error(r.Context(), "server_event", eventFields(r.Context(), "auth_fs_scope_load_failed", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
+				metricEvent(r.Context(), "auth", "result", "fs_scope_load_failed")
+				errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
+				return
+			}
+			fsScopes, err = fsScopesFromMeta(rows)
+			if err != nil {
+				logger.Error(r.Context(), "server_event", eventFields(r.Context(), "auth_fs_scope_invalid", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
+				metricEvent(r.Context(), "auth", "result", "fs_scope_invalid")
+				errJSON(w, http.StatusInternalServerError, "invalid API key scope policy")
+				return
+			}
+		default:
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_scope_kind_unsupported", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "scope_kind", scopeKind)...)
+			metricEvent(r.Context(), "auth", "result", "scope_kind_unsupported")
+			errJSON(w, http.StatusForbidden, "unsupported API key scope kind")
+			return
+		}
+
 		acquireStart := time.Now()
 		b, release, err := pool.Acquire(r.Context(), &resolved.Tenant)
 		acquireDurationMs := authPhaseMs(acquireStart)
@@ -276,6 +323,9 @@ func tenantAuthMiddleware(metaStore *meta.Store, pool *tenant.Pool, tokenSecret 
 			Provider:           resolved.Tenant.Provider,
 			Backend:            b,
 			JournalPermissions: journalPermissionsFromClaims(claims),
+			ScopeKind:          scopeKind,
+			IsScoped:           isScoped,
+			FSScopes:           fsScopes,
 		}
 		next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 	})
