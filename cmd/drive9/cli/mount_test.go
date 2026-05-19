@@ -792,6 +792,35 @@ func TestMountCmdRejectsInvalidReadConcurrency(t *testing.T) {
 	}
 }
 
+func TestMountCmdPassesFuseSyncReadOption(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--fuse-sync-read",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if !got.SyncRead {
+		t.Fatal("SyncRead = false, want true")
+	}
+}
+
 func TestMountCmdMapsDurabilityOption(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
