@@ -750,6 +750,48 @@ func TestMountCmdPassesReadCacheMaxFileOption(t *testing.T) {
 	}
 }
 
+func TestMountCmdPassesReadConcurrencyOption(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--read-concurrency", "12",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.ReadConcurrency != 12 {
+		t.Fatalf("ReadConcurrency = %d, want 12", got.ReadConcurrency)
+	}
+}
+
+func TestMountCmdRejectsInvalidReadConcurrency(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--read-concurrency", "0",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--read-concurrency") {
+		t.Fatalf("MountCmd error = %v, want read-concurrency validation error", err)
+	}
+}
+
 func TestMountCmdMapsDurabilityOption(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
