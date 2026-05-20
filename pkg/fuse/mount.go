@@ -60,6 +60,7 @@ type MountOptions struct {
 	ReadOnly              bool          // mount as read-only
 	Debug                 bool          // enable FUSE debug logging
 	PerfCounters          bool          // print low-overhead FUSE perf counter summary on shutdown
+	Profiling             ProfilingOptions
 }
 
 func (o *MountOptions) setDefaults() {
@@ -117,6 +118,12 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.PrefetchTimeout <= 0 {
 		o.PrefetchTimeout = defaultReadDirPrefetchTimeout
+	}
+	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfSampleInterval <= 0 {
+		o.Profiling.PerfSampleInterval = 10 * time.Second
+	}
+	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfMaxSamples <= 0 {
+		o.Profiling.PerfMaxSamples = defaultPerfMaxSamples
 	}
 }
 
@@ -188,11 +195,25 @@ func Mount(opts *MountOptions) error {
 
 	// Build FUSE filesystem
 	dat9fs := NewDat9FS(c, opts)
+	opts.Profiling.MountSync = dat9fs.SyncAll
+
+	profiler, err := StartProfiler(opts.Profiling)
+	if err != nil {
+		return fmt.Errorf("start profiler: %w", err)
+	}
+	opts.Profiling.PprofAddr = profiler.PprofAddr()
+	defer profiler.Stop()
 
 	// Resolve sync mode (auto-detect RTT if needed).
 	resolved := ResolveMode(context.Background(), opts.SyncMode, opts.Server)
+	opts.SyncMode = resolved
 	dat9fs.syncMode = resolved
 	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", resolved)
+	perfRecorder, err := StartContinuousPerf(opts.Profiling, dat9fs)
+	if err != nil {
+		return fmt.Errorf("start continuous perf: %w", err)
+	}
+	defer perfRecorder.Stop()
 
 	// Initialize write-back cache, shadow store, and pending index.
 	var cacheBase, shadowDir string
@@ -321,7 +342,21 @@ func Mount(opts *MountOptions) error {
 	if err := server.WaitMount(); err != nil {
 		return fmt.Errorf("fuse wait mount: %w", err)
 	}
-	pidFile, err := mountstate.WritePID(opts.MountPoint, os.Getpid())
+	pidFile, err := mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
+		PID:             os.Getpid(),
+		Component:       "drive9-fuse",
+		MountPoint:      opts.MountPoint,
+		RemoteRoot:      opts.RemoteRoot,
+		Server:          opts.Server,
+		ProfileDir:      opts.Profiling.ProfileDir,
+		PerfJSONL:       opts.Profiling.PerfSamplesPath,
+		PerfInterval:    opts.Profiling.PerfSampleInterval.String(),
+		PerfMaxSamples:  opts.Profiling.PerfMaxSamples,
+		PprofAddr:       opts.Profiling.PprofAddr,
+		StartedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+		CPUProfilePath:  opts.Profiling.CPUProfilePath,
+		HeapProfilePath: opts.Profiling.HeapProfilePath,
+	})
 	if err != nil {
 		sseWatcher.Stop()
 		dat9fs.FlushAll()
@@ -469,6 +504,9 @@ func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 	}
 	if runtime.GOOS == "linux" {
 		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively
+		if os.Geteuid() == 0 {
+			fuseOpts.DirectMountStrict = true
+		}
 	}
 	if runtime.GOOS == "darwin" {
 		// macFUSE can reject open/readdir before requests reach the daemon if

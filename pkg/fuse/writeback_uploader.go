@@ -51,6 +51,7 @@ type WriteBackUploader struct {
 	wg         sync.WaitGroup
 	stopOnce   sync.Once
 	stopped    atomic.Bool
+	active     atomic.Int64
 	stopCh     chan struct{}
 
 	// Per-path in-flight tracking.
@@ -97,6 +98,21 @@ func (u *WriteBackUploader) SetPerfCounters(perf *fusePerfCounters) {
 	u.perf = perf
 }
 
+// PendingStats returns queued and in-flight upload counts for observability.
+func (u *WriteBackUploader) PendingStats() (queued int, inFlight int) {
+	if u == nil {
+		return 0, 0
+	}
+	queued = len(u.uploadCh)
+	u.inflightMu.Lock()
+	inFlight = len(u.inflight)
+	u.inflightMu.Unlock()
+	if active := int(u.active.Load()); active > inFlight {
+		inFlight = active
+	}
+	return queued, inFlight
+}
+
 // Submit enqueues a local namespace path for background upload. Blocks up to 5s if the
 // channel is full; on timeout, falls back to synchronous upload in the current
 // goroutine so data is never silently dropped.
@@ -140,6 +156,34 @@ func (u *WriteBackUploader) WaitPath(localPath string) {
 	u.inflightMu.Unlock()
 	if ok {
 		<-ps.done
+	}
+}
+
+// WaitAll waits until all queued and in-flight write-back uploads complete
+// without stopping the uploader.
+func (u *WriteBackUploader) WaitAll(ctx context.Context) error {
+	if u == nil {
+		return nil
+	}
+	start := time.Now()
+	defer func() {
+		if u.perf != nil {
+			u.perf.uploaderDrainCount.add(1)
+			u.perf.uploaderDrainTotal.add(uint64(time.Since(start)))
+		}
+	}()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		queued, inFlight := u.PendingStats()
+		if queued == 0 && inFlight == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -195,7 +239,11 @@ func expectedRevisionForWriteBack(meta *WriteBackMeta) (int64, error) {
 func (u *WriteBackUploader) worker() {
 	defer u.wg.Done()
 	for localPath := range u.uploadCh {
-		u.uploadOne(localPath)
+		u.active.Add(1)
+		func() {
+			defer u.active.Add(-1)
+			u.uploadOne(localPath)
+		}()
 	}
 }
 
