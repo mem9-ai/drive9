@@ -14,6 +14,17 @@ import (
 )
 
 // Token manages workspace-zone scoped filesystem tokens.
+//
+// Per task #11 / Plan B consensus (#drive9:f2a8e33e):
+//   - `drive9 token issue`  — issue a scoped capability (server)
+//   - `drive9 token revoke` — revoke a scoped capability (server)
+// are the canonical token namespace operations.
+//
+// `drive9 token list` / `drive9 token forget` are kept as hidden
+// deprecation-warning aliases that point users to the canonical
+// `drive9 ctx list --type fs_scoped` / `drive9 ctx rm` paths. They
+// are NOT advertised in `drive9 token --help`. One release cycle
+// later they should be deleted entirely.
 func Token(args []string) error {
 	if len(args) == 0 {
 		return tokenUsageErr()
@@ -21,12 +32,21 @@ func Token(args []string) error {
 	switch args[0] {
 	case "issue":
 		return TokenIssue(args[1:])
-	case "list", "ls":
-		return TokenList(args[1:])
-	case "forget":
-		return TokenForget(args[1:])
 	case "revoke":
 		return TokenRevoke(args[1:])
+	case "list", "ls":
+		// Deprecated alias; warn on stderr then dispatch through
+		// the canonical ctx-list filter path. Keeps existing
+		// scripts working for one release.
+		fmt.Fprintln(os.Stderr, "WARNING: `drive9 token list` is deprecated; use `drive9 ctx list --type fs_scoped` instead.")
+		fmt.Fprintln(os.Stderr, "         This command will be removed in a future release.")
+		return Ctx([]string{"list", "--type", "fs_scoped"})
+	case "forget":
+		// Deprecated alias; warn on stderr then dispatch through
+		// `drive9 ctx rm <name>` which owns local namespace cleanup.
+		fmt.Fprintln(os.Stderr, "WARNING: `drive9 token forget` is deprecated; use `drive9 ctx rm <name>` instead.")
+		fmt.Fprintln(os.Stderr, "         This command will be removed in a future release.")
+		return Ctx(append([]string{"rm"}, args[1:]...))
 	case "-h", "-help", "--help", "help":
 		_, _ = fmt.Fprint(os.Stdout, tokenUsage())
 		return nil
@@ -41,10 +61,10 @@ func tokenUsage() string {
 commands:
   issue [name] --ttl <duration> --allow <prefix:ops>
                        issue an fs_scoped token; name is local only when set
-  list                 list locally saved fs_scoped token names
-  forget <name>        remove a local token name without revoking the token
-  revoke <name>        revoke a locally named fs_scoped token
+  revoke <name>        revoke a locally named fs_scoped token (deletes local name on success)
   revoke -             read a token from stdin and revoke it
+  revoke --api-key-file <path>
+                       read the target token from a file and revoke it
 
 issue flags:
   --subject <name>    optional server-side audit label; not a revoke key
@@ -55,9 +75,13 @@ issue flags:
   --print             print only the bearer token
   --token-only        alias for --print
 
-revoke flags:
-  --api-key-file <path>
-                       read the target token from a file instead of a local name
+To list local contexts (including fs_scoped tokens):
+  drive9 ctx list                     all local contexts
+  drive9 ctx list --type fs_scoped    only scoped tokens
+  drive9 ctx list --scoped            shorthand for --type fs_scoped
+
+To remove a local context name without revoking the server credential:
+  drive9 ctx rm <name>
 `
 }
 

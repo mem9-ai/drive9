@@ -53,9 +53,9 @@ func ctxUsage() string {
   import --from-file -                                add delegated context from stdin explicitly
   import                                              add delegated context from stdin (default when stdin is a pipe)
   fork [<new>] [--from <ctx>] [--json]                create a copy-on-write fork context
-  ls [-l|--json]                                      list contexts
+  ls [-l|--json] [--type <kind>|--scoped]             list contexts (filter by type: owner|delegated|fs_scoped)
   use <name>                                          activate a context
-  rm <name>                                           delete a context`
+  rm <name>                                           remove a local context name (does NOT revoke server-side credential)`
 }
 
 func ctxUsageErr() error {
@@ -685,24 +685,56 @@ func scopeRootSegment(scope string) string {
 func ctxListCmd(args []string) error {
 	longForm := false
 	asJSON := false
-	for _, arg := range args {
-		switch arg {
+	typeFilter := ""
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
 		case "-l", "--long":
 			longForm = true
 		case "--json":
 			asJSON = true
+		case "--scoped":
+			// Shorthand for --type fs_scoped. The user mental model
+			// is "show me the scoped tokens" — accept the shortcut
+			// so they don't have to remember the type literal.
+			typeFilter = string(PrincipalFSScoped)
+		case "--type":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--type requires a value (owner|delegated|fs_scoped)")
+			}
+			i++
+			typeFilter = args[i]
 		default:
-			return fmt.Errorf("unknown flag %q\nusage: drive9 ctx ls [-l|--json]", arg)
+			if strings.HasPrefix(args[i], "--type=") {
+				typeFilter = strings.TrimPrefix(args[i], "--type=")
+				continue
+			}
+			return fmt.Errorf("unknown flag %q\nusage: drive9 ctx ls [-l|--json] [--type <kind>|--scoped]", args[i])
 		}
 	}
 	if longForm && asJSON {
 		return fmt.Errorf("-l/--long and --json are mutually exclusive")
 	}
+	if typeFilter != "" {
+		if !isKnownPrincipalType(typeFilter) {
+			return fmt.Errorf("unknown --type %q; valid: owner, delegated, fs_scoped", typeFilter)
+		}
+	}
 	cfg := loadConfig()
 	if asJSON {
-		return writeCtxListJSON(cfg)
+		return writeCtxListJSON(cfg, typeFilter)
 	}
-	return writeCtxListTable(cfg, longForm)
+	return writeCtxListTable(cfg, longForm, typeFilter)
+}
+
+// isKnownPrincipalType validates a --type filter value against the set
+// of principal types stored in local contexts. Keep this in sync with
+// PrincipalOwner / PrincipalDelegated / PrincipalFSScoped in config.go.
+func isKnownPrincipalType(value string) bool {
+	switch PrincipalType(value) {
+	case PrincipalOwner, PrincipalDelegated, PrincipalFSScoped:
+		return true
+	}
+	return false
 }
 
 type ctxListEntry struct {
@@ -718,8 +750,8 @@ type ctxListEntry struct {
 	GrantID   string    `json:"grant_id,omitempty"`
 }
 
-func writeCtxListJSON(cfg *Config) error {
-	entries := buildCtxListEntries(cfg)
+func writeCtxListJSON(cfg *Config, typeFilter string) error {
+	entries := filterCtxListEntries(buildCtxListEntries(cfg), typeFilter)
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(map[string]any{
@@ -728,9 +760,13 @@ func writeCtxListJSON(cfg *Config) error {
 	})
 }
 
-func writeCtxListTable(cfg *Config, longForm bool) error {
-	entries := buildCtxListEntries(cfg)
+func writeCtxListTable(cfg *Config, longForm bool, typeFilter string) error {
+	entries := filterCtxListEntries(buildCtxListEntries(cfg), typeFilter)
 	if len(entries) == 0 {
+		if typeFilter != "" {
+			fmt.Printf("no contexts of type %q configured\n", typeFilter)
+			return nil
+		}
 		fmt.Println("no contexts configured")
 		fmt.Println("run: drive9 ctx add --api-key <key>  (owner)")
 		fmt.Println("     drive9 ctx import --from-file <path>  (delegated)")
@@ -789,6 +825,22 @@ func buildCtxListEntries(cfg *Config) []ctxListEntry {
 		})
 	}
 	return entries
+}
+
+// filterCtxListEntries returns the subset of entries whose Type matches
+// the supplied filter. An empty filter returns the slice unchanged.
+// Used by `drive9 ctx list --type <kind>` / `--scoped`.
+func filterCtxListEntries(entries []ctxListEntry, typeFilter string) []ctxListEntry {
+	if typeFilter == "" {
+		return entries
+	}
+	out := entries[:0:0]
+	for _, e := range entries {
+		if e.Type == typeFilter {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func ctxStatus(c *Context, now time.Time) string {
@@ -887,25 +939,110 @@ func ctxUseDescriptor(c *Context) string {
 }
 
 // ctxRmCmd implements `drive9 ctx rm <name>` per spec §13.2.
+// ctxRmCmd implements `drive9 ctx rm <name>`.
+//
+// SAFETY CONTRACT (per task #11 / msg `7472f701` from qiffang):
+// This is a LOCAL cleanup operation. It does NOT contact the server and
+// does NOT revoke any server-side credential. Three safety layers:
+//
+//  1. Help text (ctxRmUsage) leads with a WARNING line so the
+//     scanning user reads "Local cleanup only. Does NOT revoke
+//     server-side credentials." in the first screen.
+//  2. Runtime: removing an owner context is unrecoverable on this
+//     machine (the api_key is erased from local config; the server
+//     key remains valid), so we require interactive [y/N]
+//     confirmation. fs_scoped contexts do not require confirmation
+//     but the post-rm output explicitly states the server token
+//     remains valid until TTL or explicit revoke.
+//  3. Removing the current active context is refused (per
+//     @adversary-1 msg `7c8dc13c`) to prevent leaving a dangling
+//     CurrentContext pointer in saved config. The user is told to
+//     `ctx use <other>` first.
+//
+// Acceptance from #drive9:67e75a87 task #11 thread.
 func ctxRmCmd(args []string) error {
 	if len(args) != 1 || strings.HasPrefix(args[0], "--") {
-		return fmt.Errorf("usage: drive9 ctx rm <name>")
+		return fmt.Errorf("%s", ctxRmUsage())
 	}
 	name := args[0]
 	cfg := loadConfig()
-	if _, ok := cfg.Contexts[name]; !ok {
+	target, ok := cfg.Contexts[name]
+	if !ok || target == nil {
 		return fmt.Errorf("context %q not found", name)
 	}
-	delete(cfg.Contexts, name)
 	if cfg.CurrentContext == name {
-		cfg.CurrentContext = ""
+		return fmt.Errorf("refusing to remove current context %q; switch first with `drive9 ctx use <other>` then retry", name)
 	}
+	if target.Type == PrincipalOwner {
+		if !confirmCtxRmOwner(name) {
+			fmt.Printf("aborted; %q was not removed\n", name)
+			return nil
+		}
+	}
+	delete(cfg.Contexts, name)
 	if err := saveConfig(cfg); err != nil {
 		return fmt.Errorf("save config: %w", err)
 	}
-	fmt.Printf("removed context %q\n", name)
-	if cfg.CurrentContext == "" {
-		fmt.Println("no current context; run `drive9 ctx use <name>` to activate one")
-	}
+	emitCtxRmSuccess(name, target)
 	return nil
+}
+
+// ctxRmUsage returns the user-facing help text for `drive9 ctx rm`.
+// Written English-only (per qiffang msg `405e0ae9` directive: no
+// Chinese in CLI surface). The first screen leads with a WARNING line
+// + a redirect to the correct revoke path, per @gtm-1's scan-first
+// observation (msg `30bf6704`).
+func ctxRmUsage() string {
+	return `usage: drive9 ctx rm <name>
+
+  WARNING: Local cleanup only. Does NOT revoke server-side credentials.
+  To revoke a scoped token: drive9 token revoke <name>
+
+  Removes the named context from local config (~/.drive9/config).
+  - fs_scoped: the dat9_... token remains valid on the server until TTL
+    expiry or explicit revoke.
+  - owner: the api_key is erased from local config. The server key
+    remains valid. You'll need it saved elsewhere to log back in.
+
+  Removing the current active context is refused; switch with
+  ` + "`drive9 ctx use <other>`" + ` first.
+
+example:
+  drive9 ctx rm smoke`
+}
+
+// confirmCtxRmOwner prompts the operator for a yes/no answer before
+// removing an owner context. Returns true only if the operator types
+// "y" or "yes" (case-insensitive). Any other input — including an
+// empty line, "n", EOF, or read error — is treated as a refusal.
+func confirmCtxRmOwner(name string) bool {
+	fmt.Fprintf(os.Stderr, "WARNING: %q is an owner context. Removing it erases the owner api_key\n", name)
+	fmt.Fprintf(os.Stderr, "from local config; the server key remains valid (you may lose access from this\n")
+	fmt.Fprintf(os.Stderr, "machine unless the key is saved elsewhere).\n")
+	fmt.Fprint(os.Stderr, "Continue? [y/N]: ")
+	var answer string
+	if _, err := fmt.Fscanln(os.Stdin, &answer); err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "y", "yes":
+		return true
+	}
+	return false
+}
+
+// emitCtxRmSuccess writes the success message after a context is
+// removed. For fs_scoped contexts it includes an explicit reminder
+// that the server-side token is still valid, with a one-line pointer
+// to the correct revoke command (per the @qiffang msg `7472f701`
+// usage clarity directive).
+func emitCtxRmSuccess(name string, removed *Context) {
+	fmt.Printf("removed local context %q (type=%s)\n", name, removed.Type)
+	if removed.Type == PrincipalFSScoped {
+		fmt.Println("note: the scoped token on the server is NOT revoked.")
+		fmt.Printf("      to revoke, run: drive9 token revoke -   (paste the saved api_key on stdin)\n")
+		if !removed.ExpiresAt.IsZero() {
+			fmt.Printf("      otherwise the token remains valid until %s\n", removed.ExpiresAt.UTC().Format(time.RFC3339))
+		}
+	}
 }
