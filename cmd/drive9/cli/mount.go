@@ -102,6 +102,7 @@ func fsMountCmd(args []string) error {
 	prefetchTimeout := fs.Duration("readdir-prefetch-timeout", time.Second, "timeout for one readdir prefetch batch")
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
 	profile := fs.String("profile", "", "mount profile: interactive (empty for default)")
+	uploadConcurrency := fs.Int("upload-concurrency", 16, "maximum concurrent background uploads issued by FUSE")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
 	debug := fs.Bool("debug", false, "enable FUSE debug logging")
@@ -155,6 +156,9 @@ func fsMountCmd(args []string) error {
 	}
 	if *readConcurrency <= 0 {
 		return fmt.Errorf("drive9 mount: --read-concurrency must be > 0")
+	}
+	if *uploadConcurrency <= 0 {
+		return fmt.Errorf("drive9 mount: --upload-concurrency must be > 0")
 	}
 	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
 		return err
@@ -251,6 +255,7 @@ func fsMountCmd(args []string) error {
 		SyncMode:              syncModeVal,
 		WritePolicy:           writePolicyVal,
 		Profile:               *profile,
+		UploadConcurrency:     *uploadConcurrency,
 		ReadConcurrency:       *readConcurrency,
 		SyncRead:              *syncRead,
 		AllowOther:            *allowOther,

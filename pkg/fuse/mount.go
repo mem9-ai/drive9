@@ -62,6 +62,8 @@ type MountOptions struct {
 	PerfCounters          bool          // print low-overhead FUSE perf counter summary on shutdown
 }
 
+const defaultUploadConcurrency = 16
+
 func (o *MountOptions) setDefaults() {
 	// Apply profile defaults before generic defaults so profile-specific
 	// zero-value options can take effect while explicit non-zero values win.
@@ -91,7 +93,7 @@ func (o *MountOptions) setDefaults() {
 		o.FlushDebounce = defaultFlushDebounce
 	}
 	if o.UploadConcurrency <= 0 {
-		o.UploadConcurrency = 4
+		o.UploadConcurrency = defaultUploadConcurrency
 	}
 	if o.ReadConcurrency <= 0 {
 		o.ReadConcurrency = defaultRemoteReadConcurrency

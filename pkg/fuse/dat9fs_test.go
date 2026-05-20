@@ -2689,6 +2689,26 @@ func TestMountOptionsReadConcurrencyDefaults(t *testing.T) {
 	}
 }
 
+func TestMountOptionsUploadConcurrencyDefaults(t *testing.T) {
+	defaults := &MountOptions{}
+	defaults.setDefaults()
+	if defaults.UploadConcurrency != defaultUploadConcurrency {
+		t.Fatalf("default UploadConcurrency = %d, want %d", defaults.UploadConcurrency, defaultUploadConcurrency)
+	}
+
+	explicit := &MountOptions{UploadConcurrency: 7}
+	explicit.setDefaults()
+	if explicit.UploadConcurrency != 7 {
+		t.Fatalf("explicit UploadConcurrency = %d, want 7", explicit.UploadConcurrency)
+	}
+
+	profileExplicit := &MountOptions{Profile: "interactive", UploadConcurrency: 9}
+	profileExplicit.setDefaults()
+	if profileExplicit.UploadConcurrency != 9 {
+		t.Fatalf("interactive profile explicit UploadConcurrency = %d, want 9", profileExplicit.UploadConcurrency)
+	}
+}
+
 func TestMountOptionsSyncReadDefaultsToAsyncReads(t *testing.T) {
 	defaults := &MountOptions{}
 	defaults.setDefaults()
