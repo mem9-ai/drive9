@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -183,5 +184,200 @@ func TestRunDoctorAllowsNoAllowOtherOnlyFailure(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "failures.jsonl")); !os.IsNotExist(err) {
 		t.Fatalf("failures.jsonl err = %v, want not exist", err)
+	}
+}
+
+func TestPublishPerfUploadsBundleAndIndex(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX fake drive9 script")
+	}
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run")
+	writePublishRun(t, runDir)
+	logPath := filepath.Join(dir, "drive9.log")
+	bin := fakePublishDrive9(t, dir)
+	t.Setenv("DRIVE9_FAKE_LOG", logPath)
+	pub, err := PublishPerf(context.Background(), PublishPerfConfig{
+		RunDir:        runDir,
+		WorkspaceRoot: ":/performance-reports",
+		Drive9Bin:     bin,
+		Server:        "https://drive9.example",
+		APIKey:        "test-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pub.Status != "succeeded" {
+		t.Fatalf("publish status = %q", pub.Status)
+	}
+	if pub.ArtifactPaths["perf/customer-report.md"] == "" || pub.ArtifactPaths["perf/publish-manifest.json"] == "" {
+		t.Fatalf("artifact paths = %+v", pub.ArtifactPaths)
+	}
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logBytes)
+	for _, want := range []string{"fs cp", "perf/customer-report.md", "index.json"} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("drive9 log missing %q:\n%s", want, logText)
+		}
+	}
+}
+
+func TestPublishPerfPartialFailureWritesManifest(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX fake drive9 script")
+	}
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run")
+	writePublishRun(t, runDir)
+	logPath := filepath.Join(dir, "drive9.log")
+	bin := fakePublishDrive9(t, dir)
+	t.Setenv("DRIVE9_FAKE_LOG", logPath)
+	t.Setenv("DRIVE9_FAIL_RESULTS", "1")
+	pub, err := PublishPerf(context.Background(), PublishPerfConfig{
+		RunDir:        runDir,
+		WorkspaceRoot: ":/performance-reports",
+		Drive9Bin:     bin,
+		Server:        "https://drive9.example",
+		APIKey:        "test-key",
+	})
+	if err == nil {
+		t.Fatal("PublishPerf returned nil error, want partial failure")
+	}
+	if pub.Status != "partial_failed" {
+		t.Fatalf("publish status = %q", pub.Status)
+	}
+	var persisted PublishManifest
+	if err := readJSON(filepath.Join(runDir, "perf", "publish-manifest.json"), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != "partial_failed" || len(persisted.Errors) == 0 {
+		t.Fatalf("persisted manifest = %+v", persisted)
+	}
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logBytes), "index.json") {
+		t.Fatalf("partial publish should not update index:\n%s", string(logBytes))
+	}
+}
+
+func writePublishRun(t *testing.T, runDir string) {
+	t.Helper()
+	rec, err := report.NewRecorder(runDir, "run1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.WriteManifest(report.Manifest{
+		RunID:         "run1",
+		StartedAt:     "2026-01-01T00:00:00Z",
+		Host:          "perf-host linux/amd64",
+		Drive9Version: "drive9 test",
+		Server:        "https://drive9.example",
+		Suites:        []string{"stress"},
+		SelectedCases: []string{"case1"},
+		Cases:         []report.CaseSummary{{ID: "case1", Suite: "stress", ExpectedOutcome: "baseline_pass"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Event(report.Event{Type: "run_end", TS: "2026-01-01T00:00:05Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.WritePerfEnvironment(report.PerfEnvironment{
+		RunID:             "run1",
+		Host:              "perf-host",
+		OS:                "linux",
+		Kernel:            "6.1.0",
+		Architecture:      "amd64",
+		ProductVersion:    "drive9 test",
+		ServerEndpoint:    "https://drive9.example",
+		CloudProvider:     "aws",
+		InstanceType:      "c7i.large",
+		VCPU:              "2",
+		CPUModel:          "Intel Xeon",
+		Memory:            "4 GiB",
+		StorageType:       "gp3",
+		StorageSize:       "64 GiB",
+		StorageIOPS:       "3000",
+		StorageThroughput: "125 MiB/s",
+		StorageEncrypted:  "true",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.PerfResult(report.PerfResult{
+		CaseID:       "case1",
+		ScenarioID:   "case1",
+		OperationID:  "op1",
+		Operation:    "upload",
+		Status:       "ok",
+		StartedAt:    "2026-01-01T00:00:00Z",
+		EndedAt:      "2026-01-01T00:00:01Z",
+		DurationMS:   1000,
+		Bytes:        50 << 20,
+		RequestUnits: 10,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := report.Generate(runDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := report.GeneratePerfReport(runDir, report.PerfOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func fakePublishDrive9(t *testing.T, dir string) string {
+	t.Helper()
+	bin := filepath.Join(dir, "drive9")
+	script := `#!/usr/bin/env sh
+printf '%s\n' "$*" >> "$DRIVE9_FAKE_LOG"
+if [ "$1" = "fs" ] && [ "$2" = "mkdir" ]; then
+  exit 0
+fi
+if [ "$1" = "fs" ] && [ "$2" = "cat" ]; then
+  if [ -n "$DRIVE9_FAKE_INDEX" ]; then
+    cat "$DRIVE9_FAKE_INDEX"
+    exit 0
+  fi
+  exit 1
+fi
+if [ "$1" = "fs" ] && [ "$2" = "cp" ]; then
+  case "$3" in
+    *results.jsonl)
+      if [ "$DRIVE9_FAIL_RESULTS" = "1" ]; then
+        echo "forced results upload failure" >&2
+        exit 9
+      fi
+      ;;
+  esac
+  exit 0
+fi
+echo "unexpected fake drive9 command: $*" >&2
+exit 2
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+func TestPublishIndexJSONShape(t *testing.T) {
+	entry := publishIndex{
+		SchemaVersion: publishSchemaVersion,
+		Entries: []publishIndexEntry{{
+			Title:      "title",
+			RunID:      "run1",
+			ReportPath: ":/performance-reports/stress/2026-01-01/run1/perf/customer-report.md",
+		}},
+	}
+	b, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "run1") {
+		t.Fatalf("index json = %s", string(b))
 	}
 }

@@ -142,20 +142,20 @@ func (cq *CommitQueue) Enqueue(entry *CommitEntry) error {
 	defer cq.mu.Unlock()
 	if cq.stopped {
 		if cq.perf != nil {
-			cq.perf.commitEnqueueError.add(1)
+			cq.perf.commitEnqueueError.Add(1)
 		}
 		return fmt.Errorf("commit queue stopped")
 	}
 	if len(cq.queue) >= cq.maxPending {
 		if cq.perf != nil {
-			cq.perf.commitEnqueueError.add(1)
+			cq.perf.commitEnqueueError.Add(1)
 		}
 		return fmt.Errorf("commit queue full (%d pending)", cq.maxPending)
 	}
 	cq.queue = append(cq.queue, entry)
 	cq.addQueuedLocked(entry)
 	if cq.perf != nil {
-		cq.perf.commitEnqueue.add(1)
+		cq.perf.commitEnqueue.Add(1)
 	}
 
 	// Send to workers while holding the lock. The channel buffer is always
@@ -221,8 +221,8 @@ func (cq *CommitQueue) DrainAll() {
 	start := time.Now()
 	defer func() {
 		if cq.perf != nil {
-			cq.perf.commitDrainCount.add(1)
-			cq.perf.commitDrainTotalNS.add(uint64(time.Since(start)))
+			cq.perf.commitDrainCount.Add(1)
+			cq.perf.commitDrainTotalNS.Add(uint64(time.Since(start)))
 		}
 	}()
 	cq.mu.Lock()
@@ -546,7 +546,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 
 		if attempt > 0 {
 			if cq.perf != nil {
-				cq.perf.commitRetry.add(1)
+				cq.perf.commitRetry.Add(1)
 			}
 			delay := time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt-1)))
 			if delay > maxDelay {
@@ -622,7 +622,7 @@ func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error 
 	committedRev, err := cq.uploadEntry(ctx, entry)
 	if err != nil {
 		if cq.perf != nil {
-			cq.perf.commitFailure.add(1)
+			cq.perf.commitFailure.Add(1)
 		}
 		return err
 	}
@@ -788,7 +788,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) {
 	cq.removeFromQueue(entry)
 
 	if cq.perf != nil {
-		cq.perf.commitSuccess.add(1)
+		cq.perf.commitSuccess.Add(1)
 	}
 	log.Printf("commit queue: successfully uploaded %s (%d bytes, rev=%d)", entry.Path, entry.Size, committedRev)
 }
@@ -901,7 +901,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
 	if cq.perf != nil {
-		cq.perf.commitFailure.add(1)
+		cq.perf.commitFailure.Add(1)
 	}
 	// Mark the entry as conflicted in the pending index so that crash
 	// recovery (RecoverPending) skips it instead of retrying forever.

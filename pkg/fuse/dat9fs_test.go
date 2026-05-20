@@ -2230,7 +2230,7 @@ func TestLookupRetriesTransientCanceledStat(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	opts := &MountOptions{PerfCounters: true}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
@@ -2293,7 +2293,7 @@ func TestLookupReturnsENOENTAfterTransientCanceledStat(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	opts := &MountOptions{PerfCounters: true}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
@@ -2347,7 +2347,7 @@ func TestLookupTransientRetryExhaustedReturnsEAGAIN(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	opts := &MountOptions{PerfCounters: true}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
@@ -6885,7 +6885,6 @@ func TestSetAttr_NoKernelNotify(t *testing.T) {
 		t.Fatalf("SetAttr produced %d kernel notify calls, want 0", delta)
 	}
 }
-
 
 // TestLookupParsesModeHeader verifies that Lookup reads the X-Dat9-Mode header
 // from the remote stat response and stores it in the inode entry.
