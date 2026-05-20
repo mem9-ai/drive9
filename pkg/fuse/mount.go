@@ -59,7 +59,7 @@ type MountOptions struct {
 	AllowOther            bool          // allow other users to access mount
 	ReadOnly              bool          // mount as read-only
 	Debug                 bool          // enable FUSE debug logging
-	PerfCounters          bool          // print low-overhead FUSE perf counter summary on shutdown
+	PerfCounters          bool          // enable FUSE perf counters, shutdown summary, and Prometheus FUSE metrics hot path
 }
 
 const defaultUploadConcurrency = 16
