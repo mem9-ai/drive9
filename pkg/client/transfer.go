@@ -228,6 +228,17 @@ func uploadParallelism(partSize int64) int {
 	return min(byMemory, uploadMaxConcurrency)
 }
 
+func boundedUploadParallelism(partSize int64, partCount int) int {
+	parallelism := uploadParallelism(partSize)
+	if partCount > 0 && parallelism > partCount {
+		parallelism = partCount
+	}
+	if parallelism < 1 {
+		return 1
+	}
+	return parallelism
+}
+
 func checksumParallelism(partSize int64, partCount int) int {
 	if partSize <= 0 {
 		partSize = s3client.PartSize
@@ -450,7 +461,7 @@ func (c *Client) writeStreamV1WithSummary(ctx context.Context, path string, ra i
 		summary.PartSizeBytes = stdPartSize
 		summary.TotalParts = len(plan.Parts)
 		summary.UploadedParts = len(plan.Parts)
-		summary.Parallelism = uploadParallelism(stdPartSize)
+		summary.Parallelism = boundedUploadParallelism(stdPartSize, len(plan.Parts))
 	}
 
 	uploadStart := time.Now()
@@ -486,14 +497,14 @@ func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra i
 		summary.PartSizeBytes = plan.PartSize
 		summary.TotalParts = plan.TotalParts
 		summary.UploadedParts = plan.TotalParts
-		summary.Parallelism = uploadParallelism(plan.PartSize)
+		summary.Parallelism = boundedUploadParallelism(plan.PartSize, plan.TotalParts)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// Pipelined presign: feed presigned URLs into a buffered channel.
-	parallelism := uploadParallelism(plan.PartSize)
+	parallelism := boundedUploadParallelism(plan.PartSize, plan.TotalParts)
 	presignCh := make(chan presignedPart, parallelism)
 	presignErrCh := make(chan error, 1)
 	presignRecorder := &uploadDurationRecorder{}
@@ -639,7 +650,7 @@ func (c *Client) uploadPartsOnly(ctx context.Context, plan UploadPlan, ra io.Rea
 	if stdPartSize <= 0 {
 		stdPartSize = s3client.PartSize
 	}
-	maxConcurrency := uploadParallelism(stdPartSize)
+	maxConcurrency := boundedUploadParallelism(stdPartSize, len(plan.Parts))
 	bufferPool := newUploadBufferPool(stdPartSize, maxConcurrency)
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -921,7 +932,7 @@ func (c *Client) presignPipeline(ctx context.Context, plan *uploadPlanV2, batchS
 func (c *Client) uploadPartsV2(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt,
 	presignCh <-chan presignedPart, presignErrCh <-chan error, recorder *uploadDurationRecorder, progress ProgressFunc) ([]completePart, error) {
 
-	parallelism := uploadParallelism(plan.PartSize)
+	parallelism := boundedUploadParallelism(plan.PartSize, plan.TotalParts)
 	bufferPool := newUploadBufferPool(plan.PartSize, parallelism)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1650,7 +1661,7 @@ func (c *Client) ResumeUploadWithSummaryAndTags(ctx context.Context, path string
 	summary.PartSizeBytes = plan.PartSize
 	summary.TotalParts = meta.PartsTotal
 	summary.UploadedParts = len(plan.Parts)
-	summary.Parallelism = uploadParallelism(plan.PartSize)
+	summary.Parallelism = boundedUploadParallelism(plan.PartSize, len(plan.Parts))
 
 	if len(plan.Parts) == 0 {
 		// All parts uploaded, just complete
@@ -1792,7 +1803,7 @@ func (c *Client) uploadMissingParts(ctx context.Context, plan UploadPlan, r io.R
 	if stdPartSize <= 0 {
 		stdPartSize = s3client.PartSize
 	}
-	maxConcurrency := uploadParallelism(stdPartSize)
+	maxConcurrency := boundedUploadParallelism(stdPartSize, len(plan.Parts))
 	bufferPool := newUploadBufferPool(stdPartSize, maxConcurrency)
 
 	ctx, cancel := context.WithCancel(ctx)
