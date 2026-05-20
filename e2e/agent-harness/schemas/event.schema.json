@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Drive9 Agent Harness Event",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "case_id",
+    "ts",
+    "type",
+    "message",
+    "duration_ms",
+    "command_id",
+    "exit_code",
+    "signal",
+    "artifact_refs"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "agent-harness.v1"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "case_id": {
+      "type": "string"
+    },
+    "ts": {
+      "type": "string"
+    },
+    "type": {
+      "enum": [
+        "run_start",
+        "run_end",
+        "case_start",
+        "case_end",
+        "command_start",
+        "command_end",
+        "mount_start",
+        "mount_ready",
+        "mount_end",
+        "unmount_start",
+        "unmount_end",
+        "oracle_start",
+        "oracle_end",
+        "timeout",
+        "artifact_written",
+        "cleanup_start",
+        "cleanup_end"
+      ]
+    },
+    "message": {
+      "type": "string"
+    },
+    "duration_ms": {
+      "type": "integer"
+    },
+    "command_id": {
+      "type": "string"
+    },
+    "exit_code": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "signal": {
+      "type": "string"
+    },
+    "artifact_refs": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
