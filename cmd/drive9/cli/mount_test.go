@@ -1622,6 +1622,52 @@ func TestMountCmdMapsDurabilityOption(t *testing.T) {
 	}
 }
 
+func TestMountCmdPassesContinuousPerfOptions(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-jsonl", "/tmp/drive9-perf.jsonl",
+		"--perf-interval", "2s",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.PerfSamplesPath != "/tmp/drive9-perf.jsonl" {
+		t.Fatalf("PerfSamplesPath = %q, want /tmp/drive9-perf.jsonl", got.PerfSamplesPath)
+	}
+	if got.PerfSampleInterval != 2*time.Second {
+		t.Fatalf("PerfSampleInterval = %v, want 2s", got.PerfSampleInterval)
+	}
+}
+
+func TestMountCmdRejectsPerfIntervalWithoutJSONL(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-interval", "2s",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--perf-interval requires --perf-jsonl") {
+		t.Fatalf("MountCmd error = %v, want perf interval validation error", err)
+	}
+}
+
 func TestMountCmdLeavesDefaultTTLsUnsetForFuseDefaults(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })

@@ -120,6 +120,18 @@ func (u *WriteBackUploader) SetPerfCounters(perf *fusePerfCounters) {
 	u.perf = perf
 }
 
+// PendingStats returns queued and in-flight upload counts for observability.
+func (u *WriteBackUploader) PendingStats() (queued int, inFlight int) {
+	if u == nil {
+		return 0, 0
+	}
+	queued = len(u.uploadCh)
+	u.inflightMu.Lock()
+	inFlight = len(u.inflight)
+	u.inflightMu.Unlock()
+	return queued, inFlight
+}
+
 // Submit enqueues a local namespace path for background upload. Blocks up to 5s if the
 // channel is full; on timeout, falls back to synchronous upload in the current
 // goroutine so data is never silently dropped.

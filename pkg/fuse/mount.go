@@ -55,7 +55,7 @@ type MountOptions struct {
 	LocalOnlyPatterns       []string      // additional local-only path patterns for overlay-profile mounts
 	RemoteOnlyPatterns      []string      // remote-persistent override path patterns for overlay-profile mounts
 	PackPaths               []string      // local overlay paths auto-packed after unmount
-	UploadConcurrency       int           // number of background upload workers (default 4)
+	UploadConcurrency       int           // number of background upload workers (default 16)
 	ReadConcurrency         int           // maximum concurrent backend reads issued by FUSE (default 24)
 	ParallelReadConcurrency int           // maximum concurrent block reads for one large FUSE read (default 4)
 	ParallelReadBlockSize   int64         // block size for parallel large-file reads in bytes (default 1MiB)
@@ -74,6 +74,7 @@ type MountOptions struct {
 	Debug                   bool          // enable FUSE debug logging
 	PerfCounters            bool          // print low-overhead FUSE perf counter summary on shutdown
 	EnableGitWorkspaces     bool          // enable fast-clone git workspace overlay discovery
+	Profiling               ProfilingOptions
 }
 
 const defaultUploadConcurrency = 16
@@ -148,6 +149,9 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.PrefetchTimeout <= 0 {
 		o.PrefetchTimeout = defaultReadDirPrefetchTimeout
+	}
+	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfSampleInterval <= 0 {
+		o.Profiling.PerfSampleInterval = 10 * time.Second
 	}
 }
 
@@ -247,6 +251,17 @@ func Mount(opts *MountOptions) error {
 	// Build FUSE filesystem
 	dat9fs := NewDat9FS(c, opts)
 	layerEventWatcherStop := func() {}
+
+	profiler, err := StartProfiler(opts.Profiling)
+	if err != nil {
+		return fmt.Errorf("start profiler: %w", err)
+	}
+	defer profiler.Stop()
+	perfRecorder, err := StartContinuousPerf(opts.Profiling, dat9fs)
+	if err != nil {
+		return fmt.Errorf("start continuous perf: %w", err)
+	}
+	defer perfRecorder.Stop()
 
 	// Resolve sync mode (auto-detect RTT if needed).
 	resolved := ResolveMode(context.Background(), opts.SyncMode, opts.Server)
@@ -864,6 +879,9 @@ func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively
 		if opts.AllowOther {
 			fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
+		}
+		if os.Geteuid() == 0 {
+			fuseOpts.DirectMountStrict = true
 		}
 	}
 	if runtime.GOOS == "darwin" {
