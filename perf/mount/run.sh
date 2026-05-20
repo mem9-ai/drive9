@@ -10,6 +10,7 @@ workloads:
   metadata-walk
   large-write
   large-read
+  cold-read
 USAGE
   exit 2
 }
@@ -78,7 +79,13 @@ WORKLOAD_LOG="$DRIVE9_PROFILE_DIR/workload.log"
   echo "perf_max_samples=$DRIVE9_PERF_MAX_SAMPLES"
   echo "pprof_addr=$DRIVE9_PPROF_ADDR"
   echo "extra_flags=$DRIVE9_MOUNT_EXTRA_FLAGS"
-  git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null | sed 's/^/git_head=/'
+  git_head=""
+  if command -v git >/dev/null 2>&1; then
+    git_head="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+  fi
+  if [[ -n "$git_head" ]]; then
+    echo "git_head=$git_head"
+  fi
   "$DRIVE9_BIN" version 2>/dev/null | sed 's/^/drive9_version=/'
 } > "$DRIVE9_PROFILE_DIR/env.txt"
 
@@ -177,7 +184,11 @@ fi
 
 start_ns="$(date +%s)"
 set +e
-MNT="$DRIVE9_MOUNTPOINT" RUN_DIR="$DRIVE9_PROFILE_DIR" "$WORKLOAD_SCRIPT" >"$WORKLOAD_LOG" 2>&1
+MNT="$DRIVE9_MOUNTPOINT" \
+RUN_DIR="$DRIVE9_PROFILE_DIR" \
+DRIVE9_BIN="$DRIVE9_BIN" \
+DRIVE9_REMOTE_ROOT="$DRIVE9_REMOTE_ROOT" \
+"$WORKLOAD_SCRIPT" >"$WORKLOAD_LOG" 2>&1
 workload_status=$?
 set -e
 end_ns="$(date +%s)"

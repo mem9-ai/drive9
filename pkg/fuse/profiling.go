@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -24,6 +25,7 @@ type ProfilingOptions struct {
 	PerfSamplesPath     string
 	PerfSampleInterval  time.Duration
 	PerfMaxSamples      int
+	MountSync           func(context.Context) error
 }
 
 // Profiler owns the profiling resources for one mount process.
@@ -80,6 +82,7 @@ func StartProfiler(opts ProfilingOptions) (*Profiler, error) {
 			return nil, fmt.Errorf("listen pprof %s: %w", opts.PprofAddr, err)
 		}
 		p.ln = ln
+		p.opts.PprofAddr = ln.Addr().String()
 		p.server = &http.Server{Handler: p.newPprofMux()}
 		p.wg.Add(1)
 		go func() {
@@ -92,6 +95,16 @@ func StartProfiler(opts ProfilingOptions) (*Profiler, error) {
 		fmt.Fprintf(os.Stderr, "drive9: pprof listening on %s\n", ln.Addr().String())
 	}
 	return p, nil
+}
+
+func (p *Profiler) PprofAddr() string {
+	if p == nil {
+		return ""
+	}
+	if p.ln != nil {
+		return p.ln.Addr().String()
+	}
+	return p.opts.PprofAddr
 }
 
 // Stop stops active profilers and writes the final heap profile when requested.
@@ -232,6 +245,7 @@ func (p *Profiler) newPprofMux() *http.ServeMux {
 	mux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
 	mux.HandleFunc("/debug/drive9/profile/cpu/start", p.handleStartCPUProfile)
 	mux.HandleFunc("/debug/drive9/profile/cpu/stop", p.handleStopCPUProfile)
+	mux.HandleFunc("/debug/drive9/mount/sync", p.handleMountSync)
 	return mux
 }
 
@@ -254,4 +268,31 @@ func (p *Profiler) handleStopCPUProfile(w http.ResponseWriter, _ *http.Request) 
 		return
 	}
 	_, _ = fmt.Fprintf(w, "stopped cpu profile: %s\n", path)
+}
+
+func (p *Profiler) handleMountSync(w http.ResponseWriter, r *http.Request) {
+	if p.opts.MountSync == nil {
+		http.Error(w, "mount sync is not available", http.StatusNotFound)
+		return
+	}
+	timeout := 5 * time.Minute
+	if raw := r.URL.Query().Get("timeout"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			http.Error(w, "invalid timeout duration", http.StatusBadRequest)
+			return
+		}
+		timeout = d
+	}
+	ctx, cf := context.WithTimeout(r.Context(), timeout)
+	defer cf()
+	if err := p.opts.MountSync(ctx); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			status = http.StatusGatewayTimeout
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	_, _ = fmt.Fprint(w, "synced mount\n")
 }

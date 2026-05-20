@@ -254,11 +254,13 @@ func Mount(opts *MountOptions) error {
 	// Build FUSE filesystem
 	dat9fs := NewDat9FS(c, opts)
 	layerEventWatcherStop := func() {}
+	opts.Profiling.MountSync = dat9fs.SyncAll
 
 	profiler, err := StartProfiler(opts.Profiling)
 	if err != nil {
 		return fmt.Errorf("start profiler: %w", err)
 	}
+	opts.Profiling.PprofAddr = profiler.PprofAddr()
 	defer profiler.Stop()
 
 	// Resolve sync mode (auto-detect RTT if needed).
