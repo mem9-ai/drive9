@@ -382,6 +382,48 @@ func TestTokenForgetEmitsDeprecationWarningAndDispatchesToCtxRm(t *testing.T) {
 	}
 }
 
+// TestTokenIssueDuplicateNameDoesNotRecommendDeprecatedForget is the
+// @adversary-1 msg `b07b633a` primary-review blocker fix: when
+// `drive9 token issue <name>` finds an existing local context with
+// that name, the error must NOT steer the user to the deprecated
+// `drive9 token forget`. It must point at the canonical
+// `drive9 ctx rm <name>` cleanup path so the user keeps a single
+// mental model (Plan B lock).
+//
+// Two code sites are affected (token.go lines 146 + 337 — both
+// `TokenIssue` pre-check and `saveScopedTokenContext` write-time
+// duplicate-name guard). The test exercises the pre-check site
+// directly via TokenIssue.
+func TestTokenIssueDuplicateNameDoesNotRecommendDeprecatedForget(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cfg := &Config{Contexts: map[string]*Context{}}
+	if _, err := ctxAdd(cfg, "smoke", &Context{Type: PrincipalFSScoped, Server: "https://s", APIKey: "dat9_existing"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvServer, "https://s")
+	t.Setenv(EnvAPIKey, "owner-key")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	err := TokenIssue([]string{"smoke", "--ttl", "1h", "--allow", "/scratch/smoke:read"})
+	if err == nil {
+		t.Fatal("expected duplicate-name error, got nil")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "drive9 token forget") {
+		t.Fatalf("duplicate-name error must NOT recommend deprecated `drive9 token forget`, got: %s", msg)
+	}
+	if !strings.Contains(msg, "drive9 ctx rm") {
+		t.Fatalf("duplicate-name error must point at canonical `drive9 ctx rm`, got: %s", msg)
+	}
+	if !strings.Contains(msg, "smoke") {
+		t.Fatalf("error must include the conflicting name 'smoke', got: %s", msg)
+	}
+}
+
 // TestTokenUsageHidesListAndForget verifies the canonical
 // `drive9 token --help` no longer advertises `list` or `forget`
 // as subcommands. They remain reachable as hidden aliases but the

@@ -143,7 +143,7 @@ func TokenIssue(args []string) error {
 	if name != "" {
 		cfg := loadConfig()
 		if _, exists := cfg.Contexts[name]; exists {
-			return fmt.Errorf("context %q already exists; use a different name or run: drive9 token forget %s", name, name)
+			return fmt.Errorf("context %q already exists; use a different name or remove the local context with: drive9 ctx rm %s", name, name)
 		}
 	}
 	if ttlRaw == "" {
@@ -334,7 +334,7 @@ func TokenRevoke(args []string) error {
 func saveScopedTokenContext(name, server string, resp *client.IssueScopedTokenResponse) error {
 	cfg := loadConfig()
 	if _, exists := cfg.Contexts[name]; exists {
-		return fmt.Errorf("context %q already exists; use a different name or run: drive9 token forget %s", name, name)
+		return fmt.Errorf("context %q already exists; use a different name or remove the local context with: drive9 ctx rm %s", name, name)
 	}
 	if server == "" {
 		server = cfg.ResolveServer()
