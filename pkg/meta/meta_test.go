@@ -144,6 +144,44 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 	}
 }
 
+func TestInsertAPIKeyAllowsRepeatedKeyName(t *testing.T) {
+	s := newControlStore(t)
+	now := time.Now().UTC()
+	tenant := &Tenant{
+		ID:               "repeat-key-name-tenant",
+		Status:           TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: []byte("cipher"),
+		DBName:           "tenant_db",
+		DBTLS:            true,
+		Provider:         "tidb_zero",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := s.InsertTenant(context.Background(), tenant); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"k-repeat-a", "k-repeat-b"} {
+		if err := s.InsertAPIKey(context.Background(), &APIKey{
+			ID:            id,
+			TenantID:      tenant.ID,
+			KeyName:       "same-audit-label",
+			JWTCiphertext: []byte("jwt-cipher-" + id),
+			JWTHash:       "hash-" + id,
+			TokenVersion:  1,
+			Status:        APIKeyActive,
+			IssuedAt:      now,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}); err != nil {
+			t.Fatalf("InsertAPIKey %s: %v", id, err)
+		}
+	}
+}
+
 func TestInsertAndListAPIKeyFSScopes(t *testing.T) {
 	s := newControlStore(t)
 	now := time.Now().UTC()
@@ -554,6 +592,9 @@ func TestMetaSchemaSpecIncludesForkStorageNamespaceColumns(t *testing.T) {
 func TestMetaSchemaSpecIncludesAPIKeyScopeTables(t *testing.T) {
 	spec := mustMetaSpec(t)
 	apiKeys := mustMetaTableSpec(t, spec, "tenant_api_keys")
+	if _, ok := apiKeys.indexes["idx_api_keys_tenant_name"]; ok {
+		t.Fatal("tenant_api_keys schema must not require key_name uniqueness")
+	}
 	scopeKind, ok := apiKeys.columns["scope_kind"]
 	if !ok {
 		t.Fatal("tenant_api_keys schema missing scope_kind")

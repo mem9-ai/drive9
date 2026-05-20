@@ -36,7 +36,7 @@ const fsClientWarmTimeout = 3 * time.Second
 func NewFromEnv() *client.Client {
 	r := ResolveCredentials()
 	apiKey := ""
-	if r.Kind == CredentialOwner {
+	if r.Kind == CredentialOwner || r.Kind == CredentialFSScoped {
 		apiKey = r.APIKey
 	}
 	return client.New(r.Server, apiKey)

@@ -9,7 +9,8 @@ import (
 )
 
 func TestIssueScopedTokenSendsRequest(t *testing.T) {
-	var gotAuth, gotSubject string
+	var gotAuth string
+	var gotSubject any
 	var gotTTL float64
 	var gotScopes []any
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -24,7 +25,7 @@ func TestIssueScopedTokenSendsRequest(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-		gotSubject, _ = body["subject"].(string)
+		gotSubject = body["subject"]
 		gotTTL, _ = body["ttl_seconds"].(float64)
 		gotScopes, _ = body["scopes"].([]any)
 		w.Header().Set("Content-Type", "application/json")
@@ -35,7 +36,6 @@ func TestIssueScopedTokenSendsRequest(t *testing.T) {
 
 	c := New(ts.URL, "owner-key")
 	resp, err := c.IssueScopedToken(context.Background(), IssueScopedTokenRequest{
-		Subject:    "vm0",
 		TTLSeconds: 3600,
 		Scopes:     []FSScopeGrant{{Prefix: ":/scratch", Ops: []string{"read", "write"}}},
 	})
@@ -45,7 +45,7 @@ func TestIssueScopedTokenSendsRequest(t *testing.T) {
 	if gotAuth != "Bearer owner-key" {
 		t.Fatalf("Authorization = %q, want owner bearer", gotAuth)
 	}
-	if gotSubject != "vm0" || gotTTL != 3600 || len(gotScopes) != 1 {
+	if gotSubject != nil || gotTTL != 3600 || len(gotScopes) != 1 {
 		t.Fatalf("request body subject=%q ttl=%v scopes=%v", gotSubject, gotTTL, gotScopes)
 	}
 	if resp.Token != "dat9_scoped" || resp.TokenID != "key_123" || resp.ScopeKind != "fs_scoped" {
@@ -53,6 +53,34 @@ func TestIssueScopedTokenSendsRequest(t *testing.T) {
 	}
 	if resp.ExpiresAt == nil {
 		t.Fatal("ExpiresAt = nil, want timestamp")
+	}
+}
+
+func TestRevokeScopedTokenByAPIKeyUsesPOSTBody(t *testing.T) {
+	var gotPath, gotMethod string
+	var gotBody map[string]string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotMethod = r.Method
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "owner-key")
+	if err := c.RevokeScopedTokenByAPIKey(context.Background(), "dat9_scoped"); err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Fatalf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/v1/tokens/revoke" {
+		t.Fatalf("path = %q, want /v1/tokens/revoke", gotPath)
+	}
+	if gotBody["api_key"] != "dat9_scoped" {
+		t.Fatalf("body = %#v", gotBody)
 	}
 }
 

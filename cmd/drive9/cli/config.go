@@ -16,6 +16,7 @@ type PrincipalType string
 const (
 	PrincipalOwner     PrincipalType = "owner"
 	PrincipalDelegated PrincipalType = "delegated"
+	PrincipalFSScoped  PrincipalType = "fs_scoped"
 )
 
 // Perm is the scope permission carried by a delegated context's JWT. Spec §6
@@ -31,8 +32,9 @@ const (
 // Type per spec §13.1:
 //
 //   - owner:     APIKey, Server
+//   - fs_scoped: APIKey, Server, Scope[], ExpiresAt
 //   - delegated: Token, Server (from iss), Agent, Scope[], Perm, ExpiresAt,
-//                GrantID, optional LabelHint
+//     GrantID, optional LabelHint
 //
 // The delegated fields are populated by locally decoding the JWT payload at
 // `ctx import` time. This is UX-only — authorization remains server-side
@@ -121,7 +123,7 @@ func saveConfig(cfg *Config) error {
 // active context is delegated or absent.
 func (c *Config) CurrentAPIKey() string {
 	ctx := c.currentContextEntry()
-	if ctx == nil || ctx.Type != PrincipalOwner {
+	if ctx == nil || (ctx.Type != PrincipalOwner && ctx.Type != PrincipalFSScoped) {
 		return ""
 	}
 	return ctx.APIKey

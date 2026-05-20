@@ -586,7 +586,7 @@ func resolveMountCredentials(r ResolvedCredentials, flagServer, flagAPIKey strin
 	apiKey = flagAPIKey
 	if apiKey == "" {
 		switch r.Kind {
-		case CredentialOwner:
+		case CredentialOwner, CredentialFSScoped:
 			apiKey = r.APIKey
 		case CredentialDelegated:
 			token = r.Token

@@ -34,6 +34,7 @@ type CredentialKind int
 const (
 	CredentialNone CredentialKind = iota
 	CredentialOwner
+	CredentialFSScoped
 	CredentialDelegated
 )
 
@@ -46,7 +47,7 @@ const (
 type ResolvedCredentials struct {
 	Kind         CredentialKind
 	Server       string
-	APIKey       string // set when Kind == CredentialOwner
+	APIKey       string // set when Kind == CredentialOwner or CredentialFSScoped
 	Token        string // set when Kind == CredentialDelegated
 	CredSource   string // "env:DRIVE9_VAULT_TOKEN", "env:DRIVE9_API_KEY", "config:<ctx-name>", ""
 	ServerSource string // "env:DRIVE9_SERVER", "config:<ctx-name>", "default"
@@ -129,6 +130,12 @@ func resolveCredentialsWithConfig(cfg *Config) ResolvedCredentials {
 			case PrincipalOwner:
 				if ctx.APIKey != "" {
 					r.Kind = CredentialOwner
+					r.APIKey = ctx.APIKey
+					r.CredSource = "config:" + ctxName
+				}
+			case PrincipalFSScoped:
+				if ctx.APIKey != "" {
+					r.Kind = CredentialFSScoped
 					r.APIKey = ctx.APIKey
 					r.CredSource = "config:" + ctxName
 				}

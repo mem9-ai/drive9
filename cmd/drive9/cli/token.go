@@ -3,8 +3,11 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"sort"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
@@ -18,6 +21,10 @@ func Token(args []string) error {
 	switch args[0] {
 	case "issue":
 		return TokenIssue(args[1:])
+	case "list", "ls":
+		return TokenList(args[1:])
+	case "forget":
+		return TokenForget(args[1:])
 	case "revoke":
 		return TokenRevoke(args[1:])
 	case "-h", "-help", "--help", "help":
@@ -32,17 +39,25 @@ func tokenUsage() string {
 	return `usage: drive9 token <command> [arguments]
 
 commands:
-  issue --subject <name> --ttl <duration> --allow <prefix:ops>
-                       issue an fs_scoped token
-  revoke <token_id>   revoke an fs_scoped token
+  issue [name] --ttl <duration> --allow <prefix:ops>
+                       issue an fs_scoped token; name is local only when set
+  list                 list locally saved fs_scoped token names
+  forget <name>        remove a local token name without revoking the token
+  revoke <name>        revoke a locally named fs_scoped token
+  revoke -             read a token from stdin and revoke it
 
 issue flags:
-  --subject <name>    label stored as token key_name
+  --subject <name>    optional server-side audit label; not a revoke key
   --ttl <duration>    required positive duration, e.g. 1h, 24h
   --allow <prefix:ops>
                        repeatable; ops are comma-separated read,list,search,write,delete
   --json              print full JSON response
-  --token-only        print only the bearer token
+  --print             print only the bearer token
+  --token-only        alias for --print
+
+revoke flags:
+  --api-key-file <path>
+                       read the target token from a file instead of a local name
 `
 }
 
@@ -57,6 +72,7 @@ func TokenIssue(args []string) error {
 		asJSON    bool
 		tokenOnly bool
 		scopes    []client.FSScopeGrant
+		name      string
 	)
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -84,17 +100,27 @@ func TokenIssue(args []string) error {
 			scopes = append(scopes, scope)
 		case "--json":
 			asJSON = true
-		case "--token-only":
+		case "--print", "--token-only":
 			tokenOnly = true
 		default:
-			return fmt.Errorf("unknown flag %q", args[i])
+			if strings.HasPrefix(args[i], "-") {
+				return fmt.Errorf("unknown flag %q", args[i])
+			}
+			if name != "" {
+				return fmt.Errorf("unexpected argument %q", args[i])
+			}
+			name = args[i]
 		}
 	}
 	if asJSON && tokenOnly {
 		return fmt.Errorf("--json and --token-only are mutually exclusive")
 	}
-	if strings.TrimSpace(subject) == "" {
-		return fmt.Errorf("--subject is required")
+	name = strings.TrimSpace(name)
+	if name != "" {
+		cfg := loadConfig()
+		if _, exists := cfg.Contexts[name]; exists {
+			return fmt.Errorf("context %q already exists; use a different name or run: drive9 token forget %s", name, name)
+		}
 	}
 	if ttlRaw == "" {
 		return fmt.Errorf("--ttl is required")
@@ -110,7 +136,8 @@ func TokenIssue(args []string) error {
 		return fmt.Errorf("at least one --allow is required")
 	}
 
-	c, err := newTokenManagementClientFromEnv()
+	r := ResolveCredentials()
+	c, err := newTokenManagementClientFromResolved(r)
 	if err != nil {
 		return err
 	}
@@ -122,14 +149,21 @@ func TokenIssue(args []string) error {
 	if err != nil {
 		return err
 	}
+	if name != "" {
+		if err := saveScopedTokenContext(name, r.Server, resp); err != nil {
+			return rollbackIssuedTokenAfterSaveFailure(c, resp.Token, err)
+		}
+	}
 	switch {
 	case tokenOnly:
 		_, _ = fmt.Fprintln(os.Stdout, resp.Token)
 	case asJSON:
 		return writeJSON(resp)
 	default:
+		if name != "" {
+			_, _ = fmt.Fprintf(os.Stdout, "name=%s\n", name)
+		}
 		_, _ = fmt.Fprintf(os.Stdout, "token=%s\n", resp.Token)
-		_, _ = fmt.Fprintf(os.Stdout, "token_id=%s\n", resp.TokenID)
 		if resp.ExpiresAt != nil {
 			_, _ = fmt.Fprintf(os.Stdout, "expires_at=%s\n", resp.ExpiresAt.Format(time.RFC3339))
 		}
@@ -140,19 +174,213 @@ func TokenIssue(args []string) error {
 	return nil
 }
 
-func TokenRevoke(args []string) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: drive9 token revoke <token_id>")
+func rollbackIssuedTokenAfterSaveFailure(c *client.Client, apiKey string, saveErr error) error {
+	if strings.TrimSpace(apiKey) == "" {
+		return fmt.Errorf("issued token but failed to save local context; no token returned for rollback: %w", saveErr)
 	}
-	tokenID := strings.TrimSpace(args[0])
-	if tokenID == "" {
-		return fmt.Errorf("token_id is required")
+	if err := c.RevokeScopedTokenByAPIKey(context.Background(), apiKey); err != nil {
+		return fmt.Errorf("issued token but failed to save local context and rollback revoke failed; token=%s; save error: %w; revoke error: %v", apiKey, saveErr, err)
+	}
+	return fmt.Errorf("failed to save local token context; issued token was revoked: %w", saveErr)
+}
+
+func TokenList(args []string) error {
+	if len(args) != 0 {
+		return fmt.Errorf("usage: drive9 token list")
+	}
+	cfg := loadConfig()
+	names := make([]string, 0, len(cfg.Contexts))
+	for name, ctx := range cfg.Contexts {
+		if ctx != nil && ctx.Type == PrincipalFSScoped {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		fmt.Println("no local fs_scoped tokens")
+		return nil
+	}
+	sort.Strings(names)
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(w, "CURRENT\tNAME\tTYPE\tSCOPE\tEXPIRES_AT\tSTATUS")
+	now := time.Now()
+	for _, name := range names {
+		ctx := cfg.Contexts[name]
+		cur := " "
+		if name == cfg.CurrentContext {
+			cur = "*"
+		}
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			cur, name, ctx.Type, renderScope(ctx.Scope, string(ctx.Type), false),
+			formatExpiresAt(ctx.ExpiresAt), ctxStatus(ctx, now))
+	}
+	return w.Flush()
+}
+
+func TokenForget(args []string) error {
+	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
+		return fmt.Errorf("usage: drive9 token forget <name>")
+	}
+	name := strings.TrimSpace(args[0])
+	cfg := loadConfig()
+	ctx, ok := cfg.Contexts[name]
+	if !ok || ctx == nil || ctx.Type != PrincipalFSScoped {
+		return fmt.Errorf("fs_scoped token context %q not found", name)
+	}
+	delete(cfg.Contexts, name)
+	if cfg.CurrentContext == name {
+		cfg.CurrentContext = ""
+	}
+	if err := saveConfig(cfg); err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+	fmt.Printf("forgot local token %q\n", name)
+	return nil
+}
+
+func TokenRevoke(args []string) error {
+	var apiKeyFile string
+	pos := make([]string, 0, 1)
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--api-key-file":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--api-key-file requires a value")
+			}
+			i++
+			apiKeyFile = args[i]
+		default:
+			pos = append(pos, args[i])
+		}
+	}
+	if apiKeyFile != "" && len(pos) > 0 {
+		return fmt.Errorf("--api-key-file cannot be combined with a token name or id")
+	}
+	if apiKeyFile == "" && len(pos) != 1 {
+		return fmt.Errorf("usage: drive9 token revoke <name|->")
+	}
+
+	var (
+		targetAPIKey string
+		localName    string
+		legacyID     string
+		err          error
+	)
+	switch {
+	case apiKeyFile != "":
+		targetAPIKey, err = readTokenAPIKeyFile(apiKeyFile)
+	case pos[0] == "-":
+		targetAPIKey, err = readTokenAPIKeyStdin()
+	default:
+		target := strings.TrimSpace(pos[0])
+		if target == "" {
+			return fmt.Errorf("token name is required")
+		}
+		if strings.HasPrefix(target, "dat9_") {
+			return fmt.Errorf("refusing token secret in argv; pipe it with: drive9 token revoke -")
+		}
+		cfg := loadConfig()
+		if ctx := cfg.Contexts[target]; ctx != nil && ctx.Type == PrincipalFSScoped && ctx.APIKey != "" {
+			targetAPIKey = ctx.APIKey
+			localName = target
+		} else {
+			legacyID = target
+		}
+	}
+	if err != nil {
+		return err
 	}
 	c, err := newTokenManagementClientFromEnv()
 	if err != nil {
 		return err
 	}
-	return c.RevokeScopedToken(context.Background(), tokenID)
+	if targetAPIKey != "" {
+		if err := c.RevokeScopedTokenByAPIKey(context.Background(), targetAPIKey); err != nil {
+			return err
+		}
+		if localName != "" {
+			if err := forgetLocalScopedTokenContext(localName); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return c.RevokeScopedToken(context.Background(), legacyID)
+}
+
+func saveScopedTokenContext(name, server string, resp *client.IssueScopedTokenResponse) error {
+	cfg := loadConfig()
+	if _, exists := cfg.Contexts[name]; exists {
+		return fmt.Errorf("context %q already exists; use a different name or run: drive9 token forget %s", name, name)
+	}
+	if server == "" {
+		server = cfg.ResolveServer()
+	}
+	ctx := &Context{
+		Type:      PrincipalFSScoped,
+		Server:    server,
+		APIKey:    resp.Token,
+		Scope:     tokenScopeStrings(resp.Scopes),
+		ExpiresAt: timeValue(resp.ExpiresAt),
+	}
+	if _, err := ctxAdd(cfg, name, ctx); err != nil {
+		return err
+	}
+	if err := saveConfig(cfg); err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+	return nil
+}
+
+func forgetLocalScopedTokenContext(name string) error {
+	cfg := loadConfig()
+	ctx := cfg.Contexts[name]
+	if ctx == nil || ctx.Type != PrincipalFSScoped {
+		return nil
+	}
+	delete(cfg.Contexts, name)
+	if cfg.CurrentContext == name {
+		cfg.CurrentContext = ""
+	}
+	return saveConfig(cfg)
+}
+
+func tokenScopeStrings(scopes []client.FSScopeGrant) []string {
+	out := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		out = append(out, fmt.Sprintf("%s:%s", scope.Prefix, strings.Join(scope.Ops, ",")))
+	}
+	return out
+}
+
+func timeValue(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return *t
+}
+
+func readTokenAPIKeyStdin() (string, error) {
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return "", fmt.Errorf("read token from stdin: %w", err)
+	}
+	apiKey := strings.TrimSpace(string(data))
+	if apiKey == "" {
+		return "", fmt.Errorf("api_key is required")
+	}
+	return apiKey, nil
+}
+
+func readTokenAPIKeyFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read token file: %w", err)
+	}
+	apiKey := strings.TrimSpace(string(data))
+	if apiKey == "" {
+		return "", fmt.Errorf("api_key is required")
+	}
+	return apiKey, nil
 }
 
 func parseTokenAllow(raw string) (client.FSScopeGrant, error) {
@@ -201,7 +429,10 @@ func parseTokenOps(raw string) ([]string, error) {
 }
 
 func newTokenManagementClientFromEnv() (*client.Client, error) {
-	r := ResolveCredentials()
+	return newTokenManagementClientFromResolved(ResolveCredentials())
+}
+
+func newTokenManagementClientFromResolved(r ResolvedCredentials) (*client.Client, error) {
 	if r.Kind != CredentialOwner {
 		return nil, fmt.Errorf("missing tenant API key; set %s or run drive9 create", EnvAPIKey)
 	}
