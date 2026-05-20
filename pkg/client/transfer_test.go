@@ -133,6 +133,15 @@ func TestUploadBufferPoolGetHonorsContextCancel(t *testing.T) {
 	pool.put(buf)
 }
 
+func TestBoundedUploadParallelismCapsAtPartCount(t *testing.T) {
+	if got := boundedUploadParallelism(s3client.PartSize, 2); got != 2 {
+		t.Fatalf("parallelism = %d, want 2", got)
+	}
+	if got := boundedUploadParallelism(s3client.PartSize, 0); got != uploadParallelism(s3client.PartSize) {
+		t.Fatalf("parallelism for unknown part count = %d, want %d", got, uploadParallelism(s3client.PartSize))
+	}
+}
+
 // TestWriteStreamSmallFile verifies that WriteStream sends a small file via single direct PUT.
 func TestWriteStreamSmallFile(t *testing.T) {
 	var writtenData []byte
