@@ -118,6 +118,14 @@ func buildCtxShowEntry(cfg *Config, reveal bool) *ctxShowEntry {
 	switch current.Type {
 	case PrincipalOwner:
 		entry.APIKey = formatSecretForDisplay(current.APIKey, reveal)
+	case PrincipalFSScoped:
+		entry.APIKey = formatSecretForDisplay(current.APIKey, reveal)
+		entry.Scope = append([]string(nil), current.Scope...)
+		if !current.ExpiresAt.IsZero() {
+			expiresAt := current.ExpiresAt
+			entry.ExpiresAt = &expiresAt
+		}
+		entry.Status = ctxStatus(current, time.Now())
 	case PrincipalDelegated:
 		entry.Token = formatSecretForDisplay(current.Token, reveal)
 		entry.Agent = current.Agent
@@ -784,7 +792,7 @@ func buildCtxListEntries(cfg *Config) []ctxListEntry {
 }
 
 func ctxStatus(c *Context, now time.Time) string {
-	if c.Type == PrincipalDelegated && !c.ExpiresAt.IsZero() && !c.ExpiresAt.After(now) {
+	if (c.Type == PrincipalDelegated || c.Type == PrincipalFSScoped) && !c.ExpiresAt.IsZero() && !c.ExpiresAt.After(now) {
 		return "expired"
 	}
 	return "active"
@@ -834,7 +842,7 @@ func ctxUseCmd(args []string) error {
 	if !ok {
 		return fmt.Errorf("context %q not found; run: drive9 ctx ls", name)
 	}
-	if c.Type == PrincipalDelegated && !c.ExpiresAt.IsZero() && !c.ExpiresAt.After(time.Now()) {
+	if (c.Type == PrincipalDelegated || c.Type == PrincipalFSScoped) && !c.ExpiresAt.IsZero() && !c.ExpiresAt.After(time.Now()) {
 		return fmt.Errorf("context %q expired at %s; request a new grant and re-import", name, c.ExpiresAt.Format(time.RFC3339))
 	}
 	if cfg.CurrentContext == name {
@@ -855,6 +863,15 @@ func ctxUseDescriptor(c *Context) string {
 	switch c.Type {
 	case PrincipalOwner:
 		return fmt.Sprintf("  owner credentials, server %s", c.Server)
+	case PrincipalFSScoped:
+		scope := "—"
+		if len(c.Scope) > 0 {
+			scope = c.Scope[0]
+			if len(c.Scope) > 1 {
+				scope = fmt.Sprintf("%s +%d", scope, len(c.Scope)-1)
+			}
+		}
+		return fmt.Sprintf("  fs_scoped: scope %s, expires %s", scope, formatExpiresAt(c.ExpiresAt))
 	case PrincipalDelegated:
 		scope := "—"
 		if len(c.Scope) > 0 {

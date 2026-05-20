@@ -18,7 +18,7 @@ type FSScopeGrant struct {
 
 // IssueScopedTokenRequest is the wire payload for POST /v1/tokens.
 type IssueScopedTokenRequest struct {
-	Subject    string         `json:"subject"`
+	Subject    string         `json:"subject,omitempty"`
 	TTLSeconds int64          `json:"ttl_seconds"`
 	Scopes     []FSScopeGrant `json:"scopes"`
 }
@@ -26,11 +26,16 @@ type IssueScopedTokenRequest struct {
 // IssueScopedTokenResponse is returned by POST /v1/tokens.
 type IssueScopedTokenResponse struct {
 	Token     string         `json:"token"`
-	TokenID   string         `json:"token_id"`
-	Subject   string         `json:"subject"`
+	TokenID   string         `json:"token_id,omitempty"`
+	Subject   string         `json:"subject,omitempty"`
 	ScopeKind string         `json:"scope_kind"`
 	ExpiresAt *time.Time     `json:"expires_at,omitempty"`
 	Scopes    []FSScopeGrant `json:"scopes"`
+}
+
+// RevokeScopedTokenByAPIKeyRequest is the wire payload for POST /v1/tokens/revoke.
+type RevokeScopedTokenByAPIKeyRequest struct {
+	APIKey string `json:"api_key"`
 }
 
 // IssueScopedToken creates an fs_scoped tenant API token. The caller must use
@@ -66,6 +71,31 @@ func (c *Client) RevokeScopedToken(ctx context.Context, tokenID string) error {
 	if err != nil {
 		return err
 	}
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return readError(resp)
+	}
+	return nil
+}
+
+// RevokeScopedTokenByAPIKey revokes one fs_scoped tenant API token by presenting
+// the target bearer as request data. The caller must authenticate separately as
+// the tenant owner; the server hashes APIKey and revokes only a matching active
+// fs_scoped token in the same tenant.
+func (c *Client) RevokeScopedTokenByAPIKey(ctx context.Context, apiKey string) error {
+	body, err := json.Marshal(RevokeScopedTokenByAPIKeyRequest{APIKey: apiKey})
+	if err != nil {
+		return fmt.Errorf("marshal scoped token revoke request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/tokens/revoke", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.do(req)
 	if err != nil {
 		return err

@@ -141,6 +141,28 @@ func TestResolveCredentials_ConfigDelegatedContext(t *testing.T) {
 	}
 }
 
+func TestResolveCredentials_ConfigFSScopedContext(t *testing.T) {
+	setResolverEnv(t, nil)
+	cfg := &Config{
+		CurrentContext: "smoke",
+		Contexts: map[string]*Context{
+			"smoke": {Type: PrincipalFSScoped, Server: "https://config.example", APIKey: "dat9_scoped"},
+		},
+	}
+
+	r := resolveCredentialsWithConfig(cfg)
+
+	if r.Kind != CredentialFSScoped {
+		t.Fatalf("Kind = %d, want CredentialFSScoped", r.Kind)
+	}
+	if r.APIKey != "dat9_scoped" {
+		t.Fatalf("APIKey = %q", r.APIKey)
+	}
+	if r.Server != "https://config.example" {
+		t.Fatalf("Server = %q", r.Server)
+	}
+}
+
 func TestResolveCredentials_EmptyWhenNothingAvailable(t *testing.T) {
 	setResolverEnv(t, nil)
 	cfg := &Config{}

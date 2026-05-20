@@ -23,18 +23,22 @@ type fsTokenScopeRequest struct {
 }
 
 type issueScopedTokenRequest struct {
-	Subject    string                `json:"subject"`
+	Subject    string                `json:"subject,omitempty"`
 	TTLSeconds int64                 `json:"ttl_seconds"`
 	Scopes     []fsTokenScopeRequest `json:"scopes"`
 }
 
 type scopedTokenResponse struct {
 	Token     string                `json:"token"`
-	TokenID   string                `json:"token_id"`
-	Subject   string                `json:"subject"`
+	TokenID   string                `json:"token_id,omitempty"`
+	Subject   string                `json:"subject,omitempty"`
 	ScopeKind string                `json:"scope_kind"`
 	ExpiresAt *time.Time            `json:"expires_at,omitempty"`
 	Scopes    []fsTokenScopeRequest `json:"scopes"`
+}
+
+type revokeScopedTokenByAPIKeyRequest struct {
+	APIKey string `json:"api_key"`
 }
 
 const maxScopedTokenTTLSeconds = int64(1<<63-1) / int64(time.Second)
@@ -55,6 +59,14 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleScopedTokenIssue(w, r, scope)
+		return
+	}
+	if r.URL.Path == "/v1/tokens/revoke" {
+		if r.Method != http.MethodPost {
+			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		s.handleScopedTokenRevokeByAPIKey(w, r, scope)
 		return
 	}
 
@@ -90,10 +102,6 @@ func (s *Server) handleScopedTokenIssue(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	subject := strings.TrimSpace(req.Subject)
-	if subject == "" {
-		errJSON(w, http.StatusBadRequest, "subject is required")
-		return
-	}
 	if len(subject) > 64 {
 		errJSON(w, http.StatusBadRequest, "subject must be at most 64 bytes")
 		return
@@ -149,7 +157,7 @@ func (s *Server) handleScopedTokenIssue(w http.ResponseWriter, r *http.Request, 
 		UpdatedAt:     now,
 	}); err != nil {
 		if errors.Is(err, meta.ErrDuplicate) {
-			errJSON(w, http.StatusConflict, "token subject already exists")
+			errJSON(w, http.StatusConflict, "token already exists")
 			return
 		}
 		errJSON(w, http.StatusInternalServerError, "failed to persist token")
@@ -195,6 +203,42 @@ func (s *Server) handleScopedTokenIssue(w http.ResponseWriter, r *http.Request, 
 
 func (s *Server) handleScopedTokenRevoke(w http.ResponseWriter, r *http.Request, scope *TenantScope, tokenID string) {
 	if err := s.meta.RevokeAPIKey(r.Context(), scope.TenantID, tokenID); err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "token not found or already revoked")
+			return
+		}
+		errJSON(w, http.StatusInternalServerError, "failed to revoke token")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleScopedTokenRevokeByAPIKey(w http.ResponseWriter, r *http.Request, scope *TenantScope) {
+	var req revokeScopedTokenByAPIKeyRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		errJSON(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	apiKey := strings.TrimSpace(req.APIKey)
+	if apiKey == "" {
+		errJSON(w, http.StatusBadRequest, "api_key is required")
+		return
+	}
+	resolved, err := s.meta.ResolveByAPIKeyHash(r.Context(), token.HashToken(apiKey))
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, "token not found or already revoked")
+			return
+		}
+		errJSON(w, http.StatusInternalServerError, "failed to revoke token")
+		return
+	}
+	if resolved.APIKey.TenantID != scope.TenantID || resolved.APIKey.ScopeKind != meta.APIKeyScopeKindFS {
+		errJSON(w, http.StatusNotFound, "token not found or already revoked")
+		return
+	}
+	if err := s.meta.RevokeAPIKey(r.Context(), scope.TenantID, resolved.APIKey.ID); err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "token not found or already revoked")
 			return

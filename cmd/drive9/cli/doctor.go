@@ -377,6 +377,8 @@ func doctorCredentialsCheck(creds ResolvedCredentials) doctorCheck {
 	switch creds.Kind {
 	case CredentialOwner:
 		return doctorCheck{name: "credentials", status: doctorPass, detail: "owner credential from " + creds.CredSource}
+	case CredentialFSScoped:
+		return doctorCheck{name: "credentials", status: doctorPass, detail: "fs_scoped credential from " + creds.CredSource}
 	case CredentialDelegated:
 		return doctorCheck{name: "credentials", status: doctorPass, detail: "delegated credential from " + creds.CredSource}
 	default:

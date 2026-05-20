@@ -208,6 +208,9 @@ func (s *Store) migrate() (err error) {
 	if err != nil {
 		return fmt.Errorf("parse meta schema statements: %w", err)
 	}
+	if err := dropObsoleteMetaIndexes(ctx, s.db); err != nil {
+		return err
+	}
 	diffs, err := diffMetaSchema(ctx, s.db, spec)
 	if err != nil {
 		return fmt.Errorf("diff meta schema: %w", err)
@@ -408,8 +411,7 @@ func metaInitSchemaStatements() []string {
 			created_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			UNIQUE INDEX idx_api_keys_hash (jwt_hash),
-			INDEX idx_api_keys_tenant (tenant_id, status),
-			UNIQUE INDEX idx_api_keys_tenant_name (tenant_id, key_name)
+			INDEX idx_api_keys_tenant (tenant_id, status)
 		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_api_key_fs_scopes (
 			tenant_id   VARCHAR(64) NOT NULL,
@@ -501,6 +503,28 @@ func metaInitSchemaStatements() []string {
 			INDEX idx_tenant_order (tenant_id, id)
 		)`,
 	}
+}
+
+func dropObsoleteMetaIndexes(ctx context.Context, db *sql.DB) error {
+	if err := dropMetaIndexIfExists(ctx, db, "tenant_api_keys", "idx_api_keys_tenant_name"); err != nil {
+		return fmt.Errorf("drop obsolete meta index idx_api_keys_tenant_name: %w", err)
+	}
+	return nil
+}
+
+func dropMetaIndexIfExists(ctx context.Context, db *sql.DB, tableName, indexName string) error {
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM information_schema.statistics
+		WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?`,
+		tableName, indexName).Scan(&count); err != nil {
+		return err
+	}
+	if count == 0 {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, fmt.Sprintf("DROP INDEX %s ON %s", indexName, tableName))
+	return err
 }
 
 func metaSchemaSpecFromStatements(stmts []string) (metaSchemaSpec, error) {
