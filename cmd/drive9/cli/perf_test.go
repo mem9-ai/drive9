@@ -4,10 +4,13 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPerfSummarizeJSONL(t *testing.T) {
@@ -55,6 +58,27 @@ func TestPerfCollectCreatesBundle(t *testing.T) {
 		if !containsString(names, want) {
 			t.Fatalf("bundle names = %v, missing %s", names, want)
 		}
+	}
+}
+
+func TestPerfMountSyncCallsEndpoint(t *testing.T) {
+	var gotPath string
+	var gotTimeout string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotTimeout = r.URL.Query().Get("timeout")
+		_, _ = w.Write([]byte("synced mount\n"))
+	}))
+	defer ts.Close()
+
+	if err := perfMountSync(ts.URL, 2*time.Second); err != nil {
+		t.Fatalf("perfMountSync: %v", err)
+	}
+	if gotPath != "/debug/drive9/mount/sync" {
+		t.Fatalf("path = %q, want /debug/drive9/mount/sync", gotPath)
+	}
+	if gotTimeout != "2s" {
+		t.Fatalf("timeout = %q, want 2s", gotTimeout)
 	}
 }
 

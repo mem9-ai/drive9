@@ -21,6 +21,7 @@ perf/mount/run.sh small-files
 perf/mount/run.sh metadata-walk
 perf/mount/run.sh large-write
 perf/mount/run.sh large-read
+perf/mount/run.sh cold-read
 ```
 
 Or provide endpoint credentials explicitly:
@@ -49,6 +50,7 @@ DRIVE9_PERF_INTERVAL=1s
 DRIVE9_PERF_MAX_SAMPLES=7200
 DRIVE9_PPROF_ADDR=127.0.0.1:6060
 DRIVE9_MOUNT_EXTRA_FLAGS="--dir-ttl 1s --attr-ttl 1s"
+COLD_READ_SEED_MB=256
 ```
 
 `DRIVE9_PROFILE_CPU_MODE=workload` starts CPU profiling immediately before the
@@ -96,9 +98,26 @@ profiles/<timestamp>-<workload>/
 - `metadata-walk`: creates a modest tree, then runs `find` and `stat`.
 - `large-write`: writes one large sequential file.
 - `large-read`: reads one large sequential file, creating it first if missing.
+- `cold-read`: seeds one large file through the Drive9 API, then reads it
+  through FUSE so the mount read path cannot reuse data written by the same
+  FUSE session.
 
 These workloads are intentionally simple shell scripts so profile results are
 easy to reproduce and reason about.
+
+## Explicit Remote Sync
+
+For a profiled FUSE mount, the pprof control server also exposes a Drive9 sync
+fence. It flushes open handles and waits for background remote write queues
+without unmounting:
+
+```bash
+drive9 perf sync --mountpoint /tmp/drive9-perf-mnt --timeout 5m
+```
+
+This is stronger than relying on a shell `sync` command for the harness because
+go-fuse does not currently expose Linux `syncfs` to the filesystem
+implementation.
 
 ## Runtime Requirements
 

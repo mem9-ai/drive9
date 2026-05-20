@@ -209,6 +209,35 @@ func (cq *CommitQueue) PendingStats() (count int, bytes int64) {
 	return
 }
 
+// WaitAll waits until all queued and in-flight commits finish without stopping
+// the queue. It is used by explicit sync controls while the mount remains
+// usable for subsequent writes.
+func (cq *CommitQueue) WaitAll(ctx context.Context) error {
+	if cq == nil {
+		return nil
+	}
+	start := time.Now()
+	defer func() {
+		if cq.perf != nil {
+			cq.perf.commitDrainCount.add(1)
+			cq.perf.commitDrainTotalNS.add(uint64(time.Since(start)))
+		}
+	}()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		count, _ := cq.PendingStats()
+		if count == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 // IsFull reports whether the queue has reached its backpressure limit.
 func (cq *CommitQueue) IsFull() bool {
 	cq.mu.Lock()

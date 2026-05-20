@@ -35,6 +35,8 @@ func Perf(args []string) error {
 		return perfCollectCmd(args[1:])
 	case "summarize":
 		return perfSummarizeCmd(args[1:])
+	case "sync":
+		return perfSyncCmd(args[1:])
 	case "-h", "-help", "--help", "help":
 		perfUsage()
 		return nil
@@ -49,6 +51,7 @@ func perfUsage() {
 commands:
   collect      collect a local support bundle for a running mount
   summarize    summarize a perf JSONL file into summary.json
+  sync         ask a running profiled FUSE mount to drain remote writes
 `)
 }
 
@@ -187,6 +190,34 @@ func perfCollectCmd(args []string) error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "drive9: perf bundle written to %s\n", *out)
+	return nil
+}
+
+func perfSyncCmd(args []string) error {
+	fs := flag.NewFlagSet("perf sync", flag.ExitOnError)
+	mountPoint := fs.String("mountpoint", "", "drive9 mountpoint to inspect")
+	pprofAddr := fs.String("pprof-addr", "", "mount pprof address, overrides mount state")
+	timeout := fs.Duration("timeout", 5*time.Minute, "maximum time to wait for remote write drain")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *timeout <= 0 {
+		return fmt.Errorf("drive9 perf sync: --timeout must be > 0")
+	}
+	if *mountPoint != "" && *pprofAddr == "" {
+		state, _, err := mountstate.ReadProcessState(*mountPoint)
+		if err != nil {
+			return fmt.Errorf("drive9 perf sync: read mount state: %w", err)
+		}
+		*pprofAddr = state.PprofAddr
+	}
+	if *pprofAddr == "" {
+		return fmt.Errorf("drive9 perf sync: provide --mountpoint for a profiled mount or --pprof-addr")
+	}
+	if err := perfMountSync(*pprofAddr, *timeout); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "drive9: mount sync completed")
 	return nil
 }
 
@@ -508,6 +539,22 @@ func fetchPprof(addr, endpoint, out string) error {
 	defer func() { _ = f.Close() }()
 	if _, err := io.Copy(f, resp.Body); err != nil {
 		return fmt.Errorf("write pprof output %s: %w", out, err)
+	}
+	return nil
+}
+
+func perfMountSync(addr string, timeout time.Duration) error {
+	base := normalizePprofBase(addr)
+	syncURL := base + "/debug/drive9/mount/sync?timeout=" + url.QueryEscape(timeout.String())
+	client := &http.Client{Timeout: timeout + 5*time.Second}
+	resp, err := client.Get(syncURL)
+	if err != nil {
+		return fmt.Errorf("mount sync: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("mount sync returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
 }
