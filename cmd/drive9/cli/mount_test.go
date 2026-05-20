@@ -779,6 +779,35 @@ func TestMountCmdPassesReadConcurrencyOption(t *testing.T) {
 	}
 }
 
+func TestMountCmdPassesUploadConcurrencyOption(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--upload-concurrency", "16",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.UploadConcurrency != 16 {
+		t.Fatalf("UploadConcurrency = %d, want 16", got.UploadConcurrency)
+	}
+}
+
 func TestMountCmdRejectsInvalidReadConcurrency(t *testing.T) {
 	err := MountCmd([]string{
 		"--mode", "fuse",
@@ -789,6 +818,19 @@ func TestMountCmdRejectsInvalidReadConcurrency(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "--read-concurrency") {
 		t.Fatalf("MountCmd error = %v, want read-concurrency validation error", err)
+	}
+}
+
+func TestMountCmdRejectsInvalidUploadConcurrency(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--upload-concurrency", "0",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--upload-concurrency") {
+		t.Fatalf("MountCmd error = %v, want upload-concurrency validation error", err)
 	}
 }
 

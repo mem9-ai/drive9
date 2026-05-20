@@ -49,6 +49,7 @@ type mountFuseOptions struct {
 	SyncMode              fuseSyncMode
 	WritePolicy           fuseWritePolicy
 	Profile               string
+	UploadConcurrency     int
 	ReadConcurrency       int
 	SyncRead              bool
 	AllowOther            bool

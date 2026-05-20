@@ -150,5 +150,7 @@ func ApplyInteractiveProfile(opts *MountOptions) {
 	}
 	// Disable debounce — replaced by shadow writes.
 	opts.FlushDebounce = 0
-	opts.UploadConcurrency = 4
+	if opts.UploadConcurrency <= 0 {
+		opts.UploadConcurrency = defaultUploadConcurrency
+	}
 }
