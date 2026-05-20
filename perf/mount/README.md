@@ -46,6 +46,7 @@ DRIVE9_PROFILE_CPU_MODE=workload
 DRIVE9_PROFILE_HEAP_INTERVAL=0s
 DRIVE9_PERF_JSONL=/tmp/drive9-perf-profiles/run/perf.jsonl
 DRIVE9_PERF_INTERVAL=1s
+DRIVE9_PERF_MAX_SAMPLES=7200
 DRIVE9_PPROF_ADDR=127.0.0.1:6060
 DRIVE9_MOUNT_EXTRA_FLAGS="--dir-ttl 1s --attr-ttl 1s"
 ```
@@ -64,7 +65,8 @@ profile data.
 includes Go runtime heap stats, process CPU/RSS counters, FUSE operation
 counters, remote operation counters, cache counters, queue depths, dirty inode
 count, and open handle counts. `DRIVE9_PERF_INTERVAL` defaults to `1s` in the
-harness. Set `DRIVE9_PERF_JSONL=` to disable continuous samples for a run.
+harness. `DRIVE9_PERF_MAX_SAMPLES` bounds one JSONL segment before rotation to
+`.1`. Set `DRIVE9_PERF_JSONL=` to disable continuous samples for a run.
 
 Each run writes:
 
@@ -74,7 +76,9 @@ profiles/<timestamp>-<workload>/
   heap-final.pprof
   heap-*.pprof        # only when DRIVE9_PROFILE_HEAP_INTERVAL > 0
   perf.jsonl
+  perf.jsonl.1        # only after segment rotation
   perf-last.json
+  summary.json
   cpu-top.txt
   cpu-callgraph.svg
   heap-inuse-space-top.txt

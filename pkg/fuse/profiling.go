@@ -23,6 +23,7 @@ type ProfilingOptions struct {
 	PprofAddr           string
 	PerfSamplesPath     string
 	PerfSampleInterval  time.Duration
+	PerfMaxSamples      int
 }
 
 // Profiler owns the profiling resources for one mount process.

@@ -63,8 +63,14 @@ func TestContinuousPerfRecorderWritesJSONLSamples(t *testing.T) {
 	if last.Runtime.Goroutines <= 0 || last.Runtime.SysBytes == 0 {
 		t.Fatalf("runtime stats not populated: %+v", last.Runtime)
 	}
+	if last.Context.Component != "drive9-fuse" || last.Context.PID <= 0 {
+		t.Fatalf("context not populated: %+v", last.Context)
+	}
 	if last.FuseOps["write"].Count != 1 || last.FuseOps["write"].Bytes != 64 {
 		t.Fatalf("write fuse stats = %+v, want count=1 bytes=64", last.FuseOps["write"])
+	}
+	if last.FuseOps["write"].P95NS == 0 || last.FuseOps["write"].MaxNS == 0 {
+		t.Fatalf("write latency stats not populated: %+v", last.FuseOps["write"])
 	}
 	if last.RemoteOps["write"].Count != 1 || last.RemoteOps["write"].Bytes != 64 {
 		t.Fatalf("write remote stats = %+v, want count=1 bytes=64", last.RemoteOps["write"])
@@ -74,6 +80,43 @@ func TestContinuousPerfRecorderWritesJSONLSamples(t *testing.T) {
 	}
 	if last.Queues.OpenFileHandles != 1 || last.Queues.DirtyInodes != 1 {
 		t.Fatalf("queue stats = %+v, want one open file handle and one dirty inode", last.Queues)
+	}
+}
+
+func TestContinuousPerfRecorderRotatesSamples(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "samples.jsonl")
+	opts := &MountOptions{
+		CacheSize:             1 << 20,
+		ReadCacheMaxFileBytes: 1 << 20,
+		Profiling: ProfilingOptions{
+			PerfSamplesPath:    path,
+			PerfSampleInterval: time.Hour,
+			PerfMaxSamples:     2,
+		},
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	recorder, err := StartContinuousPerf(opts.Profiling, fs)
+	if err != nil {
+		t.Fatalf("StartContinuousPerf: %v", err)
+	}
+	if err := recorder.writeSample("manual-1"); err != nil {
+		t.Fatalf("write manual sample 1: %v", err)
+	}
+	if err := recorder.writeSample("manual-2"); err != nil {
+		t.Fatalf("write manual sample 2: %v", err)
+	}
+	recorder.Stop()
+
+	if _, err := os.Stat(path + ".1"); err != nil {
+		t.Fatalf("stat rotated segment: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read active segment: %v", err)
+	}
+	if !strings.Contains(string(data), `"reason":"stop"`) {
+		t.Fatalf("active segment missing stop sample: %s", data)
 	}
 }
 

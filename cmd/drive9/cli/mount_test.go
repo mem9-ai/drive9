@@ -909,6 +909,7 @@ func TestMountCmdPassesContinuousPerfOptions(t *testing.T) {
 		"--api-key", "sk-test",
 		"--perf-jsonl", "/tmp/drive9-perf.jsonl",
 		"--perf-interval", "2s",
+		"--perf-max-samples", "42",
 		t.TempDir(),
 	})
 	if err != nil {
@@ -923,6 +924,9 @@ func TestMountCmdPassesContinuousPerfOptions(t *testing.T) {
 	if got.PerfSampleInterval != 2*time.Second {
 		t.Fatalf("PerfSampleInterval = %v, want 2s", got.PerfSampleInterval)
 	}
+	if got.PerfMaxSamples != 42 {
+		t.Fatalf("PerfMaxSamples = %d, want 42", got.PerfMaxSamples)
+	}
 }
 
 func TestMountCmdRejectsPerfIntervalWithoutJSONL(t *testing.T) {
@@ -935,6 +939,19 @@ func TestMountCmdRejectsPerfIntervalWithoutJSONL(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "--perf-interval requires --perf-jsonl") {
 		t.Fatalf("MountCmd error = %v, want perf interval validation error", err)
+	}
+}
+
+func TestMountCmdRejectsPerfMaxSamplesWithoutJSONL(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-max-samples", "42",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--perf-max-samples requires --perf-jsonl") {
+		t.Fatalf("MountCmd error = %v, want perf max samples validation error", err)
 	}
 }
 

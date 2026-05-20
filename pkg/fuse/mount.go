@@ -122,6 +122,9 @@ func (o *MountOptions) setDefaults() {
 	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfSampleInterval <= 0 {
 		o.Profiling.PerfSampleInterval = 10 * time.Second
 	}
+	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfMaxSamples <= 0 {
+		o.Profiling.PerfMaxSamples = defaultPerfMaxSamples
+	}
 }
 
 // Mount creates and serves a FUSE mount. It blocks until the filesystem
@@ -198,16 +201,17 @@ func Mount(opts *MountOptions) error {
 		return fmt.Errorf("start profiler: %w", err)
 	}
 	defer profiler.Stop()
+
+	// Resolve sync mode (auto-detect RTT if needed).
+	resolved := ResolveMode(context.Background(), opts.SyncMode, opts.Server)
+	opts.SyncMode = resolved
+	dat9fs.syncMode = resolved
+	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", resolved)
 	perfRecorder, err := StartContinuousPerf(opts.Profiling, dat9fs)
 	if err != nil {
 		return fmt.Errorf("start continuous perf: %w", err)
 	}
 	defer perfRecorder.Stop()
-
-	// Resolve sync mode (auto-detect RTT if needed).
-	resolved := ResolveMode(context.Background(), opts.SyncMode, opts.Server)
-	dat9fs.syncMode = resolved
-	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", resolved)
 
 	// Initialize write-back cache, shadow store, and pending index.
 	var cacheBase, shadowDir string
@@ -336,7 +340,21 @@ func Mount(opts *MountOptions) error {
 	if err := server.WaitMount(); err != nil {
 		return fmt.Errorf("fuse wait mount: %w", err)
 	}
-	pidFile, err := mountstate.WritePID(opts.MountPoint, os.Getpid())
+	pidFile, err := mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
+		PID:             os.Getpid(),
+		Component:       "drive9-fuse",
+		MountPoint:      opts.MountPoint,
+		RemoteRoot:      opts.RemoteRoot,
+		Server:          opts.Server,
+		ProfileDir:      opts.Profiling.ProfileDir,
+		PerfJSONL:       opts.Profiling.PerfSamplesPath,
+		PerfInterval:    opts.Profiling.PerfSampleInterval.String(),
+		PerfMaxSamples:  opts.Profiling.PerfMaxSamples,
+		PprofAddr:       opts.Profiling.PprofAddr,
+		StartedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+		CPUProfilePath:  opts.Profiling.CPUProfilePath,
+		HeapProfilePath: opts.Profiling.HeapProfilePath,
+	})
 	if err != nil {
 		sseWatcher.Stop()
 		dat9fs.FlushAll()
