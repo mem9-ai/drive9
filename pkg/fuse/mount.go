@@ -153,6 +153,9 @@ func (o *MountOptions) setDefaults() {
 	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfSampleInterval <= 0 {
 		o.Profiling.PerfSampleInterval = 10 * time.Second
 	}
+	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfMaxSamples <= 0 {
+		o.Profiling.PerfMaxSamples = defaultPerfMaxSamples
+	}
 }
 
 // Mount creates and serves a FUSE mount. It blocks until the filesystem
@@ -257,16 +260,17 @@ func Mount(opts *MountOptions) error {
 		return fmt.Errorf("start profiler: %w", err)
 	}
 	defer profiler.Stop()
+
+	// Resolve sync mode (auto-detect RTT if needed).
+	resolved := ResolveMode(context.Background(), opts.SyncMode, opts.Server)
+	opts.SyncMode = resolved
+	dat9fs.syncMode = resolved
+	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", resolved)
 	perfRecorder, err := StartContinuousPerf(opts.Profiling, dat9fs)
 	if err != nil {
 		return fmt.Errorf("start continuous perf: %w", err)
 	}
 	defer perfRecorder.Stop()
-
-	// Resolve sync mode (auto-detect RTT if needed).
-	resolved := ResolveMode(context.Background(), opts.SyncMode, opts.Server)
-	dat9fs.syncMode = resolved
-	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", resolved)
 
 	cacheBase := opts.CacheDir
 	if cacheBase == "" {
@@ -452,17 +456,26 @@ func Mount(opts *MountOptions) error {
 		credentialKind = mountstate.CredentialKindToken
 	}
 	pidFile, err := mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
-		PID:            os.Getpid(),
-		MountKind:      mountstate.MountKindFUSE,
-		MountPoint:     stateMountPoint,
-		RemoteRoot:     opts.RemoteRoot,
-		Profile:        opts.Profile,
-		LocalRoot:      opts.LocalRoot,
-		Server:         opts.Server,
-		PackPaths:      append([]string(nil), opts.PackPaths...),
-		CredentialKind: credentialKind,
-		APIKey:         opts.APIKey,
-		Token:          opts.Token,
+		PID:             os.Getpid(),
+		Component:       "drive9-fuse",
+		MountKind:       mountstate.MountKindFUSE,
+		MountPoint:      stateMountPoint,
+		RemoteRoot:      opts.RemoteRoot,
+		Profile:         opts.Profile,
+		LocalRoot:       opts.LocalRoot,
+		Server:          opts.Server,
+		PackPaths:       append([]string(nil), opts.PackPaths...),
+		CredentialKind:  credentialKind,
+		APIKey:          opts.APIKey,
+		Token:           opts.Token,
+		ProfileDir:      opts.Profiling.ProfileDir,
+		PerfJSONL:       opts.Profiling.PerfSamplesPath,
+		PerfInterval:    opts.Profiling.PerfSampleInterval.String(),
+		PerfMaxSamples:  opts.Profiling.PerfMaxSamples,
+		PprofAddr:       opts.Profiling.PprofAddr,
+		StartedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+		CPUProfilePath:  opts.Profiling.CPUProfilePath,
+		HeapProfilePath: opts.Profiling.HeapProfilePath,
 	})
 	if err != nil {
 		stopWatchers()

@@ -1,32 +1,38 @@
 package fuse
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"runtime"
 	"sync"
-	"syscall"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/buildinfo"
 )
+
+const defaultPerfMaxSamples = 7200
 
 // ContinuousPerfRecorder writes low-overhead mount performance samples as JSONL.
 type ContinuousPerfRecorder struct {
 	opts ProfilingOptions
 	fs   *Dat9FS
 
-	mu      sync.Mutex
-	file    *os.File
-	encoder *json.Encoder
-	stopCh  chan struct{}
-	doneCh  chan struct{}
-	once    sync.Once
+	mu          sync.Mutex
+	file        *os.File
+	encoder     *json.Encoder
+	sampleCount int
+	stopCh      chan struct{}
+	doneCh      chan struct{}
+	once        sync.Once
 }
 
 type continuousPerfSample struct {
 	Timestamp string                         `json:"timestamp"`
 	Reason    string                         `json:"reason"`
 	UptimeMS  int64                          `json:"uptime_ms"`
+	Context   continuousPerfContext          `json:"context"`
 	Runtime   continuousPerfRuntimeStats     `json:"runtime"`
 	Process   continuousPerfProcessStats     `json:"process"`
 	FuseOps   map[string]continuousPerfStats `json:"fuse_ops,omitempty"`
@@ -41,6 +47,31 @@ type continuousPerfStats struct {
 	Bytes   uint64 `json:"bytes"`
 	TotalNS uint64 `json:"total_ns"`
 	AvgNS   uint64 `json:"avg_ns"`
+	P50NS   uint64 `json:"p50_ns"`
+	P95NS   uint64 `json:"p95_ns"`
+	P99NS   uint64 `json:"p99_ns"`
+	MaxNS   uint64 `json:"max_ns"`
+}
+
+type continuousPerfContext struct {
+	Component      string `json:"component"`
+	Version        string `json:"version"`
+	GitHash        string `json:"git_hash"`
+	GitBranch      string `json:"git_branch"`
+	BuildTime      string `json:"build_time"`
+	GoVersion      string `json:"go_version"`
+	GOOS           string `json:"goos"`
+	GOARCH         string `json:"goarch"`
+	PID            int    `json:"pid"`
+	MountPointHash string `json:"mount_point_hash,omitempty"`
+	RemoteRootHash string `json:"remote_root_hash,omitempty"`
+	ServerHash     string `json:"server_hash,omitempty"`
+	SyncMode       string `json:"sync_mode,omitempty"`
+	WritePolicy    string `json:"write_policy,omitempty"`
+	Profile        string `json:"profile,omitempty"`
+	PprofAddr      string `json:"pprof_addr,omitempty"`
+	PerfIntervalMS int64  `json:"perf_interval_ms,omitempty"`
+	PerfMaxSamples int    `json:"perf_max_samples,omitempty"`
 }
 
 type continuousPerfRuntimeStats struct {
@@ -87,19 +118,20 @@ func StartContinuousPerf(opts ProfilingOptions, fs *Dat9FS) (*ContinuousPerfReco
 		opts.PerfSampleInterval = 10 * time.Second
 		r.opts.PerfSampleInterval = opts.PerfSampleInterval
 	}
+	if opts.PerfMaxSamples <= 0 {
+		opts.PerfMaxSamples = defaultPerfMaxSamples
+		r.opts.PerfMaxSamples = opts.PerfMaxSamples
+	}
 	if err := ensureParentDir(opts.PerfSamplesPath); err != nil {
 		close(r.doneCh)
 		return nil, err
 	}
-	f, err := os.OpenFile(opts.PerfSamplesPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
+	if err := r.openSamplesFile(); err != nil {
 		close(r.doneCh)
-		return nil, fmt.Errorf("open continuous perf samples %s: %w", opts.PerfSamplesPath, err)
+		return nil, err
 	}
-	r.file = f
-	r.encoder = json.NewEncoder(f)
 	if err := r.writeSample("start"); err != nil {
-		_ = f.Close()
+		_ = r.file.Close()
 		close(r.doneCh)
 		return nil, err
 	}
@@ -149,10 +181,16 @@ func (r *ContinuousPerfRecorder) writeSample(reason string) error {
 	if r.encoder == nil {
 		return nil
 	}
+	if r.opts.PerfMaxSamples > 0 && r.sampleCount >= r.opts.PerfMaxSamples {
+		if err := r.rotateLocked(); err != nil {
+			return err
+		}
+	}
 	sample := r.sample(reason)
 	if err := r.encoder.Encode(sample); err != nil {
 		return fmt.Errorf("encode continuous perf sample: %w", err)
 	}
+	r.sampleCount++
 	return nil
 }
 
@@ -161,6 +199,7 @@ func (r *ContinuousPerfRecorder) sample(reason string) continuousPerfSample {
 	sample := continuousPerfSample{
 		Timestamp: now.UTC().Format(time.RFC3339Nano),
 		Reason:    reason,
+		Context:   r.context(),
 		Runtime:   readContinuousPerfRuntimeStats(),
 		Process:   readContinuousPerfProcessStats(),
 	}
@@ -173,6 +212,64 @@ func (r *ContinuousPerfRecorder) sample(reason string) continuousPerfSample {
 	}
 	sample.Queues = r.queueStats()
 	return sample
+}
+
+func (r *ContinuousPerfRecorder) openSamplesFile() error {
+	f, err := os.OpenFile(r.opts.PerfSamplesPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("open continuous perf samples %s: %w", r.opts.PerfSamplesPath, err)
+	}
+	r.file = f
+	r.encoder = json.NewEncoder(f)
+	return nil
+}
+
+func (r *ContinuousPerfRecorder) rotateLocked() error {
+	if r.file != nil {
+		if err := r.file.Close(); err != nil {
+			return fmt.Errorf("close continuous perf samples before rotate %s: %w", r.opts.PerfSamplesPath, err)
+		}
+	}
+	previous := r.opts.PerfSamplesPath + ".1"
+	if err := os.Remove(previous); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove previous continuous perf samples %s: %w", previous, err)
+	}
+	if err := os.Rename(r.opts.PerfSamplesPath, previous); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("rotate continuous perf samples %s: %w", r.opts.PerfSamplesPath, err)
+	}
+	r.file = nil
+	r.encoder = nil
+	r.sampleCount = 0
+	return r.openSamplesFile()
+}
+
+func (r *ContinuousPerfRecorder) context() continuousPerfContext {
+	info := buildinfo.Get("drive9-fuse")
+	ctx := continuousPerfContext{
+		Component:      info.Component,
+		Version:        info.Version,
+		GitHash:        info.GitHash,
+		GitBranch:      info.GitBranch,
+		BuildTime:      info.BuildTime,
+		GoVersion:      info.GoVersion,
+		GOOS:           runtime.GOOS,
+		GOARCH:         runtime.GOARCH,
+		PID:            os.Getpid(),
+		PprofAddr:      r.opts.PprofAddr,
+		PerfIntervalMS: r.opts.PerfSampleInterval.Milliseconds(),
+		PerfMaxSamples: r.opts.PerfMaxSamples,
+	}
+	if r.fs == nil || r.fs.opts == nil {
+		return ctx
+	}
+	opts := r.fs.opts
+	ctx.MountPointHash = shortHash(opts.MountPoint)
+	ctx.RemoteRootHash = shortHash(opts.RemoteRoot)
+	ctx.ServerHash = shortHash(opts.Server)
+	ctx.SyncMode = opts.SyncMode.String()
+	ctx.WritePolicy = opts.WritePolicy.String()
+	ctx.Profile = opts.Profile
+	return ctx
 }
 
 func (r *ContinuousPerfRecorder) queueStats() continuousPerfQueueStats {
@@ -210,6 +307,10 @@ func continuousPerfStatsMap(src map[string]perfOpStats) map[string]continuousPer
 			Bytes:   st.bytes,
 			TotalNS: st.totalNS,
 			AvgNS:   avg,
+			P50NS:   st.p50NS,
+			P95NS:   st.p95NS,
+			P99NS:   st.p99NS,
+			MaxNS:   st.maxNS,
 		}
 	}
 	return dst
@@ -231,25 +332,10 @@ func readContinuousPerfRuntimeStats() continuousPerfRuntimeStats {
 	}
 }
 
-func readContinuousPerfProcessStats() continuousPerfProcessStats {
-	var ru syscall.Rusage
-	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
-		return continuousPerfProcessStats{}
+func shortHash(s string) string {
+	if s == "" {
+		return ""
 	}
-	return continuousPerfProcessStats{
-		UserCPUNS:   timevalNS(ru.Utime),
-		SystemCPUNS: timevalNS(ru.Stime),
-		MaxRSSBytes: normalizeMaxRSSBytes(ru.Maxrss),
-	}
-}
-
-func timevalNS(tv syscall.Timeval) uint64 {
-	return uint64(tv.Sec)*uint64(time.Second) + uint64(tv.Usec)*uint64(time.Microsecond)
-}
-
-func normalizeMaxRSSBytes(maxRSS int64) int64 {
-	if runtime.GOOS == "linux" {
-		return maxRSS * 1024
-	}
-	return maxRSS
+	sum := sha256.Sum256([]byte(s))
+	return fmt.Sprintf("%x", sum[:6])
 }

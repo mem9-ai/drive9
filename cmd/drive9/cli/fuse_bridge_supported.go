@@ -70,6 +70,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 			PprofAddr:           opts.PprofAddr,
 			PerfSamplesPath:     opts.PerfSamplesPath,
 			PerfSampleInterval:  opts.PerfSampleInterval,
+			PerfMaxSamples:      opts.PerfMaxSamples,
 		},
 	})
 }

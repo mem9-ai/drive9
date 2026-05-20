@@ -36,4 +36,8 @@ if [[ -n "$DRIVE9_BIN" && -x "$DRIVE9_BIN" && -f "$RUN_DIR/heap-final.pprof" ]];
   go tool pprof -svg -alloc_space -output "$RUN_DIR/heap-alloc-callgraph.svg" "$DRIVE9_BIN" "$RUN_DIR/heap-final.pprof" >/dev/null 2>&1 || true
 fi
 
+if [[ -n "$DRIVE9_BIN" && -x "$DRIVE9_BIN" && -f "$RUN_DIR/perf.jsonl" ]]; then
+  "$DRIVE9_BIN" perf summarize --input "$RUN_DIR/perf.jsonl" --out "$RUN_DIR/summary.json" >/dev/null 2>&1 || true
+fi
+
 echo "summary: $summary"

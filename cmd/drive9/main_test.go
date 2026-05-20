@@ -88,6 +88,7 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 		"journal <new|append|cat|find|verify>",
 		"region list [--json]",
 		"profile show [profile]",
+		"perf <collect|summarize>",
 		"mount [flags] [:/remote] <mountpoint>",
 		"mount vault [flags] <mountpoint>",
 		"umount <mountpoint>",
@@ -557,6 +558,39 @@ func TestDispatchProfileVerbReachesHandler(t *testing.T) {
 		t.Fatal("profile handler was not invoked for `drive9 profile ...`")
 	}
 	want := []string{"show", "coding-agent"}
+	if len(gotArgs) != len(want) {
+		t.Fatalf("args = %v, want %v", gotArgs, want)
+	}
+	for i := range want {
+		if gotArgs[i] != want[i] {
+			t.Fatalf("args[%d] = %q, want %q", i, gotArgs[i], want[i])
+		}
+	}
+}
+
+func TestDispatchPerfVerbReachesHandler(t *testing.T) {
+	origHandler := perfHandler
+	origExit := exitFunc
+	t.Cleanup(func() {
+		perfHandler = origHandler
+		exitFunc = origExit
+	})
+	exitFunc = func(int) {}
+
+	var gotArgs []string
+	called := false
+	perfHandler = func(args []string) error {
+		called = true
+		gotArgs = args
+		return nil
+	}
+
+	dispatch("perf", []string{"summarize", "--input", "perf.jsonl"})
+
+	if !called {
+		t.Fatal("perf handler was not invoked for `drive9 perf ...`")
+	}
+	want := []string{"summarize", "--input", "perf.jsonl"}
 	if len(gotArgs) != len(want) {
 		t.Fatalf("args = %v, want %v", gotArgs, want)
 	}

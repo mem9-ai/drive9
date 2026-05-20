@@ -45,6 +45,7 @@ DRIVE9_PROFILE_CPU_MODE="${DRIVE9_PROFILE_CPU_MODE:-workload}"
 DRIVE9_PROFILE_HEAP_INTERVAL="${DRIVE9_PROFILE_HEAP_INTERVAL:-0s}"
 DRIVE9_PERF_JSONL="${DRIVE9_PERF_JSONL:-$DRIVE9_PROFILE_DIR/perf.jsonl}"
 DRIVE9_PERF_INTERVAL="${DRIVE9_PERF_INTERVAL:-1s}"
+DRIVE9_PERF_MAX_SAMPLES="${DRIVE9_PERF_MAX_SAMPLES:-7200}"
 DRIVE9_PPROF_ADDR="${DRIVE9_PPROF_ADDR:-}"
 DRIVE9_MOUNT_EXTRA_FLAGS="${DRIVE9_MOUNT_EXTRA_FLAGS:-}"
 
@@ -74,6 +75,7 @@ WORKLOAD_LOG="$DRIVE9_PROFILE_DIR/workload.log"
   echo "heap_interval=$DRIVE9_PROFILE_HEAP_INTERVAL"
   echo "perf_jsonl=$DRIVE9_PERF_JSONL"
   echo "perf_interval=$DRIVE9_PERF_INTERVAL"
+  echo "perf_max_samples=$DRIVE9_PERF_MAX_SAMPLES"
   echo "pprof_addr=$DRIVE9_PPROF_ADDR"
   echo "extra_flags=$DRIVE9_MOUNT_EXTRA_FLAGS"
   git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null | sed 's/^/git_head=/'
@@ -104,6 +106,7 @@ mount_args=(
 if [[ -n "$DRIVE9_PERF_JSONL" ]]; then
   mount_args+=(--perf-jsonl "$DRIVE9_PERF_JSONL")
   mount_args+=(--perf-interval "$DRIVE9_PERF_INTERVAL")
+  mount_args+=(--perf-max-samples "$DRIVE9_PERF_MAX_SAMPLES")
 fi
 if [[ "$DRIVE9_PROFILE_CPU_MODE" == "mount" ]]; then
   mount_args+=(--profile-cpu "$DRIVE9_PROFILE_DIR/cpu.pprof")

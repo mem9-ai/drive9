@@ -151,6 +151,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	perfCounters := fs.Bool("perf-counters", false, "print FUSE perf counter summary on unmount")
 	perfJSONL := fs.String("perf-jsonl", "", "write continuous mount performance samples to a JSONL file")
 	perfInterval := fs.Duration("perf-interval", 0, "continuous performance sample interval (default 10s when --perf-jsonl is set)")
+	perfMaxSamples := fs.Int("perf-max-samples", 0, "maximum samples per continuous perf JSONL segment (default 7200 when --perf-jsonl is set)")
 	profileCPU := fs.String("profile-cpu", "", "write CPU profile to file for the mount lifetime")
 	profileHeap := fs.String("profile-heap", "", "write final heap profile to file on unmount")
 	profileDir := fs.String("profile-dir", "", "directory for periodic mount profiles")
@@ -225,6 +226,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 	if flagProvided(fs, "perf-interval") && *perfJSONL == "" {
 		return fmt.Errorf("drive9 mount: --perf-interval requires --perf-jsonl")
+	}
+	if flagProvided(fs, "perf-max-samples") && *perfMaxSamples <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-max-samples must be > 0")
+	}
+	if flagProvided(fs, "perf-max-samples") && *perfJSONL == "" {
+		return fmt.Errorf("drive9 mount: --perf-max-samples requires --perf-jsonl")
 	}
 
 	profileGiven := flagProvided(fs, "profile")
@@ -477,6 +484,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		PprofAddr:               *pprofAddr,
 		PerfSamplesPath:         *perfJSONL,
 		PerfSampleInterval:      *perfInterval,
+		PerfMaxSamples:          *perfMaxSamples,
 	}
 
 	return mountFuse(opts)
