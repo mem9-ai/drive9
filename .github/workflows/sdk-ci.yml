@@ -1,0 +1,147 @@
+name: sdk-ci
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/sdk-ci.yml"
+      - "clients/**"
+  push:
+    branches:
+      - main
+      - mobile-bindings*
+      - sdk-ci
+    paths:
+      - ".github/workflows/sdk-ci.yml"
+      - "clients/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python SDK test dependencies
+        working-directory: clients/drive9-py
+        run: python -m pip install -e ".[dev]"
+
+      - name: Test Python SDK
+        working-directory: clients/drive9-py
+        run: pytest tests/
+
+  javascript:
+    name: JavaScript SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install JavaScript SDK dependencies
+        working-directory: clients/drive9-js
+        run: npm install
+
+      - name: Test JavaScript SDK
+        working-directory: clients/drive9-js
+        run: npm test
+
+  rust:
+    name: Rust SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: clients/drive9-rs
+
+      - name: Build Rust SDK
+        working-directory: clients/drive9-rs
+        run: cargo build
+
+      - name: Test Rust SDK
+        working-directory: clients/drive9-rs
+        run: cargo test
+
+  kotlin:
+    name: Kotlin SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Test Kotlin SDK
+        working-directory: clients/drive9-kotlin
+        run: gradle test --no-daemon --console=plain
+
+  swift:
+    name: Swift SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0.1"
+
+      - name: Test Swift SDK
+        working-directory: clients/drive9-swift
+        run: swift test
