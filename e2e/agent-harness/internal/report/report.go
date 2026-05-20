@@ -127,7 +127,7 @@ type Recorder struct {
 }
 
 func NewRecorder(runDir, runID string) (*Recorder, error) {
-	for _, dir := range []string{runDir, filepath.Join(runDir, "mount"), filepath.Join(runDir, "debug"), filepath.Join(runDir, "metrics"), filepath.Join(runDir, "repro")} {
+	for _, dir := range []string{runDir, filepath.Join(runDir, "mount"), filepath.Join(runDir, "debug"), filepath.Join(runDir, "metrics"), filepath.Join(runDir, "repro"), filepath.Join(runDir, "perf")} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, err
 		}

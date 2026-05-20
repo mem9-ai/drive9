@@ -102,14 +102,6 @@ type Dat9FS struct {
 	// for observability and testing. Incremented even when fs.server is nil.
 	notifyCount atomic.Int64
 
-	// lookupStatRetry* counters track only the Lookup->Stat retry path so
-	// operators can distinguish absorbed interrupt noise from exhausted retries
-	// on the primary probe route. GetAttr and list-fallback retries intentionally
-	// reuse the retry logic without contributing to these counters.
-	lookupStatRetryTotal     atomic.Uint64
-	lookupStatRetrySuccess   atomic.Uint64
-	lookupStatRetryExhausted atomic.Uint64
-
 	// perf contains optional mount-level counters. Nil when disabled.
 	perf *fusePerfCounters
 
@@ -3619,7 +3611,7 @@ func (fs *Dat9FS) readSmallFileWithRetry(ctx context.Context, path string) ([]by
 	}
 
 	if fs.perf != nil {
-		fs.perf.readRetryTotal.add(1)
+		fs.perf.readRetryTotal.Add(1)
 	}
 	lastErr := err
 	for range readTransientRetryCount {
@@ -3630,7 +3622,7 @@ func (fs *Dat9FS) readSmallFileWithRetry(ctx context.Context, path string) ([]by
 		fs.perfRecordRemote(perfRemoteRead, readStart, err, uint64(len(data)))
 		if err == nil {
 			if fs.perf != nil {
-				fs.perf.readRetrySuccess.add(1)
+				fs.perf.readRetrySuccess.Add(1)
 			}
 			return data, nil
 		}
@@ -3640,7 +3632,7 @@ func (fs *Dat9FS) readSmallFileWithRetry(ctx context.Context, path string) ([]by
 		lastErr = err
 	}
 	if fs.perf != nil {
-		fs.perf.readRetryExhausted.add(1)
+		fs.perf.readRetryExhausted.Add(1)
 	}
 	return nil, fmt.Errorf("%w: %s: %v", errReadRetriesExhausted, path, lastErr)
 }
@@ -3996,7 +3988,7 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, fh 
 	}
 
 	if fs.perf != nil {
-		fs.perf.readRetryTotal.add(1)
+		fs.perf.readRetryTotal.Add(1)
 	}
 	lastErr := err
 	for range readTransientRetryCount {
@@ -4010,7 +4002,7 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, fh 
 		retryCancel()
 		if err == nil {
 			if fs.perf != nil {
-				fs.perf.readRetrySuccess.add(1)
+				fs.perf.readRetrySuccess.Add(1)
 			}
 			return data, n, nil
 		}
@@ -4020,7 +4012,7 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, fh 
 		lastErr = err
 	}
 	if fs.perf != nil {
-		fs.perf.readRetryExhausted.add(1)
+		fs.perf.readRetryExhausted.Add(1)
 	}
 	return nil, 0, fmt.Errorf("%w: %s: %v", errReadRetriesExhausted, path, lastErr)
 }
@@ -4356,7 +4348,10 @@ func (fs *Dat9FS) lookupRetryStats() (total, success, exhausted uint64) {
 	if fs == nil {
 		return 0, 0, 0
 	}
-	return fs.lookupStatRetryTotal.Load(), fs.lookupStatRetrySuccess.Load(), fs.lookupStatRetryExhausted.Load()
+	if fs.perf == nil {
+		return 0, 0, 0
+	}
+	return fs.perf.lookupRetryTotal.Load(), fs.perf.lookupRetrySuccess.Load(), fs.perf.lookupRetryExhausted.Load()
 }
 
 func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath string, trackLookupMetrics bool) (*client.StatResult, error) {
@@ -4379,9 +4374,8 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath strin
 		return nil, err
 	}
 	if trackLookupMetrics {
-		fs.lookupStatRetryTotal.Add(1)
 		if fs.perf != nil {
-			fs.perf.lookupRetryTotal.add(1)
+			fs.perf.lookupRetryTotal.Add(1)
 		}
 	}
 
@@ -4400,12 +4394,11 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath strin
 		fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
 		if err == nil {
 			if trackLookupMetrics {
-				successCount := fs.lookupStatRetrySuccess.Add(1)
 				if fs.perf != nil {
-					fs.perf.lookupRetrySuccess.add(1)
-				}
-				if successCount <= 3 || successCount%lookupRetrySuccessLogEvery == 0 {
-					log.Printf("lookup stat retry recovered for %s (success_count=%d)", localPath, successCount)
+					successCount := fs.perf.lookupRetrySuccess.Add(1)
+					if successCount <= 3 || successCount%lookupRetrySuccessLogEvery == 0 {
+						log.Printf("lookup stat retry recovered for %s (success_count=%d)", localPath, successCount)
+					}
 				}
 			}
 			return stat, nil
@@ -4417,9 +4410,8 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath strin
 	}
 
 	if trackLookupMetrics {
-		fs.lookupStatRetryExhausted.Add(1)
 		if fs.perf != nil {
-			fs.perf.lookupRetryExhausted.add(1)
+			fs.perf.lookupRetryExhausted.Add(1)
 		}
 		log.Printf("lookup stat retries exhausted for %s: %v", localPath, lastErr)
 	}
@@ -4431,8 +4423,8 @@ func (fs *Dat9FS) lookupStatWithRetry(cancel <-chan struct{}, childP string) (*c
 }
 
 func (fs *Dat9FS) getAttrStatWithRetry(cancel <-chan struct{}, remotePath string) (*client.StatResult, error) {
-	// Keep GetAttr retries out of lookupStatRetry* so that those counters retain
-	// a single meaning: Lookup path retry behavior.
+	// Keep GetAttr retries out of lookup retry perf counters so those counters
+	// retain a single meaning: Lookup path retry behavior.
 	return fs.statWithTransientRetry(cancel, remotePath, false)
 }
 
@@ -4461,8 +4453,8 @@ func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
 }
 
 func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string) ([]client.FileInfo, error) {
-	// list-fallback retries are intentionally not counted in lookupStatRetry*;
-	// those counters remain scoped to the primary Lookup->Stat path.
+	// list-fallback retries are intentionally not counted in lookup retry perf
+	// counters; those counters remain scoped to the primary Lookup->Stat path.
 	ctx, cf := fuseCtx(cancel)
 	apiPath := fs.remotePath(parentPath)
 	listStart := fs.perfStart()
@@ -5123,8 +5115,8 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 			return false, gofuse.OK
 		}
 		if fs.perf != nil {
-			fs.perf.dirCacheHit.add(1)
-			fs.perf.namespacePositiveHit.add(1)
+			fs.perf.dirCacheHit.Add(1)
+			fs.perf.namespacePositiveHit.Add(1)
 		}
 		item := result.item
 		fs.applyLayerFileModeToCachedInfo(childP, &item)
@@ -5148,19 +5140,19 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 	case namespaceLookupNegative, namespaceLookupCompleteMiss, namespaceLookupSessionMiss:
 		if isLockFilePath(childP) {
 			if fs.perf != nil {
-				fs.perf.dirCacheMiss.add(1)
+				fs.perf.dirCacheMiss.Add(1)
 			}
 			return false, gofuse.OK
 		}
 		if fs.perf != nil {
-			fs.perf.dirCacheHit.add(1)
+			fs.perf.dirCacheHit.Add(1)
 			switch result.kind {
 			case namespaceLookupNegative:
-				fs.perf.namespaceNegativeHit.add(1)
+				fs.perf.namespaceNegativeHit.Add(1)
 			case namespaceLookupCompleteMiss:
-				fs.perf.namespaceCompleteMiss.add(1)
+				fs.perf.namespaceCompleteMiss.Add(1)
 			case namespaceLookupSessionMiss:
-				fs.perf.namespaceSessionMiss.add(1)
+				fs.perf.namespaceSessionMiss.Add(1)
 			}
 		}
 		out.NodeId = 0
@@ -5168,13 +5160,13 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 		return true, gofuse.ENOENT
 	case namespaceLookupPartialMiss:
 		if fs.perf != nil {
-			fs.perf.dirCacheMiss.add(1)
-			fs.perf.namespacePartialMiss.add(1)
+			fs.perf.dirCacheMiss.Add(1)
+			fs.perf.namespacePartialMiss.Add(1)
 		}
 		return false, gofuse.OK
 	default:
 		if fs.perf != nil {
-			fs.perf.dirCacheMiss.add(1)
+			fs.perf.dirCacheMiss.Add(1)
 		}
 		return false, gofuse.OK
 	}
@@ -5256,7 +5248,7 @@ var inlineThresholdWarmTimeout = 5 * time.Second
 func (fs *Dat9FS) notifyEntry(parentIno uint64, name string) {
 	fs.notifyCount.Add(1)
 	if fs.perf != nil {
-		fs.perf.notifyEntry.add(1)
+		fs.perf.notifyEntry.Add(1)
 	}
 	if fs.server == nil {
 		return
@@ -5277,7 +5269,7 @@ func (fs *Dat9FS) notifyEntry(parentIno uint64, name string) {
 func (fs *Dat9FS) notifyInode(ino uint64) {
 	fs.notifyCount.Add(1)
 	if fs.perf != nil {
-		fs.perf.notifyInode.add(1)
+		fs.perf.notifyInode.Add(1)
 	}
 	if fs.server == nil {
 		return
@@ -8134,13 +8126,13 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	// Check dir cache first
 	if cached, ok := fs.dirCache.Get(dirPath); ok {
 		if fs.perf != nil {
-			fs.perf.dirCacheHit.add(1)
+			fs.perf.dirCacheHit.Add(1)
 		}
 		entries := fs.cachedToDirEntries(dirPath, cached)
 		return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries)))
 	}
 	if fs.perf != nil {
-		fs.perf.dirCacheMiss.add(1)
+		fs.perf.dirCacheMiss.Add(1)
 	}
 
 	listStart := fs.perfStart()
@@ -9357,7 +9349,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		size := int(input.Size)
 		if data, ok := fh.Prefetch.Get(offset, size); ok {
 			if fs.perf != nil {
-				fs.perf.prefetchHit.add(1)
+				fs.perf.prefetchHit.Add(1)
 			}
 			// Trigger next prefetch
 			fh.Prefetch.OnRead(offset, len(data))
@@ -9366,7 +9358,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			return gofuse.ReadResultData(data), gofuse.OK
 		}
 		if fs.perf != nil {
-			fs.perf.prefetchMiss.add(1)
+			fs.perf.prefetchMiss.Add(1)
 		}
 		// Cache miss — fall through to direct read. Prefetch is triggered
 		// only after a successful read (see below), not unconditionally.
@@ -9381,7 +9373,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		// Fast path: serve from cache without any HTTP call.
 		if data, ok := fs.readCache.Get(p, cacheRev); ok {
 			if fs.perf != nil {
-				fs.perf.readCacheHit.add(1)
+				fs.perf.readCacheHit.Add(1)
 			}
 			offset := int64(input.Offset)
 			if offset >= int64(len(data)) {
@@ -9398,7 +9390,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			return gofuse.ReadResultData(data[offset:end]), gofuse.OK
 		}
 		if fs.perf != nil {
-			fs.perf.readCacheMiss.add(1)
+			fs.perf.readCacheMiss.Add(1)
 		}
 
 		// Cache miss: read the file and store it. Singleflight ensures

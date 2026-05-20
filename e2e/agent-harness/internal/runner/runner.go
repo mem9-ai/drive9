@@ -51,6 +51,13 @@ type GCConfig struct {
 	ConfirmDelete  bool
 }
 
+type ReportConfig struct {
+	RunDir string
+	Format string
+	Title  string
+	Output string
+}
+
 type EvidenceConfig struct {
 	RunDir          string
 	KubeContext     string
@@ -182,6 +189,9 @@ func Run(ctx context.Context, cfg Config) (string, error) {
 	if err := rec.WriteManifest(manifest); err != nil {
 		return runDir, err
 	}
+	if err := rec.WritePerfEnvironment(report.DefaultPerfEnvironment(id, manifest)); err != nil {
+		return runDir, err
+	}
 	_ = rec.Event(report.Event{Type: "run_start"})
 	env := mountproc.Env{Server: cfg.Server, APIKey: apiKey}
 	for _, c := range cases {
@@ -205,8 +215,29 @@ func Run(ctx context.Context, cfg Config) (string, error) {
 }
 
 func Regenerate(runDir string) error {
-	_, _, err := report.Generate(runDir)
-	return err
+	return Report(ReportConfig{RunDir: runDir, Format: "summary"})
+}
+
+func Report(cfg ReportConfig) error {
+	if cfg.RunDir == "" {
+		return errors.New("report requires run dir")
+	}
+	format := cfg.Format
+	if format == "" {
+		format = "summary"
+	}
+	if _, _, err := report.Generate(cfg.RunDir); err != nil {
+		return err
+	}
+	switch format {
+	case "summary":
+		return nil
+	case "customer-perf":
+		_, err := report.GeneratePerfReport(cfg.RunDir, report.PerfOptions{Title: cfg.Title, Output: cfg.Output})
+		return err
+	default:
+		return fmt.Errorf("unsupported report format %q", cfg.Format)
+	}
 }
 
 func gateError(runDir string, gating report.Gating) error {
@@ -561,9 +592,11 @@ func runFIO(ctx context.Context, rec *report.Recorder, mountpoint string, c case
 		"--fsync=1",
 		"--output-format=json",
 	}
+	writeStarted := time.Now()
 	result := mountproc.Run(ctx, "fio-write", mountproc.Env{}, "", fio, args...)
 	recordResult(rec, c.ID, result)
 	_ = os.WriteFile(output, []byte(result.Stdout), 0o644)
+	recordPerfResult(rec, c.ID, "fio-write", "fuse_write", resultStatus(result.ExitCode), writeStarted, result.Duration, perfBytes(result.ExitCode, c.Workload.SizeBytes), 1, result.Stderr, []string{filepath.ToSlash(output)})
 	if result.ExitCode != 0 {
 		recordOracleFailure(rec, c, "throughput_min", result.Stderr, "fio exit 0")
 		return nil
@@ -577,9 +610,11 @@ func runFIO(ctx context.Context, rec *report.Recorder, mountpoint string, c case
 	}
 	start := time.Now()
 	if _, err := hashFile(target); err != nil {
+		recordPerfResult(rec, c.ID, "fio-readback", "fuse_read", "failed", start, time.Since(start), 0, 1, err.Error(), nil)
 		recordOracleFailure(rec, c, "cli_read_equals", err.Error(), "readable fio output")
 	} else {
 		elapsed := time.Since(start)
+		recordPerfResult(rec, c.ID, "fio-readback", "fuse_read", "ok", start, elapsed, c.Workload.SizeBytes, 1, "", nil)
 		if elapsed > 0 {
 			_ = rec.Metric(report.Metric{CaseID: c.ID, Name: "bytes_read", Value: float64(c.Workload.SizeBytes), Unit: "bytes", Source: "fio-readback"})
 		}
@@ -660,11 +695,13 @@ func runParallelWrites(ctx context.Context, rec *report.Recorder, mountpoint str
 	}
 	wg.Wait()
 	if len(errs) > 0 {
+		recordPerfResult(rec, c.ID, "parallel-writes", "fuse_write", "failed", start, time.Since(start), 0, float64(c.Workload.ParallelWriters), strings.Join(errs, "; "), nil)
 		recordOracleFailure(rec, c, "fuse_write_success", errs, "all writers succeed")
 		return nil
 	}
 	total := c.Workload.WriterBytes * int64(c.Workload.ParallelWriters)
 	elapsed := time.Since(start)
+	recordPerfResult(rec, c.ID, "parallel-writes", "fuse_write", "ok", start, elapsed, total, float64(c.Workload.ParallelWriters), "", nil)
 	if elapsed > 0 {
 		bps := float64(total) / elapsed.Seconds()
 		_ = rec.Metric(report.Metric{CaseID: c.ID, Name: "mount_perf_counter", Value: bps, Unit: "bytes", Source: "parallel_write_bytes_per_second"})
@@ -936,6 +973,56 @@ func recordResult(rec *report.Recorder, caseID string, result mountproc.Result) 
 	exit := result.ExitCode
 	_ = rec.Event(report.Event{CaseID: caseID, Type: "command_end", CommandID: result.ID, ExitCode: &exit, DurationMS: result.Duration.Milliseconds()})
 	_ = rec.Metric(report.Metric{CaseID: caseID, Name: "command_duration_ms", Value: float64(result.Duration.Milliseconds()), Unit: "ms", Source: result.ID})
+}
+
+func recordPerfResult(rec *report.Recorder, caseID, operationID, operation, status string, started time.Time, duration time.Duration, bytes int64, requestUnits float64, errText string, artifactRefs []string) {
+	if duration < 0 {
+		duration = 0
+	}
+	if started.IsZero() {
+		started = time.Now()
+	}
+	errorClass := ""
+	if status != "ok" && status != "skipped" {
+		errorClass = "product"
+	}
+	_ = rec.PerfResult(report.PerfResult{
+		CaseID:       caseID,
+		ScenarioID:   caseID,
+		OperationID:  operationID,
+		Operation:    operation,
+		Status:       status,
+		StartedAt:    started.UTC().Format(time.RFC3339Nano),
+		EndedAt:      started.Add(duration).UTC().Format(time.RFC3339Nano),
+		DurationMS:   float64(duration.Microseconds()) / 1000,
+		Bytes:        bytes,
+		RequestUnits: requestUnits,
+		ErrorClass:   errorClass,
+		Error:        boundedForPerf(errText),
+		ArtifactRefs: artifactRefs,
+	})
+}
+
+func resultStatus(exitCode int) string {
+	if exitCode == 0 {
+		return "ok"
+	}
+	return "failed"
+}
+
+func perfBytes(exitCode int, bytes int64) int64 {
+	if exitCode == 0 {
+		return bytes
+	}
+	return 0
+}
+
+func boundedForPerf(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= 240 {
+		return s
+	}
+	return s[:237] + "..."
 }
 
 func recordOracleFailure(rec *report.Recorder, c casefile.Case, oracle string, observed, expected any) {

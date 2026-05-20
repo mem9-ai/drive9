@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Drive9 Agent Harness Perf Environment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "host",
+    "os",
+    "kernel",
+    "architecture",
+    "product_version",
+    "server_endpoint",
+    "cloud_provider",
+    "instance_type",
+    "vcpu",
+    "cpu_model",
+    "memory",
+    "storage_type",
+    "storage_size",
+    "storage_iops",
+    "storage_throughput",
+    "storage_encrypted"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "perf-environment.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "host": {
+      "type": "string"
+    },
+    "os": {
+      "type": "string"
+    },
+    "kernel": {
+      "type": "string"
+    },
+    "architecture": {
+      "type": "string"
+    },
+    "product_version": {
+      "type": "string"
+    },
+    "server_endpoint": {
+      "type": "string"
+    },
+    "cloud_provider": {
+      "type": "string"
+    },
+    "instance_type": {
+      "type": "string"
+    },
+    "vcpu": {
+      "type": "string"
+    },
+    "cpu_model": {
+      "type": "string"
+    },
+    "memory": {
+      "type": "string"
+    },
+    "storage_type": {
+      "type": "string"
+    },
+    "storage_size": {
+      "type": "string"
+    },
+    "storage_iops": {
+      "type": "string"
+    },
+    "storage_throughput": {
+      "type": "string"
+    },
+    "storage_encrypted": {
+      "type": "string"
+    }
+  }
+}
