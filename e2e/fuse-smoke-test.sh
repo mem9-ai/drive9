@@ -143,11 +143,31 @@ skip_or_fail() {
 
 is_mounted() {
   local mount_point="$1"
+  local physical_mount_point
+  physical_mount_point="$(cd "$(dirname "$mount_point")" 2>/dev/null && pwd -P)/$(basename "$mount_point")"
   if command -v mountpoint >/dev/null 2>&1; then
     mountpoint -q "$mount_point"
     return
   fi
-  awk -v mp="$mount_point" '$2 == mp { found = 1 } END { exit !found }' /proc/mounts
+  # Fallback for macOS and systems without mountpoint or /proc/mounts.
+  mount | awk -v mp="$mount_point" -v pmp="$physical_mount_point" '{for(i=1;i<=NF;i++) if($i=="on" && ($(i+1)==mp || $(i+1)==pmp)) found=1} END{exit !found}'
+}
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  "$@" &
+  local cmd_pid=$!
+  (
+    sleep "$seconds"
+    kill "$cmd_pid" >/dev/null 2>&1 || true
+  ) &
+  local watchdog_pid=$!
+  wait "$cmd_pid"
+  local rc=$?
+  kill "$watchdog_pid" >/dev/null 2>&1 || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  return "$rc"
 }
 
 curl_body_code() {
@@ -806,32 +826,38 @@ PY
   echo "[8.1] git config lockfile semantics"
   mkdir -p "$GIT_PROBE_MOUNT"
   git_config_ok=true
-  if ! git -C "$GIT_PROBE_MOUNT" init >/dev/null; then
-    git_config_ok=false
-  fi
-  if ! git -C "$GIT_PROBE_MOUNT" config core.repositoryformatversion 0; then
-    git_config_ok=false
-  fi
-  if ! git -C "$GIT_PROBE_MOUNT" config core.filemode false; then
-    git_config_ok=false
-  fi
-  if ! git -C "$GIT_PROBE_MOUNT" config core.bare false; then
-    git_config_ok=false
-  fi
-  if ! git -C "$GIT_PROBE_MOUNT" config core.logallrefupdates true; then
-    git_config_ok=false
-  fi
-  if ! git -C "$GIT_PROBE_MOUNT" config core.symlinks false; then
-    git_config_ok=false
-  fi
-  if ! git -C "$GIT_PROBE_MOUNT" remote add origin "$GIT_PROBE_ORIGIN"; then
+  if run_with_timeout 20 git -C "$GIT_PROBE_MOUNT" init >/dev/null; then
+    if ! run_with_timeout 20 git -C "$GIT_PROBE_MOUNT" config core.repositoryformatversion 0; then
+      git_config_ok=false
+    fi
+    if ! run_with_timeout 20 git -C "$GIT_PROBE_MOUNT" config core.filemode false; then
+      git_config_ok=false
+    fi
+    if ! run_with_timeout 20 git -C "$GIT_PROBE_MOUNT" config core.bare false; then
+      git_config_ok=false
+    fi
+    if ! run_with_timeout 20 git -C "$GIT_PROBE_MOUNT" config core.logallrefupdates true; then
+      git_config_ok=false
+    fi
+    if ! run_with_timeout 20 git -C "$GIT_PROBE_MOUNT" config core.symlinks false; then
+      git_config_ok=false
+    fi
+    if ! run_with_timeout 20 git -C "$GIT_PROBE_MOUNT" remote add origin "$GIT_PROBE_ORIGIN"; then
+      git_config_ok=false
+    fi
+  else
     git_config_ok=false
   fi
   check_eq "git config lockfile updates succeed" "$git_config_ok" "true"
-  set +e
-  git_origin=$(git -C "$GIT_PROBE_MOUNT" config --get remote.origin.url 2>/dev/null)
-  git_origin_rc=$?
-  set -e
+  git_origin_tmp="$(mktemp)"
+  if run_with_timeout 20 git -C "$GIT_PROBE_MOUNT" config --get remote.origin.url >"$git_origin_tmp" 2>/dev/null; then
+    git_origin_rc=0
+    git_origin="$(cat "$git_origin_tmp")"
+  else
+    git_origin_rc=1
+    git_origin=""
+  fi
+  rm -f "$git_origin_tmp"
   check_eq "git config remote origin is readable" "$git_origin_rc" "0"
   check_eq "git config remote origin survives lockfile reuse" "$git_origin" "$GIT_PROBE_ORIGIN"
 

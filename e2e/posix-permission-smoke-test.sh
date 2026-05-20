@@ -217,12 +217,14 @@ local_mode() {
 
 is_mounted() {
   local mount_point="$1"
+  local physical_mount_point
+  physical_mount_point="$(cd "$(dirname "$mount_point")" 2>/dev/null && pwd -P)/$(basename "$mount_point")"
   if command -v mountpoint >/dev/null 2>&1; then
     mountpoint -q "$mount_point"
     return
   fi
   # Fallback for macOS and systems without mountpoint or /proc/mounts
-  mount | awk -v mp="$mount_point" '{for(i=1;i<=NF;i++) if($i=="on" && $(i+1)==mp) found=1} END{exit !found}'
+  mount | awk -v mp="$mount_point" -v pmp="$physical_mount_point" '{for(i=1;i<=NF;i++) if($i=="on" && ($(i+1)==mp || $(i+1)==pmp)) found=1} END{exit !found}'
 }
 
 wait_mount_state() {
