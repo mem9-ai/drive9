@@ -64,6 +64,11 @@ var perfFuseOpNames = [...]string{
 	perfFuseAccess:      "access",
 }
 
+var (
+	_ [int(perfFuseOpCount) - len(perfFuseOpNames)]struct{}
+	_ [len(perfFuseOpNames) - int(perfFuseOpCount)]struct{}
+)
+
 type perfRemoteOp int
 
 const (
@@ -83,6 +88,11 @@ var perfRemoteOpNames = [...]string{
 	perfRemoteMutation: "mutation",
 }
 
+var (
+	_ [int(perfRemoteOpCount) - len(perfRemoteOpNames)]struct{}
+	_ [len(perfRemoteOpNames) - int(perfRemoteOpCount)]struct{}
+)
+
 type perfOpStats struct {
 	count   uint64
 	errors  uint64
@@ -101,143 +111,90 @@ type fusePerfCounters struct {
 	fuseOps   [perfFuseOpCount]perfAtomicStats
 	remoteOps [perfRemoteOpCount]perfAtomicStats
 
-	readCacheHit  atomicUint64
-	readCacheMiss atomicUint64
-	dirCacheHit   atomicUint64
-	dirCacheMiss  atomicUint64
-	prefetchHit   atomicUint64
-	prefetchMiss  atomicUint64
+	readCacheHit  atomic.Uint64
+	readCacheMiss atomic.Uint64
+	dirCacheHit   atomic.Uint64
+	dirCacheMiss  atomic.Uint64
+	prefetchHit   atomic.Uint64
+	prefetchMiss  atomic.Uint64
 
-	namespacePositiveHit  atomicUint64
-	namespaceNegativeHit  atomicUint64
-	namespaceCompleteMiss atomicUint64
-	namespaceSessionMiss  atomicUint64
-	namespacePartialMiss  atomicUint64
-	lookupStormList       atomicUint64
-	lookupStormDeferred   atomicUint64
+	namespacePositiveHit  atomic.Uint64
+	namespaceNegativeHit  atomic.Uint64
+	namespaceCompleteMiss atomic.Uint64
+	namespaceSessionMiss  atomic.Uint64
+	namespacePartialMiss  atomic.Uint64
+	lookupStormList       atomic.Uint64
+	lookupStormDeferred   atomic.Uint64
 
-	lookupRetryTotal     atomicUint64
-	lookupRetrySuccess   atomicUint64
-	lookupRetryExhausted atomicUint64
-	readRetryTotal       atomicUint64
-	readRetrySuccess     atomicUint64
-	readRetryExhausted   atomicUint64
+	lookupRetryTotal     atomic.Uint64
+	lookupRetrySuccess   atomic.Uint64
+	lookupRetryExhausted atomic.Uint64
+	readRetryTotal       atomic.Uint64
+	readRetrySuccess     atomic.Uint64
+	readRetryExhausted   atomic.Uint64
 
-	commitEnqueue      atomicUint64
-	commitEnqueueError atomicUint64
-	commitRetry        atomicUint64
-	commitSuccess      atomicUint64
-	commitFailure      atomicUint64
+	commitEnqueue      atomic.Uint64
+	commitEnqueueError atomic.Uint64
+	commitRetry        atomic.Uint64
+	commitSuccess      atomic.Uint64
+	commitFailure      atomic.Uint64
 
-	uploaderSubmit       atomicUint64
-	uploaderSyncFallback atomicUint64
-	uploaderSuccess      atomicUint64
-	uploaderFailure      atomicUint64
+	uploaderSubmit       atomic.Uint64
+	uploaderSyncFallback atomic.Uint64
+	uploaderSuccess      atomic.Uint64
+	uploaderFailure      atomic.Uint64
 
-	commitDrainCount   atomicUint64
-	commitDrainTotalNS atomicUint64
-	uploaderDrainCount atomicUint64
-	uploaderDrainTotal atomicUint64
+	commitDrainCount   atomic.Uint64
+	commitDrainTotalNS atomic.Uint64
+	uploaderDrainCount atomic.Uint64
+	uploaderDrainTotal atomic.Uint64
 
-	sseChange       atomicUint64
-	sseReset        atomicUint64
-	sseSelfFiltered atomicUint64
+	sseChange       atomic.Uint64
+	sseReset        atomic.Uint64
+	sseSelfFiltered atomic.Uint64
 
-	notifyEntry atomicUint64
-	notifyInode atomicUint64
+	notifyEntry atomic.Uint64
+	notifyInode atomic.Uint64
 
-	localPolicyLocalOnly      atomicUint64
-	localPolicyRemoteOverride atomicUint64
-	localPolicyRemoteDefault  atomicUint64
+	localPolicyLocalOnly      atomic.Uint64
+	localPolicyRemoteOverride atomic.Uint64
+	localPolicyRemoteDefault  atomic.Uint64
 
-	gitCleanReadCount         atomicUint64
-	gitCleanTreeHit           atomicUint64
-	gitCleanBlobCacheHit      atomicUint64
-	gitCleanCacheMiss         atomicUint64
-	gitCatFileCount           atomicUint64
-	gitCatFileSlowCount       atomicUint64
-	gitCatFileTotalNS         atomicUint64
-	gitHydrateStart           atomicUint64
-	gitHydrateSuccess         atomicUint64
-	gitHydrateFailure         atomicUint64
-	gitHydrateBytes           atomicUint64
-	gitHydrateTotalNS         atomicUint64
-	gitHydrateObjects         atomicUint64
-	gitHydrateObjectBytes     atomicUint64
-	gitHydrateObjectSkipped   atomicUint64
-	gitHydrateObjectMismatch  atomicUint64
-	gitHydrateObjectFallbacks atomicUint64
-	gitOverlayEnqueue         atomicUint64
-	gitOverlaySync            atomicUint64
-	gitOverlaySuccess         atomicUint64
-	gitOverlayFailure         atomicUint64
-	gitOverlayDrainCount      atomicUint64
-	gitOverlayDrainTotalNS    atomicUint64
+	gitCleanReadCount         atomic.Uint64
+	gitCleanTreeHit           atomic.Uint64
+	gitCleanBlobCacheHit      atomic.Uint64
+	gitCleanCacheMiss         atomic.Uint64
+	gitCatFileCount           atomic.Uint64
+	gitCatFileSlowCount       atomic.Uint64
+	gitCatFileTotalNS         atomic.Uint64
+	gitHydrateStart           atomic.Uint64
+	gitHydrateSuccess         atomic.Uint64
+	gitHydrateFailure         atomic.Uint64
+	gitHydrateBytes           atomic.Uint64
+	gitHydrateTotalNS         atomic.Uint64
+	gitHydrateObjects         atomic.Uint64
+	gitHydrateObjectBytes     atomic.Uint64
+	gitHydrateObjectSkipped   atomic.Uint64
+	gitHydrateObjectMismatch  atomic.Uint64
+	gitHydrateObjectFallbacks atomic.Uint64
+	gitOverlayEnqueue         atomic.Uint64
+	gitOverlaySync            atomic.Uint64
+	gitOverlaySuccess         atomic.Uint64
+	gitOverlayFailure         atomic.Uint64
+	gitOverlayDrainCount      atomic.Uint64
+	gitOverlayDrainTotalNS    atomic.Uint64
 
-	gitWorkspaceRefresh       atomicUint64
-	gitWorkspaceForcedRefresh atomicUint64
-}
-
-// atomicUint64 is a small wrapper around sync/atomic.Uint64. Keeping it local
-// keeps tests compact and avoids map allocations on FUSE hot paths.
-type atomicUint64 struct {
-	v uint64
-}
-
-func (a *atomicUint64) add(n uint64) { atomic.AddUint64(&a.v, n) }
-func (a *atomicUint64) load() uint64 { return atomic.LoadUint64(&a.v) }
-func (a *atomicUint64) max(n uint64) {
-	for {
-		cur := atomic.LoadUint64(&a.v)
-		if n <= cur {
-			return
-		}
-		if atomic.CompareAndSwapUint64(&a.v, cur, n) {
-			return
-		}
-	}
-}
-
-const perfLatencyBucketCount = 28
-
-var perfLatencyBucketNS = [...]uint64{
-	uint64(time.Microsecond),
-	2 * uint64(time.Microsecond),
-	4 * uint64(time.Microsecond),
-	8 * uint64(time.Microsecond),
-	16 * uint64(time.Microsecond),
-	32 * uint64(time.Microsecond),
-	64 * uint64(time.Microsecond),
-	128 * uint64(time.Microsecond),
-	256 * uint64(time.Microsecond),
-	512 * uint64(time.Microsecond),
-	uint64(time.Millisecond),
-	2 * uint64(time.Millisecond),
-	4 * uint64(time.Millisecond),
-	8 * uint64(time.Millisecond),
-	16 * uint64(time.Millisecond),
-	32 * uint64(time.Millisecond),
-	64 * uint64(time.Millisecond),
-	128 * uint64(time.Millisecond),
-	256 * uint64(time.Millisecond),
-	512 * uint64(time.Millisecond),
-	uint64(time.Second),
-	2 * uint64(time.Second),
-	4 * uint64(time.Second),
-	8 * uint64(time.Second),
-	16 * uint64(time.Second),
-	32 * uint64(time.Second),
-	64 * uint64(time.Second),
-	120 * uint64(time.Second),
+	gitWorkspaceRefresh       atomic.Uint64
+	gitWorkspaceForcedRefresh atomic.Uint64
 }
 
 type perfAtomicStats struct {
-	count          atomicUint64
-	errors         atomicUint64
-	bytes          atomicUint64
-	totalNS        atomicUint64
-	maxNS          atomicUint64
-	latencyBuckets [perfLatencyBucketCount]atomicUint64
+	count          atomic.Uint64
+	errors         atomic.Uint64
+	bytes          atomic.Uint64
+	totalNS        atomic.Uint64
+	maxNS          atomic.Uint64
+	latencyBuckets [perfLatencyBucketCount]atomic.Uint64
 }
 
 func newFusePerfCounters(enabled bool) *fusePerfCounters {
@@ -255,18 +212,22 @@ func (p *fusePerfCounters) isEnabled() bool {
 	return p != nil && p.enabled
 }
 
-func (p *fusePerfCounters) recordFuseOp(op perfFuseOp, status gofuse.Status, dur time.Duration, bytes uint64) {
-	if !p.isEnabled() || op < 0 || op >= perfFuseOpCount {
-		return
+func (p *fusePerfCounters) recordFuseOp(op perfFuseOp, status gofuse.Status, dur time.Duration, bytes uint64) (string, bool) {
+	name, ok := perfFuseName(op)
+	if !p.isEnabled() || !ok {
+		return "", false
 	}
 	p.fuseOps[op].record(status != gofuse.OK, dur, bytes)
+	return name, true
 }
 
-func (p *fusePerfCounters) recordRemoteOp(op perfRemoteOp, err error, dur time.Duration, bytes uint64) {
-	if !p.isEnabled() || op < 0 || op >= perfRemoteOpCount {
-		return
+func (p *fusePerfCounters) recordRemoteOp(op perfRemoteOp, err error, dur time.Duration, bytes uint64) (string, bool) {
+	name, ok := perfRemoteName(op)
+	if !p.isEnabled() || !ok {
+		return "", false
 	}
 	p.remoteOps[op].record(err != nil, dur, bytes)
+	return name, true
 }
 
 func (p *fusePerfCounters) recordLocalPolicy(source policyMatchSource) {
@@ -275,45 +236,45 @@ func (p *fusePerfCounters) recordLocalPolicy(source policyMatchSource) {
 	}
 	switch source {
 	case policyMatchLocalOnly:
-		p.localPolicyLocalOnly.add(1)
+		p.localPolicyLocalOnly.Add(1)
 	case policyMatchRemoteOverride:
-		p.localPolicyRemoteOverride.add(1)
+		p.localPolicyRemoteOverride.Add(1)
 	case policyMatchRemoteDefault:
-		p.localPolicyRemoteDefault.add(1)
+		p.localPolicyRemoteDefault.Add(1)
 	}
 }
 
 func (s *perfAtomicStats) record(failed bool, dur time.Duration, bytes uint64) {
-	s.count.add(1)
+	s.count.Add(1)
 	if failed {
-		s.errors.add(1)
+		s.errors.Add(1)
 	}
 	if bytes > 0 {
-		s.bytes.add(bytes)
+		s.bytes.Add(bytes)
 	}
 	if dur > 0 {
 		durNS := uint64(dur)
-		s.totalNS.add(durNS)
-		s.maxNS.max(durNS)
-		s.latencyBuckets[perfLatencyBucketIndex(durNS)].add(1)
+		s.totalNS.Add(durNS)
+		perfAtomicMax(&s.maxNS, durNS)
+		s.latencyBuckets[perfLatencyBucketIndex(durNS)].Add(1)
 	}
 }
 
 func (s *perfAtomicStats) snapshot() perfOpStats {
 	var buckets [perfLatencyBucketCount]uint64
 	for i := range s.latencyBuckets {
-		buckets[i] = s.latencyBuckets[i].load()
+		buckets[i] = s.latencyBuckets[i].Load()
 	}
-	count := s.count.load()
+	count := s.count.Load()
 	return perfOpStats{
 		count:   count,
-		errors:  s.errors.load(),
-		bytes:   s.bytes.load(),
-		totalNS: s.totalNS.load(),
+		errors:  s.errors.Load(),
+		bytes:   s.bytes.Load(),
+		totalNS: s.totalNS.Load(),
 		p50NS:   perfLatencyPercentile(buckets, count, 50),
 		p95NS:   perfLatencyPercentile(buckets, count, 95),
 		p99NS:   perfLatencyPercentile(buckets, count, 99),
-		maxNS:   s.maxNS.load(),
+		maxNS:   s.maxNS.Load(),
 	}
 }
 
@@ -367,71 +328,71 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 	for i, stats := range p.remoteOps {
 		snap.RemoteOps[perfRemoteOpNames[i]] = stats.snapshot()
 	}
-	snap.Counters["read_cache_hit"] = p.readCacheHit.load()
-	snap.Counters["read_cache_miss"] = p.readCacheMiss.load()
-	snap.Counters["dir_cache_hit"] = p.dirCacheHit.load()
-	snap.Counters["dir_cache_miss"] = p.dirCacheMiss.load()
-	snap.Counters["prefetch_hit"] = p.prefetchHit.load()
-	snap.Counters["prefetch_miss"] = p.prefetchMiss.load()
-	snap.Counters["namespace_positive_hit"] = p.namespacePositiveHit.load()
-	snap.Counters["namespace_negative_hit"] = p.namespaceNegativeHit.load()
-	snap.Counters["namespace_complete_miss"] = p.namespaceCompleteMiss.load()
-	snap.Counters["namespace_session_miss"] = p.namespaceSessionMiss.load()
-	snap.Counters["namespace_partial_miss"] = p.namespacePartialMiss.load()
-	snap.Counters["lookup_storm_list"] = p.lookupStormList.load()
-	snap.Counters["lookup_storm_list_deferred"] = p.lookupStormDeferred.load()
-	snap.Counters["lookup_retry_total"] = p.lookupRetryTotal.load()
-	snap.Counters["lookup_retry_success"] = p.lookupRetrySuccess.load()
-	snap.Counters["lookup_retry_exhausted"] = p.lookupRetryExhausted.load()
-	snap.Counters["read_retry_total"] = p.readRetryTotal.load()
-	snap.Counters["read_retry_success"] = p.readRetrySuccess.load()
-	snap.Counters["read_retry_exhausted"] = p.readRetryExhausted.load()
-	snap.Counters["commit_enqueue"] = p.commitEnqueue.load()
-	snap.Counters["commit_enqueue_error"] = p.commitEnqueueError.load()
-	snap.Counters["commit_retry"] = p.commitRetry.load()
-	snap.Counters["commit_success"] = p.commitSuccess.load()
-	snap.Counters["commit_failure"] = p.commitFailure.load()
-	snap.Counters["uploader_submit"] = p.uploaderSubmit.load()
-	snap.Counters["uploader_sync_fallback"] = p.uploaderSyncFallback.load()
-	snap.Counters["uploader_success"] = p.uploaderSuccess.load()
-	snap.Counters["uploader_failure"] = p.uploaderFailure.load()
-	snap.Counters["commit_drain_count"] = p.commitDrainCount.load()
-	snap.Counters["commit_drain_total_ns"] = p.commitDrainTotalNS.load()
-	snap.Counters["uploader_drain_count"] = p.uploaderDrainCount.load()
-	snap.Counters["uploader_drain_total_ns"] = p.uploaderDrainTotal.load()
-	snap.Counters["sse_change"] = p.sseChange.load()
-	snap.Counters["sse_reset"] = p.sseReset.load()
-	snap.Counters["sse_self_filtered"] = p.sseSelfFiltered.load()
-	snap.Counters["notify_entry"] = p.notifyEntry.load()
-	snap.Counters["notify_inode"] = p.notifyInode.load()
-	snap.Counters["local_policy_local_only"] = p.localPolicyLocalOnly.load()
-	snap.Counters["local_policy_remote_override"] = p.localPolicyRemoteOverride.load()
-	snap.Counters["local_policy_remote_default"] = p.localPolicyRemoteDefault.load()
-	snap.Counters["git_clean_read_count"] = p.gitCleanReadCount.load()
-	snap.Counters["git_clean_tree_hit"] = p.gitCleanTreeHit.load()
-	snap.Counters["git_clean_blob_cache_hit"] = p.gitCleanBlobCacheHit.load()
-	snap.Counters["git_clean_cache_miss"] = p.gitCleanCacheMiss.load()
-	snap.Counters["git_cat_file_count"] = p.gitCatFileCount.load()
-	snap.Counters["git_cat_file_slow_count"] = p.gitCatFileSlowCount.load()
-	snap.Counters["git_cat_file_total_ns"] = p.gitCatFileTotalNS.load()
-	snap.Counters["git_hydrate_start"] = p.gitHydrateStart.load()
-	snap.Counters["git_hydrate_success"] = p.gitHydrateSuccess.load()
-	snap.Counters["git_hydrate_failure"] = p.gitHydrateFailure.load()
-	snap.Counters["git_hydrate_bytes"] = p.gitHydrateBytes.load()
-	snap.Counters["git_hydrate_total_ns"] = p.gitHydrateTotalNS.load()
-	snap.Counters["git_hydrate_objects"] = p.gitHydrateObjects.load()
-	snap.Counters["git_hydrate_object_bytes"] = p.gitHydrateObjectBytes.load()
-	snap.Counters["git_hydrate_object_skipped"] = p.gitHydrateObjectSkipped.load()
-	snap.Counters["git_hydrate_object_mismatch"] = p.gitHydrateObjectMismatch.load()
-	snap.Counters["git_hydrate_object_fallbacks"] = p.gitHydrateObjectFallbacks.load()
-	snap.Counters["git_overlay_enqueue"] = p.gitOverlayEnqueue.load()
-	snap.Counters["git_overlay_sync"] = p.gitOverlaySync.load()
-	snap.Counters["git_overlay_success"] = p.gitOverlaySuccess.load()
-	snap.Counters["git_overlay_failure"] = p.gitOverlayFailure.load()
-	snap.Counters["git_overlay_drain_count"] = p.gitOverlayDrainCount.load()
-	snap.Counters["git_overlay_drain_total_ns"] = p.gitOverlayDrainTotalNS.load()
-	snap.Counters["git_workspace_refresh"] = p.gitWorkspaceRefresh.load()
-	snap.Counters["git_workspace_forced_refresh"] = p.gitWorkspaceForcedRefresh.load()
+	snap.Counters["read_cache_hit"] = p.readCacheHit.Load()
+	snap.Counters["read_cache_miss"] = p.readCacheMiss.Load()
+	snap.Counters["dir_cache_hit"] = p.dirCacheHit.Load()
+	snap.Counters["dir_cache_miss"] = p.dirCacheMiss.Load()
+	snap.Counters["prefetch_hit"] = p.prefetchHit.Load()
+	snap.Counters["prefetch_miss"] = p.prefetchMiss.Load()
+	snap.Counters["namespace_positive_hit"] = p.namespacePositiveHit.Load()
+	snap.Counters["namespace_negative_hit"] = p.namespaceNegativeHit.Load()
+	snap.Counters["namespace_complete_miss"] = p.namespaceCompleteMiss.Load()
+	snap.Counters["namespace_session_miss"] = p.namespaceSessionMiss.Load()
+	snap.Counters["namespace_partial_miss"] = p.namespacePartialMiss.Load()
+	snap.Counters["lookup_storm_list"] = p.lookupStormList.Load()
+	snap.Counters["lookup_storm_list_deferred"] = p.lookupStormDeferred.Load()
+	snap.Counters["lookup_retry_total"] = p.lookupRetryTotal.Load()
+	snap.Counters["lookup_retry_success"] = p.lookupRetrySuccess.Load()
+	snap.Counters["lookup_retry_exhausted"] = p.lookupRetryExhausted.Load()
+	snap.Counters["read_retry_total"] = p.readRetryTotal.Load()
+	snap.Counters["read_retry_success"] = p.readRetrySuccess.Load()
+	snap.Counters["read_retry_exhausted"] = p.readRetryExhausted.Load()
+	snap.Counters["commit_enqueue"] = p.commitEnqueue.Load()
+	snap.Counters["commit_enqueue_error"] = p.commitEnqueueError.Load()
+	snap.Counters["commit_retry"] = p.commitRetry.Load()
+	snap.Counters["commit_success"] = p.commitSuccess.Load()
+	snap.Counters["commit_failure"] = p.commitFailure.Load()
+	snap.Counters["uploader_submit"] = p.uploaderSubmit.Load()
+	snap.Counters["uploader_sync_fallback"] = p.uploaderSyncFallback.Load()
+	snap.Counters["uploader_success"] = p.uploaderSuccess.Load()
+	snap.Counters["uploader_failure"] = p.uploaderFailure.Load()
+	snap.Counters["commit_drain_count"] = p.commitDrainCount.Load()
+	snap.Counters["commit_drain_total_ns"] = p.commitDrainTotalNS.Load()
+	snap.Counters["uploader_drain_count"] = p.uploaderDrainCount.Load()
+	snap.Counters["uploader_drain_total_ns"] = p.uploaderDrainTotal.Load()
+	snap.Counters["sse_change"] = p.sseChange.Load()
+	snap.Counters["sse_reset"] = p.sseReset.Load()
+	snap.Counters["sse_self_filtered"] = p.sseSelfFiltered.Load()
+	snap.Counters["notify_entry"] = p.notifyEntry.Load()
+	snap.Counters["notify_inode"] = p.notifyInode.Load()
+	snap.Counters["local_policy_local_only"] = p.localPolicyLocalOnly.Load()
+	snap.Counters["local_policy_remote_override"] = p.localPolicyRemoteOverride.Load()
+	snap.Counters["local_policy_remote_default"] = p.localPolicyRemoteDefault.Load()
+	snap.Counters["git_clean_read_count"] = p.gitCleanReadCount.Load()
+	snap.Counters["git_clean_tree_hit"] = p.gitCleanTreeHit.Load()
+	snap.Counters["git_clean_blob_cache_hit"] = p.gitCleanBlobCacheHit.Load()
+	snap.Counters["git_clean_cache_miss"] = p.gitCleanCacheMiss.Load()
+	snap.Counters["git_cat_file_count"] = p.gitCatFileCount.Load()
+	snap.Counters["git_cat_file_slow_count"] = p.gitCatFileSlowCount.Load()
+	snap.Counters["git_cat_file_total_ns"] = p.gitCatFileTotalNS.Load()
+	snap.Counters["git_hydrate_start"] = p.gitHydrateStart.Load()
+	snap.Counters["git_hydrate_success"] = p.gitHydrateSuccess.Load()
+	snap.Counters["git_hydrate_failure"] = p.gitHydrateFailure.Load()
+	snap.Counters["git_hydrate_bytes"] = p.gitHydrateBytes.Load()
+	snap.Counters["git_hydrate_total_ns"] = p.gitHydrateTotalNS.Load()
+	snap.Counters["git_hydrate_objects"] = p.gitHydrateObjects.Load()
+	snap.Counters["git_hydrate_object_bytes"] = p.gitHydrateObjectBytes.Load()
+	snap.Counters["git_hydrate_object_skipped"] = p.gitHydrateObjectSkipped.Load()
+	snap.Counters["git_hydrate_object_mismatch"] = p.gitHydrateObjectMismatch.Load()
+	snap.Counters["git_hydrate_object_fallbacks"] = p.gitHydrateObjectFallbacks.Load()
+	snap.Counters["git_overlay_enqueue"] = p.gitOverlayEnqueue.Load()
+	snap.Counters["git_overlay_sync"] = p.gitOverlaySync.Load()
+	snap.Counters["git_overlay_success"] = p.gitOverlaySuccess.Load()
+	snap.Counters["git_overlay_failure"] = p.gitOverlayFailure.Load()
+	snap.Counters["git_overlay_drain_count"] = p.gitOverlayDrainCount.Load()
+	snap.Counters["git_overlay_drain_total_ns"] = p.gitOverlayDrainTotalNS.Load()
+	snap.Counters["git_workspace_refresh"] = p.gitWorkspaceRefresh.Load()
+	snap.Counters["git_workspace_forced_refresh"] = p.gitWorkspaceForcedRefresh.Load()
 	return snap
 }
 
@@ -528,6 +489,32 @@ func avgDuration(totalNS, count uint64) time.Duration {
 	return time.Duration(totalNS / count)
 }
 
+func perfFuseName(op perfFuseOp) (string, bool) {
+	if op < 0 || op >= perfFuseOpCount {
+		return "", false
+	}
+	return perfFuseOpNames[op], true
+}
+
+func perfRemoteName(op perfRemoteOp) (string, bool) {
+	if op < 0 || op >= perfRemoteOpCount {
+		return "", false
+	}
+	return perfRemoteOpNames[op], true
+}
+
+func perfAtomicMax(p *atomic.Uint64, n uint64) {
+	for {
+		cur := p.Load()
+		if n <= cur {
+			return
+		}
+		if p.CompareAndSwap(cur, n) {
+			return
+		}
+	}
+}
+
 func (fs *Dat9FS) perfEnabled() bool {
 	return fs != nil && fs.perf != nil && fs.perf.enabled
 }
@@ -544,14 +531,15 @@ func (fs *Dat9FS) perfRecordFuse(op perfFuseOp, start time.Time, status gofuse.S
 		return
 	}
 	dur := time.Since(start)
-	fs.perf.recordFuseOp(op, status, dur, bytes)
+	name, ok := fs.perf.recordFuseOp(op, status, dur, bytes)
+	if !ok {
+		return
+	}
 	result := "ok"
 	if status != gofuse.OK {
 		result = "error"
 	}
-	if op >= 0 && op < perfFuseOpCount {
-		metrics.RecordFuseOperation(perfFuseOpNames[op], result, dur, bytes)
-	}
+	metrics.RecordFuseOperation(name, result, dur, bytes)
 }
 
 func (fs *Dat9FS) perfRecordRemote(op perfRemoteOp, start time.Time, err error, bytes uint64) {
@@ -559,12 +547,13 @@ func (fs *Dat9FS) perfRecordRemote(op perfRemoteOp, start time.Time, err error, 
 		return
 	}
 	dur := time.Since(start)
-	fs.perf.recordRemoteOp(op, err, dur, bytes)
+	name, ok := fs.perf.recordRemoteOp(op, err, dur, bytes)
+	if !ok {
+		return
+	}
 	result := "ok"
 	if err != nil {
 		result = "error"
 	}
-	if op >= 0 && op < perfRemoteOpCount {
-		metrics.RecordFuseRemoteOperation(perfRemoteOpNames[op], result, dur, bytes)
-	}
+	metrics.RecordFuseRemoteOperation(name, result, dur, bytes)
 }

@@ -1,0 +1,311 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Drive9 Agent Harness Perf Summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "title",
+    "started_at",
+    "ended_at",
+    "overall_status",
+    "scope",
+    "environment",
+    "infrastructure",
+    "scenarios",
+    "observations",
+    "artifacts",
+    "conclusion",
+    "metric_notes",
+    "generator_schema"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "perf-summary.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "title": {
+      "type": "string"
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "ended_at": {
+      "type": "string"
+    },
+    "overall_status": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "INCONCLUSIVE"
+      ]
+    },
+    "scope": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "environment": {
+      "$ref": "#/$defs/environment"
+    },
+    "infrastructure": {
+      "$ref": "#/$defs/infrastructure"
+    },
+    "scenarios": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/scenario"
+      }
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "conclusion": {
+      "type": "string"
+    },
+    "metric_notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "generator_schema": {
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "run_id",
+        "host",
+        "os",
+        "kernel",
+        "architecture",
+        "product_version",
+        "server_endpoint",
+        "cloud_provider",
+        "instance_type",
+        "vcpu",
+        "cpu_model",
+        "memory",
+        "storage_type",
+        "storage_size",
+        "storage_iops",
+        "storage_throughput",
+        "storage_encrypted"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "perf-environment.v1"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "os": {
+          "type": "string"
+        },
+        "kernel": {
+          "type": "string"
+        },
+        "architecture": {
+          "type": "string"
+        },
+        "product_version": {
+          "type": "string"
+        },
+        "server_endpoint": {
+          "type": "string"
+        },
+        "cloud_provider": {
+          "type": "string"
+        },
+        "instance_type": {
+          "type": "string"
+        },
+        "vcpu": {
+          "type": "string"
+        },
+        "cpu_model": {
+          "type": "string"
+        },
+        "memory": {
+          "type": "string"
+        },
+        "storage_type": {
+          "type": "string"
+        },
+        "storage_size": {
+          "type": "string"
+        },
+        "storage_iops": {
+          "type": "string"
+        },
+        "storage_throughput": {
+          "type": "string"
+        },
+        "storage_encrypted": {
+          "type": "string"
+        }
+      }
+    },
+    "infrastructure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "instance_type",
+        "architecture",
+        "vcpu",
+        "cpu_model",
+        "memory",
+        "storage_type",
+        "storage_size",
+        "storage_iops",
+        "storage_throughput",
+        "storage_encrypted"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "instance_type": {
+          "type": "string"
+        },
+        "architecture": {
+          "type": "string"
+        },
+        "vcpu": {
+          "type": "string"
+        },
+        "cpu_model": {
+          "type": "string"
+        },
+        "memory": {
+          "type": "string"
+        },
+        "storage_type": {
+          "type": "string"
+        },
+        "storage_size": {
+          "type": "string"
+        },
+        "storage_iops": {
+          "type": "string"
+        },
+        "storage_throughput": {
+          "type": "string"
+        },
+        "storage_encrypted": {
+          "type": "string"
+        }
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "workload",
+        "load",
+        "attempted",
+        "successful",
+        "failed",
+        "qps",
+        "throughput",
+        "latency_avg",
+        "latency_p50",
+        "latency_p95",
+        "latency_p99",
+        "gate_status",
+        "metric_notes"
+      ],
+      "properties": {
+        "case_id": {
+          "type": "string"
+        },
+        "workload": {
+          "type": "string"
+        },
+        "load": {
+          "type": "string"
+        },
+        "attempted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "successful": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "qps": {
+          "type": "number",
+          "minimum": 0
+        },
+        "throughput": {
+          "type": "number",
+          "minimum": 0
+        },
+        "latency_avg": {
+          "type": "number",
+          "minimum": 0
+        },
+        "latency_p50": {
+          "type": "number",
+          "minimum": 0
+        },
+        "latency_p95": {
+          "type": "number",
+          "minimum": 0
+        },
+        "latency_p99": {
+          "type": "number",
+          "minimum": 0
+        },
+        "gate_status": {
+          "enum": [
+            "pass",
+            "fail",
+            "harness_failed",
+            "non_gating"
+          ]
+        },
+        "metric_notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "failure_class": {
+          "type": "string"
+        },
+        "failure": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

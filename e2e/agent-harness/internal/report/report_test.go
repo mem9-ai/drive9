@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestGenerateKnownBugNonGating(t *testing.T) {
@@ -188,6 +189,110 @@ func TestRecorderConcurrentWrites(t *testing.T) {
 	}
 }
 
+func TestGeneratePerfReportFromResults(t *testing.T) {
+	dir := t.TempDir()
+	rec := newPerfRun(t, dir, "run1", "upload-download")
+	if err := rec.WritePerfEnvironment(PerfEnvironment{
+		RunID:             "run1",
+		Host:              "perf-host",
+		OS:                "linux",
+		Kernel:            "6.1.0",
+		Architecture:      "amd64",
+		ProductVersion:    "drive9 test",
+		ServerEndpoint:    "https://drive9.example",
+		CloudProvider:     "aws",
+		InstanceType:      "c7i.2xlarge",
+		VCPU:              "8",
+		CPUModel:          "Intel Xeon",
+		Memory:            "16 GiB",
+		StorageType:       "gp3",
+		StorageSize:       "100 GiB",
+		StorageIOPS:       "3000",
+		StorageThroughput: "125 MiB/s",
+		StorageEncrypted:  "true",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	addPerfResult(t, rec, "upload-download", "upload", "upload-1", "upload", "ok", "2026-01-01T00:00:00Z", 100, 50<<20, 10, "")
+	addPerfResult(t, rec, "upload-download", "upload", "upload-2", "upload", "ok", "2026-01-01T00:00:01Z", 200, 50<<20, 10, "")
+	addPerfResult(t, rec, "upload-download", "download", "download-1", "download", "ok", "2026-01-01T00:00:03Z", 150, 50<<20, 10, "")
+	if _, _, err := Generate(dir); err != nil {
+		t.Fatal(err)
+	}
+	report, err := GeneratePerfReport(dir, PerfOptions{Title: "Drive9 Upload and Download Performance Test Report"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Scenarios) != 2 {
+		t.Fatalf("scenarios = %d, want 2", len(report.Scenarios))
+	}
+	if report.Infrastructure.StorageType != "gp3" || report.Infrastructure.StorageIOPS != "3000" {
+		t.Fatalf("infrastructure = %+v", report.Infrastructure)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "perf", "customer-report.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{"| Case | Workload | Load | Success | QPS | Throughput | Avg | p50 | p95 | p99 | Gate |", "gp3", "125 MiB/s", "upload", "download"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("customer report missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestGeneratePerfReportMissingEnvironmentUsesUnknown(t *testing.T) {
+	dir := t.TempDir()
+	rec := newPerfRun(t, dir, "run1", "case1")
+	addPerfResult(t, rec, "case1", "case1", "op1", "metadata_op", "ok", "2026-01-01T00:00:00Z", 10, 0, 1, "")
+	if _, _, err := Generate(dir); err != nil {
+		t.Fatal(err)
+	}
+	report, err := GeneratePerfReport(dir, PerfOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Environment.StorageIOPS != "unknown" || report.Infrastructure.StorageThroughput != "unknown" {
+		t.Fatalf("environment = %+v infrastructure = %+v", report.Environment, report.Infrastructure)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "perf", "customer-report.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "| Storage IOPS | unknown |") {
+		t.Fatalf("customer report missing unknown storage field:\n%s", string(body))
+	}
+}
+
+func TestGeneratePerfReportFailedScenarioRendersNA(t *testing.T) {
+	dir := t.TempDir()
+	rec := newPerfRun(t, dir, "run1", "failing")
+	addPerfResult(t, rec, "failing", "failing", "upload-1", "upload", "failed", "2026-01-01T00:00:00Z", 100, 0, 1, "write failed")
+	if err := rec.Failure(Failure{CaseID: "failing", Class: "product", Severity: "P1", ExpectedOutcome: "baseline_pass", Oracle: "throughput_min", Message: "write failed"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Generate(dir); err != nil {
+		t.Fatal(err)
+	}
+	report, err := GeneratePerfReport(dir, PerfOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.OverallStatus != "FAIL" || report.Scenarios[0].GateStatus != "fail" {
+		t.Fatalf("report status=%s scenario=%+v", report.OverallStatus, report.Scenarios[0])
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "perf", "customer-report.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{"| failing | upload | 1 operations | 0/1 | N/A | N/A | N/A | N/A | N/A | N/A | fail |", "failure_class=product"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("customer report missing %q:\n%s", want, text)
+		}
+	}
+}
+
 func countJSONLLines(t *testing.T, path string) int {
 	t.Helper()
 	b, err := os.ReadFile(path)
@@ -195,4 +300,57 @@ func countJSONLLines(t *testing.T, path string) int {
 		t.Fatal(err)
 	}
 	return strings.Count(string(b), "\n")
+}
+
+func newPerfRun(t *testing.T, dir, runID, caseID string) *Recorder {
+	t.Helper()
+	rec, err := NewRecorder(dir, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.WriteManifest(Manifest{
+		RunID:         runID,
+		StartedAt:     "2026-01-01T00:00:00Z",
+		Host:          "perf-host linux/amd64",
+		Drive9Version: "drive9 test",
+		Server:        "https://drive9.example",
+		Suites:        []string{"stress"},
+		SelectedCases: []string{caseID},
+		Cases:         []CaseSummary{{ID: caseID, Suite: "stress", ExpectedOutcome: "baseline_pass"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Event(Event{Type: "run_end", TS: "2026-01-01T00:00:05Z"}); err != nil {
+		t.Fatal(err)
+	}
+	return rec
+}
+
+func addPerfResult(t *testing.T, rec *Recorder, caseID, scenarioID, operationID, operation, status, started string, durationMS float64, bytes int64, requestUnits float64, errText string) {
+	t.Helper()
+	startedAt, err := time.Parse(time.RFC3339, started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endedAt := startedAt.Add(time.Duration(durationMS * float64(time.Millisecond)))
+	errorClass := ""
+	if status != "ok" && status != "skipped" {
+		errorClass = "product"
+	}
+	if err := rec.PerfResult(PerfResult{
+		CaseID:       caseID,
+		ScenarioID:   scenarioID,
+		OperationID:  operationID,
+		Operation:    operation,
+		Status:       status,
+		StartedAt:    startedAt.Format(time.RFC3339Nano),
+		EndedAt:      endedAt.Format(time.RFC3339Nano),
+		DurationMS:   durationMS,
+		Bytes:        bytes,
+		RequestUnits: requestUnits,
+		ErrorClass:   errorClass,
+		Error:        errText,
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
