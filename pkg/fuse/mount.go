@@ -60,6 +60,7 @@ type MountOptions struct {
 	ReadOnly              bool          // mount as read-only
 	Debug                 bool          // enable FUSE debug logging
 	PerfCounters          bool          // print low-overhead FUSE perf counter summary on shutdown
+	Profiling             ProfilingOptions
 }
 
 func (o *MountOptions) setDefaults() {
@@ -117,6 +118,9 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.PrefetchTimeout <= 0 {
 		o.PrefetchTimeout = defaultReadDirPrefetchTimeout
+	}
+	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfSampleInterval <= 0 {
+		o.Profiling.PerfSampleInterval = 10 * time.Second
 	}
 }
 
@@ -188,6 +192,17 @@ func Mount(opts *MountOptions) error {
 
 	// Build FUSE filesystem
 	dat9fs := NewDat9FS(c, opts)
+
+	profiler, err := StartProfiler(opts.Profiling)
+	if err != nil {
+		return fmt.Errorf("start profiler: %w", err)
+	}
+	defer profiler.Stop()
+	perfRecorder, err := StartContinuousPerf(opts.Profiling, dat9fs)
+	if err != nil {
+		return fmt.Errorf("start continuous perf: %w", err)
+	}
+	defer perfRecorder.Stop()
 
 	// Resolve sync mode (auto-detect RTT if needed).
 	resolved := ResolveMode(context.Background(), opts.SyncMode, opts.Server)
@@ -469,6 +484,9 @@ func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 	}
 	if runtime.GOOS == "linux" {
 		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively
+		if os.Geteuid() == 0 {
+			fuseOpts.DirectMountStrict = true
+		}
 	}
 	if runtime.GOOS == "darwin" {
 		// macFUSE can reject open/readdir before requests reach the daemon if

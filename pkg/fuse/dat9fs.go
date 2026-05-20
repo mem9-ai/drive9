@@ -183,7 +183,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		gid:           uint32(os.Getgid()),
 		opts:          opts,
 		debouncer:     newFlushDebouncer(opts.FlushDebounce),
-		perf:          newFusePerfCounters(opts.PerfCounters),
+		perf:          newFusePerfCounters(opts.PerfCounters || opts.Profiling.PerfSamplesPath != ""),
 	}
 }
 
