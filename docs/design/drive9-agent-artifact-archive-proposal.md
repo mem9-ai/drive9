@@ -6,7 +6,7 @@ title: Drive9 Agent Artifact Archive Proposal
 
 Create a versioned drive9 archive space for agent consumption. GitHub remains the canonical source of truth for history, pull requests, review, and branch workflow. drive9 becomes an agent-optimized mirror of merged `main` artifacts: exact source snapshots, built binaries, checksums, and machine-readable metadata.
 
-The workflow should run after commits land on `main`, publish immutable commit-scoped artifacts, and update a small mutable `latest` manifest that points to the newest complete commit archive.
+The workflow should run after commits land on `main` and publish immutable commit-scoped artifacts.
 
 ## Motivation
 
@@ -20,9 +20,8 @@ This is not intended to replace git. It is a distribution and recovery layer for
 2. Store built drive9 binaries for the same commit.
 3. Store checksums and manifest metadata so agents can verify what they fetched.
 4. Provide immutable commit paths for reproducibility.
-5. Provide a mutable `latest` path for convenience.
-6. Keep the v1 archive usable through ordinary `drive9 fs cp`, `cat`, and `ls` workflows for artifacts and metadata.
-7. Leave file-level source search through `drive9 fs find` and `grep` as a post-v1 extension that requires uploading an expanded source tree.
+5. Keep the v1 archive usable through ordinary `drive9 fs cp`, `cat`, and `ls` workflows for artifacts and metadata.
+6. Leave file-level source search through `drive9 fs find` and `grep` as a post-v1 extension that requires uploading an expanded source tree.
 
 ## Non-Goals
 
@@ -56,13 +55,7 @@ Recommended v1 commit layout:
 /drive9/commits/<sha>/checksums.txt
 ```
 
-Recommended v1 latest layout:
-
-```text
-/drive9/latest/manifest.json
-```
-
-Commit paths are immutable after their `manifest.json` is published. The `latest` manifest is pointer-only and contains the newest complete commit SHA, commit path, publish timestamp, and expected artifact checksums. It does not duplicate source archives or binaries. This keeps the mutable surface small and avoids partial `latest` artifact copies.
+Commit paths are immutable after their `manifest.json` is published.
 
 Future optional paths:
 
@@ -99,23 +92,6 @@ Suggested fields:
 }
 ```
 
-The `latest/manifest.json` is a pointer, not a copied artifact manifest:
-
-```json
-{
-  "schema_version": 1,
-  "repository": "mem9-ai/drive9",
-  "branch": "main",
-  "commit_sha": "<full sha>",
-  "commit_path": "/drive9/commits/<full sha>/",
-  "published_at": "<UTC RFC3339>",
-  "checksums": {
-    "source.tar.gz": "<sha256>",
-    "bin/drive9-linux-amd64": "<sha256>"
-  }
-}
-```
-
 ## Workflow Shape
 
 Trigger on push to `main`. That represents the final merged commit regardless of merge, squash, or rebase strategy.
@@ -124,13 +100,12 @@ High-level workflow:
 
 1. Check out the merged commit.
 2. Set up Go using `go.mod`.
-3. Install a pinned, known-good drive9 publisher CLI before building the current commit. The newly built CLI is archived as data, not used as the publisher for that same commit.
+3. Install the official drive9 publisher CLI before building the current commit. The newly built CLI is archived as data, not used as the publisher for that same commit.
 4. Build release CLI binaries with `make build-cli-release`.
 5. Create `source.tar.gz` from the checked-out tree, excluding `.git`, transient build outputs, and local caches.
-6. Generate `checksums.txt`, the commit `manifest.json`, and the pointer-only `latest/manifest.json`.
+6. Generate `checksums.txt` and the commit `manifest.json`.
 7. Upload source archive, binaries, and checksums to the immutable commit path.
 8. Upload the commit `manifest.json` last. This marks the commit path complete.
-9. Update `latest/manifest.json` only after the commit manifest upload succeeds.
 
 Server binaries and expanded source `tree/` uploads are out of v1 scope.
 
@@ -141,25 +116,10 @@ The publisher must be safe to rerun for the same commit.
 1. If `/commits/<sha>/manifest.json` exists and all referenced checksums match, the commit publish step is complete and should be skipped.
 2. If some artifacts exist but the commit manifest is missing, the publisher may repair the commit path by re-uploading missing artifacts and then writing the manifest.
 3. If the commit manifest exists but any referenced artifact is missing or has a checksum mismatch, the workflow must fail rather than silently overwrite immutable data.
-4. `latest/manifest.json` may be repaired whenever it does not point to the newest complete `main` commit.
-5. A manual `workflow_dispatch` input `commit_sha` should allow backfilling or repairing a specific commit.
-6. A scheduled reconciliation job should periodically check recent `main` commits and publish any commit that lacks a complete commit manifest.
-7. The reconciliation job should also compare `latest/manifest.json` with the newest complete `main` commit and repair stale `latest` pointers.
+4. A manual `workflow_dispatch` input `branch` should allow publishing the tip of a specific branch.
+5. A scheduled reconciliation job should periodically check recent `main` commits and publish any commit that lacks a complete commit manifest.
 
 ## Retrieval Examples
-
-Fetch latest manifest:
-
-```bash
-drive9 fs cat :/drive9/latest/manifest.json
-```
-
-Fetch the source archive pointed to by `latest`:
-
-```bash
-commit_path="$(drive9 fs cat :/drive9/latest/manifest.json | jq -r .commit_path)"
-drive9 fs cp ":${commit_path}source.tar.gz" .
-```
 
 Fetch a specific source archive:
 
@@ -191,11 +151,11 @@ chmod +x ./drive9
 3. Archive growth:
    Mitigation: start with immutable commit archives, then add retention rules only if storage pressure becomes real.
 4. Partial publish:
-   Mitigation: publish commit artifacts first, write the commit `manifest.json` last, use pointer-only `latest`, and allow scheduled reconciliation to repair stale `latest`.
+   Mitigation: publish commit artifacts first, write the commit `manifest.json` last, and allow scheduled reconciliation to repair missing commit manifests.
 5. Confusing source of truth:
    Mitigation: document that GitHub remains canonical and drive9 is an artifact mirror.
 6. Publisher regression:
-   Mitigation: publish with a pinned known-good drive9 CLI or equivalent stable uploader, not the newly built candidate binary from the commit being archived.
+   Mitigation: publish with the official drive9 CLI download, not the newly built candidate binary from the commit being archived.
 
 ## Open Decisions
 
@@ -210,10 +170,10 @@ Start small:
 
 1. One pre-provisioned archive space.
 2. GitHub Actions secrets: `DRIVE9_SERVER`, `DRIVE9_API_KEY`.
-3. Triggers: `push` to `main`, `workflow_dispatch` with `commit_sha`, and scheduled reconciliation for recent `main` commits.
+3. Triggers: `push` to `main`, `workflow_dispatch` with `branch`, and scheduled reconciliation for recent `main` commits.
 4. Artifacts: `source.tar.gz`, CLI release binaries, `checksums.txt`, `manifest.json`.
-5. Paths: immutable `commits/<sha>/` plus mutable pointer-only `latest/manifest.json`.
-6. Publisher: pinned known-good drive9 CLI or equivalent stable uploader.
-7. Recovery: idempotent reruns, missing-manifest repair, and stale-latest repair.
+5. Paths: immutable `commits/<sha>/`.
+6. Publisher: official drive9 CLI download.
+7. Recovery: idempotent reruns and missing-manifest repair.
 
 This should fit in roughly `80-150 LoC` of workflow YAML and shell if it reuses the existing build targets and drive9 CLI upload path while adding manifest generation, checksum validation, idempotent reruns, and scheduled reconciliation.

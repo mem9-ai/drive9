@@ -1,0 +1,59 @@
+name: Drive9 archive
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to publish.
+        required: true
+        default: main
+        type: string
+  schedule:
+    - cron: "17 3 * * *"
+
+jobs:
+  publish:
+    name: Publish archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    env:
+      DRIVE9_SERVER: https://api.drive9.ai
+      DRIVE9_API_KEY: ${{ secrets.DRIVE9_ARCHIVE_API_KEY }}
+      DRIVE9_ARCHIVE_BRANCH: ${{ github.event.inputs.branch || 'main' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'push' && github.sha || github.event.inputs.branch || 'main' }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate archive configuration
+        run: |
+          set -euo pipefail
+          test -n "${DRIVE9_SERVER}" || { echo "DRIVE9_ARCHIVE_SERVER secret is required" >&2; exit 1; }
+          test -n "${DRIVE9_API_KEY}" || { echo "DRIVE9_ARCHIVE_API_KEY secret is required" >&2; exit 1; }
+
+      - name: Install drive9 publisher
+        run: |
+          set -euo pipefail
+          publisher="${RUNNER_TEMP}/drive9-publisher"
+          curl -fsSL -o "${publisher}" "https://drive9.ai/releases/drive9-linux-amd64"
+          chmod +x "${publisher}"
+          "${publisher}" version
+          echo "DRIVE9_PUBLISHER=${publisher}" >> "${GITHUB_ENV}"
+
+      - name: Publish archive
+        run: ./scripts/publish-agent-archive.sh

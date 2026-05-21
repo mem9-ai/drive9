@@ -30,7 +30,7 @@ work_root="${RUNNER_TEMP:-$(pwd)/.tmp}/drive9-agent-archive"
 artifact_root="${work_root}/artifacts"
 worktree_root="${work_root}/worktrees"
 repository="${GITHUB_REPOSITORY:-mem9-ai/drive9}"
-branch="main"
+branch="${DRIVE9_ARCHIVE_BRANCH:-main}"
 remote_missing_status=42
 active_worktree=""
 
@@ -39,6 +39,12 @@ if [ -z "${DRIVE9_SERVER:-}" ]; then
 fi
 if [ -z "${DRIVE9_API_KEY:-}" ]; then
   die "DRIVE9_API_KEY is required"
+fi
+if [ -z "$branch" ]; then
+  die "DRIVE9_ARCHIVE_BRANCH must not be empty"
+fi
+if [ "${branch#-}" != "$branch" ] || ! git check-ref-format "refs/heads/${branch}" >/dev/null; then
+  die "invalid DRIVE9_ARCHIVE_BRANCH: ${branch}"
 fi
 
 remote() {
@@ -82,6 +88,10 @@ remote_upload() {
   local remote_path=$2
   info "upload ${remote_path}"
   remote fs cp "$local_path" "$(remote_ref "$remote_path")"
+}
+
+fetch_archive_branch() {
+  git fetch --quiet origin "refs/heads/${branch}:refs/remotes/origin/${branch}"
 }
 
 checksums_object() {
@@ -177,61 +187,6 @@ write_commit_manifest() {
     }' >"${artifact_dir}/manifest.json"
 }
 
-write_latest_manifest() {
-  local sha=$1
-  local artifact_dir=$2
-  local published_at checksums_json
-  published_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  checksums_json="$(checksums_object "${artifact_dir}/checksums.txt")"
-
-  jq -n \
-    --arg repository "$repository" \
-    --arg branch "$branch" \
-    --arg sha "$sha" \
-    --arg commit_path "${archive_root}/commits/${sha}/" \
-    --arg published_at "$published_at" \
-    --argjson checksums "$checksums_json" \
-    '{
-      schema_version: 1,
-      repository: $repository,
-      branch: $branch,
-      commit_sha: $sha,
-      commit_path: $commit_path,
-      published_at: $published_at,
-      checksums: $checksums
-    }' >"${artifact_dir}/latest-manifest.json"
-}
-
-write_latest_manifest_from_remote_commit() {
-  local sha=$1
-  local out=$2
-  local remote_manifest="${work_root}/latest-source-${sha}.json"
-  local published_at checksums_json
-
-  if ! remote_cat "${archive_root}/commits/${sha}/manifest.json" "$remote_manifest"; then
-    die "failed to read complete remote manifest for ${sha}"
-  fi
-  published_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  checksums_json="$(jq '.checksums' "$remote_manifest")"
-
-  jq -n \
-    --arg repository "$repository" \
-    --arg branch "$branch" \
-    --arg sha "$sha" \
-    --arg commit_path "${archive_root}/commits/${sha}/" \
-    --arg published_at "$published_at" \
-    --argjson checksums "$checksums_json" \
-    '{
-      schema_version: 1,
-      repository: $repository,
-      branch: $branch,
-      commit_sha: $sha,
-      commit_path: $commit_path,
-      published_at: $published_at,
-      checksums: $checksums
-    }' >"$out"
-}
-
 prepare_agfs_dependency() {
   local worktree=$1
   local parent target marker module_dir
@@ -301,7 +256,6 @@ build_artifacts() {
   )
 
   write_commit_manifest "$sha" "$artifact_dir"
-  write_latest_manifest "$sha" "$artifact_dir"
 
   cleanup_worktree "$worktree"
   active_worktree=""
@@ -413,49 +367,18 @@ publish_commit() {
   remote_upload "${artifact_dir}/manifest.json" "${commit_path}/manifest.json"
 }
 
-update_latest_if_head() {
-  local sha=$1
-  local artifact_dir="${artifact_root}/${sha}"
-  local latest_manifest="${artifact_dir}/latest-manifest.json"
-  local newest
-  git fetch --quiet origin main
-  newest="$(git rev-parse origin/main)"
-  if [ "$sha" != "$newest" ]; then
-    info "skip latest for ${sha}; origin/main is ${newest}"
-    return
-  fi
-
-  if [ "$(remote_commit_self_state "$sha")" != "complete" ]; then
-    die "cannot update latest because ${sha} is not complete"
-  fi
-
-  if [ ! -f "$latest_manifest" ]; then
-    mkdir -p "$artifact_dir"
-    write_latest_manifest_from_remote_commit "$sha" "$latest_manifest"
-  fi
-
-  remote_mkdir "$archive_root" || true
-  remote_mkdir "${archive_root}/latest" || true
-  remote_upload "$latest_manifest" "${archive_root}/latest/manifest.json"
-}
-
 resolve_commits() {
   if [ "$#" -gt 0 ]; then
     printf '%s\n' "$@"
     return
   fi
 
-  if [ -n "${DRIVE9_ARCHIVE_COMMIT_SHA:-}" ]; then
-    printf '%s\n' "$DRIVE9_ARCHIVE_COMMIT_SHA"
-    return
-  fi
-
   case "${GITHUB_EVENT_NAME:-}" in
   schedule)
-    git rev-list --first-parent --reverse --max-count="$recent_commits" origin/main
+    git rev-list --first-parent --reverse --max-count="$recent_commits" "refs/remotes/origin/${branch}"
     ;;
   workflow_dispatch)
-    git rev-parse origin/main
+    git rev-parse "refs/remotes/origin/${branch}^{commit}"
     ;;
   *)
     git rev-parse HEAD
@@ -465,7 +388,7 @@ resolve_commits() {
 
 main() {
   mkdir -p "$artifact_root" "$worktree_root"
-  git fetch --quiet origin main
+  fetch_archive_branch
 
   mapfile -t commits < <(resolve_commits "$@")
   if [ "${#commits[@]}" -eq 0 ]; then
@@ -475,7 +398,6 @@ main() {
   for sha in "${commits[@]}"; do
     sha="$(git rev-parse "${sha}^{commit}")"
     publish_commit "$sha"
-    update_latest_if_head "$sha"
   done
 }
 
