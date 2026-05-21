@@ -29,6 +29,11 @@ func makeJWT(t *testing.T, claims map[string]any) string {
 	return header + "." + payload + "." + sig
 }
 
+func makeDrive9APIKey(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	return "dat9_" + base64.RawURLEncoding.EncodeToString([]byte(makeJWT(t, claims)))
+}
+
 func TestCtxForkCreatesOwnerContextWithoutSwitching(t *testing.T) {
 	withIsolatedHome(t)
 	var sawName string
@@ -414,6 +419,48 @@ func TestCtxShowOwnerRevealJSON(t *testing.T) {
 	}
 }
 
+func TestCtxShowOwnerDisplaysTenantID(t *testing.T) {
+	_ = withIsolatedHome(t)
+	cfg := loadConfig()
+	_, err := ctxAdd(cfg, "prod", &Context{
+		Type: PrincipalOwner,
+		APIKey: makeDrive9APIKey(t, map[string]any{
+			"tenant_id":     "tenant-owner-1",
+			"token_version": 1,
+			"iat":           time.Now().Unix(),
+		}),
+		Server: "https://api.drive9.ai",
+	})
+	if err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+
+	out, err := captureStdoutE(t, func() error { return Ctx([]string{"show"}) })
+	if err != nil {
+		t.Fatalf("ctx show: %v", err)
+	}
+	if !strings.Contains(out, "tenant_id:") || !strings.Contains(out, "tenant-owner-1") {
+		t.Fatalf("ctx show output = %q, want tenant_id", out)
+	}
+
+	out, err = captureStdoutE(t, func() error { return Ctx([]string{"show", "--json"}) })
+	if err != nil {
+		t.Fatalf("ctx show --json: %v", err)
+	}
+	var got struct {
+		TenantID string `json:"tenant_id"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v\nout=%q", err, out)
+	}
+	if got.TenantID != "tenant-owner-1" {
+		t.Fatalf("tenant_id = %q, want tenant-owner-1", got.TenantID)
+	}
+}
+
 func TestCtxShowDelegatedJSON(t *testing.T) {
 	_ = withIsolatedHome(t)
 	expiresAt := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
@@ -483,6 +530,42 @@ func TestCtxShowDelegatedJSON(t *testing.T) {
 	}
 	if got.LabelHint != "alice-prod-db" {
 		t.Fatalf("label_hint = %q, want alice-prod-db", got.LabelHint)
+	}
+}
+
+func TestCtxShowDelegatedDisplaysTenantID(t *testing.T) {
+	_ = withIsolatedHome(t)
+	cfg := loadConfig()
+	_, err := ctxAdd(cfg, "alice-prod-db", &Context{
+		Type:   PrincipalDelegated,
+		Server: "https://api.drive9.ai",
+		Token: makeJWT(t, map[string]any{
+			"tenant_id":      "tenant-delegated-1",
+			"principal_type": "delegated",
+			"grant_id":       "grt_1",
+			"agent":          "alice",
+			"scope":          []string{"/n/vault/prod-db/DB_URL"},
+			"perm":           "read",
+			"exp":            time.Now().Add(time.Hour).Unix(),
+		}),
+		Agent:   "alice",
+		Scope:   []string{"/n/vault/prod-db/DB_URL"},
+		Perm:    PermRead,
+		GrantID: "grt_1",
+	})
+	if err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+
+	out, err := captureStdoutE(t, func() error { return Ctx([]string{"show"}) })
+	if err != nil {
+		t.Fatalf("ctx show: %v", err)
+	}
+	if !strings.Contains(out, "tenant_id:") || !strings.Contains(out, "tenant-delegated-1") {
+		t.Fatalf("ctx show output = %q, want tenant_id", out)
 	}
 }
 
@@ -711,6 +794,80 @@ func TestF16_CtxListUsesCurrentColumn(t *testing.T) {
 	}
 	if stars != 1 {
 		t.Errorf("expected exactly one row with * in CURRENT column; got %d", stars)
+	}
+}
+
+func TestCtxListDisplaysTenantID(t *testing.T) {
+	_ = withIsolatedHome(t)
+	cfg := loadConfig()
+	_, err := ctxAdd(cfg, "owner-prod", &Context{
+		Type: PrincipalOwner,
+		APIKey: makeDrive9APIKey(t, map[string]any{
+			"tenant_id":     "tenant-owner-1",
+			"token_version": 1,
+			"iat":           time.Now().Unix(),
+		}),
+		Server: "https://s",
+	})
+	if err != nil {
+		t.Fatalf("ctxAdd owner: %v", err)
+	}
+	_, err = ctxAdd(cfg, "alice", &Context{
+		Type:   PrincipalDelegated,
+		Server: "https://s",
+		Token: makeJWT(t, map[string]any{
+			"tenant_id":      "tenant-delegated-1",
+			"principal_type": "delegated",
+			"grant_id":       "grt_1",
+			"agent":          "alice",
+			"scope":          []string{"/n/vault/prod-db/DB_URL"},
+			"perm":           "read",
+			"exp":            time.Now().Add(time.Hour).Unix(),
+		}),
+		Agent:   "alice",
+		Scope:   []string{"/n/vault/prod-db/DB_URL"},
+		Perm:    PermRead,
+		GrantID: "grt_1",
+	})
+	if err != nil {
+		t.Fatalf("ctxAdd delegated: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	out, err := captureStdoutE(t, func() error { return Ctx([]string{"ls"}) })
+	if err != nil {
+		t.Fatalf("ctx ls: %v", err)
+	}
+	for _, want := range []string{"TENANT_ID", "tenant-owner-1", "tenant-delegated-1"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("ctx ls output = %q, want substring %q", out, want)
+		}
+	}
+
+	out, err = captureStdoutE(t, func() error { return Ctx([]string{"ls", "--json"}) })
+	if err != nil {
+		t.Fatalf("ctx ls --json: %v", err)
+	}
+	var got struct {
+		Contexts []struct {
+			Name     string `json:"name"`
+			TenantID string `json:"tenant_id"`
+		} `json:"contexts"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v\nout=%q", err, out)
+	}
+	tenantIDs := map[string]string{}
+	for _, entry := range got.Contexts {
+		tenantIDs[entry.Name] = entry.TenantID
+	}
+	if tenantIDs["owner-prod"] != "tenant-owner-1" {
+		t.Fatalf("owner tenant_id = %q, want tenant-owner-1", tenantIDs["owner-prod"])
+	}
+	if tenantIDs["alice"] != "tenant-delegated-1" {
+		t.Fatalf("delegated tenant_id = %q, want tenant-delegated-1", tenantIDs["alice"])
 	}
 }
 

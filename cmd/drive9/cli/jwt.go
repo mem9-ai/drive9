@@ -16,6 +16,7 @@ import (
 // MUST re-validate signature, TTL, and revocation on every request.
 type jwtClaims struct {
 	Iss           string   `json:"iss"`
+	TenantID      string   `json:"tenant_id"`
 	GrantID       string   `json:"grant_id"`
 	PrincipalType string   `json:"principal_type"`
 	Agent         string   `json:"agent"`

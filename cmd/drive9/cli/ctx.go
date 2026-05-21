@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -66,6 +67,7 @@ type ctxShowEntry struct {
 	Name      string     `json:"name"`
 	Type      string     `json:"type"`
 	Server    string     `json:"server,omitempty"`
+	TenantID  string     `json:"tenant_id,omitempty"`
 	APIKey    string     `json:"api_key,omitempty"`
 	Token     string     `json:"token,omitempty"`
 	Agent     string     `json:"agent,omitempty"`
@@ -109,10 +111,11 @@ func buildCtxShowEntry(cfg *Config, reveal bool) *ctxShowEntry {
 	}
 
 	entry := &ctxShowEntry{
-		Name:   cfg.CurrentContext,
-		Type:   string(current.Type),
-		Server: cfg.ResolveServer(),
-		Source: configPath(),
+		Name:     cfg.CurrentContext,
+		Type:     string(current.Type),
+		Server:   cfg.ResolveServer(),
+		TenantID: tenantIDFromContext(current),
+		Source:   configPath(),
 	}
 
 	switch current.Type {
@@ -164,6 +167,12 @@ func writeCtxShowText(entry *ctxShowEntry) error {
 		{label: "name", value: entry.Name},
 		{label: "type", value: entry.Type},
 		{label: "server", value: entry.Server},
+	}
+	if entry.TenantID != "" {
+		fields = append(fields, struct {
+			label string
+			value string
+		}{label: "tenant_id", value: entry.TenantID})
 	}
 	if entry.APIKey != "" {
 		fields = append(fields, struct {
@@ -231,6 +240,41 @@ func writeCtxShowText(entry *ctxShowEntry) error {
 		_, _ = fmt.Fprintf(w, "%s:\t%s\n", field.label, field.value)
 	}
 	return w.Flush()
+}
+
+const drive9APIKeyJWTWrapperPrefix = "dat9_"
+
+func tenantIDFromContext(ctx *Context) string {
+	if ctx == nil {
+		return ""
+	}
+	var claims *jwtClaims
+	var err error
+	switch ctx.Type {
+	case PrincipalOwner, PrincipalFSScoped:
+		claims, err = decodeDrive9APIKeyPayload(ctx.APIKey)
+	case PrincipalDelegated:
+		claims, err = decodeJWTPayload(ctx.Token)
+	default:
+		return ""
+	}
+	if err != nil || claims == nil {
+		return ""
+	}
+	return claims.TenantID
+}
+
+func decodeDrive9APIKeyPayload(apiKey string) (*jwtClaims, error) {
+	apiKey = strings.TrimSpace(apiKey)
+	if !strings.HasPrefix(apiKey, drive9APIKeyJWTWrapperPrefix) {
+		return nil, fmt.Errorf("invalid drive9 api key format")
+	}
+	wrapped := strings.TrimPrefix(apiKey, drive9APIKeyJWTWrapperPrefix)
+	rawJWT, err := base64.RawURLEncoding.DecodeString(wrapped)
+	if err != nil {
+		return nil, fmt.Errorf("decode api key wrapper: %w", err)
+	}
+	return decodeJWTPayload(string(rawJWT))
 }
 
 func formatSecretForDisplay(secret string, reveal bool) string {
@@ -742,6 +786,7 @@ type ctxListEntry struct {
 	Current   bool      `json:"current"`
 	Type      string    `json:"type"`
 	Server    string    `json:"server,omitempty"`
+	TenantID  string    `json:"tenant_id,omitempty"`
 	Scope     []string  `json:"scope,omitempty"`
 	Perm      string    `json:"perm,omitempty"`
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
@@ -774,7 +819,7 @@ func writeCtxListTable(cfg *Config, longForm bool, typeFilter string) error {
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	// tabwriter.Writer buffers internally; errors surface at Flush().
-	_, _ = fmt.Fprintln(w, "CURRENT\tNAME\tTYPE\tSCOPE\tPERM\tEXPIRES_AT\tSTATUS")
+	_, _ = fmt.Fprintln(w, "CURRENT\tNAME\tTYPE\tTENANT_ID\tSCOPE\tPERM\tEXPIRES_AT\tSTATUS")
 	for _, e := range entries {
 		cur := " "
 		if e.Current {
@@ -785,10 +830,11 @@ func writeCtxListTable(cfg *Config, longForm bool, typeFilter string) error {
 		if e.Type == string(PrincipalOwner) {
 			perm = "rw"
 		}
-		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			cur,
 			e.Name,
 			e.Type,
+			e.TenantID,
 			scope,
 			perm,
 			formatExpiresAt(e.ExpiresAt),
@@ -816,6 +862,7 @@ func buildCtxListEntries(cfg *Config) []ctxListEntry {
 			Current:   n == cfg.CurrentContext,
 			Type:      string(c.Type),
 			Server:    c.Server,
+			TenantID:  tenantIDFromContext(c),
 			Scope:     c.Scope,
 			Perm:      string(c.Perm),
 			ExpiresAt: c.ExpiresAt,
