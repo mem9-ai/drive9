@@ -142,6 +142,8 @@ type semanticWorkerManager struct {
 	tenantScanCursorSet       bool
 	tenantScanCursorCreatedAt time.Time
 	tenantScanCursorID        string
+	tenantScanRoundRawTenants int
+	tenantScanRoundIncluded   int
 	lastTenantScan            semanticTenantScanSnapshot
 	tenantScanMu              sync.Mutex
 
@@ -638,7 +640,7 @@ func (m *semanticWorkerManager) listTenantRefs(ctx context.Context) ([]semanticT
 			}
 			refs = append(refs, semanticTenantRef{id: t.ID, tenant: &t})
 		}
-		m.recordTenantScan(tenants, len(refs), wrapped)
+		m.recordTenantScan(ctx, tenants, len(refs), wrapped)
 		return refs, nil
 	}
 	if m.shouldIncludeFallback() {
@@ -647,15 +649,30 @@ func (m *semanticWorkerManager) listTenantRefs(ctx context.Context) ([]semanticT
 	return nil, nil
 }
 
+// nextTenantScanPage returns the next raw page of active tenants for round-robin
+// scheduling. It reads the current scan cursor, fetches up to TenantScanLimit rows
+// after that cursor in (created_at, id) order, and wraps to the first page when the
+// cursor is already at the end of the active-tenant sequence.
+//
+// Outward behavior for callers (typically listTenantRefs under tenantScanMu):
+//   - Returns DB rows only; provider/task-type filtering happens after this call.
+//   - Does not advance the scan cursor; the caller must call recordTenantScan with
+//     the returned page and wrapped flag.
+//   - wrapped is true only when the first query after the cursor returned no rows
+//     and a second query restarted from the beginning of the active-tenant order.
+//   - On the first scan (no cursor yet), an empty page means there are no active
+//     tenants; wrapped stays false.
 func (m *semanticWorkerManager) nextTenantScanPage(ctx context.Context) ([]meta.Tenant, bool, error) {
 	createdAt, id, ok := m.tenantScanCursor()
 	tenants, err := m.meta.ListTenantsByStatusAfter(ctx, meta.TenantActive, createdAt, id, m.opts.TenantScanLimit)
 	if err != nil {
 		return nil, false, err
 	}
+	// Non-empty page, or the initial scan before any cursor exists: return as-is.
 	if len(tenants) > 0 || !ok {
 		return tenants, false, nil
 	}
+	// Cursor was set but nothing remains after it; wrap to the head of the order.
 	tenants, err = m.meta.ListTenantsByStatusAfter(ctx, meta.TenantActive, time.Time{}, "", m.opts.TenantScanLimit)
 	if err != nil {
 		return nil, true, err
@@ -672,9 +689,19 @@ func (m *semanticWorkerManager) tenantScanCursor() (time.Time, string, bool) {
 	return m.tenantScanCursorCreatedAt, m.tenantScanCursorID, true
 }
 
-func (m *semanticWorkerManager) recordTenantScan(tenants []meta.Tenant, included int, wrapped bool) {
+func (m *semanticWorkerManager) recordTenantScan(ctx context.Context, tenants []meta.Tenant, included int, wrapped bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if wrapped {
+		logger.Info(ctx, "semantic_worker_tenant_scan_wrapped",
+			zap.Int("tenant_scan_round_raw_tenants", m.tenantScanRoundRawTenants),
+			zap.Int("tenant_scan_round_included_tenants", m.tenantScanRoundIncluded),
+		)
+		m.tenantScanRoundRawTenants = 0
+		m.tenantScanRoundIncluded = 0
+	}
+	m.tenantScanRoundRawTenants += len(tenants)
+	m.tenantScanRoundIncluded += included
 	if len(tenants) > 0 {
 		last := tenants[len(tenants)-1]
 		m.tenantScanCursorSet = true
