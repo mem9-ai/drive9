@@ -1251,13 +1251,51 @@ func (s *Store) ListTenantsByStatus(ctx context.Context, status TenantStatus, li
 		db_host, db_port, db_user, db_password, db_name,
 		db_tls, provider, cluster_id, branch_id, claim_url, claim_expires_at, schema_version,
 		s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at
-		FROM tenants WHERE status = ? ORDER BY created_at ASC LIMIT ?`, status, limit)
+		FROM tenants WHERE status = ? ORDER BY created_at ASC, id ASC LIMIT ?`, status, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 
-	out = make([]Tenant, 0)
+	return scanTenantRows(rows)
+}
+
+// ListTenantsByStatusAfter returns one keyset page of tenants after
+// (afterCreatedAt, afterID), ordered by (created_at, id). Pass a zero
+// afterCreatedAt and empty afterID to scan from the beginning.
+func (s *Store) ListTenantsByStatusAfter(ctx context.Context, status TenantStatus, afterCreatedAt time.Time, afterID string, limit int) (out []Tenant, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_tenants_by_status_after", start, &err)
+	if limit <= 0 {
+		limit = 100
+	}
+
+	var rows *sql.Rows
+	if afterCreatedAt.IsZero() && afterID == "" {
+		rows, err = s.db.QueryContext(ctx, `SELECT id, status, kind, parent_tenant_id, storage_namespace_id,
+			db_host, db_port, db_user, db_password, db_name,
+			db_tls, provider, cluster_id, branch_id, claim_url, claim_expires_at, schema_version,
+			s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at
+			FROM tenants WHERE status = ? ORDER BY created_at ASC, id ASC LIMIT ?`, status, limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `SELECT id, status, kind, parent_tenant_id, storage_namespace_id,
+			db_host, db_port, db_user, db_password, db_name,
+			db_tls, provider, cluster_id, branch_id, claim_url, claim_expires_at, schema_version,
+			s3_encryption_mode, s3_kms_key_id, s3_bucket_key_enabled, created_at, updated_at
+			FROM tenants
+			WHERE status = ? AND (created_at > ? OR (created_at = ? AND id > ?))
+			ORDER BY created_at ASC, id ASC LIMIT ?`, status, afterCreatedAt.UTC(), afterCreatedAt.UTC(), afterID, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	return scanTenantRows(rows)
+}
+
+func scanTenantRows(rows *sql.Rows) ([]Tenant, error) {
+	out := make([]Tenant, 0)
 	for rows.Next() {
 		var t Tenant
 		var dbTLS int

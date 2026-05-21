@@ -139,6 +139,12 @@ type semanticWorkerManager struct {
 	processing int
 	rr         int
 
+	tenantScanCursorSet       bool
+	tenantScanCursorCreatedAt time.Time
+	tenantScanCursorID        string
+	lastTenantScan            semanticTenantScanSnapshot
+	tenantScanMu              sync.Mutex
+
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
@@ -162,6 +168,17 @@ type semanticObservationSnapshot struct {
 	deadLettered    int
 	queueLagSeconds float64
 	inflight        int
+	tenantScan      semanticTenantScanSnapshot
+}
+
+type semanticTenantScanSnapshot struct {
+	limit           int
+	cursorSet       bool
+	cursorCreatedAt time.Time
+	cursorID        string
+	rawTenants      int
+	includedTenants int
+	wrapped         bool
 }
 
 type semanticTaskAction string
@@ -264,11 +281,14 @@ func (m *semanticWorkerManager) Start(ctx context.Context) {
 	}
 	m.wg.Add(1)
 	go m.recoverLoop(workerCtx)
-	logger.Info(workerCtx, "semantic_worker_manager_started",
+	fields := []zap.Field{
 		zap.Int("workers", m.opts.Workers),
 		zap.Duration("poll_interval", m.opts.PollInterval),
 		zap.Duration("lease_duration", m.opts.LeaseDuration),
-		zap.Duration("recover_interval", m.opts.RecoverInterval))
+		zap.Duration("recover_interval", m.opts.RecoverInterval),
+	}
+	fields = append(fields, m.tenantScanLogFields()...)
+	logger.Info(workerCtx, "semantic_worker_manager_started", fields...)
 }
 
 func (m *semanticWorkerManager) Stop() {
@@ -599,7 +619,15 @@ func (m *semanticWorkerManager) releaseTenantSlot(tenantID string) {
 
 func (m *semanticWorkerManager) listTenantRefs(ctx context.Context) ([]semanticTenantRef, error) {
 	if m.meta != nil && m.pool != nil {
-		tenants, err := m.meta.ListTenantsByStatus(ctx, meta.TenantActive, m.opts.TenantScanLimit)
+		// Multi-tenant workers scan active tenants with a keyset cursor rather than
+		// repeatedly reading the oldest TenantScanLimit rows. The cursor advances to
+		// the last raw active tenant in each page, even when provider filtering drops
+		// every tenant from that page, so unsupported providers cannot pin the scan.
+		// When the page after the cursor is empty, the next scan wraps to the start
+		// of the active-tenant order and continues round-robin pagination.
+		m.tenantScanMu.Lock()
+		defer m.tenantScanMu.Unlock()
+		tenants, wrapped, err := m.nextTenantScanPage(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -611,12 +639,62 @@ func (m *semanticWorkerManager) listTenantRefs(ctx context.Context) ([]semanticT
 			}
 			refs = append(refs, semanticTenantRef{id: t.ID, tenant: &t})
 		}
+		m.recordTenantScan(tenants, len(refs), wrapped)
 		return refs, nil
 	}
 	if m.shouldIncludeFallback() {
 		return []semanticTenantRef{{id: semanticLocalTenantID}}, nil
 	}
 	return nil, nil
+}
+
+func (m *semanticWorkerManager) nextTenantScanPage(ctx context.Context) ([]meta.Tenant, bool, error) {
+	createdAt, id, ok := m.tenantScanCursor()
+	tenants, err := m.meta.ListTenantsByStatusAfter(ctx, meta.TenantActive, createdAt, id, m.opts.TenantScanLimit)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(tenants) > 0 || !ok {
+		return tenants, false, nil
+	}
+	tenants, err = m.meta.ListTenantsByStatusAfter(ctx, meta.TenantActive, time.Time{}, "", m.opts.TenantScanLimit)
+	if err != nil {
+		return nil, true, err
+	}
+	return tenants, true, nil
+}
+
+func (m *semanticWorkerManager) tenantScanCursor() (time.Time, string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.tenantScanCursorSet {
+		return time.Time{}, "", false
+	}
+	return m.tenantScanCursorCreatedAt, m.tenantScanCursorID, true
+}
+
+func (m *semanticWorkerManager) recordTenantScan(tenants []meta.Tenant, included int, wrapped bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(tenants) > 0 {
+		last := tenants[len(tenants)-1]
+		m.tenantScanCursorSet = true
+		m.tenantScanCursorCreatedAt = last.CreatedAt.UTC()
+		m.tenantScanCursorID = last.ID
+	} else if wrapped || !m.tenantScanCursorSet {
+		m.tenantScanCursorSet = false
+		m.tenantScanCursorCreatedAt = time.Time{}
+		m.tenantScanCursorID = ""
+	}
+	m.lastTenantScan = semanticTenantScanSnapshot{
+		limit:           m.opts.TenantScanLimit,
+		cursorSet:       m.tenantScanCursorSet,
+		cursorCreatedAt: m.tenantScanCursorCreatedAt,
+		cursorID:        m.tenantScanCursorID,
+		rawTenants:      len(tenants),
+		includedTenants: included,
+		wrapped:         wrapped,
+	}
 }
 
 // TODO(JaySon-Huang): DB9/Postgres tenants are not yet supported in the semantic
@@ -1043,6 +1121,38 @@ func (m *semanticWorkerManager) snapshotProcessing() int {
 	return m.processing
 }
 
+func (m *semanticWorkerManager) tenantScanSnapshot() semanticTenantScanSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.lastTenantScan
+	if s.limit == 0 {
+		s.limit = m.opts.TenantScanLimit
+		s.cursorSet = m.tenantScanCursorSet
+		s.cursorCreatedAt = m.tenantScanCursorCreatedAt
+		s.cursorID = m.tenantScanCursorID
+	}
+	return s
+}
+
+func (m *semanticWorkerManager) tenantScanLogFields() []zap.Field {
+	return semanticTenantScanLogFields(m.tenantScanSnapshot())
+}
+
+func semanticTenantScanLogFields(s semanticTenantScanSnapshot) []zap.Field {
+	fields := []zap.Field{
+		zap.Int("tenant_scan_limit", s.limit),
+		zap.Bool("tenant_scan_cursor_set", s.cursorSet),
+		zap.String("tenant_scan_cursor_id", s.cursorID),
+		zap.Int("tenant_scan_raw_tenants", s.rawTenants),
+		zap.Int("tenant_scan_included_tenants", s.includedTenants),
+		zap.Bool("tenant_scan_wrapped", s.wrapped),
+	}
+	if s.cursorSet {
+		fields = append(fields, zap.Time("tenant_scan_cursor_created_at", s.cursorCreatedAt.UTC()))
+	}
+	return fields
+}
+
 func (m *semanticWorkerManager) observeOnce(ctx context.Context, now time.Time) {
 	snapshot := m.collectObservation(ctx, now)
 	metrics.RecordGauge("semantic_worker", "inflight", float64(snapshot.inflight))
@@ -1050,6 +1160,15 @@ func (m *semanticWorkerManager) observeOnce(ctx context.Context, now time.Time) 
 	metrics.RecordGauge("semantic_worker", "processing", float64(snapshot.processing))
 	metrics.RecordGauge("semantic_worker", "dead_lettered", float64(snapshot.deadLettered))
 	metrics.RecordGauge("semantic_worker", "queue_lag_seconds", snapshot.queueLagSeconds)
+	fields := []zap.Field{
+		zap.Int("queued", snapshot.queued),
+		zap.Int("processing", snapshot.processing),
+		zap.Int("dead_lettered", snapshot.deadLettered),
+		zap.Float64("queue_lag_seconds", snapshot.queueLagSeconds),
+		zap.Int("inflight", snapshot.inflight),
+	}
+	fields = append(fields, semanticTenantScanLogFields(snapshot.tenantScan)...)
+	logger.Info(ctx, "semantic_worker_observe", fields...)
 }
 
 func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time.Time) semanticObservationSnapshot {
@@ -1064,6 +1183,7 @@ func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time
 		logger.Warn(ctx, "semantic_worker_list_tenants_for_observation_failed", zap.Error(err))
 		return snapshot
 	}
+	snapshot.tenantScan = m.tenantScanSnapshot()
 
 	var oldest *time.Time
 	for _, ref := range refs {

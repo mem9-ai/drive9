@@ -1025,6 +1025,95 @@ func TestSemanticWorkerListTenantRefsImageOnlyIncludesAutoProviders(t *testing.T
 	}
 }
 
+func TestSemanticWorkerListTenantRefsRotatesAcrossActiveTenantPages(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	pool := newTestTenantPoolWithBackendOptions(t, backend.Options{
+		AsyncImageExtract: backend.AsyncImageExtractOptions{Enabled: true},
+	})
+	passCipher, err := pool.Encrypt(context.Background(), []byte("pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Truncate(time.Millisecond)
+	for _, tc := range []struct {
+		id        string
+		provider  string
+		createdAt time.Time
+	}{
+		{id: "tenant-db9", provider: tenant.ProviderDB9, createdAt: base},
+		{id: "tenant-auto-1", provider: tenant.ProviderTiDBZero, createdAt: base.Add(time.Second)},
+		{id: "tenant-auto-2", provider: tenant.ProviderTiDBZero, createdAt: base.Add(2 * time.Second)},
+	} {
+		if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+			ID:               tc.id,
+			Status:           meta.TenantActive,
+			DBHost:           "127.0.0.1",
+			DBPort:           4000,
+			DBUser:           "root",
+			DBPasswordCipher: passCipher,
+			DBName:           "app",
+			DBTLS:            false,
+			Provider:         tc.provider,
+			SchemaVersion:    1,
+			CreatedAt:        tc.createdAt,
+			UpdatedAt:        tc.createdAt,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	orig := semanticWorkerUsesTiDBAutoEmbedding
+	semanticWorkerUsesTiDBAutoEmbedding = func(provider string) bool {
+		return provider == tenant.ProviderTiDBZero
+	}
+	defer func() {
+		semanticWorkerUsesTiDBAutoEmbedding = orig
+	}()
+
+	m := newSemanticWorkerManager(nil, metaStore, pool, nil, SemanticWorkerOptions{TenantScanLimit: 1})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	assertRefs := func(want ...string) {
+		t.Helper()
+		refs, err := m.listTenantRefs(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			got = append(got, ref.id)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("refs = %v, want %v", got, want)
+		}
+	}
+
+	assertRefs()
+	assertRefs("tenant-auto-1")
+	assertRefs("tenant-auto-2")
+	assertRefs()
+	assertRefs("tenant-auto-1")
+
+	scan := m.tenantScanSnapshot()
+	if scan.limit != 1 {
+		t.Fatalf("tenant scan limit = %d, want 1", scan.limit)
+	}
+	if scan.rawTenants != 1 || scan.includedTenants != 1 {
+		t.Fatalf("tenant scan raw/included = %d/%d, want 1/1", scan.rawTenants, scan.includedTenants)
+	}
+	if !scan.cursorSet || scan.cursorID != "tenant-auto-1" {
+		t.Fatalf("tenant scan cursor = set:%v id:%q, want tenant-auto-1", scan.cursorSet, scan.cursorID)
+	}
+}
+
 func TestSemanticWorkerListTenantRefsEmbedOnlySkipsAutoProviders(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {

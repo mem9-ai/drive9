@@ -484,6 +484,70 @@ func TestListTenantsByStatus(t *testing.T) {
 	}
 }
 
+func TestListTenantsByStatusAfterKeyset(t *testing.T) {
+	s := newControlStore(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	for _, tc := range []struct {
+		id        string
+		status    TenantStatus
+		createdAt time.Time
+	}{
+		{id: "active-a", status: TenantActive, createdAt: now},
+		{id: "active-b", status: TenantActive, createdAt: now},
+		{id: "active-c", status: TenantActive, createdAt: now.Add(time.Second)},
+		{id: "provisioning-a", status: TenantProvisioning, createdAt: now},
+	} {
+		if err := s.InsertTenant(context.Background(), &Tenant{
+			ID:               tc.id,
+			Status:           tc.status,
+			DBHost:           "127.0.0.1",
+			DBPort:           4000,
+			DBUser:           "root",
+			DBPasswordCipher: []byte("cipher"),
+			DBName:           "tenant_db",
+			DBTLS:            true,
+			Provider:         "tidb_zero",
+			SchemaVersion:    1,
+			CreatedAt:        tc.createdAt,
+			UpdatedAt:        tc.createdAt,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first, err := s.ListTenantsByStatusAfter(context.Background(), TenantActive, time.Time{}, "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 2 || first[0].ID != "active-a" || first[1].ID != "active-b" {
+		t.Fatalf("first page ids = %v, want active-a, active-b", tenantIDs(first))
+	}
+
+	second, err := s.ListTenantsByStatusAfter(context.Background(), TenantActive, first[1].CreatedAt, first[1].ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 1 || second[0].ID != "active-c" {
+		t.Fatalf("second page ids = %v, want active-c", tenantIDs(second))
+	}
+
+	empty, err := s.ListTenantsByStatusAfter(context.Background(), TenantActive, second[0].CreatedAt, second[0].ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("tail page ids = %v, want empty", tenantIDs(empty))
+	}
+}
+
+func tenantIDs(tenants []Tenant) []string {
+	ids := make([]string, 0, len(tenants))
+	for _, t := range tenants {
+		ids = append(ids, t.ID)
+	}
+	return ids
+}
+
 func TestMetaSchemaSpecFromStatementsParsesNewTable(t *testing.T) {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS tenant_custom_events (

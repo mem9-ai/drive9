@@ -257,7 +257,7 @@ func NewWithConfig(cfg Config) *Server {
 		poolAutoTaskTypes = semanticWorkerLogTaskTypesFromTypes(cfg.Pool.AutoSemanticTaskTypes())
 	}
 	if s.semanticWorker != nil {
-		logger.Info("server_semantic_workers_enabled",
+		fields := []zap.Field{
 			zap.Int("workers", s.semanticWorker.opts.Workers),
 			zap.Duration("poll_interval", s.semanticWorker.opts.PollInterval),
 			zap.Duration("lease_duration", s.semanticWorker.opts.LeaseDuration),
@@ -267,7 +267,10 @@ func NewWithConfig(cfg Config) *Server {
 			zap.Strings("fallback_task_types", fallbackTaskTypes),
 			zap.Strings("pool_auto_task_types", poolAutoTaskTypes),
 			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
-			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()))
+			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()),
+		}
+		fields = append(fields, s.semanticWorker.tenantScanLogFields()...)
+		logger.Info("server_semantic_workers_enabled", fields...)
 		s.semanticWorker.Start(backgroundWithTrace(context.Background()))
 	} else {
 		logger.Info("server_semantic_workers_disabled",
