@@ -653,6 +653,51 @@ func TestMetaSchemaSpecIncludesForkStorageNamespaceColumns(t *testing.T) {
 	_ = mustMetaTableSpec(t, mustMetaSpec(t), "object_gc_candidates")
 }
 
+func TestMetaSchemaSpecIncludesTenantStatusCreatedIDIndex(t *testing.T) {
+	table := mustMetaTableSpec(t, mustMetaSpec(t), "tenants")
+	idx, ok := table.indexes["idx_tenant_status_created_id"]
+	if !ok {
+		t.Fatal("tenants schema missing idx_tenant_status_created_id")
+	}
+	wantCreateSQL := "CREATE INDEX idx_tenant_status_created_id ON tenants(status, created_at, id)"
+	if idx.createSQL != wantCreateSQL {
+		t.Fatalf("idx_tenant_status_created_id createSQL = %q, want %q", idx.createSQL, wantCreateSQL)
+	}
+
+	observed := metaTableMeta{
+		tableName: "tenants",
+		columns: map[string]metaColumnMeta{
+			"id":         {columnType: "varchar(64)"},
+			"status":     {columnType: "varchar(20)"},
+			"created_at": {columnType: "datetime(3)"},
+		},
+	}
+	observedIndexes := map[string]struct{}{
+		"primary":           {},
+		"idx_tenant_status": {},
+	}
+	diffs := diffMetaTableMetaWithObservedIndexes(table, observed, "", observedIndexes)
+	if !hasMetaDiff(diffs, metaSchemaDiffMissingIndex, "idx_tenant_status_created_id") {
+		t.Fatalf("expected missing idx_tenant_status_created_id diff, got %#v", diffs)
+	}
+
+	var indexDiff metaSchemaDiff
+	for _, diff := range diffs {
+		if diff.indexName == "idx_tenant_status_created_id" {
+			indexDiff = diff
+			break
+		}
+	}
+	if indexDiff.repairSQL != wantCreateSQL {
+		t.Fatalf("idx_tenant_status_created_id repairSQL = %q, want %q", indexDiff.repairSQL, wantCreateSQL)
+	}
+
+	plans := plannedMetaSchemaRepairs([]metaSchemaDiff{indexDiff})
+	if len(plans) != 1 || plans[0] != wantCreateSQL {
+		t.Fatalf("repair plans = %#v, want [%q]", plans, wantCreateSQL)
+	}
+}
+
 func TestMetaSchemaSpecIncludesAPIKeyScopeTables(t *testing.T) {
 	spec := mustMetaSpec(t)
 	apiKeys := mustMetaTableSpec(t, spec, "tenant_api_keys")

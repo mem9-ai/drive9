@@ -363,6 +363,7 @@ func metaInitSchemaStatements() []string {
 			updated_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			deleted_at       DATETIME(3) NULL,
 			INDEX idx_tenant_status (status),
+			INDEX idx_tenant_status_created_id (status, created_at, id),
 			INDEX idx_tenant_provider (provider),
 			INDEX idx_tenant_namespace (storage_namespace_id, kind, status),
 			INDEX idx_tenant_parent (parent_tenant_id)
