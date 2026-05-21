@@ -10,6 +10,7 @@ const (
 	streamingWriteMaxSize     = 10 << 30 // 10GB — for sequential streaming writes
 	DefaultPartSize           = 8 << 20  // 8MB - default for v1 uploads; v2 may use adaptive sizes
 	maxPreloadSize            = 1 << 30  // 1GB - hard limit for preloading existing files into memory
+	minPartGrowthCapacity     = 64 << 10 // 64KB lower bound for sparse part growth
 )
 
 // LoadPartFunc is called to lazily load part data from the remote server.
@@ -255,10 +256,16 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 			if neededLen > wb.partSize {
 				neededLen = wb.partSize
 			}
-			grown := make([]byte, neededLen)
-			copy(grown, part)
-			wb.curMemory += neededLen - int64(len(part))
-			part = grown
+			oldLen := int64(len(part))
+			if neededLen <= int64(cap(part)) {
+				part = part[:neededLen]
+				clear(part[oldLen:])
+			} else {
+				grown := make([]byte, neededLen, growPartCapacity(int64(cap(part)), neededLen, wb.partSize))
+				copy(grown, part)
+				part = grown
+			}
+			wb.curMemory += neededLen - oldLen
 			wb.parts[partIdx] = part
 		}
 
@@ -308,6 +315,26 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 	}
 
 	return uint32(len(data)), nil
+}
+
+func growPartCapacity(currentCap, neededLen, partSize int64) int64 {
+	if partSize > 0 && neededLen > partSize {
+		neededLen = partSize
+	}
+	newCap := currentCap
+	if newCap < minPartGrowthCapacity {
+		newCap = minPartGrowthCapacity
+	}
+	for newCap < neededLen && (partSize <= 0 || newCap < partSize) {
+		newCap *= 2
+	}
+	if partSize > 0 && newCap > partSize {
+		newCap = partSize
+	}
+	if newCap < neededLen {
+		return neededLen
+	}
+	return newCap
 }
 
 // writeSmallFile is the fast-path Write for files that remain below

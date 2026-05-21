@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -409,6 +410,32 @@ func TestWriteBuffer_GapFill(t *testing.T) {
 		if wb.Bytes()[i] != 0 {
 			t.Fatalf("byte %d = %d, want 0", i, wb.Bytes()[i])
 		}
+	}
+}
+
+func TestWriteBuffer_PartGrowthUsesHeadroom(t *testing.T) {
+	wb := NewWriteBuffer("/test", 0, 8)
+	if _, err := wb.Write(0, []byte{1, 2}); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	first := wb.parts[0]
+	if len(first) != 2 {
+		t.Fatalf("part len after first write = %d, want 2", len(first))
+	}
+	if cap(first) != 8 {
+		t.Fatalf("part cap after first write = %d, want 8", cap(first))
+	}
+
+	if _, err := wb.Write(6, []byte{7}); err != nil {
+		t.Fatalf("gap write: %v", err)
+	}
+	part := wb.parts[0]
+	if cap(part) != cap(first) {
+		t.Fatalf("part cap after gap write = %d, want %d", cap(part), cap(first))
+	}
+	want := []byte{1, 2, 0, 0, 0, 0, 7}
+	if got := wb.PartData(1); !bytes.Equal(got, want) {
+		t.Fatalf("part data = %v, want %v", got, want)
 	}
 }
 
