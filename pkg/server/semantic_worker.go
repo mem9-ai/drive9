@@ -168,7 +168,6 @@ type semanticObservationSnapshot struct {
 	deadLettered    int
 	queueLagSeconds float64
 	inflight        int
-	tenantScan      semanticTenantScanSnapshot
 }
 
 type semanticTenantScanSnapshot struct {
@@ -1160,15 +1159,6 @@ func (m *semanticWorkerManager) observeOnce(ctx context.Context, now time.Time) 
 	metrics.RecordGauge("semantic_worker", "processing", float64(snapshot.processing))
 	metrics.RecordGauge("semantic_worker", "dead_lettered", float64(snapshot.deadLettered))
 	metrics.RecordGauge("semantic_worker", "queue_lag_seconds", snapshot.queueLagSeconds)
-	fields := []zap.Field{
-		zap.Int("queued", snapshot.queued),
-		zap.Int("processing", snapshot.processing),
-		zap.Int("dead_lettered", snapshot.deadLettered),
-		zap.Float64("queue_lag_seconds", snapshot.queueLagSeconds),
-		zap.Int("inflight", snapshot.inflight),
-	}
-	fields = append(fields, semanticTenantScanLogFields(snapshot.tenantScan)...)
-	logger.Info(ctx, "semantic_worker_observe", fields...)
 }
 
 func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time.Time) semanticObservationSnapshot {
@@ -1183,7 +1173,6 @@ func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time
 		logger.Warn(ctx, "semantic_worker_list_tenants_for_observation_failed", zap.Error(err))
 		return snapshot
 	}
-	snapshot.tenantScan = m.tenantScanSnapshot()
 
 	var oldest *time.Time
 	for _, ref := range refs {
