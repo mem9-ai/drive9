@@ -661,7 +661,7 @@ func TestMetaSchemaSpecIncludesTenantStatusCreatedIDIndex(t *testing.T) {
 	}
 	wantCreateSQL := "CREATE INDEX idx_tenant_status_created_id ON tenants(status, created_at, id)"
 	if idx.createSQL != wantCreateSQL {
-		t.Fatalf("idx_tenant_status_created_id createSQL = %q, want %q", idx.createSQL, wantCreateSQL)
+		t.Errorf("idx_tenant_status_created_id createSQL = %q, want %q", idx.createSQL, wantCreateSQL)
 	}
 
 	observed := metaTableMeta{
@@ -678,7 +678,7 @@ func TestMetaSchemaSpecIncludesTenantStatusCreatedIDIndex(t *testing.T) {
 	}
 	diffs := diffMetaTableMetaWithObservedIndexes(table, observed, "", observedIndexes)
 	if !hasMetaDiff(diffs, metaSchemaDiffMissingIndex, "idx_tenant_status_created_id") {
-		t.Fatalf("expected missing idx_tenant_status_created_id diff, got %#v", diffs)
+		t.Errorf("expected missing idx_tenant_status_created_id diff, got %#v", diffs)
 	}
 
 	var indexDiff metaSchemaDiff
@@ -689,12 +689,12 @@ func TestMetaSchemaSpecIncludesTenantStatusCreatedIDIndex(t *testing.T) {
 		}
 	}
 	if indexDiff.repairSQL != wantCreateSQL {
-		t.Fatalf("idx_tenant_status_created_id repairSQL = %q, want %q", indexDiff.repairSQL, wantCreateSQL)
+		t.Errorf("idx_tenant_status_created_id repairSQL = %q, want %q", indexDiff.repairSQL, wantCreateSQL)
 	}
 
 	plans := plannedMetaSchemaRepairs([]metaSchemaDiff{indexDiff})
 	if len(plans) != 1 || plans[0] != wantCreateSQL {
-		t.Fatalf("repair plans = %#v, want [%q]", plans, wantCreateSQL)
+		t.Errorf("repair plans = %#v, want [%q]", plans, wantCreateSQL)
 	}
 }
 
