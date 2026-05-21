@@ -16,25 +16,25 @@ func Mv(c *client.Client, args []string) error {
 	}
 	oldPath := args[0]
 	newPath := args[1]
-	var (
-		oldCtx string
-		newCtx string
-		err    error
-	)
-	c, oldPath, oldCtx, _, err = fsClientForRemoteArg(c, oldPath)
-	if err != nil {
-		return err
+	oldRP, oldIsRemote := ParseRemote(oldPath)
+	newRP, newIsRemote := ParseRemote(newPath)
+	if oldIsRemote {
+		oldPath = oldRP.Path
 	}
-	newClient := c
-	newClient, newPath, newCtx, _, err = fsClientForRemoteArg(newClient, newPath)
-	if err != nil {
-		return err
+	if newIsRemote {
+		newPath = newRP.Path
 	}
-	if oldCtx != "" && newCtx != "" && oldCtx != newCtx {
-		return fmt.Errorf("cross-context rename not supported: %s -> %s", oldCtx, newCtx)
-	}
-	if oldCtx == "" && newCtx != "" {
-		c = newClient
+
+	switch {
+	case oldRP.Context == "" && newRP.Context == "":
+	case oldRP.Context != "" && newRP.Context != "" && oldRP.Context == newRP.Context:
+		var err error
+		c, err = newFSClientForContext(oldRP.Context)
+		if err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("cross-context rename not supported: %q -> %q", args[0], args[1])
 	}
 	return c.Rename(oldPath, newPath)
 }

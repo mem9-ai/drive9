@@ -70,7 +70,11 @@ func newFSClientForContext(name string) (*client.Client, error) {
 
 	server := ctx.Server
 	if server == "" {
-		server = cfg.ResolveServer()
+		if cfg.Server != "" {
+			server = cfg.Server
+		} else {
+			server = defaultServerURL
+		}
 	}
 
 	switch ctx.Type {
