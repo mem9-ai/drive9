@@ -183,7 +183,7 @@ func TestResolveCredentials_EmptyWhenNothingAvailable(t *testing.T) {
 	}
 }
 
-func TestResolveCredentials_ServerEnvOverridesContextServer(t *testing.T) {
+func TestResolveCredentials_ContextServerBeatsEnvServer(t *testing.T) {
 	setResolverEnv(t, map[string]string{
 		EnvServer: "https://env.override",
 	})
@@ -196,12 +196,33 @@ func TestResolveCredentials_ServerEnvOverridesContextServer(t *testing.T) {
 
 	r := resolveCredentialsWithConfig(cfg)
 
-	if r.Server != "https://env.override" {
-		t.Fatalf("Server = %q, want env override", r.Server)
+	if r.Server != "https://config.example" {
+		t.Fatalf("Server = %q, want context server", r.Server)
 	}
 	// Credential still from config.
 	if r.APIKey != "sk-config-owner" {
 		t.Fatalf("APIKey = %q, want config", r.APIKey)
+	}
+	if r.ServerSource != "config:prod" {
+		t.Fatalf("ServerSource = %q", r.ServerSource)
+	}
+}
+
+func TestResolveCredentials_ServerEnvUsedWhenContextServerEmpty(t *testing.T) {
+	setResolverEnv(t, map[string]string{
+		EnvServer: "https://env.override",
+	})
+	cfg := &Config{
+		CurrentContext: "prod",
+		Contexts: map[string]*Context{
+			"prod": {Type: PrincipalOwner, APIKey: "sk-config-owner"},
+		},
+	}
+
+	r := resolveCredentialsWithConfig(cfg)
+
+	if r.Server != "https://env.override" {
+		t.Fatalf("Server = %q, want env override", r.Server)
 	}
 	if r.ServerSource != "env:"+EnvServer {
 		t.Fatalf("ServerSource = %q", r.ServerSource)

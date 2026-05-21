@@ -42,9 +42,10 @@ func Rm(c *client.Client, args []string) error {
 		return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] <path>")
 	}
 
-	// Handle ":" prefixed remote paths like cp command
-	if rp, isRemote := ParseRemote(path); isRemote {
-		path = rp.Path
+	var err error
+	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	if err != nil {
+		return err
 	}
 	if recursive {
 		return c.RemoveAll(path)

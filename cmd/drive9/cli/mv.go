@@ -16,12 +16,25 @@ func Mv(c *client.Client, args []string) error {
 	}
 	oldPath := args[0]
 	newPath := args[1]
-	// Handle ":" prefixed remote paths like cp command
-	if rp, isRemote := ParseRemote(oldPath); isRemote {
-		oldPath = rp.Path
+	var (
+		oldCtx string
+		newCtx string
+		err    error
+	)
+	c, oldPath, oldCtx, _, err = fsClientForRemoteArg(c, oldPath)
+	if err != nil {
+		return err
 	}
-	if rp, isRemote := ParseRemote(newPath); isRemote {
-		newPath = rp.Path
+	newClient := c
+	newClient, newPath, newCtx, _, err = fsClientForRemoteArg(newClient, newPath)
+	if err != nil {
+		return err
+	}
+	if oldCtx != "" && newCtx != "" && oldCtx != newCtx {
+		return fmt.Errorf("cross-context rename not supported: %s -> %s", oldCtx, newCtx)
+	}
+	if oldCtx == "" && newCtx != "" {
+		c = newClient
 	}
 	return c.Rename(oldPath, newPath)
 }

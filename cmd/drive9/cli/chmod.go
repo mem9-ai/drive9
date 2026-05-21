@@ -17,5 +17,9 @@ func Chmod(c *client.Client, args []string) error {
 	if err != nil {
 		return fmt.Errorf("invalid mode %q: %w", modeStr, err)
 	}
+	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	if err != nil {
+		return err
+	}
 	return c.Chmod(path, uint32(mode64))
 }

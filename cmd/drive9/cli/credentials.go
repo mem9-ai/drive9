@@ -54,10 +54,10 @@ type ResolvedCredentials struct {
 }
 
 // ResolveCredentials is the single source of truth for (credential, server)
-// resolution across all drive9 CLI call sites. Priority matches spec §14.2:
+// resolution across all drive9 CLI call sites.
 //
 //	Credential: DRIVE9_VAULT_TOKEN > DRIVE9_API_KEY > active context
-//	Server:     DRIVE9_SERVER      > active-context.server > compiled-in default
+//	Server:     active-context.server > DRIVE9_SERVER > config.server > compiled-in default
 //
 // "First match wins" applies to *presence*, not validity. A set-but-malformed
 // env var yields a distinct error at validation time; it must never silently
@@ -109,12 +109,6 @@ func resolveCredentialsWithConfig(cfg *Config) ResolvedCredentials {
 	envToken := consumeEnv(EnvVaultToken)
 	envAPIKey := consumeEnv(EnvAPIKey)
 
-	// Server resolution is orthogonal to credential resolution (§14.2).
-	if envServer != "" {
-		r.Server = envServer
-		r.ServerSource = "env:" + EnvServer
-	}
-
 	// Credential resolution: VAULT_TOKEN > API_KEY > active context.
 	if envToken != "" {
 		r.Kind = CredentialDelegated
@@ -146,7 +140,7 @@ func resolveCredentialsWithConfig(cfg *Config) ResolvedCredentials {
 					r.CredSource = "config:" + ctxName
 				}
 			}
-			if r.Server == "" && ctx.Server != "" {
+			if ctx.Server != "" {
 				r.Server = ctx.Server
 				r.ServerSource = "config:" + ctxName
 			}
@@ -154,7 +148,10 @@ func resolveCredentialsWithConfig(cfg *Config) ResolvedCredentials {
 	}
 
 	if r.Server == "" {
-		if cfg.Server != "" {
+		if envServer != "" {
+			r.Server = envServer
+			r.ServerSource = "env:" + EnvServer
+		} else if cfg.Server != "" {
 			r.Server = cfg.Server
 			r.ServerSource = "config:server"
 		} else {

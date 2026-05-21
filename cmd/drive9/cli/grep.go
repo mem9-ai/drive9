@@ -18,9 +18,10 @@ func Grep(c *client.Client, args []string) error {
 		path = args[1]
 	}
 
-	// Handle ":" prefixed remote paths like cp command
-	if rp, isRemote := ParseRemote(path); isRemote {
-		path = rp.Path
+	var err error
+	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	if err != nil {
+		return err
 	}
 
 	results, err := c.Grep(query, path, 20)
@@ -50,9 +51,10 @@ func GrepJSON(c *client.Client, args []string) error {
 		path = args[1]
 	}
 
-	// Handle ":" prefixed remote paths like cp command
-	if rp, isRemote := ParseRemote(path); isRemote {
-		path = rp.Path
+	var err error
+	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	if err != nil {
+		return err
 	}
 
 	results, err := c.Grep(query, path, 20)

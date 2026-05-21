@@ -50,13 +50,13 @@ func catWithWriter(c *client.Client, args []string, out io.Writer) error {
 		return fmt.Errorf("--length must be >= 0")
 	}
 	path := fs.Arg(0)
-	// Handle ":" prefixed remote paths like cp command
-	if rp, isRemote := ParseRemote(path); isRemote {
-		path = rp.Path
+	var err error
+	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	if err != nil {
+		return err
 	}
 	var (
-		rc  io.ReadCloser
-		err error
+		rc io.ReadCloser
 	)
 	if offsetSet {
 		rc, err = c.ReadStreamRange(context.Background(), path, *offset, *length)

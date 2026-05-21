@@ -111,6 +111,22 @@ func Cp(c *client.Client, args []string) error {
 
 	srcRP, srcIsRemote := ParseRemote(src)
 	dstRP, dstIsRemote := ParseRemote(dst)
+	switch {
+	case srcIsRemote && dstIsRemote && srcRP.Context != "" && dstRP.Context != "" && srcRP.Context != dstRP.Context:
+		return fmt.Errorf("cross-context copy not supported: %s -> %s", srcRP.Context, dstRP.Context)
+	case srcIsRemote && srcRP.Context != "":
+		var err error
+		c, err = newFSClientForContext(srcRP.Context)
+		if err != nil {
+			return err
+		}
+	case dstIsRemote && dstRP.Context != "":
+		var err error
+		c, err = newFSClientForContext(dstRP.Context)
+		if err != nil {
+			return err
+		}
+	}
 	if description != "" {
 		descriptionSupported := dstIsRemote && !appendMode && !resume && (src == "-" || !srcIsRemote)
 		if !descriptionSupported {

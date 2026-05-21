@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
@@ -25,8 +26,9 @@ const fsClientWarmTimeout = 3 * time.Second
 // dispatch; retaining the lenient shape keeps parity with the pre-resolver
 // behaviour (which also returned an empty key).
 //
-// Credential resolution goes through the unified resolver per §14.2
-// (env > config, Unsetenv-after-read).
+// Credential resolution goes through the unified resolver: env credentials
+// override config credentials, while the active context's server URL wins
+// over DRIVE9_SERVER. Resolver reads still use Unsetenv-after-read.
 //
 // NewFromEnv intentionally does NOT warm the /v1/status cache: read-only
 // commands (ls/cat/stat/rm/grep/find) don't need the upload threshold and
@@ -57,4 +59,45 @@ func NewFromEnvWithWarm() *client.Client {
 	defer cancel()
 	c.Warm(ctx)
 	return c
+}
+
+func newFSClientForContext(name string) (*client.Client, error) {
+	cfg := loadConfig()
+	ctx := cfg.Contexts[name]
+	if ctx == nil {
+		return nil, fmt.Errorf("context %q not found; run: drive9 ctx ls", name)
+	}
+
+	server := ctx.Server
+	if server == "" {
+		server = cfg.ResolveServer()
+	}
+
+	switch ctx.Type {
+	case PrincipalOwner, PrincipalFSScoped:
+		if ctx.APIKey == "" {
+			return nil, fmt.Errorf("context %q has no API key", name)
+		}
+		return client.New(server, ctx.APIKey), nil
+	case PrincipalDelegated:
+		return nil, fmt.Errorf("context %q is delegated; fs commands require an owner or fs_scoped context", name)
+	default:
+		return nil, fmt.Errorf("context %q has unsupported type %q", name, ctx.Type)
+	}
+}
+
+func fsClientForRemoteArg(defaultClient *client.Client, raw string) (*client.Client, string, string, bool, error) {
+	rp, isRemote := ParseRemote(raw)
+	if !isRemote {
+		return defaultClient, raw, "", false, nil
+	}
+	if rp.Context == "" {
+		return defaultClient, rp.Path, "", true, nil
+	}
+
+	c, err := newFSClientForContext(rp.Context)
+	if err != nil {
+		return nil, "", "", true, err
+	}
+	return c, rp.Path, rp.Context, true, nil
 }
