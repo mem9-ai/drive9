@@ -1031,8 +1031,7 @@ func TestSemanticWorkerListTenantRefsRotatesAcrossActiveTenantPages(t *testing.T
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	pool := newTestTenantPoolWithBackendOptions(t, backend.Options{
 		AsyncImageExtract: backend.AsyncImageExtractOptions{Enabled: true},

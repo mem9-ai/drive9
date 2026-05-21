@@ -78,6 +78,21 @@ func ResetDB(t *testing.T, db *sql.DB) {
 	}
 }
 
+// ResetMetaDB clears control-plane tenant metadata tables for meta store tests.
+func ResetMetaDB(t *testing.T, db *sql.DB) {
+	t.Helper()
+	queries := []string{
+		"DELETE FROM tenant_api_key_fs_scopes",
+		"DELETE FROM tenant_api_keys",
+		"DELETE FROM tenants",
+	}
+	for _, q := range queries {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("reset meta test db: %v", err)
+		}
+	}
+}
+
 // ResetDBWithoutFiles is like ResetDB but for tests that intentionally drop
 // the legacy files table to exercise the no-legacy-table code path.
 func ResetDBWithoutFiles(t *testing.T, db *sql.DB) {
