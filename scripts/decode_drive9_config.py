@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Decode tenant_id from ~/.drive9/config without revealing credentials.
 
+This script is intended for drive9 CLI versions where ``drive9 ctx`` does not
+yet display ``tenant_id``. When your ``drive9 ctx show`` or ``drive9 ctx ls``
+output already includes ``tenant_id``, prefer those commands instead of this
+script.
+
 Owner and fs_scoped contexts store a drive9 API key shaped as:
 
     dat9_<base64url(jwt)>
