@@ -139,6 +139,26 @@ func TestCpRejectsMixedExplicitAndCurrentRemoteContexts(t *testing.T) {
 	}
 }
 
+func TestCpRecursiveRejectsMixedExplicitAndCurrentRemoteContexts(t *testing.T) {
+	withIsolatedHome(t)
+
+	cfg := loadConfig()
+	if _, err := ctxAdd(cfg, "current", &Context{Type: PrincipalOwner, APIKey: "current-key", Server: "https://current.example"}); err != nil {
+		t.Fatalf("ctxAdd current: %v", err)
+	}
+	if _, err := ctxAdd(cfg, "prod", &Context{Type: PrincipalOwner, APIKey: "prod-key", Server: "https://prod.example"}); err != nil {
+		t.Fatalf("ctxAdd prod: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	err := Cp(client.New("https://current.example", "current-key"), []string{"-r", "prod:/dir", ":/dir"})
+	if err == nil || !strings.Contains(err.Error(), "cross-context copy not supported") {
+		t.Fatalf("Cp recursive error = %v, want cross-context rejection", err)
+	}
+}
+
 func TestMvRejectsMixedExplicitAndCurrentRemoteContexts(t *testing.T) {
 	withIsolatedHome(t)
 

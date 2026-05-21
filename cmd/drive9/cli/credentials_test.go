@@ -229,6 +229,56 @@ func TestResolveCredentials_ServerEnvUsedWhenContextServerEmpty(t *testing.T) {
 	}
 }
 
+func TestResolveCredentials_ContextServerBeatsEnvServerWhenCredentialFromEnvAPIKey(t *testing.T) {
+	setResolverEnv(t, map[string]string{
+		EnvAPIKey: "sk-env-owner",
+		EnvServer: "https://env.override",
+	})
+	cfg := &Config{
+		CurrentContext: "prod",
+		Contexts: map[string]*Context{
+			"prod": {Type: PrincipalOwner, Server: "https://config.example", APIKey: "sk-config-owner"},
+		},
+	}
+
+	r := resolveCredentialsWithConfig(cfg)
+
+	if r.APIKey != "sk-env-owner" {
+		t.Fatalf("APIKey = %q, want env API key", r.APIKey)
+	}
+	if r.Server != "https://config.example" {
+		t.Fatalf("Server = %q, want context server", r.Server)
+	}
+	if r.ServerSource != "config:prod" {
+		t.Fatalf("ServerSource = %q", r.ServerSource)
+	}
+}
+
+func TestResolveCredentials_ContextServerBeatsEnvServerWhenCredentialFromEnvVaultToken(t *testing.T) {
+	setResolverEnv(t, map[string]string{
+		EnvVaultToken: "jwt-eyAAA",
+		EnvServer:     "https://env.override",
+	})
+	cfg := &Config{
+		CurrentContext: "prod",
+		Contexts: map[string]*Context{
+			"prod": {Type: PrincipalOwner, Server: "https://config.example", APIKey: "sk-config-owner"},
+		},
+	}
+
+	r := resolveCredentialsWithConfig(cfg)
+
+	if r.Token != "jwt-eyAAA" {
+		t.Fatalf("Token = %q, want env vault token", r.Token)
+	}
+	if r.Server != "https://config.example" {
+		t.Fatalf("Server = %q, want context server", r.Server)
+	}
+	if r.ServerSource != "config:prod" {
+		t.Fatalf("ServerSource = %q", r.ServerSource)
+	}
+}
+
 func TestResolveCredentials_UnsetsEnvAfterRead(t *testing.T) {
 	setResolverEnv(t, map[string]string{
 		EnvVaultToken: "jwt-eyAAA",

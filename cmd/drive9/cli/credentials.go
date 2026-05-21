@@ -100,6 +100,11 @@ func resetCredentialCacheForTest() {
 
 func resolveCredentialsWithConfig(cfg *Config) ResolvedCredentials {
 	var r ResolvedCredentials
+	var activeCtx *Context
+	ctxName := cfg.CurrentContext
+	if ctxName != "" {
+		activeCtx = cfg.Contexts[ctxName]
+	}
 
 	// Consume all three credential-bearing env vars up-front so the Unsetenv
 	// mitigation fires regardless of which one "wins" priority. Otherwise a
@@ -108,6 +113,11 @@ func resolveCredentialsWithConfig(cfg *Config) ResolvedCredentials {
 	envServer := consumeEnv(EnvServer)
 	envToken := consumeEnv(EnvVaultToken)
 	envAPIKey := consumeEnv(EnvAPIKey)
+
+	if activeCtx != nil && activeCtx.Server != "" {
+		r.Server = activeCtx.Server
+		r.ServerSource = "config:" + ctxName
+	}
 
 	// Credential resolution: VAULT_TOKEN > API_KEY > active context.
 	if envToken != "" {
@@ -118,31 +128,25 @@ func resolveCredentialsWithConfig(cfg *Config) ResolvedCredentials {
 		r.Kind = CredentialOwner
 		r.APIKey = envAPIKey
 		r.CredSource = "env:" + EnvAPIKey
-	} else if ctxName := cfg.CurrentContext; ctxName != "" {
-		if ctx := cfg.Contexts[ctxName]; ctx != nil {
-			switch ctx.Type {
-			case PrincipalOwner:
-				if ctx.APIKey != "" {
-					r.Kind = CredentialOwner
-					r.APIKey = ctx.APIKey
-					r.CredSource = "config:" + ctxName
-				}
-			case PrincipalFSScoped:
-				if ctx.APIKey != "" {
-					r.Kind = CredentialFSScoped
-					r.APIKey = ctx.APIKey
-					r.CredSource = "config:" + ctxName
-				}
-			case PrincipalDelegated:
-				if ctx.Token != "" {
-					r.Kind = CredentialDelegated
-					r.Token = ctx.Token
-					r.CredSource = "config:" + ctxName
-				}
+	} else if activeCtx != nil {
+		switch activeCtx.Type {
+		case PrincipalOwner:
+			if activeCtx.APIKey != "" {
+				r.Kind = CredentialOwner
+				r.APIKey = activeCtx.APIKey
+				r.CredSource = "config:" + ctxName
 			}
-			if ctx.Server != "" {
-				r.Server = ctx.Server
-				r.ServerSource = "config:" + ctxName
+		case PrincipalFSScoped:
+			if activeCtx.APIKey != "" {
+				r.Kind = CredentialFSScoped
+				r.APIKey = activeCtx.APIKey
+				r.CredSource = "config:" + ctxName
+			}
+		case PrincipalDelegated:
+			if activeCtx.Token != "" {
+				r.Kind = CredentialDelegated
+				r.Token = activeCtx.Token
+				r.CredSource = "config:" + ctxName
 			}
 		}
 	}

@@ -140,10 +140,35 @@ func Cp(c *client.Client, args []string) error {
 		}
 		switch {
 		case !srcIsRemote && dstIsRemote:
+			if dstRP.Context != "" {
+				var err error
+				c, err = newFSClientForContext(dstRP.Context)
+				if err != nil {
+					return err
+				}
+			}
 			return copyTreeLocalToRemote(ctx, c, src, dstRP.Path)
 		case srcIsRemote && !dstIsRemote:
+			if srcRP.Context != "" {
+				var err error
+				c, err = newFSClientForContext(srcRP.Context)
+				if err != nil {
+					return err
+				}
+			}
 			return copyTreeRemoteToLocal(ctx, c, srcRP.Path, dst)
 		case srcIsRemote && dstIsRemote:
+			switch {
+			case srcRP.Context == "" && dstRP.Context == "":
+			case srcRP.Context != "" && dstRP.Context != "" && srcRP.Context == dstRP.Context:
+				var err error
+				c, err = newFSClientForContext(srcRP.Context)
+				if err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("cross-context copy not supported: %q -> %q", src, dst)
+			}
 			return copyTreeRemoteToRemote(ctx, c, srcRP.Path, dstRP.Path)
 		default:
 			return fmt.Errorf("-r/--recursive requires at least one remote path")
