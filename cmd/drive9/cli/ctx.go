@@ -24,6 +24,10 @@ func Ctx(args []string) error {
 	if len(args) == 0 {
 		return ctxShowCmd(nil)
 	}
+	if IsHelpArg(args[0]) {
+		_, _ = fmt.Fprintln(os.Stdout, ctxUsage())
+		return nil
+	}
 	switch args[0] {
 	case "show":
 		return ctxShowCmd(args[1:])
@@ -39,8 +43,6 @@ func Ctx(args []string) error {
 		return ctxUseCmd(args[1:])
 	case "rm":
 		return ctxRmCmd(args[1:])
-	case "-h", "--help", "help":
-		return ctxUsageErr()
 	default:
 		return fmt.Errorf("unknown ctx command %q\n%s", args[0], ctxUsage())
 	}
@@ -57,10 +59,6 @@ func ctxUsage() string {
   ls [-l|--json] [--type <kind>|--scoped]             list contexts (filter by type: owner|delegated|fs_scoped)
   use <name>                                          activate a context
   rm <name>                                           remove a local context name (does NOT revoke server-side credential)`
-}
-
-func ctxUsageErr() error {
-	return fmt.Errorf("%s", ctxUsage())
 }
 
 type ctxShowEntry struct {
@@ -1008,7 +1006,11 @@ func ctxUseDescriptor(c *Context) string {
 //
 // Acceptance from #drive9:67e75a87 task #11 thread.
 func ctxRmCmd(args []string) error {
-	if len(args) != 1 || strings.HasPrefix(args[0], "--") {
+	if len(args) == 1 && IsHelpArg(args[0]) {
+		_, _ = fmt.Fprintln(os.Stdout, ctxRmUsage())
+		return nil
+	}
+	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
 		return fmt.Errorf("%s", ctxRmUsage())
 	}
 	name := args[0]

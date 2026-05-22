@@ -18,6 +18,7 @@ import (
 // Per task #11 / Plan B consensus (#drive9:f2a8e33e):
 //   - `drive9 token issue`  — issue a scoped capability (server)
 //   - `drive9 token revoke` — revoke a scoped capability (server)
+//
 // are the canonical token namespace operations.
 //
 // `drive9 token list` / `drive9 token forget` are kept as hidden
@@ -28,6 +29,10 @@ import (
 func Token(args []string) error {
 	if len(args) == 0 {
 		return tokenUsageErr()
+	}
+	if IsHelpArg(args[0]) {
+		_, _ = fmt.Fprint(os.Stdout, tokenUsage())
+		return nil
 	}
 	switch args[0] {
 	case "issue":
@@ -47,9 +52,6 @@ func Token(args []string) error {
 		fmt.Fprintln(os.Stderr, "WARNING: `drive9 token forget` is deprecated; use `drive9 ctx rm <name>` instead.")
 		fmt.Fprintln(os.Stderr, "         This command will be removed in a future release.")
 		return Ctx(append([]string{"rm"}, args[1:]...))
-	case "-h", "-help", "--help", "help":
-		_, _ = fmt.Fprint(os.Stdout, tokenUsage())
-		return nil
 	default:
 		return fmt.Errorf("unknown token command %q\n%s", args[0], tokenUsage())
 	}
