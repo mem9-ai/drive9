@@ -22,7 +22,6 @@ require_cmd sha256sum
 publisher="${DRIVE9_PUBLISHER:-drive9}"
 archive_root="${DRIVE9_ARCHIVE_ROOT:-/drive9}"
 archive_root="${archive_root%/}"
-recent_commits="${DRIVE9_ARCHIVE_RECENT_COMMITS:-20}"
 cli_targets="${DRIVE9_ARCHIVE_CLI_TARGETS:-linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64}"
 legacy_agfs_module="github.com/c4pt0r/agfs/agfs-server"
 legacy_agfs_version="${DRIVE9_ARCHIVE_LEGACY_AGFS_VERSION:-v0.0.0-20260410081414-678f51854d2a}"
@@ -374,9 +373,6 @@ resolve_commits() {
   fi
 
   case "${GITHUB_EVENT_NAME:-}" in
-  schedule)
-    git rev-list --first-parent --reverse --max-count="$recent_commits" "refs/remotes/origin/${branch}"
-    ;;
   workflow_dispatch)
     git rev-parse "refs/remotes/origin/${branch}^{commit}"
     ;;

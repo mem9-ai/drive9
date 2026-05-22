@@ -116,8 +116,7 @@ The publisher must be safe to rerun for the same commit.
 1. If `/commits/<sha>/manifest.json` exists and all referenced checksums match, the commit publish step is complete and should be skipped.
 2. If some artifacts exist but the commit manifest is missing, the publisher may repair the commit path by re-uploading missing artifacts and then writing the manifest.
 3. If the commit manifest exists but any referenced artifact is missing or has a checksum mismatch, the workflow must fail rather than silently overwrite immutable data.
-4. A manual `workflow_dispatch` input `branch` should allow publishing the tip of a specific branch.
-5. A scheduled reconciliation job should periodically check recent `main` commits and publish any commit that lacks a complete commit manifest.
+4. A manual `workflow_dispatch` input `branch` should allow publishing the tip of a specific branch for repair.
 
 ## Retrieval Examples
 
@@ -151,7 +150,7 @@ chmod +x ./drive9
 3. Archive growth:
    Mitigation: start with immutable commit archives, then add retention rules only if storage pressure becomes real.
 4. Partial publish:
-   Mitigation: publish commit artifacts first, write the commit `manifest.json` last, and allow scheduled reconciliation to repair missing commit manifests.
+   Mitigation: publish commit artifacts first, write the commit `manifest.json` last, and use manual dispatch to repair missing commit manifests.
 5. Confusing source of truth:
    Mitigation: document that GitHub remains canonical and drive9 is an artifact mirror.
 6. Publisher regression:
@@ -170,10 +169,10 @@ Start small:
 
 1. One pre-provisioned archive space.
 2. GitHub Actions secrets: `DRIVE9_SERVER`, `DRIVE9_API_KEY`.
-3. Triggers: `push` to `main`, `workflow_dispatch` with `branch`, and scheduled reconciliation for recent `main` commits.
+3. Triggers: `push` to `main` and `workflow_dispatch` with `branch`.
 4. Artifacts: `source.tar.gz`, CLI release binaries, `checksums.txt`, `manifest.json`.
 5. Paths: immutable `commits/<sha>/`.
 6. Publisher: official drive9 CLI download.
 7. Recovery: idempotent reruns and missing-manifest repair.
 
-This should fit in roughly `80-150 LoC` of workflow YAML and shell if it reuses the existing build targets and drive9 CLI upload path while adding manifest generation, checksum validation, idempotent reruns, and scheduled reconciliation.
+This should fit in roughly `80-150 LoC` of workflow YAML and shell if it reuses the existing build targets and drive9 CLI upload path while adding manifest generation, checksum validation, and idempotent reruns.

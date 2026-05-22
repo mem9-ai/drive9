@@ -11,8 +11,6 @@ on:
         required: true
         default: main
         type: string
-  schedule:
-    - cron: "17 3 * * *"
 
 jobs:
   publish:
