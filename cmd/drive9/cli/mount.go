@@ -61,10 +61,11 @@ func MountCmd(args []string) error {
 
 // fsMountCmd is the pre-V2e writable fs mount entry point.
 //
-// Credential precedence matches spec section 14.2: explicit --server / --api-key flag
-// > DRIVE9_SERVER / DRIVE9_API_KEY / DRIVE9_VAULT_TOKEN env > active config
-// context. The flag defaults are empty strings so we can distinguish "unset"
-// from "explicit empty"; the latter is rejected (see rejectEmptyFlag).
+// Credential precedence matches the unified resolver: explicit --server /
+// --api-key flag overrides all resolver sources; env credentials still beat
+// config credentials, but the active context's server beats DRIVE9_SERVER.
+// The flag defaults are empty strings so we can distinguish "unset" from
+// "explicit empty"; the latter is rejected (see rejectEmptyFlag).
 //
 // A mount is bound to exactly one principal at mount time (Invariant #3).
 // If the resolver returns a delegated credential (owner JWT / `ctx use <alice>`),

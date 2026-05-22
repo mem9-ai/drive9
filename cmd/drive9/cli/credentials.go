@@ -51,13 +51,14 @@ type ResolvedCredentials struct {
 	Token        string // set when Kind == CredentialDelegated
 	CredSource   string // "env:DRIVE9_VAULT_TOKEN", "env:DRIVE9_API_KEY", "config:<ctx-name>", ""
 	ServerSource string // "env:DRIVE9_SERVER", "config:<ctx-name>", "default"
+	envServer    string
 }
 
 // ResolveCredentials is the single source of truth for (credential, server)
-// resolution across all drive9 CLI call sites. Priority matches spec §14.2:
+// resolution across all drive9 CLI call sites.
 //
 //	Credential: DRIVE9_VAULT_TOKEN > DRIVE9_API_KEY > active context
-//	Server:     DRIVE9_SERVER      > active-context.server > compiled-in default
+//	Server:     active-context.server > DRIVE9_SERVER > config.server > compiled-in default
 //
 // "First match wins" applies to *presence*, not validity. A set-but-malformed
 // env var yields a distinct error at validation time; it must never silently
@@ -81,25 +82,41 @@ type ResolvedCredentials struct {
 // whitespace to match file-based ingress (`ctx import`) behaviour.
 func ResolveCredentials() ResolvedCredentials {
 	credentialOnce.Do(func() {
-		cachedCredentials = resolveCredentialsWithConfig(loadConfig())
+		cachedCredentials = resolveCredentialsWithConfig(loadCredentialConfigSnapshot())
 	})
 	return cachedCredentials
 }
 
 var (
-	credentialOnce    sync.Once
-	cachedCredentials ResolvedCredentials
+	credentialOnce       sync.Once
+	cachedCredentials    ResolvedCredentials
+	configSnapshotOnce   sync.Once
+	cachedConfigSnapshot *Config
 )
+
+func loadCredentialConfigSnapshot() *Config {
+	configSnapshotOnce.Do(func() {
+		cachedConfigSnapshot = loadConfig()
+	})
+	return cachedConfigSnapshot
+}
 
 // resetCredentialCacheForTest clears the per-process resolver cache. Test-
 // only; callers in production would see an env-read-after-unset race.
 func resetCredentialCacheForTest() {
 	credentialOnce = sync.Once{}
 	cachedCredentials = ResolvedCredentials{}
+	configSnapshotOnce = sync.Once{}
+	cachedConfigSnapshot = nil
 }
 
 func resolveCredentialsWithConfig(cfg *Config) ResolvedCredentials {
 	var r ResolvedCredentials
+	var activeCtx *Context
+	ctxName := cfg.CurrentContext
+	if ctxName != "" {
+		activeCtx = cfg.Contexts[ctxName]
+	}
 
 	// Consume all three credential-bearing env vars up-front so the Unsetenv
 	// mitigation fires regardless of which one "wins" priority. Otherwise a
@@ -108,11 +125,11 @@ func resolveCredentialsWithConfig(cfg *Config) ResolvedCredentials {
 	envServer := consumeEnv(EnvServer)
 	envToken := consumeEnv(EnvVaultToken)
 	envAPIKey := consumeEnv(EnvAPIKey)
+	r.envServer = envServer
 
-	// Server resolution is orthogonal to credential resolution (§14.2).
-	if envServer != "" {
-		r.Server = envServer
-		r.ServerSource = "env:" + EnvServer
+	if activeCtx != nil && activeCtx.Server != "" {
+		r.Server = activeCtx.Server
+		r.ServerSource = "config:" + ctxName
 	}
 
 	// Credential resolution: VAULT_TOKEN > API_KEY > active context.
@@ -124,37 +141,34 @@ func resolveCredentialsWithConfig(cfg *Config) ResolvedCredentials {
 		r.Kind = CredentialOwner
 		r.APIKey = envAPIKey
 		r.CredSource = "env:" + EnvAPIKey
-	} else if ctxName := cfg.CurrentContext; ctxName != "" {
-		if ctx := cfg.Contexts[ctxName]; ctx != nil {
-			switch ctx.Type {
-			case PrincipalOwner:
-				if ctx.APIKey != "" {
-					r.Kind = CredentialOwner
-					r.APIKey = ctx.APIKey
-					r.CredSource = "config:" + ctxName
-				}
-			case PrincipalFSScoped:
-				if ctx.APIKey != "" {
-					r.Kind = CredentialFSScoped
-					r.APIKey = ctx.APIKey
-					r.CredSource = "config:" + ctxName
-				}
-			case PrincipalDelegated:
-				if ctx.Token != "" {
-					r.Kind = CredentialDelegated
-					r.Token = ctx.Token
-					r.CredSource = "config:" + ctxName
-				}
+	} else if activeCtx != nil {
+		switch activeCtx.Type {
+		case PrincipalOwner:
+			if activeCtx.APIKey != "" {
+				r.Kind = CredentialOwner
+				r.APIKey = activeCtx.APIKey
+				r.CredSource = "config:" + ctxName
 			}
-			if r.Server == "" && ctx.Server != "" {
-				r.Server = ctx.Server
-				r.ServerSource = "config:" + ctxName
+		case PrincipalFSScoped:
+			if activeCtx.APIKey != "" {
+				r.Kind = CredentialFSScoped
+				r.APIKey = activeCtx.APIKey
+				r.CredSource = "config:" + ctxName
+			}
+		case PrincipalDelegated:
+			if activeCtx.Token != "" {
+				r.Kind = CredentialDelegated
+				r.Token = activeCtx.Token
+				r.CredSource = "config:" + ctxName
 			}
 		}
 	}
 
 	if r.Server == "" {
-		if cfg.Server != "" {
+		if envServer != "" {
+			r.Server = envServer
+			r.ServerSource = "env:" + EnvServer
+		} else if cfg.Server != "" {
 			r.Server = cfg.Server
 			r.ServerSource = "config:server"
 		} else {

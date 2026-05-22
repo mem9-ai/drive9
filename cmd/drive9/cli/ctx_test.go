@@ -166,6 +166,8 @@ func TestCtxForkRejectsDelegatedSource(t *testing.T) {
 // duration of the test. Returns the tmp dir path.
 func withIsolatedHome(t *testing.T) string {
 	t.Helper()
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
 	// Some macOS Go versions cache UserHomeDir via getenv; t.Setenv is

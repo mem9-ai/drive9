@@ -16,8 +16,10 @@ func Mkdir(c *client.Client, args []string) error {
 		return fmt.Errorf("usage: drive9 fs mkdir <path>")
 	}
 	path := args[0]
-	if rp, isRemote := ParseRemote(path); isRemote {
-		path = rp.Path
+	var err error
+	c, path, _, _, err = fsClientForRemoteArg(c, path)
+	if err != nil {
+		return err
 	}
 	if err := c.Mkdir(path); err != nil {
 		return err

@@ -44,10 +44,11 @@ func Create(args []string) error {
 		return err
 	}
 
-	// Precedence per §14.2: explicit --server flag > DRIVE9_SERVER env > config.
-	// ResolveCredentials consumes the env var (Unsetenv mitigation), so even when
-	// the flag wins we still sink the env to keep downstream forks from inheriting
-	// it. Credential resolution is not used here — provisioning is unauthenticated.
+	// Precedence here is: explicit --server flag > active context.server >
+	// DRIVE9_SERVER env > config.server/default. ResolveCredentials consumes the
+	// env var (Unsetenv mitigation), so even when the flag wins we still sink the
+	// env to keep downstream forks from inheriting it. Credential resolution is
+	// not used here — provisioning is unauthenticated.
 	r := ResolveCredentials()
 	server := serverFlag
 	if server == "" {
