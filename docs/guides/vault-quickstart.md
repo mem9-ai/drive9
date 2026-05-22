@@ -258,7 +258,9 @@ Credential priority (first match wins):
 
 An explicitly-empty flag (`--api-key=""`) is rejected at parse time — it is not treated as "unset and fall through." Pass a non-empty value or omit the flag entirely.
 
-`DRIVE9_SERVER` is resolved independently: if set, it overrides the active context's `server` field even when credentials come from the active context.
+Server routing is resolved independently from credential selection, but an active context's `server` field wins over `DRIVE9_SERVER`. This prevents a stale shell export from silently sending the active context's credential to the wrong drive9 server after `drive9 ctx use`. The effective server order is: explicit `--server` flag, active context `server`, `DRIVE9_SERVER`, top-level config `server`, compiled default.
+
+Migration note: if an existing CI job or one-off shell relied on `DRIVE9_SERVER` to override an active context with its own `server`, switch to a context pointed at the desired endpoint, clear/replace the active context for that invocation, or pass an explicit `--server` flag on commands that support it.
 
 "First match wins" applies to **presence**, not to validity. A set-but-invalid `DRIVE9_VAULT_TOKEN` (malformed, expired, revoked, or issued by an unknown server) fails as `Permission denied` — it does not silently fall through to `DRIVE9_API_KEY` or the active context. To use the owner credential, unset `DRIVE9_VAULT_TOKEN`.
 

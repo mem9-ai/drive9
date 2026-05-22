@@ -51,6 +51,7 @@ type ResolvedCredentials struct {
 	Token        string // set when Kind == CredentialDelegated
 	CredSource   string // "env:DRIVE9_VAULT_TOKEN", "env:DRIVE9_API_KEY", "config:<ctx-name>", ""
 	ServerSource string // "env:DRIVE9_SERVER", "config:<ctx-name>", "default"
+	envServer    string
 }
 
 // ResolveCredentials is the single source of truth for (credential, server)
@@ -81,21 +82,32 @@ type ResolvedCredentials struct {
 // whitespace to match file-based ingress (`ctx import`) behaviour.
 func ResolveCredentials() ResolvedCredentials {
 	credentialOnce.Do(func() {
-		cachedCredentials = resolveCredentialsWithConfig(loadConfig())
+		cachedCredentials = resolveCredentialsWithConfig(loadCredentialConfigSnapshot())
 	})
 	return cachedCredentials
 }
 
 var (
-	credentialOnce    sync.Once
-	cachedCredentials ResolvedCredentials
+	credentialOnce       sync.Once
+	cachedCredentials    ResolvedCredentials
+	configSnapshotOnce   sync.Once
+	cachedConfigSnapshot *Config
 )
+
+func loadCredentialConfigSnapshot() *Config {
+	configSnapshotOnce.Do(func() {
+		cachedConfigSnapshot = loadConfig()
+	})
+	return cachedConfigSnapshot
+}
 
 // resetCredentialCacheForTest clears the per-process resolver cache. Test-
 // only; callers in production would see an env-read-after-unset race.
 func resetCredentialCacheForTest() {
 	credentialOnce = sync.Once{}
 	cachedCredentials = ResolvedCredentials{}
+	configSnapshotOnce = sync.Once{}
+	cachedConfigSnapshot = nil
 }
 
 func resolveCredentialsWithConfig(cfg *Config) ResolvedCredentials {
@@ -113,6 +125,7 @@ func resolveCredentialsWithConfig(cfg *Config) ResolvedCredentials {
 	envServer := consumeEnv(EnvServer)
 	envToken := consumeEnv(EnvVaultToken)
 	envAPIKey := consumeEnv(EnvAPIKey)
+	r.envServer = envServer
 
 	if activeCtx != nil && activeCtx.Server != "" {
 		r.Server = activeCtx.Server

@@ -62,7 +62,8 @@ func NewFromEnvWithWarm() *client.Client {
 }
 
 func newFSClientForContext(name string) (*client.Client, error) {
-	cfg := loadConfig()
+	r := ResolveCredentials()
+	cfg := loadCredentialConfigSnapshot()
 	ctx := cfg.Contexts[name]
 	if ctx == nil {
 		return nil, fmt.Errorf("context %q not found; run: drive9 ctx ls", name)
@@ -70,7 +71,9 @@ func newFSClientForContext(name string) (*client.Client, error) {
 
 	server := ctx.Server
 	if server == "" {
-		if cfg.Server != "" {
+		if r.envServer != "" {
+			server = r.envServer
+		} else if cfg.Server != "" {
 			server = cfg.Server
 		} else {
 			server = defaultServerURL

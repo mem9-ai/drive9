@@ -484,10 +484,16 @@ The unified credential resolver (`ResolveCredentials()`) is the **sole source-of
 Server URL resolution is **orthogonal** to credential resolution:
 
 1. Explicit `--server` flag
-2. `DRIVE9_SERVER`
-3. The `server` field of the active context
+2. The `server` field of the active context
+3. `DRIVE9_SERVER`
+4. Top-level `server` in `~/.drive9/config`
+5. Compiled-in default
 
-`ctx use` does **not** lock server and credential together: if `DRIVE9_SERVER` is set, it overrides the context's `server` field even when the active context is used for credentials. If the resulting (server, credential) pair is mismatched (e.g. a JWT signed by a different issuer), the server rejects the request with `EACCES` via the standard stale-auth path (§11). No new error model is introduced.
+`ctx use` intentionally binds the active context's server before the process environment's `DRIVE9_SERVER`. This prevents a stale shell export from silently routing an active context's credential to the wrong drive9 server after switching contexts. Environment credentials still override context credentials; only server routing prefers the active context's explicit `server` field.
+
+For explicit filesystem context paths (`<ctx>:/path`), the named context's `server` field has the same priority as the active context's server. If the named context omits `server`, fallback is `DRIVE9_SERVER`, then top-level config `server`, then the compiled default.
+
+Migration note: CI jobs, containers, and one-off scripts that previously relied on `DRIVE9_SERVER` to override an active context with its own `server` must either switch to a context whose `server` points at the desired endpoint, clear/replace the active context before invoking drive9, or pass an explicit `--server` flag on commands that support it. If the resulting (server, credential) pair is mismatched (e.g. a JWT signed by a different issuer), the server rejects the request with `EACCES` via the standard stale-auth path (§11). No new error model is introduced.
 
 ### 14.3 Activation mechanics
 
