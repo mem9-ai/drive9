@@ -1006,17 +1006,17 @@ func ctxUseDescriptor(c *Context) string {
 //
 // Acceptance from #drive9:67e75a87 task #11 thread.
 func ctxRmCmd(args []string) error {
-	if len(args) == 1 && IsHelpArg(args[0]) {
-		_, _ = fmt.Fprintln(os.Stdout, ctxRmUsage())
-		return nil
-	}
-	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
+	if len(args) != 1 {
 		return fmt.Errorf("%s", ctxRmUsage())
 	}
 	name := args[0]
 	cfg := loadConfig()
 	target, ok := cfg.Contexts[name]
 	if !ok || target == nil {
+		if IsHelpArg(name) {
+			_, _ = fmt.Fprintln(os.Stdout, ctxRmUsage())
+			return nil
+		}
 		return fmt.Errorf("context %q not found", name)
 	}
 	if cfg.CurrentContext == name {

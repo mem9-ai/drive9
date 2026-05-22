@@ -128,6 +128,8 @@ func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+
 			origExit := exitFunc
 			origStdout := os.Stdout
 			origStderr := os.Stderr
@@ -175,13 +177,13 @@ func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {
 			stderr := <-stderrDone
 
 			if len(exitCodes) != 0 {
-				t.Fatalf("exit codes = %v, want no fatal/usage exit", exitCodes)
+				t.Errorf("exit codes = %v, want no fatal/usage exit", exitCodes)
 			}
 			if !strings.HasPrefix(stdout, tc.firstLine) {
-				t.Fatalf("stdout = %q, want first line %q", stdout, tc.firstLine)
+				t.Errorf("stdout = %q, want first line %q", stdout, tc.firstLine)
 			}
 			if stderr != "" {
-				t.Fatalf("stderr = %q, want empty stderr for explicit help", stderr)
+				t.Errorf("stderr = %q, want empty stderr for explicit help", stderr)
 			}
 		})
 	}
