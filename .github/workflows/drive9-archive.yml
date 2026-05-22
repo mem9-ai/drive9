@@ -27,13 +27,14 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
+          persist-credentials: false
           fetch-depth: 0
           ref: ${{ github.event_name == 'push' && github.sha || github.event.inputs.branch || 'main' }}
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: go.mod
           cache: true
@@ -41,7 +42,7 @@ jobs:
       - name: Validate archive configuration
         run: |
           set -euo pipefail
-          test -n "${DRIVE9_SERVER}" || { echo "DRIVE9_ARCHIVE_SERVER secret is required" >&2; exit 1; }
+          test -n "${DRIVE9_SERVER}" || { echo "DRIVE9_SERVER must be configured" >&2; exit 1; }
           test -n "${DRIVE9_API_KEY}" || { echo "DRIVE9_ARCHIVE_API_KEY secret is required" >&2; exit 1; }
 
       - name: Install drive9 publisher

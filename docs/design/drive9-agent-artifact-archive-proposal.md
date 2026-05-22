@@ -33,7 +33,7 @@ This is not intended to replace git. It is a distribution and recovery layer for
 
 ## Archive Model
 
-Use one long-lived drive9 archive space dedicated to this repository. Provision it once, then store its owner API key and server URL in GitHub Actions secrets.
+Use one long-lived drive9 archive space dedicated to this repository. Provision it once, then store its owner API key in the `DRIVE9_ARCHIVE_API_KEY` GitHub Actions secret. The workflow maps that secret to runtime `DRIVE9_API_KEY` and uses the public `https://api.drive9.ai` endpoint as `DRIVE9_SERVER`.
 
 Recommended root:
 
@@ -146,7 +146,7 @@ chmod +x ./drive9
 1. Bootstrap circularity: a fresh agent may need the drive9 binary to fetch the drive9 binary.
    Mitigation: keep GitHub releases or another bootstrap path available, and store direct HTTP download support if needed later.
 2. Credential exposure in CI:
-   Mitigation: use GitHub Actions secrets for `DRIVE9_SERVER` and `DRIVE9_API_KEY`; never echo tokens; avoid writing credentials into artifacts.
+   Mitigation: use the GitHub Actions secret `DRIVE9_ARCHIVE_API_KEY`, mapped at runtime to `DRIVE9_API_KEY`; never echo tokens; avoid writing credentials into artifacts.
 3. Archive growth:
    Mitigation: start with immutable commit archives, then add retention rules only if storage pressure becomes real.
 4. Partial publish:
@@ -168,7 +168,7 @@ chmod +x ./drive9
 Start small:
 
 1. One pre-provisioned archive space.
-2. GitHub Actions secrets: `DRIVE9_SERVER`, `DRIVE9_API_KEY`.
+2. GitHub Actions secret: `DRIVE9_ARCHIVE_API_KEY`, mapped at runtime to `DRIVE9_API_KEY`; `DRIVE9_SERVER` uses `https://api.drive9.ai`.
 3. Triggers: `push` to `main` and `workflow_dispatch` with `branch`.
 4. Artifacts: `source.tar.gz`, CLI release binaries, `checksums.txt`, `manifest.json`.
 5. Paths: immutable `commits/<sha>/`.

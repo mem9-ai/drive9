@@ -363,6 +363,7 @@ publish_commit() {
     remote_upload "${artifact_dir}/${binary}" "${commit_path}/${binary}"
   done < <(cd "$artifact_dir" && find bin -type f -name 'drive9-*' | sort)
   remote_upload "${artifact_dir}/checksums.txt" "${commit_path}/checksums.txt"
+  verify_remote_artifacts "$commit_path" "${artifact_dir}/checksums.txt"
   remote_upload "${artifact_dir}/manifest.json" "${commit_path}/manifest.json"
 }
 
