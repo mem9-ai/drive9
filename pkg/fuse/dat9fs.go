@@ -803,16 +803,53 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 		if !entry.HasMode {
 			mode = 0755
 		}
-		out.Mode = syscall.S_IFDIR | mode
+		out.Mode = syscall.S_IFDIR | (mode & 0o777)
 		out.Nlink = 2
+	} else if entryIsSymlink(entry) {
+		mode := entry.Mode & 0o777
+		if !entry.HasMode {
+			mode = 0o777
+		}
+		out.Mode = uint32(syscall.S_IFLNK) | mode
+		out.Nlink = 1
 	} else {
 		mode := entry.Mode
 		if !entry.HasMode {
 			mode = 0644
 		}
-		out.Mode = syscall.S_IFREG | mode
+		out.Mode = syscall.S_IFREG | (mode & 0o777)
 		out.Nlink = 1
 	}
+}
+
+func isSymlinkMode(mode uint32) bool {
+	return mode&uint32(syscall.S_IFMT) == uint32(syscall.S_IFLNK)
+}
+
+func entryIsSymlink(entry *InodeEntry) bool {
+	return entry != nil && !entry.IsDir && entry.HasMode && isSymlinkMode(entry.Mode)
+}
+
+func dirEntryMode(isDir, hasMode bool, mode uint32) uint32 {
+	if isDir {
+		perm := uint32(0o755)
+		if hasMode {
+			perm = mode & 0o777
+		}
+		return uint32(syscall.S_IFDIR) | perm
+	}
+	perm := uint32(0o644)
+	if hasMode {
+		perm = mode & 0o777
+	}
+	if hasMode && isSymlinkMode(mode) {
+		return uint32(syscall.S_IFLNK) | perm
+	}
+	return uint32(syscall.S_IFREG) | perm
+}
+
+func symlinkMode() uint32 {
+	return uint32(syscall.S_IFLNK) | 0o777
 }
 
 func (fs *Dat9FS) fillEntryOut(entry *InodeEntry, out *gofuse.EntryOut) {
@@ -1984,6 +2021,11 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 			if stat.Revision > 0 {
 				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
 			}
+			if stat.HasMode {
+				entry.Mode = stat.Mode
+				entry.HasMode = true
+				fs.inodes.UpdateMode(input.NodeId, stat.Mode)
+			}
 			if !stat.Mtime.IsZero() {
 				entry.Mtime = stat.Mtime
 				fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
@@ -2002,6 +2044,11 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 			fs.inodes.UpdateSize(input.NodeId, stat.Size)
 			if stat.Revision > 0 {
 				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
+			}
+			if stat.HasMode {
+				entry.Mode = stat.Mode
+				entry.HasMode = true
+				fs.inodes.UpdateMode(input.NodeId, stat.Mode)
 			}
 			if !stat.Mtime.IsZero() {
 				entry.Mtime = stat.Mtime
@@ -2032,6 +2079,10 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	// Handle mode (chmod)
 	if input.Valid&gofuse.FATTR_MODE != 0 {
 		mode := input.Mode & 0777
+		entryMode := mode
+		if entryIsSymlink(entry) {
+			entryMode |= uint32(syscall.S_IFLNK)
+		}
 		// If the file has an open dirty handle, update mode locally without
 		// consulting the remote server. The mode will be synced on Flush.
 		// Use a single ForEach pass to avoid a TOCTOU race between the check
@@ -2055,8 +2106,8 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				return httpToFuseStatus(err)
 			}
 		}
-		entry.Mode = mode
-		fs.inodes.UpdateMode(input.NodeId, mode)
+		entry.Mode = entryMode
+		fs.inodes.UpdateMode(input.NodeId, entryMode)
 	}
 
 	// Handle truncate
@@ -2130,6 +2181,29 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	return gofuse.OK
 }
 
+func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out []byte, status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseReadlink, perfStart, status, uint64(len(out))) }()
+
+	entry, ok := fs.inodes.GetEntry(header.NodeId)
+	if !ok {
+		return nil, gofuse.ENOENT
+	}
+	if !entryIsSymlink(entry) {
+		return nil, gofuse.Status(syscall.EINVAL)
+	}
+
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	readStart := fs.perfStart()
+	target, err := fs.client.ReadCtx(ctx, fs.remotePath(entry.Path))
+	fs.perfRecordRemote(perfRemoteRead, readStart, err, uint64(len(target)))
+	if err != nil {
+		return nil, httpToFuseStatus(err)
+	}
+	return target, gofuse.OK
+}
+
 // --- Directory operations ----------------------------------------------------
 
 func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, out *gofuse.EntryOut) (status gofuse.Status) {
@@ -2158,6 +2232,55 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 	// Kernel already receives the new entry via the Mkdir reply —
 	// no need for notifyEntry/notifyInode here.
 
+	fs.fillEntryOut(entry, out)
+	return gofuse.OK
+}
+
+func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, pointedTo string, linkName string, out *gofuse.EntryOut) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseSymlink, perfStart, status, 0) }()
+	if fs.opts.ReadOnly {
+		return gofuse.EROFS
+	}
+
+	childP, st := fs.childPath(header.NodeId, linkName)
+	if st != gofuse.OK {
+		return st
+	}
+
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	mutationStart := fs.perfStart()
+	err := fs.client.SymlinkCtx(ctx, pointedTo, fs.remotePath(childP))
+	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
+	if err != nil {
+		return httpToFuseStatus(err)
+	}
+
+	mode := symlinkMode()
+	ino := fs.inodes.Lookup(childP, false, int64(len(pointedTo)), time.Now())
+	fs.inodes.UpdateMode(ino, mode)
+	if stat, err := fs.client.StatCtx(ctx, fs.remotePath(childP)); err == nil && stat != nil {
+		if stat.Revision > 0 {
+			fs.inodes.UpdateRevision(ino, stat.Revision)
+		}
+		if !stat.Mtime.IsZero() {
+			fs.inodes.UpdateMtime(ino, stat.Mtime)
+		}
+		if stat.HasMode {
+			fs.inodes.UpdateMode(ino, stat.Mode)
+		}
+	} else if err != nil && !isNotFoundErr(err) {
+		log.Printf("post-symlink stat refresh failed for %s: %v", childP, err)
+	}
+
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		return gofuse.EIO
+	}
+	parentPath, _ := fs.inodes.GetPath(header.NodeId)
+	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
+	fs.invalidateReadCacheAndTargets(childP)
 	fs.fillEntryOut(entry, out)
 	return gofuse.OK
 }
@@ -2900,19 +3023,10 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 			fs.inodes.UpdateMode(ino, item.Mode)
 		}
 
-		var mode uint32
-		if item.IsDir {
-			mode = syscall.S_IFDIR
-		} else {
-			mode = syscall.S_IFREG
-		}
-		if item.HasMode {
-			mode |= item.Mode & 0o777
-		}
 		entries = append(entries, DirEntry{
 			Name: item.Name,
 			Ino:  ino,
-			Mode: mode,
+			Mode: dirEntryMode(item.IsDir, item.HasMode, item.Mode),
 		})
 	}
 	return entries
@@ -3021,6 +3135,9 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	}
 	entry, _ := fs.inodes.GetEntry(input.NodeId)
 	if entry != nil {
+		if entryIsSymlink(entry) {
+			return gofuse.Status(syscall.ELOOP)
+		}
 		fh.OrigSize = entry.Size
 		fh.BaseRev = entry.Revision
 	}

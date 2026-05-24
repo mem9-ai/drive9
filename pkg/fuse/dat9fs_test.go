@@ -1445,6 +1445,123 @@ func TestLookupUsesDirCachePositiveEntryWithoutRemoteStat(t *testing.T) {
 	}
 }
 
+func TestLookupRecognizesRemoteSymlinkMode(t *testing.T) {
+	target := []byte("../target")
+	symlinkMode := uint32(syscall.S_IFLNK) | 0o777
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			headCalls.Add(1)
+			w.Header().Set("Content-Length", strconv.Itoa(len(target)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(symlinkMode), 10))
+			w.Header().Set("X-Dat9-Revision", "11")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			_, _ = w.Write(target)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "link", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got := out.Mode & uint32(syscall.S_IFMT); got != uint32(syscall.S_IFLNK) {
+		t.Fatalf("Lookup mode type = %o, want symlink", got)
+	}
+	if got := out.Size; got != uint64(len(target)) {
+		t.Fatalf("Lookup size = %d, want %d", got, len(target))
+	}
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+
+	got, st := fs.Readlink(nil, &gofuse.InHeader{NodeId: out.NodeId})
+	if st != gofuse.OK {
+		t.Fatalf("Readlink status = %v, want OK", st)
+	}
+	if string(got) != string(target) {
+		t.Fatalf("Readlink target = %q, want %q", got, target)
+	}
+}
+
+func TestSymlinkCreatesRemoteLinkAndCachesEntry(t *testing.T) {
+	const target = "../target"
+	symlinkMode := uint32(syscall.S_IFLNK) | 0o777
+	var gotTarget string
+	var postCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			postCalls.Add(1)
+			if r.URL.Path != "/v1/fs/link" {
+				t.Errorf("POST path = %s, want /v1/fs/link", r.URL.Path)
+			}
+			if got := r.URL.Query().Get("symlink"); got != "1" {
+				t.Errorf("symlink query = %q, want 1", got)
+			}
+			var req struct {
+				Target string `json:"target"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode body: %v", err)
+			}
+			gotTarget = req.Target
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(target)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(symlinkMode), 10))
+			w.Header().Set("X-Dat9-Revision", "12")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			_, _ = w.Write([]byte(target))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Symlink(nil, &gofuse.InHeader{NodeId: 1}, target, "link", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Symlink status = %v, want OK", st)
+	}
+	if gotTarget != target {
+		t.Fatalf("posted target = %q, want %q", gotTarget, target)
+	}
+	if got := postCalls.Load(); got != 1 {
+		t.Fatalf("POST calls = %d, want 1", got)
+	}
+	if got := out.Mode & uint32(syscall.S_IFMT); got != uint32(syscall.S_IFLNK) {
+		t.Fatalf("Symlink mode type = %o, want symlink", got)
+	}
+	if got := out.Size; got != uint64(len(target)) {
+		t.Fatalf("Symlink size = %d, want %d", got, len(target))
+	}
+
+	got, st := fs.Readlink(nil, &gofuse.InHeader{NodeId: out.NodeId})
+	if st != gofuse.OK {
+		t.Fatalf("Readlink status = %v, want OK", st)
+	}
+	if string(got) != target {
+		t.Fatalf("Readlink target = %q, want %q", got, target)
+	}
+}
+
 func TestLookupUsesDirCacheNegativeEntryWithoutRemoteStat(t *testing.T) {
 	var remoteCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4461,6 +4578,13 @@ func TestMutationHandlers_CompleteWithinTimeout(t *testing.T) {
 				return fs.Mkdir(nil, &gofuse.MkdirIn{
 					InHeader: gofuse.InHeader{NodeId: 1},
 				}, "newdir", &out)
+			},
+		},
+		{
+			name: "Symlink",
+			fn: func() gofuse.Status {
+				var out gofuse.EntryOut
+				return fs.Symlink(nil, &gofuse.InHeader{NodeId: 1}, "target.txt", "newlink", &out)
 			},
 		},
 		{

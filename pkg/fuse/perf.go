@@ -31,6 +31,8 @@ const (
 	perfFuseRmdir
 	perfFuseRename
 	perfFuseSetAttr
+	perfFuseReadlink
+	perfFuseSymlink
 	perfFuseOpCount
 )
 
@@ -52,6 +54,8 @@ var perfFuseOpNames = [...]string{
 	perfFuseRmdir:       "rmdir",
 	perfFuseRename:      "rename",
 	perfFuseSetAttr:     "setattr",
+	perfFuseReadlink:    "readlink",
+	perfFuseSymlink:     "symlink",
 }
 
 type perfRemoteOp int

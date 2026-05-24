@@ -58,6 +58,9 @@ const (
 	// InlineThreshold: extraction can be tightened or relaxed without
 	// changing the storage-class boundary.
 	DefaultTextExtractMaxBytes int64 = 8_192
+
+	symlinkMode        uint32 = 0o120000 | 0o777
+	symlinkContentType        = "application/x-symlink"
 )
 
 // Dat9Backend implements filesystem.FileSystem with the inode model.
@@ -242,6 +245,64 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		return err
 	}
 	b.syncCentralFileCreate(ctx, fileID, 0, "")
+	return nil
+}
+
+// CreateSymlinkCtx creates a symbolic link whose target is stored as the file
+// payload and whose inode mode carries the POSIX symlink file type bits.
+func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "create_symlink", err, start) }()
+
+	if target == "" || strings.ContainsRune(target, 0) {
+		return ErrInvalidSymlinkTarget
+	}
+	linkPath, err = pathutil.Canonicalize(linkPath)
+	if err != nil {
+		return err
+	}
+
+	data := []byte(target)
+	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
+		return err
+	}
+	fileID := b.genID()
+	now := time.Now()
+	checksum := sha256sum(data)
+
+	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.ensureStorageQuota(ctx, tx, linkPath, int64(len(data))); err != nil {
+			return err
+		}
+		if err := b.store.InsertFileTx(tx, &datastore.File{
+			FileID:                fileID,
+			StorageType:           datastore.StorageDB9,
+			StorageRef:            "inline",
+			StorageEncryptionMode: datastore.StorageEncryptionNone,
+			ContentBlob:           append([]byte(nil), data...),
+			ContentType:           symlinkContentType,
+			SizeBytes:             int64(len(data)),
+			ChecksumSHA256:        checksum,
+			Revision:              1,
+			Mode:                  symlinkMode,
+			Status:                datastore.StatusConfirmed,
+			CreatedAt:             now,
+			ConfirmedAt:           &now,
+		}); err != nil {
+			return err
+		}
+		if err := b.store.EnsureParentDirsTx(tx, linkPath, b.genID); err != nil {
+			return err
+		}
+		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+			NodeID: b.genID(), Path: linkPath, ParentPath: pathutil.ParentPath(linkPath),
+			Name: pathutil.BaseName(linkPath), FileID: fileID, CreatedAt: now,
+		})
+	})
+	if err != nil {
+		return err
+	}
+	b.syncCentralFileCreate(ctx, fileID, int64(len(data)), symlinkContentType)
 	return nil
 }
 

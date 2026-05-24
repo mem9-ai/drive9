@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -895,6 +896,57 @@ func TestStatDirectoryReturnsMode(t *testing.T) {
 	}
 	if modeHdr != "448" { // 0o700 = 448 decimal
 		t.Errorf("expected X-Dat9-Mode 448, got %s", modeHdr)
+	}
+}
+
+func TestSymlinkRoundTrip(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	reqBody := strings.NewReader(`{"target":"../target.txt"}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/link?symlink=1", reqBody)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("symlink: %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/link", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stat link: %d", resp.StatusCode)
+	}
+	wantMode := strconv.FormatUint(uint64(uint32(syscall.S_IFLNK)|0o777), 10)
+	if got := resp.Header.Get("X-Dat9-Mode"); got != wantMode {
+		t.Fatalf("X-Dat9-Mode = %s, want %s", got, wantMode)
+	}
+	if got := resp.Header.Get("Content-Length"); got != strconv.Itoa(len("../target.txt")) {
+		t.Fatalf("Content-Length = %s, want %d", got, len("../target.txt"))
+	}
+
+	resp, err = http.Get(ts.URL + "/v1/fs/link")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("read link payload: %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "../target.txt" {
+		t.Fatalf("read link payload = %q, want ../target.txt", body)
 	}
 }
 
