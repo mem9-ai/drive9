@@ -11,6 +11,9 @@ CLAUDE.md
 
 # Go
 bin/
+!/bench/bin/
+!/bench/bin/*.sh
+!/bench/bin/*.py
 vendor/
 *.exe
 *.exe~
