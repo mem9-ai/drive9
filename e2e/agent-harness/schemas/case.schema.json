@@ -89,7 +89,8 @@
                   "git_workflow",
                   "doctor_fuse",
                   "open_fd_unmount",
-                  "kill_during_write"
+                  "kill_during_write",
+                  "cp_perf"
                 ]
               },
               "files": {
@@ -241,6 +242,49 @@
                 "type": "integer"
               },
               "allow_nonzero_when_no_allow_other": {
+                "type": "boolean"
+              },
+              "file_sizes_mib": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "concurrency_levels": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "modes": {
+                "type": "array",
+                "items": {
+                  "enum": [
+                    "upload_warm",
+                    "download_file",
+                    "download_null",
+                    "upload_cold",
+                    "upload_stdin",
+                    "download_fsync"
+                  ]
+                }
+              },
+              "transfers_per_scenario": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "remote_root": {
+                "type": "string"
+              },
+              "artifact_root": {
+                "type": "string"
+              },
+              "durable_flush": {
+                "type": "boolean"
+              },
+              "collect_host_telemetry": {
                 "type": "boolean"
               }
             }

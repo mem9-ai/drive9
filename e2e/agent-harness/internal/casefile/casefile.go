@@ -102,6 +102,14 @@ type Workload struct {
 	RemountVerifyPaths           []VerifySpec `yaml:"remount_verify_paths" json:"remount_verify_paths,omitempty"`
 	ExpectExit                   *int         `yaml:"expect_exit" json:"expect_exit,omitempty"`
 	AllowNonzeroWhenNoAllowOther bool         `yaml:"allow_nonzero_when_no_allow_other" json:"allow_nonzero_when_no_allow_other,omitempty"`
+	FileSizesMiB                 []int        `yaml:"file_sizes_mib" json:"file_sizes_mib,omitempty"`
+	ConcurrencyLevels            []int        `yaml:"concurrency_levels" json:"concurrency_levels,omitempty"`
+	Modes                        []string     `yaml:"modes" json:"modes,omitempty"`
+	TransfersPerScenario         int          `yaml:"transfers_per_scenario" json:"transfers_per_scenario,omitempty"`
+	RemoteRoot                   string       `yaml:"remote_root" json:"remote_root,omitempty"`
+	ArtifactRoot                 string       `yaml:"artifact_root" json:"artifact_root,omitempty"`
+	DurableFlush                 bool         `yaml:"durable_flush" json:"durable_flush,omitempty"`
+	CollectHostTelemetry         *bool        `yaml:"collect_host_telemetry" json:"collect_host_telemetry,omitempty"`
 }
 
 type FileSpec struct {
@@ -319,8 +327,51 @@ func validateWorkload(w Workload) error {
 		if w.WriterBytes <= 0 || w.KillAfter.Duration <= 0 {
 			return errors.New("kill_during_write requires writer_bytes and kill_after")
 		}
+	case "cp_perf":
+		if err := validateCPPerfWorkload(w); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("invalid workload type %q", w.Type)
+	}
+	return nil
+}
+
+func validateCPPerfWorkload(w Workload) error {
+	for _, size := range w.FileSizesMiB {
+		if size <= 0 {
+			return fmt.Errorf("cp_perf file_sizes_mib must be > 0, got %d", size)
+		}
+	}
+	maxConcurrency := 0
+	for _, concurrency := range w.ConcurrencyLevels {
+		if concurrency <= 0 {
+			return fmt.Errorf("cp_perf concurrency_levels must be > 0, got %d", concurrency)
+		}
+		if concurrency > maxConcurrency {
+			maxConcurrency = concurrency
+		}
+	}
+	for _, mode := range w.Modes {
+		if !oneOf(mode, "upload_warm", "download_file", "download_null", "upload_cold", "upload_stdin", "download_fsync") {
+			return fmt.Errorf("invalid cp_perf mode %q", mode)
+		}
+	}
+	if w.TransfersPerScenario < 0 {
+		return errors.New("cp_perf transfers_per_scenario must be >= 0")
+	}
+	if w.TransfersPerScenario > 0 && maxConcurrency > w.TransfersPerScenario {
+		return fmt.Errorf("cp_perf transfers_per_scenario %d must be >= max concurrency %d", w.TransfersPerScenario, maxConcurrency)
+	}
+	if w.RemoteRoot != "" {
+		if err := ValidateRelativeSlashPath("cp_perf remote_root", w.RemoteRoot); err != nil {
+			return err
+		}
+	}
+	if w.ArtifactRoot != "" {
+		if err := ValidateRelativeSlashPath("cp_perf artifact_root", w.ArtifactRoot); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -382,8 +433,8 @@ func validateOracle(w Workload, o OracleSpec) error {
 			return errors.New("dual_mount_visibility oracle requires dual_mount_visibility workload")
 		}
 	case "throughput_min":
-		if w.Type != "fio" && w.Type != "parallel_writes" {
-			return errors.New("throughput_min oracle requires fio or parallel_writes workload")
+		if w.Type != "fio" && w.Type != "parallel_writes" && w.Type != "cp_perf" {
+			return errors.New("throughput_min oracle requires fio, parallel_writes, or cp_perf workload")
 		}
 	case "file_count_equals":
 		if w.Type != "small_file_storm" {

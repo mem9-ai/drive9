@@ -1,13 +1,56 @@
 package report
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestPerfScenarioLessOrdersCPPerfByWorkloadThenNumericSize(t *testing.T) {
+	scenarios := []PerfScenario{
+		{CaseID: "cp", Workload: "download_file", ScenarioID: "download_file-100mib-c001"},
+		{CaseID: "cp", Workload: "download_file", ScenarioID: "download_file-1024mib-c001"},
+		{CaseID: "cp", Workload: "upload_warm", ScenarioID: "upload_warm-100mib-c001"},
+		{CaseID: "cp", Workload: "upload_warm", ScenarioID: "upload_warm-50mib-c001"},
+		{CaseID: "cp", Workload: "download_file", ScenarioID: "download_file-50mib-c001"},
+	}
+	sort.Slice(scenarios, func(i, j int) bool {
+		return perfScenarioLess(scenarios[i], scenarios[j])
+	})
+	got := []string{}
+	for _, scenario := range scenarios {
+		got = append(got, scenario.ScenarioID)
+	}
+	want := []string{
+		"upload_warm-50mib-c001",
+		"upload_warm-100mib-c001",
+		"download_file-50mib-c001",
+		"download_file-100mib-c001",
+		"download_file-1024mib-c001",
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sorted scenarios = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestPerfMarkdownOutputPathUsesTitleSlug(t *testing.T) {
+	got := PerfMarkdownOutputPath("/tmp/run", "Drive9 fs cp Bottleneck 1 GiB Matrix Report", "")
+	want := filepath.Join("/tmp/run", "perf", "drive9-fs-cp-bottleneck-1-gib-matrix-report.md")
+	if got != want {
+		t.Fatalf("output path = %q, want %q", got, want)
+	}
+	override := "/tmp/custom/report.md"
+	if got := PerfMarkdownOutputPath("/tmp/run", "ignored", override); got != override {
+		t.Fatalf("output override = %q, want %q", got, override)
+	}
+}
 
 func TestGenerateKnownBugNonGating(t *testing.T) {
 	dir := t.TempDir()
@@ -219,7 +262,8 @@ func TestGeneratePerfReportFromResults(t *testing.T) {
 	if _, _, err := Generate(dir); err != nil {
 		t.Fatal(err)
 	}
-	report, err := GeneratePerfReport(dir, PerfOptions{Title: "Drive9 Upload and Download Performance Test Report"})
+	title := "Drive9 Upload and Download Performance Test Report"
+	report, err := GeneratePerfReport(dir, PerfOptions{Title: title})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,14 +273,24 @@ func TestGeneratePerfReportFromResults(t *testing.T) {
 	if report.Infrastructure.StorageType != "gp3" || report.Infrastructure.StorageIOPS != "3000" {
 		t.Fatalf("infrastructure = %+v", report.Infrastructure)
 	}
-	body, err := os.ReadFile(filepath.Join(dir, "perf", "customer-report.md"))
+	var upload PerfScenario
+	for _, scenario := range report.Scenarios {
+		if scenario.Workload == "upload" {
+			upload = scenario
+			break
+		}
+	}
+	if upload.LatencyMin != 100 || upload.LatencyMax != 200 {
+		t.Fatalf("upload latency min/max = %v/%v, want 100/200", upload.LatencyMin, upload.LatencyMax)
+	}
+	body, err := os.ReadFile(PerfMarkdownOutputPath(dir, title, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(body)
-	for _, want := range []string{"| Case | Workload | Load | Success | QPS | Throughput | Avg | p50 | p95 | p99 | Gate |", "gp3", "125 MiB/s", "upload", "download"} {
+	for _, want := range []string{"| Case | Workload | Load | Success | QPS | Throughput | Min | Avg | p50 | p95 | p99 | Max | Gate |", "gp3", "125 MiB/s", "upload", "download"} {
 		if !strings.Contains(text, want) {
-			t.Fatalf("customer report missing %q:\n%s", want, text)
+			t.Fatalf("performance report missing %q:\n%s", want, text)
 		}
 	}
 }
@@ -255,12 +309,57 @@ func TestGeneratePerfReportMissingEnvironmentUsesUnknown(t *testing.T) {
 	if report.Environment.StorageIOPS != "unknown" || report.Infrastructure.StorageThroughput != "unknown" {
 		t.Fatalf("environment = %+v infrastructure = %+v", report.Environment, report.Infrastructure)
 	}
-	body, err := os.ReadFile(filepath.Join(dir, "perf", "customer-report.md"))
+	body, err := os.ReadFile(PerfMarkdownOutputPath(dir, "", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(body), "| Storage IOPS | unknown |") {
-		t.Fatalf("customer report missing unknown storage field:\n%s", string(body))
+		t.Fatalf("performance report missing unknown storage field:\n%s", string(body))
+	}
+}
+
+func TestRootVolumeIDFromDescribeInstances(t *testing.T) {
+	var resp awsDescribeInstancesResponse
+	body := []byte(`{
+	  "Reservations": [{
+	    "Instances": [{
+	      "RootDeviceName": "/dev/sda1",
+	      "BlockDeviceMappings": [
+	        {"DeviceName": "/dev/xvdb", "Ebs": {"VolumeId": "vol-data"}},
+	        {"DeviceName": "/dev/sda1", "Ebs": {"VolumeId": "vol-root"}}
+	      ]
+	    }]
+	  }]
+	}`)
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if got := rootVolumeIDFromDescribeInstances(resp); got != "vol-root" {
+		t.Fatalf("root volume id = %q, want vol-root", got)
+	}
+}
+
+func TestPerfEnvironmentAppliesEBSVolume(t *testing.T) {
+	env := PerfEnvironment{
+		StorageType:       unknown(),
+		StorageSize:       unknown(),
+		StorageIOPS:       unknown(),
+		StorageThroughput: unknown(),
+		StorageEncrypted:  unknown(),
+	}
+	env.applyEBSVolume(awsEBSVolume{
+		VolumeType: "gp3",
+		Size:       200,
+		IOPS:       8000,
+		Throughput: 2000,
+		Encrypted:  false,
+	})
+	if env.StorageType != "gp3" ||
+		env.StorageSize != "200 GiB" ||
+		env.StorageIOPS != "8000" ||
+		env.StorageThroughput != "2000 MiB/s" ||
+		env.StorageEncrypted != "false" {
+		t.Fatalf("environment storage fields = %+v", env)
 	}
 }
 
@@ -281,14 +380,49 @@ func TestGeneratePerfReportFailedScenarioRendersNA(t *testing.T) {
 	if report.OverallStatus != "FAIL" || report.Scenarios[0].GateStatus != "fail" {
 		t.Fatalf("report status=%s scenario=%+v", report.OverallStatus, report.Scenarios[0])
 	}
-	body, err := os.ReadFile(filepath.Join(dir, "perf", "customer-report.md"))
+	body, err := os.ReadFile(PerfMarkdownOutputPath(dir, "", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(body)
-	for _, want := range []string{"| failing | upload | 1 operations | 0/1 | N/A | N/A | N/A | N/A | N/A | N/A | fail |", "failure_class=product"} {
+	for _, want := range []string{"| failing | upload | 1 operations | 0/1 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | fail |", "failure_class=product"} {
 		if !strings.Contains(text, want) {
-			t.Fatalf("customer report missing %q:\n%s", want, text)
+			t.Fatalf("performance report missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestGeneratePerfReportCPPerfObservations(t *testing.T) {
+	dir := t.TempDir()
+	rec := newPerfRun(t, dir, "run1", "cp-bottleneck")
+	addPerfResult(t, rec, "cp-bottleneck", "upload_warm-50mib-c001", "op-1", "cp.upload_warm", "ok", "2026-01-01T00:00:00Z", 1000, 50<<20, 7, "")
+	addPerfResult(t, rec, "cp-bottleneck", "upload_warm-50mib-c002", "op-2", "cp.upload_warm", "ok", "2026-01-01T00:00:02Z", 1000, 50<<20, 7, "")
+	addPerfResult(t, rec, "cp-bottleneck", "upload_warm-50mib-c002", "op-3", "cp.upload_warm", "ok", "2026-01-01T00:00:02Z", 1000, 50<<20, 7, "")
+	for i := 0; i < 4; i++ {
+		addPerfResult(t, rec, "cp-bottleneck", "upload_warm-50mib-c004", "op-c4-"+string(rune('0'+i)), "cp.upload_warm", "ok", "2026-01-01T00:00:04Z", 2000, 50<<20, 7, "")
+	}
+	if _, _, err := Generate(dir); err != nil {
+		t.Fatal(err)
+	}
+	report, err := GeneratePerfReport(dir, PerfOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Observations) != 1 || !strings.Contains(report.Observations[0], "classification=inconclusive") {
+		t.Fatalf("observations = %+v", report.Observations)
+	}
+	body, err := os.ReadFile(PerfMarkdownOutputPath(dir, "", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		"This phase runs 50 MiB files, concurrency 1, 2, and 4, with `upload_warm`.",
+		"| cp-bottleneck | upload_warm | 50 MiB, concurrency 4, 4 transfers |",
+		"classification=inconclusive",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("performance report missing %q:\n%s", want, text)
 		}
 	}
 }

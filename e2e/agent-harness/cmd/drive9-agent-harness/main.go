@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/mem9-ai/dat9/e2e/agent-harness/internal/report"
 	"github.com/mem9-ai/dat9/e2e/agent-harness/internal/runner"
 )
 
@@ -33,17 +34,15 @@ func main() {
 		fs := flag.NewFlagSet("report", flag.ExitOnError)
 		runDir := fs.String("run-dir", "", "existing run directory")
 		format := fs.String("format", "summary", "report format: summary or customer-perf")
-		title := fs.String("title", "", "customer report title")
-		output := fs.String("output", "", "customer report output path")
+		title := fs.String("title", "", "performance report title")
+		output := fs.String("output", "", "performance report output path")
 		exitOnErr(fs.Parse(os.Args[2:]))
 		if *runDir == "" {
 			exitOnErr(fmt.Errorf("report requires --run-dir"))
 		}
 		exitOnErr(runner.Report(runner.ReportConfig{RunDir: *runDir, Format: *format, Title: *title, Output: *output}))
-		if *format == "customer-perf" && *output != "" {
-			fmt.Println(*output)
-		} else if *format == "customer-perf" {
-			fmt.Println(*runDir + "/perf/customer-report.md")
+		if *format == "customer-perf" {
+			fmt.Println(report.PerfMarkdownOutputPath(*runDir, *title, *output))
 		} else {
 			fmt.Println(*runDir)
 		}
@@ -123,7 +122,7 @@ func parsePublishPerf(args []string) (runner.PublishPerfConfig, error) {
 	fs.StringVar(&cfg.Drive9Bin, "drive9-bin", "drive9", "drive9 binary")
 	fs.StringVar(&cfg.Server, "server", os.Getenv("DRIVE9_BASE"), "Drive9 server URL")
 	fs.StringVar(&cfg.APIKey, "api-key", os.Getenv("DRIVE9_API_KEY"), "Drive9 API key")
-	fs.StringVar(&cfg.Title, "title", "", "customer report title")
+	fs.StringVar(&cfg.Title, "title", "", "performance report title")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}

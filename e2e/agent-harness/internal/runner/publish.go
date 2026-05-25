@@ -91,7 +91,8 @@ func PublishPerf(ctx context.Context, cfg PublishPerfConfig) (PublishManifest, e
 	}
 	env := mountproc.Env{Server: cfg.Server, APIKey: cfg.APIKey}
 	remoteRunPath := publishRunPath(rootPath, manifest, perfReport)
-	files, err := collectPublishFiles(cfg.RunDir)
+	reportRelPath := path.Join("perf", report.PerfMarkdownFilename(perfReport.Title))
+	files, err := collectPublishFiles(cfg.RunDir, reportRelPath)
 	if err != nil {
 		return PublishManifest{}, err
 	}
@@ -163,7 +164,7 @@ func PublishPerf(ctx context.Context, cfg PublishPerfConfig) (PublishManifest, e
 		Workload:        workloadName(perfReport),
 		ServiceEndpoint: perfReport.Environment.ServerEndpoint,
 		GateStatus:      perfReport.OverallStatus,
-		ReportPath:      ":" + path.Join(remoteRunPath, "perf", "customer-report.md"),
+		ReportPath:      ":" + path.Join(remoteRunPath, reportRelPath),
 		SummaryPath:     ":" + path.Join(remoteRunPath, "perf", "summary.json"),
 		PublishedAt:     publishedAt,
 	}
@@ -173,7 +174,7 @@ func PublishPerf(ctx context.Context, cfg PublishPerfConfig) (PublishManifest, e
 	return pub, nil
 }
 
-func collectPublishFiles(runDir string) ([]publishFile, error) {
+func collectPublishFiles(runDir, reportRelPath string) ([]publishFile, error) {
 	seen := map[string]bool{}
 	var files []publishFile
 	add := func(rel string) error {
@@ -204,7 +205,7 @@ func collectPublishFiles(runDir string) ([]publishFile, error) {
 		"summary.json",
 		"gating.json",
 		"summary.md",
-		"perf/customer-report.md",
+		reportRelPath,
 		"perf/environment.json",
 		"perf/results.jsonl",
 		"perf/summary.json",

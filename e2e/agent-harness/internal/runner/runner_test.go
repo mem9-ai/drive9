@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -68,6 +69,248 @@ func TestFioWriteBytesPerSecond(t *testing.T) {
 	if got != 133.5 {
 		t.Fatalf("bw = %v, want 133.5", got)
 	}
+}
+
+func TestCPPerfRequestUnitsAndScenarioID(t *testing.T) {
+	if got := cpPerfRequestUnits(50 << 20); got != 7 {
+		t.Fatalf("50 MiB request units = %v, want 7", got)
+	}
+	if got := cpPerfRequestUnits(100 << 20); got != 13 {
+		t.Fatalf("100 MiB request units = %v, want 13", got)
+	}
+	if got := cpPerfRequestUnits(1024 << 20); got != 128 {
+		t.Fatalf("1024 MiB request units = %v, want 128", got)
+	}
+	if got := cpPerfScenarioID("download_file", 50, 8); got != "download_file-50mib-c008" {
+		t.Fatalf("scenario ID = %q", got)
+	}
+	if got := cpPerfScenarioID("upload_warm", 1024, 32); got != "upload_warm-1024mib-c032" {
+		t.Fatalf("scenario ID = %q", got)
+	}
+}
+
+func TestRunCPPerfWithFakeDrive9RecordsRows(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX fake drive9 script")
+	}
+	dir := t.TempDir()
+	bin := fakeCPPerfDrive9(t, dir, "")
+	suiteDir := writeCPPerfSuite(t, dir, "upload_warm,download_file,download_null", 2)
+	runDir, err := Run(context.Background(), Config{
+		ArtifactRoot:   dir,
+		MountRoot:      filepath.Join(dir, "mounts"),
+		RemoteRootBase: "/agent-test-$RUN_ID",
+		Drive9Bin:      bin,
+		Server:         "http://127.0.0.1:1",
+		APIKey:         "test-key",
+		SuiteDir:       suiteDir,
+		Suites:         []string{"stress"},
+		CaseFilter:     "cp-test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := readPerfResultsForTest(t, filepath.Join(runDir, "perf", "results.jsonl"))
+	if len(results) != 6 {
+		t.Fatalf("perf rows = %d, want 6", len(results))
+	}
+	for _, result := range results {
+		if result.Status != "ok" {
+			t.Fatalf("result = %+v, want ok", result)
+		}
+		if result.RequestUnits != 1 {
+			t.Fatalf("request units = %v, want 1", result.RequestUnits)
+		}
+		if len(result.ArtifactRefs) == 0 {
+			t.Fatalf("artifact refs empty for %+v", result)
+		}
+	}
+	downloadDir := filepath.Join(runDir, "perf", "cp_perf", "cp-test", "downloads", "download_file-1mib-c002")
+	if _, err := os.Stat(downloadDir); !os.IsNotExist(err) {
+		t.Fatalf("download dir stat err = %v, want not exist", err)
+	}
+}
+
+func TestRunCPPerfRecordsFailedTransfer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX fake drive9 script")
+	}
+	dir := t.TempDir()
+	bin := fakeCPPerfDrive9(t, dir, "transfer-0002.bin")
+	suiteDir := writeCPPerfSuite(t, dir, "upload_warm", 2)
+	runDir, err := Run(context.Background(), Config{
+		ArtifactRoot:   dir,
+		MountRoot:      filepath.Join(dir, "mounts"),
+		RemoteRootBase: "/agent-test-$RUN_ID",
+		Drive9Bin:      bin,
+		Server:         "http://127.0.0.1:1",
+		APIKey:         "test-key",
+		SuiteDir:       suiteDir,
+		Suites:         []string{"stress"},
+		CaseFilter:     "cp-test",
+	})
+	if !errors.Is(err, ErrGateFailed) {
+		t.Fatalf("err = %v, want ErrGateFailed", err)
+	}
+	results := readPerfResultsForTest(t, filepath.Join(runDir, "perf", "results.jsonl"))
+	if len(results) != 2 {
+		t.Fatalf("perf rows = %d, want 2", len(results))
+	}
+	failed := 0
+	for _, result := range results {
+		if result.Status == "failed" {
+			failed++
+			if !strings.Contains(result.Error, "forced cp failure") {
+				t.Fatalf("error = %q, want forced cp failure", result.Error)
+			}
+		}
+	}
+	if failed != 1 {
+		t.Fatalf("failed rows = %d, want 1", failed)
+	}
+}
+
+func TestCPPerfMissingTelemetryToolsWriteNotes(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", dir)
+	evidence, err := newCPPerfEvidence(dir, filepath.Join(dir, "perf", "evidence", "scenario"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	telemetry, err := evidence.start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	telemetry.stop(context.Background())
+	if err := evidence.writeNotes(); err != nil {
+		t.Fatal(err)
+	}
+	notes, err := os.ReadFile(filepath.Join(dir, "perf", "evidence", "scenario", "notes.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(notes), "pidstat unavailable") {
+		t.Fatalf("notes = %s, want missing pidstat note", string(notes))
+	}
+}
+
+func fakeCPPerfDrive9(t *testing.T, dir, failToken string) string {
+	t.Helper()
+	bin := filepath.Join(dir, "drive9")
+	script := `#!/usr/bin/env sh
+if [ "$1" = "--version" ]; then
+  echo fake-drive9
+  exit 0
+fi
+if [ "$1" = "fs" ] && [ "$2" = "mkdir" ]; then
+  exit 0
+fi
+if [ "$1" = "fs" ] && [ "$2" = "rm" ]; then
+  exit 0
+fi
+if [ "$1" = "fs" ] && [ "$2" = "cp" ]; then
+  fail_token="` + failToken + `"
+  if [ -n "$fail_token" ]; then
+    case "$3 $4" in
+      *"$fail_token"*)
+        echo forced cp failure >&2
+        exit 7
+        ;;
+    esac
+  fi
+  if [ "$3" = "-" ]; then
+    cat >/dev/null
+  fi
+  case "$4" in
+    :*)
+      ;;
+    -)
+      printf fake-download
+      ;;
+    /dev/null)
+      ;;
+    *)
+      mkdir -p "$(dirname "$4")"
+      printf fake-download > "$4"
+      ;;
+  esac
+  exit 0
+fi
+echo "unexpected fake drive9 command: $*" >&2
+exit 2
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+func writeCPPerfSuite(t *testing.T, dir, modes string, transfers int) string {
+	t.Helper()
+	suiteDir := filepath.Join(dir, "cases")
+	if err := os.MkdirAll(suiteDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var modeLines strings.Builder
+	for _, mode := range strings.Split(modes, ",") {
+		mode = strings.TrimSpace(mode)
+		if mode == "" {
+			continue
+		}
+		modeLines.WriteString("        - " + mode + "\n")
+	}
+	body := `defaults:
+  timeout: 2m
+  cleanup: always
+cases:
+  - id: cp-test
+    suite: stress
+    expected_outcome: baseline_pass
+    remote_root_suffix: cp-test
+    mountpoint_suffix: cp-test
+    workload:
+      type: cp_perf
+      file_sizes_mib:
+        - 1
+      concurrency_levels:
+        - 2
+      modes:
+` + modeLines.String() + `      transfers_per_scenario: ` + fmtInt(transfers) + `
+      collect_host_telemetry: false
+      min_bytes_per_second: 1
+    oracles:
+      - type: throughput_min
+    severity:
+      failure: P2
+`
+	if err := os.WriteFile(filepath.Join(suiteDir, "stress.yaml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return suiteDir
+}
+
+func readPerfResultsForTest(t *testing.T, path string) []report.PerfResult {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []report.PerfResult
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var result report.PerfResult
+		if err := json.Unmarshal([]byte(line), &result); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, result)
+	}
+	return out
+}
+
+func fmtInt(v int) string {
+	return strconv.Itoa(v)
 }
 
 func TestRunReturnsGateFailed(t *testing.T) {
@@ -210,7 +453,7 @@ func TestPublishPerfUploadsBundleAndIndex(t *testing.T) {
 	if pub.Status != "succeeded" {
 		t.Fatalf("publish status = %q", pub.Status)
 	}
-	if pub.ArtifactPaths["perf/customer-report.md"] == "" || pub.ArtifactPaths["perf/publish-manifest.json"] == "" {
+	if pub.ArtifactPaths["perf/drive9-performance-test-report.md"] == "" || pub.ArtifactPaths["perf/publish-manifest.json"] == "" {
 		t.Fatalf("artifact paths = %+v", pub.ArtifactPaths)
 	}
 	logBytes, err := os.ReadFile(logPath)
@@ -218,7 +461,7 @@ func TestPublishPerfUploadsBundleAndIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	logText := string(logBytes)
-	for _, want := range []string{"fs cp", "perf/customer-report.md", "index.json"} {
+	for _, want := range []string{"fs cp", "perf/drive9-performance-test-report.md", "index.json"} {
 		if !strings.Contains(logText, want) {
 			t.Fatalf("drive9 log missing %q:\n%s", want, logText)
 		}
@@ -370,7 +613,7 @@ func TestPublishIndexJSONShape(t *testing.T) {
 		Entries: []publishIndexEntry{{
 			Title:      "title",
 			RunID:      "run1",
-			ReportPath: ":/performance-reports/stress/2026-01-01/run1/perf/customer-report.md",
+			ReportPath: ":/performance-reports/stress/2026-01-01/run1/perf/drive9-performance-test-report.md",
 		}},
 	}
 	b, err := json.Marshal(entry)
