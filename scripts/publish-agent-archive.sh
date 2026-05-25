@@ -94,6 +94,11 @@ fetch_archive_branch() {
   git fetch --quiet origin "refs/heads/${branch}:refs/remotes/origin/${branch}"
 }
 
+archive_branch_tip() {
+  fetch_archive_branch
+  git rev-parse "refs/remotes/origin/${branch}^{commit}"
+}
+
 checksums_object() {
   local checksums_file=$1
   jq -Rn '
@@ -373,6 +378,13 @@ publish_latest_index() {
   local commit_path="${archive_root}/commits/${sha}"
   local remote_manifest="${work_root}/latest-source-manifest-${sha}.json"
   local latest_manifest="${work_root}/latest.json"
+  local branch_tip
+
+  branch_tip="$(archive_branch_tip)"
+  if [ "$sha" != "$branch_tip" ]; then
+    info "skip latest index ${latest_index}; ${sha} is not current origin/${branch} tip ${branch_tip}"
+    return
+  fi
 
   remote_cat "${commit_path}/manifest.json" "$remote_manifest" >/dev/null
   jq -n \
