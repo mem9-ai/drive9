@@ -667,6 +667,7 @@ func (fs *Dat9FS) clearPendingModeForInodeExcept(ino uint64, skip *FileHandle) {
 		h.Lock()
 		h.HasPendingMode = false
 		h.HasPreviousMode = false
+		h.PreviousModeKnown = false
 		h.Unlock()
 	}
 }
@@ -694,9 +695,11 @@ func (fs *Dat9FS) applyPendingModeForHandleLocked(ctx context.Context, fh *FileH
 	ino := fh.Ino
 	previousMode := fh.PreviousMode
 	hasPreviousMode := fh.HasPreviousMode
+	previousModeKnown := fh.PreviousModeKnown
 	if !shouldApplyRemoteMode(fs.pendingKindForHandle(fh), hasMode, mode) {
 		fh.HasPendingMode = false
 		fh.HasPreviousMode = false
+		fh.PreviousModeKnown = false
 		fh.Unlock()
 		fs.clearPendingModeForInodeExcept(ino, fh)
 		fh.Lock()
@@ -710,12 +713,13 @@ func (fs *Dat9FS) applyPendingModeForHandleLocked(ctx context.Context, fh *FileH
 	fh.Lock()
 	if err != nil {
 		if hasPreviousMode {
-			fs.inodes.UpdateMode(ino, previousMode)
+			fs.inodes.SetModeState(ino, previousMode, previousModeKnown)
 		}
 		return err
 	}
 	fh.HasPendingMode = false
 	fh.HasPreviousMode = false
+	fh.PreviousModeKnown = false
 	fh.Unlock()
 	fs.clearPendingModeForInodeExcept(ino, fh)
 	fh.Lock()
@@ -2232,8 +2236,13 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				h.PendingMode = mode
 				h.HasPendingMode = true
 				if !h.HasPreviousMode {
-					h.PreviousMode = entry.Mode
+					if entry.HasMode {
+						h.PreviousMode = entry.Mode
+					} else {
+						h.PreviousMode = 0
+					}
 					h.HasPreviousMode = true
+					h.PreviousModeKnown = entry.HasMode
 				}
 			}
 			h.Unlock()
@@ -4508,6 +4517,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			ino := fh.Ino
 			fh.HasPendingMode = false
 			fh.HasPreviousMode = false
+			fh.PreviousModeKnown = false
 			fh.Unlock()
 			fs.clearPendingModeForInodeExcept(ino, fh)
 			fh.Lock()
@@ -4552,6 +4562,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			pendingMode := fh.PendingMode & 0o777
 			previousMode := fh.PreviousMode
 			hasPreviousMode := fh.HasPreviousMode
+			previousModeKnown := fh.PreviousModeKnown
 			ino := fh.Ino
 			localPath := fh.Path
 			fh.Unlock()
@@ -4566,7 +4577,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				if err != nil {
 					log.Printf("release: pending chmod failed for %s: %v", localPath, err)
 					if hasPreviousMode {
-						fs.inodes.UpdateMode(ino, previousMode)
+						fs.inodes.SetModeState(ino, previousMode, previousModeKnown)
 					}
 					return
 				}
@@ -4576,7 +4587,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 
 			// Flush failed — revert the in-memory mode so local GetAttr doesn't lie.
 			if hasPreviousMode {
-				fs.inodes.UpdateMode(ino, previousMode)
+				fs.inodes.SetModeState(ino, previousMode, previousModeKnown)
 			}
 			fs.clearPendingModeForInode(ino)
 		}()

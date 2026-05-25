@@ -558,6 +558,67 @@ func TestWriteBackUploader_ChmodFailureRetainsCache(t *testing.T) {
 	if _, ok := cache.Get("/mode-fail.txt"); !ok {
 		t.Fatal("cache entry should be retained after chmod failure")
 	}
+	meta, ok := cache.GetMeta("/mode-fail.txt")
+	if !ok {
+		t.Fatal("cache metadata should be retained after chmod failure")
+	}
+	if meta.Kind != PendingChmod {
+		t.Fatalf("meta kind = %v, want PendingChmod", meta.Kind)
+	}
+}
+
+func TestWriteBackUploader_ChmodFailureRetryDoesNotReuploadData(t *testing.T) {
+	var putCalls atomic.Int32
+	var chmodCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			if putCalls.Add(1) > 1 {
+				http.Error(w, "unexpected data reupload", http.StatusConflict)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
+			if chmodCalls.Add(1) == 1 {
+				http.Error(w, "chmod failed", http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := newTestClient(ts.URL)
+	uploader := NewWriteBackUploader(c, cache, 1)
+
+	_ = cache.PutWithBaseRevAndMode("/mode-retry.txt", []byte("data"), 4, PendingNew, 0, 0o755, true)
+	uploader.Submit("/mode-retry.txt")
+	uploader.DrainAll()
+
+	meta, ok := cache.GetMeta("/mode-retry.txt")
+	if !ok {
+		t.Fatal("cache metadata should be retained after first chmod failure")
+	}
+	if meta.Kind != PendingChmod {
+		t.Fatalf("meta kind after first attempt = %v, want PendingChmod", meta.Kind)
+	}
+
+	uploader.Submit("/mode-retry.txt")
+	uploader.DrainAll()
+
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("PUT calls = %d, want 1", got)
+	}
+	if got := chmodCalls.Load(); got != 2 {
+		t.Fatalf("chmod calls = %d, want 2", got)
+	}
+	if _, ok := cache.GetMeta("/mode-retry.txt"); ok {
+		t.Fatal("cache metadata should be removed after chmod retry succeeds")
+	}
 }
 
 func TestWriteBackUploaderSkipsDefaultModeForPendingNew(t *testing.T) {

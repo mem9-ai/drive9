@@ -50,6 +50,9 @@ const (
 	// retries). The local data is preserved for manual recovery but will
 	// not be re-enqueued by RecoverPending.
 	PendingConflict
+	// PendingChmod means file data has already been uploaded remotely, but
+	// the post-upload chmod step still needs to be retried.
+	PendingChmod
 )
 
 // WriteBackMeta stores metadata alongside cached file data so that the
@@ -364,6 +367,34 @@ func (c *WriteBackCache) UpdateMode(remotePath string, mode uint32) error {
 	cp := updated
 	c.metas[remotePath] = &cp
 	return nil
+}
+
+// MarkChmodPending records that data has reached the remote server and only
+// the chmod step remains. The generation guard prevents an old upload from
+// overwriting metadata for a newer local write.
+func (c *WriteBackCache) MarkChmodPending(remotePath string, generation uint64) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	meta, ok := c.metas[remotePath]
+	if !ok || meta.Generation != generation {
+		return false, nil
+	}
+	updated := *meta
+	updated.Kind = PendingChmod
+	updated.BaseRev = 0
+	updated.Generation = c.nextGen.Add(1)
+
+	metaBytes, err := json.Marshal(updated)
+	if err != nil {
+		return false, fmt.Errorf("writeback marshal chmod-pending meta: %w", err)
+	}
+	if err := atomicWrite(c.metaFile(remotePath), metaBytes); err != nil {
+		return false, fmt.Errorf("writeback update chmod-pending meta: %w", err)
+	}
+	cp := updated
+	c.metas[remotePath] = &cp
+	return true, nil
 }
 
 // RenamePending atomically moves a pending cache entry from oldPath to newPath.

@@ -3179,6 +3179,69 @@ func TestCreateDefaultModeDoesNotStageRemoteMode(t *testing.T) {
 	}
 }
 
+func TestDeferredChmodRollbackRestoresUnknownMode(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.RawQuery == "chmod" {
+			http.Error(w, "chmod failed", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/rollback.txt", false, 4, time.Now())
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode not found")
+	}
+	if entry.HasMode {
+		t.Fatal("test setup expected unknown mode")
+	}
+
+	wb := NewWriteBuffer("/rollback.txt", maxPreloadSize, 0)
+	if _, err := wb.Write(0, []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/rollback.txt",
+		Dirty:   wb,
+		BaseRev: 3,
+	}
+	fs.fileHandles.Allocate(fh)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MODE,
+			Mode:     0o755,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	fh.Lock()
+	err := fs.applyPendingModeForHandleLocked(context.Background(), fh)
+	fh.Unlock()
+	if err == nil {
+		t.Fatal("applyPendingModeForHandleLocked should fail")
+	}
+
+	entry, ok = fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode not found after rollback")
+	}
+	if entry.HasMode {
+		t.Fatalf("rollback should restore unknown mode, got mode=%o", entry.Mode)
+	}
+}
+
 func TestLookupPendingIndexPreservesMode(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()

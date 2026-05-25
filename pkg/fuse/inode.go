@@ -250,12 +250,17 @@ func (m *InodeToPath) UpdateRevision(ino uint64, revision int64) {
 
 // UpdateMode updates the permission bits of the entry identified by ino.
 func (m *InodeToPath) UpdateMode(ino uint64, mode uint32) {
+	m.SetModeState(ino, mode, true)
+}
+
+// SetModeState updates both permission bits and whether they are authoritative.
+func (m *InodeToPath) SetModeState(ino uint64, mode uint32, hasMode bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Mode = mode
-		entry.HasMode = true
+		entry.HasMode = hasMode
 	}
 }
 

@@ -202,6 +202,9 @@ func expectedRevisionForWriteBack(meta *WriteBackMeta) (int64, error) {
 	if meta == nil {
 		return -1, fmt.Errorf("missing writeback metadata")
 	}
+	if meta.Kind == PendingChmod {
+		return -1, fmt.Errorf("data already uploaded for %s; chmod pending", meta.Path)
+	}
 	if meta.Kind == PendingNew {
 		return 0, nil
 	}
@@ -257,6 +260,11 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		return // Already uploaded or removed.
 	}
 	gen := meta.Generation
+
+	if meta.Kind == PendingChmod {
+		u.applyPendingChmod(context.Background(), localPath, meta, gen, false)
+		return
+	}
 
 	data, ok := u.cache.getView(localPath)
 	if !ok {
@@ -320,6 +328,11 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		if u.perf != nil {
 			u.perf.uploaderFailure.add(1)
 		}
+		if updated, err := u.cache.MarkChmodPending(localPath, gen); err != nil {
+			log.Printf("writeback upload chmod-pending meta update failed for %s: %v", localPath, err)
+		} else if updated {
+			log.Printf("writeback upload data committed for %s; chmod remains pending", localPath)
+		}
 		log.Printf("%v (will retry on next mount)", modeErr)
 		return
 	}
@@ -350,6 +363,10 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 	}
 	gen := meta.Generation
 
+	if meta.Kind == PendingChmod {
+		return u.applyPendingChmod(ctx, localPath, meta, gen, true)
+	}
+
 	data, ok := u.cache.getView(localPath)
 	if !ok {
 		return nil
@@ -377,6 +394,9 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 		if u.perf != nil {
 			u.perf.uploaderFailure.add(1)
 		}
+		if _, markErr := u.cache.MarkChmodPending(localPath, gen); markErr != nil {
+			return fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
+		}
 		return err
 	}
 	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -390,6 +410,31 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 	}
 
 	// Only remove if generation matches — a concurrent Put() may have written newer data.
+	curMeta, ok := u.cache.GetMeta(localPath)
+	if ok && curMeta.Generation == gen {
+		u.cache.Remove(localPath)
+	}
+	if u.perf != nil {
+		u.perf.uploaderSuccess.add(1)
+	}
+	return nil
+}
+
+func (u *WriteBackUploader) applyPendingChmod(ctx context.Context, localPath string, meta *WriteBackMeta, gen uint64, sync bool) error {
+	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
+	err := u.applyMode(chmodCtx, meta)
+	chmodCancel()
+	if err != nil {
+		if u.perf != nil {
+			u.perf.uploaderFailure.add(1)
+		}
+		if sync {
+			return err
+		}
+		log.Printf("%v (chmod remains pending)", err)
+		return nil
+	}
+
 	curMeta, ok := u.cache.GetMeta(localPath)
 	if ok && curMeta.Generation == gen {
 		u.cache.Remove(localPath)
