@@ -108,6 +108,14 @@ func fsMountCmd(args []string) error {
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
 	debug := fs.Bool("debug", false, "enable FUSE debug logging")
 	perfCounters := fs.Bool("perf-counters", false, "print FUSE perf counter summary on unmount")
+	perfJSONL := fs.String("perf-jsonl", "", "write continuous mount performance samples to a JSONL file")
+	perfInterval := fs.Duration("perf-interval", 0, "continuous performance sample interval (default 10s when --perf-jsonl is set)")
+	perfMaxSamples := fs.Int("perf-max-samples", 0, "maximum samples per continuous perf JSONL segment (default 7200 when --perf-jsonl is set)")
+	profileCPU := fs.String("profile-cpu", "", "write CPU profile to file for the mount lifetime")
+	profileHeap := fs.String("profile-heap", "", "write final heap profile to file on unmount")
+	profileDir := fs.String("profile-dir", "", "directory for periodic mount profiles")
+	profileHeapInterval := fs.Duration("profile-heap-interval", 0, "periodically write heap profiles at this interval (requires --profile-dir)")
+	pprofAddr := fs.String("pprof-addr", "", "serve live pprof on this address, e.g. 127.0.0.1:6060")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: drive9 mount [flags] [:/remote] <mountpoint>\n\nflags:\n")
@@ -164,6 +172,18 @@ func fsMountCmd(args []string) error {
 	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
 		return err
 	}
+	if flagProvided(fs, "perf-interval") && *perfInterval <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-interval must be > 0")
+	}
+	if flagProvided(fs, "perf-interval") && *perfJSONL == "" {
+		return fmt.Errorf("drive9 mount: --perf-interval requires --perf-jsonl")
+	}
+	if flagProvided(fs, "perf-max-samples") && *perfMaxSamples <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-max-samples must be > 0")
+	}
+	if flagProvided(fs, "perf-max-samples") && *perfJSONL == "" {
+		return fmt.Errorf("drive9 mount: --perf-max-samples requires --perf-jsonl")
+	}
 	syncModeVal, writePolicyVal, err := parseFuseDurability(*durability)
 	if err != nil {
 		return err
@@ -212,6 +232,9 @@ func fsMountCmd(args []string) error {
 	if resolved == MountModeWebDAV {
 		if *durability != string(fuseDurabilityAuto) {
 			return fmt.Errorf("--durability is only supported with --mode=fuse; WebDAV mounts always use their native write behavior")
+		}
+		if *perfJSONL != "" {
+			return fmt.Errorf("--perf-jsonl is only supported with --mode=fuse")
 		}
 		var c *client.Client
 		if token != "" {
@@ -263,6 +286,14 @@ func fsMountCmd(args []string) error {
 		ReadOnly:              *readOnly,
 		Debug:                 *debug,
 		PerfCounters:          *perfCounters,
+		ProfileCPU:            *profileCPU,
+		ProfileHeap:           *profileHeap,
+		ProfileDir:            *profileDir,
+		ProfileHeapInterval:   *profileHeapInterval,
+		PprofAddr:             *pprofAddr,
+		PerfSamplesPath:       *perfJSONL,
+		PerfSampleInterval:    *perfInterval,
+		PerfMaxSamples:        *perfMaxSamples,
 	}
 
 	return mountFuse(opts)

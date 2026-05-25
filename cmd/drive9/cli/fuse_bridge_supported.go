@@ -49,6 +49,16 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		ReadOnly:              opts.ReadOnly,
 		Debug:                 opts.Debug,
 		PerfCounters:          opts.PerfCounters,
+		Profiling: drive9fuse.ProfilingOptions{
+			CPUProfilePath:      opts.ProfileCPU,
+			HeapProfilePath:     opts.ProfileHeap,
+			ProfileDir:          opts.ProfileDir,
+			HeapProfileInterval: opts.ProfileHeapInterval,
+			PprofAddr:           opts.PprofAddr,
+			PerfSamplesPath:     opts.PerfSamplesPath,
+			PerfSampleInterval:  opts.PerfSampleInterval,
+			PerfMaxSamples:      opts.PerfMaxSamples,
+		},
 	})
 }
 

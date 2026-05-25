@@ -82,6 +82,10 @@ type perfOpStats struct {
 	errors  uint64
 	bytes   uint64
 	totalNS uint64
+	p50NS   uint64
+	p95NS   uint64
+	p99NS   uint64
+	maxNS   uint64
 }
 
 type fusePerfCounters struct {
@@ -143,12 +147,58 @@ type atomicUint64 struct {
 
 func (a *atomicUint64) add(n uint64) { atomic.AddUint64(&a.v, n) }
 func (a *atomicUint64) load() uint64 { return atomic.LoadUint64(&a.v) }
+func (a *atomicUint64) max(n uint64) {
+	for {
+		cur := atomic.LoadUint64(&a.v)
+		if n <= cur {
+			return
+		}
+		if atomic.CompareAndSwapUint64(&a.v, cur, n) {
+			return
+		}
+	}
+}
+
+const perfLatencyBucketCount = 28
+
+var perfLatencyBucketNS = [...]uint64{
+	uint64(time.Microsecond),
+	2 * uint64(time.Microsecond),
+	4 * uint64(time.Microsecond),
+	8 * uint64(time.Microsecond),
+	16 * uint64(time.Microsecond),
+	32 * uint64(time.Microsecond),
+	64 * uint64(time.Microsecond),
+	128 * uint64(time.Microsecond),
+	256 * uint64(time.Microsecond),
+	512 * uint64(time.Microsecond),
+	uint64(time.Millisecond),
+	2 * uint64(time.Millisecond),
+	4 * uint64(time.Millisecond),
+	8 * uint64(time.Millisecond),
+	16 * uint64(time.Millisecond),
+	32 * uint64(time.Millisecond),
+	64 * uint64(time.Millisecond),
+	128 * uint64(time.Millisecond),
+	256 * uint64(time.Millisecond),
+	512 * uint64(time.Millisecond),
+	uint64(time.Second),
+	2 * uint64(time.Second),
+	4 * uint64(time.Second),
+	8 * uint64(time.Second),
+	16 * uint64(time.Second),
+	32 * uint64(time.Second),
+	64 * uint64(time.Second),
+	120 * uint64(time.Second),
+}
 
 type perfAtomicStats struct {
-	count   atomicUint64
-	errors  atomicUint64
-	bytes   atomicUint64
-	totalNS atomicUint64
+	count          atomicUint64
+	errors         atomicUint64
+	bytes          atomicUint64
+	totalNS        atomicUint64
+	maxNS          atomicUint64
+	latencyBuckets [perfLatencyBucketCount]atomicUint64
 }
 
 func newFusePerfCounters(enabled bool) *fusePerfCounters {
@@ -189,17 +239,56 @@ func (s *perfAtomicStats) record(failed bool, dur time.Duration, bytes uint64) {
 		s.bytes.add(bytes)
 	}
 	if dur > 0 {
-		s.totalNS.add(uint64(dur))
+		durNS := uint64(dur)
+		s.totalNS.add(durNS)
+		s.maxNS.max(durNS)
+		s.latencyBuckets[perfLatencyBucketIndex(durNS)].add(1)
 	}
 }
 
 func (s *perfAtomicStats) snapshot() perfOpStats {
+	var buckets [perfLatencyBucketCount]uint64
+	for i := range s.latencyBuckets {
+		buckets[i] = s.latencyBuckets[i].load()
+	}
+	count := s.count.load()
 	return perfOpStats{
-		count:   s.count.load(),
+		count:   count,
 		errors:  s.errors.load(),
 		bytes:   s.bytes.load(),
 		totalNS: s.totalNS.load(),
+		p50NS:   perfLatencyPercentile(buckets, count, 50),
+		p95NS:   perfLatencyPercentile(buckets, count, 95),
+		p99NS:   perfLatencyPercentile(buckets, count, 99),
+		maxNS:   s.maxNS.load(),
 	}
+}
+
+func perfLatencyBucketIndex(durNS uint64) int {
+	for i, upper := range perfLatencyBucketNS {
+		if durNS <= upper {
+			return i
+		}
+	}
+	return len(perfLatencyBucketNS) - 1
+}
+
+func perfLatencyPercentile(buckets [perfLatencyBucketCount]uint64, count uint64, percentile uint64) uint64 {
+	if count == 0 || percentile == 0 {
+		return 0
+	}
+	target := (count*percentile + 99) / 100
+	if target == 0 {
+		target = 1
+	}
+	var seen uint64
+	for i, n := range buckets {
+		seen += n
+		if seen >= target {
+			return perfLatencyBucketNS[i]
+		}
+	}
+	return 0
 }
 
 type fusePerfSnapshot struct {
@@ -305,8 +394,11 @@ func writePerfOps(w io.Writer, group string, names []string, stats map[string]pe
 		if st.count > 0 && st.totalNS > 0 {
 			avg = time.Duration(st.totalNS / st.count)
 		}
-		writePerfLine(w, "drive9: perf %s %s count=%d errors=%d bytes=%d avg=%s\n",
-			group, name, st.count, st.errors, st.bytes, avg.Truncate(time.Microsecond))
+		writePerfLine(w, "drive9: perf %s %s count=%d errors=%d bytes=%d avg=%s p95=%s max=%s\n",
+			group, name, st.count, st.errors, st.bytes,
+			avg.Truncate(time.Microsecond),
+			time.Duration(st.p95NS).Truncate(time.Microsecond),
+			time.Duration(st.maxNS).Truncate(time.Microsecond))
 	}
 }
 
