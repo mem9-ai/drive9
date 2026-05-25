@@ -46,13 +46,13 @@ title: Drive9 Agent Harness
    drive9-agent-harness report --run-dir /tmp/drive9-agent-test-YYYYMMDDTHHMMSSZ
    ```
 
-8. Generate a customer performance report:
+8. Generate a performance report:
 
    ```bash
    drive9-agent-harness report --run-dir /tmp/drive9-agent-test-YYYYMMDDTHHMMSSZ --format customer-perf
    ```
 
-9. Publish a customer performance report bundle:
+9. Publish a performance report bundle:
 
    ```bash
    drive9-agent-harness publish-perf --run-dir /tmp/drive9-agent-test-YYYYMMDDTHHMMSSZ --workspace-root :/performance-reports
@@ -84,5 +84,5 @@ title: Drive9 Agent Harness
 2. `fault.yaml` covers open-file unmount and kill-during-write recovery classification.
 3. `gc` refuses to delete without `--confirm-delete` and checks run gating when `--successful-only` is set.
 4. `collect-server-evidence` refuses external reads without `--approve-external`.
-5. `report --format customer-perf` renders `perf/customer-report.md` from structured perf artifacts.
+5. `report --format customer-perf` renders a self-named Markdown report under `perf/`, for example `perf/drive9-performance-test-report.md`.
 6. `publish-perf` uploads the report bundle and updates a Drive9 workspace index.

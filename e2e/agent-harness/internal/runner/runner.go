@@ -282,6 +282,13 @@ func runCase(ctx context.Context, rec *report.Recorder, manifest *report.Manifes
 	if result := runCmd(caseCtx, rec, c.ID, "mkdir-remote", env, "", drive9Bin, "fs", "mkdir", ":"+caseRemote); result.ExitCode != 0 {
 		return fmt.Errorf("create remote root: %s", result.Stderr)
 	}
+	if c.Workload.Type == "cp_perf" {
+		if err := runCPPerf(caseCtx, rec, env, drive9Bin, caseRemote, c); err != nil {
+			return err
+		}
+		_ = rec.Event(report.Event{CaseID: c.ID, Type: "case_end"})
+		return nil
+	}
 	mount, err := startCaseMount(caseCtx, rec, manifest, env, drive9Bin, caseRemote, mountpoint, c)
 	if err != nil {
 		return err
