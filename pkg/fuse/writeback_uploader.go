@@ -262,7 +262,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	gen := meta.Generation
 
 	if meta.Kind == PendingChmod {
-		u.applyPendingChmod(context.Background(), localPath, meta, gen, false)
+		_ = u.applyPendingChmod(context.Background(), localPath, meta, gen, false)
 		return
 	}
 
