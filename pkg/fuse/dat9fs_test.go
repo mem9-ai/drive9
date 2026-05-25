@@ -3076,6 +3076,123 @@ func TestLockFileCreateDisablesEntryCache(t *testing.T) {
 	}
 }
 
+func TestCreatePreservesInputMode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+		Mode:     0o755,
+	}, "exec.sh", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	if got, want := out.Mode, uint32(syscall.S_IFREG)|0o755; got != want {
+		t.Fatalf("Create mode = %o, want %o", got, want)
+	}
+
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("created inode not found")
+	}
+	if !entry.HasMode || entry.Mode != 0o755 {
+		t.Fatalf("inode mode = %o has=%t, want 0755 true", entry.Mode, entry.HasMode)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("created file handle not found")
+	}
+	if !fh.HasPendingMode || fh.PendingMode != 0o755 {
+		t.Fatalf("pending mode = %o has=%t, want 0755 true", fh.PendingMode, fh.HasPendingMode)
+	}
+}
+
+func TestLookupPendingIndexPreservesMode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.pendingIndex = pending
+	if _, err := pending.PutWithBaseRevAndMode("/exec.sh", 3, PendingNew, 0, 0o755, true); err != nil {
+		t.Fatal(err)
+	}
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "exec.sh", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got, want := out.Mode, uint32(syscall.S_IFREG)|0o755; got != want {
+		t.Fatalf("Lookup mode = %o, want %o", got, want)
+	}
+}
+
+func TestFlushStagesCreateModeInPendingMetadata(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeBack, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.writeBack = writeBack
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+		Mode:     0o755,
+	}, "exec.sh", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: out.NodeId},
+		Fh:       out.Fh,
+	}, []byte("echo ok\n")); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+	st = fs.Flush(nil, &gofuse.FlushIn{Fh: out.Fh})
+	if st != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", st)
+	}
+
+	pendingMeta, ok := pending.GetMeta("/exec.sh")
+	if !ok {
+		t.Fatal("pending index entry missing")
+	}
+	if !pendingMeta.HasMode || pendingMeta.Mode != 0o755 {
+		t.Fatalf("pending mode = %o has=%t, want 0755 true", pendingMeta.Mode, pendingMeta.HasMode)
+	}
+	writeBackMeta, ok := writeBack.GetMeta("/exec.sh")
+	if !ok {
+		t.Fatal("writeback entry missing")
+	}
+	if !writeBackMeta.HasMode || writeBackMeta.Mode != 0o755 {
+		t.Fatalf("writeback mode = %o has=%t, want 0755 true", writeBackMeta.Mode, writeBackMeta.HasMode)
+	}
+}
+
 func TestInitStoresServer(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()

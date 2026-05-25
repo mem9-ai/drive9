@@ -44,6 +44,8 @@ type CommitEntry struct {
 	Size         int64
 	Kind         PendingKind
 	ShadowSpill  bool // true when data is only in shadow file (auto-resolve would OOM)
+	Mode         uint32
+	HasMode      bool
 	canceled     bool
 	cancelCommit context.CancelFunc
 	cancelUpload context.CancelFunc
@@ -269,6 +271,8 @@ func (cq *CommitQueue) RecoverPending() {
 			Size:        meta.Size,
 			Kind:        meta.Kind,
 			ShadowSpill: meta.ShadowSpill,
+			Mode:        meta.Mode,
+			HasMode:     meta.HasMode,
 		}
 		if err := cq.Enqueue(entry); err != nil {
 			log.Printf("commit queue: recover enqueue failed for %s: %v", path, err)
@@ -753,6 +757,19 @@ func (cq *CommitQueue) rebuildQueuedIndexLocked() {
 }
 
 func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) {
+	if entry.HasMode {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		start := time.Now()
+		err := cq.client.ChmodCtx(ctx, cq.remotePath(entry.Path), entry.Mode&0o777)
+		cancel()
+		if cq.perf != nil {
+			cq.perf.recordRemoteOp(perfRemoteMutation, err, time.Since(start), 0)
+		}
+		if err != nil {
+			log.Printf("commit queue: chmod %s to %o failed after upload: %v", entry.Path, entry.Mode&0o777, err)
+		}
+	}
+
 	// Write durable commit record BEFORE cleaning up local state so that
 	// crash recovery never re-uploads an already committed entry.
 	if cq.journal != nil {

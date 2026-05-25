@@ -93,6 +93,20 @@ func (u *WriteBackUploader) remotePath(localPath string) string {
 	return mountpath.ToRemote(root, localPath)
 }
 
+func (u *WriteBackUploader) applyMode(ctx context.Context, meta *WriteBackMeta) {
+	if meta == nil || !meta.HasMode {
+		return
+	}
+	start := time.Now()
+	err := u.client.ChmodCtx(ctx, u.remotePath(meta.Path), meta.Mode&0o777)
+	if u.perf != nil {
+		u.perf.recordRemoteOp(perfRemoteMutation, err, time.Since(start), 0)
+	}
+	if err != nil {
+		log.Printf("writeback upload chmod %s to %o failed: %v", meta.Path, meta.Mode&0o777, err)
+	}
+}
+
 func (u *WriteBackUploader) SetPerfCounters(perf *fusePerfCounters) {
 	u.perf = perf
 }
@@ -294,6 +308,9 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		log.Printf("writeback upload failed for %s after %d attempts: %v (will retry on next mount)", localPath, uploadMaxRetries+1, lastErr)
 		return
 	}
+	chmodCtx, chmodCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	u.applyMode(chmodCtx, meta)
+	chmodCancel()
 
 	// Only remove from cache if the generation hasn't changed. If a newer
 	// Put() happened while we were uploading, the cache now holds fresher
@@ -350,6 +367,9 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 		}
 		return err
 	}
+	chmodCtx, chmodCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	u.applyMode(chmodCtx, meta)
+	chmodCancel()
 
 	// Only remove if generation matches — a concurrent Put() may have written newer data.
 	curMeta, ok := u.cache.GetMeta(localPath)

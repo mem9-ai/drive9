@@ -614,6 +614,47 @@ func (fs *Dat9FS) pendingKindForHandle(fh *FileHandle) PendingKind {
 	return PendingOverwrite
 }
 
+func createInputMode(inputMode uint32) (uint32, bool) {
+	mode := inputMode & 0o777
+	if mode == 0 {
+		return 0o644, false
+	}
+	return mode, true
+}
+
+func (fs *Dat9FS) modeForPendingHandle(fh *FileHandle) (uint32, bool) {
+	if fh == nil {
+		return 0, false
+	}
+	if fh.HasPendingMode {
+		return fh.PendingMode & 0o777, true
+	}
+	return 0, false
+}
+
+func (fs *Dat9FS) setPendingMetadataMode(path string, mode uint32) {
+	mode &= 0o777
+	if fs.pendingIndex != nil {
+		if err := fs.pendingIndex.UpdateMode(path, mode); err != nil {
+			log.Printf("pending index mode update failed for %s: %v", path, err)
+		}
+	}
+	if fs.writeBack != nil {
+		if err := fs.writeBack.UpdateMode(path, mode); err != nil {
+			log.Printf("writeback mode update failed for %s: %v", path, err)
+		}
+	}
+}
+
+func (fs *Dat9FS) clearPendingModeForInode(ino uint64) {
+	fs.fileHandles.ForEach(func(_ uint64, h *FileHandle) {
+		if h.Ino == ino {
+			h.HasPendingMode = false
+			h.HasPreviousMode = false
+		}
+	})
+}
+
 func expectedRevisionForHandle(fh *FileHandle) int64 {
 	if fh == nil {
 		return -1
@@ -693,12 +734,13 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 			return err
 		}
 	}
+	mode, hasMode := fs.modeForPendingHandle(fh)
 	if fh.ShadowSpill {
-		if _, err := fs.pendingIndex.PutShadowSpill(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev); err != nil {
+		if _, err := fs.pendingIndex.PutShadowSpillWithMode(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode); err != nil {
 			log.Printf("pending index put failed for %s: %v", fh.Path, err)
 		}
 	} else {
-		if _, err := fs.pendingIndex.PutWithBaseRev(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev); err != nil {
+		if _, err := fs.pendingIndex.PutWithBaseRevAndMode(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode); err != nil {
 			log.Printf("pending index put failed for %s: %v", fh.Path, err)
 		}
 	}
@@ -715,12 +757,15 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 	if !fh.ShadowReady && !fh.IsNew && !fh.Dirty.CanMaterializeFull() {
 		return syscall.ENOTSUP
 	}
-	return fs.writeBack.PutWithBaseRev(
+	mode, hasMode := fs.modeForPendingHandle(fh)
+	return fs.writeBack.PutWithBaseRevAndMode(
 		fh.Path,
 		fh.Dirty.bytesView(),
 		fh.Dirty.Size(),
 		fs.pendingKindForHandle(fh),
 		fh.BaseRev,
+		mode,
+		hasMode,
 	)
 }
 
@@ -753,6 +798,12 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 	} else if rev := fs.shadowStore.BaseRev(fh.Path); rev > 0 {
 		fh.BaseRev = rev
 	}
+	if meta.HasMode {
+		mode := meta.Mode & 0o777
+		fh.PendingMode = mode
+		fh.HasPendingMode = true
+		fs.inodes.UpdateMode(fh.Ino, mode)
+	}
 	return nil
 }
 
@@ -779,6 +830,12 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 	if meta.BaseRev > 0 {
 		fh.BaseRev = meta.BaseRev
 		fs.inodes.UpdateRevision(fh.Ino, meta.BaseRev)
+	}
+	if meta.HasMode {
+		mode := meta.Mode & 0o777
+		fh.PendingMode = mode
+		fh.HasPendingMode = true
+		fs.inodes.UpdateMode(fh.Ino, mode)
 	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, int64(len(data)))
 	fh.WriteBackSeq = fh.DirtySeq
@@ -1796,6 +1853,9 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 				mtime = time.Now()
 			}
 			ino := fs.inodes.Lookup(childP, false, meta.Size, mtime)
+			if meta.HasMode {
+				fs.inodes.UpdateMode(ino, meta.Mode)
+			}
 			entry, ok := fs.inodes.GetEntry(ino)
 			if !ok {
 				return gofuse.EIO
@@ -1810,6 +1870,9 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 				mtime = time.Now()
 			}
 			ino := fs.inodes.Lookup(childP, false, meta.Size, mtime)
+			if meta.HasMode {
+				fs.inodes.UpdateMode(ino, meta.Mode)
+			}
 			entry, ok := fs.inodes.GetEntry(ino)
 			if !ok {
 				return gofuse.EIO
@@ -2108,6 +2171,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				}
 			}
 		})
+		if hasDirtyHandle {
+			fs.setPendingMetadataMode(entry.Path, mode)
+		}
 		if !hasDirtyHandle {
 			ctx, cf := fuseCtx(cancel)
 			defer cf()
@@ -2569,6 +2635,8 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 			Size:        meta.Size,
 			Kind:        meta.Kind,
 			ShadowSpill: meta.ShadowSpill,
+			Mode:        meta.Mode,
+			HasMode:     meta.HasMode,
 		}
 		if isGitLooseObjectFinalPath(newP) {
 			// Git treats a successful tmp_obj_* -> <sha> rename as making the
@@ -2985,10 +3053,13 @@ func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []D
 				mtime = time.Now()
 			}
 			ino := fs.inodes.EnsureInode(meta.Path, false, meta.Size, mtime)
+			if meta.HasMode {
+				fs.inodes.UpdateMode(ino, meta.Mode)
+			}
 			entries = append(entries, DirEntry{
 				Name: name,
 				Ino:  ino,
-				Mode: syscall.S_IFREG,
+				Mode: dirEntryMode(false, meta.HasMode, meta.Mode),
 			})
 			existing[name] = struct{}{}
 		}
@@ -3016,10 +3087,13 @@ func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []D
 				mtime = time.Now()
 			}
 			ino := fs.inodes.EnsureInode(meta.Path, false, meta.Size, mtime)
+			if meta.HasMode {
+				fs.inodes.UpdateMode(ino, meta.Mode)
+			}
 			entries = append(entries, DirEntry{
 				Name: name,
 				Ino:  ino,
-				Mode: syscall.S_IFREG,
+				Mode: dirEntryMode(false, meta.HasMode, meta.Mode),
 			})
 			existing[name] = struct{}{}
 		}
@@ -3075,7 +3149,9 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		return st
 	}
 
+	mode, hasRemoteMode := createInputMode(input.Mode)
 	ino := fs.inodes.Lookup(childP, false, 0, time.Now())
+	fs.inodes.UpdateMode(ino, mode)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
@@ -3093,6 +3169,10 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		IsNew:       true,
 		ShadowReady: false,
 		WritePolicy: fs.writePolicyForOpen(input.Flags),
+	}
+	if hasRemoteMode {
+		fh.PendingMode = mode
+		fh.HasPendingMode = true
 	}
 
 	if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
@@ -4471,6 +4551,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			size := fh.Dirty.Size()
 			fh.DirtySeq = 0
 			fh.ShadowCommitReady = false
+			mode, hasMode := fs.modeForPendingHandle(fh)
 			fh.Unlock()
 
 			entry := &CommitEntry{
@@ -4480,6 +4561,8 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				Size:        size,
 				Kind:        PendingOverwrite,
 				ShadowSpill: true,
+				Mode:        mode,
+				HasMode:     hasMode,
 			}
 			if fh.IsNew {
 				entry.Kind = PendingNew
@@ -4508,6 +4591,8 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					log.Printf("release: ShadowSpill sync upload failed for %s: %v", fh.Path, uploadErr)
 				}
 				cf()
+			} else if hasMode {
+				fs.clearPendingModeForInode(fh.Ino)
 			}
 
 			fs.invalidateReadCacheAndTargets(fh.Path)
@@ -4542,6 +4627,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			fs.debugf("release writeback check path=%s streamer_active=%t writeback_seq=%d dirty_seq=%d can_use_cache=%t", fh.Path, streamerActive, fh.WriteBackSeq, fh.DirtySeq, canUseCache)
 			if canUseCache {
 				phase = "writeback-cache-release"
+				mode, hasMode := fs.modeForPendingHandle(fh)
 				fh.Dirty.ClearDirty()
 				fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 				fh.DirtySeq = 0
@@ -4557,6 +4643,8 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 						BaseRev: fh.BaseRev,
 						Size:    fh.Dirty.Size(),
 						Kind:    PendingOverwrite,
+						Mode:    mode,
+						HasMode: hasMode,
 					}
 					if fh.IsNew {
 						entry.Kind = PendingNew
@@ -4579,6 +4667,9 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					// Async upload — the uploader will read from cache and upload.
 					fs.debugf("release uploader submit path=%s", fh.Path)
 					fs.uploader.Submit(fh.Path)
+				}
+				if hasMode {
+					fs.clearPendingModeForInode(fh.Ino)
 				}
 
 				// Invalidate caches so subsequent reads see fresh data.
@@ -5105,12 +5196,18 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		}
 		fs.inodes.UpdateRevision(entry.Inode, committedRev)
 		fs.inodes.UpdateSize(entry.Inode, entry.Size)
+		if entry.HasMode {
+			fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
+		}
 		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), committedRev)
 		// Local async commit completion — this is not an external change.
 		// Kernel does not need notify; userspace caches and inode state
 		// are updated above. Kernel will see new attrs on next access.
 	} else {
 		fs.invalidateReadCacheAndTargets(entry.Path)
+		if entry.HasMode && entry.Inode > 0 {
+			fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
+		}
 		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
 	}
 }

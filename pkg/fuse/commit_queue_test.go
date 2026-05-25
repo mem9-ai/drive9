@@ -72,6 +72,66 @@ func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 	}
 }
 
+func TestCommitQueueAppliesModeAfterUpload(t *testing.T) {
+	var putCalls atomic.Int32
+	var chmodCalls atomic.Int32
+	var chmodBody []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			putCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","revision":9}`))
+		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
+			chmodCalls.Add(1)
+			chmodBody, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/exec.sh", []byte("data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRevAndMode("/exec.sh", 4, PendingNew, 0, 0o755, true); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	if err := cq.Enqueue(&CommitEntry{
+		Path:    "/exec.sh",
+		Size:    4,
+		Kind:    PendingNew,
+		Mode:    0o755,
+		HasMode: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("PUT calls = %d, want 1", got)
+	}
+	if got := chmodCalls.Load(); got != 1 {
+		t.Fatalf("chmod calls = %d, want 1", got)
+	}
+	if !bytes.Contains(chmodBody, []byte("493")) {
+		t.Fatalf("chmod body = %s, want decimal mode 493", chmodBody)
+	}
+}
+
 func TestCommitQueueConflictKeepsPendingState(t *testing.T) {
 	var calls int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

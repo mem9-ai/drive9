@@ -63,6 +63,8 @@ type WriteBackMeta struct {
 	Kind        PendingKind `json:"kind"`
 	BaseRev     int64       `json:"base_rev,omitempty"`
 	ShadowSpill bool        `json:"shadow_spill,omitempty"`
+	Mode        uint32      `json:"mode,omitempty"`
+	HasMode     bool        `json:"has_mode,omitempty"`
 }
 
 // WriteBackCache manages a local disk cache of pending (not-yet-uploaded)
@@ -175,6 +177,12 @@ func (c *WriteBackCache) Put(remotePath string, data []byte, size int64, kind Pe
 // PutWithBaseRev is like Put, but also persists the remote base revision used
 // for CAS-protected overwrite uploads. baseRev is ignored for PendingNew.
 func (c *WriteBackCache) PutWithBaseRev(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64) error {
+	return c.PutWithBaseRevAndMode(remotePath, data, size, kind, baseRev, 0, false)
+}
+
+// PutWithBaseRevAndMode is like PutWithBaseRev, but also persists the file
+// permission bits that should be applied once the pending data is remote.
+func (c *WriteBackCache) PutWithBaseRevAndMode(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -193,6 +201,8 @@ func (c *WriteBackCache) PutWithBaseRev(remotePath string, data []byte, size int
 		Generation: c.nextGen.Add(1),
 		Kind:       kind,
 		BaseRev:    baseRev,
+		Mode:       mode & 0o777,
+		HasMode:    hasMode,
 	}
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
@@ -328,6 +338,32 @@ func (c *WriteBackCache) Remove(remotePath string) {
 	defer c.mu.Unlock()
 
 	c.pruneEntryLocked(remotePath, true)
+}
+
+// UpdateMode updates the pending mode metadata for an existing cache entry.
+func (c *WriteBackCache) UpdateMode(remotePath string, mode uint32) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	meta, ok := c.metas[remotePath]
+	if !ok {
+		return nil
+	}
+	updated := *meta
+	updated.Mode = mode & 0o777
+	updated.HasMode = true
+	updated.Generation = c.nextGen.Add(1)
+
+	metaBytes, err := json.Marshal(updated)
+	if err != nil {
+		return fmt.Errorf("writeback marshal mode meta: %w", err)
+	}
+	if err := atomicWrite(c.metaFile(remotePath), metaBytes); err != nil {
+		return fmt.Errorf("writeback update mode meta: %w", err)
+	}
+	cp := updated
+	c.metas[remotePath] = &cp
+	return nil
 }
 
 // RenamePending atomically moves a pending cache entry from oldPath to newPath.
