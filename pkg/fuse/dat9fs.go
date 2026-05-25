@@ -4819,6 +4819,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					}
 					return
 				}
+				fs.inodes.UpdateMode(ino, pendingMode)
 				fs.clearPendingModeForInode(ino)
 				return
 			}

@@ -3439,7 +3439,7 @@ func TestReleaseRetriesDeferredChmodNotFound(t *testing.T) {
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	ino := fs.inodes.Lookup("/release-retry.txt", false, 0, time.Now())
-	fs.inodes.UpdateMode(ino, 0o755)
+	fs.inodes.UpdateMode(ino, 0o644)
 	fh := &FileHandle{
 		Ino:               ino,
 		Path:              "/release-retry.txt",
