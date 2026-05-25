@@ -22,6 +22,7 @@ require_cmd sha256sum
 publisher="${DRIVE9_PUBLISHER:-drive9}"
 archive_root="${DRIVE9_ARCHIVE_ROOT:-/drive9}"
 archive_root="${archive_root%/}"
+latest_index="${archive_root}/latest.json"
 cli_targets="${DRIVE9_ARCHIVE_CLI_TARGETS:-linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64}"
 legacy_agfs_module="github.com/c4pt0r/agfs/agfs-server"
 legacy_agfs_version="${DRIVE9_ARCHIVE_LEGACY_AGFS_VERSION:-v0.0.0-20260410081414-678f51854d2a}"
@@ -91,6 +92,11 @@ remote_upload() {
 
 fetch_archive_branch() {
   git fetch --quiet origin "refs/heads/${branch}:refs/remotes/origin/${branch}"
+}
+
+archive_branch_tip() {
+  fetch_archive_branch
+  git rev-parse "refs/remotes/origin/${branch}^{commit}"
 }
 
 checksums_object() {
@@ -367,6 +373,48 @@ publish_commit() {
   remote_upload "${artifact_dir}/manifest.json" "${commit_path}/manifest.json"
 }
 
+publish_latest_index() {
+  local sha=$1
+  local commit_path="${archive_root}/commits/${sha}"
+  local remote_manifest="${work_root}/latest-source-manifest-${sha}.json"
+  local latest_manifest="${work_root}/latest.json"
+  local branch_tip
+
+  branch_tip="$(archive_branch_tip)"
+  if [ "$sha" != "$branch_tip" ]; then
+    info "skip latest index ${latest_index}; ${sha} is not current origin/${branch} tip ${branch_tip}"
+    return
+  fi
+
+  remote_cat "${commit_path}/manifest.json" "$remote_manifest" >/dev/null
+  jq -n \
+    --arg commit_path "$commit_path" \
+    --arg manifest_path "${commit_path}/manifest.json" \
+    --arg source_archive_path "${commit_path}/source.tar.gz" \
+    --arg checksums_path "${commit_path}/checksums.txt" \
+    --slurpfile manifest "$remote_manifest" \
+    '($manifest[0]) as $m
+    | {
+        schema_version: 1,
+        repository: $m.repository,
+        branch: $m.branch,
+        commit_sha: $m.commit_sha,
+        short_sha: $m.short_sha,
+        published_at: $m.published_at,
+        commit_path: $commit_path,
+        manifest_path: $manifest_path,
+        source_archive_path: $source_archive_path,
+        checksums_path: $checksums_path,
+        binaries: [
+          $m.binaries[]
+          | . + {path: ($commit_path + "/" + .path)}
+        ]
+      }' >"$latest_manifest"
+
+  info "upload latest index ${latest_index} -> ${commit_path}"
+  remote_upload "$latest_manifest" "$latest_index"
+}
+
 resolve_commits() {
   if [ "$#" -gt 0 ]; then
     printf '%s\n' "$@"
@@ -395,6 +443,7 @@ main() {
   for sha in "${commits[@]}"; do
     sha="$(git rev-parse "${sha}^{commit}")"
     publish_commit "$sha"
+    publish_latest_index "$sha"
   done
 }
 
