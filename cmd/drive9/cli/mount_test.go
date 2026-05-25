@@ -1020,7 +1020,7 @@ func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
 		"--profile", "coding-agent",
-		"--local-policy-observe-root", localRoot,
+		"--local-policy-observe-root", " " + localRoot + " ",
 		"--local-policy-observe-local", "**/node_modules/**",
 		"--local-policy-observe-remote", "**/node_modules/keep/**",
 		t.TempDir(),
@@ -1098,6 +1098,34 @@ func TestMountCmdLocalObserveRootMustBeAbsolute(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "--local-policy-observe-root") {
 		t.Fatalf("error = %v, want observe root validation error", err)
+	}
+}
+
+func TestMountCmdLocalPolicyPatternsRejectUnsafePaths(t *testing.T) {
+	tests := []struct {
+		name    string
+		pattern string
+		want    string
+	}{
+		{name: "backslash", pattern: `**\\.git\\**`, want: "path contains backslash"},
+		{name: "dotdot", pattern: "**/../.git/**", want: `path contains ".." segment`},
+		{name: "dot", pattern: "**/./.git/**", want: `path contains "." segment`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := MountCmd([]string{
+				"--mode", "fuse",
+				"--server", "https://drive9.example",
+				"--api-key", "sk-test",
+				"--profile", "coding-agent",
+				"--local-policy-observe-local", test.pattern,
+				t.TempDir(),
+			})
+			if err == nil || !strings.Contains(err.Error(), "invalid local policy pattern") || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want invalid policy pattern containing %q", err, test.want)
+			}
+		})
 	}
 }
 

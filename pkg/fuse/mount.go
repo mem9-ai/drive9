@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -471,6 +472,7 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	if !validMountProfile(opts.Profile) {
 		return fmt.Errorf("mount: unknown profile %q", opts.Profile)
 	}
+	opts.LocalRoot = strings.TrimSpace(opts.LocalRoot)
 	hasLocalPolicy := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0
 	if opts.Profile != MountProfileCodingAgent {
 		if hasLocalPolicy {
@@ -480,6 +482,9 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	}
 	if opts.LocalRoot != "" && !filepath.IsAbs(opts.LocalRoot) {
 		return fmt.Errorf("mount: LocalRoot must be an absolute path")
+	}
+	if err := validateLocalPolicyPatterns(opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns); err != nil {
+		return fmt.Errorf("mount: %w", err)
 	}
 	return nil
 }

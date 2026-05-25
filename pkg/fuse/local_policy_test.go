@@ -1,6 +1,9 @@
 package fuse
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestLocalPolicyCodingAgentDefaultsMatchGitSegmentExactly(t *testing.T) {
 	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
@@ -72,5 +75,36 @@ func TestLocalPolicyDoesNotDefaultProjectOutputsToLocalOnly(t *testing.T) {
 		if got := policy.Classify(path); got != PathLayerRemotePersistent {
 			t.Fatalf("Classify(%q) = %s, want remote persistent default", path, got)
 		}
+	}
+}
+
+func TestValidateLocalPolicyPatternsRejectsUnsafeNormalization(t *testing.T) {
+	tests := []struct {
+		name    string
+		pattern string
+		want    string
+	}{
+		{name: "backslash", pattern: `**\\.git\\**`, want: "path contains backslash"},
+		{name: "dotdot", pattern: "**/../.git/**", want: `path contains ".." segment`},
+		{name: "dot", pattern: "**/./.git/**", want: `path contains "." segment`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateLocalPolicyPatterns([]string{test.pattern}, nil)
+			if err == nil {
+				t.Fatalf("validateLocalPolicyPatterns(%q) = nil, want error", test.pattern)
+			}
+			if got := err.Error(); !strings.Contains(got, test.want) {
+				t.Fatalf("error = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestLocalPolicyInvalidRuntimePathDoesNotMatchLocalOnly(t *testing.T) {
+	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
+	if got := policy.Classify(`repo\\.git\\config`); got != PathLayerRemotePersistent {
+		t.Fatalf("invalid backslash runtime path = %s, want remote persistent", got)
 	}
 }

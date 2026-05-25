@@ -1,8 +1,11 @@
 package fuse
 
 import (
+	"fmt"
 	"path"
 	"strings"
+
+	"github.com/mem9-ai/dat9/pkg/pathutil"
 )
 
 const (
@@ -122,36 +125,66 @@ func compileLocalPolicyPatterns(patterns []string) []localPolicyPattern {
 		if pattern == "" {
 			continue
 		}
-		compiled = append(compiled, newLocalPolicyPattern(pattern))
+		compiledPattern, err := newLocalPolicyPattern(pattern)
+		if err != nil {
+			continue
+		}
+		compiled = append(compiled, compiledPattern)
 	}
 	return compiled
 }
 
-func newLocalPolicyPattern(raw string) localPolicyPattern {
-	cleaned := cleanPolicyPath(raw)
+func validateLocalPolicyPatterns(localOnlyPatterns []string, remoteOnlyPatterns []string) error {
+	for _, pattern := range append(append([]string{}, localOnlyPatterns...), remoteOnlyPatterns...) {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
+		}
+		if _, err := newLocalPolicyPattern(pattern); err != nil {
+			return fmt.Errorf("invalid local policy pattern %q: %w", pattern, err)
+		}
+	}
+	return nil
+}
+
+func newLocalPolicyPattern(raw string) (localPolicyPattern, error) {
+	cleaned, err := canonicalPolicyPath(raw)
+	if err != nil {
+		return localPolicyPattern{}, err
+	}
 	pattern := localPolicyPattern{raw: raw}
 	if strings.HasPrefix(cleaned, "**/") {
 		rest := strings.TrimPrefix(cleaned, "**/")
 		rest = strings.TrimSuffix(rest, "/**")
 		rest = strings.TrimSuffix(rest, "/")
 		if rest != "" {
-			pattern.subpath = splitPolicyPath(rest)
-			return pattern
+			pattern.subpath, err = splitPolicyPath(rest)
+			if err != nil {
+				return localPolicyPattern{}, err
+			}
+			return pattern, nil
 		}
 	}
 	if strings.HasSuffix(cleaned, "/**") {
 		prefix := strings.TrimSuffix(cleaned, "/**")
 		pattern.prefix = prefix
-		return pattern
+		return pattern, nil
 	}
 	pattern.exact = cleaned
-	return pattern
+	return pattern, nil
 }
 
 func (pattern localPolicyPattern) matches(localPath string) bool {
-	cleaned := cleanPolicyPath(localPath)
+	cleaned, err := canonicalPolicyPath(localPath)
+	if err != nil {
+		return false
+	}
 	if len(pattern.subpath) > 0 {
-		return containsSubpath(splitPolicyPath(cleaned), pattern.subpath)
+		segments, err := splitPolicyPath(cleaned)
+		if err != nil {
+			return false
+		}
+		return containsSubpath(segments, pattern.subpath)
 	}
 	if pattern.prefix != "" {
 		return cleaned == pattern.prefix || strings.HasPrefix(cleaned, pattern.prefix+"/")
@@ -165,19 +198,24 @@ func (pattern localPolicyPattern) matches(localPath string) bool {
 	return false
 }
 
-func cleanPolicyPath(value string) string {
-	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
-	value = strings.TrimPrefix(value, "/")
-	cleaned := path.Clean("/" + value)
-	return strings.TrimPrefix(cleaned, "/")
+func canonicalPolicyPath(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	cleaned, err := pathutil.Canonicalize(value)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimPrefix(cleaned, "/"), nil
 }
 
-func splitPolicyPath(value string) []string {
-	value = cleanPolicyPath(value)
-	if value == "" || value == "." {
-		return nil
+func splitPolicyPath(value string) ([]string, error) {
+	value, err := canonicalPolicyPath(value)
+	if err != nil {
+		return nil, err
 	}
-	return strings.Split(value, "/")
+	if value == "" || value == "." {
+		return nil, nil
+	}
+	return strings.Split(value, "/"), nil
 }
 
 func containsSubpath(segments []string, subpath []string) bool {

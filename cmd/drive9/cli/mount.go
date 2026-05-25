@@ -18,6 +18,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/mountpath"
 	"github.com/mem9-ai/dat9/pkg/mountstate"
+	"github.com/mem9-ai/dat9/pkg/pathutil"
 	drive9webdav "github.com/mem9-ai/dat9/pkg/webdav"
 )
 
@@ -171,7 +172,8 @@ func fsMountCmd(args []string) error {
 	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
 		return err
 	}
-	if err := validateMountProfileFlags(*profile, *localRoot, localOnlyPatterns, remoteOnlyPatterns); err != nil {
+	normalizedLocalRoot := strings.TrimSpace(*localRoot)
+	if err := validateMountProfileFlags(*profile, normalizedLocalRoot, localOnlyPatterns, remoteOnlyPatterns); err != nil {
 		return err
 	}
 	syncModeVal, writePolicyVal, err := parseFuseDurability(*durability)
@@ -210,7 +212,7 @@ func fsMountCmd(args []string) error {
 			MountPoint:         mountPoint,
 			RemoteRoot:         remoteRoot,
 			Profile:            *profile,
-			LocalRoot:          *localRoot,
+			LocalRoot:          normalizedLocalRoot,
 			LocalOnlyPatterns:  append([]string(nil), localOnlyPatterns...),
 			RemoteOnlyPatterns: append([]string(nil), remoteOnlyPatterns...),
 			ReadOnly:           *readOnly,
@@ -273,7 +275,7 @@ func fsMountCmd(args []string) error {
 		SyncMode:              syncModeVal,
 		WritePolicy:           writePolicyVal,
 		Profile:               *profile,
-		LocalRoot:             *localRoot,
+		LocalRoot:             normalizedLocalRoot,
 		LocalOnlyPatterns:     append([]string(nil), localOnlyPatterns...),
 		RemoteOnlyPatterns:    append([]string(nil), remoteOnlyPatterns...),
 		UploadConcurrency:     *uploadConcurrency,
@@ -375,6 +377,24 @@ func validateMountProfileFlags(profile string, localRoot string, localOnlyPatter
 	}
 	if strings.TrimSpace(localRoot) != "" && !filepath.IsAbs(localRoot) {
 		return fmt.Errorf("drive9 mount: --local-policy-observe-root must be an absolute path")
+	}
+	if err := validateMountPolicyPatterns(localOnlyPatterns, remoteOnlyPatterns); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateMountPolicyPatterns(patternGroups ...[]string) error {
+	for _, patterns := range patternGroups {
+		for _, pattern := range patterns {
+			pattern = strings.TrimSpace(pattern)
+			if pattern == "" {
+				continue
+			}
+			if _, err := pathutil.Canonicalize(pattern); err != nil {
+				return fmt.Errorf("drive9 mount: invalid local policy pattern %q: %w", pattern, err)
+			}
+		}
 	}
 	return nil
 }

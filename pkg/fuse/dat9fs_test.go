@@ -3152,6 +3152,19 @@ func TestMountOptionsCodingAgentPolicyValidation(t *testing.T) {
 		t.Fatalf("coding-agent profile validation failed: %v", err)
 	}
 
+	paddedLocalRoot := t.TempDir()
+	codingAgentPadded := &MountOptions{
+		Profile:   MountProfileCodingAgent,
+		LocalRoot: " " + paddedLocalRoot + " ",
+	}
+	codingAgentPadded.setDefaults()
+	if err := validateMountOptionsProfile(codingAgentPadded); err != nil {
+		t.Fatalf("coding-agent padded LocalRoot validation failed: %v", err)
+	}
+	if codingAgentPadded.LocalRoot != paddedLocalRoot {
+		t.Fatalf("LocalRoot = %q, want trimmed %q", codingAgentPadded.LocalRoot, paddedLocalRoot)
+	}
+
 	missingRoot := &MountOptions{Profile: MountProfileCodingAgent}
 	missingRoot.setDefaults()
 	if err := validateMountOptionsProfile(missingRoot); err != nil {
@@ -3162,6 +3175,15 @@ func TestMountOptionsCodingAgentPolicyValidation(t *testing.T) {
 	ordinaryWithPolicy.setDefaults()
 	if err := validateMountOptionsProfile(ordinaryWithPolicy); err == nil {
 		t.Fatal("ordinary mount with local-only policy should fail")
+	}
+
+	invalidPattern := &MountOptions{
+		Profile:           MountProfileCodingAgent,
+		LocalOnlyPatterns: []string{"**/../.git/**"},
+	}
+	invalidPattern.setDefaults()
+	if err := validateMountOptionsProfile(invalidPattern); err == nil {
+		t.Fatal("coding-agent mount with unsafe policy pattern should fail")
 	}
 }
 
