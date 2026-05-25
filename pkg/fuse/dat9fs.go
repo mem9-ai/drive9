@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -790,6 +791,19 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 		return false
 	}
 
+	type candidate struct {
+		src          *FileHandle
+		size         int64
+		origSize     int64
+		baseRev      int64
+		dirtySeq     uint64
+		isNew        bool
+		zeroBase     bool
+		shadowSource bool
+		canMemory    bool
+	}
+
+	var candidates []candidate
 	for _, src := range fs.openHandles.SnapshotPath(fh.Path) {
 		if src == nil || src == fh {
 			continue
@@ -800,30 +814,70 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 			src.Unlock()
 			continue
 		}
-		size := src.Dirty.Size()
-		baseRev := src.BaseRev
-		isNew := src.IsNew
-		zeroBase := src.ZeroBase
-		shadowSource := fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill)
-
-		var data []byte
-		haveData := size == 0
-		if !haveData && src.Dirty.CanMaterializeFull() {
-			data = src.Dirty.Bytes()
-			haveData = true
+		c := candidate{
+			src:          src,
+			size:         src.Dirty.Size(),
+			origSize:     src.OrigSize,
+			baseRev:      src.BaseRev,
+			dirtySeq:     src.DirtySeq,
+			isNew:        src.IsNew,
+			zeroBase:     src.ZeroBase,
+			shadowSource: fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill),
+			canMemory:    src.Dirty.CanMaterializeFull(),
 		}
 		src.Unlock()
+		candidates = append(candidates, c)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		a, b := candidates[i], candidates[j]
+		if a.dirtySeq != b.dirtySeq {
+			return a.dirtySeq > b.dirtySeq
+		}
+		if a.shadowSource != b.shadowSource {
+			return a.shadowSource
+		}
+		if a.size != b.size {
+			return a.size > b.size
+		}
+		return a.baseRev > b.baseRev
+	})
 
-		if !haveData && shadowSource {
+	for _, c := range candidates {
+		var data []byte
+		size := c.size
+		haveData := size == 0
+
+		// Shadow-backed handles are authoritative in the shadow store. Their
+		// dirty buffer may have evicted parts and would materialize zeros.
+		if !haveData && c.shadowSource {
 			var err error
 			data, err = fs.shadowStore.ReadAll(fh.Path)
 			if err != nil {
 				log.Printf("open-handle preload shadow read failed for %s: %v", fh.Path, err)
-				continue
+			} else {
+				size = int64(len(data))
+				haveData = true
 			}
-			size = int64(len(data))
-			haveData = true
 		}
+
+		if !haveData && c.canMemory {
+			c.src.Lock()
+			if c.src.Dirty != nil {
+				size = c.src.Dirty.Size()
+				c.origSize = c.src.OrigSize
+				c.baseRev = c.src.BaseRev
+				c.isNew = c.src.IsNew
+				c.zeroBase = c.src.ZeroBase
+				if size == 0 {
+					haveData = true
+				} else if c.src.Dirty.CanMaterializeFull() {
+					data = c.src.Dirty.Bytes()
+					haveData = true
+				}
+			}
+			c.src.Unlock()
+		}
+
 		if !haveData {
 			continue
 		}
@@ -838,13 +892,17 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 			continue
 		}
 		fh.Dirty.ClearDirty()
-		fh.IsNew = isNew
-		fh.ZeroBase = zeroBase || (isNew && baseRev == 0)
-		fh.BaseRev = baseRev
-		fh.OrigSize = size
+		fh.IsNew = c.isNew
+		fh.ZeroBase = c.zeroBase || (c.isNew && c.baseRev == 0)
+		fh.BaseRev = c.baseRev
+		if c.isNew {
+			fh.OrigSize = 0
+		} else {
+			fh.OrigSize = c.origSize
+		}
 		fs.inodes.UpdateSize(fh.Ino, size)
-		if baseRev > 0 {
-			fs.inodes.UpdateRevision(fh.Ino, baseRev)
+		if c.baseRev > 0 {
+			fs.inodes.UpdateRevision(fh.Ino, c.baseRev)
 		}
 		return true
 	}
@@ -1496,6 +1554,23 @@ func cachedInfoFromStat(name string, stat *client.StatResult) CachedFileInfo {
 		item.Mode = stat.Mode
 	}
 	return item
+}
+
+func cachedInfoFromWriteBackMeta(name string, meta *WriteBackMeta) CachedFileInfo {
+	if meta == nil {
+		return CachedFileInfo{Name: name}
+	}
+	mtime := meta.Mtime
+	if mtime.IsZero() {
+		mtime = time.Now()
+	}
+	return CachedFileInfo{
+		Name:     name,
+		Size:     meta.Size,
+		IsDir:    false,
+		Mtime:    mtime,
+		Revision: meta.BaseRev,
+	}
 }
 
 func (fs *Dat9FS) cacheFileForPath(p string, size int64, mtime time.Time, revision int64) {
@@ -2931,9 +3006,7 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 	for i := int(input.Offset); i < len(dh.Entries); i++ {
 		e := dh.Entries[i]
 		if _, ok := fs.inodes.GetEntry(e.Ino); !ok {
-			childP := dirEntryChildPath(dh.Path, e.Name)
-			isDir := e.Mode&uint32(syscall.S_IFMT) == uint32(syscall.S_IFDIR)
-			e.Ino = fs.inodes.EnsureInode(childP, isDir, 0, time.Now())
+			e.Ino = fs.recreateDirEntryInode(dh.Path, e)
 			dh.Entries[i].Ino = e.Ino
 		}
 		entryOut := out.AddDirLookupEntry(gofuse.DirEntry{
@@ -2956,6 +3029,60 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 		}
 	}
 	return gofuse.OK
+}
+
+func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
+	childP := dirEntryChildPath(dirPath, e.Name)
+	if ino, ok := fs.inodes.GetInode(childP); ok {
+		return ino
+	}
+
+	isDir := e.Mode&uint32(syscall.S_IFMT) == uint32(syscall.S_IFDIR)
+	size := int64(0)
+	mtime := time.Now()
+	var revision int64
+	var mode uint32
+	hasMode := false
+
+	if item, ok := fs.dirEntryMetadata(dirPath, childP, e.Name); ok {
+		isDir = item.IsDir
+		size = item.Size
+		if !item.Mtime.IsZero() {
+			mtime = item.Mtime
+		}
+		revision = item.Revision
+		mode = item.Mode
+		hasMode = item.HasMode
+	}
+
+	ino := fs.inodes.EnsureInodeNoUpdate(childP, isDir, size, mtime)
+	if revision > 0 {
+		fs.inodes.UpdateRevision(ino, revision)
+	}
+	if hasMode {
+		fs.inodes.UpdateMode(ino, mode)
+	}
+	return ino
+}
+
+func (fs *Dat9FS) dirEntryMetadata(dirPath, childP, name string) (CachedFileInfo, bool) {
+	if fs.writeBack != nil {
+		if meta, ok := fs.writeBack.GetMeta(childP); ok {
+			return cachedInfoFromWriteBackMeta(name, meta), true
+		}
+	}
+	if fs.pendingIndex != nil {
+		if meta, ok := fs.pendingIndex.GetMeta(childP); ok {
+			return cachedInfoFromWriteBackMeta(name, meta), true
+		}
+	}
+	if fs.dirCache != nil {
+		result := fs.dirCache.Lookup(dirPath, name)
+		if result.kind == namespaceLookupPositive {
+			return result.item, true
+		}
+	}
+	return CachedFileInfo{}, false
 }
 
 func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
