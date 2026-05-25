@@ -1515,6 +1515,15 @@ func (fs *Dat9FS) remotePathExistsDetached(localPath string) (bool, error) {
 	return false, err
 }
 
+func (fs *Dat9FS) remotePathStatDetached(localPath string) (*client.StatResult, error) {
+	retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+	defer retryCancel()
+	statStart := fs.perfStart()
+	stat, err := fs.client.StatCtx(retryCtx, fs.remotePath(localPath))
+	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
+	return stat, err
+}
+
 func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string, mode uint32) error {
 	apiPath := fs.remotePath(localPath)
 	ctx, cf := fuseCtx(cancel)
@@ -2256,10 +2265,13 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err != nil {
 		if isTransientLookupErr(err) {
-			if exists, probeErr := fs.remotePathExistsDetached(childP); probeErr == nil && exists {
+			stat, probeErr := fs.remotePathStatDetached(childP)
+			if probeErr == nil && stat != nil && stat.HasMode && isSymlinkMode(stat.Mode) {
 				err = nil
 			} else if probeErr != nil {
 				log.Printf("symlink: probe created path %s failed: %v", childP, probeErr)
+			} else if stat != nil {
+				log.Printf("symlink: recovered path %s is not a symlink (hasMode=%t mode=%o)", childP, stat.HasMode, stat.Mode)
 			}
 		}
 	}

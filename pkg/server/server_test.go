@@ -997,6 +997,32 @@ func TestSymlinkRejectsOversizeBody(t *testing.T) {
 	}
 }
 
+func TestSymlinkAllowsMaxTargetWithWorstCaseJSONEscaping(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	target := strings.Repeat("\x01", backend.MaxSymlinkTargetBytes)
+	body, err := json.Marshal(map[string]string{"target": target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) > maxSymlinkBodyBytes {
+		t.Fatalf("test body length = %d exceeds symlink body cap %d", len(body), maxSymlinkBodyBytes)
+	}
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/escaped-max-link?symlink=1", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("symlink escaped max target status = %d, want %d: %s", resp.StatusCode, http.StatusOK, body)
+	}
+}
+
 func TestSymlinkReturns507WhenTenantStorageQuotaExceeded(t *testing.T) {
 	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 10}, SemanticWorkerOptions{})
 	ts := httptest.NewServer(s)

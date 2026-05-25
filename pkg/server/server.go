@@ -1983,7 +1983,9 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
 }
 
-const maxSymlinkBodyBytes = backend.MaxSymlinkTargetBytes + 1024
+// Worst-case JSON escaping can expand one target byte to six bytes (\u00XX),
+// plus fixed wrapper overhead for {"target":...}.
+const maxSymlinkBodyBytes = backend.MaxSymlinkTargetBytes*6 + 64
 
 func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path string) {
 	if !authorizeFS(w, r, FSOpWrite, path) {

@@ -1525,18 +1525,22 @@ func TestReadlinkRetriesTransientRead(t *testing.T) {
 	var out gofuse.EntryOut
 	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "link", &out)
 	if st != gofuse.OK {
-		t.Fatalf("Lookup status = %v, want OK", st)
+		t.Errorf("Lookup status = %v, want OK", st)
+		return
 	}
 
 	got, st := fs.Readlink(nil, &gofuse.InHeader{NodeId: out.NodeId})
 	if st != gofuse.OK {
-		t.Fatalf("Readlink status = %v, want OK", st)
+		t.Errorf("Readlink status = %v, want OK", st)
+		return
 	}
 	if string(got) != string(target) {
-		t.Fatalf("Readlink target = %q, want %q", got, target)
+		t.Errorf("Readlink target = %q, want %q", got, target)
+		return
 	}
 	if calls := getCalls.Load(); calls < 2 {
-		t.Fatalf("GET calls = %d, want retry", calls)
+		t.Errorf("GET calls = %d, want retry", calls)
+		return
 	}
 }
 
@@ -1639,16 +1643,63 @@ func TestSymlinkRecoversWhenInterruptedAfterRemoteCreate(t *testing.T) {
 	var out gofuse.EntryOut
 	st := fs.Symlink(nil, &gofuse.InHeader{NodeId: 1}, target, "link", &out)
 	if st != gofuse.OK {
-		t.Fatalf("Symlink status = %v, want OK", st)
+		t.Errorf("Symlink status = %v, want OK", st)
+		return
 	}
 	if got := postCalls.Load(); got != 1 {
-		t.Fatalf("POST calls = %d, want 1", got)
+		t.Errorf("POST calls = %d, want 1", got)
+		return
 	}
 	if got := headCalls.Load(); got == 0 {
-		t.Fatal("symlink retry did not probe created path")
+		t.Error("symlink retry did not probe created path")
+		return
 	}
 	if got := out.Mode & uint32(syscall.S_IFMT); got != uint32(syscall.S_IFLNK) {
-		t.Fatalf("Symlink mode type = %o, want symlink", got)
+		t.Errorf("Symlink mode type = %o, want symlink", got)
+		return
+	}
+}
+
+func TestSymlinkRecoveryRejectsNonSymlinkProbe(t *testing.T) {
+	const target = "../target"
+	var postCalls atomic.Int32
+	var headCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/link" && r.URL.RawQuery == "symlink=1":
+			postCalls.Add(1)
+			w.WriteHeader(statusClientClosedRequest)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/link":
+			headCalls.Add(1)
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(uint32(syscall.S_IFREG)|0o644), 10))
+			w.Header().Set("X-Dat9-Revision", "12")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Symlink(nil, &gofuse.InHeader{NodeId: 1}, target, "link", &out)
+	if st != gofuse.Status(syscall.EAGAIN) {
+		t.Errorf("Symlink status = %v, want EAGAIN", st)
+		return
+	}
+	if got := postCalls.Load(); got != 1 {
+		t.Errorf("POST calls = %d, want 1", got)
+		return
+	}
+	if got := headCalls.Load(); got == 0 {
+		t.Error("symlink recovery did not stat created path")
+		return
 	}
 }
 

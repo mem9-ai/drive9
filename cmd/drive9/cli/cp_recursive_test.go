@@ -394,13 +394,16 @@ func TestCpRecursiveRemoteToLocal_RejectsSymlinkInTree(t *testing.T) {
 	c := client.New(srv.URL, "")
 	err := Cp(c, []string{"-r", ":/src", dstLocal})
 	if err == nil {
-		t.Fatal("expected remote symlink reject error, got nil")
+		t.Error("expected remote symlink reject error, got nil")
+		return
 	}
 	if !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("error = %v, want 'symlink' message", err)
+		t.Errorf("error = %v, want 'symlink' message", err)
+		return
 	}
 	if _, statErr := os.Lstat(dstLocal); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("local destination should not be created after symlink reject, stat err=%v", statErr)
+		t.Errorf("local destination should not be created after symlink reject, stat err=%v", statErr)
+		return
 	}
 }
 
@@ -421,16 +424,20 @@ func TestCpRecursiveRemoteToRemote_RejectsSymlinkInTree(t *testing.T) {
 	c := client.New(srv.URL, "")
 	err := Cp(c, []string{"-r", ":/src", ":/dst"})
 	if err == nil {
-		t.Fatal("expected remote symlink reject error, got nil")
+		t.Error("expected remote symlink reject error, got nil")
+		return
 	}
 	if !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("error = %v, want 'symlink' message", err)
+		t.Errorf("error = %v, want 'symlink' message", err)
+		return
 	}
 	if len(mock.recordedCopies) > 0 {
-		t.Fatalf("expected no remote copies before symlink reject, got %v", mock.recordedCopies)
+		t.Errorf("expected no remote copies before symlink reject, got %v", mock.recordedCopies)
+		return
 	}
 	if len(mock.recordedMkdirs) > 0 {
-		t.Fatalf("expected no remote mkdirs before symlink reject, got %v", mock.recordedMkdirs)
+		t.Errorf("expected no remote mkdirs before symlink reject, got %v", mock.recordedMkdirs)
+		return
 	}
 }
 
