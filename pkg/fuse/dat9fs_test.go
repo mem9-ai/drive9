@@ -3106,8 +3106,47 @@ func TestCreatePreservesInputMode(t *testing.T) {
 	if !ok {
 		t.Fatal("created file handle not found")
 	}
+	fh.Lock()
+	defer fh.Unlock()
 	if !fh.HasPendingMode || fh.PendingMode != 0o755 {
 		t.Fatalf("pending mode = %o has=%t, want 0755 true", fh.PendingMode, fh.HasPendingMode)
+	}
+}
+
+func TestCreatePreservesZeroMode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+		Mode:     0,
+	}, "private.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	if got, want := out.Mode, uint32(syscall.S_IFREG); got != want {
+		t.Fatalf("Create mode = %o, want %o", got, want)
+	}
+
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("created inode not found")
+	}
+	if !entry.HasMode || entry.Mode != 0 {
+		t.Fatalf("inode mode = %o has=%t, want 000 true", entry.Mode, entry.HasMode)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("created file handle not found")
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if !fh.HasPendingMode || fh.PendingMode != 0 {
+		t.Fatalf("pending mode = %o has=%t, want 000 true", fh.PendingMode, fh.HasPendingMode)
 	}
 }
 
@@ -3808,6 +3847,10 @@ func TestReleaseNewEmptyFileUsesCreateAction(t *testing.T) {
 			if r.URL.Path != "/v1/fs/empty.txt" {
 				recordHandlerErr(fmt.Errorf("path = %s, want /v1/fs/empty.txt", r.URL.Path))
 				http.Error(w, "bad path", http.StatusBadRequest)
+				return
+			}
+			if r.URL.Query().Has("chmod") {
+				w.WriteHeader(http.StatusOK)
 				return
 			}
 			if !r.URL.Query().Has("create") {
@@ -5189,6 +5232,8 @@ func largeFlushStreamingMock(t *testing.T, fileSize int64, completeCh chan<- str
 			etag := fmt.Sprintf(`"etag-%d"`, etagSeq)
 			mu.Unlock()
 			w.Header().Set("ETag", etag)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/up-large/complete":
 			_, _ = io.Copy(io.Discard, r.Body)

@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -129,6 +130,57 @@ func TestCommitQueueAppliesModeAfterUpload(t *testing.T) {
 	}
 	if !bytes.Contains(chmodBody, []byte("493")) {
 		t.Fatalf("chmod body = %s, want decimal mode 493", chmodBody)
+	}
+}
+
+func TestCommitQueueChmodFailureKeepsPendingState(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","revision":9}`))
+		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
+			http.Error(w, "chmod failed", http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/exec-fail.sh", []byte("data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRevAndMode("/exec-fail.sh", 4, PendingNew, 0, 0o755, true); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.DrainAll()
+	err = cq.CommitNow(context.Background(), &CommitEntry{
+		Path:    "/exec-fail.sh",
+		Size:    4,
+		Kind:    PendingNew,
+		Mode:    0o755,
+		HasMode: true,
+	})
+	if err == nil {
+		t.Fatal("CommitNow should fail when chmod fails")
+	}
+	if !pending.HasPending("/exec-fail.sh") {
+		t.Fatal("pending entry should be retained when chmod fails")
+	}
+	if !shadow.Has("/exec-fail.sh") {
+		t.Fatal("shadow should be retained when chmod fails")
 	}
 }
 

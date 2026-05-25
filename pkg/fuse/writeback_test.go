@@ -533,6 +533,62 @@ func TestWriteBackUploader_UploadFailRetainsCache(t *testing.T) {
 	}
 }
 
+func TestWriteBackUploader_ChmodFailureRetainsCache(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
+			http.Error(w, "chmod failed", http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := newTestClient(ts.URL)
+	uploader := NewWriteBackUploader(c, cache, 1)
+
+	_ = cache.PutWithBaseRevAndMode("/mode-fail.txt", []byte("data"), 4, PendingNew, 0, 0o755, true)
+	uploader.Submit("/mode-fail.txt")
+	uploader.DrainAll()
+
+	if _, ok := cache.Get("/mode-fail.txt"); !ok {
+		t.Fatal("cache entry should be retained after chmod failure")
+	}
+}
+
+func TestWriteBackUploader_UploadSyncChmodFailureReturnsErrorAndRetainsCache(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
+			http.Error(w, "chmod failed", http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := newTestClient(ts.URL)
+	uploader := NewWriteBackUploader(c, cache, 1)
+
+	_ = cache.PutWithBaseRevAndMode("/mode-sync-fail.txt", []byte("data"), 4, PendingNew, 0, 0o755, true)
+	err := uploader.UploadSync(context.Background(), "/mode-sync-fail.txt")
+	if err == nil {
+		t.Fatal("UploadSync should fail when chmod fails")
+	}
+	if _, ok := cache.Get("/mode-sync-fail.txt"); !ok {
+		t.Fatal("cache entry should be retained after UploadSync chmod failure")
+	}
+	uploader.DrainAll()
+}
+
 func TestWriteBackUploader_PendingNewUsesCreateIfAbsent(t *testing.T) {
 	var gotExpected string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1217,6 +1273,9 @@ func newWriteSyncMultipartRecorder(t *testing.T, wantPath string) *writeSyncMult
 	}
 	rec.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+rec.wantPath && r.URL.Query().Has("chmod"):
+			w.WriteHeader(http.StatusOK)
+			return
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
 			var req struct {
 				Path      string `json:"path"`

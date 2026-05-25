@@ -15,6 +15,8 @@ import (
 	"github.com/mem9-ai/dat9/pkg/mountpath"
 )
 
+var errCommitPostUpload = errors.New("commit post-upload step failed")
+
 // directPutThreshold returns the size limit below which commit queue workers
 // use direct PUT (WriteCtxConditionalWithRevision) instead of multipart
 // upload. Must match the server's inline_threshold — the server rejects
@@ -586,9 +588,13 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		cancel()
 
 		if err == nil {
-			// Success — clean up.
-			cq.onCommitSuccess(entry, committedRev)
-			return
+			if err := cq.onCommitSuccess(entry, committedRev); err == nil {
+				return
+			} else {
+				lastErr = err
+				log.Printf("commit queue: post-upload attempt %d/%d failed for %s: %v", attempt+1, maxRetries, entry.Path, err)
+				continue
+			}
 		}
 		if cq.isEntryCanceled(entry) {
 			cq.removeFromQueue(entry)
@@ -605,6 +611,10 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 	}
 
 	log.Printf("commit queue: giving up on %s after %d retries: %v", entry.Path, maxRetries, lastErr)
+	if errors.Is(lastErr, errCommitPostUpload) {
+		cq.onCommitPostUploadFailure(entry, lastErr)
+		return
+	}
 	cq.onCommitTerminalFailure(entry)
 }
 
@@ -630,7 +640,12 @@ func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error 
 		}
 		return err
 	}
-	cq.onCommitSuccess(entry, committedRev)
+	if err := cq.onCommitSuccess(entry, committedRev); err != nil {
+		if cq.perf != nil {
+			cq.perf.commitFailure.add(1)
+		}
+		return err
+	}
 	return nil
 }
 
@@ -756,7 +771,7 @@ func (cq *CommitQueue) rebuildQueuedIndexLocked() {
 	}
 }
 
-func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) {
+func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) error {
 	if entry.HasMode {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		start := time.Now()
@@ -766,7 +781,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) {
 			cq.perf.recordRemoteOp(perfRemoteMutation, err, time.Since(start), 0)
 		}
 		if err != nil {
-			log.Printf("commit queue: chmod %s to %o failed after upload: %v", entry.Path, entry.Mode&0o777, err)
+			return fmt.Errorf("%w: chmod %s to %o: %v", errCommitPostUpload, entry.Path, entry.Mode&0o777, err)
 		}
 	}
 
@@ -779,7 +794,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) {
 		}); err != nil {
 			log.Printf("commit queue: journal commit marker failed for %s: %v (keeping local state)", entry.Path, err)
 			cq.removeFromQueue(entry)
-			return
+			return nil
 		}
 	}
 
@@ -808,6 +823,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) {
 		cq.perf.commitSuccess.add(1)
 	}
 	log.Printf("commit queue: successfully uploaded %s (%d bytes, rev=%d)", entry.Path, entry.Size, committedRev)
+	return nil
 }
 
 // tryAutoResolveConflict attempts to resolve a 409 conflict automatically.
@@ -887,7 +903,9 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	// Branch 1: idempotent — content already matches server.
 	if bytes.Equal(localData, serverData) {
 		log.Printf("commit queue: auto-resolved conflict for %s (idempotent, content matches server rev %d)", entry.Path, serverRev)
-		cq.onCommitSuccess(entry, 0)
+		if err := cq.onCommitSuccess(entry, 0); err != nil {
+			cq.onCommitPostUploadFailure(entry, err)
+		}
 		return
 	}
 
@@ -913,7 +931,17 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	}
 
 	log.Printf("commit queue: auto-resolved conflict for %s via LWW (overwrote rev %d → new upload based on rev %d)", entry.Path, entry.BaseRev, serverRev)
-	cq.onCommitSuccess(entry, 0)
+	if err := cq.onCommitSuccess(entry, 0); err != nil {
+		cq.onCommitPostUploadFailure(entry, err)
+	}
+}
+
+func (cq *CommitQueue) onCommitPostUploadFailure(entry *CommitEntry, err error) {
+	if cq.perf != nil {
+		cq.perf.commitFailure.add(1)
+	}
+	cq.removeFromQueue(entry)
+	log.Printf("commit queue: post-upload failure for %s; local pending state preserved for retry: %v", entry.Path, err)
 }
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
