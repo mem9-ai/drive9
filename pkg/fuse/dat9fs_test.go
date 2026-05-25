@@ -1914,6 +1914,57 @@ func TestLookupSSEForeignCreateInvalidatesSessionCreatedMiss(t *testing.T) {
 	}
 }
 
+func TestReadDirPlusRecreatesStaleSnapshotInode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+	fileIno := fs.inodes.Lookup("/dir/file.txt", false, 1, time.Now())
+	fs.inodes.Forget(fileIno, 1)
+	if _, ok := fs.inodes.GetEntry(fileIno); ok {
+		t.Fatalf("stale file inode %d is still mapped", fileIno)
+	}
+
+	dh := &DirHandle{
+		Ino:  dirIno,
+		Path: "/dir",
+		Entries: []DirEntry{{
+			Name: "file.txt",
+			Ino:  fileIno,
+			Mode: uint32(syscall.S_IFREG) | 0o644,
+		}},
+	}
+	fh := fs.dirHandles.Allocate(dh)
+	out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	st := fs.ReadDirPlus(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Size:     4096,
+	}, out)
+	if st != gofuse.OK {
+		t.Fatalf("ReadDirPlus status = %v, want OK", st)
+	}
+
+	newIno, ok := fs.inodes.GetInode("/dir/file.txt")
+	if !ok {
+		t.Fatal("file path was not remapped")
+	}
+	if newIno == fileIno {
+		t.Fatalf("file inode = %d, want a replacement for stale inode", newIno)
+	}
+	if dh.Entries[0].Ino != newIno {
+		t.Fatalf("snapshot inode = %d, want remapped inode %d", dh.Entries[0].Ino, newIno)
+	}
+	entry, ok := fs.inodes.GetEntry(newIno)
+	if !ok {
+		t.Fatalf("replacement inode %d is not mapped", newIno)
+	}
+	if entry.Nlookup != 1 {
+		t.Fatalf("replacement inode lookup refs = %d, want 1", entry.Nlookup)
+	}
+}
+
 func TestLookupSSEForeignDeleteInvalidatesPositiveNamespaceHit(t *testing.T) {
 	var headCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3275,6 +3326,48 @@ func TestLookupOpenCreatedFileAfterForgetSupportsGitChmodLock(t *testing.T) {
 	}
 	if got := remoteCalls.Load(); got != 0 {
 		t.Fatalf("remote calls = %d, want 0 for open-created lookup", got)
+	}
+}
+
+func TestOpenWritableCreatedFileUsesOpenLocalHandle(t *testing.T) {
+	var remoteCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted for open-created file", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT | syscall.O_EXCL),
+	}, "script.tmp", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	var openOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Flags:    uint32(syscall.O_WRONLY),
+	}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0 for open-created file", got)
+	}
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       openOut.Fh,
+		Offset:   0,
+	}, []byte("#!/bin/sh\n")); st != gofuse.OK {
+		t.Fatalf("Write through reopened handle status = %v, want OK", st)
 	}
 }
 

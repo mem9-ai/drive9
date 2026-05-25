@@ -785,6 +785,72 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 	return true
 }
 
+func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
+	if fs.openHandles == nil || fh == nil || fh.Dirty == nil {
+		return false
+	}
+
+	for _, src := range fs.openHandles.SnapshotPath(fh.Path) {
+		if src == nil || src == fh {
+			continue
+		}
+
+		src.Lock()
+		if src.Dirty == nil {
+			src.Unlock()
+			continue
+		}
+		size := src.Dirty.Size()
+		baseRev := src.BaseRev
+		isNew := src.IsNew
+		zeroBase := src.ZeroBase
+		shadowSource := fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill)
+
+		var data []byte
+		haveData := size == 0
+		if !haveData && src.Dirty.CanMaterializeFull() {
+			data = src.Dirty.Bytes()
+			haveData = true
+		}
+		src.Unlock()
+
+		if !haveData && shadowSource {
+			var err error
+			data, err = fs.shadowStore.ReadAll(fh.Path)
+			if err != nil {
+				log.Printf("open-handle preload shadow read failed for %s: %v", fh.Path, err)
+				continue
+			}
+			size = int64(len(data))
+			haveData = true
+		}
+		if !haveData {
+			continue
+		}
+
+		if len(data) > 0 {
+			if _, err := fh.Dirty.Write(0, data); err != nil {
+				log.Printf("open-handle preload failed for %s: %v", fh.Path, err)
+				continue
+			}
+		} else if err := fh.Dirty.Truncate(size); err != nil {
+			log.Printf("open-handle preload truncate failed for %s: %v", fh.Path, err)
+			continue
+		}
+		fh.Dirty.ClearDirty()
+		fh.IsNew = isNew
+		fh.ZeroBase = zeroBase || (isNew && baseRev == 0)
+		fh.BaseRev = baseRev
+		fh.OrigSize = size
+		fs.inodes.UpdateSize(fh.Ino, size)
+		if baseRev > 0 {
+			fs.inodes.UpdateRevision(fh.Ino, baseRev)
+		}
+		return true
+	}
+	return false
+}
+
 func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 	out.Ino = entry.Ino
 	out.Size = uint64(entry.Size)
@@ -2864,6 +2930,12 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 
 	for i := int(input.Offset); i < len(dh.Entries); i++ {
 		e := dh.Entries[i]
+		if _, ok := fs.inodes.GetEntry(e.Ino); !ok {
+			childP := dirEntryChildPath(dh.Path, e.Name)
+			isDir := e.Mode&uint32(syscall.S_IFMT) == uint32(syscall.S_IFDIR)
+			e.Ino = fs.inodes.EnsureInode(childP, isDir, 0, time.Now())
+			dh.Entries[i].Ino = e.Ino
+		}
 		entryOut := out.AddDirLookupEntry(gofuse.DirEntry{
 			Name: e.Name,
 			Ino:  e.Ino,
@@ -3177,6 +3249,9 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		// random writes don't discard the original file data.
 		if input.Flags&syscall.O_TRUNC == 0 {
 			preloaded := false
+			if fs.loadWritableHandleFromOpenHandleLocked(fh) {
+				preloaded = true
+			}
 			if fs.pendingIndex != nil && fs.shadowStore != nil {
 				if meta, ok := fs.pendingIndex.GetMeta(p); ok && fs.shadowStore.Has(p) {
 					if err := fs.loadWritableHandleFromShadowLocked(fh, meta); err == nil {
