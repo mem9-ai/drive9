@@ -40,6 +40,7 @@ type Dat9FS struct {
 	dirtyMu     sync.Mutex
 	dirtyInodes map[uint64]dirtyInodeState
 	dirtySeq    uint64
+	modeSeq     atomic.Uint64
 	uid         uint32
 	gid         uint32
 	opts        *MountOptions
@@ -632,6 +633,36 @@ func (fs *Dat9FS) modeForPendingHandle(fh *FileHandle) (uint32, bool) {
 	return 0, false
 }
 
+func (fs *Dat9FS) nextPendingModeGen() uint64 {
+	if fs == nil {
+		return 0
+	}
+	return fs.modeSeq.Add(1)
+}
+
+func (fs *Dat9FS) setPendingModeLocked(fh *FileHandle, mode uint32, gen uint64) {
+	if fh == nil {
+		return
+	}
+	if gen == 0 {
+		gen = fs.nextPendingModeGen()
+	}
+	fh.PendingMode = mode & 0o777
+	fh.HasPendingMode = true
+	fh.PendingModeGen = gen
+}
+
+func clearPendingModeLocked(fh *FileHandle) {
+	fh.HasPendingMode = false
+	fh.PendingModeGen = 0
+	fh.HasPreviousMode = false
+	fh.PreviousModeKnown = false
+}
+
+func pendingModeMatchesLocked(fh *FileHandle, mode uint32, gen uint64) bool {
+	return fh != nil && fh.HasPendingMode && fh.PendingModeGen == gen && fh.PendingMode&0o777 == mode&0o777
+}
+
 func (fs *Dat9FS) fileHandlesForInode(ino uint64) []*FileHandle {
 	var handles []*FileHandle
 	fs.fileHandles.ForEach(func(_ uint64, h *FileHandle) {
@@ -666,9 +697,20 @@ func (fs *Dat9FS) clearPendingModeForInodeExcept(ino uint64, skip *FileHandle) {
 			continue
 		}
 		h.Lock()
-		h.HasPendingMode = false
-		h.HasPreviousMode = false
-		h.PreviousModeKnown = false
+		clearPendingModeLocked(h)
+		h.Unlock()
+	}
+}
+
+func (fs *Dat9FS) clearPendingModeForInodeGeneration(ino uint64, skip *FileHandle, mode uint32, gen uint64) {
+	for _, h := range fs.fileHandlesForInode(ino) {
+		if h == skip {
+			continue
+		}
+		h.Lock()
+		if pendingModeMatchesLocked(h, mode, gen) {
+			clearPendingModeLocked(h)
+		}
 		h.Unlock()
 	}
 }
@@ -694,15 +736,16 @@ func (fs *Dat9FS) applyPendingModeForHandleLocked(ctx context.Context, fh *FileH
 	}
 	localPath := fh.Path
 	ino := fh.Ino
+	modeGen := fh.PendingModeGen
 	previousMode := fh.PreviousMode
 	hasPreviousMode := fh.HasPreviousMode
 	previousModeKnown := fh.PreviousModeKnown
 	if !shouldApplyRemoteMode(fs.pendingKindForHandle(fh), hasMode, mode) {
-		fh.HasPendingMode = false
-		fh.HasPreviousMode = false
-		fh.PreviousModeKnown = false
+		if pendingModeMatchesLocked(fh, mode, modeGen) {
+			clearPendingModeLocked(fh)
+		}
 		fh.Unlock()
-		fs.clearPendingModeForInodeExcept(ino, fh)
+		fs.clearPendingModeForInodeGeneration(ino, fh, mode, modeGen)
 		fh.Lock()
 		return nil
 	}
@@ -713,18 +756,30 @@ func (fs *Dat9FS) applyPendingModeForHandleLocked(ctx context.Context, fh *FileH
 	})
 	fh.Lock()
 	if err != nil {
+		if !pendingModeMatchesLocked(fh, mode, modeGen) {
+			return nil
+		}
 		if hasPreviousMode {
 			fs.inodes.SetModeState(ino, previousMode, previousModeKnown)
 		}
 		return err
 	}
-	fh.HasPendingMode = false
-	fh.HasPreviousMode = false
-	fh.PreviousModeKnown = false
+	if !pendingModeMatchesLocked(fh, mode, modeGen) {
+		return nil
+	}
+	fs.inodes.UpdateMode(ino, mode)
+	clearPendingModeLocked(fh)
 	fh.Unlock()
-	fs.clearPendingModeForInodeExcept(ino, fh)
+	fs.clearPendingModeForInodeGeneration(ino, fh, mode, modeGen)
 	fh.Lock()
 	return nil
+}
+
+func (fs *Dat9FS) applyPendingModeWithTimeoutLocked(fh *FileHandle) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err := fs.applyPendingModeForHandleLocked(ctx, fh)
+	cancel()
+	return err
 }
 
 func expectedRevisionForHandle(fh *FileHandle) int64 {
@@ -872,8 +927,7 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 	}
 	if meta.HasMode {
 		mode := meta.Mode & 0o777
-		fh.PendingMode = mode
-		fh.HasPendingMode = true
+		fs.setPendingModeLocked(fh, mode, 0)
 		fs.inodes.UpdateMode(fh.Ino, mode)
 	}
 	return nil
@@ -905,8 +959,7 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 	}
 	if meta.HasMode {
 		mode := meta.Mode & 0o777
-		fh.PendingMode = mode
-		fh.HasPendingMode = true
+		fs.setPendingModeLocked(fh, mode, 0)
 		fs.inodes.UpdateMode(fh.Ino, mode)
 	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, int64(len(data)))
@@ -2372,12 +2425,12 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		// If the file has an open dirty handle, update mode locally without
 		// consulting the remote server. The mode will be synced on Flush.
 		hasDirtyHandle := false
+		modeGen := fs.nextPendingModeGen()
 		for _, h := range fs.fileHandlesForInode(input.NodeId) {
 			h.Lock()
 			if h.Dirty != nil {
 				hasDirtyHandle = true
-				h.PendingMode = mode
-				h.HasPendingMode = true
+				fs.setPendingModeLocked(h, mode, modeGen)
 				if !h.HasPreviousMode {
 					if entry.HasMode {
 						h.PreviousMode = entry.Mode
@@ -3480,8 +3533,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		WritePolicy: fs.writePolicyForOpen(input.Flags),
 	}
 	if hasRemoteMode {
-		fh.PendingMode = mode
-		fh.HasPendingMode = true
+		fs.setPendingModeLocked(fh, mode, 0)
 	}
 
 	if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
@@ -4318,7 +4370,7 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 		log.Printf("write-sync upload failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
 	}
-	if err := fs.applyPendingModeForHandleLocked(ctx, fh); err != nil {
+	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 		log.Printf("write-sync pending chmod failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
 	}
@@ -4372,7 +4424,7 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 			log.Printf("sync handle shadowspill upload failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
-		if err := fs.applyPendingModeForHandleLocked(ctx, fh); err != nil {
+		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 			log.Printf("sync handle shadowspill pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
@@ -4558,7 +4610,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				log.Printf("flush: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
 				return gofuse.EIO
 			}
-			if err := fs.applyPendingModeForHandleLocked(ctx, fh); err != nil {
+			if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 				log.Printf("flush: ShadowSpill pending chmod failed for %s: %v", fh.Path, err)
 				return httpToFuseStatus(err)
 			}
@@ -4722,7 +4774,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			log.Printf("fsync: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
 			return gofuse.EIO
 		}
-		if err := fs.applyPendingModeForHandleLocked(ctx, fh); err != nil {
+		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 			log.Printf("fsync: ShadowSpill pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
@@ -4751,11 +4803,11 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}
 		if fh.HasPendingMode {
 			ino := fh.Ino
-			fh.HasPendingMode = false
-			fh.HasPreviousMode = false
-			fh.PreviousModeKnown = false
+			mode := fh.PendingMode & 0o777
+			modeGen := fh.PendingModeGen
+			clearPendingModeLocked(fh)
 			fh.Unlock()
-			fs.clearPendingModeForInodeExcept(ino, fh)
+			fs.clearPendingModeForInodeGeneration(ino, fh, mode, modeGen)
 			fh.Lock()
 		}
 		// UploadSync already persisted the data to the server. Clear
@@ -4796,6 +4848,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			fh.Lock()
 			hasPendingMode := fh.HasPendingMode
 			pendingMode := fh.PendingMode & 0o777
+			pendingModeGen := fh.PendingModeGen
 			previousMode := fh.PreviousMode
 			hasPreviousMode := fh.HasPreviousMode
 			previousModeKnown := fh.PreviousModeKnown
@@ -4814,21 +4867,40 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				cf()
 				if err != nil {
 					log.Printf("release: pending chmod failed for %s: %v", localPath, err)
-					if hasPreviousMode {
+					fh.Lock()
+					stillCurrent := pendingModeMatchesLocked(fh, pendingMode, pendingModeGen)
+					fh.Unlock()
+					if stillCurrent && hasPreviousMode {
 						fs.inodes.SetModeState(ino, previousMode, previousModeKnown)
 					}
 					return
 				}
-				fs.inodes.UpdateMode(ino, pendingMode)
-				fs.clearPendingModeForInode(ino)
+				fh.Lock()
+				stillCurrent := pendingModeMatchesLocked(fh, pendingMode, pendingModeGen)
+				if stillCurrent {
+					clearPendingModeLocked(fh)
+				}
+				fh.Unlock()
+				if stillCurrent {
+					fs.inodes.UpdateMode(ino, pendingMode)
+					fs.clearPendingModeForInodeGeneration(ino, fh, pendingMode, pendingModeGen)
+				}
 				return
 			}
 
 			// Flush failed — revert the in-memory mode so local GetAttr doesn't lie.
-			if hasPreviousMode {
+			fh.Lock()
+			stillCurrent := pendingModeMatchesLocked(fh, pendingMode, pendingModeGen)
+			if stillCurrent {
+				clearPendingModeLocked(fh)
+			}
+			fh.Unlock()
+			if stillCurrent && hasPreviousMode {
 				fs.inodes.SetModeState(ino, previousMode, previousModeKnown)
 			}
-			fs.clearPendingModeForInode(ino)
+			if stillCurrent {
+				fs.clearPendingModeForInodeGeneration(ino, fh, pendingMode, pendingModeGen)
+			}
 		}()
 
 		// Unpin shadow if this handle pinned it, so deferred removals can proceed.
@@ -5247,7 +5319,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			log.Printf("finish streaming failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
-		if err := fs.applyPendingModeForHandleLocked(ctx, fh); err != nil {
+		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 			log.Printf("finish streaming pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
@@ -5309,7 +5381,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			log.Printf("upload all parts failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
-		if err := fs.applyPendingModeForHandleLocked(ctx, fh); err != nil {
+		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 			log.Printf("upload all pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
@@ -5427,7 +5499,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		log.Printf("flush upload failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
 	}
-	if err := fs.applyPendingModeForHandleLocked(ctx, fh); err != nil {
+	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 		log.Printf("flush pending chmod failed for %s: %v", fh.Path, err)
 		return httpToFuseStatus(err)
 	}

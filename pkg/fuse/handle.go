@@ -32,6 +32,7 @@ type FileHandle struct {
 	WritePolicy       WritePolicy // per-handle remote durability policy chosen at open/create
 	PendingMode       uint32      // mode change deferred because a dirty handle was open
 	HasPendingMode    bool        // true when PendingMode should be applied on Release
+	PendingModeGen    uint64      // generation for PendingMode, used to avoid clearing newer chmods
 	PreviousMode      uint32      // mode before PendingMode was set (for rollback on flush failure)
 	HasPreviousMode   bool        // true when previous mode state was snapshotted
 	PreviousModeKnown bool        // true when PreviousMode was authoritative
