@@ -94,16 +94,20 @@ func (u *WriteBackUploader) remotePath(localPath string) string {
 }
 
 func (u *WriteBackUploader) applyMode(ctx context.Context, meta *WriteBackMeta) error {
-	if meta == nil || !meta.HasMode {
+	if meta == nil || !shouldApplyRemoteMode(meta.Kind, meta.HasMode, meta.Mode) {
 		return nil
 	}
-	start := time.Now()
-	err := u.client.ChmodCtx(ctx, u.remotePath(meta.Path), meta.Mode&0o777)
-	if u.perf != nil {
-		u.perf.recordRemoteOp(perfRemoteMutation, err, time.Since(start), 0)
-	}
+	mode := meta.Mode & 0o777
+	err := retryPostUploadMode(ctx, func() error {
+		start := time.Now()
+		applyErr := u.client.ChmodCtx(ctx, u.remotePath(meta.Path), mode)
+		if u.perf != nil {
+			u.perf.recordRemoteOp(perfRemoteMutation, applyErr, time.Since(start), 0)
+		}
+		return applyErr
+	})
 	if err != nil {
-		return fmt.Errorf("writeback upload chmod %s to %o: %w", meta.Path, meta.Mode&0o777, err)
+		return fmt.Errorf("writeback upload chmod %s to %o: %w", meta.Path, mode, err)
 	}
 	return nil
 }

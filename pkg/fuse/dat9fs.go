@@ -615,7 +615,8 @@ func (fs *Dat9FS) pendingKindForHandle(fh *FileHandle) PendingKind {
 }
 
 func createInputMode(inputMode uint32) (uint32, bool) {
-	return inputMode & 0o777, true
+	mode := inputMode & 0o777
+	return mode, mode != defaultRegularFileMode
 }
 
 // modeForPendingHandle returns the mode that still needs to be committed to
@@ -693,9 +694,19 @@ func (fs *Dat9FS) applyPendingModeForHandleLocked(ctx context.Context, fh *FileH
 	ino := fh.Ino
 	previousMode := fh.PreviousMode
 	hasPreviousMode := fh.HasPreviousMode
+	if !shouldApplyRemoteMode(fs.pendingKindForHandle(fh), hasMode, mode) {
+		fh.HasPendingMode = false
+		fh.HasPreviousMode = false
+		fh.Unlock()
+		fs.clearPendingModeForInodeExcept(ino, fh)
+		fh.Lock()
+		return nil
+	}
 
 	fh.Unlock()
-	err := fs.applyRemoteMode(ctx, localPath, mode)
+	err := retryPostUploadMode(ctx, func() error {
+		return fs.applyRemoteMode(ctx, localPath, mode)
+	})
 	fh.Lock()
 	if err != nil {
 		if hasPreviousMode {

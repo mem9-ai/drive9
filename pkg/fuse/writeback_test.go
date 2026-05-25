@@ -560,6 +560,43 @@ func TestWriteBackUploader_ChmodFailureRetainsCache(t *testing.T) {
 	}
 }
 
+func TestWriteBackUploaderSkipsDefaultModeForPendingNew(t *testing.T) {
+	var putCalls atomic.Int32
+	var chmodCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			putCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
+			chmodCalls.Add(1)
+			http.Error(w, "unexpected chmod", http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := newTestClient(ts.URL)
+	uploader := NewWriteBackUploader(c, cache, 1)
+
+	_ = cache.PutWithBaseRevAndMode("/plain.txt", []byte("data"), 4, PendingNew, 0, defaultRegularFileMode, true)
+	uploader.Submit("/plain.txt")
+	uploader.DrainAll()
+
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("PUT calls = %d, want 1", got)
+	}
+	if got := chmodCalls.Load(); got != 0 {
+		t.Fatalf("chmod calls = %d, want 0", got)
+	}
+	if _, ok := cache.Get("/plain.txt"); ok {
+		t.Fatal("cache entry should be removed after successful default-mode upload")
+	}
+}
+
 func TestWriteBackUploader_UploadSyncChmodFailureReturnsErrorAndRetainsCache(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {

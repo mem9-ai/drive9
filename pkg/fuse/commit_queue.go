@@ -591,9 +591,9 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			if err := cq.onCommitSuccess(entry, committedRev); err == nil {
 				return
 			} else {
-				lastErr = err
 				log.Printf("commit queue: post-upload attempt %d/%d failed for %s: %v", attempt+1, maxRetries, entry.Path, err)
-				continue
+				cq.onCommitPostUploadFailure(entry, err)
+				return
 			}
 		}
 		if cq.isEntryCanceled(entry) {
@@ -772,16 +772,21 @@ func (cq *CommitQueue) rebuildQueuedIndexLocked() {
 }
 
 func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) error {
-	if entry.HasMode {
+	if shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		start := time.Now()
-		err := cq.client.ChmodCtx(ctx, cq.remotePath(entry.Path), entry.Mode&0o777)
+		var err error
+		mode := entry.Mode & 0o777
+		err = retryPostUploadMode(ctx, func() error {
+			start := time.Now()
+			applyErr := cq.client.ChmodCtx(ctx, cq.remotePath(entry.Path), mode)
+			if cq.perf != nil {
+				cq.perf.recordRemoteOp(perfRemoteMutation, applyErr, time.Since(start), 0)
+			}
+			return applyErr
+		})
 		cancel()
-		if cq.perf != nil {
-			cq.perf.recordRemoteOp(perfRemoteMutation, err, time.Since(start), 0)
-		}
 		if err != nil {
-			return fmt.Errorf("%w: chmod %s to %o: %v", errCommitPostUpload, entry.Path, entry.Mode&0o777, err)
+			return fmt.Errorf("%w: chmod %s to %o: %w", errCommitPostUpload, entry.Path, mode, err)
 		}
 	}
 

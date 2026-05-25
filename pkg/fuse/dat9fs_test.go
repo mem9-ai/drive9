@@ -3150,6 +3150,35 @@ func TestCreatePreservesZeroMode(t *testing.T) {
 	}
 }
 
+func TestCreateDefaultModeDoesNotStageRemoteMode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+		Mode:     defaultRegularFileMode,
+	}, "plain.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	if got, want := out.Mode, uint32(syscall.S_IFREG)|defaultRegularFileMode; got != want {
+		t.Fatalf("Create mode = %o, want %o", got, want)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("created file handle not found")
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if fh.HasPendingMode {
+		t.Fatalf("default create mode should not require remote chmod, got pending %o", fh.PendingMode)
+	}
+}
+
 func TestLookupPendingIndexPreservesMode(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
