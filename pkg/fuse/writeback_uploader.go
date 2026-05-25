@@ -394,9 +394,6 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 		if u.perf != nil {
 			u.perf.uploaderFailure.add(1)
 		}
-		if _, markErr := u.cache.MarkChmodPending(localPath, gen); markErr != nil {
-			return fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
-		}
 		return err
 	}
 	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -405,6 +402,9 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 	if err != nil {
 		if u.perf != nil {
 			u.perf.uploaderFailure.add(1)
+		}
+		if _, markErr := u.cache.MarkChmodPending(localPath, gen); markErr != nil {
+			return fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
 		}
 		return err
 	}

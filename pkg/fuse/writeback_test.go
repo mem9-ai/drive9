@@ -684,6 +684,54 @@ func TestWriteBackUploader_UploadSyncChmodFailureReturnsErrorAndRetainsCache(t *
 	if _, ok := cache.Get("/mode-sync-fail.txt"); !ok {
 		t.Fatal("cache entry should be retained after UploadSync chmod failure")
 	}
+	meta, ok := cache.GetMeta("/mode-sync-fail.txt")
+	if !ok {
+		t.Fatal("cache metadata should be retained after UploadSync chmod failure")
+	}
+	if meta.Kind != PendingChmod {
+		t.Fatalf("meta kind = %v, want PendingChmod", meta.Kind)
+	}
+	uploader.DrainAll()
+}
+
+func TestWriteBackUploader_UploadSyncUploadFailureRetainsDataPendingKind(t *testing.T) {
+	var chmodCalled atomic.Bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			http.Error(w, "upload failed", http.StatusInternalServerError)
+		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
+			chmodCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := newTestClient(ts.URL)
+	uploader := NewWriteBackUploader(c, cache, 1)
+
+	_ = cache.PutWithBaseRevAndMode("/sync-upload-fail.txt", []byte("data"), 4, PendingNew, 0, 0o755, true)
+	err := uploader.UploadSync(context.Background(), "/sync-upload-fail.txt")
+	if err == nil {
+		t.Fatal("UploadSync should fail when data upload fails")
+	}
+	if data, ok := cache.Get("/sync-upload-fail.txt"); !ok || string(data) != "data" {
+		t.Fatalf("cache data = %q, %v; want retained data", string(data), ok)
+	}
+	meta, ok := cache.GetMeta("/sync-upload-fail.txt")
+	if !ok {
+		t.Fatal("cache metadata should be retained after upload failure")
+	}
+	if meta.Kind != PendingNew {
+		t.Fatalf("meta kind = %v, want PendingNew", meta.Kind)
+	}
+	if chmodCalled.Load() {
+		t.Fatal("chmod should not be attempted after upload failure")
+	}
 	uploader.DrainAll()
 }
 
