@@ -44,6 +44,8 @@ const (
 	StorageS3  StorageType = "s3"
 )
 
+const fileTypeModeMask uint32 = 0o170000
+
 type StorageEncryptionMode string
 
 const (
@@ -974,7 +976,14 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 		return ErrNotFound
 	}
 
-	mode = mode & 0o777
+	var currentMode uint32
+	if err := s.db.QueryRowContext(ctx, `SELECT mode FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED'`, inodeID).Scan(&currentMode); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	mode = (mode & 0o777) | (currentMode & fileTypeModeMask)
 	res, err := s.db.ExecContext(ctx, `UPDATE inodes SET mode = ? WHERE inode_id = ? AND status = 'CONFIRMED'`, mode, inodeID)
 	if err != nil {
 		return err

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -184,6 +185,9 @@ func copyTreeRemoteToLocal(ctx context.Context, c *client.Client, srcRemote, dst
 		files []remoteFileEntry // relative paths to download
 	)
 	walkErr := walkRemoteTreeBFS(ctx, c, srcRemote, func(rel string, info client.FileInfo) error {
+		if remoteInfoIsSymlink(info) {
+			return fmt.Errorf("recursive copy does not support symlinks yet (path: %s)", rel)
+		}
 		if info.IsDir {
 			dirs = append(dirs, remoteDirEntry{rel: rel})
 			return nil
@@ -288,6 +292,9 @@ func copyTreeRemoteToRemote(ctx context.Context, c *client.Client, srcRemote, ds
 		files []remoteCopyPlanItem // src+dst pairs
 	)
 	walkErr := walkRemoteTreeBFS(ctx, c, srcRemote, func(rel string, info client.FileInfo) error {
+		if remoteInfoIsSymlink(info) {
+			return fmt.Errorf("recursive copy does not support symlinks yet (path: %s)", rel)
+		}
 		dstPath, joinErr := joinRemoteSafe(dstRemote, rel)
 		if joinErr != nil {
 			return joinErr
@@ -571,6 +578,10 @@ func walkRemoteTreeBFS(ctx context.Context, c *client.Client, root string, visit
 		}
 	}
 	return nil
+}
+
+func remoteInfoIsSymlink(info client.FileInfo) bool {
+	return info.HasMode && info.Mode&uint32(syscall.S_IFMT) == uint32(syscall.S_IFLNK)
 }
 
 // uploadOneFile streams a single local file to the remote destination.

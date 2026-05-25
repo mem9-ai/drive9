@@ -602,7 +602,7 @@ func isScopedFSPostQueryAllowed(q url.Values) bool {
 	// no selector = deny (no handler matches the dispatcher's else branch
 	// for scoped tokens — that's "unknown POST action" which is a 400 for
 	// owner today, and we don't want to silently widen for scoped).
-	selectors := []string{"append", "copy", "rename", "mkdir", "chmod", "create"}
+	selectors := []string{"append", "copy", "rename", "mkdir", "chmod", "create", "symlink"}
 	selectorCount := 0
 	var selectorKey string
 	for _, k := range selectors {
@@ -639,6 +639,9 @@ func isScopedFSPostQueryAllowed(q url.Values) bool {
 	case "create":
 		// handleCreate reads only ?create.
 		return queryKeysSubsetOf(q, []string{"create"})
+	case "symlink":
+		// handleSymlink reads only ?symlink; target is in the JSON body.
+		return queryKeysSubsetOf(q, []string{"symlink"})
 	default:
 		return false
 	}
@@ -873,6 +876,8 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 			s.handleChmod(w, r, path)
 		} else if r.URL.Query().Has("create") {
 			s.handleCreate(w, r, path)
+		} else if r.URL.Query().Has("symlink") {
+			s.handleSymlink(w, r, path)
 		} else {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_unknown_post_action", "path", path)...)
 			errJSON(w, http.StatusBadRequest, "unknown POST action")
@@ -1974,6 +1979,65 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "create_ok", "path", path)...)
 	s.publishEvent(r, path, "create")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
+}
+
+// Worst-case JSON escaping can expand one target byte to six bytes (\u00XX),
+// plus fixed wrapper overhead for {"target":...}.
+const maxSymlinkBodyBytes = backend.MaxSymlinkTargetBytes*6 + 64
+
+func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path string) {
+	if !authorizeFS(w, r, FSOpWrite, path) {
+		return
+	}
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_missing_scope", "path", path)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	var req struct {
+		Target string `json:"target"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxSymlinkBodyBytes)).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_body_too_large", "path", path, "max", maxSymlinkBodyBytes)...)
+			errJSON(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_bad_body", "path", path, "error", err)...)
+		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if err := b.CreateSymlinkCtx(r.Context(), path, req.Target); err != nil {
+		if errors.Is(err, backend.ErrInvalidSymlinkTarget) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_invalid_target", "path", path, "error", err)...)
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrUploadTooLarge) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_upload_too_large", "path", path, "error", err)...)
+			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_storage_quota_exceeded", "path", path, "error", err)...)
+			errJSON(w, http.StatusInsufficientStorage, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrPathConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_conflict", "path", path, "error", err)...)
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "symlink_failed", "path", path, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "symlink_ok", "path", path)...)
+	s.publishEvent(r, path, "symlink")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
 }

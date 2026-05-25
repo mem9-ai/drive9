@@ -15,8 +15,8 @@ including local single-tenant validation via `drive9-server-local`.
 |--------|--------------------|
 | `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download |
 | `api-smoke-test-existing-key.sh` | Existing API key status/list checks |
-| `cli-smoke-test.sh` | End-to-end CLI workflow including `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
-| `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/rename/stat semantics, cross-channel consistency, read-only and error-path checks |
+| `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
+| `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/symlink/rename/stat semantics, cross-channel consistency, read-only and error-path checks |
 | `fuse-release-gate.sh` | Strict FUSE release/CI gate with hard prereq failures, small-repo git clone/status/log, durable umount/remount, and mount-log audit |
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
 | `smoke-all.sh` | Runs API + CLI + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail |

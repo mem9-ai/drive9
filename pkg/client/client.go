@@ -506,6 +506,33 @@ func (c *Client) CreateFileCtx(ctx context.Context, path string) (int64, error) 
 	return result.Revision, nil
 }
 
+// Symlink creates a symbolic link at linkPath pointing to target.
+func (c *Client) Symlink(target, linkPath string) error {
+	return c.SymlinkCtx(context.Background(), target, linkPath)
+}
+
+// SymlinkCtx creates a symbolic link with context support.
+func (c *Client) SymlinkCtx(ctx context.Context, target, linkPath string) error {
+	body, err := json.Marshal(map[string]string{"target": target})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(linkPath)+"?symlink=1", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return readError(resp)
+	}
+	return nil
+}
+
 func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
 	if err != nil {
