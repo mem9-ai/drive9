@@ -98,12 +98,13 @@ func runDoctor(args []string, deps doctorDeps) error {
 	if len(args) == 0 {
 		return errors.New(doctorUsage())
 	}
+	if IsHelpArg(args[0]) {
+		_, _ = fmt.Fprint(deps.stdout, doctorUsage())
+		return nil
+	}
 	switch args[0] {
 	case "fuse":
 		return runDoctorFuse(args[1:], deps)
-	case "-h", "-help", "--help", "help":
-		_, _ = fmt.Fprint(deps.stdout, doctorUsage())
-		return nil
 	default:
 		return fmt.Errorf("unknown doctor command %q\n%s", args[0], doctorUsage())
 	}

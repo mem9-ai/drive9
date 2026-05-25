@@ -219,6 +219,58 @@ func TestCtxRmFSScopedEmitsServerNotRevokedWarning(t *testing.T) {
 	}
 }
 
+func TestCtxRmRemovesDashPrefixedContextNames(t *testing.T) {
+	seedThreeContexts(t)
+	cfg := loadConfig()
+	if _, err := ctxAdd(cfg, "-foo", &Context{Type: PrincipalFSScoped, Server: "https://s", APIKey: "dat9_scoped", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatalf("ctxAdd -foo: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+
+	out, err := captureStdoutE(t, func() error {
+		return Ctx([]string{"rm", "-foo"})
+	})
+	if err != nil {
+		t.Fatalf("ctx rm -foo: %v", err)
+	}
+	if !strings.Contains(out, "removed local context") {
+		t.Fatalf("missing success line, got: %s", out)
+	}
+	if _, ok := loadConfig().Contexts["-foo"]; ok {
+		t.Fatal("local -foo context still present after rm")
+	}
+}
+
+func TestCtxRmRemovesHelpAliasContextNames(t *testing.T) {
+	for _, name := range []string{"help", "-h", "-help", "--help"} {
+		t.Run(name, func(t *testing.T) {
+			seedThreeContexts(t)
+			cfg := loadConfig()
+			if _, err := ctxAdd(cfg, name, &Context{Type: PrincipalFSScoped, Server: "https://s", APIKey: "dat9_scoped", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+				t.Fatalf("ctxAdd %q: %v", name, err)
+			}
+			if err := saveConfig(cfg); err != nil {
+				t.Fatalf("saveConfig: %v", err)
+			}
+
+			out, err := captureStdoutE(t, func() error {
+				return Ctx([]string{"rm", name})
+			})
+			if err != nil {
+				t.Fatalf("ctx rm %q: %v", name, err)
+			}
+			if !strings.Contains(out, "removed local context") {
+				t.Fatalf("missing success line, got: %s", out)
+			}
+			if _, ok := loadConfig().Contexts[name]; ok {
+				t.Fatalf("local %q context still present after rm", name)
+			}
+		})
+	}
+}
+
 // TestCtxRmOwnerRequiresConfirmation verifies the [y/N] prompt on
 // owner-context removal. A "no" answer (empty line) MUST abort the
 // removal so owner key loss is never accidental.

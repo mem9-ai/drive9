@@ -95,6 +95,100 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 	}
 }
 
+func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		cmd       string
+		args      []string
+		firstLine string
+	}{
+		{
+			name:      "ctx",
+			cmd:       "ctx",
+			args:      []string{"--help"},
+			firstLine: "usage: drive9 ctx <show|add|import|fork|ls|use|rm>",
+		},
+		{
+			name:      "ctx rm",
+			cmd:       "ctx",
+			args:      []string{"rm", "--help"},
+			firstLine: "usage: drive9 ctx rm <name>",
+		},
+		{
+			name:      "journal",
+			cmd:       "journal",
+			args:      []string{"--help"},
+			firstLine: "usage: drive9 journal <new|append|cat|find|verify>",
+		},
+		{
+			name:      "vault",
+			cmd:       "vault",
+			args:      []string{"--help"},
+			firstLine: "usage drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+
+			origExit := exitFunc
+			origStdout := os.Stdout
+			origStderr := os.Stderr
+			origStop := cpuProfileStop
+			t.Cleanup(func() {
+				exitFunc = origExit
+				os.Stdout = origStdout
+				os.Stderr = origStderr
+				cpuProfileStop = origStop
+			})
+			cpuProfileStop = func() {}
+
+			var exitCodes []int
+			exitFunc = func(code int) { exitCodes = append(exitCodes, code) }
+
+			stdoutR, stdoutW, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("stdout pipe: %v", err)
+			}
+			stderrR, stderrW, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("stderr pipe: %v", err)
+			}
+			os.Stdout = stdoutW
+			os.Stderr = stderrW
+
+			stdoutDone := make(chan string, 1)
+			stderrDone := make(chan string, 1)
+			go func() {
+				var buf bytes.Buffer
+				_, _ = io.Copy(&buf, stdoutR)
+				stdoutDone <- buf.String()
+			}()
+			go func() {
+				var buf bytes.Buffer
+				_, _ = io.Copy(&buf, stderrR)
+				stderrDone <- buf.String()
+			}()
+
+			dispatch(tc.cmd, tc.args)
+
+			_ = stdoutW.Close()
+			_ = stderrW.Close()
+			stdout := <-stdoutDone
+			stderr := <-stderrDone
+
+			if len(exitCodes) != 0 {
+				t.Errorf("exit codes = %v, want no fatal/usage exit", exitCodes)
+			}
+			if !strings.HasPrefix(stdout, tc.firstLine) {
+				t.Errorf("stdout = %q, want first line %q", stdout, tc.firstLine)
+			}
+			if stderr != "" {
+				t.Errorf("stderr = %q, want empty stderr for explicit help", stderr)
+			}
+		})
+	}
+}
+
 // V2b: `drive9 vault <sub>` MUST route to the vault handler with args forwarded
 // verbatim (no shell parsing, no arg mangling). This is the positive half of
 // the hard-cut contract: the new verb name is live.

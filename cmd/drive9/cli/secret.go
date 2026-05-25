@@ -31,7 +31,11 @@ const (
 // rationale on fail-loud > silent-drop.
 func Secret(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>")
+		return fmt.Errorf("%s", vaultUsage())
+	}
+	if IsHelpArg(args[0]) {
+		_, _ = fmt.Fprintln(os.Stdout, vaultUsage())
+		return nil
 	}
 	switch args[0] {
 	case "set":
@@ -52,11 +56,13 @@ func Secret(args []string) error {
 		return SecretRevoke(args[1:])
 	case "audit":
 		return SecretAudit(args[1:])
-	case "-h", "--help", "help":
-		return fmt.Errorf("usage drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>")
 	default:
 		return fmt.Errorf("unknown vault command %q", args[0])
 	}
+}
+
+func vaultUsage() string {
+	return "usage drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>"
 }
 
 // SecretSet creates a new secret. It deliberately does NOT update in place on
