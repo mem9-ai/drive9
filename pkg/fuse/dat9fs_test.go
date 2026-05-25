@@ -1914,6 +1914,181 @@ func TestLookupSSEForeignCreateInvalidatesSessionCreatedMiss(t *testing.T) {
 	}
 }
 
+func TestReadDirPlusRecreatesStaleSnapshotInode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	mtime := time.Now().Add(-time.Minute)
+	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+	fileIno := fs.inodes.Lookup("/dir/file.txt", false, 1, time.Now())
+	fs.inodes.Forget(fileIno, 1)
+	if _, ok := fs.inodes.GetEntry(fileIno); ok {
+		t.Fatalf("stale file inode %d is still mapped", fileIno)
+	}
+	fs.dirCache.Upsert("/dir", CachedFileInfo{
+		Name:     "file.txt",
+		Size:     9,
+		Mtime:    mtime,
+		Revision: 12,
+	})
+
+	dh := &DirHandle{
+		Ino:  dirIno,
+		Path: "/dir",
+		Entries: []DirEntry{{
+			Name: "file.txt",
+			Ino:  fileIno,
+			Mode: uint32(syscall.S_IFREG) | 0o644,
+		}},
+	}
+	fh := fs.dirHandles.Allocate(dh)
+	out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	st := fs.ReadDirPlus(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Size:     4096,
+	}, out)
+	if st != gofuse.OK {
+		t.Fatalf("ReadDirPlus status = %v, want OK", st)
+	}
+
+	newIno, ok := fs.inodes.GetInode("/dir/file.txt")
+	if !ok {
+		t.Fatal("file path was not remapped")
+	}
+	if newIno == fileIno {
+		t.Fatalf("file inode = %d, want a replacement for stale inode", newIno)
+	}
+	if dh.Entries[0].Ino != newIno {
+		t.Fatalf("snapshot inode = %d, want remapped inode %d", dh.Entries[0].Ino, newIno)
+	}
+	entry, ok := fs.inodes.GetEntry(newIno)
+	if !ok {
+		t.Fatalf("replacement inode %d is not mapped", newIno)
+	}
+	if entry.Nlookup != 1 {
+		t.Fatalf("replacement inode lookup refs = %d, want 1", entry.Nlookup)
+	}
+	if entry.Size != 9 {
+		t.Fatalf("replacement inode size = %d, want cached size 9", entry.Size)
+	}
+	if entry.Revision != 12 {
+		t.Fatalf("replacement inode revision = %d, want cached revision 12", entry.Revision)
+	}
+}
+
+func TestReadDirPlusStaleSnapshotDoesNotZeroLiveInode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+	staleIno := fs.inodes.Lookup("/dir/file.txt", false, 1, time.Now())
+	fs.inodes.Forget(staleIno, 1)
+	if _, ok := fs.inodes.GetEntry(staleIno); ok {
+		t.Fatalf("stale file inode %d is still mapped", staleIno)
+	}
+	liveIno := fs.inodes.Lookup("/dir/file.txt", false, 17, time.Now())
+
+	dh := &DirHandle{
+		Ino:  dirIno,
+		Path: "/dir",
+		Entries: []DirEntry{{
+			Name: "file.txt",
+			Ino:  staleIno,
+			Mode: uint32(syscall.S_IFREG) | 0o644,
+		}},
+	}
+	fh := fs.dirHandles.Allocate(dh)
+	out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	st := fs.ReadDirPlus(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Size:     4096,
+	}, out)
+	if st != gofuse.OK {
+		t.Fatalf("ReadDirPlus status = %v, want OK", st)
+	}
+
+	if dh.Entries[0].Ino != liveIno {
+		t.Fatalf("snapshot inode = %d, want existing live inode %d", dh.Entries[0].Ino, liveIno)
+	}
+	entry, ok := fs.inodes.GetEntry(liveIno)
+	if !ok {
+		t.Fatalf("live inode %d is not mapped", liveIno)
+	}
+	if entry.Size != 17 {
+		t.Fatalf("live inode size = %d, want preserved size 17", entry.Size)
+	}
+}
+
+func TestReadDirPlusStaleSnapshotUsesStoredEntryMetadataAfterDirCacheInvalidated(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+	mtime := time.Now().Add(-2 * time.Minute).Truncate(time.Second)
+	entries := fs.cachedToDirEntries("/dir", []CachedFileInfo{{
+		Name:     "file.txt",
+		Size:     23,
+		Mtime:    mtime,
+		Revision: 44,
+		Mode:     0o600,
+		HasMode:  true,
+	}})
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	staleIno := entries[0].Ino
+	fs.inodes.Forget(staleIno, 1)
+	if _, ok := fs.inodes.GetEntry(staleIno); ok {
+		t.Fatalf("stale file inode %d is still mapped", staleIno)
+	}
+	fs.dirCache.Invalidate("/dir")
+
+	dh := &DirHandle{
+		Ino:     dirIno,
+		Path:    "/dir",
+		Entries: entries,
+	}
+	fh := fs.dirHandles.Allocate(dh)
+	out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	st := fs.ReadDirPlus(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Size:     4096,
+	}, out)
+	if st != gofuse.OK {
+		t.Fatalf("ReadDirPlus status = %v, want OK", st)
+	}
+
+	newIno, ok := fs.inodes.GetInode("/dir/file.txt")
+	if !ok {
+		t.Fatal("file path was not remapped")
+	}
+	if newIno == staleIno {
+		t.Fatalf("file inode = %d, want a replacement for stale inode", newIno)
+	}
+	entry, ok := fs.inodes.GetEntry(newIno)
+	if !ok {
+		t.Fatalf("replacement inode %d is not mapped", newIno)
+	}
+	if entry.Size != 23 {
+		t.Fatalf("replacement inode size = %d, want stored size 23", entry.Size)
+	}
+	if entry.Revision != 44 {
+		t.Fatalf("replacement inode revision = %d, want stored revision 44", entry.Revision)
+	}
+	if !entry.HasMode || entry.Mode != 0o600 {
+		t.Fatalf("replacement inode mode = %o has=%t, want 0600 true", entry.Mode, entry.HasMode)
+	}
+	if !entry.Mtime.Equal(mtime) {
+		t.Fatalf("replacement inode mtime = %s, want %s", entry.Mtime, mtime)
+	}
+}
+
 func TestLookupSSEForeignDeleteInvalidatesPositiveNamespaceHit(t *testing.T) {
 	var headCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3574,6 +3749,236 @@ func TestLookupOpenCreatedFileAfterForgetSupportsGitChmodLock(t *testing.T) {
 	}
 	if got := remoteCalls.Load(); got != 0 {
 		t.Fatalf("remote calls = %d, want 0 for open-created lookup", got)
+	}
+}
+
+func TestOpenWritableCreatedFileUsesOpenLocalHandle(t *testing.T) {
+	var remoteCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted for open-created file", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT | syscall.O_EXCL),
+	}, "script.tmp", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	var openOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Flags:    uint32(syscall.O_WRONLY),
+	}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0 for open-created file", got)
+	}
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       openOut.Fh,
+		Offset:   0,
+	}, []byte("#!/bin/sh\n")); st != gofuse.OK {
+		t.Fatalf("Write through reopened handle status = %v, want OK", st)
+	}
+}
+
+func TestOpenWritablePreloadChoosesNewestOpenHandle(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	ino := fs.inodes.Lookup("/script.tmp", false, 0, time.Now())
+	stale := &FileHandle{
+		Ino:   ino,
+		Path:  "/script.tmp",
+		Dirty: fs.newWriteBuffer("/script.tmp", maxPreloadSize, 0),
+		IsNew: true,
+	}
+	if err := stale.Dirty.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	stale.DirtySeq = fs.markDirtySize(ino, 0)
+	fs.openHandles.Add(stale)
+
+	fresh := &FileHandle{
+		Ino:   ino,
+		Path:  "/script.tmp",
+		Dirty: fs.newWriteBuffer("/script.tmp", maxPreloadSize, 0),
+		IsNew: true,
+	}
+	want := []byte("fresh local bytes")
+	if _, err := fresh.Dirty.Write(0, want); err != nil {
+		t.Fatal(err)
+	}
+	fresh.DirtySeq = fs.markDirtySize(ino, int64(len(want)))
+	fs.openHandles.Add(fresh)
+
+	target := &FileHandle{
+		Ino:   ino,
+		Path:  "/script.tmp",
+		Dirty: fs.newWriteBuffer("/script.tmp", maxPreloadSize, 0),
+	}
+	if !fs.loadWritableHandleFromOpenHandleLocked(target) {
+		t.Fatal("preload from open handle returned false")
+	}
+	if got := target.Dirty.Bytes(); !bytes.Equal(got, want) {
+		t.Fatalf("preloaded bytes = %q, want %q", got, want)
+	}
+	if target.OrigSize != 0 {
+		t.Fatalf("target OrigSize = %d, want 0 for pending new file", target.OrigSize)
+	}
+}
+
+func TestOpenWritablePreloadReadsShadowBeforeEvictedBuffer(t *testing.T) {
+	var remoteCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted for shadow-backed open handle", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT | syscall.O_EXCL),
+	}, "large.tmp", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	want := bytes.Repeat([]byte{0x5a}, DefaultPartSize)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, want); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+	src, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created handle not found")
+	}
+	src.Lock()
+	partLoaded := src.Dirty.IsPartLoaded(0)
+	src.Unlock()
+	if partLoaded {
+		t.Fatal("test setup expected ShadowSpill to evict the first part")
+	}
+
+	var openOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Flags:    uint32(syscall.O_WRONLY),
+	}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+	reopened, ok := fs.fileHandles.Get(openOut.Fh)
+	if !ok {
+		t.Fatal("reopened handle not found")
+	}
+	reopened.Lock()
+	got := reopened.Dirty.Bytes()
+	origSize := reopened.OrigSize
+	isNew := reopened.IsNew
+	reopened.Unlock()
+	if !bytes.Equal(got, want) {
+		t.Fatal("reopened handle did not preload the authoritative shadow bytes")
+	}
+	if !isNew {
+		t.Fatal("reopened handle should preserve pending-new state")
+	}
+	if origSize != 0 {
+		t.Fatalf("reopened OrigSize = %d, want 0 for pending new file", origSize)
+	}
+}
+
+func TestOpenWritablePreloadPreservesExistingOrigSize(t *testing.T) {
+	var remoteCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted for cached existing file", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/grow.bin", false, 1, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.readCache.Put("/grow.bin", []byte("a"), 7)
+
+	var firstOut gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDWR),
+	}, &firstOut)
+	if st != gofuse.OK {
+		t.Fatalf("first Open status = %v, want OK", st)
+	}
+	want := bytes.Repeat([]byte("x"), defaultSmallFileThreshold+1024)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       firstOut.Fh,
+		Offset:   0,
+	}, want); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	var secondOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY),
+	}, &secondOut)
+	if st != gofuse.OK {
+		t.Fatalf("second Open status = %v, want OK", st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+	reopened, ok := fs.fileHandles.Get(secondOut.Fh)
+	if !ok {
+		t.Fatal("reopened handle not found")
+	}
+	reopened.Lock()
+	origSize := reopened.OrigSize
+	got := reopened.Dirty.Bytes()
+	reopened.Unlock()
+	if origSize != 1 {
+		t.Fatalf("reopened OrigSize = %d, want original remote size 1", origSize)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("reopened handle did not preload local grown bytes")
 	}
 }
 

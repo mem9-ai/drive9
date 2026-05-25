@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"sync"
+	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -56,9 +57,16 @@ type DirHandle struct {
 
 // DirEntry is a simplified directory entry for FUSE readdir.
 type DirEntry struct {
-	Name string
-	Ino  uint64
-	Mode uint32 // S_IFDIR or S_IFREG
+	Name        string
+	Ino         uint64
+	Mode        uint32 // S_IFDIR or S_IFREG
+	Size        int64
+	Mtime       time.Time
+	Revision    int64
+	AttrMode    uint32
+	HasMode     bool
+	IsDir       bool
+	HasMetadata bool
 }
 
 // ---------------------------------------------------------------------------
