@@ -58,3 +58,32 @@ cases:
       - type: remount_hash_equal
     severity:
       failure: P2
+  - id: cp-bottleneck-matrix
+    suite: stress
+    expected_outcome: baseline_pass
+    remote_root_suffix: cp-bottleneck-matrix
+    mountpoint_suffix: cp-bottleneck-matrix
+    timeout: 2h
+    workload:
+      type: cp_perf
+      file_sizes_mib:
+        - 50
+        - 100
+        - 1024
+      concurrency_levels:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+      modes:
+        - upload_warm
+        - download_file
+        - download_null
+      min_bytes_per_second: 1
+      collect_host_telemetry: true
+    oracles:
+      - type: throughput_min
+    severity:
+      failure: P2

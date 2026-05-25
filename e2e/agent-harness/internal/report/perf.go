@@ -2,14 +2,19 @@ package report
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -18,11 +23,31 @@ const (
 	PerfEnvironmentSchemaVersion = "perf-environment.v1"
 	PerfResultSchemaVersion      = "perf-result.v1"
 	PerfSummarySchemaVersion     = "perf-summary.v1"
+	DefaultPerfReportTitle       = "Drive9 Performance Test Report"
 )
+
+var awsCommandOutput = func(ctx context.Context, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, "aws", args...).Output()
+}
 
 type PerfOptions struct {
 	Title  string
 	Output string
+}
+
+func PerfMarkdownOutputPath(runDir, title, output string) string {
+	if output != "" {
+		return output
+	}
+	return filepath.Join(runDir, "perf", PerfMarkdownFilename(title))
+}
+
+func PerfMarkdownFilename(title string) string {
+	slug := slugifyPerfReportTitle(firstNonEmpty(title, DefaultPerfReportTitle))
+	if slug == "" {
+		slug = "drive9-performance-test-report"
+	}
+	return slug + ".md"
 }
 
 type PerfEnvironment struct {
@@ -100,6 +125,7 @@ type InfrastructureSpec struct {
 
 type PerfScenario struct {
 	CaseID       string   `json:"case_id"`
+	ScenarioID   string   `json:"scenario_id,omitempty"`
 	Workload     string   `json:"workload"`
 	Load         string   `json:"load"`
 	Attempted    int      `json:"attempted"`
@@ -107,10 +133,12 @@ type PerfScenario struct {
 	Failed       int      `json:"failed"`
 	QPS          float64  `json:"qps"`
 	Throughput   float64  `json:"throughput"`
+	LatencyMin   float64  `json:"latency_min"`
 	LatencyAvg   float64  `json:"latency_avg"`
 	LatencyP50   float64  `json:"latency_p50"`
 	LatencyP95   float64  `json:"latency_p95"`
 	LatencyP99   float64  `json:"latency_p99"`
+	LatencyMax   float64  `json:"latency_max"`
 	GateStatus   string   `json:"gate_status"`
 	MetricNotes  []string `json:"metric_notes"`
 	FailureClass string   `json:"failure_class,omitempty"`
@@ -138,6 +166,7 @@ func DefaultPerfEnvironment(runID string, manifest Manifest) PerfEnvironment {
 		StorageThroughput: unknown(),
 		StorageEncrypted:  unknown(),
 	}
+	env.applyHostMetadata()
 	env.applyOptionalEnv()
 	return env
 }
@@ -216,7 +245,7 @@ func GeneratePerfReport(runDir string, opts PerfOptions) (PerfReport, error) {
 	}
 	output := opts.Output
 	if output == "" {
-		output = filepath.Join(perfDir, "customer-report.md")
+		output = PerfMarkdownOutputPath(runDir, report.Title, "")
 	}
 	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
 		return PerfReport{}, err
@@ -264,15 +293,20 @@ func readPerfResults(path string) ([]PerfResult, error) {
 func buildPerfReport(manifest Manifest, summary Summary, gating Gating, env PerfEnvironment, results []PerfResult, failures []Failure) PerfReport {
 	scenarios := rollupPerfScenarios(results, summary, failures)
 	sort.Slice(scenarios, func(i, j int) bool {
-		if scenarios[i].CaseID == scenarios[j].CaseID {
-			return scenarios[i].Workload < scenarios[j].Workload
-		}
-		return scenarios[i].CaseID < scenarios[j].CaseID
+		return perfScenarioLess(scenarios[i], scenarios[j])
 	})
+	observations := observationsFromScenarios(scenarios)
+	if cpObservations := cpPerfBottleneckObservations(scenarios); len(cpObservations) > 0 {
+		if len(observations) == 1 && observations[0] == "No blocking performance gate failures were recorded." {
+			observations = cpObservations
+		} else {
+			observations = append(observations, cpObservations...)
+		}
+	}
 	report := PerfReport{
 		SchemaVersion:   PerfSummarySchemaVersion,
 		RunID:           manifest.RunID,
-		Title:           "Drive9 Performance Test Report",
+		Title:           DefaultPerfReportTitle,
 		StartedAt:       summary.StartedAt,
 		EndedAt:         summary.EndedAt,
 		OverallStatus:   overallPerfStatus(summary, gating),
@@ -280,8 +314,7 @@ func buildPerfReport(manifest Manifest, summary Summary, gating Gating, env Perf
 		Environment:     env,
 		Infrastructure:  infrastructureFromEnvironment(env),
 		Scenarios:       scenarios,
-		Observations:    observationsFromScenarios(scenarios),
-		Artifacts:       defaultPerfArtifacts(),
+		Observations:    observations,
 		Conclusion:      defaultConclusion(overallPerfStatus(summary, gating)),
 		MetricNotes:     defaultMetricNotes(),
 		GeneratorSchema: PerfSummarySchemaVersion,
@@ -320,6 +353,7 @@ func rollupPerfScenarios(results []PerfResult, summary Summary, failures []Failu
 		var startedAt, endedAt time.Time
 		var firstErrClass, firstErr string
 		operations := map[string]bool{}
+		scenarioID := firstNonEmpty(first.ScenarioID, first.CaseID)
 		for _, r := range group {
 			operations[r.Operation] = true
 			started := parsePerfTime(r.StartedAt)
@@ -356,10 +390,17 @@ func rollupPerfScenarios(results []PerfResult, summary Summary, failures []Failu
 			durationSeconds = sumDurationSeconds(group)
 		}
 		sort.Float64s(latencies)
+		workload := joinOperations(operations)
+		load := fmt.Sprintf("%d operations", len(group))
+		if cp, ok := parseCPPerfScenarioID(scenarioID); ok {
+			workload = cp.Mode
+			load = fmt.Sprintf("%d MiB, concurrency %d, %d transfers", cp.SizeMiB, cp.Concurrency, len(group))
+		}
 		scenario := PerfScenario{
 			CaseID:      first.CaseID,
-			Workload:    joinOperations(operations),
-			Load:        fmt.Sprintf("%d operations", len(group)),
+			ScenarioID:  scenarioID,
+			Workload:    workload,
+			Load:        load,
 			Attempted:   len(group),
 			Successful:  successful,
 			Failed:      failed,
@@ -369,10 +410,12 @@ func rollupPerfScenarios(results []PerfResult, summary Summary, failures []Failu
 		if successful > 0 && durationSeconds > 0 {
 			scenario.QPS = requestUnits / durationSeconds
 			scenario.Throughput = float64(bytes) / durationSeconds
+			scenario.LatencyMin = latencies[0]
 			scenario.LatencyAvg = average(latencies)
 			scenario.LatencyP50 = percentile(latencies, 0.50)
 			scenario.LatencyP95 = percentile(latencies, 0.95)
 			scenario.LatencyP99 = percentile(latencies, 0.99)
+			scenario.LatencyMax = latencies[len(latencies)-1]
 		}
 		if firstErr != "" {
 			scenario.FailureClass = firstNonEmpty(firstErrClass, "unknown")
@@ -391,7 +434,7 @@ func normalizePerfReport(r PerfReport, manifest Manifest, summary Summary, gatin
 		r.SchemaVersion = PerfSummarySchemaVersion
 	}
 	r.RunID = firstNonEmpty(r.RunID, manifest.RunID)
-	r.Title = firstNonEmpty(opts.Title, r.Title, "Drive9 Performance Test Report")
+	r.Title = firstNonEmpty(opts.Title, r.Title, DefaultPerfReportTitle)
 	r.StartedAt = firstNonEmpty(r.StartedAt, summary.StartedAt)
 	r.EndedAt = firstNonEmpty(r.EndedAt, summary.EndedAt)
 	r.OverallStatus = firstNonEmpty(r.OverallStatus, overallPerfStatus(summary, gating))
@@ -410,8 +453,10 @@ func normalizePerfReport(r PerfReport, manifest Manifest, summary Summary, gatin
 		r.Scope = defaultScope(manifest)
 	}
 	if r.Artifacts == nil {
-		r.Artifacts = defaultPerfArtifacts()
+		r.Artifacts = defaultPerfArtifacts(r.Title)
 	}
+	delete(r.Artifacts, "customer_report")
+	r.Artifacts["performance_report"] = filepath.ToSlash(filepath.Join("perf", PerfMarkdownFilename(r.Title)))
 	if len(r.MetricNotes) == 0 {
 		r.MetricNotes = defaultMetricNotes()
 	}
@@ -422,10 +467,7 @@ func normalizePerfReport(r PerfReport, manifest Manifest, summary Summary, gatin
 		r.GeneratorSchema = PerfSummarySchemaVersion
 	}
 	sort.Slice(r.Scenarios, func(i, j int) bool {
-		if r.Scenarios[i].CaseID == r.Scenarios[j].CaseID {
-			return r.Scenarios[i].Workload < r.Scenarios[j].Workload
-		}
-		return r.Scenarios[i].CaseID < r.Scenarios[j].CaseID
+		return perfScenarioLess(r.Scenarios[i], r.Scenarios[j])
 	})
 	for i := range r.Scenarios {
 		if r.Scenarios[i].MetricNotes == nil {
@@ -457,8 +499,36 @@ func normalizePerfEnvironment(env PerfEnvironment) PerfEnvironment {
 	env.StorageIOPS = firstNonEmpty(env.StorageIOPS, unknown())
 	env.StorageThroughput = firstNonEmpty(env.StorageThroughput, unknown())
 	env.StorageEncrypted = firstNonEmpty(env.StorageEncrypted, unknown())
+	env.applyHostMetadata()
 	env.applyOptionalEnv()
 	return env
+}
+
+func (env *PerfEnvironment) applyHostMetadata() {
+	ec2Host := looksLikeEC2Host()
+	if env.OS == unknown() || env.OS == runtime.GOOS {
+		env.OS = firstNonEmpty(osPrettyNameFromRelease(), env.OS)
+	}
+	if env.Kernel == unknown() {
+		env.Kernel = firstNonEmpty(kernelNameFromProc(), env.Kernel)
+	} else if strings.HasPrefix(strings.ToLower(env.OS), "ubuntu") && !strings.HasPrefix(strings.ToLower(env.Kernel), "linux ") {
+		env.Kernel = "Linux " + env.Kernel
+	}
+	if env.VCPU == unknown() {
+		env.VCPU = fmt.Sprint(runtime.NumCPU())
+	}
+	if env.CPUModel == unknown() {
+		env.CPUModel = firstNonEmpty(cpuModelFromProc(), env.CPUModel)
+	}
+	if env.Memory == unknown() {
+		env.Memory = firstNonEmpty(memoryFromProc(), env.Memory)
+	}
+	if env.CloudProvider == unknown() && ec2Host {
+		env.CloudProvider = "aws"
+	}
+	if ec2Host {
+		env.applyEC2Metadata()
+	}
 }
 
 func (env *PerfEnvironment) applyOptionalEnv() {
@@ -574,18 +644,19 @@ func defaultScope(manifest Manifest) []string {
 	return scope
 }
 
-func defaultPerfArtifacts() map[string]string {
+func defaultPerfArtifacts(title string) map[string]string {
 	return map[string]string{
-		"manifest":         "manifest.json",
-		"events":           "events.jsonl",
-		"failures":         "failures.jsonl",
-		"metrics":          "metrics.jsonl",
-		"harness_summary":  "summary.json",
-		"gating":           "gating.json",
-		"perf_environment": "perf/environment.json",
-		"perf_results":     "perf/results.jsonl",
-		"perf_summary":     "perf/summary.json",
-		"customer_report":  "perf/customer-report.md",
+		"manifest":           "manifest.json",
+		"events":             "events.jsonl",
+		"failures":           "failures.jsonl",
+		"metrics":            "metrics.jsonl",
+		"harness_summary":    "summary.json",
+		"gating":             "gating.json",
+		"perf_environment":   "perf/environment.json",
+		"perf_results":       "perf/results.jsonl",
+		"perf_summary":       "perf/summary.json",
+		"perf_evidence":      "perf/evidence/",
+		"performance_report": filepath.ToSlash(filepath.Join("perf", PerfMarkdownFilename(title))),
 	}
 }
 
@@ -593,7 +664,7 @@ func defaultMetricNotes() []string {
 	return []string{
 		"QPS is successful request units divided by measured wall time.",
 		"Throughput is successful bytes divided by measured wall time.",
-		"Avg, p50, p95, and p99 are computed from successful operation latencies.",
+		"Min, avg, p50, p95, p99, and max are computed from successful operation latencies.",
 		"Failed or skipped operations affect Success and Gate, but do not contribute to latency percentiles.",
 	}
 }
@@ -626,6 +697,137 @@ func observationsFromScenarios(scenarios []PerfScenario) []string {
 	}
 	if len(out) == 0 {
 		out = append(out, "No blocking performance gate failures were recorded.")
+	}
+	return out
+}
+
+type cpPerfScenarioParts struct {
+	Mode        string
+	SizeMiB     int
+	Concurrency int
+}
+
+func parseCPPerfScenarioID(s string) (cpPerfScenarioParts, bool) {
+	parts := strings.Split(s, "-")
+	if len(parts) != 3 || !strings.HasSuffix(parts[1], "mib") || !strings.HasPrefix(parts[2], "c") {
+		return cpPerfScenarioParts{}, false
+	}
+	size, err := strconv.Atoi(strings.TrimSuffix(parts[1], "mib"))
+	if err != nil || size <= 0 {
+		return cpPerfScenarioParts{}, false
+	}
+	concurrency, err := strconv.Atoi(strings.TrimPrefix(parts[2], "c"))
+	if err != nil || concurrency <= 0 {
+		return cpPerfScenarioParts{}, false
+	}
+	switch parts[0] {
+	case "upload_warm", "download_file", "download_null", "upload_cold", "upload_stdin", "download_fsync":
+		return cpPerfScenarioParts{Mode: parts[0], SizeMiB: size, Concurrency: concurrency}, true
+	default:
+		return cpPerfScenarioParts{}, false
+	}
+}
+
+func perfScenarioLess(a, b PerfScenario) bool {
+	if a.CaseID != b.CaseID {
+		return a.CaseID < b.CaseID
+	}
+	aCP, aOK := parseCPPerfScenarioID(a.ScenarioID)
+	bCP, bOK := parseCPPerfScenarioID(b.ScenarioID)
+	if aOK && bOK {
+		if cpPerfModeSort(aCP.Mode) != cpPerfModeSort(bCP.Mode) {
+			return cpPerfModeSort(aCP.Mode) < cpPerfModeSort(bCP.Mode)
+		}
+		if aCP.SizeMiB != bCP.SizeMiB {
+			return aCP.SizeMiB < bCP.SizeMiB
+		}
+		if aCP.Concurrency != bCP.Concurrency {
+			return aCP.Concurrency < bCP.Concurrency
+		}
+		return a.ScenarioID < b.ScenarioID
+	}
+	if a.Workload != b.Workload {
+		return a.Workload < b.Workload
+	}
+	return a.ScenarioID < b.ScenarioID
+}
+
+func cpPerfModeSort(mode string) int {
+	switch mode {
+	case "upload_warm":
+		return 0
+	case "download_file":
+		return 1
+	case "download_null":
+		return 2
+	case "upload_cold":
+		return 3
+	case "upload_stdin":
+		return 4
+	case "download_fsync":
+		return 5
+	default:
+		return 99
+	}
+}
+
+func cpPerfBottleneckObservations(scenarios []PerfScenario) []string {
+	type keyedScenario struct {
+		parts    cpPerfScenarioParts
+		scenario PerfScenario
+	}
+	groups := map[string][]keyedScenario{}
+	for _, scenario := range scenarios {
+		parts, ok := parseCPPerfScenarioID(scenario.ScenarioID)
+		if !ok {
+			continue
+		}
+		key := parts.Mode + "\x00" + strconv.Itoa(parts.SizeMiB)
+		groups[key] = append(groups[key], keyedScenario{parts: parts, scenario: scenario})
+	}
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var out []string
+	for _, key := range keys {
+		group := groups[key]
+		sort.Slice(group, func(i, j int) bool {
+			return group[i].parts.Concurrency < group[j].parts.Concurrency
+		})
+		if len(group) == 0 {
+			continue
+		}
+		mode := group[0].parts.Mode
+		sizeMiB := group[0].parts.SizeMiB
+		peak := 0.0
+		peakConcurrency := 0
+		plateauAt := 0
+		prevThroughput := 0.0
+		for _, item := range group {
+			throughput := item.scenario.Throughput
+			if item.scenario.Successful == 0 || throughput <= 0 {
+				continue
+			}
+			if throughput > peak {
+				peak = throughput
+				peakConcurrency = item.parts.Concurrency
+			}
+			if prevThroughput > 0 && plateauAt == 0 && throughput <= prevThroughput*1.10 {
+				plateauAt = item.parts.Concurrency
+			}
+			prevThroughput = throughput
+		}
+		if peak == 0 {
+			out = append(out, fmt.Sprintf("cp_perf mode=%s size=%dMiB classification=inconclusive: no successful transfers were recorded.", mode, sizeMiB))
+			continue
+		}
+		if plateauAt == 0 {
+			out = append(out, fmt.Sprintf("cp_perf mode=%s size=%dMiB classification=not_observed: throughput kept scaling through concurrency %d; peak %.2f MiB/s.", mode, sizeMiB, peakConcurrency, peak/(1024*1024)))
+			continue
+		}
+		out = append(out, fmt.Sprintf("cp_perf mode=%s size=%dMiB classification=inconclusive: throughput plateaued around concurrency %d; peak %.2f MiB/s. Use perf/evidence for CPU, network, and disk proof.", mode, sizeMiB, plateauAt, peak/(1024*1024)))
 	}
 	return out
 }
@@ -718,6 +920,24 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func slugifyPerfReportTitle(title string) string {
+	title = strings.ToLower(strings.TrimSpace(title))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range title {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if b.Len() > 0 && !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
 func envOverride(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
@@ -727,4 +947,282 @@ func envOverride(key, fallback string) string {
 
 func unknown() string {
 	return "unknown"
+}
+
+func readTrimmedFile(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func cpuModelFromProc() string {
+	b, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(strings.ToLower(key))
+		if key == "model name" || key == "hardware" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func memoryFromProc() string {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "MemTotal:" {
+			kib, err := strconv.ParseInt(fields[1], 10, 64)
+			if err != nil {
+				return ""
+			}
+			gib := float64(kib) / 1024 / 1024
+			return fmt.Sprintf("%.1f GiB", gib)
+		}
+	}
+	return ""
+}
+
+func osPrettyNameFromRelease() string {
+	b, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || key != "PRETTY_NAME" {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		value = strings.Trim(value, `"`)
+		return value
+	}
+	return ""
+}
+
+func kernelNameFromProc() string {
+	release := readTrimmedFile("/proc/sys/kernel/osrelease")
+	if release == "" {
+		return ""
+	}
+	return "Linux " + release
+}
+
+func looksLikeEC2Host() bool {
+	for _, p := range []string{"/sys/hypervisor/uuid", "/sys/devices/virtual/dmi/id/product_uuid"} {
+		if strings.HasPrefix(strings.ToLower(readTrimmedFile(p)), "ec2") {
+			return true
+		}
+	}
+	vendor := strings.ToLower(readTrimmedFile("/sys/devices/virtual/dmi/id/sys_vendor"))
+	return strings.Contains(vendor, "amazon")
+}
+
+type ec2IdentityDocument struct {
+	InstanceID   string `json:"instanceId"`
+	InstanceType string `json:"instanceType"`
+	Region       string `json:"region"`
+}
+
+type awsDescribeInstancesResponse struct {
+	Reservations []struct {
+		Instances []struct {
+			RootDeviceName      string `json:"RootDeviceName"`
+			BlockDeviceMappings []struct {
+				DeviceName string `json:"DeviceName"`
+				EBS        struct {
+					VolumeID string `json:"VolumeId"`
+				} `json:"Ebs"`
+			} `json:"BlockDeviceMappings"`
+		} `json:"Instances"`
+	} `json:"Reservations"`
+}
+
+type awsDescribeVolumesResponse struct {
+	Volumes []awsEBSVolume `json:"Volumes"`
+}
+
+type awsEBSVolume struct {
+	VolumeType string `json:"VolumeType"`
+	Size       int    `json:"Size"`
+	IOPS       int    `json:"Iops"`
+	Throughput int    `json:"Throughput"`
+	Encrypted  bool   `json:"Encrypted"`
+}
+
+func (env *PerfEnvironment) applyEC2Metadata() {
+	doc, ok := ec2IdentityFromIMDS()
+	if !ok {
+		return
+	}
+	if env.InstanceType == unknown() && doc.InstanceType != "" {
+		env.InstanceType = doc.InstanceType
+	}
+	if !env.needsStorageMetadata() {
+		return
+	}
+	region := firstNonEmpty(envOverride("DRIVE9_PERF_AWS_REGION", ""), os.Getenv("AWS_REGION"), os.Getenv("AWS_DEFAULT_REGION"), doc.Region)
+	if region == "" || doc.InstanceID == "" {
+		return
+	}
+	volumeID := rootVolumeIDFromAWS(region, doc.InstanceID)
+	if volumeID == "" {
+		return
+	}
+	if volume, ok := ebsVolumeFromAWS(region, volumeID); ok {
+		env.applyEBSVolume(volume)
+	}
+}
+
+func (env PerfEnvironment) needsStorageMetadata() bool {
+	return env.StorageType == unknown() ||
+		env.StorageSize == unknown() ||
+		env.StorageIOPS == unknown() ||
+		env.StorageThroughput == unknown() ||
+		env.StorageEncrypted == unknown()
+}
+
+func (env *PerfEnvironment) applyEBSVolume(volume awsEBSVolume) {
+	if env.StorageType == unknown() && volume.VolumeType != "" {
+		env.StorageType = volume.VolumeType
+	}
+	if env.StorageSize == unknown() && volume.Size > 0 {
+		env.StorageSize = fmt.Sprintf("%d GiB", volume.Size)
+	}
+	if env.StorageIOPS == unknown() && volume.IOPS > 0 {
+		env.StorageIOPS = fmt.Sprint(volume.IOPS)
+	}
+	if env.StorageThroughput == unknown() && volume.Throughput > 0 {
+		env.StorageThroughput = fmt.Sprintf("%d MiB/s", volume.Throughput)
+	}
+	if env.StorageEncrypted == unknown() {
+		env.StorageEncrypted = strconv.FormatBool(volume.Encrypted)
+	}
+}
+
+func ec2IdentityFromIMDS() (ec2IdentityDocument, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	token, _ := imdsToken(ctx)
+	body, err := imdsGet(ctx, "http://169.254.169.254/latest/dynamic/instance-identity/document", token)
+	if err != nil {
+		return ec2IdentityDocument{}, false
+	}
+	var doc ec2IdentityDocument
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return ec2IdentityDocument{}, false
+	}
+	return doc, doc.InstanceID != "" || doc.InstanceType != "" || doc.Region != ""
+}
+
+func imdsToken(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://169.254.169.254/latest/api/token", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "60")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("imds token status %d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+func imdsGet(ctx context.Context, url, token string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("X-aws-ec2-metadata-token", token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("imds get status %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+}
+
+func rootVolumeIDFromAWS(region, instanceID string) string {
+	args := awsBaseArgs(region)
+	args = append(args, "ec2", "describe-instances", "--instance-ids", instanceID, "--output", "json")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := awsCommandOutput(ctx, args...)
+	if err != nil {
+		return ""
+	}
+	var resp awsDescribeInstancesResponse
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return ""
+	}
+	return rootVolumeIDFromDescribeInstances(resp)
+}
+
+func rootVolumeIDFromDescribeInstances(resp awsDescribeInstancesResponse) string {
+	for _, reservation := range resp.Reservations {
+		for _, instance := range reservation.Instances {
+			for _, mapping := range instance.BlockDeviceMappings {
+				if mapping.EBS.VolumeID != "" && mapping.DeviceName == instance.RootDeviceName {
+					return mapping.EBS.VolumeID
+				}
+			}
+			for _, mapping := range instance.BlockDeviceMappings {
+				if mapping.EBS.VolumeID != "" {
+					return mapping.EBS.VolumeID
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func ebsVolumeFromAWS(region, volumeID string) (awsEBSVolume, bool) {
+	args := awsBaseArgs(region)
+	args = append(args, "ec2", "describe-volumes", "--volume-ids", volumeID, "--output", "json")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := awsCommandOutput(ctx, args...)
+	if err != nil {
+		return awsEBSVolume{}, false
+	}
+	var resp awsDescribeVolumesResponse
+	if err := json.Unmarshal(out, &resp); err != nil || len(resp.Volumes) == 0 {
+		return awsEBSVolume{}, false
+	}
+	return resp.Volumes[0], true
+}
+
+func awsBaseArgs(region string) []string {
+	var args []string
+	if profile := strings.TrimSpace(os.Getenv("DRIVE9_PERF_AWS_PROFILE")); profile != "" {
+		args = append(args, "--profile", profile)
+	}
+	if region != "" {
+		args = append(args, "--region", region)
+	}
+	return args
 }

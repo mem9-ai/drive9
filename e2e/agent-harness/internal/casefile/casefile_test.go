@@ -104,6 +104,122 @@ cases:
 	}
 }
 
+func TestLoadFileParsesCPPerf(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stress.yaml")
+	if err := os.WriteFile(path, []byte(`
+defaults:
+  timeout: 2m
+  cleanup: retain_on_failure
+cases:
+  - id: cp-bottleneck
+    suite: stress
+    expected_outcome: baseline_pass
+    remote_root_suffix: cp-bottleneck
+    mountpoint_suffix: cp-bottleneck
+    workload:
+      type: cp_perf
+      file_sizes_mib:
+        - 50
+        - 100
+        - 1024
+      concurrency_levels:
+        - 1
+        - 2
+      modes:
+        - upload_warm
+        - download_file
+      transfers_per_scenario: 2
+      remote_root: nested
+      artifact_root: perf-work
+      durable_flush: true
+      collect_host_telemetry: false
+    oracles:
+      - type: throughput_min
+    severity:
+      failure: P2
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cases, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := cases[0].Workload
+	if got := len(w.FileSizesMiB); got != 3 {
+		t.Fatalf("file_sizes_mib count = %d, want 3", got)
+	}
+	if got := w.Modes[1]; got != "download_file" {
+		t.Fatalf("mode = %q, want download_file", got)
+	}
+	if w.CollectHostTelemetry == nil || *w.CollectHostTelemetry {
+		t.Fatalf("collect_host_telemetry = %v, want false", w.CollectHostTelemetry)
+	}
+}
+
+func TestLoadFileRejectsInvalidCPPerf(t *testing.T) {
+	tests := []struct {
+		name     string
+		workload string
+	}{
+		{
+			name: "invalid mode",
+			workload: `
+      type: cp_perf
+      modes:
+        - invalid
+`,
+		},
+		{
+			name: "invalid concurrency",
+			workload: `
+      type: cp_perf
+      concurrency_levels:
+        - 0
+`,
+		},
+		{
+			name: "transfers below concurrency",
+			workload: `
+      type: cp_perf
+      concurrency_levels:
+        - 4
+      transfers_per_scenario: 2
+`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "stress.yaml")
+			body := `
+defaults:
+  timeout: 2m
+  cleanup: retain_on_failure
+cases:
+  - id: cp-bottleneck
+    suite: stress
+    expected_outcome: baseline_pass
+    remote_root_suffix: cp-bottleneck
+    mountpoint_suffix: cp-bottleneck
+    workload:
+` + tt.workload + `
+    oracles:
+      - type: throughput_min
+    severity:
+      failure: P2
+`
+			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadFile(path)
+			if !errors.Is(err, ErrValidation) {
+				t.Fatalf("err = %v, want ErrValidation", err)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsUnsafeRelativePaths(t *testing.T) {
 	expectExit := 0
 	tests := []struct {
@@ -201,8 +317,8 @@ func TestLoadRepositorySuites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cases) != 13 {
-		t.Fatalf("case count = %d, want 13", len(cases))
+	if len(cases) != 14 {
+		t.Fatalf("case count = %d, want 14", len(cases))
 	}
 	for _, c := range cases {
 		if c.Workload.Type == "git_workflow" && len(c.Workload.ExpectedLocks) != 0 {
