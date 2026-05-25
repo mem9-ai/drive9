@@ -4572,7 +4572,9 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 
 			if flushStatus == gofuse.OK {
 				ctx, cf := context.WithTimeout(context.Background(), 30*time.Second)
-				err := fs.applyRemoteMode(ctx, localPath, pendingMode)
+				err := retryPostUploadMode(ctx, func() error {
+					return fs.applyRemoteMode(ctx, localPath, pendingMode)
+				})
 				cf()
 				if err != nil {
 					log.Printf("release: pending chmod failed for %s: %v", localPath, err)

@@ -3242,6 +3242,57 @@ func TestDeferredChmodRollbackRestoresUnknownMode(t *testing.T) {
 	}
 }
 
+func TestReleaseRetriesDeferredChmodNotFound(t *testing.T) {
+	var chmodCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
+			if chmodCalls.Add(1) == 1 {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/release-retry.txt", false, 0, time.Now())
+	fs.inodes.UpdateMode(ino, 0o755)
+	fh := &FileHandle{
+		Ino:               ino,
+		Path:              "/release-retry.txt",
+		PendingMode:       0o755,
+		HasPendingMode:    true,
+		PreviousMode:      0o644,
+		HasPreviousMode:   true,
+		PreviousModeKnown: true,
+	}
+	fhID := fs.fileHandles.Allocate(fh)
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: fhID})
+
+	if got := chmodCalls.Load(); got != 2 {
+		t.Fatalf("chmod calls = %d, want 2", got)
+	}
+	if fh.HasPendingMode {
+		t.Fatal("pending mode should be cleared after Release retry succeeds")
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode not found after Release")
+	}
+	if !entry.HasMode || entry.Mode&0o777 != 0o755 {
+		t.Fatalf("inode mode = %o has=%t, want 0755 true", entry.Mode&0o777, entry.HasMode)
+	}
+}
+
 func TestLookupPendingIndexPreservesMode(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
