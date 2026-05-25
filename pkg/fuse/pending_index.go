@@ -79,17 +79,29 @@ func (idx *PendingIndex) Put(remotePath string, size int64, kind PendingKind) (u
 // PutWithBaseRev stores metadata for the given path together with the base
 // revision observed when the local edit session started.
 func (idx *PendingIndex) PutWithBaseRev(remotePath string, size int64, kind PendingKind, baseRev int64) (uint64, error) {
-	return idx.putInternal(remotePath, size, kind, baseRev, false)
+	return idx.PutWithBaseRevAndMode(remotePath, size, kind, baseRev, 0, false)
+}
+
+// PutWithBaseRevAndMode stores metadata for the given path together with the
+// file mode that must be applied after the pending data commits remotely.
+func (idx *PendingIndex) PutWithBaseRevAndMode(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
+	return idx.putInternal(remotePath, size, kind, baseRev, false, mode, hasMode)
 }
 
 // PutShadowSpill is like PutWithBaseRev but marks the entry as ShadowSpill
 // so that crash recovery (RecoverPending) reconstructs it with the correct
 // upload path (streaming from shadow, not full-memory ReadAll).
 func (idx *PendingIndex) PutShadowSpill(remotePath string, size int64, kind PendingKind, baseRev int64) (uint64, error) {
-	return idx.putInternal(remotePath, size, kind, baseRev, true)
+	return idx.PutShadowSpillWithMode(remotePath, size, kind, baseRev, 0, false)
 }
 
-func (idx *PendingIndex) putInternal(remotePath string, size int64, kind PendingKind, baseRev int64, shadowSpill bool) (uint64, error) {
+// PutShadowSpillWithMode is like PutShadowSpill, but also persists file mode
+// metadata for the eventual remote chmod.
+func (idx *PendingIndex) PutShadowSpillWithMode(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
+	return idx.putInternal(remotePath, size, kind, baseRev, true, mode, hasMode)
+}
+
+func (idx *PendingIndex) putInternal(remotePath string, size int64, kind PendingKind, baseRev int64, shadowSpill bool, mode uint32, hasMode bool) (uint64, error) {
 	gen := idx.nextGen.Add(1)
 	meta := &WriteBackMeta{
 		Path:        remotePath,
@@ -100,6 +112,8 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 		Kind:        kind,
 		BaseRev:     baseRev,
 		ShadowSpill: shadowSpill,
+		Mode:        mode & 0o777,
+		HasMode:     hasMode,
 	}
 
 	// Write to disk first for durability.
@@ -181,6 +195,8 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 		Kind:        meta.Kind,
 		BaseRev:     meta.BaseRev,
 		ShadowSpill: meta.ShadowSpill,
+		Mode:        meta.Mode,
+		HasMode:     meta.HasMode,
 	}
 	idx.mu.RUnlock()
 
@@ -242,6 +258,33 @@ func (idx *PendingIndex) UpdateSize(remotePath string, size int64) {
 		meta.Size = size
 		meta.Mtime = time.Now()
 	}
+}
+
+// UpdateMode updates the pending mode metadata for an existing entry.
+func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	meta, ok := idx.items[remotePath]
+	if !ok {
+		return nil
+	}
+	updated := *meta
+	updated.Mode = mode & 0o777
+	updated.HasMode = true
+	updated.Generation = idx.nextGen.Add(1)
+
+	metaBytes, err := json.Marshal(&updated)
+	if err != nil {
+		return fmt.Errorf("pending index marshal mode: %w", err)
+	}
+	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
+	if err := atomicWrite(metaPath, metaBytes); err != nil {
+		return fmt.Errorf("pending index update mode: %w", err)
+	}
+	cp := updated
+	idx.items[remotePath] = &cp
+	return nil
 }
 
 // MarkConflict marks a pending entry as conflicted so that RecoverPending

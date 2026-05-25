@@ -66,7 +66,7 @@ func TestPendingIndexRenamePending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = idx.PutShadowSpill("/old/file.txt", 512, PendingOverwrite, 11)
+	_, err = idx.PutShadowSpillWithMode("/old/file.txt", 512, PendingOverwrite, 11, 0o755, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,6 +98,9 @@ func TestPendingIndexRenamePending(t *testing.T) {
 	if meta.BaseRev != 11 {
 		t.Errorf("baseRev = %d, want 11", meta.BaseRev)
 	}
+	if !meta.HasMode || meta.Mode != 0o755 {
+		t.Errorf("mode = %o has=%t, want 0755 true", meta.Mode, meta.HasMode)
+	}
 }
 
 func TestPendingIndexRecoverFromDisk(t *testing.T) {
@@ -108,7 +111,7 @@ func TestPendingIndexRecoverFromDisk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = idx1.Put("/recover/a.txt", 100, PendingNew)
+	_, err = idx1.PutWithBaseRevAndMode("/recover/a.txt", 100, PendingNew, 0, 0o755, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,6 +135,9 @@ func TestPendingIndexRecoverFromDisk(t *testing.T) {
 	}
 	if meta.Size != 100 {
 		t.Errorf("a.txt size = %d, want 100", meta.Size)
+	}
+	if !meta.HasMode || meta.Mode != 0o755 {
+		t.Errorf("a.txt mode = %o has=%t, want 0755 true", meta.Mode, meta.HasMode)
 	}
 
 	meta, ok = idx2.GetMeta("/recover/b.txt")

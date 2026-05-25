@@ -15,6 +15,8 @@ import (
 	"github.com/mem9-ai/dat9/pkg/mountpath"
 )
 
+var errCommitPostUpload = errors.New("commit post-upload step failed")
+
 // directPutThreshold returns the size limit below which commit queue workers
 // use direct PUT (WriteCtxConditionalWithRevision) instead of multipart
 // upload. Must match the server's inline_threshold — the server rejects
@@ -44,6 +46,8 @@ type CommitEntry struct {
 	Size         int64
 	Kind         PendingKind
 	ShadowSpill  bool // true when data is only in shadow file (auto-resolve would OOM)
+	Mode         uint32
+	HasMode      bool
 	canceled     bool
 	cancelCommit context.CancelFunc
 	cancelUpload context.CancelFunc
@@ -269,6 +273,8 @@ func (cq *CommitQueue) RecoverPending() {
 			Size:        meta.Size,
 			Kind:        meta.Kind,
 			ShadowSpill: meta.ShadowSpill,
+			Mode:        meta.Mode,
+			HasMode:     meta.HasMode,
 		}
 		if err := cq.Enqueue(entry); err != nil {
 			log.Printf("commit queue: recover enqueue failed for %s: %v", path, err)
@@ -582,9 +588,13 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		cancel()
 
 		if err == nil {
-			// Success — clean up.
-			cq.onCommitSuccess(entry, committedRev)
-			return
+			if err := cq.onCommitSuccess(entry, committedRev); err == nil {
+				return
+			} else {
+				log.Printf("commit queue: post-upload attempt %d/%d failed for %s: %v", attempt+1, maxRetries, entry.Path, err)
+				cq.onCommitPostUploadFailure(entry, err)
+				return
+			}
 		}
 		if cq.isEntryCanceled(entry) {
 			cq.removeFromQueue(entry)
@@ -601,6 +611,10 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 	}
 
 	log.Printf("commit queue: giving up on %s after %d retries: %v", entry.Path, maxRetries, lastErr)
+	if errors.Is(lastErr, errCommitPostUpload) {
+		cq.onCommitPostUploadFailure(entry, lastErr)
+		return
+	}
 	cq.onCommitTerminalFailure(entry)
 }
 
@@ -626,7 +640,12 @@ func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error 
 		}
 		return err
 	}
-	cq.onCommitSuccess(entry, committedRev)
+	if err := cq.onCommitSuccess(entry, committedRev); err != nil {
+		if cq.perf != nil {
+			cq.perf.commitFailure.add(1)
+		}
+		return err
+	}
 	return nil
 }
 
@@ -752,7 +771,25 @@ func (cq *CommitQueue) rebuildQueuedIndexLocked() {
 	}
 }
 
-func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) {
+func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) error {
+	if shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		var err error
+		mode := entry.Mode & 0o777
+		err = retryPostUploadMode(ctx, func() error {
+			start := time.Now()
+			applyErr := cq.client.ChmodCtx(ctx, cq.remotePath(entry.Path), mode)
+			if cq.perf != nil {
+				cq.perf.recordRemoteOp(perfRemoteMutation, applyErr, time.Since(start), 0)
+			}
+			return applyErr
+		})
+		cancel()
+		if err != nil {
+			return fmt.Errorf("%w: chmod %s to %o: %w", errCommitPostUpload, entry.Path, mode, err)
+		}
+	}
+
 	// Write durable commit record BEFORE cleaning up local state so that
 	// crash recovery never re-uploads an already committed entry.
 	if cq.journal != nil {
@@ -762,7 +799,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) {
 		}); err != nil {
 			log.Printf("commit queue: journal commit marker failed for %s: %v (keeping local state)", entry.Path, err)
 			cq.removeFromQueue(entry)
-			return
+			return nil
 		}
 	}
 
@@ -791,6 +828,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) {
 		cq.perf.commitSuccess.add(1)
 	}
 	log.Printf("commit queue: successfully uploaded %s (%d bytes, rev=%d)", entry.Path, entry.Size, committedRev)
+	return nil
 }
 
 // tryAutoResolveConflict attempts to resolve a 409 conflict automatically.
@@ -870,7 +908,9 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	// Branch 1: idempotent — content already matches server.
 	if bytes.Equal(localData, serverData) {
 		log.Printf("commit queue: auto-resolved conflict for %s (idempotent, content matches server rev %d)", entry.Path, serverRev)
-		cq.onCommitSuccess(entry, 0)
+		if err := cq.onCommitSuccess(entry, 0); err != nil {
+			cq.onCommitPostUploadFailure(entry, err)
+		}
 		return
 	}
 
@@ -896,7 +936,17 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	}
 
 	log.Printf("commit queue: auto-resolved conflict for %s via LWW (overwrote rev %d → new upload based on rev %d)", entry.Path, entry.BaseRev, serverRev)
-	cq.onCommitSuccess(entry, 0)
+	if err := cq.onCommitSuccess(entry, 0); err != nil {
+		cq.onCommitPostUploadFailure(entry, err)
+	}
+}
+
+func (cq *CommitQueue) onCommitPostUploadFailure(entry *CommitEntry, err error) {
+	if cq.perf != nil {
+		cq.perf.commitFailure.add(1)
+	}
+	cq.removeFromQueue(entry)
+	log.Printf("commit queue: post-upload failure for %s; local pending state preserved for retry: %v", entry.Path, err)
 }
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {

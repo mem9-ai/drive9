@@ -3251,6 +3251,490 @@ func TestLockFileCreateDisablesEntryCache(t *testing.T) {
 	}
 }
 
+func TestCreatePreservesInputMode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+		Mode:     0o755,
+	}, "exec.sh", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	if got, want := out.Mode, uint32(syscall.S_IFREG)|0o755; got != want {
+		t.Fatalf("Create mode = %o, want %o", got, want)
+	}
+
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("created inode not found")
+	}
+	if !entry.HasMode || entry.Mode != 0o755 {
+		t.Fatalf("inode mode = %o has=%t, want 0755 true", entry.Mode, entry.HasMode)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("created file handle not found")
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if !fh.HasPendingMode || fh.PendingMode != 0o755 {
+		t.Fatalf("pending mode = %o has=%t, want 0755 true", fh.PendingMode, fh.HasPendingMode)
+	}
+}
+
+func TestCreatePreservesZeroMode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+		Mode:     0,
+	}, "private.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	if got, want := out.Mode, uint32(syscall.S_IFREG); got != want {
+		t.Fatalf("Create mode = %o, want %o", got, want)
+	}
+
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok {
+		t.Fatal("created inode not found")
+	}
+	if !entry.HasMode || entry.Mode != 0 {
+		t.Fatalf("inode mode = %o has=%t, want 000 true", entry.Mode, entry.HasMode)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("created file handle not found")
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if !fh.HasPendingMode || fh.PendingMode != 0 {
+		t.Fatalf("pending mode = %o has=%t, want 000 true", fh.PendingMode, fh.HasPendingMode)
+	}
+}
+
+func TestCreateDefaultModeDoesNotStageRemoteMode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+		Mode:     defaultRegularFileMode,
+	}, "plain.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	if got, want := out.Mode, uint32(syscall.S_IFREG)|defaultRegularFileMode; got != want {
+		t.Fatalf("Create mode = %o, want %o", got, want)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("created file handle not found")
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if fh.HasPendingMode {
+		t.Fatalf("default create mode should not require remote chmod, got pending %o", fh.PendingMode)
+	}
+}
+
+func TestDeferredChmodRollbackRestoresUnknownMode(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.RawQuery == "chmod" {
+			http.Error(w, "chmod failed", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/rollback.txt", false, 4, time.Now())
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode not found")
+	}
+	if entry.HasMode {
+		t.Fatal("test setup expected unknown mode")
+	}
+
+	wb := NewWriteBuffer("/rollback.txt", maxPreloadSize, 0)
+	if _, err := wb.Write(0, []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/rollback.txt",
+		Dirty:   wb,
+		BaseRev: 3,
+	}
+	fs.fileHandles.Allocate(fh)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MODE,
+			Mode:     0o755,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	fh.Lock()
+	err := fs.applyPendingModeForHandleLocked(context.Background(), fh)
+	fh.Unlock()
+	if err == nil {
+		t.Fatal("applyPendingModeForHandleLocked should fail")
+	}
+
+	entry, ok = fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode not found after rollback")
+	}
+	if entry.HasMode {
+		t.Fatalf("rollback should restore unknown mode, got mode=%o", entry.Mode)
+	}
+}
+
+func TestReleaseRetriesDeferredChmodNotFound(t *testing.T) {
+	var chmodCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
+			if chmodCalls.Add(1) == 1 {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/release-retry.txt", false, 0, time.Now())
+	fs.inodes.UpdateMode(ino, 0o644)
+	fh := &FileHandle{
+		Ino:               ino,
+		Path:              "/release-retry.txt",
+		PendingMode:       0o755,
+		HasPendingMode:    true,
+		PreviousMode:      0o644,
+		HasPreviousMode:   true,
+		PreviousModeKnown: true,
+	}
+	fhID := fs.fileHandles.Allocate(fh)
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: fhID})
+
+	if got := chmodCalls.Load(); got != 2 {
+		t.Fatalf("chmod calls = %d, want 2", got)
+	}
+	if fh.HasPendingMode {
+		t.Fatal("pending mode should be cleared after Release retry succeeds")
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode not found after Release")
+	}
+	if !entry.HasMode || entry.Mode&0o777 != 0o755 {
+		t.Fatalf("inode mode = %o has=%t, want 0755 true", entry.Mode&0o777, entry.HasMode)
+	}
+}
+
+func TestApplyPendingModeDoesNotClearNewerConcurrentChmod(t *testing.T) {
+	var chmodCalls atomic.Int32
+	chmodStarted := make(chan struct{})
+	allowChmod := make(chan struct{})
+	var startedOnce sync.Once
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
+			if chmodCalls.Add(1) == 1 {
+				startedOnce.Do(func() { close(chmodStarted) })
+				<-allowChmod
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/chmod-race.txt", false, 4, time.Now())
+	fs.inodes.UpdateMode(ino, 0o644)
+	fh1 := &FileHandle{Ino: ino, Path: "/chmod-race.txt", Dirty: NewWriteBuffer("/chmod-race.txt", maxPreloadSize, 0), BaseRev: 1}
+	fh2 := &FileHandle{Ino: ino, Path: "/chmod-race.txt", Dirty: NewWriteBuffer("/chmod-race.txt", maxPreloadSize, 0), BaseRev: 1}
+	fs.fileHandles.Allocate(fh1)
+	fs.fileHandles.Allocate(fh2)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MODE,
+			Mode:     0o755,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr 0755 status = %v, want OK", st)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		fh1.Lock()
+		err := fs.applyPendingModeForHandleLocked(context.Background(), fh1)
+		fh1.Unlock()
+		done <- err
+	}()
+
+	select {
+	case <-chmodStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first chmod did not start")
+	}
+
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MODE,
+			Mode:     0o700,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr 0700 status = %v, want OK", st)
+	}
+	close(allowChmod)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("applyPendingModeForHandleLocked: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending chmod did not finish")
+	}
+
+	for i, fh := range []*FileHandle{fh1, fh2} {
+		fh.Lock()
+		hasPending := fh.HasPendingMode
+		pendingMode := fh.PendingMode & 0o777
+		fh.Unlock()
+		if !hasPending || pendingMode != 0o700 {
+			t.Fatalf("fh%d pending mode = %o has=%t, want 0700 true", i+1, pendingMode, hasPending)
+		}
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode not found")
+	}
+	if !entry.HasMode || entry.Mode&0o777 != 0o700 {
+		t.Fatalf("inode mode = %o has=%t, want 0700 true", entry.Mode&0o777, entry.HasMode)
+	}
+}
+
+func TestReleaseDeferredChmodDoesNotClearNewerConcurrentChmod(t *testing.T) {
+	var chmodCalls atomic.Int32
+	chmodStarted := make(chan struct{})
+	allowChmod := make(chan struct{})
+	var startedOnce sync.Once
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
+			if chmodCalls.Add(1) == 1 {
+				startedOnce.Do(func() { close(chmodStarted) })
+				<-allowChmod
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/release-chmod-race.txt", false, 0, time.Now())
+	fs.inodes.UpdateMode(ino, 0o644)
+	fh1 := &FileHandle{Ino: ino, Path: "/release-chmod-race.txt", Dirty: NewWriteBuffer("/release-chmod-race.txt", maxPreloadSize, 0), BaseRev: 1}
+	fh2 := &FileHandle{Ino: ino, Path: "/release-chmod-race.txt", Dirty: NewWriteBuffer("/release-chmod-race.txt", maxPreloadSize, 0), BaseRev: 1}
+	fh1ID := fs.fileHandles.Allocate(fh1)
+	fs.fileHandles.Allocate(fh2)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MODE,
+			Mode:     0o755,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr 0755 status = %v, want OK", st)
+	}
+
+	releaseDone := make(chan struct{})
+	go func() {
+		fs.Release(nil, &gofuse.ReleaseIn{Fh: fh1ID})
+		close(releaseDone)
+	}()
+
+	select {
+	case <-chmodStarted:
+	case <-time.After(time.Second):
+		t.Fatal("release chmod did not start")
+	}
+
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MODE,
+			Mode:     0o700,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr 0700 status = %v, want OK", st)
+	}
+	close(allowChmod)
+
+	select {
+	case <-releaseDone:
+	case <-time.After(time.Second):
+		t.Fatal("Release did not finish")
+	}
+
+	fh2.Lock()
+	hasPending := fh2.HasPendingMode
+	pendingMode := fh2.PendingMode & 0o777
+	fh2.Unlock()
+	if !hasPending || pendingMode != 0o700 {
+		t.Fatalf("sibling pending mode = %o has=%t, want 0700 true", pendingMode, hasPending)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode not found")
+	}
+	if !entry.HasMode || entry.Mode&0o777 != 0o700 {
+		t.Fatalf("inode mode = %o has=%t, want 0700 true", entry.Mode&0o777, entry.HasMode)
+	}
+}
+
+func TestLookupPendingIndexPreservesMode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.pendingIndex = pending
+	if _, err := pending.PutWithBaseRevAndMode("/exec.sh", 3, PendingNew, 0, 0o755, true); err != nil {
+		t.Fatal(err)
+	}
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "exec.sh", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got, want := out.Mode, uint32(syscall.S_IFREG)|0o755; got != want {
+		t.Fatalf("Lookup mode = %o, want %o", got, want)
+	}
+}
+
+func TestFlushStagesCreateModeInPendingMetadata(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeBack, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.writeBack = writeBack
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+		Mode:     0o755,
+	}, "exec.sh", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: out.NodeId},
+		Fh:       out.Fh,
+	}, []byte("echo ok\n")); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+	st = fs.Flush(nil, &gofuse.FlushIn{Fh: out.Fh})
+	if st != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", st)
+	}
+
+	pendingMeta, ok := pending.GetMeta("/exec.sh")
+	if !ok {
+		t.Fatal("pending index entry missing")
+	}
+	if !pendingMeta.HasMode || pendingMeta.Mode != 0o755 {
+		t.Fatalf("pending mode = %o has=%t, want 0755 true", pendingMeta.Mode, pendingMeta.HasMode)
+	}
+	writeBackMeta, ok := writeBack.GetMeta("/exec.sh")
+	if !ok {
+		t.Fatal("writeback entry missing")
+	}
+	if !writeBackMeta.HasMode || writeBackMeta.Mode != 0o755 {
+		t.Fatalf("writeback mode = %o has=%t, want 0755 true", writeBackMeta.Mode, writeBackMeta.HasMode)
+	}
+}
+
 func TestInitStoresServer(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
@@ -4096,6 +4580,10 @@ func TestReleaseNewEmptyFileUsesCreateAction(t *testing.T) {
 			if r.URL.Path != "/v1/fs/empty.txt" {
 				recordHandlerErr(fmt.Errorf("path = %s, want /v1/fs/empty.txt", r.URL.Path))
 				http.Error(w, "bad path", http.StatusBadRequest)
+				return
+			}
+			if r.URL.Query().Has("chmod") {
+				w.WriteHeader(http.StatusOK)
 				return
 			}
 			if !r.URL.Query().Has("create") {
@@ -5477,6 +5965,8 @@ func largeFlushStreamingMock(t *testing.T, fileSize int64, completeCh chan<- str
 			etag := fmt.Sprintf(`"etag-%d"`, etagSeq)
 			mu.Unlock()
 			w.Header().Set("ETag", etag)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/up-large/complete":
 			_, _ = io.Copy(io.Discard, r.Body)
