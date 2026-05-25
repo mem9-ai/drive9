@@ -105,6 +105,33 @@ func (m *InodeToPath) EnsureInode(path string, isDir bool, size int64, mtime tim
 	return ino
 }
 
+// EnsureInodeNoUpdate returns the inode for path, allocating one if needed.
+// Unlike EnsureInode, an existing mapping is returned without mutating its
+// cached metadata. Use this when recovering stale snapshot references.
+func (m *InodeToPath) EnsureInodeNoUpdate(path string, isDir bool, size int64, mtime time.Time) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if ino, ok := m.byPath[path]; ok {
+		return ino
+	}
+
+	ino := m.nextIno
+	m.nextIno++
+
+	entry := &InodeEntry{
+		Ino:     ino,
+		Path:    path,
+		IsDir:   isDir,
+		Nlookup: 0,
+		Size:    size,
+		Mtime:   mtime,
+	}
+	m.byInode[ino] = entry
+	m.byPath[path] = ino
+	return ino
+}
+
 // IncrementLookup adds one kernel lookup reference to an existing inode.
 // Returns false if the inode does not exist.
 func (m *InodeToPath) IncrementLookup(ino uint64) bool {
