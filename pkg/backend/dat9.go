@@ -59,6 +59,10 @@ const (
 	// changing the storage-class boundary.
 	DefaultTextExtractMaxBytes int64 = 8_192
 
+	// MaxSymlinkTargetBytes bounds symbolic link targets to a path-sized inline
+	// payload instead of allowing generic upload-sized blobs.
+	MaxSymlinkTargetBytes = 4 << 10
+
 	symlinkMode        uint32 = 0o120000 | 0o777
 	symlinkContentType        = "application/x-symlink"
 )
@@ -254,7 +258,8 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 	start := time.Now()
 	defer func() { observeBackend(ctx, "create_symlink", err, start) }()
 
-	if target == "" || strings.ContainsRune(target, 0) {
+	data := []byte(target)
+	if target == "" || strings.ContainsRune(target, 0) || len(data) > MaxSymlinkTargetBytes {
 		return ErrInvalidSymlinkTarget
 	}
 	linkPath, err = pathutil.Canonicalize(linkPath)
@@ -262,7 +267,6 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 		return err
 	}
 
-	data := []byte(target)
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
 		return err
 	}

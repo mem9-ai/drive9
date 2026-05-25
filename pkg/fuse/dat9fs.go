@@ -2195,10 +2195,11 @@ func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out
 
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	readStart := fs.perfStart()
-	target, err := fs.client.ReadCtx(ctx, fs.remotePath(entry.Path))
-	fs.perfRecordRemote(perfRemoteRead, readStart, err, uint64(len(target)))
+	target, err := fs.readSmallFileWithRetry(ctx, entry.Path)
 	if err != nil {
+		if errors.Is(err, errReadRetriesExhausted) {
+			return nil, gofuse.EIO
+		}
 		return nil, httpToFuseStatus(err)
 	}
 	return target, gofuse.OK
@@ -2253,6 +2254,15 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	mutationStart := fs.perfStart()
 	err := fs.client.SymlinkCtx(ctx, pointedTo, fs.remotePath(childP))
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
+	if err != nil {
+		if isTransientLookupErr(err) {
+			if exists, probeErr := fs.remotePathExistsDetached(childP); probeErr == nil && exists {
+				err = nil
+			} else if probeErr != nil {
+				log.Printf("symlink: probe created path %s failed: %v", childP, probeErr)
+			}
+		}
+	}
 	if err != nil {
 		return httpToFuseStatus(err)
 	}

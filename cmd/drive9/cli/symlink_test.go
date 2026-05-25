@@ -14,13 +14,13 @@ func TestSymlink(t *testing.T) {
 	t.Run("creates_link", func(t *testing.T) {
 		var gotMethod string
 		var gotPath string
-		var gotSymlink bool
+		var gotSymlink string
 		var gotTarget string
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			gotMethod = r.Method
 			gotPath = r.URL.Path
-			gotSymlink = r.URL.Query().Has("symlink")
+			gotSymlink = r.URL.Query().Get("symlink")
 			var req struct {
 				Target string `json:"target"`
 			}
@@ -42,8 +42,8 @@ func TestSymlink(t *testing.T) {
 		if gotPath != "/v1/fs/link" {
 			t.Fatalf("path = %q, want /v1/fs/link", gotPath)
 		}
-		if !gotSymlink {
-			t.Fatal("missing ?symlink query parameter")
+		if gotSymlink != "1" {
+			t.Fatalf("symlink query = %q, want 1", gotSymlink)
 		}
 		if gotTarget != "../target.txt" {
 			t.Fatalf("target = %q, want ../target.txt", gotTarget)
@@ -52,10 +52,12 @@ func TestSymlink(t *testing.T) {
 
 	t.Run("remote_path_prefix", func(t *testing.T) {
 		var gotPath string
+		var gotSymlink string
 		var gotTarget string
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			gotPath = r.URL.Path
+			gotSymlink = r.URL.Query().Get("symlink")
 			var req struct {
 				Target string `json:"target"`
 			}
@@ -73,6 +75,9 @@ func TestSymlink(t *testing.T) {
 		}
 		if gotPath != "/v1/fs/workspace/link" {
 			t.Fatalf("path = %q, want /v1/fs/workspace/link", gotPath)
+		}
+		if gotSymlink != "1" {
+			t.Fatalf("symlink query = %q, want 1", gotSymlink)
 		}
 		if gotTarget != "/target.txt" {
 			t.Fatalf("target = %q, want /target.txt", gotTarget)

@@ -1494,6 +1494,52 @@ func TestLookupRecognizesRemoteSymlinkMode(t *testing.T) {
 	}
 }
 
+func TestReadlinkRetriesTransientRead(t *testing.T) {
+	target := []byte("../target")
+	symlinkMode := uint32(syscall.S_IFLNK) | 0o777
+	var getCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(target)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(symlinkMode), 10))
+			w.Header().Set("X-Dat9-Revision", "11")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if getCalls.Add(1) == 1 {
+				http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write(target)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "link", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+
+	got, st := fs.Readlink(nil, &gofuse.InHeader{NodeId: out.NodeId})
+	if st != gofuse.OK {
+		t.Fatalf("Readlink status = %v, want OK", st)
+	}
+	if string(got) != string(target) {
+		t.Fatalf("Readlink target = %q, want %q", got, target)
+	}
+	if calls := getCalls.Load(); calls < 2 {
+		t.Fatalf("GET calls = %d, want retry", calls)
+	}
+}
+
 func TestSymlinkCreatesRemoteLinkAndCachesEntry(t *testing.T) {
 	const target = "../target"
 	symlinkMode := uint32(syscall.S_IFLNK) | 0o777
@@ -1559,6 +1605,50 @@ func TestSymlinkCreatesRemoteLinkAndCachesEntry(t *testing.T) {
 	}
 	if string(got) != target {
 		t.Fatalf("Readlink target = %q, want %q", got, target)
+	}
+}
+
+func TestSymlinkRecoversWhenInterruptedAfterRemoteCreate(t *testing.T) {
+	const target = "../target"
+	symlinkMode := uint32(syscall.S_IFLNK) | 0o777
+	var postCalls atomic.Int32
+	var headCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/link" && r.URL.RawQuery == "symlink=1":
+			postCalls.Add(1)
+			w.WriteHeader(statusClientClosedRequest)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/link":
+			headCalls.Add(1)
+			w.Header().Set("Content-Length", strconv.Itoa(len(target)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(symlinkMode), 10))
+			w.Header().Set("X-Dat9-Revision", "12")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Symlink(nil, &gofuse.InHeader{NodeId: 1}, target, "link", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Symlink status = %v, want OK", st)
+	}
+	if got := postCalls.Load(); got != 1 {
+		t.Fatalf("POST calls = %d, want 1", got)
+	}
+	if got := headCalls.Load(); got == 0 {
+		t.Fatal("symlink retry did not probe created path")
+	}
+	if got := out.Mode & uint32(syscall.S_IFMT); got != uint32(syscall.S_IFLNK) {
+		t.Fatalf("Symlink mode type = %o, want symlink", got)
 	}
 }
 

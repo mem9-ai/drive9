@@ -416,14 +416,21 @@ PY
 check_eq "mv renames remote file" "$renamed_present" "true"
 
 drive9_retry fs symlink ":$SMALL_RENAMED" ":$SMALL_SYMLINK" >/dev/null
-symlink_ls="$(drive9_retry fs ls /)"
-symlink_present=$(python3 - "$symlink_ls" "$(basename "$SMALL_SYMLINK")" <<'PY'
+symlink_present="false"
+for _ in $(seq 1 "$CLI_MAX_RETRIES"); do
+  symlink_ls="$(drive9_retry fs ls /)"
+  symlink_present=$(python3 - "$symlink_ls" "$(basename "$SMALL_SYMLINK")" <<'PY'
 import sys
 out=sys.argv[1].splitlines()
 name=sys.argv[2]
 print("true" if any(line.strip()==name for line in out) else "false")
 PY
 )
+  if [[ "$symlink_present" == "true" ]]; then
+    break
+  fi
+  sleep "$CLI_RETRY_SLEEP_S"
+done
 check_eq "symlink appears in ls /" "$symlink_present" "true"
 
 symlink_target="$(drive9_retry_read fs cat "$SMALL_SYMLINK")"

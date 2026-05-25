@@ -398,6 +398,9 @@ func TestC2aWriteHandlersRejectScopedRequestBeforeBackend(t *testing.T) {
 		{"handleCreate", func(s *Server, w http.ResponseWriter, r *http.Request) {
 			s.handleCreate(w, r, "/main/secrets.env")
 		}},
+		{"handleSymlink", func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.handleSymlink(w, r, "/main/secrets.env")
+		}},
 		{"handleMkdir", func(s *Server, w http.ResponseWriter, r *http.Request) {
 			s.handleMkdir(w, r, "/main/newdir")
 		}},

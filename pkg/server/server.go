@@ -1983,6 +1983,8 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
 }
 
+const maxSymlinkBodyBytes = backend.MaxSymlinkTargetBytes + 1024
+
 func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path string) {
 	if !authorizeFS(w, r, FSOpWrite, path) {
 		return
@@ -1996,7 +1998,13 @@ func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path stri
 	var req struct {
 		Target string `json:"target"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxSymlinkBodyBytes)).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_body_too_large", "path", path, "max", maxSymlinkBodyBytes)...)
+			errJSON(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_bad_body", "path", path, "error", err)...)
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
@@ -2005,6 +2013,16 @@ func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path stri
 		if errors.Is(err, backend.ErrInvalidSymlinkTarget) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_invalid_target", "path", path, "error", err)...)
 			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrUploadTooLarge) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_upload_too_large", "path", path, "error", err)...)
+			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_storage_quota_exceeded", "path", path, "error", err)...)
+			errJSON(w, http.StatusInsufficientStorage, err.Error())
 			return
 		}
 		if errors.Is(err, datastore.ErrPathConflict) {

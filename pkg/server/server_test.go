@@ -950,6 +950,72 @@ func TestSymlinkRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSymlinkRejectsOversizeTarget(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	target := strings.Repeat("x", backend.MaxSymlinkTargetBytes+1)
+	reqBody := strings.NewReader(`{"target":"` + target + `"}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/too-long-link?symlink=1", reqBody)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("symlink oversize target status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/too-long-link", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("oversize symlink should not be inserted; stat status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestSymlinkRejectsOversizeBody(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	reqBody := strings.NewReader(`{"target":"` + strings.Repeat("x", maxSymlinkBodyBytes) + `"}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/body-too-large-link?symlink=1", reqBody)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("symlink oversize body status = %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestSymlinkReturns507WhenTenantStorageQuotaExceeded(t *testing.T) {
+	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 10}, SemanticWorkerOptions{})
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	reqBody := strings.NewReader(`{"target":"12345678901"}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/quota-link?symlink=1", reqBody)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusInsufficientStorage {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("symlink quota status = %d, want %d: %s", resp.StatusCode, http.StatusInsufficientStorage, body)
+	}
+}
+
 func TestStatDirectoryWithoutTrailingSlashDoesNotLogDatastoreError(t *testing.T) {
 	core, recorded := observer.New(zap.ErrorLevel)
 	restoreLogger := logger.L()

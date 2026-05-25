@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/client"
@@ -55,9 +57,12 @@ type mockTreeServer struct {
 
 func newMockTreeServer() *mockTreeServer {
 	return &mockTreeServer{
-		existing:     map[string]bool{},
-		listEntries:  map[string][]client.FileInfo{},
-		statResults:  map[string]struct{ exists, isDir bool; size int64 }{},
+		existing:    map[string]bool{},
+		listEntries: map[string][]client.FileInfo{},
+		statResults: map[string]struct {
+			exists, isDir bool
+			size          int64
+		}{},
 		fileBodies:   map[string][]byte{},
 		recordedPuts: map[string][]byte{},
 	}
@@ -117,7 +122,8 @@ func (m *mockTreeServer) httpServer(t *testing.T) *httptest.Server {
 					"name":    e.Name,
 					"size":    e.Size,
 					"isDir":   e.IsDir,
-					"hasMode": false,
+					"mode":    e.Mode,
+					"hasMode": e.HasMode,
 				}
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"entries": out})
@@ -368,6 +374,66 @@ func TestCpRecursiveLocalToRemote_RejectsSymlinkInTree(t *testing.T) {
 	}
 }
 
+func TestCpRecursiveRemoteToLocal_RejectsSymlinkInTree(t *testing.T) {
+	mock := newMockTreeServer()
+	mock.statResults["/src"] = struct {
+		exists bool
+		isDir  bool
+		size   int64
+	}{exists: true, isDir: true}
+	mock.listEntries["/src"] = []client.FileInfo{
+		{Name: "target.txt", Size: 5, IsDir: false},
+		{Name: "link", Size: 10, IsDir: false, HasMode: true, Mode: uint32(syscall.S_IFLNK) | 0o777},
+	}
+	mock.fileBodies["/src/target.txt"] = []byte("alpha")
+
+	srv := mock.httpServer(t)
+	defer srv.Close()
+
+	dstLocal := filepath.Join(t.TempDir(), "dst")
+	c := client.New(srv.URL, "")
+	err := Cp(c, []string{"-r", ":/src", dstLocal})
+	if err == nil {
+		t.Fatal("expected remote symlink reject error, got nil")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("error = %v, want 'symlink' message", err)
+	}
+	if _, statErr := os.Lstat(dstLocal); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("local destination should not be created after symlink reject, stat err=%v", statErr)
+	}
+}
+
+func TestCpRecursiveRemoteToRemote_RejectsSymlinkInTree(t *testing.T) {
+	mock := newMockTreeServer()
+	mock.statResults["/src"] = struct {
+		exists bool
+		isDir  bool
+		size   int64
+	}{exists: true, isDir: true}
+	mock.listEntries["/src"] = []client.FileInfo{
+		{Name: "link", Size: 10, IsDir: false, HasMode: true, Mode: uint32(syscall.S_IFLNK) | 0o777},
+	}
+
+	srv := mock.httpServer(t)
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	err := Cp(c, []string{"-r", ":/src", ":/dst"})
+	if err == nil {
+		t.Fatal("expected remote symlink reject error, got nil")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("error = %v, want 'symlink' message", err)
+	}
+	if len(mock.recordedCopies) > 0 {
+		t.Fatalf("expected no remote copies before symlink reject, got %v", mock.recordedCopies)
+	}
+	if len(mock.recordedMkdirs) > 0 {
+		t.Fatalf("expected no remote mkdirs before symlink reject, got %v", mock.recordedMkdirs)
+	}
+}
+
 // ───────────────────────── Constraint #3: preflight then runtime semantics ─────────────────────────
 
 // TestCpRecursiveLocalToRemote_RuntimePartialFailureSurfacesError
@@ -600,7 +666,10 @@ func TestCpRecursive_RejectsFileSource(t *testing.T) {
 func TestCpRecursiveRemoteToRemote_UsesServerSideCopyPerLeaf(t *testing.T) {
 	mock := newMockTreeServer()
 	// Source tree on the remote: /src is a dir with two files.
-	mock.statResults["/src"] = struct{ exists, isDir bool; size int64 }{exists: true, isDir: true}
+	mock.statResults["/src"] = struct {
+		exists, isDir bool
+		size          int64
+	}{exists: true, isDir: true}
 	mock.listEntries["/src"] = []client.FileInfo{
 		{Name: "a.txt", Size: 5, IsDir: false},
 		{Name: "sub", Size: 0, IsDir: true},
