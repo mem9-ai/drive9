@@ -96,6 +96,11 @@ type Dat9FS struct {
 	// perf contains optional mount-level counters. Nil when disabled.
 	perf *fusePerfCounters
 
+	// localPolicy classifies paths that future coding-agent mounts may route
+	// to a local-only backend. PR A observes the policy only; it does not
+	// change remote routing semantics.
+	localPolicy *LocalPolicy
+
 	// smallFileMax mirrors the server's inline_threshold (fetched lazily via
 	// the dat9 client). When 0, defaultSmallFileThreshold is used. Use the
 	// inlineThreshold() accessor; do not read directly.
@@ -186,6 +191,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		opts:          opts,
 		debouncer:     newFlushDebouncer(opts.FlushDebounce),
 		perf:          newFusePerfCounters(opts.PerfCounters),
+		localPolicy:   NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
 	}
 }
 
@@ -2110,6 +2116,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if st != gofuse.OK {
 		return st
 	}
+	fs.observePathPolicy(childP)
 
 	// Pending namespace overlay: check in-memory PendingIndex first (O(1)),
 	// then fall back to the write-back cache GetMeta for backward compat.
@@ -2323,6 +2330,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	if !ok {
 		return gofuse.ENOENT
 	}
+	fs.observePathPolicy(entry.Path)
 
 	// Prefer unflushed writable state over the remote object size.
 	if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
@@ -2408,6 +2416,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	if !ok {
 		return gofuse.ENOENT
 	}
+	fs.observePathPolicy(entry.Path)
 
 	// Handle mtime updates
 	if mtime, ok := input.GetMTime(); ok {
@@ -2539,6 +2548,7 @@ func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out
 	if !entryIsSymlink(entry) {
 		return nil, gofuse.Status(syscall.EINVAL)
 	}
+	fs.observePathPolicy(entry.Path)
 
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -2561,6 +2571,7 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 	if st != gofuse.OK {
 		return st
 	}
+	fs.observePathPolicy(childP)
 
 	mode := input.Mode & 0o777
 	if err := fs.mkdirRemoteWithTransientRetry(cancel, childP, mode); err != nil {
@@ -2595,6 +2606,7 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	if st != gofuse.OK {
 		return st
 	}
+	fs.observePathPolicy(childP)
 
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -2652,6 +2664,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if st != gofuse.OK {
 		return st
 	}
+	fs.observePathPolicy(childP)
 	start := time.Now()
 	status = gofuse.OK
 	fs.debugf("unlink start path=%s parent_ino=%d name=%s", childP, header.NodeId, name)
@@ -2749,6 +2762,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	if st != gofuse.OK {
 		return st
 	}
+	fs.observePathPolicy(childP)
 	start := time.Now()
 	status = gofuse.OK
 	fs.debugf("rmdir start path=%s parent_ino=%d name=%s", childP, header.NodeId, name)
@@ -3016,6 +3030,8 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	if st != gofuse.OK {
 		return st
 	}
+	fs.observePathPolicy(oldP)
+	fs.observePathPolicy(newP)
 	if oldP == newP {
 		return gofuse.OK
 	}
@@ -3139,6 +3155,7 @@ func (fs *Dat9FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gof
 	if !ok {
 		return gofuse.ENOENT
 	}
+	fs.observePathPolicy(p)
 
 	dh := &DirHandle{
 		Ino:  input.NodeId,
@@ -3156,6 +3173,7 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 	if !ok {
 		return gofuse.ENOENT
 	}
+	fs.observePathPolicy(dh.Path)
 
 	// Populate entries if not already done
 	if dh.Entries == nil {
@@ -3190,6 +3208,7 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 	if !ok {
 		return gofuse.ENOENT
 	}
+	fs.observePathPolicy(dh.Path)
 
 	if dh.Entries == nil {
 		ctx, cf := fuseCtx(cancel)
@@ -3510,6 +3529,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	if st != gofuse.OK {
 		return st
 	}
+	fs.observePathPolicy(childP)
 
 	mode, hasRemoteMode := createInputMode(input.Mode)
 	ino := fs.inodes.Lookup(childP, false, 0, time.Now())
@@ -3588,6 +3608,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	if !ok {
 		return gofuse.ENOENT
 	}
+	fs.observePathPolicy(p)
 
 	fh := &FileHandle{
 		Ino:         input.NodeId,
@@ -3767,6 +3788,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 	logPath = fh.Path
 	logIno = fh.Ino
+	fs.observePathPolicy(fh.Path)
 
 	lockStart := time.Now()
 	fh.Lock()
@@ -4160,6 +4182,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 	logPath = fh.Path
 	logIno = fh.Ino
+	fs.observePathPolicy(fh.Path)
 
 	lockStart := time.Now()
 	fh.Lock()
@@ -4459,6 +4482,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	if !ok {
 		return gofuse.OK
 	}
+	fs.observePathPolicy(fh.Path)
 
 	start := time.Now()
 	phase := "start"
@@ -4675,6 +4699,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	if !ok {
 		return gofuse.OK
 	}
+	fs.observePathPolicy(fh.Path)
 
 	start := time.Now()
 	phase := "start"
@@ -4835,6 +4860,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	defer func() { fs.perfRecordFuse(perfFuseRelease, perfStart, releaseStatus, 0) }()
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
+		fs.observePathPolicy(fh.Path)
 		flushStatus := gofuse.OK
 		defer func() {
 			if fh.Prefetch != nil {

@@ -1003,6 +1003,104 @@ func TestMountCmdPreservesExplicitTTLs(t *testing.T) {
 	}
 }
 
+func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	localRoot := t.TempDir()
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile", "coding-agent",
+		"--local-policy-observe-root", localRoot,
+		"--local-policy-observe-local", "**/node_modules/**",
+		"--local-policy-observe-remote", "**/node_modules/keep/**",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.Profile != "coding-agent" {
+		t.Fatalf("Profile = %q, want coding-agent", got.Profile)
+	}
+	if got.LocalRoot != localRoot {
+		t.Fatalf("LocalRoot = %q, want %q", got.LocalRoot, localRoot)
+	}
+	if !reflect.DeepEqual(got.LocalOnlyPatterns, []string{"**/node_modules/**"}) {
+		t.Fatalf("LocalOnlyPatterns = %v", got.LocalOnlyPatterns)
+	}
+	if !reflect.DeepEqual(got.RemoteOnlyPatterns, []string{"**/node_modules/keep/**"}) {
+		t.Fatalf("RemoteOnlyPatterns = %v", got.RemoteOnlyPatterns)
+	}
+}
+
+func TestMountCmdCodingAgentProfileAllowsMissingObserveRoot(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile", "coding-agent",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.Profile != "coding-agent" {
+		t.Fatalf("Profile = %q, want coding-agent", got.Profile)
+	}
+}
+
+func TestMountCmdLocalPolicyFlagsRequireCodingAgentProfile(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--local-policy-observe-local", "**/.git/**",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--profile=coding-agent") {
+		t.Fatalf("error = %v, want coding-agent profile validation error", err)
+	}
+}
+
+func TestMountCmdLocalObserveRootMustBeAbsolute(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile", "coding-agent",
+		"--local-policy-observe-root", "relative/root",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--local-policy-observe-root") {
+		t.Fatalf("error = %v, want observe root validation error", err)
+	}
+}
+
 func TestValidateLookupRetryFlags(t *testing.T) {
 	if err := validateLookupRetryFlags(0, 0, false, false); err != nil {
 		t.Fatalf("omitted lookup retry flags should be allowed: %v", err)

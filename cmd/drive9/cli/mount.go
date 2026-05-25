@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -102,7 +104,12 @@ func fsMountCmd(args []string) error {
 	prefetchMaxBytes := fs.Int64("readdir-prefetch-max-bytes", 1<<20, "maximum aggregate bytes prefetched per directory read")
 	prefetchTimeout := fs.Duration("readdir-prefetch-timeout", time.Second, "timeout for one readdir prefetch batch")
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
-	profile := fs.String("profile", "", "mount profile: interactive (empty for default)")
+	profile := fs.String("profile", "", "mount profile: interactive, coding-agent (coding-agent is observe-only; empty for default)")
+	localRoot := fs.String("local-policy-observe-root", "", "reserved future local-only storage root for --profile=coding-agent; observe-only, no IO is routed there yet")
+	var localOnlyPatterns stringListFlag
+	var remoteOnlyPatterns stringListFlag
+	fs.Var(&localOnlyPatterns, "local-policy-observe-local", "additional would-be local-only path pattern for coding-agent observe-only counters (repeatable, e.g. **/.git/**)")
+	fs.Var(&remoteOnlyPatterns, "local-policy-observe-remote", "would-be remote-persistent override path pattern for coding-agent observe-only counters (repeatable)")
 	uploadConcurrency := fs.Int("upload-concurrency", 16, "maximum concurrent background uploads issued by FUSE")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
@@ -164,6 +171,9 @@ func fsMountCmd(args []string) error {
 	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
 		return err
 	}
+	if err := validateMountProfileFlags(*profile, *localRoot, localOnlyPatterns, remoteOnlyPatterns); err != nil {
+		return err
+	}
 	syncModeVal, writePolicyVal, err := parseFuseDurability(*durability)
 	if err != nil {
 		return err
@@ -188,16 +198,23 @@ func fsMountCmd(args []string) error {
 	// Resolve auto mode to a concrete backend.
 	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
 	fmt.Fprintf(os.Stderr, "drive9: mount mode: %s\n", resolved)
+	if *profile == "coding-agent" && resolved != MountModeFUSE {
+		return fmt.Errorf("drive9 mount: --profile=coding-agent requires --mode=fuse")
+	}
 
 	if resolved == MountModeWebDAV && *readOnly {
 		return fmt.Errorf("drive9 mount: --read-only is not supported with WebDAV mode")
 	}
 	if runtime.GOOS == "windows" && resolved == MountModeFUSE {
 		return mountFuse(&mountFuseOptions{
-			MountPoint: mountPoint,
-			RemoteRoot: remoteRoot,
-			ReadOnly:   *readOnly,
-			Debug:      *debug,
+			MountPoint:         mountPoint,
+			RemoteRoot:         remoteRoot,
+			Profile:            *profile,
+			LocalRoot:          *localRoot,
+			LocalOnlyPatterns:  append([]string(nil), localOnlyPatterns...),
+			RemoteOnlyPatterns: append([]string(nil), remoteOnlyPatterns...),
+			ReadOnly:           *readOnly,
+			Debug:              *debug,
 		})
 	}
 
@@ -256,6 +273,9 @@ func fsMountCmd(args []string) error {
 		SyncMode:              syncModeVal,
 		WritePolicy:           writePolicyVal,
 		Profile:               *profile,
+		LocalRoot:             *localRoot,
+		LocalOnlyPatterns:     append([]string(nil), localOnlyPatterns...),
+		RemoteOnlyPatterns:    append([]string(nil), remoteOnlyPatterns...),
 		UploadConcurrency:     *uploadConcurrency,
 		ReadConcurrency:       *readConcurrency,
 		SyncRead:              *syncRead,
@@ -337,6 +357,43 @@ func validateReadDirPrefetchFlags(maxFiles int, maxFileBytes int64, maxBytes int
 	if timeout <= 0 {
 		return fmt.Errorf("drive9 mount: --readdir-prefetch-timeout must be > 0")
 	}
+	return nil
+}
+
+func validateMountProfileFlags(profile string, localRoot string, localOnlyPatterns []string, remoteOnlyPatterns []string) error {
+	switch profile {
+	case "", "interactive", "coding-agent":
+	default:
+		return fmt.Errorf("drive9 mount: unknown --profile %q (valid: interactive, coding-agent)", profile)
+	}
+	hasPolicyFlags := localRoot != "" || len(localOnlyPatterns) > 0 || len(remoteOnlyPatterns) > 0
+	if profile != "coding-agent" {
+		if hasPolicyFlags {
+			return fmt.Errorf("drive9 mount: --local-policy-observe-root, --local-policy-observe-local, and --local-policy-observe-remote require --profile=coding-agent")
+		}
+		return nil
+	}
+	if strings.TrimSpace(localRoot) != "" && !filepath.IsAbs(localRoot) {
+		return fmt.Errorf("drive9 mount: --local-policy-observe-root must be an absolute path")
+	}
+	return nil
+}
+
+type stringListFlag []string
+
+func (values *stringListFlag) String() string {
+	if values == nil {
+		return ""
+	}
+	return strings.Join(*values, ",")
+}
+
+func (values *stringListFlag) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("empty path pattern")
+	}
+	*values = append(*values, value)
 	return nil
 }
 

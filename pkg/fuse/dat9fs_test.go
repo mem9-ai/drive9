@@ -3142,6 +3142,56 @@ func TestMountOptionsUploadConcurrencyDefaults(t *testing.T) {
 	}
 }
 
+func TestMountOptionsCodingAgentPolicyValidation(t *testing.T) {
+	codingAgent := &MountOptions{
+		Profile:   MountProfileCodingAgent,
+		LocalRoot: t.TempDir(),
+	}
+	codingAgent.setDefaults()
+	if err := validateMountOptionsProfile(codingAgent); err != nil {
+		t.Fatalf("coding-agent profile validation failed: %v", err)
+	}
+
+	missingRoot := &MountOptions{Profile: MountProfileCodingAgent}
+	missingRoot.setDefaults()
+	if err := validateMountOptionsProfile(missingRoot); err != nil {
+		t.Fatalf("observe-only coding-agent profile without LocalRoot should be allowed: %v", err)
+	}
+
+	ordinaryWithPolicy := &MountOptions{LocalOnlyPatterns: []string{"**/.git/**"}}
+	ordinaryWithPolicy.setDefaults()
+	if err := validateMountOptionsProfile(ordinaryWithPolicy); err == nil {
+		t.Fatal("ordinary mount with local-only policy should fail")
+	}
+}
+
+func TestDat9FSObservesLocalPolicyWithoutChangingRouting(t *testing.T) {
+	opts := &MountOptions{
+		CacheSize:    1 << 20,
+		DirTTL:       time.Second,
+		Profile:      MountProfileCodingAgent,
+		LocalRoot:    t.TempDir(),
+		PerfCounters: true,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	if got := fs.observePathPolicy("/repo/.git/config"); got != PathLayerLocalOnly {
+		t.Fatalf(".git classification = %s, want local-only", got)
+	}
+	if got := fs.observePathPolicy("/repo/src/main.go"); got != PathLayerRemotePersistent {
+		t.Fatalf("source classification = %s, want remote persistent", got)
+	}
+
+	snap := fs.perf.snapshot()
+	if got := snap.Counters["local_policy_local_only"]; got != 1 {
+		t.Fatalf("local policy local-only counter = %d, want 1", got)
+	}
+	if got := snap.Counters["local_policy_remote_default"]; got != 1 {
+		t.Fatalf("local policy remote-default counter = %d, want 1", got)
+	}
+}
+
 func TestMountOptionsSyncReadDefaultsToAsyncReads(t *testing.T) {
 	defaults := &MountOptions{}
 	defaults.setDefaults()
