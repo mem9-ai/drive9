@@ -3044,7 +3044,16 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 	var mode uint32
 	hasMode := false
 
-	if item, ok := fs.dirEntryMetadata(dirPath, childP, e.Name); ok {
+	if e.HasMetadata {
+		isDir = e.IsDir
+		size = e.Size
+		if !e.Mtime.IsZero() {
+			mtime = e.Mtime
+		}
+		revision = e.Revision
+		mode = e.AttrMode
+		hasMode = e.HasMode
+	} else if item, ok := fs.dirEntryMetadata(dirPath, childP, e.Name); ok {
 		isDir = item.IsDir
 		size = item.Size
 		if !item.Mtime.IsZero() {
@@ -3083,6 +3092,21 @@ func (fs *Dat9FS) dirEntryMetadata(dirPath, childP, name string) (CachedFileInfo
 		}
 	}
 	return CachedFileInfo{}, false
+}
+
+func dirEntryFromCachedInfo(item CachedFileInfo, ino uint64) DirEntry {
+	return DirEntry{
+		Name:        item.Name,
+		Ino:         ino,
+		Mode:        dirEntryMode(item.IsDir, item.HasMode, item.Mode),
+		Size:        item.Size,
+		Mtime:       item.Mtime,
+		Revision:    item.Revision,
+		AttrMode:    item.Mode,
+		HasMode:     item.HasMode,
+		IsDir:       item.IsDir,
+		HasMetadata: true,
+	}
 }
 
 func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
@@ -3185,9 +3209,13 @@ func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []D
 			}
 			ino := fs.inodes.EnsureInode(meta.Path, false, meta.Size, mtime)
 			entries = append(entries, DirEntry{
-				Name: name,
-				Ino:  ino,
-				Mode: syscall.S_IFREG,
+				Name:        name,
+				Ino:         ino,
+				Mode:        syscall.S_IFREG,
+				Size:        meta.Size,
+				Mtime:       mtime,
+				IsDir:       false,
+				HasMetadata: true,
 			})
 			existing[name] = struct{}{}
 		}
@@ -3216,9 +3244,13 @@ func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []D
 			}
 			ino := fs.inodes.EnsureInode(meta.Path, false, meta.Size, mtime)
 			entries = append(entries, DirEntry{
-				Name: name,
-				Ino:  ino,
-				Mode: syscall.S_IFREG,
+				Name:        name,
+				Ino:         ino,
+				Mode:        syscall.S_IFREG,
+				Size:        meta.Size,
+				Mtime:       mtime,
+				IsDir:       false,
+				HasMetadata: true,
 			})
 			existing[name] = struct{}{}
 		}
@@ -3244,11 +3276,7 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 			fs.inodes.UpdateMode(ino, item.Mode)
 		}
 
-		entries = append(entries, DirEntry{
-			Name: item.Name,
-			Ino:  ino,
-			Mode: dirEntryMode(item.IsDir, item.HasMode, item.Mode),
-		})
+		entries = append(entries, dirEntryFromCachedInfo(item, ino))
 	}
 	return entries
 }

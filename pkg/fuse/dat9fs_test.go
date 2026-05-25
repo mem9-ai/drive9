@@ -2023,6 +2023,72 @@ func TestReadDirPlusStaleSnapshotDoesNotZeroLiveInode(t *testing.T) {
 	}
 }
 
+func TestReadDirPlusStaleSnapshotUsesStoredEntryMetadataAfterDirCacheInvalidated(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+	mtime := time.Now().Add(-2 * time.Minute).Truncate(time.Second)
+	entries := fs.cachedToDirEntries("/dir", []CachedFileInfo{{
+		Name:     "file.txt",
+		Size:     23,
+		Mtime:    mtime,
+		Revision: 44,
+		Mode:     0o600,
+		HasMode:  true,
+	}})
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	staleIno := entries[0].Ino
+	fs.inodes.Forget(staleIno, 1)
+	if _, ok := fs.inodes.GetEntry(staleIno); ok {
+		t.Fatalf("stale file inode %d is still mapped", staleIno)
+	}
+	fs.dirCache.Invalidate("/dir")
+
+	dh := &DirHandle{
+		Ino:     dirIno,
+		Path:    "/dir",
+		Entries: entries,
+	}
+	fh := fs.dirHandles.Allocate(dh)
+	out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	st := fs.ReadDirPlus(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Size:     4096,
+	}, out)
+	if st != gofuse.OK {
+		t.Fatalf("ReadDirPlus status = %v, want OK", st)
+	}
+
+	newIno, ok := fs.inodes.GetInode("/dir/file.txt")
+	if !ok {
+		t.Fatal("file path was not remapped")
+	}
+	if newIno == staleIno {
+		t.Fatalf("file inode = %d, want a replacement for stale inode", newIno)
+	}
+	entry, ok := fs.inodes.GetEntry(newIno)
+	if !ok {
+		t.Fatalf("replacement inode %d is not mapped", newIno)
+	}
+	if entry.Size != 23 {
+		t.Fatalf("replacement inode size = %d, want stored size 23", entry.Size)
+	}
+	if entry.Revision != 44 {
+		t.Fatalf("replacement inode revision = %d, want stored revision 44", entry.Revision)
+	}
+	if !entry.HasMode || entry.Mode != 0o600 {
+		t.Fatalf("replacement inode mode = %o has=%t, want 0600 true", entry.Mode, entry.HasMode)
+	}
+	if !entry.Mtime.Equal(mtime) {
+		t.Fatalf("replacement inode mtime = %s, want %s", entry.Mtime, mtime)
+	}
+}
+
 func TestLookupSSEForeignDeleteInvalidatesPositiveNamespaceHit(t *testing.T) {
 	var headCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
