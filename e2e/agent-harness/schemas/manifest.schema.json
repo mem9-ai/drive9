@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Drive9 Agent Harness Manifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "started_at",
+    "host",
+    "harness_git_sha",
+    "drive9_version",
+    "server",
+    "suites",
+    "selected_cases",
+    "cases",
+    "artifact_root",
+    "mount_root",
+    "remote_root_base",
+    "generated_mountpoints",
+    "generated_remote_roots",
+    "process_groups",
+    "api_key_redacted",
+    "approval_mode"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "agent-harness.v1"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "host": {
+      "type": "string"
+    },
+    "harness_git_sha": {
+      "type": "string"
+    },
+    "drive9_version": {
+      "type": "string"
+    },
+    "server": {
+      "type": "string"
+    },
+    "suites": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "selected_cases": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "suite",
+          "expected_outcome"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "suite": {
+            "enum": [
+              "smoke",
+              "regression",
+              "stress",
+              "fault"
+            ]
+          },
+          "expected_outcome": {
+            "enum": [
+              "baseline_pass",
+              "bug_reproduced",
+              "fix_verified"
+            ]
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "failed",
+              "inconclusive",
+              "known_bug_reproduced",
+              "known_bug_fixed_candidate"
+            ]
+          }
+        }
+      }
+    },
+    "artifact_root": {
+      "type": "string"
+    },
+    "mount_root": {
+      "type": "string"
+    },
+    "remote_root_base": {
+      "type": "string"
+    },
+    "generated_mountpoints": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "generated_remote_roots": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "process_groups": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer"
+      }
+    },
+    "api_key_redacted": {
+      "type": "string"
+    },
+    "approval_mode": {
+      "type": "string"
+    }
+  }
+}

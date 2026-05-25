@@ -121,12 +121,12 @@ func (u *WriteBackUploader) SetPerfCounters(perf *fusePerfCounters) {
 // goroutine so data is never silently dropped.
 func (u *WriteBackUploader) Submit(localPath string) {
 	if u.perf != nil {
-		u.perf.uploaderSubmit.add(1)
+		u.perf.uploaderSubmit.Add(1)
 	}
 	if u.stopped.Load() {
 		log.Printf("writeback uploader: already stopped, uploading synchronously for %s", localPath)
 		if u.perf != nil {
-			u.perf.uploaderSyncFallback.add(1)
+			u.perf.uploaderSyncFallback.Add(1)
 		}
 		u.uploadOne(localPath)
 		return
@@ -142,7 +142,7 @@ func (u *WriteBackUploader) Submit(localPath string) {
 		case <-timer.C:
 			log.Printf("writeback uploader: channel full after %v, uploading synchronously for %s", submitTimeout, localPath)
 			if u.perf != nil {
-				u.perf.uploaderSyncFallback.add(1)
+				u.perf.uploaderSyncFallback.Add(1)
 			}
 			u.uploadOne(localPath)
 		}
@@ -168,8 +168,8 @@ func (u *WriteBackUploader) DrainAll() {
 	start := time.Now()
 	defer func() {
 		if u.perf != nil {
-			u.perf.uploaderDrainCount.add(1)
-			u.perf.uploaderDrainTotal.add(uint64(time.Since(start)))
+			u.perf.uploaderDrainCount.Add(1)
+			u.perf.uploaderDrainTotal.Add(uint64(time.Since(start)))
 		}
 	}()
 	u.stopOnce.Do(func() {
@@ -310,7 +310,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 
 	if lastErr != nil {
 		if u.perf != nil {
-			u.perf.uploaderFailure.add(1)
+			u.perf.uploaderFailure.Add(1)
 		}
 		if errors.Is(lastErr, client.ErrConflict) {
 			// TODO: persist a conflict marker or resolution flow so these
@@ -345,7 +345,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		u.cache.Remove(localPath)
 	}
 	if u.perf != nil {
-		u.perf.uploaderSuccess.add(1)
+		u.perf.uploaderSuccess.Add(1)
 	}
 }
 
@@ -392,7 +392,7 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 	}
 	if err != nil {
 		if u.perf != nil {
-			u.perf.uploaderFailure.add(1)
+			u.perf.uploaderFailure.Add(1)
 		}
 		return err
 	}
@@ -415,7 +415,7 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 		u.cache.Remove(localPath)
 	}
 	if u.perf != nil {
-		u.perf.uploaderSuccess.add(1)
+		u.perf.uploaderSuccess.Add(1)
 	}
 	return nil
 }

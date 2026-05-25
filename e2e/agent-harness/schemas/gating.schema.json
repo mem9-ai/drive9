@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Drive9 Agent Harness Gating",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "gate_status",
+    "pass",
+    "fail",
+    "known_bug_reproduced",
+    "known_bug_fixed_candidate",
+    "non_gating",
+    "blocking_failures"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "agent-harness.v1"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "gate_status": {
+      "enum": [
+        "pass",
+        "fail",
+        "non_gating",
+        "harness_failed"
+      ]
+    },
+    "pass": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "fail": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "known_bug_reproduced": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "known_bug_fixed_candidate": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "non_gating": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "blocking_failures": {
+      "type": "array"
+    }
+  }
+}

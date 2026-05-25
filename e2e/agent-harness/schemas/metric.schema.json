@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Drive9 Agent Harness Metric",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "case_id",
+    "ts",
+    "name",
+    "value",
+    "unit",
+    "source",
+    "artifact_refs"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "agent-harness.v1"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "case_id": {
+      "type": "string"
+    },
+    "ts": {
+      "type": "string"
+    },
+    "name": {
+      "enum": [
+        "mount_startup_ms",
+        "command_duration_ms",
+        "git_clone_duration_ms",
+        "bytes_written",
+        "bytes_read",
+        "file_count",
+        "mount_perf_counter"
+      ]
+    },
+    "value": {
+      "type": "number"
+    },
+    "unit": {
+      "enum": [
+        "ms",
+        "bytes",
+        "files",
+        "count",
+        "bool"
+      ]
+    },
+    "source": {
+      "type": "string"
+    },
+    "artifact_refs": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

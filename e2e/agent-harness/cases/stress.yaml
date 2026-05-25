@@ -1,0 +1,89 @@
+defaults:
+  timeout: 20m
+  cleanup: retain_on_failure
+  mount_ready_timeout: 20s
+  remote_visibility_timeout: 30s
+  command_retry_count: 8
+  command_retry_sleep: 2s
+  requires_fresh_tenant: false
+cases:
+  - id: fio-seq-1g-strict
+    suite: stress
+    sync_mode: strict
+    expected_outcome: baseline_pass
+    remote_root_suffix: fio-seq-1g-strict
+    mountpoint_suffix: fio-seq-1g-strict
+    workload:
+      type: fio
+      size_bytes: 1073741824
+      block_bytes: 1048576
+      min_bytes_per_second: 1
+      remount: false
+    oracles:
+      - type: throughput_min
+    severity:
+      failure: P2
+  - id: small-file-storm-interactive
+    suite: stress
+    sync_mode: interactive
+    expected_outcome: baseline_pass
+    remote_root_suffix: small-file-storm-interactive
+    mountpoint_suffix: small-file-storm-interactive
+    workload:
+      type: small_file_storm
+      file_count: 1000
+      read_sample_count: 20
+      remount: true
+    oracles:
+      - type: file_count_equals
+      - type: cli_read_equals
+      - type: remount_hash_equal
+    severity:
+      failure: P2
+  - id: parallel-writers-strict
+    suite: stress
+    sync_mode: strict
+    expected_outcome: baseline_pass
+    remote_root_suffix: parallel-writers-strict
+    mountpoint_suffix: parallel-writers-strict
+    workload:
+      type: parallel_writes
+      parallel_writers: 8
+      writer_bytes: 67108864
+      min_bytes_per_second: 1
+      remount: true
+    oracles:
+      - type: fuse_write_success
+      - type: throughput_min
+      - type: remount_hash_equal
+    severity:
+      failure: P2
+  - id: cp-bottleneck-matrix
+    suite: stress
+    expected_outcome: baseline_pass
+    remote_root_suffix: cp-bottleneck-matrix
+    mountpoint_suffix: cp-bottleneck-matrix
+    timeout: 2h
+    workload:
+      type: cp_perf
+      file_sizes_mib:
+        - 50
+        - 100
+        - 1024
+      concurrency_levels:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+      modes:
+        - upload_warm
+        - download_file
+        - download_null
+      min_bytes_per_second: 1
+      collect_host_telemetry: true
+    oracles:
+      - type: throughput_min
+    severity:
+      failure: P2
