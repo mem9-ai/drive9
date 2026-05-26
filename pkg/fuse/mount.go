@@ -46,9 +46,9 @@ type MountOptions struct {
 	SyncMode              SyncMode      // interactive, strict, or auto (default auto)
 	WritePolicy           WritePolicy   // writeback, close-sync, or write-sync (default writeback)
 	Profile               string        // mount profile: "interactive", "coding-agent", "" (default)
-	LocalRoot             string        // observe-only future local-only root; no IO is routed there yet
-	LocalOnlyPatterns     []string      // additional would-be local-only observe patterns for coding-agent mounts
-	RemoteOnlyPatterns    []string      // would-be remote-persistent observe overrides for coding-agent mounts
+	LocalRoot             string        // local-only overlay root for coding-agent mounts
+	LocalOnlyPatterns     []string      // additional local-only path patterns for coding-agent mounts
+	RemoteOnlyPatterns    []string      // remote-persistent override path patterns for coding-agent mounts
 	UploadConcurrency     int           // number of background upload workers (default 4)
 	ReadConcurrency       int           // maximum concurrent backend reads issued by FUSE (default 24)
 	SyncRead              bool          // disable kernel async read dispatch; at most one read in flight per file handle
@@ -135,6 +135,11 @@ func Mount(opts *MountOptions) error {
 	opts.setDefaults()
 	if err := validateMountOptionsProfile(opts); err != nil {
 		return err
+	}
+	if localOverlay := NewLocalOverlay(opts.LocalRoot); localOverlay != nil {
+		if err := localOverlay.EnsureRoot(); err != nil {
+			return fmt.Errorf("mount: prepare LocalRoot: %w", err)
+		}
 	}
 
 	if err := os.MkdirAll(opts.MountPoint, 0o755); err != nil {
@@ -476,11 +481,14 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	hasLocalPolicy := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0
 	if opts.Profile != MountProfileCodingAgent {
 		if hasLocalPolicy {
-			return fmt.Errorf("mount: observe-only local policy options require profile %q", MountProfileCodingAgent)
+			return fmt.Errorf("mount: local policy options require profile %q", MountProfileCodingAgent)
 		}
 		return nil
 	}
-	if opts.LocalRoot != "" && !filepath.IsAbs(opts.LocalRoot) {
+	if opts.LocalRoot == "" {
+		return fmt.Errorf("mount: profile %q requires LocalRoot", MountProfileCodingAgent)
+	}
+	if !filepath.IsAbs(opts.LocalRoot) {
 		return fmt.Errorf("mount: LocalRoot must be an absolute path")
 	}
 	if err := validateLocalPolicyPatterns(opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns); err != nil {

@@ -96,10 +96,11 @@ type Dat9FS struct {
 	// perf contains optional mount-level counters. Nil when disabled.
 	perf *fusePerfCounters
 
-	// localPolicy classifies paths that future coding-agent mounts may route
-	// to a local-only backend. PR A observes the policy only; it does not
-	// change remote routing semantics.
+	// localPolicy classifies coding-agent paths that should be routed to
+	// local-only storage instead of the Drive9 remote backend.
 	localPolicy *LocalPolicy
+	// localOverlay stores local-only paths under MountOptions.LocalRoot.
+	localOverlay *LocalOverlay
 
 	// smallFileMax mirrors the server's inline_threshold (fetched lazily via
 	// the dat9 client). When 0, defaultSmallFileThreshold is used. Use the
@@ -192,6 +193,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		debouncer:     newFlushDebouncer(opts.FlushDebounce),
 		perf:          newFusePerfCounters(opts.PerfCounters),
 		localPolicy:   NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
+		localOverlay:  NewLocalOverlay(opts.LocalRoot),
 	}
 }
 
@@ -346,6 +348,36 @@ func (fs *Dat9FS) remoteRoot() string {
 
 func (fs *Dat9FS) remotePath(localPath string) string {
 	return mountpath.ToRemote(fs.remoteRoot(), localPath)
+}
+
+func (fs *Dat9FS) localOverlayForPath(localPath string) (*LocalOverlay, bool, gofuse.Status) {
+	if fs.observePathPolicy(localPath) != PathLayerLocalOnly {
+		return nil, false, gofuse.OK
+	}
+	if fs.localOverlay == nil {
+		return nil, true, gofuse.EIO
+	}
+	return fs.localOverlay, true, gofuse.OK
+}
+
+func (fs *Dat9FS) localEntry(localPath string, info os.FileInfo, incrementLookup bool) (*InodeEntry, gofuse.Status) {
+	entry := entryFromLocalInfo(localPath, info)
+	var ino uint64
+	if incrementLookup {
+		ino = fs.inodes.Lookup(localPath, entry.IsDir, entry.Size, entry.Mtime)
+	} else {
+		ino = fs.inodes.EnsureInode(localPath, entry.IsDir, entry.Size, entry.Mtime)
+	}
+	fs.inodes.SetModeState(ino, entry.Mode, entry.HasMode)
+	out, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		return nil, gofuse.EIO
+	}
+	return out, gofuse.OK
+}
+
+func isLocalFileHandle(fh *FileHandle) bool {
+	return fh != nil && fh.Layer == PathLayerLocalOnly && fh.LocalFile != nil
 }
 
 func (fs *Dat9FS) writePolicyForOpen(flags uint32) WritePolicy {
@@ -2116,7 +2148,28 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if st != gofuse.OK {
 		return st
 	}
-	fs.observePathPolicy(childP)
+	if overlay, local, st := fs.localOverlayForPath(childP); local {
+		if st != gofuse.OK {
+			return st
+		}
+		info, err := overlay.Lstat(childP)
+		if err != nil {
+			if os.IsNotExist(err) {
+				out.NodeId = 0
+				out.SetEntryTimeout(fs.negativeEntryTTL(childP))
+				return gofuse.ENOENT
+			}
+			return localErrToFuseStatus(err)
+		}
+		entry, st := fs.localEntry(childP, info, true)
+		if st != gofuse.OK {
+			return st
+		}
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.fillEntryOut(entry, out)
+		return gofuse.OK
+	}
 
 	// Pending namespace overlay: check in-memory PendingIndex first (O(1)),
 	// then fall back to the write-back cache GetMeta for backward compat.
@@ -2330,7 +2383,22 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	if !ok {
 		return gofuse.ENOENT
 	}
-	fs.observePathPolicy(entry.Path)
+	if overlay, local, st := fs.localOverlayForPath(entry.Path); local {
+		if st != gofuse.OK {
+			return st
+		}
+		info, err := overlay.Lstat(entry.Path)
+		if err != nil {
+			return localErrToFuseStatus(err)
+		}
+		localEntry, st := fs.localEntry(entry.Path, info, false)
+		if st != gofuse.OK {
+			return st
+		}
+		fs.fillAttr(localEntry, &out.Attr)
+		out.SetTimeout(fs.opts.AttrTTL)
+		return gofuse.OK
+	}
 
 	// Prefer unflushed writable state over the remote object size.
 	if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
@@ -2416,7 +2484,49 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	if !ok {
 		return gofuse.ENOENT
 	}
-	fs.observePathPolicy(entry.Path)
+	if overlay, local, st := fs.localOverlayForPath(entry.Path); local {
+		if st != gofuse.OK {
+			return st
+		}
+		if mtime, ok := input.GetMTime(); ok {
+			if err := overlay.Chtimes(entry.Path, mtime); err != nil {
+				return localErrToFuseStatus(err)
+			}
+			entry.Mtime = mtime
+			fs.inodes.UpdateMtime(input.NodeId, mtime)
+		}
+		if input.Valid&gofuse.FATTR_MODE != 0 {
+			mode := input.Mode & 0o777
+			if err := overlay.Chmod(entry.Path, mode); err != nil {
+				return localErrToFuseStatus(err)
+			}
+			entryMode := mode
+			if entryIsSymlink(entry) {
+				entryMode |= uint32(syscall.S_IFLNK)
+			}
+			entry.Mode = entryMode
+			fs.inodes.UpdateMode(input.NodeId, entryMode)
+		}
+		if input.Valid&gofuse.FATTR_SIZE != 0 {
+			if entry.IsDir {
+				return gofuse.Status(syscall.EISDIR)
+			}
+			if err := overlay.Truncate(entry.Path, int64(input.Size)); err != nil {
+				return localErrToFuseStatus(err)
+			}
+			entry.Size = int64(input.Size)
+			fs.inodes.UpdateSize(input.NodeId, int64(input.Size))
+		}
+		info, err := overlay.Lstat(entry.Path)
+		if err == nil {
+			if refreshed, st := fs.localEntry(entry.Path, info, false); st == gofuse.OK {
+				entry = refreshed
+			}
+		}
+		fs.fillAttr(entry, &out.Attr)
+		out.SetTimeout(fs.opts.AttrTTL)
+		return gofuse.OK
+	}
 
 	// Handle mtime updates
 	if mtime, ok := input.GetMTime(); ok {
@@ -2548,7 +2658,16 @@ func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out
 	if !entryIsSymlink(entry) {
 		return nil, gofuse.Status(syscall.EINVAL)
 	}
-	fs.observePathPolicy(entry.Path)
+	if overlay, local, st := fs.localOverlayForPath(entry.Path); local {
+		if st != gofuse.OK {
+			return nil, st
+		}
+		target, err := overlay.Readlink(entry.Path)
+		if err != nil {
+			return nil, localErrToFuseStatus(err)
+		}
+		return []byte(target), gofuse.OK
+	}
 
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -2571,9 +2690,29 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 	if st != gofuse.OK {
 		return st
 	}
-	fs.observePathPolicy(childP)
 
 	mode := input.Mode & 0o777
+	if overlay, local, st := fs.localOverlayForPath(childP); local {
+		if st != gofuse.OK {
+			return st
+		}
+		if err := overlay.Mkdir(childP, mode); err != nil {
+			return localErrToFuseStatus(err)
+		}
+		info, err := overlay.Lstat(childP)
+		if err != nil {
+			return localErrToFuseStatus(err)
+		}
+		entry, st := fs.localEntry(childP, info, true)
+		if st != gofuse.OK {
+			return st
+		}
+		parentPath, _ := fs.inodes.GetPath(input.NodeId)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.fillEntryOut(entry, out)
+		return gofuse.OK
+	}
+
 	if err := fs.mkdirRemoteWithTransientRetry(cancel, childP, mode); err != nil {
 		return httpToFuseStatus(err)
 	}
@@ -2606,7 +2745,26 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	if st != gofuse.OK {
 		return st
 	}
-	fs.observePathPolicy(childP)
+	if overlay, local, st := fs.localOverlayForPath(childP); local {
+		if st != gofuse.OK {
+			return st
+		}
+		if err := overlay.Symlink(pointedTo, childP); err != nil {
+			return localErrToFuseStatus(err)
+		}
+		info, err := overlay.Lstat(childP)
+		if err != nil {
+			return localErrToFuseStatus(err)
+		}
+		entry, st := fs.localEntry(childP, info, true)
+		if st != gofuse.OK {
+			return st
+		}
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
+		fs.fillEntryOut(entry, out)
+		return gofuse.OK
+	}
 
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -2664,7 +2822,26 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if st != gofuse.OK {
 		return st
 	}
-	fs.observePathPolicy(childP)
+	if overlay, local, st := fs.localOverlayForPath(childP); local {
+		if st != gofuse.OK {
+			return st
+		}
+		info, err := overlay.Lstat(childP)
+		if err != nil {
+			return localErrToFuseStatus(err)
+		}
+		if info.IsDir() {
+			return gofuse.Status(syscall.EISDIR)
+		}
+		if err := overlay.Remove(childP); err != nil {
+			return localErrToFuseStatus(err)
+		}
+		fs.inodes.Remove(childP)
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Remove(parentPath, name)
+		fs.cacheNegativePath(childP)
+		return gofuse.OK
+	}
 	start := time.Now()
 	status = gofuse.OK
 	fs.debugf("unlink start path=%s parent_ino=%d name=%s", childP, header.NodeId, name)
@@ -2762,7 +2939,27 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	if st != gofuse.OK {
 		return st
 	}
-	fs.observePathPolicy(childP)
+	if overlay, local, st := fs.localOverlayForPath(childP); local {
+		if st != gofuse.OK {
+			return st
+		}
+		info, err := overlay.Lstat(childP)
+		if err != nil {
+			return localErrToFuseStatus(err)
+		}
+		if !info.IsDir() {
+			return gofuse.Status(syscall.ENOTDIR)
+		}
+		if err := overlay.Remove(childP); err != nil {
+			return localErrToFuseStatus(err)
+		}
+		fs.inodes.Remove(childP)
+		fs.dirCache.InvalidatePrefix(childP)
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Remove(parentPath, name)
+		fs.cacheNegativePath(childP)
+		return gofuse.OK
+	}
 	start := time.Now()
 	status = gofuse.OK
 	fs.debugf("rmdir start path=%s parent_ino=%d name=%s", childP, header.NodeId, name)
@@ -3030,9 +3227,22 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	if st != gofuse.OK {
 		return st
 	}
-	fs.observePathPolicy(oldP)
-	fs.observePathPolicy(newP)
 	if oldP == newP {
+		return gofuse.OK
+	}
+	oldLayer := fs.observePathPolicy(oldP)
+	newLayer := fs.observePathPolicy(newP)
+	if oldLayer == PathLayerLocalOnly || newLayer == PathLayerLocalOnly {
+		if oldLayer != newLayer {
+			return gofuse.Status(syscall.EXDEV)
+		}
+		if fs.localOverlay == nil {
+			return gofuse.EIO
+		}
+		if err := fs.localOverlay.Rename(oldP, newP); err != nil {
+			return localErrToFuseStatus(err)
+		}
+		fs.finishLocalRename(input, oldP, newP)
 		return gofuse.OK
 	}
 
@@ -3182,7 +3392,7 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 		entries, err := fs.listDir(ctx, dh.Path)
 		if err != nil {
 			log.Printf("list dir failed for %s: %v", dh.Path, err)
-			return httpToFuseStatus(err)
+			return listDirErrToFuseStatus(err)
 		}
 		dh.Entries = entries
 	}
@@ -3216,7 +3426,7 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 		entries, err := fs.listDir(ctx, dh.Path)
 		if err != nil {
 			log.Printf("list dir plus failed for %s: %v", dh.Path, err)
-			return httpToFuseStatus(err)
+			return listDirErrToFuseStatus(err)
 		}
 		dh.Entries = entries
 	}
@@ -3332,13 +3542,24 @@ func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
 }
 
 func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, error) {
+	if overlay, local, st := fs.localOverlayForPath(dirPath); local {
+		if st != gofuse.OK {
+			return nil, syscall.EIO
+		}
+		items, err := overlay.ReadDir(dirPath)
+		if err != nil {
+			return nil, err
+		}
+		return fs.localOverlayDirEntries(dirPath, items), nil
+	}
+
 	// Check dir cache first
 	if cached, ok := fs.dirCache.Get(dirPath); ok {
 		if fs.perf != nil {
 			fs.perf.dirCacheHit.add(1)
 		}
 		entries := fs.cachedToDirEntries(dirPath, cached)
-		return fs.mergePendingDirEntries(dirPath, entries), nil
+		return fs.mergeLocalDirEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries))
 	}
 	if fs.perf != nil {
 		fs.perf.dirCacheMiss.add(1)
@@ -3358,7 +3579,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached)
 
 	entries := fs.cachedToDirEntries(dirPath, cached)
-	return fs.mergePendingDirEntries(dirPath, entries), nil
+	return fs.mergeLocalDirEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries))
 }
 
 func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []CachedFileInfo) {
@@ -3487,6 +3708,66 @@ func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []D
 	return entries
 }
 
+func (fs *Dat9FS) mergeLocalDirEntries(dirPath string, entries []DirEntry) ([]DirEntry, error) {
+	if fs.localOverlay == nil {
+		return entries, nil
+	}
+	items, err := fs.localOverlay.ReadDir(dirPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return entries, nil
+		}
+		return nil, err
+	}
+	localEntries := fs.localOverlayDirEntries(dirPath, items)
+	if len(localEntries) == 0 {
+		return entries, nil
+	}
+	byName := make(map[string]int, len(entries)+len(localEntries))
+	for i, entry := range entries {
+		byName[entry.Name] = i
+	}
+	for _, entry := range localEntries {
+		if idx, ok := byName[entry.Name]; ok {
+			entries[idx] = entry
+			continue
+		}
+		byName[entry.Name] = len(entries)
+		entries = append(entries, entry)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name < entries[j].Name
+	})
+	return entries, nil
+}
+
+func (fs *Dat9FS) localOverlayDirEntries(dirPath string, items []localOverlayEntry) []DirEntry {
+	entries := make([]DirEntry, 0, len(items))
+	for _, item := range items {
+		childP := dirEntryChildPath(dirPath, item.Name)
+		if fs.observePathPolicy(childP) != PathLayerLocalOnly {
+			continue
+		}
+		info := item.Info
+		entry := entryFromLocalInfo(childP, info)
+		ino := fs.inodes.EnsureInode(childP, entry.IsDir, entry.Size, entry.Mtime)
+		fs.inodes.SetModeState(ino, entry.Mode, entry.HasMode)
+		entries = append(entries, dirEntryFromLocalInfo(item.Name, ino, info))
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name < entries[j].Name
+	})
+	return entries
+}
+
+func listDirErrToFuseStatus(err error) gofuse.Status {
+	var errno syscall.Errno
+	if errors.As(err, &errno) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrExist) {
+		return localErrToFuseStatus(err)
+	}
+	return httpToFuseStatus(err)
+}
+
 func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []DirEntry {
 	entries := make([]DirEntry, 0, len(items))
 	for _, item := range items {
@@ -3529,9 +3810,42 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	if st != gofuse.OK {
 		return st
 	}
-	fs.observePathPolicy(childP)
 
 	mode, hasRemoteMode := createInputMode(input.Mode)
+	if overlay, local, st := fs.localOverlayForPath(childP); local {
+		if st != gofuse.OK {
+			return st
+		}
+		file, err := overlay.OpenFile(childP, input.Flags|uint32(syscall.O_CREAT), mode)
+		if err != nil {
+			return localErrToFuseStatus(err)
+		}
+		info, err := overlay.Lstat(childP)
+		if err != nil {
+			_ = file.Close()
+			return localErrToFuseStatus(err)
+		}
+		entry, st := fs.localEntry(childP, info, true)
+		if st != gofuse.OK {
+			_ = file.Close()
+			return st
+		}
+		fh := &FileHandle{
+			Ino:       entry.Ino,
+			Path:      childP,
+			Layer:     PathLayerLocalOnly,
+			LocalFile: file,
+			Flags:     input.Flags,
+		}
+		out.Fh = fs.allocateFileHandle(fh)
+		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
+		fs.fillEntryOut(entry, &out.EntryOut)
+
+		parentPath, _ := fs.inodes.GetPath(input.NodeId)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		return gofuse.OK
+	}
+
 	ino := fs.inodes.Lookup(childP, false, 0, time.Now())
 	fs.inodes.UpdateMode(ino, mode)
 	entry, ok := fs.inodes.GetEntry(ino)
@@ -3628,6 +3942,35 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 
 	// Allocate write buffer for writable opens
 	accMode := input.Flags & syscall.O_ACCMODE
+	if overlay, local, st := fs.localOverlayForPath(p); local {
+		if st != gofuse.OK {
+			return st
+		}
+		if (accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR) && fs.opts.ReadOnly {
+			return gofuse.EROFS
+		}
+		file, err := overlay.OpenFile(p, input.Flags, 0)
+		if err != nil {
+			return localErrToFuseStatus(err)
+		}
+		info, err := overlay.Lstat(p)
+		if err != nil {
+			_ = file.Close()
+			return localErrToFuseStatus(err)
+		}
+		refreshed, st := fs.localEntry(p, info, false)
+		if st != gofuse.OK {
+			_ = file.Close()
+			return st
+		}
+		fh.Layer = PathLayerLocalOnly
+		fh.LocalFile = file
+		fh.OrigSize = refreshed.Size
+		out.Fh = fs.allocateFileHandle(fh)
+		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
+		return gofuse.OK
+	}
+
 	if accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR {
 		if fs.opts.ReadOnly {
 			return gofuse.EROFS
@@ -3794,6 +4137,26 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	fh.Lock()
 	if lockWait := time.Since(lockStart); fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
 		fs.debugf("read lock wait path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, lockWait)
+	}
+
+	if isLocalFileHandle(fh) {
+		size := int(input.Size)
+		if size <= 0 {
+			fh.Unlock()
+			source = "local-empty"
+			bytesRead = 0
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
+		data := make([]byte, size)
+		n, err := fh.LocalFile.ReadAt(data, int64(input.Offset))
+		fh.Unlock()
+		if err != nil && !errors.Is(err, io.EOF) {
+			source = "local-error"
+			return nil, localErrToFuseStatus(err)
+		}
+		source = "local-file"
+		bytesRead = n
+		return gofuse.ReadResultData(data[:n]), gofuse.OK
 	}
 
 	// ShadowSpill: read from shadow file (the authoritative data source).
@@ -4191,6 +4554,29 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 	defer fh.Unlock()
 
+	if isLocalFileHandle(fh) {
+		var (
+			n   int
+			err error
+		)
+		if fh.Flags&uint32(syscall.O_APPEND) != 0 {
+			n, err = fh.LocalFile.Write(data)
+		} else {
+			n, err = fh.LocalFile.WriteAt(data, int64(input.Offset))
+		}
+		if err != nil && n == 0 {
+			source = "local-error"
+			return 0, localErrToFuseStatus(err)
+		}
+		written = uint32(n)
+		if info, statErr := fh.LocalFile.Stat(); statErr == nil {
+			fs.inodes.UpdateSize(fh.Ino, info.Size())
+			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
+		}
+		source = "local-file"
+		return written, gofuse.OK
+	}
+
 	if fh.Dirty == nil {
 		source = "new-dirty-buffer"
 		fh.Dirty = fs.newWriteBuffer(fh.Path, 0, 0)
@@ -4510,6 +4896,18 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		fs.debugf("flush done path=%s fh=%d ino=%d phase=%s size=%d dirty=%t shadow_ready=%t shadow_spill=%t status=%d dur=%s", fh.Path, input.Fh, fh.Ino, phase, size, dirty, fh.ShadowReady, fh.ShadowSpill, status, d)
 	}()
 
+	if isLocalFileHandle(fh) {
+		phase = "local-sync"
+		if err := fh.LocalFile.Sync(); err != nil {
+			return localErrToFuseStatus(err)
+		}
+		if info, err := fh.LocalFile.Stat(); err == nil {
+			fs.inodes.UpdateSize(fh.Ino, info.Size())
+			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
+		}
+		return gofuse.OK
+	}
+
 	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() &&
 		(fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync) {
 		size := fh.Dirty.Size()
@@ -4726,6 +5124,18 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}
 		fs.debugf("fsync done path=%s fh=%d ino=%d phase=%s size=%d dirty=%t shadow_spill=%t status=%d dur=%s", fh.Path, input.Fh, fh.Ino, phase, size, dirty, fh.ShadowSpill, status, d)
 	}()
+
+	if isLocalFileHandle(fh) {
+		phase = "local-sync"
+		if err := fh.LocalFile.Sync(); err != nil {
+			return localErrToFuseStatus(err)
+		}
+		if info, err := fh.LocalFile.Stat(); err == nil {
+			fs.inodes.UpdateSize(fh.Ino, info.Size())
+			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
+		}
+		return gofuse.OK
+	}
 
 	// Interactive mode: Fsync = local durable only. Shadow file + journal
 	// ensure crash safety. Remote commit happens asynchronously.
@@ -4954,6 +5364,25 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			}
 			fs.debugf("release done path=%s fh=%d ino=%d phase=%s size=%d dirty=%t shadow_ready=%t shadow_spill=%t status=%d dur=%s", fh.Path, input.Fh, fh.Ino, phase, size, dirty, fh.ShadowReady, fh.ShadowSpill, flushStatus, d)
 		}()
+
+		if isLocalFileHandle(fh) {
+			phase = "local-close"
+			fh.Lock()
+			localFile := fh.LocalFile
+			fh.LocalFile = nil
+			fh.Unlock()
+			if localFile != nil {
+				if info, err := localFile.Stat(); err == nil {
+					fs.inodes.UpdateSize(fh.Ino, info.Size())
+					fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
+				}
+				if err := localFile.Close(); err != nil {
+					flushStatus = localErrToFuseStatus(err)
+				}
+			}
+			return
+		}
+
 		// Cancel any pending debounce for this path — Release always flushes immediately.
 		phase = "cancel-debounce"
 		fs.debouncer.Cancel(fh.Path)

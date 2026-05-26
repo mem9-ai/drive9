@@ -105,12 +105,12 @@ func fsMountCmd(args []string) error {
 	prefetchMaxBytes := fs.Int64("readdir-prefetch-max-bytes", 1<<20, "maximum aggregate bytes prefetched per directory read")
 	prefetchTimeout := fs.Duration("readdir-prefetch-timeout", time.Second, "timeout for one readdir prefetch batch")
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
-	profile := fs.String("profile", "", "mount profile: interactive, coding-agent (coding-agent is observe-only; empty for default)")
-	localRoot := fs.String("local-policy-observe-root", "", "reserved future local-only storage root for --profile=coding-agent; observe-only, no IO is routed there yet")
+	profile := fs.String("profile", "", "mount profile: interactive, coding-agent (empty for default)")
+	localRoot := fs.String("local-root", "", "local-only overlay storage root for --profile=coding-agent")
 	var localOnlyPatterns stringListFlag
 	var remoteOnlyPatterns stringListFlag
-	fs.Var(&localOnlyPatterns, "local-policy-observe-local", "additional would-be local-only path pattern for coding-agent observe-only counters (repeatable, e.g. **/.git/**)")
-	fs.Var(&remoteOnlyPatterns, "local-policy-observe-remote", "would-be remote-persistent override path pattern for coding-agent observe-only counters (repeatable)")
+	fs.Var(&localOnlyPatterns, "local-only", "additional local-only path pattern for coding-agent overlay routing (repeatable, e.g. **/node_modules/**)")
+	fs.Var(&remoteOnlyPatterns, "remote-only", "remote-persistent override path pattern for coding-agent overlay routing (repeatable)")
 	uploadConcurrency := fs.Int("upload-concurrency", 16, "maximum concurrent background uploads issued by FUSE")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
@@ -371,12 +371,15 @@ func validateMountProfileFlags(profile string, localRoot string, localOnlyPatter
 	hasPolicyFlags := localRoot != "" || len(localOnlyPatterns) > 0 || len(remoteOnlyPatterns) > 0
 	if profile != "coding-agent" {
 		if hasPolicyFlags {
-			return fmt.Errorf("drive9 mount: --local-policy-observe-root, --local-policy-observe-local, and --local-policy-observe-remote require --profile=coding-agent")
+			return fmt.Errorf("drive9 mount: --local-root, --local-only, and --remote-only require --profile=coding-agent")
 		}
 		return nil
 	}
-	if strings.TrimSpace(localRoot) != "" && !filepath.IsAbs(localRoot) {
-		return fmt.Errorf("drive9 mount: --local-policy-observe-root must be an absolute path")
+	if strings.TrimSpace(localRoot) == "" {
+		return fmt.Errorf("drive9 mount: --profile=coding-agent requires --local-root")
+	}
+	if !filepath.IsAbs(localRoot) {
+		return fmt.Errorf("drive9 mount: --local-root must be an absolute path")
 	}
 	if err := validateMountPolicyPatterns(localOnlyPatterns, remoteOnlyPatterns); err != nil {
 		return err

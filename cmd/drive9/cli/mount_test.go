@@ -1020,9 +1020,9 @@ func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
 		"--profile", "coding-agent",
-		"--local-policy-observe-root", " " + localRoot + " ",
-		"--local-policy-observe-local", "**/node_modules/**",
-		"--local-policy-observe-remote", "**/node_modules/keep/**",
+		"--local-root", " " + localRoot + " ",
+		"--local-only", "**/node_modules/**",
+		"--remote-only", "**/node_modules/keep/**",
 		t.TempDir(),
 	})
 	if err != nil {
@@ -1045,14 +1045,12 @@ func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
 	}
 }
 
-func TestMountCmdCodingAgentProfileAllowsMissingObserveRoot(t *testing.T) {
+func TestMountCmdCodingAgentProfileRequiresLocalRoot(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
-	var got *mountFuseOptions
 	mountFuse = func(opts *mountFuseOptions) error {
-		copied := *opts
-		got = &copied
+		t.Fatal("mountFuse should not be called")
 		return nil
 	}
 
@@ -1063,14 +1061,8 @@ func TestMountCmdCodingAgentProfileAllowsMissingObserveRoot(t *testing.T) {
 		"--profile", "coding-agent",
 		t.TempDir(),
 	})
-	if err != nil {
-		t.Fatalf("MountCmd: %v", err)
-	}
-	if got == nil {
-		t.Fatal("mountFuse was not called")
-	}
-	if got.Profile != "coding-agent" {
-		t.Fatalf("Profile = %q, want coding-agent", got.Profile)
+	if err == nil || !strings.Contains(err.Error(), "requires --local-root") {
+		t.Fatalf("error = %v, want missing local-root validation error", err)
 	}
 }
 
@@ -1079,7 +1071,7 @@ func TestMountCmdLocalPolicyFlagsRequireCodingAgentProfile(t *testing.T) {
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
-		"--local-policy-observe-local", "**/.git/**",
+		"--local-only", "**/.git/**",
 		t.TempDir(),
 	})
 	if err == nil || !strings.Contains(err.Error(), "--profile=coding-agent") {
@@ -1087,17 +1079,17 @@ func TestMountCmdLocalPolicyFlagsRequireCodingAgentProfile(t *testing.T) {
 	}
 }
 
-func TestMountCmdLocalObserveRootMustBeAbsolute(t *testing.T) {
+func TestMountCmdLocalRootMustBeAbsolute(t *testing.T) {
 	err := MountCmd([]string{
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
 		"--profile", "coding-agent",
-		"--local-policy-observe-root", "relative/root",
+		"--local-root", "relative/root",
 		t.TempDir(),
 	})
-	if err == nil || !strings.Contains(err.Error(), "--local-policy-observe-root") {
-		t.Fatalf("error = %v, want observe root validation error", err)
+	if err == nil || !strings.Contains(err.Error(), "--local-root") {
+		t.Fatalf("error = %v, want local root validation error", err)
 	}
 }
 
@@ -1119,7 +1111,8 @@ func TestMountCmdLocalPolicyPatternsRejectUnsafePaths(t *testing.T) {
 				"--server", "https://drive9.example",
 				"--api-key", "sk-test",
 				"--profile", "coding-agent",
-				"--local-policy-observe-local", test.pattern,
+				"--local-root", t.TempDir(),
+				"--local-only", test.pattern,
 				t.TempDir(),
 			})
 			if err == nil || !strings.Contains(err.Error(), "invalid local policy pattern") || !strings.Contains(err.Error(), test.want) {

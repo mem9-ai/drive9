@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -3167,8 +3168,8 @@ func TestMountOptionsCodingAgentPolicyValidation(t *testing.T) {
 
 	missingRoot := &MountOptions{Profile: MountProfileCodingAgent}
 	missingRoot.setDefaults()
-	if err := validateMountOptionsProfile(missingRoot); err != nil {
-		t.Fatalf("observe-only coding-agent profile without LocalRoot should be allowed: %v", err)
+	if err := validateMountOptionsProfile(missingRoot); err == nil {
+		t.Fatal("coding-agent profile without LocalRoot should fail")
 	}
 
 	ordinaryWithPolicy := &MountOptions{LocalOnlyPatterns: []string{"**/.git/**"}}
@@ -3179,6 +3180,7 @@ func TestMountOptionsCodingAgentPolicyValidation(t *testing.T) {
 
 	invalidPattern := &MountOptions{
 		Profile:           MountProfileCodingAgent,
+		LocalRoot:         t.TempDir(),
 		LocalOnlyPatterns: []string{"**/../.git/**"},
 	}
 	invalidPattern.setDefaults()
@@ -3187,7 +3189,7 @@ func TestMountOptionsCodingAgentPolicyValidation(t *testing.T) {
 	}
 }
 
-func TestDat9FSObservesLocalPolicyWithoutChangingRouting(t *testing.T) {
+func TestDat9FSClassifiesCodingAgentLocalPolicy(t *testing.T) {
 	opts := &MountOptions{
 		CacheSize:    1 << 20,
 		DirTTL:       time.Second,
@@ -3211,6 +3213,150 @@ func TestDat9FSObservesLocalPolicyWithoutChangingRouting(t *testing.T) {
 	}
 	if got := snap.Counters["local_policy_remote_default"]; got != 1 {
 		t.Fatalf("local policy remote-default counter = %d, want 1", got)
+	}
+}
+
+func TestCodingAgentLocalOverlayCreateReadWriteDoesNotUseRemote(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be used for local-only overlay paths", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	localRoot := t.TempDir()
+	opts := &MountOptions{
+		Profile:   MountProfileCodingAgent,
+		LocalRoot: localRoot,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	var gitOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Mode:     0o755,
+	}, ".git", &gitOut); st != gofuse.OK {
+		t.Fatalf("Mkdir .git: %v", st)
+	}
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: gitOut.NodeId},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "config", &createOut); st != gofuse.OK {
+		t.Fatalf("Create config: %v", st)
+	}
+
+	content := []byte("[core]\n\trepositoryformatversion = 0\n")
+	written, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(content)),
+	}, content)
+	if st != gofuse.OK {
+		t.Fatalf("Write config: %v", st)
+	}
+	if written != uint32(len(content)) {
+		t.Fatalf("Write bytes = %d, want %d", written, len(content))
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush config: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+
+	localPath := localRoot + "/overlay/repo/.git/config"
+	gotFile, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatalf("ReadFile local overlay: %v", err)
+	}
+	if string(gotFile) != string(content) {
+		t.Fatalf("local overlay content = %q, want %q", gotFile, content)
+	}
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: gitOut.NodeId}, "config", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup config: %v", st)
+	}
+	var openOut gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &openOut); st != gofuse.OK {
+		t.Fatalf("Open config: %v", st)
+	}
+	buf := make([]byte, len(content)+8)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       openOut.Fh,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read config: %v", st)
+	}
+	got, _ := result.Bytes(buf)
+	if string(got) != string(content) {
+		t.Fatalf("Read config = %q, want %q", got, content)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+}
+
+func TestCodingAgentLocalOverlayCrossLayerRenameReturnsEXDEV(t *testing.T) {
+	opts := &MountOptions{
+		Profile:   MountProfileCodingAgent,
+		LocalRoot: t.TempDir(),
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	gitIno := fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
+	fs.inodes.Lookup("/repo/.git/config.lock", false, 4, time.Now())
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: gitIno},
+		Newdir:   repoIno,
+	}, "config.lock", "config")
+	if st != gofuse.Status(syscall.EXDEV) {
+		t.Fatalf("Rename local->remote status = %v, want EXDEV", st)
+	}
+}
+
+func TestCodingAgentLocalOverlayReadDirMergesRemoteAndLocalEntries(t *testing.T) {
+	localRoot := t.TempDir()
+	opts := &MountOptions{
+		Profile:   MountProfileCodingAgent,
+		LocalRoot: localRoot,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	if err := os.MkdirAll(localRoot+"/overlay/repo/.git", 0o755); err != nil {
+		t.Fatalf("MkdirAll local .git: %v", err)
+	}
+	remote := []DirEntry{
+		{Name: ".git", Ino: 99, Mode: uint32(syscall.S_IFREG) | 0o644},
+		{Name: "README.md", Ino: 100, Mode: uint32(syscall.S_IFREG) | 0o644},
+	}
+	entries, err := fs.mergeLocalDirEntries("/repo", remote)
+	if err != nil {
+		t.Fatalf("mergeLocalDirEntries: %v", err)
+	}
+
+	if len(entries) != 2 {
+		t.Fatalf("entry count = %d, want 2: %#v", len(entries), entries)
+	}
+	if entries[0].Name != ".git" || !entries[0].IsDir {
+		t.Fatalf("first entry = %#v, want local .git directory override", entries[0])
+	}
+	if entries[1].Name != "README.md" {
+		t.Fatalf("second entry = %#v, want README.md", entries[1])
 	}
 }
 
