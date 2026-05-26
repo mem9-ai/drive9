@@ -1,93 +1,18 @@
-# Prod Coding-Agent Local Overlay Benchmark
+# Prod Drive9 FUSE Coding-Agent Local Overlay Benchmark
 
 Date: 2026-05-26 UTC
 
-EC2: `i-073e6d574b0d04ce1`, `c6i.2xlarge`, `ap-southeast-1`
+## Executive Summary
 
-Drive9 backend: production endpoint `https://api.drive9.ai`
+This benchmark compares native disk against Drive9 FUSE on three real coding
+agent workloads: cloning a fresh checkout and running each repo's build command.
+The Drive9 FUSE sample used the `coding-agent` local overlay profile, which
+routes Git metadata, dependency installs, caches, temporary trees, and generated
+outputs to local disk while leaving the remaining source tree on the tested
+storage.
 
-Drive9 CLI: self-built from the current `feat/bench` source snapshot, version
-`feat-bench-coding-agent`, git hash
-`5b9c505faf643ecffdc685a1e1aa114f513b226f`.
-
-## Conclusion
-
-All three target repos completed `git clone` and build on both native disk and
-Drive9 FUSE with the coding-agent local overlay enabled.
-
-The final setup routes `.git`, dependency install trees, caches, temporary
-directories, and generated output directories to native disk through Drive9's
-`--profile=coding-agent --local-root ...` mount policy. The remaining source
-tree is kept under the tested storage, so the result still measures native disk
-versus Drive9 FUSE for ordinary source-tree reads and metadata activity.
-
-At one measured run per repo/storage, Drive9 FUSE remained slower than native
-disk, with clone ratios from `11.24x` to `42.29x` and build ratios from `3.07x`
-to `9.73x`. The full matrix succeeded without failed phase events.
-
-## Test Method
-
-- Runs: `1` measured repeat per repo/storage.
-- Storages:
-  - native disk under `/mnt/drive9-bench/work/...`
-  - Drive9 FUSE under `/mnt/drive9-bench/mounts/prod-coding-agent-localgit-v2`
-- Clone timing: `git clone --no-checkout <url> <dir>` plus
-  `git checkout --detach <commit>`.
-- Build timing: repo-specific build commands inside the fresh checkout.
-- Not timed: dependency prewarm, `drive9 create`, FUSE mount/unmount, checkout
-  cleanup, context setup, and local overlay setup.
-- FUSE flags: `--mode=fuse --allow-other --profile=coding-agent --local-root
-  <BENCH_HOME/local-overlay/...> --durability=interactive --perf-counters`.
-- Drive9 context strategy: one fresh prod context per repo via
-  `drive9 create --server https://api.drive9.ai`.
-- CLI selection: `BENCH_DRIVE9_CLI` pointed to the self-built EC2 binary at
-  `/mnt/drive9-bench/src/drive9-coding-agent-20260526T044200Z/bin/drive9`.
-- Timeouts: clone, build, and prewarm were each capped at `1800s`.
-
-## Test Process
-
-1. Synced the current `feat/bench` source snapshot to the EC2 machine.
-2. Built the Drive9 CLI on EC2 with `make build-cli`.
-3. Activated prod configuration from `/home/ubuntu/.drive9/config_prod_bak_codex`.
-4. Resolved target commits for `drive9`, `kimi-cli`, and `kimi-code`.
-5. Prewarmed dependency caches outside measured timings.
-6. For each repo, created a fresh prod Drive9 context, ran native clone/build,
-   then ran Drive9 FUSE clone/build with coding-agent local overlay enabled.
-7. Captured raw events, per-phase logs, summary CSV/Markdown, manifest,
-   `.git` local overlay probes, and FUSE perf counters.
-8. Unmounted the FUSE mount after each FUSE sample and restored the previous
-   Drive9 config after the run.
-
-## Local-Only Policy
-
-Common local-only patterns:
-
-`**/.git/**`, `**/node_modules/**`, `**/.venv/**`, `**/dist/**`,
-`**/build/**`, `**/target/**`, `**/bin/**`, cache directories, temp
-directories, and common Python cache directories.
-
-Repo-specific additions:
-
-| repo | extra local-only paths |
-| --- | --- |
-| `drive9` | none beyond common policy |
-| `kimi-cli` | `src/kimi_cli/deps/{bin,tmp}`, `src/kimi_cli/{web,vis}`, `packages/kimi-code/README.md`, `src/kimi_cli/CHANGELOG.md` |
-| `kimi-code` | `packages/node-sdk/.tmp-api-extractor` |
-
-## Final Results
-
-Final session: `ec2-20260526T050107Z-prod-coding-agent-localgit-v2`
-
-| repo | commit | storage | clone s | build s | clone+build s | status |
-| --- | --- | --- | ---: | ---: | ---: | --- |
-| `drive9` | `a7f48a5bda2566137220d5a0915bc8db9517f2be` | native | 1.129 | 18.234 | 19.364 | ok |
-| `drive9` | `a7f48a5bda2566137220d5a0915bc8db9517f2be` | Drive9 FUSE | 18.453 | 55.981 | 74.434 | ok |
-| `kimi-cli` | `33d7b4f8a012953e73ed625e45dcbea42048248d` | native | 3.983 | 44.724 | 48.708 | ok |
-| `kimi-cli` | `33d7b4f8a012953e73ed625e45dcbea42048248d` | Drive9 FUSE | 44.786 | 218.348 | 263.134 | ok |
-| `kimi-code` | `b2854353e7dacc4daf9f7cc19f4be62e6e62b6a9` | native | 1.380 | 23.543 | 24.923 | ok |
-| `kimi-code` | `b2854353e7dacc4daf9f7cc19f4be62e6e62b6a9` | Drive9 FUSE | 58.347 | 229.152 | 287.498 | ok |
-
-## FUSE / Native Ratios
+All three repos completed successfully on both native disk and Drive9 FUSE. With
+the local overlay enabled, Drive9 FUSE was still slower than native disk:
 
 | repo | clone ratio | build ratio | clone+build ratio |
 | --- | ---: | ---: | ---: |
@@ -95,27 +20,131 @@ Final session: `ec2-20260526T050107Z-prod-coding-agent-localgit-v2`
 | `kimi-cli` | 11.24x | 4.88x | 5.40x |
 | `kimi-code` | 42.29x | 9.73x | 11.54x |
 
-## Verification Evidence
+The most expensive relative phase remains clone/checkout. Because `.git` is
+local-only in this profile, this is not a pure remote-Git benchmark; the measured
+FUSE cost is primarily source working-tree materialization plus ordinary
+source-tree reads and metadata activity.
 
-- `.git` local overlay probe succeeded for all repos:
-  - `drive9`: `.git/config` existed under
-    `/mnt/drive9-bench/local-overlay/ec2-20260526T050107Z-prod-coding-agent-localgit-v2/drive9/run-1/.../.git`
-  - `kimi-cli`: `.git/config` existed under
-    `/mnt/drive9-bench/local-overlay/ec2-20260526T050107Z-prod-coding-agent-localgit-v2/kimi-cli/run-1/.../.git`
-  - `kimi-code`: `.git/config` existed under
-    `/mnt/drive9-bench/local-overlay/ec2-20260526T050107Z-prod-coding-agent-localgit-v2/kimi-code/run-1/.../.git`
-- FUSE perf counters showed local policy hits:
-  - `drive9`: `local_only=6512`, `remote_default=13612`
-  - `kimi-cli`: `local_only=1204940`, `remote_default=20393`
-  - `kimi-code`: `local_only=540446`, `remote_default=39978`
-- Final run had no failed phase events.
-- FUSE cleanup was verified with
-  `findmnt /mnt/drive9-bench/mounts/prod-coding-agent-localgit-v2`, which
-  returned no mount.
+These are single-run measurements. They are suitable for pass/fail validation
+and directional performance comparison, not for statistical claims or tight
+regression thresholds.
+
+## Environment
+
+| item | value |
+| --- | --- |
+| Host class | Linux EC2, `c6i.2xlarge`, `ap-southeast-1` |
+| Drive9 endpoint | production, `https://api.drive9.ai` |
+| Drive9 CLI | self-built from `feat/bench` |
+| Drive9 CLI version | `feat-bench-coding-agent` |
+| Drive9 CLI git hash | `5b9c505faf643ecffdc685a1e1aa114f513b226f` |
+| Go | `go1.25.1 linux/amd64` |
+| Git | `2.43.0` |
+| Node | `v24.16.0` |
+| npm | `11.13.0` |
+| corepack | `0.35.0` |
+| uv | `0.11.16` |
+
+## Methodology
+
+- Runs: `1` measured repeat per repo/storage.
+- Storages:
+  - native disk under the benchmark work directory
+  - Drive9 FUSE mounted with `--profile=coding-agent --local-root <...>`
+- Drive9 context strategy: one fresh production Drive9 context per repo via
+  `drive9 create`; context creation time is excluded.
+- Clone timing: `git clone --no-checkout <url> <dir>` followed by
+  `git checkout --detach <commit>`.
+- Build timing: repo-specific build commands inside the fresh checkout.
+- Not timed: dependency prewarm, `drive9 create`, FUSE mount/unmount, checkout
+  cleanup, context setup, and local overlay setup.
+- Timeout: clone, build, and prewarm were each capped at `1800s`.
+- FUSE flags: `--mode=fuse --allow-other --profile=coding-agent --local-root
+  <BENCH_HOME/local-overlay/...> --durability=interactive --perf-counters`.
+- Git safety: benchmark environment set `safe.directory=*` because the FUSE
+  mount was root-started with `allow_other`.
+
+## Repo Matrix
+
+| repo | language | commit | build command |
+| --- | --- | --- | --- |
+| `mem9-ai/drive9` | Go | `a7f48a5bda2566137220d5a0915bc8db9517f2be` | `make build` |
+| `MoonshotAI/kimi-cli` | Python/Node | `33d7b4f8a012953e73ed625e45dcbea42048248d` | `uv sync --frozen --all-extras --all-packages && make build` |
+| `MoonshotAI/kimi-code` | TypeScript | `b2854353e7dacc4daf9f7cc19f4be62e6e62b6a9` | `corepack pnpm install --frozen-lockfile --store-dir "$PNPM_STORE_DIR" && corepack pnpm run build` |
+
+## Local Overlay Policy
+
+Common local-only categories:
+
+- VCS metadata: `.git`, `.hg`, `.svn`
+- Dependency installs and package caches: `node_modules`, `.pnpm-store`,
+  `.venv`, `.gradle`, cache directories
+- Generated outputs: `dist`, `build`, `target`, `bin`
+- Temporary and language cache trees: `tmp`, `.tmp`, `__pycache__`,
+  `.pytest_cache`, `.mypy_cache`, `.ruff_cache`
+
+Repo-specific additions:
+
+| repo | extra local-only paths |
+| --- | --- |
+| `drive9` | none beyond the common policy |
+| `kimi-cli` | `src/kimi_cli/deps/{bin,tmp}`, `src/kimi_cli/{web,vis}`, `packages/kimi-code/README.md`, `src/kimi_cli/CHANGELOG.md` |
+| `kimi-code` | `packages/node-sdk/.tmp-api-extractor` |
+
+## Timing Results
+
+| repo | storage | clone s | build s | clone+build s | status |
+| --- | --- | ---: | ---: | ---: | --- |
+| `drive9` | native | 1.129 | 18.234 | 19.364 | ok |
+| `drive9` | Drive9 FUSE | 18.453 | 55.981 | 74.434 | ok |
+| `kimi-cli` | native | 3.983 | 44.724 | 48.708 | ok |
+| `kimi-cli` | Drive9 FUSE | 44.786 | 218.348 | 263.134 | ok |
+| `kimi-code` | native | 1.380 | 23.543 | 24.923 | ok |
+| `kimi-code` | Drive9 FUSE | 58.347 | 229.152 | 287.498 | ok |
+
+## FUSE Overhead
+
+| repo | clone overhead s | build overhead s | clone+build overhead s |
+| --- | ---: | ---: | ---: |
+| `drive9` | 17.324 | 37.747 | 55.070 |
+| `kimi-cli` | 40.803 | 173.624 | 214.426 |
+| `kimi-code` | 56.967 | 205.609 | 262.575 |
+
+## Interpretation
+
+- The coding-agent local overlay removes the write-heavy paths that usually
+  dominate coding-agent workloads: `.git`, dependency trees, caches, temporary
+  trees, and generated outputs.
+- Clone/checkout remains the largest relative slowdown because the working tree
+  source files still need to be materialized through the tested storage.
+- Build slowdown varies by repo. `drive9` has the smallest build ratio because
+  Go module/build caches are outside the measured source tree. `kimi-code` is
+  the most expensive build workload in this run, even with dependency and
+  generated-output paths local-only.
+- The result should be compared against future runs only when host class,
+  target commits, CLI build, profile, and prewarm policy are kept consistent.
+
+## Validation
+
+| check | result |
+| --- | --- |
+| Phase status | all clone/build phases completed successfully |
+| Failed phase events | none |
+| `.git` local overlay probe | `.git/config` was present in the local overlay for all repos |
+| FUSE cleanup | final mount check returned no active mount |
+
+FUSE perf counters also confirmed that the local-only policy was exercised:
+
+| repo | local-only hits | remote-default hits |
+| --- | ---: | ---: |
+| `drive9` | 6,512 | 13,612 |
+| `kimi-cli` | 1,204,940 | 20,393 |
+| `kimi-code` | 540,446 | 39,978 |
 
 ## Artifacts
 
-- Final raw artifacts:
+- Result session: `ec2-20260526T050107Z-prod-coding-agent-localgit-v2`
+- Local artifact copy:
   `bench/results-ec2/ec2-20260526T050107Z-prod-coding-agent-localgit-v2/`
-- Main result files in that directory:
-  `events.jsonl`, `manifest.json`, `summary.csv`, `summary.md`, and `logs/`.
+- Main files: `events.jsonl`, `manifest.json`, `summary.csv`, `summary.md`,
+  and `logs/`
