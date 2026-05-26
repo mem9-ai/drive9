@@ -75,12 +75,13 @@ bench/bin/run-repo-build.py run --session <session> --resume --continue-on-error
 bench/bin/run-repo-build.py summarize "$BENCH_HOME/results/<session>"
 ```
 
-## Local Dependency And Output Bind Suite
+## Coding-Agent Local Overlay Suite
 
 `bench/bin/run-localdeps-output-build.py` is the currently successful suite for
-large repo builds where package install trees and known build-output trees should
-stay on native disk, while the source checkout is compared on native disk versus
-Drive9 FUSE.
+large repo builds where `.git`, package install trees, caches, temporary trees,
+and known build-output trees should stay on native disk through the Drive9
+coding-agent local overlay, while the remaining source checkout is compared on
+native disk versus Drive9 FUSE.
 
 The default repo set is:
 
@@ -95,6 +96,7 @@ export BENCH_HOME=/mnt/drive9-bench
 export BENCH_DRIVE9_ENV=prod
 export BENCH_DRIVE9_SERVER=https://api.drive9.ai
 export BENCH_DRIVE9_CONFIG=$HOME/.drive9/config_prod_bak
+export BENCH_DRIVE9_CLI=$PWD/bin/drive9
 export BENCH_REPOS=drive9,kimi-cli,kimi-code
 export BENCH_RUNS=1
 
@@ -105,19 +107,21 @@ Useful controls:
 
 - `BENCH_DRIVE9_CONTEXT_PREFIX`: prefix for the fresh `drive9 create` context
   created per repo.
+- `BENCH_DRIVE9_CLI`: path to the CLI binary used for `create`, `ctx`,
+  `mount`, `umount`, and version capture.
 - `BENCH_RUN_LABEL`: appears in mount/work/result paths.
 - `BENCH_SESSION`: pins an exact result directory name.
 - `BENCH_CLONE_TIMEOUT_SECONDS`, `BENCH_BUILD_TIMEOUT_SECONDS`, and
   `BENCH_PREWARM_TIMEOUT_SECONDS`: default to 30 minutes.
 
 This suite writes raw artifacts under `$BENCH_HOME/results/<session>/`. On FUSE
-samples it uses `--mode=fuse --allow-other --profile=interactive
---durability=interactive --perf-counters`; mount/unmount and `drive9 create`
-time are outside measured clone/build timings. `kimi-cli` and `kimi-code` have
-repo-specific bind policies for `node_modules`, `.venv`, generated `dist`
-trees, and other known generated outputs. `drive9` does not need output bind
-mounts; Go module/build caches are kept on native disk through `GOMODCACHE` and
-per-sample `GOCACHE`.
+samples it uses `--mode=fuse --allow-other --profile=coding-agent --local-root
+<BENCH_HOME/local-overlay/...> --durability=interactive --perf-counters`.
+Mount/unmount and `drive9 create` time are outside measured clone/build timings.
+The coding-agent local overlay keeps `.git`, third-party install directories,
+caches, temporary trees, and known generated outputs on native disk while the
+remaining source tree stays under the tested storage. Go module/build caches are
+also kept on native disk through `GOMODCACHE` and per-sample `GOCACHE`.
 
 ## Notes
 

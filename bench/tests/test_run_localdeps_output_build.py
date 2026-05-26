@@ -33,19 +33,31 @@ class LocalDepsOutputBuildHarnessTest(unittest.TestCase):
         runner = load_runner({"BENCH_REPOS": "drive9,kimi-code"})
         self.assertEqual([repo.repo_id for repo in runner.selected_repos()], ["drive9", "kimi-code"])
 
-    def test_kimi_code_parent_bind_avoids_nested_node_sdk_bind(self):
+    def test_kimi_code_local_policy_keeps_node_sdk_temp_local(self):
         runner = load_runner()
         repo = next(repo for repo in runner.REPOS if repo.repo_id == "kimi-code")
-        mounts = runner.bind_mounts_for(repo, Path("/checkout"), "fuse", 1)
-        targets = {target.as_posix() for _, target in mounts}
-        self.assertIn("/checkout/packages/node-sdk", targets)
-        self.assertNotIn("/checkout/packages/node-sdk/node_modules", targets)
-        self.assertIn("/checkout/apps/vis/web/dist", targets)
+        patterns = runner.local_only_patterns_for(repo)
+        self.assertIn("**/.git/**", patterns)
+        self.assertIn("**/node_modules/**", patterns)
+        self.assertIn("**/dist/**", patterns)
+        self.assertIn("**/packages/node-sdk/.tmp-api-extractor/**", patterns)
+        self.assertNotIn("**/packages/node-sdk/**", patterns)
 
-    def test_drive9_uses_no_repo_output_bind_mounts(self):
+    def test_drive9_uses_common_local_overlay_policy(self):
         runner = load_runner()
         repo = next(repo for repo in runner.REPOS if repo.repo_id == "drive9")
-        self.assertEqual(runner.bind_mounts_for(repo, Path("/checkout"), "fuse", 1), [])
+        patterns = runner.local_only_patterns_for(repo)
+        self.assertIn("**/.git/**", patterns)
+        self.assertIn("**/target/**", patterns)
+        self.assertIn("**/bin/**", patterns)
+        self.assertNotIn("**/src/kimi_cli/web/**", patterns)
+
+    def test_kimi_cli_keeps_known_package_metadata_symlinks_local(self):
+        runner = load_runner()
+        repo = next(repo for repo in runner.REPOS if repo.repo_id == "kimi-cli")
+        patterns = runner.local_only_patterns_for(repo)
+        self.assertIn("**/packages/kimi-code/README.md", patterns)
+        self.assertIn("**/src/kimi_cli/CHANGELOG.md", patterns)
 
 
 if __name__ == "__main__":

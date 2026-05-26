@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Run the production/dev Drive9 FUSE benchmark with local dependency/output binds.
+"""Run the production/dev Drive9 FUSE benchmark with coding-agent local overlay.
 
 This harness is intentionally narrower than run-repo-build.py. It captures the
-successful workaround used for large real-world repo builds where third-party
-install trees and known generated-output trees are bind-mounted from the native
-disk, while the source checkout itself remains on either native disk or Drive9
-FUSE. Each repo gets a fresh `drive9 create` context before its FUSE sample.
+successful benchmark mode for large real-world repo builds where .git,
+third-party install trees, caches, temporary trees, and known generated outputs
+are routed to the coding-agent local overlay, while the remaining source
+checkout is compared on either native disk or Drive9 FUSE. Each repo gets a
+fresh `drive9 create` context before its FUSE sample.
 """
 
 from __future__ import annotations
@@ -29,11 +30,13 @@ BENCH_HOME = Path(os.environ.get("BENCH_HOME", "/mnt/drive9-bench"))
 RUNS = int(os.environ.get("BENCH_RUNS", "1"))
 DRIVE9_ENV = os.environ.get("BENCH_DRIVE9_ENV", "prod")
 DRIVE9_SERVER = os.environ.get("BENCH_DRIVE9_SERVER", "https://api.drive9.ai")
-RUN_LABEL = os.environ.get("BENCH_RUN_LABEL", f"{DRIVE9_ENV}-localdeps-outputs-newinst")
+DRIVE9_CLI = os.environ.get("BENCH_DRIVE9_CLI", "drive9")
+RUN_LABEL = os.environ.get("BENCH_RUN_LABEL", f"{DRIVE9_ENV}-coding-agent-localgit")
 SESSION = os.environ.get("BENCH_SESSION") or time.strftime(f"ec2-%Y%m%dT%H%M%SZ-{RUN_LABEL}", time.gmtime())
 RESULT_DIR = BENCH_HOME / "results" / SESSION
 WORK_DIR = BENCH_HOME / "work" / RUN_LABEL / SESSION
 LOCAL_DEPS_DIR = BENCH_HOME / "local-deps" / SESSION
+LOCAL_OVERLAY_DIR = BENCH_HOME / "local-overlay" / SESSION
 MOUNTPOINT = BENCH_HOME / "mounts" / RUN_LABEL
 TOOLS_DIR = BENCH_HOME / "tools"
 DEFAULT_PROD_CONFIGS = (
@@ -104,37 +107,40 @@ REPOS = (
 )
 
 
-KIMI_CODE_NODE_MODULE_DIRS = (
-    ".",
-    "apps/kimi-code",
-    "apps/vis",
-    "apps/vis/server",
-    "apps/vis/web",
-    "docs",
-    "packages/agent-core",
-    "packages/kaos",
-    "packages/kosong",
-    "packages/migration-legacy",
-    "packages/node-sdk",
-    "packages/oauth",
-    "packages/telemetry",
+COMMON_LOCAL_ONLY_PATTERNS = (
+    "**/.git/**",
+    "**/.hg/**",
+    "**/.svn/**",
+    "**/node_modules/**",
+    "**/.pnpm-store/**",
+    "**/target/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/.next/cache/**",
+    "**/.gradle/**",
+    "**/.venv/**",
+    "**/__pycache__/**",
+    "**/.pytest_cache/**",
+    "**/.mypy_cache/**",
+    "**/.ruff_cache/**",
+    "**/.cache/**",
+    "**/cache/**",
+    "**/tmp/**",
+    "**/.tmp/**",
+    "**/bin/**",
 )
 
-KIMI_CODE_OUTPUT_DIRS = (
-    "apps/kimi-code/dist",
-    "apps/vis/server/dist",
-    "apps/vis/web/dist",
-    "docs/.vitepress/dist",
-    "packages/agent-core/dist",
-    "packages/kaos/dist",
-    "packages/kosong/dist",
-    "packages/migration-legacy/dist",
-    "packages/oauth/dist",
-    "packages/telemetry/dist",
+KIMI_CLI_LOCAL_ONLY_PATTERNS = (
+    "**/src/kimi_cli/deps/bin/**",
+    "**/src/kimi_cli/deps/tmp/**",
+    "**/src/kimi_cli/web/**",
+    "**/src/kimi_cli/vis/**",
+    "**/packages/kimi-code/README.md",
+    "**/src/kimi_cli/CHANGELOG.md",
 )
 
-KIMI_CODE_PARENT_BIND_DIRS = (
-    "packages/node-sdk",
+KIMI_CODE_LOCAL_ONLY_PATTERNS = (
+    "**/packages/node-sdk/.tmp-api-extractor/**",
 )
 
 
@@ -351,7 +357,7 @@ def restore_config() -> None:
 
 
 def sudo_drive9_command(env: dict[str, str], *args: str) -> list[str]:
-    return ["sudo", "env", f"HOME={Path.home()}", f"PATH={env['PATH']}", "drive9", *args]
+    return ["sudo", "env", f"HOME={Path.home()}", f"PATH={env['PATH']}", DRIVE9_CLI, *args]
 
 
 def create_repo_context(repo: Repo, env: dict[str, str]) -> str:
@@ -361,7 +367,7 @@ def create_repo_context(repo: Repo, env: dict[str, str]) -> str:
     ctx = f"{ctx_prefix}{short}{stamp}"
     log_dir = RESULT_DIR / "logs" / "contexts" / repo.repo_id
     log_dir.mkdir(parents=True, exist_ok=True)
-    command = ["drive9", "create", "--name", ctx, "--server", DRIVE9_SERVER]
+    command = [DRIVE9_CLI, "create", "--name", ctx, "--server", DRIVE9_SERVER]
     started = utc_now()
     start = time.monotonic()
     proc = subprocess.run(
@@ -397,7 +403,7 @@ def create_repo_context(repo: Repo, env: dict[str, str]) -> str:
     if proc.returncode != 0:
         raise RuntimeError(f"drive9 create failed for {repo.repo_id}; see {log_dir / 'create.err'}")
     use_code = run(
-        ["drive9", "ctx", "use", ctx],
+        [DRIVE9_CLI, "ctx", "use", ctx],
         cwd=Path.home(),
         env=env,
         stdout=log_dir / "ctx-use.out",
@@ -424,19 +430,24 @@ def mount_drive9(repo: Repo, run_index: int, env: dict[str, str]) -> subprocess.
     stderr = log_dir / "mount.err"
     cache_dir = BENCH_HOME / "cache" / f"drive9-{RUN_LABEL}" / SESSION
     cache_dir.mkdir(parents=True, exist_ok=True)
+    local_root = local_overlay_root(repo, run_index)
+    local_root.mkdir(parents=True, exist_ok=True)
     command = sudo_drive9_command(
         env,
         "mount",
         "--mode=fuse",
         "--allow-other",
-        "--profile=interactive",
+        "--profile=coding-agent",
+        "--local-root",
+        str(local_root),
         "--durability=interactive",
         "--perf-counters",
         "--cache-dir",
         str(cache_dir),
-        ":/",
-        str(MOUNTPOINT),
     )
+    for pattern in local_only_patterns_for(repo):
+        command.extend(["--local-only", pattern])
+    command.extend([":/", str(MOUNTPOINT)])
     stdout.parent.mkdir(parents=True, exist_ok=True)
     with stdout.open("ab") as out, stderr.open("ab") as err:
         out.write(f"# {utc_now()} $ {' '.join(command)}\n".encode())
@@ -502,65 +513,42 @@ def local_dep_env(repo: Repo, storage: str, run_index: int, env: dict[str, str])
     return env
 
 
-def bind_mounts_for(repo: Repo, checkout: Path, storage: str, run_index: int) -> list[tuple[Path, Path]]:
-    base = LOCAL_DEPS_DIR / storage / repo.repo_id / f"run-{run_index}" / "binds"
-    mounts: list[tuple[Path, Path]] = []
+def local_overlay_root(repo: Repo, run_index: int) -> Path:
+    return LOCAL_OVERLAY_DIR / repo.repo_id / f"run-{run_index}"
+
+
+def local_only_patterns_for(repo: Repo) -> tuple[str, ...]:
+    patterns = list(COMMON_LOCAL_ONLY_PATTERNS)
     if repo.repo_id == "kimi-cli":
-        rels = (
-            ".venv",
-            "web/node_modules",
-            "vis/node_modules",
-            "src/kimi_cli/deps/bin",
-            "src/kimi_cli/deps/tmp",
-            "web/dist",
-            "vis/dist",
-            "src/kimi_cli/web",
-            "src/kimi_cli/vis",
-            "dist",
-            "build",
-        )
+        patterns.extend(KIMI_CLI_LOCAL_ONLY_PATTERNS)
     elif repo.repo_id == "kimi-code":
-        parent_bound = set(KIMI_CODE_PARENT_BIND_DIRS)
-        rels = tuple(
-            f"{rel}/node_modules" if rel != "." else "node_modules"
-            for rel in KIMI_CODE_NODE_MODULE_DIRS
-            if rel not in parent_bound
-        )
-        rels = rels + KIMI_CODE_OUTPUT_DIRS
-        rels = rels + KIMI_CODE_PARENT_BIND_DIRS
-    else:
-        rels = ()
-    for rel in rels:
-        source = base / rel
-        target = checkout / rel
-        mounts.append((source, target))
-    return mounts
+        patterns.extend(KIMI_CODE_LOCAL_ONLY_PATTERNS)
+    return tuple(dict.fromkeys(patterns))
 
 
-def setup_bind_mounts(mounts: list[tuple[Path, Path]], env: dict[str, str], log_dir: Path) -> list[Path]:
-    mounted: list[Path] = []
-    stdout = log_dir / "bind-mount.out"
-    stderr = log_dir / "bind-mount.err"
-    for source, target in mounts:
-        source.mkdir(parents=True, exist_ok=True)
-        target.mkdir(parents=True, exist_ok=True)
-        try:
-            if target.exists() and not any(source.iterdir()):
-                shutil.copytree(target, source, dirs_exist_ok=True, symlinks=True)
-        except OSError:
-            pass
-        code = run(["sudo", "mount", "--bind", str(source), str(target)], cwd=Path.home(), env=env, stdout=stdout, stderr=stderr, timeout=60)
-        if code != 0:
-            raise RuntimeError(f"bind mount failed: {source} -> {target}; see {stderr}")
-        mounted.append(target)
-    return mounted
+def local_overlay_path(repo: Repo, run_index: int, checkout: Path, rel: str) -> Path:
+    try:
+        mount_rel = checkout.relative_to(MOUNTPOINT)
+    except ValueError:
+        mount_rel = Path(checkout.name)
+    return local_overlay_root(repo, run_index) / "overlay" / mount_rel / rel
 
 
-def teardown_bind_mounts(mounted: list[Path], env: dict[str, str], log_dir: Path) -> None:
-    stdout = log_dir / "bind-umount.out"
-    stderr = log_dir / "bind-umount.err"
-    for target in reversed(mounted):
-        run(["sudo", "umount", "-l", str(target)], cwd=Path.home(), env=env, stdout=stdout, stderr=stderr, timeout=60)
+def emit_local_overlay_probe(repo: Repo, run_index: int, checkout: Path, stage: str) -> None:
+    git_dir = local_overlay_path(repo, run_index, checkout, ".git")
+    emit(
+        {
+            "type": "local_overlay_probe",
+            "session": SESSION,
+            "repo": repo.repo_id,
+            "run": run_index,
+            "stage": stage,
+            "local_root": str(local_overlay_root(repo, run_index)),
+            "git_dir": str(git_dir),
+            "git_dir_exists": git_dir.exists(),
+            "git_config_exists": (git_dir / "config").exists(),
+        }
+    )
 
 
 def clone_phase(repo: Repo, storage: str, run_index: int, checkout: Path, commit: str, env: dict[str, str]) -> dict[str, Any]:
@@ -672,6 +660,7 @@ def prewarm_repo(repo: Repo, commit: str, env: dict[str, str]) -> None:
 
 def write_manifest(commits: dict[str, str], env: dict[str, str]) -> None:
     repos = selected_repos()
+    local_policies = {repo.repo_id: list(local_only_patterns_for(repo)) for repo in repos}
     manifest = {
         "session": SESSION,
         "started_at": utc_now(),
@@ -681,11 +670,14 @@ def write_manifest(commits: dict[str, str], env: dict[str, str]) -> None:
         "repo_commits": commits,
         "drive9_env": DRIVE9_ENV,
         "drive9_server": DRIVE9_SERVER,
-        "dependency_policy": "fresh per-sample dependency directories bind-mounted from native disk; shared package caches under BENCH_HOME/cache",
-        "output_policy": "known build output directories are also bind-mounted from native disk so generated artifacts do not go through Drive9 FUSE",
+        "drive9_cli": DRIVE9_CLI,
+        "dependency_policy": "fresh per-sample dependency and cache directories are routed to the coding-agent local overlay; shared package caches stay under BENCH_HOME/cache",
+        "output_policy": "known build output, temporary, and .git paths are routed to the coding-agent local overlay so generated artifacts and Git metadata do not go through Drive9 FUSE",
         "drive9_context_strategy": f"create one fresh {DRIVE9_ENV} drive9 context per repo; context creation is not timed in clone/build phases",
         "git_safe_directory": "GIT_CONFIG_COUNT=1, safe.directory=* for root-started allow_other FUSE mounts",
-        "mount_flags": "--mode=fuse --allow-other --profile=interactive --durability=interactive --perf-counters",
+        "mount_flags": "--mode=fuse --allow-other --profile=coding-agent --local-root <BENCH_HOME/local-overlay/...> --durability=interactive --perf-counters",
+        "local_overlay_root": str(LOCAL_OVERLAY_DIR),
+        "local_only_patterns": local_policies,
         "timeouts": {"clone": CLONE_TIMEOUT, "build": BUILD_TIMEOUT, "prewarm": PREWARM_TIMEOUT},
         "tool_versions": {
             "git": capture(["git", "--version"], env=env),
@@ -694,8 +686,8 @@ def write_manifest(commits: dict[str, str], env: dict[str, str]) -> None:
             "corepack": capture(["corepack", "--version"], env=env),
             "uv": capture(["uv", "--version"], env=env),
             "go": capture(["go", "version"], env=env),
-            "drive9": capture(["drive9", "--version"], env=env),
-            "mount_ctx": capture(["drive9", "ctx"], env=env),
+            "drive9": capture([DRIVE9_CLI, "--version"], env=env),
+            "mount_ctx": capture([DRIVE9_CLI, "ctx"], env=env),
         },
     }
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
@@ -751,10 +743,11 @@ def summarize() -> None:
         "",
         f"- Session: `{SESSION}`",
         f"- Drive9 endpoint: `{DRIVE9_SERVER}`",
+        f"- Drive9 CLI: `{DRIVE9_CLI}`",
         f"- Runs per repo/storage: `{RUNS}`",
         f"- Context strategy: one fresh {DRIVE9_ENV} drive9 context per repo via `drive9 create`; context creation time is not included in clone/build.",
-        "- Dependency policy: dependency caches, install directories, and known build output directories are bind-mounted from native disk under `/mnt/drive9-bench`; remaining repo source stays under the tested storage.",
-        "- FUSE mount flags: `--mode=fuse --allow-other --profile=interactive --durability=interactive --perf-counters`; mount is started via `sudo env HOME=/home/ubuntu ...` so bind mounts work without changing `/etc/fuse.conf`.",
+        "- Local overlay policy: `.git`, dependency installs, caches, temp trees, and known build outputs are routed through `--profile=coding-agent --local-root`; remaining repo source stays under the tested storage.",
+        "- FUSE mount flags: `--mode=fuse --allow-other --profile=coding-agent --local-root <...> --durability=interactive --perf-counters`.",
         "- Git safety: benchmark env sets `safe.directory=*` because root-started `allow_other` FUSE mounts otherwise trigger Git dubious-ownership checks.",
         "",
         "## Summary",
@@ -819,21 +812,19 @@ def main() -> int:
                     if repo.repo_id == "kimi-code":
                         sample_env = ensure_node24(sample_env)
                     mount_proc: subprocess.Popen[bytes] | None = None
-                    mounted: list[Path] = []
                     if storage == "native":
                         root = WORK_DIR / "native"
                     else:
                         mount_proc = mount_drive9(repo, run_index, sample_env)
                         root = MOUNTPOINT / "bench-localdeps" / SESSION
                     checkout = root / f"{repo.repo_id}-run-{run_index}"
-                    log_dir = RESULT_DIR / "logs" / storage / repo.repo_id / f"run-{run_index}"
                     try:
                         if checkout.exists():
                             shutil.rmtree(checkout, ignore_errors=True)
                         clone = clone_phase(repo, storage, run_index, checkout, commits[repo.repo_id], sample_env)
+                        if storage == "fuse":
+                            emit_local_overlay_probe(repo, run_index, checkout, "post_clone")
                         if clone["status"] == "ok":
-                            mounts = bind_mounts_for(repo, checkout, storage, run_index)
-                            mounted = setup_bind_mounts(mounts, sample_env, log_dir)
                             build_phase(repo, storage, run_index, checkout, commits[repo.repo_id], sample_env)
                     except Exception as exc:  # noqa: BLE001
                         emit(
@@ -849,7 +840,6 @@ def main() -> int:
                         )
                         print(f"sample error: {repo.repo_id} {storage}: {exc}", flush=True)
                     finally:
-                        teardown_bind_mounts(mounted, sample_env, log_dir)
                         if checkout.exists():
                             shutil.rmtree(checkout, ignore_errors=True)
                         if storage == "fuse":
