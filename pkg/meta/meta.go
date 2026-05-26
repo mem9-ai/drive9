@@ -1071,6 +1071,20 @@ func (s *Store) InsertExternalBinding(ctx context.Context, b *ExternalBinding) (
 	return err
 }
 
+func (s *Store) DeleteExternalBinding(ctx context.Context, provider, subjectKey string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_external_binding", start, &err)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM tenant_external_bindings WHERE provider = ? AND subject_key = ?`, provider, subjectKey)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) WithExternalBindingLock(ctx context.Context, provider, subjectKey string, fn func(context.Context) error) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "external_binding_lock", start, &err)

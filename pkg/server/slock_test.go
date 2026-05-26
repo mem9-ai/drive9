@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
+	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/slockoauth"
 	"github.com/mem9-ai/dat9/pkg/tenant"
@@ -34,10 +34,7 @@ func (f *fakeSlockOAuth) Userinfo(_ context.Context, _ string) (slockoauth.UserI
 func newSlockTestServer(t *testing.T, info slockoauth.UserInfo) (*Server, *meta.Store, []byte) {
 	t.Helper()
 	dbi := newTestDBInfo(t)
-	_, _ = dbi.Meta.DB().Exec("DELETE FROM tenant_api_key_fs_scopes")
-	_, _ = dbi.Meta.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = dbi.Meta.DB().Exec("DELETE FROM tenant_external_bindings")
-	_, _ = dbi.Meta.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, dbi.Meta.DB())
 	tokenSecret := make([]byte, 32)
 	if _, err := rand.Read(tokenSecret); err != nil {
 		t.Fatal(err)
@@ -57,6 +54,7 @@ func newSlockTestServer(t *testing.T, info slockoauth.UserInfo) (*Server, *meta.
 		TokenSecret: tokenSecret,
 		SlockOAuth:  &fakeSlockOAuth{info: info},
 	})
+	t.Cleanup(srv.Close)
 	return srv, dbi.Meta, tokenSecret
 }
 
@@ -134,18 +132,23 @@ func TestSlockCallbackCreatesTenantBindingAndOwnerKey(t *testing.T) {
 	if _, err := token.ParseAndVerifyToken(tokenSecret, out.APIKey); err != nil {
 		t.Fatalf("ParseAndVerifyToken: %v", err)
 	}
-	binding, err := metaStore.GetExternalBinding(context.Background(), "slock", "server-1:sub-1")
+	wantSubjectKey := slockSubjectKey(info)
+	binding, err := metaStore.GetExternalBinding(context.Background(), "slock", wantSubjectKey)
 	if err != nil {
 		t.Fatalf("GetExternalBinding: %v", err)
 	}
-	if binding.TenantID != out.TenantID || !strings.Contains(string(binding.MetadataJSON), `"principal_type": "agent"`) {
+	var bindingMeta map[string]any
+	if err := json.Unmarshal(binding.MetadataJSON, &bindingMeta); err != nil {
+		t.Fatalf("Unmarshal(binding.MetadataJSON): %v", err)
+	}
+	if binding.TenantID != out.TenantID || bindingMeta["principal_type"] != "agent" {
 		t.Fatalf("unexpected binding: %+v metadata=%s", binding, string(binding.MetadataJSON))
 	}
 	resolved, err := metaStore.ResolveByAPIKeyHash(context.Background(), token.HashToken(out.APIKey))
 	if err != nil {
 		t.Fatalf("ResolveByAPIKeyHash: %v", err)
 	}
-	if resolved.APIKey.IssuedByProvider != "slock" || resolved.APIKey.IssuedBySubjectKey != "server-1:sub-1" {
+	if resolved.APIKey.IssuedByProvider != "slock" || resolved.APIKey.IssuedBySubjectKey != wantSubjectKey {
 		t.Fatalf("issued-by metadata not set: %+v", resolved.APIKey)
 	}
 }
@@ -186,5 +189,53 @@ func TestSlockCallbackReusesExistingBinding(t *testing.T) {
 	}
 	if tenantCount != 1 {
 		t.Fatalf("tenant count = %d, want 1", tenantCount)
+	}
+}
+
+func TestSlockCallbackReprovisionsFailedBinding(t *testing.T) {
+	info := slockoauth.UserInfo{Sub: "sub-1", Type: "agent", ClientID: "drive9", ServerID: "server-1"}
+	srv, metaStore, _ := newSlockTestServer(t, info)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	call := func(code string) slockCallbackResponse {
+		t.Helper()
+		resp, err := http.Get(ts.URL + "/v1/auth/slock/callback?code=" + code + "&format=json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		var out slockCallbackResponse
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	first := call("first")
+	if err := metaStore.UpdateTenantStatus(context.Background(), first.TenantID, meta.TenantFailed); err != nil {
+		t.Fatalf("UpdateTenantStatus: %v", err)
+	}
+	second := call("second")
+	if second.TenantID == first.TenantID {
+		t.Fatalf("second tenant = %s, want new tenant after failed binding", second.TenantID)
+	}
+	binding, err := metaStore.GetExternalBinding(context.Background(), "slock", slockSubjectKey(info))
+	if err != nil {
+		t.Fatalf("GetExternalBinding: %v", err)
+	}
+	if binding.TenantID != second.TenantID {
+		t.Fatalf("binding tenant = %s, want %s", binding.TenantID, second.TenantID)
+	}
+}
+
+func TestSlockSubjectKeyIsUnambiguous(t *testing.T) {
+	a := slockSubjectKey(slockoauth.UserInfo{ServerID: "a:b", Sub: "c"})
+	b := slockSubjectKey(slockoauth.UserInfo{ServerID: "a", Sub: "b:c"})
+	if a == b {
+		t.Fatalf("slockSubjectKey collision: %q", a)
 	}
 }

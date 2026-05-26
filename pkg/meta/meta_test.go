@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/metrics"
 )
 
@@ -20,10 +21,7 @@ func newControlStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	_, _ = s.DB().Exec("DELETE FROM tenant_api_key_fs_scopes")
-	_, _ = s.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = s.DB().Exec("DELETE FROM tenant_external_bindings")
-	_, _ = s.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, s.DB())
 	_, _ = s.DB().Exec("DELETE FROM llm_usage")
 	return s
 }

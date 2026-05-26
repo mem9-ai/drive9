@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -132,9 +133,14 @@ func (s *Server) slockProvisionForUserInfo(ctx context.Context, info slockoauth.
 
 	binding, err := s.meta.GetExternalBinding(ctx, slockProvider, subjectKey)
 	if err == nil {
-		return s.slockIssueForBinding(ctx, binding, source, principal)
-	}
-	if !errors.Is(err, meta.ErrNotFound) {
+		resp, reprovision, err := s.slockIssueForBinding(ctx, binding, source, principal)
+		if err == nil && !reprovision {
+			return resp, nil
+		}
+		if !reprovision {
+			return nil, err
+		}
+	} else if !errors.Is(err, meta.ErrNotFound) {
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to load external binding", err)
 	}
 
@@ -142,14 +148,20 @@ func (s *Server) slockProvisionForUserInfo(ctx context.Context, info slockoauth.
 	err = s.meta.WithExternalBindingLock(ctx, slockProvider, subjectKey, func(lockCtx context.Context) error {
 		binding, err := s.meta.GetExternalBinding(lockCtx, slockProvider, subjectKey)
 		if err == nil {
-			resp, issueErr := s.slockIssueForBinding(lockCtx, binding, source, principal)
-			if issueErr != nil {
+			resp, reprovision, issueErr := s.slockIssueForBinding(lockCtx, binding, source, principal)
+			if issueErr == nil && !reprovision {
+				out = resp
+				return nil
+			}
+			if !reprovision {
 				return issueErr
 			}
-			out = resp
-			return nil
-		}
-		if !errors.Is(err, meta.ErrNotFound) {
+			if err := s.meta.DeleteExternalBinding(lockCtx, slockProvider, subjectKey); err != nil && !errors.Is(err, meta.ErrNotFound) {
+				return newProvisionTenantError(http.StatusInternalServerError, "failed to delete stale external binding", err)
+			}
+			logger.Info(lockCtx, "server_event", eventFields(lockCtx, "slock_external_binding_deleted",
+				"subject_key", subjectKey, "tenant_id", binding.TenantID)...)
+		} else if !errors.Is(err, meta.ErrNotFound) {
 			return newProvisionTenantError(http.StatusInternalServerError, "failed to load external binding", err)
 		}
 
@@ -189,23 +201,25 @@ func (s *Server) slockProvisionForUserInfo(ctx context.Context, info slockoauth.
 	return out, nil
 }
 
-func (s *Server) slockIssueForBinding(ctx context.Context, binding *meta.ExternalBinding, source apiKeyIssueSource, principal slockPrincipal) (*slockCallbackResponse, error) {
+func (s *Server) slockIssueForBinding(ctx context.Context, binding *meta.ExternalBinding, source apiKeyIssueSource, principal slockPrincipal) (*slockCallbackResponse, bool, error) {
 	t, err := s.meta.GetTenant(ctx, binding.TenantID)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
-			return nil, newProvisionTenantError(http.StatusNotFound, "bound tenant not found", err)
+			return nil, true, nil
 		}
-		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to load bound tenant", err)
+		return nil, false, newProvisionTenantError(http.StatusInternalServerError, "failed to load bound tenant", err)
 	}
 	switch t.Status {
 	case meta.TenantActive, meta.TenantProvisioning:
+	case meta.TenantFailed, meta.TenantDeleted:
+		return nil, true, nil
 	default:
-		return nil, newProvisionTenantError(http.StatusForbidden, "bound tenant is unavailable", fmt.Errorf("tenant status %s", t.Status))
+		return nil, false, newProvisionTenantError(http.StatusForbidden, "bound tenant is unavailable", fmt.Errorf("tenant status %s", t.Status))
 	}
 	apiKey, _, err := s.issueOwnerAPIKey(ctx, t.ID, "slock", 0, source)
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "slock_api_key_issue_failed", "tenant_id", t.ID, "error", err)...)
-		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to issue api key", err)
+		return nil, false, newProvisionTenantError(http.StatusInternalServerError, "failed to issue api key", err)
 	}
 	logger.Info(ctx, "server_event", eventFields(ctx, "slock_external_binding_resolved",
 		"tenant_id", t.ID, "subject_key", binding.SubjectKey, "status", string(t.Status))...)
@@ -214,11 +228,12 @@ func (s *Server) slockIssueForBinding(ctx context.Context, binding *meta.Externa
 		APIKey:    apiKey,
 		Status:    string(t.Status),
 		Principal: principal,
-	}, nil
+	}, false, nil
 }
 
 func slockSubjectKey(info slockoauth.UserInfo) string {
-	return info.ServerID + ":" + info.Sub
+	return base64.RawURLEncoding.EncodeToString([]byte(info.ServerID)) + "." +
+		base64.RawURLEncoding.EncodeToString([]byte(info.Sub))
 }
 
 func slockMetadataJSON(info slockoauth.UserInfo) ([]byte, error) {
