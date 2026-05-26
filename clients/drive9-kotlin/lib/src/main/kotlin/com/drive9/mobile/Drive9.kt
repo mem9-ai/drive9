@@ -870,7 +870,15 @@ public class Drive9Client(
                 val idx = line.indexOf(':')
                 if (idx <= 0) null else line.substring(0, idx).lowercase() to line.substring(idx + 1).trim()
             }.toMap()
-            return RawResponse(status, responseBody, responseHeaders)
+            val decodedBody = if (responseHeaders["transfer-encoding"]
+                    ?.split(',')
+                    ?.any { it.trim().equals("chunked", ignoreCase = true) } == true
+            ) {
+                responseBody.decodeChunkedBody()
+            } else {
+                responseBody
+            }
+            return RawResponse(status, decodedBody, responseHeaders)
         }
     }
 
@@ -1275,6 +1283,39 @@ private fun ByteArray.indexOfHeaderEnd(): Int {
     }
     return size
 }
+
+private fun ByteArray.decodeChunkedBody(): ByteArray {
+    val out = ByteArrayOutputStream()
+    var offset = 0
+    while (true) {
+        val lineEnd = indexOfCrlf(offset)
+        if (lineEnd < 0) throw malformedChunkedResponse()
+        val sizeText = copyOfRange(offset, lineEnd)
+            .toString(StandardCharsets.ISO_8859_1)
+            .substringBefore(';')
+            .trim()
+        val chunkSize = sizeText.toIntOrNull(16) ?: throw malformedChunkedResponse()
+        offset = lineEnd + 2
+        if (chunkSize == 0) return out.toByteArray()
+        if (chunkSize < 0 || offset + chunkSize > size) throw malformedChunkedResponse()
+        out.write(this, offset, chunkSize)
+        offset += chunkSize
+        if (offset + 2 > size || this[offset] != '\r'.code.toByte() || this[offset + 1] != '\n'.code.toByte()) {
+            throw malformedChunkedResponse()
+        }
+        offset += 2
+    }
+}
+
+private fun ByteArray.indexOfCrlf(start: Int): Int {
+    for (i in start until size - 1) {
+        if (this[i] == '\r'.code.toByte() && this[i + 1] == '\n'.code.toByte()) return i
+    }
+    return -1
+}
+
+private fun malformedChunkedResponse(): Drive9Exception.Drive9 =
+    Drive9Exception.Drive9("request", null, "malformed chunked HTTP response", null)
 
 private fun readLocalPart(
     raf: RandomAccessFile,

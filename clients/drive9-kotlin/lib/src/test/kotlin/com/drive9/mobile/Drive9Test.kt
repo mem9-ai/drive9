@@ -489,6 +489,40 @@ class Drive9Test {
     }
 
     @Test
+    fun patchFilePartsAcceptsChunkedPlanResponse() = runBlocking {
+        val patched = mutableListOf<ByteArray>()
+        route("PATCH", "/v1/fs/chunked") { ex ->
+            ex.requestBody.readBytes()
+            val response = """{"upload_id":"pc","part_size":4,"upload_parts":[{"number":1,"url":"$baseUrl/chunked-patch-part","size":4,"headers":{}}],"copied_parts":[]}"""
+                .toByteArray()
+            ex.responseHeaders.add("Content-Type", "application/json")
+            ex.responseHeaders.add("Transfer-Encoding", "chunked")
+            ex.sendResponseHeaders(200, 0)
+            ex.responseBody.write(response)
+            ex.close()
+        }
+        route("PUT", "/chunked-patch-part") { ex ->
+            patched += ex.requestBody.readBytes()
+            ex.sendResponseHeaders(200, -1)
+            ex.close()
+        }
+        route("POST", "/v1/uploads/pc/complete") { ex ->
+            ex.sendResponseHeaders(200, -1)
+            ex.close()
+        }
+
+        val local = Files.createTempFile("drive9-kotlin-patch-chunked", ".bin")
+        Files.write(local, "abcdef".toByteArray())
+        val client = Drive9Client(baseUrl, "k")
+        try {
+            client.patchFileParts(local.toString(), "/chunked", listOf(1), 6, 4)
+            assertContentEquals("abcd".toByteArray(), patched.single())
+        } finally {
+            local.deleteIfExists()
+        }
+    }
+
+    @Test
     fun streamUploadUsesV2Multipart() = runBlocking {
         val uploaded = mutableListOf<ByteArray>()
         route("POST", "/v2/uploads/initiate") { ex ->
