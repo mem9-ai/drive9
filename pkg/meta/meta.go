@@ -1578,6 +1578,18 @@ func (s *Store) RevokeAPIKey(ctx context.Context, tenantID, apiKeyID string) (er
 	return nil
 }
 
+func (s *Store) RevokeAPIKeysByIssuer(ctx context.Context, tenantID, provider, subjectKey, exceptAPIKeyID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "revoke_api_keys_by_issuer", start, &err)
+	now := time.Now().UTC()
+	_, err = s.db.ExecContext(ctx, `UPDATE tenant_api_keys
+		SET status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+		WHERE tenant_id = ? AND issued_by_provider = ? AND issued_by_subject_key = ? AND status = ?
+			AND (? = '' OR id <> ?)`,
+		APIKeyRevoked, now, now, tenantID, provider, subjectKey, APIKeyActive, exceptAPIKeyID, exceptAPIKeyID)
+	return err
+}
+
 func (s *Store) UpsertStorageNamespace(ctx context.Context, ns *StorageNamespace) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "upsert_storage_namespace", start, &err)

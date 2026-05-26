@@ -92,6 +92,8 @@ var (
 	schemaInitRetryWindow    = 10 * time.Minute
 	schemaInitInitialBackoff = 2 * time.Second
 	schemaInitMaxBackoff     = 30 * time.Second
+	pendingTenantStaleAfter  = 10 * time.Minute
+	pendingTenantSweepEvery  = time.Minute
 )
 
 // DefaultMaxUploadBytes is the server-wide fallback upload size limit.
@@ -257,6 +259,7 @@ func NewWithConfig(cfg Config) *Server {
 	s.mux = mux
 	if s.meta != nil && s.pool != nil && s.provisioner != nil {
 		s.resumePendingTenants()
+		s.startPendingTenantReconciler()
 		s.resumeProvisioningTenants()
 		s.resumeDeletingForkTenants()
 	}
@@ -352,16 +355,7 @@ func (s *Server) resumePendingTenants() {
 		return
 	}
 	for i := range tenants {
-		t := tenants[i]
-		logger.Warn(ctx, "resume_pending_mark_failed",
-			zap.String("tenant_id", t.ID),
-			zap.String("kind", string(t.Kind)),
-			zap.String("provider", t.Provider))
-		if err := s.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantFailed); err != nil {
-			logger.Error(ctx, "resume_pending_mark_failed_update_error",
-				zap.String("tenant_id", t.ID),
-				zap.Error(err))
-		}
+		s.reconcilePendingTenant(ctx, tenants[i])
 	}
 }
 
@@ -374,6 +368,60 @@ func (s *Server) resumeTenantSchemaInit(t meta.Tenant) {
 	}
 	dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
 	s.initTenantSchemaAsync(ctx, t.ID, dsn, t.Provider, s.provisioner.InitSchema)
+}
+
+func (s *Server) startPendingTenantReconciler() {
+	if s.forkWorkerCtx == nil || pendingTenantSweepEvery <= 0 {
+		return
+	}
+	s.forkWorkerWG.Add(1)
+	go func() {
+		defer s.forkWorkerWG.Done()
+		ticker := time.NewTicker(pendingTenantSweepEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.forkWorkerCtx.Done():
+				return
+			case <-ticker.C:
+				s.resumePendingTenants()
+			}
+		}
+	}()
+}
+
+func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
+	if !isStalePendingTenant(time.Now().UTC(), t) {
+		return
+	}
+	logger.Warn(ctx, "resume_pending_mark_failed",
+		zap.String("tenant_id", t.ID),
+		zap.String("kind", string(t.Kind)),
+		zap.String("provider", t.Provider),
+		zap.Time("updated_at", t.UpdatedAt))
+	updated, err := s.meta.UpdateTenantStatusIf(ctx, t.ID, meta.TenantPending, meta.TenantFailed)
+	if err != nil {
+		logger.Error(ctx, "resume_pending_mark_failed_update_error",
+			zap.String("tenant_id", t.ID),
+			zap.Error(err))
+		return
+	}
+	if !updated {
+		logger.Info(ctx, "resume_pending_mark_failed_skipped",
+			zap.String("tenant_id", t.ID),
+			zap.String("reason", "status_changed"))
+	}
+}
+
+func isStalePendingTenant(now time.Time, t meta.Tenant) bool {
+	if pendingTenantStaleAfter <= 0 {
+		return true
+	}
+	lastTouched := t.UpdatedAt
+	if lastTouched.IsZero() || t.CreatedAt.After(lastTouched) {
+		lastTouched = t.CreatedAt
+	}
+	return !lastTouched.IsZero() && now.Sub(lastTouched) >= pendingTenantStaleAfter
 }
 
 func backgroundWithTrace(ctx context.Context) context.Context {
@@ -3217,8 +3265,14 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			if s.metrics != nil {
 				s.metrics.recordEvent("tenant_schema_init", "provider", provider, "result", "ok")
 			}
-			if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantActive); err != nil {
+			updated, err := s.meta.UpdateTenantStatusIf(ctx, tenantID, meta.TenantProvisioning, meta.TenantActive)
+			if err != nil {
 				logger.Error(ctx, "schema_init_activate_failed", zap.String("tenant_id", tenantID), zap.Error(err))
+			} else if !updated {
+				logger.Warn(ctx, "schema_init_activate_skipped",
+					zap.String("tenant_id", tenantID),
+					zap.String("provider", provider),
+					zap.String("reason", "status_changed"))
 			}
 			return
 		} else {
@@ -3228,8 +3282,13 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			}
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
-				if uerr := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed); uerr != nil {
+				if updated, uerr := s.meta.UpdateTenantStatusIf(ctx, tenantID, meta.TenantProvisioning, meta.TenantFailed); uerr != nil {
 					logger.Error(ctx, "schema_init_mark_failed_update_error", zap.String("tenant_id", tenantID), zap.Error(uerr))
+				} else if !updated {
+					logger.Warn(ctx, "schema_init_mark_failed_skipped",
+						zap.String("tenant_id", tenantID),
+						zap.String("provider", provider),
+						zap.String("reason", "status_changed"))
 				}
 				logger.Error(ctx, "schema_init_retry_exhausted", zap.String("tenant_id", tenantID), zap.Error(err))
 				return

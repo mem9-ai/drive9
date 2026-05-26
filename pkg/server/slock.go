@@ -19,6 +19,11 @@ import (
 
 const slockProvider = "slock"
 
+const (
+	maxExternalSubjectKeyBytes = 512
+	maxExternalMetadataBytes   = 16 << 10
+)
+
 var slockHTMLTemplate = template.Must(template.New("slock").Parse(`<!doctype html>
 <html>
 <head><meta charset="utf-8"><title>Drive9 Slock Login</title></head>
@@ -26,8 +31,7 @@ var slockHTMLTemplate = template.Must(template.New("slock").Parse(`<!doctype htm
 <h1>Drive9 tenant ready</h1>
 <p>Tenant: <code>{{.TenantID}}</code></p>
 <p>Status: <code>{{.Status}}</code></p>
-<p>API key:</p>
-<pre>{{.APIKey}}</pre>
+<p>API key is only returned from the JSON callback response.</p>
 </body>
 </html>`))
 
@@ -128,21 +132,11 @@ func (s *Server) slockProvisionForUserInfo(ctx context.Context, info slockoauth.
 	if err != nil {
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to encode slock metadata", err)
 	}
+	if err := validateExternalIdentityPayload(subjectKey, metadata); err != nil {
+		return nil, err
+	}
 	source := apiKeyIssueSource{Provider: slockProvider, SubjectKey: subjectKey, MetadataJSON: metadata}
 	principal := slockPrincipal{Provider: slockProvider, Type: info.Type, ServerID: info.ServerID, Sub: info.Sub}
-
-	binding, err := s.meta.GetExternalBinding(ctx, slockProvider, subjectKey)
-	if err == nil {
-		resp, reprovision, err := s.slockIssueForBinding(ctx, binding, source, principal)
-		if err == nil && !reprovision {
-			return resp, nil
-		}
-		if !reprovision {
-			return nil, err
-		}
-	} else if !errors.Is(err, meta.ErrNotFound) {
-		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to load external binding", err)
-	}
 
 	var out *slockCallbackResponse
 	err = s.meta.WithExternalBindingLock(ctx, slockProvider, subjectKey, func(lockCtx context.Context) error {
@@ -214,10 +208,15 @@ func (s *Server) slockIssueForBinding(ctx context.Context, binding *meta.Externa
 	case meta.TenantActive, meta.TenantProvisioning:
 	case meta.TenantFailed, meta.TenantDeleted:
 		return nil, true, nil
+	case meta.TenantPending:
+		if isStalePendingTenant(time.Now().UTC(), *t) {
+			return nil, true, nil
+		}
+		return nil, false, newProvisionTenantError(http.StatusConflict, "bound tenant is still pending", fmt.Errorf("tenant status %s", t.Status))
 	default:
 		return nil, false, newProvisionTenantError(http.StatusForbidden, "bound tenant is unavailable", fmt.Errorf("tenant status %s", t.Status))
 	}
-	apiKey, _, err := s.issueOwnerAPIKey(ctx, t.ID, "slock", 0, source)
+	apiKey, _, err := s.rotateIssuedOwnerAPIKey(ctx, t.ID, "slock", source)
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "slock_api_key_issue_failed", "tenant_id", t.ID, "error", err)...)
 		return nil, false, newProvisionTenantError(http.StatusInternalServerError, "failed to issue api key", err)
@@ -247,6 +246,30 @@ func slockMetadataJSON(info slockoauth.UserInfo) ([]byte, error) {
 		"name":               info.Name,
 		"client_id":          info.ClientID,
 	})
+}
+
+func validateExternalIdentityPayload(subjectKey string, metadata []byte) *provisionTenantError {
+	switch {
+	case len(subjectKey) == 0:
+		return newProvisionTenantError(http.StatusBadRequest, "external subject key is required", nil)
+	case len(subjectKey) > maxExternalSubjectKeyBytes:
+		return newProvisionTenantError(http.StatusBadRequest, "external subject key is too large", nil)
+	case len(metadata) > maxExternalMetadataBytes:
+		return newProvisionTenantError(http.StatusBadRequest, "external metadata is too large", nil)
+	default:
+		return nil
+	}
+}
+
+func (s *Server) rotateIssuedOwnerAPIKey(ctx context.Context, tenantID, keyName string, source apiKeyIssueSource) (rawToken, apiKeyID string, err error) {
+	rawToken, apiKeyID, err = s.issueOwnerAPIKey(ctx, tenantID, keyName, 0, source)
+	if err != nil {
+		return "", "", err
+	}
+	if err := s.meta.RevokeAPIKeysByIssuer(ctx, tenantID, source.Provider, source.SubjectKey, apiKeyID); err != nil {
+		return "", "", err
+	}
+	return rawToken, apiKeyID, nil
 }
 
 func writeSlockOAuthError(w http.ResponseWriter, err error) {

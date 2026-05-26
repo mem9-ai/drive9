@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,10 +22,11 @@ import (
 )
 
 type fakeProvisioner struct {
-	provider     string
-	cluster      *tenant.ClusterInfo
-	initErr      error
-	provisionErr error
+	provider       string
+	cluster        *tenant.ClusterInfo
+	initErr        error
+	provisionErr   error
+	provisionCalls atomic.Int32
 }
 
 func (f *fakeProvisioner) ProviderType() string { return f.provider }
@@ -37,6 +39,7 @@ func (f *fakeProvisioner) InitSchema(_ context.Context, dsn string) error {
 }
 
 func (f *fakeProvisioner) Provision(_ context.Context, tenantID string) (*tenant.ClusterInfo, error) {
+	f.provisionCalls.Add(1)
 	if f.provisionErr != nil {
 		return nil, f.provisionErr
 	}
@@ -44,6 +47,10 @@ func (f *fakeProvisioner) Provision(_ context.Context, tenantID string) (*tenant
 	out.TenantID = tenantID
 	out.Provider = f.provider
 	return &out, nil
+}
+
+func (f *fakeProvisioner) ProvisionCallCount() int {
+	return int(f.provisionCalls.Load())
 }
 
 func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
@@ -430,7 +437,14 @@ func TestStartupMarksPendingTenantFailed(t *testing.T) {
 	defer pool.Close()
 
 	tenantID := token.NewID()
-	now := time.Now().UTC()
+	now := time.Now().UTC().Add(-2 * time.Minute)
+	origStaleAfter, origSweepEvery := pendingTenantStaleAfter, pendingTenantSweepEvery
+	pendingTenantStaleAfter = time.Minute
+	pendingTenantSweepEvery = time.Hour
+	defer func() {
+		pendingTenantStaleAfter = origStaleAfter
+		pendingTenantSweepEvery = origSweepEvery
+	}()
 	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantPending,
@@ -465,5 +479,107 @@ func TestStartupMarksPendingTenantFailed(t *testing.T) {
 			t.Fatalf("pending tenant did not become failed after startup resume, status=%s", status)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestStartupKeepsFreshPendingTenant(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tenantID := token.NewID()
+	now := time.Now().UTC()
+	origStaleAfter, origSweepEvery := pendingTenantStaleAfter, pendingTenantSweepEvery
+	pendingTenantStaleAfter = time.Minute
+	pendingTenantSweepEvery = time.Hour
+	defer func() {
+		pendingTenantStaleAfter = origStaleAfter
+		pendingTenantSweepEvery = origSweepEvery
+	}()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantPending,
+		DBHost:           "",
+		DBPort:           0,
+		DBUser:           "",
+		DBPasswordCipher: []byte{},
+		DBName:           "",
+		DBTLS:            true,
+		Provider:         tenant.ProviderTiDBZero,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBZero, cluster: &tenant.ClusterInfo{}}
+	_ = NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov, TokenSecret: []byte("abc")})
+
+	time.Sleep(100 * time.Millisecond)
+	row := metaStore.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", tenantID)
+	var status string
+	if err := row.Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantPending) {
+		t.Fatalf("fresh pending tenant status = %s, want %s", status, meta.TenantPending)
+	}
+}
+
+func TestReconcilePendingTenantDoesNotOverwriteChangedStatus(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	tenantID := token.NewID()
+	now := time.Now().UTC().Add(-2 * time.Minute)
+	origStaleAfter := pendingTenantStaleAfter
+	pendingTenantStaleAfter = time.Minute
+	defer func() { pendingTenantStaleAfter = origStaleAfter }()
+	pendingTenant := meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantPending,
+		DBPasswordCipher: []byte{},
+		DBTLS:            true,
+		Provider:         tenant.ProviderTiDBZero,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := metaStore.InsertTenant(context.Background(), &pendingTenant); err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.UpdateTenantStatus(context.Background(), tenantID, meta.TenantProvisioning); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{meta: metaStore}
+	srv.reconcilePendingTenant(context.Background(), pendingTenant)
+
+	row := metaStore.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", tenantID)
+	var status string
+	if err := row.Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantProvisioning) {
+		t.Fatalf("status after reconcile = %s, want %s", status, meta.TenantProvisioning)
 	}
 }

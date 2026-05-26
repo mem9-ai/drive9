@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/mem9-ai/dat9/internal/testmysql"
@@ -183,12 +185,33 @@ func TestSlockCallbackReusesExistingBinding(t *testing.T) {
 	if second.APIKey == first.APIKey {
 		t.Fatal("repeat callback should issue a fresh api key")
 	}
+	firstResolved, err := metaStore.ResolveByAPIKeyHash(context.Background(), token.HashToken(first.APIKey))
+	if err != nil {
+		t.Fatalf("ResolveByAPIKeyHash(first): %v", err)
+	}
+	if firstResolved.APIKey.Status != meta.APIKeyRevoked {
+		t.Fatalf("first api key status = %s, want %s", firstResolved.APIKey.Status, meta.APIKeyRevoked)
+	}
+	secondResolved, err := metaStore.ResolveByAPIKeyHash(context.Background(), token.HashToken(second.APIKey))
+	if err != nil {
+		t.Fatalf("ResolveByAPIKeyHash(second): %v", err)
+	}
+	if secondResolved.APIKey.Status != meta.APIKeyActive {
+		t.Fatalf("second api key status = %s, want %s", secondResolved.APIKey.Status, meta.APIKeyActive)
+	}
 	var tenantCount int
 	if err := metaStore.DB().QueryRow("SELECT COUNT(*) FROM tenants").Scan(&tenantCount); err != nil {
 		t.Fatal(err)
 	}
 	if tenantCount != 1 {
 		t.Fatalf("tenant count = %d, want 1", tenantCount)
+	}
+	var activeKeyCount int
+	if err := metaStore.DB().QueryRow("SELECT COUNT(*) FROM tenant_api_keys WHERE tenant_id = ? AND status = ?", first.TenantID, meta.APIKeyActive).Scan(&activeKeyCount); err != nil {
+		t.Fatal(err)
+	}
+	if activeKeyCount != 1 {
+		t.Fatalf("active api key count = %d, want 1", activeKeyCount)
 	}
 }
 
@@ -245,5 +268,129 @@ func TestWantsJSONAcceptHeaderCaseInsensitive(t *testing.T) {
 	req.Header.Set("Accept", "Application/JSON")
 	if !wantsJSON(req) {
 		t.Fatal("wantsJSON = false, want true")
+	}
+}
+
+func TestSlockCallbackRejectsOversizedSubjectBeforeProvision(t *testing.T) {
+	dbi := newTestDBInfo(t)
+	testmysql.ResetMetaDB(t, dbi.Meta.DB())
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBZero, cluster: &tenant.ClusterInfo{
+		ClusterID: "slock-cluster",
+		Host:      dbi.DBHost,
+		Port:      dbi.DBPort,
+		Username:  dbi.DBUser,
+		Password:  dbi.DBPass,
+		DBName:    dbi.DBName,
+	}}
+	info := slockoauth.UserInfo{
+		Sub:      strings.Repeat("sub", 160),
+		Type:     "agent",
+		ClientID: "drive9",
+		ServerID: strings.Repeat("server", 80),
+	}
+	srv := NewWithConfig(Config{
+		Meta:        dbi.Meta,
+		Pool:        dbi.Pool,
+		Provisioner: prov,
+		TokenSecret: tokenSecret,
+		SlockOAuth:  &fakeSlockOAuth{info: info},
+	})
+	t.Cleanup(srv.Close)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/auth/slock/callback?code=oversized&format=json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	if prov.ProvisionCallCount() != 0 {
+		t.Fatalf("ProvisionCallCount = %d, want 0", prov.ProvisionCallCount())
+	}
+}
+
+func TestSlockCallbackRejectsOversizedMetadataBeforeProvision(t *testing.T) {
+	dbi := newTestDBInfo(t)
+	testmysql.ResetMetaDB(t, dbi.Meta.DB())
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBZero, cluster: &tenant.ClusterInfo{
+		ClusterID: "slock-cluster",
+		Host:      dbi.DBHost,
+		Port:      dbi.DBPort,
+		Username:  dbi.DBUser,
+		Password:  dbi.DBPass,
+		DBName:    dbi.DBName,
+	}}
+	info := slockoauth.UserInfo{
+		Sub:               "sub-1",
+		Type:              "agent",
+		ClientID:          "drive9",
+		ServerID:          "server-1",
+		Name:              strings.Repeat("n", maxExternalMetadataBytes),
+		PreferredUsername: "assistant",
+	}
+	srv := NewWithConfig(Config{
+		Meta:        dbi.Meta,
+		Pool:        dbi.Pool,
+		Provisioner: prov,
+		TokenSecret: tokenSecret,
+		SlockOAuth:  &fakeSlockOAuth{info: info},
+	})
+	t.Cleanup(srv.Close)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/auth/slock/callback?code=oversized-metadata&format=json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	if prov.ProvisionCallCount() != 0 {
+		t.Fatalf("ProvisionCallCount = %d, want 0", prov.ProvisionCallCount())
+	}
+}
+
+func TestSlockHTMLDoesNotRenderAPIKey(t *testing.T) {
+	info := slockoauth.UserInfo{Sub: "sub-1", Type: "agent", ClientID: "drive9", ServerID: "server-1"}
+	srv, _, _ := newSlockTestServer(t, info)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/auth/slock/callback?code=html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var out slockCallbackResponse
+	jsonResp, err := http.Get(ts.URL + "/v1/auth/slock/callback?code=json&format=json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = jsonResp.Body.Close() }()
+	if err := json.NewDecoder(jsonResp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(bodyBytes), out.APIKey) {
+		t.Fatal("html response should not render api key")
 	}
 }

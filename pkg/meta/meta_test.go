@@ -144,6 +144,49 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 	if err := s.RevokeAPIKey(context.Background(), "wrong-tenant", key.ID); err != ErrNotFound {
 		t.Fatalf("RevokeAPIKey wrong tenant error = %v, want ErrNotFound", err)
 	}
+
+	key2 := &APIKey{
+		ID:                 "k2",
+		TenantID:           tenant.ID,
+		KeyName:            "k2",
+		JWTCiphertext:      []byte("jwt2"),
+		JWTHash:            "hash2",
+		TokenVersion:       2,
+		Status:             APIKeyActive,
+		ScopeKind:          APIKeyScopeKindOwner,
+		IssuedByProvider:   "slock",
+		IssuedBySubjectKey: "subject-1",
+		IssuedAt:           now,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+	if err := s.InsertAPIKey(context.Background(), key2); err != nil {
+		t.Fatal(err)
+	}
+	key3 := *key2
+	key3.ID = "k3"
+	key3.KeyName = "k3"
+	key3.JWTHash = "hash3"
+	if err := s.InsertAPIKey(context.Background(), &key3); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevokeAPIKeysByIssuer(context.Background(), tenant.ID, "slock", "subject-1", key3.ID); err != nil {
+		t.Fatalf("RevokeAPIKeysByIssuer error = %v, want nil", err)
+	}
+	issuerRevoked, err := s.ResolveByAPIKeyHash(context.Background(), "hash2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issuerRevoked.APIKey.Status != APIKeyRevoked {
+		t.Fatalf("issuer revoked key status = %s, want %s", issuerRevoked.APIKey.Status, APIKeyRevoked)
+	}
+	issuerKept, err := s.ResolveByAPIKeyHash(context.Background(), "hash3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issuerKept.APIKey.Status != APIKeyActive {
+		t.Fatalf("issuer kept key status = %s, want %s", issuerKept.APIKey.Status, APIKeyActive)
+	}
 }
 
 func TestInsertAndGetExternalBinding(t *testing.T) {
