@@ -25,6 +25,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
 	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/dat9/pkg/slockoauth"
 	"github.com/mem9-ai/dat9/pkg/tagutil"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
@@ -52,6 +53,13 @@ type Config struct {
 	Logger           *zap.Logger
 	SemanticEmbedder embedding.Client
 	SemanticWorkers  SemanticWorkerOptions
+	SlockOAuth       SlockOAuthClient
+}
+
+type SlockOAuthClient interface {
+	LoginURL() string
+	ExchangeCode(ctx context.Context, code string) (slockoauth.Token, error)
+	Userinfo(ctx context.Context, accessToken string) (slockoauth.UserInfo, error)
 }
 
 type Server struct {
@@ -72,6 +80,7 @@ type Server struct {
 	semanticWorker      *semanticWorkerManager
 	journalCursorSecret []byte
 	objectGCWorker      *objectGCWorker
+	slockOAuth          SlockOAuthClient
 	forkWorkerCtx       context.Context
 	forkWorkerCancel    context.CancelFunc
 	forkWorkerWG        sync.WaitGroup
@@ -159,6 +168,7 @@ func NewWithConfig(cfg Config) *Server {
 		metrics:             newServerMetrics(),
 		logger:              logger,
 		events:              newEventBuses(),
+		slockOAuth:          cfg.SlockOAuth,
 		journalCursorSecret: newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:       forkWorkerCtx,
 		forkWorkerCancel:    forkWorkerCancel,
@@ -208,6 +218,8 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
+	mux.HandleFunc("/v1/auth/slock/login", s.handleSlockLogin)
+	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 
@@ -2938,44 +2950,99 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	tenantID := token.NewID()
-	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_requested", "tenant_id", tenantID, "provider", provider)...)
-	keyName := "default"
-
-	apiToken, err := token.IssueTokenWithJournalPermissions(s.tokenSecret, tenantID, 1, time.Time{}, ownerJournalPermissionList())
+	res, err := s.provisionTenant(r.Context(), provisionTenantOptions{
+		KeyName:      "default",
+		TokenVersion: 1,
+	})
 	if err != nil {
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_issue_token_failed", "tenant_id", tenantID, "error", err)...)
-		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
-		errJSON(w, http.StatusInternalServerError, "failed to issue token")
+		var pe *provisionTenantError
+		if errors.As(err, &pe) {
+			errJSON(w, pe.status, pe.message)
+			return
+		}
+		errJSON(w, http.StatusInternalServerError, "failed to provision tenant")
 		return
 	}
-	hash := token.HashToken(apiToken)
-	now := time.Now().UTC()
-	cluster, err := s.provisioner.Provision(r.Context(), tenantID)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"tenant_id": res.TenantID,
+		"api_key":   res.APIKey,
+		"status":    string(res.Status),
+	})
+}
+
+type apiKeyIssueSource struct {
+	Provider     string
+	SubjectKey   string
+	MetadataJSON []byte
+}
+
+type provisionTenantOptions struct {
+	KeyName      string
+	TokenVersion int
+	APIKeySource apiKeyIssueSource
+}
+
+type provisionTenantResult struct {
+	TenantID string
+	APIKey   string
+	APIKeyID string
+	Status   meta.TenantStatus
+	Provider string
+}
+
+type provisionTenantError struct {
+	status  int
+	message string
+	err     error
+}
+
+func (e *provisionTenantError) Error() string {
+	if e.err != nil {
+		return e.err.Error()
+	}
+	return e.message
+}
+
+func (e *provisionTenantError) Unwrap() error { return e.err }
+
+func newProvisionTenantError(status int, message string, err error) *provisionTenantError {
+	return &provisionTenantError{status: status, message: message, err: err}
+}
+
+func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOptions) (*provisionTenantResult, error) {
+	provider := s.provisioner.ProviderType()
+	provider, err := tenant.NormalizeProvider(provider)
 	if err != nil {
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
-		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "cluster_error")
-		errJSON(w, http.StatusBadGateway, fmt.Sprintf("provision tenant cluster failed: %v", err))
-		return
+		logger.Warn(ctx, "server_event", eventFields(ctx, "provision_provider_invalid", "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
+	}
+	tenantID := token.NewID()
+	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
+
+	keyName := strings.TrimSpace(opts.KeyName)
+	if keyName == "" {
+		keyName = "default"
+	}
+	now := time.Now().UTC()
+	cluster, err := s.provisioner.Provision(ctx, tenantID)
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "cluster_error")
+		return nil, newProvisionTenantError(http.StatusBadGateway, fmt.Sprintf("provision tenant cluster failed: %v", err), err)
 	}
 	cluster.Provider = provider
 
-	cipherPass, err := s.pool.Encrypt(r.Context(), []byte(cluster.Password))
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
 	if err != nil {
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_encrypt_db_password_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
-		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
-		errJSON(w, http.StatusInternalServerError, "failed to encrypt db password")
-		return
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_db_password_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to encrypt db password", err)
 	}
-	cipherToken, err := s.pool.Encrypt(r.Context(), []byte(apiToken))
-	if err != nil {
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_encrypt_api_key_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
-		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
-		errJSON(w, http.StatusInternalServerError, "failed to encrypt api key")
-		return
-	}
-
-	if err := s.meta.InsertTenant(r.Context(), &meta.Tenant{
+	if err := s.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantProvisioning,
 		DBHost:           cluster.Host,
@@ -2992,48 +3059,74 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}); err != nil {
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_insert_tenant_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
-		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
-		metricEvent(r.Context(), "metadb_query", "api", "insert_tenant", "result", "error")
-		errJSON(w, http.StatusInternalServerError, "failed to persist tenant")
-		return
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_tenant_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "error")
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant", err)
 	}
-	metricEvent(r.Context(), "metadb_query", "api", "insert_tenant", "result", "ok")
-	apiKeyID := token.NewID()
-	if err := s.meta.InsertAPIKey(r.Context(), &meta.APIKey{
-		ID:            apiKeyID,
-		TenantID:      tenantID,
-		KeyName:       keyName,
-		JWTCiphertext: cipherToken,
-		JWTHash:       hash,
-		TokenVersion:  1,
-		Status:        meta.APIKeyActive,
-		IssuedAt:      now,
-		CreatedAt:     now,
-		UpdatedAt:     now,
-	}); err != nil {
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_insert_api_key_failed", "tenant_id", tenantID, "api_key_id", apiKeyID, "error", err)...)
-		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
-		metricEvent(r.Context(), "metadb_query", "api", "insert_api_key", "result", "error")
-		_ = s.meta.UpdateTenantStatus(r.Context(), tenantID, meta.TenantDeleted)
-		errJSON(w, http.StatusInternalServerError, "failed to persist api key")
-		return
+	metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "ok")
+
+	apiToken, apiKeyID, err := s.issueOwnerAPIKey(ctx, tenantID, keyName, opts.TokenVersion, opts.APIKeySource)
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_api_key_failed", "tenant_id", tenantID, "api_key_id", apiKeyID, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		metricEvent(ctx, "metadb_query", "api", "insert_api_key", "result", "error")
+		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantDeleted)
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist api key", err)
 	}
-	metricEvent(r.Context(), "metadb_query", "api", "insert_api_key", "result", "ok")
 
 	// Initialize tenant schema asynchronously; tenant remains in provisioning state until success.
 	dsn := tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true)
-	go s.initTenantSchemaAsync(backgroundWithTrace(r.Context()), tenantID, dsn, provider, s.provisioner.InitSchema)
-	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_accepted", "tenant_id", tenantID, "provider", provider)...)
-	metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "accepted")
+	go s.initTenantSchemaAsync(backgroundWithTrace(ctx), tenantID, dsn, provider, s.provisioner.InitSchema)
+	logger.Info(ctx, "server_event", eventFields(ctx, "provision_accepted", "tenant_id", tenantID, "provider", provider)...)
+	metricEvent(ctx, "tenant_provision", "provider", provider, "result", "accepted")
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"tenant_id": tenantID,
-		"api_key":   apiToken,
-		"status":    string(meta.TenantProvisioning),
-	})
+	return &provisionTenantResult{
+		TenantID: tenantID,
+		APIKey:   apiToken,
+		APIKeyID: apiKeyID,
+		Status:   meta.TenantProvisioning,
+		Provider: provider,
+	}, nil
+}
+
+func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string, tokenVersion int, source apiKeyIssueSource) (rawToken, apiKeyID string, err error) {
+	if tokenVersion <= 0 {
+		tokenVersion, err = newScopedTokenVersion()
+		if err != nil {
+			return "", "", err
+		}
+	}
+	rawToken, err = token.IssueTokenWithJournalPermissions(s.tokenSecret, tenantID, tokenVersion, time.Time{}, ownerJournalPermissionList())
+	if err != nil {
+		return "", "", err
+	}
+	cipherToken, err := s.pool.Encrypt(ctx, []byte(rawToken))
+	if err != nil {
+		return "", "", err
+	}
+	now := time.Now().UTC()
+	apiKeyID = token.NewID()
+	if err := s.meta.InsertAPIKey(ctx, &meta.APIKey{
+		ID:                   apiKeyID,
+		TenantID:             tenantID,
+		KeyName:              keyName,
+		JWTCiphertext:        cipherToken,
+		JWTHash:              token.HashToken(rawToken),
+		TokenVersion:         tokenVersion,
+		Status:               meta.APIKeyActive,
+		ScopeKind:            meta.APIKeyScopeKindOwner,
+		IssuedByProvider:     source.Provider,
+		IssuedBySubjectKey:   source.SubjectKey,
+		IssuedByMetadataJSON: source.MetadataJSON,
+		IssuedAt:             now,
+		CreatedAt:            now,
+		UpdatedAt:            now,
+	}); err != nil {
+		return "", "", err
+	}
+	metricEvent(ctx, "metadb_query", "api", "insert_api_key", "result", "ok")
+	return rawToken, apiKeyID, nil
 }
 
 // handleLocalTenantProvision serves drive9-server-local's single-tenant

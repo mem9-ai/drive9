@@ -136,18 +136,21 @@ func (t Tenant) S3BucketKeyEnabledValue() bool {
 }
 
 type APIKey struct {
-	ID            string
-	TenantID      string
-	KeyName       string
-	JWTCiphertext []byte
-	JWTHash       string
-	TokenVersion  int
-	Status        APIKeyStatus
-	ScopeKind     APIKeyScopeKind
-	IssuedAt      time.Time
-	RevokedAt     *time.Time
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID                   string
+	TenantID             string
+	KeyName              string
+	JWTCiphertext        []byte
+	JWTHash              string
+	TokenVersion         int
+	Status               APIKeyStatus
+	ScopeKind            APIKeyScopeKind
+	IssuedByProvider     string
+	IssuedBySubjectKey   string
+	IssuedByMetadataJSON []byte
+	IssuedAt             time.Time
+	RevokedAt            *time.Time
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 type APIKeyFSScope struct {
@@ -163,6 +166,15 @@ type APIKeyFSScope struct {
 type TenantWithAPIKey struct {
 	Tenant Tenant
 	APIKey APIKey
+}
+
+type ExternalBinding struct {
+	Provider     string
+	SubjectKey   string
+	TenantID     string
+	MetadataJSON []byte
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 type Store struct {
@@ -190,6 +202,7 @@ func (s *Store) DB() *sql.DB  { return s.db }
 
 const metaSchemaMigrateLockNamePrefix = "dat9_meta_schema_migrate:"
 const metaSchemaMigrateLockTimeoutSeconds = 30
+const externalBindingLockTimeoutSeconds = 30
 
 func (s *Store) migrate() (err error) {
 	ctx := context.Background()
@@ -407,12 +420,25 @@ func metaInitSchemaStatements() []string {
 			token_version  INT NOT NULL DEFAULT 1,
 			status         VARCHAR(20) NOT NULL DEFAULT 'active',
 			scope_kind     VARCHAR(32) NOT NULL DEFAULT 'owner',
+			issued_by_provider VARCHAR(64) NOT NULL DEFAULT '',
+			issued_by_subject_key VARCHAR(512) NOT NULL DEFAULT '',
+			issued_by_metadata_json JSON NULL,
 			issued_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			revoked_at     DATETIME(3) NULL,
 			created_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			UNIQUE INDEX idx_api_keys_hash (jwt_hash),
 			INDEX idx_api_keys_tenant (tenant_id, status)
+		)`,
+		`CREATE TABLE IF NOT EXISTS tenant_external_bindings (
+			provider      VARCHAR(64) NOT NULL,
+			subject_key   VARCHAR(512) NOT NULL,
+			tenant_id     VARCHAR(64) NOT NULL,
+			metadata_json JSON NULL,
+			created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			UNIQUE INDEX uk_external_binding_subject (provider, subject_key),
+			INDEX idx_external_binding_tenant (tenant_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_api_key_fs_scopes (
 			tenant_id   VARCHAR(64) NOT NULL,
@@ -997,14 +1023,99 @@ func (s *Store) InsertAPIKey(ctx context.Context, k *APIKey) (err error) {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_api_keys
-		(id, tenant_id, key_name, jwt_ciphertext, jwt_hash, token_version, status, scope_kind, issued_at, revoked_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(id, tenant_id, key_name, jwt_ciphertext, jwt_hash, token_version, status, scope_kind,
+		 issued_by_provider, issued_by_subject_key, issued_by_metadata_json,
+		 issued_at, revoked_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		k.ID, k.TenantID, k.KeyName, k.JWTCiphertext, k.JWTHash, k.TokenVersion, k.Status, scopeKind,
+		k.IssuedByProvider, k.IssuedBySubjectKey, nullableBytes(k.IssuedByMetadataJSON),
 		k.IssuedAt.UTC(), k.RevokedAt, k.CreatedAt.UTC(), k.UpdatedAt.UTC())
 	if isDuplicateEntry(err) {
 		return ErrDuplicate
 	}
 	return err
+}
+
+func (s *Store) GetExternalBinding(ctx context.Context, provider, subjectKey string) (out *ExternalBinding, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "get_external_binding", start, &err)
+	row := s.db.QueryRowContext(ctx, `SELECT provider, subject_key, tenant_id, metadata_json, created_at, updated_at
+		FROM tenant_external_bindings
+		WHERE provider = ? AND subject_key = ?`, provider, subjectKey)
+	var rec ExternalBinding
+	var metadata []byte
+	if err = row.Scan(&rec.Provider, &rec.SubjectKey, &rec.TenantID, &metadata, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = ErrNotFound
+			return nil, err
+		}
+		return nil, err
+	}
+	rec.MetadataJSON = metadata
+	return &rec, nil
+}
+
+func (s *Store) InsertExternalBinding(ctx context.Context, b *ExternalBinding) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "insert_external_binding", start, &err)
+	if b == nil {
+		return fmt.Errorf("external binding is required")
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_external_bindings
+		(provider, subject_key, tenant_id, metadata_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		b.Provider, b.SubjectKey, b.TenantID, nullableBytes(b.MetadataJSON), b.CreatedAt.UTC(), b.UpdatedAt.UTC())
+	if isDuplicateEntry(err) {
+		return ErrDuplicate
+	}
+	return err
+}
+
+func (s *Store) WithExternalBindingLock(ctx context.Context, provider, subjectKey string, fn func(context.Context) error) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "external_binding_lock", start, &err)
+	if fn == nil {
+		return fmt.Errorf("external binding lock callback is required")
+	}
+	lockName := externalBindingLockName(provider, subjectKey)
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	var got sql.NullInt64
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, externalBindingLockTimeoutSeconds).Scan(&got); err != nil {
+		return err
+	}
+	if !got.Valid {
+		return fmt.Errorf("external binding named lock returned NULL")
+	}
+	if got.Int64 != 1 {
+		return fmt.Errorf("timed out waiting for external binding named lock")
+	}
+	defer func() {
+		var released sql.NullInt64
+		releaseErr := conn.QueryRowContext(context.Background(), "SELECT RELEASE_LOCK(?)", lockName).Scan(&released)
+		if releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+			return
+		}
+		if !released.Valid {
+			err = errors.Join(err, fmt.Errorf("external binding named lock release returned NULL"))
+			return
+		}
+		if released.Int64 != 1 {
+			err = errors.Join(err, fmt.Errorf("external binding named lock was not held by current connection"))
+		}
+	}()
+
+	return fn(ctx)
+}
+
+func externalBindingLockName(provider, subjectKey string) string {
+	sum := sha256.Sum256([]byte(provider + "\x00" + subjectKey))
+	return "d9_extbind:" + hex.EncodeToString(sum[:26])
 }
 
 func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *TenantWithAPIKey, err error) {
@@ -1015,7 +1126,8 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name, t.db_tls,
 			t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
 			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
-			k.id, k.tenant_id, k.key_name, k.jwt_ciphertext, k.jwt_hash, k.token_version, k.status, k.scope_kind, k.issued_at,
+			k.id, k.tenant_id, k.key_name, k.jwt_ciphertext, k.jwt_hash, k.token_version, k.status, k.scope_kind,
+			k.issued_by_provider, k.issued_by_subject_key, k.issued_by_metadata_json, k.issued_at,
 			k.revoked_at, k.created_at, k.updated_at
 		FROM tenant_api_keys k
 		JOIN tenants t ON t.id = k.tenant_id
@@ -1030,6 +1142,9 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 	var storageNamespaceID sql.NullString
 	var revokedAt sql.NullTime
 	var s3BucketKeyEnabled int
+	var issuedByProvider sql.NullString
+	var issuedBySubjectKey sql.NullString
+	var issuedByMetadataJSON []byte
 	if err = row.Scan(
 		&rec.Tenant.ID, &rec.Tenant.Status, &rec.Tenant.Kind, &parentTenantID, &storageNamespaceID,
 		&rec.Tenant.DBHost, &rec.Tenant.DBPort, &rec.Tenant.DBUser,
@@ -1037,7 +1152,8 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 		&rec.Tenant.BranchID, &claimURL, &claimExp, &rec.Tenant.SchemaVersion, &rec.Tenant.S3EncryptionMode,
 		&rec.Tenant.S3KMSKeyID, &s3BucketKeyEnabled, &rec.Tenant.CreatedAt, &rec.Tenant.UpdatedAt,
 		&rec.APIKey.ID, &rec.APIKey.TenantID, &rec.APIKey.KeyName, &rec.APIKey.JWTCiphertext,
-		&rec.APIKey.JWTHash, &rec.APIKey.TokenVersion, &rec.APIKey.Status, &rec.APIKey.ScopeKind, &rec.APIKey.IssuedAt,
+		&rec.APIKey.JWTHash, &rec.APIKey.TokenVersion, &rec.APIKey.Status, &rec.APIKey.ScopeKind,
+		&issuedByProvider, &issuedBySubjectKey, &issuedByMetadataJSON, &rec.APIKey.IssuedAt,
 		&revokedAt, &rec.APIKey.CreatedAt, &rec.APIKey.UpdatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1068,6 +1184,13 @@ func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *Tena
 		t := revokedAt.Time.UTC()
 		rec.APIKey.RevokedAt = &t
 	}
+	if issuedByProvider.Valid {
+		rec.APIKey.IssuedByProvider = issuedByProvider.String
+	}
+	if issuedBySubjectKey.Valid {
+		rec.APIKey.IssuedBySubjectKey = issuedBySubjectKey.String
+	}
+	rec.APIKey.IssuedByMetadataJSON = issuedByMetadataJSON
 	out = &rec
 	return out, nil
 }
@@ -1765,6 +1888,13 @@ func boolPtr(v bool) *bool {
 
 func nullStr(v string) any {
 	if v == "" {
+		return nil
+	}
+	return v
+}
+
+func nullableBytes(v []byte) any {
+	if len(v) == 0 {
 		return nil
 	}
 	return v

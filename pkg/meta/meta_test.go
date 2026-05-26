@@ -2,8 +2,11 @@ package meta
 
 import (
 	"context"
+	"errors"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +22,7 @@ func newControlStore(t *testing.T) *Store {
 	t.Cleanup(func() { _ = s.Close() })
 	_, _ = s.DB().Exec("DELETE FROM tenant_api_key_fs_scopes")
 	_, _ = s.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = s.DB().Exec("DELETE FROM tenant_external_bindings")
 	_, _ = s.DB().Exec("DELETE FROM tenants")
 	_, _ = s.DB().Exec("DELETE FROM llm_usage")
 	return s
@@ -141,6 +145,133 @@ func TestInsertAndResolveByAPIKeyHash(t *testing.T) {
 	}
 	if err := s.RevokeAPIKey(context.Background(), "wrong-tenant", key.ID); err != ErrNotFound {
 		t.Fatalf("RevokeAPIKey wrong tenant error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestInsertAndGetExternalBinding(t *testing.T) {
+	s := newControlStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertTenant(context.Background(), &Tenant{
+		ID:               "binding-tenant",
+		Status:           TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: []byte("cipher"),
+		DBName:           "tenant_db_binding",
+		DBTLS:            true,
+		Provider:         "tidb_zero",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"server_id":"srv","sub":"sub"}`)
+	if err := s.InsertExternalBinding(context.Background(), &ExternalBinding{
+		Provider:     "slock",
+		SubjectKey:   "srv:sub",
+		TenantID:     "binding-tenant",
+		MetadataJSON: metadata,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}); err != nil {
+		t.Fatalf("InsertExternalBinding: %v", err)
+	}
+	got, err := s.GetExternalBinding(context.Background(), "slock", "srv:sub")
+	if err != nil {
+		t.Fatalf("GetExternalBinding: %v", err)
+	}
+	if got.Provider != "slock" || got.SubjectKey != "srv:sub" || got.TenantID != "binding-tenant" ||
+		!strings.Contains(string(got.MetadataJSON), `"server_id": "srv"`) ||
+		!strings.Contains(string(got.MetadataJSON), `"sub": "sub"`) {
+		t.Fatalf("binding = %+v metadata=%s", got, string(got.MetadataJSON))
+	}
+	if err := s.InsertExternalBinding(context.Background(), got); !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("duplicate InsertExternalBinding error = %v, want ErrDuplicate", err)
+	}
+	if _, err := s.GetExternalBinding(context.Background(), "slock", "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing GetExternalBinding error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestInsertAPIKeyStoresIssuedByMetadata(t *testing.T) {
+	s := newControlStore(t)
+	now := time.Now().UTC()
+	tenant := &Tenant{
+		ID:               "issued-by-tenant",
+		Status:           TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "root",
+		DBPasswordCipher: []byte("cipher"),
+		DBName:           "tenant_db_issued_by",
+		DBTLS:            true,
+		Provider:         "tidb_zero",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := s.InsertTenant(context.Background(), tenant); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertAPIKey(context.Background(), &APIKey{
+		ID:                   "issued-key",
+		TenantID:             tenant.ID,
+		KeyName:              "slock",
+		JWTCiphertext:        []byte("cipher"),
+		JWTHash:              "hash-issued",
+		TokenVersion:         1,
+		Status:               APIKeyActive,
+		ScopeKind:            APIKeyScopeKindOwner,
+		IssuedByProvider:     "slock",
+		IssuedBySubjectKey:   "srv:sub",
+		IssuedByMetadataJSON: []byte(`{"type":"agent"}`),
+		IssuedAt:             now,
+		CreatedAt:            now,
+		UpdatedAt:            now,
+	}); err != nil {
+		t.Fatalf("InsertAPIKey: %v", err)
+	}
+	got, err := s.ResolveByAPIKeyHash(context.Background(), "hash-issued")
+	if err != nil {
+		t.Fatalf("ResolveByAPIKeyHash: %v", err)
+	}
+	if got.APIKey.IssuedByProvider != "slock" || got.APIKey.IssuedBySubjectKey != "srv:sub" ||
+		!strings.Contains(string(got.APIKey.IssuedByMetadataJSON), `"type": "agent"`) {
+		t.Fatalf("issued-by metadata not round-tripped: %+v metadata=%s", got.APIKey, string(got.APIKey.IssuedByMetadataJSON))
+	}
+}
+
+func TestWithExternalBindingLockSerializesCallbacks(t *testing.T) {
+	s := newControlStore(t)
+	var running int32
+	var maxRunning int32
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := s.WithExternalBindingLock(context.Background(), "slock", "srv:sub", func(context.Context) error {
+				n := atomic.AddInt32(&running, 1)
+				for {
+					max := atomic.LoadInt32(&maxRunning)
+					if n <= max || atomic.CompareAndSwapInt32(&maxRunning, max, n) {
+						break
+					}
+				}
+				time.Sleep(20 * time.Millisecond)
+				atomic.AddInt32(&running, -1)
+				return nil
+			})
+			if err != nil {
+				t.Errorf("WithExternalBindingLock: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if maxRunning != 1 {
+		t.Fatalf("max concurrent lock holders = %d, want 1", maxRunning)
 	}
 }
 
@@ -711,6 +842,19 @@ func TestMetaSchemaSpecIncludesAPIKeyScopeTables(t *testing.T) {
 	if scopeKind.addSQL != "ALTER TABLE tenant_api_keys ADD COLUMN scope_kind VARCHAR(32) NOT NULL DEFAULT 'owner'" {
 		t.Fatalf("scope_kind addSQL = %q", scopeKind.addSQL)
 	}
+	for column, wantAddSQL := range map[string]string{
+		"issued_by_provider":      "ALTER TABLE tenant_api_keys ADD COLUMN issued_by_provider VARCHAR(64) NOT NULL DEFAULT ''",
+		"issued_by_subject_key":   "ALTER TABLE tenant_api_keys ADD COLUMN issued_by_subject_key VARCHAR(512) NOT NULL DEFAULT ''",
+		"issued_by_metadata_json": "ALTER TABLE tenant_api_keys ADD COLUMN issued_by_metadata_json JSON NULL",
+	} {
+		spec, ok := apiKeys.columns[column]
+		if !ok {
+			t.Fatalf("tenant_api_keys schema missing %s", column)
+		}
+		if spec.addSQL != wantAddSQL {
+			t.Fatalf("%s addSQL = %q, want %q", column, spec.addSQL, wantAddSQL)
+		}
+	}
 
 	scopes := mustMetaTableSpec(t, spec, "tenant_api_key_fs_scopes")
 	for _, column := range []string{"tenant_id", "api_key_id", "prefix", "prefix_hash", "ops"} {
@@ -721,6 +865,20 @@ func TestMetaSchemaSpecIncludesAPIKeyScopeTables(t *testing.T) {
 	for _, index := range []string{"primary", "idx_fs_scopes_api_key", "idx_fs_scopes_tenant_key"} {
 		if _, ok := scopes.indexes[index]; !ok {
 			t.Fatalf("tenant_api_key_fs_scopes schema missing index %s", index)
+		}
+	}
+}
+
+func TestMetaSchemaSpecIncludesExternalBindings(t *testing.T) {
+	table := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_external_bindings")
+	for _, column := range []string{"provider", "subject_key", "tenant_id", "metadata_json", "created_at", "updated_at"} {
+		if _, ok := table.columns[column]; !ok {
+			t.Fatalf("tenant_external_bindings schema missing %s", column)
+		}
+	}
+	for _, index := range []string{"uk_external_binding_subject", "idx_external_binding_tenant"} {
+		if _, ok := table.indexes[index]; !ok {
+			t.Fatalf("tenant_external_bindings schema missing index %s", index)
 		}
 	}
 }
