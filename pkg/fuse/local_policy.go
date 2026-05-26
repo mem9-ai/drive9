@@ -185,14 +185,6 @@ func newLocalPolicyPattern(raw string) (localPolicyPattern, error) {
 	return pattern, nil
 }
 
-func (pattern localPolicyPattern) matches(localPath string) bool {
-	cleaned, err := canonicalRuntimePolicyPath(localPath)
-	if err != nil {
-		return false
-	}
-	return pattern.matchesCanonical(cleaned)
-}
-
 func (pattern localPolicyPattern) matchesCanonical(cleaned string) bool {
 	if len(pattern.subpath) > 0 {
 		segments := splitCanonicalPolicyPath(cleaned)
@@ -229,14 +221,6 @@ func canonicalPolicyPath(value string) (string, error) {
 
 func splitPolicyPath(value string) ([]string, error) {
 	value, err := canonicalPolicyPattern(value)
-	if err != nil {
-		return nil, err
-	}
-	return splitCanonicalPolicyPath(value), nil
-}
-
-func splitRuntimePolicyPath(value string) ([]string, error) {
-	value, err := canonicalRuntimePolicyPath(value)
 	if err != nil {
 		return nil, err
 	}

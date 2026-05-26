@@ -22,7 +22,7 @@ func TestLocalPolicyCodingAgentDefaultsMatchGitSegmentExactly(t *testing.T) {
 
 	for _, test := range tests {
 		if got := policy.Classify(test.path); got != test.want {
-			t.Fatalf("Classify(%q) = %s, want %s", test.path, got, test.want)
+			t.Errorf("Classify(%q) = %s, want %s", test.path, got, test.want)
 		}
 	}
 }
@@ -80,7 +80,7 @@ func TestLocalPolicyDefaultsCodingAgentCacheSegmentsToLocalOnly(t *testing.T) {
 		"/repo/.venv/bin/python",
 	} {
 		if got := policy.Classify(path); got != PathLayerLocalOnly {
-			t.Fatalf("Classify(%q) = %s, want local-only default", path, got)
+			t.Errorf("Classify(%q) = %s, want local-only default", path, got)
 		}
 	}
 }
@@ -103,7 +103,7 @@ func TestValidateLocalPolicyPatternsRejectsUnsafeNormalization(t *testing.T) {
 				t.Fatalf("validateLocalPolicyPatterns(%q) = nil, want error", test.pattern)
 			}
 			if got := err.Error(); !strings.Contains(got, test.want) {
-				t.Fatalf("error = %q, want %q", got, test.want)
+				t.Errorf("error = %q, want %q", got, test.want)
 			}
 		})
 	}
