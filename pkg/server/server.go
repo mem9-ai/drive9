@@ -256,6 +256,7 @@ func NewWithConfig(cfg Config) *Server {
 
 	s.mux = mux
 	if s.meta != nil && s.pool != nil && s.provisioner != nil {
+		s.resumePendingTenants()
 		s.resumeProvisioningTenants()
 		s.resumeDeletingForkTenants()
 	}
@@ -340,6 +341,27 @@ func (s *Server) resumeProvisioningTenants() {
 			continue
 		}
 		go s.resumeTenantSchemaInit(t)
+	}
+}
+
+func (s *Server) resumePendingTenants() {
+	ctx := backgroundWithTrace(context.Background())
+	tenants, err := s.meta.ListTenantsByStatus(ctx, meta.TenantPending, 1000)
+	if err != nil {
+		logger.Error(ctx, "resume_pending_list_failed", zap.Error(err))
+		return
+	}
+	for i := range tenants {
+		t := tenants[i]
+		logger.Warn(ctx, "resume_pending_mark_failed",
+			zap.String("tenant_id", t.ID),
+			zap.String("kind", string(t.Kind)),
+			zap.String("provider", t.Provider))
+		if err := s.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantFailed); err != nil {
+			logger.Error(ctx, "resume_pending_mark_failed_update_error",
+				zap.String("tenant_id", t.ID),
+				zap.Error(err))
+		}
 	}
 }
 
@@ -3028,33 +3050,16 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		keyName = "default"
 	}
 	now := time.Now().UTC()
-	cluster, err := s.provisioner.Provision(ctx, tenantID)
-	if err != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
-		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "cluster_error")
-		return nil, newProvisionTenantError(http.StatusBadGateway, fmt.Sprintf("provision tenant cluster failed: %v", err), err)
-	}
-	cluster.Provider = provider
-
-	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
-	if err != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_db_password_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
-		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to encrypt db password", err)
-	}
 	if err := s.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:               tenantID,
-		Status:           meta.TenantProvisioning,
-		DBHost:           cluster.Host,
-		DBPort:           cluster.Port,
-		DBUser:           cluster.Username,
-		DBPasswordCipher: cipherPass,
-		DBName:           cluster.DBName,
+		Status:           meta.TenantPending,
+		DBHost:           "",
+		DBPort:           0,
+		DBUser:           "",
+		DBPasswordCipher: []byte{},
+		DBName:           "",
 		DBTLS:            true,
 		Provider:         provider,
-		ClusterID:        cluster.ClusterID,
-		ClaimURL:         cluster.ClaimURL,
-		ClaimExpiresAt:   cluster.ClaimExpiresAt,
 		SchemaVersion:    1,
 		CreatedAt:        now,
 		UpdatedAt:        now,
@@ -3066,12 +3071,60 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 	metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "ok")
 
+	cluster, err := s.provisioner.Provision(ctx, tenantID)
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "cluster_error")
+		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+		}
+		return nil, newProvisionTenantError(http.StatusBadGateway, fmt.Sprintf("provision tenant cluster failed: %v", err), err)
+	}
+	cluster.Provider = provider
+
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_db_password_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+		}
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to encrypt db password", err)
+	}
+	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
+		DBHost:           cluster.Host,
+		DBPort:           cluster.Port,
+		DBUser:           cluster.Username,
+		DBPasswordCipher: cipherPass,
+		DBName:           cluster.DBName,
+		DBTLS:            true,
+		Provider:         provider,
+		ClusterID:        cluster.ClusterID,
+		ClaimURL:         cluster.ClaimURL,
+		ClaimExpiresAt:   cluster.ClaimExpiresAt,
+	}); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_update_tenant_connection_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+		}
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant connection", err)
+	}
+	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantProvisioning); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_update_tenant_status_failed", "tenant_id", tenantID, "provider", provider, "status", meta.TenantProvisioning, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+		}
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to update tenant status", err)
+	}
+
 	apiToken, apiKeyID, err := s.issueOwnerAPIKey(ctx, tenantID, keyName, opts.TokenVersion, opts.APIKeySource)
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_api_key_failed", "tenant_id", tenantID, "api_key_id", apiKeyID, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
 		metricEvent(ctx, "metadb_query", "api", "insert_api_key", "result", "error")
-		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantDeleted)
+		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist api key", err)
 	}
 

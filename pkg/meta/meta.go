@@ -30,6 +30,7 @@ var (
 type TenantStatus string
 
 const (
+	TenantPending      TenantStatus = "pending"
 	TenantProvisioning TenantStatus = "provisioning"
 	TenantActive       TenantStatus = "active"
 	TenantFailed       TenantStatus = "failed"

@@ -20,9 +20,10 @@ import (
 )
 
 type fakeProvisioner struct {
-	provider string
-	cluster  *tenant.ClusterInfo
-	initErr  error
+	provider     string
+	cluster      *tenant.ClusterInfo
+	initErr      error
+	provisionErr error
 }
 
 func (f *fakeProvisioner) ProviderType() string { return f.provider }
@@ -35,6 +36,9 @@ func (f *fakeProvisioner) InitSchema(_ context.Context, dsn string) error {
 }
 
 func (f *fakeProvisioner) Provision(_ context.Context, tenantID string) (*tenant.ClusterInfo, error) {
+	if f.provisionErr != nil {
+		return nil, f.provisionErr
+	}
 	out := *f.cluster
 	out.TenantID = tenantID
 	out.Provider = f.provider
@@ -260,6 +264,78 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	}
 }
 
+func TestProvisionPersistsTenantBeforeProvisionFailure(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+
+	prov := &fakeProvisioner{
+		provider:     tenant.ProviderTiDBZero,
+		cluster:      &tenant.ClusterInfo{},
+		provisionErr: fmt.Errorf("boom"),
+	}
+
+	srv := NewWithConfig(Config{
+		Meta:        metaStore,
+		Pool:        pool,
+		Provisioner: prov,
+		TokenSecret: tokenSecret,
+	})
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	body, _ := json.Marshal(map[string]any{"provider": tenant.ProviderTiDBZero})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status=%d, want %d", resp.StatusCode, http.StatusBadGateway)
+	}
+
+	var tenantID, status string
+	if err := metaStore.DB().QueryRow("SELECT id, status FROM tenants LIMIT 1").Scan(&tenantID, &status); err != nil {
+		t.Fatalf("QueryRow tenant: %v", err)
+	}
+	if tenantID == "" {
+		t.Fatal("expected tenant row to be persisted")
+	}
+	if status != string(meta.TenantFailed) {
+		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
+	}
+	var keyCount int
+	if err := metaStore.DB().QueryRow("SELECT COUNT(*) FROM tenant_api_keys").Scan(&keyCount); err != nil {
+		t.Fatal(err)
+	}
+	if keyCount != 0 {
+		t.Fatalf("api key count = %d, want 0", keyCount)
+	}
+}
+
 func TestStartupResumesProvisioningTenantInit(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
@@ -332,6 +408,65 @@ func TestStartupResumesProvisioningTenantInit(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("tenant did not become active after restart resume, status=%s", status)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestStartupMarksPendingTenantFailed(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tenantID := token.NewID()
+	now := time.Now().UTC()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantPending,
+		DBHost:           "",
+		DBPort:           0,
+		DBUser:           "",
+		DBPasswordCipher: []byte{},
+		DBName:           "",
+		DBTLS:            true,
+		Provider:         tenant.ProviderTiDBZero,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBZero, cluster: &tenant.ClusterInfo{}}
+	_ = NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov, TokenSecret: []byte("abc")})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		row := metaStore.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", tenantID)
+		var status string
+		if err := row.Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status == string(meta.TenantFailed) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pending tenant did not become failed after startup resume, status=%s", status)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
