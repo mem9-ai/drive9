@@ -203,7 +203,7 @@ func (s *Store) DB() *sql.DB  { return s.db }
 
 const metaSchemaMigrateLockNamePrefix = "dat9_meta_schema_migrate:"
 const metaSchemaMigrateLockTimeoutSeconds = 30
-const externalBindingLockTimeoutSeconds = 30
+const externalBindingLockTimeoutSeconds = 90
 const externalBindingReleaseLockTimeout = 5 * time.Second
 
 func (s *Store) migrate() (err error) {
