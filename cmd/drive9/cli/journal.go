@@ -28,7 +28,11 @@ func (r *repeatStrings) Set(value string) error {
 
 func Journal(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: drive9 journal <new|append|cat|find|verify>")
+		return fmt.Errorf("%s", journalUsage())
+	}
+	if IsHelpArg(args[0]) {
+		_, _ = fmt.Fprintln(os.Stdout, journalUsage())
+		return nil
 	}
 	switch args[0] {
 	case "new":
@@ -43,11 +47,13 @@ func Journal(args []string) error {
 		return JournalVerify(args[1:])
 	case "seal":
 		return fmt.Errorf("journal seal is not implemented in the Phase 1 journal backend")
-	case "-h", "--help", "help":
-		return fmt.Errorf("usage: drive9 journal <new|append|cat|find|verify>")
 	default:
 		return fmt.Errorf("unknown journal command %q", args[0])
 	}
+}
+
+func journalUsage() string {
+	return "usage: drive9 journal <new|append|cat|find|verify>"
 }
 
 func JournalNew(args []string) error {

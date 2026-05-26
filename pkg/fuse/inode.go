@@ -105,6 +105,33 @@ func (m *InodeToPath) EnsureInode(path string, isDir bool, size int64, mtime tim
 	return ino
 }
 
+// EnsureInodeNoUpdate returns the inode for path, allocating one if needed.
+// Unlike EnsureInode, an existing mapping is returned without mutating its
+// cached metadata. Use this when recovering stale snapshot references.
+func (m *InodeToPath) EnsureInodeNoUpdate(path string, isDir bool, size int64, mtime time.Time) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if ino, ok := m.byPath[path]; ok {
+		return ino
+	}
+
+	ino := m.nextIno
+	m.nextIno++
+
+	entry := &InodeEntry{
+		Ino:     ino,
+		Path:    path,
+		IsDir:   isDir,
+		Nlookup: 0,
+		Size:    size,
+		Mtime:   mtime,
+	}
+	m.byInode[ino] = entry
+	m.byPath[path] = ino
+	return ino
+}
+
 // IncrementLookup adds one kernel lookup reference to an existing inode.
 // Returns false if the inode does not exist.
 func (m *InodeToPath) IncrementLookup(ino uint64) bool {
@@ -250,12 +277,17 @@ func (m *InodeToPath) UpdateRevision(ino uint64, revision int64) {
 
 // UpdateMode updates the permission bits of the entry identified by ino.
 func (m *InodeToPath) UpdateMode(ino uint64, mode uint32) {
+	m.SetModeState(ino, mode, true)
+}
+
+// SetModeState updates both permission bits and whether they are authoritative.
+func (m *InodeToPath) SetModeState(ino uint64, mode uint32, hasMode bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Mode = mode
-		entry.HasMode = true
+		entry.HasMode = hasMode
 	}
 }
 

@@ -1,7 +1,9 @@
 package fuse
 
 import (
+	"os"
 	"sync"
+	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -11,6 +13,8 @@ import (
 type FileHandle struct {
 	Ino               uint64
 	Path              string
+	Layer             PathLayer
+	LocalFile         *os.File
 	Flags             uint32          // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
 	OpenPID           uint32          // PID that opened the handle, when supplied by the kernel
 	Dirty             *WriteBuffer    // write buffer, nil for read-only opens
@@ -31,8 +35,10 @@ type FileHandle struct {
 	WritePolicy       WritePolicy // per-handle remote durability policy chosen at open/create
 	PendingMode       uint32      // mode change deferred because a dirty handle was open
 	HasPendingMode    bool        // true when PendingMode should be applied on Release
+	PendingModeGen    uint64      // generation for PendingMode, used to avoid clearing newer chmods
 	PreviousMode      uint32      // mode before PendingMode was set (for rollback on flush failure)
-	HasPreviousMode   bool        // true when PreviousMode is valid
+	HasPreviousMode   bool        // true when previous mode state was snapshotted
+	PreviousModeKnown bool        // true when PreviousMode was authoritative
 	mu                sync.Mutex
 }
 
@@ -55,9 +61,16 @@ type DirHandle struct {
 
 // DirEntry is a simplified directory entry for FUSE readdir.
 type DirEntry struct {
-	Name string
-	Ino  uint64
-	Mode uint32 // S_IFDIR or S_IFREG
+	Name        string
+	Ino         uint64
+	Mode        uint32 // S_IFDIR or S_IFREG
+	Size        int64
+	Mtime       time.Time
+	Revision    int64
+	AttrMode    uint32
+	HasMode     bool
+	IsDir       bool
+	HasMetadata bool
 }
 
 // ---------------------------------------------------------------------------

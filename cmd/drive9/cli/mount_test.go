@@ -1003,6 +1003,125 @@ func TestMountCmdPreservesExplicitTTLs(t *testing.T) {
 	}
 }
 
+func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	localRoot := t.TempDir()
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile", "coding-agent",
+		"--local-root", " " + localRoot + " ",
+		"--local-only", "**/node_modules/**",
+		"--remote-only", "**/node_modules/keep/**",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.Profile != "coding-agent" {
+		t.Fatalf("Profile = %q, want coding-agent", got.Profile)
+	}
+	if got.LocalRoot != localRoot {
+		t.Fatalf("LocalRoot = %q, want %q", got.LocalRoot, localRoot)
+	}
+	if !reflect.DeepEqual(got.LocalOnlyPatterns, []string{"**/node_modules/**"}) {
+		t.Fatalf("LocalOnlyPatterns = %v", got.LocalOnlyPatterns)
+	}
+	if !reflect.DeepEqual(got.RemoteOnlyPatterns, []string{"**/node_modules/keep/**"}) {
+		t.Fatalf("RemoteOnlyPatterns = %v", got.RemoteOnlyPatterns)
+	}
+}
+
+func TestMountCmdCodingAgentProfileRequiresLocalRoot(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	mountFuse = func(opts *mountFuseOptions) error {
+		t.Fatal("mountFuse should not be called")
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile", "coding-agent",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires --local-root") {
+		t.Fatalf("error = %v, want missing local-root validation error", err)
+	}
+}
+
+func TestMountCmdLocalPolicyFlagsRequireCodingAgentProfile(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--local-only", "**/.git/**",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--profile=coding-agent") {
+		t.Fatalf("error = %v, want coding-agent profile validation error", err)
+	}
+}
+
+func TestMountCmdLocalRootMustBeAbsolute(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile", "coding-agent",
+		"--local-root", "relative/root",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--local-root") {
+		t.Fatalf("error = %v, want local root validation error", err)
+	}
+}
+
+func TestMountCmdLocalPolicyPatternsRejectUnsafePaths(t *testing.T) {
+	tests := []struct {
+		name    string
+		pattern string
+		want    string
+	}{
+		{name: "backslash", pattern: `**\\.git\\**`, want: "path contains backslash"},
+		{name: "dotdot", pattern: "**/../.git/**", want: `path contains ".." segment`},
+		{name: "dot", pattern: "**/./.git/**", want: `path contains "." segment`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := MountCmd([]string{
+				"--mode", "fuse",
+				"--server", "https://drive9.example",
+				"--api-key", "sk-test",
+				"--profile", "coding-agent",
+				"--local-root", t.TempDir(),
+				"--local-only", test.pattern,
+				t.TempDir(),
+			})
+			if err == nil || !strings.Contains(err.Error(), "invalid local policy pattern") || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want invalid policy pattern containing %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestValidateLookupRetryFlags(t *testing.T) {
 	if err := validateLookupRetryFlags(0, 0, false, false); err != nil {
 		t.Fatalf("omitted lookup retry flags should be allowed: %v", err)

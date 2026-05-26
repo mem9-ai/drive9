@@ -31,6 +31,8 @@ const (
 	perfFuseRmdir
 	perfFuseRename
 	perfFuseSetAttr
+	perfFuseReadlink
+	perfFuseSymlink
 	perfFuseOpCount
 )
 
@@ -52,6 +54,8 @@ var perfFuseOpNames = [...]string{
 	perfFuseRmdir:       "rmdir",
 	perfFuseRename:      "rename",
 	perfFuseSetAttr:     "setattr",
+	perfFuseReadlink:    "readlink",
+	perfFuseSymlink:     "symlink",
 }
 
 type perfRemoteOp int
@@ -129,6 +133,10 @@ type fusePerfCounters struct {
 
 	notifyEntry atomicUint64
 	notifyInode atomicUint64
+
+	localPolicyLocalOnly      atomicUint64
+	localPolicyRemoteOverride atomicUint64
+	localPolicyRemoteDefault  atomicUint64
 }
 
 // atomicUint64 is a small wrapper around sync/atomic.Uint64. Keeping it local
@@ -174,6 +182,20 @@ func (p *fusePerfCounters) recordRemoteOp(op perfRemoteOp, err error, dur time.D
 		return
 	}
 	p.remoteOps[op].record(err != nil, dur, bytes)
+}
+
+func (p *fusePerfCounters) recordLocalPolicy(source policyMatchSource) {
+	if !p.isEnabled() {
+		return
+	}
+	switch source {
+	case policyMatchLocalOnly:
+		p.localPolicyLocalOnly.add(1)
+	case policyMatchRemoteOverride:
+		p.localPolicyRemoteOverride.add(1)
+	case policyMatchRemoteDefault:
+		p.localPolicyRemoteDefault.add(1)
+	}
 }
 
 func (s *perfAtomicStats) record(failed bool, dur time.Duration, bytes uint64) {
@@ -256,6 +278,9 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 	snap.Counters["sse_self_filtered"] = p.sseSelfFiltered.load()
 	snap.Counters["notify_entry"] = p.notifyEntry.load()
 	snap.Counters["notify_inode"] = p.notifyInode.load()
+	snap.Counters["local_policy_local_only"] = p.localPolicyLocalOnly.load()
+	snap.Counters["local_policy_remote_override"] = p.localPolicyRemoteOverride.load()
+	snap.Counters["local_policy_remote_default"] = p.localPolicyRemoteDefault.load()
 	return snap
 }
 
@@ -289,6 +314,10 @@ func (p *fusePerfCounters) printSummary(w io.Writer) {
 	writePerfLine(w, "drive9: perf sse change=%d reset=%d self_filtered=%d notify_entry=%d notify_inode=%d\n",
 		snap.Counters["sse_change"], snap.Counters["sse_reset"], snap.Counters["sse_self_filtered"],
 		snap.Counters["notify_entry"], snap.Counters["notify_inode"])
+	writePerfLine(w, "drive9: perf local_policy local_only=%d remote_override=%d remote_default=%d\n",
+		snap.Counters["local_policy_local_only"],
+		snap.Counters["local_policy_remote_override"],
+		snap.Counters["local_policy_remote_default"])
 }
 
 func writePerfOps(w io.Writer, group string, names []string, stats map[string]perfOpStats) {

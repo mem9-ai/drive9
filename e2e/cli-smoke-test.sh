@@ -296,6 +296,7 @@ CLI_CTX_HOME="$(mktemp -d)"
 SMALL_LOCAL="/tmp/drive9-cli-small-${TS}.txt"
 SMALL_REMOTE="/cli-${TS}-small.txt"
 SMALL_RENAMED="/cli-${TS}-small-renamed.txt"
+SMALL_SYMLINK="/cli-${TS}-small-link"
 CP_DIR_REMOTE="/cli-${TS}-cpdir"
 CP_DIR_REMOTE_COPY="/cli-${TS}-cpdir-copy"
 CP_DIR_LOCAL="/tmp/drive9-cli-cpdir-${TS}"
@@ -413,6 +414,27 @@ print("true" if any(line.strip()==name for line in out) else "false")
 PY
 )
 check_eq "mv renames remote file" "$renamed_present" "true"
+
+drive9_retry fs symlink ":$SMALL_RENAMED" ":$SMALL_SYMLINK" >/dev/null
+symlink_present="false"
+for _ in $(seq 1 "$CLI_MAX_RETRIES"); do
+  symlink_ls="$(drive9_retry fs ls /)"
+  symlink_present=$(python3 - "$symlink_ls" "$(basename "$SMALL_SYMLINK")" <<'PY'
+import sys
+out=sys.argv[1].splitlines()
+name=sys.argv[2]
+print("true" if any(line.strip()==name for line in out) else "false")
+PY
+)
+  if [[ "$symlink_present" == "true" ]]; then
+    break
+  fi
+  sleep "$CLI_RETRY_SLEEP_S"
+done
+check_eq "symlink appears in ls /" "$symlink_present" "true"
+
+symlink_target="$(drive9_retry_read fs cat "$SMALL_SYMLINK")"
+check_eq "cat symlink returns target payload" "$symlink_target" "$SMALL_RENAMED"
 
 echo "[4.1] cli tag/stat metadata checks"
 printf "cli-tag-%s" "$TS" > "$TAG_LOCAL"
@@ -564,6 +586,7 @@ sum_dst=$(sha256sum "$LARGE_DOWNLOADED" | cut -d' ' -f1)
 check_eq "downloaded large file sha256 matches" "$sum_dst" "$sum_src"
 
 echo "[8] cleanup via cli"
+drive9_retry fs rm "$SMALL_SYMLINK" >/dev/null
 drive9_retry fs rm "$SMALL_RENAMED" >/dev/null
 drive9_retry fs rm "$TAG_REMOTE" >/dev/null
 if [ "$CLI_IMAGE_UPLOADED" = "1" ]; then

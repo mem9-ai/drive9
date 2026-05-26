@@ -398,6 +398,9 @@ func TestC2aWriteHandlersRejectScopedRequestBeforeBackend(t *testing.T) {
 		{"handleCreate", func(s *Server, w http.ResponseWriter, r *http.Request) {
 			s.handleCreate(w, r, "/main/secrets.env")
 		}},
+		{"handleSymlink", func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.handleSymlink(w, r, "/main/secrets.env")
+		}},
 		{"handleMkdir", func(s *Server, w http.ResponseWriter, r *http.Request) {
 			s.handleMkdir(w, r, "/main/newdir")
 		}},
@@ -604,6 +607,7 @@ func TestC2aDispatcherWriteSideAllowed(t *testing.T) {
 			{http.MethodPost, "mkdir=1"},
 			{http.MethodPost, "mkdir=1&mode=755"},
 			{http.MethodPost, "create=1"},
+			{http.MethodPost, "symlink=1"},
 		}
 		for _, tc := range cases {
 			r := newScopedRequest(t, tc.method, "/v1/fs/main.txt", tc.query)
@@ -626,6 +630,7 @@ func TestC2aDispatcherWriteSideAllowed(t *testing.T) {
 			"append=1&copy=1",
 			"copy=1&rename=1",
 			"mkdir=1&create=1",
+			"create=1&symlink=1",
 			"copy=1&chmod=1", // chmod combined with anything → deny
 			"append=1&mkdir=1&create=1",
 		}

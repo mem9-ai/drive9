@@ -610,6 +610,60 @@ func TestCreateFileCtxReturnsMalformedJSONError(t *testing.T) {
 	}
 }
 
+func TestSymlinkCtxPostsSymlinkAction(t *testing.T) {
+	var gotTarget string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/fs/link" {
+			t.Errorf("path = %s, want /v1/fs/link", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("symlink"); got != "1" {
+			t.Errorf("symlink query = %q, want 1", got)
+		}
+		var req struct {
+			Target string `json:"target"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		gotTarget = req.Target
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	if err := c.SymlinkCtx(context.Background(), "../target", "/link"); err != nil {
+		t.Fatalf("SymlinkCtx error = %v", err)
+	}
+	if gotTarget != "../target" {
+		t.Fatalf("target = %q, want ../target", gotTarget)
+	}
+}
+
+func TestSymlinkCtxPreservesStatusError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		errJSON := map[string]string{"error": "already exists"}
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(errJSON)
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	err := c.SymlinkCtx(context.Background(), "target", "/link")
+	if err == nil {
+		t.Fatal("SymlinkCtx error = nil, want conflict")
+	}
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("SymlinkCtx error type = %T, want *StatusError", err)
+	}
+	if statusErr.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", statusErr.StatusCode)
+	}
+}
+
 func TestWriteCtxConditionalWithTagsRejectsInvalidHeaderTags(t *testing.T) {
 	requests := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1099,7 +1153,6 @@ func TestSmallFileThresholdOverrideShortCircuits(t *testing.T) {
 		t.Fatalf("override should short-circuit network; saw %d hits", hits)
 	}
 }
-
 
 func TestChmod(t *testing.T) {
 	c, cleanup := newTestClient(t)

@@ -650,6 +650,9 @@ RW_BETA_MOUNT="$RW_ALPHA_MOUNT/beta"
 RW_TEXT_REL="${RW_ALPHA_REL}/text.txt"
 RW_TEXT_REMOTE="/${RW_TEXT_REL}"
 RW_TEXT_MOUNT="$MOUNT_POINT/$RW_TEXT_REL"
+RW_SYMLINK_REL="${RW_ALPHA_REL}/text-link"
+RW_SYMLINK_REMOTE="/${RW_SYMLINK_REL}"
+RW_SYMLINK_MOUNT="$MOUNT_POINT/$RW_SYMLINK_REL"
 RW_TEXT_RENAMED_REL="${RW_ALPHA_REL}/text-renamed.txt"
 RW_TEXT_RENAMED_REMOTE="/${RW_TEXT_RENAMED_REL}"
 RW_TEXT_RENAMED_MOUNT="$MOUNT_POINT/$RW_TEXT_RENAMED_REL"
@@ -739,6 +742,25 @@ if is_mounted "$MOUNT_POINT"; then
   printf -- "-append" >> "$RW_TEXT_MOUNT"
   remote_append=$(wait_remote_cat_eq "$RW_TEXT_REMOTE" "overwrite-${TS}-append")
   check_eq "append visible via remote cat" "$remote_append" "overwrite-${TS}-append"
+
+  if ln -s "text.txt" "$RW_SYMLINK_MOUNT"; then
+    check_eq "symlink via mount succeeds" "true" "true"
+  else
+    check_eq "symlink via mount succeeds" "false" "true"
+  fi
+  check_cmd "symlink is visible as local link" test -L "$RW_SYMLINK_MOUNT"
+  if [ -L "$RW_SYMLINK_MOUNT" ]; then
+    link_target=$(readlink "$RW_SYMLINK_MOUNT")
+    symlink_cat=$(cat "$RW_SYMLINK_MOUNT")
+    remote_link_target=$(wait_remote_cat_eq "$RW_SYMLINK_REMOTE" "text.txt")
+  else
+    link_target=""
+    symlink_cat=""
+    remote_link_target=""
+  fi
+  check_eq "readlink returns symlink target" "$link_target" "text.txt"
+  check_eq "cat follows mounted symlink" "$symlink_cat" "overwrite-${TS}-append"
+  check_eq "remote cat returns symlink payload" "$remote_link_target" "text.txt"
 
   if : > "$RW_TEXT_MOUNT"; then
     check_eq "truncate via mount succeeds" "true" "true"

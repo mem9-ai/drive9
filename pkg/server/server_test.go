@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -895,6 +896,149 @@ func TestStatDirectoryReturnsMode(t *testing.T) {
 	}
 	if modeHdr != "448" { // 0o700 = 448 decimal
 		t.Errorf("expected X-Dat9-Mode 448, got %s", modeHdr)
+	}
+}
+
+func TestSymlinkRoundTrip(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	reqBody := strings.NewReader(`{"target":"../target.txt"}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/link?symlink=1", reqBody)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("symlink: %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/link", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stat link: %d", resp.StatusCode)
+	}
+	wantMode := strconv.FormatUint(uint64(uint32(syscall.S_IFLNK)|0o777), 10)
+	if got := resp.Header.Get("X-Dat9-Mode"); got != wantMode {
+		t.Fatalf("X-Dat9-Mode = %s, want %s", got, wantMode)
+	}
+	if got := resp.Header.Get("Content-Length"); got != strconv.Itoa(len("../target.txt")) {
+		t.Fatalf("Content-Length = %s, want %d", got, len("../target.txt"))
+	}
+
+	resp, err = http.Get(ts.URL + "/v1/fs/link")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("read link payload: %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "../target.txt" {
+		t.Fatalf("read link payload = %q, want ../target.txt", body)
+	}
+}
+
+func TestSymlinkRejectsOversizeTarget(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	target := strings.Repeat("x", backend.MaxSymlinkTargetBytes+1)
+	reqBody := strings.NewReader(`{"target":"` + target + `"}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/too-long-link?symlink=1", reqBody)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("symlink oversize target status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/too-long-link", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("oversize symlink should not be inserted; stat status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestSymlinkRejectsOversizeBody(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	reqBody := strings.NewReader(`{"target":"` + strings.Repeat("x", maxSymlinkBodyBytes) + `"}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/body-too-large-link?symlink=1", reqBody)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("symlink oversize body status = %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestSymlinkAllowsMaxTargetWithWorstCaseJSONEscaping(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	target := strings.Repeat("\x01", backend.MaxSymlinkTargetBytes)
+	body, err := json.Marshal(map[string]string{"target": target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) > maxSymlinkBodyBytes {
+		t.Fatalf("test body length = %d exceeds symlink body cap %d", len(body), maxSymlinkBodyBytes)
+	}
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/escaped-max-link?symlink=1", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("symlink escaped max target status = %d, want %d: %s", resp.StatusCode, http.StatusOK, body)
+	}
+}
+
+func TestSymlinkReturns507WhenTenantStorageQuotaExceeded(t *testing.T) {
+	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 10}, SemanticWorkerOptions{})
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	reqBody := strings.NewReader(`{"target":"12345678901"}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/quota-link?symlink=1", reqBody)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusInsufficientStorage {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("symlink quota status = %d, want %d: %s", resp.StatusCode, http.StatusInsufficientStorage, body)
 	}
 }
 

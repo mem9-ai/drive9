@@ -155,7 +155,7 @@ use the same value as `DRIVE9_API_KEY` here.
 1. Provision + readiness polling
 2. Prepare `drive9` CLI binary (build local or download official release)
 3. CLI fork flow (`ctx add`, `ctx fork`, fork readiness polling, fork-context file read/write, fork delete)
-4. CLI small-file flow (`cp`, `ls`, `cat`, `mv`, `rm`)
+4. CLI small-file flow (`cp`, `ls`, `cat`, `mv`, `symlink`, `rm`)
 5. CLI `cp` directory-target semantics (local->remote dir, remote->local dir, remote->remote dir all preserve source basename)
 6. CLI batch small-file flow (`cp` many files + dir list count + stat + sample reads)
 7. CLI search flow (`fs grep`, `fs find`)
@@ -186,7 +186,7 @@ script is not a supported Windows validation path.
 2. Prepare `drive9` CLI binary (build local or download official release)
 3. Mount compatibility precheck for root `ls /`
 4. RW mount lifecycle (`drive9 mount`, `drive9 umount`)
-5. File semantics (`create`, `read`, `overwrite`, `append`, `truncate`, `unlink`)
+5. File semantics (`create`, `read`, `overwrite`, `append`, `symlink`, `truncate`, `unlink`)
 6. Directory semantics (`mkdir`, nested paths, `readdir`, empty/non-empty `rmdir`)
 7. Rename semantics (file + directory rename consistency)
 8. Attribute semantics (`size`, `mtime` monotonicity, remote stat parity)

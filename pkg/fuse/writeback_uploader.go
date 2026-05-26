@@ -93,6 +93,25 @@ func (u *WriteBackUploader) remotePath(localPath string) string {
 	return mountpath.ToRemote(root, localPath)
 }
 
+func (u *WriteBackUploader) applyMode(ctx context.Context, meta *WriteBackMeta) error {
+	if meta == nil || !shouldApplyRemoteMode(meta.Kind, meta.HasMode, meta.Mode) {
+		return nil
+	}
+	mode := meta.Mode & 0o777
+	err := retryPostUploadMode(ctx, func() error {
+		start := time.Now()
+		applyErr := u.client.ChmodCtx(ctx, u.remotePath(meta.Path), mode)
+		if u.perf != nil {
+			u.perf.recordRemoteOp(perfRemoteMutation, applyErr, time.Since(start), 0)
+		}
+		return applyErr
+	})
+	if err != nil {
+		return fmt.Errorf("writeback upload chmod %s to %o: %w", meta.Path, mode, err)
+	}
+	return nil
+}
+
 func (u *WriteBackUploader) SetPerfCounters(perf *fusePerfCounters) {
 	u.perf = perf
 }
@@ -183,6 +202,9 @@ func expectedRevisionForWriteBack(meta *WriteBackMeta) (int64, error) {
 	if meta == nil {
 		return -1, fmt.Errorf("missing writeback metadata")
 	}
+	if meta.Kind == PendingChmod {
+		return -1, fmt.Errorf("data already uploaded for %s; chmod pending", meta.Path)
+	}
 	if meta.Kind == PendingNew {
 		return 0, nil
 	}
@@ -239,6 +261,11 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	}
 	gen := meta.Generation
 
+	if meta.Kind == PendingChmod {
+		_ = u.applyPendingChmod(context.Background(), localPath, meta, gen, false)
+		return
+	}
+
 	data, ok := u.cache.getView(localPath)
 	if !ok {
 		return
@@ -294,6 +321,21 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		log.Printf("writeback upload failed for %s after %d attempts: %v (will retry on next mount)", localPath, uploadMaxRetries+1, lastErr)
 		return
 	}
+	chmodCtx, chmodCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	modeErr := u.applyMode(chmodCtx, meta)
+	chmodCancel()
+	if modeErr != nil {
+		if u.perf != nil {
+			u.perf.uploaderFailure.add(1)
+		}
+		if updated, err := u.cache.MarkChmodPending(localPath, gen); err != nil {
+			log.Printf("writeback upload chmod-pending meta update failed for %s: %v", localPath, err)
+		} else if updated {
+			log.Printf("writeback upload data committed for %s; chmod remains pending", localPath)
+		}
+		log.Printf("%v (will retry on next mount)", modeErr)
+		return
+	}
 
 	// Only remove from cache if the generation hasn't changed. If a newer
 	// Put() happened while we were uploading, the cache now holds fresher
@@ -320,6 +362,10 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 		return nil // not in cache (may have been uploaded by the background worker we just waited for)
 	}
 	gen := meta.Generation
+
+	if meta.Kind == PendingChmod {
+		return u.applyPendingChmod(ctx, localPath, meta, gen, true)
+	}
 
 	data, ok := u.cache.getView(localPath)
 	if !ok {
@@ -350,8 +396,45 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 		}
 		return err
 	}
+	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
+	err = u.applyMode(chmodCtx, meta)
+	chmodCancel()
+	if err != nil {
+		if u.perf != nil {
+			u.perf.uploaderFailure.add(1)
+		}
+		if _, markErr := u.cache.MarkChmodPending(localPath, gen); markErr != nil {
+			return fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
+		}
+		return err
+	}
 
 	// Only remove if generation matches — a concurrent Put() may have written newer data.
+	curMeta, ok := u.cache.GetMeta(localPath)
+	if ok && curMeta.Generation == gen {
+		u.cache.Remove(localPath)
+	}
+	if u.perf != nil {
+		u.perf.uploaderSuccess.add(1)
+	}
+	return nil
+}
+
+func (u *WriteBackUploader) applyPendingChmod(ctx context.Context, localPath string, meta *WriteBackMeta, gen uint64, sync bool) error {
+	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
+	err := u.applyMode(chmodCtx, meta)
+	chmodCancel()
+	if err != nil {
+		if u.perf != nil {
+			u.perf.uploaderFailure.add(1)
+		}
+		if sync {
+			return err
+		}
+		log.Printf("%v (chmod remains pending)", err)
+		return nil
+	}
+
 	curMeta, ok := u.cache.GetMeta(localPath)
 	if ok && curMeta.Generation == gen {
 		u.cache.Remove(localPath)

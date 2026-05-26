@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -44,7 +45,10 @@ type MountOptions struct {
 	FlushDebounce         time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
 	SyncMode              SyncMode      // interactive, strict, or auto (default auto)
 	WritePolicy           WritePolicy   // writeback, close-sync, or write-sync (default writeback)
-	Profile               string        // mount profile: "interactive", "" (default)
+	Profile               string        // mount profile: "interactive", "coding-agent", "" (default)
+	LocalRoot             string        // local-only overlay root for coding-agent mounts
+	LocalOnlyPatterns     []string      // additional local-only path patterns for coding-agent mounts
+	RemoteOnlyPatterns    []string      // remote-persistent override path patterns for coding-agent mounts
 	UploadConcurrency     int           // number of background upload workers (default 4)
 	ReadConcurrency       int           // maximum concurrent backend reads issued by FUSE (default 24)
 	SyncRead              bool          // disable kernel async read dispatch; at most one read in flight per file handle
@@ -67,7 +71,7 @@ const defaultUploadConcurrency = 16
 func (o *MountOptions) setDefaults() {
 	// Apply profile defaults before generic defaults so profile-specific
 	// zero-value options can take effect while explicit non-zero values win.
-	if o.Profile == "interactive" {
+	if o.Profile == MountProfileInteractive {
 		ApplyInteractiveProfile(o)
 	}
 	if o.CacheSize <= 0 {
@@ -125,7 +129,18 @@ func (o *MountOptions) setDefaults() {
 // Mount creates and serves a FUSE mount. It blocks until the filesystem
 // is unmounted or a signal (SIGINT, SIGTERM) is received.
 func Mount(opts *MountOptions) error {
+	if opts == nil {
+		return fmt.Errorf("mount: options are required")
+	}
 	opts.setDefaults()
+	if err := validateMountOptionsProfile(opts); err != nil {
+		return err
+	}
+	if localOverlay := NewLocalOverlay(opts.LocalRoot); localOverlay != nil {
+		if err := localOverlay.EnsureRoot(); err != nil {
+			return fmt.Errorf("mount: prepare LocalRoot: %w", err)
+		}
+	}
 
 	if err := os.MkdirAll(opts.MountPoint, 0o755); err != nil {
 		return fmt.Errorf("create mount point: %w", err)
@@ -455,6 +470,30 @@ func Mount(opts *MountOptions) error {
 		opts.MountPoint, opts.Server, actorID, opts.ReadOnly, opts.WritePolicy, cacheBase, shadowDir)
 	server.Wait()
 	shutdown()
+	return nil
+}
+
+func validateMountOptionsProfile(opts *MountOptions) error {
+	if !validMountProfile(opts.Profile) {
+		return fmt.Errorf("mount: unknown profile %q", opts.Profile)
+	}
+	opts.LocalRoot = strings.TrimSpace(opts.LocalRoot)
+	hasLocalPolicy := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0
+	if opts.Profile != MountProfileCodingAgent {
+		if hasLocalPolicy {
+			return fmt.Errorf("mount: local policy options require profile %q", MountProfileCodingAgent)
+		}
+		return nil
+	}
+	if opts.LocalRoot == "" {
+		return fmt.Errorf("mount: profile %q requires LocalRoot", MountProfileCodingAgent)
+	}
+	if !filepath.IsAbs(opts.LocalRoot) {
+		return fmt.Errorf("mount: LocalRoot must be an absolute path")
+	}
+	if err := validateLocalPolicyPatterns(opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns); err != nil {
+		return fmt.Errorf("mount: %w", err)
+	}
 	return nil
 }
 

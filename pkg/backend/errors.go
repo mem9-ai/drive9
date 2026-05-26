@@ -10,3 +10,7 @@ var ErrS3NotConfigured = errors.New("S3 not configured")
 
 // ErrNotInlineStorage reports that an operation requires db9-inline file data.
 var ErrNotInlineStorage = errors.New("file is not stored inline")
+
+// ErrInvalidSymlinkTarget reports that a symbolic link target is empty or
+// contains bytes that cannot be represented by the FUSE symlink contract.
+var ErrInvalidSymlinkTarget = errors.New("invalid symlink target")
