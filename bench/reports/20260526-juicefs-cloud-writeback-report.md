@@ -1,102 +1,141 @@
-# JuiceFS Cloud FUSE Repo Build Benchmark - 2026-05-26
+# JuiceFS Cloud FUSE Writeback Repo Build Benchmark
 
-## Conclusion
+Date: 2026-05-26 UTC
 
-On the EC2 host `47.129.127.73`, JuiceFS Cloud FUSE with writeback/cache enabled successfully completed `git clone` for all three target repos, but clone latency was much higher than the native `/tmp` baseline. The Go repo (`mem9-ai/drive9`) also completed build successfully on JuiceFS. The Python and TypeScript repos did not finish their build phase within the 30 minute timeout because dependency materialization inside the FUSE working tree was still in progress.
+## Executive Summary
 
-For `kimi-code`, the timeout happened during `pnpm install`; the observable package-add progress reached `394/665`, or `59.2%`, before the 30 minute limit. For `kimi-cli`, `uv sync` does not expose a numeric install denominator in the captured log; at timeout it had prepared the five local Python packages but had not returned from `uv sync`, and the subsequent `make build` command had not started. By top-level build-command completion, both `kimi-cli` and `kimi-code` were still at `0/2` commands complete when the 30 minute timeout fired.
+This benchmark compares native disk against JuiceFS Cloud FUSE on three real
+coding-agent-style repo workloads: cloning a fresh checkout and running each
+repo's build command. JuiceFS was mounted with writeback/cache enabled.
+
+All three repos completed `git clone` on JuiceFS, but clone latency was much
+higher than the native baseline. The Go repo (`mem9-ai/drive9`) also completed
+build successfully. The Python/Node repo (`MoonshotAI/kimi-cli`) and TypeScript
+repo (`MoonshotAI/kimi-code`) did not finish within the 30 minute build timeout.
+Both were still in dependency materialization; their actual total build time is
+therefore unknown and higher than the reported lower bound.
+
+| repo | clone ratio | build ratio | clone+build ratio | JuiceFS build status |
+| --- | ---: | ---: | ---: | --- |
+| `drive9` | 95.1x | 3.0x | 8.6x | completed |
+| `kimi-cli` | 110.4x | >41.6x | >45.7x | timed out during `uv sync` |
+| `kimi-code` | 198.6x | >74.0x | >81.7x | timed out during `pnpm install` |
+
+The comparison is not technically identical to the Drive9 coding-agent local
+overlay run. This JuiceFS run used normal JuiceFS cache/writeback behavior, and
+the repo working tree remained on the FUSE mount, including `.git`, dependency
+install directories, temporary trees, and generated outputs. Dependency package
+caches were prewarmed outside measured time, but install materialization still
+happened inside the JuiceFS working tree.
+
+These are single-run measurements. They are suitable for pass/fail validation
+and directional performance comparison, not for statistical claims or tight
+regression thresholds.
 
 ## Environment
 
 | item | value |
 | --- | --- |
-| Host | EC2 at `47.129.127.73` |
-| CPU / memory | 8 vCPU, 15 GiB RAM |
-| Native workspace | `/tmp/juicefs-bench/work/...` |
-| JuiceFS mountpoint | `/tmp/juicefs-bench/mount` |
-| JuiceFS Cloud volume | `qiffang` |
+| Host class | Linux EC2, 8 vCPU, 15 GiB RAM |
+| Native baseline | local `/tmp` workspace |
+| JuiceFS | JuiceFS Cloud FUSE |
 | JuiceFS version | `juicefs version 5.3.8 (2026-05-11 678ddf9)` |
-| Mount flags | `--writeback --cache-dir /tmp/juicefs-bench/cache/juicefs --cache-size 4096 --buffer-size 1024 -o allow_other,writeback_cache` |
+| Mount flags | `--writeback --cache-dir <BENCH_HOME/cache/juicefs> --cache-size 4096 --buffer-size 1024 -o allow_other,writeback_cache` |
+| Go | `go1.25.1 linux/amd64` |
+| Git | `2.53.0` |
 | Node | `v24.16.0` |
-| Corepack | `0.35.0` |
 | npm | `11.13.0` |
 | pnpm | `10.33.0` via Corepack |
-| Go | `go1.25.1 linux/amd64` |
-| uv | `uv 0.11.16` |
-| Python | `Python 3.14.4` |
+| corepack | `0.35.0` |
+| uv | `0.11.16` |
+| Python | `3.14.4` |
 
-Notes:
+## Methodology
 
-- The native baseline used `/tmp` on this host because the root disk had limited free space. On this EC2 image `/tmp` is tmpfs, so the native baseline is very fast.
-- I did not find a JuiceFS Cloud equivalent of Drive9's coding-agent path-local overlay. This run used JuiceFS' normal cache/writeback mechanisms. Dependency caches were stored under `/tmp/juicefs-bench/cache`, but the repo working tree and generated directories such as `.git`, `.venv`, and `node_modules` were on the JuiceFS FUSE mount.
-- Each phase had a 1800 second timeout. Dependency prewarm was run before measured phases and was not counted in clone/build timing.
+- Runs: `1` measured repeat per repo/storage.
+- Storages:
+  - native disk under a local `/tmp/juicefs-bench/work/...` workspace
+  - JuiceFS Cloud FUSE under `/tmp/juicefs-bench/mount/...`
+- Clone timing: `git clone --no-checkout <url> <dir>` followed by
+  `git checkout --detach <commit>`.
+- Build timing: repo-specific build commands inside the fresh checkout.
+- Not timed: dependency prewarm, JuiceFS mount/unmount, checkout cleanup, and
+  benchmark setup.
+- Timeout: clone, build, and prewarm were each capped at `1800s`.
+- Cache policy: shared package caches were stored under the benchmark cache
+  directory and prewarmed before measured phases.
+- Working-tree policy: `.git`, dependency install directories, temporary trees,
+  and generated outputs remained inside the JuiceFS FUSE working tree.
 
-## Method
+Note: the native baseline used `/tmp` because the host root disk had limited
+free space. On this image, `/tmp` is tmpfs, so the native baseline is especially
+fast.
 
-For each repo/storage pair, the runner executed:
+## Repo Matrix
 
-1. `git clone --no-checkout <repo> <checkout>`
-2. `git -C <checkout> checkout --detach <resolved-commit>`
-3. build commands inside the fresh checkout
+| repo | language | commit | build command |
+| --- | --- | --- | --- |
+| `mem9-ai/drive9` | Go | `a7f48a5bda2566137220d5a0915bc8db9517f2be` | `make build` |
+| `MoonshotAI/kimi-cli` | Python/Node | `33d7b4f8a012953e73ed625e45dcbea42048248d` | `uv sync --frozen --all-extras --all-packages && make build` |
+| `MoonshotAI/kimi-code` | TypeScript | `9d037168d34699f575f61b8f592af6ccb25eea79` | `corepack pnpm install --frozen-lockfile --store-dir "$PNPM_STORE_DIR" --package-import-method=copy && corepack pnpm run build` |
 
-Storage locations:
+## Timing Results
 
-| storage | path |
-| --- | --- |
-| native | `/tmp/juicefs-bench/work/<session>/native/<repo>-run-1` |
-| juicefs | `/tmp/juicefs-bench/mount/bench/<session>/<repo>-run-1` |
+| repo | storage | clone s | build s | clone+build s | status |
+| --- | --- | ---: | ---: | ---: | --- |
+| `drive9` | native | 1.180 | 18.341 | 19.521 | ok |
+| `drive9` | JuiceFS | 112.149 | 55.795 | 167.943 | ok |
+| `kimi-cli` | native | 2.732 | 43.264 | 45.996 | ok |
+| `kimi-cli` | JuiceFS | 301.523 | >1800.094 | >2101.617 | build timeout |
+| `kimi-code` | native | 1.580 | 24.308 | 25.888 | ok |
+| `kimi-code` | JuiceFS | 313.841 | >1800.126 | >2113.967 | build timeout |
 
-Resolved commits:
+## Build Progress At Timeout
 
-| repo | commit |
-| --- | --- |
-| `mem9-ai/drive9` | `a7f48a5bda2566137220d5a0915bc8db9517f2be` |
-| `MoonshotAI/kimi-cli` | `33d7b4f8a012953e73ed625e45dcbea42048248d` |
-| `MoonshotAI/kimi-code` | `9d037168d34699f575f61b8f592af6ccb25eea79` |
-
-## Results
-
-| repo | storage | clone | build | total clone+build | top-level build commands | build progress at 30 min |
-| --- | --- | ---: | ---: | ---: | ---: | --- |
-| `mem9-ai/drive9` | native | 1.18s | 18.34s | 19.52s | 1/1, 100% | `make build` completed |
-| `mem9-ai/drive9` | JuiceFS | 112.15s | 55.79s | 167.94s | 1/1, 100% | `make build` completed |
-| `MoonshotAI/kimi-cli` | native | 2.73s | 43.26s | 46.00s | 2/2, 100% | `uv sync` + `make build` completed |
-| `MoonshotAI/kimi-cli` | JuiceFS | 301.52s | timeout at 1800.09s | >2101.62s | 0/2, 0% | Numeric percentage unavailable from `uv`; `uv sync` prepared 5 local packages, did not return, `make build` did not start |
-| `MoonshotAI/kimi-code` | native | 1.58s | 24.31s | 25.89s | 2/2, 100% | `pnpm install` + `pnpm run build` completed |
-| `MoonshotAI/kimi-code` | JuiceFS | 313.84s | timeout at 1800.13s | >2113.97s | 0/2, 0% | `pnpm install` reached `394/665` packages, 59.2%; `pnpm run build` did not start |
-
-## Ratios
-
-| repo | metric | JuiceFS / native |
-| --- | --- | ---: |
-| `mem9-ai/drive9` | clone | 95.1x |
-| `mem9-ai/drive9` | build | 3.0x |
-| `mem9-ai/drive9` | clone+build | 8.6x |
-| `MoonshotAI/kimi-cli` | clone | 110.4x |
-| `MoonshotAI/kimi-cli` | build | >41.6x |
-| `MoonshotAI/kimi-cli` | clone+build | >45.7x |
-| `MoonshotAI/kimi-code` | clone | 198.6x |
-| `MoonshotAI/kimi-code` | build | >74.0x |
-| `MoonshotAI/kimi-code` | clone+build | >81.7x |
-
-## Build Progress Details
-
-| repo | JuiceFS build status after 30 min | last observable log marker |
+| repo | top-level build commands | last observable marker |
 | --- | --- | --- |
-| `mem9-ai/drive9` | Completed in 55.79s | `go build` produced `bin/drive9-server` and `bin/drive9` |
-| `MoonshotAI/kimi-cli` | Timed out during `uv sync` | `Prepared 5 packages in 1.26s`; no numeric install denominator was emitted before timeout |
-| `MoonshotAI/kimi-code` | Timed out during `pnpm install` | `Progress: resolved 665, reused 665, downloaded 0, added 394` |
+| `drive9` | `1/1` completed | `make build` produced `bin/drive9-server` and `bin/drive9` |
+| `kimi-cli` | `0/2` completed | `uv sync` prepared 5 local Python packages, did not return, and `make build` did not start |
+| `kimi-code` | `0/2` completed | `pnpm install` reached `394/665` packages added, or `59.2%`; `pnpm run build` did not start |
+
+## FUSE Overhead
+
+| repo | clone overhead s | build overhead s | clone+build overhead s |
+| --- | ---: | ---: | ---: |
+| `drive9` | 110.969 | 37.454 | 148.423 |
+| `kimi-cli` | 298.791 | >1756.830 | >2055.621 |
+| `kimi-code` | 312.261 | >1775.818 | >2088.079 |
+
+## Interpretation
+
+- JuiceFS writeback/cache was enough for the Go repo to complete, but clone was
+  still about `95x` slower than the local `/tmp` baseline.
+- Python and TypeScript builds were dominated by dependency tree materialization
+  inside the FUSE working tree. Both timed out before the actual build command
+  ran.
+- Because this run has no path-local overlay equivalent, it exercises a heavier
+  workload on FUSE than the Drive9 coding-agent profile, where `.git`,
+  dependencies, temporary paths, and generated outputs are routed to local disk.
+- The timeout rows should be read as lower bounds: the true JuiceFS build and
+  clone+build ratios for `kimi-cli` and `kimi-code` are higher than reported.
+
+## Validation
+
+| check | result |
+| --- | --- |
+| Clone status | all three JuiceFS clone phases completed successfully |
+| Build status | `drive9` completed; `kimi-cli` and `kimi-code` timed out after 30 minutes |
+| Failure mode | dependency materialization still in progress at timeout |
+| Artifact capture | events, manifests, and per-phase logs were copied locally |
 
 ## Artifacts
 
-Raw artifacts were copied back under ignored local result directories:
-
 | session | contents |
 | --- | --- |
-| `bench/results-ec2/ec2-20260526T070756Z-juicefs-cloud-writeback` | `drive9` and `kimi-cli` events/logs |
-| `bench/results-ec2/ec2-20260526T075415Z-juicefs-cloud-writeback-kimicode` | `kimi-code` events/logs/summary |
+| `ec2-20260526T070756Z-juicefs-cloud-writeback` | `drive9` and `kimi-cli` events/logs |
+| `ec2-20260526T075415Z-juicefs-cloud-writeback-kimicode` | `kimi-code` events/logs/summary |
 
-The key event files are:
+Local artifact copies:
 
-- `bench/results-ec2/ec2-20260526T070756Z-juicefs-cloud-writeback/events.jsonl`
-- `bench/results-ec2/ec2-20260526T075415Z-juicefs-cloud-writeback-kimicode/events.jsonl`
+- `bench/results-ec2/ec2-20260526T070756Z-juicefs-cloud-writeback/`
+- `bench/results-ec2/ec2-20260526T075415Z-juicefs-cloud-writeback-kimicode/`
