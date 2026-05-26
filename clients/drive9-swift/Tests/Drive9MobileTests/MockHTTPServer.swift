@@ -55,7 +55,12 @@ final class MockHTTPServer: @unchecked Sendable {
     }
 
     func start() throws {
-        let sock = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        #if canImport(Glibc)
+        let socketType = Int32(SOCK_STREAM.rawValue)
+        #else
+        let socketType = SOCK_STREAM
+        #endif
+        let sock = socket(AF_INET, socketType, 0)
         guard sock >= 0 else { throw POSIXError(.EIO) }
         var yes: Int32 = 1
         setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
