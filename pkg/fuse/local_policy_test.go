@@ -62,18 +62,25 @@ func TestLocalPolicyMatchesNestedSubpath(t *testing.T) {
 	}
 }
 
-func TestLocalPolicyDoesNotDefaultProjectOutputsToLocalOnly(t *testing.T) {
+func TestLocalPolicyDefaultsCodingAgentCacheSegmentsToLocalOnly(t *testing.T) {
 	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
 
 	for _, path := range []string{
+		"/repo/node_modules/pkg/index.js",
+		"/repo/.pnpm-store/v3/files/pkg",
 		"/repo/dist/app.js",
 		"/repo/build/output.bin",
-		"/repo/.venv/bin/python",
 		"/repo/target/debug/app",
-		"/repo/node_modules/pkg/index.js",
+		"/repo/web/.next/cache/webpack.bin",
+		"/repo/.pytest_cache/v/cache/nodeids",
+		"/repo/.mypy_cache/3.12/module.meta.json",
+		"/repo/.ruff_cache/content",
+		"/repo/pkg/__pycache__/mod.cpython-312.pyc",
+		"/repo/.gradle/caches/modules-2/files-2.1",
+		"/repo/.venv/bin/python",
 	} {
-		if got := policy.Classify(path); got != PathLayerRemotePersistent {
-			t.Fatalf("Classify(%q) = %s, want remote persistent default", path, got)
+		if got := policy.Classify(path); got != PathLayerLocalOnly {
+			t.Fatalf("Classify(%q) = %s, want local-only default", path, got)
 		}
 	}
 }
@@ -106,5 +113,12 @@ func TestLocalPolicyInvalidRuntimePathDoesNotMatchLocalOnly(t *testing.T) {
 	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
 	if got := policy.Classify(`repo\\.git\\config`); got != PathLayerRemotePersistent {
 		t.Fatalf("invalid backslash runtime path = %s, want remote persistent", got)
+	}
+}
+
+func TestLocalPolicyRuntimePathWhitespaceIsNotTrimmedIntoMatch(t *testing.T) {
+	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
+	if got := policy.Classify("/repo/.git "); got != PathLayerRemotePersistent {
+		t.Fatalf("runtime path with spaced .git segment = %s, want remote persistent", got)
 	}
 }

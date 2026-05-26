@@ -66,11 +66,18 @@ func defaultCodingAgentLocalOnlyPatterns(profile string) []string {
 		"**/.git/**",
 		"**/.hg/**",
 		"**/.svn/**",
+		"**/node_modules/**",
+		"**/.pnpm-store/**",
+		"**/target/**",
+		"**/dist/**",
+		"**/build/**",
+		"**/.next/cache/**",
+		"**/.gradle/**",
+		"**/.venv/**",
 		"**/__pycache__/**",
 		"**/.pytest_cache/**",
 		"**/.mypy_cache/**",
 		"**/.ruff_cache/**",
-		"**/.next/cache/**",
 	}
 }
 
@@ -148,7 +155,7 @@ func validateLocalPolicyPatterns(localOnlyPatterns []string, remoteOnlyPatterns 
 }
 
 func newLocalPolicyPattern(raw string) (localPolicyPattern, error) {
-	cleaned, err := canonicalPolicyPath(raw)
+	cleaned, err := canonicalPolicyPattern(raw)
 	if err != nil {
 		return localPolicyPattern{}, err
 	}
@@ -175,12 +182,12 @@ func newLocalPolicyPattern(raw string) (localPolicyPattern, error) {
 }
 
 func (pattern localPolicyPattern) matches(localPath string) bool {
-	cleaned, err := canonicalPolicyPath(localPath)
+	cleaned, err := canonicalRuntimePolicyPath(localPath)
 	if err != nil {
 		return false
 	}
 	if len(pattern.subpath) > 0 {
-		segments, err := splitPolicyPath(cleaned)
+		segments, err := splitRuntimePolicyPath(cleaned)
 		if err != nil {
 			return false
 		}
@@ -198,8 +205,16 @@ func (pattern localPolicyPattern) matches(localPath string) bool {
 	return false
 }
 
-func canonicalPolicyPath(value string) (string, error) {
+func canonicalPolicyPattern(value string) (string, error) {
 	value = strings.TrimSpace(value)
+	return canonicalPolicyPath(value)
+}
+
+func canonicalRuntimePolicyPath(value string) (string, error) {
+	return canonicalPolicyPath(value)
+}
+
+func canonicalPolicyPath(value string) (string, error) {
 	cleaned, err := pathutil.Canonicalize(value)
 	if err != nil {
 		return "", err
@@ -208,14 +223,26 @@ func canonicalPolicyPath(value string) (string, error) {
 }
 
 func splitPolicyPath(value string) ([]string, error) {
-	value, err := canonicalPolicyPath(value)
+	value, err := canonicalPolicyPattern(value)
 	if err != nil {
 		return nil, err
 	}
-	if value == "" || value == "." {
-		return nil, nil
+	return splitCanonicalPolicyPath(value), nil
+}
+
+func splitRuntimePolicyPath(value string) ([]string, error) {
+	value, err := canonicalRuntimePolicyPath(value)
+	if err != nil {
+		return nil, err
 	}
-	return strings.Split(value, "/"), nil
+	return splitCanonicalPolicyPath(value), nil
+}
+
+func splitCanonicalPolicyPath(value string) []string {
+	if value == "" || value == "." {
+		return nil
+	}
+	return strings.Split(value, "/")
 }
 
 func containsSubpath(segments []string, subpath []string) bool {
