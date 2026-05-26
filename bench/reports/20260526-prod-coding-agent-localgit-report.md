@@ -10,30 +10,22 @@ Drive9 CLI: self-built from the current `feat/bench` source snapshot, version
 `feat-bench-coding-agent`, git hash
 `5b9c505faf643ecffdc685a1e1aa114f513b226f`.
 
-## Summary
+## Conclusion
 
-All three target repos completed `git clone` and build on native disk and on
-Drive9 FUSE using PR #464's coding-agent local overlay feature.
+All three target repos completed `git clone` and build on both native disk and
+Drive9 FUSE with the coding-agent local overlay enabled.
 
-The important behavior change is that `.git` is no longer written through
-Drive9 FUSE. It is routed to the local overlay with `--profile=coding-agent
---local-root ...`, together with dependency install trees, caches, temporary
-directories, and generated output directories.
+The final setup routes `.git`, dependency install trees, caches, temporary
+directories, and generated output directories to native disk through Drive9's
+`--profile=coding-agent --local-root ...` mount policy. The remaining source
+tree is kept under the tested storage, so the result still measures native disk
+versus Drive9 FUSE for ordinary source-tree reads and metadata activity.
 
-Compared with the previous 2026-05-25 bind-mount workaround, FUSE clone time
-improved materially for all three repos:
+At one measured run per repo/storage, Drive9 FUSE remained slower than native
+disk, with clone ratios from `11.24x` to `42.29x` and build ratios from `3.07x`
+to `9.73x`. The full matrix succeeded without failed phase events.
 
-| repo | previous FUSE clone | coding-agent FUSE clone | change |
-| --- | ---: | ---: | ---: |
-| `drive9` | 62.066s | 18.453s | -70.3% |
-| `kimi-cli` | 103.539s | 44.786s | -56.7% |
-| `kimi-code` | 102.806s | 58.347s | -43.2% |
-
-These are single-run measurements. `drive9` and `kimi-code` commits changed
-because the benchmark resolves `main` at run time, so the comparison is
-directional rather than a strict A/B on identical source revisions.
-
-## Method
+## Test Method
 
 - Runs: `1` measured repeat per repo/storage.
 - Storages:
@@ -43,13 +35,28 @@ directional rather than a strict A/B on identical source revisions.
   `git checkout --detach <commit>`.
 - Build timing: repo-specific build commands inside the fresh checkout.
 - Not timed: dependency prewarm, `drive9 create`, FUSE mount/unmount, checkout
-  cleanup, and context setup.
+  cleanup, context setup, and local overlay setup.
 - FUSE flags: `--mode=fuse --allow-other --profile=coding-agent --local-root
   <BENCH_HOME/local-overlay/...> --durability=interactive --perf-counters`.
-- Prod Drive9 context: one fresh `drive9 create --server https://api.drive9.ai`
-  context per repo.
-- CLI source: self-built on EC2 with `make build-cli`; the runner used
-  `BENCH_DRIVE9_CLI=/mnt/drive9-bench/src/drive9-coding-agent-20260526T044200Z/bin/drive9`.
+- Drive9 context strategy: one fresh prod context per repo via
+  `drive9 create --server https://api.drive9.ai`.
+- CLI selection: `BENCH_DRIVE9_CLI` pointed to the self-built EC2 binary at
+  `/mnt/drive9-bench/src/drive9-coding-agent-20260526T044200Z/bin/drive9`.
+- Timeouts: clone, build, and prewarm were each capped at `1800s`.
+
+## Test Process
+
+1. Synced the current `feat/bench` source snapshot to the EC2 machine.
+2. Built the Drive9 CLI on EC2 with `make build-cli`.
+3. Activated prod configuration from `/home/ubuntu/.drive9/config_prod_bak_codex`.
+4. Resolved target commits for `drive9`, `kimi-cli`, and `kimi-code`.
+5. Prewarmed dependency caches outside measured timings.
+6. For each repo, created a fresh prod Drive9 context, ran native clone/build,
+   then ran Drive9 FUSE clone/build with coding-agent local overlay enabled.
+7. Captured raw events, per-phase logs, summary CSV/Markdown, manifest,
+   `.git` local overlay probes, and FUSE perf counters.
+8. Unmounted the FUSE mount after each FUSE sample and restored the previous
+   Drive9 config after the run.
 
 ## Local-Only Policy
 
@@ -63,14 +70,9 @@ Repo-specific additions:
 
 | repo | extra local-only paths |
 | --- | --- |
+| `drive9` | none beyond common policy |
 | `kimi-cli` | `src/kimi_cli/deps/{bin,tmp}`, `src/kimi_cli/{web,vis}`, `packages/kimi-code/README.md`, `src/kimi_cli/CHANGELOG.md` |
 | `kimi-code` | `packages/node-sdk/.tmp-api-extractor` |
-| `drive9` | none beyond common policy |
-
-The two `kimi-cli` metadata paths are symlinks in the target commit. An initial
-coding-agent run without them failed during `uv sync` because
-`packages/kimi-code/README.md -> ../../README.md` was not reliably readable
-through prod FUSE. Keeping those symlink entries local fixed the build.
 
 ## Final Results
 
@@ -93,22 +95,6 @@ Final session: `ec2-20260526T050107Z-prod-coding-agent-localgit-v2`
 | `kimi-cli` | 11.24x | 4.88x | 5.40x |
 | `kimi-code` | 42.29x | 9.73x | 11.54x |
 
-## Previous Run Comparison
-
-Previous report: `bench/reports/20260525-prod-three-repo-localdeps-output-report.md`
-
-| repo | previous FUSE build | coding-agent FUSE build | change |
-| --- | ---: | ---: | ---: |
-| `drive9` | 83.226s | 55.981s | -32.7% |
-| `kimi-cli` | 196.890s | 218.348s | +10.9% |
-| `kimi-code` | 334.084s | 229.152s | -31.4% |
-
-Clone improved for all three repos because `.git` writes moved to local disk.
-Build improved for `drive9` and `kimi-code`; `kimi-cli` build became slightly
-slower in this single run, likely because its `uv sync` and package build still
-scan a mix of remote source and local overlay metadata while also using the
-extra symlink local-only workaround.
-
 ## Verification Evidence
 
 - `.git` local overlay probe succeeded for all repos:
@@ -123,18 +109,13 @@ extra symlink local-only workaround.
   - `kimi-cli`: `local_only=1204940`, `remote_default=20393`
   - `kimi-code`: `local_only=540446`, `remote_default=39978`
 - Final run had no failed phase events.
+- FUSE cleanup was verified with
+  `findmnt /mnt/drive9-bench/mounts/prod-coding-agent-localgit-v2`, which
+  returned no mount.
 
 ## Artifacts
 
 - Final raw artifacts:
   `bench/results-ec2/ec2-20260526T050107Z-prod-coding-agent-localgit-v2/`
-- Initial failed coding-agent run before adding `kimi-cli` symlink metadata
-  local-only paths:
-  `bench/results-ec2/ec2-20260526T044427Z-prod-coding-agent-localgit/`
-
-## Cleanup
-
-FUSE mount cleanup was verified with
-`findmnt /mnt/drive9-bench/mounts/prod-coding-agent-localgit-v2`, which returned
-no mount. The EC2 Drive9 config was restored to its previous dev context after
-the prod run. The EC2 machine was left running for follow-up experiments.
+- Main result files in that directory:
+  `events.jsonl`, `manifest.json`, `summary.csv`, `summary.md`, and `logs/`.
