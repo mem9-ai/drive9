@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"os"
 	"sync"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 type FileHandle struct {
 	Ino               uint64
 	Path              string
+	Layer             PathLayer
+	LocalFile         *os.File
 	Flags             uint32          // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
 	OpenPID           uint32          // PID that opened the handle, when supplied by the kernel
 	Dirty             *WriteBuffer    // write buffer, nil for read-only opens

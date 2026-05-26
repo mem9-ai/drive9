@@ -26,6 +26,9 @@ func TestFusePerfCountersSummary(t *testing.T) {
 	perf.uploaderSubmit.add(1)
 	perf.sseChange.add(1)
 	perf.notifyEntry.add(1)
+	perf.recordLocalPolicy(policyMatchLocalOnly)
+	perf.recordLocalPolicy(policyMatchRemoteOverride)
+	perf.recordLocalPolicy(policyMatchRemoteDefault)
 
 	snap := perf.snapshot()
 	if got := snap.FuseOps["lookup"].count; got != 1 {
@@ -54,6 +57,7 @@ func TestFusePerfCountersSummary(t *testing.T) {
 		"perf commit enqueue=1",
 		"perf uploader submit=1",
 		"perf sse change=1",
+		"perf local_policy local_only=1 remote_override=1 remote_default=1",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("summary missing %q:\n%s", want, text)

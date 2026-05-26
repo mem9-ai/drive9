@@ -49,6 +49,9 @@ type mountFuseOptions struct {
 	SyncMode              fuseSyncMode
 	WritePolicy           fuseWritePolicy
 	Profile               string
+	LocalRoot             string
+	LocalOnlyPatterns     []string
+	RemoteOnlyPatterns    []string
 	UploadConcurrency     int
 	ReadConcurrency       int
 	SyncRead              bool
