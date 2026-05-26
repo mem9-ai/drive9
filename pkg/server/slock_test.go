@@ -239,3 +239,11 @@ func TestSlockSubjectKeyIsUnambiguous(t *testing.T) {
 		t.Fatalf("slockSubjectKey collision: %q", a)
 	}
 }
+
+func TestWantsJSONAcceptHeaderCaseInsensitive(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/auth/slock/callback", nil)
+	req.Header.Set("Accept", "Application/JSON")
+	if !wantsJSON(req) {
+		t.Fatal("wantsJSON = false, want true")
+	}
+}

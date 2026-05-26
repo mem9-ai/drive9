@@ -204,6 +204,7 @@ func (s *Store) DB() *sql.DB  { return s.db }
 const metaSchemaMigrateLockNamePrefix = "dat9_meta_schema_migrate:"
 const metaSchemaMigrateLockTimeoutSeconds = 30
 const externalBindingLockTimeoutSeconds = 30
+const externalBindingReleaseLockTimeout = 5 * time.Second
 
 func (s *Store) migrate() (err error) {
 	ctx := context.Background()
@@ -1100,7 +1101,7 @@ func (s *Store) WithExternalBindingLock(ctx context.Context, provider, subjectKe
 	defer func() { _ = conn.Close() }()
 
 	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, externalBindingLockTimeoutSeconds).Scan(&got); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(CONCAT(?, DATABASE()), ?)", lockName, externalBindingLockTimeoutSeconds).Scan(&got); err != nil {
 		return err
 	}
 	if !got.Valid {
@@ -1110,8 +1111,10 @@ func (s *Store) WithExternalBindingLock(ctx context.Context, provider, subjectKe
 		return fmt.Errorf("timed out waiting for external binding named lock")
 	}
 	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), externalBindingReleaseLockTimeout)
+		defer cancel()
 		var released sql.NullInt64
-		releaseErr := conn.QueryRowContext(context.Background(), "SELECT RELEASE_LOCK(?)", lockName).Scan(&released)
+		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(CONCAT(?, DATABASE()))", lockName).Scan(&released)
 		if releaseErr != nil {
 			err = errors.Join(err, releaseErr)
 			return
@@ -1130,7 +1133,7 @@ func (s *Store) WithExternalBindingLock(ctx context.Context, provider, subjectKe
 
 func externalBindingLockName(provider, subjectKey string) string {
 	sum := sha256.Sum256([]byte(provider + "\x00" + subjectKey))
-	return "d9_extbind:" + hex.EncodeToString(sum[:26])
+	return "d9_extbind:" + hex.EncodeToString(sum[:20])
 }
 
 func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *TenantWithAPIKey, err error) {

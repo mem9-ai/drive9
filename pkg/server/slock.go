@@ -261,7 +261,7 @@ func wantsJSON(r *http.Request) bool {
 	if strings.EqualFold(r.URL.Query().Get("format"), "json") {
 		return true
 	}
-	return strings.Contains(r.Header.Get("Accept"), "application/json")
+	return strings.Contains(strings.ToLower(r.Header.Get("Accept")), "application/json")
 }
 
 func writeSlockHTML(w http.ResponseWriter, resp *slockCallbackResponse) {
