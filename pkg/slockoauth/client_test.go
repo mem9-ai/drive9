@@ -79,7 +79,8 @@ func TestNewTrimsClientSecret(t *testing.T) {
 		t.Fatalf("ExchangeCode: %v", err)
 	}
 	if err := <-reqErr; err != nil {
-		t.Fatal(err)
+		t.Errorf("unexpected error: %v", err)
+		return
 	}
 }
 
@@ -112,7 +113,8 @@ func TestExchangeCodeSuccess(t *testing.T) {
 		t.Fatalf("ExchangeCode: %v", err)
 	}
 	if err := <-reqErr; err != nil {
-		t.Fatal(err)
+		t.Errorf("unexpected error: %v", err)
+		return
 	}
 	if tok.AccessToken != "tok" {
 		t.Fatalf("AccessToken = %q", tok.AccessToken)
@@ -167,7 +169,8 @@ func TestUserinfoSuccess(t *testing.T) {
 		t.Fatalf("Userinfo: %v", err)
 	}
 	if err := <-reqErr; err != nil {
-		t.Fatal(err)
+		t.Errorf("unexpected error: %v", err)
+		return
 	}
 	if info.Sub != "sub-1" || info.ServerID != "server-1" || info.Type != "agent" {
 		t.Fatalf("unexpected info: %+v", info)

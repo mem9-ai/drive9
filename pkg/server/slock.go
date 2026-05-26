@@ -267,6 +267,7 @@ func (s *Server) rotateIssuedOwnerAPIKey(ctx context.Context, tenantID, keyName 
 		return "", "", err
 	}
 	if err := s.meta.RevokeAPIKeysByIssuer(ctx, tenantID, source.Provider, source.SubjectKey, apiKeyID); err != nil {
+		_ = s.meta.RevokeAPIKey(ctx, tenantID, apiKeyID)
 		return "", "", err
 	}
 	return rawToken, apiKeyID, nil

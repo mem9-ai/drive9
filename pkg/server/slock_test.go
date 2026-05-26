@@ -377,20 +377,18 @@ func TestSlockHTMLDoesNotRenderAPIKey(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	var out slockCallbackResponse
-	jsonResp, err := http.Get(ts.URL + "/v1/auth/slock/callback?code=json&format=json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = jsonResp.Body.Close() }()
-	if err := json.NewDecoder(jsonResp.Body).Decode(&out); err != nil {
-		t.Fatal(err)
-	}
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(bodyBytes), out.APIKey) {
-		t.Fatal("html response should not render api key")
+	body := string(bodyBytes)
+	if strings.Contains(body, "<pre>") {
+		t.Fatal("html response should not render preformatted api key output")
+	}
+	if strings.Contains(strings.ToLower(body), "api_key") {
+		t.Fatal("html response should not render api_key field")
+	}
+	if strings.Contains(body, "eyJ") {
+		t.Fatal("html response should not render token-like content")
 	}
 }

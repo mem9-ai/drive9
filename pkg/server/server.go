@@ -343,7 +343,7 @@ func (s *Server) resumeProvisioningTenants() {
 			s.startForkProvision(ctx, t.ID)
 			continue
 		}
-		go s.resumeTenantSchemaInit(t)
+		s.startTenantSchemaInitResume(ctx, t)
 	}
 }
 
@@ -368,6 +368,18 @@ func (s *Server) resumeTenantSchemaInit(t meta.Tenant) {
 	}
 	dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
 	s.initTenantSchemaAsync(ctx, t.ID, dsn, t.Provider, s.provisioner.InitSchema)
+}
+
+func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant) {
+	s.startServerWorker(ctx, func(workerCtx context.Context) {
+		plain, err := s.pool.Decrypt(workerCtx, t.DBPasswordCipher)
+		if err != nil {
+			logger.Warn(workerCtx, "resume_schema_init_skipped", zap.String("tenant_id", t.ID), zap.Error(err))
+			return
+		}
+		dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
+		s.initTenantSchemaAsync(workerCtx, t.ID, dsn, t.Provider, s.provisioner.InitSchema)
+	})
 }
 
 func (s *Server) startPendingTenantReconciler() {
@@ -426,6 +438,27 @@ func isStalePendingTenant(now time.Time, t meta.Tenant) bool {
 
 func backgroundWithTrace(ctx context.Context) context.Context {
 	return contextWithTrace(context.Background(), ctx)
+}
+
+func (s *Server) startServerWorker(ctx context.Context, fn func(context.Context)) {
+	workerCtx := backgroundWithTrace(ctx)
+	if s.forkWorkerCtx != nil {
+		workerCtx = contextWithTrace(s.forkWorkerCtx, ctx)
+	}
+
+	s.forkWorkerMu.Lock()
+	if s.forkWorkerClosed {
+		s.forkWorkerMu.Unlock()
+		logger.Warn(workerCtx, "server_worker_start_after_close")
+		return
+	}
+	s.forkWorkerWG.Add(1)
+	s.forkWorkerMu.Unlock()
+
+	go func() {
+		defer s.forkWorkerWG.Done()
+		fn(workerCtx)
+	}()
 }
 
 func ensureTrace(ctx context.Context) context.Context {
@@ -3196,7 +3229,9 @@ func (s *Server) startProvisionedTenantSchemaInit(ctx context.Context, res *prov
 		return
 	}
 	// Tenant remains in provisioning state until schema initialization succeeds.
-	go s.initTenantSchemaAsync(backgroundWithTrace(ctx), res.TenantID, res.TenantDSN, res.Provider, s.provisioner.InitSchema)
+	s.startServerWorker(ctx, func(workerCtx context.Context) {
+		s.initTenantSchemaAsync(workerCtx, res.TenantID, res.TenantDSN, res.Provider, s.provisioner.InitSchema)
+	})
 }
 
 func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string, tokenVersion int, source apiKeyIssueSource) (rawToken, apiKeyID string, err error) {

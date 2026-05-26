@@ -528,7 +528,8 @@ func TestStartupKeepsFreshPendingTenant(t *testing.T) {
 	}
 
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBZero, cluster: &tenant.ClusterInfo{}}
-	_ = NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov, TokenSecret: []byte("abc")})
+	srv := NewWithConfig(Config{Meta: metaStore, Pool: pool, Provisioner: prov, TokenSecret: []byte("abc")})
+	t.Cleanup(srv.Close)
 
 	time.Sleep(100 * time.Millisecond)
 	row := metaStore.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", tenantID)
