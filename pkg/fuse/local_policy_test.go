@@ -53,7 +53,7 @@ func TestLocalPolicyDisabledForOrdinaryMount(t *testing.T) {
 }
 
 func TestLocalPolicyMatchesNestedSubpath(t *testing.T) {
-	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
+	policy := NewLocalPolicy(MountProfileCodingAgent, []string{"**/.next/cache/**"}, nil)
 	if got := policy.Classify("/repo/web/.next/cache/webpack.bin"); got != PathLayerLocalOnly {
 		t.Fatalf(".next/cache = %s, want local-only", got)
 	}
@@ -62,8 +62,17 @@ func TestLocalPolicyMatchesNestedSubpath(t *testing.T) {
 	}
 }
 
-func TestLocalPolicyDefaultsCodingAgentCacheSegmentsToLocalOnly(t *testing.T) {
+func TestLocalPolicyDefaultsOnlyVCSDatabaseSegmentsToLocalOnly(t *testing.T) {
 	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
+
+	for _, path := range []string{
+		"/repo/.hg/store/data",
+		"/repo/.svn/wc.db",
+	} {
+		if got := policy.Classify(path); got != PathLayerLocalOnly {
+			t.Errorf("Classify(%q) = %s, want local-only default", path, got)
+		}
+	}
 
 	for _, path := range []string{
 		"/repo/node_modules/pkg/index.js",
@@ -79,8 +88,8 @@ func TestLocalPolicyDefaultsCodingAgentCacheSegmentsToLocalOnly(t *testing.T) {
 		"/repo/.gradle/caches/modules-2/files-2.1",
 		"/repo/.venv/bin/python",
 	} {
-		if got := policy.Classify(path); got != PathLayerLocalOnly {
-			t.Errorf("Classify(%q) = %s, want local-only default", path, got)
+		if got := policy.Classify(path); got != PathLayerRemotePersistent {
+			t.Errorf("Classify(%q) = %s, want remote-persistent default", path, got)
 		}
 	}
 }

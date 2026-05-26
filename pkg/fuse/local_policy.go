@@ -66,18 +66,6 @@ func defaultCodingAgentLocalOnlyPatterns(profile string) []string {
 		"**/.git/**",
 		"**/.hg/**",
 		"**/.svn/**",
-		"**/node_modules/**",
-		"**/.pnpm-store/**",
-		"**/target/**",
-		"**/dist/**",
-		"**/build/**",
-		"**/.next/cache/**",
-		"**/.gradle/**",
-		"**/.venv/**",
-		"**/__pycache__/**",
-		"**/.pytest_cache/**",
-		"**/.mypy_cache/**",
-		"**/.ruff_cache/**",
 	}
 }
 

@@ -199,6 +199,7 @@ script is not a supported Windows validation path.
 Notes:
 - The script prechecks root `ls /` reachability before mount behavior checks.
 - Optional release-gate knobs add small-repo git clone/status/log checks,
+  coding-agent `--local-root` git clone/status/diff local-overlay checks,
   durable `drive9 umount --timeout` remount visibility checks, and mount-log audit.
 
 ### `posix-permission-smoke-test.sh`
@@ -216,8 +217,9 @@ Notes:
 
 1. Runs `fuse-smoke-test.sh` with `FUSE_STRICT_PREREQS=1`
 2. Enables small-repo git clone/status/log coverage
-3. Enables durable `umount --timeout` followed by remount visibility checks
-4. Enables mount-log audit and dumps mount logs on failure
+3. Enables coding-agent `--local-root` git clone/status/diff local-overlay coverage
+4. Enables durable `umount --timeout` followed by remount visibility checks
+5. Enables mount-log audit and dumps mount logs on failure
 
 ### `smoke-all.sh`
 
@@ -269,6 +271,7 @@ Notes:
 | `FUSE_STRICT_PREREQS` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 | `FUSE_UMOUNT_TIMEOUT` | `60s` | `fuse-smoke-test.sh` |
 | `RUN_FUSE_GIT_CLONE` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
+| `RUN_FUSE_CODING_AGENT_GIT_CLONE` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 | `FUSE_GIT_CLONE_URL` | `https://github.com/octocat/Hello-World.git` | `fuse-smoke-test.sh` |
 | `FUSE_GIT_CLONE_TIMEOUT_S` | `180` | `fuse-smoke-test.sh` |
 | `RUN_FUSE_UMOUNT_DURABLE` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |

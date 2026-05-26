@@ -23,6 +23,7 @@ CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
 FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-0}"
 FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
 RUN_FUSE_GIT_CLONE="${RUN_FUSE_GIT_CLONE:-0}"
+RUN_FUSE_CODING_AGENT_GIT_CLONE="${RUN_FUSE_CODING_AGENT_GIT_CLONE:-0}"
 RUN_FUSE_UMOUNT_DURABLE="${RUN_FUSE_UMOUNT_DURABLE:-0}"
 RUN_FUSE_LOG_AUDIT="${RUN_FUSE_LOG_AUDIT:-0}"
 FUSE_GIT_CLONE_URL="${FUSE_GIT_CLONE_URL:-https://github.com/octocat/Hello-World.git}"
@@ -527,6 +528,7 @@ echo "BASE=$BASE"
 echo "CLI_SOURCE=$CLI_SOURCE"
 echo "FUSE_STRICT_PREREQS=$FUSE_STRICT_PREREQS"
 echo "RUN_FUSE_GIT_CLONE=$RUN_FUSE_GIT_CLONE"
+echo "RUN_FUSE_CODING_AGENT_GIT_CLONE=$RUN_FUSE_CODING_AGENT_GIT_CLONE"
 echo "FUSE_GIT_CLONE_TIMEOUT_S=$FUSE_GIT_CLONE_TIMEOUT_S"
 echo "RUN_FUSE_UMOUNT_DURABLE=$RUN_FUSE_UMOUNT_DURABLE"
 echo "RUN_FUSE_LOG_AUDIT=$RUN_FUSE_LOG_AUDIT"
@@ -545,6 +547,12 @@ if [ "$FUSE_STRICT_PREREQS" = "1" ] && [ "$RUN_FUSE_GIT_CLONE" = "1" ]; then
     skip_or_fail "timeout is required for strict FUSE git clone timeout"
   fi
   check_eq "timeout is available" "true" "true"
+fi
+if [ "$FUSE_STRICT_PREREQS" = "1" ] && [ "$RUN_FUSE_CODING_AGENT_GIT_CLONE" = "1" ]; then
+  if ! command -v timeout >/dev/null 2>&1; then
+    skip_or_fail "timeout is required for strict coding-agent FUSE git clone timeout"
+  fi
+  check_eq "timeout is available for coding-agent git clone" "true" "true"
 fi
 
 if [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
@@ -629,6 +637,9 @@ ROOT_REMOTE="/${ROOT_REL}"
 ROOT_MOUNT="$FUSE_MOUNT_ROOT/drive9-fuse-smoke-${TS}"
 MOUNT_POINT="$ROOT_MOUNT"
 MOUNT_LOG="$FUSE_MOUNT_ROOT/drive9-fuse-smoke-${TS}.log"
+CODING_AGENT_MOUNT_POINT="$FUSE_MOUNT_ROOT/drive9-fuse-coding-agent-${TS}"
+CODING_AGENT_MOUNT_LOG="$FUSE_MOUNT_ROOT/drive9-fuse-coding-agent-${TS}.log"
+CODING_AGENT_LOCAL_ROOT="$FUSE_MOUNT_ROOT/drive9-fuse-coding-agent-local-${TS}"
 SEED_LOCAL="$FUSE_MOUNT_ROOT/drive9-fuse-seed-${TS}.txt"
 LARGE_DOWNLOADED="$FUSE_MOUNT_ROOT/drive9-fuse-large-down-${TS}.bin"
 
@@ -676,6 +687,10 @@ GIT_PROBE_MOUNT="$MOUNT_POINT/$GIT_PROBE_REL"
 GIT_PROBE_ORIGIN="https://github.com/mem9-ai/drive9.git"
 GIT_CLONE_REL="${ROOT_REL}/hello-world"
 GIT_CLONE_MOUNT="$MOUNT_POINT/$GIT_CLONE_REL"
+CODING_AGENT_GIT_CLONE_REL="${ROOT_REL}/coding-agent-hello-world"
+CODING_AGENT_GIT_CLONE_MOUNT="$CODING_AGENT_MOUNT_POINT/$CODING_AGENT_GIT_CLONE_REL"
+CODING_AGENT_GIT_CLONE_REMOTE="/${CODING_AGENT_GIT_CLONE_REL}"
+CODING_AGENT_GIT_CLONE_LOCAL_OVERLAY="$CODING_AGENT_LOCAL_ROOT/overlay/$CODING_AGENT_GIT_CLONE_REL"
 DURABLE_REL="${ROOT_REL}/umount-durable.txt"
 DURABLE_REMOTE="/${DURABLE_REL}"
 DURABLE_MOUNT="$MOUNT_POINT/$DURABLE_REL"
@@ -686,6 +701,7 @@ RO_WRITE_MOUNT="$MOUNT_POINT/${ROOT_REL}/ro-write.txt"
 
 mkdir -p "$MOUNT_POINT"
 : >"$MOUNT_LOG"
+: >"$CODING_AGENT_MOUNT_LOG"
 printf "seed-%s" "$TS" > "$SEED_LOCAL"
 
 MOUNT_PID=""
@@ -693,6 +709,7 @@ cleanup() {
   stop_mount
   rm -f "$SEED_LOCAL" "$LARGE_DOWNLOADED" "$CLI_BIN"
   rm -rf "${MOUNT_POINT:?}" || true
+  rm -rf "${CODING_AGENT_MOUNT_POINT:?}" "$CODING_AGENT_LOCAL_ROOT" || true
 }
 on_exit() {
   local rc=$?
@@ -903,6 +920,54 @@ PY
       check_cmd "git log reads latest commit" git -C "$GIT_CLONE_MOUNT" log --oneline -1
       check_cmd "git clone directory visible via remote list" wait_remote_ls_has_name "$ROOT_REMOTE" "hello-world"
       check_cmd "git config lockfile absent after clone" test ! -e "$GIT_CLONE_MOUNT/.git/config.lock"
+    fi
+  fi
+
+  if [ "$RUN_FUSE_CODING_AGENT_GIT_CLONE" = "1" ]; then
+    echo "[8.3] coding-agent local-overlay git clone"
+    stop_mount
+    mkdir -p "$CODING_AGENT_MOUNT_POINT" "$CODING_AGENT_LOCAL_ROOT"
+    MOUNT_POINT="$CODING_AGENT_MOUNT_POINT"
+    MOUNT_LOG="$CODING_AGENT_MOUNT_LOG"
+    drive9 mount --profile coding-agent --local-root "$CODING_AGENT_LOCAL_ROOT" "$CODING_AGENT_MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+    MOUNT_PID="$!"
+    if wait_mount_state mounted; then
+      check_eq "coding-agent mount point is mounted" "true" "true"
+    else
+      check_eq "coding-agent mount point is mounted" "false" "true"
+    fi
+
+    if is_mounted "$CODING_AGENT_MOUNT_POINT"; then
+      rm -rf "$CODING_AGENT_GIT_CLONE_MOUNT"
+      git_clone_ok=true
+      date -u '+coding-agent git clone start: %Y-%m-%dT%H:%M:%SZ'
+      if command -v timeout >/dev/null 2>&1; then
+        if ! GIT_PROGRESS_DELAY=0 timeout "$FUSE_GIT_CLONE_TIMEOUT_S" git clone --progress --depth 1 "$FUSE_GIT_CLONE_URL" "$CODING_AGENT_GIT_CLONE_MOUNT"; then
+          git_clone_ok=false
+        fi
+      elif ! GIT_PROGRESS_DELAY=0 git clone --progress --depth 1 "$FUSE_GIT_CLONE_URL" "$CODING_AGENT_GIT_CLONE_MOUNT"; then
+        git_clone_ok=false
+      fi
+      date -u '+coding-agent git clone done:  %Y-%m-%dT%H:%M:%SZ'
+      check_eq "coding-agent git clone succeeds" "$git_clone_ok" "true"
+      if [ "$git_clone_ok" = "true" ]; then
+        git_status=$(git -C "$CODING_AGENT_GIT_CLONE_MOUNT" status --short)
+        check_eq "coding-agent git status clean after clone" "$git_status" ""
+        printf "\n# drive9 smoke %s\n" "$TS" >>"$CODING_AGENT_GIT_CLONE_MOUNT/README"
+        git_diff=$(git -C "$CODING_AGENT_GIT_CLONE_MOUNT" diff -- README)
+        check_cmd "coding-agent git diff sees source edit" bash -c 'test -n "$1"' _ "$git_diff"
+        check_cmd "coding-agent .git objects stored in local-root" test -d "$CODING_AGENT_GIT_CLONE_LOCAL_OVERLAY/.git/objects"
+        check_cmd "coding-agent source is visible remotely" wait_remote_ls_has_name "$CODING_AGENT_GIT_CLONE_REMOTE" "README"
+        check_cmd "coding-agent .git is absent from remote listing" wait_remote_ls_missing_name "$CODING_AGENT_GIT_CLONE_REMOTE" ".git"
+      fi
+    fi
+    stop_mount
+    MOUNT_POINT="$ROOT_MOUNT"
+    MOUNT_LOG="$FUSE_MOUNT_ROOT/drive9-fuse-smoke-${TS}.log"
+    if start_mount rw; then
+      check_eq "rw mount restored after coding-agent git gate" "true" "true"
+    else
+      check_eq "rw mount restored after coding-agent git gate" "false" "true"
     fi
   fi
 

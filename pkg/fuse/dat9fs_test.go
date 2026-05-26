@@ -3360,6 +3360,32 @@ func TestCodingAgentLocalOverlayReadDirMergesRemoteAndLocalEntries(t *testing.T)
 	}
 }
 
+func TestCodingAgentLocalOverlayReadDirFiltersRemoteLocalOnlyEntries(t *testing.T) {
+	localRoot := t.TempDir()
+	opts := &MountOptions{
+		Profile:   MountProfileCodingAgent,
+		LocalRoot: localRoot,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	remote := []DirEntry{
+		{Name: ".git", Ino: 99, Mode: uint32(syscall.S_IFDIR) | 0o755},
+		{Name: "README.md", Ino: 100, Mode: uint32(syscall.S_IFREG) | 0o644},
+	}
+	entries, err := fs.mergeLocalDirEntries("/repo", remote)
+	if err != nil {
+		t.Fatalf("mergeLocalDirEntries: %v", err)
+	}
+
+	if len(entries) != 1 {
+		t.Fatalf("entry count = %d, want 1: %#v", len(entries), entries)
+	}
+	if entries[0].Name != "README.md" {
+		t.Fatalf("entry = %#v, want only remote README.md", entries[0])
+	}
+}
+
 func TestMountOptionsSyncReadDefaultsToAsyncReads(t *testing.T) {
 	defaults := &MountOptions{}
 	defaults.setDefaults()

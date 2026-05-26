@@ -3712,6 +3712,7 @@ func (fs *Dat9FS) mergeLocalDirEntries(dirPath string, entries []DirEntry) ([]Di
 	if fs.localOverlay == nil {
 		return entries, nil
 	}
+	entries = fs.filterRemoteLocalOnlyDirEntries(dirPath, entries)
 	items, err := fs.localOverlay.ReadDir(dirPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -3739,6 +3740,21 @@ func (fs *Dat9FS) mergeLocalDirEntries(dirPath string, entries []DirEntry) ([]Di
 		return entries[i].Name < entries[j].Name
 	})
 	return entries, nil
+}
+
+func (fs *Dat9FS) filterRemoteLocalOnlyDirEntries(dirPath string, entries []DirEntry) []DirEntry {
+	if len(entries) == 0 || fs.localPolicy == nil || !fs.localPolicy.Enabled() {
+		return entries
+	}
+	filtered := entries[:0]
+	for _, entry := range entries {
+		childPath := dirEntryChildPath(dirPath, entry.Name)
+		if fs.localPolicy.Classify(childPath) == PathLayerLocalOnly {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
 }
 
 func (fs *Dat9FS) localOverlayDirEntries(dirPath string, items []localOverlayEntry) []DirEntry {
