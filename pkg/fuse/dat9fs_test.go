@@ -435,6 +435,47 @@ func TestOpenWritableLargeFileLazyPreload(t *testing.T) {
 	}
 }
 
+func TestWriteAppendUsesRemoteHandleEndOffset(t *testing.T) {
+	fs, ino, cleanup := newTestDat9FS(t, int64(len("hello")), func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "hello")
+	})
+	defer cleanup()
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_APPEND),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Offset:   0,
+	}, []byte("!")); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("expected file handle to exist")
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if got, want := fh.Dirty.Size(), int64(len("hello!")); got != want {
+		t.Fatalf("dirty size = %d, want %d", got, want)
+	}
+	buf := make([]byte, fh.Dirty.Size())
+	if n := fh.Dirty.ReadAt(0, buf); n != len(buf) {
+		t.Fatalf("dirty read bytes = %d, want %d", n, len(buf))
+	}
+	if got, want := string(buf), "hello!"; got != want {
+		t.Fatalf("dirty content = %q, want %q", got, want)
+	}
+}
+
 func TestOpenWritableSmallFileUsesReadCacheFastPath(t *testing.T) {
 	var headCalls atomic.Int32
 	var getCalls atomic.Int32

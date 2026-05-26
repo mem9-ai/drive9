@@ -450,6 +450,49 @@ PY
   done
 }
 
+wait_remote_cat_contains() {
+  local path="$1"
+  local needle="$2"
+  local deadline
+  local out rc
+  deadline=$(python3 - "$REMOTE_VISIBILITY_TIMEOUT_S" <<'PY'
+import sys
+import time
+print(time.time() + float(sys.argv[1]))
+PY
+)
+
+  while :; do
+    set +e
+    out=$(drive9 fs cat "$path" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      if [[ "$out" == *"$needle"* ]]; then
+        printf '%s' "$out"
+        return 0
+      fi
+    elif [[ "$out" != *"not found"* && "$out" != *"Too Many Requests"* && "$out" != *"HTTP 429"* && "$out" != *"HTTP 403"* && "$out" != *"403 Forbidden"* ]]; then
+      printf '%s\n' "$out" >&2
+      return 1
+    fi
+
+    if python3 - "$deadline" <<'PY'
+import sys
+import time
+raise SystemExit(0 if time.time() >= float(sys.argv[1]) else 1)
+PY
+    then
+      if [ "$rc" -eq 0 ]; then
+        printf '%s\n' "$out" >&2
+      fi
+      return 1
+    fi
+
+    sleep "$REMOTE_VISIBILITY_INTERVAL_S"
+  done
+}
+
 start_mount() {
   local mode="$1"
   {
@@ -927,6 +970,8 @@ PY
     echo "[8.3] coding-agent local-overlay git clone"
     stop_mount
     mkdir -p "$CODING_AGENT_MOUNT_POINT" "$CODING_AGENT_LOCAL_ROOT"
+    git_clone_ok=false
+    coding_agent_edit_marker="# drive9 smoke ${TS}"
     MOUNT_POINT="$CODING_AGENT_MOUNT_POINT"
     MOUNT_LOG="$CODING_AGENT_MOUNT_LOG"
     drive9 mount --profile coding-agent --local-root "$CODING_AGENT_LOCAL_ROOT" "$CODING_AGENT_MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
@@ -953,15 +998,38 @@ PY
       if [ "$git_clone_ok" = "true" ]; then
         git_status=$(git -C "$CODING_AGENT_GIT_CLONE_MOUNT" status --short)
         check_eq "coding-agent git status clean after clone" "$git_status" ""
-        printf "\n# drive9 smoke %s\n" "$TS" >>"$CODING_AGENT_GIT_CLONE_MOUNT/README"
+        printf "\n%s\n" "$coding_agent_edit_marker" >>"$CODING_AGENT_GIT_CLONE_MOUNT/README"
         git_diff=$(git -C "$CODING_AGENT_GIT_CLONE_MOUNT" diff -- README)
         check_cmd "coding-agent git diff sees source edit" bash -c 'test -n "$1"' _ "$git_diff"
+        check_cmd "coding-agent git diff includes source edit" bash -c 'printf "%s" "$1" | grep -F "$2" >/dev/null' _ "$git_diff" "$coding_agent_edit_marker"
         check_cmd "coding-agent .git objects stored in local-root" test -d "$CODING_AGENT_GIT_CLONE_LOCAL_OVERLAY/.git/objects"
         check_cmd "coding-agent source is visible remotely" wait_remote_ls_has_name "$CODING_AGENT_GIT_CLONE_REMOTE" "README"
+        check_cmd "coding-agent source edit is visible remotely" wait_remote_cat_contains "$CODING_AGENT_GIT_CLONE_REMOTE/README" "$coding_agent_edit_marker"
         check_cmd "coding-agent .git is absent from remote listing" wait_remote_ls_missing_name "$CODING_AGENT_GIT_CLONE_REMOTE" ".git"
       fi
     fi
     stop_mount
+    if [ "$git_clone_ok" = "true" ]; then
+      MOUNT_POINT="$CODING_AGENT_MOUNT_POINT"
+      MOUNT_LOG="$CODING_AGENT_MOUNT_LOG"
+      drive9 mount --profile coding-agent --local-root "$CODING_AGENT_LOCAL_ROOT" "$CODING_AGENT_MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+      MOUNT_PID="$!"
+      if wait_mount_state mounted; then
+        check_eq "coding-agent remount with same local-root succeeds" "true" "true"
+      else
+        check_eq "coding-agent remount with same local-root succeeds" "false" "true"
+      fi
+      if is_mounted "$CODING_AGENT_MOUNT_POINT"; then
+        check_cmd "coding-agent .git survives remount via local-root" test -d "$CODING_AGENT_GIT_CLONE_LOCAL_OVERLAY/.git/objects"
+        check_cmd "coding-agent git log works after remount" git -C "$CODING_AGENT_GIT_CLONE_MOUNT" log --oneline -1
+        remount_status=$(git -C "$CODING_AGENT_GIT_CLONE_MOUNT" status --short)
+        check_cmd "coding-agent git status sees source edit after remount" bash -c 'printf "%s" "$1" | grep -F "README" >/dev/null' _ "$remount_status"
+        check_cmd "coding-agent source edit visible after remount" grep -F "$coding_agent_edit_marker" "$CODING_AGENT_GIT_CLONE_MOUNT/README"
+        remount_diff=$(git -C "$CODING_AGENT_GIT_CLONE_MOUNT" diff -- README)
+        check_cmd "coding-agent git diff survives remount" bash -c 'test -n "$1"' _ "$remount_diff"
+      fi
+      stop_mount
+    fi
     MOUNT_POINT="$ROOT_MOUNT"
     MOUNT_LOG="$FUSE_MOUNT_ROOT/drive9-fuse-smoke-${TS}.log"
     if start_mount rw; then

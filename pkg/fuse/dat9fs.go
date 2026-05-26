@@ -4597,6 +4597,10 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		source = "new-dirty-buffer"
 		fh.Dirty = fs.newWriteBuffer(fh.Path, 0, 0)
 	}
+	writeOffset := int64(input.Offset)
+	if fh.Flags&uint32(syscall.O_APPEND) != 0 {
+		writeOffset = fh.Dirty.Size()
+	}
 	writeSyncSnapshot := (*writeBufferSnapshot)(nil)
 	if fh.WritePolicy == WritePolicyWriteSync {
 		writeSyncSnapshot = fh.Dirty.snapshot()
@@ -4612,18 +4616,18 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			return 0, gofuse.Status(syscall.ENOSPC)
 		}
 		shadowStart := time.Now()
-		if _, err := fs.shadowStore.WriteAt(fh.Path, int64(input.Offset), data, fh.BaseRev); err != nil {
+		if _, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev); err != nil {
 			log.Printf("shadow write failed for ShadowSpill %s: %v", fh.Path, err)
 			source = "shadow-spill-error"
 			return 0, gofuse.EIO
 		}
 		if fs.debugEnabled() && time.Since(shadowStart) >= fuseDebugSlowOpThreshold {
-			fs.debugf("write shadow-spill done path=%s off=%d size=%d dur=%s", fh.Path, input.Offset, len(data), time.Since(shadowStart))
+			fs.debugf("write shadow-spill done path=%s off=%d size=%d dur=%s", fh.Path, writeOffset, len(data), time.Since(shadowStart))
 		}
 		source = "shadow-spill"
 	}
 
-	n, err := fh.Dirty.Write(int64(input.Offset), data)
+	n, err := fh.Dirty.Write(writeOffset, data)
 	if err != nil {
 		source = "dirty-write-error"
 		return 0, gofuse.Status(syscall.EFBIG)
@@ -4633,7 +4637,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	// Non-ShadowSpill: write-through to shadow after Dirty (best-effort).
 	if !fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil {
 		shadowStart := time.Now()
-		if _, err := fs.shadowStore.WriteAt(fh.Path, int64(input.Offset), data, fh.BaseRev); err != nil {
+		if _, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev); err != nil {
 			log.Printf("shadow write-through failed for %s: %v", fh.Path, err)
 			fs.shadowStore.Remove(fh.Path)
 			fh.ShadowReady = false
@@ -4642,7 +4646,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			source = "shadow-through"
 		}
 		if fs.debugEnabled() && time.Since(shadowStart) >= fuseDebugSlowOpThreshold {
-			fs.debugf("write shadow-through done path=%s off=%d size=%d dur=%s", fh.Path, input.Offset, len(data), time.Since(shadowStart))
+			fs.debugf("write shadow-through done path=%s off=%d size=%d dur=%s", fh.Path, writeOffset, len(data), time.Since(shadowStart))
 		}
 	}
 	if source == "start" || source == "new-dirty-buffer" {
@@ -4650,6 +4654,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
 	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
+	fs.inodes.UpdateMtime(fh.Ino, time.Now())
 	if fh.WritePolicy == WritePolicyWriteSync {
 		size := fh.Dirty.Size()
 		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
