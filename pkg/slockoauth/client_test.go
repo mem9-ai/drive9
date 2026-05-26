@@ -2,6 +2,7 @@ package slockoauth
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -47,6 +48,31 @@ func TestLoginURL(t *testing.T) {
 	}
 	if !strings.Contains(got, "return_to=https%3A%2F%2Fdrive9.example.com%2Fv1%2Fauth%2Fslock%2Fcallback") {
 		t.Fatalf("LoginURL missing callback: %q", got)
+	}
+}
+
+func TestNewTrimsClientSecret(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		want := "Basic " + base64.StdEncoding.EncodeToString([]byte("drive9:secret"))
+		if r.Header.Get("Authorization") != want {
+			t.Fatalf("Authorization = %q, want %q", r.Header.Get("Authorization"), want)
+		}
+		_, _ = w.Write([]byte(`{"access_token":"tok"}`))
+	}))
+	t.Cleanup(srv.Close)
+	c, err := New(Config{
+		Origin:       "https://app.slock.ai",
+		APIOrigin:    srv.URL,
+		ClientID:     "drive9",
+		ClientSecret: " secret ",
+		PublicURL:    "https://drive9.example.com",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, err := c.ExchangeCode(context.Background(), "abc"); err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
 	}
 }
 

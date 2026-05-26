@@ -18,6 +18,18 @@ import (
 
 const slockProvider = "slock"
 
+var slockHTMLTemplate = template.Must(template.New("slock").Parse(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Drive9 Slock Login</title></head>
+<body>
+<h1>Drive9 tenant ready</h1>
+<p>Tenant: <code>{{.TenantID}}</code></p>
+<p>Status: <code>{{.Status}}</code></p>
+<p>API key:</p>
+<pre>{{.APIKey}}</pre>
+</body>
+</html>`))
+
 type slockPrincipal struct {
 	Provider string `json:"provider"`
 	Type     string `json:"type"`
@@ -91,6 +103,7 @@ func (s *Server) handleSlockCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if wantsJSON(r) {
+		setSlockCallbackNoStoreHeaders(w)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 		return
@@ -237,19 +250,14 @@ func wantsJSON(r *http.Request) bool {
 }
 
 func writeSlockHTML(w http.ResponseWriter, resp *slockCallbackResponse) {
+	setSlockCallbackNoStoreHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	tmpl := template.Must(template.New("slock").Parse(`<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Drive9 Slock Login</title></head>
-<body>
-<h1>Drive9 tenant ready</h1>
-<p>Tenant: <code>{{.TenantID}}</code></p>
-<p>Status: <code>{{.Status}}</code></p>
-<p>API key:</p>
-<pre>{{.APIKey}}</pre>
-</body>
-</html>`))
-	if err := tmpl.Execute(w, resp); err != nil {
+	if err := slockHTMLTemplate.Execute(w, resp); err != nil {
 		logger.Warn(context.Background(), "slock_html_render_failed", zap.Error(err))
 	}
+}
+
+func setSlockCallbackNoStoreHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 }

@@ -3,6 +3,7 @@
 package slockoauth
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -64,6 +65,7 @@ func New(cfg Config) (*Client, error) {
 	cfg.APIOrigin = strings.TrimRight(strings.TrimSpace(cfg.APIOrigin), "/")
 	cfg.PublicURL = strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/")
 	cfg.ClientID = strings.TrimSpace(cfg.ClientID)
+	cfg.ClientSecret = strings.TrimSpace(cfg.ClientSecret)
 	return &Client{cfg: cfg, http: httpClient}, nil
 }
 
@@ -122,11 +124,14 @@ func (c *Client) ExchangeCode(ctx context.Context, code string) (Token, error) {
 	if code == "" {
 		return Token{}, errors.New("slockoauth: code is required")
 	}
-	rawBody, _ := json.Marshal(map[string]string{
+	rawBody, err := json.Marshal(map[string]string{
 		"grant_type": "authorization_code",
 		"code":       code,
 	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.APIOrigin+"/api/oauth/token", strings.NewReader(string(rawBody)))
+	if err != nil {
+		return Token{}, fmt.Errorf("slockoauth: encode token request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.APIOrigin+"/api/oauth/token", bytes.NewReader(rawBody))
 	if err != nil {
 		return Token{}, fmt.Errorf("slockoauth: build token request: %w", err)
 	}

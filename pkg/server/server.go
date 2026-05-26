@@ -3013,11 +3013,11 @@ func newProvisionTenantError(status int, message string, err error) *provisionTe
 }
 
 func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOptions) (*provisionTenantResult, error) {
-	provider := s.provisioner.ProviderType()
-	provider, err := tenant.NormalizeProvider(provider)
+	rawProvider := s.provisioner.ProviderType()
+	provider, err := tenant.NormalizeProvider(rawProvider)
 	if err != nil {
-		logger.Warn(ctx, "server_event", eventFields(ctx, "provision_provider_invalid", "provider", provider, "error", err)...)
-		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		logger.Warn(ctx, "server_event", eventFields(ctx, "provision_provider_invalid", "provider", rawProvider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", rawProvider, "result", "error")
 		return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
 	}
 	tenantID := token.NewID()
