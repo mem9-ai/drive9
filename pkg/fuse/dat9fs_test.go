@@ -3360,6 +3360,115 @@ func TestCodingAgentLocalOverlayReadDirMergesRemoteAndLocalEntries(t *testing.T)
 	}
 }
 
+func TestCodingAgentLocalOverlayReadDirHidesRemoteLocalOnlyEntryWithoutOverlay(t *testing.T) {
+	localRoot := t.TempDir()
+	opts := &MountOptions{
+		Profile:   MountProfileCodingAgent,
+		LocalRoot: localRoot,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	remote := []DirEntry{
+		{Name: ".git", Ino: 99, Mode: uint32(syscall.S_IFDIR) | 0o755, IsDir: true},
+		{Name: "README.md", Ino: 100, Mode: uint32(syscall.S_IFREG) | 0o644},
+	}
+	entries, err := fs.mergeLocalDirEntries("/repo", remote)
+	if err != nil {
+		t.Fatalf("mergeLocalDirEntries: %v", err)
+	}
+
+	if len(entries) != 1 || entries[0].Name != "README.md" {
+		t.Fatalf("entries = %#v, want only README.md", entries)
+	}
+}
+
+func TestCodingAgentLocalOverlayRemoteOnlyOverrideTraversesAbsentLocalParent(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/repo/node_modules":
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/repo/node_modules" && r.URL.Query().Get("list") == "1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []map[string]any{
+					{"name": "keep", "isDir": true},
+					{"name": "pkg", "isDir": true},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
+			var req struct {
+				Paths []string `json:"paths"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode batch request: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"results": []map[string]any{
+					{"path": "/repo/node_modules/keep", "status": 200, "isDir": true, "revision": 8},
+					{"path": "/repo/node_modules/pkg", "status": 200, "isDir": true, "revision": 9},
+				},
+			})
+		default:
+			t.Fatalf("unexpected request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{
+		Profile:            MountProfileCodingAgent,
+		LocalRoot:          t.TempDir(),
+		LocalOnlyPatterns:  []string{"**/node_modules/**"},
+		RemoteOnlyPatterns: []string{"**/node_modules/keep/**"},
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var out gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "node_modules", &out); st != gofuse.OK {
+		t.Fatalf("Lookup node_modules: %v", st)
+	}
+	entry, ok := fs.inodes.GetEntry(out.NodeId)
+	if !ok || !entry.IsDir {
+		t.Fatalf("lookup entry = %#v, ok=%t; want remote directory", entry, ok)
+	}
+
+	entries, err := fs.listDir(context.Background(), "/repo/node_modules")
+	if err != nil {
+		t.Fatalf("listDir node_modules: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "keep" {
+		t.Fatalf("entries = %#v, want only remote-only keep", entries)
+	}
+}
+
+func TestCodingAgentLocalOverlayRenameWithRemoteOnlyDescendantReturnsEXDEV(t *testing.T) {
+	localRoot := t.TempDir()
+	opts := &MountOptions{
+		Profile:            MountProfileCodingAgent,
+		LocalRoot:          localRoot,
+		LocalOnlyPatterns:  []string{"**/node_modules/**"},
+		RemoteOnlyPatterns: []string{"**/node_modules/keep/**"},
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	if err := os.MkdirAll(localRoot+"/overlay/repo/node_modules", 0o755); err != nil {
+		t.Fatalf("MkdirAll local node_modules: %v", err)
+	}
+
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	otherIno := fs.inodes.Lookup("/repo/other", true, 0, time.Now())
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Newdir:   otherIno,
+	}, "node_modules", "node_modules")
+	if st != gofuse.Status(syscall.EXDEV) {
+		t.Fatalf("Rename local-only subtree with remote-only descendant = %v, want EXDEV", st)
+	}
+}
+
 func TestMountOptionsSyncReadDefaultsToAsyncReads(t *testing.T) {
 	defaults := &MountOptions{}
 	defaults.setDefaults()

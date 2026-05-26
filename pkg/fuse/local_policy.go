@@ -90,6 +90,22 @@ func (policy *LocalPolicy) Classify(localPath string) PathLayer {
 	return layer
 }
 
+func (policy *LocalPolicy) HasRemoteOnlyDescendant(localPath string) bool {
+	if !policy.Enabled() {
+		return false
+	}
+	cleaned, err := canonicalRuntimePolicyPath(localPath)
+	if err != nil {
+		return false
+	}
+	for _, pattern := range policy.remoteOnly {
+		if pattern.canMatchDescendantOf(cleaned) {
+			return true
+		}
+	}
+	return false
+}
+
 func (policy *LocalPolicy) classifyWithSource(localPath string) (PathLayer, policyMatchSource) {
 	if !policy.Enabled() {
 		return PathLayerRemotePersistent, policyMatchDisabled
@@ -120,6 +136,10 @@ func (fs *Dat9FS) observePathPolicy(localPath string) PathLayer {
 		fs.perf.recordLocalPolicy(source)
 	}
 	return layer
+}
+
+func (fs *Dat9FS) localPathHasRemoteOnlyDescendant(localPath string) bool {
+	return fs != nil && fs.localPolicy != nil && fs.localPolicy.HasRemoteOnlyDescendant(localPath)
 }
 
 type localPolicyPattern struct {
@@ -202,6 +222,27 @@ func (pattern localPolicyPattern) matchesCanonical(cleaned string) bool {
 	return false
 }
 
+func (pattern localPolicyPattern) canMatchDescendantOf(cleaned string) bool {
+	if len(pattern.subpath) > 0 {
+		segments := splitCanonicalPolicyPath(cleaned)
+		return subpathCanMatchAtOrBelow(segments, pattern.subpath)
+	}
+	if pattern.prefix != "" {
+		return cleaned == pattern.prefix ||
+			strings.HasPrefix(cleaned, pattern.prefix+"/") ||
+			strings.HasPrefix(pattern.prefix, cleaned+"/")
+	}
+	if pattern.exact != "" {
+		if strings.ContainsAny(pattern.exact, "*?[") {
+			return true
+		}
+		return cleaned == pattern.exact ||
+			strings.HasPrefix(cleaned, pattern.exact+"/") ||
+			strings.HasPrefix(pattern.exact, cleaned+"/")
+	}
+	return false
+}
+
 func canonicalPolicyPattern(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	return canonicalPolicyPath(value)
@@ -242,6 +283,32 @@ func containsSubpath(segments []string, subpath []string) bool {
 		matched := true
 		for offset := range subpath {
 			if segments[start+offset] != subpath[offset] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+func subpathCanMatchAtOrBelow(segments []string, subpath []string) bool {
+	if len(subpath) == 0 {
+		return false
+	}
+	if containsSubpath(segments, subpath) {
+		return true
+	}
+	maxOverlap := len(segments)
+	if maxOverlap > len(subpath)-1 {
+		maxOverlap = len(subpath) - 1
+	}
+	for overlap := 1; overlap <= maxOverlap; overlap++ {
+		matched := true
+		for i := 0; i < overlap; i++ {
+			if segments[len(segments)-overlap+i] != subpath[i] {
 				matched = false
 				break
 			}

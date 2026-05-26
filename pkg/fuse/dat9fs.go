@@ -2155,20 +2155,24 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		info, err := overlay.Lstat(childP)
 		if err != nil {
 			if os.IsNotExist(err) {
-				out.NodeId = 0
-				out.SetEntryTimeout(fs.negativeEntryTTL(childP))
-				return gofuse.ENOENT
+				if !fs.localPathHasRemoteOnlyDescendant(childP) {
+					out.NodeId = 0
+					out.SetEntryTimeout(fs.negativeEntryTTL(childP))
+					return gofuse.ENOENT
+				}
+			} else {
+				return localErrToFuseStatus(err)
 			}
-			return localErrToFuseStatus(err)
+		} else {
+			entry, st := fs.localEntry(childP, info, true)
+			if st != gofuse.OK {
+				return st
+			}
+			parentPath, _ := fs.inodes.GetPath(header.NodeId)
+			fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+			fs.fillEntryOut(entry, out)
+			return gofuse.OK
 		}
-		entry, st := fs.localEntry(childP, info, true)
-		if st != gofuse.OK {
-			return st
-		}
-		parentPath, _ := fs.inodes.GetPath(header.NodeId)
-		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
-		fs.fillEntryOut(entry, out)
-		return gofuse.OK
 	}
 
 	// Pending namespace overlay: check in-memory PendingIndex first (O(1)),
@@ -3236,6 +3240,9 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		if oldLayer != newLayer {
 			return gofuse.Status(syscall.EXDEV)
 		}
+		if fs.localPathHasRemoteOnlyDescendant(oldP) || fs.localPathHasRemoteOnlyDescendant(newP) {
+			return gofuse.Status(syscall.EXDEV)
+		}
 		if fs.localOverlay == nil {
 			return gofuse.EIO
 		}
@@ -3546,20 +3553,37 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 		if st != gofuse.OK {
 			return nil, syscall.EIO
 		}
+		entries := []DirEntry{}
 		items, err := overlay.ReadDir(dirPath)
-		if err != nil {
+		if err == nil {
+			entries = fs.localOverlayDirEntries(dirPath, items)
+		} else if !os.IsNotExist(err) {
 			return nil, err
 		}
-		return fs.localOverlayDirEntries(dirPath, items), nil
+		if !fs.localPathHasRemoteOnlyDescendant(dirPath) {
+			return entries, nil
+		}
+		remoteEntries, err := fs.listRemoteDir(ctx, dirPath)
+		if err != nil && !isNotFoundErr(err) {
+			return nil, err
+		}
+		return fs.mergeLocalEntries(dirPath, remoteEntries, entries), nil
 	}
 
-	// Check dir cache first
+	entries, err := fs.listRemoteDir(ctx, dirPath)
+	if err != nil {
+		return nil, err
+	}
+	return fs.mergeLocalDirEntries(dirPath, entries)
+}
+
+func (fs *Dat9FS) listRemoteDir(ctx context.Context, dirPath string) ([]DirEntry, error) {
 	if cached, ok := fs.dirCache.Get(dirPath); ok {
 		if fs.perf != nil {
 			fs.perf.dirCacheHit.add(1)
 		}
 		entries := fs.cachedToDirEntries(dirPath, cached)
-		return fs.mergeLocalDirEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries))
+		return fs.mergePendingDirEntries(dirPath, entries), nil
 	}
 	if fs.perf != nil {
 		fs.perf.dirCacheMiss.add(1)
@@ -3579,7 +3603,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached)
 
 	entries := fs.cachedToDirEntries(dirPath, cached)
-	return fs.mergeLocalDirEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries))
+	return fs.mergePendingDirEntries(dirPath, entries), nil
 }
 
 func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []CachedFileInfo) {
@@ -3715,14 +3739,19 @@ func (fs *Dat9FS) mergeLocalDirEntries(dirPath string, entries []DirEntry) ([]Di
 	items, err := fs.localOverlay.ReadDir(dirPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return entries, nil
+			return fs.filterRemoteLocalOnlyDirEntries(dirPath, entries), nil
 		}
 		return nil, err
 	}
 	localEntries := fs.localOverlayDirEntries(dirPath, items)
 	if len(localEntries) == 0 {
-		return entries, nil
+		return fs.filterRemoteLocalOnlyDirEntries(dirPath, entries), nil
 	}
+	return fs.mergeLocalEntries(dirPath, entries, localEntries), nil
+}
+
+func (fs *Dat9FS) mergeLocalEntries(dirPath string, remoteEntries []DirEntry, localEntries []DirEntry) []DirEntry {
+	entries := fs.filterRemoteLocalOnlyDirEntries(dirPath, remoteEntries)
 	byName := make(map[string]int, len(entries)+len(localEntries))
 	for i, entry := range entries {
 		byName[entry.Name] = i
@@ -3738,7 +3767,19 @@ func (fs *Dat9FS) mergeLocalDirEntries(dirPath string, entries []DirEntry) ([]Di
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Name < entries[j].Name
 	})
-	return entries, nil
+	return entries
+}
+
+func (fs *Dat9FS) filterRemoteLocalOnlyDirEntries(dirPath string, entries []DirEntry) []DirEntry {
+	filtered := make([]DirEntry, 0, len(entries))
+	for _, entry := range entries {
+		childP := dirEntryChildPath(dirPath, entry.Name)
+		if fs.observePathPolicy(childP) == PathLayerLocalOnly && !fs.localPathHasRemoteOnlyDescendant(childP) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
 }
 
 func (fs *Dat9FS) localOverlayDirEntries(dirPath string, items []localOverlayEntry) []DirEntry {

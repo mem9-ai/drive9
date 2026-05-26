@@ -40,6 +40,15 @@ func TestLocalPolicyRemoteOnlyOverridesLocalOnly(t *testing.T) {
 	if got := policy.Classify("/repo/node_modules/keep/index.js"); got != PathLayerRemotePersistent {
 		t.Fatalf("remote override = %s, want remote persistent", got)
 	}
+	if !policy.HasRemoteOnlyDescendant("/repo/node_modules") {
+		t.Fatal("node_modules should report possible remote-only descendants")
+	}
+	if policy.HasRemoteOnlyDescendant("/repo/node_modules/pkg") {
+		t.Fatal("unrelated node_modules child should not report remote-only descendants")
+	}
+	if policy.HasRemoteOnlyDescendant("/repo/.git") {
+		t.Fatal(".git should not report node_modules remote-only descendants")
+	}
 }
 
 func TestLocalPolicyDisabledForOrdinaryMount(t *testing.T) {
